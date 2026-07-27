@@ -846,6 +846,60 @@ def auto_polort(
 # (a list[NuisanceBlock]). Downstream consumers see one structure.
 # ---------------------------------------------------------------------------
 
+# Per-run transforms a nuisance block may declare. Adding one here (plus a
+# branch in apply_nuisance_transform) makes it available to every input mode
+# and to design.toml's `transform =` field at once.
+NUISANCE_TRANSFORMS = ("none", "deriv", "deriv_back", "deriv_fwd")
+
+
+def apply_nuisance_transform(arr: np.ndarray, transform: str) -> np.ndarray:
+    """Apply a per-run transform to ONE run's regressor block.
+
+    Derivatives follow ``1d_tool.py`` exactly (afni_util.derivative), including
+    the length: the output has as many rows as the input, with the edge row the
+    difference cannot reach set to zero.
+
+    - ``deriv`` / ``deriv_back`` — backward difference (``1d_tool.py
+      -derivative`` / ``-backward_diff``, the afni_proc.py default):
+      ``d[t] = v[t] - v[t-1]``, ``d[0] = 0``.
+    - ``deriv_fwd`` — forward difference (``-forward_diff``):
+      ``d[t] = v[t+1] - v[t]``, ``d[-1] = 0``. Same regressor shifted one TR;
+      which one you want depends on where you think the artefact sits relative
+      to the motion.
+
+    Per run is not an optimisation: differencing across a run boundary turns the
+    between-run offset into a spike in a regressor that then eats real signal.
+    """
+    if transform in (None, "", "none"):
+        return arr
+    a = np.asarray(arr, dtype=np.float64)
+    out = np.zeros_like(a)
+    if transform in ("deriv", "deriv_back"):
+        out[1:] = a[1:] - a[:-1]
+    elif transform == "deriv_fwd":
+        out[:-1] = a[1:] - a[:-1]
+    else:
+        raise ValueError(f"unknown nuisance transform {transform!r} (known: {NUISANCE_TRANSFORMS})")
+    return out
+
+
+def split_label_transform(label: str) -> tuple[str, str]:
+    """Split an ortvec LABEL into ``(label, transform)``.
+
+    ``motion:deriv`` → ``("motion", "deriv")``; a bare label → transform "none".
+    One modifier syntax for all four ``-ortvec*`` flags beats four parallel
+    flag families, and it round-trips to design.toml's `transform =` field.
+    """
+    if ":" not in label:
+        return label, "none"
+    base, _, tf = label.rpartition(":")
+    if tf not in NUISANCE_TRANSFORMS:
+        raise ValueError(
+            f"unknown transform {tf!r} in ortvec label {label!r} "
+            f"(known: {', '.join(NUISANCE_TRANSFORMS)})"
+        )
+    return base, tf
+
 
 @dataclass
 class NuisanceBlock:
@@ -875,6 +929,9 @@ class NuisanceBlock:
     # the -ortvec_run / -ortvec_glob case (distinct per-run files). False → a single
     # full-length regressor SHARED across runs (AFNI -ortvec semantics).
     block_diagonal: bool = False
+    # Per-run transform applied in get_run (see apply_nuisance_transform). Stored
+    # rather than baked in so per_run stays the file's raw content, inspectable.
+    transform: str = "none"
 
     def __post_init__(self):
         if not self.source:
@@ -905,7 +962,9 @@ class NuisanceBlock:
                 f"NuisanceBlock {self.label!r}: run {run_idx} has "
                 f"{m.shape[0]} rows, design expects {run_length}"
             )
-        m = m.astype(np.float32, copy=False)
+        # Transform before padding: the zero columns of a short run must stay
+        # zero, and the derivative is defined on this run's rows alone.
+        m = apply_nuisance_transform(m, self.transform).astype(np.float32, copy=False)
         if m.shape[1] < ncols:
             pad = np.zeros((run_length, ncols - m.shape[1]), dtype=np.float32)
             return np.hstack([m, pad])
@@ -1035,6 +1094,7 @@ def make_nuisance_block_from_full_length(
     label: str,
     run_starts: list[int],
     n_timepoints: int,
+    transform: str = "none",
 ) -> NuisanceBlock:
     """Mode 1: one file with rows for *all* runs concatenated (pre-padded)."""
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
@@ -1049,6 +1109,7 @@ def make_nuisance_block_from_full_length(
         label=label,
         per_run=per_run,
         source=[str(path)] * len(run_starts),
+        transform=transform,
     )
 
 
@@ -1058,6 +1119,7 @@ def make_nuisance_block_from_per_run_file(
     run_idx_1based: int,
     run_starts: list[int],
     n_timepoints: int,
+    transform: str = "none",
 ) -> NuisanceBlock:
     """Mode 2: one file that covers exactly one run; other runs get zeros."""
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
@@ -1078,7 +1140,9 @@ def make_nuisance_block_from_per_run_file(
     per_run[run_idx] = arr
     source: list[str | None] = [None] * n_runs
     source[run_idx] = str(path)
-    return NuisanceBlock(label=label, per_run=per_run, source=source, block_diagonal=True)
+    return NuisanceBlock(
+        label=label, per_run=per_run, source=source, block_diagonal=True, transform=transform
+    )
 
 
 def make_nuisance_block_from_glob(
@@ -1086,6 +1150,7 @@ def make_nuisance_block_from_glob(
     label: str,
     run_starts: list[int],
     n_timepoints: int,
+    transform: str = "none",
 ) -> NuisanceBlock:
     """Mode 3: glob matches N files; infer per-file run index from filename.
 
@@ -1118,7 +1183,9 @@ def make_nuisance_block_from_glob(
         per_run[run_idx] = arr
         source[run_idx] = str(path)
 
-    return NuisanceBlock(label=label, per_run=per_run, source=source, block_diagonal=True)
+    return NuisanceBlock(
+        label=label, per_run=per_run, source=source, block_diagonal=True, transform=transform
+    )
 
 
 def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
@@ -1128,7 +1195,16 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
     `collect_nuisance_blocks(args, ...)` to get a `list[NuisanceBlock]`.
     Any per-CLI guard in front of that call must test all four flags
     (a subset guard silently drops the omitted mode).
+
+    Every LABEL accepts a `:transform` modifier (see NUISANCE_TRANSFORMS), so
+    the same file can enter twice — once raw, once differenced — without a
+    parallel flag family per transform.
     """
+    transform_note = (
+        " LABEL may carry a transform modifier: LABEL:deriv (per-run backward "
+        "difference, as 1d_tool.py -derivative), LABEL:deriv_fwd (forward "
+        "difference), LABEL:deriv_back (explicit synonym of :deriv)."
+    )
     if include_legacy:
         parser_or_group.add_argument(
             "-ortvec",
@@ -1137,7 +1213,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
             metavar=("FILE", "LABEL"),
             help=(
                 "Full-length nuisance regressors (pre-concatenated across all runs). "
-                "Repeatable: -ortvec motion.1D motion -ortvec physio.1D physio"
+                "Repeatable: -ortvec motion.1D motion -ortvec physio.1D physio" + transform_note
             ),
         )
     parser_or_group.add_argument(
@@ -1149,6 +1225,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
         help=(
             "Per-run nuisance regressors; RUN is 1-based run index. Other runs are zero-padded. "
             "Repeatable: -ortvec_run motion_r1.1D motion 1 -ortvec_run motion_r2.1D motion 2"
+            + transform_note
         ),
     )
     parser_or_group.add_argument(
@@ -1160,7 +1237,7 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
         help=(
             "Glob matching per-run nuisance files; run index inferred from filename "
             "(BIDS-style `_run-N_` preferred). Missing runs zero-padded. "
-            "Repeatable: -ortvec_glob 'motion_run-*.1D' motion"
+            "Repeatable: -ortvec_glob 'motion_run-*.1D' motion" + transform_note
         ),
     )
     parser_or_group.add_argument(
@@ -1226,18 +1303,21 @@ def collect_nuisance_blocks(
     its parser.
     """
     blocks: list[NuisanceBlock] = []
-    for path, label in getattr(args, "ortvec", None) or []:
+    for path, raw_label in getattr(args, "ortvec", None) or []:
+        label, tf = split_label_transform(raw_label)
         blocks.append(
             make_nuisance_block_from_full_length(
                 path,
                 label,
                 run_starts,
                 n_timepoints,
+                transform=tf,
             )
         )
         if verbose:
-            print(f"  -ortvec: {path} (label={label})")
-    for path, label, run_str in getattr(args, "ortvec_run", None) or []:
+            print(f"  -ortvec: {path} (label={label}, transform={tf})")
+    for path, raw_label, run_str in getattr(args, "ortvec_run", None) or []:
+        label, tf = split_label_transform(raw_label)
         try:
             run_idx = int(run_str)
         except ValueError:
@@ -1250,25 +1330,32 @@ def collect_nuisance_blocks(
                 run_idx,
                 run_starts,
                 n_timepoints,
+                transform=tf,
             )
         )
         if verbose:
-            print(f"  -ortvec_run: {path} (label={label}, run={run_idx})")
-    for pattern, label in getattr(args, "ortvec_glob", None) or []:
+            print(f"  -ortvec_run: {path} (label={label}, run={run_idx}, transform={tf})")
+    for pattern, raw_label in getattr(args, "ortvec_glob", None) or []:
+        label, tf = split_label_transform(raw_label)
         block = make_nuisance_block_from_glob(
             pattern,
             label,
             run_starts,
             n_timepoints,
+            transform=tf,
         )
         blocks.append(block)
         if verbose:
             matched = [s for s in block.source if s]
-            print(f"  -ortvec_glob: {pattern} (label={label}) → {len(matched)} run(s) assigned")
+            print(
+                f"  -ortvec_glob: {pattern} (label={label}, transform={tf})"
+                f" → {len(matched)} run(s) assigned"
+            )
     # -ortvec_concat: glob over already-full-length per-run files; each becomes
     # its own full-length NuisanceBlock with an auto-suffixed label. Equivalent
     # to writing N -ortvec calls.
-    for pattern, label in getattr(args, "ortvec_concat", None) or []:
+    for pattern, raw_label in getattr(args, "ortvec_concat", None) or []:
+        label, tf = split_label_transform(raw_label)
         n_runs = len(run_starts)
         for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
             blocks.append(
@@ -1277,6 +1364,7 @@ def collect_nuisance_blocks(
                     suffixed_label,
                     run_starts,
                     n_timepoints,
+                    transform=tf,
                 )
             )
             if verbose:

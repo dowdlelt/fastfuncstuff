@@ -33,15 +33,12 @@ from fastfuncstuff.design.builder import (
 )
 from fastfuncstuff.design.spec import (
     EventSpec,
-    MetaSpec,
     NuisanceSpec,
-    RunSpec,
-    Spec,
+    build_stub_spec,
     load_spec,
     resolve_contrast,
     write_spec,
 )
-from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
 
 # ---------------------------------------------------------------------------
 # Argparse plumbing
@@ -144,70 +141,6 @@ def _build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
-def _bold_header(path: Path) -> tuple[int, float]:
-    """Return (n_timepoints, tr) by reading only the NIfTI header."""
-    img = load_nifti(path)
-    n_tp = img.shape[3] if len(img.shape) > 3 else 1
-    tr = get_tr_from_file(str(path))
-    return int(n_tp), float(tr)
-
-
-def _auto_polort(durations_sec: list[float]) -> int | list[int]:
-    """AFNI's rule: 1 + floor(duration_sec / 150). Collapse to scalar if
-    every run agrees."""
-    per_run = [int(1 + math.floor(d / 150.0)) for d in durations_sec]
-    return per_run[0] if len(set(per_run)) == 1 else per_run
-
-
-def _scan_trial_types(
-    events_files: list[Path],
-    cols: tuple[str, str, str],
-    drop: set[str],
-) -> tuple[list[str], dict[str, list[float]]]:
-    """Read every events TSV and return:
-
-    - sorted unique trial_types (after applying *drop*)
-    - per-trial-type list of all observed event durations (across all runs).
-    """
-    onset_col, dur_col, tt_col = cols
-    del onset_col
-    durations: dict[str, list[float]] = {}
-    for path in events_files:
-        with open(path, newline="") as fh:
-            reader = csv.DictReader(fh, delimiter="\t")
-            for row in reader:
-                tt = str(row.get(tt_col, "")).strip()
-                if not tt or tt.lower() == "n/a" or tt in drop:
-                    continue
-                try:
-                    dur = float(row[dur_col])
-                except (KeyError, ValueError):
-                    dur = float("nan")
-                durations.setdefault(tt, []).append(dur)
-    return sorted(durations.keys()), durations
-
-
-def _duration_stats_comment(durations: list[float]) -> str:
-    """One-line summary of a trial_type's durations for stub annotation.
-
-    Purely informational — comments cannot influence compile output.
-    """
-    valid = [d for d in durations if d == d]  # drop NaN
-    if not valid:
-        return "no parseable durations"
-    n = len(valid)
-    lo, hi = min(valid), max(valid)
-    mean = sum(valid) / n
-    sorted_vals = sorted(valid)
-    median = sorted_vals[n // 2] if n % 2 else 0.5 * (sorted_vals[n // 2 - 1] + sorted_vals[n // 2])
-    uniq = sorted(set(round(d, 4) for d in valid))
-    uniq_str = ", ".join(f"{u:g}" for u in uniq) if len(uniq) <= 5 else f"{len(uniq)} unique values"
-    return (
-        f"n={n}, range=[{lo:g}, {hi:g}], "
-        f"mean={mean:.3g}, median={median:.3g}, unique={{{uniq_str}}}"
-    )
-
-
 def _build_nuisance_from_cli_args(
     args: argparse.Namespace,
     n_runs: int,
@@ -217,33 +150,39 @@ def _build_nuisance_from_cli_args(
     so users learn one API. The fourth (concat) is a convenience for
     AFNI-style already-padded per-run files (each is full length and
     block-diagonal — the demean output of afni_proc.py)."""
-    from fastfuncstuff.cli_utils import expand_ortvec_concat
+    from fastfuncstuff.cli_utils import expand_ortvec_concat, split_label_transform
 
     out: list[NuisanceSpec] = []
 
-    for file, label in getattr(args, "ortvec", None) or []:
-        out.append(NuisanceSpec(file=str(file), label=label, scope="full"))
+    for file, raw_label in getattr(args, "ortvec", None) or []:
+        label, tf = split_label_transform(raw_label)
+        out.append(NuisanceSpec(file=str(file), label=label, scope="full", transform=tf))
 
-    for file, label, run in getattr(args, "ortvec_run", None) or []:
-        out.append(NuisanceSpec(file=str(file), label=label, scope=f"run:{int(run)}"))
+    for file, raw_label, run in getattr(args, "ortvec_run", None) or []:
+        label, tf = split_label_transform(raw_label)
+        out.append(NuisanceSpec(file=str(file), label=label, scope=f"run:{int(run)}", transform=tf))
 
-    for pattern, label in getattr(args, "ortvec_glob", None) or []:
+    for pattern, raw_label in getattr(args, "ortvec_glob", None) or []:
+        label, tf = split_label_transform(raw_label)
         out.append(
             NuisanceSpec(
                 file=None,
                 label=label,
                 scope="glob",
                 pattern=str(pattern),
+                transform=tf,
             )
         )
 
-    for pattern, label in getattr(args, "ortvec_concat", None) or []:
+    for pattern, raw_label in getattr(args, "ortvec_concat", None) or []:
+        label, tf = split_label_transform(raw_label)
         for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
             out.append(
                 NuisanceSpec(
                     file=str(path),
                     label=suffixed_label,
                     scope="full",
+                    transform=tf,
                 )
             )
 
@@ -287,68 +226,15 @@ def _confirm_overwrite(path: Path, force: bool, kind: str) -> bool:
 def _do_stub(args: argparse.Namespace) -> int:
     bold_paths = [Path(p) for p in args.input]
     events_paths = [Path(p) for p in args.events]
-    if len(bold_paths) != len(events_paths):
-        raise ValueError(
-            f"-input and -events must have the same length "
-            f"(got {len(bold_paths)} input vs {len(events_paths)} events)."
-        )
-    n_runs = len(bold_paths)
-
-    # Header scan.
-    n_tp_per_run: list[int] = []
-    trs: list[float] = []
-    for p in bold_paths:
-        n_tp, tr = _bold_header(p)
-        n_tp_per_run.append(n_tp)
-        trs.append(tr)
-    if args.TR is not None:
-        tr_final = float(args.TR)
-    elif len(set(trs)) > 1:
-        raise ValueError(f"BOLD files report inconsistent TRs: {trs}. Use -TR.")
-    else:
-        tr_final = trs[0]
-
-    cols = tuple(args.event_cols) if args.event_cols else ("onset", "duration", "trial_type")
-    drop_set = set(args.drop_trial_types)
-    trial_types, durations_per_tt = _scan_trial_types(events_paths, cols, drop_set)
-    if not trial_types:
-        raise ValueError("No trial_types survived the drop filter — nothing to model.")
-
-    polort = _auto_polort([n * tr_final for n in n_tp_per_run])
-
-    meta = MetaSpec(
-        runs=[
-            RunSpec(bold=str(b), events=str(e))
-            for b, e in zip(bold_paths, events_paths, strict=True)
-        ],
-        tr=tr_final,
-        n_timepoints_per_run=n_tp_per_run,
-        polort=polort,
+    spec, event_notes = build_stub_spec(
+        bold_paths,
+        events_paths,
+        tr=args.TR,
+        event_cols=tuple(args.event_cols) if args.event_cols else None,
         drop_trial_types=list(args.drop_trial_types),
+        default_hrf=args.default_hrf,
+        nuisance=_build_nuisance_from_cli_args(args, len(bold_paths)),
     )
-    # Don't overwrite events_columns with defaults; only set if user customised.
-    if args.event_cols:
-        from fastfuncstuff.design.spec import EventsColumns
-
-        meta.events_columns = EventsColumns(onset=cols[0], duration=cols[1], trial_type=cols[2])
-
-    events = [
-        EventSpec(trial_type=tt, duration="from_events", hrf=args.default_hrf, mode="condition")
-        for tt in trial_types
-    ]
-
-    nuisance = _build_nuisance_from_cli_args(args, n_runs)
-
-    # Stats per trial_type → informational comments above each [[events]] block.
-    event_notes = {
-        tt: (
-            "observed durations (informational, no effect on compile): "
-            + _duration_stats_comment(durations_per_tt[tt])
-        )
-        for tt in trial_types
-    }
-
-    spec = Spec(meta=meta, events=events, nuisance=nuisance, contrasts=[])
 
     out_path = Path(args.out)
     if not out_path.suffix:
@@ -370,8 +256,12 @@ def _do_stub(args: argparse.Namespace) -> int:
         include_contrast_examples=True,
     )
     print(f"Wrote stub: {out_path}", file=sys.stderr)
-    print(f"  {len(meta.runs)} runs, TR={tr_final}, polort={polort}", file=sys.stderr)
-    print(f"  {len(events)} trial types: {trial_types}", file=sys.stderr)
+    print(
+        f"  {len(spec.meta.runs)} runs, TR={spec.meta.tr}, polort={spec.meta.polort}",
+        file=sys.stderr,
+    )
+    tts = [e.trial_type for e in spec.events]
+    print(f"  {len(tts)} trial types: {tts}", file=sys.stderr)
     return 0
 
 
@@ -538,12 +428,49 @@ def _resolved_row_to_sym(
     return "SYM: " + " ".join(tokens)
 
 
-def _maybe_demean_to_tempdir(path: Path, tmpdir: Path) -> Path:
-    """Load a .1D file, subtract the per-column mean, write to *tmpdir*.
-    Returns the new path. The original file is untouched."""
+def _materialize_nuisance(
+    path: Path,
+    n_spec: NuisanceSpec,
+    tmpdir: Path | None,
+    run_lengths: list[int] | None = None,
+) -> Path:
+    """Apply a nuisance block's transform + rescale, writing the result to
+    *tmpdir* and returning its path. The original file is untouched; a block
+    that asks for neither is passed straight through.
+
+    ``run_lengths`` splits a scope="full" file into runs so the derivative never
+    crosses a run boundary (per-run and glob files are one run by construction,
+    so they pass None). This mirrors 1d_tool.py -set_nruns / -set_run_lens.
+    """
+    from fastfuncstuff.cli_utils import apply_nuisance_transform
+
+    if n_spec.transform == "none" and n_spec.rescale == "as-is":
+        return path
+    if tmpdir is None:
+        raise RuntimeError(
+            f"nuisance '{n_spec.label}': transform/rescale requires a tmpdir to write to"
+        )
     arr = np.loadtxt(path, ndmin=2)
-    arr = arr - arr.mean(axis=0, keepdims=True)
-    out = tmpdir / f"{path.stem}_demean.1D"
+    if n_spec.transform != "none":
+        if run_lengths:
+            if sum(run_lengths) != arr.shape[0]:
+                raise ValueError(
+                    f"nuisance '{n_spec.label}': {path} has {arr.shape[0]} rows but the "
+                    f"design's runs total {sum(run_lengths)} — cannot split for transform"
+                )
+            parts, start = [], 0
+            for n_rows in run_lengths:
+                parts.append(
+                    apply_nuisance_transform(arr[start : start + n_rows], n_spec.transform)
+                )
+                start += n_rows
+            arr = np.vstack(parts)
+        else:
+            arr = apply_nuisance_transform(arr, n_spec.transform)
+    if n_spec.rescale == "demean":
+        arr = arr - arr.mean(axis=0, keepdims=True)
+    tag = "_".join(t for t in (n_spec.transform, n_spec.rescale) if t not in ("none", "as-is"))
+    out = tmpdir / f"{path.stem}_{tag}.1D"
     np.savetxt(out, arr, fmt="%.10g")
     return out
 
@@ -570,23 +497,23 @@ def _resolve_nuisance_for_compile(
     ortvec_files: list[tuple[Path, str]] = []
     padortvec_files: list[tuple[Path, str, int]] = []
 
-    def _maybe_rescale(src: Path, n_spec: NuisanceSpec) -> Path:
-        if n_spec.rescale == "demean":
-            if tmpdir is None:
-                raise RuntimeError(
-                    "rescale='demean' requires a tmpdir to write the preprocessed file to"
-                )
-            return _maybe_demean_to_tempdir(src, tmpdir)
-        return src
-
     for n in nuisance:
         if n.scope == "full":
-            ortvec_files.append((_maybe_rescale(Path(n.file or ""), n), n.label))
+            ortvec_files.append(
+                (
+                    _materialize_nuisance(
+                        Path(n.file or ""), n, tmpdir, run_lengths=n_timepoints_per_run
+                    ),
+                    n.label,
+                )
+            )
         elif n.scope.startswith("run:"):
             run_idx = int(n.scope.split(":", 1)[1])
             if run_idx < 1 or run_idx > n_runs:
                 raise ValueError(f"nuisance '{n.label}': run {run_idx} out of range [1, {n_runs}]")
-            padortvec_files.append((_maybe_rescale(Path(n.file or ""), n), n.label, run_idx))
+            padortvec_files.append(
+                (_materialize_nuisance(Path(n.file or ""), n, tmpdir), n.label, run_idx)
+            )
         elif n.scope == "glob":
             if not n.pattern:
                 raise ValueError(f"nuisance '{n.label}': scope='glob' but no pattern")
@@ -608,7 +535,9 @@ def _resolve_nuisance_for_compile(
                         f"but run {run_idx0 + 1} expects {expected} "
                         "(glob mode requires one-run-length files)"
                     )
-                padortvec_files.append((_maybe_rescale(path, n), n.label, run_idx0 + 1))
+                padortvec_files.append(
+                    (_materialize_nuisance(path, n, tmpdir), n.label, run_idx0 + 1)
+                )
         else:
             raise ValueError(f"nuisance '{n.label}': unknown scope {n.scope!r}")
 

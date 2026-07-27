@@ -83,6 +83,10 @@ class NuisanceSpec:
     scope: str = "full"  # "full" | "run:N" | "glob"
     pattern: str | None = None  # required when scope == "glob"
     rescale: str = "as-is"  # "as-is" | "demean"
+    # Per-run transform, applied BEFORE rescale. See cli_utils.NUISANCE_TRANSFORMS
+    # ("deriv" = 1d_tool.py -derivative). The same file can appear twice — once
+    # raw, once differenced — as two blocks with different labels.
+    transform: str = "none"
 
 
 @dataclass
@@ -101,6 +105,153 @@ class Spec:
 
 
 # ---------------------------------------------------------------------------
+# Stub construction (shared by `ffs_design_spec stub` and ffs_autoproc)
+# ---------------------------------------------------------------------------
+
+DEFAULT_EVENT_COLUMNS = ("onset", "duration", "trial_type")
+DEFAULT_DROP_TRIAL_TYPES = ("rest", "Rest", "REST", "baseline")
+
+
+def bold_header(path: str | Path) -> tuple[int, float]:
+    """(n_timepoints, TR) from a NIfTI header — no voxel data is read."""
+    from fastfuncstuff.io.afni import get_tr_from_file, load_nifti
+
+    img = load_nifti(Path(path))
+    n_tp = img.shape[3] if len(img.shape) > 3 else 1
+    return int(n_tp), float(get_tr_from_file(str(path)))
+
+
+def auto_polort(durations_sec: list[float]) -> int | list[int]:
+    """AFNI's rule: 1 + floor(run_seconds / 150). Scalar if every run agrees."""
+    import math
+
+    per_run = [int(1 + math.floor(d / 150.0)) for d in durations_sec]
+    return per_run[0] if len(set(per_run)) == 1 else per_run
+
+
+def scan_trial_types(
+    events_files: list[Path],
+    cols: tuple[str, str, str] = DEFAULT_EVENT_COLUMNS,
+    drop: set[str] | None = None,
+) -> tuple[list[str], dict[str, list[float]]]:
+    """Read every events TSV; return sorted surviving trial_types and the
+    durations observed for each (used for the informational stub comments)."""
+    import csv
+
+    drop = drop or set()
+    _, dur_col, tt_col = cols
+    durations: dict[str, list[float]] = {}
+    for path in events_files:
+        with open(path, newline="") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                tt = str(row.get(tt_col, "")).strip()
+                if not tt or tt.lower() == "n/a" or tt in drop:
+                    continue
+                try:
+                    dur = float(row[dur_col])
+                except (KeyError, ValueError):
+                    dur = float("nan")
+                durations.setdefault(tt, []).append(dur)
+    return sorted(durations.keys()), durations
+
+
+def duration_stats_comment(durations: list[float]) -> str:
+    """One-line summary of a trial_type's durations. Informational only —
+    a comment cannot influence what compile produces."""
+    valid = [d for d in durations if d == d]  # drop NaN
+    if not valid:
+        return "no parseable durations"
+    n = len(valid)
+    lo, hi = min(valid), max(valid)
+    mean = sum(valid) / n
+    sv = sorted(valid)
+    median = sv[n // 2] if n % 2 else 0.5 * (sv[n // 2 - 1] + sv[n // 2])
+    uniq = sorted({round(d, 4) for d in valid})
+    uniq_str = ", ".join(f"{u:g}" for u in uniq) if len(uniq) <= 5 else f"{len(uniq)} unique values"
+    return (
+        f"n={n}, range=[{lo:g}, {hi:g}], "
+        f"mean={mean:.3g}, median={median:.3g}, unique={{{uniq_str}}}"
+    )
+
+
+def build_stub_spec(
+    bold_paths: list[Path],
+    events_paths: list[Path],
+    *,
+    tr: float | None = None,
+    n_timepoints_per_run: list[int] | None = None,
+    event_cols: tuple[str, str, str] | None = None,
+    drop_trial_types: list[str] | None = None,
+    default_hrf: str = "SPMG1(0)",
+    nuisance: list[NuisanceSpec] | None = None,
+) -> tuple[Spec, dict[str, str]]:
+    """Build a stub Spec (+ per-trial-type informational notes) from BOLD
+    headers and events TSVs.
+
+    ``tr`` / ``n_timepoints_per_run`` override what the headers report. That is
+    what lets ffs_autoproc stub a design at *script-generation* time, from the
+    raw BIDS series, for outputs that do not exist yet: the preprocessed runs
+    have the same TR and the same length minus any trimmed noise volumes.
+    """
+    if len(bold_paths) != len(events_paths):
+        raise ValueError(
+            f"bold and events must be the same length "
+            f"(got {len(bold_paths)} bold vs {len(events_paths)} events)."
+        )
+    drop_list = list(DEFAULT_DROP_TRIAL_TYPES if drop_trial_types is None else drop_trial_types)
+    cols = tuple(event_cols) if event_cols else DEFAULT_EVENT_COLUMNS
+
+    if n_timepoints_per_run is None or tr is None:
+        n_tp_scan, trs = [], []
+        for p in bold_paths:
+            n_tp, tr_i = bold_header(p)
+            n_tp_scan.append(n_tp)
+            trs.append(tr_i)
+        if tr is None:
+            if len(set(trs)) > 1:
+                raise ValueError(f"BOLD files report inconsistent TRs: {trs}. Pass tr=.")
+            tr = trs[0]
+        if n_timepoints_per_run is None:
+            n_timepoints_per_run = n_tp_scan
+    if len(n_timepoints_per_run) != len(bold_paths):
+        raise ValueError(
+            f"n_timepoints_per_run has {len(n_timepoints_per_run)} entries "
+            f"for {len(bold_paths)} runs"
+        )
+
+    trial_types, durations_per_tt = scan_trial_types(events_paths, cols, set(drop_list))
+    if not trial_types:
+        raise ValueError("No trial_types survived the drop filter — nothing to model.")
+
+    meta = MetaSpec(
+        runs=[
+            RunSpec(bold=str(b), events=str(e))
+            for b, e in zip(bold_paths, events_paths, strict=True)
+        ],
+        tr=float(tr),
+        n_timepoints_per_run=list(n_timepoints_per_run),
+        polort=auto_polort([n * float(tr) for n in n_timepoints_per_run]),
+        drop_trial_types=drop_list,
+    )
+    # Only set events_columns when customised, so the TOML keeps the defaults implicit.
+    if event_cols:
+        meta.events_columns = EventsColumns(onset=cols[0], duration=cols[1], trial_type=cols[2])
+
+    events = [
+        EventSpec(trial_type=tt, duration="from_events", hrf=default_hrf, mode="condition")
+        for tt in trial_types
+    ]
+    notes = {
+        tt: (
+            "observed durations (informational, no effect on compile): "
+            + duration_stats_comment(durations_per_tt[tt])
+        )
+        for tt in trial_types
+    }
+    return Spec(meta=meta, events=events, nuisance=list(nuisance or [])), notes
+
+
+# ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
 
@@ -108,6 +259,11 @@ class Spec:
 def load_spec(path: str | Path) -> Spec:
     """Parse a ``design.spec`` TOML file into a Spec object. Raises on
     missing required fields or unknown enum values."""
+    # Local import: cli_utils pulls in torch, and the spec module is meant to
+    # stay loadable from anywhere. NUISANCE_TRANSFORMS lives beside the code that
+    # applies it, so the TOML validator and the GLM can never disagree.
+    from fastfuncstuff.cli_utils import NUISANCE_TRANSFORMS
+
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
 
@@ -156,6 +312,11 @@ def load_spec(path: str | Path) -> Spec:
             raise ValueError(
                 f"{path}: nuisance '{n.label}': rescale must be "
                 f"'as-is' or 'demean' (got {n.rescale!r})"
+            )
+        if n.transform not in NUISANCE_TRANSFORMS:
+            raise ValueError(
+                f"{path}: nuisance '{n.label}': transform must be one of "
+                f"{', '.join(NUISANCE_TRANSFORMS)} (got {n.transform!r})"
             )
         nuisance.append(n)
 
@@ -358,6 +519,18 @@ def write_spec(
     lines.append("#")
     lines.append('# pattern  Shell glob — only set this when scope = "glob".')
     lines.append("#")
+    lines.append("# transform  Per-run transform applied BEFORE rescale. Length is preserved;")
+    lines.append("#            the edge row the difference cannot reach is set to zero, and the")
+    lines.append("#            difference never crosses a run boundary.")
+    lines.append('#              "none"       Use the file as-is. Default.')
+    lines.append('#              "deriv"      Backward difference, d[t] = v[t]-v[t-1], d[0]=0.')
+    lines.append("#                           Same as 1d_tool.py -derivative / -backward_diff,")
+    lines.append("#                           which is what afni_proc.py uses for mot_deriv.")
+    lines.append('#              "deriv_back" Explicit synonym of "deriv".')
+    lines.append('#              "deriv_fwd"  Forward difference, d[t] = v[t+1]-v[t], d[-1]=0.')
+    lines.append("#                           Same regressor shifted one TR (1d_tool.py")
+    lines.append("#                           -forward_diff).")
+    lines.append("#")
     lines.append("# rescale  Per-column preprocessing applied before the regressor enters the")
     lines.append("#          design matrix.")
     lines.append('#            "as-is"  Use the file values verbatim. Default.')
@@ -404,6 +577,8 @@ def write_spec(
             lines.append(f'file = "{n.file}"')
             lines.append(f'label = "{n.label}"')
             lines.append(f'scope = "{n.scope}"')
+        if n.transform != "none":
+            lines.append(f'transform = "{n.transform}"')
         if n.rescale != "as-is":
             lines.append(f'rescale = "{n.rescale}"')
 

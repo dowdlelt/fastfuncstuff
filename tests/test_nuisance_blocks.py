@@ -19,6 +19,7 @@ from fastfuncstuff.cli_utils import (
     NuisanceBlock,
     _infer_run_indices_from_filenames,
     add_ortvec_arguments,
+    apply_nuisance_transform,
     assemble_per_run_nuisance,
     build_nuisance_block_diag,
     build_nuisance_per_run,
@@ -26,6 +27,7 @@ from fastfuncstuff.cli_utils import (
     make_nuisance_block_from_full_length,
     make_nuisance_block_from_glob,
     make_nuisance_block_from_per_run_file,
+    split_label_transform,
 )
 
 CPU = torch.device("cpu")
@@ -652,3 +654,63 @@ class TestBuilderBlocksKwarg:
         np.testing.assert_allclose(col[:10].mean(), 0.0, atol=1e-6)  # per-run demeaned
         # Shape preserved within run 1 (demean is just a constant shift).
         np.testing.assert_allclose(col[:10], arr[:, 0] - arr[:, 0].mean(), atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Per-run transforms (deriv)
+# ---------------------------------------------------------------------------
+
+
+class TestNuisanceTransforms:
+    def test_deriv_matches_1d_tool_semantics(self):
+        """Backward difference with a zero first row, length preserved — this is
+        exactly afni_util.derivative(direct=0), which 1d_tool.py -derivative uses."""
+        v = np.array([[1.0], [3.0], [6.0], [10.0]])
+        back = apply_nuisance_transform(v, "deriv")
+        np.testing.assert_allclose(back.ravel(), [0, 2, 3, 4])
+        np.testing.assert_allclose(apply_nuisance_transform(v, "deriv_back"), back)
+        # Forward difference: same values shifted one row, zero at the END.
+        fwd = apply_nuisance_transform(v, "deriv_fwd")
+        np.testing.assert_allclose(fwd.ravel(), [2, 3, 4, 0])
+        assert back.shape == fwd.shape == v.shape
+        assert apply_nuisance_transform(v, "none") is v
+
+    def test_unknown_transform_is_rejected(self):
+        with pytest.raises(ValueError, match="unknown nuisance transform"):
+            apply_nuisance_transform(np.zeros((4, 1)), "integral")
+        with pytest.raises(ValueError, match="unknown transform"):
+            split_label_transform("motion:integral")
+
+    def test_deriv_never_crosses_a_run_boundary(self, tmp_path):
+        """The bug this guards: differencing a concatenated file across runs turns
+        the between-run offset into a spike in the regressor."""
+        run1 = np.arange(10, dtype=float).reshape(10, 1)
+        run2 = 1000 + np.arange(10, dtype=float).reshape(10, 1)  # huge offset
+        f1, f2 = tmp_path / "m_run-01.1D", tmp_path / "m_run-02.1D"
+        _write_1d(f1, run1)
+        _write_1d(f2, run2)
+
+        block = make_nuisance_block_from_glob(
+            str(tmp_path / "m_run-*.1D"), "motion", [0, 10], 20, transform="deriv"
+        )
+        r2 = block.get_run(1, 10)
+        assert r2[0, 0] == 0.0  # run 2 starts fresh, no 991 spike
+        np.testing.assert_allclose(r2[1:, 0], 1.0)
+
+    def test_label_modifier_flows_through_the_cli(self, tmp_path):
+        """`-ortvec_glob PATTERN motion:deriv` is the one syntax that works for
+        every ortvec mode, so the same file can enter raw and differenced."""
+        for r in (1, 2):
+            _write_1d(tmp_path / f"m_run-0{r}.1D", np.arange(10, dtype=float).reshape(10, 1))
+        parser = argparse.ArgumentParser()
+        add_ortvec_arguments(parser)
+        pattern = str(tmp_path / "m_run-*.1D")
+        args = parser.parse_args(
+            ["-ortvec_glob", pattern, "motion", "-ortvec_glob", pattern, "motion_d:deriv"]
+        )
+        blocks = collect_nuisance_blocks(args, [0, 10], 20)
+        assert [(b.label, b.transform) for b in blocks] == [
+            ("motion", "none"),
+            ("motion_d", "deriv"),
+        ]
+        np.testing.assert_allclose(blocks[1].get_run(0, 10)[:, 0], [0] + [1] * 9)
