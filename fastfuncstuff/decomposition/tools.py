@@ -1320,7 +1320,11 @@ def _ggm_em_step(
     w_ng = r_neg.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
     new_mu_n = (r_noise * x).sum(dim=1, keepdim=True) / w_n
-    new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-8)
+    # MELODIC floors every component variance at 1e-4 on each iteration
+    # (melgmix.cc:631-634), including the noise Gaussian. Our old 1e-8 let the
+    # noise collapse onto a delta spike and z = (x - mu)/1e-4 blow up by 1e4;
+    # the reference's floor caps that at 100.
+    new_var_n = ((r_noise * (x - new_mu_n) ** 2).sum(dim=1, keepdim=True) / w_n).clamp(min=1e-4)
 
     sqrt_var_n = torch.sqrt(new_var_n)
     new_pi_n_now = (w_n / n_scalar).clamp(1e-4, 1 - 2e-4)
@@ -1455,34 +1459,30 @@ def batch_fit_ggm(
     x = (x_raw - data_mean) / data_std
     del x_raw
 
-    # ----- Initialization -----
-    # Noise Gaussian: median and 25% of variance per component
-    mu_n = x.median(dim=1).values.unsqueeze(1)  # (K, 1)
-    var_n = (x.var(dim=1, unbiased=False) * 0.25).unsqueeze(1).clamp(min=1e-8)
+    # ----- Initialization (MELODIC melgmix.cc::setup + ggmfit) -----
+    # All three components start at the full data variance E[x^2] with equal
+    # mixing weights, and the tails at +-2 sigma. An "informed" init that starts
+    # the noise Gaussian narrow (we used var/4, pi=0.8) biases the very first
+    # E-step: the Gammas immediately claim the shoulders, and because the
+    # const2 floor scales with sqrt(var_noise) they then have room to creep
+    # further in. Starting wide lets the noise component hold the bulk.
+    v0 = (x * x).mean(dim=1, keepdim=True).clamp(min=1e-4)  # = 1 for z-scored x
+    s0 = torch.sqrt(v0)
+    mu_n = -2.0 * x.mean(dim=1, keepdim=True)  # ggmfit line 1: -2*mean(data)
+    var_n = v0.clone()
 
-    std_n = torch.sqrt(var_n)
-
-    # Positive tail init
-    pos_mask = x > (mu_n + std_n)  # (K, V)
-    pos_count = pos_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-    pos_sum = (x * pos_mask.float()).sum(dim=1, keepdim=True)
-    mu_p = (pos_sum / pos_count).clamp(min=min_mode_offset)
-    pos_diff = (x - mu_p) * pos_mask.float()
-    var_p = ((pos_diff**2).sum(dim=1, keepdim=True) / pos_count).clamp(min=0.1)
-
-    # Negative tail init
     neg_x = -x
-    neg_mask = neg_x > (std_n - mu_n).clamp(min=0)  # (K, V)
-    neg_count = neg_mask.float().sum(dim=1, keepdim=True).clamp(min=1)
-    neg_sum = (neg_x * neg_mask.float()).sum(dim=1, keepdim=True)
-    mu_ng = (neg_sum / neg_count).clamp(min=min_mode_offset)
-    neg_diff = (neg_x - mu_ng) * neg_mask.float()
-    var_ng = ((neg_diff**2).sum(dim=1, keepdim=True) / neg_count).clamp(min=0.1)
+    # mu_p / mu_ng are both stored positive; mu_ng is the mean of neg_x, i.e.
+    # the magnitude of MELODIC's negative means(3) = mu_n - 2*sigma.
+    mu_p = (mu_n + 2.0 * s0).clamp(min=min_mode_offset)
+    var_p = v0.clone()
+    mu_ng = (2.0 * s0 - mu_n).clamp(min=min_mode_offset)
+    var_ng = v0.clone()
 
     # Mixing proportions (K, 1) — float32, negligible size
-    pi_n = torch.full((K, 1), 0.8, device=device, dtype=torch.float32)
-    pi_p = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
-    pi_ng = torch.full((K, 1), 0.1, device=device, dtype=torch.float32)
+    pi_n = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
+    pi_p = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
+    pi_ng = torch.full((K, 1), 1.0 / 3.0, device=device, dtype=torch.float32)
 
     eps_conv = log(V) / 1000.0
     old_ll = torch.full((K, 1), -1e30, device=device, dtype=torch.float32)
@@ -1599,7 +1599,7 @@ def batch_fit_ggm(
     p_signal = (p_pos_f + p_neg_f) / total_f  # (K, V) float32
     del p_pos_f, p_neg_f, total_f
 
-    sigma_n = torch.sqrt(var_n).clamp(min=1e-8)
+    sigma_n = torch.sqrt(var_n.clamp(min=1e-4))
     z_signed = (x - mu_n) / sigma_n  # (K, V) float32 — z-scored input space
     del x
 
