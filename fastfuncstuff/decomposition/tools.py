@@ -437,6 +437,47 @@ def apply_varnorm_map(
     return out
 
 
+def find_constant_voxels(
+    data_vox_t: np.ndarray | torch.Tensor,
+    tol: float = 1e-6,
+) -> np.ndarray:
+    """(V,) bool — voxels whose timeseries is constant, non-finite, or all-zero.
+
+    MELODIC drops these from the analysis mask outright (`meldata.cc`). Keeping
+    them and merely zeroing them, as we used to, leaves an exact-zero delta
+    spike in every IC map; the mixture model's noise Gaussian then collapses
+    onto that spike, `pi_noise` falls under the 0.4 fallback threshold, and the
+    3-Gaussian fallback labels most of the brain as signal. Measured on real
+    unsmoothed data: 5.6% constant voxels turned mean P(signal) into 0.70
+    against MELODIC's 0.07 on noise components.
+    """
+    if isinstance(data_vox_t, torch.Tensor):
+        std = data_vox_t.to(torch.float32).std(dim=1, unbiased=True)
+        bad = ~torch.isfinite(std) | (std <= tol)
+        bad = bad | ~torch.isfinite(data_vox_t).all(dim=1)
+        return bad.cpu().numpy()
+    arr = np.asarray(data_vox_t, dtype=np.float32)
+    std = arr.std(axis=1, ddof=1) if arr.shape[1] > 1 else np.zeros(arr.shape[0], np.float32)
+    return ~np.isfinite(std) | (std <= tol) | ~np.isfinite(arr).all(axis=1)
+
+
+def prune_mask_constant_voxels(
+    mask3d: np.ndarray,
+    bad_vox: np.ndarray,
+) -> tuple[np.ndarray, int]:
+    """Remove flagged voxels from a 3D boolean mask.
+
+    ``bad_vox`` is (V,) over the mask's True voxels in C order — i.e. the same
+    ordering ``data[mask3d]`` produces. Returns (new_mask3d, n_dropped).
+    """
+    n_drop = int(np.count_nonzero(bad_vox))
+    if n_drop == 0:
+        return mask3d, 0
+    new_mask = mask3d.copy()
+    new_mask[mask3d] = ~np.asarray(bad_vox, dtype=bool)
+    return new_mask, n_drop
+
+
 def effective_rank_from_spectrum(evals: np.ndarray) -> int:
     """Estimate effective rank from eigenvalue spectrum entropy.
 
@@ -1371,6 +1412,7 @@ def batch_fit_ggm(
     n_iter: int = 200,
     min_mode_offset: float = 0.001,
     verbose: bool = False,
+    fallback_pi_thresh: float = 0.4,
 ) -> dict:
     """Fit GGM to ALL ICA spatial maps simultaneously on GPU.
 
@@ -1391,6 +1433,9 @@ def batch_fit_ggm(
         Lower floor on Gamma means (MELODIC uses 0.001 in normalized space).
     verbose : bool
         Show tqdm progress bar over EM iterations.
+    fallback_pi_thresh : float
+        Components whose fitted noise proportion falls below this switch to a
+        3-Gaussian mixture. Set to 0.0 to disable the fallback entirely.
 
     Returns
     -------
@@ -1508,7 +1553,7 @@ def batch_fit_ggm(
     # MELODIC switches to a 3-Gaussian mixture when the noise proportion is
     # small, since a noise-Gaussian + signal-Gammas model is inappropriate
     # for near-uniform distributions.
-    fb_mask = pi_n.squeeze(1) < 0.4  # (K,)
+    fb_mask = pi_n.squeeze(1) < fallback_pi_thresh  # (K,)
     if fb_mask.any():
         fb_idx = fb_mask.nonzero(as_tuple=True)[0]
         gmm = _batch_gmm_3comp(x[fb_idx], n_iter=n_iter)

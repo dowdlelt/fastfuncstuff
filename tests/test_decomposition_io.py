@@ -173,3 +173,44 @@ def test_melodic_compat_ftmix_matches_fsleyes_frequency_axis(tmp_path, n_t):
     assert ev.shape == (n_k,)
     assert ev[-1] == pytest.approx(1.0)
     assert np.all(np.diff(ev) >= 0)
+
+
+def test_prune_mask_constant_voxels_keeps_row_order(tmp_path):
+    """Pruning must stay aligned with the data[mask3d] extraction order."""
+    from fastfuncstuff.decomposition.tools import (
+        find_constant_voxels,
+        prune_mask_constant_voxels,
+    )
+
+    rng = np.random.default_rng(0)
+    shape3d = (3, 3, 2)
+    mask3d = np.zeros(shape3d, dtype=bool)
+    mask3d[:, :, 0] = True  # 9 voxels
+    data = rng.standard_normal((*shape3d, 8)).astype(np.float32)
+    # Make three in-mask voxels constant, one of them exactly zero.
+    data[0, 0, 0, :] = 0.0
+    data[1, 2, 0, :] = 5.0
+    data[2, 1, 0, :] = -1.0
+
+    vox = data[mask3d]
+    bad = find_constant_voxels(vox)
+    assert bad.sum() == 3
+
+    new_mask, n_drop = prune_mask_constant_voxels(mask3d, bad)
+    assert n_drop == 3
+    assert new_mask.sum() == 6
+    assert not new_mask[0, 0, 0] and not new_mask[1, 2, 0] and not new_mask[2, 1, 0]
+    # Re-extracting through the pruned mask must equal the filtered rows.
+    np.testing.assert_allclose(data[new_mask], vox[~bad])
+
+
+def test_find_constant_voxels_flags_nonfinite():
+    from fastfuncstuff.decomposition.tools import find_constant_voxels
+
+    x = np.ones((4, 6), dtype=np.float32)
+    x[0] = np.arange(6)
+    x[1, 2] = np.nan
+    x[2] = np.arange(6) * 2.0
+    # row 3 stays constant
+    bad = find_constant_voxels(x)
+    assert not bad[0] and bad[1] and not bad[2] and bad[3]
