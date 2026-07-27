@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from fastfuncstuff.autoproc import config
-from fastfuncstuff.autoproc.bids import scan_subject
+from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.plan import Options, build_plan
 
@@ -381,26 +381,40 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     if opt.run_glm and not opt.events:
         tasks = {r.task for s in subject.sessions for r in s.bold_runs}
         for task in sorted(tasks):
-            if not _events_exist(args.bids_dir, task, subject):
+            pairs = _events_by_run(args.bids_dir, task, subject)
+            missing = [r for r, ev in pairs if ev is None]
+            if len(missing) == len(pairs):
                 warnings.append(
                     f"no events found for task '{task}' (BIDS or -events). The GLM stage will "
                     "fail for it unless you pass -events; preprocessing (stages 0–10) is unaffected."
                 )
+            elif missing:
+                names = ", ".join(f"run-{r.run or '?'}" for r in missing)
+                warnings.append(
+                    f"task '{task}': events found for some runs but not {names}. The GLM stage "
+                    "will use what was found — check that this is what you want."
+                )
     return errors, warnings
 
 
-def _events_exist(bids_dir: str, task: str, subject) -> bool:
-    """True if a BIDS events TSV exists for the task (per-run sibling or root)."""
-    if (Path(bids_dir) / f"task-{task}_events.tsv").is_file():
-        return True
+def _events_by_run(bids_dir: str, task: str, subject) -> list[tuple[BoldRun, Path | None]]:
+    """(run, its events TSV or None) for every run of a task, in scan order.
+
+    Resolution is ``bids.find_events`` — the same function the emitter writes
+    into the script — so what preflight reports is exactly what the GLM stage
+    gets, and the dataset-root ``task-<T>_events.tsv`` is the last fallback.
+    """
+    root_ev = Path(bids_dir) / f"task-{task}_events.tsv"
+    pairs = []
     for sess in subject.sessions:
         for run in sess.bold_runs:
             if run.task != task:
                 continue
-            sib = run.mag_path.parent / (run.mag_path.name.split("_bold")[0] + "_events.tsv")
-            if sib.is_file():
-                return True
-    return False
+            ev = find_events(run.mag_path, bids_dir)
+            if ev is None and root_ev.is_file():
+                ev = root_ev
+            pairs.append((run, ev))
+    return pairs
 
 
 def _fmt_time(sec: float | None) -> str:
@@ -433,6 +447,25 @@ def _report_fmap_assignment(subject) -> None:
                 f"    fmap-{fg.fmap_id}  t={_fmt_time(fg.acq_time)}  →  [{items}]",
                 file=sys.stderr,
             )
+
+
+def _report_events(args, opt, subject) -> None:
+    """Print the events TSV each task's GLM will read — the same resolution the
+    emitted script gets. Printed because the alternative is finding out at the
+    very end of the pipeline, after every preprocessing stage has run."""
+    if not opt.run_glm:
+        return
+    if opt.events:
+        print("== events (from -events) ==", file=sys.stderr)
+        for ev in opt.events:
+            print(f"  {ev}", file=sys.stderr)
+        return
+    tasks = sorted({r.task for s in subject.sessions for r in s.bold_runs})
+    print("== events → run assignment ==", file=sys.stderr)
+    for task in tasks:
+        for run, ev in _events_by_run(args.bids_dir, task, subject):
+            coord = f"{task}/run-{run.run}" if run.run else task
+            print(f"  {coord:<24} {ev if ev is not None else '(none found)'}", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -518,6 +551,8 @@ def main(argv: list[str] | None = None) -> int:
         opt.final_fmt = args.final_fmt
     if args.glm_fmt is not None:
         opt.glm_fmt = args.glm_fmt
+
+    _report_events(args, opt, subject)
 
     # Hard preflight: refuse to write a script that wouldn't run first try.
     errors, warnings = preflight(args, opt, anat_path, subject)

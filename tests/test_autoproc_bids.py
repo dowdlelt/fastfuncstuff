@@ -7,7 +7,12 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastfuncstuff.autoproc.bids import parse_entities, parse_suffix, scan_subject
+from fastfuncstuff.autoproc.bids import (
+    find_events,
+    parse_entities,
+    parse_suffix,
+    scan_subject,
+)
 
 
 def _touch(p: Path, sidecar: dict | None = None) -> None:
@@ -148,3 +153,43 @@ def test_anat_prefers_uni(tmp_path: Path):
     subj = scan_subject(tmp_path, "ME1")
     assert subj.sessions[0].anat is not None
     assert "acq-uni" in subj.sessions[0].anat.name
+
+
+def test_find_events_ignores_image_only_entities(tmp_path: Path):
+    """The bug of record: a `part-mag_bold.nii.gz` run pairs with an events TSV
+    that carries no `part-` entity at all (part describes the image, not the
+    task). Swapping `_bold`→`_events` looks for a file that BIDS forbids."""
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    bold = func / "sub-ME1_ses-SM_task-floc_run-01_part-mag_bold.nii.gz"
+    _touch(bold, {"RepetitionTime": 2.0})
+    ev = func / "sub-ME1_ses-SM_task-floc_run-01_events.tsv"
+    ev.write_text("onset\tduration\n1\t2\n")
+    assert find_events(bold, tmp_path) == ev
+
+
+def test_find_events_inherits_from_coarser_levels(tmp_path: Path):
+    """Per-run file wins; without it the search widens (drops run, then ses/sub)
+    and walks up to the dataset root."""
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    bold = func / "sub-ME1_ses-SM_task-floc_run-01_part-mag_bold.nii.gz"
+    _touch(bold, {"RepetitionTime": 2.0})
+
+    root_ev = tmp_path / "task-floc_events.tsv"
+    root_ev.write_text("onset\tduration\n1\t2\n")
+    assert find_events(bold, tmp_path) == root_ev
+
+    ses_ev = func / "sub-ME1_ses-SM_task-floc_events.tsv"  # no run entity
+    ses_ev.write_text("onset\tduration\n1\t2\n")
+    assert find_events(bold, tmp_path) == ses_ev
+
+    run_ev = func / "sub-ME1_ses-SM_task-floc_run-01_events.tsv"
+    run_ev.write_text("onset\tduration\n1\t2\n")
+    assert find_events(bold, tmp_path) == run_ev
+
+
+def test_find_events_none_for_a_task_without_them(tmp_path: Path):
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    bold = func / "sub-ME1_ses-SM_task-rest_bold.nii.gz"
+    _touch(bold, {"RepetitionTime": 2.0})
+    (func / "sub-ME1_ses-SM_task-floc_events.tsv").write_text("onset\n1\n")  # other task
+    assert find_events(bold, tmp_path) is None

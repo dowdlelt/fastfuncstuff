@@ -583,3 +583,30 @@ def test_phase_proc_off_emits_no_phase_machinery():
     # unwrap stage, ROMEO, and the phase-side outputs must not be.
     assert "PHASE_FMT" not in s and "romeo" not in s
     assert "stage00.unwrap" not in s and "-phase_prefix" not in s
+
+
+def test_glm_stage_names_real_events_files_and_preflight_checks_them(tmp_path: Path):
+    """End-to-end: a part-mag BIDS layout must produce explicit per-run -events
+    paths (not a glob ffs_reml can't expand) AND get them into the preflight, so
+    a missing TSV fails in the first seconds instead of after every stage."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    func.mkdir(parents=True)
+    for r in ("01", "02"):
+        base = f"sub-ME1_ses-SM_task-floc_run-{r}"
+        (func / f"{base}_part-mag_bold.nii.gz").write_bytes(b"")
+        (func / f"{base}_part-mag_bold.json").write_text(
+            '{"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}'
+        )
+        (func / f"{base}_events.tsv").write_text("onset\tduration\ttrial_type\n1\t10\tface\n")
+
+    subj = scan_subject(tmp_path, "ME1")
+    s = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root=str(tmp_path))
+
+    ev_line = next(ln for ln in s.splitlines() if ln.strip().startswith("-events "))
+    for r in ("01", "02"):
+        ev = str(func / f"sub-ME1_ses-SM_task-floc_run-{r}_events.tsv")
+        assert ev in ev_line
+        assert s.count(ev) == 2  # once in preflight, once in -events
+    assert "**" not in s  # no placeholder glob when the real files exist

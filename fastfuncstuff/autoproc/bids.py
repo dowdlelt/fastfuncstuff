@@ -98,6 +98,61 @@ def load_sidecar(nifti: Path, bids_root: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Events lookup
+# ---------------------------------------------------------------------------
+
+# Entities an ``_events.tsv`` may carry, in BIDS filename order. Everything else
+# on the BOLD name (part, echo, inv, ...) describes the *image*, not the task, so
+# it must be dropped: a `part-mag_bold.nii.gz` run pairs with a `..._events.tsv`
+# that has no `part-` at all. Naively swapping `_bold`→`_events` misses it.
+_EVENTS_ENTITIES = ("sub", "ses", "task", "acq", "ce", "dir", "rec", "run")
+# Order in which entities are dropped to widen the search, finest first. `task`
+# is never dropped — an events file without it belongs to a different task.
+_EVENTS_DROP_ORDER = ("rec", "ce", "dir", "acq", "run", "ses", "sub")
+
+
+def find_events(bold_path: Path, bids_root: Path | str | None = None) -> Path | None:
+    """The events TSV for a BOLD run, following BIDS inheritance.
+
+    Searches the run's own directory first, then each parent up to ``bids_root``
+    (session → subject → dataset root), trying progressively fewer entities so a
+    shared ``task-<T>_events.tsv`` at the root is found after the per-run file.
+    Returns None when the task has no events anywhere (a resting-state run, or a
+    dataset where the timing simply was not shared).
+    """
+    ents = parse_entities(bold_path.name)
+    keys = [k for k in _EVENTS_ENTITIES if k in ents]
+    if "task" not in keys:
+        return None
+
+    stems: list[str] = []
+    for drop in (0, *range(1, len(_EVENTS_DROP_ORDER) + 1)):
+        dropped = set(_EVENTS_DROP_ORDER[:drop])
+        kept = [k for k in keys if k not in dropped]
+        s = "_".join(f"{k}-{ents[k]}" for k in kept)
+        if s not in stems:
+            stems.append(s)
+
+    # Walk up in the *given* form (relative stays relative, matching how the rest
+    # of the scanner records paths); resolve only to test against bids_root.
+    root = Path(bids_root).resolve() if bids_root else None
+    dirs = [bold_path.parent]
+    for d in bold_path.parent.parents:
+        dirs.append(d)
+        if root is not None and d.resolve() == root:
+            break
+        if root is None and len(dirs) > 4:  # func/ → ses → sub → root
+            break
+
+    for directory in dirs:
+        for s in stems:
+            cand = directory / f"{s}_events.tsv"
+            if cand.is_file():
+                return cand
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
 
