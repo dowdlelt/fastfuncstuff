@@ -223,6 +223,22 @@ def test_nonlinear_toggles_add_warps():
     assert ch == ["anat_lin", "blip_half", "wxrun_nl", "wxrun_lin", "locomoco", "moco"]
 
 
+def test_locomoco_consumes_the_moco_timeseries_not_the_mean():
+    """locomoco estimates a warp per volume, so stage02 must write its corrected 4D
+    (-prefix) and stage03 must read that, not the mean. Without locomoco the 4D is
+    not written at all — the only resample is stage10's."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+
+    s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root="/bids")
+    assert '-prefix \\"${mstem}.nii$FMT\\"' in s
+    assert '-input "stage02.moco.${FRAG[$k]}.nii$FMT"' in s
+    # and the mean that goes downstream is locomoco's, not moco's
+    assert "stage03.nlmoco.ses-01.task-foo.run-1_locomoco_mean.nii$FMT" in s
+
+    s2 = write_script(build_plan(subj, Options(locomoco=False)), "wd", bids_root="/bids")
+    assert '-prefix \\"${mstem}.nii$FMT\\"' not in s2
+
+
 def test_grand_reference_chain_and_borrowed_anat():
     """primary→floc: anat matrix borrowed from the ref dir, grandmean aligned to
     the ref (xref), one last segment on current data (anat_nl)."""

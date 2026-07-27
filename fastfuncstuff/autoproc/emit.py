@@ -595,14 +595,20 @@ done
 def _stage_moco(plan: Plan, script_stem: str) -> str:
     moco_flags = " ".join(_split_flags(config.DEFAULT_OPTS["moco"]))
     batchfile = f"{script_stem}_mocobatch.txt"
+    # locomoco estimates residual motion per volume: it needs the rigid-corrected
+    # 4D, not the mean. Only then is it worth writing this intermediate.
+    ts_arg = ' -prefix \\"${mstem}.nii$FMT\\"' if plan.options.locomoco else ""
     return f"""
 # ============================ stage02: motion correction ====================
 # Batched: ONE ffs_moco process motion-corrects every run, so the Python/CUDA/
 # torch.compile startup is paid once, not per run. Each run's arguments are
 # appended to {batchfile} (beside the script's outputs) and consumed with -batch.
 # Reads the source series in place (no full-dataset copy). Saves the target mean
-# + per-volume matrices + motion params; the corrected 4D is produced once by the
-# final single-resample (stage10). skip_moco=1 → -batch_skip (skip complete runs).
+# + per-volume matrices + motion params; the corrected 4D is normally produced
+# once by the final single-resample (stage10) — the exception is locomoco, which
+# estimates residual per-volume PE motion and therefore needs a rigid-corrected
+# 4D of its own (written here with -prefix, wsinc5).
+# skip_moco=1 → -batch_skip (skip complete runs).
 echo '== stage02: moco =='
 MOCO_REF={plan.options.moco_ref}   # sbref | first | last | <int>
 mocobatch="{batchfile}"
@@ -617,7 +623,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     last)  nv=$(3dinfo -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags} -save_mean \\"${{mstem}}_mean.nii$FMT\\" -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
+  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} -save_mean \\"${{mstem}}_mean.nii$FMT\\" -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -629,12 +635,15 @@ def _stage_locomoco(plan: Plan) -> str:
         return ""
     return f"""
 # ============================ stage03: locomoco (residual NL motion) ========
+# Input is stage02's rigid-corrected 4D (written only when this stage runs), NOT
+# the moco mean: locomoco estimates a warp per volume, so it needs the time axis.
+# Its own mean (_locomoco_mean) is what the rest of the chain aligns from.
 echo '== stage03: locomoco =='
 for k in "${{RUN_KEYS[@]}}"; do
   nlstem="stage03.nlmoco.${{FRAG[$k]}}"
   [ "$skip_locomoco" -eq 1 ] && [ -f "${{nlstem}}_warp.nii$FMT" ] && continue
   pe="${{PEDIR[$k]}}"; pe="${{pe//[!a-zA-Z]/}}"
-{_ffs("ffs_locomoco", ['-input "stage02.moco.${FRAG[$k]}_mean.nii$FMT"', '-prefix "${nlstem}.nii$FMT"', '-pe_dir "${pe:-y}"', *_split_flags(config.DEFAULT_OPTS["locomoco"]), "-warp_format 5d", "-save_mean", '-device "$DEVICE"'])}
+{_ffs("ffs_locomoco", ['-input "stage02.moco.${FRAG[$k]}.nii$FMT"', '-prefix "${nlstem}.nii$FMT"', '-pe_dir "${pe:-y}"', *_split_flags(config.DEFAULT_OPTS["locomoco"]), "-warp_format 5d", "-save_mean", '-device "$DEVICE"'])}
 done
 """
 
