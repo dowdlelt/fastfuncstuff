@@ -2148,6 +2148,39 @@ def _spatial_highpass3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
     return vol - _blur3d_b(vol, sigma)
 
 
+MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag")
+
+
+def _match_prep(vol: torch.Tensor, mode: str, sigma: float = 2.0) -> torch.Tensor:
+    """Make brightness constancy approximately true for a cross-contrast ``(B,X,Y,Z)`` pair.
+
+    Same modes and semantics as :func:`fastfuncstuff.processing.optiwarp.prep_intensity`
+    (written for optiwarp's ``(D,H,W)`` convention); this is the batched form locomoco's
+    kernels take. LK's residual ``moving − fixed`` only encodes displacement when both
+    images sit on one intensity scale. Across TE they do not — T2* decay dims the later
+    echo everywhere, and that intensity step is gradient-shaped, so the Gauss-Newton
+    solve reads it as displacement and runs away. Removing a LOCAL mean/scale (or
+    dropping to gradient magnitude) takes the decay out and leaves the geometry.
+    """
+    if mode == "none":
+        return vol
+    if mode == "gradmag":
+        b = _blur3d_b(vol, 1.0)
+        gx, gy, gz = (_grad_axis_3d(b, a) for a in (0, 1, 2))
+        mag = (gx * gx + gy * gy + gz * gz).clamp(min=1e-12).sqrt()
+        return _match_prep(mag, "localnorm", sigma)
+    if mode == "meanstd":
+        dims = (1, 2, 3)
+        mu = vol.mean(dim=dims, keepdim=True)
+        sd = vol.std(dim=dims, keepdim=True).clamp(min=1e-6)
+        return (vol - mu) / sd
+    if mode == "localnorm":
+        mu = _blur3d_b(vol, sigma)
+        var = _blur3d_b(vol * vol, sigma) - mu * mu
+        return (vol - mu) / var.clamp(min=1e-12).sqrt()
+    raise ValueError(f"unknown match mode {mode!r}; choose from {MATCH_MODES}")
+
+
 def _grad_axis_3d(vol: torch.Tensor, axis: int) -> torch.Tensor:
     """Central-difference gradient of ``(B, X, Y, Z)`` along spatial ``axis`` (0/1/2)."""
     dim = axis + 1
@@ -2845,6 +2878,9 @@ def optical_flow_lk_3d_multiecho(
     reg: float = 1e-3,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
+    match: str = "none",
+    match_sigma: float = 2.0,
+    max_disp: float | None = None,
 ) -> torch.Tensor:
     """Shared-field 1-DOF (PE-axis) pyramidal LK across echoes ``(B,X,Y,Z)``.
 
@@ -2854,7 +2890,17 @@ def optical_flow_lk_3d_multiecho(
     equations over echoes: ``step = -Σ_e α_e·⟨∇·r⟩ / (Σ_e α_e²·⟨∇²⟩ + reg)`` under a
     Gaussian window. Reduces to :func:`optical_flow_lk_3d` for a single echo with
     ``alpha=[1]``. Returns the shared PE-axis pull displacement ``w`` ``(B,X,Y,Z)``.
+
+    ``match`` (see :func:`_match_prep`) preprocesses both sides when fixed and moving
+    are NOT the same contrast — mandatory for inter-echo pairs, pointless for the
+    temporal modes where each echo is matched to its own template. ``max_disp`` bounds
+    ``|w|`` after every Gauss-Newton step: LK has no built-in trust region, so a pair
+    whose residual is dominated by contrast rather than geometry otherwise diverges to
+    tens of voxels instead of returning a merely-wrong small number.
     """
+    if match != "none":
+        fixed_list = [_match_prep(f, match, match_sigma) for f in fixed_list]
+        moving_list = [_match_prep(m, match, match_sigma) for m in moving_list]
     e = len(fixed_list)
     fpyr = [[f] for f in fixed_list]
     mpyr = [[m] for m in moving_list]
@@ -2893,6 +2939,8 @@ def optical_flow_lk_3d_multiecho(
                 num = num + a * _blur3d_b(ip * it, window_sigma)
                 den = den + (a * a) * _blur3d_b(ip * ip, window_sigma)
             disp = disp - num / (den + reg)
+            if max_disp is not None:
+                disp = disp.clamp(-max_disp, max_disp)
     return disp
 
 
@@ -3058,6 +3106,10 @@ class MultiEchoLocomocoResult:
     confidence: torch.Tensor | None = None  # (nx,ny,nz,T) searchlight quality map, if xcorr
     corr_curve: torch.Tensor | None = None  # (nx,ny,nz,nd) per-voxel corr vs offset, one frame
     corr_offsets: torch.Tensor | None = None  # (nd,) the trial offsets (voxels) for corr_curve
+    # How alpha is normalised, for the diagnostic header. Only alpha·w is determined, so
+    # the divisor is a display choice — and ÷echo1 is unreadable when echo 1 is the
+    # inter-echo anchor (alpha_1 ≈ 0 blows every other entry up).
+    alpha_label: str = "alpha(÷echo1)"
 
 
 def _rank1_factor_echoes(disps: torch.Tensor, alpha_init: torch.Tensor, n_iter: int = 8):
@@ -3105,6 +3157,7 @@ def estimate_residual_flow_multiecho(
     automask_sigma: float = 3.0,
     learn_scaling: bool = True,
     flat_scaling: bool = False,
+    alpha_override: torch.Tensor | None = None,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
@@ -3195,8 +3248,9 @@ def estimate_residual_flow_multiecho(
 
     refs = [_prep(_select_ref_vol(v, ref_mode, first_n).to(device)) for v in vols]
 
-    # A fixed scaling (TE ratio or flat) skips learning; both still pool all echoes.
-    learn = learn_scaling and not flat_scaling
+    # A fixed scaling (TE ratio, flat, or an explicit law) skips learning; all still pool
+    # every echo into one solve.
+    learn = learn_scaling and not flat_scaling and alpha_override is None
 
     # Single-echo backend estimator — used to LEARN alpha (rank-1 factor of one per-echo
     # pass) and, for xcorr, to solve the shared field itself. Persistent bars (leave=True)
@@ -3311,8 +3365,15 @@ def estimate_residual_flow_multiecho(
 
     # Phase 1: learn alpha, then the initial shared field. When learning, factor ONE
     # per-echo pass; for xcorr reuse that very pass as the initial w (no second sweep).
-    # flat_scaling pins alpha to 1 (TE-independent shift); else the TE ratio.
-    alpha = torch.ones(e) if flat_scaling else te / float(te[0])
+    # flat_scaling pins alpha to 1 (TE-independent shift); else the TE ratio. An explicit
+    # alpha_override supplies a law neither covers — e.g. the inter-echo ladder
+    # alpha ∝ (TE_e − TE_1), which is zero at the anchor echo rather than at TE = 0.
+    if alpha_override is not None:
+        if alpha_override.shape != (e,):
+            raise ValueError(f"alpha_override must be ({e},), got {tuple(alpha_override.shape)}.")
+        alpha = alpha_override.float().clone()
+    else:
+        alpha = torch.ones(e) if flat_scaling else te / float(te[0])
     if learn:
         disp0 = _per_echo_estimate(refs, "init").reshape(e, -1)
         alpha, _ = _rank1_factor_echoes(disp0, alpha)
@@ -3889,6 +3950,8 @@ def estimate_residual_flow_me_interecho(
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     hpf_sigma: float = 0.0,
+    match: str = "localnorm",
+    match_sigma: float = 2.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -3913,6 +3976,13 @@ def estimate_residual_flow_me_interecho(
     that is common to every echo — follow with a temporal pass (the joint / scaled modes)
     if that residual matters. ``w`` is stored at the echo1→echo2 step scale and ``alpha``
     counts steps from echo 1 (``alpha_1 = 0``); ``linearity_r2`` is 1.0 (imposed).
+
+    ``backend="flow"`` registers images of DIFFERENT contrast (echo n vs n−1 differ by a
+    T2* decay factor everywhere), which breaks LK's brightness-constancy assumption, so
+    the pairs are intensity-matched first (``match``, default local z-scoring) and each
+    Gauss-Newton step is clamped so the echo1→echo2 step field stays within ``max_shift``
+    — the same bound the xcorr searchlight obeys. ``match="none"`` restores the raw
+    (divergent) behaviour. ``xcorr`` needs neither: correlation is scale-invariant.
 
     ``automask`` gates out signal-dropout regions: later echoes lose signal where the
     shorter echo still has it, and a searchlight there rails at ``max_shift``. For each
@@ -3963,6 +4033,11 @@ def estimate_residual_flow_me_interecho(
             f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  "
             f"× {e} echoes (inter-echo)"
         )
+        if backend == "flow":
+            print(
+                f"   cross-TE contrast: match={match} (σ={match_sigma:g} vox), "
+                f"GN step clamp |w| ≤ {max_shift:g} vox"
+            )
 
     vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
 
@@ -4016,6 +4091,7 @@ def estimate_residual_flow_me_interecho(
         moving_list = [ims[j + 1][None] for j in range(e - 1)]  # echo n
         if backend == "flow":
             # LK has no per-pair weighting yet; dropout is handled by gating the output.
+            # g is per-ms, so the max_shift bound (an echo1→echo2 step) divides by denom.
             g = optical_flow_lk_3d_multiecho(
                 fixed_list,
                 moving_list,
@@ -4024,6 +4100,9 @@ def estimate_residual_flow_me_interecho(
                 n_levels=n_levels,
                 n_iters=n_iters,
                 window_sigma=window_sigma,
+                match=match,
+                match_sigma=match_sigma,
+                max_disp=max_shift / denom,
             )[0]
         else:
             weights = [pm[None] for pm in pair_masks] if pair_masks is not None else None
@@ -4120,6 +4199,357 @@ def estimate_residual_flow_me_interecho(
         confidence=conf,
         corr_curve=corr_curve,
         corr_offsets=corr_offsets,
+    )
+
+
+def _nonzero_median(mag: torch.Tensor) -> float:
+    """Median of the non-zero entries — a magnitude summary a masked-out field can't dilute."""
+    sel = mag[mag > 0]
+    return float(sel.median()) if sel.numel() else 0.0
+
+
+def _affine_in_te_r2(disps: torch.Tensor, te: torch.Tensor) -> float:
+    """How well ``disp_e(r,t) = A(r,t) + TE_e·B(r,t)`` explains a per-echo warp stack.
+
+    ``disps`` is ``(E, nx, ny, nz, T)``. The TE model every multi-echo mode enforces is
+    a per-echo SCALING of shared fields, so the per-echo warps must lie in a 2-D family
+    spanned by ``1`` and ``TE`` — proportional-to-TE for a temporal solve (echo 1 moves
+    too), proportional-to-(TE − TE_1) for an inter-echo solve (echo 1 is the anchor), and
+    the composition of the two is the general affine case. r² is the variance-weighted
+    fraction explained across the whole field, so it is a genuine model check: 1.0 means
+    the echoes really are one field scaled, well below 1 means something has broken the
+    coupling and the echoes are drifting apart.
+    """
+    e = disps.shape[0]
+    if e < 3:
+        return 1.0  # two echoes always fit a 2-parameter model exactly
+    x = torch.stack([torch.ones_like(te), te], dim=1).double()  # (E, 2)
+    resid_op = torch.eye(e, dtype=torch.float64) - x @ torch.linalg.pinv(x.T @ x) @ x.T
+    centre = torch.eye(e, dtype=torch.float64) - 1.0 / e
+    ss_res = ss_tot = 0.0
+    for t in range(disps.shape[-1]):  # per frame: bounds the temporary to one volume
+        y = disps[..., t].reshape(e, -1).double()
+        ss_res += float((resid_op @ y).pow(2).sum())
+        ss_tot += float((centre @ y).pow(2).sum())
+    return 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else 1.0
+
+
+# Per-echo scaling laws available to the inter-echo refine pass, and the sequence of
+# pooled solves each one runs. The residual left by the inter-echo pass has TWO parts —
+# the anchor leftover TE_1·g (flat: echo 1's own distortion, which inter-echo can never
+# see) and the ladder error (TE_e − TE_1)·δ from an imperfectly estimated g (zero at the
+# anchor, growing with TE). No single per-echo scaling spans both, so the default runs
+# one pooled solve per component: 'step' first (it dominates the late echoes, which carry
+# the largest, best-conditioned signal), then 'flat'. Together they span the full
+# affine-in-TE family the residual actually lives in.
+_REFINE_LAWS: dict[str, tuple[str, ...]] = {
+    "affine": ("step", "flat"),
+    "step": ("step",),
+    "flat": ("flat",),
+    "te": ("te",),
+    "learn": ("learn",),
+}
+_LAW_BLURB = {
+    "step": "ladder error ∝ (TE_e − TE₁)",
+    "flat": "anchor leftover TE₁·g, flat across echoes",
+    "te": "∝ TE_e",
+    "learn": "learned α",
+}
+
+
+def _refine_alpha(law: str, te: torch.Tensor) -> torch.Tensor | None:
+    """Per-echo scaling vector for a refine law; ``None`` for ``learn`` (fitted from data)."""
+    if law == "learn":
+        return None
+    if law == "step":  # the inter-echo ladder: zero at the anchor, growing with TE
+        return (te - float(te[0])) / float(te[1] - te[0])
+    if law == "flat":
+        return torch.ones_like(te)
+    if law == "te":
+        return te / float(te[0])
+    raise ValueError(f"unknown refine law {law!r}")
+
+
+def _orthogonalize_alpha(a: torch.Tensor, used: list[torch.Tensor]) -> torch.Tensor:
+    """Gram-Schmidt a scaling vector against the laws already solved for.
+
+    Sequential solves only add up to the joint one if their per-echo scalings are
+    orthogonal. ``step`` = [0,1,2,3,4] and ``flat`` = [1,1,1,1,1] are far from it
+    (cos ≈ 0.82), so a naive step-then-flat pair lets the first solve absorb part of the
+    second's component and leaves it there: against a purely common-mode residual the
+    step pass takes ``Σα/Σα²`` of it, and echo 1 ends up ~⅓ corrected. Replacing the
+    second law by its component orthogonal to the first makes one round of each EXACT —
+    it spans the same affine family (only the basis changes), so the composed warp is
+    unaffected, but the split between the two solves is no longer biased.
+    """
+    out = a.clone()
+    for p in used:
+        denom = float((p * p).sum())
+        if denom > 1e-12:
+            out = out - float((out * p).sum()) / denom * p
+    scale = float(out.abs().max())
+    return out / scale if scale > 1e-12 else out
+
+
+def refine_interecho_temporally(
+    result: MultiEchoLocomocoResult,
+    datas: list[np.ndarray],
+    echo_times: list[float],
+    pe_axis: int,
+    slice_axis: int,
+    *,
+    refine_rounds: int = 1,
+    ref_mode: str = "mean",
+    backend: str = "flow",
+    smooth_sigma: float = 0.0,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    max_shift: float = 3.0,
+    trial_step: float = 0.5,
+    converge: float = 0.0,
+    converge_rel: float = 0.0,
+    first_n: int | None = None,
+    automask: bool = False,
+    automask_dilate: int = 4,
+    automask_sigma: float = 3.0,
+    scaling: str = "affine",
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    hpf_sigma: float = 0.0,
+    want_corrected: bool = True,
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> MultiEchoLocomocoResult:
+    """Second pass: a temporal joint solve seeded by the inter-echo correction.
+
+    The inter-echo solve is blind exactly where its own masking makes it blind. Every
+    pair is gated by the LATER echo's eroded automask, so at the brain edge — where the
+    late echo has dropped out but the early echoes have not — there is no estimate, and
+    the feathered gate rolls the field to zero. Worse, the surviving edge windows see a
+    later echo that is *dimmer at its rim*, which a displacement search reads as
+    shrinkage. Inside the brain it is the better estimator (two real volumes per
+    estimate, a short ΔTE reach, no template); at the rim it is not.
+
+    So run :func:`estimate_residual_flow_multiecho` on the inter-echo-CORRECTED series.
+    That pass has a temporal template rather than a cross-echo one, needs no dropout
+    mask, and sees the edge voxels the inter-echo pass had to throw away; because the
+    stack is already aligned, what is left for it is echo 1's own (common-mode) wiggle
+    plus the rim the first pass could not reach. Any real edge displacement is now a
+    large error in the EARLY echoes too, which is what makes the temporal pass able to
+    pull it back.
+
+    Nothing is masked to "the voxels the first pass missed" — every solve here is a full
+    joint pass over the whole volume and every echo, with the inter-echo result acting as
+    an INITIALISATION rather than a boundary. A gated-region-only refine would just draw a
+    second seam inside the first one.
+
+    ``scaling`` picks the model for the leftover, which has two components and therefore
+    is not describable by any single per-echo scaling:
+
+    - ``TE_1·g`` — echo 1's own distortion. Inter-echo aligns echoes to each other, never
+      to undistorted anatomy, so this survives on EVERY echo identically (flat). With
+      ``TE_1 = 7.45`` ms against ~13 ms spacing it is over half an inter-echo step.
+    - ``(TE_e − TE_1)·δ`` — the ladder error from estimating ``ĝ`` instead of ``g``. If
+      the true step was 1.5 vox and the pass found 1.0, echo 3 was moved 2.0 instead of
+      3.0 and echo 2 was moved 1.0 instead of 1.5: the shortfall grows with TE and is
+      exactly zero at the anchor. Note it scales as ``TE_e − TE_1``, not ``TE_e``.
+
+    So the default ``"affine"`` runs TWO pooled solves — ``"step"`` (``∝ TE_e − TE_1``)
+    then ``"flat"`` — which together span the affine family the residual lives in. Each
+    is a genuine single solve over the whole stack (one shared-parameter searchlight with
+    every echo trial-shifted by ``alpha_e·s`` at once, or one pooled Gauss-Newton), and
+    each round re-derives its input from the RAW data through the composed warp, so the
+    stack the second solve sees is one interpolation deep, not two.
+
+    Single-law modes ``"step"`` / ``"flat"`` / ``"te"`` run just that component. ``"learn"``
+    fits alpha from the data instead and is the only mode that is NOT one pooled solve:
+    rank-1 factoring needs each echo estimated separately first, then pools in warp space.
+    Use it to data-check which law the leftover actually follows.
+
+    Fields are composed rather than summed — all are pull warps along the same axis, so
+    ``total(x) = new(x) + old(x + new(x))``. The per-echo warps returned are exact; the
+    returned ``alpha`` / ``w_field`` are a rank-1 summary of them (a single ``alpha·w``
+    cannot hold a two-component field), and ``linearity_r2`` is the affine-in-TE model
+    check from :func:`_affine_in_te_r2`.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    e = len(datas)
+    nx, ny, nz, nt = datas[0].shape
+    proto = result.per_echo[0]
+
+    if scaling not in _REFINE_LAWS:
+        raise ValueError(f"refine scaling must be one of {tuple(_REFINE_LAWS)}, got {scaling!r}.")
+    te = result.echo_times
+    laws = _REFINE_LAWS[scaling]
+
+    if verbose:
+        # Name the actual solve, because "joint" means different things per mode: only the
+        # fixed-alpha paths are ONE search over all echoes. Learning alpha costs a per-echo
+        # pass (that is what factors the ratios) and pools in warp space after.
+        how = (
+            "per-echo passes + rank-1 projection (learning alpha)"
+            if "learn" in laws and backend != "flow"
+            else f"{len(laws)} pooled solve(s), each over all echoes at once"
+        )
+        print(
+            f"🔁 inter-echo refine: temporal pass over all {e} echoes on the corrected stack "
+            f"— {how} (ref={ref_mode}, backend={backend}, refine={refine_rounds}, "
+            f"scaling={scaling}: {' then '.join(_LAW_BLURB[law] for law in laws)})"
+        )
+
+    vols = [torch.from_numpy(np.ascontiguousarray(d)).float() for d in datas]
+    # Running state: the exact per-echo warp so far (seeded from the inter-echo pass) and
+    # the series it produces from the RAW data. Re-deriving the series from `vols` each
+    # round keeps the corrected stack one interpolation deep no matter how many laws run.
+    totals = torch.stack([(result.alpha[j] * result.w_field).contiguous() for j in range(e)], 0)
+    cur = [r.corrected_series() for r in result.per_echo]
+
+    def _apply(j: int, disp: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros(nx, ny, nz, nt)
+        for t in range(nt):
+            out[..., t] = _shift3d_axis(
+                vols[j][..., t].to(device)[None],
+                disp[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
+            )[0].cpu()
+        return out
+
+    res_rf = None
+    used_alphas: list[torch.Tensor] = []
+    for law in laws:
+        a_law = _refine_alpha(law, te)
+        if a_law is not None:
+            a_law = _orthogonalize_alpha(a_law, used_alphas)
+            used_alphas.append(a_law)
+            if verbose and len(used_alphas) > 1:
+                print(
+                    f"   {law} law orthogonalized against the previous solve → alpha = "
+                    f"[{', '.join(f'{float(x):.3f}' for x in a_law)}]"
+                )
+        res_rf = estimate_residual_flow_multiecho(
+            [c.numpy() for c in cur],
+            echo_times,
+            pe_axis,
+            slice_axis,
+            ref_mode=ref_mode,
+            backend=backend,
+            smooth_sigma=smooth_sigma,
+            n_levels=n_levels,
+            n_iters=n_iters,
+            window_sigma=window_sigma,
+            max_shift=max_shift,
+            trial_step=trial_step,
+            refine_rounds=refine_rounds,
+            converge=converge,
+            converge_rel=converge_rel,
+            first_n=first_n,
+            automask=automask,
+            automask_dilate=automask_dilate,
+            automask_sigma=automask_sigma,
+            learn_scaling=a_law is None,
+            flat_scaling=False,
+            alpha_override=a_law,
+            noshift_margin=noshift_margin,
+            reg_sigma=reg_sigma,
+            peak_mode=peak_mode,
+            search_min_steps=search_min_steps,
+            want_corrected=False,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
+            hpf_sigma=hpf_sigma,
+            device=device,
+            verbose=verbose,
+        )
+        # Compose this round's field onto the running total: both are pull warps along the
+        # same axis, so total(x) = new(x) + old(x + new(x)) — NOT a sum.
+        for j in range(e):
+            d_new = res_rf.alpha[j] * res_rf.w_field
+            for t in range(nt):
+                nw = d_new[..., t].to(device)[None]
+                old = _shift3d_axis(totals[j, ..., t].to(device)[None], nw, pe_axis)
+                totals[j, ..., t] = (nw + old)[0].cpu()
+            cur[j] = _apply(j, totals[j])
+
+    assert res_rf is not None  # _REFINE_LAWS never maps to an empty sequence
+    per_echo: list[LocomocoResult] = []
+    for j in range(e):
+        corrected = cur[j] if want_corrected else None
+        p_canon = totals[j].permute(proto.perm).contiguous()
+        u_canon = p_canon if proto.pe_flow_is_u else torch.zeros_like(p_canon)
+        v_canon = torch.zeros_like(p_canon) if proto.pe_flow_is_u else p_canon
+        per_echo.append(
+            LocomocoResult(
+                u_canon=u_canon,
+                v_canon=v_canon,
+                corrected_canon=torch.zeros_like(p_canon),
+                perm=proto.perm,
+                pe_flow_is_u=proto.pe_flow_is_u,
+                pe_axis=pe_axis,
+                slice_axis=proto.slice_axis,
+                orig_shape=(nx, ny, nz, nt),
+                a0=proto.a0,
+                a1=proto.a1,
+                dual=False,
+                corrected_nifti=corrected,
+            )
+        )
+
+    te = result.echo_times
+    alpha, w_flat = _rank1_factor_echoes(totals.reshape(e, -1), te / float(te[0]))
+    # Re-normalise onto the LARGEST echo. _rank1_factor_echoes divides by alpha_1, which is
+    # the one echo guaranteed to be near-zero here (the inter-echo anchor barely moves), so
+    # its default scaling reports a readable field as alpha = [1, 17, 33, ...].
+    amax = float(alpha.abs().max())
+    if amax > 1e-12:
+        alpha, w_flat = alpha / amax, w_flat * amax
+    w = w_flat.reshape(nx, ny, nz, nt)
+    # The TE model check for the COMPOSED warp. Each pass is a per-echo scaling of one
+    # shared field, but with different TE anchors — inter-echo ∝ (TE − TE_1) (echo 1 is
+    # the anchor), temporal ∝ TE (echo 1 moves too) — so the sum is affine in TE, not
+    # proportional to it. r² of the affine fit is therefore the invariant to watch: it
+    # says the echoes are still ONE field scaled by echo time. A single alpha·w rank-1
+    # summary cannot represent two components, so its own r² is reported separately and
+    # is expected to sit below 1 whenever both passes contributed.
+    r2 = _affine_in_te_r2(totals, te)
+
+    if verbose:
+        a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
+        for j in range(e):
+            ie_med = _nonzero_median((result.alpha[j] * result.w_field).abs())
+            tot_med = _nonzero_median(totals[j].abs())
+            print(
+                f"   echo {j + 1}: |disp| median {ie_med:.3f} → {tot_med:.3f} vox "
+                f"(max {float(totals[j].abs().max()):.3f})"
+            )
+        rf_law = " ⊕ ".join(_LAW_BLURB[law] for law in laws)
+        print(
+            f"   composed warp is affine-in-TE (inter-echo ∝ TE−TE₁ ⊕ {rf_law}): "
+            f"r²={r2:.5f}  ← 1.0 = the per-echo TE scaling still holds exactly"
+        )
+        print(
+            f"   rank-1 summary alpha (÷largest) = [{a_str}] — the saved alpha/w only; the "
+            "per-echo warps written out are the exact composed fields."
+        )
+
+    return MultiEchoLocomocoResult(
+        per_echo=per_echo,
+        alpha=alpha,
+        echo_times=te,
+        w_field=w,
+        pe_axis=pe_axis,
+        linearity_r2=r2,
+        confidence=res_rf.confidence,
+        corr_curve=res_rf.corr_curve,
+        corr_offsets=res_rf.corr_offsets,
+        alpha_label="alpha(÷largest echo)",
     )
 
 

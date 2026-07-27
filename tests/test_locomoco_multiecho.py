@@ -383,6 +383,195 @@ def test_interecho_aligns_stack_to_anchor():
         assert _spread(corr_list, t) < _spread(datas, t)
 
 
+def _interecho_stack(tes, hs, decay=12.0):
+    """Echo n = base shifted by (n−1)·h_t along PE, dimmed by a STEEP T2* decay.
+
+    A short decay constant is the point: consecutive echoes then differ in brightness by
+    far more than the displacement moves them, which is the regime that breaks LK.
+    """
+    base = _phantom()
+    datas = []
+    for step, te in enumerate(tes):
+        c = float(np.exp(-te / decay))
+        series = np.zeros((*base.shape, len(hs)), np.float32)
+        for t, h in enumerate(hs):
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(step * h), PE)[0].numpy()
+            )
+        datas.append(series)
+    return base, datas
+
+
+def test_interecho_flow_matches_contrast_and_clamps_step():
+    """Cross-TE LK diverges on raw intensities; matching + the step clamp keep it sane."""
+    tes = [10.0, 20.0, 30.0, 40.0]
+    hs = [0.0, 0.5, -0.4, 0.3]
+    base, datas = _interecho_stack(tes, hs)
+    common = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        backend="flow",
+        n_iters=8,
+        max_shift=2.0,
+        automask=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    core = base > np.percentile(base, 40)
+
+    matched = estimate_residual_flow_me_interecho(datas, tes, match="localnorm", **common)
+    raw = estimate_residual_flow_me_interecho(datas, tes, match="none", **common)
+
+    # The clamp is on the echo1→echo2 step field, in voxels — it holds for both.
+    assert float(matched.w_field.abs().max()) <= 2.0 + 1e-5
+    assert float(raw.w_field.abs().max()) <= 2.0 + 1e-5
+    # Matching is what makes the recovered step track the truth; unmatched, the T2* step
+    # dominates the residual and the field is driven by decay, not geometry.
+    err_m = np.array(
+        [abs(float(np.median(matched.w_field.numpy()[core, t])) + hs[t]) for t in (1, 2, 3)]
+    )
+    err_r = np.array(
+        [abs(float(np.median(raw.w_field.numpy()[core, t])) + hs[t]) for t in (1, 2, 3)]
+    )
+    assert err_m.mean() < 0.15, err_m
+    assert err_m.mean() < err_r.mean(), (err_m, err_r)
+
+
+def test_interecho_temporal_refine_recovers_the_echo1_anchor_offset():
+    """The refine pass must recover the leftover the inter-echo anchor leaves behind.
+
+    Echo e truly sits at TE_e·g. Inter-echo removes the DIFFERENCES (TE_e − TE_1)·g, so
+    every echo comes out carrying the same TE_1·g — a FLAT (common to all echoes)
+    residual, which is why the refine defaults to flat scaling. Here the truth is built
+    that way: a per-frame shift common to the whole stack on top of the TE ladder. Only
+    the temporal pass can see it, and the composed result must show it on echo 1 too.
+    """
+    from fastfuncstuff.processing.locomoco import refine_interecho_temporally
+
+    tes = [10.0, 20.0, 30.0]
+    hs = [0.0, 0.5, -0.4, 0.3, -0.5]
+    common_shift = [0.0, 0.4, 0.4, -0.3, -0.3]  # echo-1 wiggle, shared by the whole stack
+    base = _phantom()
+    datas = []
+    for step, te in enumerate(tes):
+        c = float(np.exp(-te / 40.0))
+        series = np.zeros((*base.shape, len(hs)), np.float32)
+        for t, (h, s) in enumerate(zip(hs, common_shift, strict=True)):
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(step * h + s), PE)[0].numpy()
+            )
+        datas.append(series)
+
+    kw = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        backend="xcorr",
+        trial_step=0.1,
+        automask=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    ie = estimate_residual_flow_me_interecho(datas, tes, **kw)
+    refined = refine_interecho_temporally(
+        ie,
+        datas,
+        tes,
+        PE,
+        PE,
+        refine_rounds=1,
+        ref_mode="mean",
+        **{k: v for k, v in kw.items() if k not in ("pe_axis", "slice_axis")},
+    )
+
+    # Inter-echo leaves echo 1 alone by construction; the temporal pass must not.
+    assert float(ie.per_echo[0].pe_displacement().abs().max()) == 0.0
+    core = base > np.percentile(base, 40)
+    d1 = refined.per_echo[0].pe_displacement().numpy()
+    for t in (1, 3):
+        assert abs(float(np.median(d1[core, t])) + common_shift[t]) < 0.2, (
+            t,
+            np.median(d1[core, t]),
+        )
+
+    # Every echo's corrected series is flatter in time than the inter-echo-only result.
+    for j in range(len(tes)):
+        before = float(
+            np.asarray(ie.per_echo[j].corrected_series().numpy())[core].std(axis=-1).mean()
+        )
+        after = float(
+            np.asarray(refined.per_echo[j].corrected_series().numpy())[core].std(axis=-1).mean()
+        )
+        assert after < before, (j, before, after)
+
+    # ...and 'flat' is the right default for it: a TE-proportional model cannot represent
+    # a common-mode leftover and under-corrects the anchor echo it matters most for.
+    te_scaled = refine_interecho_temporally(
+        ie,
+        datas,
+        tes,
+        PE,
+        PE,
+        refine_rounds=1,
+        ref_mode="mean",
+        scaling="te",
+        **{k: v for k, v in kw.items() if k not in ("pe_axis", "slice_axis")},
+    )
+    d1_te = te_scaled.per_echo[0].pe_displacement().numpy()
+    err_flat = np.mean([abs(float(np.median(d1[core, t])) + common_shift[t]) for t in (1, 3)])
+    err_te = np.mean([abs(float(np.median(d1_te[core, t])) + common_shift[t]) for t in (1, 3)])
+    assert err_flat < err_te, (err_flat, err_te)
+
+
+def test_interecho_refine_keeps_the_te_scaling_coupled():
+    """The refine pass must not let the echoes drift into independent per-echo warps.
+
+    Both passes enforce "one shared field, scaled per echo", but with different anchors
+    (inter-echo ∝ TE−TE₁, temporal ∝ TE), so the composed per-echo warps must lie exactly
+    in the 2-D affine-in-TE family — that is the invariant, not proportionality. Also
+    checks the refine pass really is a joint solve over EVERY echo: its own field is a
+    single alpha·w, so the ratio between any two echoes' contributions is constant.
+    """
+    from fastfuncstuff.processing.locomoco import (
+        _affine_in_te_r2,
+        refine_interecho_temporally,
+    )
+
+    tes = [10.0, 22.0, 34.0, 46.0]  # 4 echoes: 2 more than the affine model has parameters
+    hs = [0.0, 0.5, -0.4, 0.3, -0.5]
+    common_shift = [0.0, 0.4, 0.3, -0.3, -0.2]
+    base = _phantom()
+    datas = []
+    for step, te in enumerate(tes):
+        c = float(np.exp(-te / 40.0))
+        series = np.zeros((*base.shape, len(hs)), np.float32)
+        for t, (h, s) in enumerate(zip(hs, common_shift, strict=True)):
+            series[..., t] = (
+                c * _shift3d_axis(torch.from_numpy(base)[None], float(step * h + s), PE)[0].numpy()
+            )
+        datas.append(series)
+
+    kw = dict(backend="xcorr", trial_step=0.1, automask=False, device=torch.device("cpu"))
+    ie = estimate_residual_flow_me_interecho(
+        datas, tes, pe_axis=PE, slice_axis=PE, verbose=False, **kw
+    )
+    refined = refine_interecho_temporally(
+        ie, datas, tes, PE, PE, refine_rounds=1, ref_mode="mean", verbose=False, **kw
+    )
+
+    # The composed per-echo warps are still ONE field scaled by echo time (affine family).
+    totals = torch.stack([r.pe_displacement() for r in refined.per_echo], 0)
+    r2 = _affine_in_te_r2(totals, torch.tensor(tes))
+    assert r2 > 0.999, r2
+    assert abs(refined.linearity_r2 - r2) < 1e-9  # ...and that is what gets reported
+
+    # A per-echo-independent warp stack would NOT satisfy it — guard against the test
+    # passing for a trivial reason (e.g. an all-zero or 2-echo field).
+    scrambled = totals.clone()
+    scrambled[2] = scrambled[2] * 3.0
+    assert _affine_in_te_r2(scrambled, torch.tensor(tes)) < 0.99
+    assert float(totals.abs().max()) > 0.1
+
+
 def test_erode_6conn_peels_one_voxel_shell():
     from fastfuncstuff.processing.mask import _erode_6conn
 

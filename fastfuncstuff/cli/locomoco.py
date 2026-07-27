@@ -318,6 +318,61 @@ def create_parser() -> argparse.ArgumentParser:
         "BEFORE motion correction (unlike the temporal modes, which require moco'd input).",
     )
     me.add_argument(
+        "-me_interecho_refine",
+        "-me_ie_refine",
+        nargs="?",
+        type=int,
+        const=1,
+        default=0,
+        metavar="N",
+        help="After -me_interecho, run a TEMPORAL joint pass on the inter-echo-corrected "
+        "stack (N internal -refine rounds; bare flag = 1). Recovers what the inter-echo pass "
+        "cannot see: its per-pair dropout masks are eroded and gated, so the brain RIM — where "
+        "the late echo has dropped out but the early ones have not — gets no estimate, and a "
+        "dimming rim can even read as shrinkage. The second pass has a temporal template "
+        "instead of a cross-echo one, needs no dropout mask, and any leftover rim shift is now "
+        "a large error in the EARLY echoes, which is what lets it pull the edges back. It also "
+        "removes the leftover TE_1·g that inter-echo leaves on EVERY echo (it only ever "
+        "removed the differences between echoes). ONE combined solve over the whole stack — "
+        "pooled searchlight / pooled LK — per scaling law; see -me_refine_scaling. Uses "
+        "the SAME backend / -window / -max_shift / -xcorr_step as the first pass, plus -ref "
+        "(which the plain inter-echo mode ignores). The two fields are composed (not summed) "
+        "and the output is resampled once from the raw data.",
+    )
+    me.add_argument(
+        "-me_refine_scaling",
+        choices=("affine", "step", "flat", "te", "learn"),
+        default="affine",
+        help="[-me_interecho_refine] Per-echo scaling model for the refine pass. The leftover "
+        "after inter-echo has TWO parts: (a) TE_1·g, echo 1's OWN distortion — inter-echo "
+        "aligns echoes to each other, never to undistorted anatomy, so this survives "
+        "identically on every echo (FLAT); and (b) (TE_e−TE_1)·delta, the ladder error if the "
+        "pass found 1.0 vox where the truth was 1.5 — the shortfall grows with TE and is zero "
+        "at the anchor (STEP). 'affine' (default) runs both as two pooled solves and so spans "
+        "the whole family; 'step' / 'flat' / 'te' run one law only; 'learn' fits alpha from the "
+        "data (the only mode that is NOT a single pooled solve — rank-1 factoring needs each "
+        "echo estimated separately first) and is the way to data-check which law dominates.",
+    )
+    me.add_argument(
+        "-me_match",
+        choices=("none", "meanstd", "localnorm", "gradmag"),
+        default="localnorm",
+        help="[-me_interecho -backend flow] Intensity matching applied to each echo pair before "
+        "the LK solve. Optical flow assumes brightness constancy, which consecutive echoes "
+        "violate by construction (T2* dims the later echo everywhere) — unmatched, the decay "
+        "step is read as displacement and the field diverges. 'localnorm' (default) local "
+        "z-scores both sides; 'gradmag' registers locally-normalized gradient magnitude (edges "
+        "only, the most contrast-agnostic); 'meanstd' is a global rescale; 'none' is the raw "
+        "residual. Inert for -backend xcorr (correlation is already scale-invariant).",
+    )
+    me.add_argument(
+        "-me_match_sigma",
+        type=float,
+        default=2.0,
+        metavar="VOX",
+        help="Neighbourhood sigma (voxels) for -me_match localnorm/gradmag. Default 2.",
+    )
+    me.add_argument(
         "-me_estimate_from",
         "-me_from",
         default=None,
@@ -1161,6 +1216,16 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             file=sys.stderr,
         )
         return 2
+    if args.me_interecho_refine and not args.me_interecho:
+        print(
+            "❌ -me_interecho_refine is the second pass of -me_interecho; add -me_interecho "
+            "(or use -refine for the plain temporal solve).",
+            file=sys.stderr,
+        )
+        return 2
+    if args.me_interecho_refine < 0:
+        print("❌ -me_interecho_refine takes a non-negative round count.", file=sys.stderr)
+        return 2
     # Argument-only -backend qwarp checks: fire BEFORE the (slow) data load, not after.
     if args.backend == "qwarp":
         if args.me_interecho:
@@ -1212,13 +1277,12 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         corr_curve_frame = nt // 2 if args.save_corr_curve == -1 else args.save_corr_curve
 
     automask = not args.no_automask
-    ref_was_set = args.ref is not None  # distinguish an explicit -ref from the default
-    if args.ref is None:
-        args.ref = "mean"
-    if args.me_interecho and ref_was_set:
+    # main() already resolved the default; ref_explicit tells us whether the user chose it.
+    if args.me_interecho and args.ref_explicit and not args.me_interecho_refine:
         print(
             f"   ℹ️  -ref '{args.ref}' is ignored under -me_interecho: there is no temporal "
-            "template — each echo registers to its adjacent lower-TE echo at the same TR."
+            "template — each echo registers to its adjacent lower-TE echo at the same TR. "
+            "(-me_interecho_refine adds a temporal pass, which does use it.)"
         )
     if args.me_fixed_scaling and args.me_flat_scaling:
         print(
@@ -1254,10 +1318,28 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             )
             return 2
 
-    if args.me_interecho and (est_idx is not None or args.me_fixed_scaling or args.me_flat_scaling):
+    # -me_flat_scaling and -me_estimate_from CONTRADICT the inter-echo model (which is
+    # linear-in-TE by construction, and estimates from every adjacent pair). -me_fixed_scaling
+    # does not: it asks for exactly what inter-echo already imposes, so accept it — under
+    # -me_interecho_refine it usefully carries that constraint into the temporal pass too.
+    if args.me_interecho and (est_idx is not None or args.me_flat_scaling):
+        which = "-me_estimate_from" if est_idx is not None else "-me_flat_scaling"
         print(
-            "❌ -me_interecho is its own estimation — don't combine it with -me_estimate_from / "
-            "-me_fixed_scaling / -me_flat_scaling.",
+            f"❌ {which} contradicts -me_interecho: inter-echo pools every adjacent pair under "
+            "a linear-in-TE scaling anchored at echo 1. Drop one.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.me_interecho and args.me_fixed_scaling:
+        note = (
+            "; the refine pass has its own model (-me_refine_scaling, default affine)"
+            if args.me_interecho_refine
+            else " (no-op here)"
+        )
+        print(f"   ℹ️  -me_fixed_scaling is what -me_interecho already imposes{note}.")
+    if args.me_refine_scaling != "affine" and not args.me_interecho_refine:
+        print(
+            "❌ -me_refine_scaling only applies to the -me_interecho_refine pass.",
             file=sys.stderr,
         )
         return 2
@@ -1274,6 +1356,9 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     )
     if args.me_interecho:
         mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
+        if args.me_interecho_refine:
+            mode += f" + temporal refine ×{args.me_interecho_refine}"
+            scaling += f" → refine {args.me_refine_scaling}"
     else:
         mode = f"scaled from echo {est_idx + 1}" if est_idx is not None else "joint solve"
         if args.me_flat_scaling:
@@ -1282,9 +1367,16 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             scaling = "fixed(TE)"
         else:
             scaling = "learned"
-    # ref / refine are temporal-template knobs — inert under inter-echo (no template).
-    ref_note = "ref=n/a" if args.me_interecho else f"ref={args.ref}"
-    refine_note = "refine=n/a" if args.me_interecho else f"refine={args.refine}"
+    # ref / refine are temporal-template knobs — inert under inter-echo unless its
+    # temporal refine pass runs, which is a genuine template-based solve.
+    ie_only = args.me_interecho and not args.me_interecho_refine
+    ref_note = "ref=n/a" if ie_only else f"ref={args.ref}"
+    if ie_only:
+        refine_note = "refine=n/a"
+    elif args.me_interecho:
+        refine_note = f"refine={args.me_interecho_refine} (temporal pass)"
+    else:
+        refine_note = f"refine={args.refine}"
     if qwarp_backend:
         # qwarp owns the whole field and the reference is a plain median of the raw
         # echoes (no flow estimation), so the flow-tuning / ref / refine flags don't apply.
@@ -1352,8 +1444,45 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             hpf_sigma=hpf_sigma,
+            match=args.me_match,
+            match_sigma=args.me_match_sigma,
             device=device,
         )
+        if args.me_interecho_refine:
+            from fastfuncstuff.processing.locomoco import refine_interecho_temporally
+
+            result = refine_interecho_temporally(
+                result,
+                datas,
+                args.echo_times,
+                pe_axis,
+                slice_axis,
+                refine_rounds=args.me_interecho_refine,
+                ref_mode=args.ref,
+                backend=prepass_backend,
+                smooth_sigma=smooth_sigma,
+                n_levels=args.levels,
+                n_iters=args.iters,
+                window_sigma=args.window,
+                max_shift=args.max_shift,
+                trial_step=args.xcorr_step,
+                converge=args.converge,
+                converge_rel=args.converge_rel,
+                first_n=args.first_n,
+                automask=automask,
+                automask_dilate=args.automask_dilate,
+                automask_sigma=args.automask_sigma,
+                scaling=args.me_refine_scaling,
+                noshift_margin=args.noshift_margin,
+                reg_sigma=args.reg_sigma,
+                peak_mode="argmax" if args.argmax else "first_peak",
+                search_min_steps=args.search_min_steps,
+                warp_interp=args.warp_interp,
+                warp_radius=args.warp_radius,
+                hpf_sigma=hpf_sigma,
+                want_corrected=not args.no_corrected,
+                device=device,
+            )
     elif est_idx is not None:
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_scaled
 
@@ -1483,7 +1612,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     with open(alpha_path, "w") as f:
         f.write("# ffs_locomoco multi-echo per-echo scaling (alpha_e · shared field)\n")
         f.write(f"# linear-in-TE r² = {result.linearity_r2:.6f}\n")
-        f.write("# echo_TE_ms   alpha(÷echo1)\n")
+        f.write(f"# echo_TE_ms   {result.alpha_label}\n")
         for te_v, a_v in zip(result.echo_times.tolist(), result.alpha.tolist(), strict=True):
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
     print(f"  • per-echo scaling + linearity: {alpha_path}")
@@ -1514,6 +1643,9 @@ def main(argv: list[str] | None = None) -> int:
     # Rotation-aware mode (both raw + matrices) defaults its reference to the temporal
     # MAX (fills FoV dropout, high-signal anchor); the plain path stays on the mean.
     rotaware = args.raw_input is not None or args.moco_matrix is not None
+    # Stash explicitness BEFORE defaulting: the multi-echo path runs later and can only
+    # tell "the user asked for this reference" from "nobody set one" via this flag.
+    args.ref_explicit = args.ref is not None
     if args.ref is None:
         args.ref = "max" if rotaware else "mean"
 
