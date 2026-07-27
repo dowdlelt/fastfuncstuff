@@ -47,7 +47,14 @@ class Options:
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
     distortion: bool = True  # apply fieldmap distortion correction when fmaps exist
     run_glm: bool = True  # emit the GLM stage enabled (else behind FFS_RUN_GLM)
-    glm_ortvec: bool = False  # add motion + locomoco-PC nuisance regressors to the GLM
+    # Named nuisance sources for the GLM, keys of config.GLM_ORTVEC (e.g.
+    # ["motion", "motion_deriv", "locomoco"]). Empty = no nuisance regressors.
+    glm_ortvec: list[str] = field(default_factory=list)
+    # Extra ffs_reml flags appended to the GLM command, as one string.
+    glm_opts: str = ""
+    # Write the design TOML even if one is already there (an edited spec is
+    # otherwise never clobbered — that is the whole point of generating it).
+    glm_spec_overwrite: bool = False
     locomoco: bool = False
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False

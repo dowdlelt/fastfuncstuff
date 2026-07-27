@@ -458,15 +458,29 @@ def _data_arrays(plan: Plan) -> str:
 def _all_events(plan: Plan, bids_root: str | None) -> list[str]:
     """Every events TSV the GLM stage will read, across tasks. Empty when the GLM
     is off or nothing resolved (the emitted -events is then a TODO placeholder)."""
+    from fastfuncstuff.autoproc.glm import runs_by_task
+
     if not plan.options.run_glm:
         return []
-    tasks: dict[str, list[PlanRun]] = {}
-    for pr in plan.runs:
-        tasks.setdefault(pr.bold.task, []).append(pr)
+    tasks = runs_by_task(plan)
     out: list[str] = []
     for task, prs in tasks.items():
         out.extend(events_for_task(task, prs, bids_root, plan.options))
     return out
+
+
+def _spec_files(plan: Plan, bids_root: str | None) -> list[str]:
+    """Design TOMLs stage12 will read — one per task whose events resolved.
+    Deleting a spec should stop the run at preflight, not at the GLM."""
+    from fastfuncstuff.autoproc.glm import runs_by_task, spec_path
+
+    if not plan.options.run_glm:
+        return []
+    return [
+        spec_path(task)
+        for task, prs in runs_by_task(plan).items()
+        if events_for_task(task, prs, bids_root, plan.options)
+    ]
 
 
 def _preflight(plan: Plan, bids_root: str | None = None) -> str:
@@ -474,10 +488,11 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         {str(pr.bold.mag_path) for pr in plan.runs}
         | {str(pr.bold.phase_path) for pr in plan.runs if pr.bold.phase_path}
         | {str(pr.fmap.reverse_path) for pr in plan.runs if pr.fmap}
-        # The GLM is the last stage; a missing events file should fail here, not
-        # after an hour of preprocessing. Only files we actually resolved are
-        # checked (a task with no events at all warns at generation time).
+        # The GLM is the last stage; a missing events file or design spec should
+        # fail here, not after an hour of preprocessing. Only files we actually
+        # resolved are checked (a task with no events warns at generation time).
         | set(_all_events(plan, bids_root))
+        | set(_spec_files(plan, bids_root))
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # romeo (MRItools) is an external dependency, only needed with -phase_proc.
@@ -1433,58 +1448,78 @@ done
 
 
 def _stage_stats(plan: Plan, bids_root: str | None) -> str:
-    # One GLM per task, over that task's final runs, broadcasting BIDS events.
-    tasks: dict[str, list[PlanRun]] = {}
-    for pr in plan.runs:
-        tasks.setdefault(pr.bold.task, []).append(pr)
+    """One GLM per task.
+
+    The model lives in that task's design TOML (written by ffs_autoproc at
+    generation time, see autoproc/glm.py) and the command is `ffs_reml -spec` —
+    so changing conditions, HRF, nuisance blocks or contrasts is an edit to one
+    annotated file, not a hunt through generated bash. Tasks whose events could
+    not be resolved fall back to the flag form with a TODO, because there is
+    nothing to build a spec from.
+    """
+    from fastfuncstuff.autoproc.glm import nuisance_specs, runs_by_task, spec_path
+
     opt = plan.options
+    tasks = runs_by_task(plan)
     gate = "1" if opt.run_glm else "0"
     out = ["", "# ============================ stage12: GLM (ffs_reml) ======================="]
     out.append(f"# One model per task. Runs when FFS_RUN_GLM=1 (default {gate} for this recipe).")
-    out.append("# Edit -events / -polort as needed.")
     out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
     for task, prs in tasks.items():
         finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         resolved = events_for_task(task, prs, bids_root, opt)
-        events = _events_args(task, prs, bids_root, opt)
-        if not resolved:
-            out.append(
-                f"# TODO task-{task}: no events TSV found when this script was written — the"
-                "\n#      -events value below is a PLACEHOLDER GLOB that ffs_reml will not"
-                "\n#      expand. Replace it with the real file(s), one per run or one shared."
-            )
-        elif len(resolved) not in (1, len(prs)):
-            out.append(
-                f"# NOTE task-{task}: found {len(resolved)} events file(s) for {len(prs)} run(s)"
-                "\n#      — ffs_reml wants one per run or exactly one to broadcast. Check these."
-            )
-        ort_parts = []
-        if opt.glm_ortvec:
-            # motion + locomoco warp-PCs as nuisance; run index inferred from the
-            # .run-NN. token in each filename.
-            ort_parts.append(f"-ortvec_glob 'stage02.moco.*task-{task}*.motion.1D' motion")
-            if opt.locomoco:
-                ort_parts.append(
-                    f"-ortvec_glob 'stage03.nlmoco.*task-{task}*_locomoco_pcs.1D' locomoco"
+        common = [
+            f'-Obuck "stage12.stats-ols.task-{task}.nii$GLM_FMT"',
+            f'-Rbuck "stage12.stats-reml.task-{task}.nii$GLM_FMT"',
+            "-tout",
+            "-fout",
+            "-mask epi_mask.nii$FMT",
+            "-do_scale",
+            *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
+            '-device "$DEVICE"',
+        ]
+        if resolved:
+            spec = spec_path(task)
+            _, skipped = nuisance_specs(task, opt)
+            out.append(f"# task-{task}: model = {spec} (edit that, not this command).")
+            if skipped:
+                out.append(
+                    f"# NOTE -glm_ortvec {' '.join(skipped)} skipped: the stage that writes "
+                    "those regressors is not in this pipeline."
                 )
-        cmd = _ffs(
-            "ffs_reml",
-            [
-                f"-input {finals}",
-                f"-events {events}",
-                *ort_parts,
-                "-polort 3",
-                f'-Obuck "stage12.stats-ols.task-{task}.nii$GLM_FMT"',
-                f'-Rbuck "stage12.stats-reml.task-{task}.nii$GLM_FMT"',
-                "-tout",
-                "-fout",
-                "-mask epi_mask.nii$FMT",
-                "-do_scale",
-                '-device "$DEVICE"',
-            ],
-            indent="",
+            out.append(_ffs("ffs_reml", [f"-input {finals}", f"-spec {spec}", *common], indent=""))
+            continue
+
+        out.append(
+            f"# TODO task-{task}: no events TSV found when this script was written, so no"
+            "\n#      design spec could be built. The -events value below is a PLACEHOLDER"
+            "\n#      GLOB that ffs_reml will not expand — replace it with the real file(s),"
+            "\n#      or write a spec with `ffs_design_spec stub` and swap in -spec."
         )
-        out.append(cmd)
+        ort_parts = []
+        for name, entry in config.GLM_ORTVEC.items():
+            if name not in opt.glm_ortvec:
+                continue
+            req = entry.get("requires")
+            if req and not getattr(opt, req, False):
+                continue
+            label = (
+                name if entry.get("transform", "none") == "none" else f"{name}:{entry['transform']}"
+            )
+            ort_parts.append(f"-ortvec_glob '{entry['pattern'].format(task=task)}' {label}")
+        out.append(
+            _ffs(
+                "ffs_reml",
+                [
+                    f"-input {finals}",
+                    f"-events {_events_args(task, prs, bids_root, opt)}",
+                    *ort_parts,
+                    "-polort 3",
+                    *common,
+                ],
+                indent="",
+            )
+        )
     out.append("fi")
     return "\n".join(out) + "\n"
 

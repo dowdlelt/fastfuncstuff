@@ -585,28 +585,123 @@ def test_phase_proc_off_emits_no_phase_machinery():
     assert "stage00.unwrap" not in s and "-phase_prefix" not in s
 
 
-def test_glm_stage_names_real_events_files_and_preflight_checks_them(tmp_path: Path):
-    """End-to-end: a part-mag BIDS layout must produce explicit per-run -events
-    paths (not a glob ffs_reml can't expand) AND get them into the preflight, so
-    a missing TSV fails in the first seconds instead of after every stage."""
-    from fastfuncstuff.autoproc.bids import scan_subject
+def _bids_with_events(tmp_path: Path, n_tp: int = 12):
+    """Minimal on-disk BIDS: 2 part-mag runs of a task, each with an events TSV."""
+    import nibabel as nib
+    import numpy as np
 
     func = tmp_path / "sub-ME1" / "ses-SM" / "func"
     func.mkdir(parents=True)
     for r in ("01", "02"):
         base = f"sub-ME1_ses-SM_task-floc_run-{r}"
-        (func / f"{base}_part-mag_bold.nii.gz").write_bytes(b"")
+        img = nib.Nifti1Image(np.zeros((2, 2, 2, n_tp), dtype=np.float32), np.eye(4))
+        img.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+        nib.save(img, func / f"{base}_part-mag_bold.nii.gz")
         (func / f"{base}_part-mag_bold.json").write_text(
             '{"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}'
         )
-        (func / f"{base}_events.tsv").write_text("onset\tduration\ttrial_type\n1\t10\tface\n")
+        (func / f"{base}_events.tsv").write_text(
+            "onset\tduration\ttrial_type\n2\t4\tface\n10\t4\tplace\n"
+        )
+    return func
 
+
+def test_glm_stage_is_spec_driven_and_preflight_checks_its_inputs(tmp_path: Path):
+    """The GLM's model is the design TOML, not the command line: stage12 runs
+    `ffs_reml -spec`, and preflight checks BOTH the spec and the events files it
+    names — a missing one should fail in the first seconds, not after an hour of
+    preprocessing."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+
+    func = _bids_with_events(tmp_path)
     subj = scan_subject(tmp_path, "ME1")
-    s = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root=str(tmp_path))
+    plan = build_plan(subj, Options(run_glm=True, glm_ortvec=["motion", "motion_deriv"]))
+    s = write_script(plan, str(tmp_path / "wd"), bids_root=str(tmp_path))
 
-    ev_line = next(ln for ln in s.splitlines() if ln.strip().startswith("-events "))
+    assert "-spec stage11.design.task-floc.toml" in s
+    assert "-events" not in s  # events live in the spec now
+    preflight_block = s.split("MISSING INPUT")[0]
+    assert "stage11.design.task-floc.toml" in preflight_block
     for r in ("01", "02"):
-        ev = str(func / f"sub-ME1_ses-SM_task-floc_run-{r}_events.tsv")
-        assert ev in ev_line
-        assert s.count(ev) == 2  # once in preflight, once in -events
-    assert "**" not in s  # no placeholder glob when the real files exist
+        assert str(func / f"sub-ME1_ses-SM_task-floc_run-{r}_events.tsv") in s
+
+    rows = write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+    assert [(t, st) for t, _, st in rows] == [("floc", "wrote")]
+    spec = (tmp_path / "wd" / "stage11.design.task-floc.toml").read_text()
+    # Nuisance blocks come from the -glm_ortvec registry, deriv included.
+    assert 'label = "motion"' in spec and 'label = "motion_deriv"' in spec
+    assert 'transform = "deriv"' in spec
+    assert "locomoco" not in spec  # not requested, and locomoco is off anyway
+    # Both trial types were scanned out of the events files.
+    assert 'trial_type = "face"' in spec and 'trial_type = "place"' in spec
+
+
+def test_design_spec_describes_the_preprocessed_runs_not_the_raw_ones(tmp_path: Path):
+    """The spec is written before stage10 exists. It must name stage10's outputs
+    while taking TR/length from the raw headers — and honour trimmed noise
+    volumes, which are the one thing that changes run length."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+
+    _bids_with_events(tmp_path, 12)
+    subj = scan_subject(tmp_path, "ME1")
+    plan = build_plan(subj, Options(run_glm=True, noise_vols=2))
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+
+    from fastfuncstuff.design.spec import load_spec
+
+    spec = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert spec.meta.tr == 2.0
+    assert spec.meta.n_timepoints_per_run == [10, 10]  # 12 acquired - 2 noise volumes
+    assert [r.bold for r in spec.meta.runs] == [
+        "stage10.final.ses-SM.task-floc.run-01.nii.gz",
+        "stage10.final.ses-SM.task-floc.run-02.nii.gz",
+    ]
+
+
+def test_existing_design_spec_is_never_clobbered(tmp_path: Path):
+    """Re-running ffs_autoproc is routine; silently discarding an edited model
+    would be the worst bug this tool could have."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+
+    _bids_with_events(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    wd = str(tmp_path / "wd")
+    plan = build_plan(subj, Options(run_glm=True))
+    write_design_specs(plan, str(tmp_path), wd)
+
+    dest = tmp_path / "wd" / "stage11.design.task-floc.toml"
+    dest.write_text(dest.read_text() + "\n# my edit\n")
+
+    rows = write_design_specs(plan, str(tmp_path), wd)
+    assert rows[0][2] == "kept"
+    assert "# my edit" in dest.read_text()
+
+    plan2 = build_plan(subj, Options(run_glm=True, glm_spec_overwrite=True))
+    rows = write_design_specs(plan2, str(tmp_path), wd)
+    assert rows[0][2] == "wrote"
+    assert "# my edit" not in dest.read_text()
+
+
+def test_task_without_events_falls_back_to_flags_with_a_todo(tmp_path: Path):
+    """No events → no spec to build. The script must say so rather than emit a
+    command that looks like it works."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+
+    func = _bids_with_events(tmp_path)
+    for f in func.glob("*_events.tsv"):
+        f.unlink()
+    subj = scan_subject(tmp_path, "ME1")
+    plan = build_plan(subj, Options(run_glm=True, glm_ortvec=["motion", "motion_deriv"]))
+
+    rows = write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+    assert rows[0][2].startswith("skipped")
+    s = write_script(plan, str(tmp_path / "wd"), bids_root=str(tmp_path))
+    assert "TODO task-floc" in s
+    assert "-spec stage11" not in s
+    # The registry still drives the fallback flags, transform modifier and all.
+    assert "-ortvec_glob 'stage02.moco.*task-floc*.motion.1D' motion" in s
+    assert "motion_deriv:deriv" in s

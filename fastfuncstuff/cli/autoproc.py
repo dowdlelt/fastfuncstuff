@@ -19,6 +19,7 @@ from pathlib import Path
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
+from fastfuncstuff.autoproc.glm import write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
 
 
@@ -223,10 +224,32 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-glm_ortvec",
         "-glm-ortvec",
-        action="store_const",
-        const=True,
+        nargs="*",
         default=None,
-        help="add motion + locomoco-PC nuisance regressors to the GLM",
+        metavar="NAME",
+        help="nuisance regressor sources for the GLM, by name ("
+        + " | ".join(config.GLM_ORTVEC)
+        + "). Each becomes one [[nuisance]] block in the design TOML. Pass names "
+        "to select exactly those; pass the flag with no names for the default "
+        "set (" + " ".join(config.DEFAULT_GLM_ORTVEC) + "). A source whose stage "
+        "is not in the pipeline is dropped (with a warning if you named it).",
+    )
+    g.add_argument(
+        "-glm_opts",
+        "-glm-opts",
+        default=None,
+        metavar="STR",
+        help="extra flags appended verbatim to the ffs_reml command "
+        "(e.g. '-jobs 4 -GOFORIT'). The design itself is edited in the TOML, "
+        "not here.",
+    )
+    g.add_argument(
+        "-glm_spec_overwrite",
+        "-glm-spec-overwrite",
+        action="store_true",
+        help="rewrite the design TOML even if it already exists. Default is to "
+        "leave it alone — regenerating the script must never silently discard "
+        "your edits to the model.",
     )
     g.add_argument(
         "-events",
@@ -376,6 +399,16 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 f"-anat_source {opt.anat_source} needs fieldmaps; falling back to grandmean "
                 "(ffs_segment is what recovers the distortion in that case)."
             )
+    # A regressor named explicitly but not produced by this pipeline is a real
+    # mismatch worth saying out loud; the same entry coming from the default set
+    # is dropped silently (config.GLM_ORTVEC[...]["requires"]).
+    for name in args.glm_ortvec or []:
+        req = config.GLM_ORTVEC.get(name, {}).get("requires")
+        if req and not getattr(opt, req, False):
+            warnings.append(
+                f"-glm_ortvec {name} needs -{req}, which is off — that nuisance block is "
+                "dropped from the design."
+            )
     # Events: not a hard error (preprocessing still runs), but warn per task so
     # the user knows the GLM will fail without them.
     if opt.run_glm and not opt.events:
@@ -395,6 +428,28 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                     "will use what was found — check that this is what you want."
                 )
     return errors, warnings
+
+
+def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
+    """Names of the GLM nuisance sources to use.
+
+    ``-glm_ortvec`` with no names means "the default set"; with names it means
+    exactly those. Unset falls back to the recipe. Unknown names are a hard
+    error here rather than an empty glob buried in the script.
+    """
+    if args.glm_ortvec is None:
+        names = list(recipe.get("glm_ortvec", []))
+    elif args.glm_ortvec == []:
+        names = list(config.DEFAULT_GLM_ORTVEC)
+    else:
+        names = list(args.glm_ortvec)
+    unknown = [n for n in names if n not in config.GLM_ORTVEC]
+    if unknown:
+        raise SystemExit(
+            f"ffs_autoproc: unknown -glm_ortvec name(s): {', '.join(unknown)}\n"
+            f"  known: {', '.join(config.GLM_ORTVEC)}"
+        )
+    return names
 
 
 def _events_by_run(bids_dir: str, task: str, subject) -> list[tuple[BoldRun, Path | None]]:
@@ -517,7 +572,9 @@ def main(argv: list[str] | None = None) -> int:
         slicetiming_method=args.slicetiming_method or rget("slicetiming_method", "integrate"),
         distortion=(False if args.no_distortion else rget("distortion", True)),
         run_glm=(False if args.no_glm else rget("run_glm", True)),
-        glm_ortvec=eff(args.glm_ortvec, "glm_ortvec"),
+        glm_ortvec=_resolve_glm_ortvec(args, recipe),
+        glm_opts=args.glm_opts or "",
+        glm_spec_overwrite=args.glm_spec_overwrite,
         locomoco=eff(args.locomoco, "locomoco"),
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
@@ -576,9 +633,19 @@ def main(argv: list[str] | None = None) -> int:
     out_path.write_text(script)
     out_path.chmod(0o755)
 
+    # The GLM's model is a file, not a command line: write it beside the script's
+    # outputs so it can be reviewed (and edited) before anything runs.
+    spec_rows = write_design_specs(plan, args.bids_dir, work_dir)
+
     tag = f" [{args.recipe}]" if args.recipe else ""
     print(f"wrote {out_path}{tag}  ({len(plan.runs)} run(s), ref session {plan.ref_session})")
     print(f"  working dir baked in: {work_dir}")
+    for task, path, status in spec_rows:
+        note = {
+            "wrote": "design spec written — EDIT IT (contrasts, HRF) before the GLM stage",
+            "kept": "design spec already exists, left untouched (-glm_spec_overwrite to replace)",
+        }.get(status, status)
+        print(f"  task-{task}: {Path(path).name}  [{note}]")
     print("  read it, edit it, then run it.")
     return 0
 

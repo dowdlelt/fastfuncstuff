@@ -52,6 +52,9 @@ STAGE_NUMBERS: dict[str, int] = {
     "nlanat": 9,
     "final": 10,
     "scale": 11,
+    # The GLM's design TOML. Written at generation time, but numbered for where
+    # it is consumed: immediately before stats, which reads it via -spec.
+    "design": 11,
     "stats": 12,
 }
 

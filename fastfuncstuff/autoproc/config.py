@@ -63,6 +63,43 @@ DEFAULT_FINAL_INTERP = "wsinc5"
 
 
 # ---------------------------------------------------------------------------
+# GLM nuisance regressors, by name. `-glm_ortvec motion motion_deriv locomoco`
+# selects from here; each entry becomes one [[nuisance]] block in the design
+# TOML. Adding a source (CSF PCs, physio, censor-derived spikes) is one entry
+# plus whatever stage writes the .1D — nothing in the emitter changes.
+#
+#   pattern    glob over per-run .1D files, {task} substituted. The run index is
+#              inferred from the filename (see cli_utils._RUN_INDEX_PATTERNS).
+#   transform  per-run transform applied before the block enters the design
+#              (see cli_utils.NUISANCE_TRANSFORMS); "deriv" = 1d_tool.py's.
+#   requires   an Options field that must be truthy, else the entry is skipped
+#              with a warning (asking for locomoco PCs without locomoco).
+# ---------------------------------------------------------------------------
+GLM_ORTVEC: dict[str, dict[str, str]] = {
+    "motion": {
+        "pattern": "stage02.moco.*task-{task}*.motion.1D",
+        "transform": "none",
+        "note": "6 rigid-body parameters from ffs_moco, per run",
+    },
+    "motion_deriv": {
+        "pattern": "stage02.moco.*task-{task}*.motion.1D",
+        "transform": "deriv",
+        "note": "temporal derivative of the same file (1d_tool.py -derivative)",
+    },
+    "locomoco": {
+        "pattern": "stage03.nlmoco.*task-{task}*_locomoco_pcs.1D",
+        "transform": "none",
+        "requires": "locomoco",
+        "note": "top-N temporal PCs of the residual nonlinear motion warp",
+    },
+}
+# What a bare `-glm_ortvec` (or a recipe asking for nuisance) selects. Entries
+# whose `requires` is unmet are dropped silently here — this is the default set,
+# not an explicit request.
+DEFAULT_GLM_ORTVEC = ("motion", "motion_deriv", "locomoco")
+
+
+# ---------------------------------------------------------------------------
 # Recipes: named bundles of defaults so users hit the ground running. Each maps
 # to a dict of Options-field overrides; explicit CLI flags still win over these.
 # A recipe only sets the *baseline* — future versions may tune more params.
@@ -99,7 +136,8 @@ RECIPES: dict[str, dict] = {
         "anat_nonlin": True,
         "run_glm": True,
     },
-    # everything + locomoco (residual NL motion) with its PCs as GLM nuisance.
+    # everything + locomoco (residual NL motion); its warp-PCs join motion and
+    # motion-derivative as GLM nuisance (see GLM_ORTVEC).
     "extreme": {
         "go_to_anat": True,
         "distortion": True,
@@ -107,7 +145,7 @@ RECIPES: dict[str, dict] = {
         "xrun_nonlin": True,
         "anat_nonlin": True,
         "locomoco": True,
-        "glm_ortvec": True,
+        "glm_ortvec": list(DEFAULT_GLM_ORTVEC),
         "run_glm": True,
     },
 }
@@ -121,7 +159,8 @@ RECIPE_SUMMARY: dict[str, str] = {
     "simple_linear": "alias of simple.",
     "simple_nonlin": "= simple, plus nonlinear cross-run refinement.",
     "complete": "= simple_nonlin, plus NONLINEAR anat (ffs_segment; needs -anat/-suma and a TPM, or -suma).",
-    "extreme": "= complete, plus locomoco (residual NL motion) with its warp-PCs as GLM nuisance.",
+    "extreme": "= complete, plus locomoco (residual NL motion); GLM nuisance = motion + "
+    "motion deriv + locomoco warp-PCs.",
 }
 
 
