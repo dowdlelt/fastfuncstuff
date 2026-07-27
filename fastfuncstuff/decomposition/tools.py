@@ -1997,6 +1997,7 @@ def batch_mixture_zscores(
     components_kv: torch.Tensor,
     device: torch.device | None = None,
     verbose: bool = False,
+    n_iter: int = 200,
 ) -> tuple[torch.Tensor, torch.Tensor, list[dict]]:
     """Batched GGM z-scores for all components on GPU.
 
@@ -2045,7 +2046,7 @@ def batch_mixture_zscores(
         disable=n_batches <= 1,
     ):
         k1 = min(k0 + k_chunk, K)
-        result = batch_fit_ggm(components_kv[k0:k1], verbose=(verbose and k0 == 0))
+        result = batch_fit_ggm(components_kv[k0:k1], n_iter=n_iter, verbose=(verbose and k0 == 0))
 
         z_parts.append(result["z_signed"].cpu())
         p_parts.append(result["p_signal"].cpu())
