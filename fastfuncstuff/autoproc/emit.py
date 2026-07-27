@@ -21,7 +21,13 @@ from pathlib import Path
 
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS, NameKey, coord, stem
-from fastfuncstuff.autoproc.plan import Plan, PlanRun
+from fastfuncstuff.autoproc.plan import (
+    Plan,
+    PlanRun,
+    anchor_fmap_ids,
+    effective_anat_source,
+    ref_anchor,
+)
 
 _TOOLS = [
     "ffs_nordic",
@@ -150,7 +156,7 @@ def _anat_lin_files(opt) -> list[str]:
 
 
 # The fmap-level tokens: run-native → reference-fmap undistorted space. Applied
-# on their own to a run's moco-mean they build its "premean" (see grandmean).
+# on their own to a run's moco-mean they build its "runmean" (see stage07).
 _FMAP_TOKENS = ("xfmap_nl", "xfmap_lin", "blip_half", "wxrun_nl", "wxrun_lin")
 
 
@@ -196,7 +202,7 @@ def chain_files(pr: PlanRun, fmt: str, opt=None) -> list[str]:
 
 def _fmap_subchain(pr: PlanRun, fmt: str) -> list[str]:
     """Just the fmap-level tokens of a run's chain (xfmap∘blip∘wxrun) — applied to
-    the moco-mean to land it on the reference-fmap grid (the premean)."""
+    the moco-mean to land it on the reference-fmap grid (the runmean)."""
     out: list[str] = []
     for tok in pr.warp_chain:
         if tok in _FMAP_TOKENS:
@@ -205,14 +211,97 @@ def _fmap_subchain(pr: PlanRun, fmt: str) -> list[str]:
 
 
 def _ref_blip_mean(pr: PlanRun) -> str:
-    """The reference fmap group's undistorted mean — the common grid the premeans
+    """The reference fmap group's undistorted mean — the common grid the runmeans
     (and cross-fmap alignment) land on."""
     return stem(NameKey("blip", session=pr.bold.session, fmap=pr.ref_fmap_id)) + "_mean.nii$FMT"
 
 
-def _premean(pr: PlanRun) -> str:
-    """This run's mean resampled onto the reference-fmap grid (grandmean input)."""
-    return _run_stem(pr, "premean") + ".nii$FMT"
+def _runmean(pr: PlanRun) -> str:
+    """This run's mean resampled onto the reference-fmap grid (sesmean input)."""
+    return _run_stem(pr, "runmean") + ".nii$FMT"
+
+
+def _sesmean(session: str | None) -> str:
+    """One session's mean: the average of its aligned run means, in that session's
+    own space (the xses source for non-reference sessions)."""
+    return stem(NameKey("sesmean", session=session)) + ".nii$FMT"
+
+
+def _grandmean() -> str:
+    """THE grandmean: every run of every session, after cross-session alignment.
+    Built in stage08 (not 07) because it cannot exist until xses has put the
+    sessions in a single space."""
+    return stem(NameKey("grandmean")) + ".nii$FMT"
+
+
+def _ref_marker(key: NameKey, source: str, note: str) -> str:
+    """A QC-only copy of the image that *is* a level's reference, named like the
+    level's other outputs plus ``role-ref``. Alignment stages skip their reference
+    (it maps to itself), which otherwise leaves a browsable gap — N-1 files where
+    the reader expects N. Has no ``_nl`` counterpart, by definition."""
+    dst = stem(key) + ".nii$FMT"
+    return f'# {note}\n[ -f "{dst}" ] || cp -f "{source}" "{dst}"'
+
+
+def _fmapmean(plan: Plan) -> str:
+    """The ``mean_fmap`` image: mean of the anchor session's fmap means."""
+    anchor = ref_anchor(plan)
+    ses = anchor.bold.session if anchor else None
+    return stem(NameKey("fmapmean", session=ses)) + ".nii$FMT"
+
+
+def _fmapmean_inputs(plan: Plan) -> list[str]:
+    """The per-group means averaged into ``mean_fmap``, all already on the
+    reference-fmap grid: the reference group's own blip mean, plus each non-ref
+    group's xfmap-aligned mean (nonlinear result when ``-xfmap_nonlin`` ran)."""
+    anchor = ref_anchor(plan)
+    if anchor is None:
+        return []
+    ses = anchor.bold.session
+    ref_id = anchor.fmap.fmap_id if anchor.fmap else None
+    nl = plan.options.xfmap_nonlin
+    files = []
+    for fid in anchor_fmap_ids(plan):
+        if fid == ref_id:
+            files.append(stem(NameKey("blip", session=ses, fmap=fid)) + "_mean.nii$FMT")
+        else:
+            st = stem(NameKey("xfmap", session=ses, fmap=fid))
+            files.append(f"{st}_nl.nii$FMT" if nl else f"{st}.nii$FMT")
+    return files
+
+
+def _needs_fmapmean(plan: Plan) -> bool:
+    """True when anything asks for the ``mean_fmap`` image — the anat linear step
+    or (independently) ffs_segment's input — so stage05 knows to build it."""
+    opt = plan.options
+    if not opt.go_to_anat:
+        return False  # no anat step, nothing consumes it
+    requests = [opt.anat_source]
+    if opt.anat_nonlin:
+        requests.append(opt.anat_nonlin_input)
+    return any(effective_anat_source(plan, r) == "mean_fmap" for r in requests)
+
+
+def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
+    """The EPI-contrast image the anat step aligns (or ffs_segment consumes).
+
+    All three choices sit on the reference-fmap grid, so the warp chain is
+    identical whichever is picked — only the image content differs:
+      grandmean  every run's mean averaged; best SNR, N interpolations deep, and
+                 the only option without fieldmaps.
+      ref_fmap   the reference group's undistorted blip mean; one interpolation,
+                 sharpest, SBRef contrast — the image that *defines* the space.
+      mean_fmap  ref_fmap averaged with the other groups' xfmap-aligned means;
+                 ref_fmap's provenance with more SNR (multi-fieldmap only).
+    """
+    mode = effective_anat_source(plan, requested)
+    if mode == "ref_fmap":
+        anchor = ref_anchor(plan)
+        if anchor is not None:
+            return _ref_blip_mean(anchor)
+    elif mode == "mean_fmap":
+        return _fmapmean(plan)
+    return _grandmean()
 
 
 # ---------------------------------------------------------------------------
@@ -246,14 +335,14 @@ def _xrun_base(pr: PlanRun, session_first: PlanRun) -> str | None:
 
 
 def _aligned_mean(pr: PlanRun) -> str:
-    """The run's mean in the session's common grandmean space.
+    """The run's mean in the session's common (sesmean) space.
 
-    With fieldmaps: the premean (moco-mean pushed through xfmap∘blip∘wxrun onto
+    With fieldmaps: the runmean (moco-mean pushed through xfmap∘blip∘wxrun onto
     the reference-fmap grid). No fieldmap: the xrun-aligned mean (nonlinear result
     if xrun_nonlin ran, else linear), or the moco mean for the anchor run.
     """
     if pr.fmap is not None:
-        return _premean(pr)
+        return _runmean(pr)
     if "wxrun_nl" in pr.warp_chain:
         return _run_stem(pr, "xrun") + "_nl.nii$FMT"
     if "wxrun_lin" in pr.warp_chain:
@@ -357,7 +446,7 @@ def _data_arrays(plan: Plan) -> str:
             lines.append(f'XRUNBASE[{q(k)}]="{base}"')
         lines.append(f'ALIGNED[{q(k)}]="{_aligned_mean(pr)}"')
         if pr.fmap is not None:
-            # premean sub-chain (moco-mean → reference-fmap grid) + that grid.
+            # runmean sub-chain (moco-mean → reference-fmap grid) + that grid.
             lines.append(f'PRECHAIN[{q(k)}]="{" ".join(_fmap_subchain(pr, ".nii$FMT"))}"')
             lines.append(f'REFBLIP[{q(k)}]="{_ref_blip_mean(pr)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
@@ -583,18 +672,30 @@ def _stage_blip(plan: Plan) -> str:
 def _stage_xfmap(plan: Plan) -> str:
     """Align each NON-reference fmap group's undistorted mean to the session's
     reference fmap mean (once per group). This is what lets runs acquired under
-    different fieldmaps share one session space; the per-run premean composes it
-    with blip+xrun (see grandmean)."""
+    different fieldmaps share one session space; the per-run runmean composes it
+    with blip+xrun (see stage07)."""
     opt = plan.options
     groups: dict[tuple, PlanRun] = {}
     for pr in plan.runs:
         if pr.fmap is None or "xfmap_lin" not in pr.warp_chain:
             continue  # reference fmap (or no fmap) → no cross-fmap alignment
         groups.setdefault((pr.bold.session, pr.fmap.fmap_id), pr)
-    if not groups:
+    want_fmapmean = _needs_fmapmean(plan)
+    if not groups and not want_fmapmean:
         return ""
     out = ["", "# ============================ stage05: cross-fmap alignment ================="]
     out.append("echo '== stage05: cross-fmap alignment (→ reference fmap) =='")
+    # The reference fmap group has no xfmap transform (it maps to itself) — emit its
+    # undistorted mean under the xfmap name so every group shows up in one listing.
+    anchor = ref_anchor(plan)
+    if anchor is not None and anchor.fmap is not None:
+        out.append(
+            _ref_marker(
+                NameKey("xfmap", session=anchor.bold.session, fmap=anchor.fmap.fmap_id, role="ref"),
+                _ref_blip_mean(anchor),
+                f"QC: fmap-{anchor.fmap.fmap_id} is the reference group — no transform.",
+            )
+        )
     for pr in groups.values():
         xstem = _fmap_stem(pr, "xfmap")
         src = _fmap_stem(pr, "blip") + "_mean.nii$FMT"  # this fmap, undistorted
@@ -626,6 +727,20 @@ def _stage_xfmap(plan: Plan) -> str:
                 )
             )
         out.append("fi")
+    if want_fmapmean:
+        # -anat_source mean_fmap: every group's mean is now on the reference-fmap
+        # grid, so averaging them is a straight voxelwise mean (more SNR than any
+        # single group, without the grandmean's extra interpolation).
+        fm = _fmapmean(plan)
+        inputs = " ".join(f'"{f}"' for f in _fmapmean_inputs(plan))
+        out.append("echo '== stage05: mean of fieldmap means (-anat_source mean_fmap) =='")
+        out.append(
+            f'[ -f "{fm}" ] || \\\n'
+            + _ffs(
+                "ffs_util_3dmath",
+                [f"-input {inputs}", "-mean", f'-prefix "{fm}"', '-device "$DEVICE"'],
+            )
+        )
     return "\n".join(out) + "\n"
 
 
@@ -660,12 +775,30 @@ def _stage_xrun(plan: Plan) -> str:
         ],
         indent="    ",
     )
+    # No-fmap mode: the session's first run IS the anchor, so it gets no xrun output.
+    # Emit its moco mean under the xrun name so the listing covers every run.
+    markers = [
+        _ref_marker(
+            NameKey(
+                "xrun",
+                session=pr.bold.session,
+                task=pr.bold.task,
+                run=pr.bold.run or None,
+                role="ref",
+            ),
+            _moco_mean(pr),
+            f"QC: {_frag(pr)} is the cross-run anchor — no transform.",
+        )
+        for pr in plan.runs
+        if "wxrun_lin" not in pr.warp_chain
+    ]
+    marker_block = ("\n".join(markers) + "\n") if markers else ""
     return f"""
 # ============================ stage06: cross-run alignment ==================
 # Align each run's mean to its anchor (fmap group mean, or the session's first
 # run when there are no fmaps). Saves a matrix that composes into the chain.
 echo '== stage06: cross-run alignment =='
-for k in "${{RUN_KEYS[@]}}"; do
+{marker_block}for k in "${{RUN_KEYS[@]}}"; do
   base="${{XRUNBASE[$k]:-}}"
   [ -z "$base" ] && continue   # this run is the anchor (identity) — no xrun
   xstem="stage06.xrun.${{FRAG[$k]}}"
@@ -677,75 +810,76 @@ for k in "${{RUN_KEYS[@]}}"; do
 
 
 def _stage_grandmean(plan: Plan) -> str:
-    # Per-session grandmeans (mean of that session's xrun-aligned run means). The
-    # OVERALL grandmean is NOT built here for multi-session data — the session
-    # grandmeans are still in their own session spaces; it is built in stage08
-    # after cross-session alignment. Single-session: the overall == the session's.
+    """stage07: the two *within*-session mean levels — runmean then sesmean.
+
+    THE grandmean is not built here. Session means still sit in their own session
+    spaces at this point, so averaging them would be meaningless; stage08 builds it
+    once xses has brought them into one space. That is why ``grandmean`` carries
+    stage number 8 — one producer, one stage, single- and multi-session alike.
+    """
     by_ses: dict[str | None, list[PlanRun]] = {}
     for pr in plan.runs:
         by_ses.setdefault(pr.bold.session, []).append(pr)
-    out = ["", "# ============================ stage07: grandmeans ==========================="]
-    # Fieldmap runs first get a "premean": their moco-mean pushed through
+    out = ["", "# ============================ stage07: run + session means =================="]
+    # Fieldmap runs first get a "runmean": their moco-mean pushed through
     # xfmap∘blip∘xrun onto the reference-fmap grid, so runs from different fmap
     # groups average in one common space. (No-fmap runs skip this — PRECHAIN unset.)
     if any(pr.fmap is not None for pr in plan.runs):
         nwarp_opts = config.DEFAULT_OPTS["nwarp"]
-        premean_cmd = _ffs(
+        runmean_cmd = _ffs(
             "ffs_nwarp",
             [
                 '-source "${MOCOMEAN[$k]}"',
                 '-nwarp "${PRECHAIN[$k]}"',
                 '-master "${REFBLIP[$k]}"',
                 *_split_flags(nwarp_opts),
-                '-prefix "stage07.premean.${FRAG[$k]}.nii$FMT"',
+                '-prefix "stage07.runmean.${FRAG[$k]}.nii$FMT"',
                 '-device "$DEVICE"',
             ],
         )
-        out.append("echo '== stage07: premeans (→ reference-fmap grid) =='")
+        out.append("echo '== stage07: run means (→ reference-fmap grid) =='")
         out.append(
             'for k in "${RUN_KEYS[@]}"; do\n'
-            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # no-fmap run, no premean\n'
-            '  pm="stage07.premean.${FRAG[$k]}.nii$FMT"\n'
+            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # no-fmap run, no runmean\n'
+            '  pm="stage07.runmean.${FRAG[$k]}.nii$FMT"\n'
             '  [ -f "$pm" ] && continue\n'
-            f"{premean_cmd}\n"
+            f"{runmean_cmd}\n"
             "done"
         )
-    out.append("echo '== stage07: per-session grandmeans =='")
-    ses_means = []
+    out.append("echo '== stage07: session means =='")
     for ses, prs in by_ses.items():
         aligned = " ".join(f'"{_aligned_mean(pr)}"' for pr in prs)
-        tag = f".ses-{ses}" if ses else ""
-        gm = f"stage07.grandmean{tag}.nii$FMT"
-        ses_means.append(gm)
         out.append(
             _ffs(
                 "ffs_util_3dmath",
                 [
                     f"-input {aligned}",
                     "-mean",
-                    f'-prefix "{gm}"',
+                    f'-prefix "{_sesmean(ses)}"',
                     "-overwrite",
                     '-device "$DEVICE"',
                 ],
                 indent="",
             )
         )
-    if not plan.multi_session and ses_means:
-        # Single session: its grandmean IS the overall grandmean.
-        out.append(f'cp -f "{ses_means[0]}" "stage07.grandmean.nii$FMT"')
     return "\n".join(out) + "\n"
 
 
 def _xses_aligned(session: str, nonlin: bool) -> str:
-    """The cross-session-aligned grandmean for a non-ref session (nl if the
+    """The cross-session-aligned session mean for a non-ref session (nl if the
     nonlinear step ran, else the linear result)."""
-    stem = f"stage08.xses.ses-{session}"
-    return f"{stem}_nl.nii$FMT" if nonlin else f"{stem}.nii$FMT"
+    stem_ = stem(NameKey("xses", session=session))
+    return f"{stem_}_nl.nii$FMT" if nonlin else f"{stem_}.nii$FMT"
 
 
 def _stage_xses(plan: Plan) -> str:
-    if not plan.multi_session:
-        return ""
+    """stage08: bring every session into the reference session's space, then build
+    THE grandmean from the result.
+
+    Always emitted, including single-session — the grandmean has exactly one
+    producer that way, and it is always the post-alignment one. With one session
+    the alignment loop is empty and the grandmean is just that session's mean.
+    """
     opt = plan.options
     sessions = []
     seen = set()
@@ -755,15 +889,26 @@ def _stage_xses(plan: Plan) -> str:
             seen.add(s)
             sessions.append(s)
     ref = plan.ref_session
-    out = ["", "# ============================ stage08: cross-session alignment =============="]
-    out.append("echo '== stage08: cross-session alignment =='")
-    out.append(f'REFGM="stage07.grandmean.ses-{ref}.nii$FMT"')
-    aligned_means = [f"stage07.grandmean.ses-{ref}.nii$FMT"]  # ref session is already in place
+    out = ["", "# ============================ stage08: cross-session align + grandmean ======"]
+    if plan.multi_session:
+        out.append("echo '== stage08: cross-session alignment =='")
+    out.append(f'REFGM="{_sesmean(ref)}"')
+    aligned_means = [_sesmean(ref)]  # ref session is already in place
+    if plan.multi_session:
+        # The reference session has no xses transform (it maps to itself) — emit its
+        # mean under the xses name so `ls stage08.xses.*` shows every session.
+        out.append(
+            _ref_marker(
+                NameKey("xses", session=ref, role="ref"),
+                _sesmean(ref),
+                f"QC: ses-{ref} is the reference session — no transform, shown for completeness.",
+            )
+        )
     for s in sessions:
         if s == ref:
             continue
-        xstem = f"stage08.xses.ses-{s}"
-        src = f"stage07.grandmean.ses-{s}.nii$FMT"
+        xstem = stem(NameKey("xses", session=s))
+        src = _sesmean(s)
         lin = _ffs(
             "ffs_allineate",
             [
@@ -794,10 +939,10 @@ def _stage_xses(plan: Plan) -> str:
         out.append("fi")
         aligned_means.append(_xses_aligned(s, opt.xses_nonlin))
 
-    # Overall grandmean = mean of the ref grandmean + the cross-session-aligned
-    # non-ref grandmeans (all now in reference-session space). This is the target
-    # the anat alignment (stage09) uses.
-    out.append("echo '== stage08: overall grandmean (post-alignment) =='")
+    # THE grandmean = mean of the reference session's mean + every cross-session-
+    # aligned non-ref session mean (all now in reference-session space). This is the
+    # default target the anat alignment (stage09) uses.
+    out.append("echo '== stage08: grandmean (all sessions, post-alignment) =='")
     allm = " ".join(f'"{m}"' for m in aligned_means)
     out.append(
         _ffs(
@@ -805,7 +950,7 @@ def _stage_xses(plan: Plan) -> str:
             [
                 f"-input {allm}",
                 "-mean",
-                '-prefix "stage07.grandmean.nii$FMT"',
+                '-prefix "stage08.grandmean.nii$FMT"',
                 "-overwrite",
                 '-device "$DEVICE"',
             ],
@@ -831,7 +976,7 @@ def _ref_target(opt) -> str | None:
     if opt.ref_file is not None:
         return opt.ref_file
     if opt.grand_reference is not None:
-        return f"{opt.grand_reference.rstrip('/')}/stage07.grandmean.nii$FMT"
+        return f"{opt.grand_reference.rstrip('/')}/{_grandmean()}"
     return None
 
 
@@ -860,7 +1005,7 @@ def _stage_xref(plan: Plan) -> str:
         "ffs_allineate",
         [
             '-base "$REFGM_EXT"',
-            '-source "stage07.grandmean.nii$FMT"',
+            f'-source "{_grandmean()}"',
             '-prefix "stage09.xref.nii$FMT"',
             '-1Dmatrix_save "stage09.xref.aff12.1D"',
             *_split_flags(config.DEFAULT_OPTS["xses"]),
@@ -913,22 +1058,28 @@ def _stage_anat(plan: Plan) -> str:
             opt.anat_path
             or "${FFS_ANAT:?set FFS_ANAT to the skull-stripped T1w (SUMA brain.nii.gz)}"
         )
+        src = _anat_source_image(plan)
+        mode = effective_anat_source(plan)
         lin = _ffs(
             "ffs_allineate",
             [
                 '-base "$ANAT"',
-                '-source "stage07.grandmean.nii$FMT"',
+                f'-source "{src}"',
                 '-prefix "stage09.anat.nii$FMT"',
                 '-1Dmatrix_save "stage09.anat.aff12.1D"',
                 *_split_flags(config.DEFAULT_OPTS["anat"]),
                 '-device "$DEVICE"',
             ],
         )
+        note = ""
+        if mode != opt.anat_source:
+            note = f"  # (-anat_source {opt.anat_source} unavailable here → {mode})\n"
         out.append(
             f'ANAT="{anat_ph}"\n'
             'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.anat.aff12.1D" ]; then\n'
             "  # cross-modal rigid lpc: base=anat → matrix maps anat→EPI (chain head).\n"
-            f"{lin}\nfi"
+            f"  # source = -anat_source {mode} (all choices share the reference-fmap grid).\n"
+            f"{note}{lin}\nfi"
         )
         seg_mats = "stage09.anat.aff12.1D"
 
@@ -1009,6 +1160,8 @@ def _segment_input(plan: Plan) -> str:
 
     grandmean  → the EPI grandmean (works even with no fieldmap; segment does the
                  distortion correction implicitly against the anat/TPM).
+    ref_fmap /
+    mean_fmap  → the same anchor images ``-anat_source`` selects (shared vocabulary).
     blipfor    → the first fmap group's undistorted forward frame.
     blip_pair  → forward ``[0]`` + reverse ``[1]`` of the blipflip unwarped pair
                  (topup-style; matches the reference `primary` script).
@@ -1021,12 +1174,12 @@ def _segment_input(plan: Plan) -> str:
             blip = _fmap_stem(pr, "blip")
             break
     if mode in ("blipfor", "blip_pair") and blip is None:
-        return '-input "stage07.grandmean.nii$FMT"  # (no fmap; fell back from ' + mode + ")"
+        return f'-input "{_grandmean()}"  # (no fmap; fell back from {mode})'
     if mode == "blipfor":
         return f'-input "{blip}_unwarped.nii$FMT[0]"'
     if mode == "blip_pair":
         return f'-input "{blip}_unwarped.nii$FMT[0]" -pe_reverse "{blip}_unwarped.nii$FMT[1]"'
-    return '-input "stage07.grandmean.nii$FMT"'
+    return f'-input "{_anat_source_image(plan, mode)}"'
 
 
 def _own_anat(opt) -> bool:
@@ -1041,10 +1194,10 @@ def _final_master(plan: Plan) -> str:
     warpmaster autoboxes it to the brain and drops it to the EPI voxel size."""
     opt = plan.options
     if not opt.go_to_anat:
-        return "stage07.grandmean.nii$FMT"
+        return _grandmean()
     if opt.ref_file is not None:
         # explicit reference: the copied-in ref anat defines the shared grid.
-        return "stage09.ref_anat.nii.gz" if opt.ref_anat else "stage07.grandmean.nii$FMT"
+        return "stage09.ref_anat.nii.gz" if opt.ref_anat else _grandmean()
     if opt.grand_reference:
         # borrow the reference's anat-space grid so all subjects/tasks co-register.
         return f"{opt.grand_reference.rstrip('/')}/stage09.anat.nii$FMT"

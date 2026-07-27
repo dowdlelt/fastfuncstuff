@@ -11,7 +11,7 @@ import pytest
 
 from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Session, Subject
 from fastfuncstuff.autoproc.emit import write_script
-from fastfuncstuff.autoproc.plan import Options, build_plan
+from fastfuncstuff.autoproc.plan import Options, build_plan, effective_anat_source
 
 
 def _run(session, task, run, tr=2.0, pe="j-"):
@@ -74,9 +74,9 @@ def test_multi_fmap_non_ref_gets_xfmap():
     assert "xfmap_lin" in _chain(plan, ("01", "b", "2"))  # non-ref fmap
 
 
-def test_multi_fmap_xfmap_stage_and_premean():
+def test_multi_fmap_xfmap_stage_and_runmean():
     """Two fmap groups in one session: non-ref runs get xfmap in the chain, the
-    xfmap stage is emitted, and premeans (fmap runs) feed the grandmean."""
+    xfmap stage is emitted, and runmeans (fmap runs) feed the session mean."""
     from fastfuncstuff.autoproc.bids import BoldRun
 
     def frun(task, run):
@@ -119,7 +119,7 @@ def test_multi_fmap_xfmap_stage_and_premean():
     script = write_script(plan, "wd", bids_root="/bids")
     assert "stage05: cross-fmap" in script
     assert "stage04.blip.ses-SM.fmap-floc_mean" in script  # xfmap aligns to ref-fmap mean
-    assert "stage07.premean." in script  # premeans feed the grandmean
+    assert "stage07.runmean." in script  # run means feed the session mean
 
 
 def test_multi_session_xses_and_ref_drop():
@@ -135,6 +135,84 @@ def test_multi_session_xses_and_ref_drop():
     assert "xses_lin" not in _chain(plan, ("01", "foo", "1"))  # reference session
     ch2 = _chain(plan, ("02", "foo", "1"))
     assert ch2.index("xses_nl") < ch2.index("xses_lin")  # nl before lin
+
+
+def test_mean_levels_are_named_for_what_they_average():
+    """runmean (one run) → sesmean (one session) → grandmean (everything). The
+    grandmean is stage08 because it cannot exist before xses has aligned the
+    sessions — and it has exactly ONE producer, single- or multi-session."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    s = write_script(build_plan(subj, Options(ref_ses="01")), "wd", bids_root="/bids")
+    assert '-prefix "stage07.sesmean.ses-01.nii$FMT"' in s
+    assert '-prefix "stage07.sesmean.ses-02.nii$FMT"' in s
+    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    # The old names are gone entirely.
+    assert "premean" not in s and "stage07.grandmean" not in s
+    # Session means are built before the alignment that makes the grandmean valid.
+    assert s.index("stage07.sesmean.ses-02") < s.index("stage08: cross-session")
+    assert s.index("stage08: cross-session") < s.index('-prefix "stage08.grandmean.nii$FMT"')
+    # Exactly one command writes the grandmean.
+    assert s.count('-prefix "stage08.grandmean.nii$FMT"') == 1
+
+
+def test_single_session_grandmean_has_the_same_single_producer():
+    """One session: stage08 still owns the grandmean (built from the lone sesmean),
+    rather than a stage07 `cp` — same name, same stage, either way."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    assert s.count('-prefix "stage08.grandmean.nii$FMT"') == 1
+    assert '"stage07.sesmean.ses-01.nii$FMT"' in s
+    assert "cross-session alignment" not in s  # nothing to align
+
+
+def test_reference_levels_get_a_role_ref_qc_copy():
+    """Each alignment stage skips its own reference, leaving a gap when browsing.
+    A `role-ref` copy fills it so the listing has one file per session/group/run."""
+    f1 = FmapGroup("01", "a", Path("/a.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    f2 = FmapGroup("01", "b", Path("/b.nii.gz"), {"TotalReadoutTime": 0.06}, [("bar", "1")])
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1"), _run("01", "bar", "1")], [f1, f2]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    s = write_script(
+        build_plan(subj, Options(ref_ses="01", fmap_ref=["a"])), "wd", bids_root="/bids"
+    )
+    # xses: reference session has no transform, but appears in the listing.
+    assert 'cp -f "stage07.sesmean.ses-01.nii$FMT" "stage08.xses.ses-01.role-ref.nii$FMT"' in s
+    assert '-prefix "stage08.xses.ses-02.nii$FMT"' in s  # the real, aligned one
+    # xfmap: same for the reference fieldmap group.
+    assert 'cp -f "stage04.blip.ses-01.fmap-a_mean.nii$FMT" ' in s
+    assert '"stage05.xfmap.ses-01.fmap-a.role-ref.nii$FMT"' in s
+    # A reference has no nonlinear counterpart, by definition.
+    assert "role-ref_nl" not in s
+    # Markers are QC only — never fed into a warp chain or a mean.
+    assert "-nwarp" in s and "role-ref" not in s.split("CHAIN[")[-1].split("\n\n")[0]
+
+
+def test_xrun_anchor_gets_a_role_ref_copy_only_without_fieldmaps():
+    """No fmaps → the session's first run is the anchor and has no xrun output, so
+    it gets a marker. With fmaps EVERY run gets a real xrun; no gap, no marker."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert '"stage06.xrun.ses-01.task-foo.run-1.role-ref.nii$FMT"' in s
+    assert '"stage02.moco.ses-01.task-foo.run-1_mean.nii$FMT"' in s
+
+    fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {}, [("foo", "1"), ("foo", "2")])
+    with_fmap = Subject(
+        "X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")], [fmap])]
+    )
+    s2 = write_script(build_plan(with_fmap, Options()), "wd", bids_root="/bids")
+    assert "stage06.xrun" in s2 and "xrun.ses-01.task-foo.run-1.role-ref" not in s2
 
 
 def test_nonlinear_toggles_add_warps():
@@ -257,6 +335,118 @@ def test_warpmaster_defines_grid_mask_and_stats():
     )
     assert '-prefix "stage10.warpmaster.nii$FMT"' in borrow
     assert '[ -f "autobox3_brain.nii.gz" ] ||' not in borrow
+
+
+def _two_fmap_subject():
+    """One session, two fieldmap groups (floc = reference), each with a run."""
+    f1 = FmapGroup(
+        "SM", "floc", Path("/floc_rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("floc", "1")]
+    )
+    f2 = FmapGroup(
+        "SM", "prim", Path("/prim_rev.nii.gz"), {"TotalReadoutTime": 0.08}, [("prim", "1")]
+    )
+    runs = [_run("SM", "floc", "1"), _run("SM", "prim", "1")]
+    return Subject("X", [Session("SM", runs, [f1, f2], anat=Path("/anat/T1w.nii.gz"))])
+
+
+def test_anat_source_grandmean_is_the_default():
+    plan = build_plan(_two_fmap_subject(), Options(go_to_anat=True, fmap_ref=["floc"]))
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert '-source "stage08.grandmean.nii$FMT"' in s
+    assert "stage05.fmapmean" not in s  # not built when nothing asks for it
+
+
+def test_anat_source_ref_fmap_uses_the_reference_blip_mean():
+    """-anat_source ref_fmap aligns the anat to the image that DEFINES the space
+    (the reference group's undistorted mean) instead of the grandmean."""
+    plan = build_plan(
+        _two_fmap_subject(), Options(go_to_anat=True, fmap_ref=["floc"], anat_source="ref_fmap")
+    )
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert '-source "stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
+    assert '-source "stage08.grandmean.nii$FMT"' not in s
+    # The grandmean is still built (QC + xses/xref inputs) — only the anat moved.
+    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+
+
+def test_anat_source_mean_fmap_averages_the_aligned_group_means():
+    plan = build_plan(
+        _two_fmap_subject(), Options(go_to_anat=True, fmap_ref=["floc"], anat_source="mean_fmap")
+    )
+    s = write_script(plan, "wd", bids_root="/bids")
+    fm = "stage05.fmapmean.ses-SM.nii$FMT"
+    assert f'-prefix "{fm}"' in s
+    # Averaged: reference group's own blip mean + the non-ref group's ALIGNED mean.
+    assert '"stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
+    assert '"stage05.xfmap.ses-SM.fmap-prim.nii$FMT"' in s
+    assert f'-source "{fm}"' in s  # and it is what the anat aligns
+    # Built after the xfmap alignment that puts the groups in one space.
+    assert s.index("stage05: cross-fmap") < s.index(f'-prefix "{fm}"')
+
+
+def test_anat_source_mean_fmap_uses_nonlinear_xfmap_result_when_available():
+    plan = build_plan(
+        _two_fmap_subject(),
+        Options(go_to_anat=True, fmap_ref=["floc"], anat_source="mean_fmap", xfmap_nonlin=True),
+    )
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert '"stage05.xfmap.ses-SM.fmap-prim_nl.nii$FMT"' in s
+
+
+def test_anat_source_falls_back_to_grandmean_without_fieldmaps():
+    """No fmaps → the grandmean is the only EPI image there is (ffs_segment is
+    what recovers the distortion), so both fmap choices degrade to it."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
+    for mode in ("ref_fmap", "mean_fmap"):
+        plan = build_plan(subj, Options(go_to_anat=True, anat_source=mode))
+        assert effective_anat_source(plan) == "grandmean"
+        s = write_script(plan, "wd", bids_root="/bids")
+        assert '-source "stage08.grandmean.nii$FMT"' in s
+        assert f"(-anat_source {mode} unavailable here → grandmean)" in s
+
+
+def test_anat_source_mean_fmap_degenerates_to_ref_fmap_with_one_group():
+    """Averaging a single group's mean is just that mean — don't emit a 3dmath."""
+    fmap = FmapGroup("01", "only", Path("/rev.nii.gz"), {}, [("foo", "1")])
+    subj = Subject(
+        "X", [Session("01", [_run("01", "foo", "1")], [fmap], anat=Path("/anat/T1w.nii.gz"))]
+    )
+    plan = build_plan(subj, Options(go_to_anat=True, anat_source="mean_fmap"))
+    assert effective_anat_source(plan) == "ref_fmap"
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert "stage05.fmapmean" not in s
+    assert '-source "stage04.blip.ses-01.fmap-only_mean.nii$FMT"' in s
+
+
+def test_anat_source_does_not_change_the_warp_chain():
+    """All three sources live on the reference-fmap grid, so the composed chain
+    must be byte-identical whichever is chosen — only the image content differs."""
+    subj = _two_fmap_subject()
+    chains = []
+    for mode in ("grandmean", "ref_fmap", "mean_fmap"):
+        plan = build_plan(subj, Options(go_to_anat=True, fmap_ref=["floc"], anat_source=mode))
+        chains.append([pr.warp_chain for pr in plan.runs])
+    assert chains[0] == chains[1] == chains[2]
+
+
+def test_segment_input_shares_the_anat_source_vocabulary():
+    """-anat_nonlin_input accepts ref_fmap/mean_fmap too, and asking for mean_fmap
+    there alone is enough to make stage05 build it."""
+    plan = build_plan(
+        _two_fmap_subject(),
+        Options(
+            go_to_anat=True,
+            fmap_ref=["floc"],
+            anat_nonlin=True,
+            anat_nonlin_input="mean_fmap",
+            tpm="/tpm.nii.gz",
+        ),
+    )
+    s = write_script(plan, "wd", bids_root="/bids")
+    fm = "stage05.fmapmean.ses-SM.nii$FMT"
+    assert f'-prefix "{fm}"' in s  # built even though -anat_source stayed grandmean
+    assert f'ffs_segment \\\n    -input "{fm}"' in s
+    assert '-source "stage08.grandmean.nii$FMT"' in s  # anat linear step unchanged
 
 
 def test_output_format_flags_map_to_fmt_vars():

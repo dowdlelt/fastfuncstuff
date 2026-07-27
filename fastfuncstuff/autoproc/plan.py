@@ -59,7 +59,11 @@ class Options:
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
     anat_path: str | None = None  # skull-stripped T1w (baked into the script if found)
     moco_ref: str = "sbref"  # moco base: sbref|first|last|<int>  (sbref → sbref if present)
-    anat_nonlin_input: str = "grandmean"  # ffs_segment input: grandmean|blipfor|blip_pair
+    # Which EPI-contrast image the anat linear step aligns to. All choices live on
+    # the SAME grid (the reference fmap's undistorted space) — see
+    # ``effective_anat_source``; they differ only in SNR/sharpness/contrast.
+    anat_source: str = "grandmean"  # grandmean | ref_fmap | mean_fmap
+    anat_nonlin_input: str = "grandmean"  # ffs_segment input: + blipfor|blip_pair
     # -grand_reference: path to ANOTHER autoproc results dir whose anat matrix
     # this run borrows; this data's grandmean is aligned to that ref (xref_*).
     # This is how a filtered `primary`-only script anchors on a floc run.
@@ -136,6 +140,64 @@ class Plan:
     runs: list[PlanRun]
     ref_session: str | None
     multi_session: bool
+
+
+def ref_anchor(plan: Plan) -> PlanRun | None:
+    """The run carrying the *reference* fieldmap of the *reference* session — the
+    group whose undistorted mean defines the space everything else lands on.
+
+    ``None`` when no run has a fieldmap (``-no_distortion``, or no fmaps scanned),
+    which is what makes the fmap-based anat sources unreachable.
+    """
+    with_fmap = [pr for pr in plan.runs if pr.fmap is not None]
+    for pr in with_fmap:
+        if pr.is_ref_session and pr.is_ref_fmap:
+            return pr
+    # Reference session has no fmap of its own: fall back to any ref-fmap group.
+    for pr in with_fmap:
+        if pr.is_ref_fmap:
+            return pr
+    return with_fmap[0] if with_fmap else None
+
+
+def anchor_fmap_ids(plan: Plan) -> list[str]:
+    """Fieldmap ids in the anchor's session, reference first — the groups whose
+    aligned means ``mean_fmap`` averages. Cross-*session* fmaps are excluded: they
+    only reach the anchor grid via ``xses``, which is computed downstream of here.
+    """
+    anchor = ref_anchor(plan)
+    if anchor is None:
+        return []
+    ref_id = anchor.fmap.fmap_id if anchor.fmap else None
+    ids: list[str] = []
+    for pr in plan.runs:
+        if pr.fmap is None or pr.bold.session != anchor.bold.session:
+            continue
+        if pr.fmap.fmap_id not in ids:
+            ids.append(pr.fmap.fmap_id)
+    if ref_id in ids:  # reference group first
+        ids.remove(ref_id)
+        ids.insert(0, ref_id)
+    return ids
+
+
+def effective_anat_source(plan: Plan, requested: str | None = None) -> str:
+    """Resolve an anat-source request against what the data can actually supply.
+
+    ``ref_fmap`` / ``mean_fmap`` need fieldmaps; without them the grandmean is the
+    only EPI-contrast image there is (and ``ffs_segment`` is then what recovers the
+    distortion). ``mean_fmap`` with a single group degenerates to ``ref_fmap`` —
+    averaging one image is just that image.
+    """
+    mode = requested if requested is not None else plan.options.anat_source
+    if mode == "grandmean":
+        return mode
+    ids = anchor_fmap_ids(plan)
+    if not ids:
+        return "grandmean"
+    if mode == "mean_fmap" and len(ids) == 1:
+        return "ref_fmap"
+    return mode
 
 
 def _resolve_ref_session(subject: Subject, opt: Options) -> str | None:

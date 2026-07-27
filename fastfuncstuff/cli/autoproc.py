@@ -86,11 +86,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
     )
     g.add_argument(
+        "-anat_source",
+        "-anat-source",
+        choices=["grandmean", "ref_fmap", "mean_fmap"],
+        default="grandmean",
+        help="EPI image the anat alignment uses (all share the reference-fmap grid): "
+        "grandmean (best SNR, only option w/o fieldmaps) | ref_fmap (reference "
+        "fieldmap's undistorted mean; sharpest, defines the space) | mean_fmap "
+        "(ref_fmap averaged with the other groups' aligned means)",
+    )
+    g.add_argument(
         "-anat_nonlin_input",
         "-anat-nonlin-input",
-        choices=["grandmean", "blipfor", "blip_pair"],
+        choices=["grandmean", "ref_fmap", "mean_fmap", "blipfor", "blip_pair"],
         default="grandmean",
-        help="ffs_segment input: grandmean (works w/o fieldmap) | blipfor | blip_pair",
+        help="ffs_segment input: grandmean (works w/o fieldmap) | ref_fmap | "
+        "mean_fmap | blipfor | blip_pair",
     )
     g.add_argument(
         "-tpm", help="tissue-probability template for ffs_segment (or auto-built from -suma)"
@@ -352,6 +363,19 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-ref_file given without -ref_transforms/-ref_anat: the reference is assumed to "
             "already be in anat space."
         )
+    if opt.anat_source != "grandmean":
+        if not opt.go_to_anat:
+            warnings.append("-anat_source is ignored with -no_anat (there is no anat step).")
+        elif opt.has_grand_ref:
+            warnings.append(
+                "-anat_source is ignored when the anat matrix is borrowed (-grand_reference) "
+                "or overridden (-ref_file): no local anat alignment is computed."
+            )
+        elif not any(s.fmaps for s in subject.sessions) or not opt.distortion:
+            warnings.append(
+                f"-anat_source {opt.anat_source} needs fieldmaps; falling back to grandmean "
+                "(ffs_segment is what recovers the distortion in that case)."
+            )
     # Events: not a hard error (preprocessing still runs), but warn per task so
     # the user knows the GLM will fail without them.
     if opt.run_glm and not opt.events:
@@ -470,6 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         go_to_anat=go_to_anat,
         final_dxyz=args.final_dxyz,
         anat_nonlin=anat_nonlin,
+        anat_source=args.anat_source,
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,
         moco_ref=args.moco_ref,

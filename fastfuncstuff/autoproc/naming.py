@@ -4,12 +4,12 @@ Every intermediate/final file follows a single, greppable scheme so that a
 human reading the working directory can tell at a glance which stage, session,
 fieldmap, task and run produced it::
 
-    stageNN.<label>[.ses-<S>][.task-<T>][.fmap-<F>][.run-<R>][.part-phase]<ext>
+    stageNN.<label>[.ses-<S>][.task-<T>][.fmap-<F>][.run-<R>][.part-phase][.role-ref]<ext>
 
 Consistent BIDS-style ``key-value`` tokens throughout, with the run entity kept
 raw (``run-010``, no re-padding). Fieldmap groups carry an explicit ``fmap-<F>``
 so multi-fieldmap sessions stay unambiguous. Tokens are omitted where they don't
-apply (an anat matrix has none; a per-session grandmean has only ``ses-<S>``).
+apply (an anat matrix has none; a session mean has only ``ses-<S>``).
 
 Tool-specific suffixes (``.aff12.1D``, ``_warp``, ``.1D``) are appended by the
 tools; this module owns only the *prefix* stem. ``coord()`` returns just the
@@ -36,10 +36,17 @@ STAGE_NUMBERS: dict[str, int] = {
     "nlmoco": 3,
     "blip": 4,
     "xfmap": 5,
+    "fmapmean": 5,  # mean of the session's xfmap-aligned fmap means (-anat_source)
     "xrun": 6,
-    "premean": 7,  # run mean pushed to the reference-fmap grid (grandmean input)
-    "grandmean": 7,
+    # The three mean levels, each named for exactly what it averages:
+    #   runmean  one run, on the reference-fmap grid (sesmean input)
+    #   sesmean  one session's runs, in that session's own space (xses input)
+    #   grandmean  ALL data, after cross-session alignment — hence stage 8, not 7:
+    #     it cannot exist until xses has put the sessions in one space.
+    "runmean": 7,
+    "sesmean": 7,
     "xses": 8,
+    "grandmean": 8,
     "xref": 9,  # align this data's grandmean to an external -grand_reference
     "anat": 9,
     "nlanat": 9,
@@ -54,7 +61,7 @@ class NameKey:
     """The addressable coordinates of a file within the plan.
 
     Any of ``session``/``task``/``fmap``/``run`` may be ``None`` when the file is
-    not specific to that level (a session grandmean has only ``session``; a blip
+    not specific to that level (a session mean has only ``session``; a blip
     fieldmap has ``session``+``fmap`` but no run; an anat matrix has none).
     """
 
@@ -64,6 +71,11 @@ class NameKey:
     fmap: str | None = None
     run: str | None = None
     part: str | None = None  # e.g. "phase"
+    # Marks a QC-only stand-in for the level's *reference*, which by definition has
+    # no transform of its own (``role-ref``). Alignment stages skip their reference
+    # — so browsing e.g. stage08.xses.* otherwise shows N-1 files and it's on the
+    # reader to work out which session is missing and why. Never a pipeline input.
+    role: str | None = None
 
 
 def coord(key: NameKey) -> str:
@@ -87,6 +99,8 @@ def coord(key: NameKey) -> str:
         parts.append(f"run-{key.run}")  # raw run entity, not re-padded
     if key.part is not None:
         parts.append(f"part-{key.part}")
+    if key.role is not None:
+        parts.append(f"role-{key.role}")
     return ".".join(parts)
 
 
@@ -97,8 +111,10 @@ def stem(key: NameKey) -> str:
     --------
     >>> stem(NameKey("moco", session="06", task="HalfFovNoTask", run="010"))
     'stage02.moco.ses-06.task-HalfFovNoTask.run-010'
-    >>> stem(NameKey("grandmean", session="SM"))
-    'stage07.grandmean.ses-SM'
+    >>> stem(NameKey("sesmean", session="SM"))
+    'stage07.sesmean.ses-SM'
+    >>> stem(NameKey("xses", session="01", role="ref"))
+    'stage08.xses.ses-01.role-ref'
     >>> stem(NameKey("anat"))
     'stage09.anat'
     """
