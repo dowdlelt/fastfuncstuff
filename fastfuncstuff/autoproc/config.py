@@ -13,8 +13,15 @@ FOV. Callers wanting a harder zero-weight threshold override via ``-*_opts``.
 
 from __future__ import annotations
 
-# Linear + nonlinear registration op strings, per alignment level.
+# Per-stage op strings. Every key here gets a ``-<key>_opts`` CLI flag (see
+# STAGE_OPT_KEYS); structural flags (-input/-prefix/-device/paths the emitter
+# computes) are NOT in these strings and cannot be overridden this way.
 DEFAULT_OPTS: dict[str, str] = {
+    # NORDIC denoise. -nordic = the NORDIC (not MPPCA) threshold rule.
+    "nordic": "-nordic -verbose",
+    # slice timing (-slicetiming_method first). tzero 0 = shift to the first
+    # slice's acquisition instant, matching what the integrate path assumes.
+    "tshift": "-tzero 0",
     # motion correction (per run). wls = batched Gauss-Newton, the fast default and
     # the right cost for within-run same-contrast rigid moco (lpa forces a slow
     # per-volume optimizer — do NOT use it here). -twopass = coarse-blur then fine
@@ -42,6 +49,11 @@ DEFAULT_OPTS: dict[str, str] = {
     "-iters 1000x1000x1000 -smooth 0x0x0 -conv_thresh 1e-05",
     # anat linear (cross-modal EPI→anat) — lpc with EPI masked to brain.
     "anat": "-rigid -cost lpc -source_automask -autoweight -interp cubic -cmass -fast -final wsinc5",
+    # anat nonlinear (ffs_segment). Two tunings: the FS-derived TPM has 8
+    # hard-edge classes, so it needs its own ngaus/cleanup; an SPM-style TPM
+    # uses the plain one. Which applies is set by -suma/-tpm, not by the user.
+    "segment": "-niter 2000 -samp 1.5",
+    "segment_fstpm": "-ngaus 1 1 1 1 1 2 3 4 -cleanup 0 -samp 1.5",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",
     # ROMEO temporal phase unwrapping (-phase_proc). "-t epi" is the single-echo
@@ -49,6 +61,13 @@ DEFAULT_OPTS: dict[str, str] = {
     # ROMEO's B0 output. NOT an ffs tool — romeo must be on $PATH.
     "unwrap": "-t epi -v",
 }
+
+# Stages exposed as ``-<key>_opts`` on the CLI, in pipeline order. Anything in
+# DEFAULT_OPTS should be here — the emitter reads DEFAULT_OPTS, so an unlisted
+# key is a stage the user silently cannot tune. The grid utilities
+# (autobox/resample/automask/3dmath) are deliberately absent: their flags define
+# the output grid the rest of the chain assumes, so they are not free knobs.
+STAGE_OPT_KEYS: tuple[str, ...] = tuple(DEFAULT_OPTS)
 
 # Working / final / GLM output extensions. Intermediates default to zstd (read
 # many times, big); final timeseries to gzip (portability); GLM to gzip.

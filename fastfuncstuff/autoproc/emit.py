@@ -548,7 +548,7 @@ def _stage_tshift(plan: Plan) -> str:
             '-prefix "$outf"',
             '-tpattern "${JSON[$k]}"',
             '-TR "${TR[$k]}"',
-            "-tzero 0",
+            *_split_flags(config.DEFAULT_OPTS["tshift"]),
             '-device "$DEVICE"',
         ],
     )
@@ -564,7 +564,7 @@ def _stage_tshift(plan: Plan) -> str:
                 '-prefix "$phout"',
                 '-tpattern "${JSON[$k]}"',
                 '-TR "${TR[$k]}"',
-                "-tzero 0",
+                *_split_flags(config.DEFAULT_OPTS["tshift"]),
                 '-device "$DEVICE"',
             ],
         )
@@ -607,10 +607,9 @@ def _stage_nordic(plan: Plan) -> str:
             '"${phase_arg[@]}"',
             '-prefix "$outf"',
             '-noise-volume-last "$NOISE_VOLS"',
-            "-nordic",
+            *_split_flags(config.DEFAULT_OPTS["nordic"]),
             resid,
             '-device "$DEVICE"',
-            "-verbose",
         ],
     )
     return f"""
@@ -1138,12 +1137,8 @@ def _stage_anat(plan: Plan) -> str:
             if opt.tpm
             else '"${FFS_TPM:?set FFS_TPM to the subject tissue-probability template}"'
         )
-        # The FS-derived TPM has 8 hard-edge classes → these ngaus/cleanup params.
-        seg_tune = (
-            ["-ngaus 1 1 1 1 1 2 3 4", "-cleanup 0", "-samp 1.5"]
-            if opt.fs_tpm
-            else ["-niter 2000", "-samp 1.5"]
-        )
+        # The FS-derived TPM has 8 hard-edge classes → its own ngaus/cleanup params.
+        seg_tune = _split_flags(config.DEFAULT_OPTS["segment_fstpm" if opt.fs_tpm else "segment"])
         seg = _ffs(
             "ffs_segment",
             [

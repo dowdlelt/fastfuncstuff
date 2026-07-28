@@ -16,7 +16,7 @@ import shutil
 import sys
 from pathlib import Path
 
-from fastfuncstuff.autoproc import config
+from fastfuncstuff.autoproc import config, optcheck
 from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.glm import write_design_specs
@@ -301,8 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("per-stage option overrides (replace the default op string)")
-    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp", "unwrap"):
-        g.add_argument(f"-{key}_opts", f"-{key}-opts", metavar="STR", help=_opt_help(key))
+    for key in config.STAGE_OPT_KEYS:
+        dashed = key.replace("_", "-")
+        g.add_argument(f"-{key}_opts", f"-{dashed}-opts", metavar="STR", help=_opt_help(key))
     return p
 
 
@@ -322,6 +323,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
     warnings: list[str] = []
+
+    # Typo in an override: catch it now, not when the script reaches that stage.
+    for key in (*config.STAGE_OPT_KEYS, "glm"):
+        val = getattr(args, f"{key}_opts", None)
+        if val:
+            errors += optcheck.check_opts(key, val)
 
     needs_anat = opt.go_to_anat and not opt.grand_reference and not opt.ref_file
     if needs_anat and anat_path is None:
@@ -523,8 +530,74 @@ def _report_events(args, opt, subject) -> None:
             print(f"  {coord:<24} {ev if ev is not None else '(none found)'}", file=sys.stderr)
 
 
+# Every input path the emitter bakes into the script verbatim. Relative ones are
+# resolved against the CWD of *this* invocation before anything reads them.
+# -out/-work_dir are not here: -out is where the script is written now, and
+# work_dir is resolved separately (it becomes OUT inside the script).
+_PATH_ARGS = (
+    "bids_dir",
+    "anat",
+    "suma",
+    "tpm",
+    "tpm_source",
+    "grand_reference",
+    "ref_file",
+    "ref_anat",
+)
+_PATH_LIST_ARGS = ("ref_transforms", "events")
+
+
+def _absolutize_inputs(args) -> None:
+    """Make user-supplied input paths absolute.
+
+    The generated script hard-codes these, and it is routinely moved (or run from
+    a different cwd) after generation — a relative ``-grand_reference
+    floc_..results/`` would then point at nothing and the run dies at stage09.
+    Resolving here also means preflight errors name the real path."""
+
+    def abspath(p: str) -> str:
+        return str(Path(p).expanduser().resolve())
+
+    for name in _PATH_ARGS:
+        val = getattr(args, name, None)
+        if val:
+            setattr(args, name, abspath(val))
+    for name in _PATH_LIST_ARGS:
+        vals = getattr(args, name, None)
+        if vals:
+            setattr(args, name, [abspath(v) for v in vals])
+
+
+def _opt_flag_spellings() -> set[str]:
+    """Both spellings of every ``-*_opts`` flag (stage overrides plus -glm_opts)."""
+    keys = (*config.STAGE_OPT_KEYS, "glm")
+    return {f"-{k}_opts" for k in keys} | {f"-{k.replace('_', '-')}-opts" for k in keys}
+
+
+def _glue_opt_values(argv: list[str]) -> list[str]:
+    """Rewrite ``-moco_opts <value>`` as ``-moco_opts=<value>``.
+
+    Option strings for these flags are option-looking by nature. argparse only
+    accepts a ``-``-leading value when it contains a space, so a single-flag
+    override (``-nordic_opts '-save_numcomps'``) died with "expected one
+    argument" while a multi-flag one sailed through. The ``=`` form is exempt
+    from that check."""
+    flags = _opt_flag_spellings()
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] in flags and i + 1 < len(argv):
+            out.append(f"{argv[i]}={argv[i + 1]}")
+            i += 2
+        else:
+            out.append(argv[i])
+            i += 1
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    args = build_parser().parse_args(_glue_opt_values(sys.argv[1:] if argv is None else argv))
+    _absolutize_inputs(args)
     recipe = config.RECIPES.get(args.recipe, {}) if args.recipe else {}
 
     def rget(field, default):
@@ -534,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
         return argval if argval is not None else rget(field, default)
 
     # per-stage opt overrides mutate the shared defaults for this run.
-    for key in ("moco", "locomoco", "blip", "xrun", "xfmap", "xses", "anat", "nwarp", "unwrap"):
+    for key in config.STAGE_OPT_KEYS:
         val = getattr(args, f"{key}_opts", None)
         if val is not None:
             config.DEFAULT_OPTS[key] = val
