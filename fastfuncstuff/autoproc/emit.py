@@ -28,6 +28,7 @@ from fastfuncstuff.autoproc.plan import (
     anchor_fmap_ids,
     effective_anat_source,
     ref_anchor,
+    sbref_chain,
 )
 
 _TOOLS = [
@@ -66,9 +67,9 @@ def _frag(pr: PlanRun) -> str:
     return coord(NameKey("moco", session=b.session, task=b.task, run=b.run or None))
 
 
-def _run_stem(pr: PlanRun, label: str) -> str:
+def _run_stem(pr: PlanRun, label: str, src: str | None = None) -> str:
     b = pr.bold
-    return stem(NameKey(label, session=b.session, task=b.task, run=b.run or None))
+    return stem(NameKey(label, session=b.session, task=b.task, run=b.run or None, src=src))
 
 
 def _fmap_stem(pr: PlanRun, label: str) -> str:
@@ -156,9 +157,12 @@ def _anat_lin_files(opt) -> list[str]:
     return [f"{gr.rstrip('/')}/{anat}"] if gr else [anat]
 
 
-# The fmap-level tokens: run-native → reference-fmap undistorted space. Applied
-# on their own to a run's moco-mean they build its "runmean" (see stage07).
-_FMAP_TOKENS = ("xfmap_nl", "xfmap_lin", "blip_half", "wxrun_nl", "wxrun_lin")
+# The pre-chain tokens: run-native → the session's common grid. Applied on their
+# own to a run's lane image they build its "runmean" (see stage07). With
+# fieldmaps the common grid is the reference fmap's undistorted space and all
+# five tokens can appear; without, only the wxrun pair does and the grid is the
+# session's anchor run.
+_PRE_CHAIN_TOKENS = ("xfmap_nl", "xfmap_lin", "blip_half", "wxrun_nl", "wxrun_lin")
 
 
 def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
@@ -193,20 +197,27 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
     return []
 
 
-def chain_files(pr: PlanRun, fmt: str, opt=None) -> list[str]:
-    """Resolve a run's full warp chain into filenames (nwarp-apply order)."""
+def chain_files(pr: PlanRun, fmt: str, opt=None, tokens: list[str] | None = None) -> list[str]:
+    """Resolve a run's warp chain into filenames (nwarp-apply order).
+
+    ``tokens`` overrides which links to resolve — used for the SBRef chain
+    (``plan.sbref_chain``), which is the run's chain minus the within-run motion
+    tokens. The files themselves are shared: an SBRef and its BOLD are corrected
+    by exactly the same transforms from the fieldmap level up.
+    """
     resolved: list[str] = []
-    for tok in pr.warp_chain:
+    for tok in pr.warp_chain if tokens is None else tokens:
         resolved.extend(_token_files(pr, tok, fmt, opt))
     return resolved
 
 
-def _fmap_subchain(pr: PlanRun, fmt: str) -> list[str]:
-    """Just the fmap-level tokens of a run's chain (xfmap∘blip∘wxrun) — applied to
-    the moco-mean to land it on the reference-fmap grid (the runmean)."""
+def _pre_chain(pr: PlanRun, fmt: str) -> list[str]:
+    """Just the pre-chain tokens of a run's chain (xfmap∘blip∘wxrun) — applied to a
+    lane image to land it on the session's common grid (the runmean). Empty for
+    the anchor run of a no-fieldmap session, which defines that grid."""
     out: list[str] = []
     for tok in pr.warp_chain:
-        if tok in _FMAP_TOKENS:
+        if tok in _PRE_CHAIN_TOKENS:
             out.extend(_token_files(pr, tok, fmt, None))
     return out
 
@@ -217,22 +228,88 @@ def _ref_blip_mean(pr: PlanRun) -> str:
     return stem(NameKey("blip", session=pr.bold.session, fmap=pr.ref_fmap_id)) + "_mean.nii$FMT"
 
 
-def _runmean(pr: PlanRun) -> str:
-    """This run's mean resampled onto the reference-fmap grid (sesmean input)."""
-    return _run_stem(pr, "runmean") + ".nii$FMT"
+# ---------------------------------------------------------------------------
+# lanes
+#
+# Two parallel image lineages run the length of the mean pyramid, describing the
+# same anatomy in the same spaces:
+#
+#   LANE_MEAN   each run's motion-corrected BOLD mean (what this pipeline always
+#               built). Multiband contrast, high SNR, two interpolations deep by
+#               the grandmean — moco resampled the series before averaging it.
+#   LANE_SBREF  each run's SBRef. Single-band, no slice-leakage artefact, sharper
+#               tissue contrast, and ONE interpolation deep because the SBRef is
+#               the moco base and so needs no within-run transform at all.
+#
+# The SBRef lane is the better *registration* source, so it estimates the
+# transforms when it exists (see ``_primary_lane``). The mean lane is kept and
+# resampled by those same transforms: it is the data's own view of the same
+# space, which makes a lane-vs-lane comparison a direct sanity check.
+# ---------------------------------------------------------------------------
+
+LANE_MEAN = "mean"
+LANE_SBREF = "sbref"
 
 
-def _sesmean(session: str | None) -> str:
-    """One session's mean: the average of its aligned run means, in that session's
+def _src(lane: str) -> str | None:
+    """The ``src-`` naming token for a lane (None = the mean lane, untokenised so
+    every pre-lane filename is unchanged)."""
+    return "sbref" if lane == LANE_SBREF else None
+
+
+def _lanes(plan: Plan) -> tuple[str, ...]:
+    """Lanes to build, primary first."""
+    return (LANE_SBREF, LANE_MEAN) if plan.use_sbref else (LANE_MEAN,)
+
+
+def _primary_lane(plan: Plan) -> str:
+    """The lane that *estimates* the cross-run and cross-session transforms."""
+    return LANE_SBREF if plan.use_sbref else LANE_MEAN
+
+
+def _run_level(pr: PlanRun, lane: str) -> str:
+    """A run's native-space image for this lane, in the run's post-moco space."""
+    if lane == LANE_SBREF:
+        return str(pr.bold.sbref_path)
+    return _moco_mean(pr)
+
+
+def _run_level_var(lane: str) -> str:
+    """``_run_level`` as a bash data-table reference (for the stage loops)."""
+    return "${SBREF[$k]}" if lane == LANE_SBREF else "${MOCOMEAN[$k]}"
+
+
+def _common_grid(pr: PlanRun, session_first: PlanRun, lane: str) -> str:
+    """The grid this run's runmean lands on — the space its session averages in.
+
+    With fieldmaps that is the reference fmap's undistorted mean; without, the
+    session's anchor run. Both lanes' images share a run's native geometry (an
+    SBRef is acquired on its BOLD's grid), so the lanes stay voxel-comparable
+    whichever is asked for.
+    """
+    if pr.fmap is not None:
+        return _ref_blip_mean(pr)
+    return _run_level(session_first, lane)
+
+
+def _runmean(pr: PlanRun, lane: str = LANE_MEAN) -> str:
+    """This run's lane image resampled onto the reference-fmap grid (sesmean
+    input). Still called ``runmean`` in the SBRef lane: the label names the
+    pyramid *level*, ``src-`` names the lineage."""
+    return _run_stem(pr, "runmean", src=_src(lane)) + ".nii$FMT"
+
+
+def _sesmean(session: str | None, lane: str = LANE_MEAN) -> str:
+    """One session's mean: the average of its aligned run images, in that session's
     own space (the xses source for non-reference sessions)."""
-    return stem(NameKey("sesmean", session=session)) + ".nii$FMT"
+    return stem(NameKey("sesmean", session=session, src=_src(lane))) + ".nii$FMT"
 
 
-def _grandmean() -> str:
+def _grandmean(lane: str = LANE_MEAN) -> str:
     """THE grandmean: every run of every session, after cross-session alignment.
     Built in stage08 (not 07) because it cannot exist until xses has put the
     sessions in a single space."""
-    return stem(NameKey("grandmean")) + ".nii$FMT"
+    return stem(NameKey("grandmean", src=_src(lane))) + ".nii$FMT"
 
 
 def _ref_marker(key: NameKey, source: str, note: str) -> str:
@@ -286,16 +363,22 @@ def _needs_fmapmean(plan: Plan) -> bool:
 def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
     """The EPI-contrast image the anat step aligns (or ffs_segment consumes).
 
-    All three choices sit on the reference-fmap grid, so the warp chain is
+    All four choices sit on the reference-fmap grid, so the warp chain is
     identical whichever is picked — only the image content differs:
-      grandmean  every run's mean averaged; best SNR, N interpolations deep, and
-                 the only option without fieldmaps.
+      grandmean  every run's moco mean averaged; best SNR, N interpolations deep,
+                 and the only option without fieldmaps or SBRefs.
+      sbmean     every run's SBRef averaged, same spaces as the grandmean: one
+                 interpolation instead of two, single-band contrast, no multiband
+                 slice-leakage — the best cross-modal ``lpc`` source there is when
+                 SBRefs exist, and unlike ref_fmap it uses ALL the data.
       ref_fmap   the reference group's undistorted blip mean; one interpolation,
                  sharpest, SBRef contrast — the image that *defines* the space.
       mean_fmap  ref_fmap averaged with the other groups' xfmap-aligned means;
                  ref_fmap's provenance with more SNR (multi-fieldmap only).
     """
     mode = effective_anat_source(plan, requested)
+    if mode == "sbmean":
+        return _grandmean(LANE_SBREF)
     if mode == "ref_fmap":
         anchor = ref_anchor(plan)
         if anchor is not None:
@@ -321,34 +404,37 @@ def _moco_mean(pr: PlanRun) -> str:
     return _run_stem(pr, "moco") + "_mean.nii$FMT"
 
 
-def _xrun_base(pr: PlanRun, session_first: PlanRun) -> str | None:
+def _xrun_base(pr: PlanRun, session_first: PlanRun, lane: str = LANE_MEAN) -> str | None:
     """Base image for this run's xrun alignment, or None if it needs no xrun.
 
     Fieldmap-anchored: the group's DISTORTED forward (blip_up) — blip_half
-    undistorts *after* xrun in the chain, so xrun stays in distorted space.
-    No-fmap: the session's first-run moco mean.
+    undistorts *after* xrun in the chain, so xrun stays in distorted space. That
+    forward image is already ``BoldRun.rep``, i.e. the SBRef when one exists, so
+    the fieldmap path has always had an SBRef base; what the lane changes is the
+    *source* it is matched against.
+    No-fmap: the session's first run, same lane as the source.
     """
     if "wxrun_lin" not in pr.warp_chain:
         return None
     if pr.fmap is not None:
         return pr.fmap_forward
-    return _moco_mean(session_first)  # first-run anchor
+    return _run_level(session_first, lane)  # first-run anchor
 
 
-def _aligned_mean(pr: PlanRun) -> str:
-    """The run's mean in the session's common (sesmean) space.
+def _aligned_mean(pr: PlanRun, lane: str = LANE_MEAN) -> str:
+    """The run's lane image in the session's common (sesmean) space.
 
-    With fieldmaps: the runmean (moco-mean pushed through xfmap∘blip∘wxrun onto
-    the reference-fmap grid). No fieldmap: the xrun-aligned mean (nonlinear result
-    if xrun_nonlin ran, else linear), or the moco mean for the anchor run.
+    One rule for every run: push the lane image through the run's pre-chain
+    (xfmap∘blip∘wxrun, whichever of those it has) onto the common grid — that is
+    the runmean. A run with an empty pre-chain is the anchor and already sits in
+    the common space, so it *is* its own aligned image.
+
+    Both lanes ride the same pre-chain, which is what makes a runmean and its
+    ``src-sbref`` sibling directly comparable.
     """
-    if pr.fmap is not None:
-        return _runmean(pr)
-    if "wxrun_nl" in pr.warp_chain:
-        return _run_stem(pr, "xrun") + "_nl.nii$FMT"
-    if "wxrun_lin" in pr.warp_chain:
-        return _run_stem(pr, "xrun") + ".nii$FMT"
-    return _moco_mean(pr)
+    if _pre_chain(pr, ".nii$FMT"):
+        return _runmean(pr, lane)
+    return _run_level(pr, lane)
 
 
 # ---------------------------------------------------------------------------
@@ -360,6 +446,19 @@ def _skip_default(opt) -> int:
     """Default value for the batched stages' skip toggle: 1 (skip complete runs,
     the resumable default) unless -batch_overwrite forces a full re-process."""
     return 0 if opt.batch_overwrite else 1
+
+
+def _sbref_header_note(plan: Plan) -> str:
+    """What the SBRef lane is doing in this script, for the header block."""
+    if not plan.use_sbref:
+        return "  (no SBRef for every run, or -moco_ref is not sbref)"
+    return (
+        "\n#     SBRefs are the moco base, so they need no within-run transform and\n"
+        "#     estimate the cross-run/cross-session alignment. `ls *src-sbref*` is\n"
+        "#     the whole lane; the same files without that tag are the BOLD-mean\n"
+        "#     lane, resampled by the SAME transforms — compare them as a check.\n"
+        "#     -anat_source sbmean points the anat alignment at stage08.grandmean.src-sbref."
+    )
 
 
 def _header(plan: Plan, out_dir: str) -> str:
@@ -386,6 +485,7 @@ def _header(plan: Plan, out_dir: str) -> str:
 #   sessions          : {"multi" if plan.multi_session else "single"}
 #   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {opt.distortion}   slice-timing : {opt.slicetiming_method}
 #   phase  : {_phase_on(plan)}
+#   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
 # =============================================================================
 set -euo pipefail
 
@@ -411,10 +511,11 @@ def _data_arrays(plan: Plan) -> str:
         "# ============================ per-run data table ============================",
     ]
     keys = [_key(pr) for pr in plan.runs]
+    primary = _primary_lane(plan)
     lines.append("RUN_KEYS=(" + " ".join(shlex.quote(k) for k in keys) + ")")
     lines.append(
-        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN MOCOMEAN XRUNBASE ALIGNED "
-        "PRECHAIN REFBLIP"
+        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN MOCOMEAN XRUNBASE "
+        "ALIGNED ALIGNED_SB PRECHAIN REFGRID REFGRID_SB"
     )
 
     # first run per session (the no-fmap anchor).
@@ -442,14 +543,27 @@ def _data_arrays(plan: Plan) -> str:
         # so they are double-quoted (not shlex-quoted). The key and the values
         # are our own constructed names — no shell metacharacters beyond $FMT.
         lines.append(f'MOCOMEAN[{q(k)}]="{_moco_mean(pr)}"')
-        base = _xrun_base(pr, first_by_ses[b.session])
+        # xrun base is lane-aware only in the no-fmap case; with a fieldmap it is
+        # the group's forward image (already the SBRef when there is one).
+        base = _xrun_base(pr, first_by_ses[b.session], primary)
         if base is not None:
             lines.append(f'XRUNBASE[{q(k)}]="{base}"')
-        lines.append(f'ALIGNED[{q(k)}]="{_aligned_mean(pr)}"')
-        if pr.fmap is not None:
-            # runmean sub-chain (moco-mean → reference-fmap grid) + that grid.
-            lines.append(f'PRECHAIN[{q(k)}]="{" ".join(_fmap_subchain(pr, ".nii$FMT"))}"')
-            lines.append(f'REFBLIP[{q(k)}]="{_ref_blip_mean(pr)}"')
+        lines.append(f'ALIGNED[{q(k)}]="{_aligned_mean(pr, LANE_MEAN)}"')
+        # Pre-chain (lane image → the session's common grid) + that grid, per
+        # lane. Empty for a no-fmap session's anchor run: it defines the grid.
+        pre = _pre_chain(pr, ".nii$FMT")
+        if pre:
+            lines.append(f'PRECHAIN[{q(k)}]="{" ".join(pre)}"')
+        lines.append(f'REFGRID[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], LANE_MEAN)}"')
+        if plan.use_sbref:
+            lines.append(f'ALIGNED_SB[{q(k)}]="{_aligned_mean(pr, LANE_SBREF)}"')
+            lines.append(
+                f'REFGRID_SB[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], LANE_SBREF)}"'
+            )
+            # The SBRef rides the run's chain minus the within-run motion tokens:
+            # it IS the moco base, so it needs no transform of its own.
+            sbchain = chain_files(pr, ".nii$FMT", plan.options, tokens=sbref_chain(pr))
+            lines.append(f'SBCHAIN[{q(k)}]="{" ".join(sbchain)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
     return "\n".join(lines) + "\n"
@@ -488,6 +602,9 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         {str(pr.bold.mag_path) for pr in plan.runs}
         | {str(pr.bold.phase_path) for pr in plan.runs if pr.bold.phase_path}
         | {str(pr.fmap.reverse_path) for pr in plan.runs if pr.fmap}
+        # SBRefs are load-bearing once the lane is on (moco base, xrun source,
+        # the whole sbmean pyramid) — a missing one should fail here, not midway.
+        | {str(pr.bold.sbref_path) for pr in plan.runs if pr.use_sbref}
         # The GLM is the last stage; a missing events file or design spec should
         # fail here, not after an hour of preprocessing. Only files we actually
         # resolved are checked (a task with no events warns at generation time).
@@ -788,15 +905,18 @@ def _stage_xfmap(plan: Plan) -> str:
 
 def _stage_xrun(plan: Plan) -> str:
     opt = plan.options
+    primary = _primary_lane(plan)
+    src_var = _run_level_var(primary)
     nl = ""
     if opt.xrun_nonlin:
-        # Residual nonlinear refinement of the linear-aligned mean → distinct
-        # `_nl` output (never overwrite the linear source); this feeds grandmean.
+        # Residual nonlinear refinement of the linear-aligned image → distinct
+        # `_nl` output (never overwrite the linear source). The warp is a chain
+        # link shared by BOTH lanes, so it keeps the lane-free stem (naming.py).
         fw = _ffs(
             "ffs_formwarp",
             [
                 '-base "$base"',
-                '-source "${xstem}.nii$FMT"',
+                '-source "${xstem}${LANE}.nii$FMT"',
                 '-prefix "${xstem}_nl.nii$FMT"',
                 "-save_warp",
                 *_split_flags(config.DEFAULT_OPTS["xrun_nl"]),
@@ -805,12 +925,15 @@ def _stage_xrun(plan: Plan) -> str:
             indent="    ",
         )
         nl = f'  if [ ! -f "${{xstem}}_nl_WARP.nii$FMT" ]; then\n{fw}\n  fi\n'
+    # The aligned images the pyramid actually consumes are stage07's runmeans
+    # (both lanes, one shared matrix); these -prefix outputs are alignment QC, so
+    # they carry the lane that produced them. The matrix never does.
     lin = _ffs(
         "ffs_allineate",
         [
             '-base "$base"',
-            '-source "${MOCOMEAN[$k]}"',
-            '-prefix "${xstem}.nii$FMT"',
+            f'-source "{src_var}"',
+            '-prefix "${xstem}${LANE}.nii$FMT"',
             '-1Dmatrix_save "${xstem}.aff12.1D"',
             *_split_flags(config.DEFAULT_OPTS["xrun"]),
             '-device "$DEVICE"',
@@ -818,7 +941,7 @@ def _stage_xrun(plan: Plan) -> str:
         indent="    ",
     )
     # No-fmap mode: the session's first run IS the anchor, so it gets no xrun output.
-    # Emit its moco mean under the xrun name so the listing covers every run.
+    # Emit its lane image under the xrun name so the listing covers every run.
     markers = [
         _ref_marker(
             NameKey(
@@ -826,20 +949,30 @@ def _stage_xrun(plan: Plan) -> str:
                 session=pr.bold.session,
                 task=pr.bold.task,
                 run=pr.bold.run or None,
+                src=_src(primary),
                 role="ref",
             ),
-            _moco_mean(pr),
+            _run_level(pr, primary),
             f"QC: {_frag(pr)} is the cross-run anchor — no transform.",
         )
         for pr in plan.runs
         if "wxrun_lin" not in pr.warp_chain
     ]
     marker_block = ("\n".join(markers) + "\n") if markers else ""
+    lane_note = (
+        "# Source is each run's SBRef: it is the moco base, so it is already in the\n"
+        "# run's corrected space with no transform of its own, and it matches the\n"
+        "# base's contrast (the fieldmap forward image is an SBRef too). Both lanes\n"
+        "# are then resampled by the ONE matrix this saves.\n"
+        if primary == LANE_SBREF
+        else ""
+    )
     return f"""
 # ============================ stage06: cross-run alignment ==================
-# Align each run's mean to its anchor (fmap group mean, or the session's first
+# Align each run to its anchor (fmap group forward image, or the session's first
 # run when there are no fmaps). Saves a matrix that composes into the chain.
-echo '== stage06: cross-run alignment =='
+{lane_note}echo '== stage06: cross-run alignment =='
+LANE="{f".src-{_src(primary)}" if _src(primary) else ""}"   # lineage tag on the QC images
 {marker_block}for k in "${{RUN_KEYS[@]}}"; do
   base="${{XRUNBASE[$k]:-}}"
   [ -z "$base" ] && continue   # this run is the anchor (identity) — no xrun
@@ -863,55 +996,70 @@ def _stage_grandmean(plan: Plan) -> str:
     for pr in plan.runs:
         by_ses.setdefault(pr.bold.session, []).append(pr)
     out = ["", "# ============================ stage07: run + session means =================="]
-    # Fieldmap runs first get a "runmean": their moco-mean pushed through
-    # xfmap∘blip∘xrun onto the reference-fmap grid, so runs from different fmap
-    # groups average in one common space. (No-fmap runs skip this — PRECHAIN unset.)
-    if any(pr.fmap is not None for pr in plan.runs):
-        nwarp_opts = config.DEFAULT_OPTS["nwarp"]
+    # Every run first gets a "runmean": its lane image pushed through the run's
+    # pre-chain (xfmap∘blip∘xrun, whichever it has) onto the session's common
+    # grid, so runs from different fmap groups average in one space. A no-fmap
+    # session's anchor run defines that grid and has no pre-chain, so it is
+    # skipped here and feeds the session mean directly.
+    nwarp_opts = config.DEFAULT_OPTS["nwarp"]
+    for lane in _lanes(plan):
+        grid_arr = "REFGRID_SB" if lane == LANE_SBREF else "REFGRID"
+        suffix = f".src-{_src(lane)}" if _src(lane) else ""
         runmean_cmd = _ffs(
             "ffs_nwarp",
             [
-                '-source "${MOCOMEAN[$k]}"',
+                f'-source "{_run_level_var(lane)}"',
                 '-nwarp "${PRECHAIN[$k]}"',
-                '-master "${REFBLIP[$k]}"',
+                f'-master "${{{grid_arr}[$k]}}"',
                 *_split_flags(nwarp_opts),
-                '-prefix "stage07.runmean.${FRAG[$k]}.nii$FMT"',
+                f'-prefix "stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"',
                 '-device "$DEVICE"',
             ],
         )
-        out.append("echo '== stage07: run means (→ reference-fmap grid) =='")
+        label = "SBRefs" if lane == LANE_SBREF else "run means"
+        out.append(f"echo '== stage07: {label} (→ session common grid) =='")
         out.append(
             'for k in "${RUN_KEYS[@]}"; do\n'
-            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # no-fmap run, no runmean\n'
-            '  pm="stage07.runmean.${FRAG[$k]}.nii$FMT"\n'
+            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # anchor run, already on the grid\n'
+            f'  pm="stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"\n'
             '  [ -f "$pm" ] && continue\n'
             f"{runmean_cmd}\n"
             "done"
         )
     out.append("echo '== stage07: session means =='")
-    for ses, prs in by_ses.items():
-        aligned = " ".join(f'"{_aligned_mean(pr)}"' for pr in prs)
-        out.append(
-            _ffs(
-                "ffs_util_3dmath",
-                [
-                    f"-input {aligned}",
-                    "-mean",
-                    f'-prefix "{_sesmean(ses)}"',
-                    "-overwrite",
-                    '-device "$DEVICE"',
-                ],
-                indent="",
+    for lane in _lanes(plan):
+        for ses, prs in by_ses.items():
+            aligned = " ".join(f'"{_aligned_mean(pr, lane)}"' for pr in prs)
+            out.append(
+                _ffs(
+                    "ffs_util_3dmath",
+                    [
+                        f"-input {aligned}",
+                        "-mean",
+                        f'-prefix "{_sesmean(ses, lane)}"',
+                        "-overwrite",
+                        '-device "$DEVICE"',
+                    ],
+                    indent="",
+                )
             )
-        )
     return "\n".join(out) + "\n"
 
 
-def _xses_aligned(session: str, nonlin: bool) -> str:
-    """The cross-session-aligned session mean for a non-ref session (nl if the
-    nonlinear step ran, else the linear result)."""
-    stem_ = stem(NameKey("xses", session=session))
-    return f"{stem_}_nl.nii$FMT" if nonlin else f"{stem_}.nii$FMT"
+def _xses_aligned(
+    session: str, nonlin: bool, lane: str = LANE_MEAN, primary: str = LANE_MEAN
+) -> str:
+    """The cross-session-aligned session mean for a non-ref session.
+
+    The primary lane gets ffs_allineate's / ffs_formwarp's own output; the other
+    lane gets the same transform re-applied by ``_stage_xses``. A nonlinear
+    primary result keeps the lane-free stem it shares with its ``_WARP``
+    (naming.py) — the re-applied lane always carries ``src-``, so the two never
+    collide.
+    """
+    if lane == primary and nonlin:
+        return stem(NameKey("xses", session=session)) + "_nl.nii$FMT"
+    return stem(NameKey("xses", session=session, src=_src(lane))) + ".nii$FMT"
 
 
 def _stage_xses(plan: Plan) -> str:
@@ -931,32 +1079,44 @@ def _stage_xses(plan: Plan) -> str:
             seen.add(s)
             sessions.append(s)
     ref = plan.ref_session
+    primary = _primary_lane(plan)
+    lane_tag = f".src-{_src(primary)}" if _src(primary) else ""
     out = ["", "# ============================ stage08: cross-session align + grandmean ======"]
     if plan.multi_session:
         out.append("echo '== stage08: cross-session alignment =='")
-    out.append(f'REFGM="{_sesmean(ref)}"')
-    aligned_means = [_sesmean(ref)]  # ref session is already in place
+        if primary == LANE_SBREF:
+            out.append(
+                "# Estimated on the SBRef session means (sharper, single-band contrast);\n"
+                "# the BOLD-mean lane is then resampled by that same transform."
+            )
+    # Base is the primary lane's reference-session mean; both lanes' sesmeans sit
+    # on the same grid, so the one transform lands either of them.
+    out.append(f'REFGM="{_sesmean(ref, primary)}"')
+    # Per lane: the session means already in reference-session space (the ref
+    # session's own) plus the aligned non-ref ones.
+    aligned_by_lane: dict[str, list[str]] = {ln: [_sesmean(ref, ln)] for ln in _lanes(plan)}
     if plan.multi_session:
         # The reference session has no xses transform (it maps to itself) — emit its
         # mean under the xses name so `ls stage08.xses.*` shows every session.
-        out.append(
-            _ref_marker(
-                NameKey("xses", session=ref, role="ref"),
-                _sesmean(ref),
-                f"QC: ses-{ref} is the reference session — no transform, shown for completeness.",
+        for lane in _lanes(plan):
+            out.append(
+                _ref_marker(
+                    NameKey("xses", session=ref, src=_src(lane), role="ref"),
+                    _sesmean(ref, lane),
+                    f"QC: ses-{ref} is the reference session — no transform, "
+                    "shown for completeness.",
+                )
             )
-        )
     for s in sessions:
         if s == ref:
             continue
         xstem = stem(NameKey("xses", session=s))
-        src = _sesmean(s)
         lin = _ffs(
             "ffs_allineate",
             [
                 '-base "$REFGM"',
-                f'-source "{src}"',
-                f'-prefix "{xstem}.nii$FMT"',
+                f'-source "{_sesmean(s, primary)}"',
+                f'-prefix "{xstem}{lane_tag}.nii$FMT"',
                 f'-1Dmatrix_save "{xstem}.aff12.1D"',
                 *_split_flags(config.DEFAULT_OPTS["xses"]),
                 '-device "$DEVICE"',
@@ -970,7 +1130,7 @@ def _stage_xses(plan: Plan) -> str:
                     "ffs_formwarp",
                     [
                         '-base "$REFGM"',
-                        f'-source "{xstem}.nii$FMT"',
+                        f'-source "{xstem}{lane_tag}.nii$FMT"',
                         f'-prefix "{xstem}_nl.nii$FMT"',
                         "-save_warp",
                         *_split_flags(config.DEFAULT_OPTS["xses_nl"]),
@@ -979,26 +1139,51 @@ def _stage_xses(plan: Plan) -> str:
                 )
             )
         out.append("fi")
-        aligned_means.append(_xses_aligned(s, opt.xses_nonlin))
+        for lane in _lanes(plan):
+            dst = _xses_aligned(s, opt.xses_nonlin, lane, primary)
+            aligned_by_lane[lane].append(dst)
+            if lane == primary:
+                continue
+            # Secondary lane: same transform, other lineage. One resample, so this
+            # mean is exactly as many interpolations deep as the primary's.
+            xchain = " ".join(
+                ([f"{xstem}_nl_WARP.nii$FMT"] if opt.xses_nonlin else []) + [f"{xstem}.aff12.1D"]
+            )
+            out.append(
+                f'[ -f "{dst}" ] || \\\n'
+                + _ffs(
+                    "ffs_nwarp",
+                    [
+                        f'-source "{_sesmean(s, lane)}"',
+                        f'-nwarp "{xchain}"',
+                        '-master "$REFGM"',
+                        *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+                        f'-prefix "{dst}"',
+                        '-device "$DEVICE"',
+                    ],
+                )
+            )
 
     # THE grandmean = mean of the reference session's mean + every cross-session-
     # aligned non-ref session mean (all now in reference-session space). This is the
-    # default target the anat alignment (stage09) uses.
+    # default target the anat alignment (stage09) uses; the SBRef lane's sibling is
+    # what -anat_source sbmean selects.
     out.append("echo '== stage08: grandmean (all sessions, post-alignment) =='")
-    allm = " ".join(f'"{m}"' for m in aligned_means)
-    out.append(
-        _ffs(
-            "ffs_util_3dmath",
-            [
-                f"-input {allm}",
-                "-mean",
-                '-prefix "stage08.grandmean.nii$FMT"',
-                "-overwrite",
-                '-device "$DEVICE"',
-            ],
-            indent="",
+    for lane in _lanes(plan):
+        allm = " ".join(f'"{m}"' for m in aligned_by_lane[lane])
+        out.append(
+            _ffs(
+                "ffs_util_3dmath",
+                [
+                    f"-input {allm}",
+                    "-mean",
+                    f'-prefix "{_grandmean(lane)}"',
+                    "-overwrite",
+                    '-device "$DEVICE"',
+                ],
+                indent="",
+            )
         )
-    )
     return "\n".join(out) + "\n"
 
 
@@ -1198,6 +1383,7 @@ def _segment_input(plan: Plan) -> str:
 
     grandmean  → the EPI grandmean (works even with no fieldmap; segment does the
                  distortion correction implicitly against the anat/TPM).
+    sbmean /
     ref_fmap /
     mean_fmap  → the same anchor images ``-anat_source`` selects (shared vocabulary).
     blipfor    → the first fmap group's undistorted forward frame.
@@ -1375,10 +1561,45 @@ for k in "${{RUN_KEYS[@]}}"; do
 {_raw_source(plan)}
   printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
 done
-batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
+{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
 echo 'done → stage10.final.*'
 """
+
+
+def _sbref_final_jobs(plan: Plan) -> str:
+    """Extra stage10 batch entries putting every run's SBRef in the final space.
+
+    Same batch, same master/grid, same transforms as its BOLD — minus the
+    within-run motion tokens the SBRef defines rather than needs (SBCHAIN). No
+    slice-timing argument: a 3-D image has no time axis to shift.
+
+    These are the sharpest per-run images the pipeline can produce in output
+    space, which makes them the QC of record for cross-run and cross-session
+    alignment: overlay them and any residual misregistration is visible directly,
+    not inferred from a motion-blurred mean.
+    """
+    if not plan.use_sbref:
+        return ""
+    nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
+    # An empty SBCHAIN means this SBRef needs no transform at all — the anchor run
+    # of a no-anat, no-fieldmap, single-session plan, whose own space IS the final
+    # space. ffs_nwarp has no identity warp, so that one is a plain regrid.
+    return (
+        "# SBRefs into the final space (QC; same chain minus the moco tokens).\n"
+        'for k in "${RUN_KEYS[@]}"; do\n'
+        '  sboutf="stage10.final.${FRAG[$k]}.src-sbref.nii$FINAL_FMT"\n'
+        '  if [ -z "${SBCHAIN[$k]:-}" ]; then\n'
+        '    [ -f "$sboutf" ] || ffs_util_resample -input "${SBREF[$k]}" \\\n'
+        "      -master stage10.warpmaster.nii$FMT -rmode wsinc5 \\\n"
+        '      -prefix "$sboutf" -device "$DEVICE"\n'
+        "    continue\n"
+        "  fi\n"
+        '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${SBCHAIN[$k]}\\" '
+        '-master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" '
+        f'{nwarp_flags} -prefix \\"$sboutf\\"" >> "$nwarpbatch"\n'
+        "done\n"
+    )
 
 
 def _stage_unwrap(plan: Plan) -> str:

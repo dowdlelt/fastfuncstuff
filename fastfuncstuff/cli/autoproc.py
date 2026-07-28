@@ -89,19 +89,21 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-anat_source",
         "-anat-source",
-        choices=["grandmean", "ref_fmap", "mean_fmap"],
+        choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap"],
         default="grandmean",
         help="EPI image the anat alignment uses (all share the reference-fmap grid): "
-        "grandmean (best SNR, only option w/o fieldmaps) | ref_fmap (reference "
-        "fieldmap's undistorted mean; sharpest, defines the space) | mean_fmap "
-        "(ref_fmap averaged with the other groups' aligned means)",
+        "grandmean (best SNR, only option w/o fieldmaps or SBRefs) | sbmean (the "
+        "same average built from every run's SBRef: single-band contrast, one "
+        "interpolation instead of two) | ref_fmap (reference fieldmap's undistorted "
+        "mean; sharpest, defines the space) | mean_fmap (ref_fmap averaged with the "
+        "other groups' aligned means)",
     )
     g.add_argument(
         "-anat_nonlin_input",
         "-anat-nonlin-input",
-        choices=["grandmean", "ref_fmap", "mean_fmap", "blipfor", "blip_pair"],
+        choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap", "blipfor", "blip_pair"],
         default="grandmean",
-        help="ffs_segment input: grandmean (works w/o fieldmap) | ref_fmap | "
+        help="ffs_segment input: grandmean (works w/o fieldmap) | sbmean | ref_fmap | "
         "mean_fmap | blipfor | blip_pair",
     )
     g.add_argument(
@@ -401,6 +403,26 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "-anat_source is ignored when the anat matrix is borrowed (-grand_reference) "
                 "or overridden (-ref_file): no local anat alignment is computed."
             )
+        elif opt.anat_source == "sbmean":
+            # sbmean rides the SBRef lane, not the fieldmaps — different requirement.
+            missing = [
+                f"{r.task}/run-{r.run or '?'}"
+                for s in subject.sessions
+                for r in s.bold_runs
+                if r.sbref_path is None
+            ]
+            if opt.moco_ref != "sbref":
+                warnings.append(
+                    f"-anat_source sbmean needs -moco_ref sbref (got {opt.moco_ref}): only "
+                    "then is each SBRef the run's post-moco space. Falling back to grandmean."
+                )
+            elif missing:
+                warnings.append(
+                    "-anat_source sbmean needs an SBRef for every run; missing for "
+                    + ", ".join(missing[:4])
+                    + (" ..." if len(missing) > 4 else "")
+                    + ". Falling back to grandmean."
+                )
         elif not any(s.fmaps for s in subject.sessions) or not opt.distortion:
             warnings.append(
                 f"-anat_source {opt.anat_source} needs fieldmaps; falling back to grandmean "

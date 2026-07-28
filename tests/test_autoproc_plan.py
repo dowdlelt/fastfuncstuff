@@ -705,3 +705,100 @@ def test_task_without_events_falls_back_to_flags_with_a_todo(tmp_path: Path):
     # The registry still drives the fallback flags, transform modifier and all.
     assert "-ortvec_glob 'stage02.moco.*task-floc*.motion.1D' motion" in s
     assert "motion_deriv:deriv" in s
+
+
+# ---------------------------------------------------------------------------
+# SBRef lane
+# ---------------------------------------------------------------------------
+
+
+def _sbrun(session, task, run, sbref=True):
+    b = _run(session, task, run)
+    if sbref:
+        b.sbref_path = Path(f"/bids/sb_{session}_{task}_{run}.nii.gz")
+    return b
+
+
+def test_sbref_lane_is_all_or_nothing_and_needs_moco_ref_sbref():
+    """One run without an SBRef turns the lane off for everyone: a session mean
+    that silently mixed SBRef and BOLD-mean contrast would be worse than either
+    lane alone. So does a moco base that isn't the SBRef — the lane's whole
+    premise is that the SBRef IS the run's post-moco space."""
+    from fastfuncstuff.autoproc.plan import sbref_chain
+
+    full = Subject("X", [Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")])])
+    assert build_plan(full, Options()).use_sbref
+
+    partial = Subject(
+        "X", [Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2", sbref=False)])]
+    )
+    assert not build_plan(partial, Options()).use_sbref
+
+    assert not build_plan(full, Options(moco_ref="first")).use_sbref
+
+    # The SBRef rides everything from the fieldmap level up, but never the
+    # within-run motion tokens it defines rather than needs.
+    plan = build_plan(full, Options(locomoco=True))
+    pr = plan.runs[1]
+    assert "moco" in pr.warp_chain and "locomoco" in pr.warp_chain
+    assert "moco" not in sbref_chain(pr) and "locomoco" not in sbref_chain(pr)
+    assert sbref_chain(pr) == [t for t in pr.warp_chain if t not in ("moco", "locomoco")]
+
+
+def test_sbref_lane_estimates_transforms_and_keeps_the_mean_lane():
+    """xrun/xses are estimated from SBRefs, but the BOLD-mean pyramid survives
+    intact — same transforms, other lineage — so the two are comparable."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")]),
+            Session("02", [_sbrun("02", "t", "1")]),
+        ],
+    )
+    s = write_script(build_plan(subj, Options(ref_ses="01")), "wd", bids_root="/bids")
+
+    # xrun source is the SBRef, not the moco mean; the matrix stays lane-free so
+    # both lanes are resampled by exactly the same file.
+    assert '-source "${SBREF[$k]}"' in s
+    assert '-1Dmatrix_save "${xstem}.aff12.1D"' in s
+    assert '-source "${MOCOMEAN[$k]}"' not in s.split("stage07")[0]
+
+    # xses is estimated on the SBRef session means...
+    assert '-source "stage07.sesmean.ses-02.src-sbref.nii$FMT"' in s
+    # ...and re-applied to the BOLD-mean one, so both grandmeans exist.
+    assert '-prefix "stage08.xses.ses-02.nii$FMT"' in s
+    assert '-prefix "stage08.grandmean.src-sbref.nii$FMT"' in s
+    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+
+    # Both lanes' session means are built from their own runmeans.
+    assert "stage07.runmean.ses-01.task-t.run-2.src-sbref.nii$FMT" in s
+    assert "stage07.runmean.ses-01.task-t.run-2.nii$FMT" in s
+
+
+def test_sbrefs_reach_the_final_space():
+    """Every run's SBRef lands on the warpmaster grid alongside its timeseries —
+    the sharpest per-run alignment QC the pipeline can produce."""
+    subj = Subject("X", [Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert 'sboutf="stage10.final.${FRAG[$k]}.src-sbref.nii$FINAL_FMT"' in s
+    assert '-nwarp \\"${SBCHAIN[$k]}\\"' in s
+    # SBRefs are load-bearing once the lane is on, so preflight checks them.
+    assert "/bids/sb_01_t_1.nii.gz" in s.split("stage02")[0]
+
+    # A run whose SBRef needs no transform at all (no anat, no fmap, anchor run)
+    # cannot go through ffs_nwarp — there is no identity warp. It regrids instead.
+    bare = write_script(
+        build_plan(subj, Options(go_to_anat=False, distortion=False)), "wd", bids_root="/bids"
+    )
+    assert 'if [ -z "${SBCHAIN[$k]:-}" ]; then' in bare
+    assert 'ffs_util_resample -input "${SBREF[$k]}"' in bare
+
+
+def test_anat_source_sbmean_needs_the_lane():
+    subj_sb = Subject("X", [Session("01", [_sbrun("01", "t", "1")])])
+    subj_no = Subject("X", [Session("01", [_run("01", "t", "1")])])
+    assert effective_anat_source(build_plan(subj_sb, Options(anat_source="sbmean"))) == "sbmean"
+    assert effective_anat_source(build_plan(subj_no, Options(anat_source="sbmean"))) == "grandmean"
+
+    s = write_script(build_plan(subj_sb, Options(anat_source="sbmean")), "wd", bids_root="/bids")
+    assert '-source "stage08.grandmean.src-sbref.nii$FMT"' in s

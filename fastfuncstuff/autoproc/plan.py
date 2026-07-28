@@ -69,8 +69,8 @@ class Options:
     # Which EPI-contrast image the anat linear step aligns to. All choices live on
     # the SAME grid (the reference fmap's undistorted space) — see
     # ``effective_anat_source``; they differ only in SNR/sharpness/contrast.
-    anat_source: str = "grandmean"  # grandmean | ref_fmap | mean_fmap
-    anat_nonlin_input: str = "grandmean"  # ffs_segment input: + blipfor|blip_pair
+    anat_source: str = "grandmean"  # grandmean | sbmean | ref_fmap | mean_fmap
+    anat_nonlin_input: str = "grandmean"  # ffs_segment input: + sbmean|blipfor|blip_pair
     # -grand_reference: path to ANOTHER autoproc results dir whose anat matrix
     # this run borrows; this data's grandmean is aligned to that ref (xref_*).
     # This is how a filtered `primary`-only script anchors on a floc run.
@@ -138,6 +138,10 @@ class PlanRun:
     # cross-fmap alignment and the per-run premeans land on.
     ref_fmap_id: str | None = None
     warp_chain: list[str] = field(default_factory=list)
+    # This run's SBRef is usable as an alignment source: it exists, and the moco
+    # base IS that SBRef — which is what puts it in the run's post-moco space
+    # with no transform of its own (see ``sbref_chain``).
+    use_sbref: bool = False
 
 
 @dataclass
@@ -147,6 +151,31 @@ class Plan:
     runs: list[PlanRun]
     ref_session: str | None
     multi_session: bool
+
+    @property
+    def use_sbref(self) -> bool:
+        """True when the SBRef lane is available for the *whole* dataset.
+
+        All-or-nothing on purpose: the lane's value is that every run's image is
+        directly comparable to every other's, and a sesmean silently mixing SBRef
+        and BOLD-mean contrast would be worse than either lane alone. A dataset
+        that has SBRefs at all normally has one per BOLD run.
+        """
+        return bool(self.runs) and all(pr.use_sbref for pr in self.runs)
+
+
+def sbref_chain(pr: PlanRun) -> list[str]:
+    """The warp chain for this run's SBRef: the run's chain minus the tokens that
+    describe *within-run* motion.
+
+    ``moco`` goes because the SBRef is the moco base — it already defines the
+    space that token maps into, so applying it would be a double correction.
+    ``locomoco`` goes for the same reason one step out: it converges to the mean
+    of the rigid-corrected series, and its per-volume PE wiggles average to
+    roughly nothing over a run, so that mean and the SBRef describe the same
+    space to within the accuracy locomoco itself is correcting.
+    """
+    return [tok for tok in pr.warp_chain if tok not in ("moco", "locomoco")]
 
 
 def ref_anchor(plan: Plan) -> PlanRun | None:
@@ -194,11 +223,13 @@ def effective_anat_source(plan: Plan, requested: str | None = None) -> str:
     ``ref_fmap`` / ``mean_fmap`` need fieldmaps; without them the grandmean is the
     only EPI-contrast image there is (and ``ffs_segment`` is then what recovers the
     distortion). ``mean_fmap`` with a single group degenerates to ``ref_fmap`` —
-    averaging one image is just that image.
+    averaging one image is just that image. ``sbmean`` needs the SBRef lane.
     """
     mode = requested if requested is not None else plan.options.anat_source
     if mode == "grandmean":
         return mode
+    if mode == "sbmean":
+        return mode if plan.use_sbref else "grandmean"
     ids = anchor_fmap_ids(plan)
     if not ids:
         return "grandmean"
@@ -308,6 +339,10 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 is_ref_run=(not has_fmaps and bold.run == session_first_run),
                 fmap_forward=(forward_by_fmap.get(fmap.fmap_id) if fmap else None),
                 ref_fmap_id=(ref_fmap_id if fmap else None),
+                # Only ``-moco_ref sbref`` makes the SBRef the post-moco space; any
+                # other base leaves it an unregistered image with no transform of
+                # its own, so the lane is off.
+                use_sbref=(bold.sbref_path is not None and opt.moco_ref == "sbref"),
             )
             pr.warp_chain = build_warp_chain(pr, opt, multi_session)
             runs.append(pr)

@@ -4,12 +4,25 @@ Every intermediate/final file follows a single, greppable scheme so that a
 human reading the working directory can tell at a glance which stage, session,
 fieldmap, task and run produced it::
 
-    stageNN.<label>[.ses-<S>][.task-<T>][.fmap-<F>][.run-<R>][.part-phase][.role-ref]<ext>
+    stageNN.<label>[.ses-<S>][.task-<T>][.fmap-<F>][.run-<R>][.part-phase]
+                   [.src-sbref][.role-ref]<ext>
 
 Consistent BIDS-style ``key-value`` tokens throughout, with the run entity kept
 raw (``run-010``, no re-padding). Fieldmap groups carry an explicit ``fmap-<F>``
 so multi-fieldmap sessions stay unambiguous. Tokens are omitted where they don't
 apply (an anat matrix has none; a session mean has only ``ses-<S>``).
+
+``src-<lane>`` marks the *lineage* of an image: ``src-sbref`` is built from the
+runs' SBRefs, no token is built from the motion-corrected BOLD means. The two
+lanes describe the same anatomy in the same space, so a `foo` / `foo.src-sbref`
+pair is directly comparable — that is what makes the mean lane a usable sanity
+check on the sbref lane (and vice versa). ``ls *src-sbref*`` is the whole lane.
+
+Transforms (``.aff12.1D``, ``_WARP``) never carry ``src-``: a run's alignment is
+a property of the run, and *both* lanes are resampled by the same one — that
+shared-transform property is the point. The one wrinkle is the ``_nl`` image
+ffs_formwarp writes beside its ``_WARP``: it inherits the transform's lane-free
+stem even though its content is whichever lane was the estimation source.
 
 Tool-specific suffixes (``.aff12.1D``, ``_warp``, ``.1D``) are appended by the
 tools; this module owns only the *prefix* stem. ``coord()`` returns just the
@@ -74,6 +87,9 @@ class NameKey:
     fmap: str | None = None
     run: str | None = None
     part: str | None = None  # e.g. "phase"
+    # Image lineage (``src-sbref``); None = the motion-corrected BOLD-mean lane.
+    # Never set on a transform — see the module docstring.
+    src: str | None = None
     # Marks a QC-only stand-in for the level's *reference*, which by definition has
     # no transform of its own (``role-ref``). Alignment stages skip their reference
     # — so browsing e.g. stage08.xses.* otherwise shows N-1 files and it's on the
@@ -102,6 +118,8 @@ def coord(key: NameKey) -> str:
         parts.append(f"run-{key.run}")  # raw run entity, not re-padded
     if key.part is not None:
         parts.append(f"part-{key.part}")
+    if key.src is not None:
+        parts.append(f"src-{key.src}")
     if key.role is not None:
         parts.append(f"role-{key.role}")
     return ".".join(parts)
