@@ -800,7 +800,10 @@ def fit_combinatorial_denoising(
             )
 
         if verbose:
-            best_combo_display = tuple(pc + 1 for pc in best_combo)
+            # 0-indexed, matching optimal_pcs.json, the saved PC columns and the
+            # end-of-run summary. A 1-indexed display here made the same fold
+            # look like it picked a different PC set in two places.
+            best_combo_display = tuple(best_combo)
             if singleton_only:
                 print(f"  Selected PCs: {best_combo_display}")
                 print(f"  Baseline CoD: {median_cod[0]:.4f}")
