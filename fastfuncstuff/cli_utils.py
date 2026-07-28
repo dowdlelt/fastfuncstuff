@@ -719,6 +719,120 @@ def load_and_preprocess_runs(
     return result
 
 
+def restrict_voxels(
+    data: torch.Tensor,
+    keep: torch.Tensor,
+    volume_shape: tuple,
+    mask_flat: np.ndarray | None,
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray, int]:
+    """
+    Drop voxels from a (n_voxels, n_timepoints) matrix and update its masks.
+
+    *keep* is a boolean tensor over the CURRENT rows of *data* (i.e. already
+    within *mask_flat* if one is active).  The returned ``mask``/``mask_flat``
+    are full-volume, so every downstream unmask-and-save keeps working and the
+    dropped voxels come back as zeros in the output volumes.
+
+    Returns ``(data, mask, mask_flat, n_voxels)``.
+    """
+    keep_np = keep.detach().cpu().numpy().astype(bool)
+    n_full = int(np.prod(volume_shape))
+
+    new_flat = np.zeros(n_full, dtype=bool)
+    if mask_flat is not None:
+        new_flat[np.flatnonzero(mask_flat)[keep_np]] = True
+    else:
+        new_flat[keep_np] = True
+
+    data = data[torch.as_tensor(keep_np, device=data.device)]
+    new_mask = new_flat.reshape(volume_shape)
+    return data, new_mask, new_flat, int(new_flat.sum())
+
+
+def find_constant_voxels(
+    data: torch.Tensor,
+    run_starts: list[int],
+    tol: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Boolean mask (True = usable) of voxels with real variance in EVERY run.
+
+    Voxels that are flat in any run — out-of-FoV background, the empty corners
+    left by an oblique rotation, dead slices — cannot be fit or cross-validated.
+    Worse, they score R²=1: SS_res and SS_tot are both 0, and the 1e-10 floor on
+    SS_tot turns ``1 - 0/0`` into a perfect fit. Drop them, don't model them.
+    """
+    n_voxels, n_timepoints = data.shape
+    valid = torch.ones(n_voxels, dtype=torch.bool, device=data.device)
+    for run_idx in range(len(run_starts)):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx + 1 < len(run_starts) else n_timepoints
+        valid &= data[:, start_tp:end_tp].std(dim=1) > tol
+    return valid
+
+
+def compute_automask_from_data(
+    data: torch.Tensor,
+    run_starts: list[int],
+    volume_shape: tuple,
+    mask_flat: np.ndarray | None = None,
+    dilate_extra: int = 4,
+    verbose: bool = True,
+) -> np.ndarray:
+    """
+    AFNI-style automask (full-volume flat bool) from the mean of the first run.
+
+    The mean is taken over run 1 only — enough signal to find the brain, and it
+    avoids materialising the whole timeseries mean for long concatenations.
+    """
+    from fastfuncstuff.processing.mask import automask as _automask
+
+    end_tp = run_starts[1] if len(run_starts) > 1 else data.shape[1]
+    mean_1d = data[:, :end_tp].mean(dim=1).cpu()
+
+    if mask_flat is not None:
+        mean_full = torch.zeros(int(np.prod(volume_shape)), dtype=mean_1d.dtype)
+        mean_full[torch.from_numpy(mask_flat)] = mean_1d
+        mean_3d = mean_full.reshape(volume_shape)
+    else:
+        mean_3d = mean_1d.reshape(volume_shape)
+
+    auto_mask_3d = _automask(mean_3d, dilate_extra=dilate_extra, verbose=verbose)
+    auto_flat = auto_mask_3d.numpy().flatten().astype(bool)
+    if mask_flat is not None:
+        auto_flat = auto_flat & mask_flat
+    return auto_flat
+
+
+def apply_automask(
+    data: torch.Tensor,
+    run_starts: list[int],
+    volume_shape: tuple,
+    mask_flat: np.ndarray | None,
+    dilate_extra: int = 4,
+    verbose: bool = True,
+) -> tuple[torch.Tensor, np.ndarray, np.ndarray, int]:
+    """
+    Compute an automask and restrict *data* to it.
+
+    Returns ``(data, mask, mask_flat, n_voxels)`` like :func:`restrict_voxels`.
+    """
+    auto_flat = compute_automask_from_data(
+        data, run_starts, volume_shape, mask_flat, dilate_extra, verbose
+    )
+    if verbose:
+        n_full = int(np.prod(volume_shape))
+        print(
+            f"  Automask: {auto_flat.sum():,} / {n_full:,} voxels "
+            f"({100 * auto_flat.sum() / n_full:.1f}%)"
+        )
+
+    # auto_flat is full-volume; convert to a keep-mask over the current rows.
+    keep_full = torch.from_numpy(auto_flat)
+    keep = keep_full[torch.from_numpy(mask_flat)] if mask_flat is not None else keep_full
+    return restrict_voxels(data, keep, volume_shape, mask_flat)
+
+
 def save_volume_nifti(
     data_flat: torch.Tensor | np.ndarray,
     filename: str,

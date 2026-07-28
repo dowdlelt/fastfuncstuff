@@ -445,6 +445,14 @@ Notes:
         "with dilate=4). Applied before brainthresh. Mutually exclusive with -mask.",
     )
     proc_opts.add_argument(
+        "-keep_constant_voxels",
+        "-keep-constant-voxels",
+        dest="keep_constant_voxels",
+        action="store_true",
+        help="Keep voxels that are flat (zero variance) in one or more runs. Off by "
+        "default: such voxels are out-of-FoV background and score a meaningless R2=1.",
+    )
+    proc_opts.add_argument(
         "-hrf_opt",
         type=str,
         default=None,
@@ -1628,58 +1636,20 @@ def main():
             print("ERROR: -automask and -mask are mutually exclusive")
             sys.exit(1)
 
-        from fastfuncstuff.processing.mask import automask as compute_automask
+        from fastfuncstuff.cli_utils import apply_automask
 
         print()
         print("Computing automask from mean EPI...")
 
-        # Compute mean of first run in 3D
-        end_tp = run_starts[1] if n_runs > 1 else n_timepoints
-        if mask_flat is not None:
-            # Data is already masked — unmask to 3D for automask computation
-            mean_1d = data[:, :end_tp].mean(dim=1).cpu()
-            mean_full = torch.zeros(int(np.prod(volume_shape)), dtype=mean_1d.dtype)
-            mean_full[torch.from_numpy(mask_flat)] = mean_1d
-            mean_3d = mean_full.reshape(volume_shape)
-        else:
-            mean_3d = data[:, :end_tp].mean(dim=1).cpu().reshape(volume_shape)
-
-        auto_mask_3d = compute_automask(mean_3d, dilate_extra=4, verbose=True)
-        auto_mask_flat = auto_mask_3d.numpy().flatten().astype(bool)
-
-        # Combine with any existing mask
-        if mask_flat is not None:
-            auto_mask_flat = auto_mask_flat & mask_flat
-        n_automask = auto_mask_flat.sum()
-        print(
-            f"  Automask: {n_automask:,} / {int(np.prod(volume_shape)):,} voxels "
-            f"({100 * n_automask / np.prod(volume_shape):.1f}%)"
+        data, mask, mask_flat, n_voxels = apply_automask(
+            data=data,
+            run_starts=run_starts,
+            volume_shape=volume_shape,
+            mask_flat=mask_flat,
+            verbose=True,
         )
-
-        # Apply automask to data
-        auto_mask_flat_t = torch.from_numpy(auto_mask_flat)
-        if mask_flat is not None:
-            # Data already masked — need to sub-select within existing mask
-            existing_mask_t = torch.from_numpy(mask_flat)
-            # Map auto_mask_flat (full volume) to indices within existing mask
-            keep_in_data = auto_mask_flat_t[existing_mask_t]
-            data = data[keep_in_data]
-        else:
-            data = data[auto_mask_flat_t]
-
-        mask = auto_mask_3d.numpy()
-        mask_flat = auto_mask_flat
-        n_voxels = int(auto_mask_flat.sum())
-
-        # Save automask for reference
-        automask_vol = auto_mask_3d.numpy().astype(np.float32)
-        save_nifti(
-            automask_vol,
-            output_path=f"{args.prefix}_automask{_nii_ext}",
-            affine=affine,
-            header=nifti_header,
-        )
-        print(f"  Saved: {args.prefix}_automask{_nii_ext}")
+        # Saved after the constant-voxel filter below, so the file on disk is
+        # the voxel set actually analysed rather than the pre-filter automask.
 
     print()
 
@@ -1708,35 +1678,46 @@ def main():
             f"  Voxels above threshold: {n_above:,} of {n_voxels:,} ({n_above / n_voxels * 100:.1f}%)"
         )
 
-    # Filter out voxels with zero/low variance in ANY run (edge artifacts)
-    # This prevents extreme negative R² values from runs with all-zero data
+    # Drop voxels with zero/low variance in ANY run (out-of-FoV background, the
+    # empty corners of an oblique-rotated volume, dead slices). Excluding them
+    # from the noise pool alone is not enough: they still reach the R² maps,
+    # where SS_res = SS_tot = 0 scores them a spurious 1.0.
+    from fastfuncstuff.cli_utils import find_constant_voxels, restrict_voxels
+
     print()
     print("Filtering voxels with invalid data in any run...")
-    valid_per_run_mask = torch.ones(n_voxels, dtype=torch.bool, device=data.device)
-
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_data = data[:, start_tp:end_tp]
-
-        # Check for runs with zero variance (constant or all-zero)
-        run_std = run_data.std(dim=1)
-        run_valid = run_std > 1e-6  # Require non-zero variance
-
-        valid_per_run_mask &= run_valid
-
-    n_valid = valid_per_run_mask.sum().item()
+    valid_per_run_mask = find_constant_voxels(data, run_starts)
+    n_valid = int(valid_per_run_mask.sum().item())
     n_invalid = n_voxels - n_valid
 
     if n_invalid > 0:
-        print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
-        print(f"  Valid voxels: {n_valid:,} ({n_valid / n_voxels * 100:.1f}%)")
-
-        # Combine with brainthresh mask if it exists
-        if brainthresh_mask is not None:
-            brainthresh_mask = brainthresh_mask & valid_per_run_mask
+        if args.keep_constant_voxels:
+            print(
+                f"  {n_invalid:,} voxels are zero/constant in at least one run "
+                "(kept: -keep_constant_voxels); excluded from the noise pool"
+            )
+            brainthresh_mask = (
+                valid_per_run_mask
+                if brainthresh_mask is None
+                else brainthresh_mask & valid_per_run_mask
+            )
         else:
-            brainthresh_mask = valid_per_run_mask
+            print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
+            print(f"  Valid voxels: {n_valid:,} ({n_valid / n_voxels * 100:.1f}%)")
+            data, mask, mask_flat, n_voxels = restrict_voxels(
+                data, valid_per_run_mask, volume_shape, mask_flat
+            )
+            if brainthresh_mask is not None:
+                brainthresh_mask = brainthresh_mask[valid_per_run_mask.to(brainthresh_mask.device)]
+
+    if args.automask and mask is not None:
+        save_nifti(
+            mask.astype(np.float32),
+            output_path=f"{args.prefix}_automask{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
+        print(f"  Saved: {args.prefix}_automask{_nii_ext}")
 
     # Optional scaling
     if args.do_scale:
