@@ -28,19 +28,47 @@ _NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
 
 
 @contextlib.contextmanager
-def spinner(message: str, stream=None, interval: float = 0.1) -> Iterator[None]:
+def spinner(
+    message: str,
+    stream=None,
+    interval: float = 0.1,
+    *,
+    enabled: bool = True,
+    leave: bool = True,
+) -> Iterator[None]:
     """Show a braille spinner next to ``message`` while the ``with`` block runs.
 
     For opaque single-shot work a progress bar can't measure — reading one big
     run off disk, a slow decompress — where the only honest signal is "still
     going". Animates on a background thread so the wrapped call is unblocked, and
-    only when ``stream`` is a real terminal: piped/redirected output gets nothing
-    (no ``\\r`` spam in logs). The line is cleared on exit, so the caller's own
-    result line (shape, timing) reads as the completion notice.
+    only when ``stream`` is a real terminal. On exit the line is rewritten as
+    ``message done (1.2s)`` and left in place, so the transcript keeps a record of
+    every step and its cost; pass ``leave=False`` to clear it instead (for callers
+    whose own result line is the completion notice).
+
+    Non-interactive output gets no ``\\r`` spam: just the single final
+    ``message ... done (1.2s)`` line once the block finishes.
+
+    Parameters
+    ----------
+    enabled : bool
+        When false, run the block with no output at all (quiet/verbosity gates).
     """
+    if not enabled:
+        yield
+        return
+
     stream = stream or sys.stderr
-    if not getattr(stream, "isatty", lambda: False)():
-        yield  # non-interactive: stay silent, let the caller's prints speak
+    tty = getattr(stream, "isatty", lambda: False)()
+    t0 = time.perf_counter()
+
+    if not tty:
+        try:
+            yield
+        finally:
+            if leave:
+                stream.write(f"{message} ... done ({time.perf_counter() - t0:.1f}s)\n")
+                stream.flush()
         return
 
     stop = threading.Event()
@@ -61,6 +89,8 @@ def spinner(message: str, stream=None, interval: float = 0.1) -> Iterator[None]:
         stop.set()
         thread.join()
         stream.write("\r\033[K")  # carriage return + clear-to-end-of-line
+        if leave:
+            stream.write(f"✔ {message} done ({time.perf_counter() - t0:.1f}s)\n")
         stream.flush()
 
 

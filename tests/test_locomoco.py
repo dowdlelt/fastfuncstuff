@@ -655,16 +655,28 @@ def test_automask_gates_flow_outside_brain():
     assert np.abs(inside).max() > 0.3
 
 
-def test_spinner_silent_when_not_a_tty():
+def test_spinner_not_a_tty_emits_one_line():
     import io
 
     from fastfuncstuff.cli_utils import spinner
 
-    buf = io.StringIO()  # StringIO.isatty() is False -> no animation, no output
+    buf = io.StringIO()  # StringIO.isatty() is False -> no animation, one final line
     ran = []
     with spinner("loading", stream=buf, interval=0.001):
         ran.append(True)
     assert ran == [True]
+    out = buf.getvalue()
+    assert "\r" not in out  # no carriage-return spam in logs
+    assert out.startswith("loading ... done (") and out.endswith("s)\n")
+
+    buf = io.StringIO()
+    with spinner("loading", stream=buf, leave=False):
+        pass
+    assert buf.getvalue() == ""
+
+    buf = io.StringIO()
+    with spinner("loading", stream=buf, enabled=False):
+        pass
     assert buf.getvalue() == ""
 
 

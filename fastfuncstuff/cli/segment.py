@@ -17,15 +17,12 @@ Method + validation: ``../fmri_wiki/concepts/Unified Segmentation.md``. Library:
 from __future__ import annotations
 
 import argparse
-import itertools
 import sys
-import threading
-import time
-from contextlib import contextmanager
 
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
@@ -47,38 +44,7 @@ from fastfuncstuff.processing.segment import (
 _IMG_EXTS = (".nii.gz", ".nii.zst", ".nii", ".HEAD", ".BRIK.gz", ".BRIK")
 
 
-@contextmanager
-def _step(msg: str, *, enabled: bool = True):
-    """Announce a stage; on a TTY, animate a spinner while it runs (for slow steps
-    without their own tqdm bar). Prints the elapsed time when the block finishes."""
-    if not enabled:
-        yield
-        return
-    t0 = time.time()
-    tty = sys.stderr.isatty()
-    stop = threading.Event()
-
-    def _spin() -> None:
-        for ch in itertools.cycle("|/-\\"):
-            if stop.is_set():
-                break
-            print(f"\r{msg} {ch}", end="", file=sys.stderr, flush=True)
-            time.sleep(0.1)
-
-    worker = threading.Thread(target=_spin, daemon=True) if tty else None
-    if worker is not None:
-        worker.start()
-    else:
-        print(f"{msg} ...", flush=True)
-    try:
-        yield
-    finally:
-        stop.set()
-        if worker is not None:
-            worker.join()
-            print(f"\r{msg} done ({time.time() - t0:.1f}s)", file=sys.stderr, flush=True)
-        else:
-            print(f"{msg} done ({time.time() - t0:.1f}s)", flush=True)
+_step = spinner  # stage announcements are just the shared spinner
 
 
 def _strip_ext(prefix: str) -> str:
