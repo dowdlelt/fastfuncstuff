@@ -22,6 +22,7 @@ from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import find_events
 from fastfuncstuff.autoproc.naming import STAGE_NUMBERS
 from fastfuncstuff.autoproc.plan import Plan, PlanRun
+from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
 def spec_path(task: str) -> str:
@@ -90,6 +91,57 @@ def copy_events(plan: Plan, bids_root: str | None, work_dir: str) -> list[str]:
         shutil.copyfile(src, target)
         made.append(dest)
     return made
+
+
+def requested_event_cols(task: str, opt) -> tuple[str, str, str] | None:
+    """The ``(onset, duration, trial_type)`` column names asked for for ``task``.
+
+    ``-sep_spec_event_cols TASK ...`` wins over the dataset-wide
+    ``-spec_event_cols``; ``None`` means the BIDS defaults, which is also what
+    keeps ``events_columns`` out of the generated TOML entirely.
+    """
+    per_task = (opt.sep_spec_event_cols or {}).get(task)
+    return per_task or opt.spec_event_cols
+
+
+def resolve_event_cols(
+    task: str, events_paths: list, opt
+) -> tuple[tuple[str, str, str] | None, str | None]:
+    """``(columns to use, warning)`` for ``task``, after checking the files.
+
+    A named column that no events TSV actually has would make the spec compile
+    to an empty design (or crash) an hour of preprocessing later, so it is
+    checked here against the real headers and falls back to the BIDS defaults
+    with a warning. Falling back rather than erroring is deliberate: the whole
+    point of ffs_autoproc is to finish and hand you an editable model — the
+    column names are one line of the TOML to fix.
+    """
+    import csv
+
+    want = requested_event_cols(task, opt)
+    if want is None:
+        return None, None
+
+    missing: dict[str, list[str]] = {}
+    for path in events_paths:
+        try:
+            with open(path, newline="") as fh:
+                header = next(csv.reader(fh, delimiter="\t"), [])
+        except OSError as exc:
+            return None, f"task-{task}: cannot read {Path(path).name} ({exc}); using BIDS defaults"
+        absent = [c for c in want if c not in header]
+        if absent:
+            missing[Path(path).name] = absent
+    if not missing:
+        return want, None
+
+    name, absent = next(iter(missing.items()))
+    more = f" (+{len(missing) - 1} more file(s))" if len(missing) > 1 else ""
+    return None, (
+        f"task-{task}: events column(s) {', '.join(absent)} not in {name}{more} — "
+        f"falling back to the BIDS defaults {'/'.join(DEFAULT_EVENT_COLUMNS)}. "
+        "Fix events_columns in the design TOML if that is wrong."
+    )
 
 
 def nuisance_specs(task: str, opt) -> tuple[list, list[str]]:
@@ -184,12 +236,14 @@ def write_design_specs(
 
         trs = {pr.bold.tr for pr in prs if pr.bold.tr}
         nuisance, _skipped = nuisance_specs(task, opt)
+        event_cols, _warn = resolve_event_cols(task, scan_paths, opt)
         try:
             spec, notes = build_stub_spec(
                 [Path(f"stage10.final.{_frag(pr)}.nii{opt.final_fmt}") for pr in prs],
                 scan_paths,
                 tr=trs.pop() if len(trs) == 1 else None,
                 n_timepoints_per_run=[_n_timepoints(pr, opt.noise_vols) for pr in prs],
+                event_cols=event_cols,
                 nuisance=nuisance,
             )
         except (ValueError, OSError) as exc:

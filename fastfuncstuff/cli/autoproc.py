@@ -21,6 +21,7 @@ from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
+from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
 def _opt_help(key: str) -> str:
@@ -259,6 +260,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="events TSV(s) (bids); single = broadcast, or one per run. "
         "Overrides BIDS-discovered events.",
     )
+    g.add_argument(
+        "-spec_event_cols",
+        "-spec-event-cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET", "DURATION", "TRIAL_TYPE"),
+        help="column names inside the events TSVs, for EVERY task (default: the "
+        "BIDS " + "/".join(DEFAULT_EVENT_COLUMNS) + "). Written as events_columns "
+        "in each design TOML. A name that is not actually in the file falls back "
+        "to the defaults for that task, with a warning.",
+    )
+    g.add_argument(
+        "-sep_spec_event_cols",
+        "-sep-spec-event-cols",
+        nargs=4,
+        action="append",
+        default=None,
+        metavar=("TASK", "ONSET", "DURATION", "TRIAL_TYPE"),
+        help="per-task version of -spec_event_cols; repeat once per task. Wins "
+        "over -spec_event_cols for the task it names, so one oddly-columned task "
+        "does not force the others to be spelled out.",
+    )
 
     g = p.add_argument_group("batching")
     g.add_argument(
@@ -438,10 +461,36 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 f"-glm_ortvec {name} needs -{req}, which is off — that nuisance block is "
                 "dropped from the design."
             )
+    # A -sep_spec_event_cols entry naming a task that is not in scope is almost
+    # always a typo, and it would silently do nothing.
+    all_tasks = {r.task for s in subject.sessions for r in s.bold_runs}
+    for task in sorted(opt.sep_spec_event_cols or {}):
+        if task not in all_tasks:
+            warnings.append(
+                f"-sep_spec_event_cols names task '{task}', which is not in this "
+                f"subject/scope ({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
+            )
+    # The requested event columns must exist in the files, or the design compiles
+    # to nothing an hour later. Checked here; the spec writer falls back the same
+    # way, so the warning and the TOML agree.
+    if opt.run_glm and (opt.spec_event_cols or opt.sep_spec_event_cols):
+        from fastfuncstuff.autoproc.glm import resolve_event_cols
+
+        for task in sorted(all_tasks):
+            if opt.events:
+                paths = [Path(e) for e in opt.events]
+            else:
+                paths = [ev for _, ev in _events_by_run(args.bids_dir, task, subject) if ev]
+            if not paths:
+                continue
+            _cols, warn = resolve_event_cols(task, paths, opt)
+            if warn:
+                warnings.append(warn)
+
     # Events: not a hard error (preprocessing still runs), but warn per task so
     # the user knows the GLM will fail without them.
     if opt.run_glm and not opt.events:
-        tasks = {r.task for s in subject.sessions for r in s.bold_runs}
+        tasks = all_tasks
         for task in sorted(tasks):
             pairs = _events_by_run(args.bids_dir, task, subject)
             missing = [r for r, ev in pairs if ev is None]
@@ -479,6 +528,18 @@ def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
             f"  known: {', '.join(config.GLM_ORTVEC)}"
         )
     return names
+
+
+def _resolve_event_cols(
+    args,
+) -> tuple[tuple[str, str, str] | None, dict[str, tuple[str, str, str]]]:
+    """``(dataset-wide triple, {task: triple})`` from -spec_event_cols /
+    -sep_spec_event_cols. A task named twice keeps the last spelling."""
+    wide = tuple(args.spec_event_cols) if args.spec_event_cols else None
+    per_task: dict[str, tuple[str, str, str]] = {}
+    for task, *cols in args.sep_spec_event_cols or []:
+        per_task[task[len("task-") :] if task.startswith("task-") else task] = tuple(cols)
+    return wide, per_task  # type: ignore[return-value]
 
 
 def _events_by_run(bids_dir: str, task: str, subject) -> list[tuple[BoldRun, Path | None]]:
@@ -650,6 +711,7 @@ def main(argv: list[str] | None = None) -> int:
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
     anat_nonlin = eff(args.anat_nonlin, "anat_nonlin")
+    event_cols, event_cols_by_task = _resolve_event_cols(args)
 
     # TPM resolution: an explicit -tpm wins; else, with -suma, build one in-script
     # from FreeSurfer outputs (no ahead-of-time SPM TPM needed).
@@ -670,6 +732,8 @@ def main(argv: list[str] | None = None) -> int:
         glm_ortvec=_resolve_glm_ortvec(args, recipe),
         glm_opts=args.glm_opts or "",
         glm_spec_overwrite=args.glm_spec_overwrite,
+        spec_event_cols=event_cols,
+        sep_spec_event_cols=event_cols_by_task,
         locomoco=eff(args.locomoco, "locomoco"),
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),

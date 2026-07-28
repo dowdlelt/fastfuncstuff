@@ -55,6 +55,14 @@ class Options:
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False
+    # Column names inside the events TSVs: (onset, duration, trial_type). None =
+    # the BIDS defaults. ``spec_event_cols`` applies to every task;
+    # ``sep_spec_event_cols`` maps a task name to its own triple and wins for
+    # that task — one non-BIDS task in a session does not force the others to
+    # be spelled out. A requested column that is not in the file falls back to
+    # the defaults for that task, with a warning.
+    spec_event_cols: tuple[str, str, str] | None = None
+    sep_spec_event_cols: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     locomoco: bool = False
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False

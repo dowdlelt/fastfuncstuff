@@ -722,6 +722,84 @@ def test_events_are_copied_into_stimuli_and_named_relatively(tmp_path: Path):
     assert {e.trial_type for e in spec.events} == {"face", "place"}
 
 
+def _bids_two_tasks(tmp_path: Path, n_tp: int = 12):
+    """Two tasks: 'floc' with BIDS columns, 'imagery' with a 'condition' column
+    (and its trial_type column holding something coarser)."""
+    import nibabel as nib
+    import numpy as np
+
+    func = tmp_path / "sub-ME1" / "ses-SM" / "func"
+    func.mkdir(parents=True)
+    rows = {
+        "floc": "onset\tduration\ttrial_type\n2\t4\tface\n10\t4\tplace\n",
+        "imagery": (
+            "onset\tduration\ttrial_type\tcondition\n2\t4\tcue\tcue_A\n10\t4\tcue\tcue_B\n"
+        ),
+    }
+    for task, text in rows.items():
+        base = f"sub-ME1_ses-SM_task-{task}_run-01"
+        img = nib.Nifti1Image(np.zeros((2, 2, 2, n_tp), dtype=np.float32), np.eye(4))
+        img.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+        nib.save(img, func / f"{base}_part-mag_bold.nii.gz")
+        (func / f"{base}_part-mag_bold.json").write_text(
+            '{"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}'
+        )
+        (func / f"{base}_events.tsv").write_text(text)
+    return func
+
+
+def test_event_cols_are_per_task_and_reach_the_design_toml(tmp_path: Path):
+    """-spec_event_cols sets the columns for every task; -sep_spec_event_cols
+    overrides one task, so a single oddly-columned task does not force the rest
+    to be spelled out. Both end up as events_columns in that task's TOML."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_two_tasks(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    plan = build_plan(
+        subj,
+        Options(run_glm=True, sep_spec_event_cols={"imagery": ("onset", "duration", "condition")}),
+    )
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+
+    imagery = load_spec(tmp_path / "wd" / "stage11.design.task-imagery.toml")
+    assert imagery.meta.events_columns.trial_type == "condition"
+    # The trial types were scanned through THAT column, not trial_type.
+    assert {e.trial_type for e in imagery.events} == {"cue_A", "cue_B"}
+
+    floc = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert floc.meta.events_columns.trial_type == "trial_type"
+    assert {e.trial_type for e in floc.events} == {"face", "place"}
+
+
+def test_event_cols_fall_back_to_bids_defaults_with_a_warning(tmp_path: Path):
+    """A column that is not in the file would compile to an empty design an hour
+    of preprocessing later. It is caught against the real header, warned about,
+    and the task falls back to the BIDS defaults — generation still finishes."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import resolve_event_cols, write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    func = _bids_two_tasks(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    opt = Options(run_glm=True, spec_event_cols=("onset", "duration", "nope"))
+    plan = build_plan(subj, opt)
+
+    cols, warn = resolve_event_cols(
+        "floc", [func / "sub-ME1_ses-SM_task-floc_run-01_events.tsv"], opt
+    )
+    assert cols is None
+    assert "nope" in warn and "onset/duration/trial_type" in warn
+
+    rows = write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+    assert all(status == "wrote" for _, _, status in rows)  # finished anyway
+    spec = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert spec.meta.events_columns.trial_type == "trial_type"
+    assert {e.trial_type for e in spec.events} == {"face", "place"}
+
+
 def test_existing_design_spec_is_never_clobbered(tmp_path: Path):
     """Re-running ffs_autoproc is routine; silently discarding an edited model
     would be the worst bug this tool could have."""
