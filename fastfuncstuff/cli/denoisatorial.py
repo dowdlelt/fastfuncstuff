@@ -263,9 +263,27 @@ Notes:
     )
     combo_opts.add_argument(
         "-criteria_r2_threshold",
+        "-criteria-r2-threshold",
+        dest="criteria_r2_threshold",
+        type=str,
+        default="0.05",
+        metavar="SPEC",
+        help="Which voxels the CoD is medianed over — the responsive ones. "
+        "A float is an absolute inner-CV R2 threshold (0.05); 'N%%' takes the top "
+        "N percent by inner-CV R2 ('5%%'); '(N)' takes the top N voxels ('(1000)'). "
+        "An absolute threshold that yields under 100 voxels falls back to "
+        "-criteria_fallback_pct. Too permissive is the dangerous direction: at 0.0 "
+        "the median lands on an unresponsive voxel and PC deltas collapse to noise.",
+    )
+    combo_opts.add_argument(
+        "-criteria_fallback_pct",
+        "-criteria-fallback-pct",
+        dest="criteria_fallback_pct",
         type=float,
-        default=0.0,
-        help="Min inner-CV R2 for criteria voxels (default: 0.0).",
+        default=5.0,
+        metavar="PCT",
+        help="Top-percentile fallback when an absolute -criteria_r2_threshold "
+        "selects too few voxels (default: 5.0).",
     )
     combo_opts.add_argument(
         "-selection_strategy",
@@ -648,6 +666,16 @@ def main():
         sys.exit(1)
     if args.event_cols and not args.events:
         print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+
+    # Fail on a malformed criteria spec now, not after a long data load.
+    from fastfuncstuff.denoise.combinatorial import parse_criteria_spec
+
+    try:
+        parse_criteria_spec(args.criteria_r2_threshold)
+    except ValueError as exc:
+        print(f"ERROR: -criteria_r2_threshold {args.criteria_r2_threshold!r}: {exc}")
+        print("  Expected a float (0.05), a percentile ('5%'), or a top-N ('(1000)').")
         sys.exit(1)
 
     pfx = parse_prefix(args.prefix)
@@ -1151,6 +1179,7 @@ def main():
         initial_r2=initial_r2,
         max_pcs=args.max_pcs,
         criteria_r2_threshold=args.criteria_r2_threshold,
+        criteria_fallback_percentile=args.criteria_fallback_pct,
         selection_strategy=args.selection_strategy,
         singleton_only=args.singleton_only,
         designs_by_hrf=designs_by_hrf,

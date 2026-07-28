@@ -393,6 +393,90 @@ def select_optimal_combination(
 # ============================================================================
 
 
+def parse_criteria_spec(spec: float | int | str) -> tuple[str, float]:
+    """
+    Parse a criteria-pool specification into ``(kind, value)``.
+
+    Accepted forms::
+
+        0.05      absolute inner-CV R² threshold  → ("abs", 0.05)
+        "5%"      top 5% of voxels by inner R²    → ("pct", 5.0)
+        "(1000)"  top 1000 voxels by inner R²     → ("topn", 1000.0)
+
+    A bare number (float or numeric string) is always an absolute threshold;
+    top-N must be parenthesised so it can never be confused with one.
+    """
+    if isinstance(spec, int | float):
+        return ("abs", float(spec))
+
+    s = str(spec).strip()
+    if s.endswith("%"):
+        pct = float(s[:-1])
+        if not 0.0 < pct <= 100.0:
+            raise ValueError(f"Criteria percentile must be in (0, 100], got {s}")
+        return ("pct", pct)
+    if s.startswith("(") and s.endswith(")"):
+        n = float(s[1:-1])
+        if n < 1:
+            raise ValueError(f"Criteria top-N must be >= 1, got {s}")
+        return ("topn", n)
+    return ("abs", float(s))
+
+
+def select_criteria_voxels(
+    inner_r2: torch.Tensor,
+    spec: float | int | str = 0.05,
+    fallback_percentile: float = 5.0,
+    min_criteria: int = 100,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """
+    Choose the criteria voxels — the responsive voxels the CoD is medianed over.
+
+    An absolute R² threshold is the honest criterion but its yield swings with
+    tSNR, so when it selects fewer than *min_criteria* voxels we fall back to the
+    top *fallback_percentile* percent by inner-CV R². Percentile and top-N specs
+    are self-sizing and never fall back.
+
+    A too-permissive pool is the failure that matters: at threshold 0.0 the
+    median lands on a voxel with no response, the singleton deltas collapse to
+    ~1e-4, and PC selection becomes a coin flip.
+    """
+    kind, value = parse_criteria_spec(spec)
+    n_voxels = inner_r2.numel()
+
+    def _top_n(n: int) -> torch.Tensor:
+        n = int(max(1, min(n, n_voxels)))
+        mask = torch.zeros(n_voxels, dtype=torch.bool, device=inner_r2.device)
+        mask[inner_r2.topk(n).indices] = True
+        return mask
+
+    if kind == "abs":
+        mask = inner_r2 > value
+        n_sel = int(mask.sum().item())
+        if n_sel < min_criteria:
+            n_fallback = max(min_criteria, int(round(n_voxels * fallback_percentile / 100.0)))
+            if verbose:
+                print(
+                    f"  Criteria pool: R2 > {value:g} gives only {n_sel:,} voxels; "
+                    f"falling back to top {fallback_percentile:g}% ({n_fallback:,} voxels)"
+                )
+            return _top_n(n_fallback)
+        if verbose:
+            print(f"  Criteria pool: R2 > {value:g}")
+        return mask
+
+    if kind == "pct":
+        n_sel = max(1, int(round(n_voxels * value / 100.0)))
+        if verbose:
+            print(f"  Criteria pool: top {value:g}% by inner-CV R2 ({n_sel:,} voxels)")
+        return _top_n(n_sel)
+
+    if verbose:
+        print(f"  Criteria pool: top {int(value):,} voxels by inner-CV R2")
+    return _top_n(int(value))
+
+
 def fit_combinatorial_denoising(
     data: torch.Tensor,
     design: torch.Tensor | None,
@@ -402,7 +486,8 @@ def fit_combinatorial_denoising(
     noise_pool_mask: torch.Tensor,
     initial_r2: torch.Tensor,
     max_pcs: int = 7,
-    criteria_r2_threshold: float = 0.0,
+    criteria_r2_threshold: float | int | str = 0.05,
+    criteria_fallback_percentile: float = 5.0,
     selection_strategy: str = "argmax",
     singleton_only: bool = False,
     designs_by_hrf: dict[int, torch.Tensor] | None = None,
@@ -438,8 +523,13 @@ def fit_combinatorial_denoising(
         Initial cross-validated R2 per voxel, (n_voxels,).
     max_pcs : int, default=7
         Number of PCs to extract per run. 2^max_pcs combinations evaluated.
-    criteria_r2_threshold : float, default=0.0
-        Minimum inner-CV R2 for a voxel to be in the criteria pool.
+    criteria_r2_threshold : float or str, default=0.05
+        Criteria-pool specification: a float (absolute inner-CV R2 threshold),
+        ``"5%"`` (top 5% of voxels by inner-CV R2) or ``"(1000)"`` (top 1000
+        voxels). See :func:`select_criteria_voxels`.
+    criteria_fallback_percentile : float, default=5.0
+        When an absolute threshold yields too few voxels, take this top
+        percentile instead.
     selection_strategy : str, default="argmax"
         Strategy for selecting optimal combination (see select_optimal_combination).
     device : torch.device, optional
@@ -494,7 +584,7 @@ def fit_combinatorial_denoising(
         print(f"  Mode: {mode_str}")
         print(f"  Runs: {n_runs}")
         print(f"  Max PCs: {max_pcs} -> {n_combos} combinations per run")
-        print(f"  Criteria R2 threshold: {criteria_r2_threshold}")
+        print(f"  Criteria pool spec: {criteria_r2_threshold}")
         if not singleton_only:
             print(f"  Selection strategy: {selection_strategy}")
 
@@ -665,20 +755,13 @@ def fit_combinatorial_denoising(
             )
             inner_r2 = inner_r2_result["r2"]
 
-        # Criteria pool: voxels with inner R2 > threshold
-        criteria_mask = inner_r2 > criteria_r2_threshold
-        n_criteria = criteria_mask.sum().item()
-
-        if n_criteria < 10:
-            if verbose:
-                print(
-                    f"  WARNING: Only {n_criteria} criteria voxels. "
-                    f"Lowering threshold to include more..."
-                )
-            sorted_r2, _ = inner_r2.sort(descending=True)
-            fallback_threshold = sorted_r2[n_voxels // 2].item()
-            criteria_mask = inner_r2 > fallback_threshold
-            n_criteria = criteria_mask.sum().item()
+        criteria_mask = select_criteria_voxels(
+            inner_r2,
+            spec=criteria_r2_threshold,
+            fallback_percentile=criteria_fallback_percentile,
+            verbose=verbose,
+        )
+        n_criteria = int(criteria_mask.sum().item())
 
         if verbose:
             print(f"  Inner CV R2: median={inner_r2[criteria_mask].median().item():.4f}")
@@ -850,6 +933,7 @@ def fit_combinatorial_denoising(
         "max_pcs": max_pcs,
         "n_combinations": n_combos,
         "criteria_r2_threshold": criteria_r2_threshold,
+        "criteria_fallback_percentile": criteria_fallback_percentile,
         "selection_strategy": selection_strategy,
         "singleton_only": singleton_only,
         "n_runs": n_runs,
