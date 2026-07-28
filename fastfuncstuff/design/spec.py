@@ -53,7 +53,9 @@ class MetaSpec:
 class EventSpec:
     trial_type: str
     duration: float | Literal["from_events"] = "from_events"
-    hrf: str = "SPMG1(0)"
+    # Bare model name, not "SPMG1(0)": the explicit-argument form is treated as
+    # a user override at compile time and would silently discard `duration`.
+    hrf: str = "SPMG1"
     mode: Literal["condition", "im"] = "condition"
     round_onset: float | Literal["TR"] | None = None
     round_duration: float | None = None
@@ -182,7 +184,7 @@ def build_stub_spec(
     n_timepoints_per_run: list[int] | None = None,
     event_cols: tuple[str, str, str] | None = None,
     drop_trial_types: list[str] | None = None,
-    default_hrf: str = "SPMG1(0)",
+    default_hrf: str = "SPMG1",
     nuisance: list[NuisanceSpec] | None = None,
 ) -> tuple[Spec, dict[str, str]]:
     """Build a stub Spec (+ per-trial-type informational notes) from BOLD

@@ -359,6 +359,17 @@ def _expand_event_to_stims(
     # Resolve duration: explicit number vs from_events.
     if event.duration == "from_events":
         unique_durs = sorted({d for run in per_run for _, d in run})
+        if "(" in event.hrf and unique_durs:
+            # Bug-of-record: stubs used to default to "SPMG1(0)", which reads as
+            # an override and modelled 10 s blocks as impulses. Warn loudly.
+            print(
+                f"⚠️  Event '{event.trial_type}': duration = \"from_events\" but hrf = "
+                f"{event.hrf!r} carries explicit arguments, so the events-file durations "
+                f"(observed {', '.join(f'{d:g}' for d in unique_durs[:5])}"
+                f"{'…' if len(unique_durs) > 5 else ''} s) are IGNORED. "
+                f"Write the bare model name (e.g. '{event.hrf.split('(')[0]}') to use them.",
+                flush=True,
+            )
         if not unique_durs:
             raise ValueError(f"Event '{event.trial_type}': no events found in any run.")
         if event.mode == "im" or len(unique_durs) == 1:

@@ -366,6 +366,33 @@ def test_bare_hrf_compiles_with_duration_from_events(tmp_path):
     assert "task#0" in info["column_labels"]
 
 
+def test_stub_spec_default_hrf_is_bare(tmp_path):
+    """build_stub_spec (the path ffs_autoproc uses) must emit a bare model name.
+
+    Bug of record: the default was ``SPMG1(0)``, which compile reads as an
+    explicit user override, so 10 s blocks were modelled as impulses.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.design.spec import build_stub_spec
+
+    ev = tmp_path / "r01.tsv"
+    _write_events_tsv(ev, [(5.0, 10.0, "face"), (25.0, 10.0, "face")])
+    nii = nib.Nifti1Image(np.zeros((2, 2, 2, 60), dtype=np.float32), np.eye(4))
+    nii.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+    bold = tmp_path / "r01.nii.gz"
+    nib.save(nii, bold)
+
+    spec, _notes = build_stub_spec([bold], [ev])
+    assert spec.events[0].hrf == "SPMG1"
+    assert spec.events[0].duration == "from_events"
+    assert EventSpec(trial_type="x").hrf == "SPMG1"
+
+    from fastfuncstuff.cli.design_spec import _inject_duration
+
+    assert _inject_duration(spec.events[0].hrf, 10.0) == "SPMG1(10)"
+
+
 def test_stub_writes_examples_and_duration_stats(tmp_path):
     """Stub output carries duration-stats comments and example contrasts."""
     from argparse import Namespace
