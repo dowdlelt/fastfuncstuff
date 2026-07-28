@@ -21,6 +21,11 @@ Basic usage:
                       -tr 2.0 \\
                       -prefix subject01_combinatorial
 
+    ffs_denoisatorial -input run*.nii.gz \\
+                      -events sub-01_task-loc_run-*_events.tsv \\
+                      -tr 2.0 \\
+                      -prefix subject01_combinatorial
+
 For help:
     ffs_denoisatorial -help
 """
@@ -112,6 +117,19 @@ Examples:
                     -max_pcs 5 \\
                     -prefix sub01_combo5
 
+  # BIDS events TSVs (one per run) instead of AFNI timing files
+  ffs_denoisatorial -input run*.nii.gz \\
+                    -events sub-01_task-loc_run-*_events.tsv \\
+                    -event_ignore fixation \\
+                    -tr 2.0 \\
+                    -prefix sub01_bids
+
+  # One shared events TSV, broadcast to every run (identical timing per run)
+  ffs_denoisatorial -input run*.nii.gz \\
+                    -events task-loc_events.tsv \\
+                    -tr 2.0 \\
+                    -prefix sub01_shared_timing
+
   # With diagnostic plots
   ffs_denoisatorial -input run*.nii.gz \\
                     -onsets stim.txt \\
@@ -165,14 +183,54 @@ Notes:
     required.add_argument(
         "-onsets",
         nargs="+",
-        required=True,
-        help="Onset timing files (AFNI format). One file per condition.",
+        help="Onset timing files (AFNI format). One file per condition. "
+        "Mutually exclusive with -events.",
     )
     required.add_argument(
         "-durations",
         nargs="+",
-        required=True,
-        help="Stimulus durations in seconds. Either single value or one per condition.",
+        help="Stimulus durations in seconds. Either single value or one per condition. "
+        "Required with -onsets.",
+    )
+    required.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv files, one per run, or a single shared TSV broadcast "
+        "across all runs. Files are sorted by run number (run-1 and run-01 both work). "
+        "Conditions and durations are derived from the TSV. "
+        "Mutually exclusive with -onsets/-durations.",
+    )
+    # Both hyphen and underscore forms, matching the other ffs_* GLM tools.
+    required.add_argument(
+        "-event-ignore",
+        "-event_ignore",
+        dest="event_ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to drop from BIDS events (e.g. fixation null rest).",
+    )
+    required.add_argument(
+        "-event-cols",
+        "-event_cols",
+        dest="event_cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom column names for -events TSVs, replacing the BIDS defaults "
+        "(onset, duration, trial_type).",
+    )
+    required.add_argument(
+        "-round-durations",
+        "-round_durations",
+        dest="round_durations",
+        type=int,
+        default=None,
+        metavar="PLACES",
+        help="Round stimulus durations to PLACES decimal places before uniquing "
+        "(0=integer, 1=tenth). Keeps 3.03 and 3.0 from becoming distinct durations.",
     )
     required.add_argument(
         "-tr",
@@ -271,6 +329,21 @@ Notes:
     proc_opts.add_argument(
         "-mask",
         help="Mask file to restrict analysis to brain voxels",
+    )
+    proc_opts.add_argument(
+        "-automask",
+        action="store_true",
+        help="Compute a brain mask automatically from the mean EPI (AFNI-style "
+        "automask with dilate=4) and restrict the analysis to it. Applied before "
+        "brainthresh. Mutually exclusive with -mask.",
+    )
+    proc_opts.add_argument(
+        "-keep_constant_voxels",
+        "-keep-constant-voxels",
+        dest="keep_constant_voxels",
+        action="store_true",
+        help="Keep voxels that are flat (zero variance) in one or more runs. Off by "
+        "default: such voxels are out-of-FoV background and score a meaningless R2=1.",
     )
     proc_opts.add_argument(
         "-polort",
@@ -560,6 +633,23 @@ def main():
 
     args = parser.parse_args()
 
+    # Timing must come from exactly one source.
+    if bool(args.onsets) == bool(args.events):
+        print("ERROR: Specify exactly one of -onsets/-durations or -events")
+        sys.exit(1)
+    if args.onsets and not args.durations:
+        print("ERROR: -durations is required with -onsets")
+        sys.exit(1)
+    if args.durations and args.events:
+        print("ERROR: -durations is not used with -events (durations come from the TSV)")
+        sys.exit(1)
+    if args.event_ignore and not args.events:
+        print("ERROR: -event_ignore requires -events")
+        sys.exit(1)
+    if args.event_cols and not args.events:
+        print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem  # overwrite with clean stem
     _nii_ext = pfx.nifti_ext
@@ -577,22 +667,71 @@ def main():
         print("  (outer LORO needs >=2 training runs for inner LORO)")
         sys.exit(1)
 
-    # Parse onset files
-    onset_files = args.onsets
-    n_conditions = len(onset_files)
-    from fastfuncstuff.cli_utils import clean_condition_labels
+    # Parse the timing spec: BIDS events TSVs or AFNI timing files.
+    if args.events:
+        from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
 
-    condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
-
-    for f in onset_files:
-        if not Path(f).exists():
-            print(f"ERROR: Onset file not found: {f}")
+        if len(args.events) not in (1, n_runs):
+            print(
+                f"ERROR: -events requires one TSV per run or a single shared TSV: "
+                f"got {len(args.events)} events files but {n_runs} input datasets."
+            )
             sys.exit(1)
 
-    # Parse durations
-    durations = parse_durations(args.durations, n_conditions, condition_labels)
-    print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
-    print(f"  Durations: {durations}s")
+        if len(args.events) == 1 and n_runs > 1:
+            print(f"  Broadcasting 1 events file across {n_runs} runs")
+        for ep in sort_bids_event_files(args.events):
+            print(f"  {ep}")
+
+        try:
+            all_onsets, durations, condition_labels = parse_bids_events(
+                event_files=args.events,
+                event_ignore=args.event_ignore,
+                event_cols=tuple(args.event_cols) if args.event_cols else None,
+                round_durations=args.round_durations,
+                n_runs=n_runs,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        n_conditions = len(condition_labels)
+        print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
+        for cidx, label in enumerate(condition_labels):
+            n_events = sum(len(all_onsets[cidx][r]) for r in range(n_runs))
+            print(
+                f"    {label}: {n_events} events across {n_runs} runs "
+                f"(duration={durations[cidx]:.3f}s)"
+            )
+    else:
+        onset_files = args.onsets
+        n_conditions = len(onset_files)
+        from fastfuncstuff.cli_utils import clean_condition_labels
+
+        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+
+        for f in onset_files:
+            if not Path(f).exists():
+                print(f"ERROR: Onset file not found: {f}")
+                sys.exit(1)
+
+        durations = parse_durations(args.durations, n_conditions, condition_labels)
+        if args.round_durations is not None:
+            durations = [round(d, args.round_durations) for d in durations]
+
+        all_onsets = []
+        for onset_file in onset_files:
+            onsets_by_run = parse_afni_timing_file(onset_file)
+            if len(onsets_by_run) != n_runs:
+                print(
+                    f"ERROR: Onset file {onset_file} has "
+                    f"{len(onsets_by_run)} runs, expected {n_runs}"
+                )
+                sys.exit(1)
+            all_onsets.append(onsets_by_run)
+
+        print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
+        print(f"  Durations: {durations}s")
 
     # Parse HRF model arguments
     from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
@@ -669,6 +808,24 @@ def main():
     if args.tr is None:
         args.tr = load_result.tr
 
+    nifti_header = load_result.nifti_header
+
+    # Automask BEFORE brainthresh / scaling, so every later step sees brain only
+    if args.automask:
+        from fastfuncstuff.cli_utils import apply_automask
+
+        print()
+        print("Computing automask from mean EPI...")
+        data, mask, mask_flat, n_voxels = apply_automask(
+            data=data,
+            run_starts=run_starts,
+            volume_shape=volume_shape,
+            mask_flat=mask_flat,
+            verbose=True,
+        )
+        # Saved after the constant-voxel filter below, so the file on disk is
+        # the voxel set actually analysed rather than the pre-filter automask.
+
     # Compute brainthresh intensity mask BEFORE scaling
     brainthresh_mask = None
     if args.brainthresh is not None:
@@ -684,26 +841,47 @@ def main():
         print(f"  Threshold: {threshold:.2f}")
         print(f"  Voxels above: {n_above:,} of {n_voxels:,} ({n_above / n_voxels * 100:.1f}%)")
 
-    # Filter zero-variance voxels
+    # Drop zero-variance voxels outright. Keeping them only in the noise-pool
+    # exclusion (the old behaviour) still let them reach the R² maps, where
+    # 1 - 0/0 scores them a perfect 1.0 and painted the out-of-FoV background.
+    from fastfuncstuff.cli_utils import find_constant_voxels, restrict_voxels
+
     print()
     print("Filtering voxels with invalid data in any run...")
-    valid_per_run_mask = torch.ones(n_voxels, dtype=torch.bool, device=data.device)
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_data = data[:, start_tp:end_tp]
-        run_std = run_data.std(dim=1)
-        run_valid = run_std > 1e-6
-        valid_per_run_mask &= run_valid
-
-    n_valid = valid_per_run_mask.sum().item()
+    valid_per_run_mask = find_constant_voxels(data, run_starts)
+    n_valid = int(valid_per_run_mask.sum().item())
     n_invalid = n_voxels - n_valid
+
     if n_invalid > 0:
-        print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
-        if brainthresh_mask is not None:
-            brainthresh_mask = brainthresh_mask & valid_per_run_mask
+        if args.keep_constant_voxels:
+            print(
+                f"  {n_invalid:,} voxels are zero/constant in at least one run "
+                "(kept: -keep_constant_voxels); excluded from the noise pool"
+            )
+            brainthresh_mask = (
+                valid_per_run_mask
+                if brainthresh_mask is None
+                else brainthresh_mask & valid_per_run_mask
+            )
         else:
-            brainthresh_mask = valid_per_run_mask
+            print(f"  Removed {n_invalid:,} voxels with zero/constant values in any run")
+            print(f"  Valid voxels: {n_valid:,} ({n_valid / n_voxels * 100:.1f}%)")
+            data, mask, mask_flat, n_voxels = restrict_voxels(
+                data, valid_per_run_mask, volume_shape, mask_flat
+            )
+            if brainthresh_mask is not None:
+                brainthresh_mask = brainthresh_mask[valid_per_run_mask.to(brainthresh_mask.device)]
+    else:
+        print("  All voxels have usable variance in every run")
+
+    if args.automask and mask is not None:
+        save_nifti(
+            mask.astype(np.float32),
+            output_path=f"{args.prefix}_automask{_nii_ext}",
+            affine=affine,
+            header=nifti_header,
+        )
+        print(f"  Saved: {args.prefix}_automask{_nii_ext}")
 
     # Optional scaling
     if args.do_scale:
@@ -723,17 +901,6 @@ def main():
     # ======================================================================
     print()
     print("Building design matrix...")
-
-    # Parse onset files
-    all_onsets = []
-    for onset_file in onset_files:
-        onsets_by_run = parse_afni_timing_file(onset_file)
-        if len(onsets_by_run) != n_runs:
-            print(
-                f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
-            )
-            sys.exit(1)
-        all_onsets.append(onsets_by_run)
 
     # Build onset matrix at microtime resolution
     bins_per_tr = int(np.round(args.tr / args.microtime_dt))
