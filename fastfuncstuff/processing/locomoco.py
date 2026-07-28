@@ -3792,6 +3792,7 @@ def polish_me_result(
     optimizer: str = "gn",
     compile: bool = False,
     full: bool = False,
+    slicewise: bool = True,
     raw_datas: list[np.ndarray] | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -3808,6 +3809,14 @@ def polish_me_result(
       (``raw_datas``, seed 0) to the reference -- qwarp owns the whole field, output is
       just the qwarp field (the flow pass only built the reference). Needs a fuller
       cascade (more levels) since it starts from the full distortion.
+
+    ``slicewise=True`` (the default, for 2-D multi-slice EPI) makes the qwarp patches
+    2-D: one voxel thick along the slice axis, in-plane basis only. That matches the
+    estimator, which solves each slice independently because each slice is acquired at
+    its own instant -- a 3-D patch would smooth the field across ``minpatch`` slices,
+    i.e. across acquisition times. Pass ``slicewise=False`` for 3-D-acquired EPI
+    (``-is_3dacq`` / ``-me_3depi``), where the volume is one shot and through-plane
+    continuity is real.
 
     Both are JOINT: one shared PE field, every echo scored at ``alpha_e·field``.
     Returns a new :class:`MultiEchoLocomocoResult` the CLI writes exactly like the
@@ -3866,6 +3875,9 @@ def polish_me_result(
         optimizer=optimizer if cost == "ncc" else "adam",
         compile=compile,
     )
+    # slice_axis and pe_axis are both NIfTI axes, which the qwarp grid labels the same
+    # way (channel 0=x); the (z,y,x) storage order is handled inside the plan.
+    slicewise_axis = ref.slice_axis if slicewise else None
     warped, resid = qwarp_pe_scaled_polish_series(
         base_echoes,
         source_series,
@@ -3876,6 +3888,7 @@ def polish_me_result(
         n_levels=n_levels,
         device=device,
         show_progress=verbose,
+        slicewise_axis=slicewise_axis,
     )
 
     r = resid.permute(2, 1, 0, 3).contiguous()  # (nx, ny, nz, T) qwarp field, echo-1 scale
@@ -3913,9 +3926,14 @@ def polish_me_result(
         sel = rr[rr > 0]
         med = float(sel.median()) if sel.numel() else 0.0
         tag = "field |w|" if full else "residual |r|"
+        geom = (
+            f"2-D {minpatch}×{minpatch} patches, slicewise along {'xyz'[ref.slice_axis]}"
+            if slicewise
+            else f"3-D {minpatch}³ patches"
+        )
         print(
             f"🪄 qwarp {'backend' if full else 'polish'}: {tag} median {med:.3f} vox, "
-            f"max {float(rr.max()):.3f} vox (minpatch {minpatch}, {n_levels} levels, "
+            f"max {float(rr.max()):.3f} vox ({geom}, {n_levels} levels, "
             f"{cost}/{optimizer if cost == 'ncc' else 'adam'})"
         )
 

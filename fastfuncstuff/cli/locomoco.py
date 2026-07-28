@@ -391,7 +391,19 @@ def create_parser() -> argparse.ArgumentParser:
         "r, every echo scored at alpha_e·r). Removes the sub-voxel wiggle the search can't "
         "resolve; total field is w+r. Configured by the -qwarp_* flags below. Needs the "
         "corrected series (not compatible with -no_corrected). Use -backend qwarp instead to "
-        "let qwarp own the whole field. ME 3-D-EPI temporal modes only.",
+        "let qwarp own the whole field. Works single-echo too; for 2-D multi-slice data the "
+        "patches are 2-D slicewise (see -qwarp_3d).",
+    )
+    me.add_argument(
+        "-qwarp_3d",
+        "-qwarp-3d",
+        action="store_true",
+        dest="qwarp_3d",
+        help="Use isotropic 3-D qwarp patches on 2-D multi-slice data. By default (2-D "
+        "acquisition, no -is_3dacq) the patches are 2-D and one slice thick, matching the "
+        "slicewise estimator: each slice is acquired at its own instant, so a 3-D patch would "
+        "smooth the residual field across acquisition times. Set this only if you know the "
+        "residual field really is smooth through plane. Implied by -is_3dacq / -me_3depi.",
     )
     me.add_argument(
         "-qwarp_minpatch",
@@ -399,8 +411,9 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=7,
         dest="qwarp_minpatch",
-        help="Finest qwarp patch size (voxels). Default 7 for the -final_qwarp polish; try 9 "
-        "for -backend qwarp. Applies to both the polish and the full qwarp backend.",
+        help="Finest qwarp patch size (voxels), in-plane only when the patches are 2-D "
+        "slicewise. Default 7 for the -final_qwarp polish; try 9 for -backend qwarp. Applies "
+        "to both the polish and the full qwarp backend.",
     )
     me.add_argument(
         "-qwarp_levels",
@@ -1572,6 +1585,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             optimizer=args.qwarp_optimizer,
             compile=args.qwarp_compile,
             full=qwarp_backend,
+            slicewise=False,  # -me_3depi is 3-D-acquired: through-plane continuity is real
             raw_datas=datas if qwarp_backend else None,
             device=device,
         )
@@ -1983,6 +1997,9 @@ def main(argv: list[str] | None = None) -> int:
             optimizer=args.qwarp_optimizer,
             compile=args.qwarp_compile,
             full=qwarp_backend,
+            # 2-D multi-slice: each slice is its own acquisition instant, so the qwarp
+            # patches stay 2-D like the estimator. -is_3dacq is one shot -> 3-D patches.
+            slicewise=not (args.is_3dacq or args.qwarp_3d),
             raw_datas=[data] if qwarp_backend else None,
             device=device,
         )

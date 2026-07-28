@@ -12,8 +12,6 @@ Algorithm:
    through `_dedup_last_wins` (or a serial loop) to stay deterministic.
    on GPU using batched Adam optimizer with autograd
 5. After each phase: update global warp, proceed to next phase
-   on GPU using batched Adam optimizer with autograd
-5. After each phase: update global warp, proceed to next phase
 
 Key speedups vs serial version:
   - Checkerboard batching: 8-50x (process B patches per GPU call)
@@ -554,12 +552,20 @@ def _dedup_last_wins(flat_dst: Tensor) -> tuple[Tensor, Tensor]:
 
 def _checkerboard_phases(
     patches: list[PatchSpec],
+    flat_axis: int | None = None,
 ) -> list[list[PatchSpec]]:
-    """Group patches into 8 checkerboard phases (non-overlapping within each)."""
+    """Group patches into 8 checkerboard phases (non-overlapping within each).
+
+    ``flat_axis`` (grid axis 0=x/1=y/2=z) is one voxel thick in slicewise mode, so
+    patches can never overlap along it and splitting on its parity is pure overhead:
+    collapsing it halves the phase count and doubles the batch each solve sees.
+    """
     phases: list[list[PatchSpec]] = [[] for _ in range(8)]
     for p in patches:
-        idx = (p.gi % 2) * 4 + (p.gj % 2) * 2 + (p.gk % 2)
-        phases[idx].append(p)
+        gi = 0 if flat_axis == 0 else p.gi % 2
+        gj = 0 if flat_axis == 1 else p.gj % 2
+        gk = 0 if flat_axis == 2 else p.gk % 2
+        phases[gi * 4 + gj * 2 + gk].append(p)
     return phases
 
 
@@ -2570,6 +2576,7 @@ class _MEScaledPlan:
     n_active: int
     levels: list[_MELevelPlan]
     use_ncc: bool
+    slicewise_axis: int | None = None
 
 
 def _build_mescaled_plan(
@@ -2581,13 +2588,30 @@ def _build_mescaled_plan(
     device: torch.device,
     n_levels: int,
     pad: bool,
+    slicewise_axis: int | None = None,
 ) -> _MEScaledPlan:
     """Precompute all frame-invariant structure for the ME-scaled polish.
 
     Padded base references, weight/mask, blok lattice, patch lattice, per-level
     basis, and the vectorised per-phase gathers of the base/weight/mask patches.
     A series calls this ONCE and reuses it for every frame; the per-frame solve
-    (:func:`_solve_mescaled_frame`) then only touches the moving data."""
+    (:func:`_solve_mescaled_frame`) then only touches the moving data.
+
+    ``slicewise_axis`` (grid axis 0=x/1=y/2=z) makes the patches 2-D: one voxel
+    thick along that axis, with the basis functions that modulate along it dropped.
+    That is the right geometry for 2-D multi-slice acquisitions, where each slice is
+    sampled at its own instant and the field is genuinely discontinuous through
+    plane -- a cubic patch spanning ``minpatch`` slices would smooth across
+    acquisition times. Must differ from ``pe_grid_axis`` (PE has to lie in-plane).
+    """
+    if slicewise_axis is not None:
+        if slicewise_axis not in (0, 1, 2):
+            raise ValueError(f"slicewise_axis must be 0, 1, 2 or None; got {slicewise_axis}.")
+        if slicewise_axis == pe_grid_axis:
+            raise ValueError(
+                f"slicewise_axis ({slicewise_axis}) must differ from pe_grid_axis "
+                f"({pe_grid_axis}): PE must lie inside the patch plane to be solvable."
+            )
     base_echoes = base_echoes.float().to(device)
     E = base_echoes.shape[0]
     nz_orig, ny_orig, nx_orig = base_echoes.shape[1:]
@@ -2649,16 +2673,23 @@ def _build_mescaled_plan(
     levels: list[_MELevelPlan] = []
     n_active = 0
 
+    # Only the axes the patch actually spans constrain its size: in slicewise mode a
+    # 2-slice run is legal, since the through-plane extent is 1 by construction.
+    axis_limit = (nx - 2, ny - 2, nz - 2)
+    spanned = [d for d in range(3) if d != slicewise_axis]
+
     for pw in widths:
-        pw = min(pw, nx - 2, ny - 2, nz - 2)
+        pw = min(pw, *(axis_limit[d] for d in spanned))
         if pw % 2 == 0:
             pw -= 1
         if pw < 5:
             continue
-        xwid = ywid = zwid = pw
-        xdel = max(1, (xwid - 1) // 2)
-        ydel = max(1, (ywid - 1) // 2)
-        zdel = max(1, (zwid - 1) // 2)
+        wid = [pw, pw, pw]
+        if slicewise_axis is not None:
+            wid[slicewise_axis] = 1
+        xwid, ywid, zwid = wid
+        # A width-1 axis has del 1, so the lattice steps one slice at a time.
+        xdel, ydel, zdel = (max(1, (w - 1) // 2) for w in wid)
 
         ibbb = max(1, imin - xdel // 4 - 1)
         jbbb = max(1, jmin - ydel // 4 - 1)
@@ -2673,6 +2704,12 @@ def _build_mescaled_plan(
         basis, half_widths, param_max = _get_basis_config(
             basis_type, xwid, ywid, zwid, device, hfactor=hfactor
         )
+        if slicewise_axis is not None:
+            # Hermite b1 is zero at the patch centre, so on a width-1 axis every basis
+            # function that modulates along it collapses to an identically-zero row --
+            # a null column in the Jacobian. Drop them; what remains IS the 2-D
+            # in-plane tensor basis (cubic_lite 4->3, cubic 8->4).
+            basis = basis[basis.abs().amax(dim=1) > 0].contiguous()
         n_basis = basis.shape[0]
         n_active = len(active_dims) * n_basis
         n_total = 3 * n_basis
@@ -2697,7 +2734,7 @@ def _build_mescaled_plan(
             ibbb, ittt, jbbb, jttt, kbbb, kttt, xwid, ywid, zwid, xdel, ydel, zdel
         )
         valid = _filter_patches(all_patches, weight_p, mask_p, nx, ny, nz)
-        checker = _checkerboard_phases(valid)
+        checker = _checkerboard_phases(valid, slicewise_axis)
 
         phase_plans: list[_MEPhasePlan] = []
         for phase_idx in range(8):
@@ -2765,6 +2802,7 @@ def _build_mescaled_plan(
         n_active=n_active,
         levels=levels,
         use_ncc=use_ncc,
+        slicewise_axis=slicewise_axis,
     )
 
 
@@ -3062,6 +3100,7 @@ def qwarp_pe_scaled_polish(
     device: torch.device | None = None,
     n_levels: int = 2,
     pad: bool = True,
+    slicewise_axis: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Polish a seed PE displacement field with joint multi-echo TE-scaled qwarp.
 
@@ -3085,6 +3124,11 @@ def qwarp_pe_scaled_polish(
             ``cost_method`` must be ``lpc``/``lpa``.
         n_levels: number of fine levels (coarsest is ~``minpatch/shrink**(n-1)``).
         pad: AFNI-style internal zero-padding (default True).
+        slicewise_axis: grid axis (0=x, 1=y, 2=z) to make patches 2-D across -- one
+            voxel thick with an in-plane-only basis, so nothing is smoothed through
+            plane. Use it for 2-D multi-slice acquisitions (each slice has its own
+            acquisition instant); ``None`` keeps the isotropic 3-D patches, right for
+            3-D-acquired EPI. Must differ from ``pe_grid_axis``.
 
     Returns:
         ``(warped, field)`` where ``warped`` is ``(E, nz, ny, nx)`` each source warped
@@ -3112,7 +3156,7 @@ def qwarp_pe_scaled_polish(
     alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
 
     plan = _build_mescaled_plan(
-        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, pad
+        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, pad, slicewise_axis
     )
     return _solve_mescaled_frame(plan, source_echoes, seed_field, alpha, config, device)
 
@@ -3129,6 +3173,7 @@ def qwarp_pe_scaled_polish_series(
     device: torch.device | None = None,
     n_levels: int = 2,
     show_progress: bool = True,
+    slicewise_axis: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Per-frame joint multi-echo TE-scaled PE-only polish over a 4-D series.
 
@@ -3154,6 +3199,8 @@ def qwarp_pe_scaled_polish_series(
         config: :class:`QwarpConfig`; ``cost_method`` must be ``ncc``/``lpc``/``lpa``.
         n_levels: fine levels per frame.
         show_progress: draw a persistent tqdm bar over frames.
+        slicewise_axis: 2-D slicewise patches across this grid axis; see
+            :func:`qwarp_pe_scaled_polish`.
 
     Returns:
         ``(warped, field)`` with ``warped`` ``(E, nz, ny, nx, T)`` and ``field``
@@ -3176,7 +3223,7 @@ def qwarp_pe_scaled_polish_series(
 
     # Build the frame-invariant geometry + base/weight/mask gathers ONCE.
     plan = _build_mescaled_plan(
-        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True
+        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True, slicewise_axis
     )
 
     warped = torch.empty(E, nz, ny, nx, T)
