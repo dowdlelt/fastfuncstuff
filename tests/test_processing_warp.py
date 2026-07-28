@@ -17,6 +17,7 @@ from fastfuncstuff.processing.warp import (
     _checkerboard_phases,
     _compute_hfactor,
     _compute_padding,
+    _dedup_last_wins,
     _filter_patches,
     _generate_patch_grid,
     _get_basis_config,
@@ -677,6 +678,92 @@ class TestPatchPipeline:
         total = sum(len(ph) for ph in phases)
         assert total == len(valid)
         assert total > 0
+
+
+class TestPatchWriteBackDedup:
+    """Patches in a phase overlap by a voxel, so write-backs must be deduplicated.
+
+    The checkerboard is often described as partitioning into non-overlapping sets, but
+    the sweep steps ``(width-1)//2``: same-parity patches are ``width-1`` apart and so
+    share the plane where they abut. A raw scatter through the patch index is then an
+    ``index_put_`` with duplicate targets, whose winner is unspecified -- that made two
+    identical qwarp runs differ by tenths of a voxel.
+    """
+
+    def test_dedup_keeps_the_last_writer(self):
+        dst = torch.tensor([5, 3, 5, 9, 3, 5])
+        keep_dst, keep_src = _dedup_last_wins(dst)
+        assert keep_dst.tolist() == [3, 5, 9]
+        # last occurrence of each target: 3->index 4, 5->index 5, 9->index 3
+        assert keep_src.tolist() == [4, 5, 3]
+
+        values = torch.tensor([10.0, 20.0, 30.0, 40.0, 50.0, 60.0])
+        out = torch.zeros(10)
+        out[keep_dst] = values[keep_src]
+        assert out[3] == 50.0 and out[5] == 60.0 and out[9] == 40.0
+
+    def test_dedup_is_a_noop_on_disjoint_targets(self):
+        dst = torch.tensor([4, 0, 7, 2])
+        keep_dst, keep_src = _dedup_last_wins(dst)
+        assert keep_dst.tolist() == [0, 2, 4, 7]
+        assert dst[keep_src].tolist() == keep_dst.tolist()
+
+    def test_phase_patches_really_do_overlap(self):
+        """Guard: if the lattice ever becomes disjoint, the dedup is dead code."""
+        patches = _generate_patch_grid(
+            ibbb=1,
+            ittt=30,
+            jbbb=1,
+            jttt=30,
+            kbbb=1,
+            kttt=30,
+            xwid=9,
+            ywid=9,
+            zwid=9,
+            xdel=4,
+            ydel=4,
+            zdel=4,
+        )
+        phases = _checkerboard_phases(patches)
+        overlapping = 0
+        for phase in phases:
+            seen = set()
+            for p in phase:
+                vox = {
+                    (k, j, i)
+                    for k in range(p.kbot, p.ktop + 1)
+                    for j in range(p.jbot, p.jtop + 1)
+                    for i in range(p.ibot, p.itop + 1)
+                }
+                overlapping += len(seen & vox)
+                seen |= vox
+        assert overlapping > 0, "patches within a phase are disjoint -- dedup unnecessary?"
+
+    @pytest.mark.slow
+    def test_qwarp_batch_is_deterministic(self):
+        """The batched multi-volume write-back must not depend on scatter luck."""
+        from fastfuncstuff.processing.interp import warp_image
+        from fastfuncstuff.processing.warp import qwarp_batch
+
+        nz, ny, nx = 8, 20, 20
+        g = torch.Generator().manual_seed(4)
+        base = torch.rand(nz, ny, nx, generator=g)
+        base = torch.nn.functional.avg_pool3d(base[None, None], 3, 1, 1)[0, 0] + 0.05
+        zz, yy, xx = torch.meshgrid(
+            torch.linspace(0, 1, nz),
+            torch.linspace(0, 1, ny),
+            torch.linspace(0, 1, nx),
+            indexing="ij",
+        )
+        w = 1.2 * torch.sin(2 * torch.pi * xx) * torch.sin(torch.pi * yy) * torch.sin(torch.pi * zz)
+        z0 = torch.zeros_like(w)
+        sources = torch.stack([warp_image(base, z0, -s * w, z0, mode="linear") for s in (0.8, 1.0)])
+
+        cfg = QwarpConfig(minpatch=9, cost_method="lpa", verb=0)
+        a = qwarp_batch(base, sources, config=cfg)
+        b = qwarp_batch(base, sources, config=cfg)
+        for fa, fb in zip(a[1:], b[1:], strict=True):
+            assert torch.equal(fa, fb), "qwarp_batch is not reproducible"
 
 
 # ---------------------------------------------------------------------------

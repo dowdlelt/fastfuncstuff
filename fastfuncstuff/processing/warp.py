@@ -7,7 +7,11 @@ Algorithm:
 1. Level 0: global warp (full image patch, progressive basis complexity)
 2. Levels 1..N: shrinking patches with 50% overlap
 3. Within each level: 3D checkerboard decomposition into 8 phases
-4. Within each phase: ALL non-overlapping patches optimized in parallel
+4. Within each phase: ALL patches optimized in parallel. They are *nearly* disjoint
+   -- same-parity patches still share the voxel where they abut -- so write-backs go
+   through `_dedup_last_wins` (or a serial loop) to stay deterministic.
+   on GPU using batched Adam optimizer with autograd
+5. After each phase: update global warp, proceed to next phase
    on GPU using batched Adam optimizer with autograd
 5. After each phase: update global warp, proceed to next phase
 
@@ -521,6 +525,31 @@ def _generate_patch_grid(
         gi += 1
 
     return patches
+
+
+def _dedup_last_wins(flat_dst: Tensor) -> tuple[Tensor, Tensor]:
+    """Collapse a patch write-back index to one entry per target voxel.
+
+    Patches in a checkerboard phase are *nearly* disjoint, not disjoint: the sweep
+    steps ``(width-1)//2``, so same-parity patches share the voxel where they abut
+    (and more where the sweep snaps the last patch back inside the box). Assigning
+    through the raw index is then an ``index_put_`` with duplicate targets, whose
+    winner PyTorch leaves unspecified -- two identical runs drift apart by tenths of
+    a voxel. AFNI writes its patches serially, so the last patch in lattice order
+    wins; a stable sort reproduces that exactly.
+
+    Args:
+        flat_dst: ``(N,)`` flat target indices, in lattice (patch) order.
+
+    Returns:
+        ``(dst, src)`` -- unique targets and the position in ``flat_dst`` that wins
+        each one, so ``vol.view(-1)[dst] = values.reshape(-1)[src]`` is well-defined.
+    """
+    order = torch.argsort(flat_dst, stable=True)
+    sorted_dst = flat_dst[order]
+    last = torch.ones_like(sorted_dst, dtype=torch.bool)
+    last[:-1] = sorted_dst[1:] != sorted_dst[:-1]
+    return sorted_dst[last], order[last]
 
 
 def _checkerboard_phases(
@@ -1587,7 +1616,10 @@ def _improve_warp_batched(
             base_k=base_k,
         )
 
-        # Write back warp AND warped_source (non-overlapping patches, safe)
+        # Write back warp AND warped_source. Patches in a phase overlap by a voxel at
+        # their seams, so this serial loop is load-bearing: the last patch in lattice
+        # order wins, matching AFNI. Any vectorised replacement must go through
+        # _dedup_last_wins -- a raw scatter would be nondeterministic there.
         for idx_p, p in enumerate(patches):
             state.xd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_xd[
                 idx_p
@@ -1867,17 +1899,21 @@ def _improve_warp_batched_multi(
             nz,
         )
         # Scatter all patches of all active volumes in one indexed assignment per
-        # field. Patches within a phase are non-overlapping, so flat_all has no
-        # duplicate voxel per volume -- the write is well-defined. (Replaces an
-        # Na*P Python loop that fired a tiny kernel per patch.)
+        # field. (Replaces an Na*P Python loop that fired a tiny kernel per patch.)
+        # Patches within a phase are NOT disjoint -- the lattice steps (width-1)//2, so
+        # same-parity patches share a voxel at their seams -- and `index_put_` with
+        # duplicate targets leaves the winner unspecified. Deduplicate to "last patch in
+        # lattice order wins", which is what the solo path's serial patch loop does, so
+        # this is both deterministic and the behaviour qwarp_batch is matched against.
+        w_dst, w_src = _dedup_last_wins(flat_all)
         rows = active_idx.unsqueeze(1)  # (Na, 1)
-        cols = flat_all.unsqueeze(0)  # (1, P*V)
-        mstate.xd_all.view(mstate.xd_all.shape[0], -1)[rows, cols] = ah_xd.reshape(Na, -1)
-        mstate.yd_all.view(mstate.yd_all.shape[0], -1)[rows, cols] = ah_yd.reshape(Na, -1)
-        mstate.zd_all.view(mstate.zd_all.shape[0], -1)[rows, cols] = ah_zd.reshape(Na, -1)
+        cols = w_dst.unsqueeze(0)  # (1, U)
+        mstate.xd_all.view(mstate.xd_all.shape[0], -1)[rows, cols] = ah_xd.reshape(Na, -1)[:, w_src]
+        mstate.yd_all.view(mstate.yd_all.shape[0], -1)[rows, cols] = ah_yd.reshape(Na, -1)[:, w_src]
+        mstate.zd_all.view(mstate.zd_all.shape[0], -1)[rows, cols] = ah_zd.reshape(Na, -1)[:, w_src]
         mstate.warped_all.view(mstate.warped_all.shape[0], -1)[rows, cols] = warped_vals.reshape(
             Na, -1
-        )
+        )[:, w_src]
 
     mstate.patches_done += B
 
@@ -2481,10 +2517,20 @@ class _MEPhasePlan:
     Everything here depends only on the fixed geometry (patch lattice + base
     references), so it is built once and reused across all frames of a series.
     ``gather_idx`` is the flat ``(B, V)`` index into ``vol.reshape(-1)`` -- one
-    advanced-index op replaces the per-patch ``torch.stack`` loop, and the same
-    index scatters the solved warp back."""
+    advanced-index op replaces the per-patch ``torch.stack`` loop.
+
+    Patches in one checkerboard phase are NOT quite disjoint: the lattice steps
+    ``(width-1)//2``, so same-parity patches abut with a one-voxel overlap (more where
+    the sweep snaps the last patch back inside the box). Writing the solved warp
+    straight through ``gather_idx`` therefore hits duplicate targets, and
+    ``index_put_`` leaves the winner unspecified -- run-to-run drift of a few tenths of
+    a voxel. ``write_dst``/``write_src`` are the deduplicated write: one entry per
+    target voxel, taking the last patch in lattice order, which is what AFNI's serial
+    patch-by-patch overwrite does."""
 
     gather_idx: Tensor  # (B, V) long
+    write_dst: Tensor  # (U,) unique flat targets
+    write_src: Tensor  # (U,) positions into the flattened (B*V) patch values
     ibots: Tensor  # (B,) float patch origins
     jbots: Tensor
     kbots: Tensor
@@ -2670,10 +2716,13 @@ def _build_mescaled_plan(
             kb = torch.tensor([p.kbot for p in pp], device=device)
             patch_base = (kb * ny_nx + jb * nx + ib)[:, None]  # (B,1)
             gather_idx = patch_base + local_off  # (B, V) long
+            write_dst, write_src = _dedup_last_wins(gather_idx.reshape(-1))
             ibf, jbf, kbf = ib.float(), jb.float(), kb.float()
             phase_plans.append(
                 _MEPhasePlan(
                     gather_idx=gather_idx,
+                    write_dst=write_dst,
+                    write_src=write_src,
                     ibots=ibf,
                     jbots=jbf,
                     kbots=kbf,
@@ -2928,12 +2977,12 @@ def _improve_warp_batched_mescaled(
         full_params = best_params @ expand_mat
         hxd, hyd, hzd = _eval_warp(basis, full_params, half_widths, do_xyz)
         _wv, ah_xd, ah_yd, ah_zd = _compose(hxd, hyd, hzd)
-        # Patches in a checkerboard phase are non-overlapping, so a flat scatter via
-        # the precomputed gather index is safe (no colliding writes).
-        idx = phase.gather_idx.reshape(-1)
-        state.xd.view(-1)[idx] = ah_xd.reshape(-1)
-        state.yd.view(-1)[idx] = ah_yd.reshape(-1)
-        state.zd.view(-1)[idx] = ah_zd.reshape(-1)
+        # Patches in a phase overlap by a voxel at their seams, so write through the
+        # deduplicated index (last patch wins) -- a raw scatter would be nondeterministic.
+        dst, src = phase.write_dst, phase.write_src
+        state.xd.view(-1)[dst] = ah_xd.reshape(-1)[src]
+        state.yd.view(-1)[dst] = ah_yd.reshape(-1)[src]
+        state.zd.view(-1)[dst] = ah_zd.reshape(-1)[src]
     state.patches_done += B
 
 
