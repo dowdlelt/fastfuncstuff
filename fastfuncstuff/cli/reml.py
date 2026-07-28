@@ -2558,6 +2558,7 @@ def main():
             want_residuals=bool(args.Rerrts)
             or bool(args.save_clean)
             or (want_diag and bool(args.save_tsnr or args.save_acf)),
+            want_ljung_box=bool(args.Rvar),
         )
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
@@ -2916,6 +2917,23 @@ def main():
             var_stack.append(results.reml_likelihood)
             var_labels.append("-LogLik")
 
+        # -Rvar[5] = LjungBox: whiteness of the prewhitened residuals ("did the
+        # ARMA(1,1) actually remove the autocorrelation?"). AFNI writes it for
+        # every -Rvar (3dREMLfit.c:3780) — not only under -Rwherr — so it is
+        # computed inside the GLS loop rather than from retained residuals.
+        rvar_stataux = None
+        if getattr(results, "ljung_box", None) is not None:
+            var_stack.append(results.ljung_box)
+            var_labels.append("LjungBox")
+            if results.ljung_box_dof:
+                from fastfuncstuff.io.afni import stat_type_to_stataux
+
+                rvar_stataux = {
+                    len(var_labels) - 1: stat_type_to_stataux(
+                        "fict", (float(results.ljung_box_dof),)
+                    )
+                }
+
         # Stack and write
         var_data = torch.stack(var_stack, dim=1)
         # Write variance parameters directly as 4D NIfTI
@@ -2968,6 +2986,7 @@ def main():
                 affine=affine,
                 header=var_header,
                 brick_labels=var_labels,
+                brick_stataux=rvar_stataux,
             )
         print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
 

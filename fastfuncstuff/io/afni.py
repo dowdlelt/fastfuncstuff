@@ -2352,6 +2352,8 @@ def _statsym_for(code: int, params: tuple[float, ...]) -> str:
         return f"Ftest({int(params[0])},{int(params[1])})"
     if code == 5:  # fizt
         return "Zscore()"
+    if code == 6 and len(params) == 1:  # fict
+        return f"Chisq({int(params[0])})"
     return "none"
 
 

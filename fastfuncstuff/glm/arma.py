@@ -23,6 +23,7 @@ References:
 
 from __future__ import annotations
 
+import math
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -609,6 +610,10 @@ class ARMA11Results:
         self.residuals_whitened: torch.Tensor | None = (
             None  # (n_voxels, n_timepoints) - residuals after whitening
         )
+        self.ljung_box: torch.Tensor | None = (
+            None  # (n_voxels,) - whiteness stat of the whitened residuals (AFNI Rvar[5])
+        )
+        self.ljung_box_dof: int | None = None  # chi-squared DOF for ljung_box (h - 2)
         self.sigma2: torch.Tensor | None = None  # (n_voxels,) - noise variance estimates
         self.var_betas: torch.Tensor | None = (
             None  # (n_voxels, n_regressors, n_regressors) - covariance
@@ -3550,6 +3555,9 @@ def _fit_dsort_gls_pass(
     batch_size: int,
     verbose: bool,
     run_bounds: list[int] | None = None,
+    want_ljung_box: bool = False,
+    lj_max_lag: int | None = None,
+    lj_tau: torch.Tensor | None = None,
 ) -> None:
     """Redo the final GLS per voxel with an extended ``[design | dsort_v]`` design.
 
@@ -3773,6 +3781,12 @@ def _fit_dsort_gls_pass(
                     var_rem = torch.clamp(1.0 - r2.to(dtype).unsqueeze(1), min=0.0)
                     results.contrast_r2_semipartial[idx] = ((ct2 / (ct2 + dof)) * var_rem).cpu()
 
+            # LB reflects the final (dsort-extended) fit, so it is recomputed here
+            # over the residuals that actually ship, not the no-dsort pass's.
+            if want_ljung_box and results.ljung_box is not None:
+                results.ljung_box[idx] = (
+                    _ljung_box_batched(resid_w, lj_max_lag, lj_tau).to(torch.float32).cpu()
+                )
             if want_residuals:
                 results.residuals[idx] = (Y.T - pred).cpu()
                 results.residuals_whitened[idx] = resid_w.cpu()
@@ -3853,6 +3867,7 @@ def fit_glm_arma11(
     batch_size: int | None = None,
     want_residuals: bool = False,
     want_predicted: bool = False,
+    want_ljung_box: bool = False,
     want_r2_partial: bool = False,
     r2_partial_mode: str = "full",  # "full" or "task" - how to compute partial R²
     want_r2_semipartial: bool = False,
@@ -3921,6 +3936,11 @@ def fit_glm_arma11(
         Return prewhitened residuals
     want_predicted : bool, default=False
         Return predicted timecourses
+    want_ljung_box : bool, default=False
+        Compute the Ljung-Box whiteness statistic (AFNI ``-Rvar`` sub-brick 5)
+        into ``results.ljung_box``. Accumulated per voxel-batch from the whitened
+        residuals that already exist in the GLS loop, so it does **not** require
+        ``want_residuals`` and never materialises a whole-brain residual array.
     want_ols : bool, default=False
         Also compute OLS fit for comparison (stored in results.ols_results)
     ols_write_callback : callable, optional
@@ -4421,6 +4441,27 @@ def fit_glm_arma11(
         )
     if want_predicted:
         results.predicted = torch.zeros(n_voxels, n_timepoints, device=storage_device, dtype=dtype)
+
+    # Ljung-Box: one scalar per voxel, reduced inside the GLS loop from residuals
+    # that are already resident, so -Rvar never has to pay for whole-brain
+    # whitened residuals (see [[Memory module]]).
+    lj_max_lag: int | None = None
+    lj_tau: torch.Tensor | None = None
+    if want_ljung_box:
+        _lj_starts = sorted(
+            {int(s) for s in (run_starts.tolist() if torch.is_tensor(run_starts) else run_starts)}
+            if run_starts is not None
+            else {0}
+        )
+        _min_run = (
+            min(b - a for a, b in zip(_lj_starts, _lj_starts[1:] + [n_timepoints], strict=True))
+            if len(_lj_starts) > 1
+            else n_timepoints
+        )
+        lj_max_lag = ljung_box_max_lag(n_timepoints, n_regressors, _min_run)
+        lj_tau = build_ljung_box_tau(n_timepoints, run_starts, tau, device=device)
+        results.ljung_box = torch.zeros(n_voxels, device="cpu", dtype=torch.float32)
+        results.ljung_box_dof = max(1, _resolve_ljung_box_lag(n_timepoints, lj_max_lag) - 2)
 
     # OLS baseline fit (if requested)
     if want_ols:
@@ -5156,6 +5197,13 @@ def fit_glm_arma11(
                         dtype
                     )
 
+                    if want_ljung_box:
+                        results.ljung_box[sub_voxel_indices] = (
+                            _ljung_box_batched(resid_w_batch, lj_max_lag, lj_tau)
+                            .to(torch.float32)
+                            .cpu()
+                        )
+
                     if not want_residuals:
                         del resid_w_batch
 
@@ -5385,6 +5433,13 @@ def fit_glm_arma11(
                     sigma2_batch = (resid_w_batch.pow(2).sum(dim=1, dtype=_accum_dtype) / df).to(
                         dtype
                     )
+
+                    if want_ljung_box:
+                        results.ljung_box[sub_voxel_indices] = (
+                            _ljung_box_batched(resid_w_batch, lj_max_lag, lj_tau)
+                            .to(torch.float32)
+                            .cpu()
+                        )
 
                     if not want_residuals:
                         del resid_w_batch
@@ -5863,6 +5918,10 @@ def fit_glm_arma11(
             ).squeeze()
 
             # Optional outputs
+            if want_ljung_box:
+                results.ljung_box[v] = _ljung_box_batched(
+                    resid_w.reshape(1, -1), lj_max_lag, lj_tau
+                ).item()
             if want_residuals:
                 results.residuals[v] = resid_orig_cpu
                 results.residuals_whitened[v] = resid_w.cpu()
@@ -5904,6 +5963,9 @@ def fit_glm_arma11(
             batch_size=batch_size,
             verbose=verbose,
             run_bounds=dsort_run_bounds,
+            want_ljung_box=want_ljung_box,
+            lj_max_lag=lj_max_lag,
+            lj_tau=lj_tau,
         )
         _n_dsort_cols = int(dsort.shape[1]) * (
             (len(dsort_run_bounds) - 1) if dsort_run_bounds is not None else 1
@@ -6040,66 +6102,194 @@ def compare_ols_vs_arma11(
     }
 
 
-def compute_ljung_box_statistic(
-    residuals: torch.Tensor | np.ndarray, max_lag: int = 30
-) -> np.ndarray:
-    """
-    Compute Ljung-Box statistic for residual autocorrelation
+# AFNI separates runs in the pseudo-time vector by a huge constant so no lag bin
+# can ever straddle a run boundary (3dREMLfit.c:2439, "the 66666 means 'very far
+# apart'"). Reused here for exactly that purpose.
+_LJ_RUN_SEPARATION = 66666
 
-    The LB statistic tests for remaining autocorrelation in prewhitened residuals.
-    Small values indicate successful prewhitening; large values indicate the
-    ARMA(1,1) model was inadequate.
+
+def ljung_box_max_lag(n_time: int, n_regressors: int = 0, min_run: int | None = None) -> int:
+    """AFNI's semi-arbitrary Ljung-Box max lag ``h`` (``3dREMLfit.c:3412``).
+
+    ``h = nrega + 2 + min(min_run/8, round(3·ln min_run))``, clamped to
+    ``min_run/2``. The reported chi-squared DOF is ``h - 2``.
+
+    Parameters
+    ----------
+    n_time : int
+        Retained timepoint count; used as ``min_run`` for single-run data.
+    n_regressors : int, default=0
+        Design matrix column count (AFNI's ``nrega``).
+    min_run : int, optional
+        Shortest run length. Defaults to *n_time* (AFNI's single-run branch).
+
+    Notes
+    -----
+    AFNI derives ``min_run`` from the *pre-censor* timeline; we take it from the
+    retained one, because run lengths that deep in the fit are already
+    censor-collapsed. Identical without censoring, marginally smaller ``h`` with.
+    """
+    if min_run is None:
+        min_run = n_time
+    if min_run < 2:
+        return 0
+    h1 = min_run // 8
+    h2 = int(round(3.0 * math.log(min_run)))
+    hh = n_regressors + 2 + min(h1, h2)
+    return min(hh, min_run // 2)
+
+
+def _resolve_ljung_box_lag(n_time: int, max_lag: int | None) -> int:
+    """``ljung_box_uneven``'s own sanity clamp on ``hh`` (``thd_ljungbox.c:21``).
+
+    An out-of-range request (including the ``h = 0`` "you pick" sentinel) is
+    replaced by ``2 + min(n/8, round(3·ln n))``, capped at ``n/2``. Note this
+    fallback carries no ``nrega`` term — that is only in the caller's formula.
+    """
+    hh = int(max_lag) if max_lag else 0
+    if hh < 2 or hh > n_time // 2:
+        hh = 2 + min(n_time // 8, int(round(3.0 * math.log(n_time))))
+        hh = min(hh, n_time // 2)
+    return hh
+
+
+def build_ljung_box_tau(
+    n_time: int,
+    run_starts: list[int] | torch.Tensor | None = None,
+    tau: torch.Tensor | None = None,
+    device: torch.device | str | None = None,
+) -> torch.Tensor | None:
+    """Pseudo-time index for Ljung-Box lag binning, AFNI ``tau[]`` semantics.
+
+    Combines the two things that make a lag-``k`` *index* pair not a lag-``k``
+    *time* pair: censored TRs (survivors flanking a hole are further apart than
+    their indices suggest) and run boundaries (never correlated at all). The
+    former comes from *tau* — :func:`build_censor_run_info`'s within-run time
+    index — and the latter is imposed by offsetting each run by
+    :data:`_LJ_RUN_SEPARATION`, so cross-run pairs land outside every bin.
+
+    Returns ``None`` for uncensored single-run data, where lag == index and the
+    cheaper no-tau path in :func:`compute_ljung_box_statistic` is exact.
+    """
+    starts = (
+        run_starts.tolist()
+        if isinstance(run_starts, torch.Tensor)
+        else (list(run_starts) if run_starts is not None else [])
+    )
+    starts = sorted({int(s) for s in starts if 0 <= int(s) < n_time}) or [0]
+    if tau is None and len(starts) == 1 and starts[0] == 0:
+        return None
+
+    starts_t = torch.tensor(starts, dtype=torch.long)
+    idx = torch.arange(n_time, dtype=torch.long)
+    run_id = torch.bucketize(idx, starts_t, right=True) - 1
+    within = tau.to(dtype=torch.long).flatten().cpu() if tau is not None else idx - starts_t[run_id]
+    out = within + _LJ_RUN_SEPARATION * run_id
+    return out.to(device) if device is not None else out
+
+
+def _ljung_box_batched(
+    resid: torch.Tensor,
+    max_lag: int | None = None,
+    tau: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Batched Ljung-Box over voxels — port of AFNI ``ljung_box_uneven``.
+
+    ``LB = n(n+2) · Σ_k c_k² / n_k`` with ``c_k = Σ_j r_j r_{j+k} / Σ_j r_j²``
+    and ``n_k`` the number of pairs landing in time-lag bin ``k``. Note the
+    numerator is a raw lagged product over the *un-centred, un-scaled* residual,
+    not a Pearson autocorrelation — LB is scale-invariant (``c_k`` is a ratio) so
+    per-voxel normalisation upstream cannot shift it, but re-centring would.
+
+    Returns ``(n_voxels,)`` float64 on *resid*'s device. Zero marks "could not be
+    computed" exactly as AFNI does: fewer than 10 points, an all-zero residual,
+    or a bin with too few pairs.
+    """
+    n_vox, n_time = resid.shape
+    zeros = torch.zeros(n_vox, dtype=torch.float64, device=resid.device)
+    if n_time < 10:
+        return zeros
+
+    hh = _resolve_ljung_box_lag(n_time, max_lag)
+    if hh < 1:
+        return zeros
+
+    # float64 throughout: c_k is a ratio of sums over the whole series, and the
+    # lagged products are signed, so float32 cancellation is a real risk.
+    r = resid.to(torch.float64)
+    sum0 = r.pow(2).sum(dim=1)
+    ok = sum0 >= 1e-10
+    sum0 = torch.where(ok, sum0, torch.ones_like(sum0))
+
+    sumk = torch.zeros(n_vox, hh + 1, dtype=torch.float64, device=r.device)
+    nj = torch.zeros(hh + 1, dtype=torch.long, device=r.device)
+
+    if tau is not None:
+        tau = tau.to(device=r.device, dtype=torch.long).flatten()
+
+    for kk in range(1, hh + 1):
+        prod = r[:, : n_time - kk] * r[:, kk:]
+        if tau is None:
+            sumk[:, kk] = prod.sum(dim=1)
+            nj[kk] = n_time - kk
+        else:
+            # Bin by *time* lag dj, not index lag kk: one index lag can scatter
+            # across several bins once censoring stretches the gaps, and pairs
+            # further apart than hh (including every cross-run pair) drop out.
+            dj = tau[kk:] - tau[: n_time - kk]
+            keep = (dj > 0) & (dj <= hh)
+            if not bool(keep.any()):
+                continue
+            dj = dj[keep]
+            sumk.index_add_(1, dj, prod[:, keep])
+            nj.index_add_(0, dj, torch.ones_like(dj))
+
+    # AFNI requires nj > 1 (not > 0) before a bin contributes.
+    good = nj > 1
+    good[0] = False
+    if not bool(good.any()):
+        return zeros
+
+    ck = sumk[:, good] / sum0.unsqueeze(1)
+    gsum = (ck.pow(2) / nj[good].to(torch.float64)).sum(dim=1) * (n_time * (n_time + 2.0))
+    return torch.where(ok, gsum.clamp(max=1.0e10), torch.zeros_like(gsum))
+
+
+def compute_ljung_box_statistic(
+    residuals: torch.Tensor | np.ndarray,
+    max_lag: int | None = None,
+    tau: torch.Tensor | None = None,
+) -> np.ndarray:
+    """Ljung-Box whiteness statistic of prewhitened residuals (AFNI ``Rvar[5]``).
+
+    "Did the ARMA(1,1) actually remove the autocorrelation?" — small is good;
+    large means correlation survived the prewhitening and the model was
+    inadequate for that voxel.
 
     Parameters
     ----------
     residuals : array-like, shape (n_voxels, n_timepoints)
-        Prewhitened residuals from ARMA(1,1) fit
-    max_lag : int, default=30
-        Maximum lag for autocorrelation (AFNI uses h=30)
+        Prewhitened residuals.
+    max_lag : int, optional
+        Max lag ``h``. Default (None) uses AFNI's own choice for the series
+        length; see :func:`ljung_box_max_lag` for the ``nrega``-aware form the
+        ``-Rvar`` writer passes.
+    tau : torch.Tensor, optional
+        Pseudo-time index per retained point, from :func:`build_ljung_box_tau`.
+        Required for censored or multi-run data, where index lag ≠ time lag.
 
     Returns
     -------
     lb_stats : np.ndarray, shape (n_voxels,)
-        Ljung-Box chi-squared statistics (df = max_lag - 2)
-        Zero values indicate computation failed (e.g., zero residuals)
-
-    Notes
-    -----
-    LB = n(n+2) * sum_{k=1}^h [ rho_k^2 / (n-k) ]
-    where rho_k is the autocorrelation at lag k, n is sample size
-
-    Follows chi-squared distribution with (h-2) degrees of freedom
+        Chi-squared statistics with ``h - 2`` DOF. Zero = not computable.
     """
-    if isinstance(residuals, torch.Tensor):
-        residuals = residuals.detach().cpu().numpy()
-
-    n_voxels, n_timepoints = residuals.shape
-    lb_stats = np.zeros(n_voxels, dtype=np.float32)
-
-    for v in range(n_voxels):
-        resid = residuals[v]
-
-        # Skip if residuals are all zero
-        if np.all(resid == 0) or np.std(resid) < 1e-10:
-            lb_stats[v] = 0.0
-            continue
-
-        # Standardize residuals
-        resid = (resid - np.mean(resid)) / (np.std(resid) + 1e-10)
-        n = len(resid)
-
-        # Compute autocorrelations up to max_lag
-        lb = 0.0
-        for k in range(1, min(max_lag + 1, n)):
-            # Autocorrelation at lag k
-            rho_k = np.corrcoef(resid[:-k], resid[k:])[0, 1]
-            if np.isnan(rho_k):
-                continue
-            lb += (rho_k**2) / (n - k)
-
-        lb_stats[v] = n * (n + 2) * lb
-
-    return lb_stats
+    resid = residuals if isinstance(residuals, torch.Tensor) else torch.from_numpy(residuals)
+    return (
+        _ljung_box_batched(resid.detach(), max_lag=max_lag, tau=tau)
+        .cpu()
+        .numpy()
+        .astype(np.float32)
+    )
 
 
 def save_arma_rvar(
@@ -6108,7 +6298,8 @@ def save_arma_rvar(
     volume_shape: tuple[int, int, int] | None = None,
     voxel_mask: np.ndarray | None = None,
     affine: np.ndarray | None = None,
-    max_lag: int = 30,
+    max_lag: int | None = None,
+    tau: torch.Tensor | None = None,
 ) -> Path:
     """
     Save ARMA(1,1) variance parameters in AFNI 3dREMLfit -Rvar format
@@ -6136,8 +6327,12 @@ def save_arma_rvar(
         Boolean mask from results.voxel_mask
     affine : np.ndarray, optional
         4x4 affine from results.affine
-    max_lag : int, default=30
-        Maximum lag for Ljung-Box statistic (AFNI default)
+    max_lag : int, optional
+        Ljung-Box max lag, used only for the fallback recompute below. Ignored
+        when ``results.ljung_box`` is already populated.
+    tau : torch.Tensor, optional
+        Pseudo-time index for the fallback recompute; see
+        :func:`build_ljung_box_tau`. Ignored when ``results.ljung_box`` is set.
 
     Returns
     -------
@@ -6193,12 +6388,27 @@ def save_arma_rvar(
         else results.reml_likelihood
     )
 
-    # Compute Ljung-Box statistic
-    if results.residuals_whitened is not None:
-        ljung_box = compute_ljung_box_statistic(results.residuals_whitened, max_lag=max_lag)
+    # Ljung-Box. Normally computed inside the GLS loop (fit_glm_arma11
+    # want_ljung_box=True) so -Rvar doesn't have to retain whole-brain whitened
+    # residuals; fall back to those residuals only if some caller kept them.
+    # AFNI writes this brick for every -Rvar, so a zero fill here is a real gap
+    # in the output, not a default — warn rather than silently ship zeros.
+    if results.ljung_box is not None:
+        lj = results.ljung_box
+        ljung_box = (lj.detach().cpu().numpy() if isinstance(lj, torch.Tensor) else lj).astype(
+            np.float32
+        )
+    elif results.residuals_whitened is not None:
+        ljung_box = compute_ljung_box_statistic(
+            results.residuals_whitened, max_lag=max_lag, tau=tau
+        )
     else:
-        # No residuals saved - set to zero
         assert arma_params is not None, "arma_params should not be None"
+        warnings.warn(
+            "Rvar sub-brick 5 (LjungBox) written as zeros: no whiteness statistic was "
+            "computed. Pass want_ljung_box=True to fit_glm_arma11() to populate it.",
+            stacklevel=2,
+        )
         ljung_box = np.zeros(len(arma_params), dtype=np.float32)
 
     # Reshape to volume if shape provided
@@ -6262,11 +6472,22 @@ def save_arma_rvar(
     if affine is None:
         affine = np.eye(4, dtype=np.float32)
 
-    # Save as NIfTI using save_nifti for efficient compression,
-    # then re-open to add AFNI-compatible metadata (description + sub-brick labels)
-    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.io.afni import save_nifti, stat_type_to_stataux
 
-    save_nifti(rvar_4d.astype(np.float32), output_path=output_path, affine=affine)
+    # Sub-brick 5 is a chi-squared statistic (AFNI EDIT_BRICK_TO_FICT,
+    # 3dREMLfit.c:3417) — without the stataux tag viewers treat it as a plain
+    # float and can neither threshold it nor compute its FDR curve.
+    stataux = None
+    if results.ljung_box_dof:
+        stataux = {5: stat_type_to_stataux("fict", (float(results.ljung_box_dof),))}
+
+    save_nifti(
+        rvar_4d.astype(np.float32),
+        output_path=output_path,
+        affine=affine,
+        brick_labels=["a", "b", "lam", "StDev", "-LogLik", "LjungBox"],
+        brick_stataux=stataux,
+    )
 
     return output_path
 
