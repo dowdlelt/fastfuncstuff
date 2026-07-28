@@ -19,7 +19,7 @@ from pathlib import Path
 from fastfuncstuff.autoproc import config, optcheck
 from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
-from fastfuncstuff.autoproc.glm import write_design_specs
+from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
 
 
@@ -741,6 +741,9 @@ def main(argv: list[str] | None = None) -> int:
             "kept": "design spec already exists, left untouched (-glm_spec_overwrite to replace)",
         }.get(status, status)
         print(f"  task-{task}: {Path(path).name}  [{note}]")
+    n_stim = len(list((Path(work_dir) / STIMULI_DIR).glob("*.tsv")))
+    if n_stim:
+        print(f"  {n_stim} events TSV(s) copied to {STIMULI_DIR}/ (what the specs name)")
     print("  read it, edit it, then run it.")
     return 0
 

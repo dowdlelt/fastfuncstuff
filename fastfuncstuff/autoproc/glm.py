@@ -36,6 +36,62 @@ def runs_by_task(plan: Plan) -> dict[str, list[PlanRun]]:
     return tasks
 
 
+#: Where the events TSVs are copied to, relative to the script's working dir.
+STIMULI_DIR = "stimuli"
+
+
+def stimuli_map(plan: Plan, bids_root: str | None) -> dict[str, str]:
+    """``{absolute events TSV: work-dir-relative copy}`` for every task's events.
+
+    The design TOMLs point at these copies, not at the BIDS tree, so the results
+    directory is self-contained: the timing that produced a stat map travels with
+    it, and re-running the GLM does not depend on the BIDS root still being
+    mounted at the same path (or the events not having been edited since).
+
+    Basenames normally carry the full BIDS entity set and are unique across
+    tasks; a collision (two roots, same relative layout) is disambiguated by the
+    source's parent directory so the mapping stays one-to-one and deterministic.
+    """
+    from fastfuncstuff.autoproc.emit import events_for_task
+
+    mapping: dict[str, str] = {}
+    used: set[str] = set()
+    for task, prs in runs_by_task(plan).items():
+        for src in events_for_task(task, prs, bids_root, plan.options):
+            if src in mapping:
+                continue
+            name = Path(src).name
+            if name in used:
+                name = f"{Path(src).parent.name}_{name}"
+                n = 2
+                while name in used:
+                    name = f"{Path(src).parent.name}_{n}_{Path(src).name}"
+                    n += 1
+            used.add(name)
+            mapping[src] = f"{STIMULI_DIR}/{name}"
+    return mapping
+
+
+def copy_events(plan: Plan, bids_root: str | None, work_dir: str) -> list[str]:
+    """Copy every events TSV into ``<work_dir>/stimuli/``. Returns the copies made.
+
+    Overwrites: the copy is a mirror of the BIDS file, not an editable artifact
+    (the *model* is the design TOML, which is never clobbered). A source that has
+    since disappeared is skipped rather than fatal — preflight reports it.
+    """
+    import shutil
+
+    made: list[str] = []
+    for src, dest in stimuli_map(plan, bids_root).items():
+        if not Path(src).is_file():
+            continue
+        target = Path(work_dir) / dest
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(src, target)
+        made.append(dest)
+    return made
+
+
 def nuisance_specs(task: str, opt) -> tuple[list, list[str]]:
     """``([NuisanceSpec], [skipped_name])`` for the named sources in
     ``opt.glm_ortvec``. A source whose ``requires`` option is off is skipped —
@@ -91,6 +147,9 @@ def write_design_specs(
         return rows
 
     out_dir = Path(work_dir)
+    # The specs name the copies, so they have to exist before anything reads them.
+    copy_events(plan, bids_root, work_dir)
+    copies = stimuli_map(plan, bids_root)
     for task, prs in runs_by_task(plan).items():
         dest = out_dir / spec_path(task)
         if opt.events:
@@ -111,12 +170,24 @@ def write_design_specs(
             rows.append((task, str(dest), "kept"))
             continue
 
+        # Scan the copies under work_dir, but record the work-dir-relative name:
+        # the script cds there, so "stimuli/<f>.tsv" is what the GLM resolves.
+        scan_paths, rel_paths = [], []
+        for e in events:
+            rel = copies.get(str(e))
+            if rel and (out_dir / rel).is_file():
+                scan_paths.append(out_dir / rel)
+                rel_paths.append(rel)
+            else:
+                scan_paths.append(e)
+                rel_paths.append(str(e))
+
         trs = {pr.bold.tr for pr in prs if pr.bold.tr}
         nuisance, _skipped = nuisance_specs(task, opt)
         try:
             spec, notes = build_stub_spec(
                 [Path(f"stage10.final.{_frag(pr)}.nii{opt.final_fmt}") for pr in prs],
-                events,
+                scan_paths,
                 tr=trs.pop() if len(trs) == 1 else None,
                 n_timepoints_per_run=[_n_timepoints(pr, opt.noise_vols) for pr in prs],
                 nuisance=nuisance,
@@ -124,6 +195,9 @@ def write_design_specs(
         except (ValueError, OSError) as exc:
             rows.append((task, str(dest), f"skipped: {exc}"))
             continue
+
+        for run_spec, rel in zip(spec.meta.runs, rel_paths, strict=True):
+            run_spec.events = rel
 
         out_dir.mkdir(parents=True, exist_ok=True)
         write_spec(

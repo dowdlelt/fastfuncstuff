@@ -346,6 +346,39 @@ class TestDataTypeHandling:
         assert "BRICK_STATAUX" in xml
         assert "none;Ttest(35);none" in xml  # only sub-brick 1 is a stat
 
+    def test_geometry_attributes_dropped_from_extension(self, temp_output_dir):
+        """A crop/regrid changes the affine, but the AFNI extension copied from the
+        input still describes the input grid. Since NIfTI_nums is updated, AFNI
+        trusts the extension and applies its IJK_TO_DICOM_REAL over the sform --
+        which moved ffs_util_autobox output ~37mm from its own input on deoblique.
+        The geometry attributes must not survive the write."""
+        from fastfuncstuff.io.afni import _NIFTI_ECODE_AFNI, save_nifti
+
+        geom = "".join(
+            f'<AFNI_atr\n  ni_type="float"\n  ni_dimen="3"\n  atr_name="{name}" >\n'
+            " 1.0\n 2.0\n 3.0\n</AFNI_atr>\n"
+            for name in ("ORIGIN", "DELTA", "IJK_TO_DICOM", "IJK_TO_DICOM_REAL")
+        )
+        xml = (
+            '<?xml version="1.0" ?>\n<AFNI_attributes\n  self_idcode="AFN_old"\n'
+            '  NIfTI_nums="9,9,9,1,1,16"\n  ni_form="ni_group" >\n'
+            f"{geom}</AFNI_attributes>\n"
+        )
+        hdr = nib.Nifti1Header()
+        hdr.extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode()))
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        affine[:3, 3] = [-40.0, 30.0, -20.0]
+        out = temp_output_dir / "cropped.nii.gz"
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=affine, header=hdr)
+
+        img = nib.load(str(out))
+        ext = next(e for e in img.header.extensions if e.get_code() == _NIFTI_ECODE_AFNI)
+        content = ext.content.decode()
+        for name in ("ORIGIN", "DELTA", "IJK_TO_DICOM", "IJK_TO_DICOM_REAL"):
+            assert f'atr_name="{name}"' not in content, f"stale {name} survived the write"
+        assert np.allclose(img.affine, affine), "sform must carry the new geometry"
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""

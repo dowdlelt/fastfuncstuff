@@ -222,6 +222,30 @@ def _pre_chain(pr: PlanRun, fmt: str) -> list[str]:
     return out
 
 
+def _jac_spec(pr: PlanRun) -> str:
+    """``AXIS:FIELDMAP`` for ``ffs_nwarp -jac``, or ``""`` for a run with no
+    fieldmap in its chain.
+
+    ffs_blipflip estimates a *geometry-only* displacement field: applying it
+    unwarps the image but leaves the signal pile-up at compression edges, because
+    the voxel that got squeezed still holds the sum of what was squeezed into it.
+    The Jacobian ``1 + d(disp_pe)/d(pe)`` is what makes it quantitatively correct
+    (FSL applytopup --method=jac). blipflip's own output mean carries it already;
+    every *later* application of the same warp to raw data — the runmeans and the
+    final resample — has to ask for it explicitly, or those two images disagree
+    about intensity at exactly the places distortion was worst.
+
+    The fieldmap is named (not left to ffs_nwarp's lone-static-warp auto-detect):
+    the chain also carries locomoco's per-frame PE warp, and only the fieldmap's
+    Jacobian belongs here.
+    """
+    if pr.fmap is None or "blip_half" not in pr.warp_chain:
+        return ""
+    pe = pr.fmap.pe_dir or pr.bold.pe_dir or "j"
+    axis = "".join(c for c in pe if c.isalpha()) or "j"
+    return f"{axis}:{_fmap_stem(pr, 'blip')}_warp.nii$FMT"
+
+
 def _ref_blip_mean(pr: PlanRun) -> str:
     """The reference fmap group's undistorted mean — the common grid the runmeans
     (and cross-fmap alignment) land on."""
@@ -515,7 +539,7 @@ def _data_arrays(plan: Plan) -> str:
     lines.append("RUN_KEYS=(" + " ".join(shlex.quote(k) for k in keys) + ")")
     lines.append(
         "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN MOCOMEAN XRUNBASE "
-        "ALIGNED ALIGNED_SB PRECHAIN REFGRID REFGRID_SB"
+        "ALIGNED ALIGNED_SB PRECHAIN REFGRID REFGRID_SB JAC"
     )
 
     # first run per session (the no-fmap anchor).
@@ -566,21 +590,26 @@ def _data_arrays(plan: Plan) -> str:
             lines.append(f'SBCHAIN[{q(k)}]="{" ".join(sbchain)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
+        # Jacobian modulation for the fieldmap link, wherever that chain is
+        # applied to data (stage07, stage10). Empty for a run with no fmap.
+        jac = _jac_spec(pr)
+        if jac:
+            lines.append(f'JAC[{q(k)}]="{jac}"')
     return "\n".join(lines) + "\n"
 
 
 def _all_events(plan: Plan, bids_root: str | None) -> list[str]:
     """Every events TSV the GLM stage will read, across tasks. Empty when the GLM
-    is off or nothing resolved (the emitted -events is then a TODO placeholder)."""
-    from fastfuncstuff.autoproc.glm import runs_by_task
+    is off or nothing resolved (the emitted -events is then a TODO placeholder).
+
+    These are the ``stimuli/`` copies ffs_autoproc writes beside the results, not
+    the BIDS originals — the copies are what the design TOMLs name, so they are
+    what preflight has to find."""
+    from fastfuncstuff.autoproc.glm import stimuli_map
 
     if not plan.options.run_glm:
         return []
-    tasks = runs_by_task(plan)
-    out: list[str] = []
-    for task, prs in tasks.items():
-        out.extend(events_for_task(task, prs, bids_root, plan.options))
-    return out
+    return list(stimuli_map(plan, bids_root).values())
 
 
 def _spec_files(plan: Plan, bids_root: str | None) -> list[str]:
@@ -1010,6 +1039,7 @@ def _stage_grandmean(plan: Plan) -> str:
             [
                 f'-source "{_run_level_var(lane)}"',
                 '-nwarp "${PRECHAIN[$k]}"',
+                '${JAC[$k]:+-jac "${JAC[$k]}"}',
                 f'-master "${{{grid_arr}[$k]}}"',
                 *_split_flags(nwarp_opts),
                 f'-prefix "stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"',
@@ -1559,7 +1589,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
 done
 {_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -1595,7 +1625,8 @@ def _sbref_final_jobs(plan: Plan) -> str:
         '      -prefix "$sboutf" -device "$DEVICE"\n'
         "    continue\n"
         "  fi\n"
-        '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${SBCHAIN[$k]}\\" '
+        '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${SBCHAIN[$k]}\\"'
+        '${JAC[$k]:+ -jac \\"${JAC[$k]}\\"} '
         '-master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" '
         f'{nwarp_flags} -prefix \\"$sboutf\\"" >> "$nwarpbatch"\n'
         "done\n"

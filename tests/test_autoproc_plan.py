@@ -320,6 +320,39 @@ def test_chain_files_are_produced_in_script():
                 assert frag in tok, f"{tok}: does not contain run coord {frag} (key {key})"
 
 
+def test_fieldmap_jacobian_rides_every_application_of_the_blip_warp():
+    """ffs_blipflip's warp is geometry-only: applying it without ``-jac`` leaves
+    the signal pile-up at compression edges. Every stage that re-applies it to
+    data (stage07 runmeans, stage10 final + SBRef) must ask for the modulation,
+    and must name the fieldmap so locomoco's PE warp is not picked instead."""
+    import re
+
+    fmap = FmapGroup(
+        "SM", "PA", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.08}, [("t", "1"), ("t", "2")]
+    )
+    runs = [_run("SM", "t", "1"), _run("SM", "t", "2")]
+    for b in runs:
+        b.sbref_path = Path(f"/bids/sb_{b.run}.nii.gz")
+    subj = Subject("ME1", [Session("SM", runs, [fmap])])
+    plan = build_plan(subj, Options(go_to_anat=False, locomoco=True))
+    script = write_script(plan, "workdir", bids_root="/bids")
+
+    jacs = set(re.findall(r'JAC\[[^\]]+\]="([^"]*)"', script))
+    assert jacs == {"j:stage04.blip.ses-SM.fmap-PA_warp.nii$FMT"}
+    # The named warp is actually in the chains it modulates.
+    assert 'CHAIN[SM:t:1]="' in script
+    for m in re.finditer(r'(?:CHAIN|SBCHAIN|PRECHAIN)\[[^\]]+\]="([^"]*)"', script):
+        assert "stage04.blip.ses-SM.fmap-PA_warp.nii$FMT" in m.group(1).split()
+    # stage07 runmean, stage10 BOLD and stage10 SBRef all pass it.
+    assert script.count("${JAC[$k]:+") == 4  # two lanes in stage07, BOLD, SBRef
+
+    # A run with no fieldmap has no JAC entry at all (nothing to modulate).
+    plain = build_plan(
+        Subject("ME1", [Session("SM", [_run("SM", "t", "1")])]), Options(go_to_anat=False)
+    )
+    assert "JAC[" not in write_script(plain, "workdir", bids_root="/bids").split("stage07")[0]
+
+
 def test_warpmaster_defines_grid_mask_and_stats():
     """stage10a builds the warpmaster grid + epi_mask before stage10, stage10
     resamples onto it, and the GLM emits OLS+REML buckets masked by epi_mask.
@@ -614,7 +647,7 @@ def test_glm_stage_is_spec_driven_and_preflight_checks_its_inputs(tmp_path: Path
     from fastfuncstuff.autoproc.bids import scan_subject
     from fastfuncstuff.autoproc.glm import write_design_specs
 
-    func = _bids_with_events(tmp_path)
+    _bids_with_events(tmp_path)
     subj = scan_subject(tmp_path, "ME1")
     plan = build_plan(subj, Options(run_glm=True, glm_ortvec=["motion", "motion_deriv"]))
     s = write_script(plan, str(tmp_path / "wd"), bids_root=str(tmp_path))
@@ -623,8 +656,9 @@ def test_glm_stage_is_spec_driven_and_preflight_checks_its_inputs(tmp_path: Path
     assert "-events" not in s  # events live in the spec now
     preflight_block = s.split("MISSING INPUT")[0]
     assert "stage11.design.task-floc.toml" in preflight_block
+    # Preflight checks the stimuli/ copies — those are what the spec names.
     for r in ("01", "02"):
-        assert str(func / f"sub-ME1_ses-SM_task-floc_run-{r}_events.tsv") in s
+        assert f"stimuli/sub-ME1_ses-SM_task-floc_run-{r}_events.tsv" in preflight_block
 
     rows = write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
     assert [(t, st) for t, _, st in rows] == [("floc", "wrote")]
@@ -658,6 +692,34 @@ def test_design_spec_describes_the_preprocessed_runs_not_the_raw_ones(tmp_path: 
         "stage10.final.ses-SM.task-floc.run-01.nii.gz",
         "stage10.final.ses-SM.task-floc.run-02.nii.gz",
     ]
+
+
+def test_events_are_copied_into_stimuli_and_named_relatively(tmp_path: Path):
+    """The timing that produced a stat map should travel with it: events are
+    copied into <work_dir>/stimuli/ and the spec names the copy, relative to the
+    working dir the script cds into — not the BIDS path, which may not be mounted
+    (or may have been edited) by the time the GLM is re-run."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    func = _bids_with_events(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    wd = tmp_path / "wd"
+    plan = build_plan(subj, Options(run_glm=True))
+    write_design_specs(plan, str(tmp_path), str(wd))
+
+    spec = load_spec(wd / "stage11.design.task-floc.toml")
+    assert [r.events for r in spec.meta.runs] == [
+        "stimuli/sub-ME1_ses-SM_task-floc_run-01_events.tsv",
+        "stimuli/sub-ME1_ses-SM_task-floc_run-02_events.tsv",
+    ]
+    for r in spec.meta.runs:
+        copy = wd / r.events
+        assert copy.is_file()
+        assert copy.read_text() == (func / Path(r.events).name).read_text()
+    # The trial types still came out of the copied files.
+    assert {e.trial_type for e in spec.events} == {"face", "place"}
 
 
 def test_existing_design_spec_is_never_clobbered(tmp_path: Path):

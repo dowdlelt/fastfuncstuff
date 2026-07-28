@@ -2063,6 +2063,9 @@ def _update_afni_extension(
         - NIfTI_nums → matches actual data shape/dtype
         - HISTORY_NOTE → appends fastfuncstuff provenance
         - BRICK_STATS / BRICK_STATSYM / BRICK_LABS → trimmed if volume count changed
+        - ORIGIN / DELTA / IJK_TO_DICOM[_REAL] / … → dropped, so the sform we
+          write is the only geometry (the extension's copy describes the input
+          grid, which a crop or regrid has already invalidated)
     """
     import re
     from datetime import datetime
@@ -2163,6 +2166,34 @@ def _update_afni_extension(
         "BRICK_LABS",
         "BRICK_TYPES",
         "BRICK_FLOAT_FACS",
+    ):
+        afni_xml = re.sub(
+            rf'<AFNI_atr\s[^>]*atr_name="{atr_name}"[^>]*>.*?</AFNI_atr>\s*',
+            "",
+            afni_xml,
+            flags=re.DOTALL,
+        )
+
+    # --- Drop the geometry attributes ---
+    # These describe the *input* grid and we have no guarantee the output shares
+    # it (autobox crops, resample regrids, warps land on a master).  Since we
+    # update NIfTI_nums, AFNI considers the extension consistent and applies
+    # them over the sform -- so a stale IJK_TO_DICOM_REAL silently moves the
+    # dataset by the crop offset on any oblique-aware operation (3dWarp
+    # -deoblique, alignment, the GUI).  Bug of record: ffs_util_autobox output
+    # deobliqued ~37 mm away from its own input.
+    #
+    # Removing them rather than rewriting them: with no geometry in the
+    # extension AFNI derives all of it from the sform we just wrote, which is
+    # by construction the grid the data is on -- exactly what a plain-NIfTI
+    # input (no extension at all) already does correctly.
+    for atr_name in (
+        "ORIGIN",
+        "DELTA",
+        "ORIENT_SPECIFIC",
+        "IJK_TO_DICOM",
+        "IJK_TO_DICOM_REAL",
+        "DATASET_DIMENSIONS",
     ):
         afni_xml = re.sub(
             rf'<AFNI_atr\s[^>]*atr_name="{atr_name}"[^>]*>.*?</AFNI_atr>\s*',
