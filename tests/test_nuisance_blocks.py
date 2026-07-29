@@ -19,6 +19,7 @@ from fastfuncstuff.cli_utils import (
     NuisanceBlock,
     _infer_run_indices_from_filenames,
     add_ortvec_arguments,
+    append_nuisance_blocks,
     apply_nuisance_transform,
     assemble_per_run_nuisance,
     build_nuisance_block_diag,
@@ -714,3 +715,75 @@ class TestNuisanceTransforms:
             ("motion_d", "deriv"),
         ]
         np.testing.assert_allclose(blocks[1].get_run(0, 10)[:, 0], [0] + [1] * 9)
+
+
+# ---------------------------------------------------------------------------
+# Prefixed flag family (-test_ortvec …) and the shared append helper
+# ---------------------------------------------------------------------------
+
+
+class TestPrefixedOrtvecFamily:
+    """`ffs_denoisatorial` carries two independent nuisance sets — one for the
+    input runs, one for `-test_input` — so the flags and the collector must
+    stay separable."""
+
+    def _parser(self):
+        p = argparse.ArgumentParser()
+        add_ortvec_arguments(p)
+        add_ortvec_arguments(p, prefix="test_")
+        return p
+
+    def test_both_families_coexist(self, tmp_path):
+        p = self._parser()
+        args = p.parse_args(["-ortvec", "a.1D", "phys", "-test_ortvec", "b.1D", "phys"])
+        assert args.ortvec == [["a.1D", "phys"]]
+        assert args.test_ortvec == [["b.1D", "phys"]]
+
+    def test_prefixed_dash_aliases(self):
+        p = self._parser()
+        args = p.parse_args(["-test-ortvec-run", "x.1D", "mot", "2"])
+        assert args.test_ortvec_run == [["x.1D", "mot", "2"]]
+        assert args.ortvec_run is None
+
+    def test_collect_selects_only_its_own_family(self, tmp_path):
+        train = tmp_path / "train.1D"
+        test = tmp_path / "test.1D"
+        _write_1d(train, np.arange(20, dtype=float).reshape(20, 1))
+        _write_1d(test, np.arange(10, dtype=float).reshape(10, 1))
+
+        p = self._parser()
+        args = p.parse_args(["-ortvec", str(train), "mot", "-test_ortvec", str(test), "mot"])
+        # Different datasets: 2 runs of 10 for the input, 1 run of 10 held out.
+        train_blocks = collect_nuisance_blocks(args, [0, 10], 20)
+        test_blocks = collect_nuisance_blocks(args, [0], 10, prefix="test_")
+
+        assert [b.source[0] for b in train_blocks] == [str(train)]
+        assert [b.source[0] for b in test_blocks] == [str(test)]
+        assert len(train_blocks[0].per_run) == 2
+        assert len(test_blocks[0].per_run) == 1
+
+    def test_no_prefixed_flags_yields_no_blocks(self):
+        p = self._parser()
+        args = p.parse_args(["-ortvec", "a.1D", "phys"])
+        assert collect_nuisance_blocks(args, [0], 10, prefix="test_") == []
+
+
+class TestAppendNuisanceBlocks:
+    def test_columns_are_demeaned_and_padded_to_equal_width(self, tmp_path):
+        # Run 0 gets a block, run 1 does not: the widths must still match, or
+        # the block-diagonal builders downstream see a ragged stack.
+        f = tmp_path / "m_run-01.1D"
+        _write_1d(f, (100.0 + np.arange(10, dtype=float)).reshape(10, 1))
+        block = make_nuisance_block_from_glob(str(tmp_path / "m_run-*.1D"), "motion", [0, 10], 20)
+        nuisance = [torch.ones(10, 2), torch.ones(10, 2)]
+
+        out = append_nuisance_blocks(nuisance, [block], [0, 10], 20)
+
+        assert out[0].shape == out[1].shape == (10, 3)
+        assert abs(float(out[0][:, 2].mean())) < 1e-5  # demeaned, not 104.5
+        np.testing.assert_allclose(out[1][:, 2].numpy(), 0.0, atol=1e-6)
+
+    def test_no_blocks_is_a_no_op(self):
+        nuisance = [torch.ones(10, 2), torch.ones(10, 2)]
+        out = append_nuisance_blocks(nuisance, [], [0, 10], 20)
+        assert out[0].shape == (10, 2)

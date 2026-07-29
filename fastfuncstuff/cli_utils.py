@@ -1317,13 +1317,17 @@ def make_nuisance_block_from_glob(
     )
 
 
-def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
+def add_ortvec_arguments(parser_or_group, include_legacy: bool = True, prefix: str = "") -> None:
     """Register `-ortvec`, `-ortvec_run`, `-ortvec_glob`, `-ortvec_concat` on a parser/group.
 
     All four are repeatable. The CLI then funnels them through
     `collect_nuisance_blocks(args, ...)` to get a `list[NuisanceBlock]`.
     Any per-CLI guard in front of that call must test all four flags
     (a subset guard silently drops the omitted mode).
+
+    `prefix` registers a second, independent family (e.g. `prefix="test_"` gives
+    `-test_ortvec` …) so one CLI can carry nuisance for two different datasets.
+    Pass the same prefix to `collect_nuisance_blocks`.
 
     Every LABEL accepts a `:transform` modifier (see NUISANCE_TRANSFORMS), so
     the same file can enter twice — once raw, once differenced — without a
@@ -1334,53 +1338,62 @@ def add_ortvec_arguments(parser_or_group, include_legacy: bool = True) -> None:
         "difference, as 1d_tool.py -derivative), LABEL:deriv_fwd (forward "
         "difference), LABEL:deriv_back (explicit synonym of :deriv)."
     )
+    # argparse would derive these dests itself, but the prefixed family relies
+    # on them matching what collect_nuisance_blocks(prefix=...) looks up.
+    p = prefix
+    dash = prefix.replace("_", "-")
     if include_legacy:
         parser_or_group.add_argument(
-            "-ortvec",
+            f"-{p}ortvec",
+            dest=f"{p}ortvec",
             action="append",
             nargs=2,
             metavar=("FILE", "LABEL"),
             help=(
                 "Full-length nuisance regressors (pre-concatenated across all runs). "
-                "Repeatable: -ortvec motion.1D motion -ortvec physio.1D physio" + transform_note
+                f"Repeatable: -{p}ortvec motion.1D motion -{p}ortvec physio.1D physio"
+                + transform_note
             ),
         )
     parser_or_group.add_argument(
-        "-ortvec_run",
-        "-ortvec-run",
+        f"-{p}ortvec_run",
+        f"-{dash}ortvec-run",
+        dest=f"{p}ortvec_run",
         action="append",
         nargs=3,
         metavar=("FILE", "LABEL", "RUN"),
         help=(
             "Per-run nuisance regressors; RUN is 1-based run index. Other runs are zero-padded. "
-            "Repeatable: -ortvec_run motion_r1.1D motion 1 -ortvec_run motion_r2.1D motion 2"
-            + transform_note
+            f"Repeatable: -{p}ortvec_run motion_r1.1D motion 1 "
+            f"-{p}ortvec_run motion_r2.1D motion 2" + transform_note
         ),
     )
     parser_or_group.add_argument(
-        "-ortvec_glob",
-        "-ortvec-glob",
+        f"-{p}ortvec_glob",
+        f"-{dash}ortvec-glob",
+        dest=f"{p}ortvec_glob",
         action="append",
         nargs=2,
         metavar=("PATTERN", "LABEL"),
         help=(
             "Glob matching per-run nuisance files; run index inferred from filename "
             "(BIDS-style `_run-N_` preferred). Missing runs zero-padded. "
-            "Repeatable: -ortvec_glob 'motion_run-*.1D' motion" + transform_note
+            f"Repeatable: -{p}ortvec_glob 'motion_run-*.1D' motion" + transform_note
         ),
     )
     parser_or_group.add_argument(
-        "-ortvec_concat",
-        "-ortvec-concat",
+        f"-{p}ortvec_concat",
+        f"-{dash}ortvec-concat",
+        dest=f"{p}ortvec_concat",
         action="append",
         nargs=2,
         metavar=("PATTERN", "LABEL"),
         help=(
             "Glob matching N already-full-length per-run files (e.g. AFNI "
             "mot_demean.r0N.1D — each spans every run with zeros outside its own). "
-            "Expanded into N -ortvec entries labelled LABEL01, LABEL02, … "
+            f"Expanded into N -{p}ortvec entries labelled LABEL01, LABEL02, … "
             "(width auto-padded from n_runs). Repeatable: "
-            "-ortvec_concat 'mot_demean.r0*.1D' motion"
+            f"-{p}ortvec_concat 'mot_demean.r0*.1D' motion"
         ),
     )
 
@@ -1423,6 +1436,7 @@ def collect_nuisance_blocks(
     run_starts: list[int],
     n_timepoints: int,
     verbose: bool = False,
+    prefix: str = "",
 ) -> list[NuisanceBlock]:
     """Translate argparse Namespace fields into a list of NuisanceBlock.
 
@@ -1430,9 +1444,14 @@ def collect_nuisance_blocks(
     ``args.ortvec_concat`` — any combination, all repeatable, all optional.
     Designed to plug into any CLI that called ``add_ortvec_arguments`` on
     its parser.
+
+    ``prefix`` must match the one given to ``add_ortvec_arguments``; it selects
+    the prefixed flag family (``-test_ortvec`` …) instead of the plain one, and
+    ``run_starts``/``n_timepoints`` then describe that family's dataset.
     """
+    p = prefix
     blocks: list[NuisanceBlock] = []
-    for path, raw_label in getattr(args, "ortvec", None) or []:
+    for path, raw_label in getattr(args, f"{p}ortvec", None) or []:
         label, tf = split_label_transform(raw_label)
         blocks.append(
             make_nuisance_block_from_full_length(
@@ -1444,13 +1463,13 @@ def collect_nuisance_blocks(
             )
         )
         if verbose:
-            print(f"  -ortvec: {path} (label={label}, transform={tf})")
-    for path, raw_label, run_str in getattr(args, "ortvec_run", None) or []:
+            print(f"  -{p}ortvec: {path} (label={label}, transform={tf})")
+    for path, raw_label, run_str in getattr(args, f"{p}ortvec_run", None) or []:
         label, tf = split_label_transform(raw_label)
         try:
             run_idx = int(run_str)
         except ValueError:
-            print(f"ERROR: -ortvec_run RUN must be a 1-based integer, got {run_str!r}")
+            print(f"ERROR: -{p}ortvec_run RUN must be a 1-based integer, got {run_str!r}")
             sys.exit(1)
         blocks.append(
             make_nuisance_block_from_per_run_file(
@@ -1463,8 +1482,8 @@ def collect_nuisance_blocks(
             )
         )
         if verbose:
-            print(f"  -ortvec_run: {path} (label={label}, run={run_idx}, transform={tf})")
-    for pattern, raw_label in getattr(args, "ortvec_glob", None) or []:
+            print(f"  -{p}ortvec_run: {path} (label={label}, run={run_idx}, transform={tf})")
+    for pattern, raw_label in getattr(args, f"{p}ortvec_glob", None) or []:
         label, tf = split_label_transform(raw_label)
         block = make_nuisance_block_from_glob(
             pattern,
@@ -1477,13 +1496,13 @@ def collect_nuisance_blocks(
         if verbose:
             matched = [s for s in block.source if s]
             print(
-                f"  -ortvec_glob: {pattern} (label={label}, transform={tf})"
+                f"  -{p}ortvec_glob: {pattern} (label={label}, transform={tf})"
                 f" → {len(matched)} run(s) assigned"
             )
     # -ortvec_concat: glob over already-full-length per-run files; each becomes
     # its own full-length NuisanceBlock with an auto-suffixed label. Equivalent
     # to writing N -ortvec calls.
-    for pattern, raw_label in getattr(args, "ortvec_concat", None) or []:
+    for pattern, raw_label in getattr(args, f"{p}ortvec_concat", None) or []:
         label, tf = split_label_transform(raw_label)
         n_runs = len(run_starts)
         for path, suffixed_label in expand_ortvec_concat(pattern, label, n_runs):
@@ -1497,8 +1516,52 @@ def collect_nuisance_blocks(
                 )
             )
             if verbose:
-                print(f"  -ortvec_concat: {path} (label={suffixed_label})")
+                print(f"  -{p}ortvec_concat: {path} (label={suffixed_label})")
     return blocks
+
+
+def append_nuisance_blocks(
+    nuisance_per_run: list[torch.Tensor],
+    blocks: list[NuisanceBlock],
+    run_starts: list[int],
+    n_timepoints: int,
+) -> list[torch.Tensor]:
+    """Concatenate NuisanceBlock columns onto per-run nuisance, then pad to width.
+
+    Blocks are demeaned per run before they join the polynomials, which already
+    span the constant. Runs end up with a uniform column count because
+    ``compute_qr_projectors`` drops the all-zero padding anyway, and the
+    block-diagonal builders downstream assume a rectangular stack.
+    """
+    n_runs = len(run_starts)
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_length = end_tp - start_tp
+        for block in blocks:
+            if block.n_columns == 0:
+                continue
+            m = block.get_run(run_idx, run_length).copy()
+            col_mean = m.mean(axis=0, keepdims=True)
+            if np.max(np.abs(col_mean)) > 1e-4:
+                m = m - col_mean
+            columns = torch.from_numpy(m).to(
+                device=nuisance_per_run[run_idx].device,
+                dtype=nuisance_per_run[run_idx].dtype,
+            )
+            nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], columns], dim=1)
+
+    max_cols = max(n.shape[1] for n in nuisance_per_run)
+    for run_idx in range(n_runs):
+        n_cols = nuisance_per_run[run_idx].shape[1]
+        if n_cols < max_cols:
+            padding = torch.zeros(
+                (nuisance_per_run[run_idx].shape[0], max_cols - n_cols),
+                device=nuisance_per_run[run_idx].device,
+                dtype=nuisance_per_run[run_idx].dtype,
+            )
+            nuisance_per_run[run_idx] = torch.cat([nuisance_per_run[run_idx], padding], dim=1)
+    return nuisance_per_run
 
 
 def assemble_per_run_nuisance(
