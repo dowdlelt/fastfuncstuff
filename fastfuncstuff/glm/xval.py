@@ -14,7 +14,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff._compile import safe_compile
-from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
 
 
 def compute_qr_projectors(
@@ -764,6 +764,60 @@ def _compute_projection_matrix(
         return P
 
 
+def _cap_batch_to_free_vram(
+    effective_batch_size: int,
+    *,
+    cv_splits: list[tuple[list[int], list[int]]],
+    run_lengths: np.ndarray,
+    device: torch.device,
+    use_fast_r2: bool,
+    verbose: bool = False,
+) -> int:
+    """Shrink a voxel batch so one fold's working set fits in free VRAM.
+
+    The batch sizes above this call are ``estimate_chunk_size`` multiplied by
+    4 or 20 to amortize transfer and launch overhead, with the multipliers
+    tuned for LORO — one run held out, so train/test slices are bounded by the
+    dataset length. They stop being safe as soon as a fold is *big*: a split
+    testing 10 runs, or an inner CV whose training set is 9 of 10 runs, scales
+    the per-batch arrays by the same factor and the allocation fails. (On CUDA
+    the failure surfaces as an NVML assert from the caching allocator, not an
+    OOM, which is a long way from the cause.)
+
+    Sizing uses the widest fold actually in *cv_splits* and the free VRAM at
+    this moment, so it adapts to whatever else is already resident (the data
+    itself, when it lives on the GPU).
+    """
+    if device.type != "cuda":
+        return effective_batch_size
+
+    max_train_tps = 0
+    max_test_tps = 0
+    for train_runs, test_runs in cv_splits:
+        max_train_tps = max(max_train_tps, sum(int(run_lengths[r]) for r in train_runs))
+        max_test_tps = max(max_test_tps, sum(int(run_lengths[r]) for r in test_runs))
+
+    # Per voxel, live at the same moment inside the batch loop:
+    #   train side: the batch, its transpose and the projection product (3 x f32)
+    #   test side:  the same 3, plus the prediction (4 x f32)
+    #   fast R²:    data, prediction and residual promoted to f64 (3 x f64)
+    bytes_per_voxel = 12 * max_train_tps + 16 * max_test_tps
+    if use_fast_r2:
+        bytes_per_voxel += 24 * max_test_tps
+
+    budget = get_available_memory(device)
+    cap = max(1_000, int(budget // max(bytes_per_voxel, 1)))
+    if cap >= effective_batch_size:
+        return effective_batch_size
+
+    if verbose:
+        print(
+            f"  Capping batch to {cap:,} voxels for a {max_train_tps:,}-train / "
+            f"{max_test_tps:,}-test timepoint fold ({budget / 1e9:.1f}GB usable)"
+        )
+    return cap
+
+
 @torch.inference_mode()
 def compute_xval_r2(
     data: torch.Tensor,
@@ -977,6 +1031,15 @@ def compute_xval_r2(
         else:
             effective_batch_size = batch_size
 
+        effective_batch_size = _cap_batch_to_free_vram(
+            effective_batch_size,
+            cv_splits=cv_splits,
+            run_lengths=run_lengths,
+            device=device,
+            use_fast_r2=True,
+            verbose=verbose,
+        )
+
         # Streaming stats accumulators (tiny: ~24 bytes per voxel)
         ss_res_accumulator = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
         sum_actual = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
@@ -1030,6 +1093,15 @@ def compute_xval_r2(
                     data = data.cpu()
                 elif verbose:
                     print("  Data on CPU - streaming batches to GPU")
+
+        effective_batch_size = _cap_batch_to_free_vram(
+            effective_batch_size,
+            cv_splits=cv_splits,
+            run_lengths=run_lengths,
+            device=device,
+            use_fast_r2=False,
+            verbose=verbose,
+        )
 
         # Full timeseries accumulators
         pred_accumulator = torch.zeros(
