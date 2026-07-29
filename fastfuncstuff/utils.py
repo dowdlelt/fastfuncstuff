@@ -215,7 +215,65 @@ def to_tensor(
     return x
 
 
-def configure_torch_backends(device: torch.device) -> None:
+def resolve_cpu_threads(requested: int | None = None) -> tuple[int, str]:
+    """How many CPU threads this process may use, and why.
+
+    A shared server or batch scheduler expresses "use this much of the
+    machine" through the environment, and a tool that calls
+    ``os.cpu_count()`` ignores every one of those signals — it takes the whole
+    box regardless of ``OMP_NUM_THREADS``, a cpuset, or a SLURM allocation.
+    Precedence here, first hit wins:
+
+    1. *requested* — an explicit flag (``-device cpu,N``).
+    2. ``FFS_NUM_THREADS`` — ours, for when a site wants to cap only us.
+    3. ``OMP_NUM_THREADS`` — the standard knob, which torch itself honours.
+    4. ``SLURM_CPUS_PER_TASK`` — what the scheduler actually granted.
+    5. CPU affinity (``sched_getaffinity``), which respects cpusets, taskset
+       and containers, falling back to ``os.cpu_count()``.
+
+    In case 5 only, and only when nothing has narrowed the affinity mask, the
+    count drops to *physical* cores: hyperthread siblings share an FPU and
+    rarely help dense linear algebra, which is most of what we run.
+
+    Returns ``(n_threads, source)``; *source* is a short human-readable
+    explanation for the startup banner.
+    """
+    if requested is not None and requested > 0:
+        return max(1, int(requested)), "user-specified"
+
+    for var in ("FFS_NUM_THREADS", "OMP_NUM_THREADS", "SLURM_CPUS_PER_TASK"):
+        raw = os.environ.get(var)
+        if raw:
+            try:
+                val = int(raw)
+            except ValueError:
+                continue
+            if val > 0:
+                return val, f"${var}"
+
+    try:
+        n_avail = len(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        n_avail = os.cpu_count() or 1
+
+    n_logical = os.cpu_count() or n_avail
+    if n_avail < n_logical:
+        # Something restricted us (cpuset/taskset/container) — take it at
+        # face value rather than second-guessing it with core topology.
+        return max(1, n_avail), "CPU affinity"
+
+    try:
+        import psutil
+
+        physical = psutil.cpu_count(logical=False)
+        if physical and physical < n_logical:
+            return max(1, physical), f"physical cores ({n_logical} logical)"
+    except ImportError:
+        pass
+    return max(1, n_logical), "all CPUs"
+
+
+def configure_torch_backends(device: torch.device, n_threads: int | None = None) -> None:
     """Configure PyTorch backends for optimal performance.
 
     Call once at the start of a CLI entry-point after selecting the device.
@@ -223,14 +281,16 @@ def configure_torch_backends(device: torch.device) -> None:
     Sets:
       - float32 matmul precision to 'high' (use TF32 on Ampere+)
       - cudnn.benchmark = True (autotuner for convolutions)
-      - CPU thread count to physical core count (for CPU and MPS fallback paths)
+      - CPU thread count from :func:`resolve_cpu_threads` (for CPU and MPS
+        fallback paths), which honours ``FFS_NUM_THREADS`` / ``OMP_NUM_THREADS``
+        / the scheduler's allocation rather than seizing every core.
     """
     torch.set_float32_matmul_precision("high")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
-    # Always maximize CPU thread utilization — CPU is used as the linalg
-    # fallback when on MPS, and is the primary compute device when device=cpu.
-    n_cpu = os.cpu_count() or 1
+    # CPU is the linalg fallback under MPS and the primary device for
+    # device=cpu, so the thread count matters even on a GPU run.
+    n_cpu, _source = resolve_cpu_threads(n_threads)
     torch.set_num_threads(n_cpu)
     try:
         torch.set_num_interop_threads(min(4, n_cpu))

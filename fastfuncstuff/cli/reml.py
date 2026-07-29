@@ -1265,57 +1265,20 @@ def main():
         )
         device = torch.device("cpu")
 
-    configure_torch_backends(device)
+    configure_torch_backends(device, n_threads=cpu_threads_override)
 
-    # Configure CPU threading for maximum performance
     if device.type == "cpu":
-        try:
-            import psutil
+        from fastfuncstuff.utils import resolve_cpu_threads
 
-            physical_cores = psutil.cpu_count(logical=False)
-            logical_cores = os.cpu_count() or 12
-
-            # Determine number of threads to use
-            if cpu_threads_override is not None:
-                # User explicitly specified thread count
-                num_threads = cpu_threads_override
-                thread_source = "user-specified"
-            else:
-                # Auto-detect: use physical cores for compute efficiency
-                num_threads = physical_cores or logical_cores
-                thread_source = f"physical cores ({logical_cores} logical with hyperthreading)"
-
-            torch.set_num_threads(num_threads)
-            # set_num_interop_threads is one-shot and must run before any
-            # parallel work has started; under repeated entry points (tests,
-            # subprocess relaunches, ipython reloads) it may already be set,
-            # so don't fail the run if torch refuses.
-            try:
-                torch.set_num_interop_threads(num_threads)
-            except RuntimeError:
-                pass
-            # Also set environment variables for MKL/OpenMP
-            os.environ["OMP_NUM_THREADS"] = str(num_threads)
-            os.environ["MKL_NUM_THREADS"] = str(num_threads)
-
-            print(f"🖥️  Device: {device}")
-            print(f"⚡ CPU threads: {num_threads} ({thread_source})")
-        except ImportError:
-            # Fallback if psutil not available
-            num_threads = (
-                cpu_threads_override if cpu_threads_override is not None else (os.cpu_count() or 12)
-            )
-            torch.set_num_threads(num_threads)
-            # One-shot and must precede any parallel work; configure_torch_backends
-            # above may already have set it, so don't fail the run if torch refuses.
-            try:
-                torch.set_num_interop_threads(num_threads)
-            except RuntimeError:
-                pass
-            os.environ["OMP_NUM_THREADS"] = str(num_threads)
-            os.environ["MKL_NUM_THREADS"] = str(num_threads)
-            print(f"🖥️  Device: {device}")
-            print(f"⚡ CPU threads: {num_threads}")
+        num_threads, thread_source = resolve_cpu_threads(cpu_threads_override)
+        # Propagate to MKL/OpenMP for any library that reads them later, and
+        # for children we spawn. (Most OpenMP runtimes latch the value at their
+        # first parallel region, so this backs up torch's setting rather than
+        # replacing it.)
+        os.environ.setdefault("OMP_NUM_THREADS", str(num_threads))
+        os.environ.setdefault("MKL_NUM_THREADS", str(num_threads))
+        print(f"🖥️  Device: {device}")
+        print(f"⚡ CPU threads: {num_threads} ({thread_source})")
     else:
         print(f"🖥️  Device: {device}")
     print()
