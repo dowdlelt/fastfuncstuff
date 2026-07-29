@@ -313,13 +313,45 @@ Notes:
         "the usual outputs. Useful for quantifying whether the combinatorial "
         "approach is actually buying you anything on your data.",
     )
+    heldout_opts = parser.add_argument_group("Held-out validation (optional)")
+    heldout_opts.add_argument(
+        "-test_input",
+        "-test-input",
+        dest="test_input",
+        nargs="+",
+        default=None,
+        metavar="DSET",
+        help="Completely held-out run(s), never used to pick PCs, the noise pool or "
+        "anything else. After denoising finishes, task betas are fit on ALL input "
+        "runs with the winning denoising in place (per-run polynomials + that "
+        "run's selected PCs), and those betas times the held-out design predict "
+        "these runs, whose own polynomials are removed so the prediction is valid. "
+        "No PCs are removed from the held-out data — what is being tested is "
+        "whether denoising produced better betas. Writes {prefix}_heldout_r2 and "
+        "{prefix}_heldout_initial_r2 (same fit with no PCs, as the reference).",
+    )
+    heldout_opts.add_argument(
+        "-test_events",
+        "-test-events",
+        dest="test_events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS events TSV(s) for -test_input: one per held-out run, or a single "
+        "shared TSV broadcast across them. Conditions must match the input runs' "
+        "conditions exactly (same labels, same order). Required with -test_input.",
+    )
     combo_opts.add_argument(
         "-brainthresh",
         nargs=2,
         type=float,
         metavar=("PERCENTILE", "FRACTION"),
         default=None,
-        help="Signal intensity threshold for noise pool selection. Example: -brainthresh 99 0.5",
+        help="Signal intensity threshold for noise pool selection: voxels whose mean "
+        "intensity is below percentile(mean, P) * F are excluded from the noise pool. "
+        "Defaults to '99 0.5' (the GLMdenoise default) when none of -mask, -automask "
+        "or -brainthresh is given, so background voxels can't flood the noise pool. "
+        "Pass '-brainthresh 0 0' to disable the cut. Example: -brainthresh 99 0.5",
     )
     combo_opts.add_argument(
         "-min_noise_voxels",
@@ -652,6 +684,103 @@ def save_combinatorial_results(
 
 
 # ============================================================================
+# Design / nuisance construction (shared by the input runs and -test_input)
+# ============================================================================
+
+
+def build_task_designs(
+    all_onsets: list,
+    durations: list[float],
+    n_conditions: int,
+    run_starts: list[int],
+    n_timepoints: int,
+    tr: float,
+    microtime_dt: float,
+    hrf_model_name: str,
+    is_fir_model: bool,
+    fir_bot: float | None,
+    fir_top: float | None,
+    n_basis: int,
+    device: torch.device,
+    hrf_opt: str | None = None,
+    hrf_library: torch.Tensor | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    n_voxels: int | None = None,
+) -> tuple[torch.Tensor | None, dict | None]:
+    """Build the task design (or per-HRF designs) for one set of runs.
+
+    Held-out evaluation has to build its design exactly the way the input runs
+    did — same HRF, same basis count, same microtime grid — so this lives in
+    one function rather than inline in ``main``.
+    """
+    from fastfuncstuff.cli_utils import build_task_design_from_args
+
+    bins_per_tr = int(np.round(tr / microtime_dt))
+    n_microtime = n_timepoints * bins_per_tr
+    onset_matrix_micro = torch.zeros((n_microtime, n_conditions), device=device)
+
+    for cond_idx in range(n_conditions):
+        duration_bins = max(1, int(np.round(durations[cond_idx] / microtime_dt)))
+        for run_idx in range(len(run_starts)):
+            run_start_micro = run_starts[run_idx] * bins_per_tr
+            for onset_time in all_onsets[cond_idx][run_idx]:
+                onset_bin = run_start_micro + int(np.round(onset_time / microtime_dt))
+                if onset_bin < n_microtime:
+                    onset_matrix_micro[
+                        onset_bin : min(onset_bin + duration_bins, n_microtime),
+                        cond_idx,
+                    ] = 1.0
+
+    return build_task_design_from_args(
+        hrf_model_name=hrf_model_name,
+        is_fir_model=is_fir_model,
+        fir_bot=fir_bot,
+        fir_top=fir_top,
+        n_basis=n_basis,
+        all_onsets=all_onsets,
+        onset_matrix_micro=onset_matrix_micro,
+        n_conditions=n_conditions,
+        n_timepoints=n_timepoints,
+        run_starts=run_starts,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        device=device,
+        hrf_opt=hrf_opt,
+        hrf_library=hrf_library,
+        hrf_indices=hrf_indices,
+        n_voxels=n_voxels,
+    )
+
+
+def build_polort_nuisance(
+    run_starts: list[int],
+    n_timepoints: int,
+    tr: float,
+    polort_arg: int | None,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Per-run Legendre polynomial nuisance, one block per run."""
+    nuisance_per_run = []
+    n_runs = len(run_starts)
+    for run_idx in range(n_runs):
+        start_tp = run_starts[run_idx]
+        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+        run_length = end_tp - start_tp
+
+        if polort_arg is None:
+            polort = auto_polort(run_length * tr, formula="afni")
+        else:
+            polort = polort_arg
+
+        if polort >= 0:
+            poly = construct_polynomial_matrix(run_length, polort, device=device)
+        else:
+            poly = torch.zeros((run_length, 0), device=device)
+        nuisance_per_run.append(poly)
+    return nuisance_per_run
+
+
+# ============================================================================
 # Main
 # ============================================================================
 
@@ -681,6 +810,9 @@ def main():
         sys.exit(1)
     if args.event_cols and not args.events:
         print("ERROR: -event_cols requires -events")
+        sys.exit(1)
+    if bool(args.test_input) != bool(args.test_events):
+        print("ERROR: -test_input and -test_events must be given together")
         sys.exit(1)
 
     # Fail on a malformed criteria spec now, not after a long data load.
@@ -915,29 +1047,9 @@ def main():
     print()
     print("Building design matrix...")
 
-    # Build onset matrix at microtime resolution
-    bins_per_tr = int(np.round(args.tr / args.microtime_dt))
-    n_microtime = n_timepoints * bins_per_tr
-    onset_matrix_micro = torch.zeros((n_microtime, n_conditions), device=device)
-
-    for cond_idx in range(n_conditions):
-        duration_bins = max(1, int(np.round(durations[cond_idx] / args.microtime_dt)))
-        for run_idx in range(n_runs):
-            onsets = all_onsets[cond_idx][run_idx]
-            run_start_tr = run_starts[run_idx]
-            run_start_micro = run_start_tr * bins_per_tr
-            for onset_time in onsets:
-                onset_bin = run_start_micro + int(np.round(onset_time / args.microtime_dt))
-                if onset_bin < n_microtime:
-                    onset_matrix_micro[
-                        onset_bin : min(onset_bin + duration_bins, n_microtime),
-                        cond_idx,
-                    ] = 1.0
-
     # Convolve with HRF(s)
-    task_design = None
-    designs_by_hrf = None
     hrf_indices = None
+    hrf_library = None
 
     if args.hrf_opt:
         # Per-voxel HRF mode: load HRF indices and library from 3dHRFoptfast output
@@ -982,74 +1094,35 @@ def main():
         if len(unique_hrfs) > 5:
             print(f"    ... and {len(unique_hrfs) - 5} more HRFs")
 
-        # Build per-HRF design matrices using refactored function
-        from fastfuncstuff.cli_utils import build_task_design_from_args
-
-        task_design, designs_by_hrf = build_task_design_from_args(
-            hrf_model_name=hrf_model_name,
-            is_fir_model=is_fir_model,
-            fir_bot=fir_bot,
-            fir_top=fir_top,
-            n_basis=n_basis,
-            all_onsets=all_onsets,
-            onset_matrix_micro=onset_matrix_micro,
-            n_conditions=n_conditions,
-            n_timepoints=n_timepoints,
-            run_starts=run_starts,
-            tr=args.tr,
-            microtime_dt=args.microtime_dt,
-            device=device,
-            hrf_opt=args.hrf_opt,
-            hrf_library=hrf_library,
-            hrf_indices=hrf_indices,
-            n_voxels=n_voxels,
-        )
-    else:
-        # Single HRF model for all voxels - use refactored function
-        from fastfuncstuff.cli_utils import build_task_design_from_args
-
-        task_design, designs_by_hrf = build_task_design_from_args(
-            hrf_model_name=hrf_model_name,
-            is_fir_model=is_fir_model,
-            fir_bot=fir_bot,
-            fir_top=fir_top,
-            n_basis=n_basis,
-            all_onsets=all_onsets,
-            onset_matrix_micro=onset_matrix_micro,
-            n_conditions=n_conditions,
-            n_timepoints=n_timepoints,
-            run_starts=run_starts,
-            tr=args.tr,
-            microtime_dt=args.microtime_dt,
-            device=device,
-            hrf_opt=None,
-            hrf_library=None,
-            hrf_indices=None,
-            n_voxels=None,
-        )
+    task_design, designs_by_hrf = build_task_designs(
+        all_onsets=all_onsets,
+        durations=durations,
+        n_conditions=n_conditions,
+        run_starts=run_starts,
+        n_timepoints=n_timepoints,
+        tr=args.tr,
+        microtime_dt=args.microtime_dt,
+        hrf_model_name=hrf_model_name,
+        is_fir_model=is_fir_model,
+        fir_bot=fir_bot,
+        fir_top=fir_top,
+        n_basis=n_basis,
+        device=device,
+        hrf_opt=args.hrf_opt,
+        hrf_library=hrf_library,
+        hrf_indices=hrf_indices,
+        n_voxels=n_voxels if args.hrf_opt else None,
+    )
 
     # Build nuisance per run (polynomials + ortvec)
-    nuisance_per_run = []
-    max_nuisance_cols = 0
-
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_length = end_tp - start_tp
-
-        if args.polort is None:
-            run_duration = run_length * args.tr
-            polort = auto_polort(run_duration, formula="afni")
-        else:
-            polort = args.polort
-
-        if polort >= 0:
-            poly = construct_polynomial_matrix(run_length, polort, device=device)
-        else:
-            poly = torch.zeros((run_length, 0), device=device)
-
-        nuisance_per_run.append(poly)
-        max_nuisance_cols = max(max_nuisance_cols, poly.shape[1])
+    nuisance_per_run = build_polort_nuisance(
+        run_starts=run_starts,
+        n_timepoints=n_timepoints,
+        tr=args.tr,
+        polort_arg=args.polort,
+        device=device,
+    )
+    max_nuisance_cols = max(n.shape[1] for n in nuisance_per_run)
 
     # Add user nuisance blocks (-ortvec / -ortvec_run / -ortvec_glob).
     user_blocks = collect_nuisance_blocks(
@@ -1297,6 +1370,235 @@ def main():
         )
 
     # ======================================================================
+    # Step 4c (optional): fully held-out prediction on -test_input
+    # ======================================================================
+    # Everything above is cross-validated *within* the input runs, so the
+    # selection saw every voxel it is scored on. These runs were never loaded
+    # until now: the winning per-run PCs give betas on all input runs, the
+    # consensus PC indices are re-extracted from each held-out run's own noise
+    # pool, and the betas predict runs nothing in the fit has seen.
+    heldout_maps: dict[str, torch.Tensor] = {}
+    if args.test_input:
+        from fastfuncstuff.cli_utils import parse_timing_spec
+        from fastfuncstuff.denoise.heldout import heldout_prediction_r2
+
+        print()
+        print("=" * 70)
+        print("Step 4c: Fully held-out prediction (-test_input)...")
+        print("=" * 70)
+
+        test_files = parse_input_files(args.test_input)
+        n_test_runs = len(test_files)
+
+        try:
+            test_timing = parse_timing_spec(
+                events=args.test_events,
+                onsets=None,
+                durations_arg=None,
+                n_runs=n_test_runs,
+                event_ignore=args.event_ignore,
+                event_cols=tuple(args.event_cols) if args.event_cols else None,
+                round_durations=args.round_durations,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: -test_events: {exc}", file=sys.stderr)
+            sys.exit(1)
+
+        # Design columns are positional, so the condition lists must match
+        # exactly — same labels in the same order — or the betas fit on the
+        # input runs would be applied to the wrong regressors.
+        if test_timing.condition_labels != condition_labels:
+            print("ERROR: -test_events conditions differ from the input conditions.")
+            print(f"  input: {condition_labels}")
+            print(f"  test:  {test_timing.condition_labels}")
+            sys.exit(1)
+
+        # Held-out data is scored by streaming chunks to the GPU, so it never
+        # needs to live there — and there can be far more held-out runs than
+        # input runs (whole extra sessions), which is exactly the case where
+        # the loader's concatenate would OOM the card.
+        test_load: LoadResult = load_and_preprocess_runs(
+            input_files=test_files,
+            tr=args.tr,
+            mask_file=None,  # the analysed voxel set comes from the input runs
+            blur_fwhm=args.do_blur,
+            do_scale=False,
+            device=device,
+            force_cpu=True,
+            dry_run=False,
+            verbose=True,
+            load_threads=args.load_threads,
+        )
+
+        if tuple(test_load.volume_shape) != tuple(volume_shape):
+            print(
+                f"ERROR: -test_input grid {tuple(test_load.volume_shape)} does not match "
+                f"the input grid {tuple(volume_shape)}."
+            )
+            sys.exit(1)
+
+        test_data = test_load.data
+        test_run_starts = test_load.run_starts
+        test_n_timepoints = test_load.n_timepoints
+
+        # Restrict the held-out runs to exactly the voxels that were analysed
+        # (mask / automask / constant-voxel filter all folded into mask_flat).
+        if mask_flat is not None:
+            keep_rows = torch.from_numpy(np.asarray(mask_flat, dtype=bool))
+            if test_data.shape[0] != keep_rows.numel():
+                print(
+                    f"ERROR: -test_input has {test_data.shape[0]:,} voxels, expected "
+                    f"{keep_rows.numel():,} to match the input volume."
+                )
+                sys.exit(1)
+            test_data = test_data[keep_rows.to(test_data.device)]
+            # The full-volume load is a second copy of a dataset that can be
+            # bigger than the input runs; drop it now, not at scope exit.
+            test_load.data = None  # type: ignore[assignment]
+        if test_data.shape[0] != n_voxels:
+            print(
+                f"ERROR: held-out voxel count {test_data.shape[0]:,} != analysed "
+                f"{n_voxels:,}; cannot align the two datasets."
+            )
+            sys.exit(1)
+
+        if args.do_scale:
+            test_data, _, _ = scale_to_percent_signal(
+                data=test_data,
+                run_starts=test_run_starts,
+                max_scale=200.0,
+                verbose=args.verb >= 1,
+            )
+
+        # Voxels that are flat in a held-out run cannot be scored there
+        # (SS_tot = 0 → a spurious R² of 1). Track them and zero them out.
+        test_valid = find_constant_voxels(test_data, test_run_starts)
+        n_test_invalid = int((~test_valid).sum().item())
+        if n_test_invalid > 0:
+            print(
+                f"  {n_test_invalid:,} voxels are constant in a held-out run; "
+                "their held-out R² is set to 0"
+            )
+
+        test_designs = build_task_designs(
+            all_onsets=test_timing.all_onsets,
+            durations=test_timing.durations,
+            n_conditions=n_conditions,
+            run_starts=test_run_starts,
+            n_timepoints=test_n_timepoints,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            hrf_model_name=hrf_model_name,
+            is_fir_model=is_fir_model,
+            fir_bot=fir_bot,
+            fir_top=fir_top,
+            n_basis=n_basis,
+            device=device,
+            hrf_opt=args.hrf_opt,
+            hrf_library=hrf_library,
+            hrf_indices=hrf_indices,
+            n_voxels=n_voxels if args.hrf_opt else None,
+        )
+        test_task_design, test_designs_by_hrf = test_designs
+
+        # Polynomials only: -ortvec blocks describe the input runs, and there
+        # is no held-out equivalent to borrow.
+        test_nuisance_per_run = build_polort_nuisance(
+            run_starts=test_run_starts,
+            n_timepoints=test_n_timepoints,
+            tr=args.tr,
+            polort_arg=args.polort,
+            device=device,
+        )
+        if user_blocks:
+            print("  Note: -ortvec regressors are not applied to the held-out runs")
+
+        train_selections = [r.optimal_combination for r in results.per_run_results]
+        print(f"  Per-run PCs in the fit: {[list(s) for s in train_selections]}")
+
+        def _run_heldout(train_sel):
+            r2 = heldout_prediction_r2(
+                train_data=data,
+                train_run_starts=run_starts,
+                train_nuisance_per_run=nuisance_per_run,
+                train_pcs_per_run=results.noise_pcs_per_run,
+                train_selections=train_sel,
+                test_data=test_data,
+                test_run_starts=test_run_starts,
+                test_nuisance_per_run=test_nuisance_per_run,
+                train_design=task_design,
+                test_design=test_task_design,
+                train_designs_by_hrf=designs_by_hrf,
+                test_designs_by_hrf=test_designs_by_hrf,
+                hrf_indices=hrf_indices,
+                device=device,
+                verbose=args.verb >= 1,
+            )
+            # compute_xval_r2 returns an inference-mode tensor; clone before
+            # masking the unscoreable voxels.
+            r2 = r2.to(test_valid.device).clone()
+            r2[~test_valid] = 0.0
+            return r2
+
+        heldout_initial = _run_heldout([() for _ in train_selections])
+        heldout_r2 = _run_heldout(train_selections)
+
+        heldout_maps["heldout_initial_r2"] = heldout_initial
+        heldout_maps["heldout_r2"] = heldout_r2
+
+        print(
+            f"  Held-out R² (no denoising):  median={heldout_initial.median().item():+.4f}, "
+            f"mean={heldout_initial.mean().item():+.4f}"
+        )
+        print(
+            f"  Held-out R² (denoised fit):  median={heldout_r2.median().item():+.4f}, "
+            f"mean={heldout_r2.mean().item():+.4f}"
+        )
+        print(
+            f"  Held-out improvement:        "
+            f"{heldout_r2.median().item() - heldout_initial.median().item():+.4f} (median)"
+        )
+        # The internal R² scores against data that also had its PCs removed;
+        # this one scores against the raw held-out timeseries. Same prediction,
+        # bigger denominator — compare held-out to held-out, not to Step 4.
+        print("  (held-out R² scores raw data; not on the same scale as the internal xval R²)")
+
+        if args.compare and baseline_k is not None:
+            # Same procedure for the GLMdenoise choice: refit with its first
+            # baseline_k variance-ordered PCs in every run, predict the same
+            # held-out data.
+            gd_sel = tuple(range(baseline_k))
+            heldout_gd = _run_heldout([gd_sel for _ in train_selections])
+            heldout_delta = heldout_r2 - heldout_gd
+            heldout_maps["heldout_r2_glmdenoise"] = heldout_gd
+            heldout_maps["heldout_r2_delta"] = heldout_delta
+
+            print(
+                f"  Held-out R² (GLMdenoise k={baseline_k}): "
+                f"median={heldout_gd.median().item():+.4f}, mean={heldout_gd.mean().item():+.4f}"
+            )
+            print("  Δ held-out R² (combinatorial − GLMdenoise):")
+            print(
+                f"    Mean:    {heldout_delta.mean().item():+.4f}    "
+                f"Median: {heldout_delta.median().item():+.4f}"
+            )
+            hd_wins = int((heldout_delta > 0.01).sum())
+            hd_loss = int((heldout_delta < -0.01).sum())
+            hd_total = heldout_delta.numel()
+            print(
+                f"    Voxels combinatorial wins (Δ > 0.01): "
+                f"{hd_wins:,}/{hd_total:,} ({100 * hd_wins / max(hd_total, 1):.1f}%)"
+            )
+            print(
+                f"    Voxels GLMdenoise wins (Δ < -0.01):   "
+                f"{hd_loss:,}/{hd_total:,} ({100 * hd_loss / max(hd_total, 1):.1f}%)"
+            )
+
+        del test_data
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # ======================================================================
     # Step 5: Save results
     # ======================================================================
     print()
@@ -1320,18 +1622,28 @@ def main():
         nii_ext=_nii_ext,
     )
 
+    def _flat_to_vol(flat_t: torch.Tensor) -> np.ndarray:
+        flat_np = flat_t.detach().cpu().numpy().astype(np.float32)
+        if mask_flat is not None:
+            vol = np.zeros(mask_flat.size, dtype=np.float32)
+            vol[mask_flat] = flat_np
+        else:
+            vol = flat_np
+        return vol.reshape(volume_shape)
+
+    # Held-out prediction maps (-test_input).
+    if heldout_maps:
+        from fastfuncstuff.cli_utils import spinner
+
+        for name, r2_map in heldout_maps.items():
+            path = f"{args.prefix}_{name}{_nii_ext}"
+            with spinner(f"Writing {Path(path).name}"):
+                save_nifti(_flat_to_vol(r2_map), output_path=path, affine=affine)
+            output_files[name] = path
+            print(f"  Saved: {path}")
+
     # Save -compare outputs alongside the standard ones.
     if args.compare and baseline_r2_t is not None and delta_r2_t is not None:
-
-        def _flat_to_vol(flat_t: torch.Tensor) -> np.ndarray:
-            flat_np = flat_t.detach().cpu().numpy().astype(np.float32)
-            if mask_flat is not None:
-                vol = np.zeros(mask_flat.size, dtype=np.float32)
-                vol[mask_flat] = flat_np
-            else:
-                vol = flat_np
-            return vol.reshape(volume_shape)
-
         from fastfuncstuff.cli_utils import spinner
 
         baseline_path = f"{args.prefix}_r2_glmdenoise{_nii_ext}"
