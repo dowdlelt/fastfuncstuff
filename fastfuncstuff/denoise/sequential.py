@@ -1202,8 +1202,40 @@ def cross_validate_noise_pcs(
     if designs_by_hrf is not None and hrf_indices is None:
         raise ValueError("hrf_indices required when designs_by_hrf is provided")
 
-    # Determine mode
-    _per_hrf_mode = designs_by_hrf is not None
+    if designs_by_hrf is not None:
+        # Per-HRF mode: the only thing that varies across voxels is which design
+        # they are fit against, so run the single-design sweep once per HRF
+        # group over that group's voxels and scatter the R² rows back. Same
+        # pattern as compute_optimized_xval_r2_3dDenoise_style.
+        assert hrf_indices is not None
+        n_all_voxels = data.shape[0]
+        r2_maps = np.zeros((n_all_voxels, max_components + 1), dtype=np.float32)
+        unique_hrf = torch.unique(hrf_indices).tolist()
+        if verbose:
+            print(f"Per-HRF mode: {len(unique_hrf)} HRF group(s)")
+
+        for hrf_idx in unique_hrf:
+            voxel_mask = (hrf_indices == hrf_idx).cpu()
+            group_maps, _ = cross_validate_noise_pcs(
+                data=data[voxel_mask, :],
+                design_matrix=designs_by_hrf[hrf_idx],
+                noise_pcs=noise_pcs,
+                run_starts=run_starts,
+                tr=tr,
+                max_components=max_components,
+                nuisance=nuisance,
+                metric=metric,
+                cv_strategy=cv_strategy,
+                n_perms=n_perms,
+                chunk_size=chunk_size,
+                preload_data_to_device=preload_data_to_device,
+                device=device,
+                verbose=verbose,
+            )
+            r2_maps[voxel_mask.numpy(), :] = group_maps
+
+        r2_summary = np.median(r2_maps, axis=0)
+        return r2_maps, r2_summary
 
     # Detect if we can use streaming stats (LORO CV)
     # Need to check this early to determine projection device
@@ -1326,8 +1358,14 @@ def cross_validate_noise_pcs(
     if chunk_size is not None:
         voxel_chunk_size = chunk_size
     else:
-        # Import estimate_chunk_size from memory module
-        n_task_regs = design_matrix.shape[1]
+        # Import estimate_chunk_size from memory module.
+        # In per-HRF mode there is no single design_matrix; every per-HRF design
+        # has the same column count, so any of them sizes the chunk correctly.
+        if design_matrix is not None:
+            n_task_regs = design_matrix.shape[1]
+        else:
+            assert designs_by_hrf is not None
+            n_task_regs = next(iter(designs_by_hrf.values())).shape[1]
         if is_loro:
             # LORO CV: Use new dynamic chunk estimator
             # Accounts for: streaming stats, data on CPU, n_runs, max_components, CV strategy

@@ -198,6 +198,61 @@ class TestDenoiseSubWorkflows:
         assert np.all(np.isfinite(r2_maps)), "R² maps must be finite"
         assert np.all(np.isfinite(r2_agg)), "Aggregated R² must be finite"
 
+    def test_cross_validate_noise_pcs_per_hrf_matches_single_design(self, device):
+        """
+        Per-HRF mode only changes *which* design each voxel is fit against.
+        With every HRF group handed the same design, it must reproduce the
+        single-design result exactly — the guard against the per-HRF branch
+        silently scattering rows into the wrong voxels.
+        """
+        from fastfuncstuff.denoise.sequential import (
+            cross_validate_noise_pcs,
+            extract_noise_pcs_per_run,
+        )
+
+        torch.manual_seed(3)
+        n_runs, n_tp_run, tr = 3, 60, 2.0
+        n_voxels = 40
+        n_tp_total = n_runs * n_tp_run
+        run_starts = [i * n_tp_run for i in range(n_runs)]
+        data = torch.randn(n_voxels, n_tp_total, device=device)
+        design = torch.randn(n_tp_total, 3, device=device)
+
+        noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
+        noise_mask[:15] = True
+        noise_pcs = extract_noise_pcs_per_run(
+            data, run_starts, noise_mask, max_components=3, device=device, verbose=False
+        )
+        nuisance = [
+            construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
+            for _ in range(n_runs)
+        ]
+
+        common = dict(
+            data=data,
+            noise_pcs=noise_pcs,
+            run_starts=run_starts,
+            tr=tr,
+            max_components=2,
+            nuisance=nuisance,
+            device=device,
+            verbose=False,
+        )
+        r2_single, _ = cross_validate_noise_pcs(design_matrix=design, **common)
+
+        # Two HRF groups, both pointing at the same design.
+        hrf_indices = torch.zeros(n_voxels, dtype=torch.long, device=device)
+        hrf_indices[n_voxels // 2 :] = 1
+        r2_per_hrf, summary = cross_validate_noise_pcs(
+            designs_by_hrf={0: design, 1: design},
+            hrf_indices=hrf_indices,
+            **common,
+        )
+
+        assert r2_per_hrf.shape == r2_single.shape
+        np.testing.assert_allclose(r2_per_hrf, r2_single, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(summary, np.median(r2_single, axis=0), rtol=1e-5, atol=1e-6)
+
     def test_sequential_pc_selection(self, device):
         """
         select_optimal_pcs returns an index into 0..n_pc_counts-1 and a
