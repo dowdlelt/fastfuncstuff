@@ -36,7 +36,7 @@ from .affine import (  # noqa: E402
     voxel_matrix_to_dicom,
 )
 from .cost import _separable_smooth_3d, lpa_correlation  # noqa: E402
-from .interp import _separable_resample_3d, warp_image  # noqa: E402
+from .interp import _separable_resample_3d, no_gather_compile, warp_image  # noqa: E402
 from .shear import shear_resample  # noqa: E402
 
 try:  # Triton kernel is CUDA-only; absence must not break CPU/MPS installs
@@ -196,14 +196,20 @@ def compute_derivative_images(
     if verb >= 2:
         print("  Computing 12 derivative resamples (wsinc5)...")
 
+    # Twelve full-volume resamples, run once per process and never again. Left to
+    # the resampler's own eager-vs-compiled heuristic they look like the opening
+    # of a long loop, so it compiles here and the warmup (~2.9s, and not amortized
+    # by inductor's cache across separate CLI invocations) lands on a step whose
+    # eager cost is ~0.5s. Declare the one-shot instead.
     derivs = torch.zeros(6, nz * ny * nx, device=device, dtype=dtype)
-    for i in range(12):
-        resampled = apply_affine_wsinc5(base, matrices[i], base.shape)
-        k = i // 2
-        if i % 2 == 0:  # plus
-            derivs[k] += resampled.reshape(-1)
-        else:  # minus
-            derivs[k] -= resampled.reshape(-1)
+    with no_gather_compile():
+        for i in range(12):
+            resampled = apply_affine_wsinc5(base, matrices[i], base.shape)
+            k = i // 2
+            if i % 2 == 0:  # plus
+                derivs[k] += resampled.reshape(-1)
+            else:  # minus
+                derivs[k] -= resampled.reshape(-1)
 
     # Central difference: (I+ - I-) / (2 * delta)
     for k in range(6):

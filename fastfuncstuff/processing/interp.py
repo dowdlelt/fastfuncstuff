@@ -12,9 +12,13 @@ Key functions:
 
 from __future__ import annotations
 
+import json
 import os
+import time
 from collections.abc import Sequence
+from contextlib import contextmanager
 from functools import lru_cache
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -638,14 +642,104 @@ def _gather_contract(
 # (measured wsinc5 gather 461->43 ms on an RTX 5070 Ti). A hand-written Triton
 # kernel was prototyped and only matched inductor (1.02-1.07x) -- inductor already
 # emits near-optimal Triton here -- so it was not worth the CUDA-only complexity.
-# The per-device counter keeps a one-shot single apply on the eager path (no compile
-# warmup); once we've seen repeated large work we switch to compiled. dynamic=True
-# on CUDA so the per-chunk voxel count drifting with free VRAM doesn't recompile
-# every call and blow dynamo's cap; CPU keeps static shapes, which inductor fuses
-# best. Disable entirely with FFS_NWARP_NO_COMPILE=1.
-_COMPILE_MIN_VOXELS = 200_000
-_large_calls = {"cpu": 0, "cuda": 0}
+#
+# When to switch from eager to compiled is a payback question, and the two sides
+# scale differently: the eager cost grows with the data, while the warmup is a
+# near-constant property of the machine and torch build. It is NOT amortized by
+# inductor's FX graph cache -- that cache elides Triton codegen, but dynamo
+# tracing, fake-tensor propagation, guard construction and even hashing the cache
+# key are redone in every process (measured 2.1s against a fully warm 2.9 GB
+# cache, of which the cache load was 0.07s). A tool run as N short-lived CLI
+# invocations therefore pays it N times, which is how ffs_moco lost ~1.4s/run in
+# the benchmark while looking fine under -batch.
+#
+# So the gate is time, not call counts or voxel counts: accumulate eager seconds
+# and compile once they reach what a warmup actually costs *here*, measured on the
+# first compile and remembered across runs. Worst case (workload ends right after
+# the switch) is ~2x the warmup; best case is the full ~10x on everything after
+# it. dynamic=True on CUDA so the per-chunk voxel count drifting with free VRAM
+# doesn't recompile every call and blow dynamo's cap; CPU keeps static shapes,
+# which inductor fuses best. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+_COMPILE_COST_BOOTSTRAP_S = 2.0  # only until the first real measurement lands
+_eager_seconds = {"cpu": 0.0, "cuda": 0.0}
+_pending_cuda_timings: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
 _compiled_gather_contract: dict[str, object] = {}
+_compile_cost_cache: dict[str, float] = {}
+_compile_pending_measure: set[str] = set()
+_no_compile_depth = 0
+
+
+def _compile_cost_key(dt: str) -> str:
+    """Warmup cost is per device type and per torch build, so a torch upgrade
+    recalibrates rather than inheriting a stale number."""
+    return f"{dt}:{torch.__version__}"
+
+
+def _compile_cost_path() -> Path:
+    root = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+    return Path(root) / "fastfuncstuff" / "gather_compile_cost.json"
+
+
+def _measured_compile_cost(dt: str) -> float:
+    """Seconds a torch.compile warmup costs on this machine, from the last time we
+    paid one. Falls back to a bootstrap prior that the first real measurement
+    replaces -- an unfamiliar machine mis-compiles at most once."""
+    key = _compile_cost_key(dt)
+    if key in _compile_cost_cache:
+        return _compile_cost_cache[key]
+    cost = _COMPILE_COST_BOOTSTRAP_S
+    try:
+        with open(_compile_cost_path()) as f:
+            stored = json.load(f).get(key)
+        if isinstance(stored, int | float) and stored > 0:
+            cost = float(stored)
+    except (OSError, ValueError):
+        pass  # no calibration yet, or an unreadable cache -- the prior is fine
+    _compile_cost_cache[key] = cost
+    return cost
+
+
+def _record_compile_cost(dt: str, seconds: float) -> None:
+    """Persist what the warmup just cost. Best-effort: a read-only or racing cache
+    only means the next process uses the prior again."""
+    key = _compile_cost_key(dt)
+    _compile_cost_cache[key] = seconds
+    path = _compile_cost_path()
+    try:
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[key] = seconds
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)  # atomic, so a concurrent reader never sees a partial file
+    except OSError:
+        pass
+
+
+@contextmanager
+def no_gather_compile():
+    """Keep the resample gather eager for a block of one-shot work.
+
+    Some callers know statically that their resamples run once per process --
+    ffs_moco's derivative images, for instance. No accumulated-time heuristic can
+    infer that from the inside (six full-volume resamples look exactly like the
+    start of a long loop), so the call site declares it. Work inside the block is
+    also kept out of the eager budget: it must not push a *later* loop over the
+    line on its own.
+    """
+    global _no_compile_depth
+    _no_compile_depth += 1
+    try:
+        yield
+    finally:
+        _no_compile_depth -= 1
 
 
 def _already_compiling() -> bool:
@@ -659,33 +753,67 @@ def _already_compiling() -> bool:
         return False
 
 
-def _get_gather_contract(device: torch.device, n_points: int):
-    """Return the compiled _gather_contract once a recurring large workload is
-    detected on CPU or CUDA, else the eager function.
+def _drain_cuda_timings() -> None:
+    """Fold finished CUDA event pairs into the eager budget.
+
+    ``query()`` rather than ``synchronize()``: the whole point of the budget is to
+    be free, and a pair that isn't ready yet simply counts on the next call.
+    """
+    if not _pending_cuda_timings:
+        return
+    unfinished = []
+    for start, end in _pending_cuda_timings:
+        if end.query():
+            _eager_seconds["cuda"] += start.elapsed_time(end) / 1000.0
+        else:
+            unfinished.append((start, end))
+    _pending_cuda_timings[:] = unfinished
+
+
+def _budget_accounted(device: torch.device) -> bool:
+    """Whether this call's runtime should feed the eager budget at all."""
+    return (
+        device.type in ("cpu", "cuda")
+        and not _no_compile_depth
+        and not _already_compiling()
+        and device.type not in _compiled_gather_contract
+        and os.environ.get("FFS_NWARP_NO_COMPILE") != "1"
+    )
+
+
+def _get_gather_contract(device: torch.device):
+    """Return the compiled _gather_contract once eager time has covered what a
+    warmup costs on this machine, else the eager function.
 
     If a caller already has us inside a ``torch.compile`` trace, return the EAGER
-    function and skip the warmup counter entirely: dynamo inlines it into the
-    caller's graph, and — critically — we never touch the module-global
-    ``_large_calls`` while traced. That global mutation is invisible to eager use
-    but becomes a dynamo guard when traced, which recompiles on every call and
-    melts down (the ffs_moco `-cost` resample path hit exactly this)."""
+    function and skip the budget entirely: dynamo inlines it into the caller's
+    graph, and — critically — we never touch the module globals while traced. That
+    mutation is invisible to eager use but becomes a dynamo guard when traced,
+    which recompiles on every call and melts down (the ffs_moco `-cost` resample
+    path hit exactly this)."""
     dt = device.type
     if (
         _already_compiling()
         or dt not in ("cpu", "cuda")
-        or n_points < _COMPILE_MIN_VOXELS
+        or _no_compile_depth
         or os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
     ):
         return _gather_contract
-    _large_calls[dt] += 1
-    if _large_calls[dt] < 2:  # let a one-shot apply stay eager
+    existing = _compiled_gather_contract.get(dt)
+    if existing is not None:
+        return existing
+    if dt == "cuda":
+        _drain_cuda_timings()
+    if _eager_seconds[dt] < _measured_compile_cost(dt):
         return _gather_contract
-    if dt not in _compiled_gather_contract:
-        try:
-            _compiled_gather_contract[dt] = torch.compile(_gather_contract, dynamic=(dt == "cuda"))
-        except Exception:
-            _compiled_gather_contract[dt] = _gather_contract  # compile unavailable
-    return _compiled_gather_contract[dt]
+    try:
+        compiled = torch.compile(_gather_contract, dynamic=(dt == "cuda"))
+    except Exception:
+        compiled = _gather_contract  # compile unavailable
+    _compiled_gather_contract[dt] = compiled
+    if compiled is not _gather_contract:
+        _compile_pending_measure.add(dt)  # first call through it pays the warmup
+    return compiled
 
 
 def _separable_resample_3d(
@@ -794,7 +922,20 @@ def _separable_resample_3d(
     # bounded (and makes the kernel affordable on MPS/CPU and auto-padded grids).
     # The channel count scales the slab, so shrink the chunk to match.
     chunk = max(1, _resample_chunk_size(M, ntaps, device) // n_ch)
-    gather_contract = _get_gather_contract(device, M)  # compiled on recurring CPU work
+    gather_contract = _get_gather_contract(device)  # compiled once eager time pays for it
+    measuring_warmup = device.type in _compile_pending_measure
+    accounted = _budget_accounted(device)
+    # Wall clock for the warmup (it is host-side work, which CUDA events can't
+    # see); CUDA events for the eager budget (the work is async, so wall clock
+    # would time the launches, not the kernels).
+    t_wall = time.perf_counter() if (measuring_warmup or accounted) else 0.0
+    ev_start = ev_end = None
+    if accounted and device.type == "cuda":
+        ev_start, ev_end = (
+            torch.cuda.Event(enable_timing=True),
+            torch.cuda.Event(enable_timing=True),
+        )
+        ev_start.record()
     for s in range(0, M, chunk):
         e = min(M, s + chunk)
         xf, yf, zf = xin[s:e], yin[s:e], zin[s:e]
@@ -815,6 +956,18 @@ def _separable_resample_3d(
         zi = (zb.long()[:, None] + offsets[None, :]).clamp(0, nz - 1)
 
         result[..., idx[s:e]] = gather_contract(source, xi, yi, zi, wx, wy, wz)
+
+    if measuring_warmup:
+        # This call ran the compile; almost all of the wall time is it. Remember
+        # what it cost so the next process gates on this machine's number.
+        _compile_pending_measure.discard(device.type)
+        _record_compile_cost(device.type, time.perf_counter() - t_wall)
+    elif accounted:
+        if ev_end is not None and ev_start is not None:
+            ev_end.record()
+            _pending_cuda_timings.append((ev_start, ev_end))
+        else:
+            _eager_seconds[device.type] += time.perf_counter() - t_wall
 
     return result.reshape((n_ch, *out_shape) if batched else out_shape)
 

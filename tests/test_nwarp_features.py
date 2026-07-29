@@ -180,24 +180,27 @@ def test_resample_commensurate_grid_matches_einsum(kernel):
 
 
 def test_gather_contract_dispatch_gating(monkeypatch):
-    """Eager below threshold / disabled / unsupported device / first-call one-shot.
+    """Eager when disabled, on an unsupported device, or before the budget is met.
 
-    CPU and CUDA both compile once a recurring large workload is seen; a device
-    that is neither (e.g. MPS) always stays eager.
+    CPU and CUDA both compile once accumulated eager time covers what a warmup
+    costs; a device that is neither (e.g. MPS) always stays eager. The budget and
+    calibration themselves are covered in test_interp_compile_gate.py.
     """
     cpu = torch.device("cpu")
-    monkeypatch.setattr(I, "_large_calls", {"cpu": 0, "cuda": 0})
+    monkeypatch.setattr(I, "_eager_seconds", {"cpu": 0.0, "cuda": 0.0})
     monkeypatch.setattr(I, "_compiled_gather_contract", {})
-    # below the voxel threshold -> eager
-    assert I._get_gather_contract(cpu, 100) is I._gather_contract
-    # disabled via env -> eager even when large
+    # no eager time spent yet -> eager
+    assert I._get_gather_contract(cpu) is I._gather_contract
+    # disabled via env -> eager even with the budget long since met
+    I._eager_seconds["cpu"] = 1e6
     monkeypatch.setenv("FFS_NWARP_NO_COMPILE", "1")
-    assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
+    assert I._get_gather_contract(cpu) is I._gather_contract
     monkeypatch.delenv("FFS_NWARP_NO_COMPILE")
-    # an unsupported device (mps) stays eager even when large
-    assert I._get_gather_contract(torch.device("mps"), 10_000_000) is I._gather_contract
-    # first large CPU call stays eager (one-shot protection)
-    assert I._get_gather_contract(cpu, 10_000_000) is I._gather_contract
+    # an unsupported device (mps) stays eager regardless
+    assert I._get_gather_contract(torch.device("mps")) is I._gather_contract
+    # a caller-declared one-shot block stays eager too
+    with I.no_gather_compile():
+        assert I._get_gather_contract(cpu) is I._gather_contract
 
 
 def test_compiled_resample_matches_eager():
