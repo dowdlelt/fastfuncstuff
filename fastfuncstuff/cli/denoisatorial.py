@@ -51,6 +51,7 @@ try:
         add_load_threads_arg,
         add_ortvec_arguments,
         add_verbose_arg,
+        append_nuisance_blocks,
         auto_polort,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
@@ -325,7 +326,8 @@ Notes:
         "anything else. After denoising finishes, task betas are fit on ALL input "
         "runs with the winning denoising in place (per-run polynomials + that "
         "run's selected PCs), and those betas times the held-out design predict "
-        "these runs, whose own polynomials are removed so the prediction is valid. "
+        "these runs, whose own polynomials (plus any -test_ortvec) are removed so "
+        "the prediction is valid. "
         "No PCs are removed from the held-out data — what is being tested is "
         "whether denoising produced better betas. Writes {prefix}_heldout_r2 and "
         "{prefix}_heldout_initial_r2 (same fit with no PCs, as the reference).",
@@ -341,6 +343,35 @@ Notes:
         "shared TSV broadcast across them. Conditions must match the input runs' "
         "conditions exactly (same labels, same order). Required with -test_input.",
     )
+    heldout_opts.add_argument(
+        "-test_curve",
+        "-test-curve",
+        dest="test_curve",
+        action="store_true",
+        help="Learning curve on the held-out runs: refit the betas using k of the "
+        "input runs for k=1..N and score each arm's prediction, so the curves can "
+        "be compared as a function of how much training data the betas saw. A "
+        "denoising that only reduces beta variance is nearly invisible at k=N (the "
+        "variance term shrinks like 1/N against a fixed held-out noise floor) but "
+        "separates clearly at small k. Writes {prefix}_heldout_curve.png and "
+        "{prefix}_heldout_curve.tsv. Requires -test_input. Costs "
+        "k x subsets x arms extra GLM fits.",
+    )
+    heldout_opts.add_argument(
+        "-test_curve_subsets",
+        "-test-curve-subsets",
+        dest="test_curve_subsets",
+        type=int,
+        default=8,
+        metavar="N",
+        help="Run subsets sampled per k for -test_curve (default: 8). Exhaustive "
+        "when there are fewer than N distinct subsets of that size.",
+    )
+    # The held-out runs need their own nuisance: the -ortvec files describe the
+    # input runs and have the wrong length. Unmodelled held-out motion is common
+    # to both scored arms, so it only dilutes the denoising difference — but
+    # dilution is exactly what makes the held-out effect hard to read.
+    add_ortvec_arguments(heldout_opts, prefix="test_")
     combo_opts.add_argument(
         "-brainthresh",
         nargs=2,
@@ -490,6 +521,62 @@ Notes:
 # ============================================================================
 # Output saving
 # ============================================================================
+
+
+def _report_learning_curve(
+    curve: dict,
+    active_mask: torch.Tensor,
+    prefix: str,
+    plot,
+) -> dict[str, str]:
+    """Print the learning-curve table, write the TSV and the plot.
+
+    Medians are taken over the active voxels only; the deltas are per-voxel
+    against the ``initial`` arm before medianing, which keeps the comparison
+    paired (same subsets, same held-out data, same voxels).
+    """
+    subset_sizes = curve["subset_sizes"]
+    curves = curve["curves"]
+    mask = active_mask.cpu()
+    names = list(curves.keys())
+
+    medians = {n: curves[n][:, mask].median(dim=1).values for n in names}
+    deltas = {
+        n: (curves[n] - curves["initial"])[:, mask].median(dim=1).values
+        for n in names
+        if n != "initial"
+    }
+
+    header = f"    {'k':>3}  {'subsets':>7}" + "".join(f"  {n[:18]:>18}" for n in names)
+    print()
+    print("  Median held-out R² over active voxels:")
+    print(header)
+    for i, k in enumerate(subset_sizes):
+        row = f"    {k:>3}  {curve['n_subsets'][i]:>7}"
+        row += "".join(f"  {medians[n][i].item():>18.4f}" for n in names)
+        print(row)
+
+    if deltas:
+        print("  Δ vs no denoising (per-voxel paired, then medianed):")
+        print(f"    {'k':>3}" + "".join(f"  {n[:18]:>18}" for n in deltas))
+        for i, k in enumerate(subset_sizes):
+            print(f"    {k:>3}" + "".join(f"  {d[i].item():>+18.4f}" for d in deltas.values()))
+
+    files: dict[str, str] = {}
+    tsv_path = f"{prefix}_heldout_curve.tsv"
+    with open(tsv_path, "w") as fh:
+        fh.write("k\tn_subsets\t" + "\t".join(names) + "\n")
+        for i, k in enumerate(subset_sizes):
+            vals = "\t".join(f"{medians[n][i].item():.6f}" for n in names)
+            fh.write(f"{k}\t{curve['n_subsets'][i]}\t{vals}\n")
+    files["heldout_curve_tsv"] = tsv_path
+    print(f"  Saved: {tsv_path}")
+
+    plot_path = f"{prefix}_heldout_curve.png"
+    plot(curve=curve, active_mask=active_mask, output_path=plot_path)
+    files["heldout_curve_plot"] = plot_path
+    print(f"  Saved: {plot_path}")
+    return files
 
 
 def save_combinatorial_results(
@@ -814,6 +901,19 @@ def main():
     if bool(args.test_input) != bool(args.test_events):
         print("ERROR: -test_input and -test_events must be given together")
         sys.exit(1)
+    # Silently ignoring these would look like the held-out nuisance was applied.
+    if not args.test_input and any(
+        getattr(args, f"test_{name}", None)
+        for name in ("ortvec", "ortvec_run", "ortvec_glob", "ortvec_concat")
+    ):
+        print("ERROR: -test_ortvec* requires -test_input")
+        sys.exit(1)
+    if args.test_curve and not args.test_input:
+        print("ERROR: -test_curve requires -test_input")
+        sys.exit(1)
+    if args.test_curve_subsets < 1:
+        print("ERROR: -test_curve_subsets must be >= 1")
+        sys.exit(1)
 
     # Fail on a malformed criteria spec now, not after a long data load.
     from fastfuncstuff.denoise.combinatorial import parse_criteria_spec
@@ -1122,8 +1222,6 @@ def main():
         polort_arg=args.polort,
         device=device,
     )
-    max_nuisance_cols = max(n.shape[1] for n in nuisance_per_run)
-
     # Add user nuisance blocks (-ortvec / -ortvec_run / -ortvec_glob).
     user_blocks = collect_nuisance_blocks(
         args,
@@ -1131,40 +1229,9 @@ def main():
         n_timepoints,
         verbose=(args.verb >= 1),
     )
-    if user_blocks:
-        for run_idx in range(n_runs):
-            start_tp = run_starts[run_idx]
-            end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            run_length = end_tp - start_tp
-            for block in user_blocks:
-                if block.n_columns == 0:
-                    continue
-                m = block.get_run(run_idx, run_length).copy()
-                col_mean = m.mean(axis=0, keepdims=True)
-                if np.max(np.abs(col_mean)) > 1e-4:
-                    m = m - col_mean
-                ortvec_run = torch.from_numpy(m).to(
-                    device=device,
-                    dtype=nuisance_per_run[run_idx].dtype,
-                )
-                nuisance_per_run[run_idx] = torch.cat(
-                    [nuisance_per_run[run_idx], ortvec_run],
-                    dim=1,
-                )
-            max_nuisance_cols = max(max_nuisance_cols, nuisance_per_run[run_idx].shape[1])
-
-    # Pad nuisance to same columns
-    for run_idx in range(n_runs):
-        n_cols = nuisance_per_run[run_idx].shape[1]
-        if n_cols < max_nuisance_cols:
-            padding = torch.zeros(
-                (nuisance_per_run[run_idx].shape[0], max_nuisance_cols - n_cols),
-                device=device,
-            )
-            nuisance_per_run[run_idx] = torch.cat(
-                [nuisance_per_run[run_idx], padding],
-                dim=1,
-            )
+    nuisance_per_run = append_nuisance_blocks(
+        nuisance_per_run, user_blocks, run_starts, n_timepoints
+    )
 
     print(
         f"  Nuisance per run: {nuisance_per_run[0].shape[1]} cols "
@@ -1378,6 +1445,7 @@ def main():
     # consensus PC indices are re-extracted from each held-out run's own noise
     # pool, and the betas predict runs nothing in the fit has seen.
     heldout_maps: dict[str, torch.Tensor] = {}
+    curve_files: dict[str, str] = {}
     if args.test_input:
         from fastfuncstuff.cli_utils import parse_timing_spec
         from fastfuncstuff.denoise.heldout import heldout_prediction_r2
@@ -1501,8 +1569,9 @@ def main():
         )
         test_task_design, test_designs_by_hrf = test_designs
 
-        # Polynomials only: -ortvec blocks describe the input runs, and there
-        # is no held-out equivalent to borrow.
+        # Polynomials, plus whatever -test_ortvec supplies. The input runs'
+        # -ortvec blocks are never reused here: they are the wrong length and
+        # describe different runs.
         test_nuisance_per_run = build_polort_nuisance(
             run_starts=test_run_starts,
             n_timepoints=test_n_timepoints,
@@ -1510,8 +1579,25 @@ def main():
             polort_arg=args.polort,
             device=device,
         )
-        if user_blocks:
-            print("  Note: -ortvec regressors are not applied to the held-out runs")
+        test_blocks = collect_nuisance_blocks(
+            args,
+            test_run_starts,
+            test_n_timepoints,
+            verbose=(args.verb >= 1),
+            prefix="test_",
+        )
+        test_nuisance_per_run = append_nuisance_blocks(
+            test_nuisance_per_run, test_blocks, test_run_starts, test_n_timepoints
+        )
+        print(
+            f"  Held-out nuisance per run: {test_nuisance_per_run[0].shape[1]} cols "
+            f"(polort{'+test_ortvec' if test_blocks else ''})"
+        )
+        if user_blocks and not test_blocks:
+            print(
+                "  Note: -ortvec describes the input runs only; pass -test_ortvec "
+                "to model the held-out runs' nuisance too"
+            )
 
         train_selections = [r.optimal_combination for r in results.per_run_results]
         print(f"  Per-run PCs in the fit: {[list(s) for s in train_selections]}")
@@ -1594,6 +1680,74 @@ def main():
                 f"{hd_loss:,}/{hd_total:,} ({100 * hd_loss / max(hd_total, 1):.1f}%)"
             )
 
+        if args.test_curve:
+            from fastfuncstuff.denoise.heldout import (
+                heldout_learning_curve,
+                plot_heldout_learning_curve,
+            )
+
+            print()
+            print("  Learning curve: held-out R² vs number of training runs")
+
+            # Union of the pre- and post-denoising active pools. Scoring only
+            # on voxels the denoised fit calls active would hide the failure
+            # that matters most: a voxel that improved in training and fell
+            # apart on held-out data never enters the average.
+            thr = args.r2_threshold
+            active_initial = initial_r2 >= thr
+            active_denoised = optimized_r2.to(active_initial.device) >= thr
+            active_mask = (active_initial | active_denoised) & test_valid.to(active_initial.device)
+            n_active = int(active_mask.sum().item())
+            if n_active == 0:
+                print(
+                    f"  ⚠️  No voxels reach R² >= {thr:g} before or after denoising; "
+                    "skipping the learning curve"
+                )
+            else:
+                print(
+                    f"  Active voxels (R² >= {thr:g} before OR after denoising): "
+                    f"{n_active:,} of {n_voxels:,} "
+                    f"({int(active_initial.sum()):,} initial, "
+                    f"{int(active_denoised.sum()):,} denoised)"
+                )
+
+                curve_arms: dict[str, list[tuple[int, ...]]] = {
+                    "initial": [() for _ in train_selections],
+                    "denoised": list(train_selections),
+                }
+                if args.compare and baseline_k is not None:
+                    curve_arms[f"glmdenoise (k={baseline_k})"] = [
+                        tuple(range(baseline_k)) for _ in train_selections
+                    ]
+
+                curve = heldout_learning_curve(
+                    train_data=data,
+                    train_run_starts=run_starts,
+                    train_nuisance_per_run=nuisance_per_run,
+                    train_pcs_per_run=results.noise_pcs_per_run,
+                    arms=curve_arms,
+                    test_data=test_data,
+                    test_run_starts=test_run_starts,
+                    test_nuisance_per_run=test_nuisance_per_run,
+                    train_design=task_design,
+                    test_design=test_task_design,
+                    train_designs_by_hrf=designs_by_hrf,
+                    test_designs_by_hrf=test_designs_by_hrf,
+                    hrf_indices=hrf_indices,
+                    max_subsets=args.test_curve_subsets,
+                    device=device,
+                    verbose=args.verb >= 1,
+                )
+
+                curve_files.update(
+                    _report_learning_curve(
+                        curve=curve,
+                        active_mask=active_mask,
+                        prefix=args.prefix,
+                        plot=plot_heldout_learning_curve,
+                    )
+                )
+
         del test_data
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1641,6 +1795,10 @@ def main():
                 save_nifti(_flat_to_vol(r2_map), output_path=path, affine=affine)
             output_files[name] = path
             print(f"  Saved: {path}")
+
+    # -test_curve wrote its own files during Step 4c; register them so the
+    # metadata manifest lists everything the run produced.
+    output_files.update(curve_files)
 
     # Save -compare outputs alongside the standard ones.
     if args.compare and baseline_r2_t is not None and delta_r2_t is not None:

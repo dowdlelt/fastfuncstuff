@@ -180,3 +180,189 @@ def test_mismatched_voxel_counts_raise():
             device=torch.device("cpu"),
             verbose=False,
         )
+
+
+# ---------------------------------------------------------------------------
+# Learning curve
+# ---------------------------------------------------------------------------
+
+
+def _variance_only_case(n_train: int, n_test: int, n_voxels: int, seed: int):
+    """Training runs carry a design-orthogonal artifact; held-out runs are clean.
+
+    Orthogonalising the artifact against the design is the point: it inflates
+    Var(β̂) without biasing E[β̂], which is the regime where an all-runs
+    held-out R² goes nearly flat and only the learning curve can see anything.
+    """
+    torch.manual_seed(seed)
+    train_design = _boxcar_design(n_train, seed=1)
+    test_design = _boxcar_design(n_test, seed=2)
+
+    amp = torch.linspace(3.0, 6.0, n_voxels)[:, None]
+    train_data = amp @ train_design.T + torch.randn(n_voxels, n_train * RUN_LEN) * 0.3
+    test_data = amp @ test_design.T + torch.randn(n_voxels, n_test * RUN_LEN) * 0.3
+
+    train_pcs = []
+    for r in range(n_train):
+        sl = slice(r * RUN_LEN, (r + 1) * RUN_LEN)
+        artifact = torch.randn(RUN_LEN)
+        d = train_design[sl, 0]
+        artifact = artifact - d * (artifact @ d) / (d @ d)  # no bias, pure variance
+        artifact = (artifact - artifact.mean()) / artifact.std()
+        train_data[:, sl] += torch.linspace(4.0, 9.0, n_voxels)[:, None] * artifact[None, :]
+        pcs = torch.zeros(RUN_LEN, 3)
+        pcs[:, 0] = artifact
+        pcs[:, 1:] = torch.randn(RUN_LEN, 2)
+        train_pcs.append(pcs)
+
+    return train_design, test_design, train_data, test_data, train_pcs
+
+
+def test_learning_curve_separates_most_at_small_k():
+    """The premise of the curve: the denoising gap shrinks as k grows.
+
+    With a design-orthogonal artifact the betas are unbiased either way, so the
+    only thing denoising buys is lower Var(β̂) — a term that enters held-out
+    SS_res as Var(β̂)·||x_test||² and therefore shrinks like 1/k. If this
+    ordering ever inverts, the curve is not measuring what it claims to.
+    """
+    from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+    n_train, n_test, n_voxels = 6, 2, 12
+    train_design, test_design, train_data, test_data, train_pcs = _variance_only_case(
+        n_train, n_test, n_voxels, seed=3
+    )
+
+    curve = heldout_learning_curve(
+        train_data=train_data,
+        train_run_starts=[r * RUN_LEN for r in range(n_train)],
+        train_nuisance_per_run=_polys(n_train),
+        train_pcs_per_run=train_pcs,
+        arms={
+            "initial": [() for _ in range(n_train)],
+            "denoised": [(0,)] * n_train,
+        },
+        test_data=test_data,
+        test_run_starts=[r * RUN_LEN for r in range(n_test)],
+        test_nuisance_per_run=_polys(n_test),
+        train_design=train_design,
+        test_design=test_design,
+        subset_sizes=[1, 6],
+        max_subsets=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    curves = curve["curves"]
+    delta = (curves["denoised"] - curves["initial"]).median(dim=1).values
+    assert delta[0] > 0, f"denoising should help at k=1, got {delta[0]:+.4f}"
+    assert delta[0] > delta[1], (
+        f"gap must shrink as k grows: k=1 {delta[0]:+.4f} vs k=6 {delta[1]:+.4f}"
+    )
+
+
+def test_learning_curve_arms_share_subsets():
+    """Arms must be paired: identical selections in two arms give identical curves.
+
+    If the subsets were redrawn per arm, two arms with the same PC selection
+    would differ by the sampling noise of the draw.
+    """
+    from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+    n_train, n_test, n_voxels = 5, 2, 6
+    train_design, test_design, train_data, test_data, train_pcs = _variance_only_case(
+        n_train, n_test, n_voxels, seed=4
+    )
+
+    curve = heldout_learning_curve(
+        train_data=train_data,
+        train_run_starts=[r * RUN_LEN for r in range(n_train)],
+        train_nuisance_per_run=_polys(n_train),
+        train_pcs_per_run=train_pcs,
+        arms={"a": [(0,)] * n_train, "b": [(0,)] * n_train},
+        test_data=test_data,
+        test_run_starts=[r * RUN_LEN for r in range(n_test)],
+        test_nuisance_per_run=_polys(n_test),
+        train_design=train_design,
+        test_design=test_design,
+        subset_sizes=[2],
+        max_subsets=3,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    torch.testing.assert_close(curve["curves"]["a"], curve["curves"]["b"])
+
+
+def test_learning_curve_full_k_matches_the_single_shot_prediction():
+    """At k = N there is one subset, so the curve must reproduce heldout_prediction_r2."""
+    from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+    n_train, n_test, n_voxels = 4, 2, 8
+    train_design, test_design, train_data, test_data, train_pcs = _variance_only_case(
+        n_train, n_test, n_voxels, seed=5
+    )
+    sel = [(0,), (0, 1), (), (1,)]
+    common = dict(
+        train_data=train_data,
+        train_run_starts=[r * RUN_LEN for r in range(n_train)],
+        train_nuisance_per_run=_polys(n_train),
+        train_pcs_per_run=train_pcs,
+        test_data=test_data,
+        test_run_starts=[r * RUN_LEN for r in range(n_test)],
+        test_nuisance_per_run=_polys(n_test),
+        train_design=train_design,
+        test_design=test_design,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    direct = heldout_prediction_r2(train_selections=sel, **common)
+    curve = heldout_learning_curve(
+        arms={"denoised": sel}, subset_sizes=[n_train], max_subsets=1, **common
+    )
+    torch.testing.assert_close(curve["curves"]["denoised"][0], direct, rtol=1e-5, atol=1e-6)
+
+
+def test_learning_curve_rejects_out_of_range_k():
+    from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+    n_train, n_test, n_voxels = 3, 1, 4
+    train_design, test_design, train_data, test_data, train_pcs = _variance_only_case(
+        n_train, n_test, n_voxels, seed=6
+    )
+    with pytest.raises(ValueError, match="outside 1..3"):
+        heldout_learning_curve(
+            train_data=train_data,
+            train_run_starts=[r * RUN_LEN for r in range(n_train)],
+            train_nuisance_per_run=_polys(n_train),
+            train_pcs_per_run=train_pcs,
+            arms={"initial": [() for _ in range(n_train)]},
+            test_data=test_data,
+            test_run_starts=[0],
+            test_nuisance_per_run=_polys(n_test),
+            train_design=train_design,
+            test_design=test_design,
+            subset_sizes=[0, 4],
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+
+
+def test_learning_curve_requires_a_design():
+    from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+    n_train, n_test, n_voxels = 3, 1, 4
+    _, _, train_data, test_data, train_pcs = _variance_only_case(n_train, n_test, n_voxels, seed=7)
+    with pytest.raises(ValueError, match="provide either"):
+        heldout_learning_curve(
+            train_data=train_data,
+            train_run_starts=[r * RUN_LEN for r in range(n_train)],
+            train_nuisance_per_run=_polys(n_train),
+            train_pcs_per_run=train_pcs,
+            arms={"initial": [() for _ in range(n_train)]},
+            test_data=test_data,
+            test_run_starts=[0],
+            test_nuisance_per_run=_polys(n_test),
+            device=torch.device("cpu"),
+            verbose=False,
+        )
