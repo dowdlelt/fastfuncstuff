@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -940,12 +941,122 @@ def extract_nuisance_columns(design_info: dict, device: torch.device | None = No
     return to_tensor(nuisance_design, device=device, dtype=torch.float32)
 
 
+def _peek_run_length(run_file: str | Path) -> int | None:
+    """Number of timepoints in a run, without decoding its data.
+
+    For ``.nii.zst`` this decompresses only as far as the 348-byte header and
+    kills zstd, so peeking 22 runs costs milliseconds rather than gigabytes.
+    Returns None when the length cannot be determined cheaply; callers fall
+    back to the concatenate path.
+    """
+    path = Path(str(run_file))
+    try:
+        if str(path).endswith(".nii.zst"):
+            proc = subprocess.Popen(
+                ["zstd", "-dc", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            try:
+                assert proc.stdout is not None
+                head = proc.stdout.read(348)
+            finally:
+                proc.kill()
+                proc.wait()
+            if head is None or len(head) < 348:
+                return None
+            hdr = nib.Nifti1Header.from_fileobj(io.BytesIO(head), check=False)
+            shape = hdr.get_data_shape()
+        else:
+            shape = nib.load(str(path)).shape
+        return int(shape[3]) if len(shape) > 3 else 1
+    except Exception:
+        return None
+
+
+def _load_run_array(
+    run_file: str | Path,
+    mask_flat: np.ndarray | None,
+) -> np.ndarray:
+    """Decode one run to a ``(n_voxels, n_timepoints)`` float32 array.
+
+    Everything expensive here — zstd in a subprocess, nibabel's read, the
+    C-order copy out of the volume-major file layout — releases the GIL, which
+    is what makes plain threads enough to overlap runs.
+    """
+    img = load_nifti(run_file)
+    data_np = img.get_fdata(dtype=np.float32)
+
+    if data_np.ndim == 4:
+        n_voxels = data_np.shape[0] * data_np.shape[1] * data_np.shape[2]
+        data_np = data_np.reshape(n_voxels, data_np.shape[3])
+    elif data_np.ndim != 2:
+        raise ValueError(f"Data must be 2D or 4D, got shape {data_np.shape}")
+
+    if mask_flat is not None:
+        if mask_flat.shape[0] != data_np.shape[0]:
+            raise ValueError(
+                f"mask_flat length {mask_flat.shape[0]} does not match "
+                f"n_voxels {data_np.shape[0]} for {run_file}"
+            )
+        data_np = data_np[mask_flat, :]
+
+    return np.ascontiguousarray(data_np, dtype=np.float32)
+
+
+def resolve_load_threads(
+    n_runs: int,
+    bytes_per_run: int | None = None,
+    requested: int | None = None,
+) -> int:
+    """Decide how many runs to decode concurrently.
+
+    Loading is three per-run stages that all release the GIL (zstd subprocess,
+    nibabel read, the transpose-shaped copy), so threads overlap them for a
+    ~3-4x wall-clock win. The cost is that *k* runs are in flight at once, so
+    the count is bounded by host RAM through the memory module, never
+    hardcoded. ``FFS_LOAD_THREADS`` overrides, and 1 disables threading.
+    """
+    import os
+
+    from fastfuncstuff.memory import get_available_memory
+    from fastfuncstuff.utils import resolve_cpu_threads
+
+    if requested is None:
+        env = os.environ.get("FFS_LOAD_THREADS")
+        if env:
+            try:
+                requested = int(env)
+            except ValueError:
+                requested = None
+    if requested is not None:
+        return max(1, min(int(requested), n_runs))
+
+    if n_runs < 2:
+        return 1
+
+    # Same budget as compute: whatever FFS_NUM_THREADS / OMP_NUM_THREADS / the
+    # scheduler says this process may use, not the size of the machine.
+    n_cpu, _ = resolve_cpu_threads()
+    # One core stays for the consuming thread; past ~8 the gain flattens
+    # anyway (memory bandwidth, not cores, is the limit).
+    workers = min(n_runs, max(1, n_cpu - 1), 8)
+
+    if bytes_per_run:
+        # Each in-flight run costs roughly two copies: nibabel's array and the
+        # contiguous (voxels, time) result it is copied into.
+        budget = get_available_memory(torch.device("cpu"))
+        workers = min(workers, max(1, int(budget // (2 * bytes_per_run))))
+    return max(1, workers)
+
+
 def load_and_concatenate_runs(
     run_files: list[str | Path],
     device: torch.device | None = None,
     keep_on_cpu: bool = False,
     mask_flat: np.ndarray | None = None,
     total_timepoints: int | None = None,
+    load_threads: int | None = None,
 ) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -975,7 +1086,13 @@ def load_and_concatenate_runs(
         each run as it lands, so peak RAM stays ~data + one run. When None,
         falls back to the list + ``torch.cat`` path, which briefly holds two
         full copies (~2x peak) -- fine for small datasets, but at 100-run /
-        130+ GB scale that doubling OOM-kills the host.
+        130+ GB scale that doubling OOM-kills the host. When not given, the
+        total is peeked from the run headers (cheap, even for ``.nii.zst``)
+        so the single-copy path is used anyway.
+    load_threads : int, optional
+        Runs to decode concurrently. Default: auto (see
+        :func:`resolve_load_threads`); 1 disables threading. Overridden by
+        the ``FFS_LOAD_THREADS`` environment variable.
 
     Returns
     -------
@@ -1020,45 +1137,51 @@ def load_and_concatenate_runs(
     # preallocated buffer (peak ~data + one run). Otherwise we fall back to the
     # list + torch.cat path, which briefly holds two full copies (~2x peak) --
     # tolerable for small datasets but an OOM-killer at whole-dataset scale.
+    # Headers are cheap, so try to learn the total rather than accept the 2x.
+    if total_timepoints is None and len(run_files) > 1:
+        peeked = [_peek_run_length(f) for f in run_files]
+        if all(p is not None for p in peeked):
+            total_timepoints = int(sum(p for p in peeked if p is not None))
+
     concatenated: torch.Tensor | None = None
     torch_runs: list[torch.Tensor] = []
     n_voxels_out: int | None = None
 
-    # Progress bar for loading runs
-    run_iterator = enumerate(run_files)
+    # Decode runs concurrently: each run's zstd/nibabel/copy work releases the
+    # GIL, so threads overlap them. Results are consumed in order through a
+    # bounded window, so at most n_threads+1 runs are ever in flight.
+    n_threads = resolve_load_threads(len(run_files), requested=load_threads)
+
+    def _iter_runs():
+        if n_threads <= 1:
+            for i, run_file in enumerate(run_files):
+                yield i, run_file, _load_run_array(run_file, mask_flat)
+            return
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            pending: dict[int, Future] = {}
+            next_submit = 0
+            window = n_threads + 1
+            for i in range(len(run_files)):
+                while next_submit < len(run_files) and len(pending) < window:
+                    pending[next_submit] = pool.submit(
+                        _load_run_array, run_files[next_submit], mask_flat
+                    )
+                    next_submit += 1
+                yield i, run_files[i], pending.pop(i).result()
+
+    run_iterator = _iter_runs()
     if len(run_files) > 1:
-        run_iterator = enumerate(tqdm(run_files, desc="Loading fMRI runs", unit="run"))
+        desc = "Loading fMRI runs" + (f" ({n_threads} threads)" if n_threads > 1 else "")
+        run_iterator = tqdm(run_iterator, total=len(run_files), desc=desc, unit="run")
 
-    for i, run_file in run_iterator:
-        # Load run
-        img = load_nifti(run_file)
-        data_np = img.get_fdata(dtype=np.float32)
-
-        # Reshape to (n_voxels, n_timepoints)
-        if data_np.ndim == 4:
-            n_voxels = data_np.shape[0] * data_np.shape[1] * data_np.shape[2]
-            n_timepoints = data_np.shape[3]
-            data_np = data_np.reshape(n_voxels, n_timepoints)
-        elif data_np.ndim != 2:
-            raise ValueError(f"Data must be 2D or 4D, got shape {data_np.shape}")
-
-        # Apply mask before moving to device (saves GPU memory)
-        if mask_flat is not None:
-            if mask_flat.shape[0] != data_np.shape[0]:
-                raise ValueError(
-                    f"mask_flat length {mask_flat.shape[0]} does not match "
-                    f"n_voxels {data_np.shape[0]} for run {i}"
-                )
-            data_np = data_np[mask_flat, :]
-
+    for i, run_file, data_np in run_iterator:
         # Convert to torch immediately and move to device
         # This avoids keeping numpy copy around
-        data_torch = torch.from_numpy(data_np.astype(np.float32, copy=False)).to(device)
+        data_torch = torch.from_numpy(data_np).to(device)
         n_tps_run = data_torch.shape[1]
 
         # Delete numpy array immediately to free memory
-        del data_np, img
-        gc.collect()
+        del data_np
 
         # All runs must share the voxel dimension to concatenate along time.
         # A mismatch means the runs are on different spatial grids (e.g. resampled

@@ -76,6 +76,7 @@ from tqdm.auto import tqdm
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_load_threads_arg,
         add_verbose_arg,
         load_and_preprocess_runs,
         parse_device_arg,
@@ -578,6 +579,7 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print design rank/conditioning before the fit.",
     )
+    add_load_threads_arg(proc)
     add_verbose_arg(proc, default=1)
 
     # I/O extras
@@ -800,6 +802,7 @@ def main() -> int:
         force_cpu=True,
         dry_run=False,
         verbose=True,
+        load_threads=args.load_threads,
     )
     data = load_result.data
     run_starts = load_result.run_starts

@@ -48,6 +48,7 @@ import torch
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_load_threads_arg,
         add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
@@ -336,6 +337,7 @@ Notes:
         default=0,
         help="Voxels per chunk for processing. 0 = auto-detect based on available memory (default)",
     )
+    add_load_threads_arg(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -451,6 +453,7 @@ def main():
         force_cpu=False,  # 3dRidgefast always loads to GPU
         dry_run=args.dry_run,
         verbose=True,
+        load_threads=args.load_threads,
     )
 
     # Modify prefix for dry run mode

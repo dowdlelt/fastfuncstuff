@@ -39,6 +39,7 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_load_threads_arg,
         add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
@@ -428,6 +429,7 @@ Notes:
         "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
         "'auto' selects based on CV strategy (default: auto).",
     )
+    add_load_threads_arg(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-debug",
@@ -672,6 +674,7 @@ def main():
         force_cpu=True,  # Data always on CPU; GPU used for compute only
         dry_run=args.dry_run,
         verbose=True,
+        load_threads=args.load_threads,
     )
 
     # Modify prefix for dry run mode

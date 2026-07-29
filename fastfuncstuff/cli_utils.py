@@ -410,6 +410,7 @@ def load_and_preprocess_runs(
     force_cpu: bool = False,
     dry_run: bool = False,
     verbose: bool = True,
+    load_threads: int | None = None,
 ) -> LoadResult:
     """
     Load and preprocess fMRI data from multiple runs.
@@ -443,6 +444,9 @@ def load_and_preprocess_runs(
         verifying code logic and performance.
     verbose : bool, default=True
         Print progress information
+    load_threads : int, optional
+        Runs to decode concurrently (``-load_threads``). Default: auto from
+        CPU count and free RAM; 1 disables threading.
 
     Returns
     -------
@@ -668,6 +672,7 @@ def load_and_preprocess_runs(
             device=device,
             keep_on_cpu=keep_on_cpu,
             mask_flat=mask_flat,
+            load_threads=load_threads,
         )
 
     # Remove duplicate last run_start
@@ -1978,6 +1983,27 @@ def add_verbose_arg(parser_or_group, default: int = 1, dest: str = "verb"):
         action="store_const",
         const=0,
         help="Alias for -verb 0.",
+    )
+
+
+def add_load_threads_arg(parser_or_group) -> None:
+    """Register ``-load_threads`` on a parser or argument group.
+
+    Decoding runs is thread-parallel (zstd, nibabel and the copy out of the
+    file's volume-major layout all release the GIL), worth ~3-4x on multi-run
+    loads. The default adapts to CPU count and free RAM; this is the escape
+    hatch for a shared machine or a memory-tight host.
+    """
+    parser_or_group.add_argument(
+        "-load_threads",
+        "-load-threads",
+        dest="load_threads",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Runs to decode concurrently when loading (default: auto from CPU "
+        "count and free RAM; 1 disables threading). Also settable via "
+        "FFS_LOAD_THREADS.",
     )
 
 

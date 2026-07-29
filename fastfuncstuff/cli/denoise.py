@@ -42,6 +42,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_load_threads_arg,
         add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
@@ -533,6 +534,7 @@ Notes:
         action="store_true",
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
+    add_load_threads_arg(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -1577,6 +1579,7 @@ def main():
         force_cpu=args.keep_on_cpu,
         dry_run=args.dry_run,
         verbose=True,
+        load_threads=args.load_threads,
     )
 
     # Modify prefix for dry run mode

@@ -54,6 +54,7 @@ import torch
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_load_threads_arg,
         add_verbose_arg,
         load_and_preprocess_runs,
         parse_device_arg,
@@ -456,6 +457,7 @@ Notes:
             "'should-not-be-singular' failures."
         ),
     )
+    add_load_threads_arg(proc_grp)
     add_verbose_arg(proc_grp, default=1)
 
     return parser
@@ -1085,6 +1087,7 @@ def main() -> None:
         force_cpu=True,
         dry_run=False,
         verbose=True,
+        load_threads=args.load_threads,
     )
     data = load_result.data
     run_starts = load_result.run_starts
