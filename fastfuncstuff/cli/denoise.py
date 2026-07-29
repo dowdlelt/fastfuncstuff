@@ -487,8 +487,22 @@ Notes:
         help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
         "SPMG2 = canonical + temporal derivative (2 basis). "
         "SPMG3 = canonical + time + dispersion derivatives (3 basis). "
-        "FIR/TENT use durations to set window (default: 0 to max(durations)). "
+        "FIR/TENT windows are estimated from the stimulus durations (stimulus + "
+        "HRF tail); override with -fir_duration. "
         "Example: -hrf_model TENT(0,15,6) creates 6 tent bases from 0-15s.",
+    )
+    proc_opts.add_argument(
+        "-fir_duration",
+        "-fir-duration",
+        "-tent_duration",
+        "-tent-duration",
+        dest="fir_duration",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help="FIR/TENT window length in seconds (0 to SECONDS), overriding the window "
+        "estimated from the stimulus durations. -tent_duration is a synonym. "
+        "Ignored for canonical HRF models.",
     )
     proc_opts.add_argument(
         "-canonical",
@@ -1585,6 +1599,33 @@ def main():
     # Update args.tr with loaded value (for later use)
     if args.tr is None:
         args.tr = load_result.tr
+
+    # HRF model parsing needs the TR (FIR/TENT derive their basis count from it),
+    # so it has to wait until the header has been read.
+    from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
+
+    hrf_info = parse_hrf_model_args(
+        hrf_model_arg=args.hrf_model,
+        canonical_arg=args.canonical,
+        durations=durations,
+        condition_labels=condition_labels,
+        tr=args.tr,
+        fir_window_s=args.fir_duration,
+    )
+
+    hrf_model_name = hrf_info["hrf_model_name"]
+    _hrf_params = hrf_info["hrf_params"]
+    is_fir_model = hrf_info["is_fir_model"]
+    fir_bot = hrf_info["fir_bot"]
+    fir_top = hrf_info["fir_top"]
+    n_basis = hrf_info["n_basis"]
+    _condition_labels_full = hrf_info["condition_labels_full"]
+
+    validate_hrf_compatibility(
+        is_fir_model=is_fir_model,
+        single_trial=args.single_trials,
+        hrf_opt=args.hrf_opt,
+    )
 
     # Compute automask if requested (before scaling, before brainthresh)
     if args.automask:

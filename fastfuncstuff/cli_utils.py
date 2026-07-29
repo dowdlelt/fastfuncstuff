@@ -2204,6 +2204,10 @@ def parse_hrf_model_args(
         Condition labels
     tr : float
         Repetition time in seconds
+    fir_window_s : float or None, optional
+        Explicit FIR/TENT window length in seconds (``-fir_duration`` /
+        ``-tent_duration``).  Overrides the window derived from the stimulus
+        durations.  Ignored for canonical models.
 
     Returns
     -------
@@ -2255,24 +2259,39 @@ def parse_hrf_model_args(
 
     if is_fir_model:
         # For FIR/TENT, determine window from durations or params
+        window_source = "durations"
         if "bot" in hrf_params and "top" in hrf_params:
             # Explicit window specified (e.g., TENT(0,15,6))
             fir_bot = hrf_params["bot"]
             fir_top = hrf_params["top"]
+            window_source = f"{hrf_model_str}"
             if "n_basis" in hrf_params:
                 n_basis = hrf_params["n_basis"]
             else:
                 # Default: 1 basis per TR
                 n_basis = int(np.ceil((fir_top - fir_bot) / tr))
-        else:
-            # Use durations to set window: 0 to max(durations)
+        elif fir_window_s is not None:
             fir_bot = 0.0
-            fir_top = max(durations)
-            # Default: 1 basis per TR
-            n_basis = int(np.ceil(fir_top / tr))
+            fir_top = float(fir_window_s)
+            n_basis = max(1, int(np.ceil(fir_top / tr)))
+            window_source = "-fir_duration"
+        else:
+            # The response to a D-second block does not end at D seconds — the
+            # HRF keeps rising for ~5 s and decays for ~20 s after that. Taking
+            # the window as max(durations) (the old behaviour) truncated the
+            # entire post-stimulus response. Estimate it instead: convolve the
+            # canonical HRF with the boxcar and find where it returns to
+            # baseline. See design/hrf.py:estimate_hrf_window.
+            from fastfuncstuff.design.hrf import estimate_hrf_window
+
+            fir_bot = 0.0
+            n_basis = max(1, estimate_hrf_window(max(durations), tr))
+            fir_top = n_basis * tr
+            window_source = "estimated from durations"
 
         print(
-            f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, {n_basis} basis functions)"
+            f"  HRF model: {hrf_model_name} (window: {fir_bot:.1f}-{fir_top:.1f}s, "
+            f"{n_basis} basis functions; window {window_source})"
         )
 
         # Expand condition labels for FIR: cond1_t0.0s, cond1_t1.5s, ..., cond2_t0.0s, ...
