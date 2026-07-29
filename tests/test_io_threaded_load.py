@@ -19,8 +19,12 @@ import torch
 
 from fastfuncstuff.io.afni import (
     _peek_run_length,
+    _to_file_order,
+    _voxel_major_cuda,
+    _voxel_major_numpy,
     load_and_concatenate_runs,
     resolve_load_threads,
+    save_nifti,
 )
 
 SHAPE = (5, 6, 4)
@@ -120,3 +124,66 @@ def test_load_threads_respect_the_cpu_budget(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("OMP_NUM_THREADS", "2")
     assert resolve_load_threads(20) <= 2
+
+
+# --- volume-major -> voxel-major reorder ------------------------------------
+#
+# The reorder is the bulk of load time, so it has fast paths (threaded host
+# copy, device-side permute). They are only allowed to be fast: the result must
+# be bit-identical to the naive reshape, including the C-order voxel index that
+# the mask.flatten() convention depends on.
+
+
+def _naive_voxel_major(arr):
+    n_voxels = arr.shape[0] * arr.shape[1] * arr.shape[2]
+    return np.ascontiguousarray(arr.reshape(n_voxels, arr.shape[3]), dtype=np.float32)
+
+
+@pytest.mark.parametrize("n_threads", [1, 2, 5])
+def test_voxel_major_numpy_matches_naive_reshape(n_threads):
+    rng = np.random.default_rng(1)
+    arr = np.asfortranarray(rng.normal(0, 1, (5, 6, 4, 9)).astype(np.float32))
+    got = _voxel_major_numpy(arr, n_threads)
+    assert np.array_equal(got, _naive_voxel_major(arr))
+    assert got.flags["C_CONTIGUOUS"]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("masked", [False, True])
+def test_voxel_major_cuda_matches_naive_reshape(masked):
+    rng = np.random.default_rng(2)
+    arr = np.asfortranarray(rng.normal(0, 1, (5, 6, 4, 9)).astype(np.float32))
+    expected = _naive_voxel_major(arr)
+    mask = None
+    if masked:
+        mask = np.zeros(arr.shape[0] * arr.shape[1] * arr.shape[2], dtype=bool)
+        mask[::3] = True
+        expected = expected[mask]
+    got = _voxel_major_cuda(arr, torch.device("cuda"), mask)
+    assert got is not None
+    assert np.array_equal(got.cpu().numpy(), expected)
+
+
+def test_voxel_major_cuda_declines_non_file_order():
+    # A C-order array has already been copied by nibabel; the host finishes it.
+    arr = np.ascontiguousarray(np.zeros((3, 3, 3, 2), dtype=np.float32))
+    assert _voxel_major_cuda(arr, torch.device("cuda"), None) is None
+
+
+def test_to_file_order_preserves_values(tmp_path):
+    rng = np.random.default_rng(3)
+    arr = rng.normal(0, 1, (5, 6, 4, 3)).astype(np.float32)  # C-order
+    out = _to_file_order(arr, n_threads=3)
+    assert out.flags["F_CONTIGUOUS"]
+    assert np.array_equal(out, arr)
+    # and an already-F array is passed straight through, no copy
+    f_arr = np.asfortranarray(arr)
+    assert _to_file_order(f_arr, n_threads=3) is f_arr
+
+
+def test_save_nifti_roundtrip_is_exact_for_c_order(tmp_path):
+    rng = np.random.default_rng(4)
+    arr = rng.normal(0, 1, (5, 6, 4, 3)).astype(np.float32)
+    path = tmp_path / "c_order.nii"
+    save_nifti(arr, path, affine=np.diag([2.0, 2.0, 2.0, 1.0]))
+    assert np.array_equal(np.asarray(nib.load(str(path)).dataobj), arr)

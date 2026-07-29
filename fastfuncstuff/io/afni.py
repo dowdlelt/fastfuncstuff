@@ -63,7 +63,7 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
         "nibabel is required for AFNI mask and imaging utilities. Install it with `pip install nibabel`."
     ) from exc
 
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, resolve_cpu_threads, to_tensor
 
 
 def parse_subbrick_selector(path: str | Path) -> tuple[str, list[int] | None]:
@@ -974,31 +974,132 @@ def _peek_run_length(run_file: str | Path) -> int | None:
         return None
 
 
+def _voxel_major_numpy(data_np: np.ndarray, n_threads: int = 1) -> np.ndarray:
+    """Reorder a volume-major ``(x, y, z, t)`` array to C-order ``(n_voxels, t)``.
+
+    NIfTI stores x fastest and t slowest; every consumer here wants the exact
+    opposite, with the voxel index a C-order flatten of (x, y, z) to match the
+    ``mask.flatten()`` convention. That is a full four-axis memory reversal, and
+    as a single-threaded strided pass it dominates load time (~82%, 10 s for a
+    2 GB run). Splitting it over the slowest axis gives each worker a disjoint
+    output block, and the copy releases the GIL, so plain threads get ~5x.
+    """
+    n_voxels = data_np.shape[0] * data_np.shape[1] * data_np.shape[2]
+    n_tps = data_np.shape[3]
+
+    # Already C-order (e.g. a sub-brick selection that landed C-contiguous):
+    # the reshape is a free view and there is nothing to reorder.
+    if data_np.flags["C_CONTIGUOUS"]:
+        return data_np.reshape(n_voxels, n_tps)
+
+    if n_threads <= 1:
+        return np.ascontiguousarray(data_np.reshape(n_voxels, n_tps), dtype=np.float32)
+
+    out = np.empty(data_np.shape, dtype=np.float32)
+    bounds = np.linspace(0, data_np.shape[0], n_threads + 1).astype(int)
+
+    def _copy_block(k: int) -> None:
+        lo, hi = bounds[k], bounds[k + 1]
+        np.copyto(out[lo:hi], data_np[lo:hi])
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        list(pool.map(_copy_block, range(n_threads)))
+    return out.reshape(n_voxels, n_tps)
+
+
+def _voxel_major_cuda(
+    data_np: np.ndarray,
+    device: torch.device,
+    mask_flat: np.ndarray | None,
+) -> torch.Tensor | None:
+    """Do the volume-major → voxel-major reorder on the GPU.
+
+    The source bytes are already a contiguous ``(t, z, y, x)`` block, so the
+    upload is one plain memcpy and the transpose becomes a device-side permute:
+    ~0.3 s for a 2 GB run against ~10 s on the host. Consumers that wanted the
+    data on the GPU anyway get it for free.
+
+    Returns ``None`` when the layout or the VRAM budget rules the path out, so
+    the caller can fall back to the host path.
+    """
+    # Requires the untouched file layout (x fastest); anything else has already
+    # been copied by nibabel and is cheaper to finish on the host.
+    if not data_np.flags["F_CONTIGUOUS"]:
+        return None
+
+    n_x, n_y, n_z, n_tps = data_np.shape
+    n_voxels = n_x * n_y * n_z
+    n_out = n_voxels if mask_flat is None else int(np.count_nonzero(mask_flat))
+    bytes_per_tp = n_voxels * 4
+
+    from fastfuncstuff.memory import get_available_memory
+
+    # The result has to live on the device regardless; what this path adds is
+    # two chunk-sized transients (the uploaded block and its permuted copy).
+    budget = get_available_memory(device)
+    chunk_tps = int((budget - n_out * n_tps * 4) // (2 * bytes_per_tp))
+    if chunk_tps < 1:
+        return None
+    chunk_tps = min(chunk_tps, n_tps)
+
+    host = torch.from_numpy(data_np.T)  # (t, z, y, x) view of the same bytes
+    mask_t = None
+    if mask_flat is not None:
+        mask_t = torch.from_numpy(np.ascontiguousarray(mask_flat)).to(device)
+
+    out = torch.empty((n_out, n_tps), dtype=torch.float32, device=device)
+    for start in range(0, n_tps, chunk_tps):
+        stop = min(start + chunk_tps, n_tps)
+        block = host[start:stop].to(device)
+        # permute is a view; reshape materialises the reordered chunk on device
+        block = block.permute(3, 2, 1, 0).reshape(n_voxels, stop - start)
+        out[:, start:stop] = block if mask_t is None else block[mask_t]
+        del block
+    return out
+
+
 def _load_run_array(
     run_file: str | Path,
     mask_flat: np.ndarray | None,
-) -> np.ndarray:
+    n_threads: int = 1,
+    device: torch.device | None = None,
+) -> np.ndarray | torch.Tensor:
     """Decode one run to a ``(n_voxels, n_timepoints)`` float32 array.
 
     Everything expensive here — zstd in a subprocess, nibabel's read, the
     C-order copy out of the volume-major file layout — releases the GIL, which
     is what makes plain threads enough to overlap runs.
+
+    With ``device`` on CUDA the reorder happens on the GPU and a device tensor
+    is returned; otherwise the result is a numpy array, reordered with
+    ``n_threads`` host threads.
     """
     img = load_nifti(run_file)
     data_np = img.get_fdata(dtype=np.float32)
 
-    if data_np.ndim == 4:
-        n_voxels = data_np.shape[0] * data_np.shape[1] * data_np.shape[2]
-        data_np = data_np.reshape(n_voxels, data_np.shape[3])
-    elif data_np.ndim != 2:
+    if data_np.ndim not in (2, 4):
         raise ValueError(f"Data must be 2D or 4D, got shape {data_np.shape}")
 
     if mask_flat is not None:
-        if mask_flat.shape[0] != data_np.shape[0]:
+        n_voxels = (
+            data_np.shape[0]
+            if data_np.ndim == 2
+            else data_np.shape[0] * data_np.shape[1] * data_np.shape[2]
+        )
+        if mask_flat.shape[0] != n_voxels:
             raise ValueError(
                 f"mask_flat length {mask_flat.shape[0]} does not match "
-                f"n_voxels {data_np.shape[0]} for {run_file}"
+                f"n_voxels {n_voxels} for {run_file}"
             )
+
+    if data_np.ndim == 4:
+        if device is not None and device.type == "cuda":
+            out = _voxel_major_cuda(data_np, device, mask_flat)
+            if out is not None:
+                return out
+        data_np = _voxel_major_numpy(data_np, n_threads)
+
+    if mask_flat is not None:
         data_np = data_np[mask_flat, :]
 
     return np.ascontiguousarray(data_np, dtype=np.float32)
@@ -1152,10 +1253,25 @@ def load_and_concatenate_runs(
     # bounded window, so at most n_threads+1 runs are ever in flight.
     n_threads = resolve_load_threads(len(run_files), requested=load_threads)
 
+    # The volume-major -> voxel-major reorder inside each run is the bulk of the
+    # load, so give it whatever cores the outer run-level pool left unused. With
+    # one run in flight (single-run tools) that is the whole budget.
+    n_cpu, _ = resolve_cpu_threads()
+    inner_threads = max(1, min(8, n_cpu // n_threads))
+    # On CUDA the reorder happens device-side instead -- but only with a single
+    # run in flight, so the VRAM budget is not raced by concurrent workers.
+    reorder_device = (
+        device if (n_threads == 1 and device is not None and device.type == "cuda") else None
+    )
+
     def _iter_runs():
         if n_threads <= 1:
             for i, run_file in enumerate(run_files):
-                yield i, run_file, _load_run_array(run_file, mask_flat)
+                yield (
+                    i,
+                    run_file,
+                    _load_run_array(run_file, mask_flat, inner_threads, reorder_device),
+                )
             return
         with ThreadPoolExecutor(max_workers=n_threads) as pool:
             pending: dict[int, Future] = {}
@@ -1164,7 +1280,11 @@ def load_and_concatenate_runs(
             for i in range(len(run_files)):
                 while next_submit < len(run_files) and len(pending) < window:
                     pending[next_submit] = pool.submit(
-                        _load_run_array, run_files[next_submit], mask_flat
+                        _load_run_array,
+                        run_files[next_submit],
+                        mask_flat,
+                        inner_threads,
+                        reorder_device,
                     )
                     next_submit += 1
                 yield i, run_files[i], pending.pop(i).result()
@@ -1176,8 +1296,12 @@ def load_and_concatenate_runs(
 
     for i, run_file, data_np in run_iterator:
         # Convert to torch immediately and move to device
-        # This avoids keeping numpy copy around
-        data_torch = torch.from_numpy(data_np).to(device)
+        # This avoids keeping numpy copy around (the CUDA reorder path already
+        # hands back a device tensor).
+        if isinstance(data_np, torch.Tensor):
+            data_torch = data_np
+        else:
+            data_torch = torch.from_numpy(data_np).to(device)
         n_tps_run = data_torch.shape[1]
 
         # Delete numpy array immediately to free memory
@@ -2723,6 +2847,49 @@ class _ChunkedFileWriter(io.IOBase):
             pass
 
 
+def _to_file_order(data: np.ndarray, n_threads: int | None = None) -> np.ndarray:
+    """Return *data* in F (file) order, reordering with threads if needed.
+
+    NIfTI is written x-fastest, so a C-order array — which is what unflattening
+    a ``(n_voxels, t)`` result to 4D gives you — forces nibabel into the same
+    single-threaded strided pass that dominates loading. Measured on a 0.69 GB
+    array: 5.96 s to write C-order vs 0.51 s once it is F-contiguous. Doing the
+    reorder ourselves, in parallel, buys most of that back.
+
+    Falls through unchanged when the array is already F-order or when the extra
+    copy would not comfortably fit in RAM (nibabel's own path writes in slabs,
+    so it is slow but never blows up).
+    """
+    if data.ndim < 2 or data.flags["F_CONTIGUOUS"]:
+        return data
+
+    from fastfuncstuff.memory import get_available_memory
+
+    if data.nbytes > get_available_memory(torch.device("cpu")):
+        return data
+
+    if n_threads is None:
+        n_cpu, _ = resolve_cpu_threads()
+        n_threads = min(8, max(1, n_cpu))
+    if n_threads <= 1:
+        return np.asfortranarray(data)
+
+    out = np.empty(data.shape, dtype=data.dtype, order="F")
+    # Any single axis gives the workers disjoint blocks in both layouts; the
+    # longest one keeps them all busy.
+    axis = int(np.argmax(data.shape))
+    bounds = np.linspace(0, data.shape[axis], n_threads + 1).astype(int)
+
+    def _copy_block(k: int) -> None:
+        sl = [slice(None)] * data.ndim
+        sl[axis] = slice(int(bounds[k]), int(bounds[k + 1]))
+        np.copyto(out[tuple(sl)], data[tuple(sl)])
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        list(pool.map(_copy_block, range(n_threads)))
+    return out
+
+
 def _nib_save_chunked(img, path: str) -> None:
     """``nib.save`` for an uncompressed ``.nii`` that survives >2 GiB single writes."""
     from nibabel.fileholders import FileHolder
@@ -2821,7 +2988,7 @@ def save_nifti(
         _set_afni_brick_stataux(header, brick_stataux, n_sub)
 
     # Create NIfTI image
-    img = nib.Nifti1Image(data, affine, header=header)
+    img = nib.Nifti1Image(_to_file_order(data), affine, header=header)
 
     # Set TR if provided
     if tr is not None:
