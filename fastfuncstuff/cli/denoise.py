@@ -307,8 +307,9 @@ Notes:
         "Computed from raw (unscaled) mean volume: thresh = percentile(mean, P) * F. "
         "Voxels with mean intensity BELOW this threshold are excluded. "
         "GLMsingle default: '99 0.1' (99th percentile × 0.1). "
-        "Critical for unmasked data — without this or -mask, background voxels "
-        "(R²≈0) will dominate the noise pool. "
+        "Defaults to '99 0.5' (the GLMdenoise default) when none of -mask, "
+        "-automask or -brainthresh is given, since otherwise background voxels "
+        "(R²≈0) dominate the noise pool. Pass '-brainthresh 0 0' to disable. "
         "Example: -brainthresh 99 0.5 (more conservative, excludes dim voxels).",
     )
     denoise_opts.add_argument(
@@ -1651,7 +1652,18 @@ def main():
     print()
 
     # Compute brainthresh intensity mask BEFORE scaling
-    # This excludes low-intensity voxels from the noise pool
+    # This excludes low-intensity voxels from the noise pool.
+    # Unrestricted, the noise pool is "every voxel with low task R²", which is
+    # mostly air; those PCs are noise/ghosting, not shared nuisance structure.
+    # GLMdenoise's 99th-percentile x 0.5 is the reference default, so apply it
+    # unless the user has already restricted the voxel set some other way.
+    if args.brainthresh is None and args.mask is None and not args.automask:
+        args.brainthresh = [99.0, 0.5]
+        print()
+        print("No -mask / -automask / -brainthresh given: defaulting to")
+        print("  -brainthresh 99 0.5 so background voxels stay out of the noise pool.")
+        print("  Pass '-brainthresh 0 0' to disable the intensity cut entirely.")
+
     brainthresh_mask = None
     if args.brainthresh is not None:
         percentile, fraction = args.brainthresh

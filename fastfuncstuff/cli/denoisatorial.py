@@ -824,7 +824,19 @@ def main():
         # Saved after the constant-voxel filter below, so the file on disk is
         # the voxel set actually analysed rather than the pre-filter automask.
 
-    # Compute brainthresh intensity mask BEFORE scaling
+    # Compute brainthresh intensity mask BEFORE scaling.
+    # Without any brain restriction the noise pool is "every voxel with low
+    # task R²", which is mostly air — background PCs are pure noise/ghosting and
+    # swamp the real nuisance structure. GLMdenoise's default (99th percentile
+    # x 0.5) is the reference behaviour, so apply it unless the user has already
+    # restricted the voxel set some other way.
+    if args.brainthresh is None and args.mask is None and not args.automask:
+        args.brainthresh = [99.0, 0.5]
+        print()
+        print("No -mask / -automask / -brainthresh given: defaulting to")
+        print("  -brainthresh 99 0.5 so background voxels stay out of the noise pool.")
+        print("  Pass '-brainthresh 0 0' to disable the intensity cut entirely.")
+
     brainthresh_mask = None
     if args.brainthresh is not None:
         percentile, fraction = args.brainthresh
