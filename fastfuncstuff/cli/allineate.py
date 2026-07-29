@@ -14,13 +14,21 @@ Speed presets:
 from __future__ import annotations
 
 import argparse
+import shlex
+import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_verbose_arg,
+    collect_batch_jobs,
+    run_batch_jobs,
+    spinner,
+)
 from fastfuncstuff.processing.affine import (
     apply_affine,
     apply_affine_wsinc5,
@@ -97,9 +105,23 @@ Examples:
 
     # --- Input/Output ---
     io_group = parser.add_argument_group("Input/Output")
-    io_group.add_argument("-base", required=True, help="Base/reference image (.nii/.nii.gz)")
-    io_group.add_argument("-source", required=True, help="Source/moving image to align")
-    io_group.add_argument("-prefix", required=True, help="Output aligned image")
+    io_group.add_argument(
+        "-base", default=None, help="Base/reference image (.nii/.nii.gz) [required unless -batch]"
+    )
+    io_group.add_argument(
+        "-source", default=None, help="Source/moving image to align [required unless -batch]"
+    )
+    io_group.add_argument(
+        "-prefix", default=None, help="Output aligned image [required unless -batch]"
+    )
+    add_batch_args(
+        io_group,
+        tool="ffs_allineate",
+        what="affine alignments",
+        example="-base ref.nii -source mov.nii -prefix out.nii -1Dmatrix_save m.aff12.1D",
+        skip_note="-prefix / -1Dmatrix_save / -save_mean / -save_weight / -save_automask "
+        "/ -save_cmass",
+    )
     io_group.add_argument(
         "-1Dmatrix_save", default=None, help="Save affine matrix as .aff12.1D (AFNI format)"
     )
@@ -364,20 +386,83 @@ Examples:
     return args
 
 
+def _select_device(device_arg: str | None) -> torch.device:
+    """Honour ``-device`` if given, else CUDA > MPS > CPU."""
+    if device_arg:
+        return torch.device(device_arg)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    Paths are used verbatim (allineate does not run them through parse_prefix).
+    -save_mean and the diagnostic maps are listed on intent: if a runtime guard
+    means one is never written (a 3-D source has no mean; -save_automask needs
+    -source_automask), the job simply isn't skipped next time — safe, since
+    re-running costs less than a wrong skip."""
+    outs: list[str] = [args.prefix]
+    matrix_save = getattr(args, "1Dmatrix_save", None)
+    if matrix_save is not None:
+        outs.append(matrix_save)
+    if args.save_mean:
+        outs.append(derive_mean_output_path(args.prefix))
+    for name in ("save_weight", "save_automask", "save_cmass"):
+        val = getattr(args, name, None)
+        if val is not None:
+            outs.append(val)
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -base/-source/-prefix."""
+    missing = [f for f in ("base", "source", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
 def main(argv: list[str] | None = None) -> None:
     """Main CLI entry point for allineate."""
     args = parse_args(argv)
 
-    # --- Device selection ---
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    if args.batch is not None or args.batch_run:
+        # One process, many alignments: the Python/CUDA/torch.compile startup is
+        # paid once instead of per pair. The per-pair work is unchanged.
+        run_batch_jobs(
+            tool="ffs_allineate",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=_select_device(args.device),
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_dispatch_run,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return
 
+    missing = [f for f in ("base", "source", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "Error: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _dispatch_run(args, _select_device(args.device))
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
+    """Align one self-contained base/source pair (the entire per-pair body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
         print(f"allineate: device={device}")

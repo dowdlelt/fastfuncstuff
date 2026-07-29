@@ -1,8 +1,8 @@
-"""Batch-mode plumbing shared by ffs_moco and ffs_nwarp.
+"""Batch-mode plumbing shared by ffs_moco, ffs_nwarp, ffs_allineate and ffs_formwarp.
 
 Covers the shared runner (collect + skip-existing isolation), each tool's
 expected-output enumeration used by -batch_skip, and the autoproc emitter's
-batched moco / final stages.
+batched stages (moco, cross-run, cross-session, final).
 """
 
 from __future__ import annotations
@@ -143,9 +143,7 @@ def test_run_batch_rejects_nested_batch(capsys):
 def test_moco_expected_outputs_single_echo():
     from fastfuncstuff.cli.moco import _expected_outputs, parse_args
 
-    a = parse_args(
-        ["-input", "epi.nii.gz", "-prefix", "out", "-1Dfile", "m.1D", "-save_mean"]
-    )
+    a = parse_args(["-input", "epi.nii.gz", "-prefix", "out", "-1Dfile", "m.1D", "-save_mean"])
     outs = _expected_outputs(a)
     assert "out.nii.gz" in outs
     assert "mean_out.nii.gz" in outs  # -save_mean derives from prefix
@@ -209,6 +207,64 @@ def test_nwarp_expected_outputs_prefix_verbatim_plus_derived():
 
 
 # --------------------------------------------------------------------------
+# ffs_allineate / ffs_formwarp._expected_outputs
+# --------------------------------------------------------------------------
+
+
+def test_allineate_expected_outputs_and_optional_flags():
+    from fastfuncstuff.cli.allineate import _expected_outputs, parse_args
+
+    a = parse_args(
+        [
+            "-base",
+            "ref.nii",
+            "-source",
+            "mov.nii",
+            "-prefix",
+            "out.nii.gz",
+            "-1Dmatrix_save",
+            "m.aff12.1D",
+            "-save_weight",
+            "w.nii.gz",
+        ]
+    )
+    outs = _expected_outputs(a)
+    assert outs[0] == "out.nii.gz"  # prefix verbatim (no parse_prefix)
+    assert "m.aff12.1D" in outs and "w.nii.gz" in outs
+    # An alignment with no matrix requested still has its warped image checked.
+    bare = parse_args(["-base", "ref.nii", "-source", "mov.nii", "-prefix", "o.nii"])
+    assert _expected_outputs(bare) == ["o.nii"]
+
+
+def test_allineate_batch_makes_io_flags_optional():
+    """-batch alone must parse: the per-run args live in the manifest."""
+    from fastfuncstuff.cli.allineate import parse_args
+
+    a = parse_args(["-batch", "runs.txt", "-device", "cpu"])
+    assert a.batch == "runs.txt" and a.base is None and a.prefix is None
+
+
+def test_formwarp_expected_outputs_names_the_warps():
+    from fastfuncstuff.cli.formwarp import _expected_outputs, parse_args
+
+    a = parse_args(
+        [
+            "-base",
+            "f.nii",
+            "-source",
+            "m.nii",
+            "-prefix",
+            "w.nii.zst",
+            "-save_warp",
+            "-save_inverse",
+        ]
+    )
+    outs = _expected_outputs(a)
+    # Warp names follow the parsed prefix + its extension, as _dispatch_run writes them.
+    assert outs == ["w.nii.zst", "w_WARP.nii.zst", "w_WARPINV.nii.zst"]
+
+
+# --------------------------------------------------------------------------
 # autoproc emitter: batched stages
 # --------------------------------------------------------------------------
 
@@ -223,9 +279,7 @@ def _tiny_plan(**opt_kw):
             session="01",
             task="foo",
             run=run,
-            mag_path=Path(
-                f"/bids/sub-X/ses-01/func/sub-X_ses-01_task-foo_run-{run}_bold.nii.gz"
-            ),
+            mag_path=Path(f"/bids/sub-X/ses-01/func/sub-X_ses-01_task-foo_run-{run}_bold.nii.gz"),
             json={"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"},
         )
 
@@ -243,7 +297,7 @@ def test_emit_moco_stage_is_batched():
     # The manifest is (re)truncated then appended per run inside the loop.
     assert ': > "$mocobatch"' in s
     # Each run's args (incl. the motion params) are printf'd into the manifest.
-    assert 'printf ' in s and '.motion.1D\\"" >> "$mocobatch"' in s
+    assert "printf " in s and '.motion.1D\\"" >> "$mocobatch"' in s
 
 
 def test_emit_final_stage_is_batched():
@@ -252,6 +306,58 @@ def test_emit_final_stage_is_batched():
     s = write_script(_tiny_plan(), "wd", bids_root="/bids", script_stem="proc_sub-X")
     assert 'nwarpbatch="proc_sub-X_nwarpbatch.txt"' in s
     assert 'ffs_nwarp -batch "$nwarpbatch"' in s
+
+
+def test_emit_xrun_stage_is_batched():
+    """stage06 writes two manifests in the run loop, then launches one
+    ffs_allineate and (with -xrun_nonlin) one ffs_formwarp for all runs."""
+    from fastfuncstuff.autoproc.emit import write_script
+
+    s = write_script(
+        _tiny_plan(xrun_nonlin=True), "wd", bids_root="/bids", script_stem="proc_sub-X"
+    )
+    assert 'albatch="proc_sub-X_xrunbatch.txt"' in s
+    assert 'fwbatch="proc_sub-X_xrunnlbatch.txt"' in s
+    assert 'ffs_allineate -batch "$albatch"' in s
+    assert 'ffs_formwarp -batch "$fwbatch"' in s
+    # The loop only appends; no per-run tool call survives in the stage.
+    stage = s.split("stage06:")[1].split("# ====")[0]
+    assert "\n    ffs_allineate" not in stage and "\n    ffs_formwarp" not in stage
+    # The linear batch must launch before the nonlinear one — its output is the
+    # nonlinear source.
+    assert s.index('ffs_allineate -batch "$albatch"') < s.index('ffs_formwarp -batch "$fwbatch"')
+
+
+def test_emit_xses_stage_is_batched():
+    from fastfuncstuff.autoproc.bids import BoldRun, Session, Subject
+    from fastfuncstuff.autoproc.emit import write_script
+    from fastfuncstuff.autoproc.plan import Options, build_plan
+
+    def _run(ses):
+        return BoldRun(
+            subject="X",
+            session=ses,
+            task="foo",
+            run="1",
+            mag_path=Path(f"/bids/sub-X/ses-{ses}/func/sub-X_ses-{ses}_task-foo_run-1_bold.nii.gz"),
+            json={"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"},
+        )
+
+    subj = Subject("X", [Session("01", [_run("01")]), Session("02", [_run("02")])])
+    plan = build_plan(subj, Options(go_to_anat=True, ref_ses="01", xses_nonlin=True))
+    s = write_script(plan, "wd", bids_root="/bids", script_stem="p")
+    assert 'albatch="p_xsesbatch.txt"' in s and 'fwbatch="p_xsesnlbatch.txt"' in s
+    assert 'ffs_allineate -batch "$albatch"' in s
+    assert 'ffs_formwarp -batch "$fwbatch"' in s
+
+
+def test_emit_single_session_writes_no_xses_batch():
+    """One session → nothing to align across sessions, so no manifest and no
+    launch (an empty -batch is an error in the tools)."""
+    from fastfuncstuff.autoproc.emit import write_script
+
+    s = write_script(_tiny_plan(), "wd", bids_root="/bids", script_stem="p")
+    assert "xsesbatch.txt" not in s
 
 
 def test_emit_skip_toggle_default_and_overwrite():
@@ -271,9 +377,15 @@ def test_emitted_batch_stage_is_valid_bash(tmp_path):
         pytest.skip("bash not available")
     from fastfuncstuff.autoproc.emit import write_script
 
-    s = write_script(_tiny_plan(), "wd", bids_root="/bids", script_stem="proc_sub-X")
-    script = tmp_path / "proc.sh"
-    script.write_text(s)
-    # bash -n parses without executing: catches quoting/printf mistakes in the
-    # batch-manifest construction.
-    subprocess.run(["bash", "-n", str(script)], check=True)
+    # Both shapes: the simple plan and the one where every batched stage is live.
+    plans = [
+        _tiny_plan(),
+        _tiny_plan(xrun_nonlin=True, xses_nonlin=True, anat_nonlin=True, locomoco=True),
+    ]
+    for i, plan in enumerate(plans):
+        s = write_script(plan, "wd", bids_root="/bids", script_stem="proc_sub-X")
+        script = tmp_path / f"proc{i}.sh"
+        script.write_text(s)
+        # bash -n parses without executing: catches quoting/printf mistakes in the
+        # batch-manifest construction.
+        subprocess.run(["bash", "-n", str(script)], check=True)

@@ -2810,13 +2810,80 @@ def preflight_check(
 # ---------------------------------------------------------------------------
 # Shared batch runner
 #
-# ffs_moco and ffs_nwarp both process many datasets per session, so running one
-# process per dataset pays the Python/CUDA/torch.compile startup for every run.
+# ffs_moco, ffs_nwarp, ffs_allineate and ffs_formwarp all process many datasets
+# per session, so one process per dataset pays the Python/CUDA/torch.compile
+# startup for every run.
 # A batch mode amortizes those fixed costs across many self-contained runs in a
 # single process. The collection and loop mechanics are identical between tools;
 # only the parse/validate/dispatch/expected-outputs callbacks differ, so they
 # live here and each CLI supplies the callbacks.
 # ---------------------------------------------------------------------------
+
+
+def add_batch_args(
+    group,
+    *,
+    tool: str,
+    what: str,
+    example: str,
+    skip_note: str,
+) -> None:
+    """Register the canonical ``-batch`` / ``-batch_run`` / ``-batch_skip`` trio.
+
+    Every batchable tool takes the same three flags with the same semantics; only
+    the noun and the example differ, so the help text is generated here rather
+    than re-typed per CLI.
+
+    Parameters
+    ----------
+    group : argparse parser or argument group
+        Where the flags land (normally the tool's Input/Output group).
+    tool : str
+        The command name, e.g. ``"ffs_allineate"``.
+    what : str
+        Plural noun for one unit of work, e.g. ``"affine alignments"``.
+    example : str
+        A representative argument string for one run (no leading tool name).
+    skip_note : str
+        Which flags ``-batch_skip`` derives a job's outputs from, e.g.
+        ``"-prefix / -1Dmatrix_save"``.
+    """
+    group.add_argument(
+        "-batch",
+        default=None,
+        metavar="FILE",
+        help=f"Run many self-contained {what} in one process, amortizing "
+        "Python/CUDA startup and torch.compile warmup. FILE is a manifest with "
+        "one run per line; each line is exactly the arguments you would pass "
+        f"after `{tool}` for that run (e.g. `{example}`). Blank lines and lines "
+        "starting with # are ignored. The device is chosen once for the whole "
+        "batch; a per-line -device is ignored. One failing run is reported and "
+        "skipped without sinking the rest; the batch exits nonzero if any run "
+        "failed.",
+    )
+    group.add_argument(
+        "-batch_run",
+        "-batch-run",
+        dest="batch_run",
+        action="append",
+        metavar="ARGS",
+        help="Inline alternative to -batch for self-contained scripts: one run "
+        f'given as a single quoted argument string (e.g. -batch_run "{example}"), '
+        f"exactly as you would type it after `{tool}`. Repeatable — pass it once "
+        "per run. Same semantics as -batch (device chosen once, failures "
+        "isolated); may be combined with -batch, in which case manifest-file "
+        "runs come first.",
+    )
+    group.add_argument(
+        "-batch_skip",
+        "-batch-skip",
+        dest="batch_skip",
+        action="store_true",
+        help="In a -batch / -batch_run run, skip any job whose requested outputs "
+        f"all already exist on disk (checked from that job's {skip_note}). Lets "
+        "you re-run a manifest and only pay for the jobs that still need work. A "
+        "job missing any one of its outputs is run in full.",
+    )
 
 
 def collect_batch_jobs(

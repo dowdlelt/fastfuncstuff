@@ -205,7 +205,7 @@ def test_reference_levels_get_a_role_ref_qc_copy():
     )
     # xses: reference session has no transform, but appears in the listing.
     assert 'cp -f "stage07.sesmean.ses-01.nii$FMT" "stage08.xses.ses-01.role-ref.nii$FMT"' in s
-    assert '-prefix "stage08.xses.ses-02.nii$FMT"' in s  # the real, aligned one
+    assert '-prefix \\"stage08.xses.ses-02.nii$FMT\\"' in s  # the real, aligned one (batched)
     # xfmap: same for the reference fieldmap group.
     assert 'cp -f "stage04.blip.ses-01.fmap-a_mean.nii$FMT" ' in s
     assert '"stage05.xfmap.ses-01.fmap-a.role-ref.nii$FMT"' in s
@@ -914,15 +914,17 @@ def test_sbref_lane_estimates_transforms_and_keeps_the_mean_lane():
     s = write_script(build_plan(subj, Options(ref_ses="01")), "wd", bids_root="/bids")
 
     # xrun source is the SBRef, not the moco mean; the matrix stays lane-free so
-    # both lanes are resampled by exactly the same file.
-    assert '-source "${SBREF[$k]}"' in s
-    assert '-1Dmatrix_save "${xstem}.aff12.1D"' in s
+    # both lanes are resampled by exactly the same file. (Batched stage: the args
+    # live in a manifest line, so their quotes are backslash-escaped.)
+    assert '-source \\"${SBREF[$k]}\\"' in s
+    assert '-1Dmatrix_save \\"${xstem}.aff12.1D\\"' in s
     assert '-source "${MOCOMEAN[$k]}"' not in s.split("stage07")[0]
 
     # xses is estimated on the SBRef session means...
-    assert '-source "stage07.sesmean.ses-02.src-sbref.nii$FMT"' in s
-    # ...and re-applied to the BOLD-mean one, so both grandmeans exist.
-    assert '-prefix "stage08.xses.ses-02.nii$FMT"' in s
+    assert '-source \\"stage07.sesmean.ses-02.src-sbref.nii$FMT\\"' in s
+    # ...and re-applied to the BOLD-mean one (an ffs_nwarp manifest line), so both
+    # grandmeans exist.
+    assert '-prefix \\"stage08.xses.ses-02.nii$FMT\\"' in s
     assert '-prefix "stage08.grandmean.src-sbref.nii$FMT"' in s
     assert '-prefix "stage08.grandmean.nii$FMT"' in s
 

@@ -17,7 +17,12 @@ import time
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, collect_batch_jobs, run_batch_jobs
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_verbose_arg,
+    collect_batch_jobs,
+    run_batch_jobs,
+)
 from fastfuncstuff.processing.io import derive_mean_output_path, derive_prefixed_output_path
 from fastfuncstuff.processing.nwarpforge import (
     derive_phase_output_path,
@@ -67,41 +72,12 @@ Examples:
         default=None,
         help="Source (magnitude) dataset to warp (3D or 4D NIfTI) [required unless -batch]",
     )
-    io_group.add_argument(
-        "-batch",
-        default=None,
-        metavar="FILE",
-        help="Run many self-contained warp applies in one process, amortizing "
-        "Python/CUDA startup and torch.compile warmup. FILE is a manifest with "
-        "one run per line; each line is exactly the arguments you would pass "
-        "after `ffs_nwarp` for that run (e.g. `-source a.nii -nwarp warp.nii "
-        "-master m.nii -prefix a_w.nii`). Blank lines and lines starting with # "
-        "are ignored. The device is chosen once for the whole batch; a per-line "
-        "-device is ignored. One failing run is reported and skipped without "
-        "sinking the rest; the batch exits nonzero if any run failed.",
-    )
-    io_group.add_argument(
-        "-batch_run",
-        "-batch-run",
-        dest="batch_run",
-        action="append",
-        metavar="ARGS",
-        help="Inline alternative to -batch for self-contained scripts: one run "
-        'given as a single quoted argument string (e.g. -batch_run "-source '
-        'a.nii -nwarp warp.nii -prefix a_w.nii"), exactly as you would type it '
-        "after `ffs_nwarp`. Repeatable — pass it once per run. Same semantics as "
-        "-batch (device chosen once, failures isolated); may be combined with "
-        "-batch, in which case manifest-file runs come first.",
-    )
-    io_group.add_argument(
-        "-batch_skip",
-        "-batch-skip",
-        dest="batch_skip",
-        action="store_true",
-        help="In a -batch / -batch_run run, skip any job whose requested outputs "
-        "all already exist on disk (checked from that job's -prefix / -phase_prefix "
-        "/ -save_mean / -save_first_last). Lets you re-run a manifest and only pay "
-        "for jobs that still need work. A job missing any one output is run in full.",
+    add_batch_args(
+        io_group,
+        tool="ffs_nwarp",
+        what="warp applies",
+        example="-source a.nii -nwarp warp.nii -master m.nii -prefix a_w.nii",
+        skip_note="-prefix / -phase_prefix / -save_mean / -save_first_last",
     )
     io_group.add_argument(
         "-phase",

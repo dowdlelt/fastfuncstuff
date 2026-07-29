@@ -17,6 +17,7 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.cli_utils import (
+    add_batch_args,
     add_verbose_arg,
     collect_batch_jobs,
     parse_prefix,
@@ -140,44 +141,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "multi-echo registration: motion is estimated once and applied to "
         "every echo.",
     )
-    io_group.add_argument(
-        "-batch",
-        default=None,
-        metavar="FILE",
-        help="Run many self-contained motion corrections in one process, "
-        "amortizing Python/CUDA startup and torch.compile warmup. FILE is a "
-        "manifest with one run per line; each line is exactly the arguments "
-        "you would pass after `ffs_moco` for that run (e.g. `-input a.nii "
-        "-base 0 -prefix a_mc.nii -dfile a.1D`). Blank lines and lines "
-        "starting with # are ignored. The device is chosen once for the whole "
-        "batch; a per-line -device is ignored. One failing run is reported and "
-        "skipped without sinking the rest; the batch exits nonzero if any "
-        "run failed.",
-    )
-    io_group.add_argument(
-        "-batch_run",
-        "-batch-run",
-        dest="batch_run",
-        action="append",
-        metavar="ARGS",
-        help="Inline alternative to -batch for self-contained scripts: one run "
-        'given as a single quoted argument string (e.g. -batch_run "-input '
-        'a.nii -base 0 -prefix a_mc.nii -dfile a.1D"), exactly as you would '
-        "type it after `ffs_moco`. Repeatable — pass it once per run. Same "
-        "semantics as -batch (device chosen once, failures isolated); may be "
-        "combined with -batch, in which case manifest-file runs come first.",
-    )
-    io_group.add_argument(
-        "-batch_skip",
-        "-batch-skip",
-        dest="batch_skip",
-        action="store_true",
-        help="In a -batch / -batch_run run, skip any job whose requested outputs "
-        "all already exist on disk (checked from that job's -prefix / -save_mean / "
-        "-1Dfile / -1Dmatrix_save / -dfile / -maxdisp1D / -iterfile / QC flags). "
-        "Lets you re-run a manifest after adding an output to a few jobs and only "
-        "pay for the jobs that actually still need work. A job missing any one of "
-        "its outputs is run in full.",
+    add_batch_args(
+        io_group,
+        tool="ffs_moco",
+        what="motion corrections",
+        example="-input a.nii -base 0 -prefix a_mc.nii -dfile a.1D",
+        skip_note="-prefix / -save_mean / -1Dfile / -1Dmatrix_save / -dfile / "
+        "-maxdisp1D / -iterfile / QC flags",
     )
     io_group.add_argument(
         "-reg_echo",

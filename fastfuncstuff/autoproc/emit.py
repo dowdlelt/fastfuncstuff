@@ -144,6 +144,32 @@ def _ffs(tool: str, parts: list[str], indent: str = "  ") -> str:
     return " \\\n".join(lines)
 
 
+def _manifest_line(var: str, parts: list[str], indent: str = "  ") -> str:
+    """A ``printf`` that appends one run's arguments to the batch manifest ``$var``.
+
+    ``parts`` are the same per-flag tokens :func:`_ffs` takes, so a batched stage
+    and a solo call are written from one list. The inner double quotes are escaped
+    because the whole line is emitted inside a double-quoted printf argument —
+    paths still expand ($FMT, ${FRAG[$k]}) but stay quoted for the tool."""
+    flat = " ".join(p for p in parts if p).replace('"', '\\"')
+    return f'{indent}printf \'%s\\n\' "{flat}" >> "${var}"'
+
+
+def _batch_launch(tool: str, var: str, skip_var: str, indent: str = "") -> str:
+    """One batched launch of ``tool`` over the manifest in ``$var``.
+
+    Empty manifest → no call (the tools exit(1) on an empty -batch, and a stage
+    can legitimately have nothing to do: single session, or every run its own
+    anchor). ``skip_var`` is the stage's skip toggle, passed through as
+    -batch_skip so a re-run only pays for jobs that are still missing outputs."""
+    return (
+        f'{indent}if [ -s "${var}" ]; then\n'
+        f'{indent}  batch_skip=(); [ "${skip_var}" -eq 1 ] && batch_skip=(-batch_skip)\n'
+        f'{indent}  {tool} -batch "${var}" "${{batch_skip[@]}}" -device "$DEVICE"\n'
+        f"{indent}fi"
+    )
+
+
 def _anat_lin_files(opt) -> list[str]:
     """The anat-matrix link(s) at the chain head, per reference mode:
     * explicit ref_file → the user's ``-ref_transforms`` (nwarp order), if any;
@@ -857,7 +883,7 @@ def _stage_blip(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
-def _stage_xfmap(plan: Plan) -> str:
+def _stage_xfmap(plan: Plan, script_stem: str) -> str:
     """Align each NON-reference fmap group's undistorted mean to the session's
     reference fmap mean (once per group). This is what lets runs acquired under
     different fieldmaps share one session space; the per-run runmean composes it
@@ -884,37 +910,46 @@ def _stage_xfmap(plan: Plan) -> str:
                 f"QC: fmap-{anchor.fmap.fmap_id} is the reference group — no transform.",
             )
         )
+    # Batched like stage06/stage08: manifests first, then one process each.
+    if groups:
+        out.append(f'albatch="{script_stem}_xfmapbatch.txt"; : > "$albatch"')
+        if opt.xfmap_nonlin:
+            out.append(f'fwbatch="{script_stem}_xfmapnlbatch.txt"; : > "$fwbatch"')
     for pr in groups.values():
         xstem = _fmap_stem(pr, "xfmap")
         src = _fmap_stem(pr, "blip") + "_mean.nii$FMT"  # this fmap, undistorted
         base = _ref_blip_mean(pr)  # reference fmap, undistorted
-        lin = _ffs(
-            "ffs_allineate",
-            [
-                f'-base "{base}"',
-                f'-source "{src}"',
-                f'-prefix "{xstem}.nii$FMT"',
-                f'-1Dmatrix_save "{xstem}.aff12.1D"',
-                *_split_flags(config.DEFAULT_OPTS["xfmap"]),
-                '-device "$DEVICE"',
-            ],
+        out.append(
+            _manifest_line(
+                "albatch",
+                [
+                    f'-base "{base}"',
+                    f'-source "{src}"',
+                    f'-prefix "{xstem}.nii$FMT"',
+                    f'-1Dmatrix_save "{xstem}.aff12.1D"',
+                    *_split_flags(config.DEFAULT_OPTS["xfmap"]),
+                ],
+                indent="",
+            )
         )
-        out.append(f'if [ "$skip_xfmap" -ne 1 ] || [ ! -f "{xstem}.aff12.1D" ]; then\n{lin}')
         if opt.xfmap_nonlin:
             out.append(
-                _ffs(
-                    "ffs_formwarp",
+                _manifest_line(
+                    "fwbatch",
                     [
                         f'-base "{base}"',
                         f'-source "{xstem}.nii$FMT"',
                         f'-prefix "{xstem}_nl.nii$FMT"',
                         "-save_warp",
                         *_split_flags(config.DEFAULT_OPTS["xfmap_nl"]),
-                        '-device "$DEVICE"',
                     ],
+                    indent="",
                 )
             )
-        out.append("fi")
+    if groups:
+        out.append(_batch_launch("ffs_allineate", "albatch", "skip_xfmap"))
+        if opt.xfmap_nonlin:
+            out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xfmap"))
     if want_fmapmean:
         # -anat_source mean_fmap: every group's mean is now on the reference-fmap
         # grid, so averaging them is a straight voxelwise mean (more SNR than any
@@ -932,42 +967,44 @@ def _stage_xfmap(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
-def _stage_xrun(plan: Plan) -> str:
+def _stage_xrun(plan: Plan, script_stem: str) -> str:
     opt = plan.options
     primary = _primary_lane(plan)
     src_var = _run_level_var(primary)
-    nl = ""
+    albatch = f"{script_stem}_xrunbatch.txt"
+    fwbatch = f"{script_stem}_xrunnlbatch.txt"
+    nl_append = ""
+    nl_launch = ""
     if opt.xrun_nonlin:
         # Residual nonlinear refinement of the linear-aligned image → distinct
         # `_nl` output (never overwrite the linear source). The warp is a chain
         # link shared by BOTH lanes, so it keeps the lane-free stem (naming.py).
-        fw = _ffs(
-            "ffs_formwarp",
-            [
-                '-base "$base"',
-                '-source "${xstem}${LANE}.nii$FMT"',
-                '-prefix "${xstem}_nl.nii$FMT"',
-                "-save_warp",
-                *_split_flags(config.DEFAULT_OPTS["xrun_nl"]),
-                '-device "$DEVICE"',
-            ],
-            indent="    ",
+        nl_append = (
+            _manifest_line(
+                "fwbatch",
+                [
+                    '-base "$base"',
+                    '-source "${xstem}${LANE}.nii$FMT"',
+                    '-prefix "${xstem}_nl.nii$FMT"',
+                    "-save_warp",
+                    *_split_flags(config.DEFAULT_OPTS["xrun_nl"]),
+                ],
+            )
+            + "\n"
         )
-        nl = f'  if [ ! -f "${{xstem}}_nl_WARP.nii$FMT" ]; then\n{fw}\n  fi\n'
+        nl_launch = "\n" + _batch_launch("ffs_formwarp", "fwbatch", "skip_xrun")
     # The aligned images the pyramid actually consumes are stage07's runmeans
     # (both lanes, one shared matrix); these -prefix outputs are alignment QC, so
     # they carry the lane that produced them. The matrix never does.
-    lin = _ffs(
-        "ffs_allineate",
+    lin_append = _manifest_line(
+        "albatch",
         [
             '-base "$base"',
             f'-source "{src_var}"',
             '-prefix "${xstem}${LANE}.nii$FMT"',
             '-1Dmatrix_save "${xstem}.aff12.1D"',
             *_split_flags(config.DEFAULT_OPTS["xrun"]),
-            '-device "$DEVICE"',
         ],
-        indent="    ",
     )
     # No-fmap mode: the session's first run IS the anchor, so it gets no xrun output.
     # Emit its lane image under the xrun name so the listing covers every run.
@@ -1000,16 +1037,22 @@ def _stage_xrun(plan: Plan) -> str:
 # ============================ stage06: cross-run alignment ==================
 # Align each run to its anchor (fmap group forward image, or the session's first
 # run when there are no fmaps). Saves a matrix that composes into the chain.
+# Batched: the loop only WRITES the manifests, then ONE ffs_allineate (and one
+# ffs_formwarp) process does every run — Python/CUDA/torch.compile startup is
+# paid once instead of once per run. The nonlinear batch runs after the linear
+# one because its source is that run's linear output.
+# skip_xrun=1 → -batch_skip (skip runs whose outputs already exist).
 {lane_note}echo '== stage06: cross-run alignment =='
 LANE="{f".src-{_src(primary)}" if _src(primary) else ""}"   # lineage tag on the QC images
+albatch="{albatch}"; : > "$albatch"
+fwbatch="{fwbatch}"; : > "$fwbatch"
 {marker_block}for k in "${{RUN_KEYS[@]}}"; do
   base="${{XRUNBASE[$k]:-}}"
   [ -z "$base" ] && continue   # this run is the anchor (identity) — no xrun
   xstem="stage06.xrun.${{FRAG[$k]}}"
-  if [ "$skip_xrun" -ne 1 ] || [ ! -f "${{xstem}}.aff12.1D" ]; then
-{lin}
-  fi
-{nl}done
+{lin_append}
+{nl_append}done
+{_batch_launch("ffs_allineate", "albatch", "skip_xrun")}{nl_launch}
 """
 
 
@@ -1092,7 +1135,7 @@ def _xses_aligned(
     return stem(NameKey("xses", session=session, src=_src(lane))) + ".nii$FMT"
 
 
-def _stage_xses(plan: Plan) -> str:
+def _stage_xses(plan: Plan, script_stem: str) -> str:
     """stage08: bring every session into the reference session's space, then build
     THE grandmean from the result.
 
@@ -1137,38 +1180,50 @@ def _stage_xses(plan: Plan) -> str:
                     "shown for completeness.",
                 )
             )
-    for s in sessions:
-        if s == ref:
-            continue
+    # Same batching as stage06: the per-session manifests are written first, then
+    # ONE ffs_allineate (and one ffs_formwarp) process handles every session.
+    nonref = [s for s in sessions if s != ref]
+    if nonref:
+        out.append(f'albatch="{script_stem}_xsesbatch.txt"; : > "$albatch"')
+        if opt.xses_nonlin:
+            out.append(f'fwbatch="{script_stem}_xsesnlbatch.txt"; : > "$fwbatch"')
+    for s in nonref:
         xstem = stem(NameKey("xses", session=s))
-        lin = _ffs(
-            "ffs_allineate",
-            [
-                '-base "$REFGM"',
-                f'-source "{_sesmean(s, primary)}"',
-                f'-prefix "{xstem}{lane_tag}.nii$FMT"',
-                f'-1Dmatrix_save "{xstem}.aff12.1D"',
-                *_split_flags(config.DEFAULT_OPTS["xses"]),
-                '-device "$DEVICE"',
-            ],
+        out.append(
+            _manifest_line(
+                "albatch",
+                [
+                    '-base "$REFGM"',
+                    f'-source "{_sesmean(s, primary)}"',
+                    f'-prefix "{xstem}{lane_tag}.nii$FMT"',
+                    f'-1Dmatrix_save "{xstem}.aff12.1D"',
+                    *_split_flags(config.DEFAULT_OPTS["xses"]),
+                ],
+                indent="",
+            )
         )
-        out.append(f'if [ "$skip_xses" -ne 1 ] || [ ! -f "{xstem}.aff12.1D" ]; then\n{lin}')
         if opt.xses_nonlin:
             # Distinct `_nl` output — don't overwrite the linear-aligned source.
             out.append(
-                _ffs(
-                    "ffs_formwarp",
+                _manifest_line(
+                    "fwbatch",
                     [
                         '-base "$REFGM"',
                         f'-source "{xstem}{lane_tag}.nii$FMT"',
                         f'-prefix "{xstem}_nl.nii$FMT"',
                         "-save_warp",
                         *_split_flags(config.DEFAULT_OPTS["xses_nl"]),
-                        '-device "$DEVICE"',
                     ],
+                    indent="",
                 )
             )
-        out.append("fi")
+    if nonref:
+        out.append(_batch_launch("ffs_allineate", "albatch", "skip_xses"))
+        if opt.xses_nonlin:
+            out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xses"))
+    lane_lines: list[str] = []
+    for s in nonref:
+        xstem = stem(NameKey("xses", session=s))
         for lane in _lanes(plan):
             dst = _xses_aligned(s, opt.xses_nonlin, lane, primary)
             aligned_by_lane[lane].append(dst)
@@ -1179,20 +1234,23 @@ def _stage_xses(plan: Plan) -> str:
             xchain = " ".join(
                 ([f"{xstem}_nl_WARP.nii$FMT"] if opt.xses_nonlin else []) + [f"{xstem}.aff12.1D"]
             )
-            out.append(
-                f'[ -f "{dst}" ] || \\\n'
-                + _ffs(
-                    "ffs_nwarp",
+            lane_lines.append(
+                _manifest_line(
+                    "nwbatch",
                     [
                         f'-source "{_sesmean(s, lane)}"',
                         f'-nwarp "{xchain}"',
                         '-master "$REFGM"',
                         *_split_flags(config.DEFAULT_OPTS["nwarp"]),
                         f'-prefix "{dst}"',
-                        '-device "$DEVICE"',
                     ],
+                    indent="",
                 )
             )
+    if lane_lines:
+        out.append(f'nwbatch="{script_stem}_xseslanebatch.txt"; : > "$nwbatch"')
+        out += lane_lines
+        out.append(_batch_launch("ffs_nwarp", "nwbatch", "skip_xses"))
 
     # THE grandmean = mean of the reference session's mean + every cross-session-
     # aligned non-ref session mean (all now in reference-session space). This is the
@@ -1818,9 +1876,10 @@ def write_script(
     """Assemble the full pipeline script text for ``plan``.
 
     ``script_stem`` is the basename (no extension) of the script being written;
-    the batched moco / final stages name their manifest files after it
-    (``{script_stem}_mocobatch.txt`` / ``_nwarpbatch.txt``) so they sit beside
-    the script's outputs and don't collide across sibling subjects."""
+    every batched stage names its manifest file after it (``_mocobatch.txt``,
+    ``_xrunbatch.txt`` / ``_xrunnlbatch.txt``, ``_xsesbatch.txt`` /
+    ``_xsesnlbatch.txt``, ``_nwarpbatch.txt``) so they sit beside the script's
+    outputs and don't collide across sibling subjects."""
     parts = [
         _header(plan, out_dir),
         _data_arrays(plan),
@@ -1831,10 +1890,10 @@ def write_script(
         _stage_moco(plan, script_stem),
         _stage_locomoco(plan),
         _stage_blip(plan),
-        _stage_xfmap(plan),
-        _stage_xrun(plan),
+        _stage_xfmap(plan, script_stem),
+        _stage_xrun(plan, script_stem),
         _stage_grandmean(plan),
-        _stage_xses(plan),
+        _stage_xses(plan, script_stem),
         _stage_xref(plan),
         _stage_anat(plan),
         _stage_warpmaster(plan),

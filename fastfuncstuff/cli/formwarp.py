@@ -21,13 +21,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_verbose_arg,
+    collect_batch_jobs,
+    parse_prefix,
+    run_batch_jobs,
+    spinner,
+)
 from fastfuncstuff.processing.formwarp import (
     METRICS,
     NO_X_DISP,
@@ -59,9 +67,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # I/O
-    p.add_argument("-base", required=True, help="Fixed/target image (3D).")
-    p.add_argument("-source", required=True, help="Moving image to deform (3D).")
-    p.add_argument("-prefix", required=True, help="Output path for the warped image.")
+    p.add_argument("-base", default=None, help="Fixed/target image (3D) [required unless -batch].")
+    p.add_argument(
+        "-source", default=None, help="Moving image to deform (3D) [required unless -batch]."
+    )
+    p.add_argument(
+        "-prefix", default=None, help="Output path for the warped image [required unless -batch]."
+    )
+    add_batch_args(
+        p,
+        tool="ffs_formwarp",
+        what="SyN registrations",
+        example="-base fixed.nii -source moving.nii -prefix out.nii -save_warp",
+        skip_note="-prefix / -save_warp / -save_inverse / -save_halfway",
+    )
     p.add_argument(
         "-save_warp",
         action="store_true",
@@ -206,21 +225,93 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _select_device(args: argparse.Namespace) -> torch.device:
+    """Honour ``-device`` if given, else CUDA > MPS > CPU."""
+    if args.device is not None:
+        return torch.device(args.device)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if args.verb >= 1:
+        print("WARNING: no GPU available, running on CPU")
+    return torch.device("cpu")
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    The warp files are named off the parsed prefix, matching ``_dispatch_run``.
+    A timeseries run with ``-warp_format folder`` writes directories under these
+    stems rather than files, so such a job is simply never skipped — safe."""
+    pfx = parse_prefix(args.prefix)
+    prefix, ext = pfx.stem, pfx.nifti_ext
+    outs: list[str] = [pfx.as_file()]
+    if args.save_warp:
+        outs.append(f"{prefix}_WARP{ext}")
+    if args.save_inverse:
+        outs.append(f"{prefix}_WARPINV{ext}")
+    if args.save_halfway:
+        outs += [
+            f"{prefix}_HALF_mid2fixed{ext}",
+            f"{prefix}_HALF_mid2moving{ext}",
+            f"{prefix}_HALF_fixed2mid{ext}",
+            f"{prefix}_HALF_moving2mid{ext}",
+        ]
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -base/-source/-prefix."""
+    missing = [f for f in ("base", "source", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
+def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
+    """Batch adapter: turn a nonzero return (a grid mismatch, say) into an
+    exception so the shared runner records the job as failed."""
+    rc = _dispatch_run(run_args, device)
+    if rc != 0:
+        raise ValueError(f"run failed (exit {rc})")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
-    # Select device (prefer CUDA > MPS > CPU), honouring -device end to end.
-    if args.device is not None:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-        if args.verb >= 1:
-            print("WARNING: no GPU available, running on CPU")
+    if args.batch is not None or args.batch_run:
+        # One process, many registrations: SyN's fixed costs (CUDA context,
+        # torch.compile warmup) are paid once instead of per pair.
+        run_batch_jobs(
+            tool="ffs_formwarp",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=_select_device(args),
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_batch_dispatch,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return 0
 
+    missing = [f for f in ("base", "source", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "ERROR: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS)."
+        )
+        return 1
+
+    return _dispatch_run(args, _select_device(args))
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
+    """Register one self-contained base/source pair (the entire per-pair body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     if args.verb >= 1:
         print(f"ffs_formwarp: device={device}")
 
