@@ -137,6 +137,22 @@ def test_multi_session_xses_and_ref_drop():
     assert ch2.index("xses_nl") < ch2.index("xses_lin")  # nl before lin
 
 
+def test_anat_nl_acts_after_xses():
+    """The segment invwarp is estimated on the grandmean = REFERENCE-session
+    space, so it must act on data xses has already brought there. In the
+    leftmost-acts-first chain that means anat_nl is listed above xses_*."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1")]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    plan = build_plan(subj, Options(ref_ses="01", xses_nonlin=True, anat_nonlin=True))
+    ch = _chain(plan, ("02", "foo", "1"))
+    assert ch.index("anat_lin") < ch.index("anat_nl") < ch.index("xses_nl")
+
+
 def test_mean_levels_are_named_for_what_they_average():
     """runmean (one run) → sesmean (one session) → grandmean (everything). The
     grandmean is stage08 because it cannot exist before xses has aligned the

@@ -9,14 +9,18 @@ tokens into filenames.
 Warp-chain token order (output/anat space → native source; the same order
 ``ffs_nwarp -nwarp`` consumes, leftmost acting first on the output coordinate)::
 
-    anat_lin  xref_nl xref_lin  xses_nl xses_lin  anat_nl  xfmap_nl xfmap_lin
+    anat_lin  xref_nl xref_lin  anat_nl  xses_nl xses_lin  xfmap_nl xfmap_lin
         blip_half  wxrun_nl wxrun_lin  locomoco  moco
 
 Verified against both reference ffs scripts and the AFNI final-apply block:
   * own-anat, single session (floc):   anat_lin  anat_nl  blip_half  wxrun*  ...
   * grand-reference (primary→floc):    anat_lin(borrowed)  xref_lin  anat_nl  blip_half  wxrun*  ...
 ``anat_nl`` (an ffs_segment invwarp computed on the *current* data) sits just
-before the fieldmap block in both. The per-level lin/nl order is deliberately
+below the anat/xref block in both. It is estimated on the *grandmean* — which
+lives in the reference session's space — so it must act on data that xses has
+already brought there; listing it above ``xses_*`` is what does that (bug of
+record: multi-session runs had it acting in session-native space). The
+per-level lin/nl order is deliberately
 *not* uniform (anat is lin-then-nl; the cross-* levels are nl-then-lin) — it
 mirrors how each tool stores its warp, and matches the reference scripts.
 """
@@ -119,9 +123,12 @@ _CHAIN_ORDER = (
     "anat_lin",
     "xref_nl",
     "xref_lin",
+    # anat_nl is estimated on the grandmean (reference-session space), so the
+    # data must already be there when it acts — i.e. AFTER xses, which in this
+    # leftmost-acts-first order means it is listed BEFORE the xses tokens.
+    "anat_nl",
     "xses_nl",
     "xses_lin",
-    "anat_nl",
     "xfmap_nl",
     "xfmap_lin",
     "blip_half",
