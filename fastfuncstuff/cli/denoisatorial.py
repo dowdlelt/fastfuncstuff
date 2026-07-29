@@ -304,6 +304,34 @@ Notes:
         "Much faster (k+1 combos instead of 2^k).",
     )
     combo_opts.add_argument(
+        "-criterion",
+        choices=["within_run", "cross_run"],
+        default="within_run",
+        help="How a candidate PC set is scored. 'within_run' (default) holds the "
+        "training betas fixed and asks how well they explain what is left of the "
+        "held-out run after removal. 'cross_run' matches how the denoising is "
+        "actually used: the run's PCs are removed while that run contributes to "
+        "the betas, and those betas are scored on the OTHER runs, which are never "
+        "cleaned. Because the scored target never changes with the candidate, "
+        "SS_tot is fixed and a candidate can only win by producing better betas — "
+        "the mechanical CoD gain from removing variance is gone. Also puts N-1 "
+        "runs of evidence behind each decision instead of one. Needs >= 3 runs "
+        "and costs more.",
+    )
+    combo_opts.add_argument(
+        "-whole_brain_noise_pool",
+        "-whole-brain-noise-pool",
+        dest="whole_brain_noise_pool",
+        action="store_true",
+        help="Extract noise PCs from every in-brain voxel instead of the low-R2 "
+        "noise pool. Task-dominated components are not a safety problem — removing "
+        "one strips the variance the betas exist to predict, so the criterion "
+        "rejects it — but they do crowd the top of the variance ordering, so raise "
+        "-max_pcs alongside this. The criteria pool is unaffected, and a -compare "
+        "GLMdenoise baseline keeps its own noise-pool PCs so the comparison stays "
+        "fair.",
+    )
+    combo_opts.add_argument(
         "-null_surrogates",
         "-null-surrogates",
         dest="null_surrogates",
@@ -950,6 +978,9 @@ def main():
     if args.null_surrogates < 0:
         print("ERROR: -null_surrogates must be >= 0")
         sys.exit(1)
+    if args.criterion == "cross_run" and len(parse_input_files(args.input)) < 3:
+        print("ERROR: -criterion cross_run needs at least 3 runs")
+        sys.exit(1)
     if args.null_surrogates > 0 and not args.singleton_only:
         print("ERROR: -null_surrogates requires -singleton_only")
         sys.exit(1)
@@ -1331,6 +1362,22 @@ def main():
     print(f"  Noise pool: {n_noise:,} voxels")
     print(f"  Criteria: {n_criteria:,} voxels")
 
+    # -whole_brain_noise_pool widens where PCs are *extracted* from without
+    # touching the criteria pool they are scored on. Task-dominated components
+    # are not a safety problem here — removing one strips the variance the
+    # betas exist to predict, so the criterion rejects it — they just crowd the
+    # top of the variance ordering and push real artifacts past max_pcs.
+    pc_source_mask = noise_pool_mask
+    if args.whole_brain_noise_pool:
+        pc_source_mask = (
+            brainthresh_mask.to(noise_pool_mask.device)
+            if brainthresh_mask is not None
+            else torch.ones_like(noise_pool_mask)
+        )
+        print(
+            f"  PC source: whole brain ({int(pc_source_mask.sum()):,} voxels) — not the noise pool"
+        )
+
     # ======================================================================
     # Step 3: Run combinatorial denoising
     # ======================================================================
@@ -1345,13 +1392,14 @@ def main():
         run_starts=run_starts,
         tr=args.tr,
         nuisance_per_run=nuisance_per_run,
-        noise_pool_mask=noise_pool_mask,
+        noise_pool_mask=pc_source_mask,
         initial_r2=initial_r2,
         max_pcs=args.max_pcs,
         criteria_r2_threshold=args.criteria_r2_threshold,
         criteria_fallback_percentile=args.criteria_fallback_pct,
         selection_strategy=args.selection_strategy,
         singleton_only=args.singleton_only,
+        criterion=args.criterion,
         n_null_surrogates=args.null_surrogates,
         null_percentile=args.null_percentile,
         null_seed=args.null_seed,
@@ -1417,6 +1465,7 @@ def main():
     baseline_r2_t: torch.Tensor | None = None
     delta_r2_t: torch.Tensor | None = None
     baseline_k: int | None = None
+    baseline_pcs_per_run = results.noise_pcs_per_run
     if args.compare:
         print()
         print("=" * 70)
@@ -1425,10 +1474,33 @@ def main():
 
         from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
 
+        # GLMdenoise is defined on a noise pool. Handing it whole-brain PCs
+        # because -whole_brain_noise_pool happened to be set would compare our
+        # change against a straw man, so the baseline always gets its own
+        # classic-pool PCs.
+        if args.whole_brain_noise_pool:
+            from fastfuncstuff.denoise.combinatorial import (
+                extract_pcs_single_run_with_variance,
+            )
+
+            print("  Re-extracting noise-pool PCs for the baseline (not whole-brain)")
+            baseline_pcs_per_run = []
+            for run_idx in range(n_runs):
+                r_start = run_starts[run_idx]
+                r_end = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
+                run_pcs, _ = extract_pcs_single_run_with_variance(
+                    run_data=data[:, r_start:r_end],
+                    noise_pool_mask=noise_pool_mask,
+                    nuisance=nuisance_per_run[run_idx],
+                    max_components=args.max_pcs,
+                    device=device,
+                )
+                baseline_pcs_per_run.append(run_pcs.cpu())
+
         r2_maps_inc, r2_summary_inc = cross_validate_noise_pcs(
             data=data,
             design_matrix=task_design,
-            noise_pcs=results.noise_pcs_per_run,
+            noise_pcs=baseline_pcs_per_run,
             run_starts=run_starts,
             tr=args.tr,
             max_components=args.max_pcs,
@@ -1650,12 +1722,12 @@ def main():
         train_selections = [r.optimal_combination for r in results.per_run_results]
         print(f"  Per-run PCs in the fit: {[list(s) for s in train_selections]}")
 
-        def _run_heldout(train_sel):
+        def _run_heldout(train_sel, train_pcs=None):
             r2 = heldout_prediction_r2(
                 train_data=data,
                 train_run_starts=run_starts,
                 train_nuisance_per_run=nuisance_per_run,
-                train_pcs_per_run=results.noise_pcs_per_run,
+                train_pcs_per_run=(results.noise_pcs_per_run if train_pcs is None else train_pcs),
                 train_selections=train_sel,
                 test_data=test_data,
                 test_run_starts=test_run_starts,
@@ -1702,7 +1774,9 @@ def main():
             # baseline_k variance-ordered PCs in every run, predict the same
             # held-out data.
             gd_sel = tuple(range(baseline_k))
-            heldout_gd = _run_heldout([gd_sel for _ in train_selections])
+            heldout_gd = _run_heldout(
+                [gd_sel for _ in train_selections], train_pcs=baseline_pcs_per_run
+            )
             heldout_delta = heldout_r2 - heldout_gd
             heldout_maps["heldout_r2_glmdenoise"] = heldout_gd
             heldout_maps["heldout_r2_delta"] = heldout_delta
@@ -1763,10 +1837,12 @@ def main():
                     "initial": [() for _ in train_selections],
                     "denoised": list(train_selections),
                 }
+                curve_arm_pcs: dict[str, list[torch.Tensor]] = {}
                 if args.compare and baseline_k is not None:
-                    curve_arms[f"glmdenoise (k={baseline_k})"] = [
-                        tuple(range(baseline_k)) for _ in train_selections
-                    ]
+                    gd_name = f"glmdenoise (k={baseline_k})"
+                    curve_arms[gd_name] = [tuple(range(baseline_k)) for _ in train_selections]
+                    # Keeps its noise-pool PCs under -whole_brain_noise_pool.
+                    curve_arm_pcs[gd_name] = baseline_pcs_per_run
 
                 curve = heldout_learning_curve(
                     train_data=data,
@@ -1774,6 +1850,7 @@ def main():
                     train_nuisance_per_run=nuisance_per_run,
                     train_pcs_per_run=results.noise_pcs_per_run,
                     arms=curve_arms,
+                    arm_pcs_per_run=curve_arm_pcs,
                     test_data=test_data,
                     test_run_starts=test_run_starts,
                     test_nuisance_per_run=test_nuisance_per_run,

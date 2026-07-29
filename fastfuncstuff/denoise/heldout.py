@@ -46,6 +46,13 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from fastfuncstuff.glm.moments import (
+    RunMoments,
+    compute_run_moments,
+    run_bounds,
+    solve_from_moments,
+)
+
 __all__ = ["heldout_prediction_r2", "heldout_learning_curve", "plot_heldout_learning_curve"]
 
 
@@ -61,11 +68,6 @@ def _augmented_nuisance(
     return torch.cat([base_nuisance, selected], dim=1)
 
 
-def _run_bounds(run_starts: list[int], n_timepoints: int, run_idx: int) -> tuple[int, int]:
-    end = run_starts[run_idx + 1] if run_idx < len(run_starts) - 1 else n_timepoints
-    return run_starts[run_idx], end
-
-
 def _subset_time_indices(
     run_starts: list[int], n_timepoints: int, runs: list[int]
 ) -> tuple[list[int], list[int]]:
@@ -74,7 +76,7 @@ def _subset_time_indices(
     local_starts: list[int] = []
     for r in runs:
         local_starts.append(len(time_indices))
-        start, end = _run_bounds(run_starts, n_timepoints, r)
+        start, end = run_bounds(run_starts, n_timepoints, r)
         time_indices.extend(range(start, end))
     return time_indices, local_starts
 
@@ -191,10 +193,10 @@ def heldout_prediction_r2(
             else train_designs_by_hrf[_target_hrf_index(target, hrf_indices)]
         )
         assert design is not None
-        moments = _train_moments(
-            train_data=train_data,
-            train_run_starts=train_run_starts,
-            train_nuisance=train_nuisance,
+        moments = compute_run_moments(
+            data=train_data,
+            run_starts=train_run_starts,
+            nuisance_per_run=train_nuisance,
             design=design,
             voxel_mask=target.voxel_mask,
             device=device,
@@ -260,72 +262,8 @@ def _prepare_test_targets(
     return [_one(test_data, test_design, None)]
 
 
-class _TrainMoments(NamedTuple):
-    """Per-run OLS sufficient statistics for one arm and one voxel group.
-
-    Because the nuisance projection is *per run*, both normal-equation terms
-    are sums over runs::
-
-        X'X = Σ_r Xr'Xr        X'y = Σ_r Xr'yr
-
-    so a subset fit is a sum of precomputed blocks plus one small solve — no
-    re-projection, no re-slicing of the training data, and no per-subset
-    host↔device copy of anything voxel-sized. This is what makes the learning
-    curve cost O(runs) projections instead of O(k × subsets × arms).
-    """
-
-    xtx: list[torch.Tensor]  # per run, (C, C) float64 on the compute device
-    xty: list[torch.Tensor]  # per run, (C, V_g) on the storage device
-
-
-def _train_moments(
-    train_data: torch.Tensor,
-    train_run_starts: list[int],
-    train_nuisance: list[torch.Tensor],
-    design: torch.Tensor,
-    voxel_mask: torch.Tensor | None,
-    device: torch.device,
-    store_device: torch.device,
-    chunk_size: int = 20000,
-) -> _TrainMoments:
-    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
-
-    n_timepoints = train_data.shape[1]
-    n_cols = design.shape[1]
-    xtx_per_run: list[torch.Tensor] = []
-    xty_per_run: list[torch.Tensor] = []
-
-    for run_idx in range(len(train_run_starts)):
-        start, end = _run_bounds(train_run_starts, n_timepoints, run_idx)
-        run_data = train_data[:, start:end]
-        if voxel_mask is not None:
-            run_data = run_data[voxel_mask, :]
-
-        # Single-run call: reuses the canonical projector, including its
-        # zero-column handling for runs whose nuisance is partly padding.
-        data_proj, design_proj = project_out_nuisance_per_run(
-            data=run_data,
-            design=design[start:end, :],
-            nuisance_per_run=[train_nuisance[run_idx]],
-            run_starts=[0],
-            device=device,
-        )
-        X = design_proj.to(device)
-        xtx_per_run.append(X.T.double() @ X.double())
-
-        n_vox = data_proj.shape[0]
-        xty = torch.zeros(n_cols, n_vox, device=store_device, dtype=X.dtype)
-        for cs in range(0, n_vox, chunk_size):
-            ce = min(cs + chunk_size, n_vox)
-            xty[:, cs:ce] = (X.T @ data_proj[cs:ce, :].to(device).T).to(store_device)
-        xty_per_run.append(xty)
-        del data_proj, design_proj, X
-
-    return _TrainMoments(xtx_per_run, xty_per_run)
-
-
 def _solve_and_score(
-    moments: _TrainMoments,
+    moments: RunMoments,
     target: _TestTarget,
     runs: list[int],
     device: torch.device,
@@ -334,16 +272,12 @@ def _solve_and_score(
     """Betas from the summed moments of *runs*, scored against the held-out side."""
     from fastfuncstuff.glm.xval import compute_r2_metric
 
-    xtx = torch.stack([moments.xtx[r] for r in runs], dim=0).sum(dim=0)
-    xty = moments.xty[runs[0]].clone()
-    for r in runs[1:]:
-        xty += moments.xty[r]
-
-    # The same 1e-6 ridge the combinatorial fit uses: at small k a subset design
-    # can be genuinely rank-deficient for a condition no run in the subset saw.
-    n_cols = xtx.shape[0]
-    xtx = xtx + 1e-6 * torch.eye(n_cols, device=device, dtype=xtx.dtype)
-    betas = torch.linalg.solve(xtx, xty.to(device).double()).to(target.design_proj.dtype)
+    betas = solve_from_moments(
+        [moments.xtx[r] for r in runs],
+        [moments.xty[r] for r in runs],
+        device=device,
+        out_dtype=target.design_proj.dtype,
+    )
 
     n_vox = betas.shape[1]
     r2 = torch.zeros(n_vox)
@@ -396,6 +330,7 @@ def heldout_learning_curve(
     train_designs_by_hrf: dict[int, torch.Tensor] | None = None,
     test_designs_by_hrf: dict[int, torch.Tensor] | None = None,
     hrf_indices: torch.Tensor | None = None,
+    arm_pcs_per_run: dict[str, list[torch.Tensor]] | None = None,
     subset_sizes: list[int] | None = None,
     max_subsets: int = 8,
     seed: int = 0,
@@ -418,6 +353,9 @@ def heldout_learning_curve(
         Named per-run PC selections to compare, e.g.
         ``{"denoised": sel, "initial": [()] * n_runs}``. Each list is indexed
         by *global* run index; subsetting picks the entries it needs.
+    arm_pcs_per_run : dict, optional
+        Per-arm override of ``train_pcs_per_run``, keyed by arm name. Arms not
+        listed use the shared PCs.
     subset_sizes : list of int, optional
         Which k to evaluate. Defaults to every k from 1 to n_train_runs.
     max_subsets : int, default=8
@@ -516,8 +454,16 @@ def heldout_learning_curve(
     )
 
     for name, selections in arms.items():
+        # An arm may carry its own PCs: a GLMdenoise reference must keep its
+        # noise-pool components even when the arm under test used a different
+        # source, or the comparison is against a straw man.
+        pcs_for_arm = (
+            train_pcs_per_run
+            if arm_pcs_per_run is None or name not in arm_pcs_per_run
+            else arm_pcs_per_run[name]
+        )
         arm_nuisance = [
-            _augmented_nuisance(train_nuisance_per_run[r], train_pcs_per_run[r], selections[r])
+            _augmented_nuisance(train_nuisance_per_run[r], pcs_for_arm[r], selections[r])
             for r in range(n_train_runs)
         ]
         for target in targets:
@@ -527,10 +473,10 @@ def heldout_learning_curve(
                 else train_designs_by_hrf[_target_hrf_index(target, hrf_indices)]
             )
             assert design is not None
-            moments = _train_moments(
-                train_data=train_data,
-                train_run_starts=train_run_starts,
-                train_nuisance=arm_nuisance,
+            moments = compute_run_moments(
+                data=train_data,
+                run_starts=train_run_starts,
+                nuisance_per_run=arm_nuisance,
                 design=design,
                 voxel_mask=target.voxel_mask,
                 device=device,

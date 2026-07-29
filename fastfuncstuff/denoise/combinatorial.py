@@ -343,6 +343,175 @@ def evaluate_all_combinations_for_run(
     return median_cod, var_explained
 
 
+def evaluate_combinations_cross_run(
+    data_criteria: torch.Tensor,
+    run_starts: list[int],
+    n_timepoints: int,
+    nuisance_per_run: list[torch.Tensor],
+    target_run: int,
+    pcs: torch.Tensor,
+    combinations: list[tuple[int, ...]],
+    design: torch.Tensor | None,
+    designs_by_hrf: dict[int, torch.Tensor] | None,
+    criteria_hrf_indices: torch.Tensor | None,
+    device: torch.device,
+    variance_ratios: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Score PC removal by whether it improves prediction of the *other* runs.
+
+    The within-run criterion asks: with the training betas held fixed, does
+    removing these PCs from run *r* improve how well they explain what is left
+    of run *r*? That is not what the denoising is later used for — in the final
+    fit the PCs come out of run *r* while run *r* is *contributing to the betas*.
+    It also cannot be read cleanly, because it re-derives SS_tot from the
+    cleaned data, so CoD rises whenever residual variance is removed.
+
+    This criterion matches deployment instead. For each other run *h*:
+
+    1. Fit betas on every run except *h*, with run *r*'s candidate PCs removed
+       from run *r*'s contribution.
+    2. Predict run *h*, which never has PCs removed — only its own polynomials.
+    3. Accumulate SS_res and SS_tot across all *h*, then one CoD per voxel.
+
+    Because the scored target never changes with the candidate, SS_tot is
+    identical across candidates and the mechanical inflation disappears: a
+    candidate can only win by producing better betas. Averaging over every
+    *h* also puts N-1 runs of evidence behind each decision instead of one.
+
+    Parameters
+    ----------
+    data_criteria : torch.Tensor
+        ``(n_criteria, n_timepoints)`` — criteria voxels only, all runs.
+    target_run : int
+        The run whose PCs are being chosen.
+    pcs : torch.Tensor
+        ``(run_length, k)`` candidate PCs for ``target_run``.
+    criteria_hrf_indices : torch.Tensor, optional
+        Per-criteria-voxel HRF index, required with ``designs_by_hrf``.
+    variance_ratios : np.ndarray, optional
+        Per-PC variance, only used to fill the returned var-explained vector.
+
+    Returns
+    -------
+    median_cod : np.ndarray
+        ``(n_combos,)`` median across criteria voxels.
+    var_explained : np.ndarray
+        ``(n_combos,)`` summed variance ratios, or zeros when not supplied.
+    """
+    from fastfuncstuff.glm.moments import compute_run_moments, run_bounds, solve_from_moments
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+
+    n_runs = len(run_starts)
+    other_runs = [h for h in range(n_runs) if h != target_run]
+    if not other_runs:
+        raise ValueError("cross-run criterion needs at least 2 runs")
+
+    n_criteria = data_criteria.shape[0]
+
+    if designs_by_hrf is not None:
+        if criteria_hrf_indices is None:
+            raise ValueError("designs_by_hrf requires criteria_hrf_indices")
+        groups = [
+            ((criteria_hrf_indices == h).cpu(), designs_by_hrf[h])
+            for h in torch.unique(criteria_hrf_indices).tolist()
+        ]
+    else:
+        assert design is not None
+        groups = [(None, design)]
+
+    ss_res = torch.zeros(len(combinations), n_criteria, dtype=torch.float64)
+    ss_tot = torch.zeros(n_criteria, dtype=torch.float64)
+
+    for voxel_mask, group_design in groups:
+        group_slice = slice(None) if voxel_mask is None else voxel_mask
+        n_group = n_criteria if voxel_mask is None else int(voxel_mask.sum().item())
+        if n_group == 0:
+            continue
+
+        # Blocks for every run other than the target: these never change with
+        # the candidate, so they are built once.
+        base = compute_run_moments(
+            data=data_criteria,
+            run_starts=run_starts,
+            nuisance_per_run=nuisance_per_run,
+            design=group_design,
+            device=device,
+            voxel_mask=voxel_mask,
+            runs=other_runs,
+        )
+        base_xtx = dict(zip(other_runs, base.xtx, strict=True))
+        base_xty = dict(zip(other_runs, base.xty, strict=True))
+
+        # Each h's own target: polynomials only, fixed across candidates.
+        targets = {}
+        for h in other_runs:
+            h_start, h_end = run_bounds(run_starts, n_timepoints, h)
+            h_data = data_criteria[:, h_start:h_end]
+            if voxel_mask is not None:
+                h_data = h_data[voxel_mask, :]
+            h_proj, h_design_proj = project_out_nuisance_per_run(
+                data=h_data,
+                design=group_design[h_start:h_end, :],
+                nuisance_per_run=[nuisance_per_run[h]],
+                run_starts=[0],
+                device=device,
+            )
+            targets[h] = (h_proj.to(device), h_design_proj.to(device))
+
+        group_ss_tot = torch.zeros(n_group, dtype=torch.float64, device=device)
+        for h in other_runs:
+            actual = targets[h][0]
+            centred = actual - actual.mean(dim=1, keepdim=True)
+            group_ss_tot += (centred**2).sum(dim=1).double()
+        ss_tot[group_slice] = group_ss_tot.cpu()
+
+        for ci, combo in enumerate(combinations):
+            target_nuisance = list(nuisance_per_run)
+            if len(combo) > 0:
+                cols = pcs[:, list(combo)].to(
+                    nuisance_per_run[target_run].device, nuisance_per_run[target_run].dtype
+                )
+                target_nuisance[target_run] = torch.cat([nuisance_per_run[target_run], cols], dim=1)
+            cand = compute_run_moments(
+                data=data_criteria,
+                run_starts=run_starts,
+                nuisance_per_run=target_nuisance,
+                design=group_design,
+                device=device,
+                voxel_mask=voxel_mask,
+                runs=[target_run],
+            )
+
+            combo_ss_res = torch.zeros(n_group, dtype=torch.float64, device=device)
+            for h in other_runs:
+                fit_runs = [r for r in other_runs if r != h]
+                betas = solve_from_moments(
+                    [base_xtx[r] for r in fit_runs] + [cand.xtx[0]],
+                    [base_xty[r] for r in fit_runs] + [cand.xty[0]],
+                    device=device,
+                )
+                actual, h_design_proj = targets[h]
+                pred = betas.T @ h_design_proj.T
+                combo_ss_res += ((actual - pred) ** 2).sum(dim=1).double()
+                del betas, pred
+            ss_res[ci, group_slice] = combo_ss_res.cpu()
+            del cand, combo_ss_res
+
+        del base, base_xtx, base_xty, targets
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    cod = 1.0 - ss_res / ss_tot.clamp(min=1e-10).unsqueeze(0)
+    median_cod = cod.median(dim=1).values.numpy().astype(np.float64)
+    if variance_ratios is None:
+        var_explained = np.zeros(len(combinations))
+    else:
+        var_explained = np.array(
+            [sum(variance_ratios[pc] for pc in combo) for combo in combinations]
+        )
+    return median_cod, var_explained
+
+
 def _evaluate_columns_for_run(
     columns: torch.Tensor,
     combos: list[tuple[int, ...]],
@@ -659,6 +828,7 @@ def fit_combinatorial_denoising(
     criteria_fallback_percentile: float = 5.0,
     selection_strategy: str = "argmax",
     singleton_only: bool = False,
+    criterion: str = "within_run",
     n_null_surrogates: int = 0,
     null_percentile: float = 95.0,
     null_seed: int = 0,
@@ -706,6 +876,16 @@ def fit_combinatorial_denoising(
         Strategy for selecting optimal combination (see select_optimal_combination).
     singleton_only : bool, default=False
         Evaluate each PC alone rather than all 2^k subsets.
+    criterion : {"within_run", "cross_run"}, default="within_run"
+        How a candidate PC set is scored. ``within_run`` holds the training
+        betas fixed and asks how well they explain what is left of the held-out
+        run after removal — the historical rule, which scores a removal on the
+        *scoring* side while the denoising is later applied on the *fitting*
+        side, and whose SS_tot moves with the candidate. ``cross_run`` matches
+        deployment: the run's PCs are removed while it contributes to the betas,
+        and the betas are scored on the other runs, which are never cleaned. The
+        scored target is then identical across candidates, so SS_tot is fixed
+        and only better betas can win. Needs >= 3 runs and costs more.
     n_null_surrogates : int, default=0
         Phase-randomised surrogates per PC for the singleton null. 0 keeps the
         historical bare ``delta > 0`` rule, which has no noise floor: CoD rises
@@ -761,6 +941,7 @@ def fit_combinatorial_denoising(
             if n_null_surrogates > 0
             else "Singleton-only (positive-delta PCs)"
         )
+        mode_str += f", criterion={criterion}"
     else:
         combinations = generate_all_pc_combinations(max_pcs)
         n_combos = 2**max_pcs
@@ -777,6 +958,11 @@ def fit_combinatorial_denoising(
 
     if n_null_surrogates > 0 and not singleton_only:
         raise ValueError("null calibration is a singleton-mode rule; pass singleton_only=True")
+    if criterion not in ("within_run", "cross_run"):
+        raise ValueError(f"criterion must be 'within_run' or 'cross_run', got {criterion!r}")
+    if criterion == "cross_run" and n_runs < 3:
+        # Two runs leaves one to fit and none to hold out once the target is in.
+        raise ValueError(f"criterion='cross_run' needs at least 3 runs, got {n_runs}")
     # Seeded on the host so the selection reproduces regardless of device.
     null_generator = torch.Generator(device="cpu").manual_seed(null_seed)
 
@@ -1014,9 +1200,30 @@ def fit_combinatorial_denoising(
             device=device,
             verbose=verbose,
         )
-        median_cod, var_explained = _evaluate_columns_for_run(
-            columns=pcs, combos=combinations, variance_ratios=variance_ratios, **eval_kwargs
+        cross_run_kwargs = dict(
+            data_criteria=data[criteria_mask, :],
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            nuisance_per_run=nuisance_per_run,
+            target_run=held_out_idx,
+            design=design,
+            designs_by_hrf=designs_by_hrf,
+            criteria_hrf_indices=hrf_indices[criteria_mask] if per_hrf_mode else None,
+            device=device,
         )
+
+        # kwargs bound at definition time: the closure is rebuilt each outer
+        # fold and must not see the next fold's tensors.
+        def _score(columns, combos, var_ratios, _cross=cross_run_kwargs, _within=eval_kwargs):
+            if criterion == "cross_run":
+                return evaluate_combinations_cross_run(
+                    pcs=columns, combinations=combos, variance_ratios=var_ratios, **_cross
+                )
+            return _evaluate_columns_for_run(
+                columns=columns, combos=combos, variance_ratios=var_ratios, **_within
+            )
+
+        median_cod, var_explained = _score(pcs, combinations, variance_ratios)
 
         # ----------------------------------------------------------------
         # Step 5: Select optimal combination
@@ -1034,12 +1241,7 @@ def fit_combinatorial_denoising(
                 # itself instead.
                 surrogates = phase_randomize(pcs, n_null_surrogates, generator=null_generator)
                 null_combos = [()] + [(i,) for i in range(surrogates.shape[1])]
-                null_cod, _ = _evaluate_columns_for_run(
-                    columns=surrogates,
-                    combos=null_combos,
-                    variance_ratios=np.zeros(surrogates.shape[1]),
-                    **eval_kwargs,
-                )
+                null_cod, _ = _score(surrogates, null_combos, np.zeros(surrogates.shape[1]))
                 best_combo, null_thresholds, pc_status = select_singletons_against_null(
                     median_cod=median_cod,
                     null_cod=null_cod,
@@ -1135,6 +1337,7 @@ def fit_combinatorial_denoising(
         "criteria_fallback_percentile": criteria_fallback_percentile,
         "selection_strategy": selection_strategy,
         "singleton_only": singleton_only,
+        "criterion": criterion,
         "n_null_surrogates": n_null_surrogates,
         "null_percentile": null_percentile if n_null_surrogates > 0 else None,
         "null_seed": null_seed if n_null_surrogates > 0 else None,

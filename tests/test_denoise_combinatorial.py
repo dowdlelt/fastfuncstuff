@@ -658,3 +658,303 @@ class TestNullCalibrationWiring:
         assert "rejected by null" in heat[0].axes[0].get_title()
         for f in heat:
             plt.close(f)
+
+
+# ===========================================================================
+# Cross-run selection criterion (-criterion cross_run)
+# ===========================================================================
+
+from fastfuncstuff.denoise.combinatorial import (  # noqa: E402
+    evaluate_combinations_cross_run,
+)
+
+
+def _cross_run_setup(seed, n_runs=6, run_len=120, n_voxels=200, k=4):
+    torch.manual_seed(seed)
+    n_tp = n_runs * run_len
+    run_starts = [r * run_len for r in range(n_runs)]
+    design = torch.zeros(n_tp, 1)
+    for r in range(n_runs):
+        for onset in range(10, run_len - 10, 25):
+            design[r * run_len + onset : r * run_len + onset + 5, 0] = 1.0
+    nuisance = [
+        torch.stack([torch.ones(run_len), torch.linspace(-1, 1, run_len)], 1) for _ in range(n_runs)
+    ]
+    amp = torch.rand(n_voxels, 1) * 2 + 1
+    data = amp @ design.T + torch.randn(n_voxels, n_tp) * 1.5
+    pcs = torch.randn(run_len, k)
+    combos = [()] + [(i,) for i in range(k)]
+    return dict(
+        data=data,
+        design=design,
+        run_starts=run_starts,
+        n_tp=n_tp,
+        nuisance=nuisance,
+        pcs=pcs,
+        combos=combos,
+        run_len=run_len,
+        k=k,
+    )
+
+
+class TestCrossRunCriterion:
+    def test_no_positive_bias_for_unrelated_pcs(self):
+        """The whole reason the criterion exists.
+
+        within_run recomputes SS_tot from the cleaned run, so removing residual
+        variance lifts CoD regardless of merit. cross_run scores runs that are
+        never cleaned, so SS_tot cannot move with the candidate and an unrelated
+        PC has nothing to gain — if anything it should lose, since it still
+        costs a degree of freedom in the beta fit.
+
+        The absolute mean is the robust statistic here. A sign-fraction is far
+        noisier per trial, and the size of within_run's bias scales with the
+        baseline CoD, so a cross-criterion ratio would be data-dependent — see
+        test_within_run_inflates_when_baseline_cod_is_high for that half.
+        """
+        deltas = []
+        for seed in range(5):
+            s = _cross_run_setup(seed)
+            cod, _ = evaluate_combinations_cross_run(
+                data_criteria=s["data"],
+                run_starts=s["run_starts"],
+                n_timepoints=s["n_tp"],
+                nuisance_per_run=s["nuisance"],
+                target_run=0,
+                pcs=s["pcs"],
+                combinations=s["combos"],
+                design=s["design"],
+                designs_by_hrf=None,
+                criteria_hrf_indices=None,
+                device=CPU,
+            )
+            deltas.append(cod[1:] - cod[0])
+        mean_delta = float(np.mean(deltas))
+        assert abs(mean_delta) < 2e-4, f"expected ~0 mean delta, got {mean_delta:+.6f}"
+
+    def test_within_run_inflates_when_baseline_cod_is_high(self):
+        """The other half: the bias cross_run exists to remove.
+
+        CoD = 1 - SS_res/SS_tot with SS_tot re-derived from the cleaned data,
+        and d/dv[(R-v)/(T-v)] < 0 for R < T, so the inflation grows as the
+        baseline fit improves. Accurate betas and a strong response put it
+        clear of the noise; at low baseline CoD it shrinks toward zero, which
+        is why the paired ratio is not the thing to assert.
+        """
+        n_time, n_vox, k = 200, 400, 5
+        design = torch.zeros(n_time, 1)
+        for onset in range(10, n_time - 10, 25):
+            design[onset : onset + 5, 0] = 1.0
+        poly = torch.stack([torch.ones(n_time), torch.linspace(-1, 1, n_time)], 1)
+
+        deltas = []
+        for seed in range(5):
+            torch.manual_seed(seed)
+            amp = torch.rand(n_vox, 1) * 2 + 1
+            data = amp @ design.T + torch.randn(n_vox, n_time) * 0.5
+            betas = amp + torch.randn(n_vox, 1) * 0.05  # near-true => high CoD
+            cod, _ = evaluate_all_combinations_for_run(
+                run_data_criteria=data,
+                run_design=design,
+                betas_criteria=betas,
+                poly_nuisance=poly,
+                noise_pcs=torch.randn(n_time, k),  # unrelated to the data
+                combinations=[()] + [(i,) for i in range(k)],
+                variance_ratios=np.zeros(k),
+                device=CPU,
+                verbose=False,
+            )
+            assert cod[0] > 0.5, "this regime is meant to have a high baseline CoD"
+            deltas.append(cod[1:] - cod[0])
+
+        assert float(np.mean(deltas)) > 0, (
+            "unrelated regressors should still gain CoD under within_run — if "
+            "this stops holding, the mechanical inflation is gone and the "
+            "cross_run criterion's main justification needs revisiting"
+        )
+
+    def test_ss_tot_is_constant_across_candidates(self):
+        """A direct check of the mechanism: identical CoD when betas cannot differ.
+
+        With a single-column design and a PC that is exactly zero, every
+        candidate produces the same fit, so any CoD spread would have to come
+        from the denominator moving.
+        """
+        s = _cross_run_setup(11)
+        s["pcs"] = torch.zeros_like(s["pcs"])
+        cod, _ = evaluate_combinations_cross_run(
+            data_criteria=s["data"],
+            run_starts=s["run_starts"],
+            n_timepoints=s["n_tp"],
+            nuisance_per_run=s["nuisance"],
+            target_run=0,
+            pcs=s["pcs"],
+            combinations=s["combos"],
+            design=s["design"],
+            designs_by_hrf=None,
+            criteria_hrf_indices=None,
+            device=CPU,
+        )
+        np.testing.assert_allclose(cod, cod[0], atol=1e-9)
+
+    def test_genuine_shared_noise_is_ranked_first(self):
+        """Sensitivity is lower than within_run because the effect it measures is
+        genuinely smaller -- one run's artifact only perturbs betas that N runs
+        contribute to -- but the real component should still lead the ranking."""
+        hits = 0
+        trials = 6
+        for seed in range(trials):
+            s = _cross_run_setup(100 + seed, n_voxels=300)
+            rl = s["run_len"]
+            s["data"][:, :rl] += (torch.randn(s["data"].shape[0], 1) * 8.0) @ s["pcs"][:, :1].T
+            cod, _ = evaluate_combinations_cross_run(
+                data_criteria=s["data"],
+                run_starts=s["run_starts"],
+                n_timepoints=s["n_tp"],
+                nuisance_per_run=s["nuisance"],
+                target_run=0,
+                pcs=s["pcs"],
+                combinations=s["combos"],
+                design=s["design"],
+                designs_by_hrf=None,
+                criteria_hrf_indices=None,
+                device=CPU,
+            )
+            delta = cod[1:] - cod[0]
+            hits += int(delta.argmax() == 0)
+        assert hits >= trials - 2, f"real PC0 led the ranking only {hits}/{trials} times"
+
+    def test_needs_three_runs(self, multi_run_setup):
+        s = _cross_run_setup(0, n_runs=1)
+        with pytest.raises(ValueError, match="at least 2 runs"):
+            evaluate_combinations_cross_run(
+                data_criteria=s["data"],
+                run_starts=s["run_starts"],
+                n_timepoints=s["n_tp"],
+                nuisance_per_run=s["nuisance"],
+                target_run=0,
+                pcs=s["pcs"],
+                combinations=s["combos"],
+                design=s["design"],
+                designs_by_hrf=None,
+                criteria_hrf_indices=None,
+                device=CPU,
+            )
+
+    def test_rejects_bad_criterion_and_too_few_runs(self, multi_run_setup):
+        s = multi_run_setup
+        common = dict(
+            data=s["data"],
+            design=s["design"],
+            run_starts=s["run_starts"],
+            tr=2.0,
+            nuisance_per_run=s["nuisance_per_run"],
+            noise_pool_mask=torch.ones(s["n_voxels"], dtype=torch.bool),
+            initial_r2=torch.rand(s["n_voxels"]),
+            max_pcs=2,
+            device=CPU,
+            verbose=False,
+        )
+        with pytest.raises(ValueError, match="criterion must be"):
+            fit_combinatorial_denoising(criterion="nonsense", **common)
+        with pytest.raises(ValueError, match="at least 3 runs"):
+            fit_combinatorial_denoising(criterion="cross_run", **{**common, "run_starts": [0, 20]})
+
+    def test_end_to_end_through_fit(self, multi_run_setup):
+        s = multi_run_setup
+        results = fit_combinatorial_denoising(
+            data=s["data"],
+            design=s["design"],
+            run_starts=s["run_starts"],
+            tr=2.0,
+            nuisance_per_run=s["nuisance_per_run"],
+            noise_pool_mask=torch.ones(s["n_voxels"], dtype=torch.bool),
+            initial_r2=torch.rand(s["n_voxels"]),
+            max_pcs=2,
+            criteria_r2_threshold="50%",
+            singleton_only=True,
+            criterion="cross_run",
+            n_null_surrogates=3,
+            device=CPU,
+            verbose=False,
+        )
+        assert results.metadata["criterion"] == "cross_run"
+        assert len(results.per_run_results) == 3
+        for run_res in results.per_run_results:
+            assert run_res.pc_status is not None
+            assert set(run_res.optimal_combination) <= {0, 1}
+
+
+class TestArmSpecificPcs:
+    def test_learning_curve_honours_per_arm_pcs(self):
+        """A GLMdenoise reference must keep its own noise-pool PCs even when the
+        arm under test used -whole_brain_noise_pool, or the comparison is rigged."""
+        from fastfuncstuff.denoise.heldout import heldout_learning_curve
+
+        torch.manual_seed(3)
+        n_train, run_len, n_vox, k = 4, 60, 20, 3
+        design = torch.randn(n_train * run_len, 1)
+        test_design = torch.randn(2 * run_len, 1)
+        data = torch.randn(n_vox, n_train * run_len)
+        test_data = torch.randn(n_vox, 2 * run_len)
+        polys = lambda n: [  # noqa: E731
+            torch.stack([torch.ones(run_len), torch.linspace(-1, 1, run_len)], 1) for _ in range(n)
+        ]
+        pcs_a = [torch.randn(run_len, k) for _ in range(n_train)]
+        pcs_b = [torch.randn(run_len, k) for _ in range(n_train)]
+
+        curve = heldout_learning_curve(
+            train_data=data,
+            train_run_starts=[r * run_len for r in range(n_train)],
+            train_nuisance_per_run=polys(n_train),
+            train_pcs_per_run=pcs_a,
+            arms={"shared": [(0,)] * n_train, "own_pcs": [(0,)] * n_train},
+            arm_pcs_per_run={"own_pcs": pcs_b},
+            test_data=test_data,
+            test_run_starts=[0, run_len],
+            test_nuisance_per_run=polys(2),
+            train_design=design,
+            test_design=test_design,
+            subset_sizes=[n_train],
+            max_subsets=1,
+            device=CPU,
+            verbose=False,
+        )
+        # Same selection, different PCs -> different curves. Equality would mean
+        # the override was silently ignored.
+        assert not torch.allclose(curve["curves"]["shared"], curve["curves"]["own_pcs"], atol=1e-6)
+
+
+class TestWholeBrainPcSource:
+    def test_whole_brain_pc0_is_the_task_response(self):
+        """Why -compare must never inherit whole-brain PCs.
+
+        Task variance is large and spatially coherent, so with the noise-pool
+        restriction lifted it dominates the top of the variance ordering. A
+        GLMdenoise baseline handed these PCs would remove the task as its
+        first component — a straw man. It also means -max_pcs has to grow
+        alongside -whole_brain_noise_pool to reach real artifacts.
+        """
+        torch.manual_seed(0)
+        n_time, n_vox = 150, 400
+        task = torch.zeros(n_time)
+        task[::25] = 1.0
+        data = torch.randn(n_vox, n_time)
+        data[:100] += 8.0 * task  # first quarter of voxels are task-responsive
+
+        noise_pool = torch.zeros(n_vox, dtype=torch.bool)
+        noise_pool[100:] = True
+        whole_brain = torch.ones(n_vox, dtype=torch.bool)
+        nuisance = torch.stack([torch.ones(n_time), torch.linspace(-1, 1, n_time)], 1)
+
+        pool_pcs, _ = extract_pcs_single_run_with_variance(data, noise_pool, nuisance, 3, CPU)
+        brain_pcs, _ = extract_pcs_single_run_with_variance(data, whole_brain, nuisance, 3, CPU)
+
+        def abs_corr(x, y):
+            return abs(float(torch.corrcoef(torch.stack([x, y]))[0, 1]))
+
+        assert abs_corr(brain_pcs[:, 0], task) > 0.9, "whole-brain PC0 should track the task"
+        assert abs_corr(pool_pcs[:, 0], task) < 0.5, "noise-pool PC0 should not"
+        assert abs_corr(pool_pcs[:, 0], brain_pcs[:, 0]) < 0.5, (
+            "the two PC sources must differ, or guarding the baseline is pointless"
+        )
