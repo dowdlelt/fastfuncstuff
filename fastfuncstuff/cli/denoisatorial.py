@@ -68,7 +68,6 @@ try:
         plot_singleton_contributions,
     )
     from fastfuncstuff.denoise.sequential import select_noise_pool_voxels
-    from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
     from fastfuncstuff.glm.core import construct_polynomial_matrix
@@ -696,96 +695,26 @@ def main():
         sys.exit(1)
 
     # Parse the timing spec: BIDS events TSVs or AFNI timing files.
-    if args.events:
-        from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+    from fastfuncstuff.cli_utils import parse_timing_spec
 
-        if len(args.events) not in (1, n_runs):
-            print(
-                f"ERROR: -events requires one TSV per run or a single shared TSV: "
-                f"got {len(args.events)} events files but {n_runs} input datasets."
-            )
-            sys.exit(1)
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
+            event_ignore=args.event_ignore,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            round_durations=args.round_durations,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        if len(args.events) == 1 and n_runs > 1:
-            print(f"  Broadcasting 1 events file across {n_runs} runs")
-        for ep in sort_bids_event_files(args.events):
-            print(f"  {ep}")
-
-        try:
-            all_onsets, durations, condition_labels = parse_bids_events(
-                event_files=args.events,
-                event_ignore=args.event_ignore,
-                event_cols=tuple(args.event_cols) if args.event_cols else None,
-                round_durations=args.round_durations,
-                n_runs=n_runs,
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        n_conditions = len(condition_labels)
-        print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
-        for cidx, label in enumerate(condition_labels):
-            n_events = sum(len(all_onsets[cidx][r]) for r in range(n_runs))
-            print(
-                f"    {label}: {n_events} events across {n_runs} runs "
-                f"(duration={durations[cidx]:.3f}s)"
-            )
-    else:
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        from fastfuncstuff.cli_utils import clean_condition_labels
-
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
-
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                sys.exit(1)
-
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-
-        all_onsets = []
-        for onset_file in onset_files:
-            onsets_by_run = parse_afni_timing_file(onset_file)
-            if len(onsets_by_run) != n_runs:
-                print(
-                    f"ERROR: Onset file {onset_file} has "
-                    f"{len(onsets_by_run)} runs, expected {n_runs}"
-                )
-                sys.exit(1)
-            all_onsets.append(onsets_by_run)
-
-        print(f"  Conditions: {n_conditions} ({', '.join(condition_labels)})")
-        print(f"  Durations: {durations}s")
-
-    # Parse HRF model arguments
-    from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
-
-    hrf_info = parse_hrf_model_args(
-        hrf_model_arg=args.hrf_model,
-        canonical_arg=args.canonical,
-        durations=durations,
-        condition_labels=condition_labels,
-        tr=args.tr,
-    )
-
-    hrf_model_name = hrf_info["hrf_model_name"]
-    _hrf_params = hrf_info["hrf_params"]
-    is_fir_model = hrf_info["is_fir_model"]
-    fir_bot = hrf_info["fir_bot"]
-    fir_top = hrf_info["fir_top"]
-    n_basis = hrf_info["n_basis"]
-    _condition_labels_full = hrf_info["condition_labels_full"]
-
-    # Check for incompatible options with FIR models
-    validate_hrf_compatibility(
-        is_fir_model=is_fir_model,
-        single_trial=False,  # ffs_denoisatorial doesn't have -single_trial
-        hrf_opt=args.hrf_opt,
-    )
+    all_onsets = timing.all_onsets
+    durations = timing.durations
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
 
     # Warn about large max_pcs
     if args.max_pcs > 12:

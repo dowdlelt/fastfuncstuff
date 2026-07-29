@@ -60,7 +60,6 @@ try:
         save_volume_nifti,
         spinner,
     )
-    from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.glm.ridge import (
         create_single_trial_design,
@@ -395,48 +394,28 @@ def main():
         print("ERROR: -durations is required when using -onsets")
         sys.exit(1)
 
-    from fastfuncstuff.cli_utils import clean_condition_labels
+    from fastfuncstuff.cli_utils import parse_timing_spec
 
     print("Parsing onset metadata...")
-    all_onsets_bids = None  # populated for BIDS path; AFNI path populates later
-    condition_labels = []
-    onset_files = None
-
-    if _has_events:
-        from fastfuncstuff.design.bids_events import parse_bids_events
-
-        if len(args.events) != n_runs:
-            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
-            sys.exit(1)
-        event_cols = tuple(args.event_cols) if args.event_cols else None
-        all_onsets_bids, durations, condition_labels = parse_bids_events(
-            event_files=args.events,
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
             event_ignore=args.event_ignore,
-            event_cols=event_cols,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
             round_durations=args.round_durations,
         )
-        n_conditions = len(condition_labels)
-        print(f"  BIDS events: {n_conditions} conditions from {len(args.events)} TSV files")
-        print(f"  Conditions: {condition_labels}")
-        print(f"  Durations: {durations}s")
-    else:
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                sys.exit(1)
-
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-
-        if len(args.durations) == 1 and "," not in args.durations[0]:
-            print(f"  Using {durations[0]}s for all {n_conditions} conditions")
-        else:
-            print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
+    all_onsets = timing.all_onsets
+    durations = timing.durations
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
+    onset_files = timing.onset_files
 
     # Pre-flight checks (before slow data loading)
     preflight_check(
@@ -497,30 +476,9 @@ def main():
         print(f"  TR (specified): {args.tr}s")
 
     # ========================================================================
-    # 3. Build all_onsets and apply rounding (TR now known)
+    # 3. Apply onset rounding (TR now known)
     # ========================================================================
     print()
-    print("Parsing onset files...")
-    if all_onsets_bids is not None:
-        all_onsets = all_onsets_bids
-        for i, cond in enumerate(condition_labels):
-            n_ev = sum(arr.size for arr in all_onsets[i])
-            print(f"  {cond}: {n_ev} events across {n_runs} runs")
-    else:
-        all_onsets = []
-        for i, onset_file in enumerate(onset_files):
-            runs_onsets = parse_afni_timing_file(onset_file)
-            if len(runs_onsets) != n_runs:
-                print(
-                    f"ERROR: Onset file '{onset_file}' has {len(runs_onsets)} runs, "
-                    f"but {n_runs} input files were provided"
-                )
-                sys.exit(1)
-            all_onsets.append(runs_onsets)
-            n_events = sum(len(r) for r in runs_onsets)
-            print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
-
-    # Apply onset rounding (TR is now known from data load)
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
 

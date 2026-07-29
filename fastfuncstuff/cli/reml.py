@@ -49,8 +49,6 @@ try:
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
-        parse_afni_timing_file,
-        parse_durations,
     )
     from fastfuncstuff.glm.outputs import (
         slice_glm_results,
@@ -1396,87 +1394,35 @@ def main():
         print("=" * 70)
         print()
 
-        if args.events:
-            # ── BIDS events TSV path ─────────────────────────────────────────
-            from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+        from fastfuncstuff.cli_utils import parse_timing_spec
 
-            # Validate: one TSV per input run, OR a single shared TSV to
-            # broadcast across all runs (identical timing every run).
-            if len(args.events) not in (1, len(input_files)):
-                print(
-                    f"ERROR: -events requires one TSV per run or a single shared TSV: "
-                    f"got {len(args.events)} events files but {len(input_files)} input datasets."
-                )
-                sys.exit(1)
+        print("Parsing event timing...")
+        try:
+            timing = parse_timing_spec(
+                events=args.events,
+                onsets=args.onsets,
+                durations_arg=args.durations,
+                n_runs=len(input_files),
+                event_ignore=args.event_ignore,
+                event_cols=tuple(args.event_cols) if args.event_cols else None,
+                round_durations=args.round_durations,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            sys.exit(1)
 
-            # Custom column mapping
-            event_cols = tuple(args.event_cols) if args.event_cols else None
+        all_onsets = timing.all_onsets
+        durations = timing.durations
+        condition_labels = timing.condition_labels
+        n_conditions = timing.n_conditions
+        n_runs = len(input_files)
 
-            if len(args.events) == 1 and len(input_files) > 1:
-                print(
-                    f"Parsing BIDS events file (broadcasting 1 events file across "
-                    f"{len(input_files)} runs)..."
-                )
-            else:
-                print("Parsing BIDS events files...")
-            # Show the sorted order so the user can confirm alignment
-            sorted_event_paths = sort_bids_event_files(args.events)
-            for ep in sorted_event_paths:
-                print(f"  {ep}")
-
-            try:
-                all_onsets, durations, condition_labels = parse_bids_events(
-                    event_files=args.events,
-                    event_ignore=args.event_ignore,
-                    event_cols=event_cols,
-                    round_durations=args.round_durations,
-                    n_runs=len(input_files),
-                )
-            except (FileNotFoundError, ValueError) as exc:
-                print(f"ERROR: {exc}", file=sys.stderr)
-                sys.exit(1)
-
-            n_conditions = len(condition_labels)
-            n_runs = len(input_files)
-
-            print()
-            for cidx, label in enumerate(condition_labels):
-                n_events = sum(len(all_onsets[cidx][r]) for r in range(n_runs))
-                print(
-                    f"  {label}: {n_events} events across {n_runs} runs  (duration={durations[cidx]:.3f}s)"
-                )
-
-            if len(set(durations)) == 1:
-                print(f"\n  Single duration for all conditions: {durations[0]:.3f}s")
-            else:
-                print(
-                    f"\n  Per-condition durations: {dict(zip(condition_labels, durations, strict=False))}"
-                )
-
+        if len(set(durations)) == 1:
+            print(f"\n  Single duration for all conditions: {durations[0]:.3f}s")
         else:
-            # ── AFNI timing files path ───────────────────────────────────────
-            print("Parsing onset files...")
-            all_onsets = []
-            condition_labels = []
-            for onset_file in args.onsets:
-                condition_label = Path(onset_file).stem
-                runs_onsets = parse_afni_timing_file(onset_file)
-                all_onsets.append(runs_onsets)
-                condition_labels.append(condition_label)
-                n_events = sum(len(run_onsets) for run_onsets in runs_onsets)
-                print(f"  {condition_label}: {n_events} events across {len(runs_onsets)} runs")
-
-            n_conditions = len(all_onsets)
-            n_runs = len(all_onsets[0])  # All conditions must have same number of runs
-
-            # Parse durations
-            print()
-            print("Parsing durations...")
-            durations = parse_durations(args.durations, n_conditions, condition_labels)
-            if len(args.durations) == 1 and "," not in args.durations[0]:
-                print(f"  Using {durations[0]}s for all {n_conditions} conditions")
-            else:
-                print(f"  Matched {len(durations)} durations to {n_conditions} conditions")
+            print(
+                f"\n  Per-condition durations: {dict(zip(condition_labels, durations, strict=False))}"
+            )
 
         # ── Optional onset / duration rounding ──────────────────────────
         if args.round_onsets is not None:
@@ -1484,12 +1430,6 @@ def main():
 
             all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
             print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
-
-        # For BIDS, round_durations was already applied per-event inside parse_bids_events
-        if args.round_durations is not None and not args.events:
-            dp = args.round_durations
-            durations = [round(d, dp) for d in durations]
-            print(f"Durations rounded to {dp} decimal place(s): {durations}")
 
         # Parse HRF model arguments
         print()

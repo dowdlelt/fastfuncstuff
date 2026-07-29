@@ -4129,11 +4129,21 @@ def main() -> None:
     if _has_events:
         from fastfuncstuff.design.bids_events import parse_bids_events
 
+        n_event_runs = len(input_files)
+        if len(args.events) not in (1, n_event_runs):
+            print(
+                f"ERROR: -events requires one TSV per run or a single shared TSV: "
+                f"got {len(args.events)} events files but {n_event_runs} input datasets."
+            )
+            sys.exit(1)
+        if len(args.events) == 1 and n_event_runs > 1:
+            print(f"Broadcasting 1 events file across {n_event_runs} runs")
         event_cols = tuple(args.event_cols) if getattr(args, "event_cols", None) else None
         bids_task_onsets, bids_task_durations, bids_task_labels = parse_bids_events(
             event_files=args.events,
             event_ignore=getattr(args, "event_ignore", None),
             event_cols=event_cols,
+            n_runs=n_event_runs,
         )
         print(
             f"Task annotation: {len(bids_task_labels)} conditions from BIDS events: "

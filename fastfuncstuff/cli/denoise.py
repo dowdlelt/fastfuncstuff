@@ -62,8 +62,6 @@ try:
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
-        parse_afni_timing_file,
-        parse_durations,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
@@ -1504,69 +1502,27 @@ def main():
         sys.exit(1)
 
     # Parse onset metadata (condition labels and durations)
-    from fastfuncstuff.cli_utils import clean_condition_labels
+    from fastfuncstuff.cli_utils import parse_timing_spec
 
-    all_onsets_bids = None  # populated here for BIDS path; AFNI path populates later
-
-    if _has_events:
-        from fastfuncstuff.design.bids_events import parse_bids_events
-
-        if len(args.events) != n_runs:
-            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
-            sys.exit(1)
-        event_cols = tuple(args.event_cols) if args.event_cols else None
-        all_onsets_bids, durations, condition_labels = parse_bids_events(
-            event_files=args.events,
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
             event_ignore=args.event_ignore,
-            event_cols=event_cols,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
             round_durations=args.round_durations,
         )
-        n_conditions = len(condition_labels)
-        onset_files = None
-        print(f"  BIDS events: {n_conditions} conditions from {len(args.events)} TSV files")
-        print(f"  Conditions: {condition_labels}")
-        print(f"  Durations: {durations}s")
-    else:
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        # Validate onset files
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                sys.exit(1)
-
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-        print(f"  Durations: {durations}s")
-
-    # Parse HRF model arguments
-    from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
-
-    hrf_info = parse_hrf_model_args(
-        hrf_model_arg=args.hrf_model,
-        canonical_arg=args.canonical,
-        durations=durations,
-        condition_labels=condition_labels,
-        tr=args.tr,
-    )
-
-    hrf_model_name = hrf_info["hrf_model_name"]
-    _hrf_params = hrf_info["hrf_params"]
-    is_fir_model = hrf_info["is_fir_model"]
-    fir_bot = hrf_info["fir_bot"]
-    fir_top = hrf_info["fir_top"]
-    n_basis = hrf_info["n_basis"]
-    _condition_labels_full = hrf_info["condition_labels_full"]
-
-    # Check for incompatible options with FIR models
-    validate_hrf_compatibility(
-        is_fir_model=is_fir_model,
-        single_trial=args.single_trials,
-        hrf_opt=args.hrf_opt,
-    )
+    all_onsets = timing.all_onsets
+    durations = timing.durations
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
+    onset_files = timing.onset_files
 
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
@@ -1787,20 +1743,6 @@ def main():
 
     print()
     print("Building design matrix...")
-
-    # Build all_onsets: BIDS (already parsed) or AFNI (parse files now)
-    if all_onsets_bids is not None:
-        all_onsets = all_onsets_bids
-    else:
-        all_onsets = []
-        for onset_file in onset_files:
-            onsets_by_run = parse_afni_timing_file(onset_file)
-            if len(onsets_by_run) != n_runs:
-                print(
-                    f"ERROR: Onset file {onset_file} has {len(onsets_by_run)} runs, expected {n_runs}"
-                )
-                sys.exit(1)
-            all_onsets.append(onsets_by_run)
 
     # Apply onset rounding (after TR is known from data load)
     if args.round_onsets is not None:

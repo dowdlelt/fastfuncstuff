@@ -489,15 +489,17 @@ def _compute_task_alignment(model, args, device):
     from fastfuncstuff.dynamics.task import align_states_to_task
 
     n_runs = len(model.responsibilities)
-    if len(args.events) != n_runs:
+    if len(args.events) not in (1, n_runs):
         raise SystemExit(
             f"-events has {len(args.events)} file(s) but the model has {n_runs} run(s); "
-            "pass one events.tsv per -input run, in the same order."
+            "pass one events.tsv per -input run (in the same order), or a single "
+            "shared TSV to broadcast across runs."
         )
     all_onsets, durations, condition_labels = parse_bids_events(
         args.events,
         event_ignore=args.event_ignore,
         event_cols=tuple(args.event_cols) if args.event_cols else None,
+        n_runs=n_runs,
     )
     align = align_states_to_task(
         model,

@@ -85,8 +85,6 @@ try:
     )
     from fastfuncstuff.design.builder import (
         pack_for_shared_task_glm,
-        parse_afni_timing_file,
-        parse_durations,
     )
     from fastfuncstuff.design.flobs import (
         ARMAWhitenCell,
@@ -763,44 +761,25 @@ def main() -> int:
     # expanded the glob, this is a no-op.
     args.input = input_files
     n_runs = len(input_files)
-    if has_events:
-        from fastfuncstuff.cli_utils import clean_condition_labels  # noqa: F401
-        from fastfuncstuff.design.bids_events import parse_bids_events
+    from fastfuncstuff.cli_utils import parse_timing_spec
 
-        if len(args.events) != n_runs:
-            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs.")
-            return 1
-        event_cols = tuple(args.event_cols) if args.event_cols else None
-        all_onsets, durations, condition_labels = parse_bids_events(
-            event_files=args.events,
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
             event_ignore=args.event_ignore,
-            event_cols=event_cols,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
             round_durations=args.round_durations,
         )
-    else:
-        from fastfuncstuff.cli_utils import clean_condition_labels
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                return 1
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-        all_onsets = [parse_afni_timing_file(f) for f in onset_files]
-        for i, cond_runs in enumerate(all_onsets):
-            if len(cond_runs) != n_runs:
-                print(
-                    f"ERROR: Onset file {onset_files[i]} has "
-                    f"{len(cond_runs)} runs, but {n_runs} input runs."
-                )
-                return 1
-
-    n_conditions = len(condition_labels)
-    print(f"  {n_conditions} conditions: {condition_labels}")
+    all_onsets = timing.all_onsets
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
 
     preflight_check(
         input_files=input_files, onset_files=args.onsets if has_onsets else None, ortvec_files=None

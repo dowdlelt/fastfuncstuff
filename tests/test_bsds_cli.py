@@ -121,9 +121,14 @@ def test_cli_events_count_mismatch_errors(tmp_path):
         f = tmp_path / f"run{i}.1D"
         np.savetxt(f, s.numpy().T)
         files.append(str(f))
-    ev = tmp_path / "run-01_events.tsv"
-    with open(ev, "w") as fh:
-        fh.write("onset\tduration\ttrial_type\n0\t10\tA\n")
+    # 3 events files for 2 runs: neither one-per-run nor the single shared
+    # TSV that broadcasts, so it must error.
+    evs = []
+    for i in (1, 2, 3):
+        ev = tmp_path / f"run-0{i}_events.tsv"
+        with open(ev, "w") as fh:
+            fh.write("onset\tduration\ttrial_type\n0\t10\tA\n")
+        evs.append(str(ev))
 
     stem = str(tmp_path / "out" / "sub01")
     with pytest.raises(SystemExit):
@@ -144,7 +149,7 @@ def test_cli_events_count_mismatch_errors(tmp_path):
                 "-device",
                 "cpu",
                 "-events",
-                str(ev),
+                *evs,
                 "-plots",
                 "none",
             ]

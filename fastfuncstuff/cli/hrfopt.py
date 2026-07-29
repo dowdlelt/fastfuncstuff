@@ -55,8 +55,6 @@ try:
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
-        parse_afni_timing_file,
-        parse_durations,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import (
@@ -619,43 +617,27 @@ def main():
         sys.exit(1)
 
     # Parse onset files / BIDS events (early pass for condition metadata)
-    from fastfuncstuff.cli_utils import clean_condition_labels
+    from fastfuncstuff.cli_utils import parse_timing_spec
 
-    all_onsets_bids = None  # populated here for BIDS path; AFNI path populates later
-
-    if _has_events:
-        from fastfuncstuff.design.bids_events import parse_bids_events
-
-        if len(args.events) != n_runs:
-            print(f"ERROR: -events: {len(args.events)} files but {n_runs} input runs")
-            sys.exit(1)
-        event_cols = tuple(args.event_cols) if args.event_cols else None
-        all_onsets_bids, durations, condition_labels = parse_bids_events(
-            event_files=args.events,
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
             event_ignore=args.event_ignore,
-            event_cols=event_cols,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
             round_durations=args.round_durations,
         )
-        n_conditions = len(condition_labels)
-        onset_files = None
-        print(f"  BIDS events: {n_conditions} conditions from {len(args.events)} TSV files")
-        print(f"  Conditions: {condition_labels}")
-        print(f"  Durations: {durations}s")
-    else:
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        # Validate onset files exist
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                sys.exit(1)
-
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-        print(f"  Durations: {durations}s")
+    all_onsets = timing.all_onsets
+    durations = timing.durations
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
+    onset_files = timing.onset_files
 
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
@@ -727,27 +709,6 @@ def main():
 
     print()
     print("Building onset matrix...")
-
-    # Build all_onsets: BIDS (already parsed) or AFNI (parse files now)
-    if all_onsets_bids is not None:
-        all_onsets = all_onsets_bids
-    else:
-        all_onsets = []
-        for i, onset_file in enumerate(onset_files):
-            onsets_by_run = parse_afni_timing_file(onset_file)
-
-            # Validate number of runs matches
-            if len(onsets_by_run) != n_runs:
-                print(
-                    f"ERROR: Onset file '{onset_file}' has {len(onsets_by_run)} runs, "
-                    f"but {n_runs} input files were provided"
-                )
-                sys.exit(1)
-
-            all_onsets.append(onsets_by_run)
-            if args.verb >= 1:
-                n_events = sum(len(r) for r in onsets_by_run)
-                print(f"  {condition_labels[i]}: {n_events} events across {n_runs} runs")
 
     # Apply onset rounding (after TR is known from data load)
     if args.round_onsets is not None:

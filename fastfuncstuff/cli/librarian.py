@@ -64,8 +64,6 @@ try:
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,  # noqa: F401
-        parse_afni_timing_file,
-        parse_durations,
     )
     from fastfuncstuff.design.hrf import (
         compute_windows_from_durations,  # noqa: F401
@@ -1009,66 +1007,49 @@ def main() -> None:
         p.strip().lstrip("-").isdigit() for p in split_arg.split(",")
     )
 
-    if has_events:
-        from fastfuncstuff.cli_utils import clean_condition_labels
-        from fastfuncstuff.design.bids_events import parse_bids_events
+    if split_column_mode and not has_events:
+        print(
+            "ERROR: -split as a column name requires -events (BIDS); "
+            "with -onsets, -split must be a comma vector."
+        )
+        sys.exit(1)
 
-        if len(args.events) != n_runs:
-            print(f"ERROR: -events: {len(args.events)} files but {n_runs} runs.")
-            sys.exit(1)
-        # Resolve event_cols: -event-cols takes precedence; split-column
-        # mode overlays the split column as the trial_type axis.  Falls
-        # back to None (parse_bids_events defaults: onset/duration/trial_type).
-        event_cols: tuple[str, str, str] | None = None
-        if args.event_cols:
-            event_cols = tuple(args.event_cols)  # type: ignore[assignment]
-        if split_column_mode:
-            # Reuse the user-supplied onset/duration column names when
-            # provided, else fall back to BIDS defaults; replace the
-            # trial_type column with the split column.
-            on_col = event_cols[0] if event_cols else "onset"
-            dur_col = event_cols[1] if event_cols else "duration"
-            event_cols = (on_col, dur_col, split_arg)
-            print(f"  -split column mode: grouping by events column '{split_arg}'")
-        all_onsets, durations, condition_labels = parse_bids_events(
-            event_files=args.events,
+    # Resolve event_cols: -event-cols takes precedence; split-column mode
+    # overlays the split column as the trial_type axis.  Falls back to None
+    # (parse_bids_events defaults: onset/duration/trial_type).
+    event_cols: tuple[str, str, str] | None = None
+    if args.event_cols:
+        event_cols = tuple(args.event_cols)  # type: ignore[assignment]
+    if split_column_mode:
+        on_col = event_cols[0] if event_cols else "onset"
+        dur_col = event_cols[1] if event_cols else "duration"
+        event_cols = (on_col, dur_col, split_arg)
+        print(f"  -split column mode: grouping by events column '{split_arg}'")
+
+    from fastfuncstuff.cli_utils import parse_timing_spec
+
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
             event_ignore=args.event_ignore,
             event_cols=event_cols,
             round_durations=args.round_durations,
         )
-        n_conditions = len(condition_labels)
-        print(f"  {n_conditions} conditions from BIDS events: {condition_labels}")
-        # Column-mode -> each condition IS already a group; clear arg so
-        # resolve_split doesn't try to vectorize the column name.
-        split_for_resolver = None if split_column_mode else split_arg
-    else:
-        from fastfuncstuff.cli_utils import clean_condition_labels
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        onset_files = args.onsets
-        n_conditions = len(onset_files)
-        condition_labels = clean_condition_labels([Path(f).stem for f in onset_files])
-        for f in onset_files:
-            if not Path(f).exists():
-                print(f"ERROR: Onset file not found: {f}")
-                sys.exit(1)
-        durations = parse_durations(args.durations, n_conditions, condition_labels)
-        if args.round_durations is not None:
-            durations = [round(d, args.round_durations) for d in durations]
-        all_onsets = [parse_afni_timing_file(f) for f in onset_files]
-        for i, cond_runs in enumerate(all_onsets):
-            if len(cond_runs) != n_runs:
-                print(
-                    f"ERROR: Onset file {onset_files[i]} has "
-                    f"{len(cond_runs)} runs, but {n_runs} input runs."
-                )
-                sys.exit(1)
-        if split_column_mode:
-            print(
-                "ERROR: -split as a column name requires -events (BIDS); "
-                "with -onsets, -split must be a comma vector."
-            )
-            sys.exit(1)
-        split_for_resolver = split_arg
+    all_onsets = timing.all_onsets
+    durations = timing.durations
+    condition_labels = timing.condition_labels
+    n_conditions = timing.n_conditions
+
+    # Column-mode -> each condition IS already a group; clear arg so
+    # resolve_split doesn't try to vectorize the column name.
+    split_for_resolver = None if split_column_mode else split_arg
 
     # --- Resolve grouping -----------------------------------------------------
     group_per_cond, group_labels = resolve_split(split_for_resolver, n_conditions, condition_labels)

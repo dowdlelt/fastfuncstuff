@@ -2060,12 +2060,131 @@ def parse_device_arg(
     return device, cpu_threads_override, cuda_device_id
 
 
+@dataclass
+class TimingSpec:
+    """Event timing parsed from either BIDS ``*_events.tsv`` or AFNI timing files.
+
+    ``all_onsets[condition_idx][run_idx]`` is an ndarray of onset times in
+    seconds — the shape every design builder in the repo expects, regardless of
+    which input format the user supplied.
+    """
+
+    all_onsets: list[list[np.ndarray]]
+    durations: list[float]
+    condition_labels: list[str]
+    from_events: bool
+    onset_files: list[str] | None = None
+
+    @property
+    def n_conditions(self) -> int:
+        return len(self.condition_labels)
+
+
+def parse_timing_spec(
+    *,
+    events: list[str] | None,
+    onsets: list[str] | None,
+    durations_arg: list[str] | str | None,
+    n_runs: int,
+    event_ignore: list[str] | None = None,
+    event_cols: tuple[str, str, str] | None = None,
+    round_durations: int | None = None,
+    verbose: bool = True,
+) -> TimingSpec:
+    """Parse the timing spec of an ``ffs_*`` GLM tool into a common structure.
+
+    Single source of truth for both timing paths: BIDS ``-events`` TSVs (with
+    the one-file-broadcast-across-runs convention) and AFNI ``-onsets`` timing
+    files (one file per condition, one line per run). Every caller used to
+    hand-roll this, which is how ``-events`` broadcasting ended up supported in
+    some tools and not others.
+
+    Exactly one of *events* / *onsets* must be non-empty. Raises ``ValueError``
+    (or ``FileNotFoundError``) with a user-facing message on any problem; the
+    CLI is responsible for printing it and exiting.
+    """
+    from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+    from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
+
+    if bool(events) == bool(onsets):
+        raise ValueError("Specify exactly one of -onsets/-durations or -events")
+
+    if events:
+        # One TSV per run, or a single shared TSV broadcast to every run
+        # (a valid BIDS pattern when all runs share the same stimulus timing).
+        if len(events) not in (1, n_runs):
+            raise ValueError(
+                f"-events requires one TSV per run or a single shared TSV: "
+                f"got {len(events)} events files but {n_runs} input datasets."
+            )
+
+        if verbose:
+            if len(events) == 1 and n_runs > 1:
+                print(f"  Broadcasting 1 events file across {n_runs} runs")
+            for ep in sort_bids_event_files(events):
+                print(f"  {ep}")
+
+        all_onsets, durations, condition_labels = parse_bids_events(
+            event_files=events,
+            event_ignore=event_ignore,
+            event_cols=event_cols,
+            round_durations=round_durations,
+            n_runs=n_runs,
+        )
+        spec = TimingSpec(
+            all_onsets=all_onsets,
+            durations=durations,
+            condition_labels=condition_labels,
+            from_events=True,
+        )
+    else:
+        assert onsets is not None
+        missing = [f for f in onsets if not Path(f).exists()]
+        if missing:
+            raise FileNotFoundError(f"Onset file not found: {missing[0]}")
+
+        condition_labels = clean_condition_labels([Path(f).stem for f in onsets])
+        durations = parse_durations(durations_arg, len(onsets), condition_labels)
+        if round_durations is not None:
+            durations = [round(d, round_durations) for d in durations]
+
+        all_onsets = []
+        for onset_file in onsets:
+            onsets_by_run = parse_afni_timing_file(onset_file)
+            if len(onsets_by_run) != n_runs:
+                raise ValueError(
+                    f"Onset file {onset_file} has {len(onsets_by_run)} runs, "
+                    f"but {n_runs} input runs were given."
+                )
+            all_onsets.append(onsets_by_run)
+
+        spec = TimingSpec(
+            all_onsets=all_onsets,
+            durations=durations,
+            condition_labels=condition_labels,
+            from_events=False,
+            onset_files=list(onsets),
+        )
+
+    if verbose:
+        print(f"  Conditions: {spec.n_conditions} ({', '.join(spec.condition_labels)})")
+        for cidx, label in enumerate(spec.condition_labels):
+            n_events = sum(len(spec.all_onsets[cidx][r]) for r in range(n_runs))
+            print(
+                f"    {label}: {n_events} events across {n_runs} runs "
+                f"(duration={spec.durations[cidx]:.3f}s)"
+            )
+
+    return spec
+
+
 def parse_hrf_model_args(
     hrf_model_arg: str,
     canonical_arg: str | None,
     durations: list[float],
     condition_labels: list[str],
     tr: float,
+    fir_window_s: float | None = None,
 ) -> dict:
     """
     Parse HRF model arguments and expand labels for FIR.

@@ -948,18 +948,22 @@ def main(argv: list[str] | None = None) -> int:
     elif args.events:
         from fastfuncstuff.design.bids_events import parse_bids_events
 
-        if len(args.events) != n_runs:
+        if len(args.events) not in (1, n_runs):
             print(
-                f"ERROR: {len(args.events)} events files but {n_runs} runs.",
+                f"ERROR: -events requires one TSV per run or a single shared TSV: "
+                f"got {len(args.events)} events files but {n_runs} runs.",
                 file=sys.stderr,
             )
             return 1
+        if len(args.events) == 1 and n_runs > 1:
+            print(f"  Broadcasting 1 events file across {n_runs} runs")
         event_cols = tuple(args.event_cols) if args.event_cols else None
         try:
             bids_onsets, bids_durations, bids_labels = parse_bids_events(
                 event_files=args.events,
                 event_ignore=args.event_ignore,
                 event_cols=event_cols,
+                n_runs=n_runs,
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
