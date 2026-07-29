@@ -304,6 +304,38 @@ Notes:
         "Much faster (k+1 combos instead of 2^k).",
     )
     combo_opts.add_argument(
+        "-null_surrogates",
+        "-null-surrogates",
+        dest="null_surrogates",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Calibrate singleton selection against N phase-randomised surrogates "
+        "per PC (recommended: 20; 0 = off). A bare 'delta > 0' has no noise floor: "
+        "CoD rises mechanically whenever residual variance is removed, so regressors "
+        "unrelated to the data clear zero about half the time and their degrees of "
+        "freedom cost you on unseen data. Each surrogate keeps its PC's variance and "
+        "spectrum but carries no real structure, so a PC must beat its own surrogates "
+        "to be kept. Requires -singleton_only.",
+    )
+    combo_opts.add_argument(
+        "-null_percentile",
+        "-null-percentile",
+        dest="null_percentile",
+        type=float,
+        default=95.0,
+        metavar="P",
+        help="Percentile of its own surrogate deltas a PC must beat (default: 95).",
+    )
+    combo_opts.add_argument(
+        "-null_seed",
+        "-null-seed",
+        dest="null_seed",
+        type=int,
+        default=0,
+        help="Seed for surrogate generation, so a rerun reproduces the selection (default: 0).",
+    )
+    combo_opts.add_argument(
         "-compare",
         action="store_true",
         help="Also run a standard GLMdenoise-style baseline (incremental PCs in "
@@ -653,6 +685,10 @@ def save_combinatorial_results(
             "n_criteria_voxels": run_res.n_criteria_voxels,
             "explained_variance_ratios": run_res.explained_variance_ratios.tolist(),
         }
+        if run_res.pc_status is not None:
+            pc_info["pc_status"] = list(run_res.pc_status)
+        if run_res.null_thresholds is not None:
+            pc_info["null_thresholds"] = run_res.null_thresholds.tolist()
         json_path = f"{output_prefix}_run{run_idx:02d}_optimal_pcs.json"
         with open(json_path, "w") as f:
             json.dump(pc_info, f, indent=2)
@@ -910,6 +946,15 @@ def main():
         sys.exit(1)
     if args.test_curve and not args.test_input:
         print("ERROR: -test_curve requires -test_input")
+        sys.exit(1)
+    if args.null_surrogates < 0:
+        print("ERROR: -null_surrogates must be >= 0")
+        sys.exit(1)
+    if args.null_surrogates > 0 and not args.singleton_only:
+        print("ERROR: -null_surrogates requires -singleton_only")
+        sys.exit(1)
+    if not 0 < args.null_percentile <= 100:
+        print("ERROR: -null_percentile must be in (0, 100]")
         sys.exit(1)
     if args.test_curve_subsets < 1:
         print("ERROR: -test_curve_subsets must be >= 1")
@@ -1307,6 +1352,9 @@ def main():
         criteria_fallback_percentile=args.criteria_fallback_pct,
         selection_strategy=args.selection_strategy,
         singleton_only=args.singleton_only,
+        n_null_surrogates=args.null_surrogates,
+        null_percentile=args.null_percentile,
+        null_seed=args.null_seed,
         designs_by_hrf=designs_by_hrf,
         hrf_indices=hrf_indices,
         device=device,

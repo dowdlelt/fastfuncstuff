@@ -434,3 +434,227 @@ class TestPlotCombinatorialResults:
         results = _make_full_results(3, 40, 50, singleton_only=True)
         figs = plot_combinatorial_results(results, str(tmp_path / "test"))
         assert figs == []
+
+
+# ===========================================================================
+# Null-calibrated singleton selection (-null_surrogates)
+# ===========================================================================
+
+from fastfuncstuff.denoise.combinatorial import (  # noqa: E402
+    fit_combinatorial_denoising,
+    phase_randomize,
+    select_singletons_against_null,
+)
+
+
+class TestPhaseRandomize:
+    """Surrogates are only a valid null if they match the PC on everything
+    except being real: same variance, same spectrum, same DoF cost."""
+
+    def test_preserves_variance_and_autocorrelation(self):
+        torch.manual_seed(0)
+        x = torch.cumsum(torch.randn(200, 3), 0)  # strongly autocorrelated
+        x = (x - x.mean(0)) * torch.tensor([1.0, 5.0, 0.5])
+        gen = torch.Generator().manual_seed(0)
+        surr = phase_randomize(x, 25, generator=gen)
+
+        assert surr.shape == (200, 75)
+        for i in range(3):
+            block = surr[:, i * 25 : (i + 1) * 25]
+            # Variance is exactly preserved by construction, not approximately.
+            torch.testing.assert_close(
+                block.var(dim=0), x[:, i].var().expand(25), rtol=1e-4, atol=1e-4
+            )
+            lag1 = torch.stack(
+                [
+                    torch.corrcoef(torch.stack([block[:-1, j], block[1:, j]]))[0, 1]
+                    for j in range(25)
+                ]
+            )
+            src_lag1 = torch.corrcoef(torch.stack([x[:-1, i], x[1:, i]]))[0, 1]
+            assert abs(lag1.mean() - src_lag1) < 0.1
+
+    def test_surrogates_are_real_valued(self):
+        """Rotating the DC or Nyquist phase would make the inverse FFT complex."""
+        for n_time in (200, 201):  # even and odd both hit the Nyquist branch
+            x = torch.randn(n_time, 2)
+            gen = torch.Generator().manual_seed(1)
+            surr = phase_randomize(x, 4, generator=gen)
+            assert not surr.is_complex()
+            assert torch.isfinite(surr).all()
+
+    def test_seed_reproduces_and_device_does_not_matter(self):
+        x = torch.randn(128, 3)
+        a = phase_randomize(x, 5, generator=torch.Generator().manual_seed(7))
+        b = phase_randomize(x, 5, generator=torch.Generator().manual_seed(7))
+        torch.testing.assert_close(a, b)
+        if torch.cuda.is_available():
+            c = phase_randomize(x.cuda(), 5, generator=torch.Generator().manual_seed(7))
+            torch.testing.assert_close(a, c.cpu(), rtol=1e-4, atol=1e-4)
+
+
+class TestSelectSingletonsAgainstNull:
+    def test_three_states_are_assigned_correctly(self):
+        k, n_sur = 3, 4
+        # baseline 0.5; PC deltas: +0.10 (clears), +0.01 (positive, inside null), -0.02
+        median_cod = np.array([0.5, 0.60, 0.51, 0.48])
+        # every surrogate delta is +0.05, so the p95 threshold is ~0.05
+        null_cod = np.concatenate([[0.5], np.full(k * n_sur, 0.55)])
+
+        selected, thresholds, status = select_singletons_against_null(
+            median_cod, null_cod, k, n_sur, percentile=95.0
+        )
+        assert selected == (0,)
+        assert status == ("selected", "rejected_null", "not_selected")
+        np.testing.assert_allclose(thresholds, 0.05, atol=1e-6)
+
+    def test_each_pc_gets_its_own_threshold(self):
+        """A high-variance PC removes more variance, so it must clear a higher bar."""
+        k, n_sur = 2, 2
+        median_cod = np.array([0.0, 0.05, 0.05])  # identical deltas
+        # PC0's surrogates are quiet, PC1's are not
+        null_cod = np.array([0.0, 0.01, 0.01, 0.09, 0.09])
+        selected, thresholds, status = select_singletons_against_null(
+            median_cod, null_cod, k, n_sur, percentile=95.0
+        )
+        assert selected == (0,)
+        assert status == ("selected", "rejected_null")
+        assert thresholds[1] > thresholds[0]
+
+
+class TestNullCalibrationRejectsFalsePositives:
+    """The reason the null exists.
+
+    CoD is 1 - SS_res/SS_tot with SS_tot recomputed from the cleaned data, and
+    d/dv[(R-v)/(T-v)] < 0 for R < T, so removing residual variance raises CoD
+    whether or not the removed direction was real. A bare `delta > 0` therefore
+    has no noise floor and admits unrelated regressors about half the time.
+    """
+
+    @staticmethod
+    def _one_trial(seed, inject_real_structure, device):
+        n_time, n_vox, k, n_sur = 160, 300, 5, 20
+        torch.manual_seed(seed)
+        design = torch.zeros(n_time, 1)
+        for onset in range(10, n_time - 10, 25):
+            design[onset : onset + 5, 0] = 1.0
+        poly = torch.stack([torch.ones(n_time), torch.linspace(-1, 1, n_time)], 1)
+
+        amp = torch.rand(n_vox, 1) * 2 + 1
+        data = amp @ design.T + torch.randn(n_vox, n_time) * 1.5
+        pcs = torch.randn(n_time, k)
+        if inject_real_structure:
+            # PC0 becomes genuine shared noise: present in every voxel.
+            data = data + (torch.randn(n_vox, 1) * 6.0) @ pcs[:, :1].T
+        betas = amp + torch.randn(n_vox, 1) * 0.05
+
+        def score(columns):
+            return evaluate_all_combinations_for_run(
+                run_data_criteria=data,
+                run_design=design,
+                betas_criteria=betas,
+                poly_nuisance=poly,
+                noise_pcs=columns,
+                combinations=[()] + [(i,) for i in range(columns.shape[1])],
+                variance_ratios=np.zeros(columns.shape[1]),
+                device=device,
+                verbose=False,
+            )[0]
+
+        median_cod = score(pcs)
+        gen = torch.Generator().manual_seed(seed)
+        null_cod = score(phase_randomize(pcs, n_sur, generator=gen))
+        selected, _, _ = select_singletons_against_null(median_cod, null_cod, k, n_sur, 95.0)
+        naive = tuple(i for i in range(k) if median_cod[1 + i] - median_cod[0] > 0)
+        return naive, selected
+
+    def test_unrelated_pcs_are_mostly_rejected(self):
+        """PCs with no relationship to the data: the bare rule keeps ~half."""
+        n_trials = 6
+        naive_total = null_total = 0
+        for seed in range(n_trials):
+            naive, selected = self._one_trial(seed, False, CPU)
+            naive_total += len(naive)
+            null_total += len(selected)
+
+        naive_rate = naive_total / n_trials
+        null_rate = null_total / n_trials
+        assert naive_rate > 1.5, f"expected the bare rule to over-select, got {naive_rate:.2f}/5"
+        assert null_rate < naive_rate / 2, (
+            f"null should cut false positives sharply: {naive_rate:.2f} -> {null_rate:.2f}"
+        )
+
+    def test_genuine_shared_noise_still_survives(self):
+        """Rejecting noise is worthless if it also rejects the real component."""
+        for seed in range(4):
+            _, selected = self._one_trial(seed, True, CPU)
+            assert 0 in selected, f"seed {seed}: real shared-noise PC0 was rejected"
+
+
+class TestNullCalibrationWiring:
+    def test_singleton_only_is_required(self, multi_run_setup):
+        s = multi_run_setup
+        with pytest.raises(ValueError, match="singleton-mode rule"):
+            fit_combinatorial_denoising(
+                data=s["data"],
+                design=s["design"],
+                run_starts=s["run_starts"],
+                tr=2.0,
+                nuisance_per_run=s["nuisance_per_run"],
+                noise_pool_mask=torch.ones(s["n_voxels"], dtype=torch.bool),
+                initial_r2=torch.rand(s["n_voxels"]),
+                max_pcs=2,
+                singleton_only=False,
+                n_null_surrogates=5,
+                device=CPU,
+                verbose=False,
+            )
+
+    def test_status_and_thresholds_reach_the_results(self, multi_run_setup):
+        s = multi_run_setup
+        results = fit_combinatorial_denoising(
+            data=s["data"],
+            design=s["design"],
+            run_starts=s["run_starts"],
+            tr=2.0,
+            nuisance_per_run=s["nuisance_per_run"],
+            noise_pool_mask=torch.ones(s["n_voxels"], dtype=torch.bool),
+            initial_r2=torch.rand(s["n_voxels"]),
+            max_pcs=2,
+            criteria_r2_threshold="50%",
+            singleton_only=True,
+            n_null_surrogates=4,
+            device=CPU,
+            verbose=False,
+        )
+        for run_res in results.per_run_results:
+            assert run_res.pc_status is not None
+            assert len(run_res.pc_status) == 2
+            assert set(run_res.pc_status) <= {"selected", "rejected_null", "not_selected"}
+            assert run_res.null_thresholds is not None
+            assert run_res.null_thresholds.shape == (2,)
+            # The selection and the status must agree, or the plots lie.
+            from_status = tuple(i for i, st in enumerate(run_res.pc_status) if st == "selected")
+            assert from_status == run_res.optimal_combination
+        assert results.metadata["n_null_surrogates"] == 4
+
+    def test_plots_render_with_the_middle_state(self, tmp_path):
+        """The discarded-after-initial-selection state has to reach the figures."""
+        results = _make_full_results(3, 40, 50, max_pcs=3, singleton_only=True)
+        for run_res in results.per_run_results:
+            run_res.pc_status = ("selected", "rejected_null", "not_selected")
+            run_res.null_thresholds = np.array([0.01, 0.02, 0.03])
+            run_res.optimal_combination = (0,)
+
+        import matplotlib.pyplot as plt
+
+        figs = plot_singleton_contributions(results, str(tmp_path / "t"))
+        assert len(figs) == 3
+        for f in figs:
+            plt.close(f)
+        heat = plot_inclusion_heatmap(results, str(tmp_path / "t"))
+        assert (tmp_path / "t_combinatorial_heatmap.png").exists()
+        # "o" for the rejected PC must appear in the heatmap title/marks.
+        assert "rejected by null" in heat[0].axes[0].get_title()
+        for f in heat:
+            plt.close(f)

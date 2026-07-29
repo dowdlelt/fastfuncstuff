@@ -51,6 +51,9 @@ class CombinatorialDenoiseRunResult:
     all_combinations: list[tuple[int, ...]]  # All 2^k subsets
     explained_variance_ratios: np.ndarray  # (k,) per-PC variance ratios
     n_criteria_voxels: int  # Number of criteria voxels used
+    # Singleton null calibration (-null_surrogates). None when it was not run.
+    null_thresholds: np.ndarray | None = None  # (k,) delta a PC had to beat
+    pc_status: tuple[str, ...] | None = None  # (k,) selected|rejected_null|not_selected
 
 
 @dataclass
@@ -340,6 +343,172 @@ def evaluate_all_combinations_for_run(
     return median_cod, var_explained
 
 
+def _evaluate_columns_for_run(
+    columns: torch.Tensor,
+    combos: list[tuple[int, ...]],
+    variance_ratios: np.ndarray,
+    held_data_criteria: torch.Tensor,
+    betas_criteria: torch.Tensor,
+    held_nuisance: torch.Tensor,
+    held_start: int,
+    held_end: int,
+    design: torch.Tensor | None,
+    designs_by_hrf: dict[int, torch.Tensor] | None,
+    hrf_indices: torch.Tensor | None,
+    criteria_mask: torch.Tensor,
+    unique_hrf_indices: list[int] | None,
+    device: torch.device,
+    verbose: bool,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Score a set of candidate nuisance columns against one held-out run.
+
+    Split out so the real PCs and their null surrogates go through exactly the
+    same evaluation — same criteria voxels, same training betas, same per-HRF
+    aggregation. A null scored any other way would not be a null.
+    """
+    if unique_hrf_indices is not None:
+        assert designs_by_hrf is not None and hrf_indices is not None
+        all_group_cods = []
+        criteria_hrf_indices = hrf_indices[criteria_mask]
+
+        for hrf_idx in unique_hrf_indices:
+            group_criteria = criteria_hrf_indices == hrf_idx
+            if int(group_criteria.sum().item()) == 0:
+                continue
+
+            # Move mask to CPU for indexing CPU tensors
+            group_criteria_cpu = group_criteria.cpu()
+            raw_cod, _ = evaluate_all_combinations_for_run(
+                run_data_criteria=held_data_criteria[group_criteria_cpu, :],
+                run_design=designs_by_hrf[hrf_idx][held_start:held_end, :],
+                betas_criteria=betas_criteria[group_criteria_cpu, :],
+                poly_nuisance=held_nuisance,
+                noise_pcs=columns,
+                combinations=combos,
+                variance_ratios=variance_ratios,
+                device=device,
+                return_raw_cod=True,
+                verbose=verbose,
+            )
+            all_group_cods.append(raw_cod)  # (n_combos, V_group)
+
+        # Aggregate across HRF groups
+        all_cod_combined = np.concatenate(all_group_cods, axis=1)
+        return (
+            np.median(all_cod_combined, axis=1).astype(np.float64),
+            np.array([sum(variance_ratios[pc] for pc in combo) for combo in combos]),
+        )
+
+    assert design is not None
+    return evaluate_all_combinations_for_run(
+        run_data_criteria=held_data_criteria,
+        run_design=design[held_start:held_end, :],
+        betas_criteria=betas_criteria,
+        poly_nuisance=held_nuisance,
+        noise_pcs=columns,
+        combinations=combos,
+        variance_ratios=variance_ratios,
+        device=device,
+        verbose=verbose,
+    )
+
+
+# ============================================================================
+# Null calibration for singleton selection
+# ============================================================================
+
+
+def phase_randomize(
+    timecourses: torch.Tensor,
+    n_surrogates: int,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Phase-randomised surrogates: same spectrum and variance, no real structure.
+
+    Randomising the Fourier phases while keeping the magnitudes preserves each
+    timecourse's variance and autocorrelation exactly, so a surrogate costs the
+    same degree of freedom and removes a comparable amount of residual variance
+    as the PC it stands in for. It differs in one respect only: it carries no
+    genuine relationship to the shared noise in the criteria voxels. That makes
+    the distribution of surrogate deltas the right null for "did this PC help",
+    absorbing both the CoD's mechanical response to variance removal and the
+    single-run sampling noise without having to model either.
+
+    Parameters
+    ----------
+    timecourses : torch.Tensor
+        ``(T, k)`` real-valued columns to build surrogates for.
+    n_surrogates : int
+        Surrogates per column.
+    generator : torch.Generator, optional
+        Seeded RNG, so a rerun reproduces the same selection.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(T, k * n_surrogates)``, column-major by source PC: columns
+        ``i * n_surrogates ... (i+1) * n_surrogates - 1`` are surrogates of PC i.
+    """
+    n_time, k = timecourses.shape
+    device = timecourses.device
+    spectrum = torch.fft.rfft(timecourses.double(), dim=0)  # (F, k)
+    magnitude = spectrum.abs()
+    n_freq = magnitude.shape[0]
+
+    mag = magnitude.T.unsqueeze(1).expand(k, n_surrogates, n_freq)
+    # Drawn on the generator's own device (CPU by default) and moved, so the
+    # same seed gives the same surrogates whether the PCs live on GPU or CPU.
+    gen_device = generator.device if generator is not None else torch.device("cpu")
+    phases = (
+        torch.rand(k, n_surrogates, n_freq, device=gen_device, generator=generator) * 2 * torch.pi
+    ).to(device)
+    # DC has no phase to randomise, and for even T neither does Nyquist —
+    # rotating either would make the surrogate complex after the inverse FFT.
+    phases[:, :, 0] = 0.0
+    if n_time % 2 == 0:
+        phases[:, :, -1] = 0.0
+
+    surrogates = torch.fft.irfft(
+        mag * torch.exp(1j * phases.double()), n=n_time, dim=2
+    )  # (k, n_surr, T)
+    out = surrogates.permute(2, 0, 1).reshape(n_time, k * n_surrogates)
+    return out.to(timecourses.dtype)
+
+
+def select_singletons_against_null(
+    median_cod: np.ndarray,
+    null_cod: np.ndarray,
+    k: int,
+    n_surrogates: int,
+    percentile: float = 95.0,
+) -> tuple[tuple[int, ...], np.ndarray, tuple[str, ...]]:
+    """Keep the PCs whose singleton delta beats their own surrogates' deltas.
+
+    ``median_cod`` and ``null_cod`` share element 0 — the baseline (no columns
+    removed) CoD — so the deltas are on the same footing.
+
+    Returns the selection, the per-PC threshold, and a per-PC status of
+    ``selected`` / ``rejected_null`` (delta was positive but inside the null) /
+    ``not_selected`` (delta was not positive at all).
+    """
+    baseline = median_cod[0]
+    deltas = median_cod[1 : k + 1] - baseline
+    null_deltas = (null_cod[1:] - baseline).reshape(k, n_surrogates)
+    thresholds = np.percentile(null_deltas, percentile, axis=1)
+
+    selected: list[int] = []
+    status: list[str] = []
+    for i in range(k):
+        if deltas[i] > thresholds[i]:
+            selected.append(i)
+            status.append("selected")
+        elif deltas[i] > 0:
+            status.append("rejected_null")
+        else:
+            status.append("not_selected")
+    return tuple(selected), thresholds, tuple(status)
+
+
 # ============================================================================
 # Selection strategies
 # ============================================================================
@@ -490,6 +659,9 @@ def fit_combinatorial_denoising(
     criteria_fallback_percentile: float = 5.0,
     selection_strategy: str = "argmax",
     singleton_only: bool = False,
+    n_null_surrogates: int = 0,
+    null_percentile: float = 95.0,
+    null_seed: int = 0,
     designs_by_hrf: dict[int, torch.Tensor] | None = None,
     hrf_indices: torch.Tensor | None = None,
     device: torch.device | None = None,
@@ -532,6 +704,17 @@ def fit_combinatorial_denoising(
         percentile instead.
     selection_strategy : str, default="argmax"
         Strategy for selecting optimal combination (see select_optimal_combination).
+    singleton_only : bool, default=False
+        Evaluate each PC alone rather than all 2^k subsets.
+    n_null_surrogates : int, default=0
+        Phase-randomised surrogates per PC for the singleton null. 0 keeps the
+        historical bare ``delta > 0`` rule, which has no noise floor: CoD rises
+        mechanically when residual variance is removed, so unrelated regressors
+        clear zero roughly half the time. Singleton mode only.
+    null_percentile : float, default=95.0
+        Percentile of a PC's own surrogate deltas it must beat to be selected.
+    null_seed : int, default=0
+        Seed for surrogate generation, so a rerun reproduces the selection.
     device : torch.device, optional
         Compute device. Auto-detected if None.
     verbose : bool, default=True
@@ -573,7 +756,11 @@ def fit_combinatorial_denoising(
         # Only singletons: baseline + each PC alone
         combinations = [()] + [(i,) for i in range(max_pcs)]
         n_combos = max_pcs + 1
-        mode_str = "Singleton-only (positive-delta PCs)"
+        mode_str = (
+            f"Singleton-only (null-calibrated, {n_null_surrogates} surrogates)"
+            if n_null_surrogates > 0
+            else "Singleton-only (positive-delta PCs)"
+        )
     else:
         combinations = generate_all_pc_combinations(max_pcs)
         n_combos = 2**max_pcs
@@ -587,6 +774,11 @@ def fit_combinatorial_denoising(
         print(f"  Criteria pool spec: {criteria_r2_threshold}")
         if not singleton_only:
             print(f"  Selection strategy: {selection_strategy}")
+
+    if n_null_surrogates > 0 and not singleton_only:
+        raise ValueError("null calibration is a singleton-mode rule; pass singleton_only=True")
+    # Seeded on the host so the selection reproduces regardless of device.
+    null_generator = torch.Generator(device="cpu").manual_seed(null_seed)
 
     per_run_results = []
     noise_pcs_per_run = []
@@ -806,74 +998,75 @@ def fit_combinatorial_denoising(
             del X, XtX, XtX_reg, XtX_inv, pinv
         torch.cuda.empty_cache()
 
-        if per_hrf_mode:
-            assert designs_by_hrf is not None and hrf_indices is not None
-            # Per-HRF evaluation: get raw CoD per group, concatenate, take median
-            all_group_cods = []
-            criteria_hrf_indices = hrf_indices[criteria_mask]
-
-            for hrf_idx in unique_hrf_indices_list:
-                group_criteria = criteria_hrf_indices == hrf_idx
-                n_group_criteria = int(group_criteria.sum().item())
-                if n_group_criteria == 0:
-                    continue
-
-                # Move mask to CPU for indexing CPU tensors
-                group_criteria_cpu = group_criteria.cpu()
-                group_data = held_data_criteria[group_criteria_cpu, :]
-                group_betas = betas_criteria[group_criteria_cpu, :]
-                group_design = designs_by_hrf[hrf_idx][held_start:held_end, :]
-
-                raw_cod, _ = evaluate_all_combinations_for_run(
-                    run_data_criteria=group_data,
-                    run_design=group_design,
-                    betas_criteria=group_betas,
-                    poly_nuisance=held_nuisance,
-                    noise_pcs=pcs,
-                    combinations=combinations,
-                    variance_ratios=variance_ratios,
-                    device=device,
-                    return_raw_cod=True,
-                    verbose=verbose,
-                )
-                all_group_cods.append(raw_cod)  # (n_combos, V_group)
-
-            # Aggregate across HRF groups
-            all_cod_combined = np.concatenate(all_group_cods, axis=1)
-            median_cod = np.median(all_cod_combined, axis=1).astype(np.float64)
-            var_explained = np.array(
-                [sum(variance_ratios[pc] for pc in combo) for combo in combinations]
-            )
-        else:
-            assert design is not None
-            held_design = design[held_start:held_end, :]
-            median_cod, var_explained = evaluate_all_combinations_for_run(
-                run_data_criteria=held_data_criteria,
-                run_design=held_design,
-                betas_criteria=betas_criteria,
-                poly_nuisance=held_nuisance,
-                noise_pcs=pcs,
-                combinations=combinations,
-                variance_ratios=variance_ratios,
-                device=device,
-                verbose=verbose,
-            )
+        # One scoring path, so the null surrogates are evaluated exactly the way
+        # the real PCs are — same criteria voxels, same betas, same aggregation.
+        eval_kwargs = dict(
+            held_data_criteria=held_data_criteria,
+            betas_criteria=betas_criteria,
+            held_nuisance=held_nuisance,
+            held_start=held_start,
+            held_end=held_end,
+            design=design,
+            designs_by_hrf=designs_by_hrf,
+            hrf_indices=hrf_indices,
+            criteria_mask=criteria_mask,
+            unique_hrf_indices=unique_hrf_indices_list if per_hrf_mode else None,
+            device=device,
+            verbose=verbose,
+        )
+        median_cod, var_explained = _evaluate_columns_for_run(
+            columns=pcs, combos=combinations, variance_ratios=variance_ratios, **eval_kwargs
+        )
 
         # ----------------------------------------------------------------
         # Step 5: Select optimal combination
         # ----------------------------------------------------------------
+        null_thresholds = None
+        pc_status = None
         if singleton_only:
-            # Select all PCs with positive delta vs baseline
             baseline_cod = median_cod[0]
-            positive_pcs = []
-            var_exp_positive = 0.0
-            for i, combo in enumerate(combinations):
-                if len(combo) == 1:  # Singleton
-                    delta = median_cod[i] - baseline_cod
-                    if delta > 0:
-                        positive_pcs.append(combo[0])
-                        var_exp_positive += var_explained[i]
-            best_combo = tuple(positive_pcs)
+            if n_null_surrogates > 0:
+                # A bare `delta > 0` is a sign test with no noise floor: CoD
+                # rises mechanically whenever residual variance is removed
+                # (d/dv[(R-v)/(T-v)] < 0 for R < T), and the single-run delta
+                # is noisy on top of that, so unrelated regressors clear zero
+                # about half the time. Each PC is scored against surrogates of
+                # itself instead.
+                surrogates = phase_randomize(pcs, n_null_surrogates, generator=null_generator)
+                null_combos = [()] + [(i,) for i in range(surrogates.shape[1])]
+                null_cod, _ = _evaluate_columns_for_run(
+                    columns=surrogates,
+                    combos=null_combos,
+                    variance_ratios=np.zeros(surrogates.shape[1]),
+                    **eval_kwargs,
+                )
+                best_combo, null_thresholds, pc_status = select_singletons_against_null(
+                    median_cod=median_cod,
+                    null_cod=null_cod,
+                    k=max_pcs,
+                    n_surrogates=n_null_surrogates,
+                    percentile=null_percentile,
+                )
+                var_exp_positive = float(sum(variance_ratios[pc] for pc in best_combo))
+                if verbose:
+                    n_rejected = sum(s == "rejected_null" for s in pc_status)
+                    print(
+                        f"  Null calibration ({n_null_surrogates} surrogates, "
+                        f"p{null_percentile:g}): {len(best_combo)} PC(s) cleared, "
+                        f"{n_rejected} positive-but-inside-null rejected"
+                    )
+                del surrogates
+            else:
+                # Select all PCs with positive delta vs baseline
+                positive_pcs = []
+                var_exp_positive = 0.0
+                for i, combo in enumerate(combinations):
+                    if len(combo) == 1:  # Singleton
+                        delta = median_cod[i] - baseline_cod
+                        if delta > 0:
+                            positive_pcs.append(combo[0])
+                            var_exp_positive += var_explained[i]
+                best_combo = tuple(positive_pcs)
             best_idx = 0  # Not meaningful in singleton mode
         else:
             best_idx, best_combo = select_optimal_combination(
@@ -909,6 +1102,8 @@ def fit_combinatorial_denoising(
                 all_combinations=combinations,
                 explained_variance_ratios=variance_ratios,
                 n_criteria_voxels=int(n_criteria),
+                null_thresholds=null_thresholds,
+                pc_status=pc_status,
             )
         )
 
@@ -927,7 +1122,11 @@ def fit_combinatorial_denoising(
         print(f"{'=' * 60}")
         for res in per_run_results:
             combo_display = tuple(pc + 1 for pc in res.optimal_combination)
-            print(f"  Run {res.run_idx}: PCs {combo_display} (CoD={res.optimal_cod:.4f})")
+            line = f"  Run {res.run_idx}: PCs {combo_display} (CoD={res.optimal_cod:.4f})"
+            if res.pc_status is not None:
+                n_rej = sum(s == "rejected_null" for s in res.pc_status)
+                line += f", {n_rej} rejected by null"
+            print(line)
 
     metadata = {
         "max_pcs": max_pcs,
@@ -936,6 +1135,9 @@ def fit_combinatorial_denoising(
         "criteria_fallback_percentile": criteria_fallback_percentile,
         "selection_strategy": selection_strategy,
         "singleton_only": singleton_only,
+        "n_null_surrogates": n_null_surrogates,
+        "null_percentile": null_percentile if n_null_surrogates > 0 else None,
+        "null_seed": null_seed if n_null_surrogates > 0 else None,
         "n_runs": n_runs,
         "tr": tr,
     }
@@ -1373,6 +1575,7 @@ def plot_singleton_contributions(
     from pathlib import Path
 
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     Path(output_prefix).parent.mkdir(parents=True, exist_ok=True)
 
@@ -1382,7 +1585,16 @@ def plot_singleton_contributions(
     figs = []
 
     for run_res in results.per_run_results:
-        fig, ax = plt.subplots(figsize=(max(4, max_pcs * 0.5 + 2), 4))
+        # With a null in play the deltas span orders of magnitude — one real PC
+        # dwarfs the rest — so the margin against each PC's own threshold gets
+        # its own symlog panel. Otherwise the near-threshold PCs, which are the
+        # whole point of the null, are a flat line at the bottom of the plot.
+        has_null = run_res.null_thresholds is not None
+        if has_null:
+            fig, (ax, ax_margin) = plt.subplots(1, 2, figsize=(max(8, max_pcs * 1.0 + 4), 4))
+        else:
+            fig, ax = plt.subplots(figsize=(max(4, max_pcs * 0.5 + 2), 4))
+            ax_margin = None
 
         # Find baseline (no PCs) and singleton (one PC) combinations
         baseline_cod = None
@@ -1402,16 +1614,43 @@ def plot_singleton_contributions(
         pc_indices = [pc for pc, _ in singleton_deltas]
         deltas = [cod - baseline_cod for _, cod in singleton_deltas]
 
-        # Color bars by sign (positive=green, negative=red)
-        colors = ["#2ecc71" if d >= 0 else "#e74c3c" for d in deltas]
+        # Three states once a null is in play: kept, positive-but-inside-the-null
+        # (the ones the old bare `delta > 0` rule would have swept in), and
+        # negative. Without a null there are only the two.
+        status = run_res.pc_status
+        if status is not None:
+            palette = {
+                "selected": "#2ecc71",
+                "rejected_null": "#f39c12",
+                "not_selected": "#e74c3c",
+            }
+            colors = [palette[status[pc]] for pc in pc_indices]
+        else:
+            colors = ["#2ecc71" if d >= 0 else "#e74c3c" for d in deltas]
 
         ax.bar(range(len(pc_indices)), deltas, color=colors, edgecolor="black", alpha=0.7)
+
+        # Draw the bar each PC actually had to clear.
+        if run_res.null_thresholds is not None:
+            for xi, pc in enumerate(pc_indices):
+                ax.hlines(
+                    run_res.null_thresholds[pc],
+                    xi - 0.4,
+                    xi + 0.4,
+                    color="black",
+                    linestyle="--",
+                    linewidth=1.2,
+                    zorder=3,
+                )
 
         # Add zero line
         ax.axhline(y=0, color="black", linestyle="-", linewidth=0.8)
 
         # Set fixed y-limits with some padding to prevent squishing
         y_min, y_max = min(deltas), max(deltas)
+        if run_res.null_thresholds is not None:
+            y_min = min(y_min, float(run_res.null_thresholds.min()))
+            y_max = max(y_max, float(run_res.null_thresholds.max()))
         y_range = y_max - y_min
         if y_range == 0:
             y_range = 0.001
@@ -1422,9 +1661,53 @@ def plot_singleton_contributions(
         ax.set_xticklabels([f"PC{pc + 1}" for pc in pc_indices])
         ax.set_xlabel("Principal Component")
         ax.set_ylabel("Δ CoD (vs. baseline)")
-        ax.set_title(
-            f"Run {run_res.run_idx}: Individual PC Contributions\nBaseline CoD = {baseline_cod:.4f}"
-        )
+        if status is not None:
+            from matplotlib.patches import Patch
+
+            n_rej = sum(s == "rejected_null" for s in status)
+            # Two panels: the run identity goes above both, so the axes titles
+            # stay short enough not to collide.
+            fig.suptitle(
+                f"Run {run_res.run_idx}: Individual PC Contributions — "
+                f"Baseline CoD = {baseline_cod:.4f} — "
+                f"{n_rej} PC(s) positive but inside the null",
+                fontsize=10,
+            )
+            ax.set_title("Δ CoD per PC", fontsize=9)
+            ax.legend(
+                handles=[
+                    Patch(facecolor="#2ecc71", edgecolor="black", label="selected"),
+                    Patch(facecolor="#f39c12", edgecolor="black", label="rejected by null"),
+                    Patch(facecolor="#e74c3c", edgecolor="black", label="Δ ≤ 0"),
+                    Line2D([0], [0], color="black", ls="--", label="null threshold"),
+                ],
+                fontsize=7,
+                loc="best",
+            )
+        else:
+            ax.set_title(
+                f"Run {run_res.run_idx}: Individual PC Contributions\n"
+                f"Baseline CoD = {baseline_cod:.4f}"
+            )
+
+        if ax_margin is not None:
+            assert run_res.null_thresholds is not None
+            margins = [deltas[i] - run_res.null_thresholds[pc] for i, pc in enumerate(pc_indices)]
+            ax_margin.bar(
+                range(len(pc_indices)), margins, color=colors, edgecolor="black", alpha=0.7
+            )
+            ax_margin.axhline(y=0, color="black", linewidth=1.0)
+            finite = [abs(m) for m in margins if m != 0]
+            ax_margin.set_yscale(
+                "symlog", linthresh=max(float(np.median(finite)) if finite else 1e-6, 1e-9)
+            )
+            ax_margin.set_xticks(range(len(pc_indices)))
+            ax_margin.set_xticklabels([f"PC{pc + 1}" for pc in pc_indices])
+            ax_margin.set_xlabel("Principal Component")
+            ax_margin.set_ylabel("Δ CoD − null threshold (symlog)")
+            ax_margin.set_title("Margin over the null (>0 = kept)", fontsize=9)
+            ax_margin.grid(alpha=0.3, axis="y")
+            fig.tight_layout(rect=(0, 0, 1, 0.93))
 
         # Use bbox_inches instead of tight_layout to avoid warnings
         singleton_path = f"{output_prefix}_run{run_res.run_idx}_singleton_contributions.png"
@@ -1590,6 +1873,10 @@ def plot_inclusion_heatmap(
     # Extract delta R2 for each singleton PC (same calculation as bar plot)
     delta_matrix = np.zeros((n_runs, max_pcs), dtype=np.float32)
     inclusion_mask = np.zeros((n_runs, max_pcs), dtype=bool)
+    # Positive delta that did not clear its own null — the PCs the bare
+    # `delta > 0` rule would have taken. Shown so an over-permissive selection
+    # is visible as a field of open circles rather than silently absent.
+    rejected_mask = np.zeros((n_runs, max_pcs), dtype=bool)
 
     for run_res in results.per_run_results:
         run_idx = run_res.run_idx
@@ -1608,6 +1895,10 @@ def plot_inclusion_heatmap(
             delta_matrix[run_idx, pc_idx] = delta
         for pc_idx in run_res.optimal_combination:
             inclusion_mask[run_idx, pc_idx] = True
+        if run_res.pc_status is not None:
+            for pc_idx, state in enumerate(run_res.pc_status):
+                if state == "rejected_null":
+                    rejected_mask[run_idx, pc_idx] = True
 
     # Find global min/max for consistent color scale (centered at 0 if possible)
     delta_min = delta_matrix.min()
@@ -1625,30 +1916,36 @@ def plot_inclusion_heatmap(
         vmax=abs_max,
     )
 
-    # Add X marks for included PCs
+    # X = kept, o = positive but inside the null, blank = not a candidate
     for ri in range(n_runs):
         for pi in range(max_pcs):
-            if inclusion_mask[ri, pi]:
-                # Choose text color based on delta sign for visibility
-                delta_val = delta_matrix[ri, pi]
-                text_color = "white" if abs(delta_val) > abs_max * 0.5 else "black"
-                ax_heat.text(
-                    pi,
-                    ri,
-                    "X",
-                    ha="center",
-                    va="center",
-                    fontweight="bold",
-                    color=text_color,
-                    fontsize=10,
-                )
+            if not (inclusion_mask[ri, pi] or rejected_mask[ri, pi]):
+                continue
+            # Choose text color based on delta sign for visibility
+            delta_val = delta_matrix[ri, pi]
+            text_color = "white" if abs(delta_val) > abs_max * 0.5 else "black"
+            ax_heat.text(
+                pi,
+                ri,
+                "X" if inclusion_mask[ri, pi] else "o",
+                ha="center",
+                va="center",
+                fontweight="bold",
+                color=text_color,
+                fontsize=10,
+            )
 
     ax_heat.set_xlabel("PC Index (1-based)")
     ax_heat.set_ylabel("Run")
     ax_heat.set_xticks(range(max_pcs))
     ax_heat.set_xticklabels([f"PC{i + 1}" for i in range(max_pcs)], fontsize=8)
     ax_heat.set_yticks(range(n_runs))
-    ax_heat.set_title("PC Delta R² (X = included)")
+    if rejected_mask.any():
+        ax_heat.set_title(
+            f"PC Delta R² (X = included, o = rejected by null; {int(rejected_mask.sum())} rejected)"
+        )
+    else:
+        ax_heat.set_title("PC Delta R² (X = included)")
 
     # Colorbar
     cbar = fig_heat.colorbar(im, ax=ax_heat, shrink=0.8)
