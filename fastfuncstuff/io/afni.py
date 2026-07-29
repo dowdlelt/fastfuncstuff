@@ -49,6 +49,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
@@ -1158,6 +1159,7 @@ def load_and_concatenate_runs(
     mask_flat: np.ndarray | None = None,
     total_timepoints: int | None = None,
     load_threads: int | None = None,
+    per_run_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -1194,6 +1196,13 @@ def load_and_concatenate_runs(
         Runs to decode concurrently. Default: auto (see
         :func:`resolve_load_threads`); 1 disables threading. Overridden by
         the ``FFS_LOAD_THREADS`` environment variable.
+    per_run_fn : callable, optional
+        ``fn(run_data, run_idx) -> run_data``, applied to each run's
+        ``(n_voxels, n_timepoints)`` block before it lands in the output, while
+        that run is the only copy in flight. This is where per-run
+        preprocessing belongs (spatial blur, for instance): doing it afterwards
+        would need the whole concatenated dataset resident twice. Must return
+        the same shape and device it was given. Applied after ``mask_flat``.
 
     Returns
     -------
@@ -1302,10 +1311,17 @@ def load_and_concatenate_runs(
             data_torch = data_np
         else:
             data_torch = torch.from_numpy(data_np).to(device)
-        n_tps_run = data_torch.shape[1]
 
         # Delete numpy array immediately to free memory
         del data_np
+
+        # Per-run preprocessing (blur, etc.) happens here, while the run is the
+        # only copy in flight -- doing it after concatenation would need the
+        # whole dataset resident twice.
+        if per_run_fn is not None:
+            data_torch = per_run_fn(data_torch, i)
+
+        n_tps_run = data_torch.shape[1]
 
         # All runs must share the voxel dimension to concatenate along time.
         # A mismatch means the runs are on different spatial grids (e.g. resampled

@@ -57,6 +57,7 @@ try:
     )
     from fastfuncstuff.io.afni import (
         get_tr_from_file,
+        load_and_concatenate_runs,
         load_nifti,
         nifti_shape,
         read_afni_design_matrix,  # noqa: F401 — re-imported in sub-function but also used at module scope
@@ -2140,9 +2141,6 @@ def main():
         print()
         print("📦 Preprocessing data...")
 
-        # Need to load data manually for preprocessing
-        from tqdm import tqdm
-
         # Get header info from first file
         first_img = load_nifti(input_files[0])
         affine = first_img.affine
@@ -2189,46 +2187,35 @@ def main():
         # fill run-by-run — peak stays ~one extra run instead of a full copy.
         n_voxels = int(np.prod(volume_shape))
         total_tps = int(design_info["n_timepoints"])
-        fmri_data_preprocessed = np.empty((n_voxels, total_tps), dtype=np.float32)
 
         if args.do_blur is not None:
             print(f"  Applying Gaussian blur (FWHM = {args.do_blur} mm)...")
 
-        col = 0
-        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading runs", unit="run")):
-            img = load_nifti(run_file)
-            data_4d = img.get_fdata(dtype=np.float32)
-
-            if data_4d.ndim != 4:
-                raise ValueError(f"Expected 4D data, got shape {data_4d.shape}")
-
-            # Apply blur if requested (on 4D data)
-            if args.do_blur is not None:
-                data_4d = gaussian_blur_3d(
-                    data_4d,
-                    fwhm_mm=args.do_blur,
-                    voxel_sizes=voxel_sizes,
-                    device=device,
-                    verbose=(run_idx == 0),  # Only print details for first run
-                )
-
-            # Flatten to 2D (n_voxels, n_timepoints) and copy into the buffer,
-            # freeing this run before the next load so we never hold two copies.
-            n_tps = data_4d.shape[3]
-            if col + n_tps > total_tps:
-                raise ValueError(
-                    f"Run data exceeds design length: loaded {col + n_tps} "
-                    f"timepoints, design expects {total_tps}"
-                )
-            fmri_data_preprocessed[:, col : col + n_tps] = data_4d.reshape(n_voxels, n_tps)
-            col += n_tps
-            del img, data_4d
-
-        if col != total_tps:
-            raise ValueError(
-                f"Loaded {col} timepoints but design expects {total_tps}; "
-                "check that the input runs match the design matrix."
+        def _blur_run(run_data, run_idx):
+            # The loader hands us (n_voxels, n_tps) in C order, so the view back
+            # to (x, y, z, t) is free.
+            n_tps = run_data.shape[1]
+            blurred = gaussian_blur_3d(
+                run_data.numpy().reshape(*volume_shape, n_tps),
+                fwhm_mm=args.do_blur,
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=(run_idx == 0),  # Only print details for first run
             )
+            return torch.from_numpy(blurred.reshape(n_voxels, n_tps))
+
+        # Shared loader: threaded decode, the fast volume-major -> voxel-major
+        # reorder, and the same preallocate-and-fill / length-check behaviour
+        # this branch used to hand-roll. keep_on_cpu because the diagnostics and
+        # scaling below work on the whole resident dataset.
+        data_tensor, _loaded_run_starts = load_and_concatenate_runs(
+            input_files,
+            keep_on_cpu=True,
+            total_timepoints=total_tps,
+            per_run_fn=_blur_run if args.do_blur is not None else None,
+        )
+        fmri_data_preprocessed = data_tensor.numpy()
+        del data_tensor
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:

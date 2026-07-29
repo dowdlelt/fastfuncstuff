@@ -187,3 +187,21 @@ def test_save_nifti_roundtrip_is_exact_for_c_order(tmp_path):
     path = tmp_path / "c_order.nii"
     save_nifti(arr, path, affine=np.diag([2.0, 2.0, 2.0, 1.0]))
     assert np.array_equal(np.asarray(nib.load(str(path)).dataobj), arr)
+
+
+def test_per_run_fn_sees_each_run_once_in_order(tmp_path):
+    paths = _write_runs(tmp_path, ".nii.gz")
+    baseline, _ = load_and_concatenate_runs(paths, device=torch.device("cpu"))
+    seen = []
+
+    def scale_by_run(run_data, run_idx):
+        seen.append((run_idx, run_data.shape[1]))
+        return run_data * (run_idx + 1)
+
+    got, run_starts = load_and_concatenate_runs(
+        paths, device=torch.device("cpu"), per_run_fn=scale_by_run
+    )
+    assert seen == list(zip(range(len(RUN_LENS)), RUN_LENS, strict=True))
+    for i, start in enumerate(run_starts):
+        stop = start + RUN_LENS[i]
+        assert torch.equal(got[:, start:stop], baseline[:, start:stop] * (i + 1))
