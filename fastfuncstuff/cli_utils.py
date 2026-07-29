@@ -474,8 +474,6 @@ def load_and_preprocess_runs(
     - Device strategy is automatically determined based on data size vs GPU memory
     """
     try:
-        from tqdm import tqdm
-
         from fastfuncstuff.io.afni import load_afni_mask, load_and_concatenate_runs, load_nifti
         from fastfuncstuff.utils import gaussian_blur_3d, scale_to_percent_signal
     except ImportError as e:
@@ -623,57 +621,39 @@ def load_and_preprocess_runs(
         print(f"  ⚠️  Large dataset ({data_size_gb:.2f} GB)")
         print("     Loading to CPU and processing in GPU chunks")
 
-    # Load data with blur if needed
+    # Blur is per-run work, so it rides along inside the shared loader rather
+    # than justifying a second, slower load path: the old fork here decoded
+    # serially, did the slow volume-major reshape, and then torch.cat'd a list
+    # of runs (~2x peak). The loader threads the decode, fills one preallocated
+    # buffer, and hands the callback each run while it is the only copy alive.
+    per_run_fn = None
     if blur_fwhm is not None:
         if verbose:
             print(f"\n  Applying Gaussian blur (FWHM = {blur_fwhm} mm)...")
 
-        run_data_list = []
-        run_starts = [0]
-        current_timepoint = 0
-
-        for run_file in tqdm(
-            input_files, desc="    Loading & blurring", unit="run", disable=not verbose
-        ):
-            img = load_nifti(run_file)
-            data_4d = img.get_fdata(dtype=np.float32)
-
-            # Apply blur on 4D data
-            data_4d_blurred = gaussian_blur_3d(
-                data_4d,
+        def per_run_fn(run_data, _run_idx):
+            # The loader hands us (n_voxels, n_tps) in C order and, because a
+            # blur needs whole volumes, before any mask -- so the view back to
+            # (x, y, z, t) is free and complete.
+            n_tps = run_data.shape[1]
+            blurred = gaussian_blur_3d(
+                run_data.cpu().numpy().reshape(*volume_shape, n_tps),
                 fwhm_mm=blur_fwhm,
                 voxel_sizes=voxel_sizes,
                 device=device,
                 verbose=False,
             )
+            out = torch.from_numpy(blurred.reshape(-1, n_tps))
+            return out.to(run_data.device)
 
-            # Flatten and mask
-            n_tps = data_4d_blurred.shape[3]
-            data_2d = data_4d_blurred.reshape(-1, n_tps)
-
-            if mask_flat is not None:
-                data_2d = data_2d[mask_flat, :]
-
-            # Convert to tensor
-            data_tensor = torch.from_numpy(data_2d.T).contiguous()  # (n_tps, n_voxels)
-            if not keep_on_cpu:
-                data_tensor = data_tensor.to(device)
-
-            run_data_list.append(data_tensor)
-            current_timepoint += n_tps
-            run_starts.append(current_timepoint)
-
-        # Concatenate runs
-        data = torch.cat(run_data_list, dim=0).T  # (n_voxels, n_timepoints)
-    else:
-        # Use optimized loading function
-        data, run_starts = load_and_concatenate_runs(
-            [Path(f) for f in input_files],
-            device=device,
-            keep_on_cpu=keep_on_cpu,
-            mask_flat=mask_flat,
-            load_threads=load_threads,
-        )
+    data, run_starts = load_and_concatenate_runs(
+        [Path(f) for f in input_files],
+        device=device,
+        keep_on_cpu=keep_on_cpu,
+        mask_flat=mask_flat,
+        load_threads=load_threads,
+        per_run_fn=per_run_fn,
+    )
 
     # Remove duplicate last run_start
     if len(run_starts) > len(input_files):

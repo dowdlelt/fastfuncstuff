@@ -83,6 +83,7 @@ try:
         load_nifti,
         onsets_to_tr_matrix,  # noqa: F401
         save_nifti,
+        to_voxel_major,
     )
     from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
 except ImportError as e:
@@ -958,8 +959,10 @@ def main():
         n_tp = data.shape[3]
         n_timepoints_per_run.append(n_tp)
 
-        # Flatten to 2D immediately to avoid large 4D concatenation later
-        data_list.append(data.reshape(-1, n_tp))
+        # Flatten to 2D immediately to avoid large 4D concatenation later.
+        # Shared primitive: a plain reshape here is a single-threaded reversal
+        # of the whole run and would dominate load time.
+        data_list.append(to_voxel_major(data))
 
     # Check TR consistency
     if args.tr is None:

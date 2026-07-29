@@ -205,3 +205,24 @@ def test_per_run_fn_sees_each_run_once_in_order(tmp_path):
     for i, start in enumerate(run_starts):
         stop = start + RUN_LENS[i]
         assert torch.equal(got[:, start:stop], baseline[:, start:stop] * (i + 1))
+
+
+def test_per_run_fn_runs_before_the_mask(tmp_path):
+    # A spatial blur needs whole volumes, so the callback must see every voxel
+    # even when the caller asked for a masked load.
+    paths = _write_runs(tmp_path, ".nii.gz")
+    n_voxels = int(np.prod(SHAPE))
+    mask = np.zeros(n_voxels, dtype=bool)
+    mask[::4] = True
+    widths = []
+
+    def note_width(run_data, _run_idx):
+        widths.append(run_data.shape[0])
+        return run_data
+
+    got, _ = load_and_concatenate_runs(
+        paths, device=torch.device("cpu"), mask_flat=mask, per_run_fn=note_width
+    )
+    assert widths == [n_voxels] * len(paths)  # full volume, not the mask
+    expected, _ = load_and_concatenate_runs(paths, device=torch.device("cpu"), mask_flat=mask)
+    assert torch.equal(got, expected)

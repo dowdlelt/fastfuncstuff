@@ -1671,11 +1671,9 @@ def analyze_with_cross_validation(
         if verbose:
             print(f"  • Loaded {len(fmri_data)} run files")
     elif isinstance(fmri_data, (str, Path)):
-        # Single file
-        img = load_nifti(fmri_data)
-        data_np = img.get_fdata()  # type: ignore[attr-defined]
-        data_np = data_np.reshape(-1, data_np.shape[-1])
-        data = torch.from_numpy(data_np).float()
+        # Single file -- same shared loader as the multi-run branch above, which
+        # is what makes the volume-major reorder fast (and float32, not float64).
+        data, _ = load_and_concatenate_runs([fmri_data], device=torch.device("cpu"))
         if verbose:
             print(f"  • Loaded single file: {fmri_data}")
     elif isinstance(fmri_data, np.ndarray):
@@ -1788,13 +1786,13 @@ def _load_fmri_data(
         if not filepath.exists():
             raise FileNotFoundError(f"fMRI data file not found: {filepath}")
 
-        img = load_nifti(filepath)
-        data_np = img.get_fdata(dtype=np.float32)
-
-        # from_numpy SHARES the buffer (no copy) -- to_tensor() would go through
-        # torch.tensor(), which always copies, doubling peak RAM. At whole-dataset
-        # scale (a 130+ GB concatenated input) that copy OOM-kills the host.
-        data = torch.from_numpy(data_np).to(device=device)
+        # One loader for every file read: it threads the decode, does the
+        # volume-major -> voxel-major reorder on the GPU when that is where the
+        # data is headed, and fills a single buffer (no copy to double peak RAM,
+        # which at whole-dataset scale would OOM-kill the host). Returns 2D
+        # (n_voxels, n_timepoints); both callers set volume_shape from the
+        # header themselves and treat 2D as already-flattened.
+        data, _ = load_and_concatenate_runs([filepath], device=device)
 
     elif isinstance(fmri_data, np.ndarray):
         # Same reasoning: share the array via from_numpy rather than copy it.

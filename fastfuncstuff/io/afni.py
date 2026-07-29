@@ -1008,6 +1008,21 @@ def _voxel_major_numpy(data_np: np.ndarray, n_threads: int = 1) -> np.ndarray:
     return out.reshape(n_voxels, n_tps)
 
 
+def to_voxel_major(data_4d: np.ndarray, n_threads: int | None = None) -> np.ndarray:
+    """Reorder a volume-major ``(x, y, z, t)`` array to C-order ``(n_voxels, t)``.
+
+    The shared primitive for code that has already got a 4D array in hand and
+    cannot use :func:`load_and_concatenate_runs` (which does this itself, and
+    should be preferred whenever you are loading from disk). A plain
+    ``reshape`` here is a single-threaded four-axis memory reversal and the
+    slowest step in most loads; this threads it.
+    """
+    if n_threads is None:
+        n_cpu, _ = resolve_cpu_threads()
+        n_threads = max(1, min(8, n_cpu))
+    return _voxel_major_numpy(data_4d, n_threads)
+
+
 def _voxel_major_cuda(
     data_np: np.ndarray,
     device: torch.device,
@@ -1273,13 +1288,21 @@ def load_and_concatenate_runs(
         device if (n_threads == 1 and device is not None and device.type == "cuda") else None
     )
 
+    # per_run_fn has to see full-volume data -- a spatial blur cannot be
+    # computed on a masked voxel list -- so when one is given the mask moves out
+    # of the decode and is applied in the consumer loop, after the callback.
+    decode_mask = None if per_run_fn is not None else mask_flat
+    deferred_mask: torch.Tensor | None = None
+    if per_run_fn is not None and mask_flat is not None:
+        deferred_mask = torch.from_numpy(np.ascontiguousarray(mask_flat))
+
     def _iter_runs():
         if n_threads <= 1:
             for i, run_file in enumerate(run_files):
                 yield (
                     i,
                     run_file,
-                    _load_run_array(run_file, mask_flat, inner_threads, reorder_device),
+                    _load_run_array(run_file, decode_mask, inner_threads, reorder_device),
                 )
             return
         with ThreadPoolExecutor(max_workers=n_threads) as pool:
@@ -1291,7 +1314,7 @@ def load_and_concatenate_runs(
                     pending[next_submit] = pool.submit(
                         _load_run_array,
                         run_files[next_submit],
-                        mask_flat,
+                        decode_mask,
                         inner_threads,
                         reorder_device,
                     )
@@ -1320,6 +1343,8 @@ def load_and_concatenate_runs(
         # whole dataset resident twice.
         if per_run_fn is not None:
             data_torch = per_run_fn(data_torch, i)
+            if deferred_mask is not None:
+                data_torch = data_torch[deferred_mask.to(data_torch.device)]
 
         n_tps_run = data_torch.shape[1]
 
@@ -1368,6 +1393,11 @@ def load_and_concatenate_runs(
                 "check that the input runs match the design matrix."
             )
         result = concatenated
+    elif len(torch_runs) == 1:
+        # Nothing to concatenate: torch.cat would still copy the whole run,
+        # doubling peak for the single-file case.
+        result = torch_runs[0]
+        del torch_runs
     else:
         # Concatenate on device (no numpy intermediate)
         result = torch.cat(torch_runs, dim=1)

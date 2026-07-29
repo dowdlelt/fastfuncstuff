@@ -1401,46 +1401,34 @@ def main():
     else:
         keep_on_cpu = False
 
-    # Load and optionally blur
+    # Load and optionally blur. The blur rides inside the shared loader as a
+    # per-run callback rather than forking into a second, serial load path.
+    mask_flat = mask.flatten().astype(bool) if mask is not None else None
+
+    per_run_fn = None
     if args.do_blur is not None:
         print(f"\nApplying Gaussian blur (FWHM = {args.do_blur} mm)...")
-        run_data_list = []
-        run_starts = [0]
-        current_timepoint = 0
 
-        for run_idx, run_file in enumerate(tqdm(input_files, desc="  Loading & blurring")):
-            img = load_nifti(run_file)
-            data_4d = img.get_fdata(dtype=np.float32)
-            data_4d_blurred = gaussian_blur_3d(
-                data_4d, fwhm_mm=args.do_blur, voxel_sizes=voxel_sizes, device=device, verbose=False
+        def per_run_fn(run_data, _run_idx):
+            # (n_voxels, n_tps) in C order and pre-mask, so the view back to
+            # (x, y, z, t) is free and covers the whole volume.
+            n_tps = run_data.shape[1]
+            blurred = gaussian_blur_3d(
+                run_data.cpu().numpy().reshape(*volume_shape, n_tps),
+                fwhm_mm=args.do_blur,
+                voxel_sizes=voxel_sizes,
+                device=device,
+                verbose=False,
             )
-            n_tps = data_4d_blurred.shape[3]
-            data_2d = data_4d_blurred.reshape(-1, n_tps)
+            return torch.from_numpy(blurred.reshape(-1, n_tps)).to(run_data.device)
 
-            if mask is not None:
-                mask_flat = mask.flatten().astype(bool)
-                data_2d = data_2d[mask_flat, :]
-
-            if keep_on_cpu:
-                data_2d = torch.from_numpy(data_2d).to(torch.float32)
-            else:
-                data_2d = torch.from_numpy(data_2d).to(device=device, dtype=torch.float32)
-
-            run_data_list.append(data_2d)
-            current_timepoint += n_tps
-            if run_idx < len(input_files) - 1:
-                run_starts.append(current_timepoint)
-
-        data = torch.cat(run_data_list, dim=1)
-        del run_data_list
-    else:
-        mask_flat = mask.flatten().astype(bool) if mask is not None else None
-        data, run_starts = load_and_concatenate_runs(
-            [Path(f) for f in input_files],
-            device=device,
-            keep_on_cpu=keep_on_cpu,
-            mask_flat=mask_flat,
-        )
+    data, run_starts = load_and_concatenate_runs(
+        [Path(f) for f in input_files],
+        device=device,
+        keep_on_cpu=keep_on_cpu,
+        mask_flat=mask_flat,
+        per_run_fn=per_run_fn,
+    )
 
     # Get TR
     if args.tr is None:

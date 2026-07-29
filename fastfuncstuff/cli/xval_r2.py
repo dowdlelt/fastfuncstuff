@@ -302,17 +302,18 @@ def main():
     volume_shape = first_img.shape[:3]  # type: ignore[attr-defined]
     affine = first_img.affine  # type: ignore[attr-defined]
 
+    from fastfuncstuff.io.afni import load_and_concatenate_runs as load_runs
+
     if len(input_files) == 1:
+        # Same loader as the multi-run case: one read path, so the single-file
+        # case gets the fast volume-major reorder too (and float32, not float64).
         with spinner(f"Loading {Path(input_files[0]).name}"):
-            data_np = first_img.get_fdata()  # type: ignore[attr-defined]
-
-            # Reshape to (n_voxels, n_timepoints)
-            data_np = data_np.reshape(-1, data_np.shape[-1])
-            data = torch.from_numpy(data_np).float()
+            data, actual_run_starts = load_runs(
+                [Path(input_files[0])],
+                device=torch.device("cpu"),
+                keep_on_cpu=True,
+            )
     else:
-        # Multiple runs - use existing loader
-        from fastfuncstuff.io.afni import load_and_concatenate_runs as load_runs
-
         data, actual_run_starts = load_runs(
             [Path(f) for f in input_files],
             device=torch.device("cpu"),  # Load to CPU first
