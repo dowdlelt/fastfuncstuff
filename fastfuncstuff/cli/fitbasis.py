@@ -263,6 +263,100 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    shift_grp = parser.add_argument_group(
+        "Shifted-HRF parametrisation (per-trial latency)",
+        description=(
+            "An alternative MODEL, not another -reg.  Instead of K basis "
+            "columns per block with free betas, each block gets ONE column "
+            "— the HRF shifted exactly — plus a free amplitude and a "
+            "box-bounded delay reported directly in seconds.  This is the "
+            "only path here that recovers per-trial latency: the SPMG2 "
+            "derivative ratio measured r≈0.03 against known truth, this "
+            "measures r≈0.69.  Most -reg values are meaningless under it "
+            "(there are no basis coefficients left to regularise)."
+        ),
+    )
+    shift_grp.add_argument(
+        "-parametrization",
+        "-parametrisation",
+        dest="parametrization",
+        choices=["linear", "shift"],
+        default="linear",
+        help=(
+            "linear (default) — K basis columns per block, free betas, "
+            "constrained by -reg.  shift — one exactly-shifted column per "
+            "block with amplitude + bounded delay."
+        ),
+    )
+    shift_grp.add_argument(
+        "-shift-hrf",
+        "-shift_hrf",
+        dest="shift_hrf",
+        default="canonical",
+        metavar="SOURCE",
+        help=(
+            "Response shape for -parametrization shift.  'canonical' (SPM), "
+            "'library' / 'glmsingle', or a path to a one-column text file "
+            "sampled at -flobs-dt.  Any shape works — exact shifting needs "
+            "no temporal derivative, so a curve from ffs_hrfopt / "
+            "ffs_librarian drops straight in."
+        ),
+    )
+    shift_grp.add_argument(
+        "-tau-max",
+        "-tau_max",
+        dest="tau_max",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help=(
+            "Hard bound on the per-block delay.  Set it wide enough to "
+            "contain the real latency spread: truth OUTSIDE the bound does "
+            "not clamp gracefully — the amplitude solve compensates via "
+            "overlapping trials and emits alternating signed amplitudes."
+        ),
+    )
+    shift_grp.add_argument(
+        "-tau-step",
+        "-tau_step",
+        dest="tau_step",
+        type=float,
+        default=0.25,
+        metavar="SECONDS",
+        help="Delay search grid spacing.  Finer costs linearly in the gram table.",
+    )
+    shift_grp.add_argument(
+        "-delay-prior-sd",
+        "-delay_prior_sd",
+        dest="delay_prior_sd",
+        type=float,
+        default=0.75,
+        metavar="SECONDS",
+        help=(
+            "Std of a Gaussian prior shrinking each block's delay toward "
+            "the voxel's own mean delay.  Not optional in spirit: latency "
+            "is chosen by maximising fit, so at low SNR the winning delay "
+            "partly fits noise and inflates amplitude (measured 1.86 vs a "
+            "true 1.0 unshrunk; 1.15 shrunk).  Pass 0 to disable."
+        ),
+    )
+    shift_grp.add_argument(
+        "-shift-sweeps",
+        "-shift_sweeps",
+        dest="shift_sweeps",
+        type=int,
+        default=4,
+        metavar="N",
+        help=(
+            "Coordinate-descent sweeps over blocks (amplitudes re-solved "
+            "after each).  Affects the delay SCALE, not just convergence: "
+            "the prior's centre is re-estimated each sweep, so too few "
+            "sweeps leaves delays compressed toward zero (measured 1.09 / "
+            "1.15 / 1.18 s against a true 1.20 s at 2 / 4 / 8 sweeps).  "
+            "Raise it if absolute delay magnitudes matter to you."
+        ),
+    )
+
     # FLOBS-specific knobs (each flag accepts hyphen + underscore forms)
     flobs_opts = parser.add_argument_group("FLOBS Options (-model FLOBS)")
     flobs_opts.add_argument(
@@ -750,12 +844,248 @@ def _resolve_prior_weight_arg(arg: str | float, reg: str) -> float | str:
     return float(arg)
 
 
+def _resolve_shift_hrf(spec: str, dt: float, duration: float) -> np.ndarray:
+    """Resolve -shift-hrf into a single response curve sampled at ``dt``.
+
+    Any shape works — exact shifting needs no derivative — so this accepts
+    the SPM canonical, the first curve of the standard library, or a
+    user-supplied one-column text file (e.g. a per-voxel-cluster HRF
+    exported from ``ffs_hrfopt`` / ``ffs_librarian``).
+    """
+    from fastfuncstuff.design.hrf import get_hrf_library, get_spm_hrf_with_derivatives
+
+    cpu = torch.device("cpu")
+    key = spec.strip().lower()
+    if key == "canonical":
+        h = (
+            get_spm_hrf_with_derivatives(
+                microtime_dt=dt, hrf_duration=duration, n_basis=1, device=cpu
+            )
+            .cpu()
+            .numpy()[0]
+        )
+    elif key in ("library", "glmsingle"):
+        lib = get_hrf_library(
+            mode="single" if key == "glmsingle" else "library",
+            microtime_dt=dt,
+            hrf_duration=duration,
+            device=cpu,
+        )
+        arr = lib.cpu().numpy()
+        h = arr[0] if arr.ndim == 2 else arr
+    else:
+        path = Path(spec)
+        if not path.exists():
+            raise FileNotFoundError(
+                f"-shift-hrf {spec!r} is neither a keyword "
+                f"(canonical, library, glmsingle) nor an existing file."
+            )
+        h = np.loadtxt(path, dtype=np.float64)
+        if h.ndim > 1:
+            h = h[:, 0] if h.shape[0] >= h.shape[1] else h[0]
+    peak = float(np.max(np.abs(h)))
+    if peak <= 0:
+        raise ValueError(f"-shift-hrf {spec!r} produced an all-zero curve.")
+    # Peak-normalise so the reported amplitude is in data units.
+    return np.asarray(h, dtype=np.float64) / peak
+
+
+def _run_shift_mode(
+    *,
+    args,
+    data: torch.Tensor,
+    run_starts_ext: list[int],
+    n_tp_per_run: list[int],
+    all_onsets,
+    condition_labels: list[str],
+    tr: float,
+    polort: int,
+    volume_shape,
+    mask,
+    device: torch.device,
+    nii_ext: str,
+) -> int:
+    """-parametrization shift: per-block amplitude + bounded latency.
+
+    Fits on the concatenated timeseries with block-diagonal per-run drift,
+    then optionally runs the LORO held-out validator.  Emits amplitude and
+    delay maps rather than basis-coefficient maps — there are no basis
+    coefficients in this model.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.design.shifted_hrf import (
+        build_blockdiag_polys,
+        fit_shifted_hrf,
+        xval_shifted_hrf,
+    )
+
+    n_runs = len(n_tp_per_run)
+    hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
+    print("\n  Parametrisation: shift (amplitude + bounded latency per block)")
+    print(
+        f"  HRF source: {args.shift_hrf}  ({hrf.size} samples @ {args.flobs_dt}s, peak-normalised)"
+    )
+    print(
+        f"  Delay search: ±{args.tau_max}s step {args.tau_step}s"
+        f"{f', prior sd {args.delay_prior_sd}s' if args.delay_prior_sd else ', no prior'}"
+    )
+
+    per_run_data = [
+        data[:, run_starts_ext[r] : run_starts_ext[r + 1]].clone().detach() for r in range(n_runs)
+    ]
+    # onsets in CONCATENATED time; blocks are trials or conditions
+    offsets = np.cumsum([0] + n_tp_per_run[:-1]) * tr
+    block_onsets: list[np.ndarray] = []
+    block_labels: list[str] = []
+    block_cond: list[int] = []
+    for c, label in enumerate(condition_labels):
+        if args.single_trials:
+            k = 0
+            for r in range(n_runs):
+                for t in np.atleast_1d(all_onsets[c][r]):
+                    block_onsets.append(np.array([float(t) + offsets[r]]))
+                    block_labels.append(f"{label}_trial{k:03d}_run{r + 1}")
+                    block_cond.append(c)
+                    k += 1
+        else:
+            merged = [np.atleast_1d(all_onsets[c][r]) + offsets[r] for r in range(n_runs)]
+            block_onsets.append(np.concatenate(merged) if merged else np.array([]))
+            block_labels.append(label)
+            block_cond.append(c)
+    print(f"  Blocks: {len(block_onsets)}")
+
+    Z = build_blockdiag_polys(n_tp_per_run, polort, device)
+    fit = fit_shifted_hrf(
+        data=data,
+        block_onsets=block_onsets,
+        hrf=hrf,
+        hrf_dt=args.flobs_dt,
+        tr=tr,
+        nuisance=Z,
+        tau_max=args.tau_max,
+        tau_step=args.tau_step,
+        n_sweeps=args.shift_sweeps,
+        delay_prior_sd=args.delay_prior_sd,
+        device=device,
+        verbose=True,
+    )
+    del Z
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    nx, ny, nz = volume_shape
+
+    def _to_volume(masked: np.ndarray) -> np.ndarray:
+        out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
+        out = np.zeros(out_shape, dtype=np.float32)
+        if mask is not None:
+            out[mask, ...] = masked
+        else:
+            out = masked.reshape(out_shape)
+        return out
+
+    for arr, name in ((fit.r2, "r2"), (fit.r2_fixed, "r2_tau0")):
+        path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_nifti(
+                _to_volume(arr[:, None]).squeeze(-1),
+                output_path=path,
+                reference_img=args.input[0],
+            )
+        print(f"  Wrote {path}")
+    print(
+        "  NOTE: r2 minus r2_tau0 is IN-SAMPLE and is not evidence of real\n"
+        "        latency — free delay parameters always buy in-sample fit.\n"
+        "        Use -xval-r2 for the held-out comparison."
+    )
+
+    cond_idx: dict[str, list[int]] = {}
+    for b, c in enumerate(block_cond):
+        cond_idx.setdefault(condition_labels[c], []).append(b)
+    for cond, idxs in cond_idx.items():
+        for arr, name in ((fit.amplitudes, "amplitude"), (fit.delays, "delay")):
+            vol = _to_volume(arr[:, idxs])
+            path = f"{args.prefix}_fitbasis_shift_{name}_{cond}{nii_ext}"
+            save_nifti(vol, output_path=path, reference_img=args.input[0])
+            print(f"  Wrote {path}  (n_blocks={len(idxs)})")
+
+    if args.xval_r2:
+        if n_runs < 2:
+            print("  -xval-r2 needs ≥2 runs; skipping.")
+        else:
+            print("\n  Held-out validation (LORO, condition-level generalisation)…")
+            r2_shift, r2_tau0 = xval_shifted_hrf(
+                per_run_data=per_run_data,
+                per_run_condition_onsets=[
+                    [np.atleast_1d(all_onsets[c][r]) for c in range(len(condition_labels))]
+                    for r in range(n_runs)
+                ],
+                hrf=hrf,
+                hrf_dt=args.flobs_dt,
+                tr=tr,
+                polort=polort,
+                single_trials=args.single_trials,
+                tau_max=args.tau_max,
+                tau_step=args.tau_step,
+                delay_prior_sd=args.delay_prior_sd,
+                n_sweeps=args.shift_sweeps,
+                leave_n_out=args.cv_leave_n_out,
+                device=device,
+                verbose=True,
+            )
+            for arr, name in (
+                (r2_shift, "xvalr2"),
+                (r2_tau0, "xvalr2_tau0"),
+                (r2_shift - r2_tau0, "xvalr2_delay_gain"),
+            ):
+                path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
+                save_nifti(
+                    _to_volume(arr[:, None]).squeeze(-1),
+                    output_path=path,
+                    reference_img=args.input[0],
+                )
+                print(f"  Wrote {path}")
+            print(
+                "  _xvalr2_delay_gain is the map that answers 'is the delay real':\n"
+                "  positive = the estimated delays predicted held-out runs better\n"
+                "  than pinning them to zero; ≤0 = they did not."
+            )
+
+    meta = {
+        "tool": "ffs_fitbasis",
+        "parametrization": "shift",
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "tr": float(tr),
+        "hrf_source": args.shift_hrf,
+        "tau_max": float(args.tau_max),
+        "tau_step": float(args.tau_step),
+        "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),
+        "n_sweeps": int(fit.n_sweeps),
+        "single_trials": bool(args.single_trials),
+        "n_blocks": len(block_onsets),
+        "condition_labels": list(condition_labels),
+        "polort": int(polort),
+        "r2_median": float(np.median(fit.r2)),
+        "r2_tau0_median": float(np.median(fit.r2_fixed)),
+    }
+    meta_path = f"{args.prefix}_fitbasis_metadata.json"
+    Path(meta_path).write_text(json.dumps(meta, indent=2))
+    print(f"  Wrote {meta_path}")
+    print(f"\n{'=' * 72}")
+    print(" ✓ ffs_fitbasis complete (shift parametrisation)")
+    print(f"{'=' * 72}")
+    return 0
+
+
 def main() -> int:
     parser = create_parser()
     if len(sys.argv) == 1:
         parser.print_help()
         return 0
     args = parser.parse_args()
+
+    if getattr(args, "delay_prior_sd", None) is not None and args.delay_prior_sd <= 0:
+        args.delay_prior_sd = None
 
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem
@@ -870,10 +1200,12 @@ def main() -> int:
                 f"({'single-trials' if args.single_trials else 'per-condition'})"
             )
 
-    print(
-        f"\n  Model: {args.model}    Regularisation: {args.reg}    "
-        f"Single-trials: {args.single_trials}"
-    )
+    _shift_mode = args.parametrization == "shift"
+    if not _shift_mode:
+        print(
+            f"\n  Model: {args.model}    Regularisation: {args.reg}    "
+            f"Single-trials: {args.single_trials}"
+        )
     basis = _build_basis(args)
     n_basis = basis.basis_functions.shape[0]
     prior_m, prior_C = _build_prior(
@@ -885,14 +1217,19 @@ def main() -> int:
         dispersion_std=args.dispersion_std,
     )
     pw = _resolve_prior_weight_arg(args.prior_weight, args.reg)
-    print(
-        f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
-        f"(dt={basis.dt}s, window={basis.duration:.1f}s)"
-    )
+    if not _shift_mode:
+        print(
+            f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
+            f"(dt={basis.dt}s, window={basis.duration:.1f}s)"
+        )
     # Only print prior info when the prior is actually applied.  With
     # -reg none, m/C/λ are all zeros / unused — printing them is noise
     # that confuses users about whether the prior is active.
-    if args.reg != "none":
+    if _shift_mode:
+        # -reg / -model / the basis play no part in the shift model; printing
+        # them here previously implied a prior was active when none was.
+        pass
+    elif args.reg != "none":
         print(f"  Prior: m = {prior_m},  σ_diag = {np.sqrt(np.diag(prior_C))}")
         print(f"  Prior weight: {pw!r}")
     else:
@@ -960,6 +1297,27 @@ def main() -> int:
     print(
         f"  Blocks to fit: {n_blocks}  ({'one per trial' if args.single_trials else 'one per condition'})"
     )
+
+    # ── Dispatch: shifted-HRF parametrisation ──────────────────────
+    # This model has no basis-coefficient vector at all (one column per
+    # block, amplitude + bounded delay), so it bypasses the whole
+    # basis / prior / packed-design pipeline below rather than
+    # threading a special case through it.
+    if args.parametrization == "shift":
+        return _run_shift_mode(
+            args=args,
+            data=data,
+            run_starts_ext=run_starts_ext,
+            n_tp_per_run=n_tp_per_run,
+            all_onsets=all_onsets,
+            condition_labels=list(condition_labels),
+            tr=tr,
+            polort=polort_resolved,
+            volume_shape=volume_shape,
+            mask=mask,
+            device=device,
+            nii_ext=nii_ext,
+        )
 
     # Build per-run design with K basis cols per block
     per_run_designs: list[torch.Tensor] = []

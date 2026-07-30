@@ -293,3 +293,102 @@ def test_r2_fixed_is_the_no_latency_baseline(setup):
     pinned = fit_shifted_hrf(**kw, tau_max=0.0, n_sweeps=1, delay_prior_sd=None)
     np.testing.assert_allclose(full.r2_fixed, pinned.r2, rtol=1e-6, atol=1e-8)
     assert np.median(full.r2) > np.median(full.r2_fixed)
+
+
+# ---------------------------------------------------------------------------
+# Held-out validation.  These are the tests that matter most: the validator
+# is what tells the user whether a delay map means anything, so it has to
+# discriminate real latency structure from none.
+# ---------------------------------------------------------------------------
+
+
+def _multirun(h, n_runs, cond_onsets, tau_by_voxel, jitter_sd, noise_sd, nv, seed):
+    """Simulate runs where each voxel has a stable condition-level delay.
+
+    ``tau_by_voxel`` is (nv, n_cond) and repeats across runs -- that is the
+    structure the LORO validator should be able to generalise.  Per-trial
+    jitter is added on top so the fit still has to average over trials.
+    """
+    from fastfuncstuff.design.shifted_hrf import build_shifted_design_bank
+
+    rng = np.random.default_rng(seed)
+    fine = np.arange(-3.0, 3.001, 0.05)
+    runs = []
+    per_run_onsets = []
+    for _r in range(n_runs):
+        per_run_onsets.append([np.asarray(o, dtype=float) for o in cond_onsets])
+        blocks, cidx = [], []
+        for c, o in enumerate(cond_onsets):
+            for t in np.atleast_1d(o):
+                blocks.append(np.array([float(t)]))
+                cidx.append(c)
+        bank = build_shifted_design_bank(blocks, h, DT, fine, TR, NTP, device=CPU).numpy()
+        y = np.zeros((nv, NTP))
+        for b, c in enumerate(cidx):
+            tau = tau_by_voxel[:, c] + rng.normal(0, jitter_sd, size=nv)
+            gi = np.argmin(np.abs(fine[None, :] - tau[:, None]), axis=1)
+            y += bank[b][gi]
+        y += rng.normal(0, noise_sd, size=y.shape)
+        runs.append(torch.from_numpy(y))
+    return runs, per_run_onsets
+
+
+def test_xval_detects_real_latency_structure(setup):
+    """A stable per-voxel delay must give a positive held-out gap."""
+    from fastfuncstuff.design.shifted_hrf import xval_shifted_hrf
+
+    h, _, _, _ = setup
+    cond_onsets = [np.arange(10.0, NTP * TR - 40, 12.0)]
+    nv = 120
+    rng = np.random.default_rng(7)
+    # half the voxels early, half late -- a real, run-stable delay
+    tau_v = np.where(rng.random((nv, 1)) < 0.5, -1.5, 1.5)
+    runs, onsets = _multirun(h, 4, cond_onsets, tau_v, 0.3, 0.5, nv, seed=7)
+    r2_shift, r2_tau0 = xval_shifted_hrf(
+        per_run_data=runs,
+        per_run_condition_onsets=onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        polort=2,
+        single_trials=True,
+        tau_max=2.0,
+        tau_step=0.25,
+        delay_prior_sd=0.75,
+        device=CPU,
+        verbose=False,
+    )
+    gap = np.median(r2_shift - r2_tau0)
+    assert gap > 0.05, f"validator missed real latency structure: gap {gap:+.4f}"
+
+
+def test_xval_rejects_absent_latency(setup):
+    """With zero true delay the held-out gap must NOT be meaningfully positive.
+
+    This is the counterpart to the in-sample trap: n_blocks free latency
+    parameters always buy in-sample fit (+0.14 measured on zero-latency
+    data), so a validator that cannot return ~0 here is useless.
+    """
+    from fastfuncstuff.design.shifted_hrf import xval_shifted_hrf
+
+    h, _, _, _ = setup
+    cond_onsets = [np.arange(10.0, NTP * TR - 40, 12.0)]
+    nv = 120
+    tau_v = np.zeros((nv, 1))
+    runs, onsets = _multirun(h, 4, cond_onsets, tau_v, 0.0, 0.5, nv, seed=8)
+    r2_shift, r2_tau0 = xval_shifted_hrf(
+        per_run_data=runs,
+        per_run_condition_onsets=onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        polort=2,
+        single_trials=True,
+        tau_max=2.0,
+        tau_step=0.25,
+        delay_prior_sd=0.75,
+        device=CPU,
+        verbose=False,
+    )
+    gap = np.median(r2_shift - r2_tau0)
+    assert gap < 0.02, f"validator claims latency where there is none: gap {gap:+.4f}"
