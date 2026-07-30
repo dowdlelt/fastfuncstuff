@@ -62,20 +62,37 @@ def test_util_gmm_drops_constant_voxels(tmp_path):
     mask = np.ones(shape3d, dtype=np.float32)
     _write(tmp_path / "mask.nii.gz", mask)
 
-    main([
-        "-input", str(inp), "-mask", str(tmp_path / "mask.nii.gz"),
-        "-prefix", str(tmp_path / "out"), "-verb", "0",
-    ])
+    main(
+        [
+            "-input",
+            str(inp),
+            "-mask",
+            str(tmp_path / "mask.nii.gz"),
+            "-prefix",
+            str(tmp_path / "out"),
+            "-verb",
+            "0",
+        ]
+    )
 
     out_mask = nib.load(str(tmp_path / "out_mask.nii.gz")).get_fdata() > 0
     assert out_mask.sum() == np.prod(shape3d) - 400
     assert not out_mask[:, :, 0].any()
 
     # Keeping them must change the answer — that is the whole point of the flag.
-    main([
-        "-input", str(inp), "-mask", str(tmp_path / "mask.nii.gz"),
-        "-prefix", str(tmp_path / "keep"), "-no_drop_constant", "-verb", "0",
-    ])
+    main(
+        [
+            "-input",
+            str(inp),
+            "-mask",
+            str(tmp_path / "mask.nii.gz"),
+            "-prefix",
+            str(tmp_path / "keep"),
+            "-no_drop_constant",
+            "-verb",
+            "0",
+        ]
+    )
     kept_mask = nib.load(str(tmp_path / "keep_mask.nii.gz")).get_fdata() > 0
     assert kept_mask.sum() == np.prod(shape3d)
 

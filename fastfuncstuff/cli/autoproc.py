@@ -225,6 +225,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="nonlinear cross-session refinement",
     )
+    for _stage, _what in (
+        ("xrun", "cross-run"),
+        ("xfmap", "cross-fmap-group"),
+        ("xses", "cross-session"),
+    ):
+        g.add_argument(
+            f"-{_stage}_nonlin_in_source",
+            f"-{_stage}-nonlin-in-source",
+            action="store_const",
+            const=True,
+            default=None,
+            help=f"estimate the {_what} nonlinear warp in the SOURCE's frame: pass the "
+            "linear stage's matrix and its un-allineated input to ffs_formwarp, which "
+            "inverts the matrix and pulls the base onto the source grid. The source is "
+            "never resampled, and the warp swaps places with its affine in the nwarp "
+            "chain. NOTE: this relocates a clipped FoV rather than recovering it (the "
+            "base falls out of frame instead) and measured worse than the default at a "
+            "clipped edge -- see ../fmri_wiki/concepts/SyN.md.",
+        )
 
     g = p.add_argument_group("GLM")
     g.add_argument(
@@ -762,6 +781,9 @@ def main(argv: list[str] | None = None) -> int:
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
         xses_nonlin=eff(args.xses_nonlin, "xses_nonlin"),
+        xrun_nonlin_in_source=eff(args.xrun_nonlin_in_source, "xrun_nonlin_in_source"),
+        xfmap_nonlin_in_source=eff(args.xfmap_nonlin_in_source, "xfmap_nonlin_in_source"),
+        xses_nonlin_in_source=eff(args.xses_nonlin_in_source, "xses_nonlin_in_source"),
         ref_ses=args.ref_ses,
         fmap_ref=args.fmap_ref,
         go_to_anat=go_to_anat,

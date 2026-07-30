@@ -41,9 +41,7 @@ def test_two_matrix_composition_order(tmp_path):
 
     # Stack [f1, f2] composes base-side→source-side: C_dicom = D2 @ D1.
     got = load_matrix_chain([str(f1), str(f2)], base_affine=BASE, source_affine=SRC)
-    expect = dicom_matrix_to_voxel(
-        torch.as_tensor(D2 @ D1, dtype=torch.float32), BASE, SRC
-    )
+    expect = dicom_matrix_to_voxel(torch.as_tensor(D2 @ D1, dtype=torch.float32), BASE, SRC)
     assert torch.allclose(got, expect, atol=1e-5)
 
     # Order matters: reversing the stack gives a different composite.

@@ -71,6 +71,15 @@ class Options:
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False
     xses_nonlin: bool = False
+    # Estimate the nonlinear refinement in the SOURCE's own frame instead of the
+    # base's: hand ffs_formwarp the linear stage's matrix and its *un*-allineated
+    # input, and it inverts the matrix, pulls the base onto the source grid, and
+    # solves there. The source is never resampled. Per stage, because the trade
+    # depends on which image has the fuller FoV -- see ../fmri_wiki/concepts/SyN.md,
+    # where the default (base-frame) arrangement measured better at a clipped edge.
+    xrun_nonlin_in_source: bool = False
+    xfmap_nonlin_in_source: bool = False
+    xses_nonlin_in_source: bool = False
     ref_ses: str | None = None
     fmap_ref: list[str] | None = None
     go_to_anat: bool = True  # False → final space is the EPI grandmean
@@ -315,7 +324,36 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
         "locomoco": opt.locomoco,
         "moco": True,
     }
-    return [tok for tok in _CHAIN_ORDER if include.get(tok, False)]
+    toks = [tok for tok in _CHAIN_ORDER if include.get(tok, False)]
+    return _apply_in_source_swaps(toks, opt)
+
+
+# Which option flips which (nonlinear, linear) pair. _CHAIN_ORDER is written
+# leftmost-acts-first *on coordinates*, i.e. rightmost-acts-first on the data, so
+# the default "affine then warp" reads as (nl, lin). Estimating the warp in the
+# source frame makes it act on the data BEFORE the affine, which is the other order.
+_IN_SOURCE_PAIRS = (
+    ("xses_nonlin_in_source", "xses_nl", "xses_lin"),
+    ("xfmap_nonlin_in_source", "xfmap_nl", "xfmap_lin"),
+    ("xrun_nonlin_in_source", "wxrun_nl", "wxrun_lin"),
+)
+
+
+def _apply_in_source_swaps(tokens: list[str], opt) -> list[str]:
+    """Swap each in-source stage's nonlinear link past its own affine.
+
+    Only the pair moves; every other link keeps its place, because only that one
+    warp changed the space it lives in.
+    """
+    out = list(tokens)
+    for attr, nl, lin in _IN_SOURCE_PAIRS:
+        if not getattr(opt, attr, False):
+            continue
+        if nl not in out or lin not in out:
+            continue
+        i, j = out.index(nl), out.index(lin)
+        out[i], out[j] = out[j], out[i]
+    return out
 
 
 def build_plan(subject: Subject, opt: Options) -> Plan:

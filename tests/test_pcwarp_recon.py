@@ -73,8 +73,22 @@ def test_diag_frame_clamped_and_disable(tmp_path):
     main(["-warp", path, "-n_pcs", "4", "-warp_pc_recon", "2", "-diag_frame", "10", "-verb", "0"])
     assert (tmp_path / "warps5d_pcrecon2_frame6_orig.nii.gz").exists()
     # diag_frame 0 disables.
-    main(["-warp", path, "-n_pcs", "4", "-warp_pc_recon", "2", "-diag_frame", "0",
-          "-recon_prefix", str(tmp_path / "nodiag.nii.gz"), "-verb", "0"])
+    main(
+        [
+            "-warp",
+            path,
+            "-n_pcs",
+            "4",
+            "-warp_pc_recon",
+            "2",
+            "-diag_frame",
+            "0",
+            "-recon_prefix",
+            str(tmp_path / "nodiag.nii.gz"),
+            "-verb",
+            "0",
+        ]
+    )
     assert not list(tmp_path.glob("nodiag_frame*"))
 
 
@@ -82,8 +96,7 @@ def test_recon_prefix_and_default_path(tmp_path):
     path, _ = _make_lowrank_y_warp(tmp_path, T=10)
     custom = str(tmp_path / "denoised.nii.gz")
     rc = main(
-        ["-warp", path, "-n_pcs", "3", "-warp_pc_recon", "3",
-         "-recon_prefix", custom, "-verb", "0"]
+        ["-warp", path, "-n_pcs", "3", "-warp_pc_recon", "3", "-recon_prefix", custom, "-verb", "0"]
     )
     assert rc == 0
     _, yr, _, _, _ = load_warp_series(custom)
