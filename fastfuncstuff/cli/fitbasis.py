@@ -303,6 +303,33 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     shift_grp.add_argument(
+        "-shift-shapes",
+        "-shift_shapes",
+        dest="shift_shapes",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Select a per-voxel response shape before fitting delays, from "
+            "'library' (20 double-gammas), 'pighs' (half-cosines), or "
+            "'flobs' (curves drawn from the empirical FLOBS coefficient "
+            "prior, so every candidate is a shape that prior calls "
+            "sensible).  Overrides -shift-hrf.  Two stages on purpose: "
+            "shape is chosen at zero delay, then delays are fit within "
+            "each shape group — with both free at once a wrong shape can "
+            "masquerade as a delay and neither means what it says.  Cheap, "
+            "because the design bank depends on the shape, not the voxel."
+        ),
+    )
+    shift_grp.add_argument(
+        "-shift-n-shapes",
+        "-shift_n_shapes",
+        dest="shift_n_shapes",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Candidate count for -shift-shapes pighs / flobs (library is fixed at 20).",
+    )
+    shift_grp.add_argument(
         "-tau-max",
         "-tau_max",
         dest="tau_max",
@@ -915,7 +942,9 @@ def _run_shift_mode(
     from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.design.shifted_hrf import (
         build_blockdiag_polys,
+        build_shape_library,
         fit_shifted_hrf,
+        fit_shifted_hrf_per_voxel_shape,
         xval_shifted_hrf,
     )
 
@@ -941,11 +970,37 @@ def _run_shift_mode(
             f"wanted {args.model}/{args.reg}."
         )
 
-    hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
     print("\n  Parametrisation: shift (amplitude + bounded latency per block)")
-    print(
-        f"  HRF source: {args.shift_hrf}  ({hrf.size} samples @ {args.flobs_dt}s, peak-normalised)"
-    )
+    shapes = None
+    shape_labels: list[str] = []
+    if args.shift_shapes:
+        shapes, shape_labels = build_shape_library(
+            args.shift_shapes,
+            args.flobs_dt,
+            args.flobs_window,
+            n_hrfs=args.shift_n_shapes,
+        )
+        hrf = shapes[0]
+        print(
+            f"  Shape source: {args.shift_shapes} — {shapes.shape[0]} candidates, "
+            f"selected PER VOXEL at zero delay (overrides -shift-hrf)"
+        )
+        print(
+            "  NOTE: a shape library that varies PEAK TIME competes with the\n"
+            "        delay parameter — both move the response in time.  Measured\n"
+            "        on synthetic data with a true ±1.2 s delay, shape selection\n"
+            "        absorbed all of it (corr(shape, true delay)=0.99) and the\n"
+            "        held-out delay gain fell to zero.  With shapes on, read the\n"
+            "        delay map as RESIDUAL timing and shape_index as the main\n"
+            "        carrier of voxel-level timing.  For one clean absolute delay\n"
+            "        map, use a single -shift-hrf instead."
+        )
+    else:
+        hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
+        print(
+            f"  HRF source: {args.shift_hrf}  ({hrf.size} samples @ "
+            f"{args.flobs_dt}s, peak-normalised)  [one shape for all voxels]"
+        )
     print(
         f"  Delay search: ±{args.tau_max}s step {args.tau_step}s"
         f"{f', prior sd {args.delay_prior_sd}s' if args.delay_prior_sd else ', no prior'}"
@@ -976,20 +1031,37 @@ def _run_shift_mode(
     print(f"  Blocks: {len(block_onsets)}")
 
     Z = build_blockdiag_polys(n_tp_per_run, polort, device)
-    fit = fit_shifted_hrf(
-        data=data,
-        block_onsets=block_onsets,
-        hrf=hrf,
-        hrf_dt=args.flobs_dt,
-        tr=tr,
-        nuisance=Z,
-        tau_max=args.tau_max,
-        tau_step=args.tau_step,
-        n_sweeps=args.shift_sweeps,
-        delay_prior_sd=args.delay_prior_sd,
-        device=device,
-        verbose=True,
-    )
+    shape_index = None
+    if shapes is not None:
+        fit, shape_index = fit_shifted_hrf_per_voxel_shape(
+            data=data,
+            block_onsets=block_onsets,
+            shapes=shapes,
+            hrf_dt=args.flobs_dt,
+            tr=tr,
+            nuisance=Z,
+            tau_max=args.tau_max,
+            tau_step=args.tau_step,
+            n_sweeps=args.shift_sweeps,
+            delay_prior_sd=args.delay_prior_sd,
+            device=device,
+            verbose=True,
+        )
+    else:
+        fit = fit_shifted_hrf(
+            data=data,
+            block_onsets=block_onsets,
+            hrf=hrf,
+            hrf_dt=args.flobs_dt,
+            tr=tr,
+            nuisance=Z,
+            tau_max=args.tau_max,
+            tau_step=args.tau_step,
+            n_sweeps=args.shift_sweeps,
+            delay_prior_sd=args.delay_prior_sd,
+            device=device,
+            verbose=True,
+        )
     del Z
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -1020,6 +1092,26 @@ def _run_shift_mode(
         "        Use -xval-r2 for the held-out comparison."
     )
 
+    if shape_index is not None and shapes is not None:
+        path = f"{args.prefix}_fitbasis_shift_shape_index{nii_ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_nifti(
+                _to_volume(shape_index.astype(np.float32)[:, None]).squeeze(-1),
+                output_path=path,
+                reference_img=args.input[0],
+            )
+        print(f"  Wrote {path}  (int index into the curves TSV below)")
+        curves_path = f"{args.prefix}_fitbasis_shift_shapes.tsv"
+        np.savetxt(
+            curves_path,
+            shapes.T,
+            fmt="%.10g",
+            delimiter="\t",
+            header="\t".join(shape_labels),
+            comments="",
+        )
+        print(f"  Wrote {curves_path}  (columns = candidates @ {args.flobs_dt}s)")
+
     cond_idx: dict[str, list[int]] = {}
     for b, c in enumerate(block_cond):
         cond_idx.setdefault(condition_labels[c], []).append(b)
@@ -1046,6 +1138,7 @@ def _run_shift_mode(
                 tr=tr,
                 polort=polort,
                 single_trials=args.single_trials,
+                shapes=shapes,
                 tau_max=args.tau_max,
                 tau_step=args.tau_step,
                 delay_prior_sd=args.delay_prior_sd,
@@ -1077,7 +1170,8 @@ def _run_shift_mode(
         "parametrization": "shift",
         "started": datetime.now().isoformat(timespec="seconds"),
         "tr": float(tr),
-        "hrf_source": args.shift_hrf,
+        "hrf_source": (args.shift_hrf if shapes is None else f"per-voxel:{args.shift_shapes}"),
+        "n_shape_candidates": (0 if shapes is None else int(shapes.shape[0])),
         "tau_max": float(args.tau_max),
         "tau_step": float(args.tau_step),
         "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),

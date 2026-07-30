@@ -571,6 +571,7 @@ def xval_shifted_hrf(
     polort: int,
     *,
     single_trials: bool,
+    shapes: np.ndarray | None = None,
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     delay_prior_sd: float | None = 0.75,
@@ -613,6 +614,15 @@ def xval_shifted_hrf(
         or one block per condition directly.
     leave_n_out : int
         Runs held out per fold; 1 = LORO.
+    shapes : (n_shapes, n_h), optional
+        Candidate response shapes.  When given, each fold selects a
+        per-voxel shape **from its own training runs** and both scored
+        models use it.  This is not optional bookkeeping: shape choice is
+        a free parameter that buys in-sample fit exactly as delay does, so
+        selecting it once on all the data and then "validating" would
+        leak, and scoring a single shared shape while the main fit used
+        per-voxel shapes would validate a different model than was fitted.
+        ``hrf`` is ignored when this is supplied.
 
     Returns
     -------
@@ -664,20 +674,37 @@ def xval_shifted_hrf(
 
         y_train = torch.cat([per_run_data[r] for r in train_runs], dim=1)
         Z_train = build_blockdiag_polys(n_tp_train, polort, device)
-        fit = fit_shifted_hrf(
-            data=y_train,
-            block_onsets=block_onsets,
-            hrf=hrf,
-            hrf_dt=hrf_dt,
-            tr=tr,
-            nuisance=Z_train,
-            tau_max=tau_max,
-            tau_step=tau_step,
-            n_sweeps=n_sweeps,
-            delay_prior_sd=delay_prior_sd,
-            device=device,
-            verbose=False,
-        )
+        if shapes is not None:
+            fit, fold_shape_idx = fit_shifted_hrf_per_voxel_shape(
+                data=y_train,
+                block_onsets=block_onsets,
+                shapes=shapes,
+                hrf_dt=hrf_dt,
+                tr=tr,
+                nuisance=Z_train,
+                tau_max=tau_max,
+                tau_step=tau_step,
+                n_sweeps=n_sweeps,
+                delay_prior_sd=delay_prior_sd,
+                device=device,
+                verbose=False,
+            )
+        else:
+            fold_shape_idx = None
+            fit = fit_shifted_hrf(
+                data=y_train,
+                block_onsets=block_onsets,
+                hrf=hrf,
+                hrf_dt=hrf_dt,
+                tr=tr,
+                nuisance=Z_train,
+                tau_max=tau_max,
+                tau_step=tau_step,
+                n_sweeps=n_sweeps,
+                delay_prior_sd=delay_prior_sd,
+                device=device,
+                verbose=False,
+            )
         del y_train, Z_train
 
         # collapse to condition level per voxel: mean amplitude, median grid index
@@ -701,29 +728,38 @@ def xval_shifted_hrf(
 
         for r in test_runs:
             n_tp_r = int(per_run_data[r].shape[1])
-            bank_test = build_shifted_design_bank(
-                [np.atleast_1d(per_run_condition_onsets[r][c]) for c in range(n_cond)],
-                hrf,
-                hrf_dt,
-                tau_grid,
-                tr,
-                n_tp_r,
-                device=device,
-            )  # (n_cond, G, T)
+            test_onsets = [np.atleast_1d(per_run_condition_onsets[r][c]) for c in range(n_cond)]
             Z_test = build_blockdiag_polys([n_tp_r], polort, device)
             y_test = per_run_data[r].to(device=device, dtype=torch.float64)
             y_p = _project_out(y_test, Z_test)
             ss_tot = ((y_p - y_p.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
             ar_c = torch.arange(n_cond, device=device)
-            for gsel, acc in ((g_t, num_s), (g_zero, num_0)):
-                # cols[v, c, t] gathered per voxel, then weighted by A
-                cols = bank_test[ar_c.unsqueeze(0), gsel]  # (nv, n_cond, T)
-                pred = torch.einsum("vc,vct->vt", A_t, cols)
-                pred = _project_out(pred, Z_test)
-                acc[:] += ((y_p - pred) ** 2).sum(dim=1).cpu().numpy()
-                del cols, pred
             den[:] += ss_tot.cpu().numpy()
-            del bank_test, y_test, y_p, ss_tot
+            # Predict within shape groups: the test-run bank depends on the
+            # shape, so it is built once per occupied group and shared by
+            # that group's voxels -- the same structure the fit uses.
+            if fold_shape_idx is None:
+                groups = [(hrf, np.arange(n_voxels))]
+            else:
+                groups = [
+                    (shapes[si], np.flatnonzero(fold_shape_idx == si))
+                    for si in np.unique(fold_shape_idx)
+                ]
+            for curve, vsel in groups:
+                if vsel.size == 0:
+                    continue
+                bank_test = build_shifted_design_bank(
+                    test_onsets, curve, hrf_dt, tau_grid, tr, n_tp_r, device=device
+                )  # (n_cond, G, T)
+                vt = torch.from_numpy(vsel).to(device)
+                for gsel, acc in ((g_t, num_s), (g_zero, num_0)):
+                    cols = bank_test[ar_c.unsqueeze(0), gsel[vt]]  # (nvs, n_cond, T)
+                    pred = torch.einsum("vc,vct->vt", A_t[vt], cols)
+                    pred = _project_out(pred, Z_test)
+                    acc[vsel] += ((y_p[vt] - pred) ** 2).sum(dim=1).cpu().numpy()
+                    del cols, pred
+                del bank_test, vt
+            del y_test, y_p, ss_tot
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
@@ -740,3 +776,336 @@ def xval_shifted_hrf(
             f"Δ={gap:+.4f}  → {verdict}"
         )
     return r2_shift, r2_tau0
+
+
+def build_shape_library(
+    source: str,
+    dt: float,
+    duration: float,
+    *,
+    n_hrfs: int = 20,
+    n_flobs_basis: int = 3,
+) -> tuple[np.ndarray, list[str]]:
+    """Candidate response shapes for per-voxel shape selection.
+
+    Every curve is peak-normalised so the fitted amplitude stays in data
+    units and is comparable across voxels that ended up on different
+    shapes — without this, "amplitude" would silently mean a different
+    thing in each shape group.
+
+    Sources
+    -------
+    ``library``  the 20-HRF double-gamma library (same file ffs_hrfopt uses)
+    ``pighs``    ``n_hrfs`` half-cosine curves, stratified over peak time
+    ``flobs``    curves reconstructed from the FLOBS eigenbasis by sampling
+                 the empirical MVN(m, C) on its coefficients, so every
+                 candidate is a shape the FLOBS prior considers sensible
+    ``canonical`` a single curve (degenerate; equivalent to no selection)
+
+    Returns
+    -------
+    (n_shapes, n_t) curves, and a label per curve.
+    """
+    from fastfuncstuff.design.hrf import (
+        create_pighs_library,
+        get_hrf_library,
+        get_spm_hrf_with_derivatives,
+    )
+
+    cpu = torch.device("cpu")
+    key = source.strip().lower()
+    if key == "canonical":
+        curves = (
+            get_spm_hrf_with_derivatives(
+                microtime_dt=dt, hrf_duration=duration, n_basis=1, device=cpu
+            )
+            .cpu()
+            .numpy()
+        )
+        labels = ["canonical"]
+    elif key == "library":
+        curves = (
+            get_hrf_library(mode="library", microtime_dt=dt, hrf_duration=duration, device=cpu)
+            .cpu()
+            .numpy()
+        )
+        labels = [f"lib{i:02d}" for i in range(curves.shape[0])]
+    elif key == "pighs":
+        lib, _ = create_pighs_library(n_hrfs=n_hrfs, duration=duration, microtime_dt=dt, device=cpu)
+        curves = lib.cpu().numpy()
+        labels = [f"pighs{i:02d}" for i in range(curves.shape[0])]
+    elif key == "flobs":
+        from fastfuncstuff.design.flobs import generate_flobs_basis
+
+        basis = generate_flobs_basis(
+            n_basis=n_flobs_basis, n_samples=1000, duration=duration, dt=dt
+        )
+        # Sample the empirical coefficient prior rather than perturbing
+        # coefficients arbitrarily: every candidate is then a shape the
+        # FLOBS prior itself regards as plausible, which is the whole
+        # point of having (m, C).
+        rng = np.random.default_rng(0)
+        coefs = rng.multivariate_normal(basis.m, basis.C, size=max(1, n_hrfs))
+        coefs[0] = basis.m  # keep the mean shape as a candidate
+        curves = coefs @ basis.basis_functions
+        labels = [f"flobs{i:02d}" for i in range(curves.shape[0])]
+    else:
+        raise ValueError(
+            f"unknown shape source {source!r}; expected one of canonical, library, pighs, flobs"
+        )
+    curves = np.atleast_2d(np.asarray(curves, dtype=np.float64))
+    # Orient each curve positive, then peak-normalise.  A FLOBS draw can
+    # come out sign-flipped; leaving it would put a negative "HRF" in the
+    # library and let a voxel fit a positive response with a negative
+    # amplitude, which is indistinguishable from real negative BOLD.
+    for i in range(curves.shape[0]):
+        c = curves[i]
+        if abs(c.min()) > abs(c.max()):
+            c = -c
+        pk = float(np.max(np.abs(c)))
+        curves[i] = c / pk if pk > 0 else c
+    keep = np.array([np.any(np.abs(c) > 0) for c in curves])
+    return curves[keep], [lbl for lbl, k in zip(labels, keep, strict=True) if k]
+
+
+def select_shape_per_voxel(
+    data: np.ndarray | Tensor,
+    block_onsets: list[np.ndarray],
+    shapes: np.ndarray,
+    hrf_dt: float,
+    tr: float,
+    *,
+    nuisance: Tensor | None = None,
+    durations: list[float] | None = None,
+    device: torch.device | None = None,
+    chunk_size: int | None = None,
+    verbose: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick each voxel's best-fitting response shape at zero delay.
+
+    Selection is done with all delays pinned to 0 and amplitudes solved
+    exactly, so shape and delay are chosen in separate stages rather than
+    competing inside one search.  That ordering matters: with both free at
+    once, a wrong shape can be partly absorbed by a delay (and vice
+    versa), and neither parameter ends up meaning what it says.
+
+    Shape and delay are partly CONFOUNDED, and badly so
+    -----------------------------------------------------
+    Any library that varies peak time competes directly with the delay
+    parameter, because both move the response in time.  Measured on data
+    with a true run-stable ±1.2 s delay and a FLOBS library: voxels with
+    −1.2 s all selected a 4.1 s-peak curve, voxels with +1.2 s selected
+    6.4–6.5 s-peak curves (``corr(shape_index, true delay) = +0.992``),
+    the recovered *delay* collapsed to ±0.15 s, and the held-out delay
+    gain fell to +0.000 — the shape absorbed the whole thing.
+
+    So with a shape library active:
+
+    - the per-voxel **absolute** delay is not separable from the selected
+      shape's peak time.  Read the delay map as *residual* timing beyond
+      what the shape already accounted for, and treat ``shape_index`` as
+      the primary carrier of voxel-level timing.
+    - the per-**trial** delay is still meaningful, because the shape is
+      fixed within a voxel across trials, so trial-to-trial deviations
+      cannot be absorbed by it.
+
+    If you want one clean absolute delay map, use a single shared shape so
+    that all timing is forced into the delay parameter.
+
+    Returns
+    -------
+    (shape_index, r2_by_shape) : (n_voxels,) long, (n_voxels, n_shapes)
+        ``r2_by_shape`` is IN-SAMPLE.  Shape choice is another free
+        parameter, so it buys in-sample fit exactly as delay does — judge
+        it with :func:`xval_shifted_hrf`, which selects fold-locally.
+    """
+    if device is None:
+        device = get_device()
+    y_src = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
+    n_voxels, n_t = y_src.shape
+    n_shapes = shapes.shape[0]
+    zero = np.array([0.0])
+    if chunk_size is None:
+        from fastfuncstuff.memory import get_available_memory
+
+        budget = int(get_available_memory(device) * 0.5)
+        chunk_size = max(256, min(n_voxels, int(budget // max(n_t * 8 * 6, 1))))
+
+    ss_res = np.zeros((n_voxels, n_shapes), dtype=np.float32)
+    ss_tot = np.zeros(n_voxels, dtype=np.float32)
+    n_blocks = len(block_onsets)
+
+    for si in tqdm(
+        range(n_shapes),
+        total=n_shapes,
+        desc="  Shape selection",
+        unit="shape",
+        leave=False,
+        disable=n_shapes <= 1,
+    ):
+        bank = build_shifted_design_bank(
+            block_onsets,
+            shapes[si],
+            hrf_dt,
+            zero,
+            tr,
+            n_t,
+            durations=durations,
+            device=device,
+        )[:, 0, :]  # (NB, T)
+        X = _project_out(bank, nuisance).T.contiguous()  # (T, NB)
+        XtX = X.T @ X
+        XtX = XtX + 1e-8 * float(torch.diagonal(XtX).mean()) * torch.eye(
+            n_blocks, dtype=XtX.dtype, device=device
+        )
+        L = torch.linalg.cholesky(XtX)
+        for s in range(0, n_voxels, chunk_size):
+            e = min(s + chunk_size, n_voxels)
+            y = _project_out(
+                y_src[s:e].to(device=device, dtype=torch.float64, non_blocking=True), nuisance
+            )
+            beta = torch.cholesky_solve(X.T @ y.T, L)  # (NB, nv)
+            # SSE = ||y||^2 - beta' X'y  (exact for the OLS solution)
+            sse = (y**2).sum(dim=1) - (beta * (X.T @ y.T)).sum(dim=0)
+            ss_res[s:e, si] = sse.clamp_min(0).float().cpu().numpy()
+            if si == 0:
+                ss_tot[s:e] = (
+                    ((y - y.mean(dim=1, keepdim=True)) ** 2)
+                    .sum(dim=1)
+                    .clamp_min(1e-12)
+                    .float()
+                    .cpu()
+                    .numpy()
+                )
+            del y, beta, sse
+        del bank, X, XtX, L
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    r2 = 1.0 - ss_res / ss_tot[:, None]
+    idx = np.argmax(r2, axis=1).astype(np.int64)
+    if verbose:
+        counts = np.bincount(idx, minlength=n_shapes)
+        top = np.argsort(-counts)[: min(5, n_shapes)]
+        print(
+            f"  Shape selection over {n_shapes} candidates: "
+            + ", ".join(f"#{int(t)}={int(counts[t])}" for t in top)
+            + f" (median in-sample R² {float(np.median(r2.max(axis=1))):.3f})"
+        )
+    return idx, r2.astype(np.float32)
+
+
+def fit_shifted_hrf_per_voxel_shape(
+    data: np.ndarray | Tensor,
+    block_onsets: list[np.ndarray],
+    shapes: np.ndarray,
+    hrf_dt: float,
+    tr: float,
+    *,
+    shape_index: np.ndarray | None = None,
+    nuisance: Tensor | None = None,
+    durations: list[float] | None = None,
+    tau_max: float = 2.0,
+    tau_step: float = 0.25,
+    n_sweeps: int = 4,
+    delay_prior_sd: float | None = 0.75,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> tuple[ShiftedHRFResult, np.ndarray]:
+    """Per-voxel HRF shape, then per-trial amplitude + delay on that shape.
+
+    Two stages, deliberately not one.  First each voxel picks its shape at
+    zero delay (:func:`select_shape_per_voxel`); then the delay search runs
+    within each shape group.  Letting shape and delay compete in a single
+    search lets each absorb the other's error — a mis-specified shape can
+    masquerade as a delay and vice versa — so the estimates stop meaning
+    what their names say.
+
+    This is cheap because the design bank is a function of the *shape*,
+    not of the voxel: it is built once per group and shared by every voxel
+    assigned to that group.  No per-voxel design is ever constructed.
+
+    Returns
+    -------
+    (result, shape_index)
+        ``result`` fields are in the caller's original voxel order.
+    """
+    if device is None:
+        device = get_device()
+    y_src = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
+    n_voxels = y_src.shape[0]
+    n_blocks = len(block_onsets)
+
+    if shape_index is None:
+        shape_index, _ = select_shape_per_voxel(
+            y_src,
+            block_onsets,
+            shapes,
+            hrf_dt,
+            tr,
+            nuisance=nuisance,
+            durations=durations,
+            device=device,
+            verbose=verbose,
+        )
+    shape_index = np.asarray(shape_index, dtype=np.int64)
+    if shape_index.shape != (n_voxels,):
+        raise ValueError(f"shape_index must have shape ({n_voxels},); got {shape_index.shape}")
+
+    amps = np.zeros((n_voxels, n_blocks), dtype=np.float32)
+    delays = np.zeros((n_voxels, n_blocks), dtype=np.float32)
+    r2 = np.zeros(n_voxels, dtype=np.float32)
+    r2_fixed = np.zeros(n_voxels, dtype=np.float32)
+    tau_grid = np.arange(-tau_max, tau_max + 0.5 * tau_step, tau_step, dtype=np.float64)
+    sweeps = 1
+
+    used = np.unique(shape_index)
+    for si in tqdm(
+        used,
+        total=used.size,
+        desc="  Shift fit per shape",
+        unit="shape",
+        leave=True,
+        disable=used.size <= 1,
+    ):
+        sel = np.flatnonzero(shape_index == si)
+        if sel.size == 0:
+            continue
+        sub = fit_shifted_hrf(
+            data=y_src[torch.from_numpy(sel)],
+            block_onsets=block_onsets,
+            hrf=shapes[si],
+            hrf_dt=hrf_dt,
+            tr=tr,
+            nuisance=nuisance,
+            tau_max=tau_max,
+            tau_step=tau_step,
+            durations=durations,
+            n_sweeps=n_sweeps,
+            delay_prior_sd=delay_prior_sd,
+            device=device,
+            verbose=False,
+        )
+        amps[sel] = sub.amplitudes
+        delays[sel] = sub.delays
+        r2[sel] = sub.r2
+        r2_fixed[sel] = sub.r2_fixed
+        sweeps = max(sweeps, sub.n_sweeps)
+
+    if verbose:
+        print(
+            f"  Shift fit across {used.size} occupied shape group(s): "
+            f"median R² {float(np.median(r2)):.3f} "
+            f"(τ=0 baseline {float(np.median(r2_fixed)):.3f})"
+        )
+    return (
+        ShiftedHRFResult(
+            amplitudes=amps,
+            delays=delays,
+            r2=r2,
+            r2_fixed=r2_fixed,
+            n_sweeps=sweeps,
+            tau_grid=tau_grid,
+        ),
+        shape_index,
+    )

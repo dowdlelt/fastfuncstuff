@@ -22,9 +22,7 @@ CPU = torch.device("cpu")
 @pytest.fixture(scope="module")
 def setup():
     h = (
-        get_spm_hrf_with_derivatives(
-            microtime_dt=DT, hrf_duration=32.0, n_basis=1, device=CPU
-        )
+        get_spm_hrf_with_derivatives(microtime_dt=DT, hrf_duration=32.0, n_basis=1, device=CPU)
         .cpu()
         .numpy()[0]
     )
@@ -38,9 +36,7 @@ def setup():
 def _simulate(h, block_onsets, tau, amps):
     """Exact-shift simulation on a grid fine enough to be ~continuous."""
     fine = np.arange(-3.0, 3.001, 0.05)
-    bank = build_shifted_design_bank(
-        block_onsets, h, DT, fine, TR, NTP, device=CPU
-    ).numpy()
+    bank = build_shifted_design_bank(block_onsets, h, DT, fine, TR, NTP, device=CPU).numpy()
     nv, nb = tau.shape
     y = np.zeros((nv, NTP))
     for v in range(nv):
@@ -54,9 +50,7 @@ def test_bank_shift_is_exact(setup):
     """C[b, g] must equal the HRF sampled at (t - onset - tau), not a Taylor step."""
     h, onsets, block_onsets, _ = setup
     tau_grid = np.array([-1.7, 0.0, 2.3])
-    bank = build_shifted_design_bank(
-        block_onsets, h, DT, tau_grid, TR, NTP, device=CPU
-    ).numpy()
+    bank = build_shifted_design_bank(block_onsets, h, DT, tau_grid, TR, NTP, device=CPU).numpy()
     t_tr = np.arange(NTP) * TR
     hrf_t = np.arange(h.size) * DT
     for b, o in enumerate(onsets):
@@ -275,9 +269,7 @@ def test_r2_fixed_is_the_no_latency_baseline(setup):
     nb = len(block_onsets)
     rng = np.random.default_rng(3)
     tau = rng.normal(0, 1.0, size=(50, nb)).clip(-3, 3)
-    y = _simulate(h, block_onsets, tau, np.ones((50, nb))) + rng.normal(
-        0, 0.5, size=(50, NTP)
-    )
+    y = _simulate(h, block_onsets, tau, np.ones((50, nb))) + rng.normal(0, 0.5, size=(50, NTP))
     kw = dict(
         data=torch.from_numpy(y),
         block_onsets=block_onsets,
@@ -392,3 +384,252 @@ def test_xval_rejects_absent_latency(setup):
     )
     gap = np.median(r2_shift - r2_tau0)
     assert gap < 0.02, f"validator claims latency where there is none: gap {gap:+.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Per-voxel shape selection
+# ---------------------------------------------------------------------------
+
+
+def test_shape_library_curves_are_positive_and_peak_normalised():
+    """Every candidate must be peak-1 and positive-going.
+
+    A sign-flipped curve in the library would let a voxel fit a positive
+    response with a negative amplitude, which is then indistinguishable
+    from genuine negative BOLD downstream.  Peak-normalisation is what
+    makes the fitted amplitude mean the same thing across shape groups.
+    """
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    for src in ("canonical", "library", "pighs", "flobs"):
+        curves, labels = build_shape_library(src, DT, 32.0, n_hrfs=8)
+        assert curves.shape[0] == len(labels) >= 1
+        for c in curves:
+            assert abs(np.max(np.abs(c)) - 1.0) < 1e-9, f"{src} not peak-normalised"
+            assert abs(c.max()) >= abs(c.min()), f"{src} has a sign-flipped curve"
+
+
+def test_shape_library_rejects_unknown_source():
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    with pytest.raises(ValueError, match="unknown shape source"):
+        build_shape_library("nope", DT, 32.0)
+
+
+def test_shape_selection_recovers_the_generating_curve(setup):
+    """Voxels simulated from curve k should mostly be assigned curve k."""
+    from fastfuncstuff.design.shifted_hrf import (
+        build_shape_library,
+        select_shape_per_voxel,
+    )
+
+    _, _, block_onsets, polys = setup
+    curves, _ = build_shape_library("pighs", DT, 32.0, n_hrfs=6)
+    # pick two curves that are actually distinguishable
+    a, b = 0, curves.shape[0] - 1
+    nb = len(block_onsets)
+    rng = np.random.default_rng(5)
+    ys, truth = [], []
+    for k in (a, b):
+        y = _simulate(curves[k], block_onsets, np.zeros((40, nb)), np.ones((40, nb)))
+        ys.append(y + rng.normal(0, 0.3, size=y.shape))
+        truth += [k] * 40
+    y_all = np.concatenate(ys, axis=0)
+    idx, r2 = select_shape_per_voxel(
+        torch.from_numpy(y_all),
+        block_onsets,
+        curves,
+        DT,
+        TR,
+        nuisance=torch.from_numpy(polys).to(torch.float64),
+        device=CPU,
+    )
+    truth = np.asarray(truth)
+    assert r2.shape == (80, curves.shape[0])
+    # Neighbouring curves in the library are genuinely similar, so exact
+    # index recovery is too strict.  What must hold is that the two groups
+    # separate, and in the right direction.
+    med_a = float(np.median(idx[truth == a]))
+    med_b = float(np.median(idx[truth == b]))
+    assert med_a < med_b, f"groups not separated in order: {med_a} vs {med_b}"
+    # each group's chosen curve should be nearer its own generator
+    assert abs(med_a - a) < abs(med_a - b)
+    assert abs(med_b - b) < abs(med_b - a)
+
+
+def test_per_voxel_shape_beats_a_single_wrong_shape(setup):
+    """Selecting per voxel must fit better than forcing one shape on all."""
+    from fastfuncstuff.design.shifted_hrf import (
+        build_shape_library,
+        fit_shifted_hrf_per_voxel_shape,
+    )
+
+    _, _, block_onsets, polys = setup
+    curves, _ = build_shape_library("pighs", DT, 32.0, n_hrfs=6)
+    nb = len(block_onsets)
+    rng = np.random.default_rng(6)
+    ys = []
+    for k in (0, curves.shape[0] - 1):
+        y = _simulate(curves[k], block_onsets, np.zeros((30, nb)), np.ones((30, nb)))
+        ys.append(y + rng.normal(0, 0.3, size=y.shape))
+    y_all = np.concatenate(ys, axis=0)
+    Zt = torch.from_numpy(polys).to(torch.float64)
+
+    res, sidx = fit_shifted_hrf_per_voxel_shape(
+        data=torch.from_numpy(y_all),
+        block_onsets=block_onsets,
+        shapes=curves,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=Zt,
+        tau_max=1.0,
+        tau_step=0.25,
+        n_sweeps=2,
+        device=CPU,
+    )
+    # forcing every voxel onto the first curve
+    forced = fit_shifted_hrf(
+        data=torch.from_numpy(y_all),
+        block_onsets=block_onsets,
+        hrf=curves[0],
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=Zt,
+        tau_max=1.0,
+        tau_step=0.25,
+        n_sweeps=2,
+        device=CPU,
+    )
+    assert sidx.shape == (60,)
+    assert np.median(res.r2) > np.median(forced.r2), (
+        f"per-voxel shape {np.median(res.r2):.4f} did not beat forced {np.median(forced.r2):.4f}"
+    )
+
+
+def test_per_voxel_shape_validates_shape_index_length(setup):
+    from fastfuncstuff.design.shifted_hrf import (
+        build_shape_library,
+        fit_shifted_hrf_per_voxel_shape,
+    )
+
+    _, _, block_onsets, polys = setup
+    curves, _ = build_shape_library("library", DT, 32.0)
+    with pytest.raises(ValueError, match="shape_index must have shape"):
+        fit_shifted_hrf_per_voxel_shape(
+            data=torch.zeros((5, NTP), dtype=torch.float64),
+            block_onsets=block_onsets,
+            shapes=curves,
+            hrf_dt=DT,
+            tr=TR,
+            shape_index=np.zeros(4, dtype=np.int64),
+            nuisance=torch.from_numpy(polys).to(torch.float64),
+            device=CPU,
+        )
+
+
+def test_xval_selects_shape_fold_locally(setup):
+    """Shape must be re-selected per fold, and scoring must use that shape.
+
+    Shape choice is a free parameter that buys in-sample fit exactly as
+    delay does.  Selecting it once on all the data and then "validating"
+    leaks; scoring one shared shape while the fit used per-voxel shapes
+    validates a different model than was fitted.  Both bugs show up as an
+    xval result that does not respond to the shape library at all, so this
+    checks that passing `shapes` genuinely changes the held-out score AND
+    that a library containing the true generator beats a single wrong one.
+    """
+    from fastfuncstuff.design.shifted_hrf import build_shape_library, xval_shifted_hrf
+
+    h, _, _, _ = setup
+    curves, _ = build_shape_library("pighs", DT, 32.0, n_hrfs=6)
+    cond_onsets = [np.arange(10.0, NTP * TR - 40, 12.0)]
+    nv = 60
+    rng = np.random.default_rng(11)
+    tau_v = np.where(rng.random((nv, 1)) < 0.5, -1.0, 1.0)
+    # generate half the voxels from the first curve, half from the last
+    runs, onsets = _multirun(curves[0], 4, cond_onsets, tau_v[: nv // 2], 0.3, 0.4, nv // 2, 11)
+    runs2, _ = _multirun(curves[-1], 4, cond_onsets, tau_v[nv // 2 :], 0.3, 0.4, nv - nv // 2, 12)
+    runs = [torch.cat([a, b], dim=0) for a, b in zip(runs, runs2, strict=True)]
+
+    kw = dict(
+        per_run_data=runs,
+        per_run_condition_onsets=onsets,
+        hrf_dt=DT,
+        tr=TR,
+        polort=2,
+        single_trials=True,
+        tau_max=2.0,
+        tau_step=0.25,
+        delay_prior_sd=0.75,
+        device=CPU,
+        verbose=False,
+    )
+    # one shape for everyone, deliberately the wrong one for half the voxels
+    single, _ = xval_shifted_hrf(hrf=curves[0], **kw)
+    # per-voxel selection from a library containing both generators
+    per_vox, _ = xval_shifted_hrf(hrf=curves[0], shapes=curves, **kw)
+
+    # voxels generated from the LAST curve are the ones a single wrong shape
+    # hurts, so that half must improve when selection is available
+    wrong_half = slice(nv // 2, nv)
+    assert np.median(per_vox[wrong_half]) > np.median(single[wrong_half]), (
+        f"fold-local shape selection did not help the mismatched voxels: "
+        f"{np.median(per_vox[wrong_half]):.4f} vs {np.median(single[wrong_half]):.4f}"
+    )
+
+
+def test_shape_selection_absorbs_delay_confound(setup):
+    """Records the shape/delay confound so a change in it is visible.
+
+    A library varying peak time competes with the delay parameter: both
+    move the response in time.  This is an identifiability property of the
+    model, not a bug, but it decides how the outputs must be read, so it
+    is pinned here.  If this test starts failing, the confound structure
+    changed and the interpretation guidance needs revisiting.
+
+    The magnitude of the confound depends on the library's peak-time spread
+    and on SNR (measured r=0.99 with a FLOBS library over 4 runs, r=0.35
+    with 8 PIGHS curves over 1), so asserting a particular correlation
+    would be brittle.  What is asserted instead is the consequence that
+    governs interpretation: on identical data, letting the shape vary
+    shrinks the recovered delay relative to holding the shape fixed.
+    """
+    from fastfuncstuff.design.shifted_hrf import (
+        build_shape_library,
+        fit_shifted_hrf_per_voxel_shape,
+    )
+
+    h, _, _, _ = setup
+    curves, _ = build_shape_library("pighs", DT, 32.0, n_hrfs=12)
+    cond_onsets = [np.arange(10.0, NTP * TR - 40, 12.0)]
+    nv = 80
+    rng = np.random.default_rng(21)
+    tau_v = np.where(rng.random((nv, 1)) < 0.5, -1.2, 1.2)
+    runs, _ = _multirun(h, 1, cond_onsets, tau_v, 0.2, 0.3, nv, seed=21)
+    blocks = [np.array([float(t)]) for t in cond_onsets[0]]
+    Zt = torch.from_numpy(
+        np.polynomial.legendre.legvander(np.linspace(-1, 1, NTP), 2)
+    ).to(torch.float64)
+    kw = dict(
+        block_onsets=blocks,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=Zt,
+        tau_max=2.0,
+        tau_step=0.25,
+        n_sweeps=4,
+        device=CPU,
+    )
+    with_shapes, _ = fit_shifted_hrf_per_voxel_shape(
+        data=runs[0], shapes=curves, **kw
+    )
+    # same data, shape held fixed at the true generator: all the timing
+    # information has nowhere to go but the delay parameter
+    fixed_shape = fit_shifted_hrf(data=runs[0], hrf=h, **kw)
+
+    d_free = float(np.median(np.abs(with_shapes.delays.mean(axis=1))))
+    d_fixed = float(np.median(np.abs(fixed_shape.delays.mean(axis=1))))
+    assert d_free < d_fixed, (
+        f"expected a varying shape to absorb some delay: |delay| with shapes "
+        f"{d_free:.3f} vs fixed shape {d_fixed:.3f}"
+    )
