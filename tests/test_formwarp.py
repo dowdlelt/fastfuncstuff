@@ -296,3 +296,52 @@ def test_cli_timeseries_5d_and_folder_match(tmp_path):
     assert n5 == nf == 3
     torch.testing.assert_close(y5, yf)
     torch.testing.assert_close(x5, xf)
+
+
+def test_cli_matrix_estimates_on_the_source_grid(tmp_path):
+    """-matrix inverts the source->base affine and pulls the base onto the SOURCE grid.
+
+    The source is then never resampled, and every output carries the source's grid and
+    header -- the warp lives in source space and is applied to the source *before* the
+    affine, i.e. ``ffs_nwarp -nwarp 'matrix.aff12.1D out_WARP.nii'``.
+    """
+    import numpy as np
+
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.cli.formwarp import main as fmain
+    from fastfuncstuff.processing.affine import (
+        apply_affine_interp,
+        save_matrix_1D,
+        voxel_matrix_to_dicom,
+    )
+
+    # Deliberately different grids, so "which grid did it use" is unambiguous.
+    nz, ny, nx = 16, 20, 18
+    snz, sny, snx = 14, 18, 16
+    base = _blobs(nz, ny, nx) + 0.2
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    src_affine = np.diag([2.0, 2.0, 2.0, 1.0])
+
+    m_b2s = torch.eye(4)  # base voxel -> source voxel (a pure shift here)
+    m_b2s[1, 3] = 1.0
+    source = apply_affine_interp(
+        base, torch.linalg.inv(m_b2s.double()).float(), output_shape=(snz, sny, snx)
+    )
+
+    bp, sp, mp = tmp_path / "b.nii.gz", tmp_path / "s.nii.gz", tmp_path / "m.aff12.1D"
+    nib.save(nib.Nifti1Image(base.permute(2, 1, 0).numpy(), affine), bp)
+    nib.save(nib.Nifti1Image(source.permute(2, 1, 0).numpy(), src_affine), sp)
+    save_matrix_1D(voxel_matrix_to_dicom(m_b2s, affine, src_affine), mp)
+
+    out = tmp_path / "out.nii.gz"
+    rc = fmain(
+        [
+            *("-base", str(bp), "-source", str(sp), "-matrix", str(mp)),
+            *("-prefix", str(out), "-save_warp", "-shrink", "2x1"),
+            *("-smooth", "1x0", "-iters", "4x3", "-device", "cpu", "-verb", "0"),
+        ]
+    )
+    assert rc == 0
+    # Outputs are on the SOURCE grid, not the base's -- the whole point of -matrix.
+    assert nib.load(str(out)).shape == (snx, sny, snz)
+    assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)

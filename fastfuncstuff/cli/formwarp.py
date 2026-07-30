@@ -40,6 +40,7 @@ from fastfuncstuff.cli_utils import (
     sanitize_volume,
     spinner,
 )
+from fastfuncstuff.processing.affine import apply_affine_interp, load_matrix_1D
 from fastfuncstuff.processing.formwarp import (
     METRICS,
     NO_X_DISP,
@@ -208,6 +209,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("-noYdis", "-noydis", action="store_true", help="No y-displacement.")
     p.add_argument("-noZdis", "-nozdis", action="store_true", help="No z-displacement.")
 
+    p.add_argument(
+        "-matrix",
+        "-1Dmatrix",
+        "-1Dmatrix_apply",
+        default=None,
+        help="An .aff12.1D affine (as ffs_allineate -1Dmatrix_save writes) taking the "
+        "SOURCE to the base. Given this, the source is NOT expected to be pre-aligned: "
+        "the matrix is inverted and the BASE is resampled (wsinc5) onto the source's "
+        "own grid, and the warp is estimated there. The source is never resampled, so "
+        "it keeps every voxel it acquired. Everything written out -- warped image and "
+        "warp fields -- is then on the SOURCE grid; carry it to base space with the "
+        "warp applied to the source first: "
+        "ffs_nwarp -source src.nii -nwarp 'matrix.aff12.1D out_WARP.nii' -master base.nii. "
+        "NOTE: this does not recover the clipped FoV, it relocates it -- the base is "
+        "what falls out of frame now, and the fixed image is the one interpolated. "
+        "Measured worse than the default arrangement at a clipped edge; see "
+        "../fmri_wiki/concepts/SyN.md.",
+    )
+
     # Weight / mask
     p.add_argument("-weight", help="Weight image emphasizing the metric (overrides automask).")
     add_coverage_args(p)
@@ -321,7 +341,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     with spinner(f"Loading {Path(args.base).name}"):
         base, base_info = load_image(args.base, device=torch.device("cpu"))
     with spinner(f"Loading {Path(args.source).name}"):
-        source, _ = load_image(args.source, device=torch.device("cpu"))
+        source, source_info = load_image(args.source, device=torch.device("cpu"))
 
     base = sanitize_volume(base, "-base", args.verb)
     source = sanitize_volume(source, "-source", args.verb)
@@ -331,19 +351,42 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             print("WARNING: 4D -base; using vol[0] as the fixed target")
         base = base[0]
 
+    # -matrix: invert the source->base affine and pull the base onto the source's grid,
+    # so the registration runs in the source's own frame with the source untouched.
+    # Everything after this point is identical to the pre-aligned path -- the only
+    # difference is which grid "the grid" means, hence which header the outputs carry.
+    out_info = base_info
+    if args.matrix is not None:
+        src_shape = tuple(source.shape[1:]) if source.ndim == 4 else tuple(source.shape)
+        m_b2s = load_matrix_1D(args.matrix, base_info["affine"], source_info["affine"])
+        m_s2b = torch.linalg.inv(m_b2s.double()).float().to(device)
+        with spinner(f"Resampling base onto the {Path(args.source).name} grid"):
+            base = apply_affine_interp(
+                base.float().to(device),
+                m_s2b,
+                interp="wsinc5",
+                output_shape=src_shape,
+                zero_outside=True,
+            ).cpu()
+        out_info = source_info
+        if args.verb >= 1:
+            print(f"Base resampled into source space: grid {src_shape[::-1]}")
+
     # Timeseries mode: a 4D -source registers every volume to the (3D) base and
     # writes a 4D warped series + a per-volume warp series (5D file or folder).
     timeseries = source.ndim == 4
     if timeseries and tuple(source.shape[1:]) != tuple(base.shape):
         print(
             f"ERROR: source volumes {tuple(source.shape[1:])} and base {tuple(base.shape)} "
-            "must be on the same grid (resample first, e.g. ffs_allineate)."
+            "must be on the same grid (resample first with ffs_allineate, or pass "
+            "that alignment as -matrix)."
         )
         return 1
     if not timeseries and tuple(base.shape) != tuple(source.shape):
         print(
             f"ERROR: base {tuple(base.shape)} and source {tuple(source.shape)} "
-            "must be on the same grid (resample first, e.g. ffs_allineate)."
+            "must be on the same grid (resample first with ffs_allineate, or pass "
+            "that alignment as -matrix)."
         )
         return 1
 
@@ -421,7 +464,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             mask,
             base_cover,
             config,
-            base_info,
+            out_info,
             prefix,
             nii_ext,
             device,
@@ -441,7 +484,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
-        save_image(res.warped, warped_path, header_info=base_info)
+        save_image(res.warped, warped_path, header_info=out_info)
     if args.verb >= 1:
         print(f"Saved warped image: {warped_path}")
 
@@ -454,7 +497,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
                 triple[1].cpu(),
                 triple[2].cpu(),
                 path,
-                header_info=base_info,
+                header_info=out_info,
                 units="mm",
             )
         if args.verb >= 1:
@@ -476,7 +519,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
 
 def _run_timeseries(
-    args, base, source, weight, mask, base_cover, config, base_info, prefix, nii_ext, device, t0
+    args, base, source, weight, mask, base_cover, config, out_info, prefix, nii_ext, device, t0
 ) -> int:
     """Register every volume of a 4D source to the 3D base (per-volume SyN).
 
@@ -526,7 +569,7 @@ def _run_timeseries(
 
     warped_path = f"{prefix}{nii_ext}"
     with spinner(f"Writing {Path(warped_path).name}"):
-        save_image(torch.stack(warped_frames), warped_path, header_info=base_info)
+        save_image(torch.stack(warped_frames), warped_path, header_info=out_info)
     if args.verb >= 1:
         print(f"Saved warped series: {warped_path} ({n_t} volumes)")
 
@@ -537,7 +580,7 @@ def _run_timeseries(
         zs = torch.stack([f[2] for f in frames])
         dest = f"{prefix}_{tag}{nii_ext}" if as_5d else f"{prefix}_{tag}"
         with spinner(f"Writing {Path(dest).name}"):
-            out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=base_info, units="mm")
+            out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=out_info, units="mm")
         if args.verb >= 1:
             fmt = "5D" if as_5d else "folder"
             print(f"Saved {label} ({fmt}): {out}")
