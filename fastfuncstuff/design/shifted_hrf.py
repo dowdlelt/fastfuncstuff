@@ -193,6 +193,7 @@ def _solve_amplitudes(
     ar_b: Tensor,
     ar_v: Tensor,
     n_blocks: int,
+    amp_batch: int,
 ) -> Tensor:
     """Exact joint amplitude solve given every block's chosen grid index.
 
@@ -219,20 +220,32 @@ def _solve_amplitudes(
     -------
     (nv, n_blocks) amplitudes.
     """
-    g_b = gi.T  # (NB, nv)
-    XtX = gram[
-        ar_b.view(-1, 1, 1),  # b
-        g_b.unsqueeze(-1),  # gi[v, b]
-        ar_b.view(1, 1, -1),  # b'
-        gi.unsqueeze(0),  # gi[v, b']
-    ]  # (NB, nv, NB)
-    XtX = XtX.permute(1, 0, 2)  # (nv, NB, NB)
-    Xty = proj[ar_b[:, None], g_b, ar_v[None, :]].T  # (nv, NB)
-    # Overlapping trials at short ISI make XtX near-singular; a relative
-    # jitter keeps the batched solve well-posed without biasing A.
-    ridge = 1e-8 * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
-    XtX = XtX + ridge[:, None, None] * torch.eye(n_blocks, dtype=XtX.dtype, device=XtX.device)
-    return torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
+    nv = gi.shape[0]
+    out = torch.empty((nv, n_blocks), dtype=gram.dtype, device=gram.device)
+    eye = torch.eye(n_blocks, dtype=gram.dtype, device=gram.device)
+    # Sub-batch so the (nv, NB, NB) gather never forces the CALLER to use a
+    # small chunk.  Keeping these two independent is what unblocks the
+    # coordinate loop from running launch-bound.
+    step = max(16, int(amp_batch))
+    for s in range(0, nv, step):
+        e = min(s + step, nv)
+        gi_s = gi[s:e]
+        g_b = gi_s.T  # (NB, nb_v)
+        XtX = gram[
+            ar_b.view(-1, 1, 1),  # b
+            g_b.unsqueeze(-1),  # gi[v, b]
+            ar_b.view(1, 1, -1),  # b'
+            gi_s.unsqueeze(0),  # gi[v, b']
+        ]  # (NB, nb_v, NB)
+        XtX = XtX.permute(1, 0, 2)  # (nb_v, NB, NB)
+        Xty = proj[ar_b[:, None], g_b, ar_v[s:e][None, :]].T  # (nb_v, NB)
+        # Overlapping trials at short ISI make XtX near-singular; a relative
+        # jitter keeps the batched solve well-posed without biasing A.
+        ridge = 1e-8 * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+        XtX = XtX + ridge[:, None, None] * eye
+        out[s:e] = torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
+        del XtX, Xty, ridge
+    return out
 
 
 def _project_out(mat: Tensor, Z: Tensor | None) -> Tensor:
@@ -371,6 +384,16 @@ def fit_shifted_hrf(
     # Gaussian prior on tau expressed in the grid's own units.  Scaled by
     # sigma^2 below so it competes with SSE on equal footing.
 
+    # Real free memory drives both the chunk size and the amplitude-solve
+    # sub-batch; [[Memory module]] is the single source of truth rather than
+    # hardcoded element counts.
+    from fastfuncstuff.memory import get_available_memory
+
+    bytes_budget = int(get_available_memory(device) * 0.6)
+    # Amplitude solve peak: the (nv, NB, NB) gather plus the batched
+    # Cholesky's workspace, float64.  Give it a third of the budget.
+    amp_batch = max(16, int((bytes_budget / 3) // max(n_blocks * n_blocks * 8 * 2, 1)))
+
     if chunk_size is None:
         from fastfuncstuff.memory import estimate_chunk_size
 
@@ -382,13 +405,18 @@ def fit_shifted_hrf(
             operation="glm",
             use_double=True,
         )
-        # Two gathers bound the chunk: the coordinate step's (G, NB, nv)
-        # and the amplitude solve's (nv, NB, NB).  The latter dominates at
-        # single-trial scale, so cap on NB^2 as well or a 142-trial fit
-        # allocates ~2 GB per chunk.
-        cap_grid = int(4e7 // max(n_blocks * n_grid, 1))
-        cap_gram = int(2e7 // max(n_blocks * n_blocks, 1))
-        chunk_size = max(32, min(chunk_size, max(1, cap_grid), max(1, cap_gram)))
+        # The chunk size is bounded by the coordinate step's (G, NB, nv)
+        # gather ONLY.  The amplitude solve's (nv, NB, NB) gather used to
+        # cap it too, and that was a serious performance bug: at 420
+        # blocks it forced 113 voxels per chunk, so a 381k-voxel brain ran
+        # 3374 chunks × 420 blocks × n_sweeps tiny kernels — millions of
+        # launches, GPU sitting at 30-50 % util and launch-bound.  The
+        # amplitude solve is now sub-batched internally (see
+        # ``amp_batch``), which decouples the two constraints: the
+        # expensive sequential coordinate loop gets a big chunk, and the
+        # memory-hungry solve gets a small one.
+        cap_grid = int(bytes_budget // max(n_blocks * n_grid * 8 * 4, 1))
+        chunk_size = max(64, min(chunk_size, max(1, cap_grid)))
 
     amps = np.zeros((n_voxels, n_blocks), dtype=np.float32)
     delays = np.zeros((n_voxels, n_blocks), dtype=np.float32)
@@ -418,7 +446,7 @@ def fit_shifted_hrf(
         gi = torch.full((nv, n_blocks), zero_idx, dtype=torch.long, device=device)
 
         ar_v = torch.arange(nv, device=device)
-        A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks)
+        A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks, amp_batch)
         # σ² for the τ prior, taken from the τ=0 fit.  With A solved
         # exactly, SSE = ‖y‖² − Aᵀ(Xᵀy), so no prediction is needed.
         sse0 = (
@@ -460,7 +488,7 @@ def fit_shifted_hrf(
             for b in range(n_blocks):
                 # residual excluding block b, expressed via precomputed tables:
                 #   <C[b,g], r_other> = proj[b,g,v] - sum_{b'!=b} A_b' gram[b,g,b',g_b']
-                cross = gram[b][:, ar_b, :]  # (G, NB, G)
+                cross = gram[b]  # (G, NB, G) -- indexing dim1 by arange was a no-op
                 gsel = gi.T  # (NB, nv)
                 # (G, NB, nv) <- pick g' per (b', v)
                 cr = cross[:, ar_b[:, None], gsel]
@@ -475,7 +503,7 @@ def fit_shifted_hrf(
                     dev_tau = tau_t.unsqueeze(-1) - tau_bar.unsqueeze(0)
                     gain = gain - lam_sweep.unsqueeze(0) * dev_tau**2
                 gi[:, b] = torch.argmax(gain, dim=0)
-            A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks)
+            A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks, amp_batch)
 
         sse = (
             ss_y - torch.einsum("vb,vb->v", A, proj[ar_b[:, None], gi.T, ar_v[None, :]].T)
