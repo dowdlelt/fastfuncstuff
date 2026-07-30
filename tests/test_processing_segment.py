@@ -716,36 +716,123 @@ def test_warp_penalty_linear_elastic_and_tuple_compat():
     assert warp_penalty(field, (0.0, 0.0, 0.1, 0.02, 0.03), vox) > p3
 
 
-def test_warp_penalty_bending_is_the_biharmonic():
-    """Bending must be ``½Σ(Δu)²`` — SPM's ``ΔᵀΔ`` stencil — not ``½Σ(u_xx²+u_yy²+u_zz²)``.
+def test_vel2mom_impulse_response_matches_spm_stencil():
+    """``warp_prior_grad`` must reproduce ``spm_diffeo('vel2mom')``'s stencil coefficients.
 
-    The two forms differ because ``ΔᵀΔ`` carries the mixed partials (the ``8Σᵢ<ⱼvᵢvⱼ`` and
-    ``w110 = lam2·2v₀v₁`` terms in ``src/shoot_regularisers.c``). The discriminating field
-    is a **harmonic** one, whose pure second derivatives cancel in the Laplacian:
-    ``u_x = x² - y²`` gives ``u_xx = 2``, ``u_yy = -2`` → ``Δu = 0`` and no bending energy,
-    where summing ``u_xx² + u_yy² + u_zz²`` scores 8 at every interior node.
+    This is the test that was missing. Every previous check on the regulariser was a
+    *self-consistency* check — the operator matches the autograd gradient of the energy,
+    bending annihilates a harmonic field, the coarse-``samp`` warp does not freeze — and
+    all of them passed while the operator was off from SPM's by a factor of 729 at
+    ``samp 3`` / 1 mm. Nothing compared an absolute magnitude to the reference.
+
+    Two things fixed on 2026-07-29 and pinned here (``src/shoot_regularisers.c:601``):
+
+    - ``v_i = param_i²`` as a **multiplier** (SPM's ``v0 = s[0]*s[0]``), where the old code
+      divided by the node spacing (``1/h²``).
+    - ``vel2mom`` **always** divides the absolute/membrane/bending part of component ``c``
+      by ``v_c``; only the ``kernel()`` helper has a ``mu==0 && lam==0`` shortcut.
+
+    Read off an impulse response, which is the stencil by definition. Anisotropic ``param``
+    so an axis mix-up cannot cancel.
     """
-    from fastfuncstuff.processing.segment import _laplacian_neumann
+    from fastfuncstuff.processing.segment import warp_prior_grad
 
-    n = 9
-    zz, yy, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing="ij")
-    zero = torch.zeros_like(xx)
-    vox = (1.0, 1.0, 1.0)
-    harmonic = torch.stack([xx**2 - yy**2, zero, zero], dim=-1)  # dims (gz, gy, gx, 3)
+    param = (3.0, 2.0, 4.0)  # node spacing (SPM's sk.*vx), deliberately anisotropic
+    lam0, lam1, lam2 = 0.011, 0.022, 0.1
+    reg = (lam0, lam1, lam2, 0.0, 0.0)  # mu = lam = 0 → no cross-component coupling
+    v0, v1, v2 = (p * p for p in param)
+    tot = v0 + v1 + v2
+    # SPM's scalars, transcribed
+    w000 = (
+        lam2 * (6.0 * (v0 * v0 + v1 * v1 + v2 * v2) + 8.0 * (v0 * v1 + v0 * v2 + v1 * v2))
+        + lam1 * 2.0 * tot
+        + lam0
+    )
+    w100 = lam2 * (-4.0 * v0 * tot) - lam1 * v0
+    w010 = lam2 * (-4.0 * v1 * tot) - lam1 * v1
+    w001 = lam2 * (-4.0 * v2 * tot) - lam1 * v2
+    w200, w020, w002 = lam2 * v0 * v0, lam2 * v1 * v1, lam2 * v2 * v2
+    w110, w101, w011 = lam2 * 2.0 * v0 * v1, lam2 * 2.0 * v0 * v2, lam2 * 2.0 * v1 * v2
 
-    lap = _laplacian_neumann(harmonic, vox)
-    # interior nodes never touch the replicate padding, so the cancellation is exact
-    assert lap[1:-1, 1:-1, 1:-1].abs().max() < 1e-9
-    # the form used here until 2026-07-22 — pure second differences — does NOT vanish
-    old_form = sum((torch.diff(harmonic, n=2, dim=ax) ** 2).sum() for ax in (0, 1, 2))
-    assert old_form > 0
+    n = 13  # wide enough that the ±2 taps never reach the boundary
+    c = n // 2
+    for comp, vc in enumerate((v0, v1, v2)):
+        field = torch.zeros(n, n, n, 3, dtype=torch.float64)
+        field[c, c, c, comp] = 1.0
+        g = warp_prior_grad(field, reg, param)[..., comp]
 
-    # and the bending term is exactly ½·w·Σ(Δu)²
-    w = 0.3
-    assert torch.isclose(warp_penalty(harmonic, (0.0, 0.0, w), vox), 0.5 * w * (lap**2).sum())
-    # a genuinely curved (non-harmonic) field still carries bending energy
-    curved = torch.stack([xx**2 + yy**2, zero, zero], dim=-1)
-    assert warp_penalty(curved, (0.0, 0.0, 1.0), vox) > 0
+        # (dx, dy, dz) offset in SPM's (i, j, k) → array index (z, y, x)
+        def at(dx, dy, dz, _g=g):
+            return _g[c + dz, c + dy, c + dx].item()
+
+        assert at(0, 0, 0) == pytest.approx(w000 / vc, rel=1e-12)
+        assert at(1, 0, 0) == pytest.approx(w100 / vc, rel=1e-12)
+        assert at(0, 1, 0) == pytest.approx(w010 / vc, rel=1e-12)
+        assert at(0, 0, 1) == pytest.approx(w001 / vc, rel=1e-12)
+        assert at(2, 0, 0) == pytest.approx(w200 / vc, rel=1e-12)
+        assert at(0, 2, 0) == pytest.approx(w020 / vc, rel=1e-12)
+        assert at(0, 0, 2) == pytest.approx(w002 / vc, rel=1e-12)
+        assert at(1, 1, 0) == pytest.approx(w110 / vc, rel=1e-12)
+        assert at(1, 0, 1) == pytest.approx(w101 / vc, rel=1e-12)
+        assert at(0, 1, 1) == pytest.approx(w011 / vc, rel=1e-12)
+
+    # the elastic terms couple components: mu/lam put w2 = (mu+lam)/4 on the mixed taps
+    mu, lam = 0.013, 0.041
+    field = torch.zeros(n, n, n, 3, dtype=torch.float64)
+    field[c, c, c, 1] = 1.0  # a y-displacement impulse
+    gx = warp_prior_grad(field, (0.0, 0.0, 0.0, mu, lam), param)[..., 0]
+    w2 = 0.25 * (mu + lam)
+    assert gx[c, c - 1, c + 1].item() == pytest.approx(w2, rel=1e-12)  # (dx,dy) = (+1,-1)
+    assert gx[c, c + 1, c + 1].item() == pytest.approx(-w2, rel=1e-12)  # (+1,+1)
+
+    # and the per-component diagonal helper agrees with SPM's wx000/wy000/wz000
+    from fastfuncstuff.processing.segment import warp_prior_diagonal
+
+    diag = warp_prior_diagonal((lam0, lam1, lam2, mu, lam), param, (n, n, n))
+    w000_le = w000  # lam0/lam1/lam2 part is unchanged by mu/lam
+    expected = (
+        2.0 * mu * (2.0 * v0 + v1 + v2) / v0 + 2.0 * lam + w000_le / v0,
+        2.0 * mu * (v0 + 2.0 * v1 + v2) / v1 + 2.0 * lam + w000_le / v1,
+        2.0 * mu * (v0 + v1 + 2.0 * v2) / v2 + 2.0 * lam + w000_le / v2,
+    )
+    assert diag == pytest.approx(expected, rel=1e-12)
+
+
+def test_warp_prior_symbol_diagonalises_the_operator():
+    """The DCT-II symbol must equal ``L`` on its diagonal blocks.
+
+    The Gauss-Newton warp solve depends on this: ``L`` is stiff and ill-conditioned in
+    exactly the smooth modes the prior exists to produce, so CG needs the
+    ``(shift·I + L)⁻¹`` preconditioner to converge in a sane number of iterations, and that
+    preconditioner is only valid if the symbol really diagonalises the operator. A wrong
+    symbol degrades silently into slow convergence — i.e. back into the spiky warp this
+    was fixed to avoid — so pin it. ``mu = lam = 0`` because the cross-component coupling
+    is deliberately excluded from the symbol (it maps cosine modes to sine modes).
+    """
+    from fastfuncstuff.processing.segment import (
+        _dct3,
+        _dct_matrix,
+        warp_prior_grad,
+        warp_prior_symbol,
+    )
+
+    torch.manual_seed(0)
+    shape = (9, 11, 13)
+    field = torch.randn(*shape, 3, dtype=torch.float64)
+    for reg, param in (
+        ((0.0, 0.0, 0.1, 0.0, 0.0), (3.0, 3.0, 3.0)),
+        ((0.01, 0.02, 0.1, 0.0, 0.0), (3.0, 2.0, 4.0)),
+        ((0.0, 0.5, 0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+    ):
+        mats = tuple(_dct_matrix(n, torch.device("cpu"), torch.float64) for n in shape)
+        x = field.permute(3, 0, 1, 2).contiguous()
+        assert torch.allclose(_dct3(_dct3(x, mats, inverse=False), mats, inverse=True), x)
+        sym = warp_prior_symbol(reg, param, shape, dtype=torch.float64)
+        got = _dct3(_dct3(x, mats, inverse=False) * sym, mats, inverse=True).permute(1, 2, 3, 0)
+        expected = warp_prior_grad(field, reg, param)
+        assert torch.allclose(got, expected, atol=1e-9, rtol=1e-7), (
+            f"reg={reg} param={param}: max |Δ| = {(got - expected).abs().max():.3e}"
+        )
 
 
 def test_warp_penalty_is_half_the_quadratic_form():
@@ -761,9 +848,15 @@ def test_warp_penalty_is_half_the_quadratic_form():
     pen = warp_penalty(field, (0.01, 0.02, 0.1, 0.01, 0.04), vox)
     (grad,) = torch.autograd.grad(pen, field)
     assert torch.isclose((field * grad).sum(), 2.0 * pen)
-    # and the half itself: doubling the field quadruples the energy, from a known scale
+    # and the half itself: doubling the field quadruples the energy, from a known scale.
+    # SPM's absolute term enters as `lam0*c` inside the group divided by v_c = param_c²
+    # (`shoot_regularisers.c:729`), so the energy is ½·lam0·Σu²/v — isotropic `vox` here,
+    # so one factor covers all three components.
     field2 = field.detach() * 2.0
-    assert torch.isclose(warp_penalty(field2, (1.0, 0.0, 0.0), vox), 4.0 * 0.5 * (field**2).sum())
+    v = vox[0] ** 2
+    assert torch.isclose(
+        warp_penalty(field2, (1.0, 0.0, 0.0), vox), 4.0 * 0.5 * (field**2).sum() / v
+    )
 
 
 @pytest.mark.parametrize(
@@ -1063,6 +1156,63 @@ def test_split_is_deferred_but_still_applied_in_one_iteration():
     assert out["means"].shape[1] == 6
     assert out["covs"].shape[2] == 6
     assert out["mix"].numel() == 6
+
+
+def test_split_after_waits_for_the_bias_before_expanding_gaussians():
+    """``split_after`` must delay the expansion, and the delayed split must start from a
+    **tighter** covariance than SPM's split-after-one-round schedule.
+
+    The first ``[GMM, bias]`` round fits the GMM to the *uncorrected* image (``Tbias``
+    starts at zero, the bias step comes after), so every tissue covariance is still
+    inflated by the bias field. ``split_gaussians`` hands both children that inflated
+    covariance, and on real data a too-broad pair bifurcates — one child contracts onto
+    the tissue, the other expands onto the intensity tails and becomes an outlier-catcher.
+    Measured on a reference T1 at ``samp 3``: split after 1 round starts from CSF sd 196
+    and ends at means 284/1009 mixing 0.97/0.03; after 2 rounds it starts from sd 116 and
+    ends at 226/340 mixing 0.41/0.59, against SPM's 224/349 at 0.43/0.57.
+
+    Here the phantom carries a strong bias field so the same mechanism is visible: assert
+    the split is genuinely deferred and that the covariance it starts from shrinks.
+    """
+    from fastfuncstuff.processing import segment as seg
+
+    torch.manual_seed(0)
+    n = 16
+    vol, tissue, _, _ = _phantom_three_tissue(n)
+    prob = tissue / tissue.sum(0, keepdim=True).clamp_min(1e-6)
+    log_prior = torch.log(prob.clamp(0, 1) + 1e-4)
+    eye = torch.eye(4, dtype=torch.float64)
+    bg = prob[:, 0].mean(dim=(1, 2))
+    _, _, xx = torch.meshgrid(*[torch.arange(n, dtype=torch.float64)] * 3, indexing="ij")
+    biased = vol * torch.exp(0.7 * torch.cos(math.pi * xx / (n - 1)))  # strong INU
+
+    seen: dict[int, float] = {}
+    real_split = seg.split_gaussians
+
+    def spy(means1, covs1, ngaus, **kw):
+        seen.setdefault(len(seen), float(covs1[0, 0, 0]))
+        return real_split(means1, covs1, ngaus, **kw)
+
+    widths = {}
+    for after in (1, 4):
+        seen.clear()
+        seg.split_gaussians = spy
+        try:
+            out = fit_segment(
+                biased, eye, log_prior, eye, bg, bg, eye,
+                ngaus=[2, 1, 2], biasfwhm=12.0, samp=1.0, n_iter=2, n_inner=6,
+                split_after=after, fit_warp=False, verbose=False,
+            )  # fmt: skip
+        finally:
+            seg.split_gaussians = real_split
+        assert len(seen) == 1, "split must happen exactly once"
+        assert out["tissue_of"].tolist() == [0, 0, 1, 2, 2]  # ngaus still applied
+        widths[after] = seen[0]
+
+    assert widths[4] < widths[1], (
+        f"deferring the split should start it from a tighter covariance, "
+        f"got {widths[4]:.4g} (after 4) vs {widths[1]:.4g} (after 1)"
+    )
 
 
 def test_warp_reg_in_node_units_survives_a_coarser_samp():
@@ -1384,3 +1534,68 @@ def test_clean_gwc_strips_disconnected_tissue():
     assert cleaned.sum(0).max() <= 1.0 + 1e-4
     kept = cleaned.sum(0) > 0.5
     assert torch.allclose(cleaned.sum(0)[kept], torch.ones(kept.sum()), atol=1e-4)
+
+
+def test_separable_bias_assembly_matches_the_dense_normal_equations():
+    """The Kronecker-separable GN assembly must equal ``Phiᵀ diag(wt2) Phi`` exactly.
+
+    SPM never materialises the ``(n_samp, d3)`` DCT design matrix: the samples sit on a
+    regular lattice and the basis is separable, so it contracts one axis at a time
+    (``kron(b3*b3', spm_krutil(wt2,B1,B2,1))``). That is the same arithmetic at
+    ``O(ngz·nbx²nby²nbz²)`` instead of ``O(n_samp·d3²)`` — on a reference T1 at
+    ``-biasfwhm 30`` (d3 = 3094) about 3700x fewer operations, and the dense form grows
+    *quadratically* as ``-biasfwhm`` is lowered. Since the two are supposed to be
+    algebraically identical, pin that directly against the dense reference, including the
+    ``(i,i',j,j',k,k') -> (i,j,k,i',j',k')`` index shuffle that is easy to get wrong.
+    """
+    from fastfuncstuff.processing.segment import dct_basis
+
+    torch.manual_seed(0)
+    nx, ny, nz = 20, 18, 16  # full image dims the DCT basis is defined over
+    sk = (2, 3, 2)
+    gx = torch.arange(0, nx, sk[0], dtype=torch.float64)
+    gy = torch.arange(0, ny, sk[1], dtype=torch.float64)
+    gz = torch.arange(0, nz, sk[2], dtype=torch.float64)
+    ngx, ngy, ngz = len(gx), len(gy), len(gz)
+    nbx, nby, nbz = 4, 3, 5  # deliberately unequal so an axis mix-up cannot cancel
+    d3 = nbx * nby * nbz
+
+    b1 = dct_basis(gx + 1.0, nx, nbx)
+    b2 = dct_basis(gy + 1.0, ny, nby)
+    b3 = dct_basis(gz + 1.0, nz, nbz)
+    wt1 = torch.randn(ngz, ngy, ngx, dtype=torch.float64)
+    wt2 = torch.rand(ngz, ngy, ngx, dtype=torch.float64) + 0.5  # PSD weights, as in eq. 34
+
+    # separable: contract x, then y, then z (mirrors _assemble_separable)
+    p1 = (b1[:, :, None] * b1[:, None, :]).reshape(ngx, -1)
+    p2 = (b2[:, :, None] * b2[:, None, :]).reshape(ngy, -1)
+    p3 = (b3[:, :, None] * b3[:, None, :]).reshape(ngz, -1)
+    u1 = torch.einsum("zya,yb->zab", (wt1.reshape(-1, ngx) @ b1).reshape(ngz, ngy, nbx), b2)
+    beta_sep = torch.einsum("zab,zc->abc", u1, b3).reshape(-1)
+    u2 = torch.einsum("zya,yb->zab", (wt2.reshape(-1, ngx) @ p1).reshape(ngz, ngy, -1), p2)
+    alpha_sep = (
+        (u2.reshape(ngz, -1).T @ p3)
+        .reshape(nbx, nbx, nby, nby, nbz, nbz)
+        .permute(0, 2, 4, 1, 3, 5)
+        .reshape(d3, d3)
+    )
+
+    # dense reference: one row per lattice node, flattened (z, y, x) as `kept_flat` indexes
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(ngz), torch.arange(ngy), torch.arange(ngx), indexing="ij"
+    )
+    bx, by, bz = b1[xx.reshape(-1)], b2[yy.reshape(-1)], b3[zz.reshape(-1)]
+    xy = (bx[:, :, None] * by[:, None, :]).reshape(bx.shape[0], -1)
+    phi = (xy[:, :, None] * bz[:, None, :]).reshape(bx.shape[0], -1)  # (n, d3)
+    beta_dense = phi.T @ wt1.reshape(-1)
+    alpha_dense = (phi * wt2.reshape(-1)[:, None]).T @ phi
+
+    assert torch.allclose(beta_sep, beta_dense, atol=1e-10, rtol=1e-9), (
+        f"Beta max |Δ| = {(beta_sep - beta_dense).abs().max():.3e}"
+    )
+    assert torch.allclose(alpha_sep, alpha_dense, atol=1e-10, rtol=1e-9), (
+        f"Alpha max |Δ| = {(alpha_sep - alpha_dense).abs().max():.3e}"
+    )
+    # and Alpha must stay symmetric PSD, since the GN solve assumes it
+    assert torch.allclose(alpha_sep, alpha_sep.T, atol=1e-12)
+    assert torch.linalg.eigvalsh(alpha_sep).min() > -1e-9

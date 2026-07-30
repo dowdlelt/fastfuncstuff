@@ -833,220 +833,389 @@ def weight_prior(prior: Tensor, wp: Tensor) -> Tensor:
 
 
 # ---------------------------------------------------------------------------
-# Deformation regulariser — membrane + bending energy on the dense field.
+# Deformation regulariser — SPM's `spm_diffeo('vel2mom')`, transcribed exactly.
 # ---------------------------------------------------------------------------
+#
+# The operator is a fixed 5x5x5 symmetric stencil on the dense field, built from
+# `reg = (abs, membrane, bending, mu, lambda)` and `param(1:3)`, the **node spacing**
+# of the warp lattice (SPM's `sk.*vx`). Reference: `src/shoot_regularisers.c:vel2mom`.
+#
+# Two things here are easy to get wrong and were wrong until 2026-07-29:
+#
+# 1. **`v_i = param_i²`, in the NUMERATOR.** The old implementation evaluated the
+#    energy with finite differences divided by the node spacing (`v_i = 1/h²`). SPM
+#    squares `param(1:3)` and uses it as a multiplier. At `samp 3` on 1 mm data that is
+#    an 81x error per `v`, and bending goes as `v²` — so the deformation prior was
+#    ~729x too weak once the per-component `1/v_c` below is accounted for. A grossly
+#    under-penalised bending term does NOT give a bigger warp: it gives a *spiky* one,
+#    because each node then follows only its own data gradient instead of the smooth
+#    prior propagating displacement out of the high-gradient regions. Measured against
+#    SPM's own `Twarp` on a reference subject: 41x its bending energy at 0.57x its mean
+#    displacement, which inflated CSF (thin sheet, so most sensitive) by 41%.
+#
+# 2. **`vel2mom` always uses the linear-elastic branch.** Only the `kernel()` helper
+#    has a `mu==0 && lam==0` shortcut; `vel2mom` itself unconditionally divides the
+#    absolute/membrane/bending part of component `c` by `v_c` (`:743`, `:757`, `:771`).
+#    So the isotropic part scales as `v²/v = v`, not `v²`.
+#
+# The stencil is written in SPM's "difference form" — every term is `w·(neighbour −
+# centre)` rather than a plain weighted sum. SPM does that for rounding accuracy; it is
+# also what makes the Neumann boundary free, since a mirrored neighbour equals the
+# centre at an edge and the term vanishes. Note this means SPM's `w?000` centre weights
+# are never used by `vel2mom` (only by the relaxation and kernel helpers), which is why
+# they do not appear below — but they *are* the diagonal, so
+# :func:`warp_prior_diagonal` reconstructs them for the preconditioner.
 
 
-def _linear_elastic_energy(
-    field: Tensor, le: tuple[float, float], vox: tuple[float, float, float]
-) -> Tensor:
-    """Linear-elastic warp energy — ``mu·Σ ε_ij²`` (shear) + ``lambda·(∇·u)²`` (volume).
+def _pad_sym2(x: Tensor, dim: int) -> Tensor:
+    """Pad ``dim`` by 2 each side with SPM's Neumann (half-sample mirror) extension.
 
-    ``le = (mu, lambda)`` = SPM's ``reg`` terms 4-5 (defaults 0.01 / 0.04). Per
-    ``spm_diffeo.m``: the *first* parameter (``mu``) "penalises the sum of squares of the
-    Jacobian tensors after they have been made symmetric … length changes, without
-    penalising rotations"; the *second* (``lambda``) "denotes how much to penalise changes
-    to the divergence". These two were **swapped** here until 2026-07-22, so the shipped
-    default applied 0.01 to divergence and 0.04 to shear instead of the reverse.
-
-    ``ε_ij = ½(∂u_i/∂x_j + ∂u_j/∂x_i)`` is the symmetric strain tensor, and
-    ``Σ_ij ε_ij² = Σ_i ε_ii² + 2 Σ_{i<j} ε_ij²`` — the ``0.5·(∂_j u_i + ∂_i u_j)²`` form
-    below. A finite-difference approximation of SPM's linear-elastic operator (the exact
-    multigrid stencil is out of scope). Displacement components ``(0,1,2)=(x,y,z)``;
-    spatial dims ``(0,1,2)=(z,y,x)`` with step ``(vox[2],vox[1],vox[0])``.
-
-    Derivatives are **forward differences with a Neumann edge** (:func:`_dfwd`), the same
-    operator the membrane term uses — not ``torch.gradient``'s central differences. Two
-    reasons: it makes the adjoint expressible in closed form (so :func:`warp_prior_grad`
-    can apply ``L`` analytically instead of through autograd), and ``torch.gradient`` was
-    measured at 454 ms of *host* time for 10 ms of GPU work in a 3-iteration fit — it is
-    pure dispatch overhead in the innermost loop of the conjugate-gradient solve.
+    ``shoot_boundary.c:neumann_boundary`` maps ``-1→0, -2→1`` and ``n→n-1, n+1→n-2``:
+    a mirror that **repeats** the edge sample (numpy's ``symmetric``, not ``reflect``).
+    Torch has no such pad mode, so build it by flipping the two outermost planes.
     """
-    w_mu, w_lam = le
-    if min(field.shape[:3]) < 2:
-        return field.new_zeros(())
-    d = _jacobian(field, vox)  # d[i][j] = ∂u_i/∂x_j
-    energy = field.new_zeros(())
-    if w_lam:
-        div = d[0][0] + d[1][1] + d[2][2]
-        energy = energy + w_lam * (div**2).sum()
-    if w_mu:
-        strain_sq = field.new_zeros(())
-        for i in range(3):
-            for j in range(3):
-                eps_ij = 0.5 * (d[i][j] + d[j][i])
-                strain_sq = strain_sq + (eps_ij**2).sum()
-        energy = energy + w_mu * strain_sq
-    return energy
+    n = x.shape[dim]
+    if n == 1:  # every shift lands back on the single plane
+        one = x.narrow(dim, 0, 1)
+        return torch.cat([one, one, x, one, one], dim=dim)
+    if n == 2:
+        lo = x.narrow(dim, 0, 2).flip(dim)  # [x1, x0] ↔ indices -2, -1
+        hi = x.narrow(dim, 0, 2).flip(dim)  # [x1, x0] ↔ indices n, n+1
+        return torch.cat([lo, x, hi], dim=dim)
+    lo = x.narrow(dim, 0, 2).flip(dim)  # [x1, x0]
+    hi = x.narrow(dim, n - 2, 2).flip(dim)  # [x_{n-1}, x_{n-2}]
+    return torch.cat([lo, x, hi], dim=dim)
 
 
-# Displacement component i ∈ {x, y, z} differentiates along field axis _AXIS_OF[i]
-# (dims are (gz, gy, gx, 3)) with node spacing vox[i].
-_AXIS_OF = (2, 1, 0)
+# Displacement component index → the field axis it is indexed along.
+# `twarp` is (gz, gy, gx, 3) with components (x, y, z), so SPM's i/j/k (x/y/z) offsets
+# move along array axes 2/1/0 respectively.
+_SPM_AXIS = (3, 2, 1)  # for a (3, gz, gy, gx) stack: x→axis 3, y→axis 2, z→axis 1
 
 
-def _dfwd(u: Tensor, axis: int, h: float) -> Tensor:
-    """Forward difference along ``axis``, Neumann edge (0 in the last plane).
+def spm_vel2mom_weights(
+    reg: tuple[float, ...], param: tuple[float, float, float], dims: tuple[int, int, int]
+) -> dict[str, float]:
+    """Scalar stencil weights of ``spm_diffeo('vel2mom')`` — ``shoot_regularisers.c:601``.
 
-    Same-shape output so the operator and its adjoint compose without bookkeeping. This is
-    exactly ``torch.diff`` zero-padded at the end, i.e. the operator whose squared norm is
-    the membrane energy.
+    Args:
+        reg: ``(absolute, membrane, bending, mu, lambda)``; a 3-tuple is padded with zeros.
+        param: SPM's ``param(1:3)`` = **node spacing** of the warp lattice (``sk.*vx``, mm).
+        dims: lattice shape as SPM sees it, ``(nx, ny, nz)`` — only used for the
+            degenerate-dimension corrections (``:631-670``).
+
+    Returns a dict of the weights consumed by :func:`warp_prior_grad`.
     """
-    d = torch.zeros_like(u)
-    n = u.shape[axis]
-    if n < 2:
-        return d
-    d.narrow(axis, 0, n - 1).copy_((u.narrow(axis, 1, n - 1) - u.narrow(axis, 0, n - 1)) / h)
-    return d
+    lam0, lam1, lam2, mu, lam = (tuple(reg) + (0.0,) * (5 - len(reg)))[:5]
+    v0, v1, v2 = (float(p) * float(p) for p in param)
+    tot = v0 + v1 + v2
+    w = {
+        "w100": lam2 * (-4.0 * v0 * tot) - lam1 * v0,
+        "w010": lam2 * (-4.0 * v1 * tot) - lam1 * v1,
+        "w001": lam2 * (-4.0 * v2 * tot) - lam1 * v2,
+        "w200": lam2 * v0 * v0,
+        "w020": lam2 * v1 * v1,
+        "w002": lam2 * v2 * v2,
+        "w110": lam2 * 2.0 * v0 * v1,
+        "w101": lam2 * 2.0 * v0 * v2,
+        "w011": lam2 * 2.0 * v1 * v2,
+    }
+    nx, ny, nz = dims
+    # A lattice 2 wide cannot carry a ±2 tap: the mirror folds it onto a *different*
+    # sample, so SPM drops the term rather than double-counting it (:631-650).
+    if nx <= 2:
+        w["w200"] = 0.0
+    if ny <= 2:
+        w["w020"] = 0.0
+    if nz <= 2:
+        w["w002"] = 0.0
+    if ny == 1 and nz == 1:
+        w["w011"] = 0.0
+    # per-component first-neighbour weights: the elastic part, plus the isotropic part
+    # divided by this component's v (SPM's wx100 = -2mu - lam + w100/v0, etc.)
+    w["wx100"] = -2.0 * mu - lam + w["w100"] / v0
+    w["wx010"] = -mu * v1 / v0 + w["w010"] / v0
+    w["wx001"] = -mu * v2 / v0 + w["w001"] / v0
+    w["wy100"] = -mu * v0 / v1 + w["w100"] / v1
+    w["wy010"] = -2.0 * mu - lam + w["w010"] / v1
+    w["wy001"] = -mu * v2 / v1 + w["w001"] / v1
+    w["wz100"] = -mu * v0 / v2 + w["w100"] / v2
+    w["wz010"] = -mu * v1 / v2 + w["w010"] / v2
+    w["wz001"] = -2.0 * mu - lam + w["w001"] / v2
+    if ny == 1:
+        w["wx010"] = w["wy010"] = w["wz010"] = 0.0
+    if nz == 1:
+        w["wx001"] = w["wy001"] = w["wz001"] = 0.0
+    w["w2"] = 0.25 * mu + 0.25 * lam  # off-diagonal (shear/divergence) coupling
+    w["lam0"] = lam0
+    w["v0"], w["v1"], w["v2"] = v0, v1, v2
+    return w
 
 
-def _dfwd_adj(d: Tensor, axis: int, h: float) -> Tensor:
-    """Adjoint of :func:`_dfwd`: ``(Dᵀd)[j] = (d[j-1] - d[j])/h`` with ``d[-1] = d[n-1] = 0``."""
-    out = torch.zeros_like(d)
-    n = d.shape[axis]
-    if n < 2:
-        return out
-    head = d.narrow(axis, 0, n - 1) / h
-    out.narrow(axis, 0, n - 1).copy_(-head)
-    out.narrow(axis, 1, n - 1).add_(head)
-    return out
-
-
-def _jacobian(field: Tensor, vox: tuple[float, float, float]) -> list[list[Tensor]]:
-    """``d[i][j] = ∂u_i/∂x_j`` for a ``(gz, gy, gx, 3)`` field, via :func:`_dfwd`."""
-    return [
-        [_dfwd(field[..., i], _AXIS_OF[j], vox[j]) for j in range(3)]  #
-        for i in range(3)
-    ]
-
-
-def _laplacian_neumann(field: Tensor, vox: tuple[float, float, float]) -> Tensor:
-    """Discrete Laplacian ``Δu`` of a ``(gz, gy, gx, 3)`` field, Neumann boundaries.
-
-    ``spm_preproc8`` sets ``spm_diffeo('boundary', 1)`` = ``BOUND_NEUMANN``, so the field
-    is reflected (zero-gradient) at the edges — replicate padding here.
-    """
-    import torch.nn.functional as F  # noqa: N812
-
-    x = field.permute(3, 0, 1, 2)[None]  # (1, 3, gz, gy, gx)
-    lap = torch.zeros_like(x)
-    for axis, step in zip((0, 1, 2), (vox[2], vox[1], vox[0]), strict=True):
-        n = x.shape[2 + axis]
-        if n < 3:
-            continue
-        pad = [0, 0, 0, 0, 0, 0]
-        pad[2 * (2 - axis)] = 1
-        pad[2 * (2 - axis) + 1] = 1
-        p = F.pad(x, pad, mode="replicate")
-        lo = p.narrow(2 + axis, 0, n)
-        hi = p.narrow(2 + axis, 2, n)
-        lap = lap + (lo + hi - 2.0 * x) / (step * step)
-    return lap[0].permute(1, 2, 3, 0)
-
-
-def warp_penalty(field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]) -> Tensor:
-    """Deformation prior energy ``½·uᵀLu`` on a dense field ``(gz, gy, gx, 3)``.
-
-    ``reg = (absolute, membrane, bending[, mu, lambda])`` weights up to five energies —
-    SPM's full ``reg`` vector (default ``[0 0 0.1 0.01 0.04]``). A 3-tuple is accepted
-    for back-compatibility (``mu=lambda=0``).
-
-    - **absolute** ``½·Σ u²`` — pulls the field toward zero (keeps it from drifting).
-    - **membrane** ``½·Σ |∇u|²`` — penalises stretch.
-    - **bending** ``½·Σ (Δu)²`` — penalises curvature for a smooth, fold-free warp.
-    - **linear-elastic** (``mu``/``lambda``) — shear + divergence
-      (:func:`_linear_elastic_energy`).
-
-    Two things this must get right to match ``spm_diffeo('vel2mom')``, both of which were
-    wrong before 2026-07-22:
-
-    - **The ½.** SPM's warp prior contributes ``llr = -0.5·uᵀLu`` to the objective and its
-      Gauss-Newton gradient is ``Beta += vel2mom(u) = Lu``. Returning the *unhalved*
-      quadratic form made the effective prior twice SPM's for the same ``reg``.
-    - **Bending is the biharmonic.** SPM's ``lam2`` stencil is ``ΔᵀΔ``
-      (``w000 = lam2·(6Σvᵢ² + 8Σᵢ<ⱼvᵢvⱼ)``, ``w110 = lam2·2v₀v₁`` — see
-      ``src/shoot_regularisers.c``), i.e. ``‖∇²u‖²_F`` *including* the mixed partials
-      ``u_xy, u_xz, u_yz``. Summing only the pure second differences ``u_xx²+u_yy²+u_zz²``
-      is a different operator with a much larger null space. ``Σ(Δu)²`` reproduces the
-      stencil exactly, since ``uᵀΔᵀΔu = Σ(Δu)²``.
-
-    ``vox`` must be the **node spacing** of ``field`` — for the subsampled warp grid that
-    is ``samp_stride · voxel_size`` (SPM's ``sk.*vx``), not the full-resolution voxel
-    size. ``field`` itself must be in **node units** (SPM regularises ``Twarp./sk``, not
-    ``Twarp``); :func:`fit_segment` divides by ``sk`` before calling.
-    """
-    w_abs, w_mem, w_bend, w_mu, w_lam = (tuple(reg) + (0.0,) * (5 - len(reg)))[:5]
-    penalty = field.new_zeros(())
-    if w_abs:
-        penalty = penalty + w_abs * (field**2).sum()
-    if w_mem:
-        for axis, step in zip((0, 1, 2), (vox[2], vox[1], vox[0]), strict=True):
-            if field.shape[axis] >= 2:
-                d1 = torch.diff(field, dim=axis) / step
-                penalty = penalty + w_mem * (d1**2).sum()
-    if w_bend:
-        penalty = penalty + w_bend * (_laplacian_neumann(field, vox) ** 2).sum()
-    if w_mu or w_lam:
-        penalty = penalty + _linear_elastic_energy(field, (w_mu, w_lam), vox)
-    return 0.5 * penalty
+def _all_zero(reg: tuple[float, ...]) -> bool:
+    return not any(float(r) != 0.0 for r in reg)
 
 
 def warp_prior_grad(
     field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]
 ) -> Tensor:
-    """``L·field`` — the gradient of :func:`warp_penalty`, computed **analytically**.
+    """``L·field`` — SPM's ``spm_diffeo('vel2mom')`` on a dense field ``(gz, gy, gx, 3)``.
 
-    SPM's ``vel2mom``. Every term is a quadratic form, so the ``½`` in the energy cancels
-    the ``2`` from differentiating the square and each contribution is one operator applied
-    to the field:
+    ``vox`` is SPM's ``param(1:3)``: the **node spacing** of the warp lattice (``sk·vx``
+    mm), and ``field`` must be in **node units** (SPM regularises ``Twarp./sk``) — see
+    :func:`fit_segment`, which divides by ``sk`` before calling.
 
-    ==============  ==================================  =========================
-    term            energy                              gradient
-    ==============  ==================================  =========================
-    absolute        ``½·w·Σu²``                         ``w·u``
-    membrane        ``½·w·Σ_j ‖D_j u‖²``                ``w·Σ_j D_jᵀD_j u``
-    bending         ``½·w·Σ(Δu)²``                      ``w·Δ(Δu)``  (Δ is self-adjoint)
-    elastic λ       ``½·w·Σ(∇·u)²``                     ``w·D_kᵀ(∇·u)``
-    elastic μ       ``½·w·Σ_ij ε_ij²``                  ``w·Σ_j D_jᵀ ε_kj``
-    ==============  ==================================  =========================
-
-    Why not just autograd through :func:`warp_penalty`: the Gauss-Newton solver applies
-    ``L`` **eleven times per warp sub-iteration** (once for ``Beta``, then once per
-    conjugate-gradient step), and the autograd route paid for a full forward graph, a
-    backward pass dominated by slice-backward kernels, and ``torch.gradient``'s dispatch
-    overhead on every one. Profiling a 3-iteration fit: ``aten::gradient`` 454 ms of host
-    time for 10 ms of GPU work, and ``warp_penalty`` was 20 % of total wall time. The whole
-    EM loop was launch-bound (87 k kernel launches, GPU busy ~12 %), and this operator was
-    the largest single contributor.
-
-    Verified against ``torch.autograd.grad(warp_penalty(...))`` in
-    ``test_warp_prior_grad_matches_autograd``.
+    Transcribed term-for-term from ``shoot_regularisers.c:vel2mom`` (see the module
+    comment above for the two scaling subtleties). Every neighbour enters as
+    ``w·(neighbour − centre)``, so the Neumann boundary needs no special case. Pure
+    slicing and arithmetic, so it is differentiable and ``warp_penalty``'s autograd
+    gradient is exactly this operator.
     """
-    w_abs, w_mem, w_bend, w_mu, w_lam = (tuple(reg) + (0.0,) * (5 - len(reg)))[:5]
-    grad = torch.zeros_like(field)
-    if w_abs:
-        grad = grad + w_abs * field
-    if w_mem:
-        for j in range(3):
-            axis, h = _AXIS_OF[j], vox[j]
-            if field.shape[axis] >= 2:
-                grad = grad + w_mem * _dfwd_adj(_dfwd(field, axis, h), axis, h)
-    if w_bend:
-        grad = grad + w_bend * _laplacian_neumann(_laplacian_neumann(field, vox), vox)
-    if (w_mu or w_lam) and min(field.shape[:3]) >= 2:
-        d = _jacobian(field, vox)
-        contrib = [field.new_zeros(field.shape[:3]) for _ in range(3)]
-        if w_lam:
-            div = d[0][0] + d[1][1] + d[2][2]
-            for k in range(3):
-                contrib[k] = contrib[k] + w_lam * _dfwd_adj(div, _AXIS_OF[k], vox[k])
-        if w_mu:
-            for k in range(3):
-                for j in range(3):
-                    eps_kj = 0.5 * (d[k][j] + d[j][k])
-                    contrib[k] = contrib[k] + w_mu * _dfwd_adj(eps_kj, _AXIS_OF[j], vox[j])
-        grad = grad + torch.stack(contrib, dim=-1)
-    return grad
+    if _all_zero(reg):
+        return torch.zeros_like(field)
+    gz, gy, gx = field.shape[:3]
+    w = spm_vel2mom_weights(reg, vox, (gx, gy, gz))
+    u = field.permute(3, 0, 1, 2)  # (3, gz, gy, gx)
+    # pad all three spatial axes by 2 once; every tap is then a plain (view) slice
+    p = u
+    for dim in (1, 2, 3):
+        p = _pad_sym2(p, dim)
+
+    def tap(c: int, dx: int, dy: int, dz: int) -> Tensor:
+        """Component ``c`` shifted by ``(dx, dy, dz)`` in SPM's (i, j, k) = (x, y, z)."""
+        return p[c].narrow(0, 2 + dz, gz).narrow(1, 2 + dy, gy).narrow(2, 2 + dx, gx)
+
+    # The shear/divergence coupling below reads a MIXED-derivative stencil, whose kernel is
+    # even in the joint offset (k(-d) = k(d)) but not in each axis separately
+    # (k(-1,-1) = -k(+1,-1)). A per-axis symmetric extension therefore makes it
+    # non-self-adjoint at the lattice boundary — verified: exactly symmetric for interior
+    # support, off by ~1% for a field that touches the edge. SPM has the same property
+    # (same `bound()` on those taps) and gets away with it because `fmg` multigrid
+    # tolerates mild asymmetry; conjugate gradient does not — it silently converges to the
+    # wrong thing. So the cross term alone uses ZERO extension, which is a plain truncated
+    # convolution and exactly symmetric for an even kernel. Identical to SPM in the
+    # interior, and the warp lattice's outer plane sits well outside the head anyway.
+    pz_ = u
+    for dim in (1, 2, 3):
+        pz_ = torch.cat(
+            [torch.zeros_like(pz_.narrow(dim, 0, 1)), pz_, torch.zeros_like(pz_.narrow(dim, 0, 1))],
+            dim=dim,
+        )
+
+    def tap_zero(c: int, dx: int, dy: int, dz: int) -> Tensor:
+        """As :func:`tap` but zero outside the lattice (offsets limited to ±1)."""
+        return pz_[c].narrow(0, 1 + dz, gz).narrow(1, 1 + dy, gy).narrow(2, 1 + dx, gx)
+
+    out = []
+    for c, (k1, k2, k3, vc) in enumerate(
+        (
+            ("wx100", "wx010", "wx001", "v0"),
+            ("wy100", "wy010", "wy001", "v1"),
+            ("wz100", "wz010", "wz001", "v2"),
+        )
+    ):
+        ctr = u[c]
+
+        def d(dx: int, dy: int, dz: int, _c: int = c, _ctr: Tensor = ctr) -> Tensor:
+            return tap(_c, dx, dy, dz) - _ctr
+
+        g = w[k1] * (d(-1, 0, 0) + d(1, 0, 0))
+        g = g + w[k2] * (d(0, -1, 0) + d(0, 1, 0))
+        g = g + w[k3] * (d(0, 0, -1) + d(0, 0, 1))
+        # isotropic (absolute + membrane + bending) part, divided by this component's v
+        iso = w["lam0"] * ctr
+        if w["w110"]:
+            iso = iso + w["w110"] * (d(-1, -1, 0) + d(1, -1, 0) + d(-1, 1, 0) + d(1, 1, 0))
+        if w["w101"]:
+            iso = iso + w["w101"] * (d(-1, 0, -1) + d(1, 0, -1) + d(-1, 0, 1) + d(1, 0, 1))
+        if w["w011"]:
+            iso = iso + w["w011"] * (d(0, -1, -1) + d(0, 1, -1) + d(0, -1, 1) + d(0, 1, 1))
+        if w["w200"]:
+            iso = iso + w["w200"] * (d(-2, 0, 0) + d(2, 0, 0))
+        if w["w020"]:
+            iso = iso + w["w020"] * (d(0, -2, 0) + d(0, 2, 0))
+        if w["w002"]:
+            iso = iso + w["w002"] * (d(0, 0, -2) + d(0, 0, 2))
+        g = g + iso / w[vc]
+        # off-diagonal shear/divergence coupling to the other two components. SPM's
+        # sign pattern (`:727`): +(+1,-1) -(+1,+1) +(-1,+1) -(-1,-1) in the two axes
+        # spanned by this component and the partner's.
+        if w["w2"]:
+            cross = field.new_zeros(())
+            for other in (0, 1, 2):
+                if other == c:
+                    continue
+
+                def t(sc: int, so: int, _o: int = other, _c: int = c) -> Tensor:
+                    """Partner component ``_o``, offset ``sc`` along this component's own
+                    axis and ``so`` along the partner's."""
+                    off = [0, 0, 0]
+                    off[_c] = sc
+                    off[_o] = so
+                    return tap_zero(_o, off[0], off[1], off[2])
+
+                cross = cross + (t(1, -1) - t(1, 1) + t(-1, 1) - t(-1, -1))
+            g = g + w["w2"] * cross
+        out.append(g)
+    return torch.stack(out, dim=-1)
+
+
+def warp_penalty(field: Tensor, reg: tuple[float, ...], vox: tuple[float, float, float]) -> Tensor:
+    """Deformation prior energy ``½·uᵀLu`` — SPM's ``llr = -0.5·Σ u·vel2mom(u)``.
+
+    ``reg = (absolute, membrane, bending, mu, lambda)`` (default ``[0 0 0.1 0.01 0.04]``);
+    a 3-tuple is accepted (``mu=lambda=0``). ``vox`` is the lattice **node spacing**
+    (``sk·vx``) and ``field`` is in node units — see :func:`warp_prior_grad`, which is
+    both the operator and (because ``L`` is symmetric) this function's exact gradient.
+
+    Defined *through* the operator rather than as an independently-written energy, so the
+    two can no longer disagree — they did before 2026-07-29, when the energy was a
+    hand-rolled sum of squared finite differences and the operator its analytic adjoint,
+    both self-consistent but neither matching ``spm_diffeo``.
+    """
+    if _all_zero(reg):
+        return field.new_zeros(())
+    return 0.5 * (field * warp_prior_grad(field, reg, vox)).sum()
+
+
+def warp_prior_diagonal(
+    reg: tuple[float, ...], vox: tuple[float, float, float], dims: tuple[int, int, int]
+) -> tuple[float, float, float]:
+    """Per-component diagonal of ``L`` — SPM's ``wx000/wy000/wz000``.
+
+    In the difference form each ``w·(neighbour − centre)`` tap contributes ``−w`` to the
+    centre, so the diagonal is recoverable from the same weights; the identity
+    ``diag_x == 2mu(2v0+v1+v2)/v0 + 2lam + w000/v0`` is pinned by a unit test. ``dims``
+    is ``(nx, ny, nz)``.
+    """
+    w = spm_vel2mom_weights(reg, vox, dims)
+    diag = []
+    for k1, k2, k3, vc in (
+        ("wx100", "wx010", "wx001", "v0"),
+        ("wy100", "wy010", "wy001", "v1"),
+        ("wz100", "wz010", "wz001", "v2"),
+    ):
+        iso = (
+            w["lam0"]
+            - 4.0 * (w["w110"] + w["w101"] + w["w011"])
+            - 2.0 * (w["w200"] + w["w020"] + w["w002"])
+        )
+        diag.append(-2.0 * (w[k1] + w[k2] + w[k3]) + iso / w[vc])
+    return diag[0], diag[1], diag[2]
+
+
+def warp_prior_symbol(
+    reg: tuple[float, ...],
+    vox: tuple[float, float, float],
+    shape: tuple[int, int, int],
+    *,
+    device: torch.device | str = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Eigenvalues of ``L``'s diagonal blocks under the DCT-II basis — ``(3, gz, gy, gx)``.
+
+    A symmetric convolution with half-sample-symmetric (Neumann) boundaries is
+    diagonalised by the DCT-II, so each diagonal block of ``L`` has the closed-form
+    symbol below at ``θ_k = πk/N``. This is what makes an exact, O(N log N)
+    preconditioner possible (:func:`_dct_precond`) — and it is the whole reason the
+    Gauss-Newton warp can now run at SPM's regularisation strength instead of a
+    weakened one (see :func:`_cg_solve`).
+
+    The off-diagonal shear/divergence coupling (``w2·sin θ_a sin θ_b``) is **not**
+    DCT-diagonal — it maps cosine modes to sine modes — so it is omitted. That only
+    makes the preconditioner approximate, never wrong: CG converges regardless, this
+    just decides how fast. ``mu``/``lambda`` are small next to bending anyway.
+    """
+    gz, gy, gx = shape
+    if _all_zero(reg):
+        return torch.zeros((3, gz, gy, gx), device=device, dtype=dtype)
+    w = spm_vel2mom_weights(reg, vox, (gx, gy, gz))
+    ax = [
+        torch.arange(n, device=device, dtype=torch.float64) * (torch.pi / n) for n in (gz, gy, gx)
+    ]
+    cz, cy, cx = (torch.cos(a) for a in ax)
+    c2z, c2y, c2x = (torch.cos(2.0 * a) for a in ax)
+    # broadcast to (gz, gy, gx)
+    Cx, Cy, Cz = cx[None, None, :], cy[None, :, None], cz[:, None, None]
+    C2x, C2y, C2z = c2x[None, None, :], c2y[None, :, None], c2z[:, None, None]
+    out = []
+    for k1, k2, k3, vc in (
+        ("wx100", "wx010", "wx001", "v0"),
+        ("wy100", "wy010", "wy001", "v1"),
+        ("wz100", "wz010", "wz001", "v2"),
+    ):
+        lam = 2.0 * w[k1] * (Cx - 1.0) + 2.0 * w[k2] * (Cy - 1.0) + 2.0 * w[k3] * (Cz - 1.0)
+        iso = (
+            w["lam0"]
+            + 4.0 * w["w110"] * (Cx * Cy - 1.0)
+            + 4.0 * w["w101"] * (Cx * Cz - 1.0)
+            + 4.0 * w["w011"] * (Cy * Cz - 1.0)
+            + 2.0 * w["w200"] * (C2x - 1.0)
+            + 2.0 * w["w020"] * (C2y - 1.0)
+            + 2.0 * w["w002"] * (C2z - 1.0)
+        )
+        out.append((lam + iso / w[vc]).expand(gz, gy, gx))
+    return torch.stack(out, dim=0).to(dtype)
+
+
+def _dct_matrix(n: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+    """Orthonormal DCT-II matrix ``(n, n)``. Small enough that an explicit matmul beats
+    the FFT reindexing tricks, and leaves nothing to get subtly wrong."""
+    k = torch.arange(n, device=device, dtype=torch.float64)[:, None]
+    i = torch.arange(n, device=device, dtype=torch.float64)[None, :]
+    m = torch.cos(torch.pi * k * (2.0 * i + 1.0) / (2.0 * n)) * ((2.0 / n) ** 0.5)
+    m[0] = (1.0 / n) ** 0.5
+    return m.to(dtype)
+
+
+def _dct3(x: Tensor, mats: tuple[Tensor, Tensor, Tensor], *, inverse: bool) -> Tensor:
+    """Separable orthonormal DCT-II (or its transpose, DCT-III) over the last three axes
+    of a ``(3, gz, gy, gx)`` stack."""
+    for axis, m in zip((1, 2, 3), mats, strict=True):
+        mm = m.T if inverse else m
+        x = torch.movedim(torch.matmul(mm, torch.movedim(x, axis, -2)), -2, axis)
+    return x
+
+
+def _dct_precond(
+    reg: tuple[float, ...],
+    vox: tuple[float, float, float],
+    shape: tuple[int, int, int],
+    shift: Tensor,
+    *,
+    sym_scale: Tensor | None = None,
+    device: torch.device,
+    dtype: torch.dtype,
+):
+    """Preconditioner ``M⁻¹ ≈ (shift·I + L)⁻¹``, applied exactly in the DCT domain.
+
+    ``shift`` is a per-component positive scalar standing in for the data Hessian
+    ``Alpha``'s diagonal (its mean); it also regularises ``L``'s null space — bending
+    alone is blind to affine fields, so the zero-frequency symbol is 0. ``sym_scale``
+    rescales the symbol per component, which is how the caller accounts for solving in
+    image-voxel units while ``L`` is defined in node units (a factor ``1/sk_c²``).
+
+    Why this and not multigrid: the Gauss-Newton system is ``(Alpha + L)u = Beta``, and
+    at SPM's regularisation ``L`` is stiff enough that plain CG needs O(1000) iterations
+    — it converges fast on high-frequency modes and slowly on exactly the smooth,
+    long-wavelength deformation the prior is there to produce. Truncating it (the old
+    fixed 10 iterations) therefore returned the *high-frequency half* of the Newton
+    step, which is why the warp came out spiky. ``L`` is the stiff part **and** it is
+    DCT-diagonalisable, so inverting it exactly removes the ill-conditioning and leaves
+    CG only the well-conditioned per-node ``Alpha`` variation to work on.
+    """
+    sym = warp_prior_symbol(reg, vox, shape, device=device, dtype=dtype)
+    if sym_scale is not None:
+        sym = sym * sym_scale.reshape(3, 1, 1, 1).to(dtype)
+    inv = 1.0 / (sym + shift.reshape(3, 1, 1, 1).to(dtype)).clamp_min(1e-20)
+    mats = tuple(_dct_matrix(n, device, dtype) for n in shape)
+
+    def apply(r: Tensor) -> Tensor:
+        s = r.permute(3, 0, 1, 2).contiguous()
+        s = _dct3(_dct3(s, mats, inverse=False) * inv, mats, inverse=True)
+        return s.permute(1, 2, 3, 0).contiguous()
+
+    return apply
 
 
 def fudge_factor(vox: tuple[float, float, float], sk: tuple[int, int, int], fwhm: float) -> float:
@@ -1068,31 +1237,46 @@ def fudge_factor(vox: tuple[float, float, float], sk: tuple[int, int, int], fwhm
     return prod**0.5
 
 
-def _cg_solve(beta: Tensor, apply_a, n_iter: int = 10) -> Tensor:
-    """Conjugate gradient for the SPD system ``A·x = beta`` (``apply_a`` computes ``A·p``).
+def _cg_solve(beta: Tensor, apply_a, n_iter: int = 10, precond=None) -> Tensor:
+    """(Preconditioned) conjugate gradient for the SPD system ``A·x = beta``.
 
-    Used by the Gauss-Newton warp solver to invert ``(Alpha + L)`` — the per-node GN
-    Hessian plus the regularisation operator — the way SPM's ``spm_field`` multigrid does,
-    but matrix-free on the GPU (``apply_a`` is a couple of tensor ops + one autograd pass
-    for the regulariser). Starts from ``x=0`` so the initial residual is ``beta``.
+    ``apply_a`` computes ``A·p``; ``precond`` (optional) applies ``M⁻¹`` and turns this
+    into PCG. Used by the Gauss-Newton warp solver to invert ``(Alpha + L)`` — the
+    per-node GN Hessian plus the regularisation operator — where SPM uses the
+    ``spm_diffeo('fmg')`` full multigrid. Starts from ``x=0``, so the initial residual is
+    ``beta``.
 
-    Runs a **fixed** ``n_iter`` with no residual-tolerance check: the check compared a GPU
-    scalar in a Python ``if`` every iteration, forcing a host sync that idled the GPU. A
-    fixed short run gives an approximate Newton direction that the Armijo line search
-    validates anyway — all scalar arithmetic stays on-device, so CG runs sync-free.
+    **The preconditioner is not an optimisation, it is what makes the solve possible.**
+    Unpreconditioned CG on this system converges quickly in the high-frequency modes and
+    very slowly in the smooth ones — the opposite of what is wanted, since the smooth,
+    long-wavelength deformation is precisely what the prior exists to produce. Measured
+    at SPM's regularisation strength on a reference subject, plain CG reached a warp with
+    mean |displacement| 0.012 / 0.25 / 0.78 / 1.20 voxels at 10 / 50 / 200 / 800
+    iterations against SPM's 1.63, i.e. still climbing after 800. Truncating it — the
+    fixed 10 iterations used here until 2026-07-29 — returns the high-frequency part of
+    the Newton step and nothing else, which is exactly the spiky warp that was inflating
+    CSF. With the DCT preconditioner (:func:`_dct_precond`) the stiff operator is
+    inverted exactly and a few tens of iterations suffice.
+
+    Runs a fixed ``n_iter`` with no residual-tolerance check: the check would compare a
+    GPU scalar in a Python ``if`` every iteration, forcing a host sync that idles the GPU.
+    The Armijo line search validates the resulting direction anyway, so all scalar
+    arithmetic stays on-device and CG runs sync-free.
     """
     x = torch.zeros_like(beta)
     r = beta.clone()
-    p = r.clone()
-    rs = (r * r).sum()
+    z = precond(r) if precond is not None else r
+    p = z.clone()
+    rz = (r * z).sum()
     for _ in range(n_iter):
         ap = apply_a(p)
-        alpha = rs / (p * ap).sum().clamp_min(1e-30)
+        alpha = rz / (p * ap).sum().clamp_min(1e-30)
         x = x + alpha * p
         r = r - alpha * ap
-        rs_new = (r * r).sum()
-        p = r + (rs_new / rs.clamp_min(1e-30)) * p
-        rs = rs_new
+        z = precond(r) if precond is not None else r
+        rz_new = (r * z).sum()
+        p = z + (rz_new / rz.clamp_min(1e-30)) * p
+        rz = rz_new
     return x
 
 
@@ -1208,8 +1392,10 @@ def fit_segment(
     reg: tuple[float, ...] = (0.0, 0.0, 0.1, 0.01, 0.04),
     fwhm: float = 0.0,
     samp: float = 3.0,
+    dither: float | list[float] = 0.0,
     n_iter: int = 30,
     n_inner: int = 8,
+    split_after: int = 2,
     min_iter: int = 10,
     tol: float = 1e-4,
     tpm_bottom_mm: float = 5.0,
@@ -1230,6 +1416,7 @@ def fit_segment(
     warp_solver: str = "gn",
     warp_lr: float = 1.0,
     warp_iters: int | None = None,
+    warp_cg_iters: int = 32,
     warp_smooth: float = 0.8,
     fit_chunk: int | None = None,
     dtype: torch.dtype = torch.float32,
@@ -1258,6 +1445,30 @@ def fit_segment(
     ``min_iter`` (SPM 10) is a floor on the outer loop — the heavy-to-light warp anneal
     (``2^max(10-iter,0)`` on the bending term) only reaches its target at iteration 10, so
     stopping earlier leaves the deformation clamped by up to 2¹⁰ and effectively unfitted.
+
+    ``split_after`` is how many ``[GMM, bias]`` rounds run before the per-tissue Gaussians
+    are expanded to ``ngaus`` (:func:`split_gaussians`). SPM splits after the **first**
+    round; the problem is that the first round's GMM runs on the *uncorrected* image
+    (``Tbias`` starts at zero and the bias step comes after), so every tissue's covariance
+    is still inflated by the bias field it has not seen removed yet. ``split_gaussians``
+    then hands both children that inflated covariance (``vr = vr1·(1-w)``), and a
+    too-broad pair is free to bifurcate: one child contracts onto the tissue while the
+    other expands onto the intensity tails and becomes an outlier-catcher, spending a
+    Gaussian on a fraction of a percent of the data.
+
+    Measured on a reference T1 at ``samp 3``: splitting after 1 round starts from a CSF
+    sd of 196 (the converged single-Gaussian value is 83) and the pair ends at means
+    284/1009 with mixing 0.97/0.03 — one real CSF Gaussian and one catcher sitting on
+    ~180 samples of bright skull-base tissue. Waiting one more round starts from sd 116
+    and gives 226/340 at 0.41/0.59, against SPM's 224/349 at 0.43/0.57. The failure is
+    deterministic (six different split seeds collapse identically) and is *not* a
+    convergence-effort problem (``tol=0``, 2296 M-steps, collapses the same way).
+
+    Default 2 rather than SPM's 1 because it reproduces SPM's *fitted Gaussians* far more
+    closely, which is the thing that matters; ``split_after=1`` restores SPM's literal
+    schedule. Note this also makes ``ngaus`` behave the way a user expects — with the
+    early split, adding a Gaussian to a tissue could simply feed the catcher instead of
+    modelling that tissue's structure.
 
     ``tpm_bottom_mm`` (SPM 5) drops samples the affine places below the bottom of the TPM
     — on a whole-head T1 that is the neck and shoulders, which SPM never fits. Set 0 to
@@ -1332,8 +1543,15 @@ def fit_segment(
 
     ``warp_solver`` selects the deformation optimiser. ``"gn"`` (default) is SPM's
     **Gauss-Newton** update (``spm_preproc8``): per-node gradient + rank-1 GN Hessian
-    ``dp·dpᵀ``, the regularisation operator added, solved by conjugate gradient (in place of
-    SPM's multigrid), with Armijo backtracking. It **converges** — the warp reaches a stable
+    ``dp·dpᵀ``, the regularisation operator added, solved by **DCT-preconditioned**
+    conjugate gradient (``warp_cg_iters``, default 32; in place of SPM's multigrid), with
+    Armijo backtracking. The preconditioner is load-bearing, not a speed tweak: the
+    regularisation operator is stiff and ill-conditioned in exactly the smooth modes the
+    prior exists to produce, so unpreconditioned CG needs O(1000) iterations and a
+    truncated run yields only the high-frequency part of the Newton step — a spiky warp.
+    Because ``L`` is a symmetric convolution with Neumann boundaries it is exactly
+    DCT-diagonalisable, so ``(shift·I + L)⁻¹`` is available in closed form
+    (:func:`_dct_precond`). It **converges** — the warp reaches a stable
     fixed point and stops growing once the fit settles, so a large ``n_iter`` is safe
     (matches SPM). ``"adam"`` is the autograd + Sobolev-smoothing update (``warp_lr``/
     ``warp_smooth``/``warp_focus`` apply), but it **accumulates** displacement across EM
@@ -1452,6 +1670,23 @@ def fit_segment(
         kept_flat = flat_idx_full[keep]
         warp_sign = coords.new_ones(coords.shape[0])
 
+    # Integer-data dither (SPM `scrand`, spm_preproc8.m:212-217, 259-266). An image stored
+    # as int16 has intensities on a lattice of `scl_slope`, and the GMM will happily put a
+    # near-zero-variance Gaussian on one of those spikes — the bias field then has an
+    # aliasing pattern to chase. SPM adds one quantisation step of uniform noise,
+    # `rand*slope - slope/2`, to break the lattice up. Applied once to the sampled values,
+    # as SPM does, so it is fixed for the whole fit; seeded for reproducibility.
+    if dither:
+        steps = [float(dither)] * n_chan if isinstance(dither, (int, float)) else list(dither)
+        if len(steps) != n_chan:
+            raise ValueError(f"dither must be a scalar or {n_chan} values, got {len(steps)}")
+        gen = torch.Generator(device="cpu").manual_seed(0)
+        for c, step in enumerate(steps):
+            if step <= 0:
+                continue
+            noise = torch.rand(intens.shape[0], generator=gen).to(device=device, dtype=wdt)
+            intens[:, c] += (noise - 0.5) * step
+
     # SPM's fudge factor (non-independence of smoothed voxels): scales BOTH the bias
     # precision and the warp regularisation so their strength tracks the sampling stride
     # `sk` the way SPM's does. `node_vox` is the warp grid's node spacing (sk·vx mm),
@@ -1473,9 +1708,9 @@ def fit_segment(
         (nx, ny, nz), vox, biasfwhm, biasreg, ff, device=device
     )
     d3 = nbx * nby * nbz  # DCT coefficients per channel (bias GN works in this flat space)
-    # cap the assembly chunk so the (chunk, d3) DCT design matrix stays bounded (~160 MB
-    # float32) regardless of d3 — the GN bias's only large transient.
-    bias_chunk = max(1, int(40_000_000 // max(d3, 1)))
+    # NB the GN assembly no longer builds a (chunk, d3) design matrix — it contracts the
+    # lattice axis by axis (`_assemble_separable`) — so its transients are just the
+    # per-sample responsibilities and `bias_chunk` is simply `fit_chunk` (set below).
 
     # Wishart covariance prior vr0 = diag(per-channel variance)/Kb² (SPM eq. after 25);
     # kept float64 for the M-step. Diagonal even for multi-channel (SPM's vr0).
@@ -1517,6 +1752,7 @@ def fit_segment(
             max_chunk_size=n_samp,
         )
     fit_chunk = max(1, min(int(fit_chunk), n_samp))
+    bias_chunk = fit_chunk
     n_chunks = (n_samp + fit_chunk - 1) // fit_chunk
     if verbose:
         how = "single pass — all samples fit" if n_chunks == 1 else f"{n_chunks} chunks"
@@ -1681,10 +1917,64 @@ def fit_segment(
     def _khatri_rao_rows(bx: Tensor, by: Tensor, bz: Tensor) -> Tensor:
         """Row-wise DCT design matrix ``Phi[v, flat(i,j,k)] = bx[v,i]·by[v,j]·bz[v,k]`` —
         ``(n, d3)``, flattened C-order to match ``coef.reshape(-1)`` (so ``Phi @ coef.ravel``
-        reproduces :func:`eval_log_bias`)."""
+        reproduces :func:`eval_log_bias`). Kept for the reference implementation the
+        separable assembly is tested against; the fit itself no longer builds it."""
         n = bx.shape[0]
         xy = (bx[:, :, None] * by[:, None, :]).reshape(n, -1)  # (n, nbx·nby)
         return (xy[:, :, None] * bz[:, None, :]).reshape(n, -1)  # (n, d3)
+
+    # --- separable (Kronecker) bias-GN assembly, SPM's `spm_krutil` structure ---------
+    #
+    # The GN normal equations are
+    #     Beta[i,j,k]            = Σ_v wt1[v]·B1[x,i]·B2[y,j]·B3[z,k]
+    #     Alpha[(ijk),(i'j'k')]  = Σ_v wt2[v]·B1[x,i]B1[x,i']·B2[y,j]B2[y,j']·B3[z,k]B3[z,k']
+    #
+    # Building the dense `(n_samp, d3)` design matrix and forming `Phiᵀ diag(wt2) Phi`
+    # costs O(n_samp·d3²) — the single largest FLOP sink in the fit, and it grows
+    # QUADRATICALLY as `-biasfwhm` is lowered. SPM never forms it: the samples sit on a
+    # regular lattice and the basis is separable, so it contracts one axis at a time
+    # (`kron(b3*b3', spm_krutil(wt2,B1,B2,1))`). Same arithmetic, O(ngz·nbx²nby²nbz²)
+    # instead. On the reference T1 at `-biasfwhm 30` (d3 = 13·17·14 = 3094) that is
+    # 2.4 TMAC/sweep versus 6.4e8 — ~3700x fewer operations.
+    #
+    # The per-axis bases are evaluated on the LATTICE (a few hundred rows), not per sample;
+    # `wt1`/`wt2` are scattered back onto the lattice with zeros outside the mask, exactly
+    # as SPM zero-fills `wt1(buf(z).msk)`. `scatter_add_` (not assignment) because
+    # dual-echo PE mode maps two samples to one node and their contributions must sum.
+    ngz, ngy, ngx = grid_shape
+    lat_b1 = dct_basis(gx.to(torch.float64) + 1.0, nx, nbx).to(wdt)  # (ngx, nbx)
+    lat_b2 = dct_basis(gy.to(torch.float64) + 1.0, ny, nby).to(wdt)  # (ngy, nby)
+    lat_b3 = dct_basis(gz.to(torch.float64) + 1.0, nz, nbz).to(wdt)  # (ngz, nbz)
+    # outer products per axis: P[a, i*nb + i'] = B[a,i]·B[a,i']
+    lat_p1 = (lat_b1[:, :, None] * lat_b1[:, None, :]).reshape(ngx, -1)
+    lat_p2 = (lat_b2[:, :, None] * lat_b2[:, None, :]).reshape(ngy, -1)
+    lat_p3 = (lat_b3[:, :, None] * lat_b3[:, None, :]).reshape(ngz, -1)
+    # z-chunk so the (nz_c, nbx², nby²) intermediate stays bounded at a fine `samp`
+    z_chunk = max(1, int(40_000_000 // max(nbx * nbx * nby * nby, 1)))
+
+    def _assemble_separable(wt1_g: Tensor, wt2_g: Tensor) -> tuple[Tensor, Tensor]:
+        """``(Beta, Alpha)`` from lattice-shaped weights ``(ngz, ngy, ngx)``."""
+        beta_acc = torch.zeros((nbx, nby, nbz), dtype=torch.float64, device=device)
+        alpha_acc = torch.zeros(
+            (nbx * nbx * nby * nby, nbz * nbz), dtype=torch.float64, device=device
+        )
+        for s in range(0, ngz, z_chunk):
+            e = min(s + z_chunk, ngz)
+            # Beta: contract x, then y, then z
+            t1 = wt1_g[s:e].reshape(-1, ngx) @ lat_b1  # (nz_c·ngy, nbx)
+            u1 = torch.einsum("zya,yb->zab", t1.reshape(e - s, ngy, nbx), lat_b2)
+            beta_acc += torch.einsum("zab,zc->abc", u1, lat_b3[s:e]).double()
+            # Alpha: same, on the per-axis outer products
+            t2 = wt2_g[s:e].reshape(-1, ngx) @ lat_p1  # (nz_c·ngy, nbx²)
+            u2 = torch.einsum("zya,yb->zab", t2.reshape(e - s, ngy, nbx * nbx), lat_p2)
+            alpha_acc += (u2.reshape(e - s, -1).T @ lat_p3[s:e]).double()
+        # (i,i',j,j',k,k') → (i,j,k, i',j',k'), C-order flattening to match coef.reshape(-1)
+        alpha = (
+            alpha_acc.reshape(nbx, nbx, nby, nby, nbz, nbz)
+            .permute(0, 2, 4, 1, 3, 5)
+            .reshape(d3, d3)
+        )
+        return beta_acc.reshape(-1), alpha
 
     def _bias_objective(coef_val: Tensor) -> float:
         """Bias-relevant objective (SPM's ``ll`` terms that move with the bias): data ll +
@@ -1724,8 +2014,10 @@ def fit_segment(
         prec_w = prec.to(wdt)  # (n_gauss, n_chan, n_chan)
         means_w = means.to(wdt)  # (n_chan, n_gauss)
         for c in range(n_chan):
-            alpha = torch.zeros((d3, d3), dtype=torch.float64, device=device)
-            beta = torch.zeros(d3, dtype=torch.float64, device=device)
+            # accumulate the per-voxel GN weights on the sample lattice, zero outside the
+            # mask (SPM's `wt1 = zeros(d(1:2)); wt1(buf(z).msk) = ...`)
+            wt1_g = torch.zeros(n_grid, dtype=wdt, device=device)
+            wt2_g = torch.zeros(n_grid, dtype=wdt, device=device)
             with torch.no_grad():
                 for sl in _bias_chunks():
                     bx, by, bz = _basis(sl)
@@ -1740,11 +2032,11 @@ def fit_segment(
                     w1 = (resp * w0).sum(dim=1)  # (chunk,)
                     w2 = resp @ prec_w[:, c, c]  # (chunk,)
                     cr_c = corr[:, c]
-                    wt1 = -(1.0 + cr_c * w1)  # gradient weight (the 1 = Jacobian term)
-                    wt2 = cr_c * cr_c * w2 + 1.0  # simplified GN Hessian weight (PSD, ≥1)
-                    phi = _khatri_rao_rows(bx, by, bz)  # (chunk, d3), float32
-                    beta += (phi.T @ wt1).double()
-                    alpha += ((phi * wt2[:, None]).T @ phi).double()
+                    wt1_g.scatter_add_(0, kept_flat[sl], -(1.0 + cr_c * w1))  # 1 = Jacobian
+                    wt2_g.scatter_add_(0, kept_flat[sl], cr_c * cr_c * w2 + 1.0)  # PSD, ≥1
+                beta, alpha = _assemble_separable(
+                    wt1_g.reshape(grid_shape), wt2_g.reshape(grid_shape)
+                )
             t_flat = coef_val[c].reshape(-1).to(torch.float64)
             update = (
                 torch.linalg.solve(alpha + torch.diag(c_diag), beta + c_diag * t_flat)
@@ -1767,10 +2059,10 @@ def fit_segment(
     prior_raw = None  # (n_samp, n_tissue) unweighted warped TPM, refreshed per outer iter
     tissue_lik = None  # (n_samp, n_tissue) collapsed Gaussian likelihood, refreshed per iter
     split_done = False
+    rounds_done = 0  # completed [GMM, bias] rounds in outer iteration 0, for `split_after`
     # SPM's tol1 is an ABSOLUTE per-voxel log-likelihood gain (`ll - oll < tol1*nm`), not a
     # relative change — every break below uses it, so `tol` means the same thing throughout.
     tol_abs = tol * n_samp
-    prev_ll = -float("inf")
     total_ll = -float("inf")
     ll_per_vox = float("nan")
     bar = (
@@ -1903,9 +2195,14 @@ def fit_segment(
             # SPM expands lkp to `ngaus` HERE — after the first [GMM, bias] round of the
             # first outer iteration (spm_preproc8.m:646-675), so each tissue is split from
             # its own converged mean/covariance rather than from the pooled moment init.
+            # `split_after` lets that wait for more [GMM, bias] rounds: see its docstring
+            # entry — the first round runs on the *uncorrected* image, and splitting from
+            # the resulting over-broad covariance is what lets a component run away.
             if not split_done and it == 0:
-                means, covs, mix, tissue_of = split_gaussians(means, covs, ngaus)
-                split_done = True
+                rounds_done += 1
+                if rounds_done >= split_after or inner == n_inner - 1:
+                    means, covs, mix, tissue_of = split_gaussians(means, covs, ngaus)
+                    split_done = True
 
         # corrected under the updated bias — constant for the warp + wp steps below
         corrected = corrected_full(coef)
@@ -1942,10 +2239,36 @@ def fit_segment(
                     ap = _g * (_g * pv).sum(dim=-1, keepdim=True) + _reg_grad(pv)
                     return _pe_project(ap)
 
-                update = _pe_project(_cg_solve(beta, _apply_a))
+                # Preconditioner (shift·I + L)⁻¹ in the DCT domain. `L` is the stiff,
+                # ill-conditioned part of the system and is exactly DCT-diagonalisable, so
+                # inverting it leaves CG only the per-node Alpha variation — without this,
+                # CG needs O(1000) iterations at SPM's regularisation and a truncated run
+                # returns only the high-frequency part of the Newton step. `shift` is the
+                # mean of Alpha's diagonal (Alpha_cc = g_c², since Alpha = g·gᵀ), floored
+                # so PE-mode's zeroed components stay invertible. `sym_scale = 1/sk²`
+                # because we solve in image-voxel units while L lives in node units.
+                shift = g_data.pow(2).mean(dim=(0, 1, 2))
+                # Floor relative to the largest component, not absolutely: in PE-mode the
+                # projected-out components have shift exactly 0, and an absolute floor like
+                # 1e-12 then makes 1/(sym+shift) ~1e12 where `sym` also vanishes (bending's
+                # affine null space). Round-off in those components blows up and NaNs the
+                # whole CG through the shared `rz` reduction.
+                shift = shift.clamp_min(shift.max() * 1e-6 + 1e-30)
+                _pre = _dct_precond(
+                    warp_reg_gn,
+                    node_vox,
+                    grid_shape,
+                    shift,
+                    sym_scale=1.0 / (sk_t * sk_t),
+                    device=device,
+                    dtype=wdt,
+                )
+                # keep the constrained components identically zero inside the solve too
+                precond = (lambda r, _p=_pre: _pe_project(_p(r))) if pe_axis is not None else _pre
+                update = _pe_project(_cg_solve(beta, _apply_a, warp_cg_iters, precond))
                 base = _warp_objective(twarp, cur_log_prior)
                 armijo, improved = 1.0, False
-                for _ in range(8):  # backtracking line search (SPM's Armijo)
+                for _ in range(12):  # backtracking line search (SPM's Armijo: 12 tries)
                     cand = (twarp - armijo * update).detach()
                     if _warp_objective(cand, cur_log_prior) < base:
                         twarp, improved = cand, True
@@ -1953,6 +2276,10 @@ def fit_segment(
                     armijo *= 0.75
                 if not improved:
                     break  # no downhill step this EM iteration — stop refining the warp
+                # SPM breaks out of its `subit=1:3` loop once the deformation stops paying
+                # for itself (`spm_preproc8.m:852`); we only had the line-search failure.
+                if base - _warp_objective(twarp, cur_log_prior) <= tol_abs:
+                    break
         elif fit_warp:
             twarp = twarp.detach().requires_grad_(True)
             opt = torch.optim.Adam([twarp], lr=warp_lr)
@@ -2043,14 +2370,18 @@ def fit_segment(
             bar.update(1)
         elif verbose:
             print(f"iter {it + 1:2d}/{n_iter}  ll/vox {ll_per_vox:+.4f}")
-        # SPM: `if iter>=10 && ~((ll-ooll)>2*tol1*nm), break`. The `min_iter` floor is
+        # SPM: `if iter>=10 && ~((ll-ooll)>2*tol1*nm), break` (spm_preproc8.m:859). The
+        # reference for the gain is `ooll`, which SPM last wrote *inside* this same outer
+        # iteration's `iter1` loop (`:516`) — so the test asks "did the deformation improve
+        # on the state before the last bias update", not "did this iteration beat the last
+        # one". The previous-iteration form used here until 2026-07-30 is a strictly larger
+        # gain, so it kept iterating past SPM's stopping point. The `min_iter` floor is
         # load-bearing, not defensive — the heavy-to-light schedule only relaxes the bending
         # term to its target at iteration 10, so an earlier exit leaves the deformation
         # stiffened by up to 2¹⁰ and effectively unfitted. Also don't stop inside the coarse
         # (blurred-TPM) phase: the ll there is on a different objective.
-        if it + 1 >= min_iter and it >= n_coarse and not (total_ll - prev_ll > 2.0 * tol_abs):
+        if it + 1 >= min_iter and it >= n_coarse and not (total_ll - ooll > 2.0 * tol_abs):
             break
-        prev_ll = total_ll
     if bar is not None:
         bar.close()
 
@@ -2309,11 +2640,16 @@ def mrf_cleanup(
     the iteratively-smoothed field, and ``w = 1/vox²`` handles anisotropy. ``mrf=0``
     returns the input unchanged.
 
+    Updated **red-black in place**, as ``spm_mrf.c`` does — see the comment in the body.
+    (One deliberate non-replication: SPM carries ``p``/``q`` as ``uint8`` and re-quantises
+    every sweep. That is a storage decision in the reference, not part of the model, so
+    this runs in float.)
+
     Args:
         posteriors: ``(n_tissue, nz, ny, nx)`` GMM data-term posteriors.
         mrf: connectivity strength (SPM default 1); 0 disables.
         vox: ``(vx, vy, vz)`` mm voxel sizes.
-        n_iter: mean-field iterations (SPM uses 10).
+        n_iter: mean-field iterations (SPM uses 10, each a full red + black sweep).
 
     Returns:
         ``(n_tissue, nz, ny, nx)`` cleaned posteriors (each voxel sums to 1).
@@ -2321,25 +2657,43 @@ def mrf_cleanup(
     if mrf <= 0:
         return posteriors
     data = posteriors.to(torch.float32)
-    field = data.clone()
+    # SPM starts its state at zero (`P = zeros(...,'uint8')` in `clean_write_tissues`), so
+    # the first half-sweep sees no neighbour mass and reduces to the data term.
+    field = torch.zeros_like(data)
     # posteriors are (tissue, z, y, x): axes 1,2,3 ↔ z,y,x → weights 1/vox_z², /vox_y², /vox_x²
     w = [1.0 / vox[2] ** 2, 1.0 / vox[1] ** 2, 1.0 / vox[0] ** 2]
+
+    # SPM's `spm_mrf` is a RED-BLACK (checkerboard) Gauss-Seidel sweep updated IN PLACE, not
+    # the synchronous Jacobi iteration used here until 2026-07-30. Each call makes two
+    # half-sweeps (`for it=0; it<2`), and decoding its `i0start/i1start/i2start` loop bounds
+    # shows they are exactly the two parities of `(x+y+z) % 2`. The distinction is not
+    # cosmetic: Gauss-Seidel propagates each update to its neighbours within the same
+    # iteration, so it converges roughly twice as fast as Jacobi and does not exhibit the
+    # two-colour oscillation Jacobi can settle into on a Potts field.
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, device=data.device) for n in data.shape[1:]), indexing="ij"
+    )
+    parity = ((xx + yy + zz) % 2).to(torch.bool)[None]  # (1, nz, ny, nx), broadcast over tissue
+
     for _ in range(n_iter):
-        neigh = torch.zeros_like(field)
-        for axis, wa in zip((1, 2, 3), w, strict=True):
-            lo = torch.roll(field, shifts=1, dims=axis)
-            hi = torch.roll(field, shifts=-1, dims=axis)
-            # zero the wrapped-around planes so edges see fewer neighbours (not toroidal)
-            idx_lo = [slice(None)] * 4
-            idx_lo[axis] = 0
-            lo[tuple(idx_lo)] = 0.0
-            idx_hi = [slice(None)] * 4
-            idx_hi[axis] = field.shape[axis] - 1
-            hi[tuple(idx_hi)] = 0.0
-            neigh = neigh + wa * (lo + hi)
-        neigh = neigh / 6.0
-        field = data * torch.exp(mrf * neigh)
-        field = field / field.sum(dim=0, keepdim=True).clamp_min(1e-20)
+        for colour in (False, True):
+            neigh = torch.zeros_like(field)
+            for axis, wa in zip((1, 2, 3), w, strict=True):
+                lo = torch.roll(field, shifts=1, dims=axis)
+                hi = torch.roll(field, shifts=-1, dims=axis)
+                # zero the wrapped-around planes so edges see fewer neighbours (not toroidal)
+                idx_lo = [slice(None)] * 4
+                idx_lo[axis] = 0
+                lo[tuple(idx_lo)] = 0.0
+                idx_hi = [slice(None)] * 4
+                idx_hi[axis] = field.shape[axis] - 1
+                hi[tuple(idx_hi)] = 0.0
+                neigh = neigh + wa * (lo + hi)
+            neigh = neigh / 6.0
+            upd = data * torch.exp(mrf * neigh)
+            upd = upd / upd.sum(dim=0, keepdim=True).clamp_min(1e-20)
+            # write back only this colour; the next half-sweep then reads the new values
+            field = torch.where(parity == colour, upd, field)
     return field
 
 

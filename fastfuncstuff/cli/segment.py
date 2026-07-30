@@ -47,6 +47,29 @@ _IMG_EXTS = (".nii.gz", ".nii.zst", ".nii", ".HEAD", ".BRIK.gz", ".BRIK")
 _step = spinner  # stage announcements are just the shared spinner
 
 
+def _dither_step(header_info, mode: str) -> float:
+    """Quantisation step to dither an integer-stored image by (SPM's ``scrand``).
+
+    ``spm_preproc8.m:212-217`` takes ``V.pinfo(1)`` — the NIfTI scaling slope — for
+    integer datatypes and 0 otherwise, then adds uniform noise of one step to the sampled
+    intensities. An int16 image has its intensities on a lattice of that slope, and a
+    Gaussian will happily collapse onto one of those spikes, leaving the bias field an
+    aliasing pattern to chase. ``mode`` is ``auto`` (SPM's rule), ``off``, or a literal step.
+    """
+    if mode == "off":
+        return 0.0
+    if mode != "auto":
+        return float(mode)
+    try:
+        hdr = header_info["header"]
+        if np.issubdtype(np.dtype(hdr.get_data_dtype()), np.integer):
+            slope, _ = hdr.get_slope_inter()
+            return float(slope) if slope else 1.0
+    except Exception:  # odd/absent header — dithering is a refinement, not a requirement
+        return 0.0
+    return 0.0
+
+
 def _strip_ext(prefix: str) -> str:
     """Drop a trailing image extension from a prefix so ``t1_seg.nii.gz`` →
     ``t1_seg`` and outputs are named ``t1_seg_c1.nii.gz`` (not
@@ -467,6 +490,38 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "wasted); for adam, more = the warp makes more progress per EM iteration.",
     )
     knobs.add_argument(
+        "-dither",
+        default="auto",
+        metavar="auto|off|STEP",
+        help="Add one quantisation step of uniform noise to integer-stored inputs (SPM's "
+        "'scrand'). An int16 image has its intensities on a lattice of the NIfTI scaling "
+        "slope, and a Gaussian can collapse onto one of those spikes, leaving the bias "
+        "field an aliasing pattern to chase. 'auto' (default) applies SPM's rule — the "
+        "slope for integer datatypes, nothing for float. 'off', or give an explicit step.",
+    )
+    knobs.add_argument(
+        "-split_after",
+        type=int,
+        default=2,
+        help="[GMM, bias] rounds before each tissue's single Gaussian is expanded to "
+        "-ngaus (default 2; SPM splits after 1). SPM's first round fits the GMM to the "
+        "UNCORRECTED image, so every covariance is still inflated by the bias field, and "
+        "splitting from it lets one child expand onto the intensity tails and become an "
+        "outlier-catcher instead of modelling the tissue — it costs a Gaussian and makes "
+        "-ngaus behave unintuitively. Waiting one round lands on SPM's own fitted "
+        "Gaussians. Use 1 for SPM's literal schedule.",
+    )
+    knobs.add_argument(
+        "-warp_cg_iters",
+        type=int,
+        default=32,
+        help="Preconditioned conjugate-gradient iterations per GN warp step (default 32). "
+        "The DCT preconditioner inverts the stiff regularisation operator exactly, so this "
+        "converges by ~8 and 32 is headroom; raise only if a very fine -samp or an unusual "
+        "-reg leaves the warp under-moving. (Without the preconditioner the same solve needs "
+        "hundreds of iterations and a short run yields a spiky warp — see the wiki note.)",
+    )
+    knobs.add_argument(
         "-blur_tpms",
         type=float,
         default=0.0,
@@ -667,9 +722,11 @@ def main(argv: list[str] | None = None) -> int:
 
     with _step("Loading input + TPM", enabled=verbose):
         channels = []
+        dither_steps: list[float] = []
         hdr = None
         for path in args.input:  # one or several co-registered channels
             ch, ch_hdr = load_image(path, device=device)
+            dither_steps.append(_dither_step(ch_hdr, args.dither))
             if hdr is None:
                 hdr = ch_hdr
             elif ch.shape != channels[0].shape or not np.allclose(
@@ -799,6 +856,9 @@ def main(argv: list[str] | None = None) -> int:
         warp_solver=args.warp_solver,
         warp_lr=args.warp_lr,
         warp_iters=args.warp_iters,
+        warp_cg_iters=args.warp_cg_iters,
+        split_after=args.split_after,
+        dither=dither_steps,
         warp_smooth=args.warp_smooth,
         fit_chunk=args.fit_chunk,
         dtype=torch.float32 if args.fit_dtype == "float32" else torch.float64,
