@@ -969,3 +969,60 @@ def compute_power_spectra(
 
     freqs = np.fft.rfftfreq(n, d=1.0 / sampling_rate)
     return freqs, amplitudes
+
+
+def parabolic_peak_offset(
+    curve: torch.Tensor,
+    peak_idx: torch.Tensor,
+    *,
+    dim: int = 0,
+) -> torch.Tensor:
+    """Sub-grid peak offset by a 5-point least-squares parabola.
+
+    A grid search reports the peak quantised to the grid.  The underlying
+    objective is smooth, so fitting a parabola through the samples around
+    the argmax and taking its vertex recovers the peak to a fraction of a
+    step — the standard cross-correlation sub-sample trick.
+
+    Five points via least squares rather than the 3-point analytic vertex:
+    the 3-point vertex uses only the immediate neighbours and so inherits
+    their noise directly, while the 5-point fit averages over a wider
+    window.  Falls back to 3 points one sample from an edge, and to no
+    refinement at the boundary (where a vertex would be an extrapolation
+    outside the searched range).
+
+    Formulas are shared with the ``locomoco`` xcorr searchlights, which
+    compute the same vertex from a streaming running-peak because they do
+    not hold the full curve.
+
+    Parameters
+    ----------
+    curve : Tensor
+        Objective sampled on a regular grid, peak along ``dim``.
+    peak_idx : Tensor
+        ``argmax(curve, dim=dim)``; shape is ``curve``'s shape minus ``dim``.
+
+    Returns
+    -------
+    Tensor
+        Offset in units of ONE GRID STEP, clamped to [-1, 1], same shape as
+        ``peak_idx``.  Add ``offset * step`` to the grid-valued peak.
+    """
+    n = curve.shape[dim]
+    c = curve.movedim(dim, 0)
+    idx = torch.stack(
+        [(peak_idx + k).clamp(0, n - 1) for k in (-2, -1, 0, 1, 2)], dim=0
+    )  # (5, ...)
+    y = c.gather(0, idx)
+    ym2, ym1, y0, yp1, yp2 = y[0], y[1], y[2], y[3], y[4]
+
+    b5 = (-2.0 * ym2 - ym1 + yp1 + 2.0 * yp2) / 10.0
+    a5 = (5.0 * (4.0 * ym2 + ym1 + yp1 + 4.0 * yp2) - 10.0 * (ym2 + ym1 + y0 + yp1 + yp2)) / 70.0
+    vtx5 = torch.where(a5.abs() > 1e-9, -b5 / (2.0 * a5), torch.zeros_like(a5)).clamp(-1.0, 1.0)
+    den3 = ym1 - 2.0 * y0 + yp1
+    vtx3 = torch.where(den3.abs() > 1e-6, 0.5 * (ym1 - yp1) / den3, torch.zeros_like(den3)).clamp(
+        -1.0, 1.0
+    )
+    can5 = (peak_idx >= 2) & (peak_idx <= n - 3)
+    can3 = (peak_idx >= 1) & (peak_idx <= n - 2)
+    return torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))

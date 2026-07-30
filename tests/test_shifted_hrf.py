@@ -79,6 +79,7 @@ def test_noiseless_recovery_is_exact(setup):
         tau_step=0.25,
         n_sweeps=4,
         delay_prior_sd=None,  # no shrinkage: we want the raw optimum
+        refine_delays=False,  # this test is about the GRID search itself
         device=CPU,
     )
     assert np.median(r.r2) > 0.999, f"noiseless R2 only {np.median(r.r2):.4f}"
@@ -607,9 +608,9 @@ def test_shape_selection_absorbs_delay_confound(setup):
     tau_v = np.where(rng.random((nv, 1)) < 0.5, -1.2, 1.2)
     runs, _ = _multirun(h, 1, cond_onsets, tau_v, 0.2, 0.3, nv, seed=21)
     blocks = [np.array([float(t)]) for t in cond_onsets[0]]
-    Zt = torch.from_numpy(
-        np.polynomial.legendre.legvander(np.linspace(-1, 1, NTP), 2)
-    ).to(torch.float64)
+    Zt = torch.from_numpy(np.polynomial.legendre.legvander(np.linspace(-1, 1, NTP), 2)).to(
+        torch.float64
+    )
     kw = dict(
         block_onsets=blocks,
         hrf_dt=DT,
@@ -620,9 +621,7 @@ def test_shape_selection_absorbs_delay_confound(setup):
         n_sweeps=4,
         device=CPU,
     )
-    with_shapes, _ = fit_shifted_hrf_per_voxel_shape(
-        data=runs[0], shapes=curves, **kw
-    )
+    with_shapes, _ = fit_shifted_hrf_per_voxel_shape(data=runs[0], shapes=curves, **kw)
     # same data, shape held fixed at the true generator: all the timing
     # information has nowhere to go but the delay parameter
     fixed_shape = fit_shifted_hrf(data=runs[0], hrf=h, **kw)
@@ -670,4 +669,85 @@ def test_band_covers_every_nonzero_gram_entry(setup):
     assert not missed.any(), (
         f"band drops {int(missed.sum())} non-zero gram pairs; "
         "the fast path would silently lose those interactions"
+    )
+
+
+def test_delay_refinement_beats_the_grid_off_grid(setup):
+    """Sub-grid refinement must reduce delay error when truth is off-grid.
+
+    A grid search alone quantises delays to tau_step, which shows up as
+    banding in a delay map and puts a floor of step/sqrt(12) on the error.
+    The profiled objective is smooth in tau, so a parabola through the
+    samples around the argmax should recover most of that.
+    """
+    h, _, block_onsets, polys = setup
+    nb = len(block_onsets)
+    rng = np.random.default_rng(31)
+    step = 0.5  # deliberately coarse so quantisation dominates
+    # truth placed mid-step, the worst case for a grid search
+    tau = rng.uniform(-1.5, 1.5, size=(60, nb))
+    y = _simulate(h, block_onsets, tau, np.ones((60, nb))) + rng.normal(0, 0.2, size=(60, NTP))
+    kw = dict(
+        data=torch.from_numpy(y),
+        block_onsets=block_onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=torch.from_numpy(polys),
+        tau_max=2.0,
+        tau_step=step,
+        n_sweeps=4,
+        delay_prior_sd=None,
+        device=CPU,
+    )
+    grid = fit_shifted_hrf(**kw, refine_delays=False)
+    fine = fit_shifted_hrf(**kw, refine_delays=True)
+    rmse_grid = float(np.sqrt(np.mean((grid.delays - tau) ** 2)))
+    rmse_fine = float(np.sqrt(np.mean((fine.delays - tau) ** 2)))
+    assert rmse_fine < rmse_grid, f"refinement did not help: {rmse_grid:.4f} -> {rmse_fine:.4f}"
+    # and the refined delays must stop looking quantised
+    n_on_grid_grid = np.mean(np.abs(grid.delays / step - np.round(grid.delays / step)) < 1e-6)
+    n_on_grid_fine = np.mean(np.abs(fine.delays / step - np.round(fine.delays / step)) < 1e-6)
+    assert n_on_grid_grid > 0.99, "grid search should be exactly quantised"
+    assert n_on_grid_fine < 0.2, "refined delays should no longer sit on the grid"
+
+
+def test_r2_is_task_relative_not_drift_inflated(setup):
+    """r2 must not credit the nuisance model with explained variance.
+
+    Bug of record: ss_tot came from the RAW data while SSE was measured
+    after removing BOTH drift and task, so everything the polynomials
+    absorbed counted as "explained".  With realistic drift that inflates
+    r2 badly and makes it useless for spotting task-responsive voxels --
+    which is exactly what it gets used for.  r2_total keeps the old
+    convention, so the two must differ in the presence of drift, and r2
+    must be the smaller one.
+    """
+    h, _, block_onsets, polys = setup
+    nb = len(block_onsets)
+    rng = np.random.default_rng(41)
+    nv = 40
+    # weak task response sitting on strong low-frequency drift
+    y = 0.3 * _simulate(h, block_onsets, np.zeros((nv, nb)), np.ones((nv, nb)))
+    t = np.linspace(-1, 1, NTP)
+    drift = np.stack([rng.normal(0, 6.0) * t**k for k in range(1, 4)], axis=0).sum(axis=0)
+    y = y + drift[None, :] + rng.normal(0, 0.3, size=(nv, NTP))
+    r = fit_shifted_hrf(
+        data=torch.from_numpy(y),
+        block_onsets=block_onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=torch.from_numpy(polys),
+        tau_max=1.0,
+        tau_step=0.25,
+        n_sweeps=2,
+        device=CPU,
+    )
+    task = float(np.median(r.r2))
+    incl = float(np.median(r.r2_total))
+    assert incl > task, f"drift-inclusive r2 should be larger: {incl:.3f} vs {task:.3f}"
+    # the drift here dominates, so the gap must be substantial
+    assert incl - task > 0.2, (
+        f"expected drift to inflate r2 substantially, gap only {incl - task:.3f}"
     )

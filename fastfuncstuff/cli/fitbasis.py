@@ -1094,7 +1094,11 @@ def _run_shift_mode(
             out = masked.reshape(out_shape)
         return out
 
-    for arr, name in ((fit.r2, "r2"), (fit.r2_fixed, "r2_tau0")):
+    for arr, name in (
+        (fit.r2, "r2"),
+        (fit.r2_fixed, "r2_tau0"),
+        (fit.r2_total, "r2_incl_drift"),
+    ):
         path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
         with spinner(f"Writing {Path(path).name}"):
             save_nifti(
@@ -1104,9 +1108,16 @@ def _run_shift_mode(
             )
         print(f"  Wrote {path}")
     print(
-        "  NOTE: r2 minus r2_tau0 is IN-SAMPLE and is not evidence of real\n"
-        "        latency — free delay parameters always buy in-sample fit.\n"
-        "        Use -xval-r2 for the held-out comparison."
+        "  NOTE: _r2 is TASK variance / NON-DRIFT variance — the nuisance is\n"
+        "        removed from both terms, so drift is not credited to the model.\n"
+        "        _r2_incl_drift uses raw total variance (what most tools print)\n"
+        "        and is inflated by the polynomial model: with -polort 4 over 10\n"
+        "        runs that is 50 nuisance columns absorbing real variance.\n"
+        "        Neither is evidence of task response on its own — n_blocks free\n"
+        "        amplitudes buy in-sample fit too.  For a task-responsiveness\n"
+        "        map use the held-out _xvalr2 from -xval-r2; for latency, use\n"
+        "        _xvalr2_delay_gain.  r2 minus r2_tau0 is in-sample and proves\n"
+        "        nothing."
     )
 
     if shape_index is not None and shapes is not None:
@@ -1226,8 +1237,9 @@ def _run_shift_mode(
         "n_blocks": len(block_onsets),
         "condition_labels": list(condition_labels),
         "polort": int(polort),
-        "r2_median": float(np.median(fit.r2)),
+        "r2_median_task_relative": float(np.median(fit.r2)),
         "r2_tau0_median": float(np.median(fit.r2_fixed)),
+        "r2_median_incl_drift": float(np.median(fit.r2_total)),
     }
     meta_path = f"{args.prefix}_fitbasis_metadata.json"
     Path(meta_path).write_text(json.dumps(meta, indent=2))

@@ -65,7 +65,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import get_device, parabolic_peak_offset
 
 
 @dataclass
@@ -82,7 +82,22 @@ class ShiftedHRFResult:
         ``τ_b`` per voxel, **in seconds**.  Positive = response later
         than the nominal onset.  Bounded by the search grid.
     r2 : np.ndarray, shape (n_voxels,)
-        In-sample R² of the full model.
+        In-sample R² **of the task, relative to non-drift variance**:
+        ``1 - SSE / ||y_projected||²``, where the nuisance has been removed
+        from both terms.  This is the number to look at when asking which
+        voxels responded to the task.
+
+        It is deliberately NOT ``1 - SSE / ||y_raw - mean||²``.  With
+        per-run polynomial drift (``polort 4`` over 10 runs is 50 nuisance
+        columns) the drift absorbs a large share of the raw variance, and
+        putting that in the denominator credits it to the model: the same
+        fit reported 0.60 on real data by that definition and far less by
+        this one.  ``r2_total`` keeps the old convention for reference.
+    r2_total : np.ndarray, shape (n_voxels,)
+        In-sample R² against RAW total variance, i.e. task + drift together.
+        Inflated by the nuisance model and near-useless for identifying
+        task-responsive voxels; retained because it is what most tools
+        print, so it is what a cross-tool comparison needs.
     r2_fixed : np.ndarray, shape (n_voxels,)
         R² of the same model with every ``τ`` pinned at 0 — the
         no-latency baseline.
@@ -105,6 +120,7 @@ class ShiftedHRFResult:
     delays: np.ndarray
     r2: np.ndarray
     r2_fixed: np.ndarray
+    r2_total: np.ndarray
     n_sweeps: int
     tau_grid: np.ndarray
 
@@ -353,6 +369,7 @@ def fit_shifted_hrf(
     run_bounds: list[tuple[int, int]] | None = None,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
+    refine_delays: bool = True,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = False,
@@ -549,6 +566,7 @@ def fit_shifted_hrf(
     delays = np.zeros((n_voxels, n_blocks), dtype=np.float32)
     r2_out = np.zeros(n_voxels, dtype=np.float32)
     r2_fixed_out = np.zeros(n_voxels, dtype=np.float32)
+    r2_total_out = np.zeros(n_voxels, dtype=np.float32)
     nz = 0 if Z is None else Z.shape[1]
 
     n_chunks = (n_voxels + chunk_size - 1) // chunk_size
@@ -582,9 +600,12 @@ def fit_shifted_hrf(
         sse0 = (
             ss_y - torch.einsum("vb,vb->v", A, proj[ar_b[:, None], gi.T, ar_v[None, :]].T)
         ).clamp_min(1e-30)
-        r2_fixed_out[start:end] = (
-            (1.0 - sse0 / ss_tot.clamp_min(1e-12)).clamp(-10, 1).float().cpu().numpy()
-        )
+        # Task-relative: denominator is the NON-DRIFT variance (ss_y), not the
+        # raw total (ss_tot).  ss_y is already mean-free because polort >= 0
+        # includes the constant term, so it is exactly "variance left after
+        # the nuisance model".
+        ss_ref = ss_y.clamp_min(1e-12)
+        r2_fixed_out[start:end] = (1.0 - sse0 / ss_ref).clamp(-10, 1).float().cpu().numpy()
         dof = max(1, n_t - n_blocks - nz)
         sigma2 = (sse0 / dof).clamp_min(1e-30)
         lam_tau = (
@@ -643,22 +664,59 @@ def fit_shifted_hrf(
                 gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch
             )
 
+        # ---- sub-grid delay refinement --------------------------------
+        # The grid search reports delays quantised to tau_step, which shows
+        # up as visible banding in a delay map.  The profiled objective is
+        # smooth in tau (it is built from inner products of a smoothly
+        # shifted HRF), so a parabola through the samples around each
+        # argmax recovers the peak to a fraction of a step -- the standard
+        # cross-correlation sub-sample trick.
+        #
+        # This is a reporting refinement, deliberately run AFTER the sweeps
+        # and without touching gi: the amplitudes were solved on the grid,
+        # and re-solving them at off-grid delays would mean building a
+        # per-voxel design, which is exactly what this solver's speed
+        # depends on avoiding.  The residual mismatch is at most half a
+        # step of HRF misplacement, and the HRF is smooth on that scale.
+        tau_fine = tau_t[gi]
+        if refine_delays and n_grid >= 3:
+            for b in range(n_blocks):
+                nb_i = nbr_idx_t[b]
+                gsel = gi[:, nb_i].T
+                cr = banded[b][:, ar_w[:, None], gsel]
+                A_nb = A[:, nb_i] * nbr_w_t[b].unsqueeze(0)
+                contrib = torch.einsum("gwv,vw->gv", cr, A_nb)
+                own = A[:, b]
+                self_cr = banded[b][:, self_pos_t[b], :][:, gi[:, b]]
+                num = proj[b] - (contrib - own.unsqueeze(0) * self_cr)
+                gain = num**2 / self_norm[b].unsqueeze(-1)
+                if lam_tau is not None:
+                    dev_tau = tau_t.unsqueeze(-1) - tau_t[gi].mean(dim=1).unsqueeze(0)
+                    gain = gain - lam_tau.unsqueeze(0) * dev_tau**2
+                off = parabolic_peak_offset(gain, gi[:, b])
+                tau_fine[:, b] = tau_fine[:, b] + off * tau_step
+                del cr, A_nb, contrib, self_cr, num, gain, off
+            tau_fine = tau_fine.clamp(-tau_max, tau_max)
+
         sse = (
             ss_y - torch.einsum("vb,vb->v", A, proj[ar_b[:, None], gi.T, ar_v[None, :]].T)
         ).clamp_min(0.0)
-        r2_out[start:end] = (
+        r2_out[start:end] = (1.0 - sse / ss_ref).clamp(-10, 1).float().cpu().numpy()
+        r2_total_out[start:end] = (
             (1.0 - sse / ss_tot.clamp_min(1e-12)).clamp(-10, 1).float().cpu().numpy()
         )
         amps[start:end] = A.float().cpu().numpy()
-        delays[start:end] = tau_t[gi].float().cpu().numpy()
+        delays[start:end] = tau_fine.float().cpu().numpy()
         del y_raw, y, proj, A, gi
 
     if verbose:
         gained = float(np.median(r2_out - r2_fixed_out))
         print(
             f"  Shifted-HRF: {n_blocks} blocks, grid ±{tau_max}s/{tau_step}s, "
-            f"{n_sweeps} sweep(s).  median R² {float(np.median(r2_out)):.3f} "
-            f"(in-sample; τ=0 baseline {float(np.median(r2_fixed_out)):.3f}, "
+            f"{n_sweeps} sweep(s).  median task R² {float(np.median(r2_out)):.3f} "
+            f"(in-sample, vs non-drift variance; τ=0 baseline "
+            f"{float(np.median(r2_fixed_out)):.3f}; incl. drift "
+            f"{float(np.median(r2_total_out)):.3f}, "
             f"Δ={gained:+.4f} — free parameters, NOT evidence of real latency)"
         )
     return ShiftedHRFResult(
@@ -666,6 +724,7 @@ def fit_shifted_hrf(
         delays=delays,
         r2=r2_out,
         r2_fixed=r2_fixed_out,
+        r2_total=r2_total_out,
         n_sweeps=int(max(1, n_sweeps)),
         tau_grid=tau_grid,
     )
@@ -1210,6 +1269,7 @@ def fit_shifted_hrf_per_voxel_shape(
     delays = np.zeros((n_voxels, n_blocks), dtype=np.float32)
     r2 = np.zeros(n_voxels, dtype=np.float32)
     r2_fixed = np.zeros(n_voxels, dtype=np.float32)
+    r2_total = np.zeros(n_voxels, dtype=np.float32)
     tau_grid = np.arange(-tau_max, tau_max + 0.5 * tau_step, tau_step, dtype=np.float64)
     sweeps = 1
 
@@ -1245,13 +1305,15 @@ def fit_shifted_hrf_per_voxel_shape(
         delays[sel] = sub.delays
         r2[sel] = sub.r2
         r2_fixed[sel] = sub.r2_fixed
+        r2_total[sel] = sub.r2_total
         sweeps = max(sweeps, sub.n_sweeps)
 
     if verbose:
         print(
             f"  Shift fit across {used.size} occupied shape group(s): "
-            f"median R² {float(np.median(r2)):.3f} "
-            f"(τ=0 baseline {float(np.median(r2_fixed)):.3f})"
+            f"median task R² {float(np.median(r2)):.3f} "
+            f"(vs non-drift variance; τ=0 baseline "
+            f"{float(np.median(r2_fixed)):.3f})"
         )
     return (
         ShiftedHRFResult(
@@ -1259,6 +1321,7 @@ def fit_shifted_hrf_per_voxel_shape(
             delays=delays,
             r2=r2,
             r2_fixed=r2_fixed,
+            r2_total=r2_total,
             n_sweeps=sweeps,
             tau_grid=tau_grid,
         ),
