@@ -99,6 +99,7 @@ try:
         decouple_amplitude_prior,
         estimate_and_apply_arma11_prewhitening,
         estimate_arma11_per_voxel,
+        fit_basis_cone_prior,
         fit_basis_constrained_ridge,
         fit_basis_fracridge,
         fit_basis_lss,
@@ -220,15 +221,23 @@ def create_parser() -> argparse.ArgumentParser:
     )
     model_grp.add_argument(
         "-reg",
-        choices=["none", "ridge", "mvn", "mvn-shape", "fracridge"],
-        default="mvn",
+        choices=["none", "ridge", "mvn", "mvn-shape", "cone", "fracridge"],
+        default="cone",
         help=(
             "Regularisation / shape prior:\n"
             "  none      — plain OLS, no shape constraint (see how it fails);\n"
             "  ridge     — diagonal generalised ridge with hand-picked weights;\n"
-            "  mvn       — full MVN(m, C) prior (empirical from half-cosine "
-            "samples for FLOBS; spmg_prior defaults for SPMG).  Closest to "
-            "the VB shape-prior path without full VB;\n"
+            "  cone      — DEFAULT.  Scale-invariant shape prior, the "
+            "faithful filmbabe form: β must lie near the ray {s·m} with "
+            "tolerance ∝ s, where s is a free per-block size parameter "
+            "(TR04MW2 §2.4; filmbabe_vb_flobs.cc gam_Beta).  Constrains "
+            "SHAPE only — amplitude is entirely free, and negative BOLD "
+            "keeps its shape and sign.  Use this;\n"
+            "  mvn       — full MVN(m, C) prior with a FIXED mean.  "
+            "BIASED: m comes from peak-normalised HRF samples, so this is "
+            "an amplitude prior in data units — it drags every voxel "
+            "toward peak ≈ 0.8 (true 3.0 → 1.37, true 0.2 → 0.72).  Kept "
+            "for reproducing older runs; prefer -reg cone;\n"
             "  mvn-shape — amplitude-decoupled prior: constrain only the "
             "*shape* direction orthogonal to the prior mean; leave "
             "amplitude unconstrained.  Fixes amplitude over-shrinkage on "
@@ -656,6 +665,12 @@ def _build_prior(
                                  which isn't a thing for SPMG).
     """
     n_basis = basis.basis_functions.shape[0]
+    if reg == "cone" and model in ("SPMG1",):
+        raise ValueError(
+            "-reg cone needs at least 2 basis functions: with K=1 there is "
+            "no shape direction to constrain, only amplitude — which the "
+            "cone prior leaves free by design.  Use -reg none with SPMG1."
+        )
     if reg in ("none", "fracridge"):
         # Returned but ignored downstream (fracridge uses its own
         # CV-tuned shrinkage; no MVN prior involved).
@@ -663,7 +678,7 @@ def _build_prior(
 
     # First build the base (m, C); then optionally decouple amplitude.
     if model == "FLOBS":
-        if reg in ("mvn", "mvn-shape"):
+        if reg in ("mvn", "mvn-shape", "cone"):
             base_m, base_C = flobs_prior(basis)
         else:  # ridge
             std = float(np.sqrt(np.median(np.diag(basis.C))))
@@ -680,6 +695,20 @@ def _build_prior(
         )
     else:
         raise ValueError(f"Unknown model {model}")
+
+    if reg == "cone":
+        # The cone prior needs a non-zero mean: it IS the prior ray.
+        # spmg_prior centres at the origin (amplitude sign-free), which
+        # leaves no direction to constrain, so point m along the
+        # canonical-amplitude axis.  Its scale is not a free knob —
+        # with spmg_prior's C the angular strength mᵀC⁻¹m comes out to
+        # exactly 1 regardless of canonical_std, and the shape
+        # tightness is set by the (canonical_std / derivative_std)
+        # anisotropy alone.
+        if np.linalg.norm(base_m) < 1e-12:
+            base_m = np.zeros(n_basis, dtype=np.float64)
+            base_m[0] = float(canonical_std)
+        return base_m, base_C
 
     if reg == "mvn-shape":
         # Need a non-zero mean to define the amplitude direction.
@@ -1585,6 +1614,27 @@ def main() -> int:
             f"  Held-out R² mean — OLS (frac=1.0): {fit.r2_ols.mean():.3f}  "
             f"fracridge optimal: {fit.r2.mean():.3f}"
         )
+    elif args.reg == "cone":
+        fit = fit_basis_cone_prior(
+            data=packed.data_concat,
+            design_task=task_design,
+            basis_functions=basis.basis_functions,
+            prior_mean=prior_m,
+            prior_cov=prior_C,
+            n_blocks=n_blocks,
+            nuisance=nuisance,
+            prior_weight=pw,
+            device=device,
+            lambda_mode=args.lambda_mode,
+            reconstruct_hrfs=False,
+            verbose=args.verb >= 1,
+        )
+        print(
+            f"  ✓ Cone fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+            f"λ_mean={fit.effective_prior_weight:.4g}, "
+            f"{fit.n_iter} IRLS iter(s)"
+        )
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
     else:
         fit = fit_basis_constrained_ridge(
             data=packed.data_concat,
@@ -1853,6 +1903,7 @@ def main() -> int:
                 # Single-trial mode: re-use existing betas (no per-fold re-fit).
                 single_trial_betas=task_betas if args.single_trials else None,
                 block_labels=block_labels if args.single_trials else None,
+                cone_prior=args.reg == "cone",
                 device=device,
                 verbose=args.verb >= 1,
             )
@@ -2025,7 +2076,18 @@ def main() -> int:
                 save_nifti(r2_4d, output_path=r2_path, reference_img=args.input[0])
             print(f"  Wrote {r2_path}  (4-D; volume k = held-out R² at fracs[k])")
 
-    if args.cv_runs and args.reg != "fracridge":
+    if args.cv_runs and args.reg == "cone":
+        # cv_basis_constrained_ridge sweeps the prior weight through the
+        # FIXED-mean ridge solver.  Running it under -reg cone would
+        # silently cross-validate a different model than the one that
+        # was fit, so refuse rather than emit a misleading map.
+        # -xval-r2 does honour -reg cone (it takes the solver swap).
+        print(
+            "  -cv-runs is not supported with -reg cone (the weight sweep "
+            "uses the fixed-mean ridge solver); use -xval-r2 instead.  "
+            "Skipping CV."
+        )
+    elif args.cv_runs and args.reg != "fracridge":
         if n_runs < 2:
             print(f"  WARNING: -cv-runs requires ≥2 runs (got {n_runs}); skipping CV.")
         else:

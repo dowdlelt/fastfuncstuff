@@ -1137,7 +1137,7 @@ def fit_basis_cone_prior(
     device: torch.device | None = None,
     lambda_mode: str = "voxelwise",
     n_iter: int = 8,
-    tol: float = 1e-4,
+    tol: float = 5e-3,
     size_floor: float = 1e-3,
     reconstruct_hrfs: bool = False,
     chunk_size: int | None = None,
@@ -1213,7 +1213,14 @@ def fit_basis_cone_prior(
         directly, so exact per-voxel λ costs nothing extra.
     n_iter, tol : int, float
         IRLS iteration cap and convergence threshold on the median
-        relative change in the task betas.
+        relative change in the task betas.  Convergence is monotone but
+        *sublinear* at single-trial scale — measured 6.6e-2 → 2.8e-3 over
+        14 iterations, and damping the update does not help.  That tail is
+        a plateau in the angular objective (each trial's ``s`` is barely
+        identified at per-trial SNR), not an instability, and at δ≈3e-3
+        the betas are moving 0.3 % per step — far below the noise.  Hence
+        the loose default: it reflects what is actually reachable rather
+        than advertising a tolerance the iteration never hits.
     size_floor : float
         Clamp on ``|s|``.  Where ``mᵀP₀β ≈ 0`` the block is
         P₀-orthogonal to the prior ray: the angular penalty is at its
@@ -3250,6 +3257,7 @@ def compute_xval_r2_per_voxel(
     single_trials: bool,
     single_trial_betas: np.ndarray | None = None,
     block_labels: list[str] | None = None,
+    cone_prior: bool = False,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> np.ndarray:
@@ -3390,7 +3398,8 @@ def compute_xval_r2_per_voxel(
                 device=device,
             )
             n_task_cols_train = packed_train.n_task_cols
-            train_fit = fit_basis_constrained_ridge(
+            _solver = fit_basis_cone_prior if cone_prior else fit_basis_constrained_ridge
+            train_fit = _solver(
                 data=packed_train.data_concat,
                 design_task=packed_train.design_concat[:, :n_task_cols_train],
                 basis_functions=basis_functions,
