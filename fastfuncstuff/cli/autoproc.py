@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 from fastfuncstuff.autoproc import config, optcheck
-from fastfuncstuff.autoproc.bids import BoldRun, find_events, scan_subject
+from fastfuncstuff.autoproc.bids import BoldRun, find_events, pair_undetermined, scan_subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
@@ -195,6 +195,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="skip fieldmap distortion correction even if fmaps exist",
     )
     g.add_argument("-fmap_ref", "-fmap-ref", nargs="+", help="reference fmap id(s) per session")
+    g.add_argument(
+        "-fmap_pe_dir",
+        "-fmap-pe-dir",
+        help="dir label matching the BOLD runs' phase encoding (e.g. AP); pairs "
+        "opposite-PE fmaps when the sidecars omit PhaseEncodingDirection",
+    )
     g.add_argument(
         "-xrun_nonlin",
         "-xrun-nonlin",
@@ -588,8 +594,20 @@ def _report_fmap_assignment(subject) -> None:
                 if multitask
                 else ", ".join(fg.run_ids)
             ) or "(none)"
+            # A paired fmap (both PE polarities in fmap/) corrects itself; an
+            # unpaired one borrows a data run as its forward image. Worth showing:
+            # it's the difference between two blip inputs and one.
+            kind = "pair" if fg.forward_path is not None else "solo"
             print(
-                f"    fmap-{fg.fmap_id}  t={_fmt_time(fg.acq_time)}  →  [{items}]",
+                f"    fmap-{fg.fmap_id} ({kind})  t={_fmt_time(fg.acq_time)}  →  [{items}]",
+                file=sys.stderr,
+            )
+        if undet := pair_undetermined(sess):
+            print(
+                f"    NOTE: {', '.join(undet)} look like opposite-PE pairs, but no sidecar"
+                " gives a phase-encoding polarity, so each is corrected against a data"
+                " run instead of its mate. Pass -fmap_pe_dir <label of the runs' PE dir>"
+                " to pair them.",
                 file=sys.stderr,
             )
 
@@ -695,7 +713,13 @@ def main(argv: list[str] | None = None) -> int:
         if val is not None:
             config.DEFAULT_OPTS[key] = val
 
-    subject = scan_subject(args.bids_dir, args.subject, sessions=args.session, tasks=args.task)
+    subject = scan_subject(
+        args.bids_dir,
+        args.subject,
+        sessions=args.session,
+        tasks=args.task,
+        fmap_pe_dir=args.fmap_pe_dir,
+    )
     if not subject.sessions:
         print("ERROR: no matching BOLD runs found", file=sys.stderr)
         return 1

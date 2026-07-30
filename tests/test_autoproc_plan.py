@@ -3,6 +3,7 @@ emitted script is valid bash. Uses hand-built Subject trees (no disk)."""
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -334,6 +335,29 @@ def test_chain_files_are_produced_in_script():
         for tok in toks:
             if re.match(r"stage0[236]\.", tok):
                 assert frag in tok, f"{tok}: does not contain run coord {frag} (key {key})"
+
+
+def test_paired_fmap_supplies_its_own_forward_image():
+    """A self-contained AP/PA pair corrects itself: blipflip gets BOTH inputs from
+    fmap/, and that forward image (not a data run's rep) is the xrun base — the
+    distorted space the field was estimated in."""
+    fmap = FmapGroup(
+        "SM",
+        "run01",
+        Path("/bids/fmap/dir-PA_epi.nii.gz"),
+        {"TotalReadoutTime": 0.08},
+        [("t", "1"), ("t", "2")],
+        forward_path=Path("/bids/fmap/dir-AP_epi.nii.gz"),
+    )
+    runs = [_run("SM", "t", "1"), _run("SM", "t", "2")]
+    plan = build_plan(Subject("X", [Session("SM", runs, [fmap])]), Options(go_to_anat=False))
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert "-blip_up /bids/fmap/dir-AP_epi.nii.gz" in s
+    assert "-blip_down /bids/fmap/dir-PA_epi.nii.gz" in s
+    # Every run's xrun base is the fmap's forward image, not its own rep.
+    bases = set(re.findall(r'XRUNBASE\[[^\]]+\]="([^"]*)"', s))
+    assert bases == {"/bids/fmap/dir-AP_epi.nii.gz"}
+    assert "/bids/fmap/dir-AP_epi.nii.gz" in s.split("stage04")[0]  # preflight-checked
 
 
 def test_fieldmap_jacobian_rides_every_application_of_the_blip_warp():

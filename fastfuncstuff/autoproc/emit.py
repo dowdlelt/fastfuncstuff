@@ -657,6 +657,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         {str(pr.bold.mag_path) for pr in plan.runs}
         | {str(pr.bold.phase_path) for pr in plan.runs if pr.bold.phase_path}
         | {str(pr.fmap.reverse_path) for pr in plan.runs if pr.fmap}
+        | {str(pr.fmap.forward_path) for pr in plan.runs if pr.fmap and pr.fmap.forward_path}
         # SBRefs are load-bearing once the lane is on (moco base, xrun source,
         # the whole sbmean pyramid) — a missing one should fail here, not midway.
         | {str(pr.bold.sbref_path) for pr in plan.runs if pr.use_sbref}
@@ -867,10 +868,13 @@ def _stage_blip(plan: Plan) -> str:
         st = _fmap_stem(pr, "blip")
         pe = "".join(c for c in (pr.fmap.pe_dir or pr.bold.pe_dir or "j") if c.isalpha()) or "j"
         ro = f"-readout {pr.fmap.readout}" if pr.fmap.readout else ""
+        # blip_up: the fmap's own matched-PE image when the pair is self-contained,
+        # else this run's rep (the only forward image there is).
+        up = pr.fmap.forward_path or pr.bold.rep
         cmd = _ffs(
             "ffs_blipflip",
             [
-                f"-blip_up {shlex.quote(str(pr.bold.rep))}",
+                f"-blip_up {shlex.quote(str(up))}",
                 f"-blip_down {shlex.quote(str(pr.fmap.reverse_path))}",
                 f"-pe_dir {pe}",
                 ro,

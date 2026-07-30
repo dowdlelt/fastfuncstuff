@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastfuncstuff.autoproc.bids import (
     find_events,
+    pair_undetermined,
     parse_entities,
     parse_suffix,
     scan_subject,
@@ -143,6 +144,129 @@ def test_time_based_fmap_assignment(tmp_path: Path):
     # distinct from skilled/01 (10:05) → run-1 (no run-number collision).
     assert set(fmaps["skilled-run1"]) == {("skilled", "01"), ("skilled", "02")}
     assert set(fmaps["skilled-run2"]) == {("skilled", "03"), ("rest", "01")}
+
+
+def test_opposite_pe_fmaps_merge_into_one_paired_group(tmp_path: Path):
+    """fmap/ holding BOTH polarities of the same acquisition (dir-AP + dir-PA) is
+    ONE self-contained fieldmap: the pair corrects itself, so the group carries its
+    own forward image and never borrows a data run. Pairs still pair with runs by
+    AcquisitionTime as usual."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    for run, t in (("01", "10:05:00"), ("02", "11:30:00")):
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-check_run-{run}_bold.nii.gz",
+            {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-", "AcquisitionTime": t},
+        )
+    # Two AP/PA pairs, run-numbered, no IntendedFor. Data is j- → AP (j-) is forward.
+    for frun, t in (("01", "10:00:00"), ("02", "11:00:00")):
+        for d, pe in (("AP", "j-"), ("PA", "j")):
+            _touch(
+                ses / "fmap" / f"sub-01_ses-01_acq-bold_dir-{d}_run-{frun}_epi.nii.gz",
+                {"PhaseEncodingDirection": pe, "TotalReadoutTime": 0.05, "AcquisitionTime": t},
+            )
+
+    fmaps = scan_subject(tmp_path, "01").sessions[0].fmaps
+    # One group per pair, not per polarity.
+    assert sorted(f.fmap_id for f in fmaps) == ["run01", "run02"]
+    by = {f.fmap_id: f for f in fmaps}
+    # Forward = the polarity matching the runs (j-, i.e. AP); reverse = the other.
+    assert "dir-AP" in by["run01"].forward_path.name
+    assert "dir-PA" in by["run01"].reverse_path.name
+    assert by["run01"].intended_runs == [("check", "01")]
+    assert by["run02"].intended_runs == [("check", "02")]
+
+
+def test_unpaired_pe_fmaps_stay_separate_groups(tmp_path: Path):
+    """Only ONE polarity present → no pair to merge: the fmap is the reverse image
+    and a data run supplies the forward, so the dir stays in the group id."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    _touch(
+        ses / "func" / "sub-01_ses-01_task-check_run-01_bold.nii.gz",
+        {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-"},
+    )
+    _touch(
+        ses / "fmap" / "sub-01_ses-01_dir-PA_epi.nii.gz",
+        {"PhaseEncodingDirection": "j", "TotalReadoutTime": 0.05},
+    )
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert fg.fmap_id == "PA"
+    assert fg.forward_path is None
+    assert fg.intended_runs == [("check", "01")]
+
+
+def test_same_polarity_fmaps_do_not_pair(tmp_path: Path):
+    """Two dir labels but the SAME PE direction is not an opposite-PE pair —
+    merging them would hand blipflip two identically-distorted images."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    for run, t in (("01", "10:05:00"), ("02", "11:05:00")):
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-check_run-{run}_bold.nii.gz",
+            {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-", "AcquisitionTime": t},
+        )
+    for d, t in (("AP", "10:00:00"), ("PA", "11:00:00")):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_dir-{d}_epi.nii.gz",
+            {"PhaseEncodingDirection": "j", "AcquisitionTime": t},
+        )
+    fmaps = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert sorted(f.fmap_id for f in fmaps) == ["AP", "PA"]
+    assert all(f.forward_path is None for f in fmaps)
+
+
+def test_fmap_pe_dir_pairs_when_sidecars_omit_phase_encoding(tmp_path: Path):
+    """quirk: some conversions write only InPlanePhaseEncodingDirectionDICOM (axis,
+    no sign) on both fmaps and runs — nothing identifies a polarity, so the pair is
+    recognisable but not orientable. Unpaired by default (and flagged);
+    ``-fmap_pe_dir`` names the runs' polarity and pairs it."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    for run, t in (("01", "10:00:30"), ("02", "10:05:00")):
+        _touch(
+            ses / "func" / f"sub-01_ses-01_task-check_run-{run}_part-mag_bold.nii.gz",
+            {
+                "RepetitionTime": 1.5,
+                "InPlanePhaseEncodingDirectionDICOM": "COL",
+                "AcquisitionTime": t,
+            },
+        )
+    # Unpaired, these fall through to AcquisitionTime assignment (as the real data
+    # does) — and each polarity ends up owning a different run, which is precisely
+    # the wrong answer pairing fixes.
+    for d, t in (("AP", "10:00:00"), ("PA", "10:01:00")):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_dir-{d}_run-01_part-mag_epi.nii.gz",
+            {
+                "InPlanePhaseEncodingDirectionDICOM": "COL",
+                "TotalReadoutTime": 0.05,
+                "AcquisitionTime": t,
+            },
+        )
+
+    plain = scan_subject(tmp_path, "01").sessions[0]
+    assert sorted(f.fmap_id for f in plain.fmaps) == ["AP-run01", "PA-run01"]
+    assert pair_undetermined(plain) == ["AP-run01", "PA-run01"]
+
+    paired = scan_subject(tmp_path, "01", fmap_pe_dir="AP").sessions[0]
+    (fg,) = paired.fmaps
+    assert fg.fmap_id == "run01"
+    assert "dir-AP" in fg.forward_path.name
+    assert "dir-PA" in fg.reverse_path.name
+    assert fg.intended_runs == [("check", "01"), ("check", "02")]  # one fmap, both runs
+    assert pair_undetermined(paired) == []
+
+
+def test_fmap_pe_dir_from_the_runs_own_dir_entity(tmp_path: Path):
+    """A run carrying its own ``dir`` entity names the forward polarity itself — no
+    flag needed."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    _touch(
+        ses / "func" / "sub-01_ses-01_task-check_dir-PA_run-01_bold.nii.gz",
+        {"RepetitionTime": 1.5},
+    )
+    for d in ("AP", "PA"):
+        _touch(ses / "fmap" / f"sub-01_ses-01_dir-{d}_epi.nii.gz", {"TotalReadoutTime": 0.05})
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert "dir-PA" in fg.forward_path.name  # matches the runs
+    assert "dir-AP" in fg.reverse_path.name
 
 
 def test_anat_prefers_uni(tmp_path: Path):

@@ -331,12 +331,16 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         has_fmaps = bool(sess.fmaps) and opt.distortion
         # First run of the session anchors xrun when there are no fmaps.
         session_first_run = sess.bold_runs[0].run if sess.bold_runs else None
-        # Each fmap group's DISTORTED forward = the (first intended run's) blip_up
-        # image — the same image _stage_blip feeds to ffs_blipflip. This is the
-        # xrun base for that group.
+        # Each fmap group's DISTORTED forward = the blip_up image _stage_blip feeds
+        # to ffs_blipflip, and hence the xrun base for that group: the fmap's own
+        # matched-PE mate when it has one (self-contained AP/PA pair), else the
+        # first intended run's rep.
         forward_by_fmap: dict[str, str] = {}
         if has_fmaps:
             for fg in sess.fmaps:
+                if fg.forward_path is not None:
+                    forward_by_fmap[fg.fmap_id] = str(fg.forward_path)
+                    continue
                 for b in sess.bold_runs:
                     if (b.task, b.run) in fg.intended_runs:
                         forward_by_fmap[fg.fmap_id] = str(b.rep)

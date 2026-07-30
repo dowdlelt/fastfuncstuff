@@ -222,9 +222,16 @@ class BoldRun:
 class FmapGroup:
     """A reverse-PE fieldmap and the runs it corrects.
 
-    ``reverse_path`` is the blip-down (opposite PE) image; the forward (blip-up)
-    reference is the intended runs' SBRef/mean, filled in by the emitter. Runs
-    are associated via ``IntendedFor`` when present, else by task+session.
+    ``reverse_path`` is the blip-down (opposite PE) image. The forward (blip-up)
+    image is ``forward_path`` when ``fmap/`` supplies its own matched-PE mate
+    (the AP/PA pair case — the pair is self-contained, so the correction never
+    borrows a data run); otherwise it is None and the emitter uses the first
+    intended run's SBRef/mean. Runs are associated via ``IntendedFor`` when
+    present, else by task+session.
+
+    ``json`` is the sidecar of the image whose distorted space the estimated
+    field lives in: the forward image for a pair, the lone reverse image
+    otherwise.
     """
 
     session: str | None
@@ -234,6 +241,7 @@ class FmapGroup:
     # (task, run) pairs — run numbers repeat across tasks, so the pair is the
     # unique run identity this fmap corrects.
     intended_runs: list[tuple[str, str]] = field(default_factory=list)
+    forward_path: Path | None = None
 
     @property
     def run_ids(self) -> list[str]:
@@ -311,6 +319,7 @@ def scan_subject(
     subject: str,
     sessions: list[str] | None = None,
     tasks: list[str] | None = None,
+    fmap_pe_dir: str | None = None,
 ) -> Subject:
     """Scan one subject into a :class:`Subject` tree.
 
@@ -318,6 +327,10 @@ def scan_subject(
     labels or full ``ses-``/``task-`` forms). Returns sessions and runs in
     directory-sorted order; run numbers are taken as-found (never assumed
     contiguous).
+
+    ``fmap_pe_dir`` names the ``dir`` label whose polarity matches the BOLD runs
+    (e.g. ``AP``) — needed to pair opposite-PE fieldmaps when the sidecars omit
+    ``PhaseEncodingDirection``. See :func:`_pick_pe_pair`.
     """
     bids_root = Path(bids_root)
     sub_label = _norm_id(subject, "sub-")
@@ -337,7 +350,7 @@ def scan_subject(
         ses_label = _norm_id(sdir.name, "ses-") if sdir.name.startswith("ses-") else None
         if want_ses is not None and ses_label not in want_ses:
             continue
-        sess = _scan_session(sdir, bids_root, sub_label, ses_label, want_task)
+        sess = _scan_session(sdir, bids_root, sub_label, ses_label, want_task, fmap_pe_dir)
         if sess.bold_runs:
             out.sessions.append(sess)
     return out
@@ -349,6 +362,7 @@ def _scan_session(
     sub_label: str,
     ses_label: str | None,
     want_task: set[str] | None,
+    fmap_pe_dir: str | None = None,
 ) -> Session:
     sess = Session(session=ses_label)
 
@@ -405,23 +419,35 @@ def _scan_session(
     # ---- fmap: reverse-PE images (conventional epi OR task-tagged bold/sbref) ----
     fmap_dir = sdir / "fmap"
     if fmap_dir.is_dir():
-        sess.fmaps = _scan_fmaps(fmap_dir, bids_root, sess.bold_runs)
+        sess.fmaps = _scan_fmaps(fmap_dir, bids_root, sess.bold_runs, fmap_pe_dir)
 
     # ---- anat: prefer acq-uni T1w (MP2RAGE), else first T1w / MPRAGE ----
     sess.anat = _pick_anat(sdir)
     return sess
 
 
-def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> list[FmapGroup]:
+def _scan_fmaps(
+    fmap_dir: Path,
+    bids_root: Path,
+    bold_runs: list[BoldRun],
+    fmap_pe_dir: str | None = None,
+) -> list[FmapGroup]:
     """Build FmapGroups from the reverse-PE images in ``fmap/``.
 
-    Preference order for the representative reverse image within a group:
-    SBRef > EPI > BOLD (SBRef is cleanest). Grouping key is the ``task`` entity
-    when present (Fieldmaps could betask-tagged), else ``dir``+``run`` (conventional
-    epi). ``acq`` is *not* a group key: ``acq-bold``/``acq-sbref`` are two forms
-    of one fieldmap, not two fieldmaps.
+    Preference order for the representative image within a group: SBRef > EPI >
+    BOLD (SBRef is cleanest). Grouping key is the ``task`` entity when present
+    (Fieldmaps could betask-tagged), else ``run`` (conventional epi). ``acq`` is
+    *not* a group key: ``acq-bold``/``acq-sbref`` are two forms of one fieldmap,
+    not two fieldmaps.
+
+    ``dir`` is not a group key either, for the same reason one step out: when
+    ``fmap/`` holds both PE polarities of the same acquisition (dir-AP + dir-PA),
+    that opposite-PE *pair* is one fieldmap — a self-contained correction that no
+    data run contributes to. Only when a polarity stands alone does ``dir`` split
+    groups (the fmap is then the reverse image and a data run is the forward).
     """
-    candidates: dict[str, dict] = {}
+    # tag -> dir (or "" when absent) -> form -> (path, sidecar)
+    candidates: dict[str, dict[str, dict[str, tuple[Path, dict]]]] = {}
     for nf in sorted(fmap_dir.glob("*.nii*")):
         if not _NIFTI_RE.search(nf.name):
             continue
@@ -429,38 +455,53 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
         if _is_phase(nf, ents, bids_root):
             continue  # phase fmap unused this milestone
         suffix = parse_suffix(nf.name)
-        # One group per DISTINCT fieldmap = task and/or run (and dir), but NOT acq
-        # — acq-bold/acq-sbref are two forms of one fieldmap. A task-tagged fmap
-        # with a run (SKILLED: task-skilled_dir-PA_run-1/2/3) is several fmaps, so
-        # the run must be in the key or they'd collapse into one.
+        # One group per DISTINCT fieldmap = task and/or run, but NOT acq — those
+        # are two forms of one fieldmap. A task-tagged fmap with a run (SKILLED:
+        # task-skilled_dir-PA_run-1/2/3) is several fmaps, so the run must be in
+        # the key or they'd collapse into one.
         task, run, d = ents.get("task"), ents.get("run"), ents.get("dir")
-        if task:
-            tag = task + (f"-run{run}" if run else "")
-        else:
-            tag = f"{d or 'x'}" + (f"-run{run}" if run else "")
+        tag = (task or "") + (f"-run{run}" if run else "")
         # Form within the group: acq (bold/sbref) refines the plain suffix so the
         # SBRef form wins the preference below even for conventional epi fmaps.
         form = ents.get("acq") or suffix or "epi"
-        slot = candidates.setdefault(tag, {})
-        slot[form] = (nf, load_sidecar(nf, bids_root))
+        candidates.setdefault(tag, {}).setdefault(d or "", {})[form] = (
+            nf,
+            load_sidecar(nf, bids_root),
+        )
 
     groups: list[FmapGroup] = []
-    for tag, slot in candidates.items():
-        for key in ("sbref", "epi", "bold"):
-            if key in slot:
-                nf, js = slot[key]
-                break
-        else:
-            continue
-        groups.append(
-            FmapGroup(
-                session=bold_runs[0].session if bold_runs else None,
-                fmap_id=tag,
-                reverse_path=nf,
-                json=js,
-                intended_runs=_resolve_intended(js, tag, bold_runs),
+    for tag, by_dir in candidates.items():
+        picks = {d: p for d, slot in by_dir.items() if (p := _pick_form(slot)) is not None}
+        pair = _pick_pe_pair(picks, bold_runs, fmap_pe_dir)
+        if pair is not None:
+            fwd_dir, rev_dir = pair
+            fwd_nf, fwd_js = picks[fwd_dir]
+            rev_nf, _ = picks[rev_dir]
+            gid = tag.lstrip("-") or f"{fwd_dir}-{rev_dir}"
+            groups.append(
+                FmapGroup(
+                    session=bold_runs[0].session if bold_runs else None,
+                    fmap_id=gid,
+                    reverse_path=rev_nf,
+                    json=fwd_js,
+                    forward_path=fwd_nf,
+                    intended_runs=_resolve_intended(fwd_js, gid, bold_runs),
+                )
             )
-        )
+            continue
+        for d, (nf, js) in picks.items():
+            # Unpaired: the dir carries real information (which polarity this is),
+            # so it goes back into the id — unless a task already names the group.
+            gid = tag if tag and not tag.startswith("-") else f"{d or 'x'}{tag}"
+            groups.append(
+                FmapGroup(
+                    session=bold_runs[0].session if bold_runs else None,
+                    fmap_id=gid,
+                    reverse_path=nf,
+                    json=js,
+                    intended_runs=_resolve_intended(js, gid, bold_runs),
+                )
+            )
 
     # Keep only (task, run) pairs that are actually in scope. Because the pair
     # carries the task, this drops an out-of-scope fmap (e.g. a task-floc fmap
@@ -481,6 +522,81 @@ def _scan_fmaps(fmap_dir: Path, bids_root: Path, bold_runs: list[BoldRun]) -> li
         groups[0].intended_runs = [(r.task, r.run) for r in bold_runs]
         return groups
     return served
+
+
+def _pick_form(slot: dict[str, tuple[Path, dict]]) -> tuple[Path, dict] | None:
+    """Representative image for one fieldmap acquisition: SBRef > EPI > BOLD."""
+    for key in ("sbref", "epi", "bold"):
+        if key in slot:
+            return slot[key]
+    return None
+
+
+def _pe_axis_sign(js: dict) -> tuple[str, int] | None:
+    """``PhaseEncodingDirection`` as (axis letter, +1/-1), or None if absent."""
+    pe = js.get("PhaseEncodingDirection")
+    if not pe:
+        return None
+    pe = str(pe)
+    return pe[0], (-1 if pe.endswith("-") else 1)
+
+
+# Conventional opposite ``dir`` labels, used only to *recognise* a pair when the
+# sidecars omit PhaseEncodingDirection. These names are convention, not BIDS.
+_OPPOSITE_DIRS = {"ap": "pa", "pa": "ap", "lr": "rl", "rl": "lr", "is": "si", "si": "is"}
+
+
+def _pick_pe_pair(
+    picks: dict[str, tuple[Path, dict]],
+    bold_runs: list[BoldRun],
+    fmap_pe_dir: str | None = None,
+) -> tuple[str, str] | None:
+    """Find the opposite-PE pair among one tag's ``dir`` variants, as
+    ``(forward_dir, reverse_dir)``; None when there is no usable pair.
+
+    Forward is the polarity that matches the BOLD runs. This is not cosmetic:
+    ffs_blipflip estimates the field in the *blip_up* image's distorted space, so
+    naming the wrong side forward would apply the correction backwards and double
+    the distortion instead of removing it. Three ways to know, in order:
+
+    1. ``PhaseEncodingDirection`` on the fmap sidecars vs the runs' — the real answer.
+    2. the runs' own ``dir`` entity (present on some datasets that omit the PE field).
+    3. ``fmap_pe_dir`` (``-fmap_pe_dir``), the user naming the runs' polarity.
+
+    quirk: some conversions write only ``InPlanePhaseEncodingDirectionDICOM``
+    (axis, no sign) on *both* the fmaps and the runs — nothing there identifies a
+    polarity. Such a pair is recognisable by its ``dir`` labels but not
+    orientable, so it stays unmerged (one group per polarity, the pre-pairing
+    behaviour) and ``pair_undetermined`` flags it for the caller to warn about.
+    """
+    if len(picks) < 2:
+        return None
+    axes = {d: _pe_axis_sign(js) for d, (_nf, js) in picks.items()}
+    run_pe = next((pe for r in bold_runs if (pe := _pe_axis_sign(r.json)) is not None), None)
+    if run_pe is not None and all(v is not None for v in axes.values()):
+        fwd = [d for d, v in axes.items() if v == run_pe]
+        rev = [d for d, v in axes.items() if v[0] == run_pe[0] and v[1] != run_pe[1]]
+        return (fwd[0], rev[0]) if fwd and rev else None
+    # No usable PE signs. Fall back to the dir labels, which only work as a pair.
+    forward = fmap_pe_dir or next(
+        (d for r in bold_runs if (d := parse_entities(r.mag_path.name).get("dir"))), None
+    )
+    if forward is None:
+        return None
+    fwd = [d for d in picks if d.lower() == forward.lower()]
+    rev = [d for d in picks if d.lower() == _OPPOSITE_DIRS.get(forward.lower())]
+    return (fwd[0], rev[0]) if fwd and rev else None
+
+
+def pair_undetermined(session: Session) -> list[str]:
+    """``dir`` labels that look like an opposite-PE pair the scanner could not
+    orient — the sidecars carry no polarity and nothing named the runs'. Each such
+    fieldmap fell back to borrowing a data run as its forward image, which works
+    but wastes the acquired mate; ``-fmap_pe_dir`` resolves it.
+    """
+    labels = [f.fmap_id for f in session.fmaps if f.forward_path is None]
+    bare = {lab.split("-")[0].lower() for lab in labels}
+    return sorted(lab for lab in labels if _OPPOSITE_DIRS.get(lab.split("-")[0].lower()) in bare)
 
 
 def _assign_by_time(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> bool:
