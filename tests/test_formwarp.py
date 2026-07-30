@@ -178,6 +178,71 @@ def test_formwarp_noxdis_zeros_x_component():
     assert res.moving_to_mid[1].abs().max().item() > 0.1
 
 
+def test_data_coverage_mask_peels_only_a_clipped_fov():
+    """All-true (and un-eroded) on a full volume; the zero wedge plus its resampling
+    ramp is excluded when one is present."""
+    from fastfuncstuff.processing.mask import data_coverage_mask
+
+    full = _blobs(12, 14, 16) + 1.0  # strictly nonzero everywhere
+    assert bool(data_coverage_mask(full, erode=2).all())  # no wedge => no peel
+
+    clipped = full.clone()
+    clipped[:, :, :4] = 0.0
+    cov = data_coverage_mask(clipped, erode=1)
+    assert not bool(cov[:, :, :5].any())  # wedge + one peeled ramp voxel
+    assert bool(cov[2:-2, 2:-2, 6:-2].all())  # interior untouched
+
+    raw = data_coverage_mask(clipped, erode=0)
+    assert torch.equal(raw, clipped != 0)
+
+
+def test_coverage_fill_beats_coverage_exclusion_on_a_clipped_wedge():
+    """A source whose FoV was clipped must not have tissue dragged into the empty wedge.
+
+    What makes this work is that the CC's *window statistics* are weighted, not just
+    its outer sum. Weighting only the sum decides which windows count but not what goes
+    into one, so every window within cc_radius of the boundary still averaged in the
+    void and chased the tissue/nothing cliff. Accumulating the boxes under the weight
+    means a boundary window measures only its covered part, and the cliff stops
+    existing as far as the metric is concerned.
+    """
+    from fastfuncstuff.processing.mask import data_coverage_mask
+
+    nz, ny, nx = 20, 32, 28
+    fixed = _blobs(nz, ny, nx) + 0.2
+    moving = _blobs(nz, ny, nx, shift=(0.0, 1.5, 0.0)) + 0.2
+    cut = 14  # the source lost everything below y < cut
+    moving[:, :cut, :] = 0.0
+
+    cfg = SynConfig(
+        metric="cc",
+        cc_radius=3,
+        grad_step=0.4,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(25, 25),
+        verb=0,
+    )
+    cover = data_coverage_mask(moving, erode=1)
+
+    free = formwarp(fixed, moving, config=cfg, device=DEVICE)
+    excl = formwarp(fixed, moving, mask=cover.float(), config=cfg, device=DEVICE)
+    fill = formwarp(fixed, moving, moving_cover=cover, config=cfg, device=DEVICE)
+
+    # Displacement reaching down the clipped axis, in the band just above the cut.
+    def stretch(res) -> float:
+        return res.fwd[1][:, : cut + 4, :].abs().max().item()
+
+    assert stretch(excl) < 0.3 * stretch(free)
+    assert stretch(fill) < 0.3 * stretch(free)
+    # No tissue dragged into the wedge, and the output keeps honest zeros there
+    # (the fill is for the metric only -- it must never reach the warped image).
+    assert fill.warped[:, : cut - 2, :].abs().max() < 0.1 * free.warped[:, : cut - 2, :].max()
+    # The shared-support region is registered at least as well, not worse.
+    resid = lambda w: ((fixed - w)[:, cut + 2 :, :] ** 2).mean().item()  # noqa: E731
+    assert resid(fill.warped) <= resid(free.warped)
+
+
 def test_cli_timeseries_5d_and_folder_match(tmp_path):
     """CLI timeseries mode (4D -source): per-volume SyN writes a 4D warped series
     plus a warp series in both -warp_format modes, and the two formats agree."""

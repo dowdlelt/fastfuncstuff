@@ -3061,3 +3061,153 @@ def run_batch_jobs(
         for label, reason in failures:
             print(f"  {label}: {reason}", file=sys.stderr)
         sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Data coverage / brain masking, shared by the registration CLIs
+# ---------------------------------------------------------------------------
+
+
+def add_coverage_args(parser, automask_help: str | None = None) -> None:
+    """Register the shared ``-automask*`` / data-coverage flags on a registration CLI.
+
+    ffs_formwarp, ffs_optiwarp and ffs_qwarp all face the same problem -- a source
+    resampled onto the base grid carries an empty wedge where its FoV was clipped, and
+    a metric that can see that wedge's edge will warp real tissue into it -- so they
+    share one set of flags and one meaning for each.
+    """
+    g = parser.add_argument_group("Masking / data coverage")
+    g.add_argument(
+        "-automask",
+        action="store_true",
+        help=automask_help
+        or "Restrict the metric to the automask of BOTH images (unioned; see "
+        "-automask_intersect). Independent of the data-coverage restriction below.",
+    )
+    g.add_argument(
+        "-automask_base", "-automask-base", action="store_true", help="Automask the base only."
+    )
+    g.add_argument(
+        "-automask_source",
+        "-automask-source",
+        action="store_true",
+        help="Automask the source only.",
+    )
+    g.add_argument(
+        "-automask_intersect",
+        "-automask-intersect",
+        action="store_true",
+        help="Intersect the two automasks instead of unioning them. Stricter, but one "
+        "image's automask failure (common where a FoV fades in over several slices) "
+        "then vetoes the other image's good data.",
+    )
+    g.add_argument(
+        "-nocoverage",
+        "-no_coverage",
+        "-no-coverage",
+        action="store_true",
+        help="Do not treat non-finite/zero voxels as missing data. By default each "
+        "image's empty region is excluded from the metric AND filled from the other "
+        "image, so a clipped FoV presents no artificial edge for the warp to chase. "
+        "Use this when a zero background is a REAL edge you want registered -- a "
+        "skull-stripped anatomical, say -- rather than data loss.",
+    )
+    g.add_argument(
+        "-void_guard",
+        "-void-guard",
+        type=float,
+        default=1.0,
+        help="Strength (0..1) of the no-data-boundary guard: near a coverage boundary, "
+        "remove this fraction of the update that points along the boundary's normal "
+        "(i.e. into the void), leaving both tangential directions free. This is the "
+        "general form of -noZdis for a void that happens to lie below the brain: it "
+        "blocks only the direction that reaches into missing data, so an in-plane "
+        "shift along that same edge still happens. 0 disables.",
+    )
+    g.add_argument(
+        "-coverage_erode",
+        "-coverage-erode",
+        type=int,
+        default=1,
+        help="Voxels to peel off the data-coverage boundary (default 1), removing the "
+        "partial-value ramp resampling leaves at a clipped FoV edge. 0 keeps the raw "
+        "nonzero region. The peel also trims the volume's own outer faces, so keep it "
+        "small.",
+    )
+
+
+def sanitize_volume(vol: torch.Tensor, label: str, verb: int) -> torch.Tensor:
+    """Replace non-finite voxels with 0, loudly.
+
+    Must happen before anything else touches the volume. ``automask``'s clip level
+    comes out NaN on a NaN-bearing image and it returns an *empty* mask; ``!= 0`` is
+    True for NaN so a coverage test passes the whole void through as valid data; and
+    NaN survives every smoothing kernel, so one bad slab makes a whole metric NaN. A
+    NaN rim is common in the wild -- anything that divides by the data turns the
+    exact-zero background into NaN, leaving a volume with an empty slab and not one
+    zero in it -- and every one of those failures is silent.
+    """
+    n_bad = int((~torch.isfinite(vol)).sum().item())
+    if n_bad:
+        if verb >= 1:
+            print(
+                f"WARNING: {label} has {n_bad:,} non-finite voxels "
+                f"({100.0 * n_bad / vol.numel():.1f}%) -- treating as no-data (0)"
+            )
+        vol = torch.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
+    return vol
+
+
+def image_support(
+    vol: torch.Tensor,
+    args,
+    device: torch.device,
+    want_automask: bool,
+    label: str,
+    verb: int,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """One image's ``(brain, cover)`` masks: where is the object, where is the data.
+
+    Two different questions with two different jobs. ``cover`` (finite and nonzero) is
+    both excluded from the metric and cross-filled, because a missing-data boundary is
+    an artificial cliff that must not exist as far as the metric is concerned.
+    ``brain`` only ever damps the metric -- an automask boundary is real anatomy, and
+    filling across it would splice one image's skull into the other's.
+    """
+    from fastfuncstuff.processing.mask import automask, data_coverage_mask
+
+    v = vol.float().to(device)
+    brain = None
+    if want_automask:
+        brain = automask(v, device=device)
+        if verb >= 1:
+            print(f"Automask ({label}): {100.0 * brain.float().mean().item():.1f}% of voxels")
+    cover = None
+    if not args.nocoverage:
+        cover = data_coverage_mask(v, erode=args.coverage_erode, device=device)
+        if verb >= 1:
+            frac = 100.0 * cover.float().mean().item()
+            if frac < 99.95:
+                print(f"Coverage ({label}): {frac:.1f}% of voxels hold data")
+    return brain, cover
+
+
+def combine_brain_masks(
+    base_brain: torch.Tensor | None,
+    src_brain: torch.Tensor | None,
+    intersect: bool = False,
+) -> torch.Tensor | None:
+    """Union (default) the two brain masks, or intersect them if asked.
+
+    Union is the default because automask fails asymmetrically: on a partially covered
+    slice (a FoV that fades in over several slices rather than cutting cleanly) the
+    clip-level test and the peel erosion reject real tissue, and intersecting lets one
+    image's failure veto the other's perfectly good data. Measured on a 9.4T pair whose
+    source coverage ramps in over ~10 slices, intersecting deleted 40% of the evaluable
+    voxels in that band and bought nothing (edge-band correlation 0.9067 intersected vs
+    0.9094 unioned). Data coverage is the constraint to trust; a brain mask is a soft
+    preference, so let either image vouch for a voxel.
+    """
+    if base_brain is None or src_brain is None:
+        return base_brain if src_brain is None else src_brain
+    return base_brain & src_brain if intersect else base_brain | src_brain

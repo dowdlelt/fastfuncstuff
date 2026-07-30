@@ -27,3 +27,31 @@ def test_cliplevel_runs_on_large_volume():
     vol = torch.rand(300, 300, 300)
     clip = _cliplevel(vol)
     assert clip > 0
+
+
+def test_automask_survives_nan_and_coverage_excludes_it():
+    """NaN is not brain, and it is not data either.
+
+    Both were silent failures: the clip level came out NaN so every ``vol >= clip``
+    was False and ``automask`` returned an *empty* mask, while ``vol != 0`` is True
+    for NaN so a coverage test passed the whole void through as valid. A NaN rim is
+    common in the wild -- anything that divides by the data turns the exact-zero
+    background into NaN, leaving a volume with an empty slab and not one zero in it.
+    """
+    from fastfuncstuff.processing.mask import automask, data_coverage_mask
+
+    zz, yy, xx = torch.meshgrid(
+        *(torch.arange(n, dtype=torch.float32) for n in (20, 24, 24)), indexing="ij"
+    )
+    # A blob on a faint but nonzero background, so "brain" and "has data" differ.
+    vol = torch.exp(-(((xx - 12) / 6) ** 2 + ((yy - 12) / 6) ** 2 + ((zz - 10) / 5) ** 2)) + 0.02
+    clean = automask(vol)
+    assert 0.05 < clean.float().mean() < 0.95  # a sane mask to compare against
+
+    poisoned = vol.clone()
+    poisoned[:4] = float("nan")  # a clipped slab, spelled NaN rather than 0
+    assert automask(poisoned).float().mean() > 0.5 * clean.float().mean()
+
+    cover = data_coverage_mask(poisoned, erode=0)
+    assert not bool(cover[:4].any())
+    assert bool(cover[6:].all())

@@ -259,3 +259,42 @@ def test_cross_contrast_pair_registers_with_gradmag():
     err = torch.sqrt(sum((res.fwd[i][core] - truth[i][core]) ** 2 for i in range(3))).mean()
     truth_mag = torch.sqrt(sum(truth[i][core] ** 2 for i in range(3))).mean()
     assert err < 0.5 * truth_mag, f"field error {err:.3f} vs truth {truth_mag:.3f}"
+
+
+def test_data_coverage_stops_flow_into_a_clipped_wedge():
+    """A clipped source must not have tissue dragged into its empty region.
+
+    Matters more for optical flow than for SyN: ``-match gradmag`` registers gradient
+    magnitude, and the tissue/nothing cliff at a clipped FoV is the strongest gradient
+    in the volume. Masking the *update* is not enough on its own either -- the local
+    statistics behind ``prep_intensity`` and the Lucas-Kanade structure tensor are box
+    sums, so a window near the boundary is built partly from the void unless the weight
+    is folded into those sums too.
+    """
+    from fastfuncstuff.processing.mask import data_coverage_mask
+
+    shape = (20, 32, 28)
+    fixed = _blobs(shape, seed=0)
+    moving = warp_image_linear(fixed, *_smooth_field(shape, 1.5, seed=3))
+    cut = 14  # the source lost everything below y < cut
+    moving = moving.clone()
+    moving[:, :cut, :] = 0.0
+    cover = data_coverage_mask(moving, erode=1)
+
+    cfg = OptiwarpConfig(
+        shrink_factors=(2, 1), smoothing_sigmas=(1.0, 0.0), iterations=(30, 30), verb=0
+    )
+    free = optiwarp(fixed, moving, config=cfg)
+    held = optiwarp(fixed, moving, moving_cover=cover, config=cfg)
+
+    def stretch(res) -> float:
+        return res.fwd[1][:, : cut + 4, :].abs().max().item()
+
+    assert stretch(held) < 0.5 * stretch(free)
+    # The fill is metric/force only -- the warped output keeps honest zeros. (Loose
+    # ratio, not an absolute: this phantom's background is already near zero, so the
+    # headroom between "dragged in" and "empty" is small in absolute terms.)
+    assert held.warped[:, : cut - 2, :].abs().max() < 0.3 * free.warped[:, : cut - 2, :].max()
+    # And the region that does have data is registered at least as well.
+    resid = lambda w: ((fixed - w)[:, cut + 2 :, :] ** 2).mean().item()  # noqa: E731
+    assert resid(held.warped) <= resid(free.warped)

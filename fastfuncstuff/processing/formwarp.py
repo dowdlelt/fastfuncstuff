@@ -58,6 +58,7 @@ from .cost import (
     pearson_correlation,
 )
 from .interp import _grid_sample_3d, trilinear_interpolate, warp_image
+from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 
 _EPS = 1e-6
@@ -125,6 +126,11 @@ class SynConfig:
     once the (range-normalized) downward slope of cost over the window falls below
     this — i.e. the cost has flattened. Larger = stop sooner."""
 
+    void_guard: float = 1.0
+    """Strength (0..1) of the no-data-boundary guard: how much of the void-normal
+    component of each update is removed near a coverage boundary. 0 disables it.
+    Only has an effect when the caller supplies coverage masks."""
+
     warp_flags: int = 0
     """Bit flags: 1=no-x-disp, 2=no-y-disp, 4=no-z-disp (matches qwarp)."""
 
@@ -176,17 +182,29 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     out of ``cov^2/(varA*varB)``), so we compute it from normalized box means. The
     autograd gradient of this is the exact local-CC update field that the fluid
     smoothing then regularizes.
+
+    The window statistics are **weighted**. Weighting only the outer sum decides which
+    windows count but not what goes into one, so a window near the edge of the mask
+    still averages in everything the mask was meant to exclude: the no-data void, and
+    the air beside the brain. Both wreck the gradient exactly where the deformation is
+    largest -- a void cross-filled from the other image correlates perfectly and
+    inflates the local CC, so real misalignment in the rest of the window produces a
+    weak update, and the tissue at the boundary refuses to move. Accumulating every
+    box under ``w`` instead means a boundary window measures only its valid part: full
+    drive from the real tissue, nothing from the void or the air. With ``w`` constant
+    this is algebraically identical to the unweighted form.
     """
     r = float(radius)
 
     def box(v: Tensor) -> Tensor:
         return _separable_smooth_3d(v, r, kernel_type="box")
 
-    am = box(a)
-    bm = box(b)
-    cov = box(a * b) - am * bm
-    va = (box(a * a) - am * am).clamp(min=_EPS)
-    vb = (box(b * b) - bm * bm).clamp(min=_EPS)
+    wn = box(weight).clamp(min=_EPS)
+    am = box(weight * a) / wn
+    bm = box(weight * b) / wn
+    cov = box(weight * a * b) / wn - am * bm
+    va = (box(weight * a * a) / wn - am * am).clamp(min=_EPS)
+    vb = (box(weight * b * b) / wn - bm * bm).clamp(min=_EPS)
     cc = cov * cov / (va * vb)  # in [0, 1], higher = better
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 
@@ -241,6 +259,42 @@ def _smooth_field(xd: Tensor, yd: Tensor, zd: Tensor, sigma: float) -> Field:
         _separable_smooth_3d(yd, sigma, kernel_type="gauss"),
         _separable_smooth_3d(zd, sigma, kernel_type="gauss"),
     )
+
+
+def _void_guard_field(cover: Tensor, sigma: float = 2.0) -> tuple[Tensor, ...] | None:
+    """Local outward normal of a no-data region, plus a band weight around it.
+
+    Returns ``(nx, ny, nz, band)`` on ``cover``'s grid, or None if there is no void.
+
+    The point is that the constraint at a coverage boundary is **directional**, and
+    treating it isotropically throws away good deformation. Where a slab of missing
+    data sits below the brain, motion *down into it* is the artifact -- but an in-plane
+    shift along that same boundary is perfectly legitimate anatomy, and often exactly
+    what the registration needs. ``-noZdis`` gets this right by accident when the void
+    happens to be axis-aligned and nothing else in the volume needs z. Deriving the
+    normal from the coverage mask itself gets it right in general: it constrains the
+    one direction that reaches into the void, wherever the boundary is and however it
+    is oriented, and leaves the two tangential directions completely free.
+
+    The band weight is the normalized gradient magnitude, so the constraint is
+    strongest exactly at the boundary and fades smoothly to nothing in the interior --
+    no hard cutoff to tune, and identically zero for a volume with full coverage.
+    """
+    c = _separable_smooth_3d(cover.float(), sigma, kernel_type="gauss")
+    gz, gy, gx = torch.gradient(c)  # array dims are (z, y, x)
+    mag = torch.sqrt(gx * gx + gy * gy + gz * gz)
+    peak = mag.max()
+    if float(peak) < _EPS:
+        return None  # fully covered: nothing to guard against
+    inv = 1.0 / mag.clamp(min=_EPS)
+    return gx * inv, gy * inv, gz * inv, (mag / peak).clamp(0.0, 1.0)
+
+
+def _apply_void_guard(xd: Tensor, yd: Tensor, zd: Tensor, guard, strength: float) -> Field:
+    """Remove the void-normal component of an update field, scaled by the band weight."""
+    nx, ny, nz, band = guard
+    k = strength * band * (xd * nx + yd * ny + zd * nz)
+    return xd - k * nx, yd - k * ny, zd - k * nz
 
 
 def _apply_axis_flags(xd: Tensor, yd: Tensor, zd: Tensor, flags: int) -> Field:
@@ -362,6 +416,7 @@ def _syn_level(
     n_iter: int,
     config: SynConfig,
     level_tag: str = "",
+    guard: tuple[Tensor, ...] | None = None,
 ) -> tuple[Field, Field, Field, Field]:
     """Run up to ``n_iter`` symmetric SyN updates at one resolution.
 
@@ -427,6 +482,13 @@ def _syn_level(
         ufx, ufy, ufz = _smooth_field(ufx, ufy, ufz, config.update_var)
         umx, umy, umz = _smooth_field(umx, umy, umz, config.update_var)
 
+        # Then drop whatever of that update points into a no-data region, leaving the
+        # two tangential directions untouched. After the smoothing, so the fluid step
+        # cannot reintroduce a normal component from a neighbour.
+        if guard is not None:
+            ufx, ufy, ufz = _apply_void_guard(ufx, ufy, ufz, guard, config.void_guard)
+            umx, umy, umz = _apply_void_guard(umx, umy, umz, guard, config.void_guard)
+
         # Normalize the joint update so the largest displacement step is grad_step.
         norm = torch.sqrt(ufx**2 + ufy**2 + ufz**2 + umx**2 + umy**2 + umz**2)
         scale = config.grad_step / norm.max().clamp(min=_EPS)
@@ -456,6 +518,17 @@ def _syn_level(
         bar.close()
     if config.verb >= 1:
         print(f"  {level_tag}: {len(costs)} iters, best cost {best_cost:.5f}")
+
+    # Every iteration's cost was non-finite, so best-restore handed back the fields we
+    # started with: this level did nothing, and the run would go on to write an
+    # identity warp as though it had succeeded. Fail loudly instead -- the cause is in
+    # the inputs (non-finite voxels, an all-constant image, an empty mask), not here.
+    if best_cost == float("inf"):
+        raise ValueError(
+            f"{level_tag}: metric was non-finite on every iteration, so no warp could be "
+            "estimated. Check the base/source for NaN/Inf or constant-valued data, and "
+            "that the metric mask/weight is not empty."
+        )
 
     return best_fields
 
@@ -504,6 +577,8 @@ def formwarp(
     moving: Tensor,
     weight: Tensor | None = None,
     mask: Tensor | None = None,
+    fixed_cover: Tensor | None = None,
+    moving_cover: Tensor | None = None,
     config: SynConfig | None = None,
     device: torch.device | None = None,
 ) -> SynResult:
@@ -514,6 +589,9 @@ def formwarp(
         moving: (nz, ny, nx) moving image to deform (the ``-source``).
         weight: Optional (nz, ny, nx) weight image (metric emphasis). Defaults to ones.
         mask: Optional (nz, ny, nx) mask; restricts the metric to mask>0.
+        fixed_cover: Optional (nz, ny, nx) mask of where ``fixed`` holds real data.
+        moving_cover: Optional (nz, ny, nx) mask of where ``moving`` holds real data.
+            Both are excluded from the metric *and* cross-filled (see below).
         config: :class:`SynConfig`. Uses defaults if None.
         device: Torch device. Inferred from ``fixed`` if None.
 
@@ -532,10 +610,42 @@ def formwarp(
     moving = moving.float().to(device)
     full_shape = tuple(fixed.shape)  # type: ignore[assignment]
 
+    # Non-finite voxels have to go before the metric ever sees them. NaN survives the
+    # CC box filter and every other smoothing here, spreading to the whole window, so
+    # a single NaN slab makes the cost NaN on iteration 1 -- and then no iteration
+    # beats the initial best, so every level returns the identity warp and the tool
+    # writes a plausible-looking file having done nothing. Zeroing them is not a data
+    # change we can avoid either way: grid_sample would smear the NaN across each
+    # interpolation neighbourhood on the final warp pass regardless. Callers should
+    # pair this with a coverage mask (mask/weight) so the zeroed rim doesn't become a
+    # phantom edge in its own right; see mask.data_coverage_mask.
+    n_bad = int((~torch.isfinite(fixed)).sum().item() + (~torch.isfinite(moving)).sum().item())
+    if n_bad:
+        if config.verb >= 1:
+            pct = 100.0 * n_bad / (2 * fixed.numel())
+            print(
+                f"WARNING: {n_bad:,} non-finite voxels ({pct:.1f}% of base+source) "
+                "treated as no-data (set to 0)"
+            )
+        fixed = torch.nan_to_num(fixed, nan=0.0, posinf=0.0, neginf=0.0)
+        moving = torch.nan_to_num(moving, nan=0.0, posinf=0.0, neginf=0.0)
+
     if weight is not None:
         weight = weight.float().to(device)
     if mask is not None:
         mask = mask.float().to(device)
+
+    # Exclude each image's no-data region from the metric and cross-fill it from the
+    # other image, so the void presents no edge for the warp to chase. The fill is for
+    # the METRIC ONLY -- ``moving`` is untouched, so the warped output below keeps
+    # honest zeros where the source had no data. See mask.cross_fill_no_data.
+    f_metric, m_metric, cover = cross_fill_no_data(fixed, moving, fixed_cover, moving_cover)
+    if cover is not None:
+        # Fold the shared support into whichever restriction the caller supplied.
+        if weight is not None:
+            weight = weight * cover.float()
+        else:
+            mask = cover.float() if mask is None else mask * cover.float()
 
     n_levels = len(config.shrink_factors)
     if not (len(config.smoothing_sigmas) == len(config.iterations) == n_levels):
@@ -555,8 +665,12 @@ def formwarp(
         target = _shrunk_shape(full_shape, factor)  # type: ignore[arg-type]
 
         # Pre-smooth (anti-alias) then shrink the images for this level.
-        f_lvl = _resize_volume(_separable_smooth_3d(fixed, sigma) if sigma > 0 else fixed, target)
-        m_lvl = _resize_volume(_separable_smooth_3d(moving, sigma) if sigma > 0 else moving, target)
+        f_lvl = _resize_volume(
+            _separable_smooth_3d(f_metric, sigma) if sigma > 0 else f_metric, target
+        )
+        m_lvl = _resize_volume(
+            _separable_smooth_3d(m_metric, sigma) if sigma > 0 else m_metric, target
+        )
 
         if weight is not None:
             w_lvl = _resize_volume(weight, target).clamp(min=0.0)
@@ -578,6 +692,12 @@ def formwarp(
                 f"iters={n_iter} metric={config.metric}"
             )
 
+        # Rebuilt per level: the normal is a grid-relative quantity, so it has to be
+        # measured on the grid the updates actually live on.
+        guard = None
+        if cover is not None and config.void_guard > 0.0:
+            guard = _void_guard_field(_resize_volume(cover.float(), target))
+
         phi_f, inv_f, phi_m, inv_m = _syn_level(
             f_lvl,
             m_lvl,
@@ -586,6 +706,7 @@ def formwarp(
             n_iter,
             config,
             level_tag=f"L{lev + 1}",
+            guard=guard,
         )
 
     # Restore to full resolution if the finest level was still shrunk.

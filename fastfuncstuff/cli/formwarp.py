@@ -30,10 +30,14 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_coverage_args,
     add_verbose_arg,
     collect_batch_jobs,
+    combine_brain_masks,
+    image_support,
     parse_prefix,
     run_batch_jobs,
+    sanitize_volume,
     spinner,
 )
 from fastfuncstuff.processing.formwarp import (
@@ -46,7 +50,7 @@ from fastfuncstuff.processing.formwarp import (
 )
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
-from fastfuncstuff.processing.mask import automask
+from fastfuncstuff.processing.mask import data_coverage_mask
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -206,9 +210,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Weight / mask
     p.add_argument("-weight", help="Weight image emphasizing the metric (overrides automask).")
-    p.add_argument(
-        "-automask", action="store_true", help="Restrict the metric to an automask of the base."
-    )
+    add_coverage_args(p)
 
     # Output interpolation
     p.add_argument(
@@ -321,6 +323,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     with spinner(f"Loading {Path(args.source).name}"):
         source, _ = load_image(args.source, device=torch.device("cpu"))
 
+    base = sanitize_volume(base, "-base", args.verb)
+    source = sanitize_volume(source, "-source", args.verb)
+
     if base.ndim == 4:
         if args.verb >= 1:
             print("WARNING: 4D -base; using vol[0] as the fixed target")
@@ -346,17 +351,35 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     if args.verb >= 1:
         print(f"Base/source: {nx}x{ny}x{nz}, loaded in {time.time() - t0:.1f}s")
 
-    # Weight / mask
+    # Weight / mask. The base side is pair-invariant, so build it once here; the
+    # source side depends on the volume being registered and is rebuilt per volume in
+    # timeseries mode (motion correction clips a different wedge out of every frame).
     weight = None
-    mask = None
     if args.weight is not None:
         with spinner(f"Loading {Path(args.weight).name}"):
             weight, _ = load_image(args.weight, device=torch.device("cpu"))
-    elif args.automask:
-        mask = automask(base.float().to(device), device=device).float()
-        if args.verb >= 1:
-            frac = 100.0 * (mask > 0).float().mean().item()
-            print(f"Automask: {frac:.1f}% of voxels inside brain")
+        weight = weight.float().to(device)
+
+    base_brain, base_cover = image_support(
+        base, args, device, args.automask or args.automask_base, "base", args.verb
+    )
+    # A source automask on the temporal mean, not per frame: the brain doesn't move
+    # between frames anywhere near enough to matter, and automask is far and away the
+    # most expensive thing here. Data coverage IS per frame -- see _run_timeseries.
+    src_ref = source.mean(dim=0) if source.ndim == 4 else source
+    src_brain, src_cover = image_support(
+        src_ref, args, device, args.automask or args.automask_source, "source", args.verb
+    )
+
+    # The brain masks damp the metric; the coverage masks are passed through so the
+    # engine can cross-fill as well as exclude.
+    brain = combine_brain_masks(base_brain, src_brain, args.automask_intersect)
+    mask = None
+    if brain is not None:
+        if weight is not None:
+            weight = weight * brain.float()
+        else:
+            mask = brain.float()
 
     warp_flags = 0
     if args.noXdis:
@@ -380,6 +403,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         iterations=_int_list(args.iters),
         convergence_window=args.conv_window,
         convergence_threshold=args.conv_thresh,
+        void_guard=args.void_guard,
         warp_flags=warp_flags,
         final_interp=args.final_interp,
         verb=args.verb,
@@ -390,10 +414,30 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     if timeseries:
         return _run_timeseries(
-            args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+            args,
+            base,
+            source,
+            weight,
+            mask,
+            base_cover,
+            config,
+            base_info,
+            prefix,
+            nii_ext,
+            device,
+            t0,
         )
 
-    res = formwarp(base, source, weight=weight, mask=mask, config=config, device=device)
+    res = formwarp(
+        base,
+        source,
+        weight=weight,
+        mask=mask,
+        fixed_cover=base_cover,
+        moving_cover=src_cover,
+        config=config,
+        device=device,
+    )
 
     warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
@@ -432,13 +476,16 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
 
 def _run_timeseries(
-    args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+    args, base, source, weight, mask, base_cover, config, base_info, prefix, nii_ext, device, t0
 ) -> int:
     """Register every volume of a 4D source to the 3D base (per-volume SyN).
 
     Writes the 4D warped series and, with -save_warp/-save_inverse, a per-volume
     warp series in the chosen -warp_format (one 5D file or a folder of 4D frames).
     -save_halfway is single-pair only and is ignored here.
+
+    Data coverage is recomputed per volume: motion correction clips a different wedge
+    out of every frame. The brain masks are not -- see _dispatch_run.
     """
     from tqdm import tqdm
 
@@ -453,12 +500,21 @@ def _run_timeseries(
     inv_frames: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
     quiet = config.verb
     for t in tqdm(range(n_t), desc="formwarp", disable=args.verb < 1, leave=True):
+        cover_t = (
+            None
+            if args.nocoverage
+            else data_coverage_mask(
+                source[t].float().to(device), erode=args.coverage_erode, device=device
+            )
+        )
         # Silence per-volume SyN chatter; the bar is the progress signal.
         res = formwarp(
             base,
             source[t],
             weight=weight,
             mask=mask,
+            fixed_cover=base_cover,
+            moving_cover=cover_t,
             config=replace(config, verb=0) if quiet else config,
             device=device,
         )
