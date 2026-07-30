@@ -920,6 +920,27 @@ def _run_shift_mode(
     )
 
     n_runs = len(n_tp_per_run)
+
+    # Loudly disown the flags this parametrisation does not read.  -model and
+    # -reg select a basis and a prior on basis coefficients; the shift model
+    # has neither, so passing them silently did nothing — a command reading
+    # "-model FLOBS -parametrization shift" would quietly fit the SPM
+    # canonical.  Shape comes from -shift-hrf and nowhere else.
+    ignored = [f for f in ("-model", "-reg") if any(a.startswith(f) for a in sys.argv[1:])]
+    if ignored:
+        print(
+            f"\n  WARNING: {', '.join(ignored)} {'is' if len(ignored) == 1 else 'are'} "
+            f"IGNORED with -parametrization shift.\n"
+            f"           This model has no basis coefficients, so there is no "
+            f"basis to choose\n"
+            f"           and no prior on coefficients to apply.  The response "
+            f"shape comes\n"
+            f"           from -shift-hrf (currently {args.shift_hrf!r}); the delay "
+            f"prior from\n"
+            f"           -delay-prior-sd.  Use -parametrization linear if you "
+            f"wanted {args.model}/{args.reg}."
+        )
+
     hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
     print("\n  Parametrisation: shift (amplitude + bounded latency per block)")
     print(

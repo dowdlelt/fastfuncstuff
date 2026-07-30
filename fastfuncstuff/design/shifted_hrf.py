@@ -344,6 +344,22 @@ def fit_shifted_hrf(
         durations=durations,
         device=device,
     )
+    # The gram table is (NB, G, NB, G) float64 — quadratic in BOTH the block
+    # count and the grid size.  That is fine for per-condition fits and for
+    # single-trial fits at a few hundred trials (500 trials × a 17-point grid
+    # = 578 MB) but it walls hard: 2000 trials is 9.2 GB.  Check before
+    # allocating so the failure is an actionable message rather than an OOM
+    # several minutes into a real run.
+    gram_bytes = (n_blocks * n_grid) ** 2 * 8
+    if gram_bytes > 4 * 1024**3:
+        raise MemoryError(
+            f"shifted-HRF gram table would need {gram_bytes / 1024**3:.1f} GB "
+            f"({n_blocks} blocks × {n_grid} grid points, and it is quadratic in "
+            f"both).  Options, cheapest first: coarsen -tau-step (halving the "
+            f"grid quarters this), narrow -tau-max, or fit per condition "
+            f"instead of per trial."
+        )
+
     bank = _project_out(bank, Z)  # (NB, G, T)
     # gram[b, g, b', g'] — the only thing the inner loop needs from the
     # time axis, computed once.
