@@ -37,6 +37,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
@@ -427,6 +428,10 @@ class FLOBSFitResult:
     # via ``return_vb_diagnostics`` in :func:`fit_basis_constrained_ridge`.
     sigma2_per_voxel: np.ndarray | None = None  # (n_vox,)
     lambda_per_voxel: np.ndarray | None = None  # (n_vox,) effective λ used
+    # Per-(voxel, block) inferred "size" parameter s from the cone prior
+    # (:func:`fit_basis_cone_prior`).  This is filmbabe's free amplitude
+    # scalar: β_b ≈ s_b · m.  ``None`` for every other fit path.
+    size_per_block: np.ndarray | None = None  # (n_vox, n_blocks)
 
 
 def fit_basis_constrained_ridge(
@@ -1028,6 +1033,426 @@ def fit_basis_constrained_ridge(
         n_iter=1,
         sigma2_per_voxel=sigma2_pv_np,
         lambda_per_voxel=lambda_pv_np,
+    )
+
+
+def _apply_block_precision(
+    v: Tensor,
+    P0: Tensor,
+    gam: Tensor,
+    n_blocks: int,
+    n_basis: int,
+) -> Tensor:
+    """Apply ``blockdiag(gam_b · P0)`` to the task part of ``v``.
+
+    ``v`` is (chunk, n_cols) with the first ``n_blocks × n_basis`` columns
+    holding the task blocks and the remainder nuisance (unpenalised).
+    ``gam`` is (chunk, n_blocks).  Never materialises the (n_cols, n_cols)
+    penalty — that is the whole point of the CG path.
+    """
+    n_task = n_blocks * n_basis
+    out = torch.zeros_like(v)
+    blk = v[:, :n_task].reshape(-1, n_blocks, n_basis)
+    # (chunk, n_blocks, K) @ (K, K) -> (chunk, n_blocks, K), then scale per block
+    out[:, :n_task] = (
+        torch.einsum("vbk,kl->vbl", blk, P0).mul_(gam.unsqueeze(-1)).reshape(-1, n_task)
+    )
+    return out
+
+
+def _cg_solve_batched(
+    rhs: Tensor,
+    XtX: Tensor,
+    P0: Tensor,
+    gam: Tensor,
+    lam: Tensor,
+    n_blocks: int,
+    n_basis: int,
+    L_pre: Tensor | None,
+    *,
+    tol: float = 1e-10,
+    max_iter: int = 200,
+) -> Tensor:
+    """Batched preconditioned CG for ``(XtX + λ_v·blockdiag(gam_vb·P0)) β = rhs``.
+
+    Each voxel has its own system (``gam`` and ``λ`` are per-voxel), so a
+    shared Cholesky is impossible — but the operator is SPD and its matvec
+    costs one ``(chunk, p) @ (p, p)`` product plus a per-block K×K apply.
+    ``L_pre`` is the Cholesky of a single representative system used as a
+    fixed preconditioner; it collapses the iteration count to a handful
+    because ``gam`` varies over a modest range across voxels.
+
+    Parameters
+    ----------
+    rhs : (chunk, n_cols)
+    lam : (chunk,) per-voxel prior weight.
+    L_pre : (n_cols, n_cols) lower Cholesky factor, or None for plain CG.
+
+    Returns
+    -------
+    (chunk, n_cols) solution.
+    """
+    lam_c = lam.unsqueeze(-1)  # (chunk, 1)
+
+    def A_mv(v: Tensor) -> Tensor:
+        return v @ XtX + lam_c * _apply_block_precision(v, P0, gam, n_blocks, n_basis)
+
+    def precond(r: Tensor) -> Tensor:
+        if L_pre is None:
+            return r
+        return torch.cholesky_solve(r.T, L_pre).T
+
+    x = torch.zeros_like(rhs)
+    r = rhs - A_mv(x)
+    z = precond(r)
+    p = z.clone()
+    rz = (r * z).sum(dim=1)  # (chunk,)
+    rhs_norm = rhs.norm(dim=1).clamp_min(1e-300)
+    for _ in range(max_iter):
+        Ap = A_mv(p)
+        denom = (p * Ap).sum(dim=1)
+        alpha = rz / torch.where(denom.abs() < 1e-300, torch.full_like(denom, 1e-300), denom)
+        x = x + alpha.unsqueeze(-1) * p
+        r = r - alpha.unsqueeze(-1) * Ap
+        if float((r.norm(dim=1) / rhs_norm).max()) < tol:
+            break
+        z = precond(r)
+        rz_new = (r * z).sum(dim=1)
+        beta_cg = rz_new / torch.where(rz.abs() < 1e-300, torch.full_like(rz, 1e-300), rz)
+        p = z + beta_cg.unsqueeze(-1) * p
+        rz = rz_new
+    return x
+
+
+def fit_basis_cone_prior(
+    data: np.ndarray | torch.Tensor,
+    design_task: np.ndarray | torch.Tensor,
+    basis_functions: np.ndarray,
+    prior_mean: np.ndarray,
+    prior_cov: np.ndarray,
+    n_blocks: int,
+    *,
+    nuisance: np.ndarray | torch.Tensor | None = None,
+    prior_weight: float | str = "auto",
+    device: torch.device | None = None,
+    lambda_mode: str = "voxelwise",
+    n_iter: int = 8,
+    tol: float = 1e-4,
+    size_floor: float = 1e-3,
+    reconstruct_hrfs: bool = False,
+    chunk_size: int | None = None,
+    verbose: bool = False,
+) -> FLOBSFitResult:
+    """Scale-invariant ("cone") shape prior — the faithful filmbabe form.
+
+    :func:`fit_basis_constrained_ridge` penalises ``(β − m)ᵀC⁻¹(β − m)``
+    with a **fixed** ``m``.  Because ``m`` from :func:`generate_flobs_basis`
+    is the coefficient vector of a *peak-normalised* HRF, that penalty is
+    an assertion about **amplitude** in data units, not about shape: every
+    voxel is dragged toward a response of peak ≈ ``‖m‖ / ‖β_peak1‖``
+    (0.80 for the default FLOBS basis — the flat maps reported in the
+    wiki note).  Measured bias on synthetic data: a true peak of 3.0 comes
+    back as 1.37, a true 0.2 as 0.72.
+
+    filmbabe does not do that.  In ``filmbabe_vb_flobs.cc`` the parameter
+    vector is augmented with a free per-EV "size" scalar ``s`` that never
+    enters the design (``Y = X·Q·β``, and ``Q`` drops it), and the penalty
+    is
+
+    .. math::
+
+        (\\beta_b - s_b m)^T P_0 (\\beta_b - s_b m) \\; / \\; s_b^2
+
+    with ``P₀ = C⁻¹``.  The ``1/s²`` factor is filmbabe's ``gam_Beta``.
+    This is a **cone**: β must lie near the ray ``{s·m}``, with tolerance
+    scaling as ``s``.  Amplitude is entirely free; only the *direction*
+    of β is constrained.
+
+    Minimising over ``s`` in closed form gives a purely angular penalty,
+
+    .. math::
+
+        s^* = \\frac{\\beta^T P_0 \\beta}{m^T P_0 \\beta}, \\qquad
+        \\text{penalty}(\\beta) = m^T P_0 m -
+            \\frac{(m^T P_0 \\beta)^2}{\\beta^T P_0 \\beta}
+        = \\|m\\|^2_{P_0}\\, \\sin^2\\theta_{P_0}(\\beta, m)
+
+    which is homogeneous of degree 0 in β — scale-invariant by
+    construction, and symmetric under ``β → −β`` so negative BOLD
+    responses are allowed with their shape still constrained.
+
+    Solved by IRLS, which is exactly filmbabe's alternation: hold ``s``
+    fixed (the problem is then quadratic), solve, update ``s = s*``,
+    repeat.  Each inner solve has a per-voxel *and* per-block precision
+    multiplier, so ``A_v = XtX + λ_v·blockdiag(gam_vb·P₀)`` differs per
+    voxel — no shared Cholesky is possible.  We therefore use batched
+    preconditioned CG (:func:`_cg_solve_batched`), which keeps peak
+    memory at ``O(chunk × n_cols)`` instead of the ``O(chunk × n_cols²)``
+    a batched direct factorisation would need (18 MB *per voxel* at the
+    ~1500 columns a single-trial LSA design reaches).
+
+    Parameters
+    ----------
+    data : (n_voxels, n_timepoints)
+    design_task : (n_timepoints, n_blocks × n_basis)
+    basis_functions : (n_basis, n_t)
+    prior_mean, prior_cov : (K,), (K, K)
+        ``prior_cov`` must be positive definite.  Note that with the
+        angular penalty the *scale* of ``prior_mean`` sets the overall
+        strength (penalty ∝ ``mᵀP₀m``) while its *direction* sets the
+        prior ray; a ``prior_cov`` that is singular along ``prior_mean``
+        makes ``mᵀP₀m = 0`` and the penalty degenerate.
+    n_blocks : int
+        One block per condition, or per trial in single-trial mode.
+    prior_weight : float or "auto"
+        As :func:`fit_basis_constrained_ridge`: ``"auto"`` → λ = σ²,
+        a float multiplies it.
+    lambda_mode : {"voxelwise", "global"}, default "voxelwise"
+        Per-voxel σ²_v, or one σ²_mean for all voxels.  Unlike the
+        ridge path there is no binning — λ enters the CG operator
+        directly, so exact per-voxel λ costs nothing extra.
+    n_iter, tol : int, float
+        IRLS iteration cap and convergence threshold on the median
+        relative change in the task betas.
+    size_floor : float
+        Clamp on ``|s|``.  Where ``mᵀP₀β ≈ 0`` the block is
+        P₀-orthogonal to the prior ray: the angular penalty is at its
+        plateau and carries no gradient, so the prior is *disabled*
+        there (``gam → 0``) rather than given an invented ``s``.
+
+    Returns
+    -------
+    FLOBSFitResult
+        ``size_per_block`` carries the inferred (n_vox, n_blocks) ``s``.
+    """
+    if device is None:
+        device = get_device()
+    if device.type == "mps":
+        warn_mps_cpu_fallback("FLOBS cone prior")
+    device, data, design_task, nuisance = _cpu_if_mps(device, data, design_task, nuisance)
+    if lambda_mode not in ("global", "voxelwise"):
+        raise ValueError(f"lambda_mode must be 'global' or 'voxelwise'; got {lambda_mode!r}")
+
+    y = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
+    X = (
+        torch.as_tensor(design_task, dtype=torch.float64, device=device)
+        if not isinstance(design_task, torch.Tensor)
+        else design_task.to(device=device, dtype=torch.float64)
+    )
+    if y.ndim != 2:
+        raise ValueError(f"data must be 2-D (n_voxels, n_t); got {y.shape}")
+    n_voxels, n_t = y.shape
+    n_basis = basis_functions.shape[0]
+    if X.shape[1] != n_blocks * n_basis:
+        raise ValueError(
+            f"design_task has {X.shape[1]} columns but expected "
+            f"n_blocks ({n_blocks}) × n_basis ({n_basis}) = {n_blocks * n_basis}"
+        )
+    if prior_mean.shape != (n_basis,):
+        raise ValueError(f"prior_mean must have shape ({n_basis},); got {prior_mean.shape}")
+    if prior_cov.shape != (n_basis, n_basis):
+        raise ValueError(f"prior_cov must have shape ({n_basis}, {n_basis}); got {prior_cov.shape}")
+
+    if nuisance is not None:
+        Z = (
+            torch.as_tensor(nuisance, dtype=torch.float64, device=device)
+            if not isinstance(nuisance, torch.Tensor)
+            else nuisance.to(device=device, dtype=torch.float64)
+        )
+        X_full = torch.cat([X, Z], dim=1)
+    else:
+        X_full = X
+    n_cols = X_full.shape[1]
+    n_task_cols = n_blocks * n_basis
+
+    P0 = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=device, dtype=torch.float64)
+    m_t = torch.from_numpy(np.asarray(prior_mean, dtype=np.float64)).to(device=device)
+    P0m = P0 @ m_t  # (K,)
+    # The angular penalty has magnitude mᵀP₀m, so the guard has to be
+    # RELATIVE: a prior whose precision along `prior_mean` is negligible
+    # compared to ‖P₀‖ defines no usable ray even when mᵀP₀m > 0 in
+    # floating point.  ``decouple_amplitude_prior`` output is exactly
+    # this case by construction (it zeroes the amplitude precision).
+    mP0m = float(m_t @ P0m)
+    _p0_scale = float(torch.linalg.matrix_norm(P0, ord=2)) * float(m_t @ m_t)
+    if mP0m <= 0 or mP0m < 1e-10 * max(_p0_scale, 1e-300):
+        raise ValueError(
+            "cone prior is degenerate: mᵀC⁻¹m is zero or negligible "
+            f"({mP0m:.3g} vs scale {_p0_scale:.3g}).  The prior covariance "
+            "must be positive definite along prior_mean.  A covariance that "
+            "is singular in the amplitude direction — e.g. the output of "
+            "decouple_amplitude_prior — cannot define a prior ray, and is "
+            "unnecessary here: the cone prior already leaves amplitude free."
+        )
+
+    XtX = X_full.T @ X_full
+    try:
+        L0 = torch.linalg.cholesky(XtX)
+        use_chol_ols = True
+    except torch.linalg.LinAlgError:
+        L0 = None
+        use_chol_ols = False
+
+    if chunk_size is None:
+        from fastfuncstuff.memory import estimate_chunk_size
+
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_t,
+            n_regressors=n_cols,
+            device=device,
+            operation="glm",
+            use_double=True,
+        )
+
+    beta_ols_full = torch.empty((n_voxels, n_cols), dtype=torch.float64, device="cpu")
+    betas_full = torch.empty((n_voxels, n_cols), dtype=torch.float64, device="cpu")
+    ss_res_ols_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+    ss_res_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+    ss_tot_full = torch.empty(n_voxels, dtype=torch.float64, device="cpu")
+    size_full = torch.empty((n_voxels, n_blocks), dtype=torch.float64, device="cpu")
+
+    # ---- Pass 1: OLS (init for IRLS + σ² for λ) -----------------------
+    n_chunks = (n_voxels + chunk_size - 1) // chunk_size
+    for start in tqdm(
+        range(0, n_voxels, chunk_size),
+        total=n_chunks,
+        desc="  Cone pass 1 (OLS)",
+        unit="chunk",
+        leave=False,
+        disable=n_chunks <= 1,
+    ):
+        end = min(start + chunk_size, n_voxels)
+        y_chunk = y[start:end].to(device=device, dtype=torch.float64, non_blocking=True)
+        Xty = X_full.T @ y_chunk.T
+        b = (
+            torch.cholesky_solve(Xty, L0)
+            if use_chol_ols
+            else torch.linalg.lstsq(X_full, y_chunk.T).solution
+        )
+        resid = y_chunk - (X_full @ b).T
+        beta_ols_full[start:end] = b.T.cpu()
+        ss_res_ols_full[start:end] = (resid**2).sum(dim=1).cpu()
+        ss_tot_full[start:end] = (
+            ((y_chunk - y_chunk.mean(dim=1, keepdim=True)) ** 2).sum(dim=1).cpu()
+        )
+        del y_chunk, Xty, b, resid
+
+    dof = max(1, n_t - n_cols)
+    sigma2_pv = (ss_res_ols_full / dof).clamp_min(1e-30)
+    sigma2_mean = float(sigma2_pv.mean().item())
+    user_mult = 1.0 if isinstance(prior_weight, str) else float(prior_weight)
+    if isinstance(prior_weight, str) and prior_weight != "auto":
+        raise ValueError(f"prior_weight: expected float or 'auto'; got {prior_weight!r}")
+    if lambda_mode == "global":
+        lambda_pv = torch.full_like(sigma2_pv, user_mult * sigma2_mean)
+    else:
+        lambda_pv = user_mult * sigma2_pv
+    effective_weight = float(lambda_pv.mean().item())
+
+    # ---- Pass 2: IRLS over the size parameter -------------------------
+    # Preconditioner: one representative system using the median gam.
+    # Rebuilt once per IRLS iteration is unnecessary — gam's *spread*
+    # is what matters and it stabilises after the first couple of steps.
+    total_iters = 0
+    for start in tqdm(
+        range(0, n_voxels, chunk_size),
+        total=n_chunks,
+        desc="  Cone pass 2 (IRLS)",
+        unit="chunk",
+        leave=False,
+        disable=n_chunks <= 1,
+    ):
+        end = min(start + chunk_size, n_voxels)
+        y_chunk = y[start:end].to(device=device, dtype=torch.float64, non_blocking=True)
+        Xty = (X_full.T @ y_chunk.T).T  # (chunk, n_cols)
+        lam_chunk = lambda_pv[start:end].to(device)
+        beta = beta_ols_full[start:end].to(device)
+        L_pre = None
+        for it in range(max(1, n_iter)):
+            bt = beta[:, :n_task_cols].reshape(-1, n_blocks, n_basis)
+            a = torch.einsum("vbk,kl,vbl->vb", bt, P0, bt)  # βᵀP₀β
+            bb = bt @ P0m  # mᵀP₀β
+            degenerate = bb.abs() < 1e-10
+            s = a / torch.where(degenerate, torch.ones_like(bb), bb)
+            s = s.sign() * s.abs().clamp(size_floor, 1e6)
+            gam = torch.where(degenerate, torch.zeros_like(s), 1.0 / s**2)
+            # rhs: X'y + λ·gam·P₀·(s·m) = X'y + λ·(1/s)·P₀m
+            rhs = Xty.clone()
+            mean_term = torch.where(degenerate, torch.zeros_like(s), 1.0 / s)
+            rhs[:, :n_task_cols] += (
+                lam_chunk[:, None, None] * mean_term.unsqueeze(-1) * P0m
+            ).reshape(-1, n_task_cols)
+            if L_pre is None:
+                gam_med = float(gam.median()) if gam.numel() else 1.0
+                lam_med = float(lam_chunk.median())
+                P_rep = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
+                for blk_i in range(n_blocks):
+                    sl = slice(blk_i * n_basis, (blk_i + 1) * n_basis)
+                    P_rep[sl, sl] = P0
+                try:
+                    L_pre = torch.linalg.cholesky(XtX + lam_med * gam_med * P_rep)
+                except torch.linalg.LinAlgError:
+                    L_pre = None
+                del P_rep
+            beta_new = _cg_solve_batched(rhs, XtX, P0, gam, lam_chunk, n_blocks, n_basis, L_pre)
+            delta = (beta_new[:, :n_task_cols] - beta[:, :n_task_cols]).norm(dim=1) / beta_new[
+                :, :n_task_cols
+            ].norm(dim=1).clamp_min(1e-30)
+            beta = beta_new
+            total_iters = max(total_iters, it + 1)
+            if float(delta.median()) < tol:
+                break
+        resid = y_chunk - (X_full @ beta.T).T
+        betas_full[start:end] = beta.cpu()
+        ss_res_full[start:end] = (resid**2).sum(dim=1).cpu()
+        # Recompute s from the FINAL beta — the loop's `s` is one step
+        # stale (it was derived from the beta that produced this solve).
+        bt_f = beta[:, :n_task_cols].reshape(-1, n_blocks, n_basis)
+        a_f = torch.einsum("vbk,kl,vbl->vb", bt_f, P0, bt_f)
+        bb_f = bt_f @ P0m
+        s_f = a_f / torch.where(bb_f.abs() < 1e-10, torch.ones_like(bb_f), bb_f)
+        size_full[start:end] = torch.where(bb_f.abs() < 1e-10, torch.zeros_like(s_f), s_f).cpu()
+        del y_chunk, Xty, beta, resid, lam_chunk, bt_f, a_f, bb_f, s_f
+
+    _SS_TOT_MIN = 1e-6
+    valid = ss_tot_full > _SS_TOT_MIN
+    r2 = torch.where(
+        valid, 1.0 - ss_res_full / ss_tot_full.clamp(min=_SS_TOT_MIN), torch.zeros_like(ss_tot_full)
+    )
+    r2_ols = torch.where(
+        valid,
+        1.0 - ss_res_ols_full / ss_tot_full.clamp(min=_SS_TOT_MIN),
+        torch.zeros_like(ss_tot_full),
+    )
+    betas_np = betas_full.numpy()
+    betas_ols_np = beta_ols_full.numpy()
+    if reconstruct_hrfs:
+        hrfs = betas_np[:, :n_task_cols].reshape(n_voxels, n_blocks, n_basis) @ basis_functions
+        hrfs_ols = (
+            betas_ols_np[:, :n_task_cols].reshape(n_voxels, n_blocks, n_basis) @ basis_functions
+        )
+    else:
+        hrfs = None
+        hrfs_ols = None
+    if verbose:
+        print(
+            f"  Cone prior: {total_iters} IRLS iter(s), λ_mean={effective_weight:.4g}, "
+            f"median |s|={float(size_full.abs().median()):.4g}"
+        )
+    return FLOBSFitResult(
+        betas=betas_np,
+        hrfs=hrfs,  # type: ignore[arg-type]
+        r2=r2.numpy(),
+        betas_ols=betas_ols_np,
+        hrfs_ols=hrfs_ols,  # type: ignore[arg-type]
+        r2_ols=r2_ols.numpy(),
+        sigma2_mean=sigma2_mean,
+        effective_prior_weight=effective_weight,
+        n_iter=total_iters,
+        sigma2_per_voxel=sigma2_pv.numpy().astype(np.float32),
+        lambda_per_voxel=lambda_pv.numpy().astype(np.float32),
+        size_per_block=size_full.numpy(),
     )
 
 
