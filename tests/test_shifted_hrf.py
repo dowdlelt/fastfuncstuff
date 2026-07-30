@@ -633,3 +633,41 @@ def test_shape_selection_absorbs_delay_confound(setup):
         f"expected a varying shape to absorb some delay: |delay| with shapes "
         f"{d_free:.3f} vs fixed shape {d_fixed:.3f}"
     )
+
+
+def test_band_covers_every_nonzero_gram_entry(setup):
+    """The band must be a superset of the projected gram's support.
+
+    Bug of record: banding on raw time overlap alone is WRONG.  Projecting
+    the nuisance out of the design bank couples every column through the
+    nuisance subspace, so the projected gram is dense even when the raw one
+    is banded.  Dropping those terms wrecked the fit (negative R2, runaway
+    amplitudes).  This checks the band derivation against a brute-force
+    dense gram, which is the thing the fast path must not lose.
+    """
+    from fastfuncstuff.design.shifted_hrf import _project_out
+
+    h, _, block_onsets, polys = setup
+    nb = len(block_onsets)
+    tau = np.arange(-2.0, 2.001, 0.25)
+    Zt = torch.from_numpy(polys).to(torch.float64)
+    raw = build_shifted_design_bank(block_onsets, h, DT, tau, TR, NTP, device=CPU)
+    proj = _project_out(raw, Zt)
+    flat = proj.reshape(nb * tau.size, NTP)
+    dense = (flat @ flat.T).reshape(nb, tau.size, nb, tau.size)
+    mag = dense.abs().amax(dim=(1, 3)).numpy()
+    nonzero = mag > 1e-12 * mag.max()
+
+    # reproduce the band the solver derives
+    raw_support = (raw.abs().amax(dim=1) > 0).to(torch.float64)
+    band = ((raw_support @ raw_support.T) > 0).numpy()
+    Q, _ = torch.linalg.qr(Zt)
+    u = (raw.reshape(nb * tau.size, NTP) @ Q).reshape(nb, tau.size, -1)
+    umag = u.abs().amax(dim=1)
+    band = band | ((umag @ umag.T) > 0).numpy()
+
+    missed = nonzero & ~band
+    assert not missed.any(), (
+        f"band drops {int(missed.sum())} non-zero gram pairs; "
+        "the fast path would silently lose those interactions"
+    )

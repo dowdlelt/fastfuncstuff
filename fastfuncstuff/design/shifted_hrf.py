@@ -109,6 +109,41 @@ class ShiftedHRFResult:
     tau_grid: np.ndarray
 
 
+def _memory_budget(device: torch.device, fraction: float = 0.6) -> int:
+    """Free-memory budget in bytes, tolerant of a broken NVML.
+
+    ``get_available_memory`` defaults to calling ``empty_cache()``, which
+    pokes the CUDA caching allocator.  On hosts where NVML fails to
+    initialise that raises
+
+        NVML_SUCCESS == DriverAPI::get()->nvmlInit_v2_() INTERNAL ASSERT FAILED
+
+    from inside the allocator.  This path is hit once per ``fit_shifted_hrf``
+    call, and cross-validation calls it once per fold per shape group, so a
+    flaky NVML turned into a mid-run crash after the first fold.  Fall back
+    through progressively dumber queries rather than taking the process down
+    over a memory *hint*.
+    """
+    total_fallback = 4 * 1024**3
+    try:
+        from fastfuncstuff.memory import get_available_memory
+
+        return int(get_available_memory(device, empty_cache=False) * fraction)
+    except Exception:
+        pass
+    if device.type == "cuda":
+        try:
+            free, _total = torch.cuda.mem_get_info(device)
+            return int(free * fraction)
+        except Exception:
+            try:
+                props = torch.cuda.get_device_properties(device)
+                return int(props.total_memory * 0.5 * fraction)
+            except Exception:
+                return total_fallback
+    return total_fallback
+
+
 def build_shifted_design_bank(
     block_onsets: list[np.ndarray],
     hrf: np.ndarray,
@@ -118,6 +153,7 @@ def build_shifted_design_bank(
     n_timepoints: int,
     *,
     durations: list[float] | None = None,
+    run_bounds: list[tuple[int, int]] | None = None,
     device: torch.device | None = None,
 ) -> Tensor:
     """Build ``C[b, g, t]`` — every block's column at every candidate shift.
@@ -143,6 +179,14 @@ def build_shifted_design_bank(
     durations : list of float, optional
         Per-block stimulus duration (s).  When given and > 0, the HRF is
         boxcar-convolved by summing shifted copies at ``hrf_dt`` spacing.
+    run_bounds : list of (start, stop) sample indices, optional
+        Run boundaries in the concatenated timeline.  Each block's response
+        is confined to the run its onset falls in.  Without this, an event
+        in the last ~32 s of a run spills its tail into the NEXT run's
+        early samples — physically wrong, since runs are separate
+        acquisitions, and it induces spurious coupling between the last
+        trials of one run and the first of the next.  Supply it whenever
+        the data is concatenated across runs.
 
     Returns
     -------
@@ -181,16 +225,34 @@ def build_shifted_design_bank(
         valid = (i0 >= 0) & (i0 < n_h - 1)
         i0c = i0.clamp(0, n_h - 2)
         vals = torch.where(valid, h[i0c] * (1.0 - frac) + h[i0c + 1] * frac, torch.zeros_like(frac))
-        bank[b] = vals.sum(dim=(0, 1))
-        del lag, pos, i0, frac, valid, i0c, vals
+        col = vals.sum(dim=(0, 1))
+        if run_bounds is not None:
+            # confine to the run containing this block's first onset
+            t0 = float(ons.min())
+            keep = None
+            for r0, r1 in run_bounds:
+                if r0 * tr <= t0 < r1 * tr:
+                    keep = (r0, r1)
+                    break
+            if keep is None:
+                keep = run_bounds[-1]
+            m = torch.zeros(n_timepoints, dtype=col.dtype, device=device)
+            m[keep[0] : keep[1]] = 1.0
+            col = col * m
+            del m
+        bank[b] = col
+        del lag, pos, i0, frac, valid, i0c, vals, col
     return bank
 
 
 def _solve_amplitudes(
     gi: Tensor,
-    gram: Tensor,
+    banded: Tensor,
     proj: Tensor,
+    nbr_idx: Tensor,
+    nbr_w: Tensor,
     ar_b: Tensor,
+    ar_w: Tensor,
     ar_v: Tensor,
     n_blocks: int,
     amp_batch: int,
@@ -198,53 +260,71 @@ def _solve_amplitudes(
     """Exact joint amplitude solve given every block's chosen grid index.
 
     Given ``τ``, the model is linear in ``A``, so this is the projection
-    half of variable projection: ``A = (XᵀX)⁻¹Xᵀy`` with both sides
-    gathered out of the precomputed ``gram`` / ``proj`` tables rather
-    than recomputed against the time axis.
+    half of variable projection: ``A = (XᵀX)⁻¹Xᵀy``, with both sides read
+    out of the precomputed tables instead of recomputed against the time
+    axis.
 
-    ``XtX[v, b, b'] = gram[b, gi[v,b], b', gi[v,b']]`` is built with a
-    *single* advanced-index call.  Gathering along ``(b, g)`` first and
-    ``(b', g')`` second would materialise an intermediate of shape
-    ``(NB, nv, NB, G)`` — 4 GB at 142 blocks / 1000 voxels / a 25-point
-    grid.  Broadcasting all four index arrays at once goes straight to
-    ``(NB, nv, NB)``.
+    ``XᵀX`` is banded — only overlapping blocks interact — so it is built
+    by scattering the band into a dense ``(nb_v, NB, NB)`` for the batched
+    Cholesky, rather than gathering ``NB²`` entries of which almost all are
+    structurally zero.
 
     Parameters
     ----------
     gi : (nv, n_blocks) long
         Grid index chosen per (voxel, block).
-    gram : (NB, G, NB, G), proj : (NB, G, nv)
-    ar_b, ar_v : aranges over blocks and voxels, on-device.
+    banded : (NB, G, W, G)
+        ``banded[b, g, w, g'] = <C[b,g], C[nbr[b,w], g']>``.
+    proj : (NB, G, nv)
+    nbr_idx : (NB, W) long, nbr_w : (NB, W) float
+        Neighbour indices and a 0/1 weight masking the padding.
+    ar_b, ar_w, ar_v : aranges over blocks, band width, and voxels.
+    amp_batch : int
+        Voxels per sub-batch.  Sub-batching here is what keeps the
+        ``(nb_v, NB, NB)`` allocation from dictating the caller's chunk
+        size, which previously forced 113-voxel chunks at 420 blocks and
+        left the coordinate loop launch-bound.
 
     Returns
     -------
     (nv, n_blocks) amplitudes.
     """
     nv = gi.shape[0]
-    out = torch.empty((nv, n_blocks), dtype=gram.dtype, device=gram.device)
-    eye = torch.eye(n_blocks, dtype=gram.dtype, device=gram.device)
-    # Sub-batch so the (nv, NB, NB) gather never forces the CALLER to use a
-    # small chunk.  Keeping these two independent is what unblocks the
-    # coordinate loop from running launch-bound.
+    band_w = nbr_idx.shape[1]
+    out = torch.empty((nv, n_blocks), dtype=banded.dtype, device=banded.device)
+    eye = torch.eye(n_blocks, dtype=banded.dtype, device=banded.device)
     step = max(16, int(amp_batch))
     for s in range(0, nv, step):
         e = min(s + step, nv)
         gi_s = gi[s:e]
+        nbv = gi_s.shape[0]
         g_b = gi_s.T  # (NB, nb_v)
-        XtX = gram[
+        # gi[v, nbr[b, w]] -> (NB, nb_v, W)
+        gi_nb = gi_s[:, nbr_idx].permute(1, 0, 2)
+        band_vals = banded[
             ar_b.view(-1, 1, 1),  # b
             g_b.unsqueeze(-1),  # gi[v, b]
-            ar_b.view(1, 1, -1),  # b'
-            gi_s.unsqueeze(0),  # gi[v, b']
-        ]  # (NB, nb_v, NB)
-        XtX = XtX.permute(1, 0, 2)  # (nb_v, NB, NB)
+            ar_w.view(1, 1, -1),  # w
+            gi_nb,  # gi[v, nbr[b, w]]
+        ]  # (NB, nb_v, W)
+        XtX = torch.zeros((nbv, n_blocks, n_blocks), dtype=banded.dtype, device=banded.device)
+        # scatter_ADD, not scatter_: the padding slots point at block b itself
+        # with weight 0, and a plain scatter lets the last write win, so the
+        # padding would zero the real diagonal entry.  Adding is safe because
+        # the genuine neighbour indices in a row are unique, so the only
+        # duplicates are zero-weight padding.
+        XtX.scatter_add_(
+            2,
+            nbr_idx.view(n_blocks, 1, band_w).expand(n_blocks, nbv, band_w).permute(1, 0, 2),
+            (band_vals * nbr_w.view(n_blocks, 1, band_w)).permute(1, 0, 2),
+        )
         Xty = proj[ar_b[:, None], g_b, ar_v[s:e][None, :]].T  # (nb_v, NB)
         # Overlapping trials at short ISI make XtX near-singular; a relative
         # jitter keeps the batched solve well-posed without biasing A.
         ridge = 1e-8 * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
         XtX = XtX + ridge[:, None, None] * eye
         out[s:e] = torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
-        del XtX, Xty, ridge
+        del XtX, Xty, ridge, band_vals, gi_nb
     return out
 
 
@@ -270,6 +350,7 @@ def fit_shifted_hrf(
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     durations: list[float] | None = None,
+    run_bounds: list[tuple[int, int]] | None = None,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
     device: torch.device | None = None,
@@ -355,30 +436,78 @@ def fit_shifted_hrf(
         tr,
         n_t,
         durations=durations,
+        run_bounds=run_bounds,
         device=device,
     )
-    # The gram table is (NB, G, NB, G) float64 — quadratic in BOTH the block
-    # count and the grid size.  That is fine for per-condition fits and for
-    # single-trial fits at a few hundred trials (500 trials × a 17-point grid
-    # = 578 MB) but it walls hard: 2000 trials is 9.2 GB.  Check before
-    # allocating so the failure is an actionable message rather than an OOM
-    # several minutes into a real run.
-    gram_bytes = (n_blocks * n_grid) ** 2 * 8
-    if gram_bytes > 4 * 1024**3:
-        raise MemoryError(
-            f"shifted-HRF gram table would need {gram_bytes / 1024**3:.1f} GB "
-            f"({n_blocks} blocks × {n_grid} grid points, and it is quadratic in "
-            f"both).  Options, cheapest first: coarsen -tau-step (halving the "
-            f"grid quarters this), narrow -tau-max, or fit per condition "
-            f"instead of per trial."
-        )
-
+    bank_raw = bank
     bank = _project_out(bank, Z)  # (NB, G, T)
-    # gram[b, g, b', g'] — the only thing the inner loop needs from the
-    # time axis, computed once.
     flat = bank.reshape(n_blocks * n_grid, n_t)
-    gram = (flat @ flat.T).reshape(n_blocks, n_grid, n_blocks, n_grid)
     self_norm = torch.einsum("bgt,bgt->bg", bank, bank).clamp_min(1e-30)  # (NB, G)
+
+    # ---- banded gram ------------------------------------------------
+    # The dense gram is (NB, G, NB, G) -- quadratic in BOTH block count and
+    # grid size (500 trials x a 17-point grid = 578 MB; 2000 trials = 9.2 GB)
+    # and it makes every coordinate step gather over all NB blocks.
+    #
+    # Most of it is structurally zero, but working out WHICH part needs care.
+    # Two trials couple if either
+    #   (a) their raw responses overlap in time, or
+    #   (b) they share nuisance support -- projecting the drift out of the
+    #       bank couples every column through the nuisance subspace, so the
+    #       PROJECTED gram is dense even when the raw one is banded.  This
+    #       was a real bug: banding on time overlap alone silently dropped
+    #       the nuisance-induced terms and wrecked the fit.
+    # With per-run polynomial drift, (b) means "same run", so the band comes
+    # out as within-run and cross-run pairs are exactly zero.  Both patterns
+    # are MEASURED here rather than assumed, so a globally-supported nuisance
+    # regressor simply widens the band instead of corrupting the result.
+    raw_support = (bank_raw.abs().amax(dim=1) > 0).to(torch.float64)  # (NB, T)
+    overlap = (raw_support @ raw_support.T) > 0  # (NB, NB)
+    if Z is not None:
+        Q, _ = torch.linalg.qr(Z)  # orthonormal basis of the nuisance space
+        u = (bank_raw.reshape(n_blocks * n_grid, n_t) @ Q).reshape(n_blocks, n_grid, -1)
+        umag = u.abs().amax(dim=1)  # (NB, nz)
+        cpl = umag @ umag.T
+        # RELATIVE threshold, not `> 0`.  QR leaves ~1e-17 fuzz outside each
+        # run's rows, so an exact-zero test marks every cross-run pair as
+        # coupled and the band collapses to nearly dense (measured 378/420
+        # instead of 42/420).
+        overlap = overlap | (cpl > 1e-12 * float(cpl.max()))
+        del Q, u, umag, cpl
+    del raw_support
+
+    nbr_lists = [np.flatnonzero(overlap[b].cpu().numpy()) for b in range(n_blocks)]
+    band_w = max(1, max(len(x) for x in nbr_lists))
+    nbr_idx = np.zeros((n_blocks, band_w), dtype=np.int64)
+    nbr_msk = np.zeros((n_blocks, band_w), dtype=bool)
+    self_pos = np.zeros(n_blocks, dtype=np.int64)
+    for b, lst in enumerate(nbr_lists):
+        if b not in lst:
+            lst = np.union1d(lst, [b])
+        nbr_idx[b, : len(lst)] = lst
+        nbr_msk[b, : len(lst)] = True
+        nbr_idx[b, len(lst) :] = b  # padding points at self; zero-weighted below
+        self_pos[b] = int(np.flatnonzero(lst == b)[0])
+    nbr_idx_t = torch.from_numpy(nbr_idx).to(device)
+    nbr_w_t = torch.from_numpy(nbr_msk.astype(np.float64)).to(device)
+    self_pos_t = torch.from_numpy(self_pos).to(device)
+    del overlap
+
+    # banded[b, g, w, g'] = <C[b,g], C[nbr[b,w], g']> on the PROJECTED bank
+    banded = torch.empty((n_blocks, n_grid, band_w, n_grid), dtype=torch.float64, device=device)
+    for b in range(n_blocks):
+        nb = bank[nbr_idx_t[b]].reshape(band_w * n_grid, n_t)  # (W*G, T)
+        banded[b] = (bank[b] @ nb.T).reshape(n_grid, band_w, n_grid)
+        del nb
+    if verbose:
+        dense_gb = (n_blocks * n_grid) ** 2 * 8 / 1024**3
+        band_gb = banded.numel() * 8 / 1024**3
+        print(
+            f"  Banded gram: width {band_w}/{n_blocks} blocks "
+            f"({band_gb:.3f} GB vs {dense_gb:.2f} GB dense, "
+            f"{n_blocks / band_w:.1f}x less work per coordinate step)"
+        )
+    del bank_raw
 
     tau_t = torch.as_tensor(tau_grid, device=device)
     # Gaussian prior on tau expressed in the grid's own units.  Scaled by
@@ -387,9 +516,7 @@ def fit_shifted_hrf(
     # Real free memory drives both the chunk size and the amplitude-solve
     # sub-batch; [[Memory module]] is the single source of truth rather than
     # hardcoded element counts.
-    from fastfuncstuff.memory import get_available_memory
-
-    bytes_budget = int(get_available_memory(device) * 0.6)
+    bytes_budget = _memory_budget(device, 0.6)
     # Amplitude solve peak: the (nv, NB, NB) gather plus the batched
     # Cholesky's workspace, float64.  Give it a third of the budget.
     amp_batch = max(16, int((bytes_budget / 3) // max(n_blocks * n_blocks * 8 * 2, 1)))
@@ -426,6 +553,7 @@ def fit_shifted_hrf(
 
     n_chunks = (n_voxels + chunk_size - 1) // chunk_size
     ar_b = torch.arange(n_blocks, device=device)
+    ar_w = torch.arange(band_w, device=device)
     for start in tqdm(
         range(0, n_voxels, chunk_size),
         total=n_chunks,
@@ -446,7 +574,9 @@ def fit_shifted_hrf(
         gi = torch.full((nv, n_blocks), zero_idx, dtype=torch.long, device=device)
 
         ar_v = torch.arange(nv, device=device)
-        A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks, amp_batch)
+        A = _solve_amplitudes(
+            gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch
+        )
         # σ² for the τ prior, taken from the τ=0 fit.  With A solved
         # exactly, SSE = ‖y‖² − Aᵀ(Xᵀy), so no prediction is needed.
         sse0 = (
@@ -486,15 +616,21 @@ def fit_shifted_hrf(
             lam_sweep = None if _sweep == 0 else lam_tau
             tau_bar = tau_t[gi].mean(dim=1) if lam_sweep is not None else None
             for b in range(n_blocks):
-                # residual excluding block b, expressed via precomputed tables:
-                #   <C[b,g], r_other> = proj[b,g,v] - sum_{b'!=b} A_b' gram[b,g,b',g_b']
-                cross = gram[b]  # (G, NB, G) -- indexing dim1 by arange was a no-op
-                gsel = gi.T  # (NB, nv)
-                # (G, NB, nv) <- pick g' per (b', v)
-                cr = cross[:, ar_b[:, None], gsel]
-                contrib = torch.einsum("gbv,vb->gv", cr, A)
+                # Residual excluding block b, via the precomputed tables:
+                #   <C[b,g], r_other> = proj[b,g,v]
+                #                       - sum_{b'!=b} A_b' gram[b,g,b',g_b']
+                # The sum runs only over b's OVERLAPPING NEIGHBOURS, since
+                # every other term is identically zero.  That turns the
+                # gather from (G, NB, nv) into (G, W, nv) -- at 420 blocks
+                # with a band of ~16 that is ~26x less memory traffic per
+                # step, and traffic is what this loop is bound by.
+                nb_i = nbr_idx_t[b]  # (W,)
+                gsel = gi[:, nb_i].T  # (W, nv)
+                cr = banded[b][:, ar_w[:, None], gsel]  # (G, W, nv)
+                A_nb = A[:, nb_i] * nbr_w_t[b].unsqueeze(0)  # (nv, W), padding zeroed
+                contrib = torch.einsum("gwv,vw->gv", cr, A_nb)
                 own = A[:, b]  # remove block b's own term
-                self_cr = cross[:, b, :][:, gi[:, b]]  # (G, nv) -- gram[b,g,b,g_b]
+                self_cr = banded[b][:, self_pos_t[b], :][:, gi[:, b]]  # (G, nv)
                 num = proj[b] - (contrib - own.unsqueeze(0) * self_cr)
                 # profiled SSE reduction for each candidate g
                 gain = num**2 / self_norm[b].unsqueeze(-1)
@@ -503,7 +639,9 @@ def fit_shifted_hrf(
                     dev_tau = tau_t.unsqueeze(-1) - tau_bar.unsqueeze(0)
                     gain = gain - lam_sweep.unsqueeze(0) * dev_tau**2
                 gi[:, b] = torch.argmax(gain, dim=0)
-            A = _solve_amplitudes(gi, gram, proj, ar_b, ar_v, n_blocks, amp_batch)
+            A = _solve_amplitudes(
+                gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch
+            )
 
         sse = (
             ss_y - torch.einsum("vb,vb->v", A, proj[ar_b[:, None], gi.T, ar_v[None, :]].T)
@@ -514,8 +652,6 @@ def fit_shifted_hrf(
         amps[start:end] = A.float().cpu().numpy()
         delays[start:end] = tau_t[gi].float().cpu().numpy()
         del y_raw, y, proj, A, gi
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     if verbose:
         gained = float(np.median(r2_out - r2_fixed_out))
@@ -674,12 +810,24 @@ def xval_shifted_hrf(
 
         y_train = torch.cat([per_run_data[r] for r in train_runs], dim=1)
         Z_train = build_blockdiag_polys(n_tp_train, polort, device)
+        _tb = np.cumsum([0] + n_tp_train)
+        train_bounds = [(int(_tb[k]), int(_tb[k + 1])) for k in range(len(train_runs))]
         if shapes is not None:
+            # condition-level blocks in the same concatenated train time
+            sel_blocks = []
+            for c in range(n_cond):
+                merged = [
+                    np.atleast_1d(per_run_condition_onsets[r][c]) + offsets[k]
+                    for k, r in enumerate(train_runs)
+                ]
+                sel_blocks.append(np.concatenate(merged) if merged else np.array([]))
             fit, fold_shape_idx = fit_shifted_hrf_per_voxel_shape(
                 data=y_train,
                 block_onsets=block_onsets,
+                selection_block_onsets=sel_blocks,
                 shapes=shapes,
                 hrf_dt=hrf_dt,
+                run_bounds=train_bounds,
                 tr=tr,
                 nuisance=Z_train,
                 tau_max=tau_max,
@@ -696,6 +844,7 @@ def xval_shifted_hrf(
                 block_onsets=block_onsets,
                 hrf=hrf,
                 hrf_dt=hrf_dt,
+                run_bounds=train_bounds,
                 tr=tr,
                 nuisance=Z_train,
                 tau_max=tau_max,
@@ -760,8 +909,6 @@ def xval_shifted_hrf(
                     del cols, pred
                 del bank_test, vt
             del y_test, y_p, ss_tot
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
     den_safe = np.maximum(den, 1e-12)
     r2_shift = np.clip(1.0 - num_s / den_safe, -10, 1).astype(np.float32)
@@ -877,6 +1024,7 @@ def select_shape_per_voxel(
     *,
     nuisance: Tensor | None = None,
     durations: list[float] | None = None,
+    run_bounds: list[tuple[int, int]] | None = None,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = False,
@@ -926,9 +1074,7 @@ def select_shape_per_voxel(
     n_shapes = shapes.shape[0]
     zero = np.array([0.0])
     if chunk_size is None:
-        from fastfuncstuff.memory import get_available_memory
-
-        budget = int(get_available_memory(device) * 0.5)
+        budget = _memory_budget(device, 0.5)
         chunk_size = max(256, min(n_voxels, int(budget // max(n_t * 8 * 6, 1))))
 
     ss_res = np.zeros((n_voxels, n_shapes), dtype=np.float32)
@@ -951,6 +1097,7 @@ def select_shape_per_voxel(
             tr,
             n_t,
             durations=durations,
+            run_bounds=run_bounds,
             device=device,
         )[:, 0, :]  # (NB, T)
         X = _project_out(bank, nuisance).T.contiguous()  # (T, NB)
@@ -979,8 +1126,6 @@ def select_shape_per_voxel(
                 )
             del y, beta, sse
         del bank, X, XtX, L
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     r2 = 1.0 - ss_res / ss_tot[:, None]
     idx = np.argmax(r2, axis=1).astype(np.int64)
@@ -1002,9 +1147,11 @@ def fit_shifted_hrf_per_voxel_shape(
     hrf_dt: float,
     tr: float,
     *,
+    selection_block_onsets: list[np.ndarray] | None = None,
     shape_index: np.ndarray | None = None,
     nuisance: Tensor | None = None,
     durations: list[float] | None = None,
+    run_bounds: list[tuple[int, int]] | None = None,
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     n_sweeps: int = 4,
@@ -1037,14 +1184,21 @@ def fit_shifted_hrf_per_voxel_shape(
     n_blocks = len(block_onsets)
 
     if shape_index is None:
+        # Select the shape from CONDITION-level blocks by default: pooling a
+        # condition's trials into one regressor spends 1 amplitude DOF
+        # instead of n_trials, so the shape comparison is far better
+        # determined.  The delay fit that follows still uses the per-trial
+        # blocks.
+        sel_blocks = selection_block_onsets if selection_block_onsets else block_onsets
         shape_index, _ = select_shape_per_voxel(
             y_src,
-            block_onsets,
+            sel_blocks,
             shapes,
             hrf_dt,
             tr,
             nuisance=nuisance,
-            durations=durations,
+            durations=None if selection_block_onsets else durations,
+            run_bounds=run_bounds,
             device=device,
             verbose=verbose,
         )
@@ -1081,6 +1235,7 @@ def fit_shifted_hrf_per_voxel_shape(
             tau_max=tau_max,
             tau_step=tau_step,
             durations=durations,
+            run_bounds=run_bounds,
             n_sweeps=n_sweeps,
             delay_prior_sd=delay_prior_sd,
             device=device,
@@ -1108,4 +1263,20 @@ def fit_shifted_hrf_per_voxel_shape(
             tau_grid=tau_grid,
         ),
         shape_index,
+    )
+
+
+def shape_time_to_peak(shapes: np.ndarray, hrf_dt: float) -> np.ndarray:
+    """Time to peak (s) of each candidate curve.
+
+    This is what makes the shape/delay confound harmless rather than
+    destructive.  A voxel responding 1 s later than its neighbour will be
+    assigned a later-peaking curve rather than a positive delay, so the
+    *delay* map understates it — but the information is not lost, it moved
+    here.  Report ``shape_time_to_peak(shapes, dt)[shape_index]`` as the
+    voxel's mean response timing, and the per-trial delays as deviations
+    around it.
+    """
+    return (np.argmax(np.asarray(shapes, dtype=np.float64), axis=1) * float(hrf_dt)).astype(
+        np.float32
     )

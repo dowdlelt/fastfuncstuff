@@ -945,6 +945,7 @@ def _run_shift_mode(
         build_shape_library,
         fit_shifted_hrf,
         fit_shifted_hrf_per_voxel_shape,
+        shape_time_to_peak,
         xval_shifted_hrf,
     )
 
@@ -1028,7 +1029,20 @@ def _run_shift_mode(
             block_onsets.append(np.concatenate(merged) if merged else np.array([]))
             block_labels.append(label)
             block_cond.append(c)
+    # Condition-level blocks, used ONLY for shape selection: pooling a
+    # condition's trials into one regressor spends 1 amplitude DOF instead
+    # of n_trials, so the shape comparison is far better determined.
+    cond_block_onsets: list[np.ndarray] = []
+    for c in range(len(condition_labels)):
+        merged = [np.atleast_1d(all_onsets[c][r]) + offsets[r] for r in range(n_runs)]
+        cond_block_onsets.append(np.concatenate(merged) if merged else np.array([]))
     print(f"  Blocks: {len(block_onsets)}")
+
+    # Sample-index run boundaries: keeps each block's response inside its own
+    # run (an event in the last ~32 s of a run would otherwise spill its tail
+    # into the next run's samples) and makes cross-run gram pairs exactly zero.
+    _b = np.cumsum([0] + n_tp_per_run)
+    run_bounds = [(int(_b[r]), int(_b[r + 1])) for r in range(n_runs)]
 
     Z = build_blockdiag_polys(n_tp_per_run, polort, device)
     shape_index = None
@@ -1036,12 +1050,14 @@ def _run_shift_mode(
         fit, shape_index = fit_shifted_hrf_per_voxel_shape(
             data=data,
             block_onsets=block_onsets,
+            selection_block_onsets=cond_block_onsets,
             shapes=shapes,
             hrf_dt=args.flobs_dt,
             tr=tr,
             nuisance=Z,
             tau_max=args.tau_max,
             tau_step=args.tau_step,
+            run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
             device=device,
@@ -1057,6 +1073,7 @@ def _run_shift_mode(
             nuisance=Z,
             tau_max=args.tau_max,
             tau_step=args.tau_step,
+            run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
             device=device,
@@ -1112,11 +1129,40 @@ def _run_shift_mode(
         )
         print(f"  Wrote {curves_path}  (columns = candidates @ {args.flobs_dt}s)")
 
+        # The selected shape absorbs part of the voxel's mean timing, so the
+        # delay map alone understates it.  Emit the two pieces that make the
+        # confound decomposable rather than destructive: time-to-peak of the
+        # chosen curve, and TTP + mean delay, which recovers the true mean
+        # timing (verified to sum exactly at good SNR).
+        ttp = shape_time_to_peak(shapes, args.flobs_dt)[shape_index]
+        mean_timing = ttp + fit.delays.mean(axis=1)
+        for arr, name, note in (
+            (ttp, "shape_ttp", "time-to-peak of each voxel's selected curve (s)"),
+            (mean_timing, "mean_timing", "TTP + mean delay = mean response timing (s)"),
+        ):
+            path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
+            save_nifti(
+                _to_volume(arr.astype(np.float32)[:, None]).squeeze(-1),
+                output_path=path,
+                reference_img=args.input[0],
+            )
+            print(f"  Wrote {path}  ({note})")
+
     cond_idx: dict[str, list[int]] = {}
     for b, c in enumerate(block_cond):
         cond_idx.setdefault(condition_labels[c], []).append(b)
+    # Per-trial deviation from each voxel's OWN mean delay.  This is the
+    # quantity that survives the shape/delay confound: the shape is fixed
+    # within a voxel across trials, so it cannot absorb trial-to-trial
+    # variation.  Verified to track true jitter at r=0.61 (noise sd 0.3)
+    # even when the voxel's absolute delay was absorbed into its shape.
+    delay_dev = fit.delays - fit.delays.mean(axis=1, keepdims=True)
     for cond, idxs in cond_idx.items():
-        for arr, name in ((fit.amplitudes, "amplitude"), (fit.delays, "delay")):
+        for arr, name in (
+            (fit.amplitudes, "amplitude"),
+            (fit.delays, "delay"),
+            (delay_dev, "delay_dev"),
+        ):
             vol = _to_volume(arr[:, idxs])
             path = f"{args.prefix}_fitbasis_shift_{name}_{cond}{nii_ext}"
             save_nifti(vol, output_path=path, reference_img=args.input[0])
