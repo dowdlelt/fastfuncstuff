@@ -343,8 +343,9 @@ def test_compute_pe_jacobian_single_axis_and_value():
     jj = torch.arange(ny, dtype=torch.float32)[None, :, None].expand(nz, ny, nx).contiguous()
     yd = 0.3 * jj
     zero = torch.zeros_like(yd)
-    warp = NonlinearWarp(xd=zero, yd=yd, zd=zero.clone(),
-                         header_info={"affine": _diag_affine()}, units="voxels")
+    warp = NonlinearWarp(
+        xd=zero, yd=yd, zd=zero.clone(), header_info={"affine": _diag_affine()}, units="voxels"
+    )
     jac, single, ratio = compute_pe_jacobian(warp, pe_axis=1)
     assert single and ratio < 1e-6
     expected = 1.0 + _central_diff_batched(yd, dim=1)
@@ -352,8 +353,9 @@ def test_compute_pe_jacobian_single_axis_and_value():
     assert abs(float(jac[nz // 2, ny // 2, nx // 2]) - 1.3) < 1e-5
 
     # Off-axis displacement -> not single-axis -> caller must skip.
-    warp_mixed = NonlinearWarp(xd=0.3 * jj, yd=yd, zd=zero.clone(),
-                               header_info={"affine": _diag_affine()}, units="voxels")
+    warp_mixed = NonlinearWarp(
+        xd=0.3 * jj, yd=yd, zd=zero.clone(), header_info={"affine": _diag_affine()}, units="voxels"
+    )
     _, single_mixed, ratio_mixed = compute_pe_jacobian(warp_mixed, pe_axis=1)
     assert not single_mixed and ratio_mixed > 0.5
 
@@ -366,8 +368,13 @@ def test_jac_modulation_end_to_end():
     src = torch.ones(nz, ny, nx)
     jj = torch.arange(ny, dtype=torch.float32)[None, :, None].expand(nz, ny, nx).contiguous()
     yd = 0.2 * (jj - ny / 2)  # linear PE displacement
-    warp = NonlinearWarp(xd=torch.zeros_like(src), yd=yd, zd=torch.zeros_like(src),
-                         header_info={"affine": aff}, units="voxels")
+    warp = NonlinearWarp(
+        xd=torch.zeros_like(src),
+        yd=yd,
+        zd=torch.zeros_like(src),
+        header_info={"affine": aff},
+        units="voxels",
+    )
     geom = apply_composed_warp(src, warp, aff, aff, interp="linear")
     from fastfuncstuff.processing.nwarpforge import compute_pe_jacobian
 
@@ -399,8 +406,14 @@ def test_jac_static_with_slice_timing(tmp_path):
 
     st = list(np.linspace(0.0, 0.9, n))
     common = dict(
-        source_path=str(src_path), nwarp_specs=[str(warp_path)], interp="linear",
-        device=DEV, verb=0, slice_times=st, tr=1.0, auto_pad=False,
+        source_path=str(src_path),
+        nwarp_specs=[str(warp_path)],
+        interp="linear",
+        device=DEV,
+        verb=0,
+        slice_times=st,
+        tr=1.0,
+        auto_pad=False,
     )
     out = tmp_path / "out.nii"
     out_nojac = tmp_path / "out_nojac.nii"
@@ -462,8 +475,14 @@ def test_jac_transport_with_upstream_motion(tmp_path):
 
     out = tmp_path / "o.nii"
     out0 = tmp_path / "o0.nii"
-    common = dict(source_path=str(src_path), nwarp_specs=[str(fmap), str(motion)],
-                  interp="linear", device=DEV, verb=0, auto_pad=False)
+    common = dict(
+        source_path=str(src_path),
+        nwarp_specs=[str(fmap), str(motion)],
+        interp="linear",
+        device=DEV,
+        verb=0,
+        auto_pad=False,
+    )
     nwarpforge(prefix=str(out), jac_axis=1, jac_match="fmap", **common)
     nwarpforge(prefix=str(out0), jac_axis=None, **common)
     res = np.asarray(nib.load(str(out)).dataobj)
@@ -489,9 +508,15 @@ def test_jac_transport_errors_on_downstream_perframe(tmp_path):
     _write_aff1d(motion, [_IDENT12 for _ in range(nt)])
     with pytest.raises(ValueError, match="downstream"):
         nwarpforge(
-            source_path=str(src_path), nwarp_specs=[str(motion), str(fmap)],
-            prefix=str(tmp_path / "o.nii"), interp="linear", device=DEV, verb=0,
-            auto_pad=False, jac_axis=1, jac_match="fmap",
+            source_path=str(src_path),
+            nwarp_specs=[str(motion), str(fmap)],
+            prefix=str(tmp_path / "o.nii"),
+            interp="linear",
+            device=DEV,
+            verb=0,
+            auto_pad=False,
+            jac_axis=1,
+            jac_match="fmap",
         )
 
 

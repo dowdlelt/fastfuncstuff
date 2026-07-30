@@ -191,6 +191,22 @@ def _anat_lin_files(opt) -> list[str]:
 _PRE_CHAIN_TOKENS = ("xfmap_nl", "xfmap_lin", "blip_half", "wxrun_nl", "wxrun_lin")
 
 
+def _nl_source_args(in_source: bool, aligned: str, native: str, matrix: str) -> list[str]:
+    """The -source (and maybe -matrix) args for a nonlinear refinement stage.
+
+    Default: refine the image the linear stage already produced, on the base grid.
+    ``in_source``: hand ffs_formwarp the linear stage's matrix and the *un*-allineated
+    input instead, and it inverts the matrix, pulls the base onto the source's grid and
+    solves there -- the source is never resampled. The resulting warp lives in source
+    space and therefore acts on the data BEFORE its affine, which is why plan.py swaps
+    the pair in the chain. Both halves have to agree or the chain silently composes in
+    the wrong order; they are driven by the same flag for exactly that reason.
+    """
+    if not in_source:
+        return [f'-source "{aligned}"']
+    return [f'-source "{native}"', f'-matrix "{matrix}"']
+
+
 def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
     """The concrete file(s) one warp-chain token resolves to. Single source of
     truth for both the full chain and the fmap sub-chain (no drift)."""
@@ -942,7 +958,12 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
                     "fwbatch",
                     [
                         f'-base "{base}"',
-                        f'-source "{xstem}.nii$FMT"',
+                        *_nl_source_args(
+                            opt.xfmap_nonlin_in_source,
+                            f"{xstem}.nii$FMT",
+                            src,
+                            f"{xstem}.aff12.1D",
+                        ),
                         f'-prefix "{xstem}_nl.nii$FMT"',
                         "-save_warp",
                         *_split_flags(config.DEFAULT_OPTS["xfmap_nl"]),
@@ -988,7 +1009,12 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
                 "fwbatch",
                 [
                     '-base "$base"',
-                    '-source "${xstem}${LANE}.nii$FMT"',
+                    *_nl_source_args(
+                        opt.xrun_nonlin_in_source,
+                        "${xstem}${LANE}.nii$FMT",
+                        src_var,
+                        "${xstem}.aff12.1D",
+                    ),
                     '-prefix "${xstem}_nl.nii$FMT"',
                     "-save_warp",
                     *_split_flags(config.DEFAULT_OPTS["xrun_nl"]),
@@ -1213,7 +1239,12 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                     "fwbatch",
                     [
                         '-base "$REFGM"',
-                        f'-source "{xstem}{lane_tag}.nii$FMT"',
+                        *_nl_source_args(
+                            opt.xses_nonlin_in_source,
+                            f"{xstem}{lane_tag}.nii$FMT",
+                            _sesmean(s, primary),
+                            f"{xstem}.aff12.1D",
+                        ),
                         f'-prefix "{xstem}_nl.nii$FMT"',
                         "-save_warp",
                         *_split_flags(config.DEFAULT_OPTS["xses_nl"]),

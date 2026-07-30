@@ -74,15 +74,18 @@ from .formwarp import (
     NO_Z_DISP,
     Field,
     _apply_axis_flags,
+    _apply_void_guard,
     _convergence_value,
     _resize_field,
     _resize_volume,
     _shrunk_shape,
     _smooth_field,
+    _void_guard_field,
     image_metric,
     invert_displacement_field,
 )
 from .interp import warp_image, warp_image_linear
+from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 
 _EPS = 1e-6
@@ -199,6 +202,11 @@ class OptiwarpConfig:
     """Fixed-point iterations for displacement-field inversion (the -save_inverse warp
     and, in diffeo mode, nothing else — the forward field is built by composition)."""
 
+    void_guard: float = 1.0
+    """Strength (0..1) of the no-data-boundary guard: how much of the void-normal
+    component of each update is removed near a coverage boundary. 0 disables it.
+    Only has an effect when the caller supplies coverage masks."""
+
     warp_flags: int = 0
     """Bit flags: 1=no-x-disp, 2=no-y-disp, 4=no-z-disp (matches qwarp/formwarp)."""
 
@@ -278,8 +286,19 @@ def prep_intensity(vol: Tensor, mode: str, sigma: float, mask: Tensor | None = N
             mu, sd = vol.mean(), vol.std()
         return (vol - mu) / sd.clamp(min=_EPS)
     if mode == "localnorm":
-        mu = _separable_smooth_3d(vol, sigma, kernel_type="gauss")
-        var = _separable_smooth_3d(vol * vol, sigma, kernel_type="gauss") - mu * mu
+        # Weighted local statistics. An unweighted local mean/variance at the edge of
+        # the mask is computed partly from whatever the mask exists to exclude -- a
+        # no-data void, or air beside the brain -- so the normalization is wrong
+        # exactly where the deformation is largest, and the flow force it feeds is
+        # wrong with it. With no mask this is the plain local z-score as before.
+        if mask is not None:
+            w = mask.float()
+            wn = _separable_smooth_3d(w, sigma, kernel_type="gauss").clamp(min=_EPS)
+            mu = _separable_smooth_3d(w * vol, sigma, kernel_type="gauss") / wn
+            var = _separable_smooth_3d(w * vol * vol, sigma, kernel_type="gauss") / wn - mu * mu
+        else:
+            mu = _separable_smooth_3d(vol, sigma, kernel_type="gauss")
+            var = _separable_smooth_3d(vol * vol, sigma, kernel_type="gauss") - mu * mu
         return (vol - mu) / var.clamp(min=_EPS).sqrt()
     raise ValueError(f"unknown match mode {mode!r}; choose from {MATCH_MODES}")
 
@@ -359,6 +378,7 @@ def _flow_lk(
     grad: tuple[Tensor, Tensor, Tensor],
     radius: int,
     reg: float,
+    weight: Tensor | None = None,
 ) -> Field:
     """Lucas-Kanade: per-voxel 3x3 least squares over a box neighbourhood.
 
@@ -367,12 +387,21 @@ def _flow_lk(
     window (both computed as box sums, i.e. separable smoothing). Solved in closed form
     by cofactor inversion — a batched ``linalg.solve`` over every voxel would allocate a
     (N,3,3) system and is pure overhead for a fixed 3x3.
+
+    ``weight`` makes it *weighted* least squares. Masking the resulting update is not
+    the same thing and is not enough: a window straddling the mask edge still builds
+    its structure tensor from voxels the mask excludes, so the solve is driven by a
+    no-data boundary or by air. Folding the weight into the box sums means each window
+    is fit only to the data it is allowed to see.
     """
     gx, gy, gz = grad
     diff = warped - fixed
 
     def box(v: Tensor) -> Tensor:
         return _separable_smooth_3d(v, float(radius), kernel_type="box")
+
+    if weight is not None:
+        gx, gy, gz = gx * weight, gy * weight, gz * weight
 
     a11, a22, a33 = box(gx * gx), box(gy * gy), box(gz * gz)
     a12, a13, a23 = box(gx * gy), box(gx * gz), box(gy * gz)
@@ -432,7 +461,11 @@ def _flow_hs(
 
 
 def _flow_update(
-    warped: Tensor, fixed: Tensor, fixed_grad: tuple[Tensor, Tensor, Tensor], cfg: OptiwarpConfig
+    warped: Tensor,
+    fixed: Tensor,
+    fixed_grad: tuple[Tensor, Tensor, Tensor],
+    cfg: OptiwarpConfig,
+    weight: Tensor | None = None,
 ) -> Field:
     """One optical-flow displacement increment for the current warped image."""
     grad = _grad3(warped)
@@ -441,7 +474,7 @@ def _flow_update(
     if cfg.force == "demons":
         return _flow_demons(warped, fixed, grad, cfg.demons_noise)
     if cfg.force == "lk":
-        return _flow_lk(warped, fixed, grad, cfg.lk_radius, cfg.lk_reg)
+        return _flow_lk(warped, fixed, grad, cfg.lk_radius, cfg.lk_reg, weight)
     if cfg.force == "hs":
         return _flow_hs(warped, fixed, grad, cfg.hs_alpha, cfg.hs_iters)
     raise ValueError(f"unknown force {cfg.force!r}; choose from {FORCES}")
@@ -460,6 +493,7 @@ def _optiflow_level(
     n_iter: int,
     cfg: OptiwarpConfig,
     level_tag: str = "",
+    guard: tuple[Tensor, ...] | None = None,
 ) -> tuple[Field, float]:
     """Run up to ``n_iter`` optical-flow updates at one resolution.
 
@@ -507,7 +541,7 @@ def _optiflow_level(
                 if _convergence_value(costs, window) < cfg.convergence_threshold:
                     break
 
-            ux, uy, uz = _flow_update(warped, fixed, fixed_grad, cfg)
+            ux, uy, uz = _flow_update(warped, fixed, fixed_grad, cfg, weight)
 
             # Drive the flow only from voxels the metric cares about; an unmasked
             # background gradient otherwise pulls the field outward at the edges.
@@ -515,6 +549,11 @@ def _optiflow_level(
 
             # Fluid regularization, then step-size control.
             ux, uy, uz = _smooth_field(ux, uy, uz, cfg.update_sigma)
+            # Drop whatever of the update points into a no-data region, leaving both
+            # tangential directions free. After the smoothing, so the fluid step cannot
+            # reintroduce a normal component from a neighbour.
+            if guard is not None:
+                ux, uy, uz = _apply_void_guard(ux, uy, uz, guard, cfg.void_guard)
             if flags:
                 ux, uy, uz = _apply_axis_flags(ux, uy, uz, flags)
             mag = float(torch.sqrt(ux**2 + uy**2 + uz**2).max())
@@ -576,6 +615,8 @@ def optiwarp(
     moving: Tensor,
     weight: Tensor | None = None,
     mask: Tensor | None = None,
+    fixed_cover: Tensor | None = None,
+    moving_cover: Tensor | None = None,
     config: OptiwarpConfig | None = None,
     device: torch.device | None = None,
 ) -> OptiwarpResult:
@@ -590,6 +631,11 @@ def optiwarp(
         weight: Optional (nz, ny, nx) weight image. Weights both the monitoring metric
             and the flow force. Defaults to ones (or ``mask`` if given).
         mask: Optional (nz, ny, nx) mask; used as a binary weight when ``weight`` is None.
+        fixed_cover: Optional (nz, ny, nx) mask of where ``fixed`` holds real data.
+        moving_cover: Optional (nz, ny, nx) mask of where ``moving`` holds real data.
+            Both are excluded from the metric and the flow force, *and* cross-filled
+            so the void presents no edge -- which matters more here than for SyN,
+            since ``-match gradmag`` is built out of edges.
         config: :class:`OptiwarpConfig`. Uses defaults if None.
         device: Torch device. Inferred from ``fixed`` if None.
 
@@ -612,6 +658,16 @@ def optiwarp(
     if mask is not None:
         mask = mask.float().to(device)
 
+    # Exclude each image's no-data region and cross-fill it from the other, so the
+    # void presents no edge for the flow to chase. Metric/force only -- ``moving`` is
+    # untouched, so the warped output keeps honest zeros. See mask.cross_fill_no_data.
+    f_metric, m_metric, cover = cross_fill_no_data(fixed, moving, fixed_cover, moving_cover)
+    if cover is not None:
+        if weight is not None:
+            weight = weight * cover.float()
+        else:
+            mask = cover.float() if mask is None else mask * cover.float()
+
     n_levels = len(cfg.shrink_factors)
     if not (len(cfg.smoothing_sigmas) == len(cfg.iterations) == n_levels):
         raise ValueError("shrink_factors, smoothing_sigmas and iterations must have equal length")
@@ -629,8 +685,12 @@ def optiwarp(
         n_iter = cfg.iterations[lev]
         target = _shrunk_shape(full_shape, factor)
 
-        f_lvl = _resize_volume(_separable_smooth_3d(fixed, sigma) if sigma > 0 else fixed, target)
-        m_lvl = _resize_volume(_separable_smooth_3d(moving, sigma) if sigma > 0 else moving, target)
+        f_lvl = _resize_volume(
+            _separable_smooth_3d(f_metric, sigma) if sigma > 0 else f_metric, target
+        )
+        m_lvl = _resize_volume(
+            _separable_smooth_3d(m_metric, sigma) if sigma > 0 else m_metric, target
+        )
 
         if weight is not None:
             w_lvl = _resize_volume(weight, target).clamp(min=0.0)
@@ -654,8 +714,14 @@ def optiwarp(
                 f"iters={n_iter} force={cfg.force} match={cfg.match}"
             )
 
+        # Rebuilt per level: the normal is grid-relative, so it must be measured on
+        # the grid the updates live on.
+        guard = None
+        if cover is not None and cfg.void_guard > 0.0:
+            guard = _void_guard_field(_resize_volume(cover.float(), target))
+
         fwd, best_cost = _optiflow_level(
-            f_prep, m_prep, w_lvl, fwd, n_iter, cfg, level_tag=f"L{lev + 1}"
+            f_prep, m_prep, w_lvl, fwd, n_iter, cfg, level_tag=f"L{lev + 1}", guard=guard
         )
 
     fwd = _resize_field(*fwd, full_shape)

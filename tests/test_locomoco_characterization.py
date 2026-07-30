@@ -75,8 +75,14 @@ def test_char_2d_flow():
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": -0.001030, "std": 0.411161, "q05": -0.527366, "q50": -0.058987,
-         "q95": 0.675630, "absmax": 0.844810},
+        {
+            "mean": -0.001030,
+            "std": 0.411161,
+            "q05": -0.527366,
+            "q50": -0.058987,
+            "q95": 0.675630,
+            "absmax": 0.844810,
+        },
     )
 
 
@@ -86,32 +92,60 @@ def test_char_2d_xcorr():
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": -0.007996, "std": 0.407173, "q05": -0.547944, "q50": -0.052291,
-         "q95": 0.676604, "absmax": 0.791614},
+        {
+            "mean": -0.007996,
+            "std": 0.407173,
+            "q05": -0.547944,
+            "q50": -0.052291,
+            "q95": 0.676604,
+            "absmax": 0.791614,
+        },
     )
 
 
 def test_char_3d_xcorr():
     r = L.estimate_residual_flow(
-        _phantom4d(), pe_axis=1, slice_axis=2, backend="xcorr", is_3dacq=True,
-        device=_DEV, verbose=False,
+        _phantom4d(),
+        pe_axis=1,
+        slice_axis=2,
+        backend="xcorr",
+        is_3dacq=True,
+        device=_DEV,
+        verbose=False,
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": 0.015923, "std": 0.398597, "q05": -0.519979, "q50": 0.000000,
-         "q95": 0.683320, "absmax": 0.845521},
+        {
+            "mean": 0.015923,
+            "std": 0.398597,
+            "q05": -0.519979,
+            "q50": 0.000000,
+            "q95": 0.683320,
+            "absmax": 0.845521,
+        },
     )
 
 
 def test_char_3d_flow():
     r = L.estimate_residual_flow(
-        _phantom4d(), pe_axis=1, slice_axis=2, backend="flow", is_3dacq=True,
-        device=_DEV, verbose=False,
+        _phantom4d(),
+        pe_axis=1,
+        slice_axis=2,
+        backend="flow",
+        is_3dacq=True,
+        device=_DEV,
+        verbose=False,
     )
     _assert_stats(
         r.pe_displacement(),
-        {"mean": -0.000821, "std": 0.409817, "q05": -0.522195, "q50": -0.071100,
-         "q95": 0.669497, "absmax": 0.756710},
+        {
+            "mean": -0.000821,
+            "std": 0.409817,
+            "q05": -0.522195,
+            "q50": -0.071100,
+            "q95": 0.669497,
+            "absmax": 0.756710,
+        },
     )
 
 
@@ -122,21 +156,39 @@ def test_char_me_joint():
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.018060, "std": 0.675731, "q05": -1.085326, "q50": -0.019396,
-         "q95": 0.990209, "absmax": 2.845777},
+        {
+            "mean": -0.018060,
+            "std": 0.675731,
+            "q05": -1.085326,
+            "q50": -0.019396,
+            "q95": 0.990209,
+            "absmax": 2.845777,
+        },
     )
     assert np.allclose(r.alpha.tolist(), [1.0, 0.19318, 0.17425], atol=ATOL)
 
 
 def test_char_me_fixed():
     r = L.estimate_residual_flow_multiecho(
-        _me_datas(), _TES, pe_axis=2, slice_axis=2, backend="xcorr", learn_scaling=False,
-        device=_DEV, verbose=False,
+        _me_datas(),
+        _TES,
+        pe_axis=2,
+        slice_axis=2,
+        backend="xcorr",
+        learn_scaling=False,
+        device=_DEV,
+        verbose=False,
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.000366, "std": 0.089310, "q05": -0.107882, "q50": -0.006136,
-         "q95": 0.110331, "absmax": 0.604402},
+        {
+            "mean": -0.000366,
+            "std": 0.089310,
+            "q05": -0.107882,
+            "q50": -0.006136,
+            "q95": 0.110331,
+            "absmax": 0.604402,
+        },
     )
 
 
@@ -146,8 +198,14 @@ def test_char_me_interecho():
     )
     _assert_stats(
         r.w_field,
-        {"mean": 0.046277, "std": 0.472227, "q05": -0.576482, "q50": 0.083549,
-         "q95": 0.655723, "absmax": 1.603773},
+        {
+            "mean": 0.046277,
+            "std": 0.472227,
+            "q05": -0.576482,
+            "q50": 0.083549,
+            "q95": 0.655723,
+            "absmax": 1.603773,
+        },
     )
 
 
@@ -157,6 +215,12 @@ def test_char_me_scaled():
     )
     _assert_stats(
         r.w_field,
-        {"mean": -0.004341, "std": 0.088442, "q05": -0.109205, "q50": -0.008755,
-         "q95": 0.113341, "absmax": 0.595628},
+        {
+            "mean": -0.004341,
+            "std": 0.088442,
+            "q05": -0.109205,
+            "q50": -0.008755,
+            "q95": 0.113341,
+            "absmax": 0.595628,
+        },
     )

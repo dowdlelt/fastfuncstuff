@@ -178,6 +178,71 @@ def test_formwarp_noxdis_zeros_x_component():
     assert res.moving_to_mid[1].abs().max().item() > 0.1
 
 
+def test_data_coverage_mask_peels_only_a_clipped_fov():
+    """All-true (and un-eroded) on a full volume; the zero wedge plus its resampling
+    ramp is excluded when one is present."""
+    from fastfuncstuff.processing.mask import data_coverage_mask
+
+    full = _blobs(12, 14, 16) + 1.0  # strictly nonzero everywhere
+    assert bool(data_coverage_mask(full, erode=2).all())  # no wedge => no peel
+
+    clipped = full.clone()
+    clipped[:, :, :4] = 0.0
+    cov = data_coverage_mask(clipped, erode=1)
+    assert not bool(cov[:, :, :5].any())  # wedge + one peeled ramp voxel
+    assert bool(cov[2:-2, 2:-2, 6:-2].all())  # interior untouched
+
+    raw = data_coverage_mask(clipped, erode=0)
+    assert torch.equal(raw, clipped != 0)
+
+
+def test_coverage_fill_beats_coverage_exclusion_on_a_clipped_wedge():
+    """A source whose FoV was clipped must not have tissue dragged into the empty wedge.
+
+    What makes this work is that the CC's *window statistics* are weighted, not just
+    its outer sum. Weighting only the sum decides which windows count but not what goes
+    into one, so every window within cc_radius of the boundary still averaged in the
+    void and chased the tissue/nothing cliff. Accumulating the boxes under the weight
+    means a boundary window measures only its covered part, and the cliff stops
+    existing as far as the metric is concerned.
+    """
+    from fastfuncstuff.processing.mask import data_coverage_mask
+
+    nz, ny, nx = 20, 32, 28
+    fixed = _blobs(nz, ny, nx) + 0.2
+    moving = _blobs(nz, ny, nx, shift=(0.0, 1.5, 0.0)) + 0.2
+    cut = 14  # the source lost everything below y < cut
+    moving[:, :cut, :] = 0.0
+
+    cfg = SynConfig(
+        metric="cc",
+        cc_radius=3,
+        grad_step=0.4,
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(25, 25),
+        verb=0,
+    )
+    cover = data_coverage_mask(moving, erode=1)
+
+    free = formwarp(fixed, moving, config=cfg, device=DEVICE)
+    excl = formwarp(fixed, moving, mask=cover.float(), config=cfg, device=DEVICE)
+    fill = formwarp(fixed, moving, moving_cover=cover, config=cfg, device=DEVICE)
+
+    # Displacement reaching down the clipped axis, in the band just above the cut.
+    def stretch(res) -> float:
+        return res.fwd[1][:, : cut + 4, :].abs().max().item()
+
+    assert stretch(excl) < 0.3 * stretch(free)
+    assert stretch(fill) < 0.3 * stretch(free)
+    # No tissue dragged into the wedge, and the output keeps honest zeros there
+    # (the fill is for the metric only -- it must never reach the warped image).
+    assert fill.warped[:, : cut - 2, :].abs().max() < 0.1 * free.warped[:, : cut - 2, :].max()
+    # The shared-support region is registered at least as well, not worse.
+    resid = lambda w: ((fixed - w)[:, cut + 2 :, :] ** 2).mean().item()  # noqa: E731
+    assert resid(fill.warped) <= resid(free.warped)
+
+
 def test_cli_timeseries_5d_and_folder_match(tmp_path):
     """CLI timeseries mode (4D -source): per-volume SyN writes a 4D warped series
     plus a warp series in both -warp_format modes, and the two formats agree."""
@@ -231,3 +296,52 @@ def test_cli_timeseries_5d_and_folder_match(tmp_path):
     assert n5 == nf == 3
     torch.testing.assert_close(y5, yf)
     torch.testing.assert_close(x5, xf)
+
+
+def test_cli_matrix_estimates_on_the_source_grid(tmp_path):
+    """-matrix inverts the source->base affine and pulls the base onto the SOURCE grid.
+
+    The source is then never resampled, and every output carries the source's grid and
+    header -- the warp lives in source space and is applied to the source *before* the
+    affine, i.e. ``ffs_nwarp -nwarp 'matrix.aff12.1D out_WARP.nii'``.
+    """
+    import numpy as np
+
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.cli.formwarp import main as fmain
+    from fastfuncstuff.processing.affine import (
+        apply_affine_interp,
+        save_matrix_1D,
+        voxel_matrix_to_dicom,
+    )
+
+    # Deliberately different grids, so "which grid did it use" is unambiguous.
+    nz, ny, nx = 16, 20, 18
+    snz, sny, snx = 14, 18, 16
+    base = _blobs(nz, ny, nx) + 0.2
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    src_affine = np.diag([2.0, 2.0, 2.0, 1.0])
+
+    m_b2s = torch.eye(4)  # base voxel -> source voxel (a pure shift here)
+    m_b2s[1, 3] = 1.0
+    source = apply_affine_interp(
+        base, torch.linalg.inv(m_b2s.double()).float(), output_shape=(snz, sny, snx)
+    )
+
+    bp, sp, mp = tmp_path / "b.nii.gz", tmp_path / "s.nii.gz", tmp_path / "m.aff12.1D"
+    nib.save(nib.Nifti1Image(base.permute(2, 1, 0).numpy(), affine), bp)
+    nib.save(nib.Nifti1Image(source.permute(2, 1, 0).numpy(), src_affine), sp)
+    save_matrix_1D(voxel_matrix_to_dicom(m_b2s, affine, src_affine), mp)
+
+    out = tmp_path / "out.nii.gz"
+    rc = fmain(
+        [
+            *("-base", str(bp), "-source", str(sp), "-matrix", str(mp)),
+            *("-prefix", str(out), "-save_warp", "-shrink", "2x1"),
+            *("-smooth", "1x0", "-iters", "4x3", "-device", "cpu", "-verb", "0"),
+        ]
+    )
+    assert rc == 0
+    # Outputs are on the SOURCE grid, not the base's -- the whole point of -matrix.
+    assert nib.load(str(out)).shape == (snx, sny, snz)
+    assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)

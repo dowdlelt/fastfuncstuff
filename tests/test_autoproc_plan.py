@@ -984,3 +984,66 @@ def test_anat_source_sbmean_needs_the_lane():
 
     s = write_script(build_plan(subj_sb, Options(anat_source="sbmean")), "wd", bids_root="/bids")
     assert '-source "stage08.grandmean.src-sbref.nii$FMT"' in s
+
+
+def test_nonlin_in_source_swaps_the_warp_past_its_own_affine():
+    """A warp estimated in the source's frame acts on the data BEFORE its affine.
+
+    _CHAIN_ORDER is written leftmost-acts-first on *coordinates*, so the default
+    "affine then warp" reads as (nl, lin); estimating in the source frame is the
+    other order. Only the one pair moves -- the other stages' links stay put, and a
+    stage left in the default mode keeps its default order in the same chain.
+    """
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1")]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    opts = dict(ref_ses="01", xses_nonlin=True, xrun_nonlin=True, anat_nonlin=True)
+    key = ("02", "foo", "1")
+
+    plain = _chain(build_plan(subj, Options(**opts)), key)
+    assert plain.index("xses_nl") < plain.index("xses_lin")
+
+    swapped = _chain(build_plan(subj, Options(**opts, xses_nonlin_in_source=True)), key)
+    assert swapped.index("xses_lin") < swapped.index("xses_nl")
+    # Only that pair moved: the anat link keeps its place relative to the stage,
+    # and xrun -- left in the default mode -- keeps the default order.
+    assert swapped.index("anat_nl") < swapped.index("xses_lin")
+    assert set(swapped) == set(plain)
+    if "wxrun_nl" in swapped:
+        assert swapped.index("wxrun_nl") < swapped.index("wxrun_lin")
+
+
+def test_nonlin_in_source_passes_the_matrix_and_the_unaligned_source():
+    """The emitted formwarp call must take -matrix and the *un*-allineated image.
+
+    If the script kept feeding the linear stage's output while the chain swapped,
+    the warp would be estimated in one space and composed as though it lived in
+    another -- silently, and only visibly as a bad alignment.
+    """
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1")]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    opts = dict(ref_ses="01", xses_nonlin=True)
+
+    plain = write_script(build_plan(subj, Options(**opts)), "wd", bids_root="/bids")
+    swapped = write_script(
+        build_plan(subj, Options(**opts, xses_nonlin_in_source=True)), "wd", bids_root="/bids"
+    )
+
+    assert "-matrix" not in plain
+    nl = [ln for ln in swapped.splitlines() if "_nl.nii" in ln and "-matrix" in ln]
+    assert nl, "no formwarp line carried -matrix"
+    for ln in nl:
+        assert ".aff12.1D" in ln
+        # the source must be what the LINEAR stage consumed, not what it produced.
+        # (manifest lines are printf'd, so the inner quotes arrive backslash-escaped)
+        src = re.search(r'-source "([^"]+)"', ln.replace('\\"', '"')).group(1)
+        assert "_nl" not in src and "sesmean" in src, src

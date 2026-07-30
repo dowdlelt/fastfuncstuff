@@ -298,7 +298,10 @@ class TestEdgeAndNGF:
 
     def test_ngf_recovers_shift_and_is_polarity_agnostic(self):
         best = {}
-        for label, (bright, base) in {"wm_bright": (100.0, 10.0), "wm_dark": (-100.0, 110.0)}.items():
+        for label, (bright, base) in {
+            "wm_bright": (100.0, 10.0),
+            "wm_dark": (-100.0, 110.0),
+        }.items():
             vol = _y_edge_volume(y0=20.0, bright=bright, base=base)
             grad = gradient_field(vol)
             pts, nrm = self._edge_pts(23.0)  # anat edge displaced +3 vox from the EPI edge

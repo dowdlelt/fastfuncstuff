@@ -48,7 +48,9 @@ def test_ribbon_wm_union_labels(tmp_path):
     rh[20:30, 10:30, 10:30] = 41
     _write(tmp_path / "lh.nii.gz", lh, aff)
     _write(tmp_path / "rh.nii.gz", rh, aff)
-    wm, hdr = _ribbon_wm(str(tmp_path / "lh.nii.gz"), str(tmp_path / "rh.nii.gz"), torch.device("cpu"))
+    wm, hdr = _ribbon_wm(
+        str(tmp_path / "lh.nii.gz"), str(tmp_path / "rh.nii.gz"), torch.device("cpu")
+    )
     assert wm.sum() > 0
     assert float(wm.max()) == 1.0  # binary union of the WM labels
     assert hdr is not None
@@ -58,14 +60,28 @@ def test_tissue_only_runs_and_writes_pve_outputs(tmp_path):
     _phantom(tmp_path)
     p = str(tmp_path / "bt")
     # No -wm_mask: the reference grid must come from a PVE.
-    main([
-        "-epi", str(tmp_path / "epi.nii.gz"),
-        "-1Dmatrix", str(tmp_path / "aff.aff12.1D"),
-        "-wm_pve", str(tmp_path / "wm_pve.nii.gz"),
-        "-gm_pve", str(tmp_path / "gm_pve.nii.gz"),
-        "-csf_pve", str(tmp_path / "csf_pve.nii.gz"),
-        "-target", "tissue", "-device", "cpu", "-prefix", p, "-verb", "0",
-    ])
+    main(
+        [
+            "-epi",
+            str(tmp_path / "epi.nii.gz"),
+            "-1Dmatrix",
+            str(tmp_path / "aff.aff12.1D"),
+            "-wm_pve",
+            str(tmp_path / "wm_pve.nii.gz"),
+            "-gm_pve",
+            str(tmp_path / "gm_pve.nii.gz"),
+            "-csf_pve",
+            str(tmp_path / "csf_pve.nii.gz"),
+            "-target",
+            "tissue",
+            "-device",
+            "cpu",
+            "-prefix",
+            p,
+            "-verb",
+            "0",
+        ]
+    )
     for name in ("wm", "gm", "csf"):
         out = tmp_path / f"bt_{name}_pve_in_epi.nii.gz"
         assert out.exists()
@@ -79,14 +95,30 @@ def test_tissue_only_runs_and_writes_pve_outputs(tmp_path):
 def test_combined_wm_tissue_runs(tmp_path):
     _phantom(tmp_path)
     p = str(tmp_path / "bwt")
-    main([
-        "-epi", str(tmp_path / "epi.nii.gz"),
-        "-1Dmatrix", str(tmp_path / "aff.aff12.1D"),
-        "-wm_mask", str(tmp_path / "wm.nii.gz"),
-        "-wm_pve", str(tmp_path / "wm_pve.nii.gz"),
-        "-gm_pve", str(tmp_path / "gm_pve.nii.gz"),
-        "-csf_pve", str(tmp_path / "csf_pve.nii.gz"),
-        "-target", "wm", "tissue", "-device", "cpu", "-prefix", p, "-verb", "0",
-    ])
+    main(
+        [
+            "-epi",
+            str(tmp_path / "epi.nii.gz"),
+            "-1Dmatrix",
+            str(tmp_path / "aff.aff12.1D"),
+            "-wm_mask",
+            str(tmp_path / "wm.nii.gz"),
+            "-wm_pve",
+            str(tmp_path / "wm_pve.nii.gz"),
+            "-gm_pve",
+            str(tmp_path / "gm_pve.nii.gz"),
+            "-csf_pve",
+            str(tmp_path / "csf_pve.nii.gz"),
+            "-target",
+            "wm",
+            "tissue",
+            "-device",
+            "cpu",
+            "-prefix",
+            p,
+            "-verb",
+            "0",
+        ]
+    )
     assert (tmp_path / "bwt_wm_in_epi.nii.gz").exists()
     assert (tmp_path / "bwt_gm_pve_in_epi.nii.gz").exists()

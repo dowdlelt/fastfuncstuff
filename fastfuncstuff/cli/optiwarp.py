@@ -38,10 +38,18 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import (
+    add_coverage_args,
+    add_verbose_arg,
+    combine_brain_masks,
+    image_support,
+    parse_prefix,
+    sanitize_volume,
+    spinner,
+)
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
-from fastfuncstuff.processing.mask import automask
+from fastfuncstuff.processing.mask import data_coverage_mask
 from fastfuncstuff.processing.optiwarp import (
     FORCES,
     MATCH_MODES,
@@ -402,10 +410,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Weight / mask
     p.add_argument("-weight", help="Weight image emphasizing the metric (overrides automask).")
-    p.add_argument(
-        "-automask",
-        action="store_true",
-        help="Restrict the metric and the flow force to an automask of the base.",
+    add_coverage_args(
+        p,
+        automask_help="Restrict the metric and the flow force to the automask of BOTH "
+        "images (unioned; see -automask_intersect). Independent of the data-coverage "
+        "restriction below.",
     )
 
     # Output interpolation
@@ -467,6 +476,7 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
         convergence_window=args.conv_window,
         convergence_threshold=args.conv_thresh,
         invert_iters=args.invert_iters,
+        void_guard=args.void_guard,
         warp_flags=warp_flags,
         final_qwarp=args.final_qwarp,
         qwarp_config=qcfg,
@@ -499,6 +509,9 @@ def main(argv: list[str] | None = None) -> int:
     with spinner(f"Loading {Path(args.source).name}"):
         source, _ = load_image(args.source, device=torch.device("cpu"))
 
+    base = sanitize_volume(base, "-base", args.verb)
+    source = sanitize_volume(source, "-source", args.verb)
+
     if base.ndim == 4:
         if args.verb >= 1:
             print("WARNING: 4D -base; using vol[0] as the fixed target")
@@ -518,15 +531,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Base/source: {nx}x{ny}x{nz}, loaded in {time.time() - t0:.1f}s")
 
     weight = None
-    mask = None
     if args.weight is not None:
         with spinner(f"Loading {Path(args.weight).name}"):
             weight, _ = load_image(args.weight, device=torch.device("cpu"))
-    elif args.automask:
-        mask = automask(base.float().to(device), device=device).float()
-        if args.verb >= 1:
-            frac = 100.0 * (mask > 0).float().mean().item()
-            print(f"Automask: {frac:.1f}% of voxels inside brain")
+        weight = weight.float().to(device)
+
+    base_brain, base_cover = image_support(
+        base, args, device, args.automask or args.automask_base, "base", args.verb
+    )
+    # Source automask on the temporal mean, not per frame: the brain does not move
+    # nearly enough between frames to matter and automask is the expensive part.
+    # Data coverage IS per frame -- see _run_timeseries.
+    src_ref = source.mean(dim=0) if source.ndim == 4 else source
+    src_brain, src_cover = image_support(
+        src_ref, args, device, args.automask or args.automask_source, "source", args.verb
+    )
+    brain = combine_brain_masks(base_brain, src_brain, args.automask_intersect)
+    mask = None
+    if brain is not None:
+        if weight is not None:
+            weight = weight * brain.float()
+        else:
+            mask = brain.float()
 
     config = _build_config(args)
     pfx = parse_prefix(args.prefix)
@@ -534,10 +560,30 @@ def main(argv: list[str] | None = None) -> int:
 
     if timeseries:
         return _run_timeseries(
-            args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+            args,
+            base,
+            source,
+            weight,
+            mask,
+            base_cover,
+            config,
+            base_info,
+            prefix,
+            nii_ext,
+            device,
+            t0,
         )
 
-    res = optiwarp(base, source, weight=weight, mask=mask, config=config, device=device)
+    res = optiwarp(
+        base,
+        source,
+        weight=weight,
+        mask=mask,
+        fixed_cover=base_cover,
+        moving_cover=src_cover,
+        config=config,
+        device=device,
+    )
 
     warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
@@ -575,7 +621,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_timeseries(
-    args, base, source, weight, mask, config, base_info, prefix, nii_ext, device, t0
+    args, base, source, weight, mask, base_cover, config, base_info, prefix, nii_ext, device, t0
 ) -> int:
     """Register every volume of a 4D source to the 3D base (per-volume optical flow).
 
@@ -594,7 +640,23 @@ def _run_timeseries(
     inv_frames: list[tuple] = []
     min_jac = float("inf")
     for t in tqdm(range(n_t), desc="optiwarp", disable=args.verb < 1, leave=True):
-        res = optiwarp(base, source[t], weight=weight, mask=mask, config=per_vol_cfg, device=device)
+        cover_t = (
+            None
+            if args.nocoverage
+            else data_coverage_mask(
+                source[t].float().to(device), erode=args.coverage_erode, device=device
+            )
+        )
+        res = optiwarp(
+            base,
+            source[t],
+            weight=weight,
+            mask=mask,
+            fixed_cover=base_cover,
+            moving_cover=cover_t,
+            config=per_vol_cfg,
+            device=device,
+        )
         warped_frames.append(res.warped.cpu())
         min_jac = min(min_jac, res.min_jacobian)
         if args.save_warp:

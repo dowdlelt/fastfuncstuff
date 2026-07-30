@@ -469,6 +469,12 @@ def automask(
 
     nz, ny, nx = vol.shape
 
+    # A single NaN poisons the whole thing: the clip level comes out NaN, every
+    # `vol >= clip` comparison is False, and the mask is empty -- a silent 0%-brain
+    # answer rather than an error. NaN is not brain, so treat it as background.
+    if not bool(torch.isfinite(vol).all()):
+        vol = torch.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0)
+
     # Step 1: clip level (matches THD_cliplevel)
     clip = _cliplevel(vol, mfrac=clip_frac)
     if verbose:
@@ -523,3 +529,85 @@ def automask(
             print(f"  automask: after dilate({dilate_extra}): {int(mask.sum().item()):,} voxels")
 
     return mask
+
+
+def data_coverage_mask(
+    vol: Tensor,
+    erode: int = 1,
+    device: torch.device | None = None,
+) -> Tensor:
+    """Voxels where ``vol`` actually holds acquired data: finite and not exactly zero.
+
+    Distinct from :func:`automask`: this is not "where is the brain" but "where did
+    the scanner (and any resampling since) put a real number". A volume that has been
+    rotated onto another grid — say by ``ffs_allineate`` after the subject turned
+    their head out of the FoV — carries a hard zero wedge where the source had no
+    data. A registration metric evaluated across that wedge sees a step edge and
+    happily stretches real tissue into it, so callers intersect this with their own
+    weight/mask to keep the metric inside the shared support of both images.
+
+    NaN/Inf count as no-data, and in practice are the commonest spelling of it: any
+    upstream step that divides by the data (a scaling or normalisation) turns the
+    exact-zero rim into NaN, so a volume can hold a fully empty slab and not contain
+    a single zero. Testing ``!= 0`` alone silently passes every one of those voxels
+    through as valid data.
+
+    ``erode`` peels the coverage boundary (6-connectivity) to drop the ramp of
+    partial-value voxels that linear/sinc resampling leaves one voxel inside the
+    empty wedge — nonzero, but a blend of tissue and nothing. A volume that is finite
+    and nonzero throughout has no wedge to protect, and is returned all-true without
+    erosion so this is a no-op on full-FoV data.
+    """
+    if device is not None:
+        vol = vol.to(device)
+
+    cover = torch.isfinite(vol) & (vol != 0)
+    if bool(cover.all()):
+        return cover
+    return _erode_6conn(cover, iterations=erode)
+
+
+def cross_fill_no_data(
+    fixed: Tensor,
+    moving: Tensor,
+    fixed_cover: Tensor | None,
+    moving_cover: Tensor | None,
+) -> tuple[Tensor, Tensor, Tensor | None]:
+    """Make a pair of images safe for a registration metric to compare.
+
+    Returns ``(fixed_metric, moving_metric, cover)``: copies of the two images with
+    each one's no-data region filled from the other, plus the shared support.
+
+    Excluding a no-data region from the metric is not enough on its own, and the
+    reason is easy to miss: exclusion stops the warp being *rewarded* for reaching
+    into the void, but it leaves the void's edge in plain view. Every local window
+    within the metric's radius of the boundary still straddles a cliff between tissue
+    and nothing, and that cliff is a strong feature the warp will try to align to
+    something. Filling the void from the other image makes the pair agree exactly
+    there, so the cliff is gone and the local gradient is ~0 -- the metric becomes
+    genuinely *indifferent* to the region rather than being fenced out of it.
+
+    Measured on a clipped 9.4T pair (max |dz| in the six slices above the source's
+    data floor): 12.81 unrestricted, 8.89 with brain masks, 7.99 adding coverage
+    exclusion, 0.69 adding this fill. The hard edge, not the weighting, is what drives
+    the artifact.
+
+    Callers must use the returned images for the METRIC ONLY and keep the originals
+    for the final resample -- filling the output would fabricate anatomy into a saved
+    image. Pass only *data coverage* here, never a brain automask: an automask
+    boundary is real anatomy, and cross-filling across it would splice one image's
+    skull into the other's, which a cross-modal metric would follow.
+    """
+    f_metric, m_metric = fixed, moving
+    if fixed_cover is not None:
+        fixed_cover = fixed_cover.to(fixed.device) > 0
+        f_metric = torch.where(fixed_cover, fixed, moving)
+    if moving_cover is not None:
+        moving_cover = moving_cover.to(moving.device) > 0
+        m_metric = torch.where(moving_cover, moving, fixed)
+
+    if fixed_cover is not None and moving_cover is not None:
+        cover = fixed_cover & moving_cover
+    else:
+        cover = fixed_cover if moving_cover is None else moving_cover
+    return f_metric, m_metric, cover
