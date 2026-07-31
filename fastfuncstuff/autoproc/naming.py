@@ -59,6 +59,12 @@ STAGE_NUMBERS: dict[str, int] = {
     "runmean": 7,
     "sesmean": 7,
     "xses": 8,
+    # One run, resampled straight from its post-moco space into grandmean space in
+    # a SINGLE interpolation (the whole pre-chain + xses composed). The grandmean
+    # is built from these, not from the session means: a mean of means is one
+    # interpolation deeper for every non-reference session, and that blur lands on
+    # the image the anat step and every downstream reference is estimated from.
+    "gmrun": 8,
     "grandmean": 8,
     "xref": 9,  # align this data's grandmean to an external -grand_reference
     "anat": 9,

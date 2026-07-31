@@ -90,6 +90,12 @@ class Options:
     xses_nonlin_in_source: bool = False
     ref_ses: str | None = None
     fmap_ref: list[str] | None = None
+    # -ref_image: which EPI-contrast image REPRESENTS a level. One vocabulary at
+    # two levels — it picks each session's cross-session alignment source AND
+    # (unless -anat_source overrides it) the image the anat step aligns. They are
+    # the same question: "what stands in for this data in the space above it?".
+    # None → the historical behaviour, i.e. the session mean for xses.
+    ref_image: str | None = None
     go_to_anat: bool = True  # False → final space is the EPI grandmean
     final_dxyz: str | None = None  # final output voxel size (mm); None → input EPI res
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
@@ -167,8 +173,15 @@ class PlanRun:
     # the xrun base, since blip_half undistorts *after* xrun in the chain.
     fmap_forward: str | None = None
     # The session's reference fmap id — the common (undistorted) grid that the
-    # cross-fmap alignment and the per-run premeans land on.
+    # cross-fmap alignment and the per-run premeans land on. Set for EVERY run of
+    # a session that has fieldmaps, including one with no fieldmap of its own:
+    # that run still has to land on this grid or it drops out of the session mean
+    # (bug of record: an unclaimed run aligned to the session's first run instead,
+    # so its runmean sat on a different grid AND was never undistorted).
     ref_fmap_id: str | None = None
+    # This run was not claimed by any fieldmap's IntendedFor / acquisition time and
+    # inherited the session's reference group. Header-note only.
+    fmap_inherited: bool = False
     warp_chain: list[str] = field(default_factory=list)
     # This run's SBRef is usable as an alignment source: it exists, and the moco
     # base IS that SBRef — which is what puts it in the run's post-moco space
@@ -228,54 +241,92 @@ def ref_anchor(plan: Plan) -> PlanRun | None:
     return with_fmap[0] if with_fmap else None
 
 
-def anchor_fmap_ids(plan: Plan) -> list[str]:
-    """Fieldmap ids in the anchor's session, reference first — the groups whose
-    aligned means ``mean_fmap`` averages. Cross-*session* fmaps are excluded: they
-    only reach the anchor grid via ``xses``, which is computed downstream of here.
-    """
-    anchor = ref_anchor(plan)
-    if anchor is None:
-        return []
-    ref_id = anchor.fmap.fmap_id if anchor.fmap else None
+def session_fmap_ids(plan: Plan, session: str | None) -> list[str]:
+    """Fieldmap ids in one session, that session's reference first — the groups
+    whose aligned means its ``mean_fmap`` representative averages."""
     ids: list[str] = []
+    ref_id: str | None = None
     for pr in plan.runs:
-        if pr.fmap is None or pr.bold.session != anchor.bold.session:
+        if pr.fmap is None or pr.bold.session != session:
             continue
         if pr.fmap.fmap_id not in ids:
             ids.append(pr.fmap.fmap_id)
-    if ref_id in ids:  # reference group first
+        if pr.is_ref_fmap:
+            ref_id = pr.fmap.fmap_id
+    if ref_id in ids:
         ids.remove(ref_id)
         ids.insert(0, ref_id)
     return ids
 
 
+def effective_ref_image(plan: Plan, session: str | None, requested: str) -> str:
+    """Resolve a representative-image request against what ONE session can supply.
+
+    ``ref_fmap`` / ``mean_fmap`` need fieldmaps in *that* session; without them its
+    own mean is the only image there is. ``mean_fmap`` with a single group
+    degenerates to ``ref_fmap`` — averaging one image is just that image.
+    ``sbmean`` needs the SBRef lane (dataset-wide, by construction).
+    """
+    # "grandmean" names the level's OWN mean of the data — the session mean at the
+    # session level, THE grandmean at the top. One token, because it is one idea.
+    if requested == "grandmean":
+        return requested
+    if requested == "sbmean":
+        return requested if plan.use_sbref else "grandmean"
+    ids = session_fmap_ids(plan, session)
+    if not ids:
+        return "grandmean"
+    if requested == "mean_fmap" and len(ids) == 1:
+        return "ref_fmap"
+    return requested
+
+
+def session_ref_mode(plan: Plan, session: str | None) -> str:
+    """Which representative image stands in for ``session`` at the cross-session
+    alignment, resolved against what that session has. Defaults to the session's
+    own mean, which is what the pipeline always used."""
+    return effective_ref_image(plan, session, plan.options.ref_image or "grandmean")
+
+
 def effective_anat_source(plan: Plan, requested: str | None = None) -> str:
     """Resolve an anat-source request against what the data can actually supply.
 
-    ``ref_fmap`` / ``mean_fmap`` need fieldmaps; without them the grandmean is the
-    only EPI-contrast image there is (and ``ffs_segment`` is then what recovers the
-    distortion). ``mean_fmap`` with a single group degenerates to ``ref_fmap`` —
-    averaging one image is just that image. ``sbmean`` needs the SBRef lane.
+    Same vocabulary as ``-ref_image``, resolved against the *anchor* session —
+    with one extra condition the per-session resolver cannot know about: the anat
+    step aligns an image that must live in **grandmean space**, i.e. the reference
+    session's. When the reference session has no fieldmap of its own, ``ref_anchor``
+    falls back to some other session's group, whose undistorted mean is NOT in that
+    space (it only gets there through xses, which is estimated downstream). Taking
+    it would estimate the anat matrix in the wrong frame, so the fieldmap-based
+    choices degrade to the grandmean there (bug of record).
     """
     mode = requested if requested is not None else plan.options.anat_source
     if mode == "grandmean":
         return mode
     if mode == "sbmean":
         return mode if plan.use_sbref else "grandmean"
-    ids = anchor_fmap_ids(plan)
-    if not ids:
+    anchor = ref_anchor(plan)
+    if anchor is None or anchor.bold.session != plan.ref_session:
         return "grandmean"
-    if mode == "mean_fmap" and len(ids) == 1:
-        return "ref_fmap"
-    return mode
+    return effective_ref_image(plan, anchor.bold.session, mode)
 
 
 def _resolve_ref_session(subject: Subject, opt: Options) -> str | None:
+    """The session everything else is aligned to (its reference fieldmap defines
+    the final EPI space).
+
+    An unrecognised ``-ref_ses`` raises rather than quietly falling back to the
+    first session: the reference is the one choice that changes every warp chain
+    in the script, and a typo'd label would produce a plausible-looking pipeline
+    anchored on the wrong session.
+    """
     labels = [s.session for s in subject.sessions]
     if opt.ref_ses is not None:
         want = opt.ref_ses[len("ses-") :] if opt.ref_ses.startswith("ses-") else opt.ref_ses
         if want in labels:
             return want
+        have = ", ".join(str(lab) for lab in labels) or "(none scanned)"
+        raise ValueError(f"-ref_ses {opt.ref_ses!r}: no such session in scope. Scanned: {have}")
     return labels[0] if labels else None
 
 
@@ -291,13 +342,39 @@ def _resolve_ref_fmap(session_fmaps: list[FmapGroup], opt: Options) -> FmapGroup
     return session_fmaps[0]
 
 
-def _fmap_for_run(run: BoldRun, session_fmaps: list[FmapGroup]) -> FmapGroup | None:
+def _pe_compatible(run: BoldRun, fg: FmapGroup) -> bool:
+    """True when ``fg``'s displacement field is applicable to ``run`` — same phase-
+    encode axis AND polarity. An unknown direction on either side is permissive
+    (the scan is quirk-tolerant; the common case is a sidecar that omits it).
+
+    Polarity matters as much as the axis: applying an AP field to a PA run doubles
+    the distortion instead of removing it.
+    """
+    a, b = run.pe_dir, fg.pe_dir
+    return not a or not b or a == b
+
+
+def _fmap_for_run(
+    run: BoldRun, session_fmaps: list[FmapGroup], ref_fmap: FmapGroup | None = None
+) -> tuple[FmapGroup | None, bool]:
+    """This run's fieldmap group, and whether it was inherited rather than claimed.
+
+    ``IntendedFor`` (resolved in bids.py) is authoritative. A run no group claims
+    falls back to the session's *reference* group when that group's field is
+    applicable — one unclaimed run is far more likely to be a sidecar omission
+    than a run genuinely acquired with no usable fieldmap, and the alternative
+    (no fieldmap at all) strands it off the session's common grid. A run whose PE
+    direction rules the reference field out gets no group: it still lands on the
+    common grid (see ``_xrun_base``), just without undistortion.
+    """
     # intended_runs holds (task, run) pairs, so this is collision-proof across
     # tasks that share run numbers (rest/run-01 vs skilled/run-01).
     for fg in session_fmaps:
         if (run.task, run.run) in fg.intended_runs:
-            return fg
-    return None
+            return fg, False
+    if ref_fmap is not None and _pe_compatible(run, ref_fmap):
+        return ref_fmap, True
+    return None, False
 
 
 def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str]:
@@ -393,7 +470,9 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                         break
         ref_fmap_id = ref_fmap.fmap_id if ref_fmap is not None else None
         for bold in sess.bold_runs:
-            fmap = _fmap_for_run(bold, sess.fmaps) if has_fmaps else None
+            fmap, inherited = (
+                _fmap_for_run(bold, sess.fmaps, ref_fmap) if has_fmaps else (None, False)
+            )
             pr = PlanRun(
                 bold=bold,
                 fmap=fmap,
@@ -403,7 +482,10 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 ),
                 is_ref_run=(not has_fmaps and bold.run == session_first_run),
                 fmap_forward=(forward_by_fmap.get(fmap.fmap_id) if fmap else None),
-                ref_fmap_id=(ref_fmap_id if fmap else None),
+                # Every run of a fieldmap session shares the session's common grid,
+                # whether or not it has a fieldmap of its own.
+                ref_fmap_id=(ref_fmap_id if has_fmaps else None),
+                fmap_inherited=inherited,
                 # Only ``-moco_ref sbref`` makes the SBRef the post-moco space; any
                 # other base leaves it an unregistered image with no transform of
                 # its own, so the lane is off.

@@ -25,10 +25,11 @@ from fastfuncstuff.autoproc.naming import STAGE_NUMBERS, NameKey, coord, stem
 from fastfuncstuff.autoproc.plan import (
     Plan,
     PlanRun,
-    anchor_fmap_ids,
     effective_anat_source,
     ref_anchor,
     sbref_chain,
+    session_fmap_ids,
+    session_ref_mode,
 )
 
 _TOOLS = [
@@ -304,63 +305,108 @@ def _ref_blip_mean(pr: PlanRun) -> str:
 # ---------------------------------------------------------------------------
 # lanes
 #
-# Two parallel image lineages run the length of the mean pyramid, describing the
-# same anatomy in the same spaces:
+# Parallel image lineages run the length of the mean pyramid, describing the same
+# anatomy in the same spaces. One set of transforms is estimated (from the
+# primary lane) and every lane is resampled by it, so any two lanes are directly
+# comparable at every level:
 #
 #   LANE_MEAN   each run's motion-corrected BOLD mean (what this pipeline always
-#               built). Multiband contrast, high SNR, two interpolations deep by
-#               the grandmean — moco resampled the series before averaging it.
+#               built). Multiband contrast, high SNR — but motion carries edge
+#               voxels out of the FoV, and averaging a zero into those frames
+#               DIMS the very edges registration needs.
 #   LANE_SBREF  each run's SBRef. Single-band, no slice-leakage artefact, sharper
-#               tissue contrast, and ONE interpolation deep because the SBRef is
-#               the moco base and so needs no within-run transform at all.
+#               tissue contrast, ONE interpolation deep because the SBRef is the
+#               moco base and needs no within-run transform at all — and, being a
+#               single volume, it has no coverage deficit to repair.
+#   LANE_MAX    each run's motion-corrected temporal MAX: the union of every voxel
+#               imaged in any frame. Keeps the edges the mean loses, and it is the
+#               lineage that COMPOSES — max-of-maxes up the pyramid keeps the most
+#               brain in the most places, where a mean of means only ever loses.
+#   LANE_MIN    the counterpart: 0 wherever any frame lost the voxel, so
+#               min-of-mins is exactly the region with complete data everywhere.
+#               Not a registration lane — a coverage floor, carried for masking.
 #
-# The SBRef lane is the better *registration* source, so it estimates the
-# transforms when it exists (see ``_primary_lane``). The mean lane is kept and
-# resampled by those same transforms: it is the data's own view of the same
-# space, which makes a lane-vs-lane comparison a direct sanity check.
+# Compositing is per lane (``_lane_reduce``): means average, maxes take the max,
+# mins take the min. Averaging a lane of mins would be meaningless.
 # ---------------------------------------------------------------------------
 
 LANE_MEAN = "mean"
 LANE_SBREF = "sbref"
+LANE_MAX = "max"
+LANE_MIN = "min"
+
+# How each lane composites when several of its images are combined into the level
+# above (the ffs_util_3dmath reduction flag).
+_LANE_REDUCE = {LANE_MEAN: "-mean", LANE_SBREF: "-mean", LANE_MAX: "-max", LANE_MIN: "-min"}
 
 
 def _src(lane: str) -> str | None:
     """The ``src-`` naming token for a lane (None = the mean lane, untokenised so
     every pre-lane filename is unchanged)."""
-    return "sbref" if lane == LANE_SBREF else None
+    return None if lane == LANE_MEAN else lane
 
 
 def _lanes(plan: Plan) -> tuple[str, ...]:
     """Lanes to build, primary first."""
-    return (LANE_SBREF, LANE_MEAN) if plan.use_sbref else (LANE_MEAN,)
+    coverage = (LANE_MAX, LANE_MIN)
+    return ((LANE_SBREF,) if plan.use_sbref else ()) + coverage + (LANE_MEAN,)
 
 
 def _primary_lane(plan: Plan) -> str:
-    """The lane that *estimates* the cross-run and cross-session transforms."""
-    return LANE_SBREF if plan.use_sbref else LANE_MEAN
+    """The lane that *estimates* the cross-run and cross-session transforms.
+
+    The SBRef leads where it exists: it is a single full-FoV volume, so the edge
+    loss LANE_MAX repairs never happened to it, and it is sharper besides. With no
+    SBRef the max leads — same geometry as the mean, but with the moving edges
+    still in it, which is exactly what the cost function needs at the FoV rim.
+    """
+    return LANE_SBREF if plan.use_sbref else LANE_MAX
+
+
+def _lane_reduce(lane: str) -> str:
+    return _LANE_REDUCE[lane]
+
+
+def _lane_nwarp_flags(lane: str) -> list[str]:
+    """The shared nwarp defaults with this lane's interpolation override applied.
+
+    The min lane's information is its zero boundary; wsinc5 rings across it and
+    smears the very edge the map exists to mark, so it resamples linearly. The
+    override REPLACES the default ``-interp`` rather than trailing it — a line
+    carrying two ``-interp`` flags parses fine and reads like a bug.
+    """
+    flags = _split_flags(config.DEFAULT_OPTS["nwarp"])
+    if lane != LANE_MIN:
+        return flags
+    return ["-interp linear" if f.startswith("-interp ") else f for f in flags]
 
 
 def _run_level(pr: PlanRun, lane: str) -> str:
     """A run's native-space image for this lane, in the run's post-moco space."""
     if lane == LANE_SBREF:
         return str(pr.bold.sbref_path)
-    return _moco_mean(pr)
+    return _moco_reduction(pr, lane)
 
 
 def _run_level_var(lane: str) -> str:
     """``_run_level`` as a bash data-table reference (for the stage loops)."""
-    return "${SBREF[$k]}" if lane == LANE_SBREF else "${MOCOMEAN[$k]}"
+    if lane == LANE_SBREF:
+        return "${SBREF[$k]}"
+    return f"${{MOCO_{lane.upper()}[$k]}}"
 
 
 def _common_grid(pr: PlanRun, session_first: PlanRun, lane: str) -> str:
     """The grid this run's runmean lands on — the space its session averages in.
 
-    With fieldmaps that is the reference fmap's undistorted mean; without, the
-    session's anchor run. Both lanes' images share a run's native geometry (an
-    SBRef is acquired on its BOLD's grid), so the lanes stay voxel-comparable
-    whichever is asked for.
+    In a session with fieldmaps that is the reference fmap's undistorted mean, for
+    EVERY run of the session: a run with no fieldmap of its own still has to land
+    there, or its runmean sits on a different grid from its siblings' and the
+    session mean is averaging incompatible images (bug of record). Without
+    fieldmaps the grid is the session's anchor run. Every lane's image shares a
+    run's native geometry (an SBRef is acquired on its BOLD's grid), so this is one
+    grid however many lineages ride it.
     """
-    if pr.fmap is not None:
+    if pr.ref_fmap_id is not None:
         return _ref_blip_mean(pr)
     return _run_level(session_first, lane)
 
@@ -394,43 +440,68 @@ def _ref_marker(key: NameKey, source: str, note: str) -> str:
     return f'# {note}\n[ -f "{dst}" ] || cp -f "{source}" "{dst}"'
 
 
-def _fmapmean(plan: Plan) -> str:
-    """The ``mean_fmap`` image: mean of the anchor session's fmap means."""
-    anchor = ref_anchor(plan)
-    ses = anchor.bold.session if anchor else None
-    return stem(NameKey("fmapmean", session=ses)) + ".nii$FMT"
+def _sessions(plan: Plan) -> list[str | None]:
+    """Session labels in scan order (the None-session case yields ``[None]``)."""
+    out: list[str | None] = []
+    for pr in plan.runs:
+        if pr.bold.session not in out:
+            out.append(pr.bold.session)
+    return out
 
 
-def _fmapmean_inputs(plan: Plan) -> list[str]:
-    """The per-group means averaged into ``mean_fmap``, all already on the
-    reference-fmap grid: the reference group's own blip mean, plus each non-ref
-    group's xfmap-aligned mean (nonlinear result when ``-xfmap_nonlin`` ran)."""
+def _fmapmean(plan: Plan, session: str | None) -> str:
+    """The ``mean_fmap`` image for a session: the mean of its fmap group means."""
+    return stem(NameKey("fmapmean", session=session)) + ".nii$FMT"
+
+
+def _anchor_session(plan: Plan) -> str | None:
     anchor = ref_anchor(plan)
-    if anchor is None:
+    return anchor.bold.session if anchor else None
+
+
+def _session_ref_fmap_mean(plan: Plan, session: str | None) -> str:
+    """That session's reference fieldmap's undistorted mean — the image that
+    DEFINES its common grid."""
+    ids = session_fmap_ids(plan, session)
+    return stem(NameKey("blip", session=session, fmap=ids[0] if ids else None)) + "_mean.nii$FMT"
+
+
+def _fmapmean_inputs(plan: Plan, session: str | None) -> list[str]:
+    """The per-group means averaged into one session's ``mean_fmap``, all already
+    on that session's reference-fmap grid: the reference group's own blip mean,
+    plus each non-ref group's xfmap-aligned mean (nonlinear result when
+    ``-xfmap_nonlin`` ran)."""
+    ids = session_fmap_ids(plan, session)
+    if not ids:
         return []
-    ses = anchor.bold.session
-    ref_id = anchor.fmap.fmap_id if anchor.fmap else None
     nl = plan.options.xfmap_nonlin
     files = []
-    for fid in anchor_fmap_ids(plan):
-        if fid == ref_id:
-            files.append(stem(NameKey("blip", session=ses, fmap=fid)) + "_mean.nii$FMT")
+    for fid in ids:
+        if fid == ids[0]:  # session_fmap_ids puts the reference group first
+            files.append(stem(NameKey("blip", session=session, fmap=fid)) + "_mean.nii$FMT")
         else:
-            st = stem(NameKey("xfmap", session=ses, fmap=fid))
+            st = stem(NameKey("xfmap", session=session, fmap=fid))
             files.append(f"{st}_nl.nii$FMT" if nl else f"{st}.nii$FMT")
     return files
 
 
-def _needs_fmapmean(plan: Plan) -> bool:
-    """True when anything asks for the ``mean_fmap`` image — the anat linear step
-    or (independently) ffs_segment's input — so stage05 knows to build it."""
+def _fmapmean_sessions(plan: Plan) -> list[str | None]:
+    """Sessions needing a ``mean_fmap`` built in stage05: the anat step's (or
+    ffs_segment's) request, plus any session whose ``-ref_image`` representative
+    for the cross-session alignment is ``mean_fmap``."""
     opt = plan.options
-    if not opt.go_to_anat:
-        return False  # no anat step, nothing consumes it
-    requests = [opt.anat_source]
-    if opt.anat_nonlin:
-        requests.append(opt.anat_nonlin_input)
-    return any(effective_anat_source(plan, r) == "mean_fmap" for r in requests)
+    want: list[str | None] = []
+    if opt.go_to_anat:
+        requests = [opt.anat_source]
+        if opt.anat_nonlin:
+            requests.append(opt.anat_nonlin_input)
+        if any(effective_anat_source(plan, r) == "mean_fmap" for r in requests):
+            want.append(_anchor_session(plan))
+    if plan.multi_session:
+        for ses in _sessions(plan):
+            if session_ref_mode(plan, ses) == "mean_fmap" and ses not in want:
+                want.append(ses)
+    return want
 
 
 def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
@@ -457,8 +528,26 @@ def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
         if anchor is not None:
             return _ref_blip_mean(anchor)
     elif mode == "mean_fmap":
-        return _fmapmean(plan)
+        return _fmapmean(plan, _anchor_session(plan))
     return _grandmean()
+
+
+def _ref_image_file(plan: Plan, session: str | None, lane: str) -> str:
+    """The image that represents ``session`` at the cross-session alignment.
+
+    Same vocabulary as ``-anat_source``, one level down — see
+    ``plan.session_ref_mode``. The fieldmap choices are lane-free (there is one
+    fieldmap image, not one per lineage), so a lane only reaches this for the
+    data-mean choices; that is what keeps every lane resampled by ONE transform.
+    """
+    mode = session_ref_mode(plan, session)
+    if mode == "ref_fmap":
+        return _session_ref_fmap_mean(plan, session)
+    if mode == "mean_fmap":
+        return _fmapmean(plan, session)
+    if mode == "sbmean":
+        return _sesmean(session, LANE_SBREF)
+    return _sesmean(session, lane)
 
 
 # ---------------------------------------------------------------------------
@@ -466,15 +555,20 @@ def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _moco_mean(pr: PlanRun) -> str:
-    """The registration-target mean for a run (locomoco mean if enabled).
+def _moco_reduction(pr: PlanRun, which: str) -> str:
+    """One temporal reduction of a run's corrected series (locomoco's when enabled).
 
-    Filenames match the tools' own output naming: ffs_moco writes the file we
-    pass to ``-save_mean``; ffs_locomoco writes ``{stem}_locomoco_mean``.
+    Filenames match the tools' own output naming: ffs_moco writes the files we
+    pass to ``-save_{mean,max,min}``; ffs_locomoco writes ``{stem}_locomoco_{which}``.
     """
     if pr.warp_chain and "locomoco" in pr.warp_chain:
-        return _run_stem(pr, "nlmoco") + "_locomoco_mean.nii$FMT"
-    return _run_stem(pr, "moco") + "_mean.nii$FMT"
+        return _run_stem(pr, "nlmoco") + f"_locomoco_{which}.nii$FMT"
+    return _run_stem(pr, "moco") + f"_{which}.nii$FMT"
+
+
+def _moco_mean(pr: PlanRun) -> str:
+    """The registration-target mean for a run."""
+    return _moco_reduction(pr, LANE_MEAN)
 
 
 def _xrun_base(pr: PlanRun, session_first: PlanRun, lane: str = LANE_MEAN) -> str | None:
@@ -485,12 +579,19 @@ def _xrun_base(pr: PlanRun, session_first: PlanRun, lane: str = LANE_MEAN) -> st
     forward image is already ``BoldRun.rep``, i.e. the SBRef when one exists, so
     the fieldmap path has always had an SBRef base; what the lane changes is the
     *source* it is matched against.
-    No-fmap: the session's first run, same lane as the source.
+    Fieldmap session, run with no usable fieldmap (PE direction rules the
+    reference field out): the reference group's UNdistorted mean. Its chain has no
+    blip_half, so this is the one base that still lands it on the session's common
+    grid — cross-contrast (distorted source, undistorted base) but in the right
+    space, which beats being correctly registered to the wrong one.
+    No-fmap session: the session's first run, same lane as the source.
     """
     if "wxrun_lin" not in pr.warp_chain:
         return None
     if pr.fmap is not None:
         return pr.fmap_forward
+    if pr.ref_fmap_id is not None:
+        return _ref_blip_mean(pr)
     return _run_level(session_first, lane)  # first-run anchor
 
 
@@ -548,6 +649,32 @@ def _sbref_header_note(plan: Plan) -> str:
     )
 
 
+def _lane_header_note(plan: Plan) -> str:
+    """What the coverage lanes are and which lineage estimates the transforms."""
+    return (
+        f"\n#     lanes: {', '.join(_lanes(plan))} — one set of transforms, estimated from"
+        f"\n#     '{_primary_lane(plan)}', applied to every lineage. src-max is the temporal MAX of"
+        "\n#     each run (the union of every voxel any frame saw), composited up the"
+        "\n#     pyramid with max-of-maxes, so edges motion cost one run survive in the"
+        "\n#     grandmean instead of being averaged away. src-min is its counterpart:"
+        "\n#     min-of-mins, >0 exactly where every frame of every run has data."
+    )
+
+
+def _fmap_inherit_note(plan: Plan) -> str:
+    """Runs no fieldmap claimed, which took the session's reference group instead —
+    a guess worth stating out loud, since it silently undistorts real data."""
+    borrowed = [_frag(pr) for pr in plan.runs if pr.fmap_inherited]
+    if not borrowed:
+        return ""
+    shown = ", ".join(borrowed[:4]) + (" ..." if len(borrowed) > 4 else "")
+    return (
+        f"\n#   inherited fmap    : {len(borrowed)} run(s) matched no IntendedFor/acq-time and"
+        f"\n#     took the session's REFERENCE fieldmap: {shown}."
+        "\n#     Check that is right — fix IntendedFor if it is not."
+    )
+
+
 def _header(plan: Plan, out_dir: str) -> str:
     opt = plan.options
     # Phase working files are plain gzip whatever FMT is: ROMEO (and every other
@@ -573,6 +700,8 @@ def _header(plan: Plan, out_dir: str) -> str:
 #   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {opt.distortion}   slice-timing : {opt.slicetiming_method}
 #   phase  : {_phase_on(plan)}{_timing_header_note(plan)}
 #   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
+#   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
+#   ref image         : {opt.ref_image or "grandmean"} (session representative for xses; -ref_image){_fmap_inherit_note(plan)}
 # =============================================================================
 set -euo pipefail
 
@@ -600,9 +729,13 @@ def _data_arrays(plan: Plan) -> str:
     keys = [_key(pr) for pr in plan.runs]
     primary = _primary_lane(plan)
     lines.append("RUN_KEYS=(" + " ".join(shlex.quote(k) for k in keys) + ")")
+    # One MOCO_<LANE> array per BOLD-derived lineage (MOCO_MEAN / MOCO_MAX /
+    # MOCO_MIN); the SBRef lane reads SBREF directly. REFGRID is lane-free: every
+    # lane's image is on the run's own geometry, so they share one target grid.
+    moco_arrays = " ".join(f"MOCO_{ln.upper()}" for ln in _lanes(plan) if ln != LANE_SBREF)
     lines.append(
-        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN MOCOMEAN XRUNBASE "
-        "ALIGNED ALIGNED_SB PRECHAIN REFGRID REFGRID_SB JAC"
+        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN XRUNBASE "
+        f"{moco_arrays} PRECHAIN REFGRID JAC"
     )
 
     # first run per session (the no-fmap anchor).
@@ -630,24 +763,22 @@ def _data_arrays(plan: Plan) -> str:
         # These values contain the bash var $FMT and must expand at assignment,
         # so they are double-quoted (not shlex-quoted). The key and the values
         # are our own constructed names — no shell metacharacters beyond $FMT.
-        lines.append(f'MOCOMEAN[{q(k)}]="{_moco_mean(pr)}"')
+        for lane in _lanes(plan):
+            if lane == LANE_SBREF:
+                continue
+            lines.append(f'MOCO_{lane.upper()}[{q(k)}]="{_moco_reduction(pr, lane)}"')
         # xrun base is lane-aware only in the no-fmap case; with a fieldmap it is
         # the group's forward image (already the SBRef when there is one).
         base = _xrun_base(pr, first_by_ses[b.session], primary)
         if base is not None:
             lines.append(f'XRUNBASE[{q(k)}]="{base}"')
-        lines.append(f'ALIGNED[{q(k)}]="{_aligned_mean(pr, LANE_MEAN)}"')
-        # Pre-chain (lane image → the session's common grid) + that grid, per
-        # lane. Empty for a no-fmap session's anchor run: it defines the grid.
+        # Pre-chain (lane image → the session's common grid) + that grid. Empty for
+        # a no-fmap session's anchor run: it defines the grid.
         pre = _pre_chain(pr, ".nii$FMT")
         if pre:
             lines.append(f'PRECHAIN[{q(k)}]="{" ".join(pre)}"')
-        lines.append(f'REFGRID[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], LANE_MEAN)}"')
+        lines.append(f'REFGRID[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], primary)}"')
         if plan.use_sbref:
-            lines.append(f'ALIGNED_SB[{q(k)}]="{_aligned_mean(pr, LANE_SBREF)}"')
-            lines.append(
-                f'REFGRID_SB[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], LANE_SBREF)}"'
-            )
             # The SBRef rides the run's chain minus the within-run motion tokens:
             # it IS the moco base, so it needs no transform of its own.
             sbchain = chain_files(pr, ".nii$FMT", plan.options, tokens=sbref_chain(pr))
@@ -836,6 +967,15 @@ done
 """
 
 
+def _moco_reduction_flags() -> str:
+    """``-save_mean/-save_max/-save_min`` for the stage02 manifest line (escaped for
+    the printf that writes it). One resample, three images: the mean the pipeline
+    always used, plus the coverage pair the max/min lanes are built from."""
+    return " ".join(
+        f'-save_{which} \\"${{mstem}}_{which}.nii$FMT\\"' for which in ("mean", "max", "min")
+    )
+
+
 def _stage_moco(plan: Plan, script_stem: str) -> str:
     moco_flags = " ".join(_split_flags(config.DEFAULT_OPTS["moco"]))
     batchfile = f"{script_stem}_mocobatch.txt"
@@ -867,7 +1007,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     last)  nv=$(3dinfo -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} -save_mean \\"${{mstem}}_mean.nii$FMT\\" -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
+  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -885,9 +1025,12 @@ def _stage_locomoco(plan: Plan) -> str:
 echo '== stage03: locomoco =='
 for k in "${{RUN_KEYS[@]}}"; do
   nlstem="stage03.nlmoco.${{FRAG[$k]}}"
-  [ "$skip_locomoco" -eq 1 ] && [ -f "${{nlstem}}_warp.nii$FMT" ] && continue
+  # The max is checked alongside the warp so a working directory from before the
+  # coverage lanes existed re-runs and produces them, instead of resuming into a
+  # stage07 that cannot find its inputs.
+  [ "$skip_locomoco" -eq 1 ] && [ -f "${{nlstem}}_warp.nii$FMT" ] && [ -f "${{nlstem}}_locomoco_max.nii$FMT" ] && continue
   pe="${{PEDIR[$k]}}"; pe="${{pe//[!a-zA-Z]/}}"
-{_ffs("ffs_locomoco", ['-input "stage02.moco.${FRAG[$k]}.nii$FMT"', '-prefix "${nlstem}.nii$FMT"', '-pe_dir "${pe:-y}"', *_split_flags(config.DEFAULT_OPTS["locomoco"]), "-warp_format 5d", "-save_mean", '-device "$DEVICE"'])}
+{_ffs("ffs_locomoco", ['-input "stage02.moco.${FRAG[$k]}.nii$FMT"', '-prefix "${nlstem}.nii$FMT"', '-pe_dir "${pe:-y}"', *_split_flags(config.DEFAULT_OPTS["locomoco"]), "-warp_format 5d", "-save_mean", "-save_max", "-save_min", '-device "$DEVICE"'])}
 done
 """
 
@@ -936,8 +1079,8 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
         if pr.fmap is None or "xfmap_lin" not in pr.warp_chain:
             continue  # reference fmap (or no fmap) → no cross-fmap alignment
         groups.setdefault((pr.bold.session, pr.fmap.fmap_id), pr)
-    want_fmapmean = _needs_fmapmean(plan)
-    if not groups and not want_fmapmean:
+    fmapmean_sessions = _fmapmean_sessions(plan)
+    if not groups and not fmapmean_sessions:
         return ""
     out = ["", "# ============================ stage05: cross-fmap alignment ================="]
     out.append("echo '== stage05: cross-fmap alignment (→ reference fmap) =='")
@@ -997,13 +1140,14 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
         out.append(_batch_launch("ffs_allineate", "albatch", "skip_xfmap"))
         if opt.xfmap_nonlin:
             out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xfmap"))
-    if want_fmapmean:
-        # -anat_source mean_fmap: every group's mean is now on the reference-fmap
-        # grid, so averaging them is a straight voxelwise mean (more SNR than any
-        # single group, without the grandmean's extra interpolation).
-        fm = _fmapmean(plan)
-        inputs = " ".join(f'"{f}"' for f in _fmapmean_inputs(plan))
-        out.append("echo '== stage05: mean of fieldmap means (-anat_source mean_fmap) =='")
+    if fmapmean_sessions:
+        # mean_fmap: within a session every group's mean is now on that session's
+        # reference-fmap grid, so averaging them is a straight voxelwise mean (more
+        # SNR than any single group, without the grandmean's extra interpolation).
+        out.append("echo '== stage05: mean of fieldmap means (mean_fmap) =='")
+    for ses in fmapmean_sessions:
+        fm = _fmapmean(plan, ses)
+        inputs = " ".join(f'"{f}"' for f in _fmapmean_inputs(plan, ses))
         out.append(
             f'[ -f "{fm}" ] || \\\n'
             + _ffs(
@@ -1125,9 +1269,7 @@ def _stage_grandmean(plan: Plan) -> str:
     # grid, so runs from different fmap groups average in one space. A no-fmap
     # session's anchor run defines that grid and has no pre-chain, so it is
     # skipped here and feeds the session mean directly.
-    nwarp_opts = config.DEFAULT_OPTS["nwarp"]
     for lane in _lanes(plan):
-        grid_arr = "REFGRID_SB" if lane == LANE_SBREF else "REFGRID"
         suffix = f".src-{_src(lane)}" if _src(lane) else ""
         runmean_cmd = _ffs(
             "ffs_nwarp",
@@ -1135,13 +1277,13 @@ def _stage_grandmean(plan: Plan) -> str:
                 f'-source "{_run_level_var(lane)}"',
                 '-nwarp "${PRECHAIN[$k]}"',
                 '${JAC[$k]:+-jac "${JAC[$k]}"}',
-                f'-master "${{{grid_arr}[$k]}}"',
-                *_split_flags(nwarp_opts),
+                '-master "${REFGRID[$k]}"',
+                *_lane_nwarp_flags(lane),
                 f'-prefix "stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"',
                 '-device "$DEVICE"',
             ],
         )
-        label = "SBRefs" if lane == LANE_SBREF else "run means"
+        label = {LANE_SBREF: "SBRefs", LANE_MEAN: "run means"}.get(lane, f"run {lane}es")
         out.append(f"echo '== stage07: {label} (→ session common grid) =='")
         out.append(
             'for k in "${RUN_KEYS[@]}"; do\n'
@@ -1160,7 +1302,8 @@ def _stage_grandmean(plan: Plan) -> str:
                     "ffs_util_3dmath",
                     [
                         f"-input {aligned}",
-                        "-mean",
+                        # Per lane: means average, maxes take the max, mins the min.
+                        _lane_reduce(lane),
                         f'-prefix "{_sesmean(ses, lane)}"',
                         "-overwrite",
                         '-device "$DEVICE"',
@@ -1171,20 +1314,46 @@ def _stage_grandmean(plan: Plan) -> str:
     return "\n".join(out) + "\n"
 
 
-def _xses_aligned(
-    session: str, nonlin: bool, lane: str = LANE_MEAN, primary: str = LANE_MEAN
-) -> str:
-    """The cross-session-aligned session mean for a non-ref session.
+# Tokens that do NOT belong to the grandmean chain: the within-run motion the
+# lane images already have baked in, and everything ABOVE grandmean space (which
+# is by definition estimated from the grandmean, so it cannot act before it).
+_GRANDMEAN_DROP = frozenset({"moco", "locomoco", "anat_lin", "anat_nl", "xref_lin", "xref_nl"})
 
-    The primary lane gets ffs_allineate's / ffs_formwarp's own output; the other
-    lane gets the same transform re-applied by ``_stage_xses``. A nonlinear
-    primary result keeps the lane-free stem it shares with its ``_WARP``
-    (naming.py) — the re-applied lane always carries ``src-``, so the two never
-    collide.
+
+def _grandmean_tokens(pr: PlanRun) -> list[str]:
+    """The transform tokens taking this run's post-moco lane image all the way to
+    grandmean space — pre-chain (xfmap∘blip∘xrun) plus xses, in one chain."""
+    return [tok for tok in pr.warp_chain if tok not in _GRANDMEAN_DROP]
+
+
+def _needs_gmrun(pr: PlanRun) -> bool:
+    """True when reaching grandmean space costs this run a resample the pyramid has
+    not already paid for — i.e. it has an xses link. A reference-session run's
+    grandmean chain IS its pre-chain, so its runmean is already the image."""
+    return _grandmean_tokens(pr) != [tok for tok in pr.warp_chain if tok in _PRE_CHAIN_TOKENS]
+
+
+def _gmrun(pr: PlanRun, lane: str) -> str:
+    """This run's lane image in grandmean space, one interpolation from moco."""
+    return _run_stem(pr, "gmrun", src=_src(lane)) + ".nii$FMT"
+
+
+def _gmrun_image(pr: PlanRun, lane: str) -> str:
+    """The file this run contributes to the grandmean: the dedicated single-resample
+    image when it needs one, else the runmean it already has."""
+    return _gmrun(pr, lane) if _needs_gmrun(pr) else _aligned_mean(pr, lane)
+
+
+def _xses_aligned(session: str, nonlin: bool) -> str:
+    """The cross-session-aligned representative for a non-ref session — the QC
+    image ffs_allineate / ffs_formwarp writes. A nonlinear result keeps the
+    lane-free stem it shares with its ``_WARP`` (naming.py).
+
+    Nothing downstream consumes it: the grandmean is built from per-run
+    single-resample images (``_gmrun_image``), not from these.
     """
-    if lane == primary and nonlin:
-        return stem(NameKey("xses", session=session)) + "_nl.nii$FMT"
-    return stem(NameKey("xses", session=session, src=_src(lane))) + ".nii$FMT"
+    st = stem(NameKey("xses", session=session))
+    return f"{st}_nl.nii$FMT" if nonlin else f"{st}.nii$FMT"
 
 
 def _stage_xses(plan: Plan, script_stem: str) -> str:
@@ -1196,42 +1365,41 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
     the alignment loop is empty and the grandmean is just that session's mean.
     """
     opt = plan.options
-    sessions = []
-    seen = set()
-    for pr in plan.runs:
-        s = pr.bold.session
-        if s not in seen and s is not None:
-            seen.add(s)
-            sessions.append(s)
+    sessions = [s for s in _sessions(plan) if s is not None]
     ref = plan.ref_session
     primary = _primary_lane(plan)
     lane_tag = f".src-{_src(primary)}" if _src(primary) else ""
     out = ["", "# ============================ stage08: cross-session align + grandmean ======"]
     if plan.multi_session:
         out.append("echo '== stage08: cross-session alignment =='")
-        if primary == LANE_SBREF:
+        note = {
+            LANE_SBREF: "SBRef session means (sharper, single-band contrast)",
+            LANE_MAX: "session MAX images (every voxel any frame of any run saw, "
+            "so a run that lost an edge to motion does not drag the alignment)",
+        }.get(primary)
+        if note:
             out.append(
-                "# Estimated on the SBRef session means (sharper, single-band contrast);\n"
-                "# the BOLD-mean lane is then resampled by that same transform."
+                f"# Estimated on the {note};\n"
+                "# every other lane is resampled by that same transform."
             )
-    # Base is the primary lane's reference-session mean; both lanes' sesmeans sit
-    # on the same grid, so the one transform lands either of them.
-    out.append(f'REFGM="{_sesmean(ref, primary)}"')
-    # Per lane: the session means already in reference-session space (the ref
-    # session's own) plus the aligned non-ref ones.
-    aligned_by_lane: dict[str, list[str]] = {ln: [_sesmean(ref, ln)] for ln in _lanes(plan)}
+        if opt.ref_image:
+            out.append(f"# -ref_image {opt.ref_image}: each session is represented by that image.")
+    # Base is the reference session's representative; every candidate image sits on
+    # that session's common grid, so the one transform lands any lane.
+    out.append(f'REFGM="{_ref_image_file(plan, ref, primary)}"')
+    # The grid the grandmean is built on (always a session mean — it exists for
+    # every session and every lane, whatever -ref_image chose to align with).
+    out.append(f'GMGRID="{_sesmean(ref, primary)}"')
     if plan.multi_session:
         # The reference session has no xses transform (it maps to itself) — emit its
-        # mean under the xses name so `ls stage08.xses.*` shows every session.
-        for lane in _lanes(plan):
-            out.append(
-                _ref_marker(
-                    NameKey("xses", session=ref, src=_src(lane), role="ref"),
-                    _sesmean(ref, lane),
-                    f"QC: ses-{ref} is the reference session — no transform, "
-                    "shown for completeness.",
-                )
+        # representative under the xses name so `ls stage08.xses.*` shows every session.
+        out.append(
+            _ref_marker(
+                NameKey("xses", session=ref, role="ref"),
+                _ref_image_file(plan, ref, primary),
+                f"QC: ses-{ref} is the reference session — no transform, shown for completeness.",
             )
+        )
     # Same batching as stage06: the per-session manifests are written first, then
     # ONE ffs_allineate (and one ffs_formwarp) process handles every session.
     nonref = [s for s in sessions if s != ref]
@@ -1246,7 +1414,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                 "albatch",
                 [
                     '-base "$REFGM"',
-                    f'-source "{_sesmean(s, primary)}"',
+                    f'-source "{_ref_image_file(plan, s, primary)}"',
                     f'-prefix "{xstem}{lane_tag}.nii$FMT"',
                     f'-1Dmatrix_save "{xstem}.aff12.1D"',
                     *_split_flags(config.DEFAULT_OPTS["xses"]),
@@ -1264,7 +1432,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                         *_nl_source_args(
                             opt.xses_nonlin_in_source,
                             f"{xstem}{lane_tag}.nii$FMT",
-                            _sesmean(s, primary),
+                            _ref_image_file(plan, s, primary),
                             f"{xstem}.aff12.1D",
                         ),
                         f'-prefix "{xstem}_nl.nii$FMT"',
@@ -1278,50 +1446,23 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
         out.append(_batch_launch("ffs_allineate", "albatch", "skip_xses"))
         if opt.xses_nonlin:
             out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xses"))
-    lane_lines: list[str] = []
-    for s in nonref:
-        xstem = stem(NameKey("xses", session=s))
-        for lane in _lanes(plan):
-            dst = _xses_aligned(s, opt.xses_nonlin, lane, primary)
-            aligned_by_lane[lane].append(dst)
-            if lane == primary:
-                continue
-            # Secondary lane: same transform, other lineage. One resample, so this
-            # mean is exactly as many interpolations deep as the primary's.
-            xchain = " ".join(
-                ([f"{xstem}_nl_WARP.nii$FMT"] if opt.xses_nonlin else []) + [f"{xstem}.aff12.1D"]
-            )
-            lane_lines.append(
-                _manifest_line(
-                    "nwbatch",
-                    [
-                        f'-source "{_sesmean(s, lane)}"',
-                        f'-nwarp "{xchain}"',
-                        '-master "$REFGM"',
-                        *_split_flags(config.DEFAULT_OPTS["nwarp"]),
-                        f'-prefix "{dst}"',
-                    ],
-                    indent="",
-                )
-            )
-    if lane_lines:
-        out.append(f'nwbatch="{script_stem}_xseslanebatch.txt"; : > "$nwbatch"')
-        out += lane_lines
-        out.append(_batch_launch("ffs_nwarp", "nwbatch", "skip_xses"))
+    out.append(_stage_gmrun(plan, script_stem))
 
-    # THE grandmean = mean of the reference session's mean + every cross-session-
-    # aligned non-ref session mean (all now in reference-session space). This is the
-    # default target the anat alignment (stage09) uses; the SBRef lane's sibling is
-    # what -anat_source sbmean selects.
-    out.append("echo '== stage08: grandmean (all sessions, post-alignment) =='")
+    # THE grandmean, composited from every run's image in grandmean space (one
+    # interpolation from moco for all of them — see _stage_gmrun). Per lane: the
+    # mean lanes average, the max lane takes the max of the maxes (the most brain
+    # in the most places), the min lane the min of the mins (where every frame of
+    # every run has data). This is the default target the anat alignment (stage09)
+    # uses; the SBRef lane's sibling is what -anat_source sbmean selects.
+    out.append("echo '== stage08: grandmean (all runs, in one space) =='")
     for lane in _lanes(plan):
-        allm = " ".join(f'"{m}"' for m in aligned_by_lane[lane])
+        allm = " ".join(f'"{_gmrun_image(pr, lane)}"' for pr in plan.runs)
         out.append(
             _ffs(
                 "ffs_util_3dmath",
                 [
                     f"-input {allm}",
-                    "-mean",
+                    _lane_reduce(lane),
                     f'-prefix "{_grandmean(lane)}"',
                     "-overwrite",
                     '-device "$DEVICE"',
@@ -1330,6 +1471,57 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
             )
         )
     return "\n".join(out) + "\n"
+
+
+def _stage_gmrun(plan: Plan, script_stem: str) -> str:
+    """The interpolation checkpoint: every run that needs an xses link is resampled
+    from its post-moco lane image into grandmean space in ONE pass.
+
+    Without this the grandmean is a mean of session means, and a non-reference
+    session's contribution has been interpolated three times (moco resample →
+    runmean → xses) before it lands. That blur is not cosmetic: the grandmean is
+    what the anat step, ffs_segment and every -grand_reference align to, so it sets
+    the sharpness ceiling for everything downstream. Composing the pre-chain with
+    xses costs the same single resample the runmean already pays, so the whole
+    grandmean sits one interpolation from moco, uniformly.
+
+    Runs of the reference session have no xses link — their grandmean chain IS
+    their pre-chain — so they contribute the runmean they already have, and a
+    single-session dataset emits nothing here at all.
+    """
+    todo = [pr for pr in plan.runs if _needs_gmrun(pr)]
+    if not todo:
+        return ""
+    batch = f"{script_stem}_gmrunbatch.txt"
+    out = [
+        "",
+        "# ---------------------------- stage08b: runs → grandmean space -------------",
+        "# One resample each: the whole pre-chain composed with this run's xses link,",
+        "# straight from the post-moco image. Keeps the grandmean one interpolation",
+        "# from moco instead of three. Batched like every other per-run stage.",
+        "echo '== stage08b: runs → grandmean space (single resample) =='",
+        f'gmbatch="{batch}"; : > "$gmbatch"',
+    ]
+    for pr in todo:
+        chain = " ".join(chain_files(pr, ".nii$FMT", plan.options, tokens=_grandmean_tokens(pr)))
+        jac = _jac_spec(pr)
+        for lane in _lanes(plan):
+            out.append(
+                _manifest_line(
+                    "gmbatch",
+                    [
+                        f'-source "{_run_level(pr, lane)}"',
+                        f'-nwarp "{chain}"',
+                        *([f'-jac "{jac}"'] if jac else []),
+                        '-master "$GMGRID"',
+                        *_lane_nwarp_flags(lane),
+                        f'-prefix "{_gmrun(pr, lane)}"',
+                    ],
+                    indent="",
+                )
+            )
+    out.append(_batch_launch("ffs_nwarp", "gmbatch", "skip_xses"))
+    return "\n".join(out)
 
 
 def _pe_axis(plan: Plan) -> str:
