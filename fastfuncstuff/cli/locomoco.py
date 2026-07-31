@@ -92,6 +92,11 @@ reading the outputs (3D = one value/voxel, 4D = a time series):
   _locomoco_mean.nii.gz  [with -save_mean]  Temporal mean of the corrected series
       — a sharp, motion-reduced registration target.
 
+  _locomoco_max.nii.gz / _locomoco_min.nii.gz  [with -save_max / -save_min]
+      Coverage images: the max is the union of every voxel ever imaged (edges the
+      mean dims because motion took them out of the FoV), the min is 0 wherever
+      any single volume lost the voxel.
+
   dual -pe_dir: _flow has no single signed scalar (the shift is a 2-D vector), so
       it is written as _flowmag.nii.gz (magnitude, voxels) + _flowang.nii.gz
       (direction, degrees 0-360) instead.
@@ -840,6 +845,25 @@ def create_parser() -> argparse.ArgumentParser:
         help="Also write the temporal mean of the corrected series "
         "({prefix}_locomoco_mean), e.g. for use as a registration target. "
         "Independent of -no_corrected.",
+    )
+    out.add_argument(
+        "-save_max",
+        "-save-max",
+        dest="save_max",
+        action="store_true",
+        help="Also write the temporal MAX of the corrected series "
+        "({prefix}_locomoco_max): motion carries edge voxels out of the FoV, where "
+        "the resampler leaves 0, so the max is the union of everything ever imaged "
+        "— a fuller alignment target than the mean, which dims those edges.",
+    )
+    out.add_argument(
+        "-save_min",
+        "-save-min",
+        dest="save_min",
+        action="store_true",
+        help="Also write the temporal MIN of the corrected series "
+        "({prefix}_locomoco_min): 0 wherever ANY volume lost the voxel, so >0 is "
+        "exactly the region with complete data at every timepoint.",
     )
     out.add_argument(
         "-save_first_last",
@@ -2069,16 +2093,23 @@ def main(argv: list[str] | None = None) -> int:
             )
         print(f"  • corrected series: {corr_path}")
 
-    if args.save_mean:
-        mean_path = f"{stem}_locomoco_mean{ext}"
-        # Temporal mean of the corrected series ((nx, ny, nz, T) -> mean over T).
-        with spinner(f"Writing {Path(mean_path).name}"):
+    # Temporal reductions of the corrected series ((nx, ny, nz, T) -> over T).
+    # max/min are coverage images, not contrast images — see the -save_max help.
+    for want, which, reduce in (
+        (args.save_mean, "mean", lambda s: s.mean(dim=-1)),
+        (args.save_max, "max", lambda s: s.amax(dim=-1)),
+        (args.save_min, "min", lambda s: s.amin(dim=-1)),
+    ):
+        if not want:
+            continue
+        out_path = f"{stem}_locomoco_{which}{ext}"
+        with spinner(f"Writing {Path(out_path).name}"):
             save_nifti(
-                _neg_clip(result.corrected_series().mean(dim=-1).numpy(), args.allow_neg),
-                mean_path,
+                _neg_clip(reduce(result.corrected_series()).numpy(), args.allow_neg),
+                out_path,
                 affine=affine,
             )
-        print(f"  • corrected mean: {mean_path}")
+        print(f"  • corrected {which}: {out_path}")
 
     if _want_qc(args):
         # corrected_series() is cheap (cached / reshape) and works even with

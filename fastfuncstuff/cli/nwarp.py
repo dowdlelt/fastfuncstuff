@@ -23,7 +23,7 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     run_batch_jobs,
 )
-from fastfuncstuff.processing.io import derive_mean_output_path, derive_prefixed_output_path
+from fastfuncstuff.processing.io import derive_prefixed_output_path
 from fastfuncstuff.processing.nwarpforge import (
     derive_phase_output_path,
     nwarpforge,
@@ -77,7 +77,7 @@ Examples:
         tool="ffs_nwarp",
         what="warp applies",
         example="-source a.nii -nwarp warp.nii -master m.nii -prefix a_w.nii",
-        skip_note="-prefix / -phase_prefix / -save_mean / -save_first_last",
+        skip_note="-prefix / -phase_prefix / -save_mean / -save_max / -save_min / -save_first_last",
     )
     io_group.add_argument(
         "-phase",
@@ -132,6 +132,25 @@ Examples:
         "-save_mean",
         action="store_true",
         help="If output is 4D, save mean as mean_{prefix_basename}{ext}",
+    )
+    io_group.add_argument(
+        "-save_max",
+        "-save-max",
+        dest="save_max",
+        action="store_true",
+        help="If output is 4D, save the temporal MAX as max_{prefix_basename}{ext} "
+        "— the union of every voxel imaged in any volume (motion/warp carry edge "
+        "voxels out of the FoV, where the mean dims them). Computed on the OUTPUT "
+        "grid, so it is exact for the final space.",
+    )
+    io_group.add_argument(
+        "-save_min",
+        "-save-min",
+        dest="save_min",
+        action="store_true",
+        help="If output is 4D, save the temporal MIN as min_{prefix_basename}{ext} "
+        "— 0 wherever any volume lost the voxel, i.e. >0 is the region with "
+        "complete data at every timepoint (an analysis mask).",
     )
     io_group.add_argument(
         "-save_first_last",
@@ -320,8 +339,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     outs: list[str] = [args.prefix]
     if args.phase:
         outs.append(args.phase_prefix or derive_phase_output_path(args.prefix))
-    if args.save_mean:
-        outs.append(derive_mean_output_path(args.prefix))
+    for want, which in ((args.save_mean, "mean"), (args.save_max, "max"), (args.save_min, "min")):
+        if want:
+            outs.append(derive_prefixed_output_path(args.prefix, which))
     if args.save_first_last:
         outs.append(derive_prefixed_output_path(args.prefix, "firstlast"))
     return outs
@@ -468,6 +488,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         time_range=time_range,
         debug=args.debug,
         save_mean=args.save_mean,
+        save_max=args.save_max,
+        save_min=args.save_min,
         save_first_last_flag=args.save_first_last,
         dxyz=args.dxyz,
         no_neg=args.no_neg,
