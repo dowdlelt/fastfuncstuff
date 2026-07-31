@@ -170,6 +170,7 @@ def optical_flow_lk_2d(
     reg: float = 1e-3,
     pe_only_axis: int | None = None,
     warp_interp: str = "bilinear",
+    max_shift: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense pyramidal Lucas-Kanade optical flow for a batch of 2-D image pairs.
 
@@ -180,6 +181,16 @@ def optical_flow_lk_2d(
     ``pe_only_axis`` (0 = W/columns, 1 = H/rows) constrains the flow to one axis
     (residual EPI motion is ~1-D along PE): a 1-DOF, more robust estimate.
     Returns ``(u, v)``; a constrained-out component is all zeros.
+
+    ``max_shift`` bounds the accumulated displacement, and is the same guard the phase
+    backend has always applied for the same reason (see :func:`phase_correlation_flow_2d`).
+    The LK step is ``-blur(Ip·It) / (blur(Ip²) + reg)``; where the image has no structure
+    the denominator collapses to ``reg`` (1e-3) and a single iteration can move a pixel
+    hundreds of voxels. Nothing pulls it back, and n_iters × n_levels of that is a random
+    walk with no bound — the mechanism behind a measured 3621-voxel displacement on a
+    130-voxel axis, in the ramp-in slices at the end of a slab where the tissue signal is
+    a third of mid-slab and there is nothing to track. Clamping per level keeps the
+    unbounded case at the physical limit the caller already declared via ``-max_shift``.
     """
     fixed_pyr, moving_pyr = [fixed], [moving]
     for _ in range(n_levels - 1):
@@ -229,6 +240,9 @@ def optical_flow_lk_2d(
                 det = a11 * a22 - a12 * a12
                 u = u + (a22 * b1 - a12 * b2) / det
                 v = v + (a11 * b2 - a12 * b1) / det
+            if max_shift is not None:
+                u = u.clamp(-max_shift, max_shift)
+                v = v.clamp(-max_shift, max_shift)
 
     return u, v
 
@@ -1097,6 +1111,71 @@ class LocomocoResult:
         return np.stack(frames, 0)
 
 
+def _temporal_coverage(data: np.ndarray, erode: int, device: torch.device) -> torch.Tensor:
+    """Voxels holding real data in **every** frame, as a (nz, ny, nx) bool tensor.
+
+    :func:`mask.data_coverage_mask` answers "did the scanner put a number here" for one
+    volume. Over a series the question is per-frame and the answer must be the
+    intersection: a voxel that is acquired in most frames and an exact zero in the rest
+    has no business driving a displacement in any of them.
+
+    That case is the norm, not an edge case, because locomoco's input has usually been
+    through rigid motion correction, which resamples with zero fill. Each frame carries
+    its own zero wedge at the FoV boundary, in a slightly different place. The time-MEAN
+    is nonzero right across that band — it averages the frames that were covered — so an
+    automask built from the mean happily includes it, and the flow then sees a voxel that
+    is bright in one frame and exactly zero in the next. There is no displacement that
+    explains that, but a shift estimator will invent an enormous one trying: on a 9.4T
+    288-frame run this produced in-brain motion of 0.10 vox alongside a whole-volume max
+    of 3621 vox, and poisoned the reference that the refine passes were rebuilt from.
+
+    Intersecting per frame rather than testing ``min(t) != 0`` is deliberate: the min is
+    only equivalent for non-negative data, and NORDIC/detrended series are signed, where
+    a negative minimum would hide an exactly-zero frame. The loop also avoids
+    materializing a full-size boolean copy of the series.
+    """
+    from .mask import _dilate_6conn
+
+    cover = np.ones(data.shape[:3], dtype=bool)
+    for t in range(data.shape[3]):
+        v = data[..., t]
+        np.logical_and(cover, np.isfinite(v) & (v != 0), out=cover)
+    c = torch.from_numpy(cover).permute(2, 1, 0).contiguous().to(device)  # (nz, ny, nx)
+    if bool(c.all()) or erode <= 0:
+        return c  # full-FoV series: nothing to protect, and erosion would only eat brain
+    # Peel by DILATING THE VOID rather than eroding the coverage. The two differ at the
+    # volume boundary: mask._erode_6conn zero-pads, so it treats every face of the FoV as
+    # a coverage edge and peels inward from all six — which on a thin-slab acquisition
+    # (few slices) can consume the volume outright, and always throws away good voxels on
+    # data that has no void near the boundary. Growing the void leaves the FoV edge alone.
+    return ~(_dilate_6conn(~c, iterations=int(erode)) > 0)
+
+
+def _dilate_inplane(m: torch.Tensor, iterations: int) -> torch.Tensor:
+    """4-connected dilation within each ``(H, W)`` plane of a ``(nSlice, H, W)`` stack."""
+    if iterations <= 0:
+        return m
+    kernel = torch.zeros(1, 1, 3, 3, device=m.device, dtype=torch.float32)
+    kernel[0, 0, 1, 1] = kernel[0, 0, 0, 1] = kernel[0, 0, 2, 1] = 1
+    kernel[0, 0, 1, 0] = kernel[0, 0, 1, 2] = 1
+    x = m.float()[:, None]  # slices are the batch: no growth ACROSS planes
+    for _ in range(iterations):
+        x = (F.conv2d(x, kernel, padding=1) > 0.5).float()
+    return x[:, 0]
+
+
+def _blur_inplane(m: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable Gaussian blur within each ``(H, W)`` plane of a ``(nSlice, H, W)`` stack."""
+    if sigma <= 0:
+        return m
+    k = _gaussian_kernel1d(sigma, m.device, m.dtype)
+    r = (k.numel() - 1) // 2
+    x = m[:, None]
+    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
+    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    return x[:, 0]
+
+
 def _build_soft_mask(
     data: np.ndarray,
     slice_axis: int,
@@ -1105,24 +1184,59 @@ def _build_soft_mask(
     dilate: int,
     sigma: float,
     device: torch.device,
+    coverage_erode: int | None = 1,
+    in_plane: bool = True,
 ) -> torch.Tensor:
-    """Feathered brain mask in canonical ``(nSlice, H, W)`` layout, values in [0, 1].
+    """Feathered gate in canonical ``(nSlice, H, W)`` layout, values in [0, 1].
 
-    A 3dAutomask on the time-mean, dilated by ``dilate`` voxels (safety margin so
-    real brain-edge motion survives) and Gaussian-feathered by ``sigma`` voxels so
-    the flow decays smoothly to zero instead of at a hard edge. Multiplying the
-    flow by this kills the wild displacements optical flow invents in the pure-noise
-    air outside the head, without clipping a hard boundary through the brain.
+    Two distinct restrictions, multiplied:
+
+    * a 3dAutomask on the time-mean, dilated by ``dilate`` voxels (safety margin so
+      real brain-edge motion survives) — "where is the head", which kills the wild
+      displacements optical flow invents in the pure-noise air outside it;
+    * the temporal data coverage (:func:`_temporal_coverage`) when ``coverage_erode``
+      is not None — "where is there a number in every frame", which kills the ones it
+      invents at a no-data boundary *inside* the automask.
+
+    The whole thing is Gaussian-feathered by ``sigma`` so the flow decays smoothly to
+    zero instead of at a hard edge. Coverage is eroded by a further ``ceil(sigma)``
+    first: feathering a hard 1→0 step leaves the gate at ~0.5 *on* the boundary and
+    non-trivial for ~sigma voxels into the void, so without the extra peel half the
+    ramp would sit over voxels that have no data.
+
+    ``in_plane`` (the slicewise estimators) does the dilation and the feather WITHIN
+    each slice instead of in 3-D, and this is the difference between a usable gate and
+    a broken one at the ends of the slab. The margin exists to protect brain-edge
+    motion, which for a 2-D slicewise solve is an in-plane concept; letting it grow
+    along the slice axis instead lets it *seed* mask on slices where 3dAutomask found
+    no brain at all. Measured on a 9.4T 80-slice run: 3dAutomask claims 0 voxels on
+    z=0 and z=1, and the 3-D dilate-by-4 handed the estimator 2075 and 2467 of them —
+    slabs of pure ramp-in signal (slice mean 12 and 45 vs 208 mid-slab) with no
+    correspondence to track. The flow went to 3621 voxels there and poisoned the
+    reference; 1.86M of the 2.27M grossly displaced voxel-frames were on those two
+    slices. A 3-D *feather* leaks the same way at reduced amplitude, which is still
+    hundreds of voxels of displacement, so both have to be in-plane.
     """
     from .mask import automask
 
+    def _canon(v):  # (nz, ny, nx) -> (nSlice, H, W)
+        return v.permute(2, 1, 0).permute(slice_axis, a0, a1).contiguous()
+
     ref = torch.from_numpy(np.ascontiguousarray(data.mean(axis=3)))  # (nx, ny, nz)
     vol_zyx = ref.permute(2, 1, 0).contiguous().to(device).float()  # automask wants (nz,ny,nx)
-    m = automask(vol_zyx, dilate_extra=dilate, device=device).float()
-    m = _gaussian_blur3d(m, sigma)
-    mask_nifti = m.permute(2, 1, 0)  # back to (nx, ny, nz)
-    # Reorder to the canonical spatial layout used for the flow (slice, H=a0, W=a1).
-    return mask_nifti.permute(slice_axis, a0, a1).contiguous().cpu()
+    m = automask(vol_zyx, dilate_extra=0 if in_plane else dilate, device=device).float()
+    if in_plane:
+        m = _dilate_inplane(_canon(m), dilate)
+    # Coverage is intersected AFTER the dilation, never before: the safety margin is
+    # allowed to grow over brain the automask missed, but not back over voxels that
+    # hold no data — dilating first and masking second would simply undo it.
+    if coverage_erode is not None:
+        peel = int(coverage_erode) + int(np.ceil(max(0.0, sigma)))
+        cov = _temporal_coverage(data, peel, device).float()
+        m = m * (_canon(cov) if in_plane else cov)
+    if in_plane:
+        return _blur_inplane(m, sigma).cpu()
+    return _canon(_gaussian_blur3d(m, sigma)).cpu()
 
 
 def _jacobian_det(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -1349,6 +1463,7 @@ def _build_flow_fn(
                 window_sigma=window_sigma,
                 pe_only_axis=pe_only_axis,
                 warp_interp=warp_interp,
+                max_shift=max_shift,
             )
     elif backend == "phase":
 
@@ -1413,6 +1528,7 @@ def estimate_residual_flow(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    coverage_erode: int | None = 1,
     is_3dacq: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
@@ -1514,6 +1630,7 @@ def estimate_residual_flow(
             automask=automask,
             automask_dilate=automask_dilate,
             automask_sigma=automask_sigma,
+            coverage_erode=coverage_erode,
             noshift_margin=noshift_margin,
             reg_sigma=reg_sigma,
             peak_mode=peak_mode,
@@ -1563,6 +1680,47 @@ def estimate_residual_flow(
         cf = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
         diag = {"curve_frame": cf}
 
+    # The gate is built BEFORE the first estimate and re-applied after every one,
+    # including inside the refine loop. Gating only the final field is too late: refine
+    # rebuilds its next reference from the *corrected* series, so one pass's ungated
+    # edge flow warps the template that the next pass registers everything against, and
+    # the damage spreads inward from the no-data boundary into good brain. See
+    # _temporal_coverage for the failure this fixes.
+    soft = None
+    if automask:
+        soft = _build_soft_mask(
+            data,
+            slice_axis,
+            a0,
+            a1,
+            automask_dilate,
+            automask_sigma,
+            device,
+            coverage_erode=coverage_erode,
+        )
+
+    def _gate(u, v, corr):
+        """Zero the flow outside the gate and rebuild the corrected series from it.
+
+        Outside the head (and outside data coverage) the displacement becomes ~0, so
+        the resample is the identity there and the voxels pass through untouched
+        instead of being yanked by a phantom warp.
+        """
+        if soft is None:
+            return u, v, corr
+        u, v = u * soft[None], v * soft[None]
+        for s in range(ns):
+            corr[:, s] = _correct_pe(
+                vol[:, s].to(device).float(),
+                u[:, s].to(device),
+                v[:, s].to(device),
+                pe_flow_is_u,
+                dual,
+                warp_interp,
+                warp_radius,
+            ).cpu()
+        return u, v, corr
+
     progressive = ref_mode in ("first_mean", "first_median")
     if progressive:
         u_all, v_all, corrected = _estimate_cumulative(
@@ -1592,6 +1750,7 @@ def estimate_residual_flow(
             diag=diag,
             hpf_sigma=hpf_sigma,
         )
+    u_all, v_all, corrected = _gate(u_all, v_all, corrected)
     # Outer reference-refinement (shared engine): rebuild the reference from the
     # corrected series and re-register, converging the template out of its bias. The
     # aggregate honours -ref and -first_n; the step is the in-brain rms of the stacked
@@ -1614,6 +1773,7 @@ def estimate_residual_flow(
                 diag=diag,
                 hpf_sigma=hpf_sigma,
             )
+            u, v, corr = _gate(u, v, corr)
             return torch.stack([u, v]), corr
 
         def _brain_rms_2d(delta):
@@ -1633,26 +1793,6 @@ def estimate_residual_flow(
             verbose=verbose,
         )
         u_all, v_all = stacked[0], stacked[1]
-
-    soft = None
-    if automask:
-        soft = _build_soft_mask(data, slice_axis, a0, a1, automask_dilate, automask_sigma, device)
-        u_all = u_all * soft[None]
-        v_all = v_all * soft[None]
-        # Rebuild the corrected series from the masked flow: outside the head the
-        # displacement is now ~0, so the resample is identity and the noise passes
-        # through untouched instead of getting yanked by a phantom warp.
-        for s in range(ns):
-            moving_raw = vol[:, s].to(device).float()
-            corrected[:, s] = _correct_pe(
-                moving_raw,
-                u_all[:, s].to(device),
-                v_all[:, s].to(device),
-                pe_flow_is_u,
-                dual,
-                warp_interp,
-                warp_radius,
-            ).cpu()
 
     if jacobian:
         # Conserve signal along PE: where the unwarp stretches a region (Jacobian > 1)
@@ -1695,11 +1835,15 @@ def estimate_residual_flow(
             sel = ap[ap > 0]
             region = "nonzero"
         med = float(sel.median()) if sel.numel() else 0.0
+        # Report the max over the SAME set as the median. A whole-volume max is
+        # dominated by whatever the gate is about to zero anyway, so it read as a
+        # catastrophe (3621 vox) on runs whose actual output was fine.
+        mx = float(sel.abs().max()) if sel.numel() else 0.0
         axes = f"axes {a0},{a1}" if dual else f"axis {pe_axis}"
         print(
             f"🌀 locomoco: {nt} frames × {ns} slices, PE {axes}, ref={ref_mode} "
             f"({'2-D dual-PE' if dual else '1-D PE' if pe_only else '2-D'} flow); "
-            f"|disp| median {med:.3f} vox ({region}), max {float(ap.max()):.3f} vox"
+            f"|disp| median {med:.3f} vox ({region}), max {mx:.3f} vox ({region})"
         )
     return result
 
@@ -1880,6 +2024,7 @@ def estimate_residual_flow_rotaware(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    coverage_erode: int | None = 1,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
@@ -2055,7 +2200,14 @@ def estimate_residual_flow_rotaware(
     # ── automask soft-gate (same feathered brain mask as the plain path) ──
     if automask:
         soft = _build_soft_mask(
-            moco_data, slice_axis, a0, a1, automask_dilate, automask_sigma, device
+            moco_data,
+            slice_axis,
+            a0,
+            a1,
+            automask_dilate,
+            automask_sigma,
+            device,
+            coverage_erode=coverage_erode,
         )
         soft_xyz = soft.permute(_inv_perm(perm_sp)).contiguous()  # canonical→(nx,ny,nz)
         p = p * soft_xyz[..., None]
@@ -2702,6 +2854,7 @@ def _run_3dacq_plain(
     automask: bool,
     automask_dilate: int,
     automask_sigma: float,
+    coverage_erode: int | None = 1,
     device: torch.device,
     verbose: bool,
     noshift_margin: float = 0.0,
@@ -2778,14 +2931,49 @@ def _run_3dacq_plain(
                 curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
         return disp, corrected
 
-    disp, corrected = _estimate(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
+    # Gate before the first refine pass, not after the last: refine rebuilds its next
+    # reference from `corrected`, so ungated no-data flow would be baked into the
+    # template every pass. Same reasoning as the 2-D path — see _temporal_coverage.
+    soft_xyz = None
+    if automask:
+        soft = _build_soft_mask(
+            data,
+            disp_slice,
+            a0,
+            a1,
+            automask_dilate,
+            automask_sigma,
+            device,
+            coverage_erode=coverage_erode,
+            in_plane=False,  # one 3-D solve: the margin/feather are 3-D concepts here
+        )
+        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
+
+    def _gate3d(d, corr):
+        if soft_xyz is None:
+            return d, corr
+        d = d * soft_xyz[..., None]
+        for t in range(nt):
+            corr[..., t] = _shift3d_axis(
+                vol4d[..., t].to(device)[None],
+                d[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
+            )[0].cpu()
+        return d, corr
+
+    def _estimate_gated(ref_vol):
+        return _gate3d(*_estimate(ref_vol))
+
+    disp, corrected = _estimate_gated(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
     # shared engine: rebuild the reference from the corrected series and re-register.
     # The aggregate honours -ref and -first_n; the step is the in-brain rms of the field.
     if refine_rounds > 0:
         brain = _brain_mask_from(corrected.abs().mean(dim=3))  # (nx, ny, nz)
         disp, corrected = _refine_loop(
-            _estimate,
+            _estimate_gated,
             disp,
             corrected,
             reduce_ref=lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device),
@@ -2796,19 +2984,6 @@ def _run_3dacq_plain(
             max_shift=max_shift,
             verbose=verbose,
         )
-
-    if automask:
-        soft = _build_soft_mask(data, disp_slice, a0, a1, automask_dilate, automask_sigma, device)
-        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
-        disp = disp * soft_xyz[..., None]
-        for t in range(nt):
-            corrected[..., t] = _shift3d_axis(
-                vol4d[..., t].to(device)[None],
-                disp[..., t].to(device)[None],
-                pe_axis,
-                mode=warp_interp,
-                radius=warp_radius,
-            )[0].cpu()
 
     p_canon = disp.permute(perm4).contiguous()
     u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
@@ -3155,6 +3330,7 @@ def estimate_residual_flow_multiecho(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    coverage_erode: int | None = 1,
     learn_scaling: bool = True,
     flat_scaling: bool = False,
     alpha_override: torch.Tensor | None = None,
@@ -3385,6 +3561,29 @@ def estimate_residual_flow_multiecho(
     else:
         w = _solve_w(refs, "joint" if backend == "flow" else "solve")
 
+    # Gate every solve, not just the last: _reduce_me derives each echo's next reference
+    # from w, so ungated no-data flow would go straight into the refined template.
+    soft_xyz = None
+    if automask:
+        # One shared mask from the across-echo mean (all echoes share geometry).
+        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
+        soft = _build_soft_mask(
+            mean_series,
+            disp_slice,
+            a0,
+            a1,
+            automask_dilate,
+            automask_sigma,
+            device,
+            coverage_erode=coverage_erode,
+        )
+        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
+
+    def _gate_me(field):
+        return field if soft_xyz is None else field * soft_xyz[..., None]
+
+    w = _gate_me(w)
+
     # Phase 2: reference-refinement (the -refine knob; applies to BOTH backends — it is
     # the estimator-agnostic template sharpening). The initial reference is the mean/median
     # of the still-DISTORTED frames, so it is motion-blurred and biases every shift LOW —
@@ -3406,7 +3605,7 @@ def estimate_residual_flow_multiecho(
 
         def _est_me(new_refs):
             _pass["n"] += 1
-            w_new = _solve_w(new_refs, f"refine {_pass['n']}/{refine_rounds}")
+            w_new = _gate_me(_solve_w(new_refs, f"refine {_pass['n']}/{refine_rounds}"))
             return w_new, w_new
 
         def _brain_rms_me(delta):
@@ -3425,15 +3624,6 @@ def estimate_residual_flow_multiecho(
             max_shift=max_shift,
             verbose=verbose,
         )
-
-    if automask:
-        # One shared mask from the across-echo mean (all echoes share geometry).
-        mean_series = np.mean(np.stack([np.asarray(d) for d in datas], 0), 0)
-        soft = _build_soft_mask(
-            mean_series, disp_slice, a0, a1, automask_dilate, automask_sigma, device
-        )
-        soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
-        w = w * soft_xyz[..., None]
 
     # Build per-echo results: echo e warped by alpha_e · w.
     per_echo: list[LocomocoResult] = []
@@ -3527,6 +3717,7 @@ def estimate_residual_flow_me_scaled(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    coverage_erode: int | None = 1,
     flat_scaling: bool = False,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
@@ -3581,6 +3772,7 @@ def estimate_residual_flow_me_scaled(
         automask=automask,
         automask_dilate=automask_dilate,
         automask_sigma=automask_sigma,
+        coverage_erode=coverage_erode,
         is_3dacq=True,
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
@@ -4331,6 +4523,7 @@ def refine_interecho_temporally(
     automask: bool = False,
     automask_dilate: int = 4,
     automask_sigma: float = 3.0,
+    coverage_erode: int | None = 1,
     scaling: str = "affine",
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
@@ -4472,6 +4665,7 @@ def refine_interecho_temporally(
             automask=automask,
             automask_dilate=automask_dilate,
             automask_sigma=automask_sigma,
+            coverage_erode=coverage_erode,
             learn_scaling=a_law is None,
             flat_scaling=False,
             alpha_override=a_law,

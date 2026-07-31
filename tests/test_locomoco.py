@@ -655,6 +655,135 @@ def test_automask_gates_flow_outside_brain():
     assert np.abs(inside).max() > 0.3
 
 
+def _wedged_series(rng, nx=40, ny=40, nz=4, T=6):
+    """Bright blob + a per-frame zero wedge at the +y edge, as rigid moco leaves behind.
+
+    The wedge depth varies frame to frame, so the time-MEAN is nonzero across the whole
+    band: an automask built from the mean includes it, and the flow then has to explain
+    a voxel that is bright in one frame and exactly zero in the next.
+    """
+    xx, yy = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
+    # Deliberately centred so the blob is still BRIGHT where the wedge cuts: the cliff
+    # has to be inside the brain mask, or the automask alone would already have handled it.
+    blob = np.exp(-(((xx - 20) / 9.0) ** 2 + ((yy - 32) / 12.0) ** 2)).astype(np.float32)
+    brain = (blob[:, :, None] * (5.0 + np.sin(xx / 3.0)[:, :, None])).astype(np.float32)
+    shifts = np.array([0.0, 1.0, -1.0, 1.5, -0.8, 0.6], np.float32)[:T]
+    depths = [0, 3, 1, 4, 2, 3][:T]  # zero-fill depth at the +y edge, per frame
+    data = np.zeros((nx, ny, nz, T), np.float32)
+    for t, sh in enumerate(shifts):
+        vol = _shift_along_y(np.repeat(brain, nz, axis=2), float(sh))
+        vol = vol + 0.2 * rng.standard_normal((nx, ny, nz)).astype(np.float32)
+        if depths[t]:
+            vol[:, ny - depths[t] :, :] = 0.0
+        data[..., t] = vol
+    return data
+
+
+def test_coverage_gate_kills_flow_at_a_per_frame_zero_wedge():
+    """The dropout band must not drive a displacement — the brain-mask alone won't do it.
+
+    Bug of record: on a 288-frame 9.4T run the ungated wedge produced a whole-volume max
+    displacement of 3621 voxels while in-brain motion was 0.10, and the corrupted field
+    fed the refine loop's reference until it diverged.
+    """
+    data = _wedged_series(np.random.default_rng(0))
+    ny = data.shape[1]
+    common = dict(
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        automask=True,
+        automask_dilate=3,
+        automask_sigma=2.0,
+        verbose=False,
+    )
+    band = slice(ny - 4, ny)  # the voxels that lose data in at least one frame
+
+    off = estimate_residual_flow(data, coverage_erode=None, **common)
+    on = estimate_residual_flow(data, coverage_erode=1, **common)
+    f_off = off.pe_displacement().numpy()
+    f_on = on.pe_displacement().numpy()
+
+    # The wedge is what drives the runaway, and coverage is what stops it.
+    assert np.abs(f_off[:, band]).max() > 2.0
+    assert np.abs(f_on[:, band]).max() < 0.15
+    # ...without giving up the real in-brain estimate a few voxels away.
+    assert np.abs(f_on[15:25, 15:25]).max() > 0.3
+
+
+def test_coverage_gate_is_a_noop_on_a_full_fov_series():
+    """No wedge, no erosion: a fully covered series must not lose its brain-edge flow."""
+    rng = np.random.default_rng(1)
+    data = _wedged_series(rng)
+    data[data == 0] = 0.01  # same series, but every voxel is acquired in every frame
+    common = dict(
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        automask=True,
+        automask_dilate=3,
+        automask_sigma=2.0,
+        verbose=False,
+    )
+    f_off = estimate_residual_flow(data, coverage_erode=None, **common).pe_displacement()
+    f_on = estimate_residual_flow(data, coverage_erode=1, **common).pe_displacement()
+    assert torch.allclose(f_off, f_on)
+
+
+def test_lk_flow_is_bounded_by_max_shift_in_a_textureless_region():
+    """LK's denominator collapses to `reg` without structure — the field must still be bounded.
+
+    Bug of record: the ramp-in slices at the end of a slab have signal but no trackable
+    structure, and the unbounded accumulation reached 3621 voxels on a 130-voxel axis,
+    which then diverged the refine loop. The phase backend has always clamped here.
+    """
+    # Faint structure (tiny Ip, so blur(Ip²) << reg) against a large intensity mismatch
+    # (big It). The step is then ~Ip·It/reg, which is enormous and never pulled back.
+    h = w = 24
+    yy, _ = torch.meshgrid(
+        torch.arange(h, dtype=torch.float32), torch.arange(w, dtype=torch.float32), indexing="ij"
+    )
+    faint = 0.01 * torch.sin(yy / 3.0)
+    fixed = faint[None].repeat(2, 1, 1)
+    moving = (faint + 0.5)[None].repeat(2, 1, 1)
+    kw = dict(n_levels=2, n_iters=8, window_sigma=2.0, pe_only_axis=1)
+
+    _, v_free = optical_flow_lk_2d(fixed, moving, **kw)
+    _, v_cap = optical_flow_lk_2d(fixed, moving, max_shift=3.0, **kw)
+
+    assert float(v_free.abs().max()) > 10.0
+    assert float(v_cap.abs().max()) <= 3.0 + 1e-5
+
+
+def test_lk_max_shift_does_not_disturb_a_recoverable_shift():
+    """The clamp must be inert when the true displacement is inside the bound."""
+    rng = np.random.default_rng(3)
+    base = rng.random((1, 40, 40)).astype(np.float32)
+    base = torch.from_numpy(base)
+    base = _lm._blur2d(base, 1.5)
+    moved = torch.roll(base, shifts=2, dims=1)  # 2 voxels along H, inside max_shift=3
+    kw = dict(n_levels=3, n_iters=12, window_sigma=2.0, pe_only_axis=1)
+    _, v_free = optical_flow_lk_2d(base, moved, **kw)
+    _, v_cap = optical_flow_lk_2d(base, moved, max_shift=3.0, **kw)
+    core = (slice(None), slice(10, 30), slice(10, 30))
+    assert torch.allclose(v_free[core], v_cap[core], atol=1e-4)
+    assert abs(float(v_cap[core].median()) - 2.0) < 0.5
+
+
+def test_temporal_coverage_intersects_frames_not_the_min():
+    """A voxel zeroed in ONE frame is uncovered, even when its temporal min is negative."""
+    data = np.ones((6, 6, 6, 4), np.float32)
+    data[2, 2, 2, 1] = 0.0  # dropped in exactly one frame
+    data[4, 4, 4, :] = -1.0  # signed throughout; min < 0 but always acquired
+    data[1, 1, 1, 2] = np.nan  # NaN counts as no-data
+    cov = _lm._temporal_coverage(data, erode=0, device=torch.device("cpu"))
+    assert not bool(cov[2, 2, 2])  # (z,y,x) layout; symmetric index here
+    assert bool(cov[4, 4, 4])
+    assert not bool(cov[1, 1, 1])
+
+
 def test_spinner_not_a_tty_emits_one_line():
     import io
 

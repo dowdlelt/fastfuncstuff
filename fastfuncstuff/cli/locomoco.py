@@ -567,10 +567,12 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=3.0,
         metavar="VOX",
-        help="[phase, xcorr] Largest PE shift to search for (voxels). Set just above "
-        "the biggest residual shift you expect (sub- to a few voxels here). Smaller = "
-        "faster xcorr (fewer trial offsets) and a tighter phase no-wrap band; too "
-        "small clips real motion. flow ignores it (pyramid handles range).",
+        help="Largest PE shift to allow (voxels). Set just above the biggest residual "
+        "shift you expect (sub- to a few voxels here). Smaller = faster xcorr (fewer "
+        "trial offsets) and a tighter phase no-wrap band; too small clips real motion. "
+        "phase and xcorr search within it; flow clamps its accumulated field to it, "
+        "which is what stops a textureless slab-end slice random-walking to hundreds "
+        "of voxels. All three also use it as the refine divergence threshold.",
     )
     search.add_argument(
         "-search_min_steps",
@@ -775,6 +777,28 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="SIGMA_VOX",
         help="Gaussian feather (voxels) on the dilated mask, so the flow decays "
         "smoothly to zero near the edge instead of at a hard boundary; 0 = hard edge.",
+    )
+    mask.add_argument(
+        "-nocoverage",
+        "-no_coverage",
+        "-no-coverage",
+        dest="nocoverage",
+        action="store_true",
+        help="Disable the temporal data-coverage restriction. By default the gate also "
+        "excludes voxels that are not acquired in EVERY frame — the zero wedge that "
+        "rigid motion correction leaves at the FoV edge sits in a different place each "
+        "frame, and a voxel that is bright in one frame and exactly zero in the next "
+        "makes a shift estimator invent an enormous displacement to explain it.",
+    )
+    mask.add_argument(
+        "-coverage_erode",
+        "-coverage-erode",
+        type=int,
+        default=1,
+        metavar="VOX",
+        help="Voxels to peel off the data-coverage boundary (default 1), dropping the "
+        "ramp of partial-value voxels that interpolation leaves just inside the empty "
+        "wedge. The feather width is peeled on top of this automatically.",
     )
 
     out = p.add_argument_group("Outputs")
@@ -1485,6 +1509,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
                 automask=automask,
                 automask_dilate=args.automask_dilate,
                 automask_sigma=args.automask_sigma,
+                coverage_erode=None if args.nocoverage else args.coverage_erode,
                 scaling=args.me_refine_scaling,
                 noshift_margin=args.noshift_margin,
                 reg_sigma=args.reg_sigma,
@@ -1520,6 +1545,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            coverage_erode=None if args.nocoverage else args.coverage_erode,
             flat_scaling=args.me_flat_scaling,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
@@ -1549,6 +1575,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            coverage_erode=None if args.nocoverage else args.coverage_erode,
             learn_scaling=not args.me_fixed_scaling,
             flat_scaling=args.me_flat_scaling,
             noshift_margin=args.noshift_margin,
@@ -1805,8 +1832,9 @@ def main(argv: list[str] | None = None) -> int:
 
     pe_only = not args.full_2d
     automask = not args.no_automask
+    cover_desc = "no coverage" if args.nocoverage else f"coverage erode {args.coverage_erode}"
     mask_desc = (
-        f"on (dilate {args.automask_dilate}, σ {args.automask_sigma:.1f} vox)"
+        f"on (dilate {args.automask_dilate}, σ {args.automask_sigma:.1f} vox, {cover_desc})"
         if automask
         else "off"
     )
@@ -1915,6 +1943,7 @@ def main(argv: list[str] | None = None) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            coverage_erode=None if args.nocoverage else args.coverage_erode,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
@@ -1958,6 +1987,7 @@ def main(argv: list[str] | None = None) -> int:
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
+            coverage_erode=None if args.nocoverage else args.coverage_erode,
             noshift_margin=args.noshift_margin,
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
