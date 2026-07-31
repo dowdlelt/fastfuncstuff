@@ -234,7 +234,9 @@ def write_design_specs(
                 scan_paths.append(e)
                 rel_paths.append(str(e))
 
-        trs = {pr.bold.tr for pr in prs if pr.bold.tr}
+        # -TR wins over the sidecar: for a 3D acquisition the header value is the
+        # per-partition time, and the design must be sampled at the volume TR.
+        trs = {opt.tr} if opt.tr is not None else {pr.bold.tr for pr in prs if pr.bold.tr}
         nuisance, _skipped = nuisance_specs(task, opt)
         event_cols, _warn = resolve_event_cols(task, scan_paths, opt)
         try:

@@ -170,7 +170,28 @@ def build_parser() -> argparse.ArgumentParser:
         "-slicetiming-method",
         choices=["integrate", "first", "none"],
         default=None,
-        help="integrate STC into the final resample | first (before moco) | none",
+        help="integrate STC into the final resample | first (before moco) | none. "
+        "Falls back to none when no slice timing is available (no -slicetiming and no "
+        "SliceTiming in the sidecars).",
+    )
+    g.add_argument(
+        "-slicetiming",
+        "-slice_timing",
+        "-slice-timing",
+        metavar="FILE",
+        help="slice timing for EVERY run, in place of the per-run BIDS sidecar: a text "
+        "file with one acquisition offset (seconds) per slice, or a JSON with a "
+        "SliceTiming field. Use when the sidecars have no SliceTiming.",
+    )
+    g.add_argument(
+        "-TR",
+        "-tr",
+        dest="tr",
+        type=float,
+        metavar="SECONDS",
+        help="volume TR for every run, overriding the sidecar/header value. 3D "
+        "acquisitions often store the per-partition time in the header; slice timing "
+        "and the GLM (ffs_reml -TR) need the volume TR.",
     )
     g.add_argument(
         "-moco_ref",
@@ -393,6 +414,14 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
             "to build one from FreeSurfer (aseg.auto + SurfVol)."
         )
+    if opt.slicetiming_method != "none" and opt.tr is None:
+        # Slice timing needs a TR per run; the sidecar is the only source here.
+        no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]
+        if no_tr:
+            errors.append(
+                f"slice timing is on but {len(no_tr)} run(s) have no RepetitionTime in their "
+                "sidecar. Pass -TR SECONDS (volume TR) or -slicetiming_method none."
+            )
     if opt.phase_proc:
         # Phase is carried per run, so a single run without one would silently
         # produce a script that dies at stage00 — catch it here instead.
@@ -423,6 +452,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-tpm_source", opt.tpm_source),
         ("-ref_file", opt.ref_file),
         ("-ref_anat", opt.ref_anat),
+        ("-slicetiming", opt.slicetiming_file),
     ):
         if val and not Path(val).exists():
             errors.append(f"{label} not found: {val}")
@@ -585,6 +615,37 @@ def _events_by_run(bids_dir: str, task: str, subject) -> list[tuple[BoldRun, Pat
                 ev = root_ev
             pairs.append((run, ev))
     return pairs
+
+
+def _resolve_slicetiming(args, rget, subject) -> str:
+    """The effective ``-slicetiming_method``, downgraded to ``none`` when there is
+    no slice timing to apply.
+
+    STC is on by default, but 3D acquisitions (and any converter that drops the
+    field) leave the sidecars without ``SliceTiming`` — ffs_nwarp/ffs_slicetime
+    would then die mid-run on a script that looked fine when it was written. Say
+    so loudly at generation time instead, since a *missing* sidecar field is just
+    as often a conversion mistake as a genuine 3D acquisition."""
+    method = args.slicetiming_method or rget("slicetiming_method", "integrate")
+    if method == "none" or args.slicetiming:
+        return method
+    runs = [r for s in subject.sessions for r in s.bold_runs]
+    have = [r for r in runs if r.has_slice_timing]
+    if len(have) == len(runs):
+        return method
+    which = (
+        "no run has SliceTiming in its sidecar"
+        if not have
+        else f"{len(runs) - len(have)} of {len(runs)} runs have no SliceTiming in their sidecar"
+    )
+    print(
+        f"warning: slice timing disabled (-slicetiming_method {method} → none): {which}.\n"
+        "         Expected for a 3D acquisition. If it is NOT — the field was lost in "
+        "conversion —\n"
+        "         pass -slicetiming FILE (one offset per slice, seconds) and regenerate.",
+        file=sys.stderr,
+    )
+    return "none"
 
 
 def _fmt_time(sec: float | None) -> str:
@@ -769,7 +830,9 @@ def main(argv: list[str] | None = None) -> int:
         want_nordic=eff(args.want_nordic, "want_nordic"),
         phase_proc=args.phase_proc,
         noise_vols=args.noise_vols,
-        slicetiming_method=args.slicetiming_method or rget("slicetiming_method", "integrate"),
+        slicetiming_method=_resolve_slicetiming(args, rget, subject),
+        slicetiming_file=args.slicetiming,
+        tr=args.tr,
         distortion=(False if args.no_distortion else rget("distortion", True)),
         run_glm=(False if args.no_glm else rget("run_glm", True)),
         glm_ortvec=_resolve_glm_ortvec(args, recipe),

@@ -49,6 +49,14 @@ class Options:
     phase_proc: bool = False
     noise_vols: int = 0
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
+    # One slice-timing file (text, one offset per slice in seconds, or a JSON with
+    # SliceTiming) used for EVERY run, in place of each run's BIDS sidecar. For
+    # data whose sidecars carry no SliceTiming. None → per-run sidecar.
+    slicetiming_file: str | None = None
+    # Volume TR (seconds) for every run, overriding the sidecar/header value. 3D
+    # acquisitions often store the per-partition time in the header, not the
+    # volume TR, which is the number slice timing and the GLM actually need.
+    tr: float | None = None
     distortion: bool = True  # apply fieldmap distortion correction when fmaps exist
     run_glm: bool = True  # emit the GLM stage enabled (else behind FFS_RUN_GLM)
     # Named nuisance sources for the GLM, keys of config.GLM_ORTVEC (e.g.

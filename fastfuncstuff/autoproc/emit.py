@@ -119,6 +119,13 @@ def _phase_source(plan: Plan) -> str:
     return _unwrapped()
 
 
+def _tpattern(plan: Plan) -> str:
+    """The ``-tpattern`` value: a single user-supplied slice-timing file for every
+    run (``-slicetiming``), else that run's BIDS sidecar."""
+    stf = plan.options.slicetiming_file
+    return shlex.quote(str(Path(stf).resolve())) if stf else '"${JSON[$k]}"'
+
+
 def _sidecar(nifti: Path) -> Path:
     return nifti.parent / (re.sub(r"\.(nii\.gz|nii|nii\.zst)$", "", nifti.name) + ".json")
 
@@ -514,6 +521,20 @@ def _skip_default(opt) -> int:
     return 0 if opt.batch_overwrite else 1
 
 
+def _timing_header_note(plan: Plan) -> str:
+    """Header lines for the timing decisions that are not obvious from the flags:
+    where slice timing came from, and whether the TR was overridden."""
+    opt = plan.options
+    out = ""
+    if opt.slicetiming_method == "none":
+        out += "\n#   slice timing      : OFF (no timing available, or -slicetiming_method none)"
+    elif opt.slicetiming_file:
+        out += f"\n#   slice timing      : {opt.slicetiming_file} (same for every run)"
+    if opt.tr is not None:
+        out += f"\n#   TR                : {opt.tr:g} s for every run (-TR; overrides the header)"
+    return out
+
+
 def _sbref_header_note(plan: Plan) -> str:
     """What the SBRef lane is doing in this script, for the header block."""
     if not plan.use_sbref:
@@ -550,7 +571,7 @@ def _header(plan: Plan, out_dir: str) -> str:
 #   reference session : {plan.ref_session}
 #   sessions          : {"multi" if plan.multi_session else "single"}
 #   NORDIC : {opt.want_nordic}   locomoco : {opt.locomoco}   distortion : {opt.distortion}   slice-timing : {opt.slicetiming_method}
-#   phase  : {_phase_on(plan)}
+#   phase  : {_phase_on(plan)}{_timing_header_note(plan)}
 #   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
 # =============================================================================
 set -euo pipefail
@@ -600,7 +621,8 @@ def _data_arrays(plan: Plan) -> str:
         if b.sbref_path:
             lines.append(f"SBREF[{q(k)}]={q(str(b.sbref_path))}")
         lines.append(f"JSON[{q(k)}]={q(str(_sidecar(b.mag_path)))}")
-        lines.append(f"TR[{q(k)}]={q(str(b.tr if b.tr is not None else ''))}")
+        tr = plan.options.tr if plan.options.tr is not None else b.tr
+        lines.append(f"TR[{q(k)}]={q(str(tr if tr is not None else ''))}")
         lines.append(f"PEDIR[{q(k)}]={q(str(b.pe_dir or ''))}")
         # Filename coordinate fragment — the stage loops build run filenames as
         # stageNN.label.${FRAG[$k]}, matching every reference in the data table.
@@ -735,7 +757,7 @@ def _stage_tshift(plan: Plan) -> str:
         [
             '-input "$raw"',
             '-prefix "$outf"',
-            '-tpattern "${JSON[$k]}"',
+            f"-tpattern {_tpattern(plan)}",
             '-TR "${TR[$k]}"',
             *_split_flags(config.DEFAULT_OPTS["tshift"]),
             '-device "$DEVICE"',
@@ -751,7 +773,7 @@ def _stage_tshift(plan: Plan) -> str:
             [
                 f'-input "{_unwrapped()}"',
                 '-prefix "$phout"',
-                '-tpattern "${JSON[$k]}"',
+                f"-tpattern {_tpattern(plan)}",
                 '-TR "${TR[$k]}"',
                 *_split_flags(config.DEFAULT_OPTS["tshift"]),
                 '-device "$DEVICE"',
@@ -1640,7 +1662,7 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
     opt = plan.options
     if opt.slicetiming_method == "integrate":
         st = (
-            '  tp="${JSON[$k]}"; tr="${TR[$k]}"\n'
+            f"  tp={_tpattern(plan)}; " + 'tr="${TR[$k]}"\n'
             '  if [ -n "$tr" ]; then st_str="-tpattern \\"$tp\\" -TR \\"$tr\\" -tzero 0"; '
             'else st_str=""; fi'
         )
@@ -1815,6 +1837,9 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             "-fout",
             "-mask epi_mask.nii$FMT",
             "-do_scale",
+            # -TR only when the user gave one: a 3D acquisition's header TR is the
+            # per-partition time, not the volume TR the design is sampled at.
+            *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
             *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
             '-device "$DEVICE"',
         ]

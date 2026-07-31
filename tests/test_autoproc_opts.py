@@ -14,7 +14,12 @@ from fastfuncstuff.autoproc import config, optcheck
 from fastfuncstuff.autoproc.bids import BoldRun, Session, Subject
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.plan import Options, build_plan
-from fastfuncstuff.cli.autoproc import _absolutize_inputs, _glue_opt_values, build_parser
+from fastfuncstuff.cli.autoproc import (
+    _absolutize_inputs,
+    _glue_opt_values,
+    _resolve_slicetiming,
+    build_parser,
+)
 
 
 def _subject():
@@ -148,3 +153,83 @@ def test_absolutize_leaves_unset_paths_alone():
     assert args.anat is None
     assert args.grand_reference is None
     assert args.events is None
+
+
+# --- slice timing / TR ------------------------------------------------------
+# Bug of record: STC is on by default and 3D acquisitions have no SliceTiming in
+# their sidecars, so the script died inside ffs_nwarp on data that scanned fine.
+
+
+def _st_subject(*, slice_timing, tr=2.0):
+    json = {"RepetitionTime": tr, "PhaseEncodingDirection": "j-"}
+    runs = []
+    for i, st in enumerate(slice_timing, start=1):
+        j = dict(json)
+        if st:
+            j["SliceTiming"] = [0.0, 0.5]
+        runs.append(
+            BoldRun(
+                subject="X",
+                session="01",
+                task="foo",
+                run=str(i),
+                mag_path=Path(f"/bids/sub-X/ses-01/func/sub-X_ses-01_task-foo_run-{i}_bold.nii.gz"),
+                json=j,
+            )
+        )
+    return Subject("X", [Session("01", runs)])
+
+
+def _resolve(subject, argv):
+    args = build_parser().parse_args(["-bids_dir", "/bids", "-subject", "X", *argv])
+    return _resolve_slicetiming(args, lambda f, d: d, subject)
+
+
+def test_slicetiming_disabled_when_no_sidecar_has_it(capsys):
+    assert _resolve(_st_subject(slice_timing=[False, False]), []) == "none"
+    assert "slice timing disabled" in capsys.readouterr().err
+
+
+def test_slicetiming_disabled_when_only_some_runs_have_it():
+    assert _resolve(_st_subject(slice_timing=[True, False]), []) == "none"
+
+
+def test_slicetiming_kept_when_every_sidecar_has_it():
+    assert _resolve(_st_subject(slice_timing=[True, True]), []) == "integrate"
+
+
+def test_explicit_slicetiming_file_overrides_the_missing_sidecars():
+    subj = _st_subject(slice_timing=[False, False])
+    assert _resolve(subj, ["-slicetiming", "/st.1D"]) == "integrate"
+
+
+def test_slicetiming_file_is_the_tpattern_for_every_run(tmp_path):
+    st = tmp_path / "st.1D"
+    st.write_text("0\n0.5\n")
+    subj = _st_subject(slice_timing=[False])
+    opt = Options(slicetiming_file=str(st), slicetiming_method="first", tr=3.2)
+    s = write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+    assert f"-tpattern {st}" in s
+    assert '-tpattern "${JSON[$k]}"' not in s
+
+
+def test_global_tr_replaces_the_sidecar_tr_and_reaches_the_glm():
+    subj = _st_subject(slice_timing=[True], tr=0.056)
+    s = write_script(build_plan(subj, Options(tr=3.2)), "wd", bids_root="/bids")
+    assert "TR[01:foo:1]=3.2" in s
+    assert "0.056" not in s
+    assert "-TR 3.2" in s  # ffs_reml
+
+
+def test_no_global_tr_leaves_the_glm_reading_the_header():
+    subj = _st_subject(slice_timing=[True], tr=2.0)
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert "TR[01:foo:1]=2.0" in s
+    assert "-TR 2.0" not in s
+
+
+def test_slicetiming_none_emits_no_timing_flags():
+    subj = _st_subject(slice_timing=[False])
+    s = write_script(build_plan(subj, Options(slicetiming_method="none")), "wd", bids_root="/bids")
+    assert "-tpattern" not in s
+    assert 'st_str=""' in s
