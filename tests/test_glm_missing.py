@@ -583,3 +583,19 @@ def test_rank_deficient_censored_design_rejected():
     fams, demoted = _families_for(design, [1], min_task_mass=0.0)
     assert fams == []
     assert int(demoted.sum()) == 150
+
+
+def test_pattern_label_collapses_consecutive_runs():
+    """17-run patterns are unreadable spelled out one index at a time."""
+    from fastfuncstuff.glm.missing import _pattern_label
+
+    def pat(idx, n=17):
+        p = torch.zeros(n, dtype=torch.bool)
+        p[list(idx)] = True
+        return p
+
+    assert _pattern_label(pat(range(4, 17))) == "runs 4-16"
+    assert _pattern_label(pat([0, 1, 2, 3, 5, 6, 7])) == "runs 0-3,5-7"
+    assert _pattern_label(pat([0, 2, 4])) == "runs 0,2,4"
+    assert _pattern_label(pat([9])) == "runs 9"
+    assert _pattern_label(torch.zeros(5, dtype=torch.bool)) == "runs (none)"

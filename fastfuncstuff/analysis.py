@@ -1491,6 +1491,8 @@ def analyze_from_design_matrix(
                 # fit_glm add more would duplicate them.
                 max_poly_degree=-1,
                 preload_data_to_device=False,
+                # Silent: the family loop owns the progress bar.
+                verbose=False,
             )
         else:
             fam_fit_kwargs = dict(

@@ -290,8 +290,25 @@ def detect_run_validity(
 
 
 def _pattern_label(pattern: torch.Tensor) -> str:
-    kept = [str(i) for i, k in enumerate(pattern.tolist()) if k]
-    return "runs " + ",".join(kept)
+    """ "runs 0-3,5-16" — consecutive runs collapse into ranges.
+
+    At 17 runs the raw list is most of a terminal line, and a table of 47
+    families becomes unreadable; the ranges are also what makes an odd-one-out
+    run obvious at a glance.
+    """
+    kept = [i for i, k in enumerate(pattern.tolist()) if k]
+    if not kept:
+        return "runs (none)"
+    spans: list[tuple[int, int]] = []
+    start = prev = kept[0]
+    for i in kept[1:]:
+        if i == prev + 1:
+            prev = i
+            continue
+        spans.append((start, prev))
+        start = prev = i
+    spans.append((start, prev))
+    return "runs " + ",".join(str(a) if a == b else f"{a}-{b}" for a, b in spans)
 
 
 @dataclass
@@ -687,7 +704,22 @@ def fit_and_merge_families(
     if verbose:
         print(f"\n🔁 Refitting {len(families)} missing-data family/families (censored)")
 
-    for fam_i, fam in enumerate(families):
+    # One bar for the whole partition. Each family's inner fit is a fraction of a
+    # second on OLS, so per-family bars flash past unreadably; the per-family
+    # numbers are worth keeping, but as a table afterwards. Inner verbosity is
+    # off (see fit_kwargs) so nothing scrolls the bar away.
+    from tqdm.auto import tqdm
+
+    fam_iter = tqdm(
+        families,
+        desc="Missing-data families",
+        unit="family",
+        leave=True,
+        disable=not verbose or len(families) < 2,
+    )
+    rows_out: list[tuple[str, int, int, int, int, int]] = []
+
+    for fam in fam_iter:
         rows = torch.as_tensor(fam.good_list, dtype=torch.long)
         sub_design, keep_cols = censor_design(design, fam.good_list)
         sub_run_starts, sub_tau = build_censor_run_info(
@@ -695,10 +727,12 @@ def fit_and_merge_families(
         )
         sub_data = data[fam.voxel_indices][:, rows]
 
-        if verbose:
+        if hasattr(fam_iter, "set_postfix_str"):
+            fam_iter.set_postfix_str(f"{fam.label()} ({fam.n_voxels:,} vox)", refresh=False)
+        elif verbose and len(families) < 2:
             print(
-                f"  ─── family {fam_i + 1}/{len(families)} ({fam.label()}): "
-                f"{fam.n_voxels:,} voxels, {len(fam.good_list)} TRs, "
+                f"  ─── {fam.label()}: {fam.n_voxels:,} voxels, "
+                f"{len(fam.good_list)} TRs, "
                 f"{int((~keep_cols).sum())} nuisance column(s) dropped ───"
             )
 
@@ -736,13 +770,47 @@ def fit_and_merge_families(
             )
 
         _scatter_family(results, fam_results, fam, rows, scatter_attrs, TIME_AXIS_ATTRS)
-        dof_loss[fam.voxel_indices] = float(dof_full - int(fam_results.dof))
-        if verbose:
-            print(
-                f"      dof {dof_full} → {fam_results.dof} (lost {dof_full - int(fam_results.dof)})"
+        fam_dof = int(fam_results.dof)
+        dof_loss[fam.voxel_indices] = float(dof_full - fam_dof)
+        rows_out.append(
+            (
+                fam.label(),
+                fam.n_voxels,
+                len(fam.good_list),
+                int((~keep_cols).sum()),
+                fam_dof,
+                dof_full - fam_dof,
             )
+        )
 
+    if verbose:
+        _print_family_table(rows_out, dof_full)
     return dof_loss
+
+
+def _print_family_table(rows_out, dof_full: int) -> None:
+    """Per-family detail, once, after the bar rather than scrolling past it."""
+    if not rows_out:
+        return
+    wlab = max(len("family"), max(len(r[0]) for r in rows_out))
+    print(f"\n  Refitted families (model dof without censoring: {dof_full:,})")
+    print(
+        f"    {'family'.ljust(wlab)}  {'voxels':>8}  {'TRs':>6}  "
+        f"{'cut':>4}  {'dof':>7}  {'dof lost':>8}"
+    )
+    for label, n_vox, n_tr, n_cut, fam_dof, lost in rows_out:
+        print(
+            f"    {label.ljust(wlab)}  {n_vox:>8,}  {n_tr:>6,}  "
+            f"{n_cut:>4}  {fam_dof:>7,}  {lost:>8,}"
+        )
+    losses = sorted(r[5] for r in rows_out)
+    total_vox = sum(r[1] for r in rows_out)
+    mid = losses[len(losses) // 2]
+    print(
+        f"    → {len(rows_out)} famil{'y' if len(rows_out) == 1 else 'ies'}, "
+        f"{total_vox:,} voxels refitted; dof lost {losses[0]:,}–{losses[-1]:,} "
+        f"(median {mid:,}). 'cut' = nuisance columns dropped with their run."
+    )
 
 
 def _scatter_family(results, fam_results, fam, rows, scatter_attrs, time_attrs) -> None:
