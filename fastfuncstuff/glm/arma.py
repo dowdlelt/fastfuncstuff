@@ -150,6 +150,61 @@ def _debug_memory_snapshot(
 
 # AFNI 3dREMLfit default grid parameters (Grid 3 - medium resolution)
 # These are well-validated values from AFNI documentation
+# Every per-voxel array on ARMA11Results, in one place, so anything that fits a
+# voxel subset and scatters it back (per-HRF/slice grouping, missing-data
+# families) agrees on what has to be carried across.
+VOXEL_SCATTER_ATTRS = [
+    "betas",
+    "tstats",
+    "r2",
+    "r2_partial",
+    "r2_partial_nuisance",
+    "r2_semipartial",
+    "r2_semipartial_nuisance",
+    "arma_params",
+    "arma_lambda",
+    "reml_likelihood",
+    "sigma2",
+    "fstats",
+    "residuals",
+    "residuals_whitened",
+    "predicted",
+    "contrast_betas",
+    "contrast_tstats",
+    "contrast_fstats",
+    "contrast_r2_partial",
+    "contrast_r2_semipartial",
+    "dsort_betas",
+    "dsort_tstats",
+]
+
+# The GLMResults equivalent of VOXEL_SCATTER_ATTRS (OLS has stderr/meanvol/r2_run
+# and no ARMA parameters).
+OLS_VOXEL_SCATTER_ATTRS = [
+    "betas",
+    "r2",
+    "r2_partial",
+    "r2_partial_nuisance",
+    "r2_semipartial",
+    "r2_semipartial_nuisance",
+    "r2_run",
+    "residuals",
+    "predicted",
+    "meanvol",
+    "tstats",
+    "stderr",
+    "sigma2",
+    "fstats",
+    "contrast_betas",
+    "contrast_tstats",
+    "contrast_fstats",
+]
+
+# Arrays whose second axis is TIME, not regressors. A censored fit produces
+# fewer timepoints than the full timeline, so these need scattering back onto
+# the original time axis rather than a straight row copy.
+TIME_AXIS_ATTRS = frozenset({"residuals", "residuals_whitened", "predicted"})
+
 # AFNI 3dREMLfit defaults: -MAXa 0.8, -MAXb 0.8, -Grid 3 (step=0.1).
 # a is non-negative (POScor); b is symmetric.
 # 9 a-values × 17 b-values = 153 candidates (gamma0>0 filter trims to ~117).
@@ -3307,30 +3362,7 @@ def fit_glm_arma11_grouped(
     merged.fitted_column_indices = template.fitted_column_indices
     merged.n_regressors_full = template.n_regressors_full
 
-    _scatter_attrs = [
-        "betas",
-        "tstats",
-        "r2",
-        "r2_partial",
-        "r2_partial_nuisance",
-        "r2_semipartial",
-        "r2_semipartial_nuisance",
-        "arma_params",
-        "arma_lambda",
-        "reml_likelihood",
-        "sigma2",
-        "fstats",
-        "residuals",
-        "residuals_whitened",
-        "predicted",
-        "contrast_betas",
-        "contrast_tstats",
-        "contrast_fstats",
-        "contrast_r2_partial",
-        "contrast_r2_semipartial",
-        "dsort_betas",
-        "dsort_tstats",
-    ]
+    _scatter_attrs = VOXEL_SCATTER_ATTRS
 
     for attr in _scatter_attrs:
         # Find first sub-result that has this attr populated to learn shape/dtype
@@ -3417,25 +3449,7 @@ def fit_glm_arma11_grouped(
         ols_merged.xtx_inv = getattr(ols_template, "xtx_inv", None)
         ols_merged.contrast_labels = getattr(ols_template, "contrast_labels", None)
 
-        _ols_scatter_attrs = [
-            "betas",
-            "r2",
-            "r2_partial",
-            "r2_partial_nuisance",
-            "r2_semipartial",
-            "r2_semipartial_nuisance",
-            "r2_run",
-            "residuals",
-            "predicted",
-            "meanvol",
-            "tstats",
-            "stderr",
-            "sigma2",
-            "fstats",
-            "contrast_betas",
-            "contrast_tstats",
-            "contrast_fstats",
-        ]
+        _ols_scatter_attrs = OLS_VOXEL_SCATTER_ATTRS
         for attr in _ols_scatter_attrs:
             ref = None
             for h in unique_hrfs:

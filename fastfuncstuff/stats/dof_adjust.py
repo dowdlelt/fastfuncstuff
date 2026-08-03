@@ -252,6 +252,96 @@ def resolve_dof_adjust_arg(arg: str | float, expected_shape=None) -> float | np.
     return m
 
 
+def _load_4d(path: str, what: str, expected_shape=None) -> np.ndarray:
+    """Load a 4-D per-run volume, validating its spatial grid."""
+    from fastfuncstuff.io.afni import load_nifti
+
+    m = np.asarray(load_nifti(str(path)).get_fdata(dtype=np.float32))
+    if m.ndim == 3:
+        m = m[..., None]
+    if m.ndim != 4:
+        raise ValueError(f"{what} must be 3D or 4D, got shape {m.shape}")
+    if expected_shape is not None and m.shape[:3] != tuple(expected_shape):
+        raise ValueError(f"{what} grid {m.shape[:3]} != stats volume {tuple(expected_shape)}")
+    return m
+
+
+def resolve_dof_adjust_set(
+    per_run: str | float,
+    inclusion: str,
+    expected_shape=None,
+) -> np.ndarray:
+    """Per-run dof loss × per-run inclusion → one per-voxel dof-loss map.
+
+    A voxel that was dropped from run *r* never used run *r*'s data, so whatever
+    dof that run cost (NORDIC components removed, say) must not be charged to it.
+    This collapses the two into the per-voxel total actually incurred::
+
+        adjust[v] = Σ_r  per_run[v, r] · inclusion[v, r]
+
+    Parameters
+    ----------
+    per_run : str or float
+        Per-run dof lost: a 4-D ``(X, Y, Z, n_runs)`` map, or a scalar applied to
+        every run (then the total is ``scalar × n_surviving_runs``).
+    inclusion : str
+        The 4-D ``(X, Y, Z, n_runs)`` run-inclusion mask written by
+        ``ffs_reml -save_runmask`` — 1 where the run contributed to that voxel's
+        fit, 0 where it was guarded out or censored away.
+    expected_shape : tuple, optional
+        Spatial grid the stats bucket lives on; both inputs are checked against it.
+
+    Returns
+    -------
+    np.ndarray
+        ``(X, Y, Z)`` float dof loss, ready to sum with any other adjustment.
+    """
+    inc = _load_4d(inclusion, "-adjust_dof_set inclusion map", expected_shape)
+    n_runs = inc.shape[3]
+
+    try:
+        scalar = float(per_run)
+    except (TypeError, ValueError):
+        scalar = None
+
+    if scalar is not None:
+        return scalar * inc.sum(axis=3)
+
+    pr = _load_4d(str(per_run), "-adjust_dof_set per-run map", expected_shape)
+    if pr.shape[3] == 1:
+        pr = np.broadcast_to(pr, inc.shape)
+    elif pr.shape[3] != n_runs:
+        raise ValueError(
+            f"-adjust_dof_set: per-run map has {pr.shape[3]} runs but the "
+            f"inclusion map has {n_runs}"
+        )
+    return (pr * inc).sum(axis=3)
+
+
+def combine_dof_adjustments(
+    adjustments: list[float | np.ndarray],
+    expected_shape=None,
+) -> float | np.ndarray:
+    """Sum any mix of scalar and per-voxel dof adjustments into one.
+
+    Every source of lost dof is additive in dof units — NORDIC component removal,
+    missing-data censoring, anything else — so ``-adjust_dof`` is repeatable and
+    the totals just add. Returns a scalar only when every input was scalar.
+    """
+    if not adjustments:
+        return 0.0
+    total: float | np.ndarray = 0.0
+    for adj in adjustments:
+        if not np.isscalar(adj):
+            arr = np.asarray(adj)
+            if expected_shape is not None and arr.shape[:3] != tuple(expected_shape):
+                raise ValueError(
+                    f"dof adjustment map shape {arr.shape[:3]} != {tuple(expected_shape)}"
+                )
+        total = total + adj
+    return total
+
+
 def _default_invalid_path(output_path: str) -> str:
     stem = str(output_path)
     for ext in (".nii.gz", ".nii.zst", ".nii"):

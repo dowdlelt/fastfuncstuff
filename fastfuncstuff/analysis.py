@@ -409,6 +409,12 @@ def analyze_from_design_matrix(
     censor_file: str | Path | None = None,
     want_residuals: bool = False,
     want_ljung_box: bool = False,
+    run_validity=None,
+    handle_missing: bool = False,
+    missing_min_family: int = 50,
+    missing_max_families: int = 32,
+    missing_min_task_mass: float = 0.0,
+    missing_min_task_runs: int = 1,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -1434,6 +1440,88 @@ def analyze_from_design_matrix(
 
     else:
         raise ValueError(f"Unknown method: {method}. Choose 'ols' or 'arma11'")
+
+    # ── Missing-data families (-handle_missing) ──────────────────────────────
+    # Voxels valid in only some runs were just fitted with their dead rows in,
+    # which dilutes beta and deflates sigma2 in lockstep so the t-stat hides it.
+    # Refit each family against its own censored design and overwrite those rows.
+    # Applies to both methods: OLS is the same partition without the noise model.
+    if handle_missing and run_validity is not None:
+        from fastfuncstuff.glm.missing import (
+            build_families,
+            fit_and_merge_families,
+            subset_run_validity,
+        )
+
+        # run_validity is volume-indexed; the fit works on masked voxels.
+        validity_masked = run_validity
+        if mask_tensor is not None:
+            validity_masked = subset_run_validity(run_validity, mask_tensor)
+
+        _fam_run_starts = arma_run_starts if arma_run_starts is not None else [0]
+        families, demoted = build_families(
+            validity_masked,
+            _fam_run_starts,
+            design.shape[0],
+            min_family_voxels=missing_min_family,
+            max_families=missing_max_families,
+            design=design,
+            task_indices=stim_indices if stim_indices else None,
+            min_task_mass=missing_min_task_mass,
+            min_task_runs=missing_min_task_runs,
+        )
+
+        _shared_kwargs = dict(
+            device=device,
+            use_double=use_double,
+            glt_labels=design_info.get("glt_labels", None),
+            glt_matrices=design_info.get("glt_matrices", None),
+            task_indices=stim_indices if stim_indices else None,
+            want_r2_partial=want_r2_partial,
+            r2_partial_mode=r2_partial_mode,
+            want_r2_semipartial=want_r2_semipartial,
+            r2_semipartial_mode=r2_semipartial_mode,
+            want_residuals=want_residuals,
+        )
+        if method == "ols":
+            fam_fit_kwargs = dict(
+                _shared_kwargs,
+                chunk_size=voxel_chunk_size,
+                # The censored design already carries its polynomials; letting
+                # fit_glm add more would duplicate them.
+                max_poly_degree=-1,
+                preload_data_to_device=False,
+                # Silent: the family loop owns the progress bar.
+                verbose=False,
+            )
+        else:
+            fam_fit_kwargs = dict(
+                _shared_kwargs,
+                a_grid=arma_a_grid,
+                b_grid=arma_b_grid,
+                batch_size=voxel_chunk_size,
+                use_grid_batching=use_grid_batching,
+                legacy_contrasts=legacy_contrasts,
+                verbose=False,
+            )
+
+        dof_loss = fit_and_merge_families(
+            results,
+            data,
+            design,
+            families,
+            _fam_run_starts,
+            design.shape[0],
+            fit_kwargs=fam_fit_kwargs,
+            tr=tr,
+            method=method,
+        )
+        # Voxels whose family was rejected (too small, too few runs, a task
+        # regressor that did not survive) never got a valid fit, so the caller
+        # must keep them out of the output.
+        results.missing_dof_loss = dof_loss
+        results.missing_demoted = demoted
+        results.missing_families = families
 
     # The -dsort no-dsort snapshot needs the same spatial metadata to be written.
     _nods = getattr(results, "nods_results", None)
