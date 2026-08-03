@@ -1405,3 +1405,105 @@ def test_qc_single_session_grandmean_stack_is_not_a_duplicate():
     s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
     assert "stage07.QC.runmean.ses-01.nii.gz" in _qc(s)
     assert "stage08.QC.grandmean.nii.gz" not in _qc(s)
+
+
+# ---------------------------------------------------------------------------
+# GRE (B0) fieldmaps
+# ---------------------------------------------------------------------------
+
+
+def _stage04(script: str) -> str:
+    """Just the stage04 block — the preflight lists every tool by name, so a bare
+    substring search cannot tell which fieldmap tool the pipeline actually calls."""
+    start = script.index("# ============================ stage04")
+    return script[start : script.index("# ============================ stage0", start + 10)]
+
+
+def _b0_run(session, task, run, pe="j-", readout=0.06):
+    """A run whose sidecar carries the EPI geometry a GRE fieldmap does not."""
+    r = _run(session, task, run, pe=pe)
+    r.json["TotalReadoutTime"] = readout
+    return r
+
+
+def _b0_fmap(fmap_id="b0", intended=(("foo", "1"),), **kw):
+    return FmapGroup(
+        "01",
+        fmap_id,
+        Path("/fmap/sub-X_phasediff.nii.gz"),
+        {"EchoTime1": 0.00492, "EchoTime2": 0.00738},
+        list(intended),
+        kind="b0",
+        phasediff_path=Path("/fmap/sub-X_phasediff.nii.gz"),
+        magnitude_paths=[Path("/fmap/sub-X_magnitude1.nii.gz")],
+        te_ms=[4.92, 7.38],
+        **kw,
+    )
+
+
+def test_b0_fmap_emits_b0fmap_and_its_own_undistorted_mean():
+    """A GRE group must reach stage05+ with the same two products a blipflip group
+    has: the PE warp and the undistorted mean that defines the common grid."""
+    fmap = _b0_fmap(intended=[("foo", "1"), ("foo", "2")])
+    subj = Subject(
+        "X", [Session("01", [_b0_run("01", "foo", "1"), _b0_run("01", "foo", "2")], [fmap])]
+    )
+    plan = build_plan(subj, Options())
+    s = write_script(plan, "wd", bids_root="/bids")
+    st4 = _stage04(s)
+    assert "ffs_util_b0fmap" in st4 and "ffs_blipflip" not in st4
+    assert "-phasediff /fmap/sub-X_phasediff.nii.gz" in s
+    assert "-te 4.92 7.38" in s
+    # EPI geometry comes from the RUN: a GRE sidecar has neither of these.
+    assert "-pe_dir j-" in s and "-readout 0.06" in s
+    # The mean the rest of the pipeline consumes, made with the Jacobian so it
+    # agrees with the runmeans about intensity where distortion was worst.
+    assert 'stage04.blip.ses-01.fmap-b0_mean.nii$FMT"' in s
+    assert "-jac j" in s
+    for run in ("1", "2"):
+        assert "blip_half" in _chain(plan, ("01", "foo", run))
+
+
+def test_b0_fmap_without_a_readout_aborts_rather_than_guessing():
+    """A measured field has an absolute Hz scale, so the readout cannot be inferred
+    the way blipflip can manage without one."""
+    fmap = _b0_fmap()
+    run = _run("01", "foo", "1")
+    run.json.pop("TotalReadoutTime", None)
+    subj = Subject("X", [Session("01", [run], [fmap])])
+    s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    st4 = _stage04(s)
+    assert "no TotalReadoutTime" in st4 and "ffs_util_b0fmap" not in st4
+
+
+def test_b0_fmap_splits_per_pe_polarity():
+    """One measured field, runs of both polarities: the field is polarity-free but
+    the warp is not, so each polarity gets its own group, warp and undistorted
+    space (which cross-fmap alignment then reconciles)."""
+    fmap = _b0_fmap(intended=[("foo", "1"), ("foo", "2")])
+    subj = Subject(
+        "X",
+        [
+            Session(
+                "01",
+                [_b0_run("01", "foo", "1", pe="j-"), _b0_run("01", "foo", "2", pe="j")],
+                [fmap],
+            )
+        ],
+    )
+    plan = build_plan(subj, Options())
+    ids = {pr.bold.run: pr.fmap.fmap_id for pr in plan.runs}
+    assert ids["1"] != ids["2"]
+    s = write_script(plan, "wd", bids_root="/bids")
+    flags = _stage04(s).replace(" \\", "")
+    assert "-pe_dir j-\n" in flags and "-pe_dir j\n" in flags
+    # Two groups → the non-reference one is brought onto the reference's grid.
+    assert "xfmap_lin" in _chain(plan, ("01", "foo", "2"))
+
+
+def test_pepolar_fmap_is_untouched_by_the_polarity_split():
+    fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], [fmap])])
+    plan = build_plan(subj, Options())
+    assert plan.runs[0].fmap is not None and plan.runs[0].fmap.fmap_id == "f"
+    assert "ffs_blipflip" in _stage04(write_script(plan, "wd", bids_root="/bids"))

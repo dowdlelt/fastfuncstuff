@@ -7,9 +7,11 @@ fallbacks for the real-world non-compliance we hit in practice (see the
 ``# quirk:`` notes below), which a strict validator-driven indexer chokes on.
 
 Scope for this milestone: magnitude BOLD, optional per-run phase, magnitude
-SBRef, reverse-PE fieldmaps (either conventional ``fmap/*_epi`` or task-tagged
-``fmap/*_bold``/``*_sbref``), and a single anat T1w. Everything is returned as
-plain dataclasses; reference/warp logic lives in ``plan.py``.
+SBRef, fieldmaps of either flavour — reverse-PE (conventional ``fmap/*_epi`` or
+task-tagged ``fmap/*_bold``/``*_sbref``) and dual-echo GRE (``*_phasediff``,
+``*_phase1``/``*_phase2``, or a ready-made ``*_fieldmap``) — and a single anat
+T1w. Everything is returned as plain dataclasses; reference/warp logic lives in
+``plan.py``.
 """
 
 from __future__ import annotations
@@ -220,18 +222,31 @@ class BoldRun:
 
 @dataclass
 class FmapGroup:
-    """A reverse-PE fieldmap and the runs it corrects.
+    """A fieldmap and the runs it corrects — reverse-PE (``kind="pepolar"``) or
+    dual-echo GRE (``kind="b0"``).
 
-    ``reverse_path`` is the blip-down (opposite PE) image. The forward (blip-up)
-    image is ``forward_path`` when ``fmap/`` supplies its own matched-PE mate
-    (the AP/PA pair case — the pair is self-contained, so the correction never
-    borrows a data run); otherwise it is None and the emitter uses the first
-    intended run's SBRef/mean. Runs are associated via ``IntendedFor`` when
-    present, else by task+session.
+    **pepolar.** ``reverse_path`` is the blip-down (opposite PE) image. The
+    forward (blip-up) image is ``forward_path`` when ``fmap/`` supplies its own
+    matched-PE mate (the AP/PA pair case — the pair is self-contained, so the
+    correction never borrows a data run); otherwise it is None and the emitter
+    uses the first intended run's SBRef/mean.
+
+    **b0.** ``reverse_path`` holds the primary field source, purely so a group
+    always has one representative path; nothing reads it as a reverse-PE image
+    (``field_source`` is the honest name for it). The field comes from ``phase_paths``
+    (BIDS phase1/phase2), ``phasediff_path`` (Siemens) or ``fieldmap_path``
+    (ready-made Hz), plus ``magnitude_paths``. There is no forward image in
+    ``fmap/`` at all — a GRE acquisition is not an EPI — so ``forward_path``
+    stays None and the emitter always borrows the intended run's rep, which is
+    also what ``ffs_util_b0fmap -epi`` needs to put the warp on the EPI grid.
+
+    Runs are associated via ``IntendedFor`` when present, else by task+session.
 
     ``json`` is the sidecar of the image whose distorted space the estimated
-    field lives in: the forward image for a pair, the lone reverse image
-    otherwise.
+    field lives in: the forward image for a pepolar pair, the lone reverse image
+    otherwise. For a b0 group it is the *phase* sidecar, which carries the echo
+    times but no EPI geometry — hence ``pe_dir``/``readout`` are None there and
+    the emitter reads them from the run (see :func:`plan.split_b0_by_polarity`).
     """
 
     session: str | None
@@ -242,6 +257,19 @@ class FmapGroup:
     # unique run identity this fmap corrects.
     intended_runs: list[tuple[str, str]] = field(default_factory=list)
     forward_path: Path | None = None
+    kind: str = "pepolar"  # pepolar | b0
+    # --- b0 only ---
+    phase_paths: list[Path] = field(default_factory=list)
+    phasediff_path: Path | None = None
+    fieldmap_path: Path | None = None
+    magnitude_paths: list[Path] = field(default_factory=list)
+    # Echo times in ms, in image order (b0 only). Empty when the sidecars didn't
+    # give them — ffs_util_b0fmap then reads them itself and errors if it can't.
+    te_ms: list[float] = field(default_factory=list)
+    # PE direction this group's warp was built for, when the group was split by
+    # run polarity (b0 only — a measured field serves either polarity, but the
+    # warp it produces does not). None means "take it from the run".
+    pe_override: str | None = None
 
     @property
     def run_ids(self) -> list[str]:
@@ -253,13 +281,22 @@ class FmapGroup:
         return seen
 
     @property
+    def is_b0(self) -> bool:
+        return self.kind == "b0"
+
+    @property
+    def field_source(self) -> Path:
+        """The image the field is derived from (b0: phasediff/phase1/fieldmap)."""
+        return self.reverse_path
+
+    @property
     def readout(self) -> float | None:
         v = self.json.get("TotalReadoutTime")
         return float(v) if v is not None else None
 
     @property
     def pe_dir(self) -> str | None:
-        return self.json.get("PhaseEncodingDirection")
+        return self.pe_override or self.json.get("PhaseEncodingDirection")
 
     @property
     def acq_time(self) -> float | None:
@@ -320,6 +357,7 @@ def scan_subject(
     sessions: list[str] | None = None,
     tasks: list[str] | None = None,
     fmap_pe_dir: str | None = None,
+    fmap_kind: str = "auto",
 ) -> Subject:
     """Scan one subject into a :class:`Subject` tree.
 
@@ -331,6 +369,9 @@ def scan_subject(
     ``fmap_pe_dir`` names the ``dir`` label whose polarity matches the BOLD runs
     (e.g. ``AP``) — needed to pair opposite-PE fieldmaps when the sidecars omit
     ``PhaseEncodingDirection``. See :func:`_pick_pe_pair`.
+
+    ``fmap_kind`` is ``auto`` | ``pepolar`` | ``b0`` — which fieldmap flavour to
+    use from a ``fmap/`` that offers both. See :func:`_scan_fmaps`.
     """
     bids_root = Path(bids_root)
     sub_label = _norm_id(subject, "sub-")
@@ -350,7 +391,9 @@ def scan_subject(
         ses_label = _norm_id(sdir.name, "ses-") if sdir.name.startswith("ses-") else None
         if want_ses is not None and ses_label not in want_ses:
             continue
-        sess = _scan_session(sdir, bids_root, sub_label, ses_label, want_task, fmap_pe_dir)
+        sess = _scan_session(
+            sdir, bids_root, sub_label, ses_label, want_task, fmap_pe_dir, fmap_kind
+        )
         if sess.bold_runs:
             out.sessions.append(sess)
     return out
@@ -363,6 +406,7 @@ def _scan_session(
     ses_label: str | None,
     want_task: set[str] | None,
     fmap_pe_dir: str | None = None,
+    fmap_kind: str = "auto",
 ) -> Session:
     sess = Session(session=ses_label)
 
@@ -419,7 +463,7 @@ def _scan_session(
     # ---- fmap: reverse-PE images (conventional epi OR task-tagged bold/sbref) ----
     fmap_dir = sdir / "fmap"
     if fmap_dir.is_dir():
-        sess.fmaps = _scan_fmaps(fmap_dir, bids_root, sess.bold_runs, fmap_pe_dir)
+        sess.fmaps = _scan_fmaps(fmap_dir, bids_root, sess.bold_runs, fmap_pe_dir, fmap_kind)
 
     # ---- anat: prefer acq-uni T1w (MP2RAGE), else first T1w / MPRAGE ----
     sess.anat = _pick_anat(sdir)
@@ -427,6 +471,35 @@ def _scan_session(
 
 
 def _scan_fmaps(
+    fmap_dir: Path,
+    bids_root: Path,
+    bold_runs: list[BoldRun],
+    fmap_pe_dir: str | None = None,
+    fmap_kind: str = "auto",
+) -> list[FmapGroup]:
+    """Build FmapGroups from ``fmap/`` — reverse-PE images and/or GRE fieldmaps.
+
+    ``fmap_kind`` picks between the two when a session has both: ``pepolar``
+    wins under ``auto`` (it is the better-travelled path here and needs no
+    ROMEO), and the two are never mixed — a session gets one kind of fieldmap,
+    so every group in it lives in the same estimation framework.
+    """
+    kinds = ("pepolar", "b0") if fmap_kind == "auto" else (fmap_kind,)
+    for kind in kinds:
+        if kind == "pepolar":
+            groups = _finalize_groups(
+                _scan_pepolar_fmaps(fmap_dir, bids_root, bold_runs, fmap_pe_dir), bold_runs
+            )
+        else:
+            groups = _finalize_groups(_scan_b0_fmaps(fmap_dir, bids_root), bold_runs)
+        if groups:
+            for g in groups:
+                g.session = bold_runs[0].session if bold_runs else None
+            return groups
+    return []
+
+
+def _scan_pepolar_fmaps(
     fmap_dir: Path,
     bids_root: Path,
     bold_runs: list[BoldRun],
@@ -503,6 +576,13 @@ def _scan_fmaps(
                 )
             )
 
+    return groups
+
+
+def _finalize_groups(groups: list[FmapGroup], bold_runs: list[BoldRun]) -> list[FmapGroup]:
+    """Resolve which in-scope runs each group serves, dropping groups that serve
+    none. Shared by both fieldmap kinds — the assignment rules are about runs and
+    acquisition order, not about how the field was measured."""
     # Keep only (task, run) pairs that are actually in scope. Because the pair
     # carries the task, this drops an out-of-scope fmap (e.g. a task-floc fmap
     # when only -task primary was scanned) AND is immune to run-number collisions
@@ -522,6 +602,107 @@ def _scan_fmaps(
         groups[0].intended_runs = [(r.task, r.run) for r in bold_runs]
         return groups
     return served
+
+
+# The three BIDS GRE fieldmap forms, by suffix. All three end up as one Hz field
+# inside ffs_util_b0fmap; what differs is what it has to do to get there.
+_B0_SUFFIXES = (
+    "phasediff",
+    "phase1",
+    "phase2",
+    "fieldmap",
+    "magnitude",
+    "magnitude1",
+    "magnitude2",
+)
+
+
+def _scan_b0_fmaps(fmap_dir: Path, bids_root: Path) -> list[FmapGroup]:
+    """Build FmapGroups from the dual-echo GRE fieldmaps in ``fmap/``.
+
+    One group per distinct GRE acquisition, keyed on ``task``/``acq``/``run`` —
+    the entities that name a separate acquisition. Unlike the reverse-PE scan
+    there is no ``dir`` to reason about: a GRE fieldmap has no phase-encode
+    polarity of its own (that is the whole point of it), which is why one group
+    can serve runs of either polarity and why ``plan.split_b0_by_polarity``
+    exists to give each polarity its own warp.
+
+    The three forms are recognised in BIDS preference order: phasediff (one
+    difference volume), phase1+phase2 (two echoes), fieldmap (ready-made Hz).
+    """
+    by_tag: dict[str, dict[str, tuple[Path, dict]]] = {}
+    for nf in sorted(fmap_dir.glob("*.nii*")):
+        if not _NIFTI_RE.search(nf.name):
+            continue
+        suffix = parse_suffix(nf.name)
+        if suffix not in _B0_SUFFIXES:
+            continue
+        ents = parse_entities(nf.name)
+        task, acq, run = ents.get("task"), ents.get("acq"), ents.get("run")
+        tag = "-".join(p for p in (task, acq, f"run{run}" if run else None) if p)
+        by_tag.setdefault(tag, {})[suffix] = (nf, load_sidecar(nf, bids_root))
+
+    groups: list[FmapGroup] = []
+    for tag, slot in by_tag.items():
+        mags = [slot[s][0] for s in ("magnitude1", "magnitude2", "magnitude") if s in slot]
+        phase_paths: list[Path] = []
+        phasediff = fieldmap = None
+        if "phasediff" in slot:
+            source, js = slot["phasediff"]
+            phasediff = source
+        elif "phase1" in slot and "phase2" in slot:
+            phase_paths = [slot["phase1"][0], slot["phase2"][0]]
+            source, js = slot["phase1"]
+        elif "fieldmap" in slot:
+            source, js = slot["fieldmap"]
+            fieldmap = source
+        else:
+            continue  # magnitudes with nothing to derive a field from
+        if not mags and fieldmap is None:
+            continue  # no magnitude → nothing to mask or match with
+        # quirk: IntendedFor is required on the *fieldmap* image but some
+        # datasets put it only on the magnitude. Take it from wherever it is.
+        if "IntendedFor" not in js:
+            for _s, (_p, mjs) in slot.items():
+                if "IntendedFor" in mjs:
+                    js = {**js, "IntendedFor": mjs["IntendedFor"]}
+                    break
+        gid = tag or "b0"
+        groups.append(
+            FmapGroup(
+                session=None,  # filled by the caller's session context
+                fmap_id=gid,
+                reverse_path=source,
+                json=js,
+                kind="b0",
+                phase_paths=phase_paths,
+                phasediff_path=phasediff,
+                fieldmap_path=fieldmap,
+                magnitude_paths=mags,
+                te_ms=_b0_echo_times(slot),
+                intended_runs=[],
+            )
+        )
+    return groups
+
+
+def _b0_echo_times(slot: dict[str, tuple[Path, dict]]) -> list[float]:
+    """Echo times in ms for a GRE group, or [] when the sidecars don't say.
+
+    BIDS stores EchoTime/EchoTime1/EchoTime2 in *seconds*; ``-te`` wants ms. An
+    empty list is fine — ffs_util_b0fmap reads the same sidecars itself and
+    errors clearly if they are absent.
+    """
+    js = slot.get("phasediff", (None, {}))[1]
+    if "EchoTime1" in js and "EchoTime2" in js:
+        return [float(js["EchoTime1"]) * 1e3, float(js["EchoTime2"]) * 1e3]
+    tes = []
+    for s in ("phase1", "phase2"):
+        te = slot.get(s, (None, {}))[1].get("EchoTime")
+        if te is None:
+            return []
+        tes.append(float(te) * 1e3)
+    return tes
 
 
 def _pick_form(slot: dict[str, tuple[Path, dict]]) -> tuple[Path, dict] | None:
@@ -594,7 +775,7 @@ def pair_undetermined(session: Session) -> list[str]:
     fieldmap fell back to borrowing a data run as its forward image, which works
     but wastes the acquired mate; ``-fmap_pe_dir`` resolves it.
     """
-    labels = [f.fmap_id for f in session.fmaps if f.forward_path is None]
+    labels = [f.fmap_id for f in session.fmaps if f.forward_path is None and not f.is_b0]
     bare = {lab.split("-")[0].lower() for lab in labels}
     return sorted(lab for lab in labels if _OPPOSITE_DIRS.get(lab.split("-")[0].lower()) in bare)
 
