@@ -36,7 +36,6 @@ from fastfuncstuff.processing.ffs_moco import (
     save_moco_dfile,
 )
 from fastfuncstuff.processing.io import (
-    derive_mean_output_path,
     derive_prefixed_output_path,
     load_image,
     save_first_last,
@@ -44,8 +43,21 @@ from fastfuncstuff.processing.io import (
     save_tsnr,
 )
 
-# Sentinel for `-save_mean` given with no value: derive the path from -prefix.
+# Sentinel for `-save_mean` / `-save_max` / `-save_min` given with no value:
+# derive the path from -prefix.
 _MEAN_FROM_PREFIX = "\x00from_prefix"
+
+# Temporal reductions of the corrected series, in the order they are written.
+# max/min exist for coverage, not contrast: motion carries edge voxels out of the
+# FoV, where the resampler writes 0, so the max over time is the union of what
+# was ever imaged (the most complete alignment target) and the min is the
+# intersection (0 wherever ANY volume lost the voxel — an exact "analysable
+# everywhere" mask). Both compose down a chain of maxes/mins; a mean does not.
+_TEMPORAL_REDUCTIONS: tuple[tuple[str, str], ...] = (
+    ("save_mean", "mean"),
+    ("save_max", "max"),
+    ("save_min", "min"),
+)
 
 # Sentinel for `-save_weight` given with no value: derive the paths from -prefix.
 _WEIGHT_FROM_PREFIX = "\x00weight_from_prefix"
@@ -441,6 +453,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "write it there (and you may then omit -prefix to skip the full series).",
     )
     out_group.add_argument(
+        "-save_max",
+        "-save-max",
+        dest="save_max",
+        nargs="?",
+        const=_MEAN_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="Save the temporal MAX of the corrected series (max_{prefix} with no "
+        "value). Voxels that motion carried outside the FoV are 0 in the volumes "
+        "that lost them, so the max is the union of everything ever imaged — a "
+        "fuller alignment target than the mean, which dims those edges.",
+    )
+    out_group.add_argument(
+        "-save_min",
+        "-save-min",
+        dest="save_min",
+        nargs="?",
+        const=_MEAN_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="Save the temporal MIN of the corrected series (min_{prefix} with no "
+        "value): 0 wherever ANY volume lost the voxel, so >0 is exactly the region "
+        "with complete data for every timepoint.",
+    )
+    out_group.add_argument(
         "-save_first_last",
         "-save-first-last",
         dest="save_first_last",
@@ -790,6 +827,35 @@ def _parse_reg_echo(reg_echo: str | None, n_echoes: int) -> tuple[bool, int]:
     return False, r - 1
 
 
+def _want_reductions(args: argparse.Namespace) -> bool:
+    """True when any temporal reduction was requested (each needs the resample)."""
+    return any(getattr(args, dest, None) is not None for dest, _ in _TEMPORAL_REDUCTIONS)
+
+
+def _reduce_time(series: torch.Tensor, which: str) -> torch.Tensor:
+    """One temporal reduction of a (nt, nz, ny, nx) corrected series."""
+    if which == "max":
+        return series.amax(dim=0)
+    if which == "min":
+        return series.amin(dim=0)
+    return series.mean(dim=0)
+
+
+def _reduction_path(value: str, which: str, prefix: str | None, flag: str) -> str:
+    """Output path for a temporal reduction: the given PREFIX, or ``{which}_`` on
+    the front of -prefix when the flag was passed bare. Exits when neither exists."""
+    if value is not _MEAN_FROM_PREFIX:
+        return parse_prefix(value).as_file()
+    if prefix is None:
+        print(
+            f"Error: -{flag} with no value needs -prefix to derive the "
+            f"{which} path; pass -{flag} PREFIX instead.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    return derive_prefixed_output_path(parse_prefix(prefix).as_file(), which)
+
+
 def _validate_run_args(args: argparse.Namespace) -> None:
     """Validate the output/QC request for one run; exit(1) on an empty request.
 
@@ -802,6 +868,8 @@ def _validate_run_args(args: argparse.Namespace) -> None:
         for name in (
             "prefix",
             "save_mean",
+            "save_max",
+            "save_min",
             "1Dfile",
             "1Dmatrix_save",
             "dfile",
@@ -813,7 +881,8 @@ def _validate_run_args(args: argparse.Namespace) -> None:
     if not _any_output:
         print(
             "Error: no outputs requested. Give at least one of -prefix, "
-            "-save_mean, -1Dfile, -1Dmatrix_save, -dfile, -maxdisp1D, -iterfile.",
+            "-save_mean, -save_max, -save_min, -1Dfile, -1Dmatrix_save, -dfile, "
+            "-maxdisp1D, -iterfile.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -876,15 +945,20 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         # Corrected series.
         if args.prefix is not None:
             outs.append(parse_prefix(_pfx(args.prefix, tag)).as_file())
-        # Temporal mean of the corrected series.
-        if args.save_mean is not None:
-            if args.save_mean is _MEAN_FROM_PREFIX:
+        # Temporal reductions of the corrected series.
+        for dest, which in _TEMPORAL_REDUCTIONS:
+            value = getattr(args, dest, None)
+            if value is None:
+                continue
+            if value is _MEAN_FROM_PREFIX:
                 if args.prefix is not None:
                     outs.append(
-                        derive_mean_output_path(parse_prefix(_pfx(args.prefix, tag)).as_file())
+                        derive_prefixed_output_path(
+                            parse_prefix(_pfx(args.prefix, tag)).as_file(), which
+                        )
                     )
             else:
-                outs.append(parse_prefix(_pfx(args.save_mean, tag)).as_file())
+                outs.append(parse_prefix(_pfx(value, tag)).as_file())
         # QC files — all named after the (per-echo) prefix.
         if _want_qc(args) and args.prefix is not None:
             base_file = parse_prefix(_pfx(args.prefix, tag)).as_file()
@@ -991,7 +1065,7 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
 
     # Resampling is only needed if we will emit a corrected series, its mean, or a
     # corrected-series QC map (-save_initial reads the raw data only).
-    need_aligned = args.prefix is not None or args.save_mean is not None or _want_corrected_qc(args)
+    need_aligned = args.prefix is not None or _want_reductions(args) or _want_corrected_qc(args)
     config = _build_config(
         args, device, verb, skip_resample=not need_aligned, base_index=base_index
     )
@@ -1009,23 +1083,16 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         if verb >= 1:
             print(f"Saved: {out_path}")
 
-    # Temporal mean of the corrected series.
-    if args.save_mean is not None:
-        if args.save_mean is _MEAN_FROM_PREFIX:
-            if args.prefix is None:
-                print(
-                    "Error: -save_mean with no value needs -prefix to derive the "
-                    "mean path; pass -save_mean PREFIX instead.",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            mean_path = derive_mean_output_path(parse_prefix(args.prefix).as_file())
-        else:
-            mean_path = parse_prefix(args.save_mean).as_file()
-        with spinner(f"Writing {Path(mean_path).name}"):
-            save_image(result.aligned.mean(dim=0), mean_path, header_info=header_info)
+    # Temporal reductions of the corrected series (mean / max / min).
+    for dest, which in _TEMPORAL_REDUCTIONS:
+        value = getattr(args, dest)
+        if value is None:
+            continue
+        out = _reduction_path(value, which, args.prefix, dest)
+        with spinner(f"Writing {Path(out).name}"):
+            save_image(_reduce_time(result.aligned, which), out, header_info=header_info)
         if verb >= 1:
-            print(f"Saved mean: {mean_path}")
+            print(f"Saved {which}: {out}")
 
     if _want_qc(args):
         base_path = parse_prefix(args.prefix).as_file()
@@ -1076,11 +1143,11 @@ def _run_multi_echo(
     del reg_data  # free the estimation series before loading echoes for resampling
 
     write_series = args.prefix is not None
-    write_mean = args.save_mean is not None
+    write_reductions = _want_reductions(args)
     want_qc = _want_qc(args)
 
     # Resample each echo with the shared matrices and write eN_ outputs.
-    if write_series or write_mean or want_qc:
+    if write_series or write_reductions or want_qc:
         base_copy_idx = base_index if base_vol is None else -1
         dtype = torch.float32
         for i, path in enumerate(input_files):
@@ -1114,22 +1181,20 @@ def _run_multi_echo(
                 if verb >= 1:
                     print(f"  Saved: {out_path}")
 
-            if write_mean:
-                if args.save_mean is _MEAN_FROM_PREFIX:
-                    if args.prefix is None:
-                        print(
-                            "Error: -save_mean with no value needs -prefix to derive "
-                            "the mean path; pass -save_mean PREFIX instead.",
-                            file=sys.stderr,
-                        )
-                        sys.exit(1)
-                    base_pfx = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
-                    mean_path = derive_mean_output_path(base_pfx)
-                else:
-                    mean_path = parse_prefix(_sibling(args.save_mean, f"e{echo_num}_")).as_file()
-                save_image(aligned.mean(dim=0), mean_path, header_info=echo_hdr)
+            for dest, which in _TEMPORAL_REDUCTIONS:
+                value = getattr(args, dest)
+                if value is None:
+                    continue
+                echo_prefix = _sibling(args.prefix, f"e{echo_num}_") if args.prefix else None
+                out_path = _reduction_path(
+                    value if value is _MEAN_FROM_PREFIX else _sibling(value, f"e{echo_num}_"),
+                    which,
+                    echo_prefix,
+                    dest,
+                )
+                save_image(_reduce_time(aligned, which), out_path, header_info=echo_hdr)
                 if verb >= 1:
-                    print(f"  Saved mean: {mean_path}")
+                    print(f"  Saved {which}: {out_path}")
 
             if want_qc:
                 base_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()

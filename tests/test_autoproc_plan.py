@@ -204,16 +204,58 @@ def test_reference_levels_get_a_role_ref_qc_copy():
     s = write_script(
         build_plan(subj, Options(ref_ses="01", fmap_ref=["a"])), "wd", bids_root="/bids"
     )
-    # xses: reference session has no transform, but appears in the listing.
-    assert 'cp -f "stage07.sesmean.ses-01.nii$FMT" "stage08.xses.ses-01.role-ref.nii$FMT"' in s
-    assert '-prefix \\"stage08.xses.ses-02.nii$FMT\\"' in s  # the real, aligned one (batched)
+    # xses: reference session has no transform, but appears in the listing. The
+    # marker is the image that actually served as the alignment base — the primary
+    # lane's session representative (the max lane, with no SBRefs here).
+    assert (
+        'cp -f "stage07.sesmean.ses-01.src-max.nii$FMT" "stage08.xses.ses-01.role-ref_lin.nii$FMT"'
+        in s
+    )
+    # the real, aligned one (batched); tagged with the lane that estimated it.
+    assert '-prefix \\"stage08.xses.ses-02.src-max_lin.nii$FMT\\"' in s
     # xfmap: same for the reference fieldmap group.
     assert 'cp -f "stage04.blip.ses-01.fmap-a_mean.nii$FMT" ' in s
-    assert '"stage05.xfmap.ses-01.fmap-a.role-ref.nii$FMT"' in s
+    assert '"stage05.xfmap.ses-01.fmap-a.role-ref_lin.nii$FMT"' in s
     # A reference has no nonlinear counterpart, by definition.
     assert "role-ref_nl" not in s
     # Markers are QC only — never fed into a warp chain or a mean.
     assert "-nwarp" in s and "role-ref" not in s.split("CHAIN[")[-1].split("\n\n")[0]
+
+
+def test_alignment_images_pair_as_lin_and_nl_while_the_warp_stays_lane_free():
+    """An alignment stage's two images differ only by `_lin` / `_nl`, so the pair
+    reads as one thing refined twice and the nl file names what fed it. The warp
+    beside the nl image is shared by every lane, so it keeps the lane-free stem —
+    which is exactly what the chain references."""
+    fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1")], [fmap]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    opts = Options(ref_ses="01", fmap_ref=["f"], xrun_nonlin=True, xses_nonlin=True)
+    s = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
+
+    # xrun: bash-loop names, so assert on the emitted template.
+    assert '-prefix \\"${xstem}${LANE}_lin.nii$FMT\\"' in s
+    assert '-prefix \\"${xstem}${LANE}_nl.nii$FMT\\"' in s
+    assert '-warp_prefix \\"${xstem}_nl\\"' in s
+    # The nonlinear step refines the linear image, not the raw source.
+    assert '-source \\"${xstem}${LANE}_lin.nii$FMT\\"' in s
+
+    # xses: fully expanded names.
+    xs = "stage08.xses.ses-02"
+    assert f'-prefix \\"{xs}.src-max_lin.nii$FMT\\"' in s
+    assert f'-prefix \\"{xs}.src-max_nl.nii$FMT\\"' in s
+    assert f'-warp_prefix \\"{xs}_nl\\"' in s
+
+    # Transforms carry neither the lane nor `_lin`, and the chain uses those names.
+    assert f'-1Dmatrix_save \\"{xs}.aff12.1D\\"' in s
+    assert "src-max_nl_WARP" not in s
+    assert f"{xs}_nl_WARP.nii$FMT" in s
+    assert "_lin.aff12.1D" not in s and "_lin_WARP" not in s
 
 
 def test_xrun_anchor_gets_a_role_ref_copy_only_without_fieldmaps():
@@ -221,8 +263,10 @@ def test_xrun_anchor_gets_a_role_ref_copy_only_without_fieldmaps():
     it gets a marker. With fmaps EVERY run gets a real xrun; no gap, no marker."""
     subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
     s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
-    assert '"stage06.xrun.ses-01.task-foo.run-1.role-ref.nii$FMT"' in s
-    assert '"stage02.moco.ses-01.task-foo.run-1_mean.nii$FMT"' in s
+    # The marker is the anchor's primary-lane image: with no SBRefs that is the
+    # moco MAX (the lane that estimates the transforms), not the mean.
+    assert '"stage06.xrun.ses-01.task-foo.run-1.src-max.role-ref_lin.nii$FMT"' in s
+    assert '"stage02.moco.ses-01.task-foo.run-1_max.nii$FMT"' in s
 
     fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {}, [("foo", "1"), ("foo", "2")])
     with_fmap = Subject(
@@ -383,8 +427,8 @@ def test_fieldmap_jacobian_rides_every_application_of_the_blip_warp():
     assert 'CHAIN[SM:t:1]="' in script
     for m in re.finditer(r'(?:CHAIN|SBCHAIN|PRECHAIN)\[[^\]]+\]="([^"]*)"', script):
         assert "stage04.blip.ses-SM.fmap-PA_warp.nii$FMT" in m.group(1).split()
-    # stage07 runmean, stage10 BOLD and stage10 SBRef all pass it.
-    assert script.count("${JAC[$k]:+") == 4  # two lanes in stage07, BOLD, SBRef
+    # stage07 runmean (once per lane), stage10 BOLD and stage10 SBRef all pass it.
+    assert script.count("${JAC[$k]:+") == 2 + len({"sbref", "max", "min", "mean"})
 
     # A run with no fieldmap has no JAC entry at all (nothing to modulate).
     plain = build_plan(
@@ -393,10 +437,30 @@ def test_fieldmap_jacobian_rides_every_application_of_the_blip_warp():
     assert "JAC[" not in write_script(plain, "workdir", bids_root="/bids").split("stage07")[0]
 
 
+def test_header_carries_the_generating_command():
+    """The ffs_autoproc call that made the script is in it, commented out, and
+    every continuation line stays commented (a bare wrapped line would run)."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
+    plan = build_plan(subj, Options(go_to_anat=True))
+    cmd = "ffs_autoproc -bids /some/very/long/path/to/a/bids/dataset/root -sub 01 " + (
+        "-anat /an/equally/long/path/to/the/freesurfer/SUMA/brain.nii.gz -recipe 9p4T -format .zst"
+    )
+    s = write_script(plan, "wd", bids_root="/bids", invocation=cmd)
+    note = s.split("set -euo pipefail")[0].splitlines()
+    quoted = [ln for ln in note if "ffs_autoproc -bids" in ln or ln.startswith("#   -")]
+    assert quoted, "generating command missing from the header"
+    assert all(ln.startswith("#") for ln in note)
+    # The words survive the wrapping, in order.
+    assert " ".join(w for ln in quoted for w in ln.lstrip("# ").rstrip(" \\").split()) == cmd
+
+    assert "generated by (uncomment" not in write_script(plan, "wd", bids_root="/bids")
+
+
 def test_warpmaster_defines_grid_mask_and_stats():
     """stage10a builds the warpmaster grid + epi_mask before stage10, stage10
     resamples onto it, and the GLM emits OLS+REML buckets masked by epi_mask.
-    autobox3_brain (viewing only) is emitted only when we own the anat."""
+    The anat underlays (whole-brain box + the EPI-FOV crop of it) are emitted only
+    when we own the anat."""
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
     plan = build_plan(subj, Options(go_to_anat=True, run_glm=True))
     s = write_script(plan, "wd", bids_root="/bids")
@@ -406,7 +470,11 @@ def test_warpmaster_defines_grid_mask_and_stats():
     assert "ffs_util_autobox" in s and "ffs_util_resample" in s
     assert '-prefix "stage10.warpmaster.nii$FMT"' in s
     assert '-prefix "epi_mask.nii$FMT"' in s and "-dilate 2" in s
-    assert '[ -f "autobox3_brain.nii.gz" ] ||' in s  # own anat → viewing brain
+    assert '[ -f "stage09.anat_autobox.nii.gz" ] ||' in s  # own anat → whole-brain underlay
+    assert '[ -f "stage10.anat_in_epi_fov.nii.gz" ] ||' in s  # ... and the EPI-FOV crop
+    # The alignment base is the boxed anat, and its output is named for the source.
+    assert '-base "stage09.anat_autobox.nii.gz"' in s
+    assert '-prefix "stage09.grandmean_al_anat.nii$FMT"' in s
 
     # stage10 lands runs on the warpmaster (not the raw anat master).
     assert "-master stage10.warpmaster.nii$FMT" in s
@@ -423,7 +491,8 @@ def test_warpmaster_defines_grid_mask_and_stats():
         bids_root="/bids",
     )
     assert '-prefix "stage10.warpmaster.nii$FMT"' in borrow
-    assert '[ -f "autobox3_brain.nii.gz" ] ||' not in borrow
+    assert "stage09.anat_autobox.nii.gz" not in borrow
+    assert "stage10.anat_in_epi_fov.nii.gz" not in borrow
 
 
 def _two_fmap_subject():
@@ -467,7 +536,7 @@ def test_anat_source_mean_fmap_averages_the_aligned_group_means():
     assert f'-prefix "{fm}"' in s
     # Averaged: reference group's own blip mean + the non-ref group's ALIGNED mean.
     assert '"stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
-    assert '"stage05.xfmap.ses-SM.fmap-prim.nii$FMT"' in s
+    assert '"stage05.xfmap.ses-SM.fmap-prim_lin.nii$FMT"' in s
     assert f'-source "{fm}"' in s  # and it is what the anat aligns
     # Built after the xfmap alignment that puts the groups in one space.
     assert s.index("stage05: cross-fmap") < s.index(f'-prefix "{fm}"')
@@ -942,13 +1011,14 @@ def test_sbref_lane_estimates_transforms_and_keeps_the_mean_lane():
     # live in a manifest line, so their quotes are backslash-escaped.)
     assert '-source \\"${SBREF[$k]}\\"' in s
     assert '-1Dmatrix_save \\"${xstem}.aff12.1D\\"' in s
-    assert '-source "${MOCOMEAN[$k]}"' not in s.split("stage07")[0]
+    assert '-source "${MOCO_MEAN[$k]}"' not in s.split("stage07")[0]
 
     # xses is estimated on the SBRef session means...
     assert '-source \\"stage07.sesmean.ses-02.src-sbref.nii$FMT\\"' in s
-    # ...and re-applied to the BOLD-mean one (an ffs_nwarp manifest line), so both
-    # grandmeans exist.
-    assert '-prefix \\"stage08.xses.ses-02.nii$FMT\\"' in s
+    # ...and every lane reaches the grandmean through that ONE transform, applied
+    # per run in stage08b (not by re-warping each lane's session mean).
+    assert '-prefix \\"stage08.gmrun.ses-02.task-t.run-1.nii$FMT\\"' in s
+    assert '-prefix \\"stage08.gmrun.ses-02.task-t.run-1.src-sbref.nii$FMT\\"' in s
     assert '-prefix "stage08.grandmean.src-sbref.nii$FMT"' in s
     assert '-prefix "stage08.grandmean.nii$FMT"' in s
 
@@ -1047,3 +1117,181 @@ def test_nonlin_in_source_passes_the_matrix_and_the_unaligned_source():
         # (manifest lines are printf'd, so the inner quotes arrive backslash-escaped)
         src = re.search(r'-source "([^"]+)"', ln.replace('\\"', '"')).group(1)
         assert "_nl" not in src and "sesmean" in src, src
+
+
+# ---------------------------------------------------------------------------
+# every run reaches the common grid; the coverage lanes; the grandmean checkpoint
+# ---------------------------------------------------------------------------
+
+
+def _fmap(session, fid, intended, pe="j-", readout=0.05):
+    return FmapGroup(
+        session,
+        fid,
+        Path(f"/{session}_{fid}_rev.nii.gz"),
+        {"TotalReadoutTime": readout, "PhaseEncodingDirection": pe},
+        list(intended),
+    )
+
+
+def test_unclaimed_run_inherits_the_session_reference_fieldmap():
+    """A run no IntendedFor claims used to anchor on the session's FIRST RUN, which
+    left its runmean on a different grid from its siblings' (and never undistorted)
+    — so the session mean was averaging incompatible images. It inherits the
+    reference group instead, and comes out with the same chain as its siblings."""
+    subj = Subject(
+        "X",
+        [
+            Session(
+                "01",
+                [_run("01", "t", "1"), _run("01", "t", "2")],
+                [_fmap("01", "PA", [("t", "1")])],
+            )
+        ],
+    )
+    plan = build_plan(subj, Options(go_to_anat=False))
+    claimed, orphan = plan.runs
+    assert orphan.fmap is not None and orphan.fmap_inherited
+    assert orphan.warp_chain == claimed.warp_chain
+    s = write_script(plan, "wd", bids_root="/bids")
+    # Both runs land on the ONE grid the session averages in.
+    grids = set(re.findall(r'REFGRID\[[^\]]+\]="([^"]*)"', s))
+    assert grids == {"stage04.blip.ses-01.fmap-PA_mean.nii$FMT"}
+    assert "inherited fmap" in s  # and the guess is stated in the header
+
+
+def test_unclaimed_run_with_the_wrong_pe_still_lands_on_the_common_grid():
+    """Applying an AP field to a PA run doubles the distortion, so a PE-incompatible
+    run gets NO fieldmap — but it must still reach the session's common grid, or it
+    drops out of the session mean. It aligns straight to the undistorted reference."""
+    runs = [_run("01", "t", "1"), _run("01", "t", "2", pe="j")]
+    subj = Subject("X", [Session("01", runs, [_fmap("01", "PA", [("t", "1")], pe="j-")])])
+    plan = build_plan(subj, Options(go_to_anat=False))
+    flipped = plan.runs[1]
+    assert flipped.fmap is None  # no field applied...
+    assert "blip_half" not in flipped.warp_chain
+    assert flipped.ref_fmap_id == "PA"  # ...but still on the session's grid
+    s = write_script(plan, "wd", bids_root="/bids")
+    assert 'XRUNBASE[01:t:2]="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
+    assert 'REFGRID[01:t:2]="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
+
+
+def test_unknown_ref_ses_is_an_error_not_a_silent_first_session():
+    """The reference session changes every warp chain in the script; a typo that
+    quietly anchored on session one would produce a plausible, wrong pipeline."""
+    subj = Subject(
+        "X", [Session("01", [_run("01", "t", "1")]), Session("02", [_run("02", "t", "1")])]
+    )
+    with pytest.raises(ValueError, match="no such session"):
+        build_plan(subj, Options(ref_ses="99"))
+    assert build_plan(subj, Options(ref_ses="ses-02")).ref_session == "02"
+
+
+def test_fmap_anat_sources_need_the_fieldmap_in_the_REFERENCE_session():
+    """ref_fmap/mean_fmap name an image in the anchor group's space. When the
+    reference session has no fieldmap, the anchor falls back to another session,
+    whose blip mean is NOT in grandmean space — the anat matrix would be estimated
+    in the wrong frame. Degrade to the grandmean instead."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "t", "1")], anat=Path("/anat/T1w.nii.gz")),
+            Session("02", [_run("02", "t", "1")], [_fmap("02", "PA", [("t", "1")])]),
+        ],
+    )
+    plan = build_plan(subj, Options(go_to_anat=True, ref_ses="01", anat_source="ref_fmap"))
+    assert effective_anat_source(plan) == "grandmean"
+    # ...and it IS available when the reference session owns the fieldmap.
+    subj.sessions[0].fmaps = [_fmap("01", "PA", [("t", "1")])]
+    plan = build_plan(subj, Options(go_to_anat=True, ref_ses="01", anat_source="ref_fmap"))
+    assert effective_anat_source(plan) == "ref_fmap"
+
+
+def test_ref_image_picks_the_cross_session_representative_per_session():
+    """-ref_image is one vocabulary at two levels: it chooses what represents each
+    session to the cross-session alignment, and (by default) what the anat aligns."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "t", "1")], [_fmap("01", "PA", [("t", "1")])]),
+            Session("02", [_run("02", "t", "1")], [_fmap("02", "PB", [("t", "1")])]),
+        ],
+    )
+    s = write_script(
+        build_plan(subj, Options(go_to_anat=False, ref_ses="01", ref_image="ref_fmap")),
+        "wd",
+        bids_root="/bids",
+    )
+    # base and source are each session's own reference fieldmap, undistorted.
+    assert 'REFGM="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
+    assert '-source \\"stage04.blip.ses-02.fmap-PB_mean.nii$FMT\\"' in s
+    # A session with no fieldmap degrades to its own mean, on its own.
+    subj.sessions[1].fmaps = []
+    s2 = write_script(
+        build_plan(subj, Options(go_to_anat=False, ref_ses="01", ref_image="ref_fmap")),
+        "wd",
+        bids_root="/bids",
+    )
+    assert 'REFGM="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s2
+    assert '-source \\"stage07.sesmean.ses-02.src-max.nii$FMT\\"' in s2
+
+
+def test_coverage_lanes_are_built_from_moco_and_composite_by_their_own_rule():
+    """max-of-maxes keeps the edges motion cost a single run; min-of-mins marks
+    where every frame of every run has data. Averaging either would be wrong."""
+    subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    # one moco pass writes all three reductions
+    for which in ("mean", "max", "min"):
+        assert f'-save_{which} \\"${{mstem}}_{which}.nii$FMT\\"' in s
+    # ...and each lane composites with its own reduction, not -mean for all.
+    for lane, flag in (("src-max", "-max"), ("src-min", "-min")):
+        block = [b for b in s.split("ffs_util_3dmath") if f"sesmean.ses-01.{lane}" in b]
+        assert block and flag in block[0], lane
+    # The min lane resamples linearly (its information is the zero boundary, which
+    # wsinc5 rings across); every other lane keeps the sharp default.
+    blocks = {
+        lane: [
+            b for b in s.split("ffs_nwarp") if f'-prefix "stage07.runmean.${{FRAG[$k]}}{lane}' in b
+        ]
+        for lane in (".src-min", ".src-max")
+    }
+    assert "-interp linear" in blocks[".src-min"][0]
+    assert "-interp wsinc5" in blocks[".src-max"][0]
+
+
+def test_grandmean_is_rebuilt_from_moco_space_in_one_interpolation():
+    """A mean of session means is three interpolations deep for every non-reference
+    session (moco → runmean → xses), and the grandmean is what the anat step and
+    every -grand_reference align to. Compose the pre-chain with xses and resample
+    each run ONCE instead."""
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "t", "1")]),
+            Session("02", [_run("02", "t", "1")]),
+        ],
+    )
+    s = write_script(
+        build_plan(subj, Options(go_to_anat=False, ref_ses="01")), "wd", bids_root="/bids"
+    )
+    gm = [ln for ln in s.splitlines() if "stage08.gmrun.ses-02" in ln and "-source" in ln]
+    assert gm, "no single-resample job for the non-reference session's run"
+    line = gm[0].replace('\\"', '"')
+    # straight from the post-moco image, through xses ∘ pre-chain, in one call
+    assert '-source "stage02.moco.ses-02.task-t.run-1_max.nii$FMT"' in line
+    assert "stage08.xses.ses-02.aff12.1D" in line
+    # the reference session needs no extra pass — its runmean already IS the image
+    assert "stage08.gmrun.ses-01" not in s
+    # and the grandmean is composited from runs, not from session means
+    gmean = [b for b in s.split("ffs_util_3dmath") if 'prefix "stage08.grandmean.nii' in b][0]
+    assert "gmrun.ses-02" in gmean and "sesmean" not in gmean
+
+
+def test_single_session_needs_no_grandmean_checkpoint():
+    """One session: every run's runmean is already in grandmean space, so the
+    checkpoint stage is not emitted at all."""
+    subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    assert "stage08b" not in s and "gmrun" not in s
+    assert '-prefix "stage08.grandmean.nii$FMT"' in s

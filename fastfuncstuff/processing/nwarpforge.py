@@ -31,7 +31,7 @@ from .interp import (
     warp_image,
 )
 from .io import (
-    derive_mean_output_path,
+    derive_prefixed_output_path,
     load_image,
     load_warp_field,
     save_first_last,
@@ -1637,6 +1637,8 @@ def nwarpforge(
     time_range: tuple[int, int] | None = None,
     debug: bool = False,
     save_mean: bool = False,
+    save_max: bool = False,
+    save_min: bool = False,
     save_first_last_flag: bool = False,
     dxyz: float | None = None,
     no_neg: bool = False,
@@ -2492,15 +2494,26 @@ def nwarpforge(
     if verb >= 1:
         print(f"Saved: {prefix}")
 
-    if save_mean:
-        if output.ndim == 4:
-            mean_path = derive_mean_output_path(prefix)
-            mean_image = output.mean(dim=0)
-            save_image(mean_image, mean_path, header_info=output_header)
+    # Temporal reductions of the warped series. max/min are coverage images: a
+    # voxel that left the FoV (motion, or the warp itself) is 0 in the volumes
+    # that lost it, so max = everything ever imaged, min = 0 wherever any volume
+    # lost it. Taken here, after the single final resample, they describe the
+    # OUTPUT grid exactly — no zero-boundary smearing from warping a min/max map.
+    for want, which, reduce in (
+        (save_mean, "mean", lambda t: t.mean(dim=0)),
+        (save_max, "max", lambda t: t.amax(dim=0)),
+        (save_min, "min", lambda t: t.amin(dim=0)),
+    ):
+        if not want:
+            continue
+        if output.ndim != 4:
             if verb >= 1:
-                print(f"Saved mean: {mean_path}")
-        elif verb >= 1:
-            print("-save_mean requested, but output is not 4D; skipping mean output")
+                print(f"-save_{which} requested, but output is not 4D; skipping")
+            continue
+        out_path = derive_prefixed_output_path(prefix, which)
+        save_image(reduce(output), out_path, header_info=output_header)
+        if verb >= 1:
+            print(f"Saved {which}: {out_path}")
 
     if save_first_last_flag:
         save_first_last(output, prefix, header_info=output_header, verb=verb)

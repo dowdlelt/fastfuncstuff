@@ -345,3 +345,52 @@ def test_cli_matrix_estimates_on_the_source_grid(tmp_path):
     # Outputs are on the SOURCE grid, not the base's -- the whole point of -matrix.
     assert nib.load(str(out)).shape == (snx, sny, snz)
     assert nib.load(str(tmp_path / "out_WARP.nii.gz")).shape == (snx, sny, snz, 3)
+
+
+def test_cli_warp_prefix_names_the_warp_independently(tmp_path):
+    """-warp_prefix renames only the warp family, not the warped image.
+
+    The autoproc naming split needs this: the warped image is tagged with the one
+    lane that produced it (``...src-max_nl``) while the warp it saves is shared by
+    every lane and stays lane-free (``..._nl_WARP``)."""
+    import numpy as np
+
+    nib = pytest.importorskip("nibabel")
+    from fastfuncstuff.cli.formwarp import main as fmain
+
+    nz, ny, nx = 14, 16, 12
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    bpath, spath = tmp_path / "base.nii.gz", tmp_path / "src.nii.gz"
+    nib.save(nib.Nifti1Image(_blobs(nz, ny, nx).permute(2, 1, 0).numpy(), affine), bpath)
+    nib.save(
+        nib.Nifti1Image(_blobs(nz, ny, nx, shift=(0.0, 1.0, 0.0)).permute(2, 1, 0).numpy(), affine),
+        spath,
+    )
+
+    rc = fmain(
+        [
+            "-base",
+            str(bpath),
+            "-source",
+            str(spath),
+            "-prefix",
+            str(tmp_path / "x.src-max_nl.nii.gz"),
+            "-warp_prefix",
+            str(tmp_path / "x_nl"),
+            "-save_warp",
+            "-shrink",
+            "2x1",
+            "-smooth",
+            "1x0",
+            "-iters",
+            "4x3",
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert (tmp_path / "x.src-max_nl.nii.gz").exists()
+    assert (tmp_path / "x_nl_WARP.nii.gz").exists()
+    assert not (tmp_path / "x.src-max_nl_WARP.nii.gz").exists()

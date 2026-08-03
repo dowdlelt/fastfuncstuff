@@ -12,6 +12,7 @@ written (the point is: no broken scripts).
 from __future__ import annotations
 
 import argparse
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -88,16 +89,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
     )
     g.add_argument(
+        "-ref_image",
+        "-ref-image",
+        choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap"],
+        default=None,
+        help="Which image REPRESENTS a level of data to the level above it — one "
+        "choice for two places: each session's source for the cross-session "
+        "alignment, and (unless -anat_source says otherwise) the image the anat "
+        "step aligns. grandmean = the level's own mean of the data (a session mean "
+        "at the session level); sbmean = the same, built from SBRefs; ref_fmap = "
+        "that level's reference fieldmap, undistorted (sharpest, and it DEFINES the "
+        "space); mean_fmap = ref_fmap averaged with the level's other aligned "
+        "fieldmap means. A choice the data cannot supply degrades per level "
+        "(no fieldmaps in a session → its own mean). Default: the data mean.",
+    )
+    g.add_argument(
         "-anat_source",
         "-anat-source",
         choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap"],
-        default="grandmean",
-        help="EPI image the anat alignment uses (all share the reference-fmap grid): "
-        "grandmean (best SNR, only option w/o fieldmaps or SBRefs) | sbmean (the "
-        "same average built from every run's SBRef: single-band contrast, one "
-        "interpolation instead of two) | ref_fmap (reference fieldmap's undistorted "
-        "mean; sharpest, defines the space) | mean_fmap (ref_fmap averaged with the "
-        "other groups' aligned means)",
+        default=None,
+        help="Override -ref_image for the anat step alone (same vocabulary). All "
+        "four choices share the reference-fmap grid: grandmean (best SNR, only "
+        "option w/o fieldmaps or SBRefs) | sbmean (the same average built from "
+        "every run's SBRef: single-band contrast, one interpolation instead of "
+        "two) | ref_fmap (reference fieldmap's undistorted mean; sharpest, defines "
+        "the space) | mean_fmap (ref_fmap averaged with the other groups' aligned "
+        "means). Default: whatever -ref_image is (grandmean).",
     )
     g.add_argument(
         "-anat_nonlin_input",
@@ -777,7 +794,8 @@ def _glue_opt_values(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(_glue_opt_values(sys.argv[1:] if argv is None else argv))
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(_glue_opt_values(raw_argv))
     _absolutize_inputs(args)
     recipe = config.RECIPES.get(args.recipe, {}) if args.recipe else {}
 
@@ -849,10 +867,13 @@ def main(argv: list[str] | None = None) -> int:
         xses_nonlin_in_source=eff(args.xses_nonlin_in_source, "xses_nonlin_in_source"),
         ref_ses=args.ref_ses,
         fmap_ref=args.fmap_ref,
+        ref_image=args.ref_image,
         go_to_anat=go_to_anat,
         final_dxyz=args.final_dxyz,
         anat_nonlin=anat_nonlin,
-        anat_source=args.anat_source,
+        # -ref_image is the answer for every level; -anat_source overrides it for
+        # the anat step alone.
+        anat_source=args.anat_source or args.ref_image or "grandmean",
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,
         moco_ref=args.moco_ref,
@@ -896,7 +917,13 @@ def main(argv: list[str] | None = None) -> int:
     # script and running it elsewhere still writes outputs to the intended dir.
     work_dir = str(Path(args.work_dir or f"ffs_proc_sub-{subject.subject}.results").resolve())
     out_path = Path(args.out or f"proc_sub-{subject.subject}.sh")
-    script = write_script(plan, work_dir, bids_root=args.bids_dir, script_stem=out_path.stem)
+    script = write_script(
+        plan,
+        work_dir,
+        bids_root=args.bids_dir,
+        script_stem=out_path.stem,
+        invocation=shlex.join(["ffs_autoproc", *raw_argv]),
+    )
 
     out_path.write_text(script)
     out_path.chmod(0o755)
