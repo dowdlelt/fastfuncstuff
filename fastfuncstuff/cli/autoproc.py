@@ -346,6 +346,18 @@ def build_parser() -> argparse.ArgumentParser:
         "does not force the others to be spelled out.",
     )
 
+    g = p.add_argument_group("QC")
+    g.add_argument(
+        "-no_qc",
+        "-no-qc",
+        action="store_true",
+        help="Don't emit the stageNN.QC.* stacks. By default every alignment stage "
+        "concatenates the set of images it claims to have brought into one space "
+        "into a single 4-D file (labelled per sub-brick), so a misregistration is "
+        "seen by scrolling the time axis instead of loading N files by hand. "
+        "stage10.QC.final is every run's mean in output space — the main one.",
+    )
+
     g = p.add_argument_group("batching")
     g.add_argument(
         "-batch_overwrite",
@@ -890,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     opt.nordic_save_resid = args.nordic_save_resid  # emitter reads via getattr
     opt.batch_overwrite = args.batch_overwrite
+    opt.qc = not args.no_qc
     # Output formats: keep the Options (config) default unless the user set one.
     if args.fmt is not None:
         opt.fmt = args.fmt
