@@ -88,8 +88,15 @@ def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     # ``replicate`` (not ``reflect``) so a blur radius larger than the plane still
     # pads: automask crops edge slices to tiny in-brain bounding boxes (e.g. 10x7),
     # and reflect requires pad < dim. Matches _gaussian_blur3d.
-    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
-    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    #
+    # One 4-sided pad, not one per axis. Replicate padding along W copies whole
+    # columns and the vertical pass is per-column, so the columns the horizontal
+    # pass sees are the same either way -- verified bit-identical (maxdiff 0.0).
+    # It blurs 2r extra columns in the vertical pass, but that costs less than
+    # the second pad's kernel launch: 57.5 -> 50.6 us on CUDA at (60, 64, 64).
+    x = F.pad(x, (r, r, r, r), mode="replicate")
+    x = F.conv2d(x, k.view(1, 1, -1, 1))
+    x = F.conv2d(x, k.view(1, 1, 1, -1))
     return x.squeeze(1)
 
 

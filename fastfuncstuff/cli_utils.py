@@ -2746,7 +2746,7 @@ def preflight_check(
     denoise_prefix : str, optional
         Prefix for 3dDenoisefast outputs. Checks `{prefix}_noise_pcs.xmat.1D` exists.
     """
-    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.io.afni import nifti_shape
 
     errors: list[str] = []
     n_runs = len(input_files)
@@ -2822,7 +2822,10 @@ def preflight_check(
         header_ok = True
         for nii_file in input_files:
             try:
-                shape = load_nifti(nii_file).shape
+                # nifti_shape, not load_nifti(...).shape -- the comment above
+                # already claimed "header-only", but load_nifti decompressed the
+                # entire payload of every run just to reach dim 4.
+                shape = nifti_shape(nii_file)
                 total_timepoints += shape[3] if len(shape) >= 4 else 1
             except Exception as exc:
                 errors.append(f"  Cannot read NIfTI header '{nii_file}': {exc}")
