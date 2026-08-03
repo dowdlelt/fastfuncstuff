@@ -639,8 +639,16 @@ def main() -> None:
             )
 
     # ── Mask ───────────────────────────────────────────────────────────────
-    with spinner(f"Loading {Path(args.mask).name}"):
-        mask = _load_mask(args.mask, data4d.shape[:3])
+    # -mask is optional (_load_mask returns all-True for None), but the spinner
+    # label used to evaluate Path(args.mask) unconditionally and died on None
+    # before _load_mask was ever reached.
+    if args.mask:
+        with spinner(f"Loading {Path(args.mask).name}"):
+            mask = _load_mask(args.mask, data4d.shape[:3])
+    else:
+        mask = _load_mask(None, data4d.shape[:3])
+        if args.verb >= 1:
+            print("[ffs_perm] no -mask given: testing every voxel", file=sys.stderr)
     v_in_mask = int(mask.sum())
     if v_in_mask == 0:
         raise SystemExit("Mask is empty.")
