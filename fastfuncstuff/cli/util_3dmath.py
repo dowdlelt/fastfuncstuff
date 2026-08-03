@@ -13,8 +13,13 @@ Two modes:
       ffs_util_3dmath -input a.nii b.nii -expr 'a-b'         -prefix diff.nii.gz
       ffs_util_3dmath -input epi.nii     -expr 'step(a-100)' -prefix mask.nii.gz
 
-All inputs must share a shape. The output header (affine, TR, units) is copied
-from the first input. Small, deliberately: extend with more ops as needed.
+  Concatenation along time (like 3dTcat):
+      ffs_util_3dmath -input a.nii b.nii c.nii -tcat -labels ses-01 ses-02 ses-03 \
+          -prefix stack.nii.gz
+
+All inputs must share a shape (spatial shape only, for -tcat). The output header
+(affine, TR, units) is copied from the first input. Small, deliberately: extend
+with more ops as needed.
 """
 
 from __future__ import annotations
@@ -84,10 +89,57 @@ def _build_parser() -> argparse.ArgumentParser:
     grp.add_argument(
         "-expr", metavar="EXPR", help="3dcalc-style expression over a, b, c, ... (input order)."
     )
+    grp.add_argument(
+        "-tcat",
+        dest="op",
+        action="store_const",
+        const="tcat",
+        help="Concatenate the inputs along TIME into one 4-D stack (≈ 3dTcat). "
+        "Only the spatial shape has to match; a 4-D input contributes all of its "
+        "volumes. Pair with -labels so a viewer names the sub-bricks.",
+    )
+    p.add_argument(
+        "-labels",
+        nargs="+",
+        metavar="LAB",
+        help="Sub-brick labels for the output (AFNI BRICK_LABS). Give one per "
+        "output volume, or one per -input (a 4-D input's volumes are then "
+        "suffixed #0, #1, ...).",
+    )
     p.add_argument("-mask", metavar="FILE", help="Only compute inside mask>0; zero elsewhere.")
     p.add_argument("-device", default="cpu", help="torch device (cpu/cuda).")
     p.add_argument("-overwrite", action="store_true")
     return p
+
+
+def _resolve_labels(
+    labels: list[str] | None, per_input: list[int], out: torch.Tensor
+) -> list[str] | None:
+    """Expand ``-labels`` to one label per OUTPUT sub-brick, or None.
+
+    One label per input is the form a caller naturally writes ("these files, in
+    this order"), so a 4-D input's volumes are suffixed ``#j`` rather than making
+    the caller count volumes it does not control. A count that matches neither is
+    a caller bug worth saying out loud, but not worth failing a whole job over —
+    the data is still correct, it just loses its names.
+    """
+    if not labels:
+        return None
+    nvol = out.shape[0] if out.ndim == 4 else 1
+    if len(labels) == nvol:
+        return list(labels)
+    if len(labels) == len(per_input):
+        expanded: list[str] = []
+        for lab, n in zip(labels, per_input, strict=True):
+            expanded.extend([lab] if n == 1 else [f"{lab}#{j}" for j in range(n)])
+        if len(expanded) == nvol:
+            return expanded
+    print(
+        f"WARNING: -labels has {len(labels)} entries but the output has {nvol} "
+        f"sub-brick(s) ({len(per_input)} inputs); labels not written.",
+        file=sys.stderr,
+    )
+    return None
 
 
 def main() -> int:
@@ -100,12 +152,15 @@ def main() -> int:
         return 1
 
     dev = torch.device(args.device)
+    # -tcat stacks along time, so only the spatial lattice has to agree; every
+    # other op is voxelwise and needs the full shape to match.
+    key = (lambda s: s[-3:]) if args.op == "tcat" else (lambda s: s)
     vols, hdr0 = [], None
     for f in args.input:
         d, h = load_image(f)
         if hdr0 is None:
-            hdr0, shape0 = h, tuple(d.shape)
-        elif tuple(d.shape) != shape0:
+            hdr0, shape0 = h, key(tuple(d.shape))
+        elif key(tuple(d.shape)) != shape0:
             print(
                 f"ERROR: shape mismatch: {f} is {tuple(d.shape)}, expected {shape0}.",
                 file=sys.stderr,
@@ -113,7 +168,9 @@ def main() -> int:
             return 1
         vols.append(d.to(dev).float())
 
-    if args.op is not None:
+    if args.op == "tcat":
+        out = torch.cat([v if v.ndim == 4 else v[None] for v in vols], dim=0)
+    elif args.op is not None:
         stack = torch.stack(vols, dim=0)
         out = _REDUCTIONS[args.op](stack)
     else:
@@ -133,13 +190,15 @@ def main() -> int:
         if out.shape != vols[0].shape:
             out = out.expand(vols[0].shape).clone()
 
+    labels = _resolve_labels(args.labels, [v.shape[0] if v.ndim == 4 else 1 for v in vols], out)
+
     if args.mask:
         with spinner(f"Loading {Path(args.mask).name}"):
             m, _ = load_image(args.mask)
         out = out * (m.to(dev).float() > 0)
 
     with spinner(f"Writing {Path(args.prefix).name}"):
-        save_image(out.cpu(), args.prefix, header_info=hdr0)
+        save_image(out.cpu(), args.prefix, header_info=hdr0, brick_labels=labels)
     print(f"ffs_util_3dmath: wrote {args.prefix}  ({tuple(out.shape)})")
     return 0
 
