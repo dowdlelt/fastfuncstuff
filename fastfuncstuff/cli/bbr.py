@@ -62,6 +62,7 @@ from fastfuncstuff.processing.tissue import (
     tissue_projector,
     tissue_synthesis_cost,
 )
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def _normalize_targets(tokens: list[str]) -> set[str]:
@@ -327,6 +328,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     if verb:
         print(f"ffs_bbr: device={device}")
 

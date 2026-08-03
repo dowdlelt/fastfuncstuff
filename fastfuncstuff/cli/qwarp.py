@@ -44,6 +44,7 @@ from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
 from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1290,6 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
         device = torch.device("cpu")
         if args.verb >= 1:
             print("WARNING: No GPU available, running on CPU (will be slow)")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     if args.verb >= 1:
         print(f"qwarp_torch: device={device}")

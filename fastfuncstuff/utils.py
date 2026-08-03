@@ -273,19 +273,46 @@ def resolve_cpu_threads(requested: int | None = None) -> tuple[int, str]:
     return max(1, n_logical), "all CPUs"
 
 
-def configure_torch_backends(device: torch.device, n_threads: int | None = None) -> None:
+REGISTRATION_TF32 = False
+"""TF32 policy for the registration / resampling CLIs.
+
+These tools are gather- and grid_sample-bound rather than GEMM-bound, so TF32
+is expected to buy them little, while their cost functions (lpc/lpa and
+friends) key on small float32 differences that a 10-bit mantissa could blur.
+They are wired to this flag rather than a hardcoded ``False`` so the question
+can be settled with numbers instead of argument: run ``ffs_benchmark`` on main,
+flip this single constant to ``True`` on a branch, and re-run. If the
+registration stages hold their thresholds and the timings improve, delete this
+constant and let those CLIs take the default ``tf32=True``.
+
+Does not affect the GLM-side CLIs, which already call
+:func:`configure_torch_backends` with the default and want TF32.
+"""
+
+
+def configure_torch_backends(
+    device: torch.device, n_threads: int | None = None, *, tf32: bool = True
+) -> None:
     """Configure PyTorch backends for optimal performance.
 
     Call once at the start of a CLI entry-point after selecting the device.
 
     Sets:
-      - float32 matmul precision to 'high' (use TF32 on Ampere+)
+      - float32 matmul precision to 'high' (use TF32 on Ampere+), when ``tf32``
       - cudnn.benchmark = True (autotuner for convolutions)
       - CPU thread count from :func:`resolve_cpu_threads` (for CPU and MPS
         fallback paths), which honours ``FFS_NUM_THREADS`` / ``OMP_NUM_THREADS``
         / the scheduler's allocation rather than seizing every core.
+
+    Pass ``tf32=False`` from the registration tools. They are gather- and
+    grid_sample-bound rather than GEMM-bound, so TF32 buys them almost nothing,
+    while their cost functions (lpc/lpa and friends) key on small float32
+    differences that a 10-bit mantissa would blur. ``warp.py`` still opts into
+    ``allow_tf32`` deliberately and narrowly where it does pay. The thread count
+    is the part every CLI needs either way.
     """
-    torch.set_float32_matmul_precision("high")
+    if tf32:
+        torch.set_float32_matmul_precision("high")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
     # CPU is the linalg fallback under MPS and the primary device for

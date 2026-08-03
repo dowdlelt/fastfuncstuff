@@ -18,6 +18,7 @@ from fastfuncstuff.processing.complex import (
     scale_phase_to_radians,
 )
 from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -168,6 +169,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     # This is a memory-bandwidth-bound elementwise pass; a GPU only adds PCIe
     # transfers for a trivial cos/sin, so it runs on the host regardless of -device.

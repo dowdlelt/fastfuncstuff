@@ -28,6 +28,7 @@ import torch
 from fastfuncstuff.cli_utils import add_verbose_arg, spinner
 from fastfuncstuff.processing.io import load_image
 from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -121,6 +122,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     verb = args.verb
     t0 = time.time()
 

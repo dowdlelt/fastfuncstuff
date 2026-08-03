@@ -36,6 +36,7 @@ from fastfuncstuff.processing.grid import (
     validate_orient,
 )
 from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -147,6 +148,7 @@ def _resolve_dxyz(args: argparse.Namespace, src_vox: np.ndarray) -> tuple[np.nda
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     verb = args.debug if args.debug is not None else args.verb
 
     if args.bound_type.upper() not in BOUND_TYPES:
