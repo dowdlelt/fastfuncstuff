@@ -147,12 +147,18 @@ def auto_box_radius(n_voxels_target: int = 500) -> int:
     return max(r, 1)
 
 
-def _separable_smooth_3d(vol: Tensor, sigma: float, kernel_type: str = "gauss") -> Tensor:
+def _separable_smooth_3d(
+    vol: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str = "gauss",
+) -> Tensor:
     """Apply 3D smoothing using separable convolution.
 
     Args:
         vol: (1, 1, D, H, W) or (D, H, W) volume.
-        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels.
+        sigma: Kernel parameter — Gaussian sigma or box radius, in voxels. A
+            3-tuple gives a per-axis ``(z, y, x)`` extent, which is how a
+            physical (mm) smoothing width is expressed on an anisotropic grid.
         kernel_type: ``"gauss"`` or ``"box"``.
 
     Returns:
@@ -162,21 +168,26 @@ def _separable_smooth_3d(vol: Tensor, sigma: float, kernel_type: str = "gauss") 
     if squeeze:
         vol = vol[None, None]
 
-    kernel = _make_kernel_1d(kernel_type, sigma, vol.device)
-    radius = kernel.shape[0] // 2
+    sz, sy, sx = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
 
     # Z
     if vol.shape[2] > 1:
+        kernel = _make_kernel_1d(kernel_type, sz, vol.device)
+        radius = kernel.shape[0] // 2
         k = kernel[None, None, :, None, None]
         vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
         vol = F.conv3d(vol, k)
     # Y
     if vol.shape[3] > 1:
+        kernel = _make_kernel_1d(kernel_type, sy, vol.device)
+        radius = kernel.shape[0] // 2
         k = kernel[None, None, None, :, None]
         vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k)
     # X
     if vol.shape[4] > 1:
+        kernel = _make_kernel_1d(kernel_type, sx, vol.device)
+        radius = kernel.shape[0] // 2
         k = kernel[None, None, None, None, :]
         vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
         vol = F.conv3d(vol, k)
