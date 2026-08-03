@@ -12,6 +12,7 @@ written (the point is: no broken scripts).
 from __future__ import annotations
 
 import argparse
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -793,7 +794,8 @@ def _glue_opt_values(argv: list[str]) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(_glue_opt_values(sys.argv[1:] if argv is None else argv))
+    raw_argv = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(_glue_opt_values(raw_argv))
     _absolutize_inputs(args)
     recipe = config.RECIPES.get(args.recipe, {}) if args.recipe else {}
 
@@ -915,7 +917,13 @@ def main(argv: list[str] | None = None) -> int:
     # script and running it elsewhere still writes outputs to the intended dir.
     work_dir = str(Path(args.work_dir or f"ffs_proc_sub-{subject.subject}.results").resolve())
     out_path = Path(args.out or f"proc_sub-{subject.subject}.sh")
-    script = write_script(plan, work_dir, bids_root=args.bids_dir, script_stem=out_path.stem)
+    script = write_script(
+        plan,
+        work_dir,
+        bids_root=args.bids_dir,
+        script_stem=out_path.stem,
+        invocation=shlex.join(["ffs_autoproc", *raw_argv]),
+    )
 
     out_path.write_text(script)
     out_path.chmod(0o755)
