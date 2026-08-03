@@ -474,7 +474,12 @@ def load_and_preprocess_runs(
     - Device strategy is automatically determined based on data size vs GPU memory
     """
     try:
-        from fastfuncstuff.io.afni import load_afni_mask, load_and_concatenate_runs, load_nifti
+        from fastfuncstuff.io.afni import (
+            _peek_run_length,
+            load_afni_mask,
+            load_and_concatenate_runs,
+            load_nifti,
+        )
         from fastfuncstuff.utils import gaussian_blur_3d, scale_to_percent_signal
     except ImportError as e:
         print(f"ERROR: Could not import required modules: {e}")
@@ -599,14 +604,18 @@ def load_and_preprocess_runs(
 
         return result
 
-    # Estimate total timepoints
+    # Estimate total timepoints. Header-only peek: this number only feeds the
+    # CPU-vs-GPU device decision below, and the runs are about to be decoded for
+    # real by load_and_concatenate_runs. Fully decoding each run here just to read
+    # its 4th dimension doubled startup on multi-run datasets, and for .nii.zst it
+    # meant a whole extra decompress-to-disk pass per run.
     total_timepoints = 0
     for f in input_files:
-        img = load_nifti(f)
-        if len(img.shape) > 3:
-            total_timepoints += img.shape[3]
-        else:
-            total_timepoints += img.shape[0]
+        n_tp = _peek_run_length(f)
+        if n_tp is None:
+            img = load_nifti(f)
+            n_tp = img.shape[3] if len(img.shape) > 3 else 1
+        total_timepoints += n_tp
 
     # Determine device strategy
     keep_on_cpu = estimate_device_strategy(

@@ -85,9 +85,10 @@ def make_adaptive_mask(
     # Base mask: longest prefix of echoes with no NaN/<=0 sample at any timepoint.
     bad = torch.isnan(data) | (data <= 0)
     good_vox_echoes = (~bad.any(dim=-1)).to(torch.int64)  # (V, E)
-    base = torch.zeros(n_samples, dtype=torch.int64, device=data.device)
-    for e in range(n_echos):
-        base = torch.where((base == e) & (good_vox_echoes[:, e] == 1), base + 1, base)
+    # cumprod over a 0/1 row is 1 up to the first bad echo and 0 after, so its
+    # sum is exactly that prefix length — same integers as the sequential
+    # where() chain, without one kernel per echo.
+    base = torch.cumprod(good_vox_echoes, dim=1).sum(dim=1)
     masks.append(base)
 
     if "dropout" in methods or "decay" in methods:

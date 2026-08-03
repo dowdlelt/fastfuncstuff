@@ -115,13 +115,14 @@ def write_single_trials_output(
     # Write NIfTI file with complete header preservation
     tr = getattr(results, "tr", None)
     img = _create_nifti_with_header(betas_vol, affine, results, tr)
-    output_path = Path(output_path)
-    # Ensure .nii.gz extension
-    if not str(output_path).endswith(".nii.gz"):
-        if str(output_path).endswith(".nii"):
-            output_path = Path(str(output_path) + ".gz")
-        else:
-            output_path = Path(str(output_path) + ".nii.gz")
+    # Honour whichever NIfTI extension the caller asked for, defaulting to
+    # .nii.gz when there is none. The old "ensure .nii.gz" branch only
+    # recognised .nii/.nii.gz, so a -prefix of out.nii.zst fell through to the
+    # else and was written as out.nii.zst.nii.gz.
+    from fastfuncstuff.cli_utils import parse_prefix
+
+    prefix_info = parse_prefix(str(output_path))
+    output_path = Path(prefix_info.stem + prefix_info.nifti_ext)
     save_nifti(
         np.asarray(img.dataobj),
         output_path=output_path,
@@ -132,14 +133,7 @@ def write_single_trials_output(
 
     # Write labels as JSON sidecar
     if labels_reordered:
-        # Strip image extensions (.nii.gz or .nii) to get basename, then add .json
-        path_str = str(output_path)
-        if path_str.endswith(".nii.gz"):
-            json_path = Path(path_str[:-7] + ".json")  # Remove .nii.gz
-        elif path_str.endswith(".nii"):
-            json_path = Path(path_str[:-4] + ".json")  # Remove .nii
-        else:
-            json_path = output_path.with_suffix(".json")  # Fallback
+        json_path = Path(prefix_info.stem + ".json")
         with json_path.open("w") as f:
             json.dump(
                 {

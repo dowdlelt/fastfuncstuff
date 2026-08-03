@@ -549,9 +549,34 @@ def _cod_kernel(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     return torch.clamp(r2, max=1.0)
 
 
+@torch.inference_mode()
+def _cod_from_ss_res_kernel(y_true: torch.Tensor, ss_res: torch.Tensor) -> torch.Tensor:
+    """CoD for callers that already hold the residual sum of squares.
+
+    Same arithmetic as :func:`_cod_kernel`, minus the terms it can't avoid
+    recomputing: a caller with residuals in hand would otherwise have to
+    reconstruct ``y_pred`` (a full (V, T) allocation) only for this kernel to
+    subtract it back off. See :func:`fastfuncstuff.glm.core.fit_glm_chunk`.
+    """
+    y_mean = y_true.mean(dim=1, keepdim=True)
+    ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
+    r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
+    return torch.clamp(r2, max=1.0)
+
+
 # Compile through the central policy: PCH disabled (no stale-cache crashes) plus a
 # permanent eager fallback if compilation ever fails for another reason. See _compile.py.
 _cod_kernel_compiled = safe_compile(_cod_kernel, dynamic=True, fullgraph=True)
+_cod_from_ss_res_compiled = safe_compile(_cod_from_ss_res_kernel, dynamic=True, fullgraph=True)
+
+
+def cod_from_ss_residual(y_true: torch.Tensor, ss_residual: torch.Tensor) -> torch.Tensor:
+    """Coefficient of determination from precomputed residual sum of squares.
+
+    Equivalent to ``compute_r2_metric(y_true, y_pred, metric="cod")`` when
+    ``ss_residual == ((y_true - y_pred) ** 2).sum(dim=1)``.
+    """
+    return _cod_from_ss_res_compiled(y_true, ss_residual).float()
 
 
 def compute_r2_metric(

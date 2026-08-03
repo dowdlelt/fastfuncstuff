@@ -318,7 +318,12 @@ def _exp_field(v: Field, max_norm: float = 0.5, max_squarings: int = 8) -> Field
     field is trivially a diffeomorphism), then square by self-composition. This is what
     makes the diffeomorphic-demons update foldless by construction.
     """
-    mag = torch.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2).max().item()
+    # max-then-sqrt, not sqrt-then-max: sqrt is monotone, so this is the same
+    # scalar without a full 3-D sqrt over the velocity field. Kept as a tensor
+    # op rather than math.sqrt so the sqrt still happens in the field's dtype —
+    # widening to float64 first would shift `mag` by ~1e-7 relative, which is
+    # enough to flip the squaring-count comparison below right at its boundary.
+    mag = (v[0] ** 2 + v[1] ** 2 + v[2] ** 2).max().sqrt().item()
     if mag < _EPS:
         return v
     n = 0

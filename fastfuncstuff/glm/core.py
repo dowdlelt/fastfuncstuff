@@ -21,7 +21,7 @@ from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.memory import bytes_per_voxel_glm, estimate_chunk_size, make_vram_debugger
 from fastfuncstuff.utils import get_device, linalg_device, to_tensor
 
-from .xval import compute_r2_metric
+from .xval import cod_from_ss_residual
 
 # MPS's only hard gap is float64 (the Metal backend has no float64 support at
 # all); the f64 linalg routines used below run on CPU on MPS via this helper.
@@ -263,8 +263,12 @@ def fit_glm_chunk(
     # Compute residual sum of squares for output
     ss_residual = (residuals_vals**2).sum(dim=1)
 
-    # Compute R² using unified function (allows negative values for poor fits)
-    r2 = compute_r2_metric(data, data - residuals_vals, metric="cod")
+    # Compute R² (allows negative values for poor fits). Fed from ss_residual
+    # rather than compute_r2_metric(data, data - residuals_vals): that form
+    # allocated a second (n_voxels, n_timepoints) tensor to rebuild the
+    # predictions, only for the kernel to subtract them off again and redo the
+    # SS_res reduction we already have.
+    r2 = cod_from_ss_residual(data, ss_residual)
 
     return (
         betas,

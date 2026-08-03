@@ -394,9 +394,10 @@ def local_pearson_value_batched(
         out = torch.zeros(nblok, dtype=vals.dtype, device=device)
         return out.index_add(0, bi, vals)
 
+    wb = w * b
     sw = _seg(w)
-    swx = _seg(w * b)
-    swxx = _seg(w * b * b)
+    swx = _seg(wb)
+    swxx = _seg(wb * b)
     cnt = _seg(torch.ones_like(w))
 
     wy = w[None, :] * yb  # (B, Nv)
@@ -494,12 +495,16 @@ def local_pearson_value_pairs(
     def _seg(vals: Tensor) -> Tensor:
         return torch.zeros(P, dtype=vals.dtype, device=device).index_add(0, inv, vals)
 
+    # Hoist w*x and w*y: left-to-right evaluation makes w*x*x == (w*x)*x, so
+    # reusing them is exact and drops three full-length multiplies per call.
+    wx = w * x
+    wy = w * y
     sw = _seg(w)
-    swx = _seg(w * x)
-    swxx = _seg(w * x * x)
-    swy = _seg(w * y)
-    swyy = _seg(w * y * y)
-    swxy = _seg(w * x * y)
+    swx = _seg(wx)
+    swxx = _seg(wx * x)
+    swy = _seg(wy)
+    swyy = _seg(wy * y)
+    swxy = _seg(wx * y)
     cnt = _seg(torch.ones_like(w))
 
     sw_safe = sw.clamp(min=1e-12)

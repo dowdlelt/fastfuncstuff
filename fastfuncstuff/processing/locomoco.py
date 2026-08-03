@@ -32,6 +32,7 @@ future NVIDIA-hardware / RAFT backend can slot in behind the same signature.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -130,6 +131,25 @@ def _spatial_gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return gx, gy
 
 
+@functools.lru_cache(maxsize=32)
+def _plane_meshgrid(
+    h: int, w: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached ``(ys, xs)`` index grids for an ``(h, w)`` plane.
+
+    The estimation loop warps the same handful of plane shapes (one per pyramid
+    level) tens of thousands of times, and the grid is a pure function of shape
+    plus device/dtype. Cached entries are read-only by construction — every
+    consumer builds a new tensor from them rather than writing in place.
+    """
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return ys, xs
+
+
 def _warp2d(
     img: torch.Tensor, u: torch.Tensor, v: torch.Tensor, mode: str = "bilinear"
 ) -> torch.Tensor:
@@ -146,11 +166,7 @@ def _warp2d(
     if mode == "lanczos":
         mode = "bilinear"
     _, h, w = img.shape
-    ys, xs = torch.meshgrid(
-        torch.arange(h, device=img.device, dtype=img.dtype),
-        torch.arange(w, device=img.device, dtype=img.dtype),
-        indexing="ij",
-    )
+    ys, xs = _plane_meshgrid(h, w, img.device, img.dtype)
     gxn = 2.0 * (xs.unsqueeze(0) + u) / max(w - 1, 1) - 1.0
     gyn = 2.0 * (ys.unsqueeze(0) + v) / max(h - 1, 1) - 1.0
     grid = torch.stack([gxn, gyn], dim=-1)
