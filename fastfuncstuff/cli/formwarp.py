@@ -92,6 +92,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Save the moving->fixed warp ({prefix}_WARP.nii.gz).",
     )
     p.add_argument(
+        "-warp_prefix",
+        "-warp-prefix",
+        default=None,
+        help="Name the warp outputs off this stem instead of -prefix. For when the "
+        "warped image and the warp want different names: the image belongs to the "
+        "one input that produced it, the warp is shared by everything it is applied "
+        "to. Does not change what is computed.",
+    )
+    p.add_argument(
         "-save_inverse",
         action="store_true",
         help="Save the fixed->moving inverse warp ({prefix}_WARPINV.nii.gz).",
@@ -260,14 +269,21 @@ def _select_device(args: argparse.Namespace) -> torch.device:
     return torch.device("cpu")
 
 
+def _warp_stem(args: argparse.Namespace, pfx) -> str:
+    """Stem the warp outputs hang off: ``-warp_prefix`` when given, else ``-prefix``."""
+    wp = getattr(args, "warp_prefix", None)
+    return parse_prefix(wp).stem if wp else pfx.stem
+
+
 def _expected_outputs(args: argparse.Namespace) -> list[str]:
     """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
 
-    The warp files are named off the parsed prefix, matching ``_dispatch_run``.
-    A timeseries run with ``-warp_format folder`` writes directories under these
-    stems rather than files, so such a job is simply never skipped — safe."""
+    The warp files are named off ``-warp_prefix`` (else the parsed prefix),
+    matching ``_dispatch_run``. A timeseries run with ``-warp_format folder``
+    writes directories under these stems rather than files, so such a job is
+    simply never skipped — safe."""
     pfx = parse_prefix(args.prefix)
-    prefix, ext = pfx.stem, pfx.nifti_ext
+    prefix, ext = _warp_stem(args, pfx), pfx.nifti_ext
     outs: list[str] = [pfx.as_file()]
     if args.save_warp:
         outs.append(f"{prefix}_WARP{ext}")
@@ -454,6 +470,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     pfx = parse_prefix(args.prefix)
     prefix, nii_ext = pfx.stem, pfx.nifti_ext
+    warp_stem = _warp_stem(args, pfx)
 
     if timeseries:
         return _run_timeseries(
@@ -466,6 +483,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             config,
             out_info,
             prefix,
+            warp_stem,
             nii_ext,
             device,
             t0,
@@ -503,15 +521,16 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         if args.verb >= 1:
             print(f"Saved {label}: {path}")
 
+    p = warp_stem
     if args.save_warp:
-        _save_warp(res.fwd, f"{prefix}_WARP{nii_ext}", "moving->fixed warp")
+        _save_warp(res.fwd, f"{p}_WARP{nii_ext}", "moving->fixed warp")
     if args.save_inverse:
-        _save_warp(res.inv, f"{prefix}_WARPINV{nii_ext}", "fixed->moving inverse warp")
+        _save_warp(res.inv, f"{p}_WARPINV{nii_ext}", "fixed->moving inverse warp")
     if args.save_halfway:
-        _save_warp(res.fixed_to_mid, f"{prefix}_HALF_mid2fixed{nii_ext}", "mid->fixed half-warp")
-        _save_warp(res.moving_to_mid, f"{prefix}_HALF_mid2moving{nii_ext}", "mid->moving half-warp")
-        _save_warp(res.mid_to_fixed, f"{prefix}_HALF_fixed2mid{nii_ext}", "fixed->mid half-warp")
-        _save_warp(res.mid_to_moving, f"{prefix}_HALF_moving2mid{nii_ext}", "moving->mid half-warp")
+        _save_warp(res.fixed_to_mid, f"{p}_HALF_mid2fixed{nii_ext}", "mid->fixed half-warp")
+        _save_warp(res.moving_to_mid, f"{p}_HALF_mid2moving{nii_ext}", "mid->moving half-warp")
+        _save_warp(res.mid_to_fixed, f"{p}_HALF_fixed2mid{nii_ext}", "fixed->mid half-warp")
+        _save_warp(res.mid_to_moving, f"{p}_HALF_moving2mid{nii_ext}", "moving->mid half-warp")
 
     if args.verb >= 1:
         print(f"Done in {time.time() - t0:.1f}s")
@@ -519,7 +538,19 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
 
 def _run_timeseries(
-    args, base, source, weight, mask, base_cover, config, out_info, prefix, nii_ext, device, t0
+    args,
+    base,
+    source,
+    weight,
+    mask,
+    base_cover,
+    config,
+    out_info,
+    prefix,
+    warp_stem,
+    nii_ext,
+    device,
+    t0,
 ) -> int:
     """Register every volume of a 4D source to the 3D base (per-volume SyN).
 
@@ -578,7 +609,7 @@ def _run_timeseries(
         xs = torch.stack([f[0] for f in frames])
         ys = torch.stack([f[1] for f in frames])
         zs = torch.stack([f[2] for f in frames])
-        dest = f"{prefix}_{tag}{nii_ext}" if as_5d else f"{prefix}_{tag}"
+        dest = f"{warp_stem}_{tag}{nii_ext}" if as_5d else f"{warp_stem}_{tag}"
         with spinner(f"Writing {Path(dest).name}"):
             out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=out_info, units="mm")
         if args.verb >= 1:
