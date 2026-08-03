@@ -44,6 +44,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 # A run whose relative std falls below this carries no usable signal. Compared
@@ -523,3 +524,163 @@ def dof_loss_map(
         loss[fam.voxel_indices] = float(dof_full - int(dof))
     loss[~final_mask.reshape(-1).bool()] = 0.0
     return loss
+
+
+def fit_and_merge_families(
+    results,
+    data: torch.Tensor,
+    design: torch.Tensor,
+    families: list[MissingFamily],
+    run_starts: list[int],
+    n_timepoints: int,
+    *,
+    fit_kwargs: dict,
+    tr: float,
+    method: str = "arma11",
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Refit each family against its own censored design, in place on ``results``.
+
+    ``results`` is the main fit over the whole masked voxel set. Family voxels
+    were fitted there too, with their dead rows still in, which is exactly the
+    wrong answer this module exists to prevent — so every family's rows are
+    overwritten here by a fit that drops those rows. Fitting them twice is a
+    small waste (family voxels are edge data by construction) in exchange for
+    leaving the main path completely untouched.
+
+    Why the design is re-derived per family rather than reused: censoring a whole
+    run zeroes that run's block-diagonal polynomial columns, and leaving them in
+    is not merely inelegant — ``torch.linalg.cholesky`` fails outright on the
+    singular normal equations ("the leading minor of order 8 is not
+    positive-definite"). They have to be dropped. Because the guard only admits
+    families where every *task* regressor survives, the dropped columns are
+    always nuisance, so the fitted output keeps the same column layout and can be
+    written into the same bucket.
+
+    ``method="ols"`` runs the same partition through :func:`fit_glm` instead.
+    It is strictly the simpler case: with no ARMA noise model there is no
+    ``(a, b)`` grid to re-search and no ``tau`` to carry across the censoring
+    gaps, so a family is just least squares on fewer rows.
+
+    Returns
+    -------
+    dof_loss : (n_masked_voxels,) float tensor
+        ``main_dof - family_dof`` per voxel, 0 outside families. This is the map
+        ``-adjust_dof`` needs to put every voxel's z-score at its true dof.
+    """
+    from fastfuncstuff.glm.arma import (
+        OLS_VOXEL_SCATTER_ATTRS,
+        TIME_AXIS_ATTRS,
+        VOXEL_SCATTER_ATTRS,
+        build_censor_run_info,
+        fit_glm_arma11,
+    )
+
+    is_ols = method == "ols"
+    scatter_attrs = OLS_VOXEL_SCATTER_ATTRS if is_ols else VOXEL_SCATTER_ATTRS
+    n_masked = int(data.shape[0])
+    dof_loss = torch.zeros(n_masked, dtype=torch.float32)
+    if not families:
+        return dof_loss
+
+    dof_full = int(results.dof)
+    if verbose:
+        print(f"\n🔁 Refitting {len(families)} missing-data family/families (censored)")
+
+    for fam_i, fam in enumerate(families):
+        rows = torch.as_tensor(fam.good_list, dtype=torch.long)
+        sub_design, keep_cols = censor_design(design, fam.good_list)
+        sub_run_starts, sub_tau = build_censor_run_info(
+            run_starts, n_timepoints, good_list=fam.good_list
+        )
+        sub_data = data[fam.voxel_indices][:, rows]
+
+        if verbose:
+            print(
+                f"  ─── family {fam_i + 1}/{len(families)} ({fam.label()}): "
+                f"{fam.n_voxels:,} voxels, {len(fam.good_list)} TRs, "
+                f"{int((~keep_cols).sum())} nuisance column(s) dropped ───"
+            )
+
+        sub_kwargs = dict(fit_kwargs)
+        # Contrasts are defined against the FULL design; drop the same columns so
+        # the GLT rows still line up with the censored design.
+        for key in ("glt_matrices",):
+            mats = sub_kwargs.get(key)
+            if mats:
+                keep_np = keep_cols.cpu().numpy()
+                sub_kwargs[key] = [np.asarray(m).reshape(-1)[keep_np] for m in mats]
+        # Column indices refer to positions in the full design; remap them onto
+        # the censored one. All task columns survive by construction (see
+        # build_families), so this is a pure re-indexing, never a loss.
+        if sub_kwargs.get("task_indices"):
+            remap = torch.cumsum(keep_cols.long(), 0) - 1
+            sub_kwargs["task_indices"] = [
+                int(remap[i]) for i in sub_kwargs["task_indices"] if bool(keep_cols[i])
+            ]
+
+        if is_ols:
+            from fastfuncstuff.glm.core import fit_glm
+
+            # OLS has no noise model, so the censoring gaps need no tau and the
+            # run boundaries only matter to whatever built the design.
+            fam_results = fit_glm(sub_data, sub_design, tr=tr, **sub_kwargs)
+        else:
+            fam_results = fit_glm_arma11(
+                sub_data,
+                sub_design,
+                tr=tr,
+                run_starts=sub_run_starts,
+                tau=sub_tau,
+                **sub_kwargs,
+            )
+
+        _scatter_family(results, fam_results, fam, rows, scatter_attrs, TIME_AXIS_ATTRS)
+        dof_loss[fam.voxel_indices] = float(dof_full - int(fam_results.dof))
+        if verbose:
+            print(
+                f"      dof {dof_full} → {fam_results.dof} (lost {dof_full - int(fam_results.dof)})"
+            )
+
+    return dof_loss
+
+
+def _scatter_family(results, fam_results, fam, rows, scatter_attrs, time_attrs) -> None:
+    """Overwrite the family's rows in the main results with its censored refit."""
+    idx = fam.voxel_indices
+    for attr in scatter_attrs:
+        dest = getattr(results, attr, None)
+        src = getattr(fam_results, attr, None)
+        if dest is None or src is None:
+            continue
+        src = src.cpu()
+        if attr in time_attrs:
+            # Censored fits are short along time: place each retained sample back
+            # at its original index and leave the censored TRs at zero, so an
+            # errts volume stays aligned with the input timeline.
+            block = torch.zeros((src.shape[0], dest.shape[1]), dtype=dest.dtype, device=dest.device)
+            block[:, rows] = src.to(dest.dtype)
+            dest[idx] = block
+            continue
+        if tuple(dest.shape[1:]) != tuple(src.shape[1:]):
+            # Shape disagreement means the censored design changed a
+            # non-time axis we cannot align; skip rather than write nonsense.
+            continue
+        dest[idx] = src.to(dest.dtype)
+
+
+def subset_run_validity(validity: RunValidity, mask: torch.Tensor) -> RunValidity:
+    """Restrict a volume-indexed RunValidity to a masked voxel subset.
+
+    The detector runs over the whole volume (it is what decides the mask), but
+    the fit works on masked voxels, so families must be indexed the same way the
+    fitted arrays are.
+    """
+    m = mask.reshape(-1).bool()
+    return RunValidity(
+        valid=validity.valid[m],
+        constant=validity.constant[m],
+        zeros=validity.zeros[m],
+        negative=validity.negative[m],
+        negative_rule_active=validity.negative_rule_active,
+    )

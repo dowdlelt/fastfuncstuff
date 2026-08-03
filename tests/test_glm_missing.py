@@ -313,3 +313,161 @@ def test_accumulator_rejects_unobserved_run():
     acc.observe_run(_data(n_voxels=4)[:, :NT], 0)
     with pytest.raises(RuntimeError, match="never observed"):
         acc.finalize(verbose=False)
+
+
+# ── family refit + merge ────────────────────────────────────────────────────
+
+
+def _signal_data(n_voxels, amp=1.0, seed=5):
+    """Voxels 0..n/2 lose run 2; all share the same task signal."""
+    rng = np.random.default_rng(seed)
+    design = _design()
+    task = design.numpy()[:, 0].astype(np.float64)
+    y = 1000.0 + amp * task + rng.standard_normal((n_voxels, T)) * 0.5
+    return torch.from_numpy(y).float(), design
+
+
+def _fit_main(data, design, method="arma11"):
+    from fastfuncstuff.glm.core import fit_glm
+
+    if method == "ols":
+        return fit_glm(
+            data,
+            design,
+            tr=2.0,
+            task_indices=[0],
+            max_poly_degree=-1,
+            device=torch.device("cpu"),
+        )
+    return fit_glm_arma11(
+        data,
+        design,
+        tr=2.0,
+        run_starts=RUN_STARTS,
+        task_indices=[0],
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+
+@pytest.mark.parametrize("method", ["arma11", "ols"])
+def test_family_refit_recovers_beta_and_reports_dof_loss(method):
+    from fastfuncstuff.glm.missing import fit_and_merge_families
+
+    n_vox = 200
+    data, design = _signal_data(n_vox, amp=1.0)
+    truth = _fit_main(data, design, method)
+    clean_beta = float(truth.betas[100:, 0].mean())
+
+    damaged = data.clone()
+    damaged[:100, 2 * NT :] = 0.0
+    results = _fit_main(damaged, design, method)
+    naive_beta = float(results.betas[:100, 0].mean())
+
+    validity = detect_run_validity(damaged, RUN_STARTS, verbose=False)
+    families, demoted = build_families(
+        validity,
+        RUN_STARTS,
+        T,
+        min_family_voxels=10,
+        design=design,
+        task_indices=[0],
+        verbose=False,
+    )
+    assert len(families) == 1
+    assert not bool(demoted.any())
+
+    kwargs = dict(task_indices=[0], device=torch.device("cpu"))
+    if method == "ols":
+        kwargs.update(max_poly_degree=-1)
+    else:
+        kwargs.update(verbose=False)
+    dof_loss = fit_and_merge_families(
+        results,
+        damaged,
+        design,
+        families,
+        RUN_STARTS,
+        T,
+        fit_kwargs=kwargs,
+        tr=2.0,
+        method=method,
+        verbose=False,
+    )
+    fixed_beta = float(results.betas[:100, 0].mean())
+
+    # Naive is diluted toward zero by the dead-run fraction; the refit is not.
+    assert naive_beta < 0.85 * clean_beta
+    assert abs(fixed_beta - clean_beta) < abs(naive_beta - clean_beta)
+    assert fixed_beta == pytest.approx(clean_beta, rel=0.25)
+
+    # dof loss is timepoints removed MINUS the polynomial columns that went away.
+    assert float(dof_loss[:100].max()) == pytest.approx(NT - 3)
+    assert float(dof_loss[100:].max()) == 0.0
+
+
+def test_family_refit_leaves_clean_voxels_bit_identical():
+    from fastfuncstuff.glm.missing import fit_and_merge_families
+
+    data, design = _signal_data(200, amp=1.0)
+    data[:100, 2 * NT :] = 0.0
+    results = _fit_main(data, design)
+    before = results.betas[100:].clone()
+
+    validity = detect_run_validity(data, RUN_STARTS, verbose=False)
+    families, _ = build_families(
+        validity,
+        RUN_STARTS,
+        T,
+        min_family_voxels=10,
+        design=design,
+        task_indices=[0],
+        verbose=False,
+    )
+    fit_and_merge_families(
+        results,
+        data,
+        design,
+        families,
+        RUN_STARTS,
+        T,
+        fit_kwargs=dict(task_indices=[0], device=torch.device("cpu"), verbose=False),
+        tr=2.0,
+        verbose=False,
+    )
+    assert torch.equal(results.betas[100:], before)
+
+
+def test_no_families_is_a_no_op():
+    from fastfuncstuff.glm.missing import fit_and_merge_families
+
+    data, design = _signal_data(50)
+    results = _fit_main(data, design)
+    before = results.betas.clone()
+    loss = fit_and_merge_families(
+        results,
+        data,
+        design,
+        [],
+        RUN_STARTS,
+        T,
+        fit_kwargs=dict(task_indices=[0], device=torch.device("cpu"), verbose=False),
+        tr=2.0,
+        verbose=False,
+    )
+    assert torch.equal(results.betas, before)
+    assert float(loss.abs().max()) == 0.0
+
+
+def test_subset_run_validity_matches_manual_indexing():
+    from fastfuncstuff.glm.missing import subset_run_validity
+
+    d = _data(n_voxels=40)
+    d[5, 2 * NT :] = 0.0
+    v = detect_run_validity(d, RUN_STARTS, verbose=False)
+    mask = torch.zeros(40, dtype=torch.bool)
+    mask[3:12] = True
+    sub = subset_run_validity(v, mask)
+    assert sub.valid.shape == (9, NRUN)
+    assert torch.equal(sub.valid, v.valid[mask])
+    assert sub.negative_rule_active == v.negative_rule_active

@@ -1310,16 +1310,38 @@ def main():
                 "before running."
             )
 
+    if args.handle_missing and args.no_guard:
+        raise SystemExit("❌ -handle_missing needs the guard's detection; drop -no_guard.")
     if args.handle_missing:
-        raise SystemExit(
-            "❌ -handle_missing is not wired into the fit yet. The detection and "
-            "family-partitioning primitives exist and are tested "
-            "(fastfuncstuff/glm/missing.py), but the per-family censored refit "
-            "still has to happen inside analyze_from_design_matrix, where the "
-            "design matrix lives. For now the default guard drops the affected "
-            "voxels, which is correct but discards them; -save_runmask records "
-            "which runs each surviving voxel used."
-        )
+        # OLS-only and REML-only both refit families fine. What cannot work is
+        # the OLS *baseline alongside* REML: that bucket is streamed out by a
+        # write callback that fires inside the ARMA fit, before any family has
+        # been refitted, so its family voxels would keep their uncensored
+        # values -- exactly the silent wrongness this flag exists to remove.
+        _ols_flags = [
+            n for n in ("Obuck", "Obeta", "Onuisance", "Oerrts", "Ofitts") if getattr(args, n, None)
+        ]
+        _reml_flags = [
+            n
+            for n in ("Rvar", "Rbuck", "Rbeta", "Rnuisance", "Rfitts", "Rerrts", "Rwherr")
+            if getattr(args, n, None)
+        ]
+        if _ols_flags and _reml_flags:
+            raise SystemExit(
+                "❌ -handle_missing cannot write OLS and REML outputs in one run "
+                f"({', '.join('-' + f for f in _ols_flags + _reml_flags)}). The OLS "
+                "baseline is streamed out from inside the ARMA fit, before the "
+                "censored refit happens, so its missing-data voxels would be "
+                "wrong. Run the two passes separately — each is corrected on its "
+                "own."
+            )
+        if args.hrfopt_prefix or args.slibase or args.slibase_sm:
+            raise SystemExit(
+                "❌ -handle_missing cannot yet be combined with per-voxel HRF "
+                "(-hrfopt_prefix) or slicewise regressors (-slibase): both already "
+                "partition voxels by design, and families multiply against that "
+                "grouping rather than composing with it."
+            )
     if args.no_guard and (args.save_runmask or args.save_dofloss):
         raise SystemExit(
             "❌ -save_runmask / -save_dofloss need the missing-data guard, but "
@@ -2241,6 +2263,10 @@ def main():
     # behaviour, including the -cache fast path.
     guard_enabled = not args.no_guard
     preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag or guard_enabled
+    # Set by the guard block below, then handed to analyze_from_design_matrix so
+    # -handle_missing can partition the salvageable voxels into families.
+    guard_validity = None
+    guard_volume_shape = None
     preproc_cached_metadata = None
     diag = None
 
@@ -2346,8 +2372,6 @@ def main():
         # pull it toward zero while contributing no residual, so sigma2 deflates
         # by the same factor and the t-stat barely moves.
         if guard_acc is not None:
-            from fastfuncstuff.glm.missing import run_inclusion_map
-
             print("\n🛡️  Missing-data guard (raw data, pre-blur/scale)")
             user_mask_flat = None
             if args.mask:
@@ -2355,15 +2379,19 @@ def main():
                     (load_nifti(args.mask).get_fdata() > 0).reshape(-1)
                 )
             guard_validity = guard_acc.finalize(mask=user_mask_flat, verbose=True)
+            guard_volume_shape = tuple(volume_shape)
 
-            keep = guard_validity.all_runs_valid
+            full = guard_validity.all_runs_valid
+            partial = guard_validity.any_run_valid & ~full
+            # -handle_missing fits the partial voxels too (against a censored
+            # design), so they have to be inside the mask the analysis sees.
+            keep = (full | partial) if args.handle_missing else full
             if user_mask_flat is not None:
                 keep = keep & user_mask_flat
-            n_dropped = (
-                int((user_mask_flat & ~guard_validity.all_runs_valid).sum())
-                if user_mask_flat is not None
-                else int((~keep).sum())
-            )
+                partial = partial & user_mask_flat
+            was_in = user_mask_flat if user_mask_flat is not None else torch.ones_like(keep)
+            n_dropped = int((was_in & ~keep).sum())
+
             if not bool(keep.any()):
                 print(
                     "\n❌ ERROR: the missing-data guard excluded every voxel. Check the "
@@ -2371,18 +2399,22 @@ def main():
                     "with -no_guard if that is expected."
                 )
                 sys.exit(1)
-            if n_dropped:
+
+            if args.handle_missing:
+                print(
+                    f"  → keeping {int(partial.sum()):,} partially-valid voxel(s) for "
+                    "censored refitting (-handle_missing)"
+                )
+                if n_dropped:
+                    print(f"  → dropped {n_dropped:,} voxel(s) with no valid run at all")
+            elif n_dropped:
                 print(f"  → dropped {n_dropped:,} voxel(s) from the analysis mask")
-                if not args.handle_missing:
-                    n_salvageable = int(
-                        (guard_validity.any_run_valid & ~guard_validity.all_runs_valid).sum()
+                if int(partial.sum()):
+                    print(
+                        f"  ℹ️  {int(partial.sum()):,} of those have data in SOME runs — "
+                        "-handle_missing can refit them against a censored design "
+                        "instead of discarding them."
                     )
-                    if n_salvageable:
-                        print(
-                            f"  ℹ️  {n_salvageable:,} of those have data in SOME runs — "
-                            "-handle_missing can refit them against a censored design "
-                            "instead of discarding them."
-                        )
             else:
                 print("  → no voxels dropped; all in-mask voxels are valid in every run")
 
@@ -2393,23 +2425,8 @@ def main():
             guard_mask_path = str(Path(guard_tmpdir) / "guard_mask.nii.gz")
             save_nifti(guard_mask_vol, guard_mask_path, affine=affine)
             args.mask = guard_mask_path
-
-            if args.save_runmask:
-                # No families yet -- every surviving voxel used every run.
-                inc = run_inclusion_map(guard_validity, [], keep)
-                runmask_path = replace_afni_extension(args.save_runmask, ".nii.gz")
-                save_nifti(
-                    inc.reshape(*volume_shape, guard_validity.n_runs).numpy(),
-                    runmask_path,
-                    affine=affine,
-                )
-                print(f"  • run-inclusion mask: {runmask_path}")
-
-            if args.save_dofloss:
-                # Guard-only: survivors lost nothing (that is the point of it).
-                dofloss_path = replace_afni_extension(args.save_dofloss, ".nii.gz")
-                save_nifti(np.zeros(volume_shape, dtype=np.float32), dofloss_path, affine=affine)
-                print(f"  • dof-loss map: {dofloss_path} (all zero — guard drops, not censors)")
+            guard_keep = keep
+            guard_affine = affine
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:
@@ -2643,7 +2660,86 @@ def main():
             or bool(args.save_clean)
             or (want_diag and bool(args.save_tsnr or args.save_acf)),
             want_ljung_box=bool(args.Rvar),
+            run_validity=guard_validity,
+            handle_missing=args.handle_missing,
+            missing_min_family=args.guard_min_family,
+            missing_max_families=args.guard_max_families,
+            missing_min_task_mass=args.guard_min_task_mass,
         )
+
+        # ── Missing-data bookkeeping ─────────────────────────────────────────
+        # Written after the fit because -handle_missing only knows which
+        # families actually earned a censored refit once build_families has
+        # screened them (size, surviving runs, task-regressor survival).
+        if guard_validity is not None and guard_volume_shape is not None:
+            from fastfuncstuff.glm.missing import MissingFamily, run_inclusion_map
+
+            _fams = getattr(results, "missing_families", []) or []
+            _dof_loss_masked = getattr(results, "missing_dof_loss", None)
+            _demoted_masked = getattr(results, "missing_demoted", None)
+
+            _vol_idx = guard_keep.nonzero(as_tuple=True)[0]
+            _n_vol = int(guard_keep.numel())
+
+            # A demoted family never got a valid fit, so its voxels must leave
+            # the mask rather than ship the (wrong) uncensored numbers.
+            _final_keep = guard_keep.clone()
+            if _demoted_masked is not None and bool(_demoted_masked.any()):
+                _final_keep[_vol_idx[_demoted_masked]] = False
+                # Zero their rows too: they are inside results.voxel_mask, so
+                # without this the bucket would ship the uncensored (wrong)
+                # numbers the main fit produced for them.
+                from fastfuncstuff.glm.arma import VOXEL_SCATTER_ATTRS
+
+                for _attr in VOXEL_SCATTER_ATTRS:
+                    _arr = getattr(results, _attr, None)
+                    if _arr is not None and _arr.shape[0] == _demoted_masked.shape[0]:
+                        _arr[_demoted_masked] = 0
+                print(
+                    f"  ⚠️  {int(_demoted_masked.sum()):,} voxel(s) whose family was "
+                    "rejected are zeroed in the outputs (no valid fit exists for them)"
+                )
+
+            if args.save_runmask:
+                # Families index the masked voxel axis; lift them to volume
+                # indices so the map lines up with the stats bucket.
+                _vol_fams = [
+                    MissingFamily(
+                        pattern=_f.pattern,
+                        voxel_indices=_vol_idx[_f.voxel_indices],
+                        good_list=_f.good_list,
+                    )
+                    for _f in _fams
+                ]
+                inc = run_inclusion_map(guard_validity, _vol_fams, _final_keep)
+                runmask_path = replace_afni_extension(args.save_runmask, ".nii.gz")
+                save_nifti(
+                    inc.reshape(*guard_volume_shape, guard_validity.n_runs).numpy(),
+                    runmask_path,
+                    affine=guard_affine,
+                )
+                print(f"  • run-inclusion mask: {runmask_path}")
+
+            if args.save_dofloss:
+                loss_vol = torch.zeros(_n_vol, dtype=torch.float32)
+                if _dof_loss_masked is not None:
+                    loss_vol[_vol_idx] = _dof_loss_masked
+                loss_vol[~_final_keep] = 0.0
+                dofloss_path = replace_afni_extension(args.save_dofloss, ".nii.gz")
+                save_nifti(
+                    loss_vol.reshape(*guard_volume_shape).numpy(),
+                    dofloss_path,
+                    affine=guard_affine,
+                )
+                _nz = int((loss_vol > 0).sum())
+                if _nz:
+                    print(
+                        f"  • dof-loss map: {dofloss_path} ({_nz:,} voxel(s) lost dof; "
+                        f"max {float(loss_vol.max()):.0f}). Pass it to -adjust_dof — "
+                        "the t-stats in the bucket carry the header's dof, not theirs."
+                    )
+                else:
+                    print(f"  • dof-loss map: {dofloss_path} (all zero — nothing was censored)")
 
         # In OLS-only mode, write requested OLS outputs here (ARMA path writes via callback).
         if analysis_method == "ols" and want_ols and _ols_write_callback is not None:
