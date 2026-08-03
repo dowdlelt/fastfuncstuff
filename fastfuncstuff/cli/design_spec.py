@@ -29,6 +29,7 @@ from fastfuncstuff.cli_utils import add_ortvec_arguments
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     good_list_from_censor,
+    parse_afni_timing_file,
     write_afni_xmat,
 )
 from fastfuncstuff.design.spec import (
@@ -322,6 +323,28 @@ def _write_afni_timing(
                 fh.write("*\n")
             else:
                 fh.write(" ".join(f"{o:.4f}" for o in sorted(run_onsets)) + "\n")
+
+
+def _warn_sparse_conditions(
+    timing_files: list[Path],
+    stim_labels: list[str],
+    n_runs: int,
+) -> None:
+    """Report conditions that are absent from some runs, or so rare they will
+    barely be estimable."""
+    for path, label in zip(timing_files, stim_labels, strict=True):
+        per_run = parse_afni_timing_file(path)
+        missing = [i + 1 for i, onsets in enumerate(per_run) if len(onsets) == 0]
+        n_events = sum(len(o) for o in per_run)
+        if not missing:
+            continue
+        print(
+            f"⚠️  Condition '{label}': {n_events} event(s) total; absent from "
+            f"{len(missing)}/{n_runs} run(s) ({', '.join(str(r) for r in missing)}). "
+            "The regressor is zero over those runs — legal, but the estimate "
+            "rests on the runs that have it.",
+            flush=True,
+        )
 
 
 def _expand_event_to_stims(
@@ -685,6 +708,11 @@ def _do_compile(args: argparse.Namespace) -> int:
         n_timepoints_per_run=spec.meta.n_timepoints_per_run,
         tmpdir=tmpdir,
     )
+
+    # A condition that only fires in a subset of runs is legal (its column is
+    # zero elsewhere) but is a common data-entry surprise and a weak estimate,
+    # so say so before the design is built.
+    _warn_sparse_conditions(timing_files, stim_labels, len(spec.meta.runs))
 
     design, regressor_labels, run_starts, metadata = build_design_matrix(
         timing_files=[str(p) for p in timing_files],

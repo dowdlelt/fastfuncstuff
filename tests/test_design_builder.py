@@ -125,6 +125,66 @@ def test_parse_afni_timing_file():
     print(f"Prompt onsets run 0: {prompt_onsets[0]}")
 
 
+def test_parse_afni_timing_file_asterisk_placeholders(tmp_path):
+    """A run where the condition never occurred is written as a bare '*'
+    (ffs_design_spec) or '* *' (AFNI). Both mean "empty run", and a leading
+    '*' next to real onsets is just a disambiguator."""
+    tf = tmp_path / "rare.1D"
+    tf.write_text("# comment line\n*\n* *\n172.25\n* 12.5 30\n\n")
+
+    onsets = parse_afni_timing_file(tf)
+
+    assert len(onsets) == 5
+    assert len(onsets[0]) == 0
+    assert len(onsets[1]) == 0
+    np.testing.assert_allclose(onsets[2], [172.25])
+    np.testing.assert_allclose(onsets[3], [12.5, 30.0])
+    assert len(onsets[4]) == 0
+
+
+def test_build_design_matrix_condition_missing_from_some_runs(tmp_path):
+    """A condition present in only one run is legal: its column is zero over
+    the runs that lack it, nonzero in the run that has it."""
+    rare = tmp_path / "rare.1D"
+    rare.write_text("*\n40.0\n*\n")
+    common = tmp_path / "common.1D"
+    common.write_text("10 30 50\n10 30 50\n10 30 50\n")
+
+    n_tp = 50
+    design, labels, run_starts, _ = build_design_matrix(
+        timing_files=[str(common), str(rare)],
+        stim_labels=["common", "rare"],
+        n_timepoints_per_run=[n_tp] * 3,
+        tr=2.0,
+        polort=1,
+        hrf_models="SPMG1(0)",
+    )
+
+    rare_col = design[:, labels.index("rare#0")]
+    assert np.all(rare_col[:n_tp] == 0)
+    assert np.any(rare_col[n_tp : 2 * n_tp] != 0)
+    assert np.all(rare_col[2 * n_tp :] == 0)
+
+
+def test_build_design_matrix_rejects_all_empty_condition(tmp_path):
+    """A condition with no events anywhere is an all-zero regressor — refuse
+    it rather than emitting a rank-deficient design."""
+    never = tmp_path / "never.1D"
+    never.write_text("*\n*\n")
+    common = tmp_path / "common.1D"
+    common.write_text("10 30 50\n10 30 50\n")
+
+    with pytest.raises(ValueError, match="no events in any run"):
+        build_design_matrix(
+            timing_files=[str(common), str(never)],
+            stim_labels=["common", "never"],
+            n_timepoints_per_run=[50, 50],
+            tr=2.0,
+            polort=1,
+            hrf_models="SPMG1(0)",
+        )
+
+
 def test_create_onset_regressors():
     """Test creating stimulus regressors from onsets"""
     # Simple test case
