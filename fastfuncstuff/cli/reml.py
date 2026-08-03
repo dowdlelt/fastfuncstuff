@@ -628,10 +628,12 @@ Examples:
         dest="save_runmask",
         metavar="FILE",
         default=None,
-        help="Write the 4D (X,Y,Z,n_runs) run-inclusion mask: volume r is 1 "
-        "where run r contributed to that voxel's fit. Feeds "
+        help="Where to write the 4D (X,Y,Z,n_runs) run-inclusion mask: volume r "
+        "is 1 where run r contributed to that voxel's fit. Feeds "
         "ffs_util_updatedof -adjust_dof_set so a per-run dof cost (e.g. NORDIC) "
-        "is charged only for the runs a voxel actually used.",
+        "is charged only for the runs a voxel actually used. Written "
+        "automatically under -handle_missing as <bucket>_runmask.nii.gz; this "
+        "flag only overrides the path.",
     )
     missing_opts.add_argument(
         "-save_dofloss",
@@ -639,8 +641,26 @@ Examples:
         dest="save_dofloss",
         metavar="FILE",
         default=None,
-        help="Write the per-voxel dof lost to missing-data censoring, ready to "
-        "pass straight to -adjust_dof (or to sum with a NORDIC map).",
+        help="Where to write the per-voxel dof lost to missing-data censoring, "
+        "ready to pass straight to -adjust_dof (or to sum with a NORDIC map). "
+        "Written automatically under -handle_missing as "
+        "<bucket>_dofloss.nii.gz; this flag only overrides the path.",
+    )
+    missing_opts.add_argument(
+        "-no_runmask",
+        "-no-runmask",
+        dest="no_runmask",
+        action="store_true",
+        help="Do not write the run-inclusion mask that -handle_missing writes by default.",
+    )
+    missing_opts.add_argument(
+        "-no_dofloss",
+        "-no-dofloss",
+        dest="no_dofloss",
+        action="store_true",
+        help="Do not write the dof-loss map that -handle_missing writes by "
+        "default. You almost certainly want it: without it the bucket's t-stats "
+        "sit at the header dof, which is wrong for every rescued voxel.",
     )
     missing_opts.add_argument(
         "-guard_min_family",
@@ -1347,6 +1367,31 @@ def main():
             "❌ -save_runmask / -save_dofloss need the missing-data guard, but "
             "-no_guard disabled it."
         )
+
+    # -handle_missing writes its bookkeeping by default, named off whichever
+    # bucket the run is producing. The dof-loss map especially: without it the
+    # bucket's t-stats sit at the header dof, which is wrong for exactly the
+    # voxels this flag went to the trouble of rescuing.
+    if args.handle_missing:
+        _bucket = next(
+            (
+                getattr(args, n)
+                for n in ("Rbuck", "Obuck", "Rbeta", "Obeta", "Rnuisance", "Onuisance")
+                if getattr(args, n, None)
+            ),
+            None,
+        )
+        if _bucket is not None:
+            if not args.no_runmask and not args.save_runmask:
+                args.save_runmask = _insert_path_suffix(_bucket, "_runmask")
+            if not args.no_dofloss and not args.save_dofloss:
+                args.save_dofloss = _insert_path_suffix(_bucket, "_dofloss")
+        elif not (args.no_runmask and args.no_dofloss):
+            print(
+                "ℹ️  -handle_missing: no bucket output to name the run-inclusion / "
+                "dof-loss maps after; pass -save_runmask / -save_dofloss "
+                "explicitly if you want them."
+            )
 
     # Get TR: an explicit -tr overrides whatever is in the header (headers get
     # mangled by upstream tools, so being explicit at the modeling stage is safer).
@@ -2267,6 +2312,8 @@ def main():
     # -handle_missing can partition the salvageable voxels into families.
     guard_validity = None
     guard_volume_shape = None
+    guard_keep = None
+    guard_affine = None
     preproc_cached_metadata = None
     diag = None
 
@@ -2458,7 +2505,24 @@ def main():
             fmri_data_preprocessed = data_tensor.numpy()
 
             if scale_info["n_violations"] > 0:
-                print(f"  ⚠️  {scale_info['n_violations']:,} ceiling violations")
+                # Scaling runs on the whole volume, before masking, so the
+                # headline violation count is dominated by out-of-brain air:
+                # near-zero run means give enormous scale factors. Re-report
+                # against the analysis mask, where the number actually means
+                # something.
+                if guard_keep is not None:
+                    _vi = scale_info["violation_voxel_indices"]
+                    _in_mask = int(guard_keep[_vi].sum())
+                    _n_mask = int(guard_keep.sum())
+                    print(
+                        f"  ⚠️  {_in_mask:,} of {_n_mask:,} in-mask voxels "
+                        f"({100.0 * _in_mask / max(_n_mask, 1):.1f}%) hit the ceiling "
+                        f"at least once — the whole-volume figure above counts "
+                        "out-of-brain air, where a near-zero run mean makes the "
+                        "scale factor explode."
+                    )
+                else:
+                    print(f"  ⚠️  {scale_info['n_violations']:,} ceiling violations")
 
             # Diagnostics hook 2: raw tSNR on the scaled data.
             if diag is not None:
