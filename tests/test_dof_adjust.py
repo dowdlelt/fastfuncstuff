@@ -241,3 +241,129 @@ def test_end_to_end_from_real_reml_bucket():
     ]
     aux = read_brick_stataux(img)
     assert {i: c for i, (c, _) in aux.items()} == {0: 4, 1: 5, 3: 3, 4: 5, 6: 3, 7: 5}
+
+
+# ---------------------------------------------------------------------------
+# composing multiple adjustments (-adjust_dof repeated, -adjust_dof_set)
+# ---------------------------------------------------------------------------
+
+
+def _save_vol(path, arr):
+    from fastfuncstuff.io.afni import save_nifti
+
+    save_nifti(np.asarray(arr, np.float32), path, affine=np.eye(4, dtype=np.float32))
+
+
+def test_combine_scalars_and_maps():
+    from fastfuncstuff.stats.dof_adjust import combine_dof_adjustments
+
+    assert combine_dof_adjustments([]) == 0.0
+    assert combine_dof_adjustments([3.0, 4.0]) == 7.0
+
+    m = np.full((2, 2, 2), 5.0, np.float32)
+    out = combine_dof_adjustments([2.0, m])
+    assert isinstance(out, np.ndarray)
+    assert np.allclose(out, 7.0)
+
+
+def test_combine_rejects_mismatched_grid():
+    from fastfuncstuff.stats.dof_adjust import combine_dof_adjustments
+
+    with pytest.raises(ValueError, match="!="):
+        combine_dof_adjustments([np.zeros((2, 2, 2), np.float32)], expected_shape=(4, 4, 4))
+
+
+def test_adjust_dof_set_charges_only_surviving_runs():
+    """A voxel that lost run 2 must not be charged run 2's dof cost."""
+    from fastfuncstuff.stats.dof_adjust import resolve_dof_adjust_set
+
+    d = tempfile.mkdtemp()
+    # 3 runs costing 10, 20, 40 dof; uniform across space.
+    per_run = np.zeros((2, 2, 2, 3), np.float32)
+    per_run[..., 0], per_run[..., 1], per_run[..., 2] = 10.0, 20.0, 40.0
+    inc = np.ones((2, 2, 2, 3), np.float32)
+    inc[0, 0, 0, 2] = 0.0  # this voxel lost run 2
+    inc[1, 1, 1, :] = [1.0, 0.0, 0.0]  # this one survived only run 0
+
+    _save_vol(f"{d}/perrun.nii.gz", per_run)
+    _save_vol(f"{d}/inc.nii.gz", inc)
+
+    adj = resolve_dof_adjust_set(f"{d}/perrun.nii.gz", f"{d}/inc.nii.gz")
+    assert adj.shape == (2, 2, 2)
+    assert adj[0, 0, 0] == pytest.approx(30.0)  # 10 + 20, not 70
+    assert adj[1, 1, 1] == pytest.approx(10.0)
+    assert adj[0, 1, 0] == pytest.approx(70.0)  # full survivor pays everything
+
+
+def test_adjust_dof_set_scalar_per_run():
+    from fastfuncstuff.stats.dof_adjust import resolve_dof_adjust_set
+
+    d = tempfile.mkdtemp()
+    inc = np.ones((2, 2, 2, 4), np.float32)
+    inc[0, 0, 0, :] = [1.0, 1.0, 0.0, 0.0]
+    _save_vol(f"{d}/inc.nii.gz", inc)
+
+    adj = resolve_dof_adjust_set(7.0, f"{d}/inc.nii.gz")
+    assert adj[0, 0, 0] == pytest.approx(14.0)  # 7 x 2 surviving runs
+    assert adj[1, 1, 1] == pytest.approx(28.0)  # 7 x 4
+
+
+def test_adjust_dof_set_run_count_mismatch_errors():
+    from fastfuncstuff.stats.dof_adjust import resolve_dof_adjust_set
+
+    d = tempfile.mkdtemp()
+    _save_vol(f"{d}/perrun.nii.gz", np.zeros((2, 2, 2, 3), np.float32))
+    _save_vol(f"{d}/inc.nii.gz", np.ones((2, 2, 2, 5), np.float32))
+    with pytest.raises(ValueError, match="3 runs but"):
+        resolve_dof_adjust_set(f"{d}/perrun.nii.gz", f"{d}/inc.nii.gz")
+
+
+def test_updatedof_cli_sums_repeated_adjustments():
+    """Two -adjust_dof plus an -adjust_dof_set must land at the summed dof."""
+    from fastfuncstuff.cli.util_updatedof import main as updatedof_main
+    from fastfuncstuff.io.afni import save_nifti
+
+    d = tempfile.mkdtemp()
+    x, stataux, labels = _make_bucket(dof=200.0)
+    src = f"{d}/stats.nii.gz"
+    save_nifti(
+        x, src, affine=np.eye(4, dtype=np.float32), brick_labels=labels, brick_stataux=stataux
+    )
+
+    vol_shape = x.shape[:3]
+    inc = np.ones(vol_shape + (2,), np.float32)
+    inc[..., 1] = 0.0  # everyone lost run 1
+    _save_vol(f"{d}/inc.nii.gz", inc)
+
+    out = f"{d}/adj.nii.gz"
+    rc = updatedof_main(
+        [
+            "-input",
+            src,
+            "-adjust_dof",
+            "5",
+            "-adjust_dof",
+            "3",
+            "-adjust_dof_set",
+            "10",
+            f"{d}/inc.nii.gz",
+            "-prefix",
+            out,
+            "-quiet",
+        ]
+    )
+    assert rc == 0
+
+    # total adjustment = 5 + 3 + (10 x 1 surviving run) = 18 -> dof 182
+    expected = t_to_z(x[..., 2], 200.0 - 18.0)
+    from fastfuncstuff.io.afni import load_nifti
+
+    got = np.asarray(load_nifti(out).get_fdata(dtype=np.float32))[..., 4]
+    assert np.allclose(got, expected, atol=1e-4)
+
+
+def test_updatedof_cli_requires_an_adjustment():
+    from fastfuncstuff.cli.util_updatedof import main as updatedof_main
+
+    d = tempfile.mkdtemp()
+    assert updatedof_main(["-input", "x.nii.gz", "-prefix", f"{d}/o.nii.gz"]) == 1
