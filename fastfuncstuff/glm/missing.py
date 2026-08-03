@@ -106,6 +106,119 @@ class RunValidity:
         return ", ".join(parts) + tail
 
 
+def _reduce_run(
+    run: torch.Tensor, constant_rel_tol: float
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-voxel (is_constant, has_zeros, negative_fraction) for one run."""
+    run = run.float()
+    mean = run.mean(dim=1)
+    std = run.std(dim=1)
+    # Scale-invariant: compare std against the run's own level. The absolute
+    # floor catches a run that is constant *at* zero, where the relative test
+    # degenerates.
+    level = mean.abs().clamp_min(1e-12)
+    is_constant = (std <= constant_rel_tol * level) | (std <= 1e-12)
+    has_zeros = (run == 0).any(dim=1)
+    neg_frac = (run < 0).float().mean(dim=1)
+    return is_constant, has_zeros, neg_frac
+
+
+class RunValidityAccumulator:
+    """Streaming :func:`detect_run_validity` — observe one run at a time.
+
+    ``ffs_reml`` blurs each run as it loads it, so the raw concatenated dataset
+    never exists in memory. Detection has to happen inside that loop, on the raw
+    run, before the blur smears nonzero data into the dead voxels and destroys
+    the exact-zero signature.
+    """
+
+    def __init__(
+        self,
+        n_voxels: int,
+        n_runs: int,
+        *,
+        constant_rel_tol: float = CONSTANT_REL_TOL,
+        negative_frac: float = NEGATIVE_FRAC,
+        check_negative: bool = True,
+    ) -> None:
+        shape = (n_voxels, n_runs)
+        self.constant = torch.zeros(shape, dtype=torch.bool)
+        self.zeros = torch.zeros(shape, dtype=torch.bool)
+        self.neg_frac = torch.zeros(shape, dtype=torch.float32)
+        self.constant_rel_tol = constant_rel_tol
+        self.negative_frac = negative_frac
+        self.check_negative = check_negative
+        self._seen: set[int] = set()
+
+    def observe_run(self, run_data: torch.Tensor, run_idx: int) -> None:
+        """Record one **raw** run, shaped (n_voxels, n_run_timepoints)."""
+        if run_data.shape[1] == 0:
+            return
+        c, z, n = _reduce_run(run_data.cpu(), self.constant_rel_tol)
+        self.constant[:, run_idx] = c
+        self.zeros[:, run_idx] = z
+        self.neg_frac[:, run_idx] = n
+        self._seen.add(int(run_idx))
+
+    def finalize(self, *, mask: torch.Tensor | None = None, verbose: bool = True) -> RunValidity:
+        missing = set(range(self.constant.shape[1])) - self._seen
+        if missing:
+            raise RuntimeError(f"run validity: never observed run(s) {sorted(missing)}")
+        return _finalize_validity(
+            self.constant,
+            self.zeros,
+            self.neg_frac,
+            mask=mask,
+            negative_frac=self.negative_frac,
+            check_negative=self.check_negative,
+            verbose=verbose,
+        )
+
+
+def _finalize_validity(
+    constant: torch.Tensor,
+    zeros: torch.Tensor,
+    neg_frac_per_run: torch.Tensor,
+    *,
+    mask: torch.Tensor | None,
+    negative_frac: float,
+    check_negative: bool,
+    verbose: bool,
+) -> RunValidity:
+    negative = torch.zeros_like(constant)
+    # The negative rule only means anything on magnitude data. If the input is
+    # broadly negative it has been detrended/centered and the rule would delete
+    # the brain -- turn it off and say so.
+    negative_rule_active = check_negative
+    if check_negative:
+        if mask is not None:
+            m = mask.reshape(-1).bool()
+            global_neg = float(neg_frac_per_run[m].mean()) if bool(m.any()) else 0.0
+        else:
+            global_neg = float(neg_frac_per_run.mean())
+        if global_neg > NEGATIVE_AUTODISABLE_FRAC:
+            negative_rule_active = False
+            if verbose:
+                print(
+                    f"  ⚠️  {global_neg:.0%} of in-mask samples are negative — this is not "
+                    "magnitude data (detrended or mean-centered?), so the negative "
+                    "run-validity rule is disabled. Constancy and zero checks still apply."
+                )
+        else:
+            negative = neg_frac_per_run >= negative_frac
+
+    result = RunValidity(
+        valid=~(constant | zeros | negative),
+        constant=constant,
+        zeros=zeros,
+        negative=negative,
+        negative_rule_active=negative_rule_active,
+    )
+    if verbose:
+        print(f"  Run validity: {result.summary()}")
+    return result
+
+
 def detect_run_validity(
     data: torch.Tensor,
     run_starts: list[int],
@@ -151,9 +264,8 @@ def detect_run_validity(
     shape = (n_voxels, n_runs)
     constant = torch.zeros(shape, dtype=torch.bool)
     zeros = torch.zeros(shape, dtype=torch.bool)
-    negative = torch.zeros(shape, dtype=torch.bool)
 
-    # Pass 1: the cheap per-run reductions. Everything below is (n_voxels, n_runs)
+    # The cheap per-run reductions. Everything accumulated is (n_voxels, n_runs)
     # -- a few MB even at whole-dataset scale -- so only the slices are big.
     neg_frac_per_run = torch.zeros(shape, dtype=torch.float32)
     for v0 in range(0, n_voxels, chunk_voxels):
@@ -162,49 +274,18 @@ def detect_run_validity(
             run = data[v0:v1, s:e]
             if run.shape[1] == 0:
                 continue
-            run = run.float()
-            mean = run.mean(dim=1)
-            std = run.std(dim=1)
-            # Scale-invariant: compare std against the run's own level. The
-            # absolute floor catches a run that is constant *at* zero, where the
-            # relative test degenerates.
-            level = mean.abs().clamp_min(1e-12)
-            constant[v0:v1, r] = (std <= constant_rel_tol * level) | (std <= 1e-12)
-            zeros[v0:v1, r] = (run == 0).any(dim=1)
-            neg_frac_per_run[v0:v1, r] = (run < 0).float().mean(dim=1)
+            c, z, n = _reduce_run(run, constant_rel_tol)
+            constant[v0:v1, r], zeros[v0:v1, r], neg_frac_per_run[v0:v1, r] = c, z, n
 
-    # The negative rule only means anything on magnitude data. If the input is
-    # broadly negative it has been detrended/centered and the rule would delete
-    # the brain -- turn it off and say so.
-    negative_rule_active = check_negative
-    if check_negative:
-        if mask is not None:
-            m = mask.reshape(-1).bool()
-            global_neg = float(neg_frac_per_run[m].mean()) if bool(m.any()) else 0.0
-        else:
-            global_neg = float(neg_frac_per_run.mean())
-        if global_neg > NEGATIVE_AUTODISABLE_FRAC:
-            negative_rule_active = False
-            if verbose:
-                print(
-                    f"  ⚠️  {global_neg:.0%} of in-mask samples are negative — this is not "
-                    "magnitude data (detrended or mean-centered?), so the negative "
-                    "run-validity rule is disabled. Constancy and zero checks still apply."
-                )
-        else:
-            negative = neg_frac_per_run >= negative_frac
-
-    valid = ~(constant | zeros | negative)
-    result = RunValidity(
-        valid=valid,
-        constant=constant,
-        zeros=zeros,
-        negative=negative,
-        negative_rule_active=negative_rule_active,
+    return _finalize_validity(
+        constant,
+        zeros,
+        neg_frac_per_run,
+        mask=mask,
+        negative_frac=negative_frac,
+        check_negative=check_negative,
+        verbose=verbose,
     )
-    if verbose:
-        print(f"  Run validity: {result.summary()}")
-    return result
 
 
 def _pattern_label(pattern: torch.Tensor) -> str:

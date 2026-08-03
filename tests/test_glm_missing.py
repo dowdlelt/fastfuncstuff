@@ -282,3 +282,34 @@ def test_censored_refit_removes_the_beta_dilution():
 
     # The censored fit honestly reports fewer degrees of freedom.
     assert fixed.dof < truth.dof
+
+
+def test_accumulator_matches_whole_array_detection():
+    """The streaming path ffs_reml uses must agree with the batch path exactly."""
+    from fastfuncstuff.glm.missing import RunValidityAccumulator
+
+    d = _data(n_voxels=32, seed=7)
+    d[3, 2 * NT :] = 0.0
+    d[5, NT : 2 * NT] = 742.0
+    d[9, NT + NT // 2 : 2 * NT] = 0.0
+
+    batch = detect_run_validity(d, RUN_STARTS, verbose=False)
+
+    acc = RunValidityAccumulator(32, NRUN)
+    for r, s in enumerate(RUN_STARTS):
+        e = RUN_STARTS[r + 1] if r + 1 < NRUN else T
+        acc.observe_run(d[:, s:e], r)
+    streamed = acc.finalize(verbose=False)
+
+    assert torch.equal(batch.valid, streamed.valid)
+    assert torch.equal(batch.constant, streamed.constant)
+    assert torch.equal(batch.zeros, streamed.zeros)
+
+
+def test_accumulator_rejects_unobserved_run():
+    from fastfuncstuff.glm.missing import RunValidityAccumulator
+
+    acc = RunValidityAccumulator(4, NRUN)
+    acc.observe_run(_data(n_voxels=4)[:, :NT], 0)
+    with pytest.raises(RuntimeError, match="never observed"):
+        acc.finalize(verbose=False)

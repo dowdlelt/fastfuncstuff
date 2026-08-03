@@ -16,6 +16,7 @@ import argparse
 import contextlib
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 # Reduce CUDA fragmentation: groups allocate/free n_time×n_time Cholesky tensors
@@ -592,6 +593,90 @@ Examples:
         help="Use double precision (float64) - matches AFNI exactly, ~2x memory, ~1.5x slower",
     )
     proc_opts.add_argument("-mask", help="Mask file to restrict analysis")
+
+    # ── Missing-data handling ────────────────────────────────────────────────
+    # A voxel can be in-mask and still be dead in some runs (coverage that moves
+    # between sessions, a subject who moved on the last run). Those rows assert
+    # "response = 0" against a nonzero regressor, diluting beta while deflating
+    # sigma2 by the same factor -- the t-stat barely moves, so it is silent.
+    missing_opts = parser.add_argument_group("Missing-Data Options")
+    missing_opts.add_argument(
+        "-no_guard",
+        "-no-guard",
+        dest="no_guard",
+        action="store_true",
+        help="Disable the default missing-data guard. By default ffs_reml drops "
+        "from the analysis mask any voxel that is constant within a run, hits "
+        "exact zeros within a run, or goes negative for a run — all of which "
+        "silently corrupt the betas and deflate the noise variance. Use this "
+        "only if you know your data has none of those.",
+    )
+    missing_opts.add_argument(
+        "-handle_missing",
+        "-handle-missing",
+        dest="handle_missing",
+        action="store_true",
+        help="Instead of only dropping partially-valid voxels, rescue them: "
+        "group them into families sharing a run-validity pattern, refit each "
+        "family against its own censored design, and record the per-voxel dof "
+        "lost. Statistics for those voxels are valid only after the z-conversion "
+        "(-adjust_dof), because their dof differs from the bucket header's.",
+    )
+    missing_opts.add_argument(
+        "-save_runmask",
+        "-save-runmask",
+        dest="save_runmask",
+        metavar="FILE",
+        default=None,
+        help="Write the 4D (X,Y,Z,n_runs) run-inclusion mask: volume r is 1 "
+        "where run r contributed to that voxel's fit. Feeds "
+        "ffs_util_updatedof -adjust_dof_set so a per-run dof cost (e.g. NORDIC) "
+        "is charged only for the runs a voxel actually used.",
+    )
+    missing_opts.add_argument(
+        "-save_dofloss",
+        "-save-dofloss",
+        dest="save_dofloss",
+        metavar="FILE",
+        default=None,
+        help="Write the per-voxel dof lost to missing-data censoring, ready to "
+        "pass straight to -adjust_dof (or to sum with a NORDIC map).",
+    )
+    missing_opts.add_argument(
+        "-guard_min_family",
+        "-guard-min-family",
+        dest="guard_min_family",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Minimum voxels for a -handle_missing family to be worth its own "
+        "fit; smaller families are dropped from the mask instead (default 50).",
+    )
+    missing_opts.add_argument(
+        "-guard_max_families",
+        "-guard-max-families",
+        dest="guard_max_families",
+        type=int,
+        default=32,
+        metavar="N",
+        help="Cap on -handle_missing families (default 32). Each costs a full "
+        "REML fit with its own autocorrelation cache, which cannot be shared "
+        "across families because it is keyed on timepoint count. Overflow "
+        "families are dropped from the mask.",
+    )
+    missing_opts.add_argument(
+        "-guard_min_task_mass",
+        "-guard-min-task-mass",
+        dest="guard_min_task_mass",
+        type=float,
+        default=0.25,
+        metavar="FRAC",
+        help="Fraction of a task regressor's design mass that must survive "
+        "censoring for a family to be fitted (default 0.25). A voxel that can "
+        "estimate one condition but not another makes degenerate contrasts, so "
+        "such families are dropped from the mask instead.",
+    )
+
     proc_opts.add_argument(
         "-censor",
         metavar="FILE.1D",
@@ -1224,6 +1309,22 @@ def main():
                 "Resample the mask onto the data grid (or pick the right mask) "
                 "before running."
             )
+
+    if args.handle_missing:
+        raise SystemExit(
+            "❌ -handle_missing is not wired into the fit yet. The detection and "
+            "family-partitioning primitives exist and are tested "
+            "(fastfuncstuff/glm/missing.py), but the per-family censored refit "
+            "still has to happen inside analyze_from_design_matrix, where the "
+            "design matrix lives. For now the default guard drops the affected "
+            "voxels, which is correct but discards them; -save_runmask records "
+            "which runs each surviving voxel used."
+        )
+    if args.no_guard and (args.save_runmask or args.save_dofloss):
+        raise SystemExit(
+            "❌ -save_runmask / -save_dofloss need the missing-data guard, but "
+            "-no_guard disabled it."
+        )
 
     # Get TR: an explicit -tr overrides whatever is in the header (headers get
     # mangled by upstream tools, so being explicit at the modeling stage is safer).
@@ -2133,7 +2234,13 @@ def main():
     # ==========================================================================
     # Whole-dataset diagnostics need the manual load path (data resident in RAM).
     want_diag = bool(args.save_grandmean or args.save_tsnr or args.save_acf or args.save_mask)
-    preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag
+    # The guard has to see RAW data, before the blur smears nonzero samples into
+    # the dead voxels and destroys the exact-zero signature. Detection therefore
+    # runs inside the per-run load callback below, which forces the resident-load
+    # path (the same one -save_* diagnostics use). -no_guard restores the old
+    # behaviour, including the -cache fast path.
+    guard_enabled = not args.no_guard
+    preprocessing_applied = args.do_blur is not None or args.do_scale or want_diag or guard_enabled
     preproc_cached_metadata = None
     diag = None
 
@@ -2204,6 +2311,22 @@ def main():
             )
             return torch.from_numpy(blurred.reshape(n_voxels, n_tps))
 
+        guard_acc = None
+        if guard_enabled:
+            from fastfuncstuff.glm.missing import RunValidityAccumulator
+
+            guard_acc = RunValidityAccumulator(n_voxels, len(run_starts))
+
+        def _per_run(run_data, run_idx):
+            # Guard first: it must read the run RAW. Blurring here would smear
+            # live signal into the dead voxels and erase the exact-zero
+            # signature that a mid-run dropout is detected by.
+            if guard_acc is not None:
+                guard_acc.observe_run(run_data, run_idx)
+            if args.do_blur is not None:
+                return _blur_run(run_data, run_idx)
+            return run_data
+
         # Shared loader: threaded decode, the fast volume-major -> voxel-major
         # reorder, and the same preallocate-and-fill / length-check behaviour
         # this branch used to hand-roll. keep_on_cpu because the diagnostics and
@@ -2212,10 +2335,81 @@ def main():
             input_files,
             keep_on_cpu=True,
             total_timepoints=total_tps,
-            per_run_fn=_blur_run if args.do_blur is not None else None,
+            per_run_fn=_per_run if (guard_acc is not None or args.do_blur is not None) else None,
         )
         fmri_data_preprocessed = data_tensor.numpy()
         del data_tensor
+
+        # ── Missing-data guard ───────────────────────────────────────────────
+        # Intersect the analysis mask down to voxels that carry usable data in
+        # EVERY run. Anything else silently corrupts its own beta: the dead rows
+        # pull it toward zero while contributing no residual, so sigma2 deflates
+        # by the same factor and the t-stat barely moves.
+        if guard_acc is not None:
+            from fastfuncstuff.glm.missing import run_inclusion_map
+
+            print("\n🛡️  Missing-data guard (raw data, pre-blur/scale)")
+            user_mask_flat = None
+            if args.mask:
+                user_mask_flat = torch.from_numpy(
+                    (load_nifti(args.mask).get_fdata() > 0).reshape(-1)
+                )
+            guard_validity = guard_acc.finalize(mask=user_mask_flat, verbose=True)
+
+            keep = guard_validity.all_runs_valid
+            if user_mask_flat is not None:
+                keep = keep & user_mask_flat
+            n_dropped = (
+                int((user_mask_flat & ~guard_validity.all_runs_valid).sum())
+                if user_mask_flat is not None
+                else int((~keep).sum())
+            )
+            if not bool(keep.any()):
+                print(
+                    "\n❌ ERROR: the missing-data guard excluded every voxel. Check the "
+                    "input for a run that is constant or zero everywhere, or rerun "
+                    "with -no_guard if that is expected."
+                )
+                sys.exit(1)
+            if n_dropped:
+                print(f"  → dropped {n_dropped:,} voxel(s) from the analysis mask")
+                if not args.handle_missing:
+                    n_salvageable = int(
+                        (guard_validity.any_run_valid & ~guard_validity.all_runs_valid).sum()
+                    )
+                    if n_salvageable:
+                        print(
+                            f"  ℹ️  {n_salvageable:,} of those have data in SOME runs — "
+                            "-handle_missing can refit them against a censored design "
+                            "instead of discarding them."
+                        )
+            else:
+                print("  → no voxels dropped; all in-mask voxels are valid in every run")
+
+            # The guard mask is what the analysis actually runs on, so it has to
+            # reach analyze_from_design_matrix as a file like any other -mask.
+            guard_mask_vol = keep.reshape(*volume_shape).numpy().astype(np.float32)
+            guard_tmpdir = tempfile.mkdtemp(prefix="ffs_reml_guard_")
+            guard_mask_path = str(Path(guard_tmpdir) / "guard_mask.nii.gz")
+            save_nifti(guard_mask_vol, guard_mask_path, affine=affine)
+            args.mask = guard_mask_path
+
+            if args.save_runmask:
+                # No families yet -- every surviving voxel used every run.
+                inc = run_inclusion_map(guard_validity, [], keep)
+                runmask_path = replace_afni_extension(args.save_runmask, ".nii.gz")
+                save_nifti(
+                    inc.reshape(*volume_shape, guard_validity.n_runs).numpy(),
+                    runmask_path,
+                    affine=affine,
+                )
+                print(f"  • run-inclusion mask: {runmask_path}")
+
+            if args.save_dofloss:
+                # Guard-only: survivors lost nothing (that is the point of it).
+                dofloss_path = replace_afni_extension(args.save_dofloss, ".nii.gz")
+                save_nifti(np.zeros(volume_shape, dtype=np.float32), dofloss_path, affine=affine)
+                print(f"  • dof-loss map: {dofloss_path} (all zero — guard drops, not censors)")
 
         # Diagnostics hook 1: grand mean, computed on the un-scaled data.
         if want_diag:
