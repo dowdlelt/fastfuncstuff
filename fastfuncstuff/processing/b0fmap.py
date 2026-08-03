@@ -21,8 +21,9 @@ What is left for us, and what this module is:
   ready-made Hz map) into the one 4-D call ROMEO wants,
 * **conditioning** the field where ROMEO's mask ends -- a measured field is only
   defined over tissue, and a hard mask edge is a cliff in the field and therefore
-  a tear in the warp. We extrapolate smoothly outward past the mask and then taper
-  to zero in far air (the same reasoning as ``topup.taper_field_to_object``),
+  a tear in the warp. Growth beyond the mask is strictly **along the phase-encode
+  axis**, with a fold-safe decay, since that is the only direction EPI distortion
+  displaces signal (see :func:`extend_field_along_pe`),
 * Hz -> PE voxel displacement -> the 4-D mm pull warp that ``ffs_nwarp`` composes,
   in exactly the convention ``ffs_blipflip`` writes,
 * the geometry hand-off to the EPI. A GRE fieldmap is measured in *undistorted*
@@ -48,7 +49,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from .cost import _separable_smooth_3d
@@ -59,7 +59,7 @@ __all__ = [
     "B0FieldResult",
     "RomeoOutputs",
     "condition_field",
-    "extrapolate_outward",
+    "extend_field_along_pe",
     "field_to_pe_warp",
     "read_echo_times",
     "romeo_available",
@@ -252,7 +252,7 @@ def run_romeo(
 
 
 # ---------------------------------------------------------------------------
-# Field conditioning: extrapolate past the mask, then taper to zero
+# Field conditioning: smooth inside the mask, extend along PE outside it
 # ---------------------------------------------------------------------------
 def _weighted_smooth(
     field: Tensor, weight: Tensor, sigma_vox: tuple[float, float, float]
@@ -264,51 +264,92 @@ def _weighted_smooth(
     return torch.where(den > 1e-6, num / den.clamp_min(1e-6), field)
 
 
-def extrapolate_outward(
-    field: Tensor, mask: Tensor, n_iter: int, kernel: int = 3
+def extend_field_along_pe(
+    field: Tensor,
+    mask: Tensor,
+    pe_tdim: int,
+    *,
+    hold_vox: float,
+    decay_vox: float,
+    disp_per_unit: float = 0.0,
+    jac_margin: float = 0.5,
 ) -> tuple[Tensor, Tensor]:
-    """Grow the field ``n_iter`` voxels past ``mask`` by neighbourhood averaging.
+    """Extend the field past the mask **along the phase-encode axis only**.
 
-    Each pass fills the one-voxel shell around the current support with the mean of
-    its already-valid neighbours, then adopts that shell as valid. This is the fast
-    GPU stand-in for solving a Laplace equation in the exterior: it is smooth, it is
-    exact at the boundary, and it decays to the local field rather than to zero.
+    EPI distortion displaces signal along one axis. The field therefore only ever needs
+    to be defined a little beyond the object *along that axis* -- far enough to pull back
+    signal that distortion pushed outside the object outline, and no further.
 
-    The alternative -- leaving the field at zero outside the mask -- puts a step of
-    tens of Hz right at the brain edge. Through :func:`field_to_pe_warp` that step is
-    a discontinuous PE displacement, so the resample tears exactly where orbitofrontal
-    and temporal signal (the voxels most in need of correction) lives.
+    Extending isotropically instead (a neighbourhood-average or Laplace fill) propagates
+    the field along the boundary *normal*, so at a curved skull it carries a large value
+    out sideways. The warp component stays on the PE axis, but its magnitude out there is
+    inherited from tissue that lies medially and has no bearing on that column. Worse, a
+    subsequent taper then drives that inherited value to zero over a short distance, and
+    since the Jacobian here is ``1 + d(disp)/d(PE)``, a large value collapsing over a few
+    voxels folds the warp. That is exactly where folds were concentrated -- overwhelmingly
+    outside the brain, in the halo rather than in tissue.
 
-    Returns the extended field and the extended (dilated) mask.
+    So: interior gaps are filled by 1-D interpolation along PE; outside the mask the
+    boundary value is held for ``hold_vox`` and then decays exponentially. The decay
+    length is raised per column to at least ``|edge displacement| / jac_margin``, which
+    bounds ``|d(disp)/d(PE)|`` by ``jac_margin`` and so *guarantees* a Jacobian of at
+    least ``1 - jac_margin``. Orthogonal to PE nothing is extrapolated at all, so columns
+    that never touch the object stay at zero and their warp is the identity.
+
+    ``disp_per_unit`` converts field units to PE voxels (the readout time, for Hz);
+    leave it 0 to skip the fold-safety widening and use ``decay_vox`` as given.
+
+    Returns the extended field and the mask of where it is now defined.
     """
-    f = field.clone()
-    m = mask.to(field.dtype).clone()
-    pad = kernel // 2
-    for _ in range(max(0, n_iter)):
-        num = F.avg_pool3d(
-            (f * m)[None, None], kernel_size=kernel, stride=1, padding=pad, count_include_pad=True
-        )[0, 0]
-        den = F.avg_pool3d(
-            m[None, None], kernel_size=kernel, stride=1, padding=pad, count_include_pad=True
-        )[0, 0]
-        grown = (den > 0).to(field.dtype)
-        shell = grown * (1.0 - m)
-        f = f * m + shell * torch.where(den > 0, num / den.clamp_min(1e-8), torch.zeros_like(num))
-        m = grown
-    return f, m
+    f = field.movedim(pe_tdim, -1)
+    m = mask.movedim(pe_tdim, -1)
+    n = f.shape[-1]
+    far = 10 * n
+    idx = torch.arange(n, device=f.device).expand_as(m)
+
+    # Nearest valid sample at or before / at or after each position, along PE.
+    prev = torch.where(m, idx, torch.full_like(idx, -far)).cummax(-1).values
+    nxt = torch.where(m, idx, torch.full_like(idx, far)).flip(-1).cummin(-1).values.flip(-1)
+    has_prev, has_next = prev >= 0, nxt < n
+    p, q = prev.clamp(0, n - 1), nxt.clamp(0, n - 1)
+    fp, fq = f.gather(-1, p), f.gather(-1, q)
+
+    # Interior gaps: linear interpolation between the bracketing valid samples.
+    span = (q - p).clamp(min=1).to(f.dtype)
+    t = (idx - p).clamp(min=0).to(f.dtype) / span
+    interior = fp * (1.0 - t) + fq * t
+
+    # Outside: hold the boundary value, then decay. distance is measured from the
+    # boundary sample, which is `nxt` below the object and `prev` above it.
+    edge = torch.where(has_prev, fp, fq)
+    dist = torch.where(has_prev, (idx - p), (q - idx)).clamp(min=0).to(f.dtype)
+
+    length = torch.full_like(edge, float(max(decay_vox, 1e-3)))
+    if disp_per_unit != 0.0 and jac_margin > 0:
+        need = edge.abs() * abs(disp_per_unit) / jac_margin
+        length = torch.maximum(length, need)
+    env = torch.exp(-(dist - hold_vox).clamp(min=0.0) / length)
+
+    valid = has_prev | has_next
+    out = torch.where(m, f, torch.where(has_prev & has_next, interior, edge * env))
+    out = torch.where(valid, out, torch.zeros_like(out))
+    return out.movedim(-1, pe_tdim).contiguous(), valid.movedim(-1, pe_tdim).contiguous()
 
 
 def condition_field(
     field_hz: Tensor,
     mask: Tensor,
     voxel_sizes: tuple[float, float, float],
+    pe_tdim: int,
     *,
     weight: Tensor | None = None,
     fwhm_mm: float = 4.0,
     extend_mm: float = 16.0,
     rolloff_mm: float = 8.0,
+    disp_per_unit: float = 0.0,
+    jac_margin: float = 0.5,
 ) -> tuple[Tensor, Tensor]:
-    """Smooth inside the mask, extrapolate outward, taper to zero in far air.
+    """Smooth inside the mask, then extend along PE only.
 
     ``voxel_sizes`` is ``(vz, vy, vx)`` to match the ``(nz, ny, nx)`` tensor layout.
     ``weight`` (ROMEO's B0 SNR or quality map) makes the smoothing inverse-noise
@@ -320,8 +361,13 @@ def condition_field(
     SNR-weighted combination across echoes, so heavy smoothing here only blurs away
     the sharp sinus gradients that matter.
 
-    Returns ``(conditioned_field, support_mask)`` where the support mask is the
-    extended (pre-taper) one -- useful as the "field is trustworthy here" map.
+    Smoothing is 3-D, which is right *inside* the object where the field really is a
+    smooth 3-D structure -- but its result is re-masked before extension, because a
+    normalised convolution also bleeds a couple of sigma past the boundary and that
+    halo is isotropic. All growth beyond the mask is left to
+    :func:`extend_field_along_pe`, which is 1-D and fold-safe.
+
+    Returns ``(conditioned_field, support_mask)``.
     """
     m = mask.to(field_hz.dtype)
     w = m if weight is None else (m * weight.clamp_min(0.0).to(field_hz.dtype))
@@ -330,14 +376,17 @@ def condition_field(
     if fwhm_mm > 0:
         field_hz = _weighted_smooth(field_hz * m, w, sigma_vox)
 
-    mean_vox = sum(voxel_sizes) / 3.0
-    n_ext = int(round(extend_mm / mean_vox))
-    field_hz, support = extrapolate_outward(field_hz * m, m > 0.5, n_ext)
-
-    if rolloff_mm > 0:
-        env = _separable_smooth_3d(support.to(field_hz.dtype), rolloff_mm / mean_vox)
-        field_hz = field_hz * env.clamp(0.0, 1.0)
-    return field_hz, support > 0.5
+    pe_vox_mm = voxel_sizes[pe_tdim]
+    field_hz, support = extend_field_along_pe(
+        field_hz * m,
+        m > 0.5,
+        pe_tdim,
+        hold_vox=extend_mm / pe_vox_mm,
+        decay_vox=rolloff_mm / pe_vox_mm,
+        disp_per_unit=disp_per_unit,
+        jac_margin=jac_margin,
+    )
+    return field_hz, support
 
 
 # ---------------------------------------------------------------------------

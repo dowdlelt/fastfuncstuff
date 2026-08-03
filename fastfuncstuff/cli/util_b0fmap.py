@@ -165,11 +165,22 @@ def create_parser() -> argparse.ArgumentParser:
         "-rolloff",
         type=float,
         default=8.0,
-        help="Distance (mm) over which the extended field tapers to zero in far air, so "
-        "the warp is identity there instead of dragging tissue into the pad margin.",
+        help="Length scale (mm) of the exponential decay to zero beyond -extend, ALONG PE "
+        "only, so far air is identity instead of dragging tissue into the pad margin. "
+        "Widened per column where needed to respect -jac_margin.",
     )
     cond.add_argument(
-        "-no_taper", action="store_true", help="Skip the far-air taper (implies -rolloff 0)."
+        "-no_taper",
+        action="store_true",
+        help="Never decay: hold the boundary value out to the FOV edge along PE.",
+    )
+    cond.add_argument(
+        "-jac_margin",
+        type=float,
+        default=0.5,
+        help="Cap on |d(displacement)/d(PE)| in the extended region, which bounds the "
+        "Jacobian below by 1-margin and so keeps the warp from folding out there. The "
+        "decay length is widened per column as needed to respect it. 0 disables.",
     )
     cond.add_argument(
         "-mask",
@@ -412,27 +423,32 @@ def main(argv: list[str] | None = None) -> int:
             f"Hz 1-99 pct [{torch.quantile(inm, 0.01):.0f}, {torch.quantile(inm, 0.99):.0f}]"
         )
 
+    pe_axis = PE_AXIS_MAP[pe_dir]
+    pe_tdim = {0: 2, 1: 1, 2: 0}[pe_axis]
     field, support = B.condition_field(
         field_raw,
         mask,
         vox,
+        pe_tdim,
         weight=weight,
         fwhm_mm=args.fwhm,
         extend_mm=args.extend,
-        rolloff_mm=0.0 if args.no_taper else args.rolloff,
+        rolloff_mm=1e9 if args.no_taper else args.rolloff,
+        disp_per_unit=readout,
+        jac_margin=args.jac_margin,
     )
     if verb >= 1:
         print(
-            f"  conditioned: fwhm {args.fwhm:g} mm, extend {args.extend:g} mm "
-            f"({int(support.sum()):,} voxels of support), rolloff "
-            f"{0 if args.no_taper else args.rolloff:g} mm"
+            f"  conditioned: fwhm {args.fwhm:g} mm in-mask; extended along {pe_dir} "
+            f"by {args.extend:g} mm then decaying over "
+            + ("no decay" if args.no_taper else f"{args.rolloff:g} mm")
+            + f" ({int(support.sum()):,} voxels of support)"
         )
 
     # ---- warp on the fieldmap grid, and the synthetic distorted magnitude ----
     # The displacement is in EPI PE voxels; expressed on the fieldmap grid it has to be
     # rescaled by the PE voxel-size ratio, since the same physical mm shift is a
     # different number of voxels on a different grid.
-    pe_axis = PE_AXIS_MAP[pe_dir]
     fmap_pe_mm = _voxel_sizes_zyx(affine)[{0: 2, 1: 1, 2: 0}[pe_axis]]
     epi_pe_mm = fmap_pe_mm
     if args.epi:

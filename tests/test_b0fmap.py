@@ -10,7 +10,7 @@ import torch
 
 from fastfuncstuff.processing.b0fmap import (
     condition_field,
-    extrapolate_outward,
+    extend_field_along_pe,
     field_to_pe_warp,
     read_echo_times,
     read_epi_geometry,
@@ -33,40 +33,77 @@ def _smooth_field(shape=(12, 20, 20), amp=60.0):
     return amp * torch.exp(-((y + 0.4) ** 2 + x**2) / 0.3) - 0.3 * amp * z
 
 
-class TestExtrapolate:
-    def test_fills_outward_without_touching_the_interior(self):
-        field = _smooth_field()
-        mask = torch.zeros_like(field, dtype=torch.bool)
-        mask[3:9, 5:15, 5:15] = True
-        out, grown = extrapolate_outward(field * mask, mask, n_iter=3)
+class TestExtendAlongPE:
+    """Growth beyond the mask must be 1-D along PE. Isotropic fill propagates the field
+    along the boundary *normal*, so at a curved skull it carries a large value out
+    sideways that was inherited from tissue lying medially — and the subsequent decay of
+    that value then folds the warp. Folds were overwhelmingly extra-cerebral because of it.
+    """
 
-        assert torch.allclose(out[mask], field[mask]), "interior must be untouched"
-        assert grown.sum() > mask.sum(), "support must grow"
-        # Everything the original mask touched plus its 3-voxel shell is now defined.
-        assert bool(grown[3:9, 5:15, 5:15].all())
-        assert bool(grown[2, 5, 5])
+    def test_boundary_value_is_held_then_decays(self):
+        f = torch.zeros(4, 20, 4)
+        m = torch.zeros_like(f, dtype=torch.bool)
+        m[:, 8:12, :] = True
+        f[:, 8:12, :] = 50.0
+        out, sup = extend_field_along_pe(f, m, 1, hold_vox=3, decay_vox=4)
 
-    def test_no_step_at_the_mask_edge(self):
-        """The point of extrapolating: the gradient across the boundary must stay
-        bounded instead of falling off a cliff to zero."""
-        field = _smooth_field()
-        mask = torch.zeros_like(field, dtype=torch.bool)
-        mask[:, 5:15, 5:15] = True
+        assert torch.allclose(out[:, 8:12, :], torch.full_like(out[:, 8:12, :], 50.0))
+        assert torch.allclose(out[:, 12:15, :], torch.full_like(out[:, 12:15, :], 50.0))
+        assert out[0, 19, 0] < 25.0, "must decay far from the object"
+        assert bool(sup.all()), "every column touching the object is defined"
 
-        zeroed = field * mask
-        extended, _ = extrapolate_outward(zeroed, mask, n_iter=4)
+    def test_no_growth_orthogonal_to_pe(self):
+        """A column that never touches the object stays exactly zero, so its warp is the
+        identity — the property isotropic filling destroys."""
+        f = torch.zeros(6, 20, 6)
+        m = torch.zeros_like(f, dtype=torch.bool)
+        m[2:4, 8:12, 2:4] = True
+        f[2:4, 8:12, 2:4] = 80.0
+        out, sup = extend_field_along_pe(f, m, 1, hold_vox=4, decay_vox=4)
 
-        # Jump across the boundary column, along y.
-        jump_zeroed = (zeroed[:, 4, 8] - zeroed[:, 5, 8]).abs().max()
-        jump_ext = (extended[:, 4, 8] - extended[:, 5, 8]).abs().max()
-        assert jump_ext < 0.25 * jump_zeroed
+        off = torch.ones_like(f, dtype=torch.bool)
+        off[2:4, :, 2:4] = False  # every column NOT passing through the object
+        assert float(out[off].abs().max()) == 0.0
+        assert not bool(sup[off].any())
 
-    def test_zero_iterations_is_identity(self):
-        field = _smooth_field()
-        mask = torch.ones_like(field, dtype=torch.bool)
-        out, grown = extrapolate_outward(field, mask, n_iter=0)
-        assert torch.equal(out, field)
-        assert bool(grown.all())
+    def test_jac_margin_guarantees_no_fold(self):
+        """The decay length is widened per column so |d(disp)/d(PE)| stays under the
+        margin — which is what actually keeps the Jacobian positive out in the halo."""
+        f = torch.zeros(2, 40, 2)
+        m = torch.zeros_like(f, dtype=torch.bool)
+        m[:, 18:22, :] = True
+        f[:, 18:22, :] = 300.0  # a big field: 300 Hz * 0.035 s ~ 10 voxels of shift
+        readout = 0.035
+
+        loose, _ = extend_field_along_pe(f, m, 1, hold_vox=0, decay_vox=2, disp_per_unit=0.0)
+        safe, _ = extend_field_along_pe(
+            f, m, 1, hold_vox=0, decay_vox=2, disp_per_unit=readout, jac_margin=0.5
+        )
+        assert float(_jacobian_pe(loose * readout, 1).min()) < 0, "short decay must fold"
+        assert float(_jacobian_pe(safe * readout, 1).min()) > 0.4, "margin must prevent it"
+
+    def test_interior_gaps_are_interpolated(self):
+        """A dropout hole inside the object is bridged, not left as a spike to zero."""
+        f = torch.zeros(2, 12, 2)
+        m = torch.ones_like(f, dtype=torch.bool)
+        f[:, :, :] = torch.linspace(0, 110, 12).reshape(1, 12, 1)
+        m[:, 5:7, :] = False
+        out, _ = extend_field_along_pe(f * m, m, 1, hold_vox=2, decay_vox=4)
+        expected = torch.linspace(0, 110, 12)[5:7]
+        assert torch.allclose(out[0, 5:7, 0], expected, atol=1e-4)
+
+    @pytest.mark.parametrize("pe_tdim", [0, 1, 2])
+    def test_axis_selection(self, pe_tdim):
+        f = torch.zeros(9, 9, 9)
+        m = torch.zeros_like(f, dtype=torch.bool)
+        sl = [slice(None)] * 3
+        sl[pe_tdim] = slice(4, 5)
+        f[tuple(sl)] = 40.0
+        m[tuple(sl)] = True
+        out, _ = extend_field_along_pe(f, m, pe_tdim, hold_vox=1, decay_vox=2)
+        # Growth happens only along pe_tdim, so the result is constant on the other axes.
+        moved = out.movedim(pe_tdim, -1)
+        assert torch.allclose(moved, moved[0:1, 0:1, :].expand_as(moved))
 
 
 class TestConditionField:
@@ -75,9 +112,9 @@ class TestConditionField:
         mask = torch.zeros_like(field, dtype=torch.bool)
         mask[6:10, 13:19, 13:19] = True
         out, support = condition_field(
-            field, mask, (2.0, 2.0, 2.0), fwhm_mm=0.0, extend_mm=4.0, rolloff_mm=4.0
+            field, mask, (2.0, 2.0, 2.0), 1, fwhm_mm=0.0, extend_mm=4.0, rolloff_mm=4.0
         )
-        assert float(out[0, 0, 0].abs()) < 1e-3, "far air must taper to zero"
+        assert float(out[0, 0, 0].abs()) < 1e-3, "far air must decay to zero"
         assert float(out[mask].abs().mean()) > 1.0, "the object's field must survive"
         assert support.sum() >= mask.sum()
 
@@ -88,7 +125,7 @@ class TestConditionField:
         mask = torch.zeros_like(field, dtype=torch.bool)
         mask[:, 4:12, 4:12] = True
         out, _ = condition_field(
-            field, mask, (2.0, 2.0, 2.0), fwhm_mm=6.0, extend_mm=0.0, rolloff_mm=0.0
+            field, mask, (2.0, 2.0, 2.0), 1, fwhm_mm=6.0, extend_mm=0.0, rolloff_mm=0.0
         )
         # A constant field stays constant inside the mask, edge included.
         assert torch.allclose(out[mask], torch.full_like(out[mask], 50.0), atol=1e-2)
@@ -100,7 +137,7 @@ class TestConditionField:
         field[8, 8, 8] = 100.0
         mask = torch.ones_like(field, dtype=torch.bool)
         out, _ = condition_field(
-            field, mask, (8.0, 1.0, 1.0), fwhm_mm=6.0, extend_mm=0.0, rolloff_mm=0.0
+            field, mask, (8.0, 1.0, 1.0), 1, fwhm_mm=6.0, extend_mm=0.0, rolloff_mm=0.0
         )
         spread_z = float(out[:, 8, 8].abs().sum() - out[8, 8, 8].abs())
         spread_x = float(out[8, 8, :].abs().sum() - out[8, 8, 8].abs())
