@@ -450,7 +450,11 @@ def test_warpmaster_defines_grid_mask_and_stats():
     assert "ffs_util_autobox" in s and "ffs_util_resample" in s
     assert '-prefix "stage10.warpmaster.nii$FMT"' in s
     assert '-prefix "epi_mask.nii$FMT"' in s and "-dilate 2" in s
-    assert '[ -f "autobox3_brain.nii.gz" ] ||' in s  # own anat → viewing brain
+    assert '[ -f "stage09.anat_autobox.nii.gz" ] ||' in s  # own anat → whole-brain underlay
+    assert '[ -f "stage10.anat_in_epi_fov.nii.gz" ] ||' in s  # ... and the EPI-FOV crop
+    # The alignment base is the boxed anat, and its output is named for the source.
+    assert '-base "stage09.anat_autobox.nii.gz"' in s
+    assert '-prefix "stage09.grandmean_al_anat.nii$FMT"' in s
 
     # stage10 lands runs on the warpmaster (not the raw anat master).
     assert "-master stage10.warpmaster.nii$FMT" in s
@@ -467,7 +471,8 @@ def test_warpmaster_defines_grid_mask_and_stats():
         bids_root="/bids",
     )
     assert '-prefix "stage10.warpmaster.nii$FMT"' in borrow
-    assert '[ -f "autobox3_brain.nii.gz" ] ||' not in borrow
+    assert "stage09.anat_autobox.nii.gz" not in borrow
+    assert "stage10.anat_in_epi_fov.nii.gz" not in borrow
 
 
 def _two_fmap_subject():

@@ -1618,12 +1618,17 @@ def _stage_anat(plan: Plan) -> str:
         )
         src = _anat_source_image(plan)
         mode = effective_anat_source(plan)
+        box = _anat_box()
+        boxing = _ffs(
+            "ffs_util_autobox",
+            ['-input "$ANAT"', "-npad 3", f'-prefix "{box}"', '-device "$DEVICE"'],
+        )
         lin = _ffs(
             "ffs_allineate",
             [
-                '-base "$ANAT"',
+                f'-base "{box}"',
                 f'-source "{src}"',
-                '-prefix "stage09.anat.nii$FMT"',
+                f'-prefix "{_al_anat(plan)}"',
                 '-1Dmatrix_save "stage09.anat.aff12.1D"',
                 *_split_flags(config.DEFAULT_OPTS["anat"]),
                 '-device "$DEVICE"',
@@ -1634,6 +1639,11 @@ def _stage_anat(plan: Plan) -> str:
             note = f"  # (-anat_source {opt.anat_source} unavailable here → {mode})\n"
         out.append(
             f'ANAT="{anat_ph}"\n'
+            "# Crop the anat's air away first: the alignment base, every EPI-in-anat\n"
+            "# output, and the final grid all inherit this FOV, and the aff12 matrix is\n"
+            "# in DICOM mm — cropping the base moves nothing, it only shrinks the search\n"
+            "# space and the volume-sized allocations. Doubles as the viewing underlay.\n"
+            f'[ -f "{box}" ] || \\\n{boxing}\n'
             'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.anat.aff12.1D" ]; then\n'
             "  # cross-modal rigid lpc: base=anat → matrix maps anat→EPI (chain head).\n"
             f"  # source = -anat_source {mode} (all choices share the reference-fmap grid).\n"
@@ -1740,13 +1750,31 @@ def _segment_input(plan: Plan) -> str:
 def _own_anat(opt) -> bool:
     """True when this pipeline computes its OWN anat matrix (an ``$ANAT`` bash var
     is defined in stage09) — as opposed to borrowing (-grand_reference) or
-    overriding (-ref_file) it. Gates the viewing-only autobox3_brain."""
+    overriding (-ref_file) it. Gates the anat-derived underlays."""
     return opt.go_to_anat and opt.ref_file is None and opt.grand_reference is None
+
+
+def _anat_box() -> str:
+    """The anat cropped to its own brain — the alignment base (stage09), the final
+    grid's ancestor, and the whole-brain viewing underlay.
+
+    Plain .gz, not $FMT: this one is for looking at, and stock AFNI cannot open
+    .nii.zst."""
+    return "stage09.anat_autobox.nii.gz"
+
+
+def _al_anat(plan: Plan) -> str:
+    """The EPI anchor resampled into anat space by the stage09 alignment.
+
+    Named for the source that made it (``stage09.grandmean_al_anat``,
+    ``stage09.sbmean_al_anat``, …): it is EPI data sitting on the anat grid, not
+    an anatomical, and the distinction decides what you should be looking at."""
+    return f"stage09.{effective_anat_source(plan)}_al_anat.nii$FMT"
 
 
 def _final_master(plan: Plan) -> str:
     """The dataset whose grid (space/FOV) the final output inherits — before the
-    warpmaster autoboxes it to the brain and drops it to the EPI voxel size."""
+    warpmaster autoboxes it to the EPI coverage and drops it to the EPI voxel size."""
     opt = plan.options
     if not opt.go_to_anat:
         return _grandmean()
@@ -1754,9 +1782,14 @@ def _final_master(plan: Plan) -> str:
         # explicit reference: the copied-in ref anat defines the shared grid.
         return "stage09.ref_anat.nii.gz" if opt.ref_anat else _grandmean()
     if opt.grand_reference:
-        # borrow the reference's anat-space grid so all subjects/tasks co-register.
-        return f"{opt.grand_reference.rstrip('/')}/stage09.anat.nii$FMT"
-    return "stage09.anat.nii$FMT"
+        # Borrow the reference's anat-space grid so all subjects/tasks co-register.
+        # Globbed because the reference's file is named for ITS -anat_source, which
+        # this script has no way to know.
+        gr = opt.grand_reference.rstrip("/")
+        # `|| true` so a miss leaves MASTER empty for the guard below to report,
+        # rather than tripping `set -o pipefail` with no explanation.
+        return f"$(ls {gr}/stage09.*_al_anat.nii* 2>/dev/null | head -1 || true)"
+    return _al_anat(plan)
 
 
 def _final_dxyz_default(plan: Plan) -> str:
@@ -1772,17 +1805,21 @@ def _final_dxyz_default(plan: Plan) -> str:
 def _stage_warpmaster(plan: Plan) -> str:
     """Pin the final output grid and analysis mask BEFORE the resample (stage10).
 
-    The warpmaster is the anat-space target autoboxed to a tight brain FOV and
-    resampled to the EPI voxel size — it fixes the exact position + spacing every
-    run's timeseries lands on (stage10 ``-master``). epi_mask is a dilated automask
-    on that grid, used to mask the GLM. autobox3_brain is a tight skull-stripped
-    anat for nicer result overlays (viewing only; not used downstream). MASTER and
-    FINAL_DXYZ are defined here once and reused by stage10 (same shell); the
+    The warpmaster is the anat-space EPI target autoboxed to the EPI's own
+    coverage and resampled to the EPI voxel size — it fixes the exact position +
+    spacing every run's timeseries lands on (stage10 ``-master``). The EPI FOV is
+    usually a slab, not the whole head, so this crop is what keeps the output from
+    carrying the anat's empty space. epi_mask is a dilated automask on that grid,
+    used to mask the GLM. Two anat underlays come out of this: the whole-brain
+    stage09.anat_autobox and stage10.anat_in_epi_fov, the same anat at anat
+    resolution over the warpmaster's FOV — the one to overlay results on. MASTER
+    and FINAL_DXYZ are defined here once and reused by stage10 (same shell); the
     FFS_MASTER / FFS_FINAL_DXYZ overrides are still honoured."""
     opt = plan.options
     box = "stage10.warpmaster_box.nii$FMT"
     wm = "stage10.warpmaster.nii$FMT"
     mask = "epi_mask.nii$FMT"
+    anat_fov = "stage10.anat_in_epi_fov.nii.gz"
 
     def guarded(outfile: str, tool: str, parts: list[str]) -> str:
         return f'[ -f "{outfile}" ] || \\\n' + _ffs(tool, parts)
@@ -1791,28 +1828,22 @@ def _stage_warpmaster(plan: Plan) -> str:
         "",
         "# ============================ stage10a: warpmaster + mask ==================",
         "# Fix the final output grid and analysis mask before the resample. The",
-        "# warpmaster is the anat-space target autoboxed to a tight brain FOV and",
-        "# resampled to the EPI voxel size; stage10 lands every run on it (-master).",
-        "# epi_mask is a dilated automask on that grid (masks the GLM). autobox3_brain",
-        "# is a tight skull-stripped anat for nicer result overlays (viewing only).",
+        "# warpmaster is the anat-space EPI target autoboxed to the EPI's own coverage",
+        "# and resampled to the EPI voxel size; stage10 lands every run on it (-master).",
+        "# epi_mask is a dilated automask on that grid (masks the GLM).",
+    ]
+    if _own_anat(opt):
+        out += [
+            "# stage10.anat_in_epi_fov is the anat on that same FOV at anat resolution —",
+            "# the underlay for results; stage09.anat_autobox is the whole-brain one.",
+        ]
+    out += [
         "echo '== stage10a: warpmaster + mask =='",
         # Defined once here and reused by stage10; FFS_* overrides still win.
         f'MASTER="${{FFS_MASTER:-{_final_master(plan)}}}"',
+        '[ -n "$MASTER" ] || { echo "stage10a: no master dataset; set FFS_MASTER" >&2; exit 1; }',
         f'FINAL_DXYZ="${{FFS_FINAL_DXYZ:-{_final_dxyz_default(plan)}}}"',
     ]
-    if _own_anat(opt):
-        out.append(
-            guarded(
-                "autobox3_brain.nii.gz",
-                "ffs_util_autobox",
-                [
-                    '-input "$ANAT"',
-                    "-npad 3",
-                    '-prefix "autobox3_brain.nii.gz"',
-                    '-device "$DEVICE"',
-                ],
-            )
-        )
     out.append(
         guarded(
             box,
@@ -1820,6 +1851,21 @@ def _stage_warpmaster(plan: Plan) -> str:
             ['-input "$MASTER"', "-npad 5", f'-prefix "{box}"', '-device "$DEVICE"'],
         )
     )
+    if _own_anat(opt):
+        # Pure crop: the box came from a dataset on the anat grid, so this shares
+        # its voxel lattice and -rmode never fires.
+        out.append(
+            guarded(
+                anat_fov,
+                "ffs_util_resample",
+                [
+                    f'-input "{_anat_box()}"',
+                    f'-master "{box}"',
+                    f'-prefix "{anat_fov}"',
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
     # resample -dxyz needs three values; FINAL_DXYZ is one number (isotropic).
     out.append(
         guarded(
