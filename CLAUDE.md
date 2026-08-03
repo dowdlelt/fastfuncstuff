@@ -32,6 +32,7 @@ All of these are spelled out under `../fmri_wiki/principles/`. Don't re-derive t
 - [[Float32 vs float64]] — default float32 (One consumer GPUs several times faster, half VRAM). Promote to float64 only for the numerically sensitive step (REML likelihood, Cholesky on near-singular matrices); cast back for storage.
 - [[Data formats]] — `.nii.gz` with `use_pigz=True` for outputs (parallel gzip); `.nii.zst` for big intermediates read many times.
 - [[Benchmark validation]] — `ffs_benchmark` is the correctness gate. Thresholds are documented per stage. **If a stage fails, investigate before lowering the threshold.**
+- **Reference AFNI** — the AFNI on `PATH` cannot read `.nii.zst` (it reports `NO-DSET`). Use the locally built tree at `~/afni_binaries/afni/src/` by full path (`~/afni_binaries/afni/src/3dinfo dset.nii.zst`); the same directory holds the AFNI **C sources** (`3dAutobox.c`, `thd_automask.c`, …) — read them when checking a port instead of guessing.
 - [[VRAM debugging]] — enable with `FFS_DEBUG_VRAM=1` (or `-debug_memory` on tools that wire it). The actual-vs-predicted peak ratio tells you whether the memory model is right.
 
 ## Testing
