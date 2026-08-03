@@ -1295,3 +1295,113 @@ def test_single_session_needs_no_grandmean_checkpoint():
     s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
     assert "stage08b" not in s and "gmrun" not in s
     assert '-prefix "stage08.grandmean.nii$FMT"' in s
+
+
+# ---------------------------------------------------------------------------
+# QC stacks
+# ---------------------------------------------------------------------------
+
+
+def _qc(script: str) -> dict[str, list[str]]:
+    """The emitted qc_tcat calls, as {output file: [inputs]}."""
+    out: dict[str, list[str]] = {}
+    for ln in script.splitlines():
+        if not ln.startswith("qc_tcat "):
+            continue
+        parts = re.findall(r'"([^"]*)"', ln)
+        out[parts[0]] = parts[2:]  # parts[1] is the label string
+    return out
+
+
+def _qc_labels(script: str, name: str) -> list[str]:
+    for ln in script.splitlines():
+        parts = re.findall(r'"([^"]*)"', ln)
+        if ln.startswith("qc_tcat ") and parts[0] == name:
+            return parts[1].split()
+    raise KeyError(name)
+
+
+def test_qc_stacks_group_the_images_a_stage_claims_to_have_aligned():
+    """Two sessions, two fieldmap groups in the first: each level's stack holds
+    exactly the images that level put in ONE space, and no more."""
+    fA = FmapGroup("01", "A", Path("/revA.nii.gz"), {"TotalReadoutTime": 0.06}, [("t", "1")])
+    fB = FmapGroup("01", "B", Path("/revB.nii.gz"), {"TotalReadoutTime": 0.06}, [("t", "2")])
+    fC = FmapGroup("02", "C", Path("/revC.nii.gz"), {"TotalReadoutTime": 0.06}, [("t", "3")])
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "t", "1"), _run("01", "t", "2")], [fA, fB]),
+            Session("02", [_run("02", "t", "3")], [fC]),
+        ],
+    )
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    qc = _qc(s)
+
+    # cross-fmap: the reference group's own mean, then each aligned group.
+    xf = qc["stage05.QC.xfmap.ses-01_lin.nii.gz"]
+    assert xf == [
+        "stage04.blip.ses-01.fmap-A_mean.nii$FMT",
+        "stage05.xfmap.ses-01.fmap-B_lin.nii$FMT",
+    ]
+    assert _qc_labels(s, "stage05.QC.xfmap.ses-01_lin.nii.gz") == ["ref:fmap-A", "fmap-B"]
+    # ses-02 has one group — nothing to compare, no stack.
+    assert "stage05.QC.xfmap.ses-02_lin.nii.gz" not in qc
+
+    # cross-run is grouped by ALIGNMENT BASE, not by session: each fieldmap group's
+    # runs land on its own forward image and are only comparable within the group.
+    assert "stage06.QC.xrun.ses-01.fmap-A_lin.nii.gz" in qc
+    assert "stage06.QC.xrun.ses-01.fmap-B_lin.nii.gz" in qc
+    assert "stage06.QC.xrun.ses-01_lin.nii.gz" not in qc
+
+    # stage07 is where a session's runs first share a grid — one stack per session.
+    assert _qc(s)["stage07.QC.runmean.ses-01.nii.gz"] == [
+        "stage07.runmean.ses-01.task-t.run-1.nii$FMT",
+        "stage07.runmean.ses-01.task-t.run-2.nii$FMT",
+    ]
+
+    # cross-session, reference session first; then every run of every session.
+    assert _qc_labels(s, "stage08.QC.xses.src-max_lin.nii.gz") == ["ref:ses-01", "ses-02"]
+    assert _qc_labels(s, "stage08.QC.grandmean.nii.gz") == [
+        "ses-01.task-t.run-1",
+        "ses-01.task-t.run-2",
+        "ses-02.task-t.run-3",
+    ]
+
+
+def test_qc_final_stack_is_every_runs_mean_in_output_space():
+    """-save_mean is on by default at the final resample, and those means are the
+    dataset-wide stack: if anything moves here, no earlier stage fixed it."""
+    subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    assert "-save_mean -prefix" in s
+    assert _qc(s)["stage10.QC.final.nii.gz"] == [
+        "stage10.warpmaster.nii$FMT",
+        "mean_stage10.final.ses-01.task-t.run-1.nii$FINAL_FMT",
+        "mean_stage10.final.ses-01.task-t.run-2.nii$FINAL_FMT",
+    ]
+
+
+def test_qc_skips_single_image_groups_and_honours_no_qc():
+    """A one-image "stack" answers no alignment question, and -no_qc drops the
+    machinery entirely."""
+    subj = Subject("X", [Session("01", [_run("01", "t", "1")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    # one run: nothing to compare at the run/session levels...
+    assert not [k for k in _qc(s) if k.startswith(("stage06", "stage07", "stage08"))]
+    # ...but the final stack still pairs that run against the output grid.
+    assert "stage10.QC.final.nii.gz" in _qc(s)
+
+    off = write_script(build_plan(subj, Options(go_to_anat=False, qc=False)), "wd")
+    assert "qc_tcat" not in off
+    # The per-run mean survives -no_qc: it is a useful output in its own right,
+    # not scaffolding for the stack.
+    assert "-save_mean -prefix" in off
+
+
+def test_qc_single_session_grandmean_stack_is_not_a_duplicate():
+    """With one session, grandmean space IS the session's common grid, so the
+    stage08 stack would repeat stage07's file for file."""
+    subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
+    s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
+    assert "stage07.QC.runmean.ses-01.nii.gz" in _qc(s)
+    assert "stage08.QC.grandmean.nii.gz" not in _qc(s)

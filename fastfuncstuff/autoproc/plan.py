@@ -122,6 +122,11 @@ class Options:
     ref_file: str | None = None
     ref_transforms: list[str] | None = None
     ref_anat: str | None = None
+    # Emit the ``stageNN.QC.*`` stacks: at every level, the set of images that
+    # stage claims to have brought into one space, concatenated along time into a
+    # single 4-D file. Cheap (one temporal concat per group) and it is what makes
+    # a misregistration visible instead of inferred.
+    qc: bool = True
     # Batched stages (moco, final resample) skip already-complete runs by default
     # (via each tool's -batch_skip). True forces every run to re-process.
     batch_overwrite: bool = False

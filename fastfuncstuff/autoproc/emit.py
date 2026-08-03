@@ -552,6 +552,111 @@ def _ref_image_file(plan: Plan, session: str | None, lane: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# QC stacks
+#
+# Every alignment stage produces a SET of images that, if the stage worked, are
+# in one space — the runs of a session on its common grid, the sessions in the
+# reference session's space, every run's mean in the final output space. Each of
+# those sets is concatenated along time into one 4-D ``stageNN.QC.*`` file, so
+# the check is "scroll the time axis and watch for the brain to jump" instead of
+# loading N files into a viewer and toggling them by hand.
+#
+# The grouping rule is exactly "these files SHOULD be voxel-for-voxel aligned",
+# which is why the groups are not always one-per-stage: cross-run alignment in a
+# multi-fieldmap session lands each group's runs on ITS forward image, so that
+# stage gets one stack per fieldmap group, and the single per-session stack only
+# appears at stage07 once the pre-chain has put them all on one grid. Where a
+# level has a reference that maps to itself, it goes in as sub-brick 0 — the
+# thing everything else was supposed to move onto.
+#
+# QC files are plain .nii.gz (never $FMT): they exist to be opened in a viewer,
+# and stock AFNI/FSLeyes cannot read .nii.zst.
+# ---------------------------------------------------------------------------
+
+# What (file, label) pairs a QC stack is built from.
+QCItems = list[tuple[str, str]]
+
+
+def _qc_on(plan: Plan) -> bool:
+    return bool(getattr(plan.options, "qc", True))
+
+
+def _qc_stem(label: str, **coords) -> str:
+    """``stageNN.QC.<label>[.<coords>]`` — the QC stack for a level.
+
+    Same stage number and coordinate vocabulary as the images it stacks, with
+    ``QC`` between them: an uppercase token sorts the stacks to the head of their
+    stage in a directory listing, and ``ls *.QC.*`` is every one of them.
+    """
+    key = NameKey(label, **coords)
+    c = coord(key)
+    base = f"stage{STAGE_NUMBERS[label]:02d}.QC.{label}"
+    return f"{base}.{c}" if c else base
+
+
+def _qc_lanes(plan: Plan) -> tuple[str, ...]:
+    """Lanes worth a QC stack: the anatomy-bearing ones.
+
+    max/min are coverage maps resampled by the SAME transforms as the mean lane,
+    so a stack of them shows the identical alignment twice — the extra files
+    would only dilute the listing the QC exists to make readable.
+    """
+    return ((LANE_SBREF,) if plan.use_sbref else ()) + (LANE_MEAN,)
+
+
+def _qc_call(out_stem: str, items: QCItems, indent: str = "") -> str:
+    """One ``qc_tcat`` line, or "" when there is nothing to compare.
+
+    A single-image group is dropped: a 1-volume "stack" answers no alignment
+    question, and the stage's own output is already that file.
+    """
+    if len(items) < 2:
+        return ""
+    labels = " ".join(lab for _, lab in items)
+    files = " ".join(f'"{f}"' for f, _ in items)
+    return f'{indent}qc_tcat "{out_stem}.nii.gz" "{labels}" {files}'
+
+
+def _qc_block(title: str, calls: list[str]) -> str:
+    """A stage's QC lines under one echo, or "" when the stage has no groups."""
+    live = [c for c in calls if c]
+    if not live:
+        return ""
+    return "\n".join([f"echo {shlex.quote('== QC: ' + title + ' ==')}", *live])
+
+
+def _qc_helper(plan: Plan) -> str:
+    """The ``qc_tcat`` shell function, emitted once near the top of the script.
+
+    Missing inputs skip the stack rather than failing: a QC group can name a file
+    an optional stage did not write (a nonlinear refinement that was turned off
+    after a partial run, a fieldmap that failed), and `set -e` would take the
+    whole pipeline down over an image nobody is going to analyse.
+    """
+    if not _qc_on(plan):
+        return ""
+    return """
+# ============================ QC stacks =====================================
+# qc_tcat OUT "LABELS..." INPUT... — concatenate images that SHOULD be aligned
+# into one 4-D file. Scroll its time axis in a viewer: any jump between
+# sub-bricks is a registration failure at that stage, and the sub-brick label
+# names the run/session/fieldmap responsible. `ls *.QC.*` is all of them.
+skip_qc=1          # 1 = keep an existing QC stack; 0 = rebuild every one
+qc_tcat() {
+  local out="$1" labs="$2"; shift 2
+  [ "$skip_qc" -eq 1 ] && [ -f "$out" ] && return 0
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] || { echo "  QC skip $(basename "$out"): missing $f"; return 0; }
+  done
+  # $labs is deliberately unquoted: it is a space-separated label list.
+  ffs_util_3dmath -input "$@" -tcat -labels $labs \\
+    -prefix "$out" -overwrite -device "$DEVICE"
+}
+"""
+
+
+# ---------------------------------------------------------------------------
 # per-run derived paths (computed in Python, emitted as data)
 # ---------------------------------------------------------------------------
 
@@ -610,6 +715,181 @@ def _aligned_mean(pr: PlanRun, lane: str = LANE_MEAN) -> str:
     if _pre_chain(pr, ".nii$FMT"):
         return _runmean(pr, lane)
     return _run_level(pr, lane)
+
+
+def _first_by_session(plan: Plan) -> dict[str | None, PlanRun]:
+    """First run of each session — the anchor a no-fieldmap session aligns to."""
+    first: dict[str | None, PlanRun] = {}
+    for pr in plan.runs:
+        first.setdefault(pr.bold.session, pr)
+    return first
+
+
+# ---------------------------------------------------------------------------
+# QC groups, one builder per stage. Each returns the stage's QC block, or "".
+# ---------------------------------------------------------------------------
+
+
+def _qc_xfmap(plan: Plan) -> str:
+    """Per session: every fieldmap group's mean on that session's reference-fmap
+    grid. Sub-brick 0 is the reference group's own undistorted mean."""
+    if not _qc_on(plan):
+        return ""
+    calls = []
+    for ses in _sessions(plan):
+        ids = session_fmap_ids(plan, ses)
+        if len(ids) < 2:
+            continue
+        ref = (_session_ref_fmap_mean(plan, ses), f"ref:fmap-{ids[0]}")
+        for kind in ("lin", "nl") if plan.options.xfmap_nonlin else ("lin",):
+            items: QCItems = [ref]
+            for fid in ids[1:]:
+                st = stem(NameKey("xfmap", session=ses, fmap=fid))
+                items.append((f"{st}_{kind}.nii$FMT", f"fmap-{fid}"))
+            calls.append(_qc_call(_qc_stem("xfmap", session=ses) + f"_{kind}", items))
+    return _qc_block("cross-fmap (each group → the session reference fmap)", calls)
+
+
+def _qc_xrun(plan: Plan) -> str:
+    """Per alignment base: the runs that were aligned to it, plus the base itself.
+
+    Grouped by base, not by session: in a multi-fieldmap session each group's runs
+    land on ITS forward image, so they are only mutually comparable within a group
+    until stage07 composes the rest of the pre-chain.
+    """
+    if not _qc_on(plan):
+        return ""
+    primary = _primary_lane(plan)
+    first = _first_by_session(plan)
+    kinds = ("lin", "nl") if plan.options.xrun_nonlin else ("lin",)
+    groups: dict[tuple, QCItems] = {}
+    for pr in plan.runs:
+        base = _xrun_base(pr, first[pr.bold.session], primary)
+        if base is None:
+            continue  # this run IS the anchor; it enters as sub-brick 0 below
+        fid = pr.fmap.fmap_id if pr.fmap is not None else None
+        for kind in kinds:
+            items = groups.setdefault((pr.bold.session, fid, base, kind), [(base, "base")])
+            st = _run_stem(pr, "xrun", src=_src(primary))
+            items.append((f"{st}_{kind}.nii$FMT", _frag(pr)))
+    calls = [
+        _qc_call(_qc_stem("xrun", session=ses, fmap=fid) + f"_{kind}", items)
+        for (ses, fid, _base, kind), items in groups.items()
+    ]
+    return _qc_block("cross-run (runs → their alignment base)", calls)
+
+
+def _qc_runmean(plan: Plan) -> str:
+    """Per session, per lane: every run on that session's common grid. The first
+    stack where all of a session's runs are directly comparable."""
+    if not _qc_on(plan):
+        return ""
+    by_ses: dict[str | None, list[PlanRun]] = {}
+    for pr in plan.runs:
+        by_ses.setdefault(pr.bold.session, []).append(pr)
+    calls = [
+        _qc_call(
+            _qc_stem("runmean", session=ses, src=_src(lane)),
+            [(_aligned_mean(pr, lane), _frag(pr)) for pr in prs],
+        )
+        for lane in _qc_lanes(plan)
+        for ses, prs in by_ses.items()
+    ]
+    return _qc_block("run means (all runs of a session, on its common grid)", calls)
+
+
+def _qc_xses(plan: Plan) -> str:
+    """Every session's representative image in the reference session's space."""
+    if not _qc_on(plan) or not plan.multi_session:
+        return ""
+    primary = _primary_lane(plan)
+    lane_tag = f".src-{_src(primary)}" if _src(primary) else ""
+    ref = plan.ref_session
+    nonref = [s for s in _sessions(plan) if s is not None and s != ref]
+    calls = []
+    for kind in ("lin", "nl") if plan.options.xses_nonlin else ("lin",):
+        items: QCItems = [(_ref_image_file(plan, ref, primary), f"ref:ses-{ref}")]
+        items += [
+            (f"{stem(NameKey('xses', session=s))}{lane_tag}_{kind}.nii$FMT", f"ses-{s}")
+            for s in nonref
+        ]
+        calls.append(_qc_call(_qc_stem("xses", src=_src(primary)) + f"_{kind}", items))
+    return _qc_block("cross-session (each session → the reference session)", calls)
+
+
+def _qc_grandmean(plan: Plan) -> str:
+    """Every run of every session in grandmean space — the inputs to the grandmean,
+    stacked. The one QC that covers the whole dataset before the anat step, and the
+    place a cross-session failure shows up as a jump at a session boundary.
+
+    Single session: grandmean space IS that session's common grid, so this stack
+    would be stage07's per-session one under a second name. Skipped there.
+    """
+    if not _qc_on(plan) or not plan.multi_session:
+        return ""
+    calls = [
+        _qc_call(
+            _qc_stem("grandmean", src=_src(lane)),
+            [(_gmrun_image(pr, lane), _frag(pr)) for pr in plan.runs],
+        )
+        for lane in _qc_lanes(plan)
+    ]
+    return _qc_block("grandmean inputs (every run, in one space)", calls)
+
+
+def _qc_xref(plan: Plan) -> str:
+    """This data's grandmean against the external reference it was aligned to."""
+    opt = plan.options
+    if not (_qc_on(plan) and opt.go_to_anat and opt.has_grand_ref):
+        return ""
+    items: QCItems = [("$REFGM_EXT", "ref")]
+    for kind in ("lin", "nl") if opt.grand_reference_nonlin else ("lin",):
+        items.append((f"stage09.xref_{kind}.nii$FMT", f"grandmean_{kind}"))
+    return _qc_block("external reference", [_qc_call(_qc_stem("xref"), items)])
+
+
+def _qc_anat(plan: Plan) -> str:
+    """The EPI anchor on the anat grid, over the anat itself — the cross-modal
+    alignment check, as the two images that are supposed to overlay."""
+    if not (_qc_on(plan) and _own_anat(plan.options)):
+        return ""
+    items: QCItems = [
+        (_anat_box(), "anat"),
+        (_al_anat(plan), f"{effective_anat_source(plan)}_al_anat"),
+    ]
+    return _qc_block("EPI → anat", [_qc_call(_qc_stem("anat"), items)])
+
+
+def _qc_final(plan: Plan) -> str:
+    """THE final QC: every run's mean, in output space, in one file.
+
+    This is the whole dataset as the GLM will see it. Sub-brick 0 is the
+    warpmaster, so the stack also answers "did the data land on the grid it was
+    supposed to". Anything that moves between sub-bricks here was not fixed by any
+    earlier stage, whatever those stages' own QC stacks showed.
+    """
+    if not _qc_on(plan):
+        return ""
+    wm = ("stage10.warpmaster.nii$FMT", "warpmaster")
+    calls = [
+        _qc_call(
+            _qc_stem("final"),
+            [wm]
+            + [(f"mean_stage10.final.{_frag(pr)}.nii$FINAL_FMT", _frag(pr)) for pr in plan.runs],
+        )
+    ]
+    if plan.use_sbref:
+        calls.append(
+            _qc_call(
+                _qc_stem("final", src=LANE_SBREF),
+                [wm]
+                + [
+                    (f"stage10.final.{_frag(pr)}.src-sbref.nii$FINAL_FMT", _frag(pr))
+                    for pr in plan.runs
+                ],
+            )
+        )
+    return _qc_block("final space (per-run means — the one to look at)", calls)
 
 
 # ---------------------------------------------------------------------------
@@ -676,6 +956,19 @@ def _fmap_inherit_note(plan: Plan) -> str:
     )
 
 
+def _qc_header_note(plan: Plan) -> str:
+    """Point the reader at the QC stacks and say what they are for."""
+    if not _qc_on(plan):
+        return "\n#   QC stacks         : OFF (-no_qc)"
+    return (
+        "\n#   QC stacks         : stageNN.QC.*.nii.gz — at each level, the images that"
+        "\n#     level put in ONE space, concatenated over time. Scroll the time axis:"
+        "\n#     a jump between sub-bricks is that stage failing, and the sub-brick"
+        "\n#     label names the run/session/fieldmap. stage10.QC.final is the whole"
+        "\n#     dataset as the GLM sees it — start there, work backwards."
+    )
+
+
 def _invocation_note(invocation: str | None) -> str:
     """The ffs_autoproc command that generated this script, commented out.
 
@@ -727,7 +1020,7 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 #   phase  : {_phase_on(plan)}{_timing_header_note(plan)}
 #   sbref lane        : {plan.use_sbref}{_sbref_header_note(plan)}
 #   image lanes       : {len(_lanes(plan))}{_lane_header_note(plan)}
-#   ref image         : {opt.ref_image or "grandmean"} (session representative for xses; -ref_image){_fmap_inherit_note(plan)}
+#   ref image         : {opt.ref_image or "grandmean"} (session representative for xses; -ref_image){_fmap_inherit_note(plan)}{_qc_header_note(plan)}
 # ============================================================================={_invocation_note(invocation)}
 set -euo pipefail
 
@@ -1181,7 +1474,8 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
                 [f"-input {inputs}", "-mean", f'-prefix "{fm}"', '-device "$DEVICE"'],
             )
         )
-    return "\n".join(out) + "\n"
+    out.append(_qc_xfmap(plan))
+    return "\n".join(p for p in out if p) + "\n"
 
 
 def _stage_xrun(plan: Plan, script_stem: str) -> str:
@@ -1278,6 +1572,7 @@ fwbatch="{fwbatch}"; : > "$fwbatch"
 {lin_append}
 {nl_append}done
 {_batch_launch("ffs_allineate", "albatch", "skip_xrun")}{nl_launch}
+{_qc_xrun(plan)}
 """
 
 
@@ -1340,7 +1635,8 @@ def _stage_grandmean(plan: Plan) -> str:
                     indent="",
                 )
             )
-    return "\n".join(out) + "\n"
+    out.append(_qc_runmean(plan))
+    return "\n".join(p for p in out if p) + "\n"
 
 
 # Tokens that do NOT belong to the grandmean chain: the within-run motion the
@@ -1465,6 +1761,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
         out.append(_batch_launch("ffs_allineate", "albatch", "skip_xses"))
         if opt.xses_nonlin:
             out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xses"))
+    out.append(_qc_xses(plan))
     out.append(_stage_gmrun(plan, script_stem))
 
     # THE grandmean, composited from every run's image in grandmean space (one
@@ -1489,7 +1786,8 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                 indent="",
             )
         )
-    return "\n".join(out) + "\n"
+    out.append(_qc_grandmean(plan))
+    return "\n".join(p for p in out if p) + "\n"
 
 
 def _stage_gmrun(plan: Plan, script_stem: str) -> str:
@@ -1606,6 +1904,7 @@ REFGM_EXT="{target}"
 if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.xref.aff12.1D" ]; then
 {lin}
 {nl}fi
+{_qc_xref(plan)}
 """
 
 
@@ -1707,7 +2006,8 @@ def _stage_anat(plan: Plan) -> str:
             f'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.nlanat_invwarp.nii$FMT" ]; then\n'
             f"{seg}\nfi"
         )
-    return "\n".join(out) + "\n"
+    out.append(_qc_anat(plan))
+    return "\n".join(p for p in out if p) + "\n"
 
 
 def _fs_tpm_block(opt) -> str:
@@ -1946,6 +2246,9 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
     phase_out = (
         '  phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"\n' if _phase_on(plan) else ""
     )
+    # -save_mean is not optional: mean_stage10.final.<frag> is the per-run image
+    # the final QC stack is built from, and it costs one temporal reduction of a
+    # series ffs_nwarp already has in memory.
     return f"""
 # ============================ stage10: compose + resample ===================
 # Batched: ONE ffs_nwarp process resamples every run (startup paid once). Each
@@ -1954,6 +2257,7 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
 # read in place (NORDIC output, or BIDS magnitude with noise vols trimmed inline)
 # so no raw copy is materialised. The chain lands every run on the stage10a
 # warpmaster grid (MASTER/FINAL_DXYZ set there). skip_final=1 → -batch_skip.
+# -save_mean writes mean_stage10.final.<frag> per run — the QC stack below.
 {phase_note}echo '== stage10: final compose + resample =='
 nwarpbatch="{batchfile}"
 : > "$nwarpbatch"
@@ -1961,11 +2265,12 @@ for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
 done
 {_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
 echo 'done → stage10.final.*'
+{_qc_final(plan)}
 """
 
 
@@ -2205,6 +2510,7 @@ def write_script(
         _header(plan, out_dir, invocation),
         _data_arrays(plan),
         _preflight(plan, bids_root),
+        _qc_helper(plan),
         _stage_nordic(plan),
         _stage_unwrap(plan),
         _stage_tshift(plan),

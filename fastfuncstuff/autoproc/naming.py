@@ -29,6 +29,13 @@ went in, and which kind of alignment produced it. A ``role-ref`` marker carries
 ``_lin`` too (the identity is a linear transform), so one glob covers every unit
 at a level including the reference.
 
+QC stacks slot ``QC`` between the stage number and the label —
+``stage07.QC.runmean.ses-01.nii.gz`` — and are built by ``emit._qc_stem``, not
+``stem()``: they are not one unit's output but a *set* of units concatenated
+along time (every image that level put in one space). The uppercase token sorts
+them to the head of their stage in a listing, and ``ls *.QC.*`` is all of them.
+They are always plain ``.nii.gz``, never ``$FMT``: they exist to be opened.
+
 Transforms (``.aff12.1D``, ``_WARP``) never carry ``src-`` and never carry
 ``_lin``: a run's alignment is a property of the run, and *both* lanes are
 resampled by the same one — that shared-transform property is the point. The
