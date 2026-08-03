@@ -26,6 +26,7 @@ STAGE_TOOL: dict[str, str] = {
     "moco": "moco",
     "locomoco": "locomoco",
     "blip": "blipflip",
+    "b0fmap": "util_b0fmap",
     "xrun": "allineate",
     "xrun_nl": "formwarp",
     "xfmap": "allineate",

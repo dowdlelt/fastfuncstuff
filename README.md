@@ -33,7 +33,7 @@ cd fastfuncstuff
 **conda** (What I used, because I'm used to it):
 
 ```bash
-conda create -n ffs python=3.15
+conda create -n ffs python=3.14
 conda activate ffs
 pip install -e .
 ```
@@ -238,6 +238,7 @@ so you can drive a pipeline from a script without going through subprocess:
 
 ```python
 from fastfuncstuff.cli.reml import main as ffs_reml
+
 ffs_reml(["-input", "run*.nii.gz", "-matrix", "design.1D", "-prefix", "sub01"])
 ```
 
@@ -249,14 +250,15 @@ The library is usable directly. A skeleton:
 import fastfuncstuff as ffs
 
 device = ffs.get_device()  # CUDA / MPS / CPU
-hrf    = ffs.get_canonical_hrf(stim_duration=2.0, tr=1.5, device=device)
+hrf = ffs.get_canonical_hrf(stim_duration=2.0, tr=1.5, device=device)
 design = ffs.build_glm_design(onsets, hrf, n_timepoints=200, device=device)
 
 results = ffs.fit_glm(data, design, tr=1.5, device=device)
 # .betas, .r2, .tstats, .fstats, .sigma2, .meanvol
 
-ffs.write_glm_results_nifti(results, output_dir="./out", prefix="sub01",
-                            condition_names=["face", "house"])
+ffs.write_glm_results_nifti(
+    results, output_dir="./out", prefix="sub01", condition_names=["face", "house"]
+)
 ```
 
 Other entry points worth knowing about: `fit_glm_arma11`, `fit_glm_hrf_library`,

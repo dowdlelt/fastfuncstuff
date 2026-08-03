@@ -317,3 +317,128 @@ def test_find_events_none_for_a_task_without_them(tmp_path: Path):
     _touch(bold, {"RepetitionTime": 2.0})
     (func / "sub-ME1_ses-SM_task-floc_events.tsv").write_text("onset\n1\n")  # other task
     assert find_events(bold, tmp_path) is None
+
+
+# ---------------------------------------------------------------------------
+# GRE (B0) fieldmaps
+# ---------------------------------------------------------------------------
+
+
+def _b0_session(tmp_path: Path, fmap_files: dict[str, dict], n_runs: int = 2) -> Path:
+    ses = tmp_path / "sub-01" / "ses-01"
+    intended = []
+    for run in [f"{i + 1:02d}" for i in range(n_runs)]:
+        rel = f"ses-01/func/sub-01_ses-01_task-check_run-{run}_bold.nii.gz"
+        _touch(
+            ses / "func" / Path(rel).name,
+            {
+                "RepetitionTime": 1.5,
+                "PhaseEncodingDirection": "j-",
+                "TotalReadoutTime": 0.05,
+            },
+        )
+        intended.append(rel)
+    for name, js in fmap_files.items():
+        _touch(ses / "fmap" / name, {"IntendedFor": intended, **js})
+    return ses
+
+
+def test_b0_phasediff_form_scanned(tmp_path: Path):
+    """Siemens phasediff + two magnitudes: one GRE group, echo times in ms."""
+    _b0_session(
+        tmp_path,
+        {
+            "sub-01_ses-01_phasediff.nii.gz": {"EchoTime1": 0.00492, "EchoTime2": 0.00738},
+            "sub-01_ses-01_magnitude1.nii.gz": {},
+            "sub-01_ses-01_magnitude2.nii.gz": {},
+        },
+    )
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert fg.kind == "b0" and fg.is_b0
+    assert fg.phasediff_path is not None and fg.phase_paths == []
+    assert len(fg.magnitude_paths) == 2
+    assert fg.te_ms == [4.92, 7.38]  # BIDS seconds → the tool's ms
+    assert fg.intended_runs == [("check", "01"), ("check", "02")]
+    # A GRE sidecar carries no EPI geometry — the emitter reads those from the run.
+    assert fg.pe_dir is None and fg.readout is None
+
+
+def test_b0_phase1_phase2_form_scanned(tmp_path: Path):
+    _b0_session(
+        tmp_path,
+        {
+            "sub-01_ses-01_phase1.nii.gz": {"EchoTime": 0.00492},
+            "sub-01_ses-01_phase2.nii.gz": {"EchoTime": 0.00738},
+            "sub-01_ses-01_magnitude1.nii.gz": {},
+            "sub-01_ses-01_magnitude2.nii.gz": {},
+        },
+    )
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert [p.name for p in fg.phase_paths] == [
+        "sub-01_ses-01_phase1.nii.gz",
+        "sub-01_ses-01_phase2.nii.gz",
+    ]
+    assert fg.te_ms == [4.92, 7.38]
+
+
+def test_b0_ready_made_hz_form_scanned(tmp_path: Path):
+    """The ``fieldmap`` form is already in Hz — no echo times to find."""
+    _b0_session(
+        tmp_path,
+        {
+            "sub-01_ses-01_fieldmap.nii.gz": {"Units": "Hz"},
+            "sub-01_ses-01_magnitude.nii.gz": {},
+        },
+    )
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert fg.fieldmap_path is not None and fg.te_ms == []
+
+
+def test_magnitudes_alone_are_not_a_fieldmap(tmp_path: Path):
+    """Magnitudes with nothing to derive a field from must not produce a group —
+    silently planning distortion correction off an empty field is worse than none."""
+    _b0_session(tmp_path, {"sub-01_ses-01_magnitude1.nii.gz": {}})
+    assert scan_subject(tmp_path, "01").sessions[0].fmaps == []
+
+
+def test_pepolar_wins_over_b0_unless_asked(tmp_path: Path):
+    """A fmap/ offering both flavours: reverse-PE by default, GRE on request. Never
+    both — one session gets one kind, so every group shares an estimation framework."""
+    ses = _b0_session(
+        tmp_path,
+        {
+            "sub-01_ses-01_phasediff.nii.gz": {"EchoTime1": 0.00492, "EchoTime2": 0.00738},
+            "sub-01_ses-01_magnitude1.nii.gz": {},
+        },
+    )
+    for d, pe in (("AP", "j-"), ("PA", "j")):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_dir-{d}_epi.nii.gz",
+            {"PhaseEncodingDirection": pe, "TotalReadoutTime": 0.05},
+        )
+    (auto,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert auto.kind == "pepolar"
+    (forced,) = scan_subject(tmp_path, "01", fmap_kind="b0").sessions[0].fmaps
+    assert forced.kind == "b0"
+    (forced_pe,) = scan_subject(tmp_path, "01", fmap_kind="pepolar").sessions[0].fmaps
+    assert forced_pe.kind == "pepolar"
+
+
+def test_b0_intendedfor_on_the_magnitude_only(tmp_path: Path):
+    """quirk: some datasets put IntendedFor on the magnitude rather than the
+    fieldmap image. Taking it from wherever it is beats dropping the fieldmap."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    _touch(
+        ses / "func" / "sub-01_ses-01_task-check_run-01_bold.nii.gz",
+        {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j-"},
+    )
+    _touch(
+        ses / "fmap" / "sub-01_ses-01_phasediff.nii.gz",
+        {"EchoTime1": 0.00492, "EchoTime2": 0.00738},
+    )
+    _touch(
+        ses / "fmap" / "sub-01_ses-01_magnitude1.nii.gz",
+        {"IntendedFor": ["ses-01/func/sub-01_ses-01_task-check_run-01_bold.nii.gz"]},
+    )
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    assert fg.intended_runs == [("check", "01")]

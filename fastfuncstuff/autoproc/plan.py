@@ -27,7 +27,7 @@ mirrors how each tool stores its warp, and matches the reference scripts.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from fastfuncstuff.autoproc import config
 from fastfuncstuff.autoproc.bids import BoldRun, FmapGroup, Subject
@@ -353,10 +353,52 @@ def _pe_compatible(run: BoldRun, fg: FmapGroup) -> bool:
     (the scan is quirk-tolerant; the common case is a sidecar that omits it).
 
     Polarity matters as much as the axis: applying an AP field to a PA run doubles
-    the distortion instead of removing it.
+    the distortion instead of removing it. For a GRE group the constraint is on the
+    *warp*, not the measurement — the Hz field has no polarity — so a b0 group has
+    already been split per polarity by :func:`split_b0_by_polarity` and ``pe_dir``
+    reports which split this one is.
     """
     a, b = run.pe_dir, fg.pe_dir
     return not a or not b or a == b
+
+
+def split_b0_by_polarity(fmaps: list[FmapGroup], bold_runs: list[BoldRun]) -> list[FmapGroup]:
+    """Give each PE polarity a GRE group serves its own group (and hence its own
+    warp), leaving reverse-PE groups untouched.
+
+    A measured GRE field is polarity-free: the same Hz map corrects AP and PA runs
+    alike. The *displacement* it implies is not — it flips sign — so one group
+    cannot own one warp for both. Splitting here rather than emitting two warps per
+    group keeps the rest of the pipeline's "one fmap_id, one blip stem" invariant,
+    and the two halves land in different undistorted spaces, which cross-fmap
+    alignment (stage05) already exists to reconcile.
+
+    Groups whose runs are all one polarity (the overwhelmingly common case) come
+    back unchanged apart from ``pe_override``, so no ids churn.
+    """
+    pe_by_run = {(r.task, r.run): r.pe_dir for r in bold_runs}
+    out: list[FmapGroup] = []
+    for fg in fmaps:
+        if not fg.is_b0:
+            out.append(fg)
+            continue
+        by_pe: dict[str | None, list[tuple[str, str]]] = {}
+        for key in fg.intended_runs:
+            by_pe.setdefault(pe_by_run.get(key), []).append(key)
+        multi = len([pe for pe in by_pe if pe]) > 1
+        for pe, keys in by_pe.items():
+            # A suffix only when there is something to disambiguate; PE strings
+            # carry a '-' that would read as a separator in the filename fragment.
+            tag = (pe or "").replace("-", "neg") if multi else ""
+            out.append(
+                replace(
+                    fg,
+                    fmap_id=f"{fg.fmap_id}-{tag}" if tag else fg.fmap_id,
+                    intended_runs=keys,
+                    pe_override=pe,
+                )
+            )
+    return out
 
 
 def _fmap_for_run(
@@ -379,6 +421,14 @@ def _fmap_for_run(
             return fg, False
     if ref_fmap is not None and _pe_compatible(run, ref_fmap):
         return ref_fmap, True
+    # A GRE field measured for this session applies to this run whatever its
+    # polarity; only the warp differs, and the polarity split already built one
+    # per direction. So an unclaimed run whose PE rules the reference split out
+    # can still inherit its sibling instead of going uncorrected.
+    if ref_fmap is not None and ref_fmap.is_b0:
+        for fg in session_fmaps:
+            if fg.is_b0 and _pe_compatible(run, fg):
+                return fg, True
     return None, False
 
 
@@ -453,16 +503,20 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
 
     runs: list[PlanRun] = []
     for sess in subject.sessions:
+        # Do this before anything reads sess.fmaps: the split can change fmap_ids,
+        # and the reference group must be chosen from the post-split list.
+        sess.fmaps = split_b0_by_polarity(sess.fmaps, sess.bold_runs)
         ref_fmap = _resolve_ref_fmap(sess.fmaps, opt)
         # -distortion off (e.g. bare_bones): treat as no fmaps → no blip/xfmap,
         # xrun falls back to first-run anchoring.
         has_fmaps = bool(sess.fmaps) and opt.distortion
         # First run of the session anchors xrun when there are no fmaps.
         session_first_run = sess.bold_runs[0].run if sess.bold_runs else None
-        # Each fmap group's DISTORTED forward = the blip_up image _stage_blip feeds
-        # to ffs_blipflip, and hence the xrun base for that group: the fmap's own
+        # Each fmap group's DISTORTED forward = the image stage04 estimates the
+        # field against, and hence the xrun base for that group: the fmap's own
         # matched-PE mate when it has one (self-contained AP/PA pair), else the
-        # first intended run's rep.
+        # first intended run's rep — which is always the case for a GRE fieldmap,
+        # since a GRE acquisition is not an EPI and has no distorted mate at all.
         forward_by_fmap: dict[str, str] = {}
         if has_fmaps:
             for fg in sess.fmaps:

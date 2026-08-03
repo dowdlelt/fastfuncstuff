@@ -240,6 +240,15 @@ def build_parser() -> argparse.ArgumentParser:
         "opposite-PE fmaps when the sidecars omit PhaseEncodingDirection",
     )
     g.add_argument(
+        "-fmap_kind",
+        "-fmap-kind",
+        choices=["auto", "pepolar", "b0"],
+        default="auto",
+        help="which fieldmap flavour to use from a fmap/ that offers both: "
+        "pepolar (reverse-PE pair, ffs_blipflip) | b0 (dual-echo GRE, "
+        "ffs_util_b0fmap) | auto = pepolar when present, else b0",
+    )
+    g.add_argument(
         "-xrun_nonlin",
         "-xrun-nonlin",
         action="store_const",
@@ -705,8 +714,18 @@ def _report_fmap_assignment(subject) -> None:
             ) or "(none)"
             # A paired fmap (both PE polarities in fmap/) corrects itself; an
             # unpaired one borrows a data run as its forward image. Worth showing:
-            # it's the difference between two blip inputs and one.
-            kind = "pair" if fg.forward_path is not None else "solo"
+            # it's the difference between two blip inputs and one. A GRE fieldmap
+            # is neither — it is measured, so it names the form it was measured in.
+            if fg.is_b0:
+                kind = (
+                    "GRE phasediff"
+                    if fg.phasediff_path is not None
+                    else "GRE Hz"
+                    if fg.fieldmap_path is not None
+                    else "GRE phase1/2"
+                )
+            else:
+                kind = "pair" if fg.forward_path is not None else "solo"
             print(
                 f"    fmap-{fg.fmap_id} ({kind})  t={_fmt_time(fg.acq_time)}  →  [{items}]",
                 file=sys.stderr,
@@ -829,6 +848,7 @@ def main(argv: list[str] | None = None) -> int:
         sessions=args.session,
         tasks=args.task,
         fmap_pe_dir=args.fmap_pe_dir,
+        fmap_kind=args.fmap_kind,
     )
     if not subject.sessions:
         print("ERROR: no matching BOLD runs found", file=sys.stderr)

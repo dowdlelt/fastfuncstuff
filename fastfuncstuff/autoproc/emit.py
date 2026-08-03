@@ -38,6 +38,7 @@ _TOOLS = [
     "ffs_moco",
     "ffs_locomoco",
     "ffs_blipflip",
+    "ffs_util_b0fmap",
     "ffs_allineate",
     "ffs_formwarp",
     "ffs_segment",
@@ -276,14 +277,15 @@ def _jac_spec(pr: PlanRun) -> str:
     """``AXIS:FIELDMAP`` for ``ffs_nwarp -jac``, or ``""`` for a run with no
     fieldmap in its chain.
 
-    ffs_blipflip estimates a *geometry-only* displacement field: applying it
+    Both fieldmap tools emit a *geometry-only* displacement field: applying it
     unwarps the image but leaves the signal pile-up at compression edges, because
     the voxel that got squeezed still holds the sum of what was squeezed into it.
     The Jacobian ``1 + d(disp_pe)/d(pe)`` is what makes it quantitatively correct
-    (FSL applytopup --method=jac). blipflip's own output mean carries it already;
-    every *later* application of the same warp to raw data — the runmeans and the
-    final resample — has to ask for it explicitly, or those two images disagree
-    about intensity at exactly the places distortion was worst.
+    (FSL applytopup --method=jac). The stage04 mean carries it already (blipflip
+    applies it to its own pair; the b0 branch asks ffs_nwarp for it); every
+    *later* application of the same warp to raw data — the runmeans and the final
+    resample — has to ask for it explicitly, or those two images disagree about
+    intensity at exactly the places distortion was worst.
 
     The fieldmap is named (not left to ffs_nwarp's lone-static-warp auto-detect):
     the chain also carries locomoco's per-frame PE warp, and only the fieldmap's
@@ -291,8 +293,7 @@ def _jac_spec(pr: PlanRun) -> str:
     """
     if pr.fmap is None or "blip_half" not in pr.warp_chain:
         return ""
-    pe = pr.fmap.pe_dir or pr.bold.pe_dir or "j"
-    axis = "".join(c for c in pe if c.isalpha()) or "j"
+    axis = "".join(c for c in _fmap_pe(pr) if c.isalpha()) or "j"
     return f"{axis}:{_fmap_stem(pr, 'blip')}_warp.nii$FMT"
 
 
@@ -1146,6 +1147,14 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         | {str(pr.bold.phase_path) for pr in plan.runs if pr.bold.phase_path}
         | {str(pr.fmap.reverse_path) for pr in plan.runs if pr.fmap}
         | {str(pr.fmap.forward_path) for pr in plan.runs if pr.fmap and pr.fmap.forward_path}
+        # A GRE fieldmap is several files, and reverse_path names only the first:
+        # the magnitudes it is masked and matched with are just as load-bearing.
+        | {
+            str(p)
+            for pr in plan.runs
+            if pr.fmap
+            for p in [*pr.fmap.phase_paths, *pr.fmap.magnitude_paths]
+        }
         # SBRefs are load-bearing once the lane is on (moco base, xrun source,
         # the whole sbmean pyramid) — a missing one should fail here, not midway.
         | {str(pr.bold.sbref_path) for pr in plan.runs if pr.use_sbref}
@@ -1354,6 +1363,15 @@ done
 """
 
 
+def _fmap_pe(pr: PlanRun) -> str:
+    """The signed PE direction the fieldmap's warp is built for (``j-``, ``i``…).
+
+    The group's own value when it has one — a reverse-PE fmap's polarity is a
+    property of the acquisition, and a split GRE group carries its polarity in
+    ``pe_override`` — else the run's."""
+    return (pr.fmap.pe_dir if pr.fmap else None) or pr.bold.pe_dir or "j"
+
+
 def _stage_blip(plan: Plan) -> str:
     groups: dict[tuple, PlanRun] = {}
     for pr in plan.runs:
@@ -1362,11 +1380,17 @@ def _stage_blip(plan: Plan) -> str:
         groups.setdefault((pr.bold.session, pr.fmap.fmap_id), pr)
     if not groups:
         return ""
-    out = ["", "# ============================ stage04: fieldmap (blipflip) =================="]
+    kinds = {pr.fmap.kind for pr in groups.values() if pr.fmap}
+    tool = "b0fmap" if kinds == {"b0"} else "blipflip"
+    out = ["", f"# ============================ stage04: fieldmap ({tool}) " + "=" * 18]
     out.append("echo '== stage04: distortion correction =='")
     for pr in groups.values():
+        assert pr.fmap is not None
         st = _fmap_stem(pr, "blip")
-        pe = "".join(c for c in (pr.fmap.pe_dir or pr.bold.pe_dir or "j") if c.isalpha()) or "j"
+        if pr.fmap.is_b0:
+            out.append(_blip_b0(pr, st))
+            continue
+        pe = "".join(c for c in _fmap_pe(pr) if c.isalpha()) or "j"
         ro = f"-readout {pr.fmap.readout}" if pr.fmap.readout else ""
         # blip_up: the fmap's own matched-PE image when the pair is self-contained,
         # else this run's rep (the only forward image there is).
@@ -1385,6 +1409,110 @@ def _stage_blip(plan: Plan) -> str:
         )
         out.append(f'if [ "$skip_blip" -ne 1 ] || [ ! -f "{st}_warp.nii$FMT" ]; then\n{cmd}\nfi')
     return "\n".join(out) + "\n"
+
+
+def _blip_b0(pr: PlanRun, st: str) -> str:
+    """One GRE fieldmap group: ffs_util_b0fmap, then the ``_mean`` the rest of the
+    pipeline expects from this stage.
+
+    Two things a reverse-PE pair gives for free and a GRE fieldmap does not:
+
+    * **The EPI geometry.** A GRE sidecar has echo times, not a phase-encode
+      direction or a readout — the field is measured in a sequence that has no
+      EPI distortion of its own. Both come from the run instead, and ``-readout``
+      is not optional for a measured field (it sets the Hz→voxel scale), so a run
+      whose sidecar omits ``TotalReadoutTime`` is reported here rather than
+      failing inside the tool.
+    * **An undistorted mean.** blipflip corrects its own pair and writes their
+      mean, which is what defines the session's common grid (every ``_ref_blip_mean``
+      consumer downstream). There is no EPI pair here, so we make the same image
+      the same way the final resample will: pull the run's rep through the warp
+      with the Jacobian, which is what keeps this image and the runmeans agreeing
+      about intensity where distortion was worst (see :func:`_jac_spec`).
+    """
+    fmap = pr.fmap
+    assert fmap is not None
+    pe = _fmap_pe(pr)
+    axis = "".join(c for c in pe if c.isalpha()) or "j"
+    epi = pr.fmap_forward or str(pr.bold.rep)
+    readout = fmap.readout if fmap.readout is not None else pr.bold.json.get("TotalReadoutTime")
+    if readout is None:
+        return (
+            f'echo "ffs_autoproc: fmap-{fmap.fmap_id} is a GRE fieldmap but '
+            f'no TotalReadoutTime was found for its runs;" >&2\n'
+            f'echo "  a measured field has an absolute Hz scale, so the readout '
+            f'cannot be inferred. Aborting." >&2\nexit 1'
+        )
+    if fmap.phasediff_path is not None:
+        src = [f"-phasediff {shlex.quote(str(fmap.phasediff_path))}"]
+    elif fmap.fieldmap_path is not None:
+        src = [f"-fieldmap {shlex.quote(str(fmap.fieldmap_path))}"]
+    else:
+        src = ["-phase " + " ".join(shlex.quote(str(p)) for p in fmap.phase_paths)]
+    mags = " ".join(shlex.quote(str(p)) for p in fmap.magnitude_paths)
+    cmd = _ffs(
+        "ffs_util_b0fmap",
+        [
+            *src,
+            f"-magnitude {mags}" if mags else "",
+            f"-epi {shlex.quote(epi)}",
+            f"-pe_dir {pe}",
+            f"-readout {readout}",
+            "-te " + " ".join(f"{t:g}" for t in fmap.te_ms) if fmap.te_ms else "",
+            *_split_flags(config.DEFAULT_OPTS["b0fmap"]),
+            f'-prefix "{st}.nii$FMT"',
+            '-device "$DEVICE"',
+        ],
+    )
+    # A static warp is applied identically to every volume, so collapsing before
+    # or after it gives the same image — but only ffs_nwarp can collapse, so a 4-D
+    # anchor pays for a full warped timeseries it then throws away. A 3-D anchor
+    # (the SBRef case, and most fieldmap datasets have one) warps straight to the
+    # mean with no intermediate at all.
+    if _n_volumes(epi) > 1:
+        tmp = f"{st}_unwarped.nii$FMT"
+        mean = _ffs(
+            "ffs_nwarp",
+            [
+                f"-source {shlex.quote(epi)}",
+                f"-master {shlex.quote(epi)}",
+                f'-nwarp "{st}_warp.nii$FMT"',
+                f"-jac {axis}",
+                "-save_mean",
+                f'-prefix "{tmp}"',
+                '-device "$DEVICE"',
+            ],
+        )
+        mean += f'\n  mv -f "mean_{st}_unwarped.nii$FMT" "{st}_mean.nii$FMT"\n  rm -f "{tmp}"'
+    else:
+        mean = _ffs(
+            "ffs_nwarp",
+            [
+                f"-source {shlex.quote(epi)}",
+                f"-master {shlex.quote(epi)}",
+                f'-nwarp "{st}_warp.nii$FMT"',
+                f"-jac {axis}",
+                f'-prefix "{st}_mean.nii$FMT"',
+                '-device "$DEVICE"',
+            ],
+        )
+    return (
+        f'if [ "$skip_blip" -ne 1 ] || [ ! -f "{st}_warp.nii$FMT" ]; then\n{cmd}\nfi\n'
+        f'if [ "$skip_blip" -ne 1 ] || [ ! -f "{st}_mean.nii$FMT" ]; then\n{mean}\nfi'
+    )
+
+
+def _n_volumes(path: str) -> int:
+    """Volume count of an input, read from its header at emit time (the file is on
+    disk — the scanner just read its sidecar). Unreadable → 2, i.e. take the branch
+    that is correct for both cases."""
+    try:
+        import nibabel as nib
+
+        shape: tuple[int, ...] = tuple(getattr(nib.load(path), "shape", ()))
+    except Exception:
+        return 2
+    return int(shape[3]) if len(shape) > 3 else 1
 
 
 def _stage_xfmap(plan: Plan, script_stem: str) -> str:
@@ -2055,16 +2183,19 @@ def _segment_input(plan: Plan) -> str:
     blipfor    → the first fmap group's undistorted forward frame.
     blip_pair  → forward ``[0]`` + reverse ``[1]`` of the blipflip unwarped pair
                  (topup-style; matches the reference `primary` script).
-    Falls back to grandmean (with a note) when no fmap exists.
+    Falls back to grandmean (with a note) when no fmap exists, and likewise for a
+    GRE fieldmap: both modes read the blipflip unwarped *pair*, which a measured
+    field has no counterpart to — there is only ever one EPI.
     """
     mode = plan.options.anat_nonlin_input
     blip = None
     for pr in plan.runs:
-        if pr.fmap is not None:
+        if pr.fmap is not None and not pr.fmap.is_b0:
             blip = _fmap_stem(pr, "blip")
             break
     if mode in ("blipfor", "blip_pair") and blip is None:
-        return f'-input "{_grandmean()}"  # (no fmap; fell back from {mode})'
+        why = "no reverse-PE fmap" if any(pr.fmap for pr in plan.runs) else "no fmap"
+        return f'-input "{_grandmean()}"  # ({why}; fell back from {mode})'
     if mode == "blipfor":
         return f'-input "{blip}_unwarped.nii$FMT[0]"'
     if mode == "blip_pair":

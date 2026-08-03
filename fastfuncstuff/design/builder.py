@@ -171,7 +171,11 @@ def parse_afni_timing_file(filepath: str | Path) -> list[np.ndarray]:
     AFNI timing files have one row per run, with onset times in seconds
     separated by spaces. Special cases:
     - Empty row: no events in that run
-    - '* *' (two asterisks): condition not present in that run (AFNI convention)
+    - '*' is a placeholder, never an onset. A row of only asterisks ('*',
+      '* *', ...) means the condition is absent from that run; a leading '*'
+      next to real onsets is AFNI's disambiguator for a single-event row
+      ('* 12.5') and is simply dropped.
+    - '#' starts a comment; comment-only lines do not consume a run.
 
     Parameters
     ----------
@@ -215,24 +219,24 @@ def parse_afni_timing_file(filepath: str | Path) -> list[np.ndarray]:
 
     with open(filepath) as f:
         for line in f:
-            line = line.strip()
+            if line.lstrip().startswith("#"):
+                # Whole-line comment: not a run.
+                continue
+            line = line.split("#", 1)[0].strip()
 
             if not line:
                 # Empty line = no events in this run
                 onsets_by_run.append(np.array([]))
-            else:
-                # Check for '* *' marker (condition not present)
-                tokens = line.split()
-                if len(tokens) == 2 and tokens[0] == "*" and tokens[1] == "*":
-                    # Condition not present in this run
-                    onsets_by_run.append(np.array([]))
-                else:
-                    # Parse onset times
-                    try:
-                        onsets = np.array([float(x) for x in tokens])
-                        onsets_by_run.append(onsets)
-                    except ValueError as e:
-                        raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}") from e
+                continue
+
+            # Asterisks are placeholders, not onsets: drop them and let an
+            # all-asterisk row fall through to the empty-run case.
+            tokens = [tok for tok in line.split() if tok != "*"]
+            try:
+                onsets = np.array([float(x) for x in tokens])
+            except ValueError as e:
+                raise ValueError(f"Could not parse line '{line}' in {filepath}: {e}") from e
+            onsets_by_run.append(onsets)
 
     return onsets_by_run
 
@@ -985,6 +989,18 @@ def build_design_matrix(
         im_mode = [im_mode] * n_stim  # Broadcast to all stimuli
     elif len(im_mode) != n_stim:
         raise ValueError(f"im_mode length ({len(im_mode)}) must match n_stim ({n_stim})")
+
+    # A condition with no events anywhere is an all-zero column (or, under IM,
+    # no column at all) — rank-deficient and silently poisonous downstream.
+    # Conditions present in only *some* runs are fine: the column is simply
+    # zero over the runs that lack them.
+    empty_stims = [stim_labels[s] for s in range(n_stim) if not any(len(r) for r in all_onsets[s])]
+    if empty_stims:
+        raise ValueError(
+            f"Condition(s) {empty_stims} have no events in any run — that is an "
+            "all-zero regressor and makes the design rank-deficient. Drop them "
+            "from the design (and from any contrasts that reference them)."
+        )
 
     # Count total stimulus columns (depends on IM mode)
     # Non-IM: 1 column per stimulus

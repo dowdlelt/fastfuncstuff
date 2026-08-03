@@ -31,6 +31,10 @@ DEFAULT_OPTS: dict[str, str] = {
     "locomoco": "-backend flow -superhard -no_movie -ref mean -want_pcs 3",
     # fieldmap distortion (blipflip); reproduces FSL b02b0 by default.
     "blip": "-workhard",
+    # measured GRE fieldmap (b0fmap). Defaults are the tool's own — the field
+    # conditioning was tuned there against real sinus gradients, so overriding it
+    # here would silently diverge from what the tool was validated with.
+    "b0fmap": "",
     # cross-run linear: rigid lpa to the fmap/first-run reference. -final wsinc5:
     # these aligned means feed the grandmean, so a sharper single resample avoids
     # accumulating interpolation blur down the chain (applies to every allineate).
