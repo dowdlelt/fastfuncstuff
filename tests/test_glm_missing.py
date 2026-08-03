@@ -173,8 +173,10 @@ def test_family_rejected_when_a_task_regressor_does_not_survive():
         min_family_voxels=10,
         design=design,
         task_indices=[0, 1],
+        min_task_mass=0.0,  # the default: no precision floor at all
         verbose=False,
     )
+    # Rejected on ESTIMABILITY, not on any tunable threshold.
     assert fams == []
     assert int(demoted.sum()) == 150
 
@@ -471,3 +473,113 @@ def test_subset_run_validity_matches_manual_indexing():
     assert sub.valid.shape == (9, NRUN)
     assert torch.equal(sub.valid, v.valid[mask])
     assert sub.negative_rule_active == v.negative_rule_active
+
+
+# ── estimability vs precision ───────────────────────────────────────────────
+
+
+def _blocked_design():
+    """Condition A only in run 0, condition B only in run 1."""
+    a, b = np.zeros(T), np.zeros(T)
+    a[:NT] = np.tile([1.0, 0.0], NT // 2)
+    b[NT : 2 * NT] = np.tile([1.0, 0.0], NT // 2)
+    return torch.from_numpy(np.column_stack([a, b]).astype(np.float32))
+
+
+def _every_run_design():
+    """Both conditions present in every run -- the common case."""
+    a, b = np.zeros(T), np.zeros(T)
+    for r in range(NRUN):
+        a[r * NT : r * NT + 20] = 1.0
+        b[r * NT + 30 : r * NT + 50] = 1.0
+    return torch.from_numpy(np.column_stack([a, b]).astype(np.float32))
+
+
+def _families_for(design, dead_runs, **kw):
+    d = _data(n_voxels=300)
+    for r in dead_runs:
+        d[:150, r * NT : (r + 1) * NT] = 0.0
+    v = detect_run_validity(d, RUN_STARTS, verbose=False)
+    return build_families(
+        v,
+        RUN_STARTS,
+        T,
+        min_family_voxels=10,
+        design=design,
+        task_indices=[0, 1],
+        verbose=False,
+        **kw,
+    )
+
+
+def test_unestimable_condition_always_rejected_even_with_no_floors():
+    """A condition with NO data in the surviving runs can never be fitted."""
+    fams, demoted = _families_for(_blocked_design(), [1], min_task_mass=0.0, min_task_runs=1)
+    assert fams == []
+    assert int(demoted.sum()) == 150
+
+
+def test_weakly_sampled_but_estimable_is_kept_by_default():
+    """Present in every run, only 1 of 3 surviving: estimable, so keep it.
+
+    The dof accounting reports the reduced precision honestly; throwing the
+    voxel away instead would discard real data for no statistical reason.
+    """
+    fams, demoted = _families_for(_every_run_design(), [1, 2])
+    assert len(fams) == 1
+    assert fams[0].n_runs_kept == 1
+    assert not bool(demoted.any())
+
+
+def test_precision_floor_rejects_only_when_asked():
+    design = _every_run_design()
+    kept, _ = _families_for(design, [1, 2], min_task_mass=0.0)
+    assert len(kept) == 1
+    dropped, demoted = _families_for(design, [1, 2], min_task_mass=0.5)
+    assert dropped == []
+    assert int(demoted.sum()) == 150
+
+
+def test_min_task_runs_floor():
+    design = _every_run_design()
+    assert len(_families_for(design, [2], min_task_runs=2)[0]) == 1  # 2 runs survive
+    assert _families_for(design, [1, 2], min_task_runs=2)[0] == []  # only 1 survives
+
+
+def test_task_runs_present_counts_runs_not_mass():
+    """The two measures genuinely differ; that is why both flags exist."""
+    from fastfuncstuff.glm.missing import task_runs_present
+
+    blocked = _blocked_design()
+    good = list(range(NT))  # keep run 0 only
+    # A keeps 100% of its mass from that single run...
+    assert float(task_survival(blocked, [0], good)[0]) == pytest.approx(1.0)
+    # ...but is observed in exactly one run.
+    assert task_runs_present(blocked, [0, 1], good, RUN_STARTS, T).tolist() == [1, 0]
+
+    every = _every_run_design()
+    good2 = list(range(2 * NT))
+    assert float(task_survival(every, [0], good2)[0]) == pytest.approx(2 / 3, abs=1e-6)
+    assert task_runs_present(every, [0, 1], good2, RUN_STARTS, T).tolist() == [2, 2]
+
+
+def test_rank_deficient_censored_design_rejected():
+    """Two regressors that become collinear once a run is censored."""
+    from fastfuncstuff.glm.missing import censored_design_is_full_rank
+
+    a, b = np.zeros(T), np.zeros(T)
+    a[:NT] = np.tile([1.0, 0.0], NT // 2)
+    b[:NT] = np.tile([1.0, 0.0], NT // 2)  # identical to a in run 0
+    b[NT : 2 * NT] = np.tile([1.0, 0.0], NT // 2)  # separable only via run 1
+    design = torch.from_numpy(np.column_stack([a, b]).astype(np.float32))
+
+    assert censored_design_is_full_rank(design, list(range(2 * NT)))
+    # Censor run 1 and the two columns are identical -> not identifiable, even
+    # though BOTH retain plenty of mass.
+    assert not censored_design_is_full_rank(design, list(range(NT)))
+    mass = task_survival(design, [0, 1], list(range(NT)))
+    assert float(mass.min()) > 0.4  # mass alone would have let this through
+
+    fams, demoted = _families_for(design, [1], min_task_mass=0.0)
+    assert fams == []
+    assert int(demoted.sum()) == 150

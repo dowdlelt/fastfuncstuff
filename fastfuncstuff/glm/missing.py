@@ -364,6 +364,59 @@ def task_survival(
     return torch.where(total > 0, retained / total, torch.ones_like(total))
 
 
+# Retained design mass at or below this counts as "this regressor is simply not
+# present in the surviving runs" rather than "present but weakly sampled".
+ESTIMABLE_EPS = 1e-9
+
+
+def task_runs_present(
+    design: torch.Tensor,
+    task_indices: list[int] | None,
+    good_list: list[int],
+    run_starts: list[int],
+    n_timepoints: int,
+) -> torch.Tensor:
+    """How many *surviving* runs each task regressor actually has events in.
+
+    Distinct from :func:`task_survival`: mass answers "how much of this
+    regressor is left", this answers "in how many runs is it observed at all".
+    A design where a condition appears in one run only can retain 100% of its
+    mass from a single surviving run, and a design where it appears everywhere
+    can retain 6% and still be observed in every run that survived.
+    """
+    if not task_indices:
+        return torch.zeros(0, dtype=torch.long)
+    starts = [int(s) for s in run_starts] or [0]
+    ends = starts[1:] + [int(n_timepoints)]
+    keep = set(int(t) for t in good_list)
+    cols = torch.as_tensor(task_indices, dtype=torch.long, device=design.device)
+    sub = design.index_select(1, cols).double()
+
+    counts = torch.zeros(len(task_indices), dtype=torch.long)
+    for s, e in zip(starts, ends, strict=True):
+        rows = [t for t in range(s, e) if t in keep]
+        if not rows:
+            continue
+        idx = torch.as_tensor(rows, dtype=torch.long, device=design.device)
+        present = sub.index_select(0, idx).pow(2).sum(dim=0) > ESTIMABLE_EPS
+        counts += present.cpu().long()
+    return counts
+
+
+def censored_design_is_full_rank(design: torch.Tensor, good_list: list[int]) -> bool:
+    """Can the censored design be fitted at all?
+
+    Retained mass per column is necessary but not sufficient: dropping runs can
+    make two task regressors collinear with each other even though both still
+    carry plenty of mass, and that is a rank deficiency the per-column test
+    cannot see. One SVD per family is nothing next to the fit it guards.
+    """
+    sub, _ = censor_design(design, good_list)
+    if sub.numel() == 0 or sub.shape[1] == 0:
+        return False
+    return int(torch.linalg.matrix_rank(sub.double())) == int(sub.shape[1])
+
+
 def build_families(
     validity: RunValidity,
     run_starts: list[int],
@@ -375,7 +428,8 @@ def build_families(
     min_runs: int = 1,
     design: torch.Tensor | None = None,
     task_indices: list[int] | None = None,
-    min_task_mass: float = 0.25,
+    min_task_mass: float = 0.0,
+    min_task_runs: int = 1,
     verbose: bool = True,
 ) -> tuple[list[MissingFamily], torch.Tensor]:
     """Partition partially-valid voxels into families sharing a run pattern.
@@ -388,17 +442,34 @@ def build_families(
     REML fit with its own autocorrelation cache (which is keyed on timepoint
     count and so cannot be shared), making family count the dominant cost.
 
-    When ``design`` and ``task_indices`` are given, a family is also rejected
-    unless **every** task regressor retains at least ``min_task_mass`` of its
-    design mass. A voxel that can estimate one condition but not another is a
-    degenerate contrast waiting to happen, and requiring all of them to survive
-    has a useful side effect: every surviving family carries the full task column
-    set, so contrasts are always defined and the output bucket layout is uniform
-    across families. Only polynomial columns ever drop.
+    When ``design`` and ``task_indices`` are given, two *different* things are
+    checked and it matters that they are not confused:
 
-    Families that are too small, keep too few runs, fail the task-survival check,
-    or fall outside ``max_families`` are *not* returned; their voxels come back in
-    the ``demoted`` mask for the caller to drop from the analysis mask instead.
+    **Estimability — a hard constraint, never tunable.** If a condition is only
+    ever presented in run 1 and a family censors run 1, that condition has no
+    data at all: its column is identically zero, its beta is undefined, and any
+    contrast touching it is meaningless. The same applies when censoring makes
+    two task regressors collinear, which per-column mass cannot see, so the
+    censored design is also rank-checked. Families failing either are always
+    rejected. Requiring every task regressor to survive has a useful side
+    effect: each surviving family carries the full task column set, so contrasts
+    stay defined and the bucket layout is uniform. Only nuisance columns drop.
+
+    **Precision — a soft preference, off by default.** A condition observed in
+    every run but retaining only 24% of its mass *is* estimable; it is simply
+    estimated from less data. That is not a reason to discard the voxel, because
+    the dof accounting already reports it honestly: fewer degrees of freedom, a
+    larger standard error, and a z-score at the voxel's true dof. So
+    ``min_task_mass`` defaults to 0 (no floor) and ``min_task_runs`` to 1
+    (observed at all). Raise them only if you would rather drop weakly-sampled
+    voxels than read an honest, unimpressive statistic — the usual reason being
+    that the *Coef* map still shows a large noisy value that people threshold on
+    by eye.
+
+    Families that are too small, keep too few runs, are unestimable, fall below a
+    requested precision floor, or fall outside ``max_families`` are *not*
+    returned; their voxels come back in the ``demoted`` mask for the caller to
+    drop from the analysis mask instead.
 
     Returns
     -------
@@ -448,18 +519,47 @@ def build_families(
             for t in range(s, e)
         ]
         if design is not None and task_indices:
+            reason = None
             mass = task_survival(design, task_indices, good_list)
-            if bool((mass < min_task_mass).any()):
-                # Cannot see every condition -> its contrasts would be degenerate.
+
+            # (1) Estimability — always enforced, whatever the thresholds say.
+            if bool((mass <= ESTIMABLE_EPS).any()):
+                dead = [task_indices[i] for i, m in enumerate(mass.tolist()) if m <= ESTIMABLE_EPS]
+                reason = (
+                    f"task regressor(s) {dead} have NO data in the surviving runs "
+                    "— unestimable, so every contrast touching them would be meaningless"
+                )
+            elif not censored_design_is_full_rank(design, good_list):
+                reason = (
+                    "the censored design is rank-deficient (censoring made "
+                    "regressors collinear), so the fit is not identifiable"
+                )
+            else:
+                # (2) Precision — only if the user asked for a floor.
+                n_runs_seen = task_runs_present(
+                    design, task_indices, good_list, run_starts, n_timepoints
+                )
+                if min_task_runs > 1 and bool((n_runs_seen < min_task_runs).any()):
+                    reason = (
+                        f"a task regressor is observed in only "
+                        f"{int(n_runs_seen.min())} surviving run(s) "
+                        f"(-guard_min_task_runs {min_task_runs})"
+                    )
+                elif min_task_mass > 0.0 and bool((mass < min_task_mass).any()):
+                    reason = (
+                        f"a task regressor retains only {float(mass.min()):.0%} of its "
+                        f"design mass (-guard_min_task_mass {min_task_mass:.0%}). It is "
+                        "estimable — just from less data — so consider lowering or "
+                        "removing this floor and reading the z-score instead"
+                    )
+
+            if reason is not None:
                 demoted[members] = True
                 n_rejected_task += 1
                 if verbose:
-                    worst = float(mass.min())
                     print(
-                        f"    ✗ {_pattern_label(pattern)}: rejected, a task regressor "
-                        f"retains only {worst:.0%} of its design mass "
-                        f"(need {min_task_mass:.0%}) — {int(members.numel()):,} voxels "
-                        "demoted to the guard"
+                        f"    ✗ {_pattern_label(pattern)}: rejected — {reason}; "
+                        f"{int(members.numel()):,} voxels demoted to the guard"
                     )
                 continue
         families.append(MissingFamily(pattern=pattern, voxel_indices=members, good_list=good_list))

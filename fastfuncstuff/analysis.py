@@ -413,7 +413,8 @@ def analyze_from_design_matrix(
     handle_missing: bool = False,
     missing_min_family: int = 50,
     missing_max_families: int = 32,
-    missing_min_task_mass: float = 0.25,
+    missing_min_task_mass: float = 0.0,
+    missing_min_task_runs: int = 1,
 ) -> tuple[GLMResults | ARMA11Results, dict]:
     """
     Complete analysis pipeline: AFNI design matrix → GLM results
@@ -1467,6 +1468,7 @@ def analyze_from_design_matrix(
             design=design,
             task_indices=stim_indices if stim_indices else None,
             min_task_mass=missing_min_task_mass,
+            min_task_runs=missing_min_task_runs,
         )
 
         _shared_kwargs = dict(

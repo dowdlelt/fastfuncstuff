@@ -689,12 +689,29 @@ Examples:
         "-guard-min-task-mass",
         dest="guard_min_task_mass",
         type=float,
-        default=0.25,
+        default=0.0,
         metavar="FRAC",
-        help="Fraction of a task regressor's design mass that must survive "
-        "censoring for a family to be fitted (default 0.25). A voxel that can "
-        "estimate one condition but not another makes degenerate contrasts, so "
-        "such families are dropped from the mask instead.",
+        help="Optional PRECISION floor: fraction (0-1) of a task regressor's "
+        "design mass that must survive censoring for a family to be fitted. "
+        "Default 0 = no floor, because a regressor estimated from fewer runs is "
+        "still estimable and the dof accounting already reports it honestly "
+        "(fewer dof, bigger SE, correct z). Raise it only if you would rather "
+        "discard weakly-sampled voxels than read an unimpressive statistic. "
+        "Unestimability — a condition with NO data in the surviving runs, or a "
+        "rank-deficient censored design — is always rejected regardless.",
+    )
+    missing_opts.add_argument(
+        "-guard_min_task_runs",
+        "-guard-min-task-runs",
+        dest="guard_min_task_runs",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Optional PRECISION floor expressed in runs: each task regressor "
+        "must be observed in at least N surviving runs (default 1 = observed at "
+        "all). Use this rather than -guard_min_task_mass when you think in runs; "
+        "the two are not interchangeable, since a condition presented in only "
+        "one run keeps 100%% of its mass from that single run.",
     )
 
     proc_opts.add_argument(
@@ -2729,6 +2746,7 @@ def main():
             missing_min_family=args.guard_min_family,
             missing_max_families=args.guard_max_families,
             missing_min_task_mass=args.guard_min_task_mass,
+            missing_min_task_runs=args.guard_min_task_runs,
         )
 
         # ── Missing-data bookkeeping ─────────────────────────────────────────
