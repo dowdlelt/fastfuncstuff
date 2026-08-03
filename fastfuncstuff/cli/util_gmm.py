@@ -38,6 +38,7 @@ from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_hea
 from fastfuncstuff.decomposition import io as decomposition_io
 from fastfuncstuff.decomposition.tools import batch_mixture_zscores
 from fastfuncstuff.io.afni import load_nifti, save_nifti
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -124,6 +125,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     _pfx = parse_prefix(args.prefix)
     out_prefix, nii_ext = _pfx.stem, _pfx.nifti_ext

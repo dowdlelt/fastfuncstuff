@@ -20,6 +20,16 @@ dependencies = [
     "h5py>=3.8",
     "pyyaml>=6.0",
     "warpkit>=1.2",
+    # Connected components for the ffs_perm cluster tables. stats/cluster.py
+    # imports cc3d at module scope and ffs_perm imports that unconditionally,
+    # so this is required, not optional.
+    "connected-components-3d>=3.10",
+    # Single-pass DSU cluster extent (stats/cluster_fast.py) -- the *default*
+    # ffs_perm path, not an accelerator you can skip.
+    "numba>=0.58",
+    # memory.py falls back to assuming 8 GB of RAM without this, which badly
+    # under-chunks every GPU path on a large host.
+    "psutil>=5.9",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -47,6 +57,11 @@ dynamics = [
     "nilearn>=0.10",
     "osl-dynamics>=1.2",
     "cebra>=0.4",
+]
+# Movie/GIF writing for the ffs_locomoco diagnostic frames (imageio is used
+# only when ffmpeg is unavailable or a GIF is asked for).
+viz = [
+    "imageio>=2.31",
 ]
 
 [project.scripts]

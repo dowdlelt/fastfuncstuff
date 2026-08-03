@@ -48,7 +48,7 @@ from fastfuncstuff.dynamics.parcellate import (
 from fastfuncstuff.dynamics.preprocess import preprocess_sessions
 from fastfuncstuff.dynamics.states import compute_state_stats
 from fastfuncstuff.dynamics.switching import compute_switch_stats
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends, get_device
 
 
 def _ldim(value: str):
@@ -616,6 +616,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     print_cli_header("ffs_bsds", "Bayesian Switching Dynamical Systems")
     device = get_device(args.device)
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     sessions_np, labels = _load_sessions(args)
     print(

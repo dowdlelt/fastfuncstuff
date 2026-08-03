@@ -61,6 +61,7 @@ from fastfuncstuff.processing.optiwarp import (
     optiwarp,
 )
 from fastfuncstuff.processing.warp import QwarpConfig
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -499,6 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         device = torch.device("cpu")
         if args.verb >= 1:
             print("WARNING: no GPU available, running on CPU")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     if args.verb >= 1:
         print(f"ffs_optiwarp: device={device}")

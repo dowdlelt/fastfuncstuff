@@ -22,9 +22,11 @@ from fastfuncstuff.io.afni import (
     load_afni_mask,
     load_and_concatenate_runs,
     load_nifti,
+    nifti_shape,
     onsets_to_binary_matrix,
     read_afni_design_matrix,
     read_afni_onset_files,
+    read_nifti_header,
 )
 
 from .utils import get_device, to_tensor
@@ -543,15 +545,18 @@ def analyze_from_design_matrix(
         if not first_path.exists():
             raise FileNotFoundError(f"Run file not found: {first_path}")
 
-        first_img = load_nifti(first_path)
-        if len(first_img.shape) < 4:
+        # Header only: nothing here touches the payload, and the runs are about
+        # to be decoded by the shared loader anyway.
+        first_shape = nifti_shape(first_path)
+        if len(first_shape) < 4:
             raise ValueError(
-                f"Expected 4D fMRI runs, but '{first_path.name}' has shape {first_img.shape}"
+                f"Expected 4D fMRI runs, but '{first_path.name}' has shape {first_shape}"
             )
 
-        volume_shape = tuple(int(dim) for dim in first_img.shape[:3])
-        affine = first_img.affine
-        nifti_header = first_img.header  # Capture full header for cache
+        first_hdr = read_nifti_header(first_path)
+        volume_shape = tuple(int(dim) for dim in first_shape[:3])
+        affine = first_hdr.get_best_affine()
+        nifti_header = first_hdr  # Capture full header for cache
 
         loader_mask_flat: np.ndarray | None = None
         if use_loader_mask:
@@ -603,11 +608,15 @@ def analyze_from_design_matrix(
             fmri_path = Path(fmri_data)
             if not fmri_path.exists():
                 raise FileNotFoundError(f"fMRI data file not found: {fmri_path}")
-            img = load_nifti(fmri_path)
-            if len(img.shape) >= 3:
-                volume_shape = tuple(int(dim) for dim in img.shape[:3])
-            affine = img.affine
-            nifti_header = img.header  # Capture full header for cache
+            # _load_fmri_data already read this file; re-reading it through
+            # load_nifti decompressed the whole payload a second time purely
+            # for geometry. Header-only gives the same three values.
+            shape = nifti_shape(fmri_path)
+            if len(shape) >= 3:
+                volume_shape = tuple(int(dim) for dim in shape[:3])
+            hdr = read_nifti_header(fmri_path)
+            affine = hdr.get_best_affine()
+            nifti_header = hdr  # Capture full header for cache
 
     # data should be (n_voxels, n_timepoints)
     if data.ndim == 4:

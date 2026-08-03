@@ -29,6 +29,7 @@ from fastfuncstuff.processing.autobox import (
 )
 from fastfuncstuff.processing.grid import afni_orient_code, grid_extent_rai
 from fastfuncstuff.processing.io import load_image, save_image
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -158,6 +159,7 @@ def _ijkord_rows(orient: str, bounds: tuple[int, ...]) -> list[tuple[str, int, i
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     verb = args.verb
 
     t0 = time.time()

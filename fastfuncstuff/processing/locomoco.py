@@ -32,6 +32,7 @@ future NVIDIA-hardware / RAFT backend can slot in behind the same signature.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import numpy as np
@@ -87,8 +88,15 @@ def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     # ``replicate`` (not ``reflect``) so a blur radius larger than the plane still
     # pads: automask crops edge slices to tiny in-brain bounding boxes (e.g. 10x7),
     # and reflect requires pad < dim. Matches _gaussian_blur3d.
-    x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
-    x = F.conv2d(F.pad(x, (r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1))
+    #
+    # One 4-sided pad, not one per axis. Replicate padding along W copies whole
+    # columns and the vertical pass is per-column, so the columns the horizontal
+    # pass sees are the same either way -- verified bit-identical (maxdiff 0.0).
+    # It blurs 2r extra columns in the vertical pass, but that costs less than
+    # the second pad's kernel launch: 57.5 -> 50.6 us on CUDA at (60, 64, 64).
+    x = F.pad(x, (r, r, r, r), mode="replicate")
+    x = F.conv2d(x, k.view(1, 1, -1, 1))
+    x = F.conv2d(x, k.view(1, 1, 1, -1))
     return x.squeeze(1)
 
 
@@ -130,6 +138,25 @@ def _spatial_gradients(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return gx, gy
 
 
+@functools.lru_cache(maxsize=32)
+def _plane_meshgrid(
+    h: int, w: int, device: torch.device, dtype: torch.dtype
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Cached ``(ys, xs)`` index grids for an ``(h, w)`` plane.
+
+    The estimation loop warps the same handful of plane shapes (one per pyramid
+    level) tens of thousands of times, and the grid is a pure function of shape
+    plus device/dtype. Cached entries are read-only by construction — every
+    consumer builds a new tensor from them rather than writing in place.
+    """
+    ys, xs = torch.meshgrid(
+        torch.arange(h, device=device, dtype=dtype),
+        torch.arange(w, device=device, dtype=dtype),
+        indexing="ij",
+    )
+    return ys, xs
+
+
 def _warp2d(
     img: torch.Tensor, u: torch.Tensor, v: torch.Tensor, mode: str = "bilinear"
 ) -> torch.Tensor:
@@ -146,11 +173,7 @@ def _warp2d(
     if mode == "lanczos":
         mode = "bilinear"
     _, h, w = img.shape
-    ys, xs = torch.meshgrid(
-        torch.arange(h, device=img.device, dtype=img.dtype),
-        torch.arange(w, device=img.device, dtype=img.dtype),
-        indexing="ij",
-    )
+    ys, xs = _plane_meshgrid(h, w, img.device, img.dtype)
     gxn = 2.0 * (xs.unsqueeze(0) + u) / max(w - 1, 1) - 1.0
     gyn = 2.0 * (ys.unsqueeze(0) + v) / max(h - 1, 1) - 1.0
     grid = torch.stack([gxn, gyn], dim=-1)

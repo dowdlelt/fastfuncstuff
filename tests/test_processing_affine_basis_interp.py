@@ -382,3 +382,54 @@ class TestSourceBatchedCompose:
         for a, b in zip(seq, multi, strict=True):
             assert b.shape == (N, P, V)
             assert torch.allclose(a, b, atol=1e-5)
+
+
+class TestApplyAffineSlabChunking:
+    """Large output grids resample in z-slabs instead of one giant allocation.
+
+    Bug of record: ffs_allineate with -dxyz 0.35 produced a 640^3 output grid.
+    The single-shot path holds the (4, N) coordinate grid, the transformed
+    copy, the normalized grid and the bounds masks live at once -- ~16 GB at
+    that size -- and died inside the CUDA allocator. Slabbing along z is exact
+    because the resample is independent per output slice.
+    """
+
+    @pytest.mark.parametrize("interp", ["linear", "cubic", "quintic", "heptic", "wsinc5"])
+    def test_slabbed_matches_single_shot(self, monkeypatch, interp):
+        from fastfuncstuff.processing import affine as affine_mod
+
+        torch.manual_seed(0)
+        src = torch.randn(20, 24, 26)
+        m = torch.eye(4)
+        m[:3, 3] = torch.tensor([2.5, -1.5, 0.7])
+        out_shape = (18, 22, 24)
+
+        reference = affine_mod.apply_affine_interp(src, m, interp, out_shape, zero_outside=True)
+        # Force several slabs, including one that does not divide onz evenly.
+        for slab in (1, 5, 7):
+            monkeypatch.setattr(affine_mod, "_z_slab_size", lambda *a, **k: slab)
+            got = affine_mod.apply_affine_interp(src, m, interp, out_shape, zero_outside=True)
+            assert torch.equal(reference, got), f"{interp} differs at slab={slab}"
+
+    def test_slab_size_shrinks_when_budget_is_small(self, monkeypatch):
+        from fastfuncstuff.processing import affine as affine_mod
+
+        dev = torch.device("cpu")
+        # 64 MB budget against a 512x512 slice cannot fit many z at once.
+        monkeypatch.setattr(affine_mod, "get_available_memory", lambda *a, **k: 64 << 20)
+        slab = affine_mod._z_slab_size(512, 512, 512, dev, torch.float32, 16)
+        assert 1 <= slab < 512
+
+        # A generous budget takes the whole volume in one pass.
+        monkeypatch.setattr(affine_mod, "get_available_memory", lambda *a, **k: 1 << 40)
+        assert affine_mod._z_slab_size(512, 512, 512, dev, torch.float32, 16) == 512
+
+    def test_slab_size_survives_a_failing_memory_probe(self, monkeypatch):
+        from fastfuncstuff.processing import affine as affine_mod
+
+        def boom(*a, **k):
+            raise RuntimeError("NVML unavailable")
+
+        monkeypatch.setattr(affine_mod, "get_available_memory", boom)
+        slab = affine_mod._z_slab_size(640, 640, 640, torch.device("cpu"), torch.float32, 16)
+        assert slab >= 1

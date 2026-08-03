@@ -51,22 +51,25 @@ def convolve_hrf(
     # normalized at source resolution so that a single event peaks at 1.0.
     # Multiple events will sum to >1.0, which is correct (linear superposition).
 
-    # Convolve each condition with HRF
-    design = torch.zeros(n_timepoints, n_conditions, device=device)
+    # Convolve every condition in one grouped conv1d rather than looping one
+    # kernel launch per condition. Each condition is its own group, so group c
+    # sees only channel c — identical to the per-condition convolution, but a
+    # single launch regardless of how many conditions there are. (A plain
+    # 1-output-channel conv would instead *sum* across conditions.)
+    onset_batch = onsets.T.unsqueeze(0).contiguous()  # (1, n_conditions, T)
+    hrf_kernel = hrf.flip(0).view(1, 1, -1).expand(n_conditions, 1, -1)  # (C, 1, H)
 
-    for cond_idx in range(n_conditions):
-        # Use torch.nn.functional.conv1d for GPU acceleration
-        # Need to reshape for conv1d: (batch, channels, length)
-        onset_vec = onsets[:, cond_idx].unsqueeze(0).unsqueeze(0)  # (1, 1, T)
-        hrf_kernel = hrf.flip(0).unsqueeze(0).unsqueeze(0)  # (1, 1, H)
+    # Causal convolution: response follows stimulus.
+    # padding=len(hrf)-1 ensures output[t] only depends on input[<=t]
+    convolved = F.conv1d(
+        onset_batch, hrf_kernel.contiguous(), padding=len(hrf) - 1, groups=n_conditions
+    )
+    # Trim the right-side padding, back to (n_timepoints, n_conditions)
+    design = convolved[0, :, :n_timepoints].T
 
-        # Causal convolution: response follows stimulus
-        # padding=len(hrf)-1 ensures output[t] only depends on input[<=t]
-        convolved = F.conv1d(onset_vec, hrf_kernel, padding=len(hrf) - 1)
-        # Take first n_timepoints (trim the right side padding)
-        design[:, cond_idx] = convolved.squeeze()[:n_timepoints]
-
-    return design
+    # torch.zeros() built the old output at the default dtype; keep that so
+    # float64 onsets don't silently change every caller's design dtype.
+    return design.to(torch.get_default_dtype()).contiguous()
 
 
 def convolve_hrf_microtime(

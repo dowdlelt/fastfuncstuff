@@ -25,6 +25,7 @@ from fastfuncstuff.processing.slicetime import (
     temporal_resample,
     tween_midpoints,
 )
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def _resolve_tr(
@@ -212,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     verb = args.verb
     # Pick the interpolation default per mode: -tween wants a plain neighbour average

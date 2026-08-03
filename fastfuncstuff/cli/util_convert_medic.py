@@ -43,6 +43,8 @@ from pathlib import Path
 
 import numpy as np
 
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+
 
 class _HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
@@ -158,6 +160,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     pfx = parse_prefix(args.prefix)
     prefix_stem, nii_ext = pfx.stem, pfx.nifti_ext
     pe_axis = PE_AXIS_MAP[args.pe_dir]

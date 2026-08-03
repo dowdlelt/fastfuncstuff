@@ -106,20 +106,24 @@ def apply_polort_projection(
     if run_starts is not None and len(run_starts) > 1:
         # Block-diagonal polynomial basis: each run gets its own polynomials,
         # zero-padded so they don't affect other runs' timepoints.
-        poly = torch.zeros(n_t, 0, device=device, dtype=data_vox_t.dtype)
+        # One allocation for the whole basis, then write each run's block into
+        # its own column slice. The previous torch.cat-per-run rebuilt and
+        # recopied the entire growing matrix on every iteration (O(n_runs²)
+        # copies), which is the cost that bites on 20+ run concatenations.
         run_ends = list(run_starts[1:]) + [n_t]
-        for rs, re in zip(run_starts, run_ends, strict=False):
-            run_len = re - rs
+        n_cols_per_run = polort + 1
+        poly = torch.zeros(
+            n_t, n_cols_per_run * len(run_starts), device=device, dtype=data_vox_t.dtype
+        )
+        for i, (rs, re) in enumerate(zip(run_starts, run_ends, strict=False)):
             run_poly = construct_polynomial_matrix(
-                n_timepoints=run_len,
+                n_timepoints=re - rs,
                 max_degree=polort,
                 device=device,
                 dtype=data_vox_t.dtype,
             )
-            # Zero-pad into full timeseries length
-            padded = torch.zeros(n_t, run_poly.shape[1], device=device, dtype=data_vox_t.dtype)
-            padded[rs:re, :] = run_poly
-            poly = torch.cat([poly, padded], dim=1)
+            c0 = i * n_cols_per_run
+            poly[rs:re, c0 : c0 + run_poly.shape[1]] = run_poly
     else:
         poly = construct_polynomial_matrix(
             n_timepoints=n_t,

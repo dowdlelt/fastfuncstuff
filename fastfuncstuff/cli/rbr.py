@@ -63,6 +63,7 @@ from fastfuncstuff.processing.rbr import (
     resample_with_affine_field,
 )
 from fastfuncstuff.processing.tissue import build_tissue_design, tissue_projector
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 _AXIS = {"x": 0, "y": 1, "z": 2}
 
@@ -263,6 +264,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     if verb:
         print(f"ffs_rbr: device={device}")
 

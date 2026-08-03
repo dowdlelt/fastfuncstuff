@@ -44,6 +44,7 @@ Examples
 
 from __future__ import annotations
 
+import functools
 import io
 import re
 import shutil
@@ -250,6 +251,22 @@ def nifti_shape(filepath: str | Path) -> tuple[int, ...]:
     return shape
 
 
+@functools.lru_cache(maxsize=1)
+def _require_zstd() -> None:
+    """Raise unless a usable ``zstd`` is on PATH.
+
+    Cached: this used to fork a `zstd --version` subprocess on *every*
+    ``load_nifti`` of a .nii.zst, which on a threaded multi-run load is one
+    fork per run for an answer that cannot change within a process.
+    """
+    try:
+        subprocess.run(["zstd", "--version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError) as err:
+        raise RuntimeError(
+            "zstd is not installed or not available in PATH. Install zstd to load .nii.zst files."
+        ) from err
+
+
 def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
@@ -295,14 +312,7 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
 
     # Handle .nii.zst files by decompressing through zstd
     if str(filepath).endswith(".nii.zst"):
-        # Check if zstd is available
-        try:
-            subprocess.run(["zstd", "--version"], capture_output=True, check=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as err:
-            raise RuntimeError(
-                "zstd is not installed or not available in PATH. "
-                "Install zstd to load .nii.zst files."
-            ) from err
+        _require_zstd()
 
         # Decompress to temporary file
         with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:

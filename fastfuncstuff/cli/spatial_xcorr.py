@@ -35,6 +35,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -314,6 +316,7 @@ def main(argv: list[str] | None = None) -> None:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     t0 = time.time()
     thresholds = tuple(float(x) for x in args.thresholds.split(","))

@@ -51,6 +51,8 @@ from datetime import datetime
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+
 
 class _HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
@@ -338,6 +340,7 @@ def main(argv: list[str] | None = None) -> int:
 
     args = create_parser().parse_args(argv)
     device, _, _ = parse_device_arg(args.device)
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
 

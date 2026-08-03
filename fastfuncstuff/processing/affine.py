@@ -24,6 +24,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from fastfuncstuff.memory import get_available_memory
+
 from .interp import _grid_sample_3d, _separable_resample_3d, wsinc5_resample_3d
 
 # Cache of constant homogeneous output-grid coordinates, keyed by
@@ -475,6 +477,66 @@ def grid_from_dxyz(
     return new_affine, (int(new_dim[2]), int(new_dim[1]), int(new_dim[0]))
 
 
+def _slab_src_coords(
+    matrix: Tensor,
+    z0: int,
+    z1: int,
+    ony: int,
+    onx: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Source (x, y, z) voxel coords for output slices ``[z0:z1]``.
+
+    Same math as the whole-volume path, restricted to a slab of the output
+    grid, and deliberately *not* routed through ``_homogeneous_grid``: that
+    cache is keyed on the full output shape and would pin the very allocation
+    slabbing exists to avoid (a 640^3 grid is 4.2 GB of (4, N) coordinates).
+    """
+    nz = z1 - z0
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(z0, z1, dtype=dtype, device=device),
+        torch.arange(ony, dtype=dtype, device=device),
+        torch.arange(onx, dtype=dtype, device=device),
+        indexing="ij",
+    )
+    coords = torch.stack(
+        [
+            ii.reshape(-1),
+            jj.reshape(-1),
+            kk.reshape(-1),
+            torch.ones(nz * ony * onx, device=device, dtype=dtype),
+        ],
+        dim=0,
+    )
+    src = matrix @ coords  # (4, M)
+    return (
+        src[0].reshape(nz, ony, onx),
+        src[1].reshape(nz, ony, onx),
+        src[2].reshape(nz, ony, onx),
+    )
+
+
+def _z_slab_size(
+    onz: int, ony: int, onx: int, device: torch.device, dtype: torch.dtype, live_per_voxel: int
+) -> int:
+    """How many output z-slices fit in the memory budget at once.
+
+    ``live_per_voxel`` counts the simultaneously-live per-output-voxel tensors
+    (coords, transformed coords, normalized grid, result, bounds masks). Returns
+    ``onz`` when the whole volume fits, so ordinary-sized images keep the
+    single-shot path and its cached grid.
+    """
+    itemsize = torch.empty((), dtype=dtype).element_size()
+    per_z = max(ony * onx * live_per_voxel * itemsize, 1)
+    try:
+        budget = get_available_memory(device)
+    except Exception:
+        # Never let a memory probe be the thing that fails the resample.
+        budget = 1 << 30
+    return max(1, min(onz, int(budget // per_z)))
+
+
 def apply_affine(
     source: Tensor,
     matrix: Tensor,
@@ -484,6 +546,11 @@ def apply_affine(
     """Resample source image using an affine transformation matrix.
 
     The matrix maps output (base) voxel indices to source voxel indices.
+
+    Large output grids are resampled in z-slabs sized from the memory module.
+    A single-shot 640^3 output needs ~16 bytes/voxel live across the coordinate
+    grid, the normalized grid and the bounds masks -- about 16 GB, which OOMs
+    even though the resample itself is trivially separable along z.
 
     Args:
         source: (nz, ny, nx) source image.
@@ -503,37 +570,47 @@ def apply_affine(
     device = source.device
     dtype = source.dtype
 
-    # Apply affine: source_coords = M @ output_coords (grid is cached).
-    coords = _homogeneous_grid((onz, ony, onx), device, dtype)
-    src_coords = matrix @ coords  # (4, N)
-
-    src_x = src_coords[0].reshape(onz, ony, onx)
-    src_y = src_coords[1].reshape(onz, ony, onx)
-    src_z = src_coords[2].reshape(onz, ony, onx)
-
-    # Convert to normalized [-1, 1] for grid_sample
     snz, sny, snx = source.shape
-    gx = 2.0 * src_x / (snx - 1) - 1.0 if snx > 1 else src_x * 0.0
-    gy = 2.0 * src_y / (sny - 1) - 1.0 if sny > 1 else src_y * 0.0
-    gz = 2.0 * src_z / (snz - 1) - 1.0 if snz > 1 else src_z * 0.0
-
-    grid = torch.stack([gx, gy, gz], dim=-1)[None]  # (1, D, H, W, 3)
     vol = source[None, None]  # (1, 1, D, H, W)
 
-    result = _grid_sample_3d(vol, grid)
-    result = result[0, 0]
+    def _slab(src_x: Tensor, src_y: Tensor, src_z: Tensor) -> Tensor:
+        # Convert to normalized [-1, 1] for grid_sample
+        gx = 2.0 * src_x / (snx - 1) - 1.0 if snx > 1 else src_x * 0.0
+        gy = 2.0 * src_y / (sny - 1) - 1.0 if sny > 1 else src_y * 0.0
+        gz = 2.0 * src_z / (snz - 1) - 1.0 if snz > 1 else src_z * 0.0
 
-    if zero_outside:
-        oob = (
-            (src_x < -0.5)
-            | (src_x > snx - 0.5)
-            | (src_y < -0.5)
-            | (src_y > sny - 0.5)
-            | (src_z < -0.5)
-            | (src_z > snz - 0.5)
+        grid = torch.stack([gx, gy, gz], dim=-1)[None]  # (1, D, H, W, 3)
+        out = _grid_sample_3d(vol, grid)[0, 0]
+
+        if zero_outside:
+            oob = (
+                (src_x < -0.5)
+                | (src_x > snx - 0.5)
+                | (src_y < -0.5)
+                | (src_y > sny - 0.5)
+                | (src_z < -0.5)
+                | (src_z > snz - 0.5)
+            )
+            out[oob] = 0.0
+        return out
+
+    slab = _z_slab_size(onz, ony, onx, device, dtype, live_per_voxel=16)
+    if slab >= onz:
+        # Whole-volume path: keeps the cached grid, which is what makes the
+        # thousands of calls in the optimizer loop cheap.
+        coords = _homogeneous_grid((onz, ony, onx), device, dtype)
+        src_coords = matrix @ coords  # (4, N)
+        return _slab(
+            src_coords[0].reshape(onz, ony, onx),
+            src_coords[1].reshape(onz, ony, onx),
+            src_coords[2].reshape(onz, ony, onx),
         )
-        result[oob] = 0.0
 
+    result = torch.empty((onz, ony, onx), device=device, dtype=dtype)
+    for z0 in range(0, onz, slab):
+        z1 = min(z0 + slab, onz)
+        sx, sy, sz = _slab_src_coords(matrix, z0, z1, ony, onx, device, dtype)
+        result[z0:z1] = _slab(sx, sy, sz)
     return result
 
 
@@ -564,43 +641,33 @@ def apply_affine_wsinc5(
     dtype = source.dtype
     snz, sny, snx = source.shape
 
-    # Build output grid in voxel indices
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(onz, dtype=dtype, device=device),
-        torch.arange(ony, dtype=dtype, device=device),
-        torch.arange(onx, dtype=dtype, device=device),
-        indexing="ij",
-    )
+    def _slab(src_x: Tensor, src_y: Tensor, src_z: Tensor) -> Tensor:
+        out = wsinc5_resample_3d(source, src_x, src_y, src_z)
+        # Zero out-of-bounds voxels (wsinc5 clamps internally, so undo that)
+        oob = (
+            (src_x < -0.5)
+            | (src_x > snx - 0.5)
+            | (src_y < -0.5)
+            | (src_y > sny - 0.5)
+            | (src_z < -0.5)
+            | (src_z > snz - 0.5)
+        )
+        out[oob] = 0.0
+        return out
 
-    # Apply affine: source_coords = M @ output_coords
-    coords = torch.stack(
-        [
-            ii.reshape(-1),
-            jj.reshape(-1),
-            kk.reshape(-1),
-            torch.ones(onz * ony * onx, device=device, dtype=dtype),
-        ],
-        dim=0,
-    )
-    src_coords = matrix @ coords  # (4, N)
+    # Higher per-voxel budget than the trilinear path: the 11-tap separable
+    # resampler holds its own intermediates on top of the coordinate grids.
+    slab = _z_slab_size(onz, ony, onx, device, dtype, live_per_voxel=28)
 
-    src_x = src_coords[0].reshape(onz, ony, onx)
-    src_y = src_coords[1].reshape(onz, ony, onx)
-    src_z = src_coords[2].reshape(onz, ony, onx)
+    if slab >= onz:
+        sx, sy, sz = _slab_src_coords(matrix, 0, onz, ony, onx, device, dtype)
+        return _slab(sx, sy, sz)
 
-    result = wsinc5_resample_3d(source, src_x, src_y, src_z)
-
-    # Zero out-of-bounds voxels (wsinc5 clamps internally, so undo that)
-    oob = (
-        (src_x < -0.5)
-        | (src_x > snx - 0.5)
-        | (src_y < -0.5)
-        | (src_y > sny - 0.5)
-        | (src_z < -0.5)
-        | (src_z > snz - 0.5)
-    )
-    result[oob] = 0.0
-
+    result = torch.empty((onz, ony, onx), device=device, dtype=dtype)
+    for z0 in range(0, onz, slab):
+        z1 = min(z0 + slab, onz)
+        sx, sy, sz = _slab_src_coords(matrix, z0, z1, ony, onx, device, dtype)
+        result[z0:z1] = _slab(sx, sy, sz)
     return result
 
 
@@ -637,41 +704,33 @@ def apply_affine_interp(
     dtype = source.dtype
     snz, sny, snx = source.shape
 
-    # Build output grid
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(onz, dtype=dtype, device=device),
-        torch.arange(ony, dtype=dtype, device=device),
-        torch.arange(onx, dtype=dtype, device=device),
-        indexing="ij",
-    )
-    coords = torch.stack(
-        [
-            ii.reshape(-1),
-            jj.reshape(-1),
-            kk.reshape(-1),
-            torch.ones(onz * ony * onx, device=device, dtype=dtype),
-        ],
-        dim=0,
-    )
-    src_coords = matrix @ coords
+    def _slab(src_x: Tensor, src_y: Tensor, src_z: Tensor) -> Tensor:
+        out = _separable_resample_3d(source, src_x, src_y, src_z, interp)
+        if zero_outside:
+            oob = (
+                (src_x < -0.5)
+                | (src_x > snx - 0.5)
+                | (src_y < -0.5)
+                | (src_y > sny - 0.5)
+                | (src_z < -0.5)
+                | (src_z > snz - 0.5)
+            )
+            out[oob] = 0.0
+        return out
 
-    src_x = src_coords[0].reshape(onz, ony, onx)
-    src_y = src_coords[1].reshape(onz, ony, onx)
-    src_z = src_coords[2].reshape(onz, ony, onx)
+    # As in apply_affine_wsinc5: the separable multi-tap resamplers carry their
+    # own intermediates on top of the coordinate grids.
+    slab = _z_slab_size(onz, ony, onx, device, dtype, live_per_voxel=28)
 
-    result = _separable_resample_3d(source, src_x, src_y, src_z, interp)
+    if slab >= onz:
+        sx, sy, sz = _slab_src_coords(matrix, 0, onz, ony, onx, device, dtype)
+        return _slab(sx, sy, sz)
 
-    if zero_outside:
-        oob = (
-            (src_x < -0.5)
-            | (src_x > snx - 0.5)
-            | (src_y < -0.5)
-            | (src_y > sny - 0.5)
-            | (src_z < -0.5)
-            | (src_z > snz - 0.5)
-        )
-        result[oob] = 0.0
-
+    result = torch.empty((onz, ony, onx), device=device, dtype=dtype)
+    for z0 in range(0, onz, slab):
+        z1 = min(z0 + slab, onz)
+        sx, sy, sz = _slab_src_coords(matrix, z0, z1, ony, onx, device, dtype)
+        result[z0:z1] = _slab(sx, sy, sz)
     return result
 
 

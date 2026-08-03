@@ -296,6 +296,10 @@ def gauss_newton_rigid(
     eps = 1e-6 * JtWJ.diagonal().mean()
     reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
     JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
+    # Factor once: the normal matrix is fixed for the whole GN loop, so
+    # torch.linalg.solve was redoing the same LU on every iteration. On CUDA
+    # that decomposition is ~110 us of the ~146 us per solve.
+    JtWJ_lu = torch.linalg.lu_factor(JtWJ_reg)
 
     for it in range(config.max_iter):
         matrix = p2m_fn(params)
@@ -309,7 +313,7 @@ def gauss_newton_rigid(
         JtWr = WJ @ residual  # (6,)
 
         # Solve 6×6 system (float64; RHS promoted, step cast back to float32)
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
+        dp = torch.linalg.lu_solve(*JtWJ_lu, JtWr.to(JtWJ_reg.dtype).unsqueeze(1)).squeeze(1)
 
         # Update only rigid params (first 6)
         params[:6] += dp.to(params.dtype)
@@ -341,6 +345,10 @@ def gauss_newton_rigid_masked(
     eps = 1e-6 * JtWJ.diagonal().mean()
     reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
     JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
+    # Factor once: the normal matrix is fixed for the whole GN loop, so
+    # torch.linalg.solve was redoing the same LU on every iteration. On CUDA
+    # that decomposition is ~110 us of the ~146 us per solve.
+    JtWJ_lu = torch.linalg.lu_factor(JtWJ_reg)
 
     for it in range(config.max_iter):
         matrix = p2m_fn(params)
@@ -351,7 +359,7 @@ def gauss_newton_rigid_masked(
         residual = weight_flat_masked * (base_flat_masked - warped)
 
         JtWr = WJ_masked @ residual
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
+        dp = torch.linalg.lu_solve(*JtWJ_lu, JtWr.to(JtWJ_reg.dtype).unsqueeze(1)).squeeze(1)
 
         params[:6] += dp.to(params.dtype)
 
@@ -381,6 +389,10 @@ def gauss_newton_rigid_fixed(
     eps = 1e-6 * JtWJ.diagonal().mean()
     reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
     JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
+    # Factor once: the normal matrix is fixed for the whole GN loop, so
+    # torch.linalg.solve was redoing the same LU on every iteration. On CUDA
+    # that decomposition is ~110 us of the ~146 us per solve.
+    JtWJ_lu = torch.linalg.lu_factor(JtWJ_reg)
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
@@ -388,7 +400,7 @@ def gauss_newton_rigid_fixed(
         residual = weight_flat * (base_flat - warped.reshape(-1))
 
         JtWr = WJ @ residual
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
+        dp = torch.linalg.lu_solve(*JtWJ_lu, JtWr.to(JtWJ_reg.dtype).unsqueeze(1)).squeeze(1)
 
         params[:6] += dp.to(params.dtype)
 
@@ -416,6 +428,10 @@ def gauss_newton_rigid_fixed_masked(
     eps = 1e-6 * JtWJ.diagonal().mean()
     reg = eps * torch.eye(6, device=device, dtype=JtWJ.dtype)
     JtWJ_reg = JtWJ + reg  # float64: see JtWJ construction in moco()
+    # Factor once: the normal matrix is fixed for the whole GN loop, so
+    # torch.linalg.solve was redoing the same LU on every iteration. On CUDA
+    # that decomposition is ~110 us of the ~146 us per solve.
+    JtWJ_lu = torch.linalg.lu_factor(JtWJ_reg)
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
@@ -426,7 +442,7 @@ def gauss_newton_rigid_fixed_masked(
         residual = weight_flat_masked * (base_flat_masked - warped)
 
         JtWr = WJ_masked @ residual  # (6,)
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.to(JtWJ_reg.dtype))
+        dp = torch.linalg.lu_solve(*JtWJ_lu, JtWr.to(JtWJ_reg.dtype).unsqueeze(1)).squeeze(1)
 
         params[:6] += dp.to(params.dtype)
 
@@ -470,6 +486,8 @@ def batched_gn_estimate(
 
     eps = 1e-6 * JtWJ.diagonal().mean()
     JtWJ_reg = JtWJ + eps * torch.eye(6, device=device, dtype=JtWJ.dtype)  # float64
+    # Same hoist as the scalar GN solvers above: constant across iterations.
+    JtWJ_lu = torch.linalg.lu_factor(JtWJ_reg)
 
     if init_params is None:
         params = identity_params(device=device, dtype=dtype)[None].repeat(B, 1)
@@ -487,7 +505,7 @@ def batched_gn_estimate(
         JtWr = residual @ WJ.t()  # (B,6)
         # Solve in float64 (RHS promoted, step cast back); the Gram matrix and
         # solve are where ill-conditioning amplifies float32 rounding.
-        dp = torch.linalg.solve(JtWJ_reg, JtWr.t().to(JtWJ_reg.dtype)).t().to(dtype)  # (B,6)
+        dp = torch.linalg.lu_solve(*JtWJ_lu, JtWr.t().to(JtWJ_reg.dtype)).t().to(dtype)  # (B,6)
 
         # only update active, validly-decomposed volumes
         upd = (active & valid).unsqueeze(1).to(dtype)

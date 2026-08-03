@@ -261,3 +261,48 @@ class TestSelectOneVsAll:
         # Dropping B leaves only rare in the other group → 1 trial → raises
         with pytest.raises(ValueError, match="onevsall"):
             select_one_vs_all(ev, "trial_type", "A", drop_values=("B",))
+
+
+# ---------------------------------------------------------------------------
+# ffs_perm CLI: optional -mask
+# ---------------------------------------------------------------------------
+
+
+class TestPermCLIOptionalMask:
+    """-mask is optional; _load_mask returns all-True for None.
+
+    Bug of record: the spinner label evaluated ``Path(args.mask).name``
+    unconditionally, so omitting -mask raised TypeError from pathlib before
+    _load_mask was ever reached.
+    """
+
+    def test_runs_without_mask(self, tmp_path, monkeypatch):
+        nib = pytest.importorskip("nibabel")
+        from fastfuncstuff.cli.ffs_perm import main
+
+        rng = np.random.default_rng(0)
+        data = rng.normal(size=(6, 6, 4, 12)).astype(np.float32)
+        data[2:4, 2:4, 1:3, :] += 1.5
+        in_path = tmp_path / "betas.nii.gz"
+        nib.save(nib.Nifti1Image(data, np.eye(4)), str(in_path))
+
+        prefix = tmp_path / "nomask.nii"
+        monkeypatch.setattr(
+            "sys.argv",
+            [
+                "ffs_perm",
+                "-input",
+                str(in_path),
+                "-nn",
+                "3",
+                "-prefix",
+                str(prefix),
+                "-n_perms",
+                "50",
+                "-verb",
+                "0",
+            ],
+        )
+        rc = main()
+        assert rc in (0, None)
+        assert (tmp_path / "nomask_stats.nii").exists()

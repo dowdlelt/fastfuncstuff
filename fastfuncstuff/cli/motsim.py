@@ -26,6 +26,7 @@ from fastfuncstuff.processing.motsim import (
     save_1d,
 )
 from fastfuncstuff.processing.nwarpforge import load_affine_1D
+from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -143,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
+    configure_torch_backends(device, tf32=REGISTRATION_TF32)
 
     if args.verb >= 1:
         print(f"ffs_motsim: device={device}")
