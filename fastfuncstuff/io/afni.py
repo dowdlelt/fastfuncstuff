@@ -3033,8 +3033,26 @@ def save_nifti(
         n_sub = data.shape[3] if data.ndim == 4 else 1
         _set_afni_brick_stataux(header, brick_stataux, n_sub)
 
+    # Carry the input's space codes across; a header we invented claims
+    # scanner-anat, which is what every grid we write actually is.
+    qcode = int(header["qform_code"]) if header is not None else 0
+    scode = int(header["sform_code"]) if header is not None else 0
+    qcode = qcode or scode or 1
+    scode = scode or qcode
+
     # Create NIfTI image
     img = nib.Nifti1Image(_to_file_order(data), affine, header=header)
+
+    # Write BOTH forms from the affine we were handed. nibabel only touches the
+    # s/qform when the affine differs from the header's best affine -- and when
+    # it does, it writes sform_code=2 with qform_code=0, leaving the file with no
+    # qform at all. Any reader that follows the NIfTI precedence rule (qform
+    # first) then falls back to pixdim-only geometry: no orientation, no origin,
+    # so the dataset displays rotated and offset from its own input. Bug of
+    # record: ffs_util_autobox of an anat came out sideways in the viewer while
+    # 3dinfo (an sform reader) showed it correctly placed.
+    img.set_sform(affine, code=scode)
+    img.set_qform(affine, code=qcode)
 
     # Set TR if provided
     if tr is not None:

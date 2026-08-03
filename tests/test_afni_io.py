@@ -379,6 +379,33 @@ class TestDataTypeHandling:
             assert f'atr_name="{name}"' not in content, f"stale {name} survived the write"
         assert np.allclose(img.affine, affine), "sform must carry the new geometry"
 
+    def test_regrid_keeps_both_qform_and_sform(self, temp_output_dir):
+        """A changed affine must land in BOTH forms, with the input's space codes.
+
+        nibabel rewrites the s/qform only when the affine differs from the
+        header's -- and then writes sform_code=2 with qform_code=0, i.e. no qform
+        at all. Readers that follow the NIfTI precedence rule (qform first) fall
+        back to pixdim-only geometry and display the dataset rotated and offset,
+        which is what a cropped anat did while 3dinfo still read it correctly."""
+        from fastfuncstuff.io.afni import save_nifti
+
+        src_affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        hdr = nib.Nifti1Header()
+        hdr.set_sform(src_affine, code=1)
+        hdr.set_qform(src_affine, code=1)
+
+        # A crop: same voxel lattice, origin walked to the new corner.
+        affine = src_affine.copy()
+        affine[:3, 3] = [-40.0, 30.0, -20.0]
+        out = temp_output_dir / "regridded.nii.gz"
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=affine, header=hdr)
+
+        img = nib.load(str(out))
+        assert int(img.header["qform_code"]) == 1
+        assert int(img.header["sform_code"]) == 1
+        assert np.allclose(img.get_sform(), affine)
+        assert np.allclose(img.get_qform(), affine)
+
 
 class TestEdgeCases:
     """Test edge cases and error handling."""
