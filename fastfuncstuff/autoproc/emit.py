@@ -435,8 +435,9 @@ def _ref_marker(key: NameKey, source: str, note: str) -> str:
     """A QC-only copy of the image that *is* a level's reference, named like the
     level's other outputs plus ``role-ref``. Alignment stages skip their reference
     (it maps to itself), which otherwise leaves a browsable gap — N-1 files where
-    the reader expects N. Has no ``_nl`` counterpart, by definition."""
-    dst = stem(key) + ".nii$FMT"
+    the reader expects N. Carries ``_lin`` like the images it stands in for (the
+    identity is a linear transform); has no ``_nl`` counterpart, by definition."""
+    dst = stem(key) + "_lin.nii$FMT"
     return f'# {note}\n[ -f "{dst}" ] || cp -f "{source}" "{dst}"'
 
 
@@ -481,7 +482,7 @@ def _fmapmean_inputs(plan: Plan, session: str | None) -> list[str]:
             files.append(stem(NameKey("blip", session=session, fmap=fid)) + "_mean.nii$FMT")
         else:
             st = stem(NameKey("xfmap", session=session, fmap=fid))
-            files.append(f"{st}_nl.nii$FMT" if nl else f"{st}.nii$FMT")
+            files.append(f"{st}_nl.nii$FMT" if nl else f"{st}_lin.nii$FMT")
     return files
 
 
@@ -1110,7 +1111,7 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
                 [
                     f'-base "{base}"',
                     f'-source "{src}"',
-                    f'-prefix "{xstem}.nii$FMT"',
+                    f'-prefix "{xstem}_lin.nii$FMT"',
                     f'-1Dmatrix_save "{xstem}.aff12.1D"',
                     *_split_flags(config.DEFAULT_OPTS["xfmap"]),
                 ],
@@ -1125,7 +1126,7 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
                         f'-base "{base}"',
                         *_nl_source_args(
                             opt.xfmap_nonlin_in_source,
-                            f"{xstem}.nii$FMT",
+                            f"{xstem}_lin.nii$FMT",
                             src,
                             f"{xstem}.aff12.1D",
                         ),
@@ -1177,12 +1178,15 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
                     '-base "$base"',
                     *_nl_source_args(
                         opt.xrun_nonlin_in_source,
-                        "${xstem}${LANE}.nii$FMT",
+                        "${xstem}${LANE}_lin.nii$FMT",
                         src_var,
                         "${xstem}.aff12.1D",
                     ),
-                    '-prefix "${xstem}_nl.nii$FMT"',
+                    '-prefix "${xstem}${LANE}_nl.nii$FMT"',
                     "-save_warp",
+                    # The warp is shared by every lane; only the image it wrote
+                    # belongs to the lane that produced it.
+                    '-warp_prefix "${xstem}_nl"',
                     *_split_flags(config.DEFAULT_OPTS["xrun_nl"]),
                 ],
             )
@@ -1197,7 +1201,7 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
         [
             '-base "$base"',
             f'-source "{src_var}"',
-            '-prefix "${xstem}${LANE}.nii$FMT"',
+            '-prefix "${xstem}${LANE}_lin.nii$FMT"',
             '-1Dmatrix_save "${xstem}.aff12.1D"',
             *_split_flags(config.DEFAULT_OPTS["xrun"]),
         ],
@@ -1344,18 +1348,6 @@ def _gmrun_image(pr: PlanRun, lane: str) -> str:
     return _gmrun(pr, lane) if _needs_gmrun(pr) else _aligned_mean(pr, lane)
 
 
-def _xses_aligned(session: str, nonlin: bool) -> str:
-    """The cross-session-aligned representative for a non-ref session — the QC
-    image ffs_allineate / ffs_formwarp writes. A nonlinear result keeps the
-    lane-free stem it shares with its ``_WARP`` (naming.py).
-
-    Nothing downstream consumes it: the grandmean is built from per-run
-    single-resample images (``_gmrun_image``), not from these.
-    """
-    st = stem(NameKey("xses", session=session))
-    return f"{st}_nl.nii$FMT" if nonlin else f"{st}.nii$FMT"
-
-
 def _stage_xses(plan: Plan, script_stem: str) -> str:
     """stage08: bring every session into the reference session's space, then build
     THE grandmean from the result.
@@ -1415,7 +1407,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                 [
                     '-base "$REFGM"',
                     f'-source "{_ref_image_file(plan, s, primary)}"',
-                    f'-prefix "{xstem}{lane_tag}.nii$FMT"',
+                    f'-prefix "{xstem}{lane_tag}_lin.nii$FMT"',
                     f'-1Dmatrix_save "{xstem}.aff12.1D"',
                     *_split_flags(config.DEFAULT_OPTS["xses"]),
                 ],
@@ -1431,12 +1423,14 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
                         '-base "$REFGM"',
                         *_nl_source_args(
                             opt.xses_nonlin_in_source,
-                            f"{xstem}{lane_tag}.nii$FMT",
+                            f"{xstem}{lane_tag}_lin.nii$FMT",
                             _ref_image_file(plan, s, primary),
                             f"{xstem}.aff12.1D",
                         ),
-                        f'-prefix "{xstem}_nl.nii$FMT"',
+                        f'-prefix "{xstem}{lane_tag}_nl.nii$FMT"',
                         "-save_warp",
+                        # Lane-free warp: it is applied to every lane (see xrun).
+                        f'-warp_prefix "{xstem}_nl"',
                         *_split_flags(config.DEFAULT_OPTS["xses_nl"]),
                     ],
                     indent="",
@@ -1556,7 +1550,7 @@ def _stage_xref(plan: Plan) -> str:
                 "ffs_formwarp",
                 [
                     '-base "$REFGM_EXT"',
-                    '-source "stage09.xref.nii$FMT"',
+                    '-source "stage09.xref_lin.nii$FMT"',
                     '-prefix "stage09.xref_nl.nii$FMT"',
                     "-save_warp",
                     *_split_flags(config.DEFAULT_OPTS["xses_nl"]),
@@ -1570,7 +1564,7 @@ def _stage_xref(plan: Plan) -> str:
         [
             '-base "$REFGM_EXT"',
             f'-source "{_grandmean()}"',
-            '-prefix "stage09.xref.nii$FMT"',
+            '-prefix "stage09.xref_lin.nii$FMT"',
             '-1Dmatrix_save "stage09.xref.aff12.1D"',
             *_split_flags(config.DEFAULT_OPTS["xses"]),
             '-device "$DEVICE"',

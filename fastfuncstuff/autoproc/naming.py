@@ -18,11 +18,22 @@ lanes describe the same anatomy in the same space, so a `foo` / `foo.src-sbref`
 pair is directly comparable — that is what makes the mean lane a usable sanity
 check on the sbref lane (and vice versa). ``ls *src-sbref*`` is the whole lane.
 
-Transforms (``.aff12.1D``, ``_WARP``) never carry ``src-``: a run's alignment is
-a property of the run, and *both* lanes are resampled by the same one — that
-shared-transform property is the point. The one wrinkle is the ``_nl`` image
-ffs_formwarp writes beside its ``_WARP``: it inherits the transform's lane-free
-stem even though its content is whichever lane was the estimation source.
+An alignment stage's *image* outputs end in ``_lin`` or ``_nl`` — the linear
+(ffs_allineate) and nonlinear (ffs_formwarp) results, otherwise identical names::
+
+    stage06.xrun.ses-02.task-checkevent.run-05.src-max_lin.nii.zst
+    stage06.xrun.ses-02.task-checkevent.run-05.src-max_nl.nii.zst
+
+so the pair reads as one thing refined twice: which stage, which unit, which lane
+went in, and which kind of alignment produced it. A ``role-ref`` marker carries
+``_lin`` too (the identity is a linear transform), so one glob covers every unit
+at a level including the reference.
+
+Transforms (``.aff12.1D``, ``_WARP``) never carry ``src-`` and never carry
+``_lin``: a run's alignment is a property of the run, and *both* lanes are
+resampled by the same one — that shared-transform property is the point. The
+nonlinear pair splits with ``ffs_formwarp -warp_prefix``: the image takes the
+lane-tagged ``_nl`` prefix, the ``_WARP`` beside it keeps the lane-free stem.
 
 Tool-specific suffixes (``.aff12.1D``, ``_warp``, ``.1D``) are appended by the
 tools; this module owns only the *prefix* stem. ``coord()`` returns just the

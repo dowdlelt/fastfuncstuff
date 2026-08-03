@@ -208,17 +208,54 @@ def test_reference_levels_get_a_role_ref_qc_copy():
     # marker is the image that actually served as the alignment base — the primary
     # lane's session representative (the max lane, with no SBRefs here).
     assert (
-        'cp -f "stage07.sesmean.ses-01.src-max.nii$FMT" "stage08.xses.ses-01.role-ref.nii$FMT"' in s
+        'cp -f "stage07.sesmean.ses-01.src-max.nii$FMT" "stage08.xses.ses-01.role-ref_lin.nii$FMT"'
+        in s
     )
     # the real, aligned one (batched); tagged with the lane that estimated it.
-    assert '-prefix \\"stage08.xses.ses-02.src-max.nii$FMT\\"' in s
+    assert '-prefix \\"stage08.xses.ses-02.src-max_lin.nii$FMT\\"' in s
     # xfmap: same for the reference fieldmap group.
     assert 'cp -f "stage04.blip.ses-01.fmap-a_mean.nii$FMT" ' in s
-    assert '"stage05.xfmap.ses-01.fmap-a.role-ref.nii$FMT"' in s
+    assert '"stage05.xfmap.ses-01.fmap-a.role-ref_lin.nii$FMT"' in s
     # A reference has no nonlinear counterpart, by definition.
     assert "role-ref_nl" not in s
     # Markers are QC only — never fed into a warp chain or a mean.
     assert "-nwarp" in s and "role-ref" not in s.split("CHAIN[")[-1].split("\n\n")[0]
+
+
+def test_alignment_images_pair_as_lin_and_nl_while_the_warp_stays_lane_free():
+    """An alignment stage's two images differ only by `_lin` / `_nl`, so the pair
+    reads as one thing refined twice and the nl file names what fed it. The warp
+    beside the nl image is shared by every lane, so it keeps the lane-free stem —
+    which is exactly what the chain references."""
+    fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {"TotalReadoutTime": 0.06}, [("foo", "1")])
+    subj = Subject(
+        "X",
+        [
+            Session("01", [_run("01", "foo", "1")], [fmap]),
+            Session("02", [_run("02", "foo", "1")]),
+        ],
+    )
+    opts = Options(ref_ses="01", fmap_ref=["f"], xrun_nonlin=True, xses_nonlin=True)
+    s = write_script(build_plan(subj, opts), "wd", bids_root="/bids")
+
+    # xrun: bash-loop names, so assert on the emitted template.
+    assert '-prefix \\"${xstem}${LANE}_lin.nii$FMT\\"' in s
+    assert '-prefix \\"${xstem}${LANE}_nl.nii$FMT\\"' in s
+    assert '-warp_prefix \\"${xstem}_nl\\"' in s
+    # The nonlinear step refines the linear image, not the raw source.
+    assert '-source \\"${xstem}${LANE}_lin.nii$FMT\\"' in s
+
+    # xses: fully expanded names.
+    xs = "stage08.xses.ses-02"
+    assert f'-prefix \\"{xs}.src-max_lin.nii$FMT\\"' in s
+    assert f'-prefix \\"{xs}.src-max_nl.nii$FMT\\"' in s
+    assert f'-warp_prefix \\"{xs}_nl\\"' in s
+
+    # Transforms carry neither the lane nor `_lin`, and the chain uses those names.
+    assert f'-1Dmatrix_save \\"{xs}.aff12.1D\\"' in s
+    assert "src-max_nl_WARP" not in s
+    assert f"{xs}_nl_WARP.nii$FMT" in s
+    assert "_lin.aff12.1D" not in s and "_lin_WARP" not in s
 
 
 def test_xrun_anchor_gets_a_role_ref_copy_only_without_fieldmaps():
@@ -228,7 +265,7 @@ def test_xrun_anchor_gets_a_role_ref_copy_only_without_fieldmaps():
     s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
     # The marker is the anchor's primary-lane image: with no SBRefs that is the
     # moco MAX (the lane that estimates the transforms), not the mean.
-    assert '"stage06.xrun.ses-01.task-foo.run-1.src-max.role-ref.nii$FMT"' in s
+    assert '"stage06.xrun.ses-01.task-foo.run-1.src-max.role-ref_lin.nii$FMT"' in s
     assert '"stage02.moco.ses-01.task-foo.run-1_max.nii$FMT"' in s
 
     fmap = FmapGroup("01", "f", Path("/rev.nii.gz"), {}, [("foo", "1"), ("foo", "2")])
@@ -474,7 +511,7 @@ def test_anat_source_mean_fmap_averages_the_aligned_group_means():
     assert f'-prefix "{fm}"' in s
     # Averaged: reference group's own blip mean + the non-ref group's ALIGNED mean.
     assert '"stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
-    assert '"stage05.xfmap.ses-SM.fmap-prim.nii$FMT"' in s
+    assert '"stage05.xfmap.ses-SM.fmap-prim_lin.nii$FMT"' in s
     assert f'-source "{fm}"' in s  # and it is what the anat aligns
     # Built after the xfmap alignment that puts the groups in one space.
     assert s.index("stage05: cross-fmap") < s.index(f'-prefix "{fm}"')
