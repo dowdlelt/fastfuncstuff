@@ -53,6 +53,7 @@ import tempfile
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -330,6 +331,9 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
 
             # Load the decompressed file
             img = nib.load(tmp_path)
+            # nib.load()'s stub return type is the loose FileBasedImage base;
+            # a .nii is always a real Nifti1Image/Nifti2Image at runtime.
+            assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
 
             # Load data into memory and create new image to avoid lazy loading issues
             # This ensures the temp file can be safely deleted. Read as float32:
@@ -352,6 +356,9 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
     else:
         # Standard nibabel loading for .nii and .nii.gz
         img_out = nib.load(str(filepath))
+        # Stub gap (see above); this function's contract is to always return
+        # Nifti1Image, matching the .nii.zst branch above.
+        assert isinstance(img_out, nib.Nifti1Image)
 
     # Apply sub-brick selection if requested
     if indices is not None:
@@ -979,7 +986,7 @@ def _peek_run_length(run_file: str | Path) -> int | None:
             hdr = nib.Nifti1Header.from_fileobj(io.BytesIO(head), check=False)
             shape = hdr.get_data_shape()
         else:
-            shape = nib.load(str(path)).shape
+            shape = nib.load(str(path)).shape  # ty: ignore[unresolved-attribute]  # stub gap: FileBasedImage
         return int(shape[3]) if len(shape) > 3 else 1
     except Exception:
         return None
@@ -2172,7 +2179,7 @@ def _history_prefix() -> str:
     return f"{user}@{host}: {time.ctime()}"
 
 
-def _append_history_note(header: object) -> None:
+def _append_history_note(header: Any) -> None:
     """Append this command to the dataset's ``HISTORY_NOTE`` (AFNI provenance).
 
     In-script equivalent of AFNI's ``tross_Append_History`` (afni/src/thd_notes.c):
@@ -2185,7 +2192,7 @@ def _append_history_note(header: object) -> None:
     import nibabel as nib
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2219,7 +2226,7 @@ def _append_history_note(header: object) -> None:
         set_afni_atr(header, "HISTORY_NOTE", entry, ni_type="String")
 
 
-def get_afni_space_info(header: object) -> dict[str, str | int]:
+def get_afni_space_info(header: Any) -> dict[str, str | int]:
     """Extract AFNI view code and template space from a NIfTI header.
 
     Returns a dict with:
@@ -2233,7 +2240,7 @@ def get_afni_space_info(header: object) -> dict[str, str | int]:
     result: dict[str, str | int] = {"view": 0, "space": "ORIG"}
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return result
 
@@ -2263,7 +2270,7 @@ def get_afni_space_info(header: object) -> dict[str, str | int]:
 
 
 def set_afni_space_info(
-    header: object,
+    header: Any,
     view: int,
     space: str,
 ) -> None:
@@ -2279,7 +2286,7 @@ def set_afni_space_info(
     try:
         import nibabel as nib
 
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2306,7 +2313,7 @@ def set_afni_space_info(
             break
 
 
-def set_afni_func_type(header: object, func_code: int = 11) -> None:
+def set_afni_func_type(header: Any, func_code: int = 11) -> None:
     """Set AFNI SCENE_DATA[1] (func type) and TYPESTRING in a NIfTI AFNI extension.
 
     Call this after inheriting a header from an EPI source when the output is a
@@ -2327,7 +2334,7 @@ def set_afni_func_type(header: object, func_code: int = 11) -> None:
     try:
         import nibabel as nib
 
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2354,7 +2361,7 @@ def set_afni_func_type(header: object, func_code: int = 11) -> None:
 
 
 def _update_afni_extension(
-    header: object,
+    header: Any,
     data_shape: tuple[int, ...],
     data_dtype: np.dtype,
 ) -> None:
@@ -2374,7 +2381,7 @@ def _update_afni_extension(
     from datetime import datetime
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2512,7 +2519,7 @@ def _update_afni_extension(
     extensions[afni_idx] = new_ext
 
 
-def _set_afni_brick_labels(header: object, labels: list[str]) -> None:
+def _set_afni_brick_labels(header: Any, labels: list[str]) -> None:
     """Set per-sub-brick labels (BRICK_LABS) so AFNI viewers show them.
 
     NIfTI has no native sub-brick labels; AFNI stores them in its NIfTI
@@ -2527,7 +2534,7 @@ def _set_afni_brick_labels(header: object, labels: list[str]) -> None:
     import nibabel as nib
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2692,7 +2699,7 @@ def _statsym_for(code: int, params: tuple[float, ...]) -> str:
 
 
 def _set_afni_brick_stataux(
-    header: object,
+    header: Any,
     stataux: dict[int, tuple[int, tuple[float, ...]]],
     n_sub: int,
 ) -> None:
@@ -2706,7 +2713,7 @@ def _set_afni_brick_stataux(
     import nibabel as nib
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2785,7 +2792,7 @@ def _niml_escape_string(cn: str) -> str:
 
 
 def set_afni_atr(
-    header: object,
+    header: Any,
     name: str,
     value: str,
     ni_type: str = "String",
@@ -2804,7 +2811,7 @@ def set_afni_atr(
     import nibabel as nib
 
     try:
-        extensions = header.extensions  # type: ignore[union-attr]
+        extensions = header.extensions
     except AttributeError:
         return
 
@@ -2961,7 +2968,7 @@ def save_nifti(
     reference_img: str | Path | None = None,
     affine: np.ndarray | None = None,
     tr: float | None = None,
-    header: object | None = None,
+    header: Any = None,
     brick_labels: list[str] | None = None,
     brick_stataux: dict[int, tuple[int, tuple[float, ...]]] | None = None,
 ):

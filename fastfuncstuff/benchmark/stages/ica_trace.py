@@ -22,6 +22,19 @@ name = "ica_trace"
 description = "ICA step-by-step parity (MELODIC debug vs ffs_ica -trace)"
 
 
+def _get_fdata(path: Path, dtype: type | None = None) -> np.ndarray:
+    """Load a NIfTI file's data as ndarray.
+
+    nib.load()'s stub return type is the loose FileBasedImage base; a real
+    .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    """
+    import nibabel as nib
+
+    img = nib.load(str(path))
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    return img.get_fdata(dtype=dtype) if dtype is not None else img.get_fdata()
+
+
 def _ica_tasks(ctx: BenchmarkContext) -> list[str]:
     params = ctx.get_stage_params("ica_trace")
     return params.get("tasks", ctx.task_names())
@@ -174,13 +187,11 @@ def _compare_subspace(mel_dir: Path, trace_dir: Path) -> dict:
     if not post_p.exists() or not mel_post_p.exists():
         return {"error": "subspace inputs missing (need migp_post_varnorm.npy)"}
 
-    import nibabel as nib
-
     pre = np.load(post_p).astype(np.float32)  # (T, V) FFS post-varnorm
-    mel_4d = nib.load(str(mel_post_p)).get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+    mel_4d = _get_fdata(mel_post_p, dtype=np.float32)
     if not mask_p.exists():
         mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5  # type: ignore[attr-defined]
+    mask = _get_fdata(mask_p) > 0.5
     mel = mel_4d[mask].T.astype(np.float32)  # (T, V)
 
     if mel.shape != pre.shape:
@@ -273,16 +284,14 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
-    import nibabel as nib
-
     ffs_post = np.load(post_p).astype(np.float64)
     ffs_std = np.load(ffs_std_p).astype(np.float64)
-    mel_4d = nib.load(str(mel_post_p)).get_fdata(dtype=np.float32)
+    mel_4d = _get_fdata(mel_post_p, dtype=np.float32)
     if mel_4d.ndim != 4:
         return {"error": f"mel concat_data not 4D: shape={mel_4d.shape}"}
     if not mask_p.exists():
         mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_post = mel_4d[mask].astype(np.float64).T
 
     if mel_post.shape != ffs_post.shape:
@@ -367,11 +376,9 @@ def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
-    import nibabel as nib
-
-    mel_noise_vol = nib.load(str(mel_noise_p)).get_fdata(dtype=np.float32)
+    mel_noise_vol = _get_fdata(mel_noise_p, dtype=np.float32)
     mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_noise = mel_noise_vol[mask].astype(np.float64)
 
     ffs_noise = np.load(str(ffs_noise_p)).astype(np.float64)

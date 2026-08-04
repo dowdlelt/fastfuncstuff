@@ -84,9 +84,23 @@ def _load_vol(path: str | Path) -> tuple[Tensor, np.ndarray]:
     shape (x,y,z,1,n) instead of (x,y,z,n)).
     """
     img = nib.load(str(path))
+    # nib.load()'s stub return type is the loose FileBasedImage base; a real
+    # .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
     data = np.asarray(img.dataobj, dtype=np.float32)
     data = np.squeeze(data)
     return torch.from_numpy(data), img.affine
+
+
+def _load_dataobj(path: str | Path) -> np.ndarray:
+    """Load a NIfTI file's raw (unscaled) data array via ``.dataobj``.
+
+    nib.load()'s stub return type is the loose FileBasedImage base; a real
+    .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    """
+    img = nib.load(str(path))
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    return np.array(img.dataobj)
 
 
 def _automask(vol: Tensor) -> Tensor:
@@ -659,27 +673,38 @@ def compare_prob_maps(
     if not stats_dir.exists():
         return {"error": "MELODIC stats/ dir not found"}
 
-    mel_prob_files = sorted(
-        stats_dir.glob("probmap*.nii.gz"),
-        key=lambda p: int(re.search(r"\d+", p.name).group()),  # type: ignore[union-attr]
-    )
+    def _probmap_index(p: Path) -> int:
+        # Filenames are always "probmap<digits>.nii.gz" by the glob below,
+        # so the digit match can never fail.
+        m = re.search(r"\d+", p.name)
+        assert m is not None
+        return int(m.group())
+
+    mel_prob_files = sorted(stats_dir.glob("probmap*.nii.gz"), key=_probmap_index)
     if not mel_prob_files:
         return {"error": "No MELODIC probmap*.nii.gz found in stats/"}
 
     if not ffs_zp_path.exists():
         return {"error": f"FFS z_prob not found: {ffs_zp_path}"}
 
-    mask_vol = nib.load(str(mask_path)).get_fdata() > 0.5  # type: ignore[attr-defined]
+    def _get_fdata(path: Path, dtype: type | None = None) -> np.ndarray:
+        # nib.load()'s stub return type is the loose FileBasedImage base; a
+        # real .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+        img = nib.load(str(path))
+        assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+        return img.get_fdata(dtype=dtype) if dtype is not None else img.get_fdata()
+
+    mask_vol = _get_fdata(mask_path) > 0.5
 
     mel_probs = []
     for f in mel_prob_files:
-        vol = nib.load(str(f)).get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+        vol = _get_fdata(f, dtype=np.float32)
         if vol.shape[:3] != mask_vol.shape:
             return {"error": f"shape mismatch: {f.name} {vol.shape} vs mask {mask_vol.shape}"}
         mel_probs.append(vol[mask_vol])
     mel_maps = np.stack(mel_probs, axis=0)  # (k_mel, V)
 
-    ffs_4d = nib.load(str(ffs_zp_path)).get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+    ffs_4d = _get_fdata(ffs_zp_path, dtype=np.float32)
     if ffs_4d.ndim != 4:
         return {"error": f"FFS z_prob not 4D: {ffs_4d.shape}"}
     ffs_maps = ffs_4d[mask_vol][:, 1::2].T  # (K, V) — odd sub-bricks = Prob

@@ -154,19 +154,15 @@ def validate(ctx: BenchmarkContext) -> dict:
     """Compare PC selection and denoised betas."""
     import json
 
-    import nibabel as nib
+    from ..validation import _load_dataobj
 
     gs = ctx.glmsingle_dir
     ffs = ctx.ffs_denoise_dir
 
     # Load GLMsingle results
-    matlab_noisepool = (
-        np.array(nib.load(str(gs / "glmsingle_noisepool.nii.gz")).dataobj).flatten().astype(bool)
-    )
-    matlab_betas = np.array(nib.load(str(gs / "glmsingle_betas_C.nii.gz")).dataobj)
-    matlab_mask = (
-        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
-    )
+    matlab_noisepool = _load_dataobj(gs / "glmsingle_noisepool.nii.gz").flatten().astype(bool)
+    matlab_betas = _load_dataobj(gs / "glmsingle_betas_C.nii.gz")
+    matlab_mask = _load_dataobj(gs / "glmsingle_mask.nii.gz").flatten().astype(bool)
 
     matlab_pcnum = int((gs / "glmsingle_pcnum.txt").read_text().strip())
     matlab_xvaltrend = np.loadtxt(str(gs / "glmsingle_xvaltrend.txt"))
@@ -184,13 +180,13 @@ def validate(ctx: BenchmarkContext) -> dict:
     noise_pool_file = ffs / "denoise_noise_pool_mask.nii.gz"
     ffs_noisepool = None
     if noise_pool_file.exists():
-        ffs_noisepool = np.array(nib.load(str(noise_pool_file)).dataobj).flatten().astype(bool)
+        ffs_noisepool = _load_dataobj(noise_pool_file).flatten().astype(bool)
 
     # FFS betas (Type C = denoised, before ridge)
     betas_file = ffs / "denoise_single_trial_betas.nii.gz"
     ffs_betas = None
     if betas_file.exists():
-        ffs_betas = np.array(nib.load(str(betas_file)).dataobj)
+        ffs_betas = _load_dataobj(betas_file)
 
     # FFS xvaltrend (pc_selection_curve.npy)
     curve_file = ffs / "denoise_pc_selection_curve.npy"

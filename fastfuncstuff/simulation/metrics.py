@@ -74,7 +74,7 @@ def compute_estimation_efficiency(
     tr: float = 1.0,
     normalize: bool = True,
     device: torch.device | None = None,
-) -> torch.Tensor | dict[str, torch.Tensor]:
+) -> torch.Tensor | dict[str, torch.Tensor | float]:
     """
     Compute estimation efficiency for HRF shape estimation
 
@@ -346,7 +346,7 @@ def compute_conditional_entropy(
     n_conditions: int,
     tr: float = 1.0,
     device: torch.device | None = None,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     """
     Compute conditional entropy (randomness) of design
 
@@ -637,7 +637,7 @@ def compare_designs(
     effect_size: float = 1.0,
     noise_std: float = 1.0,
     device: torch.device | None = None,
-) -> dict[str, dict]:
+) -> dict[str, Any]:
     """
     Compare multiple designs on efficiency, power, entropy
 

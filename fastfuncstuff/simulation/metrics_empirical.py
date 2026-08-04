@@ -25,6 +25,8 @@ Both computed with AR(1) correction for realistic fMRI temporal autocorrelation.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 import torch
 from scipy.linalg import toeplitz
@@ -325,7 +327,7 @@ def compute_estimation_efficiency_empirical(
     rho: float | None = None,
     tr: float = 1.0,
     device: torch.device | None = None,
-) -> dict[str, float | torch.Tensor]:
+) -> dict[str, float | torch.Tensor | None]:
     """
     Compute estimation efficiency using FIR design with GLS
 
@@ -463,7 +465,7 @@ def evaluate_design_empirical(
     contrast: torch.Tensor | np.ndarray | None = None,
     tr: float = 1.0,
     device: torch.device | None = None,
-) -> dict[str, float | torch.Tensor]:
+) -> dict[str, Any]:
     """
     Complete design evaluation: detection power + estimation efficiency
 

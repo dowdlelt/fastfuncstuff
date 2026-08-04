@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -1230,6 +1230,9 @@ def build_design_matrix(
                 run_starts=run_starts,
                 device=stim_device,
             )
+            # return_single_trials defaults False here, so convolve_hrf_microtime
+            # always returns a Tensor, never the (tensor, trial_info) tuple form.
+            assert isinstance(convolved, torch.Tensor)
             spmg_cols = convolved.cpu().numpy()
         else:
             spmg_cols = None
@@ -1896,7 +1899,11 @@ def _resolve_windows(
                 f"fir_window_s as list of tuples must have {n_conditions} "
                 f"entries; got {len(fir_window_s)}"
             )
-        return [(float(b), float(t)) for b, t in fir_window_s]
+        # isinstance(fir_window_s[0], tuple) only proves the first element is a
+        # tuple; ty can't infer the rest of the (assumed-homogeneous) list from
+        # that, so narrow explicitly.
+        tuple_windows = cast("list[tuple[float, float]]", fir_window_s)
+        return [(float(b), float(t)) for b, t in tuple_windows]
 
     # Form 2: user supplied per-cond scalar tops
     if isinstance(fir_window_s, list):

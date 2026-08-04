@@ -150,30 +150,26 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def validate(ctx: BenchmarkContext) -> dict:
     """Compare FRACvalue and Type D betas."""
-    import nibabel as nib
+    from ..validation import _load_dataobj, _pearson_r
 
     gs = ctx.glmsingle_dir
     ffs = ctx.ffs_ridge_dir
 
-    matlab_fracvalue = np.array(nib.load(str(gs / "glmsingle_fracvalue.nii.gz")).dataobj).flatten()
-    matlab_mask = (
-        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
-    )
-    matlab_betas = np.array(nib.load(str(gs / "glmsingle_betas_D.nii.gz")).dataobj)
+    matlab_fracvalue = _load_dataobj(gs / "glmsingle_fracvalue.nii.gz").flatten()
+    matlab_mask = _load_dataobj(gs / "glmsingle_mask.nii.gz").flatten().astype(bool)
+    matlab_betas = _load_dataobj(gs / "glmsingle_betas_D.nii.gz")
 
     results = {}
 
     frac_file = ffs / "ridge_optimal_frac.nii.gz"
     ffs_frac = None
     if frac_file.exists():
-        ffs_frac = np.array(nib.load(str(frac_file)).dataobj).flatten()
+        ffs_frac = _load_dataobj(frac_file).flatten()
 
     betas_file = ffs / "ridge_single_trial_betas.nii.gz"
     ffs_betas = None
     if betas_file.exists():
-        ffs_betas = np.array(nib.load(str(betas_file)).dataobj)
-
-    from ..validation import _pearson_r
+        ffs_betas = _load_dataobj(betas_file)
 
     # 1. FRACvalue spatial correlation
     frac_corr = float("nan")

@@ -11,6 +11,7 @@ Removes MIGP from the pipeline — isolates varnorm and ICA solver divergence.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -19,6 +20,19 @@ from ..validation import _pearson_r, compare_prob_maps
 
 name = "ica_single_trace"
 description = "ICA single-run step-by-step parity (MELODIC debug vs ffs_ica -trace)"
+
+
+def _get_fdata(path: Path, dtype: type | None = None) -> np.ndarray:
+    """Load a NIfTI file's data as ndarray.
+
+    nib.load()'s stub return type is the loose FileBasedImage base; a real
+    .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    """
+    import nibabel as nib
+
+    img = nib.load(str(path))
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    return img.get_fdata(dtype=dtype) if dtype is not None else img.get_fdata()
 
 
 def _ica_tasks(ctx: BenchmarkContext) -> list[str]:
@@ -84,12 +98,10 @@ def _compare_varnorm(mel_dir: Path, trace_dir: Path) -> dict:
     if not post_p.exists() or not mel_post_p.exists():
         return {"error": "varnorm inputs missing"}
 
-    import nibabel as nib
-
     ffs_post = np.load(str(post_p)).astype(np.float64)
-    mel_4d = nib.load(str(mel_post_p)).get_fdata(dtype=np.float32)
+    mel_4d = _get_fdata(mel_post_p, dtype=np.float32)
     mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_post = mel_4d[mask].astype(np.float64).T
 
     if mel_post.shape != ffs_post.shape:
@@ -233,10 +245,8 @@ def _compare_ic_maps(mel_dir: Path, trace_dir: Path, mask_path: Path) -> dict:
     if not mel_ic_p.exists() or not ffs_ic_p.exists():
         return {"error": "IC map files not found"}
 
-    import nibabel as nib
-
-    mel_4d = nib.load(str(mel_ic_p)).get_fdata(dtype=np.float32)
-    mask = nib.load(str(mask_path)).get_fdata() > 0.5
+    mel_4d = _get_fdata(mel_ic_p, dtype=np.float32)
+    mask = _get_fdata(mask_path) > 0.5
     mel_maps = mel_4d[mask].T  # (k, V)
 
     ffs_maps = np.load(str(ffs_ic_p)).astype(np.float32)
@@ -273,11 +283,9 @@ def _compare_noise_norm(mel_dir: Path, trace_dir: Path) -> dict:
     if missing:
         return {"error": f"missing: {', '.join(missing)}"}
 
-    import nibabel as nib
-
-    mel_noise_vol = nib.load(str(mel_noise_p)).get_fdata(dtype=np.float32)
+    mel_noise_vol = _get_fdata(mel_noise_p, dtype=np.float32)
     mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_noise = mel_noise_vol[mask].astype(np.float64)
 
     ffs_noise = np.load(str(ffs_noise_p)).astype(np.float64)
@@ -313,11 +321,9 @@ def _compare_raw_oic(mel_dir: Path, trace_dir: Path) -> dict:
     if not mel_oic_p.exists() or not ffs_oic_p.exists():
         return {"error": "raw oIC files not found"}
 
-    import nibabel as nib
-
-    mel_4d = nib.load(str(mel_oic_p)).get_fdata(dtype=np.float32)
+    mel_4d = _get_fdata(mel_oic_p, dtype=np.float32)
     mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_maps = mel_4d[mask].T.astype(np.float32)
 
     ffs_maps = np.load(str(ffs_oic_p)).astype(np.float32)
@@ -373,11 +379,9 @@ def _compare_pca_components(mel_dir: Path, trace_dir: Path) -> dict:
     if not mel_pca_p.exists() or not ffs_pca_p.exists():
         return {"error": "PCA component files not found"}
 
-    import nibabel as nib
-
-    mel_4d = nib.load(str(mel_pca_p)).get_fdata(dtype=np.float32)
+    mel_4d = _get_fdata(mel_pca_p, dtype=np.float32)
     mask_p = mel_dir / "mask.nii.gz"
-    mask = nib.load(str(mask_p)).get_fdata() > 0.5
+    mask = _get_fdata(mask_p) > 0.5
     mel_pca = mel_4d[mask].T.astype(np.float32)
 
     ffs_pca = np.load(str(ffs_pca_p)).astype(np.float32)
@@ -463,7 +467,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 
 def validate(ctx: BenchmarkContext) -> dict:
-    per_run_results = []
+    per_run_results: list[dict[str, Any]] = []
 
     for dataset in _ica_tasks(ctx):
         for run in ctx.runs_for_task(dataset):
@@ -483,7 +487,9 @@ def validate(ctx: BenchmarkContext) -> dict:
                 / "stats"
                 / "z_prob.nii.gz"
             )
-            run_result = {
+            # Heterogeneous values (str/int/dict per key) — dict[str, Any] is
+            # the honest type; ty can't derive a TypedDict from the literal.
+            run_result: dict[str, Any] = {
                 "dataset": dataset,
                 "run": run,
                 "eigenvalues": _compare_eigenvalues(mel_dir, td),

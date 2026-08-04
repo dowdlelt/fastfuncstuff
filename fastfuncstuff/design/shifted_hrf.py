@@ -656,6 +656,9 @@ def fit_shifted_hrf(
                 # profiled SSE reduction for each candidate g
                 gain = num**2 / self_norm[b].unsqueeze(-1)
                 if lam_sweep is not None:
+                    # tau_bar is set above whenever lam_sweep is not None
+                    # (same condition), just outside this per-block loop.
+                    assert tau_bar is not None
                     # (tau_g - tau_bar_v)^2 -> (G, nv)
                     dev_tau = tau_t.unsqueeze(-1) - tau_bar.unsqueeze(0)
                     gain = gain - lam_sweep.unsqueeze(0) * dev_tau**2

@@ -269,6 +269,9 @@ def inject_clustsim_headers(
     src = (
         load_nifti(str(path)) if str(path).endswith(".nii.zst") else nib.load(str(path), mmap=False)
     )
+    # nib.load()'s stub return type is the loose FileBasedImage base; a real
+    # .nii/.nii.gz/.nii.zst is always a Nifti1Image/Nifti2Image at runtime.
+    assert isinstance(src, (nib.Nifti1Image, nib.Nifti2Image))
     data = np.asarray(src.dataobj)
     header = src.header.copy()
     affine = src.affine

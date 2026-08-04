@@ -2165,6 +2165,9 @@ def build_task_design_for_run(
         run_starts=[0],
         device=device,
     )
+    # return_single_trials defaults False here, so convolve_hrf_microtime
+    # always returns a Tensor, never the (tensor, trial_info) tuple form.
+    assert isinstance(design, torch.Tensor)
     return design, labels, durations
 
 

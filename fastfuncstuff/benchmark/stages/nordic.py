@@ -29,6 +29,20 @@ REF_GFACTOR = "gfactor_NORDIC_sub-3003_ses-fine_task-expres_run-1_part-mag_bold.
 FFS_PREFIX = "ffs_nordic_defaults"
 NOISE_VOLS = 3
 
+
+def _get_fdata(path: Path, dtype: type | None = None) -> np.ndarray:
+    """Load a NIfTI file's data as ndarray.
+
+    nib.load()'s stub return type is the loose FileBasedImage base; a real
+    .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    """
+    import nibabel as nib
+
+    img = nib.load(str(path))
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    return img.get_fdata(dtype=dtype) if dtype is not None else img.get_fdata()
+
+
 THRESHOLDS = {
     "ts_median_r": 0.95,
     "gfactor_r": 0.99,
@@ -142,8 +156,6 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def validate(ctx: BenchmarkContext) -> dict:
     """Compare ffs_nordic output against MATLAB NORDIC reference."""
-    import nibabel as nib
-
     nd = _nordic_dir(ctx)
 
     ref_path = nd / REF_OUT
@@ -155,8 +167,8 @@ def validate(ctx: BenchmarkContext) -> dict:
         if not p.exists():
             return {"passed": False, "summary": f"Missing: {p.name}"}
 
-    ref_img = nib.load(str(ref_path)).get_fdata(dtype=np.float32)
-    ffs_img = nib.load(str(ffs_path)).get_fdata(dtype=np.float32)
+    ref_img = _get_fdata(ref_path, dtype=np.float32)
+    ffs_img = _get_fdata(ffs_path, dtype=np.float32)
 
     keep = ref_img.shape[3] - NOISE_VOLS
     mask = ref_img[..., :keep].std(axis=3) > 0
@@ -165,8 +177,8 @@ def validate(ctx: BenchmarkContext) -> dict:
 
     gf_r = None
     if ref_gf_path.exists() and ffs_gf_path.exists():
-        gf_ref = nib.load(str(ref_gf_path)).get_fdata().squeeze()
-        gf_ffs = nib.load(str(ffs_gf_path)).get_fdata().squeeze()
+        gf_ref = _get_fdata(ref_gf_path).squeeze()
+        gf_ffs = _get_fdata(ffs_gf_path).squeeze()
         gf_mask = gf_ref.ravel() > 0
         if gf_mask.sum() > 10:
             gf_r = float(np.corrcoef(gf_ref.ravel()[gf_mask], gf_ffs.ravel()[gf_mask])[0, 1])

@@ -889,11 +889,11 @@ def fit_glm_hrf_library_with_xval(
     if not needs_chunking:
         projected_data = data.clone()
         for run_idx in range(n_runs):
-            if q_factors[run_idx] is None:
+            Q = q_factors[run_idx]
+            if Q is None:
                 continue
             start_tp = run_starts[run_idx]
             end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-            Q = q_factors[run_idx]
             run_data = data[:, start_tp:end_tp].to(device)
             run_data_proj = run_data - (Q @ (Q.T @ run_data.T)).T
             projected_data[:, start_tp:end_tp] = run_data_proj.cpu()
@@ -907,8 +907,8 @@ def fit_glm_hrf_library_with_xval(
                 start_tp = run_starts[run_idx]
                 end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
                 chunk_run = data[cs:ce, start_tp:end_tp]
-                if q_factors[run_idx] is not None:
-                    Q = q_factors[run_idx]
+                Q = q_factors[run_idx]
+                if Q is not None:
                     chunk_dev = chunk_run.to(device)
                     chunk_proj = chunk_dev - (Q @ (Q.T @ chunk_dev.T)).T
                     projected_data[cs:ce, start_tp:end_tp] = chunk_proj.cpu()
@@ -1006,6 +1006,9 @@ def fit_glm_hrf_library_with_xval(
         run_starts=run_starts,
         device=device,
     )
+    # return_single_trials defaults False here, so convolve_hrf_microtime
+    # always returns a Tensor, never the (tensor, trial_info) tuple form.
+    assert isinstance(canonical_design, torch.Tensor)
     projected_canonical_design = _project_design_with_q_factors(
         canonical_design, q_factors, run_starts, n_timepoints, n_runs, device
     )
@@ -1179,6 +1182,10 @@ def fit_glm_hrf_library_with_xval(
                 r2_method=r2_method,
                 verbose=False,
             )
+            # "r2" is always a Tensor at runtime; only "n_splits" in this dict
+            # is an int, which is why compute_xval_r2's declared return type
+            # is the whole-dict union `Tensor | int`.
+            assert isinstance(canonical_check["r2"], torch.Tensor)
             r2_path_a = canonical_check["r2"].to(device)
 
             # Path B: full 3dDenoisefast-style (project_out_nuisance_per_run + compute_xval_r2)
@@ -1203,6 +1210,7 @@ def fit_glm_hrf_library_with_xval(
                 r2_method=r2_method,
                 verbose=False,
             )
+            assert isinstance(canonical_check_b["r2"], torch.Tensor)
             r2_path_b = canonical_check_b["r2"].to(device)
 
             print(f"  [diagnostic] Batched LORO canonical R²:      {xval_r2_canonical.mean():.4f}")
@@ -1240,6 +1248,7 @@ def fit_glm_hrf_library_with_xval(
                 r2_method=r2_method,
                 verbose=False,
             )
+            assert isinstance(xval_results["r2"], torch.Tensor)
             xval_r2_median_all[:, hrf_idx] = xval_results["r2"].to(device)
 
         canonical_xval = compute_xval_r2(
@@ -1256,6 +1265,7 @@ def fit_glm_hrf_library_with_xval(
             r2_method=r2_method,
             verbose=False,
         )
+        assert isinstance(canonical_xval["r2"], torch.Tensor)
         xval_r2_canonical = canonical_xval["r2"].to(device)
 
     xval_r2_std_all = torch.zeros(n_voxels, n_hrfs, device=device)
@@ -1294,6 +1304,7 @@ def fit_glm_hrf_library_with_xval(
     canonical_design_matrix = torch.cat([canonical_design, nuisance_design], dim=1)
 
     if verbose:
+        assert canonical_glm_results.r2 is not None  # fit_glm always computes r2
         print(f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}")
 
     # Select best HRF per voxel based on median CV R²
@@ -1427,6 +1438,7 @@ def fit_glm_hrf_library_with_xval(
         print("HRF SELECTION COMPLETE")
         print("=" * 70)
         print("  Best HRF per voxel stored in hrf_index")
+        assert final_results.betas is not None and final_results.r2 is not None  # fit_glm output
         print(f"  Final betas shape: {final_results.betas.shape}")
         print(f"  Final R² mean: {final_results.r2.mean().item():.4f}")
         print()
@@ -1692,6 +1704,7 @@ def _fit_voxelwise_hrf_canonical(
     results.dof = results_glm.dof
 
     if verbose:
+        assert results.r2 is not None  # fit_glm always computes r2
         print(f"  Canonical fit complete. Mean R²: {results.r2.mean().item():.4f}")
 
     return results
@@ -2140,7 +2153,7 @@ def save_hrf_selection_results(
     onsets: torch.Tensor | None = None,
     save_plots: bool = False,
     nii_ext: str = ".nii.gz",
-) -> dict[str, str]:
+) -> dict[str, str | list[str]]:
     """
     Save HRF selection results to disk.
 
@@ -2180,8 +2193,7 @@ def save_hrf_selection_results(
 
     from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
-    output_prefix = Path(output_prefix)
-    output_dir = output_prefix.parent
+    output_dir = Path(output_prefix).parent
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_files = {}
@@ -2461,6 +2473,9 @@ def save_hrf_selection_results(
                     microtime_dt=microtime_dt,
                     microtime_onset=microtime_onset,
                 )
+                # return_single_trials defaults False here, so this is always
+                # a Tensor, never the (tensor, trial_info) tuple form.
+                assert isinstance(stim_design, torch.Tensor)
 
                 # Build full design: [stimulus | polynomials]
                 full_design = torch.cat([stim_design, poly_design], dim=1)

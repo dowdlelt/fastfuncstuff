@@ -215,7 +215,9 @@ def plot_speedup_bars(
             ref = _get_ref_seconds(stage_data)
             ffs = stage_data.get("ffs_seconds", 0) or 0
             if ffs > 0 and ref > 0:
-                speedups.append(ref / ffs)
+                # ty's division-by-zero check doesn't refine numeric value
+                # ranges from the `ffs > 0` guard above.
+                speedups.append(ref / ffs)  # ty: ignore[division-by-zero]
             else:
                 speedups.append(0.0)
 

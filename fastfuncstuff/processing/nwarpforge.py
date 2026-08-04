@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -153,7 +154,7 @@ class NonlinearWarp:
 
     @property
     def shape(self) -> tuple[int, int, int]:
-        return self.xd.shape
+        return (self.xd.shape[0], self.xd.shape[1], self.xd.shape[2])
 
 
 @dataclass
@@ -1345,7 +1346,8 @@ def _estimate_warp_padding(
 
     import math
 
-    return tuple(int(math.ceil(b)) for b in bound)  # type: ignore[return-value]
+    px, py, pz = (int(math.ceil(b)) for b in bound)
+    return px, py, pz
 
 
 def _pad_output_grid(
@@ -1750,6 +1752,9 @@ def nwarpforge(
 
     t0_load = __import__("time").time()
     source, source_header = load_image(source_path, device=device)
+    # load_image's header_info is declared `object` (loose I/O boundary type)
+    # but is always the {"affine": ..., "header": ...} dict it documents.
+    assert isinstance(source_header, dict)
     if verb >= 1:
         print(
             f"Loaded source: {source_path} {source.shape} ({__import__('time').time() - t0_load:.2f}s)"
@@ -1850,7 +1855,7 @@ def nwarpforge(
         if verb >= 1:
             print(f"nwarpforge: joint slice-timing carries phase (phase_warp={phase_warp})")
 
-    master_hdr_obj = None  # nibabel header for AFNI extension propagation
+    master_hdr_obj: Any = None  # nibabel header for AFNI extension propagation
     # "-master WARP/NWARP": use the first nonlinear warp's grid. The warps
     # aren't loaded yet, so defer the grid decision until after the chain loads.
     use_warp_master = master_path is not None and master_path.upper() in ("WARP", "NWARP")
@@ -1864,6 +1869,7 @@ def nwarpforge(
             print("nwarpforge: -master WARP -> output grid = first nonlinear warp")
     elif master_path is not None:
         master, master_header = load_image(master_path, device=device)
+        assert isinstance(master_header, dict)
         if master.ndim == 4:
             master = master[0]
         output_shape = tuple(master.shape)
@@ -2445,7 +2451,9 @@ def nwarpforge(
     # source's qform/sform which would conflict with the output grid.
     # Preserve temporal metadata (TR, units) from source.
     # Propagate AFNI view/space from master (e.g. tlrc + MNI_2009c_asym).
-    src_hdr = source_header.get("header")
+    # header_info["header"] is a nibabel header object; the dict itself is
+    # typed loosely (see load_image), so this duck-typed access is expected.
+    src_hdr: Any = source_header.get("header")
     try:
         import nibabel as nib
 
@@ -2466,7 +2474,7 @@ def nwarpforge(
             if hdr_candidate is None:
                 continue
             try:
-                for ext in hdr_candidate.extensions:
+                for ext in hdr_candidate.extensions:  # ty: ignore[unresolved-attribute]
                     if ext.get_code() == 4:
                         out_hdr.extensions.append(ext)
                         afni_ext_copied = True

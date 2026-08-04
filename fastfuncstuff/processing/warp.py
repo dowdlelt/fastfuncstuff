@@ -1563,6 +1563,9 @@ def _improve_warp_batched(
                 kernel_type=config.lpa_kernel,
             )
         else:
+            # batch_incor is built exactly when `not (use_blok or use_conv_lpa)`,
+            # which is this branch's condition.
+            assert batch_incor is not None
             corr = batch_incor.evaluate(base_patches, warped_vals, weight_patches)
         cost = -corr  # negate for minimization
 
@@ -3419,6 +3422,10 @@ def _improve_warp_serial(
                 )[0]
             )
         else:
+            # incor is built exactly when `not use_blok_serial`, this branch's
+            # condition; it's a captured closure variable so ty can't narrow
+            # it across the outer `if use_blok_serial` the way it would inline.
+            assert incor is not None
             corr = incor.evaluate(b_local, warped_vals, w_local)
         cost = -corr
 

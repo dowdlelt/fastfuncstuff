@@ -645,6 +645,7 @@ def icasso(
         )
         ica.verbose = False
         ica.fit(X_i)
+        assert ica.pca_ is not None and ica.components_ is not None and ica.mixing_ is not None
 
         if i == 0:
             evar = ica.pca_.explained_variance_.cpu().numpy()
@@ -1005,6 +1006,7 @@ def icasso_auto_select(
         print("Running PCA for variance analysis ...")
     temp_ica = FastICA(n_components=1, pca_components=pca_components, device=device)
     temp_ica.fit(X)
+    assert temp_ica.pca_ is not None  # fit() always populates it
     evar = temp_ica.pca_.explained_variance_.cpu().numpy()
     pca_variance_curve = evar / evar.sum()
     pca_cumsum_curve = pca_variance_curve.cumsum()

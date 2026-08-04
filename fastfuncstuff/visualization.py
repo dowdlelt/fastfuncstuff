@@ -558,7 +558,7 @@ def plot_parametric_exploration(
     axes = axes.flatten()
 
     # Color map
-    cmap = plt.cm.viridis  # ty: ignore[unresolved-attribute]
+    cmap = plt.cm.viridis
 
     for z_idx, z_val in enumerate(z_vals):
         ax = axes[z_idx]
@@ -1026,7 +1026,7 @@ def plot_noise_pool_pca_scree(
         raise ValueError("scree_ratio_per_run is empty")
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=False)
-    colors = plt.cm.tab10(np.linspace(0, 1, len(ratios_np)))  # ty: ignore[unresolved-attribute]
+    colors = plt.cm.tab10(np.linspace(0, 1, len(ratios_np)))
 
     for run_idx, (ratios, color) in enumerate(zip(ratios_np, colors, strict=False)):
         x = np.arange(1, len(ratios) + 1)
@@ -1202,7 +1202,7 @@ def plot_denoising_pcs(
         _time_axis = np.arange(total_tps) * tr
 
         # Plot each run with different color
-        colors = plt.cm.tab10(np.linspace(0, 1, n_runs))  # ty: ignore[unresolved-attribute]
+        colors = plt.cm.tab10(np.linspace(0, 1, n_runs))
         current_tp = 0
 
         for run_idx, (pcs, color) in enumerate(zip(pcs_np, colors, strict=False)):

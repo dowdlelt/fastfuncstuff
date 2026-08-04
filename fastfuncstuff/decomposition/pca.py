@@ -371,7 +371,7 @@ class PCA:
         second_deriv = np.diff(first_deriv)
 
         # Find knee (max curvature)
-        knee_idx = np.argmax(np.abs(second_deriv)) + 2  # +2 to account for two diffs
+        knee_idx = int(np.argmax(np.abs(second_deriv))) + 2  # +2 to account for two diffs
 
         return max(1, knee_idx)
 
@@ -398,7 +398,12 @@ class PCA:
         params : dict
             Dictionary with PCA parameters (converted to numpy arrays)
         """
-        if self.components_ is None:
+        if (
+            self.components_ is None
+            or self.explained_variance_ is None
+            or self.explained_variance_ratio_ is None
+            or self.mean_ is None
+        ):
             raise RuntimeError("PCA must be fitted first")
 
         return {

@@ -52,6 +52,17 @@ class _RowCenteredPCAState:
         X = to_tensor(X, device=self.device)
         return X @ self.components_.T
 
+    def to_dict(self) -> dict:
+        """Export PCA state to a dictionary (for FastICA.to_dict())."""
+        return {
+            "components": self.components_.cpu().numpy(),
+            "n_components": self.n_components_,
+            "explained_variance": self.explained_variance_.cpu().numpy(),
+            "eigenvectors": self._eigenvectors.cpu().numpy(),
+            "eigenvalues": self._eigenvalues.cpu().numpy(),
+            "row_mean": self._row_mean.cpu().numpy(),
+        }
+
 
 class FastICA:
     """
@@ -282,7 +293,7 @@ class FastICA:
         S : torch.Tensor, shape (n_samples, n_components)
             ICA component timeseries
         """
-        if self.components_ is None:
+        if self.components_ is None or self.pca_ is None:
             raise RuntimeError("ICA must be fitted before transform()")
 
         # Convert to tensor
@@ -313,6 +324,7 @@ class FastICA:
             ICA component timeseries
         """
         self.fit(X)
+        assert self.mixing_ is not None  # fit() always populates it
         return self.mixing_
 
     def inverse_transform(self, S: np.ndarray | torch.Tensor) -> torch.Tensor:
@@ -678,7 +690,7 @@ class FastICA:
 
     def to_dict(self) -> dict:
         """Export ICA parameters to dictionary"""
-        if self.components_ is None:
+        if self.components_ is None or self.mixing_ is None or self.pca_ is None:
             raise RuntimeError("ICA must be fitted first")
 
         return {
@@ -1063,7 +1075,7 @@ class InfoMaxICA:
 
     def transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Transform data to ICA component space."""
-        if self.components_ is None:
+        if self.components_ is None or self.pca_ is None:
             raise RuntimeError("ICA must be fitted before transform()")
         X = to_tensor(X, device=self.device)
         X_pca = self.pca_.transform(X)
@@ -1073,6 +1085,7 @@ class InfoMaxICA:
     def fit_transform(self, X: np.ndarray | torch.Tensor) -> torch.Tensor:
         """Fit and return mixing matrix."""
         self.fit(X)
+        assert self.mixing_ is not None  # fit() always populates it
         return self.mixing_
 
 
@@ -1173,6 +1186,7 @@ def ica_stability_analysis(
             device=device,
         )
         ica.fit(X)
+        assert ica.components_ is not None  # fit() always populates it
         components_list.append(ica.components_.cpu().numpy())
 
     # Convert to array

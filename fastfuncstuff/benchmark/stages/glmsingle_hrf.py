@@ -10,8 +10,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import numpy as np
-
 from ..runner import BenchmarkContext, run_timed
 
 name = "glmsingle_hrf"
@@ -134,26 +132,24 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 def validate(ctx: BenchmarkContext) -> dict:
     """Compare HRF indices and R² maps between GLMsingle and FFS."""
-    import nibabel as nib
+    from ..validation import _load_dataobj, _pearson_r
 
     gs = ctx.glmsingle_dir
     ffs = ctx.ffs_hrfopt_dir
 
     # Load GLMsingle results
-    matlab_hrf_index = np.array(nib.load(str(gs / "glmsingle_hrf_index.nii.gz")).dataobj).flatten()
-    matlab_r2 = np.array(nib.load(str(gs / "glmsingle_r2_B.nii.gz")).dataobj).flatten()
-    matlab_mask = (
-        np.array(nib.load(str(gs / "glmsingle_mask.nii.gz")).dataobj).flatten().astype(bool)
-    )
+    matlab_hrf_index = _load_dataobj(gs / "glmsingle_hrf_index.nii.gz").flatten()
+    matlab_r2 = _load_dataobj(gs / "glmsingle_r2_B.nii.gz").flatten()
+    matlab_mask = _load_dataobj(gs / "glmsingle_mask.nii.gz").flatten().astype(bool)
 
     # Load FFS results. ffs_hrfopt writes hrf_index as 4D with 2 sub-briks:
     # [0] = chosen HRF index (1..N_HRFS), [1] = per-voxel quality/score.
     # Compare against MATLAB's 3D single-brik output using sub-brik 0.
-    ffs_idx_raw = np.array(nib.load(str(ffs / "hrfopt_hrf_index.nii.gz")).dataobj)
+    ffs_idx_raw = _load_dataobj(ffs / "hrfopt_hrf_index.nii.gz")
     if ffs_idx_raw.ndim == 4:
         ffs_idx_raw = ffs_idx_raw[..., 0]
     ffs_hrf_index = ffs_idx_raw.flatten()
-    ffs_r2 = np.array(nib.load(str(ffs / "hrfopt_xval_r2.nii.gz")).dataobj).flatten()
+    ffs_r2 = _load_dataobj(ffs / "hrfopt_xval_r2.nii.gz").flatten()
 
     # Compare within mask
     mask = matlab_mask & (ffs_r2 > 0)
@@ -170,8 +166,6 @@ def validate(ctx: BenchmarkContext) -> dict:
     agreement = (matlab_idx_masked == ffs_idx_masked).mean()
 
     # R² spatial correlation
-    from ..validation import _pearson_r
-
     r2_corr = _pearson_r(matlab_r2[mask], ffs_r2[mask])
 
     passed = (

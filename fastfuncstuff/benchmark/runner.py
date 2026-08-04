@@ -328,7 +328,10 @@ def run_timed(
         while open_streams > 0:
             for key, _ in sel.select(timeout=0.5):
                 _, sink, buf = key.data
-                line = key.fileobj.readline()
+                # key.fileobj is `int | HasFileno` per selectors' stub (any
+                # fileno()-having registerable); we only ever register the
+                # actual proc.stdout/proc.stderr text streams above.
+                line = key.fileobj.readline()  # ty: ignore[unresolved-attribute]
                 if not line:
                     sel.unregister(key.fileobj)
                     open_streams -= 1

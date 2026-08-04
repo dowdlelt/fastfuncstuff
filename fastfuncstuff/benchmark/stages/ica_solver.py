@@ -77,9 +77,13 @@ def _run_solver(mel_dir: Path, out_dir: Path, seed: int = 1) -> None:
 
     white = np.loadtxt(mel_dir / "melodic_white").astype(np.float64)  # (k, T)
     mask_img = nib.load(str(mel_dir / "mask.nii.gz"))
-    mask = mask_img.get_fdata() > 0.5  # type: ignore[attr-defined]
+    # nib.load()'s stub return type is the loose FileBasedImage base; a real
+    # .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    assert isinstance(mask_img, (nib.Nifti1Image, nib.Nifti2Image))
+    mask = mask_img.get_fdata() > 0.5
     concat_img = nib.load(str(mel_dir / "concat_data.nii.gz"))
-    concat_4d = concat_img.get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+    assert isinstance(concat_img, (nib.Nifti1Image, nib.Nifti2Image))
+    concat_4d = concat_img.get_fdata(dtype=np.float32)
     if concat_4d.ndim != 4:
         raise ValueError(f"concat_data not 4D: shape={concat_4d.shape}")
     concat_tv = concat_4d[mask].astype(np.float64).T  # (T, V)
@@ -217,8 +221,11 @@ def _compare(mel_dir: Path, out_dir: Path) -> dict:
     import nibabel as nib
 
     mel_img = nib.load(str(mel_dir / "melodic_oIC.nii.gz"))
-    mask = nib.load(str(mel_dir / "mask.nii.gz")).get_fdata() > 0.5  # type: ignore[attr-defined]
-    mel_4d = mel_img.get_fdata(dtype=np.float32)  # type: ignore[attr-defined]
+    mask_img = nib.load(str(mel_dir / "mask.nii.gz"))
+    assert isinstance(mask_img, (nib.Nifti1Image, nib.Nifti2Image))
+    assert isinstance(mel_img, (nib.Nifti1Image, nib.Nifti2Image))
+    mask = mask_img.get_fdata() > 0.5
+    mel_4d = mel_img.get_fdata(dtype=np.float32)
     if mel_4d.ndim != 4:
         return {"error": f"melodic_oIC not 4D: {mel_4d.shape}"}
     mel_comp = mel_4d[mask].T.astype(np.float64)

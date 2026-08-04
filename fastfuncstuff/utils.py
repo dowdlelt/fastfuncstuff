@@ -733,7 +733,7 @@ def generate_synthetic_runs(
         print("\n" + "=" * 70)
         print("🎭 DRY RUN MODE - Generating Synthetic Data")
         print("=" * 70)
-        if use_first_run:
+        if first_run_data is not None:
             print(f"  Using real data from run 1: {first_run_data.shape}")
         else:
             print(f"  All-synthetic mode: {n_voxels:,} voxels, {n_runs_total} runs")

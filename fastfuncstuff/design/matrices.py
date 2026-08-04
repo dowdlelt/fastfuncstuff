@@ -180,7 +180,9 @@ def convolve_hrf_microtime(
 
     # 2. Process each condition using single-trial approach
     design = torch.zeros(n_timepoints, n_conditions, device=device)
-    single_trial_designs = [] if return_single_trials else None
+    # Always a list (not Optional): trivially cheap when unused, and it avoids
+    # having to re-narrow `list | None` at each conditional append below.
+    single_trial_designs: list[torch.Tensor] = []
 
     run_start_bins: torch.Tensor | None = None
     run_end_bins: torch.Tensor | None = None
@@ -774,7 +776,7 @@ def is_tr_locked(
 
 def make_singletrialdesign(
     onsets: torch.Tensor, device: torch.device | None = None
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Create single-trial design matrix (one regressor per trial)
 
