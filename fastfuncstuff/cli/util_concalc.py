@@ -809,7 +809,11 @@ def main() -> int:
             input_stataux = _parse_stataux(txt)
             break
 
-    vol_shape = stats_data.shape[:3] if args.ols else a_map.shape
+    if args.ols:
+        vol_shape = stats_data.shape[:3]
+    else:
+        assert a_map is not None, "a_map is always set when not args.ols"
+        vol_shape = a_map.shape
     if not args.ols and stats_data.shape[:3] != vol_shape:
         print(
             f"ERROR: stats and rvar volume shapes disagree "

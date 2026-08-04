@@ -56,7 +56,7 @@ def _sgf_coefficients(
 
     try:
         coeffs = torch.linalg.pinv(vander, atol=1e-7)[deriv]
-    except torch._C._LinAlgError:
+    except torch._C._LinAlgError:  # ty: ignore[unresolved-attribute]
         coeffs = torch.zeros(window_length, device=device, dtype=dtype)
         coeffs[half] = 1.0
     return coeffs
@@ -208,7 +208,7 @@ def savgol_filter_explore(
         for p in range(min_order, min(max_order, w - 1) + 1):
             try:
                 filt = savgol_filter_1d(data, w, p)
-            except torch._C._LinAlgError:
+            except torch._C._LinAlgError:  # ty: ignore[unresolved-attribute]
                 continue
             score = metric_fn(filt)
             improved = score > best_score

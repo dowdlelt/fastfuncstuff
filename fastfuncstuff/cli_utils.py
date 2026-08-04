@@ -1183,7 +1183,7 @@ def _infer_run_indices_from_filenames(
             unmatched = [n for n, m in zip(names, matches, strict=False) if not m]
             failures.append(f"{desc}: did not match {unmatched[:3]}")
             continue
-        nums = [int(m.group(1)) for m in matches]
+        nums = [int(m.group(1)) for m in matches if m is not None]
         dup_counts = Counter(nums)
         dups = [n for n, c in dup_counts.items() if c > 1]
         if dups:

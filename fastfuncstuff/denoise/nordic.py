@@ -613,6 +613,7 @@ def _llr_denoise(
 
     # Flatten accumulators for scatter (all allocated contiguous, so reshape = view)
     if return_recon:
+        assert recon_acc is not None
         recon_flat = recon_acc.reshape(-1, nt)
     weight_flat = weight.reshape(-1)
     noise_flat = noise_map.reshape(-1)

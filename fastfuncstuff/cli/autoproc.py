@@ -920,7 +920,7 @@ def main(argv: list[str] | None = None) -> int:
         ref_anat=args.ref_anat,
         events=args.events,
     )
-    opt.nordic_save_resid = args.nordic_save_resid  # emitter reads via getattr
+    opt.nordic_save_resid = args.nordic_save_resid  # ty: ignore[unresolved-attribute]  # emitter reads via getattr
     opt.batch_overwrite = args.batch_overwrite
     opt.qc = not args.no_qc
     # Output formats: keep the Options (config) default unless the user set one.

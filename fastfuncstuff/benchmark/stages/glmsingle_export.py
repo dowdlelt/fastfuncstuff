@@ -49,9 +49,10 @@ def export_glmsingle_niftis(
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load template for affine and header
+    # Load template for affine and header. nibabel ships without type stubs,
+    # so ty infers the loose base FileBasedImage type here.
     template = nib.load(str(template_nifti))
-    affine = template.affine
+    affine = template.affine  # ty: ignore[unresolved-attribute]
 
     # Load .mat file
     with h5py.File(str(mat_file), "r") as f:

@@ -109,5 +109,5 @@ def safe_compile(fn: Callable | None = None, **compile_kwargs: Any) -> Callable:
                 )
             return fn(*args, **kwargs)
 
-    wrapper._ffs_eager = fn  # type: ignore[attr-defined]  # escape hatch for tests
+    wrapper._ffs_eager = fn  # ty: ignore[unresolved-attribute]  # escape hatch for tests
     return wrapper

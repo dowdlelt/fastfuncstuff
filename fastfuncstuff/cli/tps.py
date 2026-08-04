@@ -345,7 +345,7 @@ def main():
             mask_3d = load_nifti(args.mask)
         if mask_3d.shape != (nx, ny, nz):
             raise ValueError(f"Mask shape {mask_3d.shape} doesn't match data {(nx, ny, nz)}")
-        mask = mask_3d.astype(bool)
+        mask = mask_3d.get_fdata().astype(bool)
     else:
         if args.verb >= 1:
             print("\nGenerating brain mask (non-zero voxels)...")

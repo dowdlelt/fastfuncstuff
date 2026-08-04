@@ -1212,6 +1212,7 @@ def main() -> None:
     betas_full = results.betas
     if isinstance(betas_full, torch.Tensor):
         betas_full = betas_full.detach().cpu().numpy()
+    assert results.r2 is not None, "fit_glm always populates r2"
     r2 = results.r2
     if isinstance(r2, torch.Tensor):
         r2 = r2.detach().cpu().numpy()

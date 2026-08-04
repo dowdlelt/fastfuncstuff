@@ -283,13 +283,18 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 def _load_vol(path: Path) -> np.ndarray:
     import nibabel as nib
 
-    return np.asarray(nib.load(str(path)).dataobj, dtype=np.float32)
+    # nibabel ships without type stubs; ty infers the loose base FileBasedImage
+    # type from its untyped source, but nib.load() always returns a concrete
+    # image with a real .dataobj.
+    img = nib.load(str(path))
+    return np.asarray(img.dataobj, dtype=np.float32)  # ty: ignore[unresolved-attribute]
 
 
 def _load_4d(path: Path) -> np.ndarray:
     import nibabel as nib
 
-    return np.asarray(nib.load(str(path)).dataobj, dtype=np.float32)
+    img = nib.load(str(path))
+    return np.asarray(img.dataobj, dtype=np.float32)  # ty: ignore[unresolved-attribute]
 
 
 def _ts_corr_median(a4d: np.ndarray, b4d: np.ndarray, mask3d: np.ndarray) -> float:

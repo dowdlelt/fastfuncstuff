@@ -816,7 +816,7 @@ def plot_fitness_landscape(
 
         powers.append(power)
         efficiencies.append(efficiency)
-        distributions.append(candidate.metadata.get("distribution", "unknown"))
+        distributions.append((candidate.metadata or {}).get("distribution", "unknown"))
 
         # Compute balanced score for sizing
         # Normalize within dataset

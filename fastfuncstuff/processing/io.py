@@ -144,7 +144,7 @@ def _require_nibabel() -> None:
         raise ImportError("nibabel is required for NIfTI I/O. Install with: pip install nibabel")
 
 
-def load_image(path: str | Path, device: torch.device | None = None) -> tuple[Tensor, object]:
+def load_image(path: str | Path, device: torch.device | None = None) -> tuple[Tensor, dict]:
     """Load a NIfTI image as a torch tensor.
 
     Args:
