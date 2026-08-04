@@ -50,6 +50,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -67,6 +68,10 @@ except ImportError as exc:  # pragma: no cover - nibabel is required for AFNI in
     ) from exc
 
 from fastfuncstuff.utils import get_device, resolve_cpu_threads, to_tensor
+
+# Writes at or above this uncompressed size announce themselves and report elapsed time;
+# below it the routine stays quiet so the many small per-run parameter maps don't spam.
+_BIG_WRITE_BYTES = 256 << 20
 
 
 def parse_subbrick_selector(path: str | Path) -> tuple[str, list[int] | None]:
@@ -3079,6 +3084,20 @@ def save_nifti(
     out = Path(output_path)
     out_str = str(out)
 
+    # Big writes go through an uncompressed temp file plus an external compressor, which
+    # on a multi-GB single-trial bucket is minutes of apparent hang. Announce the size and
+    # report the elapsed time so the run does not look wedged. Threshold keeps the routine
+    # silent for the many small parameter maps written per run.
+    _nbytes = int(data.nbytes)
+    _announce = _nbytes >= _BIG_WRITE_BYTES
+    if _announce:
+        print(
+            f"    ⏳ writing {out.name} ({_nbytes / 1e9:.2f} GB uncompressed)"
+            f" — compressing, this can take a while...",
+            flush=True,
+        )
+    _t_write = time.time()
+
     if out_str.endswith(".nii.zst") or (out_str.endswith(".nii.gz") and shutil.which("pigz")):
         # Write uncompressed to a temp file first, then compress externally.
         # This avoids nibabel's single-threaded gzip and enables pigz / zstd.
@@ -3096,3 +3115,11 @@ def save_nifti(
     else:
         # .nii.gz without pigz → nibabel's gzip stream chunks internally, so it's safe.
         nib.save(img, str(out))
+
+    if _announce:
+        _elapsed = time.time() - _t_write
+        try:
+            _on_disk = out.stat().st_size / 1e9
+            print(f"    ✓ wrote {out.name} ({_on_disk:.2f} GB) in {_elapsed:.1f}s", flush=True)
+        except OSError:
+            print(f"    ✓ wrote {out.name} in {_elapsed:.1f}s", flush=True)

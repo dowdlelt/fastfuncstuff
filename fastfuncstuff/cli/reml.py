@@ -439,6 +439,36 @@ Examples:
         ),
     )
 
+    input_group = parser.add_argument_group("Run Ordering / Timing Validation")
+    input_group.add_argument(
+        "-sort",
+        "-sort_runs",
+        "-sort-runs",
+        dest="sort_runs",
+        action="store_true",
+        help=(
+            "Reorder runs into acquisition order by (session, task, run) parsed from the "
+            "filenames, instead of using -input order as given. The same permutation is "
+            "applied to -events so pairing is preserved. Useful when runs were listed "
+            "ad hoc and you want concatenation (and single-trial output) in true time "
+            "order. Not compatible with -onsets (those files are per-condition, with one "
+            "line per run, so run order is baked into the file)."
+        ),
+    )
+    input_group.add_argument(
+        "-allow_late_events",
+        "-allow-late-events",
+        dest="allow_late_events",
+        action="store_true",
+        help=(
+            "Drop events whose onset falls at or after the end of their run instead of "
+            "aborting. By default such events are a hard error: they contribute all-zero "
+            "design columns (rank-deficient design) and nearly always mean the timing "
+            "files were paired with the wrong runs rather than that the scan truly "
+            "stopped early."
+        ),
+    )
+
     # Special output options
     special_out = parser.add_argument_group("Special Output Options")
     special_out.add_argument(
@@ -1146,9 +1176,14 @@ def print_output_summary(args):
     special_outputs = []
     if args.single_trials:
         label = args.single_trials
+        # Only promise the REML file when an -R* output will actually trigger a REML
+        # fit; otherwise this is an OLS-only run and reml_*_single is never written.
+        files = [f"ols_{label}_single.nii.gz"]
+        if arma_outputs:
+            files.append(f"reml_{label}_single.nii.gz")
         special_outputs.append(
             f"  • Single-trial mode (one regressor per event, chronological output): "
-            f"ols_{label}_single.nii.gz, reml_{label}_single.nii.gz"
+            f"{', '.join(files)}"
         )
 
     if special_outputs:
@@ -1327,6 +1362,54 @@ def main():
 
     # Parse input files
     input_files = parse_input_files(args.input)
+
+    # The same run listed twice is silently concatenated twice, double-counting its
+    # timepoints and its events. The usual cause is a glob like '*_final.nii.*' matching
+    # both a .nii.gz and a .nii.zst copy of the same data.
+    from fastfuncstuff.design.bids_events import find_duplicate_inputs
+
+    _dupes = find_duplicate_inputs(input_files)
+    if _dupes:
+        _lines = []
+        for grp in _dupes[:10]:
+            _lines.append("  " + "  ".join(Path(input_files[i]).name for i in grp))
+        if len(_dupes) > 10:
+            _lines.append(f"  ... and {len(_dupes) - 10} more")
+        raise SystemExit(
+            f"\n❌ {len(_dupes)} run(s) appear more than once in -input, differing only by "
+            f"file extension:\n" + "\n".join(_lines) + "\n\n"
+            "Each would be concatenated as a separate run, double-counting that data.\n"
+            "Narrow the glob to one compression format (e.g. '*_final.nii.gz')."
+        )
+
+    # Length agreement is checked before -sort touches either list: the two are paired
+    # by position, and reordering a mismatched pair indexes off the end.
+    if args.events and len(args.events) > 1 and len(args.events) != len(input_files):
+        raise SystemExit(
+            f"\n❌ {len(input_files)} input runs but {len(args.events)} events files.\n"
+            "-events takes one TSV per run (paired by position) or a single shared TSV."
+        )
+
+    if getattr(args, "sort_runs", False):
+        if args.onsets:
+            raise SystemExit(
+                "❌ -sort is not compatible with -onsets: AFNI timing files are "
+                "per-condition with one line per run, so run order is baked into the "
+                "file and reordering -input alone would desynchronise them."
+            )
+        from fastfuncstuff.design.bids_events import sort_runs_by_entities
+
+        order, sorted_inputs, sorted_events = sort_runs_by_entities(
+            input_files, list(args.events) if args.events and len(args.events) > 1 else None
+        )
+        if order != list(range(len(order))):
+            print("🔀 -sort: reordering runs into (session, task, run) acquisition order")
+            input_files = sorted_inputs
+            if sorted_events is not None:
+                args.events = sorted_events
+        else:
+            print("🔀 -sort: runs already in (session, task, run) order")
+
     print(f"📁 Input files: {len(input_files)} file(s)")
     for f in input_files:
         print(f"   • {f}")
@@ -1555,6 +1638,7 @@ def main():
                 event_ignore=args.event_ignore,
                 event_cols=tuple(args.event_cols) if args.event_cols else None,
                 round_durations=args.round_durations,
+                input_files=input_files,
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -1618,6 +1702,41 @@ def main():
         print(f"  Runs: {n_runs}")
         print(f"  Total timepoints: {n_timepoints}")
         print(f"  Run starts (TRs): {run_starts}")
+
+        # An onset at or past its run's end contributes an all-zero column (single-trial)
+        # or silently nothing (condition-level), leaving the design rank deficient. The
+        # usual cause is timing paired with the wrong run, not a truncated scan, so this
+        # is fatal by default -- the alternative is a pseudo-inverse fit whose betas and
+        # t-stats look plausible and are not.
+        from fastfuncstuff.design.bids_events import drop_late_events, find_late_events
+
+        _run_lengths = compute_run_lengths(run_starts, n_timepoints)
+        _run_len_sec = [rl * tr for rl in _run_lengths]
+        late = find_late_events(all_onsets, _run_len_sec, condition_labels)
+        if late:
+            n_late = sum(item["n_late"] for item in late)
+            lines = [
+                f"  run {item['run']:>3} (len {item['length_sec']:.0f}s): "
+                f"{item['n_late']} event(s), last onset {item['last_onset']:.1f}s "
+                f"[{', '.join(item['conditions'])}]"
+                for item in late[:12]
+            ]
+            if len(late) > 12:
+                lines.append(f"  ... and {len(late) - 12} more run(s)")
+            detail = "\n".join(lines)
+            if args.allow_late_events:
+                print(f"\n⚠️  Dropping {n_late} event(s) starting at/after their run's end:")
+                print(detail)
+                all_onsets = drop_late_events(all_onsets, _run_len_sec)
+            else:
+                raise SystemExit(
+                    f"\n❌ {n_late} event(s) start at or after the end of their run, "
+                    f"across {len(late)} run(s):\n{detail}\n\n"
+                    "These produce all-zero design columns and a rank-deficient fit.\n"
+                    "Most often the events files are paired with the wrong runs — events "
+                    "are matched to -input by position (or by -sort). Check the pairing "
+                    "first; use -allow_late_events to drop them and continue."
+                )
 
         # Auto-determine polort if not specified
         if args.polort is None:
@@ -3068,7 +3187,13 @@ def main():
             )
 
     # Single-trial REML output: chronologically ordered per-trial betas.
-    if args.single_trials and getattr(results, "betas", None) is not None:
+    #
+    # Gated on want_reml: in OLS-only mode `results` holds OLS betas, so writing them
+    # under a reml_* name claimed a REML fit that never happened (no ARMA grid search,
+    # no prewhitening). The OLS single-trial file is written separately by the analysis
+    # callback. This block is also the sole writer of reml_*_single.nii.gz -- a second
+    # copy of it further down used to re-emit the identical file a few lines later.
+    if want_reml and args.single_trials and getattr(results, "betas", None) is not None:
         stim_idx = design_info.get("stim_indices") or []
         stim_lbls = (
             [design_info["column_labels"][i] for i in stim_idx]
@@ -3694,21 +3819,8 @@ def main():
         print("    ⚠️  Warning: Whitened residuals not currently computed")
         # Would need to compute: residuals @ inv(chol(R))
 
-    # Single trials output for ARMA (if requested)
-    if args.single_trials and stim_indices:
-        label = args.single_trials
-        output_filename = f"reml_{label}_single.nii.gz"
-        print(f"  • Writing REML single-trial betas (onset order): {output_filename}")
-        if "matrix" in design_info:
-            write_single_trials_output(
-                results,
-                output_filename,
-                design_info["matrix"],  # Full design matrix for onset extraction
-                stim_indices,  # Column indices into full design
-                fitted_labels,  # Labels matching results.betas shape
-            )
-        else:
-            print("      ⚠️  Warning: Design matrix not available, cannot determine onset times")
+    # (reml_*_single.nii.gz is written once, in the REML outputs block above. A duplicate
+    # writer lived here and re-emitted the same file — and did so even in OLS-only mode.)
 
     # OLS outputs - already written by callback during analysis!
     # The callback writes OLS results immediately after OLS completion,
