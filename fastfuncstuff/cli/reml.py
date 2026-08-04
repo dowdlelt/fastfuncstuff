@@ -1800,6 +1800,10 @@ def main():
         # Per-voxel HRF: build one full design per HRF (same nuisance, different task).
         full_designs_by_hrf = None
         if per_voxel_hrf_mode:
+            # per_voxel_hrf_mode is defined as designs_by_hrf is not None, and every
+            # later reassignment of designs_by_hrf stays inside a per_voxel_hrf_mode
+            # branch too, so it's guaranteed non-None here.
+            assert designs_by_hrf is not None
             full_designs_by_hrf = {
                 int(h): torch.cat([designs_by_hrf[h], nuisance_design], dim=1)
                 for h in designs_by_hrf
@@ -1951,14 +1955,18 @@ def main():
             nuisance_labels_st.append(f"nuisance_{len(nuisance_labels_st)}")
         nuisance_labels_st = nuisance_labels_st[: len(nuisance_indices_st)]
 
-        # Create a temporary design_info for single-trial mode
+        # Create a temporary design_info for single-trial mode (schema matches
+        # read_afni_design_matrix()'s return dict, since analyze_from_design_matrix
+        # only accepts a design_info dict, not raw matrix/indices kwargs).
         design_info_st = {
-            "design_matrix": full_design_st.cpu().numpy(),
+            "matrix": full_design_st.cpu().numpy(),
             "column_labels": trial_labels + nuisance_labels_st,
-            "stim_indices": task_indices_st,
-            "nuisance_indices": nuisance_indices_st,
+            "stim_bots": task_indices_st,
+            "stim_tops": task_indices_st,
             "run_starts": run_starts,
-            "n_runs": n_runs,
+            "n_timepoints": full_design_st.shape[0],
+            "n_regressors": full_design_st.shape[1],
+            "tr": args.tr,
         }
 
         # Load and prepare fMRI data
@@ -1969,9 +1977,7 @@ def main():
         # This will fit ARMA(1,1), prewhiten, and return single-trial betas
         results_st, _ = analyze_from_design_matrix(
             fmri_data=fmri_data_st,
-            design_matrix=design_info_st["design_matrix"],
-            stim_column_indices=task_indices_st,
-            nuisance_column_indices=nuisance_indices_st,
+            design_info=design_info_st,
             method="arma11",
             arma_a_grid=a_grid,
             arma_b_grid=b_grid,
@@ -1979,10 +1985,10 @@ def main():
             mask_file=args.mask,
             voxel_chunk_size=args.batch_size,
             use_double=args.use_double,
-            verbose=args.verb >= 1,
         )
 
         # 4. Extract single-trial betas
+        assert results_st.betas is not None
         st_betas = results_st.betas  # (n_voxels, n_trials)
         print(f"  Single-trial betas: {st_betas.shape}")
 
@@ -2026,6 +2032,7 @@ def main():
         print("=" * 70)
         print("✅ ffs_reml (single-trial mode) Complete!")
         print("=" * 70)
+        assert isinstance(xval["r2"], torch.Tensor)
         print(f"  Median beta-space R²: {xval['r2'].median():.4f}")
         print(f"  {xval['n_test_trials_total']} test trials across {xval['n_splits']} folds")
         print()
@@ -2342,6 +2349,10 @@ def main():
         first_img = load_nifti(input_files[0])
         affine = first_img.affine
         nifti_header = first_img.header.copy()
+        # nibabel ships without type stubs, so ty infers an overly broad
+        # (possibly-None) shape from its untyped source; a loaded image always
+        # has a concrete shape.
+        assert first_img.shape is not None
         volume_shape = first_img.shape[:3]
         # Voxel sizes from pixdim (get_zooms), which is orientation-independent.
         # The affine diagonal is wrong for permuted/oblique grids (e.g. an RSP/LIA
@@ -2390,7 +2401,9 @@ def main():
 
         def _blur_run(run_data, run_idx):
             # The loader hands us (n_voxels, n_tps) in C order, so the view back
-            # to (x, y, z, t) is free.
+            # to (x, y, z, t) is free. volume_shape is set once, above, before
+            # this closure is ever invoked.
+            assert volume_shape is not None
             n_tps = run_data.shape[1]
             blurred = gaussian_blur_3d(
                 run_data.numpy().reshape(*volume_shape, n_tps),
@@ -2756,6 +2769,9 @@ def main():
         if guard_validity is not None and guard_volume_shape is not None:
             from fastfuncstuff.glm.missing import MissingFamily, run_inclusion_map
 
+            # guard_validity/guard_volume_shape/guard_keep are always set together
+            # in the guard block above.
+            assert guard_keep is not None
             _fams = getattr(results, "missing_families", []) or []
             _dof_loss_masked = getattr(results, "missing_dof_loss", None)
             _demoted_masked = getattr(results, "missing_demoted", None)
@@ -3027,8 +3043,11 @@ def main():
                 add_fdr=args.add_fdr,
             )
 
-        # -dsort_nods: parallel no-dsort bucket for comparison.
-        if getattr(results, "nods_results", None) is not None:
+        # -dsort_nods: parallel no-dsort bucket for comparison. nods_results only
+        # exists on ARMA11Results (dsort_nods is a REML-only feature).
+        from fastfuncstuff.glm.arma import ARMA11Results
+
+        if isinstance(results, ARMA11Results) and results.nods_results is not None:
             nods_path = _insert_path_suffix(args.Rbuck, "_nods")
             print(f"  • Writing no-dsort REML bucket: {nods_path}")
             nods = results.nods_results
@@ -3070,6 +3089,12 @@ def main():
             print("  ⚠️  Skipping REML single-trial output: no stimulus columns in design")
 
     if args.Rbeta:
+        from fastfuncstuff.glm.arma import ARMA11Results
+
+        # -Rbeta forces want_reml (see want_reml above), so `results` is always
+        # the ARMA11Results branch here, never plain GLMResults.
+        assert isinstance(results, ARMA11Results)
+
         print(f"  • Writing REML betas only: {args.Rbeta}")
         # Rbeta: ALL betas, no stats
         from fastfuncstuff.glm.outputs import (
@@ -3100,7 +3125,7 @@ def main():
             save_nifti(betas_vol, output_path=_rbeta_path, affine=affine)
 
         # -dsort_nods: parallel no-dsort betas.
-        if getattr(results, "nods_results", None) is not None:
+        if results.nods_results is not None:
             nods_beta_path = _insert_path_suffix(args.Rbeta, "_nods")
             print(f"  • Writing no-dsort REML betas only: {nods_beta_path}")
             nods_betas_np = _ensure_numpy(results.nods_results.betas)
@@ -3147,6 +3172,12 @@ def main():
         )
 
     if args.Rvar:
+        from fastfuncstuff.glm.arma import ARMA11Results
+
+        # -Rvar forces want_reml (see want_reml above), so `results` is always
+        # the ARMA11Results branch here, never plain GLMResults.
+        assert isinstance(results, ARMA11Results)
+
         # Respect the extension the user gave (.nii/.nii.gz/.nii.zst); default
         # to compressed .nii.gz only when no NIfTI extension is present.
         rvar_output_path = Path(args.Rvar)
@@ -3252,19 +3283,22 @@ def main():
             )
         print(f"    ✓ Labeled {len(var_labels)} sub-briks: {', '.join(var_labels)}")
 
-    # Write full REML likelihood surface if requested (-Rlklhd)
+    # Write full REML likelihood surface if requested (-Rlklhd). reml_lklhd_surface
+    # only exists on ARMA11Results (isinstance, not hasattr, so ty can narrow it).
+    from fastfuncstuff.glm.arma import ARMA11Results
+
     _rlklhd = getattr(args, "Rlklhd", None)
-    _has_surface = (
-        hasattr(results, "reml_lklhd_surface") and results.reml_lklhd_surface is not None  # type: ignore[union-attr]
-    )
+    _has_surface = isinstance(results, ARMA11Results) and results.reml_lklhd_surface is not None
     if _rlklhd and _has_surface:
         import copy
 
         from fastfuncstuff.io.afni import set_afni_func_type
 
+        assert isinstance(results, ARMA11Results) and results.reml_lklhd_surface is not None
         print(f"  • Writing REML likelihood surface: {_rlklhd}")
-        surface_np = results.reml_lklhd_surface.cpu().float().numpy()  # type: ignore[union-attr]
-        surf_params = results.reml_surface_params  # type: ignore[union-attr]
+        surface_np = results.reml_lklhd_surface.cpu().float().numpy()
+        surf_params = results.reml_surface_params
+        assert surf_params is not None  # always set alongside reml_lklhd_surface
         n_pairs = surface_np.shape[1]
         print(f"    {n_pairs} valid (a,b) grid points → {n_pairs} sub-briks")
 
