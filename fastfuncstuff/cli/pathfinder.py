@@ -742,7 +742,9 @@ def fit_pathfinder(
         batch_size=chunk_size,
         verbose=False,
     )
-    initial_xval_r2 = initial_xval_results["r2_median"].cpu()
+    _initial_r2_median = initial_xval_results["r2_median"]
+    assert isinstance(_initial_r2_median, torch.Tensor)  # "r2_median" key is always a tensor
+    initial_xval_r2 = _initial_r2_median.cpu()
 
     # Full GLM fit with canonical HRF for betas/tstats
     nuisance_block_diag = torch.block_diag(*nuisance_per_run)
@@ -759,6 +761,7 @@ def fit_pathfinder(
         preload_data_to_device=(data.device == device),
     )
 
+    assert initial_glm_results.r2 is not None  # set by fit_glm above
     if verbose:
         print(f"  Initial xval R² (canonical, no denoise): {initial_xval_r2.mean().item():.4f}")
         print(f"  Initial full-fit R²: {initial_glm_results.r2.mean().item():.4f}")
@@ -792,6 +795,7 @@ def fit_pathfinder(
             microtime_dt=microtime_dt,
             device=device,
         )
+        assert isinstance(stim_design, torch.Tensor)  # return_single_trials defaults False
         n_stim_cols = stim_design.shape[1]
 
         # 2. Compute initial xval R² (task-only) to identify noise pool
@@ -819,7 +823,9 @@ def fit_pathfinder(
             verbose=False,
         )
 
-        initial_r2 = xval_results["r2_median"].to(device)
+        _r2_median = xval_results["r2_median"]
+        assert isinstance(_r2_median, torch.Tensor)  # "r2_median" key is always a tensor
+        initial_r2 = _r2_median.to(device)
 
         # 3. Select noise pool and criteria voxels
         try:
@@ -949,6 +955,9 @@ def fit_pathfinder(
         pc_blocks = []
         for run_idx in range(n_runs):
             pcs_run = best_noise_pcs[run_idx]
+            assert isinstance(
+                pcs_run, torch.Tensor
+            )  # extract_noise_pcs_per_run(return_loadings=False)
             n_use = min(global_optimal_pcs, pcs_run.shape[1])
             pc_blocks.append(pcs_run[:, :n_use].to(device))
         noise_pc_design = torch.block_diag(*pc_blocks)
@@ -1132,16 +1141,17 @@ def save_pathfinder_results(
         output_files["initial_xval_r2"] = initial_xval_r2_path
 
     # Initial stats (betas, t-stats) with AFNI-style labels
-    if results.initial_results is not None:
-        results.initial_results.original_shape = volume_shape
-        results.initial_results.affine = affine
+    initial_results_obj = results.initial_results
+    if initial_results_obj is not None:
+        initial_results_obj.original_shape = volume_shape
+        initial_results_obj.affine = affine
         if voxel_mask is not None:
-            results.initial_results.voxel_mask = voxel_mask
+            initial_results_obj.voxel_mask = voxel_mask
 
         initial_stats_path = f"{output_prefix}_initial_stats{nii_ext}"
         with spinner(f"Writing {Path(initial_stats_path).name}"):
             write_glm_bucket_as_nifti(
-                results.initial_results,
+                initial_results_obj,
                 initial_stats_path,
                 condition_names=condition_labels,
                 volume_shape=volume_shape,
@@ -1151,7 +1161,8 @@ def save_pathfinder_results(
         output_files["initial_stats"] = initial_stats_path
 
         # Also save initial R² (full-fit, not xval)
-        initial_r2_vol = to_volume(results.initial_results.r2.numpy())
+        assert initial_results_obj.r2 is not None
+        initial_r2_vol = to_volume(initial_results_obj.r2.numpy())
         initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
         save_nifti(initial_r2_vol.astype(np.float32), output_path=initial_r2_path, affine=affine)
         output_files["initial_r2"] = initial_r2_path
@@ -1161,16 +1172,17 @@ def save_pathfinder_results(
     # =========================================================================
 
     # Final stats (betas, t-stats) with AFNI-style labels
-    if results.final_results is not None:
-        results.final_results.original_shape = volume_shape
-        results.final_results.affine = affine
+    final_results_obj = results.final_results
+    if final_results_obj is not None:
+        final_results_obj.original_shape = volume_shape
+        final_results_obj.affine = affine
         if voxel_mask is not None:
-            results.final_results.voxel_mask = voxel_mask
+            final_results_obj.voxel_mask = voxel_mask
 
         final_stats_path = f"{output_prefix}_final_stats{nii_ext}"
         with spinner(f"Writing {Path(final_stats_path).name}"):
             write_glm_bucket_as_nifti(
-                results.final_results,
+                final_results_obj,
                 final_stats_path,
                 condition_names=condition_labels,
                 volume_shape=volume_shape,
@@ -1180,7 +1192,8 @@ def save_pathfinder_results(
         output_files["final_stats"] = final_stats_path
 
         # Also save final R² (full-fit, not xval)
-        final_r2_vol = to_volume(results.final_results.r2.numpy())
+        assert final_results_obj.r2 is not None
+        final_r2_vol = to_volume(final_results_obj.r2.numpy())
         final_r2_path = f"{output_prefix}_final_r2{nii_ext}"
         save_nifti(final_r2_vol.astype(np.float32), output_path=final_r2_path, affine=affine)
         output_files["final_r2"] = final_r2_path

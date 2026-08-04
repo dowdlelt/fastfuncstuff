@@ -369,6 +369,7 @@ def main():
     # Print summary statistics (GLMdenoise-style: single R² from concatenated predictions)
     print("📊 Results Summary (GLMdenoise-style concatenation):")
     r2_result = xval_results["r2"]
+    assert isinstance(r2_result, torch.Tensor)  # "r2" key is always a tensor
     print(f"  • Mean R²: {r2_result.mean():.4f} ± {r2_result.std():.4f}")
     print(f"  • Median R²: {r2_result.median().item():.4f}")
     print(f"  • Min R²: {r2_result.min():.4f}")

@@ -606,6 +606,7 @@ def _run_single_ica(
             device=device,
         )
         ica.fit(x_t)
+        assert ica.components_ is not None and ica.mixing_ is not None  # set by fit above
 
         # Check convergence
         if ica.n_iter_ >= args.ica_max_iter:
@@ -1888,6 +1889,7 @@ def _run_concat_ica(
             device=device,
         )
         ica.fit(x_t)
+        assert ica.components_ is not None and ica.mixing_ is not None  # set by fit above
         if ica.n_iter_ >= args.ica_max_iter:
             _vprint(
                 args.verb >= 1,
@@ -3089,6 +3091,7 @@ def _run_tensorial_ica(
             device=device,
         )
         ica.fit(x_t)
+        assert ica.components_ is not None and ica.mixing_ is not None  # set by fit above
         components = ica.components_.to(device)
         mixing = ica.mixing_.to(device)
         stability = None

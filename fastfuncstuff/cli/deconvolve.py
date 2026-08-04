@@ -1085,6 +1085,9 @@ def main():
             )
 
     # Flatten all onset times for TR-locking check
+    # onsets_per_condition is always set by this point: either from the BIDS
+    # branch (line ~896) or the AFNI timing-file loop (line ~1027) above.
+    assert onsets_per_condition is not None
     all_onset_times = []
     for cond_onsets in onsets_per_condition:
         for run_onsets in cond_onsets:

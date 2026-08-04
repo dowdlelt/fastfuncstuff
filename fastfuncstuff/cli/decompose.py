@@ -384,6 +384,7 @@ def main():
 
         pca = PCA(n_components=pca_n_components, device=device)
         pca_scores = pca.fit_transform(data)
+        assert pca.explained_variance_ratio_ is not None  # set by fit_transform above
 
         if args.verb >= 1:
             print(f"  Kept {pca.n_components_} components")
@@ -496,6 +497,7 @@ def main():
             )
 
             ica_timeseries = ica.fit_transform(data)
+            assert ica.components_ is not None  # set by fit_transform above
 
             if args.verb >= 1:
                 print(f"  Converged in {ica.n_iter_} iterations")

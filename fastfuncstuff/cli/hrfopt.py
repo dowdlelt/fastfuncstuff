@@ -1000,6 +1000,7 @@ def main():
             device=device,
         )
         canonical_xval_r2 = canonical_cv["r2"]
+        assert isinstance(canonical_xval_r2, torch.Tensor)  # "r2" key is always a tensor
 
         print("Computing beta-series CV R² (optimal HRF per voxel)...")
         hrfopt_cv = compute_xval_r2_single_trials(
@@ -1011,6 +1012,7 @@ def main():
             device=device,
         )
         hrfopt_xval_r2 = hrfopt_cv["r2"]
+        assert isinstance(hrfopt_xval_r2, torch.Tensor)  # "r2" key is always a tensor
 
         del canonical_betas, best_betas  # Free ~1.4 GB
 
@@ -1279,12 +1281,11 @@ def main():
         # In-sample (HRFopt) R² delta — the headline "fit looks better" number.
         # This field is only present for the time-series path; guard anyway.
         delta_hrfopt = None
-        if (
-            getattr(results, "hrfopt_full_r2", None) is not None
-            and getattr(results_nodenoise, "hrfopt_full_r2", None) is not None
-        ):
-            r2f_primary = results.hrfopt_full_r2.detach().cpu()
-            r2f_nd = results_nodenoise.hrfopt_full_r2.detach().cpu()
+        _hrfopt_full_r2 = getattr(results, "hrfopt_full_r2", None)
+        _hrfopt_full_r2_nd = getattr(results_nodenoise, "hrfopt_full_r2", None)
+        if _hrfopt_full_r2 is not None and _hrfopt_full_r2_nd is not None:
+            r2f_primary = _hrfopt_full_r2.detach().cpu()
+            r2f_nd = _hrfopt_full_r2_nd.detach().cpu()
             delta_hrfopt = r2f_primary - r2f_nd
             _save_volume(
                 delta_hrfopt,
@@ -1347,29 +1348,31 @@ def main():
     # Note: The canonical betas are already saved correctly by save_hrf_selection_results()
     # to {prefix}_canonical_stats.nii.gz. For single-trial betas, we need custom saving
     # to {prefix}_stats_single_trial.nii.gz instead of the default {prefix}_stats.nii.gz
-    if args.save_single_trial_betas and results.final_results is not None:
+    final_results_for_save = results.final_results
+    if args.save_single_trial_betas and final_results_for_save is not None:
         from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
         print("  Saving single-trial betas with custom filename...")
 
         # Set required metadata for saving (same as canonical_results)
-        results.final_results.original_shape = volume_shape
-        results.final_results.affine = affine
+        final_results_for_save.original_shape = volume_shape
+        final_results_for_save.affine = affine
         if voxel_mask is not None:
-            results.final_results.voxel_mask = voxel_mask
+            final_results_for_save.voxel_mask = voxel_mask
 
         # Get trial labels from results (stored during refit)
-        trial_labels = results.final_results.trial_labels
+        trial_labels = final_results_for_save.trial_labels
         if trial_labels is None:
             print("  WARNING: No trial labels found, using generic names")
-            n_trials = results.final_results.betas.shape[1]
+            assert final_results_for_save.betas is not None
+            n_trials = final_results_for_save.betas.shape[1]
             trial_labels = [f"trial_{i:04d}" for i in range(n_trials)]
 
         # Save with custom filename using trial labels
         single_trial_file = f"{args.prefix}_stats_single_trial{_nii_ext}"
         with spinner(f"Writing {Path(single_trial_file).name}"):
             write_glm_bucket_as_nifti(
-                results.final_results,
+                final_results_for_save,
                 output_path=single_trial_file,
                 condition_names=trial_labels,  # Use trial labels, not condition labels!
                 volume_shape=volume_shape,
@@ -1429,8 +1432,10 @@ def main():
         best_r2 = results.xval_r2_best.mean().item()
         print(f"  Canonical HRF baseline R²: {canonical_r2:.4f}")
         print(f"  Improvement over canonical: {best_r2 - canonical_r2:+.4f}")
-    if results.final_results is not None:
-        print(f"  Final R² (full data): {results.final_results.r2.mean().item():.4f}")
+    _final_results_summary = results.final_results
+    if _final_results_summary is not None:
+        assert _final_results_summary.r2 is not None
+        print(f"  Final R² (full data): {_final_results_summary.r2.mean().item():.4f}")
     print()
     print("  HRF usage distribution:")
     hrf_counts = results.hrf_metadata["hrf_usage_counts"]

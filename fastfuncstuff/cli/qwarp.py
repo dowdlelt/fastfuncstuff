@@ -770,7 +770,8 @@ def _read_motion_params(filepath: str) -> list[tuple[float, float, float, float,
             vals = line.split()
             if len(vals) < 6:
                 continue
-            params.append(tuple(float(v) for v in vals[:6]))
+            floats = [float(v) for v in vals[:6]]
+            params.append((floats[0], floats[1], floats[2], floats[3], floats[4], floats[5]))
     return params
 
 

@@ -1933,7 +1933,9 @@ def main():
         )
         designs_by_hrf = None
     else:
-        # Per-HRF mode: get shape from first design matrix
+        # Per-HRF mode: get shape from first design matrix.
+        # build_task_design_from_args returns exactly one of (task_design, designs_by_hrf).
+        assert designs_by_hrf is not None
         first_hrf_idx = list(designs_by_hrf.keys())[0]
         n_task_cols = designs_by_hrf[first_hrf_idx].shape[1]
         print(f"  Task predictors: {n_task_cols} ({', '.join(condition_labels)})")
@@ -2043,6 +2045,9 @@ def main():
 
         # Pre-compute HRF group info for per-voxel path (used in steps 2, 5, 7)
         if per_voxel_st:
+            # per_voxel_st (3D st_design) only occurs when hrf_index_per_voxel was
+            # passed to create_single_trial_design, i.e. hrf_indices is not None.
+            assert hrf_indices is not None
             hrf_indices_dev = hrf_indices.to(data.device)
             unique_hrfs = torch.unique(hrf_indices_dev).tolist()
             n_trials = st_design.shape[-1]
@@ -2083,7 +2088,11 @@ def main():
                 verbose=False,
             )
 
-            initial_r2 = xval_init["r2"].to(device)
+            r2_init = xval_init["r2"]
+            assert isinstance(
+                r2_init, torch.Tensor
+            )  # "r2" key is always a tensor, unlike n_splits etc.
+            initial_r2 = r2_init.to(device)
             del projected_data, projected_cond_design
         else:
             # Per-voxel HRF path: compute R² per HRF group with correct design
@@ -2126,10 +2135,12 @@ def main():
                     verbose=False,
                 )
 
-                initial_r2[voxel_mask] = xval_group["r2"].to(device)
+                r2_group = xval_group["r2"]
+                assert isinstance(r2_group, torch.Tensor)  # "r2" key is always a tensor
+                initial_r2[voxel_mask] = r2_group.to(device)
                 print(
                     f"    HRF {hrf_idx}: {n_group:,} voxels, "
-                    f"median R²={xval_group['r2'].median().item():.4f}"
+                    f"median R²={r2_group.median().item():.4f}"
                 )
 
                 del proj_data, proj_design
@@ -2342,6 +2353,7 @@ def main():
                     verbose=False,
                     task_indices=task_indices,
                 )
+                assert glm_results.betas is not None  # set by fit_glm above
                 all_st_betas[n_pcs] = glm_results.betas.cpu()
             else:
                 # Per-voxel HRF path: group by HRF index
@@ -2359,6 +2371,7 @@ def main():
                         verbose=False,
                         task_indices=task_indices,
                     )
+                    assert glm_results.betas is not None  # set by fit_glm above
                     all_st_betas[n_pcs, voxel_mask] = glm_results.betas.cpu()
 
         # Batch beta-space CV across all PC counts at once
@@ -2508,7 +2521,9 @@ def main():
                     verbose=False,
                     task_indices=task_indices_final,
                 )
+                assert glm_results_final.betas is not None  # set by fit_glm above
                 final_betas[voxel_mask] = glm_results_final.betas
+            assert glm_results_final.r2 is not None  # set by fit_glm above
             print(f"  Complete. Mean R² = {glm_results_final.r2.mean().item():.3f}")
 
         # Per-run beta diagnostics (detect runs with degenerate betas)
@@ -2540,8 +2555,11 @@ def main():
             device=device,
             verbose=False,
         )
+        final_r2_cod = final_xval_cod["r2"]
+        assert isinstance(final_r2_cod, torch.Tensor)  # "r2" key is always a tensor
 
         final_xval_metric = None
+        final_r2_metric: torch.Tensor | None = None
         if args.cv_metric != "cod":
             final_xval_metric = compute_xval_r2_single_trials(
                 final_betas,
@@ -2552,20 +2570,22 @@ def main():
                 device=device,
                 verbose=False,
             )
+            final_r2_metric = final_xval_metric["r2"]
+            assert isinstance(final_r2_metric, torch.Tensor)
 
         # Print CV summary
         n_folds = len(cv_splits)
-        n_test_trials = final_xval_cod["r2"].numel()
+        n_test_trials = final_r2_cod.numel()
         print(
-            f"  Beta-space CV R² (COD): mean={final_xval_cod['r2'].mean():.4f}, "
-            f"median={final_xval_cod['r2'].median():.4f} "
+            f"  Beta-space CV R² (COD): mean={final_r2_cod.mean():.4f}, "
+            f"median={final_r2_cod.median():.4f} "
             f"({n_test_trials} trials across {n_folds} folds)"
         )
-        if final_xval_metric is not None:
+        if final_r2_metric is not None:
             _ml = args.cv_metric.upper()
             print(
-                f"  Beta-space CV {_ml}: mean={final_xval_metric['r2'].mean():.4f}, "
-                f"median={final_xval_metric['r2'].median():.4f}"
+                f"  Beta-space CV {_ml}: mean={final_r2_metric.mean():.4f}, "
+                f"median={final_r2_metric.median():.4f}"
             )
 
         # 8. Save outputs
@@ -2579,7 +2599,7 @@ def main():
 
         output_files = save_single_trial_results(
             betas=final_betas,
-            xval_r2=final_xval_cod["r2"],
+            xval_r2=final_r2_cod,
             trial_labels=trial_labels,
             trial_condition_ids=trial_cond_ids,
             trial_run_ids=trial_run_ids,
@@ -2651,9 +2671,9 @@ def main():
         print("  Saved: initial cross-validated R²")
 
         # Save optimization metric map if different from COD
-        if final_xval_metric is not None:
+        if final_r2_metric is not None:
             _ml = args.cv_metric.lower()
-            _metric_vol = _to_vol(final_xval_metric["r2"].cpu().numpy())
+            _metric_vol = _to_vol(final_r2_metric.cpu().numpy())
             _metric_path = f"{args.prefix}_xval_{_ml}{_nii_ext}"
             save_nifti(_metric_vol, output_path=_metric_path, affine=affine, header=nifti_header)
             output_files[f"xval_{_ml}"] = _metric_path
@@ -2662,8 +2682,10 @@ def main():
         # Save per-run selected PCs as text files (for ridge -denoise consumption)
         for run_idx in range(n_runs):
             pcs = noise_pcs_per_run[run_idx]
+            # extract_noise_{pcs,ics}_per_run's return type is a bool-flag-dependent
+            # union (list vs. tuple) that ty can't resolve through the branches above.
             pcs_np = pcs.cpu().numpy() if torch.is_tensor(pcs) else pcs
-            n_selected = min(optimal_pcs, pcs_np.shape[1])
+            n_selected = min(optimal_pcs, pcs_np.shape[1])  # ty: ignore[unresolved-attribute]
             selected_pcs = pcs_np[:, :n_selected]
             pc_txt_path = f"{args.prefix}_run{run_idx + 1:02d}_selected_PCs.txt"
             with open(pc_txt_path, "w") as f:
@@ -2683,7 +2705,7 @@ def main():
             "n_noise_voxels": int(n_noise),
             "noise_fraction": float(noise_fraction),
             "pc_selection_curve": r2_by_pc.cpu().tolist(),
-            "final_median_r2": float(final_xval_cod["r2"].median()),
+            "final_median_r2": float(final_r2_cod.median()),
             "cv_metric": args.cv_metric,
             "noise_method": args.noise,
             "auto_component_caps": bool(args.auto_component_caps),
@@ -2824,8 +2846,10 @@ def main():
 
                 # Per-PC plots (only for "full" mode)
                 if args.plots == "full":
-                    # Convert PC tensors to CPU for plotting
-                    pcs_cpu = [pc.cpu() for pc in noise_pcs_per_run]
+                    # Convert PC tensors to CPU for plotting.
+                    # extract_noise_{pcs,ics}_per_run's return type is a bool-flag-dependent
+                    # union (list vs. tuple) that ty can't resolve through the branches above.
+                    pcs_cpu = [pc.cpu() for pc in noise_pcs_per_run]  # ty: ignore[unresolved-attribute]
                     print(
                         f"  Component diagnostics: method={args.noise.upper()}, map_space={args.component_map_space}"
                     )
@@ -2894,7 +2918,7 @@ def main():
         print("✅ 3dDenoisefast (single-trial mode) Complete!")
         print("=" * 70)
         print(f"  Optimal PCs: {optimal_pcs}")
-        print(f"  Final median beta-space R²: {final_xval_cod['r2'].median():.4f}")
+        print(f"  Final median beta-space R²: {final_r2_cod.median():.4f}")
         print()
         for key, path in output_files.items():
             print(f"  {key}: {path}")
@@ -3070,6 +3094,10 @@ def main():
         print("Fitting initial model (no denoising)...")
 
         from fastfuncstuff.glm.core import fit_glm
+
+        # need_model_fits is forced False above when designs_by_hrf is not None,
+        # so task_design (the mutually-exclusive alternative) is set here.
+        assert task_design is not None
 
         # Build zero-padded nuisance for concatenated fit
         n_total_timepoints = data.shape[1]
