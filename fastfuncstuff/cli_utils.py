@@ -2167,6 +2167,7 @@ def parse_timing_spec(
     event_ignore: list[str] | None = None,
     event_cols: tuple[str, str, str] | None = None,
     round_durations: int | None = None,
+    input_files: list[str] | None = None,
     verbose: bool = True,
 ) -> TimingSpec:
     """Parse the timing spec of an ``ffs_*`` GLM tool into a common structure.
@@ -2181,7 +2182,7 @@ def parse_timing_spec(
     (or ``FileNotFoundError``) with a user-facing message on any problem; the
     CLI is responsible for printing it and exiting.
     """
-    from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+    from fastfuncstuff.design.bids_events import parse_bids_events, verify_events_match_inputs
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
 
     if bool(events) == bool(onsets):
@@ -2196,10 +2197,31 @@ def parse_timing_spec(
                 f"got {len(events)} events files but {n_runs} input datasets."
             )
 
+        # Events pair with -input by position. When both sides carry sub/ses/task/run
+        # entities, verify the pairing rather than trusting it: a mispaired timing file
+        # produces a plausible-looking design that is simply wrong about which run is
+        # which, and nothing downstream necessarily notices.
+        if input_files is not None and len(events) == n_runs:
+            problems = verify_events_match_inputs(input_files, events)
+            if problems:
+                shown = problems[:12]
+                more = (
+                    f"\n  ... and {len(problems) - len(shown)} more" if len(problems) > 12 else ""
+                )
+                raise ValueError(
+                    "-events do not line up with -input (entity check):\n"
+                    + "\n".join(shown)
+                    + more
+                    + f"\n\n{len(problems)} of {n_runs} slots mismatch. Events are paired with "
+                    "inputs by position, so pass both lists in the same order."
+                )
+
         if verbose:
             if len(events) == 1 and n_runs > 1:
                 print(f"  Broadcasting 1 events file across {n_runs} runs")
-            for ep in sort_bids_event_files(events):
+            # Printed in pairing order -- this listing used to be sorted independently
+            # of the parse, which made a mispairing look like a display quirk.
+            for ep in events:
                 print(f"  {ep}")
 
         all_onsets, durations, condition_labels = parse_bids_events(

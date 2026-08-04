@@ -180,9 +180,14 @@ class TestParseMultiRun:
         assert all_onsets[1][0].tolist() == [10.0]
         assert all_onsets[1][1].tolist() == []
 
-    def test_runs_sorted_before_parsing(self, tmp_path):
-        """If passed out of order, runs get re-sorted by run number — so
-        all_onsets[c][0] corresponds to run-01, not the first file passed."""
+    def test_caller_order_is_preserved(self, tmp_path):
+        """Event files pair with -input by position, so the list is used as given.
+
+        This used to sort by run number, which ignores the session entity: across
+        sessions that groups every run-001 together and hands session N's timing to
+        session 1's run N. The corruption was silent — the only symptom was an
+        occasional all-zero design column where borrowed onsets overran a shorter run.
+        """
         f1 = _write_tsv(
             tmp_path / "run-1_events.tsv",
             [
@@ -196,8 +201,8 @@ class TestParseMultiRun:
             ],
         )
         all_onsets, _, _ = parse_bids_events([f2, f1])  # reversed
-        assert all_onsets[0][0].tolist() == [1.1]
-        assert all_onsets[0][1].tolist() == [2.2]
+        assert all_onsets[0][0].tolist() == [2.2]
+        assert all_onsets[0][1].tolist() == [1.1]
 
     def test_condition_only_in_some_runs(self, tmp_path):
         """Condition present in run 2 but not run 1 still gets an entry,
@@ -395,3 +400,184 @@ class TestErrors:
         )
         with pytest.raises(ValueError, match="No conditions remain"):
             parse_bids_events([f], event_ignore=["A"])
+
+
+# ---------------------------------------------------------------------------
+# Run pairing / ordering / late-event guards
+#
+# Regression cover for a silent multi-session corruption: parse_bids_events used to
+# sort event files by run number alone. Run number is not unique across sessions, so
+# every run-001 grouped together and session N's timing landed on session 1's run N.
+# ---------------------------------------------------------------------------
+
+
+class TestPathEntities:
+    def test_parses_bids_and_hyphenless_forms(self):
+        from fastfuncstuff.design.bids_events import parse_path_entities
+
+        # Derivative filenames routinely drop `sub-` and write run01 rather than run-01.
+        assert parse_path_entities("ses-01_task-mvpsA_run01_final.nii.gz") == {
+            "ses": "1",
+            "task": "mvpsa",
+            "run": "1",
+        }
+        ent = parse_path_entities("sub-pilot01_ses-01_task-mvpsA_run-001_events.tsv")
+        assert ent["sub"] == "pilot01"
+        assert (ent["ses"], ent["task"], ent["run"]) == ("1", "mvpsa", "1")
+
+    def test_zero_padding_never_registers_as_a_mismatch(self):
+        from fastfuncstuff.design.bids_events import parse_path_entities
+
+        assert parse_path_entities("run-1.nii")["run"] == parse_path_entities("run-001.nii")["run"]
+
+    def test_missing_entities_are_absent_not_guessed(self):
+        from fastfuncstuff.design.bids_events import parse_path_entities
+
+        assert parse_path_entities("scan_a.nii") == {}
+
+
+class TestVerifyEventsMatchInputs:
+    def _lists(self):
+        inputs, events = [], []
+        for ses, task, n in (("01", "mvpsA", 3), ("02", "mvpsA", 2), ("02", "mvpsB", 2)):
+            for r in range(1, n + 1):
+                inputs.append(f"ses-{ses}_task-{task}_run{r:02d}_final.nii.gz")
+                events.append(f"sub-p01_ses-{ses}_task-{task}_run-{r:03d}_events.tsv")
+        return inputs, events
+
+    def test_matching_lists_pass(self):
+        from fastfuncstuff.design.bids_events import verify_events_match_inputs
+
+        inputs, events = self._lists()
+        assert verify_events_match_inputs(inputs, events) == []
+
+    def test_run_number_sort_is_caught(self):
+        """The exact historical failure: events grouped by run across sessions."""
+        from fastfuncstuff.design.bids_events import (
+            sort_bids_event_files,
+            verify_events_match_inputs,
+        )
+
+        inputs, events = self._lists()
+        scrambled = [str(p) for p in sort_bids_event_files(events)]
+        problems = verify_events_match_inputs(inputs, scrambled)
+        assert problems, "run-number sort must not pass verification"
+        assert any("MISMATCH" in p for p in problems)
+
+    def test_length_mismatch_reported(self):
+        from fastfuncstuff.design.bids_events import verify_events_match_inputs
+
+        inputs, events = self._lists()
+        problems = verify_events_match_inputs(inputs, events[:-1])
+        assert len(problems) == 1 and "events files" in problems[0]
+
+    def test_unparseable_names_are_skipped_not_flagged(self):
+        """Non-BIDS filenames must not manufacture failures for people who don't use entities."""
+        from fastfuncstuff.design.bids_events import verify_events_match_inputs
+
+        assert verify_events_match_inputs(["a.nii", "b.nii"], ["x.tsv", "y.tsv"]) == []
+
+
+class TestSortRunsByEntities:
+    def test_restores_acquisition_order_keeping_pairs_together(self):
+        import random
+
+        from fastfuncstuff.design.bids_events import sort_runs_by_entities
+
+        inputs, events = [], []
+        for ses, task, n in (("01", "mvpsA", 3), ("02", "mvpsA", 2), ("02", "mvpsB", 2)):
+            for r in range(1, n + 1):
+                inputs.append(f"ses-{ses}_task-{task}_run{r:02d}_final.nii.gz")
+                events.append(f"sub-p01_ses-{ses}_task-{task}_run-{r:03d}_events.tsv")
+
+        idx = list(range(len(inputs)))
+        random.Random(0).shuffle(idx)
+        _, si, se = sort_runs_by_entities([inputs[i] for i in idx], [events[i] for i in idx])
+        assert si == inputs
+        assert se == events
+
+    def test_task_orders_before_run_so_tasks_stay_contiguous(self):
+        """Sorting on (ses, run) alone would interleave two tasks within a session."""
+        from fastfuncstuff.design.bids_events import sort_runs_by_entities
+
+        files = [
+            "ses-04_task-mvpsB_run02_final.nii.gz",
+            "ses-04_task-mvpsA_run01_final.nii.gz",
+            "ses-04_task-mvpsB_run01_final.nii.gz",
+            "ses-04_task-mvpsA_run02_final.nii.gz",
+        ]
+        _, out, _ = sort_runs_by_entities(files)
+        assert [f.split("_")[1] for f in out] == [
+            "task-mvpsA",
+            "task-mvpsA",
+            "task-mvpsB",
+            "task-mvpsB",
+        ]
+
+
+class TestLateEvents:
+    def test_finds_and_drops_events_past_run_end(self):
+        import numpy as np
+
+        from fastfuncstuff.design.bids_events import drop_late_events, find_late_events
+
+        # condition A, two runs of 100 s; run 1 has two onsets past the end
+        all_onsets = [[np.array([10.0, 50.0]), np.array([10.0, 105.0, 130.0])]]
+        late = find_late_events(all_onsets, [100.0, 100.0], ["A"])
+        assert len(late) == 1
+        assert late[0]["run"] == 1
+        assert late[0]["n_late"] == 2
+        assert late[0]["last_onset"] == 130.0
+        assert late[0]["conditions"] == ["A"]
+
+        cleaned = drop_late_events(all_onsets, [100.0, 100.0])
+        assert cleaned[0][1].tolist() == [10.0]
+        assert cleaned[0][0].tolist() == [10.0, 50.0]
+
+    def test_no_late_events_is_empty(self):
+        import numpy as np
+
+        from fastfuncstuff.design.bids_events import find_late_events
+
+        assert find_late_events([[np.array([1.0, 2.0])]], [100.0], ["A"]) == []
+
+    def test_onset_exactly_at_run_end_is_late(self):
+        """An onset at t == run_length has no timepoints left, so its column is all-zero."""
+        import numpy as np
+
+        from fastfuncstuff.design.bids_events import find_late_events
+
+        assert len(find_late_events([[np.array([100.0])]], [100.0], ["A"])) == 1
+
+
+class TestDuplicateInputs:
+    def test_same_run_in_two_compression_formats_is_flagged(self):
+        """A glob like '*_final.nii.*' matches both copies; the run would be
+        concatenated twice, double-counting its timepoints and events."""
+        from fastfuncstuff.design.bids_events import find_duplicate_inputs
+
+        inputs = [
+            "../ses-05_run01_final.nii.gz",
+            "../ses-05_run01_final.nii.zst",
+            "../ses-05_run02_final.nii.gz",
+        ]
+        dupes = find_duplicate_inputs(inputs)
+        assert len(dupes) == 1
+        assert dupes[0] == [0, 1]
+
+    def test_distinct_runs_are_not_flagged(self):
+        from fastfuncstuff.design.bids_events import find_duplicate_inputs
+
+        assert find_duplicate_inputs(["a_run01.nii.gz", "a_run02.nii.gz"]) == []
+
+    def test_plain_nii_and_gz_of_same_stem_collide(self):
+        from fastfuncstuff.design.bids_events import find_duplicate_inputs
+
+        assert len(find_duplicate_inputs(["x_final.nii", "x_final.nii.gz"])) == 1
+
+    def test_sort_rejects_length_mismatch_before_indexing(self):
+        """-sort ran before any length check and indexed off the end of the events list."""
+        from fastfuncstuff.design.bids_events import sort_runs_by_entities
+
+        with pytest.raises(ValueError, match="cannot reorder"):
+            sort_runs_by_entities(["a.nii", "b.nii", "c.nii"], ["e1.tsv", "e2.tsv"])

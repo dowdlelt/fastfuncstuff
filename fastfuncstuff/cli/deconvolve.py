@@ -864,7 +864,25 @@ def main():
                 file=sys.stderr,
             )
             return 1
-        from fastfuncstuff.design.bids_events import parse_bids_events, sort_bids_event_files
+        from fastfuncstuff.design.bids_events import (
+            parse_bids_events,
+            verify_events_match_inputs,
+        )
+
+        # Events pair with -input by position; verify that when both sides carry
+        # sub/ses/task/run entities. A mispairing is otherwise silent.
+        if len(args.events) == n_runs:
+            _problems = verify_events_match_inputs(list(args.input), list(args.events))
+            if _problems:
+                print(
+                    "ERROR: -events do not line up with -input (entity check):\n"
+                    + "\n".join(_problems[:12])
+                    + (f"\n  ... and {len(_problems) - 12} more" if len(_problems) > 12 else "")
+                    + "\nEvents are matched to inputs by position; pass both in the "
+                    "same order.",
+                    file=sys.stderr,
+                )
+                return 1
 
         if len(args.events) == 1 and n_runs > 1:
             print(f"Broadcasting 1 events file across {n_runs} runs.")
@@ -1056,10 +1074,10 @@ def main():
     else:
         # BIDS path: onsets_per_condition already set above
         if args.verb >= 1:
-            from fastfuncstuff.design.bids_events import sort_bids_event_files
-
-            print("\nBIDS events files (sorted by run):")
-            for ep in sort_bids_event_files(args.events):
+            # Listed in pairing order. This print used to sort independently of the
+            # parse, which made a genuine mispairing look like a display quirk.
+            print("\nBIDS events files (in -input pairing order):")
+            for ep in args.events:
                 print(f"  {ep}")
             print()
             for cidx, lbl in enumerate(condition_labels):
