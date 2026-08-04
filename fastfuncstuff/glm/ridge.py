@@ -565,6 +565,7 @@ def create_single_trial_design(
                 device=device,
                 return_single_trials=False,
             )
+            assert isinstance(design_matrix, torch.Tensor)  # return_single_trials=False => Tensor
 
             # Enforce run boundaries: zero HRF tails that bleed into neighbouring runs.
             # Run boundaries are hard walls — nothing from one run reaches into another.
@@ -1074,7 +1075,7 @@ def _fit_ridge_chunk_with_per_voxel_designs(
 
 def fit_ridge_single_trial(
     data: torch.Tensor,
-    design_matrix: torch.Tensor | list[torch.Tensor],
+    design_matrix: torch.Tensor,
     run_starts: list[int],
     tr: float,
     trial_condition_ids: torch.Tensor,
@@ -1100,7 +1101,7 @@ def fit_ridge_single_trial(
     ----------
     data : torch.Tensor, shape (n_voxels, n_timepoints)
         fMRI data
-    design_matrix : torch.Tensor or list of torch.Tensor
+    design_matrix : torch.Tensor
         Single design: (n_timepoints, n_trials)
         Per-voxel designs: (n_voxels, n_timepoints, n_trials) for per-voxel HRFs
     run_starts : list of int

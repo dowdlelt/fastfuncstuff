@@ -528,7 +528,7 @@ def compute_arma_lambda(a: float, b: float) -> float:
     >>> compute_arma_lambda(0.5, -0.8)  # May give negative lambda!
     -0.xxx
     """
-    return _compute_arma11_lambda(a, b)
+    return float(_compute_arma11_lambda(a, b))
 
 
 def get_default_arma_grids(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -726,6 +726,10 @@ class ARMA11Results:
         self.reml_surface_params: list | None = (
             None  # [(a_0,b_0), (a_1,b_1), ...] — grid points in column order
         )
+
+        # Per-HRF merge: OLS write callback deferred until spatial metadata
+        # (shape/mask/affine/header) is attached to the merged result.
+        self._deferred_ols_write_callback: Callable | None = None
 
 
 def _compute_arma11_lambda(
@@ -3388,13 +3392,14 @@ def fit_glm_arma11_grouped(
 
     # -dsort: scatter the no-dsort snapshot (if produced) and carry labels.
     merged.dsort_labels = template.dsort_labels
-    if getattr(template, "nods_results", None) is not None:
+    template_nods = getattr(template, "nods_results", None)
+    if template_nods is not None:
         nods_merged = ARMA11Results()
-        nods_merged.dof = template.nods_results.dof
-        nods_merged.tr = template.nods_results.tr
-        nods_merged.fitted_column_indices = template.nods_results.fitted_column_indices
-        nods_merged.n_regressors_full = template.nods_results.n_regressors_full
-        nods_merged.contrast_labels = template.nods_results.contrast_labels
+        nods_merged.dof = template_nods.dof
+        nods_merged.tr = template_nods.tr
+        nods_merged.fitted_column_indices = template_nods.fitted_column_indices
+        nods_merged.n_regressors_full = template_nods.n_regressors_full
+        nods_merged.contrast_labels = template_nods.contrast_labels
         for attr in _scatter_attrs:
             ref = None
             for h in unique_hrfs:
@@ -3616,7 +3621,9 @@ def _fit_dsort_gls_pass(
     )
 
     # Group voxels by optimal (a, b) so L (and whitened base design) is computed
-    # once per group, mirroring the main GLS loop's grouping.
+    # once per group, mirroring the main GLS loop's grouping. arma_params was
+    # populated by the main (no-dsort) GLS fit that always precedes this pass.
+    assert results.arma_params is not None
     ab_cpu = results.arma_params.cpu().contiguous()
     unique_pairs, inverse_indices = torch.unique(ab_cpu, dim=0, return_inverse=True)
     sort_keys, sort_perm = torch.sort(inverse_indices, stable=True)
@@ -5263,6 +5270,8 @@ def fit_glm_arma11(
                             )
 
                             if r2_partial_mode == "task" and len(nuisance_indices) > 0:
+                                # nuisance_indices non-empty here => set to non-None above
+                                assert r2_partial_nuisance_batch is not None
                                 # Rescale task partial R² by variance remaining after nuisance
                                 r2_nuisance_total = r2_partial_nuisance_batch.sum(
                                     dim=1, keepdim=True
@@ -5504,6 +5513,8 @@ def fit_glm_arma11(
                             )
 
                             if r2_partial_mode == "task" and len(nuisance_indices) > 0:
+                                # nuisance_indices non-empty here => set to non-None above
+                                assert r2_partial_nuisance_batch is not None
                                 # Rescale task partial R² by variance remaining after nuisance
                                 r2_nuisance_total = r2_partial_nuisance_batch.sum(
                                     dim=1, keepdim=True
@@ -5882,6 +5893,8 @@ def fit_glm_arma11(
                     )
 
                     if r2_partial_mode == "task" and len(nuisance_indices) > 0:
+                        # nuisance_indices non-empty here => set to non-None above
+                        assert r2_partial_nuisance is not None
                         # Rescale task partial R² by variance remaining after nuisance
                         r2_nuisance_total = r2_partial_nuisance.sum()
                         denominator = torch.clamp(1.0 - r2_nuisance_total, min=0.01)
@@ -6006,8 +6019,9 @@ def fit_glm_arma11(
         if results.dsort_betas is not None:
             results.dsort_betas.mul_(scale_col)
         # The _nods snapshot was taken in normalized units — unscale it too.
-        if results.nods_results is not None:
-            _nods = results.nods_results
+        _nods = results.nods_results
+        if isinstance(_nods, ARMA11Results):
+            assert _nods.betas is not None and _nods.sigma2 is not None
             _nods.betas.mul_(scale_col)
             _nods.sigma2.mul_(_y_norm_scale**2)
             if _nods.contrast_betas is not None:
@@ -6078,6 +6092,11 @@ def compare_ols_vs_arma11(
     print("\nRunning ARMA(1,1) GLM...")
     arma_results = fit_glm_arma11(data, design, tr, device=device, verbose=True)
 
+    # A completed fit_glm/fit_glm_arma11 call always populates these fields.
+    assert ols_results.tstats is not None and ols_results.r2 is not None
+    assert arma_results.tstats is not None and arma_results.r2 is not None
+    assert arma_results.arma_params is not None and arma_results.arma_lambda is not None
+
     # Compare t-statistics
     tstat_ratio = arma_results.tstats.abs().mean() / (ols_results.tstats.abs().mean() + 1e-10)
 
@@ -6090,15 +6109,15 @@ def compare_ols_vs_arma11(
     OLS Mean R²:      {ols_results.r2.mean():.4f}
     ARMA Mean R²:     {arma_results.r2.mean():.4f}
     R² Improvement:   {r2_improvement:.4f}
-    
+
     OLS Mean |t|:     {ols_results.tstats.abs().mean():.3f}
     ARMA Mean |t|:    {arma_results.tstats.abs().mean():.3f}
     |t| Ratio:        {tstat_ratio:.3f}
-    
+
     ARMA Parameters:
     Mean (a, b):      ({arma_results.arma_params[:, 0].mean():.3f}, {arma_results.arma_params[:, 1].mean():.3f})
     Mean λ (lag-1):   {arma_results.arma_lambda.mean():.3f}
-    
+
     Interpretation:
     - t-ratio < 1: ARMA reduces inflated t-stats (typical for positive autocorrelation)
     - t-ratio > 1: ARMA increases t-stats (rare, negative autocorrelation)
@@ -6401,6 +6420,8 @@ def save_arma_rvar(
         if isinstance(results.reml_likelihood, torch.Tensor)
         else results.reml_likelihood
     )
+    assert arma_lambda is not None, "arma_lambda should not be None"
+    assert neg_loglik is not None, "reml_likelihood should not be None"
 
     # Ljung-Box. Normally computed inside the GLS loop (fit_glm_arma11
     # want_ljung_box=True) so -Rvar doesn't have to retain whole-brain whitened

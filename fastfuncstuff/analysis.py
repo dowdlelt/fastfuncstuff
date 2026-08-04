@@ -1340,6 +1340,7 @@ def analyze_from_design_matrix(
 
             designs_by_group: dict[int, torch.Tensor] = {}
             if has_hrf and has_sli:
+                assert hrf_idx_tensor is not None and slice_indices is not None
                 ns = int(slice_blocks.shape[0])
                 sblk = slice_blocks.to(device)
                 group_indices = hrf_idx_tensor * ns + slice_indices.long()
@@ -1350,6 +1351,7 @@ def analyze_from_design_matrix(
                     )
                 group_label = "HRF×slice"
             elif has_sli:
+                assert slice_indices is not None
                 sblk = slice_blocks.to(device)
                 group_indices = slice_indices.long()
                 for s in torch.unique(group_indices).tolist():
@@ -1569,9 +1571,10 @@ def analyze_from_design_matrix(
     # merged OLS result instead of partial per-HRF outputs. Fire it now that
     # spatial metadata (shape/mask/affine/header) is attached.
     _deferred_ols_cb = getattr(results, "_deferred_ols_write_callback", None)
-    if _deferred_ols_cb is not None and results.ols_results is not None:
+    _ols_results = getattr(results, "ols_results", None)
+    if _deferred_ols_cb is not None and _ols_results is not None:
         _deferred_ols_cb(
-            results.ols_results,
+            _ols_results,
             getattr(results, "original_shape", None),
             getattr(results, "affine", None),
         )
@@ -1847,12 +1850,15 @@ def analyze_with_cross_validation(
     design_info["n_splits"] = xval_results["n_splits"]
 
     if verbose:
+        r2_median = xval_results["r2_median"]
+        r2_std = xval_results["r2_std"]
+        assert isinstance(r2_median, torch.Tensor) and isinstance(r2_std, torch.Tensor)
         print()
         print("=" * 80)
         print("✅ CROSS-VALIDATION COMPLETE")
         print("=" * 80)
-        print(f"Mean xval R² ({metric}): {xval_results['r2_median'].mean():.4f}")
-        print(f"Std xval R² ({metric}): {xval_results['r2_std'].mean():.4f}")
+        print(f"Mean xval R² ({metric}): {r2_median.mean():.4f}")
+        print(f"Std xval R² ({metric}): {r2_std.mean():.4f}")
         print()
 
     return xval_results, design_info

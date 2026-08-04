@@ -349,6 +349,7 @@ def estimate_noise_component_caps_per_run(
             n_iters += 1
             pca = PCA(n_components=current_max, device=device)
             pca.fit(run_data_t)
+            assert pca.explained_variance_ is not None and pca.explained_variance_ratio_ is not None
 
             ev = torch.clamp(pca.explained_variance_.detach().float(), min=1e-12).cpu()
             ev_ratio = torch.clamp(pca.explained_variance_ratio_.detach().float(), min=1e-12).cpu()
@@ -491,6 +492,7 @@ def compute_noise_pool_pca_scree_per_run(
 
         pca = PCA(n_components=n_components, device=device)
         pca.fit(run_data_t)
+        assert pca.explained_variance_ratio_ is not None
 
         ratios = torch.clamp(pca.explained_variance_ratio_.detach().float(), min=1e-12).cpu()
         scree_ratio_per_run.append(ratios)
@@ -1108,6 +1110,7 @@ def fit_glm_with_noise_pcs(
 
     # Compute R² only in eval voxels
     r2_full = torch.full((n_voxels,), float("nan"), device=data.device)
+    assert results.betas is not None and results.r2 is not None
     r2_full[eval_mask] = results.r2[eval_mask]
 
     return results.betas, r2_full
@@ -1236,6 +1239,10 @@ def cross_validate_noise_pcs(
 
         r2_summary = np.median(r2_maps, axis=0)
         return r2_maps, r2_summary
+
+    # designs_by_hrf is None here, so the earlier mutual-exclusion check
+    # guarantees design_matrix was provided.
+    assert design_matrix is not None
 
     # Detect if we can use streaming stats (LORO CV)
     # Need to check this early to determine projection device
@@ -1593,7 +1600,7 @@ def cross_validate_noise_pcs(
                     xtx_inv = torch.linalg.pinv(xtx, rcond=1e-6)  # Add rcond for stability
                     pinv_full = xtx_inv @ x_full.T  # (n_regs, n_tps)
                     pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
-                except (torch._C._LinAlgError, RuntimeError) as e:
+                except (torch._C._LinAlgError, RuntimeError) as e:  # ty: ignore[unresolved-attribute]
                     # Fall back to direct pinv on X (more memory, but more stable)
                     # Catches both LinAlgError and RuntimeError (MKL errors appear as RuntimeError)
                     if n_pcs == 0:
@@ -1604,7 +1611,7 @@ def cross_validate_noise_pcs(
                     try:
                         pinv_full = torch.linalg.pinv(x_full, rcond=1e-5)  # (n_regs, n_tps)
                         pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
-                    except (torch._C._LinAlgError, RuntimeError):
+                    except (torch._C._LinAlgError, RuntimeError):  # ty: ignore[unresolved-attribute]
                         # Last resort: very conservative rcond
                         if n_pcs == 0:
                             print("  Warning: Using very conservative rcond=1e-4 for stability")
@@ -2165,8 +2172,8 @@ def fit_denoising_model(
     # Validate inputs
     if design_matrix is None and designs_by_hrf is None:
         raise ValueError("Either design_matrix or designs_by_hrf must be provided")
-        if run_starts is None:
-            raise ValueError("run_starts must be provided")
+    if run_starts is None:
+        raise ValueError("run_starts must be provided")
 
     if design_matrix is not None and designs_by_hrf is not None:
         raise ValueError("Cannot provide both design_matrix and designs_by_hrf")
@@ -2232,6 +2239,8 @@ def fit_denoising_model(
 
     # Per-HRF mode: Compute initial R² for each HRF group to build unified noise pool
     if per_hrf_mode and initial_r2 is None:
+        # per_hrf_mode implies designs_by_hrf/hrf_indices were both required (see guard above).
+        assert designs_by_hrf is not None and hrf_indices is not None
         unique_hrf_indices = torch.unique(hrf_indices).tolist()
         if verbose:
             print("\nStep 1a: Computing baseline R² per HRF group for unified noise pool...")
@@ -2292,7 +2301,9 @@ def fit_denoising_model(
             )
 
             # Store R² values for this group (ensure same device)
-            initial_r2[voxel_mask] = xval_results["r2"].to(initial_r2.device)  # Task-only R²
+            group_r2 = xval_results["r2"]
+            assert isinstance(group_r2, torch.Tensor)
+            initial_r2[voxel_mask] = group_r2.to(initial_r2.device)  # Task-only R²
 
         if verbose:
             print(f"\n  Unified noise pool created from {n_voxels:,} voxels across all HRFs")
@@ -2316,6 +2327,9 @@ def fit_denoising_model(
             print("\nStep 1: Computing cross-validated task-only R² for noise pool selection...")
             print("  (project-first nuisance removal, per run)")
 
+        # not per_hrf_mode means designs_by_hrf is None, so the earlier
+        # mutual-exclusion check guarantees design_matrix was provided.
+        assert design_matrix is not None
         n_task_cols = design_matrix.shape[1]
 
         # Use the already-converted nuisance_per_run (or create empty if None)
@@ -2359,13 +2373,18 @@ def fit_denoising_model(
             verbose=False,
         )
 
-        initial_r2 = xval_results["r2"].to(device)
+        r2_step1 = xval_results["r2"]
+        assert isinstance(r2_step1, torch.Tensor)
+        initial_r2 = r2_step1.to(device)
 
         if verbose:
             print(f"  Completed {n_splits} CV folds (GLMdenoise-style concatenation)")
             print(f"  Median xval R²: {initial_r2.median().item():.4f}")
             print(f"  R² range: [{initial_r2.min().item():.4f}, {initial_r2.max().item():.4f}]")
     else:
+        # Reached only when initial_r2 was passed in, or was just computed by
+        # the per-HRF unified-pool block above — either way it is set here.
+        assert initial_r2 is not None
         if verbose:
             print("\nStep 1: Using pre-computed R² for noise pool selection")
             print(f"  Median R²: {initial_r2.median().item():.4f}")
@@ -2624,6 +2643,7 @@ def fit_denoising_model(
                 hrf_idx: design.to("cpu") for hrf_idx, design in designs_by_hrf.items()
             }
         else:
+            assert design_matrix is not None
             design_matrix = design_matrix.to("cpu")
 
         # Also move nuisance regressors to CPU
@@ -2656,6 +2676,7 @@ def fit_denoising_model(
 
     if per_hrf_mode:
         # Per-HRF mode: Process each HRF group separately, then aggregate
+        assert hrf_indices is not None
         unique_hrf_indices = torch.unique(hrf_indices).tolist()
         r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
 

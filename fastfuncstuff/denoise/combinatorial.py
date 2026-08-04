@@ -1466,7 +1466,9 @@ def compute_optimized_xval_r2(
         verbose=verbose,
     )
 
-    return r2_result["r2"]
+    r2 = r2_result["r2"]
+    assert isinstance(r2, torch.Tensor)
+    return r2
 
 
 def compute_optimized_xval_r2_3dDenoise_style(
@@ -1610,7 +1612,9 @@ def compute_optimized_xval_r2_3dDenoise_style(
             verbose=verbose,
         )
 
-        return r2_result["r2"]
+        r2 = r2_result["r2"]
+        assert isinstance(r2, torch.Tensor)
+        return r2
 
 
 def compute_initial_xval_r2(
@@ -1740,7 +1744,9 @@ def compute_initial_xval_r2(
             verbose=verbose,
         )
 
-        return r2_result["r2"]
+        r2 = r2_result["r2"]
+        assert isinstance(r2, torch.Tensor)
+        return r2
 
 
 # ============================================================================

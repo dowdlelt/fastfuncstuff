@@ -182,9 +182,9 @@ def project_out_nuisance_per_run(
         run_length = run_lengths[run_idx]
         run_design = design[start_tp : start_tp + run_length, :].to(device)  # (run_length, n_task)
 
-        if q_factors[run_idx] is not None:
+        Q = q_factors[run_idx]
+        if Q is not None:
             # Apply projection using Q: design_proj = design - Q @ (Q.T @ design)
-            Q = q_factors[run_idx]
             run_design_proj = run_design - Q @ (Q.T @ run_design)
         else:
             run_design_proj = run_design
@@ -202,12 +202,12 @@ def project_out_nuisance_per_run(
             run_length = run_lengths[run_idx]
             run_data = data[:, start_tp : start_tp + run_length]  # (n_voxels, run_length)
 
-            if q_factors[run_idx] is not None:
+            Q = q_factors[run_idx]
+            if Q is not None:
                 # Move to compute device, project using Q, move back
                 # data_proj = data - Q @ (Q.T @ data.T).T = data - (Q @ Q.T) @ data.T
                 # Simplified: data_proj.T = data.T - Q @ (Q.T @ data.T)
                 run_data_dev = run_data.to(device)
-                Q = q_factors[run_idx]
                 # Project: (Q @ Q.T) @ run_data_dev.T, then transpose back
                 QQt_data = (Q @ (Q.T @ run_data_dev.T)).T
                 run_data_proj = run_data_dev - QQt_data
@@ -234,10 +234,10 @@ def project_out_nuisance_per_run(
                 # Get chunk data for this run
                 run_chunk_data = data[chunk_start:chunk_end, start_tp : start_tp + run_length]
 
-                if q_factors[run_idx] is not None:
+                Q = q_factors[run_idx]
+                if Q is not None:
                     # Move chunk to compute device, project using Q, store result
                     run_chunk_dev = run_chunk_data.to(device)
-                    Q = q_factors[run_idx]
                     # Project: QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     QQt_data = (Q @ (Q.T @ run_chunk_dev.T)).T
                     run_chunk_proj = run_chunk_dev - QQt_data

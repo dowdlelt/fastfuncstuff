@@ -11,6 +11,7 @@ Supports multiple GLM variants:
 from __future__ import annotations
 
 import warnings
+from typing import Any
 
 import numpy as np
 import torch
@@ -43,43 +44,57 @@ class GLMResults:
         None
             Initializes all result attributes to ``None``.
         """
-        self.betas = None  # (n_voxels, n_regressors) or (n_x, n_y, n_z, n_regressors)
-        self.r2 = None  # (n_voxels,) or (n_x, n_y, n_z) - total model R²
-        self.r2_partial = None  # (n_voxels, n_task_regressors) - partial R² per TASK regressor
-        self.r2_partial_nuisance = (
+        self.betas: torch.Tensor | None = (
+            None  # (n_voxels, n_regressors) or (n_x, n_y, n_z, n_regressors)
+        )
+        self.r2: torch.Tensor | None = None  # (n_voxels,) or (n_x, n_y, n_z) - total model R²
+        self.r2_partial: torch.Tensor | None = (
+            None  # (n_voxels, n_task_regressors) - partial R² per TASK regressor
+        )
+        self.r2_partial_nuisance: torch.Tensor | None = (
             None  # (n_voxels, n_nuisance_regressors) - partial R² per NUISANCE regressor
         )
-        self.r2_semipartial = (
+        self.r2_semipartial: torch.Tensor | None = (
             None  # (n_voxels, n_task_regressors) - semi-partial R² per TASK regressor
         )
-        self.r2_semipartial_nuisance = (
+        self.r2_semipartial_nuisance: torch.Tensor | None = (
             None  # (n_voxels, n_nuisance_regressors) - semi-partial R² per NUISANCE regressor
         )
-        self.r2_run = None  # (n_voxels, n_runs) if provided
-        self.residuals = None  # (n_voxels, n_timepoints) - optional
-        self.predicted = None  # (n_voxels, n_timepoints) - optional
-        self.meanvol = None  # Mean signal across time
-        self.tstats = None  # (n_voxels, n_regressors)
-        self.stderr = None  # (n_voxels, n_regressors)
-        self.sigma2 = None  # (n_voxels,)
-        self.fstats = None  # (n_voxels,)
-        self.dof = None  # Degrees of freedom used for contrasts
-        self.xtx_inv = None  # (n_regressors, n_regressors) - needed for contrasts
-        self.original_shape = None  # Original spatial dimensions
-        self.tr = None  # Repetition time (seconds)
-        self.voxel_mask = None  # Optional boolean mask for sparse analyses
-        self.full_shape = None  # Original spatial shape before masking
-        self.affine = None  # Spatial affine if available
-        self.nifti_header = None  # NIfTI header for output reconstruction (from analysis module)
-        self.hrf_idx = None  # Selected HRF index (from hrf_selection module)
-        self.r2_per_hrf = None  # R² for each HRF in the library (from hrf_selection)
-        self.trial_labels = None  # Trial condition labels (from hrf_selection module)
+        self.r2_run: torch.Tensor | None = None  # (n_voxels, n_runs) if provided
+        self.residuals: torch.Tensor | None = None  # (n_voxels, n_timepoints) - optional
+        self.predicted: torch.Tensor | None = None  # (n_voxels, n_timepoints) - optional
+        self.meanvol: torch.Tensor | None = None  # Mean signal across time
+        self.tstats: torch.Tensor | None = None  # (n_voxels, n_regressors)
+        self.stderr: torch.Tensor | None = None  # (n_voxels, n_regressors)
+        self.sigma2: torch.Tensor | None = None  # (n_voxels,)
+        self.fstats: torch.Tensor | None = None  # (n_voxels,)
+        self.dof: int | None = None  # Degrees of freedom used for contrasts
+        self.xtx_inv: torch.Tensor | None = (
+            None  # (n_regressors, n_regressors) - needed for contrasts
+        )
+        self.original_shape: tuple[int, ...] | None = None  # Original spatial dimensions
+        self.tr: float | None = None  # Repetition time (seconds)
+        self.voxel_mask: torch.Tensor | None = None  # Optional boolean mask for sparse analyses
+        self.full_shape: tuple[int, ...] | None = None  # Original spatial shape before masking
+        self.affine: np.ndarray | None = None  # Spatial affine if available
+        self.nifti_header: Any | None = (
+            None  # NIfTI header for output reconstruction (from analysis module)
+        )
+        self.hrf_idx: torch.Tensor | int | None = (
+            None  # Selected HRF index (from hrf_selection module)
+        )
+        self.r2_per_hrf: torch.Tensor | None = (
+            None  # R² for each HRF in the library (from hrf_selection)
+        )
+        self.trial_labels: list | None = None  # Trial condition labels (from hrf_selection module)
 
         # GLT contrast results (computed in-loop, not post-hoc)
-        self.contrast_labels = None  # List of contrast names
-        self.contrast_betas = None  # (n_voxels, n_contrasts) - c'β estimates
-        self.contrast_tstats = None  # (n_voxels, n_contrasts) - t-statistics
-        self.contrast_fstats = None  # (n_voxels, n_contrasts) - F-statistics (for multi-row GLTs)
+        self.contrast_labels: list[str] | None = None  # List of contrast names
+        self.contrast_betas: torch.Tensor | None = None  # (n_voxels, n_contrasts) - c'β estimates
+        self.contrast_tstats: torch.Tensor | None = None  # (n_voxels, n_contrasts) - t-statistics
+        self.contrast_fstats: torch.Tensor | None = (
+            None  # (n_voxels, n_contrasts) - F-statistics (for multi-row GLTs)
+        )
 
     def to_spatial(self):
         """Reshape results back to spatial dimensions if available"""
@@ -89,6 +104,9 @@ class GLMResults:
 
         if len(self.original_shape) == 3:
             nx, ny, nz = self.original_shape
+            assert self.betas is not None and self.r2 is not None, (
+                "betas/r2 are always populated by a completed GLM fit"
+            )
             self.betas = self.betas.reshape(nx, ny, nz, -1)
             self.r2 = self.r2.reshape(nx, ny, nz)
             if self.r2_run is not None:
@@ -847,6 +865,8 @@ def fit_glm(
             )
 
             if r2_partial_mode == "task" and len(nuisance_indices) > 0:
+                # nuisance_indices non-empty here => set to non-None above
+                assert r2_partial_nuisance_dev is not None
                 # Rescale task partial R² by variance remaining after nuisance
                 # Sum nuisance partial R² (total variance explained by nuisance)
                 r2_nuisance_total = r2_partial_nuisance_dev.sum(dim=1, keepdim=True)
@@ -1002,18 +1022,24 @@ def fit_glm(
         all_r2.append(r2_cpu)
 
         if want_r2_partial and r2_partial_cpu is not None:
+            assert all_r2_partial is not None  # allocated whenever want_r2_partial
             all_r2_partial.append(r2_partial_cpu)
         if want_r2_partial and r2_partial_nuisance_cpu is not None:
+            assert all_r2_partial_nuisance is not None
             all_r2_partial_nuisance.append(r2_partial_nuisance_cpu)
 
         if want_r2_semipartial and r2_semipartial_cpu is not None:
+            assert all_r2_semipartial is not None  # allocated whenever want_r2_semipartial
             all_r2_semipartial.append(r2_semipartial_cpu)
         if want_r2_semipartial and r2_semipartial_nuisance_cpu is not None:
+            assert all_r2_semipartial_nuisance is not None
             all_r2_semipartial_nuisance.append(r2_semipartial_nuisance_cpu)
 
         if want_residuals and residuals_cpu is not None:
+            assert all_residuals is not None  # allocated whenever want_residuals
             all_residuals.append(residuals_cpu)
         if want_predicted and predicted_cpu is not None:
+            assert all_predicted is not None  # allocated whenever want_predicted
             all_predicted.append(predicted_cpu)
 
         all_sigma2.append(sigma2_cpu)
@@ -1078,6 +1104,7 @@ def fit_glm(
                 run_r2_cpu = torch.clamp(run_r2_cpu, 0, 1)
                 r2_run.append(run_r2_cpu)
 
+            assert all_r2_run is not None  # allocated whenever want_r2_run
             all_r2_run.append(torch.stack(r2_run, dim=1))  # (chunk_voxels, n_runs)
 
         # Release GPU tensors for this chunk and clear cache periodically
@@ -1173,7 +1200,7 @@ def percent_bold_change(betas: torch.Tensor, meanvol: torch.Tensor) -> torch.Ten
 
 def fit_glm_hrf_library(
     data: torch.Tensor | list,
-    design: torch.Tensor | list,
+    design: torch.Tensor,
     hrf_library: torch.Tensor,
     tr: float,
     microtime_dt: float = 0.1,
@@ -1188,10 +1215,13 @@ def fit_glm_hrf_library(
     ----------
     data : torch.Tensor or list
         fMRI data
-    design : torch.Tensor or list
+    design : torch.Tensor
         Design matrix (NOT yet convolved with HRF) at microtime_dt resolution.
         Shape: (n_microtime_points, n_conditions) where
-        n_microtime_points = n_timepoints * (tr / microtime_dt)
+        n_microtime_points = n_timepoints * (tr / microtime_dt).
+        Unlike ``data``, this must be a single tensor — per-run design lists
+        aren't supported here (design is convolved directly, not routed
+        through fit_glm's multi-run concatenation path).
     hrf_library : torch.Tensor
         (n_hrfs, n_hrf_timepoints) library of HRF candidates at microtime_dt resolution
     tr : float
@@ -1274,6 +1304,7 @@ def fit_glm_hrf_library(
     best_results.original_shape = all_results[0].original_shape
 
     n_voxels = r2_all_hrfs.shape[0]
+    assert all_results[0].betas is not None  # populated by the completed fit_glm() call above
     n_regressors = all_results[0].betas.shape[1]
 
     # Select betas and R² for best HRF per voxel

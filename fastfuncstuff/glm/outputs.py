@@ -776,8 +776,9 @@ def write_glm_results_nifti(
         )
         outputs["r2"] = r2_path
 
-    if include_mean and getattr(results, "meanvol", None) is not None:
-        mean_np = _ensure_numpy(results.meanvol)
+    _meanvol = getattr(results, "meanvol", None)
+    if include_mean and _meanvol is not None:
+        mean_np = _ensure_numpy(_meanvol)
         mean_vol = _reshape_parameter_map(mean_np, volume_shape, voxel_mask)
         mean_img = _create_nifti_with_header(
             mean_vol.astype(dtype, copy=False), affine_mat, results, tr
@@ -1350,6 +1351,7 @@ def write_ols_arma_comparison(
         )
 
     ols_results = arma_results.ols_results
+    assert ols_results is not None
     output_prefix = Path(output_prefix)
 
     # Extract contrast_results for OLS and ARMA if provided
@@ -1392,6 +1394,13 @@ def write_ols_arma_comparison(
         contrast_results=contrast_results_arma,
         **kwargs,
     )
+
+    # Both results are from completed fits (fit_glm_arma11 with want_ols=True),
+    # so the core per-voxel fields are always populated.
+    assert ols_results.r2 is not None and ols_results.tstats is not None
+    assert ols_results.betas is not None
+    assert arma_results.r2 is not None and arma_results.tstats is not None
+    assert arma_results.betas is not None and arma_results.arma_params is not None
 
     # Create comparison summary
     summary = {
