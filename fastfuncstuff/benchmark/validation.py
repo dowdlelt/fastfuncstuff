@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import nibabel as nib
+import nibabel.brikhead
 import numpy as np
 import torch
 from torch import Tensor
@@ -85,8 +86,10 @@ def _load_vol(path: str | Path) -> tuple[Tensor, np.ndarray]:
     """
     img = nib.load(str(path))
     # nib.load()'s stub return type is the loose FileBasedImage base; a real
-    # .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
-    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    # .nii/.nii.gz is a Nifti1Image/Nifti2Image, and an AFNI .HEAD/.BRIK
+    # (benchmark reference outputs) is an AFNIImage -- both have the
+    # dataobj/affine attributes this function actually uses.
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image, nib.brikhead.AFNIImage))
     data = np.asarray(img.dataobj, dtype=np.float32)
     data = np.squeeze(data)
     return torch.from_numpy(data), img.affine
@@ -96,10 +99,11 @@ def _load_dataobj(path: str | Path) -> np.ndarray:
     """Load a NIfTI file's raw (unscaled) data array via ``.dataobj``.
 
     nib.load()'s stub return type is the loose FileBasedImage base; a real
-    .nii/.nii.gz is always a Nifti1Image/Nifti2Image at runtime.
+    .nii/.nii.gz is a Nifti1Image/Nifti2Image, and an AFNI .HEAD/.BRIK
+    (benchmark reference outputs) is an AFNIImage.
     """
     img = nib.load(str(path))
-    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+    assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image, nib.brikhead.AFNIImage))
     return np.array(img.dataobj)
 
 
