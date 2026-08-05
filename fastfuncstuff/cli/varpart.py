@@ -145,6 +145,19 @@ mapping back to the original labels is written to {prefix}_varpart.json).
         default="unique_a,unique_b,interaction",
         help="Which statistics to test; comma-separated",
     )
+    opt.add_argument(
+        "-strict_run_locality",
+        "-strict-run-locality",
+        dest="strict_run_locality",
+        action="store_true",
+        help=(
+            "Fail instead of warn when a cell has two repeats inside one run. Repeats "
+            "within a run are a legitimate design; they only mean run-level nuisance sits "
+            "on both sides of that cell's train/test split, inflating held-out R² and the "
+            "noise ceiling (the partition ratios are much less affected). Use this when "
+            "you expected repeats to be spread across runs and want to be told they are not."
+        ),
+    )
     opt.add_argument("-seed", type=int, default=0, help="RNG seed for permutations")
     opt.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto)")
     opt.add_argument("-quiet", action="store_true", help="Suppress progress bars")
@@ -348,6 +361,7 @@ def main() -> int:
         run=block,
         max_rank=args.max_rank,
         min_ncsnr_for_rank=args.min_ncsnr_for_rank,
+        strict_run_locality=args.strict_run_locality,
         device=device,
         verbose=not args.quiet,
     )
@@ -362,7 +376,15 @@ def main() -> int:
         f"   cells: {d['cells_total']}, empty {d['cells_empty']}, repeats {d['repeats_min']}"
         f"-{d['repeats_max']}"
     )
-    print(f"   folds: {d['n_folds']}   run locality: {d['run_locality_ok']}")
+    locality = d["run_locality_ok"]
+    if locality is None:
+        locality_note = "no run/session column"
+    elif locality:
+        locality_note = "ok (no cell repeats within a run)"
+    else:
+        n_leaks = sum(int(item.get("n_leaks", 0)) for item in d.get("run_leaks", []))
+        locality_note = f"{n_leaks} cell-run repeats — R² and ncsnr inflated, ratios ok"
+    print(f"   folds: {d['n_folds']}   run locality: {locality_note}")
     # Shared variance is ~0 by construction under an exhaustively crossed balanced
     # design, so a non-trivial value means the balance broke, not that a real overlap
     # was found. Surface it as a check rather than a result.
@@ -389,6 +411,7 @@ def main() -> int:
             statistics=stats,
             n_perms=args.perm,
             seed=args.seed,
+            strict_run_locality=args.strict_run_locality,
             device=device,
             verbose=not args.quiet,
         )

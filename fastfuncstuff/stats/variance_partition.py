@@ -213,14 +213,22 @@ def derive_repeat_index(design: FactorDesign) -> np.ndarray:
 def build_repeat_folds(
     repeat: np.ndarray,
     run: np.ndarray | None = None,
+    cell: np.ndarray | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
     """Leave-one-repeat-out folds, refusing any fold that leaks a run across the split.
 
     Every cell is trained and tested exactly once per fold, so the folds stay balanced.
     The constraint that matters is run locality: if two repeats of a cell share a run, then
     run-level nuisance (drift, motion, alertness, shared noise PCs) is present in both the
-    training and test side of that cell, which inflates *every* model equally and reads as
+    training and test side of *that cell*, which inflates every model equally and reads as
     signal. Same trap as fold-local nuisance projection in LORO cross-validation.
+
+    ``cell`` is what makes that check mean what the paragraph above says. Without it the
+    test degrades to "does any run appear on both sides", which every interleaved design
+    fails by construction: a run holding trials from many cells necessarily contributes
+    training trials (other cells) and test trials (this cell) at once, and that is harmless
+    -- the two sets share no cell mean. Pass the per-trial cell identity and the check
+    becomes per (cell, run), which is the leak that actually inflates prediction.
     """
     repeat = np.asarray(repeat)
     uniq = np.unique(repeat)
@@ -232,17 +240,77 @@ def build_repeat_folds(
 
     diag: dict = {"n_folds": len(folds), "repeat_levels": [int(u) for u in uniq]}
     if run is not None:
-        run = np.asarray(run)
+        run = np.asarray(run).astype(str)
+        keys = (
+            np.array(
+                [f"{c}\x00{r}" for c, r in zip(np.asarray(cell).astype(str), run, strict=True)]
+            )
+            if cell is not None
+            else run
+        )
         leaks = []
         for fi, (train, test) in enumerate(folds):
-            shared = np.intersect1d(np.unique(run[train]), np.unique(run[test]))
+            shared = np.intersect1d(np.unique(keys[train]), np.unique(keys[test]))
             if shared.size:
-                leaks.append({"fold": fi, "runs": [str(s) for s in shared.tolist()]})
+                entry: dict = {"fold": fi, "n_leaks": int(shared.size)}
+                if cell is None:
+                    entry["runs"] = [str(s) for s in shared.tolist()[:10]]
+                else:
+                    entry["examples"] = [
+                        f"cell {s.split(chr(0))[0]} in run {s.split(chr(0))[1]}"
+                        for s in shared.tolist()[:10]
+                    ]
+                leaks.append(entry)
         diag["run_leaks"] = leaks
         diag["run_locality_ok"] = not leaks
     else:
         diag["run_locality_ok"] = None
     return folds, diag
+
+
+def cell_labels(design: FactorDesign) -> np.ndarray:
+    """Per-trial ``"levelA|levelB"`` cell identity, for readable locality diagnostics."""
+    la, lb = design.levels[0], design.levels[1]
+    codes = design.codes.numpy()
+    return np.array([f"{la[a]}|{lb[b]}" for a, b in codes])
+
+
+def _check_run_locality(fold_diag: dict, strict: bool, verbose: bool) -> None:
+    """Warn (or refuse, under *strict*) when a cell's repeats share a run.
+
+    Repeating a cell inside one run is a deliberate design choice in plenty of
+    experiments, so this is not an error by default. What it costs is honesty about
+    magnitude: run-level nuisance then sits on both sides of that cell's train/test
+    split, inflating held-out R² and the noise ceiling. It inflates every band alike,
+    so the partition *ratios* -- which is what the tool is for -- are far less affected
+    than the absolute numbers. Pass ``strict_run_locality=True`` to make it fatal when
+    you expected repeats to be spread across runs and want to be told they are not.
+    """
+    leaks = fold_diag.get("run_leaks")
+    if not leaks:
+        return
+
+    total = sum(int(item.get("n_leaks", 0)) for item in leaks)
+    detail = "; ".join(
+        f"fold {item['fold']}: {item.get('n_leaks')} "
+        f"({', '.join(item.get('examples', item.get('runs', []))[:3])}...)"
+        for item in leaks[:4]
+    )
+    if strict:
+        raise ValueError(
+            f"fold construction leaks {total} (cell, run) pairs across the train/test "
+            f"split: {detail}. A cell has two repeats in the same run, so run-level "
+            "nuisance sits on both sides of that cell and inflates held-out R² and the "
+            "noise ceiling. Drop -strict_run_locality if the repeats-within-run are "
+            "deliberate; the partition ratios survive it, the absolute numbers are "
+            "optimistic."
+        )
+    if verbose:
+        print(
+            f"   ⚠️  {total} (cell, run) pairs have repeats inside one run "
+            f"({detail}). Held-out R² and ncsnr are inflated by shared run nuisance; "
+            "the partition ratios are much less affected."
+        )
 
 
 def _solve_gammas(
@@ -309,6 +377,7 @@ def partition_variance(
     run: np.ndarray | None = None,
     max_rank: int | None = None,
     min_ncsnr_for_rank: float = 0.75,
+    strict_run_locality: bool = False,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = True,
@@ -362,13 +431,8 @@ def partition_variance(
 
     if repeat is None:
         repeat = derive_repeat_index(design)
-    folds, fold_diag = build_repeat_folds(repeat, run)
-    if fold_diag.get("run_leaks"):
-        raise ValueError(
-            f"fold construction leaks runs across the train/test split: {fold_diag['run_leaks']}. "
-            "Some cell has repeats sharing a run, so run-level nuisance would inflate every "
-            "model equally and read as signal. Fix the repeat assignment or drop the trials."
-        )
+    folds, fold_diag = build_repeat_folds(repeat, run, cell=cell_labels(design))
+    _check_run_locality(fold_diag, strict=strict_run_locality, verbose=verbose)
 
     n_a, n_b = len(design.levels[0]), len(design.levels[1])
     ia, ib = n_a - 1, n_b - 1
@@ -773,6 +837,7 @@ def permutation_test(
     statistics: tuple[str, ...] = ("unique_a", "unique_b", "interaction"),
     n_perms: int = 1000,
     seed: int = 0,
+    strict_run_locality: bool = False,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = True,
@@ -823,9 +888,8 @@ def permutation_test(
 
     if repeat is None:
         repeat = derive_repeat_index(design)
-    folds, fold_diag = build_repeat_folds(repeat, run)
-    if fold_diag.get("run_leaks"):
-        raise ValueError(f"fold construction leaks runs: {fold_diag['run_leaks']}")
+    folds, fold_diag = build_repeat_folds(repeat, run, cell=cell_labels(design))
+    _check_run_locality(fold_diag, strict=strict_run_locality, verbose=verbose)
 
     ops = _build_cell_ops(design, folds, device)
 

@@ -20,6 +20,7 @@ from fastfuncstuff.stats.variance_partition import (
     _partition_stats,
     build_factor_design,
     build_repeat_folds,
+    cell_labels,
     derive_repeat_index,
     partition_variance,
     permutation_test,
@@ -108,23 +109,60 @@ def test_derive_repeat_index_matches_explicit():
     np.testing.assert_array_equal(derived, rep)
 
 
-def test_fold_builder_refuses_run_leak():
+def test_fold_builder_flags_run_leak():
     factors, rep, run = make_crossed_table()
-    _, diag = build_repeat_folds(rep, run)
+    design = build_factor_design(factors)
+    cells = cell_labels(design)
+    _, diag = build_repeat_folds(rep, run, cell=cells)
     assert diag["run_locality_ok"]
     assert diag["n_folds"] == N_REP
 
-    leaky = np.zeros_like(run)  # every trial in one run -> every fold leaks
-    _, diag_leak = build_repeat_folds(rep, leaky)
+    leaky = np.zeros_like(run)  # every trial in one run -> every cell repeats within it
+    _, diag_leak = build_repeat_folds(rep, leaky, cell=cells)
     assert not diag_leak["run_locality_ok"]
     assert diag_leak["run_leaks"]
 
 
-def test_partition_rejects_run_leak():
+def test_interleaved_runs_are_not_a_leak():
+    """A run holding many cells is the normal design, not a violation.
+
+    Without per-cell identity the check degrades to "does any run appear on both sides",
+    which every interleaved design fails by construction even though train and test share
+    no cell mean. This is the case that made the guard fire on real data.
+    """
+    factors, rep, _ = make_crossed_table()
+    design = build_factor_design(factors)
+    cells = cell_labels(design)
+    n = len(rep)
+    # Chop each repeat block into 4 runs: every run holds many cells, but no cell's
+    # repeats ever share a run.
+    per_rep = n // N_REP
+    run = np.array([f"{rep[i]}/{(i % per_rep) // (per_rep // 4)}" for i in range(n)])
+    _, diag = build_repeat_folds(rep, run, cell=cells)
+    assert diag["run_locality_ok"], diag["run_leaks"]
+
+
+def test_partition_warns_but_proceeds_on_run_leak(capsys):
+    """Repeats inside a run are a legitimate design; they inflate R2, they do not abort."""
     factors, rep, _ = make_crossed_table()
     betas = synth_betas(factors, a=np.zeros((4, N_STIM)), noise=1.0)
-    with pytest.raises(ValueError, match="leaks runs"):
-        partition_variance(betas, factors, repeat=rep, run=np.zeros_like(rep), verbose=False)
+    res = partition_variance(betas, factors, repeat=rep, run=np.zeros_like(rep), verbose=True)
+    assert res.diagnostics["run_locality_ok"] is False
+    assert "repeats inside one run" in capsys.readouterr().out
+
+
+def test_partition_rejects_run_leak_under_strict():
+    factors, rep, _ = make_crossed_table()
+    betas = synth_betas(factors, a=np.zeros((4, N_STIM)), noise=1.0)
+    with pytest.raises(ValueError, match="leaks"):
+        partition_variance(
+            betas,
+            factors,
+            repeat=rep,
+            run=np.zeros_like(rep),
+            strict_run_locality=True,
+            verbose=False,
+        )
 
 
 def test_shared_variance_is_near_zero_on_balanced_design():
