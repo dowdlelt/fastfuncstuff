@@ -152,6 +152,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Refinement grid spacing (voxels) around the coarse peak.",
     )
     p.add_argument(
+        "-corr_extent",
+        "-corr-extent",
+        dest="corr_extent",
+        choices=["full", "inner_half"],
+        default="full",
+        help="Which voxels the correlation sees. 'full' uses the whole volume, "
+        "tapering only the outermost few partitions that a trial shift fills with "
+        "replicated content. 'inner_half' reproduces the reference script's "
+        "central-half crop, which exists there only because it does not pad before "
+        "shifting — it assumes the anatomy is centred on the partition axis.",
+    )
+    p.add_argument(
         "-weight",
         choices=["none", "signal"],
         default="none",
@@ -293,6 +305,7 @@ def main(argv: list[str] | None = None) -> None:
         coarse_step=args.coarse_step,
         fine_step=args.fine_step,
         weight=None if args.weight == "none" else args.weight,
+        extent=args.corr_extent,
         device=device,
         verb=verb,
     )

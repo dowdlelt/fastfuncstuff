@@ -20,11 +20,21 @@ local fields.
 
 Estimation is a global inter-echo cross-correlation — deliberately one giant patch
 covering the whole volume, which is why it needs no mask and no regularisation to
-be stable (contrast with locomoco, where small patches force both). Consecutive
-echoes are correlated as a function of a trial sub-voxel shift, the peak is found
-per timepoint, and the pairwise answers are cumulated to give each echo's shift
-relative to echo 1. A line is then fit through those against TE and applied
-THROUGH THE ORIGIN, so echo 1 is corrected too.
+be stable (contrast with locomoco, where small patches force both). EVERY voxel
+votes: the only down-weighting is a raised cosine over the outermost few
+partitions, which a trial shift fills with replicate-padded content. Excluding
+more than that would assume the anatomy is centred on the partition axis, which
+an off-centre slab or an odd FoV cheerfully violates.
+
+Consecutive echoes are correlated as a function of a trial sub-voxel shift, the
+peak is found per timepoint, and the pairwise answers are cumulated to give each
+echo's shift relative to echo 1. A line is then fit through those against TE and
+applied THROUGH THE ORIGIN, so echo 1 is corrected too. Note what the intercept
+is NOT: echo 1 is its own reference, so the measured point at TE_1 is exactly
+zero by construction and the fitted intercept is just -m*TE_1 — it carries no
+independent information. Inter-echo correlation is structurally blind to a
+translation COMMON to all echoes (there is no reference outside the echo set to
+see it against); that part is rigid moco's job, and it has one.
 
 Sub-voxel shifting is the Fourier shift theorem, not interpolation: one phase ramp
 in k-space along the partition axis. It is sinc-exact, so a fractional shift adds
@@ -185,14 +195,41 @@ class _ShiftBank:
 
 
 def _inner_half(x: Tensor, dim: int) -> Tensor:
-    """The central half of ``dim`` — the reference's wrap-around guard.
+    """The central half of ``dim`` — the reference implementation's guard.
 
-    Even with padding, the outermost partitions are the least trustworthy part of
-    a shifted volume, and they are also where a 3-D EPI's slab profile rolls off.
-    Correlating only the middle half keeps the metric on real signal.
+    The reference does NOT pad before its trial shift, so the FFT's circular
+    wrap-around genuinely folds the far edge in, and cropping to the middle half
+    is how it stays away from the damage. We replicate-pad instead (see
+    :class:`_ShiftBank`), which removes the reason for the crop — so this is kept
+    only as an opt-in parity mode. Prefer :func:`_edge_taper`: throwing away half
+    the partitions assumes the anatomy is centred in the slab, and lets whatever
+    happens to sit mid-volume decide the shift for the whole image.
     """
     n = x.shape[dim]
     return x.narrow(dim, n // 4, max(1, (3 * n) // 4 - n // 4))
+
+
+def _edge_taper(n: int, ramp: int, dim: int, ndim: int, device, dtype) -> Tensor:
+    """Raised-cosine weight along ``dim``: 1 everywhere but the outermost ``ramp``.
+
+    The honest version of the reference's inner-half crop. After a shift of ``d``
+    voxels the outermost ~``d`` partitions hold replicate-fabricated content and
+    should not vote; everything else is real data and does. Since ``ramp`` is the
+    padding width (a few voxels), essentially the WHOLE volume drives the
+    correlation — which is the point: a 3-D EPI slab, an off-centre FoV or a
+    non-brain phantom must not have its edges silently excluded.
+    """
+    w = torch.ones(n, device=device, dtype=dtype)
+    ramp = min(int(ramp), n // 2)
+    if ramp > 0:
+        ramp_w = 0.5 * (
+            1.0 - torch.cos(math.pi * (torch.arange(ramp, device=device, dtype=dtype) + 0.5) / ramp)
+        )
+        w[:ramp] = ramp_w
+        w[n - ramp :] = ramp_w.flip(0)
+    shape = [1] * ndim
+    shape[dim] = n
+    return w.reshape(shape)
 
 
 def _corr(a: Tensor, b: Tensor, w: Tensor | None) -> Tensor:
@@ -259,32 +296,53 @@ def _search_chunk(
     coarse_step: float,
     fine_step: float,
     weight: Tensor | None,
+    extent: str = "full",
 ) -> tuple[Tensor, Tensor]:
-    """Peak-correlation shift for one time chunk. ``ref``/``mov`` are ``(B, …)``."""
+    """Peak-correlation shift for one time chunk. ``ref``/``mov`` are ``(B, …)``.
+
+    Two nested searches, both batched over the time axis:
+
+    1. a SHARED coarse grid across the whole allowed range — one scalar trial
+       shift applied to every volume at once, so the peak's basin is located
+       unambiguously (the whole-volume correlation curve has exactly one);
+    2. a PER-VOLUME fine grid around each volume's own coarse peak. Per-volume
+       costs the same as shared, because the phase ramp already takes a shift per
+       batch element and it is a broadcast multiply either way.
+
+    A 3-point parabola closes each stage. Roughly 90 inverse transforms per echo
+    pair per chunk buys the reference's stated 5e-4-voxel precision, against the
+    thousands of strictly serial evaluations a per-volume Brent search would need.
+    """
     pad = int(math.ceil(max(abs(lo), abs(hi)))) + 1
     bank = _ShiftBank(mov, dim, pad)
-    ref_s = _inner_half(ref, dim)
-    # The weight is a single volume; give it the batch axis so `dim` addresses the
-    # same spatial axis it does in ref/mov.
-    w_s = _inner_half(weight.unsqueeze(0), dim).squeeze(0) if weight is not None else None
+    crop = (lambda x: _inner_half(x, dim)) if extent == "inner_half" else (lambda x: x)
+    ref_s = crop(ref)
+
+    # One static weight volume covering both the edge taper and any spatial
+    # weighting, so the correlation pays for it once rather than per trial.
+    w_s = None
+    if extent != "inner_half":
+        w_s = _edge_taper(
+            ref_s.shape[dim], pad, dim - 1, ref_s.ndim - 1, ref.device, ref.dtype
+        ).expand(ref_s.shape[1:])
+    if weight is not None:
+        # The weight is a single volume; give it the batch axis so `dim` addresses
+        # the same spatial axis it does in ref/mov.
+        w_v = crop(weight.unsqueeze(0)).squeeze(0)
+        w_s = w_v if w_s is None else w_s * w_v
+    if w_s is not None:
+        w_s = w_s.contiguous()
 
     n_coarse = max(3, int(round((hi - lo) / coarse_step)) + 1)
     coarse = torch.linspace(lo, hi, n_coarse, device=ref.device)
-    curve = torch.stack(
-        [_corr(ref_s, _inner_half(bank.shift(float(s)), dim), w_s) for s in coarse], dim=1
-    )
+    curve = torch.stack([_corr(ref_s, crop(bank.shift(float(s))), w_s) for s in coarse], dim=1)
     center, _ = _parabola_peak(curve, coarse)
 
-    # Local refinement: the grid is now per-timepoint, which costs exactly the same
-    # as a shared one (the ramp is already a broadcast multiply).
     half = int(math.ceil(coarse_step / (2.0 * fine_step)))
     fine_off = torch.arange(-half, half + 1, device=ref.device, dtype=ref.dtype) * fine_step
     trials = (center.unsqueeze(1) + fine_off.unsqueeze(0)).clamp(lo, hi)
     curve_f = torch.stack(
-        [
-            _corr(ref_s, _inner_half(bank.shift(trials[:, j]), dim), w_s)
-            for j in range(trials.shape[1])
-        ],
+        [_corr(ref_s, crop(bank.shift(trials[:, j])), w_s) for j in range(trials.shape[1])],
         dim=1,
     )
     peak, corr = _parabola_peak(curve_f, trials)
@@ -309,6 +367,7 @@ def estimate_pair_shift(
     coarse_step: float = 0.25,
     fine_step: float = 0.005,
     weight: Tensor | None = None,
+    extent: str = "full",
     device: torch.device | None = None,
     desc: str = "shift search",
     disable_pbar: bool = False,
@@ -319,6 +378,11 @@ def estimate_pair_shift(
     ``axis`` is the NIfTI voxel axis of the partition direction. Returns
     ``(shift, corr)``, each ``(T,)`` — the shift being the value that, PUSHED onto
     ``mov``, best matches ``ref``.
+
+    ``extent`` selects what the correlation sees: ``"full"`` (the default) uses
+    every voxel, tapering only the outermost few partitions that a shift fills
+    with replicated content; ``"inner_half"`` reproduces the reference
+    implementation's central-half crop.
     """
     lo, hi = search_bounds(ordering, max_shift)
     if ref.ndim == 3:  # a lone volume is just T=1
@@ -346,7 +410,7 @@ def estimate_pair_shift(
         stop = min(start + step, n_t)
         r = ref[start:stop].to(device=device, dtype=torch.float32)
         m = mov[start:stop].to(device=device, dtype=torch.float32)
-        s, c = _search_chunk(r, m, dim, lo, hi, coarse_step, fine_step, weight)
+        s, c = _search_chunk(r, m, dim, lo, hi, coarse_step, fine_step, weight, extent)
         shifts[start:stop] = s.double().cpu().numpy()
         corrs[start:stop] = c.double().cpu().numpy()
         del r, m, s, c
@@ -448,6 +512,7 @@ def estimate_shifts(
     coarse_step: float = 0.25,
     fine_step: float = 0.005,
     weight: Tensor | str | None = None,
+    extent: str = "full",
     device: torch.device | None = None,
     verb: int = 1,
 ) -> ShiftEstimate:
@@ -488,6 +553,7 @@ def estimate_shifts(
                 coarse_step=coarse_step,
                 fine_step=fine_step,
                 weight=weight if isinstance(weight, Tensor) else None,
+                extent=extent,
                 device=device,
                 desc=f"  xcorr echo {e + 1} vs {e}",
                 disable_pbar=verb == 0,

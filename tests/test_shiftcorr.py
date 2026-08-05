@@ -145,3 +145,55 @@ def test_fold_into_matrices_matches_the_fourier_shift():
 
     inner = slice(6, -6)
     assert torch.allclose(via_matrix[:, inner], via_fourier[:, inner], atol=5e-3)
+
+
+def test_full_extent_sees_structure_the_inner_half_crop_throws_away():
+    """Anatomy in the outer quarters must still drive the estimate.
+
+    The reference crops to the central half because it does not pad before its
+    trial shift. We replicate-pad, so the crop is unnecessary — and harmful the
+    moment the FoV is not centred on the structure. Here ALL the structure sits in
+    the outer quarters of the partition axis; "full" recovers the shift, the
+    reference's crop is left correlating noise.
+    """
+    n_z = 40
+    interior = slice(n_z // 4, (3 * n_z) // 4)
+    # Structure deliberately in the outer quarters only — an off-centre slab, or
+    # any FoV where the anatomy is not politely centred on the partition axis.
+    zz, yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, n_z),
+        torch.linspace(-1, 1, 20),
+        torch.linspace(-1, 1, 20),
+        indexing="ij",
+    )
+    edges = (torch.exp(-((zz - 0.7) ** 2) * 60) + torch.exp(-((zz + 0.7) ** 2) * 60)) * (
+        1.0 + 0.5 * torch.sin(5.0 * yy) * torch.cos(5.0 * xx)
+    )
+    ref = edges.unsqueeze(0).repeat(2, 1, 1, 1)
+    truth = np.array([-0.6, 0.45])
+    mov = apply_shift(ref, truth, axis=2)
+
+    # Independent noise in the interior of BOTH members of the pair: the central
+    # half now carries no shared signal at all, so only the outer quarters can
+    # say anything about the shift.
+    g = torch.Generator().manual_seed(7)
+    ref[:, interior] = 0.05 * torch.randn(2, n_z // 2, 20, 20, generator=g)
+    mov[:, interior] = 0.05 * torch.randn(2, n_z // 2, 20, 20, generator=g)
+
+    full, _ = estimate_pair_shift(ref, mov, axis=2, max_shift=2.0, extent="full")
+    inner, r_inner = estimate_pair_shift(ref, mov, axis=2, max_shift=2.0, extent="inner_half")
+
+    assert np.allclose(full, -truth, atol=0.05), f"full extent got {full}"
+    assert np.abs(inner - -truth).max() > 0.1, f"inner_half should be blind here but got {inner}"
+    assert (r_inner < 0.2).all()  # and it knows: the peak correlation is near zero
+
+
+def test_edge_taper_only_touches_the_padding_width():
+    """The taper must downweight the fabricated edge and nothing else."""
+    from fastfuncstuff.processing.shiftcorr import _edge_taper
+
+    w = _edge_taper(40, 3, dim=0, ndim=1, device="cpu", dtype=torch.float32)
+    assert w.shape == (40,)
+    assert torch.all(w[3:-3] == 1.0)  # 34 of 40 partitions at full weight
+    assert w[0] < w[1] < w[2] < 1.0
+    assert torch.allclose(w[:3], w[-3:].flip(0))

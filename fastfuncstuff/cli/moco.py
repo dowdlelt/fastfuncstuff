@@ -503,6 +503,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Shift search half-range in voxels.",
     )
     sc_group.add_argument(
+        "-corr_extent",
+        "-corr-extent",
+        dest="corr_extent",
+        choices=["full", "inner_half"],
+        default="full",
+        help="Which voxels the inter-echo correlation sees. 'full' uses the whole "
+        "volume, tapering only the outermost few partitions a trial shift fills with "
+        "replicated content; 'inner_half' is the reference script's central-half crop "
+        "(which assumes the anatomy is centred on the partition axis).",
+    )
+    sc_group.add_argument(
         "-shift_weight",
         "-shift-weight",
         dest="shift_weight",
@@ -1101,6 +1112,7 @@ def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb
         ordering=args.shift_ordering,
         max_shift=args.shift_max,
         weight=None if args.shift_weight == "none" else args.shift_weight,
+        extent=args.corr_extent,
         device=device,
         verb=verb,
     )
