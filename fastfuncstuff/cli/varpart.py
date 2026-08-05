@@ -51,6 +51,82 @@ def create_parser() -> argparse.ArgumentParser:
         description="Variance partitioning for fully crossed factorial designs",
         formatter_class=_HelpFormatter,
         epilog="""
+OUTPUTS
+=======
+  {prefix}.nii.gz         one sub-brick per measure below (parcel-painted with -atlas)
+  {prefix}_roi.tsv        with -atlas: the same measures, one row per ROI
+  {prefix}_varpart.json   factors, level-name mapping, dropped trials, diagnostics
+
+Everything is computed on HELD-OUT repeats (leave-one-repeat-out CV). "Explains"
+always means predicted out of sample, never fitted. Below, A and B are your two
+-factors, in the order you gave them.
+
+--- The R2 family: fraction of held-out variance explained ------------------
+R2 = 1 - SS_residual/SS_total, NOT a squared correlation. 1.0 = perfect
+prediction, 0.0 = no better than the unit's own mean, NEGATIVE = worse than the
+mean (routine in noise -- it is a real value, not a bug).
+
+  r2_additive   R2 of the model A + B, no interaction term.
+  r2_full       R2 of the saturated model A + B + A:B. Not guaranteed above
+                r2_additive: the interaction band is estimated from ~2 trials per
+                cell, so when there is no interaction its shrinkage goes to 0 and
+                the two models coincide.
+
+--- The partition: same R2 units, so these add up ---------------------------
+  unique_A      R2(A+B) - R2(B alone). Variance only A can explain.
+  unique_B      R2(A+B) - R2(A alone).
+  shared        R2(A) + R2(B) - R2(A+B). Under exhaustive crossing this is ~0 BY
+                CONSTRUCTION -- the factors are orthogonal, so there is nothing to
+                share. Read it as a BALANCE CHECK, not a result: a nonzero value
+                means trials were dropped or censored unevenly.
+  interaction   r2_full - r2_additive. Response specific to a particular (A, B)
+                combination, beyond what A and B contribute separately.
+  preference    (unique_B - unique_A) / (unique_B + unique_A). Dimensionless,
+                -1 = purely A-driven, +1 = purely B-driven, 0 = equal. Being a
+                RATIO it is largely insensitive to how reliable the voxel is, so
+                it survives low SNR far better than the raw R2 maps. Usually the
+                map to look at first.
+
+--- Interaction structure ---------------------------------------------------
+  rank_E        Cross-validated rank of the interaction matrix E (the cell means
+                with the additive part stripped out). 0 = additive, nothing beyond
+                A + B. 1 = ONE pattern, scaled: e.g. every level of B rescales the
+                same A-profile (a gain change). >1 = REORGANIZATION: different
+                levels of B reshape the A-profile in genuinely different ways.
+                -1 = UNDETERMINED (ncsnr below -min_ncsnr_for_rank). -1 means
+                "cannot tell here", never "no interaction here".
+  rank_E_raw    Same argmax with no SNR mask. Compare against rank_E to see what
+                the mask removed; do not interpret it on its own.
+
+--- Reliability: properties of the DATA, not of the model -------------------
+  ncsnr         Noise-ceiling SNR = sd(signal) / sd(noise), estimated from
+                repeat-to-repeat variability of the same cell. Dimensionless,
+                >= 0. 0 = no reliable signal at all; 1 = signal and noise are the
+                same size; >1.5 = strong. Low ncsnr caps everything else.
+  noise_ceiling ncsnr^2 / (ncsnr^2 + 1/n_repeats), in 0..1. The R2 a PERFECT model
+                would get on this unit given its trial-to-trial noise and this
+                many repeats -- the best anyone could do. Always read r2_full
+                against it: r2_full = 0.10 is poor against a ceiling of 0.80 and
+                essentially perfect against a ceiling of 0.12.
+
+--- Shrinkage: diagnostic, not a result -------------------------------------
+  gamma_A       Per-band shrinkage in 0..1, gamma = n/(n + lambda), fitted per
+  gamma_B       unit. 1 = that band kept at full strength (held-out data supports
+  gamma_inter.. it), 0 = shrunk away entirely (no out-of-sample evidence for it).
+                gamma_interaction near 0 over most of the brain is the EXPECTED
+                picture at 3 repeats, not a failure. Useful for asking "did this
+                band get used at all here?" before believing its R2.
+
+--- Inference (only with -perm N) -------------------------------------------
+  oneminusp_unc_<stat>   1 - uncorrected p, per unit.
+  oneminusp_fwe_<stat>   1 - family-wise p, from the max-statistic null across
+                         all units (voxels, or ROIs with -atlas).
+                Stored as 1 - p so SIGNIFICANT IS THE HIGH END: threshold at 0.95
+                for p < 0.05, 0.99 for p < 0.01. The null is Freedman-Lane on the
+                reduced model's residuals, permuted within run blocks, with the
+                per-band shrinkage re-fitted inside every permutation so the null
+                absorbs the selection optimism.
+
 Examples:
   # 21 tasks x 20 stimuli, 3 repeats, single-trial betas from ffs_ridge
   ffs_varpart -betas trials.nii.gz -trials trials.csv -factors stim,task \\
@@ -454,11 +530,17 @@ def main() -> int:
         "r2_full": res.r2["M_full"],
     }
     if perm_res is not None:
+        # Stored as 1 - p so that "significant" is the *high* end: threshold the map at
+        # 0.95 for p < 0.05 and every viewer's one-sided threshold slider does the right
+        # thing. Raw p-values invert that (small = interesting), which makes every overlay
+        # a two-step operation and is easy to get backwards. The library still returns
+        # true p-values; only the written maps are complemented. Name avoids a leading
+        # digit so it stays usable in AFNI sub-brick label selectors.
         rename = {"unique_a": f"unique_{fa}", "unique_b": f"unique_{fb}"}
         for key in perm_res.p_fwe:
             base = rename.get(key, key)
-            maps[f"p_unc_{base}"] = perm_res.p_uncorrected[key]
-            maps[f"p_fwe_{base}"] = perm_res.p_fwe[key]
+            maps[f"oneminusp_unc_{base}"] = 1.0 - perm_res.p_uncorrected[key]
+            maps[f"oneminusp_fwe_{base}"] = 1.0 - perm_res.p_fwe[key]
 
     info = parse_prefix(args.prefix)
     stem = info.stem
@@ -497,6 +579,8 @@ def main() -> int:
     print(f"💾 Wrote {out_path} ({len(maps)} sub-bricks, {kind})")
     for i, name in enumerate(names):
         print(f"   [{i:>2}] {name}")
+    if perm_res is not None:
+        print("   p-maps are stored as 1 - p: threshold at 0.95 for p < 0.05.")
 
     meta = {
         "factors": factor_names,
@@ -512,6 +596,12 @@ def main() -> int:
         "min_ncsnr_for_rank": args.min_ncsnr_for_rank,
         "n_perms": args.perm,
     }
+    if perm_res is not None:
+        meta["p_map_convention"] = "oneminusp_* sub-bricks store 1 - p (threshold 0.95 for p<0.05)"
+        meta["perm_diagnostics"] = {
+            k: (v if not isinstance(v, np.generic) else v.item())
+            for k, v in perm_res.diagnostics.items()
+        }
     if roi_ids is not None:
         meta["roi_ids"] = [int(r) for r in roi_ids]
     with open(f"{stem}_varpart.json", "w") as fh:

@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 nib = pytest.importorskip("nibabel")
 
@@ -167,9 +168,48 @@ def test_permutation_adds_pvalue_columns(tmp_path):
     )
 
     rows = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))
-    assert "p_fwe_unique_stim" in rows[0]
-    assert "p_unc_interaction" in rows[0]
-    assert 0.0 < float(rows[0]["p_fwe_unique_stim"]) <= 1.0
+    assert "oneminusp_fwe_unique_stim" in rows[0]
+    assert "oneminusp_unc_interaction" in rows[0]
+    # Stored as 1 - p, so significance is the high end: p in (0, 1] -> value in [0, 1).
+    val = float(rows[0]["oneminusp_fwe_unique_stim"])
+    assert 0.0 <= val < 1.0
+    # No raw-p sub-brick survives, or a threshold at 0.95 would silently mean p > 0.95.
+    assert not any(k.startswith(("p_unc", "p_fwe")) for k in rows[0])
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    assert "1 - p" in meta["p_map_convention"]
+
+
+def test_pvalues_are_stored_complemented(tmp_path):
+    """The written map must be exactly 1 - the library's p, not a rescaling of it."""
+    from fastfuncstuff.stats.variance_partition import permutation_test
+
+    betas, tsv, shape, _ = _fixture(tmp_path)
+    atlas = tmp_path / "atlas2.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.int16), np.eye(4)), atlas)
+    out = tmp_path / "vpc"
+    args = [
+        "-betas", str(betas), "-trials", str(tsv), "-factors", "stim,task",
+        "-atlas", str(atlas), "-perm", "16", "-seed", "5", "-prefix", str(out), "-quiet",
+    ]  # fmt: skip
+    assert _run(args) == 0
+
+    rows_tbl = list(csv.reader(open(tsv, newline="")))
+    header = rows_tbl[0]
+    factors = {
+        name: np.array([r[header.index(name)] for r in rows_tbl[1:]]) for name in ("stim", "task")
+    }
+    run = np.array([r[header.index("run")] for r in rows_tbl[1:]])
+    rep = np.array([int(r[header.index("repeat")]) for r in rows_tbl[1:]])
+    data = np.asanyarray(nib.load(str(betas)).dataobj)
+    y = torch.as_tensor(data.reshape(-1, data.shape[3])[None].mean(axis=1), dtype=torch.float32)
+
+    res = permutation_test(y, factors, repeat=rep, run=run, n_perms=16, seed=5, verbose=False)
+    row = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))[0]
+    for key, col in (
+        ("unique_a", "oneminusp_unc_unique_stim"),
+        ("interaction", "oneminusp_unc_interaction"),
+    ):
+        assert float(row[col]) == pytest.approx(1.0 - float(res.p_uncorrected[key][0]), abs=1e-5)
 
 
 def test_trial_count_mismatch_is_a_clear_error(tmp_path):
