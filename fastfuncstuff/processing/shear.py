@@ -579,6 +579,17 @@ def _interp_1d_along(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
 # drifts with the transform, mints a graph per volume, and blows dynamo's
 # recompile limit -- see the note on _resample_chunk_size.
 #
+# So the two want OPPOSITE settings, and the shear's matters more: dynamic=True
+# measures 27.1 ms/resample against 4.79 ms static (the unrolled tap loop is
+# exactly what dynamic shapes stop inductor fusing), where for the gather
+# dynamic=True was the 7x win. Do not "unify" these.
+#
+# Known limit: the ~3 graphs are per volume shape, so a process spanning more
+# than two grids (a -batch manifest mixing resolutions) exceeds dynamo's cap of
+# 8 and falls back to eager for the rest of the run. That is a graceful
+# degradation -- eager shear is still ~2.7x the gather it replaced -- unlike the
+# gather's failure mode, which was 6x SLOWER than eager. Untested above two grids.
+#
 # Gating mirrors interp._get_gather_contract: accumulate eager seconds, compile
 # once they cover what a warmup actually costs here (~2.7s against a warm
 # inductor cache, ~25s cold). Separate counter from the gather's -- one having
