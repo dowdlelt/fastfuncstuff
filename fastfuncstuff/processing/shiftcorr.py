@@ -64,7 +64,10 @@ from fastfuncstuff.memory import get_available_memory
 
 # View ordering constrains the SIGN of the shift: partitions encoded in a fixed
 # order accumulate the drift phase monotonically, so a known ordering halves the
-# search and keeps a noisy timepoint from flipping sign. "unknown" searches both.
+# search. Only use it when the drift really is one-directional — over a TIMESERIES
+# respiration swings the frequency both ways, and a constrained range silently
+# pins every volume that wanted the other sign at exactly zero. "unknown" (both
+# signs) is the right default; the reference's single-volume case is not.
 ORDERING_SIGN: dict[str, tuple[float, float]] = {
     "ascending": (-1.0, 0.0),
     "descending": (0.0, 1.0),
@@ -562,7 +565,17 @@ def estimate_shifts(
             corrs.append(c)
             if verb >= 1:
                 edge = float(np.mean((np.abs(s - lo) < fine_step) | (np.abs(s - hi) < fine_step)))
-                note = f"  [!] {edge:.0%} of volumes hit the search bound" if edge > 0.02 else ""
+                note = ""
+                if edge > 0.02:
+                    note = f"  [!] {edge:.0%} of volumes hit the search bound"
+                    if ordering != "unknown":
+                        # Almost always this flag, not a too-small -max_shift: a
+                        # fixed ordering pins one side of the range at zero, and
+                        # across a timeseries respiration swings the frequency BOTH
+                        # ways, so a good fraction of volumes legitimately want the
+                        # forbidden sign. The reference's single-volume use case
+                        # (one known monotonic drift) does not have this problem.
+                        note += f" — '{ordering}' forbids one sign; try -ordering unknown"
                 print(
                     f"  echo {e + 1} vs {e}: shift {s.mean():+.4f} ± {s.std():.4f} vox  "
                     f"(r = {np.nanmean(c):.4f}){note}"

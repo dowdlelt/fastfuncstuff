@@ -125,7 +125,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["ascending", "descending", "unknown"],
         default="unknown",
         help="Partition view ordering. A known ordering fixes the sign of the drift "
-        "and halves the search: ascending searches [-max,0], descending [0,+max].",
+        "and halves the search: ascending searches [-max,0], descending [0,+max]. "
+        "Use it only when the drift really is one-directional (a single volume with a "
+        "known monotonic drift). Over a TIMESERIES respiration swings the frequency "
+        "both ways, so a constrained range pins every volume that wanted the other "
+        "sign at exactly zero; keep 'unknown' there.",
     )
     p.add_argument(
         "-max_shift",
