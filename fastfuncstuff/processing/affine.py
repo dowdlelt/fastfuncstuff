@@ -921,6 +921,7 @@ def sample_affine_at_points(
     matrix: Tensor,
     points_xyz: Tensor,
     zero_outside: bool = True,
+    interp: str = "linear",
 ) -> Tensor:
     """Sample ``source`` at M base points transformed by ``matrix`` -> (M,).
 
@@ -951,10 +952,13 @@ def sample_affine_at_points(
     gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
     gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
 
-    # grid_sample wants (N, D, H, W, 3); pack the M points along one axis.
-    grid = torch.stack([gx, gy, gz], dim=-1).view(1, M, 1, 1, 3)
-    vol = source[None, None]  # (1, 1, nz, ny, nx)
-    vals = _grid_sample_3d(vol, grid).reshape(M)
+    if interp == "linear":
+        # grid_sample wants (N, D, H, W, 3); pack the M points along one axis.
+        grid = torch.stack([gx, gy, gz], dim=-1).view(1, M, 1, 1, 3)
+        vol = source[None, None]  # (1, 1, nz, ny, nx)
+        vals = _grid_sample_3d(vol, grid).reshape(M)
+    else:
+        vals = _separable_resample_3d(source, sx, sy, sz, interp).reshape(M)
 
     if zero_outside:
         oob = (
@@ -974,14 +978,16 @@ def sample_affine_at_points_batched(
     matrices: Tensor,
     points_xyz: Tensor,
     zero_outside: bool = True,
+    interp: str = "linear",
 ) -> Tensor:
     """Sample ``source`` at M points under B transforms -> (B, M).
 
     Batched :func:`sample_affine_at_points` for the subsampled coarse search:
-    one source volume, B candidate matrices, the same M base points. Uses a
-    single grid_sample with the points packed into the (D, H) grid dims, so only
-    one copy of the source is needed regardless of B. Caller should chunk B to
-    bound the B*M grid memory.
+    one source volume, B candidate matrices, the same M base points. "linear"
+    uses a single grid_sample with the points packed into the (D, H) grid dims,
+    so only one copy of the source is needed regardless of B; other kernels go
+    through the separable resampler, which takes scattered coordinates directly.
+    Caller should chunk B to bound the B*M grid memory.
     """
     device = source.device
     dtype = source.dtype
@@ -997,8 +1003,11 @@ def sample_affine_at_points_batched(
     gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
     gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
 
-    grid = torch.stack([gx, gy, gz], dim=-1).view(1, B, M, 1, 3)
-    vals = _grid_sample_3d(source[None, None], grid).reshape(B, M)
+    if interp == "linear":
+        grid = torch.stack([gx, gy, gz], dim=-1).view(1, B, M, 1, 3)
+        vals = _grid_sample_3d(source[None, None], grid).reshape(B, M)
+    else:
+        vals = _separable_resample_3d(source, sx, sy, sz, interp).reshape(B, M)
 
     if zero_outside:
         oob = (

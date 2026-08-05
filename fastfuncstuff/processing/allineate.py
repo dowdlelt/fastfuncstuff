@@ -30,6 +30,7 @@ from . import cost_hist
 from .affine import (
     apply_affine,
     apply_affine_batched,
+    apply_affine_interp,
     apply_affine_wsinc5,
     identity_params,
     params_to_matrix,
@@ -190,6 +191,10 @@ class CostContext:
     ppow: float = 1.0
     base_clip: tuple[float, float] | None = None
     source_clip: tuple[float, float] | None = None
+    # Interpolation for the source resample *inside* the cost, i.e. -interp.
+    # Lives here rather than being read off the config at each call site because
+    # the cost evaluators are closures that capture ctx and nothing else.
+    interp: str = "linear"
     # Overlap penalty (AFNI lpc+/lpa+ "ov"): differentiable additive term so the
     # gradient-based refiner is steered away from low-overlap configurations.
     # ``src_cov`` is a soft source-coverage map on the optimisation grid that is
@@ -855,7 +860,7 @@ def _coarse_search_joint(
     for s in range(0, B, chunk):
         with torch.no_grad():
             wb = sample_affine_at_points_batched(
-                source_blur, matrices[s : s + chunk], pts_xyz, zero_outside=True
+                source_blur, matrices[s : s + chunk], pts_xyz, zero_outside=True, interp=ctx.interp
             )
             val = local_pearson_value_batched(base_pts, wb, weight_c, blokset_c, ctx.ppow)
         costs.append((-val) if is_lpc else val.abs())
@@ -1193,7 +1198,9 @@ def _refine_adam_normalized(
             cost = cost_fn(matrix)
         else:
             # zero_outside (AFNI outval=0) during optimization — see _eval_candidates.
-            warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+            warped = apply_affine_interp(
+                source, matrix, ctx.interp, base.shape, zero_outside=True
+            )
             cost = _compute_cost(
                 base, warped, weight, ctx, voxdims, matrix=matrix, blokrad_mm=blokrad_mm
             )
@@ -1259,7 +1266,7 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
 
     def fn(matrices: Tensor) -> Tensor:
         warped = sample_affine_at_points_batched(
-            source_stage, matrices, points_xyz, zero_outside=True
+            source_stage, matrices, points_xyz, zero_outside=True, interp=ctx.interp
         )  # (T, M)
         val = local_pearson_value_batched(base_pts, warped, weight_s, blokset, ctx.ppow)  # (T,)
         c = (-val) if is_lpc else val.abs()
@@ -1404,7 +1411,9 @@ def _make_powell_cost(
                 cost = matrix_cost_fn(matrix)
             else:
                 # zero_outside (AFNI outval=0) during optimization — see _eval_candidates.
-                warped = apply_affine(source, matrix, base.shape, zero_outside=True)
+                warped = apply_affine_interp(
+                    source, matrix, ctx.interp, base.shape, zero_outside=True
+                )
                 cost = _compute_cost(base, warped, weight, ctx, voxdims, matrix=matrix)
 
         val = -cost.item()
@@ -1577,7 +1586,7 @@ def _refine_progressive(
 
         def fn(matrix: Tensor) -> Tensor:
             warped_s = sample_affine_at_points(
-                source_stage, matrix, samp.points_xyz, zero_outside=True
+                source_stage, matrix, samp.points_xyz, zero_outside=True, interp=ctx.interp
             )
             val = local_pearson_value(base_pts, warped_s, samp.weight_s, blokset_s, ppow=ctx.ppow)
             c = (-val) if is_lpc else val.abs()
@@ -1965,6 +1974,7 @@ def allineate(
         src_cov=src_cov,
         base_dom=base_dom,
         ov_denom=ov_denom,
+        interp=config.interp,
     )
 
     # Stage 1: the optimiser starts from identity — the cmass/manual shift is
