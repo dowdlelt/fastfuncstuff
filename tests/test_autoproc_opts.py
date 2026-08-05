@@ -233,3 +233,21 @@ def test_slicetiming_none_emits_no_timing_flags():
     s = write_script(build_plan(subj, Options(slicetiming_method="none")), "wd", bids_root="/bids")
     assert "-tpattern" not in s
     assert 'st_str=""' in s
+
+
+def test_device_option_sets_the_scripts_DEVICE():
+    """Every stage reads $DEVICE, so the one variable is the whole knob."""
+    s = write_script(build_plan(_subject(), Options(device="cpu")), "wd", bids_root="/bids")
+    assert "\nDEVICE=cpu " in s
+    assert f"DEVICE={config.DEFAULT_DEVICE}\n" not in s
+
+
+def test_device_flag_is_validated_and_reaches_options():
+    p = build_parser()
+    assert (
+        p.parse_args(["-bids_dir", "/bids", "-subject", "X", "-device", "CUDA,0"]).device
+        == "cuda,0"
+    )
+    for bad in ("gpu", "cuda,x"):
+        with pytest.raises(SystemExit):
+            p.parse_args(["-bids_dir", "/bids", "-subject", "X", "-device", bad])

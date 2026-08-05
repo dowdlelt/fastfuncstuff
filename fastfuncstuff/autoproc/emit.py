@@ -1026,7 +1026,7 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 set -euo pipefail
 
 OUT={shlex.quote(out_dir)}
-DEVICE={config.DEFAULT_DEVICE}
+DEVICE={shlex.quote(opt.device)}          # compute device for every ffs stage; -device
 FMT={opt.fmt}           # working intermediates (read many times); -format
 FINAL_FMT={opt.final_fmt}     # final timeseries (portable); -final_format
 GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format

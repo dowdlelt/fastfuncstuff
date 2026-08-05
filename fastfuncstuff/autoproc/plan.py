@@ -137,6 +137,10 @@ class Options:
     fmt: str = config.DEFAULT_FMT
     final_fmt: str = config.DEFAULT_FINAL_FMT
     glm_fmt: str = config.DEFAULT_GLM_FMT
+    # Compute device handed to every ffs_* stage as ``-device $DEVICE``
+    # (cuda | mps | cpu | auto, plus the "cuda,0" / "cpu,8" forms every ffs CLI
+    # parses). Emitted as the DEVICE variable so it stays editable in the script.
+    device: str = config.DEFAULT_DEVICE
 
     @property
     def has_grand_ref(self) -> bool:

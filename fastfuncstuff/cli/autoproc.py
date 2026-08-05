@@ -47,6 +47,27 @@ def _fmt_suffix(value: str) -> str:
     )
 
 
+def _device_spec(value: str) -> str:
+    """Validate a device string for the emitted ``DEVICE`` variable.
+
+    Only the spelling is checked, never availability: the script is routinely
+    generated on one machine and run on another (a cluster node with the GPU).
+    Accepts what every ffs CLI's ``parse_device_arg`` accepts — cuda | mps | cpu
+    | auto, optionally ``,N`` (cuda device index / cpu thread count)."""
+    v = value.strip().lower()
+    backend, _, suffix = v.partition(",")
+    if backend not in ("cuda", "mps", "cpu", "auto"):
+        raise argparse.ArgumentTypeError(
+            f"unrecognized device {value!r}; use cuda, mps, cpu, or auto (optionally cuda,N / cpu,N)"
+        )
+    if suffix and not suffix.isdigit():
+        raise argparse.ArgumentTypeError(
+            f"device {value!r}: the part after ',' must be a number "
+            "(cuda,N = GPU index; cpu,N = threads)"
+        )
+    return v
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_autoproc",
@@ -377,6 +398,19 @@ def build_parser() -> argparse.ArgumentParser:
         "a re-run skips runs whose outputs already exist (-batch_skip); pass this "
         "to force every run to re-process. Sets skip_moco=skip_final=0 in the "
         "emitted script (both stay editable there).",
+    )
+
+    g = p.add_argument_group("compute device")
+    g.add_argument(
+        "-device",
+        type=_device_spec,
+        default=None,
+        metavar="DEV",
+        help=f"compute device every ffs stage in the script runs on → DEVICE "
+        f"(default: {config.DEFAULT_DEVICE}). cuda | mps | cpu | auto, or the "
+        "indexed/threaded forms every ffs CLI accepts (cuda,0 / cpu,8). "
+        "Edit DEVICE at the top of the emitted script to change it later. "
+        "On Apple Silicon prefer cpu: float64 ops fall back off MPS anyway.",
     )
 
     g = p.add_argument_group("output format (nii | nii.gz/gz | nii.zst/zst)")
@@ -930,6 +964,8 @@ def main(argv: list[str] | None = None) -> int:
         opt.final_fmt = args.final_fmt
     if args.glm_fmt is not None:
         opt.glm_fmt = args.glm_fmt
+    if args.device is not None:
+        opt.device = args.device
 
     _report_events(args, opt, subject)
 
