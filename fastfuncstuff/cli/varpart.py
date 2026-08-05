@@ -45,6 +45,11 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefa
     """Show defaults while preserving raw description formatting."""
 
 
+# Noise ceiling below which the *_frac_ceiling ratios are reported as 0: an oracle model
+# could not reach 1% of the variance there, so the ratio divides noise by noise.
+CEILING_FLOOR = 0.01
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_varpart",
@@ -86,6 +91,23 @@ mean (routine in noise -- it is a real value, not a bug).
                 RATIO it is largely insensitive to how reliable the voxel is, so
                 it survives low SNR far better than the raw R2 maps. Usually the
                 map to look at first.
+
+--- Fraction of the OBTAINABLE variance -------------------------------------
+Held-out R2 is capped by noise_ceiling, not by 1, and that ceiling swings wildly
+across the brain. These divide by it, turning "how much variance" into "how much
+of what was ever gettable here":
+
+  unique_A_frac_ceiling      unique_A / noise_ceiling
+  unique_B_frac_ceiling      unique_B / noise_ceiling
+  interaction_frac_ceiling   interaction / noise_ceiling
+  r2_full_frac_ceiling       r2_full / noise_ceiling -- "how close to the best
+                             anyone could do is this model, here?"
+
+  1.0 = the whole obtainable signal. 0.4 = 40% of it, whether the raw R2 was 0.02
+  or 0.5. Reported as 0 wherever noise_ceiling <= 0.01, since dividing by a
+  ceiling that low is noise over noise. Values slightly ABOVE 1 happen and are not
+  a bug: the ceiling is itself estimated from a handful of repeats, so it lands
+  low in some units.
 
 --- Interaction structure ---------------------------------------------------
   rank_E        Cross-validated rank of the interaction matrix E (the cell means
@@ -529,6 +551,21 @@ def main() -> int:
         "r2_additive": res.r2["M_add"],
         "r2_full": res.r2["M_full"],
     }
+
+    # Held-out R² is capped by the noise ceiling, not by 1, and the ceiling varies enormously
+    # across the brain. 0.02 against a ceiling of 0.05 is most of what was ever obtainable
+    # there; the same 0.02 against 0.60 is marginal. Dividing turns "how much variance" into
+    # "how much of the obtainable variance", which is the comparison a reader is making by
+    # eye anyway -- and doing it by eye across a map is not possible.
+    ceiling = maps["noise_ceiling"]
+    zero = torch.zeros((), dtype=ceiling.dtype, device=ceiling.device)
+    # Below this an oracle model could not explain 1% of the variance, so the ratio is
+    # noise/noise and would paint garbage over exactly the tissue with nothing in it.
+    obtainable = ceiling > CEILING_FLOOR
+    for source in (f"unique_{fa}", f"unique_{fb}", "interaction", "r2_full"):
+        frac = torch.where(obtainable, maps[source] / ceiling.clamp_min(CEILING_FLOOR), zero)
+        maps[f"{source}_frac_ceiling"] = frac
+
     if perm_res is not None:
         # Stored as 1 - p so that "significant" is the *high* end: threshold the map at
         # 0.95 for p < 0.05 and every viewer's one-sided threshold slider does the right

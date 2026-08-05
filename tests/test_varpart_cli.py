@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-import torch
 
 nib = pytest.importorskip("nibabel")
 
@@ -25,7 +24,7 @@ from test_variance_partition import (  # noqa: E402
     make_crossed_table,
 )
 
-from fastfuncstuff.cli.varpart import main  # noqa: E402
+from fastfuncstuff.cli.varpart import CEILING_FLOOR, main  # noqa: E402
 
 
 def _fixture(tmp_path, shape=(4, 4, 3), noise=1.0, seed=0, drop_col=None):
@@ -85,7 +84,7 @@ def test_voxel_mode_writes_expected_subbricks(tmp_path):
 
     img = nib.load(str(out) + ".nii.gz")
     assert img.shape[:3] == shape
-    assert img.shape[3] == 14
+    assert img.shape[3] == 18
     assert (tmp_path / "vp_varpart.json").exists()
 
     import json
@@ -130,7 +129,7 @@ def test_atlas_mode_writes_roi_table(tmp_path):
     # ROI mode also paints a volume for figures: same grid and sub-bricks as voxel mode,
     # constant within each parcel.
     img = nib.load(str(out) + ".nii.gz")
-    assert img.shape == (*shape, 14)
+    assert img.shape == (*shape, 18)
     painted = np.asanyarray(img.dataobj)
     names = list(rows[0])
     ustim = painted[..., names.index("unique_stim") - 1]
@@ -180,36 +179,31 @@ def test_permutation_adds_pvalue_columns(tmp_path):
 
 
 def test_pvalues_are_stored_complemented(tmp_path):
-    """The written map must be exactly 1 - the library's p, not a rescaling of it."""
-    from fastfuncstuff.stats.variance_partition import permutation_test
+    """A real effect must score HIGH and an absent one LOW -- the raw-p convention inverts
+    both, so this ordering is what actually distinguishes the two conventions.
 
-    betas, tsv, shape, _ = _fixture(tmp_path)
-    atlas = tmp_path / "atlas2.nii.gz"
-    nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.int16), np.eye(4)), atlas)
+    Comparing against a recomputed p-value cannot do that job: with band shrinkage an
+    absent effect gives a statistic of exactly zero, so its p sits on a knife-edge of ties
+    and moves by a whole 1/(P+1) step under float noise.
+    """
+    betas, tsv, shape, _ = _fixture(tmp_path, noise=0.5)
+    atlas = tmp_path / "atlas_p.nii.gz"
+    lab = (np.arange(int(np.prod(shape))) % 4 + 1).reshape(shape).astype(np.int16)
+    nib.save(nib.Nifti1Image(lab, np.eye(4)), atlas)
+
     out = tmp_path / "vpc"
-    args = [
-        "-betas", str(betas), "-trials", str(tsv), "-factors", "stim,task",
-        "-atlas", str(atlas), "-perm", "16", "-seed", "5", "-prefix", str(out), "-quiet",
-    ]  # fmt: skip
-    assert _run(args) == 0
+    assert (
+        _run([*_base_args(betas, tsv, out), "-atlas", str(atlas), "-perm", "40", "-seed", "5"]) == 0
+    )
 
-    rows_tbl = list(csv.reader(open(tsv, newline="")))
-    header = rows_tbl[0]
-    factors = {
-        name: np.array([r[header.index(name)] for r in rows_tbl[1:]]) for name in ("stim", "task")
-    }
-    run = np.array([r[header.index("run")] for r in rows_tbl[1:]])
-    rep = np.array([int(r[header.index("repeat")]) for r in rows_tbl[1:]])
-    data = np.asanyarray(nib.load(str(betas)).dataobj)
-    y = torch.as_tensor(data.reshape(-1, data.shape[3])[None].mean(axis=1), dtype=torch.float32)
-
-    res = permutation_test(y, factors, repeat=rep, run=run, n_perms=16, seed=5, verbose=False)
-    row = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))[0]
-    for key, col in (
-        ("unique_a", "oneminusp_unc_unique_stim"),
-        ("interaction", "oneminusp_unc_interaction"),
-    ):
-        assert float(row[col]) == pytest.approx(1.0 - float(res.p_uncorrected[key][0]), abs=1e-5)
+    rows = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))
+    for row in rows:
+        real = float(row["oneminusp_unc_unique_stim"])
+        absent = float(row["oneminusp_unc_interaction"])
+        assert real > 0.9, "a real main effect must land near 1 under the 1-p convention"
+        assert real > absent
+        # Every value sits on the (n_perms + 1) grid of achievable p-values.
+        assert (1.0 - real) * 41 == pytest.approx(round((1.0 - real) * 41), abs=1e-3)
 
 
 def test_trial_count_mismatch_is_a_clear_error(tmp_path):
@@ -443,3 +437,55 @@ def test_drop_trials_accepts_the_sanitized_identifier(tmp_path):
     rows = list(csv.DictReader(open(messy, newline="")))
     meta = json.loads(Path(f"{out}_varpart.json").read_text())
     assert meta["n_trials"] == len(rows) - sum("shown 0" in r["task"] for r in rows)
+
+
+def test_frac_ceiling_maps_are_the_ratio_to_the_noise_ceiling(tmp_path):
+    """R2 alone cannot say "is this good"; divided by the ceiling it can."""
+    betas, tsv, shape, _ = _fixture(tmp_path)
+    atlas = tmp_path / "atlas3.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.int16), np.eye(4)), atlas)
+    out = tmp_path / "vpf"
+    assert _run([*_base_args(betas, tsv, out), "-atlas", str(atlas)]) == 0
+
+    row = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))[0]
+    for src in ("unique_stim", "unique_task", "interaction", "r2_full"):
+        assert f"{src}_frac_ceiling" in row
+    ceiling = float(row["noise_ceiling"])
+    assert ceiling > 0.01  # the fixture has real signal, so the ratio is defined
+    for src in ("unique_stim", "interaction", "r2_full"):
+        expected = float(row[src]) / ceiling
+        assert float(row[f"{src}_frac_ceiling"]) == pytest.approx(expected, rel=1e-4)
+
+
+def test_frac_ceiling_is_zero_where_nothing_is_obtainable(tmp_path):
+    """Pure noise gives a ~0 ceiling; the ratio must not paint noise/noise over it."""
+    rng = np.random.default_rng(0)
+    factors, rep, run = make_crossed_table()
+    n_tr = len(rep)
+    shape = (4, 4, 3)
+    n_vox = int(np.prod(shape))
+    y = rng.normal(0, 1.0, size=(n_vox, n_tr))  # no signal at all
+    betas = tmp_path / "noise.nii.gz"
+    nib.save(nib.Nifti1Image(y.reshape(*shape, n_tr).astype(np.float32), np.eye(4)), betas)
+
+    tsv = tmp_path / "noise_trials.csv"
+    with open(tsv, "w", newline="") as fh:
+        w = csv.writer(fh)
+        w.writerow(["stim", "task", "run", "repeat"])
+        for i in range(n_tr):
+            w.writerow([f"s{factors['stim'][i]}", f"t{factors['task'][i]}", f"r{run[i]}", rep[i]])
+
+    # One ROI per voxel keeps the named-column table while leaving the units untouched.
+    atlas = tmp_path / "atlas_noise.nii.gz"
+    lab = (np.arange(n_vox) + 1).reshape(shape).astype(np.int16)
+    nib.save(nib.Nifti1Image(lab, np.eye(4)), atlas)
+
+    out = tmp_path / "vpn"
+    assert _run([*_base_args(betas, tsv, out), "-atlas", str(atlas)]) == 0
+
+    rows = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))
+    dead = [r for r in rows if float(r["noise_ceiling"]) <= CEILING_FLOOR]
+    assert dead, "expected pure noise to collapse the ceiling somewhere"
+    for r in dead:
+        for src in ("unique_stim", "interaction", "r2_full"):
+            assert float(r[f"{src}_frac_ceiling"]) == 0.0
