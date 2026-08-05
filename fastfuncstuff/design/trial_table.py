@@ -37,8 +37,19 @@ _DEFAULT_BASIS_NAMES = {
 }
 
 
+def canonicalize_label(value: str) -> str:
+    """Normalise whitespace in a free-text label: strip, then collapse runs to one space.
+
+    ``"location shown"`` and ``"location  shown"`` are the same level typed twice, and a
+    stray double space is invisible in a spreadsheet — treating them as two levels
+    halves the trials per cell and silently changes the design. Whitespace is the only
+    difference collapsed here; every other character difference stays meaningful.
+    """
+    return " ".join(str(value).split())
+
+
 def _sanitize(value: str) -> str:
-    """Collapse a free-text label into a token safe for filenames and identifiers.
+    """Collapse a canonicalised label into a token safe for filenames and identifiers.
 
     Spaces and punctuation in ``trial_type`` are routine ("face, inverted") and
     become a problem the moment a level name is used as a column name, a sub-brick
@@ -46,33 +57,39 @@ def _sanitize(value: str) -> str:
     caller, not here — this only maps characters.
     """
     out = []
-    for ch in str(value).strip():
+    for ch in value:
         out.append(ch if (ch.isalnum() or ch in "-_.") else "_")
     token = "".join(out).strip("_")
     return token or "unlabeled"
 
 
 def sanitize_levels(values: list[str]) -> tuple[list[str], dict[str, str]]:
-    """Map free-text labels to unique identifiers, preserving distinctness.
+    """Map free-text labels to identifiers, merging only whitespace-equal labels.
 
-    Returns ``(sanitized_values, mapping)`` where *mapping* goes from the original
-    label to its identifier. Two different labels that sanitize to the same token
-    (``"a b"`` and ``"a-b"`` both give ``a_b``) get a numeric suffix rather than
-    being silently merged — merging two levels of a factor would change the design,
-    not just its naming.
+    Returns ``(sanitized_values, mapping)`` where *mapping* goes from each original
+    label to its identifier. Two labels that differ only in whitespace share an
+    identifier (see :func:`canonicalize_label`); two that genuinely differ but happen
+    to sanitize to the same token (``"a b"`` and ``"a-b"`` both give ``a_b``) get a
+    numeric suffix instead, since merging real levels would change the design rather
+    than just its naming.
     """
     mapping: dict[str, str] = {}
+    by_canonical: dict[str, str] = {}
     used: set[str] = set()
     for raw in values:
         if raw in mapping:
             continue
-        token = _sanitize(raw)
-        if token in used:
-            n = 2
-            while f"{token}__{n}" in used:
-                n += 1
-            token = f"{token}__{n}"
-        used.add(token)
+        canonical = canonicalize_label(raw)
+        token = by_canonical.get(canonical)
+        if token is None:
+            token = _sanitize(canonical)
+            if token in used:
+                n = 2
+                while f"{token}__{n}" in used:
+                    n += 1
+                token = f"{token}__{n}"
+            used.add(token)
+            by_canonical[canonical] = token
         mapping[raw] = token
     return [mapping[v] for v in values], mapping
 

@@ -281,8 +281,17 @@ def main() -> int:
     kept_note = f" ({n_rows_total - len(rows)} dropped)" if len(rows) != n_rows_total else ""
     print(f"\n📋 Trial table: {len(rows)} rows{kept_note}")
     for name in factor_names:
-        renamed = sum(1 for k, v in level_maps[name].items() if k != v)
-        note = f", {renamed} level name(s) sanitized" if renamed else ""
+        mapping = level_maps[name]
+        renamed = sum(1 for k, v in mapping.items() if k != v)
+        # Two raw labels sharing an identifier means they differed only in whitespace
+        # and were merged into one level -- worth saying out loud, it changes the design.
+        merged = len(mapping) - len(set(mapping.values()))
+        notes = []
+        if renamed:
+            notes.append(f"{renamed} name(s) sanitized")
+        if merged:
+            notes.append(f"{merged} merged on whitespace")
+        note = f", {'; '.join(notes)}" if notes else ""
         print(f"   • {name}: {len(np.unique(factor_codes[name]))} levels{note}")
     print(f"   • run: {'yes' if run is not None else 'absent'}")
     print(f"   • session: {'yes' if session is not None else 'absent'}")

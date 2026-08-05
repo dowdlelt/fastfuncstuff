@@ -186,6 +186,18 @@ def test_sanitize_levels_keeps_distinct_labels_distinct():
     assert sanitize_levels(["!!!"])[0] == ["unlabeled"]
 
 
+def test_sanitize_levels_merges_labels_differing_only_in_whitespace():
+    """A stray double space is a typo, not a second level -- it must not split the cell."""
+    values = ["location shown", "location  shown", " location shown ", "location\tshown"]
+    out, mapping = sanitize_levels(values)
+    assert len(set(out)) == 1
+    assert out[0] == "location_shown"
+    assert len(mapping) == 4  # every raw spelling maps, all to the same identifier
+    # Whitespace is the only difference collapsed: real differences still split.
+    out2, _ = sanitize_levels(["location shown", "location showns"])
+    assert out2[0] != out2[1]
+
+
 def test_trial_table_matches_ridge_labels_with_repeats(tmp_path):
     """Repeat numbering in the beta labels lines up with row order per condition."""
     f = _write_events(
