@@ -18,11 +18,15 @@ See ``../afni/src/fastreg/fr_gpu_rota.cu`` and ``thd_shear3d.c``.
 
 from __future__ import annotations
 
+import os
+import time
+
 import torch
 from torch import Tensor
 
 from fastfuncstuff.utils import linalg_device
 
+from . import interp as _interp
 from .interp import _cubic_kernel, _heptic_kernel, _quintic_kernel
 
 _BIG_NORM = 1.0e38
@@ -562,6 +566,95 @@ def _interp_1d_along(vol: Tensor, dim: int, af: Tensor, mode: str) -> Tensor:
     return acc
 
 
+# The eager pass above runs ~6 unfused full-volume ops per tap (materialized
+# int64 index, gather, bounds mask, where, FMA) x ntaps x 4 shears -- ~1.6 GB of
+# traffic for a 2.8 MB volume. Inductor fuses the whole tap loop and never
+# materializes the index tensors: heptic 63.3 -> 5.7 ms, wsinc5 86.1 -> 6.1 ms
+# on an M4 Max, bit-identical output (max|diff| exactly 0, measured).
+#
+# Unlike interp._gather_contract this is shape-stable, which is the whole reason
+# static shapes are safe here: a shear always spans the full volume, so the only
+# specializations are the three tensor dims and the kernel mode (~3 graphs). The
+# gather's batch dim is a *content-dependent* count (in_bounds & ~tiny) that
+# drifts with the transform, mints a graph per volume, and blows dynamo's
+# recompile limit -- see the note on _resample_chunk_size.
+#
+# So the two want OPPOSITE settings, and the shear's matters more: dynamic=True
+# measures 27.1 ms/resample against 4.79 ms static (the unrolled tap loop is
+# exactly what dynamic shapes stop inductor fusing), where for the gather
+# dynamic=True was the 7x win. Do not "unify" these.
+#
+# Known limit: the ~3 graphs are per volume shape, so a process spanning more
+# than two grids (a -batch manifest mixing resolutions) exceeds dynamo's cap of
+# 8 and falls back to eager for the rest of the run. That is a graceful
+# degradation -- eager shear is still ~2.7x the gather it replaced -- unlike the
+# gather's failure mode, which was 6x SLOWER than eager. Untested above two grids.
+#
+# Gating mirrors interp._get_gather_contract: accumulate eager seconds, compile
+# once they cover what a warmup actually costs here (~2.7s against a warm
+# inductor cache, ~25s cold). Separate counter from the gather's -- one having
+# earned a compile says nothing about whether the other has.
+#
+# The prior is above the gather's 2.0s because this compile is bigger (the tap
+# loop unrolls per kernel mode): ~3s warm, ~20s cold. 5s means any workload worth
+# compiling for still trips it -- 5s of eager shear is ~75 volumes of estimation
+# -- while a trivial one-off run never pays a cold warmup it can't earn back.
+_SHEAR_COMPILE_BOOTSTRAP_S = 5.0
+_shear_eager_seconds: dict[str, float] = {"cpu": 0.0, "cuda": 0.0, "mps": 0.0}
+_compiled_shear_interp: dict[str, object] = {}
+_shear_compile_pending: set[str] = set()
+
+
+def _sync(device: torch.device) -> None:
+    """Make elapsed wall time meaningful on an async device.
+
+    Only ever called while the budget is still accumulating (a handful of calls
+    before the compile decision lands), so serializing here costs nothing once
+    the steady state is reached.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+def _shear_compile_allowed(device: torch.device) -> bool:
+    return (
+        device.type in _shear_eager_seconds
+        and not _interp._no_compile_depth
+        and not _interp._already_compiling()
+        and os.environ.get("FFS_NWARP_NO_COMPILE") != "1"
+    )
+
+
+def _get_shear_interp(device: torch.device):
+    """Return the compiled 1D shear pass once eager time has paid for a warmup.
+
+    Returns the EAGER function whenever a caller already has us inside a
+    ``torch.compile`` trace: dynamo inlines it into the caller's graph, and we
+    must not touch module globals while traced (that mutation becomes a guard
+    and recompiles every call -- interp._get_gather_contract has the full story).
+    """
+    if not _shear_compile_allowed(device):
+        return _interp_1d_along
+    dt = device.type
+    existing = _compiled_shear_interp.get(dt)
+    if existing is not None:
+        return existing
+    if _shear_eager_seconds[dt] < _interp._measured_compile_cost(
+        dt, "shear", _SHEAR_COMPILE_BOOTSTRAP_S
+    ):
+        return _interp_1d_along
+    try:
+        compiled = torch.compile(_interp_1d_along, dynamic=False)
+    except Exception:
+        compiled = _interp_1d_along  # compile unavailable on this build
+    _compiled_shear_interp[dt] = compiled
+    if compiled is not _interp_1d_along:
+        _shear_compile_pending.add(dt)  # the first call through it pays the warmup
+    return compiled
+
+
 # fr-axis (0=x,1=y,2=z) -> tensor dim (vol is (nz,ny,nx)), plus the two driving
 # axes (p1,p2) with their fr-axis id and tensor dim.
 _AXIS_INFO = {
@@ -571,7 +664,9 @@ _AXIS_INFO = {
 }
 
 
-def _apply_one_shear(vol: Tensor, fr_axis: int, a: float, b: float, s: float, mode: str) -> Tensor:
+def _apply_one_shear(
+    vol: Tensor, fr_axis: int, a: float, b: float, s: float, mode: str, interp_fn=None
+) -> Tensor:
     nz, ny, nx = vol.shape
     sizes = {0: nx, 1: ny, 2: nz}
     centers = {0: (nx - 1) / 2.0, 1: (ny - 1) / 2.0, 2: (nz - 1) / 2.0}
@@ -589,7 +684,7 @@ def _apply_one_shear(vol: Tensor, fr_axis: int, a: float, b: float, s: float, mo
     shp2 = [1, 1, 1]
     shp2[p2dim] = sizes[p2fr]
     af = a * coord1.reshape(shp1) + b * coord2.reshape(shp2) + s
-    return _interp_1d_along(vol, tdim, af, mode)
+    return (interp_fn or _interp_1d_along)(vol, tdim, af, mode)
 
 
 # unpack MCW_3shear (ax, scl) -> per-shear (a, b) (matches fr_gpu_unpack)
@@ -618,9 +713,29 @@ def shear_resample(
     scl_l = scl_t[0].tolist()
     sft_l = sft_t[0].tolist()
 
+    device = source.device
+    interp_fn = _get_shear_interp(device)
+    measuring = device.type in _shear_compile_pending
+    # Only time while the decision is still open: eager calls feed the budget,
+    # and the one call that runs the compile reports what the warmup cost.
+    accounted = interp_fn is _interp_1d_along and _shear_compile_allowed(device)
+    if measuring or accounted:
+        _sync(device)
+        t0 = time.perf_counter()
+
     vol = source
     for step in range(4):
         ax = ax_l[step]
         a, b = _unpack(ax, scl_l[step])
-        vol = _apply_one_shear(vol, ax, a, b, sft_l[step], mode)
+        vol = _apply_one_shear(vol, ax, a, b, sft_l[step], mode, interp_fn)
+
+    if measuring or accounted:
+        _sync(device)
+        elapsed = time.perf_counter() - t0
+        if measuring:
+            # This call ran the compile; almost all of its wall time is that.
+            _shear_compile_pending.discard(device.type)
+            _interp._record_compile_cost(device.type, elapsed, "shear")
+        else:
+            _shear_eager_seconds[device.type] += elapsed
     return vol

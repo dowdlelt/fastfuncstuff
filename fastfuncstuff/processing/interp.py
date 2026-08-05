@@ -657,9 +657,18 @@ def _gather_contract(
 # and compile once they reach what a warmup actually costs *here*, measured on the
 # first compile and remembered across runs. Worst case (workload ends right after
 # the switch) is ~2x the warmup; best case is the full ~10x on everything after
-# it. dynamic=True on CUDA so the per-chunk voxel count drifting with free VRAM
-# doesn't recompile every call and blow dynamo's cap; CPU keeps static shapes,
-# which inductor fuses best. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+# it. Disable entirely with FFS_NWARP_NO_COMPILE=1.
+#
+# dynamic=True on BOTH devices, because the batch dim is a *content-dependent*
+# count, not a property of the data: _separable_resample_3d hands us only the
+# heavy voxels (in_bounds & ~tiny), and how many survive shifts with the
+# transform. Registering a moving series therefore mints a graph per volume.
+# CPU was on static shapes for the fusion, but the churn dwarfs it -- across 12
+# transforms with a realistically drifting M (480,807 down to 459,000, the range
+# one 300-volume run actually produces): eager 151 ms/call, dynamic=False 948
+# ms/call, dynamic=True 20 ms/call. Static shapes blow dynamo's recompile cap of
+# 8 and fall back to eager for the rest of the process, having paid for eight
+# compiles first -- 6x SLOWER than never compiling at all.
 _COMPILE_COST_BOOTSTRAP_S = 2.0  # only until the first real measurement lands
 _eager_seconds = {"cpu": 0.0, "cuda": 0.0}
 _pending_cuda_timings: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
@@ -669,10 +678,22 @@ _compile_pending_measure: set[str] = set()
 _no_compile_depth = 0
 
 
-def _compile_cost_key(dt: str) -> str:
+# Bumped whenever the compile itself changes shape (flags, or what gets traced):
+# a cost measured under the old regime does not predict the new one. v2 = the
+# move to dynamic=True, whose recorded costs were inflated by recompile churn.
+_COMPILE_COST_SCHEMA = "v2"
+
+
+def _compile_cost_key(dt: str, what: str = "gather") -> str:
     """Warmup cost is per device type and per torch build, so a torch upgrade
-    recalibrates rather than inheriting a stale number."""
-    return f"{dt}:{torch.__version__}"
+    recalibrates rather than inheriting a stale number.
+
+    ``what`` namespaces the entry per compiled function: the gather and the 1D
+    shear pass (shear._get_shear_interp) have genuinely different warmups -- the
+    shear's cold compile measured 4x the gather's -- so sharing one key makes
+    whichever compiled last mis-gate the other.
+    """
+    return f"{what}:{dt}:{torch.__version__}:{_COMPILE_COST_SCHEMA}"
 
 
 def _compile_cost_path() -> Path:
@@ -680,14 +701,22 @@ def _compile_cost_path() -> Path:
     return Path(root) / "fastfuncstuff" / "gather_compile_cost.json"
 
 
-def _measured_compile_cost(dt: str) -> float:
+def _measured_compile_cost(dt: str, what: str = "gather", bootstrap: float | None = None) -> float:
     """Seconds a torch.compile warmup costs on this machine, from the last time we
     paid one. Falls back to a bootstrap prior that the first real measurement
-    replaces -- an unfamiliar machine mis-compiles at most once."""
-    key = _compile_cost_key(dt)
+    replaces -- an unfamiliar machine mis-compiles at most once.
+
+    Note the measurement is whatever the *last* compile paid, and a cold inductor
+    cache costs several times a warm one (gather ~5s cold vs ~2s warm; the shear
+    pass ~20s vs ~3s). So a first-ever compile records a pessimistic number and
+    the following run gates conservatively, until a compile on a warm cache
+    overwrites it. That self-corrects as long as the workload still reaches the
+    higher bar -- pick ``bootstrap`` above the warm cost so it can.
+    """
+    key = _compile_cost_key(dt, what)
     if key in _compile_cost_cache:
         return _compile_cost_cache[key]
-    cost = _COMPILE_COST_BOOTSTRAP_S
+    cost = _COMPILE_COST_BOOTSTRAP_S if bootstrap is None else bootstrap
     try:
         with open(_compile_cost_path()) as f:
             stored = json.load(f).get(key)
@@ -699,10 +728,10 @@ def _measured_compile_cost(dt: str) -> float:
     return cost
 
 
-def _record_compile_cost(dt: str, seconds: float) -> None:
+def _record_compile_cost(dt: str, seconds: float, what: str = "gather") -> None:
     """Persist what the warmup just cost. Best-effort: a read-only or racing cache
     only means the next process uses the prior again."""
-    key = _compile_cost_key(dt)
+    key = _compile_cost_key(dt, what)
     _compile_cost_cache[key] = seconds
     path = _compile_cost_path()
     try:
@@ -807,7 +836,7 @@ def _get_gather_contract(device: torch.device):
     if _eager_seconds[dt] < _measured_compile_cost(dt):
         return _gather_contract
     try:
-        compiled = torch.compile(_gather_contract, dynamic=(dt == "cuda"))
+        compiled = torch.compile(_gather_contract, dynamic=True)
     except Exception:
         compiled = _gather_contract  # compile unavailable
     _compiled_gather_contract[dt] = compiled

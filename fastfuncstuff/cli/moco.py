@@ -1032,6 +1032,29 @@ def _validate_run_args(args: argparse.Namespace) -> None:
 
     _validate_shiftcorr_args(args)
 
+    # A bare -save_mean/-save_max/-save_min/-save_weight derives its path from
+    # -prefix, and without one the run cannot write what it was asked for. Catch
+    # that here rather than where the path is built: those call sites sit after
+    # the correction, so the user paid for a full 300-volume registration before
+    # being told the invocation was unusable (bug of record).
+    _bare = [
+        f"-{flag}"
+        for flag, _which in _TEMPORAL_REDUCTIONS
+        if getattr(args, flag, None) is _MEAN_FROM_PREFIX
+    ]
+    if getattr(args, "save_weight", None) is _WEIGHT_FROM_PREFIX:
+        _bare.append("-save_weight")
+    if _bare and args.prefix is None:
+        _plural = len(_bare) > 1
+        print(
+            f"Error: {', '.join(_bare)} given with no value, so "
+            f"{'their paths are' if _plural else 'its path is'} derived from "
+            f"-prefix. Pass -prefix, or give {'each flag' if _plural else 'the flag'} "
+            "an explicit PREFIX.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # The QC files are named after -prefix; require it when requested.
     if _want_qc(args) and args.prefix is None:
         print(

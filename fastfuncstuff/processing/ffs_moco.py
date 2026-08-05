@@ -73,7 +73,7 @@ class MocoConfig:
     powell_maxfev: int = 100  # Max function evals for LPA Powell
     fixed_iter: bool = False  # Fast mode: skip convergence, run exactly max_iter
     compile: bool = True  # Use torch.compile for hot path (CUDA only)
-    use_shear: bool = True  # Shear-based rigid resample for final pass (AFNI THD_rota_vol)
+    use_shear: bool = True  # Shear-based rigid resample (AFNI THD_rota_vol): estimation + final
     skip_resample: bool = False  # Estimate only: skip Pass 2 (no aligned output produced)
     device: str | None = None
     verb: int = 1
@@ -143,6 +143,7 @@ def compute_derivative_images(
     base: Tensor,
     device: torch.device,
     verb: int = 0,
+    use_shear: bool = False,
 ) -> Tensor:
     """Compute 6 spatial derivative images of the base via central differences.
 
@@ -153,6 +154,10 @@ def compute_derivative_images(
         base: (nz, ny, nx) reference volume on device.
         device: torch device.
         verb: verbosity level.
+        use_shear: resample via the 4-way shear decomposition (AFNI's
+            THD_rota3D) rather than a scattered 3D gather. 12 full-volume
+            wsinc5 resamples cost ~5.6s the gather way and ~1.0s this way on a
+            104x104x66 grid, before any compile.
 
     Returns:
         (6, nz*ny*nx) derivative images flattened.
@@ -196,20 +201,36 @@ def compute_derivative_images(
     if verb >= 2:
         print("  Computing 12 derivative resamples (wsinc5)...")
 
-    # Twelve full-volume resamples, run once per process and never again. Left to
-    # the resampler's own eager-vs-compiled heuristic they look like the opening
-    # of a long loop, so it compiles here and the warmup (~2.9s, and not amortized
-    # by inductor's cache across separate CLI invocations) lands on a step whose
-    # eager cost is ~0.5s. Declare the one-shot instead.
     derivs = torch.zeros(6, nz * ny * nx, device=device, dtype=dtype)
-    with no_gather_compile():
+
+    def _accumulate() -> None:
         for i in range(12):
-            resampled = apply_affine_wsinc5(base, matrices[i], base.shape)
+            if use_shear:
+                resampled = shear_resample(base, matrices[i], base.shape, "wsinc5")
+                if resampled is None:  # degenerate decomposition; essentially never
+                    resampled = apply_affine_wsinc5(base, matrices[i], base.shape)
+            else:
+                resampled = apply_affine_wsinc5(base, matrices[i], base.shape)
             k = i // 2
             if i % 2 == 0:  # plus
                 derivs[k] += resampled.reshape(-1)
             else:  # minus
                 derivs[k] -= resampled.reshape(-1)
+
+    if use_shear:
+        # Deliberately NOT one-shot here. These 12 resamples run through the same
+        # 1D shear pass the GN loop is about to hammer, so the seconds they spend
+        # eager are exactly the evidence that the compile will pay off -- letting
+        # them feed the budget makes the estimation loop compile sooner.
+        _accumulate()
+    else:
+        # Twelve full-volume resamples, run once per process and never again. Left to
+        # the resampler's own eager-vs-compiled heuristic they look like the opening
+        # of a long loop, so it compiles here and the warmup (~2.9s, and not amortized
+        # by inductor's cache across separate CLI invocations) lands on a step whose
+        # eager cost is ~0.5s. Declare the one-shot instead.
+        with no_gather_compile():
+            _accumulate()
 
     # Central difference: (I+ - I-) / (2 * delta)
     for k in range(6):
@@ -221,6 +242,27 @@ def compute_derivative_images(
 # ---------------------------------------------------------------------------
 # Gauss-Newton WLS solver
 # ---------------------------------------------------------------------------
+
+
+def _shear_resample_fn(
+    source: Tensor,
+    matrix: Tensor,
+    coords: Tensor,
+    interp: str,
+    output_shape: tuple[int, int, int],
+) -> Tensor:
+    """``resample_affine_fast`` signature, backed by the 4-way shear.
+
+    ``coords`` is unused by the shear (it works on whole rows, not a scattered
+    point list) but is kept so this drops into the GN solvers' ``resample_fn``
+    slot -- and is what the fallback needs when a decomposition comes back
+    degenerate, which requires a rotation large enough to need the unimplemented
+    180-degree flip branch and so does not happen for motion correction.
+    """
+    warped = shear_resample(source, matrix, tuple(output_shape), interp)
+    if warped is None:
+        warped = resample_affine_fast(source, matrix, coords, interp, output_shape)
+    return warped
 
 
 def _weighted_rms(base: Tensor, source: Tensor, weight: Tensor) -> float:
@@ -381,6 +423,7 @@ def gauss_newton_rigid_fixed(
     coords: Tensor,
     max_iter: int,
     interp: str,
+    resample_fn=resample_affine_fast,
 ) -> Tensor:
     device = source.device
     params = init_params.clone()
@@ -396,7 +439,7 @@ def gauss_newton_rigid_fixed(
 
     for _ in range(max_iter):
         matrix = params_to_matrix(params)
-        warped = resample_affine_fast(source, matrix, coords, interp, output_shape)
+        warped = resample_fn(source, matrix, coords, interp, output_shape)
         residual = weight_flat * (base_flat - warped.reshape(-1))
 
         JtWr = WJ @ residual
@@ -1062,6 +1105,17 @@ def moco(
     # Pre-blur if requested
     base_est = _blur_volume(base, config.blur_fwhm) if config.blur_fwhm > 0 else base
 
+    # Estimation-side shear. AFNI never interpolates in 3D to register: mri_3dalign.c
+    # drives THD_rota3D, four stride-1 1D shears, so heptic costs 4x8=32 taps/voxel
+    # against 8^3=512 for a scattered gather. We had the decomposition already but
+    # only spent it on the final resample; the GN loop and the derivative images
+    # were still paying the gather.
+    #
+    # CUDA is deliberately excluded: it has the fused Triton shear for the batched
+    # path and a compiled gather otherwise, both already fast and benchmark-locked.
+    # This is the CPU/MPS gap.
+    use_shear_est = config.use_shear and device.type != "cuda"
+
     # Derivative images are shared by the WLS pass and the reweight pre-pass; they
     # depend only on the (blurred) base, not the weight, so compute them at most
     # once. An override (from the recursive global/preweight call) skips the
@@ -1078,7 +1132,9 @@ def moco(
         from .moco_reweight import compute_reweight
 
         t0 = time.time()
-        derivs = compute_derivative_images(base_est, device, verb=config.verb)
+        derivs = compute_derivative_images(
+            base_est, device, verb=config.verb, use_shear=use_shear_est
+        )
         if config.verb >= 1:
             print(f"  Derivative images: {time.time() - t0:.2f}s")
         weight0 = weight
@@ -1142,7 +1198,9 @@ def moco(
     if config.cost == "wls":
         t0 = time.time()
         if derivs is None:
-            derivs = compute_derivative_images(base_est, device, verb=config.verb)
+            derivs = compute_derivative_images(
+                base_est, device, verb=config.verb, use_shear=use_shear_est
+            )
             if config.verb >= 1:
                 print(f"  Derivative images: {time.time() - t0:.2f}s")
 
@@ -1206,9 +1264,13 @@ def moco(
         and shear_resample_triton is not None
     )
 
-    # Compute mask for efficient resampling (skip zero-weight voxels)
+    # Compute mask for efficient resampling (skip zero-weight voxels).
+    # Pointless under the shear: it resamples whole rows, so restricting to the
+    # ~69% of voxels with non-zero weight saves nothing and would cost the
+    # decomposition. The full-volume shear beats the masked gather outright
+    # (66ms vs 179ms eager, 104x104x66 heptic), so keep the volume intact.
     use_masked = False
-    if config.cost == "wls" and not batched_eligible:
+    if config.cost == "wls" and not batched_eligible and not use_shear_est:
         mask_idx = (weight.reshape(-1) > 0).nonzero(as_tuple=True)[0]
         M = mask_idx.numel()
         if M < N:
@@ -1251,19 +1313,26 @@ def moco(
         use_cudagraphs = False  # default mode doesn't use CUDA graphs
     else:
         _p2m = params_to_matrix
-        _resample = resample_affine_fast
+        _resample = _shear_resample_fn if use_shear_est else resample_affine_fast
         if use_masked:
             _gn_fixed = gauss_newton_rigid_fixed_masked
         else:
             _gn_fixed = gauss_newton_rigid_fixed
         use_cudagraphs = False
 
+    # Only forwarded when the shear is in play: on CUDA _gn_fixed may be compiled,
+    # and an explicitly-passed callable becomes a dynamo guard where the default
+    # is baked into the code object. Empty kwargs keeps that path as it was.
+    _gn_fixed_kw = {"resample_fn": _resample} if use_shear_est else {}
+
     # Pre-compute coarse-pass normal equations for twopass (done once, not per-volume)
     if config.twopass and config.cost == "wls":
         coarse_fwhm = max(4.0, config.blur_fwhm)
         base_coarse = _blur_volume(base, coarse_fwhm)
         weight_coarse = _blur_volume(weight, coarse_fwhm / 2)
-        derivs_coarse = compute_derivative_images(base_coarse, device, verb=config.verb)
+        derivs_coarse = compute_derivative_images(
+            base_coarse, device, verb=config.verb, use_shear=use_shear_est
+        )
         wf_coarse = weight_coarse.reshape(1, -1)
         bf_coarse = base_coarse.reshape(-1)
         WJ_c = wf_coarse * derivs_coarse
@@ -1373,6 +1442,7 @@ def moco(
                     homo_coords,
                     config.max_iter,
                     config.interp,
+                    **_gn_fixed_kw,
                 )
             else:
                 init_params, _ = gauss_newton_rigid(
@@ -1414,6 +1484,7 @@ def moco(
                         homo_coords,
                         config.max_iter,
                         config.interp,
+                        **_gn_fixed_kw,
                     )
                 n_iter = config.max_iter
             else:
