@@ -104,8 +104,10 @@ class Options:
     # Which EPI-contrast image the anat linear step aligns to. All choices live on
     # the SAME grid (the reference fmap's undistorted space) — see
     # ``effective_anat_source``; they differ only in SNR/sharpness/contrast.
-    anat_source: str = "grandmean"  # grandmean | sbmean | ref_fmap | mean_fmap
-    anat_nonlin_input: str = "grandmean"  # ffs_segment input: + sbmean|blipfor|blip_pair
+    # auto = sbmean where the SBRef lane exists, else grandmean (see
+    # ``effective_anat_source``).
+    anat_source: str = "auto"  # auto | grandmean | sbmean | ref_fmap | mean_fmap
+    anat_nonlin_input: str = "auto"  # ffs_segment input: + blipfor | blip_pair
     # -grand_reference: path to ANOTHER autoproc results dir whose anat matrix
     # this run borrows; this data's grandmean is aligned to that ref (xref_*).
     # This is how a filtered `primary`-only script anchors on a floc run.
@@ -137,6 +139,10 @@ class Options:
     fmt: str = config.DEFAULT_FMT
     final_fmt: str = config.DEFAULT_FINAL_FMT
     glm_fmt: str = config.DEFAULT_GLM_FMT
+    # Compute device handed to every ffs_* stage as ``-device $DEVICE``
+    # (cuda | mps | cpu | auto, plus the "cuda,0" / "cpu,8" forms every ffs CLI
+    # parses). Emitted as the DEVICE variable so it stays editable in the script.
+    device: str = config.DEFAULT_DEVICE
 
     @property
     def has_grand_ref(self) -> bool:
@@ -306,6 +312,14 @@ def effective_anat_source(plan: Plan, requested: str | None = None) -> str:
     choices degrade to the grandmean there (bug of record).
     """
     mode = requested if requested is not None else plan.options.anat_source
+    # "auto" = use the SBRefs when they exist. They already lead every other
+    # alignment (``emit._primary_lane`` estimates xrun/xses from the SBRef lane),
+    # and the anat step is the one cross-modal ``lpc`` fit in the pipeline — the
+    # place a sharp, single-interpolation, single-band image matters MOST. Falling
+    # back to the BOLD grandmean there wasted the very images the rest of the
+    # pipeline is anchored on.
+    if mode == "auto":
+        mode = "sbmean" if plan.use_sbref else "grandmean"
     if mode == "grandmean":
         return mode
     if mode == "sbmean":
@@ -510,8 +524,12 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         # -distortion off (e.g. bare_bones): treat as no fmaps → no blip/xfmap,
         # xrun falls back to first-run anchoring.
         has_fmaps = bool(sess.fmaps) and opt.distortion
-        # First run of the session anchors xrun when there are no fmaps.
-        session_first_run = sess.bold_runs[0].run if sess.bold_runs else None
+        # First run of the session anchors xrun when there are no fmaps. Identity
+        # is the BoldRun itself, not its `run` entity: a session whose runs are
+        # distinguished by TASK (task-bar1/bar2/... with no run- entity) has
+        # run=None everywhere, so comparing `run` made every run the reference and
+        # dropped xrun alignment entirely (bug of record).
+        session_first_run = sess.bold_runs[0] if sess.bold_runs else None
         # Each fmap group's DISTORTED forward = the image stage04 estimates the
         # field against, and hence the xrun base for that group: the fmap's own
         # matched-PE mate when it has one (self-contained AP/PA pair), else the
@@ -539,7 +557,7 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 is_ref_fmap=(
                     fmap is not None and ref_fmap is not None and fmap.fmap_id == ref_fmap.fmap_id
                 ),
-                is_ref_run=(not has_fmaps and bold.run == session_first_run),
+                is_ref_run=(not has_fmaps and bold is session_first_run),
                 fmap_forward=(forward_by_fmap.get(fmap.fmap_id) if fmap else None),
                 # Every run of a fieldmap session shares the session's common grid,
                 # whether or not it has a fieldmap of its own.

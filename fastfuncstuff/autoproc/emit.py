@@ -927,7 +927,9 @@ def _sbref_header_note(plan: Plan) -> str:
         "#     estimate the cross-run/cross-session alignment. `ls *src-sbref*` is\n"
         "#     the whole lane; the same files without that tag are the BOLD-mean\n"
         "#     lane, resampled by the SAME transforms — compare them as a check.\n"
-        "#     -anat_source sbmean points the anat alignment at stage08.grandmean.src-sbref."
+        "#     They also feed the anat step: -anat_source auto (the default) aligns\n"
+        "#     stage08.grandmean.src-sbref to the anat, not the BOLD-mean grandmean.\n"
+        "#     -anat_source grandmean goes back to the BOLD mean."
     )
 
 
@@ -1026,7 +1028,7 @@ def _header(plan: Plan, out_dir: str, invocation: str | None = None) -> str:
 set -euo pipefail
 
 OUT={shlex.quote(out_dir)}
-DEVICE={config.DEFAULT_DEVICE}
+DEVICE={shlex.quote(opt.device)}          # compute device for every ffs stage; -device
 FMT={opt.fmt}           # working intermediates (read many times); -format
 FINAL_FMT={opt.final_fmt}     # final timeseries (portable); -final_format
 GLM_FMT={opt.glm_fmt}       # GLM stat buckets; -glm_format
@@ -2083,11 +2085,12 @@ def _stage_anat(plan: Plan) -> str:
                 f'-prefix "{_al_anat(plan)}"',
                 '-1Dmatrix_save "stage09.anat.aff12.1D"',
                 *_split_flags(config.DEFAULT_OPTS["anat"]),
+                "-tbest 16",
                 '-device "$DEVICE"',
             ],
         )
         note = ""
-        if mode != opt.anat_source:
+        if opt.anat_source not in (mode, "auto"):
             note = f"  # (-anat_source {opt.anat_source} unavailable here → {mode})\n"
         out.append(
             f'ANAT="{anat_ph}"\n'

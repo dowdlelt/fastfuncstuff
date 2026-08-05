@@ -499,6 +499,11 @@ def _scan_fmaps(
     return []
 
 
+# The image "forms" one fieldmap acquisition can appear as, best first. Also the
+# only `acq` values that mean a form rather than a protocol label.
+_FMAP_FORMS = ("sbref", "epi", "bold")
+
+
 def _scan_pepolar_fmaps(
     fmap_dir: Path,
     bids_root: Path,
@@ -534,9 +539,16 @@ def _scan_pepolar_fmaps(
         # the key or they'd collapse into one.
         task, run, d = ents.get("task"), ents.get("run"), ents.get("dir")
         tag = (task or "") + (f"-run{run}" if run else "")
-        # Form within the group: acq (bold/sbref) refines the plain suffix so the
-        # SBRef form wins the preference below even for conventional epi fmaps.
-        form = ents.get("acq") or suffix or "epi"
+        # Form within the group: acq refines the plain suffix ONLY when it names a
+        # form (acq-bold/acq-sbref), so the SBRef form wins the preference below
+        # even for conventional epi fmaps. `acq` is otherwise a free-text protocol
+        # label (acq-fMRI, acq-2mm, ...) that says nothing about the form — bug of
+        # record: acq-fMRI_dir-AP_epi produced form "fMRI", which _pick_form does
+        # not recognise, so the whole fieldmap was silently dropped.
+        acq = (ents.get("acq") or "").lower()
+        form = acq if acq in _FMAP_FORMS else (suffix or "epi").lower()
+        if form not in _FMAP_FORMS:
+            continue  # a GRE form (magnitude/fieldmap/...) — _scan_b0_fmaps' job
         candidates.setdefault(tag, {}).setdefault(d or "", {})[form] = (
             nf,
             load_sidecar(nf, bids_root),
@@ -707,7 +719,7 @@ def _b0_echo_times(slot: dict[str, tuple[Path, dict]]) -> list[float]:
 
 def _pick_form(slot: dict[str, tuple[Path, dict]]) -> tuple[Path, dict] | None:
     """Representative image for one fieldmap acquisition: SBRef > EPI > BOLD."""
-    for key in ("sbref", "epi", "bold"):
+    for key in _FMAP_FORMS:
         if key in slot:
             return slot[key]
     return None

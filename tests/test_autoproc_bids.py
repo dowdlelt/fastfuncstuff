@@ -442,3 +442,30 @@ def test_b0_intendedfor_on_the_magnitude_only(tmp_path: Path):
     )
     (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
     assert fg.intended_runs == [("check", "01")]
+
+
+def test_free_text_acq_label_does_not_hide_the_fieldmap(tmp_path: Path):
+    """`acq` is a free-text protocol label (acq-fMRI, acq-2mm); only acq-bold /
+    acq-sbref name the image FORM. Treating any acq as the form made
+    acq-fMRI_dir-AP_epi unrecognisable, and the fieldmap vanished silently — the
+    script then had no blip stage at all despite -recipe complete."""
+    ses = tmp_path / "sub-01" / "ses-01"
+    _touch(
+        ses / "func" / "sub-01_ses-01_task-bar1_bold.nii.gz",
+        {"RepetitionTime": 1.5, "PhaseEncodingDirection": "j"},
+    )
+    for d, pe in (("AP", "j-"), ("PA", "j")):
+        _touch(
+            ses / "fmap" / f"sub-01_ses-01_acq-fMRI_dir-{d}_epi.nii.gz",
+            {
+                "PhaseEncodingDirection": pe,
+                "TotalReadoutTime": 0.05,
+                "IntendedFor": ["ses-01/func/sub-01_ses-01_task-bar1_bold.nii.gz"],
+            },
+        )
+
+    (fg,) = scan_subject(tmp_path, "01").sessions[0].fmaps
+    # Forward = the polarity matching the data (j → PA); reverse = the other.
+    assert "dir-PA" in fg.forward_path.name
+    assert "dir-AP" in fg.reverse_path.name
+    assert fg.intended_runs == [("bar1", "")]
