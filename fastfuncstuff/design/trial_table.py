@@ -63,6 +63,18 @@ def _sanitize(value: str) -> str:
     return token or "unlabeled"
 
 
+def level_identifier(value: str) -> str:
+    """The identifier a single label would get: canonicalize whitespace, then sanitize.
+
+    Matching a user-typed label against table values goes through this so that
+    ``"Where is this shown"``, ``"Where is  this shown"`` and the ``Where_is_this_shown``
+    that shows up in the JSON and map names are all the same thing. It has no view of the
+    other levels, so it cannot apply the collision suffix that :func:`sanitize_levels`
+    does — use that when you need identifiers guaranteed unique across a factor.
+    """
+    return _sanitize(canonicalize_label(value))
+
+
 def sanitize_levels(values: list[str]) -> tuple[list[str], dict[str, str]]:
     """Map free-text labels to identifiers, merging only whitespace-equal labels.
 

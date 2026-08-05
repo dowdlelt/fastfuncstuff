@@ -357,3 +357,49 @@ def test_free_text_levels_are_sanitized_and_recorded(tmp_path):
     assert all(" " not in v and "," not in v for v in mapping.values())
     assert len(set(mapping.values())) == len(mapping)
     assert any(k != v for k, v in mapping.items())
+
+
+def _messy_question_table(tmp_path, tsv):
+    """Rewrite the task column into free text, including a whitespace variant."""
+    rows = list(csv.reader(open(tsv, newline="")))
+    header = rows[0]
+    ti = header.index("task")
+    out = tmp_path / "freetext.csv"
+    for i, row in enumerate(rows[1:]):
+        n = row[ti][1:]
+        # Every third trial of a level gets a stray double space -- same level, typed twice.
+        sep = "  " if i % 3 == 0 else " "
+        row[ti] = f"Where{sep}is this shown {n}"
+    with open(out, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+    return out
+
+
+def test_drop_trials_matches_free_text_across_whitespace_variants(tmp_path, capsys):
+    """The label as typed must drop the whole level, not just the exactly-spelled rows."""
+    betas, tsv, _, _ = _fixture(tmp_path)
+    messy = _messy_question_table(tmp_path, tsv)
+    out = tmp_path / "ft"
+    assert (
+        _run([*_base_args(betas, messy, out), "-drop_trials", "task", "Where is this shown 0"]) == 0
+    )
+    txt = capsys.readouterr().out
+    assert "matched 2 spellings" in txt
+    rows = list(csv.DictReader(open(messy, newline="")))
+    remaining = [r for r in rows if "shown 0" in r["task"]]
+    assert remaining  # the level really was present in the table
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    assert meta["n_trials"] == len(rows) - len(remaining)
+
+
+def test_drop_trials_accepts_the_sanitized_identifier(tmp_path):
+    """The identifier from level_names / map names is a legitimate thing to paste back in."""
+    betas, tsv, _, _ = _fixture(tmp_path)
+    messy = _messy_question_table(tmp_path, tsv)
+    out = tmp_path / "ident"
+    assert (
+        _run([*_base_args(betas, messy, out), "-drop_trials", "task", "Where_is_this_shown_0"]) == 0
+    )
+    rows = list(csv.DictReader(open(messy, newline="")))
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    assert meta["n_trials"] == len(rows) - sum("shown 0" in r["task"] for r in rows)

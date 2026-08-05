@@ -22,7 +22,11 @@ import torch
 
 try:
     from fastfuncstuff.cli_utils import parse_prefix
-    from fastfuncstuff.design.trial_table import sanitize_levels
+    from fastfuncstuff.design.trial_table import (
+        canonicalize_label,
+        level_identifier,
+        sanitize_levels,
+    )
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.stats.variance_partition import (
         build_roi_weights,
@@ -189,13 +193,21 @@ def _optional_column(rows: list[dict], name: str) -> np.ndarray | None:
 def _label_matches(value: str, label: str) -> bool:
     """Lenient equality for -drop_trials.
 
-    A BIDS run entity is written ``01`` in one table and ``1`` in the next, and a
-    user typing ``-drop_trials run 1`` means the same run either way. Numeric
-    values compare numerically; everything else compares case-insensitively on
-    stripped text.
+    Three spellings of the same level all have to match, because all three are things a
+    user legitimately has in front of them:
+
+    - the raw table text, modulo whitespace and case (``"Where is  this shown"``);
+    - the sanitized identifier that appears in the JSON ``level_names`` and in map
+      names (``Where_is_this_shown``);
+    - a number written with different zero padding (``run 1`` vs ``run 01``).
+
+    Anything stricter drops *some* trials of a level and leaves the whitespace-variant
+    ones in, which is worse than not dropping at all -- it unbalances the design silently.
     """
-    a, b = str(value).strip(), str(label).strip()
+    a, b = canonicalize_label(value), canonicalize_label(label)
     if a.lower() == b.lower():
+        return True
+    if level_identifier(a).lower() == level_identifier(b).lower():
         return True
     try:
         return float(a) == float(b)
@@ -228,7 +240,15 @@ def _apply_drop_trials(rows: list[dict], drops: list[list[str]] | None) -> np.nd
                 f"❌ -drop_trials {column} {label}: no trial has that value.\n"
                 f"   Values present in '{column}': {', '.join(shown)}"
             )
-        print(f"   ✂️  -drop_trials {column}={label}: dropping {int(hit.sum())} trials")
+        matched = sorted({str(r[column]) for r, h in zip(rows, hit, strict=True) if h})
+        # More than one distinct raw value means the label matched whitespace or case
+        # variants of itself. That is the intent, but say so -- it is also how a user
+        # discovers their table has variants at all.
+        variants = f"  [matched {len(matched)} spellings: {', '.join(repr(m) for m in matched)}]"
+        print(
+            f"   ✂️  -drop_trials {column}={label}: dropping {int(hit.sum())} trials"
+            + (variants if len(matched) > 1 else "")
+        )
         keep &= ~hit
 
     if not keep.any():
