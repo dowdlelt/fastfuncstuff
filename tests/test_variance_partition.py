@@ -15,9 +15,11 @@ import torch
 from fastfuncstuff.stats.variance_partition import (
     BALANCE_TOL,
     _build_cell_ops,
+    _build_trial_ops,
     _cellspace_partials,
     _orthonormal_contrasts,
     _partition_stats,
+    _trialspace_partials,
     build_factor_design,
     build_repeat_folds,
     cell_labels,
@@ -467,19 +469,52 @@ def test_unique_task_null_controls_type_one_error():
     assert (res.p_uncorrected["unique_b"] < 0.05).float().mean() <= 0.15
 
 
-def test_permutation_rejects_unbalanced_design():
+def test_trialspace_engine_matches_cellspace_when_balanced():
+    """The general engine is only trustworthy if it reproduces the fast one where both apply.
+
+    Same folds, same design, same data: the cell-space compression is exact under balance,
+    so any disagreement means the trial-space path is fitting a different model.
+    """
+    betas, factors, rep, run = _perm_data(0.0, n_vox=8, seed=21)
+    design = build_factor_design(factors)
+    folds, _ = build_repeat_folds(rep, run, cell=cell_labels(design))
+    device = torch.device("cpu")
+
+    cell_stats = _partition_stats(
+        *_cellspace_partials(betas, _build_cell_ops(design, folds, device))
+    )
+    trial_stats = _partition_stats(
+        *_trialspace_partials(betas, _build_trial_ops(design, folds, device))
+    )
+    for key in ("unique_a", "unique_b", "interaction", "M_add", "M_full"):
+        torch.testing.assert_close(cell_stats[key], trial_stats[key], atol=2e-4, rtol=2e-3)
+
+
+def test_permutation_runs_on_unbalanced_design(capsys):
+    """Dropping trials leaves unequal repeats; inference falls back, it does not refuse."""
     betas, factors, rep, run = _perm_data(0.0, n_vox=10, seed=16)
     keep = np.ones(len(factors["stim"]), dtype=bool)
     keep[:40] = False
-    with pytest.raises(ValueError, match="requires a balanced crossed design"):
-        permutation_test(
-            betas[:, keep],
-            {k: v[keep] for k, v in factors.items()},
-            repeat=rep[keep],
-            run=run[keep],
-            n_perms=2,
-            verbose=False,
-        )
+    sub = {k: v[keep] for k, v in factors.items()}
+    assert not build_factor_design(sub).balanced
+
+    res = permutation_test(
+        betas[:, keep],
+        sub,
+        repeat=rep[keep],
+        run=run[keep],
+        n_perms=8,
+        seed=3,
+        verbose=True,
+    )
+    assert res.diagnostics["engine"] == "trial-space"
+    assert "not balanced" in capsys.readouterr().out
+    for key in ("unique_a", "unique_b", "interaction"):
+        p = res.p_uncorrected[key]
+        assert p.shape == (10,)
+        assert bool(((p > 0) & (p <= 1)).all())
+        # A degenerate null (every permutation identical) would make the test vacuous.
+        assert res.null_max[key].std() > 0
 
 
 def test_permutation_rejects_unknown_statistic():
@@ -631,3 +666,28 @@ class TestPaintRoisToVoxels:
         roi = collapse_to_rois(betas, spec, sizes, device=torch.device("cpu"))
         painted = paint_rois_to_voxels(roi[:, 0], spec, n_voxels=4)
         assert painted.tolist() == [2.0, 2.0, 15.0, 15.0]
+
+
+@pytest.mark.slow
+def test_unbalanced_null_stays_calibrated():
+    """The fallback engine has to be a real test, not just one that runs.
+
+    Under a null with no effect at all, uncorrected p must stay near nominal and no unit
+    may survive FWE. Measured at 12% of trials randomly dropped (off-diagonal Gram ~8e-3,
+    1-3 repeats per cell): 0.050 / 0.050 / 0.035 at alpha 0.05 and FWE 0.000 for the three
+    statistics -- the imbalance costs orthogonality, not calibration.
+    """
+    rng = np.random.default_rng(0)
+    factors, rep, run = make_crossed_table()
+    keep = rng.random(len(rep)) > 0.12
+    sub = {k: v[keep] for k, v in factors.items()}
+    assert not build_factor_design(sub).balanced
+
+    y = torch.as_tensor(rng.normal(0, 1, size=(100, int(keep.sum()))), dtype=torch.float32)
+    res = permutation_test(
+        y, sub, repeat=rep[keep], run=run[keep], n_perms=200, seed=1, verbose=False
+    )
+    for key in ("unique_a", "unique_b", "interaction"):
+        p = res.p_uncorrected[key].numpy()
+        assert (p <= 0.05).mean() < 0.12, f"{key} anticonservative: {(p <= 0.05).mean()}"
+        assert (res.p_fwe[key].numpy() <= 0.05).mean() < 0.05

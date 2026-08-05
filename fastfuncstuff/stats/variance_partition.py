@@ -749,6 +749,112 @@ def _cellspace_partials(y: Tensor, ops: _CellOps) -> tuple[Tensor, Tensor]:
     return partials, target
 
 
+@dataclass
+class _TrialOps:
+    """Trial-space equivalent of :class:`_CellOps`, for designs that are not balanced.
+
+    The cell-space engine compresses every model to per-cell means, which is only valid
+    when each cell has the same number of repeats and every fold holds out exactly one of
+    each. Unequal repeats -- the normal result of dropping trials, or of a design that
+    simply did not run every cell the same number of times -- break both assumptions.
+
+    This path fits the same nested models with an explicit pseudo-inverse per fold, which
+    is what :func:`partition_variance` already does for the observed statistic. It costs
+    roughly an order of magnitude more per permutation because the design is n_trials wide
+    instead of n_cells, and the fold solvers depend only on the design, so they are built
+    once and reused across every permutation.
+    """
+
+    band_mats: dict[str, Tensor]
+    band_order: list[str]
+    band_slices: dict[str, slice]
+    folds: list[tuple[Tensor, Tensor, Tensor]]  # (train idx, test idx, solver)
+    reduced_solvers: dict[tuple[int, ...], tuple[Tensor, Tensor]]
+    n_trials: int
+    cell_of_trial: Tensor
+    n_cells: int
+
+
+def _build_trial_ops(
+    design: FactorDesign,
+    folds: list[tuple[np.ndarray, np.ndarray]],
+    device: torch.device,
+) -> _TrialOps:
+    band_order = list(design.band_order)
+    band_mats = {k: v.to(device=device, dtype=torch.float32) for k, v in design.bands.items()}
+    band_slices: dict[str, slice] = {}
+    off = 0
+    for name in band_order:
+        w = band_mats[name].shape[1]
+        band_slices[name] = slice(off, off + w)
+        off += w
+
+    fold_ops = []
+    for train, test in folds:
+        tr = torch.as_tensor(train, dtype=torch.long, device=device)
+        te = torch.as_tensor(test, dtype=torch.long, device=device)
+        x_tr = torch.cat(
+            [torch.ones(len(tr), 1, device=device)] + [band_mats[n][tr] for n in band_order], dim=1
+        )
+        fold_ops.append((tr, te, torch.linalg.pinv(x_tr.double()).float()))
+
+    # Freedman-Lane reduced fits, on the whole dataset. Under imbalance a reduced model is
+    # not a sub-vector of the full fit, so each one gets its own solve.
+    n_a_cols = len(band_order)
+    reduced: dict[tuple[int, ...], tuple[Tensor, Tensor]] = {}
+    for bands in ((0,), (1,), (0, 1)):
+        if max(bands) >= n_a_cols:
+            continue
+        x = torch.cat(
+            [torch.ones(design.n_trials, 1, device=device)]
+            + [band_mats[band_order[i]] for i in bands],
+            dim=1,
+        )
+        reduced[bands] = (x, torch.linalg.pinv(x.double()).float())
+
+    n_a, n_b = len(design.levels[0]), len(design.levels[1])
+    return _TrialOps(
+        band_mats=band_mats,
+        band_order=band_order,
+        band_slices=band_slices,
+        folds=fold_ops,
+        reduced_solvers=reduced,
+        n_trials=design.n_trials,
+        cell_of_trial=(design.codes[:, 0] * n_b + design.codes[:, 1]).to(device),
+        n_cells=n_a * n_b,
+    )
+
+
+def _trialspace_partials(y: Tensor, ops: _TrialOps) -> tuple[Tensor, Tensor]:
+    """Per-band held-out predictions and targets, in trial space.
+
+    Same contract as :func:`_cellspace_partials` -- ``(n_vox, n_trials, 3)`` partials and
+    ``(n_vox, n_trials)`` targets, band order (A, B, interaction) -- so
+    :func:`_partition_stats` consumes either without knowing which engine produced it.
+    Leave-one-repeat-out folds partition the trials, so every column gets written exactly
+    once.
+    """
+    n_vox = y.shape[0]
+    partials = torch.zeros(n_vox, ops.n_trials, 3, device=y.device, dtype=y.dtype)
+    target = torch.zeros(n_vox, ops.n_trials, device=y.device, dtype=y.dtype)
+
+    for tr, te, solver in ops.folds:
+        coef = y[:, tr] @ solver.T
+        target[:, te] = y[:, te] - coef[:, 0:1]
+        for bi, name in enumerate(ops.band_order):
+            sl = ops.band_slices[name]
+            cb = coef[:, 1 + sl.start : 1 + sl.stop]
+            partials[:, te, bi] = cb @ ops.band_mats[name][te].T
+
+    return partials, target
+
+
+def _reduced_fit_trials(y: Tensor, ops: _TrialOps, bands: tuple[int, ...]) -> Tensor:
+    """Whole-dataset fitted values of a reduced model, per trial (see Freedman-Lane note)."""
+    x, pinv = ops.reduced_solvers[tuple(sorted(bands))]
+    return (y @ pinv.T) @ x.T
+
+
 _CELL_MODELS: dict[str, list[int]] = {
     "M0": [],
     "M_a": [0],
@@ -870,13 +976,6 @@ def permutation_test(
         raise ValueError(f"unknown statistics {sorted(bad)}; expected {sorted(_REDUCED_FOR)}")
 
     design = build_factor_design(factor_codes)
-    if not design.balanced:
-        raise ValueError(
-            "permutation inference requires a balanced crossed design: the null must be "
-            "computed under the same estimator variance as the observed statistic, and "
-            "imbalance already invalidates the orthogonality the partition relies on. "
-            f"max off-diagonal Gram mass = {design.max_offdiag:.3e}"
-        )
 
     betas_t = torch.as_tensor(np.asarray(betas)) if not isinstance(betas, Tensor) else betas
     if betas_t.shape[1] != design.n_trials:
@@ -891,7 +990,38 @@ def permutation_test(
     folds, fold_diag = build_repeat_folds(repeat, run, cell=cell_labels(design))
     _check_run_locality(fold_diag, strict=strict_run_locality, verbose=verbose)
 
-    ops = _build_cell_ops(design, folds, device)
+    # Balanced designs get the cell-space engine, which is what makes 200k voxels x 1000
+    # permutations affordable. Imbalance (unequal repeats per cell, usually from dropped
+    # trials) invalidates its compression, so fall back to the same pseudo-inverse engine
+    # partition_variance uses for the observed statistic. Refusing instead would be
+    # over-strict: what imbalance costs is the exact orthogonality of the bands, which
+    # makes the *partition* approximate -- it does not make the null invalid, because the
+    # null is computed by the identical estimator under the identical design.
+    ops: _CellOps | _TrialOps
+    if design.balanced:
+        ops = _build_cell_ops(design, folds, device)
+        partials_of = _cellspace_partials
+
+        def reduced_fit(y: Tensor, bands: tuple[int, ...]) -> Tensor:
+            cell_ops = ops
+            assert isinstance(cell_ops, _CellOps)
+            return _reduced_fit_cells(y, cell_ops, bands)[:, cell_ops.cell_of_trial]
+    else:
+        ops = _build_trial_ops(design, folds, device)
+        partials_of = _trialspace_partials
+
+        def reduced_fit(y: Tensor, bands: tuple[int, ...]) -> Tensor:
+            trial_ops = ops
+            assert isinstance(trial_ops, _TrialOps)
+            return _reduced_fit_trials(y, trial_ops, bands)
+
+        if verbose:
+            print(
+                f"   ⚠️  design is not balanced (max off-diagonal Gram "
+                f"{design.max_offdiag:.2e}); using the general trial-space permutation "
+                "engine, ~10x slower per permutation. The partition itself is approximate "
+                "under imbalance — check shared |C| before reading the p-values."
+            )
 
     if run is None:
         blocks = np.zeros(design.n_trials, dtype=np.int64)
@@ -920,7 +1050,7 @@ def permutation_test(
     for c0 in range(0, n_vox, chunk_size):
         c1 = min(c0 + chunk_size, n_vox)
         chunk = betas_t[c0:c1].to(device)
-        stats = _partition_stats(*_cellspace_partials(chunk, ops))
+        stats = _partition_stats(*partials_of(chunk, ops))
         for key in statistics:
             observed[key][c0:c1] = stats[key].cpu()
 
@@ -931,6 +1061,9 @@ def permutation_test(
         diagnostics={
             "n_blocks": int(np.unique(blocks).size),
             "blocked_by_run": run is not None,
+            "balanced": design.balanced,
+            "max_offdiag_gram": design.max_offdiag,
+            "engine": "cell-space" if design.balanced else "trial-space",
             **fold_diag,
         },
     )
@@ -966,18 +1099,17 @@ def permutation_test(
             for c0 in range(0, n_vox, chunk_size):
                 c1 = min(c0 + chunk_size, n_vox)
                 chunk = betas_t[c0:c1].to(device)
-                fit_cells = _reduced_fit_cells(chunk, ops, reduced)
-                fit_trials = fit_cells[:, ops.cell_of_trial]
+                fit_trials = reduced_fit(chunk, reduced)
                 resid = chunk - fit_trials
                 obs_chunk = obs_dev[c0:c1]
                 for p in range(n_perms):
                     y_star = fit_trials + resid[:, perms[p]]
-                    stats = _partition_stats(*_cellspace_partials(y_star, ops))
+                    stats = _partition_stats(*partials_of(y_star, ops))
                     s = stats[key]
                     null_max[p] = torch.maximum(null_max[p], s.max())
                     count_ge[c0:c1] += (s >= obs_chunk).to(torch.int32)
                     bar.update(1)
-                del chunk, fit_cells, fit_trials, resid
+                del chunk, fit_trials, resid
 
         null_max_cpu = null_max.cpu()
         obs = observed[key]
