@@ -120,6 +120,7 @@ ffs_util_resample = "fastfuncstuff.cli.util_resample:main"
 ffs_util_updatedof = "fastfuncstuff.cli.util_updatedof:main"
 # Stats / utility tools
 ffs_spatial_xcorr = "fastfuncstuff.cli.spatial_xcorr:main"
+ffs_varpart = "fastfuncstuff.cli.varpart:main"
 # Benchmark / testing
 ffs_benchmark = "fastfuncstuff.cli.benchmark:main"
 

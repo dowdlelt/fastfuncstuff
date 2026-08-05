@@ -20,6 +20,7 @@ import csv
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 
@@ -65,14 +66,17 @@ _ENTITY_RE = {
 }
 
 
-def parse_path_entities(path: str | Path) -> dict[str, str]:
+def parse_path_entities(path: str | Path, normalize: bool = True) -> dict[str, str]:
     """Extract whatever sub/ses/task/run entities a filename carries.
 
     Deliberately lenient: derivative filenames routinely drop ``sub-`` and write
     ``run01`` rather than ``run-01``. Missing entities are simply absent from the
     result, so callers can compare only the keys both sides actually have.
-    Numeric entities are normalised (``run-001`` and ``run01`` both give ``"1"``)
-    so zero-padding differences never register as a mismatch.
+    With ``normalize`` (the default) numeric entities are canonicalised
+    (``run-001`` and ``run01`` both give ``"1"``) and strings lowercased, so
+    zero-padding differences never register as a mismatch. Pass
+    ``normalize=False`` to get the values exactly as the filename spells them —
+    what a table meant for human reading should show.
     """
     name = Path(path).name
     out: dict[str, str] = {}
@@ -80,7 +84,10 @@ def parse_path_entities(path: str | Path) -> dict[str, str]:
         m = rx.search(name)
         if m:
             val = m.group(1)
-            out[key] = str(int(val)) if val.isdigit() else val.lower()
+            if not normalize:
+                out[key] = val
+            else:
+                out[key] = str(int(val)) if val.isdigit() else val.lower()
     return out
 
 
@@ -264,25 +271,24 @@ def drop_late_events(
 # ---------------------------------------------------------------------------
 
 
-def _read_tsv(
-    path: Path,
-    onset_col: str,
-    duration_col: str,
-    trial_type_col: str,
-) -> list[tuple[float, float, str]]:
-    """
-    Read one BIDS events TSV.
+def read_tsv_rows(
+    path: Path | str,
+    onset_col: str = "onset",
+    duration_col: str = "duration",
+    trial_type_col: str = "trial_type",
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Read one BIDS events TSV, keeping every column of every usable row.
 
-    Returns a list of (onset_s, duration_s, trial_type) tuples.
-    Rows where trial_type is empty or 'n/a' are skipped.
+    Returns ``(rows, fieldnames)``. Each row is the raw ``csv.DictReader`` mapping
+    with two parsed values attached under the reserved keys ``"_onset"`` and
+    ``"_duration"`` (floats) and the cleaned trial type under ``"_trial_type"``,
+    so callers never have to re-parse or re-guess the column mapping.
 
-    Raises
-    ------
-    FileNotFoundError
-        If *path* does not exist.
-    ValueError
-        If a required column is missing or a row cannot be parsed.
+    Rows are filtered exactly as :func:`_read_tsv` filters them — empty or ``n/a``
+    trial types are dropped — because the companion trial table has to line up
+    row-for-row with the design those same rows produced.
     """
+    path = Path(path)
     if not path.exists():
         raise FileNotFoundError(f"Events file not found: {path}")
 
@@ -302,7 +308,7 @@ def _read_tsv(
                     f"  Use -event_cols to specify custom column names."
                 )
 
-        events: list[tuple[float, float, str]] = []
+        rows: list[dict[str, Any]] = []
         for row_num, row in enumerate(reader, start=2):  # row 1 is header
             trial_type = str(row[trial_type_col]).strip()
             if not trial_type or trial_type.lower() == "n/a":
@@ -314,9 +320,37 @@ def _read_tsv(
                 raise ValueError(
                     f"Cannot parse numeric values on row {row_num} of {path}: {exc}"
                 ) from exc
-            events.append((onset, duration, trial_type))
+            parsed: dict[str, Any] = dict(row)
+            parsed["_onset"] = onset
+            parsed["_duration"] = duration
+            parsed["_trial_type"] = trial_type
+            parsed["_source_row"] = row_num
+            rows.append(parsed)
 
-    return events
+    return rows, fieldnames
+
+
+def _read_tsv(
+    path: Path,
+    onset_col: str,
+    duration_col: str,
+    trial_type_col: str,
+) -> list[tuple[float, float, str]]:
+    """
+    Read one BIDS events TSV.
+
+    Returns a list of (onset_s, duration_s, trial_type) tuples.
+    Rows where trial_type is empty or 'n/a' are skipped.
+
+    Raises
+    ------
+    FileNotFoundError
+        If *path* does not exist.
+    ValueError
+        If a required column is missing or a row cannot be parsed.
+    """
+    rows, _ = read_tsv_rows(path, onset_col, duration_col, trial_type_col)
+    return [(float(r["_onset"]), float(r["_duration"]), str(r["_trial_type"])) for r in rows]
 
 
 # ---------------------------------------------------------------------------

@@ -1889,6 +1889,27 @@ def main():
                     f"({len(trial_labels)} columns)"
                 )
 
+            # Companion table describing every single-trial column, in column order.
+            # Written here rather than at save time because the design (and therefore
+            # the ordering) is what it describes, and three separate save paths below
+            # emit the same trial ordering.
+            from fastfuncstuff.design.trial_table import write_single_trial_event_table
+
+            # ffs_reml has no -prefix; its single-trial buckets are named after the
+            # -single_trials label (ols_LABEL_single / reml_LABEL_single), so the
+            # companion table sits beside them under the same label.
+            write_single_trial_event_table(
+                str(args.single_trials),
+                args.events,
+                run_starts,
+                args.tr,
+                event_ignore=args.event_ignore,
+                event_cols=tuple(args.event_cols) if args.event_cols else None,
+                n_runs=n_runs,
+                run_lengths_sec=_run_len_sec if args.allow_late_events else None,
+                n_basis=n_basis if n_basis else 1,
+            )
+
             # Override label/count bookkeeping so downstream design_info uses
             # per-trial columns (each trial is its own "condition" for output).
             condition_labels_full = trial_labels

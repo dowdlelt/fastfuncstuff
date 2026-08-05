@@ -2032,6 +2032,20 @@ def main():
                 n_basis=n_basis if not is_fir_model else 1,  # FIR incompatible with single-trial
             )
         )
+        # Companion table describing every single-trial volume, in design order.
+        from fastfuncstuff.design.trial_table import write_single_trial_event_table
+
+        write_single_trial_event_table(
+            args.prefix,
+            args.events,
+            run_starts,
+            args.tr,
+            event_ignore=args.event_ignore,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            n_runs=n_runs,
+            n_basis=n_basis if not is_fir_model else 1,
+        )
+
         per_voxel_st = st_design.ndim == 3  # (n_unique_hrfs, n_timepoints, n_trials * n_basis)
         n_columns = (
             trial_labels.__len__() if hasattr(trial_labels, "__len__") else len(trial_labels)

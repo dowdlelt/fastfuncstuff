@@ -982,6 +982,21 @@ def main():
     vol_shape = volume_shape
     # affine is already extracted from load_result
 
+    # Companion table describing every single-trial volume (both output paths below
+    # write one volume per trial, in the design's chronological order).
+    from fastfuncstuff.design.trial_table import write_single_trial_event_table
+
+    write_single_trial_event_table(
+        args.prefix,
+        args.events,
+        run_starts,
+        args.tr,
+        event_ignore=args.event_ignore,
+        event_cols=tuple(args.event_cols) if args.event_cols else None,
+        n_runs=n_runs,
+        n_basis=n_basis,
+    )
+
     if args.single_trials:
         # ========== SINGLE-TRIAL OUTPUT MODE ==========
         # Use save_single_trial_results for single-trial mode
