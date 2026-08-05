@@ -507,7 +507,9 @@ def _two_fmap_subject():
     return Subject("X", [Session("SM", runs, [f1, f2], anat=Path("/anat/T1w.nii.gz"))])
 
 
-def test_anat_source_grandmean_is_the_default():
+def test_anat_source_defaults_to_grandmean_without_sbrefs():
+    """-anat_source auto has only one thing to fall back on when the dataset has
+    no SBRef lane."""
     plan = build_plan(_two_fmap_subject(), Options(go_to_anat=True, fmap_ref=["floc"]))
     s = write_script(plan, "wd", bids_root="/bids")
     assert '-source "stage08.grandmean.nii$FMT"' in s
@@ -1589,3 +1591,35 @@ def test_recipe_emits_exactly_the_stages_it_advertises(recipe):
             f"{recipe}: stage {stage} {'missing from' if stage in want else 'unexpectedly in'} "
             "the emitted script"
         )
+
+
+def test_anat_source_auto_prefers_the_sbref_grandmean():
+    """SBRefs already estimate xrun and xses (emit._primary_lane). The anat step is
+    the pipeline's one cross-modal lpc fit, so defaulting it to the BOLD-mean
+    grandmean threw away the sharpest, least-interpolated image available — for
+    the alignment that needs it most. `auto` follows the lane, and the segment
+    input follows with it."""
+    subj = Subject(
+        "X",
+        [
+            Session(
+                "01",
+                [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")],
+                anat=Path("/anat/T1w.nii.gz"),
+            )
+        ],
+    )
+    plan = build_plan(subj, Options(go_to_anat=True, anat_nonlin=True, tpm="/tpm.nii.gz"))
+    assert plan.use_sbref
+    assert effective_anat_source(plan) == "sbmean"
+    s = write_script(plan, "wd", bids_root="/bids")
+    sb = "stage08.grandmean.src-sbref.nii$FMT"
+    assert f'-source "{sb}"' in s  # linear anat (ffs_allineate)
+    assert f'ffs_segment \\\n    -input "{sb}"' in s  # nonlinear anat
+    # "auto" resolving to something is not a degraded request — no fallback note.
+    assert "unavailable here →" not in s
+    # ...and the explicit opt-out still works.
+    s_gm = write_script(
+        build_plan(subj, Options(go_to_anat=True, anat_source="grandmean")), "wd", bids_root="/bids"
+    )
+    assert '-source "stage08.grandmean.nii$FMT"' in s_gm

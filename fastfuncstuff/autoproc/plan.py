@@ -104,8 +104,10 @@ class Options:
     # Which EPI-contrast image the anat linear step aligns to. All choices live on
     # the SAME grid (the reference fmap's undistorted space) — see
     # ``effective_anat_source``; they differ only in SNR/sharpness/contrast.
-    anat_source: str = "grandmean"  # grandmean | sbmean | ref_fmap | mean_fmap
-    anat_nonlin_input: str = "grandmean"  # ffs_segment input: + sbmean|blipfor|blip_pair
+    # auto = sbmean where the SBRef lane exists, else grandmean (see
+    # ``effective_anat_source``).
+    anat_source: str = "auto"  # auto | grandmean | sbmean | ref_fmap | mean_fmap
+    anat_nonlin_input: str = "auto"  # ffs_segment input: + blipfor | blip_pair
     # -grand_reference: path to ANOTHER autoproc results dir whose anat matrix
     # this run borrows; this data's grandmean is aligned to that ref (xref_*).
     # This is how a filtered `primary`-only script anchors on a floc run.
@@ -310,6 +312,14 @@ def effective_anat_source(plan: Plan, requested: str | None = None) -> str:
     choices degrade to the grandmean there (bug of record).
     """
     mode = requested if requested is not None else plan.options.anat_source
+    # "auto" = use the SBRefs when they exist. They already lead every other
+    # alignment (``emit._primary_lane`` estimates xrun/xses from the SBRef lane),
+    # and the anat step is the one cross-modal ``lpc`` fit in the pipeline — the
+    # place a sharp, single-interpolation, single-band image matters MOST. Falling
+    # back to the BOLD grandmean there wasted the very images the rest of the
+    # pipeline is anchored on.
+    if mode == "auto":
+        mode = "sbmean" if plan.use_sbref else "grandmean"
     if mode == "grandmean":
         return mode
     if mode == "sbmean":

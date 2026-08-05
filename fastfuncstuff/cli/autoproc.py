@@ -127,22 +127,24 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-anat_source",
         "-anat-source",
-        choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap"],
+        choices=["auto", "grandmean", "sbmean", "ref_fmap", "mean_fmap"],
         default=None,
         help="Override -ref_image for the anat step alone (same vocabulary). All "
-        "four choices share the reference-fmap grid: grandmean (best SNR, only "
-        "option w/o fieldmaps or SBRefs) | sbmean (the same average built from "
+        "choices share the reference-fmap grid: auto (sbmean when the dataset has "
+        "SBRefs, else grandmean) | grandmean (best SNR, only option w/o fieldmaps "
+        "or SBRefs) | sbmean (the same average built from "
         "every run's SBRef: single-band contrast, one interpolation instead of "
         "two) | ref_fmap (reference fieldmap's undistorted mean; sharpest, defines "
         "the space) | mean_fmap (ref_fmap averaged with the other groups' aligned "
-        "means). Default: whatever -ref_image is (grandmean).",
+        "means). Default: whatever -ref_image is, else auto.",
     )
     g.add_argument(
         "-anat_nonlin_input",
         "-anat-nonlin-input",
-        choices=["grandmean", "sbmean", "ref_fmap", "mean_fmap", "blipfor", "blip_pair"],
-        default="grandmean",
-        help="ffs_segment input: grandmean (works w/o fieldmap) | sbmean | ref_fmap | "
+        choices=["auto", "grandmean", "sbmean", "ref_fmap", "mean_fmap", "blipfor", "blip_pair"],
+        default="auto",
+        help="ffs_segment input: auto (= -anat_source auto: sbmean with SBRefs, else "
+        "grandmean) | grandmean (works w/o fieldmap) | sbmean | ref_fmap | "
         "mean_fmap | blipfor | blip_pair",
     )
     g.add_argument(
@@ -939,7 +941,7 @@ def main(argv: list[str] | None = None) -> int:
         anat_nonlin=anat_nonlin,
         # -ref_image is the answer for every level; -anat_source overrides it for
         # the anat step alone.
-        anat_source=args.anat_source or args.ref_image or "grandmean",
+        anat_source=args.anat_source or args.ref_image or "auto",
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,
         moco_ref=args.moco_ref,
