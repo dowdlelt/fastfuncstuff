@@ -1507,3 +1507,85 @@ def test_pepolar_fmap_is_untouched_by_the_polarity_split():
     plan = build_plan(subj, Options())
     assert plan.runs[0].fmap is not None and plan.runs[0].fmap.fmap_id == "f"
     assert "ffs_blipflip" in _stage04(write_script(plan, "wd", bids_root="/bids"))
+
+
+def test_task_distinguished_runs_still_get_xrun_alignment():
+    """Runs identified by TASK alone (task-bar1/bar2/..., no run- entity) all have
+    run=None. Anchoring on the `run` value made every one of them 'the first run',
+    so nothing was ever aligned to anything: no wxrun link in any chain."""
+    subj = Subject(
+        "X",
+        [Session("01", [_run("01", "bar1", None), _run("01", "bar2", None)])],
+    )
+    plan = build_plan(subj, Options(go_to_anat=False))
+    first, second = plan.runs
+    assert first.is_ref_run and not second.is_ref_run
+    assert first.warp_chain == ["moco"]
+    assert second.warp_chain == ["wxrun_lin", "moco"]
+
+
+# ---------------------------------------------------------------------------
+# recipes: each named preset must actually put its stages in the script
+# ---------------------------------------------------------------------------
+
+# Marker → the stage that emits it, for a subject that HAS fieldmaps, an anat,
+# and several runs, i.e. a dataset where every recipe's stages are all possible.
+_STAGE_MARKERS = {
+    # Section headers / chain tokens, never the preflight `command -v` list —
+    # that names every tool the generator knows about, stage or not.
+    "tshift": 'st_str="-tpattern',
+    "blip": "stage04: fieldmap",
+    "xrun": "stage06: cross-run alignment",
+    "xrun_nl": "_nl_WARP",
+    "anat": "stage09: anatomical alignment",
+    "anat_nl": "nlanat_invwarp",
+    "locomoco": "stage03: locomoco",
+    "glm": "stage12: GLM",
+}
+
+# What each recipe claims (config.RECIPE_SUMMARY), as the stages it must emit.
+_RECIPE_STAGES = {
+    # xrun is in every recipe, bare_bones included: without it the runs are not
+    # in a common space and a multi-run GLM is meaningless.
+    "bare_bones": {"xrun", "glm"},
+    "simple": {"tshift", "blip", "xrun", "anat", "glm"},
+    "simple_nonlin": {"tshift", "blip", "xrun", "xrun_nl", "anat", "glm"},
+    "complete": {"tshift", "blip", "xrun", "xrun_nl", "anat", "anat_nl", "glm"},
+    "extreme": {"tshift", "blip", "xrun", "xrun_nl", "anat", "anat_nl", "locomoco", "glm"},
+}
+
+
+def _full_subject():
+    """One session, two runs distinguished by task (the retinotopy shape), an
+    AP/PA fieldmap pair, slice timing present."""
+    runs = []
+    for task in ("bar1", "bar2"):
+        r = _run("01", task, None, pe="j")
+        r.json["SliceTiming"] = [0.0, 0.5]
+        runs.append(r)
+    fmap = FmapGroup(
+        "01",
+        "PA-AP",
+        Path("/fmap_AP.nii.gz"),
+        {"TotalReadoutTime": 0.05, "PhaseEncodingDirection": "j"},
+        [("bar1", None), ("bar2", None)],
+        forward_path=Path("/fmap_PA.nii.gz"),
+    )
+    return Subject("X", [Session("01", runs, [fmap])])
+
+
+@pytest.mark.parametrize("recipe", sorted(_RECIPE_STAGES))
+def test_recipe_emits_exactly_the_stages_it_advertises(recipe):
+    from fastfuncstuff.autoproc import config
+
+    opt = Options(**config.RECIPES[recipe], recipe=recipe)
+    opt.anat_path = "/anat.nii.gz"
+    opt.tpm = "/tpm.nii.gz"
+    script = write_script(build_plan(_full_subject(), opt), "wd", bids_root="/bids")
+    want = _RECIPE_STAGES[recipe]
+    for stage, marker in _STAGE_MARKERS.items():
+        present = marker in script
+        assert present == (stage in want), (
+            f"{recipe}: stage {stage} {'missing from' if stage in want else 'unexpectedly in'} "
+            "the emitted script"
+        )

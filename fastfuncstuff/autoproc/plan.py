@@ -514,8 +514,12 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         # -distortion off (e.g. bare_bones): treat as no fmaps → no blip/xfmap,
         # xrun falls back to first-run anchoring.
         has_fmaps = bool(sess.fmaps) and opt.distortion
-        # First run of the session anchors xrun when there are no fmaps.
-        session_first_run = sess.bold_runs[0].run if sess.bold_runs else None
+        # First run of the session anchors xrun when there are no fmaps. Identity
+        # is the BoldRun itself, not its `run` entity: a session whose runs are
+        # distinguished by TASK (task-bar1/bar2/... with no run- entity) has
+        # run=None everywhere, so comparing `run` made every run the reference and
+        # dropped xrun alignment entirely (bug of record).
+        session_first_run = sess.bold_runs[0] if sess.bold_runs else None
         # Each fmap group's DISTORTED forward = the image stage04 estimates the
         # field against, and hence the xrun base for that group: the fmap's own
         # matched-PE mate when it has one (self-contained AP/PA pair), else the
@@ -543,7 +547,7 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 is_ref_fmap=(
                     fmap is not None and ref_fmap is not None and fmap.fmap_id == ref_fmap.fmap_id
                 ),
-                is_ref_run=(not has_fmaps and bold.run == session_first_run),
+                is_ref_run=(not has_fmaps and bold is session_first_run),
                 fmap_forward=(forward_by_fmap.get(fmap.fmap_id) if fmap else None),
                 # Every run of a fieldmap session shares the session's common grid,
                 # whether or not it has a fieldmap of its own.
