@@ -1903,7 +1903,16 @@ def fit_segment(
         return warp_prior_grad(field.detach() / sk_t, warp_reg_gn, node_vox) / sk_t
 
     def _warp_objective(tw: Tensor, active_log_prior: Tensor) -> float:
-        """Penalised negative log-likelihood the GN line search must decrease."""
+        """Penalised negative log-likelihood the GN line search must decrease.
+
+        A non-finite ``tw`` (an occasionally ill-conditioned CG solve can return NaN/Inf,
+        more likely the larger the grid) must never reach the TPM sampler: its
+        ``floor().clamp().long()`` tap indexing is undefined for NaN on CUDA and asserts
+        with an out-of-bounds index rather than raising a catchable Python error. Scoring
+        it as +inf makes the Armijo search reject it like any other uphill step.
+        """
+        if not torch.isfinite(tw).all():
+            return float("inf")
         return (
             _warp_data_term(tw, active_log_prior, want_grad=False)
             + _warp_prior_energy(tw, warp_reg_gn).item()
@@ -2266,6 +2275,11 @@ def fit_segment(
                 # keep the constrained components identically zero inside the solve too
                 precond = (lambda r, _p=_pre: _pe_project(_p(r))) if pe_axis is not None else _pre
                 update = _pe_project(_cg_solve(beta, _apply_a, warp_cg_iters, precond))
+                if not torch.isfinite(update).all():
+                    # A NaN/Inf update stays NaN/Inf under any Armijo scale (armijo·NaN is
+                    # still NaN), so the 12-try backtracking loop below can never accept it —
+                    # skip straight to "no downhill step" instead of burning it pointlessly.
+                    break
                 base = _warp_objective(twarp, cur_log_prior)
                 armijo, improved = 1.0, False
                 for _ in range(12):  # backtracking line search (SPM's Armijo: 12 tries)
