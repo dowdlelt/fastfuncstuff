@@ -7,6 +7,7 @@ sub-brick assembly, and the failure messages a user is most likely to hit.
 from __future__ import annotations
 
 import csv
+import json
 import sys
 from pathlib import Path
 
@@ -253,3 +254,106 @@ def test_runs_without_run_or_repeat_columns(tmp_path):
         == 0
     )
     assert Path(str(out) + ".nii.gz").exists()
+
+
+def _base_args(betas, tsv, out):
+    return [
+        "-betas",
+        str(betas),
+        "-trials",
+        str(tsv),
+        "-factors",
+        "stim,task",
+        "-prefix",
+        str(out),
+        "-quiet",
+    ]
+
+
+def test_drop_trials_excludes_matching_rows(tmp_path, capsys):
+    betas, tsv, _, n_tr = _fixture(tmp_path)
+    out = tmp_path / "dropped"
+    assert _run([*_base_args(betas, tsv, out), "-drop_trials", "run", "r0"]) == 0
+    txt = capsys.readouterr().out
+    assert "-drop_trials run=r0" in txt
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    assert meta["n_trials_in_table"] == n_tr
+    assert meta["n_trials"] < n_tr
+    assert meta["dropped_trials"] == [["run", "r0"]]
+
+
+def test_drop_trials_is_repeatable(tmp_path):
+    betas, tsv, _, n_tr = _fixture(tmp_path)
+    out = tmp_path / "dropped2"
+    assert (
+        _run(
+            [
+                *_base_args(betas, tsv, out),
+                "-drop_trials",
+                "run",
+                "r0",
+                "-drop_trials",
+                "run",
+                "r1",
+            ]
+        )
+        == 0
+    )
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    assert 0 < meta["n_trials"] < n_tr
+
+
+def test_drop_trials_rejects_a_label_that_matches_nothing(tmp_path):
+    """A silent no-op here means analysing trials the user believes were excluded."""
+    betas, tsv, _, _ = _fixture(tmp_path)
+    with pytest.raises(SystemExit, match="no trial has that value"):
+        _run([*_base_args(betas, tsv, tmp_path / "x"), "-drop_trials", "run", "r99"])
+
+
+def test_drop_trials_rejects_an_unknown_column(tmp_path):
+    betas, tsv, _, _ = _fixture(tmp_path)
+    with pytest.raises(SystemExit, match="column 'session' not found"):
+        _run([*_base_args(betas, tsv, tmp_path / "x"), "-drop_trials", "session", "1"])
+
+
+def test_beta_count_is_checked_against_the_undropped_table(tmp_path):
+    betas, tsv, _, _ = _fixture(tmp_path)
+    short = tmp_path / "short.csv"
+    rows = list(csv.reader(open(tsv, newline="")))
+    with open(short, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows[:-3])
+    with pytest.raises(SystemExit, match="One row per volume"):
+        _run(
+            [
+                "-betas",
+                str(betas),
+                "-trials",
+                str(short),
+                "-factors",
+                "stim,task",
+                "-prefix",
+                str(tmp_path / "x"),
+                "-quiet",
+            ]
+        )
+
+
+def test_free_text_levels_are_sanitized_and_recorded(tmp_path):
+    """Levels with spaces/punctuation become identifiers; the mapping is written out."""
+    betas, tsv, _, _ = _fixture(tmp_path)
+    messy = tmp_path / "messy.csv"
+    rows = list(csv.reader(open(tsv, newline="")))
+    header = rows[0]
+    ti = header.index("task")
+    for row in rows[1:]:
+        row[ti] = row[ti].replace("t", "task, number ")
+    with open(messy, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+
+    out = tmp_path / "messy_out"
+    assert _run(_base_args(betas, messy, out)) == 0
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    mapping = meta["level_names"]["task"]
+    assert all(" " not in v and "," not in v for v in mapping.values())
+    assert len(set(mapping.values())) == len(mapping)
+    assert any(k != v for k, v in mapping.items())

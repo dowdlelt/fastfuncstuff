@@ -22,6 +22,7 @@ import torch
 
 try:
     from fastfuncstuff.cli_utils import parse_prefix
+    from fastfuncstuff.design.trial_table import sanitize_levels
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.stats.variance_partition import (
         build_roi_weights,
@@ -60,9 +61,18 @@ Examples:
   ffs_varpart -betas trials.nii.gz -trials trials.csv -factors stim,task \\
               -mask brain.nii.gz -perm 1000 -prefix vp
 
+  # Restrict to a subset: drop the first run and one task entirely
+  ffs_varpart -betas out_single_trial_betas.nii.gz \\
+              -trials out_single_trial_events.tsv -factors trial_type,task \\
+              -drop_trials run 01 -drop_trials task rest -prefix vp
+
 Sidecar table: one row per volume of -betas, in the same order. Must contain the
 columns named by -factors. Columns 'run', 'session' and 'repeat' are used when
 present (fold construction and permutation blocks) and ignored when absent.
+ffs_reml / ffs_ridge / ffs_denoise write exactly this table next to their
+single-trial betas as {prefix}_single_trial_events.tsv when given BIDS -events.
+Factor levels may be free text; they are sanitized into identifiers here (the
+mapping back to the original labels is written to {prefix}_varpart.json).
 """,
     )
     req = p.add_argument_group("Required")
@@ -76,6 +86,21 @@ present (fold construction and permutation blocks) and ignored when absent.
     req.add_argument("-prefix", required=True, help="Output prefix")
 
     opt = p.add_argument_group("Options")
+    opt.add_argument(
+        "-drop_trials",
+        "-drop-trials",
+        dest="drop_trials",
+        nargs=2,
+        action="append",
+        metavar=("COLUMN", "LABEL"),
+        default=None,
+        help=(
+            "Exclude every trial whose COLUMN equals LABEL, before anything else "
+            "(e.g. -drop_trials run 01 -drop_trials task rest). Repeatable; each "
+            "occurrence drops one COLUMN/LABEL pair. Numeric labels match regardless "
+            "of zero padding and string labels regardless of case."
+        ),
+    )
     opt.add_argument("-mask", default=None, help="Restrict to voxels inside this mask")
     opt.add_argument(
         "-atlas",
@@ -148,6 +173,56 @@ def _optional_column(rows: list[dict], name: str) -> np.ndarray | None:
     return _column(rows, name) if name in rows[0] else None
 
 
+def _label_matches(value: str, label: str) -> bool:
+    """Lenient equality for -drop_trials.
+
+    A BIDS run entity is written ``01`` in one table and ``1`` in the next, and a
+    user typing ``-drop_trials run 1`` means the same run either way. Numeric
+    values compare numerically; everything else compares case-insensitively on
+    stripped text.
+    """
+    a, b = str(value).strip(), str(label).strip()
+    if a.lower() == b.lower():
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
+def _apply_drop_trials(rows: list[dict], drops: list[list[str]] | None) -> np.ndarray:
+    """Return a boolean keep-mask over *rows* after applying every -drop_trials pair.
+
+    A pair that matches nothing is an error, not a no-op: it is almost always a typo
+    or the wrong column, and silently analysing the full dataset under the belief
+    that a condition was excluded is the failure mode worth being loud about.
+    """
+    keep = np.ones(len(rows), dtype=bool)
+    if not drops:
+        return keep
+
+    for column, label in drops:
+        if column not in rows[0]:
+            raise SystemExit(
+                f"❌ -drop_trials: column '{column}' not found in trial table. "
+                f"Available: {sorted(rows[0])}"
+            )
+        hit = np.array([_label_matches(r[column], label) for r in rows], dtype=bool)
+        if not hit.any():
+            values = sorted({str(r[column]) for r in rows})
+            shown = values[:20] + (["..."] if len(values) > 20 else [])
+            raise SystemExit(
+                f"❌ -drop_trials {column} {label}: no trial has that value.\n"
+                f"   Values present in '{column}': {', '.join(shown)}"
+            )
+        print(f"   ✂️  -drop_trials {column}={label}: dropping {int(hit.sum())} trials")
+        keep &= ~hit
+
+    if not keep.any():
+        raise SystemExit("❌ -drop_trials removed every trial")
+    return keep
+
+
 def main() -> int:
     args = create_parser().parse_args()
     device = get_device(args.device)
@@ -165,8 +240,31 @@ def main() -> int:
             f"❌ -factors needs exactly 2 column names, got {len(factor_names)}: {factor_names}"
         )
 
-    rows = _read_table(args.trials)
-    factor_codes = {name: _column(rows, name) for name in factor_names}
+    all_rows = _read_table(args.trials)
+    n_rows_total = len(all_rows)
+    if args.drop_trials:
+        print(f"\n✂️  Dropping trials ({n_rows_total} in table)")
+    keep = _apply_drop_trials(all_rows, args.drop_trials)
+    rows = [r for r, k in zip(all_rows, keep, strict=True) if k]
+
+    # Levels arrive as free text ("face, inverted"), and become identifiers downstream --
+    # map names, JSON keys, anything a later script indexes by. Sanitize once here, keeping
+    # distinct labels distinct, and report the mapping so the raw names stay recoverable.
+    factor_codes: dict[str, np.ndarray] = {}
+    level_maps: dict[str, dict[str, str]] = {}
+    for name in factor_names:
+        raw = [str(v) for v in _column(rows, name)]
+        clean, mapping = sanitize_levels(raw)
+        factor_codes[name] = np.array(clean)
+        level_maps[name] = mapping
+        # -drop_trials makes a one-level factor easy to reach by accident; the
+        # contrast builder's ValueError does not say which flag caused it.
+        if len(set(clean)) < 2:
+            raise SystemExit(
+                f"❌ factor '{name}' has only one level ({sorted(set(clean))}) after "
+                "trial selection; variance partitioning needs at least two."
+            )
+
     run = _optional_column(rows, "run")
     session = _optional_column(rows, "session")
     repeat_col = _optional_column(rows, "repeat")
@@ -180,9 +278,12 @@ def main() -> int:
     else:
         block = run if run is not None else session
 
-    print(f"\n📋 Trial table: {len(rows)} rows")
+    kept_note = f" ({n_rows_total - len(rows)} dropped)" if len(rows) != n_rows_total else ""
+    print(f"\n📋 Trial table: {len(rows)} rows{kept_note}")
     for name in factor_names:
-        print(f"   • {name}: {len(np.unique(factor_codes[name]))} levels")
+        renamed = sum(1 for k, v in level_maps[name].items() if k != v)
+        note = f", {renamed} level name(s) sanitized" if renamed else ""
+        print(f"   • {name}: {len(np.unique(factor_codes[name]))} levels{note}")
     print(f"   • run: {'yes' if run is not None else 'absent'}")
     print(f"   • session: {'yes' if session is not None else 'absent'}")
     print(f"   • repeat: {'yes' if repeat is not None else 'derived from cell order'}")
@@ -193,11 +294,18 @@ def main() -> int:
     if data.ndim != 4:
         raise SystemExit(f"❌ -betas must be 4-D (one volume per trial), got {data.ndim}-D")
     vol_shape, n_trials = data.shape[:3], data.shape[3]
-    if n_trials != len(rows):
+    # The pairing is checked against the *full* table: -drop_trials subsets the volumes
+    # here, so the file on disk still has to be one volume per un-dropped row.
+    if n_trials != n_rows_total:
         raise SystemExit(
-            f"❌ -betas has {n_trials} volumes but the trial table has {len(rows)} rows.\n"
-            "One row per volume is required; drop excluded trials from both."
+            f"❌ -betas has {n_trials} volumes but the trial table has {n_rows_total} rows.\n"
+            "One row per volume is required; use -drop_trials to exclude trials rather "
+            "than editing the table."
         )
+    if len(rows) != n_rows_total:
+        data = data[..., keep]
+        n_trials = data.shape[3]
+        print(f"   Kept {n_trials} of {n_rows_total} volumes after -drop_trials")
 
     if args.mask:
         mask = np.asanyarray(load_nifti(args.mask).dataobj).astype(bool)
@@ -340,6 +448,9 @@ def main() -> int:
 
     meta = {
         "factors": factor_names,
+        "level_names": level_maps,  # sanitized identifier -> original label, per factor
+        "dropped_trials": [list(d) for d in (args.drop_trials or [])],
+        "n_trials_in_table": n_rows_total,
         "n_trials": n_trials,
         "n_units": int(betas.shape[0]),
         "unit": "roi" if roi_ids is not None else "voxel",
