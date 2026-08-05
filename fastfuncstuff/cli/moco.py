@@ -14,6 +14,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from fastfuncstuff.cli_utils import (
@@ -24,7 +25,11 @@ from fastfuncstuff.cli_utils import (
     run_batch_jobs,
     spinner,
 )
-from fastfuncstuff.processing.affine import save_matrix_1D
+from fastfuncstuff.processing.affine import (
+    matrix_to_params,
+    save_matrix_1D,
+    voxel_matrix_to_dicom,
+)
 from fastfuncstuff.processing.ffs_moco import (
     MocoConfig,
     _blur_volume,
@@ -41,6 +46,14 @@ from fastfuncstuff.processing.io import (
     save_first_last,
     save_image,
     save_tsnr,
+)
+from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
+from fastfuncstuff.processing.shiftcorr import (
+    apply_shift,
+    estimate_shifts,
+    fold_shift_into_matrices,
+    save_shift_tables,
+    shift_table_paths,
 )
 
 # Sentinel for `-save_mean` / `-save_max` / `-save_min` given with no value:
@@ -134,6 +147,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
   # Estimate from the cross-echo mean instead:
   ffs_moco -input e?.nii.gz -reg_echo mean -prefix mc.nii.gz -1Dfile motion.1D
+
+  # Multi-echo 3-D EPI: strip the TE-dependent partition-axis shift first, then
+  # motion-correct, in one resample; save the per-echo TOTAL transforms:
+  ffs_moco -input e1.nii.gz e2.nii.gz e3.nii.gz -reg_echo 1 -prefix mc.nii.gz \\
+      -me_3depi -axis IS -echo_times 7.61 21.71 35.81 -shift_ordering ascending \\
+      -1Dfile motion.1D -1Dfile_shiftcorr motion_shiftcorr.1D \\
+      -1Dmatrix_shiftcorr mat_shiftcorr.aff12.1D -save_shifts mc
 
   # Drop the first 4 and last 2 volumes of every input:
   ffs_moco -input epi.nii.gz -prefix epi_mc.nii.gz -skip_first 4 -skip_last 2
@@ -429,10 +449,115 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "joint-corrected data).",
     )
 
+    sc_group = parser.add_argument_group(
+        "Multi-echo 3-D EPI partition-axis shift correction (-me_3depi)"
+    )
+    sc_group.add_argument(
+        "-me_3depi",
+        "-me-3depi",
+        dest="me_3depi",
+        action="store_true",
+        help="Before estimating motion, remove the TE-dependent apparent shift along "
+        "the partition (slow phase-encode) axis that a frequency drift over the 3-D "
+        "shot produces. It is a DIFFERENT shift for every echo, which is exactly what "
+        "one-pose-for-all-echoes multi-echo moco cannot represent, and a bulk "
+        "translation that would confuse ffs_locomoco downstream. Estimated per volume "
+        "by whole-volume inter-echo cross-correlation, then FOLDED into each echo's "
+        "motion matrix so the data is still resampled only once. Needs -axis and "
+        "several -input echoes.",
+    )
+    sc_group.add_argument(
+        "-axis",
+        default=None,
+        help="Partition (slow phase-encode) axis for -me_3depi: a direction code "
+        "AP/PA/LR/RL/IS/SI or an axis letter x/y/z (i/j/k).",
+    )
+    sc_group.add_argument(
+        "-echo_times",
+        "-echo-times",
+        dest="echo_times",
+        nargs="+",
+        type=float,
+        default=None,
+        help="Echo times in MILLISECONDS, one per -input echo. Enables the TE "
+        "regression: the shift is fit as a line in TE per volume and applied through "
+        "the origin, so echo 1 is corrected too and only the echo-COMMON offset (the "
+        "fit's intercept) is left for rigid motion correction. Without it, the raw "
+        "cumulative shifts are applied and echo 1 is the fixed reference.",
+    )
+    sc_group.add_argument(
+        "-shift_ordering",
+        "-shift-ordering",
+        dest="shift_ordering",
+        choices=["ascending", "descending", "unknown"],
+        default="unknown",
+        help="Partition view ordering. A known ordering fixes the sign of the drift "
+        "and halves the search — but over a timeseries respiration swings the frequency "
+        "BOTH ways, and a constrained range pins every volume that wanted the other sign "
+        "at exactly zero. Leave this at 'unknown' unless you know the drift is "
+        "one-directional.",
+    )
+    sc_group.add_argument(
+        "-shift_max",
+        "-shift-max",
+        dest="shift_max",
+        type=float,
+        default=5.0,
+        help="Shift search half-range in voxels.",
+    )
+    sc_group.add_argument(
+        "-corr_extent",
+        "-corr-extent",
+        dest="corr_extent",
+        choices=["full", "inner_half"],
+        default="full",
+        help="Which voxels the inter-echo correlation sees. 'full' uses the whole "
+        "volume, tapering only the outermost few partitions a trial shift fills with "
+        "replicated content; 'inner_half' is the reference script's central-half crop "
+        "(which assumes the anatomy is centred on the partition axis).",
+    )
+    sc_group.add_argument(
+        "-shift_weight",
+        "-shift-weight",
+        dest="shift_weight",
+        choices=["none", "signal"],
+        default="none",
+        help="Voxel weighting for the correlation. 'none' is a plain Pearson r over "
+        "the whole volume and is enough here because the patch IS the volume; "
+        "'signal' softly weights by mean echo-1 intensity.",
+    )
+    sc_group.add_argument(
+        "-save_shifts",
+        "-save-shifts",
+        dest="save_shifts",
+        default=None,
+        help="Stem for the -me_3depi shift/QC tables: {stem}_shifts_xcorr.1D, "
+        "_shifts_applied.1D, _corr.1D and (with -echo_times) _te_fit.1D.",
+    )
+
     # --- Output files ---
     out_group = parser.add_argument_group("Output files")
     out_group.add_argument("-1Dfile", default=None, help="Save 6-column motion parameters (.1D)")
     out_group.add_argument("-1Dmatrix_save", default=None, help="Save affine matrices (.aff12.1D)")
+    out_group.add_argument(
+        "-1Dfile_shiftcorr",
+        "-1Dfile-shiftcorr",
+        dest="onedfile_shiftcorr",
+        default=None,
+        help="-me_3depi: save the TOTAL per-echo motion parameters — rigid motion "
+        "WITH that echo's partition-axis shift folded in — one eN_ prefixed 6-column "
+        ".1D per echo. Unlike -1Dfile (one shared rigid pose) these differ across "
+        "echoes, which is the whole point.",
+    )
+    out_group.add_argument(
+        "-1Dmatrix_shiftcorr",
+        "-1Dmatrix-shiftcorr",
+        dest="onedmatrix_shiftcorr",
+        default=None,
+        help="-me_3depi: the same total per-echo transforms as affine matrices, one "
+        "eN_ prefixed .aff12.1D per echo. These are exactly the matrices the "
+        "resampler used.",
+    )
     out_group.add_argument(
         "-dfile",
         default=None,
@@ -527,7 +652,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print VRAM usage vs. prediction after registration and resampling loops",
     )
 
-    args = parser.parse_args(argv)
+    # `-axis -k` looks like an option flag to argparse; rewrite the axis token.
+    if argv is None:
+        argv = sys.argv[1:]
+    args = parser.parse_args(normalize_axis_argv(list(argv), {"-axis"}))
     return args
 
 
@@ -584,18 +712,30 @@ def _load_trimmed(path: str, skip_first: int, skip_last: int, verb: int):
     return data, header_info
 
 
-def _load_echo_mean(input_files: list[str], skip_first: int, skip_last: int, verb: int):
+def _load_echo_mean(
+    input_files: list[str],
+    skip_first: int,
+    skip_last: int,
+    verb: int,
+    est=None,
+    axis: int | None = None,
+):
     """Per-timepoint mean across echoes, accumulated one echo at a time.
 
     Loads echoes sequentially and sums in place so peak memory stays at roughly
     two 4D volumes rather than N — the running accumulator plus the current echo.
+    With an ``est`` from -me_3depi, each echo is shift-corrected BEFORE it enters
+    the sum: averaging echoes that sit at different partition offsets would blur
+    the very structure the rigid estimate needs.
     """
     if verb >= 1:
         print(f"Building reg series: mean of {len(input_files)} echoes")
     acc = None
     header_info = None
-    for path in input_files:
+    for i, path in enumerate(input_files):
         echo, hdr = _load_trimmed(path, skip_first, skip_last, verb)
+        if est is not None:
+            echo = apply_shift(echo, est.applied[:, i], axis)
         if acc is None:
             acc = echo.float()
             header_info = hdr
@@ -876,6 +1016,9 @@ def _validate_run_args(args: argparse.Namespace) -> None:
             "maxdisp1D",
             "iterfile",
             "save_weight",
+            "save_shifts",
+            "onedfile_shiftcorr",
+            "onedmatrix_shiftcorr",
         )
     ) or _want_qc(args)
     if not _any_output:
@@ -887,6 +1030,8 @@ def _validate_run_args(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    _validate_shiftcorr_args(args)
+
     # The QC files are named after -prefix; require it when requested.
     if _want_qc(args) and args.prefix is None:
         print(
@@ -895,6 +1040,127 @@ def _validate_run_args(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _validate_shiftcorr_args(args: argparse.Namespace) -> None:
+    """Validate the -me_3depi request (and the flags that only mean anything with it)."""
+    dependent = {
+        "save_shifts": "-save_shifts",
+        "onedfile_shiftcorr": "-1Dfile_shiftcorr",
+        "onedmatrix_shiftcorr": "-1Dmatrix_shiftcorr",
+        "echo_times": "-echo_times",
+    }
+    if not args.me_3depi:
+        for name, flag in dependent.items():
+            if getattr(args, name, None) is not None:
+                print(f"Error: {flag} only applies with -me_3depi.", file=sys.stderr)
+                sys.exit(1)
+        return
+
+    n_echoes = len(args.input_file or [])
+    if n_echoes < 2:
+        print(
+            "Error: -me_3depi estimates the shift BETWEEN echoes; give at least two "
+            "-input files (one per echo).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.axis is None:
+        print("Error: -me_3depi requires -axis (the partition direction).", file=sys.stderr)
+        sys.exit(1)
+    try:
+        resolve_pe_axis(args.axis)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.echo_times is not None and len(args.echo_times) != n_echoes:
+        print(
+            f"Error: -echo_times has {len(args.echo_times)} values but -input has "
+            f"{n_echoes} echoes.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if args.tpattern is not None:
+        print("Error: -me_3depi and -tpattern cannot be combined yet.", file=sys.stderr)
+        sys.exit(1)
+    if args.shift_max <= 0:
+        print("Error: -shift_max must be positive.", file=sys.stderr)
+        sys.exit(1)
+
+
+def _estimate_shiftcorr(args, input_files: list[str], device: torch.device, verb: int):
+    """Run the -me_3depi inter-echo estimate, streaming one echo at a time.
+
+    Only two echoes are ever resident: the estimator consumes the generator
+    lazily, so a 5-echo series costs the same RAM as a 2-echo one.
+    """
+    axis = resolve_pe_axis(args.axis)
+    tes = np.asarray(args.echo_times, dtype=np.float64) if args.echo_times else None
+    if verb >= 1:
+        mode = "TE regression through the origin" if tes is not None else "raw cumulative"
+        print(
+            f"-me_3depi: partition axis {args.axis} (voxel axis {axis}), "
+            f"{args.shift_ordering} ordering, {mode}"
+        )
+
+    def _echo_stream():
+        for path in input_files:
+            data, _ = _load_trimmed(path, args.skip_first, args.skip_last, verb)
+            yield data
+
+    est = estimate_shifts(
+        _echo_stream(),
+        axis,
+        tes=tes,
+        ordering=args.shift_ordering,
+        max_shift=args.shift_max,
+        weight=None if args.shift_weight == "none" else args.shift_weight,
+        extent=args.corr_extent,
+        device=device,
+        verb=verb,
+    )
+    if args.save_shifts is not None:
+        save_shift_tables(est, args.save_shifts, tes, verb)
+    return est, axis
+
+
+def _save_shiftcorr_params(args, result, est, axis: int, header_info, verb: int) -> None:
+    """Write the per-echo TOTAL transforms (rigid motion + that echo's shift).
+
+    -1Dfile / -1Dmatrix_save report the one rigid pose shared by every echo;
+    these report what each echo's voxels actually did, which is the shared pose
+    plus a translation that differs per echo and per volume.
+    """
+    if args.onedfile_shiftcorr is None and args.onedmatrix_shiftcorr is None:
+        return
+    affine = header_info["affine"] if header_info else np.eye(4)
+    for i in range(est.applied.shape[1]):
+        tag = f"e{i + 1}_"
+        mats = fold_shift_into_matrices(result.matrices_vox, est.applied[:, i], axis)
+        dicom = np.stack(
+            [voxel_matrix_to_dicom(mats[t], affine, affine).numpy() for t in range(mats.shape[0])]
+        )
+        if args.onedmatrix_shiftcorr is not None:
+            path = _sibling(args.onedmatrix_shiftcorr, tag)
+            save_matrix_1D(
+                dicom,
+                path,
+                header=f"ffs_moco echo {i + 1} matrices, motion + -me_3depi shift "
+                "(DICOM-to-DICOM, row-by-row):",
+            )
+            if verb >= 1:
+                print(f"Saved echo {i + 1} matrices: {path}")
+        if args.onedfile_shiftcorr is not None:
+            params = np.stack(
+                [
+                    matrix_to_params(torch.from_numpy(dicom[t]))[:6].numpy()
+                    for t in range(len(dicom))
+                ]
+            )
+            path = _sibling(args.onedfile_shiftcorr, tag)
+            save_moco_1D(params, path)
+            if verb >= 1:
+                print(f"Saved echo {i + 1} params: {path}")
 
 
 def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> None:
@@ -983,6 +1249,15 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         val = getattr(args, name, None)
         if val is not None:
             outs.append(val)
+
+    # -me_3depi: the QC tables, plus the per-echo total-transform files.
+    if args.me_3depi:
+        if args.save_shifts is not None:
+            outs.extend(shift_table_paths(args.save_shifts, args.echo_times is not None))
+        for name in ("onedfile_shiftcorr", "onedmatrix_shiftcorr"):
+            val = getattr(args, name, None)
+            if val is not None:
+                outs.extend(_sibling(val, tag) for tag in echo_tags)
 
     # Reweight weight/patch maps — only written when reweight actually runs.
     if args.save_weight is not None and args.reweight:
@@ -1125,13 +1400,23 @@ def _run_multi_echo(
 
     base_vol, base_index = _parse_base(args, verb)
 
+    # -me_3depi: take the TE-dependent partition shift out FIRST, so the rigid
+    # estimate below sees geometry that is genuinely common to all echoes.
+    est = shift_axis = None
+    if args.me_3depi:
+        est, shift_axis = _estimate_shiftcorr(args, input_files, device, verb)
+
     # Build the estimation source (one echo, or the per-timepoint mean).
     if reg_mean:
-        reg_data, header_info = _load_echo_mean(input_files, args.skip_first, args.skip_last, verb)
+        reg_data, header_info = _load_echo_mean(
+            input_files, args.skip_first, args.skip_last, verb, est=est, axis=shift_axis
+        )
     else:
         reg_data, header_info = _load_trimmed(
             input_files[reg_index], args.skip_first, args.skip_last, verb
         )
+        if est is not None:
+            reg_data = apply_shift(reg_data, est.applied[:, reg_index], shift_axis, device=device)
 
     # Estimate once — matrices only. Each echo (including the reg echo) is
     # resampled separately below from its own data, so skip Pass 2 here.
@@ -1140,6 +1425,9 @@ def _run_multi_echo(
     result = moco(reg_data, config, header_info=header_info, base_vol=base_vol)
     if verb >= 1:
         print(f"Total registration: {time.time() - t1:.2f}s")
+    # The dfile's post-alignment RMS must be measured against the SHIFT-CORRECTED
+    # base, since that is the geometry the matrices were estimated in.
+    reg_base_shifted = reg_data[base_index].clone() if est is not None else None
     del reg_data  # free the estimation series before loading echoes for resampling
 
     write_series = args.prefix is not None
@@ -1148,24 +1436,38 @@ def _run_multi_echo(
 
     # Resample each echo with the shared matrices and write eN_ outputs.
     if write_series or write_reductions or want_qc:
-        base_copy_idx = base_index if base_vol is None else -1
+        # Normally the base volume is copied through verbatim to spare it an
+        # interpolation. With -me_3depi it must NOT be: its own shift correction
+        # is nonzero and lives in the matrix we are about to fold.
+        base_copy_idx = -1 if est is not None else (base_index if base_vol is None else -1)
         dtype = torch.float32
         for i, path in enumerate(input_files):
             echo_num = i + 1
             echo, echo_hdr = _load_trimmed(path, args.skip_first, args.skip_last, verb)
 
+            # Fold this echo's partition shift into the shared rigid matrices, so
+            # motion and shift reach the output through ONE interpolation.
+            matrices = result.matrices_vox
+            if est is not None:
+                matrices = fold_shift_into_matrices(matrices, est.applied[:, i], shift_axis)
+
             # Post-alignment RMS is only wired into the dfile, which reports the
             # reg echo's motion — compute it just for that echo when -dfile is set.
             base_est = None
             if not reg_mean and i == reg_index and args.dfile is not None:
-                bsrc = base_vol if base_vol is not None else echo[base_index]
+                if base_vol is not None:
+                    bsrc = base_vol
+                elif reg_base_shifted is not None:
+                    bsrc = reg_base_shifted
+                else:
+                    bsrc = echo[base_index]
                 base_est = _blur_volume(bsrc.to(device=device, dtype=dtype), args.blur)
 
             if verb >= 1:
                 print(f"Resampling echo {echo_num}: {path}")
             aligned, rms_after = resample_timeseries(
                 echo,
-                result.matrices_vox,
+                matrices,
                 config,
                 device,
                 base_copy_idx=base_copy_idx,
@@ -1205,6 +1507,8 @@ def _run_multi_echo(
                 torch.cuda.empty_cache()
 
     _save_estimation_outputs(args, result, header_info, verb)
+    if est is not None:
+        _save_shiftcorr_params(args, result, est, shift_axis, header_info, verb)
 
 
 if __name__ == "__main__":
