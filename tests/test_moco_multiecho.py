@@ -214,3 +214,96 @@ def test_skip_first_last_trims_volumes(tmp_path):
 
     aligned, _ = load_image(str(out))
     assert aligned.shape[0] == 6 - 1 - 2  # 3 volumes survive
+
+
+# ---------------------------------------------------------------------------
+# -me_3depi: TE-dependent partition-axis shift, folded into the moco matrices
+# ---------------------------------------------------------------------------
+
+
+def test_me_3depi_removes_the_te_dependent_shift(tmp_path):
+    """Echoes displaced by m*TE along z must come out co-registered in z.
+
+    The regression test for the whole -me_3depi chain: estimate, TE fit through
+    the origin, fold into each echo's matrix, one resample. A sign error anywhere
+    would double the inter-echo shift instead of removing it.
+    """
+    from fastfuncstuff.processing.shiftcorr import apply_shift, estimate_pair_shift
+
+    tes = [7.6, 21.7, 35.8]
+    slope = -0.012  # voxels per ms of TE
+    base = _shifted_series(_blob(shape=(24, 20, 20)), n_vols=3)
+
+    paths = []
+    for i, te in enumerate(tes):
+        p = tmp_path / f"e{i + 1}.nii.gz"
+        _write(p, apply_shift(base, np.full(base.shape[0], slope * te), axis=2))
+        paths.append(str(p))
+
+    prefix = tmp_path / "mc.nii.gz"
+    main(
+        [
+            "-input",
+            *paths,
+            "-reg_echo",
+            "1",
+            "-prefix",
+            str(prefix),
+            "-me_3depi",
+            "-axis",
+            "z",
+            "-echo_times",
+            *[str(t) for t in tes],
+            "-save_shifts",
+            str(tmp_path / "qc"),
+            "-1Dfile_shiftcorr",
+            str(tmp_path / "motion_sc.1D"),
+            "-1Dmatrix_shiftcorr",
+            str(tmp_path / "mat_sc.aff12.1D"),
+            "-device",
+            "cpu",
+            "-verb",
+            "0",
+        ]
+    )
+
+    # The fitted slope is the correction, i.e. minus the displacement we applied.
+    te_fit = np.loadtxt(tmp_path / "qc_te_fit.1D")
+    assert np.allclose(te_fit[:, 0], -slope, atol=2e-3)
+
+    # Every echo now sits at the same partition offset.
+    outs = [load_image(str(tmp_path / f"e{i + 1}_mc.nii.gz"))[0] for i in range(3)]
+    for i in range(1, 3):
+        resid, _ = estimate_pair_shift(outs[i - 1], outs[i], axis=2, max_shift=2.0)
+        assert np.abs(resid).max() < 0.05, f"echo {i + 1} still offset by {resid}"
+
+    # Per-echo total transforms exist and genuinely differ across echoes.
+    p1 = np.loadtxt(tmp_path / "e1_motion_sc.1D")
+    p3 = np.loadtxt(tmp_path / "e3_motion_sc.1D")
+    assert np.abs(p1 - p3).max() > 1e-3
+    for i in range(3):
+        assert (tmp_path / f"e{i + 1}_mat_sc.aff12.1D").exists()
+
+
+def test_me_3depi_rejects_a_single_echo(tmp_path):
+    """The shift is measured BETWEEN echoes; one input cannot supply it."""
+    import pytest
+
+    e1 = tmp_path / "e1.nii.gz"
+    _write(e1, _shifted_series(_blob()))
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "-input",
+                str(e1),
+                "-prefix",
+                str(tmp_path / "mc.nii.gz"),
+                "-me_3depi",
+                "-axis",
+                "z",
+                "-device",
+                "cpu",
+                "-verb",
+                "0",
+            ]
+        )
