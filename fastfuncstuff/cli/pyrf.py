@@ -49,6 +49,7 @@ from fastfuncstuff.cli_utils import (
     parse_input_files,
     parse_prefix,
 )
+from fastfuncstuff.denoise.sequential import extract_noise_pcs_per_run
 from fastfuncstuff.design.hrf import (
     get_hrf_library,
     load_canonical_hrf_basic,
@@ -66,6 +67,7 @@ from fastfuncstuff.design.prf import (
     refine_prf_hrf_window,
     refine_prf_supergrid,
     screen_voxels_ridge,
+    select_noise_pc_count,
     summarize_hrf_selection,
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
@@ -138,6 +140,14 @@ CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on your
                   but it is NOT meaningfully faster: cost is dominated by the
                   per-voxel Gaussian over the aperture, which every mode pays.
   -mask           cost is linear in voxels, so masking is a large lever.
+  -denoise        data-derived noise components, GLMdenoise style, with the
+                  noise pool taken from the screening pass rather than an
+                  anatomical guess. How many components to keep is chosen by
+                  cross-validation ON THE SUPER-GRID FIT -- seconds per
+                  candidate count, where refining the full model at every count
+                  and fold would be tens of fits -- and zero is a legitimate
+                  answer when denoising does not earn its degrees of freedom.
+                  Needs 2+ runs. -save_denoise writes the sweep figure.
   -screen_top     larger still, and functional rather than anatomical: a linear
                   ridge pRF is fitted to every voxel in seconds, and only the
                   best-screening ones get the CSS refinement. Whole brain,
@@ -521,6 +531,58 @@ def create_parser() -> argparse.ArgumentParser:
         help="Write the screening R2 map to {prefix}_screen -- a functionally derived mask",
     )
     screening.add_argument(
+        "-denoise",
+        action="store_true",
+        help=(
+            "Project data-derived noise components out of the fit (GLMdenoise "
+            "style). The noise pool is the voxels the screening pass says carry no "
+            "stimulus response at all; components are taken per run, and how many "
+            "to keep is chosen by cross-validation -- including the option of zero, "
+            "when denoising does not earn its degrees of freedom. Needs 2+ runs"
+        ),
+    )
+    screening.add_argument(
+        "-max-pcs",
+        "-max_pcs",
+        dest="max_pcs",
+        type=int,
+        default=10,
+        help="Largest number of noise components to consider",
+    )
+    screening.add_argument(
+        "-noise-pool-r2",
+        "-noise_pool_r2",
+        dest="noise_pool_r2",
+        type=float,
+        default=0.0,
+        help=(
+            "Screening R2 below which a voxel joins the noise pool. The default 0 "
+            "takes only voxels the linear pRF model fits WORSE than their own mean, "
+            "which is a strong statement that there is no stimulus response to "
+            "leak into the components"
+        ),
+    )
+    screening.add_argument(
+        "-denoise-tolerance",
+        "-denoise_tolerance",
+        dest="denoise_tolerance",
+        type=float,
+        default=0.05,
+        help=(
+            "Keep the fewest components within this fraction of the best "
+            "cross-validated improvement, rather than the noisy argmax"
+        ),
+    )
+    screening.add_argument(
+        "-save-denoise",
+        "-save_denoise",
+        action="store_true",
+        help=(
+            "Write the noise-pool mask to {prefix}_noisepool, the components to "
+            "{prefix}_noisepcs.1D, and the component-count sweep to {prefix}_denoise.png"
+        ),
+    )
+    screening.add_argument(
         "-screen-tiles",
         "-screen_tiles",
         dest="screen_tiles",
@@ -750,6 +812,179 @@ def _expand_fit(fit: PRFRefinedFit, keep: torch.Tensor, n_voxels: int) -> PRFRef
     )
 
 
+def _add_noise_components(
+    args: argparse.Namespace,
+    data: torch.Tensor,
+    screen_scores: torch.Tensor,
+    invalid_voxels: torch.Tensor,
+    stimulus_runs: list[torch.Tensor],
+    stimulus_shape: tuple[int, int],
+    grid,
+    hrf_library: torch.Tensor,
+    loaded,
+    nuisance_per_run: list[torch.Tensor],
+    device: torch.device,
+) -> tuple[list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
+    """Pick a noise-component count by cross-validation and fold it into the nuisance.
+
+    The screening pass has already said which voxels carry a stimulus response,
+    so the pool is simply the ones that carry none -- by default the ones the
+    linear pRF fits worse than their own mean. Components are extracted per run
+    (``extract_noise_pcs_per_run``), which is what keeps this honest under
+    cross-validation: a held-out run's regressors come from that run's own
+    noise-pool voxels, never from the training runs and never from the voxel
+    being scored.
+
+    How many to keep is decided on the SUPER-GRID fit rather than the refined
+    one. Refining the full model at every candidate count and every fold is tens
+    of fits; the grid is about a second, and the question here is only which
+    nuisance model predicts held-out data better, which does not need the
+    refinement. The count is then used for the one real fit.
+    """
+    verbose = args.verb > 0
+    pool = (screen_scores < args.noise_pool_r2) & torch.isfinite(screen_scores) & ~invalid_voxels
+    if int(pool.sum()) < 100:
+        raise ValueError(
+            f"noise pool has only {int(pool.sum())} voxels at -noise_pool_r2 "
+            f"{args.noise_pool_r2:g}; raise the threshold"
+        )
+    # Score the sweep on the strongest responders, EXCLUDING the noise pool. A
+    # voxel that helped build the components cannot also judge them: with a tight
+    # mask the two sets otherwise overlap, and denoising is then scored partly on
+    # its own input. A bounded set also keeps the sweep cheap.
+    rankable = torch.where(
+        invalid_voxels | pool, torch.full_like(screen_scores, -torch.inf), screen_scores
+    )
+    n_criteria = min(int(torch.isfinite(rankable).sum()), 3000)
+    if n_criteria < 10:
+        raise ValueError(
+            "fewer than 10 voxels sit outside the noise pool; -noise_pool_r2 is too high"
+        )
+    criteria = torch.topk(rankable, n_criteria).indices
+    if verbose:
+        print(
+            f"Denoising: {int(pool.sum()):,} noise-pool voxels (screen R2 < "
+            f"{args.noise_pool_r2:g}), scored on {n_criteria:,} responders"
+        )
+
+    components = extract_noise_pcs_per_run(
+        data,
+        list(loaded.run_starts),
+        pool,
+        max_components=args.max_pcs,
+        nuisance_per_run=nuisance_per_run,
+        device=device,
+    )
+    assert isinstance(components, list)  # return_loadings=False
+    available = min(args.max_pcs, min(block.shape[1] for block in components))
+    criteria_data = data[criteria]
+
+    r2_by_count: list[torch.Tensor] = []
+    counts = range(available + 1)
+    if verbose:
+        from tqdm.auto import tqdm
+
+        counts = tqdm(counts, desc="pRF noise-PC sweep", leave=True)
+    for n_components in counts:
+        trial_nuisance = _append_components(nuisance_per_run, components, n_components)
+        fit = fit_prf_loro(
+            criteria_data,
+            stimulus_runs,
+            stimulus_shape,
+            grid,
+            hrf_library,
+            loaded.run_starts,
+            nuisance_per_run=trial_nuisance,
+            candidate_chunk_size=args.candidate_chunk,
+            voxel_chunk_size=n_criteria,
+            refine=False,
+            device=device,
+        )
+        r2_by_count.append(fit.r2.detach().cpu())
+
+    median_r2 = [float(values.median()) for values in r2_by_count]
+    chosen = select_noise_pc_count(median_r2, tolerance=args.denoise_tolerance)
+    if verbose:
+        curve = "  ".join(f"{n}:{value:.4f}" for n, value in enumerate(median_r2))
+        print(f"  held-out median R2 by component count: {curve}")
+        if chosen == 0:
+            print("  keeping 0 components: denoising did not improve held-out R2")
+        else:
+            print(
+                f"  keeping {chosen} components "
+                f"(+{median_r2[chosen] - median_r2[0]:.4f} held-out median R2)"
+            )
+    if args.save_denoise:
+        _plot_noise_sweep(
+            r2_by_count, chosen, f"{parse_prefix(args.prefix).stem}_denoise.png", n_criteria
+        )
+    kept = [block[:, :chosen] for block in components]
+    return _append_components(nuisance_per_run, components, chosen), pool, kept
+
+
+def _plot_noise_sweep(
+    r2_by_count: list[torch.Tensor], chosen: int, output_path: str, n_criteria: int
+) -> None:
+    """Plot held-out R2 against noise-component count, and the gain over none.
+
+    Two panels for the same reason ffs_denoise uses two: the absolute curve says
+    whether the fit is any good, and the paired difference from the undenoised
+    model -- same voxels, same folds -- says whether denoising is what did it.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    counts = list(range(len(r2_by_count)))
+    stacked = torch.stack(r2_by_count)
+    median = stacked.median(dim=1).values.numpy()
+    low = stacked.quantile(0.25, dim=1).numpy()
+    high = stacked.quantile(0.75, dim=1).numpy()
+    delta = stacked - stacked[0]
+
+    figure, (axis, axis_delta) = plt.subplots(1, 2, figsize=(11, 4.2))
+    line = axis.plot(counts, median, marker="o")[0]
+    axis.fill_between(counts, low, high, alpha=0.15, color=line.get_color())
+    axis.axvline(chosen, color="crimson", lw=1.2, ls="--", label=f"kept {chosen}")
+    axis.set_xlabel("Noise components projected out")
+    axis.set_ylabel(f"Median held-out R2 ({n_criteria:,} responders)")
+    axis.set_title("Cross-validated fit vs component count")
+    axis.legend(fontsize=8)
+    axis.grid(alpha=0.3)
+
+    axis_delta.plot(counts, delta.median(dim=1).values.numpy(), marker="o", color="tab:green")
+    axis_delta.fill_between(
+        counts,
+        delta.quantile(0.25, dim=1).numpy(),
+        delta.quantile(0.75, dim=1).numpy(),
+        alpha=0.15,
+        color="tab:green",
+    )
+    axis_delta.axhline(0, color="0.5", lw=1.0)
+    axis_delta.axvline(chosen, color="crimson", lw=1.2, ls="--")
+    axis_delta.set_xlabel("Noise components projected out")
+    axis_delta.set_ylabel("Change in held-out R2")
+    axis_delta.set_title("Improvement over no denoising")
+    axis_delta.grid(alpha=0.3)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=120)
+    plt.close(figure)
+
+
+def _append_components(
+    nuisance_per_run: list[torch.Tensor], components: list[torch.Tensor], n_components: int
+) -> list[torch.Tensor]:
+    """Concatenate the first ``n_components`` noise PCs onto each run's nuisance block."""
+    if n_components < 1:
+        return nuisance_per_run
+    return [
+        torch.cat([block, run_components[:, :n_components].to(block.device, block.dtype)], dim=1)
+        for block, run_components in zip(nuisance_per_run, components, strict=True)
+    ]
+
+
 def _invalid_voxels(data: torch.Tensor, run_starts: list[int]) -> torch.Tensor:
     """Match analyzePRF: reject non-finite voxels and voxels zero in any run."""
     invalid = ~torch.isfinite(data).all(dim=1)
@@ -893,6 +1128,12 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.stimulus is not None and len(args.stimulus) != len(input_files):
         parser.error("-stimulus must provide exactly one aperture source per -input run")
+    if args.denoise and len(input_files) < 2:
+        parser.error("-denoise needs at least two runs to cross-validate the component count")
+    if args.max_pcs < 1:
+        parser.error("-max_pcs must be positive")
+    if not 0 <= args.denoise_tolerance < 1:
+        parser.error("-denoise_tolerance must be in [0, 1)")
     if args.screen is not None and args.screen_top is not None:
         parser.error("Specify at most one of -screen and -screen_top")
     if args.screen_top is not None and not 0 < args.screen_top <= 1:
@@ -990,7 +1231,9 @@ def main(argv: list[str] | None = None) -> int:
 
     screen_scores = None
     keep_index = None
-    if args.screen is not None or args.screen_top is not None:
+    noise_pool = None
+    noise_components: list[torch.Tensor] = []
+    if args.screen is not None or args.screen_top is not None or args.denoise:
         screen_scores = screen_voxels_ridge(
             analysis_data,
             stimulus_runs,
@@ -1011,6 +1254,33 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             verbose=args.verb > 0,
         )
+    if args.denoise:
+        grid_for_sweep = make_analyzeprf_grid(
+            stimulus_shape,
+            exponents=(1.0,) if args.model_mode == 3 else (0.5, 0.25, 0.125),
+            n_angles=args.grid_angles,
+            angle_mode=args.grid_angle_mode,
+            sigma_mode=args.grid_sigma_mode,
+            sigma_steps_per_octave=args.grid_sigma_steps,
+            eccentricity_steps=args.grid_ecc_steps,
+            device=device,
+        )
+        nuisance_per_run, noise_pool, noise_components = _add_noise_components(
+            args,
+            analysis_data,
+            screen_scores,
+            invalid_voxels,
+            stimulus_runs,
+            stimulus_shape,
+            grid_for_sweep,
+            hrf_library,
+            loaded,
+            nuisance_per_run,
+            device,
+        )
+
+    if args.screen is not None or args.screen_top is not None:
+        assert screen_scores is not None
         # Rank only over voxels that could be fit at all, so the fraction is a
         # fraction of real data rather than of background.
         rankable = torch.where(
@@ -1206,6 +1476,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Wrote fixed-canonical-HRF results: {canonical_path}")
     elif args.save_canonical and args.verb and args.hrf_mode != "canonical":
         print("-save_canonical ignored: needs -hrf_select refine")
+    if args.save_denoise and noise_pool is not None:
+        pool_path = f"{prefix_info.stem}_noisepool{prefix_info.nifti_ext}"
+        _save_voxel_matrix(
+            noise_pool.to(torch.float32).unsqueeze(1), pool_path, loaded, ["noise_pool"], None
+        )
+        if args.verb:
+            print(f"Wrote noise pool: {pool_path}")
+        if noise_components and noise_components[0].shape[1] > 0:
+            components_path = f"{prefix_info.stem}_noisepcs.1D"
+            np.savetxt(
+                components_path,
+                torch.cat(noise_components, dim=0).cpu().numpy(),
+                fmt="%.8g",
+            )
+            if args.verb:
+                print(f"Wrote noise components: {components_path}")
+    elif args.save_denoise and args.verb:
+        print("-save_denoise ignored: needs -denoise")
     if args.save_screen and screen_scores is not None:
         _save_voxel_matrix(
             screen_scores.unsqueeze(1),

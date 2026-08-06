@@ -917,3 +917,69 @@ def test_screening_rejects_constant_voxels_instead_of_ranking_them_first():
 
     assert torch.isneginf(scores[2:]).all()
     assert torch.isfinite(scores[:2]).all()
+
+
+def test_noise_pc_count_prefers_the_fewest_within_tolerance():
+    """The rule takes the knee of the curve, not its noisy argmax."""
+    from fastfuncstuff.design.prf import select_noise_pc_count
+
+    # Big jump by 2, then a negligible drift upward.
+    curve = [0.30, 0.36, 0.445, 0.447, 0.448, 0.449]
+    assert select_noise_pc_count(curve, tolerance=0.05) == 2
+    # A stricter tolerance is allowed to keep paying for the tail.
+    assert select_noise_pc_count(curve, tolerance=0.0) == 5
+
+
+def test_noise_pc_count_returns_zero_when_denoising_does_not_help():
+    """Components that never beat the undenoised fit must not be kept."""
+    from fastfuncstuff.design.prf import select_noise_pc_count
+
+    assert select_noise_pc_count([0.50, 0.49, 0.47, 0.44]) == 0
+    assert select_noise_pc_count([0.50]) == 0
+
+
+def test_appending_components_extends_every_run_block():
+    """Noise PCs join the per-run nuisance, keeping the block-diagonal structure."""
+    from fastfuncstuff.cli.pyrf import _append_components
+
+    nuisance = [torch.ones(10, 3), torch.ones(8, 3)]
+    components = [torch.randn(10, 5), torch.randn(8, 5)]
+
+    unchanged = _append_components(nuisance, components, 0)
+    assert [block.shape for block in unchanged] == [(10, 3), (8, 3)]
+
+    extended = _append_components(nuisance, components, 2)
+    assert [block.shape for block in extended] == [(10, 5), (8, 5)]
+    torch.testing.assert_close(extended[0][:, 3:], components[0][:, :2])
+    torch.testing.assert_close(extended[1][:, 3:], components[1][:, :2])
+
+
+def test_grid_only_cross_validation_skips_refinement():
+    """refine=False must score the seeds, which is what the noise sweep uses."""
+    data, stimulus_runs, parameters, hrf = _synthetic_css_data()
+    common = dict(candidate_chunk_size=1, voxel_chunk_size=1)
+
+    seeds_only = fit_prf_loro(
+        data,
+        stimulus_runs,
+        (5, 5),
+        PRFGrid(parameters),
+        hrf.unsqueeze(0),
+        [0, 9],
+        refine=False,
+        **common,
+    )
+    refined = fit_prf_loro(
+        data,
+        stimulus_runs,
+        (5, 5),
+        PRFGrid(parameters),
+        hrf.unsqueeze(0),
+        [0, 9],
+        refinement_config=PRFRefinementConfig(max_iter=10),
+        **common,
+    )
+
+    # The grid here holds the true parameters, so seeds alone already predict well.
+    assert seeds_only.r2.item() > 0.99
+    assert refined.r2.item() > 0.99

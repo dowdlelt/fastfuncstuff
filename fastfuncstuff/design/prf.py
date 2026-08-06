@@ -1279,6 +1279,7 @@ def fit_prf_loro(
     refinement_config: PRFRefinementConfig = PRFRefinementConfig(),
     hrf_mode: str = "grid",
     fixed_hrf_index: torch.Tensor | None = None,
+    refine: bool = True,
     verbose: bool = False,
 ) -> PRFCrossValidationFit:
     """Compute leave-one-run-out R2 with fold-local pRF fitting.
@@ -1304,6 +1305,8 @@ def fit_prf_loro(
         Refine under every HRF inside each fold. Leak-free *and* consistent, at
         roughly ``n_hrfs`` times the cost.
     """
+    if not refine and hrf_mode == "refine":
+        raise ValueError("hrf_mode='refine' has no meaning when refine=False")
     if hrf_mode not in ("grid", "fixed", "refine"):
         raise ValueError(f"hrf_mode must be 'grid', 'fixed', or 'refine', got {hrf_mode!r}")
     if hrf_mode == "fixed" and fixed_hrf_index is None:
@@ -1365,7 +1368,13 @@ def fit_prf_loro(
             device=device,
             config=refinement_config,
         )
-        if hrf_mode == "refine" and hrf_library.shape[0] > 1:
+        if not refine:
+            # Seeds only. The super-grid is ~1 s where refinement is minutes, and
+            # for comparing nuisance models against each other -- which noise
+            # regressors are worth keeping -- the seeds move together with the
+            # refined fit. Not a substitute for the reported fit.
+            training_fit = grid_seeds_as_fit(training_grid)
+        elif hrf_mode == "refine" and hrf_library.shape[0] > 1:
             training_fit, _, _ = refine_prf_all_hrfs(
                 training_data,
                 training_stimuli,
@@ -1735,3 +1744,37 @@ def screen_voxels_ridge(
         1.0 - residual_ss / total_ss.clamp_min(eps),
         torch.full_like(total_ss, -torch.inf),
     )
+
+
+def select_noise_pc_count(
+    median_r2_by_count: Sequence[float],
+    tolerance: float = 0.05,
+) -> int:
+    """Choose how many noise PCs to keep, GLMdenoise's conservative rule.
+
+    ``median_r2_by_count[n]`` is the cross-validated median R2 over responsive
+    voxels when ``n`` components are projected out, so entry 0 is the undenoised
+    model. Rather than the argmax -- that curve is noisy, and its peak sits at
+    more components than the data supports -- take the FEWEST components that
+    reach within ``tolerance`` of the best improvement over the undenoised fit.
+
+    Returns 0 when no count improves on the undenoised model, which is the
+    answer whenever denoising is not worth its degrees of freedom. That case is
+    the point of running the sweep: a design with strong stimulus-locked signal
+    can genuinely want zero components, and taking the argmax would hide it.
+
+    Kay, Rokem, Winawer, Dougherty & Wandell (2013), 'GLMdenoise: a fast,
+    automated technique for denoising task-based fMRI data', Front Neurosci 7:247.
+    """
+    if not median_r2_by_count:
+        raise ValueError("median_r2_by_count must not be empty")
+    if not 0 <= tolerance < 1:
+        raise ValueError(f"tolerance must be in [0, 1), got {tolerance}")
+
+    baseline = median_r2_by_count[0]
+    improvements = [value - baseline for value in median_r2_by_count]
+    best = max(improvements)
+    if best <= 0:
+        return 0
+    target = (1.0 - tolerance) * best
+    return next(count for count, gain in enumerate(improvements) if gain >= target)
