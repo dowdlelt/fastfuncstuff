@@ -22,8 +22,10 @@ from fastfuncstuff.stats.variance_partition import (
     _trialspace_partials,
     build_factor_design,
     build_repeat_folds,
+    build_run_exchange,
     cell_labels,
     derive_repeat_index,
+    detect_run_nesting,
     partition_variance,
     permutation_test,
 )
@@ -291,9 +293,15 @@ def test_rank_is_undetermined_not_zero_below_the_snr_floor():
     # Swamped voxels: flagged undetermined, never silently called additive.
     assert (res.rank_e[n_each:] == -1).float().mean() > 0.9
     assert (res.rank_e[n_each:] == 0).float().mean() < 0.05
-    # The raw argmax is still exposed, and it is what would have produced the artifact.
+    # The unmasked selection is still exposed, and it is what would have produced the
+    # artifact: the great majority of these voxels read as a confident "additive" 0.
+    # It is not *all* of them, because the rank sweep carries the same per-band shrinkage
+    # as the reported models -- so a real rank-1 interaction occasionally survives even at
+    # this SNR. That is sensitivity, not invention: these voxels genuinely have a rank-1
+    # interaction. The invention case is covered by test_additive_only_data_selects_rank_zero
+    # and test_low_snr_additive_truth_does_not_invent_rank.
     assert res.rank_e_raw is not None
-    assert (res.rank_e_raw[n_each:] == 0).float().mean() > 0.9
+    assert (res.rank_e_raw[n_each:] == 0).float().mean() > 0.8
     assert res.diagnostics["rank_undetermined_frac"] > 0.4
 
 
@@ -310,6 +318,116 @@ def test_additive_only_data_selects_rank_zero():
     assert res.rank_e.float().median() == 0
     assert res.interaction.median() < 0.02
     assert res.gammas["stim:task"].median() < 0.3
+
+
+def test_low_snr_additive_truth_does_not_invent_rank():
+    """The one-sided error property: misses are acceptable, inventions are not.
+
+    Bug of record: once the rank sweep was evaluated under the fitted per-band gammas,
+    voxels with no interaction had gamma_interaction shrink to 0, every rank predicted
+    identically, and the curve went flat to within float32 noise. A bare argmax over a flat
+    curve returned whatever the rounding favoured -- 8/20 additive voxels landed at rank
+    2-6 off improvements of 1e-5. The parsimony rule and the detection floor fix that.
+    """
+    rng = np.random.default_rng(31)
+    factors, rep, run = make_crossed_table()
+    n_vox = 120
+    a = centered(rng.normal(0, 1.0, size=(n_vox, N_STIM)), axis=1)
+    b = centered(rng.normal(0, 1.0, size=(n_vox, N_TASK)), axis=1)
+    for noise in (0.5, 2.0, 6.0):
+        betas = synth_betas(factors, a=a, b=b, noise=noise, seed=32)
+        res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+        invented = (res.rank_e > 0).float().mean()
+        assert invented == 0.0, f"noise={noise}: invented rank in {invented:.1%} of voxels"
+
+    # The detection floor carries this on its own wherever the SNR mask is switched off,
+    # up to the point where the mask is the guard that matters. Below ncsnr ~0.2 the two
+    # are not interchangeable, which is why the mask is on by default.
+    betas = synth_betas(factors, a=a, b=b, noise=2.0, seed=32)
+    unmasked = partition_variance(
+        betas, factors, repeat=rep, run=run, min_ncsnr_for_rank=0.0, verbose=False
+    )
+    assert (unmasked.rank_e > 0).float().mean() < 0.02
+
+
+def test_rank_curve_endpoint_is_the_full_model():
+    """The sweep and the reported models must be the same predictor family.
+
+    Evaluating the rank curve under different shrinkage than the models it is read against
+    made the curve systematically noisier than R2(M_full), which is the comparison a reader
+    makes by eye. Anchoring the top of the curve to M_full exactly removes that gap.
+    """
+    rng = np.random.default_rng(33)
+    factors, rep, run = make_crossed_table()
+    n_vox = 30
+    a = centered(rng.normal(0, 1.0, size=(n_vox, N_STIM)), axis=1)
+    b = centered(rng.normal(0, 1.0, size=(n_vox, N_TASK)), axis=1)
+    u = centered(rng.normal(0, 1.0, size=(n_vox, N_STIM)), axis=1)
+    v = centered(rng.normal(0, 1.0, size=(n_vox, N_TASK)), axis=1)
+    betas = synth_betas(
+        factors, a=a, b=b, e=0.9 * u[:, :, None] * v[:, None, :], noise=1.0, seed=34
+    )
+
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    assert res.rank_r2 is not None
+    torch.testing.assert_close(res.rank_r2[:, -1], res.r2["M_full"], atol=1e-4, rtol=0)
+
+
+def test_gain_alignment_separates_gain_from_reorganization():
+    """A multiplicative gain is rank 1 ALIGNED with the main effect; reorganisation is not.
+
+    m = mu + a_s*(1 + g_t) leaves the interaction a_s*g_t, whose left singular vector is
+    parallel to the stimulus main effect. A rank-1 interaction built from an unrelated
+    pattern has no such alignment. Both are "rank 1", so rank_E alone cannot tell them
+    apart -- this is the map that can.
+    """
+    rng = np.random.default_rng(35)
+    factors, rep, run = make_crossed_table()
+    n_each = 30
+    a = centered(rng.normal(0, 1.0, size=(2 * n_each, N_STIM)), axis=1)
+    b = centered(rng.normal(0, 1.0, size=(2 * n_each, N_TASK)), axis=1)
+    g = centered(rng.normal(0, 1.0, size=(2 * n_each, N_TASK)), axis=1)
+    w = centered(rng.normal(0, 1.0, size=(2 * n_each, N_STIM)), axis=1)
+
+    e = np.empty((2 * n_each, N_STIM, N_TASK))
+    e[:n_each] = 1.2 * a[:n_each, :, None] * g[:n_each, None, :]  # gain on the stim profile
+    e[n_each:] = 1.2 * w[n_each:, :, None] * g[n_each:, None, :]  # unrelated pattern
+    betas = synth_betas(factors, a=a, b=b, e=e, noise=1.0, seed=36)
+
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    align = res.gain_alignment["stim"]
+    resolved = res.rank_e >= 1
+    assert resolved.float().mean() > 0.8, "both blocks are a strong rank-1 interaction"
+    gain_block = align[:n_each][resolved[:n_each]]
+    reorg_block = align[n_each:][resolved[n_each:]]
+    assert gain_block.median() > 0.85
+    assert reorg_block.median() < 0.5
+    # Zeroed where no interaction was resolved, so the map never shows noise alignment.
+    assert (align[~resolved] == 0).all()
+
+
+def test_nuclear_sweep_tracks_the_interaction_and_stays_nonnegative():
+    rng = np.random.default_rng(37)
+    factors, rep, run = make_crossed_table()
+    n_each = 25
+    a = centered(rng.normal(0, 1.0, size=(2 * n_each, N_STIM)), axis=1)
+    b = centered(rng.normal(0, 1.0, size=(2 * n_each, N_TASK)), axis=1)
+    u = centered(rng.normal(0, 1.0, size=(2 * n_each, N_STIM)), axis=1)
+    v = centered(rng.normal(0, 1.0, size=(2 * n_each, N_TASK)), axis=1)
+    e = np.zeros((2 * n_each, N_STIM, N_TASK))
+    e[:n_each] = 1.0 * u[:n_each, :, None] * v[:n_each, None, :]  # second block additive
+    betas = synth_betas(factors, a=a, b=b, e=e, noise=1.0, seed=38)
+
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    assert res.nuclear_gain is not None and res.nuclear_tau is not None
+    assert (res.nuclear_gain >= 0).all(), "referenced to its own no-interaction endpoint"
+    assert res.nuclear_gain[:n_each].median() > 0.1
+    assert res.nuclear_gain[n_each:].median() < 0.01
+    # A strong clean interaction needs little shrinkage; an absent one is thresholded away.
+    assert res.nuclear_tau[:n_each].median() < res.nuclear_tau[n_each:].median()
+
+    off = partition_variance(betas, factors, repeat=rep, run=run, n_nuclear_taus=0, verbose=False)
+    assert off.nuclear_gain is None
 
 
 def test_noise_ceiling_orders_by_snr():
@@ -691,3 +809,183 @@ def test_unbalanced_null_stays_calibrated():
         p = res.p_uncorrected[key].numpy()
         assert (p <= 0.05).mean() < 0.12, f"{key} anticonservative: {(p <= 0.05).mean()}"
         assert (res.p_fwe[key].numpy() <= 0.05).mean() < 0.05
+
+
+# ---------------------------------------------------------------------------
+# Run-nested factors
+# ---------------------------------------------------------------------------
+
+
+def make_run_nested_table(n_task=3, n_stim=16, n_rep=3, seed=0):
+    """One task per run: task is nested in run, stimulus varies within it.
+
+    The shape Logan's follow-up study takes -- 9 runs, 3 tasks locked to run, 16 stimuli,
+    3 repeats. Still exhaustively crossed and balanced; the problem is confounding, not
+    the algebra.
+    """
+    rng = np.random.default_rng(seed)
+    task, stim, run, rep = [], [], [], []
+    r = 0
+    for k in range(n_rep):
+        for t in range(n_task):
+            for s in rng.permutation(n_stim):  # order randomised so drift does not alias
+                task.append(f"T{t}")
+                stim.append(f"S{s}")
+                run.append(f"run{r:02d}")
+                rep.append(k)
+            r += 1
+    return (
+        {"stim": np.array(stim), "task": np.array(task)},
+        np.array(rep),
+        np.array(run),
+    )
+
+
+def _run_nested_betas(task_effect, run_noise, seed, n_vox=60):
+    rng = np.random.default_rng(seed)
+    factors, rep, run = make_run_nested_table(seed=seed)
+    ti = np.array([int(x[1:]) for x in factors["task"]])
+    si = np.array([int(x[1:]) for x in factors["stim"]])
+    ri = np.array([int(x[3:]) for x in run])
+    n_stim, n_task, n_run = si.max() + 1, ti.max() + 1, ri.max() + 1
+    vs = rng.normal(size=(n_vox, n_stim))
+    vt = task_effect * rng.normal(size=(n_vox, n_task))
+    y = (
+        vs[:, si]
+        + vt[:, ti]
+        + run_noise * rng.normal(size=(n_vox, n_run))[:, ri]
+        + 0.5 * rng.normal(size=(n_vox, len(si)))
+    )
+    return torch.as_tensor(y, dtype=torch.float32), factors, rep, run
+
+
+def test_run_nesting_is_detected_and_reported(capsys):
+    betas, factors, rep, run = _run_nested_betas(0.0, 1.0, seed=3)
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=True)
+
+    nested = res.diagnostics["factors_nested_in_run"]
+    assert set(nested) == {"task"}, "stimulus varies within run; task does not"
+    assert set(nested["task"].values()) == {3}, "three runs per task"
+    out = capsys.readouterr().out
+    assert "NESTED" in out and "unique_task" in out
+
+    # Nothing is nested when both factors vary within a run.
+    crossed, c_rep, c_run = make_crossed_table(n_stim=6, n_task=5, n_rep=3)
+    assert detect_run_nesting(crossed, c_run) == {}
+    assert detect_run_nesting(crossed, None) == {}
+
+
+def test_additive_run_nuisance_lands_only_on_the_nested_factor():
+    """The reason the interaction survives a run-locked design -- and its one caveat.
+
+    A per-run offset is constant across stimulus, so in the additive decomposition it sits
+    ENTIRELY in the task main effect: no part of it can reach the stimulus main effect or
+    the interaction. That is what makes the interaction family the trustworthy half of a
+    run-locked design, and the whole recommendation rests on it.
+
+    The caveat is that these maps are R2, i.e. ratios. The offset inflates total variance,
+    so it dilutes every map through the shared denominator even though it contaminates only
+    one numerator. Absolute R2 therefore drops for stimulus and interaction alike; what is
+    preserved is their RATIO, and everything derived from the interaction's shape.
+    """
+    rng = np.random.default_rng(6)
+    clean, factors, rep, run = _run_nested_betas(0.0, 0.0, seed=5)
+    si = np.array([int(x[1:]) for x in factors["stim"]])
+    ti = np.array([int(x[1:]) for x in factors["task"]])
+    ri = np.array([int(x[3:]) for x in run])
+    n_vox = clean.shape[0]
+    # Give it a real rank-1 interaction, so there is a ratio worth preserving.
+    u = rng.normal(size=(n_vox, si.max() + 1))
+    v = rng.normal(size=(n_vox, ti.max() + 1))
+    clean = clean + torch.as_tensor(1.2 * u[:, si] * v[:, ti], dtype=torch.float32)
+
+    offsets = torch.as_tensor(
+        rng.normal(scale=2.0, size=(n_vox, ri.max() + 1)), dtype=torch.float32
+    )
+    contaminated = clean + offsets[:, ri]
+
+    a = partition_variance(clean, factors, repeat=rep, run=run, verbose=False)
+    b = partition_variance(contaminated, factors, repeat=rep, run=run, verbose=False)
+
+    # Task soaks up the entire run-level offset...
+    assert b.unique["task"].mean() > 2.0 * a.unique["task"].mean()
+    # ...and dilutes the others only through the shared denominator, so their ratio holds.
+    ratio_a = a.interaction / a.unique["stim"].clamp_min(1e-6)
+    ratio_b = b.interaction / b.unique["stim"].clamp_min(1e-6)
+    torch.testing.assert_close(ratio_a.median(), ratio_b.median(), atol=0.05, rtol=0)
+    # Run nuisance costs SENSITIVITY on the interaction even though it cannot bias it:
+    # a cell's repeats live in different runs, so the offset lands in within-cell variance,
+    # which is what ncsnr calls noise. The ceiling drops and voxels fall below the rank
+    # floor. What it does not do is change the answer where an answer is still available.
+    assert (b.rank_e == -1).float().mean() > (a.rank_e == -1).float().mean()
+    both = (a.rank_e >= 0) & (b.rank_e >= 0)
+    assert both.any()
+    assert (a.rank_e[both] == b.rank_e[both]).float().mean() > 0.9
+    resolved = (a.rank_e >= 1) & (b.rank_e >= 1)  # alignment is zeroed below rank 1
+    torch.testing.assert_close(
+        a.gain_alignment["stim"][resolved],
+        b.gain_alignment["stim"][resolved],
+        atol=0.1,
+        rtol=0,
+    )
+
+
+def test_whole_run_permutation_has_power_where_within_run_has_none():
+    """Within-run permutation cannot test a run-nested factor -- at all.
+
+    A run-constant effect is exactly invariant under permutation inside a run, so it
+    survives into every permuted dataset, the null lands on the observed statistic, and
+    the test detects nothing. Switching the exchangeability unit to the run fixes it.
+    """
+    betas, factors, rep, run = _run_nested_betas(1.0, 0.0, seed=7, n_vox=80)
+    res = permutation_test(
+        betas,
+        factors,
+        repeat=rep,
+        run=run,
+        statistics=("unique_b",),
+        n_perms=200,
+        seed=0,
+        verbose=False,
+    )
+    assert res.diagnostics["permutation_scheme"]["unique_b"] == "whole_run"
+    p_whole = res.p_uncorrected["unique_b"]
+    assert (p_whole < 0.05).float().mean() > 0.8, "a real task effect must be detectable"
+
+    # The interaction still varies within a run, so its null keeps the within-run scheme.
+    res_i = permutation_test(
+        betas,
+        factors,
+        repeat=rep,
+        run=run,
+        statistics=("interaction",),
+        n_perms=50,
+        seed=0,
+        verbose=False,
+    )
+    assert res_i.diagnostics["permutation_scheme"]["interaction"] == "within_run"
+
+
+def test_whole_run_permutation_controls_type_one_error():
+    """Run-level noise must not read as a task effect once the error term is right."""
+    betas, factors, rep, run = _run_nested_betas(0.0, 1.5, seed=11, n_vox=200)
+    res = permutation_test(
+        betas,
+        factors,
+        repeat=rep,
+        run=run,
+        statistics=("unique_b",),
+        n_perms=400,
+        seed=0,
+        verbose=False,
+    )
+    p = res.p_uncorrected["unique_b"]
+    assert (p < 0.05).float().mean() < 0.12, "nominal 5%, allowing Monte-Carlo slack"
+
+
+def test_whole_run_permutation_needs_matching_runs():
+    betas, factors, rep, run = _run_nested_betas(0.0, 0.0, seed=13, n_vox=5)
+    keep = np.ones(len(run), dtype=bool)
+    keep[0] = False  # one run is now a trial short
+    with pytest.raises(ValueError, match="matching trial structure"):
+        build_run_exchange(run[keep], factors["stim"][keep])

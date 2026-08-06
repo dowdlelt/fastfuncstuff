@@ -84,7 +84,7 @@ def test_voxel_mode_writes_expected_subbricks(tmp_path):
 
     img = nib.load(str(out) + ".nii.gz")
     assert img.shape[:3] == shape
-    assert img.shape[3] == 18
+    assert img.shape[3] == 23
     assert (tmp_path / "vp_varpart.json").exists()
 
     import json
@@ -129,7 +129,7 @@ def test_atlas_mode_writes_roi_table(tmp_path):
     # ROI mode also paints a volume for figures: same grid and sub-bricks as voxel mode,
     # constant within each parcel.
     img = nib.load(str(out) + ".nii.gz")
-    assert img.shape == (*shape, 18)
+    assert img.shape == (*shape, 23)
     painted = np.asanyarray(img.dataobj)
     names = list(rows[0])
     ustim = painted[..., names.index("unique_stim") - 1]

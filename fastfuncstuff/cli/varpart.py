@@ -90,7 +90,16 @@ mean (routine in noise -- it is a real value, not a bug).
                 -1 = purely A-driven, +1 = purely B-driven, 0 = equal. Being a
                 RATIO it is largely insensitive to how reliable the voxel is, so
                 it survives low SNR far better than the raw R2 maps. Usually the
-                map to look at first.
+                map to look at first. Reported as 0 where the denominator is not
+                POSITIVE (both uniquenesses go negative in noise, and a denominator
+                of -1e-3 would otherwise flip the sign for no reason) or where the
+                noise ceiling is below 0.01.
+
+Note on "adds up": these are CROSS-VALIDATED commonality measures, not classical
+variance components. Uniquenesses can be negative, and the four pieces need not
+sum exactly to r2_full -- the per-band shrinkage is clamped to [0, 1], and a band
+that hits a boundary in one nested model but not another breaks exact additivity.
+That clamp, not lost balance, is the usual source of a small nonzero `shared`.
 
 --- Fraction of the OBTAINABLE variance -------------------------------------
 Held-out R2 is capped by noise_ceiling, not by 1, and that ceiling swings wildly
@@ -117,8 +126,33 @@ of what was ever gettable here":
                 levels of B reshape the A-profile in genuinely different ways.
                 -1 = UNDETERMINED (ncsnr below -min_ncsnr_for_rank). -1 means
                 "cannot tell here", never "no interaction here".
-  rank_E_raw    Same argmax with no SNR mask. Compare against rank_E to see what
-                the mask removed; do not interpret it on its own.
+  rank_E_raw    The naive argmax of the rank curve, with neither the SNR mask nor
+                the detection floor applied. Compare against rank_E to see what the
+                guards removed; do not interpret it on its own.
+  gain_align_A  |cos| in 0..1 between the leading singular vector of the interaction
+  gain_align_B  and that factor's own main effect. This is what separates the two
+                ways a rank-1 interaction can arise. A pure multiplicative GAIN,
+                m = mu + a_s*(1 + g_t), leaves an interaction a_s*g_t whose left
+                singular vector is PARALLEL to the A main effect -- so
+                gain_align_A near 1 means "B rescales A's response profile". Near 0
+                means REORGANISATION: the interaction pattern is unrelated to the
+                main effect, i.e. B rewrites the profile rather than scaling it.
+                Zeroed where rank_E < 1, since below that the leading singular
+                vector is fitting noise and its alignment is uniform.
+  interaction_nuclear
+                Interaction strength under a singular-value SOFT threshold instead
+                of a hard rank cut -- the continuous version of rank_E, and the
+                better-behaved estimator when the singular values are themselves
+                noisy. Same R2 units as `interaction`, >= 0 by construction.
+  nuclear_tau   The selected threshold, as a fraction of the voxel's leading
+                singular value. 0 = no shrinkage needed (strong, clean
+                interaction), 1 = everything thresholded away (no interaction).
+                A diagnostic for interaction_nuclear, like the gamma maps.
+
+Both rank_E and interaction_nuclear are chosen by maximising held-out R2 over a
+grid, on the same folds they are reported on, so they carry SELECTION optimism:
+read them as an ordering and a structure description, not as unbiased variance.
+The permutation null on `interaction` is the significance test.
 
 --- Reliability: properties of the DATA, not of the model -------------------
   ncsnr         Noise-ceiling SNR = sd(signal) / sd(noise), estimated from
@@ -148,6 +182,34 @@ of what was ever gettable here":
                 reduced model's residuals, permuted within run blocks, with the
                 per-band shrinkage re-fitted inside every permutation so the null
                 absorbs the selection optimism.
+
+--- If a factor is locked to run (READ THIS) --------------------------------
+A factor that never varies within a run -- one task per run, say -- is NESTED in
+run, and ffs_varpart says so loudly rather than refusing. What it means:
+
+  * unique_<that factor> is confounded with EVERY run-level effect: residual
+    drift, motion regime, arousal, physiological state, position in the session.
+    Within these data the factor and "which run this was" are the same regressor,
+    and no analysis can separate them. Cross-validation does not help -- it will
+    happily confirm a stable run-level trend as reproducible "task" signal.
+  * It is also biased the OTHER way: per-run polynomial/nuisance regressors in the
+    single-trial fit remove between-run variance, which is exactly where a
+    run-locked factor's main effect lives. Both biases are present, they do not
+    cancel, and neither is measurable from the data.
+  * What survives intact: the OTHER factor's unique variance, and the whole
+    interaction family (interaction, rank_E, gain_align_*). An additive per-run
+    offset is constant across the within-run factor, so it lands entirely in the
+    nested factor's main effect and contributes exactly ZERO to those. The
+    interaction analysis is the part of this tool that stays trustworthy.
+  * Inference switches automatically: the null for the nested factor becomes
+    WHOLE-RUN permutation, which supplies the correct error term (between-run,
+    n = runs per level). Within-run permutation is not merely weak here, it is
+    powerless -- a run-constant effect is exactly invariant under shuffling inside
+    a run, so it survives into every permuted dataset and the test detects nothing.
+
+Two things fix this at the scanner, not in software: counterbalance run ORDER
+across levels so session trends do not align with the factor, and randomise the
+within-run trial order so within-run drift does not alias onto the other factor.
 
 Examples:
   # 21 tasks x 20 stimuli, 3 repeats, single-trial betas from ffs_ridge
@@ -232,6 +294,30 @@ mapping back to the original labels is written to {prefix}_varpart.json).
             "(undetermined) instead of 0. Rank selection misses real structure long "
             "before it invents any, so without this low-SNR tissue reads as "
             "'task-invariant'. Set 0 to disable."
+        ),
+    )
+    opt.add_argument(
+        "-min_interaction_frac_ceiling",
+        "-min-interaction-frac-ceiling",
+        dest="min_interaction_frac_ceiling",
+        type=float,
+        default=0.02,
+        help=(
+            "Detection floor for rank_E: the rank curve must beat the additive model by "
+            "this fraction of the voxel's noise ceiling before any nonzero rank is "
+            "reported. Without it, voxels whose interaction was shrunk away entirely have "
+            "a flat curve and the argmax reads float noise as structure."
+        ),
+    )
+    opt.add_argument(
+        "-nuclear_taus",
+        "-nuclear-taus",
+        dest="nuclear_taus",
+        type=int,
+        default=11,
+        help=(
+            "Grid size for the singular-value soft-threshold sweep, the continuous "
+            "counterpart of the hard rank sweep (0 = skip it)"
         ),
     )
     opt.add_argument(
@@ -479,6 +565,8 @@ def main() -> int:
         run=block,
         max_rank=args.max_rank,
         min_ncsnr_for_rank=args.min_ncsnr_for_rank,
+        min_interaction_frac_ceiling=args.min_interaction_frac_ceiling,
+        n_nuclear_taus=args.nuclear_taus,
         strict_run_locality=args.strict_run_locality,
         device=device,
         verbose=not args.quiet,
@@ -514,6 +602,17 @@ def main() -> int:
         f"   rank undetermined (ncsnr < {args.min_ncsnr_for_rank}): "
         f"{d['rank_undetermined_frac']:.1%}"
     )
+    nested = d.get("factors_nested_in_run") or {}
+    if nested:
+        # partition_variance already printed the full explanation; keep a one-line marker
+        # here so it survives in the diagnostics block a user scrolls back to.
+        for name, per_level in nested.items():
+            n_runs = min(per_level.values())
+            print(
+                f"   ⚠️  '{name}' is NESTED in run ({n_runs} runs/level): unique_{name} is "
+                f"confounded with run-level nuisance — read unique/interaction of the "
+                f"within-run factor instead."
+            )
 
     perm_res = None
     if args.perm > 0:
@@ -543,6 +642,8 @@ def main() -> int:
         "preference": res.preference,
         "rank_E": res.rank_e.float(),  # -1 where ncsnr is below the detection floor
         "rank_E_raw": res.rank_e_raw.float(),  # unmasked argmax, for diagnosing the mask
+        f"gain_align_{fa}": res.gain_alignment[fa],
+        f"gain_align_{fb}": res.gain_alignment[fb],
         "ncsnr": res.ncsnr,
         "noise_ceiling": res.noise_ceiling,
         f"gamma_{fa}": res.gammas[fa],
@@ -551,6 +652,9 @@ def main() -> int:
         "r2_additive": res.r2["M_add"],
         "r2_full": res.r2["M_full"],
     }
+    if res.nuclear_gain is not None and res.nuclear_tau is not None:
+        maps["interaction_nuclear"] = res.nuclear_gain
+        maps["nuclear_tau"] = res.nuclear_tau
 
     # Held-out R² is capped by the noise ceiling, not by 1, and the ceiling varies enormously
     # across the brain. 0.02 against a ceiling of 0.05 is most of what was ever obtainable
@@ -562,7 +666,10 @@ def main() -> int:
     # Below this an oracle model could not explain 1% of the variance, so the ratio is
     # noise/noise and would paint garbage over exactly the tissue with nothing in it.
     obtainable = ceiling > CEILING_FLOOR
-    for source in (f"unique_{fa}", f"unique_{fb}", "interaction", "r2_full"):
+    frac_sources = [f"unique_{fa}", f"unique_{fb}", "interaction", "r2_full"]
+    if "interaction_nuclear" in maps:
+        frac_sources.append("interaction_nuclear")
+    for source in frac_sources:
         frac = torch.where(obtainable, maps[source] / ceiling.clamp_min(CEILING_FLOOR), zero)
         maps[f"{source}_frac_ceiling"] = frac
 
