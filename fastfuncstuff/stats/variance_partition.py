@@ -49,6 +49,7 @@ the curve is directly comparable to it -- see :func:`partition_variance`.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -83,9 +84,23 @@ class FactorDesign:
     contrasts: list[Tensor]  # per factor, (n_levels, n_levels - 1) orthonormal
     bands: dict[str, Tensor]  # band name -> (n_trials, n_cols)
     band_order: list[str]
+    band_members: dict[str, tuple[int, ...]]  # band name -> factor indices it spans
     balanced: bool
     max_offdiag: float
     cell_counts: Tensor  # (n_levels_0, n_levels_1, ...) trials per cell
+
+    @property
+    def main_bands(self) -> list[str]:
+        """Main-effect band names, in factor order."""
+        return [n for n in self.band_order if len(self.band_members[n]) == 1]
+
+    @property
+    def pair_bands(self) -> list[str]:
+        """Two-way interaction band names -- the ones with an SVD structure to report."""
+        return [n for n in self.band_order if len(self.band_members[n]) == 2]
+
+    def bands_involving(self, factor: int) -> list[str]:
+        return [n for n in self.band_order if factor in self.band_members[n]]
 
     @property
     def n_trials(self) -> int:
@@ -102,20 +117,37 @@ class VarPartResult:
 
     r2: dict[str, Tensor] = field(default_factory=dict)  # model name -> (n_voxels,)
     unique: dict[str, Tensor] = field(default_factory=dict)  # factor name -> (n_voxels,)
+    # band name -> (n_voxels,) that band's unique contribution to the FULL model. Main
+    # effects, two-way interactions and higher-order terms all appear here; ``unique`` is
+    # the same idea restricted to the additive model, so factors stay comparable.
+    band_unique: dict[str, Tensor] = field(default_factory=dict)
     shared: Tensor | None = None
     interaction: Tensor | None = None
     gammas: dict[str, Tensor] = field(default_factory=dict)  # band name -> (n_voxels,)
-    preference: Tensor | None = None
-    rank_e: Tensor | None = None  # (n_voxels,) CV rank; -1 = below detection floor
-    rank_e_raw: Tensor | None = None  # (n_voxels,) unmasked argmax, for diagnostics
-    rank_r2: Tensor | None = None  # (n_voxels, max_rank + 1)
-    nuclear_r2: Tensor | None = None  # (n_voxels,) best R2 over the soft-threshold grid
-    nuclear_tau: Tensor | None = None  # (n_voxels,) selected threshold, as a fraction of s1
-    nuclear_gain: Tensor | None = None  # (n_voxels,) nuclear_r2 - its no-interaction end
-    # factor name -> (n_voxels,) |cos| between the leading singular vector of the
-    # interaction and that factor's main effect. 1 = pure multiplicative gain on that
-    # factor's profile, 0 = reorganisation. Zeroed where rank_e < 1.
+    preference: Tensor | None = None  # two factors only
+
+    # Two-way interaction structure, keyed by interaction band name. Higher-order bands get
+    # variance and shrinkage but no structure: their coefficient array is a tensor, and
+    # rank needs a CP/Tucker decomposition rather than an SVD.
+    pair_rank_e: dict[str, Tensor] = field(default_factory=dict)  # -1 = below the SNR floor
+    pair_rank_e_raw: dict[str, Tensor] = field(default_factory=dict)  # same, no SNR mask
+    pair_rank_r2: dict[str, Tensor] = field(default_factory=dict)  # (n_voxels, max_rank + 1)
+    pair_nuclear_tau: dict[str, Tensor] = field(default_factory=dict)
+    pair_nuclear_gain: dict[str, Tensor] = field(default_factory=dict)
+    # band -> factor -> (n_voxels,) |cos| between the leading singular vector and that
+    # parent factor's main effect. 1 = pure multiplicative gain on that factor's profile,
+    # 0 = reorganisation. Zeroed where the rank is below 1.
+    pair_gain_alignment: dict[str, dict[str, Tensor]] = field(default_factory=dict)
+
+    # Flat aliases for the single-interaction (two-factor) case; empty above that.
+    rank_e: Tensor | None = None
+    rank_e_raw: Tensor | None = None
+    rank_r2: Tensor | None = None
+    nuclear_r2: Tensor | None = None
+    nuclear_tau: Tensor | None = None
+    nuclear_gain: Tensor | None = None
     gain_alignment: dict[str, Tensor] = field(default_factory=dict)
+
     ncsnr: Tensor | None = None
     noise_ceiling: Tensor | None = None
     diagnostics: dict = field(default_factory=dict)
@@ -167,32 +199,30 @@ def build_factor_design(
 
     contrasts = [_orthonormal_contrasts(len(lv), dtype) for lv in levels]
 
-    # Main-effect bands: each trial takes its level's contrast row.
+    # One band per non-empty subset of factors: k main effects, then every interaction.
+    # An interaction band is the elementwise (row-wise Khatri-Rao) product of its members'
+    # columns. Because each factor's contrast columns sum to zero over its own levels, a
+    # product band is automatically orthogonal to every band it is not a superset of --
+    # which is what makes the whole partition decouple under balance, at any k.
     bands: dict[str, Tensor] = {}
     band_order: list[str] = []
-    for f, name in enumerate(names):
-        bands[name] = contrasts[f][codes[:, f], :]
-        band_order.append(name)
-
-    # Interaction bands: elementwise products across every column pair. Because each
-    # factor's contrast columns sum to zero over levels, these are automatically
-    # orthogonal to both parent main effects under balance.
-    if len(names) == 2:
-        a, b = bands[names[0]], bands[names[1]]
-        inter = (a.unsqueeze(2) * b.unsqueeze(1)).reshape(a.shape[0], -1)
-        inter_name = f"{names[0]}:{names[1]}"
-        bands[inter_name] = inter
-        band_order.append(inter_name)
-    else:
-        raise NotImplementedError(
-            f"partition algebra is defined here for 2 factors, got {len(names)}. "
-            "Band construction generalizes; the unique/shared/interaction bookkeeping "
-            "does not, and guessing at it would be worse than refusing."
-        )
+    band_members: dict[str, tuple[int, ...]] = {}
+    for size in range(1, len(names) + 1):
+        for subset in itertools.combinations(range(len(names)), size):
+            name = ":".join(names[f] for f in subset)
+            cols = contrasts[subset[0]][codes[:, subset[0]], :]
+            for f in subset[1:]:
+                nxt = contrasts[f][codes[:, f], :]
+                cols = (cols.unsqueeze(2) * nxt.unsqueeze(1)).reshape(cols.shape[0], -1)
+            bands[name] = cols.contiguous()
+            band_order.append(name)
+            band_members[name] = subset
 
     shape = tuple(len(lv) for lv in levels)
-    flat = codes[:, 0] * shape[1] + codes[:, 1]
-    cell_counts = torch.bincount(flat, minlength=shape[0] * shape[1]).reshape(shape)
+    flat = torch.zeros(codes.shape[0], dtype=torch.int64)
+    for f in range(len(names)):
+        flat = flat * shape[f] + codes[:, f]
+    cell_counts = torch.bincount(flat, minlength=int(np.prod(shape))).reshape(shape)
 
     # Balance check. Under an exhaustively crossed balanced design every band Gram is
     # n*I and cross-band Grams vanish; departures mean censoring or dropped trials broke
@@ -213,10 +243,20 @@ def build_factor_design(
         contrasts=contrasts,
         bands=bands,
         band_order=band_order,
+        band_members=band_members,
         balanced=balanced,
         max_offdiag=max_offdiag,
         cell_counts=cell_counts,
     )
+
+
+def flat_cell_index(design: FactorDesign) -> Tensor:
+    """Row-major flat index of each trial's cell in the k-dimensional level grid."""
+    shape = [len(lv) for lv in design.levels]
+    flat = torch.zeros(design.n_trials, dtype=torch.int64)
+    for f in range(design.n_factors):
+        flat = flat * shape[f] + design.codes[:, f]
+    return flat
 
 
 def derive_repeat_index(design: FactorDesign) -> np.ndarray:
@@ -225,8 +265,7 @@ def derive_repeat_index(design: FactorDesign) -> np.ndarray:
     Used when the sidecar has no explicit ``repeat`` column. Row order is trial order, so
     this reproduces "1st/2nd/3rd presentation of this cell".
     """
-    shape = tuple(len(lv) for lv in design.levels)
-    flat = (design.codes[:, 0] * shape[1] + design.codes[:, 1]).numpy()
+    flat = flat_cell_index(design).numpy()
     seen: dict[int, int] = {}
     out = np.empty(len(flat), dtype=np.int64)
     for i, cell in enumerate(flat):
@@ -358,10 +397,10 @@ def _nesting_warning(nested: dict[str, dict[str, int]], factor_names: list[str])
 
 
 def cell_labels(design: FactorDesign) -> np.ndarray:
-    """Per-trial ``"levelA|levelB"`` cell identity, for readable locality diagnostics."""
-    la, lb = design.levels[0], design.levels[1]
+    """Per-trial ``"levelA|levelB|..."`` cell identity, for readable locality diagnostics."""
     codes = design.codes.numpy()
-    return np.array([f"{la[a]}|{lb[b]}" for a, b in codes])
+    levels = design.levels
+    return np.array(["|".join(str(levels[f][c]) for f, c in enumerate(row)) for row in codes])
 
 
 def _check_run_locality(fold_diag: dict, strict: bool, verbose: bool) -> None:
@@ -454,45 +493,63 @@ def _abs_cos(x: Tensor, y: Tensor) -> Tensor:
     return num / den.clamp_min(1e-12)
 
 
+# Layout of the sweep accumulator's last axis. The first five entries are fixed; the rest
+# are the swept band's inner products against each OTHER band's partial, two per band.
+_ACC_RR, _ACC_RS, _ACC_SS, _ACC_RT, _ACC_ST = range(5)
+_ACC_FIXED = 5
+
+
+def _acc_width(n_other: int) -> int:
+    return _ACC_FIXED + 2 * n_other
+
+
 def _sweep_systems(
-    acc: Tensor,  # (..., 9) gathered sweep accumulators
-    gm: Tensor,  # (n_vox, 2, 2) main-effect Gram over all folds
-    rh: Tensor,  # (n_vox, 2) main-effect right-hand side
+    acc: Tensor,  # (..., _acc_width(n_other)) gathered sweep accumulators
+    gm: Tensor,  # (n_vox, n_other, n_other) Gram of the un-swept bands, over all folds
+    rh: Tensor,  # (n_vox, n_other) their right-hand side
     tau: Tensor,  # (...) soft-threshold, broadcastable against acc[..., 0]
     fold_dim: int | None,
 ) -> tuple[Tensor, Tensor]:
-    """Assemble the 3-band normal equations for a swept interaction predictor.
+    """Assemble the full normal equations with ONE band replaced by a swept predictor.
 
-    The swept predictor is ``R_r - tau * S_r``; *acc* carries the nine inner products of
-    ``R_r`` and ``S_r`` against each other, the two main-effect partials, and the target.
-    When *fold_dim* is given the interaction terms are summed over it first, which is what
-    lets each fold use its own prefix length ``r`` under one shared threshold.
+    The swept predictor is ``R_r - tau * S_r``; *acc* carries the inner products of ``R_r``
+    and ``S_r`` against each other, against every un-swept band's partial, and against the
+    target. Everything else in the system is independent of the sweep, so it is passed in
+    once as *gm* / *rh*. The swept band lands at the LAST index of the returned system.
+
+    When *fold_dim* is given the swept terms are summed over it first, which is what lets
+    each fold use its own prefix length ``r`` under one shared per-voxel threshold.
     """
-    qrr, qrs, qss, qra, qrb, qrt, qsa, qsb, qst = acc.unbind(-1)
-    c_ii = qrr - 2.0 * tau * qrs + tau * tau * qss
-    c_ia = qra - tau * qsa
-    c_ib = qrb - tau * qsb
-    c_it = qrt - tau * qst
+    n_other = gm.shape[-1]
+    qrr = acc[..., _ACC_RR]
+    qrs = acc[..., _ACC_RS]
+    qss = acc[..., _ACC_SS]
+    qrt = acc[..., _ACC_RT]
+    qst = acc[..., _ACC_ST]
+    qrm = acc[..., _ACC_FIXED : _ACC_FIXED + n_other]
+    qsm = acc[..., _ACC_FIXED + n_other :]
+
+    c_jj = qrr - 2.0 * tau * qrs + tau * tau * qss
+    c_jt = qrt - tau * qst
+    c_jm = qrm - tau[..., None] * qsm
     if fold_dim is not None:
-        c_ii = c_ii.sum(dim=fold_dim)
-        c_ia = c_ia.sum(dim=fold_dim)
-        c_ib = c_ib.sum(dim=fold_dim)
-        c_it = c_it.sum(dim=fold_dim)
+        c_jj = c_jj.sum(dim=fold_dim)
+        c_jt = c_jt.sum(dim=fold_dim)
+        c_jm = c_jm.sum(dim=fold_dim)
 
-    # Broadcast the (fold-invariant) main-effect block across the variant axis.
-    lead = c_ii.shape  # (n_vox, n_variants)
-    shape2 = (lead[0],) + (1,) * (len(lead) - 1) + (2, 2)
-    gram = torch.zeros(*lead, 3, 3, dtype=c_ii.dtype, device=c_ii.device)
-    gram[..., :2, :2] = gm.reshape(shape2)
-    gram[..., 0, 2] = c_ia
-    gram[..., 2, 0] = c_ia
-    gram[..., 1, 2] = c_ib
-    gram[..., 2, 1] = c_ib
-    gram[..., 2, 2] = c_ii
+    # Broadcast the (sweep-invariant) block for the other bands across the variant axis.
+    lead = c_jj.shape  # (n_vox, n_variants)
+    pad = (1,) * (len(lead) - 1)
+    n = n_other + 1
+    gram = torch.zeros(*lead, n, n, dtype=c_jj.dtype, device=c_jj.device)
+    gram[..., :n_other, :n_other] = gm.reshape((lead[0],) + pad + (n_other, n_other))
+    gram[..., :n_other, n_other] = c_jm
+    gram[..., n_other, :n_other] = c_jm
+    gram[..., n_other, n_other] = c_jj
 
-    rhs = torch.empty(*lead, 3, dtype=c_ii.dtype, device=c_ii.device)
-    rhs[..., :2] = rh.reshape((lead[0],) + (1,) * (len(lead) - 1) + (2,))
-    rhs[..., 2] = c_it
+    rhs = torch.empty(*lead, n, dtype=c_jj.dtype, device=c_jj.device)
+    rhs[..., :n_other] = rh.reshape((lead[0],) + pad + (n_other,))
+    rhs[..., n_other] = c_jt
     return gram, rhs
 
 
@@ -589,8 +646,6 @@ def partition_variance(
         device = get_device()
 
     design = build_factor_design(factor_codes)
-    fa, fb = design.factor_names
-    inter_name = f"{fa}:{fb}"
     n_trials = design.n_trials
 
     betas_t = torch.as_tensor(np.asarray(betas)) if not isinstance(betas, Tensor) else betas
@@ -611,14 +666,14 @@ def partition_variance(
     if nested and verbose:
         print(f"\n   ⚠️  RUN-NESTED FACTOR\n   {_nesting_warning(nested, design.factor_names)}")
 
-    n_a, n_b = len(design.levels[0]), len(design.levels[1])
-    ia, ib = n_a - 1, n_b - 1
-    if max_rank is None:
-        max_rank = min(ia, ib)
-    max_rank = int(min(max_rank, min(ia, ib)))
+    names = design.factor_names
+    n_levels = [len(lv) for lv in design.levels]
+    n_cells = int(np.prod(n_levels))
 
     band_order = design.band_order
     n_bands = len(band_order)
+    main_bands = design.main_bands
+    pair_bands = design.pair_bands
     band_mats = {k: v.to(device=device, dtype=torch.float32) for k, v in design.bands.items()}
     band_slices = {}
     off = 0
@@ -627,13 +682,31 @@ def partition_variance(
         band_slices[name] = slice(off, off + w)
         off += w
 
-    models = {
-        "M0": [],
-        f"M_{fa}": [fa],
-        f"M_{fb}": [fb],
-        "M_add": [fa, fb],
-        "M_full": [fa, fb, inter_name],
-    }
+    # Per-pair SVD geometry. A two-way interaction's coefficient matrix is (ia, ib), so its
+    # rank is capped by the SMALLER factor -- a 2-level factor forces every interaction it
+    # takes part in to rank <= 1, which is worth knowing before reading a rank map that can
+    # only ever say 0 or 1. There, gain_align is the informative output, not rank.
+    pair_dims = {}
+    pair_rank = {}
+    for name in pair_bands:
+        f, g = design.band_members[name]
+        ia, ib = n_levels[f] - 1, n_levels[g] - 1
+        pair_dims[name] = (f, g, ia, ib)
+        mr = min(ia, ib) if max_rank is None else int(min(max_rank, min(ia, ib)))
+        pair_rank[name] = mr
+
+    # Model set. Under exhaustive crossing every band is orthogonal to every other, so
+    # "unique variance" is just each band's own contribution and there is nothing shared to
+    # apportion -- which is why this generalises to any number of factors while classical
+    # commonality analysis (2^k - 1 overlapping terms) does not. Each band's unique variance
+    # is a drop-one comparison against the full model; each factor's is a drop-one against
+    # the additive model, so the factors stay comparable to each other on main effects alone.
+    models: dict[str, list[str]] = {"M0": [], "M_add": list(main_bands), "M_full": list(band_order)}
+    for name in main_bands:
+        models[f"M_{name}"] = [name]
+        models[f"M_add-{name}"] = [n for n in main_bands if n != name]
+    for name in band_order:
+        models[f"M_full-{name}"] = [n for n in band_order if n != name]
     band_index = {name: i for i, name in enumerate(band_order)}
 
     if chunk_size is None:
@@ -647,18 +720,19 @@ def partition_variance(
 
     r2_out = {m: torch.zeros(n_vox) for m in models}
     gam_out = {b: torch.zeros(n_vox) for b in band_order}
-    rank_r2_out = torch.zeros(n_vox, max_rank + 1)
-    nuclear_r2_out = torch.zeros(n_vox)
-    nuclear_tau_out = torch.zeros(n_vox)
-    nuclear_gain_out = torch.zeros(n_vox)
-    align_a_out = torch.zeros(n_vox)
-    align_b_out = torch.zeros(n_vox)
+    rank_r2_out = {p: torch.zeros(n_vox, pair_rank[p] + 1) for p in pair_bands}
+    nuclear_r2_out = {p: torch.zeros(n_vox) for p in pair_bands}
+    nuclear_tau_out = {p: torch.zeros(n_vox) for p in pair_bands}
+    nuclear_gain_out = {p: torch.zeros(n_vox) for p in pair_bands}
+    # Alignment is per (pair band, parent factor): the left singular vector against one
+    # parent's main effect, the right against the other's.
+    align_out = {(p, side): torch.zeros(n_vox) for p in pair_bands for side in (0, 1)}
 
     n_folds = len(folds)
     n_taus = int(max(n_nuclear_taus, 0))
     tau_fracs = torch.linspace(0.0, 1.0, max(n_taus, 1), device=device)
 
-    cell_flat = (design.codes[:, 0] * n_b + design.codes[:, 1]).to(device)
+    cell_flat = flat_cell_index(design).to(device)
 
     fold_t = [
         (
@@ -694,22 +768,29 @@ def partition_variance(
         partials = torch.zeros(nvc, n_trials, n_bands, device=device)
         target = torch.zeros(nvc, n_trials, device=device)
 
-        # Sweep accumulators. For every prefix length r of the interaction's singular
-        # expansion we keep the inner products of two running partial sums,
+        # Sweep accumulators, one set per two-way interaction band. For every prefix length
+        # r of that band's singular expansion we keep the inner products of two running
+        # partial sums,
         #     R_r = sum_{k<r} s_k c_k    (hard rank-r truncation)
         #     S_r = sum_{k<r} c_k        (the linear-in-tau correction)
-        # against each other, against the two main-effect partials, and against the target.
+        # against each other, against every OTHER band's partial, and against the target.
         # Every soft-threshold predictor is exactly ``R_r - tau * S_r`` with
         # r = #{s_k > tau}, because the singular values arrive sorted so the surviving set
-        # is always a prefix. Nine scalars per (fold, rank) therefore reconstruct the exact
-        # normal equations for BOTH sweeps, at any threshold, without ever materialising a
-        # (n_vox_chunk, n_trials, n_variants) prediction tensor -- the peak-memory term the
-        # earlier implementation had to design around. The fold axis is kept because a
-        # single per-voxel threshold selects a *different* prefix length in each fold.
-        acc = torch.zeros(nvc, n_folds, max_rank + 1, 9, device=device)
-        sv_all = torch.zeros(nvc, n_folds, max_rank, device=device)
-        align_a = torch.zeros(nvc, device=device)
-        align_b = torch.zeros(nvc, device=device)
+        # is always a prefix. A handful of scalars per (fold, rank) therefore reconstruct
+        # the exact normal equations for BOTH sweeps, at any threshold, without ever
+        # materialising a (n_vox_chunk, n_trials, n_variants) prediction tensor -- the
+        # peak-memory term the earlier implementation had to design around. The fold axis
+        # is kept because a single per-voxel threshold selects a different prefix length in
+        # each fold.
+        n_other = n_bands - 1
+        acc = {
+            p: torch.zeros(nvc, n_folds, pair_rank[p] + 1, _acc_width(n_other), device=device)
+            for p in pair_bands
+        }
+        sv_all = {
+            p: torch.zeros(nvc, n_folds, max(pair_rank[p], 1), device=device) for p in pair_bands
+        }
+        align = {k: torch.zeros(nvc, device=device) for k in align_out}
 
         for fi, ((tr, te), solver) in enumerate(zip(fold_t, fold_solvers, strict=True)):
             coef = y[:, tr] @ solver.T  # (nvc, 1 + sum band widths)
@@ -722,51 +803,58 @@ def partition_variance(
                 cf = coef[:, 1 + sl.start : 1 + sl.stop]
                 partials[:, te, band_index[name]] = cf @ band_mats[name][te].T
 
-            # Interaction structure. rank(E) == rank(B_I) because the contrast bases are
-            # full column rank, so the SVD runs on the (ia, ib) coefficient matrix rather
-            # than the (n_a, n_b) cell-mean matrix -- same answer, smaller decomposition.
-            sl = band_slices[inter_name]
-            b_i = coef[:, 1 + sl.start : 1 + sl.stop].reshape(nvc, ia, ib)
-            u, s, vh = torch.linalg.svd(b_i, full_matrices=False)
-            sv_all[:, fi, :] = s[:, :max_rank]
+            for pname in pair_bands:
+                f, g, ia, ib = pair_dims[pname]
+                mr = pair_rank[pname]
+                # rank(E) == rank(B_I) because the contrast bases are full column rank, so
+                # the SVD runs on the (ia, ib) coefficient matrix rather than the
+                # (n_a, n_b) cell-mean matrix -- same answer, smaller decomposition.
+                sl = band_slices[pname]
+                b_i = coef[:, 1 + sl.start : 1 + sl.stop].reshape(nvc, ia, ib)
+                u, s, vh = torch.linalg.svd(b_i, full_matrices=False)
+                sv_all[pname][:, fi, : min(mr, s.shape[1])] = s[:, :mr]
 
-            # A multiplicative gain model, m_st = mu + a_s * (1 + g_t), leaves an
-            # interaction a_s * g_t: rank 1, with its LEFT singular vector parallel to the
-            # factor-A main effect. Generic rank-1 reorganisation points somewhere else.
-            # One dot product per fold separates the two, which is the difference between
-            # "task rescales the stimulus profile" and "task rewrites it".
-            coef_a = coef[:, 1 + band_slices[fa].start : 1 + band_slices[fa].stop]
-            coef_b = coef[:, 1 + band_slices[fb].start : 1 + band_slices[fb].stop]
-            align_a += _abs_cos(u[:, :, 0], coef_a)
-            align_b += _abs_cos(vh[:, 0, :], coef_b)
+                # A multiplicative gain model, m = mu + a_s * (1 + g_t), leaves an
+                # interaction a_s * g_t: rank 1, with its LEFT singular vector parallel to
+                # the first parent's main effect. Generic rank-1 reorganisation points
+                # somewhere else. One dot product per fold separates the two -- the
+                # difference between "this factor rescales that profile" and "rewrites it".
+                fname, gname = names[f], names[g]
+                cf_f = coef[:, 1 + band_slices[fname].start : 1 + band_slices[fname].stop]
+                cf_g = coef[:, 1 + band_slices[gname].start : 1 + band_slices[gname].stop]
+                align[(pname, 0)] += _abs_cos(u[:, :, 0], cf_f)
+                align[(pname, 1)] += _abs_cos(vh[:, 0, :], cf_g)
 
-            a_te = band_mats[fa][te]
-            b_te = band_mats[fb][te]
-            p_a = partials[:, te, band_index[fa]]
-            p_b = partials[:, te, band_index[fb]]
-            run_r = torch.zeros_like(tgt_fold)
-            run_s = torch.zeros_like(tgt_fold)
-            for k in range(max_rank):
-                # c_k[t] = (u_k . a_t)(v_k . b_t). The interaction band is the elementwise
-                # Kronecker product of the two main-effect bands by construction, so a
-                # rank-1 term costs two (ia x n_test) products instead of one
-                # (ia*ib x n_test) product -- an order of magnitude less work per variant.
-                ck = (u[:, :, k] @ a_te.T) * (vh[:, k, :] @ b_te.T)
-                run_r = run_r + s[:, k : k + 1] * ck
-                run_s = run_s + ck
-                acc[:, fi, k + 1, 0] = (run_r * run_r).sum(dim=1)
-                acc[:, fi, k + 1, 1] = (run_r * run_s).sum(dim=1)
-                acc[:, fi, k + 1, 2] = (run_s * run_s).sum(dim=1)
-                acc[:, fi, k + 1, 3] = (run_r * p_a).sum(dim=1)
-                acc[:, fi, k + 1, 4] = (run_r * p_b).sum(dim=1)
-                acc[:, fi, k + 1, 5] = (run_r * tgt_fold).sum(dim=1)
-                acc[:, fi, k + 1, 6] = (run_s * p_a).sum(dim=1)
-                acc[:, fi, k + 1, 7] = (run_s * p_b).sum(dim=1)
-                acc[:, fi, k + 1, 8] = (run_s * tgt_fold).sum(dim=1)
+                f_te = band_mats[fname][te]
+                g_te = band_mats[gname][te]
+                other = [band_index[n] for n in band_order if n != pname]
+                p_other = partials[:, te, :][:, :, other]  # (nvc, n_te, n_other)
+                a_p = acc[pname]
+                run_r = torch.zeros_like(tgt_fold)
+                run_s = torch.zeros_like(tgt_fold)
+                for k in range(mr):
+                    # c_k[t] = (u_k . f_t)(v_k . g_t). An interaction band is the elementwise
+                    # Kronecker product of its parents' bands by construction, so a rank-1
+                    # term costs two (ia x n_test) products instead of one (ia*ib x n_test)
+                    # product -- an order of magnitude less work per variant.
+                    ck = (u[:, :, k] @ f_te.T) * (vh[:, k, :] @ g_te.T)
+                    run_r = run_r + s[:, k : k + 1] * ck
+                    run_s = run_s + ck
+                    a_p[:, fi, k + 1, _ACC_RR] = (run_r * run_r).sum(dim=1)
+                    a_p[:, fi, k + 1, _ACC_RS] = (run_r * run_s).sum(dim=1)
+                    a_p[:, fi, k + 1, _ACC_SS] = (run_s * run_s).sum(dim=1)
+                    a_p[:, fi, k + 1, _ACC_RT] = (run_r * tgt_fold).sum(dim=1)
+                    a_p[:, fi, k + 1, _ACC_ST] = (run_s * tgt_fold).sum(dim=1)
+                    a_p[:, fi, k + 1, _ACC_FIXED : _ACC_FIXED + n_other] = torch.einsum(
+                        "vt,vtm->vm", run_r, p_other
+                    )
+                    a_p[:, fi, k + 1, _ACC_FIXED + n_other :] = torch.einsum(
+                        "vt,vtm->vm", run_s, p_other
+                    )
+                del u, s, vh, b_i, run_r, run_s, p_other
+            del coef
 
-            del u, s, vh, b_i, run_r, run_s, coef
-
-        gam_full = torch.zeros(nvc, 3, device=device)
+        gam_full = torch.zeros(nvc, n_bands, device=device)
         for mname, active_names in models.items():
             if not active_names:
                 pred = torch.zeros_like(target)
@@ -780,73 +868,86 @@ def partition_variance(
                         gam_out[n][c0:c1] = gam[:, k].cpu()
             r2_out[mname][c0:c1] = _r2_from_pred(target, pred).cpu()
 
-        # Main-effect block of the normal equations, shared by every swept variant.
-        p_main = partials[:, :, [band_index[fa], band_index[fb]]]
-        gm = torch.einsum("vtb,vtc->vbc", p_main, p_main)
-        rh = torch.einsum("vtb,vt->vb", p_main, target)
         sst = (target * target).sum(dim=1)
         ss_tot = ((target - target.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
 
-        # Hard rank sweep, evaluated under M_full's gammas so the curve and the reported
-        # models are the same predictor family: rank_r2[:, max_rank] IS R2(M_full), and
-        # rank_r2[:, 0] is the additive model carrying M_full's shrinkage.
-        #
-        # The gammas are deliberately NOT re-fitted per rank. They are selected on the
-        # reporting folds (see the module docstring), which is harmless for the model R2 --
-        # the optimism is common-mode across a set of differences -- but an argmax over
-        # ranks is a selection, and that is precisely where common-mode optimism stops
-        # cancelling. Re-fitting gives the sweep a free scalar per variant and additive
-        # voxels then climb to spurious rank 2-6. Holding the gammas fixed restores the
-        # one-sided error property the rank map is read under: a pure-noise component adds
-        # variance at fixed weight, so it can only ever hurt, and every selection error is a
-        # miss rather than an invention.
-        gam_s = gam_full.unsqueeze(1)
-        gram, rhs = _sweep_systems(acc.sum(dim=1), gm, rh, torch.zeros((), device=device), None)
-        rank_r2_out[c0:c1] = (
-            1.0 - _ss_res_from_gram(gram, rhs, sst[:, None], gam_s) / (ss_tot[:, None] + 1e-12)
-        ).cpu()
-
-        if n_taus > 0 and max_rank > 0:
-            # Nuclear (singular-value soft-threshold) sweep: a continuous relaxation of the
-            # hard rank truncation. Hard truncation keeps a noisy singular value at full
-            # size or discards it entirely; soft thresholding shrinks all of them, which is
-            # the better-behaved estimator when the singular values are themselves noisy.
-            # Thresholds are per-voxel fractions of that voxel's leading singular value, so
-            # one grid spans every scale in the brain.
-            scale = sv_all[:, :, 0].mean(dim=1).clamp_min(1e-12)  # (nvc,)
-            tau = tau_fracs[None, :] * scale[:, None]  # (nvc, n_taus)
-            # Per fold, the surviving prefix length under this voxel's threshold.
-            r_sel = (sv_all[:, :, None, :] > tau[:, None, :, None]).sum(dim=-1)  # (nvc,F,T)
-            idx = r_sel.unsqueeze(-1).expand(-1, -1, -1, 9)
-            acc_sel = torch.gather(acc, 2, idx)  # (nvc, F, T, 9)
-            gram_t, rhs_t = _sweep_systems(acc_sel, gm, rh, tau[:, None, :], fold_dim=1)
-            r2_t = 1.0 - _ss_res_from_gram(gram_t, rhs_t, sst[:, None], gam_s) / (
-                ss_tot[:, None] + 1e-12
+        for pname in pair_bands:
+            mr = pair_rank[pname]
+            other = [band_index[n] for n in band_order if n != pname]
+            p_other = partials[:, :, other]
+            gm = torch.einsum("vtb,vtc->vbc", p_other, p_other)
+            rh = torch.einsum("vtb,vt->vb", p_other, target)
+            # Reorder M_full's gammas to match the swept system, which puts the swept band
+            # last.
+            gam_s = torch.cat(
+                [gam_full[:, other], gam_full[:, band_index[pname] : band_index[pname] + 1]], dim=1
             )
-            # Referenced to this family's own no-interaction endpoint (tau = s1, every
-            # singular value thresholded away), not to R2(M_add), so the gain is >= 0 by
-            # construction and is not contaminated by the gamma difference between models.
-            gain_t = r2_t - r2_t[:, -1:]
-            best_t = gain_t.max(dim=1, keepdim=True).values
-            # Largest threshold reaching 95% of the best gain -- the mirror of the rank
-            # sweep's smallest-rank rule, and it fails the same way without it: where the
-            # interaction was shrunk away the curve is flat and a bare argmax returns
-            # tau = 0 ("no shrinkage needed") for a voxel that has no interaction at all.
-            ok = gain_t >= 0.95 * best_t
-            sel = (n_taus - 1) - ok.flip(1).float().argmax(dim=1)
-            nuclear_r2_out[c0:c1] = r2_t.gather(1, sel[:, None]).squeeze(1).cpu()
-            nuclear_tau_out[c0:c1] = tau_fracs[sel].cpu()
-            nuclear_gain_out[c0:c1] = gain_t.gather(1, sel[:, None]).squeeze(1).cpu()
-            del gain_t, best_t, ok, sel
-            del gram_t, rhs_t, r2_t, acc_sel, idx, r_sel
+            gam_s = gam_s.unsqueeze(1)
 
-        align_a_out[c0:c1] = (align_a / n_folds).cpu()
-        align_b_out[c0:c1] = (align_b / n_folds).cpu()
+            # Hard rank sweep, evaluated under M_full's gammas so the curve and the reported
+            # models are the same predictor family: rank_r2[:, mr] IS R2(M_full), and
+            # rank_r2[:, 0] is the full model with this band removed.
+            #
+            # The gammas are deliberately NOT re-fitted per rank. They are selected on the
+            # reporting folds (see the module docstring), which is harmless for the model R2
+            # -- the optimism is common-mode across a set of differences -- but an argmax
+            # over ranks is a selection, and that is precisely where common-mode optimism
+            # stops cancelling. Re-fitting gives the sweep a free scalar per variant and
+            # additive voxels then climb to spurious rank 2-6. Holding the gammas fixed
+            # restores the one-sided error property the rank map is read under: a pure-noise
+            # component adds variance at fixed weight, so it can only ever hurt, and every
+            # selection error is a miss rather than an invention.
+            gram, rhs = _sweep_systems(
+                acc[pname].sum(dim=1), gm, rh, torch.zeros((), device=device), None
+            )
+            rank_r2_out[pname][c0:c1] = (
+                1.0 - _ss_res_from_gram(gram, rhs, sst[:, None], gam_s) / (ss_tot[:, None] + 1e-12)
+            ).cpu()
 
-        del partials, target, acc, sv_all, gm, rh, p_main, gram, rhs, y
+            if n_taus > 0 and mr > 0:
+                # Nuclear (singular-value soft-threshold) sweep: a continuous relaxation of
+                # the hard rank truncation. Hard truncation keeps a noisy singular value at
+                # full size or discards it entirely; soft thresholding shrinks all of them,
+                # which is the better-behaved estimator when the singular values are
+                # themselves noisy. Thresholds are per-voxel fractions of that voxel's
+                # leading singular value, so one grid spans every scale in the brain.
+                sv = sv_all[pname]
+                scale = sv[:, :, 0].mean(dim=1).clamp_min(1e-12)  # (nvc,)
+                tau = tau_fracs[None, :] * scale[:, None]  # (nvc, n_taus)
+                # Per fold, the surviving prefix length under this voxel's threshold.
+                r_sel = (sv[:, :, None, :] > tau[:, None, :, None]).sum(dim=-1)  # (nvc,F,T)
+                idx = r_sel.unsqueeze(-1).expand(-1, -1, -1, _acc_width(n_other))
+                acc_sel = torch.gather(acc[pname], 2, idx)  # (nvc, F, T, w)
+                gram_t, rhs_t = _sweep_systems(acc_sel, gm, rh, tau[:, None, :], fold_dim=1)
+                r2_t = 1.0 - _ss_res_from_gram(gram_t, rhs_t, sst[:, None], gam_s) / (
+                    ss_tot[:, None] + 1e-12
+                )
+                # Referenced to this family's own no-interaction endpoint (tau = s1, every
+                # singular value thresholded away), not to R2(M_add), so the gain is >= 0 by
+                # construction and is not contaminated by a gamma difference between models.
+                gain_t = r2_t - r2_t[:, -1:]
+                best_t = gain_t.max(dim=1, keepdim=True).values
+                # Largest threshold reaching 95% of the best gain -- the mirror of the rank
+                # sweep's smallest-rank rule, and it fails the same way without it: where the
+                # interaction was shrunk away the curve is flat and a bare argmax returns
+                # tau = 0 ("no shrinkage needed") for a voxel that has no interaction at all.
+                ok = gain_t >= 0.95 * best_t
+                sel = (n_taus - 1) - ok.flip(1).float().argmax(dim=1)
+                nuclear_r2_out[pname][c0:c1] = r2_t.gather(1, sel[:, None]).squeeze(1).cpu()
+                nuclear_tau_out[pname][c0:c1] = tau_fracs[sel].cpu()
+                nuclear_gain_out[pname][c0:c1] = gain_t.gather(1, sel[:, None]).squeeze(1).cpu()
+                del gain_t, best_t, ok, sel, gram_t, rhs_t, r2_t, acc_sel, idx, r_sel
+            del gm, rh, p_other, gram, rhs
 
-    ncsnr, noise_ceiling = _compute_ncsnr(betas_t.to(device), cell_flat, n_a * n_b)
+        for key, val in align.items():
+            align_out[key][c0:c1] = (val / n_folds).cpu()
+
+        del partials, target, acc, sv_all, y
+
+    ncsnr, noise_ceiling = _compute_ncsnr(betas_t.to(device), cell_flat, n_cells)
     ncsnr = ncsnr.cpu()
+    ceiling_cpu = noise_ceiling.cpu()
+    obtainable = ceiling_cpu > NC_FLOOR_FOR_RATIO
 
     # Rank selection wants to be one-sided in its errors: below ncsnr ~0.75 a real rank-1
     # interaction collapses to rank 0, and that miss is acceptable, but an *invented* rank
@@ -870,54 +971,69 @@ def partition_variance(
     # rank_e_raw is this selection WITHOUT the ncsnr mask, so it isolates what that mask
     # removed -- it is not the naive argmax, which differs in three ways at once and would
     # diagnose nothing.
-    ceiling_cpu = noise_ceiling.cpu()
-    improvement = rank_r2_out - rank_r2_out[:, :1]
-    best_gain = improvement.max(dim=1).values
-    # The ceiling has to be clamped before dividing, and a clamped denominator would let a
-    # meaningless gain clear the bar wherever the ceiling is essentially zero -- which is
-    # exactly the tissue this guard exists to protect. Require an obtainable ceiling too.
-    obtainable = ceiling_cpu > NC_FLOOR_FOR_RATIO
-    detected = obtainable & (
-        best_gain / ceiling_cpu.clamp_min(NC_FLOOR_FOR_RATIO) > min_interaction_frac_ceiling
-    )
-    parsimonious = (improvement >= 0.95 * best_gain[:, None]).float().argmax(dim=1)
-    rank_e_raw = torch.where(detected, parsimonious, torch.zeros_like(parsimonious))
-    # The ncsnr floor is a *sensitivity* mask, not a detection one: unmasked, the map
-    # prints "task-invariant" over exactly the low-SNR territory (white matter, dropout,
-    # edges), which is a spatial artifact that reads as a finding. Those voxels are marked
-    # -1 ("cannot tell here"), never 0.
-    rank_e_masked = torch.where(
-        ncsnr >= min_ncsnr_for_rank, rank_e_raw, torch.full_like(rank_e_raw, -1)
-    )
+    rank_e_all: dict[str, Tensor] = {}
+    rank_e_raw_all: dict[str, Tensor] = {}
+    for pname in pair_bands:
+        curve = rank_r2_out[pname]
+        improvement = curve - curve[:, :1]
+        best_gain = improvement.max(dim=1).values
+        # The ceiling has to be clamped before dividing, and a clamped denominator would let
+        # a meaningless gain clear the bar wherever the ceiling is essentially zero -- which
+        # is exactly the tissue this guard exists to protect. Require an obtainable ceiling.
+        detected = obtainable & (
+            best_gain / ceiling_cpu.clamp_min(NC_FLOOR_FOR_RATIO) > min_interaction_frac_ceiling
+        )
+        parsimonious = (improvement >= 0.95 * best_gain[:, None]).float().argmax(dim=1)
+        raw = torch.where(detected, parsimonious, torch.zeros_like(parsimonious))
+        rank_e_raw_all[pname] = raw
+        # The ncsnr floor is a *sensitivity* mask, not a detection one: unmasked, the map
+        # prints "task-invariant" over exactly the low-SNR territory (white matter, dropout,
+        # edges), which is a spatial artifact that reads as a finding. Those voxels are
+        # marked -1 ("cannot tell here"), never 0.
+        rank_e_all[pname] = torch.where(ncsnr >= min_ncsnr_for_rank, raw, torch.full_like(raw, -1))
 
-    u_a = r2_out["M_add"] - r2_out[f"M_{fb}"]
-    u_b = r2_out["M_add"] - r2_out[f"M_{fa}"]
-    shared = r2_out[f"M_{fa}"] + r2_out[f"M_{fb}"] - r2_out["M_add"]
+        # Gain vs reorganisation is only a question where there is a rank-1-or-more
+        # interaction to describe; below that the leading singular vector is fitting noise
+        # and its alignment is uniformly distributed, which reads as structure on a map.
+        # Same reasoning as the ncsnr floor on rank_E itself.
+        has_interaction = (rank_e_all[pname] >= 1).to(torch.float32)
+        for side in (0, 1):
+            align_out[(pname, side)] = align_out[(pname, side)] * has_interaction
+
+        # The nuclear sweep answers the same question by a different route, so it takes the
+        # same detection gate: below it there is no interaction to describe, the gain is
+        # zero and the threshold is "everything removed".
+        nuclear_gain_out[pname] = torch.where(
+            detected, nuclear_gain_out[pname], torch.zeros_like(nuclear_gain_out[pname])
+        )
+        nuclear_tau_out[pname] = torch.where(
+            detected, nuclear_tau_out[pname], torch.ones_like(nuclear_tau_out[pname])
+        )
+
+    # Each factor's unique main-effect variance, and each band's unique contribution in the
+    # context of the full model. Under exhaustive crossing these are the same idea applied
+    # at two levels, and there is nothing "shared" to apportion between them.
+    unique = {f: r2_out["M_add"] - r2_out[f"M_add-{f}"] for f in main_bands}
+    band_unique = {b: r2_out["M_full"] - r2_out[f"M_full-{b}"] for b in band_order}
     interaction = r2_out["M_full"] - r2_out["M_add"]
 
-    # Preference is a ratio, and both uniquenesses are held-out R2 differences that go
-    # genuinely negative in noise. A guard on |denominator| is therefore not enough: a
-    # denominator of -1e-3 passes it and flips the ratio's sign for no reason at all, which
-    # paints a confident "purely A-driven" over tissue where neither factor explains
-    # anything. Require a POSITIVE denominator, and require the voxel to have had something
-    # to explain in the first place.
-    denom = u_a + u_b
-    interpretable = (denom > 1e-8) & (ceiling_cpu > NC_FLOOR_FOR_RATIO)
-    preference = torch.where(interpretable, (u_b - u_a) / denom, torch.zeros_like(denom))
+    # Balance diagnostic, generalised: under orthogonality the factor-alone models add up to
+    # the additive model exactly, so any residual is lost balance (or the gamma clamp -- see
+    # the module docstring). At k = 2 this is the classical commonality C.
+    shared = sum((r2_out[f"M_{f}"] for f in main_bands), torch.zeros(n_vox)) - r2_out["M_add"]
 
-    # Gain vs reorganisation is only a question where there is a rank-1-or-more interaction
-    # to describe; below that the leading singular vector is fitting noise and its alignment
-    # is uniformly distributed, which reads as structure on a map. Same reasoning as the
-    # ncsnr floor on rank_E itself.
-    has_interaction = (rank_e_masked >= 1).to(align_a_out.dtype)
-    align_a_out = align_a_out * has_interaction
-    align_b_out = align_b_out * has_interaction
-
-    # The nuclear sweep answers the same question as the rank sweep by a different route,
-    # so it takes the same detection gate: below it there is no interaction to describe,
-    # the gain is zero and the threshold is "everything removed".
-    nuclear_gain_out = torch.where(detected, nuclear_gain_out, torch.zeros_like(nuclear_gain_out))
-    nuclear_tau_out = torch.where(detected, nuclear_tau_out, torch.ones_like(nuclear_tau_out))
+    # Preference is a two-way ratio and only defined for two factors. Both uniquenesses are
+    # held-out R2 differences that go genuinely negative in noise, so a guard on
+    # |denominator| is not enough: a denominator of -1e-3 passes it and flips the sign for no
+    # reason, painting a confident "purely A-driven" over tissue where neither factor
+    # explains anything. Require a POSITIVE denominator and an obtainable ceiling.
+    preference = None
+    interpretable = torch.ones(n_vox, dtype=torch.bool)
+    if len(main_bands) == 2:
+        u_a, u_b = unique[main_bands[0]], unique[main_bands[1]]
+        denom = u_a + u_b
+        interpretable = (denom > 1e-8) & obtainable
+        preference = torch.where(interpretable, (u_b - u_a) / denom, torch.zeros_like(denom))
 
     diagnostics = {
         "balanced": design.balanced,
@@ -927,16 +1043,25 @@ def partition_variance(
         "cells_empty": int((design.cell_counts == 0).sum()),
         "repeats_min": int(design.cell_counts.min()),
         "repeats_max": int(design.cell_counts.max()),
-        "n_levels": {fa: n_a, fb: n_b},
+        "n_factors": len(main_bands),
+        "n_levels": dict(zip(main_bands, n_levels, strict=True)),
+        "bands": list(band_order),
+        "max_rank_per_pair": dict(pair_rank),
         "shared_abs_median": float(shared.abs().median()),
         "min_ncsnr_for_rank": min_ncsnr_for_rank,
         "min_interaction_frac_ceiling": min_interaction_frac_ceiling,
-        "rank_undetermined_frac": float((rank_e_masked < 0).float().mean()),
+        "rank_undetermined_frac_per_pair": {
+            p: float((rank_e_all[p] < 0).float().mean()) for p in pair_bands
+        },
         "n_nuclear_taus": n_taus,
         "factors_nested_in_run": nested,
         "preference_uninterpretable_frac": float((~interpretable).float().mean()),
         **fold_diag,
     }
+    if len(pair_bands) == 1:
+        diagnostics["rank_undetermined_frac"] = diagnostics["rank_undetermined_frac_per_pair"][
+            pair_bands[0]
+        ]
     if not design.balanced:
         diagnostics["warning"] = (
             "design is not balanced: band orthogonality is broken, so the closed-form "
@@ -944,24 +1069,45 @@ def partition_variance(
             "approximate and inspect shared variance."
         )
 
-    return VarPartResult(
+    pair_align = {
+        p: {names[pair_dims[p][0]]: align_out[(p, 0)], names[pair_dims[p][1]]: align_out[(p, 1)]}
+        for p in pair_bands
+    }
+
+    result = VarPartResult(
         r2=r2_out,
-        unique={fa: u_a, fb: u_b},
+        unique=unique,
+        band_unique=band_unique,
         shared=shared,
         interaction=interaction,
         gammas=gam_out,
         preference=preference,
-        rank_e=rank_e_masked,
-        rank_e_raw=rank_e_raw,
-        rank_r2=rank_r2_out,
-        nuclear_r2=nuclear_r2_out if n_taus > 0 else None,
-        nuclear_tau=nuclear_tau_out if n_taus > 0 else None,
-        nuclear_gain=nuclear_gain_out if n_taus > 0 else None,
-        gain_alignment={fa: align_a_out, fb: align_b_out},
+        pair_rank_e=rank_e_all,
+        pair_rank_e_raw=rank_e_raw_all,
+        pair_rank_r2=rank_r2_out,
+        pair_nuclear_tau=nuclear_tau_out if n_taus > 0 else {},
+        pair_nuclear_gain=nuclear_gain_out if n_taus > 0 else {},
+        pair_gain_alignment=pair_align,
         ncsnr=ncsnr,
         noise_ceiling=noise_ceiling.cpu(),
         diagnostics=diagnostics,
     )
+
+    # Two-factor convenience aliases. With one interaction band there is no ambiguity about
+    # which one "the" rank map refers to, so the flat fields stay populated and every
+    # existing caller keeps working; above two factors they are empty and the pair_* dicts
+    # are the interface.
+    if len(pair_bands) == 1:
+        only = pair_bands[0]
+        result.rank_e = rank_e_all[only]
+        result.rank_e_raw = rank_e_raw_all[only]
+        result.rank_r2 = rank_r2_out[only]
+        result.gain_alignment = pair_align[only]
+        if n_taus > 0:
+            result.nuclear_r2 = nuclear_r2_out[only]
+            result.nuclear_tau = nuclear_tau_out[only]
+            result.nuclear_gain = nuclear_gain_out[only]
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1007,10 +1153,11 @@ class _CellOps:
     """
 
     n_cells: int
-    n_a: int
-    n_b: int
-    d_a: Tensor  # (n_cells, n_a - 1) orthonormal in cell space
-    d_b: Tensor  # (n_cells, n_b - 1)
+    band_order: list[str]
+    # Cell-space orthonormal basis per band. The highest-order band is stored as None and
+    # obtained by complement instead -- see the class docstring.
+    bases: dict[str, Tensor | None]
+    complement: str
     cell_of_trial: Tensor  # (n_trials,)
     folds: list[tuple[Tensor, Tensor, Tensor, float]]
     n_trials: int
@@ -1021,18 +1168,40 @@ def _build_cell_ops(
     folds: list[tuple[np.ndarray, np.ndarray]],
     device: torch.device,
 ) -> _CellOps:
-    n_a, n_b = len(design.levels[0]), len(design.levels[1])
-    n_cells = n_a * n_b
-    cell_of_trial = (design.codes[:, 0] * n_b + design.codes[:, 1]).to(device)
+    n_levels = [len(lv) for lv in design.levels]
+    n_cells = int(np.prod(n_levels))
+    cell_of_trial = flat_cell_index(design).to(device)
 
-    # Cell-level orthonormal bases. A main-effect column is constant across the other
-    # factor, so its cell-space norm picks up a sqrt of that factor's level count.
-    cell_a = torch.arange(n_cells, device=device) // n_b
-    cell_b = torch.arange(n_cells, device=device) % n_b
-    c_a = design.contrasts[0].to(device=device, dtype=torch.float32)
-    c_b = design.contrasts[1].to(device=device, dtype=torch.float32)
-    d_a = c_a[cell_a, :] / float(n_b) ** 0.5
-    d_b = c_b[cell_b, :] / float(n_a) ** 0.5
+    # Each cell's level on each factor. The flat index is row-major, so the last factor
+    # varies fastest and decoding runs backwards.
+    cell_codes: list[Tensor] = [torch.zeros(n_cells, dtype=torch.long, device=device)] * len(
+        n_levels
+    )
+    rem = torch.arange(n_cells, device=device)
+    for f in reversed(range(len(n_levels))):
+        cell_codes[f] = rem % n_levels[f]
+        rem = rem // n_levels[f]
+
+    # Cell-level orthonormal bases. A band's columns are constant across every factor it
+    # does not involve, so its cell-space norm picks up a sqrt of those factors' level
+    # counts. The top-order band is left out: the projections are complementary, so
+    # P_top = I - P_intercept - sum(P_other), which replaces the widest band with a
+    # subtraction and is what makes a permutation null affordable.
+    complement = design.band_order[-1]
+    bases: dict[str, Tensor | None] = {}
+    for name in design.band_order:
+        if name == complement:
+            bases[name] = None
+            continue
+        members = design.band_members[name]
+        cols = design.contrasts[members[0]].to(device=device, dtype=torch.float32)[
+            cell_codes[members[0]], :
+        ]
+        for f in members[1:]:
+            nxt = design.contrasts[f].to(device=device, dtype=torch.float32)[cell_codes[f], :]
+            cols = (cols.unsqueeze(2) * nxt.unsqueeze(1)).reshape(n_cells, -1)
+        outside = float(np.prod([n_levels[f] for f in range(len(n_levels)) if f not in members]))
+        bases[name] = (cols / outside**0.5).contiguous()
 
     fold_ops = []
     for train, test in folds:
@@ -1054,10 +1223,9 @@ def _build_cell_ops(
 
     return _CellOps(
         n_cells=n_cells,
-        n_a=n_a,
-        n_b=n_b,
-        d_a=d_a,
-        d_b=d_b,
+        band_order=list(design.band_order),
+        bases=bases,
+        complement=complement,
         cell_of_trial=cell_of_trial,
         folds=fold_ops,
         n_trials=design.n_trials,
@@ -1067,13 +1235,14 @@ def _build_cell_ops(
 def _cellspace_partials(y: Tensor, ops: _CellOps) -> tuple[Tensor, Tensor]:
     """Per-band held-out predictions and targets, concatenated over folds.
 
-    Returns ``(partials, target)`` of shapes ``(n_vox, n_folds * n_cells, 3)`` and
-    ``(n_vox, n_folds * n_cells)``. Band order is (factor A, factor B, interaction).
+    Returns ``(partials, target)`` of shapes ``(n_vox, n_folds * n_cells, n_bands)`` and
+    ``(n_vox, n_folds * n_cells)``, with bands in ``ops.band_order``.
     """
     n_vox = y.shape[0]
     nc = ops.n_cells
     n_folds = len(ops.folds)
-    partials = torch.empty(n_vox, n_folds * nc, 3, device=y.device, dtype=y.dtype)
+    n_bands = len(ops.band_order)
+    partials = torch.empty(n_vox, n_folds * nc, n_bands, device=y.device, dtype=y.dtype)
     target = torch.empty(n_vox, n_folds * nc, device=y.device, dtype=y.dtype)
 
     for fi, (tr, tr_cells, te_by_cell, n_rep_train) in enumerate(ops.folds):
@@ -1081,12 +1250,16 @@ def _cellspace_partials(y: Tensor, ops: _CellOps) -> tuple[Tensor, Tensor]:
         m.index_add_(1, tr_cells, y[:, tr])
         m = m / n_rep_train
         mu = m.mean(dim=1, keepdim=True)
-        p_a = (m @ ops.d_a) @ ops.d_a.T
-        p_b = (m @ ops.d_b) @ ops.d_b.T
         sl = slice(fi * nc, (fi + 1) * nc)
-        partials[:, sl, 0] = p_a
-        partials[:, sl, 1] = p_b
-        partials[:, sl, 2] = m - mu - p_a - p_b
+        rest = m - mu
+        for bi, name in enumerate(ops.band_order):
+            basis = ops.bases[name]
+            if basis is None:
+                continue
+            p = (m @ basis) @ basis.T
+            partials[:, sl, bi] = p
+            rest = rest - p
+        partials[:, sl, ops.band_order.index(ops.complement)] = rest
         target[:, sl] = y[:, te_by_cell] - mu
 
     return partials, target
@@ -1142,20 +1315,28 @@ def _build_trial_ops(
         fold_ops.append((tr, te, torch.linalg.pinv(x_tr.double()).float()))
 
     # Freedman-Lane reduced fits, on the whole dataset. Under imbalance a reduced model is
-    # not a sub-vector of the full fit, so each one gets its own solve.
-    n_a_cols = len(band_order)
+    # not a sub-vector of the full fit, so each one gets its own solve. Every statistic's
+    # reduced model is "the full band set minus the effect under test", so those are the
+    # only subsets that ever get asked for.
     reduced: dict[tuple[int, ...], tuple[Tensor, Tensor]] = {}
-    for bands in ((0,), (1,), (0, 1)):
-        if max(bands) >= n_a_cols:
-            continue
+    for drop in range(len(band_order)):
+        bands = tuple(i for i in range(len(band_order)) if i != drop)
         x = torch.cat(
             [torch.ones(design.n_trials, 1, device=device)]
             + [band_mats[band_order[i]] for i in bands],
             dim=1,
         )
         reduced[bands] = (x, torch.linalg.pinv(x.double()).float())
+    for f in range(design.n_factors):
+        involved = {band_order.index(n) for n in design.bands_involving(f)}
+        bands = tuple(i for i in range(len(band_order)) if i not in involved)
+        if bands in reduced:
+            continue
+        cols = [torch.ones(design.n_trials, 1, device=device)]
+        cols += [band_mats[band_order[i]] for i in bands]
+        x = torch.cat(cols, dim=1)
+        reduced[bands] = (x, torch.linalg.pinv(x.double()).float())
 
-    n_a, n_b = len(design.levels[0]), len(design.levels[1])
     return _TrialOps(
         band_mats=band_mats,
         band_order=band_order,
@@ -1163,22 +1344,21 @@ def _build_trial_ops(
         folds=fold_ops,
         reduced_solvers=reduced,
         n_trials=design.n_trials,
-        cell_of_trial=(design.codes[:, 0] * n_b + design.codes[:, 1]).to(device),
-        n_cells=n_a * n_b,
+        cell_of_trial=flat_cell_index(design).to(device),
+        n_cells=int(np.prod([len(lv) for lv in design.levels])),
     )
 
 
 def _trialspace_partials(y: Tensor, ops: _TrialOps) -> tuple[Tensor, Tensor]:
     """Per-band held-out predictions and targets, in trial space.
 
-    Same contract as :func:`_cellspace_partials` -- ``(n_vox, n_trials, 3)`` partials and
-    ``(n_vox, n_trials)`` targets, band order (A, B, interaction) -- so
-    :func:`_partition_stats` consumes either without knowing which engine produced it.
-    Leave-one-repeat-out folds partition the trials, so every column gets written exactly
-    once.
+    Same contract as :func:`_cellspace_partials` -- ``(n_vox, n_trials, n_bands)`` partials
+    and ``(n_vox, n_trials)`` targets, in ``ops.band_order`` -- so :func:`_partition_stats`
+    consumes either without knowing which engine produced it. Leave-one-repeat-out folds
+    partition the trials, so every column gets written exactly once.
     """
     n_vox = y.shape[0]
-    partials = torch.zeros(n_vox, ops.n_trials, 3, device=y.device, dtype=y.dtype)
+    partials = torch.zeros(n_vox, ops.n_trials, len(ops.band_order), device=y.device, dtype=y.dtype)
     target = torch.zeros(n_vox, ops.n_trials, device=y.device, dtype=y.dtype)
 
     for tr, te, solver in ops.folds:
@@ -1198,36 +1378,77 @@ def _reduced_fit_trials(y: Tensor, ops: _TrialOps, bands: tuple[int, ...]) -> Te
     return (y @ pinv.T) @ x.T
 
 
-_CELL_MODELS: dict[str, list[int]] = {
-    "M0": [],
-    "M_a": [0],
-    "M_b": [1],
-    "M_add": [0, 1],
-    "M_full": [0, 1, 2],
-}
+@dataclass
+class _StatSpec:
+    """One permutation statistic: which models make it, and what the null must destroy.
+
+    ``full`` and ``reduced`` are band-index tuples; the statistic is
+    ``R2(full) - R2(reduced)``, and Freedman-Lane permutes the residuals of ``reduced``.
+    """
+
+    full: tuple[int, ...]
+    reduced: tuple[int, ...]
+    factor: str | None  # set when the statistic is a factor's unique main-effect variance
 
 
-def _partition_stats(partials: Tensor, target: Tensor) -> dict[str, Tensor]:
-    """Cross-validated R2 per nested model plus the three partition statistics."""
-    out: dict[str, Tensor] = {}
-    gammas: Tensor | None = None
-    for name, active in _CELL_MODELS.items():
+def build_stat_specs(design: FactorDesign) -> dict[str, _StatSpec]:
+    """Statistic registry for a k-factor design.
+
+    Names are stable and explicit: ``unique_<factor>`` for a factor's main-effect variance
+    (against the additive model, so factors stay comparable), ``band_<band>`` for a band's
+    contribution to the full model, and ``interaction`` for every interaction band at once.
+    The two-factor names ``unique_a`` / ``unique_b`` are kept as aliases so existing callers
+    and saved scripts keep working.
+    """
+    order = list(design.band_order)
+    idx = {n: i for i, n in enumerate(order)}
+    mains = design.main_bands
+    all_bands = tuple(range(len(order)))
+    add = tuple(idx[n] for n in mains)
+
+    specs: dict[str, _StatSpec] = {}
+    for f, name in enumerate(mains):
+        without = tuple(i for i in add if i != idx[name])
+        specs[f"unique_{name}"] = _StatSpec(full=add, reduced=without, factor=name)
+        if len(mains) == 2:
+            specs["unique_a" if f == 0 else "unique_b"] = specs[f"unique_{name}"]
+    for name in order:
+        drop = tuple(i for i in all_bands if i != idx[name])
+        specs[f"band_{name}"] = _StatSpec(full=all_bands, reduced=drop, factor=None)
+    specs["interaction"] = _StatSpec(full=all_bands, reduced=add, factor=None)
+    return specs
+
+
+def _partition_stats(
+    partials: Tensor,
+    target: Tensor,
+    specs: dict[str, _StatSpec],
+    keys: tuple[str, ...] | None = None,
+) -> dict[str, Tensor]:
+    """Cross-validated R2 for every model a requested statistic needs, then the statistics.
+
+    Only the models actually referenced get fitted, which matters inside a permutation loop:
+    the full registry is 2^k + k models but any one null needs two of them.
+    """
+    wanted = tuple(specs) if keys is None else keys
+    needed: set[tuple[int, ...]] = set()
+    for key in wanted:
+        needed.add(specs[key].full)
+        needed.add(specs[key].reduced)
+
+    r2: dict[tuple[int, ...], Tensor] = {}
+    for active in needed:
         if not active:
             pred = torch.zeros_like(target)
         else:
-            gam = _solve_gammas(partials, target, active)
-            pred = torch.einsum("vtb,vb->vt", partials[:, :, active], gam)
-            if name == "M_full":
-                gammas = gam
-        out[name] = _r2_from_pred(target, pred)
+            gam = _solve_gammas(partials, target, list(active))
+            pred = torch.einsum("vtb,vb->vt", partials[:, :, list(active)], gam)
+        r2[active] = _r2_from_pred(target, pred)
 
-    out["unique_a"] = out["M_add"] - out["M_b"]
-    out["unique_b"] = out["M_add"] - out["M_a"]
-    out["interaction"] = out["M_full"] - out["M_add"]
-    out["shared"] = out["M_a"] + out["M_b"] - out["M_add"]
-    if gammas is not None:
-        for i, key in enumerate(("gamma_a", "gamma_b", "gamma_interaction")):
-            out[key] = gammas[:, i]
+    out: dict[str, Tensor] = {}
+    for key in wanted:
+        spec = specs[key]
+        out[key] = r2[spec.full] - r2[spec.reduced]
     return out
 
 
@@ -1242,11 +1463,23 @@ def _reduced_fit_cells(y: Tensor, ops: _CellOps, bands: tuple[int, ...]) -> Tens
     m.index_add_(1, ops.cell_of_trial, y)
     counts = torch.bincount(ops.cell_of_trial, minlength=ops.n_cells).to(y.dtype)
     m = m / counts.clamp_min(1)
-    fit = m.mean(dim=1, keepdim=True).expand(-1, ops.n_cells).clone()
-    if 0 in bands:
-        fit = fit + (m @ ops.d_a) @ ops.d_a.T
-    if 1 in bands:
-        fit = fit + (m @ ops.d_b) @ ops.d_b.T
+    mu = m.mean(dim=1, keepdim=True)
+    fit = mu.expand(-1, ops.n_cells).clone()
+    keep = {ops.band_order[i] for i in bands}
+    if ops.complement in keep:
+        # The top-order band has no stored basis, so build it by complement: everything
+        # except the intercept and the bands that were left out.
+        fit = m.clone()
+        for name in ops.band_order:
+            basis = ops.bases[name]
+            if name in keep or basis is None:
+                continue
+            fit = fit - (m @ basis) @ basis.T
+        return fit
+    for name in keep:
+        basis = ops.bases[name]
+        assert basis is not None
+        fit = fit + (m @ basis) @ basis.T
     return fit
 
 
@@ -1341,11 +1574,8 @@ class PermutationResult:
 
 
 # Reduced model (as band indices) whose residuals get permuted to null each statistic.
-_REDUCED_FOR: dict[str, tuple[int, ...]] = {
-    "unique_a": (1,),
-    "unique_b": (0,),
-    "interaction": (0, 1),
-}
+# The reduced model per statistic is derived from the design now (see build_stat_specs),
+# because at k factors "everything except the effect under test" is no longer a short list.
 
 
 def permutation_test(
@@ -1384,11 +1614,11 @@ def permutation_test(
     if device is None:
         device = get_device()
 
-    bad = set(statistics) - set(_REDUCED_FOR)
-    if bad:
-        raise ValueError(f"unknown statistics {sorted(bad)}; expected {sorted(_REDUCED_FOR)}")
-
     design = build_factor_design(factor_codes)
+    specs = build_stat_specs(design)
+    bad = set(statistics) - set(specs)
+    if bad:
+        raise ValueError(f"unknown statistics {sorted(bad)}; expected {sorted(specs)}")
 
     betas_t = torch.as_tensor(np.asarray(betas)) if not isinstance(betas, Tensor) else betas
     if betas_t.shape[1] != design.n_trials:
@@ -1463,7 +1693,7 @@ def permutation_test(
     for c0 in range(0, n_vox, chunk_size):
         c1 = min(c0 + chunk_size, n_vox)
         chunk = betas_t[c0:c1].to(device)
-        stats = _partition_stats(*partials_of(chunk, ops))
+        stats = _partition_stats(*partials_of(chunk, ops), specs, statistics)
         for key in statistics:
             observed[key][c0:c1] = stats[key].cpu()
 
@@ -1473,9 +1703,8 @@ def permutation_test(
     # within-run permutation leaves a run-constant effect exactly untouched and returns
     # p ~ 1 for everything. See :class:`_RunExchange`.
     nested = detect_run_nesting(factor_codes, run)
-    stat_factor = {"unique_a": design.factor_names[0], "unique_b": design.factor_names[1]}
     scheme_of = {
-        key: ("whole_run" if stat_factor.get(key) in nested else "within_run") for key in statistics
+        key: ("whole_run" if specs[key].factor in nested else "within_run") for key in statistics
     }
     exchange: _RunExchange | None = None
     if "whole_run" in scheme_of.values():
@@ -1528,7 +1757,7 @@ def permutation_test(
 
     n_chunks = (n_vox + chunk_size - 1) // chunk_size
     for key in statistics:
-        reduced = _REDUCED_FOR[key]
+        reduced = specs[key].reduced
         perms = perms_for[scheme_of[key]]
         # Running max over voxels, kept on device so the inner loop never synchronises.
         null_max = torch.full((n_perms,), float("-inf"), device=device)
@@ -1553,7 +1782,7 @@ def permutation_test(
                 obs_chunk = obs_dev[c0:c1]
                 for p in range(n_perms):
                     y_star = fit_trials + resid[:, perms[p]]
-                    stats = _partition_stats(*partials_of(y_star, ops))
+                    stats = _partition_stats(*partials_of(y_star, ops), specs, (key,))
                     s = stats[key]
                     null_max[p] = torch.maximum(null_max[p], s.max())
                     count_ge[c0:c1] += (s >= obs_chunk).to(torch.int32)

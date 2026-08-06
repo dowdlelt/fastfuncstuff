@@ -23,6 +23,7 @@ from fastfuncstuff.stats.variance_partition import (
     build_factor_design,
     build_repeat_folds,
     build_run_exchange,
+    build_stat_specs,
     cell_labels,
     derive_repeat_index,
     detect_run_nesting,
@@ -493,16 +494,15 @@ def test_cellspace_engine_matches_general_path():
     design = build_factor_design(factors)
     folds, _ = build_repeat_folds(rep, run)
     ops = _build_cell_ops(design, folds, torch.device("cpu"))
-    fast = _partition_stats(*_cellspace_partials(betas, ops))
+    fast = _partition_stats(*_cellspace_partials(betas, ops), build_stat_specs(design))
 
     slow = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
 
     torch.testing.assert_close(fast["unique_a"], slow.unique["stim"], atol=1e-4, rtol=0)
     torch.testing.assert_close(fast["unique_b"], slow.unique["task"], atol=1e-4, rtol=0)
     torch.testing.assert_close(fast["interaction"], slow.interaction, atol=1e-4, rtol=0)
-    torch.testing.assert_close(fast["shared"], slow.shared, atol=1e-4, rtol=0)
     torch.testing.assert_close(
-        fast["gamma_interaction"], slow.gammas["stim:task"], atol=1e-4, rtol=0
+        fast["band_stim:task"], slow.band_unique["stim:task"], atol=1e-4, rtol=0
     )
 
 
@@ -598,13 +598,14 @@ def test_trialspace_engine_matches_cellspace_when_balanced():
     folds, _ = build_repeat_folds(rep, run, cell=cell_labels(design))
     device = torch.device("cpu")
 
+    specs = build_stat_specs(design)
     cell_stats = _partition_stats(
-        *_cellspace_partials(betas, _build_cell_ops(design, folds, device))
+        *_cellspace_partials(betas, _build_cell_ops(design, folds, device)), specs
     )
     trial_stats = _partition_stats(
-        *_trialspace_partials(betas, _build_trial_ops(design, folds, device))
+        *_trialspace_partials(betas, _build_trial_ops(design, folds, device)), specs
     )
-    for key in ("unique_a", "unique_b", "interaction", "M_add", "M_full"):
+    for key in ("unique_a", "unique_b", "interaction", "band_stim", "band_stim:task"):
         torch.testing.assert_close(cell_stats[key], trial_stats[key], atol=2e-4, rtol=2e-3)
 
 
@@ -989,3 +990,179 @@ def test_whole_run_permutation_needs_matching_runs():
     keep[0] = False  # one run is now a trial short
     with pytest.raises(ValueError, match="matching trial structure"):
         build_run_exchange(run[keep], factors["stim"][keep])
+
+
+# ---------------------------------------------------------------------------
+# Three or more factors
+# ---------------------------------------------------------------------------
+
+
+def make_three_factor_table(n_task=3, n_stim=16, n_noise=2, n_rep=3, seed=0):
+    """Task locked to run, stimulus and noise level crossed within it.
+
+    The shape of Logan's follow-up study: 9 runs, 3 tasks, 16 stimuli at 2 noise levels,
+    3 repeats. 96 cells, 288 trials, still exhaustively crossed and balanced.
+    """
+    rng = np.random.default_rng(seed)
+    task, stim, noise, run, rep = [], [], [], [], []
+    r = 0
+    for k in range(n_rep):
+        for t in range(n_task):
+            cells = [(s, z) for s in range(n_stim) for z in range(n_noise)]
+            rng.shuffle(cells)
+            for s, z in cells:
+                task.append(f"T{t}")
+                stim.append(f"S{s:02d}")
+                noise.append(f"N{z}")
+                run.append(f"run{r:02d}")
+                rep.append(k)
+            r += 1
+    factors = {"stim": np.array(stim), "task": np.array(task), "noise": np.array(noise)}
+    return factors, np.array(rep), np.array(run)
+
+
+def test_three_factor_design_builds_every_band_orthogonally():
+    factors, _, _ = make_three_factor_table()
+    design = build_factor_design(factors)
+    assert design.band_order == [
+        "stim",
+        "task",
+        "noise",
+        "stim:task",
+        "stim:noise",
+        "task:noise",
+        "stim:task:noise",
+    ]
+    assert design.main_bands == ["stim", "task", "noise"]
+    assert design.pair_bands == ["stim:task", "stim:noise", "task:noise"]
+    assert design.balanced
+    # 2^k - 1 bands, and their widths partition the cell space minus the intercept.
+    assert sum(b.shape[1] for b in design.bands.values()) == 16 * 3 * 2 - 1
+    assert design.max_offdiag < BALANCE_TOL
+
+
+def _three_factor_betas(seed=0, n_vox=90, noise_sd=0.6):
+    """Three blocks: additive, a noise-level GAIN on the stimulus profile, a task REORG."""
+    rng = np.random.default_rng(seed)
+    factors, rep, run = make_three_factor_table(seed=seed)
+    ti = np.array([int(x[1:]) for x in factors["task"]])
+    si = np.array([int(x[1:]) for x in factors["stim"]])
+    zi = np.array([int(x[1:]) for x in factors["noise"]])
+    n_stim, n_task, n_noise = si.max() + 1, ti.max() + 1, zi.max() + 1
+    third = n_vox // 3
+
+    vs = rng.normal(size=(n_vox, n_stim))
+    vz = 0.8 * rng.normal(size=(n_vox, n_noise))
+    sig = vs[:, si] + vz[:, zi]
+    g = rng.normal(size=(n_vox, n_noise))
+    sig[third : 2 * third] += 1.2 * (vs[third : 2 * third][:, si] * g[third : 2 * third][:, zi])
+    w = rng.normal(size=(n_vox, n_stim))
+    g2 = rng.normal(size=(n_vox, n_task))
+    sig[2 * third :] += 1.2 * (w[2 * third :][:, si] * g2[2 * third :][:, ti])
+
+    y = sig + noise_sd * rng.normal(size=(n_vox, len(si)))
+    return torch.as_tensor(y, dtype=torch.float32), factors, rep, run, third
+
+
+def test_three_factor_partition_attributes_each_effect_to_its_own_band():
+    """The payoff of k factors: a noise-level gain and a task reorganisation separate.
+
+    Collapsed into a single 32-level "stimulus" factor these are indistinguishable -- both
+    read as "stimulus interacts with task". Split out, each lands in exactly one band.
+    """
+    betas, factors, rep, run, third = _three_factor_betas(seed=2)
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+
+    add, gain, reorg = slice(0, third), slice(third, 2 * third), slice(2 * third, None)
+    bu = res.band_unique
+
+    # Each planted effect shows up in its own band and nowhere else.
+    assert bu["stim:noise"][gain].median() > 0.05
+    assert bu["stim:noise"][add].median() < 0.01
+    assert bu["stim:noise"][reorg].median() < 0.01
+    assert bu["stim:task"][reorg].median() > 0.05
+    assert bu["stim:task"][add].median() < 0.01
+    assert bu["stim:task"][gain].median() < 0.01
+    # No three-way term was planted, and none is invented.
+    assert bu["stim:task:noise"].abs().median() < 0.01
+    # Orthogonality still holds at k = 3, so there is nothing shared.
+    assert res.shared.abs().median() < 0.02
+
+
+def test_three_factor_gain_alignment_names_the_modulated_factor():
+    betas, factors, rep, run, third = _three_factor_betas(seed=3)
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    gain = slice(third, 2 * third)
+
+    align = res.pair_gain_alignment["stim:noise"]["stim"]
+    resolved = res.pair_rank_e["stim:noise"][gain] >= 1
+    assert resolved.float().mean() > 0.5
+    # The planted effect IS a gain on the stimulus profile, so the leading singular vector
+    # of stim:noise should sit on the stimulus main effect.
+    assert align[gain][resolved].median() > 0.7
+
+    # A 2-level factor has one contrast column, so any interaction it takes part in is
+    # rank 1 by construction -- worth asserting, because it means rank_E carries no
+    # information there and gain_align is the only informative output.
+    assert res.diagnostics["max_rank_per_pair"]["stim:noise"] == 1
+    assert res.diagnostics["max_rank_per_pair"]["task:noise"] == 1
+    assert res.diagnostics["max_rank_per_pair"]["stim:task"] == 2
+
+
+def test_three_factor_flat_aliases_are_empty_but_pair_dicts_are_not():
+    """Above two factors "the" interaction is ambiguous, so the flat fields stay unset."""
+    betas, factors, rep, run, _ = _three_factor_betas(seed=4, n_vox=12)
+    res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    assert res.rank_e is None and res.rank_r2 is None and res.nuclear_gain is None
+    assert res.gain_alignment == {}
+    assert set(res.pair_rank_e) == {"stim:task", "stim:noise", "task:noise"}
+    assert res.preference is None, "preference is a two-way ratio"
+
+    two = partition_variance(
+        betas,
+        {k: factors[k] for k in ("stim", "task")},
+        repeat=rep,
+        run=run,
+        verbose=False,
+    )
+    assert two.rank_e is not None and two.preference is not None
+    torch.testing.assert_close(two.rank_e, two.pair_rank_e["stim:task"])
+
+
+def test_three_factor_permutation_uses_the_right_scheme_per_statistic():
+    betas, factors, rep, run, _ = _three_factor_betas(seed=5, n_vox=30)
+    res = permutation_test(
+        betas,
+        factors,
+        repeat=rep,
+        run=run,
+        statistics=("unique_stim", "unique_task", "band_stim:noise"),
+        n_perms=30,
+        seed=0,
+        verbose=False,
+    )
+    scheme = res.diagnostics["permutation_scheme"]
+    # Only the run-nested factor's own statistic changes exchangeability unit.
+    assert scheme["unique_task"] == "whole_run"
+    assert scheme["unique_stim"] == "within_run"
+    assert scheme["band_stim:noise"] == "within_run"
+    for key in ("unique_stim", "unique_task", "band_stim:noise"):
+        assert res.p_uncorrected[key].shape == (30,)
+
+
+def test_three_factor_cellspace_and_trialspace_engines_agree():
+    betas, factors, rep, run, _ = _three_factor_betas(seed=6, n_vox=8)
+    design = build_factor_design(factors)
+    folds, _ = build_repeat_folds(rep, run, cell=cell_labels(design))
+    device = torch.device("cpu")
+    specs = build_stat_specs(design)
+    keys = ("unique_stim", "interaction", "band_stim:noise", "band_stim:task:noise")
+
+    cell = _partition_stats(
+        *_cellspace_partials(betas, _build_cell_ops(design, folds, device)), specs, keys
+    )
+    trial = _partition_stats(
+        *_trialspace_partials(betas, _build_trial_ops(design, folds, device)), specs, keys
+    )
+    for key in keys:
+        torch.testing.assert_close(cell[key], trial[key], atol=2e-4, rtol=2e-3)

@@ -249,9 +249,9 @@ def test_missing_factor_column_names_available_columns(tmp_path):
         )
 
 
-def test_requires_exactly_two_factors(tmp_path):
+def test_requires_at_least_two_factors(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
-    with pytest.raises(SystemExit, match="exactly 2 column names"):
+    with pytest.raises(SystemExit, match="at least 2 column names"):
         _run(
             [
                 "-betas",

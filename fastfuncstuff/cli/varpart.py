@@ -66,6 +66,10 @@ Everything is computed on HELD-OUT repeats (leave-one-repeat-out CV). "Explains"
 always means predicted out of sample, never fitted. Below, A and B are your two
 -factors, in the order you gave them.
 
+TWO FACTORS OR MORE? The names below describe the two-factor case, which is what
+most of the maps are about. -factors accepts any number; see "Three or more
+factors" near the bottom for what changes.
+
 --- The R2 family: fraction of held-out variance explained ------------------
 R2 = 1 - SS_residual/SS_total, NOT a squared correlation. 1.0 = perfect
 prediction, 0.0 = no better than the unit's own mean, NEGATIVE = worse than the
@@ -183,6 +187,43 @@ The permutation null on `interaction` is the significance test.
                 per-band shrinkage re-fitted inside every permutation so the null
                 absorbs the selection optimism.
 
+--- Three or more factors ---------------------------------------------------
+-factors takes any number of columns. Exhaustive crossing makes every band
+orthogonal to every other, so the partition gets SIMPLER with more factors, not
+harder: there is nothing shared to apportion, and each effect is just its own
+band's contribution. With k factors there are 2^k - 1 bands -- k main effects,
+every two-way interaction, and every higher-order term.
+
+What changes in the outputs:
+
+  band_<band>   Each band's unique contribution to the full model, in R2 units.
+                Written for k > 2 only (with two factors the single interaction
+                band's value IS `interaction`). ':' becomes '_x_' in map names,
+                so the stim x task band is `band_stim_x_task`.
+  rank_E_<pair> The interaction-structure maps are now PER two-way interaction,
+  gain_align_*  suffixed with the pair. Higher-order bands get variance and a
+                gamma but no structure: their coefficients form a tensor, and
+                rank there needs a CP/Tucker decomposition rather than an SVD.
+  preference    Not written. It is a two-way ratio and has no k-way meaning.
+
+Why bother splitting a factor out rather than folding it into the levels of
+another? Because collapsed, two different effects are indistinguishable. If
+16 stimuli x 2 noise levels are coded as 32 "stimuli", then "noise level rescales
+the stimulus profile" and "task reorganises the stimulus profile" both read as
+one big stimulus x task interaction. Split out, the first lands in stim:noise and
+the second in stim:task, and you can see which is which.
+
+The one thing you must NOT do is average over a factor you care about. Two trials
+that differ in noise level but share a cell label make that difference WITHIN-cell
+variance -- which is exactly what ncsnr calls noise. The ceiling drops, and every
+*_frac_ceiling map inflates. Either give the factor its own column or bake it into
+the level name; never let it collapse into repeats.
+
+Note that a 2-level factor has ONE contrast column, so every interaction it takes
+part in is rank <= 1 by construction. rank_E carries no information there -- it
+can only say 0 or 1 -- and gain_align is the map that distinguishes "this factor
+scales the other's profile" from "it reshapes it".
+
 --- If a factor is locked to run (READ THIS) --------------------------------
 A factor that never varies within a run -- one task per run, say -- is NESTED in
 run, and ffs_varpart says so loudly rather than refusing. What it means:
@@ -224,6 +265,16 @@ Examples:
   # With permutation inference (slow at voxel level; pair it with -atlas)
   ffs_varpart -betas trials.nii.gz -trials trials.csv -factors stim,task \\
               -mask brain.nii.gz -perm 1000 -prefix vp
+
+  # Three factors: 16 stimuli x 2 noise levels x 3 tasks. Splits "noise rescales
+  # the stimulus profile" (stim:noise) from "task reorganises it" (stim:task)
+  ffs_varpart -betas trials.nii.gz -trials trials.tsv \\
+              -factors stim,task,noise -mask brain.nii.gz -prefix vp3
+
+  # Test one specific band
+  ffs_varpart -betas trials.nii.gz -trials trials.tsv -factors stim,task,noise \\
+              -perm 1000 -perm_stats band_stim:noise -atlas schaefer400.nii.gz \\
+              -prefix vp3
 
   # Restrict to a subset: drop the first run and one task entirely
   ffs_varpart -betas out_single_trial_betas.nii.gz \\
@@ -330,8 +381,12 @@ mapping back to the original labels is written to {prefix}_varpart.json).
         "-perm_stats",
         "-perm-stats",
         dest="perm_stats",
-        default="unique_a,unique_b,interaction",
-        help="Which statistics to test; comma-separated",
+        default=None,
+        help=(
+            "Which statistics to test; comma-separated. Default: unique_<factor> for every "
+            "factor plus 'interaction'. Also available: band_<band> for any single band, "
+            "e.g. band_stim:task or band_stim:task:noise"
+        ),
     )
     opt.add_argument(
         "-strict_run_locality",
@@ -452,9 +507,9 @@ def main() -> int:
     print(f"🖥️  Device: {device}")
 
     factor_names = [f.strip() for f in args.factors.replace(" ", ",").split(",") if f.strip()]
-    if len(factor_names) != 2:
+    if len(factor_names) < 2:
         raise SystemExit(
-            f"❌ -factors needs exactly 2 column names, got {len(factor_names)}: {factor_names}"
+            f"❌ -factors needs at least 2 column names, got {len(factor_names)}: {factor_names}"
         )
 
     all_rows = _read_table(args.trials)
@@ -572,9 +627,7 @@ def main() -> int:
         verbose=not args.quiet,
     )
 
-    fa, fb = factor_names
-    assert res.rank_e is not None and res.rank_e_raw is not None
-    assert res.shared is not None and res.interaction is not None and res.preference is not None
+    assert res.shared is not None and res.interaction is not None
     d = res.diagnostics
     print("\n📊 Diagnostics")
     print(f"   balanced: {d['balanced']}  (max off-diagonal Gram {d['max_offdiag_gram']:.2e})")
@@ -598,10 +651,8 @@ def main() -> int:
     if d["shared_abs_median"] > 0.02:
         print("   ⚠️  shared variance is not ~0: the design is unbalanced somewhere;")
         print("       treat the partition as approximate and check for dropped trials.")
-    print(
-        f"   rank undetermined (ncsnr < {args.min_ncsnr_for_rank}): "
-        f"{d['rank_undetermined_frac']:.1%}"
-    )
+    for pair, frac in d["rank_undetermined_frac_per_pair"].items():
+        print(f"   rank undetermined for {pair} (ncsnr < {args.min_ncsnr_for_rank}): {frac:.1%}")
     nested = d.get("factors_nested_in_run") or {}
     if nested:
         # partition_variance already printed the full explanation; keep a one-line marker
@@ -616,7 +667,10 @@ def main() -> int:
 
     perm_res = None
     if args.perm > 0:
-        stats = tuple(s.strip() for s in args.perm_stats.split(",") if s.strip())
+        if args.perm_stats:
+            stats = tuple(s.strip() for s in args.perm_stats.split(",") if s.strip())
+        else:
+            stats = tuple(f"unique_{n}" for n in factor_names) + ("interaction",)
         print(f"\n🎲 Permutation null: {args.perm} permutations x {len(stats)} statistic(s)")
         if block is None:
             print("   ⚠️  no run/session column: permuting freely (anticonservative)")
@@ -634,27 +688,44 @@ def main() -> int:
         )
 
     # ── Outputs ──────────────────────────────────────────────────────────────
-    maps: dict[str, torch.Tensor] = {
-        f"unique_{fa}": res.unique[fa],
-        f"unique_{fb}": res.unique[fb],
-        "shared": res.shared,
-        "interaction": res.interaction,
-        "preference": res.preference,
-        "rank_E": res.rank_e.float(),  # -1 where ncsnr is below the detection floor
-        "rank_E_raw": res.rank_e_raw.float(),  # unmasked argmax, for diagnosing the mask
-        f"gain_align_{fa}": res.gain_alignment[fa],
-        f"gain_align_{fb}": res.gain_alignment[fb],
-        "ncsnr": res.ncsnr,
-        "noise_ceiling": res.noise_ceiling,
-        f"gamma_{fa}": res.gammas[fa],
-        f"gamma_{fb}": res.gammas[fb],
-        "gamma_interaction": res.gammas[f"{fa}:{fb}"],
-        "r2_additive": res.r2["M_add"],
-        "r2_full": res.r2["M_full"],
-    }
-    if res.nuclear_gain is not None and res.nuclear_tau is not None:
-        maps["interaction_nuclear"] = res.nuclear_gain
-        maps["nuclear_tau"] = res.nuclear_tau
+    # ':' separates a band's factors, but it is not usable in an AFNI sub-brick label
+    # selector, so band names become '_x_' in map names ("stim_x_task").
+    def tag(band: str) -> str:
+        return band.replace(":", "_x_")
+
+    maps: dict[str, torch.Tensor] = {}
+    for name in factor_names:
+        maps[f"unique_{name}"] = res.unique[name]
+    maps["shared"] = res.shared
+    maps["interaction"] = res.interaction
+    if res.preference is not None:
+        maps["preference"] = res.preference
+
+    # Per-band contribution to the full model. With two factors these repeat information
+    # already in unique_*/interaction; above two they are the primary result, because that
+    # is where "which of the seven effects is this voxel carrying" is a real question.
+    # With two factors the single interaction band's unique variance IS `interaction`, so
+    # these would just duplicate it. Above two factors they are the primary result.
+    if len(factor_names) > 2:
+        for band in d["bands"]:
+            maps[f"band_{tag(band)}"] = res.band_unique[band]
+
+    for pair, rank in res.pair_rank_e.items():
+        suffix = "" if len(res.pair_rank_e) == 1 else f"_{tag(pair)}"
+        maps[f"rank_E{suffix}"] = rank.float()  # -1 where ncsnr is below the floor
+        maps[f"rank_E_raw{suffix}"] = res.pair_rank_e_raw[pair].float()
+        for fac, align in res.pair_gain_alignment[pair].items():
+            maps[f"gain_align{suffix}_{fac}"] = align
+        if pair in res.pair_nuclear_gain:
+            maps[f"interaction_nuclear{suffix}"] = res.pair_nuclear_gain[pair]
+            maps[f"nuclear_tau{suffix}"] = res.pair_nuclear_tau[pair]
+
+    maps["ncsnr"] = res.ncsnr
+    maps["noise_ceiling"] = res.noise_ceiling
+    for band in d["bands"]:
+        maps[f"gamma_{tag(band)}"] = res.gammas[band]
+    maps["r2_additive"] = res.r2["M_add"]
+    maps["r2_full"] = res.r2["M_full"]
 
     # Held-out R² is capped by the noise ceiling, not by 1, and the ceiling varies enormously
     # across the brain. 0.02 against a ceiling of 0.05 is most of what was ever obtainable
@@ -666,9 +737,8 @@ def main() -> int:
     # Below this an oracle model could not explain 1% of the variance, so the ratio is
     # noise/noise and would paint garbage over exactly the tissue with nothing in it.
     obtainable = ceiling > CEILING_FLOOR
-    frac_sources = [f"unique_{fa}", f"unique_{fb}", "interaction", "r2_full"]
-    if "interaction_nuclear" in maps:
-        frac_sources.append("interaction_nuclear")
+    frac_sources = [f"unique_{n}" for n in factor_names] + ["interaction", "r2_full"]
+    frac_sources += [k for k in maps if k.startswith("interaction_nuclear")]
     for source in frac_sources:
         frac = torch.where(obtainable, maps[source] / ceiling.clamp_min(CEILING_FLOOR), zero)
         maps[f"{source}_frac_ceiling"] = frac
@@ -680,9 +750,14 @@ def main() -> int:
         # a two-step operation and is easy to get backwards. The library still returns
         # true p-values; only the written maps are complemented. Name avoids a leading
         # digit so it stays usable in AFNI sub-brick label selectors.
-        rename = {"unique_a": f"unique_{fa}", "unique_b": f"unique_{fb}"}
+        rename = {}
+        if len(factor_names) == 2:
+            rename = {
+                "unique_a": f"unique_{factor_names[0]}",
+                "unique_b": f"unique_{factor_names[1]}",
+            }
         for key in perm_res.p_fwe:
-            base = rename.get(key, key)
+            base = tag(rename.get(key, key))
             maps[f"oneminusp_unc_{base}"] = 1.0 - perm_res.p_uncorrected[key]
             maps[f"oneminusp_fwe_{base}"] = 1.0 - perm_res.p_fwe[key]
 
