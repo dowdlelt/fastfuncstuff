@@ -1026,3 +1026,101 @@ def test_excluded_voxels_keep_their_mean_but_lose_their_fit(tmp_path):
     assert np.isnan(data[1, labels.index("x")])
     assert data[1, labels.index("meanvol")] == pytest.approx(340.0)
     assert data[0, labels.index("meanvol")] == pytest.approx(120.0)
+
+
+def _write_prf_dataset(tmp_path):
+    """Two runs of a tiny volume: a responsive slab, plus non-responsive voxels."""
+    import nibabel as nib
+
+    from fastfuncstuff.design.hrf import load_canonical_hrf_basic
+
+    rng = np.random.default_rng(0)
+    shape = (12, 12, 2)
+    n_voxels = int(np.prod(shape))
+    n_tps = 120
+    aperture = (6, 6)
+    hrf = load_canonical_hrf_basic(microtime_dt=1.0, device=torch.device("cpu")).numpy()
+    inputs, stimuli = [], []
+    for run in range(2):
+        frames = rng.integers(0, 2, (n_tps, *aperture)).astype(np.float32)
+        # A blob at a fixed aperture location, so the responsive voxels have a
+        # position the grid can actually find.
+        signal = np.convolve(frames[:, 1:3, 1:3].mean(axis=(1, 2)), hrf)[:n_tps]
+        nuisance = rng.standard_normal(n_tps).astype(np.float32)
+        series = np.empty((n_voxels, n_tps), dtype=np.float32)
+        for voxel in range(n_voxels):
+            noise = 0.05 * rng.standard_normal(n_tps).astype(np.float32)
+            if voxel < 24:  # the fit mask, below
+                series[voxel] = 100.0 + 10.0 * signal + noise
+            else:
+                series[voxel] = 100.0 + 5.0 * nuisance + noise
+        image = nib.Nifti1Image(series.reshape(*shape, n_tps), np.eye(4))
+        image.header.set_zooms((1.0, 1.0, 1.0, 1.0))
+        path = tmp_path / f"run{run}.nii.gz"
+        nib.save(image, path)
+        inputs.append(str(path))
+        stimulus = tmp_path / f"stim{run}.nii.gz"
+        nib.save(nib.Nifti1Image(frames.transpose(1, 2, 0)[:, :, None, :], np.eye(4)), stimulus)
+        stimuli.append(str(stimulus))
+
+    fit_mask = np.zeros(n_voxels, dtype=np.float32)
+    fit_mask[:24] = 1.0
+    mask_path = tmp_path / "fitmask.nii.gz"
+    nib.save(nib.Nifti1Image(fit_mask.reshape(shape), np.eye(4)), mask_path)
+    return inputs, stimuli, str(mask_path), shape
+
+
+def test_noise_pool_mask_reaches_outside_the_fit_mask(tmp_path):
+    """-noise_pool_mask fits only inside -mask but pools noise from the whole volume."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli, mask_path, shape = _write_prf_dataset(tmp_path)
+    prefix = str(tmp_path / "out")
+    assert (
+        main(
+            [
+                "-input",
+                *inputs,
+                "-stimulus",
+                *stimuli,
+                "-mask",
+                mask_path,
+                "-prefix",
+                prefix,
+                "-denoise",
+                "-noise_pool_mask",
+                "all",
+                "-max_pcs",
+                "2",
+                "-save_denoise",
+                "-quick",
+                "-screen_tiles",
+                "40",
+                "-grid_angles",
+                "4",
+                "-grid_sigma_steps",
+                "1",
+                "-grid_ecc_steps",
+                "2",
+                "-device",
+                "cpu",
+                "-quiet",
+            ]
+        )
+        == 0
+    )
+
+    image = nib.load(f"{prefix}.nii.gz")
+    labels = read_brick_labels(image)
+    r2 = image.get_fdata().reshape(-1, len(labels))[:, labels.index("r2")]
+    # Everything was loaded (the pool is the whole volume) but only the fit mask
+    # was fit; the rest comes back NaN rather than as a fit of the wrong voxels.
+    assert np.isfinite(r2[:24]).all()
+    assert np.isnan(r2[24:]).all()
+    # ... and the pool it denoised with is drawn from voxels the fit never saw.
+    pool = nib.load(f"{prefix}_noisepool.nii.gz").get_fdata().reshape(-1)
+    assert pool[24:].sum() > 0
+    assert pool[:24].sum() == 0

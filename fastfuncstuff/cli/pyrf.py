@@ -150,6 +150,8 @@ CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on your
                   and fold would be tens of fits -- and zero is a legitimate
                   answer when denoising does not earn its degrees of freedom.
                   Needs 2+ runs. -save_denoise writes the sweep figure.
+                  -noise_pool_mask decouples the pool from -mask: fit an ROI,
+                  but take the components from the whole brain.
   -screen_top     larger still, and functional rather than anatomical: a linear
                   ridge pRF is fitted to every voxel in seconds, and only the
                   best-screening ones get the CSS refinement. Whole brain,
@@ -570,6 +572,21 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     screening.add_argument(
+        "-noise-pool-mask",
+        "-noise_pool_mask",
+        dest="noise_pool_mask",
+        default=None,
+        metavar="DSET|all",
+        help=(
+            "Draw the noise pool from this region instead of from -mask. Use it when "
+            "the fit is deliberately local -- occipital only, say -- but the noise you "
+            "want to remove is not: pass a whole-brain mask (or 'all' for the whole "
+            "volume) and the components come from everywhere the screening pass sees "
+            "no stimulus response, while the fit still happens only inside -mask. "
+            "Voxels outside -mask are loaded but never fit"
+        ),
+    )
+    screening.add_argument(
         "-denoise-tolerance",
         "-denoise_tolerance",
         dest="denoise_tolerance",
@@ -834,6 +851,8 @@ def _add_noise_components(
     loaded,
     nuisance_per_run: list[torch.Tensor],
     device: torch.device,
+    pool_candidates: torch.Tensor | None = None,
+    fit_voxels: torch.Tensor | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor, list[torch.Tensor]]:
     """Pick a noise-component count by cross-validation and fold it into the nuisance.
 
@@ -845,6 +864,13 @@ def _add_noise_components(
     noise-pool voxels, never from the training runs and never from the voxel
     being scored.
 
+    *pool_candidates* and *fit_voxels* are the two regions when they differ
+    (``-noise_pool_mask``): the pool is drawn from the first, the sweep is scored
+    on the second. Nothing about a noise component requires it to come from a
+    voxel you intend to fit, and a fit mask tight enough to be worth drawing --
+    occipital cortex, a single ROI -- is usually too tight to contain a
+    representative pool.
+
     How many to keep is decided on the SUPER-GRID fit rather than the refined
     one. Refining the full model at every candidate count and every fold is tens
     of fits; the grid is about a second, and the question here is only which
@@ -853,6 +879,8 @@ def _add_noise_components(
     """
     verbose = args.verb > 0
     pool = (screen_scores < args.noise_pool_r2) & torch.isfinite(screen_scores) & ~invalid_voxels
+    if pool_candidates is not None:
+        pool &= pool_candidates
     if int(pool.sum()) < 100:
         raise ValueError(
             f"noise pool has only {int(pool.sum())} voxels at -noise_pool_r2 "
@@ -862,13 +890,14 @@ def _add_noise_components(
     # voxel that helped build the components cannot also judge them: with a tight
     # mask the two sets otherwise overlap, and denoising is then scored partly on
     # its own input. A bounded set also keeps the sweep cheap.
-    rankable = torch.where(
-        invalid_voxels | pool, torch.full_like(screen_scores, -torch.inf), screen_scores
-    )
+    excluded = invalid_voxels | pool
+    if fit_voxels is not None:
+        excluded |= ~fit_voxels
+    rankable = torch.where(excluded, torch.full_like(screen_scores, -torch.inf), screen_scores)
     n_criteria = min(int(torch.isfinite(rankable).sum()), 3000)
     if n_criteria < 10:
         raise ValueError(
-            "fewer than 10 voxels sit outside the noise pool; -noise_pool_r2 is too high"
+            "fewer than 10 fit voxels sit outside the noise pool; -noise_pool_r2 is too high"
         )
     criteria = torch.topk(rankable, n_criteria).indices
     if verbose:
@@ -1171,6 +1200,42 @@ def _save_results(
     )
 
 
+def _resolve_masks(
+    args: argparse.Namespace, reference_file: str, parser: argparse.ArgumentParser
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Work out the fit region, the noise-pool region, and what to load.
+
+    Without ``-noise_pool_mask`` the three are one thing and this returns Nones,
+    leaving the loader to apply ``-mask`` itself. With it, the data has to cover
+    the union so the pool can reach outside the fit mask, and the caller needs
+    both flat masks to tell the two regions apart afterwards.
+    """
+    if not args.noise_pool_mask:
+        return None, None, None
+
+    from fastfuncstuff.io.afni import load_afni_mask, nifti_shape
+
+    volume_shape = tuple(nifti_shape(reference_file)[:3])
+    n_volume_voxels = int(np.prod(volume_shape))
+
+    def _load(path: str) -> np.ndarray:
+        mask = load_afni_mask(path)
+        if tuple(mask.shape[:3]) != volume_shape:
+            parser.error(f"Mask {path} has shape {tuple(mask.shape[:3])}; data is {volume_shape}")
+        return mask.reshape(-1).astype(bool)
+
+    fit_flat = _load(args.mask) if args.mask else np.ones(n_volume_voxels, dtype=bool)
+    if args.noise_pool_mask.lower() in {"all", "full", "volume"}:
+        pool_flat = np.ones(n_volume_voxels, dtype=bool)
+    else:
+        pool_flat = _load(args.noise_pool_mask)
+    if not fit_flat.any():
+        parser.error(f"-mask {args.mask} is empty")
+    if not pool_flat.any():
+        parser.error(f"-noise_pool_mask {args.noise_pool_mask} is empty")
+    return fit_flat, pool_flat, fit_flat | pool_flat
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = create_parser()
     args = parser.parse_args(argv)
@@ -1187,6 +1252,14 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("-denoise needs at least two runs to cross-validate the component count")
     if args.max_pcs < 1:
         parser.error("-max_pcs must be positive")
+    if args.noise_pool_mask and not args.denoise:
+        parser.error("-noise_pool_mask applies only to -denoise")
+    if (
+        args.noise_pool_mask
+        and args.noise_pool_mask.lower() not in {"all", "full", "volume"}
+        and not Path(args.noise_pool_mask).exists()
+    ):
+        parser.error(f"-noise_pool_mask does not exist: {args.noise_pool_mask}")
     if not 0 <= args.denoise_tolerance < 1:
         parser.error("-denoise_tolerance must be in [0, 1)")
     if args.screen is not None and args.screen_top is not None:
@@ -1222,10 +1295,14 @@ def main(argv: list[str] | None = None) -> int:
 
     device, _, _ = parse_device_arg(args.device)
     configure_torch_backends(device)
+    # The loaded region is the union of where we fit and where the noise pool may
+    # come from; which of the two a loaded voxel belongs to is tracked below.
+    fit_mask_flat, pool_mask_flat, load_mask_flat = _resolve_masks(args, input_files[0], parser)
     loaded = load_and_preprocess_runs(
         input_files,
         tr=args.tr,
-        mask_file=args.mask,
+        mask_file=None if load_mask_flat is not None else args.mask,
+        mask_array=load_mask_flat,
         do_scale=args.do_scale,
         device=device,
         force_cpu=args.keep_on_cpu,
@@ -1233,6 +1310,20 @@ def main(argv: list[str] | None = None) -> int:
         load_threads=args.load_threads,
     )
     run_lengths = compute_run_lengths(loaded.run_starts, loaded.n_timepoints)
+    fit_voxels = pool_candidates = None
+    if load_mask_flat is not None:
+        assert fit_mask_flat is not None and pool_mask_flat is not None
+        # Same device as the data, which is where the screening scores land and so
+        # where every mask these are combined with lives.
+        selected = load_mask_flat
+        voxel_device = loaded.data.device
+        fit_voxels = torch.from_numpy(fit_mask_flat[selected]).to(voxel_device)
+        pool_candidates = torch.from_numpy(pool_mask_flat[selected]).to(voxel_device)
+        if args.verb:
+            print(
+                f"Loaded {int(selected.sum()):,} voxels: {int(fit_voxels.sum()):,} to fit, "
+                f"{int(pool_candidates.sum()):,} eligible for the noise pool"
+            )
     invalid_voxels = _invalid_voxels(loaded.data, loaded.run_starts)
     analysis_data = torch.nan_to_num(loaded.data, nan=0.0, posinf=0.0, neginf=0.0)
     if args.verb and invalid_voxels.any():
@@ -1332,17 +1423,21 @@ def main(argv: list[str] | None = None) -> int:
             loaded,
             nuisance_per_run,
             device,
+            pool_candidates=pool_candidates,
+            fit_voxels=fit_voxels,
         )
 
     if args.screen is not None or args.screen_top is not None:
         assert screen_scores is not None
         # Rank only over voxels that could be fit at all, so the fraction is a
-        # fraction of real data rather than of background.
+        # fraction of real data rather than of background. Voxels loaded solely to
+        # feed the noise pool are not candidates either.
+        unfittable = invalid_voxels if fit_voxels is None else invalid_voxels | ~fit_voxels
         rankable = torch.where(
-            invalid_voxels, torch.full_like(screen_scores, -torch.inf), screen_scores
+            unfittable, torch.full_like(screen_scores, -torch.inf), screen_scores
         )
         if args.screen_top is not None:
-            n_valid = int((~invalid_voxels).sum())
+            n_valid = int((~unfittable).sum())
             n_keep = max(1, min(n_valid, int(round(args.screen_top * n_valid))))
             threshold = torch.topk(rankable, n_keep).values.min().item()
         else:
@@ -1357,6 +1452,12 @@ def main(argv: list[str] | None = None) -> int:
                 f"Screening kept {keep_index.numel():,} of {loaded.n_voxels:,} voxels "
                 f"({100 * keep_index.numel() / loaded.n_voxels:.1f}%) at R2 >= {threshold:g}"
             )
+    elif fit_voxels is not None and not bool(fit_voxels.all()):
+        # No screening threshold, but part of what was loaded exists only to supply
+        # noise components. Reuse the screening subset machinery so those voxels are
+        # never fit and come back NaN rather than as a fit of the wrong region.
+        keep_index = torch.nonzero(fit_voxels, as_tuple=False).squeeze(1)
+        analysis_data = analysis_data[keep_index]
 
     n_fit_voxels = analysis_data.shape[0]
     grid = make_analyzeprf_grid(

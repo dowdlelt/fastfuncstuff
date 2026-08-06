@@ -404,6 +404,7 @@ def load_and_preprocess_runs(
     input_files: list[str],
     tr: float | None = None,
     mask_file: str | None = None,
+    mask_array: np.ndarray | None = None,
     blur_fwhm: float | None = None,
     do_scale: bool = False,
     device: torch.device = torch.device("cpu"),
@@ -430,6 +431,11 @@ def load_and_preprocess_runs(
         Repetition time in seconds. If None, attempts to read from first file header.
     mask_file : str, optional
         Path to brain mask NIfTI file
+    mask_array : np.ndarray, optional
+        Already-computed mask (3D volume or flat boolean), used instead of
+        *mask_file*. For callers that load more voxels than they will analyse --
+        a union of a fit mask and a noise-pool mask, say -- and so cannot name
+        the loaded region with a single file.
     blur_fwhm : float, optional
         FWHM of Gaussian blur in mm. If None, no blur applied.
     do_scale : bool, default=False
@@ -517,7 +523,12 @@ def load_and_preprocess_runs(
     # Load mask if provided
     mask = None
     mask_flat = None
-    if mask_file:
+    if mask_array is not None:
+        mask_flat = np.asarray(mask_array).reshape(-1).astype(bool)
+        mask = mask_flat.reshape(volume_shape)
+        if verbose:
+            print(f"  Mask: supplied array ({mask_flat.sum():,} voxels)")
+    elif mask_file:
         mask = load_afni_mask(mask_file)
         mask_flat = mask.flatten().astype(bool)
         if verbose:
