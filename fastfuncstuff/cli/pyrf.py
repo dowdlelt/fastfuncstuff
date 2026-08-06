@@ -586,7 +586,10 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Write the noise-pool mask to {prefix}_noisepool, the components to "
-            "{prefix}_noisepcs.1D, and the component-count sweep to {prefix}_denoise.png"
+            "{prefix}_noisepcs.1D, the component-count sweep to {prefix}_denoise.png, "
+            "and per-component timecourse/spatial-weight figures to "
+            "{prefix}_noisepc_PC*.png -- check those: a component landing on visual "
+            "cortex means the pool is contaminated"
         ),
     )
     screening.add_argument(
@@ -874,15 +877,15 @@ def _add_noise_components(
             f"{args.noise_pool_r2:g}), scored on {n_criteria:,} responders"
         )
 
-    components = extract_noise_pcs_per_run(
+    components, loadings = extract_noise_pcs_per_run(
         data,
         list(loaded.run_starts),
         pool,
         max_components=args.max_pcs,
         nuisance_per_run=nuisance_per_run,
+        return_loadings=True,
         device=device,
     )
-    assert isinstance(components, list)  # return_loadings=False
     available = min(args.max_pcs, min(block.shape[1] for block in components))
     criteria_data = data[criteria]
 
@@ -922,11 +925,50 @@ def _add_noise_components(
                 f"(+{median_r2[chosen] - median_r2[0]:.4f} held-out median R2)"
             )
     if args.save_denoise:
-        _plot_noise_sweep(
-            r2_by_count, chosen, f"{parse_prefix(args.prefix).stem}_denoise.png", n_criteria
-        )
+        stem = parse_prefix(args.prefix).stem
+        _plot_noise_sweep(r2_by_count, chosen, f"{stem}_denoise.png", n_criteria)
+        _plot_noise_components(components, loadings, pool, chosen, available, loaded, stem)
     kept = [block[:, :chosen] for block in components]
     return _append_components(nuisance_per_run, components, chosen), pool, kept
+
+
+def _plot_noise_components(
+    components: list[torch.Tensor],
+    loadings: list[torch.Tensor],
+    pool: torch.Tensor,
+    chosen: int,
+    available: int,
+    loaded,
+    stem: str,
+) -> None:
+    """Per-component timecourse and spatial-weight figures, one file per component.
+
+    Reuses ffs_denoise's ``plot_denoising_pcs``: the point of looking at these is
+    to recognise a component as physiological, motion, or scanner drift -- and
+    that judgement is spatial. A component whose weights sit in white matter and
+    ventricles is what you want; one that lands on visual cortex means the pool
+    is contaminated and the fit is having real response regressed out of it.
+    """
+    from fastfuncstuff.visualization import plot_denoising_pcs
+
+    voxel_mask = loaded.mask_flat
+    if voxel_mask is None:
+        voxel_mask = np.ones(int(np.prod(loaded.volume_shape)), dtype=bool)
+    figure_prefix = f"{stem}_noisepc"
+    plot_denoising_pcs(
+        noise_pcs_per_run=[block.cpu() for block in components],
+        run_starts=list(loaded.run_starts),
+        pc_weights_per_run=[weights.cpu().numpy() for weights in loadings],
+        volume_shape=tuple(loaded.volume_shape),
+        voxel_mask=voxel_mask,
+        noise_pool_mask=pool.cpu().numpy(),
+        n_pcs_to_show=min(available, max(chosen, 5)),
+        tr=loaded.tr,
+        optimal_n_pcs=chosen,
+        output_prefix=figure_prefix,
+        voxel_sizes=tuple(loaded.voxel_sizes),
+        return_figs=False,
+    )
 
 
 def _plot_noise_sweep(
