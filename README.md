@@ -152,6 +152,7 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 | `ffs_util_concalc` | Recompute or add GLM contrasts (t and F) on an existing REML bucket without rerunning the GLM — reuses the per-(a,b) ARMA inverse so it's near-free. |
 | `ffs_ridge` | Fractional ridge regression for single-trial betas (GLMsingle Type D; Prince et al. 2022). Per-voxel optimal fraction by cross-validation. |
 | `ffs_deconvolve` | FIR / event-related deconvolution without an assumed HRF shape (Glover 1999). |
+| `ffs_pyrf` *(beta)* | "A pyre for receptive fields." Population receptive field (pRF) mapping with the compressive spatial summation model, following Kendrick Kay's `analyzePRF` — same super-grid seeding, staged fit, and parameter conventions. Batched analytic Gauss-Newton with per-voxel HRF selection; reports `x`/`y`/`angle`/`ecc`/`rfsize` plus leave-one-run-out held-out R², in degrees of visual angle when given `-screen_extent` (aperture pixels otherwise). `-hrf canonical|library|pighs` trades HRF search against speed. Apertures as `.npy`/NIfTI movies (`-stim_nii`, `-stim_nii_multi`) or PNG frame directories (`-stim_pngs`, `-stim_pngs_multi`); apertures are block-averaged to ~100 px per axis by default (`-stim_downsample`). **Cite [Kay et al. 2013](https://doi.org/10.1152/jn.00105.2013).** |
 | `ffs_perm` *(beta)* | GPU-batched non-parametric permutation testing (ex. for single trials or group statistics; Nichols & Holmes 2002). ~5,000 permutations / 2 minutes for a full brain. Writes AFNI-compatible corrected t-stats and attacheds cluster tables (for max cluster size correction). |
 
 
@@ -283,6 +284,11 @@ docstrings in the relevant module:
 - GLMdenoise: Kay, Rokem, Winawer, Dougherty & Wandell (2013), *Front Neurosci*.
 - GLMsingle: Prince, Charest, Kurzawski et al. (2022), *eLife*.
 - Fractional ridge: Rokem & Kay (2020), *GigaScience*.
+- pRF / compressive spatial summation: Kay, Winawer, Mezer & Wandell (2013),
+  *J Neurophysiol* 110(2):481-494 — and the `analyzePRF` MATLAB toolbox by
+  Kendrick Kay (http://kendrickkay.net/analyzePRF/, © 2014, CC BY 3.0), which
+  `ffs_pyrf` follows for its model, seeding, and parameter conventions. Earlier
+  pRF formulation: Dumoulin & Wandell (2008), *NeuroImage*.
 - MELODIC / probabilistic ICA: Beckmann & Smith (2004), *IEEE TMI*.
 - MIGP: Smith, Hyvärinen, Varoquaux, Miller & Beckmann (2014), *NeuroImage*.
 - NORDIC: Moeller et al. (2021), *NeuroImage*.
