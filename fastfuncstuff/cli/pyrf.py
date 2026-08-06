@@ -96,7 +96,9 @@ OUTPUT
                     is.
     gain            amplitude of the fitted response, in the units of the input.
                     Divide by meanvol for percent signal change.
-    meanvol         each voxel's mean over time, the scale gain refers to.
+    meanvol         each voxel's mean over time, the scale gain refers to. A
+                    property of the input, so it is kept for every voxel even
+                    where the fit is NaN (screened out, or all-zero).
     correlation     correlation between prediction and data after nuisance
                     projection; r2 is the coefficient of determination.
     xval_r2         held-out R2 from leave-one-run-out (multi-run input only).
@@ -163,6 +165,11 @@ by Kendrick Kay (http://kendrickkay.net/analyzePRF/, Copyright (c) 2014
 Kendrick Kay, CC BY 3.0).
 PLEASE CITE Kay et al. 2013 if you publish results from this tool.
 """
+
+
+# Sub-bricks that describe the input data rather than the fit, and so stay valid
+# for voxels that were never fitted.
+_DATA_COLUMNS = frozenset({"meanvol"})
 
 
 class _PyrfHelpFormatter(
@@ -1100,7 +1107,13 @@ def _save_results(
         columns += [continuous_hrf + 1, hrf_evidence]
     values = torch.column_stack(columns).cpu().numpy()
     if invalid_voxels is not None:
-        values[invalid_voxels.cpu().numpy()] = np.nan
+        # Blank the fit, but not the data. meanvol is a property of the input,
+        # true everywhere, and it is the reference the gain is expressed against
+        # -- screening out a voxel says nothing about its mean signal, so
+        # blanking it would hand back a mean image with holes in it.
+        excluded = invalid_voxels.cpu().numpy()
+        fit_columns = [index for index, name in enumerate(labels) if name not in _DATA_COLUMNS]
+        values[np.ix_(excluded, fit_columns)] = np.nan
     if loaded.mask_flat is not None:
         full = np.zeros((loaded.mask_flat.size, len(labels)), dtype=values.dtype)
         full[loaded.mask_flat] = values

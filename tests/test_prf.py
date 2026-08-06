@@ -983,3 +983,46 @@ def test_grid_only_cross_validation_skips_refinement():
     # The grid here holds the true parameters, so seeds alone already predict well.
     assert seeds_only.r2.item() > 0.99
     assert refined.r2.item() > 0.99
+
+
+def test_excluded_voxels_keep_their_mean_but_lose_their_fit(tmp_path):
+    """Screening a voxel out blanks its fit, not the mean image."""
+    import types
+
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import _save_results
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    results = types.SimpleNamespace(
+        parameters=torch.tensor([[50.0, 50.0, 3.0, 0.5], [50.0, 50.0, 3.0, 0.5]]),
+        gain=torch.ones(2),
+        correlation=torch.ones(2),
+        r2=torch.ones(2),
+        hrf_index=torch.zeros(2, dtype=torch.long),
+        candidate_index=torch.zeros(2, dtype=torch.long),
+        residual_ss=torch.zeros(2),
+        n_iters=torch.ones(2),
+        converged=torch.ones(2),
+    )
+    loaded = types.SimpleNamespace(
+        mask_flat=None, volume_shape=(2, 1, 1), affine=np.eye(4), nifti_header=None
+    )
+    output = tmp_path / "excluded.nii.gz"
+
+    _save_results(
+        results,
+        str(output),
+        loaded,
+        (100, 100),
+        invalid_voxels=torch.tensor([False, True]),
+        mean_volume=torch.tensor([120.0, 340.0]),
+    )
+
+    image = nib.load(output)
+    labels = read_brick_labels(image)
+    data = image.get_fdata().reshape(2, len(labels))
+    assert np.isnan(data[1, labels.index("r2")])
+    assert np.isnan(data[1, labels.index("x")])
+    assert data[1, labels.index("meanvol")] == pytest.approx(340.0)
+    assert data[0, labels.index("meanvol")] == pytest.approx(120.0)

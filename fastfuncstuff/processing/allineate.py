@@ -1198,9 +1198,7 @@ def _refine_adam_normalized(
             cost = cost_fn(matrix)
         else:
             # zero_outside (AFNI outval=0) during optimization — see _eval_candidates.
-            warped = apply_affine_interp(
-                source, matrix, ctx.interp, base.shape, zero_outside=True
-            )
+            warped = apply_affine_interp(source, matrix, ctx.interp, base.shape, zero_outside=True)
             cost = _compute_cost(
                 base, warped, weight, ctx, voxdims, matrix=matrix, blokrad_mm=blokrad_mm
             )
