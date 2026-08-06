@@ -340,6 +340,39 @@ def bytes_per_voxel_xval(
     return (8 * n_timepoints + max(n_regressors, 10)) * 4
 
 
+def bytes_per_voxel_prf(
+    n_timepoints: int,
+    n_pixels: int,
+) -> int:
+    """
+    Estimate memory per voxel for CSS pRF Gauss-Newton refinement.
+
+    Parameters
+    ----------
+    n_timepoints : int
+        Total timepoints across all runs
+    n_pixels : int
+        Flattened stimulus aperture size (rows * columns)
+
+    Returns
+    -------
+    int
+        Bytes per voxel
+
+    Notes
+    -----
+    Memory model: (6 * n_pixels + 30 * n_timepoints) * 4 bytes.
+
+    Unlike the GLM operations, the aperture term dominates: every voxel carries
+    its own Gaussian receptive field over ``n_pixels`` (typically 100x100), and
+    the spatial derivative is formed one field at a time (~3 live fields, x2 for
+    the line search trial evaluated alongside the current parameters). The
+    temporal term covers the prediction, the four parameter derivatives, and the
+    variable-projection Jacobian, again doubled for the line search.
+    """
+    return (6 * n_pixels + 30 * n_timepoints) * 4
+
+
 def compute_reml_batched_search_strategy(
     n_voxels: int,
     n_timepoints: int,
@@ -1180,7 +1213,7 @@ def estimate_chunk_size(
     device : torch.device
         Target compute device
     operation : str, default="glm"
-        Type of operation: "glm", "xval", "ridge", "denoise", "arma"
+        Type of operation: "glm", "xval", "ridge", "denoise", "arma", "prf"
     min_chunk_size : int, optional
         Minimum chunk size. Default: from config (1000)
     max_chunk_size : int, optional
@@ -1253,6 +1286,10 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
     elif operation == "ica_varnorm":
         bytes_per_voxel = bytes_per_voxel_ica_varnorm(n_timepoints)
+    elif operation == "prf":
+        # n_regressors carries the aperture pixel count, which is what the pRF
+        # refinement actually scales with (see bytes_per_voxel_prf).
+        bytes_per_voxel = bytes_per_voxel_prf(n_timepoints, n_regressors)
     elif operation == "arma":
         bytes_per_voxel = bytes_per_voxel_arma(n_timepoints, n_regressors)
     elif operation == "arma_search":
