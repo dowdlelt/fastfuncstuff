@@ -515,6 +515,21 @@ def _project_per_run(
     return torch.cat(projected, dim=0)
 
 
+def project_nuisance_per_run(
+    data: torch.Tensor,
+    nuisance_per_run: Sequence[torch.Tensor] | None,
+    run_starts: Sequence[int],
+) -> torch.Tensor:
+    """Project per-run nuisance out of ``(n_voxels, n_timepoints)`` data.
+
+    The voxel-major public spelling of the projection the fitting path uses
+    internally. Anything comparing raw timecourses across runs -- a noise
+    ceiling above all -- has to see the same projected data the fit is scored
+    on, or shared drift gets counted as reproducible signal.
+    """
+    return _project_per_run(data.T, nuisance_per_run, run_starts).T
+
+
 def _project_prf_derivatives(
     derivatives: torch.Tensor,
     nuisance_per_run: Sequence[torch.Tensor] | None,
@@ -1263,13 +1278,124 @@ def _predict_selected_prfs(
     return prediction
 
 
-def fit_prf_loro(
+def balanced_group_halves(
+    group_labels: Sequence[int],
+    *,
+    n_draws: int = 2,
+    seed: int = 0,
+) -> list[tuple[list[int], list[int]]]:
+    """Split runs into two disjoint halves that each cover every stimulus group.
+
+    Returns ``(half_a, half_b)`` run-index pairs, one per draw.
+
+    Two constraints shape this, and they pull in opposite directions. Parameter
+    reliability requires the two fits to share **no** training data, which caps
+    each side at half the runs. A pRF fit is only valid if its training set
+    contains every stimulus type -- bars and wedges are complementary probes of
+    one receptive field, not competing models, so a fit that saw only bars is
+    deficient rather than alternative. Together these force one run per group
+    per side (``n_g // 2`` when a group has more), which is what this builds.
+
+    Groups with a single run cannot appear on both sides and are dropped; the
+    caller is expected to say so out loud, since their stimulus is then absent
+    from the reliability estimate entirely.
+
+    Odd-sized groups leave one run unused per draw, and which one it is rotates
+    with the draw. That rotation is the point of ``n_draws``: a fixed choice
+    would tie the estimate to whichever runs happen to sit out, and with
+    retinotopy runs acquired in order those are systematically the late,
+    motion-heavy ones. Draws that come out identical are dropped rather than
+    refitted, so ``n_draws`` is a ceiling and not a promise.
+    """
+    if n_draws < 1:
+        raise ValueError(f"n_draws must be positive, got {n_draws}")
+    labels: list[int] = []
+    for label in group_labels:
+        if label not in labels:
+            labels.append(label)
+
+    draws: list[tuple[list[int], list[int]]] = []
+    seen: set[tuple[int, ...]] = set()
+    for draw in range(n_draws):
+        generator = torch.Generator().manual_seed(seed + draw)
+        first: list[int] = []
+        second: list[int] = []
+        for label in labels:
+            members = [index for index, value in enumerate(group_labels) if value == label]
+            if len(members) < 2:
+                continue
+            shuffled = [
+                members[position]
+                for position in torch.randperm(len(members), generator=generator).tolist()
+            ]
+            take = len(members) // 2
+            first.extend(shuffled[:take])
+            second.extend(shuffled[take : 2 * take])
+        if not first or not second:
+            continue
+        first, second = sorted(first), sorted(second)
+        # Swapping the halves gives the same pair of fits, so canonicalise on
+        # which side owns the lowest run index before testing for duplicates.
+        if second[0] < first[0]:
+            first, second = second, first
+        key = (*first, -1, *second)
+        if key in seen:
+            continue
+        seen.add(key)
+        draws.append((first, second))
+    return draws
+
+
+def prf_parameter_maps(
+    parameters: torch.Tensor,
+    stimulus_shape: tuple[int, int],
+    scale: float = 1.0,
+) -> dict[str, torch.Tensor]:
+    """Derive the reported pRF quantities from raw ``(row, column, sigma, n)``.
+
+    One place computes these, because the saved bucket and the reliability
+    analysis have to agree on them exactly -- particularly the sign convention
+    relating ``y`` to ``angle``, which is silently reversible.
+
+    ``angle`` is in degrees to match the saved bucket; circular statistics on it
+    need radians.
+    """
+    extent = float(max(stimulus_shape))
+    center = (1.0 + extent) / 2.0
+    exponent = parameters[:, 3].clamp_min(torch.finfo(parameters.dtype).eps)
+    # Larger row index is the upper visual field for the aperture layouts these
+    # tools are given, so vertical position is row - center, not center - row.
+    vertical = parameters[:, 0] - center
+    horizontal = parameters[:, 1] - center
+    eccentricity = torch.hypot(vertical, horizontal)
+    angle = torch.rad2deg(torch.atan2(vertical, horizontal)).remainder(360.0)
+    return {
+        "x": horizontal * scale,
+        "y": vertical * scale,
+        "sigma": parameters[:, 2].abs() * scale,
+        "exponent": parameters[:, 3],
+        "angle": torch.where(eccentricity == 0, torch.full_like(angle, torch.nan), angle),
+        "eccentricity": eccentricity * scale,
+        "rfsize": parameters[:, 2].abs() / torch.sqrt(exponent) * scale,
+    }
+
+
+def loro_folds(n_runs: int) -> list[tuple[list[int], list[int]]]:
+    """Classic leave-one-run-out fold specification."""
+    return [
+        ([index for index in range(n_runs) if index != held_out], [held_out])
+        for held_out in range(n_runs)
+    ]
+
+
+def fit_prf_folds(
     data: torch.Tensor,
     stimulus_runs: Sequence[torch.Tensor],
     stimulus_shape: tuple[int, int],
     grid: PRFGrid,
     hrf_library: torch.Tensor,
     run_starts: Sequence[int],
+    folds: Sequence[tuple[Sequence[int], Sequence[int]]],
     *,
     nuisance_per_run: Sequence[torch.Tensor] | None = None,
     candidate_chunk_size: int = 256,
@@ -1280,16 +1406,24 @@ def fit_prf_loro(
     hrf_mode: str = "grid",
     fixed_hrf_index: torch.Tensor | None = None,
     refine: bool = True,
+    return_fits: bool = False,
     verbose: bool = False,
-) -> PRFCrossValidationFit:
-    """Compute leave-one-run-out R2 with fold-local pRF fitting.
+) -> tuple[PRFCrossValidationFit, list[PRFRefinedFit]]:
+    """Cross-validate with fold-local pRF fitting over explicit run partitions.
 
-    Each fold performs the complete grid-selection and GN-refinement pipeline on
-    its training runs, so the CSS parameters and gain are never informed by the
-    held-out run.
+    Each fold is ``(training_runs, held_out_runs)``; every fold performs the
+    complete grid-selection and GN-refinement pipeline on its training runs, so
+    the CSS parameters and gain are never informed by the held-out data. Folds
+    need not hold out a single run, and need not be exhaustive -- what makes the
+    pooled R2 a whole-dataset number is each timepoint being held out once, and
+    that is the caller's business to arrange.
 
-    ``hrf_mode`` decides how much of that applies to the HRF, which is the one
-    place where cost and rigour genuinely trade off:
+    ``return_fits`` additionally hands back each fold's fitted parameters. That
+    is what makes split-half reliability free: two folds with disjoint training
+    sets are, between them, a cross-validation and a reliability estimate.
+
+    ``hrf_mode`` decides how much of the fold-locality applies to the HRF, which
+    is the one place where cost and rigour genuinely trade off:
 
     ``"grid"``
         The fold's own super-grid picks the HRF. Leak-free, and the default, but
@@ -1311,10 +1445,15 @@ def fit_prf_loro(
         raise ValueError(f"hrf_mode must be 'grid', 'fixed', or 'refine', got {hrf_mode!r}")
     if hrf_mode == "fixed" and fixed_hrf_index is None:
         raise ValueError("hrf_mode='fixed' requires fixed_hrf_index")
-    if len(stimulus_runs) < 2:
-        raise ValueError("LORO pRF fitting requires at least two runs")
+    if not folds:
+        raise ValueError("at least one fold is required")
     if data.shape[1] != sum(run.shape[0] for run in stimulus_runs):
         raise ValueError("stimulus runs must span every data timepoint")
+    for training_indices, held_indices in folds:
+        if not training_indices or not held_indices:
+            raise ValueError("every fold needs at least one training and one held-out run")
+        if set(training_indices) & set(held_indices):
+            raise ValueError("a fold cannot both train on and hold out the same run")
 
     device = device or data.device
     output_device = data.device
@@ -1322,14 +1461,16 @@ def fit_prf_loro(
     run_ends = [*run_starts[1:], data.shape[1]]
     residual_ss = torch.zeros(n_voxels, device=output_device, dtype=data.dtype)
     total_ss = torch.zeros(n_voxels, device=output_device, dtype=data.dtype)
-    fold_iterator = range(len(stimulus_runs))
+    fold_fits: list[PRFRefinedFit] = []
+    fold_iterator = list(folds)
     if verbose:
         from tqdm.auto import tqdm
 
-        fold_iterator = tqdm(fold_iterator, desc="pRF LORO folds", leave=True)
+        fold_iterator = tqdm(fold_iterator, desc="pRF CV folds", leave=True)
 
-    for held_out in fold_iterator:
-        training_indices = [index for index in range(len(stimulus_runs)) if index != held_out]
+    for training_indices, held_indices in fold_iterator:
+        training_indices = list(training_indices)
+        held_indices = list(held_indices)
         training_data = torch.cat(
             [data[:, run_starts[index] : run_ends[index]] for index in training_indices], dim=1
         )
@@ -1395,13 +1536,25 @@ def fit_prf_loro(
                 **refine_kwargs,
             )
 
-        held_nuisance = [nuisance_per_run[held_out]] if nuisance_per_run is not None else None
-        held_data = data[:, run_starts[held_out] : run_ends[held_out]].T.to(
-            device=device, dtype=data.dtype
+        if return_fits:
+            fold_fits.append(training_fit)
+
+        held_stimuli = [
+            stimulus_runs[index].to(device=device, dtype=data.dtype) for index in held_indices
+        ]
+        held_lengths = [run.shape[0] for run in held_stimuli]
+        held_starts = [sum(held_lengths[:index]) for index in range(len(held_lengths))]
+        held_nuisance = (
+            [nuisance_per_run[index] for index in held_indices]
+            if nuisance_per_run is not None
+            else None
         )
-        held_data = _project_per_run(held_data, held_nuisance, [0])
+        held_data = torch.cat(
+            [data[:, run_starts[index] : run_ends[index]] for index in held_indices], dim=1
+        ).T.to(device=device, dtype=data.dtype)
+        held_data = _project_per_run(held_data, held_nuisance, held_starts)
         held_prediction = _predict_selected_prfs(
-            [stimulus_runs[held_out].to(device=device, dtype=data.dtype)],
+            held_stimuli,
             training_fit.parameters.to(device=device, dtype=data.dtype),
             training_fit.hrf_index.to(device=device),
             training_fit.gain.to(device=device, dtype=data.dtype),
@@ -1409,14 +1562,45 @@ def fit_prf_loro(
             stimulus_shape,
             refine_chunk_size or voxel_chunk_size,
         )
-        held_prediction = _project_per_run(held_prediction, held_nuisance, [0])
+        held_prediction = _project_per_run(held_prediction, held_nuisance, held_starts)
         residual_ss += (held_data - held_prediction).square().sum(dim=0).to(output_device)
-        total_ss += (
-            (held_data - held_data.mean(dim=0, keepdim=True)).square().sum(dim=0).to(output_device)
-        )
+        # Centred per held-out run, not over the concatenation: between-run mean
+        # offsets are not variance the model was ever asked to explain, and
+        # folding them into the denominator quietly inflates R2. With a polort
+        # that includes the constant this is a no-op, but -polort -1 is legal.
+        for start, length in zip(held_starts, held_lengths, strict=True):
+            segment = held_data[start : start + length]
+            total_ss += (
+                (segment - segment.mean(dim=0, keepdim=True)).square().sum(dim=0).to(output_device)
+            )
 
     r2 = 1.0 - residual_ss / total_ss.clamp_min(torch.finfo(data.dtype).eps)
-    return PRFCrossValidationFit(r2=r2, residual_ss=residual_ss, total_ss=total_ss)
+    return PRFCrossValidationFit(r2=r2, residual_ss=residual_ss, total_ss=total_ss), fold_fits
+
+
+def fit_prf_loro(
+    data: torch.Tensor,
+    stimulus_runs: Sequence[torch.Tensor],
+    stimulus_shape: tuple[int, int],
+    grid: PRFGrid,
+    hrf_library: torch.Tensor,
+    run_starts: Sequence[int],
+    **kwargs,
+) -> PRFCrossValidationFit:
+    """Leave-one-run-out cross-validation: :func:`fit_prf_folds` over single runs."""
+    if len(stimulus_runs) < 2:
+        raise ValueError("LORO pRF fitting requires at least two runs")
+    cross_validation, _ = fit_prf_folds(
+        data,
+        stimulus_runs,
+        stimulus_shape,
+        grid,
+        hrf_library,
+        run_starts,
+        loro_folds(len(stimulus_runs)),
+        **kwargs,
+    )
+    return cross_validation
 
 
 def fit_prf_supergrid(
