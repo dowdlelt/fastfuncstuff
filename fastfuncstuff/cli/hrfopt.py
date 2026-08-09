@@ -41,6 +41,7 @@ try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
         add_ortvec_arguments,
+        add_single_trial_args,
         add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
@@ -52,7 +53,9 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        resolve_cv_design,
         spinner,
+        summarize_trial_repeats,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
@@ -334,20 +337,22 @@ Notes:
         help="CV metric: 'cod', 'corr', 'corr2', "
         "'sse' (sum of squared errors, GLMsingle-compatible). Default: cod.",
     )
-    cv_opts.add_argument(
-        "-single_trials",
-        action="store_true",
-        help="Use beta-space cross-validation (GLMsingle-style). "
-        "Fits single-trial model once with each HRF, evaluates R² on "
-        "condition-averaged vs individual trial betas across folds. "
-        "Replaces timeseries CV with beta-space CV for HRF selection.",
+    add_single_trial_args(
+        cv_opts,
+        emit_help="Refit with the optimal HRF per voxel and save one beta per "
+        "trial (GLMsingle-style) to {prefix}_stats_single_trial.nii.gz. Voxels "
+        "are processed in HRF groups with chunking to avoid OOM. By default the "
+        "HRF is then also selected in single-trial space; see -cv_design to "
+        "select it on the condition-level design instead (required when "
+        "conditions do not repeat across runs).",
     )
     cv_opts.add_argument(
         "-save_single_trial_betas",
+        "-save-single-trial-betas",
+        dest="single_trials",
         action="store_true",
-        help="Save single-trial betas refit with optimal HRF per voxel. "
-        "Only works with -single_trials. Processes voxels in HRF groups "
-        "with chunking to avoid OOM. Saves to {prefix}_stats_single_trial.nii.gz",
+        help="Deprecated alias for -single_trials (emitting per-trial betas and "
+        "selecting the HRF in single-trial space are now separate: see -cv_design).",
     )
     cv_opts.add_argument(
         "-save_canonical_betas",
@@ -484,7 +489,7 @@ Notes:
             "_delta_xval_r2 (with − without), _delta_hrfopt_r2 (same for in-sample), "
             "_delta_hrf_changed (1 where selected HRF differs), and "
             "_delta_hrf_index (signed shift in HRF index). "
-            "Requires at least one -ortvec. Not supported with -single_trials."
+            "Requires at least one -ortvec. Not supported with -cv_design single."
         ),
     )
 
@@ -579,11 +584,11 @@ def main():
                 "there is nothing to compare."
             )
             sys.exit(1)
-        if args.single_trials or args.save_single_trial_betas:
+        if args.cv_design == "single":
             print(
-                "ERROR: -delta_denoise is not yet supported with -single_trials "
-                "/ -save_single_trial_betas (beta-space CV path). "
-                "Run without -single_trials to measure the nuisance effect."
+                "ERROR: -delta_denoise is not yet supported with -cv_design single "
+                "(beta-space CV path). Use -cv_design condition to measure the "
+                "nuisance effect; -single_trials output is unaffected."
             )
             sys.exit(1)
 
@@ -643,6 +648,37 @@ def main():
 
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
+
+    # Resolve -cv_design before any data is loaded: a design with no cross-run
+    # condition repeats cannot be scored in single-trial space, and finding that
+    # out after the HRF sweep wastes the whole run.
+    trial_repeats = summarize_trial_repeats(all_onsets)
+    cv_design = resolve_cv_design(
+        args.cv_design,
+        args.single_trials,
+        trial_repeats,
+        parameter="HRF",
+        # Single-trial HRF selection is in-sample (every candidate HRF costs one
+        # beta per trial, so complexity is equal), which makes it the one path
+        # that survives an events file with no cross-run repeats at all.
+        single_needs_repeats=False,
+        manual_hint=(
+            "Add -single_trials: its HRF selection is in-sample and needs no repeats. "
+            "Otherwise give -events a trial_type column that repeats across runs "
+            "(-event_cols)."
+        ),
+        # Always printed, even at -verb 0: a silent switch between selection
+        # designs is exactly the kind of thing that gets misread later.
+        verbose=True,
+    )
+
+    if args.delta_denoise and cv_design == "single":
+        print(
+            "ERROR: -delta_denoise is not yet supported with single-trial HRF "
+            "selection. Re-run with -cv_design condition (per-trial betas are "
+            "still written if -single_trials is set)."
+        )
+        sys.exit(1)
 
     # Pre-flight checks (before slow data loading)
     preflight_check(
@@ -788,24 +824,13 @@ def main():
     ortvec_files = [(f, label) for f, label in args.ortvec] if args.ortvec else None
 
     results_nodenoise = None  # populated only when -delta_denoise is set
-    if args.single_trials:
-        # ========== SINGLE-TRIAL IN-SAMPLE R² PATH (GLMsingle Type-B) ==========
-        # Matches GLMsingle's FitHRF step: for each HRF candidate, fit a single-trial
-        # OLS model (resampling=0) and use in-sample R² on nuisance-projected data
-        # for HRF selection. All HRFs have equal model complexity (one beta per trial),
-        # so in-sample R² is a fair comparison metric.
-        from tqdm import tqdm
 
-        from fastfuncstuff.glm.ridge import create_single_trial_design
-        from fastfuncstuff.glm.xval import compute_qr_projectors, compute_r2_metric
-
-        print()
-        print("=" * 70)
-        print("Single-trial HRF fitting (GLMsingle Type-B style)")
-        print("=" * 70)
-        print()
-
-        # Build nuisance design (polynomials + ortvec, block-diagonal)
+    # Nuisance design is built up front because both the single-trial selection
+    # path and the single-trial *refit* (which can now follow condition-level
+    # selection) need the same block-diagonal nuisance.
+    nuisance_per_run = None
+    nuisance_design = None
+    if cv_design == "single" or args.single_trials:
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
 
         # Auto-determine polort if not specified
@@ -829,6 +854,23 @@ def main():
         # Create block-diagonal nuisance design
         nuisance_design = torch.block_diag(*nuisance_per_run)
         print(f"  Nuisance design shape: {nuisance_design.shape}")
+
+    if cv_design == "single":
+        # ========== SINGLE-TRIAL IN-SAMPLE R² PATH (GLMsingle Type-B) ==========
+        # Matches GLMsingle's FitHRF step: for each HRF candidate, fit a single-trial
+        # OLS model (resampling=0) and use in-sample R² on nuisance-projected data
+        # for HRF selection. All HRFs have equal model complexity (one beta per trial),
+        # so in-sample R² is a fair comparison metric.
+        from tqdm import tqdm
+
+        from fastfuncstuff.glm.ridge import create_single_trial_design
+        from fastfuncstuff.glm.xval import compute_qr_projectors, compute_r2_metric
+
+        print()
+        print("=" * 70)
+        print("Single-trial HRF fitting (GLMsingle Type-B style)")
+        print("=" * 70)
+        print()
 
         n_hrfs = hrf_library.shape[0]
 
@@ -1066,38 +1108,6 @@ def main():
             results.canonical_results = canonical_results
             print("  Canonical fit complete.")
 
-        # ==========================================================================
-        # 5b. Optional: Refit with canonical/optimal HRFs for single-trial betas
-        # ==========================================================================
-        # Note: This section only applies to beta-space CV path (single-trial mode)
-        if args.save_single_trial_betas:
-            print()
-            print("Refitting with optimal HRF per voxel (single-trial betas)...")
-
-            # Convert hrf_library from tensor (n_hrfs, n_timepoints) to list of 1D tensors
-            hrf_library_list = [hrf_library[i] for i in range(hrf_library.shape[0])]
-
-            # Refit with optimal HRF per voxel
-            final_results = _fit_voxelwise_hrf_single_trial(
-                data=data,
-                onsets_by_condition=all_onsets,
-                hrf_library=hrf_library_list,
-                hrf_index=hrf_index,
-                nuisance_design=nuisance_design,
-                durations=durations,
-                run_starts=run_starts,
-                tr=tr,
-                n_timepoints=n_timepoints,
-                microtime_dt=args.microtime_dt,
-                condition_labels=condition_labels,
-                device=device,
-                verbose=args.verb >= 1,
-            )
-
-            # Update results
-            results.final_results = final_results
-            print("  Single-trial refit complete.")
-
     else:
         # ========== EXISTING Beta @ Design TIMESERIES CV PATH ==========
         results = fit_glm_hrf_library_with_xval(
@@ -1160,6 +1170,39 @@ def main():
                 condition_labels=condition_labels,
             )
 
+    # ==========================================================================
+    # 5b. Optional: refit with the optimal HRF per voxel for single-trial betas
+    # ==========================================================================
+    # Independent of how the HRF was selected: the HRF index is a property of the
+    # voxel, so it transfers to the single-trial design whether it was chosen in
+    # beta space (-cv_design single) or on the condition-level design.
+    if args.single_trials:
+        print()
+        print("Refitting with optimal HRF per voxel (single-trial betas)...")
+
+        # Convert hrf_library from tensor (n_hrfs, n_timepoints) to list of 1D tensors
+        hrf_library_list = [hrf_library[i] for i in range(hrf_library.shape[0])]
+
+        # Refit with optimal HRF per voxel
+        final_results = _fit_voxelwise_hrf_single_trial(
+            data=data,
+            onsets_by_condition=all_onsets,
+            hrf_library=hrf_library_list,
+            hrf_index=results.hrf_index,
+            nuisance_design=nuisance_design,
+            durations=durations,
+            run_starts=run_starts,
+            tr=tr,
+            n_timepoints=n_timepoints,
+            microtime_dt=args.microtime_dt,
+            condition_labels=condition_labels,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+
+        results.final_results = final_results
+        print("  Single-trial refit complete.")
+
     # Update metadata with CLI parameters
     results.hrf_metadata["hrf_mode"] = args.hrf_mode
     results.hrf_metadata["canonical_mode"] = args.canonical
@@ -1169,6 +1212,17 @@ def main():
     if args.events:
         results.hrf_metadata["event_files"] = args.events
     results.hrf_metadata["durations"] = durations
+    results.hrf_metadata["cv_design"] = cv_design
+    results.hrf_metadata["cv_design_requested"] = args.cv_design
+    results.hrf_metadata["single_trials"] = bool(args.single_trials)
+    results.hrf_metadata["trial_repeats"] = {
+        "n_trials": trial_repeats.n_trials,
+        "n_conditions": trial_repeats.n_conditions,
+        "n_repeated_conditions": trial_repeats.n_repeated_conditions,
+        "predictable_fraction": trial_repeats.predictable_fraction,
+        "trials_per_condition": trial_repeats.trials_per_condition,
+        "runs_per_condition": trial_repeats.runs_per_condition,
+    }
     if ortvec_files:
         results.hrf_metadata["ortvec_files"] = [(str(f), label) for f, label in ortvec_files]
     if nuisance_blocks:
@@ -1207,7 +1261,7 @@ def main():
     # So temporarily remove final_results from the results object
     final_results_temp = results.final_results
 
-    if args.save_single_trial_betas and results.final_results is not None:
+    if args.single_trials and results.final_results is not None:
         results.final_results = (
             None  # Temporarily remove to prevent save_hrf_selection_results from saving it
         )
@@ -1227,7 +1281,7 @@ def main():
     )
 
     # Restore final_results for custom saving
-    if args.save_single_trial_betas and final_results_temp is not None:
+    if args.single_trials and final_results_temp is not None:
         results.final_results = final_results_temp
 
     # ==========================================================================
@@ -1349,7 +1403,7 @@ def main():
     # to {prefix}_canonical_stats.nii.gz. For single-trial betas, we need custom saving
     # to {prefix}_stats_single_trial.nii.gz instead of the default {prefix}_stats.nii.gz
     final_results_for_save = results.final_results
-    if args.save_single_trial_betas and final_results_for_save is not None:
+    if args.single_trials and final_results_for_save is not None:
         from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
 
         print("  Saving single-trial betas with custom filename...")

@@ -655,6 +655,26 @@ def main():
         args.single_trials = True
 
     if args.single_trials:
+        # Ridge has no -cv_design escape hatch: the fraction regularizes
+        # collinearity between adjacent trial regressors, which only exists in the
+        # single-trial design, so it cannot be learned on a condition-level one.
+        # All we can do is say out loud when the beta-space score is undefined.
+        from fastfuncstuff.cli_utils import summarize_trial_repeats
+
+        _repeats = summarize_trial_repeats(all_onsets)
+        print(f"  Event repeat structure: {_repeats.describe()}")
+        if _repeats.n_predictable_trials == 0:
+            print(
+                "  WARNING: no condition appears in more than one run, so every "
+                "held-out trial's beta-space score is undefined and the selected "
+                "fraction is arbitrary. Pass a single value to -ridge_fracs instead."
+            )
+        elif _repeats.predictable_fraction < 0.5:
+            print(
+                f"  WARNING: only {100 * _repeats.predictable_fraction:.0f}% of trials "
+                "are predictable across runs; fraction selection rests on a thin subset."
+            )
+
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
         from fastfuncstuff.glm.outputs import save_single_trial_results
         from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs

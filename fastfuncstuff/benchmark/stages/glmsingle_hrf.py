@@ -119,8 +119,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-onsets {onsets} "
         f"-durations 3.0 3.0 3.0 3.0 3.0 "
         f"-prefix {out_prefix} "
-        f"-single_trials "
-        f"-save_single_trial_betas "
+        f"-single_trials "  # emits per-trial betas; -cv_design auto keeps beta-space selection
         f"-hrf_mode library "
         f"-metric cod"
         f"{ctx.ffs_device_flag()}"

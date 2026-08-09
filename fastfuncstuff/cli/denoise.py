@@ -44,6 +44,7 @@ try:
         LoadResult,
         add_load_threads_arg,
         add_ortvec_arguments,
+        add_single_trial_args,
         add_verbose_arg,
         auto_polort,
         collect_nuisance_blocks,
@@ -52,7 +53,9 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        resolve_cv_design,
         spinner,
+        summarize_trial_repeats,
     )
     from fastfuncstuff.denoise.sequential import (
         DenoiseResults,
@@ -417,19 +420,19 @@ Notes:
         "corr (Pearson correlation), corr2 (correlation squared), "
         "sse (sum of squared errors, GLMsingle-compatible). Default: cod.",
     )
-    denoise_opts.add_argument(
-        "-single_trials",
-        action="store_true",
-        help="Use beta-space cross-validation (GLMsingle-style). "
-        "Fits single-trial model once on all data, evaluates R² on "
-        "condition-averaged vs individual trial betas across folds.",
+    add_single_trial_args(
+        denoise_opts,
+        emit_help="Estimate and save one beta per trial (GLMsingle-style) instead "
+        "of one beta per condition. By default the PC count is then chosen by "
+        "beta-space CV; see -cv_design to select it on the condition-level "
+        "design instead (required when conditions do not repeat across runs).",
     )
     denoise_opts.add_argument(
         "-zscore_by_run",
         action="store_true",
         default=False,
         help="Z-score betas per run before CV using OLS normalization stats "
-        "(GLMsingle default). Only applies with -single_trials.",
+        "(GLMsingle default). Only applies with -cv_design single.",
     )
 
     # Processing options
@@ -1546,6 +1549,25 @@ def main():
     if args.verb >= 1:
         print(f"  CV strategy: {cv_strategy}")
 
+    # Resolve -cv_design before any data is loaded: a design with no cross-run
+    # condition repeats cannot be scored in beta space, and finding that out
+    # after the PC sweep wastes the whole run.
+    trial_repeats = summarize_trial_repeats(all_onsets)
+    cv_design = resolve_cv_design(
+        args.cv_design,
+        args.single_trials,
+        trial_repeats,
+        parameter="PC count",
+        manual_hint=(
+            "Set the component count directly with -pcstop -N (e.g. -pcstop -5), or "
+            "give -events a trial_type column that repeats across runs (-event_cols) "
+            "so there is something to cross-validate against."
+        ),
+        # Always printed, even at -verb 0: a silent switch between selection
+        # designs is exactly the kind of thing that gets misread later.
+        verbose=True,
+    )
+
     # Pre-flight checks (before slow data loading)
     preflight_check(
         input_files=input_files,
@@ -2068,6 +2090,105 @@ def main():
             n_conditions_st = int(trial_cond_ids.max().item()) + 1
             print(f"  Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs")
 
+        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
+
+        # Condition-level design per HRF group, built once and reused across every
+        # PC count in the sweep below (rebuilding it per count is pure waste).
+        _cond_design_by_hrf: dict[int, torch.Tensor] = {}
+
+        def _condition_design_for_hrf(hrf_idx: int) -> torch.Tensor:
+            cached = _cond_design_by_hrf.get(hrf_idx)
+            if cached is None:
+                hrf_st_design = st_design[hrf_idx]  # (n_tp, n_trials)
+                cached = torch.zeros(n_timepoints, n_conditions_st, device=device)
+                for c in range(n_conditions_st):
+                    cond_mask = trial_cond_ids == c
+                    if cond_mask.sum() > 0:
+                        cached[:, c] = hrf_st_design[:, cond_mask].sum(dim=1)
+                _cond_design_by_hrf[hrf_idx] = cached
+            return cached
+
+        def condition_xval_r2(
+            extra_pcs_per_run: list[torch.Tensor] | None = None,
+            metric: str = "cod",
+            verbose: bool = False,
+        ) -> torch.Tensor:
+            """Per-voxel timeseries CV R² on the condition-level design.
+
+            Serves both noise-pool selection (no extra PCs) and, under
+            ``-cv_design condition``, the scoring of each candidate PC count.
+            """
+            nuis = nuisance_per_run
+            if extra_pcs_per_run is not None:
+                nuis = [
+                    torch.cat([n, p], dim=1)
+                    for n, p in zip(nuisance_per_run, extra_pcs_per_run, strict=True)
+                ]
+
+            if not per_voxel_st:
+                # Standard path: single condition design for all voxels
+                projected_data, projected_cond_design = project_out_nuisance_per_run(
+                    data=data,
+                    design=cond_design,
+                    nuisance_per_run=nuis,
+                    run_starts=run_starts,
+                    device=data.device,
+                )
+                xval_out = compute_xval_r2(
+                    data=projected_data,
+                    design_matrix=projected_cond_design,
+                    run_starts=run_starts,
+                    stim_indices=list(range(cond_design.shape[1])),
+                    nuisance_indices=[],
+                    cv_splits=cv_splits,
+                    metric=metric,
+                    zero_event_strategy="zero",
+                    device=device,
+                    verbose=False,
+                )
+                r2_out = xval_out["r2"]
+                assert isinstance(
+                    r2_out, torch.Tensor
+                )  # "r2" key is always a tensor, unlike n_splits etc.
+                r2_out = r2_out.to(device)
+                del projected_data, projected_cond_design
+                return r2_out
+
+            # Per-voxel HRF path: each group needs its own condition design
+            # (matches denoise.py fit_denoising_model per-HRF initial R² logic)
+            r2_all = torch.zeros(data.shape[0], device=device)
+            for hrf_idx in unique_hrfs:
+                voxel_mask = hrf_indices_dev == hrf_idx
+                proj_data, proj_design = project_out_nuisance_per_run(
+                    data=data[voxel_mask],
+                    design=_condition_design_for_hrf(hrf_idx),
+                    nuisance_per_run=nuis,
+                    run_starts=run_starts,
+                    device=data.device,
+                )
+                xval_group = compute_xval_r2(
+                    data=proj_data,
+                    design_matrix=proj_design,
+                    run_starts=run_starts,
+                    stim_indices=list(range(n_conditions_st)),
+                    nuisance_indices=[],
+                    cv_splits=cv_splits,
+                    metric=metric,
+                    zero_event_strategy="zero",
+                    device=device,
+                    verbose=False,
+                )
+                r2_group = xval_group["r2"]
+                assert isinstance(r2_group, torch.Tensor)  # "r2" key is always a tensor
+                r2_all[voxel_mask] = r2_group.to(device)
+                if verbose:
+                    print(
+                        f"    HRF {hrf_idx}: {voxel_mask.sum().item():,} voxels, "
+                        f"median R²={r2_group.median().item():.4f}"
+                    )
+                del proj_data, proj_design
+            return r2_all
+
         # 2. Compute initial cross-validated R² for noise pool selection
         # Project out nuisance (polynomials) from both data and design, then
         # cross-validate with condition-level design (same approach as non-single-trial path)
@@ -2076,88 +2197,9 @@ def main():
             "Computing cross-validated R² with condition-level design for noise pool selection..."
         )
         print("  (project-first nuisance removal, per run)")
-        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=args.n_perms)
-
-        if not per_voxel_st:
-            # Standard path: single condition design for all voxels
-            projected_data, projected_cond_design = project_out_nuisance_per_run(
-                data=data,
-                design=cond_design,
-                nuisance_per_run=nuisance_per_run,
-                run_starts=run_starts,
-                device=data.device,
-            )
-
-            n_cond_cols = cond_design.shape[1]
-            xval_init = compute_xval_r2(
-                data=projected_data,
-                design_matrix=projected_cond_design,
-                run_starts=run_starts,
-                stim_indices=list(range(n_cond_cols)),
-                nuisance_indices=[],
-                cv_splits=cv_splits,
-                metric="cod",
-                zero_event_strategy="zero",
-                device=device,
-                verbose=False,
-            )
-
-            r2_init = xval_init["r2"]
-            assert isinstance(
-                r2_init, torch.Tensor
-            )  # "r2" key is always a tensor, unlike n_splits etc.
-            initial_r2 = r2_init.to(device)
-            del projected_data, projected_cond_design
-        else:
-            # Per-voxel HRF path: compute R² per HRF group with correct design
-            # (matches denoise.py fit_denoising_model per-HRF initial R² logic)
+        if per_voxel_st:
             print(f"  Computing per-HRF-group R² ({len(unique_hrfs)} groups)...")
-            initial_r2 = torch.zeros(data.shape[0], device=device)
-
-            for hrf_idx in unique_hrfs:
-                voxel_mask = hrf_indices_dev == hrf_idx
-                n_group = voxel_mask.sum().item()
-
-                # Build condition-level design from this HRF's single-trial design
-                hrf_st_design = st_design[hrf_idx]  # (n_tp, n_trials)
-                cond_design_hrf = torch.zeros(n_timepoints, n_conditions_st, device=device)
-                for c in range(n_conditions_st):
-                    cond_mask = trial_cond_ids == c
-                    if cond_mask.sum() > 0:
-                        cond_design_hrf[:, c] = hrf_st_design[:, cond_mask].sum(dim=1)
-
-                # Project nuisance and compute xval R² for this group
-                group_data = data[voxel_mask]
-                proj_data, proj_design = project_out_nuisance_per_run(
-                    data=group_data,
-                    design=cond_design_hrf,
-                    nuisance_per_run=nuisance_per_run,
-                    run_starts=run_starts,
-                    device=data.device,
-                )
-
-                xval_group = compute_xval_r2(
-                    data=proj_data,
-                    design_matrix=proj_design,
-                    run_starts=run_starts,
-                    stim_indices=list(range(n_conditions_st)),
-                    nuisance_indices=[],
-                    cv_splits=cv_splits,
-                    metric="cod",
-                    zero_event_strategy="zero",
-                    device=device,
-                    verbose=False,
-                )
-
-                r2_group = xval_group["r2"]
-                assert isinstance(r2_group, torch.Tensor)  # "r2" key is always a tensor
-                initial_r2[voxel_mask] = r2_group.to(device)
-                print(
-                    f"    HRF {hrf_idx}: {n_group:,} voxels, "
-                    f"median R²={r2_group.median().item():.4f}"
-                )
-
-                del proj_data, proj_design
+        initial_r2 = condition_xval_r2(verbose=per_voxel_st)
 
         print(f"  Initial xval R²: mean={initial_r2.mean():.4f}, median={initial_r2.median():.4f}")
         print(f"  R² range: [{initial_r2.min().item():.4f}, {initial_r2.max().item():.4f}]")
@@ -2326,99 +2368,124 @@ def main():
                     verbose=args.verb >= 1,
                 )
 
-        # 5. For each PC count: fit single-trial model with wide design, collect betas
+        # 5. Score every candidate PC count (0..max_comps).
         print()
         print(f"Optimizing component count (0 to {args.max_comps})...")
         n_voxels_st = data.shape[0]
         n_pc_counts = args.max_comps + 1
-
-        # Determine n_trials from the design
-        if not per_voxel_st:
-            n_trials_st = st_design.shape[1]
-        else:
-            n_trials_st = st_design.shape[2]  # (n_unique_hrfs, n_tp, n_trials)
-
-        # Collect all betas: (n_pc_counts, n_voxels, n_trials) on CPU
-        all_st_betas = torch.zeros(n_pc_counts, n_voxels_st, n_trials_st)
-
-        pc_range = range(n_pc_counts)
-        for n_pcs in tqdm(pc_range, desc="  Fitting PC counts", disable=not args.verb >= 1):
-            # Build nuisance: polynomials + first n_pcs per run
-            nuisance_blocks = []
-            for run_idx in range(n_runs):
-                run_nuisance = nuisance_per_run[run_idx]
-                if n_pcs > 0:
-                    pcs = noise_pcs_per_run[run_idx][:, :n_pcs]
-                    run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
-                nuisance_blocks.append(run_nuisance)
-            nuisance_design = torch.block_diag(*nuisance_blocks)
-
-            # Fit GLM and extract single-trial betas
-            if not per_voxel_st:
-                # Standard 2D path
-                full_design = torch.cat([st_design, nuisance_design], dim=1)
-                task_indices = list(range(st_design.shape[1]))
-                glm_results = fit_glm(
-                    data,
-                    full_design,
-                    tr=args.tr,
-                    max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
-                    device=device,
-                    verbose=False,
-                    task_indices=task_indices,
-                )
-                assert glm_results.betas is not None  # set by fit_glm above
-                all_st_betas[n_pcs] = glm_results.betas.cpu()
-            else:
-                # Per-voxel HRF path: group by HRF index
-                task_indices = list(range(n_trials_st))
-                for hrf_idx in unique_hrfs:
-                    voxel_mask = hrf_indices_dev == hrf_idx
-                    group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
-                    full_design = torch.cat([group_design_2d, nuisance_design], dim=1)
-                    glm_results = fit_glm(
-                        data[voxel_mask],
-                        full_design,
-                        tr=args.tr,
-                        max_poly_degree=-1,  # block-diagonal nuisance already has per-run constants
-                        device=device,
-                        verbose=False,
-                        task_indices=task_indices,
-                    )
-                    assert glm_results.betas is not None  # set by fit_glm above
-                    all_st_betas[n_pcs, voxel_mask] = glm_results.betas.cpu()
-
-        # Batch beta-space CV across all PC counts at once
-        print("  Computing beta-space CV R² for all PC counts (batch)...")
-        xval = single_trial_cv_helper(
-            all_st_betas,
-            trial_cond_ids,
-            trial_run_ids,
-            cv_splits,
-            metric=args.cv_metric,
-            zscore_by_run=args.zscore_by_run,
-            reference_variant_idx=0,  # 0 PCs = unregularized baseline for z-score stats
-            device=device,
-            verbose=False,
-        )
-        r2_maps_st = xval["r2"].T  # (n_voxels, n_pc_counts)
         _hib = metric_higher_is_better(args.cv_metric)
         _metric_label = args.cv_metric.upper()
 
-        # Determine criteria mask from initial R² (COD-based, computed earlier).
-        # This is the GLMsingle/GLMdenoise pattern: criteria voxels are those with
-        # meaningful task signal, regardless of what metric is used for PC optimization.
-        # initial_r2 is always COD (computed at step 2 above).
+        # Criteria voxels come from the initial R² (always COD, computed at step 2),
+        # not from the optimization metric.  This is the GLMsingle/GLMdenoise
+        # pattern: criteria voxels are those with meaningful task signal.
         criteria_mask = (initial_r2 > args.r2_threshold).cpu()
         n_criteria = criteria_mask.sum().item()
         print(
             f"  Criteria voxels (initial R² > {args.r2_threshold}): "
             f"{n_criteria:,} / {n_voxels_st:,}"
         )
-
         if n_criteria == 0:
             print("  WARNING: No voxels meet criteria! Using all voxels.")
             criteria_mask = torch.ones(n_voxels_st, dtype=torch.bool)
+            n_criteria = n_voxels_st
+
+        def _pcs_for_count(n_pcs: int) -> list[torch.Tensor] | None:
+            if n_pcs <= 0:
+                return None
+            return [noise_pcs_per_run[run_idx][:, :n_pcs] for run_idx in range(n_runs)]
+
+        if cv_design == "single":
+            # Beta-space CV: fit the single-trial model at every PC count, then score
+            # held-out trial betas against same-condition training-run betas.
+            print("  Scoring in single-trial beta space (-cv_design single)")
+
+            # Determine n_trials from the design
+            if not per_voxel_st:
+                n_trials_st = st_design.shape[1]
+            else:
+                n_trials_st = st_design.shape[2]  # (n_unique_hrfs, n_tp, n_trials)
+
+            # Collect all betas: (n_pc_counts, n_voxels, n_trials) on CPU
+            all_st_betas = torch.zeros(n_pc_counts, n_voxels_st, n_trials_st)
+
+            pc_range = range(n_pc_counts)
+            for n_pcs in tqdm(pc_range, desc="  Fitting PC counts", disable=not args.verb >= 1):
+                # Build nuisance: polynomials + first n_pcs per run
+                nuisance_blocks = []
+                for run_idx in range(n_runs):
+                    run_nuisance = nuisance_per_run[run_idx]
+                    if n_pcs > 0:
+                        pcs = noise_pcs_per_run[run_idx][:, :n_pcs]
+                        run_nuisance = torch.cat([run_nuisance, pcs], dim=1)
+                    nuisance_blocks.append(run_nuisance)
+                nuisance_design = torch.block_diag(*nuisance_blocks)
+
+                # Fit GLM and extract single-trial betas
+                if not per_voxel_st:
+                    # Standard 2D path
+                    full_design = torch.cat([st_design, nuisance_design], dim=1)
+                    task_indices = list(range(st_design.shape[1]))
+                    glm_results = fit_glm(
+                        data,
+                        full_design,
+                        tr=args.tr,
+                        max_poly_degree=-1,  # block-diag nuisance already has per-run constants
+                        device=device,
+                        verbose=False,
+                        task_indices=task_indices,
+                    )
+                    assert glm_results.betas is not None  # set by fit_glm above
+                    all_st_betas[n_pcs] = glm_results.betas.cpu()
+                else:
+                    # Per-voxel HRF path: group by HRF index
+                    task_indices = list(range(n_trials_st))
+                    for hrf_idx in unique_hrfs:
+                        voxel_mask = hrf_indices_dev == hrf_idx
+                        group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
+                        full_design = torch.cat([group_design_2d, nuisance_design], dim=1)
+                        glm_results = fit_glm(
+                            data[voxel_mask],
+                            full_design,
+                            tr=args.tr,
+                            max_poly_degree=-1,  # block-diag nuisance has per-run constants
+                            device=device,
+                            verbose=False,
+                            task_indices=task_indices,
+                        )
+                        assert glm_results.betas is not None  # set by fit_glm above
+                        all_st_betas[n_pcs, voxel_mask] = glm_results.betas.cpu()
+
+            # Batch beta-space CV across all PC counts at once
+            print("  Computing beta-space CV R² for all PC counts (batch)...")
+            xval = single_trial_cv_helper(
+                all_st_betas,
+                trial_cond_ids,
+                trial_run_ids,
+                cv_splits,
+                metric=args.cv_metric,
+                zscore_by_run=args.zscore_by_run,
+                reference_variant_idx=0,  # 0 PCs = unregularized baseline for z-score stats
+                device=device,
+                verbose=False,
+            )
+            r2_maps_st = xval["r2"].T.cpu()  # (n_voxels, n_pc_counts)
+            del all_st_betas
+        else:
+            # Condition-level timeseries CV.  The PC count is a property of the
+            # noise, not of the task parcellation, so it can be learned from the
+            # design with the most leverage and applied to the single-trial fit
+            # below.  This is the only path that works when conditions do not
+            # repeat across runs (a held-out trial would have no target).
+            print("  Scoring on the condition-level design (-cv_design condition)")
+            r2_maps_st = torch.zeros(n_voxels_st, n_pc_counts)
+            for n_pcs in tqdm(
+                range(n_pc_counts), desc="  Scoring PC counts", disable=not args.verb >= 1
+            ):
+                r2_maps_st[:, n_pcs] = condition_xval_r2(
+                    extra_pcs_per_run=_pcs_for_count(n_pcs),
+                    metric=args.cv_metric,
+                ).cpu()
 
         r2_criteria = r2_maps_st[criteria_mask, :]  # (n_criteria, n_pc_counts)
         r2_by_pc = r2_criteria.median(dim=0).values  # (n_pc_counts,)
@@ -2721,6 +2788,16 @@ def main():
             "pc_selection_curve": r2_by_pc.cpu().tolist(),
             "final_median_r2": float(final_r2_cod.median()),
             "cv_metric": args.cv_metric,
+            "cv_design": cv_design,
+            "cv_design_requested": args.cv_design,
+            "trial_repeats": {
+                "n_trials": trial_repeats.n_trials,
+                "n_conditions": trial_repeats.n_conditions,
+                "n_repeated_conditions": trial_repeats.n_repeated_conditions,
+                "predictable_fraction": trial_repeats.predictable_fraction,
+                "trials_per_condition": trial_repeats.trials_per_condition,
+                "runs_per_condition": trial_repeats.runs_per_condition,
+            },
             "noise_method": args.noise,
             "auto_component_caps": bool(args.auto_component_caps),
             "auto_component_estimate_max": int(estimate_max_comps)

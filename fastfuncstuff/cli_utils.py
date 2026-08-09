@@ -2499,6 +2499,238 @@ def validate_hrf_compatibility(
             sys.exit(1)
 
 
+# Minimum fraction of trials that must be predictable from other runs before
+# beta-space (single-trial) cross-validation is trustworthy.  Below this, the
+# criterion is scoring mostly-undefined predictions.
+CV_DESIGN_MIN_PREDICTABLE_FRACTION = 0.5
+
+
+@dataclass
+class TrialRepeatSummary:
+    """How repeatable the event design is, from the caller's ``[cond][run]`` onsets.
+
+    Beta-space cross-validation predicts a held-out trial from the *other runs'*
+    trials of the same condition.  A trial whose condition never appears in
+    another run has no such target, so its score is undefined no matter how good
+    the denoising is.  ``predictable_fraction`` is the share of trials that do
+    have one.
+    """
+
+    n_trials: int
+    n_runs: int
+    trials_per_condition: list[int]
+    runs_per_condition: list[int]
+    n_predictable_trials: int
+
+    @property
+    def predictable_fraction(self) -> float:
+        return self.n_predictable_trials / self.n_trials if self.n_trials else 0.0
+
+    @property
+    def n_repeated_conditions(self) -> int:
+        return sum(1 for r in self.runs_per_condition if r >= 2)
+
+    @property
+    def n_conditions(self) -> int:
+        return len(self.trials_per_condition)
+
+    def describe(self) -> str:
+        return (
+            f"{self.n_trials} trials, {self.n_conditions} conditions, "
+            f"{self.n_repeated_conditions} of them appearing in >=2 runs "
+            f"({100 * self.predictable_fraction:.0f}% of trials predictable across runs)"
+        )
+
+
+def summarize_trial_repeats(
+    onsets_by_condition: list[list[np.ndarray]],
+) -> TrialRepeatSummary:
+    """Count cross-run repeats in ``all_onsets[condition][run]`` onset lists.
+
+    Parameters
+    ----------
+    onsets_by_condition : list of list of np.ndarray
+        ``[condition][run] -> onset times``, i.e. :class:`TimingSpec.all_onsets`.
+    """
+    trials_per_condition: list[int] = []
+    runs_per_condition: list[int] = []
+    n_predictable = 0
+
+    n_runs = max((len(per_run) for per_run in onsets_by_condition), default=0)
+
+    for per_run in onsets_by_condition:
+        counts = [len(np.atleast_1d(np.asarray(onsets))) for onsets in per_run]
+        n_cond_trials = int(sum(counts))
+        n_cond_runs = int(sum(1 for c in counts if c > 0))
+        trials_per_condition.append(n_cond_trials)
+        runs_per_condition.append(n_cond_runs)
+        if n_cond_runs >= 2:
+            n_predictable += n_cond_trials
+
+    return TrialRepeatSummary(
+        n_trials=int(sum(trials_per_condition)),
+        n_runs=n_runs,
+        trials_per_condition=trials_per_condition,
+        runs_per_condition=runs_per_condition,
+        n_predictable_trials=n_predictable,
+    )
+
+
+def add_single_trial_args(group, *, emit_help: str) -> None:
+    """Add the harmonized ``-single_trials`` / ``-cv_design`` pair.
+
+    The two flags are orthogonal on purpose: ``-single_trials`` controls the
+    *output* (per-trial betas), ``-cv_design`` controls which design the tool's
+    hyperparameter search is scored against.  Keeping them separate is what lets
+    a design with no repeated conditions still produce single-trial betas — the
+    parameter is learned where the data has leverage, then applied per trial.
+    """
+    group.add_argument(
+        "-single_trials",
+        "-single-trials",
+        dest="single_trials",
+        action="store_true",
+        help=emit_help,
+    )
+    group.add_argument(
+        "-cv_design",
+        "-cv-design",
+        dest="cv_design",
+        choices=["auto", "condition", "single"],
+        default="auto",
+        help="Design used to score the cross-validated parameter search. "
+        "'single' = beta-space CV (held-out trial betas vs. same-condition "
+        "training-run betas; needs repeated conditions across runs). "
+        "'condition' = timeseries CV on the condition-level design (works with "
+        "no repeats at all). 'auto' (default) = 'single' when -single_trials is "
+        "set and the events support it, otherwise 'condition'. Selection and "
+        "output are independent: -single_trials -cv_design condition learns the "
+        "parameter from condition structure and still writes per-trial betas.",
+    )
+
+
+def resolve_cv_design(
+    requested: str,
+    single_trials: bool,
+    repeats: TrialRepeatSummary,
+    *,
+    parameter: str,
+    manual_hint: str,
+    single_needs_repeats: bool = True,
+    verbose: bool = True,
+) -> str:
+    """Turn ``-cv_design {auto,condition,single}`` into 'condition' or 'single'.
+
+    Both selection designs are cross-validated across runs *except* single-trial
+    HRF selection, which is in-sample (all HRF candidates carry one beta per
+    trial, so model complexity is equal and in-sample R² is a fair comparison).
+    That is what ``single_needs_repeats`` encodes: with no cross-run condition
+    overlap, condition-level CV is always undefined, but in-sample single-trial
+    selection still works.
+
+    Parameters
+    ----------
+    parameter : str
+        What is being chosen ("PC count", "HRF"), for the printed rationale.
+    manual_hint : str
+        Tool-specific advice printed when no selection design is usable.
+    single_needs_repeats : bool
+        False when the tool's single-trial selection is in-sample rather than
+        cross-validated.
+
+    Raises
+    ------
+    SystemExit
+        If the requested design cannot be scored on this event structure, or if
+        beta-space selection was requested without -single_trials.
+    """
+    import sys
+
+    if requested == "single" and not single_trials:
+        print("ERROR: -cv_design single requires -single_trials.")
+        print("  Beta-space selection scores single-trial betas; without")
+        print("  -single_trials there are none. Use -cv_design condition instead.")
+        sys.exit(1)
+
+    frac = repeats.predictable_fraction
+    has_repeats = repeats.n_predictable_trials > 0
+    # Condition-level CV predicts held-out runs from the others, so it needs the
+    # same cross-run condition overlap that beta-space CV needs.  A design where
+    # every condition is confined to one run cannot be cross-validated at all.
+    viable_condition = has_repeats
+    viable_single = single_trials and (has_repeats or not single_needs_repeats)
+
+    if verbose:
+        print()
+        print(f"Event repeat structure: {repeats.describe()}")
+
+    def _no_cross_run_structure() -> None:
+        print()
+        print(f"ERROR: no condition appears in more than one run, so {parameter}")
+        print("  selection cannot be cross-validated: a held-out run shares no")
+        print("  condition with the runs it would be predicted from.")
+        print(f"  {repeats.describe()}")
+        print(f"  {manual_hint}")
+        sys.exit(1)
+
+    if requested == "condition":
+        if not viable_condition:
+            _no_cross_run_structure()
+        resolved = "condition"
+    elif requested == "single":
+        if not viable_single:
+            print()
+            print("ERROR: -cv_design single needs conditions that repeat across runs.")
+            print(f"  {repeats.describe()}")
+            print("  Every trial's condition is confined to a single run, so a held-out")
+            print("  trial has no same-condition training trial to be scored against.")
+            if viable_condition:
+                print("  Use -cv_design condition; -single_trials still writes per-trial betas.")
+            else:
+                print(f"  {manual_hint}")
+            sys.exit(1)
+        if single_needs_repeats and frac < CV_DESIGN_MIN_PREDICTABLE_FRACTION:
+            print(
+                f"  WARNING: only {100 * frac:.0f}% of trials are predictable across runs; "
+                f"beta-space {parameter} selection rests on a thin subset."
+            )
+        resolved = "single"
+    else:  # auto
+        if viable_single and (frac >= CV_DESIGN_MIN_PREDICTABLE_FRACTION or not viable_condition):
+            resolved = "single"
+        elif viable_condition:
+            resolved = "condition"
+        elif viable_single:
+            resolved = "single"
+        else:
+            _no_cross_run_structure()
+            raise AssertionError("unreachable")  # _no_cross_run_structure exits
+
+    if verbose:
+        if resolved == "single":
+            how = (
+                "beta-space CV on single-trial betas"
+                if single_needs_repeats
+                else "in-sample R² on single-trial betas"
+            )
+            why = ""
+            if requested == "auto" and not viable_condition:
+                why = " — the only design with a usable criterion here"
+            print(f"  {parameter} selection: {how} (-cv_design single){why}")
+        else:
+            why = ""
+            if requested == "auto" and single_trials:
+                why = (
+                    f" — auto fell back: {100 * frac:.0f}% of trials predictable "
+                    f"across runs, below {100 * CV_DESIGN_MIN_PREDICTABLE_FRACTION:.0f}%"
+                )
+            print(f"  {parameter} selection: timeseries CV on the condition-level design{why}")
+            if single_trials:
+                print("  Single-trial betas are still estimated and saved.")
+
+    return resolved
+
+
 def build_task_design_from_args(
     hrf_model_name: str,
     is_fir_model: bool,

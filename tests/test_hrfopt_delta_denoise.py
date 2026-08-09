@@ -57,7 +57,9 @@ class TestArgValidation:
         captured = capsys.readouterr()
         assert "-delta_denoise requires at least one -ortvec" in captured.out
 
-    def test_delta_denoise_with_single_trials_exits(self, monkeypatch, tmp_path, capsys):
+    def test_delta_denoise_with_beta_space_cv_exits(self, monkeypatch, tmp_path, capsys):
+        # -delta_denoise is incompatible with the *selection* path, not with
+        # emitting single-trial betas, so the guard keys on -cv_design.
         ortvec_path = tmp_path / "motion.1D"
         ortvec_path.write_text(
             "0.0\n0.1\n0.2\n"
@@ -68,13 +70,15 @@ class TestArgValidation:
             str(ortvec_path),
             "motion",
             "-single_trials",
+            "-cv_design",
+            "single",
         ]
         monkeypatch.setattr(sys, "argv", argv)
         with pytest.raises(SystemExit) as excinfo:
             hrfopt_cli.main()
         assert excinfo.value.code == 1
         captured = capsys.readouterr()
-        assert "not yet supported with -single_trials" in captured.out
+        assert "not yet supported with -cv_design single" in captured.out
 
 
 # ---------------------------------------------------------------------------
