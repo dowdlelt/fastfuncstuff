@@ -116,10 +116,15 @@ OUTPUT
                     default the folds pick their own HRF at grid resolution, so
                     this scores a slightly different model than the other
                     sub-bricks report.
-    noise_ceiling   largest R2 any model could reach, estimated from runs whose
-                    aperture movie is bit-identical. Present only when such
-                    repeats exist. xval_r2_normalized is xval_r2 over it: 1.0
-                    means the model captured everything that reproduces at all.
+    noise_ceiling   largest R2 any model could reach on this data. Present only
+                    when two or more runs share a bit-identical aperture movie.
+                    See NOISE CEILING below for how it is derived; NaN (not 0)
+                    where no repeats exist.
+    xval_r2_normalized
+                    xval_r2 / noise_ceiling -- the fraction of the EXPLAINABLE
+                    variance the model got, so 1.0 means it captured everything
+                    that reproduces at all. Values slightly above 1 are noise in
+                    the ceiling estimate, not a model that beat it.
     hrf_index       selected HRF, ONE-BASED, into the library actually used.
     hrf_index_continuous, hrf_evidence
                     (-hrf_select refine only) parabolic sub-step interpolation
@@ -132,14 +137,45 @@ OUTPUT
                     gn_iterations equal to -maxiter; that is common and not by
                     itself a failure.
 
-  Optional extra files: {prefix}_canonical (-save_canonical) holds the same
-  bucket fit with the canonical HRF forced, for a like-for-like comparison
-  against the selected-HRF fit; {prefix}_hrf_r2 (-save_hrf_r2) holds the raw
-  per-voxel x per-HRF R2 matrix behind the HRF choice.
+OPTIONAL FILES  (each needs the flag in brackets)
+    {prefix}_canonical.nii.gz      [-save_canonical]
+        The same bucket refit with the canonical HRF forced, so the
+        HRF-selected and fixed-HRF fits can be compared voxelwise on identical
+        data rather than across two runs of the tool.
+    {prefix}_hrf_r2.nii.gz         [-save_hrf_r2]
+        Raw per-voxel x per-HRF R2 matrix, the input to any HRF-selection
+        criterion. One sub-brick per library entry.
+    {prefix}_screen.nii.gz         [-save_screen]
+        Cross-validated R2 of the fast linear screening model. Usable on its
+        own as a functionally derived mask.
+    {prefix}_noisepool.nii.gz, _noisepcs.1D, _denoise.png, _noisepc*.png
+                                   [-save_denoise]
+        Which voxels fed the noise pool, the component timecourses actually
+        projected out, the held-out-R2-vs-count sweep, and per-component
+        timecourse/spatial-weight figures.
+    {prefix}_reliability.tsv, .png, .nii.gz    [-xval halves]
+        Split-half parameter reliability. See RELIABILITY below.
 
-  -xval halves additionally writes {prefix}_reliability.{tsv,png}, the split-half
-  reliability of every parameter swept across R2 thresholds, and
-  {prefix}_reliability.nii.gz, the per-voxel half-to-half disagreement.
+NOISE CEILING
+  Runs with a bit-identical aperture movie have the same expected response, so
+  everything they disagree about is noise. Writing a voxel as y = s + e with e
+  independent across repeats, corr(y_i, y_j) = var(s) / var(y) -- which is
+  exactly the largest R2 any model can reach on a single run. So the ceiling IS
+  the mean pairwise correlation across repeats: already in R2 units, no further
+  correction, no assumption about the noise structure.
+
+  Three things worth knowing:
+    - It is computed AFTER per-run nuisance projection. Shared drift reproduces
+      perfectly across repeats and would otherwise be counted as signal, pushing
+      the ceiling toward 1 for every voxel with a slow trend in it.
+    - Repeats are DETECTED by comparing aperture movies, not declared. That is
+      stricter than -stim_groups on purpose: clockwise and counter-clockwise
+      wedges are one stimulus group but have different expected timecourses, so
+      they are not repeats. A -stim-nii-multi source is recognised for free.
+    - Odd/even TR splits within a single run are NOT a substitute. Temporal
+      autocorrelation makes the halves agree for reasons unrelated to
+      reproducible signal, and the ceiling comes out inflated. Hence NaN rather
+      than a fabricated number when no repeats exist.
 
 RELIABILITY  (-xval halves)
   Held-out R2 measures whether the model predicts unseen data. It does NOT
@@ -156,6 +192,35 @@ RELIABILITY  (-xval halves)
   to mean anything, which is what forces two folds rather than more -- and two
   folds train on half the data, so the R2 it reports is conservative relative to
   the all-runs fit in the bucket.
+
+  How the number is computed:
+    - Reliability is an ACROSS-VOXEL correlation of one parameter between the
+      two halves. It therefore needs voxels whose true pRFs differ; over an ROI
+      with no retinotopic spread it measures nothing.
+    - Voxels are selected by the FULL fit's r2 (-reliability_threshold), never
+      by either half's. Selecting on a half keeps the voxels that half happened
+      to fit well and biases the agreement upward.
+    - Spearman rank correlation for every parameter except angle, because
+      eccentricity and size are strongly skewed across an ROI. Ranks are
+      tie-averaged: pRF parameters pile up on their bounds, so ties are routine.
+    - Polar angle uses circular correlation (Jammalamadaka-Sarma), since a
+      linear coefficient calls two estimates either side of the 0/360 seam
+      completely inconsistent.
+    - Averaged over -xval_draws independent half-splits, then Spearman-Brown
+      corrected (r_full = 2r / (1 + r)) because each half saw half the data
+      while the reported fit saw all of it. Both forms are written out.
+
+  The three files:
+    .tsv   one row per R2 threshold: threshold, n_voxels, the raw correlation
+           per parameter, then the same Spearman-Brown corrected (*_sb columns).
+           The sweep stops once too few voxels survive for a correlation to
+           mean anything, so the last row tells you where the data ran out.
+    .png   those curves, Spearman-Brown corrected, with -reliability_threshold
+           marked and the surviving voxel count on a log right-hand axis.
+    .nii.gz  per-voxel abs_delta_{x,y,eccentricity,angle,sigma,rfsize}: the mean
+           absolute half-to-half disagreement, averaged over draws. Same units
+           as the main bucket, EXCEPT abs_delta_angle which is always degrees of
+           polar angle (wrapped, so it never exceeds 180).
 
   Read the curve, not just the printed number. Reliability of rfsize typically
   climbs steeply with data quality while position is already flat near 1.0; the
