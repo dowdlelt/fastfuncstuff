@@ -768,6 +768,7 @@ def create_pighs_library(
     duration: float = 32.0,
     microtime_dt: float = 0.1,
     stim_duration: float = 0.0,
+    seed: int | None = None,
     device: torch.device | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -826,7 +827,11 @@ def create_pighs_library(
     # Use LHS for the other 4 parameters (rise_fraction, fall, recovery, undershoot)
     from scipy.stats import qmc
 
-    sampler = qmc.LatinHypercube(d=4)
+    # Seeded, or the library is a different set of HRFs on every call: the four
+    # non-peak-time parameters are Latin-hypercube samples, so an unseeded run
+    # is not reproducible and two fits of the same data select from different
+    # candidate shapes.
+    sampler = qmc.LatinHypercube(d=4, seed=seed)
     samples = sampler.random(n=n_hrfs)
 
     # Sample rise_fraction to split peak_time into delay (m1) and rise (m2)

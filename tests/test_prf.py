@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -1464,3 +1466,132 @@ def test_halves_refuses_a_design_with_no_repeated_group(tmp_path):
                 "-quiet",
             ]
         )
+
+
+def test_tr_boxcar_kernel_reproduces_fine_grained_convolution():
+    """The per-TR kernel must be the TR-INTEGRATED HRF, not the sampled impulse response.
+
+    A pRF design has no onset matrix: the aperture is one frame per TR and the
+    drive is one value per TR, so the HRF has to absorb the width of a sample.
+    Writing S = TR/dt fine samples per TR and g[j] = sum_u h[jS - u], a stimulus
+    on for k TRs gives
+
+        sum_s g[t-s] = sum_s sum_u h[(t-s)S - u] = sum_{j<kS} h[tS - j]
+
+    because (sS + u) covers 0..kS-1 exactly once. So it equals the fine-grained
+    convolution EXACTLY, for any k -- the boxcar is a sample-width correction and
+    is not duplicated as the stimulus lengthens. Pinned here because reverting to
+    stim_duration=0 would look harmless and silently shift every pRF position by
+    half a TR along the stimulus sweep.
+    """
+    from fastfuncstuff.design.hrf import _load_hrf_from_file
+
+    impulse = _load_hrf_from_file("getcanonicalbasic.tsv")
+    samples_per_tr = 10  # TR = 1.0 s against the 0.1 s file resolution
+    tr_kernel = np.convolve(impulse, np.ones(samples_per_tr))[::samples_per_tr]
+
+    for n_tr_on in (1, 3, 8):
+        fine = np.zeros(len(impulse) + samples_per_tr * n_tr_on)
+        fine[: samples_per_tr * n_tr_on] = 1.0
+        truth = np.convolve(fine, impulse)[::samples_per_tr]
+
+        drive = np.zeros(len(truth))
+        drive[:n_tr_on] = 1.0
+        predicted = np.convolve(drive, tr_kernel)[: len(truth)]
+
+        np.testing.assert_allclose(predicted, truth, atol=1e-12)
+
+
+def test_prf_hrfs_are_tr_integrated(monkeypatch):
+    """Every HRF ffs_pyrf builds carries the one-TR boxcar, for all -hrf modes."""
+    import types
+
+    from fastfuncstuff.cli.pyrf import _build_hrf_library
+    from fastfuncstuff.design.hrf import load_canonical_hrf_basic
+
+    tr = 1.0
+    device = torch.device("cpu")
+    args = types.SimpleNamespace(
+        hrf_mode="canonical",
+        hrf_duration=32.0,
+        hrf_library=None,
+        num_hrfs=None,
+        save_canonical=False,
+    )
+    canonical, _ = _build_hrf_library(args, tr, device)
+    expected = load_canonical_hrf_basic(
+        microtime_dt=tr, hrf_duration=32.0, stim_duration=tr, device=device
+    )
+    torch.testing.assert_close(canonical[0], expected)
+
+    # The impulse-sampled kernel is what this used to be; it must NOT match.
+    impulse = load_canonical_hrf_basic(microtime_dt=tr, hrf_duration=32.0, device=device)
+    assert not torch.allclose(canonical[0], impulse, atol=1e-3)
+
+    from fastfuncstuff.design.hrf import get_hrf_library, load_canonical_hrf_library
+
+    args.hrf_mode = "library"
+    library, _ = _build_hrf_library(args, tr, device)
+    torch.testing.assert_close(
+        library,
+        load_canonical_hrf_library(
+            microtime_dt=tr, hrf_duration=32.0, stim_duration=tr, device=device
+        ),
+    )
+
+    args.hrf_mode = "pighs"
+    args.seed = 0
+    pighs, _ = _build_hrf_library(args, tr, device)
+    torch.testing.assert_close(
+        pighs,
+        get_hrf_library(
+            mode="pighs",
+            microtime_dt=tr,
+            hrf_duration=32.0,
+            stim_duration=tr,
+            n_hrfs=20,
+            seed=0,
+            device=device,
+        ),
+    )
+
+
+def test_pighs_library_is_reproducible_under_a_seed():
+    """The PIGHS parameters are Latin-hypercube samples; unseeded they differ per call."""
+    from fastfuncstuff.design.hrf import get_hrf_library
+
+    device = torch.device("cpu")
+    kwargs = dict(mode="pighs", microtime_dt=1.0, hrf_duration=32.0, n_hrfs=8, device=device)
+    torch.testing.assert_close(get_hrf_library(seed=7, **kwargs), get_hrf_library(seed=7, **kwargs))
+    assert not torch.allclose(get_hrf_library(seed=7, **kwargs), get_hrf_library(seed=8, **kwargs))
+
+
+def test_prf_canonical_matches_the_analyzeprf_reference_hrf():
+    """ffs_pyrf's canonical must agree with analyzePRF's getcanonicalhrf(tr,tr).
+
+    The underlying vector is bit-identical (both come from Kay's canonical, ours
+    via GLMdenoise), so the only room for disagreement is the boxcar and the
+    resample. The residual is linear vs pchip interpolation onto the TR grid.
+    """
+    import types
+
+    from fastfuncstuff.cli.pyrf import _build_hrf_library
+
+    reference_path = Path(__file__).parent / "data" / "cvn_hrf_tr1.1D"
+    if not reference_path.exists():
+        pytest.skip("analyzePRF reference HRF fixture not present")
+    reference = np.loadtxt(reference_path)
+
+    args = types.SimpleNamespace(
+        hrf_mode="canonical",
+        hrf_duration=32.0,
+        hrf_library=None,
+        num_hrfs=None,
+        save_canonical=False,
+    )
+    canonical, _ = _build_hrf_library(args, 1.0, torch.device("cpu"))
+    ours = canonical[0].numpy()
+
+    n = min(len(ours), len(reference))
+    assert np.abs(ours[:n] - reference[:n]).max() < 5e-3
+    assert int(np.argmax(ours)) == int(np.argmax(reference))

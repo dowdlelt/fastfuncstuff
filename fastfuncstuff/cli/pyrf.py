@@ -156,6 +156,34 @@ OPTIONAL FILES  (each needs the flag in brackets)
     {prefix}_reliability.tsv, .png, .nii.gz    [-xval halves]
         Split-half parameter reliability. See RELIABILITY below.
 
+HRF CONVENTION
+  Every HRF here is TR-INTEGRATED: the impulse response convolved with a
+  one-TR boxcar, then sampled at the TR. That differs from the rest of ffs,
+  where the HRF stays an impulse response and stimulus duration is carried by
+  the onset matrix -- but a pRF design has no onset matrix. The aperture is one
+  frame per TR, the drive is one value per TR, so the boxcar has nowhere to live
+  except in the HRF.
+
+  This is NOT double-counting a stimulus that lasts several TRs. The boxcar
+  accounts for the width of ONE sample; multi-TR stimulation is carried by the
+  convolution summing over TRs. Writing S = TR/dt fine samples per TR and
+  g[j] = sum_u h[jS-u], a pixel on for k TRs predicts
+
+      sum_s g[t-s] = sum_s sum_u h[(t-s)S-u] = sum_{j<kS} h[tS-j]
+
+  which is the fine-grained convolution EXACTLY, for any k, because (sS+u)
+  covers 0..kS-1 exactly once each. Sampling the impulse response instead --
+  what this tool did before 2026-08 -- leaves a 15%-of-peak error for a pixel on
+  for one TR even after the gain is fitted, and it is a timing error of about
+  half a TR rather than a scale error. In a sweeping-bar design HRF timing
+  trades against pRF position, so it surfaced as a shifted map rather than as
+  bad R2. analyzePRF does the same thing, via getcanonicalhrf(tr,tr).
+
+  The equivalent alternative is to upsample the aperture to microtime, convolve
+  there, and downsample -- identical by the algebra above, but S times the work
+  on the pixels-by-time axis. It would only buy something for apertures sampled
+  faster than the TR, which this tool does not currently accept.
+
 NOISE CEILING
   Runs with a bit-identical aperture movie have the same expected response, so
   everything they disagree about is noise. Writing a voxel as y = s + e with e
@@ -643,7 +671,11 @@ def create_parser() -> argparse.ArgumentParser:
         "-seed",
         type=int,
         default=0,
-        help="Random seed for the screening tile basis and the -xval halves draws",
+        help=(
+            "Random seed for the screening tile basis, the -xval halves draws, and "
+            "the -hrf pighs library (whose shape parameters are Latin-hypercube "
+            "samples, so it is a different library on every unseeded call)"
+        ),
     )
     model.add_argument(
         "-xval-hrf",
@@ -948,8 +980,16 @@ def _build_hrf_library(
     canonical shape exactly, so "which library entry is the canonical" has no
     honest answer.
     """
+    # stim_duration=tr, not the 0 the HRF loaders default to. Elsewhere in ffs
+    # the onset matrix carries stimulus duration and the HRF stays an impulse
+    # response, but a pRF design has no onset matrix: the aperture movie is one
+    # frame per TR and each frame is ON for that whole TR, so the boxcar has
+    # nowhere to live except in the HRF. Omitting it made the modelled response
+    # peak 0.45 s early at TR=1 (positive centroid 5.71 s vs 6.16 s, deviating
+    # by 15% of peak), and in a sweeping-bar design HRF timing trades directly
+    # against pRF position -- so it showed up as a position bias, not as bad R2.
     canonical = load_canonical_hrf_basic(
-        microtime_dt=tr, hrf_duration=args.hrf_duration, device=device
+        microtime_dt=tr, hrf_duration=args.hrf_duration, stim_duration=tr, device=device
     ).unsqueeze(0)
     if args.hrf_mode == "canonical":
         return canonical, 0
@@ -959,13 +999,16 @@ def _build_hrf_library(
             mode="pighs",
             microtime_dt=tr,
             hrf_duration=args.hrf_duration,
+            stim_duration=tr,
             n_hrfs=args.num_hrfs or 20,
+            seed=args.seed,
             device=device,
         )
     else:
         library = load_canonical_hrf_library(
             microtime_dt=tr,
             hrf_duration=args.hrf_duration,
+            stim_duration=tr,
             device=device,
             library_path=args.hrf_library,
         )
@@ -1820,8 +1863,14 @@ def main(argv: list[str] | None = None) -> int:
             analysis_data,
             stimulus_runs,
             stimulus_shape,
+            # Same TR-integrated kernel the fit uses (see _build_hrf_library):
+            # screening decides which voxels are worth refining, so it has to
+            # score them under the model they will actually be fit with.
             load_canonical_hrf_basic(
-                microtime_dt=loaded.tr, hrf_duration=args.hrf_duration, device=device
+                microtime_dt=loaded.tr,
+                hrf_duration=args.hrf_duration,
+                stim_duration=loaded.tr,
+                device=device,
             ),
             loaded.run_starts,
             nuisance_per_run=nuisance_per_run,
