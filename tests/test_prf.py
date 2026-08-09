@@ -1124,3 +1124,343 @@ def test_noise_pool_mask_reaches_outside_the_fit_mask(tmp_path):
     pool = nib.load(f"{prefix}_noisepool.nii.gz").get_fdata().reshape(-1)
     assert pool[24:].sum() > 0
     assert pool[:24].sum() == 0
+
+
+def test_average_ranks_share_the_rank_within_a_tie_group():
+    """Bound-clamped parameters tie constantly; ordinal ranks would invent an order."""
+    from fastfuncstuff.stats.reliability import average_ranks
+
+    ranks = average_ranks(torch.tensor([10.0, 20.0, 20.0, 30.0]))
+
+    torch.testing.assert_close(ranks, torch.tensor([1.0, 2.5, 2.5, 4.0]))
+
+
+def test_circular_correlation_survives_the_angle_wrap():
+    """A constant rotation is perfect circular agreement and terrible linear agreement."""
+    from fastfuncstuff.stats.reliability import circular_correlation, spearman_correlation
+
+    # Concentrated, so the circular mean is well defined; the rotation then
+    # carries part of the sample across the 2*pi -> 0 seam.
+    angles = torch.linspace(0.0, 2.0, 50)
+    rotated = (angles + 5.5).remainder(2 * torch.pi)
+    assert rotated.max() > 6.0 and rotated.min() < 1.0
+
+    assert circular_correlation(angles, rotated) == pytest.approx(1.0, abs=1e-6)
+    # The same data through the linear coefficient the other parameters use.
+    assert abs(spearman_correlation(angles, rotated)) < 0.6
+
+
+def test_noise_ceiling_recovers_a_known_signal_fraction():
+    """With y = s + e, the correlation between repeats is var(s) / var(y) -- the R2 cap."""
+    from fastfuncstuff.stats.reliability import split_half_noise_ceiling
+
+    generator = torch.Generator().manual_seed(3)
+    n_timepoints = 4000
+    signal = torch.randn(1, n_timepoints, generator=generator)
+    first = signal + torch.randn(1, n_timepoints, generator=generator)
+    second = signal + torch.randn(1, n_timepoints, generator=generator)
+    data = torch.cat([first, second], dim=1)
+
+    ceiling = split_half_noise_ceiling(data, [[0, 1]], [0, n_timepoints], 2 * n_timepoints)
+
+    # var(s) = var(e) = 1, so the reproducible fraction is 0.5.
+    assert ceiling.item() == pytest.approx(0.5, abs=0.03)
+
+
+def test_noise_ceiling_is_nan_without_repeated_designs():
+    """No repeats means no ceiling, which must be distinguishable from a zero ceiling."""
+    from fastfuncstuff.stats.reliability import split_half_noise_ceiling
+
+    data = torch.randn(3, 20)
+
+    ceiling = split_half_noise_ceiling(data, [], [0, 10], 20)
+
+    assert torch.isnan(ceiling).all()
+
+
+def test_identical_design_labels_group_only_bit_identical_apertures():
+    """The ceiling needs identical designs, which is stricter than 'same stimulus family'."""
+    from fastfuncstuff.stats.reliability import identical_design_groups, identical_design_labels
+
+    bars = torch.randint(0, 2, (7, 9), dtype=torch.float32)
+    wedges = torch.randint(0, 2, (7, 9), dtype=torch.float32)
+    runs = [bars, bars.clone(), wedges, bars]
+
+    assert identical_design_labels(runs) == [0, 0, 1, 0]
+    assert identical_design_groups(runs) == [[0, 1, 3]]
+
+
+def test_balanced_halves_cover_every_group_and_share_no_runs():
+    """Both halves must be complete stimulus sets, and disjoint, or neither number means anything."""
+    from fastfuncstuff.design.prf import balanced_group_halves
+
+    labels = [1, 1, 1, 2, 2, 2]
+    draws = balanced_group_halves(labels, n_draws=3, seed=0)
+
+    assert draws
+    for first, second in draws:
+        assert not set(first) & set(second)
+        for half in (first, second):
+            assert {labels[index] for index in half} == {1, 2}
+
+
+def test_balanced_halves_rotate_which_run_sits_out():
+    """Odd groups leave one run out per draw; a fixed choice would bias the estimate."""
+    from fastfuncstuff.design.prf import balanced_group_halves
+
+    draws = balanced_group_halves([1, 1, 1, 2, 2, 2], n_draws=4, seed=0)
+
+    used = {tuple(sorted([*first, *second])) for first, second in draws}
+    assert len(used) > 1
+
+
+def test_balanced_halves_skip_groups_with_a_single_run():
+    """A lone run cannot be in both halves, so its stimulus leaves the analysis."""
+    from fastfuncstuff.design.prf import balanced_group_halves
+
+    draws = balanced_group_halves([0, 0, 1], n_draws=2, seed=0)
+
+    assert draws
+    for first, second in draws:
+        assert 2 not in first and 2 not in second
+        assert len(first) == len(second) == 1
+
+
+def test_balanced_halves_report_nothing_when_no_group_repeats():
+    """Every group a singleton means no valid split exists; the caller must be told."""
+    from fastfuncstuff.design.prf import balanced_group_halves
+
+    assert balanced_group_halves([0, 1, 2], n_draws=3, seed=0) == []
+
+
+def _four_run_css_data():
+    """Four runs of one noiseless CSS voxel, so folds can hold out more than one run."""
+    torch.manual_seed(11)
+    stimulus_runs = [torch.randint(0, 2, (12, 25), dtype=torch.float32) for _ in range(4)]
+    parameters = torch.tensor([[2.8, 3.2, 1.1, 0.65]], dtype=torch.float32)
+    hrf = torch.tensor([1.0, 0.4, 0.1], dtype=torch.float32)
+    prediction, _ = _css_prediction_and_derivatives(stimulus_runs, parameters, hrf, (5, 5))
+    return (prediction.T * 2.5).contiguous(), stimulus_runs, parameters, hrf
+
+
+def test_folds_can_hold_out_several_runs_at_once():
+    """Half-splits hold out multiple runs; the held-out score must still be exact."""
+    from fastfuncstuff.design.prf import fit_prf_folds
+
+    data, stimulus_runs, parameters, hrf = _four_run_css_data()
+    run_starts = [0, 12, 24, 36]
+
+    results, fold_fits = fit_prf_folds(
+        data,
+        stimulus_runs,
+        (5, 5),
+        PRFGrid(parameters),
+        hrf.unsqueeze(0),
+        run_starts,
+        [([0, 1], [2, 3]), ([2, 3], [0, 1])],
+        candidate_chunk_size=1,
+        voxel_chunk_size=1,
+        refinement_config=PRFRefinementConfig(max_iter=10),
+        return_fits=True,
+    )
+
+    assert results.r2.item() > 0.999
+    assert len(fold_fits) == 2
+
+
+def test_folds_reject_a_run_that_is_both_trained_on_and_held_out():
+    """Overlapping folds would silently report a training score as held-out."""
+    from fastfuncstuff.design.prf import fit_prf_folds
+
+    data, stimulus_runs, parameters, hrf = _four_run_css_data()
+
+    with pytest.raises(ValueError, match="cannot both train on and hold out"):
+        fit_prf_folds(
+            data,
+            stimulus_runs,
+            (5, 5),
+            PRFGrid(parameters),
+            hrf.unsqueeze(0),
+            [0, 12, 24, 36],
+            [([0, 1], [1, 2])],
+        )
+
+
+def test_fold_fits_are_only_returned_when_asked():
+    """LORO keeps n_folds x n_voxels parameter sets out of memory unless they are wanted."""
+    from fastfuncstuff.design.prf import fit_prf_folds, loro_folds
+
+    data, stimulus_runs, parameters, hrf = _four_run_css_data()
+
+    _, fold_fits = fit_prf_folds(
+        data,
+        stimulus_runs,
+        (5, 5),
+        PRFGrid(parameters),
+        hrf.unsqueeze(0),
+        [0, 12, 24, 36],
+        loro_folds(4),
+        candidate_chunk_size=1,
+        voxel_chunk_size=1,
+        refinement_config=PRFRefinementConfig(max_iter=5),
+    )
+
+    assert fold_fits == []
+
+
+def test_reliability_curve_stops_when_too_few_voxels_survive():
+    """A correlation over a handful of voxels is noise; the sweep must not report it."""
+    from fastfuncstuff.cli.pyrf import _reliability_curve
+
+    generator = torch.Generator().manual_seed(5)
+    n_voxels = 400
+    parameters = torch.rand(n_voxels, 4, generator=generator) * 5 + 1
+    pairs = [
+        (
+            {name: values for name, values in _named_maps(parameters).items()},
+            {name: values for name, values in _named_maps(parameters).items()},
+        )
+    ]
+    # R2 decreasing across voxels, so each threshold keeps a known count.
+    r2 = torch.linspace(1.0, 0.0, n_voxels)
+
+    curve = _reliability_curve(pairs, r2, step=0.1, min_voxels=100)
+
+    assert curve
+    assert all(row["n_voxels"] >= 100 for row in curve)
+    # Identical halves agree perfectly, which is the sanity check on the plumbing.
+    assert curve[0]["rfsize"] == pytest.approx(1.0, abs=1e-6)
+
+
+def _named_maps(parameters):
+    from fastfuncstuff.design.prf import prf_parameter_maps
+
+    return prf_parameter_maps(parameters, (10, 10), 1.0)
+
+
+def _write_grouped_prf_dataset(tmp_path):
+    """Four runs in two stimulus groups: runs 0,1 share one aperture, runs 2,3 another."""
+    import nibabel as nib
+
+    from fastfuncstuff.design.hrf import load_canonical_hrf_basic
+
+    rng = np.random.default_rng(7)
+    shape = (12, 12, 1)
+    n_voxels = int(np.prod(shape))
+    n_tps = 80
+    aperture = (6, 6)
+    hrf = load_canonical_hrf_basic(microtime_dt=1.0, device=torch.device("cpu")).numpy()
+
+    inputs, stimuli = [], []
+    group_frames = [rng.integers(0, 2, (n_tps, *aperture)).astype(np.float32) for _ in range(2)]
+    for run in range(4):
+        frames = group_frames[run // 2]
+        series = np.empty((n_voxels, n_tps), dtype=np.float32)
+        for voxel in range(n_voxels):
+            # Reliability is an across-voxel correlation, so the voxels have to
+            # differ: each one gets its own aperture position to recover.
+            row, column = (voxel // 12) % 5, (voxel % 12) % 5
+            signal = np.convolve(
+                frames[:, row : row + 2, column : column + 2].mean(axis=(1, 2)), hrf
+            )[:n_tps]
+            noise = 0.3 * rng.standard_normal(n_tps).astype(np.float32)
+            series[voxel] = 100.0 + 10.0 * signal + noise
+        image = nib.Nifti1Image(series.reshape(*shape, n_tps), np.eye(4))
+        image.header.set_zooms((1.0, 1.0, 1.0, 1.0))
+        path = tmp_path / f"grun{run}.nii.gz"
+        nib.save(image, path)
+        inputs.append(str(path))
+
+        stimulus = tmp_path / f"gstim{run}.nii.gz"
+        nib.save(nib.Nifti1Image(frames.transpose(1, 2, 0)[:, :, None, :], np.eye(4)), stimulus)
+        stimuli.append(str(stimulus))
+    return inputs, stimuli
+
+
+def test_xval_halves_reports_reliability_and_a_noise_ceiling(tmp_path):
+    """The halves scheme yields held-out R2 and split-half reliability from one set of fits."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.pyrf import main
+    from fastfuncstuff.io.afni import read_brick_labels
+
+    inputs, stimuli = _write_grouped_prf_dataset(tmp_path)
+    prefix = str(tmp_path / "halves")
+    assert (
+        main(
+            [
+                "-input",
+                *inputs,
+                "-stimulus",
+                *stimuli,
+                "-prefix",
+                prefix,
+                "-xval",
+                "halves",
+                "-stim_groups",
+                "bars",
+                "bars",
+                "wedges",
+                "wedges",
+                "-hrf",
+                "canonical",
+                "-grid_angles",
+                "4",
+                "-maxiter",
+                "8",
+                "-device",
+                "cpu",
+                "-quiet",
+            ]
+        )
+        == 0
+    )
+
+    image = nib.load(f"{prefix}.nii.gz")
+    labels = read_brick_labels(image)
+    # The ceiling exists because runs within a group share a bit-identical aperture.
+    assert "noise_ceiling" in labels
+    assert "xval_r2_normalized" in labels
+    values = image.get_fdata().reshape(-1, len(labels))
+    ceiling = values[:, labels.index("noise_ceiling")]
+    assert np.isfinite(ceiling).all() and (ceiling > 0).all()
+
+    curve = (tmp_path / "halves_reliability.tsv").read_text().strip().splitlines()
+    header = curve[0].split("\t")
+    assert "rfsize" in header and "rfsize_sb" in header
+    assert len(curve) > 1
+    # Position is the control: it is reliable in any working pRF fit.
+    first_row = dict(zip(header, curve[1].split("\t"), strict=True))
+    assert float(first_row["eccentricity"]) > 0.5
+    assert (tmp_path / "halves_reliability.png").exists()
+    assert (tmp_path / "halves_reliability.nii.gz").exists()
+
+
+def test_halves_refuses_a_design_with_no_repeated_group(tmp_path):
+    """Without a group of two or more runs there are no valid disjoint halves."""
+    from fastfuncstuff.cli.pyrf import main
+
+    inputs, stimuli = _write_grouped_prf_dataset(tmp_path)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "-input",
+                *inputs[:2],
+                "-stimulus",
+                *stimuli[:2],
+                "-prefix",
+                str(tmp_path / "nogroups"),
+                "-xval",
+                "halves",
+                "-stim_groups",
+                "a",
+                "b",
+                "-hrf",
+                "canonical",
+                "-grid_angles",
+                "4",
+                "-device",
+                "cpu",
+                "-quiet",
+            ]
+        )

@@ -58,11 +58,14 @@ from fastfuncstuff.design.hrf import (
 from fastfuncstuff.design.prf import (
     PRFRefinedFit,
     PRFRefinementConfig,
+    balanced_group_halves,
     downsample_aperture,
-    fit_prf_loro,
+    fit_prf_folds,
     fit_prf_supergrid,
     grid_seeds_as_fit,
+    loro_folds,
     make_analyzeprf_grid,
+    prf_parameter_maps,
     refine_prf_all_hrfs,
     refine_prf_hrf_window,
     refine_prf_supergrid,
@@ -72,6 +75,14 @@ from fastfuncstuff.design.prf import (
 )
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import estimate_chunk_size
+from fastfuncstuff.stats.reliability import (
+    circular_correlation,
+    identical_design_groups,
+    identical_design_labels,
+    spearman_brown,
+    spearman_correlation,
+    split_half_noise_ceiling,
+)
 from fastfuncstuff.utils import configure_torch_backends
 
 _EPILOG = """
@@ -101,10 +112,19 @@ OUTPUT
                     where the fit is NaN (screened out, or all-zero).
     correlation     correlation between prediction and data after nuisance
                     projection; r2 is the coefficient of determination.
-    xval_r2         held-out R2 from leave-one-run-out (multi-run input only).
-                    See -xval_hrf: by default the folds pick their own HRF at
-                    grid resolution, so this scores a slightly different model
-                    than the other sub-bricks report.
+    xval_r2         held-out R2 (multi-run input only). See -xval_hrf: by
+                    default the folds pick their own HRF at grid resolution, so
+                    this scores a slightly different model than the other
+                    sub-bricks report.
+    noise_ceiling   largest R2 any model could reach on this data. Present only
+                    when two or more runs share a bit-identical aperture movie.
+                    See NOISE CEILING below for how it is derived; NaN (not 0)
+                    where no repeats exist.
+    xval_r2_normalized
+                    xval_r2 / noise_ceiling -- the fraction of the EXPLAINABLE
+                    variance the model got, so 1.0 means it captured everything
+                    that reproduces at all. Values slightly above 1 are noise in
+                    the ceiling estimate, not a model that beat it.
     hrf_index       selected HRF, ONE-BASED, into the library actually used.
     hrf_index_continuous, hrf_evidence
                     (-hrf_select refine only) parabolic sub-step interpolation
@@ -117,10 +137,96 @@ OUTPUT
                     gn_iterations equal to -maxiter; that is common and not by
                     itself a failure.
 
-  Optional extra files: {prefix}_canonical (-save_canonical) holds the same
-  bucket fit with the canonical HRF forced, for a like-for-like comparison
-  against the selected-HRF fit; {prefix}_hrf_r2 (-save_hrf_r2) holds the raw
-  per-voxel x per-HRF R2 matrix behind the HRF choice.
+OPTIONAL FILES  (each needs the flag in brackets)
+    {prefix}_canonical.nii.gz      [-save_canonical]
+        The same bucket refit with the canonical HRF forced, so the
+        HRF-selected and fixed-HRF fits can be compared voxelwise on identical
+        data rather than across two runs of the tool.
+    {prefix}_hrf_r2.nii.gz         [-save_hrf_r2]
+        Raw per-voxel x per-HRF R2 matrix, the input to any HRF-selection
+        criterion. One sub-brick per library entry.
+    {prefix}_screen.nii.gz         [-save_screen]
+        Cross-validated R2 of the fast linear screening model. Usable on its
+        own as a functionally derived mask.
+    {prefix}_noisepool.nii.gz, _noisepcs.1D, _denoise.png, _noisepc*.png
+                                   [-save_denoise]
+        Which voxels fed the noise pool, the component timecourses actually
+        projected out, the held-out-R2-vs-count sweep, and per-component
+        timecourse/spatial-weight figures.
+    {prefix}_reliability.tsv, .png, .nii.gz    [-xval halves]
+        Split-half parameter reliability. See RELIABILITY below.
+
+NOISE CEILING
+  Runs with a bit-identical aperture movie have the same expected response, so
+  everything they disagree about is noise. Writing a voxel as y = s + e with e
+  independent across repeats, corr(y_i, y_j) = var(s) / var(y) -- which is
+  exactly the largest R2 any model can reach on a single run. So the ceiling IS
+  the mean pairwise correlation across repeats: already in R2 units, no further
+  correction, no assumption about the noise structure.
+
+  Three things worth knowing:
+    - It is computed AFTER per-run nuisance projection. Shared drift reproduces
+      perfectly across repeats and would otherwise be counted as signal, pushing
+      the ceiling toward 1 for every voxel with a slow trend in it.
+    - Repeats are DETECTED by comparing aperture movies, not declared. That is
+      stricter than -stim_groups on purpose: clockwise and counter-clockwise
+      wedges are one stimulus group but have different expected timecourses, so
+      they are not repeats. A -stim-nii-multi source is recognised for free.
+    - Odd/even TR splits within a single run are NOT a substitute. Temporal
+      autocorrelation makes the halves agree for reasons unrelated to
+      reproducible signal, and the ceiling comes out inflated. Hence NaN rather
+      than a fabricated number when no repeats exist.
+
+RELIABILITY  (-xval halves)
+  Held-out R2 measures whether the model predicts unseen data. It does NOT
+  measure whether a parameter estimate is stable, and for pRF size the two
+  answers differ: Lage-Castellanos et al. (2020) compared five pRF tools whose
+  prediction accuracy was identical to two decimals while their split-half
+  reliability of size ranged from 0.39 to 0.81. If you care about pRF size,
+  reliability is the number to look at, and -xval halves is how to get it.
+
+  It works by splitting the runs into two disjoint halves that each cover every
+  stimulus group, fitting both, and using them twice over: the two fits predict
+  each other's data (held-out R2) and are compared to each other (reliability).
+  One pair of fits, both numbers. The halves must be disjoint for the comparison
+  to mean anything, which is what forces two folds rather than more -- and two
+  folds train on half the data, so the R2 it reports is conservative relative to
+  the all-runs fit in the bucket.
+
+  How the number is computed:
+    - Reliability is an ACROSS-VOXEL correlation of one parameter between the
+      two halves. It therefore needs voxels whose true pRFs differ; over an ROI
+      with no retinotopic spread it measures nothing.
+    - Voxels are selected by the FULL fit's r2 (-reliability_threshold), never
+      by either half's. Selecting on a half keeps the voxels that half happened
+      to fit well and biases the agreement upward.
+    - Spearman rank correlation for every parameter except angle, because
+      eccentricity and size are strongly skewed across an ROI. Ranks are
+      tie-averaged: pRF parameters pile up on their bounds, so ties are routine.
+    - Polar angle uses circular correlation (Jammalamadaka-Sarma), since a
+      linear coefficient calls two estimates either side of the 0/360 seam
+      completely inconsistent.
+    - Averaged over -xval_draws independent half-splits, then Spearman-Brown
+      corrected (r_full = 2r / (1 + r)) because each half saw half the data
+      while the reported fit saw all of it. Both forms are written out.
+
+  The three files:
+    .tsv   one row per R2 threshold: threshold, n_voxels, the raw correlation
+           per parameter, then the same Spearman-Brown corrected (*_sb columns).
+           The sweep stops once too few voxels survive for a correlation to
+           mean anything, so the last row tells you where the data ran out.
+    .png   those curves, Spearman-Brown corrected, with -reliability_threshold
+           marked and the surviving voxel count on a log right-hand axis.
+    .nii.gz  per-voxel abs_delta_{x,y,eccentricity,angle,sigma,rfsize}: the mean
+           absolute half-to-half disagreement, averaged over draws. Same units
+           as the main bucket, EXCEPT abs_delta_angle which is always degrees of
+           polar angle (wrapped, so it never exceeds 180).
+
+  Read the curve, not just the printed number. Reliability of rfsize typically
+  climbs steeply with data quality while position is already flat near 1.0; the
+  figure shows whether the threshold you picked sits on a plateau or a cliff,
+  with the surviving voxel count on the right axis so you can see where the
+  climb is just a shrinking sample.
 
 CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on yours)
   -hrf_select     'grid+1' is the sweet spot: it agrees with the full 20-HRF
@@ -141,6 +247,14 @@ CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on your
                   Dumoulin-Wandell model and the natural comparison baseline,
                   but it is NOT meaningfully faster: cost is dominated by the
                   per-voxel Gaussian over the aperture, which every mode pays.
+  -xval           'halves' is both cheaper and more informative than 'loro' when
+                  runs have repeat structure: LORO fits one model per run (6
+                  fits on 5 runs for 6 runs), halves fits two per draw on half
+                  the data, and the saving grows with the number of stimulus
+                  sets (4 sets x 3 repeats: 12 LORO fits vs 2 per draw).
+                  -stim_groups declares which runs belong together and defaults
+                  to grouping runs that share an aperture movie, so a
+                  -stim-nii-multi source is recognised without saying anything.
   -mask           cost is linear in voxels, so masking is a large lever.
   -denoise        data-derived noise components, GLMdenoise style, with the
                   noise pool taken from the screening pass rather than an
@@ -473,9 +587,63 @@ def create_parser() -> argparse.ArgumentParser:
     )
     model.add_argument(
         "-xval",
-        choices=["auto", "none", "loro"],
+        choices=["auto", "none", "loro", "halves"],
         default="auto",
-        help="Cross-validation: auto=LORO for multiple runs, none, or explicit LORO",
+        help=(
+            "Cross-validation scheme. 'loro' holds out one run at a time. 'halves' "
+            "splits the runs into two disjoint halves that each cover every "
+            "stimulus group (see -stim_groups) and fits both, which yields the "
+            "held-out R2 AND split-half parameter reliability from the same fits. "
+            "'auto' is LORO for multiple runs"
+        ),
+    )
+    model.add_argument(
+        "-stim-groups",
+        "-stim_groups",
+        dest="stim_groups",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help=(
+            "One label per -input run, in the same order, naming which stimulus "
+            "set each run belongs to (e.g. '1 1 1 2 2 2' for three bar runs then "
+            "three wedge runs). Runs in a group are complementary probes of the "
+            "same receptive field, so -xval halves keeps every group represented "
+            "in both halves rather than training on a deficient subset. Defaults "
+            "to grouping runs whose aperture movies are identical"
+        ),
+    )
+    model.add_argument(
+        "-xval-draws",
+        "-xval_draws",
+        dest="xval_draws",
+        type=int,
+        default=2,
+        help=(
+            "How many independent half-splits -xval halves averages over. Groups "
+            "with an odd number of runs leave one out per draw, and which one "
+            "rotates with the draw, so more draws stop the estimate depending on "
+            "whichever runs happened to sit out. Draws that repeat are skipped"
+        ),
+    )
+    model.add_argument(
+        "-reliability-threshold",
+        "-reliability_threshold",
+        dest="reliability_threshold",
+        type=float,
+        default=0.2,
+        help=(
+            "Full-fit R2 a voxel must reach to enter the -xval halves reliability "
+            "summary. Reliability over unresponsive voxels measures nothing but "
+            "noise agreement, so this threshold is part of the number and is "
+            "reported alongside it"
+        ),
+    )
+    model.add_argument(
+        "-seed",
+        type=int,
+        default=0,
+        help="Random seed for the screening tile basis and the -xval halves draws",
     )
     model.add_argument(
         "-xval-hrf",
@@ -926,13 +1094,14 @@ def _add_noise_components(
         counts = tqdm(counts, desc="pRF noise-PC sweep", leave=True)
     for n_components in counts:
         trial_nuisance = _append_components(nuisance_per_run, components, n_components)
-        fit = fit_prf_loro(
+        fit, _ = fit_prf_folds(
             criteria_data,
             stimulus_runs,
             stimulus_shape,
             grid,
             hrf_library,
             loaded.run_starts,
+            loro_folds(len(stimulus_runs)),
             nuisance_per_run=trial_nuisance,
             candidate_chunk_size=args.candidate_chunk,
             voxel_chunk_size=n_criteria,
@@ -1106,28 +1275,17 @@ def _save_results(
     mean_volume: torch.Tensor | None = None,
     hrf_r2_map: torch.Tensor | None = None,
     screen_extent: float | None = None,
+    noise_ceiling: torch.Tensor | None = None,
 ) -> None:
     """Save all primary pRF parameters in one labeled 4D NIfTI bucket."""
-    extent = float(max(stimulus_shape))
-    center = (1.0 + extent) / 2.0
-    row = results.parameters[:, 0]
-    column = results.parameters[:, 1]
-    exponent = results.parameters[:, 3].clamp_min(torch.finfo(results.parameters.dtype).eps)
-    # Larger row index is the upper visual field for the aperture layouts these
-    # tools are given, so vertical position is row - center, not center - row.
-    # y and angle must share this sign or they describe different half-fields.
-    vertical = row - center
-    eccentricity = torch.hypot(vertical, column - center)
-    angle = torch.rad2deg(torch.atan2(vertical, column - center)).remainder(360.0)
-    angle = torch.where(eccentricity == 0, torch.full_like(angle, torch.nan), angle)
-    rfsize = results.parameters[:, 2].abs() / torch.sqrt(exponent)
     # Positions are reported as x/y offsets from the aperture center (x right,
-    # y up), matching the angle convention above, rather than as the raw
-    # one-based row/column the optimizer works in. With -screen_extent every
-    # spatial quantity is scaled to degrees of visual angle by the same factor;
-    # pixel units are an artifact of the aperture resolution and change under
-    # -stim_downsample, so they are not comparable across studies.
-    scale = 1.0 if screen_extent is None else screen_extent / extent
+    # y up) rather than as the raw one-based row/column the optimizer works in.
+    # With -screen_extent every spatial quantity is scaled to degrees of visual
+    # angle by the same factor; pixel units are an artifact of the aperture
+    # resolution and change under -stim_downsample, so they are not comparable
+    # across studies.
+    scale = 1.0 if screen_extent is None else screen_extent / float(max(stimulus_shape))
+    maps = prf_parameter_maps(results.parameters, stimulus_shape, scale)
     labels = [
         "x",
         "y",
@@ -1146,14 +1304,14 @@ def _save_results(
         "gn_converged",
     ]
     columns = [
-        (column - center) * scale,
-        vertical * scale,
-        results.parameters[:, 2].abs() * scale,
-        results.parameters[:, 3],
+        maps["x"],
+        maps["y"],
+        maps["sigma"],
+        maps["exponent"],
         results.gain,
-        angle,
-        eccentricity * scale,
-        rfsize * scale,
+        maps["angle"],
+        maps["eccentricity"],
+        maps["rfsize"],
         results.correlation,
         results.r2,
         results.hrf_index + 1,
@@ -1165,6 +1323,14 @@ def _save_results(
     if xval_r2 is not None:
         labels.append("xval_r2")
         columns.append(xval_r2)
+    if noise_ceiling is not None:
+        # The ceiling is already in R2 units, so the normalised score is a plain
+        # ratio: 1.0 means the model captured everything that reproduces at all.
+        labels.append("noise_ceiling")
+        columns.append(noise_ceiling)
+        if xval_r2 is not None:
+            labels.append("xval_r2_normalized")
+            columns.append(xval_r2 / noise_ceiling.clamp_min(1e-6))
     if mean_volume is not None:
         # analyzePRF's results.meanvol - the scale the gain is expressed against,
         # and the reference for turning gain into a percent-signal-change.
@@ -1197,6 +1363,268 @@ def _save_results(
         affine=loaded.affine,
         header=loaded.nifti_header,
         brick_labels=labels,
+    )
+
+
+# Parameters whose split-half agreement is worth reporting. Position is known to
+# be reliable and is here as the control: a method that wrecks it is broken, and
+# rfsize is the one the literature actually argues about.
+_RELIABILITY_PARAMETERS = ("x", "y", "eccentricity", "angle", "sigma", "rfsize")
+
+
+def _resolve_stim_groups(
+    explicit: list[str] | None,
+    stimulus_runs: list[torch.Tensor],
+    parser: argparse.ArgumentParser,
+) -> list[int]:
+    """Map each run to a stimulus-group index, declared or inferred.
+
+    Inferring from identical aperture movies covers the common case for free: a
+    ``-stim-nii-multi bars.nii 3`` source hands the same frames to three runs, so
+    those three are recognised as one group without anything being declared.
+    Labels are positional against ``-input``, which is the same footgun that
+    silently mispaired ``-events`` across sessions, so the resolved grouping is
+    echoed rather than assumed.
+    """
+    if explicit is None:
+        return identical_design_labels(stimulus_runs)
+    if len(explicit) != len(stimulus_runs):
+        parser.error(
+            f"-stim_groups has {len(explicit)} labels but there are "
+            f"{len(stimulus_runs)} input runs; labels pair with -input by position"
+        )
+    seen: dict[str, int] = {}
+    return [seen.setdefault(label, len(seen)) for label in explicit]
+
+
+def _noise_ceiling(
+    data: torch.Tensor,
+    stimulus_runs: list[torch.Tensor],
+    run_starts: list[int],
+    nuisance_per_run: list[torch.Tensor] | None,
+    chunk_size: int,
+) -> tuple[torch.Tensor | None, list[list[int]]]:
+    """Per-voxel R2 ceiling from runs whose aperture movies are identical."""
+    repeat_groups = identical_design_groups(stimulus_runs)
+    if not repeat_groups:
+        return None, []
+    from fastfuncstuff.design.prf import project_nuisance_per_run
+
+    ceilings = []
+    for start in range(0, data.shape[0], chunk_size):
+        chunk = data[start : start + chunk_size]
+        ceilings.append(
+            split_half_noise_ceiling(
+                project_nuisance_per_run(chunk, nuisance_per_run, run_starts),
+                repeat_groups,
+                run_starts,
+                data.shape[1],
+            )
+        )
+    return torch.cat(ceilings), repeat_groups
+
+
+def _angular_difference(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """Smallest absolute difference between two angles in degrees."""
+    return ((first - second + 180.0).remainder(360.0) - 180.0).abs()
+
+
+def _half_parameter_pairs(
+    fold_fits: list[PRFRefinedFit],
+    stimulus_shape: tuple[int, int],
+    scale: float,
+) -> list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]]:
+    """Derived parameters for the two disjoint halves of each draw.
+
+    ``fold_fits`` arrives two per draw, the first trained on half A and the
+    second on half B, so consecutive pairs are exactly the disjoint fits that
+    reliability needs. Deriving the maps once here is what makes sweeping a
+    range of thresholds free: every threshold reuses these and only recomputes
+    correlations over a different voxel subset.
+    """
+    return [
+        (
+            prf_parameter_maps(first.parameters, stimulus_shape, scale),
+            prf_parameter_maps(second.parameters, stimulus_shape, scale),
+        )
+        for first, second in zip(fold_fits[0::2], fold_fits[1::2], strict=True)
+    ]
+
+
+def _reliability_at(
+    pairs: list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]],
+    responsive: torch.Tensor,
+) -> dict[str, float]:
+    """Mean split-half correlation per parameter over one voxel subset."""
+    summary: dict[str, float] = {}
+    for name in _RELIABILITY_PARAMETERS:
+        values = []
+        for first, second in pairs:
+            left, right = first[name], second[name]
+            usable = responsive & torch.isfinite(left) & torch.isfinite(right)
+            if int(usable.sum()) < 2:
+                continue
+            if name == "angle":
+                # Polar angle wraps, so a linear correlation would call two
+                # estimates either side of 0/360 completely inconsistent.
+                value = circular_correlation(
+                    torch.deg2rad(left[usable]), torch.deg2rad(right[usable])
+                )
+            else:
+                value = spearman_correlation(left[usable], right[usable])
+            if value == value:
+                values.append(value)
+        summary[name] = sum(values) / len(values) if values else float("nan")
+    return summary
+
+
+def _reliability_curve(
+    pairs: list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]],
+    r2: torch.Tensor,
+    *,
+    step: float = 0.05,
+    min_voxels: int = 50,
+) -> list[dict[str, float]]:
+    """Sweep the responsiveness threshold and report reliability at each level.
+
+    A single threshold hides the shape of the answer. Reliability of pRF size
+    typically climbs steeply with data quality while position is already flat,
+    and one number cannot show that -- nor whether the number you quoted sits on
+    a plateau or on a cliff. The fits are already done, so the whole curve costs
+    only a few rank correlations per threshold.
+
+    The sweep stops once fewer than ``min_voxels`` voxels survive, because a
+    correlation over a handful of voxels is noise with a decimal point on it.
+    """
+    thresholds = []
+    value = step
+    while value < 1.0:
+        thresholds.append(round(value, 4))
+        value += step
+
+    curve = []
+    for threshold in thresholds:
+        responsive = torch.isfinite(r2) & (r2 >= threshold)
+        n_voxels = int(responsive.sum())
+        if n_voxels < min_voxels:
+            break
+        row: dict[str, float] = {"threshold": threshold, "n_voxels": n_voxels}
+        row.update(_reliability_at(pairs, responsive))
+        curve.append(row)
+    return curve
+
+
+def _reliability_deltas(
+    pairs: list[tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]],
+) -> dict[str, torch.Tensor]:
+    """Mean absolute between-half disagreement per voxel, averaged over draws."""
+    deltas: dict[str, torch.Tensor] = {}
+    for name in _RELIABILITY_PARAMETERS:
+        stacked = []
+        for first, second in pairs:
+            if name == "angle":
+                stacked.append(_angular_difference(first[name], second[name]))
+            else:
+                stacked.append((first[name] - second[name]).abs())
+        deltas[name] = torch.stack(stacked).mean(dim=0)
+    return deltas
+
+
+def _plot_reliability_curve(
+    curve: list[dict[str, float]],
+    chosen: float,
+    output_path: str,
+    unit: str,
+    n_draws: int,
+) -> None:
+    """Plot split-half reliability against the responsiveness threshold.
+
+    The voxel count is drawn on a second axis because the two have to be read
+    together: reliability that keeps climbing as the threshold rises is partly
+    just a shrinking, better-behaved sample, and without the count there is no
+    way to see where that takes over.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    thresholds = [row["threshold"] for row in curve]
+    figure, axis = plt.subplots(figsize=(7.5, 4.8))
+    for name in _RELIABILITY_PARAMETERS:
+        values = [spearman_brown(row[name]) for row in curve]
+        axis.plot(thresholds, values, marker="o", ms=3.5, lw=1.4, label=name)
+
+    nearest = min(curve, key=lambda row: abs(row["threshold"] - chosen), default=None)
+    if nearest is not None:
+        axis.axvline(chosen, color="crimson", lw=1.2, ls="--")
+        annotation = "  ".join(
+            f"{name}={spearman_brown(nearest[name]):.2f}" for name in ("rfsize", "eccentricity")
+        )
+        axis.annotate(
+            f"R2>={chosen:g}  n={int(nearest['n_voxels']):,}\n{annotation}",
+            xy=(chosen, 0.02),
+            xycoords=("data", "axes fraction"),
+            fontsize=8,
+            color="crimson",
+            ha="left" if chosen < (thresholds[-1] + thresholds[0]) / 2 else "right",
+        )
+
+    axis.set_xlabel("Full-fit R2 threshold")
+    axis.set_ylabel("Split-half reliability (Spearman-Brown corrected)")
+    axis.set_title(f"pRF parameter reliability vs data quality ({n_draws} half-split draws)")
+    axis.set_ylim(-0.05, 1.05)
+    axis.grid(alpha=0.3)
+    axis.legend(fontsize=8, loc="lower right", ncol=2)
+
+    count_axis = axis.twinx()
+    count_axis.plot(
+        thresholds,
+        [row["n_voxels"] for row in curve],
+        color="0.55",
+        lw=1.0,
+        ls=":",
+    )
+    count_axis.set_ylabel(f"Voxels surviving ({unit} maps)", color="0.45", fontsize=9)
+    count_axis.set_yscale("log")
+    count_axis.tick_params(axis="y", labelcolor="0.45", labelsize=8)
+
+    figure.tight_layout()
+    figure.savefig(output_path, dpi=120)
+    plt.close(figure)
+
+
+def _save_reliability(
+    curve: list[dict[str, float]],
+    deltas: dict[str, torch.Tensor],
+    tsv_path: str,
+    map_path: str,
+    loaded,
+    invalid_voxels: torch.Tensor | None,
+) -> None:
+    """Write the full reliability curve and the per-voxel disagreement maps.
+
+    The table holds every threshold, not just the reported one, so the choice of
+    threshold stays auditable after the fact.
+    """
+    columns = ["threshold", "n_voxels", *_RELIABILITY_PARAMETERS]
+    with open(tsv_path, "w") as handle:
+        handle.write("\t".join([*columns, *(f"{name}_sb" for name in _RELIABILITY_PARAMETERS)]))
+        handle.write("\n")
+        for row in curve:
+            values = [
+                f"{row['threshold']:g}",
+                f"{int(row['n_voxels'])}",
+                *(f"{row[name]:.6f}" for name in _RELIABILITY_PARAMETERS),
+                *(f"{spearman_brown(row[name]):.6f}" for name in _RELIABILITY_PARAMETERS),
+            ]
+            handle.write("\t".join(values) + "\n")
+    _save_voxel_matrix(
+        torch.column_stack([deltas[name] for name in _RELIABILITY_PARAMETERS]),
+        map_path,
+        loaded,
+        [f"abs_delta_{name}" for name in _RELIABILITY_PARAMETERS],
+        invalid_voxels,
     )
 
 
@@ -1282,8 +1710,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("-candidate-chunk and -batch-size must be positive")
     if args.maxiter < 1 or args.gn_damping <= 0 or args.gn_step_tol <= 0:
         parser.error("-maxiter, -gn-damping, and -gn-step-tol must be positive")
-    if args.xval == "loro" and len(input_files) < 2:
-        parser.error("-xval loro requires at least two input runs")
+    if args.xval in ("loro", "halves") and len(input_files) < 2:
+        parser.error(f"-xval {args.xval} requires at least two input runs")
+    if args.xval_draws < 1:
+        parser.error("-xval_draws must be positive")
+    if args.stim_groups is not None and len(args.stim_groups) != len(input_files):
+        parser.error(
+            f"-stim_groups has {len(args.stim_groups)} labels but -input has "
+            f"{len(input_files)} runs; labels pair with -input by position"
+        )
     # Check the aperture paths before the fMRI load, which can take minutes.
     for source in args.stimulus or []:
         if not Path(source).exists():
@@ -1350,6 +1785,7 @@ def main(argv: list[str] | None = None) -> int:
             stimulus_runs.append(stimulus)
             stimulus_shape = shape
         assert stimulus_shape is not None
+    stim_groups = _resolve_stim_groups(args.stim_groups, stimulus_runs, parser)
     if args.verb:
         print(f"Aperture resolution: {stimulus_shape[0]} x {stimulus_shape[1]} pixels")
         if args.screen_extent:
@@ -1397,6 +1833,7 @@ def main(argv: list[str] | None = None) -> int:
                 device=device,
                 operation="xval",
             ),
+            seed=args.seed,
             device=device,
             verbose=args.verb > 0,
         )
@@ -1568,18 +2005,50 @@ def main(argv: list[str] | None = None) -> int:
             config=refinement_config,
             verbose=args.verb > 0,
         )
-    do_loro = not args.quick and (
-        args.xval == "loro" or (args.xval == "auto" and len(input_files) > 1)
-    )
+    scheme = args.xval
+    if scheme == "auto":
+        scheme = "loro" if len(input_files) > 1 else "none"
+    if args.quick:
+        scheme = "none"
     xval_r2 = None
-    if do_loro:
-        xval_results = fit_prf_loro(
+    reliability_curve: list[dict[str, float]] | None = None
+    reliability_deltas: dict[str, torch.Tensor] | None = None
+    n_reliability_draws = 0
+    if scheme != "none":
+        if scheme == "halves":
+            draws = balanced_group_halves(stim_groups, n_draws=args.xval_draws, seed=args.seed)
+            if not draws:
+                parser.error(
+                    "-xval halves needs at least one stimulus group with two or more "
+                    "runs; every group here has a single run, so no two disjoint "
+                    "halves can both cover it. Use -xval loro, or declare coarser "
+                    "groups with -stim_groups"
+                )
+            singletons = {label for label in set(stim_groups) if stim_groups.count(label) < 2}
+            if singletons and args.verb:
+                print(
+                    f"Note: {len(singletons)} stimulus group(s) have a single run and are "
+                    "excluded from the split-half analysis entirely"
+                )
+            # Each draw contributes both directions, so every timepoint is held
+            # out exactly once per draw and the pooled R2 stays a whole-dataset
+            # number rather than an average over partial coverage.
+            folds = [fold for first, second in draws for fold in ((first, second), (second, first))]
+            if args.verb:
+                print(
+                    f"Cross-validating over {len(draws)} balanced half-split draw(s) "
+                    f"({len(folds)} fold fits); groups: {stim_groups}"
+                )
+        else:
+            folds = loro_folds(len(stimulus_runs))
+        xval_results, fold_fits = fit_prf_folds(
             analysis_data,
             stimulus_runs,
             stimulus_shape,
             grid,
             hrf_library,
             loaded.run_starts,
+            folds,
             nuisance_per_run=nuisance_per_run,
             candidate_chunk_size=args.candidate_chunk,
             voxel_chunk_size=voxel_chunk_size,
@@ -1588,15 +2057,73 @@ def main(argv: list[str] | None = None) -> int:
             refinement_config=refinement_config,
             hrf_mode=args.xval_hrf,
             fixed_hrf_index=results.hrf_index if args.xval_hrf == "fixed" else None,
+            return_fits=scheme == "halves",
             verbose=args.verb > 0,
         )
         xval_r2 = xval_results.r2
+        if scheme == "halves":
+            scale = (
+                1.0
+                if args.screen_extent is None
+                else args.screen_extent / float(max(stimulus_shape))
+            )
+            pairs = _half_parameter_pairs(fold_fits, stimulus_shape, scale)
+            n_reliability_draws = len(pairs)
+            reliability_deltas = _reliability_deltas(pairs)
+            # Thresholded on the FULL fit, which both halves share. Selecting on
+            # either half's own R2 would keep the voxels that half happened to
+            # fit well and bias the agreement upward.
+            reliability_curve = _reliability_curve(pairs, results.r2)
+            if not reliability_curve:
+                if args.verb:
+                    print("No reliability curve: too few voxels survive any R2 threshold")
+            elif args.verb:
+                responsive = torch.isfinite(results.r2) & (results.r2 >= args.reliability_threshold)
+                chosen = _reliability_at(pairs, responsive)
+                print(
+                    f"Split-half reliability over {int(responsive.sum()):,} voxels "
+                    f"at R2 >= {args.reliability_threshold:g}, from "
+                    f"{n_reliability_draws} draw(s); half-length (Spearman-Brown):"
+                )
+                for name in _RELIABILITY_PARAMETERS:
+                    print(f"  {name:>12}: {chosen[name]:.3f}  ({spearman_brown(chosen[name]):.3f})")
+
+    ceiling_chunk = refine_chunk_size if refine_chunk_size > 0 else 20_000
+    noise_ceiling, repeat_groups = _noise_ceiling(
+        analysis_data,
+        stimulus_runs,
+        list(loaded.run_starts),
+        nuisance_per_run,
+        max(1, ceiling_chunk),
+    )
+    if args.verb:
+        if noise_ceiling is None:
+            print(
+                "No noise ceiling: no two runs share a bit-identical aperture movie, "
+                "so there are no repeats to estimate reproducible variance from"
+            )
+        else:
+            print(
+                f"Noise ceiling from {len(repeat_groups)} repeated design(s): "
+                f"median {float(noise_ceiling.nanmedian()):.3f}"
+            )
     if keep_index is not None:
         results = _expand_fit(results, keep_index, loaded.n_voxels)
         if hrf_r2_map is not None:
             hrf_r2_map = _expand_to_all_voxels(hrf_r2_map, keep_index, loaded.n_voxels)
         if xval_r2 is not None:
             xval_r2 = _expand_to_all_voxels(xval_r2, keep_index, loaded.n_voxels)
+        if noise_ceiling is not None:
+            noise_ceiling = _expand_to_all_voxels(
+                noise_ceiling.unsqueeze(1), keep_index, loaded.n_voxels
+            ).squeeze(1)
+        if reliability_deltas is not None:
+            reliability_deltas = {
+                name: _expand_to_all_voxels(
+                    values.unsqueeze(1), keep_index, loaded.n_voxels
+                ).squeeze(1)
+                for name, values in reliability_deltas.items()
+            }
         if canonical_results is not None:
             canonical_results = _expand_fit(canonical_results, keep_index, loaded.n_voxels)
         # Screened-out voxels were never fit, so they are reported as NaN rather
@@ -1614,9 +2141,32 @@ def main(argv: list[str] | None = None) -> int:
         mean_volume=loaded.data.mean(dim=1),
         hrf_r2_map=hrf_r2_map,
         screen_extent=args.screen_extent,
+        noise_ceiling=noise_ceiling,
     )
     if args.verb:
         print(f"Wrote pRF results: {prefix_info.stem}{prefix_info.nifti_ext}")
+    if reliability_curve and reliability_deltas is not None:
+        tsv_path = f"{prefix_info.stem}_reliability.tsv"
+        map_path = f"{prefix_info.stem}_reliability{prefix_info.nifti_ext}"
+        _save_reliability(
+            reliability_curve,
+            reliability_deltas,
+            tsv_path,
+            map_path,
+            loaded,
+            invalid_voxels,
+        )
+        figure_path = f"{prefix_info.stem}_reliability.png"
+        _plot_reliability_curve(
+            reliability_curve,
+            args.reliability_threshold,
+            figure_path,
+            "deg" if args.screen_extent else "px",
+            n_reliability_draws,
+        )
+        if args.verb:
+            print(f"Wrote reliability curve: {tsv_path}, {figure_path}")
+            print(f"Wrote per-voxel half-to-half disagreement: {map_path}")
     if canonical_results is not None:
         canonical_path = f"{prefix_info.stem}_canonical{prefix_info.nifti_ext}"
         _save_results(
