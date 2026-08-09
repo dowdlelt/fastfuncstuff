@@ -42,11 +42,13 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_cv_blur_arg,
         add_load_threads_arg,
         add_ortvec_arguments,
         add_single_trial_args,
         add_verbose_arg,
         auto_polort,
+        blur_masked_data,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_cv_strategy,
@@ -525,7 +527,15 @@ Notes:
         type=float,
         metavar="FWHM",
         default=None,
-        help="Apply 3D Gaussian spatial smoothing with FWHM in mm",
+        help="Apply 3D Gaussian spatial smoothing with FWHM in mm (whole pipeline, "
+        "including the saved betas). See -cv_blur to blur only the PC search.",
+    )
+    add_cv_blur_arg(
+        proc_opts,
+        stage_note=(
+            "NOTE: blurring raises R² brain-wide, so -r2_threshold cuts the noise "
+            "pool in a different place; check the reported noise-pool size."
+        ),
     )
     proc_opts.add_argument(
         "-device",
@@ -2011,6 +2021,24 @@ def main():
     else:
         chunk_size = None  # Auto-detect for GPU
 
+    # -cv_blur: everything the PC search touches (noise-pool R², component
+    # extraction, the sweep) reads cv_data; the final refit and every saved beta
+    # read `data`. Safe because the components are *timecourses* — where they
+    # came from does not change their validity as regressors for unblurred data.
+    cv_data = data
+    if args.cv_blur is not None:
+        cv_data = blur_masked_data(
+            data,
+            fwhm_mm=args.cv_blur,
+            volume_shape=volume_shape,
+            voxel_sizes=voxel_sizes,
+            mask_flat=mask_flat,
+            run_starts=run_starts,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        print(f"  Selection stage uses {args.cv_blur} mm blurred data; final fit does not.")
+
     # Fit denoising model
     if args.single_trials:
         # ========== SINGLE-TRIAL BETA-SPACE CV PATH ==========
@@ -2128,11 +2156,11 @@ def main():
             if not per_voxel_st:
                 # Standard path: single condition design for all voxels
                 projected_data, projected_cond_design = project_out_nuisance_per_run(
-                    data=data,
+                    data=cv_data,
                     design=cond_design,
                     nuisance_per_run=nuis,
                     run_starts=run_starts,
-                    device=data.device,
+                    device=cv_data.device,
                 )
                 xval_out = compute_xval_r2(
                     data=projected_data,
@@ -2156,15 +2184,15 @@ def main():
 
             # Per-voxel HRF path: each group needs its own condition design
             # (matches denoise.py fit_denoising_model per-HRF initial R² logic)
-            r2_all = torch.zeros(data.shape[0], device=device)
+            r2_all = torch.zeros(cv_data.shape[0], device=device)
             for hrf_idx in unique_hrfs:
                 voxel_mask = hrf_indices_dev == hrf_idx
                 proj_data, proj_design = project_out_nuisance_per_run(
-                    data=data[voxel_mask],
+                    data=cv_data[voxel_mask],
                     design=_condition_design_for_hrf(hrf_idx),
                     nuisance_per_run=nuis,
                     run_starts=run_starts,
-                    device=data.device,
+                    device=cv_data.device,
                 )
                 xval_group = compute_xval_r2(
                     data=proj_data,
@@ -2242,7 +2270,7 @@ def main():
                 else max(args.max_comps, 2 * args.max_comps)
             )
             cap_info = estimate_noise_component_caps_per_run(
-                data=data,
+                data=cv_data,
                 run_starts=run_starts,
                 noise_pool_mask=noise_pool_mask,
                 max_components=estimate_max_comps,
@@ -2287,7 +2315,7 @@ def main():
             scree_eval_max = max(5, int(scree_eval_max))
             try:
                 noise_pool_scree_ratio_per_run = compute_noise_pool_pca_scree_per_run(
-                    data=data,
+                    data=cv_data,
                     run_starts=run_starts,
                     noise_pool_mask=noise_pool_mask,
                     max_components=scree_eval_max,
@@ -2310,7 +2338,7 @@ def main():
         if args.noise == "pca":
             if want_noise_pool_maps:
                 noise_pcs_per_run, component_loadings_per_run = extract_noise_pcs_per_run(
-                    data=data,
+                    data=cv_data,
                     run_starts=run_starts,
                     noise_pool_mask=noise_pool_mask,
                     max_components=extraction_max_comps,
@@ -2323,7 +2351,7 @@ def main():
                 )
             else:
                 noise_pcs_per_run = extract_noise_pcs_per_run(
-                    data=data,
+                    data=cv_data,
                     run_starts=run_starts,
                     noise_pool_mask=noise_pool_mask,
                     max_components=extraction_max_comps,
@@ -2337,7 +2365,7 @@ def main():
             if want_noise_pool_maps:
                 noise_pcs_per_run, component_loadings_per_run, ic_variance_ratio_per_run = (
                     extract_noise_ics_per_run(
-                        data=data,
+                        data=cv_data,
                         run_starts=run_starts,
                         noise_pool_mask=noise_pool_mask,
                         max_components=extraction_max_comps,
@@ -2354,7 +2382,7 @@ def main():
                 )
             else:
                 noise_pcs_per_run, ic_variance_ratio_per_run = extract_noise_ics_per_run(
-                    data=data,
+                    data=cv_data,
                     run_starts=run_starts,
                     noise_pool_mask=noise_pool_mask,
                     max_components=extraction_max_comps,
@@ -2427,7 +2455,7 @@ def main():
                     full_design = torch.cat([st_design, nuisance_design], dim=1)
                     task_indices = list(range(st_design.shape[1]))
                     glm_results = fit_glm(
-                        data,
+                        cv_data,
                         full_design,
                         tr=args.tr,
                         max_poly_degree=-1,  # block-diag nuisance already has per-run constants
@@ -2445,7 +2473,7 @@ def main():
                         group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
                         full_design = torch.cat([group_design_2d, nuisance_design], dim=1)
                         glm_results = fit_glm(
-                            data[voxel_mask],
+                            cv_data[voxel_mask],
                             full_design,
                             tr=args.tr,
                             max_poly_degree=-1,  # block-diag nuisance has per-run constants
@@ -2531,7 +2559,12 @@ def main():
                         break
             print(f"Optimal PC count (pcstop={args.pcstop}): {optimal_pcs}")
 
-        # 7. Refit with optimal PC count and save
+        # 7. Refit with optimal PC count and save — on the UNBLURRED data.
+        if cv_data is not data:
+            del cv_data  # a full second copy of the timeseries; selection is done with it
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
         print()
         print("Refitting with optimal PC count...")
         nuisance_blocks = []
@@ -2788,6 +2821,8 @@ def main():
             "pc_selection_curve": r2_by_pc.cpu().tolist(),
             "final_median_r2": float(final_r2_cod.median()),
             "cv_metric": args.cv_metric,
+            "cv_blur_fwhm": args.cv_blur,
+            "do_blur_fwhm": args.do_blur,
             "cv_design": cv_design,
             "cv_design_requested": args.cv_design,
             "trial_repeats": {
@@ -3024,7 +3059,7 @@ def main():
         print(f"Fitting denoising model with per-voxel HRFs ({len(designs_by_hrf)} unique HRFs)...")
 
         results = fit_denoising_model(
-            data=data,
+            data=cv_data,
             designs_by_hrf=designs_by_hrf,
             hrf_indices=hrf_indices,
             run_starts=run_starts,
@@ -3063,7 +3098,7 @@ def main():
     else:
         # Single HRF for all voxels (standard pipeline)
         results = fit_denoising_model(
-            data=data,
+            data=cv_data,
             design_matrix=task_design,
             run_starts=run_starts,
             tr=args.tr,
@@ -3097,6 +3132,15 @@ def main():
             device=device,
             verbose=args.verb >= 1,
         )
+
+    if getattr(results, "metadata", None) is not None:
+        results.metadata["cv_blur_fwhm"] = args.cv_blur
+        results.metadata["do_blur_fwhm"] = args.do_blur
+
+    if cv_data is not data:
+        del cv_data  # selection is done; the fits below all read unblurred `data`
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # ==========================================================================
     # Save outputs

@@ -39,11 +39,13 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_cv_blur_arg,
         add_load_threads_arg,
         add_ortvec_arguments,
         add_single_trial_args,
         add_verbose_arg,
         auto_polort,
+        blur_masked_data,
         build_nuisance_per_run,
         collect_nuisance_blocks,
         compute_run_lengths,
@@ -394,9 +396,18 @@ Notes:
         type=float,
         metavar="FWHM",
         default=None,
-        help="Apply 3D Gaussian spatial smoothing with FWHM in mm. "
-        "Smoothing is applied BEFORE masking to avoid edge effects. "
-        "Typical values: 4-8 mm. Uses separable convolutions for speed.",
+        help="Apply 3D Gaussian spatial smoothing with FWHM in mm (whole pipeline, "
+        "including the saved betas). Smoothing is applied BEFORE masking to avoid "
+        "edge effects. Typical values: 4-8 mm. Uses separable convolutions for speed. "
+        "See -cv_blur to blur only HRF selection.",
+    )
+    add_cv_blur_arg(
+        proc_opts,
+        stage_note=(
+            "Applies to HRF selection whether or not it is cross-validated: with "
+            "-cv_design single the criterion is in-sample R², and it benefits from "
+            "the same de-noising of the search landscape."
+        ),
     )
     proc_opts.add_argument(
         "-canonical",
@@ -722,7 +733,7 @@ def main():
     run_starts = load_result.run_starts
     affine = load_result.affine
     volume_shape = load_result.volume_shape
-    _voxel_sizes = load_result.voxel_sizes
+    voxel_sizes = load_result.voxel_sizes
     tr = load_result.tr
     mask = load_result.mask
     mask_flat = load_result.mask_flat
@@ -825,6 +836,23 @@ def main():
 
     results_nodenoise = None  # populated only when -delta_denoise is set
 
+    # -cv_blur: HRF *selection* reads cv_data, the final refit reads `data`. The
+    # selected quantity is an index into the HRF library — a property of the
+    # voxel's hemodynamics — so it carries over to the unblurred fit unchanged.
+    cv_data = data
+    if args.cv_blur is not None:
+        cv_data = blur_masked_data(
+            data,
+            fwhm_mm=args.cv_blur,
+            volume_shape=volume_shape,
+            voxel_sizes=voxel_sizes,
+            mask_flat=mask_flat,
+            run_starts=run_starts,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        print(f"  HRF selection uses {args.cv_blur} mm blurred data; final fit does not.")
+
     # Nuisance design is built up front because both the single-trial selection
     # path and the single-trial *refit* (which can now follow condition-level
     # selection) need the same block-diagonal nuisance.
@@ -880,7 +908,7 @@ def main():
         print("  Projecting nuisance from data (once for all HRFs)...")
         q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
 
-        projected_data = data.clone()
+        projected_data = cv_data.clone()
         for run_idx in range(n_runs):
             start_tp = run_starts[run_idx]
             end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
@@ -1111,7 +1139,8 @@ def main():
     else:
         # ========== EXISTING Beta @ Design TIMESERIES CV PATH ==========
         results = fit_glm_hrf_library_with_xval(
-            data=data,
+            data=cv_data,
+            final_fit_data=data,
             onsets=onset_matrix,
             hrf_library=hrf_library,
             tr=args.tr,
@@ -1170,6 +1199,11 @@ def main():
                 condition_labels=condition_labels,
             )
 
+    if cv_data is not data:
+        del cv_data  # selection is done; the refit below reads unblurred `data`
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     # ==========================================================================
     # 5b. Optional: refit with the optimal HRF per voxel for single-trial betas
     # ==========================================================================
@@ -1213,6 +1247,8 @@ def main():
         results.hrf_metadata["event_files"] = args.events
     results.hrf_metadata["durations"] = durations
     results.hrf_metadata["cv_design"] = cv_design
+    results.hrf_metadata["cv_blur_fwhm"] = args.cv_blur
+    results.hrf_metadata["do_blur_fwhm"] = args.do_blur
     results.hrf_metadata["cv_design_requested"] = args.cv_design
     results.hrf_metadata["single_trials"] = bool(args.single_trials)
     results.hrf_metadata["trial_repeats"] = {

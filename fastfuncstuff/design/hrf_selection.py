@@ -620,6 +620,7 @@ def fit_glm_hrf_library_with_xval(
     debug: bool = False,
     debug_prefix: str | None = None,
     condition_labels: list[str] | None = None,
+    final_fit_data: torch.Tensor | None = None,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated or in-sample R².
@@ -637,7 +638,11 @@ def fit_glm_hrf_library_with_xval(
     Parameters
     ----------
     data : torch.Tensor
-        (n_voxels, n_timepoints) fMRI data
+        (n_voxels, n_timepoints) fMRI data used to *select* the HRF per voxel
+    final_fit_data : torch.Tensor, optional
+        Data for the final refit, when it should differ from the data the
+        selection was scored on (ffs_hrfopt -cv_blur selects on a spatially
+        blurred copy and fits the unblurred original). Defaults to ``data``.
     onsets : torch.Tensor
         (n_microtime_points, n_conditions) binary onset matrix at microtime_dt resolution.
         n_microtime_points = n_timepoints * (tr / microtime_dt)
@@ -1334,7 +1339,7 @@ def fit_glm_hrf_library_with_xval(
         print("Refitting full dataset with voxel-wise optimal HRFs...")
 
     final_results = _fit_voxelwise_hrf(
-        data=data,
+        data=data if final_fit_data is None else final_fit_data,
         onsets=onsets,
         hrf_library=hrf_library,
         hrf_index=hrf_index,

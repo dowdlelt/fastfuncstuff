@@ -2576,6 +2576,124 @@ def summarize_trial_repeats(
     )
 
 
+def add_cv_blur_arg(group, *, stage_note: str = "") -> None:
+    """Add ``-cv_blur``: blur applied only to the parameter-selection stage.
+
+    Distinct from ``-do_blur``, which blurs the whole pipeline including the
+    final fit and the saved betas.
+    """
+    group.add_argument(
+        "-cv_blur",
+        "-cv-blur",
+        dest="cv_blur",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help="Gaussian FWHM in mm applied ONLY to the parameter-selection stage; "
+        "the final model is fit on the unblurred data. In thermal-noise-dominated "
+        "data the structure the search needs is buried, so noise components come "
+        "out mixed with thermal junk and HRF fits are unstable — a few mm of blur "
+        "lets the search see the structure without smoothing the output. "
+        "Everything the selection touches is blurred consistently (noise pool, "
+        "component extraction, and scoring). Contrast -do_blur, which blurs the "
+        "whole pipeline including the saved betas. " + stage_note,
+    )
+
+
+def blur_masked_data(
+    data: torch.Tensor,
+    *,
+    fwhm_mm: float,
+    volume_shape: tuple,
+    voxel_sizes: tuple,
+    mask_flat: np.ndarray | torch.Tensor | None,
+    run_starts: list[int],
+    device: torch.device | None = None,
+    verbose: bool = True,
+) -> torch.Tensor:
+    """Blur a masked ``(n_voxels, n_timepoints)`` timeseries back through its volume.
+
+    The data has already been reduced to in-mask voxels, so blurring means
+    scattering to the volume, convolving, and gathering back. The convolution is
+    **normalized** (divided by the identically-blurred mask), because
+    ``gaussian_blur_3d`` zero-pads: without it, every voxel near the mask edge or
+    the FOV boundary gets pulled toward zero, which looks exactly like signal
+    dropout to whatever criterion is reading the result.
+
+    Returns a new tensor on the same device and dtype as ``data``; the input is
+    untouched, since the caller still needs it for the final fit.
+    """
+    from fastfuncstuff.utils import gaussian_blur_3d
+
+    n_voxels, n_timepoints = data.shape
+    n_vol_voxels = int(np.prod(volume_shape))
+
+    if mask_flat is None:
+        if n_voxels != n_vol_voxels:
+            raise ValueError(
+                f"cannot blur: {n_voxels} data voxels do not fill the "
+                f"{volume_shape} volume and no mask was supplied to place them"
+            )
+        mask_idx = None
+    else:
+        mask_np = mask_flat.cpu().numpy() if torch.is_tensor(mask_flat) else np.asarray(mask_flat)
+        mask_np = mask_np.astype(bool).reshape(-1)
+        if int(mask_np.sum()) != n_voxels:
+            raise ValueError(
+                f"cannot blur: mask selects {int(mask_np.sum())} voxels but data has {n_voxels}"
+            )
+        mask_idx = np.flatnonzero(mask_np)
+
+    if verbose:
+        print(f"  Blurring selection-stage data (FWHM = {fwhm_mm} mm)...")
+
+    # Normalizer: the mask itself, blurred with the same kernel.  Computed once.
+    weight_vol = np.zeros(n_vol_voxels, dtype=np.float32)
+    if mask_idx is None:
+        weight_vol[:] = 1.0
+    else:
+        weight_vol[mask_idx] = 1.0
+    weight = gaussian_blur_3d(
+        weight_vol.reshape(*volume_shape, 1),
+        fwhm_mm=fwhm_mm,
+        voxel_sizes=voxel_sizes,
+        device=device,
+        verbose=verbose,
+    ).reshape(n_vol_voxels)
+    # Below this the normalizer is all edge and the quotient is noise amplification.
+    weight = np.where(weight > 1e-3, weight, np.inf)
+
+    out = torch.empty_like(data)
+    run_bounds = list(run_starts) + [n_timepoints]
+    for run_idx in range(len(run_starts)):
+        start_tp, end_tp = run_bounds[run_idx], run_bounds[run_idx + 1]
+        n_tps = end_tp - start_tp
+
+        vol = np.zeros((n_vol_voxels, n_tps), dtype=np.float32)
+        run_data = data[:, start_tp:end_tp].detach().cpu().numpy().astype(np.float32, copy=False)
+        if mask_idx is None:
+            vol[:] = run_data
+        else:
+            vol[mask_idx] = run_data
+
+        blurred = gaussian_blur_3d(
+            vol.reshape(*volume_shape, n_tps),
+            fwhm_mm=fwhm_mm,
+            voxel_sizes=voxel_sizes,
+            device=device,
+            verbose=False,
+        ).reshape(n_vol_voxels, n_tps)
+        blurred /= weight[:, None]
+
+        gathered = blurred if mask_idx is None else blurred[mask_idx]
+        out[:, start_tp:end_tp] = torch.from_numpy(gathered).to(
+            device=data.device, dtype=data.dtype
+        )
+        del vol, blurred
+
+    return out
+
+
 def add_single_trial_args(group, *, emit_help: str) -> None:
     """Add the harmonized ``-single_trials`` / ``-cv_design`` pair.
 
