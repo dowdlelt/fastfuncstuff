@@ -22,6 +22,7 @@ wheels/
 .claude
 .claude/settings.local.json
 .opencode/
+AGENTS.md
 
 # Virtual environments
 venv/
@@ -106,5 +107,3 @@ docs/temp_*.md
 
 # Wiki (lives at ~/Dropbox/Resources/code/fmri_wiki; never track here)
 wiki/
-
-AGENTS.md # symlink to CLAUDE.md
