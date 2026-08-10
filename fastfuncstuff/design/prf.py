@@ -52,6 +52,46 @@ class PRFGridFit:
     gain: torch.Tensor  # (n_voxels,), constrained non-negative
     correlation: torch.Tensor  # (n_voxels,)
     r2: torch.Tensor  # (n_voxels,), correlation squared
+    # Each HRF's own best grid candidate, kept only under track_per_hrf. The
+    # winner above is the max over these; these are what seed a forced-HRF refine.
+    correlation_per_hrf: torch.Tensor | None = None  # (n_voxels, n_hrfs)
+    candidate_per_hrf: torch.Tensor | None = None  # (n_voxels, n_hrfs), int32
+    grid_parameters: torch.Tensor | None = None  # (n_candidates, 4), the full table
+
+    def seeds_for_hrf(self, hrf_index: torch.Tensor) -> PRFGridFit:
+        """Re-seed every voxel at the given HRF's *own* best super-grid candidate.
+
+        Forcing only ``hrf_index`` and leaving ``parameters`` at the global winner
+        starts Gauss-Newton from the position the *winning* HRF preferred, which is
+        not neutral: HRF delay trades against position along the sweep, so a
+        non-winning HRF's grid optimum sits systematically elsewhere (about a third
+        of a pixel per library step). Under a step limit and early stopping that
+        biases the comparison toward whichever HRF supplied the seed. The super grid
+        already scored every (candidate, HRF) pair, so the honest seed is free --
+        it just has to be kept.
+
+        Falls back to forcing the HRF alone when the per-HRF tables were not
+        tracked, which keeps callers that never asked for them working unchanged.
+        ``gain`` is left at the winner's value: refinement solves it by variable
+        projection and never reads the seed.
+        """
+        if self.candidate_per_hrf is None or self.grid_parameters is None:
+            return replace(self, hrf_index=hrf_index)
+        rows = torch.arange(hrf_index.shape[0], device=hrf_index.device)
+        candidate = self.candidate_per_hrf[rows, hrf_index].long()
+        correlation = (
+            self.correlation_per_hrf[rows, hrf_index]
+            if self.correlation_per_hrf is not None
+            else self.correlation
+        )
+        return replace(
+            self,
+            hrf_index=hrf_index,
+            candidate_index=candidate,
+            parameters=self.grid_parameters.to(self.parameters.device)[candidate],
+            correlation=correlation,
+            r2=correlation.square(),
+        )
 
 
 @dataclass(frozen=True)
@@ -1060,14 +1100,7 @@ def refine_prf_all_hrfs(
         hrf_iterator = tqdm(hrf_iterator, desc="pRF refine per HRF", leave=True)
 
     for hrf_index in hrf_iterator:
-        forced = PRFGridFit(
-            candidate_index=grid_fit.candidate_index,
-            hrf_index=torch.full_like(grid_fit.hrf_index, hrf_index),
-            parameters=grid_fit.parameters,
-            gain=grid_fit.gain,
-            correlation=grid_fit.correlation,
-            r2=grid_fit.r2,
-        )
+        forced = grid_fit.seeds_for_hrf(torch.full_like(grid_fit.hrf_index, hrf_index))
         fit = refine_prf_supergrid(
             data,
             stimulus_runs,
@@ -1095,7 +1128,9 @@ def _keep_better_fit(best: PRFRefinedFit | None, candidate: PRFRefinedFit) -> PR
         return candidate
     improved = candidate.r2 > best.r2
     return PRFRefinedFit(
-        candidate_index=best.candidate_index,
+        # Seeds differ per HRF once seeds_for_hrf is in play, so the winning
+        # candidate has to be selected like every other field.
+        candidate_index=torch.where(improved, candidate.candidate_index, best.candidate_index),
         hrf_index=torch.where(improved, candidate.hrf_index, best.hrf_index),
         parameters=torch.where(improved.unsqueeze(1), candidate.parameters, best.parameters),
         gain=torch.where(improved, candidate.gain, best.gain),
@@ -1163,7 +1198,89 @@ def refine_prf_hrf_window(
         slots = tqdm(slots, desc=f"pRF refine grid+/-{window}", leave=True)
 
     for slot in slots:
-        forced = replace(grid_fit, hrf_index=window_start + slot)
+        forced = grid_fit.seeds_for_hrf(window_start + slot)
+        fit = refine_prf_supergrid(
+            data,
+            stimulus_runs,
+            stimulus_shape,
+            forced,
+            hrf_library,
+            run_starts,
+            nuisance_per_run=nuisance_per_run,
+            voxel_chunk_size=voxel_chunk_size,
+            device=device,
+            config=config,
+        )
+        best_fit = _keep_better_fit(best_fit, fit)
+
+    assert best_fit is not None
+    return best_fit
+
+
+def refine_prf_hrf_ranked(
+    data: torch.Tensor,
+    stimulus_runs: Sequence[torch.Tensor],
+    stimulus_shape: tuple[int, int],
+    grid_fit: PRFGridFit,
+    hrf_library: torch.Tensor,
+    run_starts: Sequence[int],
+    *,
+    n_extra: int = 2,
+    nuisance_per_run: Sequence[torch.Tensor] | None = None,
+    voxel_chunk_size: int = 20_000,
+    device: torch.device | None = None,
+    config: PRFRefinementConfig = PRFRefinementConfig(),
+    verbose: bool = False,
+) -> PRFRefinedFit:
+    """Refine the grid's HRF plus the ``n_extra`` next-best HRFs *by grid fit*.
+
+    The library-index window of :func:`refine_prf_hrf_window` assumes neighbouring
+    indices are neighbouring shapes, which holds for a swept library but not for a
+    Latin-hypercube (pighs) draw, where index order is close to arbitrary. Ranking
+    by each voxel's own super-grid correlation is shape-agnostic: it picks the
+    HRFs that actually came closest to fitting that voxel, whatever their position
+    in the library.
+
+    ``n_extra`` counts the *additional* candidates, so ``n_extra=2`` refines three
+    HRFs per voxel -- the same budget as ``window=1``.
+
+    Requires ``grid_fit.correlation_per_hrf``, i.e. the super grid must have run
+    with ``track_per_hrf=True``.
+    """
+    if n_extra < 1:
+        raise ValueError(f"n_extra must be positive, got {n_extra}")
+    if grid_fit.correlation_per_hrf is None:
+        raise ValueError(
+            "refine_prf_hrf_ranked needs per-HRF grid scores; call fit_prf_supergrid "
+            "with track_per_hrf=True"
+        )
+    n_hrfs = hrf_library.shape[0]
+    width = min(n_extra + 1, n_hrfs)
+    if width >= n_hrfs:
+        return refine_prf_all_hrfs(
+            data,
+            stimulus_runs,
+            stimulus_shape,
+            grid_fit,
+            hrf_library,
+            run_starts,
+            nuisance_per_run=nuisance_per_run,
+            voxel_chunk_size=voxel_chunk_size,
+            device=device,
+            config=config,
+            verbose=verbose,
+        )[0]
+
+    ranked = grid_fit.correlation_per_hrf.topk(width, dim=1).indices
+    best_fit: PRFRefinedFit | None = None
+    slots = range(width)
+    if verbose:
+        from tqdm.auto import tqdm
+
+        slots = tqdm(slots, desc=f"pRF refine grid-{n_extra}", leave=True)
+
+    for slot in slots:
+        forced = grid_fit.seeds_for_hrf(ranked[:, slot].to(grid_fit.hrf_index.device))
         fit = refine_prf_supergrid(
             data,
             stimulus_runs,
@@ -1495,13 +1612,15 @@ def fit_prf_folds(
             candidate_chunk_size=candidate_chunk_size,
             voxel_chunk_size=voxel_chunk_size,
             device=device,
+            track_per_hrf=refine and hrf_mode in ("refine", "fixed") and hrf_library.shape[0] > 1,
         )
         if hrf_mode == "fixed":
             assert fixed_hrf_index is not None
-            # The seed position came from the grid's own HRF, but it is only a
-            # seed -- refinement is what has to run under the reported HRF.
-            training_grid = replace(
-                training_grid, hrf_index=fixed_hrf_index.to(training_grid.hrf_index.device)
+            # Seed at the imposed HRF's own grid optimum, not the grid winner's:
+            # position and HRF delay trade off, so the winner's seed would start
+            # refinement systematically off-target for every other HRF.
+            training_grid = training_grid.seeds_for_hrf(
+                fixed_hrf_index.to(training_grid.hrf_index.device)
             )
         refine_kwargs = dict(
             nuisance_per_run=training_nuisance,
@@ -1615,6 +1734,7 @@ def fit_prf_supergrid(
     candidate_chunk_size: int = 256,
     voxel_chunk_size: int = 20_000,
     device: torch.device | None = None,
+    track_per_hrf: bool = False,
     verbose: bool = False,
 ) -> PRFGridFit:
     """Fit the best CSS super-grid and HRF candidate per voxel.
@@ -1622,6 +1742,12 @@ def fit_prf_supergrid(
     ``data`` is voxel-major while stimulus runs are time-major.  Candidate
     predictions are generated on the compute device, while result maps remain
     on the data device.  This permits CPU-backed data with CUDA voxel streaming.
+
+    ``track_per_hrf`` additionally keeps each voxel's best candidate *under every
+    HRF*, not just the winner, in ``correlation_per_hrf`` / ``candidate_per_hrf``.
+    Two (n_voxels, n_hrfs) buffers and one masked update per chunk buys both the
+    ability to rank HRFs by fit rather than by library index, and an unbiased seed
+    for each HRF's refinement -- see :meth:`PRFGridFit.seeds_for_hrf`.
     """
     if data.ndim != 2:
         raise ValueError("data must have shape (n_voxels, n_timepoints)")
@@ -1646,6 +1772,17 @@ def fit_prf_supergrid(
     best_candidate = torch.zeros(n_voxels, device=output_device, dtype=torch.long)
     best_hrf = torch.zeros(n_voxels, device=output_device, dtype=torch.long)
     best_gain = torch.zeros(n_voxels, device=output_device, dtype=data.dtype)
+    hrf_correlation = None
+    hrf_candidate = None
+    if track_per_hrf:
+        hrf_correlation = torch.full(
+            (n_voxels, hrf_library.shape[0]), -torch.inf, device=output_device, dtype=data.dtype
+        )
+        # int32 halves the buffer against long, and no super-grid comes close to
+        # 2^31 candidates.
+        hrf_candidate = torch.zeros(
+            (n_voxels, hrf_library.shape[0]), device=output_device, dtype=torch.int32
+        )
 
     parameters = grid.parameters.to(device=device, dtype=data.dtype)
     hrf_library = hrf_library.to(device=device, dtype=data.dtype)
@@ -1715,6 +1852,18 @@ def fit_prf_supergrid(
                     / prediction_norm[candidate_offsets]
                 ).clamp_min(0)
 
+                if hrf_correlation is not None and hrf_candidate is not None:
+                    scores_out = candidate_scores.to(output_device)
+                    better = scores_out > hrf_correlation[output_slice, hrf_index]
+                    hrf_correlation[output_slice, hrf_index] = torch.where(
+                        better, scores_out, hrf_correlation[output_slice, hrf_index]
+                    )
+                    hrf_candidate[output_slice, hrf_index] = torch.where(
+                        better,
+                        (candidate_start + candidate_offsets).to(output_device, torch.int32),
+                        hrf_candidate[output_slice, hrf_index],
+                    )
+
                 previous_scores = best_correlation[output_slice].to(device)
                 improved = candidate_scores > previous_scores
                 if improved.any():
@@ -1746,6 +1895,11 @@ def fit_prf_supergrid(
         gain=best_gain,
         correlation=best_correlation,
         r2=best_correlation.square(),
+        correlation_per_hrf=hrf_correlation,
+        candidate_per_hrf=hrf_candidate,
+        grid_parameters=grid.parameters.to(output_device, dtype=data.dtype)
+        if track_per_hrf
+        else None,
     )
 
 

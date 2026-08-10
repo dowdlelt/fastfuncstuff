@@ -711,6 +711,144 @@ def test_hrf_window_slides_at_the_library_edge(monkeypatch):
     assert fit.hrf_index.tolist() == [2, 2, 2]
 
 
+def test_hrf_ranked_follows_grid_fit_not_library_order(monkeypatch):
+    """grid-N takes the best-scoring HRFs, however they are ordered in the library."""
+    from fastfuncstuff.design.prf import PRFRefinedFit, refine_prf_hrf_ranked
+
+    tested: list[list[int]] = []
+
+    def fake_refine(data, stimulus_runs, stimulus_shape, grid_fit, library, run_starts, **kwargs):
+        tested.append(grid_fit.hrf_index.tolist())
+        n = grid_fit.hrf_index.numel()
+        return PRFRefinedFit(
+            candidate_index=grid_fit.candidate_index.clone(),
+            hrf_index=grid_fit.hrf_index.clone(),
+            parameters=grid_fit.parameters.clone(),
+            gain=torch.zeros(n),
+            correlation=torch.zeros(n),
+            r2=grid_fit.hrf_index.float(),  # the highest index refines best
+            residual_ss=torch.zeros(n),
+            n_iters=torch.zeros(n),
+            converged=torch.zeros(n),
+        )
+
+    monkeypatch.setattr("fastfuncstuff.design.prf.refine_prf_supergrid", fake_refine)
+
+    # Grid scores whose ranking has nothing to do with index adjacency.
+    per_hrf = torch.tensor(
+        [
+            [0.9, 0.1, 0.2, 0.8, 0.3],
+            [0.1, 0.5, 0.9, 0.2, 0.7],
+        ]
+    )
+    # One distinct grid candidate per (voxel, HRF), so the seed each trial got --
+    # and the one the winner carries out -- is identifiable.
+    candidate_per_hrf = torch.arange(10, dtype=torch.int32).reshape(2, 5)
+    grid_parameters = torch.arange(10, dtype=torch.float32).reshape(10, 1).repeat(1, 4)
+    grid_fit = PRFGridFit(
+        candidate_index=torch.tensor([0, 7]),
+        hrf_index=torch.tensor([0, 2]),
+        parameters=grid_parameters[torch.tensor([0, 7])],
+        gain=torch.ones(2),
+        correlation=torch.zeros(2),
+        r2=torch.zeros(2),
+        correlation_per_hrf=per_hrf,
+        candidate_per_hrf=candidate_per_hrf,
+        grid_parameters=grid_parameters,
+    )
+    fit = refine_prf_hrf_ranked(
+        torch.zeros(2, 4), [torch.zeros(4, 4)], (2, 2), grid_fit, torch.ones(5, 2), [0], n_extra=2
+    )
+
+    # n_extra=2 means three candidates: the grid winner plus the two runners-up.
+    per_voxel = [sorted(scores) for scores in zip(*tested, strict=True)]
+    assert per_voxel[0] == [0, 3, 4]
+    assert per_voxel[1] == [1, 2, 4]
+    assert fit.hrf_index.tolist() == [4, 4]
+    # Each trial was seeded at its own HRF's grid candidate, and the winning
+    # trial's candidate -- not the first trial's -- is the one reported.
+    assert fit.candidate_index.tolist() == [4, 9]
+    assert torch.equal(fit.parameters, grid_parameters[torch.tensor([4, 9])])
+
+
+def test_hrf_ranked_requires_tracked_grid_scores():
+    from fastfuncstuff.design.prf import refine_prf_hrf_ranked
+
+    grid_fit = PRFGridFit(
+        candidate_index=torch.zeros(2, dtype=torch.long),
+        hrf_index=torch.zeros(2, dtype=torch.long),
+        parameters=torch.zeros(2, 4),
+        gain=torch.ones(2),
+        correlation=torch.zeros(2),
+        r2=torch.zeros(2),
+    )
+    with pytest.raises(ValueError, match="track_per_hrf"):
+        refine_prf_hrf_ranked(
+            torch.zeros(2, 4), [torch.zeros(4, 4)], (2, 2), grid_fit, torch.ones(5, 2), [0]
+        )
+
+
+def test_supergrid_tracks_the_best_correlation_for_every_hrf():
+    """correlation_per_hrf must hold each HRF's own best, and agree with the winner."""
+    torch.manual_seed(11)
+    stimulus_shape = (5, 5)
+    stimulus_runs = [torch.rand(20, 25)]
+    library = torch.tensor([[1.0, 0.4, 0.1], [0.1, 0.4, 1.0], [0.5, 1.0, 0.5]])
+    grid = make_analyzeprf_grid(stimulus_shape, n_angles=8)
+    data = torch.rand(6, 20)
+
+    fit = fit_prf_supergrid(
+        data, stimulus_runs, stimulus_shape, grid, library, [0], track_per_hrf=True
+    )
+
+    assert fit.correlation_per_hrf is not None
+    assert fit.candidate_per_hrf is not None
+    assert fit.correlation_per_hrf.shape == (6, 3)
+    best_per_voxel, best_hrf = fit.correlation_per_hrf.max(dim=1)
+    assert torch.allclose(best_per_voxel, fit.correlation)
+    assert torch.equal(best_hrf, fit.hrf_index)
+
+    # Each column must equal what a single-HRF grid search would have found.
+    for index in range(3):
+        alone = fit_prf_supergrid(
+            data, stimulus_runs, stimulus_shape, grid, library[index : index + 1], [0]
+        )
+        assert torch.equal(alone.candidate_index, fit.candidate_per_hrf[:, index].long())
+        assert torch.allclose(alone.correlation, fit.correlation_per_hrf[:, index])
+
+    # Untracked by default, so the extra buffers are never paid for silently.
+    plain = fit_prf_supergrid(data, stimulus_runs, stimulus_shape, grid, library, [0])
+    assert plain.correlation_per_hrf is None
+    assert plain.candidate_per_hrf is None
+
+
+def test_seeds_for_hrf_uses_that_hrfs_own_grid_optimum():
+    """Forcing an HRF must move the seed to where the grid liked *that* HRF."""
+    torch.manual_seed(12)
+    stimulus_shape = (5, 5)
+    stimulus_runs = [torch.rand(20, 25)]
+    library = torch.tensor([[1.0, 0.4, 0.1], [0.1, 0.4, 1.0], [0.5, 1.0, 0.5]])
+    grid = make_analyzeprf_grid(stimulus_shape, n_angles=8)
+    data = torch.rand(6, 20)
+
+    fit = fit_prf_supergrid(
+        data, stimulus_runs, stimulus_shape, grid, library, [0], track_per_hrf=True
+    )
+    forced = torch.full_like(fit.hrf_index, 1)
+    seeded = fit.seeds_for_hrf(forced)
+
+    alone = fit_prf_supergrid(data, stimulus_runs, stimulus_shape, grid, library[1:2], [0])
+    assert torch.equal(seeded.candidate_index, alone.candidate_index)
+    assert torch.allclose(seeded.parameters, alone.parameters)
+    assert torch.allclose(seeded.correlation, alone.correlation)
+    # Re-seeding at the winning HRF is a no-op.
+    assert torch.allclose(fit.seeds_for_hrf(fit.hrf_index).parameters, fit.parameters)
+
+    # Without the tracked tables the old behaviour stands: only the HRF changes.
+    plain = fit_prf_supergrid(data, stimulus_runs, stimulus_shape, grid, library, [0])
+    assert torch.allclose(plain.seeds_for_hrf(forced).parameters, plain.parameters)
+
+
 def test_hrf_window_wider_than_the_library_falls_back_to_every_hrf():
     """A window covering the whole library is just the full search."""
     from fastfuncstuff.design.prf import refine_prf_hrf_window

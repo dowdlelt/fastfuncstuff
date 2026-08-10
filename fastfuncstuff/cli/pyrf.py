@@ -67,6 +67,7 @@ from fastfuncstuff.design.prf import (
     make_analyzeprf_grid,
     prf_parameter_maps,
     refine_prf_all_hrfs,
+    refine_prf_hrf_ranked,
     refine_prf_hrf_window,
     refine_prf_supergrid,
     screen_voxels_ridge,
@@ -262,7 +263,12 @@ CHOOSING SETTINGS  (measured on 3 runs x 300 TRs, one subject -- confirm on your
                   half the time. Plain 'grid' is cheaper again and still agrees
                   ~84% of the time; the grid choice is within one library step
                   of the refined one essentially always, which is exactly why
-                  grid+1 works and grid+2 adds nothing.
+                  grid+1 works and grid+2 adds nothing. grid+N walks the library
+                  by INDEX, so it only makes sense when the library is ordered by
+                  shape. With -hrf pighs it is not (Latin-hypercube draws), so use
+                  grid-N, which takes the N next-best HRFs by that voxel's own
+                  super-grid fit: grid-2 is the same three-candidate budget as
+                  grid+1.
   -grid_angles    32 costs no measurable time (the super-grid stage is
                   launch-bound, not candidate-bound) and clearly beats
                   analyzePRF's 16. Subdividing sigma or eccentricity instead
@@ -314,6 +320,23 @@ PLEASE CITE Kay et al. 2013 if you publish results from this tool.
 # Sub-bricks that describe the input data rather than the fit, and so stay valid
 # for voxels that were never fitted.
 _DATA_COLUMNS = frozenset({"meanvol"})
+
+
+def _hrf_select_spec(value: str) -> str:
+    """Validate -hrf_select: 'refine', 'grid', or 'grid+N' / 'grid-N' for N >= 1."""
+    if value in ("refine", "grid"):
+        return value
+    for prefix in ("grid+", "grid-"):
+        if value.startswith(prefix):
+            count = value.removeprefix(prefix)
+            if count.isdigit() and int(count) >= 1:
+                return value
+            break
+    raise argparse.ArgumentTypeError(
+        f"invalid -hrf_select value {value!r}: expected 'refine', 'grid', "
+        "'grid+N' (N library-index steps either side) or 'grid-N' (N next-best "
+        "HRFs by grid fit), with N a positive integer"
+    )
 
 
 class _PyrfHelpFormatter(
@@ -437,7 +460,8 @@ def create_parser() -> argparse.ArgumentParser:
             "per-HRF selection entirely and is by far the fastest. 'library' is the "
             "20-HRF double-gamma family (or -hrf_library); pair it with "
             "-hrf_select grid+1. 'pighs' generates a half-cosine family of "
-            "-num_hrfs shapes"
+            "-num_hrfs shapes; its draws are not ordered by shape, so pair it "
+            "with -hrf_select grid-2 rather than grid+1"
         ),
     )
     model.add_argument(
@@ -568,18 +592,24 @@ def create_parser() -> argparse.ArgumentParser:
     model.add_argument(
         "-hrf-select",
         "-hrf_select",
-        choices=["refine", "grid", "grid+1", "grid+2"],
+        type=_hrf_select_spec,
         default="refine",
+        metavar="{refine,grid,grid+N,grid-N}",
         help=(
             "How the per-voxel HRF is chosen. 'refine' refits the pRF under every "
             "HRF and keeps the best. 'grid' keeps the super-grid's choice, which "
             "matches the refined one ~84%% of the time on well-fit voxels. 'grid+N' "
-            "refits only the HRFs within N steps of the grid choice: grid+1 reaches "
-            "~96%% agreement at equal R2 for well under half the time, and is the "
-            "recommended setting. grid+2 measured identical to grid+1, because the "
-            "grid choice is within one library step essentially always. The window "
-            "slides at the library edges, so a voxel that picked HRF 1 is still "
-            "scored on three HRFs"
+            "refits only the HRFs within N *library index* steps of the grid choice: "
+            "grid+1 reaches ~96%% agreement at equal R2 for well under half the time, "
+            "and is the recommended setting for -hrf library. grid+2 measured "
+            "identical to grid+1, because the grid choice is within one library step "
+            "essentially always. The window slides at the library edges, so a voxel "
+            "that picked HRF 1 is still scored on three HRFs. 'grid-N' instead refits "
+            "the grid choice plus the N next-best HRFs by that voxel's own super-grid "
+            "fit, ignoring library order -- use it with -hrf pighs, whose "
+            "Latin-hypercube draws are not ordered by shape, where index neighbours "
+            "are not shape neighbours. grid-2 gives three candidates per voxel, the "
+            "same budget as grid+1"
         ),
     )
     model.add_argument(
@@ -1996,6 +2026,9 @@ def main(argv: list[str] | None = None) -> int:
         candidate_chunk_size=args.candidate_chunk,
         voxel_chunk_size=voxel_chunk_size,
         device=device,
+        # Needed by every path that refines under a *forced* HRF, so each one is
+        # seeded at its own grid optimum rather than the grid winner's.
+        track_per_hrf=(hrf_library.shape[0] > 1 and not args.quick and args.hrf_select != "grid"),
         verbose=args.verb > 0,
     )
     refinement_config = PRFRefinementConfig(
@@ -2034,6 +2067,21 @@ def main(argv: list[str] | None = None) -> int:
             hrf_library,
             loaded.run_starts,
             window=int(args.hrf_select.removeprefix("grid+")),
+            nuisance_per_run=nuisance_per_run,
+            voxel_chunk_size=refine_chunk_size,
+            device=device,
+            config=refinement_config,
+            verbose=args.verb > 0,
+        )
+    elif args.hrf_select.startswith("grid-") and hrf_library.shape[0] > 1:
+        results = refine_prf_hrf_ranked(
+            analysis_data,
+            stimulus_runs,
+            stimulus_shape,
+            grid_results,
+            hrf_library,
+            loaded.run_starts,
+            n_extra=int(args.hrf_select.removeprefix("grid-")),
             nuisance_per_run=nuisance_per_run,
             voxel_chunk_size=refine_chunk_size,
             device=device,
