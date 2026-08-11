@@ -13,8 +13,10 @@ import torch
 from fastfuncstuff.stats.noise_ceiling import (
     df_corrected_ceiling,
     loro_two_half_ceiling,
+    mean_train_repeats,
     ncsnr,
     ncsnr_noise_ceiling,
+    zscore_betas_by_run,
 )
 
 
@@ -217,6 +219,72 @@ class TestDfCorrectedCeiling:
             torch.full((10,), 100.0), torch.full((10,), 200.0), sigma2, 100, 60
         )
         assert result.notes
+
+
+class TestZscoreBetasByRun:
+    def test_each_run_becomes_zero_mean_unit_scale(self):
+        betas = torch.randn(20, 40) * 3.0 + 7.0
+        run_ids = torch.arange(4).repeat_interleave(10)
+        out = zscore_betas_by_run(betas, run_ids)
+        for run in range(4):
+            block = out[:, run_ids == run]
+            assert torch.allclose(block.mean(dim=1), torch.zeros(20), atol=1e-5)
+            assert torch.allclose(block.std(dim=1), torch.ones(20), atol=1e-5)
+
+    def test_removes_the_run_offset_that_inflated_explainable_r2(self):
+        """Bug of record: ffs_ridge read explainable R2 = 1.26 without this.
+
+        The CV z-scores per run before scoring, so run-level offsets are absent
+        from its R2 but present in a raw-beta ceiling's denominator -- pushing
+        the ceiling down and the ratio above 1. Adding a large per-run offset
+        must not change the ceiling once both sides are normalised.
+        """
+        generator = torch.Generator().manual_seed(2)
+        base = torch.randn(50, 40, generator=generator)
+        run_ids = torch.arange(4).repeat_interleave(10)
+        condition_ids = torch.arange(10).repeat(4)
+
+        offset = base + (run_ids.float() * 25.0).unsqueeze(0)
+        clean = ncsnr_noise_ceiling(
+            zscore_betas_by_run(base, run_ids), condition_ids, n_train_repeats=3
+        ).ceiling
+        shifted = ncsnr_noise_ceiling(
+            zscore_betas_by_run(offset, run_ids), condition_ids, n_train_repeats=3
+        ).ceiling
+        torch.testing.assert_close(clean, shifted, atol=1e-4, rtol=1e-4)
+
+    def test_rejects_mismatched_run_ids(self):
+        with pytest.raises(ValueError, match="one entry per trial"):
+            zscore_betas_by_run(torch.randn(5, 10), torch.arange(3))
+
+
+class TestMeanTrainRepeats:
+    def test_counts_actual_training_trials_under_loro(self):
+        """4 runs x 3 trials per condition: LORO leaves 9 training trials."""
+        condition_ids = torch.zeros(12, dtype=torch.long)
+        run_ids = torch.arange(4).repeat_interleave(3)
+        splits = [([r for r in range(4) if r != held], [held]) for held in range(4)]
+        assert mean_train_repeats(condition_ids, run_ids, splits) == pytest.approx(9.0)
+
+    def test_unbalanced_conditions_are_measured_not_assumed(self):
+        """The n*(R-1)/R formula is wrong when a condition skips runs.
+
+        Condition 1 appears in runs 0 and 1 only, so folds holding out those
+        runs leave it a single training trial -- which the closed form would
+        never predict.
+        """
+        condition_ids = torch.tensor([0, 0, 0, 0, 1, 1])
+        run_ids = torch.tensor([0, 1, 2, 3, 0, 1])
+        splits = [([r for r in range(4) if r != held], [held]) for held in range(4)]
+        # Condition 0 contributes 3 training trials in each of 4 folds; condition
+        # 1 is only tested in folds 0 and 1, contributing 1 each time.
+        expected = (3 * 4 + 1 * 2) / 6
+        assert mean_train_repeats(condition_ids, run_ids, splits) == pytest.approx(expected)
+
+    def test_no_usable_fold_falls_back_to_one(self):
+        condition_ids = torch.tensor([0, 1])
+        run_ids = torch.tensor([0, 1])
+        assert mean_train_repeats(condition_ids, run_ids, [([0], [1])]) == pytest.approx(1.0)
 
 
 class TestExplainableR2:

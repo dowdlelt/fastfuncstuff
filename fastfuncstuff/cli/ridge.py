@@ -49,6 +49,7 @@ try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
         add_load_threads_arg,
+        add_noise_ceiling_args,
         add_verbose_arg,
         auto_polort,
         build_nuisance_per_run,
@@ -269,6 +270,12 @@ Notes:
         default=True,
         help="Z-score betas per run before CV using OLS normalization stats "
         "(GLMsingle default). Only applies with -single_trials.",
+    )
+    add_noise_ceiling_args(
+        ridge_opts,
+        stage_note="ffs_ridge scores in beta space, so 'auto' resolves to "
+        "'ncsnr' -- which needs conditions that repeat across runs, not "
+        "repeated runs.",
     )
 
     # Integration options
@@ -1059,6 +1066,75 @@ def main():
             voxel_mask_np,
         )
         print(f"  {args.prefix}_{cv_metric_token}_by_frac{_nii_ext}")
+
+        if args.noise_ceiling in ("auto", "ncsnr"):
+            from fastfuncstuff.stats.noise_ceiling import (
+                mean_train_repeats,
+                ncsnr,
+                ncsnr_noise_ceiling,
+                zscore_betas_by_run,
+            )
+
+            # The ceiling must see the betas the CV actually scored. With
+            # -zscore_by_run (the default) the CV strips each run's mean and
+            # scale first, so a ceiling from the raw betas bounds a different
+            # quantity and the explainable fraction runs past 1.
+            ceiling_betas = final_betas.cpu()
+            if args.zscore_by_run and args.metric != "sse":
+                ceiling_betas = zscore_betas_by_run(ceiling_betas, trial_run_ids.cpu())
+
+            # The CV predicts each held-out trial from an average of m training
+            # trials, so the divisor has to account for that predictor's own
+            # noise; the published NSD form assumes a noiseless one and would
+            # read as though the model fell short of a ceiling it could not
+            # reach. Both are saved -- ncsnr for comparison with NSD maps, the
+            # fold-matched ceiling for the ratio.
+            repeats = mean_train_repeats(trial_condition_ids, trial_run_ids, cv_splits)
+            ceiling = ncsnr_noise_ceiling(
+                ceiling_betas, trial_condition_ids.cpu(), n_train_repeats=repeats
+            )
+            print()
+            print(f"Noise ceiling (beta space, m={repeats:.1f} training trials/condition):")
+            print(f"  {ceiling.summarize()}")
+            for note in ceiling.notes:
+                print(f"  NOTE: {note}")
+
+            if ceiling.n_usable:
+                save_volume_nifti(
+                    ncsnr(ceiling_betas, trial_condition_ids.cpu()),
+                    f"{args.prefix}_ncsnr{_nii_ext}",
+                    vol_shape,
+                    affine,
+                    voxel_mask_np,
+                )
+                print(f"  {args.prefix}_ncsnr{_nii_ext}")
+                save_volume_nifti(
+                    ceiling.ceiling,
+                    f"{args.prefix}_noise_ceiling{_nii_ext}",
+                    vol_shape,
+                    affine,
+                    voxel_mask_np,
+                )
+                print(f"  {args.prefix}_noise_ceiling{_nii_ext}")
+                # Only meaningful against a coefficient-of-determination CV.
+                # Test args.metric, not cv_metric_token: the token collapses
+                # cod/corr/corr2 to "r2", and a squared correlation is not the
+                # variance fraction the ceiling is expressed in.
+                if args.metric == "cod":
+                    save_volume_nifti(
+                        ceiling.explainable_r2(xval_r2.cpu()),
+                        f"{args.prefix}_explainable_r2{_nii_ext}",
+                        vol_shape,
+                        affine,
+                        voxel_mask_np,
+                    )
+                    print(f"  {args.prefix}_explainable_r2{_nii_ext}")
+                else:
+                    print(
+                        f"  (no explainable_r2: -metric {args.metric} is not on the "
+                        "variance-fraction scale the ceiling uses, so the ratio would "
+                        "not mean anything; use -metric cod)"
+                    )
 
     else:
         # ========== EXISTING OUTPUT MODE ==========

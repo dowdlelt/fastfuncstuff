@@ -422,6 +422,66 @@ def ncsnr_noise_ceiling(
     )
 
 
+def zscore_betas_by_run(betas: torch.Tensor, run_ids: torch.Tensor) -> torch.Tensor:
+    """Per-run z-scoring of single-trial betas, matching the CV's own normalisation.
+
+    ``single_trial_cv_helper(zscore_by_run=True)`` -- the GLMsingle default that
+    ``ffs_ridge`` inherits -- scores z-scored betas, which strips the per-run mean
+    and scale before the R2 is computed. A ceiling estimated from the raw betas is
+    then a bound on a *different* quantity: the run-level variance the CV removed
+    is still in the ceiling's denominator, so the ceiling reads too low and the
+    explainable fraction sails past 1.
+
+    Bug of record: ffs_ridge reported a median explainable R2 of 1.26 on synthetic
+    data where the fitted model was the generating model, purely from this
+    mismatch.
+    """
+    if betas.shape[1] != run_ids.numel():
+        raise ValueError("run_ids must have one entry per trial")
+    out = betas.clone()
+    run_ids = run_ids.to(betas.device)
+    for run_id in torch.unique(run_ids).tolist():
+        mask = run_ids == run_id
+        block = out[:, mask]
+        mean = block.mean(dim=1, keepdim=True)
+        std = block.std(dim=1, keepdim=True).clamp_min(1e-10)
+        out[:, mask] = (block - mean) / std
+    return out
+
+
+def mean_train_repeats(
+    condition_ids: torch.Tensor,
+    run_ids: torch.Tensor,
+    cv_splits: list[tuple[list[int], list[int]]],
+) -> float:
+    """Average training trials per predicted condition, across the actual folds.
+
+    This is the ``m`` :func:`ncsnr_noise_ceiling` needs to match the ceiling to
+    what the cross-validation really scores. It is measured from the folds rather
+    than assumed to be ``n_trials_per_condition * (n_runs - 1) / n_runs``, because
+    designs where a condition appears in only some runs -- which is common enough
+    to be the default assumption in this codebase -- make that formula wrong in
+    exactly the voxels the ceiling matters for.
+
+    Conditions with no training trials in a fold are skipped: they contribute a
+    test trial nothing could predict, which is the cross-validation's problem to
+    handle, not the ceiling's.
+    """
+    condition_ids = condition_ids.cpu()
+    run_ids = run_ids.cpu()
+    counts: list[int] = []
+    for train_runs, test_runs in cv_splits:
+        in_train = torch.isin(run_ids, torch.tensor(list(train_runs)))
+        in_test = torch.isin(run_ids, torch.tensor(list(test_runs)))
+        for condition in torch.unique(condition_ids[in_test]).tolist():
+            n_train = int(((condition_ids == condition) & in_train).sum())
+            if n_train > 0:
+                counts.append(n_train)
+    if not counts:
+        return 1.0
+    return float(sum(counts) / len(counts))
+
+
 def ncsnr(betas: torch.Tensor, condition_ids: torch.Tensor, min_repeats: int = 2) -> torch.Tensor:
     """The NSD noise-ceiling SNR itself, saved as a standalone diagnostic map.
 
