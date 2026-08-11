@@ -57,6 +57,7 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        save_volume_nifti,
         spinner,
         summarize_trial_repeats,
     )
@@ -2625,6 +2626,9 @@ def main():
                 task_indices=task_indices_final,
             )
             final_betas = glm_results_final.betas
+            # fit_glm always populates betas; the Optional is for callers that
+            # request a stats-only fit, which this is not.
+            assert final_betas is not None
         else:
             # Per-voxel HRF path: group by HRF index
             print(f"  Fitting {len(unique_hrfs)} HRF groups...")
@@ -2737,6 +2741,33 @@ def main():
                 f"median={final_r2_metric.median():.4f}"
             )
 
+        # 7b. Beta-space noise ceiling. This path scores held-out trial betas,
+        # so the ceiling is the NSD one -- the timeseries ceiling written by the
+        # condition path would be in the wrong units here.
+        beta_ceiling = None
+        if args.noise_ceiling in ("auto", "ncsnr"):
+            from fastfuncstuff.stats.noise_ceiling import beta_space_ceiling
+
+            beta_ceiling = beta_space_ceiling(
+                betas=final_betas.cpu(),
+                condition_ids=trial_cond_ids.cpu(),
+                run_ids=trial_run_ids.cpu(),
+                cv_splits=cv_splits,
+                # final_r2_cod is always a coefficient of determination, whatever
+                # -cv_metric selected for the PC search, so the ratio is on scale.
+                xval_r2=final_r2_cod.cpu(),
+                zscore_by_run=args.zscore_by_run,
+                metric="cod",
+            )
+            print()
+            print(
+                f"Noise ceiling (beta space, m={beta_ceiling.n_train_repeats:.1f} "
+                "training trials/condition):"
+            )
+            print(f"  {beta_ceiling.result.summarize(beta_ceiling.explainable)}")
+            for note in beta_ceiling.result.notes:
+                print(f"  NOTE: {note}")
+
         # 8. Save outputs
         print()
         print("Saving single-trial outputs...")
@@ -2759,6 +2790,24 @@ def main():
             voxel_mask=voxel_mask,
             nifti_header=nifti_header,
         )
+
+        if beta_ceiling is not None and beta_ceiling.result.n_usable:
+            for values, name in (
+                (beta_ceiling.ncsnr_map, "ncsnr"),
+                (beta_ceiling.result.ceiling, "noise_ceiling"),
+                (beta_ceiling.explainable, "explainable_r2"),
+            ):
+                if values is None:
+                    continue
+                path = f"{args.prefix}_{name}.nii.gz"
+                save_volume_nifti(
+                    values,
+                    path,
+                    volume_shape,
+                    affine,
+                    voxel_mask.numpy() if voxel_mask is not None else None,
+                )
+                output_files[name] = path
 
         # Also save PC selection curve
         np.save(f"{args.prefix}_pc_selection_curve.npy", r2_by_pc.cpu().numpy())

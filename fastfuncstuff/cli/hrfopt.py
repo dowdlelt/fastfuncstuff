@@ -41,6 +41,7 @@ try:
     from fastfuncstuff.cli_utils import (
         add_cv_blur_arg,
         add_load_threads_arg,
+        add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
         add_verbose_arg,
@@ -56,6 +57,7 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        save_volume_nifti,
         spinner,
         summarize_trial_repeats,
     )
@@ -355,6 +357,12 @@ Notes:
         action="store_true",
         help="Deprecated alias for -single_trials (emitting per-trial betas and "
         "selecting the HRF in single-trial space are now separate: see -cv_design).",
+    )
+    add_noise_ceiling_args(
+        cv_opts,
+        stage_note="Available on the beta-space CV path only, and built from the "
+        "per-voxel best-HRF betas so it bounds the selected model rather than the "
+        "canonical baseline.",
     )
     cv_opts.add_argument(
         "-save_canonical_betas",
@@ -858,6 +866,9 @@ def main():
     # selection) need the same block-diagonal nuisance.
     nuisance_per_run = None
     nuisance_design = None
+    # Only the beta-space CV branch can produce a ceiling; bound here so the
+    # save block below can test it without caring which branch ran.
+    beta_ceiling = None
     if cv_design == "single" or args.single_trials:
         run_lengths = compute_run_lengths(run_starts, n_timepoints)
 
@@ -1083,6 +1094,32 @@ def main():
         )
         hrfopt_xval_r2 = hrfopt_cv["r2"]
         assert isinstance(hrfopt_xval_r2, torch.Tensor)  # "r2" key is always a tensor
+
+        # Ceiling on the CV R² just computed. Built from the per-voxel best-HRF
+        # betas, matching hrfopt_xval_r2 rather than the canonical baseline --
+        # the selected model is the one the explainable fraction is about.
+        # compute_xval_r2_single_trials does not z-score, so neither does this.
+        beta_ceiling = None
+        if args.noise_ceiling in ("auto", "ncsnr"):
+            from fastfuncstuff.stats.noise_ceiling import beta_space_ceiling
+
+            beta_ceiling = beta_space_ceiling(
+                betas=best_betas.cpu(),
+                condition_ids=cond_ids.cpu(),
+                run_ids=run_ids.cpu(),
+                cv_splits=cv_splits,
+                xval_r2=hrfopt_xval_r2.cpu(),
+                zscore_by_run=False,
+                metric="cod",
+            )
+            print()
+            print(
+                f"  Noise ceiling (beta space, m={beta_ceiling.n_train_repeats:.1f} "
+                "training trials/condition):"
+            )
+            print(f"    {beta_ceiling.result.summarize(beta_ceiling.explainable)}")
+            for note in beta_ceiling.result.notes:
+                print(f"    NOTE: {note}")
 
         del canonical_betas, best_betas  # Free ~1.4 GB
 
@@ -1315,6 +1352,27 @@ def main():
         save_plots=args.save_plots,
         nii_ext=_nii_ext,
     )
+
+    if beta_ceiling is not None and beta_ceiling.result.n_usable:
+        for values, name in (
+            (beta_ceiling.ncsnr_map, "ncsnr"),
+            (beta_ceiling.result.ceiling, "noise_ceiling"),
+            (beta_ceiling.explainable, "explainable_r2"),
+        ):
+            if values is None:
+                continue
+            path = f"{args.prefix}_{name}{_nii_ext}"
+            save_volume_nifti(
+                values,
+                path,
+                volume_shape,
+                affine,
+                voxel_mask.numpy() if voxel_mask is not None else None,
+            )
+            output_files[name] = path
+            print(f"  {path}")
+    if beta_ceiling is not None and beta_ceiling.explainable_withheld_because:
+        print(f"  (no explainable_r2: {beta_ceiling.explainable_withheld_because})")
 
     # Restore final_results for custom saving
     if args.single_trials and final_results_temp is not None:

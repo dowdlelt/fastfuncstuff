@@ -1068,73 +1068,46 @@ def main():
         print(f"  {args.prefix}_{cv_metric_token}_by_frac{_nii_ext}")
 
         if args.noise_ceiling in ("auto", "ncsnr"):
-            from fastfuncstuff.stats.noise_ceiling import (
-                mean_train_repeats,
-                ncsnr,
-                ncsnr_noise_ceiling,
-                zscore_betas_by_run,
-            )
+            from fastfuncstuff.stats.noise_ceiling import beta_space_ceiling
 
-            # The ceiling must see the betas the CV actually scored. With
-            # -zscore_by_run (the default) the CV strips each run's mean and
-            # scale first, so a ceiling from the raw betas bounds a different
-            # quantity and the explainable fraction runs past 1.
-            ceiling_betas = final_betas.cpu()
-            if args.zscore_by_run and args.metric != "sse":
-                ceiling_betas = zscore_betas_by_run(ceiling_betas, trial_run_ids.cpu())
-
-            # The CV predicts each held-out trial from an average of m training
-            # trials, so the divisor has to account for that predictor's own
-            # noise; the published NSD form assumes a noiseless one and would
-            # read as though the model fell short of a ceiling it could not
-            # reach. Both are saved -- ncsnr for comparison with NSD maps, the
-            # fold-matched ceiling for the ratio.
-            repeats = mean_train_repeats(trial_condition_ids, trial_run_ids, cv_splits)
-            ceiling = ncsnr_noise_ceiling(
-                ceiling_betas, trial_condition_ids.cpu(), n_train_repeats=repeats
+            ceiling = beta_space_ceiling(
+                betas=final_betas.cpu(),
+                condition_ids=trial_condition_ids.cpu(),
+                run_ids=trial_run_ids.cpu(),
+                cv_splits=cv_splits,
+                xval_r2=xval_r2.cpu(),
+                # Match the CV's own normalisation, or run-level variance sits
+                # in the ceiling's denominator but not the R2's.
+                zscore_by_run=args.zscore_by_run and args.metric != "sse",
+                metric=args.metric,
             )
             print()
-            print(f"Noise ceiling (beta space, m={repeats:.1f} training trials/condition):")
-            print(f"  {ceiling.summarize()}")
-            for note in ceiling.notes:
+            print(
+                f"Noise ceiling (beta space, m={ceiling.n_train_repeats:.1f} "
+                "training trials/condition):"
+            )
+            print(f"  {ceiling.result.summarize(ceiling.explainable)}")
+            for note in ceiling.result.notes:
                 print(f"  NOTE: {note}")
 
-            if ceiling.n_usable:
-                save_volume_nifti(
-                    ncsnr(ceiling_betas, trial_condition_ids.cpu()),
-                    f"{args.prefix}_ncsnr{_nii_ext}",
-                    vol_shape,
-                    affine,
-                    voxel_mask_np,
-                )
-                print(f"  {args.prefix}_ncsnr{_nii_ext}")
-                save_volume_nifti(
-                    ceiling.ceiling,
-                    f"{args.prefix}_noise_ceiling{_nii_ext}",
-                    vol_shape,
-                    affine,
-                    voxel_mask_np,
-                )
-                print(f"  {args.prefix}_noise_ceiling{_nii_ext}")
-                # Only meaningful against a coefficient-of-determination CV.
-                # Test args.metric, not cv_metric_token: the token collapses
-                # cod/corr/corr2 to "r2", and a squared correlation is not the
-                # variance fraction the ceiling is expressed in.
-                if args.metric == "cod":
+            if ceiling.result.n_usable:
+                for values, name in (
+                    (ceiling.ncsnr_map, "ncsnr"),
+                    (ceiling.result.ceiling, "noise_ceiling"),
+                    (ceiling.explainable, "explainable_r2"),
+                ):
+                    if values is None:
+                        continue
                     save_volume_nifti(
-                        ceiling.explainable_r2(xval_r2.cpu()),
-                        f"{args.prefix}_explainable_r2{_nii_ext}",
+                        values,
+                        f"{args.prefix}_{name}{_nii_ext}",
                         vol_shape,
                         affine,
                         voxel_mask_np,
                     )
-                    print(f"  {args.prefix}_explainable_r2{_nii_ext}")
-                else:
-                    print(
-                        f"  (no explainable_r2: -metric {args.metric} is not on the "
-                        "variance-fraction scale the ceiling uses, so the ratio would "
-                        "not mean anything; use -metric cod)"
-                    )
+                    print(f"  {args.prefix}_{name}{_nii_ext}")
+                if ceiling.explainable_withheld_because:
+                    print(f"  (no explainable_r2: {ceiling.explainable_withheld_because})")
 
     else:
         # ========== EXISTING OUTPUT MODE ==========

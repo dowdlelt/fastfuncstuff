@@ -496,6 +496,76 @@ def ncsnr(betas: torch.Tensor, condition_ids: torch.Tensor, min_repeats: int = 2
     return torch.sqrt((ratio / (1.0 - ratio).clamp_min(1e-30)).clamp_min(0.0)).to(betas.dtype)
 
 
+@dataclass
+class BetaSpaceCeiling:
+    """Everything a CLI needs to write a beta-space ceiling, computed once."""
+
+    result: CeilingResult
+    ncsnr_map: torch.Tensor
+    explainable: torch.Tensor | None
+    n_train_repeats: float
+    explainable_withheld_because: str | None = None
+
+
+def beta_space_ceiling(
+    betas: torch.Tensor,
+    condition_ids: torch.Tensor,
+    run_ids: torch.Tensor,
+    cv_splits: list[tuple[list[int], list[int]]],
+    xval_r2: torch.Tensor | None = None,
+    zscore_by_run: bool = False,
+    metric: str = "cod",
+    min_repeats: int = 2,
+) -> BetaSpaceCeiling:
+    """The whole beta-space ceiling recipe, so four CLIs cannot each get it wrong.
+
+    ``ffs_ridge``, ``ffs_denoise``, ``ffs_hrfopt`` and ``ffs_reml -beta_cv`` all
+    score held-out trial betas against same-condition training betas, and all
+    four need the same three corrections. Duplicating them was how the first
+    version shipped an explainable R2 of 1.26:
+
+    1. **Normalise as the CV did.** ``zscore_by_run`` must match the flag the
+       cross-validation ran under, or run-level variance sits in the ceiling's
+       denominator but not the R2's.
+    2. **Match the divisor to the fold.** The predictor is an average of ``m``
+       training trials with noise of its own, and ``m`` is measured from the
+       folds rather than assumed.
+    3. **Refuse the ratio off-scale.** Only a coefficient of determination lives
+       on the ceiling's variance-fraction scale; ``sse``, ``corr`` and ``corr2``
+       do not, and dividing them would produce a confident-looking nonsense.
+    """
+    if zscore_by_run:
+        betas = zscore_betas_by_run(betas, run_ids)
+
+    repeats = mean_train_repeats(condition_ids, run_ids, cv_splits)
+    result = ncsnr_noise_ceiling(
+        betas, condition_ids, n_train_repeats=repeats, min_repeats=min_repeats
+    )
+    ncsnr_map = ncsnr(betas, condition_ids, min_repeats=min_repeats)
+
+    explainable: torch.Tensor | None = None
+    withheld: str | None = None
+    if xval_r2 is None:
+        withheld = "no cross-validated R2 was computed"
+    elif metric != "cod":
+        withheld = (
+            f"-metric {metric} is not on the variance-fraction scale the ceiling "
+            "uses, so the ratio would not mean anything; use -metric cod"
+        )
+    elif result.n_usable == 0:
+        withheld = "the ceiling was not estimable"
+    else:
+        explainable = result.explainable_r2(xval_r2)
+
+    return BetaSpaceCeiling(
+        result=result,
+        ncsnr_map=ncsnr_map,
+        explainable=explainable,
+        n_train_repeats=repeats,
+        explainable_withheld_because=withheld,
+    )
+
+
 def df_corrected_ceiling(
     ss_model: torch.Tensor,
     ss_total: torch.Tensor,
