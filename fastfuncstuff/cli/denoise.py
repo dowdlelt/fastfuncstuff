@@ -44,6 +44,7 @@ try:
         LoadResult,
         add_cv_blur_arg,
         add_load_threads_arg,
+        add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
         add_verbose_arg,
@@ -141,6 +142,18 @@ Outputs:
         {prefix}_noise_pool_mask.nii.gz       - Noise pool voxels (low task R²)
         {prefix}_criteria_mask.nii.gz         - Criteria voxels (high task R²)
         {prefix}_initial_r2.nii.gz            - Initial xval R² (task-only)
+        {prefix}_noise_ceiling.nii.gz         - [-noise_ceiling] largest xval R² this
+                                                DESIGN could reach at the selected PC
+                                                count -- the reproducible fraction of
+                                                held-out variance. NaN where not
+                                                estimable (too few runs to split).
+        {prefix}_explainable_r2.nii.gz        - [-noise_ceiling] xval_r2 / noise_ceiling:
+                                                the fraction of the ACHIEVABLE variance
+                                                captured. 1.0 = everything that
+                                                reproduces at all. Slightly above 1 is
+                                                noise in the ceiling, not a better model.
+                                                NaN where the ceiling is under 0.01 and
+                                                the fraction is undefined.
         {prefix}_xval_r2_optimal.nii.gz       - Xval R² at optimal PC count (criteria voxels)
         {prefix}_xval_r2_optimal_full.nii.gz  - Xval R² at optimal PC count (all voxels)
         {prefix}_xval_r2_optimal_per_fold.nii.gz - Per-fold xval R² at optimal PCs (4D)
@@ -421,6 +434,11 @@ Notes:
         help="CV metric: cod (coefficient of determination), "
         "corr (Pearson correlation), corr2 (correlation squared), "
         "sse (sum of squared errors, GLMsingle-compatible). Default: cod.",
+    )
+    add_noise_ceiling_args(
+        denoise_opts,
+        stage_note="The ceiling is built at the SELECTED PC count with those PCs "
+        "in the nuisance, so it bounds the denoised R2 that is actually reported.",
     )
     add_single_trial_args(
         denoise_opts,
@@ -856,6 +874,23 @@ def save_denoising_results(
             xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine, header=nifti_header
         )
         output_files["xval_r2_optimal_full"] = xval_opt_full_path
+
+    # 3c-ii. Noise ceiling and the explainable-R2 map it makes possible.
+    # NaN, not 0, where the ceiling was not estimable: "no ceiling here" and
+    # "nothing reproduces here" are different findings and must stay distinct.
+    if results.noise_ceiling is not None:
+        ceiling_vol = to_volume(results.noise_ceiling.cpu().numpy().astype(np.float32))
+        ceiling_path = f"{output_prefix}_noise_ceiling{nii_ext}"
+        save_nifti(ceiling_vol, output_path=ceiling_path, affine=affine, header=nifti_header)
+        output_files["noise_ceiling"] = ceiling_path
+
+    if results.explainable_r2 is not None:
+        explainable_vol = to_volume(results.explainable_r2.cpu().numpy().astype(np.float32))
+        explainable_path = f"{output_prefix}_explainable_r2{nii_ext}"
+        save_nifti(
+            explainable_vol, output_path=explainable_path, affine=affine, header=nifti_header
+        )
+        output_files["explainable_r2"] = explainable_path
 
     # 3d. Per-fold xval R² at optimal PCs (4D)
     if results.xval_r2_optimal_per_fold is not None:
@@ -3057,6 +3092,14 @@ def main():
         # fit_denoising_model handles the per-HRF logic internally
         print()
         print(f"Fitting denoising model with per-voxel HRFs ({len(designs_by_hrf)} unique HRFs)...")
+        if args.noise_ceiling != "off":
+            # Each HRF group needs its own ceiling, since the design the two
+            # training halves are fitted with differs per group. Skipping loudly
+            # beats writing a ceiling built with the wrong design.
+            print(
+                "  NOTE: -noise_ceiling is not yet supported with per-voxel HRFs; "
+                "no ceiling will be written."
+            )
 
         results = fit_denoising_model(
             data=cv_data,
@@ -3106,6 +3149,7 @@ def main():
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
+            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro"),
             nuisance=nuisance_per_run,
             polort=args.polort,
             min_noise_voxels=args.min_noise_voxels,

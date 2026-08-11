@@ -60,7 +60,7 @@ GLMsingle (Type-C denoising):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 import numpy as np
@@ -186,6 +186,9 @@ class DenoiseResults:
     optimal_r2: float
     improvement: float
     metadata: dict
+    noise_ceiling: torch.Tensor | None = None  # Per-voxel R2 ceiling at optimal PCs
+    explainable_r2: torch.Tensor | None = None  # xval_r2_optimal / noise_ceiling
+    noise_ceiling_notes: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -2020,6 +2023,50 @@ def compute_xval_r2_optimal_full(
     return r2_all, r2_per_fold_all
 
 
+def _nuisance_with_pcs(
+    nuisance: torch.Tensor | list[torch.Tensor] | None,
+    noise_pcs: list[torch.Tensor],
+    run_starts: list[int],
+    n_pcs: int,
+    n_timepoints: int,
+) -> list[torch.Tensor]:
+    """Per-run nuisance with the selected noise PCs appended.
+
+    The cross-validation adds the PCs as zero-padded block-diagonal columns in
+    the fit design; appending them to each run's nuisance and projecting per run
+    removes exactly the same subspace (Frisch-Waugh-Lovell, and the PC columns
+    are per-run to begin with). This spelling is what
+    :func:`project_out_nuisance_per_run` wants, so the ceiling sees the same
+    denoised data the R2 was scored on.
+    """
+    run_ends = [*run_starts[1:], n_timepoints]
+
+    base: list[torch.Tensor | None]
+    if nuisance is None:
+        base = [None] * len(run_starts)
+    elif isinstance(nuisance, list):
+        base = list(nuisance)
+    else:
+        base = [nuisance[start:end, :] for start, end in zip(run_starts, run_ends, strict=True)]
+
+    combined: list[torch.Tensor] = []
+    for run_idx, (start, end) in enumerate(zip(run_starts, run_ends, strict=True)):
+        blocks: list[torch.Tensor] = []
+        base_run = base[run_idx]
+        if base_run is not None:
+            blocks.append(base_run)
+        if n_pcs > 0 and run_idx < len(noise_pcs):
+            pcs_run = noise_pcs[run_idx]
+            blocks.append(pcs_run[:, : min(n_pcs, pcs_run.shape[1])])
+        if not blocks:
+            # No nuisance at all: an empty column block keeps the per-run
+            # projection a well-defined no-op rather than a special case.
+            blocks.append(torch.zeros((end - start, 0), device=noise_pcs[0].device))
+        device = blocks[0].device
+        combined.append(torch.cat([block.to(device) for block in blocks], dim=1))
+    return combined
+
+
 def fit_denoising_model(
     data: torch.Tensor,
     design_matrix: torch.Tensor | None = None,
@@ -2058,6 +2105,7 @@ def fit_denoising_model(
     verbose: bool = False,
     designs_by_hrf: dict | None = None,
     hrf_indices: torch.Tensor | None = None,
+    compute_noise_ceiling: bool = False,
 ) -> DenoiseResults:
     """
     Fit cross-validated denoising model
@@ -2847,6 +2895,57 @@ def fit_denoising_model(
     xval_r2_optimal_full = xval_r2_optimal
     xval_r2_optimal_per_fold: np.ndarray | None = None  # Not meaningful with concatenated approach
 
+    # Ceiling for the R² above. It has to be built at the SELECTED PC count and
+    # with those PCs in the nuisance: the R² denominator is the held-out
+    # variance that survives nuisance projection, so a ceiling computed against
+    # undenoised data would be a bound on a different quantity.
+    noise_ceiling: torch.Tensor | None = None
+    explainable_r2: torch.Tensor | None = None
+    noise_ceiling_notes: list[str] = []
+    if compute_noise_ceiling and design_matrix is not None:
+        from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+        if verbose:
+            print(f"\nNoise ceiling at {optimal_n_components} PCs:")
+
+        ceiling_nuisance = _nuisance_with_pcs(
+            nuisance, noise_pcs, run_starts, optimal_n_components, data.shape[1]
+        )
+        projected_data, projected_design = project_out_nuisance_per_run(
+            data=data,
+            design=design_matrix,
+            nuisance_per_run=ceiling_nuisance,
+            run_starts=run_starts,
+            device=data.device,
+        )
+        ceiling_result = loro_two_half_ceiling(
+            data=projected_data,
+            design_matrix=projected_design,
+            run_starts=run_starts,
+            stim_indices=list(range(projected_design.shape[1])),
+            nuisance_indices=[],  # already projected, per run
+            cv_splits=generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms),
+            device=device,
+            verbose=False,
+        )
+        del projected_data, projected_design
+        if device is not None and device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        noise_ceiling = ceiling_result.ceiling.cpu()
+        noise_ceiling_notes = ceiling_result.notes
+        if xval_r2_optimal_full is not None and ceiling_result.n_usable > 0:
+            explainable_r2 = ceiling_result.explainable_r2(xval_r2_optimal_full.cpu())
+
+        if verbose:
+            if ceiling_result.n_usable == 0:
+                print("  Not estimable: no fold had enough training runs to split in two.")
+            else:
+                print(f"  Folds used: {ceiling_result.n_usable}")
+                print(f"  {ceiling_result.summarize(explainable_r2)}")
+            for note in noise_ceiling_notes:
+                print(f"  NOTE: {note}")
+
     if verbose:
         print(f"\nFull-brain cross-validated R² at optimal PC count ({optimal_n_components} PCs):")
         valid_r2 = optimal_r2_per_voxel[~np.isnan(optimal_r2_per_voxel)]
@@ -2942,6 +3041,9 @@ def fit_denoising_model(
         xval_r2_optimal=xval_r2_optimal,
         xval_r2_optimal_full=xval_r2_optimal_full,
         xval_r2_optimal_per_fold=xval_r2_optimal_per_fold,
+        noise_ceiling=noise_ceiling,
+        explainable_r2=explainable_r2,
+        noise_ceiling_notes=noise_ceiling_notes,
         pcselection_mask=pcselection_mask,
         noise_pool_mask=noise_pool_mask,
         criteria_mask=criteria_mask,

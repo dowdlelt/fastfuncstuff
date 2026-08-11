@@ -2727,6 +2727,43 @@ def add_single_trial_args(group, *, emit_help: str) -> None:
     )
 
 
+def add_noise_ceiling_args(group, *, stage_note: str = "") -> None:
+    """Add ``-noise_ceiling``: the R2 ceiling and the explainable-R2 map.
+
+    Deliberately one flag rather than a family. The estimator is not really the
+    user's choice -- it is dictated by which space the cross-validation scored
+    in, and picking the wrong one produces a ratio of two incommensurate
+    numbers -- so ``auto`` follows ``-cv_design`` and the explicit values exist
+    only to force a cross-check.
+    """
+    group.add_argument(
+        "-noise_ceiling",
+        "-noise-ceiling",
+        dest="noise_ceiling",
+        nargs="?",
+        const="auto",
+        default="off",
+        choices=["off", "auto", "loro", "df", "ncsnr"],
+        help="Estimate the per-voxel ceiling on the cross-validated R2 and save "
+        "it alongside an explainable-R2 map (xval_r2 / ceiling -- the fraction "
+        "of the achievable variance the model captured; NaN where the ceiling is "
+        "too near zero for the fraction to mean anything). Note this bounds what "
+        "THIS design can predict, not what any model could: a design missing a "
+        "real condition gets a low ceiling and a flattering explainable R2. "
+        "'auto' (the value used "
+        "when the flag is given bare) follows -cv_design: 'ncsnr' for "
+        "beta-space CV, 'loro' for condition-level timeseries CV, falling back "
+        "to 'df' when there are too few runs to split. 'loro' splits each "
+        "fold's training runs in two and uses the covariance of their two "
+        "predictions of the held-out run, so the ceiling is in the same units, "
+        "on the same timepoints, as the R2 it bounds; it wants 4+ runs. 'df' "
+        "corrects the in-sample fit for degrees of freedom and needs no "
+        "repeats, but bounds THIS design rather than any design. 'ncsnr' is the "
+        "NSD/GLMsingle beta-space ceiling and needs conditions that repeat "
+        "across runs, not repeated runs. " + stage_note,
+    )
+
+
 def resolve_cv_design(
     requested: str,
     single_trials: bool,

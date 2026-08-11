@@ -220,11 +220,38 @@ class TestDfCorrectedCeiling:
 
 
 class TestExplainableR2:
+    def _result(self, ceiling: torch.Tensor):
+        out = ncsnr_noise_ceiling(
+            torch.randn(ceiling.numel(), 40),
+            torch.arange(20).repeat_interleave(2),
+            n_train_repeats=None,
+        )
+        out.ceiling = ceiling
+        return out
+
     def test_ratio_is_not_clamped_above_one(self):
         """An explainable R2 above 1 is evidence about the ceiling, so keep it."""
-        result = ncsnr_noise_ceiling(
-            torch.randn(10, 40), torch.arange(20).repeat_interleave(2), n_train_repeats=None
-        )
-        result.ceiling = torch.full((10,), 0.5)
+        result = self._result(torch.full((10,), 0.5))
         explained = result.explainable_r2(torch.full((10,), 0.6))
         assert explained.median().item() == pytest.approx(1.2)
+
+    def test_undefined_where_nothing_reproduces(self):
+        """A near-zero ceiling has no fraction; dividing anyway gives nonsense.
+
+        Regression: dividing by a 1e-6 floor filled two thirds of a test brain
+        with values around -2000, which destroys the map's scaling and any
+        summary taken over it.
+        """
+        result = self._result(torch.tensor([0.0, 0.005, 0.01, 0.4]))
+        explained = result.explainable_r2(torch.tensor([-0.004, -0.004, 0.005, 0.2]))
+        assert torch.isnan(explained[:2]).all()
+        assert torch.isfinite(explained[2:]).all()
+        assert explained[3].item() == pytest.approx(0.5)
+
+    def test_summary_ignores_voxels_with_no_ceiling(self):
+        """Whole-brain medians are dominated by voxels that never had signal."""
+        ceiling = torch.cat([torch.zeros(100), torch.full((10,), 0.4)])
+        result = self._result(ceiling)
+        summary = result.summarize(result.explainable_r2(torch.full((110,), 0.2)))
+        assert "10 voxels" in summary
+        assert "0.4000" in summary

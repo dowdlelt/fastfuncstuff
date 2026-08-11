@@ -62,16 +62,43 @@ class CeilingResult:
     notes: list[str] = field(default_factory=list)
     """Human-readable caveats worth printing: thin splits, dropped conditions."""
 
-    def explainable_r2(self, xval_r2: torch.Tensor, floor: float = 1e-6) -> torch.Tensor:
+    def explainable_r2(self, xval_r2: torch.Tensor, min_ceiling: float = 0.01) -> torch.Tensor:
         """``xval_r2 / ceiling`` -- the fraction of achievable variance captured.
 
         Values slightly above 1 are noise in the ceiling estimate, not a model
         that beat the ceiling, and are deliberately not clamped: a map that runs
         well above 1 is evidence the ceiling is underestimated, and hiding that
         would cost the diagnostic.
+
+        Voxels whose ceiling falls below ``min_ceiling`` come back NaN rather
+        than as a ratio. Where nothing reproduces there is no achievable
+        variance to take a fraction *of*, so the quantity is undefined -- and
+        dividing by a near-zero ceiling anyway would fill most of a brain with
+        values in the hundreds, wrecking the map's scaling and any mean taken
+        over it. NaN keeps "undefined here" visible instead of laundering it
+        into a number.
         """
         ceiling = self.ceiling.to(xval_r2.device)
-        return xval_r2 / ceiling.clamp_min(floor)
+        defined = ceiling >= min_ceiling
+        return torch.where(defined, xval_r2 / ceiling.clamp_min(min_ceiling), torch.nan)
+
+    def summarize(self, explainable: torch.Tensor | None = None) -> str:
+        """One-line summary over the voxels where the ceiling is actually defined.
+
+        Medians over the whole brain are dominated by voxels with no signal, and
+        so report a near-zero ceiling and a nonsense explainable fraction no
+        matter how well the model did where it mattered.
+        """
+        finite = self.ceiling[torch.isfinite(self.ceiling)]
+        usable = finite[finite >= 0.01]
+        if usable.numel() == 0:
+            return "no voxel had an estimable ceiling above 0.01"
+        parts = [f"{usable.numel():,} voxels with ceiling >= 0.01, median {usable.median():.4f}"]
+        if explainable is not None:
+            valid = explainable[torch.isfinite(explainable)]
+            if valid.numel():
+                parts.append(f"median explainable R2 {valid.median():.4f}")
+        return "; ".join(parts)
 
 
 def _centered_cov_and_ss(
