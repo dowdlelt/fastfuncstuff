@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -2724,6 +2724,56 @@ def add_single_trial_args(group, *, emit_help: str) -> None:
         "set and the events support it, otherwise 'condition'. Selection and "
         "output are independent: -single_trials -cv_design condition learns the "
         "parameter from condition structure and still writes per-trial betas.",
+    )
+
+
+def add_cv_strategy_arg(group, *, dest: str = "cv_strategy", default: str = "loro") -> None:
+    """The one spelling of ``-cv_strategy``, so four tools cannot drift apart.
+
+    Every tool accepted this flag already but with slightly different help and
+    only some with the dashed alias, which is precisely the sort of drift that
+    makes the CV surface feel like five tools instead of one.
+    """
+    group.add_argument(
+        "-cv_strategy",
+        "-cv-strategy",
+        dest=dest,
+        default=default,
+        help="Cross-validation strategy: 'loro' or '1' for leave-one-run-out "
+        "(default), '0.5' for split-halves, any float in (0,1) for that training "
+        "fraction, any int > 1 for leave-N-out.",
+    )
+
+
+def add_cv_metric_arg(
+    group,
+    *,
+    dest: str = "cv_metric",
+    default: str = "cod",
+    choices: Sequence[str] = ("cod", "corr", "corr2", "sse"),
+) -> None:
+    """``-cv_metric`` with ``-metric`` kept as an alias.
+
+    ffs_denoise called it ``-cv_metric`` while ffs_ridge and ffs_hrfopt called
+    it ``-metric``. Both spellings now work everywhere; ``-cv_metric`` is the
+    one documented, since a bare ``-metric`` reads like it might control the
+    reported statistic rather than the cross-validation's scoring rule.
+
+    ``dest`` stays whatever each tool already used: renaming it would churn
+    every internal reference for no user-visible gain.
+    """
+    group.add_argument(
+        "-cv_metric",
+        "-cv-metric",
+        "-metric",
+        dest=dest,
+        choices=list(choices),
+        default=default,
+        help="Scoring rule for the cross-validated search: 'cod' (coefficient of "
+        "determination), 'corr' (Pearson r), 'corr2' (r squared), 'sse' (sum of "
+        "squared errors, GLMsingle-compatible, lower is better). Only 'cod' is on "
+        "the variance-fraction scale a noise ceiling uses, so -noise_ceiling "
+        "writes an explainable-R2 map only under 'cod'.",
     )
 
 

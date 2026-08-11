@@ -37,6 +37,7 @@ except ImportError:
 try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_cv_strategy_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_verbose_arg,
@@ -548,14 +549,18 @@ Examples:
         "ffs_denoise and ffs_hrfopt. Written to {prefix}_xval_r2.nii.gz.",
     )
     stats_opts.add_argument(
-        "-cv_strategy",
-        "-cv-strategy",
-        dest="cv_strategy",
-        default="loro",
-        help="Cross-validation strategy for -xval_r2: 'loro' or '1' for "
-        "leave-one-run-out (default), '0.5' for split-halves, any float in (0,1) "
-        "for that training fraction, any int > 1 for leave-N-out.",
+        "-cv_design",
+        "-cv-design",
+        dest="cv_design",
+        choices=["condition", "single"],
+        default=None,
+        help="Which design the cross-validation is scored against, spelled the "
+        "same way as in ffs_denoise / ffs_hrfopt. 'condition' is equivalent to "
+        "-xval_r2 (held-out run timecourses); 'single' is equivalent to -beta_cv "
+        "(held-out trial betas). Given either, the corresponding flag is set for "
+        "you; -beta_cv and -xval_r2 remain accepted.",
     )
+    add_cv_strategy_arg(stats_opts)
     add_noise_ceiling_args(
         stats_opts,
         stage_note="Requires -xval_r2, whose folds it shares so the ceiling and "
@@ -1388,6 +1393,13 @@ def main():
         args = parser.parse_args()
     finally:
         sys.argv = _orig_argv
+
+    # -cv_design is the harmonized spelling; translate it into the two flags
+    # the rest of this file already reads, so both vocabularies stay valid.
+    if args.cv_design == "condition":
+        args.xval_r2 = True
+    elif args.cv_design == "single":
+        args.beta_cv = True
 
     # Show help if no arguments provided (argparse handles -h/-help itself)
     if not filtered_argv:

@@ -43,6 +43,8 @@ try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
         add_cv_blur_arg,
+        add_cv_metric_arg,
+        add_cv_strategy_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -411,31 +413,14 @@ Notes:
         default=1e-6,
         help="FastICA convergence tolerance per restart (default: 1e-6)",
     )
-    denoise_opts.add_argument(
-        "-cv_strategy",
-        default="loro",
-        help=(
-            "Cross-validation strategy. Options: "
-            "'loro' or '1' for leave-one-run-out (default), "
-            "'0.5' for split-halves, "
-            "any float (0-1) for that train fraction, "
-            "any int > 1 for leave-N-out"
-        ),
-    )
+    add_cv_strategy_arg(denoise_opts)
     denoise_opts.add_argument(
         "-n_perms",
         type=int,
         default=100,
         help="Max number of CV permutations for random splits (default: 100)",
     )
-    denoise_opts.add_argument(
-        "-cv_metric",
-        choices=["cod", "corr", "corr2", "sse"],
-        default="cod",
-        help="CV metric: cod (coefficient of determination), "
-        "corr (Pearson correlation), corr2 (correlation squared), "
-        "sse (sum of squared errors, GLMsingle-compatible). Default: cod.",
-    )
+    add_cv_metric_arg(denoise_opts)
     add_noise_ceiling_args(
         denoise_opts,
         stage_note="The ceiling is built at the SELECTED PC count with those PCs "

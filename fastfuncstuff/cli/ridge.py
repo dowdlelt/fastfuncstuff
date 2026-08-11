@@ -48,6 +48,8 @@ import torch
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_cv_metric_arg,
+        add_cv_strategy_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_verbose_arg,
@@ -56,6 +58,7 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        parse_cv_strategy,
         parse_prefix,
         preflight_check,
         save_4d_nifti,
@@ -227,13 +230,7 @@ Notes:
         help="Ridge fractions to test: START END STEP (default: 0.05 1.0 0.05). "
         "Fraction = proportion of OLS coefficient norm to retain (1=no regularization, 0=maximum).",
     )
-    ridge_opts.add_argument(
-        "-cv_strategy",
-        type=str,
-        default="loro",
-        choices=["loro", "split_half"],
-        help="Cross-validation strategy for fraction selection (default: loro)",
-    )
+    add_cv_strategy_arg(ridge_opts)
     ridge_opts.add_argument(
         "-autoscale",
         action="store_true",
@@ -249,21 +246,14 @@ Notes:
     )
     ridge_opts.add_argument(
         "-single_trials",
+        "-single-trials",
         action="store_true",
         help="Use beta-space cross-validation (GLMsingle-style). "
         "Fits single-trial model once on all data, evaluates R² on "
         "condition-averaged vs individual trial betas across folds. "
         "Replaces timeseries CV with beta-space CV.",
     )
-    ridge_opts.add_argument(
-        "-metric",
-        type=str,
-        default="sse",
-        choices=["sse", "cod", "corr", "corr2"],
-        help="CV metric for fraction selection (default: sse). "
-        "'sse' = sum of squared errors (GLMsingle-compatible, lower=better). "
-        "'cod' = coefficient of determination (higher=better).",
-    )
+    add_cv_metric_arg(ridge_opts, dest="metric", default="sse")
     ridge_opts.add_argument(
         "-zscore_by_run",
         action="store_true",
@@ -717,7 +707,9 @@ def main():
         )
 
         # Generate CV splits
-        cv_splits = generate_cv_splits(n_runs, strategy=1)  # strategy=1 is LORO
+        # -cv_strategy was previously parsed and then ignored here, so every
+        # run was LORO whatever the user asked for.
+        cv_splits = generate_cv_splits(n_runs, strategy=parse_cv_strategy(args.cv_strategy))
         cv_metric_token = "sse" if args.metric == "sse" else "r2"
         cv_metric_label = "SSE (lower=better)" if args.metric == "sse" else "R²"
 

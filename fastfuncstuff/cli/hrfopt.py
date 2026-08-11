@@ -40,6 +40,8 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         add_cv_blur_arg,
+        add_cv_metric_arg,
+        add_cv_strategy_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -52,6 +54,7 @@ try:
         compute_run_lengths,
         get_average_run_duration,
         load_and_preprocess_runs,
+        parse_cv_strategy,
         parse_device_arg,
         parse_input_files,
         parse_prefix,
@@ -306,17 +309,7 @@ Notes:
 
     # Cross-validation options
     cv_opts = parser.add_argument_group("Cross-Validation Options")
-    cv_opts.add_argument(
-        "-cv_strategy",
-        default="loro",
-        help=(
-            "Cross-validation strategy. Options: "
-            "'loro' or '1' for leave-one-run-out (default), "
-            "'0.5' for split-halves, "
-            "any float (0-1) for that train fraction, "
-            "any int > 1 for leave-N-out"
-        ),
-    )
+    add_cv_strategy_arg(cv_opts)
     cv_opts.add_argument(
         "-select",
         choices=["xval", "full"],
@@ -334,13 +327,7 @@ Notes:
         default=100,
         help="Max number of CV permutations for random splits (default: 100)",
     )
-    cv_opts.add_argument(
-        "-metric",
-        choices=["cod", "corr", "corr2", "sse"],
-        default="cod",
-        help="CV metric: 'cod', 'corr', 'corr2', "
-        "'sse' (sum of squared errors, GLMsingle-compatible). Default: cod.",
-    )
+    add_cv_metric_arg(cv_opts, dest="metric")
     add_single_trial_args(
         cv_opts,
         emit_help="Refit with the optimal HRF per voxel and save one beta per "
@@ -513,31 +500,6 @@ Notes:
     )
 
     return parser
-
-
-def parse_cv_strategy(cv_str: str) -> int | float:
-    """Parse CV strategy string into int or float."""
-    cv_str = cv_str.lower().strip()
-
-    if cv_str in ["loro", "loo"]:
-        return 1  # Leave-one-run-out
-
-    try:
-        # Try parsing as float first
-        val = float(cv_str)
-        if val == int(val) and val > 1:
-            return int(val)  # Leave-N-out
-        elif 0 < val < 1:
-            return val  # Split fraction
-        elif val == 1:
-            return 1  # LORO
-        else:
-            print(f"ERROR: Invalid cv_strategy value: {cv_str}")
-            print("  Must be 'loro', int > 0, or float in (0, 1)")
-            sys.exit(1)
-    except ValueError:
-        print(f"ERROR: Could not parse cv_strategy: {cv_str}")
-        sys.exit(1)
 
 
 def print_header(args):
@@ -1068,7 +1030,10 @@ def main():
         # Beta-series CV R² (genuine cross-validated)
         from fastfuncstuff.glm.xval import compute_xval_r2_single_trials, generate_cv_splits
 
-        cv_splits = generate_cv_splits(n_runs, strategy=1)  # LORO
+        # Honour -cv_strategy here too: this block used to hardcode LORO, so
+        # the flag silently did nothing for the beta-series CV while shaping
+        # the HRF selection above it.
+        cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy)
 
         print()
         print("Computing beta-series CV R² (canonical HRF)...")
