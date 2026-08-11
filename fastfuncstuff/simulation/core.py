@@ -25,7 +25,7 @@ def simulate_fmri_run(
     tr: float,
     n_timepoints: int,
     matrix_size: tuple[int, int, int] = (100, 100, 10),
-    noise_level: float = 1.0,
+    noise_level: float | torch.Tensor = 1.0,
     baseline: float = 100.0,
     add_scanner_drift: bool = True,
     drift_amplitude: float = 0.5,
@@ -102,15 +102,40 @@ def simulate_fmri_run(
     # Generate noise
     noise = torch.zeros(n_voxels, n_timepoints, device=device)
 
+    # noise_level may be a scalar or one value per voxel, so that the per-voxel
+    # levels create_parametric_voxels returns are actually usable.
+    scale_per_voxel = to_tensor(noise_level, device=device).flatten().float()
+    if scale_per_voxel.numel() == 1:
+        scale_per_voxel = scale_per_voxel.expand(n_voxels)
+    elif scale_per_voxel.numel() != n_voxels:
+        raise ValueError(
+            f"noise_level must be a scalar or have one value per voxel "
+            f"({n_voxels}); got {scale_per_voxel.numel()}"
+        )
+    scale_per_voxel = scale_per_voxel.unsqueeze(1)
+
     # Generate noise per slice (more efficient than per voxel)
     for slice_idx in range(nz):
         slice_noise = generate_fmri_noise(
             tr, n_timepoints * tr, matrix_size=(nx, ny), normalize=True, device=device
         )
-        # Reshape and assign
-        slice_start = slice_idx * nx * ny
-        slice_end = (slice_idx + 1) * nx * ny
-        noise[slice_start:slice_end, :] = slice_noise.reshape(-1, n_timepoints) * noise_level
+        # generate_fmri_noise returns (n_trs, nx, ny) -- time FIRST. Flattening it
+        # as (-1, n_timepoints) does not transpose it, it interleaves the two:
+        # each row ends up striding across space at nearly fixed time, which
+        # destroys the temporal structure the generator exists to produce
+        # (measured lag-1 autocorrelation +0.44 correct vs -0.01 that way). Every
+        # simulation built on this function was effectively getting white noise.
+        slice_noise = slice_noise.reshape(n_timepoints, -1).T  # -> (nx*ny, n_trs)
+
+        # Voxel ordering must match the final reshape to (nx, ny, nz, n_timepoints),
+        # which indexes voxels as x*ny*nz + y*nz + z. Writing whole slices
+        # contiguously would instead lay them out as z-major.
+        voxel_index = (
+            torch.arange(nx * ny, device=device) // ny * (ny * nz)
+            + torch.arange(nx * ny, device=device) % ny * nz
+            + slice_idx
+        )
+        noise[voxel_index, :] = slice_noise * scale_per_voxel[voxel_index]
 
     data = data + noise
 
@@ -212,6 +237,7 @@ def create_parametric_voxels(
     hrf_library: torch.Tensor | None = None,
     beta_ranges: list[tuple[float, float]] | None = None,
     device: torch.device | None = None,
+    n_beta_patterns: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Create spatially organized voxels with varying betas and HRFs
@@ -260,41 +286,46 @@ def create_parametric_voxels(
     hrf_indices = torch.zeros(n_voxels, dtype=torch.long, device=device)
     noise_levels = torch.zeros(n_voxels, device=device)
 
-    voxel_idx = 0
-
     # Z dimension: noise levels
     noise_steps = torch.linspace(0.5, 2.0, nz, device=device)
 
     # X dimension: HRFs
     n_hrfs = hrf_library.shape[0] if hrf_library is not None else 1
-    hrf_voxels_per_block = nx // n_hrfs if n_hrfs > 0 else nx
 
-    # Y dimension: beta patterns
-    n_beta_patterns = 20  # Can be made configurable
-    beta_voxels_per_block = ny // n_beta_patterns
+    # Y dimension: beta patterns. Capped at ny so that a volume with fewer than
+    # n_beta_patterns rows still gets one pattern per row instead of dividing by
+    # a zero block size -- ny // 20 is 0 for any ny < 20, which made every test
+    # volume (a 4x4x2, say) raise ZeroDivisionError here.
+    if n_beta_patterns is None:
+        n_beta_patterns = min(20, ny)
+    n_beta_patterns = max(1, min(n_beta_patterns, ny))
 
-    for z in range(nz):
-        for x in range(nx):
-            # Determine HRF for this X position
-            hrf_idx = min(x // hrf_voxels_per_block, n_hrfs - 1) if n_hrfs > 1 else 0
+    # Spread the blocks across the axis by proportion rather than by an integer
+    # block size, so n_hrfs > nx degrades to "as many distinct HRFs as fit"
+    # instead of dividing by zero.
+    hrf_of_x = (torch.arange(nx, device=device) * n_hrfs // max(nx, 1)).clamp(max=n_hrfs - 1)
+    pattern_of_y = (torch.arange(ny, device=device) * n_beta_patterns // max(ny, 1)).clamp(
+        max=n_beta_patterns - 1
+    )
 
-            for y in range(ny):
-                # Determine beta pattern for this Y position
-                beta_pattern_idx = min(y // beta_voxels_per_block, n_beta_patterns - 1)
-
-                # Create beta pattern (can be customized)
+    # Voxel index must match the (nx, ny, nz) reshape that simulate_fmri_run
+    # applies to its output: x*ny*nz + y*nz + z. The original loop walked z, x, y
+    # and wrote sequentially, laying voxels out z-major -- so the "HRF varies
+    # along X, noise along Z" organisation this function documents did not
+    # survive the round trip into a volume.
+    for x in range(nx):
+        for y in range(ny):
+            for z in range(nz):
+                voxel_idx = x * ny * nz + y * nz + z
                 for cond_idx in range(n_conditions):
                     beta_min, beta_max = beta_ranges[cond_idx]
-                    # Vary betas across Y dimension
                     beta_val = beta_min + (beta_max - beta_min) * (
-                        beta_pattern_idx / n_beta_patterns
+                        int(pattern_of_y[y]) / n_beta_patterns
                     )
                     betas[voxel_idx, cond_idx] = beta_val
 
-                hrf_indices[voxel_idx] = hrf_idx
+                hrf_indices[voxel_idx] = int(hrf_of_x[x]) if n_hrfs > 1 else 0
                 noise_levels[voxel_idx] = noise_steps[z]
-
-                voxel_idx += 1
 
     return betas, hrf_indices, noise_levels
 

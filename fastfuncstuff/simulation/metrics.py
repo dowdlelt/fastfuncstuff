@@ -29,6 +29,7 @@ def compute_design_matrix_for_condition(
     condition_idx: int,
     n_timepoints: int,
     mode: str = "onoff",
+    hrf_length: int | None = None,
     device: torch.device | None = None,
 ) -> torch.Tensor:
     """
@@ -43,28 +44,79 @@ def compute_design_matrix_for_condition(
     n_timepoints : int
         Total timepoints
     mode : str, default='onoff'
-        'onoff': Binary onsets (block/impulse)
-        'fir': For FIR analysis (identity, since each lag is separate)
+        'onoff': Binary onsets (block/impulse), shape (n_timepoints, 1)
+        'fir': Lagged design, shape (n_timepoints, hrf_length). Column ``lag``
+            is the onset train shifted down by ``lag`` samples, so
+            ``X[t, lag] = onsets[t - lag]``.
+    hrf_length : int, optional
+        Number of lags. Required for mode='fir'.
     device : torch.device, optional
         Device for computation
 
     Returns
     -------
-    X_k : torch.Tensor, shape (n_timepoints, n_lags) for FIR or (n_timepoints, 1) for onoff
+    X_k : torch.Tensor, shape (n_timepoints, hrf_length) for FIR or (n_timepoints, 1) for onoff
         Design matrix for condition k
+
+    Notes
+    -----
+    ``mode='fir'`` previously returned the onset column unchanged -- identical to
+    ``'onoff'`` -- so the two modes were indistinguishable. Nothing called it
+    (both metrics built their own lagged matrix inline), which is why the stub
+    went unnoticed; those inline copies now call this.
+
+    Onset values are used as given rather than thresholded, so a parametrically
+    modulated regressor carries its amplitudes through.
     """
     if device is None:
         device = onsets.device
 
+    onsets_k = onsets[:, condition_idx].to(device)
+
     if mode == "onoff":
-        # Just the onsets for this condition
-        return onsets[:, condition_idx : condition_idx + 1]
+        return onsets_k[:, None]
     elif mode == "fir":
-        # For FIR, design is just indicator of which timepoints had events
-        # The "design matrix" for FIR efficiency is the onset pattern itself
-        return onsets[:, condition_idx : condition_idx + 1]
+        if hrf_length is None:
+            raise ValueError("hrf_length is required for mode='fir'")
+        X_k = torch.zeros((n_timepoints, hrf_length), device=device, dtype=onsets_k.dtype)
+        usable = min(n_timepoints, onsets_k.shape[0])
+        for lag in range(hrf_length):
+            if lag >= n_timepoints:
+                break
+            X_k[lag:usable, lag] = onsets_k[: usable - lag]
+        return X_k
     else:
         raise ValueError(f"Unknown mode: {mode}")
+
+
+def _residualise(X: torch.Tensor, nuisance: torch.Tensor | None) -> torch.Tensor:
+    """Project ``nuisance`` out of ``X``.
+
+    Every real GLM carries at least a baseline, and design efficiency that
+    ignores it credits the design for DC power no contrast can ever use.
+    """
+    if nuisance is None or nuisance.shape[1] == 0:
+        return X
+    q, _ = torch.linalg.qr(nuisance)
+    return X - q @ (q.T @ X)
+
+
+def _baseline_nuisance(
+    n_timepoints: int,
+    poly_degree: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor | None:
+    """Legendre-style polynomial nuisance columns, degree 0 = the baseline."""
+    if poly_degree < 0:
+        return None
+    t = torch.linspace(-1.0, 1.0, n_timepoints, device=device, dtype=dtype)
+    columns = [torch.ones_like(t)]
+    for degree in range(1, poly_degree + 1):
+        columns.append(t**degree)
+    basis = torch.stack(columns, dim=1)
+    q, _ = torch.linalg.qr(basis)
+    return q
 
 
 def compute_estimation_efficiency(
@@ -74,6 +126,7 @@ def compute_estimation_efficiency(
     tr: float = 1.0,
     normalize: bool = True,
     device: torch.device | None = None,
+    poly_degree: int = 0,
 ) -> torch.Tensor | dict[str, torch.Tensor | float]:
     """
     Compute estimation efficiency for HRF shape estimation
@@ -130,6 +183,7 @@ def compute_estimation_efficiency(
         design = design.to(device)
 
     n_timepoints = design.shape[0]
+    nuisance = _baseline_nuisance(n_timepoints, poly_degree, device, design.dtype)
 
     # For FIR efficiency, we need the onset matrix (binary indicators)
     # If design is already convolved, we need to extract onsets
@@ -154,16 +208,15 @@ def compute_estimation_efficiency(
             )
 
         # Build X_k: FIR design matrix for condition k
-        # X_k[t, lag] = 1 if event at time (t - lag), 0 otherwise
-        X_k = torch.zeros((n_timepoints, hrf_length), device=device)
+        X_k = compute_design_matrix_for_condition(
+            onsets_k[:, None], 0, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
+        )
+        event_times = torch.where(onsets_k > 0.5)[0]
 
-        event_times = torch.where(onsets_k > 0.5)[0]  # Threshold at 0.5 for binary
-
-        for t in event_times:
-            t = int(t.item())
-            for lag in range(hrf_length):
-                if t + lag < n_timepoints:
-                    X_k[t + lag, lag] = 1.0
+        # Efficiency is measured on what is left after the nuisance model, for
+        # the same reason detection power is: a baseline the GLM will fit is not
+        # available to any contrast.
+        X_k = _residualise(X_k, nuisance)
 
         # Compute A_k = (X_k^T X_k) / N
         XtX = X_k.T @ X_k
@@ -222,6 +275,7 @@ def compute_detection_power(
     noise_std: float = 1.0,
     tr: float = 1.0,
     device: torch.device | None = None,
+    poly_degree: int = 0,
 ) -> dict[str, torch.Tensor | float]:
     """
     Compute detection power for activation detection
@@ -286,6 +340,7 @@ def compute_detection_power(
 
     n_timepoints = design.shape[0]
     hrf_length = len(hrf_assumed)
+    nuisance = _baseline_nuisance(n_timepoints, poly_degree, device, design.dtype)
 
     # Normalize HRF
     h0 = hrf_assumed / torch.sqrt(torch.sum(hrf_assumed**2))
@@ -303,15 +358,18 @@ def compute_detection_power(
                 design[:, k] if k < design.shape[1] else torch.zeros(n_timepoints, device=device)
             )
 
-        # Build X_k (same as in efficiency computation)
-        X_k = torch.zeros((n_timepoints, hrf_length), device=device)
-        event_times = torch.where(onsets_k > 0.5)[0]
+        # Build X_k (same helper the efficiency path uses)
+        X_k = compute_design_matrix_for_condition(
+            onsets_k[:, None], 0, n_timepoints, mode="fir", hrf_length=hrf_length, device=device
+        )
 
-        for t in event_times:
-            t = int(t.item())
-            for lag in range(hrf_length):
-                if t + lag < n_timepoints:
-                    X_k[t + lag, lag] = 1.0
+        # Detection power is 1/Var(beta_hat) for the regressor X_k h0, and a real
+        # GLM always fits a baseline alongside it. Leaving the baseline in counts
+        # the regressor's DC against detection: measured on matched designs it was
+        # 55% of a block design's score and 84% of a random one's, which
+        # compressed the block-vs-random ratio from 4.5x to 1.6x and understated
+        # exactly the advantage this metric exists to quantify.
+        X_k = _residualise(X_k, nuisance)
 
         # Compute A_k = (X_k^T X_k) / N
         XtX = X_k.T @ X_k
@@ -346,6 +404,7 @@ def compute_conditional_entropy(
     n_conditions: int,
     tr: float = 1.0,
     device: torch.device | None = None,
+    order: int = 1,
 ) -> dict[str, Any]:
     """
     Compute conditional entropy (randomness) of design
@@ -452,14 +511,80 @@ def compute_conditional_entropy(
             entropies.append(0.0)
             isi_distributions[k] = {}
 
+    # Liu & Frank's H_r proper: how unpredictable is the NEXT TRIAL TYPE given the
+    # previous r, over an alphabet of Q types plus null. The ISI entropy above is a
+    # different quantity -- it is unbounded (a random design measured 1.95 bits
+    # where H_r for Q=1 cannot exceed log2(2) = 1), and it is a per-condition
+    # statistic, so it cannot be compared against the theoretical relation
+    # H_r ~ log2(1 + Q * eps_norm) that motivates the metric. Both are reported.
+    symbols = torch.zeros(onsets.shape[0], dtype=torch.long, device=device)
+    for k in range(n_conditions):
+        symbols[onsets[:, k] > 0.5] = k + 1  # 0 is the null/no-event symbol
+    symbols_np = symbols.cpu().numpy()
+    conditional = _conditional_entropy_rate(symbols_np, n_conditions + 1, order=order)
+
+    # Two sequences, two questions, and they do not substitute for each other.
+    #
+    # On the slot grid above, the alphabet is Q types plus null, so the answer
+    # folds in *when* an event happens: a block design scores ~0 and a p=0.5
+    # random design scores the full log2(Q+1), exactly as Liu & Frank describe.
+    # But when events are sparse on that grid, nearly every context is
+    # null-followed-by-null, and trial-type structure washes out -- a perfectly
+    # alternating ABAB and a randomly typed sequence with identical onsets both
+    # measured 0.61 bits.
+    #
+    # So also take the entropy over the event-type sequence alone, which drops
+    # timing and isolates "given the last trial's type, how surprising is the
+    # next one": 0 for ABAB, 1 bit for random types over two conditions.
+    event_types = symbols_np[symbols_np > 0] - 1
+    type_entropy = (
+        _conditional_entropy_rate(event_types, n_conditions, order=order)
+        if n_conditions > 1
+        else 0.0
+    )
+
     result = {
         "total": sum(entropies),
         "mean": np.mean(entropies),
         "per_condition": {k: entropies[k] for k in range(n_conditions)},
         "isi_distribution": isi_distributions,
+        "isi_entropy": sum(entropies),
+        "conditional_entropy": conditional,
+        "max_entropy": float(np.log2(n_conditions + 1)),
+        "normalized_entropy": conditional / float(np.log2(n_conditions + 1)),
+        "type_entropy": type_entropy,
+        "max_type_entropy": float(np.log2(n_conditions)) if n_conditions > 1 else 0.0,
+        "order": order,
     }
 
     return result
+
+
+def _conditional_entropy_rate(symbols: np.ndarray, n_symbols: int, order: int = 1) -> float:
+    """H(X_t | X_{t-1}, ..., X_{t-order}) in bits, from empirical counts.
+
+    Zero for a fully predictable sequence, log2(n_symbols) for an i.i.d. uniform
+    one. Contexts seen only once contribute zero entropy, which is the honest
+    empirical answer but does bias the estimate downward when `order` is large
+    relative to the sequence length.
+    """
+    if symbols.size <= order:
+        return 0.0
+
+    counts: dict[tuple[int, ...], np.ndarray] = {}
+    for t in range(order, symbols.size):
+        context = tuple(int(v) for v in symbols[t - order : t])
+        if context not in counts:
+            counts[context] = np.zeros(n_symbols)
+        counts[context][int(symbols[t])] += 1
+
+    total = sum(c.sum() for c in counts.values())
+    entropy = 0.0
+    for context_counts in counts.values():
+        n_context = context_counts.sum()
+        probabilities = context_counts[context_counts > 0] / n_context
+        entropy += (n_context / total) * float(-(probabilities * np.log2(probabilities)).sum())
+    return entropy
 
 
 def compute_efficiency_power_tradeoff(
