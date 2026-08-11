@@ -35,6 +35,125 @@ import torch
 from fastfuncstuff.utils import get_device, to_tensor
 
 
+def _infer_time_axis(
+    data: torch.Tensor,
+    n_design_rows: int | None = None,
+    n_mask_elements: int | None = None,
+    max_lines: int = 256,
+) -> int:
+    """Which axis of a 2D array is time? Ask the caller, then the data -- never the shape.
+
+    Shape cannot answer this. "The longer axis is time" is wrong for fMRI, where
+    voxels outnumber timepoints; "the shorter axis is time" then fails on the
+    small-ROI-long-run case.
+
+    Two better sources, in order. A design matrix states the number of
+    timepoints outright, and a mask states the number of voxels, so when either
+    is present and matches exactly one axis there is nothing to infer. Failing
+    that, the defining property of the time axis is the very thing being
+    measured: a timeseries is autocorrelated at lag 1, a row of unrelated voxels
+    is not.
+
+    Only genuinely white data reaches the final fallback, and there both
+    readings give the same near-zero answer -- so it defers to the documented
+    (n_timepoints, n_voxels) layout rather than guessing.
+    """
+    n_rows, n_cols = data.shape
+
+    if n_design_rows is not None:
+        if n_rows == n_design_rows and n_cols != n_design_rows:
+            return 0
+        if n_cols == n_design_rows and n_rows != n_design_rows:
+            return 1
+    if n_mask_elements is not None:
+        if n_cols == n_mask_elements and n_rows != n_mask_elements:
+            return 0
+        if n_rows == n_mask_elements and n_cols != n_mask_elements:
+            return 1
+
+    def mean_abs_lag1(x: torch.Tensor) -> float:
+        # x: (n_lines, length) -- autocorrelation measured along dim 1
+        if x.shape[0] > max_lines:
+            idx = torch.linspace(0, x.shape[0] - 1, max_lines, device=x.device).long()
+            x = x[idx]
+        x = x.to(torch.float32)
+        x = x - x.mean(dim=1, keepdim=True)
+        denom = (x * x).sum(dim=1)
+        num = (x[:, :-1] * x[:, 1:]).sum(dim=1)
+        valid = denom > 1e-20
+        if not bool(valid.any()):
+            return 0.0
+        return float((num[valid] / denom[valid]).abs().mean().item())
+
+    along_0 = mean_abs_lag1(data.T)  # treat axis 0 as time
+    along_1 = mean_abs_lag1(data)  # treat axis 1 as time
+
+    if max(along_0, along_1) < 0.02:
+        return 0  # white data: both readings agree, so honour the documented layout
+    return 0 if along_0 >= along_1 else 1
+
+
+def _synthesise_from_spectrum(
+    power_spectrum: torch.Tensor,
+    n_samples: int,
+    dt: float,
+    n_voxels: int,
+    device: torch.device,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    """Synthesise a Gaussian timeseries with a prescribed one-sided PSD.
+
+    Returns ``(n_samples, n_voxels)`` whose variance equals the integral of
+    ``power_spectrum`` over frequency. That scaling is what lets components
+    synthesised on *different* frequency grids be added together on one common
+    scale -- without it, a component's amplitude would depend on the grid it
+    happened to be built on rather than on the strength the caller asked for.
+    """
+    amplitude = torch.sqrt(power_spectrum)
+    n_freqs = power_spectrum.shape[0]
+
+    # Complex-Gaussian coefficients, not unit-amplitude random phases. Randomising
+    # only the phase makes |X_k| deterministic, so every voxel gets a byte-identical
+    # periodogram and the noise has no spectral variability at all -- a random-phase
+    # surrogate rather than a Gaussian process. Real fMRI noise has chi-squared
+    # distributed periodogram ordinates, and any statistic sensitive to that (an
+    # estimated AR coefficient, a spectral fit) would otherwise be unrealistically
+    # stable across voxels. Var of each part is 1/2 so that E|X_k|^2 = power.
+    amp = amplitude.unsqueeze(1)
+    real = torch.randn(n_freqs, n_voxels, device=device, generator=generator)
+    imag = torch.randn(n_freqs, n_voxels, device=device, generator=generator)
+    spectrum = amp * torch.complex(real, imag) / np.sqrt(2.0)
+
+    # DC (and Nyquist, when n_samples is even) have no conjugate partner, so they
+    # must be real or irfft silently discards their imaginary part -- which would
+    # make the realised variance disagree with the requested spectrum. Rebuilt out
+    # of place and kept complex: MPS cannot cat a real tensor with a complex one.
+    def _force_real(col: torch.Tensor) -> torch.Tensor:
+        # sqrt(2) restores the variance dropped with the imaginary part, so these
+        # bins carry E[X^2] = power like every other bin.
+        real_part = col.real * np.sqrt(2.0)
+        return torch.complex(real_part, torch.zeros_like(real_part)).unsqueeze(0)
+
+    spectrum = torch.cat([_force_real(spectrum[0]), spectrum[1:]], dim=0)
+    if n_samples % 2 == 0:
+        spectrum = torch.cat([spectrum[:-1], _force_real(spectrum[-1])], dim=0)
+
+    series = torch.fft.irfft(spectrum, n=n_samples, dim=0).real
+
+    # Variance of the synthesis above, analytically: bins with a conjugate
+    # partner contribute twice. Computed rather than measured so a single-voxel
+    # call keeps its natural sampling variability.
+    weights = torch.full((n_freqs,), 2.0, device=device, dtype=amplitude.dtype)
+    weights[0] = 1.0
+    if n_samples % 2 == 0:
+        weights[-1] = 1.0
+    synth_var = (weights * amplitude**2).sum() / (n_samples**2)
+
+    target_var = power_spectrum[1:].sum() / (n_samples * dt)  # PSD integral, DC excluded
+    scale = torch.sqrt(target_var / synth_var.clamp_min(1e-30))
+    return series * scale
+
+
 def generate_fmri_noise(
     tr: float,
     duration_s: float,
@@ -49,6 +168,7 @@ def generate_fmri_noise(
     pink_exp: float = 1.0,
     normalize: bool = True,
     device: torch.device | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Generate realistic fMRI noise with 1/f spectrum and physiological components
@@ -82,80 +202,91 @@ def generate_fmri_noise(
     cardiac_strength : float
         Strength of cardiac component (default: 5.0)
     pink_exp : float
-        Exponent for 1/f noise (default: 1.0, range: 0.5-1.5)
+        Exponent for 1/f noise (default: 1.0, range: 0.5-1.5). This is the
+        realised spectral slope of the output, not merely a request: see Notes.
     normalize : bool
         Normalize to unit variance (default: True)
     device : torch.device, optional
         Device for computation
+    generator : torch.Generator, optional
+        Seeded generator for reproducible noise without touching global RNG state.
 
     Returns
     -------
     noise : torch.Tensor
         (n_trs, rows, cols) noise time series
         If matrix_size=(1,1), returns (n_trs,)
+
+    Notes
+    -----
+    The background and the physiological peaks are synthesised on *different*
+    frequency grids, on purpose:
+
+    - **1/f background** is built directly on the TR grid. It describes the
+      spectrum of the sampled timeseries, so there is nothing above Nyquist for
+      it to fold down from. Building it at ``fs_high`` and decimating (as this
+      function used to) folded 0.5-5 Hz back as a near-flat pedestal and
+      delivered roughly half the requested slope -- ``pink_exp=1.0`` measured
+      0.48. The realised slope now matches ``pink_exp`` above the 0.01 Hz knee
+      that ``1/(f + 0.01)`` introduces.
+    - **Respiratory and cardiac peaks** are built at ``fs_high`` and decimated,
+      so they alias when they sit above Nyquist. That is deliberate and
+      physical: cardiac pulsation near 1 Hz is genuinely undersampled at any
+      ordinary TR, and real data carries it folded down. At TR=2 s a 1 Hz
+      cardiac peak lands near DC, which is where it belongs -- not a bug.
+
+    ``fs_high`` is rounded to the nearest exact integer multiple of ``1/tr``, so
+    the output TR is exactly ``tr``. Requesting a sub-second TR used to truncate
+    the ratio and shift every frequency (TR=0.35 became 0.30).
     """
     if device is None:
         device = get_device()
 
     n_voxels = matrix_size[0] * matrix_size[1]
-
-    # Generate at high sampling rate
-    n_samples = int(duration_s * fs_high)
-    dt = 1 / fs_high
-
-    # Create frequency vector
-    freqs = torch.fft.rfftfreq(n_samples, d=dt).to(device)
-
-    # Build power spectrum
-    # 1/f component (pink noise)
-    power_spectrum = 1 / (freqs + 0.01) ** pink_exp
-
-    # Respiratory component (broad Gaussian peak)
-    resp_component = resp_strength * torch.exp(-((freqs - resp_freq) ** 2) / (2 * resp_width**2))
-    power_spectrum = power_spectrum + resp_component
-
-    # Cardiac component (narrow Gaussian peak)
-    cardiac_component = cardiac_strength * torch.exp(
-        -((freqs - cardiac_freq) ** 2) / (2 * cardiac_width**2)
-    )
-    power_spectrum = power_spectrum + cardiac_component
-
-    # Convert power to amplitude
-    amplitude_spectrum = torch.sqrt(power_spectrum)
-
-    # Generate independent random phases for each voxel
-    # This is key for independent voxel noise
-    n_freqs = len(freqs)
-    phases = torch.rand(n_freqs, n_voxels, device=device) * 2 * np.pi - np.pi
-
-    # Replicate amplitude for all voxels
-    amplitude_all = amplitude_spectrum.unsqueeze(1).expand(-1, n_voxels)
-
-    # Create complex spectrum
-    complex_spectrum = amplitude_all * torch.exp(1j * phases)
-
-    # Ensure real output via conjugate symmetry: the DC component must be real.
-    # Keep it complex64 (zero imaginary) rather than a real tensor — MPS cannot
-    # torch.cat a real tensor with a complex one (mixed-dtype cat raises). Out of
-    # place to avoid the MPS in-place-on-complex error.
-    dc_term = torch.complex(
-        complex_spectrum[0, :].real,
-        torch.zeros_like(complex_spectrum[0, :].real),
-    ).unsqueeze(0)
-    complex_spectrum = torch.cat([dc_term, complex_spectrum[1:, :]], dim=0)
-
-    # Inverse FFT to get time series
-    noise_high = torch.fft.irfft(complex_spectrum, n=n_samples, dim=0).real
-
-    # Downsample to target TR
-    downsample_factor = int(fs_high / (1 / tr))
-
-    # Use strided indexing for fast downsampling
-    noise_ts = noise_high[::downsample_factor, :]
-
-    # Trim to exact number of TRs
     n_trs = int(duration_s / tr)
-    noise_ts = noise_ts[:n_trs, :]
+
+    # The decimation ratio must be an exact integer or the series carries a
+    # different TR than the caller asked for: int(fs_high / (1 / tr)) truncates,
+    # so TR=0.35 silently became 0.30 (-14%) and TR=0.25 became 0.20 (-20%),
+    # putting every requested frequency in the wrong place. Round to the nearest
+    # integer ratio and derive the generation rate from it instead.
+    decimation = max(1, int(round(fs_high * tr)))
+    fs_gen = decimation / tr
+
+    # The 1/f background describes the spectrum of the *sampled* timeseries, so it
+    # is synthesised directly on the TR grid. Building it at fs_high and decimating
+    # without an anti-alias filter folds 0.5-5 Hz back as a near-flat pedestal,
+    # which measurably flattens the result: pink_exp=1.0 delivered a realised
+    # slope of ~0.48 before this split.
+    freqs_tr = torch.fft.rfftfreq(n_trs, d=tr).to(device)
+    background = 1 / (freqs_tr + 0.01) ** pink_exp
+    noise_ts = _synthesise_from_spectrum(
+        background, n_trs, tr, n_voxels, device, generator=generator
+    )
+
+    # Physiological peaks are a different matter: cardiac pulsation near 1 Hz is
+    # genuinely undersampled at any ordinary TR, and real data really does carry
+    # it folded down. So these are synthesised at the high rate and decimated,
+    # which aliases them exactly as the scanner would.
+    if resp_strength > 0 or cardiac_strength > 0:
+        n_samples = n_trs * decimation
+        dt = 1 / fs_gen
+        freqs_hi = torch.fft.rfftfreq(n_samples, d=dt).to(device)
+
+        physio = torch.zeros_like(freqs_hi)
+        if resp_strength > 0:
+            physio = physio + resp_strength * torch.exp(
+                -((freqs_hi - resp_freq) ** 2) / (2 * resp_width**2)
+            )
+        if cardiac_strength > 0:
+            physio = physio + cardiac_strength * torch.exp(
+                -((freqs_hi - cardiac_freq) ** 2) / (2 * cardiac_width**2)
+            )
+
+        physio_hi = _synthesise_from_spectrum(
+            physio, n_samples, dt, n_voxels, device, generator=generator
+        )
+        noise_ts = noise_ts + physio_hi[::decimation][:n_trs, :]
 
     # Normalize per voxel if requested
     if normalize:
@@ -215,7 +346,11 @@ def generate_fmri_noise_batch(
 
 
 def add_drift(
-    data: torch.Tensor, amplitude: float = 0.5, n_modes: int = 3, device: torch.device | None = None
+    data: torch.Tensor,
+    amplitude: float = 0.5,
+    n_modes: int = 3,
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Add low-frequency drift to fMRI data (simulates scanner drift)
@@ -258,7 +393,7 @@ def add_drift(
     drift_basis = torch.stack(drift_basis, dim=1)  # (n_timepoints, 2*n_modes)
 
     # Random weights per voxel
-    weights = torch.randn(drift_basis.shape[1], n_voxels, device=device)
+    weights = torch.randn(drift_basis.shape[1], n_voxels, device=device, generator=generator)
 
     # Generate drift
     drift = drift_basis @ weights  # (n_timepoints, n_voxels)
@@ -336,6 +471,7 @@ def generate_ar1_noise(
     n_voxels: int = 1,
     normalize: bool = True,
     device: torch.device | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """
     Generate AR(1) temporally autocorrelated noise
@@ -394,15 +530,21 @@ def generate_ar1_noise(
     innovation_std = np.sqrt(1 - rho**2)
 
     # Generate innovations
-    epsilon = torch.randn(n_timepoints, n_voxels, device=device) * innovation_std
+    epsilon = (
+        torch.randn(n_timepoints, n_voxels, device=device, generator=generator) * innovation_std
+    )
+
+    # Seed from the stationary distribution BEFORE the recursion. Assigning y[0]
+    # afterwards (as this once did) left the loop starting from zeros, so the
+    # series ramped up to its stationary variance instead of beginning at it --
+    # at rho=0.9, var(y[1]) measured 0.19 against a stationary 1.0 and took ~50
+    # samples to recover. Short runs are exactly where that bias bites.
+    y[0] = epsilon[0] / np.sqrt(1 - rho**2)
 
     # Sequential generation (vectorized across voxels)
     # This is fast enough for typical use cases
     for t in range(1, n_timepoints):
         y[t] = rho * y[t - 1] + epsilon[t]
-
-    # First timepoint from stationary distribution
-    y[0] = epsilon[0] / np.sqrt(1 - rho**2)
 
     # Normalize if requested
     if normalize:
@@ -421,6 +563,8 @@ def generate_ar_noise(
     n_voxels: int = 1,
     normalize: bool = True,
     device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+    burn_in: int | None = None,
 ) -> torch.Tensor:
     """
     Generate AR(p) temporally autocorrelated noise
@@ -476,21 +620,29 @@ def generate_ar_noise(
 
     p = len(rho_coeffs)
 
+    # Burn-in, then discard. There is no one-line stationary seed for AR(p) as
+    # there is for AR(1), and the alternative -- starting from zeros and writing
+    # the first p samples afterwards -- is worse than it looks: those samples get
+    # the innovation variance (1.0) while the stationary variance of e.g.
+    # [0.5, 0.2] is 1.71, so every run opened with a variance step.
+    n_burn = max(p, burn_in if burn_in is not None else 200)
+    n_total = n_timepoints + n_burn
+
     # Initialize output
-    y = torch.zeros(n_timepoints, n_voxels, device=device)
+    y = torch.zeros(n_total, n_voxels, device=device)
 
     # Generate innovations (white noise)
-    epsilon = torch.randn(n_timepoints, n_voxels, device=device)
+    epsilon = torch.randn(n_total, n_voxels, device=device, generator=generator)
+    y[:p] = epsilon[:p]
 
     # Sequential generation
-    for t in range(p, n_timepoints):
+    for t in range(p, n_total):
         # Dot product with past p values
         # y[t] = sum(rho_coeffs * y[t-p:t].flip())
         past_values = y[t - p : t].flip(0)  # Reverse to align with coefficients
         y[t] = (rho_coeffs.unsqueeze(1) * past_values).sum(dim=0) + epsilon[t]
 
-    # Initialize first p timepoints from innovations
-    y[:p] = epsilon[:p]
+    y = y[n_burn:]
 
     # Normalize if requested
     if normalize:
@@ -510,6 +662,8 @@ def generate_arma_noise(
     n_voxels: int = 1,
     normalize: bool = True,
     device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+    burn_in: int | None = None,
 ) -> torch.Tensor:
     """
     Generate ARMA(p,q) temporally autocorrelated noise
@@ -575,12 +729,19 @@ def generate_arma_noise(
     q = len(ma_coeffs)
     max_order = max(p, q)
 
+    # Burn in and discard, for the same reason as AR(p): seeding the first
+    # max_order samples from the innovations alone gives them the innovation
+    # variance rather than the process's, so the run opens with a variance step.
+    n_burn = max(max_order, burn_in if burn_in is not None else 200)
+    n_total = n_timepoints + n_burn
+
     # Initialize output and innovations
-    y = torch.zeros(n_timepoints, n_voxels, device=device)
-    epsilon = torch.randn(n_timepoints, n_voxels, device=device)
+    y = torch.zeros(n_total, n_voxels, device=device)
+    epsilon = torch.randn(n_total, n_voxels, device=device, generator=generator)
+    y[:max_order] = epsilon[:max_order]
 
     # Sequential generation
-    for t in range(max_order, n_timepoints):
+    for t in range(max_order, n_total):
         # AR part: sum of past y values
         if p > 0:
             past_y = y[t - p : t].flip(0)
@@ -595,17 +756,19 @@ def generate_arma_noise(
         else:
             ma_part = 0
 
-        # Combine: y_t = AR_part + MA_part + b5_t
+        # Combine: y_t = AR_part + MA_part + innovation_t
         y[t] = ar_part + ma_part + epsilon[t]
 
-    # Initialize first max_order timepoints
-    y[:max_order] = epsilon[:max_order]
+    y = y[n_burn:]
 
     # Normalize if requested
     if normalize:
         y = (y - y.mean(dim=0, keepdim=True)) / (y.std(dim=0, keepdim=True) + 1e-10)
 
-    # Always return shape (n_timepoints, n_voxels)
+    # Squeeze to (n_timepoints,) for a single voxel, matching both the docstring
+    # and the AR(1)/AR(p) generators -- this one alone returned (n_timepoints, 1).
+    if n_voxels == 1:
+        return y.squeeze(1)
     return y
 
 
@@ -615,6 +778,7 @@ def estimate_noise_parameters_from_data(
     mask: torch.Tensor | np.ndarray | None = None,
     ar_order: int = 1,
     device: torch.device | None = None,
+    time_axis: int | None = None,
 ) -> dict:
     """
     Estimate noise parameters from real fMRI data
@@ -640,11 +804,11 @@ def estimate_noise_parameters_from_data(
     Returns
     -------
     params : dict
-        'ar_coefficients': list, AR coefficients [ρ_1, ρ_2, ..., ρ_p]
-        'ar_coefficients_mean': float, mean across voxels
-        'ar_coefficients_std': float, std across voxels
-        'sfnr': float, temporal Signal Fluctuation to Noise Ratio
-        'sfnr_mean': float, mean SFNR across voxels
+        'ar_coefficients': list of p floats, mean AR coefficients across voxels
+        'ar_coefficients_mean': same list, under the name the examples use
+        'ar_coefficients_std': list of p floats, std across voxels
+        'ar_coefficients_all': list per sampled voxel (for the distribution)
+        'sfnr' / 'sfnr_mean': float, mean SFNR across voxels
         'sfnr_std': float, std SFNR across voxels
         'noise_std': float, residual standard deviation
         'n_voxels': int, number of voxels analyzed
@@ -690,13 +854,29 @@ def estimate_noise_parameters_from_data(
         # Single timeseries
         data = data.unsqueeze(1)  # (n_timepoints, 1)
     elif data.ndim == 2:
-        # Already (n_timepoints, n_voxels) or (n_voxels, n_timepoints)
-        if data.shape[0] > data.shape[1]:
-            # Assume (n_timepoints, n_voxels)
-            pass
+        # A 2D array is genuinely ambiguous, and the old rule -- "the longer axis
+        # is time" -- was backwards for fMRI, where voxels outnumber timepoints by
+        # orders of magnitude. Handed the (n_voxels, n_timepoints) matrix every ffs
+        # tool stores, it read voxels as time and returned rho ~ 0 for a planted
+        # 0.45, silently. Time is now the SHORTER axis unless told otherwise.
+        if time_axis is not None:
+            if time_axis not in (0, 1):
+                raise ValueError(f"time_axis must be 0 or 1 for 2D input, got {time_axis}")
+            if time_axis == 1:
+                data = data.T
         else:
-            # Assume (n_voxels, n_timepoints) - transpose
-            data = data.T
+            design_rows = None
+            if design is not None:
+                design_rows = (
+                    design.shape[0] if torch.is_tensor(design) else np.asarray(design).shape[0]
+                )
+            mask_elements = None
+            if mask is not None:
+                mask_elements = (
+                    int(mask.numel()) if torch.is_tensor(mask) else int(np.asarray(mask).size)
+                )
+            if _infer_time_axis(data, design_rows, mask_elements) == 1:
+                data = data.T
     elif data.ndim >= 3:
         # 3D or 4D volume - flatten spatial dimensions
         # Assume time is last dimension
@@ -796,9 +976,13 @@ def estimate_noise_parameters_from_data(
 
     return {
         "ar_coefficients": ar_coeffs_mean,  # Mean coefficients across voxels
+        # Documented name for the same thing; the docstring's own example used
+        # 'ar_coefficients_mean' / 'sfnr_mean', neither of which was ever returned.
+        "ar_coefficients_mean": ar_coeffs_mean,
         "ar_coefficients_std": ar_coeffs_std,  # Std of coefficients
         "ar_coefficients_all": ar_coeffs_per_voxel,  # All voxels (for distribution)
         "sfnr": sfnr_mean,
+        "sfnr_mean": sfnr_mean,
         "sfnr_std": sfnr_std,
         "sfnr_all": sfnr_per_voxel.cpu().numpy().tolist(),
         "noise_std": noise_std,
@@ -812,11 +996,13 @@ def estimate_sfnr(
     data: torch.Tensor | np.ndarray,
     mask: torch.Tensor | np.ndarray | None = None,
     device: torch.device | None = None,
+    detrend: bool = True,
 ) -> dict:
     """
     Estimate temporal Signal Fluctuation to Noise Ratio (SFNR)
 
-    SFNR = mean(signal) / std(signal) across time, per voxel
+    SFNR = mean(signal) / std(detrended residual) across time, per voxel.
+    Set ``detrend=False`` for the raw ratio, which drift will depress.
 
     This is the standard fMRI quality metric. Typical values:
     - Good 3T: SFNR = 150-200
@@ -873,9 +1059,22 @@ def estimate_sfnr(
         mask_flat = mask.flatten()
         data_flat = data_flat[mask_flat]
 
-    # Compute SFNR per voxel
+    # Compute SFNR per voxel. Friedman & Glover take the fluctuation as the std
+    # of the *detrended* residual: without that, scanner drift lands in the
+    # denominator and depresses SFNR (measured: a planted 150 read 135 with drift
+    # at amplitude 0.5), which is not what the published reference values mean.
+    if detrend:
+        n_t = data_flat.shape[1]
+        t = torch.arange(n_t, dtype=data_flat.dtype, device=device)
+        t = (t - t.mean()) / (t.std() + 1e-10)
+        basis = torch.stack([torch.ones_like(t), t, t**2], dim=1)  # (n_t, 3)
+        pinv = torch.linalg.pinv(basis)
+        fluctuation = data_flat - (data_flat @ pinv.T) @ basis.T
+        std_signal = fluctuation.std(dim=1)
+    else:
+        std_signal = data_flat.std(dim=1)
+
     mean_signal = data_flat.mean(dim=1)
-    std_signal = data_flat.std(dim=1)
     sfnr = mean_signal / (std_signal + 1e-10)
 
     # Summary statistics

@@ -3127,9 +3127,16 @@ def main():
         print()
         print(f"Fitting denoising model with per-voxel HRFs ({len(designs_by_hrf)} unique HRFs)...")
         if args.noise_ceiling != "off":
-            # Each HRF group needs its own ceiling, since the design the two
-            # training halves are fitted with differs per group. Skipping loudly
-            # beats writing a ceiling built with the wrong design.
+            # TODO: wire the ceiling through the per-HRF group loop. Not a
+            # conceptual obstacle -- a voxel with its own HRF has its own design
+            # and so its own ceiling, which is what a per-voxel ceiling *is*, and
+            # var(y) is design-free so the groups stay on one common scale. The
+            # loop shape already exists in sequential.py (mask by hrf_indices,
+            # run with designs_by_hrf[idx], scatter rows back); groups partition
+            # the voxels, so only the design-side factorisations multiply, not
+            # the passes over the brain. What is missing is merging the
+            # per-group CeilingResults (maps concatenate, but notes and
+            # skipped-fold counts must combine, not come from the last group).
             print(
                 "  NOTE: -noise_ceiling is not yet supported with per-voxel HRFs; "
                 "no ceiling will be written."

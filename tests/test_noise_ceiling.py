@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.simulation.noise import generate_ar1_noise
 from fastfuncstuff.stats.noise_ceiling import (
     df_corrected_ceiling,
     loro_two_half_ceiling,
@@ -323,3 +324,79 @@ class TestExplainableR2:
         summary = result.summarize(result.explainable_r2(torch.full((110,), 0.2)))
         assert "10 voxels" in summary
         assert "0.4000" in summary
+
+
+class TestCeilingUnderColouredNoise:
+    """The two-half construction assumes E[e_A e_B] = 0. White noise is where
+    that assumption is least likely to fail, and every other test here plants
+    its ratio by scaling ``torch.randn`` -- so none of them probe it.
+
+    This one builds the noise with the simulator instead, giving it the temporal
+    autocorrelation real fMRI has. The target is *measured* from the generated
+    components rather than planted analytically, which keeps ground truth exact
+    without requiring the noise to be white.
+    """
+
+    @staticmethod
+    def _grand_centred_ratio(signal: torch.Tensor, data: torch.Tensor) -> torch.Tensor:
+        """var(signal)/var(y), centred the way the estimator pools its folds.
+
+        Under LORO every timepoint is held out exactly once, so the estimator's
+        denominator is the grand-centred variance over the whole timeseries.
+        """
+        centred_signal = signal - signal.mean(dim=1, keepdim=True)
+        centred_data = data - data.mean(dim=1, keepdim=True)
+        return centred_signal.square().sum(dim=1) / centred_data.square().sum(dim=1)
+
+    def test_recovers_the_ceiling_under_ar1_noise(self):
+        n_runs, run_length, n_conditions, n_voxels = 8, 240, 6, 300
+        rho = 0.35
+        design, run_starts, n_timepoints = _condition_design(n_runs, run_length, n_conditions)
+        generator = torch.Generator().manual_seed(23)
+
+        design_t = torch.from_numpy(design)
+        betas = torch.randn(n_voxels, n_conditions, generator=generator)
+        signal = betas @ design_t.T
+
+        # Autocorrelated noise, generated per run: real runs are independent of
+        # one another, and a single continuous AR(1) draw would correlate across
+        # run boundaries in a way no acquisition does.
+        runs = [
+            generate_ar1_noise(
+                rho,
+                n_timepoints=run_length,
+                n_voxels=n_voxels,
+                device=torch.device("cpu"),
+                generator=generator,
+            ).T
+            for _ in range(n_runs)
+        ]
+        noise = torch.cat(runs, dim=1)
+
+        target = 0.25
+        signal_var = signal.var(dim=1, keepdim=True)
+        noise = noise * (signal_var * (1.0 - target) / target).sqrt()
+        data = signal + noise
+
+        # Guard the premise: if the noise were not actually autocorrelated this
+        # test would silently degrade into a duplicate of the white-noise one.
+        centred = noise - noise.mean(dim=1, keepdim=True)
+        lag1 = ((centred[:, :-1] * centred[:, 1:]).sum(dim=1) / centred.square().sum(dim=1)).mean()
+        assert lag1.item() > 0.25
+
+        expected = self._grand_centred_ratio(signal, data).median().item()
+
+        cv_splits = [([r for r in range(n_runs) if r != held], [held]) for held in range(n_runs)]
+        result = loro_two_half_ceiling(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=list(range(n_conditions)),
+            nuisance_indices=[],
+            cv_splits=cv_splits,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+
+        assert result.n_usable == n_runs
+        assert result.ceiling.median().item() == pytest.approx(expected, abs=0.02)
