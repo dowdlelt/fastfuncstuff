@@ -37,6 +37,7 @@ except ImportError:
 try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+        add_noise_ceiling_args,
         add_ortvec_arguments,
         add_verbose_arg,
         auto_polort,
@@ -44,6 +45,7 @@ try:
         collect_nuisance_blocks,
         compute_run_lengths,
         get_average_run_duration,
+        parse_cv_strategy,
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
@@ -529,6 +531,35 @@ Examples:
         "evaluates R² on condition-averaged vs individual trial betas across folds. "
         "Requires -onsets (not -matrix). "
         "NOTE: This is different from -single_trials (which reorders output by onset time).",
+    )
+    stats_opts.add_argument(
+        "-xval_r2",
+        "-xval-r2",
+        dest="xval_r2",
+        action="store_true",
+        help="Cross-validated R² on the condition-level design: betas fitted on "
+        "the training runs predict each held-out run's timecourse (LORO by "
+        "default, see -cv_strategy). The ARMA(1,1) parameters are NOT "
+        "re-estimated per fold -- they are reused from the whole-data fit, so "
+        "only the betas are refitted. That leaks slightly, but into the noise "
+        "model rather than the betas that generate the prediction, and it avoids "
+        "multiplying the tool's most expensive stage by the fold count. R² is "
+        "reported in unwhitened units, so it is directly comparable to "
+        "ffs_denoise and ffs_hrfopt. Written to {prefix}_xval_r2.nii.gz.",
+    )
+    stats_opts.add_argument(
+        "-cv_strategy",
+        "-cv-strategy",
+        dest="cv_strategy",
+        default="loro",
+        help="Cross-validation strategy for -xval_r2: 'loro' or '1' for "
+        "leave-one-run-out (default), '0.5' for split-halves, any float in (0,1) "
+        "for that training fraction, any int > 1 for leave-N-out.",
+    )
+    add_noise_ceiling_args(
+        stats_opts,
+        stage_note="Requires -xval_r2, whose folds it shares so the ceiling and "
+        "the R2 are measured on the same held-out timepoints.",
     )
 
     # ARMA grid options
@@ -1019,6 +1050,131 @@ def _voxels_to_4d_volume(data_2d, volume_shape, voxel_mask) -> np.ndarray:
     else:
         vol[...] = arr.reshape(*volume_shape, n_time)
     return vol
+
+
+def _resolve_xval_prefix(args) -> str:
+    """Where the cross-validation maps go, given ffs_reml has no single -prefix.
+
+    The tool names each output independently (-Rbuck, -Rerrts, ...), so there is
+    no prefix to hang a new map off. -Rbuck is the stats bucket every real run
+    writes, which makes it the least surprising anchor; the explicit -prefix
+    wins when given.
+    """
+    if getattr(args, "prefix", None):
+        return str(args.prefix)
+    for candidate in (args.Rbuck, args.Obuck, args.Rbeta, args.Obeta):
+        if candidate:
+            return replace_afni_extension(str(candidate), "").rsplit(".nii", 1)[0]
+    return "ffs_reml"
+
+
+def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=None) -> None:
+    """Held-out R2 on the condition design, plus its ceiling, written as maps.
+
+    Kept out of ``main`` because it is self-contained: everything it needs is
+    already computed by the time it runs, and it writes its own outputs.
+    """
+    import torch as _torch
+
+    from fastfuncstuff.glm.reml_xval import compute_xval_r2_arma
+    from fastfuncstuff.glm.xval import generate_cv_splits
+
+    arma_params = getattr(results, "arma_params", None)
+    if arma_params is None:
+        print("  ⚠️  -xval_r2 needs ARMA parameters; skipped (OLS-only run).")
+        return
+
+    run_starts = list(design_info.get("run_starts") or [0])
+    if len(run_starts) < 2:
+        print("  ⚠️  -xval_r2 needs at least 2 runs; skipped.")
+        return
+
+    if not isinstance(fmri_data, (np.ndarray, _torch.Tensor)):
+        # The data would have to be re-read from disk, and the fit has already
+        # freed it. Say so rather than silently doing a second full load.
+        print(
+            "  ⚠️  -xval_r2 needs the data resident in memory, which this run's "
+            "load path did not keep. Re-run without -no_guard (the default keeps "
+            "it) to enable cross-validation."
+        )
+        return
+
+    data = _torch.as_tensor(np.asarray(fmri_data))
+    if data.ndim == 4:
+        data = data.reshape(-1, data.shape[-1])
+    voxel_mask = getattr(results, "voxel_mask", None)
+    if voxel_mask is not None:
+        data = data[_torch.as_tensor(np.asarray(voxel_mask)).reshape(-1).bool()]
+    data = data.float()
+
+    design = np.asarray(design_info["matrix"], dtype=np.float32)
+    stim_indices = list(design_info["stim_indices"])
+    nuisance_indices = list(design_info["nuisance_indices"])
+
+    strategy = parse_cv_strategy(str(args.cv_strategy))
+    cv_splits = generate_cv_splits(len(run_starts), strategy=strategy)
+    print()
+    print(f"📈 Cross-validated R² on the condition design ({len(cv_splits)} folds)")
+
+    xval = compute_xval_r2_arma(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        stim_indices=stim_indices,
+        nuisance_indices=nuisance_indices,
+        cv_splits=cv_splits,
+        arma_params=arma_params.detach().cpu(),
+        device=device,
+        verbose=args.verb >= 1,
+    )
+    xval_r2 = xval["r2"]
+    assert isinstance(xval_r2, _torch.Tensor)
+    finite = xval_r2[_torch.isfinite(xval_r2)]
+    if finite.numel():
+        print(
+            f"  Median xval R²: {finite.median():.4f}  (positive in {(finite > 0).float().mean() * 100:.1f}% of voxels)"
+        )
+
+    prefix = _resolve_xval_prefix(args)
+    geometry = geometry or {}
+    volume_shape = geometry.get("volume_shape") or getattr(results, "original_shape", None)
+    if volume_shape is not None:
+        volume_shape = tuple(volume_shape)[:3]
+    affine = geometry.get("affine")
+    header = geometry.get("nifti_header")
+
+    def _save(values: _torch.Tensor, name: str) -> None:
+        if volume_shape is None:
+            print(f"  ⚠️  no volume geometry available; {name} not written")
+            return
+        vol = _voxels_to_4d_volume(
+            values.detach().cpu().numpy()[:, None], volume_shape, voxel_mask
+        )[..., 0]
+        path = f"{prefix}_{name}.nii.gz"
+        save_nifti(vol, path, affine=affine, header=header)
+        print(f"  • {name}: {path}")
+
+    _save(xval_r2, "xval_r2")
+
+    if args.noise_ceiling in ("auto", "loro"):
+        from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+        ceiling = loro_two_half_ceiling(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=stim_indices,
+            nuisance_indices=nuisance_indices,
+            cv_splits=cv_splits,  # same folds: that is what makes them comparable
+            device=device,
+            verbose=False,
+        )
+        print(f"  Noise ceiling: {ceiling.summarize(ceiling.explainable_r2(xval_r2))}")
+        for note in ceiling.notes:
+            print(f"  NOTE: {note}")
+        if ceiling.n_usable:
+            _save(ceiling.ceiling, "noise_ceiling")
+            _save(ceiling.explainable_r2(xval_r2), "explainable_r2")
 
 
 def _derive_rvar_path(rbuck_path: str) -> str:
@@ -2901,6 +3057,20 @@ def main():
             missing_min_task_mass=args.guard_min_task_mass,
             missing_min_task_runs=args.guard_min_task_runs,
         )
+
+        # ── Cross-validated R2 on the condition design, and its ceiling ──────
+        # Runs after the fit because it reuses that fit's ARMA parameters; only
+        # the betas are refitted per fold. See glm/reml_xval.py for why that
+        # trade is the right one.
+        if args.xval_r2:
+            _run_condition_xval(
+                args,
+                results,
+                design_info,
+                fmri_data_to_use,
+                device,
+                geometry=preproc_cached_metadata or cache_metadata or {},
+            )
 
         # ── Missing-data bookkeeping ─────────────────────────────────────────
         # Written after the fit because -handle_missing only knows which
