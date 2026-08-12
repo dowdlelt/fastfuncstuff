@@ -71,11 +71,14 @@ def _resample(
     matrix: torch.Tensor,
     out_shape: tuple[int, int, int],
     final_interp: str,
+    no_neg: bool = False,
 ) -> torch.Tensor:
     """Pull-resample a source volume through ``matrix`` onto ``out_shape`` (final interp)."""
     if final_interp == "wsinc5":
-        return apply_affine_wsinc5(source_vol, matrix, out_shape)
-    return apply_affine(source_vol, matrix, out_shape, zero_outside=True)
+        warped = apply_affine_wsinc5(source_vol, matrix, out_shape)
+    else:
+        warped = apply_affine(source_vol, matrix, out_shape, zero_outside=True)
+    return warped.clamp_min(0.0) if no_neg else warped
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -234,6 +237,14 @@ Examples:
         default="linear",
         dest="final_interp",
         help="For output image (default: linear). wsinc5 gives sharpest results",
+    )
+    interp_group.add_argument(
+        "-no_neg",
+        "-no-neg",
+        dest="no_neg",
+        action="store_true",
+        help="Clamp the output image at 0 to suppress wsinc5/cubic negative ringing "
+        "on non-negative data (magnitude, masks, probability maps).",
     )
 
     # --- Masking ---
@@ -511,7 +522,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         )
         matrix = matrix.to(device)
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
-        warped = _resample(source, om, out_shape, args.final_interp)
+        warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
         with spinner(f"Writing {Path(args.prefix).name}"):
             save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
@@ -616,7 +627,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     # `warped` on the base grid). Same transform, finer/coarser output.
     if args.dxyz is not None:
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
-        warped = _resample(source, om, out_shape, args.final_interp)
+        warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
+    elif args.no_neg:
+        warped = warped.clamp_min(0.0)
     with spinner(f"Writing {Path(args.prefix).name}"):
         save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
     if verb >= 1:
@@ -639,7 +652,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             print(f"Applying alignment to all {source_4d.shape[0]} volumes...")
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
         aligned_vols = [
-            _resample(source_4d[t], om, out_shape, args.final_interp)
+            _resample(source_4d[t], om, out_shape, args.final_interp, args.no_neg)
             for t in range(source_4d.shape[0])
         ]
         result_4d = torch.stack(aligned_vols)
