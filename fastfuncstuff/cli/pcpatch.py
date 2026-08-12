@@ -14,9 +14,8 @@ import time
 
 import numpy as np
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.pcpatch import PCPatchConfig, run_pcpatch
-from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -165,8 +164,7 @@ def main(argv: list[str] | None = None) -> None:
         ort = np.loadtxt(args.ort, ndmin=2).astype(np.float32)
 
     prefix = parse_prefix(args.prefix).stem
-    device = get_device(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
 
     print_cli_header("ffs_pcpatch", "Patch-based residual-PC projection")
     print(

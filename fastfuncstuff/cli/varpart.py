@@ -21,7 +21,7 @@ import numpy as np
 import torch
 
 try:
-    from fastfuncstuff.cli_utils import parse_prefix
+    from fastfuncstuff.cli_utils import parse_prefix, setup_device
     from fastfuncstuff.design.trial_table import (
         canonicalize_label,
         level_identifier,
@@ -35,7 +35,6 @@ try:
         partition_variance,
         permutation_test,
     )
-    from fastfuncstuff.utils import configure_torch_backends, get_device
 except ImportError as e:  # pragma: no cover - install-time guard
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     sys.exit(1)
@@ -497,8 +496,7 @@ def _apply_drop_trials(rows: list[dict], drops: list[list[str]] | None) -> np.nd
 
 def main() -> int:
     args = create_parser().parse_args()
-    device = get_device(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
 
     print("=" * 70)
     print("ffs_varpart - variance partitioning")

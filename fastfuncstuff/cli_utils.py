@@ -2070,6 +2070,46 @@ def add_load_threads_arg(parser_or_group) -> None:
     )
 
 
+def add_device_arg(
+    parser_or_group,
+    *,
+    default: str | None = None,
+    extra: str = "",
+) -> None:
+    """Register ``-device`` with the spec the canonical parser actually accepts.
+
+    The help text advertises ``cuda,N`` and ``cpu,N`` deliberately: pinning a
+    card matters on a shared GPU, and users only find the form if the tool
+    names it. Pair with :func:`setup_device`, never with ``torch.device(...)``
+    directly — bare torch rejects every comma form.
+    """
+    parser_or_group.add_argument(
+        "-device",
+        default=default,
+        metavar="SPEC",
+        help="Compute device: auto, cpu, cuda, mps. Append ',N' to pin a CUDA "
+        "device (cuda,0) or cap CPU threads (cpu,8)." + (f" {extra}" if extra else ""),
+    )
+
+
+def setup_device(
+    device_spec: str | None,
+    *,
+    tf32: bool = True,
+) -> torch.device:
+    """Resolve ``-device`` and configure the torch backends in one step.
+
+    The one-call form exists because the two halves were drifting apart: a tool
+    that parsed the device by hand also tended to drop the ``cpu,N`` thread
+    override on the floor. Registration tools pass ``tf32=REGISTRATION_TF32``.
+    """
+    from .utils import configure_torch_backends
+
+    device, cpu_threads_override, _cuda_device_id = parse_device_arg(device_spec)
+    configure_torch_backends(device, n_threads=cpu_threads_override, tf32=tf32)
+    return device
+
+
 def parse_device_arg(
     device_spec: str | None,
 ) -> tuple[torch.device, int | None, int | None]:

@@ -23,6 +23,7 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     parse_prefix,
     run_batch_jobs,
+    setup_device,
     spinner,
 )
 from fastfuncstuff.processing.affine import (
@@ -55,6 +56,7 @@ from fastfuncstuff.processing.shiftcorr import (
     save_shift_tables,
     shift_table_paths,
 )
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 # Sentinel for `-save_mean` / `-save_max` / `-save_min` given with no value:
 # derive the path from -prefix.
@@ -661,13 +663,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _select_device(arg_device: str | None) -> torch.device:
     """Resolve the -device flag (or auto-detect)."""
-    if arg_device:
-        return torch.device(arg_device)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return setup_device(arg_device, tf32=REGISTRATION_TF32)
 
 
 def _parse_base(args: argparse.Namespace, verb: int) -> tuple[torch.Tensor | None, int]:

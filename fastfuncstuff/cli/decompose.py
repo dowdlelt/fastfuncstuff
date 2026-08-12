@@ -76,9 +76,8 @@ import sys
 from pathlib import Path
 
 import numpy as np
-import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.decomposition.ica import (
     FastICA,
     ica_stability_analysis,
@@ -89,7 +88,6 @@ from fastfuncstuff.decomposition.io import save_decomposition_results
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.decomposition.tools import parse_num_comps_spec
 from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
-from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -281,13 +279,7 @@ def main():
     _nii_ext = pfx.nifti_ext
 
     # Setup device (-cpu is an alias for -device cpu)
-    if args.cpu:
-        device = torch.device("cpu")
-    elif args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device("cpu" if args.cpu else args.device)
 
     if args.verb >= 1:
         print(f"Using device: {device}")

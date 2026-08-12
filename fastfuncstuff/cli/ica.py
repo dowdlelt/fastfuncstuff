@@ -46,6 +46,7 @@ try:
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        setup_device,
         spinner,
     )
     from fastfuncstuff.decomposition import (
@@ -72,9 +73,7 @@ try:
     )
     from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
     from fastfuncstuff.utils import (
-        configure_torch_backends,
         gaussian_blur_3d,
-        get_device,
         scale_to_percent_signal,
         to_tensor,
     )
@@ -4067,13 +4066,7 @@ def main() -> None:
         raise FileNotFoundError(f"-depth_mask file not found: {args.depth_mask}")
 
     args._n_runs_total = len(input_files)
-    if args.cpu:
-        device = torch.device("cpu")
-    elif args.device is not None:
-        device = torch.device(args.device)
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device("cpu" if args.cpu else args.device)
 
     print_cli_header("ffs_ica.py", "Fast run-wise whole-brain ICA")
     print(f"Device: {device}")

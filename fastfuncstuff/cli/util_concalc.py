@@ -39,7 +39,7 @@ import torch
 
 from fastfuncstuff.cli.design_spec import _do_compile as _design_spec_compile
 from fastfuncstuff.cli.design_spec import _resolve_spec_path
-from fastfuncstuff.cli_utils import spinner
+from fastfuncstuff.cli_utils import setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.io.afni import load_nifti, read_afni_design_matrix
@@ -840,11 +840,7 @@ def main() -> int:
             & ((a_map != 0) | (b_map != 0))
         )
 
-    device = (
-        torch.device(args.device)
-        if args.device
-        else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-    )
+    device = setup_device(args.device)
     if args.verb >= 1:
         print(f"🖥️  Device: {device}")
 

@@ -22,6 +22,7 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     collect_batch_jobs,
     run_batch_jobs,
+    setup_device,
 )
 from fastfuncstuff.processing.io import derive_prefixed_output_path
 from fastfuncstuff.processing.nwarpforge import (
@@ -29,6 +30,7 @@ from fastfuncstuff.processing.nwarpforge import (
     nwarpforge,
     parse_nwarp_string,
 )
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -321,13 +323,7 @@ Examples:
 
 def _select_device(device_arg: str | None) -> torch.device:
     """Resolve -device (explicit wins, else cuda → mps → cpu)."""
-    if device_arg:
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return setup_device(device_arg, tf32=REGISTRATION_TF32)
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:

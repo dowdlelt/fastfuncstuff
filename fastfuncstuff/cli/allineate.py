@@ -27,6 +27,7 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     collect_batch_jobs,
     run_batch_jobs,
+    setup_device,
     spinner,
 )
 from fastfuncstuff.processing.affine import (
@@ -38,6 +39,7 @@ from fastfuncstuff.processing.affine import (
 )
 from fastfuncstuff.processing.allineate import AffineAlignConfig, allineate
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def _output_grid(
@@ -388,13 +390,7 @@ Examples:
 
 def _select_device(device_arg: str | None) -> torch.device:
     """Honour ``-device`` if given, else CUDA > MPS > CPU."""
-    if device_arg:
-        return torch.device(device_arg)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return setup_device(device_arg, tf32=REGISTRATION_TF32)
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:

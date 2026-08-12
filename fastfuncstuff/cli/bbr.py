@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.bbr import (
     MODE_FREE_PARAMS,
@@ -62,7 +62,7 @@ from fastfuncstuff.processing.tissue import (
     tissue_projector,
     tissue_synthesis_cost,
 )
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def _normalize_targets(tokens: list[str]) -> set[str]:
@@ -322,13 +322,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     verb = args.verb
 
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
     if verb:
         print(f"ffs_bbr: device={device}")
 

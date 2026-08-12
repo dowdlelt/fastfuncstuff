@@ -45,6 +45,7 @@ from fastfuncstuff.cli_utils import (
     image_support,
     parse_prefix,
     sanitize_volume,
+    setup_device,
     spinner,
 )
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
@@ -61,7 +62,7 @@ from fastfuncstuff.processing.optiwarp import (
     optiwarp,
 )
 from fastfuncstuff.processing.warp import QwarpConfig
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -490,17 +491,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Select device (prefer CUDA > MPS > CPU), honouring -device end to end.
-    if args.device is not None:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-        if args.verb >= 1:
-            print("WARNING: no GPU available, running on CPU")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    if device.type == "cpu" and args.device is None and args.verb >= 1:
+        print("WARNING: no GPU available, running on CPU")
 
     if args.verb >= 1:
         print(f"ffs_optiwarp: device={device}")

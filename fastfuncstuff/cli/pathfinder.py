@@ -63,6 +63,7 @@ try:
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
+        setup_device,
         spinner,
     )
     from fastfuncstuff.denoise.sequential import (
@@ -87,7 +88,6 @@ try:
         save_nifti,
     )
     from fastfuncstuff.utils import (
-        configure_torch_backends,
         gaussian_blur_3d,
         get_device,
         scale_to_percent_signal,
@@ -1359,11 +1359,7 @@ def main():
     cv_strategy = parse_cv_strategy(args.cv_strategy)
 
     # Setup device
-    if args.device:
-        device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     print(f"  Device: {device}")
 
     # Load data

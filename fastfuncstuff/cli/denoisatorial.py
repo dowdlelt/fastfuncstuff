@@ -58,6 +58,7 @@ try:
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        setup_device,
     )
     from fastfuncstuff.denoise.combinatorial import (
         CombinatorialDenoiseResults,
@@ -76,8 +77,6 @@ try:
     from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.utils import (
-        configure_torch_backends,
-        get_device,
         scale_to_percent_signal,
         to_tensor,  # noqa: F401
     )
@@ -1049,11 +1048,7 @@ def main():
     print(f"  Max PCs: {args.max_pcs} -> {n_combos} combinations per run")
 
     # Setup device
-    if args.device:
-        device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     print(f"  Device: {device}")
 
     # ======================================================================

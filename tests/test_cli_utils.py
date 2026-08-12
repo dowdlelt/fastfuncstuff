@@ -16,6 +16,7 @@ Tests critical utility functions used by all CLI tools:
 from pathlib import Path
 
 import pytest
+import torch
 
 from fastfuncstuff.cli_utils import (
     auto_polort,
@@ -205,6 +206,49 @@ class TestCliUtilsCoreFunctions:
         assert device is not None
         assert cpu_threads is None
         assert cuda_id is None
+
+    def test_setup_device_accepts_every_documented_spec(self):
+        """setup_device parses the comma forms bare torch.device() rejects.
+
+        Bug of record: 34 CLIs hand-rolled ``torch.device(args.device)``, which
+        raises RuntimeError on 'cpu,8' / 'cuda,0' / 'auto' — so pinning a card
+        or capping threads died with an opaque traceback.
+        """
+        from fastfuncstuff.cli_utils import setup_device
+
+        for spec in (None, "auto", "cpu", "cpu,2"):
+            assert setup_device(spec) is not None
+
+        # The forms the hand-rolled idiom could not handle.
+        for spec in ("auto", "cpu,2", "cuda,0"):
+            with pytest.raises(RuntimeError):
+                torch.device(spec)
+
+    def test_setup_device_rejects_nonsense(self):
+        from fastfuncstuff.cli_utils import setup_device
+
+        with pytest.raises(ValueError):
+            setup_device("gpu")
+
+    def test_no_cli_hand_rolls_device_parsing(self):
+        """Guard: -device must be resolved by the canonical parser, everywhere.
+
+        ffs_benchmark is exempt — it forwards the raw spec string to the
+        sub-tools it invokes rather than resolving a device of its own.
+        """
+        cli_dir = Path(__file__).resolve().parent.parent / "fastfuncstuff" / "cli"
+        offenders = []
+        for path in sorted(cli_dir.glob("*.py")):
+            if path.stem in {"__init__", "benchmark"}:
+                continue
+            src = path.read_text()
+            if '"-device"' not in src:
+                continue
+            if "setup_device" not in src and "parse_device_arg" not in src:
+                offenders.append(path.stem)
+            if "torch.device(args.device)" in src:
+                offenders.append(f"{path.stem} (torch.device(args.device))")
+        assert not offenders, f"CLIs bypassing the canonical device parser: {offenders}"
 
 
 # ============================================================================

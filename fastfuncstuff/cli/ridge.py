@@ -63,6 +63,7 @@ try:
         preflight_check,
         save_4d_nifti,
         save_volume_nifti,
+        setup_device,
         spinner,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
@@ -72,7 +73,7 @@ try:
         load_hrf_indices,
         load_noise_pcs,
     )
-    from fastfuncstuff.utils import configure_torch_backends, get_device, scale_to_percent_signal
+    from fastfuncstuff.utils import scale_to_percent_signal
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -428,11 +429,7 @@ def main():
     # 2. Load data
     # ========================================================================
     print()
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device(args.device)
 
     print(f"Device: {device}")
     print()

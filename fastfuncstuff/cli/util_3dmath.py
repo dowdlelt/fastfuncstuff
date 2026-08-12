@@ -30,7 +30,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import spinner
+from fastfuncstuff.cli_utils import setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 
 # Expression helpers exposed to -expr (3dcalc-style), kept intentionally small.
@@ -151,7 +151,7 @@ def main() -> int:
         print(f"ERROR: {args.prefix} exists (use -overwrite).", file=sys.stderr)
         return 1
 
-    dev = torch.device(args.device)
+    dev = setup_device(args.device)
     # -tcat stacks along time, so only the spatial lattice has to agree; every
     # other op is voxelwise and needs the full shape to match.
     key = (lambda s: s[-3:]) if args.op == "tcat" else (lambda s: s)

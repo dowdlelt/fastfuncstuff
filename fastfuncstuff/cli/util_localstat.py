@@ -19,7 +19,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.stats.localstat import (
     ACF_LABELS,
@@ -27,6 +27,7 @@ from fastfuncstuff.stats.localstat import (
     local_acf,
     local_fwhm,
 )
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 # Per-stat default neighborhoods (used when -nbhd is omitted).
 _DEFAULT_NBHD = {"ACF": "SPHERE(-9.666)", "FWHM": "SPHERE(-2.0)"}
@@ -78,13 +79,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def _select_device(name: str | None) -> torch.device:
-    if name:
-        return torch.device(name)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return setup_device(name, tf32=REGISTRATION_TF32)
 
 
 def main(argv: list[str] | None = None) -> None:

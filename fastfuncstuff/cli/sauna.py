@@ -7,9 +7,8 @@ import argparse
 import sys
 import time
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.sauna import SaunaConfig, run_sauna
-from fastfuncstuff.utils import configure_torch_backends, get_device
 
 
 class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
@@ -194,8 +193,7 @@ def main(argv: list[str] | None = None) -> None:
     prefix_info = parse_prefix(args.prefix)
     prefix = prefix_info.stem
 
-    device = get_device(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
 
     print_cli_header("ffs_sauna", "SAUNA: Signal-Adaptive Unbiased Noise Attenuation")
     print(f"Input magnitude: {args.input_magn}")

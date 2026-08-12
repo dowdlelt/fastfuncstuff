@@ -18,10 +18,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.locomoco import resolve_pe_axis
 from fastfuncstuff.processing.shiftcorr import apply_shift, estimate_shifts, save_shift_tables
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 # Siemens phase images are stored as int16 over ±4096 -> radians.
 _DEFAULT_PHASE_SCALE = math.pi / 4096.0
@@ -196,13 +197,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _select_device(arg_device: str | None) -> torch.device:
     """Resolve the -device flag (or auto-detect)."""
-    if arg_device:
-        return torch.device(arg_device)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+    return setup_device(arg_device, tf32=REGISTRATION_TF32)
 
 
 def _sibling(path: str, prefix: str) -> str:

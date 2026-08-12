@@ -35,7 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -300,7 +300,7 @@ def _make_plot(
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
-    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.cli_utils import setup_device, spinner
     from fastfuncstuff.processing.io import load_image
     from fastfuncstuff.stats.spatial import (
         consistency_report,
@@ -308,15 +308,7 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     # Device selection
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     t0 = time.time()
     thresholds = tuple(float(x) for x in args.thresholds.split(","))

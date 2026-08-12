@@ -38,6 +38,7 @@ from fastfuncstuff.cli_utils import (
     parse_prefix,
     run_batch_jobs,
     sanitize_volume,
+    setup_device,
     spinner,
 )
 from fastfuncstuff.processing.affine import apply_affine_interp, load_matrix_1D
@@ -52,6 +53,7 @@ from fastfuncstuff.processing.formwarp import (
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
 from fastfuncstuff.processing.mask import data_coverage_mask
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -258,15 +260,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _select_device(args: argparse.Namespace) -> torch.device:
     """Honour ``-device`` if given, else CUDA > MPS > CPU."""
-    if args.device is not None:
-        return torch.device(args.device)
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    if args.verb >= 1:
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    if device.type == "cpu" and args.device is None and args.verb >= 1:
         print("WARNING: no GPU available, running on CPU")
-    return torch.device("cpu")
+    return device
 
 
 def _warp_stem(args: argparse.Namespace, pfx) -> str:

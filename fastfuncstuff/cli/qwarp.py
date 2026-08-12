@@ -29,7 +29,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import (
@@ -44,7 +44,7 @@ from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
 from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1282,17 +1282,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Select device (prefer CUDA > MPS > CPU)
-    if args.device is not None:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-        if args.verb >= 1:
-            print("WARNING: No GPU available, running on CPU (will be slow)")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    if device.type == "cpu" and args.device is None and args.verb >= 1:
+        print("WARNING: No GPU available, running on CPU (will be slow)")
 
     if args.verb >= 1:
         print(f"qwarp_torch: device={device}")

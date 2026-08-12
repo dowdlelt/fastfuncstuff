@@ -29,7 +29,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.cli_utils import setup_device
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def _axis_from_token(tok: str) -> int:
@@ -1776,11 +1777,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
 
-    if args.device:
-        device = torch.device(args.device)
-    else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     stem, ext = _split_prefix(args.prefix)
 

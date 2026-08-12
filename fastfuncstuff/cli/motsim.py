@@ -12,7 +12,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, spinner
+from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
     automask_dilate,
@@ -26,7 +26,7 @@ from fastfuncstuff.processing.motsim import (
     save_1d,
 )
 from fastfuncstuff.processing.nwarpforge import load_affine_1D
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -136,15 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
 
     # Device
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     if args.verb >= 1:
         print(f"ffs_motsim: device={device}")

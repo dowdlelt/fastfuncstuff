@@ -34,7 +34,7 @@ import sys
 
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg
+from fastfuncstuff.cli_utils import add_verbose_arg, setup_device
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -272,8 +272,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # Auto-detect device unless the user forced one (cuda if available, else cpu).
-    if args.device is None:
-        args.device = "cuda" if torch.cuda.is_available() else "cpu"
+    pca_device = setup_device(args.device)
+    args.device = str(pca_device)
 
     # --- Validate inputs: exactly one of -warp_dir / -warp ---
     if bool(args.warp_dir) == bool(args.warp):
@@ -380,7 +380,6 @@ def main(argv: list[str] | None = None) -> int:
     # Keep the data and the PCA on the SAME device: PCA.fit centers X in place and
     # fit_transform relies on that, so a device mismatch (e.g. cpu data but PCA
     # defaulting to cuda) would project uncentered data and corrupt the scores.
-    pca_device = torch.device(args.device)
     mat = mat.to(pca_device)
     pca = PCA(n_components=n_fit, device=pca_device)
     scores = pca.fit_transform(mat)  # (n_vols, n_fit)

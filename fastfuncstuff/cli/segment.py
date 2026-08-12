@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import spinner
+from fastfuncstuff.cli_utils import setup_device, spinner
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
@@ -715,7 +715,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = setup_device(args.device)
     verbose = not args.quiet
     if verbose:
         print(f"ffs_segment on {device}: {args.input}")

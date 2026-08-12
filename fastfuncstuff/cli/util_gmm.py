@@ -34,11 +34,17 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, spinner
+from fastfuncstuff.cli_utils import (
+    add_verbose_arg,
+    parse_prefix,
+    print_cli_header,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.decomposition import io as decomposition_io
 from fastfuncstuff.decomposition.tools import batch_mixture_zscores
 from fastfuncstuff.io.afni import load_nifti, save_nifti
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -119,13 +125,7 @@ def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     verb = args.verb
 
-    if args.device:
-        device = torch.device(args.device)
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     _pfx = parse_prefix(args.prefix)
     out_prefix, nii_ext = _pfx.stem, _pfx.nifti_ext
