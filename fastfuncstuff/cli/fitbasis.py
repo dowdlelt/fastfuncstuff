@@ -77,7 +77,10 @@ from tqdm.auto import tqdm
 try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
+        add_ortvec_arguments,
         add_verbose_arg,
+        append_nuisance_blocks,
+        collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
@@ -310,14 +313,35 @@ def create_parser() -> argparse.ArgumentParser:
         metavar="SOURCE",
         help=(
             "Select a per-voxel response shape before fitting delays, from "
-            "'library' (20 double-gammas), 'pighs' (half-cosines), or "
+            "'library' (20 double-gammas), 'pighs' (half-cosines), "
             "'flobs' (curves drawn from the empirical FLOBS coefficient "
             "prior, so every candidate is a shape that prior calls "
-            "sensible).  Overrides -shift-hrf.  Two stages on purpose: "
+            "sensible), or a path to a custom HRF library TSV (ffs_librarian "
+            "output).  Overrides -shift-hrf; defaults to 'library' when "
+            "-shift-shape-index is given.  Two stages on purpose: "
             "shape is chosen at zero delay, then delays are fit within "
             "each shape group — with both free at once a wrong shape can "
             "masquerade as a delay and neither means what it says.  Cheap, "
             "because the design bank depends on the shape, not the voxel."
+        ),
+    )
+    shift_grp.add_argument(
+        "-shift-shape-index",
+        "-shift_shape_index",
+        dest="shift_shape_index",
+        default=None,
+        metavar="MAP",
+        help=(
+            "Skip shape selection and take the per-voxel shape from an "
+            "existing HRF index map — sub-brick 0 of "
+            "{prefix}_hrf_index.nii.gz from ffs_hrfopt (1-based indices "
+            "into the HRF library).  -shift-shapes then only supplies the "
+            "curves, and must be the SAME library the indices were fit "
+            "against (default 'library'; pass the ffs_librarian TSV if you "
+            "ran ffs_hrfopt -hrf-library).  Preferred over letting this "
+            "tool pick: ffs_hrfopt selects on cross-validated R² and can "
+            "run on denoised data, where the selection here is in-sample "
+            "at zero delay."
         ),
     )
     shift_grp.add_argument(
@@ -702,6 +726,17 @@ def create_parser() -> argparse.ArgumentParser:
         help="Polynomial drift order (per run).  None → auto via run duration.",
     )
     proc.add_argument("-device", default="auto", help="Compute device: auto, cpu, cuda, mps.")
+
+    nuis_grp = parser.add_argument_group(
+        "External nuisance regressors",
+        description=(
+            "Motion, physio, or denoising components (e.g. ffs_denoise / "
+            "ffs_denoisatorial PC timeseries).  Columns join the per-run "
+            "polynomial block-diagonal, so they stay run-specific, and are "
+            "projected out alongside drift before the amplitudes are read."
+        ),
+    )
+    add_ortvec_arguments(nuis_grp)
     proc.add_argument(
         "-debug-design",
         "-debug_design",
@@ -917,6 +952,64 @@ def _resolve_shift_hrf(spec: str, dt: float, duration: float) -> np.ndarray:
     return np.asarray(h, dtype=np.float64) / peak
 
 
+def _load_shape_index_map(
+    path: str,
+    *,
+    n_shapes: int,
+    volume_shape,
+    mask,
+    n_voxels: int,
+) -> np.ndarray:
+    """Read an ``ffs_hrfopt`` HRF-index map into 0-based per-voxel indices.
+
+    ``{prefix}_hrf_index.nii.gz`` is a 2-sub-brick bucket: [0] is the
+    1-based HRF index, [1] the R² at that HRF.  Only sub-brick 0 is read,
+    and the 1→0 base conversion happens here so exactly one place in the
+    codebase knows about the off-by-one.
+
+    Voxels outside the mask never reach the fit; voxels the selection left
+    at 0 (no valid index — e.g. a voxel hrfopt's own mask excluded) fall
+    back to shape 0 rather than aborting, since a mask mismatch at the
+    edges is normal and shape 0 is a real curve.
+    """
+    from fastfuncstuff.io.afni import load_nifti
+
+    p = Path(path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"-shift-shape-index {path!r} does not exist.")
+    vol = np.asanyarray(load_nifti(str(p)).dataobj)
+    if vol.ndim == 4:
+        vol = vol[..., 0]
+    elif vol.ndim != 3:
+        raise ValueError(
+            f"-shift-shape-index {path!r}: expected a 3-D or 4-D volume, got {vol.shape}."
+        )
+    if tuple(vol.shape) != tuple(volume_shape):
+        raise ValueError(
+            f"-shift-shape-index {path!r} has grid {vol.shape} but the input "
+            f"data has {tuple(volume_shape)}.  The index map must be on the "
+            "same grid as -input (same ffs_hrfopt run, or resampled first)."
+        )
+    idx = np.rint(np.asarray(vol, dtype=np.float64)).astype(np.int64)
+    idx = idx[mask] if mask is not None else idx.reshape(-1)
+    if idx.size != n_voxels:
+        raise ValueError(
+            f"-shift-shape-index {path!r} yielded {idx.size} voxels but the "
+            f"data has {n_voxels}.  Use the same -mask as the ffs_hrfopt run."
+        )
+    # 1-based (hrfopt convention) → 0-based; unset voxels (0) become shape 0.
+    out = np.clip(idx - 1, 0, None)
+    too_big = out >= n_shapes
+    if too_big.any():
+        raise ValueError(
+            f"-shift-shape-index {path!r} contains index "
+            f"{int(idx[too_big].max())} (1-based) but the shape library has "
+            f"only {n_shapes} curves.  The map was fit against a different "
+            "library — pass it via -shift-shapes."
+        )
+    return out
+
+
 def _run_shift_mode(
     *,
     args,
@@ -931,6 +1024,7 @@ def _run_shift_mode(
     mask,
     device: torch.device,
     nii_ext: str,
+    extra_regs_per_run: list[torch.Tensor] | None = None,
 ) -> int:
     """-parametrization shift: per-block amplitude + bounded latency.
 
@@ -941,6 +1035,7 @@ def _run_shift_mode(
     """
     from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.design.shifted_hrf import (
+        append_blockdiag_extras,
         build_blockdiag_polys,
         build_shape_library,
         fit_shifted_hrf,
@@ -974,28 +1069,59 @@ def _run_shift_mode(
     print("\n  Parametrisation: shift (amplitude + bounded latency per block)")
     shapes = None
     shape_labels: list[str] = []
-    if args.shift_shapes:
+    imported_index: np.ndarray | None = None
+    # An imported index map only says WHICH curve each voxel took; the curves
+    # themselves still have to be rebuilt here, and the default library is
+    # what ffs_hrfopt uses unless the user pointed it elsewhere.
+    shape_source = args.shift_shapes or ("library" if args.shift_shape_index else None)
+    if shape_source:
         shapes, shape_labels = build_shape_library(
-            args.shift_shapes,
+            shape_source,
             args.flobs_dt,
             args.flobs_window,
             n_hrfs=args.shift_n_shapes,
+            drop_empty=args.shift_shape_index is None,
         )
         hrf = shapes[0]
-        print(
-            f"  Shape source: {args.shift_shapes} — {shapes.shape[0]} candidates, "
-            f"selected PER VOXEL at zero delay (overrides -shift-hrf)"
-        )
-        print(
-            "  NOTE: a shape library that varies PEAK TIME competes with the\n"
-            "        delay parameter — both move the response in time.  Measured\n"
-            "        on synthetic data with a true ±1.2 s delay, shape selection\n"
-            "        absorbed all of it (corr(shape, true delay)=0.99) and the\n"
-            "        held-out delay gain fell to zero.  With shapes on, read the\n"
-            "        delay map as RESIDUAL timing and shape_index as the main\n"
-            "        carrier of voxel-level timing.  For one clean absolute delay\n"
-            "        map, use a single -shift-hrf instead."
-        )
+        if args.shift_shape_index:
+            try:
+                imported_index = _load_shape_index_map(
+                    args.shift_shape_index,
+                    n_shapes=shapes.shape[0],
+                    volume_shape=volume_shape,
+                    mask=mask,
+                    n_voxels=data.shape[0],
+                )
+            except (FileNotFoundError, ValueError) as exc:
+                print(f"ERROR: {exc}", file=sys.stderr)
+                return 1
+            n_used = int(np.unique(imported_index).size)
+            print(
+                f"  Shape source: {shape_source} — {shapes.shape[0]} curves, "
+                f"assignment IMPORTED from {args.shift_shape_index} "
+                f"({n_used} distinct shape(s) in the mask)"
+            )
+            print(
+                "  NOTE: the imported indices must come from THIS library.  A\n"
+                "        different library (or a different -hrf_mode) makes each\n"
+                "        index point at an unrelated curve, and nothing here can\n"
+                "        detect that — only the range is checked."
+            )
+        else:
+            print(
+                f"  Shape source: {shape_source} — {shapes.shape[0]} candidates, "
+                f"selected PER VOXEL at zero delay (overrides -shift-hrf)"
+            )
+            print(
+                "  NOTE: a shape library that varies PEAK TIME competes with the\n"
+                "        delay parameter — both move the response in time.  Measured\n"
+                "        on synthetic data with a true ±1.2 s delay, shape selection\n"
+                "        absorbed all of it (corr(shape, true delay)=0.99) and the\n"
+                "        held-out delay gain fell to zero.  With shapes on, read the\n"
+                "        delay map as RESIDUAL timing and shape_index as the main\n"
+                "        carrier of voxel-level timing.  For one clean absolute delay\n"
+                "        map, use a single -shift-hrf instead."
+            )
     else:
         hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
         print(
@@ -1045,6 +1171,8 @@ def _run_shift_mode(
     run_bounds = [(int(_b[r]), int(_b[r + 1])) for r in range(n_runs)]
 
     Z = build_blockdiag_polys(n_tp_per_run, polort, device)
+    if extra_regs_per_run is not None:
+        Z = append_blockdiag_extras(Z, extra_regs_per_run, n_tp_per_run, device)
     shape_index = None
     if shapes is not None:
         fit, shape_index = fit_shifted_hrf_per_voxel_shape(
@@ -1052,6 +1180,7 @@ def _run_shift_mode(
             block_onsets=block_onsets,
             selection_block_onsets=cond_block_onsets,
             shapes=shapes,
+            shape_index=imported_index,
             hrf_dt=args.flobs_dt,
             tr=tr,
             nuisance=Z,
@@ -1184,6 +1313,15 @@ def _run_shift_mode(
             print("  -xval-r2 needs ≥2 runs; skipping.")
         else:
             print("\n  Held-out validation (LORO, condition-level generalisation)…")
+            if imported_index is not None:
+                print(
+                    "  NOTE: the imported shape assignment is held FIXED across\n"
+                    "        folds (it is an input to this model, not something\n"
+                    "        fitted here).  If it was selected on these same runs,\n"
+                    "        _xvalr2 is optimistic by that much; _xvalr2_delay_gain\n"
+                    "        is not, since both scored models carry the same shape\n"
+                    "        and only the delays are refit per fold."
+                )
             r2_shift, r2_tau0 = xval_shifted_hrf(
                 per_run_data=per_run_data,
                 per_run_condition_onsets=[
@@ -1196,6 +1334,8 @@ def _run_shift_mode(
                 polort=polort,
                 single_trials=args.single_trials,
                 shapes=shapes,
+                shape_index=imported_index,
+                extra_regs_per_run=extra_regs_per_run,
                 tau_max=args.tau_max,
                 tau_step=args.tau_step,
                 delay_prior_sd=args.delay_prior_sd,
@@ -1227,8 +1367,15 @@ def _run_shift_mode(
         "parametrization": "shift",
         "started": datetime.now().isoformat(timespec="seconds"),
         "tr": float(tr),
-        "hrf_source": (args.shift_hrf if shapes is None else f"per-voxel:{args.shift_shapes}"),
+        "hrf_source": (args.shift_hrf if shapes is None else f"per-voxel:{shape_source}"),
         "n_shape_candidates": (0 if shapes is None else int(shapes.shape[0])),
+        "shape_index_source": (
+            "imported" if imported_index is not None else ("fitted" if shapes is not None else None)
+        ),
+        "shape_index_map": args.shift_shape_index,
+        "ortvec_columns_per_run": (
+            0 if extra_regs_per_run is None else int(extra_regs_per_run[0].shape[1])
+        ),
         "tau_max": float(args.tau_max),
         "tau_step": float(args.tau_step),
         "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),
@@ -1259,6 +1406,15 @@ def main() -> int:
 
     if getattr(args, "delay_prior_sd", None) is not None and args.delay_prior_sd <= 0:
         args.delay_prior_sd = None
+
+    if args.shift_shape_index and args.parametrization != "shift":
+        print(
+            "ERROR: -shift-shape-index only applies to -parametrization shift. "
+            "The linear parametrisation has no per-voxel HRF — the basis set "
+            "IS its shape model, so an index map has nothing to select.",
+            file=sys.stderr,
+        )
+        return 1
 
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem
@@ -1425,6 +1581,32 @@ def main() -> int:
     n_tp_per_run = [run_starts_ext[r + 1] - run_starts_ext[r] for r in range(n_runs)]
     basis_lag_times = np.arange(basis.basis_functions.shape[1]) * basis.dt
 
+    # ── External nuisance (-ortvec family) ─────────────────────────
+    # Kept per-run on the block diagonal, exactly like the polynomials:
+    # denoising components estimated per run do not describe the other
+    # runs, and sharing them would let one run's noise soak up another's
+    # signal ([[Block-diagonal nuisance]]).
+    try:
+        nuisance_blocks = collect_nuisance_blocks(
+            args, run_starts=list(run_starts), n_timepoints=n_timepoints, verbose=True
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    extra_regs_per_run: list[torch.Tensor] | None = None
+    if nuisance_blocks:
+        extra_regs_per_run = append_nuisance_blocks(
+            [torch.zeros((n, 0), dtype=torch.float32) for n in n_tp_per_run],
+            nuisance_blocks,
+            list(run_starts),
+            n_timepoints,
+        )
+        n_extra = extra_regs_per_run[0].shape[1]
+        print(
+            f"  External nuisance: {n_extra} column(s) per run "
+            f"({n_extra * n_runs} total, block-diagonal)"
+        )
+
     # Auto-detect TR-lock vs sub-TR for the basis convolution path.
     all_onset_times = [
         float(t)
@@ -1490,6 +1672,7 @@ def main() -> int:
             mask=mask,
             device=device,
             nii_ext=nii_ext,
+            extra_regs_per_run=extra_regs_per_run,
         )
 
     # Build per-run design with K basis cols per block
@@ -1586,6 +1769,7 @@ def main() -> int:
                 task_column_labels=[
                     f"{lbl}#PC{b}" for lbl in condition_labels for b in range(n_basis)
                 ],
+                extra_regressors_per_run=extra_regs_per_run,
                 device=device,
             )
             pc_task_design = packed_pc.design_concat[:, :n_pc_task_cols]
@@ -1675,6 +1859,18 @@ def main() -> int:
     arma_ab: tuple[float, float] | None = None
     arma_ab_per_voxel: np.ndarray | None = None
     arma_cells: list[ARMAWhitenCell] | None = None
+    if args.prewhiten != "none" and extra_regs_per_run is not None:
+        # The ARMA path rebuilds its own nuisance from polort when it whitens,
+        # so external columns would be dropped from the whitening AND from the
+        # fit — silently leaving the noise they describe in the data.
+        print(
+            "ERROR: -ortvec* is not yet supported with -prewhiten "
+            f"{args.prewhiten} (the ARMA whitening builds its own nuisance "
+            "from -polort).  Run without prewhitening, or regress the "
+            "components out beforehand.",
+            file=sys.stderr,
+        )
+        return 1
     if args.prewhiten == "arma11":
         per_run_data, per_run_designs, a_opt, b_opt = estimate_and_apply_arma11_prewhitening(
             per_run_data=per_run_data,
@@ -1725,6 +1921,7 @@ def main() -> int:
             per_run_task_designs=per_run_designs,
             polort=polort_resolved,
             task_column_labels=task_column_labels,
+            extra_regressors_per_run=extra_regs_per_run,
             device=device,
         )
         n_task_cols = packed.n_task_cols

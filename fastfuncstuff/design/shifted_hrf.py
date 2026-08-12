@@ -59,6 +59,7 @@ Cost per coordinate step is O(n_blocks) rather than O(n_timepoints).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -760,6 +761,39 @@ def build_blockdiag_polys(
     return Z
 
 
+def append_blockdiag_extras(
+    Z: Tensor | None,
+    extra_per_run: list[Tensor],
+    n_tp_per_run: list[int],
+    device: torch.device,
+) -> Tensor:
+    """Append external per-run nuisance to a block-diagonal drift matrix.
+
+    Same convention as the polynomials and as
+    ``builder.pack_for_shared_task_glm``: run *r*'s columns are zero
+    outside run *r*, so a component estimated on one run can never explain
+    another ([[Block-diagonal nuisance]]).
+    """
+    n_runs = len(n_tp_per_run)
+    if len(extra_per_run) != n_runs:
+        raise ValueError(
+            f"extra_per_run has {len(extra_per_run)} runs but n_tp_per_run has {n_runs}."
+        )
+    n_extra = int(extra_per_run[0].shape[1])
+    dtype = Z.dtype if Z is not None else torch.float64
+    E = torch.zeros((sum(n_tp_per_run), n_runs * n_extra), dtype=dtype, device=device)
+    r0 = 0
+    for r in range(n_runs):
+        x = extra_per_run[r].to(device=device, dtype=dtype)
+        if x.shape[0] != n_tp_per_run[r]:
+            raise ValueError(
+                f"extra_per_run[{r}] has {x.shape[0]} timepoints; run has {n_tp_per_run[r]}."
+            )
+        E[r0 : r0 + n_tp_per_run[r], r * n_extra : (r + 1) * n_extra] = x
+        r0 += n_tp_per_run[r]
+    return E if Z is None else torch.cat([Z, E], dim=1)
+
+
 def xval_shifted_hrf(
     per_run_data: list[Tensor],
     per_run_condition_onsets: list[list[np.ndarray]],
@@ -770,6 +804,8 @@ def xval_shifted_hrf(
     *,
     single_trials: bool,
     shapes: np.ndarray | None = None,
+    shape_index: np.ndarray | None = None,
+    extra_regs_per_run: list[Tensor] | None = None,
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     delay_prior_sd: float | None = 0.75,
@@ -821,6 +857,17 @@ def xval_shifted_hrf(
         leak, and scoring a single shared shape while the main fit used
         per-voxel shapes would validate a different model than was fitted.
         ``hrf`` is ignored when this is supplied.
+    shape_index : (n_voxels,), optional
+        Fixed per-voxel shape assignment (an imported ``ffs_hrfopt`` map).
+        Selection is then skipped in every fold, because the shape is an
+        input to this model rather than something it fits.  The absolute
+        held-out R² is optimistic to the extent that map was chosen on
+        these same runs; the ``shift − τ=0`` gap is not, since both scored
+        models carry the same fixed shape and only the delays are refit.
+    extra_regs_per_run : list of (n_tp_r, n_extra), optional
+        External nuisance (motion, denoising components) per run.  Applied
+        fold-locally like the polynomials — never projected from the full
+        dataset before splitting ([[LORO cross-validation]]).
 
     Returns
     -------
@@ -872,6 +919,10 @@ def xval_shifted_hrf(
 
         y_train = torch.cat([per_run_data[r] for r in train_runs], dim=1)
         Z_train = build_blockdiag_polys(n_tp_train, polort, device)
+        if extra_regs_per_run is not None:
+            Z_train = append_blockdiag_extras(
+                Z_train, [extra_regs_per_run[r] for r in train_runs], n_tp_train, device
+            )
         _tb = np.cumsum([0] + n_tp_train)
         train_bounds = [(int(_tb[k]), int(_tb[k + 1])) for k in range(len(train_runs))]
         if shapes is not None:
@@ -888,6 +939,7 @@ def xval_shifted_hrf(
                 block_onsets=block_onsets,
                 selection_block_onsets=sel_blocks,
                 shapes=shapes,
+                shape_index=shape_index,
                 hrf_dt=hrf_dt,
                 run_bounds=train_bounds,
                 tr=tr,
@@ -941,6 +993,8 @@ def xval_shifted_hrf(
             n_tp_r = int(per_run_data[r].shape[1])
             test_onsets = [np.atleast_1d(per_run_condition_onsets[r][c]) for c in range(n_cond)]
             Z_test = build_blockdiag_polys([n_tp_r], polort, device)
+            if extra_regs_per_run is not None:
+                Z_test = append_blockdiag_extras(Z_test, [extra_regs_per_run[r]], [n_tp_r], device)
             y_test = per_run_data[r].to(device=device, dtype=torch.float64)
             y_p = _project_out(y_test, Z_test)
             ss_tot = ((y_p - y_p.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
@@ -994,6 +1048,7 @@ def build_shape_library(
     *,
     n_hrfs: int = 20,
     n_flobs_basis: int = 3,
+    drop_empty: bool = True,
 ) -> tuple[np.ndarray, list[str]]:
     """Candidate response shapes for per-voxel shape selection.
 
@@ -1010,6 +1065,15 @@ def build_shape_library(
                  the empirical MVN(m, C) on its coefficients, so every
                  candidate is a shape the FLOBS prior considers sensible
     ``canonical`` a single curve (degenerate; equivalent to no selection)
+    *a path*     a custom HRF library TSV in getcanonicalhrflibrary.tsv
+                 format — ``(n_timepoints, n_hrfs)`` at 0.1 s, columns are
+                 HRFs — e.g. written by ``ffs_librarian``
+
+    ``drop_empty=False`` keeps every row of the source library even if a
+    curve is all zeros, so row *i* of the result is row *i* of the source.
+    Required when the caller carries externally computed indices (an
+    ``ffs_hrfopt`` index map): silently dropping a curve would renumber
+    every shape after it.
 
     Returns
     -------
@@ -1032,12 +1096,23 @@ def build_shape_library(
             .numpy()
         )
         labels = ["canonical"]
-    elif key == "library":
+    elif key == "library" or Path(source).expanduser().is_file():
+        # A path is treated as a custom library TSV (ffs_librarian output).
+        # Row order is the contract with any external index map, so it is
+        # preserved exactly as loaded.
+        lib_path = None if key == "library" else str(Path(source).expanduser())
         curves = (
-            get_hrf_library(mode="library", microtime_dt=dt, hrf_duration=duration, device=cpu)
+            get_hrf_library(
+                mode="library",
+                microtime_dt=dt,
+                hrf_duration=duration,
+                device=cpu,
+                library_path=lib_path,
+            )
             .cpu()
             .numpy()
         )
+        curves = np.atleast_2d(curves)
         labels = [f"lib{i:02d}" for i in range(curves.shape[0])]
     elif key == "pighs":
         lib, _ = create_pighs_library(n_hrfs=n_hrfs, duration=duration, microtime_dt=dt, device=cpu)
@@ -1074,6 +1149,16 @@ def build_shape_library(
         pk = float(np.max(np.abs(c)))
         curves[i] = c / pk if pk > 0 else c
     keep = np.array([np.any(np.abs(c) > 0) for c in curves])
+    if not drop_empty:
+        if not keep.all():
+            raise ValueError(
+                f"shape source {source!r} contains "
+                f"{int((~keep).sum())} all-zero curve(s) at row(s) "
+                f"{np.flatnonzero(~keep).tolist()}.  Row order must be "
+                "preserved here (external indices point at it), so they "
+                "cannot be dropped — fix the library instead."
+            )
+        return curves, labels
     return curves[keep], [lbl for lbl, k in zip(labels, keep, strict=True) if k]
 
 

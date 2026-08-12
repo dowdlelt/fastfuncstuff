@@ -751,3 +751,139 @@ def test_r2_is_task_relative_not_drift_inflated(setup):
     assert incl - task > 0.2, (
         f"expected drift to inflate r2 substantially, gap only {incl - task:.3f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Imported HRF-index maps (ffs_hrfopt → ffs_fitbasis) and external nuisance.
+# ---------------------------------------------------------------------------
+
+
+def test_shape_library_accepts_a_custom_tsv_path(tmp_path):
+    """A librarian-style TSV must load with its row order intact.
+
+    Row order is the whole contract with an imported index map: shape i
+    has to be column i of the file the indices were fit against.
+    """
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    ref, _ = build_shape_library("library", DT, 32.0)
+    # Same content as the canonical library, written in TSV layout
+    # (n_timepoints, n_hrfs), reversed so a silent re-sort would show.
+    path = tmp_path / "custom_hrflibrary.tsv"
+    np.savetxt(path, ref[::-1].T, delimiter="\t")
+
+    curves, labels = build_shape_library(str(path), DT, 32.0)
+    assert curves.shape == ref.shape
+    assert len(labels) == curves.shape[0]
+    np.testing.assert_allclose(curves, ref[::-1], atol=1e-6)
+
+
+def test_shape_library_refuses_to_drop_rows_when_order_matters(tmp_path):
+    """With drop_empty=False an all-zero curve must raise, not renumber."""
+    from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+    ref, _ = build_shape_library("library", DT, 32.0)
+    lib = ref.copy()
+    lib[2] = 0.0
+    path = tmp_path / "holed_hrflibrary.tsv"
+    np.savetxt(path, lib.T, delimiter="\t")
+
+    dropped, _ = build_shape_library(str(path), DT, 32.0)
+    assert dropped.shape[0] == ref.shape[0] - 1  # default silently drops
+    with pytest.raises(ValueError, match="all-zero curve"):
+        build_shape_library(str(path), DT, 32.0, drop_empty=False)
+
+
+def test_imported_shape_index_is_honoured_over_selection(setup):
+    """A supplied index must be used verbatim — no re-selection.
+
+    This is the ffs_hrfopt hand-off: the map is an input, so a voxel told
+    to use shape 7 must be fitted with shape 7 even where the data prefer
+    another curve.
+    """
+    from fastfuncstuff.design.shifted_hrf import (
+        build_shape_library,
+        fit_shifted_hrf_per_voxel_shape,
+    )
+
+    _, _, block_onsets, polys = setup
+    curves, _ = build_shape_library("library", DT, 32.0)
+    rng = np.random.default_rng(0)
+    nv, nb = 6, len(block_onsets)
+    truth = np.array([0, 0, 0, 0, 0, 0])
+    amps = np.ones((nv, nb))
+    y = np.zeros((nv, NTP))
+    for v in range(nv):
+        bank = build_shifted_design_bank(
+            block_onsets, curves[truth[v]], DT, np.array([0.0]), TR, NTP, device=CPU
+        ).numpy()
+        y[v] = (amps[v][:, None] * bank[:, 0]).sum(axis=0)
+    y = y + rng.normal(0, 0.05, size=(nv, NTP))
+
+    forced = np.array([11, 11, 11, 11, 11, 11], dtype=np.int64)
+    _, used = fit_shifted_hrf_per_voxel_shape(
+        data=torch.from_numpy(y),
+        block_onsets=block_onsets,
+        shapes=curves,
+        shape_index=forced,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=torch.from_numpy(polys),
+        tau_max=1.0,
+        tau_step=0.25,
+        n_sweeps=1,
+        device=CPU,
+    )
+    np.testing.assert_array_equal(used, forced)
+
+
+def test_append_blockdiag_extras_keeps_runs_separate():
+    """Run r's nuisance columns must be exactly zero outside run r."""
+    from fastfuncstuff.design.shifted_hrf import append_blockdiag_extras, build_blockdiag_polys
+
+    n_tp = [10, 14]
+    Z = build_blockdiag_polys(n_tp, 1, CPU)
+    extras = [
+        torch.ones((10, 2), dtype=torch.float64),
+        2 * torch.ones((14, 2), dtype=torch.float64),
+    ]
+    out = append_blockdiag_extras(Z, extras, n_tp, CPU)
+
+    assert out.shape == (24, Z.shape[1] + 4)
+    block = out[:, Z.shape[1] :]
+    assert torch.all(block[:10, :2] == 1.0)
+    assert torch.all(block[:10, 2:] == 0.0)
+    assert torch.all(block[10:, :2] == 0.0)
+    assert torch.all(block[10:, 2:] == 2.0)
+
+    with pytest.raises(ValueError, match="timepoints"):
+        append_blockdiag_extras(Z, [extras[1], extras[0]], n_tp, CPU)
+
+
+def test_load_shape_index_map_converts_base_and_checks_range(tmp_path):
+    """1-based hrfopt indices → 0-based, masked, with the bad cases caught."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.fitbasis import _load_shape_index_map
+
+    vol_shape = (3, 3, 2)
+    mask = np.zeros(vol_shape, dtype=bool)
+    mask[0, :, :] = True  # 6 voxels
+    idx = np.zeros(vol_shape + (2,), dtype=np.float32)
+    idx[0, :, :, 0] = np.array([[1, 2], [3, 20], [0, 5]], dtype=np.float32)
+    idx[..., 1] = 0.42  # sub-brick 1 is R², must be ignored
+    path = tmp_path / "sub_hrf_index.nii.gz"
+    nib.save(nib.Nifti1Image(idx, np.eye(4)), path)
+
+    got = _load_shape_index_map(
+        str(path), n_shapes=20, volume_shape=vol_shape, mask=mask, n_voxels=6
+    )
+    # 1-based → 0-based; the unset 0 voxel falls back to shape 0
+    np.testing.assert_array_equal(got, np.array([0, 1, 2, 19, 0, 4]))
+
+    with pytest.raises(ValueError, match="only 5 curves"):
+        _load_shape_index_map(str(path), n_shapes=5, volume_shape=vol_shape, mask=mask, n_voxels=6)
+    with pytest.raises(ValueError, match="same grid"):
+        _load_shape_index_map(
+            str(path), n_shapes=20, volume_shape=(4, 3, 2), mask=None, n_voxels=24
+        )
