@@ -7,8 +7,11 @@ import pytest
 import torch
 
 from fastfuncstuff.processing.shiftcorr import (
+    PhaseConvention,
     ShiftEstimate,
     apply_shift,
+    check_phase_convention,
+    detect_phase_convention,
     estimate_pair_shift,
     estimate_shifts,
     search_bounds,
@@ -197,3 +200,80 @@ def test_edge_taper_only_touches_the_padding_width():
     assert torch.all(w[3:-3] == 1.0)  # 34 of 40 partitions at full weight
     assert w[0] < w[1] < w[2] < 1.0
     assert torch.allclose(w[:3], w[-3:].flip(0))
+
+
+def _wrapped_phase(shape=(24, 20, 20)) -> torch.Tensor:
+    """Radian phase with several genuine wraps along z, like a real B0 ramp."""
+    zz, yy, _ = torch.meshgrid(*[torch.arange(s).float() for s in shape], indexing="ij")
+    return torch.remainder(0.4 * zz + 0.05 * yy + np.pi, 2 * np.pi) - np.pi
+
+
+@pytest.mark.parametrize(
+    "stored, label, scale, offset",
+    [
+        (_wrapped_phase(), "radians", 1.0, 0.0),
+        (_wrapped_phase() * 4096 / np.pi, "signed", np.pi / 4096, 0.0),
+        ((_wrapped_phase() + np.pi) * 4096 / (2 * np.pi), "unsigned", 2 * np.pi / 4096, 2048.0),
+    ],
+)
+def test_detect_phase_convention_recognises_the_three_storage_forms(stored, label, scale, offset):
+    conv = detect_phase_convention(stored)
+    assert label in conv.label
+    assert conv.scale == pytest.approx(scale)
+    assert conv.offset == pytest.approx(offset)
+    assert torch.allclose(conv.to_radians(stored), _wrapped_phase(), atol=1e-3)
+
+
+def test_detect_phase_convention_refuses_unwrapped_radians():
+    """Unwrapped phase is the case range-detection CANNOT name — it must not guess."""
+    with pytest.raises(ValueError, match="cannot infer phase units"):
+        detect_phase_convention(_wrapped_phase() * 6.0)
+
+
+def test_phase_round_trip_returns_the_input_convention():
+    """What goes in as 0..4095 comes back as 0..4095, not recentred on zero."""
+    stored = (_wrapped_phase() + np.pi) * 4096 / (2 * np.pi)
+    conv = detect_phase_convention(stored)
+    back = conv.from_radians(conv.to_radians(stored))
+    assert torch.allclose(back, stored, atol=1e-2)
+    assert back.min() >= -1.0 and back.max() <= 4097.0
+
+
+def test_wrong_phase_gain_corrupts_phase_while_magnitude_looks_fine():
+    """Bug of record: the reason the gain is detected instead of assumed.
+
+    A radians-in-file phase scaled by the old +/-4096 default makes the complex
+    volume nearly real. The shifted MAGNITUDE is then still within a percent —
+    which is exactly why nobody notices — but the shifted PHASE is garbage.
+    """
+    mag = _phantom(n_t=1, seed=5).abs()[0] + 1.0
+    stored = _wrapped_phase(tuple(mag.shape))
+    shift = np.array([1.37])
+
+    good = detect_phase_convention(stored)
+    assert good.scale == 1.0
+    ref = apply_shift(torch.polar(mag, good.to_radians(stored)), shift, axis=2)
+
+    bad = PhaseConvention(np.pi / 4096, 0.0, "wrong")
+    got = apply_shift(torch.polar(mag, bad.to_radians(stored)), shift, axis=2)
+
+    d = (
+        torch.remainder(
+            bad.from_radians(torch.angle(got)) - good.from_radians(torch.angle(ref)) + np.pi,
+            2 * np.pi,
+        )
+        - np.pi
+    )
+    inner = (slice(4, -4),) * 3
+    assert d[inner].abs().mean() > 0.1  # radians of phase error
+    rel = ((got.abs() - ref.abs()).abs() / ref.abs())[inner]
+    assert rel.mean() < 0.02  # ... and a magnitude that still looks right
+
+
+def test_explicit_phase_scale_is_sanity_checked_not_overridden():
+    stored = _wrapped_phase()
+    narrow = check_phase_convention(stored, PhaseConvention(np.pi / 4096, 0.0, "user"))
+    assert narrow and "already in radians" in narrow[0]
+    unwrapped = check_phase_convention(stored * 6.0, PhaseConvention(1.0, 0.0, "user"))
+    assert unwrapped and "WRAPPED" in unwrapped[0]
+    assert check_phase_convention(stored, PhaseConvention(1.0, 0.0, "user")) == ()

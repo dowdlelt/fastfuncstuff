@@ -10,7 +10,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import math
 import sys
 import time
 from pathlib import Path
@@ -21,11 +20,15 @@ import torch
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.locomoco import resolve_pe_axis
-from fastfuncstuff.processing.shiftcorr import apply_shift, estimate_shifts, save_shift_tables
+from fastfuncstuff.processing.shiftcorr import (
+    PhaseConvention,
+    apply_shift,
+    check_phase_convention,
+    detect_phase_convention,
+    estimate_shifts,
+    save_shift_tables,
+)
 from fastfuncstuff.utils import REGISTRATION_TF32
-
-# Siemens phase images are stored as int16 over ±4096 -> radians.
-_DEFAULT_PHASE_SCALE = math.pi / 4096.0
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
@@ -46,6 +49,18 @@ what this corrects
   echo 1 is corrected too and the echo-common part (the fit's intercept) is left
   for rigid motion correction. Without -echo_times the raw cumulative inter-echo
   shifts are applied and echo 1 is the fixed reference.
+
+phase units
+
+  With -phase the correction runs on the COMPLEX data, so the stored values have
+  to be converted to radians correctly. The units are detected from the value
+  range — radians (dcm2niix), signed full-scale (Siemens +/-4096) or unsigned
+  full-scale (0..4095) — and the output is written back in the SAME convention.
+  Get the gain wrong and the failure is silent: the magnitude still comes out
+  nearly right (a near-real volume shifts much like its magnitude) while the
+  corrected phase is wrong by up to pi. -phase_scale overrides the detection;
+  unwrapped radians are the case that needs it (-phase_scale 1), and note the
+  output is then written wrapped, since complex data has no wrap count.
 
 outputs
 
@@ -101,8 +116,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-phase-scale",
         dest="phase_scale",
         type=float,
-        default=_DEFAULT_PHASE_SCALE,
-        help="Multiplier converting stored phase values to radians.",
+        default=None,
+        help="Multiplier converting stored phase values to radians. Default is to "
+        "detect it from the data range: radians (dcm2niix), signed full-scale "
+        "(Siemens +/-4096), or unsigned full-scale (0..4095). Pass it explicitly to "
+        "override the detection — e.g. -phase_scale 1 for UNWRAPPED radians, whose "
+        "range detection cannot recognise.",
+    )
+    p.add_argument(
+        "-phase_offset",
+        "-phase-offset",
+        dest="phase_offset",
+        type=float,
+        default=None,
+        help="Value that means zero phase, in STORED units (0 for signed data, 2048 "
+        "for unsigned 0..4095). Detected with -phase_scale; it only keeps the output "
+        "in the same convention as the input, since a constant phase offset cannot "
+        "affect a translation.",
     )
     p.add_argument(
         "-axis",
@@ -208,12 +238,45 @@ def _sibling(path: str, prefix: str) -> str:
     return os.path.join(d, prefix + base)
 
 
-def _load_echo(mag_path: str, phase_path: str | None, phase_scale: float):
+def _phase_convention(
+    stored: torch.Tensor, path: str, scale: float | None, offset: float | None, verb: int
+) -> PhaseConvention:
+    """Detect (or validate a user-given) stored-phase -> radians mapping."""
+    if scale is None:
+        try:
+            conv = detect_phase_convention(stored)
+        except ValueError as err:
+            print(f"Error: {path}: {err}", file=sys.stderr)
+            sys.exit(1)
+        if offset is not None:
+            conv = PhaseConvention(conv.scale, offset, conv.label, conv.warnings)
+        if verb >= 1:
+            print(
+                f"  {Path(path).name}: phase units detected as {conv.label} "
+                f"(scale {conv.scale:.6g}, offset {conv.offset:g})"
+            )
+    else:
+        conv = PhaseConvention(scale, offset or 0.0, "user-specified")
+        conv = PhaseConvention(
+            conv.scale, conv.offset, conv.label, check_phase_convention(stored, conv)
+        )
+    for msg in conv.warnings:
+        print(f"Warning: {Path(path).name}: {msg}", file=sys.stderr)
+    return conv
+
+
+def _load_echo(
+    mag_path: str,
+    phase_path: str | None,
+    scale: float | None,
+    offset: float | None,
+    verb: int,
+):
     """Load one echo as real magnitude or, with phase, as a complex volume."""
     with spinner(f"Loading {Path(mag_path).name}"):
         mag, hdr = load_image(mag_path)
     if phase_path is None:
-        return mag, hdr, None
+        return mag, hdr, None, None
     with spinner(f"Loading {Path(phase_path).name}"):
         pha, pha_hdr = load_image(phase_path)
     if pha.shape != mag.shape:
@@ -223,8 +286,9 @@ def _load_echo(mag_path: str, phase_path: str | None, phase_scale: float):
             file=sys.stderr,
         )
         sys.exit(1)
-    comp = torch.polar(mag.float(), pha.float() * phase_scale)
-    return comp, hdr, pha_hdr
+    conv = _phase_convention(pha, phase_path, scale, offset, verb)
+    comp = torch.polar(mag.float(), conv.to_radians(pha))
+    return comp, hdr, pha_hdr, conv
 
 
 def _validate(args: argparse.Namespace) -> None:
@@ -274,9 +338,11 @@ def main(argv: list[str] | None = None) -> None:
             f"ffs_util_shiftcorr: device={device}, partition axis {args.axis} (voxel axis {axis})"
         )
 
-    echoes, headers, phase_headers = [], [], []
+    echoes, headers, phase_headers, phase_convs = [], [], [], []
     for mag_path, pha_path in zip(args.input_file, phase_files, strict=True):
-        data, hdr, pha_hdr = _load_echo(mag_path, pha_path, args.phase_scale)
+        data, hdr, pha_hdr, conv = _load_echo(
+            mag_path, pha_path, args.phase_scale, args.phase_offset, verb
+        )
         if echoes and data.shape != echoes[0].shape:
             print(
                 f"Error: {mag_path} shape {tuple(data.shape)} does not match the "
@@ -287,6 +353,7 @@ def main(argv: list[str] | None = None) -> None:
         echoes.append(data)
         headers.append(hdr)
         phase_headers.append(pha_hdr)
+        phase_convs.append(conv)
 
     n_t = echoes[0].shape[0] if echoes[0].ndim == 4 else 1
     if verb >= 1:
@@ -324,7 +391,7 @@ def main(argv: list[str] | None = None) -> None:
             if out.is_complex():
                 pha_path = parse_prefix(_sibling(args.prefix, f"{tag}phase_")).as_file()
                 save_image(
-                    torch.angle(out) / args.phase_scale,
+                    phase_convs[i].from_radians(torch.angle(out)),
                     pha_path,
                     header_info=phase_headers[i] or headers[i],
                 )

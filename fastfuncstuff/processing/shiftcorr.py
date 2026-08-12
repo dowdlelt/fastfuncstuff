@@ -92,6 +92,95 @@ def search_bounds(ordering: str, max_shift: float) -> tuple[float, float]:
 
 
 @dataclass
+class PhaseConvention:
+    """How stored phase values map to radians: ``rad = (stored - offset) * scale``.
+
+    ``offset`` matters only so the written file comes back in the SAME convention
+    it went in — a constant phase offset is a global complex rotation and cannot
+    affect a translation. ``scale`` is the one that must be right: get it wrong
+    and the complex data is not the image, so the corrected PHASE is wrong while
+    the corrected magnitude still looks fine (a near-real volume shifts almost
+    like its magnitude). That is why it is detected rather than assumed.
+    """
+
+    scale: float
+    offset: float
+    label: str
+    warnings: tuple[str, ...] = ()
+
+    def to_radians(self, stored: Tensor) -> Tensor:
+        return (stored.float() - self.offset) * self.scale
+
+    def from_radians(self, rad: Tensor) -> Tensor:
+        return rad / self.scale + self.offset
+
+
+def _nominal_full_scale(hi: float) -> float:
+    """Snap an observed maximum to the nearest power-of-two full-scale value."""
+    return float(2.0 ** round(math.log2(max(hi, 1.0))))
+
+
+def detect_phase_convention(stored: Tensor) -> PhaseConvention:
+    """Infer the units of a stored phase volume from its value range.
+
+    Recognises the three conventions that actually turn up: radians (already
+    scaled, e.g. dcm2niix output), signed integer full-scale (Siemens ±4096, what
+    the reference script assumes), and unsigned integer full-scale (0…4095).
+    Anything else raises — better than silently scaling by a wrong gain.
+    """
+    lo = float(stored.min())
+    hi = float(stored.max())
+    span = hi - lo
+    warn: list[str] = []
+
+    # A little headroom over pi: interpolated/filtered radian maps overshoot.
+    if hi <= 3.3 and lo >= -3.3:
+        if span < 1.0:
+            warn.append(
+                f"phase spans only {span:.3g} rad — that is not a wrapped phase map; "
+                "check the file, or state -phase_scale explicitly."
+            )
+        return PhaseConvention(1.0, 0.0, "radians", tuple(warn))
+
+    if hi > 100.0 and lo < -100.0:
+        full = _nominal_full_scale(max(hi, -lo))
+        return PhaseConvention(math.pi / full, 0.0, f"signed integer ±{full:.0f}", ())
+
+    if hi > 100.0 and lo >= -1.0:
+        full = _nominal_full_scale(hi)
+        return PhaseConvention(
+            2.0 * math.pi / full, full / 2.0, f"unsigned integer 0…{full:.0f}", ()
+        )
+
+    raise ValueError(
+        f"cannot infer phase units from range [{lo:.4g}, {hi:.4g}]: it is neither "
+        "radians (|p| <= pi), signed full-scale (±2^n), nor unsigned full-scale "
+        "(0…2^n). If this is unwrapped phase in radians pass -phase_scale 1, "
+        "otherwise pass the multiplier that converts these values to radians."
+    )
+
+
+def check_phase_convention(stored: Tensor, conv: PhaseConvention) -> tuple[str, ...]:
+    """Sanity-check a USER-SUPPLIED convention against the data. Warn, never fail."""
+    rad_span = float(stored.max() - stored.min()) * conv.scale
+    warn: list[str] = []
+    if rad_span < 1.0:
+        warn.append(
+            f"-phase_scale {conv.scale:.6g} maps this file to a span of only "
+            f"{rad_span:.3g} rad. If the file is already in radians pass "
+            "-phase_scale 1; as given, the phase is being ignored."
+        )
+    elif rad_span > 2.0 * math.pi * 1.05:
+        warn.append(
+            f"-phase_scale {conv.scale:.6g} maps this file to {rad_span:.3g} rad, "
+            "wider than one wrap — looks like unwrapped phase. The correction runs "
+            "on complex data, which cannot carry the wrap count, so the output is "
+            "written WRAPPED; unwrap it again downstream if you need it unwrapped."
+        )
+    return tuple(warn)
+
+
+@dataclass
 class ShiftEstimate:
     """Per-timepoint, per-echo partition-axis shifts, in voxels.
 
