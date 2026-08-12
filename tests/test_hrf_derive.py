@@ -9,9 +9,13 @@ pipeline using small synthetic datasets:
 - ``project_unit_sphere`` returns unit-norm rows.
 - ``trace_manifold_auto`` returns ``n_points`` ordered points covering
   the density.
-- ``reconstruct_timecourses`` produces peak=1 cubic-interpolated curves.
+- ``reconstruct_timecourses`` produces peak=1 cubic-interpolated curves
+  and flags non-HRF-like ones instead of flipping them.
 - ``fit_double_gamma`` recovers known double-gamma parameters within
-  tolerance.
+  tolerance; ``fit_double_gamma_through_boxcar`` recovers the impulse
+  response from a duration-convolved curve.
+- ``crossval_n_pcs`` reproduces NSD's held-out dimensionality curve.
+- ``stack_subject_betas`` gives every subject equal weight.
 - ``derive_library`` end-to-end on a synthetic 3-flavor HRF dataset.
 
 Tests run in seconds; no GPU.
@@ -24,15 +28,22 @@ import pytest
 from scipy.stats import gamma
 
 from fastfuncstuff.design.hrf_derive import (
+    crossval_n_pcs,
     deconvolve_event_duration,
     derive_library,
     fit_double_gamma,
+    fit_double_gamma_through_boxcar,
+    manifold_coverage,
     project_unit_sphere,
     reconstruct_timecourses,
+    select_library_voxels,
     select_voxels,
+    stack_subject_betas,
     svd_decompose,
     trace_manifold_auto,
+    trace_manifold_blob,
     trace_manifold_grid,
+    trace_manifold_kmeans,
 )
 
 # ---------- helpers ----------------------------------------------------------
@@ -188,10 +199,23 @@ def test_reconstruct_shapes_and_peak(synthetic_fir_dataset):
     betas, _r2, lag_times, _ = synthetic_fir_dataset
     svd = svd_decompose(betas, n_pcs=3)
     manifold = np.array([[1, 0, 0], [0, 1, 0], [0, 0, -1]], dtype=float)
-    out, t = reconstruct_timecourses(manifold, svd.pcs, lag_times, target_dt=0.1)
+    out, t, valid = reconstruct_timecourses(manifold, svd.pcs, lag_times, target_dt=0.1)
     assert out.shape == (3, t.size)
-    # peak normalization
-    np.testing.assert_allclose(out.max(axis=1), 1.0)
+    assert valid.shape == (3,)
+    # peak normalization: divide by the SIGNED max, never flip the curve
+    np.testing.assert_allclose(out[valid].max(axis=1), 1.0)
+
+
+def test_reconstruct_flags_inverted_curve_instead_of_flipping():
+    # A manifold point that reconstructs to a predominantly NEGATIVE curve
+    # is not an HRF.  The old code negated it and shipped it as a library
+    # entry; it must now be flagged invalid so the caller drops it.
+    lag_times = np.arange(31, dtype=float)
+    pcs = np.zeros((1, 31))
+    pcs[0, 5] = -1.0  # single big negative excursion
+    out, _t, valid = reconstruct_timecourses(np.array([[1.0]]), pcs, lag_times)
+    assert not valid[0]
+    assert out[0].min() < 0  # not silently flipped positive
 
 
 # ---------- fit_double_gamma -------------------------------------------------
@@ -293,6 +317,7 @@ def test_derive_library_with_deconvolution(synthetic_fir_dataset):
         r2_threshold=0.05,
         max_voxels=2000,
         deconvolve_duration=2.0,
+        deconv_method="wiener",
         deconv_snr=200.0,
     )
     assert res.raw_deconvolved is not None
@@ -309,3 +334,249 @@ def test_derive_library_fit_gamma_off(synthetic_fir_dataset):
     res = derive_library(betas, r2, lag_times, n_hrfs=8, fit_gamma=False)
     assert res.fitted is None
     assert res.gamma_params == []
+
+
+def test_derive_library_is_ordered_by_time_to_peak(synthetic_fir_dataset):
+    # The ridge walk starts at the density peak and runs in whichever
+    # direction the local tangent pointed, so the raw walk order is
+    # arbitrary.  The emitted library must be sorted by time-to-peak so
+    # a downstream "which index did it pick" reads as early-vs-late.
+    betas, r2, lag_times, _ = synthetic_fir_dataset
+    res = derive_library(betas, r2, lag_times, n_hrfs=10, r2_threshold=0.05, max_voxels=2000)
+    ttp = res.target_times[np.argmax(res.raw, axis=1)]
+    assert np.all(np.diff(ttp) >= 0), f"library not ordered by time-to-peak: {ttp}"
+
+
+# ---------- manifold tracing -------------------------------------------------
+
+
+def test_trace_manifold_does_not_double_back():
+    # Regression: the previous annulus-based walk carried no direction and
+    # only forbade near-exact repeats, so it folded back and re-traversed
+    # the ridge a few degrees off — emitting duplicate library entries
+    # while never reaching one end.  Points must advance monotonically
+    # along a clean synthetic ridge.
+    rng = np.random.default_rng(0)
+    angles = rng.uniform(-40, 40, 20000) * np.pi / 180
+    v = np.column_stack([np.cos(angles), np.sin(angles), 0.02 * rng.standard_normal(angles.size)])
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+
+    pts = trace_manifold_auto(v, n_points=20, angular_step_deg=6.0, bandwidth_deg=8.0)
+    assert pts.shape == (20, 3)
+
+    walked = np.degrees(np.arctan2(pts[:, 1], pts[:, 0]))
+    diffs = np.diff(walked)
+    assert np.all(diffs > 0) or np.all(diffs < 0), f"walk reverses direction: {walked}"
+
+    # No duplicates: every consecutive pair is a real step apart.
+    cos_step = np.sum(pts[:-1] * pts[1:], axis=1)
+    assert np.degrees(np.arccos(np.clip(cos_step, -1, 1))).min() > 3.0
+
+    # And it covers both sides of the density peak, not just one arm.
+    assert walked.min() < -20 and walked.max() > 20
+
+
+def _blob(spread_deg, n=20000, seed=3):
+    """Density blob on the sphere: an arc with controllable off-arc width."""
+    rng = np.random.default_rng(seed)
+    t = rng.uniform(-35, 35, n) * np.pi / 180
+    off = rng.normal(0, spread_deg, n) * np.pi / 180
+    v = np.column_stack([np.cos(t) * np.cos(off), np.sin(t) * np.cos(off), np.sin(off)])
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+def test_manifold_coverage_cos_is_shape_correlation():
+    # The identity the coverage metric rests on: PCs are orthonormal and
+    # sphere points are unit-norm, so <w1·PCs, w2·PCs> == w1·w2.  The
+    # cosine of the sphere angle IS the reconstructed-HRF correlation.
+    rng = np.random.default_rng(0)
+    pcs = np.linalg.qr(rng.standard_normal((25, 3)))[0].T  # (3, 25) orthonormal
+    w = rng.standard_normal((2, 3))
+    w /= np.linalg.norm(w, axis=1, keepdims=True)
+    curves = w @ pcs
+    np.testing.assert_allclose(curves[0] @ curves[1], w[0] @ w[1], atol=1e-10)
+
+    # arccos round-trips the SIGNED cosine, so the recovered value is the
+    # correlation itself, not its magnitude.
+    cov = manifold_coverage(w[:1], w[1:])
+    np.testing.assert_allclose(np.cos(np.radians(cov["angles_deg"][0])), w[0] @ w[1], atol=1e-6)
+
+
+def test_two_d_modes_beat_the_arc_on_a_wide_blob():
+    # The reason these modes exist: a 1-D ridge under-serves voxels that
+    # sit off the arc.  On a blob with real 2-D extent both 2-D samplers
+    # must cut the poorly-covered tail substantially.
+    v = _blob(12)
+    arc = manifold_coverage(v, trace_manifold_auto(v, 20, 6.0, 8.0))
+    km = manifold_coverage(v, trace_manifold_kmeans(v, 20))
+    bl = manifold_coverage(v, trace_manifold_blob(v, 20, 8.0))
+
+    # k-means is density-proportional → best typical-case mismatch.
+    assert km["median_deg"] < arc["median_deg"]
+    assert km["p90_deg"] < arc["p90_deg"] / 2
+    # blob is uniform over the support → best worst-case.
+    assert bl["max_deg"] < arc["max_deg"]
+
+
+def test_arc_is_competitive_on_a_thin_ridge():
+    # Conversely, when the blob really is a 1-D arc (NSD's case), uniform
+    # blob coverage wastes entries on empty support and does worse than
+    # the ridge.  This is why 'auto' stays the default.
+    v = _blob(3)
+    arc = manifold_coverage(v, trace_manifold_auto(v, 20, 6.0, 8.0))
+    bl = manifold_coverage(v, trace_manifold_blob(v, 20, 8.0))
+    assert arc["median_deg"] < bl["median_deg"]
+
+
+def test_blob_and_kmeans_return_exact_counts():
+    # Unlike the ridge walk, which may stop early when the ridge ends.
+    v = _blob(10)
+    assert trace_manifold_blob(v, 17, 8.0).shape == (17, 3)
+    assert trace_manifold_kmeans(v, 17).shape == (17, 3)
+    # Unit norm preserved.
+    for m in (trace_manifold_blob(v, 12, 8.0), trace_manifold_kmeans(v, 12)):
+        np.testing.assert_allclose(np.linalg.norm(m, axis=1), 1.0, atol=1e-10)
+
+
+def test_kmeans_is_deterministic_and_handles_non_3d():
+    # k-means is the K != 3 fallback, so it must work off the 2-sphere.
+    rng = np.random.default_rng(1)
+    v = rng.standard_normal((2000, 5))
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    a = trace_manifold_kmeans(v, 8)
+    b = trace_manifold_kmeans(v, 8)
+    assert a.shape == (8, 5)
+    np.testing.assert_allclose(a, b)
+
+
+def test_derive_library_2d_modes_run_end_to_end(synthetic_fir_dataset):
+    betas, r2, lag_times, _ = synthetic_fir_dataset
+    for mode in ("blob", "kmeans"):
+        res = derive_library(
+            betas,
+            r2,
+            lag_times,
+            n_hrfs=10,
+            r2_threshold=0.05,
+            max_voxels=2000,
+            manifold_mode=mode,
+        )
+        assert res.coverage is not None
+        assert res.coverage["median_deg"] >= 0
+        # Even 2-D sets get a deterministic time-to-peak ordering.
+        ttp = res.target_times[np.argmax(res.raw, axis=1)]
+        assert np.all(np.diff(ttp) >= 0)
+
+
+# ---------- duration correction ----------------------------------------------
+
+
+def test_fit_through_boxcar_beats_wiener_for_long_durations():
+    # The reason "fit" is the default: Wiener has to regularize away the
+    # boxcar's spectral zeros, which for a long boxcar wrecks the recovered
+    # impulse response.  Putting the boxcar in the forward model does not.
+    dt = 0.1
+    t = np.arange(0, 32, dt)
+    imp = _double_gamma_curve(t, a1=6.0)
+    n_box = int(10.0 / dt)
+    conv = np.convolve(imp, np.ones(n_box))[: t.size]
+    conv = conv / conv.max()
+
+    recovered, params = fit_double_gamma_through_boxcar(conv, duration=10.0, dt=dt)
+    assert params["fit_ok"]
+    assert np.abs(recovered - imp).max() < 0.01
+
+    wiener = deconvolve_event_duration(conv[None], duration=10.0, dt=dt, snr=100.0)[0]
+    assert np.abs(recovered - imp).max() < np.abs(wiener - imp).max()
+
+
+def test_derive_library_deconv_fit_mode(synthetic_fir_dataset):
+    betas, r2, lag_times, _ = synthetic_fir_dataset
+    res = derive_library(
+        betas,
+        r2,
+        lag_times,
+        n_hrfs=8,
+        r2_threshold=0.05,
+        max_voxels=2000,
+        deconvolve_duration=2.0,
+        deconv_method="fit",
+    )
+    # Fit mode carries the correction inside the gamma family, so there is
+    # no separate deconvolved raw curve — the fitted one IS the impulse
+    # response.
+    assert res.raw_deconvolved is None
+    assert res.fitted_deconvolved is not None
+    assert res.duration_convolved is False
+    assert all("duration_s" in p for p in res.gamma_params_deconvolved)
+
+
+# ---------- cross-validated PC count -----------------------------------------
+
+
+def test_crossval_n_pcs_turns_over():
+    # Two noisy observations of the same low-rank truth: held-out R² must
+    # rise then fall as K starts fitting the training split's noise.
+    rng = np.random.default_rng(0)
+    lag = np.arange(31, dtype=float)
+    truth = np.stack([_double_gamma_curve(lag, a1=a) for a in rng.uniform(4, 8, 2000)])
+    a = truth + 0.08 * rng.standard_normal(truth.shape)
+    b = truth + 0.08 * rng.standard_normal(truth.shape)
+
+    cv = crossval_n_pcs(a, b, max_pcs=10)
+    assert cv.shape == (10,)
+    best = int(cv.argmax()) + 1
+    assert 1 <= best <= 4, f"expected a low-rank optimum, got K={best}"
+    assert cv[-1] < cv[best - 1], "curve should decline once K starts fitting noise"
+
+
+# ---------- multi-subject stacking -------------------------------------------
+
+
+def test_stack_subject_betas_equalizes_contribution():
+    # NSD's point: per-subject supra-threshold counts ranged 2834-17387, so
+    # a global sample would let the best subject dominate the PCs.  Each
+    # subject must contribute the same number of rows.
+    rng = np.random.default_rng(0)
+    lag = np.arange(31, dtype=float)
+    subs_betas, subs_r2 = [], []
+    for n_good in (300, 5000):
+        n = 6000
+        b = np.stack([_double_gamma_curve(lag, a1=a) for a in rng.uniform(4, 8, n)])
+        r = np.full(n, 0.01)
+        r[:n_good] = 0.5
+        subs_betas.append(b)
+        subs_r2.append(r)
+
+    betas, r2, ids = stack_subject_betas(
+        subs_betas, subs_r2, r2_threshold=0.1, per_subject_voxels=1000
+    )
+    assert betas.shape == (2000, 31)
+    assert r2.shape == (2000,)
+    assert (ids == 0).sum() == 1000
+    assert (ids == 1).sum() == 1000  # upsampled despite having 300 vs 5000
+
+    # Without equalization the richer subject dominates.
+    _b2, _r2b, ids2 = stack_subject_betas(
+        subs_betas, subs_r2, r2_threshold=0.1, per_subject_voxels=1000, equalize=False
+    )
+    assert (ids2 == 0).sum() == 300
+    assert (ids2 == 1).sum() == 1000
+
+
+def test_stack_subject_betas_rejects_mismatched_lags():
+    a = np.zeros((10, 31))
+    b = np.zeros((10, 20))
+    with pytest.raises(ValueError, match="FIR lags"):
+        stack_subject_betas([a, b], [np.ones(10), np.ones(10)])
+
+
+def test_select_library_voxels_drops_constant_high_r2_voxels():
+    # Air voxels are fit perfectly by the nuisance block, so they score
+    # R²≈1 with all-zero FIR betas and would otherwise dominate the SVD.
+    betas = np.zeros((100, 31))
+    betas[50:] = np.random.default_rng(0).standard_normal((50, 31))
+    r2 = np.full(100, 0.9)
+    sel = select_library_voxels(betas, r2, threshold=0.1)
+    assert sel.size == 50
+    assert sel.min() >= 50

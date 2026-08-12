@@ -55,7 +55,9 @@ import torch
 try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
+        add_ortvec_arguments,
         add_verbose_arg,
+        collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
@@ -72,7 +74,10 @@ try:
     )
     from fastfuncstuff.design.hrf_derive import (
         build_pc_basis_design_per_run,
+        crossval_n_pcs,
         derive_library,
+        select_library_voxels,
+        stack_subject_betas,
         svd_decompose,
     )
     from fastfuncstuff.design.matrices import (
@@ -157,13 +162,68 @@ Notes:
     req.add_argument(
         "-input",
         nargs="+",
-        required=True,
-        help="Input fMRI run files (one or more, NIfTI).",
+        default=None,
+        help="Input fMRI run files (one or more, NIfTI).  Required unless -combine.",
     )
     req.add_argument(
         "-prefix",
         required=True,
         help="Output prefix (e.g. 'out/sub01_lib').",
+    )
+
+    # Two-stage / multi-subject flow.
+    multi_grp = parser.add_argument_group("Multi-subject libraries (two-stage)")
+    multi_grp.add_argument(
+        "-save_fir",
+        "-save-fir",
+        dest="save_fir",
+        default=None,
+        metavar="NPZ",
+        help=(
+            "Also write the per-voxel FIR betas + R² to an .npz so this "
+            "subject can later contribute to a study-wide library.  Only "
+            "voxels passing the R² gate are stored, so the file is small.  "
+            "Feed several of these to -combine."
+        ),
+    )
+    multi_grp.add_argument(
+        "-combine",
+        nargs="+",
+        default=None,
+        metavar="NPZ",
+        help=(
+            "COMBINE MODE.  Skip all data loading and GLM fitting; instead "
+            "read these -save_fir intermediates (one per subject) and derive "
+            "a single study-wide library across them, NSD-style.  All "
+            "subjects must share a TR and FIR window.  Incompatible with "
+            "-input; most other flags (derivation params, -n-hrfs, "
+            "-fit-gamma, QC) still apply."
+        ),
+    )
+    multi_grp.add_argument(
+        "-per-subject-voxels",
+        "-per_subject_voxels",
+        dest="per_subject_voxels",
+        type=int,
+        default=20_000,
+        metavar="N",
+        help=(
+            "Combine mode: rows to draw from EACH subject, so subjects "
+            "contribute equally to the SVD regardless of how many voxels "
+            "passed their R² gate (NSD drew 20000 per subject from pools "
+            "ranging 2834-17387).  Subjects with fewer are sampled with "
+            "replacement unless -no-equalize-subjects."
+        ),
+    )
+    multi_grp.add_argument(
+        "-no-equalize-subjects",
+        "-no_equalize_subjects",
+        dest="equalize_subjects",
+        action="store_false",
+        help=(
+            "Combine mode: do NOT upsample subjects to a common row count. "
+            "High-R² subjects then dominate the derived PCs."
+        ),
     )
 
     # Onsets: either AFNI -onsets/-durations OR BIDS -events.
@@ -366,9 +426,38 @@ Notes:
     )
     derive_grp.add_argument(
         "-manifold",
-        choices=["auto", "grid", "points"],
+        choices=["auto", "blob", "kmeans", "grid", "points"],
         default="auto",
-        help="Manifold tracing strategy.",
+        help=(
+            "How to pick library entries out of the sphere density.  "
+            "'auto' (default) traces a 1-D density RIDGE, which is NSD's "
+            "model of HRF variation: one family running early-to-late, "
+            "entries ordered so neighbours are similar.  'blob' and "
+            "'kmeans' instead sample the density blob in 2-D, which "
+            "captures off-ridge variability the arc misses — 'blob' "
+            "covers the blob's support evenly (farthest-point over the "
+            "region above -density-floor), 'kmeans' covers it in "
+            "proportion to how many voxels are actually there (spherical "
+            "k-means, minimizes expected shape mismatch, works for any "
+            "-n-pcs).  The 2-D modes give up the 'adjacent index = "
+            "similar HRF' property.  'grid' is a legacy 1-D ordering "
+            "along the first PCA axis (not a grid).  'points' takes "
+            "user-supplied coordinates via -manifold-points.  Every run "
+            "reports coverage stats so you can compare modes."
+        ),
+    )
+    derive_grp.add_argument(
+        "-density-floor",
+        "-density_floor",
+        dest="density_floor",
+        type=float,
+        default=0.05,
+        metavar="FRAC",
+        help=(
+            "-manifold blob only: fraction of peak KDE density that still "
+            "counts as inside the blob.  Raise to sample only the dense "
+            "core, lower to chase the tails."
+        ),
     )
     derive_grp.add_argument(
         "-manifold-points",
@@ -406,15 +495,65 @@ Notes:
         ),
     )
     derive_grp.add_argument(
+        "-deconv-method",
+        "-deconv_method",
+        dest="deconv_method",
+        choices=["fit", "wiener"],
+        default="fit",
+        help=(
+            "How to turn the duration-convolved curve into an impulse "
+            "response.  'fit' (default, NSD-faithful) puts the boxcar "
+            "inside the double-gamma forward model and fits it, so the "
+            "recovered parameters ARE the impulse response — no numerical "
+            "inverse.  'wiener' explicitly deconvolves, then gamma-fits "
+            "the result; it must regularize away the boxcar's spectral "
+            "zeros and degrades badly for long durations (a 10 s boxcar "
+            "test recovers the impulse response to 0.0000 max error with "
+            "'fit' vs 0.32 with 'wiener').  Forced to 'wiener' when "
+            "-fit-gamma none, since there is then no parametric family "
+            "to carry the correction."
+        ),
+    )
+    derive_grp.add_argument(
         "-deconv-snr",
         type=float,
         default=100.0,
         metavar="SNR",
         help=(
-            "Wiener-filter SNR.  Higher = sharper deconvolution but "
-            "noisier; lower = smoother but more biased.  100 = a 1%% "
-            "noise floor, generally appropriate for the library "
-            "waveforms emerging from SVD + manifold + PCHIP."
+            "Wiener-filter SNR (-deconv-method wiener only).  Higher = "
+            "sharper deconvolution but noisier; lower = smoother but more "
+            "biased.  100 = a 1%% noise floor."
+        ),
+    )
+    derive_grp.add_argument(
+        "-r2-mode",
+        "-r2_mode",
+        dest="r2_mode",
+        choices=["task", "full"],
+        default="task",
+        help=(
+            "Which R² the -r2-threshold gate applies to.  'task' "
+            "(default) is the variance the FIR/TENT block explains AFTER "
+            "the nuisance block (polynomials, ortvecs) is accounted for — "
+            "this is what NSD thresholded and it costs one extra "
+            "nuisance-only GLM fit.  'full' is whole-model R², which "
+            "credits drift and motion to the model and therefore admits "
+            "voxels with no task response at all; it is the historical "
+            "ffs_librarian behaviour, kept for reproducing old runs."
+        ),
+    )
+    derive_grp.add_argument(
+        "-crossval-pcs",
+        "-crossval_pcs",
+        dest="crossval_pcs",
+        action="store_true",
+        help=(
+            "Emit the held-out variance-explained-vs-number-of-PCs curve "
+            "that NSD used to settle on 3 PCs: fit the FIR on odd runs "
+            "and even runs separately, derive PCs from the odd-run betas, "
+            "and score the rank-K reconstruction against the even-run "
+            "betas.  Writes {prefix}_qc_crossval_pcs.{tsv,png}.  Needs at "
+            "least 2 runs and costs two extra GLM fits."
         ),
     )
     derive_grp.add_argument(
@@ -459,6 +598,19 @@ Notes:
     )
     add_load_threads_arg(proc_grp)
     add_verbose_arg(proc_grp, default=1)
+
+    # External nuisance.  The FIR curves this tool derives ARE the product,
+    # so anything left in them (motion, physio, GLMdenoise noise PCs) ends
+    # up as spurious shape variance in the SVD and hence in the library.
+    # Same four-flag family as ffs_reml / ffs_denoise.
+    nuis_grp = parser.add_argument_group(
+        "External nuisance regressors",
+        "Projected out of BOTH the FIR/TENT fit and the NSD PC refit, "
+        "per run on the block diagonal. Pass motion parameters and any "
+        "GLMdenoise-style noise regressors here so they do not leak into "
+        "the derived HRF shapes.",
+    )
+    add_ortvec_arguments(nuis_grp)
 
     return parser
 
@@ -950,6 +1102,382 @@ def write_qc_artifacts(
     return artifacts
 
 
+def write_crossval_pcs(
+    cv_r2: np.ndarray,
+    prefix: str,
+    n_pcs_chosen: int,
+    verbose: int = 1,
+) -> dict:
+    """Write the held-out variance-explained-vs-K curve (TSV + PNG).
+
+    This is NSD's ``metricR2`` figure — the evidence for K=3.  A curve
+    that is still climbing at ``n_pcs_chosen`` means the library is
+    leaving shape variance on the table; one that peaked earlier means
+    the extra PCs are fitting noise.
+    """
+    artifacts: dict[str, str] = {}
+    ks = np.arange(1, cv_r2.size + 1)
+    path = Path(f"{prefix}_qc_crossval_pcs.tsv")
+    np.savetxt(
+        path,
+        np.column_stack([ks, cv_r2]),
+        fmt=["%d", "%.10g"],
+        delimiter="\t",
+        header="n_pcs\theldout_r2",
+        comments="",
+    )
+    artifacts["crossval_pcs_tsv"] = str(path)
+
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        if verbose >= 1:
+            print("    (matplotlib not installed — skipping crossval PNG)")
+        return artifacts
+
+    fig, ax = plt.subplots(figsize=(6, 4))
+    ax.plot(ks, cv_r2, "o-", color="C0")
+    ax.axvline(n_pcs_chosen, color="C3", ls="--", lw=1, label=f"-n-pcs {n_pcs_chosen}")
+    best = int(cv_r2.argmax()) + 1
+    ax.axvline(best, color="C2", ls=":", lw=1, label=f"held-out best K={best}")
+    ax.set_xlabel("number of PCs")
+    ax.set_ylabel("held-out variance explained (odd → even)")
+    ax.set_title("Cross-validated PC dimensionality")
+    ax.legend(fontsize=8)
+    fig.tight_layout()
+    png = Path(f"{prefix}_qc_crossval_pcs.png")
+    fig.savefig(png, dpi=120)
+    plt.close(fig)
+    artifacts["crossval_pcs_png"] = str(png)
+    return artifacts
+
+
+def derive_and_write_library(
+    *,
+    args,
+    betas: np.ndarray,
+    r2: np.ndarray,
+    lag_times: np.ndarray,
+    n_lags: int,
+    deconv_duration: float | None,
+    gtag: str,
+    label_for_output: str,
+    event_durations_arr: np.ndarray,
+    metadata: dict,
+    manifold_points: np.ndarray | None = None,
+    refit_weights: np.ndarray | None = None,
+    precomputed_svd=None,
+    precomputed_selection: np.ndarray | None = None,
+    r2_volume: tuple | None = None,
+    extra_group_meta: dict | None = None,
+):
+    """Derive one library from FIR betas and write all its artifacts.
+
+    Shared by the per-subject path in :func:`main` and the multi-subject
+    :func:`run_combine`, so both emit identical file sets and metadata.
+
+    ``r2_volume``, when given, is ``(r2_map, mask_flat, volume_shape,
+    affine, path)`` — combine mode has no volume geometry and passes
+    ``None``.
+    """
+    if deconv_duration is not None:
+        if args.deconv_method == "wiener":
+            print(
+                f"    Wiener deconvolving {deconv_duration:.2f}s boxcar (SNR={args.deconv_snr:g})"
+            )
+        else:
+            print(f"    Fitting double-gamma through a {deconv_duration:.2f}s boxcar")
+
+    lib = derive_library(
+        betas,
+        r2,
+        lag_times,
+        n_pcs=args.n_pcs,
+        n_hrfs=args.n_hrfs,
+        r2_threshold=args.r2_threshold,
+        max_voxels=args.max_voxels,
+        angular_step_deg=args.angular_step,
+        bandwidth_deg=args.bandwidth,
+        manifold_mode=args.manifold,
+        manifold_points=manifold_points,
+        density_floor_frac=args.density_floor,
+        fit_gamma=(args.fit_gamma == "double"),
+        seed=args.seed,
+        event_durations=event_durations_arr,
+        refit_weights=refit_weights,
+        deconvolve_duration=deconv_duration,
+        deconv_method=args.deconv_method,
+        deconv_snr=args.deconv_snr,
+        precomputed_svd=precomputed_svd,
+        precomputed_selection=precomputed_selection,
+    )
+    if lib.n_dropped_invalid:
+        print(
+            f"    NOTE: dropped {lib.n_dropped_invalid} manifold point(s) whose "
+            f"reconstruction had no dominant positive peak (not HRF-like); "
+            f"library has {lib.raw.shape[0]} entries."
+        )
+    if lib.coverage is not None:
+        cov = lib.coverage
+        # cos(angle) is exactly the shape correlation between a voxel's HRF
+        # and its best library entry, so this reads as "how well does the
+        # library represent the data it came from".
+        print(
+            f"    Coverage ({args.manifold}): voxel→nearest-entry angle "
+            f"median {cov['median_deg']:.1f}°, p90 {cov['p90_deg']:.1f}°, "
+            f"max {cov['max_deg']:.1f}°  |  shape r median "
+            f"{cov['median_shape_r']:.4f}, p10 {cov['p10_shape_r']:.4f}"
+        )
+        if args.manifold == "auto" and cov["p90_deg"] > 20.0:
+            print(
+                "      HINT: a large p90 means many voxels sit off the 1-D "
+                "ridge.  Try -manifold kmeans (or blob) to sample the "
+                "density in 2-D and compare these numbers."
+            )
+
+    raw_path = Path(f"{args.prefix}{gtag}_hrfraw.tsv")
+    pcs_path = Path(f"{args.prefix}{gtag}_pcs.tsv")
+
+    write_tsv(raw_path, lib.raw)
+    print(f"    Wrote {raw_path}   [duration-convolved cubic recon]")
+    np.savetxt(pcs_path, lib.svd.pcs.T, fmt="%.10g", delimiter="\t")
+    print(f"    Wrote {pcs_path}")
+
+    if lib.raw_deconvolved is not None:
+        raw_imp_path = Path(f"{args.prefix}{gtag}_hrfraw_imp.tsv")
+        write_tsv(raw_imp_path, lib.raw_deconvolved)
+        print(f"    Wrote {raw_imp_path}   [impulse-response cubic recon]")
+
+    final_library, final_label = lib.raw, "raw (duration-convolved)"
+    if lib.fitted_deconvolved is not None:
+        final_library, final_label = (
+            lib.fitted_deconvolved,
+            "gamma through boxcar" if args.deconv_method == "fit" else "deconv+gamma",
+        )
+    elif lib.fitted is not None:
+        final_library, final_label = lib.fitted, "gamma (duration-convolved)"
+    elif lib.raw_deconvolved is not None:
+        final_library, final_label = lib.raw_deconvolved, "deconv raw"
+    lib_path = Path(f"{args.prefix}{gtag}_hrflibrary.tsv")
+    write_tsv(lib_path, final_library)
+    print(f"    Wrote {lib_path}   [final library — {final_label}]")
+
+    if r2_volume is not None:
+        r2_map, mask_flat, volume_shape, affine, r2_path = r2_volume
+        write_r2_volume(r2_map, mask_flat, volume_shape, r2_path, affine)
+        print(f"    Wrote {r2_path}")
+
+    qc_artifacts = write_qc_artifacts(
+        lib, lag_times, label_for_output, args.prefix, gtag, verbose=args.verb
+    )
+    for kind, path in qc_artifacts.items():
+        print(f"    Wrote {path}   [QC: {kind}]")
+
+    group_meta = {
+        "label": label_for_output,
+        "n_lags": int(n_lags),
+        "median_duration_s": (
+            float(event_durations_arr[0])
+            if event_durations_arr.size == 1
+            else event_durations_arr.tolist()
+        ),
+        "n_selected_voxels": int(lib.selected_voxels.size),
+        "n_library_entries": int(lib.raw.shape[0]),
+        "n_dropped_invalid": int(lib.n_dropped_invalid),
+        "manifold_mode": args.manifold,
+        "coverage": (
+            {k: v for k, v in lib.coverage.items() if k != "angles_deg"}
+            if lib.coverage is not None
+            else None
+        ),
+        "variance_explained": lib.svd.variance_explained.tolist(),
+        "eigvals_top10": lib.svd.eigvals[:10].tolist(),
+        "gamma_params": lib.gamma_params,
+        "gamma_params_deconvolved": lib.gamma_params_deconvolved,
+        "duration_convolved": bool(lib.duration_convolved),
+        "deconvolution": (
+            {
+                "method": args.deconv_method,
+                "duration_s": float(deconv_duration),
+                "snr": float(args.deconv_snr) if args.deconv_method == "wiener" else None,
+            }
+            if deconv_duration is not None
+            else None
+        ),
+        "qc_artifacts": qc_artifacts,
+    }
+    if extra_group_meta:
+        group_meta.update(extra_group_meta)
+    metadata["groups"].append(group_meta)
+    return lib
+
+
+# ----------------------------------------------------------------------------
+# Combine mode — study-wide library across subjects
+# ----------------------------------------------------------------------------
+
+
+def run_combine(args, nii_ext: str) -> None:
+    """Build one library across several subjects' ``-save_fir`` intermediates.
+
+    NSD derived its canonical library this way: per-subject FIR fits,
+    then a single SVD over voxels pooled across all 8 subjects, with an
+    equal row count drawn from each so no subject dominates.  This is
+    that step, decoupled from the fitting so a study can add subjects
+    without refitting the ones it already has.
+
+    The NSD refit (``-refit-pcs``) is unavailable here — it needs the
+    timeseries, which the intermediates do not carry — so voxels are
+    placed on the sphere using the SVD's own loadings.
+    """
+    del nii_ext  # no volumes are written in combine mode
+    print(f"  COMBINE MODE: {len(args.combine)} subject intermediate(s)")
+
+    per_subject_betas: list[np.ndarray] = []
+    per_subject_r2: list[np.ndarray] = []
+    sources: list[str] = []
+    lag_times: np.ndarray | None = None
+    tr: float | None = None
+    durations: list[float] = []
+    basis: str | None = None
+
+    for path in args.combine:
+        p = Path(path)
+        if not p.exists():
+            print(f"ERROR: -combine file not found: {p}")
+            sys.exit(1)
+        with np.load(p, allow_pickle=False) as z:
+            required = {"betas", "r2", "lag_times", "tr", "median_duration_s"}
+            missing = required - set(z.files)
+            if missing:
+                print(
+                    f"ERROR: {p} is missing {sorted(missing)} — is it a "
+                    f"-save_fir intermediate from ffs_librarian?"
+                )
+                sys.exit(1)
+            b = z["betas"].astype(np.float64)
+            r = z["r2"].astype(np.float64)
+            lt = z["lag_times"].astype(np.float64)
+            this_tr = float(z["tr"])
+            this_dur = float(z["median_duration_s"])
+            this_basis = str(z["basis"]) if "basis" in z.files else "unknown"
+
+        if lag_times is None:
+            lag_times, tr, basis = lt, this_tr, this_basis
+        else:
+            if lt.shape != lag_times.shape or not np.allclose(lt, lag_times):
+                print(
+                    f"ERROR: {p} has FIR lags {lt[:3]}…({lt.size}) but the first "
+                    f"subject has {lag_times[:3]}…({lag_times.size}).  All subjects "
+                    f"must share a TR and FIR window to share a basis."
+                )
+                sys.exit(1)
+            if not np.isclose(this_tr, tr):
+                print(f"ERROR: {p} has TR={this_tr} but the first subject has TR={tr}.")
+                sys.exit(1)
+        durations.append(this_dur)
+        per_subject_betas.append(b)
+        per_subject_r2.append(r)
+        sources.append(str(p))
+        print(f"    {p.name}: {b.shape[0]:,} voxels × {b.shape[1]} lags, duration {this_dur:.2f}s")
+
+    assert lag_times is not None and tr is not None
+    n_lags = lag_times.size
+
+    # A common duration is required for the impulse-response correction:
+    # one library cannot be deconvolved at two different durations.
+    dur_ref = round(durations[0], 3)
+    uniform_duration = all(round(d, 3) == dur_ref for d in durations)
+    if not uniform_duration:
+        print(
+            f"  WARNING: subjects have different event durations {durations}. "
+            f"Skipping the duration correction — the library will stay "
+            f"duration-convolved.  Build separate libraries per duration instead."
+        )
+
+    stacked_betas, stacked_r2, subject_ids = stack_subject_betas(
+        per_subject_betas,
+        per_subject_r2,
+        r2_threshold=args.r2_threshold,
+        per_subject_voxels=args.per_subject_voxels,
+        seed=args.seed,
+        equalize=args.equalize_subjects,
+    )
+    counts = [int((subject_ids == i).sum()) for i in range(len(per_subject_betas))]
+    print(
+        f"  Stacked {stacked_betas.shape[0]:,} rows × {n_lags} lags "
+        f"across {len(per_subject_betas)} subjects (per-subject rows: {counts})"
+    )
+
+    if args.crossval_pcs:
+        print("  NOTE: -crossval-pcs needs odd/even run splits and is a per-subject step; ignored.")
+
+    # stack_subject_betas already applied the R² gate and the dead-voxel
+    # filter per subject; re-gating here would drop rows unequally across
+    # subjects and undo the equalization.
+    sel_all = np.arange(stacked_betas.shape[0])
+    svd_shared = svd_decompose(
+        stacked_betas, n_pcs=args.n_pcs, unit_normalize=True, sign_align=True
+    )
+    print(f"  SVD variance explained: {np.round(svd_shared.variance_explained * 100, 2)} %")
+
+    duration = float(durations[0]) if uniform_duration else 0.0
+    if args.deconvolve_duration == "on":
+        deconv = duration if duration > 0 else None
+    elif args.deconvolve_duration == "off" or not uniform_duration:
+        deconv = None
+    else:  # auto
+        deconv = duration if duration > 1.5 * 0.1 else None
+
+    metadata: dict = {
+        "tool": "ffs_librarian",
+        "mode": "combine",
+        "started": datetime.now().isoformat(timespec="seconds"),
+        "tr": float(tr),
+        "basis": basis,
+        "n_lags": int(n_lags),
+        "lag_times_s": lag_times.tolist(),
+        "n_subjects": len(per_subject_betas),
+        "subject_sources": sources,
+        "subject_row_counts": counts,
+        "subject_durations_s": durations,
+        "per_subject_voxels": int(args.per_subject_voxels),
+        "equalize_subjects": bool(args.equalize_subjects),
+        "refit_pcs": False,
+        "split_mode": "combine",
+        "duration_convolved": True,
+        "groups": [],
+    }
+
+    print(f"\n  --- study library across {len(per_subject_betas)} subjects ---")
+    derive_and_write_library(
+        args=args,
+        betas=stacked_betas,
+        r2=stacked_r2,
+        lag_times=lag_times,
+        n_lags=n_lags,
+        deconv_duration=deconv,
+        gtag="",
+        label_for_output="study",
+        event_durations_arr=np.asarray(durations, dtype=float),
+        metadata=metadata,
+        precomputed_svd=svd_shared,
+        precomputed_selection=sel_all,
+        extra_group_meta={"subject_row_counts": counts},
+    )
+
+    metadata["duration_convolved"] = all(
+        bool(g.get("duration_convolved", True)) for g in metadata["groups"]
+    )
+    meta_path = Path(f"{args.prefix}_metadata.json")
+    meta_path.write_text(json.dumps(metadata, indent=2))
+    print(f"\n  Wrote {meta_path}")
+    print("Done.")
+
+
 # ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
@@ -973,6 +1501,17 @@ def main() -> None:
     print("=" * 72)
     print(f"  Started: {datetime.now().isoformat(timespec='seconds')}")
     print(f"  Prefix:  {args.prefix}")
+
+    # --- Combine mode: no data loading, no GLM — dispatch and return ----------
+    if args.combine:
+        if args.input:
+            print("ERROR: -combine and -input are mutually exclusive.")
+            sys.exit(1)
+        run_combine(args, nii_ext)
+        return
+    if not args.input:
+        print("ERROR: -input is required (or use -combine to build from intermediates).")
+        sys.exit(1)
 
     # --- Validate event input -------------------------------------------------
     has_onsets = bool(args.onsets)
@@ -1061,10 +1600,16 @@ def main() -> None:
         for i, lbl in enumerate(condition_labels):
             print(f"    {lbl} -> {group_labels[group_per_cond[i]]}")
 
+    ortvec_paths = [
+        entry[0]
+        for flag in ("ortvec", "ortvec_run", "ortvec_glob", "ortvec_concat")
+        for entry in (getattr(args, flag, None) or [])
+        if flag in ("ortvec", "ortvec_run")
+    ]
     preflight_check(
         input_files=input_files,
         onset_files=args.onsets if has_onsets else None,
-        ortvec_files=None,
+        ortvec_files=ortvec_paths or None,
     )
 
     # --- Load data ------------------------------------------------------------
@@ -1183,12 +1728,55 @@ def main() -> None:
     else:
         polort_resolved = int(args.max_poly_degree)
 
-    packed = pack_for_shared_task_glm(
-        per_run_data=per_run_data,
-        per_run_task_designs=per_run_designs,
-        polort=polort_resolved,
-        task_column_labels=design_result.column_labels,
-        device=torch.device("cpu"),
+    # External nuisance (motion, physio, GLMdenoise noise regressors).
+    # These go into the per-run block-diagonal section alongside the
+    # polynomials, so they are projected out of the FIR estimate itself —
+    # anything left in the FIR curves becomes spurious shape variance in
+    # the SVD and lands in the library.
+    nuisance_blocks = collect_nuisance_blocks(
+        args, run_starts_ext[:-1], n_timepoints, verbose=args.verb >= 1
+    )
+    extra_per_run: list[torch.Tensor] | None = None
+    if nuisance_blocks:
+        extra_per_run = []
+        for r in range(n_runs):
+            run_len = n_tp_per_run[r]
+            cols = [blk.get_run(r, run_len) for blk in nuisance_blocks if blk.n_columns > 0]
+            if cols:
+                m = np.concatenate(cols, axis=1).astype(np.float64)
+                # Demean per run so the columns don't fight the polort
+                # intercept and make the design rank-deficient.
+                m = m - m.mean(axis=0, keepdims=True)
+            else:
+                m = np.zeros((run_len, 0), dtype=np.float64)
+            extra_per_run.append(torch.from_numpy(m.astype(np.float32)))
+        n_extra = extra_per_run[0].shape[1]
+        print(f"  External nuisance: {n_extra} regressor(s) per run, block-diagonal")
+
+    def _fit_packed(task_designs, run_data, labels, verbose=False):
+        """Pack + fit one shared-task GLM, returning (packed, results)."""
+        pk = pack_for_shared_task_glm(
+            per_run_data=run_data,
+            per_run_task_designs=task_designs,
+            polort=polort_resolved,
+            task_column_labels=labels,
+            extra_regressors_per_run=extra_per_run,
+            device=torch.device("cpu"),
+        )
+        res = fit_glm(
+            data=pk.data_concat,
+            design=pk.design_concat,
+            tr=tr,
+            max_poly_degree=-1,
+            device=device,
+            verbose=verbose,
+            want_r2_run=False,
+            debug_design=args.debug_design,
+        )
+        return pk, res
+
+    packed, results = _fit_packed(
+        per_run_designs, per_run_data, design_result.column_labels, verbose=args.verb >= 1
     )
     print(
         f"  Fitting pooled FIR/TENT GLM "
@@ -1196,16 +1784,6 @@ def main() -> None:
         f"{packed.n_task_cols} task + "
         f"{packed.design_concat.shape[1] - packed.n_task_cols} nuisance "
         f"across {len(per_run_data)} runs)"
-    )
-    results = fit_glm(
-        data=packed.data_concat,
-        design=packed.design_concat,
-        tr=tr,
-        max_poly_degree=-1,
-        device=device,
-        verbose=args.verb >= 1,
-        want_r2_run=False,
-        debug_design=args.debug_design,
     )
     # ``betas`` is (n_voxels, n_task_cols + n_nuisance); take the first
     # n_task_cols (these correspond to our group blocks, in order).
@@ -1216,6 +1794,41 @@ def main() -> None:
     r2 = results.r2
     if isinstance(r2, torch.Tensor):
         r2 = r2.detach().cpu().numpy()
+
+    # --- Task R² -------------------------------------------------------------
+    # fit_glm's R² is whole-model: 1 - SS_res/SS_tot with SS_tot about the
+    # data mean.  The nuisance block (polynomials, ortvecs) is in the
+    # design, so drift and motion are credited to the model and a voxel
+    # with no task response at all can clear an R² gate comfortably.  NSD
+    # thresholded GLMdenoise's R², which is task variance after nuisance
+    # removal.  Recover that by refitting nuisance-only and using its
+    # residual as the denominator:  R²_task = 1 - SS_res_full/SS_res_nuis.
+    # Both fits see the same data, so they share SS_tot and the residual
+    # ratio falls straight out of the two R² values:
+    #     R²_task = 1 - SS_full/SS_nuis = 1 - (1 - R²_full)/(1 - R²_nuis)
+    # which avoids needing SS_residual (GLMResults does not expose it).
+    if args.r2_mode == "task":
+        zero_task = [torch.zeros((n_tp_per_run[r], 0)) for r in range(n_runs)]
+        _, nuis_results = _fit_packed(zero_task, per_run_data, [])
+        r2_nuis = nuis_results.r2
+        if isinstance(r2_nuis, torch.Tensor):
+            r2_nuis = r2_nuis.detach().cpu().numpy()
+        # R²_nuis ≈ 1 means the nuisance block already explains everything —
+        # a constant voxel (air, masked edge).  There is no variance left
+        # for the task to explain, so score 0 rather than divide by ~0.
+        denom = 1.0 - r2_nuis
+        live = denom > 1e-6
+        r2_task = np.zeros_like(r2)
+        r2_task[live] = 1.0 - (1.0 - r2[live]) / denom[live]
+        print(
+            f"  R² mode: task (nuisance-only refit); "
+            f"median full-model R²={np.median(r2):.3f}, "
+            f"median task R²={np.median(r2_task[live]) if live.any() else float('nan'):.3f}, "
+            f"{int((~live).sum()):,} voxel(s) fully explained by nuisance → 0"
+        )
+        r2 = r2_task.astype(np.float32)
+    else:
+        print("  R² mode: full (whole-model R², includes drift/nuisance)")
 
     # Auto-mask: zero out R² for voxels with no FIR signal.  Without
     # a brain mask the loader keeps air/background voxels, and the
@@ -1239,6 +1852,104 @@ def main() -> None:
             )
         elif args.verb >= 1:
             print(f"  Auto-masked {n_dead:,} zero-FIR voxels (R² set to 0).")
+
+    # --- Cross-validated PC count (NSD's metricR2) ---------------------------
+    crossval_artifacts: dict = {}
+    cv_curve: np.ndarray | None = None
+    if args.crossval_pcs:
+        if n_runs < 2:
+            print("  WARNING: -crossval-pcs needs at least 2 runs; skipping.")
+        else:
+            odd = [r for r in range(n_runs) if r % 2 == 0]
+            even = [r for r in range(n_runs) if r % 2 == 1]
+            print(
+                f"\n  Cross-validating PC count: fitting runs {[r + 1 for r in odd]} "
+                f"vs {[r + 1 for r in even]} separately"
+            )
+            split_betas = []
+            for subset in (odd, even):
+                sub_data = [per_run_data[r] for r in subset]
+                sub_designs = [per_run_designs[r] for r in subset]
+                saved_extra = extra_per_run
+                if extra_per_run is not None:
+                    extra_per_run = [extra_per_run[r] for r in subset]
+                _, sub_res = _fit_packed(sub_designs, sub_data, design_result.column_labels)
+                extra_per_run = saved_extra
+                b = sub_res.betas
+                if isinstance(b, torch.Tensor):
+                    b = b.detach().cpu().numpy()
+                split_betas.append(b[:, :n_task_cols])
+            # Score on the voxels the library will actually be built from.
+            cv_sel = select_library_voxels(
+                betas_full[:, :n_task_cols],
+                r2,
+                threshold=args.r2_threshold,
+                max_voxels=args.max_voxels,
+                seed=args.seed,
+            )
+            if cv_sel.size < 10:
+                print(
+                    "  WARNING: too few voxels survived selection for cross-validation; skipping."
+                )
+            else:
+                cv_curve = crossval_n_pcs(
+                    split_betas[0][cv_sel][:, :n_lags],
+                    split_betas[1][cv_sel][:, :n_lags],
+                )
+                best_k = int(cv_curve.argmax()) + 1
+                print(
+                    f"  Held-out R² by K: {np.round(cv_curve[: min(8, cv_curve.size)], 4)} "
+                    f"→ best K={best_k} (using -n-pcs {args.n_pcs})"
+                )
+                if best_k != args.n_pcs:
+                    print(
+                        f"  NOTE: held-out variance explained peaks at K={best_k}, not "
+                        f"{args.n_pcs}.  Consider -n-pcs {best_k}; see the QC plot."
+                    )
+                crossval_artifacts = write_crossval_pcs(
+                    cv_curve, args.prefix, args.n_pcs, verbose=args.verb
+                )
+                for kind, path in crossval_artifacts.items():
+                    print(f"    Wrote {path}   [QC: {kind}]")
+
+    # --- Save the FIR intermediate for later multi-subject combination -------
+    if args.save_fir:
+        save_sel = select_library_voxels(
+            betas_full[:, :n_task_cols],
+            r2,
+            threshold=args.r2_threshold,
+            max_voxels=max(args.max_voxels, args.per_subject_voxels),
+            seed=args.seed,
+        )
+        if save_sel.size == 0:
+            print("  WARNING: no voxels passed the R² gate; -save_fir intermediate not written.")
+        else:
+            # Store only supra-threshold voxels — combine mode re-gates
+            # anyway and this keeps a whole-study set of intermediates small.
+            # For a stacked multi-group fit the task block holds all groups;
+            # save it whole so combine mode can slice it the same way.
+            fir_path = Path(args.save_fir)
+            np.savez_compressed(
+                fir_path,
+                betas=betas_full[save_sel, :n_lags].astype(np.float32),
+                r2=r2[save_sel].astype(np.float32),
+                voxel_indices=save_sel.astype(np.int64),
+                lag_times=lag_times.astype(np.float64),
+                tr=np.float64(tr),
+                median_duration_s=np.float64(pooled_durations[0]),
+                basis=str(args.basis),
+                n_groups=np.int64(n_groups),
+                r2_mode=str(args.r2_mode),
+            )
+            print(
+                f"  Wrote {fir_path}   [FIR intermediate: {save_sel.size:,} voxels × "
+                f"{n_lags} lags — feed to -combine]"
+            )
+            if n_groups > 1:
+                print(
+                    "  NOTE: only the FIRST group's FIR block is saved for combining. "
+                    "Run once per group (with -split-separate) to combine groups."
+                )
 
     # --- Per-group library derivation -----------------------------------------
     optional_manifold_points = None
@@ -1301,6 +2012,22 @@ def main() -> None:
         "group_labels": group_labels,
         "group_per_condition": group_per_cond,
         "split_mode": "stacked" if use_stacking else ("single" if n_groups == 1 else "separate"),
+        "r2_mode": args.r2_mode,
+        "deconv_method": args.deconv_method,
+        "refit_pcs": args.refit_pcs == "on",
+        "polort": int(polort_resolved),
+        "n_external_nuisance_per_run": (
+            int(extra_per_run[0].shape[1]) if extra_per_run is not None else 0
+        ),
+        "crossval_pcs": (
+            {
+                "heldout_r2_by_k": cv_curve.tolist(),
+                "best_k": int(cv_curve.argmax()) + 1,
+                "artifacts": crossval_artifacts,
+            }
+            if cv_curve is not None
+            else None
+        ),
         # Per-group ``duration_convolved`` flags live under each entry in
         # ``groups`` (the global flag here is the AND of all groups, kept
         # for backwards-compat with code that scans top-level only).
@@ -1328,131 +2055,56 @@ def main() -> None:
         pc_designs_torch = [
             torch.from_numpy(d.astype(np.float32)).to(device) for d in pc_designs_np
         ]
-        refit_packed = pack_for_shared_task_glm(
-            per_run_data=per_run_data,
-            per_run_task_designs=pc_designs_torch,
-            polort=polort_resolved,
-            task_column_labels=[f"PC{i}" for i in range(args.n_pcs)],
-            device=torch.device("cpu"),
-        )
-        refit_result = fit_glm(
-            data=refit_packed.data_concat,
-            design=refit_packed.design_concat,
-            tr=tr,
-            max_poly_degree=-1,
-            device=device,
-            verbose=False,
-            want_r2_run=False,
-            debug_design=args.debug_design,
+        # Same nuisance as the FIR fit — the refit loadings place voxels on
+        # the sphere, so any nuisance left in them distorts the manifold.
+        refit_packed, refit_result = _fit_packed(
+            pc_designs_torch,
+            per_run_data,
+            [f"PC{i}" for i in range(args.n_pcs)],
         )
         rb = refit_result.betas
         if isinstance(rb, torch.Tensor):
             rb = rb.detach().cpu().numpy()
         return rb[:, : refit_packed.n_task_cols]
 
-    # ------------------------------------------------------------------
-    # Helper: take prepared (betas, r2, refit_weights, deconv_duration)
-    # for one library — call derive_library, write the TSVs / PNGs /
-    # metadata, return the LibraryResult.
-    # ------------------------------------------------------------------
+    # The derive+write step itself now lives at module level as
+    # derive_and_write_library, so combine mode emits an identical file
+    # set.  This closure just binds the per-run context.
     def _derive_and_write_one_library(
-        betas_in: np.ndarray,
-        r2_in: np.ndarray,
-        refit_weights_in: np.ndarray | None,
-        deconv_duration: float | None,
-        gtag: str,
-        label_for_output: str,
-        event_durations_arr: np.ndarray,
+        betas_in,
+        r2_in,
+        refit_weights_in,
+        deconv_duration,
+        gtag,
+        label_for_output,
+        event_durations_arr,
+        precomputed_svd=None,
+        precomputed_selection=None,
     ):
-        if deconv_duration is not None:
-            print(
-                f"    Wiener deconvolving {deconv_duration:.2f}s boxcar (SNR={args.deconv_snr:g})"
-            )
-        lib = derive_library(
-            betas_in,
-            r2_in,
-            lag_times,
-            n_pcs=args.n_pcs,
-            n_hrfs=args.n_hrfs,
-            r2_threshold=args.r2_threshold,
-            max_voxels=args.max_voxels,
-            angular_step_deg=args.angular_step,
-            bandwidth_deg=args.bandwidth,
-            manifold_mode=args.manifold,
+        return derive_and_write_library(
+            args=args,
+            betas=betas_in,
+            r2=r2_in,
+            lag_times=lag_times,
+            n_lags=n_lags,
+            deconv_duration=deconv_duration,
+            gtag=gtag,
+            label_for_output=label_for_output,
+            event_durations_arr=event_durations_arr,
+            metadata=metadata,
             manifold_points=optional_manifold_points,
-            fit_gamma=(args.fit_gamma == "double"),
-            seed=args.seed,
-            event_durations=event_durations_arr,
             refit_weights=refit_weights_in,
-            deconvolve_duration=deconv_duration,
-            deconv_snr=args.deconv_snr,
+            precomputed_svd=precomputed_svd,
+            precomputed_selection=precomputed_selection,
+            # The R2 map is per-voxel regardless of how betas were stacked.
+            r2_volume=(
+                r2,
+                mask_flat,
+                volume_shape,
+                affine,
+                Path(f"{args.prefix}{gtag}_fir_r2{nii_ext}"),
+            ),
         )
-
-        raw_path = Path(f"{args.prefix}{gtag}_hrfraw.tsv")
-        pcs_path = Path(f"{args.prefix}{gtag}_pcs.tsv")
-        r2_path = Path(f"{args.prefix}{gtag}_fir_r2{nii_ext}")
-
-        write_tsv(raw_path, lib.raw)
-        print(f"    Wrote {raw_path}   [duration-convolved cubic recon]")
-        np.savetxt(pcs_path, lib.svd.pcs.T, fmt="%.10g", delimiter="\t")
-        print(f"    Wrote {pcs_path}")
-
-        if lib.raw_deconvolved is not None:
-            raw_imp_path = Path(f"{args.prefix}{gtag}_hrfraw_imp.tsv")
-            write_tsv(raw_imp_path, lib.raw_deconvolved)
-            print(f"    Wrote {raw_imp_path}   [impulse-response cubic recon]")
-
-        final_library, final_label = lib.raw, "raw (duration-convolved)"
-        if lib.fitted_deconvolved is not None:
-            final_library, final_label = lib.fitted_deconvolved, "deconv+gamma"
-        elif lib.fitted is not None:
-            final_library, final_label = lib.fitted, "gamma (duration-convolved)"
-        elif lib.raw_deconvolved is not None:
-            final_library, final_label = lib.raw_deconvolved, "deconv raw"
-        lib_path = Path(f"{args.prefix}{gtag}_hrflibrary.tsv")
-        write_tsv(lib_path, final_library)
-        print(f"    Wrote {lib_path}   [final library — {final_label}]")
-
-        # R² volume is written once per call.  For stacked mode the
-        # underlying r2 is the full-model R² across all groups (the
-        # tiled stack collapses back to one map per voxel).
-        write_r2_volume(r2, mask_flat, volume_shape, r2_path, affine)
-        print(f"    Wrote {r2_path}")
-
-        qc_artifacts = write_qc_artifacts(
-            lib, lag_times, label_for_output, args.prefix, gtag, verbose=args.verb
-        )
-        for kind, path in qc_artifacts.items():
-            print(f"    Wrote {path}   [QC: {kind}]")
-
-        metadata["groups"].append(
-            {
-                "label": label_for_output,
-                "n_lags": int(n_lags),
-                "median_duration_s": (
-                    float(event_durations_arr[0])
-                    if event_durations_arr.size == 1
-                    else event_durations_arr.tolist()
-                ),
-                "n_selected_voxels": int(lib.selected_voxels.size),
-                "variance_explained": lib.svd.variance_explained.tolist(),
-                "eigvals_top10": lib.svd.eigvals[:10].tolist(),
-                "gamma_params": lib.gamma_params,
-                "gamma_params_deconvolved": lib.gamma_params_deconvolved,
-                "duration_convolved": bool(lib.duration_convolved),
-                "deconvolution": (
-                    {
-                        "method": "wiener",
-                        "duration_s": float(deconv_duration),
-                        "snr": float(args.deconv_snr),
-                    }
-                    if deconv_duration is not None
-                    else None
-                ),
-                "qc_artifacts": qc_artifacts,
-            }
-        )
-        return lib
 
     # ------------------------------------------------------------------
     # Branch A: stacked mode — single library across all groups.
@@ -1468,36 +2120,31 @@ def main() -> None:
         stacked_betas = np.concatenate([task_betas_3d[:, g, :] for g in range(n_groups)], axis=0)
         stacked_r2 = np.tile(r2, n_groups)
 
-        # Compute shared PCs (one SVD on the stacked betas, same voxel
-        # selection + zero-norm filter as derive_library will do).
+        # Compute shared PCs once and hand both the selection and the SVD
+        # to derive_library.  Previously both this block and derive_library
+        # ran their own selection + SVD and relied on the two independently
+        # reproducing the same result; passing them through makes it a fact
+        # rather than a coincidence, and halves the SVD work.
         refit_weights_stacked = None
+        svd_shared = None
+        sel_s = None
         if args.refit_pcs == "on":
-            from fastfuncstuff.design.hrf_derive import select_voxels as _sel_fn
-
-            sel_s = _sel_fn(
+            sel_s = select_library_voxels(
+                stacked_betas,
                 stacked_r2,
                 threshold=args.r2_threshold,
                 max_voxels=args.max_voxels,
                 seed=args.seed,
             )
-            sel_betas_s = stacked_betas[sel_s]
-            sel_norms_s = np.linalg.norm(sel_betas_s, axis=1)
-            sel_alive_s = sel_norms_s > 1e-8 * max(
-                float(np.median(sel_norms_s[sel_norms_s > 0])) if (sel_norms_s > 0).any() else 1.0,
-                1.0,
-            )
-            sel_s = sel_s[sel_alive_s]
-            sel_betas_s = stacked_betas[sel_s]
-
             svd_shared = svd_decompose(
-                sel_betas_s,
+                stacked_betas[sel_s],
                 n_pcs=args.n_pcs,
                 unit_normalize=True,
                 sign_align=True,
             )
             print(
                 f"\n  --- stacked SVD: {sel_s.size} voxel-group rows; "
-                f"PC variance {svd_shared.variance_explained[:3] * 100} ---"
+                f"PC variance {np.round(svd_shared.variance_explained[:3] * 100, 2)} % ---"
             )
 
             # Per-group refit using SHARED PCs; concatenate the resulting
@@ -1535,6 +2182,8 @@ def main() -> None:
             gtag="",
             label_for_output="stacked",
             event_durations_arr=np.asarray(pooled_durations, dtype=float),
+            precomputed_svd=svd_shared,
+            precomputed_selection=sel_s,
         )
 
     # ------------------------------------------------------------------
@@ -1548,25 +2197,18 @@ def main() -> None:
 
             # NSD refinement using PCs derived FROM THIS GROUP only.
             refit_weights_g = None
+            svd_pre = None
+            sel_g = None
             if args.refit_pcs == "on":
-                from fastfuncstuff.design.hrf_derive import select_voxels as _sel_fn
-
-                sel_g = _sel_fn(
+                sel_g = select_library_voxels(
+                    betas_g,
                     r2,
                     threshold=args.r2_threshold,
                     max_voxels=args.max_voxels,
                     seed=args.seed,
                 )
-                sel_betas = betas_g[sel_g]
-                sel_norms = np.linalg.norm(sel_betas, axis=1)
-                sel_alive = sel_norms > 1e-8 * max(
-                    float(np.median(sel_norms[sel_norms > 0])) if (sel_norms > 0).any() else 1.0,
-                    1.0,
-                )
-                sel_g = sel_g[sel_alive]
-                sel_betas = betas_g[sel_g]
                 svd_pre = svd_decompose(
-                    sel_betas,
+                    betas_g[sel_g],
                     n_pcs=args.n_pcs,
                     unit_normalize=True,
                     sign_align=True,
@@ -1598,6 +2240,8 @@ def main() -> None:
                 gtag=gtag,
                 label_for_output=group_labels[g],
                 event_durations_arr=np.asarray([group_duration], dtype=float),
+                precomputed_svd=svd_pre,
+                precomputed_selection=sel_g,
             )
 
     # Roll up the per-group duration_convolved flag: top-level True only

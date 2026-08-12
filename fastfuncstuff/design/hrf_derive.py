@@ -62,30 +62,40 @@ Design notes
   what NSD used and is the well-tested path; other values are allowed
   but auto-manifold tracing falls back to PCA-based 1-D ordering.
 
-Duration / deconvolution caveat (TODO)
---------------------------------------
+Duration handling
+-----------------
 The FIR/TENT fit estimates the **response to whatever event shape was in
 the data** — including the stimulus duration's boxcar.  Downstream tools
-(``ffs_hrfopt``, ``ffs_denoise``, etc.) re-convolve this library HRF with
-the event boxcar at modelling time.  Strictly correct usage therefore
-requires that the library represent the *impulse response* — i.e. the
-HRF you'd see for a duration-0 stimulus — so that the downstream
-convolution recovers the actual measured response.
+(``ffs_hrfopt``, ``ffs_denoise``, …) re-convolve the library HRF with the
+event boxcar at modelling time, so the library must hold the *impulse
+response*; otherwise the design is doubly convolved.  For brief events
+(duration ≪ HRF width) the difference is negligible; for block designs
+it is not, and two conditions sharing an HRF but differing in duration
+would otherwise yield different-looking library entries.
 
-For brief events (duration << HRF width) the FIR estimate ≈ impulse
-response, so the difference is negligible.  For block designs (e.g. 10 s
-blocks) the FIR estimate is already wider than the true HRF and using it
-directly as a "library HRF" will produce a *doubly-convolved* design.
-Two conditions with the same underlying HRF but different durations will
-also yield different-looking library entries, which a per-condition
-deconvolution step would harmonize.
+Two corrections are available (``deconv_method`` in
+:func:`derive_library`):
 
-For the MVP we punt this to a later "group harmonization" stage and
-return the FIR estimate as-is, but mark the deconvolution slot in the
-pipeline with :func:`deconvolve_event_duration` (raises
-``NotImplementedError`` today) so callers can see where the missing step
-lives.  The library sidecar JSON should record the per-group event
-durations so a future stage can apply the deconvolution after the fact.
+- ``"fit"`` (default, NSD-faithful) — put the boxcar inside the
+  double-gamma forward model and fit, so the recovered parameters
+  describe the impulse response directly.  This is what
+  ``hrf_fitspmhrftomanifold.m`` does; no numerical inverse is involved.
+  See :func:`fit_double_gamma_through_boxcar`.
+- ``"wiener"`` — explicitly invert the boxcar convolution
+  (:func:`deconvolve_event_duration`).  Required when ``fit_gamma=False``
+  since there is then no parametric family to carry the correction, but
+  it has to regularize away the boxcar's spectral zeros at multiples of
+  ``1/duration``, which the fit approach never encounters.
+
+Multi-subject libraries
+-----------------------
+:func:`derive_library` is subject-agnostic: it sees a ``(n_rows, n_lags)``
+beta matrix and an R² vector.  To build a study-wide library, row-stack
+each subject's *selected* FIR betas and pass the stack.  NSD did exactly
+this across its 8 subjects, sampling a fixed count per subject so each
+contributes equally regardless of how many voxels passed its R² gate.
+``ffs_librarian -combine`` implements that; see
+:func:`stack_subject_betas`.
 """
 
 from __future__ import annotations
@@ -143,6 +153,51 @@ def select_voxels(
         return high
     rng = np.random.default_rng(seed)
     return rng.choice(high, size=max_voxels, replace=False)
+
+
+def select_library_voxels(
+    betas: np.ndarray,
+    r2: np.ndarray,
+    threshold: float = 0.10,
+    max_voxels: int = 20_000,
+    seed: int = 42,
+) -> np.ndarray:
+    """R² gate plus the dead-voxel filter, as one reusable step.
+
+    :func:`select_voxels` applies only the R² threshold.  This wrapper
+    then drops voxels whose FIR beta vector is numerically zero.
+
+    Why the second filter exists: without a brain mask, air voxels reach
+    the GLM as (post-scaling) constants.  Anything in the nuisance block
+    fits a constant perfectly, so their residual is ~0 and R² ~1 — they
+    look like the *best* voxels to an R² gate while carrying all-zero
+    FIR betas, and they then dominate the SVD and turn the PCs into
+    noise.  NSD sidestepped this with a BET mask up front; we also
+    filter post-hoc so the failure cannot happen silently.
+
+    Callers that need the selection *before* calling
+    :func:`derive_library` (to derive PCs for the NSD refit) should use
+    this and pass the result back in as ``precomputed_selection``, so
+    both stages provably see the same voxels.
+
+    Returns indices into the original voxel axis.
+    """
+    sel = select_voxels(r2, threshold=threshold, max_voxels=max_voxels, seed=seed)
+    norms = np.linalg.norm(betas[sel], axis=1)
+    floor = 1e-8 * max(float(np.median(norms[norms > 0])) if (norms > 0).any() else 1.0, 1.0)
+    alive = norms > floor
+    n_dropped = int((~alive).sum())
+    if n_dropped > 0.5 * sel.size and sel.size > 0:
+        import warnings
+
+        warnings.warn(
+            f"select_library_voxels: {n_dropped} of {sel.size} voxels passing the "
+            f"R² gate had zero-norm FIR betas (constant/air signal scoring R²≈1). "
+            f"Strongly recommend passing -mask <brain_mask.nii.gz>.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return sel[alive]
 
 
 # ----------------------------------------------------------------------------
@@ -298,6 +353,68 @@ def svd_decompose(
     )
 
 
+def crossval_n_pcs(
+    betas_train: np.ndarray,
+    betas_test: np.ndarray,
+    max_pcs: int | None = None,
+) -> np.ndarray:
+    """Cross-validated variance explained as a function of PC count.
+
+    This is the step that told NSD to use K=3.  ``hrf_derivecanonicalpcs.m``
+    fits the FIR on odd runs and even runs separately, derives PCs from
+    the odd-run betas, projects the odd-run betas onto the top-K PCs, and
+    scores that reconstruction against the **even-run** betas::
+
+        recon0 = firsSELECT(:,2,:,q) * (v(:,1:p)*v(:,1:p)');
+        metricR2(q,p) = calccod(flatten(recon0), flatten(firsSELECT(:,3,:,q)));
+
+    Because the projector is rank-K, adding PCs can only help on the
+    training split; the held-out split is what makes the curve turn over
+    (or flatten), which is what identifies the useful dimensionality.
+
+    Both inputs are row-unit-normalized here, matching the normalization
+    the real PCA step applies.
+
+    Parameters
+    ----------
+    betas_train, betas_test : np.ndarray, shape (n_voxels, n_lags)
+        FIR betas from two independent halves of the data, **same voxels
+        in the same order**.
+    max_pcs : int, optional
+        Score K = 1 … ``max_pcs``.  Defaults to ``n_lags``.
+
+    Returns
+    -------
+    r2 : np.ndarray, shape (max_pcs,)
+        Held-out coefficient of determination for each K, computed
+        relative to zero (not to the mean) to match MATLAB ``calccod``
+        defaults, so a useless reconstruction scores ≤ 0.
+    """
+    if betas_train.shape != betas_test.shape:
+        raise ValueError(
+            f"betas_train {betas_train.shape} and betas_test {betas_test.shape} must match"
+        )
+
+    def _unit_rows(x: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(x, axis=1, keepdims=True)
+        return x / np.where(norms > 1e-12, norms, 1.0)
+
+    train = _unit_rows(betas_train)
+    test = _unit_rows(betas_test)
+    n_lags = train.shape[1]
+    max_pcs = n_lags if max_pcs is None else min(max_pcs, n_lags)
+
+    _, _, vt = np.linalg.svd(train, full_matrices=False)
+    ss_tot = float((test**2).sum())
+    out = np.zeros(max_pcs, dtype=np.float64)
+    for k in range(1, max_pcs + 1):
+        v = vt[:k]  # (k, n_lags), orthonormal rows
+        recon = (train @ v.T) @ v
+        ss_res = float(((test - recon) ** 2).sum())
+        out[k - 1] = 1.0 - ss_res / max(ss_tot, 1e-30)
+    return out
+
+
 # ----------------------------------------------------------------------------
 # Unit-sphere projection
 # ----------------------------------------------------------------------------
@@ -394,6 +511,97 @@ def _fibonacci_sphere(n: int) -> np.ndarray:
     return np.column_stack([np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)])
 
 
+def _tangent_basis(p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Two orthonormal vectors spanning the tangent plane at unit vector ``p``."""
+    aux = np.array([1.0, 0.0, 0.0]) if abs(p[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    e1 = np.cross(p, aux)
+    e1 /= np.linalg.norm(e1)
+    e2 = np.cross(p, e1)
+    return e1, e2
+
+
+def _local_ridge_direction(
+    start: np.ndarray,
+    grid: np.ndarray,
+    density: np.ndarray,
+    step_rad: float,
+) -> np.ndarray:
+    """Principal tangent direction of the density ridge at ``start``.
+
+    Takes grid points within ``2 × step_rad`` of ``start``, expresses them
+    in the tangent plane at ``start``, and returns the top eigenvector of
+    their density-weighted covariance.  That is the direction the ridge
+    runs, which seeds the two-sided walk.
+    """
+    e1, e2 = _tangent_basis(start)
+    near = (grid @ start) > np.cos(2.0 * step_rad)
+    if near.sum() < 3:
+        return e1
+    coords = np.column_stack([grid[near] @ e1, grid[near] @ e2])
+    w = density[near]
+    total = float(w.sum())
+    if total <= 0:
+        return e1
+    cov = (coords * w[:, None]).T @ coords / total
+    _, evecs = np.linalg.eigh(cov)
+    d = evecs[:, -1]  # largest eigenvalue last from eigh
+    direction = d[0] * e1 + d[1] * e2
+    norm = np.linalg.norm(direction)
+    return direction / norm if norm > 1e-12 else e1
+
+
+def _walk_ridge_one_way(
+    start: np.ndarray,
+    tangent: np.ndarray,
+    grid: np.ndarray,
+    density: np.ndarray,
+    n_steps: int,
+    step_rad: float,
+    floor: float,
+    snap_cone: float = 0.5,
+) -> list[np.ndarray]:
+    """Predict-and-correct walk along a density ridge in ONE direction.
+
+    Each step takes a geodesic hop of ``step_rad`` from the current point
+    along the current tangent (the *predict*), then snaps to the highest-
+    density grid point within a cone of half-angle ``snap_cone × step_rad``
+    around that target (the *correct*).  The tangent is then recomputed as
+    the geodesic direction actually travelled, so it carries forward.
+
+    Carrying the tangent is what makes this a directed walk.  The previous
+    implementation chose purely by density within an annulus and forbade
+    only near-exact repeats, which let it fold back and re-traverse the
+    same arc a few degrees off — emitting duplicate library entries while
+    never reaching one end of the ridge.
+
+    Returns the points visited *excluding* ``start``.
+    """
+    out: list[np.ndarray] = []
+    cur = start
+    tan = tangent
+    cos_cone = np.cos(snap_cone * step_rad)
+    for _ in range(n_steps):
+        target = cur * np.cos(step_rad) + tan * np.sin(step_rad)
+        target /= np.linalg.norm(target)
+        in_cone = (grid @ target) >= cos_cone
+        if not in_cone.any():
+            break
+        cand = np.where(in_cone, density, -np.inf)
+        nxt = grid[int(cand.argmax())]
+        if density[int(cand.argmax())] < floor:
+            break
+        # Recompute the tangent as the direction actually travelled, so the
+        # walk keeps going the way it was going rather than re-deciding.
+        new_tan = nxt - cur * float(cur @ nxt)
+        norm = np.linalg.norm(new_tan)
+        if norm < 1e-12:
+            break
+        tan = new_tan / norm
+        cur = nxt
+        out.append(cur)
+    return out
+
+
 def trace_manifold_auto(
     unit_vectors: np.ndarray,
     n_points: int = 20,
@@ -404,27 +612,35 @@ def trace_manifold_auto(
 ) -> np.ndarray:
     """Trace a 1-D density ridge across the unit sphere (K=3 only).
 
-    Greedy walk:
+    Two-sided predict-and-correct walk:
 
     1. Build a near-uniform Fibonacci grid of ``n_grid`` candidate
        directions on the 2-sphere.
     2. Compute the spherical-KDE density of ``unit_vectors`` at each
        grid point (bandwidth = ``bandwidth_deg``).
-    3. Start at the global density peak.
-    4. From the current point, propose moves to grid points whose
-       angular distance from the current point is within ±20 % of
-       ``angular_step_deg``.  Pick the one with highest density that is
-       also at least ``0.7 × angular_step`` away from every previously
-       visited point (prevents backtracking).
-    5. Stop early if density drops below
-       ``density_floor_frac × peak_density`` or no valid forward move
-       exists.
+    3. Start at the global density peak and estimate the ridge's local
+       tangent direction there (:func:`_local_ridge_direction`).
+    4. Walk ``+tangent`` and ``-tangent`` away from the peak, splitting
+       the ``n_points`` budget between the two arms; if one arm
+       terminates early its remaining budget goes to the other.  Each
+       step is a geodesic hop of ``angular_step_deg`` followed by a snap
+       to the densest grid point nearby (:func:`_walk_ridge_one_way`).
+    5. Stop an arm when density drops below
+       ``density_floor_frac × peak_density``.
 
-    This is a deliberately simple heuristic — it is **not** principal
-    curves or graph-based ridge extraction.  For NSD-like data the
-    density manifold is a clean 1-D arc, and a greedy walk on a
-    Fibonacci grid recovers it; for pathological cases use
-    :func:`trace_manifold_from_points` to override.
+    This automates what NSD did by hand — ``hrf_constructmanifold.m``
+    has a human click 12 points on the (PC2, PC3) density heatmap and
+    then great-circle-interpolates between them at 6° spacing.  The
+    walk here is deliberately simple and is **not** principal curves or
+    graph-based ridge extraction; for pathological densities use
+    :func:`trace_manifold_from_points` to supply clicked points
+    directly, exactly as NSD did.
+
+    This replaces an earlier annulus-and-density walk that carried no
+    direction and forbade only near-exact repeats.  That version folded
+    back on itself and re-traversed the ridge a few degrees off — half
+    the returned points were near-duplicates and one end of the ridge
+    was never reached.
 
     Parameters
     ----------
@@ -475,76 +691,246 @@ def trace_manifold_auto(
     bw = np.deg2rad(bandwidth_deg)
     density = _spherical_kde(grid, data, bw)  # (n_grid,)
 
-    # Cosines for angular-distance comparisons.
     step_rad = np.deg2rad(angular_step_deg)
-    step_lo = np.cos(step_rad * 1.2)  # widest accepted distance
-    step_hi = np.cos(step_rad * 0.8)  # narrowest accepted distance
-    back_cos = np.cos(step_rad * 0.7)  # min distance from prior points
-
     peak_idx = int(density.argmax())
-    peak_dens = float(density[peak_idx])
-    floor = peak_dens * density_floor_frac
+    start = grid[peak_idx]
+    floor = float(density[peak_idx]) * density_floor_frac
 
-    visited_idx = [peak_idx]
-    visited = [grid[peak_idx]]
+    tangent = _local_ridge_direction(start, grid, density, step_rad)
 
-    while len(visited) < n_points:
-        cur = visited[-1]
-        cos_to_cur = grid @ cur
-        # Forward annulus: grid points at angular distance ≈ step_rad from cur.
-        annulus = (cos_to_cur <= step_hi) & (cos_to_cur >= step_lo)
-        if not annulus.any():
+    # Split the budget either side of the peak.  Walk both arms with the
+    # full remaining budget available to each, then trim: an arm that
+    # dies early (ridge ends, density floor) hands its slots to the other.
+    budget = n_points - 1
+    n_fwd_target = budget // 2 + budget % 2
+    forward = _walk_ridge_one_way(start, tangent, grid, density, budget, step_rad, floor)
+    backward = _walk_ridge_one_way(start, -tangent, grid, density, budget, step_rad, floor)
+
+    n_fwd = min(len(forward), n_fwd_target)
+    n_bwd = min(len(backward), budget - n_fwd)
+    n_fwd = min(len(forward), budget - n_bwd)  # reclaim slots the back arm left
+
+    points = list(reversed(backward[:n_bwd])) + [start] + forward[:n_fwd]
+    return np.stack(points)
+
+
+def _nonzero_rows(unit_vectors: np.ndarray) -> np.ndarray:
+    """Drop the zero rows :func:`project_unit_sphere` leaves for dead voxels."""
+    data = unit_vectors[np.linalg.norm(unit_vectors, axis=1) > 0.5]
+    if data.size == 0:
+        raise ValueError("No non-zero unit vectors to sample.")
+    return data
+
+
+def _farthest_point_sample(candidates: np.ndarray, n: int, start: int) -> np.ndarray:
+    """Greedy farthest-point (maximin) subset of ``candidates`` on the sphere.
+
+    Deterministic given ``start``.  Each pick is the candidate whose angular
+    distance to the already-picked set is largest, which spreads points
+    evenly over whatever region the candidates occupy — no assumption that
+    the region is 1-D.
+    """
+    n = min(n, candidates.shape[0])
+    picked = [start]
+    # Track each candidate's distance (1 - cos) to the nearest picked point.
+    dist = 1.0 - candidates @ candidates[start]
+    for _ in range(n - 1):
+        nxt = int(dist.argmax())
+        picked.append(nxt)
+        dist = np.minimum(dist, 1.0 - candidates @ candidates[nxt])
+    return candidates[picked]
+
+
+def trace_manifold_blob(
+    unit_vectors: np.ndarray,
+    n_points: int = 20,
+    bandwidth_deg: float = 8.0,
+    density_floor_frac: float = 0.05,
+    n_grid: int = 4096,
+) -> np.ndarray:
+    """Cover the **2-D** density blob evenly, instead of tracing a 1-D arc.
+
+    A ridge walk assumes HRF-shape variation is essentially
+    one-dimensional — a single family running from early to late.  That is
+    a good description of NSD's data and of most datasets, but it is an
+    assumption, and when the blob has genuine width the arc leaves the
+    off-arc voxels poorly represented (see :func:`manifold_coverage`).
+
+    This sampler makes no such assumption:
+
+    1. Spherical-KDE density on a Fibonacci grid (as
+       :func:`trace_manifold_auto`).
+    2. Keep grid points whose density is at least
+       ``density_floor_frac × peak`` — that masked set *is* the blob.
+    3. Farthest-point-sample ``n_points`` of them, starting at the density
+       peak, giving near-uniform angular coverage of the support.
+
+    The result is **not** an ordered curve — with a 2-D point set there is
+    no meaningful "next" entry — so neighbouring library indices need not
+    be similar.  :func:`derive_library` still sorts the output by
+    time-to-peak for a deterministic, interpretable order, but adjacency
+    stops implying similarity the way it does for a ridge.
+
+    Use this when the sphere-density QC plot shows a genuinely round or
+    forked blob rather than a clean arc, or when
+    :func:`manifold_coverage` reports a large tail of poorly-covered
+    voxels under ``auto``.
+
+    Parameters
+    ----------
+    unit_vectors : np.ndarray, shape (n_voxels, 3)
+        Unit-norm voxel directions from :func:`project_unit_sphere`.
+    n_points : int, default 20
+        Exact number of library entries to emit (unlike ``auto``, which
+        may stop early when the ridge ends).
+    bandwidth_deg : float, default 8.0
+        Spherical KDE bandwidth.
+    density_floor_frac : float, default 0.05
+        Grid points below this fraction of peak density are outside the
+        blob.  Raise it to sample only the dense core; lower it to chase
+        the tails.
+    n_grid : int, default 4096
+        Fibonacci-grid resolution.
+
+    Returns
+    -------
+    manifold : np.ndarray, shape (n_actual, 3)
+        ``n_actual == min(n_points, #grid points above the floor)``.
+    """
+    if unit_vectors.shape[1] != 3:
+        raise ValueError(f"trace_manifold_blob requires K=3 (got K={unit_vectors.shape[1]}).")
+    data = _nonzero_rows(unit_vectors)
+
+    grid = _fibonacci_sphere(n_grid)
+    density = _spherical_kde(grid, data, np.deg2rad(bandwidth_deg))
+    peak_idx = int(density.argmax())
+    inside = density >= density[peak_idx] * density_floor_frac
+    candidates = grid[inside]
+    if candidates.shape[0] == 0:
+        raise ValueError("No grid points above the density floor.")
+    # Index of the density peak within the masked subset.
+    start = int(density[inside].argmax())
+    return _farthest_point_sample(candidates, n_points, start)
+
+
+def trace_manifold_kmeans(
+    unit_vectors: np.ndarray,
+    n_points: int = 20,
+    n_iter: int = 100,
+    seed: int = 42,
+    tol: float = 1e-7,
+) -> np.ndarray:
+    """Spherical k-means on the voxel directions — density-**proportional** 2-D sampling.
+
+    Where :func:`trace_manifold_blob` spreads entries evenly over the
+    blob's *support*, this spreads them according to how many voxels
+    actually live in each part of it: dense regions get more library
+    entries, sparse fringes get fewer.  That is the right objective if
+    you want to minimize the expected mismatch between a random voxel and
+    its best library entry, since Lloyd's algorithm on cosine distance is
+    directly minimizing exactly that quantity.
+
+    Works for any K (not just 3), so it also covers the ``n_pcs != 3``
+    case that ``auto`` cannot handle.
+
+    Centroids are re-normalized to the sphere each iteration (spherical
+    k-means); empty clusters are re-seeded to the worst-fit data point so
+    the requested count is always returned.
+
+    Parameters
+    ----------
+    unit_vectors : np.ndarray, shape (n_voxels, K)
+        Unit-norm voxel directions.
+    n_points : int, default 20
+        Number of clusters, hence library entries.
+    n_iter : int, default 100
+        Maximum Lloyd iterations.
+    seed : int, default 42
+        Only used if the deterministic farthest-point init degenerates.
+    tol : float, default 1e-7
+        Stop when no centroid moves by more than this.
+
+    Returns
+    -------
+    manifold : np.ndarray, shape (n_points, K)
+        Unit-norm cluster centroids.
+    """
+    data = _nonzero_rows(unit_vectors)
+    n_points = min(n_points, data.shape[0])
+
+    # Deterministic init: farthest-point from the medoid-ish direction.
+    mean_dir = data.mean(axis=0)
+    norm = np.linalg.norm(mean_dir)
+    if norm < 1e-12:
+        rng = np.random.default_rng(seed)
+        start = int(rng.integers(data.shape[0]))
+    else:
+        start = int(np.argmax(data @ (mean_dir / norm)))
+    centroids = _farthest_point_sample(data, n_points, start).copy()
+
+    for _ in range(n_iter):
+        assign = np.argmax(data @ centroids.T, axis=1)
+        new = np.zeros_like(centroids)
+        for k in range(n_points):
+            members = data[assign == k]
+            if members.shape[0] == 0:
+                # Empty cluster: re-seed to the point currently worst served.
+                worst = int(np.argmin(np.max(data @ centroids.T, axis=1)))
+                new[k] = data[worst]
+                continue
+            s = members.sum(axis=0)
+            n_s = np.linalg.norm(s)
+            new[k] = s / n_s if n_s > 1e-12 else centroids[k]
+        shift = float(np.abs(new - centroids).max())
+        centroids = new
+        if shift < tol:
             break
+    return centroids
 
-        # Forbid points too close to *any* prior visited point (no backtrack).
-        visited_arr = np.stack(visited)  # (k, 3)
-        cos_to_prior = grid @ visited_arr.T  # (n_grid, k)
-        not_too_close = (cos_to_prior <= back_cos).all(axis=1)
 
-        valid = annulus & not_too_close
-        if not valid.any():
-            break
+def manifold_coverage(unit_vectors: np.ndarray, manifold: np.ndarray) -> dict:
+    """How well does this library represent the voxels it came from?
 
-        # Choose the highest-density forward candidate.
-        cand_density = np.where(valid, density, -np.inf)
-        nxt_idx = int(cand_density.argmax())
-        if density[nxt_idx] < floor:
-            break
+    For every voxel, the angle to its nearest library entry.  Because the
+    PCs are orthonormal and both vectors are unit-norm, the **cosine of
+    that angle is exactly the (uncentered) correlation between the two
+    reconstructed HRF waveforms** — ``<w1·PCs, w2·PCs> = w1·w2``.  So this
+    is a direct statement about HRF shape mismatch, not a proxy for one.
 
-        visited_idx.append(nxt_idx)
-        visited.append(grid[nxt_idx])
+    This is the number to look at when deciding between a 1-D ridge
+    (``-manifold auto``) and 2-D coverage (``blob`` / ``kmeans``): a large
+    p90 or max means a substantial population of voxels whose shape no
+    library entry comes close to matching.
 
-    # Try to extend backward from the original peak too — gives a symmetric
-    # ridge instead of a one-sided walk.  Same logic in reverse direction.
-    while len(visited) < n_points:
-        cur = visited[0]
-        cos_to_cur = grid @ cur
-        annulus = (cos_to_cur <= step_hi) & (cos_to_cur >= step_lo)
-        if not annulus.any():
-            break
-        visited_arr = np.stack(visited)
-        cos_to_prior = grid @ visited_arr.T
-        not_too_close = (cos_to_prior <= back_cos).all(axis=1)
-        valid = annulus & not_too_close
-        if not valid.any():
-            break
-        cand_density = np.where(valid, density, -np.inf)
-        prev_idx = int(cand_density.argmax())
-        if density[prev_idx] < floor:
-            break
-        visited.insert(0, grid[prev_idx])
-        visited_idx.insert(0, prev_idx)
-
-    return np.stack(visited)
+    Returns a dict with ``angles_deg`` (per voxel) and the summary keys
+    ``median_deg``, ``p90_deg``, ``max_deg``, ``median_shape_r``,
+    ``p10_shape_r`` (the 10th percentile of shape correlation — the
+    poorly-served tail).
+    """
+    data = _nonzero_rows(unit_vectors)
+    best_cos = np.clip((data @ manifold.T).max(axis=1), -1.0, 1.0)
+    angles = np.degrees(np.arccos(best_cos))
+    return {
+        "angles_deg": angles,
+        "median_deg": float(np.median(angles)),
+        "p90_deg": float(np.percentile(angles, 90)),
+        "max_deg": float(angles.max()),
+        "median_shape_r": float(np.median(best_cos)),
+        "p10_shape_r": float(np.percentile(best_cos, 10)),
+    }
 
 
 def trace_manifold_grid(unit_vectors: np.ndarray, n_points: int = 20) -> np.ndarray:
-    """Fallback: order voxels along the first principal axis, sample evenly.
+    """Order voxels along the first principal axis, sample evenly.
 
-    For K != 3 or when the user wants a deterministic non-density-aware
-    sampler.  Projects ``unit_vectors`` onto their first PCA direction,
+    Despite the name this is **not** a grid — it is a second 1-D path,
+    kept because it is deterministic and density-agnostic and works for
+    any K.  Projects ``unit_vectors`` onto their first PCA direction,
     sorts by that coordinate, and picks ``n_points`` evenly spaced
     percentiles.  The picked vectors are re-normalized to unit length.
+
+    For actual 2-D coverage of the blob use :func:`trace_manifold_blob`
+    or :func:`trace_manifold_kmeans`.
 
     Parameters
     ----------
@@ -840,14 +1226,12 @@ def deconvolve_event_duration(
         H = np.fft.rfft(h_padded)
         h_imp = np.fft.irfft(H * wiener_kernel, n=n_fft)[:n_t]
         if normalize_peak:
-            abs_peak = float(np.max(np.abs(h_imp)))
-            if abs_peak > 0:
-                # Flip sign so the largest *signed* extremum is positive,
-                # then divide by the new max to put the peak at +1.
-                signed_peak = float(h_imp[int(np.argmax(np.abs(h_imp)))])
-                if signed_peak < 0:
-                    h_imp = -h_imp
-                h_imp = h_imp / float(np.max(h_imp))
+            # Divide by the SIGNED max (NSD convention).  Never negate —
+            # an upside-down curve here means the input was not HRF-like,
+            # and flipping it hides that instead of surfacing it.
+            pos_peak = float(np.max(h_imp))
+            if pos_peak > 0:
+                h_imp = h_imp / pos_peak
         out[i] = h_imp
     return out
 
@@ -864,7 +1248,7 @@ def reconstruct_timecourses(
     target_dt: float = 0.1,
     target_duration: float | None = None,
     normalize: Literal["peak", "none"] = "peak",
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Reconstruct manifold-point HRFs at a fine time grid.
 
     Each manifold point ``w_i`` yields a TR-resolution waveform
@@ -892,11 +1276,9 @@ def reconstruct_timecourses(
     target_duration : float, optional
         Output duration in seconds.  Defaults to ``lag_times[-1]``.
     normalize : {"peak", "none"}, default "peak"
-        If ``"peak"``, divide each reconstructed waveform by its peak
-        absolute value so the maximum is +1.  If the raw peak is
-        negative the *sign* is flipped first (the library convention is
-        positive peaks).  This is exactly what
-        ``getcanonicalhrflibrary.tsv`` stores.
+        If ``"peak"``, divide each reconstructed waveform by its
+        **signed** maximum so the positive peak is +1 — exactly NSD's
+        ``tc0/max(tc0)`` and what ``getcanonicalhrflibrary.tsv`` stores.
 
     Returns
     -------
@@ -904,6 +1286,15 @@ def reconstruct_timecourses(
         Reconstructed HRFs at ``target_dt`` resolution.
     target_times : np.ndarray, shape (n_target,)
         The time grid used (in seconds).
+    valid : np.ndarray of bool, shape (n_points,)
+        False for entries whose positive peak is not the dominant
+        excursion (``max(h) <= max|h| × 0.5``) or is non-positive.  Such
+        a curve is not an HRF — it is an inverted or undershoot-dominated
+        edge of the manifold — and the caller should drop it rather than
+        put it in a library.  Earlier versions normalized by the
+        *absolute* peak and negated the curve when that peak was
+        negative, which silently entered upside-down HRFs into the
+        library; NSD never flips.
 
     Notes
     -----
@@ -936,6 +1327,7 @@ def reconstruct_timecourses(
     target_clipped = np.clip(target_times, src_lo, src_hi)
 
     out = np.zeros((manifold.shape[0], n_target), dtype=np.float64)
+    valid = np.ones(manifold.shape[0], dtype=bool)
     for i, coarse in enumerate(waveforms_coarse):
         # PCHIP is monotonic and won't overshoot — important for HRFs
         # where the tail decays to zero and a CubicSpline natural BC
@@ -952,17 +1344,19 @@ def reconstruct_timecourses(
         # the HRF has returned to baseline.
         fine = np.where(target_times > src_hi, 0.0, fine)
         if normalize == "peak":
-            # Match the canonical-library convention: positive peak = 1.
+            pos_peak = float(np.max(fine))
             abs_peak = float(np.max(np.abs(fine)))
-            if abs_peak > 0:
-                # Flip sign so the largest *signed* extremum is positive.
-                signed_peak = float(fine[np.argmax(np.abs(fine))])
-                if signed_peak < 0:
-                    fine = -fine
-                fine = fine / float(np.max(fine))
+            # An HRF's positive lobe must dominate.  If it does not, this
+            # manifold point is off the end of anything HRF-like; flag it
+            # so the caller drops it (NSD's clicked path never strayed
+            # this far, an automated ridge walk can).
+            if abs_peak <= 0 or pos_peak <= 0.5 * abs_peak:
+                valid[i] = False
+            if pos_peak > 0:
+                fine = fine / pos_peak
         out[i] = fine
 
-    return out, target_times
+    return out, target_times, valid
 
 
 # ----------------------------------------------------------------------------
@@ -990,6 +1384,131 @@ def _double_gamma(
     return main - c * under
 
 
+def _double_gamma_boxcar(
+    t: np.ndarray,
+    a1: float,
+    b1: float,
+    a2: float,
+    b2: float,
+    c: float,
+    amp: float,
+    *,
+    n_box: int,
+) -> np.ndarray:
+    """Double-gamma convolved with an ``n_box``-sample unit boxcar, scaled.
+
+    The forward model NSD fits in ``hrf_fitspmhrftomanifold.m``::
+
+        fun = @(pp) pp(7)*subscript(conv(spm_hrf(0.1,[pp(1:6) 50]), ...
+                                          ones(30,1)),{...});
+
+    i.e. the stimulus-duration boxcar sits *inside* the model, so the
+    free parameters describe the impulse response even though the data
+    being fit is the duration-convolved response.
+    """
+    imp = _double_gamma(t, a1, b1, a2, b2, c)
+    conv = np.convolve(imp, np.ones(n_box, dtype=np.float64))[: t.size]
+    return amp * conv
+
+
+def fit_double_gamma_through_boxcar(
+    timecourse: np.ndarray,
+    duration: float,
+    dt: float = 0.1,
+    p0: tuple[float, float, float, float, float] = (6.0, 1.0, 16.0, 1.0, 1.0 / 6.0),
+    bounds: tuple[tuple, tuple] | None = None,
+    maxfev: int = 10000,
+) -> tuple[np.ndarray, dict]:
+    """Recover the impulse-response double-gamma from a duration-convolved curve.
+
+    This is the NSD-faithful duration correction and the preferred one.
+    Instead of inverting the boxcar convolution numerically (see
+    :func:`deconvolve_event_duration`, which has to regularize away the
+    boxcar's spectral zeros at multiples of ``1/duration``), we put the
+    boxcar in the *forward* model and fit::
+
+        timecourse ≈ amp · (double_gamma(θ) ⊛ box_D)
+
+    The returned waveform is ``double_gamma(θ)`` — the impulse response —
+    peak-normalized.  No ill-conditioned inverse is involved, and the
+    parametric family does the regularizing.  ``hrf_fitspmhrftomanifold.m``
+    does exactly this with ``lsqnonlin``.
+
+    Parameters
+    ----------
+    timecourse : np.ndarray, shape (n,)
+        The duration-convolved manifold curve (peak-normalized).
+    duration : float
+        Event duration ``D`` in seconds.  ``<= dt`` makes this equivalent
+        to :func:`fit_double_gamma`.
+    dt : float, default 0.1
+        Sample spacing in seconds.
+    p0, bounds, maxfev
+        As :func:`fit_double_gamma`; ``p0``/``bounds`` cover the five
+        shape parameters and the amplitude is appended automatically.
+
+    Returns
+    -------
+    impulse : np.ndarray, shape (n,)
+        Peak-normalized impulse-response HRF.  Falls back to the input
+        ``timecourse`` if the fit fails.
+    params : dict
+        ``a1``, ``b1``, ``a2``, ``b2``, ``c``, ``amp``, ``fit_ok``,
+        ``residual_rms`` (residual is against the *convolved* model, so
+        it is comparable to the input curve).
+    """
+    n_box = max(1, int(round(duration / dt)))
+    if n_box <= 1:
+        return fit_double_gamma(timecourse, dt=dt, p0=p0, bounds=bounds, maxfev=maxfev)
+
+    if bounds is None:
+        bounds = (
+            (2.0, 0.3, 6.0, 0.3, 0.0),
+            (12.0, 5.0, 30.0, 5.0, 1.0),
+        )
+    # Append the free amplitude that absorbs the boxcar's gain (≈ n_box).
+    lo = (*tuple(bounds[0]), 0.0)
+    hi = (*tuple(bounds[1]), np.inf)
+    seed = (*tuple(p0), 1.0 / n_box)
+    t = np.arange(timecourse.size) * dt
+
+    def model(tt, a1, b1, a2, b2, c, amp):
+        return _double_gamma_boxcar(tt, a1, b1, a2, b2, c, amp, n_box=n_box)
+
+    try:
+        popt, _ = curve_fit(model, t, timecourse, p0=seed, bounds=(lo, hi), maxfev=maxfev)
+        residual = float(np.sqrt(np.mean((model(t, *popt) - timecourse) ** 2)))
+        impulse = _double_gamma(t, *popt[:5])
+        pos_peak = float(np.max(impulse))
+        if pos_peak <= 0 or not np.isfinite(pos_peak):
+            raise ValueError("fitted impulse response has no positive peak")
+        impulse = impulse / pos_peak
+        return impulse, {
+            "a1": float(popt[0]),
+            "b1": float(popt[1]),
+            "a2": float(popt[2]),
+            "b2": float(popt[3]),
+            "c": float(popt[4]),
+            "amp": float(popt[5]),
+            "duration_s": float(duration),
+            "fit_ok": True,
+            "residual_rms": residual,
+        }
+    except Exception as exc:  # noqa: BLE001 — silent fallback, caller decides
+        return timecourse.copy(), {
+            "a1": float("nan"),
+            "b1": float("nan"),
+            "a2": float("nan"),
+            "b2": float("nan"),
+            "c": float("nan"),
+            "amp": float("nan"),
+            "duration_s": float(duration),
+            "fit_ok": False,
+            "residual_rms": float("nan"),
+            "error": repr(exc),
+        }
+
+
 def fit_double_gamma(
     timecourse: np.ndarray,
     dt: float = 0.1,
@@ -1004,6 +1523,10 @@ def fit_double_gamma(
     family with sensible bounds.  Used by ``ffs_librarian`` to smooth
     the raw reconstructions into a parametric library that matches
     ``getcanonicalhrflibrary.tsv``.
+
+    For a duration-convolved input, prefer
+    :func:`fit_double_gamma_through_boxcar`, which recovers the impulse
+    response in one step.
 
     If the fit fails (no convergence, NaNs), returns the input
     ``timecourse`` unchanged and ``params["fit_ok"] = False`` so the
@@ -1022,9 +1545,12 @@ def fit_double_gamma(
     p0 : tuple, default ``(6, 1, 16, 1, 1/6)``
         Initial guess for ``(a1, b1, a2, b2, c)`` — SPM defaults.
     bounds : ((lo,…), (hi,…)), optional
-        Override the default parameter bounds.  Defaults clamp time-to-
-        peak in [2, 12] s, dispersions in [0.3, 5], and undershoot
-        ratio in [0, 1].
+        Override the default parameter bounds.  Defaults clamp the gamma
+        *shape* parameters ``a1 ∈ [2, 12]`` and ``a2 ∈ [6, 30]``, the
+        scales ``b1, b2 ∈ [0.3, 5]``, and the undershoot ratio
+        ``c ∈ [0, 1]``.  Note these bound the shape parameter, not the
+        time-to-peak — TTP is ``(a1 - 1) · b1``, so the admissible peak
+        range is roughly 0.3–55 s.
     maxfev : int, default 5000
         Max function evaluations for curve_fit.
 
@@ -1074,6 +1600,108 @@ def fit_double_gamma(
 
 
 # ----------------------------------------------------------------------------
+# Multi-subject aggregation
+# ----------------------------------------------------------------------------
+
+
+def stack_subject_betas(
+    per_subject_betas: list[np.ndarray],
+    per_subject_r2: list[np.ndarray],
+    *,
+    r2_threshold: float = 0.10,
+    per_subject_voxels: int = 20_000,
+    seed: int = 42,
+    equalize: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Row-stack several subjects' FIR betas into one matrix for the SVD.
+
+    NSD's ``hrf_derivecanonicalpcs.m`` samples a **fixed count per
+    subject** — "choose a random set of 20000 from each subject [subjects
+    are contributing equally]" — rather than pooling all supra-threshold
+    voxels and sampling globally.  That matters: their per-subject
+    supra-threshold counts ranged from 2834 to 17387, so a global sample
+    would have let the highest-SNR subject supply six times more rows
+    than the lowest and dominate the PCs.  NSD sampled *with* replacement
+    to hit 20000 even for subjects that had fewer; we upsample the same
+    way when ``equalize=True``.
+
+    Parameters
+    ----------
+    per_subject_betas : list of (n_voxels_i, n_lags)
+        One FIR beta matrix per subject.  ``n_lags`` must match across
+        subjects — i.e. same TR and same FIR window.
+    per_subject_r2 : list of (n_voxels_i,)
+        Matching R² vectors.
+    r2_threshold : float, default 0.10
+        Per-subject R² gate, applied before sampling.
+    per_subject_voxels : int, default 20000
+        Rows to draw from each subject.
+    seed : int, default 42
+        Base RNG seed; subject *i* uses ``seed + i`` so subjects are
+        independent but the whole thing stays reproducible.
+    equalize : bool, default True
+        Draw exactly ``per_subject_voxels`` rows per subject, sampling
+        with replacement where a subject has fewer (NSD behaviour).  When
+        False, take everything that passes the gate, capped at
+        ``per_subject_voxels`` — subjects then contribute unequally.
+
+    Returns
+    -------
+    betas : np.ndarray, (n_total, n_lags)
+        Row-stacked selected betas, subject-major.
+    r2 : np.ndarray, (n_total,)
+        Matching R² values, so the stack can flow through the ordinary
+        single-subject path unchanged.
+    subject_ids : np.ndarray, (n_total,)
+        Which subject each row came from — kept for per-subject QC
+        (e.g. colouring the unit-sphere histogram by subject to check
+        that no one subject owns a lobe of the manifold).
+    """
+    if len(per_subject_betas) != len(per_subject_r2):
+        raise ValueError(
+            f"{len(per_subject_betas)} beta matrices but {len(per_subject_r2)} R² vectors"
+        )
+    if not per_subject_betas:
+        raise ValueError("No subjects supplied.")
+    n_lags = per_subject_betas[0].shape[1]
+    for i, b in enumerate(per_subject_betas):
+        if b.shape[1] != n_lags:
+            raise ValueError(
+                f"Subject {i} has {b.shape[1]} FIR lags but subject 0 has {n_lags}. "
+                "All subjects must share a TR and FIR window to share a basis."
+            )
+        if b.shape[0] != per_subject_r2[i].shape[0]:
+            raise ValueError(
+                f"Subject {i}: {b.shape[0]} beta rows but {per_subject_r2[i].shape[0]} R² values."
+            )
+
+    betas_out: list[np.ndarray] = []
+    r2_out: list[np.ndarray] = []
+    ids_out: list[np.ndarray] = []
+    for i, (b, r) in enumerate(zip(per_subject_betas, per_subject_r2, strict=True)):
+        sel = select_library_voxels(
+            b, r, threshold=r2_threshold, max_voxels=per_subject_voxels, seed=seed + i
+        )
+        if sel.size == 0:
+            raise ValueError(
+                f"Subject {i}: no voxels passed R² > {r2_threshold} with non-trivial "
+                "FIR betas.  Exclude this subject or lower the threshold."
+            )
+        if equalize and sel.size < per_subject_voxels:
+            rng = np.random.default_rng(seed + i)
+            sel = rng.choice(sel, size=per_subject_voxels, replace=True)
+        betas_out.append(b[sel])
+        r2_out.append(r[sel])
+        ids_out.append(np.full(sel.size, i, dtype=np.int32))
+
+    return (
+        np.concatenate(betas_out, axis=0),
+        np.concatenate(r2_out, axis=0),
+        np.concatenate(ids_out, axis=0),
+    )
+
+
+# ----------------------------------------------------------------------------
 # High-level orchestration
 # ----------------------------------------------------------------------------
 
@@ -1100,6 +1728,12 @@ class LibraryResult:
     )
     gamma_params: list[dict] = field(default_factory=list)
     gamma_params_deconvolved: list[dict] = field(default_factory=list)
+    # Manifold points whose reconstruction had no dominant positive peak
+    # and were therefore dropped rather than entered into the library.
+    n_dropped_invalid: int = 0
+    # manifold_coverage() of the final entries against the selected voxels:
+    # angle (== shape correlation) from each voxel to its best library entry.
+    coverage: dict | None = None
     # Provenance for the future deconvolution step (see module docstring).
     # event_durations is the per-group event-duration metadata (seconds);
     # duration_convolved=True means the library entries are the duration-
@@ -1128,14 +1762,18 @@ def derive_library(
     bandwidth_deg: float = 8.0,
     target_dt: float = 0.1,
     target_duration: float | None = None,
-    manifold_mode: Literal["auto", "grid", "points"] = "auto",
+    manifold_mode: Literal["auto", "blob", "kmeans", "grid", "points"] = "auto",
     manifold_points: np.ndarray | None = None,
+    density_floor_frac: float = 0.05,
     fit_gamma: bool = True,
     seed: int = 42,
     event_durations: np.ndarray | None = None,
     refit_weights: np.ndarray | None = None,
     deconvolve_duration: float | None = None,
+    deconv_method: Literal["fit", "wiener"] = "fit",
     deconv_snr: float = 100.0,
+    precomputed_svd: SVDResult | None = None,
+    precomputed_selection: np.ndarray | None = None,
 ) -> LibraryResult:
     """End-to-end NSD-style HRF library derivation.
 
@@ -1161,9 +1799,26 @@ def derive_library(
     target_dt, target_duration
         Forwarded to :func:`reconstruct_timecourses`.  ``target_dt=0.1``
         matches the canonical library TSV.
-    manifold_mode : {"auto", "grid", "points"}
-        Selects the manifold-tracing strategy.  ``"points"`` requires
-        ``manifold_points`` to be passed.
+    manifold_mode : {"auto", "blob", "kmeans", "grid", "points"}
+        How to pick library entries out of the sphere density.
+
+        - ``"auto"`` — 1-D density ridge (:func:`trace_manifold_auto`),
+          NSD's model of HRF variation.  Ordered, adjacent entries are
+          similar.  Falls back to ``"kmeans"`` when ``n_pcs != 3``.
+        - ``"blob"`` — even 2-D coverage of the blob's support
+          (:func:`trace_manifold_blob`).
+        - ``"kmeans"`` — 2-D coverage weighted by voxel density
+          (:func:`trace_manifold_kmeans`); minimizes expected shape
+          mismatch.  Any K.
+        - ``"grid"`` — 1-D ordering along the first PCA axis (a legacy
+          name; not actually a grid).
+        - ``"points"`` — user-supplied, requires ``manifold_points``.
+
+        The 2-D modes drop the "neighbouring index ⇒ similar HRF"
+        property; check ``LibraryResult.coverage`` to see what they buy.
+    density_floor_frac : float, default 0.05
+        ``manifold_mode="blob"`` only — fraction of peak KDE density that
+        still counts as inside the blob.
     manifold_points : np.ndarray, optional
         Required for ``manifold_mode="points"``.  Shape (n_hrfs, n_pcs);
         re-normalized to unit length by
@@ -1173,19 +1828,27 @@ def derive_library(
         reconstructed waveform.  Output ``fitted`` is filled; otherwise
         it is ``None`` (caller saves only ``raw``).
     deconvolve_duration : float, optional
-        If given (and ``> target_dt``), apply Wiener duration
-        deconvolution (see :func:`deconvolve_event_duration`) to the
-        reconstructed library entries so the output represents the
-        *impulse response* HRF rather than the duration-convolved
-        response.  This is the right thing to do for any non-impulse
-        event duration: downstream consumers re-convolve with the
-        event boxcar at modelling time, so without this step the
-        library produces a doubly-convolved design.  Both the raw
-        cubic recon and (if ``fit_gamma=True``) the gamma fit are
-        deconvolved; the pre-deconv versions are also kept in
-        ``LibraryResult`` for QC inspection.
+        Event duration (s).  If given (and ``> target_dt``), correct the
+        library entries so they represent the *impulse response* rather
+        than the duration-convolved response.  This matters because
+        downstream consumers re-convolve with the event boxcar at
+        modelling time — without this step the design is doubly
+        convolved.
+    deconv_method : {"fit", "wiener"}, default "fit"
+        How to do that correction.  ``"fit"`` is NSD-faithful: put the
+        boxcar inside the double-gamma forward model and fit
+        (:func:`fit_double_gamma_through_boxcar`), which needs no
+        numerical inverse.  ``"wiener"`` runs the explicit deconvolution
+        (:func:`deconvolve_event_duration`) and then gamma-fits the
+        result — the only option when ``fit_gamma=False``, since there
+        is no parametric family to carry the correction.
     deconv_snr : float, default 100.0
-        Wiener filter SNR.  See :func:`deconvolve_event_duration`.
+        Wiener filter SNR; ``deconv_method="wiener"`` only.
+    precomputed_svd, precomputed_selection : optional
+        Reuse an SVD and voxel selection the caller already computed
+        (e.g. to derive the PCs for the NSD refit) instead of repeating
+        them here.  Must be supplied together, and ``precomputed_svd``
+        must have been computed on ``betas[precomputed_selection]``.
     refit_weights : np.ndarray, optional, shape (n_voxels, n_pcs)
         **NSD refinement.**  When provided, use these per-voxel
         coefficients (computed by the caller via a second GLM fit with
@@ -1205,47 +1868,24 @@ def derive_library(
         See dataclass.  ``result.raw`` is the always-emitted reconstruction;
         ``result.fitted`` is the double-gamma fit (or ``None``).
     """
-    sel = select_voxels(r2, threshold=r2_threshold, max_voxels=max_voxels, seed=seed)
+    if (precomputed_svd is None) != (precomputed_selection is None):
+        raise ValueError("precomputed_svd and precomputed_selection must be supplied together")
 
-    # Air / background voxels are a treacherous failure mode here.  When
-    # no brain mask is supplied, voxels outside the head pass through
-    # the loader as constant (post-scaling) zeros.  The GLM's polynomial
-    # detrending fits a constant perfectly → SS_residual = 0 → R² = 1,
-    # so these voxels look like the "best" voxels by the R² gate and
-    # end up dominating the SVD with their *all-zero* FIR betas.  The
-    # PCs then come out as pure noise.  NSD avoided this with a BET
-    # brain mask up front; we filter post-hoc: require the FIR beta
-    # vector to have non-negligible L2 norm.  This is also robust to
-    # any other "constant signal, high R²" failure mode.
+    if precomputed_selection is not None:
+        sel = np.asarray(precomputed_selection)
+    else:
+        sel = select_library_voxels(
+            betas, r2, threshold=r2_threshold, max_voxels=max_voxels, seed=seed
+        )
     selected_betas = betas[sel]
-    fir_norms = np.linalg.norm(selected_betas, axis=1)
-    norm_floor = 1e-8 * max(
-        float(np.median(fir_norms[fir_norms > 0])) if (fir_norms > 0).any() else 1.0, 1.0
-    )
-    alive = fir_norms > norm_floor
-    n_dropped = int((~alive).sum())
-    if n_dropped > 0:
-        sel = sel[alive]
-        selected_betas = selected_betas[alive]
     if sel.size < n_hrfs:
         raise ValueError(
             f"Only {sel.size} usable voxels survived selection "
             f"(R² > {r2_threshold}, FIR-betas non-trivial); need at least "
-            f"n_hrfs={n_hrfs}.  Likely cause: no brain mask supplied and air "
-            f"voxels dominated the R² selection ({n_dropped} dropped as zero-norm). "
-            f"Re-run with -mask <brain_mask.nii.gz> or lower -r2-threshold."
-        )
-    if n_dropped > 0.5 * (sel.size + n_dropped):
-        # Massive air-voxel contamination — the FIR fit may not be
-        # capturing real signal anywhere either.  Tell the user.
-        import warnings
-
-        warnings.warn(
-            f"derive_library: {n_dropped} of {sel.size + n_dropped} selected "
-            f"voxels had zero-norm FIR betas (constant/air signal with R²=1). "
-            f"Strongly recommend passing -mask <brain_mask.nii.gz>.",
-            RuntimeWarning,
-            stacklevel=2,
+            f"n_hrfs={n_hrfs}.  Likely causes: the R² threshold is too high for "
+            f"this data, or no brain mask was supplied and air voxels dominated "
+            f"the selection.  Re-run with -mask <brain_mask.nii.gz> or lower "
+            f"-r2-threshold."
         )
 
     # QC: pooled task HRF — mean of FIR betas across (post-filter) voxels.
@@ -1254,7 +1894,10 @@ def derive_library(
     # before any of the SVD machinery runs.
     mean_fir = selected_betas.mean(axis=0)
 
-    svd = svd_decompose(selected_betas, n_pcs=n_pcs, unit_normalize=True, sign_align=True)
+    if precomputed_svd is not None:
+        svd = precomputed_svd
+    else:
+        svd = svd_decompose(selected_betas, n_pcs=n_pcs, unit_normalize=True, sign_align=True)
 
     if refit_weights is not None:
         # NSD refinement: replace the SVD's loadings (which are the
@@ -1288,8 +1931,8 @@ def derive_library(
 
     if manifold_mode == "auto":
         if n_pcs != 3:
-            # Auto requires sphere; degrade gracefully.
-            manifold = trace_manifold_grid(unit, n_points=n_hrfs)
+            # Auto needs the 2-sphere; k-means is the K-agnostic fallback.
+            manifold = trace_manifold_kmeans(unit, n_points=n_hrfs, seed=seed)
         else:
             manifold = trace_manifold_auto(
                 unit,
@@ -1297,6 +1940,15 @@ def derive_library(
                 angular_step_deg=angular_step_deg,
                 bandwidth_deg=bandwidth_deg,
             )
+    elif manifold_mode == "blob":
+        manifold = trace_manifold_blob(
+            unit,
+            n_points=n_hrfs,
+            bandwidth_deg=bandwidth_deg,
+            density_floor_frac=density_floor_frac,
+        )
+    elif manifold_mode == "kmeans":
+        manifold = trace_manifold_kmeans(unit, n_points=n_hrfs, seed=seed)
     elif manifold_mode == "grid":
         manifold = trace_manifold_grid(unit, n_points=n_hrfs)
     elif manifold_mode == "points":
@@ -1306,7 +1958,7 @@ def derive_library(
     else:
         raise ValueError(f"Unknown manifold_mode: {manifold_mode}")
 
-    raw, target_times = reconstruct_timecourses(
+    raw, target_times, raw_valid = reconstruct_timecourses(
         manifold,
         svd.pcs,
         lag_times,
@@ -1315,8 +1967,50 @@ def derive_library(
         normalize="peak",
     )
 
+    # Drop manifold points that did not reconstruct to something HRF-like
+    # (undershoot-dominated or wholly negative — see reconstruct_timecourses).
+    n_invalid = int((~raw_valid).sum())
+    if n_invalid:
+        if raw_valid.sum() < 2:
+            raise ValueError(
+                f"All but {int(raw_valid.sum())} manifold points reconstructed to "
+                "non-HRF-like curves (no dominant positive peak).  The PCs are "
+                "probably not capturing HRF shape — check the FIR fit R² map and "
+                "the mean-FIR QC curve."
+            )
+        raw = raw[raw_valid]
+        manifold = manifold[raw_valid]
+
+    # Order the library by time-to-peak so the index is monotonic in HRF
+    # timing.  The ridge walk starts at the density peak and proceeds in
+    # whichever direction the local tangent pointed, so without this the
+    # ordering (and its direction) is arbitrary between runs — awkward for
+    # anything downstream that reads the chosen index as "early vs late".
+    order = np.argsort(np.argmax(raw, axis=1), kind="stable")
+    raw = raw[order]
+    manifold = manifold[order]
+
+    # How well the final entries represent the voxels they came from.  This
+    # is what tells you whether a 1-D ridge was the right model for this
+    # dataset or whether the blob has real 2-D extent worth sampling.
+    coverage = manifold_coverage(unit, manifold)
+
+    # Duration correction — recover the impulse response so downstream
+    # consumers, which re-convolve with the event boxcar at modelling
+    # time, do not end up doubly convolved.  The pre-correction curves
+    # stay on the result for QC.
+    do_deconv = deconvolve_duration is not None and deconvolve_duration > target_dt
+    # "fit" carries the correction inside the parametric family, so it
+    # needs one; without a gamma fit the explicit inverse is all there is.
+    method = deconv_method if fit_gamma else "wiener"
+
     fitted = None
     gamma_params: list[dict] = []
+    raw_deconvolved: np.ndarray | None = None
+    fitted_deconvolved: np.ndarray | None = None
+    gamma_params_deconvolved: list[dict] = []
+    duration_convolved_flag = not do_deconv
+
     if fit_gamma:
         fitted = np.zeros_like(raw)
         for i in range(raw.shape[0]):
@@ -1324,16 +2018,18 @@ def derive_library(
             fitted[i] = fit
             gamma_params.append(p)
 
-    # Duration deconvolution — recover the impulse response from the
-    # duration-convolved library so downstream consumers don't double-
-    # convolve.  We apply to BOTH the raw cubic recon and the gamma
-    # fit (if computed); the pre-deconv versions are kept on the
-    # result for diagnostics.
-    raw_deconvolved: np.ndarray | None = None
-    fitted_deconvolved: np.ndarray | None = None
-    gamma_params_deconvolved: list[dict] = []
-    duration_convolved_flag = True
-    if deconvolve_duration is not None and deconvolve_duration > target_dt:
+    if do_deconv and method == "fit":
+        # NSD-faithful: the boxcar lives in the forward model, so the
+        # fitted parameters already describe the impulse response.  No
+        # numerical inverse, hence no raw_deconvolved counterpart.
+        fitted_deconvolved = np.zeros_like(raw)
+        for i in range(raw.shape[0]):
+            fit, p = fit_double_gamma_through_boxcar(
+                raw[i], duration=float(deconvolve_duration), dt=target_dt
+            )
+            fitted_deconvolved[i] = fit
+            gamma_params_deconvolved.append(p)
+    elif do_deconv:
         raw_deconvolved = deconvolve_event_duration(
             raw,
             duration=float(deconvolve_duration),
@@ -1342,15 +2038,13 @@ def derive_library(
             normalize_peak=True,
         )
         if fit_gamma:
-            # Re-fit the gamma family AGAINST the deconvolved curve, so
-            # the parametric library is in impulse-response space (not
-            # a gamma-fit of the convolved curve).
+            # Gamma-fit in impulse-response space, not a fit of the
+            # convolved curve.
             fitted_deconvolved = np.zeros_like(raw_deconvolved)
             for i in range(raw_deconvolved.shape[0]):
                 fit, p = fit_double_gamma(raw_deconvolved[i], dt=target_dt)
                 fitted_deconvolved[i] = fit
                 gamma_params_deconvolved.append(p)
-        duration_convolved_flag = False
 
     return LibraryResult(
         raw=raw,
@@ -1363,6 +2057,8 @@ def derive_library(
         fitted_deconvolved=fitted_deconvolved,
         gamma_params=gamma_params,
         gamma_params_deconvolved=gamma_params_deconvolved,
+        n_dropped_invalid=n_invalid,
+        coverage=coverage,
         event_durations=(
             np.asarray(event_durations, dtype=float) if event_durations is not None else None
         ),
