@@ -47,7 +47,13 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    print_cli_header,
+    setup_device,
+)
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.stats.noise_ceiling import (
     beta_space_ceiling,
@@ -158,6 +164,11 @@ Notes:
         "{prefix}_explainable_r2. Only meaningful if it was computed on THIS "
         "data with the same folds.",
     )
+    add_device_arg(
+        common,
+        extra="The ceiling is a few passes over the beta/timeseries matrix, so a "
+        "GPU pays off mainly on large single-trial stacks.",
+    )
     add_verbose_arg(common)
     return parser
 
@@ -262,6 +273,9 @@ def main() -> None:
         sys.exit(1)
 
     print_cli_header("ffs_util_noiseceiling", "standalone per-voxel noise ceilings")
+    device = setup_device(args.device)
+    if args.verb >= 1:
+        print(f"  Device: {device}")
     prefix_info = parse_prefix(args.prefix)
     out_prefix = prefix_info.stem
     extension = prefix_info.nifti_ext
@@ -269,7 +283,7 @@ def main() -> None:
     mask_flat = None
     if args.mask:
         mask_data, _, _, _ = _load_volume(args.mask)
-        mask_flat = mask_data[:, 0] > 0
+        mask_flat = torch.from_numpy(mask_data[:, 0] > 0).to(device)
 
     if timeseries_mode:
         if len(args.identical_sets) != len(args.input):
@@ -287,7 +301,7 @@ def main() -> None:
             segments.append(torch.from_numpy(flat))
         run_lengths = [segment.shape[1] for segment in segments]
         run_starts = [int(sum(run_lengths[:i])) for i in range(len(run_lengths))]
-        data = torch.cat(segments, dim=1)
+        data = torch.cat(segments, dim=1).to(device)
         del segments
 
         groups: dict[str, list[int]] = {}
@@ -305,13 +319,13 @@ def main() -> None:
         if dropped:
             print(f"  Ignoring singleton label(s): {', '.join(dropped)}")
 
-        work = data if mask_flat is None else data[torch.from_numpy(mask_flat)]
+        work = data if mask_flat is None else data[mask_flat]
         ceiling_masked = split_half_noise_ceiling(work, repeat_groups, run_starts, data.shape[1])
-        ceiling = torch.full((data.shape[0],), torch.nan)
         if mask_flat is None:
             ceiling = ceiling_masked
         else:
-            ceiling[torch.from_numpy(mask_flat)] = ceiling_masked
+            ceiling = torch.full((data.shape[0],), torch.nan, device=device)
+            ceiling[mask_flat] = ceiling_masked
         ncsnr_map = None
     else:
         betas_flat, affine, header, shape = _load_volume(args.betas)
@@ -323,8 +337,10 @@ def main() -> None:
             )
             sys.exit(1)
 
-        betas = torch.from_numpy(betas_flat)
-        work = betas if mask_flat is None else betas[torch.from_numpy(mask_flat)]
+        betas = torch.from_numpy(betas_flat).to(device)
+        condition_ids = condition_ids.to(device)
+        run_ids = run_ids.to(device)
+        work = betas if mask_flat is None else betas[mask_flat]
 
         n_runs = int(run_ids.max()) + 1
         cv_splits = [([r for r in range(n_runs) if r != held], [held]) for held in range(n_runs)]
@@ -354,8 +370,8 @@ def main() -> None:
         def _scatter(values: torch.Tensor) -> torch.Tensor:
             if mask_flat is None:
                 return values
-            full = torch.full((betas.shape[0],), torch.nan)
-            full[torch.from_numpy(mask_flat)] = values
+            full = torch.full((betas.shape[0],), torch.nan, device=values.device)
+            full[mask_flat] = values
             return full
 
         ceiling = _scatter(result.ceiling)
@@ -389,7 +405,7 @@ def main() -> None:
                 "explainable_r2 not written."
             )
         else:
-            xval = torch.from_numpy(xval_flat[:, 0])
+            xval = torch.from_numpy(xval_flat[:, 0]).to(ceiling.device)
             # NaN where the ceiling is too near zero to divide by: see
             # CeilingResult.explainable_r2 for why that is not clamped instead.
             defined = torch.isfinite(ceiling) & (ceiling >= 0.01)
