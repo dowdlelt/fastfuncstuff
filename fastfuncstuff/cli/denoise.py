@@ -60,6 +60,7 @@ try:
         preflight_check,
         resolve_cv_design,
         save_volume_nifti,
+        setup_device,
         spinner,
         summarize_trial_repeats,
     )
@@ -83,7 +84,6 @@ try:
         save_nifti,
     )
     from fastfuncstuff.utils import (
-        configure_torch_backends,
         get_device,
         scale_to_percent_signal,
         to_tensor,  # noqa: F401
@@ -1071,8 +1071,6 @@ def save_denoising_results(
                         noise_pcs_per_run=results.noise_pcs_per_run,
                         run_starts=run_starts,
                         brain_mask=None,
-                        chunk_size=5000,
-                        device=None,
                         verbose=False,
                     )
                     loadings_cpu = [ld.numpy() for ld in full_loadings]
@@ -1608,11 +1606,7 @@ def main():
     )
 
     # Setup device
-    if args.device:
-        device = torch.device(args.device if args.device.lower() != "cpu" else "cpu")
-    else:
-        device = get_device()
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     print(f"  Device: {device}")
 
     # ==========================================================================
@@ -3063,8 +3057,7 @@ def main():
                                 noise_pcs_per_run=noise_pcs_per_run,
                                 run_starts=run_starts,
                                 brain_mask=None,
-                                chunk_size=5000,
-                                device=None,
+                                device=device,
                                 verbose=args.verb >= 1,
                             )
                             loadings_cpu = [ld.numpy() for ld in pc_loadings_brain]

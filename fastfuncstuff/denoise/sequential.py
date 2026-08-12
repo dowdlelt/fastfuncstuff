@@ -901,7 +901,7 @@ def compute_full_brain_pc_loadings(
     noise_pcs_per_run: list[torch.Tensor],
     run_starts: list[int],
     brain_mask: torch.Tensor | None = None,
-    chunk_size: int = 5000,
+    chunk_size: int | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> list[torch.Tensor]:
@@ -924,10 +924,11 @@ def compute_full_brain_pc_loadings(
         Starting timepoint for each run
     brain_mask : torch.Tensor, optional, shape (n_voxels,)
         Boolean mask for brain voxels. If None, uses all voxels.
-    chunk_size : int, default=5000
-        Number of voxels to process at once (for memory efficiency)
+    chunk_size : int, optional
+        Number of voxels to process at once. Default: sized from free memory
+        by :func:`fastfuncstuff.memory.estimate_chunk_size`.
     device : torch.device, optional
-        Device for computation (defaults to CPU for safety in plotting context)
+        Device for computation (defaults to the device ``data`` is already on)
     verbose : bool, default=False
         Print progress
 
@@ -936,8 +937,7 @@ def compute_full_brain_pc_loadings(
     loadings_per_run : list of torch.Tensor (on CPU)
         Spatial loadings for each run's PCs, each shape (n_voxels, n_components).
     """
-    # Use CPU for safety - this is diagnostic plotting, not speed-critical
-    device = device or torch.device("cpu")
+    device = device or data.device
     data = data.to(device)
 
     n_voxels_full = data.shape[0]
@@ -962,6 +962,17 @@ def compute_full_brain_pc_loadings(
         if verbose:
             print(f"  Computing loadings for all {n_brain_voxels} voxels...")
 
+    if chunk_size is None:
+        from ..memory import estimate_chunk_size
+
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_brain_voxels,
+            n_timepoints=data.shape[1],
+            n_regressors=_n_components,
+            device=device,
+            operation="denoise",
+        )
+
     loadings_per_run = []
     for run_idx in range(n_runs):
         start_tp = run_starts[run_idx]
@@ -973,8 +984,9 @@ def compute_full_brain_pc_loadings(
         # Get data for this run: (n_voxels, n_tp_run)
         run_data = data[:, start_tp:end_tp]
 
-        # Initialize output (all voxels x n_components)
-        loadings_full = torch.zeros(n_voxels_full, pcs.shape[1])
+        # Accumulate on the compute device — a CPU output tensor cannot take an
+        # assignment from a CUDA chunk, which is what pinned this to CPU before.
+        loadings_full = torch.zeros(n_voxels_full, pcs.shape[1], device=device)
 
         # Process only brain voxels in chunks
         for chunk_start in range(0, n_brain_voxels, chunk_size):
@@ -983,15 +995,16 @@ def compute_full_brain_pc_loadings(
             brain_voxel_idx = voxel_indices[chunk_start:chunk_end]
 
             # Data chunk: (chunk_size, n_tp_run)
-            chunk_data = run_data[brain_voxel_idx, :]
+            chunk_data = run_data[brain_voxel_idx.to(run_data.device), :]
 
             # For orthonormal PCs, loadings = data @ PCs (no inverse needed)
             chunk_loadings = chunk_data @ pcs
 
             # Place in output at correct positions
-            loadings_full[brain_voxel_idx, :] = chunk_loadings
+            loadings_full[brain_voxel_idx.to(device), :] = chunk_loadings
 
-        loadings_per_run.append(loadings_full)  # Keep on CPU
+        # Callers plot these and call .numpy(); the contract is CPU tensors.
+        loadings_per_run.append(loadings_full.cpu())
 
         if verbose:
             print(
