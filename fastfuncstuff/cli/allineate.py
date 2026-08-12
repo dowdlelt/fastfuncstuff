@@ -81,6 +81,62 @@ def _resample(
     return warped.clamp_min(0.0) if no_neg else warped
 
 
+def _follower_pairs(args: argparse.Namespace) -> list[tuple[str, str]]:
+    """(dataset, prefix) pairs from -source_follower / -follower_prefix, validated."""
+    followers = args.source_follower or []
+    prefixes = args.follower_prefix or []
+    if not followers and not prefixes:
+        return []
+    if not followers:
+        raise SystemExit("-follower_prefix given without -source_follower")
+    if len(prefixes) != len(followers):
+        raise SystemExit(
+            f"-follower_prefix takes one prefix per -source_follower "
+            f"({len(followers)} follower(s), {len(prefixes)} prefix(es))"
+        )
+    return list(zip(followers, prefixes, strict=True))
+
+
+def _apply_followers(
+    args: argparse.Namespace,
+    matrix: torch.Tensor,
+    base_header: dict,
+    source_affine: np.ndarray,
+    out_affine: np.ndarray,
+    out_shape: tuple[int, int, int],
+    device: torch.device,
+) -> None:
+    """Warp each follower with the source's transform and save it on the output grid.
+
+    ``matrix`` is out-voxel -> source-voxel. A follower on its own grid needs
+    out-voxel -> follower-voxel, i.e. ``inv(A_follower) @ A_source @ matrix``
+    (world coordinates are the common frame), so followers do not have to share
+    the source's grid.
+    """
+    verb = args.verb
+    a_src = torch.as_tensor(np.asarray(source_affine), dtype=torch.float64, device=device)
+    for path, prefix in _follower_pairs(args):
+        with spinner(f"Loading {Path(path).name}"):
+            follower, follower_header = load_image(path, device=device)
+        a_fol = torch.as_tensor(
+            np.asarray(follower_header["affine"]), dtype=torch.float64, device=device
+        )
+        fm = (torch.linalg.inv(a_fol) @ a_src @ matrix.double()).to(matrix.dtype)
+        if follower.ndim == 4:
+            warped = torch.stack(
+                [
+                    _resample(follower[t], fm, out_shape, args.final_interp, args.no_neg)
+                    for t in range(follower.shape[0])
+                ]
+            )
+        else:
+            warped = _resample(follower, fm, out_shape, args.final_interp, args.no_neg)
+        with spinner(f"Writing {Path(prefix).name}"):
+            save_image(warped, prefix, header_info=base_header, affine=out_affine)
+        if verb >= 1:
+            print(f"Saved follower: {prefix}")
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -104,6 +160,10 @@ Examples:
 
   # Apply existing matrix:
   allineate -base mni.nii -source subj.nii -prefix out.nii -1Dmatrix_apply mat.aff12.1D
+
+  # Solve on the skull-stripped volume, carry the original along:
+  allineate -base mni.nii -source subj_ss.nii -prefix out_ss.nii \\
+            -source_follower subj.nii -follower_prefix out_orig.nii
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -124,8 +184,8 @@ Examples:
         tool="ffs_allineate",
         what="affine alignments",
         example="-base ref.nii -source mov.nii -prefix out.nii -1Dmatrix_save m.aff12.1D",
-        skip_note="-prefix / -1Dmatrix_save / -save_mean / -save_weight / -save_automask "
-        "/ -save_cmass",
+        skip_note="-prefix / -follower_prefix / -1Dmatrix_save / -save_mean / -save_weight "
+        "/ -save_automask / -save_cmass",
     )
     io_group.add_argument(
         "-1Dmatrix_save", default=None, help="Save affine matrix as .aff12.1D (AFNI format)"
@@ -145,6 +205,28 @@ Examples:
         "to the given resolution: one value for isotropic (e.g. -dxyz 0.8 to preserve hi-res), "
         "or three for x y z. The transform is unchanged; only the output grid differs. Works "
         "with both the normal alignment and -1Dmatrix_apply.",
+    )
+    io_group.add_argument(
+        "-source_follower",
+        "-source-follower",
+        dest="source_follower",
+        nargs="+",
+        default=None,
+        metavar="DSET",
+        help="Extra dataset(s) that ride along on the transform solved for -source, written "
+        "with -follower_prefix. The usual case is aligning a skull-stripped volume while the "
+        "original (or any derived map) needs the identical transform, without a second run to "
+        "replay the saved matrix. A follower on a different grid than -source is handled "
+        "(the matrix is re-expressed through its affine); 4D followers are warped per volume.",
+    )
+    io_group.add_argument(
+        "-follower_prefix",
+        "-follower-prefix",
+        dest="follower_prefix",
+        nargs="+",
+        default=None,
+        metavar="PREFIX",
+        help="Output path for each -source_follower, in the same order (one per follower).",
     )
     io_group.add_argument(
         "-save_mean",
@@ -418,6 +500,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         outs.append(matrix_save)
     if args.save_mean:
         outs.append(derive_mean_output_path(args.prefix))
+    outs.extend(prefix for _, prefix in _follower_pairs(args))
     for name in ("save_weight", "save_automask", "save_cmass"):
         val = getattr(args, name, None)
         if val is not None:
@@ -474,6 +557,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if verb >= 1:
         print(f"allineate: device={device}")
 
+    # Validate follower pairing before the (long) alignment, not after it.
+    _follower_pairs(args)
+
     # --- Load images ---
     t0 = time.time()
     with spinner(f"Loading {Path(args.base).name}"):
@@ -527,6 +613,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
             print(f"Saved: {args.prefix}")
+        _apply_followers(
+            args, om, base_header, source_header["affine"], out_affine, out_shape, device
+        )
         return
 
     # --- Build config with speed/quality presets ---
@@ -634,6 +723,16 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
     if verb >= 1:
         print(f"Saved: {args.prefix}")
+
+    _apply_followers(
+        args,
+        _out_matrix(matrix, base_header["affine"], out_affine, device),
+        base_header,
+        source_header["affine"],
+        out_affine,
+        out_shape,
+        device,
+    )
 
     matrix_save_path = getattr(args, "1Dmatrix_save", None)
     if matrix_save_path is not None:
