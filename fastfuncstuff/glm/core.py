@@ -194,7 +194,9 @@ def orthogonalize_design(X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
 
     # Project out Z from X: X_orth = X - Z * (Z'Z)^-1 * Z'X
     # Using QR for numerical stability
-    Q, _ = torch.linalg.qr(Z)
+    qr_device = torch.device("cpu") if Z.device.type == "mps" else Z.device
+    Q, _ = torch.linalg.qr(Z.to(qr_device))
+    Q = Q.to(Z.device)
     X_orth = X - Q @ (Q.T @ X)
 
     return X_orth

@@ -340,6 +340,21 @@ def bytes_per_voxel_xval(
     return (8 * n_timepoints + max(n_regressors, 10)) * 4
 
 
+def bytes_per_voxel_hrf_xval(
+    n_timepoints: int,
+    n_regressors: int,
+    n_designs: int,
+) -> int:
+    """Conservative working memory for HRF-library cross-validation.
+
+    Split-half CV keeps a prediction accumulator for every candidate, while
+    LORO evaluates candidates sequentially. Planning for the larger split-half
+    case makes both paths safe. The extra three time-series terms cover input
+    data, residual/reduction temporaries, and output statistics.
+    """
+    return (n_designs * (n_timepoints + n_regressors) + 3 * n_timepoints) * 4
+
+
 def bytes_per_voxel_prf(
     n_timepoints: int,
     n_pixels: int,
@@ -1194,6 +1209,7 @@ def estimate_chunk_size(
     use_double: bool = False,
     n_fractions: int = 100,
     n_trials: int = 1,
+    n_designs: int = 1,
     verbose: bool = False,
 ) -> int:
     """
@@ -1276,6 +1292,8 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_glm(n_timepoints, n_regressors)
     elif operation == "xval":
         bytes_per_voxel = bytes_per_voxel_xval(n_timepoints, n_regressors)
+    elif operation == "hrf_xval":
+        bytes_per_voxel = bytes_per_voxel_hrf_xval(n_timepoints, n_regressors, n_designs)
     elif operation == "ridge":
         bytes_per_voxel = bytes_per_voxel_ridge(
             n_timepoints,

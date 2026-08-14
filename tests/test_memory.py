@@ -16,6 +16,7 @@ from fastfuncstuff.memory import (
     bytes_per_voxel_arma,
     bytes_per_voxel_denoise,
     bytes_per_voxel_glm,
+    bytes_per_voxel_hrf_xval,
     bytes_per_voxel_ridge,
     bytes_per_voxel_xval,
     dyn_chunk_estimator,
@@ -84,6 +85,13 @@ class TestMemoryConfig:
         """Test that min_chunk_size < 100 raises ValueError."""
         with pytest.raises(ValueError, match="min_chunk_size"):
             MemoryConfig(min_chunk_size=50)
+
+
+def test_hrf_xval_memory_scales_with_library_size():
+    small = bytes_per_voxel_hrf_xval(300, 20, 5)
+    library = bytes_per_voxel_hrf_xval(300, 20, 20)
+    assert library > small
+    assert library == (20 * (300 + 20) + 3 * 300) * 4
 
 
 class TestGlobalConfig:

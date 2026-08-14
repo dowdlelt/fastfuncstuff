@@ -42,6 +42,7 @@ try:
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
+        add_device_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -57,13 +58,13 @@ try:
         get_average_run_duration,
         load_and_preprocess_runs,
         parse_cv_strategy,
-        parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
         resolve_cv_design,
         run_lengths_from_starts,
         save_volume_nifti,
+        setup_device,
         spinner,
         summarize_trial_repeats,
         trim_spec_from_args,
@@ -79,7 +80,6 @@ try:
         save_hrf_selection_results,
     )
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.utils import configure_torch_backends
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -418,11 +418,7 @@ Notes:
         "'glmsingle' (GLMsingle/nilearn-style double-gamma). "
         "The baseline comparison shows improvement from HRF optimization.",
     )
-    proc_opts.add_argument(
-        "-device",
-        type=str,
-        help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
-    )
+    add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
         action="store_true",
@@ -678,9 +674,9 @@ def main():
     # 2. Load and preprocess data
     # ==========================================================================
 
-    # Parse device argument using unified parser
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device)
+    # setup_device preserves the shared CPU-thread precedence: an explicit
+    # cpu,N wins, then FFS_NUM_THREADS, OMP_NUM_THREADS, and scheduler limits.
+    device = setup_device(args.device)
     print(f"  Device: {device}")
 
     # Load and preprocess data using shared utility

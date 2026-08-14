@@ -202,6 +202,17 @@ def _project_design_with_q_factors(
     return torch.cat(projected_runs, dim=0)
 
 
+def _pinv_for_compute(design: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Factor a small design where LAPACK/SVD is native, then place it for GEMM.
+
+    MPS implements ``pinv`` through an implicit CPU fallback. Making that island
+    explicit avoids repeated hidden transfers and backend warnings while leaving
+    the large voxel-wise multiplications on Metal.
+    """
+    factor_device = torch.device("cpu") if device.type == "mps" else device
+    return torch.linalg.pinv(design.to(factor_device)).to(device)
+
+
 def _evaluate_hrfs_batched(
     projected_data: torch.Tensor,
     projected_designs: list[torch.Tensor],
@@ -260,13 +271,14 @@ def _evaluate_hrfs_batched(
     n_splits = len(cv_splits)
     data_on_device = projected_data.device == device or projected_data.device.type == device.type
 
-    if not data_on_device and chunk_size is None:
+    if chunk_size is None:
         chunk_size = estimate_chunk_size(
             n_voxels=n_voxels,
             n_timepoints=n_timepoints,
             n_regressors=projected_designs[0].shape[1],
             device=device,
-            operation="xval",
+            operation="hrf_xval",
+            n_designs=n_designs,
         )
 
     # Pre-slice data by runs (views, no copy)
@@ -291,8 +303,8 @@ def _evaluate_hrfs_batched(
 
     # Global SS_tot from ALL timepoints -- used in both paths.
     if data_on_device:
-        sum_y_all = projected_data.sum(dim=1).cpu()
-        sum_y2_all = (projected_data**2).sum(dim=1).cpu()
+        sum_y_all = projected_data.sum(dim=1)
+        sum_y2_all = (projected_data**2).sum(dim=1)
     else:
         sum_y_all = projected_data.sum(dim=1)
         sum_y2_all = (projected_data**2).sum(dim=1)
@@ -303,7 +315,8 @@ def _evaluate_hrfs_batched(
     # Works because each TP is tested exactly once, so sum_ss_res = SS_res_total.
     # =========================================================================
     if is_loro_style and metric == "cod":
-        sum_ss_res = torch.zeros(n_voxels, n_designs)
+        accumulator_device = device if data_on_device else torch.device("cpu")
+        sum_ss_res = torch.zeros(n_voxels, n_designs, device=accumulator_device)
 
         if verbose:
             data_loc = "GPU" if data_on_device else "CPU (streaming chunks to GPU)"
@@ -324,33 +337,21 @@ def _evaluate_hrfs_batched(
 
             # pinv: SVD-based, handles rank-deficient designs (zero betas for
             # missing events), avoids NaN/Inf from CUDA gels driver.
-            pinv_trains_gpu = [torch.linalg.pinv(td) for td in train_designs_gpu]
+            pinv_trains_gpu = [_pinv_for_compute(td, device) for td in train_designs_gpu]
 
-            if data_on_device:
-                sum_y2_test_fold = (test_data_split**2).sum(dim=1)
+            for cs in range(0, n_voxels, chunk_size):
+                ce = min(cs + chunk_size, n_voxels)
+                train_chunk = train_data_split[cs:ce].to(device)
+                test_chunk = test_data_split[cs:ce].to(device)
+                sum_y2_chunk = (test_chunk**2).sum(dim=1)
                 for d_idx in range(n_designs):
-                    betas = pinv_trains_gpu[d_idx] @ train_data_split.T
+                    betas = pinv_trains_gpu[d_idx] @ train_chunk.T
                     yhat = (test_designs_gpu[d_idx] @ betas).T
                     ss_res = (
-                        sum_y2_test_fold
-                        - 2 * (test_data_split * yhat).sum(dim=1)
-                        + (yhat**2).sum(dim=1)
+                        sum_y2_chunk - 2 * (test_chunk * yhat).sum(dim=1) + (yhat**2).sum(dim=1)
                     )
-                    sum_ss_res[:, d_idx] += ss_res.cpu()
-            else:
-                for cs in range(0, n_voxels, chunk_size):
-                    ce = min(cs + chunk_size, n_voxels)
-                    train_chunk = train_data_split[cs:ce].to(device)
-                    test_chunk = test_data_split[cs:ce].to(device)
-                    sum_y2_chunk = (test_chunk**2).sum(dim=1)
-                    for d_idx in range(n_designs):
-                        betas = pinv_trains_gpu[d_idx] @ train_chunk.T
-                        yhat = (test_designs_gpu[d_idx] @ betas).T
-                        ss_res = (
-                            sum_y2_chunk - 2 * (test_chunk * yhat).sum(dim=1) + (yhat**2).sum(dim=1)
-                        )
-                        sum_ss_res[cs:ce, d_idx] += ss_res.cpu()
-                    del train_chunk, test_chunk
+                    sum_ss_res[cs:ce, d_idx] += ss_res.to(accumulator_device)
+                del train_chunk, test_chunk
 
             del (
                 train_data_split,
@@ -362,7 +363,7 @@ def _evaluate_hrfs_batched(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        return 1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)
+        return (1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)).cpu()
 
     # --- Path B follows (guard clause above returned for LORO) ---------------
     # This is an intentional early-return guard rather than a giant else-block.
@@ -420,7 +421,7 @@ def _evaluate_hrfs_batched(
         pinvs_fold = []
         for d_idx in range(n_designs):
             X_train = torch.cat([designs_by_run[d_idx][r] for r in train_runs], dim=0).to(device)
-            pinv_X = torch.linalg.pinv(X_train)
+            pinv_X = _pinv_for_compute(X_train, device)
             pinvs_fold.append(pinv_X)
         all_pinvs.append(pinvs_fold)
 
@@ -436,7 +437,8 @@ def _evaluate_hrfs_batched(
     elif chunk_size is None:
         chunk_size = n_voxels
 
-    r2_out = torch.zeros(n_voxels, n_designs)
+    output_device = device if data_on_device else torch.device("cpu")
+    r2_out = torch.zeros(n_voxels, n_designs, device=output_device)
 
     chunk_iter = range(0, n_voxels, chunk_size)
     if verbose:
@@ -476,14 +478,14 @@ def _evaluate_hrfs_batched(
         for d_idx in range(n_designs):
             avg_yhat_d = sum_yhat[d_idx] / count_d  # (chunk, n_tp)
             ss_res = ((data_chunk - avg_yhat_d) ** 2).sum(dim=1)
-            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
+            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).to(output_device)
 
         del sum_yhat, data_chunk
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     del all_pinvs
-    return r2_out
+    return r2_out.cpu()
 
 
 def _evaluate_hrfs_batched_loro(
@@ -557,14 +559,14 @@ def _evaluate_hrfs_insample(
     sum_y2 = (projected_data**2).sum(dim=1)
     ss_tot = (sum_y2 - sum_y**2 / n_timepoints).clamp(min=1e-10)
 
-    r2_out = torch.zeros(n_voxels, n_designs)
+    output_device = device if data_on_device else torch.device("cpu")
+    r2_out = torch.zeros(n_voxels, n_designs, device=output_device)
 
     if verbose:
         data_loc = "GPU" if data_on_device else "CPU (streaming chunks to GPU)"
         print(f"  Compute device: {device} | Data: {data_loc}")
 
-    # Pre-compute pseudoinverses for all designs (tiny matrices, stay on GPU)
-    pinvs = [torch.linalg.pinv(d.to(device)) for d in projected_designs]
+    pinvs = [_pinv_for_compute(d, device) for d in projected_designs]
     designs_gpu = [d.to(device) for d in projected_designs]
 
     chunk_iter = range(0, n_voxels, chunk_size)
@@ -582,17 +584,17 @@ def _evaluate_hrfs_insample(
         ss_tot_chunk = ss_tot[cs:ce].to(device)
 
         for d_idx in range(n_designs):
-            betas = pinvs[d_idx] @ data_chunk.T  # (n_reg, chunk)
-            yhat = (designs_gpu[d_idx] @ betas).T  # (chunk, n_timepoints)
+            betas = pinvs[d_idx] @ data_chunk.T
+            yhat = (designs_gpu[d_idx] @ betas).T
             ss_res = ((data_chunk - yhat) ** 2).sum(dim=1)
-            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).cpu()
+            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).to(output_device)
 
         del data_chunk
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     del pinvs, designs_gpu
-    return r2_out
+    return r2_out.cpu()
 
 
 def fit_glm_hrf_library_with_xval(
@@ -1546,7 +1548,14 @@ def _fit_voxelwise_hrf(
 
         # Chunk within HRF group if too large (to avoid OOM)
         # Use smaller chunks for GPU to prevent memory issues
-        max_voxels_per_chunk = 50000 if device.type == "cuda" else 100000
+        max_voxels_per_chunk = estimate_chunk_size(
+            n_voxels=n_group_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_conditions + nuisance_design.shape[1],
+            device=device,
+            operation="glm",
+            max_chunk_size=n_group_voxels,
+        )
         n_chunks = (n_group_voxels + max_voxels_per_chunk - 1) // max_voxels_per_chunk
 
         def _fit_and_store(

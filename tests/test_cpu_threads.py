@@ -14,6 +14,7 @@ import os
 import pytest
 import torch
 
+from fastfuncstuff.cli_utils import setup_device
 from fastfuncstuff.utils import configure_torch_backends, resolve_cpu_threads
 
 THREAD_VARS = ("FFS_NUM_THREADS", "OMP_NUM_THREADS", "SLURM_CPUS_PER_TASK")
@@ -73,4 +74,16 @@ def test_auto_never_exceeds_the_machine(clean_env):
 def test_configure_torch_backends_applies_the_budget(clean_env):
     clean_env.setenv("OMP_NUM_THREADS", "2")
     configure_torch_backends(torch.device("cpu"))
+    assert torch.get_num_threads() == 2
+
+
+def test_setup_device_preserves_environment_thread_budget(clean_env):
+    clean_env.setenv("FFS_NUM_THREADS", "3")
+    setup_device("cpu")
+    assert torch.get_num_threads() == 3
+
+
+def test_setup_device_explicit_thread_budget_wins(clean_env):
+    clean_env.setenv("FFS_NUM_THREADS", "3")
+    setup_device("cpu,2")
     assert torch.get_num_threads() == 2

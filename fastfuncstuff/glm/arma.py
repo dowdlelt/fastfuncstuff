@@ -2286,8 +2286,10 @@ def search_voxels_precomputed_grid(
             grid_data = precomputed_grid[(a, b)]
             L_inv = grid_data["L_inv"].to(device)  # (n_time, n_time)
             Q = grid_data["Q"].to(device)  # (n_time, n_reg) orthonormal
-            logdet_Rcorr = grid_data["logdet_Rcorr"].item()
-            logdet_XwTXw = grid_data["logdet_XwTXw"].item()
+            # Keep scalar terms on the compute device. ``.item()`` forces an
+            # accelerator synchronization once per grid point.
+            logdet_Rcorr = grid_data["logdet_Rcorr"].to(device)
+            logdet_XwTXw = grid_data["logdet_XwTXw"].to(device)
 
         # Prewhiten data via GEMM: Y_w = L_inv @ Y  (no triangular solve!)
         # Y_batch: (n_voxels, n_time) → transpose for matmul → transpose back
@@ -4192,7 +4194,7 @@ def fit_glm_arma11(
 
         # Account for grid memory (AFNI strategy)
         # Grid is loaded ONCE and reused for all batches - much faster than streaming!
-        if (device.type == "cuda" or device.type == "cpu") and estimate_per_voxel:
+        if device.type in {"cuda", "mps", "cpu"} and estimate_per_voxel:
             # Estimate grid memory footprint
             if a_grid is None and b_grid is None:
                 temp_a_grid, temp_b_grid = get_default_arma_grids(device)
@@ -4217,11 +4219,22 @@ def fit_glm_arma11(
             # Auto-detect whether to use grid batching
             GRID_BATCHING_THRESHOLD_GB = 8.0
             if use_grid_batching is None:
-                # Auto-detect: use grid batching if grid > 8 GB
-                use_grid_batching = grid_memory_bytes > (GRID_BATCHING_THRESHOLD_GB * 1024**3)
+                # Keep most of the memory-module budget available for the
+                # voxel-dependent search tensors. This matters especially on
+                # unified-memory MPS hosts, where an 8 GiB fixed threshold can
+                # still put the machine under severe memory pressure.
+                from fastfuncstuff.memory import get_available_memory
+
+                grid_budget = min(
+                    int(GRID_BATCHING_THRESHOLD_GB * 1024**3),
+                    int(get_available_memory(device) * 0.40),
+                )
+                use_grid_batching = grid_memory_bytes > grid_budget
                 if use_grid_batching and verbose:
                     print(
-                        f"\n💡 Auto-enabling grid batching (grid: {grid_memory_bytes / 1024**3:.1f} GB > {GRID_BATCHING_THRESHOLD_GB} GB threshold)"
+                        f"\n💡 Auto-enabling grid batching (grid: "
+                        f"{grid_memory_bytes / 1024**3:.1f} GB > "
+                        f"{grid_budget / 1024**3:.1f} GB memory-module budget)"
                     )
                     print("   This saves memory by processing one (a,b) pair at a time.")
                     print("   Use -no_grid_batching to force full grid precomputation.\n")
@@ -4796,10 +4809,23 @@ def fit_glm_arma11(
                         },
                     )
 
-                # CRITICAL: Move entire grid to GPU ONCE (not per-batch!)
-                if device.type == "cuda":
+                # Move the grid to an accelerator once. Without this MPS paid
+                # the CPU→Metal transfer again for every voxel batch.
+                from fastfuncstuff.memory import get_available_memory
+
+                _grid_resident_bytes = sum(
+                    value.numel() * value.element_size()
+                    for entry in precomputed_grid.values()
+                    for value in entry.values()
+                    if isinstance(value, torch.Tensor)
+                )
+                _grid_resident_budget = int(get_available_memory(device) * 0.40)
+                _keep_grid_on_accelerator = (
+                    device.type in {"cuda", "mps"} and _grid_resident_bytes <= _grid_resident_budget
+                )
+                if _keep_grid_on_accelerator:
                     if verbose:
-                        print("  Loading grid to GPU (one-time cost)...")
+                        print(f"  Loading grid to {device.type.upper()} (one-time cost)...")
                     for key in precomputed_grid:
                         precomputed_grid[key]["L_inv"] = precomputed_grid[key]["L_inv"].to(device)
                         precomputed_grid[key]["X_w"] = precomputed_grid[key]["X_w"].to(device)
@@ -4811,12 +4837,14 @@ def fit_glm_arma11(
                             "logdet_XwTXw"
                         ].to(device)
 
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
 
                     if verbose:
                         print(
-                            f"  ✓ Grid loaded to GPU (will be reused for all {n_batches} batches)\n"
+                            f"  ✓ Grid loaded to {device.type.upper()} "
+                            f"(will be reused for all {n_batches} batches)\n"
                         )
 
                     if debug_memory:
@@ -4830,6 +4858,12 @@ def fit_glm_arma11(
                                 "sample_Q": precomputed_grid[sample_key]["Q"],
                             },
                         )
+                elif device.type in {"cuda", "mps"} and verbose:
+                    print(
+                        f"  Grid stays on CPU ({_grid_resident_bytes / 1024**3:.2f} GiB > "
+                        f"{_grid_resident_budget / 1024**3:.2f} GiB accelerator budget); "
+                        "streaming parameter matrices as needed."
+                    )
 
                 # CRITICAL FIX: Search each voxel against precomputed grid
                 # This was missing, causing all voxels to stay at initialization (0,0)

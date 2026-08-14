@@ -38,6 +38,7 @@ try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
         add_cv_strategy_arg,
+        add_device_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_trim_args,
@@ -831,16 +832,7 @@ Examples:
         choices=["nii", "nii.gz", "afni"],
         help="Force output format (default: match input)",
     )
-    proc_opts.add_argument(
-        "-device",
-        type=str,
-        help=(
-            "Force device (default: auto-detect GPU). "
-            "Format: 'cpu' or 'cuda' for auto-config, "
-            "'cpu,N' to use N CPU threads, "
-            "'cuda,N' to use GPU device N (e.g., 'cuda,0' for GPU 0)"
-        ),
-    )
+    add_device_arg(proc_opts)
     add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(

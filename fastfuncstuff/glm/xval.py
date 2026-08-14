@@ -65,7 +65,11 @@ def compute_qr_projectors(
         run_nuisance_clean = run_nuisance[:, nonzero_mask]
 
         if run_nuisance_clean.shape[1] > 0:
-            Q, _ = torch.linalg.qr(run_nuisance_clean)
+            # MPS routes QR through an implicit CPU fallback. This matrix is small;
+            # factor it explicitly on CPU and copy the reusable projector once.
+            qr_device = torch.device("cpu") if device.type == "mps" else device
+            Q, _ = torch.linalg.qr(run_nuisance_clean.to(qr_device))
+            Q = Q.to(device)
             q_factors.append(Q)
         else:
             q_factors.append(None)
