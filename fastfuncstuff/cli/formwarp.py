@@ -67,11 +67,107 @@ def _float_list(spec: str) -> tuple[float, ...]:
     return tuple(float(p) for p in spec.replace(",", "x").split("x") if p != "")
 
 
+class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
+    """Show defaults on each option, but leave the epilog's layout alone."""
+
+
+_EPILOG = """\
+WHICH NONLINEAR BACKEND
+-----------------------
+  ffs_formwarp (this)  ANTs SyN: one dense symmetric field. Two half-warps meet at a
+                       midpoint, so the inverse and the halfway warps are free and
+                       the fit is inverse-consistent. Best for large, smooth
+                       deformations -- subject to template, session to session.
+  ffs_qwarp            AFNI 3dQwarp overlapping polynomial patches. Sharper at fine
+                       local detail once the pair is already close.
+  ffs_optiwarp         Optical flow: solves for the field instead of optimizing a
+                       cost. The fastest way to FIND a deformation.
+All three assume the pair is already affinely aligned -- run ffs_allineate first
+(or pass its matrix with -matrix, which registers in the source's own frame).
+
+HOW A LEVEL RUNS (read before tuning anything)
+----------------------------------------------
+-shrink/-smooth/-iters are ANTs' -f/-s/-c, one entry per level, coarse to fine
+(default 4x2x1 / 2x1x0 / 100x70x40). Per level the images are pre-smoothed and
+downsampled, iterations run, and the fields are upsampled to seed the next level.
+Each iteration: evaluate the metric at the midpoint, smooth the update field by
+-update_var (fluid), take a step normalized so the largest displacement is
+-grad_step voxels, smooth the total field by -total_var (elastic), then re-derive
+each field from its inverse to keep both diffeomorphic.
+
+Greedy SyN OVERSHOOTS -- cost falls, then rises. Two defenses are always on: every
+level returns the LOWEST-cost field it saw, and a trailing-window slope test
+(-conv_window / -conv_thresh) stops a level once cost flattens. Because of the
+best-state restoration, raising -iters is safe: extra iterations can never hand
+back a worse warp.
+
+NOT ENOUGH WARP (structures still visibly misaligned)
+-----------------------------------------------------
+  * Ran out of iterations, or stopped too eagerly: raise -iters (100x70x40 ->
+    200x150x100) and/or lower -conv_thresh (1e-6 -> 1e-8); -conv_window 0 disables
+    early stopping entirely and runs the full budget (still best-restored).
+  * Fine detail never appears: -update_var 3.0 is a strong fluid prior and it is
+    the main thing smoothing detail away. Drop it (3.0 -> 1.5) and make sure the
+    finest level has -smooth 0 and -shrink 1.
+  * Everything moves a little, nothing moves enough: -grad_step is the per-iteration
+    cap in voxels, so total travel is roughly grad_step x iterations. Raise it
+    (0.25 -> 0.5) or add iterations; raising it too far makes the level oscillate,
+    which best-state restoration will silently absorb as "no progress".
+  * Large deformation never bridged: add a coarser level (-shrink 8x4x2x1 -smooth
+    3x2x1x0 -iters 150x100x70x40). Coarse levels are cheap and are where big,
+    smooth displacement is actually won.
+  * Cost dominated by background or by a clipped FoV edge: -automask, or supply
+    -weight. The tissue/nothing cliff at a cut FoV is the strongest gradient in the
+    volume; the coverage handling (-void_guard, -coverage_erode) exists for it.
+
+TOO MUCH WARP (anatomy distorted, ripples, folding)
+---------------------------------------------------
+  * Raise -update_var (more fluid smoothing of each update) -- the first knob.
+  * Turn on elastic regularization: -total_var 1-3 smooths the ACCUMULATED field,
+    off by default. This is the one that stops slow accumulation of nonsense.
+  * Lower -grad_step (0.25 -> 0.1) so each iteration commits less.
+  * Cut the finest level (-shrink 4x2 -smooth 2x1 -iters 100x70): most implausible
+    deformation is bought at full resolution.
+  * Blur more at the coarse levels (-smooth 3x2x1) so the fit is not chasing noise.
+  * Distortion-only: -noXdis / -noYdis / -noZdis zero a component of every field
+    on every iteration, which is a hard constraint, not a penalty.
+
+WRONG-LOOKING WARP / CROSS-MODAL PAIRS
+--------------------------------------
+-metric cc (neighborhood cross-correlation, radius -cc_radius) is the SyN default
+and assumes the two images covary locally. For contrast-inverted pairs (EPI to
+anat) use -metric lpc; -metric lpa is the unsigned version for same-contrast pairs
+with varying local gain (tune -lpa_sigma / -lpa_kernel). -metric mse only for
+identical-contrast sanity checks. A big -cc_radius smooths the metric and behaves
+like extra regularization; a small one is sharper and noisier.
+
+TOO SLOW
+--------
+  * The finest level dominates -- shorten its -iters before touching anything else.
+  * Coarser -shrink at the top (8x4x2x1) costs almost nothing and often removes
+    iterations from the expensive levels.
+  * -metric cc with a large -cc_radius is the expensive metric; radius 2-3 is much
+    cheaper than 4.
+  * Many pairs: -batch FILE runs them in one process, so CUDA context and warmup
+    are paid once; -batch_skip skips jobs whose outputs already exist.
+
+DIAGNOSTICS
+-----------
+-save_inverse and -save_halfway write the other three fields for free (they already
+exist inside the algorithm). The default verbosity already prints, per level, the
+iterations actually run and the best cost -- a level that used far fewer iterations
+than its budget converged (or stalled); one that used all of them was still moving
+when it ran out. If the warp looks fine but lands in the wrong space, the issue is
+usually grids/headers, not tuning -- see the -matrix help text.
+"""
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ffs_formwarp",
         description="GPU SyN (symmetric normalization) nonlinear registration.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        epilog=_EPILOG,
+        formatter_class=_HelpFormatter,
     )
 
     # I/O

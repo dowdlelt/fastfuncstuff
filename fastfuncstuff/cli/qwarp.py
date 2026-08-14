@@ -52,6 +52,104 @@ from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_vo
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
 from fastfuncstuff.utils import REGISTRATION_TF32
 
+_EPILOG = """\
+WHICH NONLINEAR BACKEND
+-----------------------
+  ffs_qwarp (this)  Overlapping polynomial patches, AFNI 3dQwarp semantics. The
+                    sharpest at fine local detail once the pair is already close.
+  ffs_formwarp      ANTs SyN: one dense symmetric field, free inverse and halfway
+                    warps. Better for large smooth deformations (subject->template).
+  ffs_optiwarp      Optical flow: SOLVES for the field instead of optimizing a cost.
+                    Fast and good at FINDING a deformation; it can hand off to this
+                    engine (-final_qwarp) for the last half-voxel.
+All three assume the pair is already affinely aligned -- run ffs_allineate first.
+
+HOW THE LEVELS WORK (read before tuning anything)
+-------------------------------------------------
+Level 0 warps the whole volume as a single patch. Every level after that multiplies
+the patch size by 0.75 and tiles the volume with 50%-overlapping patches, stopping
+once a patch would be smaller than -minpatch (default 25 voxels; floor 5, forced
+odd). So -minpatch sets the FINEST spatial scale the warp can express, and -maxlev
+caps the level count regardless of what -minpatch would allow.
+
+Three coupled knobs gate over-warping, and they act in different regimes -- tune
+them together rather than substituting one for another:
+  -penfac 0.033          Jacobian-energy penalty added to the cost. Ramps with the
+                         level as lev^0.333 (capped at 3.21x), so it bites hardest
+                         at the fine levels.
+  -penalty_first_level 3 Levels below this run unpenalized (half strength at N).
+  -hfactor_q 0.5         Shrinks the per-patch displacement bound as patches get
+                         small. This, not -penfac, is what stops fine-scale
+                         rippling. 1.0 disables it.
+
+NOT ENOUGH WARP (structures still visibly misaligned)
+-----------------------------------------------------
+  * Small features unchanged, big ones fine: -minpatch is too coarse. A structure
+    only moves independently if a patch is about its size -- drop -minpatch (25 ->
+    13 or 9). Cost grows fast; each extra level is more, smaller patches.
+  * Everything is slightly short of the target: the patches are converging early.
+    Lower -batch_tol (1e-4 -> 1e-5) and/or raise -batch_iters (60 -> 120); add
+    -workhard 0 -1 to double-pass every level (or -workhard 0 2 for the coarse
+    ones only). -quintic gives the final level a more flexible basis.
+  * The whole warp looks damped: -penfac too high for the data, or -hfactor_q too
+    small. Try -penfac 0.01 (AFNI's own "more visibly warped" territory is ~0.001)
+    and/or -hfactor_q 0.8. Raising -penalty_first_level lets more coarse levels
+    deform freely before regularization engages.
+  * Displacements pinned at a round number: you set -maxdisp, or -axweight is
+    holding an axis down.
+  * The cost is being spent on background: the default weight is "nonzero voxels of
+    the base". Use -autoweight (automask, soft-edged by -autoweight_blur) or supply
+    -useweight to put the cost where you care.
+  * Big offsets were never there to fix: qwarp is a refinement. If the misalignment
+    is many voxels and global, fix it affinely (ffs_allineate) or start from a flow
+    field (ffs_optiwarp -final_qwarp), not with a bigger -penfac budget.
+
+TOO MUCH WARP (anatomy distorted, ripples, folding)
+---------------------------------------------------
+  * High-frequency ripple at the finest scale: lower -hfactor_q (0.5 -> 0.3) and/or
+    raise -minpatch. This is the fine-level regime; -penfac helps less here.
+  * Broad implausible deformation: raise -penfac (0.033 -> 0.1+), lower
+    -penalty_first_level (3 -> 1) so the penalty engages earlier, cap with
+    -maxdisp N voxels.
+  * The last level or two makes things worse: -early_stop rolls back and stops at
+    the first level that degrades the global cost (off by default -- AFNI runs every
+    level). -maxlev N is the deterministic version once you know where it turns.
+  * Noise being chased: -blur BASE SRC (FWHM mm) or -pblur to blur proportionally
+    to the patch size at each level.
+  * Distortion correction only: turn off the axes that cannot physically move
+    (-noXdis/-noZdis for an AP phase encode), or soften with -axweight; with a
+    rotation in play, feed -motparams / -affine so the PE direction is projected
+    per volume instead of held axis-aligned.
+
+WRONG-LOOKING WARP / CROSS-MODAL PAIRS
+--------------------------------------
+The default cost (-pcl, clipped Pearson) assumes the two images brighten together.
+For contrast-inverted pairs (EPI to anat) use -lpc; for same-contrast but locally
+varying gain use -lpa. Both are the AFNI blok local Pearson; -lpa_alt is the older
+Gaussian/box-neighborhood version, tuned by -lpa_sigma / -lpa_kernel. A globally
+"good" cost with a locally wrong warp usually means the weight, not the cost.
+
+TOO SLOW
+--------
+  * -pyramid 2 (or 4) solves the coarse levels on a downsampled volume -- the
+    coarse levels are the compute bottleneck on 1mm anatomicals. Opt-in: validate
+    against a non-pyramid run.
+  * Raise -minpatch / set -maxlev: the finest level is the most expensive one.
+  * -final linear instead of wsinc5 if output sharpness does not matter; -interp is
+    already linear during optimization and raising it buys nothing.
+  * Timeseries: -chainwarp with -chain_inilev N reuses the previous volume's warp
+    and skips its coarse levels; -lookback N picks the best of the last N.
+  * -compile pays a warmup cost and only pays off on long runs; -memcheck prints
+    the memory estimate and exits.
+
+DIAGNOSING A BAD RUN
+--------------------
+-save_intermediates writes the warp and warped image after every level to
+{prefix}_levels/, -partials concatenates the per-level warped images into one 4D
+"movie", and -partial_warps saves the per-level fields. Scrub through them to see
+which level introduced the damage, then cut there with -maxlev (or -early_stop).
+"""
+
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -67,6 +165,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "is the base and vol[1:] are warped to it. Use -base_method to build a\n"
             "mean/median base instead. Per-volume warps are saved alongside the 4D output."
         ),
+        epilog=_EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 

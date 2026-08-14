@@ -147,6 +147,87 @@ proof; values <= 0 are folded voxels. -step_mode additive is the classic, faster
 unguarded update. -final_qwarp then hands the converged field to the ffs_qwarp
 engine for a fine-scale, pure image-match polish: flow is good at FINDING the
 deformation, patch optimization is good at nailing the last half-voxel.
+
+WHICH NONLINEAR BACKEND
+-----------------------
+  ffs_optiwarp (this)  Solves for the field from brightness constancy. The fastest
+                       way to FIND a deformation; loosest on its own.
+  ffs_qwarp            AFNI 3dQwarp overlapping polynomial patches; sharpest at fine
+                       local detail. Reachable from here with -final_qwarp.
+  ffs_formwarp         ANTs SyN dense symmetric field; free inverse and halfway
+                       warps, the steadiest for large smooth deformations.
+All three assume the pair is already affinely aligned -- run ffs_allineate first.
+This tool requires base and source to be on the SAME GRID.
+
+HOW A LEVEL RUNS
+----------------
+-shrink/-smooth/-iters are per-level, coarse to fine (default 4x2x1 / 2x1x0 /
+100x70x40). Each iteration: prep intensities (-match), solve the flow equation
+(-force), smooth the update by -update_sigma (fluid), clamp the largest
+displacement to -max_step voxels, compose (or add) it, then smooth the accumulated
+field by -total_sigma (elastic). The BEST-metric field is always what gets
+returned, so a long -iters can never hand back a worse warp than the minimum it
+saw; -conv_window / -conv_thresh only decide when to stop early.
+
+NOT ENOUGH WARP (structures still visibly misaligned)
+-----------------------------------------------------
+  * Stopped too early: raise -iters, lower -conv_thresh (1e-6 -> 1e-8), or
+    -conv_window 0 to run the full budget (still best-restored).
+  * Total travel is bounded by -max_step x iterations. Raise -max_step (1.0 -> 2.0)
+    for a big deformation, or add iterations at the coarse levels.
+  * Detail smoothed away: -total_sigma 1.0 is elastic smoothing of the ACCUMULATED
+    field and is the strongest brake on fine detail -- try 0.5 or 0. -update_sigma
+    is the gentler one to keep.
+  * Motion along a boundary is being missed (the warp slides instead of crossing):
+    that is the demons aperture blind spot by construction. Switch -force lk (raise
+    -lk_radius 2 -> 3 if it is noisy, lower -lk_reg for a sharper solve).
+  * Large homogeneous regions do not move at all: nothing inside them constrains the
+    flow. -force hs propagates displacement inward from the edges; lower -hs_alpha
+    to let it move more, raise -hs_iters so it propagates farther per solve.
+  * Steps damped everywhere with -force demons: raise -demons_noise (1.0 -> 2.0).
+    It is the intensity difference, in prepped units (~1 sigma after localnorm), at
+    which the force is deliberately shrunk.
+  * The last half-voxel never lands: that is what -final_qwarp is for. Flow finds
+    the deformation; patches nail the residual (-minpatch controls how fine).
+
+TOO MUCH WARP (anatomy distorted, ripples, folding)
+---------------------------------------------------
+  * Check before you tune: -save_jacobian writes the determinant map, and any value
+    <= 0 is a folded voxel. In the default -step_mode diffeo folding cannot happen
+    by construction; if you switched to additive, switch back.
+  * Raise -total_sigma (elastic) first, then -update_sigma (fluid).
+  * Lower -max_step so each iteration commits less.
+  * Drop the finest level (-shrink 4x2 -smooth 2x1 -iters 100x70) -- full resolution
+    is where implausible deformation is bought.
+  * -force lk over-warps where a window has no second orientation: raise -lk_reg
+    (1e-2 -> 1e-1) to ridge the degenerate directions, or raise -lk_radius.
+  * Distortion-only: -noXdis / -noYdis / -noZdis zero that component of every update.
+  * The polish specifically: the qwarp hand-off runs with reject-worse-levels ON, so
+    it can only improve the cost it inherits; -qwarp_penfac raises the patch penalty
+    and -minpatch raises the finest scale it is allowed to touch.
+
+WRONG-LOOKING WARP / CROSS-MODAL PAIRS
+--------------------------------------
+If the warp diverges or pushes structures the wrong way on a cross-contrast pair,
+the cause is almost always -match, not the regularization: localnorm's local
+z-score NEGATES under a contrast inversion, so the force points backwards in every
+voxel. Use -match gradmag for T1/T2/EPI-to-anat. It is blinder inside homogeneous
+tissue (only boundaries survive), which is a fair trade for a defined force. The
+-metric is only the referee that picks the best iterate -- pair it with the data
+(lpc for inverted contrast) but do not expect it to fix a wrong -match.
+
+Clipped FoV: the tissue/nothing cliff is the strongest gradient in the volume and
+-match gradmag registers gradients, so leave the coverage handling on (-void_guard,
+-coverage_erode) rather than relying on a brain mask.
+
+TOO SLOW
+--------
+  * -force demons is one pass with no solve; lk costs a 3x3 solve per voxel and hs
+    costs -hs_iters Jacobi sweeps per iteration. Try demons + more iterations before
+    a fancier force.
+  * Shorten the finest level's -iters; coarse levels are nearly free.
+  * -final_qwarp is a full qwarp run on top -- raise -minpatch if it dominates.
+  * 4D -source registers every volume independently; that cost scales linearly.
 """
 
 
