@@ -111,6 +111,7 @@ from fastfuncstuff.io.headers import (
 )
 from fastfuncstuff.utils import (
     get_device,
+    io_progress_suppressed,
     resolve_cpu_threads,
     to_tensor,
 )
@@ -2890,7 +2891,7 @@ def save_nifti(
     # report the elapsed time so the run does not look wedged. Threshold keeps the routine
     # silent for the many small parameter maps written per run.
     _nbytes = int(data.nbytes)
-    _announce = _nbytes >= _BIG_WRITE_BYTES
+    _announce = _nbytes >= _BIG_WRITE_BYTES and not io_progress_suppressed()
     if _announce:
         print(
             f"    ⏳ writing {out.name} ({_nbytes / 1e9:.2f} GB uncompressed)"

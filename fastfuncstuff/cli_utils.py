@@ -24,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import suppress_io_progress
+
 _NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
 
 
@@ -64,7 +66,8 @@ def spinner(
 
     if not tty:
         try:
-            yield
+            with suppress_io_progress():
+                yield
         finally:
             if leave:
                 stream.write(f"{message} ... done ({time.perf_counter() - t0:.1f}s)\n")
@@ -84,7 +87,8 @@ def spinner(
     thread = threading.Thread(target=_spin, daemon=True)
     thread.start()
     try:
-        yield
+        with suppress_io_progress():
+            yield
     finally:
         stop.set()
         thread.join()

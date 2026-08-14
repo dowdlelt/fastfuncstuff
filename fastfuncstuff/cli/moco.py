@@ -931,12 +931,10 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
             w_orig = pfx.with_suffix("weight_orig")
             w_new = pfx.with_suffix("weight_reweight")
             w_patch = pfx.with_suffix("patches")
-            with spinner("Writing weight/patch maps"):
+            with spinner(f"Writing weight/patch maps ({pfx.stem})", enabled=verb >= 1):
                 save_image(result.weight_orig, w_orig, header_info=header_info)
                 save_image(result.weight_refined, w_new, header_info=header_info)
                 save_image(result.patch_labels.float(), w_patch, header_info=header_info)
-            if verb >= 1:
-                print(f"Saved weights: {w_orig}, {w_new}, {w_patch}")
 
 
 def _parse_reg_echo(reg_echo: str | None, n_echoes: int) -> tuple[bool, int]:
@@ -1372,10 +1370,8 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
     # Corrected timeseries (skipped when -prefix is omitted).
     if args.prefix is not None:
         out_path = parse_prefix(args.prefix).as_file()
-        with spinner(f"Writing {Path(out_path).name}"):
+        with spinner(f"Writing {out_path}", enabled=verb >= 1):
             save_image(result.aligned, out_path, header_info=header_info)
-        if verb >= 1:
-            print(f"Saved: {out_path}")
 
     # Temporal reductions of the corrected series (mean / max / min).
     for dest, which in _TEMPORAL_REDUCTIONS:
@@ -1383,10 +1379,8 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         if value is None:
             continue
         out = _reduction_path(value, which, args.prefix, dest)
-        with spinner(f"Writing {Path(out).name}"):
+        with spinner(f"Writing {which} {out}", enabled=verb >= 1):
             save_image(_reduce_time(result.aligned, which), out, header_info=header_info)
-        if verb >= 1:
-            print(f"Saved {which}: {out}")
 
     if _want_qc(args):
         base_path = parse_prefix(args.prefix).as_file()
@@ -1498,9 +1492,8 @@ def _run_multi_echo(
 
             if write_series:
                 out_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
-                save_image(aligned, out_path, header_info=echo_hdr)
-                if verb >= 1:
-                    print(f"  Saved: {out_path}")
+                with spinner(f"Writing {out_path}", enabled=verb >= 1):
+                    save_image(aligned, out_path, header_info=echo_hdr)
 
             for dest, which in _TEMPORAL_REDUCTIONS:
                 value = getattr(args, dest)
@@ -1513,9 +1506,8 @@ def _run_multi_echo(
                     echo_prefix,
                     dest,
                 )
-                save_image(_reduce_time(aligned, which), out_path, header_info=echo_hdr)
-                if verb >= 1:
-                    print(f"  Saved {which}: {out_path}")
+                with spinner(f"Writing {which} {out_path}", enabled=verb >= 1):
+                    save_image(_reduce_time(aligned, which), out_path, header_info=echo_hdr)
 
             if want_qc:
                 base_path = parse_prefix(_sibling(args.prefix, f"e{echo_num}_")).as_file()
