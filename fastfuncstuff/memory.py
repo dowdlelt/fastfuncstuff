@@ -753,6 +753,50 @@ def compute_registration_candidate_batch_size(
     return max(1, min(n_candidates, max_batch_size, available // per_candidate))
 
 
+def estimate_nonlinear_memory_bytes(
+    shape: tuple[int, int, int],
+    engine: str,
+    *,
+    n_sources: int = 1,
+) -> int:
+    """Estimate the peak dense working set for a nonlinear registration engine.
+
+    The models deliberately count live float32 volume equivalents rather than
+    pretending dense fields can be voxel-chunked: every update depends on a
+    spatial neighbourhood and the complete deformation field.
+    """
+    voxels = int(shape[0] * shape[1] * shape[2])
+    if engine == "formwarp":
+        # Images/weights, four forward/inverse 3-channel fields, best snapshots,
+        # autograd leaves/gradients, warped midpoints, and smoothing scratch.
+        volume_equivalents = 40
+    elif engine == "optiwarp":
+        # Images/weights, forward/best/update fields, gradients, composition,
+        # Jacobian and smoothing scratch. LK is the largest force model.
+        volume_equivalents = 28
+    elif engine == "qwarp":
+        # Images/weights/warps plus the full-volume level-0 basis, coordinate,
+        # interpolation, correlation, and Jacobian working sets.
+        volume_equivalents = 61 + max(0, n_sources - 1) * 5
+    else:
+        raise ValueError(f"Unknown nonlinear engine {engine!r}")
+    fixed_overhead = 300 * 1024**2 if engine == "qwarp" else 0
+    return voxels * volume_equivalents * 4 + fixed_overhead
+
+
+def plan_nonlinear_memory(
+    shape: tuple[int, int, int],
+    device: torch.device,
+    engine: str,
+    *,
+    n_sources: int = 1,
+) -> tuple[int, int]:
+    """Return ``(predicted_peak, safe_available)`` for nonlinear registration."""
+    predicted = estimate_nonlinear_memory_bytes(shape, engine, n_sources=n_sources)
+    available = get_available_memory(device, empty_cache=False)
+    return predicted, available
+
+
 def estimate_nordic_llr_memory(
     shape: tuple[int, int, int, int],
     kernel_size: tuple[int, int, int],

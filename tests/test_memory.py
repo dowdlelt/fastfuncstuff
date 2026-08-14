@@ -23,6 +23,7 @@ from fastfuncstuff.memory import (
     dyn_chunk_estimator,
     estimate_chunk_size,
     estimate_keep_on_cpu,
+    estimate_nonlinear_memory_bytes,
     estimate_nordic_llr_memory,
     get_available_memory,
     get_memory_config,
@@ -35,6 +36,16 @@ from fastfuncstuff.memory import (
 def test_registration_candidate_batch_uses_shared_memory_budget():
     with patch("fastfuncstuff.memory.get_available_memory", return_value=52 * 1000):
         assert compute_registration_candidate_batch_size(100, 50, torch.device("cpu")) == 10
+
+
+def test_nonlinear_memory_models_scale_and_order_engines():
+    shape = (64, 64, 64)
+    opti = estimate_nonlinear_memory_bytes(shape, "optiwarp")
+    syn = estimate_nonlinear_memory_bytes(shape, "formwarp")
+    qwarp = estimate_nonlinear_memory_bytes(shape, "qwarp")
+    assert opti < syn < qwarp
+    assert estimate_nonlinear_memory_bytes((128, 64, 64), "optiwarp") == 2 * opti
+    assert estimate_nonlinear_memory_bytes(shape, "qwarp", n_sources=3) > qwarp
 
 
 class TestMemoryConfig:

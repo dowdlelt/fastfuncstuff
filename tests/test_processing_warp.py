@@ -765,6 +765,24 @@ class TestPatchWriteBackDedup:
         for fa, fb in zip(a[1:], b[1:], strict=True):
             assert torch.equal(fa, fb), "qwarp_batch is not reproducible"
 
+    def test_qwarp_cpu_level_zero_uses_resident_batched_optimizer(self, monkeypatch):
+        """CPU level zero must not cross into SciPy/Powell for every evaluation."""
+        import fastfuncstuff.processing.warp as warp_mod
+
+        def fail_serial(*args, **kwargs):
+            raise AssertionError("serial level-zero optimizer was called")
+
+        monkeypatch.setattr(warp_mod, "_improve_warp_serial", fail_serial)
+        base = torch.rand(12, 12, 12) + 0.1
+        cfg = QwarpConfig(
+            minpatch=9,
+            max_level=0,
+            cost_method="pearson",
+            batch_optimizer_iters_lev0=1,
+            verb=0,
+        )
+        warp_mod.qwarp(base, base.clone(), config=cfg, device=torch.device("cpu"), pad=False)
+
 
 # ---------------------------------------------------------------------------
 # WarpState mutation patterns

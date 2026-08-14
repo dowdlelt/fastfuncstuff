@@ -29,7 +29,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
+from fastfuncstuff.memory import plan_nonlinear_memory
 from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import (
@@ -40,7 +47,6 @@ from fastfuncstuff.processing.io import (
     save_warp_series,
 )
 from fastfuncstuff.processing.mask import automask
-from fastfuncstuff.processing.memory import estimate_gpu_memory_gb, print_memory_report
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
 from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
@@ -664,20 +670,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "GPU / Hardware",
         "Device selection and memory management.",
     )
-    g_hw.add_argument(
-        "-device",
-        type=str,
-        default=None,
-        metavar="DEV",
-        help="PyTorch device string. E.g. 'cuda', 'cuda:1', 'cpu'. "
-        "Auto-detected if omitted (prefers CUDA)",
+    add_device_arg(
+        g_hw,
+        extra="On Apple Silicon use CPU: MPS is much slower because 3-D grid-sample backward falls back to CPU.",
     )
     g_hw.add_argument(
         "-gpu_mem",
         type=float,
-        default=15.0,
+        default=None,
         metavar="GB",
-        help="Available GPU memory in GB. Used for batch size estimation [default: %(default)s]",
+        help="Optional user memory cap in GB for warnings. Actual safe memory is detected by "
+        "the shared memory module.",
     )
     g_hw.add_argument(
         "-compile",
@@ -1282,9 +1285,26 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Select device (prefer CUDA > MPS > CPU)
-    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    device_spec = args.device
+    if (
+        device_spec is None or str(device_spec).lower() == "auto"
+    ) and not torch.cuda.is_available():
+        device_spec = "cpu"
+    device = setup_device(device_spec, tf32=REGISTRATION_TF32)
     if device.type == "cpu" and args.device is None and args.verb >= 1:
-        print("WARNING: No GPU available, running on CPU (will be slow)")
+        note = (
+            " (recommended on Mac: MPS qwarp autograd falls back to CPU)"
+            if torch.backends.mps.is_available()
+            else ""
+        )
+        print(f"Using CPU{note}")
+    if (
+        device.type == "cpu"
+        and args.device is None
+        and args.verb >= 1
+        and not torch.backends.mps.is_available()
+    ):
+        print("WARNING: No accelerator available, running on CPU (will be slow)")
 
     if args.verb >= 1:
         print(f"qwarp_torch: device={device}")
@@ -1419,17 +1439,29 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Base: {nx}x{ny}x{nz}, Source: {nx}x{ny}x{nz} x {nt}t")
         print(f"Loaded in {time.time() - t0:.1f}s")
 
+    pad_x, pad_y, pad_z = _compute_padding(nx, ny, nz)
+    padded_shape = (nz + 2 * pad_z, ny + 2 * pad_y, nx + 2 * pad_x)
+    predicted, available = plan_nonlinear_memory(padded_shape, device, "qwarp")
+    if args.gpu_mem is not None:
+        available = min(available, int(args.gpu_mem * 2**30))
+
     # Memory check
     if args.memcheck:
-        print_memory_report(nx, ny, nz, nt)
+        print(f"qwarp padded grid: {padded_shape[2]}x{padded_shape[1]}x{padded_shape[0]}")
+        print(f"Estimated peak: {predicted / 2**30:.2f} GiB")
+        print(f"Safe available budget: {available / 2**30:.2f} GiB")
+        if nt > 1:
+            print(f"Timeseries source storage: {nx * ny * nz * nt * 4 / 2**30:.2f} GiB")
         return 0
 
-    mem_gb = estimate_gpu_memory_gb(nx, ny, nz)
     if args.verb >= 1:
-        print(f"Estimated GPU memory per volume: {mem_gb:.2f} GB")
+        print(f"Estimated qwarp peak per volume: {predicted / 2**30:.2f} GiB")
 
-    if mem_gb > args.gpu_mem * 0.95:
-        print(f"WARNING: Estimated {mem_gb:.1f} GB may exceed available {args.gpu_mem:.1f} GB")
+    if predicted > available:
+        print(
+            f"WARNING: estimated {predicted / 2**30:.1f} GiB exceeds the "
+            f"{available / 2**30:.1f} GiB safe memory budget"
+        )
 
     # Build config
     warp_flags = 0

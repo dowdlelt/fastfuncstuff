@@ -59,6 +59,8 @@ from typing import TYPE_CHECKING
 import torch
 from torch import Tensor
 
+from fastfuncstuff.memory import plan_nonlinear_memory
+
 if TYPE_CHECKING:
     from .warp import QwarpConfig
 
@@ -509,6 +511,13 @@ def _optiflow_level(
     flags = cfg.warp_flags
     window = cfg.convergence_window
     fixed_grad = _grad3(fixed)
+    nz, ny, nx = fixed.shape
+    voxel_grid = torch.meshgrid(
+        torch.arange(nz, dtype=fixed.dtype, device=fixed.device),
+        torch.arange(ny, dtype=fixed.dtype, device=fixed.device),
+        torch.arange(nx, dtype=fixed.dtype, device=fixed.device),
+        indexing="ij",
+    )
 
     best_cost = float("inf")
     best: Field = tuple(c.clone() for c in fwd)  # type: ignore[assignment]
@@ -520,7 +529,7 @@ def _optiflow_level(
 
     with torch.no_grad():
         for _ in range(n_iter):
-            warped = warp_image_linear(moving, fwd[0], fwd[1], fwd[2])
+            warped = warp_image_linear(moving, fwd[0], fwd[1], fwd[2], voxel_grid=voxel_grid)
 
             cost_val = float(
                 image_metric(
@@ -657,6 +666,12 @@ def optiwarp(
     fixed = fixed.float().to(device)
     moving = moving.float().to(device)
     full_shape: tuple[int, int, int] = tuple(fixed.shape)  # type: ignore[assignment]
+    predicted, available = plan_nonlinear_memory(full_shape, device, "optiwarp")
+    if predicted > available and cfg.verb >= 1:
+        print(
+            f"WARNING: estimated optical-flow peak {predicted / 2**30:.1f} GiB exceeds "
+            f"the {available / 2**30:.1f} GiB safe memory budget; use stronger shrink factors."
+        )
 
     if weight is not None:
         weight = weight.float().to(device)

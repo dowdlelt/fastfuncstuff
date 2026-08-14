@@ -72,6 +72,17 @@ The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
   explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
   path causes trouble, rerun with `-device cpu`.
 
+Nonlinear registration has its own device profile:
+
+| Tool | Apple Silicon recommendation | Why |
+|---|---|---|
+| `ffs_optiwarp` | MPS for LK/HS; benchmark demons | Forward-only flow kernels work natively; LK/HS usually win on full-size volumes. |
+| `ffs_formwarp` | CPU | SyN needs 3-D `grid_sample` backward, which currently falls back from MPS to CPU every iteration. |
+| `ffs_qwarp` | CPU | Its autograd patch optimizer hits the same MPS backward fallback; CUDA remains the fastest target. |
+
+For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
+Mac unless CUDA is available. An explicit `-device mps` is still honored.
+
 The default `pip install torch` gives you whatever wheel pip resolves for
 your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
 CUDA, install torch *first* from the official index for your CUDA version,

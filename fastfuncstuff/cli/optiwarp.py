@@ -40,6 +40,7 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_coverage_args,
+    add_device_arg,
     add_verbose_arg,
     combine_brain_masks,
     image_support,
@@ -428,7 +429,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Interpolation for the final warped image.",
     )
 
-    p.add_argument("-device", default=None, help="torch device (cuda/cpu/mps). Auto if unset.")
+    add_device_arg(
+        p,
+        extra="On Apple Silicon, MPS is useful for LK/HS on full-size volumes; CPU is often as fast for demons.",
+    )
     add_verbose_arg(p)
     return p.parse_args(argv)
 

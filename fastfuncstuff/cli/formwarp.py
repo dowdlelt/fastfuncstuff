@@ -31,6 +31,7 @@ import torch
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
+    add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
     combine_brain_masks,
@@ -253,16 +254,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Device
-    p.add_argument("-device", default=None, help="torch device (cuda/cpu/mps). Auto if unset.")
+    add_device_arg(
+        p,
+        extra="On Apple Silicon use CPU: MPS falls back to CPU for SyN's 3-D grid-sample backward pass.",
+    )
     add_verbose_arg(p)
     return p.parse_args(argv)
 
 
 def _select_device(args: argparse.Namespace) -> torch.device:
-    """Honour ``-device`` if given, else CUDA > MPS > CPU."""
-    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    """Honour explicit devices; keep auto on CPU when only MPS is available."""
+    spec = args.device
+    if (spec is None or str(spec).lower() == "auto") and not torch.cuda.is_available():
+        spec = "cpu"
+    device = setup_device(spec, tf32=REGISTRATION_TF32)
     if device.type == "cpu" and args.device is None and args.verb >= 1:
-        print("WARNING: no GPU available, running on CPU")
+        note = (
+            " (recommended on Mac: MPS SyN backward falls back to CPU)"
+            if torch.backends.mps.is_available()
+            else ""
+        )
+        print(f"Using CPU{note}")
     return device
 
 

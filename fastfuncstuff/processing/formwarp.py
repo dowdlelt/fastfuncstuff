@@ -46,6 +46,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.memory import plan_nonlinear_memory
+
 try:
     from tqdm import tqdm as _tqdm
 except ImportError:  # pragma: no cover - tqdm is a hard dep in practice
@@ -57,7 +59,7 @@ from .cost import (
     lpc_correlation,
     pearson_correlation,
 )
-from .interp import _grid_sample_3d, trilinear_interpolate, warp_image
+from .interp import _grid_sample_3d, trilinear_interpolate_multi, warp_image
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 
@@ -147,7 +149,13 @@ class SynConfig:
 # ---------------------------------------------------------------------------
 
 
-def _warp_diff(source: Tensor, xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
+def _warp_diff(
+    source: Tensor,
+    xd: Tensor,
+    yd: Tensor,
+    zd: Tensor,
+    voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
+) -> Tensor:
     """Differentiable linear warp: output[p] = source[p + d(p)].
 
     A grad-friendly companion to :func:`interp.warp_image_linear` (which masks
@@ -158,12 +166,15 @@ def _warp_diff(source: Tensor, xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
     nz, ny, nx = source.shape
     device = source.device
     dtype = source.dtype
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=dtype, device=device),
-        torch.arange(ny, dtype=dtype, device=device),
-        torch.arange(nx, dtype=dtype, device=device),
-        indexing="ij",
-    )
+    if voxel_grid is None:
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(nz, dtype=dtype, device=device),
+            torch.arange(ny, dtype=dtype, device=device),
+            torch.arange(nx, dtype=dtype, device=device),
+            indexing="ij",
+        )
+    else:
+        kk, jj, ii = voxel_grid
     x = ii + xd
     y = jj + yd
     z = kk + zd
@@ -309,7 +320,11 @@ def _apply_axis_flags(xd: Tensor, yd: Tensor, zd: Tensor, flags: int) -> Field:
 
 
 def invert_displacement_field(
-    xd: Tensor, yd: Tensor, zd: Tensor, n_iter: int = 8
+    xd: Tensor,
+    yd: Tensor,
+    zd: Tensor,
+    n_iter: int = 8,
+    voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Approximate inverse of a displacement field by fixed-point iteration.
 
@@ -319,22 +334,25 @@ def invert_displacement_field(
     """
     nz, ny, nx = xd.shape
     device = xd.device
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
+    if voxel_grid is None:
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(nz, dtype=torch.float32, device=device),
+            torch.arange(ny, dtype=torch.float32, device=device),
+            torch.arange(nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+    else:
+        kk, jj, ii = voxel_grid
     ex = -xd
     ey = -yd
     ez = -zd
+    field = torch.stack([xd, yd, zd], dim=0)
     for _ in range(n_iter):
         sx = (ii + ex).reshape(-1)
         sy = (jj + ey).reshape(-1)
         sz = (kk + ez).reshape(-1)
-        dx = trilinear_interpolate(xd, sx, sy, sz).reshape(nz, ny, nx)
-        dy = trilinear_interpolate(yd, sx, sy, sz).reshape(nz, ny, nx)
-        dz = trilinear_interpolate(zd, sx, sy, sz).reshape(nz, ny, nx)
+        sampled = trilinear_interpolate_multi(field, sx, sy, sz).T.reshape(3, nz, ny, nx)
+        dx, dy, dz = sampled.unbind(0)
         ex = -dx
         ey = -dy
         ez = -dz
@@ -431,6 +449,13 @@ def _syn_level(
     (fxd, fyd, fzd), (ifxd, ifyd, ifzd), (mxd, myd, mzd), (imxd, imyd, imzd) = fields
     flags = config.warp_flags
     window = config.convergence_window
+    nz, ny, nx = fixed.shape
+    voxel_grid = torch.meshgrid(
+        torch.arange(nz, dtype=fixed.dtype, device=fixed.device),
+        torch.arange(ny, dtype=fixed.dtype, device=fixed.device),
+        torch.arange(nx, dtype=fixed.dtype, device=fixed.device),
+        indexing="ij",
+    )
 
     def _snapshot() -> tuple[Field, Field, Field, Field]:
         return (
@@ -453,8 +478,8 @@ def _syn_level(
         leaves = [t.detach().requires_grad_(True) for t in (fxd, fyd, fzd, mxd, myd, mzd)]
         lf, lm = leaves[:3], leaves[3:]
 
-        fmid = _warp_diff(fixed, lf[0], lf[1], lf[2])
-        mmid = _warp_diff(moving, lm[0], lm[1], lm[2])
+        fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
+        mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
         cost = _metric_cost(fmid, mmid, weight, config)
         cost_val = cost.item()
         costs.append(cost_val)
@@ -509,10 +534,10 @@ def _syn_level(
             mxd, myd, mzd = _apply_axis_flags(mxd, myd, mzd, flags)
 
         # Re-derive inverses, then re-derive forwards from them (symmetrize).
-        ifxd, ifyd, ifzd = invert_displacement_field(fxd, fyd, fzd, config.invert_iters)
-        fxd, fyd, fzd = invert_displacement_field(ifxd, ifyd, ifzd, config.invert_iters)
-        imxd, imyd, imzd = invert_displacement_field(mxd, myd, mzd, config.invert_iters)
-        mxd, myd, mzd = invert_displacement_field(imxd, imyd, imzd, config.invert_iters)
+        ifxd, ifyd, ifzd = invert_displacement_field(fxd, fyd, fzd, config.invert_iters, voxel_grid)
+        fxd, fyd, fzd = invert_displacement_field(ifxd, ifyd, ifzd, config.invert_iters, voxel_grid)
+        imxd, imyd, imzd = invert_displacement_field(mxd, myd, mzd, config.invert_iters, voxel_grid)
+        mxd, myd, mzd = invert_displacement_field(imxd, imyd, imzd, config.invert_iters, voxel_grid)
 
     if bar is not None:
         bar.close()
@@ -609,6 +634,12 @@ def formwarp(
     fixed = fixed.float().to(device)
     moving = moving.float().to(device)
     full_shape = tuple(fixed.shape)  # type: ignore[assignment]
+    predicted, available = plan_nonlinear_memory(full_shape, device, "formwarp")
+    if predicted > available and config.verb >= 1:
+        print(
+            f"WARNING: estimated SyN peak {predicted / 2**30:.1f} GiB exceeds "
+            f"the {available / 2**30:.1f} GiB safe memory budget; use stronger shrink factors."
+        )
 
     # Non-finite voxels have to go before the metric ever sees them. NaN survives the
     # CC box filter and every other smoothing here, spreading to the whole window, so

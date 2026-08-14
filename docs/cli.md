@@ -7,6 +7,10 @@ Conventions used below:
 - Required arguments are listed in the minimum-example commands.
 - Flags use the AFNI-style single-dash convention (e.g. `-prefix`), matching the tools themselves.
 - All tools accept `-device {cuda,mps,cpu}` and `-verb {0,1,2}` (or the aliases `-quiet` / `-verbose`). These are omitted from the per-tool notes unless behaviour differs.
+- On Apple Silicon, `ffs_formwarp` and `ffs_qwarp` resolve `-device auto` to CPU because
+  PyTorch's 3-D grid-sample backward currently falls back from MPS to CPU. Explicit
+  `-device mps` remains available. `ffs_optiwarp` is forward-only and can benefit from
+  MPS, particularly with its LK and Horn–Schunck force models.
 - `-prefix` (or `-output`) is the output path; many tools write multiple files derived from this prefix.
 
 ---

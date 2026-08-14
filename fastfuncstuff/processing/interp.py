@@ -118,6 +118,7 @@ def warp_image_linear(
     warp_yd: Tensor,
     warp_zd: Tensor,
     mask: Tensor | None = None,
+    voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> Tensor:
     """Apply a displacement warp to a source image using trilinear interpolation.
 
@@ -128,12 +129,15 @@ def warp_image_linear(
     src_nz, src_ny, src_nx = source.shape
     device = source.device
 
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(out_nz, dtype=torch.float32, device=device),
-        torch.arange(out_ny, dtype=torch.float32, device=device),
-        torch.arange(out_nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
+    if voxel_grid is None:
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(out_nz, dtype=torch.float32, device=device),
+            torch.arange(out_ny, dtype=torch.float32, device=device),
+            torch.arange(out_nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+    else:
+        kk, jj, ii = voxel_grid
 
     x_coords = ii + warp_xd
     y_coords = jj + warp_yd

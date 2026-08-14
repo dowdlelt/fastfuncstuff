@@ -32,6 +32,7 @@ import torch
 from torch import Tensor
 
 from .._compile import safe_compile
+from ..memory import plan_nonlinear_memory
 
 try:
     from tqdm import tqdm as _tqdm
@@ -398,6 +399,12 @@ def qwarp(
         source_p = source
 
     nz, ny, nx = base_p.shape
+    predicted, available = plan_nonlinear_memory((nz, ny, nx), device, "qwarp")
+    if predicted > available and config.verb >= 1:
+        print(
+            f"WARNING: estimated qwarp peak {predicted / 2**30:.1f} GiB exceeds "
+            f"the {available / 2**30:.1f} GiB safe memory budget; enable the pyramid or use CPU."
+        )
 
     if weight is None:
         weight_p = compute_weight_image(base_p)
@@ -871,14 +878,14 @@ def _warpomatic(
     if config.start_level == 0:
         first_cost = state.cost
 
-        # Level 0: progressive basis complexity. On CUDA the single global
-        # patch runs through the GPU-resident batched optimizer (B=1) -- this
-        # is the big win, since the serial Powell path syncs to the host on
-        # every cost evaluation and used to dominate the whole runtime.
+        # Level 0: progressive basis complexity. CUDA and CPU use the resident
+        # batched optimizer (B=1), avoiding SciPy/Powell's repeated tensor↔NumPy
+        # boundary. MPS stays serial because 3-D grid-sample backward currently
+        # falls to CPU and makes the autograd path substantially slower.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
-        use_gpu_lev0 = device.type == "cuda"
+        use_batched_lev0 = device.type != "mps"
 
-        if use_gpu_lev0:
+        if use_batched_lev0:
             lev0_patch = PatchSpec(
                 ibot=ibbb,
                 itop=ittt,
@@ -914,7 +921,7 @@ def _warpomatic(
                 print(f"lev=0 {ibbb}..{ittt} {jbbb}..{jttt} {kbbb}..{kttt}: ", end="", flush=True)
 
         for basis_type in pbar:
-            if use_gpu_lev0:
+            if use_batched_lev0:
                 basis0, half_widths0, param_max0 = _get_basis_config(
                     basis_type,
                     nxh0,
@@ -979,7 +986,7 @@ def _warpomatic(
 
         # The batched path doesn't set state.cost (only the serial path does),
         # so recompute the global cost for an accurate level-0 readout.
-        if use_gpu_lev0:
+        if use_batched_lev0:
             with torch.no_grad():
                 state.cost = _global_correlation(
                     base, state.warped_source, weight, base_clip, source_clip
@@ -2399,6 +2406,12 @@ def qwarp_batch(
         base_p = base
         sources_p = sources
     nz, ny, nx = base_p.shape
+    predicted, available = plan_nonlinear_memory((nz, ny, nx), device, "qwarp", n_sources=N)
+    if predicted > available and config.verb >= 1:
+        print(
+            f"WARNING: estimated batched qwarp peak {predicted / 2**30:.1f} GiB exceeds "
+            f"the {available / 2**30:.1f} GiB safe memory budget; reduce the source batch."
+        )
 
     if weight is None:
         weight_p = compute_weight_image(base_p)

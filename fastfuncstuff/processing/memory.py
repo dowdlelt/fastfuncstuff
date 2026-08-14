@@ -6,6 +6,8 @@ chunking strategies for 4D datasets.
 
 from __future__ import annotations
 
+from fastfuncstuff.memory import estimate_nonlinear_memory_bytes
+
 
 def estimate_gpu_memory_bytes(
     nx: int,
@@ -63,7 +65,8 @@ def estimate_gpu_memory_bytes(
     # PyTorch overhead (CUDA context, allocator fragmentation, etc.)
     usage["pytorch_overhead"] = 300 * 1024 * 1024  # ~300 MB
 
-    usage["total"] = sum(usage.values())
+    # Compatibility breakdown; the authoritative total lives in memory.py.
+    usage["total"] = estimate_nonlinear_memory_bytes((nz, ny, nx), "qwarp")
     return usage
 
 
