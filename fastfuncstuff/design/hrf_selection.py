@@ -739,7 +739,21 @@ def fit_glm_hrf_library_with_xval(
     _active_idx = None
     if _n_zero > 0:
         _active_idx = _nonzero.nonzero(as_tuple=True)[0]
+        # final_fit_data has to be subset with the same index: hrf_index and every
+        # padded output are in active-voxel space, so a full-length refit both
+        # misaligns the per-voxel HRF assignment and blows up in _pad_to_full.
+        # Skipping the copy when it is the same tensor matters — this data is GBs.
+        _final_is_data = final_fit_data is data
         data = data[_active_idx]
+        if _final_is_data:
+            final_fit_data = data
+        elif final_fit_data is not None:
+            if final_fit_data.shape[0] != _n_voxels_orig:
+                raise ValueError(
+                    f"final_fit_data has {final_fit_data.shape[0]} voxels but data has "
+                    f"{_n_voxels_orig}; both must describe the same voxel set."
+                )
+            final_fit_data = final_fit_data[_active_idx.to(final_fit_data.device)]
         if verbose:
             print(
                 f"  Zero-variance voxels skipped: {_n_zero:,}/{_n_voxels_orig:,} "

@@ -1060,3 +1060,60 @@ class TestHRFSelectionFullPipeline:
                 f"Selected HRF should beat canonical for >=50% of high-SNR voxels, "
                 f"got {frac_better:.1%}"
             )
+
+
+class TestZeroVarianceVoxelHandling:
+    """Background voxels are dropped before fitting and padded back afterwards.
+
+    ffs_hrfopt always passes ``final_fit_data`` (it is the unblurred copy under
+    -cv_blur, and the same tensor otherwise). That argument was not being subset
+    with the rest, so any unmasked run — where background voxels exist — refit at
+    full length against an active-length ``hrf_index`` and then crashed padding
+    the results back out.
+    """
+
+    @pytest.mark.parametrize("separate_final_data", [False, True])
+    def test_padding_survives_final_fit_data(self, separate_final_data):
+        data, onsets, hrf_library, run_starts, n_tp, tr = _build_hrf_test_inputs(n_voxels=20)
+        data[5:10] = 0.0  # background: no signal at all
+
+        final_fit_data = data.clone() if separate_final_data else data
+
+        results = fit_glm_hrf_library_with_xval(
+            data=data,
+            final_fit_data=final_fit_data,
+            onsets=onsets,
+            hrf_library=hrf_library,
+            tr=tr,
+            run_starts=run_starts,
+            polort=1,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+
+        assert results.hrf_index.shape[0] == 20
+        assert results.final_results is not None
+        assert results.final_results.betas.shape[0] == 20
+        # Dropped voxels come back as zeros, not as some other voxel's betas.
+        assert torch.all(results.final_results.betas[5:10] == 0)
+        assert torch.all(results.xval_r2_best[5:10] == 0)
+        assert results.hrf_metadata["n_zero_voxels"] == 5
+        assert results.hrf_metadata["n_active_voxels"] == 15
+
+    def test_mismatched_final_fit_data_is_rejected(self):
+        """A final_fit_data over a different voxel set would silently misassign HRFs."""
+        data, onsets, hrf_library, run_starts, n_tp, tr = _build_hrf_test_inputs(n_voxels=20)
+        data[5:10] = 0.0
+
+        with pytest.raises(ValueError, match="same voxel set"):
+            fit_glm_hrf_library_with_xval(
+                data=data,
+                final_fit_data=data[:15].clone(),
+                onsets=onsets,
+                hrf_library=hrf_library,
+                tr=tr,
+                run_starts=run_starts,
+                polort=1,
+                device=torch.device("cpu"),
+                verbose=False,
+            )
