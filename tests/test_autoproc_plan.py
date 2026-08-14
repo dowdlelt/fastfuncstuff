@@ -119,7 +119,8 @@ def test_multi_fmap_xfmap_stage_and_runmean():
 
     script = write_script(plan, "wd", bids_root="/bids")
     assert "stage05: cross-fmap" in script
-    assert "stage04.blip.ses-SM.fmap-floc_mean" in script  # xfmap aligns to ref-fmap mean
+    # xfmap aligns to the ref group's FORWARD image, not the pair mean.
+    assert "stage04.blip.ses-SM.fmap-floc_unwarped.nii$FMT[0]" in script
     assert "stage07.runmean." in script  # run means feed the session mean
 
 
@@ -214,7 +215,7 @@ def test_reference_levels_get_a_role_ref_qc_copy():
     # the real, aligned one (batched); tagged with the lane that estimated it.
     assert '-prefix \\"stage08.xses.ses-02.src-max_lin.nii$FMT\\"' in s
     # xfmap: same for the reference fieldmap group.
-    assert 'cp -f "stage04.blip.ses-01.fmap-a_mean.nii$FMT" ' in s
+    assert '-input "stage04.blip.ses-01.fmap-a_unwarped.nii$FMT[0]"' in s
     assert '"stage05.xfmap.ses-01.fmap-a.role-ref_lin.nii$FMT"' in s
     # A reference has no nonlinear counterpart, by definition.
     assert "role-ref_nl" not in s
@@ -518,12 +519,12 @@ def test_anat_source_defaults_to_grandmean_without_sbrefs():
 
 def test_anat_source_ref_fmap_uses_the_reference_blip_mean():
     """-anat_source ref_fmap aligns the anat to the image that DEFINES the space
-    (the reference group's undistorted mean) instead of the grandmean."""
+    (the reference group's undistorted forward image) instead of the grandmean."""
     plan = build_plan(
         _two_fmap_subject(), Options(go_to_anat=True, fmap_ref=["floc"], anat_source="ref_fmap")
     )
     s = write_script(plan, "wd", bids_root="/bids")
-    assert '-source "stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
+    assert '-source "stage04.blip.ses-SM.fmap-floc_unwarped.nii$FMT[0]"' in s
     assert '-source "stage08.grandmean.nii$FMT"' not in s
     # The grandmean is still built (QC + xses/xref inputs) — only the anat moved.
     assert '-prefix "stage08.grandmean.nii$FMT"' in s
@@ -536,8 +537,8 @@ def test_anat_source_mean_fmap_averages_the_aligned_group_means():
     s = write_script(plan, "wd", bids_root="/bids")
     fm = "stage05.fmapmean.ses-SM.nii$FMT"
     assert f'-prefix "{fm}"' in s
-    # Averaged: reference group's own blip mean + the non-ref group's ALIGNED mean.
-    assert '"stage04.blip.ses-SM.fmap-floc_mean.nii$FMT"' in s
+    # Averaged: ref group's own forward image + the non-ref group's ALIGNED one.
+    assert '"stage04.blip.ses-SM.fmap-floc_unwarped.nii$FMT[0]"' in s
     assert '"stage05.xfmap.ses-SM.fmap-prim_lin.nii$FMT"' in s
     assert f'-source "{fm}"' in s  # and it is what the anat aligns
     # Built after the xfmap alignment that puts the groups in one space.
@@ -575,7 +576,7 @@ def test_anat_source_mean_fmap_degenerates_to_ref_fmap_with_one_group():
     assert effective_anat_source(plan) == "ref_fmap"
     s = write_script(plan, "wd", bids_root="/bids")
     assert "stage05.fmapmean" not in s
-    assert '-source "stage04.blip.ses-01.fmap-only_mean.nii$FMT"' in s
+    assert '-source "stage04.blip.ses-01.fmap-only_unwarped.nii$FMT[0]"' in s
 
 
 def test_anat_source_does_not_change_the_warp_chain():
@@ -1158,7 +1159,7 @@ def test_unclaimed_run_inherits_the_session_reference_fieldmap():
     s = write_script(plan, "wd", bids_root="/bids")
     # Both runs land on the ONE grid the session averages in.
     grids = set(re.findall(r'REFGRID\[[^\]]+\]="([^"]*)"', s))
-    assert grids == {"stage04.blip.ses-01.fmap-PA_mean.nii$FMT"}
+    assert grids == {"stage04.blip.ses-01.fmap-PA_unwarped.nii$FMT[0]"}
     assert "inherited fmap" in s  # and the guess is stated in the header
 
 
@@ -1174,8 +1175,8 @@ def test_unclaimed_run_with_the_wrong_pe_still_lands_on_the_common_grid():
     assert "blip_half" not in flipped.warp_chain
     assert flipped.ref_fmap_id == "PA"  # ...but still on the session's grid
     s = write_script(plan, "wd", bids_root="/bids")
-    assert 'XRUNBASE[01:t:2]="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
-    assert 'REFGRID[01:t:2]="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
+    assert 'XRUNBASE[01:t:2]="stage04.blip.ses-01.fmap-PA_unwarped.nii$FMT[0]"' in s
+    assert 'REFGRID[01:t:2]="stage04.blip.ses-01.fmap-PA_unwarped.nii$FMT[0]"' in s
 
 
 def test_unknown_ref_ses_is_an_error_not_a_silent_first_session():
@@ -1225,8 +1226,8 @@ def test_ref_image_picks_the_cross_session_representative_per_session():
         bids_root="/bids",
     )
     # base and source are each session's own reference fieldmap, undistorted.
-    assert 'REFGM="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s
-    assert '-source \\"stage04.blip.ses-02.fmap-PB_mean.nii$FMT\\"' in s
+    assert 'REFGM="stage04.blip.ses-01.fmap-PA_unwarped.nii$FMT[0]"' in s
+    assert '-source \\"stage04.blip.ses-02.fmap-PB_unwarped.nii$FMT[0]\\"' in s
     # A session with no fieldmap degrades to its own mean, on its own.
     subj.sessions[1].fmaps = []
     s2 = write_script(
@@ -1234,7 +1235,7 @@ def test_ref_image_picks_the_cross_session_representative_per_session():
         "wd",
         bids_root="/bids",
     )
-    assert 'REFGM="stage04.blip.ses-01.fmap-PA_mean.nii$FMT"' in s2
+    assert 'REFGM="stage04.blip.ses-01.fmap-PA_unwarped.nii$FMT[0]"' in s2
     assert '-source \\"stage07.sesmean.ses-02.src-max.nii$FMT\\"' in s2
 
 
@@ -1342,7 +1343,7 @@ def test_qc_stacks_group_the_images_a_stage_claims_to_have_aligned():
     # cross-fmap: the reference group's own mean, then each aligned group.
     xf = qc["stage05.QC.xfmap.ses-01_lin.nii.gz"]
     assert xf == [
-        "stage04.blip.ses-01.fmap-A_mean.nii$FMT",
+        "stage04.blip.ses-01.fmap-A_unwarped.nii$FMT[0]",
         "stage05.xfmap.ses-01.fmap-B_lin.nii$FMT",
     ]
     assert _qc_labels(s, "stage05.QC.xfmap.ses-01_lin.nii.gz") == ["ref:fmap-A", "fmap-B"]
@@ -1462,6 +1463,11 @@ def test_b0_fmap_emits_b0fmap_and_its_own_undistorted_mean():
     # agrees with the runmeans about intensity where distortion was worst.
     assert 'stage04.blip.ses-01.fmap-b0_mean.nii$FMT"' in s
     assert "-jac j" in s
+    # A GRE group has no pair to average, so that mean IS its forward image: the
+    # pepolar '_unwarped[0]' target must not be used as a transform target here
+    # (the b0 branch's own '_unwarped' is a scratch file it deletes).
+    assert "fmap-b0_unwarped.nii$FMT[0]" not in s
+    assert 'REFGRID[01:foo:2]="stage04.blip.ses-01.fmap-b0_mean.nii$FMT"' in s
     for run in ("1", "2"):
         assert "blip_half" in _chain(plan, ("01", "foo", run))
 

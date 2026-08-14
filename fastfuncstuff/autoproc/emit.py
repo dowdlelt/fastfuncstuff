@@ -297,10 +297,44 @@ def _jac_spec(pr: PlanRun) -> str:
     return f"{axis}:{_fmap_stem(pr, 'blip')}_warp.nii$FMT"
 
 
-def _ref_blip_mean(pr: PlanRun) -> str:
-    """The reference fmap group's undistorted mean — the common grid the runmeans
-    (and cross-fmap alignment) land on."""
-    return stem(NameKey("blip", session=pr.bold.session, fmap=pr.ref_fmap_id)) + "_mean.nii$FMT"
+def _blip_forward(blip_stem: str, is_b0: bool) -> str:
+    """A fieldmap group's undistorted FORWARD image — the space its runs land in,
+    and therefore the target every transform of data is estimated against.
+
+    For a pepolar pair that is sub-brick 0 of ``_unwarped`` (the corrected blip-up
+    image), NOT the ``_mean``. The mean averages the corrected up and down images,
+    and no data ever occupies it: a run's chain ends at the corrected *forward*
+    space. Averaging also cancels half of each side's residual distortion, so two
+    groups' means agree with each other far better than the images the transform
+    actually has to serve — which made the mean a flattering, and wrong, target
+    (measured on sub-3001: cross-group corrected-up agreement 0.906 for the
+    mean-estimated rigid+nonlinear transform vs 0.927 for a rigid fit estimated
+    on the forward images themselves).
+
+    A GRE group has no pair to average: its ``_mean`` is one warped run rep, i.e.
+    already the forward image, so that is what it returns.
+    """
+    return f"{blip_stem}_mean.nii$FMT" if is_b0 else f"{blip_stem}_unwarped.nii$FMT[0]"
+
+
+def _fmap_forward(pr: PlanRun) -> str:
+    """This run's OWN fmap group's undistorted forward image (xfmap source)."""
+    assert pr.fmap is not None
+    return _blip_forward(_fmap_stem(pr, "blip"), pr.fmap.is_b0)
+
+
+def _ref_blip_forward(pr: PlanRun) -> str:
+    """The reference fmap group's undistorted forward image — the image that
+    defines the common space the runmeans (and cross-fmap alignment) land on."""
+    return _blip_forward(
+        stem(NameKey("blip", session=pr.bold.session, fmap=pr.ref_fmap_id)), pr.ref_fmap_is_b0
+    )
+
+
+def _shell_path(path: str) -> str:
+    """``path`` with any AFNI sub-brick selector stripped — what a shell ``[ -f ]``
+    or ``cp`` needs, since only the tools parse ``file.nii[0]``."""
+    return path.split("[", 1)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +433,8 @@ def _run_level_var(lane: str) -> str:
 def _common_grid(pr: PlanRun, session_first: PlanRun, lane: str) -> str:
     """The grid this run's runmean lands on — the space its session averages in.
 
-    In a session with fieldmaps that is the reference fmap's undistorted mean, for
+    In a session with fieldmaps that is the reference fmap's undistorted forward
+    image (see :func:`_blip_forward`), for
     EVERY run of the session: a run with no fieldmap of its own still has to land
     there, or its runmean sits on a different grid from its siblings' and the
     session mean is averaging incompatible images (bug of record). Without
@@ -408,7 +443,7 @@ def _common_grid(pr: PlanRun, session_first: PlanRun, lane: str) -> str:
     grid however many lineages ride it.
     """
     if pr.ref_fmap_id is not None:
-        return _ref_blip_mean(pr)
+        return _ref_blip_forward(pr)
     return _run_level(session_first, lane)
 
 
@@ -439,6 +474,14 @@ def _ref_marker(key: NameKey, source: str, note: str) -> str:
     the reader expects N. Carries ``_lin`` like the images it stands in for (the
     identity is a linear transform); has no ``_nl`` counterpart, by definition."""
     dst = stem(key) + "_lin.nii$FMT"
+    if "[" in source:
+        # Only the tools parse a sub-brick selector, so the extraction has to be a
+        # tool call — cp would look for a file with brackets in its name.
+        copy = _ffs(
+            "ffs_util_3dmath",
+            [f'-input "{source}"', "-tcat", f'-prefix "{dst}"', '-device "$DEVICE"'],
+        )
+        return f'# {note}\nif [ ! -f "{dst}" ]; then\n{copy}\nfi'
     return f'# {note}\n[ -f "{dst}" ] || cp -f "{source}" "{dst}"'
 
 
@@ -461,18 +504,25 @@ def _anchor_session(plan: Plan) -> str | None:
     return anchor.bold.session if anchor else None
 
 
-def _session_ref_fmap_mean(plan: Plan, session: str | None) -> str:
-    """That session's reference fieldmap's undistorted mean — the image that
-    DEFINES its common grid."""
+def _session_ref_fmap_image(plan: Plan, session: str | None) -> str:
+    """That session's reference fieldmap's undistorted forward image — the image
+    that DEFINES its common grid (see :func:`_blip_forward`)."""
     ids = session_fmap_ids(plan, session)
-    return stem(NameKey("blip", session=session, fmap=ids[0] if ids else None)) + "_mean.nii$FMT"
+    fid = ids[0] if ids else None
+    is_b0 = any(
+        pr.fmap is not None and pr.fmap.fmap_id == fid and pr.fmap.is_b0
+        for pr in plan.runs
+        if pr.bold.session == session
+    )
+    return _blip_forward(stem(NameKey("blip", session=session, fmap=fid)), is_b0)
 
 
 def _fmapmean_inputs(plan: Plan, session: str | None) -> list[str]:
-    """The per-group means averaged into one session's ``mean_fmap``, all already
-    on that session's reference-fmap grid: the reference group's own blip mean,
-    plus each non-ref group's xfmap-aligned mean (nonlinear result when
-    ``-xfmap_nonlin`` ran)."""
+    """The per-group images averaged into one session's ``mean_fmap``, all already
+    on that session's reference-fmap grid: the reference group's own forward image,
+    plus each non-ref group's xfmap-aligned forward image (nonlinear result when
+    ``-xfmap_nonlin`` ran). One lineage throughout — mixing a pair *mean* into an
+    average of forward images would blur the composite with a different contrast."""
     ids = session_fmap_ids(plan, session)
     if not ids:
         return []
@@ -480,7 +530,7 @@ def _fmapmean_inputs(plan: Plan, session: str | None) -> list[str]:
     files = []
     for fid in ids:
         if fid == ids[0]:  # session_fmap_ids puts the reference group first
-            files.append(stem(NameKey("blip", session=session, fmap=fid)) + "_mean.nii$FMT")
+            files.append(_session_ref_fmap_image(plan, session))
         else:
             st = stem(NameKey("xfmap", session=session, fmap=fid))
             files.append(f"{st}_nl.nii$FMT" if nl else f"{st}_lin.nii$FMT")
@@ -517,7 +567,7 @@ def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
                  interpolation instead of two, single-band contrast, no multiband
                  slice-leakage — the best cross-modal ``lpc`` source there is when
                  SBRefs exist, and unlike ref_fmap it uses ALL the data.
-      ref_fmap   the reference group's undistorted blip mean; one interpolation,
+      ref_fmap   the reference group's undistorted forward image; one interpolation,
                  sharpest, SBRef contrast — the image that *defines* the space.
       mean_fmap  ref_fmap averaged with the other groups' xfmap-aligned means;
                  ref_fmap's provenance with more SNR (multi-fieldmap only).
@@ -528,7 +578,7 @@ def _anat_source_image(plan: Plan, requested: str | None = None) -> str:
     if mode == "ref_fmap":
         anchor = ref_anchor(plan)
         if anchor is not None:
-            return _ref_blip_mean(anchor)
+            return _ref_blip_forward(anchor)
     elif mode == "mean_fmap":
         return _fmapmean(plan, _anchor_session(plan))
     return _grandmean()
@@ -544,7 +594,7 @@ def _ref_image_file(plan: Plan, session: str | None, lane: str) -> str:
     """
     mode = session_ref_mode(plan, session)
     if mode == "ref_fmap":
-        return _session_ref_fmap_mean(plan, session)
+        return _session_ref_fmap_image(plan, session)
     if mode == "mean_fmap":
         return _fmapmean(plan, session)
     if mode == "sbmean":
@@ -648,7 +698,8 @@ qc_tcat() {
   [ "$skip_qc" -eq 1 ] && [ -f "$out" ] && return 0
   local f
   for f in "$@"; do
-    [ -f "$f" ] || { echo "  QC skip $(basename "$out"): missing $f"; return 0; }
+    # ${f%%[*} drops any sub-brick selector: only the tools parse "file.nii[0]".
+    [ -f "${f%%[*}" ] || { echo "  QC skip $(basename "$out"): missing $f"; return 0; }
   done
   # $labs is deliberately unquoted: it is a space-separated label list.
   ffs_util_3dmath -input "$@" -tcat -labels $labs \\
@@ -687,7 +738,7 @@ def _xrun_base(pr: PlanRun, session_first: PlanRun, lane: str = LANE_MEAN) -> st
     the fieldmap path has always had an SBRef base; what the lane changes is the
     *source* it is matched against.
     Fieldmap session, run with no usable fieldmap (PE direction rules the
-    reference field out): the reference group's UNdistorted mean. Its chain has no
+    reference field out): the reference group's UNdistorted forward image. Its chain has no
     blip_half, so this is the one base that still lands it on the session's common
     grid — cross-contrast (distorted source, undistorted base) but in the right
     space, which beats being correctly registered to the wrong one.
@@ -698,7 +749,7 @@ def _xrun_base(pr: PlanRun, session_first: PlanRun, lane: str = LANE_MEAN) -> st
     if pr.fmap is not None:
         return pr.fmap_forward
     if pr.ref_fmap_id is not None:
-        return _ref_blip_mean(pr)
+        return _ref_blip_forward(pr)
     return _run_level(session_first, lane)  # first-run anchor
 
 
@@ -733,7 +784,7 @@ def _first_by_session(plan: Plan) -> dict[str | None, PlanRun]:
 
 def _qc_xfmap(plan: Plan) -> str:
     """Per session: every fieldmap group's mean on that session's reference-fmap
-    grid. Sub-brick 0 is the reference group's own undistorted mean."""
+    grid. Sub-brick 0 is the reference group's own undistorted forward image."""
     if not _qc_on(plan):
         return ""
     calls = []
@@ -741,7 +792,7 @@ def _qc_xfmap(plan: Plan) -> str:
         ids = session_fmap_ids(plan, ses)
         if len(ids) < 2:
             continue
-        ref = (_session_ref_fmap_mean(plan, ses), f"ref:fmap-{ids[0]}")
+        ref = (_session_ref_fmap_image(plan, ses), f"ref:fmap-{ids[0]}")
         for kind in ("lin", "nl") if plan.options.xfmap_nonlin else ("lin",):
             items: QCItems = [ref]
             for fid in ids[1:]:
@@ -1425,12 +1476,14 @@ def _blip_b0(pr: PlanRun, st: str) -> str:
       is not optional for a measured field (it sets the Hz→voxel scale), so a run
       whose sidecar omits ``TotalReadoutTime`` is reported here rather than
       failing inside the tool.
-    * **An undistorted mean.** blipflip corrects its own pair and writes their
-      mean, which is what defines the session's common grid (every ``_ref_blip_mean``
-      consumer downstream). There is no EPI pair here, so we make the same image
-      the same way the final resample will: pull the run's rep through the warp
-      with the Jacobian, which is what keeps this image and the runmeans agreeing
-      about intensity where distortion was worst (see :func:`_jac_spec`).
+    * **An undistorted forward image.** blipflip corrects its own pair and writes
+      both corrected images; sub-brick 0 of those, the corrected blip-up, defines
+      the session's common space (every ``_ref_blip_forward`` consumer downstream).
+      There is no EPI pair here, so we make the equivalent image the same way the
+      final resample will: pull the run's rep through the warp with the Jacobian,
+      which is what keeps this image and the runmeans agreeing about intensity
+      where distortion was worst (see :func:`_jac_spec`). That single warped rep IS
+      the forward image, so it is written as ``_mean`` and used directly.
     """
     fmap = pr.fmap
     assert fmap is not None
@@ -1518,8 +1571,8 @@ def _n_volumes(path: str) -> int:
 
 
 def _stage_xfmap(plan: Plan, script_stem: str) -> str:
-    """Align each NON-reference fmap group's undistorted mean to the session's
-    reference fmap mean (once per group). This is what lets runs acquired under
+    """Align each NON-reference fmap group's undistorted forward image to the
+    session's reference fmap forward image (once per group). This is what lets runs acquired under
     different fieldmaps share one session space; the per-run runmean composes it
     with blip+xrun (see stage07)."""
     opt = plan.options
@@ -1534,13 +1587,13 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
     out = ["", "# ============================ stage05: cross-fmap alignment ================="]
     out.append("echo '== stage05: cross-fmap alignment (→ reference fmap) =='")
     # The reference fmap group has no xfmap transform (it maps to itself) — emit its
-    # undistorted mean under the xfmap name so every group shows up in one listing.
+    # forward image under the xfmap name so every group shows up in one listing.
     anchor = ref_anchor(plan)
     if anchor is not None and anchor.fmap is not None:
         out.append(
             _ref_marker(
                 NameKey("xfmap", session=anchor.bold.session, fmap=anchor.fmap.fmap_id, role="ref"),
-                _ref_blip_mean(anchor),
+                _ref_blip_forward(anchor),
                 f"QC: fmap-{anchor.fmap.fmap_id} is the reference group — no transform.",
             )
         )
@@ -1551,8 +1604,8 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
             out.append(f'fwbatch="{script_stem}_xfmapnlbatch.txt"; : > "$fwbatch"')
     for pr in groups.values():
         xstem = _fmap_stem(pr, "xfmap")
-        src = _fmap_stem(pr, "blip") + "_mean.nii$FMT"  # this fmap, undistorted
-        base = _ref_blip_mean(pr)  # reference fmap, undistorted
+        src = _fmap_forward(pr)  # this fmap, undistorted forward image
+        base = _ref_blip_forward(pr)  # reference fmap, same
         out.append(
             _manifest_line(
                 "albatch",

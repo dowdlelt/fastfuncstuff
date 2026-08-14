@@ -190,6 +190,10 @@ class PlanRun:
     # (bug of record: an unclaimed run aligned to the session's first run instead,
     # so its runmean sat on a different grid AND was never undistorted).
     ref_fmap_id: str | None = None
+    # Kind of that reference group, which decides which stage04 output is its
+    # forward image: a pepolar pair's is sub-brick 0 of ``_unwarped``, a GRE
+    # group's is its ``_mean`` (one warped run rep — there is no pair to average).
+    ref_fmap_is_b0: bool = False
     # This run was not claimed by any fieldmap's IntendedFor / acquisition time and
     # inherited the session's reference group. Header-note only.
     fmap_inherited: bool = False
@@ -562,6 +566,7 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
                 # Every run of a fieldmap session shares the session's common grid,
                 # whether or not it has a fieldmap of its own.
                 ref_fmap_id=(ref_fmap_id if has_fmaps else None),
+                ref_fmap_is_b0=(has_fmaps and ref_fmap is not None and ref_fmap.is_b0),
                 fmap_inherited=inherited,
                 # Only ``-moco_ref sbref`` makes the SBRef the post-moco space; any
                 # other base leaves it an unregistered image with no transform of
