@@ -304,13 +304,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "[default: off]",
     )
     g_reg.add_argument(
-        "-keep_worse_levels",
+        "-early_stop",
+        "-early-stop",
         action="store_true",
-        help="Run every refinement level even if it worsens the global "
-        "cost (AFNI-style). By default ffs_qwarp rolls back and stops "
-        "when a level degrades the fit -- the finest levels over-warp "
-        "first, so this both improves the result and skips the most "
-        "expensive, counterproductive level.",
+        help="Roll back and stop as soon as a refinement level worsens "
+        "the global cost. By default ffs_qwarp runs every level "
+        "(AFNI-style) even if one degrades the fit; with this flag the "
+        "most expensive, sometimes counterproductive finest levels are "
+        "skipped [default: off]",
     )
     g_reg.add_argument(
         "-nopad",
@@ -1520,7 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
         level_stop_tol=args.level_stop,
         compile=args.compile,
         pyramid_factor=args.pyramid,
-        reject_worse_levels=not args.keep_worse_levels,
+        reject_worse_levels=args.early_stop,
         interp=args.interp,
         final_interp=args.final,
     )
