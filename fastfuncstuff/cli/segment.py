@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import setup_device, spinner
+from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
@@ -693,7 +693,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Safe margin around the head: dilate the automask by this many voxels before "
         "cropping/masking, so the crop never clips real anatomy (default 4).",
     )
-    other.add_argument("-device", default=None, help="cuda | cpu (default: cuda if available)")
+    add_device_arg(
+        other,
+        extra="Use CPU on Mac: required float64 geometry and 3-D backward operations are unsupported on MPS.",
+    )
     other.add_argument(
         "-fit_dtype",
         default="float32",
@@ -715,7 +718,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    device = setup_device(args.device)
+    device_spec = args.device
+    if (
+        device_spec is None or str(device_spec).lower() == "auto"
+    ) and not torch.cuda.is_available():
+        device_spec = "cpu"
+    device = setup_device(device_spec)
+    if device.type == "mps":
+        raise SystemExit(
+            "ffs_segment: MPS cannot run the required float64 geometry and 3-D backward path; "
+            "use -device cpu on Mac."
+        )
     verbose = not args.quiet
     if verbose:
         print(f"ffs_segment on {device}: {args.input}")

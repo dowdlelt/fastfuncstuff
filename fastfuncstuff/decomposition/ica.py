@@ -262,11 +262,13 @@ class FastICA:
         self.components_ = W @ pca_components
 
         # Step 4: Compute mixing matrix (ICA timecourses)
-        # MELODIC: timecourses = dewhite @ pinv(W)
+        # MELODIC: timecourses = dewhite @ pinv(W). Symmetric FastICA keeps W
+        # orthogonal at every update, so pinv(W) == W.T; using the identity avoids
+        # a small SVD (and its MPS->CPU fallback) without changing the result.
         # Using dewhite (not X_pca) avoids sqrt(V) scale accumulation
         # from the dot product over V voxels in X_pca = X @ pca_comp.T.
         # Slice to n_components when ICA uses fewer than all PCA components.
-        self.mixing_ = dewhite[:, :n_components] @ torch.linalg.pinv(W)
+        self.mixing_ = dewhite[:, :n_components] @ W.T
 
         # Store PCA-like state for compatibility with transform()
         self.pca_ = _RowCenteredPCAState(

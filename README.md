@@ -83,6 +83,20 @@ Nonlinear registration has its own device profile:
 For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
 Mac unless CUDA is available. An explicit `-device mps` is still honored.
 
+Other compute-heavy tools have a mixed Apple Silicon profile:
+
+| Tool | Apple Silicon recommendation | Why |
+|---|---|---|
+| `ffs_pyrf` | MPS for whole-brain fits; CPU for small masks | Its float32 candidate GEMMs cross over in MPS's favour on large voxel sets. |
+| `ffs_nordic` | CPU | Typical complex SVD patches fall back from MPS to CPU; explicit MPS remains available for Gram-eigh-shaped workloads. |
+| `ffs_ica` | CPU | Mac CPU linear algebra wins at ordinary fMRI dimensions; CUDA remains valuable on large decompositions. |
+| `ffs_blipflip` | CPU | Stable Gauss–Newton CG uses float64 scalar reductions, which MPS cannot represent. |
+| `ffs_segment` | CPU | Required float64 geometry and 3-D interpolation backward are not supported natively on MPS. |
+
+`ffs_nordic`, `ffs_blipflip`, and `ffs_segment` therefore choose CPU for
+`-device auto` on a Mac. `ffs_nordic -device mps` is still honored; the latter two reject
+explicit MPS early with an actionable message instead of failing deep in a fit.
+
 The default `pip install torch` gives you whatever wheel pip resolves for
 your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
 CUDA, install torch *first* from the official index for your CUDA version,

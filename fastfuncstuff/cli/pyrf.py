@@ -36,6 +36,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_utils import (
+    add_device_arg,
     add_load_threads_arg,
     add_ortvec_arguments,
     add_verbose_arg,
@@ -45,9 +46,9 @@ from fastfuncstuff.cli_utils import (
     compute_run_lengths,
     get_average_run_duration,
     load_and_preprocess_runs,
-    parse_device_arg,
     parse_input_files,
     parse_prefix,
+    setup_device,
 )
 from fastfuncstuff.denoise.sequential import extract_noise_pcs_per_run
 from fastfuncstuff.design.hrf import (
@@ -84,7 +85,6 @@ from fastfuncstuff.stats.reliability import (
     spearman_correlation,
     split_half_noise_ceiling,
 )
-from fastfuncstuff.utils import configure_torch_backends
 
 _EPILOG = """
 OUTPUT
@@ -853,7 +853,7 @@ def create_parser() -> argparse.ArgumentParser:
     processing.add_argument(
         "-do-scale", "-do_scale", action="store_true", help="Scale to percent signal"
     )
-    processing.add_argument("-device", default=None, help="Compute device, e.g. cuda or cpu")
+    add_device_arg(processing, extra="MPS is available for the float32 grid and refinement paths.")
     processing.add_argument(
         "-keep-on-cpu",
         "-keep_on_cpu",
@@ -1801,8 +1801,7 @@ def main(argv: list[str] | None = None) -> int:
         if not Path(location).exists():
             parser.error(f"Stimulus source does not exist: {location}")
 
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     # The loaded region is the union of where we fit and where the noise pool may
     # come from; which of the two a loaded voxel belongs to is tracked below.
     fit_mask_flat, pool_mask_flat, load_mask_flat = _resolve_masks(args, input_files[0], parser)

@@ -39,7 +39,7 @@ from fastfuncstuff.memory import (
     nordic_llr_gpu_budget,
     plan_nordic_llr_memory,
 )
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import to_tensor
 
 # ---------------------------------------------------------------------------
 # Public dataclasses
@@ -1972,8 +1972,13 @@ def run_nordic(
 ) -> NordicOutputs:
     """Run NORDIC-style denoising matching NIFTI_NORDIC.m data flow."""
     cfg = config or NordicConfig()
+    # Typical complex patch shapes select SVD, which PyTorch sends from MPS back
+    # to CPU. Avoid paying both the fallback and transfer costs for library calls;
+    # callers can still request an explicit MPS device for tall Gram-eigh patches.
     dev = (
-        device if device is not None else get_device("cuda" if torch.cuda.is_available() else None)
+        device
+        if device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
 
     prepped = _prepare_echo(magnitude_file, phase_file, cfg, dev)
@@ -2014,7 +2019,9 @@ def run_nordic_multiecho(
     """
     cfg = config or NordicConfig()
     dev = (
-        device if device is not None else get_device("cuda" if torch.cuda.is_available() else None)
+        device
+        if device is not None
+        else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
     E = len(magnitude_files)
     if E < 2:

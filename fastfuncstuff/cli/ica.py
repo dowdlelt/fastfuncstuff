@@ -42,6 +42,7 @@ from tqdm.auto import tqdm
 # fastfuncstuff imports
 try:
     from fastfuncstuff.cli_utils import (
+        add_device_arg,
         add_verbose_arg,
         parse_input_files,
         parse_prefix,
@@ -3989,10 +3990,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     misc = parser.add_argument_group("Misc")
-    misc.add_argument(
-        "-device",
-        default=None,
-        help="PyTorch device: cuda, mps, cpu (auto-detected by default)",
+    add_device_arg(
+        misc, extra="MPS keeps bulk ICA in float32 and runs only tiny linalg islands on CPU."
     )
     misc.add_argument("-cpu", action="store_true", help="Alias for -device cpu.")
     add_verbose_arg(misc, default=0)

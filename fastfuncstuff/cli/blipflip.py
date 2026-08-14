@@ -51,7 +51,8 @@ from datetime import datetime
 import numpy as np
 import torch
 
-from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
+from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
+from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 class _HelpFormatter(
@@ -256,7 +257,10 @@ def create_parser() -> argparse.ArgumentParser:
         "no accuracy cost here (the sensitive reductions accumulate in float64 anyway); "
         "float64 reproduces the original all-double behaviour.",
     )
-    misc.add_argument("-device", default="cuda", help="Compute device (cuda/cpu/mps).")
+    add_device_arg(
+        misc,
+        extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
+    )
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
     return parser
 
@@ -333,14 +337,22 @@ def _build_config(name: str):
 
 
 def main(argv: list[str] | None = None) -> int:
-    from fastfuncstuff.cli_utils import parse_device_arg, parse_prefix
     from fastfuncstuff.processing import topup as T
     from fastfuncstuff.processing.io import save_warp_field
     from fastfuncstuff.processing.medic import PE_AXIS_MAP, invert_displacement_pe
 
     args = create_parser().parse_args(argv)
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device, tf32=REGISTRATION_TF32)
+    device_spec = args.device
+    if (
+        device_spec is None or str(device_spec).lower() == "auto"
+    ) and not torch.cuda.is_available():
+        device_spec = "cpu"
+    device = setup_device(device_spec, tf32=REGISTRATION_TF32)
+    if device.type == "mps":
+        raise SystemExit(
+            "ffs_blipflip: MPS cannot run the required float64 CG reductions; "
+            "use -device cpu on Mac."
+        )
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
 

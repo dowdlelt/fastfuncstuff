@@ -8,8 +8,15 @@ import sys
 import time
 
 import numpy as np
+import torch
 
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    print_cli_header,
+    setup_device,
+)
 from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic, run_nordic_multiecho
 from fastfuncstuff.denoise.nordic_sweep import run_nordic_factor_sweep
 
@@ -285,10 +292,9 @@ Examples:
     )
 
     perf_group = parser.add_argument_group("Performance")
-    perf_group.add_argument(
-        "-device",
-        default=None,
-        help="Device override (cuda, mps, cpu). Default: auto",
+    add_device_arg(
+        perf_group,
+        extra="MPS supports Gram-eigh patches; direct complex SVD falls back to CPU.",
     )
     perf_group.add_argument(
         "-svd-batch-size",
@@ -352,7 +358,12 @@ def main(argv: list[str] | None = None) -> None:
     prefix_info = parse_prefix(args.prefix)
     prefix = prefix_info.stem
 
-    device = setup_device(args.device)
+    device_spec = args.device
+    if (
+        device_spec is None or str(device_spec).lower() == "auto"
+    ) and not torch.cuda.is_available():
+        device_spec = "cpu"
+    device = setup_device(device_spec)
 
     print_cli_header("ffs_nordic", "NORDIC-style denoising")
     print(f"Input magnitude: {magn_files}")
