@@ -491,7 +491,7 @@ def _compute_task_alignment(model, args, device):
     """Parse -events and relate the fit to task conditions; None if no -events."""
     if not args.events:
         return None
-    from fastfuncstuff.design.bids_events import parse_bids_events
+    from fastfuncstuff.design.bids_events import check_events_pairing, parse_bids_events
     from fastfuncstuff.dynamics.task import align_states_to_task
 
     n_runs = len(model.responsibilities)
@@ -501,6 +501,10 @@ def _compute_task_alignment(model, args, device):
             "pass one events.tsv per -input run (in the same order), or a single "
             "shared TSV to broadcast across runs."
         )
+    try:
+        check_events_pairing(parse_input_files(args.input), args.events, n_runs=n_runs)
+    except ValueError as exc:
+        raise SystemExit(f"ERROR: {exc}") from exc
     all_onsets, durations, condition_labels = parse_bids_events(
         args.events,
         event_ignore=args.event_ignore,

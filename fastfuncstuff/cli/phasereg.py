@@ -946,7 +946,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Onsets: {len(onsets_per_condition)} conditions")
 
     elif args.events:
-        from fastfuncstuff.design.bids_events import parse_bids_events
+        from fastfuncstuff.design.bids_events import check_events_pairing, parse_bids_events
 
         if len(args.events) not in (1, n_runs):
             print(
@@ -955,8 +955,13 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        if len(args.events) == 1 and n_runs > 1:
-            print(f"  Broadcasting 1 events file across {n_runs} runs")
+        try:
+            check_events_pairing(
+                list(args.magnitude), args.events, n_runs=n_runs, verbose=args.verb >= 1
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
         event_cols = tuple(args.event_cols) if args.event_cols else None
         try:
             bids_onsets, bids_durations, bids_labels = parse_bids_events(

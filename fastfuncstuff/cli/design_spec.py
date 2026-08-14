@@ -26,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.cli_utils import add_ortvec_arguments
+from fastfuncstuff.design.bids_events import check_events_pairing
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     good_list_from_censor,
@@ -227,6 +228,11 @@ def _confirm_overwrite(path: Path, force: bool, kind: str) -> bool:
 def _do_stub(args: argparse.Namespace) -> int:
     bold_paths = [Path(p) for p in args.input]
     events_paths = [Path(p) for p in args.events]
+    try:
+        check_events_pairing(bold_paths, events_paths, n_runs=len(bold_paths))
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
     spec, event_notes = build_stub_spec(
         bold_paths,
         events_paths,

@@ -10,6 +10,10 @@ Public API
 parse_bids_events(event_files, event_ignore, event_cols)
     → (all_onsets, durations, condition_labels)
 
+check_events_pairing(input_files, event_files)
+    Verify the positional -input ↔ -events pairing and print it. Every CLI
+    that accepts run-paired events files calls this before parsing.
+
 sort_bids_event_files(paths)
     → list[Path] sorted by run number
 """
@@ -126,6 +130,124 @@ def verify_events_match_inputs(
                 f"   MISMATCH on {','.join(diff)}"
             )
     return problems
+
+
+def format_events_pairing(
+    input_files: list[str | Path],
+    event_files: list[str | Path],
+    *,
+    max_rows: int = 20,
+    indent: str = "  ",
+) -> list[str]:
+    """Render the positional input↔events pairing as printable lines.
+
+    Long run lists are elided in the middle: the head and tail are what a reader
+    actually scans to spot an off-by-one, and 200 lines of listing buries the
+    rest of the tool's output.
+    """
+    lines = [f"{indent}Timing pairing (events are matched to inputs by position):"]
+    n = len(input_files)
+    if n > max_rows:
+        head, tail = max_rows - 5, 5
+        shown = list(range(head)) + [-1] + list(range(n - tail, n))
+    else:
+        shown = list(range(n))
+
+    for i in shown:
+        if i < 0:
+            lines.append(f"{indent}  ... {n - max_rows} more ...")
+            continue
+        lines.append(
+            f"{indent}  [{i:>3}] {Path(input_files[i]).name}  <-  {Path(event_files[i]).name}"
+        )
+    return lines
+
+
+def _uniform_run_offset(
+    input_files: list[str | Path],
+    event_files: list[str | Path],
+) -> int | None:
+    """Return the constant run-number offset between the two lists, if there is one.
+
+    ``None`` unless *every* pair carries a run entity on both sides, no pair
+    disagrees on sub/ses/task, and all run differences are the same non-zero
+    integer. Anything else -- a permutation, a wrapped rotation, a task swap --
+    fails those conditions and stays a hard error.
+    """
+    offsets: set[int] = set()
+    for inp, ev in zip(input_files, event_files, strict=True):
+        ent_i = parse_path_entities(inp)
+        ent_e = parse_path_entities(ev)
+        if any(k in ent_i and k in ent_e and ent_i[k] != ent_e[k] for k in ("sub", "ses", "task")):
+            return None
+        if "run" not in ent_i or "run" not in ent_e:
+            return None
+        offsets.add(int(ent_e["run"]) - int(ent_i["run"]))
+    if len(offsets) != 1:
+        return None
+    offset = offsets.pop()
+    return offset or None
+
+
+def check_events_pairing(
+    input_files: list[str | Path] | None,
+    event_files: list[str | Path],
+    *,
+    n_runs: int | None = None,
+    verbose: bool = True,
+) -> None:
+    """Verify -events line up with -input, and print the pairing for eyeballing.
+
+    Every tool that pairs BIDS events with input runs goes through here, so the
+    check cannot be present in one CLI and missing in the next. Raises
+    ``ValueError`` on a mismatch; the caller prints it and exits.
+
+    The listing is printed even when the entity check passes (and even when it
+    cannot run, because the filenames carry no entities) — the check only sees
+    ``sub/ses/task/run``, so datasets that encode the run some other way still
+    need a human to glance at the pairing before a long fit starts.
+    """
+    n = n_runs if n_runs is not None else (len(input_files) if input_files else 0)
+
+    if len(event_files) == 1 and n > 1:
+        if verbose:
+            print(f"  Broadcasting 1 events file across {n} runs: {Path(event_files[0]).name}")
+        return
+
+    if input_files is None or len(input_files) != len(event_files):
+        if verbose:
+            for ep in event_files:
+                print(f"  {ep}")
+        return
+
+    problems = verify_events_match_inputs(input_files, event_files)
+
+    # A whole-list constant shift in run numbering is a numbering-base difference
+    # (0-indexed derivatives beside 1-indexed BIDS events), not a mispairing: the
+    # rotations this check exists to catch wrap around, so their per-slot offsets
+    # are never all equal. Warn rather than refuse to run.
+    offset = _uniform_run_offset(input_files, event_files) if problems else None
+    if offset is not None:
+        problems = []
+        if verbose:
+            print(
+                f"  Note: events run numbers are offset by {offset:+d} from the inputs "
+                "in every slot (different numbering base); pairing accepted."
+            )
+
+    if problems:
+        shown = problems[:12]
+        more = f"\n  ... and {len(problems) - len(shown)} more" if len(problems) > 12 else ""
+        raise ValueError(
+            "-events do not line up with -input (entity check):\n"
+            + "\n".join(shown)
+            + more
+            + f"\n\n{len(problems)} of {len(event_files)} slots mismatch. Events are paired "
+            "with inputs by position, so pass both lists in the same order."
+        )
+
+    if verbose:
+        print("\n".join(format_events_pairing(input_files, event_files)))
 
 
 def run_sort_key(path: str | Path) -> tuple:

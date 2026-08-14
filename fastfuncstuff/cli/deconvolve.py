@@ -865,27 +865,17 @@ def main():
             )
             return 1
         from fastfuncstuff.design.bids_events import (
+            check_events_pairing,
             parse_bids_events,
-            verify_events_match_inputs,
         )
 
         # Events pair with -input by position; verify that when both sides carry
         # sub/ses/task/run entities. A mispairing is otherwise silent.
-        if len(args.events) == n_runs:
-            _problems = verify_events_match_inputs(list(args.input), list(args.events))
-            if _problems:
-                print(
-                    "ERROR: -events do not line up with -input (entity check):\n"
-                    + "\n".join(_problems[:12])
-                    + (f"\n  ... and {len(_problems) - 12} more" if len(_problems) > 12 else "")
-                    + "\nEvents are matched to inputs by position; pass both in the "
-                    "same order.",
-                    file=sys.stderr,
-                )
-                return 1
-
-        if len(args.events) == 1 and n_runs > 1:
-            print(f"Broadcasting 1 events file across {n_runs} runs.")
+        try:
+            check_events_pairing(list(args.input), list(args.events), n_runs=n_runs)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
 
         event_cols = tuple(args.event_cols) if args.event_cols else None
         try:

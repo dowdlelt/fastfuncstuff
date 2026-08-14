@@ -581,3 +581,97 @@ class TestDuplicateInputs:
 
         with pytest.raises(ValueError, match="cannot reorder"):
             sort_runs_by_entities(["a.nii", "b.nii", "c.nii"], ["e1.tsv", "e2.tsv"])
+
+
+class TestCheckEventsPairing:
+    """The shared guard every -events CLI routes through.
+
+    It used to live inline in two tools out of a dozen, so ffs_hrfopt would
+    happily fit a 13-run/4-task dataset with the timing rotated by one run.
+    """
+
+    def test_multi_task_mispairing_raises(self):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        inputs = [f"sub-01_task-AAAA_run-{i:02d}_bold.nii.gz" for i in (1, 2, 3)]
+        events = [f"sub-01_task-BBBB_run-{i:02d}_events.tsv" for i in (1, 2, 3)]
+        with pytest.raises(ValueError, match="entity check"):
+            check_events_pairing(inputs, events, n_runs=3)
+
+    def test_matching_pairs_print_the_table(self, capsys):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        inputs = [f"sub-01_task-AAAA_run-{i:02d}_bold.nii.gz" for i in (1, 2)]
+        events = [f"sub-01_task-AAAA_run-{i:02d}_events.tsv" for i in (1, 2)]
+        check_events_pairing(inputs, events, n_runs=2)
+        out = capsys.readouterr().out
+        assert "Timing pairing" in out
+        # Both slots listed, input on the left of its own events file.
+        assert "[  0] sub-01_task-AAAA_run-01_bold.nii.gz  <-  " in out
+        assert "sub-01_task-AAAA_run-02_events.tsv" in out
+
+    def test_entity_free_names_still_print(self, capsys):
+        """The check only sees sub/ses/task/run; everything else needs eyeballs."""
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        check_events_pairing(["a.nii.gz", "b.nii.gz"], ["one.tsv", "two.tsv"], n_runs=2)
+        assert "Timing pairing" in capsys.readouterr().out
+
+    def test_broadcast_single_file_is_not_a_mismatch(self, capsys):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        check_events_pairing(
+            ["sub-01_run-01_bold.nii.gz", "sub-01_run-02_bold.nii.gz"],
+            ["sub-01_events.tsv"],
+            n_runs=2,
+        )
+        assert "Broadcasting" in capsys.readouterr().out
+
+    def test_long_run_list_is_elided(self, capsys):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        n = 40
+        inputs = [f"sub-01_run-{i:02d}_bold.nii.gz" for i in range(n)]
+        events = [f"sub-01_run-{i:02d}_events.tsv" for i in range(n)]
+        check_events_pairing(inputs, events, n_runs=n)
+        out = capsys.readouterr().out
+        assert "... 20 more ..." in out
+        assert f"[ {n - 1}]" in out  # the tail is what catches an off-by-one
+
+    def test_verbose_false_is_silent_but_still_checks(self, capsys):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        check_events_pairing(["sub-01_run-01.nii"], ["sub-01_run-01_events.tsv"], verbose=False)
+        assert capsys.readouterr().out == ""
+        with pytest.raises(ValueError):
+            check_events_pairing(
+                ["sub-01_task-AAAA_run-01.nii"],
+                ["sub-01_task-BBBB_run-01_events.tsv"],
+                verbose=False,
+            )
+
+    def test_constant_run_offset_is_accepted_with_a_note(self, capsys):
+        """0-indexed derivatives beside 1-indexed BIDS events are correctly paired."""
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        inputs = [f"run{i}.nii.gz" for i in range(3)]
+        events = [f"run-{i + 1:02d}_events.tsv" for i in range(3)]
+        check_events_pairing(inputs, events, n_runs=3)
+        assert "offset by +1" in capsys.readouterr().out
+
+    def test_rotation_is_still_rejected(self):
+        """The failure the check exists for: a wrapped rotation, not a re-index."""
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        inputs = [f"sub-01_run-{i:02d}_bold.nii.gz" for i in (1, 2, 3, 4)]
+        events = [f"sub-01_run-{i:02d}_events.tsv" for i in (2, 3, 4, 1)]
+        with pytest.raises(ValueError, match="entity check"):
+            check_events_pairing(inputs, events, n_runs=4)
+
+    def test_offset_does_not_excuse_a_task_swap(self):
+        from fastfuncstuff.design.bids_events import check_events_pairing
+
+        inputs = [f"task-AAAA_run-{i}_bold.nii.gz" for i in (1, 2)]
+        events = [f"task-BBBB_run-{i}_events.tsv" for i in (2, 3)]
+        with pytest.raises(ValueError, match="entity check"):
+            check_events_pairing(inputs, events, n_runs=2)

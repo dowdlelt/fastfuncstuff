@@ -1578,6 +1578,7 @@ def main() -> None:
             event_ignore=args.event_ignore,
             event_cols=event_cols,
             round_durations=args.round_durations,
+            input_files=input_files,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
