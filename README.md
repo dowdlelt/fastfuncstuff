@@ -48,7 +48,7 @@ pip install -e .
 **uv** (untested):
 
 ```bash
-uv venv --python 3.15
+uv venv --python 3.14
 source .venv/bin/activate
 uv pip install -e .
 ```
@@ -57,62 +57,6 @@ uv pip install -e .
 
 Add `".[dev]"` instead of `.` for tests + linters.
 
-### PyTorch and the GPU
-
-The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
-`OMP_NUM_THREADS`. On Apple Silicon, choose the device by workload:
-
-- Use `-device mps` for `ffs_moco`, `ffs_locomoco`, and `ffs_allineate` on typical
-  full-size brain volumes. Their interpolation, optical-flow, and batched sampling
-  kernels have enough work to outrun the Mac CPU. CPU can still win on small images.
-- Prefer `-device cpu` for `ffs_reml`, `ffs_hrfopt`, `ffs_denoise`, `ffs_ridge`, and
-  `ffs_fitbasis`. Apple CPU linear algebra is difficult for MPS to beat at their
-  usual matrix sizes. The same is true for `ffs_deconvolve` and ordinary
-  `ffs_perm` jobs; `ffs_denoisatorial` may benefit from MPS only when its large
-  float32 combination batches outweigh MPS's CPU fallback for QR.
-- MPS remains best-effort. The supported paths use float32 bulk computation and
-  explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
-  path causes trouble, rerun with `-device cpu`.
-
-Nonlinear registration has its own device profile:
-
-| Tool | Apple Silicon recommendation | Why |
-|---|---|---|
-| `ffs_optiwarp` | MPS for LK/HS; benchmark demons | Forward-only flow kernels work natively; LK/HS usually win on full-size volumes. |
-| `ffs_formwarp` | CPU | SyN needs 3-D `grid_sample` backward, which currently falls back from MPS to CPU every iteration. |
-| `ffs_qwarp` | CPU | Its autograd patch optimizer hits the same MPS backward fallback; CUDA remains the fastest target. |
-| `ffs_nwarp` | MPS for full-size volumes | Forward-only application, three-component composition, static frames, phase channels, and frozen temporal taps share memory-planned interpolation work. |
-
-For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
-Mac unless CUDA is available. An explicit `-device mps` is still honored.
-
-Other compute-heavy tools have a mixed Apple Silicon profile:
-
-| Tool | Apple Silicon recommendation | Why |
-|---|---|---|
-| `ffs_pyrf` | MPS for whole-brain fits; CPU for small masks | Its float32 candidate GEMMs cross over in MPS's favour on large voxel sets. |
-| `ffs_nordic` | CPU | Typical complex SVD patches fall back from MPS to CPU; explicit MPS remains available for Gram-eigh-shaped workloads. |
-| `ffs_ica` | CPU | Mac CPU linear algebra wins at ordinary fMRI dimensions; CUDA remains valuable on large decompositions. |
-| `ffs_blipflip` | CPU | Stable Gauss–Newton CG uses float64 scalar reductions, which MPS cannot represent. |
-| `ffs_segment` | CPU | Required float64 geometry and 3-D interpolation backward are not supported natively on MPS. |
-
-`ffs_nordic`, `ffs_blipflip`, and `ffs_segment` therefore choose CPU for
-`-device auto` on a Mac. `ffs_nordic -device mps` is still honored; the latter two reject
-explicit MPS early with an actionable message instead of failing deep in a fit.
-
-The default `pip install torch` gives you whatever wheel pip resolves for
-your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
-CUDA, install torch *first* from the official index for your CUDA version,
-then `pip install -e .`:
-
-```bash
-pip install torch --index-url https://download.pytorch.org/whl/cu124   # or cu121, cu126, …
-pip install -e .
-```
-
-Apple Silicon wheels include MPS support. MPS has no float64 support, so ffs keeps
-large accelerator work in float32 and performs only small precision-sensitive
-operations on CPU where needed.
 
 ### File formats
 
@@ -122,8 +66,6 @@ On a 100 run test dataset, load times were cut in half (every load, twice as fas
 Default outputs are `.nii.gz` written with `pigz` when available, for compatability.
 
 ## What I'm very happy with
-
-WIP.
 
 ### ffs_autoproc
 Its like afni_proc.py - but a slightly different focus. Here, I wanted a tool that you can point at a BIDS or BIDS-like (BIDS-lite?) dataset, and it will write out the entire processing script. Sure, there are still many many options, but this gets you an entire, editable script very quick. And if you were worried about slow python, I attempt to reduce that by batching - so if 100 runs are going to go through motion correction, we loop, in python (rather than looping over ffs_moco calls). 
@@ -304,6 +246,55 @@ ffs.write_glm_results_nifti(
 Other entry points worth knowing about: `fit_glm_arma11`, `fit_glm_hrf_library`,
 `generate_fmri_noise`, `simulate_fmri_run`, and `find_optimal_designs` (Liu &
 Frank efficiency). See `docs/` for details.
+
+
+### PyTorch, CPU and Mac MPS
+
+The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
+`OMP_NUM_THREADS`. On Apple Silicon, choose the device by workload:
+
+- Use `-device mps` for `ffs_moco`, `ffs_locomoco`, and `ffs_allineate` on typical
+  full-size brain volumes. Their interpolation, optical-flow, and batched sampling
+  kernels have enough work to outrun the Mac CPU. CPU can still win on small images.
+- Prefer `-device cpu` for `ffs_reml`, `ffs_hrfopt`, `ffs_denoise`, `ffs_ridge`, and
+  `ffs_fitbasis`. Apple CPU linear algebra is difficult for MPS to beat at their
+  usual matrix sizes. The same is true for `ffs_deconvolve` and ordinary
+  `ffs_perm` jobs; `ffs_denoisatorial` may benefit from MPS only when its large
+  float32 combination batches outweigh MPS's CPU fallback for QR.
+- MPS remains best-effort. The supported paths use float32 bulk computation and
+  explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
+  path causes trouble, rerun with `-device cpu`.
+
+Nonlinear registration has its own device profile:
+
+| Tool | Apple Silicon recommendation | Why |
+|---|---|---|
+| `ffs_optiwarp` | MPS for LK/HS; benchmark demons | Forward-only flow kernels work natively; LK/HS usually win on full-size volumes. |
+| `ffs_formwarp` | CPU | SyN needs 3-D `grid_sample` backward, which currently falls back from MPS to CPU every iteration. |
+| `ffs_qwarp` | CPU | Its autograd patch optimizer hits the same MPS backward fallback; CUDA remains the fastest target. |
+| `ffs_nwarp` | MPS for full-size volumes | Forward-only application, three-component composition, static frames, phase channels, and frozen temporal taps share memory-planned interpolation work. |
+
+For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
+Mac unless CUDA is available. An explicit `-device mps` is still honored.
+
+Other compute-heavy tools have a mixed Apple Silicon profile:
+
+| Tool | Apple Silicon recommendation | Why |
+|---|---|---|
+| `ffs_pyrf` | MPS for whole-brain fits; CPU for small masks | Its float32 candidate GEMMs cross over in MPS's favour on large voxel sets. |
+| `ffs_nordic` | CPU | Typical complex SVD patches fall back from MPS to CPU; explicit MPS remains available for Gram-eigh-shaped workloads. |
+| `ffs_ica` | CPU | Mac CPU linear algebra wins at ordinary fMRI dimensions; CUDA remains valuable on large decompositions. |
+| `ffs_blipflip` | CPU | Stable Gauss–Newton CG uses float64 scalar reductions, which MPS cannot represent. |
+| `ffs_segment` | CPU | Required float64 geometry and 3-D interpolation backward are not supported natively on MPS. |
+
+`ffs_nordic`, `ffs_blipflip`, and `ffs_segment` therefore choose CPU for
+`-device auto` on a Mac. `ffs_nordic -device mps` is still honored; the latter two reject
+explicit MPS early with an actionable message instead of failing deep in a fit.
+
+Apple Silicon wheels include MPS support. MPS has no float64 support, so ffs keeps
+large accelerator work in float32 and performs only small precision-sensitive
+operations on CPU where needed.
+
 
 ## Status
 
