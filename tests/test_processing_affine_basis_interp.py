@@ -454,3 +454,39 @@ class TestInterpAutograd:
         out = wsinc5_resample_3d(src, ii + shift[0], jj + shift[1], kk + shift[2])
         out.sum().backward()
         assert shift.grad is not None and torch.isfinite(shift.grad).all()
+
+    @pytest.mark.parametrize("kernel", ["cubic", "quintic", "heptic", "wsinc5"])
+    def test_grid_node_resample_is_differentiable(self, kernel):
+        # Every point landing exactly on a grid node takes the ISTINY shortcut,
+        # a pure lookup with no coordinate dependence. An identity start does
+        # precisely that, so the whole cost came back grad-free and allineate's
+        # Adam refine died on backward().
+        from fastfuncstuff.processing.interp import _separable_resample_3d
+
+        torch.manual_seed(0)
+        src = torch.rand(12, 12, 12)
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(12.0), torch.arange(12.0), torch.arange(12.0), indexing="ij"
+        )
+        shift = torch.zeros(3, requires_grad=True)
+        out = _separable_resample_3d(src, ii + shift[0], jj + shift[1], kk + shift[2], kernel)
+        assert out.requires_grad
+        out.sum().backward()
+        assert shift.grad is not None and torch.isfinite(shift.grad).all()
+        assert shift.grad.abs().sum() > 0
+
+    def test_grid_node_shortcut_still_matches_without_grad(self):
+        # The shortcut is only skipped under autograd; the no-grad forward must
+        # be unchanged, and the two paths must agree.
+        from fastfuncstuff.processing.interp import _separable_resample_3d
+
+        torch.manual_seed(0)
+        src = torch.rand(12, 12, 12)
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(12.0), torch.arange(12.0), torch.arange(12.0), indexing="ij"
+        )
+        with torch.no_grad():
+            fast = _separable_resample_3d(src, ii, jj, kk, "cubic")
+        shift = torch.zeros(3, requires_grad=True)
+        heavy = _separable_resample_3d(src, ii + shift[0], jj + shift[1], kk + shift[2], "cubic")
+        assert torch.allclose(fast, heavy.detach(), atol=1e-5)

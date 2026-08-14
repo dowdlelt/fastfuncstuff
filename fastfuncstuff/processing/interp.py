@@ -481,8 +481,12 @@ def _wsinc5_kernel(fx: Tensor) -> Tensor:
     )  # -(IRAD-1) .. +IRAD  (2*IRAD taps)
     d = (fx[:, None] - offsets[None, :]).abs()  # (N, ntaps)
 
-    pid = torch.pi * d
-    sinc = torch.where(d < 1e-7, torch.ones_like(d), torch.sin(pid) / pid)
+    # Guard the divisor as well as the result: torch.where still backprops the
+    # unselected branch, so a bare 0/0 hands autograd a NaN gradient at every
+    # tap that lands exactly on a sample (i.e. every point of an identity warp).
+    at_node = d < 1e-7
+    pid = torch.pi * torch.where(at_node, torch.ones_like(d), d)
+    sinc = torch.where(at_node, torch.ones_like(d), torch.sin(pid) / pid)
 
     # Window argument is remapped so win=1 at the taper start (xw==WCUT) and
     # tapers to the edge (xw==1); no window inside the cut region. WCUT=0 ->
@@ -994,12 +998,22 @@ def _separable_resample_3d(
     # S3 (AFNI ISTINY, :638-641): a center sitting on a grid node (fractional
     # part < 1e-4 on every axis) interpolates to that node's value for every
     # kernel here, so take it directly and keep it out of the heavy gather.
+    # The shortcut is a plain lookup, so it carries no dependence on the
+    # coordinates -- fine for a forward resample, fatal when the caller is
+    # differentiating the cost w.r.t. them (allineate's Adam refine). An exact
+    # identity start puts *every* point on a node, which made the whole cost
+    # grad-free; take the heavy path instead whenever the coords carry grad.
+    differentiable = torch.is_grad_enabled() and (
+        x_flat.requires_grad or y_flat.requires_grad or z_flat.requires_grad
+    )
     tiny = (
         in_bounds
         & ((x_flat - xb_all).abs() < 1e-4)
         & ((y_flat - yb_all).abs() < 1e-4)
         & ((z_flat - zb_all).abs() < 1e-4)
     )
+    if differentiable:
+        tiny = torch.zeros_like(in_bounds)
     if bool(tiny.any()):
         ti = tiny.nonzero(as_tuple=True)[0]
         node = source[
