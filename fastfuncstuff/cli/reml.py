@@ -1841,13 +1841,6 @@ def main():
                 f"\n  Per-condition durations: {dict(zip(condition_labels, durations, strict=False))}"
             )
 
-        # ── Optional onset / duration rounding ──────────────────────────
-        if args.round_onsets is not None:
-            from fastfuncstuff.design.builder import round_onsets
-
-            all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
-            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
-
         # Parse HRF model arguments
         print()
         from fastfuncstuff.cli_utils import parse_hrf_model_args
@@ -1892,6 +1885,14 @@ def main():
         # before the late-event guard below, so that guard judges the real design.
         apply_trim_to_timing(timing, trim, run_lengths_tr=run_lengths_tr, n_runs=n_runs)
         all_onsets = timing.all_onsets
+
+        # Rounding comes after the trim shift, so the snap lands on the TR grid
+        # the design is actually built on.
+        if args.round_onsets is not None:
+            from fastfuncstuff.design.builder import round_onsets
+
+            all_onsets = round_onsets(all_onsets, tr, threshold=args.round_onsets)
+            print(f"\nOnsets rounded to TR boundaries (threshold={args.round_onsets:.2f})")
 
         print(f"  Runs: {n_runs}")
         print(f"  Total timepoints: {n_timepoints}")
