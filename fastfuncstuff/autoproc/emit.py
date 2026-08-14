@@ -1193,7 +1193,7 @@ def _pre_stc_source(plan: Plan, indent: str = "  ") -> str:
     return (
         f'{indent}raw="${{MAG[$k]}}"\n'
         f'{indent}if [ "$NOISE_VOLS" -gt 0 ]; then '
-        f'nv=$(3dinfo -nv "$raw"); raw="${{raw}}[0..$((nv - NOISE_VOLS - 1))]"; fi'
+        f'nv=$(ffs_info -nv "$raw"); raw="${{raw}}[0..$((nv - NOISE_VOLS - 1))]"; fi'
     )
 
 
@@ -1334,7 +1334,7 @@ for k in "${{RUN_KEYS[@]}}"; do
   case "$MOCO_REF" in
     sbref) if [ -n "$sb" ]; then base_str="-base \\"$sb\\""; else base_str="-base 0"; fi ;;
     first) base_str="-base 0" ;;
-    last)  nv=$(3dinfo -nv "$raw"); base_str="-base $((nv - 1))" ;;
+    last)  nv=$(ffs_info -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
   printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
@@ -2258,7 +2258,7 @@ def _final_dxyz_default(plan: Plan) -> str:
     if opt.final_dxyz:
         return opt.final_dxyz
     first_mag = shlex.quote(str(plan.runs[0].bold.mag_path)) if plan.runs else '"$raw"'
-    return f"$(3dinfo -ad3 {first_mag} | awk '{{print $1}}')"
+    return f"$(ffs_info -adi {first_mag})"
 
 
 def _stage_warpmaster(plan: Plan) -> str:
@@ -2471,7 +2471,7 @@ def _stage_unwrap(plan: Plan) -> str:
         trim = (
             f'    tm="{_phase_file("trim", part=False)}"\n'
             f'    tp="{_phase_file("trim")}"\n'
-            f'    nv=$(3dinfo -nv "$mag"); last=$((nv - NOISE_VOLS - 1))\n'
+            f'    nv=$(ffs_info -nv "$mag"); last=$((nv - NOISE_VOLS - 1))\n'
             f'    [ -f "$tm" ] || ffs_util_3dmath -input "${{mag}}[0..$last]" -expr a '
             f'-prefix "$tm" -device cpu\n'
             f'    [ -f "$tp" ] || ffs_util_3dmath -input "${{ph}}[0..$last]" -expr a '

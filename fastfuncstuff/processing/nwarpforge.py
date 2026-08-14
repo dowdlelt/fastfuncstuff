@@ -110,19 +110,9 @@ def compute_cardinal_affine(oblique_aff: np.ndarray) -> np.ndarray:
 
     The origin (translation) is preserved.
     """
-    R = oblique_aff[:3, :3]
-    cardinal = np.zeros((4, 4), dtype=np.float64)
-    cardinal[3, 3] = 1.0
-    cardinal[:3, 3] = oblique_aff[:3, 3]
+    from fastfuncstuff.io.dsetinfo import cardinal_affine
 
-    for col in range(3):
-        vec = R[:, col]
-        voxel_size = np.sqrt(np.sum(vec**2))
-        dominant = int(np.argmax(np.abs(vec)))
-        sign = np.sign(vec[dominant])
-        cardinal[dominant, col] = sign * voxel_size
-
-    return cardinal
+    return cardinal_affine(oblique_aff)
 
 
 @dataclass

@@ -28,6 +28,7 @@ Image processing tools:
   ffs_util_pcwarp   - PC-based warp analysis
 
 Stats / utility tools:
+  ffs_info          - Dataset header report / 3dinfo-compatible value flags
   ffs_spatial_xcorr - Spatial cross-correlation
 
 Benchmark:

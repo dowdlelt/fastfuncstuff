@@ -5,8 +5,11 @@ Device management and helper functions
 
 from __future__ import annotations
 
+import contextlib
 import os
+import threading
 import warnings
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -14,6 +17,31 @@ import torch
 
 if TYPE_CHECKING:
     pass
+
+# Low-level I/O routines announce slow writes themselves so a bare library call
+# doesn't look wedged. When a CLI already wraps the call in a spinner, that
+# announcement duplicates the spinner's own line; the spinner claims the terminal
+# for the duration and the writer stays quiet.
+_io_progress_lock = threading.Lock()
+_io_progress_depth = 0
+
+
+def io_progress_suppressed() -> bool:
+    """True while a caller-level progress display owns the terminal."""
+    return _io_progress_depth > 0
+
+
+@contextlib.contextmanager
+def suppress_io_progress() -> Iterator[None]:
+    """Silence low-level write/read progress messages inside the block."""
+    global _io_progress_depth
+    with _io_progress_lock:
+        _io_progress_depth += 1
+    try:
+        yield
+    finally:
+        with _io_progress_lock:
+            _io_progress_depth -= 1
 
 
 def get_device(prefer_device: str | None = None) -> torch.device:
