@@ -26,6 +26,8 @@ import torch.nn.functional as F
 from scipy.optimize import minimize
 from torch import Tensor
 
+from fastfuncstuff.memory import compute_registration_candidate_batch_size
+
 from . import cost_hist
 from .affine import (
     apply_affine,
@@ -855,7 +857,7 @@ def _coarse_search_joint(
     # --- batched subsampled evaluation of every seed ---
     matrices = params_to_matrix_batched(seeds)
     B = matrices.shape[0]
-    chunk = max(1, int(3.0e7 / max(1, n_coarse)))
+    chunk = compute_registration_candidate_batch_size(n_coarse, B, device, bytes_per_point=40)
     costs = []
     for s in range(0, B, chunk):
         with torch.no_grad():
@@ -987,8 +989,8 @@ def _eval_candidates(
 ) -> Tensor:
     """Cost of every (B, 12) candidate against base (chunked) -> (B,)."""
     matrices = params_to_matrix_batched(candidates)
-    chunk_size = _estimate_chunk_size(base.shape, device)
     B = candidates.shape[0]
+    chunk_size = _estimate_chunk_size(base.shape, device, B)
     all_costs = []
     chunks = range(0, B, chunk_size)
     for start in _tqdm_bar(chunks, total=len(range(0, B, chunk_size)), desc=desc, disable=verb < 1):
@@ -1092,20 +1094,14 @@ def _coarse_search(
     return result
 
 
-def _estimate_chunk_size(vol_shape: tuple[int, ...], device: torch.device) -> int:
+def _estimate_chunk_size(
+    vol_shape: tuple[int, ...], device: torch.device, n_candidates: int = 4096
+) -> int:
     """Estimate how many candidates we can process at once."""
     voxels = vol_shape[0] * vol_shape[1] * vol_shape[2]
-    if device.type == "cuda":
-        try:
-            free_mem = torch.cuda.mem_get_info(device)[0]
-        except Exception:
-            free_mem = 4 * 1024**3
-    else:
-        free_mem = 4 * 1024**3
     # Peak memory per candidate: src_coords(16) + gx/gy/gz(12) + grid(12)
     # + grid_sample output(4) + grid_sample internals (~8) ≈ 52 bytes/voxel
-    chunk = max(1, int(free_mem * 0.5 / (voxels * 52)))
-    return min(chunk, 4096)
+    return compute_registration_candidate_batch_size(voxels, n_candidates, device)
 
 
 # ---------------------------------------------------------------------------

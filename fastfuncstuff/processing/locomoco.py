@@ -1964,28 +1964,40 @@ def _fuse_tridiag(
     """
     T = fd.shape[0]
     shape = fd.shape[1:]
-    fdf = fd.reshape(T, -1).double()  # (T, N)
-    af = anchor.reshape(T, -1).double()
+    # The system is strictly diagonally dominant. Keep the large voxel fields
+    # float32 on accelerators, while computing its shared Thomas coefficients
+    # once in CPU float64. This avoids consumer-CUDA double throughput and makes
+    # the rotation-aware path available on MPS without weakening the sensitive
+    # scalar recurrence. CPU retains its full float64 reference path.
+    work_dtype = torch.float64 if fd.device.type == "cpu" else torch.float32
+    fdf = fd.reshape(T, -1).to(work_dtype)  # (T, N)
+    af = anchor.reshape(T, -1).to(work_dtype)
     wa, wd = float(w_anchor), float(w_diff)
 
     # Constant tridiagonal: diag b_k = wa + wd*(#adjacent steps); off-diag = -wd.
-    b = torch.full((T,), wa + 2.0 * wd, dtype=torch.float64, device=fd.device)
-    b[0] = wa + wd
-    b[-1] = wa + wd
+    b64 = torch.full((T,), wa + 2.0 * wd, dtype=torch.float64)
+    b64[0] = wa + wd
+    b64[-1] = wa + wd
     # RHS: wa*anchor_k + wd*(fd_k − fd_{k+1}); boundaries drop the missing step term.
     rhs = wa * af
     rhs[:-1] = rhs[:-1] - wd * fdf[1:]  # − wd * fd_{k+1}
     rhs[1:] = rhs[1:] + wd * fdf[1:]  # + wd * fd_k
 
     # Thomas sweep (sub/super diagonals are the constant −wd).
-    cp = torch.zeros(T, dtype=torch.float64, device=fd.device)
-    dp = torch.zeros_like(rhs)
-    cp[0] = -wd / b[0]
-    dp[0] = rhs[0] / b[0]
+    cp64 = torch.zeros(T, dtype=torch.float64)
+    denom64 = torch.empty(T, dtype=torch.float64)
+    denom64[0] = b64[0]
+    cp64[0] = -wd / b64[0]
     for k in range(1, T):
-        m = b[k] - (-wd) * cp[k - 1]
-        cp[k] = -wd / m
-        dp[k] = (rhs[k] - (-wd) * dp[k - 1]) / m
+        denom64[k] = b64[k] - (-wd) * cp64[k - 1]
+        cp64[k] = -wd / denom64[k]
+    cp = cp64.to(device=fd.device, dtype=work_dtype)
+    denom = denom64.to(device=fd.device, dtype=work_dtype)
+
+    dp = torch.zeros_like(rhs)
+    dp[0] = rhs[0] / denom[0]
+    for k in range(1, T):
+        dp[k] = (rhs[k] - (-wd) * dp[k - 1]) / denom[k]
     p = torch.zeros_like(rhs)
     p[-1] = dp[-1]
     for k in range(T - 2, -1, -1):

@@ -732,6 +732,27 @@ def compute_moco_resample_batch_size(
     return batch_size
 
 
+def compute_registration_candidate_batch_size(
+    n_points: int,
+    n_candidates: int,
+    device: torch.device,
+    *,
+    bytes_per_point: int = 52,
+    max_batch_size: int = 4096,
+) -> int:
+    """Plan a batch of affine candidates evaluated over spatial points.
+
+    ``bytes_per_point`` covers candidate-specific coordinates, sampling grids,
+    interpolated values, and backend scratch. Available memory and safety
+    factors come from this module so registration shares the global policy.
+    """
+    if n_points < 1 or n_candidates < 1:
+        return 1
+    available = get_available_memory(device)
+    per_candidate = max(1, n_points * bytes_per_point)
+    return max(1, min(n_candidates, max_batch_size, available // per_candidate))
+
+
 def estimate_nordic_llr_memory(
     shape: tuple[int, int, int, int],
     kernel_size: tuple[int, int, int],

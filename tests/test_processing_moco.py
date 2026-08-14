@@ -15,6 +15,9 @@ from fastfuncstuff.processing.ffs_moco import (
     MocoResult,
     _blur_volume,
     _get_voxel_sizes,
+    _gram_normal_eq,
+    _normal_solve,
+    _prepare_normal_solve,
     _unweighted_rms,
     _weighted_rms,
     compute_derivative_images,
@@ -27,6 +30,21 @@ from fastfuncstuff.processing.ffs_moco import (
 from fastfuncstuff.processing.weight import compute_weight_image
 
 DEV = torch.device("cpu")
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_mps_normal_solve_matches_cpu_float64():
+    g = torch.Generator().manual_seed(12)
+    wj = torch.randn(6, 20000, generator=g)
+    wj[5] = wj[4] * 0.999 + 0.001 * wj[5]
+    rhs = torch.randn(6, generator=g)
+    gram = _gram_normal_eq(wj.to("mps"), torch.device("mps"))
+    got = _normal_solve(
+        _prepare_normal_solve(gram, torch.device("mps"), torch.float32), rhs.to("mps")
+    )
+    eps = 1e-6 * gram.diagonal().mean()
+    expected = torch.linalg.solve(gram + eps * torch.eye(6, dtype=torch.float64), rhs.double())
+    torch.testing.assert_close(got.cpu().double(), expected, rtol=2e-4, atol=2e-5)
 
 
 # ---------------------------------------------------------------------------

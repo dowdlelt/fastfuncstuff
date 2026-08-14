@@ -19,6 +19,7 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
     parse_prefix,
@@ -644,8 +645,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
-    hw_group.add_argument(
-        "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
+    add_device_arg(
+        hw_group,
+        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
     )
     add_verbose_arg(hw_group, default=1)
     hw_group.add_argument(

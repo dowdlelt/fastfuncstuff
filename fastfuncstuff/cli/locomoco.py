@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import setup_device
+from fastfuncstuff.cli_utils import add_device_arg, setup_device
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -952,7 +952,10 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     hw = p.add_argument_group("Hardware")
-    hw.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto).")
+    add_device_arg(
+        hw,
+        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
+    )
     return p
 
 

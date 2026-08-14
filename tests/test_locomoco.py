@@ -891,6 +891,16 @@ def test_fuse_tridiag_recovers_known_sequence():
     assert np.corrcoef(out.numpy().ravel(), true_p)[0, 1] > 0.999
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_fuse_tridiag_mps_matches_cpu_float64():
+    g = torch.Generator().manual_seed(8)
+    fd = torch.randn(40, 8, 9, 7, generator=g) * 0.05
+    anchor = torch.randn(fd.shape, generator=g) * 0.1
+    expected = _fuse_tridiag(fd, anchor, w_anchor=0.25)
+    got = _fuse_tridiag(fd.to("mps"), anchor.to("mps"), w_anchor=0.25).cpu()
+    torch.testing.assert_close(got, expected, rtol=2e-5, atol=2e-6)
+
+
 def test_rotaware_reduces_to_plain_at_zero_motion(known_shift_series):
     """With identity moco (raw==moco, no rotation) the rotation-aware warp must put all
     energy on the PE axis (leak ≈ 0) and its PE component must track the plain path."""

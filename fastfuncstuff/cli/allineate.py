@@ -24,6 +24,7 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
     run_batch_jobs,
@@ -61,9 +62,13 @@ def _out_matrix(
     """
     if np.array_equal(np.asarray(out_affine), np.asarray(base_affine)):
         return matrix
-    ab = torch.as_tensor(np.asarray(base_affine), dtype=torch.float64, device=device)
-    ao = torch.as_tensor(np.asarray(out_affine), dtype=torch.float64, device=device)
-    return (matrix.double() @ torch.linalg.inv(ab) @ ao).to(matrix.dtype)
+    # Header transforms are tiny and precision-sensitive.  Compose them on CPU
+    # in float64, then return the 4x4 result to the requested compute device;
+    # this avoids both slow consumer-CUDA float64 and MPS's lack of float64.
+    ab = torch.as_tensor(np.asarray(base_affine), dtype=torch.float64)
+    ao = torch.as_tensor(np.asarray(out_affine), dtype=torch.float64)
+    out = matrix.detach().cpu().double() @ torch.linalg.inv(ab) @ ao
+    return out.to(device=device, dtype=matrix.dtype)
 
 
 def _resample(
@@ -114,14 +119,13 @@ def _apply_followers(
     the source's grid.
     """
     verb = args.verb
-    a_src = torch.as_tensor(np.asarray(source_affine), dtype=torch.float64, device=device)
+    a_src = torch.as_tensor(np.asarray(source_affine), dtype=torch.float64)
     for path, prefix in _follower_pairs(args):
         with spinner(f"Loading {Path(path).name}"):
             follower, follower_header = load_image(path, device=device)
-        a_fol = torch.as_tensor(
-            np.asarray(follower_header["affine"]), dtype=torch.float64, device=device
-        )
-        fm = (torch.linalg.inv(a_fol) @ a_src @ matrix.double()).to(matrix.dtype)
+        a_fol = torch.as_tensor(np.asarray(follower_header["affine"]), dtype=torch.float64)
+        fm = torch.linalg.inv(a_fol) @ a_src @ matrix.detach().cpu().double()
+        fm = fm.to(device=device, dtype=matrix.dtype)
         if follower.ndim == 4:
             warped = torch.stack(
                 [
@@ -465,8 +469,9 @@ Examples:
 
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
-    hw_group.add_argument(
-        "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
+    add_device_arg(
+        hw_group,
+        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
     )
     hw_group.add_argument(
         "-compile",

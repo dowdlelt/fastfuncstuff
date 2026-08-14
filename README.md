@@ -1,8 +1,8 @@
 # fastfuncstuff (ffs)
 
 A small collection of fMRI analysis tools reimplemented in PyTorch, with a GPU-first bias.
-That said - there has been work to speed up the cpu branches - and in some cases they might be faster. 
-For Mac, use of cpu is recommended. CUDA is preferred, where possible. 
+CPU paths also receive performance work and can be faster for smaller linear-algebra workloads.
+CUDA is preferred where available; see the Apple Silicon guidance below for CPU versus MPS.
 
 ## Why this exists
 
@@ -58,8 +58,19 @@ uv pip install -e .
 Add `".[dev]"` instead of `.` for tests + linters.
 
 ### PyTorch and the GPU
-*note* Mac should use -device cpu where possible, MPS is flakey. 
-The CPU paths for most tools are also quite fast, and get attention.
+
+The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
+`OMP_NUM_THREADS`. On Apple Silicon, choose the device by workload:
+
+- Use `-device mps` for `ffs_moco`, `ffs_locomoco`, and `ffs_allineate` on typical
+  full-size brain volumes. Their interpolation, optical-flow, and batched sampling
+  kernels have enough work to outrun the Mac CPU. CPU can still win on small images.
+- Prefer `-device cpu` for `ffs_reml`, `ffs_hrfopt`, `ffs_denoise`, `ffs_ridge`, and
+  `ffs_fitbasis`. Apple CPU linear algebra is difficult for MPS to beat at their
+  usual matrix sizes.
+- MPS remains best-effort. The supported paths use float32 bulk computation and
+  explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
+  path causes trouble, rerun with `-device cpu`.
 
 The default `pip install torch` gives you whatever wheel pip resolves for
 your platform — usually CPU on Linux, MPS on Apple Silicon. If you want
@@ -71,9 +82,9 @@ pip install torch --index-url https://download.pytorch.org/whl/cu124   # or cu12
 pip install -e .
 ```
 
-Apple Silicon: the default wheel includes MPS. Many ops still fall back to
-CPU and some break entirely (float64 support, for example) this is a known weak spot CPU-only works everywhere but is the slow path. 
-I want to improve this, so consider that is on the TODO list. 
+Apple Silicon wheels include MPS support. MPS has no float64 support, so ffs keeps
+large accelerator work in float32 and performs only small precision-sensitive
+operations on CPU where needed.
 
 ### File formats
 

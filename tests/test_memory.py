@@ -19,6 +19,7 @@ from fastfuncstuff.memory import (
     bytes_per_voxel_hrf_xval,
     bytes_per_voxel_ridge,
     bytes_per_voxel_xval,
+    compute_registration_candidate_batch_size,
     dyn_chunk_estimator,
     estimate_chunk_size,
     estimate_keep_on_cpu,
@@ -29,6 +30,11 @@ from fastfuncstuff.memory import (
     reset_memory_config,
     set_memory_config,
 )
+
+
+def test_registration_candidate_batch_uses_shared_memory_budget():
+    with patch("fastfuncstuff.memory.get_available_memory", return_value=52 * 1000):
+        assert compute_registration_candidate_batch_size(100, 50, torch.device("cpu")) == 10
 
 
 class TestMemoryConfig:
