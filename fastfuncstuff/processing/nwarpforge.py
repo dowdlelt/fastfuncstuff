@@ -29,6 +29,7 @@ from .interp import (
     _separable_resample_3d,
     normalize_interp_mode,
     trilinear_interpolate,
+    trilinear_interpolate_multi,
     warp_image_multi,
 )
 from .io import (
@@ -46,8 +47,10 @@ from .spacetime import TissueFollowingSampler, apply_spacetime_sample
 WARP_COMPOSE_INTERP = ("linear", "cubic", "quintic", "heptic", "wsinc5")
 
 
-def _sample_field(field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = "linear") -> Tensor:
-    """Sample a displacement field at arbitrary coords with the given kernel.
+def _sample_fields(
+    fields: tuple[Tensor, ...], x: Tensor, y: Tensor, z: Tensor, interp: str = "linear"
+) -> tuple[Tensor, ...]:
+    """Sample co-registered displacement components at arbitrary coordinates.
 
     ``linear`` keeps the fast grid_sample path (border-clamped). Higher-order
     kernels reduce the smoothing each composition step adds to the warp -- the
@@ -55,17 +58,25 @@ def _sample_field(field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = 
     possible, so a sharper kernel here preserves warp detail (matches AFNI using
     the interp kernel for the warp itself, not just the data).
     """
+    stack = torch.stack(fields, dim=0)
     if interp == "linear":
-        return trilinear_interpolate(field, x, y, z)
+        sampled = trilinear_interpolate_multi(stack, x, y, z).T
+        return tuple(sampled.unbind(0))
     # Edge-extend out-of-bounds (clamp coords to the field) instead of the
     # separable kernel's zero-fill: a displacement field must extrapolate its
     # border value, matching grid_sample's border mode used by the linear path.
     # Zero-filling would tear the warp where a composed coord leaves the grid.
-    nz, ny, nx = field.shape
+    nz, ny, nx = fields[0].shape
     xc = x.clamp(0, nx - 1)
     yc = y.clamp(0, ny - 1)
     zc = z.clamp(0, nz - 1)
-    return _separable_resample_3d(field, xc, yc, zc, interp)
+    sampled = _separable_resample_3d(stack, xc, yc, zc, interp)
+    return tuple(sampled.unbind(0))
+
+
+def _sample_field(field: Tensor, x: Tensor, y: Tensor, z: Tensor, interp: str = "linear") -> Tensor:
+    """Single-component compatibility wrapper around :func:`_sample_fields`."""
+    return _sample_fields((field,), x, y, z, interp)[0]
 
 
 def derive_phase_output_path(prefix: str) -> str:
@@ -712,20 +723,9 @@ def prepare_warp_for_grid(
         flat_z = src_coords[2]
 
         # Interpolate NIfTI mm displacements at warp grid locations
-        mm_xd = (
-            _sample_field(warp.xd, flat_x, flat_y, flat_z, interp)
-            .float()
-            .reshape(tgt_nz, tgt_ny, tgt_nx)
-        )
-        mm_yd = (
-            _sample_field(warp.yd, flat_x, flat_y, flat_z, interp)
-            .float()
-            .reshape(tgt_nz, tgt_ny, tgt_nx)
-        )
-        mm_zd = (
-            _sample_field(warp.zd, flat_x, flat_y, flat_z, interp)
-            .float()
-            .reshape(tgt_nz, tgt_ny, tgt_nx)
+        sampled = _sample_fields((warp.xd, warp.yd, warp.zd), flat_x, flat_y, flat_z, interp)
+        mm_xd, mm_yd, mm_zd = (
+            component.float().reshape(tgt_nz, tgt_ny, tgt_nx) for component in sampled
         )
     else:
         if verb >= 2:
@@ -849,16 +849,10 @@ def compose_matrix_then_warp(
     ty = transformed[1].reshape(nz, ny, nx)
     tz = transformed[2].reshape(nz, ny, nx)
 
-    _N = nz * ny * nx
-    warp_x_at_t = _sample_field(
-        warp.xd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
-    ).reshape(nz, ny, nx)
-    warp_y_at_t = _sample_field(
-        warp.yd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
-    ).reshape(nz, ny, nx)
-    warp_z_at_t = _sample_field(
-        warp.zd, tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
-    ).reshape(nz, ny, nx)
+    sampled = _sample_fields(
+        (warp.xd, warp.yd, warp.zd), tx.reshape(-1), ty.reshape(-1), tz.reshape(-1), interp
+    )
+    warp_x_at_t, warp_y_at_t, warp_z_at_t = (component.reshape(nz, ny, nx) for component in sampled)
 
     new_xd = (tx + warp_x_at_t) - ii
     new_yd = (ty + warp_y_at_t) - jj
@@ -903,16 +897,14 @@ def compose_warp_then_warp(
     y_after_a = jj + warp_a.yd
     z_after_a = kk + warp_a.zd
 
-    _N = nz * ny * nx
-    bx_at_a = _sample_field(
-        warp_b.xd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
-    ).reshape(nz, ny, nx)
-    by_at_a = _sample_field(
-        warp_b.yd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
-    ).reshape(nz, ny, nx)
-    bz_at_a = _sample_field(
-        warp_b.zd, x_after_a.reshape(-1), y_after_a.reshape(-1), z_after_a.reshape(-1), interp
-    ).reshape(nz, ny, nx)
+    sampled = _sample_fields(
+        (warp_b.xd, warp_b.yd, warp_b.zd),
+        x_after_a.reshape(-1),
+        y_after_a.reshape(-1),
+        z_after_a.reshape(-1),
+        interp,
+    )
+    bx_at_a, by_at_a, bz_at_a = (component.reshape(nz, ny, nx) for component in sampled)
 
     new_xd = warp_a.xd + bx_at_a
     new_yd = warp_a.yd + by_at_a

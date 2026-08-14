@@ -53,7 +53,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor
 
-from ..memory import get_available_memory
+from ..memory import compute_moco_resample_batch_size, get_available_memory
 from .interp import warp_image_multi
 from .slicetime import _m3_window, _sinc
 
@@ -188,21 +188,34 @@ def apply_spacetime_sample(
 
     accs = [torch.zeros((onz, ony, onx), dtype=torch.float32, device=device) for _ in sources]
     wsum = torch.zeros((onz, ony, onx), dtype=torch.float32, device=device)
+    active: list[tuple[int, Tensor]] = []
     for f in range(f_lo, f_hi + 1):
         w = temporal_kernel_weights(tcoord - f, tinterp)
-        if not bool(torch.any(w != 0.0)):
-            continue
-        # Edge-extend past the series ends (nipy uses reflect; clamp is adequate
-        # and never invents structure -- the weights there are already tiny).
-        fc = min(max(f, 0), nt - 1)
-        frames = [src[fc].to(device=device, dtype=accs[c].dtype) for c, src in enumerate(sources)]
-        # Channels share this frozen pose -> warp them in one batched gather.
+        if bool(torch.any(w != 0.0)):
+            active.append((f, w))
+
+    # Every temporal tap uses the same frozen pose. Treat taps (and optional
+    # phase channels) as co-registered interpolation channels, bounded by the
+    # shared frame-batch memory planner. The per-voxel temporal weights are
+    # applied after spatial sampling, exactly as in the scalar-tap loop.
+    tap_batch = compute_moco_resample_batch_size(onz, ony, onx, len(active), device, interp=interp)
+    tap_batch = max(1, tap_batch // len(sources))
+    for start in range(0, len(active), tap_batch):
+        block = active[start : start + tap_batch]
+        frames = [
+            src[min(max(f, 0), nt - 1)].to(device=device, dtype=torch.float32)
+            for f, _ in block
+            for src in sources
+        ]
         warped = warp_image_multi(frames, xd, yd, zd, mode=interp)
-        for c, s_f in enumerate(warped):
-            if no_neg_ch[c]:
-                s_f = s_f.clamp_min(0.0)
-            accs[c] += w * s_f
-        wsum += w
+        for tap_index, (_, w) in enumerate(block):
+            offset = tap_index * len(sources)
+            for c in range(len(sources)):
+                s_f = warped[offset + c]
+                if no_neg_ch[c]:
+                    s_f = s_f.clamp_min(0.0)
+                accs[c] += w * s_f
+            wsum += w
 
     outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
     return outs if multi else outs[0]
@@ -315,6 +328,7 @@ class TissueFollowingSampler:
         )
         self._coords: dict[int, tuple[Tensor, Tensor, Tensor]] = {}
         self._srcs: dict[int, tuple[Tensor, ...]] = {}
+        self._warped: dict[int, list[Tensor]] = {}
 
         # Decide whether the window's source frames fit alongside the coordinate
         # cache and the transient warp-composition workspace. Completed output
@@ -328,20 +342,27 @@ class TissueFollowingSampler:
         )
         coord_cache_bytes = window * 3 * output_plane
         source_cache_bytes = window * source_frame_bytes
+        warped_cache_bytes = window * len(self.sources) * output_plane
         # A high-order warp composition temporarily holds several output-grid
         # fields and interpolation buffers. Keep a deliberately conservative
         # reserve so caching source frames never crowds that peak.
         compose_workspace_bytes = 16 * output_plane
-        if device.type == "cuda":
-            avail = get_available_memory(device)  # free * safety_factor
-            self.cache_source = avail > (
-                source_cache_bytes + coord_cache_bytes + compose_workspace_bytes
-            )
-        else:
-            self.cache_source = True  # CPU/MPS: source already in host RAM
+        avail = get_available_memory(device)  # device-specific safe budget
+        base_need = source_cache_bytes + coord_cache_bytes + compose_workspace_bytes
+        self.cache_source = device.type != "cuda" or avail > base_need
+        # A tap warped through frame f's own pose is independent of which output
+        # frame later consumes it. Adjacent temporal windows overlap almost
+        # completely, so retaining the bounded window turns O(nt*window) spatial
+        # resamples into O(nt). Disable automatically when the extra output planes
+        # would crowd composition or source-frame storage.
+        self.cache_warped = avail > base_need + warped_cache_bytes
         if verb >= 1:
             where = "device-cached" if self.cache_source else "streamed"
-            print(f"nwarpforge: tissue-following window={window} frames, source {where}")
+            taps = "cached" if self.cache_warped else "recomputed"
+            print(
+                f"nwarpforge: tissue-following window={window} frames, "
+                f"source {where}, warped taps {taps}"
+            )
 
     def _clamp(self, f: int) -> int:
         return min(max(f, 0), self.nt - 1)
@@ -352,6 +373,7 @@ class TissueFollowingSampler:
             if fc not in fcs:
                 del self._coords[fc]
                 self._srcs.pop(fc, None)
+                self._warped.pop(fc, None)
         for fc in fcs:
             if fc not in self._coords:
                 self._coords[fc] = self.coords_fn(fc)
@@ -364,6 +386,8 @@ class TissueFollowingSampler:
         """The source frames at ``f`` warped to the output grid through frame ``f``'s
         own pose -- i.e. the tissue at every output voxel, as frame ``f`` saw it."""
         fc = self._clamp(f)  # edge-extend pose + data past the series ends
+        if fc in self._warped:
+            return self._warped[fc]
         sx, sy, sz = self._coords[fc]
         frames = (
             self._srcs[fc]
@@ -373,10 +397,13 @@ class TissueFollowingSampler:
         xd, yd, zd = sx - self.ii, sy - self.jj, sz - self.kk
         # All channels share this pose -> one gather builds them together.
         warped = warp_image_multi(frames, xd, yd, zd, mode=self.interp)
-        return [
+        result = [
             v.clamp_min(0.0) if self.no_neg_ch[c] else v
             for c, v in enumerate(warped)  # noqa: E501
         ]
+        if self.cache_warped:
+            self._warped[fc] = result
+        return result
 
     def sample(self, frame_idx: int) -> Tensor | list[Tensor]:
         """The tissue-following, slice-timing-corrected output volume at ``frame_idx``.

@@ -13,7 +13,9 @@ Conventions used below:
   MPS, particularly with its LK and Horn–Schunck force models.
 - `ffs_nwarp` is also a strong MPS path for full-size volumes. Static nonlinear
   4-D applies batch frames with shared coordinates; time-varying motion and joint
-  slice timing retain their per-frame or sliding-window algorithms.
+  slice timing retain their pose-aware algorithms. Frozen slice-timing taps batch
+  under their common pose; tissue-following taps use a bounded, memory-budgeted
+  own-pose cache across overlapping temporal windows.
 - `ffs_nordic`, `ffs_blipflip`, and `ffs_segment` also resolve auto to CPU on Mac.
   NORDIC's usual complex SVD falls back to CPU; blipflip and segment require operations
   MPS cannot perform. Whole-brain `ffs_pyrf` can benefit from MPS, while `ffs_ica`

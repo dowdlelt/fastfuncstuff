@@ -79,7 +79,7 @@ Nonlinear registration has its own device profile:
 | `ffs_optiwarp` | MPS for LK/HS; benchmark demons | Forward-only flow kernels work natively; LK/HS usually win on full-size volumes. |
 | `ffs_formwarp` | CPU | SyN needs 3-D `grid_sample` backward, which currently falls back from MPS to CPU every iteration. |
 | `ffs_qwarp` | CPU | Its autograd patch optimizer hits the same MPS backward fallback; CUDA remains the fastest target. |
-| `ffs_nwarp` | MPS for full-size volumes | Warp application is forward-only; static 4-D chains and phase channels share coordinates in memory-planned batches. |
+| `ffs_nwarp` | MPS for full-size volumes | Forward-only application, three-component composition, static frames, phase channels, and frozen temporal taps share memory-planned interpolation work. |
 
 For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
 Mac unless CUDA is available. An explicit `-device mps` is still honored.

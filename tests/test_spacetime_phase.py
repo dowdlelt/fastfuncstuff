@@ -77,6 +77,36 @@ def test_multi_channel_matches_per_channel_follow():
         assert torch.allclose(out[c], solo.sample(4), atol=1e-6)
 
 
+def test_follow_warped_tap_cache_matches_recomputation():
+    """Overlapping output windows may reuse own-pose taps without changing values."""
+    torch.manual_seed(11)
+    source = torch.randn(NT, SNZ, SNY, SNX)
+    st = _slice_times()
+
+    def coords_fn(f):
+        return _coords(frame_shift=0.03 * f)
+
+    common = dict(
+        tr=1.0,
+        tzero=0.45,
+        slice_times=st,
+        device=DEV,
+        tinterp="cubic",
+        interp="cubic",
+    )
+    cached = TissueFollowingSampler(source, coords_fn, (SNZ, SNY, SNX), **common)
+    recomputed = TissueFollowingSampler(source, coords_fn, (SNZ, SNY, SNX), **common)
+    recomputed.cache_warped = False
+
+    cached_out = [cached.sample(f) for f in range(NT)]
+    recomputed_out = [recomputed.sample(f) for f in range(NT)]
+
+    for actual, reference in zip(cached_out, recomputed_out, strict=True):
+        assert torch.allclose(actual, reference, atol=1e-6, rtol=1e-6)
+    assert cached._warped
+    assert len(cached._warped) <= 2 * cached.half + 2
+
+
 def test_no_neg_is_per_channel():
     # A negative channel must NOT be clamped when its no_neg flag is False, even
     # though a sibling channel requests clamping.
