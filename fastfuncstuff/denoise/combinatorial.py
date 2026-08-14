@@ -33,6 +33,27 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
     slice_by_runs,
 )
+from fastfuncstuff.memory import estimate_chunk_size, get_available_memory, get_memory_config
+
+
+def _combination_work_chunks(
+    n_combos: int,
+    n_timepoints: int,
+    n_voxels: int,
+    device: torch.device,
+) -> tuple[int, int]:
+    """Jointly size combination and voxel batches from the shared budget."""
+    available = get_available_memory(device)
+    cfg = get_memory_config()
+    # A batch owns B projection matrices plus projected data, prediction, and
+    # reduction scratch proportional to B*T*V. Split the already safety-scaled
+    # budget so neither dimension can consume it all.
+    projection_bytes = max(n_timepoints * n_timepoints * 4, 1)
+    combo_batch = max(1, min(n_combos, 512, int(available * 0.35) // projection_bytes))
+    transient_bytes_per_voxel = max(combo_batch * (3 * n_timepoints + 4) * 4, 1)
+    voxel_cap = cfg.max_chunk_size_gpu if device.type in {"cuda", "mps"} else cfg.max_chunk_size_cpu
+    voxel_chunk = max(1, min(n_voxels, voxel_cap, int(available * 0.55) // transient_bytes_per_voxel))
+    return combo_batch, voxel_chunk
 
 # ============================================================================
 # Data structures
@@ -243,15 +264,11 @@ def evaluate_all_combinations_for_run(
     T = run_data_criteria.shape[1]
     V_criteria = run_data_criteria.shape[0]
 
-    # Adaptive chunk_size: scale down with more combinations to keep memory bounded
-    # Target: keep (n_combos * T * chunk) at ~300M elements per tensor
-    # For 128 combos: chunk=2000 → ~307 MB per tensor (with 2 tensors = ~614 MB)
-    # For 1024 combos: chunk=250 → ~153 MB per tensor (with 2 tensors = ~306 MB)
+    combo_batch_size, planned_voxel_chunk = _combination_work_chunks(
+        n_combos, T, V_criteria, device
+    )
     if criteria_chunk_size is None:
-        target_elements = (
-            300_000_000  # ~1.2 GB for both tensors (n_combos * T * chunk * 2 * 4 bytes)
-        )
-        chunk_size = max(100, target_elements // (n_combos * T * 2))
+        chunk_size = planned_voxel_chunk
     else:
         chunk_size = criteria_chunk_size
 
@@ -271,7 +288,6 @@ def evaluate_all_combinations_for_run(
 
     # CRITICAL: For 8192 combos, P_all would be 7.4 GB - must batch combos
     # Process combos in batches: build projections, evaluate all voxels, accumulate
-    combo_batch_size = 512  # (512, T, T) ≈ 464 MB, manageable
     all_cod = torch.zeros(n_combos, V_criteria, device="cpu")  # CPU accumulation
 
     I_T = torch.eye(T, device=device)
@@ -329,7 +345,8 @@ def evaluate_all_combinations_for_run(
 
         # Clean up batch tensors before next combo batch
         del P_batch, design_clean_batch
-        torch.cuda.empty_cache()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     # Variance explained per combo
     var_explained = np.array([sum(variance_ratios[pc] for pc in combo) for combo in combinations])
@@ -620,7 +637,10 @@ def phase_randomize(
     """
     n_time, k = timecourses.shape
     device = timecourses.device
-    spectrum = torch.fft.rfft(timecourses.double(), dim=0)  # (F, k)
+    # Phase randomisation is not a numerically sensitive solve. Keeping it in
+    # float32 avoids MPS's unsupported float64 FFT and consumer-CUDA slowdown.
+    fft_input = timecourses.to(torch.float32)
+    spectrum = torch.fft.rfft(fft_input, dim=0)  # (F, k)
     magnitude = spectrum.abs()
     n_freq = magnitude.shape[0]
 
@@ -637,9 +657,7 @@ def phase_randomize(
     if n_time % 2 == 0:
         phases[:, :, -1] = 0.0
 
-    surrogates = torch.fft.irfft(
-        mag * torch.exp(1j * phases.double()), n=n_time, dim=2
-    )  # (k, n_surr, T)
+    surrogates = torch.fft.irfft(mag * torch.exp(1j * phases), n=n_time, dim=2)
     out = surrogates.permute(2, 0, 1).reshape(n_time, k * n_surrogates)
     return out.to(timecourses.dtype)
 
@@ -987,7 +1005,16 @@ def fit_combinatorial_denoising(
         train_local_starts = _compute_local_run_starts(train_runs, run_starts, n_timepoints)
         train_nuisance = [nuisance_per_run[i] for i in train_runs]
         betas_all = torch.zeros(n_voxels, n_conds, device=torch.device("cpu"))
-        chunk_size = 10000
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=sum(
+                (run_starts[r + 1] if r < n_runs - 1 else n_timepoints) - run_starts[r]
+                for r in train_runs
+            ),
+            n_regressors=n_conds,
+            device=device,
+            operation="glm",
+        )
 
         if per_hrf_mode:
             assert designs_by_hrf is not None and hrf_indices is not None

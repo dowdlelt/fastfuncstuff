@@ -7,6 +7,7 @@ Tests for uncovered functions in denoise/ modules:
 import numpy as np
 import torch
 
+import fastfuncstuff.denoise.combinatorial as combinatorial
 from fastfuncstuff.denoise.combinatorial import (
     evaluate_all_combinations_for_run,
     extract_pcs_single_run_with_variance,
@@ -20,6 +21,18 @@ from fastfuncstuff.denoise.sequential import (
 )
 
 DEVICE = torch.device("cpu")
+
+
+def test_combination_chunks_share_the_memory_budget(monkeypatch):
+    monkeypatch.setattr(combinatorial, "get_available_memory", lambda _device: 1 << 20)
+    combo_chunk, voxel_chunk = combinatorial._combination_work_chunks(
+        n_combos=1000,
+        n_timepoints=100,
+        n_voxels=10000,
+        device=DEVICE,
+    )
+    assert combo_chunk == 9
+    assert voxel_chunk == 52
 
 
 class TestEvaluateAllCombinationsForRun:

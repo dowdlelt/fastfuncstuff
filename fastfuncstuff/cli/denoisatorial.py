@@ -48,6 +48,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        add_device_arg,
         add_load_threads_arg,
         add_ortvec_arguments,
         add_trim_args,
@@ -542,11 +543,7 @@ Notes:
         default=None,
         help="Apply 3D Gaussian spatial smoothing with FWHM in mm",
     )
-    proc_opts.add_argument(
-        "-device",
-        type=str,
-        help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
-    )
+    add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
         action="store_true",

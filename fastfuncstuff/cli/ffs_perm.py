@@ -32,9 +32,10 @@ import torch
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_device_arg,
         add_verbose_arg,
-        parse_device_arg,
         parse_prefix,
+        setup_device,
         spinner,
     )
     from fastfuncstuff.io.afni import load_afni_mask, load_nifti, save_nifti
@@ -279,11 +280,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     misc = p.add_argument_group("Misc")
-    misc.add_argument(
-        "-device",
-        default="cuda",
-        help="Compute device (cuda / cpu / mps).  Default cuda.",
-    )
+    add_device_arg(misc)
     misc.add_argument(
         "-jobs",
         "-j",
@@ -546,7 +543,10 @@ def _accumulate_cluster_null(
 
 def main() -> None:
     args = build_parser().parse_args()
-    parse_device_arg(args.device)  # validates + normalises
+    device = setup_device(args.device)
+    # Statistic kernels accept a torch-compatible string, not the richer CLI
+    # spec (cpu,N / cuda,N).  Resolve once so thread and card selection survive.
+    args.device = str(device)
     prefix = parse_prefix(args.prefix)
     t_start = time.time()
 

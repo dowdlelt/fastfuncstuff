@@ -63,7 +63,13 @@ except ImportError:
 
 # Import fastfuncstuff modules
 try:
-    from fastfuncstuff.cli_utils import add_verbose_arg, auto_polort, parse_device_arg, parse_prefix
+    from fastfuncstuff.cli_utils import (
+        add_device_arg,
+        add_verbose_arg,
+        auto_polort,
+        parse_prefix,
+        setup_device,
+    )
     from fastfuncstuff.design.builder import (
         legendre_polynomials,
         parse_afni_timing_file,
@@ -85,7 +91,7 @@ try:
         save_nifti,
         to_voxel_major,
     )
-    from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
+    from fastfuncstuff.utils import get_device  # noqa: F401
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -414,12 +420,7 @@ def parse_args():
         action="store_true",
         help="Force CPU execution (default: auto-detect GPU). Deprecated: use -device cpu.",
     )
-    hw_opts.add_argument(
-        "-device",
-        type=str,
-        default=None,
-        help="PyTorch device: cpu, cuda, mps (default: auto-detect). Overrides --cpu.",
-    )
+    add_device_arg(hw_opts, extra="Overrides --cpu.")
     hw_opts.add_argument(
         "-debug-memory",
         action="store_true",
@@ -837,10 +838,9 @@ def main():
 
     # Setup device — -device takes precedence over legacy --cpu flag
     device_spec = args.device or ("cpu" if args.cpu else None)
-    device, _, _ = parse_device_arg(device_spec)
+    device = setup_device(device_spec)
     if args.verb >= 1:
         print(f"Using device: {device}")
-    configure_torch_backends(device)
 
     # Validate design source
     n_runs = len(args.input)
@@ -1259,9 +1259,6 @@ def main():
 
         if args.verb >= 1:
             print(f"  Fitting (prior_weight={pw!r}) …")
-        fit_dev = parse_device_arg(args.device)
-        if isinstance(fit_dev, tuple):
-            fit_dev = fit_dev[0]
         fit = fit_flobs_constrained(
             data=packed.data_concat,
             design_task=task_design,
@@ -1269,7 +1266,7 @@ def main():
             n_conditions=n_conditions,
             nuisance=nuisance,
             prior_weight=pw,
-            device=fit_dev,
+            device=device,
         )
         if args.verb >= 1:
             print(f"  ✓ Fit complete.  Mean R² = {fit.r2.mean():.3f}")

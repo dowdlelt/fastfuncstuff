@@ -197,6 +197,15 @@ def _device(device_str: str) -> torch.device:
     return torch.device(device_str)
 
 
+def _stage_perm_matrix(values: np.ndarray, dev: torch.device) -> torch.Tensor:
+    """Keep a reusable float32 permutation matrix on-device when it is modest."""
+    host = torch.from_numpy(values)
+    required = values.size * 4
+    if required <= get_available_memory(dev, empty_cache=False) // 10:
+        return host.to(dev, dtype=torch.float32)
+    return host
+
+
 # Ceiling on the pinned staging buffer. Pinned pages are locked out of the
 # host's pageable pool, so this stays small enough to be free on any machine
 # that can run the rest of the tool.
@@ -289,6 +298,7 @@ def one_sample_t_perm(
 
     dev = _device(device)
     y_t = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
+    signs_t = _stage_perm_matrix(sign_flips, dev)
     sum_y2 = (y_t * y_t).sum(dim=0)  # [V], constant under sign flip
 
     if voxel_chunk is None:
@@ -333,7 +343,7 @@ def one_sample_t_perm(
 
         for p0 in range(0, p, perm_chunk):
             p1 = min(p0 + perm_chunk, p)
-            s = torch.from_numpy(sign_flips[p0:p1]).to(dev, dtype=torch.float32)
+            s = signs_t[p0:p1].to(dev, dtype=torch.float32)
             # m[p, vox] = mean(s_p * y_vox) = (S @ Y) / N
             m = (s @ y_chunk) / n  # [Pc, Vc]
             var = (sum_y2_chunk[None, :] - n * m * m) / (n - 1)
@@ -400,6 +410,7 @@ def two_sample_t_perm(
     dev = _device(device)
     y_t = torch.from_numpy(np.ascontiguousarray(y, dtype=np.float32))
     y2_t = y_t * y_t
+    groups_t = _stage_perm_matrix(group_swaps, dev)
 
     if voxel_chunk is None:
         # On-device: y_chunk, y2_chunk (2·N·4) + sumA/ssqA/mA/mB/t (≥5·P·4).
@@ -434,8 +445,6 @@ def two_sample_t_perm(
     except ImportError:
         bar = None
 
-    g_obs_np = group_swaps[0].astype(np.float32)
-
     for v0 in range(0, v, voxel_chunk):
         v1 = min(v0 + voxel_chunk, v)
         y_chunk = y_t[:, v0:v1].to(dev, non_blocking=True)  # [N, Vc]
@@ -444,14 +453,14 @@ def two_sample_t_perm(
         sum_y2_chunk = y2_chunk.sum(dim=0)  # [Vc]
 
         # Observed group means (for the meanA/meanB output sub-bricks).
-        g_obs = torch.from_numpy(g_obs_np).to(dev)
+        g_obs = groups_t[0].to(dev, dtype=torch.float32)
         sumA_obs = g_obs @ y_chunk
         meanA[v0:v1] = (sumA_obs / nA).cpu()
         meanB[v0:v1] = ((sum_y_chunk - sumA_obs) / nB).cpu()
 
         for p0 in range(0, p, perm_chunk):
             p1 = min(p0 + perm_chunk, p)
-            g = torch.from_numpy(group_swaps[p0:p1]).to(dev, dtype=torch.float32)
+            g = groups_t[p0:p1].to(dev, dtype=torch.float32)
             sumA = g @ y_chunk  # [Pc, Vc]
             ssqA = g @ y2_chunk
             sumB = sum_y_chunk[None, :] - sumA

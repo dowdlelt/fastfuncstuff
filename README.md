@@ -67,7 +67,9 @@ The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
   kernels have enough work to outrun the Mac CPU. CPU can still win on small images.
 - Prefer `-device cpu` for `ffs_reml`, `ffs_hrfopt`, `ffs_denoise`, `ffs_ridge`, and
   `ffs_fitbasis`. Apple CPU linear algebra is difficult for MPS to beat at their
-  usual matrix sizes.
+  usual matrix sizes. The same is true for `ffs_deconvolve` and ordinary
+  `ffs_perm` jobs; `ffs_denoisatorial` may benefit from MPS only when its large
+  float32 combination batches outweigh MPS's CPU fallback for QR.
 - MPS remains best-effort. The supported paths use float32 bulk computation and
   explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
   path causes trouble, rerun with `-device cpu`.
