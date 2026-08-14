@@ -52,7 +52,9 @@ try:
         add_cv_strategy_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
+        add_trim_args,
         add_verbose_arg,
+        apply_trim_to_timing,
         auto_polort,
         build_nuisance_per_run,
         compute_run_lengths,
@@ -61,10 +63,12 @@ try:
         parse_cv_strategy,
         parse_prefix,
         preflight_check,
+        run_lengths_from_starts,
         save_4d_nifti,
         save_volume_nifti,
         setup_device,
         spinner,
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.glm.ridge import (
@@ -336,6 +340,7 @@ Notes:
         help="Voxels per chunk for processing. 0 = auto-detect based on available memory (default)",
     )
     add_load_threads_arg(proc_opts)
+    add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -449,6 +454,8 @@ def main():
         dry_run=args.dry_run,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
 
     # Modify prefix for dry run mode
@@ -472,6 +479,17 @@ def main():
         print(f"  TR from header: {args.tr}s")
     else:
         print(f"  TR (specified): {args.tr}s")
+
+    # Shift event timing to the retained window before anything else touches the
+    # onsets (rounding below included) -- see design/trim.py.
+    trim = trim_spec_from_args(args, tr=args.tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(run_starts, n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
 
     # ========================================================================
     # 3. Apply onset rounding (TR now known)

@@ -1637,14 +1637,25 @@ def create_onset_matrix_microtime(
             # sampling grid. convolve_hrf_microtime downsamples at every bins_per_tr bins,
             # so run boundaries must align to that grid, not to real-time seconds.
             run_start_micro = run_starts[run_idx] * bins_per_tr
+            run_end_micro = (
+                run_starts[run_idx + 1] * bins_per_tr if run_idx + 1 < n_runs else n_microtime
+            )
 
             for onset_time in onsets:
                 # onset_time is relative to run start, in seconds
                 onset_bin = run_start_micro + int(np.round(onset_time / microtime_dt))
 
-                if 0 <= onset_bin < n_microtime:
-                    end_bin = min(onset_bin + duration_bins, n_microtime)
-                    onset_matrix[onset_bin:end_bin, cond_idx] = 1.0
+                # Clamp to this run's own span. A negative onset is legitimate --
+                # -drop_first shifts timing back, so an event that began before the
+                # first retained TR is still ongoing during it and must contribute a
+                # truncated boxcar (see design/trim.py). Clamping the far end matters
+                # too: a long event near a run's end used to paint into the *next*
+                # run, and an unclamped negative onset painted into the previous one.
+                start_bin = max(onset_bin, run_start_micro)
+                end_bin = min(onset_bin + duration_bins, run_end_micro)
+
+                if start_bin < end_bin:
+                    onset_matrix[start_bin:end_bin, cond_idx] = 1.0
 
     return onset_matrix
 

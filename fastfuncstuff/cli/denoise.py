@@ -49,7 +49,9 @@ try:
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
+        add_trim_args,
         add_verbose_arg,
+        apply_trim_to_timing,
         auto_polort,
         blur_masked_data,
         collect_nuisance_blocks,
@@ -59,10 +61,12 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        run_lengths_from_starts,
         save_volume_nifti,
         setup_device,
         spinner,
         summarize_trial_repeats,
+        trim_spec_from_args,
     )
     from fastfuncstuff.denoise.sequential import (
         DenoiseResults,
@@ -552,6 +556,7 @@ Notes:
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
     add_load_threads_arg(proc_opts)
+    add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -1628,6 +1633,8 @@ def main():
         dry_run=args.dry_run,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
 
     # Modify prefix for dry run mode
@@ -1651,6 +1658,17 @@ def main():
     # Update args.tr with loaded value (for later use)
     if args.tr is None:
         args.tr = load_result.tr
+
+    # Timing was parsed before the load, so the -drop_first shift lands here,
+    # before the HRF/design machinery reads the onsets.
+    trim = trim_spec_from_args(args, tr=args.tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(run_starts, n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
 
     # HRF model parsing needs the TR (FIR/TENT derive their basis count from it),
     # so it has to wait until the header has been read.
@@ -1924,6 +1942,7 @@ def main():
         run_starts,
         n_timepoints,
         verbose=(args.verb >= 1),
+        trim=trim,
     )
     if nuisance_blocks_user:
         for run_idx in range(n_runs):

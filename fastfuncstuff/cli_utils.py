@@ -24,6 +24,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.design.trim import TrimSpec, TrimTimingReport, shift_onsets_for_trim
 from fastfuncstuff.utils import suppress_io_progress
 
 _NIFTI_EXTENSIONS = (".nii.zst", ".nii.gz", ".nii")
@@ -416,6 +417,8 @@ def load_and_preprocess_runs(
     dry_run: bool = False,
     verbose: bool = True,
     load_threads: int | None = None,
+    drop_first: int = 0,
+    drop_last: int = 0,
 ) -> LoadResult:
     """
     Load and preprocess fMRI data from multiple runs.
@@ -457,6 +460,12 @@ def load_and_preprocess_runs(
     load_threads : int, optional
         Runs to decode concurrently (``-load_threads``). Default: auto from
         CPU count and free RAM; 1 disables threading.
+    drop_first, drop_last : int, default=0
+        TRs dropped from each end of every run (``-drop_first``/``-drop_last``).
+        Applied during the load, so ``run_starts``, ``n_timepoints`` and the
+        percent-signal run means all describe the retained window. Event timing
+        must be shifted to match -- pass the same :class:`~fastfuncstuff.design.trim.TrimSpec`
+        to :func:`parse_timing_spec`.
 
     Returns
     -------
@@ -558,6 +567,9 @@ def load_and_preprocess_runs(
 
         first_img = load_nifti(input_files[0])
         run_length = first_img.shape[3] if len(first_img.shape) > 3 else first_img.shape[0]
+        # Synthesise the trimmed length, so a dry run exercises the same shapes
+        # (and the same design alignment) the real run would see.
+        run_length = max(1, run_length - drop_first - drop_last)
 
         if verbose:
             print(f"  Run length: {run_length} TRs")
@@ -630,7 +642,7 @@ def load_and_preprocess_runs(
         if n_tp is None:
             img = load_nifti(f)
             n_tp = img.shape[3] if len(img.shape) > 3 else 1
-        total_timepoints += n_tp
+        total_timepoints += max(0, n_tp - drop_first - drop_last)
 
     # Determine device strategy
     keep_on_cpu = estimate_device_strategy(
@@ -677,7 +689,15 @@ def load_and_preprocess_runs(
         mask_flat=mask_flat,
         load_threads=load_threads,
         per_run_fn=per_run_fn,
+        drop_first=drop_first,
+        drop_last=drop_last,
     )
+
+    if verbose and (drop_first or drop_last):
+        print(
+            f"  Dropped {TrimSpec(drop_first, drop_last).describe()} from each of "
+            f"{len(input_files)} run(s) → {data.shape[1]} timepoints retained"
+        )
 
     # Remove duplicate last run_start
     if len(run_starts) > len(input_files):
@@ -1242,17 +1262,59 @@ def _slice_full_length_per_run(
     return out
 
 
+def run_lengths_from_starts(run_starts: list[int], n_timepoints: int) -> list[int]:
+    """Per-run TR counts implied by ``run_starts`` and the concatenated length."""
+    n_runs = len(run_starts)
+    return [
+        (run_starts[i + 1] if i < n_runs - 1 else n_timepoints) - run_starts[i]
+        for i in range(n_runs)
+    ]
+
+
 def make_nuisance_block_from_full_length(
     path: str | Path,
     label: str,
     run_starts: list[int],
     n_timepoints: int,
     transform: str = "none",
+    trim: TrimSpec | None = None,
 ) -> NuisanceBlock:
-    """Mode 1: one file with rows for *all* runs concatenated (pre-padded)."""
+    """Mode 1: one file with rows for *all* runs concatenated (pre-padded).
+
+    Under ``-drop_first``/``-drop_last`` the file may be either already trimmed
+    (matching the loaded data) or at the original acquired length, in which case
+    each run's block is trimmed here. Regressors like motion parameters are
+    produced from the untrimmed run, so demanding a pre-trimmed file would make
+    the flag unusable with the files people actually have.
+    """
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.trim import trim_run_series
 
     arr = load_nuisance_file(path)
+    trimmed_lengths = run_lengths_from_starts(run_starts, n_timepoints)
+
+    if trim is not None and trim.active and arr.shape[0] != n_timepoints:
+        # Walk the file on its own (untrimmed) run grid and trim each block.
+        untrimmed = [n + trim.total for n in trimmed_lengths]
+        if arr.shape[0] != sum(untrimmed):
+            raise ValueError(
+                f"{path}: has {arr.shape[0]} rows, but the design has {n_timepoints} "
+                f"timepoints after dropping {trim.describe()} per run "
+                f"(an untrimmed file would have {sum(untrimmed)} rows)."
+            )
+        blocks = []
+        off = 0
+        for i, n_un in enumerate(untrimmed):
+            blocks.append(trim_run_series(arr[off : off + n_un], trimmed_lengths[i], trim, path))
+            off += n_un
+        per_run = blocks
+        return NuisanceBlock(
+            label=label,
+            per_run=per_run,
+            source=[str(path)] * len(run_starts),
+            transform=transform,
+        )
+
     if arr.shape[0] != n_timepoints:
         raise ValueError(
             f"{path}: has {arr.shape[0]} rows, design has {n_timepoints} total timepoints"
@@ -1273,9 +1335,15 @@ def make_nuisance_block_from_per_run_file(
     run_starts: list[int],
     n_timepoints: int,
     transform: str = "none",
+    trim: TrimSpec | None = None,
 ) -> NuisanceBlock:
-    """Mode 2: one file that covers exactly one run; other runs get zeros."""
+    """Mode 2: one file that covers exactly one run; other runs get zeros.
+
+    Accepts a trimmed or an untrimmed file (see
+    :func:`make_nuisance_block_from_full_length`).
+    """
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.trim import trim_run_series
 
     n_runs = len(run_starts)
     run_idx = run_idx_1based - 1
@@ -1285,7 +1353,9 @@ def make_nuisance_block_from_per_run_file(
         run_idx
     ]
     arr = load_nuisance_file(path)
-    if arr.shape[0] != expected:
+    if trim is not None and trim.active:
+        arr = trim_run_series(arr, expected, trim, path)
+    elif arr.shape[0] != expected:
         raise ValueError(
             f"{path}: has {arr.shape[0]} rows, run {run_idx_1based} has {expected} timepoints"
         )
@@ -1304,12 +1374,15 @@ def make_nuisance_block_from_glob(
     run_starts: list[int],
     n_timepoints: int,
     transform: str = "none",
+    trim: TrimSpec | None = None,
 ) -> NuisanceBlock:
     """Mode 3: glob matches N files; infer per-file run index from filename.
 
-    Runs absent from the glob are zero-padded into the block.
+    Runs absent from the glob are zero-padded into the block. Each matched file
+    may be trimmed or untrimmed (see :func:`make_nuisance_block_from_full_length`).
     """
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.trim import trim_run_series
 
     matched = sorted(Path(p) for p in glob_module.glob(pattern))
     if not matched:
@@ -1329,7 +1402,9 @@ def make_nuisance_block_from_glob(
             run_idx
         ]
         arr = load_nuisance_file(path)
-        if arr.shape[0] != expected:
+        if trim is not None and trim.active:
+            arr = trim_run_series(arr, expected, trim, path)
+        elif arr.shape[0] != expected:
             raise ValueError(
                 f"{path}: has {arr.shape[0]} rows, run {run_idx + 1} has {expected} timepoints"
             )
@@ -1461,6 +1536,7 @@ def collect_nuisance_blocks(
     n_timepoints: int,
     verbose: bool = False,
     prefix: str = "",
+    trim: TrimSpec | None = None,
 ) -> list[NuisanceBlock]:
     """Translate argparse Namespace fields into a list of NuisanceBlock.
 
@@ -1472,6 +1548,10 @@ def collect_nuisance_blocks(
     ``prefix`` must match the one given to ``add_ortvec_arguments``; it selects
     the prefixed flag family (``-test_ortvec`` …) instead of the plain one, and
     ``run_starts``/``n_timepoints`` then describe that family's dataset.
+
+    ``trim`` lets each file be supplied either already trimmed or at its
+    original acquired length; without it, an untrimmed motion file against
+    ``-drop_first`` data is a hard row-count error.
     """
     p = prefix
     blocks: list[NuisanceBlock] = []
@@ -1484,6 +1564,7 @@ def collect_nuisance_blocks(
                 run_starts,
                 n_timepoints,
                 transform=tf,
+                trim=trim,
             )
         )
         if verbose:
@@ -1503,6 +1584,7 @@ def collect_nuisance_blocks(
                 run_starts,
                 n_timepoints,
                 transform=tf,
+                trim=trim,
             )
         )
         if verbose:
@@ -1515,6 +1597,7 @@ def collect_nuisance_blocks(
             run_starts,
             n_timepoints,
             transform=tf,
+            trim=trim,
         )
         blocks.append(block)
         if verbose:
@@ -1537,6 +1620,7 @@ def collect_nuisance_blocks(
                     run_starts,
                     n_timepoints,
                     transform=tf,
+                    trim=trim,
                 )
             )
             if verbose:
@@ -2053,6 +2137,63 @@ def add_verbose_arg(parser_or_group, default: int = 1, dest: str = "verb"):
     )
 
 
+def add_trim_args(parser_or_group) -> None:
+    """Register ``-drop_first`` / ``-drop_last`` on a parser or argument group.
+
+    ``-skip_first``/``-skip_last`` are accepted as aliases because ``ffs_moco``
+    established that spelling for the same operation on a single series.
+
+    Every tool that fits a model to timing must resolve these through
+    :func:`trim_spec_from_args` and hand the result to both the loader and
+    :func:`parse_timing_spec`; the timing shift is not optional.
+    """
+    parser_or_group.add_argument(
+        "-drop_first",
+        "-drop-first",
+        "-skip_first",
+        "-skip-first",
+        dest="drop_first",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Drop the first N TRs of every run (steady-state volumes, say). "
+            "Event timing is shifted back by N*TR automatically, and the shift "
+            "is reported. An event that began before the retained window but is "
+            "still ongoing at its start is kept, with a truncated response."
+        ),
+    )
+    parser_or_group.add_argument(
+        "-drop_last",
+        "-drop-last",
+        "-skip_last",
+        "-skip-last",
+        dest="drop_last",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Drop the last N TRs of every run. Needs no timing shift (the run's "
+            "time origin does not move), but events left past the new run end "
+            "are dropped and reported."
+        ),
+    )
+
+
+def trim_spec_from_args(args, tr: float | None = None) -> TrimSpec:
+    """Build a :class:`TrimSpec` from parsed ``-drop_first``/``-drop_last`` args.
+
+    *tr* is usually unknown until the data is loaded, hence
+    :meth:`TrimSpec.with_tr` -- but the spec is needed *before* the load to size
+    the buffers, so it is built TR-less first and completed afterwards.
+    """
+    return TrimSpec(
+        drop_first=int(getattr(args, "drop_first", 0) or 0),
+        drop_last=int(getattr(args, "drop_last", 0) or 0),
+        tr=tr,
+    )
+
+
 def add_load_threads_arg(parser_or_group) -> None:
     """Register ``-load_threads`` on a parser or argument group.
 
@@ -2224,6 +2365,8 @@ def parse_timing_spec(
     round_durations: int | None = None,
     input_files: list[str] | None = None,
     verbose: bool = True,
+    trim: TrimSpec | None = None,
+    run_lengths_tr: list[int] | None = None,
 ) -> TimingSpec:
     """Parse the timing spec of an ``ffs_*`` GLM tool into a common structure.
 
@@ -2236,6 +2379,14 @@ def parse_timing_spec(
     Exactly one of *events* / *onsets* must be non-empty. Raises ``ValueError``
     (or ``FileNotFoundError``) with a user-facing message on any problem; the
     CLI is responsible for printing it and exiting.
+
+    When *trim* is given (and carries a TR), every onset is shifted back by
+    ``trim.shift_sec`` so the timing describes the *retained* window rather than
+    the file on disk -- see :mod:`fastfuncstuff.design.trim`. This is the single
+    place that shift happens, so no CLI can wire ``-drop_first`` into its loader
+    and forget the timing. *run_lengths_tr* (post-trim, per run) lets events
+    stranded past the new run end be dropped as well; without it only the
+    start-of-run side is checked.
     """
     from fastfuncstuff.design.bids_events import check_events_pairing, parse_bids_events
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
@@ -2302,6 +2453,11 @@ def parse_timing_spec(
             onset_files=list(onsets),
         )
 
+    # Shift AFTER parsing, so both timing formats get it and the numbers printed
+    # below are the ones the design is actually built from.
+    if trim is not None:
+        apply_trim_to_timing(spec, trim, run_lengths_tr, n_runs=n_runs, verbose=verbose)
+
     if verbose:
         print(f"  Conditions: {spec.n_conditions} ({', '.join(spec.condition_labels)})")
         for cidx, label in enumerate(spec.condition_labels):
@@ -2312,6 +2468,50 @@ def parse_timing_spec(
             )
 
     return spec
+
+
+def apply_trim_to_timing(
+    spec: TimingSpec,
+    trim: TrimSpec,
+    run_lengths_tr: list[int] | None = None,
+    n_runs: int | None = None,
+    verbose: bool = True,
+) -> TrimTimingReport | None:
+    """Shift a :class:`TimingSpec` in place to match ``-drop_first`` trimmed data.
+
+    Separate from :func:`parse_timing_spec` because most CLIs parse their timing
+    before loading any data -- they need the condition list to validate other
+    flags -- and so do not know the TR or the run lengths until later. Those
+    call this once the load is done; CLIs that already know the TR up front get
+    it for free by passing ``trim=`` to :func:`parse_timing_spec`.
+
+    Returns the report (``None`` when the spec is inactive or TR-less), having
+    already printed it when *verbose*.
+    """
+    if not trim.active or trim.tr is None:
+        return None
+
+    n_runs = n_runs if n_runs is not None else len(spec.all_onsets[0]) if spec.all_onsets else 0
+    if run_lengths_tr is not None:
+        run_lengths_sec = [n * trim.tr for n in run_lengths_tr]
+    else:
+        # Without run lengths only the start-of-run side can be checked; late
+        # events are left for the caller's own late-event guard.
+        run_lengths_sec = [float("inf")] * n_runs
+    if len(run_lengths_sec) == 1 and n_runs > 1:
+        run_lengths_sec = run_lengths_sec * n_runs
+
+    spec.all_onsets, report = shift_onsets_for_trim(
+        spec.all_onsets,
+        spec.durations,
+        spec.condition_labels,
+        run_lengths_sec,
+        trim,
+    )
+    if verbose:
+        for line in report.lines():
+            print(line)
+    return report
 
 
 def parse_hrf_model_args(
@@ -2683,7 +2883,10 @@ def blur_masked_data(
         fwhm_mm=fwhm_mm,
         voxel_sizes=voxel_sizes,
         device=device,
-        verbose=verbose,
+        # Silent: this is the one-volume mask normalizer, and its "Blurred 1
+        # volumes" progress bar reads as if the whole dataset were one volume
+        # (the per-run data blurs below are the real work, and are quiet).
+        verbose=False,
     ).reshape(n_vol_voxels)
     # Below this the normalizer is all edge and the quotient is noise amplification.
     weight = np.where(weight > 1e-3, weight, np.inf)

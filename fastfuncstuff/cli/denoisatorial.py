@@ -50,15 +50,19 @@ try:
         LoadResult,
         add_load_threads_arg,
         add_ortvec_arguments,
+        add_trim_args,
         add_verbose_arg,
         append_nuisance_blocks,
+        apply_trim_to_timing,
         auto_polort,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        run_lengths_from_starts,
         setup_device,
+        trim_spec_from_args,
     )
     from fastfuncstuff.denoise.combinatorial import (
         CombinatorialDenoiseResults,
@@ -549,6 +553,7 @@ Notes:
         help="Load data to CPU and process in GPU chunks (for large datasets)",
     )
     add_load_threads_arg(proc_opts)
+    add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -1067,6 +1072,8 @@ def main():
         dry_run=args.dry_run,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
 
     # Modify prefix for dry run mode
@@ -1085,6 +1092,16 @@ def main():
 
     if args.tr is None:
         args.tr = load_result.tr
+
+    # Timing was parsed before the load, so the -drop_first shift lands here.
+    trim = trim_spec_from_args(args, tr=args.tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(run_starts, n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
 
     nifti_header = load_result.nifti_header
 
@@ -1300,6 +1317,7 @@ def main():
         run_starts,
         n_timepoints,
         verbose=(args.verb >= 1),
+        trim=trim,
     )
     nuisance_per_run = append_nuisance_blocks(
         nuisance_per_run, user_blocks, run_starts, n_timepoints
@@ -1613,6 +1631,8 @@ def main():
             dry_run=False,
             verbose=True,
             load_threads=args.load_threads,
+            drop_first=args.drop_first,
+            drop_last=args.drop_last,
         )
 
         if tuple(test_load.volume_shape) != tuple(volume_shape):
@@ -1625,6 +1645,15 @@ def main():
         test_data = test_load.data
         test_run_starts = test_load.run_starts
         test_n_timepoints = test_load.n_timepoints
+
+        # The held-out runs are trimmed the same way, so their timing needs the
+        # same shift -- against their own run lengths, which may differ.
+        apply_trim_to_timing(
+            test_timing,
+            trim,
+            run_lengths_tr=run_lengths_from_starts(test_run_starts, test_n_timepoints),
+            n_runs=n_test_runs,
+        )
 
         # Restrict the held-out runs to exactly the voxels that were analysed
         # (mask / automask / constant-voxel filter all folded into mask_flat).
@@ -1702,6 +1731,7 @@ def main():
             test_n_timepoints,
             verbose=(args.verb >= 1),
             prefix="test_",
+            trim=trim,
         )
         test_nuisance_per_run = append_nuisance_blocks(
             test_nuisance_per_run, test_blocks, test_run_starts, test_n_timepoints

@@ -342,6 +342,25 @@ def build_parser() -> argparse.ArgumentParser:
         "not here.",
     )
     g.add_argument(
+        "-glm_drop_first",
+        "-glm-drop-first",
+        type=int,
+        default=0,
+        metavar="N",
+        help="drop the first N TRs of every run at GLM time (steady-state "
+        "volumes). Event timing is shifted back by N*TR and the design is "
+        "compiled against the trimmed runs, so onsets stay aligned.",
+    )
+    g.add_argument(
+        "-glm_drop_last",
+        "-glm-drop-last",
+        type=int,
+        default=0,
+        metavar="N",
+        help="drop the last N TRs of every run at GLM time. Needs no timing "
+        "shift, but events left past the new run end are dropped.",
+    )
+    g.add_argument(
         "-glm_spec_overwrite",
         "-glm-spec-overwrite",
         action="store_true",
@@ -923,6 +942,8 @@ def main(argv: list[str] | None = None) -> int:
         run_glm=(False if args.no_glm else rget("run_glm", True)),
         glm_ortvec=_resolve_glm_ortvec(args, recipe),
         glm_opts=args.glm_opts or "",
+        glm_drop_first=args.glm_drop_first,
+        glm_drop_last=args.glm_drop_last,
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,

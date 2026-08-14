@@ -407,6 +407,7 @@ def analyze_from_design_matrix(
     slibase_files: list[str | Path] | None = None,
     slibase_files_sm: list[str | Path] | None = None,
     censor_file: str | Path | None = None,
+    censor_trim=None,
     want_residuals: bool = False,
     want_ljung_box: bool = False,
     run_validity=None,
@@ -991,7 +992,18 @@ def analyze_from_design_matrix(
         from fastfuncstuff.io.afni import read_censor_1d
 
         n_expected = design_info.get("n_timepoints") or design.shape[0]
-        design_info["good_list"] = read_censor_1d(censor_file, n_expected=n_expected)
+        # A censor file computed on the untrimmed runs is the normal case under
+        # -drop_first, so hand read_censor_1d the run structure to trim it with.
+        _rs = list(design_info.get("run_starts") or [0])
+        _run_lengths = [
+            (_rs[i + 1] if i < len(_rs) - 1 else n_expected) - _rs[i] for i in range(len(_rs))
+        ]
+        design_info["good_list"] = read_censor_1d(
+            censor_file,
+            n_expected=n_expected,
+            run_lengths_tr=_run_lengths,
+            trim=censor_trim,
+        )
 
     good_list = design_info.get("good_list")
     # NRowFull (full, pre-censor TR count) is the reference length. AFNI xmats

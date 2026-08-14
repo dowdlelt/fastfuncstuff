@@ -2591,6 +2591,8 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             # -TR only when the user gave one: a 3D acquisition's header TR is the
             # per-partition time, not the volume TR the design is sampled at.
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
+            *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
+            *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
             *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
             '-device "$DEVICE"',
         ]

@@ -64,6 +64,11 @@ class Options:
     glm_ortvec: list[str] = field(default_factory=list)
     # Extra ffs_reml flags appended to the GLM command, as one string.
     glm_opts: str = ""
+    # TRs dropped from each end of every run at GLM time (ffs_reml
+    # -drop_first/-drop_last). Dropping leading TRs shifts the event timing back
+    # by N*TR automatically -- the design is compiled against the trimmed runs.
+    glm_drop_first: int = 0
+    glm_drop_last: int = 0
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False

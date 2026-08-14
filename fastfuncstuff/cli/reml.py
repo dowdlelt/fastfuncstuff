@@ -40,7 +40,9 @@ try:
         add_cv_strategy_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
+        add_trim_args,
         add_verbose_arg,
+        apply_trim_to_timing,
         auto_polort,
         build_nuisance_block_diag,
         collect_nuisance_blocks,
@@ -50,6 +52,7 @@ try:
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
@@ -838,6 +841,7 @@ Examples:
             "'cuda,N' to use GPU device N (e.g., 'cuda,0' for GPU 0)"
         ),
     )
+    add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-legacy_contrasts",
@@ -1427,6 +1431,8 @@ def main():
         print("ERROR: Must specify one of -matrix, -onsets, -events, or -spec")
         sys.exit(1)
 
+    _matrix_from_spec = False
+
     # ── -spec handling: compile to xmat *before* loading any data ────────
     # We do this early so a syntax error or missing event file fails fast
     # instead of after the slow input load. The compiled xmat becomes the
@@ -1454,12 +1460,17 @@ def main():
             xmat=str(compiled_xmat),
             verb=0,  # quiet — our header above + the REML banner are enough
             overwrite=args.overwrite,
+            # The xmat is built against the trimmed runs, so -drop_first works
+            # through -spec even though the compiled result is used as -matrix.
+            drop_first=int(getattr(args, "drop_first", 0) or 0),
+            drop_last=int(getattr(args, "drop_last", 0) or 0),
         )
         rc = _design_spec_compile(compile_args)
         if rc != 0:
             sys.exit(rc)
         args.matrix = str(compiled_xmat)
         args.spec = None  # downstream branches key off args.matrix from here
+        _matrix_from_spec = True
 
     # Auto-write Rvar alongside Rbuck so future ffs_concalc has the per-voxel
     # ARMA (a, b) it needs to rebuild (X̃ᵀX̃)⁻¹ on demand. AFNI does the same
@@ -1670,6 +1681,19 @@ def main():
         tr = get_tr_from_file(input_files[0])
         args.tr = tr
         print(f"⏱️  TR: {tr:.3f} seconds (from header)")
+
+    trim = trim_spec_from_args(args, tr=tr)
+    if trim.active and args.matrix and not _matrix_from_spec:
+        # A user-supplied xmat already fixes the timeline: its rows are the
+        # design, and there is no timing left to shift onto a shorter one. A
+        # spec is different -- it is compiled above against the trimmed runs.
+        print(
+            "ERROR: -drop_first/-drop_last cannot be combined with -matrix. The xmat "
+            "has a fixed row count; rebuild it against the trimmed runs (or use "
+            "-spec, which is compiled against them automatically).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     print()
 
     # Detect input format (for informational purposes only)
@@ -1859,13 +1883,23 @@ def main():
         print("Computing run structure...")
         run_starts = [0]
         total_tps = 0
+        run_lengths_tr: list[int] = []
         for f in input_files:
             img_shape = nifti_shape(f)
             run_len = img_shape[3] if len(img_shape) > 3 else img_shape[0]
+            # The run structure describes what survives -drop_first/-drop_last,
+            # because that is what the design and the loaded data will contain.
+            run_len = trim.trimmed_length(run_len) if trim.active else run_len
+            run_lengths_tr.append(run_len)
             total_tps += run_len
             if f != input_files[-1]:  # Don't add start for after last run
                 run_starts.append(total_tps)
         n_timepoints = total_tps
+
+        # Shift event timing onto the retained window (see design/trim.py). Done
+        # before the late-event guard below, so that guard judges the real design.
+        apply_trim_to_timing(timing, trim, run_lengths_tr=run_lengths_tr, n_runs=n_runs)
+        all_onsets = timing.all_onsets
 
         print(f"  Runs: {n_runs}")
         print(f"  Total timepoints: {n_timepoints}")
@@ -2746,6 +2780,8 @@ def main():
             input_files,
             keep_on_cpu=True,
             total_timepoints=total_tps,
+            drop_first=trim.drop_first,
+            drop_last=trim.drop_last,
             per_run_fn=_per_run if (guard_acc is not None or args.do_blur is not None) else None,
         )
         fmri_data_preprocessed = data_tensor.numpy()
@@ -3058,6 +3094,7 @@ def main():
             slibase_files=args.slibase,
             slibase_files_sm=args.slibase_sm,
             censor_file=args.censor,
+            censor_trim=trim,
             want_residuals=bool(args.Rerrts)
             or bool(args.save_clean)
             or (want_diag and bool(args.save_tsnr or args.save_acf)),

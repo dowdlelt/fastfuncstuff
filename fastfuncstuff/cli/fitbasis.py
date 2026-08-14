@@ -78,14 +78,18 @@ try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
         add_ortvec_arguments,
+        add_trim_args,
         add_verbose_arg,
         append_nuisance_blocks,
+        apply_trim_to_timing,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
+        run_lengths_from_starts,
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
         pack_for_shared_task_glm,
@@ -745,6 +749,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Print design rank/conditioning before the fit.",
     )
     add_load_threads_arg(proc)
+    add_trim_args(proc)
     add_verbose_arg(proc, default=1)
 
     # I/O extras
@@ -1492,6 +1497,8 @@ def main() -> int:
         dry_run=False,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
     data = load_result.data
     run_starts = load_result.run_starts
@@ -1502,6 +1509,16 @@ def main() -> int:
     n_timepoints = load_result.n_timepoints
     if args.tr is None:
         args.tr = tr
+
+    # Shift timing onto the retained window before rounding touches the onsets.
+    trim = trim_spec_from_args(args, tr=tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(list(run_starts), n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
 
     if args.round_onsets is not None:
         from fastfuncstuff.design.builder import round_onsets as _round_onsets
@@ -1589,7 +1606,11 @@ def main() -> int:
     # signal ([[Block-diagonal nuisance]]).
     try:
         nuisance_blocks = collect_nuisance_blocks(
-            args, run_starts=list(run_starts), n_timepoints=n_timepoints, verbose=True
+            args,
+            run_starts=list(run_starts),
+            n_timepoints=n_timepoints,
+            verbose=True,
+            trim=trim,
         )
     except (FileNotFoundError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

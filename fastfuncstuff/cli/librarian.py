@@ -56,14 +56,18 @@ try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
         add_ortvec_arguments,
+        add_trim_args,
         add_verbose_arg,
+        apply_trim_to_timing,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
         parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
+        run_lengths_from_starts,
         spinner,
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,  # noqa: F401
@@ -597,6 +601,7 @@ Notes:
         ),
     )
     add_load_threads_arg(proc_grp)
+    add_trim_args(proc_grp)
     add_verbose_arg(proc_grp, default=1)
 
     # External nuisance.  The FIR curves this tool derives ARE the product,
@@ -1634,6 +1639,8 @@ def main() -> None:
         dry_run=False,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
     data = load_result.data
     run_starts = load_result.run_starts
@@ -1645,6 +1652,17 @@ def main() -> None:
     n_timepoints = load_result.n_timepoints
     if args.tr is None:
         args.tr = tr
+
+    # Shift timing onto the retained window before onsets are snapped to TRs.
+    trim = trim_spec_from_args(args, tr=tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(list(run_starts), n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
+
     print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
 
     # Snap onsets to TR boundaries (now that TR is known).  Applies to
@@ -1735,7 +1753,7 @@ def main() -> None:
     # anything left in the FIR curves becomes spurious shape variance in
     # the SVD and lands in the library.
     nuisance_blocks = collect_nuisance_blocks(
-        args, run_starts_ext[:-1], n_timepoints, verbose=args.verb >= 1
+        args, run_starts_ext[:-1], n_timepoints, verbose=args.verb >= 1, trim=trim
     )
     extra_per_run: list[torch.Tensor] | None = None
     if nuisance_blocks:

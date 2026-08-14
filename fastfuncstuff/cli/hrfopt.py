@@ -46,7 +46,9 @@ try:
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_single_trial_args,
+        add_trim_args,
         add_verbose_arg,
+        apply_trim_to_timing,
         auto_polort,
         blur_masked_data,
         build_nuisance_per_run,
@@ -60,9 +62,11 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        run_lengths_from_starts,
         save_volume_nifti,
         spinner,
         summarize_trial_repeats,
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
@@ -441,6 +445,7 @@ Notes:
         "'auto' selects based on CV strategy (default: auto).",
     )
     add_load_threads_arg(proc_opts)
+    add_trim_args(proc_opts)
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-debug",
@@ -693,6 +698,8 @@ def main():
         dry_run=args.dry_run,
         verbose=True,
         load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
     )
 
     # Modify prefix for dry run mode
@@ -723,6 +730,17 @@ def main():
     print(f"  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")
     print(f"  Runs: {n_runs} starting at {run_starts}")
+
+    # The timing was parsed before the load (the condition list gates other
+    # flags), so the -drop_first shift lands here, once the TR is known.
+    trim = trim_spec_from_args(args, tr=tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=run_lengths_from_starts(run_starts, n_timepoints),
+        n_runs=n_runs,
+    )
+    all_onsets = timing.all_onsets
 
     # ==========================================================================
     # 3. Parse onset files and build onset matrix
@@ -801,6 +819,7 @@ def main():
         run_starts,
         n_timepoints,
         verbose=(args.verb >= 1),
+        trim=trim,
     )
     # Legacy variable retained for back-compat fields (metadata + delta-denoise label).
     ortvec_files = [(f, label) for f, label in args.ortvec] if args.ortvec else None

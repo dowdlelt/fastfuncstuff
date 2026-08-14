@@ -1061,6 +1061,8 @@ def load_and_concatenate_runs(
     total_timepoints: int | None = None,
     load_threads: int | None = None,
     per_run_fn: Callable[[torch.Tensor, int], torch.Tensor] | None = None,
+    drop_first: int = 0,
+    drop_last: int = 0,
 ) -> tuple[torch.Tensor, list[int]]:
     """
     Load multiple fMRI run files and concatenate them (memory-efficient)
@@ -1104,6 +1106,14 @@ def load_and_concatenate_runs(
         preprocessing belongs (spatial blur, for instance): doing it afterwards
         would need the whole concatenated dataset resident twice. Must return
         the same shape and device it was given. Applied after ``mask_flat``.
+    drop_first, drop_last : int, default=0
+        TRs to drop from the start / end of *each* run before concatenation, so
+        ``run_starts`` and every downstream step describe the trimmed data.
+        Trimming here rather than after concatenation keeps dropped volumes out
+        of per-run steps that would otherwise be contaminated by them (percent
+        signal change divides by a run mean; a blur is unaffected either way).
+        Callers that also have event timing must shift it -- see
+        ``design/trim.py``.
 
     Returns
     -------
@@ -1152,7 +1162,10 @@ def load_and_concatenate_runs(
     if total_timepoints is None and len(run_files) > 1:
         peeked = [_peek_run_length(f) for f in run_files]
         if all(p is not None for p in peeked):
-            total_timepoints = int(sum(p for p in peeked if p is not None))
+            # The buffer holds what survives trimming, not what is on disk.
+            total_timepoints = int(
+                sum(max(0, p - drop_first - drop_last) for p in peeked if p is not None)
+            )
 
     concatenated: torch.Tensor | None = None
     torch_runs: list[torch.Tensor] = []
@@ -1223,6 +1236,17 @@ def load_and_concatenate_runs(
 
         # Delete numpy array immediately to free memory
         del data_np
+
+        # Trim before anything else sees the run: run_starts, the percent-signal
+        # run mean and any per-run callback must all describe the retained window.
+        if drop_first or drop_last:
+            nt_disk = data_torch.shape[1]
+            if drop_first + drop_last >= nt_disk:
+                raise ValueError(
+                    f"-drop_first {drop_first} + -drop_last {drop_last} removes all "
+                    f"{nt_disk} TRs of run {i} ({run_file})."
+                )
+            data_torch = data_torch[:, drop_first : nt_disk - drop_last].contiguous()
 
         # Per-run preprocessing (blur, etc.) happens here, while the run is the
         # only copy in flight -- doing it after concatenation would need the
@@ -1603,7 +1627,12 @@ def select_regressors_by_group(
     return matrix[:, selected_cols]
 
 
-def read_censor_1d(filepath: str | Path, n_expected: int | None = None) -> list[int]:
+def read_censor_1d(
+    filepath: str | Path,
+    n_expected: int | None = None,
+    run_lengths_tr: list[int] | None = None,
+    trim=None,
+) -> list[int]:
     """Read an AFNI-style censor ``.1D`` file into a GoodList.
 
     The file is one value per concatenated timepoint (length = total TRs across
@@ -1618,6 +1647,11 @@ def read_censor_1d(filepath: str | Path, n_expected: int | None = None) -> list[
         Expected number of timepoints (total concatenated length). If given and
         the file length differs, a ValueError is raised — a length mismatch
         almost always means the censor file does not match the data/design.
+    run_lengths_tr : list[int], optional
+        Per-run TR counts *after* trimming. With *trim*, lets an untrimmed
+        censor file be trimmed here rather than rejected.
+    trim : TrimSpec, optional
+        The ``-drop_first``/``-drop_last`` spec the data was loaded with.
 
     Returns
     -------
@@ -1641,6 +1675,26 @@ def read_censor_1d(filepath: str | Path, n_expected: int | None = None) -> list[
         raise ValueError(
             f"Censor file {filepath} must contain only 0 and 1; found values {sorted(uniq)}"
         )
+
+    # Censor files are produced from the untrimmed run (1d_tool.py reads the raw
+    # motion params), so under -drop_first/-drop_last accept either length and
+    # trim per run -- the alternative is making the two flags mutually unusable.
+    if trim is not None and getattr(trim, "active", False) and run_lengths_tr is not None:
+        from fastfuncstuff.design.trim import trim_run_series
+
+        if len(values) != sum(run_lengths_tr):
+            blocks = []
+            off = 0
+            for n_trimmed in run_lengths_tr:
+                n_un = n_trimmed + trim.total
+                blocks.append(trim_run_series(values[off : off + n_un], n_trimmed, trim, filepath))
+                off += n_un
+            if off != len(values):
+                raise ValueError(
+                    f"Censor file {filepath} has {len(values)} rows; expected "
+                    f"{sum(run_lengths_tr)} (trimmed) or {off} (untrimmed)."
+                )
+            values = np.concatenate(blocks)
 
     if n_expected is not None and len(values) != n_expected:
         raise ValueError(

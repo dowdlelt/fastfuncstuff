@@ -317,6 +317,32 @@ def _read_events_for_condition(
     return out
 
 
+def _shift_events_for_trim(
+    per_run: list[list[tuple[float, float]]],
+    trim,
+    run_lengths_sec: list[float],
+) -> list[list[tuple[float, float]]]:
+    """Shift (onset, duration) pairs onto the -drop_first retained window.
+
+    The spec path carries a real duration per *event* (not one per condition),
+    so the overlap test here is exact: keep anything whose ``[onset, onset+dur)``
+    still intersects ``[0, run_end)``. Negative onsets are kept -- the event
+    began before the retained window but is still running inside it, and the
+    builder truncates its boxcar (see fastfuncstuff/design/trim.py).
+    """
+    shift = trim.shift_sec
+    out: list[list[tuple[float, float]]] = []
+    for r, run in enumerate(per_run):
+        end = run_lengths_sec[r] if r < len(run_lengths_sec) else float("inf")
+        kept = []
+        for onset, dur in run:
+            o = onset - shift
+            if (o + dur) > 0.0 and o < end:
+                kept.append((o, dur))
+        out.append(kept)
+    return out
+
+
 def _write_afni_timing(
     path: Path,
     per_run_onsets: list[list[float]],
@@ -359,6 +385,8 @@ def _expand_event_to_stims(
     cols: tuple[str, str, str],
     tr: float,
     tmpdir: Path,
+    trim=None,
+    run_lengths_sec: list[float] | None = None,
 ) -> list[tuple[Path, str, str, bool]]:
     """
     Expand one EventSpec into one or more (timing_file, label, hrf, im_flag)
@@ -384,6 +412,9 @@ def _expand_event_to_stims(
         )
         for ef in events_files
     ]
+
+    if trim is not None and trim.active:
+        per_run = _shift_events_for_trim(per_run, trim, run_lengths_sec or [])
 
     # Resolve duration: explicit number vs from_events.
     if event.duration == "from_events":
@@ -515,11 +546,48 @@ def _materialize_nuisance(
     return out
 
 
+def _trim_1d_for_compile(
+    path: Path,
+    expected: list[int],
+    trim,
+    tmpdir: Path | None,
+) -> Path:
+    """Trim a nuisance .1D onto the retained window, if it is not already.
+
+    Motion/physio regressors are produced from the untrimmed runs, so under
+    -drop_first the file on disk is longer than the design. Accept either length
+    (see fastfuncstuff/design/trim.py) and write the trimmed copy to *tmpdir*.
+    """
+    from fastfuncstuff.design.trim import trim_run_series
+
+    if trim is None or not trim.active:
+        return path
+    arr = np.loadtxt(path, ndmin=2)
+    if arr.shape[0] == sum(expected):
+        return path
+    blocks, off = [], 0
+    for n_trimmed in expected:
+        n_un = n_trimmed + trim.total
+        blocks.append(trim_run_series(arr[off : off + n_un], n_trimmed, trim, path))
+        off += n_un
+    if off != arr.shape[0]:
+        raise ValueError(
+            f"{path}: has {arr.shape[0]} rows; expected {sum(expected)} (trimmed) or {off} "
+            f"(untrimmed, before dropping {trim.describe()} per run)."
+        )
+    if tmpdir is None:
+        raise RuntimeError(f"{path}: trimming needs a tmpdir to write to")
+    out = tmpdir / f"trimmed_{path.name}"
+    np.savetxt(out, np.concatenate(blocks))
+    return out
+
+
 def _resolve_nuisance_for_compile(
     nuisance: list[NuisanceSpec],
     n_runs: int,
     n_timepoints_per_run: list[int],
     tmpdir: Path | None = None,
+    trim=None,
 ) -> tuple[list[tuple[Path, str]], list[tuple[Path, str, int]]]:
     """Return (ortvec_files, padortvec_files) for build_design_matrix.
 
@@ -542,7 +610,12 @@ def _resolve_nuisance_for_compile(
             ortvec_files.append(
                 (
                     _materialize_nuisance(
-                        Path(n.file or ""), n, tmpdir, run_lengths=n_timepoints_per_run
+                        _trim_1d_for_compile(
+                            Path(n.file or ""), n_timepoints_per_run, trim, tmpdir
+                        ),
+                        n,
+                        tmpdir,
+                        run_lengths=n_timepoints_per_run,
                     ),
                     n.label,
                 )
@@ -552,7 +625,17 @@ def _resolve_nuisance_for_compile(
             if run_idx < 1 or run_idx > n_runs:
                 raise ValueError(f"nuisance '{n.label}': run {run_idx} out of range [1, {n_runs}]")
             padortvec_files.append(
-                (_materialize_nuisance(Path(n.file or ""), n, tmpdir), n.label, run_idx)
+                (
+                    _materialize_nuisance(
+                        _trim_1d_for_compile(
+                            Path(n.file or ""), [n_timepoints_per_run[run_idx - 1]], trim, tmpdir
+                        ),
+                        n,
+                        tmpdir,
+                    ),
+                    n.label,
+                    run_idx,
+                )
             )
         elif n.scope == "glob":
             if not n.pattern:
@@ -568,6 +651,7 @@ def _resolve_nuisance_for_compile(
             # Pre-validate row counts so failures point at the glob source.
             for path, run_idx0 in zip(matched, run_indices_0, strict=True):
                 expected = n_timepoints_per_run[run_idx0]
+                path = _trim_1d_for_compile(path, [expected], trim, tmpdir)
                 n_rows = _count_1d_rows(path)
                 if n_rows != expected:
                     raise ValueError(
@@ -663,6 +747,30 @@ def _do_compile(args: argparse.Namespace) -> int:
     xmat_path = Path(args.xmat)
     if not _confirm_overwrite(xmat_path, args.overwrite, "xmat"):
         return 1
+
+    # -drop_first/-drop_last (passed through by `ffs_reml -spec`): the xmat must
+    # be BUILT against the trimmed runs, since it is the design the trimmed data
+    # will be fit with. Reducing the run lengths here makes every downstream
+    # consumer -- polort, nuisance padding, run_starts -- describe the retained
+    # window; the event shift rides along into _expand_event_to_stims.
+    from fastfuncstuff.design.trim import TrimSpec
+
+    trim = TrimSpec(
+        drop_first=int(getattr(args, "drop_first", 0) or 0),
+        drop_last=int(getattr(args, "drop_last", 0) or 0),
+        tr=spec.meta.tr,
+    )
+    if trim.active:
+        spec.meta.n_timepoints_per_run = [
+            trim.trimmed_length(n) for n in spec.meta.n_timepoints_per_run
+        ]
+        print(
+            f"✂️  Dropping {trim.describe()} per run → "
+            f"{spec.meta.n_timepoints_per_run} TRs; "
+            f"event timing shifted back by {trim.shift_sec:.3f}s",
+            flush=True,
+        )
+    run_lengths_sec = [n * spec.meta.tr for n in spec.meta.n_timepoints_per_run]
     cols = (
         spec.meta.events_columns.onset,
         spec.meta.events_columns.duration,
@@ -697,7 +805,7 @@ def _do_compile(args: argparse.Namespace) -> int:
     im_modes: list[bool] = []
     for ev in spec.events:
         for path, label, hrf, im_flag in _expand_event_to_stims(
-            ev, events_files, cols, spec.meta.tr, tmpdir
+            ev, events_files, cols, spec.meta.tr, tmpdir, trim, run_lengths_sec
         ):
             timing_files.append(path)
             stim_labels.append(label)
@@ -713,6 +821,7 @@ def _do_compile(args: argparse.Namespace) -> int:
         n_runs=len(spec.meta.runs),
         n_timepoints_per_run=spec.meta.n_timepoints_per_run,
         tmpdir=tmpdir,
+        trim=trim,
     )
 
     # A condition that only fires in a subset of runs is legal (its column is
