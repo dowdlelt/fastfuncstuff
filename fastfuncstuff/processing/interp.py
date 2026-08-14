@@ -303,8 +303,73 @@ def warp_image_multi(
     Returns one warped volume per input channel, in order.
     """
     mode = normalize_interp_mode(mode)
-    if mode in ("linear", "nearest"):
-        return [warp_image(s, warp_xd, warp_yd, warp_zd, mode=mode) for s in sources]
+    if not sources:
+        return []
+
+    # Treat co-registered inputs as grid_sample channels. This shares both the
+    # coordinate grid and the interpolation launch; looping channels is especially
+    # expensive on MPS, where launch latency dominates small/medium volumes.
+    if mode == "linear":
+        stack = torch.stack(tuple(sources), dim=0)
+        out_nz, out_ny, out_nx = warp_xd.shape
+        src_nz, src_ny, src_nx = stack.shape[-3:]
+        device = warp_xd.device
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(out_nz, dtype=torch.float32, device=device),
+            torch.arange(out_ny, dtype=torch.float32, device=device),
+            torch.arange(out_nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        x = ii + warp_xd
+        y = jj + warp_yd
+        z = kk + warp_zd
+        oob = (
+            (x < -0.5)
+            | (x > src_nx - 0.5)
+            | (y < -0.5)
+            | (y > src_ny - 0.5)
+            | (z < -0.5)
+            | (z > src_nz - 0.5)
+        )
+        x = x.clamp(-0.499, src_nx - 0.501)
+        y = y.clamp(-0.499, src_ny - 0.501)
+        z = z.clamp(-0.499, src_nz - 0.501)
+        gx = 2.0 * x / (src_nx - 1) - 1.0 if src_nx > 1 else x * 0.0
+        gy = 2.0 * y / (src_ny - 1) - 1.0 if src_ny > 1 else y * 0.0
+        gz = 2.0 * z / (src_nz - 1) - 1.0 if src_nz > 1 else z * 0.0
+        grid = torch.stack([gx, gy, gz], dim=-1)[None]
+        result = _grid_sample_3d(stack[None], grid)[0]
+        result[:, oob] = 0.0
+        return list(result.unbind(0))
+
+    if mode == "nearest":
+        stack = torch.stack(tuple(sources), dim=0)
+        out_nz, out_ny, out_nx = warp_xd.shape
+        src_nz, src_ny, src_nx = stack.shape[-3:]
+        device = warp_xd.device
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(out_nz, dtype=torch.float32, device=device),
+            torch.arange(out_ny, dtype=torch.float32, device=device),
+            torch.arange(out_nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+        x, y, z = ii + warp_xd, jj + warp_yd, kk + warp_zd
+        oob = (
+            (x < -0.5)
+            | (x > src_nx - 0.5)
+            | (y < -0.5)
+            | (y > src_ny - 0.5)
+            | (z < -0.5)
+            | (z > src_nz - 0.5)
+        )
+        result = stack[
+            :,
+            z.round().long().clamp(0, src_nz - 1),
+            y.round().long().clamp(0, src_ny - 1),
+            x.round().long().clamp(0, src_nx - 1),
+        ]
+        result[:, oob] = 0.0
+        return list(result.unbind(0))
 
     out_nz, out_ny, out_nx = warp_xd.shape
     device = warp_xd.device

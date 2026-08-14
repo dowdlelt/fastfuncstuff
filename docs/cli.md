@@ -11,6 +11,9 @@ Conventions used below:
   PyTorch's 3-D grid-sample backward currently falls back from MPS to CPU. Explicit
   `-device mps` remains available. `ffs_optiwarp` is forward-only and can benefit from
   MPS, particularly with its LK and Horn–Schunck force models.
+- `ffs_nwarp` is also a strong MPS path for full-size volumes. Static nonlinear
+  4-D applies batch frames with shared coordinates; time-varying motion and joint
+  slice timing retain their per-frame or sliding-window algorithms.
 - `ffs_nordic`, `ffs_blipflip`, and `ffs_segment` also resolve auto to CPU on Mac.
   NORDIC's usual complex SVD falls back to CPU; blipflip and segment require operations
   MPS cannot perform. Whole-brain `ffs_pyrf` can benefit from MPS, while `ffs_ica`

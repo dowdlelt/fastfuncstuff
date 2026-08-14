@@ -285,6 +285,23 @@ def test_all_modes_run_and_identity():
         assert torch.allclose(out[3:-3, 3:-3, 3:-3], vol[3:-3, 3:-3, 3:-3], atol=1e-4), mode
 
 
+@pytest.mark.parametrize("mode", ["nearest", "linear", "cubic", "wsinc5"])
+def test_multi_channel_warp_matches_scalar_loop(mode):
+    """Shared-coordinate batching must remain identical to frame-wise apply."""
+    torch.manual_seed(73)
+    sources = [torch.randn(9, 10, 11) for _ in range(3)]
+    xd = torch.randn(9, 10, 11) * 0.15
+    yd = torch.randn(9, 10, 11) * 0.15
+    zd = torch.randn(9, 10, 11) * 0.15
+
+    expected = [I.warp_image(src, xd, yd, zd, mode=mode) for src in sources]
+    got = I.warp_image_multi(sources, xd, yd, zd, mode=mode)
+
+    assert len(got) == len(expected)
+    for actual, reference in zip(got, expected, strict=True):
+        assert torch.allclose(actual, reference, atol=2e-5, rtol=2e-5)
+
+
 # --------------------------------------------------------------------------
 # -no_neg
 # --------------------------------------------------------------------------

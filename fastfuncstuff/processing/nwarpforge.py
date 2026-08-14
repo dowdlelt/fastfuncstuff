@@ -29,7 +29,7 @@ from .interp import (
     _separable_resample_3d,
     normalize_interp_mode,
     trilinear_interpolate,
-    warp_image,
+    warp_image_multi,
 )
 from .io import (
     derive_prefixed_output_path,
@@ -1096,8 +1096,28 @@ def apply_composed_warp(
     Returns:
         Warped image on output grid
     """
+    return apply_composed_warp_multi(
+        [source], warp, source_affine, output_affine, interp=interp, no_neg=no_neg
+    )[0]
+
+
+def apply_composed_warp_multi(
+    sources: list[Tensor],
+    warp: NonlinearWarp,
+    source_affine: np.ndarray,
+    output_affine: np.ndarray,
+    interp: str = "wsinc5",
+    no_neg: bool = False,
+) -> list[Tensor]:
+    """Apply one composed warp to co-registered channels or time points.
+
+    Coordinate conversion and interpolation setup are shared across every input.
+    Callers remain responsible for memory-planned channel batching.
+    """
+    if not sources:
+        return []
     nz, ny, nx = warp.shape
-    device = source.device
+    device = sources[0].device
 
     # Build coordinate grids
     kk, jj, ii = torch.meshgrid(
@@ -1137,9 +1157,9 @@ def apply_composed_warp(
     src_yd = src_coords[1].reshape(nz, ny, nx) - jj
     src_zd = src_coords[2].reshape(nz, ny, nx) - kk
 
-    warped = warp_image(source, src_xd, src_yd, src_zd, mode=interp)
+    warped = warp_image_multi(sources, src_xd, src_yd, src_zd, mode=interp)
     if no_neg:
-        warped = warped.clamp_min(0.0)
+        warped = [vol.clamp_min(0.0) for vol in warped]
     return warped
 
 
@@ -1471,7 +1491,9 @@ def _needed_padding(
     """
     snz, sny, snx = (source.shape[-3], source.shape[-2], source.shape[-1])
     source_shape = (snz, sny, snx)
-    src3d = source[0] if source.ndim == 4 else source
+    # The full 4-D source normally remains host-backed; only this representative
+    # volume is needed for the foreground-mass probe.
+    src3d = (source[0] if source.ndim == 4 else source).to(device)
     nx, ny, nz = output_shape[-1], output_shape[-2], output_shape[-3]
     dims = (nx, ny, nz)
 
@@ -1741,7 +1763,12 @@ def nwarpforge(
         raise ValueError(f"ainterp must be one of {WARP_COMPOSE_INTERP}, got {ainterp!r}")
 
     t0_load = __import__("time").time()
-    source, source_header = load_image(source_path, device=device)
+    # A full fMRI series can exceed VRAM even though one interpolation batch fits.
+    # Keep 4-D data on the host and stream memory-planned frame batches below;
+    # 3-D inputs are small enough to place directly on the compute device.
+    source, source_header = load_image(source_path, device=None)
+    if source.ndim == 3:
+        source = source.to(device)
     # load_image's header_info is declared `object` (loose I/O boundary type)
     # but is always the {"affine": ..., "header": ...} dict it documents.
     assert isinstance(source_header, dict)
@@ -1753,7 +1780,9 @@ def nwarpforge(
     # --- Phase dataset handling ---
     phase_data: Tensor | None = None
     if phase_path is not None:
-        phase_raw, _ = load_image(phase_path, device=device)
+        phase_raw, _ = load_image(phase_path, device=None)
+        if phase_raw.ndim == 3:
+            phase_raw = phase_raw.to(device)
         if phase_raw.shape != source.shape:
             raise ValueError(
                 f"-phase shape {tuple(phase_raw.shape)} does not match "
@@ -1858,7 +1887,7 @@ def nwarpforge(
         if verb >= 1:
             print("nwarpforge: -master WARP -> output grid = first nonlinear warp")
     elif master_path is not None:
-        master, master_header = load_image(master_path, device=device)
+        master, master_header = load_image(master_path, device=None)
         assert isinstance(master_header, dict)
         if master.ndim == 4:
             master = master[0]
@@ -2239,8 +2268,51 @@ def nwarpforge(
             return vol
         return vol * jac
 
+    # Static nonlinear chain + 4-D source: every frame uses identical sample
+    # coordinates. Share coordinate conversion, index tables, kernel weights and
+    # (for linear) the grid_sample launch across memory-planned frame batches.
+    # This retains the single-resample semantics while avoiding T repetitions of
+    # interpolation setup. Time-varying motion and joint slice timing stay on the
+    # per-frame/sliding-window paths below because their coordinates differ.
+    static_series_batched = (
+        is_4d
+        and static_composed is not None
+        and phase_data is None
+        and slice_times_t is None
+        and not affine_only
+    )
+    if static_series_batched:
+        from fastfuncstuff.memory import compute_moco_resample_batch_size
+
+        onz, ony, onx = output_shape
+        n_frames = t_end - t_start
+        frame_batch = compute_moco_resample_batch_size(
+            onz, ony, onx, n_frames, device, interp=interp
+        )
+        frame_batch = max(1, min(frame_batch, n_frames))
+        if verb >= 1:
+            print(
+                "nwarpforge: static nonlinear chain -> shared-coordinate "
+                f"frame batches ({frame_batch} at a time)"
+            )
+        starts = range(t_start, t_end, frame_batch)
+        if verb > 0 and n_frames > frame_batch:
+            starts = tqdm(starts, desc="Warping frame batches", leave=True)
+        for start in starts:
+            stop = min(start + frame_batch, t_end)
+            source_batch = source[start:stop].to(device)
+            warped_batch = apply_composed_warp_multi(
+                list(source_batch.unbind(0)),
+                static_composed,
+                source_affine=source_header["affine"],
+                output_affine=output_affine,
+                interp=interp,
+                no_neg=no_neg,
+            )
+            output_volumes.extend(_stash(_apply_jac(vol, static_composed)) for vol in warped_batch)
+
     time_iter = tqdm(
-        range(t_start, t_end) if not affine_only else range(0),
+        range(t_start, t_end) if not (affine_only or static_series_batched) else range(0),
         desc="Warping volumes",
         disable=verb == 0 or (t_end - t_start) == 1,
     )
@@ -2300,10 +2372,10 @@ def nwarpforge(
                 output_volumes.append(_stash(_apply_jac(warped, composed)))
             continue
 
-        src_vol = source[t] if is_4d else source
+        src_vol = (source[t] if is_4d else source).to(device)
 
         if phase_data is not None:
-            ph_vol = phase_data[t] if is_4d else phase_data
+            ph_vol = (phase_data[t] if is_4d else phase_data).to(device)
 
             if phase_warp == "complex":
                 # Current approach: convert mag+phase -> real/imag, warp
@@ -2311,16 +2383,8 @@ def nwarpforge(
                 # real/imag and can be corrupted near phase wraps.
                 real_vol = src_vol * torch.cos(ph_vol)
                 imag_vol = src_vol * torch.sin(ph_vol)
-                warped_real = apply_composed_warp(
-                    real_vol,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
-                warped_imag = apply_composed_warp(
-                    imag_vol,
+                warped_real, warped_imag = apply_composed_warp_multi(
+                    [real_vol, imag_vol],
                     composed,
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
@@ -2334,26 +2398,10 @@ def nwarpforge(
                 # Warp magnitude directly (smooth, interpolates cleanly),
                 # then warp real/imag and extract phase only.  Magnitude
                 # is never touched by phase data.
-                warped = apply_composed_warp(
-                    src_vol,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
                 real_vol = src_vol * torch.cos(ph_vol)
                 imag_vol = src_vol * torch.sin(ph_vol)
-                warped_real = apply_composed_warp(
-                    real_vol,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
-                warped_imag = apply_composed_warp(
-                    imag_vol,
+                warped, warped_real, warped_imag = apply_composed_warp_multi(
+                    [src_vol, real_vol, imag_vol],
                     composed,
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
@@ -2366,16 +2414,8 @@ def nwarpforge(
                 # Warp magnitude and phase independently.  Assumes phase
                 # is already unwrapped (no wraps).  Fastest — one warp
                 # per volume instead of two.
-                warped = apply_composed_warp(
-                    src_vol,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
-                warped_phase = apply_composed_warp(
-                    ph_vol,
+                warped, warped_phase = apply_composed_warp_multi(
+                    [src_vol, ph_vol],
                     composed,
                     source_affine=source_header["affine"],
                     output_affine=output_affine,
@@ -2387,26 +2427,10 @@ def nwarpforge(
                 # Warp cos(phase) and sin(phase) separately (unit circle
                 # interpolation), then atan2 back.  Handles wraps without
                 # magnitude corruption.  Best for wrapped phase data.
-                warped = apply_composed_warp(
-                    src_vol,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
                 cos_ph = torch.cos(ph_vol)
                 sin_ph = torch.sin(ph_vol)
-                warped_cos = apply_composed_warp(
-                    cos_ph,
-                    composed,
-                    source_affine=source_header["affine"],
-                    output_affine=output_affine,
-                    interp=interp,
-                    no_neg=no_neg,
-                )
-                warped_sin = apply_composed_warp(
-                    sin_ph,
+                warped, warped_cos, warped_sin = apply_composed_warp_multi(
+                    [src_vol, cos_ph, sin_ph],
                     composed,
                     source_affine=source_header["affine"],
                     output_affine=output_affine,

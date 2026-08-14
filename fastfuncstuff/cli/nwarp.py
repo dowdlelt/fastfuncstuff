@@ -19,6 +19,7 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
     run_batch_jobs,
@@ -300,8 +301,9 @@ Examples:
     )
 
     hw_group = parser.add_argument_group("Hardware")
-    hw_group.add_argument(
-        "-device", default=None, help="PyTorch device: cuda, mps, cpu (auto-detected)"
+    add_device_arg(
+        hw_group,
+        extra="MPS is recommended on Mac for full-size volumes; small grids may be faster on CPU.",
     )
     add_verbose_arg(hw_group, default=1)
 
