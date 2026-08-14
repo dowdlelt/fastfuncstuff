@@ -147,7 +147,10 @@ class PCA:
         if n_features > 10 * n_samples:  # n_features >> n_samples (typical for fMRI)
             # Covariance approach: SVD on (n_samples, n_samples) instead of (n_samples, n_features)
             cov = X @ X.T  # (n_samples, n_samples)
-            U, S_squared, _ = torch.linalg.svd(cov, full_matrices=False)
+            svd_device = torch.device("cpu") if self.device.type == "mps" else self.device
+            U, S_squared, _ = torch.linalg.svd(cov.to(svd_device), full_matrices=False)
+            U = U.to(self.device)
+            S_squared = S_squared.to(self.device)
             S = torch.sqrt(torch.clamp(S_squared, min=0))  # Eigenvalues → singular values
 
             # Explained variance: S^2 / (n_samples - 1)
@@ -172,7 +175,11 @@ class PCA:
             # X = U @ S @ V^T
             # Components are rows of V^T (columns of V)
             # Scores are U @ S
-            U, S, Vt = torch.linalg.svd(X, full_matrices=False)
+            svd_device = torch.device("cpu") if self.device.type == "mps" else self.device
+            U, S, Vt = torch.linalg.svd(X.to(svd_device), full_matrices=False)
+            U = U.to(self.device)
+            S = S.to(self.device)
+            Vt = Vt.to(self.device)
 
             # Explained variance: S^2 / (n_samples - 1)
             explained_variance = (S**2) / (n_samples - 1)

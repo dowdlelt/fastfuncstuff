@@ -221,6 +221,25 @@ def test_constrained_fit_with_nuisance(basis):
     assert abs(nuis[0] - 2.5) < 0.5  # mean of drift ≈ 2.5
 
 
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS unavailable")
+def test_mps_hybrid_constrained_fit_matches_cpu_float64(basis):
+    y, X, _ = _build_test_data(basis, n_vox=24)
+    kwargs = dict(
+        data=torch.from_numpy(y).float(),
+        design_task=torch.from_numpy(X).float(),
+        basis_functions=basis.basis_functions,
+        prior_mean=basis.m,
+        prior_cov=basis.C,
+        n_blocks=1,
+        prior_weight=1.0,
+        reconstruct_hrfs=False,
+    )
+    cpu = fit_basis_constrained_ridge(**kwargs, device=torch.device("cpu"))
+    mps = fit_basis_constrained_ridge(**kwargs, device=torch.device("mps"))
+    np.testing.assert_allclose(mps.betas, cpu.betas, rtol=2e-5, atol=1e-5)
+    np.testing.assert_allclose(mps.r2, cpu.r2, rtol=2e-5, atol=2e-6)
+
+
 # ---------- SPMG bases + prior helpers --------------------------------------
 
 

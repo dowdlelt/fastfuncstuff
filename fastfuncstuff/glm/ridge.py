@@ -122,8 +122,11 @@ def _fit_ridge_multiple_fracs(
     n_targets = y.shape[1]
     n_fracs = len(fracs)
 
-    # Compute SVD of X: X = U @ S @ Vt  (small matrices, keep on device)
-    U, S, Vt = torch.linalg.svd(X, full_matrices=False)
+    # MPS implements SVD through an implicit CPU fallback. Factor the shared
+    # design explicitly on CPU, then copy its reusable factors once; all
+    # voxel-scale products remain on Metal.
+    factor_device = torch.device("cpu") if device.type == "mps" else device
+    U, S, Vt = torch.linalg.svd(X.to(factor_device), full_matrices=False)
 
     # Handle rank-deficiency: Filter out zero/tiny singular values
     # This prevents 0/0 = NaN when computing sclg with alpha=0
@@ -137,9 +140,6 @@ def _fit_ridge_multiple_fracs(
         U = U[:, valid_mask]
         Vt = Vt[valid_mask, :]
 
-    # Squared singular values
-    S_sq = S**2
-
     # Keep track of valid rank (may be less than n_features if rank-deficient)
     n_valid_rank = len(S)
 
@@ -150,19 +150,30 @@ def _fit_ridge_multiple_fracs(
         else:
             return torch.zeros(n_features, n_fracs, n_targets, device=device)
 
+    # Read the two scalar bounds before moving CPU-factored MPS factors back to
+    # Metal, avoiding an accelerator synchronization for each ``.item()``.
+    S_min_sq = S[-1].item() ** 2
+    S_max_sq = S[0].item() ** 2
+    if factor_device != device:
+        U = U.to(device)
+        S = S.to(device)
+        Vt = Vt.to(device)
+
+    # Squared singular values
+    S_sq = S**2
+
     # Create alpha grid for interpolation (log-spaced from small to large)
     # Match fracridge exactly: BIG_BIAS = 10e3 = 10000, SMALL_BIAS = 10e-3 = 0.01
     SMALL_BIAS = 10e-3  # 0.01
     BIG_BIAS = 10e3  # 10000
 
     # Match fracridge logic: if smallest singular value squared is zero, use SMALL_BIAS
-    S_min_sq = S[-1].item() ** 2
     if S_min_sq == 0:
         val2 = SMALL_BIAS
     else:
         val2 = SMALL_BIAS * S_min_sq
 
-    val1 = BIG_BIAS * S[0].item() ** 2
+    val1 = BIG_BIAS * S_max_sq
 
     # Log-spaced grid with step 0.2 (like fracridge BIAS_STEP = 0.2)
     log_min = np.floor(np.log10(val2))

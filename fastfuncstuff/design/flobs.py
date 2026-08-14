@@ -66,6 +66,12 @@ def _cpu_if_mps(device: torch.device, *inputs: object) -> tuple:
     return (torch.device("cpu"), *(_move_mps_to_cpu(x) for x in inputs))
 
 
+def _solve_from_cholesky(L: Tensor, rhs: Tensor) -> Tensor:
+    """Solve ``L Lᵀ x = rhs`` with kernels native to CUDA, MPS, and CPU."""
+    tmp = torch.linalg.solve_triangular(L, rhs, upper=False)
+    return torch.linalg.solve_triangular(L.T, tmp, upper=True)
+
+
 # ----------------------------------------------------------------------------
 # Basis generation
 # ----------------------------------------------------------------------------
@@ -591,11 +597,12 @@ def fit_basis_constrained_ridge(
     if device is None:
         device = get_device()
 
-    # Bayesian constrained-ridge is float64 end-to-end; MPS has no float64, so
-    # run the whole solver on CPU there (full-precision, just not accelerated).
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS constrained-ridge")
-    device, data, design_task, nuisance = _cpu_if_mps(device, data, design_task, nuisance)
+    # Bulk voxel work is float32 on accelerators. The shared p×p normal systems
+    # are formed and factored on CPU in float64, then their factors are cast
+    # back once. This keeps MPS usable and avoids slow consumer-GPU float64
+    # without giving up precision where conditioning is decided.
+    compute_dtype = torch.float64 if device.type == "cpu" else torch.float32
+    factor_device = torch.device("cpu")
 
     # Respect the caller's device choice.  Data on cuda stays on
     # cuda; data on CPU stays on CPU.  The chunked solver below
@@ -614,9 +621,9 @@ def fit_basis_constrained_ridge(
     # its original precision.
     y = torch.as_tensor(data) if not isinstance(data, torch.Tensor) else data
     X = (
-        torch.as_tensor(design_task, dtype=torch.float64, device=device)
+        torch.as_tensor(design_task, dtype=compute_dtype, device=device)
         if not isinstance(design_task, torch.Tensor)
-        else design_task.to(device=device, dtype=torch.float64)
+        else design_task.to(device=device, dtype=compute_dtype)
     )
     if y.ndim != 2:
         raise ValueError(f"data must be 2-D (n_voxels, n_t); got {y.shape}")
@@ -640,9 +647,9 @@ def fit_basis_constrained_ridge(
 
     if nuisance is not None:
         Z = (
-            torch.as_tensor(nuisance, dtype=torch.float64, device=device)
+            torch.as_tensor(nuisance, dtype=compute_dtype, device=device)
             if not isinstance(nuisance, torch.Tensor)
-            else nuisance.to(device=device, dtype=torch.float64)
+            else nuisance.to(device=device, dtype=compute_dtype)
         )
         if Z.ndim != 2 or Z.shape[0] != n_t:
             raise ValueError(f"nuisance must be (n_t, n_nuisance) with n_t={n_t}; got {Z.shape}")
@@ -658,16 +665,16 @@ def fit_basis_constrained_ridge(
     # ``n_blocks`` times (one block per condition OR per trial,
     # depending on caller's design).  Remaining n_nuisance rows/cols:
     # zeros (nuisance is unpenalised — no prior on polynomial drift).
-    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=device, dtype=torch.float64)
-    P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=device)
+    C_inv = torch.from_numpy(np.linalg.inv(prior_cov)).to(device=factor_device, dtype=torch.float64)
+    P = torch.zeros((n_cols, n_cols), dtype=torch.float64, device=factor_device)
     for c in range(n_blocks):
         s = c * n_basis
         P[s : s + n_basis, s : s + n_basis] = C_inv
 
     # Prior mean vector m̄ (size n_cols): stacked ``prior_mean`` for
     # each block (condition/trial), zeros for nuisance.
-    m_torch = torch.from_numpy(prior_mean).to(device=device, dtype=torch.float64)
-    m_bar = torch.zeros(n_cols, dtype=torch.float64, device=device)
+    m_torch = torch.from_numpy(prior_mean).to(device=factor_device, dtype=torch.float64)
+    m_bar = torch.zeros(n_cols, dtype=torch.float64, device=factor_device)
     for c in range(n_blocks):
         m_bar[c * n_basis : (c + 1) * n_basis] = m_torch
 
@@ -684,11 +691,12 @@ def fit_basis_constrained_ridge(
     # Cholesky factors of X'X and (X'X + λ P) computed once, reused
     # across chunks.
     # ---------------------------------------------------------------
-    XtX = X_full.T @ X_full
+    X_factor = X_full.detach().cpu().to(torch.float64)
+    XtX = X_factor.T @ X_factor
 
     # Pre-factor for the OLS path (shared across chunks).
     try:
-        L0 = torch.linalg.cholesky(XtX)
+        L0 = torch.linalg.cholesky(XtX).to(device=device, dtype=compute_dtype)
         use_chol_ols = True
     except torch.linalg.LinAlgError:
         L0 = None
@@ -706,7 +714,7 @@ def fit_basis_constrained_ridge(
             n_regressors=n_cols,
             device=device,
             operation="glm",
-            use_double=True,
+            use_double=(compute_dtype == torch.float64),
         )
 
     # CPU-resident output accumulators.
@@ -729,14 +737,16 @@ def fit_basis_constrained_ridge(
         end = min(start + chunk_size, n_voxels)
         y_chunk = y[start:end].to(
             device=device,
-            dtype=torch.float64,
+            dtype=compute_dtype,
             non_blocking=True,
         )  # (chunk, n_t)
         Xty_chunk = X_full.T @ y_chunk.T  # (n_cols, chunk)
         if use_chol_ols:
-            beta_chunk = torch.cholesky_solve(Xty_chunk, L0)
+            beta_chunk = _solve_from_cholesky(L0, Xty_chunk)
         else:
-            beta_chunk = torch.linalg.lstsq(X_full, y_chunk.T).solution
+            beta_chunk = torch.linalg.lstsq(X_factor, y_chunk.T.cpu().double()).solution.to(
+                device=device, dtype=compute_dtype
+            )
         pred = (X_full @ beta_chunk).T  # (chunk, n_t)
         resid = y_chunk - pred
         ss_res_chunk = (resid**2).sum(dim=1)
@@ -814,9 +824,9 @@ def fit_basis_constrained_ridge(
     elif lambda_mode == "global":
         # One A, one factor.
         A = XtX + effective_weight * P
-        Pm = effective_weight * Pm_unit
+        Pm = (effective_weight * Pm_unit).to(device=device, dtype=compute_dtype)
         try:
-            L_A = torch.linalg.cholesky(A)
+            L_A = torch.linalg.cholesky(A).to(device=device, dtype=compute_dtype)
             use_chol_A = True
         except torch.linalg.LinAlgError:
             L_A = None
@@ -834,15 +844,15 @@ def fit_basis_constrained_ridge(
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(
                 device=device,
-                dtype=torch.float64,
+                dtype=compute_dtype,
                 non_blocking=True,
             )
             Xty_chunk = X_full.T @ y_chunk.T
             rhs_chunk = Xty_chunk + Pm[:, None]
             if use_chol_A:
-                beta_chunk = torch.cholesky_solve(rhs_chunk, L_A)
+                beta_chunk = _solve_from_cholesky(L_A, rhs_chunk)
             else:
-                beta_chunk = torch.linalg.solve(A, rhs_chunk)
+                beta_chunk = torch.linalg.solve(A.to(device=device, dtype=compute_dtype), rhs_chunk)
             pred = (X_full @ beta_chunk).T
             resid = y_chunk - pred
             ss_res_chunk = (resid**2).sum(dim=1)
@@ -906,14 +916,14 @@ def fit_basis_constrained_ridge(
             lam = float(bin_lambda[b].item())
             A_b = XtX + lam * P
             try:
-                chol_factors[b] = torch.linalg.cholesky(A_b)
+                chol_factors[b] = torch.linalg.cholesky(A_b).to(device=device, dtype=compute_dtype)
             except torch.linalg.LinAlgError:
                 chol_factors[b] = None
         # Pm shared computation per bin too — Pm_b = λ_b · P · m̄.
         # Lay out as a (n_bins, n_cols) tensor for fast per-voxel
         # right-hand-side assembly.
-        Pm_per_bin = bin_lambda.to(Pm_unit.dtype).unsqueeze(1) * Pm_unit.cpu().unsqueeze(0)
-        Pm_per_bin = Pm_per_bin.to(device)
+        Pm_per_bin = bin_lambda.to(Pm_unit.dtype).unsqueeze(1) * Pm_unit.unsqueeze(0)
+        Pm_per_bin = Pm_per_bin.to(device=device, dtype=compute_dtype)
 
         n_chunks_p2v = (n_voxels + chunk_size - 1) // chunk_size
         for start in tqdm(
@@ -927,7 +937,7 @@ def fit_basis_constrained_ridge(
             end = min(start + chunk_size, n_voxels)
             y_chunk = y[start:end].to(
                 device=device,
-                dtype=torch.float64,
+                dtype=compute_dtype,
                 non_blocking=True,
             )
             Xty_chunk = X_full.T @ y_chunk.T  # (n_cols, chunk)
@@ -946,10 +956,12 @@ def fit_basis_constrained_ridge(
                 rhs_b = rhs_chunk[:, idx_in_chunk]
                 L_b = chol_factors[b]
                 if L_b is not None:
-                    beta_b = torch.cholesky_solve(rhs_b, L_b)
+                    beta_b = _solve_from_cholesky(L_b, rhs_b)
                 else:
                     lam = float(bin_lambda[b].item())
-                    beta_b = torch.linalg.solve(XtX + lam * P, rhs_b)
+                    beta_b = torch.linalg.solve(
+                        (XtX + lam * P).to(device=device, dtype=compute_dtype), rhs_b
+                    )
                 beta_chunk[:, idx_in_chunk] = beta_b
             pred = (X_full @ beta_chunk).T
             resid = y_chunk - pred
@@ -1587,11 +1599,6 @@ def cv_basis_constrained_ridge(
 
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS constrained-ridge CV")
-    device, per_run_data, per_run_task_designs = _cpu_if_mps(
-        device, per_run_data, per_run_task_designs
-    )
     if weight_grid is None:
         weight_grid = [0.1, 0.3, 1.0, 3.0, 10.0]
 
@@ -1663,7 +1670,7 @@ def cv_basis_constrained_ridge(
     # (because the projection removes per-run means; the relevant
     # SS_tot is the variance of the projected data).
     y_clean_mean = data_clean.mean(dim=1, keepdim=True)
-    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1)  # (n_voxels,)
+    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1).cpu().double()
 
     weights_to_run: list[float | str] = list(weight_grid)
     if include_ols:
@@ -1684,7 +1691,7 @@ def cv_basis_constrained_ridge(
         disable=(not verbose) or n_weights <= 1,
     )
     for wi, w in weights_iter:
-        ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64, device=device)
+        ss_res_accum = torch.zeros(n_voxels, dtype=torch.float64)
         weights_iter.set_postfix_str("OLS" if w == "OLS" else f"λ×σ²={w}")
         for train_runs, test_runs in tqdm(
             splits,
@@ -1748,11 +1755,11 @@ def cv_basis_constrained_ridge(
             # Predict cleaned test data using TASK betas only.
             y_test_pred = task_betas @ X_test.T  # (n_voxels, n_tp_test)
             ss_res_split = ((y_test - y_test_pred) ** 2).sum(dim=1)
-            ss_res_accum += ss_res_split.double()
+            ss_res_accum += ss_res_split.cpu().double()
             del X_train, X_test, y_train, y_test, task_betas, y_test_pred, ss_res_split
 
         # Compute R² for this weight against the full ss_tot.
-        r2_w = 1.0 - ss_res_accum / torch.clamp(ss_tot_full.double(), min=1e-30)
+        r2_w = 1.0 - ss_res_accum / torch.clamp(ss_tot_full, min=1e-30)
         r2_per_weight[:, wi] = r2_w.cpu().numpy()
         if verbose:
             print(
@@ -2345,11 +2352,6 @@ def fit_basis_fracridge(
 
     if device is None:
         device = get_device()
-    if device.type == "mps":
-        warn_mps_cpu_fallback("FLOBS fracridge")
-    device, per_run_data, per_run_task_designs = _cpu_if_mps(
-        device, per_run_data, per_run_task_designs
-    )
     if fracs is None:
         # ffs_ridge defaults; same grid GLMsingle uses by default.
         fracs = np.linspace(0.1, 1.0, 10).astype(np.float64)
@@ -2391,7 +2393,7 @@ def fit_basis_fracridge(
         # project_out_nuisance_per_run allocates the result on CPU
         # when the dataset is large (>~1 GB) — its design is built
         # for streaming, not for an in-loop LORO slice.  Push back
-        # to the compute device so train_rows / test_rows (on cuda)
+        # to the compute device so accelerator-resident train_rows / test_rows
         # can index data_clean directly.  For 9.4T scale (~1.4 GB
         # data) this is ~1.4 GB of VRAM, easy on any modern card.
         if data_clean.device != device:
@@ -2404,7 +2406,7 @@ def fit_basis_fracridge(
 
     run_ends = [run_starts[r] + n_tp_per_run[r] for r in range(n_runs)]
     y_clean_mean = data_clean.mean(dim=1, keepdim=True)
-    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1).double()
+    ss_tot_full = ((data_clean - y_clean_mean) ** 2).sum(dim=1).cpu().double()
 
     splits = generate_cv_splits(n_runs, strategy=leave_n_out, n_perms=n_perms)
     n_splits = len(splits)
@@ -2415,7 +2417,7 @@ def fit_basis_fracridge(
         )
 
     # SS_res accumulator: (n_fracs, n_voxels), float64 for numeric stability.
-    ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64, device=device)
+    ss_res_accum = torch.zeros(n_fracs, n_voxels, dtype=torch.float64)
 
     # Voxel chunk size, used for BOTH:
     #  (a) the SVD fit itself — _fit_ridge_multiple_fracs materialises
@@ -2480,11 +2482,11 @@ def fit_basis_fracridge(
         y_test = data_clean[:, test_rows]  # (n_voxels, n_tp_te)
 
         # _fit_ridge_multiple_fracs expects y as (n_samples, n_targets).
-        # On cuda we pass chunk_size to keep ``Vt.T @ ridge_flat``
+        # On accelerators we pass chunk_size to keep ``Vt.T @ ridge_flat``
         # bounded — the non-chunked path materialises a 5+ GB tensor
         # at 9.4T single-trial scale.  The chunked path returns coefs
         # on CPU; we move slices to device during prediction.
-        use_chunked = device.type == "cuda" and v_chunk < n_voxels
+        use_chunked = device.type != "cpu" and v_chunk < n_voxels
         coefs = _fit_ridge_multiple_fracs(
             X=X_train,
             y=y_train.T,
@@ -2510,7 +2512,7 @@ def fit_basis_fracridge(
                 coefs_chunk,
             )  # (T, n_fracs, V_c)
             resid = y_test[v0:v1].T.unsqueeze(1) - y_pred
-            ss_res_accum[:, v0:v1] += (resid**2).sum(dim=0).double()
+            ss_res_accum[:, v0:v1] += (resid**2).sum(dim=0).cpu().double()
             del coefs_chunk, y_pred, resid
 
         del X_train, X_test, y_train, y_test, coefs
@@ -2531,7 +2533,7 @@ def fit_basis_fracridge(
     # Same VRAM constraint as the LORO fit — use the chunked path on
     # cuda.  Result is on CPU, so the gather + numpy-cast at the end
     # happens on host (no extra D→H transfer beyond the final betas).
-    use_chunked_final = device.type == "cuda" and v_chunk < n_voxels
+    use_chunked_final = device.type != "cpu" and v_chunk < n_voxels
     final_coefs = _fit_ridge_multiple_fracs(
         X=design_clean,
         y=data_clean.T,
@@ -2553,7 +2555,7 @@ def fit_basis_fracridge(
     betas_opt = final_coefs.gather(1, gather_idx).squeeze(1)  # (n_task, n_voxels)
     betas = (
         betas_opt.T.cpu().numpy().astype(np.float64)
-        if betas_opt.is_cuda
+        if betas_opt.device.type != "cpu"
         else betas_opt.T.numpy().astype(np.float64)
     )  # (n_voxels, n_task)
 
@@ -2565,7 +2567,7 @@ def fit_basis_fracridge(
     betas_ols_slice = final_coefs[:, ols_idx, :]
     betas_ols = (
         betas_ols_slice.T.cpu().numpy().astype(np.float64)
-        if betas_ols_slice.is_cuda
+        if betas_ols_slice.device.type != "cpu"
         else betas_ols_slice.T.numpy().astype(np.float64)
     )
     r2_ols = r2_by_frac[:, ols_idx]

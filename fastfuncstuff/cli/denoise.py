@@ -45,6 +45,7 @@ try:
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
+        add_device_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -545,11 +546,7 @@ Notes:
             "pool in a different place; check the reported noise-pool size."
         ),
     )
-    proc_opts.add_argument(
-        "-device",
-        type=str,
-        help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
-    )
+    add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-keep_on_cpu",
         action="store_true",
@@ -2046,15 +2043,19 @@ def main():
     # - For 16GB GPU: chunk_size=None (auto) works for most datasets
     # - When keep_on_cpu=True: set preload_data_to_device=False to avoid GPU OOM
 
-    # Determine chunk_size based on device:
-    # - CPU: process all voxels at once (no GPU memory limit)
-    # - GPU: auto-detect based on available memory
-    if device.type == "cpu":
-        chunk_size = n_voxels  # Process all voxels at once on CPU
-        if args.verb >= 1:
-            print(f"  CPU mode: chunk_size = {n_voxels:,} (all voxels)")
-    else:
-        chunk_size = None  # Auto-detect for GPU
+    # CPU machines can also be memory constrained; use the same planner on all
+    # backends instead of assuming every CPU can materialise the whole fit.
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    chunk_size = estimate_chunk_size(
+        n_voxels=n_voxels,
+        n_timepoints=n_timepoints,
+        n_regressors=max(1, n_conditions + args.max_comps),
+        device=device,
+        operation="xval",
+        max_chunk_size=n_voxels,
+        verbose=args.verb >= 2,
+    )
 
     # -cv_blur: everything the PC search touches (noise-pool R², component
     # extraction, the sweep) reads cv_data; the final refit and every saved beta

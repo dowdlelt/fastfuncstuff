@@ -76,6 +76,7 @@ from tqdm.auto import tqdm
 
 try:
     from fastfuncstuff.cli_utils import (
+        add_device_arg,
         add_load_threads_arg,
         add_ortvec_arguments,
         add_trim_args,
@@ -84,11 +85,11 @@ try:
         apply_trim_to_timing,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
-        parse_device_arg,
         parse_input_files,
         parse_prefix,
         preflight_check,
         run_lengths_from_starts,
+        setup_device,
         trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
@@ -120,7 +121,6 @@ try:
     from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
     from fastfuncstuff.design.matrices import save_iresp
     from fastfuncstuff.io.afni import save_nifti
-    from fastfuncstuff.utils import configure_torch_backends
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -729,7 +729,7 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         help="Polynomial drift order (per run).  None → auto via run duration.",
     )
-    proc.add_argument("-device", default="auto", help="Compute device: auto, cpu, cuda, mps.")
+    add_device_arg(proc, default="auto")
 
     nuis_grp = parser.add_argument_group(
         "External nuisance regressors",
@@ -1482,8 +1482,7 @@ def main() -> int:
     )
 
     # ── Load data ──────────────────────────────────────────────────
-    device, _, _ = parse_device_arg(args.device)
-    configure_torch_backends(device)
+    device = setup_device(args.device)
     print(f"  Compute device: {device}")
 
     load_result = load_and_preprocess_runs(

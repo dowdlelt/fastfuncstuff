@@ -80,6 +80,13 @@ from fastfuncstuff.memory import dyn_chunk_estimator
 from fastfuncstuff.utils import get_device, linalg_device
 
 
+def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
+    """QR on a native backend, returning the reusable projector in place."""
+    qr_device = torch.device("cpu") if matrix.device.type == "mps" else matrix.device
+    Q, _ = torch.linalg.qr(matrix.to(qr_device))
+    return Q.to(matrix.device)
+
+
 def _compute_local_run_starts(
     run_indices: list[int],
     run_starts: list[int],
@@ -329,7 +336,7 @@ def estimate_noise_component_caps_per_run(
 
         if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
             nuisance = nuisance_per_run[run_idx].to(run_data.device)
-            q_nuisance, _ = torch.linalg.qr(nuisance)
+            q_nuisance = _qr_projector(nuisance)
             run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
 
         voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
@@ -482,7 +489,7 @@ def compute_noise_pool_pca_scree_per_run(
 
         if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
             nuisance = nuisance_per_run[run_idx].to(run_data.device)
-            q_nuisance, _ = torch.linalg.qr(nuisance)
+            q_nuisance = _qr_projector(nuisance)
             run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
 
         voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
@@ -672,7 +679,7 @@ def extract_noise_pcs_per_run(
             nuisance = nuisance_per_run[run_idx].to(run_data.device)
             # Project out: Y_clean = Y - nuisance @ (nuisance'nuisance)^-1 @ nuisance' @ Y
             # Using QR for numerical stability
-            q_nuisance, _ = torch.linalg.qr(nuisance)
+            q_nuisance = _qr_projector(nuisance)
             # run_data is (n_voxels, n_timepoints), q_nuisance is (n_timepoints, n_nuisance)
             # Project out: run_data_clean = run_data - run_data @ q_nuisance @ q_nuisance'
             run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
@@ -806,7 +813,7 @@ def extract_noise_ics_per_run(
 
         if nuisance_per_run is not None and nuisance_per_run[run_idx].shape[1] > 0:
             nuisance = nuisance_per_run[run_idx].to(run_data.device)
-            q_nuisance, _ = torch.linalg.qr(nuisance)
+            q_nuisance = _qr_projector(nuisance)
             run_data = run_data - (run_data @ q_nuisance) @ q_nuisance.T
 
         voxel_norms = torch.norm(run_data, dim=1, keepdim=True)
@@ -1956,7 +1963,7 @@ def compute_xval_r2_optimal_full(
                 run_nuisance = nuisance_per_run[run_idx].to(device)
                 if run_nuisance.shape[1] > 0:
                     # Use QR decomposition for numerical stability
-                    Q, _ = torch.linalg.qr(run_nuisance)
+                    Q = _qr_projector(run_nuisance)
                     # Project: pcs_projected = pcs - Q @ (Q.T @ pcs)
                     pcs_projected = pcs_this_run.to(device) - Q @ (Q.T @ pcs_this_run.to(device))
                 else:

@@ -50,6 +50,7 @@ try:
         LoadResult,
         add_cv_metric_arg,
         add_cv_strategy_arg,
+        add_device_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_trim_args,
@@ -328,11 +329,7 @@ Notes:
         "SPMG3 = canonical + time + dispersion derivatives (3 basis per trial). "
         "NOTE: FIR/TENT not supported in single-trial mode - use 3dDenoisefast instead.",
     )
-    proc_opts.add_argument(
-        "-device",
-        type=str,
-        help="Force device: 'cpu' or 'cuda' (default: auto-detect GPU)",
-    )
+    add_device_arg(proc_opts)
     proc_opts.add_argument(
         "-chunk_size",
         type=int,
