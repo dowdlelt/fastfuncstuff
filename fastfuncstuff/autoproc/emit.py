@@ -1446,8 +1446,10 @@ def _stage_blip(plan: Plan) -> str:
         pe = "".join(c for c in _fmap_pe(pr) if c.isalpha()) or "j"
         ro = f"-readout {pr.fmap.readout}" if pr.fmap.readout else ""
         # blip_up: the fmap's own matched-PE image when the pair is self-contained,
-        # else this run's rep (the only forward image there is).
-        up = pr.fmap.forward_path or pr.bold.rep
+        # else the borrowed rep the plan picked for the group (the run acquired
+        # next to the fieldmap — NOT this loop's representative run, which is
+        # whichever one the group dict happened to see first).
+        up = pr.fmap_forward or pr.bold.rep
         cmd = _ffs(
             "ffs_blipflip",
             [

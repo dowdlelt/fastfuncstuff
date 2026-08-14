@@ -450,6 +450,36 @@ def _fmap_for_run(
     return None, False
 
 
+def _borrowed_forward(fg: FmapGroup, bold_runs: list[BoldRun]) -> str | None:
+    """The run rep that stands in as this fieldmap's forward (blip-up) image.
+
+    The one it was acquired NEXT TO in time — the nearest run at-or-after the
+    fieldmap (a fieldmap is normally run just before the block it covers, the
+    same convention :func:`bids._assign_by_time` claims runs by), else the
+    nearest one at all. Not the first one in scan order.
+    The pair is only a pair to the extent the head did not move between them:
+    the field is estimated from forward-vs-reverse difference, so any motion in
+    that gap is written straight into the field, and everything the group
+    corrects inherits it. Session order is task-then-run, which in a session that
+    interleaves tasks put the borrowed image tens of minutes from the fieldmap
+    (bug of record: sub-3001's LR-run1 borrowed a run 16 minutes later when one
+    2.5 minutes later was in the same group).
+
+    Falls back to the first intended run when the sidecars carry no
+    ``AcquisitionTime`` — there is nothing better to order by then.
+    """
+    mine = [b for b in bold_runs if (b.task, b.run) in fg.intended_runs]
+    if not mine:
+        return None
+    ft = fg.acq_time
+    timed = [b for b in mine if b.acq_time is not None]
+    if ft is not None and timed:
+        following = [b for b in timed if b.acq_time >= ft]  # type: ignore[operator]
+        pool = following or timed
+        return str(min(pool, key=lambda b: abs(b.acq_time - ft)).rep)  # type: ignore[operator]
+    return str(mine[0].rep)
+
+
 def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str]:
     """Compose the ordered transform tokens for one run, applying drop rules.
 
@@ -537,18 +567,18 @@ def build_plan(subject: Subject, opt: Options) -> Plan:
         # Each fmap group's DISTORTED forward = the image stage04 estimates the
         # field against, and hence the xrun base for that group: the fmap's own
         # matched-PE mate when it has one (self-contained AP/PA pair), else the
-        # first intended run's rep — which is always the case for a GRE fieldmap,
-        # since a GRE acquisition is not an EPI and has no distorted mate at all.
+        # borrowed rep of one of its runs — which is always the case for a GRE
+        # fieldmap, since a GRE acquisition is not an EPI and has no distorted
+        # mate at all.
         forward_by_fmap: dict[str, str] = {}
         if has_fmaps:
             for fg in sess.fmaps:
                 if fg.forward_path is not None:
                     forward_by_fmap[fg.fmap_id] = str(fg.forward_path)
                     continue
-                for b in sess.bold_runs:
-                    if (b.task, b.run) in fg.intended_runs:
-                        forward_by_fmap[fg.fmap_id] = str(b.rep)
-                        break
+                borrowed = _borrowed_forward(fg, sess.bold_runs)
+                if borrowed is not None:
+                    forward_by_fmap[fg.fmap_id] = borrowed
         ref_fmap_id = ref_fmap.fmap_id if ref_fmap is not None else None
         for bold in sess.bold_runs:
             fmap, inherited = (

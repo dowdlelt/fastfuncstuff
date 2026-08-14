@@ -1629,3 +1629,37 @@ def test_anat_source_auto_prefers_the_sbref_grandmean():
         build_plan(subj, Options(go_to_anat=True, anat_source="grandmean")), "wd", bids_root="/bids"
     )
     assert '-source "stage08.grandmean.nii$FMT"' in s_gm
+
+
+def _timed_run(task, run, at, pe="i"):
+    r = _run("01", task, run, pe=pe)
+    r.json["AcquisitionTime"] = at
+    return r
+
+
+def test_borrowed_forward_is_the_run_acquired_next_to_the_fieldmap():
+    """A fmap folder with no matched-PE mate borrows a run's SBRef as the blip-up
+    image. Anything the head did between the two is written straight into the
+    field, so the pairing has to be by TIME, not by scan order (which is
+    task-then-run and, in an interleaved session, tens of minutes off)."""
+    runs = [
+        _timed_run("expres", "1", "14:02:21"),  # first in task order — far away
+        _timed_run("fncloc", "1", "13:48:59"),  # 2.5 min after the fieldmap
+        _timed_run("fncloc", "2", "13:44:00"),  # closer still, but BEFORE it
+    ]
+    fmap = _fmap("01", "LR", [(r.task, r.run) for r in runs], pe="i-")
+    fmap.json["AcquisitionTime"] = "13:46:29"
+    plan = build_plan(Subject("X", [Session("01", runs, [fmap])]), Options())
+    assert all(pr.fmap_forward.endswith("task-fncloc_run-1_bold.nii.gz") for pr in plan.runs)
+
+    # ...and stage04 pairs blipflip with THAT image, not with the group's first
+    # run in scan order (the emitter used to re-derive it and disagree).
+    st4 = _stage04(write_script(plan, "wd", bids_root="/bids"))
+    assert "-blip_up /bids/sub-X/ses-01/func/sub-X_ses-01_task-fncloc_run-1_bold.nii.gz" in st4
+
+    # No AcquisitionTime anywhere: fall back to the first intended run.
+    for r in runs:
+        del r.json["AcquisitionTime"]
+    del fmap.json["AcquisitionTime"]
+    plan = build_plan(Subject("X", [Session("01", runs, [fmap])]), Options())
+    assert all(pr.fmap_forward.endswith("task-expres_run-1_bold.nii.gz") for pr in plan.runs)
