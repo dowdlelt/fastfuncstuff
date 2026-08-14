@@ -433,3 +433,24 @@ class TestApplyAffineSlabChunking:
         monkeypatch.setattr(affine_mod, "get_available_memory", boom)
         slab = affine_mod._z_slab_size(640, 640, 640, torch.device("cpu"), torch.float32, 16)
         assert slab >= 1
+
+
+class TestInterpAutograd:
+    """The optimizers (allineate/qwarp refine) backward through the resample."""
+
+    def test_commensurate_grid_resample_is_differentiable(self):
+        # A whole-voxel shift makes every fractional offset identical, which is
+        # exactly the case _axis_weights dedups with torch.unique -- an op with no
+        # derivative. Backward through it used to raise NotImplementedError.
+        from fastfuncstuff.processing.interp import wsinc5_resample_3d
+
+        torch.manual_seed(0)
+        src = torch.rand(12, 12, 12)
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(12.0), torch.arange(12.0), torch.arange(12.0), indexing="ij"
+        )
+        # Half-voxel: off the grid-node fast path, but still one shared frac.
+        shift = torch.full((3,), 0.5, requires_grad=True)
+        out = wsinc5_resample_3d(src, ii + shift[0], jj + shift[1], kk + shift[2])
+        out.sum().backward()
+        assert shift.grad is not None and torch.isfinite(shift.grad).all()

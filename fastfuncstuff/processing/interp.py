@@ -581,8 +581,10 @@ def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
     direct eval, so the unique sort never runs on the hot path. The unique match
     is exact (no quantization), so the result is bit-identical to a direct eval.
     """
+    # torch.unique has no derivative (_unique2), so the dedup path would break the
+    # autograd optimizers (allineate/qwarp refine backward through the resample).
     c = frac.numel()
-    if c >= 64:
+    if c >= 64 and not frac.requires_grad:
         probe = frac[: min(256, c)]
         if torch.unique(probe).numel() * 4 < probe.numel():
             uniq, inv = torch.unique(frac, return_inverse=True)
