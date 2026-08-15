@@ -204,7 +204,7 @@ FORMWARP = BackendSpec(
         ),
         ParamSpec(
             "formwarp.conv_threshold",
-            "-conv_threshold",
+            "-conv_thresh",
             (1e-6, 1e-5, 1e-4),
             1e-6,
             "schedule",
@@ -273,7 +273,7 @@ _OW_SHARED = (
     ),
     ParamSpec(
         "optiwarp.conv_threshold",
-        "-conv_threshold",
+        "-conv_thresh",
         (1e-6, 1e-5, 1e-4),
         1e-6,
         "schedule",
@@ -479,6 +479,117 @@ RECIPES: dict[str, Recipe] = {
         ),
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Presets: what a tuning run concluded, in a form the tools can apply
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Preset:
+    """Settings a tuning run measured as best for one (recipe, backend) pair.
+
+    This is the point of the tuner. A search that ends in a table someone reads
+    once has not changed anything; the finding has to become the setting the tool
+    uses. So a run's conclusion lands here as data, `ffs_<backend> -type <recipe>`
+    applies it, and the help text is generated from it — one fact, three uses.
+
+    ``provenance`` is mandatory prose because a preset without it is unfalsifiable.
+    Every one of these is "best on the data we happened to try", and the next person
+    needs to know whether their data resembles it before trusting the numbers.
+    """
+
+    recipe: str
+    backend: str
+    config: dict[str, Any]
+    provenance: str
+    caveat: str = ""
+
+    def describe(self) -> str:
+        settings = " ".join(f"{k}={v}" for k, v in sorted(self.config.items())) or "(defaults)"
+        out = f"{settings}\n    measured on: {self.provenance}"
+        if self.caveat:
+            out += f"\n    caveat: {self.caveat}"
+        return out
+
+
+# Keyed (recipe, backend). Grown by running ffs_tunewarp and pasting what
+# `-export` prints; deliberately hand-committed rather than written at runtime, so
+# that a default change is a reviewable diff with a provenance line attached.
+PRESETS: dict[tuple[str, str], Preset] = {
+    ("MNI_T1", "optiwarp_demons"): Preset(
+        recipe="MNI_T1",
+        backend="optiwarp_demons",
+        config={"total_sigma": 1.0, "update_sigma": 0.5},
+        provenance=(
+            "5 FreeSurfer brains -> MNI152_2009_template, 480 fits, -metric lpa, "
+            "2026-08-15. Near-best consensus and 4.75x cheaper than formwarp "
+            "(2.4 s/fit vs 11.4)."
+        ),
+        caveat=(
+            "Measured BEFORE the local fold guard existed, when total_sigma below "
+            "1.0 folded on every subject. The guard makes lower values legal, so "
+            "this floor should be re-measured rather than assumed."
+        ),
+    ),
+    ("MNI_T1", "formwarp"): Preset(
+        recipe="MNI_T1",
+        backend="formwarp",
+        config={"total_var": 0.5, "update_var": 4.0, "grad_step": 0.5},
+        provenance=(
+            "5 FreeSurfer brains -> MNI152_2009_template, 300 fits, -metric lpa, "
+            "2026-08-15. total_var 0.0 scored better but was the only level that "
+            "ever folded, so the shipped value is the best that never did."
+        ),
+        caveat=(
+            "Same pre-fold-guard caveat as optiwarp. formwarp was otherwise the "
+            "robust choice here: 299 PASS / 1 MARGINAL / 0 FAIL over 60 configs."
+        ),
+    ),
+}
+
+
+def preset_for(recipe: str, backend: str) -> Preset | None:
+    """The tuned settings for this pair, if a run has ever concluded any."""
+    return PRESETS.get((recipe, backend))
+
+
+def preset_config_for_cli(recipe: str, backend: str) -> dict[str, Any]:
+    """A preset as ``{cli_dest: value}``, ready to push onto parsed arguments.
+
+    Keyed by the CLI's own attribute name rather than the ParamSpec key, because
+    that is what the caller has: an argparse namespace.
+
+    Values are converted to the form that namespace already holds, which is *after*
+    argparse's ``type=`` ran. Schedules are the trap: the tuner stores ``iters`` as
+    a tuple, but the CLI takes it as an ``"300x210x120"`` string and parses it
+    downstream, so handing back the tuple would crash the very tool the preset
+    exists to configure.
+    """
+    preset = preset_for(recipe, backend)
+    if preset is None:
+        return {}
+    spec = BACKENDS[backend]
+    out: dict[str, Any] = {}
+    for key, value in preset.config.items():
+        param = spec.param(key)
+        if param.fmt == "x" and isinstance(value, (list, tuple)):
+            out[param.flag.lstrip("-")] = "x".join(f"{v:g}" for v in value)
+        else:
+            out[param.flag.lstrip("-")] = value
+    return out
+
+
+def describe_presets(backend: str) -> str:
+    """The ``-type`` help text for one backend, generated from the presets."""
+    rows = [(r, p) for (r, b), p in sorted(PRESETS.items()) if b == backend]
+    if not rows:
+        return "No tuned presets exist for this backend yet."
+    lines = []
+    for recipe, preset in rows:
+        lines.append(f"  {recipe}: {preset.describe()}")
+    return "\n".join(lines)
 
 
 def find_param(dotted: str) -> ParamSpec:

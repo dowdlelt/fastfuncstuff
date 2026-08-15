@@ -387,3 +387,171 @@ class TestKnobEffects:
                 )
         levels = {v: fold for v, _, fold, _ in knob_effects(s)[0].levels}
         assert levels[0.0] == 1.0 and levels[1.0] == 0.0
+
+
+class TestFlagsMatchTheRealCLIs:
+    """Every ParamSpec flag must be one its backend's CLI actually accepts.
+
+    The search drives the backends in-process but records an equivalent command
+    line, and `-reproduce` runs that command for real. A flag that the spec spells
+    differently from the CLI therefore fails only at reproduce time, long after the
+    fits are done — which is exactly how `-conv_threshold` survived (the flag is
+    `-conv_thresh`).
+    """
+
+    CLI_MODULE = {
+        "qwarp": "qwarp",
+        "formwarp": "formwarp",
+        "optiwarp_demons": "optiwarp",
+        "optiwarp_lk": "optiwarp",
+        "optiwarp_hs": "optiwarp",
+    }
+
+    def test_every_flag_parses(self):
+        import importlib
+
+        from fastfuncstuff.processing.tunespec import BACKENDS
+
+        checked = 0
+        for backend, spec in BACKENDS.items():
+            mod = importlib.import_module(f"fastfuncstuff.cli.{self.CLI_MODULE[backend]}")
+            for param in spec.params:
+                for value in param.values:
+                    argv = ["-base", "b.nii", "-source", "s.nii", "-prefix", "o"]
+                    argv += param.render(value)
+                    try:
+                        mod.parse_args(argv)
+                    except SystemExit:  # argparse rejected it
+                        raise AssertionError(
+                            f"{param.name}: {self.CLI_MODULE[backend]} does not accept "
+                            f"{' '.join(param.render(value))}"
+                        ) from None
+                    checked += 1
+        assert checked > 50, "the sweep should actually be covering the parameter table"
+
+    def test_rendered_command_round_trips_to_the_right_value(self):
+        """Not just accepted — parsed back as the value the search set."""
+        import importlib
+
+        from fastfuncstuff.processing.tunespec import find_param
+
+        mod = importlib.import_module("fastfuncstuff.cli.optiwarp")
+        param = find_param("optiwarp.total_sigma")
+        args = mod.parse_args(
+            ["-base", "b.nii", "-source", "s.nii", "-prefix", "o", *param.render(2.0)]
+        )
+        assert args.total_sigma == 2.0
+
+
+class TestPresets:
+    """A preset is only useful if it survives the whole way into a running tool."""
+
+    def test_every_preset_names_a_real_recipe_and_backend(self):
+        from fastfuncstuff.processing.tunespec import BACKENDS, PRESETS, RECIPES
+
+        for (recipe, backend), preset in PRESETS.items():
+            assert recipe in RECIPES
+            assert backend in BACKENDS
+            assert preset.recipe == recipe and preset.backend == backend
+
+    def test_every_preset_key_is_a_real_knob_with_a_valid_value(self):
+        from fastfuncstuff.processing.tunespec import BACKENDS, PRESETS
+
+        for (_, backend), preset in PRESETS.items():
+            spec = BACKENDS[backend]
+            for key in preset.config:
+                spec.param(key)  # raises KeyError if the knob does not exist
+
+    def test_every_preset_carries_provenance(self):
+        """Without it the claim is unfalsifiable — 'best' on unstated data."""
+        from fastfuncstuff.processing.tunespec import PRESETS
+
+        for key, preset in PRESETS.items():
+            assert len(preset.provenance) > 30, key
+
+    def test_preset_reaches_the_parsed_arguments(self):
+        from fastfuncstuff.cli.optiwarp import parse_args
+
+        args = parse_args(["-base", "b", "-source", "s", "-prefix", "o", "-type", "MNI_T1"])
+        assert args.total_sigma == 1.0
+        assert args.update_sigma == 0.5
+
+    def test_an_explicit_flag_beats_the_preset(self):
+        """-type sets a starting point; it must never override what was asked for."""
+        from fastfuncstuff.cli.optiwarp import parse_args
+
+        args = parse_args(
+            ["-base", "b", "-source", "s", "-prefix", "o", "-type", "MNI_T1", "-total_sigma", "9.0"]
+        )
+        assert args.total_sigma == 9.0
+
+    def test_explicit_flag_wins_even_when_it_equals_the_default(self):
+        """Explicitness cannot be inferred by comparing against defaults: a user
+        who deliberately types the default value would be silently overridden."""
+        from fastfuncstuff.cli.optiwarp import parse_args
+        from fastfuncstuff.processing.optiwarp import OptiwarpConfig
+
+        stock = OptiwarpConfig().update_sigma
+        args = parse_args(
+            [
+                "-base",
+                "b",
+                "-source",
+                "s",
+                "-prefix",
+                "o",
+                "-type",
+                "MNI_T1",
+                "-update_sigma",
+                str(stock),
+            ]
+        )
+        assert args.update_sigma == stock, "typing the default must still count as typing it"
+
+    def test_preset_produces_a_usable_config_not_just_a_namespace(self):
+        """The end-to-end check. Schedule knobs are stored as tuples by the tuner
+        but taken as '300x210x120' strings by the CLI, so a preset that skipped the
+        conversion would crash the tool it exists to configure."""
+        from fastfuncstuff.cli.optiwarp import _build_config, parse_args
+
+        args = parse_args(["-base", "b", "-source", "s", "-prefix", "o", "-type", "MNI_T1"])
+        cfg = _build_config(args)
+        assert cfg.total_sigma == 1.0
+        assert cfg.update_sigma == 0.5
+        assert isinstance(cfg.iterations, tuple)
+
+    def test_schedule_values_render_as_the_cli_spelling(self):
+        from fastfuncstuff.processing.tunespec import (
+            BACKENDS,
+            PRESETS,
+            Preset,
+            preset_config_for_cli,
+        )
+
+        PRESETS[("epi2epi", "formwarp")] = Preset(
+            recipe="epi2epi",
+            backend="formwarp",
+            config={"iters": (300, 210, 120)},
+            provenance="synthetic entry used only by this test, long enough to pass",
+        )
+        try:
+            assert BACKENDS["formwarp"].param("iters").fmt == "x"
+            assert preset_config_for_cli("epi2epi", "formwarp") == {"iters": "300x210x120"}
+        finally:
+            del PRESETS[("epi2epi", "formwarp")]
+
+    def test_missing_preset_is_not_an_error(self):
+        """Most (recipe, backend) pairs have never been measured; that is normal."""
+        from fastfuncstuff.cli.formwarp import parse_args
+        from fastfuncstuff.processing.tunespec import preset_for
+
+        assert preset_for("epi2epi", "formwarp") is None
+        args = parse_args(["-base", "b", "-source", "s", "-prefix", "o", "-type", "epi2epi"])
+        assert args.total_var == 0.0  # the built-in default, untouched
+
+    def test_help_text_is_generated_from_the_presets(self):
+        from fastfuncstuff.processing.tunespec import describe_presets
+
+        text = describe_presets("optiwarp_demons")
+        assert "MNI_T1" in text
+        assert "measured on" in text, "the provenance must reach the user, not just the code"

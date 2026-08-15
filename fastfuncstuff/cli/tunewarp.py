@@ -41,6 +41,7 @@ from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
     format_convergence,
+    format_export,
     format_iteration_advice,
     format_knob_effects,
     format_reproduce,
@@ -176,6 +177,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-run config N and KEEP its outputs, so they can be looked at",
     )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
+    act.add_argument(
+        "-export",
+        action="store_true",
+        help="Print the winning configs as Preset source to paste into tunespec, so "
+        "the run's conclusion becomes the default that -type applies.",
+    )
     act.add_argument(
         "-convergence",
         action="store_true",
@@ -331,11 +338,15 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     store = TrialStore(out / "trials.json")
 
-    if args.list or args.effects or args.convergence:
+    if args.list or args.effects or args.convergence or args.export:
         if args.recipe:
             store.compute_consensus(RECIPES[args.recipe].panel())
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
+        if args.export:
+            if not args.recipe:
+                raise SystemExit("-export needs -type, since a preset is keyed by recipe")
+            print(format_export(store, args.recipe))
         if args.convergence:
             print(format_iteration_advice(recommend_iterations(store)))
             print()

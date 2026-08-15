@@ -3921,3 +3921,78 @@ def combine_brain_masks(
     if base_brain is None or src_brain is None:
         return base_brain if src_brain is None else src_brain
     return base_brain & src_brain if intersect else base_brain | src_brain
+
+
+# ---------------------------------------------------------------------------
+# Tuned presets (-type)
+# ---------------------------------------------------------------------------
+
+
+def add_recipe_arg(parser, backend: str) -> None:
+    """Register ``-type RECIPE``, which applies settings a tuning run measured.
+
+    The registration engines have a lot of knobs and no single right setting for
+    all data, so the honest default is conservative and the *good* setting is
+    whatever ``ffs_tunewarp`` found for data of that kind. This is how that finding
+    reaches a user who is not going to run a search themselves.
+    """
+    from fastfuncstuff.processing.tunespec import RECIPES, describe_presets
+
+    parser.add_argument(
+        "-type",
+        dest="recipe",
+        choices=sorted(RECIPES),
+        default=None,
+        help="Apply the settings ffs_tunewarp measured for this kind of "
+        "registration. Any flag you pass explicitly still wins, so -type sets a "
+        "starting point rather than overriding you. Presets available here:\n"
+        + describe_presets(backend),
+    )
+
+
+def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb: int = 1) -> None:
+    """Push a ``-type`` preset onto ``args``, without overriding explicit flags.
+
+    Explicit-wins is the whole contract, and it cannot be decided by comparing a
+    value against its default: a user who deliberately passes the default value
+    would be silently overridden by the preset. So it is decided by whether the
+    flag appears in argv, which is the only thing that actually distinguishes
+    "asked for" from "not mentioned".
+    """
+    import sys
+
+    from fastfuncstuff.processing.tunespec import preset_config_for_cli, preset_for
+
+    recipe = getattr(args, "recipe", None)
+    if not recipe:
+        return
+    preset = preset_for(recipe, backend)
+    if preset is None:
+        if verb >= 1:
+            print(
+                f"-type {recipe}: no tuned preset exists for {backend} yet; "
+                "using the built-in defaults.",
+                file=sys.stderr,
+            )
+        return
+
+    typed = {tok.lstrip("-").replace("-", "_") for tok in (sys.argv[1:] if argv is None else argv)}
+    applied, skipped = {}, []
+    for dest, value in preset_config_for_cli(recipe, backend).items():
+        if dest in typed:
+            skipped.append(dest)
+            continue
+        setattr(args, dest, value)
+        applied[dest] = value
+
+    if verb >= 1 and applied:
+        shown = " ".join(f"-{k} {v}" for k, v in sorted(applied.items()))
+        print(f"-type {recipe}: applied {shown}", file=sys.stderr)
+        if skipped:
+            print(
+                f"  (kept your explicit {', '.join('-' + s for s in sorted(skipped))})",
+                file=sys.stderr,
+            )
+        print(f"  measured on: {preset.provenance}", file=sys.stderr)
+        if preset.caveat:
+            print(f"  caveat: {preset.caveat}", file=sys.stderr)

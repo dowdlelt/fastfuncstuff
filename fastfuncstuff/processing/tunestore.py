@@ -18,6 +18,7 @@ you reproduce is what ran, not a reconstruction of it.
 
 from __future__ import annotations
 
+import datetime
 import json
 import statistics
 from collections.abc import Sequence
@@ -498,6 +499,52 @@ def format_iteration_advice(advice: list[IterationAdvice]) -> str:
             "  stopping rule is working. But needing most of a generous ceiling means the",
             "  solver is crawling, so raise the step size before raising the ceiling again.",
         ]
+    return "\n".join(lines)
+
+
+def format_export(store: TrialStore, recipe: str, subjects: str = "") -> str:
+    """The run's conclusion as ``Preset`` source, ready to paste into tunespec.
+
+    Deliberately printed for a human to commit rather than written to a file the
+    tools read at runtime. A default changing is a real change: it should arrive as
+    a reviewable diff with a provenance line attached, not appear because someone
+    left a tuning directory lying around. The generated provenance is a starting
+    point — the part only the operator knows is what the data actually was.
+    """
+    best: dict[str, ConfigResult] = {}
+    for r in store.results():
+        if r.grade == PASS and r.backend not in best:
+            best[r.backend] = r
+    if not best:
+        return "  (no passing config to export — nothing here is fit to be a default)"
+
+    n_subjects = len({t.subject for t in store.trials})
+    n_fits = len(store.trials)
+    lines = [
+        "  Paste into PRESETS in fastfuncstuff/processing/tunespec.py.",
+        "  Edit the provenance to say what the data actually was.",
+        "",
+    ]
+    for backend, r in sorted(best.items()):
+        cfg = ", ".join(f'"{k}": {v!r}' for k, v in sorted(r.config.items()))
+        lines += [
+            f'    ("{recipe}", "{backend}"): Preset(',
+            f'        recipe="{recipe}",',
+            f'        backend="{backend}",',
+            f"        config={{{cfg}}},",
+            "        provenance=(",
+            f'            "{subjects or f"{n_subjects} subjects"}, {n_fits} fits, '
+            f'{r.seconds_mean:.1f} s/fit, "',
+            f'            "{datetime.date.today().isoformat()}."',
+            "        ),",
+            "    ),",
+        ]
+    lines += [
+        "",
+        "  Sanity-check before committing: a preset is a claim that these settings",
+        "  generalize to data of this kind, which one run on one cohort cannot",
+        "  establish on its own.",
+    ]
     return "\n".join(lines)
 
 
