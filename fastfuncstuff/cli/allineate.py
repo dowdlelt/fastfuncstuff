@@ -141,6 +141,18 @@ def _apply_followers(
             print(f"Saved follower: {prefix}")
 
 
+def _resolve_ov(args: argparse.Namespace) -> float:
+    """Overlap-penalty weight, defaulting the way AFNI does per cost.
+
+    ``-ov`` is off unless asked for, except under the lpa+/lpc+ family, where
+    the overlap term is part of the published combination (DEFAULT_MICHO_*_OV
+    = 0.4 in 3dAllineate.c) and leaving it off would not be that cost.
+    """
+    if args.ov is not None:
+        return args.ov
+    return 0.4 if args.cost.lower().startswith(("lpa+", "lpc+")) else 0.0
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -253,12 +265,34 @@ Examples:
     cost_group = parser.add_argument_group("Cost function")
     cost_group.add_argument(
         "-cost",
-        choices=["ls", "lpa", "lpc", "lps", "lpsc", "mi", "nmi", "je", "hel", "cru", "cra", "crm"],
+        choices=[
+            "ls",
+            "lpa",
+            "lpc",
+            "lpa+",
+            "lpc+",
+            "lpa+ZZ",
+            "lpc+ZZ",
+            "lps",
+            "lpsc",
+            "mi",
+            "nmi",
+            "je",
+            "hel",
+            "cru",
+            "cra",
+            "crm",
+        ],
         default="lpa",
         help="Cost function (AFNI-faithful unless noted): "
         "ls=clipped Pearson; "
         "lpa=local Pearson absolute (default, similar contrast); "
         "lpc=local Pearson signed (cross-modal, e.g. EPI-to-anat); "
+        "lpa+/lpc+=the same plus weighted hel/mi/nmi/crA/overlap terms, which "
+        "widen the basin and make the search more robust; "
+        "lpa+ZZ/lpc+ZZ=search with the combination, then finish on the pure "
+        "cost (AFNI's most robust pair: lpc+ZZ for EPI-to-T1, lpa+ZZ for "
+        "T1-to-T1); "
         "mi/nmi=(normalized) mutual information; je=joint entropy; "
         "hel=Hellinger; cru/cra/crm=correlation ratio "
         "(unsym/additive/multiplicative). "
@@ -302,8 +336,9 @@ Examples:
         "-overlap",
         dest="ov",
         type=float,
-        default=0.0,
-        help="Overlap penalty weight (AFNI lpc+/lpa+ 'ov'; default 0=off). "
+        default=None,
+        help="Overlap penalty weight (AFNI lpc+/lpa+ 'ov'; default 0=off, but "
+        "0.4 for the lpa+/lpc+ costs, matching AFNI). "
         "Adds a differentiable (max(0,9.95-10*overlap))^2 term that pushes the "
         "refiner back toward full base/source overlap. Try ~0.05-0.5 if a "
         "whole-brain alignment drifts partly out of overlap.",
@@ -413,8 +448,8 @@ Examples:
     search_group.add_argument(
         "-coarse_shift_frac",
         type=float,
-        default=0.32,
-        help="Coarse translation half-range as a fraction of grid size (default: 0.32, like AFNI)",
+        default=0.321,
+        help="Coarse translation half-range as a fraction of grid size (default: 0.321, like AFNI)",
     )
     range_ex = search_group.add_mutually_exclusive_group()
     range_ex.add_argument(
@@ -425,8 +460,24 @@ Examples:
     range_ex.add_argument(
         "-verysmallrange", action="store_true", help="Quarter all coarse search ranges"
     )
+    range_ex.add_argument(
+        "-hugerange",
+        action="store_true",
+        help="Widen all coarse search ranges by 1.5x (rotation ±45° instead of "
+        "±30°) and keep the same angular step, so the seed grid gets "
+        "correspondingly denser. For a source that starts badly off — grossly "
+        "oblique, wrong nominal orientation, an eyeballed misplacement. Costs a "
+        "few seconds in the coarse pass; the default range is right for data "
+        "that is merely imperfectly positioned.",
+    )
     search_group.add_argument(
-        "-tbest", type=int, default=3, help="Coarse candidates to refine (default: 3)"
+        "-tbest",
+        type=int,
+        default=None,
+        help="Coarse candidates to refine (default: 10 for lpa/lpc, 3 otherwise). "
+        "The blok costs refine their trials in one batch, so up to ~10 costs no "
+        "measurable time and buys extra chances that the right basin survives the "
+        "coarse search; the other costs pay for each trial in full.",
     )
     search_group.add_argument(
         "-nmatch",
@@ -676,14 +727,22 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         lpa_kernel=args.lpa_kernel,
         bloktype=args.bloktype,
         blokrad=args.blokrad,
-        ov=args.ov,
+        ov=_resolve_ov(args),
         n_match=args.n_match,
         compile=args.compile,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,
         coarse_shift_frac=args.coarse_shift_frac,
-        range_scale=(0.25 if args.verysmallrange else 0.5 if args.smallrange else 1.0),
+        range_scale=(
+            0.25
+            if args.verysmallrange
+            else 0.5
+            if args.smallrange
+            else 1.5
+            if args.hugerange
+            else 1.0
+        ),
         adam_lr=args.adam_lr,
         tbest=args.tbest,
         adam_iters_2x=adam_iters_2x,

@@ -19,6 +19,7 @@ from fastfuncstuff.processing.allineate import (
     _compute_param_bounds,
     _compute_source_validity_mask,
     _crop_volumes,
+    _default_tbest,
     _denormalize,
     _denormalize_t,
     _downsample_3d,
@@ -28,6 +29,7 @@ from fastfuncstuff.processing.allineate import (
     _make_powell_cost,
     _normalize,
     _normalize_t,
+    _parse_cost,
     _refine_adam_normalized,
     _refine_powell,
     _rotation_candidates,
@@ -215,6 +217,60 @@ class TestComputeParamBounds:
         for i in range(3):
             mid = (bounds[i, 0] + bounds[i, 1]) / 2
             np.testing.assert_allclose(mid, shift[i], atol=1e-10)
+
+    def test_rot_range_is_honoured(self):
+        """-coarse_range reached the config but never the bounds (fixed 2026-08-15).
+
+        The joint coarse search draws its rotation seeds from these bounds, so a
+        hardcoded rotation range silently made the flag a no-op on lpa/lpc.
+        """
+        default = _compute_param_bounds((16, 16, 16))
+        np.testing.assert_allclose(default[3:6, 1], 30.0)
+        wide = _compute_param_bounds((16, 16, 16), rot_range=60.0)
+        np.testing.assert_allclose(wide[3:6, 1], 60.0)
+        np.testing.assert_allclose(wide[3:6, 0], -60.0)
+
+    def test_shift_frac_is_honoured(self):
+        narrow = _compute_param_bounds((16, 16, 16), shift_frac=0.1)
+        wide = _compute_param_bounds((16, 16, 16), shift_frac=0.4)
+        assert (wide[:3, 1] > narrow[:3, 1]).all()
+
+    def test_range_scale_multiplies_rot_range(self):
+        """-hugerange rides on range_scale, so the two must compose."""
+        huge = _compute_param_bounds((16, 16, 16), range_scale=1.5)
+        np.testing.assert_allclose(huge[3:6, 1], 45.0)
+
+
+class TestCostNameParsing:
+    """lpc+/lpa+/+ZZ decompose into a base cost, weights, and a final-pass flag."""
+
+    def test_plain_costs_are_untouched(self):
+        for name in ("lpa", "lpc", "ls", "mi", "nmi"):
+            assert _parse_cost(name) == (name, None, False)
+
+    def test_combination_weights_match_afni(self):
+        # DEFAULT_MICHO_* in 3dAllineate.c, as (hel, mi, nmi, crA).
+        assert _parse_cost("lpc+") == ("lpc", (0.4, 0.2, 0.2, 0.4), False)
+        # lpa+ drops the MI term (27 May 2021) -- the only difference.
+        assert _parse_cost("lpa+") == ("lpa", (0.4, 0.0, 0.2, 0.4), False)
+
+    def test_zz_sets_the_final_flag_only(self):
+        base, w, zz = _parse_cost("lpa+ZZ")
+        assert (base, w) == _parse_cost("lpa+")[:2]
+        assert zz is True
+
+    def test_zz_is_case_insensitive(self):
+        assert _parse_cost("lpc+zz") == _parse_cost("lpc+ZZ")
+
+    def test_tbest_default_follows_the_base_cost(self):
+        """A combination cost still refines on the blok path, so it gets 10."""
+        assert _default_tbest("lpa") == _default_tbest("lpa+ZZ") == 10
+        assert _default_tbest("ls") == _default_tbest("nmi") == 3
+
+    def test_config_resolves_tbest_from_cost(self):
+        assert AffineAlignConfig(cost="lpc+ZZ").tbest == 10
+        assert AffineAlignConfig(cost="nmi").tbest == 3
+        assert AffineAlignConfig(cost="nmi", tbest=7).tbest == 7
 
 
 # ---------------------------------------------------------------------------
