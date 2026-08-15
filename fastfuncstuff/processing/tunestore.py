@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import json
 import statistics
-from dataclasses import asdict, dataclass, field
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +45,10 @@ class Trial:
     grade: str = PASS
     reasons: list[str] = field(default_factory=list)
     warpqc: dict[str, Any] = field(default_factory=dict)
+    # Continuous distance from the regularity gate, > 0 == passing. The grade is
+    # what a user reads; this is what the adaptive searcher steers by, because a
+    # label carries no gradient and this boundary is a cliff.
+    margin: float = 0.0
     kept_outputs: str | None = None  # set when a trial was reproduced
 
     def as_dict(self) -> dict:
@@ -137,13 +142,17 @@ class TrialStore:
     def load(self) -> None:
         raw = json.loads(self.path.read_text())
         self._config_ids = raw.get("config_ids", {})
-        self.trials = [Trial(**t) for t in raw.get("trials", [])]
+        # Ignore fields this version does not know about, so a table written by a
+        # newer build still opens. A tuning run is expensive; losing one to a
+        # schema addition would be the worst possible time to be strict.
+        known = {f.name for f in fields(Trial)}
+        self.trials = [Trial(**{k: v for k, v in t.items() if k in known}) for t in raw["trials"]]
         self._next_trial = max((t.trial_id for t in self.trials), default=0)
 
     # --- scoring ------------------------------------------------------------
 
-    def compute_consensus(self, exclude: tuple[str, ...] = ()) -> None:
-        """Fill in ``scores["consensus"]`` for every trial.
+    def compute_consensus(self, panel: Sequence[str]) -> None:
+        """Fill in ``scores["consensus"]`` for every trial, using ``panel`` as the jury.
 
         Consensus is inherently *relative* — each functional votes by ranking the
         candidates it scored — so it cannot be computed when a trial is run, only
@@ -152,20 +161,22 @@ class TrialStore:
         settings we are trying to separate; comparing raw values across subjects
         would measure the subjects.
 
-        ``exclude`` drops the functionals a backend optimised, so a cost never
-        votes on the fit it produced.
+        The panel comes from :func:`allcost.judge_panel` and is not merely "all
+        the costs minus the optimised one": it also drops the functionals that
+        are *meaningless* for the contrast regime. See that function for why —
+        the short version is that on same-modality data three of the fourteen
+        rank the worst warp first.
         """
         from .allcost import consensus_rank
 
+        keep = set(panel)
         by_subject: dict[str, list[Trial]] = {}
         for t in self.trials:
             by_subject.setdefault(t.subject, []).append(t)
 
         for ts in by_subject.values():
             scored = {
-                str(t.trial_id): {
-                    k: v for k, v in t.scores.items() if k not in exclude and k != "consensus"
-                }
+                str(t.trial_id): {k: v for k, v in t.scores.items() if k in keep}
                 for t in ts
                 if t.scores
             }
@@ -237,8 +248,19 @@ class KnobEffect:
     direction: str  # "lower is better" | "higher is better" | "flat"
 
 
-def knob_effects(store: TrialStore, score_key: str = "consensus") -> list[KnobEffect]:
+def knob_effects(
+    store: TrialStore, score_key: str = "consensus", pass_only: bool = True
+) -> list[KnobEffect]:
     """Marginal effect of every knob, and how consistent it is across subjects.
+
+    ``pass_only`` averages the score over trials that passed the regularity gate,
+    which is not a detail. A folded warp scores *better* — that is what folding
+    buys — so a level's mean over all trials is pulled down in proportion to how
+    often it broke, and the report ends up recommending the setting that fails
+    most. Fold rate is still counted over every trial, so the two columns answer
+    the two different questions: "how good when it works" and "how often does it
+    work". A level with no passing trials shows ``n/a``, which is the honest
+    answer rather than a number that flatters it.
 
     Deliberately *not* a held-out-subject cross-validation. Nothing is being
     fitted to the subjects — a handful of discrete settings are being compared —
@@ -262,7 +284,8 @@ def knob_effects(store: TrialStore, score_key: str = "consensus") -> list[KnobEf
         levels = []
         for v in values:
             sel = [t for t in ts if _hashable(t.config[key]) == v]
-            scored = [t.scores[score_key] for t in sel if score_key in t.scores]
+            usable = [t for t in sel if t.grade == PASS] if pass_only else sel
+            scored = [t.scores[score_key] for t in usable if score_key in t.scores]
             folds = [t for t in sel if t.grade != PASS]
             levels.append(
                 (
@@ -274,10 +297,19 @@ def knob_effects(store: TrialStore, score_key: str = "consensus") -> list[KnobEf
             )
 
         # Pooled direction: does the best level sit low or high in the range?
+        #
+        # A level with no passing trial has no score, and dropping the whole knob
+        # for that would hide precisely the most useful knob in the report: the
+        # one with a fold cliff in it. So an unscoreable level still appears, with
+        # its fold rate, and the direction is read off whatever did pass.
         finite = [(v, s) for v, s, _, _ in levels if s == s]
-        if len(finite) < 2:
+        if not finite:
+            out.append(KnobEffect(backend, key, levels, 0.0, "never passes the gate"))
             continue
         best_v = min(finite, key=lambda p: p[1])[0]
+        if len(finite) == 1:
+            out.append(KnobEffect(backend, key, levels, 1.0, f"only {best_v} passes the gate"))
+            continue
         lo, hi = finite[0][0], finite[-1][0]
         if best_v == lo:
             direction = "lower is better"
@@ -294,6 +326,8 @@ def knob_effects(store: TrialStore, score_key: str = "consensus") -> list[KnobEf
         # config's level need not be the level that wins on average.
         per_subject: dict[str, dict[Any, list[float]]] = {}
         for t in ts:
+            if pass_only and t.grade != PASS:
+                continue
             if score_key in t.scores:
                 lvl = _hashable(t.config[key])
                 per_subject.setdefault(t.subject, {}).setdefault(lvl, []).append(
@@ -322,7 +356,11 @@ def format_knob_effects(effects: list[KnobEffect]) -> str:
     """Per-knob table: what each level scored, how often it folded, is it consistent."""
     if not effects:
         return "  (nothing varied yet)"
-    lines = []
+    lines = [
+        "  score = mean over trials that PASSED the gate; not-PASS counts every trial.",
+        "  'n/a' means no setting at that level ever produced a sound warp.",
+        "",
+    ]
     for e in effects:
         lines.append(
             f"  {e.backend}.{e.key}  -- {e.direction}, {e.consistency:.0%} of subjects agree"

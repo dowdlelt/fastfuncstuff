@@ -48,6 +48,39 @@ COST_INFO: dict[str, tuple[str, str]] = {
 
 ALL_COSTS = list(COST_INFO)
 
+# Which functionals are computed from the same underlying quantity. Excluding a
+# cost from a judging panel has to exclude its whole family, because "different
+# name" is not "different evidence": lpc, lpa, lpc+ and lpa+ are all functions of
+# the single ``lp_val`` computed once below, so dropping lpa while keeping lpa+
+# lets the optimised cost keep voting under another name (measured rank
+# correlation between them: 1.00).
+COST_FAMILY: dict[str, str] = {
+    "ls": "correlation",
+    "lss": "correlation",
+    "sp": "correlation",
+    "mi": "histogram",
+    "nmi": "histogram",
+    "je": "histogram",
+    "hel": "histogram",
+    "crM": "histogram",
+    "crA": "histogram",
+    "crU": "histogram",
+    "lpc": "localpearson",
+    "lpa": "localpearson",
+    "lpc+": "localpearson",
+    "lpa+": "localpearson",
+}
+
+# Functionals that are *signed*: lower-is-better means they reward
+# anti-correlation, which is what you want when the two images have inverted
+# contrast (EPI vs T1) and exactly wrong when they do not. On same-modality data
+# these rank the worst candidate first — measured at rho = -0.99 against every
+# unsigned functional on a T1->MNI search, where they silently cancelled three of
+# the eleven honest votes.
+SIGNED_COSTS = ("lss", "lpc", "lpc+")
+
+CONTRAST_REGIMES = ("same", "cross")
+
 # AFNI's DEFAULT_MICHO_* weights for the "+" combination costs, as
 # (hel, mi, nmi, crA, ov). lpa+ drops the MI term (3dAllineate.c, 27 May 2021).
 MICHO_LPC = (0.4, 0.2, 0.2, 0.4, 0.4)
@@ -248,6 +281,52 @@ def cost_agreement(vals_a: dict[str, float], vals_b: dict[str, float]) -> dict[s
     """
     common = [k for k in vals_a if k in vals_b]
     return {k: vals_b[k] - vals_a[k] for k in common}
+
+
+def judge_panel(
+    optimized: str | None = None,
+    contrast: str = "same",
+    exclude: tuple[str, ...] = (),
+) -> list[str]:
+    """The functionals allowed to judge a fit, given what produced it.
+
+    Two filters, and both of them changed the answer on real data:
+
+    * **Contrast regime.** On ``same``-modality pairs the signed functionals
+      (:data:`SIGNED_COSTS`) are dropped, because "lower is better" means
+      "more anti-correlated" for them and there is no legitimate anti-correlation
+      between two T1s. Left in, they rank the *worst* warp first.
+    * **Family-aware exclusion.** The optimised cost is excluded along with
+      everything derived from the same quantity (:data:`COST_FAMILY`), so a cost
+      cannot vote on its own fit through a sibling.
+
+    Args:
+        optimized: the cost the backend minimised, whose family is removed.
+        contrast: ``"same"`` or ``"cross"`` modality.
+        exclude: further functionals to drop by name.
+
+    Returns:
+        Cost names, in :data:`ALL_COSTS` order.
+    """
+    if contrast not in CONTRAST_REGIMES:
+        raise ValueError(f"contrast must be one of {CONTRAST_REGIMES}, got {contrast!r}")
+
+    drop = set(exclude)
+    if optimized:
+        if optimized not in COST_FAMILY:
+            raise ValueError(f"unknown cost {optimized!r}")
+        family = COST_FAMILY[optimized]
+        drop |= {c for c, f in COST_FAMILY.items() if f == family}
+    if contrast == "same":
+        drop |= set(SIGNED_COSTS)
+
+    panel = [c for c in ALL_COSTS if c not in drop]
+    if not panel:
+        raise ValueError(
+            f"empty judging panel: optimizing {optimized!r} under contrast "
+            f"{contrast!r} excludes every functional"
+        )
+    return panel
 
 
 def consensus_rank(candidates: dict[str, dict[str, float]]) -> list[tuple[str, float]]:

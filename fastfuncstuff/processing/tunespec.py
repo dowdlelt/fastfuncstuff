@@ -320,11 +320,22 @@ class Recipe:
     name: str
     describe: str
     optimize: str  # in-loop cost/metric, pinned (removes a whole search axis)
-    evaluate_exclude: tuple[str, ...]  # functionals not allowed to vote on their own fit
+    evaluate_exclude: tuple[str, ...]  # extra functionals barred from voting
     pairing: str  # "one_base" (many sources vs one base) | "paired"
     tune: tuple[str, ...]  # dotted parameter keys worth searching
+    # "same" | "cross" modality. Decides which functionals are even *meaningful*
+    # judges: the signed ones (lss/lpc/lpc+) reward anti-correlation, so on a
+    # same-modality pair they rank the worst warp first. This is not a nuance —
+    # left unset it silently inverted three of fourteen votes on a T1->MNI run.
+    contrast: str = "same"
     notes: str = ""
     backends: tuple[str, ...] = field(default_factory=lambda: tuple(BACKENDS))
+
+    def panel(self) -> list[str]:
+        """The functionals allowed to judge fits produced under this recipe."""
+        from .allcost import judge_panel
+
+        return judge_panel(self.optimize, self.contrast, tuple(self.evaluate_exclude))
 
 
 _ALL_REG = (
@@ -341,22 +352,30 @@ RECIPES: dict[str, Recipe] = {
         name="MNI_T1",
         describe="T1 to an MNI template: same modality, different brains",
         optimize="lpa",
-        evaluate_exclude=("lpa",),
+        evaluate_exclude=(),
+        contrast="same",
         pairing="one_base",
         tune=_ALL_REG + ("qwarp.hfactor_q", "formwarp.grad_step"),
         notes=(
-            "Measured on 3 FreeSurfer brains -> MNI152_2009: with -metric lpa, "
-            "formwarp wants total_var 0.0 (lower better, 3/3 agree) and "
-            "update_var 3-4 (2/3 agree) -- and folds on NONE of them. With the "
-            "tool default -metric cc the same settings fold ~9900 voxels, so on "
-            "same-modality data the metric matters more than the regularization."
+            "Measured on 5 FreeSurfer brains -> MNI152_2009 (480 fits, -metric "
+            "lpa). optiwarp total_sigma 1.0 is the floor: 0.0 and 0.5 fold on "
+            "100% of subjects for all three force models, and demons at "
+            "1.0/0.5 is both near-best and 4.75x cheaper than formwarp. "
+            "formwarp wants total_var 0.0-0.5 and update_var 3-4, and folds "
+            "almost never (1 of 300). Score and gate point OPPOSITE ways on "
+            "every regularization knob -- the top scorer is always the least "
+            "regularization that is still legal -- so read the ranking as the "
+            "fold boundary, not as an optimum. With the tool default -metric cc "
+            "the same settings fold ~9900 voxels: on same-modality data the "
+            "metric matters more than the regularization."
         ),
     ),
     "epi2t1": Recipe(
         name="epi2t1",
         describe="BOLD to that subject's own T1: cross-modal, same brain",
         optimize="lpc",
-        evaluate_exclude=("lpc", "lpa"),
+        evaluate_exclude=(),
+        contrast="cross",
         pairing="paired",
         tune=_ALL_REG + ("optiwarp.match",),
         notes=(
@@ -370,7 +389,8 @@ RECIPES: dict[str, Recipe] = {
         name="epi2epi",
         describe="BOLD to BOLD: same modality, same brain",
         optimize="lpa",
-        evaluate_exclude=("lpa",),
+        evaluate_exclude=(),
+        contrast="same",
         pairing="paired",
         tune=_ALL_REG + ("optiwarp.max_step", "formwarp.grad_step"),
         notes=(

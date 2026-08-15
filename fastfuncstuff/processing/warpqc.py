@@ -14,6 +14,7 @@ its way past a defect that invalidates the result.
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 
 import torch
@@ -33,6 +34,14 @@ from .penalty import _central_diff_batched
 # that a handful really is negligible.
 DEFAULT_MAX_NEG_VOXELS = 64
 DEFAULT_MAX_NEG_FRAC = 1e-5
+
+# Saturation for regularity_margin(), in log units. Real margins live within a
+# couple of units of zero, so this is "off the scale" in either direction while
+# staying finite — a searcher regressing on these needs a number for a fit that
+# exploded, not a NaN.
+MARGIN_LIMIT = 10.0
+FAILED_MARGIN = -MARGIN_LIMIT  # a fit that produced no field at all
+UNCONSTRAINED_MARGIN = MARGIN_LIMIT  # a result with no field to fold
 DEFAULT_MAX_JAC = 4.0  # local expansion beyond this is implausible
 DEFAULT_MIN_JAC = 0.25  # ... and likewise compression
 
@@ -239,6 +248,38 @@ def regularity_verdict(
         grade = FAIL
 
     return grade, reasons
+
+
+def regularity_margin(
+    qc: WarpQC,
+    max_neg_voxels: int = DEFAULT_MAX_NEG_VOXELS,
+    max_neg_frac: float = DEFAULT_MAX_NEG_FRAC,
+    min_jac: float = DEFAULT_MIN_JAC,
+    max_jac: float = DEFAULT_MAX_JAC,
+) -> float:
+    """How much room a warp has before it fails: > 0 passes, <= 0 does not.
+
+    :func:`regularity_verdict` answers the question a user asks; this answers the
+    question a *searcher* asks. A pass/fail label says only which side of the
+    boundary a config landed on, so a search steering by it is blind until it
+    trips — and the boundary is a cliff (measured: 100% folding at
+    ``total_sigma=0.5``, 0% at 1.0), so by the time the label changes the useful
+    gradient is gone.
+
+    Each criterion becomes a log ratio of achieved-to-allowed, and the margin is
+    the tightest of them. Logs because these quantities span orders of magnitude
+    and because it makes "twice the budget" and "half the budget" symmetric
+    distances, which is what a surrogate wants to interpolate over.
+    """
+    neg_budget = max(max_neg_voxels, max_neg_frac * qc.n_voxels)
+    margins = [
+        math.log((neg_budget + 1.0) / (qc.jac_neg_count + 1.0)),
+        # A non-positive Jacobian percentile is not "slightly out of bounds", it
+        # is inside-out tissue; the log is undefined and the answer is "very bad".
+        math.log(qc.jac_p01 / min_jac) if qc.jac_p01 > 0 else -MARGIN_LIMIT,
+        math.log(max_jac / qc.jac_p99) if qc.jac_p99 > 0 else -MARGIN_LIMIT,
+    ]
+    return max(-MARGIN_LIMIT, min(margins))
 
 
 def remedies(reasons: list[str]) -> list[str]:

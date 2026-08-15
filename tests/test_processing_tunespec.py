@@ -74,9 +74,28 @@ class TestRendering:
 
 class TestRecipes:
     def test_every_recipe_excludes_the_metric_it_optimises(self):
-        """A cost must never be allowed to vote on the fit it produced."""
+        """A cost must never be allowed to vote on the fit it produced.
+
+        Enforced on the assembled panel rather than on a hand-written exclusion
+        list, because the list was the weaker check: it let the optimised cost
+        keep voting through a sibling computed from the same quantity.
+        """
         for r in RECIPES.values():
-            assert r.optimize in r.evaluate_exclude, r.name
+            assert r.optimize not in r.panel(), r.name
+
+    def test_no_recipe_is_judged_by_a_meaningless_functional(self):
+        """Signed costs reward anti-correlation; on same-modality data that
+        ranks the worst warp first."""
+        from fastfuncstuff.processing.allcost import SIGNED_COSTS
+
+        for r in RECIPES.values():
+            if r.contrast == "same":
+                assert not set(r.panel()) & set(SIGNED_COSTS), r.name
+
+    def test_every_recipe_declares_a_known_contrast_regime(self):
+        for r in RECIPES.values():
+            assert r.contrast in ("same", "cross"), r.name
+            assert len(r.panel()) >= 3, r.name
 
     def test_epi2epi_and_mni_differ(self):
         """Same brain vs different brains are different problems."""

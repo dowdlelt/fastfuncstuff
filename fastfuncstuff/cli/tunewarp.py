@@ -46,10 +46,12 @@ from fastfuncstuff.processing.tunestore import (
     knob_effects,
 )
 from fastfuncstuff.processing.tunewarp import (
+    AdaptivePlan,
     SubjectPair,
     affine_align,
     enumerate_configs,
     reproduce,
+    run_adaptive,
     run_search,
 )
 from fastfuncstuff.utils import REGISTRATION_TF32
@@ -81,7 +83,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=sorted(BACKENDS),
         help="Restrict the search to these backends (default: all of them)",
     )
-    parser.add_argument(
+    search = parser.add_argument_group("Search strategy")
+    search.add_argument(
+        "-search",
+        choices=("adaptive", "grid"),
+        default="adaptive",
+        help="adaptive (default): a surrogate proposes settings, each is screened "
+        "on one subject and only survivors are confirmed on more, and a range is "
+        "extended when the best setting sits on its end. grid: the full factorial, "
+        "every config on every subject — exhaustive, reproducible, and much slower.",
+    )
+    search.add_argument(
+        "-budget",
+        type=int,
+        default=60,
+        help="Adaptive only: fits to spend per backend (default: 60)",
+    )
+    search.add_argument(
+        "-screen",
+        type=int,
+        default=1,
+        help="Adaptive only: subjects a fresh candidate is tried on (default: 1)",
+    )
+    search.add_argument(
+        "-confirm",
+        type=int,
+        default=2,
+        help="Adaptive only: further subjects a promising candidate earns (default: 2)",
+    )
+    search.add_argument(
+        "-batch",
+        type=int,
+        default=4,
+        help="Adaptive only: candidates proposed per surrogate refit (default: 4)",
+    )
+    search.add_argument(
+        "-no_expand",
+        "-no-expand",
+        action="store_true",
+        help="Adaptive only: keep every knob inside its listed range. Off by "
+        "default because an optimum on a range edge means the range is wrong.",
+    )
+    search.add_argument("-seed", type=int, default=0, help="Adaptive only: RNG seed (default: 0)")
+    search.add_argument(
         "-max_configs",
         type=int,
         default=None,
@@ -163,6 +207,9 @@ def _epilog() -> str:
         "  ffs_tunewarp -type MNI_T1 ... -out tune_mni \\",
         "               -fix qwarp.minpatch=13 qwarp.hfactor_q=0.5",
         "",
+        "  # 2b. exhaustive instead, when you want every cell of the factorial",
+        "  ffs_tunewarp -type MNI_T1 ... -out tune_mni -search grid",
+        "",
         "  # 3. read the answer",
         "  ffs_tunewarp -out tune_mni -effects      # what each knob does",
         "  ffs_tunewarp -out tune_mni -list         # ranked configs",
@@ -178,6 +225,18 @@ def _epilog() -> str:
         "each subject and averaged. Lower is better. A PASS config always outranks",
         "a MARGINAL one and a MARGINAL always outranks a FAIL, whatever the score:",
         "a better similarity number never buys its way past a folded warp.",
+        "",
+        "The jury is chosen, not just filtered. A recipe's contrast regime decides",
+        "which functionals are meaningful at all -- the signed ones (lss/lpc/lpc+)",
+        "reward anti-correlation, so on same-modality data they rank the WORST warp",
+        "first -- and excluding the optimised cost excludes its whole family, since",
+        "lpa/lpa+/lpc/lpc+ are all the same number wearing different signs.",
+        "",
+        "Expect the ranking to sit on the fold boundary. Less regularization always",
+        "scores better, because folding is what buys the score, so the top row is",
+        "normally the least regularization that is still legal rather than an",
+        "optimum. -effects is the safer read: it separates 'how good when it works'",
+        "from 'how often does it work'.",
     ]
     return "\n".join(lines)
 
@@ -265,7 +324,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.list or args.effects:
         if args.recipe:
-            store.compute_consensus(exclude=RECIPES[args.recipe].evaluate_exclude)
+            store.compute_consensus(RECIPES[args.recipe].panel())
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
         if args.list:
@@ -290,13 +349,23 @@ def main(argv: list[str] | None = None) -> int:
     backends = args.backend or list(recipe.backends)
 
     if args.verb >= 1:
-        total = sum(
-            len(enumerate_configs(recipe, b, args.max_configs, fixed)) * len(pairs)
-            for b in backends
-        )
+        panel = recipe.panel()
         print(f"Recipe {recipe.name}: {recipe.describe}")
-        print(f"  optimize={recipe.optimize}, judged without {', '.join(recipe.evaluate_exclude)}")
-        print(f"  {len(pairs)} subject(s), {len(backends)} backend(s), {total} fits")
+        print(f"  optimize={recipe.optimize}, contrast={recipe.contrast}")
+        print(f"  judged by {len(panel)} functional(s): {', '.join(panel)}")
+        if args.search == "adaptive":
+            total = args.budget * len(backends)
+            print(
+                f"  {len(pairs)} subject(s), {len(backends)} backend(s), "
+                f"adaptive, <= {total} fits "
+                f"(screen {args.screen}, confirm {args.confirm})"
+            )
+        else:
+            total = sum(
+                len(enumerate_configs(recipe, b, args.max_configs, fixed)) * len(pairs)
+                for b in backends
+            )
+            print(f"  {len(pairs)} subject(s), {len(backends)} backend(s), grid, {total} fits")
         if fixed:
             print("  pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(fixed.items())))
         print(f"  trial outputs are discarded after scoring; table in {store.path}")
@@ -306,18 +375,38 @@ def main(argv: list[str] | None = None) -> int:
             print(f"\nStep 0: affine ({recipe.optimize}) for {len(pairs)} subject(s)")
         pairs = affine_align(pairs, recipe, out, device=device, verb=args.verb)
 
-    run_search(
-        pairs,
-        recipe,
-        store,
-        backends=backends,
-        max_configs=args.max_configs,
-        fixed=fixed,
-        device=device,
-        verb=args.verb,
-    )
+    if args.search == "adaptive":
+        plan = AdaptivePlan(
+            budget=args.budget,
+            screen=args.screen,
+            confirm=args.confirm,
+            batch=args.batch,
+            expand=not args.no_expand,
+            seed=args.seed,
+        )
+        run_adaptive(
+            pairs,
+            recipe,
+            store,
+            plan,
+            backends=backends,
+            fixed=fixed,
+            device=device,
+            verb=args.verb,
+        )
+    else:
+        run_search(
+            pairs,
+            recipe,
+            store,
+            backends=backends,
+            max_configs=args.max_configs,
+            fixed=fixed,
+            device=device,
+            verb=args.verb,
+        )
 
-    store.compute_consensus(exclude=recipe.evaluate_exclude)
+    store.compute_consensus(recipe.panel())
     store.save()
     print("\n" + format_results_table(store.results(), limit=args.top))
     print("\nPer-knob effects:\n")
