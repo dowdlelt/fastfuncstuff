@@ -53,6 +53,45 @@ def pearson_correlation(base: Tensor, source: Tensor, weight: Tensor | None = No
     return bs / denom
 
 
+def _rankify(x: Tensor) -> Tensor:
+    """Fractional ranks of ``x`` (ties averaged), as float."""
+    n = x.numel()
+    order = x.argsort()
+    ranks = torch.empty(n, dtype=x.dtype, device=x.device)
+    ranks[order] = torch.arange(n, dtype=x.dtype, device=x.device)
+
+    # Average the ranks within each run of equal values, so that a volume with
+    # large flat regions (a zeroed background, a mask edge) does not get an
+    # arbitrary ordering imposed on its ties.
+    xs = x[order]
+    new_run = torch.ones(n, dtype=torch.bool, device=x.device)
+    new_run[1:] = xs[1:] != xs[:-1]
+    group = new_run.cumsum(0) - 1
+    ng = int(group[-1].item()) + 1 if n else 0
+    sums = torch.zeros(ng, dtype=x.dtype, device=x.device).index_add_(
+        0, group, torch.arange(n, dtype=x.dtype, device=x.device)
+    )
+    counts = torch.zeros(ng, dtype=x.dtype, device=x.device).index_add_(
+        0, group, torch.ones(n, dtype=x.dtype, device=x.device)
+    )
+    return (sums / counts)[group][ranks.long()]
+
+
+def spearman_correlation(base: Tensor, source: Tensor) -> Tensor:
+    """Spearman (rank-order) correlation (AFNI ``sp`` / THD_spearman_corr_nd).
+
+    Unweighted by construction — AFNI marks ``sp`` as a no-weight method, since
+    ranking discards the magnitudes a weight would modulate.
+    """
+    b = base.reshape(-1).double()
+    s = source.reshape(-1).double()
+    n = max(1, b.numel())
+    # Ranks run to N (millions of voxels), and the correlation sums their
+    # squares — in float32 that overflows to inf and the correlation collapses
+    # to 0. Rank in float64 and rescale to [0, 1] before correlating.
+    return pearson_correlation(_rankify(b) / n, _rankify(s) / n).float()
+
+
 def clipped_pearson_correlation(
     base: Tensor,
     source: Tensor,
