@@ -181,22 +181,25 @@ FORMWARP = BackendSpec(
         ParamSpec(
             "formwarp.iters",
             "-iters",
-            ((60, 40, 20), (100, 70, 40), (160, 120, 80)),
-            (100, 70, 40),
+            ((100, 70, 40), (300, 210, 120), (600, 420, 240)),
+            (300, 210, 120),
             "effort",
-            "Per-level iteration ceilings. Read alongside the recorded best_iter: a "
-            "level whose best iterate is its last was starved; one whose best is "
-            "early over-ran and fell back.",
+            "Per-level iteration CEILING. Not searched by default and rarely worth "
+            "searching: it bounds the solver rather than shaping its answer. Set it "
+            "high and read recommend_iterations() instead.",
             attr="iterations",
             fmt="x",
         ),
         ParamSpec(
             "formwarp.conv_window",
             "-conv_window",
-            (0, 5, 10, 20),
+            (5, 10, 20),
             10,
             "schedule",
-            "Trailing-window size for early stopping; 0 runs every iteration.",
+            "Trailing-window size for early stopping. 0 (disable) is deliberately not "
+            "in the ladder: with the ceiling set high it would run every iteration for "
+            "no quality gain, and whether stopping is premature is already answerable "
+            "from best_iter vs iters_run.",
             attr="convergence_window",
         ),
         ParamSpec(
@@ -247,21 +250,25 @@ _OW_SHARED = (
     ParamSpec(
         "optiwarp.iters",
         "-iters",
-        ((60, 40, 20), (100, 70, 40), (160, 120, 80)),
-        (100, 70, 40),
+        ((100, 70, 40), (300, 210, 120), (600, 420, 240)),
+        (300, 210, 120),
         "effort",
-        "Per-level iteration ceilings. Read alongside the recorded best_iter: a level "
-        "whose best iterate is its last was starved, one whose best is early over-ran.",
+        "Per-level iteration CEILING. Not searched by default and rarely worth "
+        "searching: it bounds the solver rather than shaping its answer. Set it high "
+        "and read recommend_iterations() instead.",
         attr="iterations",
         fmt="x",
     ),
     ParamSpec(
         "optiwarp.conv_window",
         "-conv_window",
-        (0, 5, 10, 20),
+        (5, 10, 20),
         10,
         "schedule",
-        "Trailing-window size for early stopping; 0 runs every iteration.",
+        "Trailing-window size for early stopping. 0 (disable) is deliberately not in "
+        "the ladder: with the ceiling set high it would run every iteration for no "
+        "quality gain, and whether stopping is premature is already answerable from "
+        "best_iter vs iters_run.",
         attr="convergence_window",
     ),
     ParamSpec(
@@ -387,17 +394,22 @@ class Recipe:
         return judge_panel(self.optimize, self.contrast, tuple(self.evaluate_exclude))
 
 
-# Iteration budget and stopping rule. Conceptually separate from regularization —
-# these decide how long the solver looks, not how stiff the answer is — but they
-# interact with it, so they are searched jointly rather than pinned. The recorded
-# LevelStats is what makes the result readable: an optimum at the top of the iters
-# ladder with `starved` set means the ladder is short, not that more is better.
+# The **stopping rule**, which is a real choice: it decides when "good enough" has
+# been reached, and getting it wrong costs quality in one direction and time in the
+# other.
+#
+# The iteration *ceiling* is deliberately NOT here. It is not a parameter of the same
+# kind — it sets the stage rather than shaping the answer. Too few iterations is
+# always wrong, and too many is free (early stopping ends the level, best-restore
+# means exhaustion cannot return a worse warp), so there is no interior optimum to
+# find and laddering over 60/100/160 asks a question with a known answer: more. The
+# ceiling is instead set high in the engine defaults and *measured* — see
+# `tunestore.recommend_iterations`, which reads the observed usage back and reports
+# what the ceiling should be, rather than spending fits discovering it.
 _ALL_EFFORT = (
     "qwarp.workhard",
-    "formwarp.iters",
     "formwarp.conv_window",
     "formwarp.conv_threshold",
-    "optiwarp.iters",
     "optiwarp.conv_window",
     "optiwarp.conv_threshold",
 )

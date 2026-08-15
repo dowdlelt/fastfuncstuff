@@ -41,10 +41,12 @@ from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
     format_convergence,
+    format_iteration_advice,
     format_knob_effects,
     format_reproduce,
     format_results_table,
     knob_effects,
+    recommend_iterations,
 )
 from fastfuncstuff.processing.tunewarp import (
     AdaptivePlan,
@@ -177,8 +179,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     act.add_argument(
         "-convergence",
         action="store_true",
-        help="Per-level iteration report: whether each backend was starved of "
-        "iterations or over-ran and fell back to an earlier iterate.",
+        help="Per-level iteration report: what ceiling each backend actually needs, "
+        "and whether it was starved or over-ran and fell back to an earlier iterate.",
     )
     act.add_argument(
         "-effects",
@@ -335,6 +337,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
         if args.convergence:
+            print(format_iteration_advice(recommend_iterations(store)))
+            print()
             print(format_convergence(store))
         if args.list:
             print(format_results_table(store.results(), limit=args.top))
@@ -430,6 +434,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\n" + format_results_table(store.results(), limit=args.top))
     print("\nPer-knob effects:\n")
     print(format_knob_effects(knob_effects(store)))
+    print("\nIteration ceilings:\n")
+    print(format_iteration_advice(recommend_iterations(store)))
     print("\nConvergence:\n")
     print(format_convergence(store))
     return 0

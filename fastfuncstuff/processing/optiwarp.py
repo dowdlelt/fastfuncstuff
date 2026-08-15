@@ -216,8 +216,24 @@ class OptiwarpConfig:
     smoothing_sigmas: tuple[float, ...] = (2.0, 1.0, 0.0)
     """Per-level Gaussian pre-smoothing sigma in voxels."""
 
-    iterations: tuple[int, ...] = (100, 70, 40)
-    """Per-level maximum iteration count (usually cut short by convergence)."""
+    iterations: tuple[int, ...] = (300, 210, 120)
+    """Per-level iteration **ceiling** — a bound, not a target.
+
+    Deliberately set about 3x higher than the level actually needs, because this is
+    not a quality knob to be tuned: too few iterations is always wrong, and too many
+    is free. Early stopping ends a level once its cost has flattened, and best-iterate
+    restore means even exhaustion cannot return a worse warp than the minimum seen. So
+    the only thing a low ceiling can do is cut a level off while it is still improving.
+
+    That was not hypothetical. At the previous default of (100, 70, 40) the finest
+    level ran to its cap of 40 and stopped; given room it ran 47 and kept improving —
+    the shipped default was starving it, invisibly, because a level that hits its cap
+    looks exactly like one that finished. Raising the ceiling cost 15% of the runtime
+    on that pair and nothing at all on the flow engine, which stopped at [12, 14, 37]
+    either way.
+
+    If :attr:`~formwarp.LevelStats.starved` ever comes back true, this is too low.
+    """
 
     metric: str = "cc"
     """Monitoring metric used for convergence and best-state selection: 'cc', 'lpa',

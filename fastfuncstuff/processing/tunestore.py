@@ -377,6 +377,130 @@ def format_knob_effects(effects: list[KnobEffect]) -> str:
     return "\n".join(lines)
 
 
+@dataclass
+class IterationAdvice:
+    """What the iteration ceiling for one backend level should be.
+
+    Derived, not searched. The ceiling is not a quality knob with an interior
+    optimum — too few is always wrong and too many is free — so laddering over it
+    spends fits to answer a question whose direction is known in advance. What is
+    genuinely unknown is *how many* a level actually uses, and that is a
+    measurement: run with the ceiling set high and look at where the levels stopped.
+    """
+
+    backend: str
+    level: int
+    n: int
+    p50_used: float
+    p95_used: int
+    max_used: int
+    starved_frac: float
+    ceiling: int  # what was allowed
+    recommended: int
+
+    # The knob to reach for when a level burns iterations rather than converging.
+    # qwarp is absent on purpose: it optimises shrinking patches rather than taking
+    # steps, so "step size" has no single analogue there.
+    STEP_KNOB = {"formwarp": "-grad_step", "optiwarp": "-max_step"}
+
+    @property
+    def step_knob(self) -> str | None:
+        family = "optiwarp" if self.backend.startswith("optiwarp") else self.backend
+        return self.STEP_KNOB.get(family)
+
+    @property
+    def crawling(self) -> bool:
+        """Using most of a deliberately generous ceiling.
+
+        Early stopping not firing is not a failure of the stopping rule — it means
+        the iterations were genuinely being used. But a level that needs hundreds of
+        iterations to flatten is usually taking steps that are too small, so the
+        useful response is a bigger step, not only a bigger ceiling.
+        """
+        return self.max_used > self.ceiling // 2
+
+    @property
+    def verdict(self) -> str:
+        hint = f"; try a larger {self.step_knob}" if self.step_knob else ""
+        if self.starved_frac > 0:
+            return f"TOO LOW — {self.starved_frac:.0%} of fits cut off while improving{hint}"
+        if self.crawling:
+            return f"converging slowly ({self.max_used}/{self.ceiling}){hint}"
+        if self.recommended < self.ceiling // 2:
+            return "generous (fine — headroom is free)"
+        return "about right"
+
+
+def recommend_iterations(store: TrialStore, headroom: float = 2.0) -> list[IterationAdvice]:
+    """Read the iteration ceiling back out of what the levels actually used.
+
+    The recommendation is the worst observed *natural* stopping point with headroom,
+    not the average: the ceiling has to accommodate the hardest subject, and the cost
+    of it being too high is nothing while the cost of it being too low is a level
+    silently truncated mid-improvement. Any level that was ever starved reports its
+    own ceiling as a lower bound instead, because a truncated run cannot tell you how
+    many iterations it would have used.
+    """
+    rows: dict[tuple[str, int], list[dict]] = {}
+    for t in store.trials:
+        for lev, stats in enumerate(t.levels):
+            rows.setdefault((t.backend, lev), []).append(stats)
+
+    out = []
+    for (backend, lev), stats in sorted(rows.items()):
+        used = sorted(s["iters_run"] for s in stats)
+        caps = [s["n_iter_cap"] for s in stats]
+        starved = sum(bool(s["starved"]) for s in stats) / len(stats)
+        p95 = used[min(len(used) - 1, int(0.95 * (len(used) - 1)))]
+        out.append(
+            IterationAdvice(
+                backend=backend,
+                level=lev + 1,
+                n=len(stats),
+                p50_used=statistics.median(used),
+                p95_used=p95,
+                max_used=used[-1],
+                starved_frac=starved,
+                ceiling=max(caps),
+                recommended=int(round(used[-1] * headroom)),
+            )
+        )
+    return out
+
+
+def format_iteration_advice(advice: list[IterationAdvice]) -> str:
+    """The ceiling report: what each level used, and what to set it to."""
+    if not advice:
+        return "  (no iteration telemetry recorded)"
+    lines = [
+        "  Iteration ceilings, measured rather than searched. 'used' is where the level",
+        "  actually stopped; the ceiling only has to be comfortably above the worst case.",
+        "",
+        f"  {'backend':16s} {'lvl':>3s} {'p50':>6s} {'p95':>6s} {'max':>6s} "
+        f"{'cap':>6s} {'suggest':>8s}  verdict",
+        "  " + "-" * 96,
+    ]
+    for a in advice:
+        lines.append(
+            f"  {a.backend:16s} {a.level:>3d} {a.p50_used:6.0f} {a.p95_used:6d} "
+            f"{a.max_used:6d} {a.ceiling:6d} {a.recommended:8d}  {a.verdict}"
+        )
+    if any(a.starved_frac > 0 for a in advice):
+        lines += [
+            "",
+            "  A starved level was still improving when its cap stopped it, so its 'used'",
+            "  is a floor, not a measurement. Raise -iters and re-run to see the real number.",
+        ]
+    if any(a.crawling or a.starved_frac > 0 for a in advice):
+        lines += [
+            "",
+            "  Where early stopping never fired, the iterations were genuinely needed — the",
+            "  stopping rule is working. But needing most of a generous ceiling means the",
+            "  solver is crawling, so raise the step size before raising the ceiling again.",
+        ]
+    return "\n".join(lines)
+
+
 def format_convergence(store: TrialStore) -> str:
     """Per backend and level: was it starved of iterations, or did it over-run?
 

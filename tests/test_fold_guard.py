@@ -229,3 +229,141 @@ class TestConvergenceReport:
         from fastfuncstuff.processing.tunestore import TrialStore, format_convergence
 
         assert "no convergence telemetry" in format_convergence(TrialStore(tmp_path / "t.json"))
+
+
+class TestIterationCeiling:
+    """The ceiling is measured, not searched.
+
+    Too few iterations is always wrong and too many is free, so there is no interior
+    optimum for a search to find. What is unknown is how many a level actually uses,
+    and that is answered by running with the ceiling high and reading it back.
+    """
+
+    def _store(self, tmp_path, used, caps, starved):
+        from fastfuncstuff.processing.tunestore import TrialStore
+
+        store = TrialStore(tmp_path / "t.json")
+        for u, c, st in zip(used, caps, starved, strict=True):
+            store.add(
+                "formwarp",
+                "s1",
+                {},
+                [],
+                levels=[LevelStats(u, u - 1 if st else 3, c, not st).as_dict()],
+            )
+        return store
+
+    def test_recommends_headroom_over_the_worst_case(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import recommend_iterations
+
+        store = self._store(tmp_path, [20, 30, 47], [300, 300, 300], [False] * 3)
+        (a,) = recommend_iterations(store, headroom=2.0)
+        assert a.max_used == 47
+        assert a.recommended == 94, "the hardest subject sets the ceiling, not the mean"
+        assert "about right" in a.verdict or "generous" in a.verdict
+
+    def test_starving_is_called_out_as_too_low(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import recommend_iterations
+
+        store = self._store(tmp_path, [40, 40, 40], [40, 40, 40], [True] * 3)
+        (a,) = recommend_iterations(store)
+        assert a.starved_frac == 1.0
+        assert "TOO LOW" in a.verdict
+
+    def test_generous_ceiling_is_not_a_complaint(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import recommend_iterations
+
+        store = self._store(tmp_path, [12, 14, 15], [300, 300, 300], [False] * 3)
+        (a,) = recommend_iterations(store)
+        assert a.starved_frac == 0.0
+        assert "generous" in a.verdict, "headroom is free; it must not read as a problem"
+
+    def test_report_warns_when_a_measurement_is_only_a_floor(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import (
+            format_iteration_advice,
+            recommend_iterations,
+        )
+
+        store = self._store(tmp_path, [40, 40, 40], [40, 40, 40], [True] * 3)
+        text = format_iteration_advice(recommend_iterations(store))
+        assert "floor, not a measurement" in text
+
+
+class TestCeilingIsNotSearched:
+    def test_no_recipe_ladders_the_iteration_count(self):
+        """Searching it asks a question whose direction is known: more."""
+        from fastfuncstuff.processing.tunespec import RECIPES
+
+        for r in RECIPES.values():
+            assert "formwarp.iters" not in r.tune, r.name
+            assert "optiwarp.iters" not in r.tune, r.name
+
+    def test_the_stopping_rule_is_still_searched(self):
+        """When to stop *is* a real choice, unlike how long you are allowed to."""
+        from fastfuncstuff.processing.tunespec import RECIPES
+
+        for r in RECIPES.values():
+            assert "formwarp.conv_threshold" in r.tune, r.name
+            assert "optiwarp.conv_window" in r.tune, r.name
+
+    def test_defaults_leave_real_headroom(self):
+        """A ceiling only helps if it is comfortably above what levels use."""
+        from fastfuncstuff.processing.formwarp import SynConfig
+        from fastfuncstuff.processing.optiwarp import OptiwarpConfig
+
+        for cfg in (SynConfig(), OptiwarpConfig()):
+            assert cfg.iterations == (300, 210, 120)
+
+    def test_iters_remains_available_to_pin_or_tune(self):
+        """Not searched by default is not the same as unreachable."""
+        from fastfuncstuff.processing.tunespec import find_param, parse_fix
+
+        assert find_param("formwarp.iters").config_attr == "iterations"
+        assert parse_fix(["optiwarp.iters=100x70x40"]) == {"optiwarp.iters": (100, 70, 40)}
+
+
+class TestCrawlingHint:
+    """Early stopping not firing is not a bug — it means the iterations were used.
+
+    The useful response is a bigger step, not only a bigger ceiling: a level that
+    needs hundreds of iterations to flatten is stepping too small.
+    """
+
+    def _advice(self, backend, used, cap, starved=False):
+        import tempfile
+
+        from fastfuncstuff.processing.tunestore import TrialStore, recommend_iterations
+
+        with tempfile.TemporaryDirectory() as d:
+            store = TrialStore(f"{d}/t.json")
+            store.add(
+                backend,
+                "s1",
+                {},
+                [],
+                levels=[LevelStats(used, used - 1 if starved else 3, cap, not starved).as_dict()],
+            )
+            return recommend_iterations(store)[0]
+
+    def test_burning_the_ceiling_suggests_a_bigger_step(self):
+        a = self._advice("formwarp", used=250, cap=300)
+        assert a.crawling
+        assert "-grad_step" in a.verdict
+
+    def test_optiwarp_gets_its_own_step_knob(self):
+        assert "-max_step" in self._advice("optiwarp_demons", used=250, cap=300).verdict
+
+    def test_qwarp_has_no_step_knob_to_suggest(self):
+        """It optimises shrinking patches, so there is no single step size."""
+        a = self._advice("qwarp", used=250, cap=300)
+        assert a.step_knob is None
+        assert "try a larger" not in a.verdict
+
+    def test_converging_early_is_not_flagged_as_crawling(self):
+        a = self._advice("formwarp", used=15, cap=300)
+        assert not a.crawling
+        assert "try a larger" not in a.verdict
+
+    def test_starved_level_also_gets_the_step_hint(self):
+        a = self._advice("formwarp", used=40, cap=40, starved=True)
+        assert "TOO LOW" in a.verdict and "-grad_step" in a.verdict
