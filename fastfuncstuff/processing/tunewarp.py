@@ -78,7 +78,7 @@ def _run_qwarp(base, source, config, recipe, device):
         cfg.cost_method = "pearclp" if recipe.optimize == "ls" else recipe.optimize
     _apply_config(cfg, "qwarp", config)
     warped, xd, yd, zd = qwarp(base, source, config=cfg, device=device)
-    return warped, (xd, yd, zd)
+    return warped, (xd, yd, zd), []
 
 
 def _run_formwarp(base, source, config, recipe, device):
@@ -89,7 +89,7 @@ def _run_formwarp(base, source, config, recipe, device):
         cfg.metric = _syn_metric(recipe.optimize)
     _apply_config(cfg, "formwarp", config)
     res = formwarp(base, source, config=cfg, device=device)
-    return res.warped, res.fwd
+    return res.warped, res.fwd, res.levels
 
 
 def _run_optiwarp(force: str):
@@ -101,7 +101,7 @@ def _run_optiwarp(force: str):
             cfg.metric = _syn_metric(recipe.optimize)
         _apply_config(cfg, f"optiwarp_{force}", config)
         res = optiwarp(base, source, config=cfg, device=device)
-        return res.warped, res.fwd
+        return res.warped, res.fwd, res.levels
 
     return run
 
@@ -269,8 +269,11 @@ def run_trial(
 
     t0 = time.time()
     try:
-        warped, field = DRIVERS[backend](referee.base, source, config, recipe, referee.device)
+        warped, field, levels = DRIVERS[backend](
+            referee.base, source, config, recipe, referee.device
+        )
         outcome = referee.score(warped, field)
+        outcome["levels"] = [lv.as_dict() for lv in levels]
         del warped, field
     except (RuntimeError, ValueError) as exc:
         # A backend that blows up on a setting is a fact about that setting, not

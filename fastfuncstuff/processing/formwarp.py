@@ -40,7 +40,7 @@ differentiable form. See ``../fmri_wiki/concepts/SyN.md``.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 import torch
 import torch.nn.functional as F
@@ -127,6 +127,31 @@ class SynConfig:
     """Convergence slope threshold (ANTs -c convergenceThreshold). A level stops
     once the (range-normalized) downward slope of cost over the window falls below
     this — i.e. the cost has flattened. Larger = stop sooner."""
+
+    fold_guard: float = 0.5
+    """Per-round shrink (0..1) applied by the **local** anti-folding damping; 0 disables it.
+
+    SyN has no fold control at all other than ``update_var``/``total_var``, which are
+    global: the only way to stop a handful of voxels inverting was to blur the entire
+    field, paying fit everywhere for a defect in a few places. This tests each half
+    field's Jacobian before accepting a step and halves the step only in the
+    neighbourhood that would fold. When nothing would fold it costs two determinants
+    per iteration and changes nothing."""
+
+    jac_floor: float = 0.05
+    """Prospective ``det(J)`` below which :attr:`fold_guard` damps a step. Guarded on
+    each half field rather than on the composed warp: the halves are what
+    ``invert_displacement_field`` has to invert, and an inverted half is where a folded
+    composite comes from."""
+
+    fold_damp_rounds: int = 6
+    """Maximum local-damping retries per iteration before taking the least-folded step."""
+
+    fold_aware_best: bool = True
+    """Require a state to be fold-free before it can become the best-so-far. Without
+    it the snapshot is decided by the image metric alone, and folding *improves* the
+    image metric — so the mechanism that makes over-running safe selects the folded
+    state."""
 
     void_guard: float = 1.0
     """Strength (0..1) of the no-data-boundary guard: how much of the void-normal
@@ -405,6 +430,164 @@ def _resize_field(xd: Tensor, yd: Tensor, zd: Tensor, target: tuple[int, int, in
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class LevelStats:
+    """What one pyramid level actually did — the telemetry behind ``-search``.
+
+    Both engines run to an iteration cap, monitor a metric, and keep the best
+    iterate rather than the last. That makes over-running *safe*, which is good, but
+    it also makes it invisible: a level that found its answer at iteration 4 and then
+    burned 96 more looks exactly like a level that needed all 100. Recording where
+    the best iterate actually landed is what separates the two, and it turns "how
+    many iterations should we use" from a guess into a reading:
+
+    * ``best_iter`` far below ``iters_run`` — the level over-ran and fell back. The
+      extra iterations bought nothing; the convergence test is too lax.
+    * ``best_iter`` at the end with ``hit_cap`` — the level was starved. It was still
+      improving when it ran out, so the cap is the binding constraint.
+    """
+
+    iters_run: int
+    best_iter: int
+    n_iter_cap: int
+    early_stopped: bool
+    best_cost: float = float("nan")
+    damped_iters: int = 0  # iterations where the anti-fold guard had to intervene
+    fold_fallback: bool = False
+    """No iterate at this level was fold-free, so the best *illegal* one was kept.
+
+    Usually means the level above handed down an already-folded field, which the
+    guard cannot undo — it damps updates, it does not repair history. A config that
+    reports this is one whose whole schedule is too aggressive, not one that merely
+    took a bad step."""
+
+    @property
+    def hit_cap(self) -> bool:
+        return self.iters_run >= self.n_iter_cap
+
+    @property
+    def starved(self) -> bool:
+        """Still improving when the iteration cap stopped it."""
+        return self.hit_cap and self.best_iter >= self.iters_run - 1
+
+    @property
+    def wasted_iters(self) -> int:
+        """Iterations run after the one that was ultimately kept."""
+        return max(0, self.iters_run - 1 - self.best_iter)
+
+    def describe(self) -> str:
+        bits = [f"{self.iters_run} iters", f"best @{self.best_iter}"]
+        if self.starved:
+            bits.append("STARVED (still improving at the cap)")
+        elif self.wasted_iters:
+            bits.append(f"{self.wasted_iters} wasted")
+        if self.damped_iters:
+            bits.append(f"{self.damped_iters} fold-damped")
+        if self.fold_fallback:
+            bits.append("NO LEGAL ITERATE (kept a folded one)")
+        bits.append(f"best cost {self.best_cost:.5f}")
+        return ", ".join(bits)
+
+    def as_dict(self) -> dict:
+        d = asdict(self)
+        d.update(hit_cap=self.hit_cap, starved=self.starved, wasted_iters=self.wasted_iters)
+        return d
+
+
+def _grad3(vol: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """Central-difference spatial gradient of a (nz,ny,nx) volume, per voxel index.
+
+    Returns ``(gx, gy, gz)`` — the derivative along the last, middle and first axis
+    respectively, matching the (x, y, z) displacement component order used everywhere
+    else in the project. Edges use a one-sided difference via replicate padding.
+    """
+    gz = torch.zeros_like(vol)
+    gy = torch.zeros_like(vol)
+    gx = torch.zeros_like(vol)
+    if vol.shape[0] > 2:
+        gz[1:-1] = 0.5 * (vol[2:] - vol[:-2])
+        gz[0] = vol[1] - vol[0]
+        gz[-1] = vol[-1] - vol[-2]
+    if vol.shape[1] > 2:
+        gy[:, 1:-1] = 0.5 * (vol[:, 2:] - vol[:, :-2])
+        gy[:, 0] = vol[:, 1] - vol[:, 0]
+        gy[:, -1] = vol[:, -1] - vol[:, -2]
+    if vol.shape[2] > 2:
+        gx[..., 1:-1] = 0.5 * (vol[..., 2:] - vol[..., :-2])
+        gx[..., 0] = vol[..., 1] - vol[..., 0]
+        gx[..., -1] = vol[..., -1] - vol[..., -2]
+    return gx, gy, gz
+
+
+def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
+    """Determinant of the transform Jacobian ``I + grad(d)`` per voxel.
+
+    Values <= 0 mark folded (non-injective) voxels; this is the diagnostic that says
+    whether a flow field stayed anatomically plausible.
+    """
+    dxx, dxy, dxz = _grad3(xd)
+    dyx, dyy, dyz = _grad3(yd)
+    dzx, dzy, dzz = _grad3(zd)
+    j11, j12, j13 = 1.0 + dxx, dxy, dxz
+    j21, j22, j23 = dyx, 1.0 + dyy, dyz
+    j31, j32, j33 = dzx, dzy, 1.0 + dzz
+    return (
+        j11 * (j22 * j33 - j23 * j32)
+        - j12 * (j21 * j33 - j23 * j31)
+        + j13 * (j21 * j32 - j22 * j31)
+    )
+
+
+def _fold_damping_mask(jac: Tensor, floor: float, strength: float, radius: float = 1.0) -> Tensor:
+    """A smooth 0..1 field: how much of the step to give back, per voxel.
+
+    Dilate-then-smooth rather than smooth-alone. A Gaussian applied straight to an
+    isolated bad voxel peaks at a fraction of 1, so the damping would be weakest
+    exactly where a fold *starts* — and folds start as one voxel. Dilating first puts
+    a solid core over the offending neighbourhood, and the smoothing only softens its
+    edge. Measured at these settings: a lone folded voxel reaches 0.97 of full
+    strength and a solid cluster 1.00, against 0.33 and 0.76 for smoothing alone.
+
+    The soft edge is not cosmetic: scaling an update discontinuously writes a step
+    into the displacement field, which is a fresh source of the defect being repaired.
+    """
+    bad = (jac < floor).to(jac.dtype)[None, None]
+    core = torch.nn.functional.max_pool3d(bad, kernel_size=5, stride=1, padding=2)[0, 0]
+    return (strength * _separable_smooth_3d(core, radius, kernel_type="gauss")).clamp(0.0, 1.0)
+
+
+def _additive_step_with_fold_guard(
+    prev: Field, update: Field, total_var: float, config: SynConfig
+) -> tuple[Field, Tensor, int]:
+    """Add ``update`` to ``prev``, backing off locally wherever that would fold.
+
+    The elastic smoothing happens inside, because the guard has to judge the field the
+    level will actually keep, and building it twice would be the only alternative.
+    """
+
+    def _apply(u: Field) -> tuple[Field, Tensor]:
+        cand = (prev[0] + u[0], prev[1] + u[1], prev[2] + u[2])
+        cand = _smooth_field(cand[0], cand[1], cand[2], total_var)
+        return cand, jacobian_determinant(*cand)
+
+    ux, uy, uz = update
+    cand, jac = _apply((ux, uy, uz))
+    if config.fold_guard <= 0:
+        return cand, jac, 0
+
+    best_cand, best_jac, damped = cand, jac, 0
+    for _ in range(config.fold_damp_rounds):
+        if float(best_jac.min()) >= config.jac_floor:
+            break
+        keep = 1.0 - _fold_damping_mask(best_jac, config.jac_floor, config.fold_guard)
+        ux, uy, uz = ux * keep, uy * keep, uz * keep
+        cand, jac = _apply((ux, uy, uz))
+        damped += 1
+        if float(jac.min()) > float(best_jac.min()):
+            best_cand, best_jac = cand, jac
+    return best_cand, best_jac, damped
+
+
 def _convergence_value(costs: list[float], window: int) -> float:
     """Trailing-window convergence measure (ANTs WindowConvergenceMonitoringFunction).
 
@@ -435,7 +618,7 @@ def _syn_level(
     config: SynConfig,
     level_tag: str = "",
     guard: tuple[Tensor, ...] | None = None,
-) -> tuple[Field, Field, Field, Field]:
+) -> tuple[tuple[Field, Field, Field, Field], LevelStats]:
     """Run up to ``n_iter`` symmetric SyN updates at one resolution.
 
     ``fields`` is ``(phi_f, inv_f, phi_m, inv_m)`` as (xd, yd, zd) triples on this
@@ -465,9 +648,16 @@ def _syn_level(
             (imxd.clone(), imyd.clone(), imzd.clone()),
         )
 
-    best_cost = float("inf")
-    best_fields = _snapshot()
+    # Two running bests: the lowest-cost *legal* state, and the lowest-cost state of
+    # any kind. The second is a fallback, not a preference -- a level can inherit an
+    # already-folded field from the level above, in which case nothing it produces is
+    # legal and refusing to return anything would fail a run that is merely imperfect.
+    best_cost, best_fields, best_iter = float("inf"), _snapshot(), 0
+    any_cost, any_fields, any_iter = float("inf"), _snapshot(), 0
     costs: list[float] = []
+    jac_f = jacobian_determinant(fxd, fyd, fzd)
+    jac_m = jacobian_determinant(mxd, myd, mzd)
+    n_damped = 0
 
     bar = None
     if _tqdm is not None and config.verb >= 1 and n_iter >= 5:
@@ -485,8 +675,16 @@ def _syn_level(
         costs.append(cost_val)
 
         # The cost reflects the current (pre-update) fields -- snapshot them as best.
-        if cost_val < best_cost:
-            best_cost = cost_val
+        # Legality of those fields was established when they were built, at the end of
+        # the previous iteration, so no determinant is recomputed here.
+        legal = not config.fold_aware_best or (
+            min(float(jac_f.min()), float(jac_m.min())) >= config.jac_floor
+        )
+        if cost_val < any_cost:
+            any_cost, any_iter = cost_val, len(costs) - 1
+            any_fields = _snapshot()
+        if cost_val < best_cost and legal:
+            best_cost, best_iter = cost_val, len(costs) - 1
             best_fields = _snapshot()
 
         if bar is not None:
@@ -518,16 +716,16 @@ def _syn_level(
         norm = torch.sqrt(ufx**2 + ufy**2 + ufz**2 + umx**2 + umy**2 + umz**2)
         scale = config.grad_step / norm.max().clamp(min=_EPS)
 
-        fxd = fxd + scale * ufx
-        fyd = fyd + scale * ufy
-        fzd = fzd + scale * ufz
-        mxd = mxd + scale * umx
-        myd = myd + scale * umy
-        mzd = mzd + scale * umz
-
-        # Elastic regularization of the total fields.
-        fxd, fyd, fzd = _smooth_field(fxd, fyd, fzd, config.total_var)
-        mxd, myd, mzd = _smooth_field(mxd, myd, mzd, config.total_var)
+        # Step + elastic regularization, with the local anti-fold backoff applied to
+        # each half field. Both happen inside the guard: it has to judge the field the
+        # level will keep, so it builds it once and hands it back.
+        (fxd, fyd, fzd), jac_f, df = _additive_step_with_fold_guard(
+            (fxd, fyd, fzd), (scale * ufx, scale * ufy, scale * ufz), config.total_var, config
+        )
+        (mxd, myd, mzd), jac_m, dm = _additive_step_with_fold_guard(
+            (mxd, myd, mzd), (scale * umx, scale * umy, scale * umz), config.total_var, config
+        )
+        n_damped += 1 if (df or dm) else 0
 
         if flags:
             fxd, fyd, fzd = _apply_axis_flags(fxd, fyd, fzd, flags)
@@ -541,21 +739,35 @@ def _syn_level(
 
     if bar is not None:
         bar.close()
+
+    fold_fallback = best_cost == float("inf") and any_cost < float("inf")
+    if fold_fallback:
+        best_cost, best_fields, best_iter = any_cost, any_fields, any_iter
+
+    stats = LevelStats(
+        iters_run=len(costs),
+        best_iter=best_iter,
+        n_iter_cap=n_iter,
+        early_stopped=len(costs) < n_iter,
+        damped_iters=n_damped,
+        best_cost=best_cost,
+        fold_fallback=fold_fallback,
+    )
     if config.verb >= 1:
-        print(f"  {level_tag}: {len(costs)} iters, best cost {best_cost:.5f}")
+        print(f"  {level_tag}: {stats.describe()}")
 
     # Every iteration's cost was non-finite, so best-restore handed back the fields we
     # started with: this level did nothing, and the run would go on to write an
     # identity warp as though it had succeeded. Fail loudly instead -- the cause is in
     # the inputs (non-finite voxels, an all-constant image, an empty mask), not here.
-    if best_cost == float("inf"):
+    if any_cost == float("inf"):
         raise ValueError(
             f"{level_tag}: metric was non-finite on every iteration, so no warp could be "
             "estimated. Check the base/source for NaN/Inf or constant-valued data, and "
             "that the metric mask/weight is not empty."
         )
 
-    return best_fields
+    return best_fields, stats
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +807,10 @@ class SynResult:
         default_factory=lambda: (torch.empty(0),) * 3
     )
     """inv_m: moving->middle half-warp (inverse of phi_m)."""
+
+    levels: list[LevelStats] = field(default_factory=list)
+    """Per-level convergence telemetry: iterations run, which one was kept, whether the
+    level was starved or over-ran, and how often the fold guard intervened."""
 
 
 def formwarp(
@@ -688,6 +904,7 @@ def formwarp(
     inv_f = (zeros(), zeros(), zeros())
     phi_m = (zeros(), zeros(), zeros())
     inv_m = (zeros(), zeros(), zeros())
+    level_stats: list[LevelStats] = []
 
     for lev in range(n_levels):
         factor = config.shrink_factors[lev]
@@ -729,7 +946,7 @@ def formwarp(
         if cover is not None and config.void_guard > 0.0:
             guard = _void_guard_field(_resize_volume(cover.float(), target))
 
-        phi_f, inv_f, phi_m, inv_m = _syn_level(
+        (phi_f, inv_f, phi_m, inv_m), stats = _syn_level(
             f_lvl,
             m_lvl,
             w_lvl,
@@ -739,6 +956,7 @@ def formwarp(
             level_tag=f"L{lev + 1}",
             guard=guard,
         )
+        level_stats.append(stats)
 
     # Restore to full resolution if the finest level was still shrunk.
     phi_f = _resize_field(*phi_f, full_shape)  # type: ignore[arg-type]
@@ -768,4 +986,5 @@ def formwarp(
         moving_to_mid=phi_m,
         mid_to_fixed=inv_f,
         mid_to_moving=inv_m,
+        levels=level_stats,
     )

@@ -40,6 +40,7 @@ from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_devic
 from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
+    format_convergence,
     format_knob_effects,
     format_reproduce,
     format_results_table,
@@ -173,6 +174,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-run config N and KEEP its outputs, so they can be looked at",
     )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
+    act.add_argument(
+        "-convergence",
+        action="store_true",
+        help="Per-level iteration report: whether each backend was starved of "
+        "iterations or over-ran and fell back to an earlier iterate.",
+    )
     act.add_argument(
         "-effects",
         action="store_true",
@@ -322,11 +329,13 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     store = TrialStore(out / "trials.json")
 
-    if args.list or args.effects:
+    if args.list or args.effects or args.convergence:
         if args.recipe:
             store.compute_consensus(RECIPES[args.recipe].panel())
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
+        if args.convergence:
+            print(format_convergence(store))
         if args.list:
             print(format_results_table(store.results(), limit=args.top))
         return 0
@@ -366,6 +375,16 @@ def main(argv: list[str] | None = None) -> int:
                 for b in backends
             )
             print(f"  {len(pairs)} subject(s), {len(backends)} backend(s), grid, {total} fits")
+            # The recipes tune the iteration schedule as well as the regularization,
+            # and a full factorial over both is thousands of configs per backend. Say
+            # so up front rather than after a day of fitting.
+            if total > 2000:
+                print(
+                    f"\n  WARNING: {total} fits at ~10 s each is roughly "
+                    f"{total * 10 / 3600:.0f} hours. The full factorial is no longer a "
+                    "practical\n  way to search this space. Use -search adaptive "
+                    "(the default), or narrow the\n  grid with -fix / -max_configs."
+                )
         if fixed:
             print("  pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(fixed.items())))
         print(f"  trial outputs are discarded after scoring; table in {store.path}")
@@ -411,6 +430,8 @@ def main(argv: list[str] | None = None) -> int:
     print("\n" + format_results_table(store.results(), limit=args.top))
     print("\nPer-knob effects:\n")
     print(format_knob_effects(knob_effects(store)))
+    print("\nConvergence:\n")
+    print(format_convergence(store))
     return 0
 
 

@@ -181,12 +181,32 @@ FORMWARP = BackendSpec(
         ParamSpec(
             "formwarp.iters",
             "-iters",
-            ((100, 70, 40), (160, 120, 80)),
+            ((60, 40, 20), (100, 70, 40), (160, 120, 80)),
             (100, 70, 40),
             "effort",
-            "Per-level iteration ceilings.",
+            "Per-level iteration ceilings. Read alongside the recorded best_iter: a "
+            "level whose best iterate is its last was starved; one whose best is "
+            "early over-ran and fell back.",
             attr="iterations",
             fmt="x",
+        ),
+        ParamSpec(
+            "formwarp.conv_window",
+            "-conv_window",
+            (0, 5, 10, 20),
+            10,
+            "schedule",
+            "Trailing-window size for early stopping; 0 runs every iteration.",
+            attr="convergence_window",
+        ),
+        ParamSpec(
+            "formwarp.conv_threshold",
+            "-conv_threshold",
+            (1e-6, 1e-5, 1e-4),
+            1e-6,
+            "schedule",
+            "Convergence slope threshold; larger stops sooner.",
+            attr="convergence_threshold",
         ),
     ),
 )
@@ -223,6 +243,35 @@ _OW_SHARED = (
         "metric",
         "Intensity prep before the flow solve. A wrong match negates the force, "
         "so this is checked before any regularization knob.",
+    ),
+    ParamSpec(
+        "optiwarp.iters",
+        "-iters",
+        ((60, 40, 20), (100, 70, 40), (160, 120, 80)),
+        (100, 70, 40),
+        "effort",
+        "Per-level iteration ceilings. Read alongside the recorded best_iter: a level "
+        "whose best iterate is its last was starved, one whose best is early over-ran.",
+        attr="iterations",
+        fmt="x",
+    ),
+    ParamSpec(
+        "optiwarp.conv_window",
+        "-conv_window",
+        (0, 5, 10, 20),
+        10,
+        "schedule",
+        "Trailing-window size for early stopping; 0 runs every iteration.",
+        attr="convergence_window",
+    ),
+    ParamSpec(
+        "optiwarp.conv_threshold",
+        "-conv_threshold",
+        (1e-6, 1e-5, 1e-4),
+        1e-6,
+        "schedule",
+        "Convergence slope threshold; larger stops sooner.",
+        attr="convergence_threshold",
     ),
     ParamSpec(
         "optiwarp.max_step",
@@ -338,6 +387,21 @@ class Recipe:
         return judge_panel(self.optimize, self.contrast, tuple(self.evaluate_exclude))
 
 
+# Iteration budget and stopping rule. Conceptually separate from regularization —
+# these decide how long the solver looks, not how stiff the answer is — but they
+# interact with it, so they are searched jointly rather than pinned. The recorded
+# LevelStats is what makes the result readable: an optimum at the top of the iters
+# ladder with `starved` set means the ladder is short, not that more is better.
+_ALL_EFFORT = (
+    "qwarp.workhard",
+    "formwarp.iters",
+    "formwarp.conv_window",
+    "formwarp.conv_threshold",
+    "optiwarp.iters",
+    "optiwarp.conv_window",
+    "optiwarp.conv_threshold",
+)
+
 _ALL_REG = (
     "qwarp.penfac",
     "qwarp.minpatch",
@@ -355,7 +419,7 @@ RECIPES: dict[str, Recipe] = {
         evaluate_exclude=(),
         contrast="same",
         pairing="one_base",
-        tune=_ALL_REG + ("qwarp.hfactor_q", "formwarp.grad_step"),
+        tune=_ALL_REG + _ALL_EFFORT + ("qwarp.hfactor_q", "formwarp.grad_step"),
         notes=(
             "Measured on 5 FreeSurfer brains -> MNI152_2009 (480 fits, -metric "
             "lpa). optiwarp total_sigma 1.0 is the floor: 0.0 and 0.5 fold on "
@@ -377,7 +441,7 @@ RECIPES: dict[str, Recipe] = {
         evaluate_exclude=(),
         contrast="cross",
         pairing="paired",
-        tune=_ALL_REG + ("optiwarp.match",),
+        tune=_ALL_REG + _ALL_EFFORT + ("optiwarp.match",),
         notes=(
             "Cross-modal, so the metric is the fragile part: -match gradmag is "
             "the only optiwarp prep that survives a contrast inversion. The "
@@ -392,7 +456,7 @@ RECIPES: dict[str, Recipe] = {
         evaluate_exclude=(),
         contrast="same",
         pairing="paired",
-        tune=_ALL_REG + ("optiwarp.max_step", "formwarp.grad_step"),
+        tune=_ALL_REG + _ALL_EFFORT + ("optiwarp.max_step", "formwarp.grad_step"),
         notes=(
             "The same brain twice, so the right answer is close to identity and "
             "small details carry the signal. Expect the optimum to sit at much "

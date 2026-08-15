@@ -54,6 +54,7 @@ output voxel ``(i,j,k)`` samples its source at ``(i+xd, j+yd, k+zd)`` in **voxel
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import TYPE_CHECKING
 
 import torch
@@ -75,9 +76,12 @@ from .formwarp import (
     NO_Y_DISP,
     NO_Z_DISP,
     Field,
+    LevelStats,
     _apply_axis_flags,
     _apply_void_guard,
     _convergence_value,
+    _fold_damping_mask,
+    _grad3,
     _resize_field,
     _resize_volume,
     _shrunk_shape,
@@ -85,6 +89,7 @@ from .formwarp import (
     _void_guard_field,
     image_metric,
     invert_displacement_field,
+    jacobian_determinant,
 )
 from .interp import warp_image, warp_image_linear
 from .mask import cross_fill_no_data
@@ -170,6 +175,41 @@ class OptiwarpConfig:
     accumulated field. Demons' ``sigma_diffusion``. 0 = off (relies on the fluid term
     alone, which is what makes flow fields loose)."""
 
+    fold_guard: float = 0.5
+    """Per-round shrink (0..1) applied by the **local** anti-folding damping; 0 disables it.
+
+    Folding is a local event — traced on a T1 pair at ``total_sigma=0`` it starts as
+    *one* voxel at iteration 2 and grows from there — but ``total_sigma`` is a global
+    knob, so the only way to stop it used to be blurring the whole field. That is why
+    the similarity score and the regularity gate pull in opposite directions on every
+    regularization knob: the sole fold control was also the fit control.
+
+    This instead tests the *prospective* Jacobian before accepting an update and
+    scales the update down only in the neighbourhood that would fold, leaving the rest
+    of the field to take its full step. In the common case (nothing would fold) it
+    costs one determinant per iteration and changes nothing."""
+
+    jac_floor: float = 0.05
+    """Prospective ``det(J)`` below which :attr:`fold_guard` damps an update. Above 0
+    rather than at it, because a voxel arriving exactly at zero is one interpolation
+    error away from inverted; this keeps a margin. Deliberately looser than the QC
+    threshold in :mod:`warpqc` — the guard's job is to prevent inversion during the
+    solve, not to enforce the report's standard mid-flight."""
+
+    fold_damp_rounds: int = 6
+    """Maximum local-damping retries per iteration before taking the least-folded
+    candidate anyway. A cap rather than a loop-until-clean: a step that cannot be made
+    legal in a few rounds is better left to the next iteration, which re-derives the
+    force from the image rather than from a repeatedly mangled update."""
+
+    fold_aware_best: bool = True
+    """Require an iterate to be fold-free before it can become the best-so-far.
+
+    Without this the best-iterate snapshot is decided by the image metric alone — and
+    since folding *improves* the image metric, the mechanism that exists to make
+    "run to exhaustion" safe systematically selects the folded iterate. Measured: a
+    run whose iteration 0 was clean returned a field with min det(J) = -0.39."""
+
     shrink_factors: tuple[int, ...] = (4, 2, 1)
     """Per-level isotropic downsample factor, coarse-to-fine."""
 
@@ -230,31 +270,6 @@ class OptiwarpConfig:
 # ---------------------------------------------------------------------------
 # Small primitives
 # ---------------------------------------------------------------------------
-
-
-def _grad3(vol: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-    """Central-difference spatial gradient of a (nz,ny,nx) volume, per voxel index.
-
-    Returns ``(gx, gy, gz)`` — the derivative along the last, middle and first axis
-    respectively, matching the (x, y, z) displacement component order used everywhere
-    else in the project. Edges use a one-sided difference via replicate padding.
-    """
-    gz = torch.zeros_like(vol)
-    gy = torch.zeros_like(vol)
-    gx = torch.zeros_like(vol)
-    if vol.shape[0] > 2:
-        gz[1:-1] = 0.5 * (vol[2:] - vol[:-2])
-        gz[0] = vol[1] - vol[0]
-        gz[-1] = vol[-1] - vol[-2]
-    if vol.shape[1] > 2:
-        gy[:, 1:-1] = 0.5 * (vol[:, 2:] - vol[:, :-2])
-        gy[:, 0] = vol[:, 1] - vol[:, 0]
-        gy[:, -1] = vol[:, -1] - vol[:, -2]
-    if vol.shape[2] > 2:
-        gx[..., 1:-1] = 0.5 * (vol[..., 2:] - vol[..., :-2])
-        gx[..., 0] = vol[..., 1] - vol[..., 0]
-        gx[..., -1] = vol[..., -1] - vol[..., -2]
-    return gx, gy, gz
 
 
 def prep_intensity(vol: Tensor, mode: str, sigma: float, mask: Tensor | None = None) -> Tensor:
@@ -339,23 +354,50 @@ def _exp_field(v: Field, max_norm: float = 0.5, max_squarings: int = 8) -> Field
     return f
 
 
-def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
-    """Determinant of the transform Jacobian ``I + grad(d)`` per voxel.
+def _step_with_fold_guard(
+    update: Field, fwd: Field, cfg: OptiwarpConfig
+) -> tuple[Field, Tensor, int]:
+    """Apply one update to the running field without letting it fold locally.
 
-    Values <= 0 mark folded (non-injective) voxels; this is the diagnostic that says
-    whether a flow field stayed anatomically plausible.
+    Returns ``(new_fwd, jacobian, n_damped)``. The composition that the guard has to
+    perform anyway *is* the step, so a clean iteration pays one extra determinant and
+    nothing else — the candidate is reused rather than recomputed.
     """
-    dxx, dxy, dxz = _grad3(xd)
-    dyx, dyy, dyz = _grad3(yd)
-    dzx, dzy, dzz = _grad3(zd)
-    j11, j12, j13 = 1.0 + dxx, dxy, dxz
-    j21, j22, j23 = dyx, 1.0 + dyy, dyz
-    j31, j32, j33 = dzx, dzy, 1.0 + dzz
-    return (
-        j11 * (j22 * j33 - j23 * j32)
-        - j12 * (j21 * j33 - j23 * j31)
-        + j13 * (j21 * j32 - j22 * j31)
-    )
+    ux, uy, uz = update
+
+    def _apply(u: Field) -> tuple[Field, Tensor]:
+        if cfg.step_mode == "diffeo":
+            cand = _compose(_exp_field(u), fwd)
+        elif cfg.step_mode == "additive":
+            cand = (fwd[0] + u[0], fwd[1] + u[1], fwd[2] + u[2])
+        else:
+            raise ValueError(f"unknown step_mode {cfg.step_mode!r}; choose from {STEP_MODES}")
+        cand = _smooth_field(cand[0], cand[1], cand[2], cfg.total_sigma)
+        return cand, jacobian_determinant(*cand)
+
+    cand, jac = _apply((ux, uy, uz))
+    if cfg.fold_guard <= 0:
+        return cand, jac, 0
+
+    best_cand, best_jac = cand, jac
+    damped = 0
+    for _ in range(cfg.fold_damp_rounds):
+        if float(best_jac.min()) >= cfg.jac_floor:
+            break
+        # A local backtracking line search, not a veto. Each round halves the step in
+        # the offending neighbourhood (strength 0.5) rather than cancelling it, so the
+        # region keeps moving — just less far. Freezing it outright was measurably
+        # worse: the level found its best legal iterate at 3 and then spent 56 more
+        # fighting the clamp, ending at a worse cost than an unguarded fold.
+        keep = 1.0 - _fold_damping_mask(best_jac, cfg.jac_floor, cfg.fold_guard)
+        ux, uy, uz = ux * keep, uy * keep, uz * keep
+        cand, jac = _apply((ux, uy, uz))
+        damped += 1
+        # Keep whichever candidate is furthest from folding, so a round that
+        # somehow made things worse cannot be what the level walks away with.
+        if float(jac.min()) > float(best_jac.min()):
+            best_cand, best_jac = cand, jac
+    return best_cand, best_jac, damped
 
 
 # ---------------------------------------------------------------------------
@@ -501,12 +543,16 @@ def _optiflow_level(
     cfg: OptiwarpConfig,
     level_tag: str = "",
     guard: tuple[Tensor, ...] | None = None,
-) -> tuple[Field, float]:
+) -> tuple[Field, float, LevelStats]:
     """Run up to ``n_iter`` optical-flow updates at one resolution.
 
     Returns the **best-metric** field seen, not the last. Like greedy SyN, demons-style
     flow overshoots: the metric falls, then wanders once the update is chasing noise.
     Snapshotting the best iterate makes "run to exhaustion" safe.
+
+    "Best" means best *among legal iterates* when ``fold_aware_best`` is set. Judging
+    it on the image metric alone is what made the snapshot prefer a folded field: the
+    fold is why the metric improved.
     """
     flags = cfg.warp_flags
     window = cfg.convergence_window
@@ -519,9 +565,16 @@ def _optiflow_level(
         indexing="ij",
     )
 
-    best_cost = float("inf")
+    # Two running bests: lowest-cost *legal*, and lowest-cost of any kind. The second
+    # is a fallback for a level that inherits an already-folded field from the level
+    # above, where nothing it can produce is legal and returning nothing helps no one.
+    best_cost, best_iter = float("inf"), 0
     best: Field = tuple(c.clone() for c in fwd)  # type: ignore[assignment]
+    any_cost, any_iter = float("inf"), 0
+    any_best: Field = tuple(c.clone() for c in fwd)  # type: ignore[assignment]
     costs: list[float] = []
+    jac = jacobian_determinant(*fwd)
+    n_damped = 0
 
     bar = None
     if _tqdm is not None and cfg.verb >= 1 and n_iter >= 5:
@@ -543,8 +596,14 @@ def _optiflow_level(
                 )
             )
             costs.append(cost_val)
-            if cost_val < best_cost:
-                best_cost = cost_val
+            # The legality of `fwd` was established when it was built, at the end of
+            # the previous iteration, so no determinant is recomputed here.
+            legal = not cfg.fold_aware_best or float(jac.min()) >= cfg.jac_floor
+            if cost_val < any_cost:
+                any_cost, any_iter = cost_val, len(costs) - 1
+                any_best = tuple(c.clone() for c in fwd)  # type: ignore[assignment]
+            if cost_val < best_cost and legal:
+                best_cost, best_iter = cost_val, len(costs) - 1
                 best = tuple(c.clone() for c in fwd)  # type: ignore[assignment]
 
             if bar is not None:
@@ -575,25 +634,36 @@ def _optiflow_level(
                 s = cfg.max_step / mag
                 ux, uy, uz = ux * s, uy * s, uz * s
 
-            if cfg.step_mode == "diffeo":
-                # Compose "update first, then the running field": the new warped image
-                # is W(p + u(p)), which is exactly the compositive demons update.
-                fwd = _compose(_exp_field((ux, uy, uz)), fwd)
-            elif cfg.step_mode == "additive":
-                fwd = (fwd[0] + ux, fwd[1] + uy, fwd[2] + uz)
-            else:
-                raise ValueError(f"unknown step_mode {cfg.step_mode!r}; choose from {STEP_MODES}")
-
-            # Elastic regularization of the accumulated field.
-            fwd = _smooth_field(fwd[0], fwd[1], fwd[2], cfg.total_sigma)
+            # Compose "update first, then the running field": the new warped image is
+            # W(p + u(p)), the compositive demons update. The elastic smoothing and
+            # the local anti-fold damping happen inside, because the guard needs the
+            # composed-and-smoothed field to judge and there is no reason to build it
+            # twice.
+            fwd, jac, damped = _step_with_fold_guard((ux, uy, uz), fwd, cfg)
+            n_damped += 1 if damped else 0
             if flags:
                 fwd = _apply_axis_flags(fwd[0], fwd[1], fwd[2], flags)
+                jac = jacobian_determinant(*fwd)
 
     if bar is not None:
         bar.close()
+
+    fold_fallback = best_cost == float("inf") and any_cost < float("inf")
+    if fold_fallback:
+        best, best_cost, best_iter = any_best, any_cost, any_iter
+
+    stats = LevelStats(
+        iters_run=len(costs),
+        best_iter=best_iter,
+        n_iter_cap=n_iter,
+        early_stopped=len(costs) < n_iter,
+        damped_iters=n_damped,
+        best_cost=best_cost,
+        fold_fallback=fold_fallback,
+    )
     if cfg.verb >= 1:
-        print(f"  {level_tag}: {len(costs)} iters, best cost {best_cost:.5f}")
-    return best, best_cost
+        print(f"  {level_tag}: {stats.describe()}")
+    return best, best_cost, stats
 
 
 # ---------------------------------------------------------------------------
@@ -622,6 +692,10 @@ class OptiwarpResult:
 
     min_jacobian: float = float("nan")
     """Minimum of ``jacobian`` — the headline foldedness diagnostic."""
+
+    levels: list[LevelStats] = dc_field(default_factory=list)
+    """Per-level convergence telemetry: how many iterations ran, which one was kept,
+    and whether the level was starved or over-ran. See :class:`formwarp.LevelStats`."""
 
 
 def optiwarp(
@@ -698,6 +772,7 @@ def optiwarp(
         torch.zeros(full_shape, device=device),
     )
     best_cost = float("nan")
+    level_stats: list[LevelStats] = []
 
     for lev in range(n_levels):
         factor = cfg.shrink_factors[lev]
@@ -740,9 +815,10 @@ def optiwarp(
         if cover is not None and cfg.void_guard > 0.0:
             guard = _void_guard_field(_resize_volume(cover.float(), target))
 
-        fwd, best_cost = _optiflow_level(
+        fwd, best_cost, stats = _optiflow_level(
             f_prep, m_prep, w_lvl, fwd, n_iter, cfg, level_tag=f"L{lev + 1}", guard=guard
         )
+        level_stats.append(stats)
 
     fwd = _resize_field(*fwd, full_shape)
 
@@ -761,7 +837,13 @@ def optiwarp(
 
     warped = warp_image(moving, fwd[0], fwd[1], fwd[2], mode=cfg.final_interp)
     return OptiwarpResult(
-        warped=warped, fwd=fwd, inv=inv, jacobian=jac, cost=best_cost, min_jacobian=min_jac
+        warped=warped,
+        fwd=fwd,
+        inv=inv,
+        jacobian=jac,
+        cost=best_cost,
+        min_jacobian=min_jac,
+        levels=level_stats,
     )
 
 

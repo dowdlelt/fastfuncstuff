@@ -283,9 +283,15 @@ class TestOverrides:
         from fastfuncstuff.processing.tunespec import with_overrides
         from fastfuncstuff.processing.tunewarp import enumerate_configs
 
+        # max_step is an epi2epi knob; MNI_T1 leaves it alone, which is what makes it
+        # a valid subject here. (formwarp.iters used to serve this role, but the
+        # recipes now tune the iteration schedule by default.)
         base = RECIPES["MNI_T1"]
-        r = with_overrides(base, None, ["formwarp.iters"])
-        assert len(enumerate_configs(r, "formwarp")) > len(enumerate_configs(base, "formwarp"))
+        r = with_overrides(base, None, ["optiwarp.max_step"])
+        assert "optiwarp.max_step" not in base.tune
+        assert len(enumerate_configs(r, "optiwarp_demons")) > len(
+            enumerate_configs(base, "optiwarp_demons")
+        )
 
     def test_optiwarp_fix_reaches_every_force_model(self):
         from fastfuncstuff.processing.tunespec import fixed_for, parse_fix

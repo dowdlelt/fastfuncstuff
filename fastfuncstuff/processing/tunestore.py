@@ -49,6 +49,10 @@ class Trial:
     # what a user reads; this is what the adaptive searcher steers by, because a
     # label carries no gradient and this boundary is a cliff.
     margin: float = 0.0
+    # Per-level convergence telemetry (formwarp.LevelStats.as_dict()). Answers the
+    # question the iteration knobs raise but cannot settle on their own: was this
+    # config starved of iterations, or did it over-run and fall back?
+    levels: list[dict[str, Any]] = field(default_factory=list)
     kept_outputs: str | None = None  # set when a trial was reproduced
 
     def as_dict(self) -> dict:
@@ -370,6 +374,45 @@ def format_knob_effects(effects: list[KnobEffect]) -> str:
             s = f"{score:8.3f}" if score == score else "     n/a"
             lines.append(f"      {str(v):>12s} {s} {fold:8.0%} {n:4d}")
         lines.append("")
+    return "\n".join(lines)
+
+
+def format_convergence(store: TrialStore) -> str:
+    """Per backend and level: was it starved of iterations, or did it over-run?
+
+    The iteration knobs cannot answer this from the score alone. A config at the top
+    of the iters ladder might be there because more iterations genuinely help, or
+    because the ladder is too short to show where it stops helping — and those call
+    for opposite actions. ``best_iter`` separates them: a level that was still
+    improving when the cap stopped it is starved, and one that peaked early and then
+    ran on has iterations to give back.
+    """
+    rows: dict[tuple[str, int], list[dict]] = {}
+    for t in store.trials:
+        for lev, stats in enumerate(t.levels):
+            rows.setdefault((t.backend, lev), []).append(stats)
+    if not rows:
+        return "  (no convergence telemetry recorded)"
+
+    lines = [
+        "  Per-level iteration behaviour. 'starved' = still improving at the cap, so",
+        "  the ladder is too short; 'wasted' = iterations run after the kept one.",
+        "",
+        f"  {'backend':16s} {'lvl':>3s} {'iters':>6s} {'best@':>6s} {'wasted':>7s} "
+        f"{'starved':>8s} {'damped':>7s} {'nolegal':>8s}  n",
+        "  " + "-" * 88,
+    ]
+    for (backend, lev), stats in sorted(rows.items()):
+        n = len(stats)
+        lines.append(
+            f"  {backend:16s} {lev + 1:>3d} "
+            f"{statistics.fmean([s['iters_run'] for s in stats]):6.1f} "
+            f"{statistics.fmean([s['best_iter'] for s in stats]):6.1f} "
+            f"{statistics.fmean([s['wasted_iters'] for s in stats]):7.1f} "
+            f"{sum(bool(s['starved']) for s in stats) / n:7.0%} "
+            f"{sum(bool(s['damped_iters']) for s in stats) / n:6.0%} "
+            f"{sum(bool(s.get('fold_fallback')) for s in stats) / n:7.0%}  {n}"
+        )
     return "\n".join(lines)
 
 
