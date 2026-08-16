@@ -35,7 +35,7 @@ from .mask import automask
 from .metrics import MetricInputs, evaluate_metrics
 from .tuneopt import Observation, SearchSpace, config_key, propose
 from .tunespec import BACKENDS, Recipe, fixed_for, render_command, resolve_tunable
-from .tunestore import TrialStore
+from .tunestore import BASELINE, TrialStore
 from .warpqc import (
     FAIL,
     FAILED_MARGIN,
@@ -303,6 +303,52 @@ def run_trial(
         torch.cuda.empty_cache()
 
 
+def score_baseline(
+    pairs: list[SubjectPair],
+    recipe: Recipe,
+    store: TrialStore,
+    referees: dict[str, Referee],
+    sources: dict[str, torch.Tensor],
+) -> None:
+    """Score every subject's *input*, unwarped, as the do-nothing row.
+
+    Without it a run reports which candidate won but not whether any of them beat
+    leaving the data alone -- and "nonlinear bought this much on data like this" is
+    the statement a recommendation is actually made of. Cheap: one scoring pass per
+    subject, no fit.
+    """
+    panel = recipe.panel()
+    for pair in pairs:
+        referee = referees[pair.base]
+        source = sources[pair.source]
+        outcome = referee.score(source, None, panel)
+        store.add(
+            BASELINE,
+            pair.name,
+            {},
+            [],
+            seconds=0.0,
+            **outcome,
+        )
+
+
+def describe_pairs(pairs: list[SubjectPair], referees: dict[str, Referee]) -> dict[str, Any]:
+    """The data's own properties, for the run record.
+
+    A preset claims some settings suit data *of a kind*; resolution, matrix and how
+    much of the volume is brain are what let the next person decide whether their
+    data is that kind.
+    """
+    ref = referees[pairs[0].base]
+    return {
+        "subjects": [p.name for p in pairs],
+        "base": pairs[0].base,
+        "shape": tuple(int(v) for v in ref.base.shape),
+        "voxdims": tuple(float(v) for v in ref.voxdims),
+        "n_mask_voxels": int(ref.brain.sum()),
+    }
+
+
 def run_search(
     pairs: list[SubjectPair],
     recipe: Recipe,
@@ -332,6 +378,14 @@ def run_search(
         if pair.source not in sources:
             vol, _ = load_image(pair.source, device=device)
             sources[pair.source] = vol[..., 0] if vol.ndim == 4 else vol
+
+    if store.runs:
+        # The data's own properties are only knowable once the images are open, so
+        # the run record is completed here rather than at begin_run().
+        for k, v in describe_pairs(pairs, referees).items():
+            setattr(store.runs[-1], k, v)
+    if not any(t.backend == BASELINE for t in store.trials):
+        score_baseline(pairs, recipe, store, referees, sources)
 
     try:
         from tqdm import tqdm
@@ -508,6 +562,14 @@ def run_adaptive(
         if pair.source not in sources:
             vol, _ = load_image(pair.source, device=device)
             sources[pair.source] = vol[..., 0] if vol.ndim == 4 else vol
+
+    if store.runs:
+        # The data's own properties are only knowable once the images are open, so
+        # the run record is completed here rather than at begin_run().
+        for k, v in describe_pairs(pairs, referees).items():
+            setattr(store.runs[-1], k, v)
+    if not any(t.backend == BASELINE for t in store.trials):
+        score_baseline(pairs, recipe, store, referees, sources)
 
     rng = np.random.default_rng(plan.seed)
     for backend in names:

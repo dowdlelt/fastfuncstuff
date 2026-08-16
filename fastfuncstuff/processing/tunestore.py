@@ -31,6 +31,174 @@ from .warpqc import FAIL, MARGINAL, PASS
 GRADE_ORDER = {PASS: 0, MARGINAL: 1, FAIL: 2}
 
 
+BASELINE = "(baseline)"
+"""Backend name for the do-nothing row: the input scored without any warp.
+
+Every other number in a run is a rank among candidates, which says which setting
+won but not whether *any* of them helped. The baseline is what turns the table
+into a statement you can act on -- "nonlinear bought this much on data like this"
+-- and it is the one row that has to be there for a recommendation to mean
+anything.
+"""
+
+
+@dataclass
+class RunMeta:
+    """What produced a batch of trials: the code, the machine, and the data.
+
+    Recorded because the trials alone are not interpretable later. Two runs of
+    this tool are only comparable if the code that scored them agrees, and on
+    2026-08-16 a fix to the qwarp Jacobian penalty changed every warp the engine
+    produces -- silently invalidating every table written before it, with nothing
+    in the file to say so. A stored commit turns that from a trap into a warning.
+
+    The data fields exist for the same reason at a different timescale. A preset
+    is a claim that some settings suit data *of a kind*, and "5 FreeSurfer brains"
+    does not describe a kind: resolution, matrix and how much deformation was
+    actually needed are what let the next person tell whether their data is like
+    this one. See [[Data Variety]] for how wide that space is.
+    """
+
+    run_id: int
+    started: str
+    commit: str = "unknown"
+    dirty: bool = False
+    device: str = ""
+    torch_version: str = ""
+    recipe: str = ""
+    contrast: str = ""
+    optimize: str = ""
+    panel: list[str] = field(default_factory=list)
+    search: str = ""
+    subjects: list[str] = field(default_factory=list)
+    base: str = ""
+    shape: tuple[int, ...] = ()
+    voxdims: tuple[float, ...] = ()
+    n_mask_voxels: int = 0
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        # JSON has no tuples, so a round trip returns lists. Coerced here so a
+        # reloaded run compares equal to the one that was written -- otherwise the
+        # comparability check reports a grid change that never happened.
+        self.shape = tuple(self.shape)
+        self.voxdims = tuple(self.voxdims)
+
+    @property
+    def n_voxels(self) -> int:
+        n = 1
+        for d in self.shape:
+            n *= int(d)
+        return n if self.shape else 0
+
+    def describe(self) -> str:
+        vox = "x".join(f"{v:g}" for v in self.voxdims) or "?"
+        shape = "x".join(str(int(v)) for v in self.shape) or "?"
+        head = (
+            f"run {self.run_id}  {self.started[:19]}  {self.commit}{'+dirty' if self.dirty else ''}"
+        )
+        return (
+            f"{head}\n"
+            f"    {self.recipe} ({self.contrast}), optimize={self.optimize}, search={self.search}\n"
+            f"    {len(self.subjects)} subject(s), grid {shape} @ {vox} mm, "
+            f"{self.n_mask_voxels} in-mask voxels\n"
+            f"    device={self.device}, torch={self.torch_version}"
+        )
+
+
+def capture_run_meta(run_id: int, **kw: Any) -> RunMeta:
+    """Build a :class:`RunMeta`, reading the bits that describe the environment."""
+    import subprocess
+
+    commit, dirty = "unknown", False
+    try:
+        root = Path(__file__).resolve().parents[2]
+        commit = (
+            subprocess.run(
+                ["git", "-C", str(root), "rev-parse", "--short", "HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+            or "unknown"
+        )
+        dirty = bool(
+            subprocess.run(
+                ["git", "-C", str(root), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - git absent
+        pass
+
+    torch_version = ""
+    try:
+        import torch
+
+        torch_version = torch.__version__
+    except ImportError:  # pragma: no cover
+        pass
+
+    return RunMeta(
+        run_id=run_id,
+        started=datetime.datetime.now().isoformat(timespec="seconds"),
+        commit=commit,
+        dirty=dirty,
+        torch_version=torch_version,
+        **kw,
+    )
+
+
+def comparability_warnings(runs: list[RunMeta]) -> list[str]:
+    """Why an earlier batch of trials may not be comparable with the newest one.
+
+    Warnings, never a refusal. Folding new subjects into an existing study is the
+    normal way this tool gets used, and the differences that matter are ones the
+    operator can weigh -- so they are stated plainly and the run proceeds.
+    """
+    if len(runs) < 2:
+        return []
+    latest, out = runs[-1], []
+    for prev in runs[:-1]:
+        if prev.commit != latest.commit and "unknown" not in (prev.commit, latest.commit):
+            out.append(
+                f"run {prev.run_id} was scored at commit {prev.commit}, this one at "
+                f"{latest.commit}. If the engines or the metrics changed in between, "
+                f"the two sets of scores are not on the same scale."
+            )
+        if prev.dirty or latest.dirty:
+            out.append(
+                f"run {prev.run_id if prev.dirty else latest.run_id} was recorded with "
+                "uncommitted changes, so its commit does not identify what ran."
+            )
+        if prev.panel and latest.panel and prev.panel != latest.panel:
+            out.append(
+                f"run {prev.run_id} was judged by a different panel "
+                f"({len(prev.panel)} vs {len(latest.panel)} metrics); consensus ranks "
+                "from the two are measuring different things."
+            )
+        if prev.optimize and prev.optimize != latest.optimize:
+            out.append(f"run {prev.run_id} optimised {prev.optimize}, this one {latest.optimize}.")
+        if prev.shape and latest.shape and tuple(prev.shape) != tuple(latest.shape):
+            out.append(
+                f"run {prev.run_id} used a {'x'.join(map(str, prev.shape))} grid, this one "
+                f"{'x'.join(map(str, latest.shape))}; per-fit timings are not comparable."
+            )
+        try:
+            delta = datetime.datetime.fromisoformat(
+                latest.started
+            ) - datetime.datetime.fromisoformat(prev.started)
+            if delta.days >= 14:
+                out.append(f"run {prev.run_id} is {delta.days} days older than this one.")
+        except ValueError:  # pragma: no cover - malformed timestamp
+            pass
+    return list(dict.fromkeys(out))
+
+
 @dataclass
 class Trial:
     """One backend + config + subject fit, scored and then thrown away."""
@@ -54,6 +222,7 @@ class Trial:
     # question the iteration knobs raise but cannot settle on their own: was this
     # config starved of iterations, or did it over-run and fall back?
     levels: list[dict[str, Any]] = field(default_factory=list)
+    run_id: int = 0  # which RunMeta produced this trial
     kept_outputs: str | None = None  # set when a trial was reproduced
 
     def as_dict(self) -> dict:
@@ -81,6 +250,14 @@ class ConfigResult:
     grade: str
     reasons: list[str]
     seconds_mean: float
+    # Mean raw value of each panel metric. The consensus score is a rank *within
+    # this run*, which is the right unit for picking a winner and useless for
+    # comparing one study to another; these are the numbers that transfer.
+    abs_scores: dict[str, float] = field(default_factory=dict)
+    # Seconds per megavoxel of the base grid, so a timing survives being quoted on
+    # a different problem size. Raw seconds do not.
+    seconds_per_mvox: float = 0.0
+    is_baseline: bool = False
 
     def label(self) -> str:
         if not self.config:
@@ -94,10 +271,32 @@ class TrialStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.trials: list[Trial] = []
+        self.runs: list[RunMeta] = []
         self._next_trial = 0
         self._config_ids: dict[str, int] = {}
         if self.path.exists():
             self.load()
+
+    # --- runs ---------------------------------------------------------------
+
+    def begin_run(self, **kw: Any) -> RunMeta:
+        """Open a new batch of trials and record what is producing it.
+
+        Appending rather than replacing: adding subjects to an existing study is
+        the normal way this gets used, and the whole point of keeping the earlier
+        run's metadata is to be able to say how it differed.
+        """
+        meta = capture_run_meta(len(self.runs) + 1, **kw)
+        self.runs.append(meta)
+        return meta
+
+    @property
+    def current_run(self) -> int:
+        return self.runs[-1].run_id if self.runs else 0
+
+    def warnings(self) -> list[str]:
+        """Reasons the runs in this store may not be directly comparable."""
+        return comparability_warnings(self.runs)
 
     # --- identity -----------------------------------------------------------
 
@@ -126,6 +325,7 @@ class TrialStore:
             subject=subject,
             config=dict(config),
             command=list(command),
+            run_id=self.current_run,
             **outcome,
         )
         self.trials.append(t)
@@ -137,6 +337,7 @@ class TrialStore:
             json.dumps(
                 {
                     "config_ids": self._config_ids,
+                    "runs": [asdict(r) for r in self.runs],
                     "trials": [t.as_dict() for t in self.trials],
                 },
                 indent=2,
@@ -152,6 +353,10 @@ class TrialStore:
         # schema addition would be the worst possible time to be strict.
         known = {f.name for f in fields(Trial)}
         self.trials = [Trial(**{k: v for k, v in t.items() if k in known}) for t in raw["trials"]]
+        run_known = {f.name for f in fields(RunMeta)}
+        self.runs = [
+            RunMeta(**{k: v for k, v in r.items() if k in run_known}) for r in raw.get("runs", [])
+        ]
         self._next_trial = max((t.trial_id for t in self.trials), default=0)
 
     # --- scoring ------------------------------------------------------------
@@ -207,6 +412,8 @@ class TrialStore:
         for t in self.trials:
             by_config.setdefault(t.config_id, []).append(t)
 
+        mvox = (self.runs[-1].n_voxels / 1e6) if self.runs else 0.0
+
         out = []
         for cid, ts in by_config.items():
             vals = [t.scores.get(score_key) for t in ts]
@@ -214,6 +421,12 @@ class TrialStore:
             if not vals:
                 continue
             worst = max(ts, key=lambda t: GRADE_ORDER.get(t.grade, 3))
+            names = {k for t in ts for k in t.scores if k != "consensus"}
+            abs_scores = {
+                n: statistics.fmean([t.scores[n] for t in ts if n in t.scores])
+                for n in sorted(names)
+            }
+            seconds = statistics.fmean([t.seconds for t in ts])
             out.append(
                 ConfigResult(
                     config_id=cid,
@@ -224,11 +437,18 @@ class TrialStore:
                     score_spread=statistics.pstdev(vals) if len(vals) > 1 else 0.0,
                     grade=worst.grade,
                     reasons=worst.reasons,
-                    seconds_mean=statistics.fmean([t.seconds for t in ts]),
+                    seconds_mean=seconds,
+                    abs_scores=abs_scores,
+                    seconds_per_mvox=(seconds / mvox) if mvox else 0.0,
+                    is_baseline=ts[0].backend == BASELINE,
                 )
             )
         out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.score_mean))
         return out
+
+    def baseline(self) -> ConfigResult | None:
+        """The do-nothing row, if this run recorded one."""
+        return next((r for r in self.results() if r.is_baseline), None)
 
     # --- reproduction -------------------------------------------------------
 
@@ -587,22 +807,236 @@ def format_convergence(store: TrialStore) -> str:
     return "\n".join(lines)
 
 
+def headline_metric(results: list[ConfigResult]) -> str | None:
+    """Which absolute metric to show beside the rank.
+
+    Preference order is deliberate: ``lncc`` first because it carries local
+    structure and is the one metric here that a reader outside this project will
+    recognise from ANTs, then ``ls`` as the plain correlation, then whatever exists.
+    """
+    have = {k for r in results for k in r.abs_scores}
+    for preferred in ("lncc", "ls", "mi"):
+        if preferred in have:
+            return preferred
+    return sorted(have)[0] if have else None
+
+
+@dataclass
+class KnobImportance:
+    """How much a knob moves the answer, relative to everything else that varied.
+
+    Deliberately a marginal effect size and **not** an ANOVA decomposition. The
+    adaptive search does not produce a balanced factorial -- it deliberately spends
+    its fits where the surrogate points -- and a variance decomposition on
+    unbalanced data attributes the imbalance to whichever factor happens to
+    correlate with it. The range of level means is crude, but it degrades honestly.
+    """
+
+    backend: str
+    key: str
+    spread: float  # max - min of the per-level mean score
+    share: float  # that spread relative to the whole config range
+    n_levels: int
+    n_trials: int
+
+
+def knob_importance(store: TrialStore, score_key: str = "consensus") -> list[KnobImportance]:
+    """Rank knobs by how much they actually moved the score. Biggest first.
+
+    This is what says which knobs to keep searching and which to pin. Without it
+    the per-knob report shows a direction for every knob equally, whether it is
+    worth 70% of the outcome or 2%.
+    """
+    passing = [t for t in store.trials if t.grade == PASS and score_key in t.scores]
+    if not passing:
+        return []
+    allv = [t.scores[score_key] for t in passing]
+    total = (max(allv) - min(allv)) or 1.0
+
+    by_knob: dict[tuple[str, str], list[Trial]] = {}
+    for t in passing:
+        for key in t.config:
+            by_knob.setdefault((t.backend, key), []).append(t)
+
+    out = []
+    for (backend, key), ts in by_knob.items():
+        levels: dict[Any, list[float]] = {}
+        for t in ts:
+            levels.setdefault(_hashable(t.config[key]), []).append(t.scores[score_key])
+        if len(levels) < 2:
+            continue
+        means = [statistics.fmean(v) for v in levels.values()]
+        spread = max(means) - min(means)
+        out.append(KnobImportance(backend, key, spread, spread / total, len(levels), len(ts)))
+    out.sort(key=lambda k: -k.share)
+    return out
+
+
+def format_importance(items: list[KnobImportance]) -> str:
+    """Which knobs earn their place in the search."""
+    if not items:
+        return "  (nothing varied enough to rank)"
+    lines = [
+        "  How much each knob moved the score, as a share of the whole spread across",
+        "  configs. A marginal effect size, not an ANOVA -- the adaptive search does not",
+        "  produce a balanced design, and a decomposition would launder that imbalance.",
+        "",
+        f"  {'backend':16s} {'knob':18s} {'share':>7s} {'spread':>8s} {'levels':>7s} {'n':>5s}",
+        "  " + "-" * 70,
+    ]
+    for k in items:
+        lines.append(
+            f"  {k.backend:16s} {k.key:18s} {k.share:6.0%} {k.spread:8.2f} "
+            f"{k.n_levels:7d} {k.n_trials:5d}"
+        )
+    small = [k for k in items if k.share < 0.05]
+    if small:
+        lines += [
+            "",
+            "  Worth pinning with -fix (each moved under 5% of the range): "
+            + ", ".join(f"{k.backend}.{k.key}" for k in small[:6]),
+        ]
+    return "\n".join(lines)
+
+
+def format_runs(store: TrialStore) -> str:
+    """What produced the trials in this store, and how the batches differ."""
+    if not store.runs:
+        return "  (no run metadata -- this table predates run tracking)"
+    lines = [r.describe() for r in store.runs]
+    warn = store.warnings()
+    if warn:
+        lines.append("")
+        lines.append("  COMPARABILITY WARNINGS (not blocking):")
+        lines += [f"    - {w}" for w in warn]
+    return "\n".join("  " + ln if not ln.startswith("  ") else ln for ln in lines)
+
+
+def format_guide(store: TrialStore, recipe: str) -> str:
+    """The alignment recommendation this run supports, as a document.
+
+    Everything here is derived rather than asserted, so a claim cannot outlive the
+    evidence for it: the settings come from the winning configs, the "worth it"
+    line from the baseline, the timings from the measured fits, and the caveats
+    from the run metadata and the comparability warnings.
+    """
+    results = store.results()
+    if not results:
+        return "No results yet."
+    base = store.baseline()
+    metric = headline_metric(results)
+    meta = store.runs[-1] if store.runs else None
+
+    out = [f"# Alignment recommendation: {recipe}", ""]
+    if meta:
+        vox = "x".join(f"{v:g}" for v in meta.voxdims) or "?"
+        shape = "x".join(str(int(v)) for v in meta.shape) or "?"
+        out += [
+            f"Measured on {len(meta.subjects)} subject(s), {shape} @ {vox} mm, "
+            f"optimising {meta.optimize}, judged by {len(meta.panel)} metric(s).",
+            f"Code {meta.commit}{'+dirty' if meta.dirty else ''}, {meta.started[:10]}, "
+            f"device {meta.device}.",
+            "",
+        ]
+
+    out += ["## Is nonlinear worth it here?", ""]
+    if base is not None and metric:
+        best = next((r for r in results if not r.is_baseline), None)
+        if best is not None:
+            b, g = base.abs_scores.get(metric), best.abs_scores.get(metric)
+            if b is not None and g is not None:
+                out += [
+                    f"Unwarped input scores {metric}={b:.4f}; the best setting reaches "
+                    f"{g:.4f}, a change of {g - b:+.4f}.",
+                    "",
+                ]
+    else:
+        out += [
+            "No baseline was recorded, so this run cannot say whether the nonlinear "
+            "step improved on its input at all.",
+            "",
+        ]
+
+    out += ["## Recommended settings", ""]
+    seen: set[str] = set()
+    for r in results:
+        if r.is_baseline or r.grade != PASS or r.backend in seen:
+            continue
+        seen.add(r.backend)
+        out.append(
+            f"- **{r.backend}**: `{r.label()}` — {r.seconds_mean:.1f}s/fit"
+            + (f" ({r.seconds_per_mvox:.1f}s per megavoxel)" if r.seconds_per_mvox else "")
+        )
+    out.append("")
+
+    imp = knob_importance(store)
+    if imp:
+        out += ["## Which knobs mattered", ""]
+        out += [f"- `{k.backend}.{k.key}` — {k.share:.0%} of the spread" for k in imp[:6]]
+        out.append("")
+
+    advice = recommend_iterations(store)
+    starved = [a for a in advice if a.starved_frac > 0]
+    if starved:
+        out += [
+            "## Iteration ceilings",
+            "",
+            "Levels that were cut off while still improving, so their settings are a "
+            "floor rather than a measurement:",
+            "",
+        ]
+        out += [f"- {a.backend} level {a.level}: used {a.max_used} of {a.ceiling}" for a in starved]
+        out.append("")
+
+    out += ["## Caveats", ""]
+    if meta:
+        out.append(
+            f"- Measured on {len(meta.subjects)} subject(s). A preset is a claim about "
+            "data *of a kind*, which one cohort cannot establish."
+        )
+    for w in store.warnings():
+        out.append(f"- {w}")
+    out.append("- Eyeballs remain the final judge; `-reproduce N` rebuilds any row.")
+    return "\n".join(out)
+
+
 def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
     """The table the user reads, and picks a number out of to reproduce."""
     if not results:
         return "  (no results yet)"
-    lines = [
-        f"  {'#':>3s}  {'backend':16s} {'score':>8s} {'+/-':>7s} {'grade':9s} {'s/fit':>6s}  settings",
-        "  " + "-" * 104,
-    ]
+    metric = headline_metric(results)
+    base = next((r for r in results if r.is_baseline), None)
+    b_val = base.abs_scores.get(metric) if (base and metric) else None
+
+    head = f"  {'#':>3s}  {'backend':16s} {'score':>8s} {'+/-':>7s} {'grade':9s} {'s/fit':>6s}"
+    if metric:
+        head += f" {metric:>9s}"
+        if b_val is not None:
+            head += f" {'vs base':>9s}"
+    lines = [head + "  settings", "  " + "-" * (len(head) + 30)]
     for r in results[:limit]:
-        lines.append(
+        row = (
             f"  {r.config_id:>3d}  {r.backend:16s} {r.score_mean:8.4f} "
-            f"{r.score_spread:7.4f} {r.grade.upper():9s} {r.seconds_mean:6.1f}  {r.label()}"
+            f"{r.score_spread:7.4f} {r.grade.upper():9s} {r.seconds_mean:6.1f}"
         )
+        if metric:
+            v = r.abs_scores.get(metric)
+            row += f" {v:9.4f}" if v is not None else f" {'-':>9s}"
+            if b_val is not None:
+                row += f" {v - b_val:+9.4f}" if v is not None else f" {'-':>9s}"
+        lines.append(row + f"  {r.label()}")
     if len(results) > limit:
         lines.append(f"  ... {len(results) - limit} more")
     lines.append("")
+    if metric:
+        lines.append(
+            f"  'score' is a rank within this run (lower better); '{metric}' is the raw "
+            "value,\n  which is the column that means anything outside it."
+        )
+    if b_val is None:
+        lines.append(
+            "  No baseline row: this run cannot say whether any setting beat doing nothing."
+        )
     lines.append("  Reproduce one with:  ffs_tunewarp ... -reproduce N   (keeps the outputs)")
     return "\n".join(lines)
 

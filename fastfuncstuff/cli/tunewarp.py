@@ -42,11 +42,15 @@ from fastfuncstuff.processing.tunestore import (
     TrialStore,
     format_convergence,
     format_export,
+    format_guide,
+    format_importance,
     format_iteration_advice,
     format_knob_effects,
     format_reproduce,
     format_results_table,
+    format_runs,
     knob_effects,
+    knob_importance,
     recommend_iterations,
 )
 from fastfuncstuff.processing.tunewarp import (
@@ -177,6 +181,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Re-run config N and KEEP its outputs, so they can be looked at",
     )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
+    act.add_argument(
+        "-runs",
+        action="store_true",
+        help="What produced the trials in this directory -- code, machine and data -- "
+        "and how the batches differ from each other.",
+    )
+    act.add_argument(
+        "-importance",
+        action="store_true",
+        help="Rank the knobs by how much they actually moved the score, so the next "
+        "run can pin the ones that did not.",
+    )
+    act.add_argument(
+        "-guide",
+        action="store_true",
+        help="Emit the alignment recommendation this run supports, as a document: "
+        "settings, whether nonlinear was worth it, timings and caveats.",
+    )
     act.add_argument(
         "-export",
         action="store_true",
@@ -338,9 +360,25 @@ def main(argv: list[str] | None = None) -> int:
     out = Path(args.out)
     store = TrialStore(out / "trials.json")
 
-    if args.list or args.effects or args.convergence or args.export:
+    if (
+        args.list
+        or args.effects
+        or args.convergence
+        or args.export
+        or args.runs
+        or args.importance
+        or args.guide
+    ):
         if args.recipe:
             store.compute_consensus(RECIPES[args.recipe].panel())
+        if args.runs:
+            print(format_runs(store))
+        if args.importance:
+            print(format_importance(knob_importance(store)))
+        if args.guide:
+            if not args.recipe:
+                raise SystemExit("-guide needs -type, since a recommendation is per recipe")
+            print(format_guide(store, args.recipe))
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
         if args.export:
@@ -404,6 +442,15 @@ def main(argv: list[str] | None = None) -> int:
             print("  pinned: " + ", ".join(f"{k}={v}" for k, v in sorted(fixed.items())))
         print(f"  trial outputs are discarded after scoring; table in {store.path}")
 
+    store.begin_run(
+        device=str(device),
+        recipe=recipe.name,
+        contrast=recipe.contrast,
+        optimize=recipe.optimize,
+        panel=recipe.panel(),
+        search=args.search,
+    )
+
     if args.allineate:
         if args.verb >= 1:
             print(f"\nStep 0: affine ({recipe.optimize}) for {len(pairs)} subject(s)")
@@ -442,6 +489,12 @@ def main(argv: list[str] | None = None) -> int:
 
     store.compute_consensus(recipe.panel())
     store.save()
+    warn = store.warnings()
+    if warn:
+        print("\nThis directory holds earlier runs that may not be comparable:")
+        for w in warn:
+            print(f"  - {w}")
+        print("  Folded in anyway; the trials are tagged with which run produced them.")
     print("\n" + format_results_table(store.results(), limit=args.top))
     print("\nPer-knob effects:\n")
     print(format_knob_effects(knob_effects(store)))
