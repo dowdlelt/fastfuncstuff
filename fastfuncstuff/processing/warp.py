@@ -50,6 +50,7 @@ from .cost import (
     BatchedIncrementalCorrelation,
     IncrementalCorrelation,
     _auto_clip,
+    _make_kernel_1d,
     batched_lpa_cost,
 )
 from .cost_blok import (
@@ -1441,6 +1442,66 @@ def _gn_normal_eqs_3d(
     return hmat, grad
 
 
+def _gn_normal_eqs_local(
+    w: Tensor,
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    omega: Tensor,
+    base_hat: Tensor,
+    kernel: Tensor,
+    dims: tuple[int, int, int],
+) -> tuple[Tensor, Tensor]:
+    """Gauss-Newton normal equations for the **local** Pearson costs.
+
+    Same construction as :func:`_gn_normal_eqs_3d` with one substitution: the
+    zero-normalisation uses locally smoothed statistics instead of one mean and one
+    standard deviation per patch. Minimising ``sum (a_hat - b_hat)^2`` over locally
+    normalised images maximises local correlation, which is what ``lpa`` scores --
+    so this is a least-squares surrogate for a cost that has no residual form of its
+    own. It is not the reported functional (AFNI aggregates ``z*|z|`` over Fisher-z
+    transformed correlations); it only has to point the same way, and the caller
+    accepts or rejects every step on the real cost.
+
+    The local mean and standard deviation of the *moving* patch are frozen at the
+    current parameters rather than differentiated. That is the standard cheap
+    approximation for local-correlation gradients, and it is what keeps the
+    Jacobian from needing its own smoothing pass per column -- with ``D*nb`` columns
+    over a patch-sized grid, that pass would cost more than the solve it feeds.
+    Freezing makes the quadratic model slightly wrong, which under an accept/reject
+    loop buys iterations rather than errors.
+
+    Args:
+        w: (B, V) warped patch values.
+        g: (D, B, V) source gradient at the same locations.
+        hw: (D, 1, 1) half-width scale per active direction.
+        bt: (V, nb) basis, transposed.
+        omega: (B, V) weight * mask.
+        base_hat: (B, V) locally normalised base patches.
+        kernel: 1-D smoothing kernel defining the neighbourhood.
+        dims: (nzh, nyh, nxh) patch shape, so (B, V) can be seen as a grid again.
+    """
+    from .cost import _batched_separable_smooth_3d
+
+    b, v = w.shape
+    nzh, nyh, nxh = dims
+
+    def sm(flat: Tensor) -> Tensor:
+        return _batched_separable_smooth_3d(flat.reshape(b, 1, nzh, nyh, nxh), kernel).reshape(b, v)
+
+    sw = sm(omega).clamp_min(1e-10)
+    mw = sm(omega * w) / sw
+    sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
+
+    res = base_hat - (w - mw) / sd
+    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    jn = dw / sd.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
+    grad = torch.einsum("bvn,bv->bn", jnw, res)
+    return hmat, grad
+
+
 def _improve_warp_batched(
     base: Tensor,
     source: Tensor,
@@ -1686,7 +1747,13 @@ def _improve_warp_batched(
     # Gauss-Newton needs a least-squares surrogate, which the correlation costs
     # have (the zero-normalised residual) and the local-Pearson / descriptor costs
     # do not. Where it does not apply the Adam path is used unchanged.
-    use_gn = config.use_gauss_newton and not (use_blok or use_conv_lpa or use_patch_metric)
+    # lpa (and lncc) get the *local* surrogate; the plain correlations get the
+    # global one. lpc is excluded on purpose: it rewards anti-correlation, and a
+    # sum-of-squares residual between normalised patches can only ever pull them
+    # together, so the surrogate would point the wrong way for that cost alone.
+    gn_local = config.cost_method in ("lpa", "lpa_alt", "lncc")
+    gn_global = config.cost_method in ("pearson", "pearclp", "ncc")
+    use_gn = config.use_gauss_newton and (gn_local or gn_global)
 
     if use_gn:
         if state.source_grad_3ch.numel() == 0:
@@ -1701,12 +1768,28 @@ def _improve_warp_batched(
         ).view(-1, 1, 1)
         omega = (weight_patches * mask_patches).to(torch.float32)
         wsum = omega.sum(-1, keepdim=True).clamp_min(1e-12)
-        bm = (omega * base_patches).sum(-1, keepdim=True) / wsum
-        bs = (
-            ((omega * base_patches * base_patches).sum(-1, keepdim=True) / wsum - bm * bm)
-            .clamp_min(1e-12)
-            .sqrt()
+        gn_kernel = _make_kernel_1d(
+            config.lpa_kernel, min(config.lpa_sigma, (min(nzh, nyh, nxh) - 1) / 2.0), device
         )
+        if gn_local:
+            # The base never moves, so its local statistics are computed once.
+            from .cost import _batched_separable_smooth_3d
+
+            def _sm(flat: Tensor) -> Tensor:
+                return _batched_separable_smooth_3d(
+                    flat.reshape(B, 1, nzh, nyh, nxh), gn_kernel
+                ).reshape(B, -1)
+
+            sw_b = _sm(omega).clamp_min(1e-10)
+            bm = _sm(omega * base_patches) / sw_b
+            bs = (_sm(omega * base_patches * base_patches) / sw_b - bm * bm).clamp_min(1e-10).sqrt()
+        else:
+            bm = (omega * base_patches).sum(-1, keepdim=True) / wsum
+            bs = (
+                ((omega * base_patches * base_patches).sum(-1, keepdim=True) / wsum - bm * bm)
+                .clamp_min(1e-12)
+                .sqrt()
+            )
         base_hat = (base_patches - bm) / bs
 
         def gn_normal_eqs(active_params: Tensor) -> tuple[Tensor, Tensor]:
@@ -1743,6 +1826,17 @@ def _improve_warp_batched(
                 sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
                 gx_, gy_, gz_ = batched_interp_3ch(source_grad_3ch, sx, sy, sz)
                 gall = torch.stack([gx_, gy_, gz_], dim=0)[list(active_dims)]
+                if gn_local:
+                    return _gn_normal_eqs_local(
+                        w_ * mask_patches,
+                        gall * mask_patches,
+                        hw_active,
+                        bt,
+                        omega,
+                        base_hat,
+                        gn_kernel,
+                        (nzh, nyh, nxh),
+                    )
                 return _gn_normal_eqs_3d(
                     w_ * mask_patches, gall * mask_patches, hw_active, bt, omega, wsum, base_hat
                 )

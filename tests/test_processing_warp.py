@@ -978,8 +978,10 @@ class TestGaussNewtonPatchOptimizer:
         assert torch.equal(a, b)
 
     def test_falls_back_to_adam_for_costs_without_a_surrogate(self):
-        """lpa/lpc have no least-squares residual, so GN cannot apply -- and asking
-        for it must not silently produce a different (or broken) answer."""
+        """The descriptor costs have no least-squares residual, so GN cannot apply
+        -- and asking for it must not silently produce a different (or broken)
+        answer. lpa and lncc DO have one, via locally normalised residuals; see
+        TestGaussNewtonLocalCosts."""
         import torch
 
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
@@ -987,12 +989,12 @@ class TestGaussNewtonPatchOptimizer:
         base, moving = self._pair()
         dev = torch.device("cpu")
         plain = qwarp(
-            base, moving, config=QwarpConfig(verb=0, cost_method="lpa", minpatch=9), device=dev
+            base, moving, config=QwarpConfig(verb=0, cost_method="mind", minpatch=9), device=dev
         )[0]
         asked = qwarp(
             base,
             moving,
-            config=QwarpConfig(verb=0, cost_method="lpa", minpatch=9, use_gauss_newton=True),
+            config=QwarpConfig(verb=0, cost_method="mind", minpatch=9, use_gauss_newton=True),
             device=dev,
         )[0]
         assert torch.equal(plain, asked)
@@ -1003,3 +1005,86 @@ class TestGaussNewtonPatchOptimizer:
         from fastfuncstuff.processing.warp import QwarpConfig
 
         assert QwarpConfig().use_gauss_newton is False
+
+
+class TestGaussNewtonLocalCosts:
+    """The local-Pearson costs get GN through a locally normalised residual.
+
+    lpa has no residual form of its own -- AFNI aggregates z*|z| over Fisher-z
+    transformed local correlations -- but minimising the squared difference of
+    locally normalised patches maximises local correlation, which points the same
+    way. Measured on a real 193^3 fit: lpa Adam 96.7s -> GN 15.9s, with GN slightly
+    *better* on ls, mi and lncc.
+    """
+
+    def _pair(self, n=24):
+        import numpy as np
+        import torch
+
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n // 2
+
+        def blob(cx, r, amp=100.0):
+            return (
+                amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))
+            ).astype(np.float32)
+
+        return (
+            torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0)),
+            torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0)),
+        )
+
+    def _run(self, cost, **kw):
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        return qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, **kw),
+            device=torch.device("cpu"),
+        )
+
+    @pytest.mark.parametrize("cost", ["lpa", "lncc"])
+    def test_local_gn_improves_alignment(self, cost):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, moving = self._pair()
+        warped, *_ = self._run(cost, use_gauss_newton=True)
+        before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
+        after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+        assert after < before
+
+    @pytest.mark.parametrize("cost", ["lpa", "lncc"])
+    def test_local_gn_tracks_the_adam_answer(self, cost):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, _ = self._pair()
+        a = evaluate_metrics(MetricInputs(base=base, moving=self._run(cost)[0]), ["ls"])["ls"]
+        g = evaluate_metrics(
+            MetricInputs(base=base, moving=self._run(cost, use_gauss_newton=True)[0]), ["ls"]
+        )["ls"]
+        assert abs(a - g) < 0.15, f"{cost}: GN {g:.4f} vs Adam {a:.4f}"
+
+    def test_lpc_is_excluded_from_gauss_newton(self):
+        """lpc rewards anti-correlation. A sum-of-squares residual between
+        normalised patches can only pull them together, so the surrogate would
+        point the wrong way -- it must fall back rather than optimise backwards."""
+        import torch
+
+        plain = self._run("lpc")[0]
+        asked = self._run("lpc", use_gauss_newton=True)[0]
+        assert torch.equal(plain, asked)
+
+    def test_local_gn_produces_a_sound_warp(self):
+        from fastfuncstuff.processing.mask import automask
+        from fastfuncstuff.processing.warpqc import regularity_verdict, warp_regularity
+
+        base, _ = self._pair()
+        _, xd, yd, zd = self._run("lpa", use_gauss_newton=True)
+        off = [(a - b) // 2 for a, b in zip(xd.shape, base.shape, strict=True)]
+        sl = tuple(slice(o, o + s) for o, s in zip(off, base.shape, strict=True))
+        qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
+        assert regularity_verdict(qc)[0] != "fail"
