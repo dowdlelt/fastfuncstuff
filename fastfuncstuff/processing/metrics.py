@@ -523,6 +523,8 @@ def check_contrast(name: str, contrast: str) -> None:
 
 __all__ = [
     "AFNI_METRICS",
+    "PATCH_METRICS",
+    "batched_patch_cost",
     "ALL_METRICS",
     "CONTRAST_REGIMES",
     "CROSS",
@@ -542,3 +544,140 @@ __all__ = [
     "ngf_volume_cost",
     "panel_for",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Patch-wise forms, so the qwarp engine can optimise these too
+# ---------------------------------------------------------------------------
+#
+# qwarp optimises shrinking overlapping patches rather than a whole field, and its
+# cost is evaluated on flat ``(B, V)`` patch vectors. The neighbourhood metrics
+# need the 3-D structure back, which is available: a patch is an ``(nzh, nyh, nxh)``
+# block that was flattened, so it can simply be reshaped. Everything below returns
+# **higher = better**, matching what the engine's other patch costs return before it
+# negates them.
+
+PATCH_METRICS = ("lncc", "mse", "ngf", "mind", "mindssc")
+
+
+def _shift_batched(v: Tensor, off: tuple[int, int, int]) -> Tensor:
+    """Whole-voxel translate of a (B, 1, D, H, W) block, replicating the edge."""
+    out = v
+    for axis, delta in enumerate(off):
+        if not delta:
+            continue
+        dim = axis + 2
+        out = torch.roll(out, shifts=delta, dims=dim)
+        idx: list = [slice(None)] * 5
+        edge: list = [slice(None)] * 5
+        if delta > 0:
+            idx[dim], edge[dim] = slice(0, delta), slice(delta, delta + 1)
+        else:
+            idx[dim], edge[dim] = slice(delta, None), slice(delta - 1, delta)
+        out = out.clone()
+        out[tuple(idx)] = out[tuple(edge)]
+    return out
+
+
+def _grad_batched(v: Tensor) -> Tensor:
+    """(B, 3, D, H, W) central-difference gradient of a (B, 1, D, H, W) block."""
+    comps = []
+    for axis in range(3):
+        hi = _shift_batched(v, tuple(-1 if a == axis else 0 for a in range(3)))
+        lo = _shift_batched(v, tuple(1 if a == axis else 0 for a in range(3)))
+        comps.append(0.5 * (hi - lo))
+    return torch.cat(comps, dim=1)
+
+
+def batched_patch_cost(
+    name: str,
+    base_patches: Tensor,
+    warped_patches: Tensor,
+    weight_patches: Tensor,
+    nzh: int,
+    nyh: int,
+    nxh: int,
+    cc_radius: int = 4,
+    mind_radius: float = 1.0,
+    ngf_eta: float | None = None,
+) -> Tensor:
+    """One grid metric evaluated per patch: ``(B, V)`` in, ``(B,)`` out.
+
+    Higher is better, so the caller negates it exactly as it does for the local
+    Pearson costs.
+    """
+    from .cost import _batched_separable_smooth_3d, _make_kernel_1d
+
+    b = base_patches.shape[0]
+    x = base_patches.reshape(b, 1, nzh, nyh, nxh)
+    y = warped_patches.reshape(b, 1, nzh, nyh, nxh)
+    w = weight_patches.reshape(b, 1, nzh, nyh, nxh).clamp(min=0)
+    wsum = w.sum(dim=(1, 2, 3, 4)).clamp(min=_EPS)
+
+    if name == "mse":
+        return -(w * (x - y) ** 2).sum(dim=(1, 2, 3, 4)) / wsum
+
+    if name == "lncc":
+        # The window has to fit inside the patch, or every voxel sees the same
+        # (whole-patch) statistics and the local metric silently becomes a global
+        # one -- which is precisely the information qwarp's small patches carry.
+        radius = max(1.0, min(float(cc_radius), (min(nzh, nyh, nxh) - 1) / 2.0))
+        kernel = _make_kernel_1d("box", radius, base_patches.device)
+
+        def sm(v: Tensor) -> Tensor:
+            return _batched_separable_smooth_3d(v, kernel)
+
+        sw = sm(w).clamp(min=_EPS)
+        mx, my = sm(w * x) / sw, sm(w * y) / sw
+        vxx = (sm(w * x * x) / sw - mx * mx).clamp(min=_EPS)
+        vyy = (sm(w * y * y) / sw - my * my).clamp(min=_EPS)
+        vxy = sm(w * x * y) / sw - mx * my
+        local = (vxy * vxy) / (vxx * vyy)
+        return (w * local).sum(dim=(1, 2, 3, 4)) / wsum
+
+    if name == "ngf":
+        ga, gb = _grad_batched(x), _grad_batched(y)
+        if ngf_eta is None:
+            mag = ga.pow(2).sum(dim=1, keepdim=True).sqrt()
+            eta = mag.flatten(1).median(dim=1).values.clamp(min=_EPS).view(b, 1, 1, 1, 1)
+        else:
+            eta = torch.full((b, 1, 1, 1, 1), float(ngf_eta), device=x.device)
+        e2 = eta * eta
+        dot = (ga * gb).sum(dim=1, keepdim=True)
+        na = ga.pow(2).sum(dim=1, keepdim=True) + e2
+        nb = gb.pow(2).sum(dim=1, keepdim=True) + e2
+        return (w * (dot * dot) / (na * nb)).sum(dim=(1, 2, 3, 4)) / wsum
+
+    if name in ("mind", "mindssc"):
+        kernel = _make_kernel_1d("box", float(mind_radius), base_patches.device)
+
+        def desc(v: Tensor) -> Tensor:
+            dists = [
+                _batched_separable_smooth_3d((v - _shift_batched(v, o)) ** 2, kernel)
+                for o in _MIND_SIX
+            ]
+            if name == "mindssc":
+                chans = [
+                    _batched_separable_smooth_3d(
+                        (_shift_batched(v, _MIND_SIX[i]) - _shift_batched(v, _MIND_SIX[j])) ** 2,
+                        kernel,
+                    )
+                    for i, j in _SSC_PAIRS
+                ]
+            else:
+                chans = dists
+            stack = torch.cat(chans, dim=1)
+            var = torch.cat(dists, dim=1).mean(dim=1, keepdim=True).clamp(min=_EPS)
+            d = torch.exp(-stack / var)
+            return d / d.max(dim=1, keepdim=True).values.clamp(min=_EPS)
+
+        # The base descriptor is constant -- the base does not move -- so it is
+        # built once under no_grad. Keeping it in the graph doubled peak memory and
+        # bought nothing; MIND-SSC's twelve channels put a 193^3 run out of memory.
+        with torch.no_grad():
+            dx = desc(x)
+        diff = (dx - desc(y)).abs().mean(dim=1, keepdim=True)
+        del dx
+        return -(w * diff).sum(dim=(1, 2, 3, 4)) / wsum
+
+    raise ValueError(f"{name!r} has no patch-wise form; have {', '.join(PATCH_METRICS)}")

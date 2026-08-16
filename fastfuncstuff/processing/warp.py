@@ -66,6 +66,7 @@ from .interp import (
     trilinear_interpolate,
     warp_image,
 )
+from .metrics import PATCH_METRICS, batched_patch_cost
 from .optimizer import optimize_warp_params_batched, optimize_warp_params_torch
 from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
 from .weight import compute_weight_image
@@ -170,6 +171,14 @@ class QwarpConfig:
 
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
+
+    cc_radius: int = 4
+    """Neighbourhood half-width for ``cost_method="lncc"``. Clamped per level so the
+    window fits inside the patch -- an oversized window makes every voxel see the same
+    whole-patch statistics, silently turning the local metric into a global one."""
+
+    mind_radius: float = 1.0
+    """Patch radius for the MIND / MIND-SSC descriptors."""
 
     penalty_first_level: int = 3
     """First level to apply penalty (no penalty before this). Matches AFNI's
@@ -1438,6 +1447,9 @@ def _improve_warp_batched(
     # the older convolution LPA (lpa_alt), or INCOR (pearson/pearclp).
     use_blok = config.cost_method in ("lpc", "lpa")
     use_conv_lpa = config.cost_method == "lpa_alt"
+    # The registry's neighbourhood metrics, evaluated per patch. They need the 3-D
+    # block back, which a flat (B, V) patch trivially reshapes to.
+    use_patch_metric = config.cost_method in PATCH_METRICS
     blok_prep = None
     if use_blok:
         blok_idx_patches = torch.stack(
@@ -1451,7 +1463,7 @@ def _improve_warp_batched(
         blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
         _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     batch_incor = None
-    if not (use_blok or use_conv_lpa):
+    if not (use_blok or use_conv_lpa or use_patch_metric):
         batch_incor = BatchedIncrementalCorrelation(
             method=config.cost_method,
             base_clip=base_clip,
@@ -1554,7 +1566,19 @@ def _improve_warp_batched(
         warped_vals = warped_vals * mask_patches
 
         # Batched cost: (B,) (all conventions are higher == better here)
-        if use_blok:
+        if use_patch_metric:
+            corr = batched_patch_cost(
+                config.cost_method,
+                base_patches,
+                warped_vals,
+                weight_patches,
+                nzh,
+                nyh,
+                nxh,
+                cc_radius=config.cc_radius,
+                mind_radius=config.mind_radius,
+            )
+        elif use_blok:
             corr = _blok_value(
                 base_patches, warped_vals, weight_patches, blok_prep, config.lpc_ppow
             )

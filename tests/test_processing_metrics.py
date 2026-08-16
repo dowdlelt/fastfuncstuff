@@ -260,3 +260,71 @@ class TestDifferentiability:
             assert name in ENGINE_METRICS
             v = image_metric(base, shifted(2), torch.ones_like(base), metric=name)
             assert torch.isfinite(v)
+
+
+class TestPatchWiseForms:
+    """qwarp optimises flat (B, V) patches, so the grid metrics need a patch form.
+
+    A patch is an (nzh, nyh, nxh) block that was flattened, so the structure the
+    neighbourhood metrics need is recoverable by reshaping.
+    """
+
+    def _patches(self, b=3, n=9):
+        torch.manual_seed(0)
+        base = torch.rand(b, n * n * n)
+        return base, base.clone(), torch.ones(b, n * n * n), n
+
+    def test_every_patch_metric_peaks_at_a_perfect_match(self):
+        from fastfuncstuff.processing.metrics import PATCH_METRICS, batched_patch_cost
+
+        base, same, w, n = self._patches()
+        worse = torch.rand_like(base)
+        for name in PATCH_METRICS:
+            good = batched_patch_cost(name, base, same, w, n, n, n)
+            bad = batched_patch_cost(name, base, worse, w, n, n, n)
+            assert (good > bad).all(), f"{name} did not prefer the exact match"
+
+    def test_returns_one_value_per_patch(self):
+        from fastfuncstuff.processing.metrics import PATCH_METRICS, batched_patch_cost
+
+        base, other, w, n = self._patches(b=5)
+        for name in PATCH_METRICS:
+            assert batched_patch_cost(name, base, other, w, n, n, n).shape == (5,)
+
+    def test_patches_are_scored_independently(self):
+        """A batch must not leak between patches -- each is a separate problem."""
+        from fastfuncstuff.processing.metrics import batched_patch_cost
+
+        base, _, w, n = self._patches(b=2)
+        moving = base.clone()
+        moving[1] = torch.rand_like(moving[1])  # only the second patch disagrees
+        out = batched_patch_cost("lncc", base, moving, w, n, n, n)
+        alone = batched_patch_cost("lncc", base[:1], moving[:1], w[:1], n, n, n)
+        assert float(out[0]) == pytest.approx(float(alone[0]), rel=1e-5)
+
+    def test_gradient_reaches_the_patch_values(self):
+        from fastfuncstuff.processing.metrics import PATCH_METRICS, batched_patch_cost
+
+        base, _, w, n = self._patches()
+        for name in PATCH_METRICS:
+            moving = torch.rand_like(base).requires_grad_(True)
+            batched_patch_cost(name, base, moving, w, n, n, n).sum().backward()
+            assert moving.grad is not None and torch.isfinite(moving.grad).all(), name
+            assert float(moving.grad.abs().sum()) > 0, name
+
+    def test_lncc_window_is_clamped_to_the_patch(self):
+        """An oversized window makes every voxel see whole-patch statistics, which
+        silently turns the local metric into a global one."""
+        from fastfuncstuff.processing.metrics import batched_patch_cost
+
+        base, _, w, n = self._patches(n=5)
+        moving = torch.rand_like(base)
+        big = batched_patch_cost("lncc", base, moving, w, n, n, n, cc_radius=64)
+        assert torch.isfinite(big).all()
+
+    def test_unknown_metric_has_no_patch_form(self):
+        from fastfuncstuff.processing.metrics import batched_patch_cost
+
+        base, other, w, n = self._patches()
+        with pytest.raises(ValueError, match="no patch-wise form"):
+            batched_patch_cost("mi", base, other, w, n, n, n)
