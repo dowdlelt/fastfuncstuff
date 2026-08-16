@@ -356,8 +356,18 @@ BACKENDS: dict[str, BackendSpec] = {
     )
 }
 
-# The fixed argument that selects the force model, kept out of the tunable set.
+# The per-patch solver the tuner drives qwarp with. Gauss-Newton because the tuner
+# is throughput-bound and comparing settings, not producing a final warp: on a
+# 193^3 fit it took lpa from 96.7s to 15.9s while scoring slightly *better*, which
+# is what lets qwarp take part in a budget at all. Defined once and used both to
+# configure the in-process run and to render the reproducible command, so the two
+# cannot drift -- the failure mode that hid `-conv_threshold` for a whole run.
+QWARP_TUNE_OPTIMIZER = "gn"
+
+# Fixed arguments a backend always gets: the force model for the flow engines, and
+# the solver for qwarp. Kept out of the tunable set.
 BACKEND_FIXED_ARGS: dict[str, list[str]] = {
+    "qwarp": ["-optimizer", QWARP_TUNE_OPTIMIZER],
     "optiwarp_demons": ["-force", "demons"],
     "optiwarp_lk": ["-force", "lk"],
     "optiwarp_hs": ["-force", "hs"],

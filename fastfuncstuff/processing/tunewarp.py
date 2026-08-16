@@ -34,7 +34,14 @@ from .io import load_image
 from .mask import automask
 from .metrics import MetricInputs, evaluate_metrics
 from .tuneopt import Observation, SearchSpace, config_key, propose
-from .tunespec import BACKENDS, Recipe, fixed_for, render_command, resolve_tunable
+from .tunespec import (
+    BACKENDS,
+    QWARP_TUNE_OPTIMIZER,
+    Recipe,
+    fixed_for,
+    render_command,
+    resolve_tunable,
+)
 from .tunestore import BASELINE, TrialStore
 from .warpqc import (
     FAIL,
@@ -73,7 +80,7 @@ def _apply_config(cfg_obj: Any, backend: str, config: dict[str, Any]) -> None:
 def _run_qwarp(base, source, config, recipe, device):
     from .warp import QwarpConfig, qwarp
 
-    cfg = QwarpConfig(verb=0)
+    cfg = QwarpConfig(verb=0, optimizer=QWARP_TUNE_OPTIMIZER)
     if recipe is not None:
         cfg.cost_method = "pearclp" if recipe.optimize == "ls" else recipe.optimize
     _apply_config(cfg, "qwarp", config)
