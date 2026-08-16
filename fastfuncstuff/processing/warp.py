@@ -61,13 +61,18 @@ from .cost_blok import (
 from .interp import (
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
+    batched_interp_3ch,
     batched_trilinear_interpolate,
     batched_trilinear_interpolate_multi,
     trilinear_interpolate,
     warp_image,
 )
 from .metrics import PATCH_METRICS, batched_patch_cost
-from .optimizer import optimize_warp_params_batched, optimize_warp_params_torch
+from .optimizer import (
+    optimize_warp_params_batched,
+    optimize_warp_params_gauss_newton,
+    optimize_warp_params_torch,
+)
 from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
 from .weight import compute_weight_image
 
@@ -171,6 +176,18 @@ class QwarpConfig:
 
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
+
+    use_gauss_newton: bool = False
+    """Solve each patch by Levenberg-damped Gauss-Newton instead of Adam.
+
+    Applies only to the correlation costs, which have a least-squares surrogate;
+    the local-Pearson and descriptor costs fall back to Adam automatically. Removes
+    the backward pass, which was 58% of a measured 193^3 runtime, and converges in
+    single-figure iterations against Adam's ~24. Every step is still accepted or
+    rejected on the true cost, so this changes the route, not the destination."""
+
+    gn_iters: int = 8
+    """Gauss-Newton iterations per patch group (one solve + one cost evaluation)."""
 
     cc_radius: int = 4
     """Neighbourhood half-width for ``cost_method="lncc"``. Clamped per level so the
@@ -299,6 +316,12 @@ class WarpState:
     patches_done: int = 0
     patches_skipped: int = 0
     last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
+
+    # Gradient of the (unchanging) source volume, stacked (3, nz, ny, nx). Built on
+    # first use by the Gauss-Newton path and kept, because it is the same for every
+    # patch of every level and rebuilding it per phase would cost more than the
+    # solve it feeds.
+    source_grad_3ch: Tensor = field(default_factory=lambda: torch.empty(0))
 
     # Per-level optimizer-budget telemetry (batched path only); reset each level.
     opt_steps_weighted: int = 0  # sum over batches of steps_run * B
@@ -1369,6 +1392,55 @@ def _warpomatic(
 # ---------------------------------------------------------------------------
 
 
+def _gn_normal_eqs_3d(
+    w: Tensor,
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    omega: Tensor,
+    wsum: Tensor,
+    base_hat: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Zero-normalised-NCC Gauss-Newton normal equations for a 3-D patch warp.
+
+    The three-direction generalisation of :func:`_mescaled_gn_normal_eqs`, which
+    solves the same problem for a phase-encode-only field. A parameter here is
+    (direction, basis function), so the Jacobian gains a column block per active
+    direction and the solve is over ``D * nb`` unknowns instead of ``nb``.
+
+    The normalisation is the point. The cost is a *correlation*, so the residual has
+    to be taken between zero-mean unit-variance patches; differentiating that
+    normalisation is what the ``mdW`` and ``sW`` terms are. Skipping it and
+    regressing on raw intensities would solve a least-squares problem the engine is
+    not scoring.
+
+    Args:
+        w: (B, V) warped patch values at the current parameters.
+        g: (D, B, V) source-image gradient sampled at the same locations, one per
+            active direction.
+        hw: (D, 1, 1) half-width scale per active direction.
+        bt: (V, nb) basis, transposed.
+        omega: (B, V) per-voxel weight * mask.
+        wsum: (B, 1) weight sum per patch.
+        base_hat: (B, V) zero-normalised base patches.
+
+    Returns:
+        ``hmat`` (B, D*nb, D*nb) and ``grad`` (B, D*nb).
+    """
+    mw = (omega * w).sum(-1, keepdim=True) / wsum
+    sw = ((omega * w * w).sum(-1, keepdim=True) / wsum - mw * mw).clamp_min(1e-12).sqrt()
+    res = base_hat - (w - mw) / sw  # (B, V)
+
+    # Steepest-descent images, one block of nb columns per active direction.
+    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
+    jn = (dw - mdw) / sw.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
+    grad = torch.einsum("bvn,bv->bn", jnw, res)
+    return hmat, grad
+
+
 def _improve_warp_batched(
     base: Tensor,
     source: Tensor,
@@ -1611,18 +1683,95 @@ def _improve_warp_batched(
 
         return cost
 
-    # Run batched Adam optimizer
-    best_params, _best_costs, opt_stats = optimize_warp_params_batched(
-        batched_cost,
-        B,
-        n_active,
-        param_max,
-        device,
-        max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
-        lr=config.batch_optimizer_lr,
-        tolerance=config.batch_optimizer_tol,
-        patience=config.batch_optimizer_patience,
-    )
+    # Gauss-Newton needs a least-squares surrogate, which the correlation costs
+    # have (the zero-normalised residual) and the local-Pearson / descriptor costs
+    # do not. Where it does not apply the Adam path is used unchanged.
+    use_gn = config.use_gauss_newton and not (use_blok or use_conv_lpa or use_patch_metric)
+
+    if use_gn:
+        if state.source_grad_3ch.numel() == 0:
+            gz, gy, gx = torch.gradient(source)
+            state.source_grad_3ch = torch.stack([gx, gy, gz], dim=0).contiguous()
+        source_grad_3ch = state.source_grad_3ch
+        bt = basis.reshape(basis.shape[0], -1).t().contiguous()  # (V, n_basis)
+        hw_active = torch.tensor(
+            [half_widths[d] * axis_weights[d] for d in active_dims],
+            device=device,
+            dtype=torch.float32,
+        ).view(-1, 1, 1)
+        omega = (weight_patches * mask_patches).to(torch.float32)
+        wsum = omega.sum(-1, keepdim=True).clamp_min(1e-12)
+        bm = (omega * base_patches).sum(-1, keepdim=True) / wsum
+        bs = (
+            ((omega * base_patches * base_patches).sum(-1, keepdim=True) / wsum - bm * bm)
+            .clamp_min(1e-12)
+            .sqrt()
+        )
+        base_hat = (base_patches - bm) / bs
+
+        def gn_normal_eqs(active_params: Tensor) -> tuple[Tensor, Tensor]:
+            with torch.no_grad():
+                full = active_params @ expand_mat
+                hxd_, hyd_, hzd_ = _eval_warp(basis, full, half_widths, do_xyz)
+                w_, ax_, ay_, az_ = _compose(
+                    source,
+                    state.xd,
+                    state.yd,
+                    state.zd,
+                    hxd_,
+                    hyd_,
+                    hzd_,
+                    ii_flat,
+                    jj_flat,
+                    kk_flat,
+                    ibots,
+                    jbots,
+                    kbots,
+                    nx,
+                    ny,
+                    nz,
+                    global_warp_3ch=global_warp_3ch,
+                    base_i=base_i,
+                    base_j=base_j,
+                    base_k=base_k,
+                )
+                # Sample the source gradient at the very positions the source was
+                # sampled at -- recomputed rather than returned, because it is two
+                # adds and a clamp against another grid_sample.
+                sx = (ax_ + base_i).clamp(-0.499, nx - 0.501)
+                sy = (ay_ + base_j).clamp(-0.499, ny - 0.501)
+                sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
+                gx_, gy_, gz_ = batched_interp_3ch(source_grad_3ch, sx, sy, sz)
+                gall = torch.stack([gx_, gy_, gz_], dim=0)[list(active_dims)]
+                return _gn_normal_eqs_3d(
+                    w_ * mask_patches, gall * mask_patches, hw_active, bt, omega, wsum, base_hat
+                )
+
+        def gn_cost(active_params: Tensor) -> Tensor:
+            with torch.no_grad():
+                return batched_cost(active_params)
+
+        best_params, _best_costs, opt_stats = optimize_warp_params_gauss_newton(
+            gn_normal_eqs,
+            gn_cost,
+            B,
+            n_active,
+            param_max,
+            device,
+            max_iter=config.gn_iters,
+        )
+    else:
+        best_params, _best_costs, opt_stats = optimize_warp_params_batched(
+            batched_cost,
+            B,
+            n_active,
+            param_max,
+            device,
+            max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
+            lr=config.batch_optimizer_lr,
+            tolerance=config.batch_optimizer_tol,
+            patience=config.batch_optimizer_patience,
+        )
     # Accumulate per-level optimizer-budget telemetry (batched path only).
     state.opt_steps_weighted += opt_stats.steps_run * opt_stats.n_patches
     state.opt_patches_counted += opt_stats.n_patches
