@@ -51,6 +51,7 @@ from fastfuncstuff.cli_utils import (
     setup_device,
     spinner,
 )
+from fastfuncstuff.processing.formwarp import METRICS
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
 from fastfuncstuff.processing.mask import data_coverage_mask
@@ -441,7 +442,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     met = p.add_argument_group("monitoring metric")
     met.add_argument(
         "-metric",
-        choices=("cc", "lpa", "lpc", "pearson", "mse"),
+        # From the shared registry, not a second hand-maintained list: a metric
+        # declared differentiable there is optimisable here by construction.
+        choices=METRICS,
         default="cc",
         help="Metric used to pick the best iterate and detect convergence. The flow "
         "equation drives the update; this decides which iterate to keep.",

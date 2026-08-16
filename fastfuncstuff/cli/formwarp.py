@@ -244,7 +244,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-metric",
         choices=METRICS,
         default="cc",
-        help="Image metric (cc=neighborhood cross-correlation, the SyN default).",
+        help="Image metric. cc=neighborhood cross-correlation (the SyN default); "
+        "lncc is the same thing under its registry name; mse=squared difference "
+        "(same-modality only); ngf=normalized gradient fields and mind/mindssc="
+        "modality-independent neighbourhood descriptors, all three of which are "
+        "invariant to a contrast inversion and so are the cross-modal choices.",
     )
     p.add_argument(
         "-cc_radius",
