@@ -29,10 +29,10 @@ from typing import Any
 import numpy as np
 import torch
 
-from .allcost import build_cost_inputs, evaluate_all_costs
 from .allineate import _voxdims_from_header
 from .io import load_image
 from .mask import automask
+from .metrics import MetricInputs, evaluate_metrics
 from .tuneopt import Observation, SearchSpace, config_key, propose
 from .tunespec import BACKENDS, Recipe, fixed_for, render_command, resolve_tunable
 from .tunestore import TrialStore
@@ -143,10 +143,20 @@ class Referee:
         )
         self.brain = automask(self.base, device=device)
 
-    def score(self, warped: torch.Tensor, field: tuple | None) -> dict[str, Any]:
-        """Score an in-memory result: similarity, then deformation regularity."""
-        inp = build_cost_inputs(self.base, warped, self.weight, self.voxdims, 1.0, "tohd")
-        scores = evaluate_all_costs(inp)
+    def score(
+        self, warped: torch.Tensor, field: tuple | None, panel: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Score an in-memory result: similarity, then deformation regularity.
+
+        Goes through the metric registry rather than the AFNI cost list alone, so
+        the neighbourhood metrics are scored too. The referee holds the volumes,
+        which is exactly what those need and what a flattened cost input cannot
+        provide.
+        """
+        inp = MetricInputs(
+            base=self.base, moving=warped, weight=self.weight, voxdims=self.voxdims, overlap=1.0
+        )
+        scores = evaluate_metrics(inp, panel)
         del inp
 
         grade, reasons, qc = "pass", [], {}
@@ -264,6 +274,9 @@ def run_trial(
     it is what ``reproduce()`` runs, and what a user pastes to get this result
     outside the tool.
     """
+    # Only the recipe's panel is scored, not every metric in the registry. The
+    # neighbourhood metrics are far more expensive than the AFNI functionals, and
+    # scoring a metric that is barred from voting buys nothing.
     prefix = f"{backend}_c{store.config_id(backend, config):04d}.nii.gz"
     cmd = render_command(backend, pair.base, pair.source, prefix, config, recipe)
 
@@ -272,7 +285,7 @@ def run_trial(
         warped, field, levels = DRIVERS[backend](
             referee.base, source, config, recipe, referee.device
         )
-        outcome = referee.score(warped, field)
+        outcome = referee.score(warped, field, recipe.panel())
         outcome["levels"] = [lv.as_dict() for lv in levels]
         del warped, field
     except (RuntimeError, ValueError) as exc:

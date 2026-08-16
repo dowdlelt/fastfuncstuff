@@ -388,10 +388,15 @@ class Recipe:
     backends: tuple[str, ...] = field(default_factory=lambda: tuple(BACKENDS))
 
     def panel(self) -> list[str]:
-        """The functionals allowed to judge fits produced under this recipe."""
-        from .allcost import judge_panel
+        """The metrics allowed to judge fits produced under this recipe.
 
-        return judge_panel(self.optimize, self.contrast, tuple(self.evaluate_exclude))
+        ``grid`` is on because the tuner scores whole volumes, so the
+        neighbourhood metrics (lncc/ngf/mind) are available to it. A caller that
+        only has scattered in-mask values must ask for ``grid=False`` instead.
+        """
+        from .metrics import panel_for
+
+        return panel_for(self.optimize, self.contrast, tuple(self.evaluate_exclude), grid=True)
 
 
 # The **stopping rule**, which is a real choice: it decides when "good enough" has

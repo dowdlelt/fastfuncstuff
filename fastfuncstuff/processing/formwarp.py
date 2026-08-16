@@ -73,7 +73,19 @@ NO_X_DISP = 1
 NO_Y_DISP = 2
 NO_Z_DISP = 4
 
-METRICS = ("cc", "lpa", "lpc", "pearson", "mse")
+# The engine's own short names, plus everything the shared registry declares
+# differentiable. One list, so a metric added to the registry is immediately
+# available to optimise with and not only to score.
+_ENGINE_METRICS = ("cc", "lpa", "lpc", "pearson", "mse")
+
+
+def _all_metrics() -> tuple[str, ...]:
+    from .metrics import differentiable_metrics
+
+    return tuple(dict.fromkeys((*_ENGINE_METRICS, *differentiable_metrics())))
+
+
+METRICS = _all_metrics()
 
 
 @dataclass
@@ -286,6 +298,15 @@ def image_metric(
         return -lpc_correlation(a, b, weight, sigma=lpa_sigma, kernel_type=lpa_kernel)
     if metric == "pearson":
         return -pearson_correlation(a.reshape(-1), b.reshape(-1), weight.reshape(-1))
+    # Anything else is looked up in the shared registry, so a metric declared
+    # differentiable there is optimisable here without being re-listed. Imported
+    # lazily: metrics.py reaches back into this module for the LNCC kernel, and a
+    # module-level import would close the loop.
+    from .metrics import METRICS as _REG
+    from .metrics import differentiable_cost
+
+    if metric in _REG:
+        return differentiable_cost(metric, a, b, weight, cc_radius=cc_radius)
     raise ValueError(f"unknown metric {metric!r}; choose from {METRICS}")
 
 
