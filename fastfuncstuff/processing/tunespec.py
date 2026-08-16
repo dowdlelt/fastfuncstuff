@@ -433,7 +433,12 @@ RECIPES: dict[str, Recipe] = {
         name="MNI_T1",
         describe="T1 to an MNI template: same modality, different brains",
         optimize="lpa",
-        evaluate_exclude=(),
+        # The descriptor metrics are barred from the same-modality juries. They cost
+        # far more to evaluate than the rest of the panel, and what they buy is
+        # invariance to a contrast inversion -- which is worth nothing when both
+        # images are T1s. They stay in the registry and stay available to `-tune`
+        # and to the cross-modal recipe; this is a default, not a verdict on them.
+        evaluate_exclude=("mind", "mindssc"),
         contrast="same",
         pairing="one_base",
         tune=_ALL_REG + _ALL_EFFORT + ("qwarp.hfactor_q", "formwarp.grad_step"),
@@ -470,7 +475,12 @@ RECIPES: dict[str, Recipe] = {
         name="epi2epi",
         describe="BOLD to BOLD: same modality, same brain",
         optimize="lpa",
-        evaluate_exclude=(),
+        # The descriptor metrics are barred from the same-modality juries. They cost
+        # far more to evaluate than the rest of the panel, and what they buy is
+        # invariance to a contrast inversion -- which is worth nothing when both
+        # images are T1s. They stay in the registry and stay available to `-tune`
+        # and to the cross-modal recipe; this is a default, not a verdict on them.
+        evaluate_exclude=("mind", "mindssc"),
         contrast="same",
         pairing="paired",
         tune=_ALL_REG + _ALL_EFFORT + ("optiwarp.max_step", "formwarp.grad_step"),

@@ -941,7 +941,7 @@ class TestGaussNewtonPatchOptimizer:
         from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
 
         base, moving = self._pair()
-        warped, *_ = self._run(use_gauss_newton=True)
+        warped, *_ = self._run(optimizer="gn")
         before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
         after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
         assert after < before
@@ -954,7 +954,7 @@ class TestGaussNewtonPatchOptimizer:
 
         base, _ = self._pair()
         adam, *_ = self._run()
-        gn, *_ = self._run(use_gauss_newton=True)
+        gn, *_ = self._run(optimizer="gn")
         a = evaluate_metrics(MetricInputs(base=base, moving=adam), ["ls"])["ls"]
         g = evaluate_metrics(MetricInputs(base=base, moving=gn), ["ls"])["ls"]
         assert abs(a - g) < 0.15, f"GN diverged from Adam: {g:.4f} vs {a:.4f}"
@@ -964,7 +964,7 @@ class TestGaussNewtonPatchOptimizer:
         from fastfuncstuff.processing.warpqc import regularity_verdict, warp_regularity
 
         base, _ = self._pair()
-        _, xd, yd, zd = self._run(use_gauss_newton=True)
+        _, xd, yd, zd = self._run(optimizer="gn")
         off = [(a - b) // 2 for a, b in zip(xd.shape, base.shape, strict=True)]
         sl = tuple(slice(o, o + s) for o, s in zip(off, base.shape, strict=True))
         qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
@@ -973,8 +973,8 @@ class TestGaussNewtonPatchOptimizer:
     def test_is_deterministic(self):
         import torch
 
-        a = self._run(use_gauss_newton=True)[0]
-        b = self._run(use_gauss_newton=True)[0]
+        a = self._run(optimizer="gn")[0]
+        b = self._run(optimizer="gn")[0]
         assert torch.equal(a, b)
 
     def test_falls_back_to_adam_for_costs_without_a_surrogate(self):
@@ -994,7 +994,7 @@ class TestGaussNewtonPatchOptimizer:
         asked = qwarp(
             base,
             moving,
-            config=QwarpConfig(verb=0, cost_method="mind", minpatch=9, use_gauss_newton=True),
+            config=QwarpConfig(verb=0, cost_method="mind", minpatch=9, optimizer="gn"),
             device=dev,
         )[0]
         assert torch.equal(plain, asked)
@@ -1004,7 +1004,7 @@ class TestGaussNewtonPatchOptimizer:
         it, so the safer route stays the default until the benchmark says otherwise."""
         from fastfuncstuff.processing.warp import QwarpConfig
 
-        assert QwarpConfig().use_gauss_newton is False
+        assert QwarpConfig().optimizer == "adam"
 
 
 class TestGaussNewtonLocalCosts:
@@ -1052,7 +1052,7 @@ class TestGaussNewtonLocalCosts:
         from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
 
         base, moving = self._pair()
-        warped, *_ = self._run(cost, use_gauss_newton=True)
+        warped, *_ = self._run(cost, optimizer="gn")
         before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
         after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
         assert after < before
@@ -1064,7 +1064,7 @@ class TestGaussNewtonLocalCosts:
         base, _ = self._pair()
         a = evaluate_metrics(MetricInputs(base=base, moving=self._run(cost)[0]), ["ls"])["ls"]
         g = evaluate_metrics(
-            MetricInputs(base=base, moving=self._run(cost, use_gauss_newton=True)[0]), ["ls"]
+            MetricInputs(base=base, moving=self._run(cost, optimizer="gn")[0]), ["ls"]
         )["ls"]
         assert abs(a - g) < 0.15, f"{cost}: GN {g:.4f} vs Adam {a:.4f}"
 
@@ -1075,7 +1075,7 @@ class TestGaussNewtonLocalCosts:
         import torch
 
         plain = self._run("lpc")[0]
-        asked = self._run("lpc", use_gauss_newton=True)[0]
+        asked = self._run("lpc", optimizer="gn")[0]
         assert torch.equal(plain, asked)
 
     def test_local_gn_produces_a_sound_warp(self):
@@ -1083,8 +1083,109 @@ class TestGaussNewtonLocalCosts:
         from fastfuncstuff.processing.warpqc import regularity_verdict, warp_regularity
 
         base, _ = self._pair()
-        _, xd, yd, zd = self._run("lpa", use_gauss_newton=True)
+        _, xd, yd, zd = self._run("lpa", optimizer="gn")
         off = [(a - b) // 2 for a, b in zip(xd.shape, base.shape, strict=True)]
         sl = tuple(slice(o, o + s) for o, s in zip(off, base.shape, strict=True))
         qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
         assert regularity_verdict(qc)[0] != "fail"
+
+
+class TestHybridOptimizer:
+    """Gauss-Newton to travel, a short Adam pass to close the surrogate's gap.
+
+    GN optimises a least-squares stand-in; Adam optimises the reported cost. On a
+    real 193^3 fit that difference was worth ls 0.3384 against 0.2977 on pearclp.
+    The hybrid spends a few autograd steps to recover it: lpa 94.8s -> 29.0s at
+    Adam's exact quality (0.3543 vs 0.3541), pearclp 35.5s -> 26.8s at 0.3019.
+    """
+
+    def _pair(self, n=24):
+        import numpy as np
+        import torch
+
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n // 2
+
+        def blob(cx, r, amp=100.0):
+            return (
+                amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))
+            ).astype(np.float32)
+
+        return (
+            torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0)),
+            torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0)),
+        )
+
+    def _ls(self, cost, optimizer):
+        import torch
+
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        warped, *_ = qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, optimizer=optimizer),
+            device=torch.device("cpu"),
+        )
+        return evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+
+    @pytest.mark.parametrize("cost", ["pearclp", "lpa"])
+    def test_hybrid_is_no_worse_than_gauss_newton_alone(self, cost):
+        """The polish starts from GN's answer and only accepts improvements, so it
+        cannot hand back something worse than what it was given."""
+        assert self._ls(cost, "hybrid") <= self._ls(cost, "gn") + 1e-6
+
+    def test_polish_warm_starts_rather_than_restarting(self):
+        """A polish that began from zeros would throw away GN's work and just be a
+        short (and therefore bad) Adam run."""
+        import torch
+
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_batched
+
+        target = torch.tensor([[0.3, -0.2]])
+
+        def cost(p):
+            return ((p - target) ** 2).sum(dim=1)
+
+        cold, _, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=2, lr=0.01
+        )
+        warm, _, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=2, lr=0.01, init=target.clone()
+        )
+        assert float(cost(warm)) < float(cost(cold))
+
+    def test_warm_start_never_returns_worse_than_its_init(self):
+        import torch
+
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_batched
+
+        good = torch.tensor([[0.5, 0.5]])
+
+        def cost(p):
+            return ((p - good) ** 2).sum(dim=1)
+
+        out, costs, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=3, lr=0.5, init=good.clone()
+        )
+        assert float(costs[0]) <= 1e-6
+
+    def test_hybrid_falls_back_where_gauss_newton_does(self):
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        dev = torch.device("cpu")
+        plain = qwarp(
+            base, moving, config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9), device=dev
+        )[0]
+        asked = qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9, optimizer="hybrid"),
+            device=dev,
+        )[0]
+        assert torch.equal(plain, asked)

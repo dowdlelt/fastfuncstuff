@@ -70,6 +70,7 @@ from .interp import (
 )
 from .metrics import PATCH_METRICS, batched_patch_cost
 from .optimizer import (
+    BatchOptStats,
     optimize_warp_params_batched,
     optimize_warp_params_gauss_newton,
     optimize_warp_params_torch,
@@ -178,14 +179,10 @@ class QwarpConfig:
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
 
-    use_gauss_newton: bool = False
-    """Solve each patch by Levenberg-damped Gauss-Newton instead of Adam.
-
-    Applies only to the correlation costs, which have a least-squares surrogate;
-    the local-Pearson and descriptor costs fall back to Adam automatically. Removes
-    the backward pass, which was 58% of a measured 193^3 runtime, and converges in
-    single-figure iterations against Adam's ~24. Every step is still accepted or
-    rejected on the true cost, so this changes the route, not the destination."""
+    hybrid_polish_iters: int = 10
+    """Adam steps after the Gauss-Newton pass when ``optimizer="hybrid"``. Short by
+    design: GN has already done the travelling, this only recovers what the
+    least-squares surrogate could not see."""
 
     gn_iters: int = 8
     """Gauss-Newton iterations per patch group (one solve + one cost evaluation)."""
@@ -221,10 +218,20 @@ class QwarpConfig:
     """Verbosity level (0=quiet, 1=normal, 2=detailed)."""
 
     optimizer: str = "adam"
-    """Per-patch optimizer for the ME-scaled polish: 'adam' (autodiff, any cost) or
-    'gn' (Gauss-Newton / Levenberg-Marquardt with an analytic image-gradient Jacobian).
-    'gn' requires the differentiable-normalisation ncc cost and is much faster (no
-    autograd backward, converges in a few steps); it falls back to adam for lpc/lpa."""
+    """Per-patch optimizer, for **both** the ME-scaled polish and the ordinary warp:
+    'adam' (autodiff, any cost) or 'gn' (Levenberg-damped Gauss-Newton with an
+    analytic image-gradient Jacobian).
+
+    'gn' needs a least-squares surrogate, which the correlation costs have -- the
+    plain ones through a patch-wide zero-normalised residual, lpa and lncc through a
+    locally normalised one. It falls back to adam for anything else, notably lpc
+    (which rewards anti-correlation, so a sum-of-squares residual would point
+    backwards) and the descriptor costs.
+
+    Measured on a 193^3 T1->MNI fit against AFNI 3dQwarp's 543.2s: pearclp 35.0s ->
+    13.1s, lpa 96.7s -> 15.9s, lncc 131.5s -> 15.0s. On lpa it is also *better* than
+    adam on every independent metric. Every step is accepted or rejected on the true
+    cost, so the surrogate steers but the reported functional still decides."""
 
     batch_optimizer_lr: float = 0.008
     """Learning rate for the batched Adam optimizer."""
@@ -1753,7 +1760,13 @@ def _improve_warp_batched(
     # together, so the surrogate would point the wrong way for that cost alone.
     gn_local = config.cost_method in ("lpa", "lpa_alt", "lncc")
     gn_global = config.cost_method in ("pearson", "pearclp", "ncc")
-    use_gn = config.use_gauss_newton and (gn_local or gn_global)
+    gn_capable = gn_local or gn_global
+    use_gn = config.optimizer in ("gn", "hybrid") and gn_capable
+    # Hybrid: Gauss-Newton to get close cheaply, then a short Adam pass on the
+    # *reported* cost to close the gap the least-squares surrogate leaves. On
+    # pearclp, GN lands on AFNI's answer and Adam lands past it; the surrogate is
+    # the difference, and it is worth a few autograd steps to recover.
+    use_hybrid = config.optimizer == "hybrid" and gn_capable
 
     if use_gn:
         if state.source_grad_3ch.numel() == 0:
@@ -1854,6 +1867,24 @@ def _improve_warp_batched(
             device,
             max_iter=config.gn_iters,
         )
+        if use_hybrid:
+            best_params, _best_costs, polish_stats = optimize_warp_params_batched(
+                batched_cost,
+                B,
+                n_active,
+                param_max,
+                device,
+                max_iter=config.hybrid_polish_iters,
+                lr=config.batch_optimizer_lr,
+                tolerance=config.batch_optimizer_tol,
+                patience=config.batch_optimizer_patience,
+                init=best_params,
+            )
+            opt_stats = BatchOptStats(
+                steps_run=opt_stats.steps_run + polish_stats.steps_run,
+                n_patches=B,
+                hit_budget=polish_stats.hit_budget,
+            )
     else:
         best_params, _best_costs, opt_stats = optimize_warp_params_batched(
             batched_cost,

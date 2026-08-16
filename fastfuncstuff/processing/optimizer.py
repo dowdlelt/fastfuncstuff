@@ -168,6 +168,7 @@ def optimize_warp_params_batched(
     tolerance: float = 1e-4,
     patience: int = 5,
     clip_group_size: int | None = None,
+    init: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Optimize parameters for B patches simultaneously using autograd.
 
@@ -185,6 +186,8 @@ def optimize_warp_params_batched(
         tolerance: Per-patch relative-improvement threshold for "stalled".
         patience: Consecutive stalled steps before a patch is considered
             converged. The loop stops only once ALL patches have converged.
+        init: Optional (B, n_params) starting point; zeros (the identity warp) if
+            omitted.
         clip_group_size: If set, clip the gradient norm independently over
             consecutive groups of this many rows (to ``max_norm=1.0`` each),
             instead of one global norm over the whole batch. Used by the
@@ -197,7 +200,16 @@ def optimize_warp_params_batched(
     Returns:
         (best_params, best_costs, stats): (B, n_params), (B,), and budget stats.
     """
-    params = torch.zeros(B, n_params, device=device, dtype=torch.float32, requires_grad=True)
+    # ``init`` warm-starts from another optimiser's answer (the hybrid hands over
+    # Gauss-Newton's). Safe in either direction: the initial point is evaluated
+    # below and only ever replaced by something better, so a polish pass cannot
+    # return worse than what it was given.
+    start = (
+        torch.zeros(B, n_params, device=device, dtype=torch.float32)
+        if init is None
+        else init.detach().clone().to(device=device, dtype=torch.float32)
+    )
+    params = start.requires_grad_(True)
 
     optimizer = torch.optim.Adam([params], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter)
