@@ -722,6 +722,50 @@ def format_iteration_advice(advice: list[IterationAdvice]) -> str:
     return "\n".join(lines)
 
 
+def format_level_gains(store: TrialStore) -> str:
+    """What each pyramid level bought, and what it cost, from the runs already done.
+
+    The finest patch size is not a parameter to compare in series -- it is where a
+    single trajectory stops. A run at minpatch 5 passes through 25, 19, 13 and 9 on
+    its way down, so the cost and benefit of every coarser stopping point is already
+    contained in it. Testing each separately pays for the same coarse levels five
+    times over, and on a 193^3 pair that is 15-27 s/fit at 25 against 137-240 s at
+    the bottom.
+
+    Read the last column: once a level stops buying cost, that is where to stop.
+    """
+    rows: dict[tuple[str, int], list[dict]] = {}
+    for t in store.trials:
+        for lv in t.levels:
+            if "patch" in lv and "cost_before" in lv:
+                rows.setdefault((t.backend, int(lv["patch"])), []).append(lv)
+    if not rows:
+        return "  (no per-level trajectory recorded -- only qwarp reports one)"
+
+    lines = [
+        "  What each pyramid level bought. The levels are one trajectory, not separate",
+        "  settings: a fine run passes through every coarser patch size on the way, so",
+        "  this answers 'how fine is worth it' without running each size separately.",
+        "",
+        f"  {'backend':10s} {'patch':>6s} {'sec':>8s} {'cost gain':>10s} {'gain/sec':>9s} "
+        f"{'patches':>8s} {'n':>4s}",
+        "  " + "-" * 66,
+    ]
+    for (backend, patch), lv in sorted(rows.items(), key=lambda kv: (kv[0][0], -kv[0][1])):
+        sec = statistics.fmean([x["seconds"] for x in lv])
+        gain = statistics.fmean([x["cost_before"] - x["cost_after"] for x in lv])
+        done = statistics.fmean([x.get("patches_done", 0) for x in lv])
+        lines.append(
+            f"  {backend:10s} {patch:6d} {sec:8.1f} {gain:10.5f} "
+            f"{(gain / sec if sec else 0):9.5f} {done:8.0f} {len(lv):4d}"
+        )
+    lines += [
+        "",
+        "  A level with a near-zero gain is one the trajectory could have stopped above.",
+    ]
+    return "\n".join(lines)
+
+
 def format_export(store: TrialStore, recipe: str, subjects: str = "") -> str:
     """The run's conclusion as ``Preset`` source, ready to paste into tunespec.
 

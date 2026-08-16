@@ -51,6 +51,12 @@ class ParamSpec:
     attr: str = ""
     # "x" renders a tuple schedule as 100x70x40 for the command line.
     fmt: str = ""
+    # Hard (min, max) the adaptive search may never expand past, independent of
+    # the listed grid. A magnitude gets a zero floor for free; this is for the
+    # knobs where going further is *meaningless* rather than merely unusual --
+    # below minpatch 5 an 8-voxel patch carries 24 cubic parameters, so the fit is
+    # underdetermined and "passes" only because the box constraint bounds it.
+    bounds: tuple[float | None, float | None] = (None, None)
 
     @property
     def config_attr(self) -> str:
@@ -122,7 +128,11 @@ QWARP = BackendSpec(
             (5, 9, 13, 19, 25),
             13,
             "schedule",
-            "Finest patch size in voxels; smaller resolves more detail.",
+            "Finest patch size in voxels; smaller resolves more detail -- and costs "
+            "sharply more: measured 15-27 s/fit at 25 against 137-240 s at 2-5 on a "
+            "193^3 pair. Floored at AFNI's 5; below that the patch has fewer voxels "
+            "than the basis has parameters.",
+            bounds=(5, None),
         ),
         ParamSpec(
             "qwarp.workhard",

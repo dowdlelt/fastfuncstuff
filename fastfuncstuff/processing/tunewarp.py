@@ -84,8 +84,22 @@ def _run_qwarp(base, source, config, recipe, device):
     if recipe is not None:
         cfg.cost_method = "pearclp" if recipe.optimize == "ls" else recipe.optimize
     _apply_config(cfg, "qwarp", config)
-    warped, xd, yd, zd = qwarp(base, source, config=cfg, device=device)
-    return warped, (xd, yd, zd), []
+    # The pyramid levels are a trajectory: a run at minpatch 5 passes through every
+    # coarser patch size on the way. Recording what each level cost and bought means
+    # one run answers "was going finer worth it?" for all of them.
+    levels: list[dict] = []
+    warped, xd, yd, zd = qwarp(base, source, config=cfg, device=device, level_log=levels)
+    return warped, (xd, yd, zd), [_QwarpLevel(lv) for lv in levels]
+
+
+class _QwarpLevel:
+    """Adapts a qwarp level record to the ``.as_dict()`` the trial store expects."""
+
+    def __init__(self, rec: dict):
+        self._rec = rec
+
+    def as_dict(self) -> dict:
+        return dict(self._rec)
 
 
 def _run_formwarp(base, source, config, recipe, device):

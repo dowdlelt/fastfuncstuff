@@ -46,6 +46,7 @@ from fastfuncstuff.processing.tunestore import (
     format_importance,
     format_iteration_advice,
     format_knob_effects,
+    format_level_gains,
     format_reproduce,
     format_results_table,
     format_runs,
@@ -386,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
                 raise SystemExit("-export needs -type, since a preset is keyed by recipe")
             print(format_export(store, args.recipe))
         if args.convergence:
+            print(format_level_gains(store))
+            print()
             print(format_iteration_advice(recommend_iterations(store)))
             print()
             print(format_convergence(store))

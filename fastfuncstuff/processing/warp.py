@@ -325,6 +325,14 @@ class WarpState:
     patches_skipped: int = 0
     last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
 
+    # One entry per pyramid level: patch size, the cost either side of it, how long
+    # it took, and how many patches ran. Recorded because the levels are a
+    # *trajectory*, not independent settings -- a run at minpatch 5 passes through
+    # 25, 19, 13 and 9 on the way down, so one run already contains the answer to
+    # "was going finer worth it?" that testing each minpatch separately pays for
+    # five times over. See `qwarp_level_gains`.
+    level_log: list[dict] = field(default_factory=list)
+
     # Gradient of the (unchanging) source volume, stacked (3, nz, ny, nx). Built on
     # first use by the Gauss-Newton path and kept, because it is the same for every
     # patch of every level and rebuilding it per phase would cost more than the
@@ -382,8 +390,13 @@ def qwarp(
     config: QwarpConfig | None = None,
     device: torch.device | None = None,
     pad: bool = True,
+    level_log: list[dict] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute nonlinear warp from source to base image.
+
+    ``level_log``, if given, is filled with one record per pyramid level: patch
+    size, the cost either side of it, and how long it took. An out-parameter rather
+    than a fifth return value so existing callers are untouched.
 
     This is the main entry point, equivalent to IW3D_warp_s2bim().
 
@@ -487,6 +500,8 @@ def qwarp(
         _warpomatic_pyramid(base_p, source_p, weight_p, mask_p, state, config, device)
     else:
         _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
+    if level_log is not None:
+        level_log.extend(state.level_log)
 
     # Final warped image: apply warp to unpadded source, crop to original size.
     # Single pass through the total warp; final_interp (wsinc5 by default, like
@@ -1356,8 +1371,19 @@ def _warpomatic(
                     print(f"  {msg}")
             break
 
+        elapsed = time.time() - t0
+        state.level_log.append(
+            {
+                "level": lev,
+                "patch": int(xwid),
+                "cost_before": float(cost_at_start),
+                "cost_after": float(state.cost),
+                "seconds": float(elapsed),
+                "patches_done": int(state.patches_done),
+                "patches_skipped": int(state.patches_skipped),
+            }
+        )
         if config.verb >= 1:
-            elapsed = time.time() - t0
             # Optimizer-budget readout: mean Adam steps/patch and the share of
             # patches that were still improving when they hit the iter cap (a high
             # % means raising -batch_iters would buy more warp).

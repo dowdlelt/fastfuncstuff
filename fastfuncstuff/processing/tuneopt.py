@@ -68,15 +68,15 @@ class Axis:
     def from_param(cls, p: ParamSpec) -> Axis:
         vals = list(p.values)
         numeric = all(_is_numeric(v) for v in vals)
-        lo = None
+        lo, hi = p.bounds
         if numeric:
             vals = sorted(vals)
             # A knob whose grid never goes negative is a magnitude (a variance, a
             # step size, a count), so zero is the floor rather than a value the
             # ladder should walk past into nonsense.
-            if min(vals) >= 0:
+            if lo is None and min(vals) >= 0:
                 lo = 0.0
-        return cls(key=p.key, values=vals, numeric=numeric, lo=lo)
+        return cls(key=p.key, values=vals, numeric=numeric, lo=lo, hi=hi)
 
     def grow(self, direction: int) -> bool:
         """Extend the ladder one step down (-1) or up (+1). True if it changed.

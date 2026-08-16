@@ -205,3 +205,96 @@ class TestKnobImportance:
 
     def test_says_so_when_nothing_varied(self, tmp_path):
         assert "nothing varied" in format_importance([])
+
+
+class TestLevelTrajectory:
+    """The pyramid levels are one trajectory, not independent settings.
+
+    A qwarp run at minpatch 5 passes through 25, 19, 13 and 9 on the way down, so
+    one run already contains what each coarser stopping point cost and bought.
+    Comparing minpatch values in series re-runs the same coarse levels every time,
+    and on a 193^3 pair that is 15-27 s/fit at 25 against 137-240 s at the bottom.
+    """
+
+    def _store(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import TrialStore
+
+        s = TrialStore(tmp_path / "t.json")
+        levels = [
+            {
+                "level": 1,
+                "patch": 25,
+                "cost_before": -0.40,
+                "cost_after": -0.55,
+                "seconds": 4.0,
+                "patches_done": 8,
+                "patches_skipped": 0,
+            },
+            {
+                "level": 2,
+                "patch": 13,
+                "cost_before": -0.55,
+                "cost_after": -0.60,
+                "seconds": 8.0,
+                "patches_done": 30,
+                "patches_skipped": 2,
+            },
+            {
+                "level": 3,
+                "patch": 5,
+                "cost_before": -0.60,
+                "cost_after": -0.601,
+                "seconds": 60.0,
+                "patches_done": 900,
+                "patches_skipped": 40,
+            },
+        ]
+        s.add("qwarp", "s1", {"minpatch": 5}, [], levels=levels, scores={"consensus": 1.0})
+        return s
+
+    def test_reports_gain_and_cost_per_level(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import format_level_gains
+
+        text = format_level_gains(self._store(tmp_path))
+        assert "25" in text and "13" in text and "5" in text
+        assert "gain/sec" in text
+
+    def test_a_level_that_bought_nothing_is_visible(self, tmp_path):
+        """The finest level here gains 0.001 for 60s -- the trajectory should have
+        stopped above it, and the table has to make that legible."""
+        from fastfuncstuff.processing.tunestore import format_level_gains
+
+        text = format_level_gains(self._store(tmp_path))
+        line = next(ln for ln in text.splitlines() if " 5 " in ln and "60.0" in ln)
+        assert "0.00100" in line or "0.001" in line
+
+    def test_says_so_when_no_trajectory_was_recorded(self, tmp_path):
+        from fastfuncstuff.processing.tunestore import TrialStore, format_level_gains
+
+        s = TrialStore(tmp_path / "t.json")
+        s.add("formwarp", "s1", {}, [], scores={"consensus": 1.0})
+        assert "no per-level trajectory" in format_level_gains(s)
+
+
+class TestExpansionBounds:
+    def test_minpatch_cannot_expand_below_afnis_floor(self):
+        """Below 5 an 8-voxel patch carries 24 cubic parameters: underdetermined,
+        and it 'passes' only because the box constraint bounds it. It is also where
+        the cost explodes -- 137-240 s/fit against 15-27 at minpatch 25."""
+        from fastfuncstuff.processing.tuneopt import Axis
+        from fastfuncstuff.processing.tunespec import find_param
+
+        axis = Axis.from_param(find_param("qwarp.minpatch"))
+        assert axis.lo == 5
+        for _ in range(5):
+            axis.grow(-1)
+        assert min(axis.values) == 5
+
+    def test_an_unbounded_knob_still_expands_freely(self):
+        from fastfuncstuff.processing.tuneopt import Axis
+        from fastfuncstuff.processing.tunespec import find_param
+
+        axis = Axis.from_param(find_param("optiwarp.total_sigma"))
+        before = max(axis.values)
+        assert axis.grow(+1)
+        assert max(axis.values) > before
