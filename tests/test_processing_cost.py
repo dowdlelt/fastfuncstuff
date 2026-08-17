@@ -11,6 +11,7 @@ from fastfuncstuff.processing.cost import (
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
+    _smoothed_weighted_moments_3d,
     auto_box_radius,
     batched_lpa_cost,
     clipped_pearson_correlation,
@@ -211,6 +212,30 @@ class TestSeparableSmooth3D:
         torch.testing.assert_close(
             packed_input.grad, reference_input.grad, atol=1e-5, rtol=1e-5
         )
+
+    def test_packed_weighted_moments_match_individual_filters_and_gradients(self):
+        torch.manual_seed(14)
+        x = torch.randn(7, 9, 11, device=DEV)
+        packed_y = torch.randn(7, 9, 11, device=DEV, requires_grad=True)
+        reference_y = packed_y.detach().clone().requires_grad_(True)
+        weight = torch.rand(7, 9, 11, device=DEV)
+
+        packed = _smoothed_weighted_moments_3d(x, packed_y, weight, 1.5, "gauss")
+        reference_inputs = (
+            weight,
+            weight * x,
+            weight * reference_y,
+            weight * x * x,
+            weight * reference_y * reference_y,
+            weight * x * reference_y,
+        )
+        reference = tuple(_separable_smooth_3d(v, 1.5) for v in reference_inputs)
+
+        for actual, expected in zip(packed, reference, strict=True):
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        sum(v.square().sum() for v in packed).backward()
+        sum(v.square().sum() for v in reference).backward()
+        torch.testing.assert_close(packed_y.grad, reference_y.grad, atol=1e-5, rtol=1e-5)
 
     def test_box_kernel(self):
         vol = torch.randn(8, 10, 12, device=DEV)

@@ -248,12 +248,29 @@ def _separable_smooth_3d(
     return vol
 
 
+def _smoothed_weighted_moments_3d(
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Filter the six weighted local-correlation moments as one channel bank."""
+    moments = torch.stack(
+        (weight, weight * x, weight * y, weight * x * x, weight * y * y, weight * x * y)
+    )[None]
+    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
+    return tuple(smoothed.unbind(0))  # type: ignore[return-value]
+
+
 def lpa_correlation(
     base: Tensor,
     source: Tensor,
     weight: Tensor | None = None,
     sigma: float = 4.0,
     kernel_type: str = "gauss",
+    *,
+    pack_moments: bool = False,
 ) -> Tensor:
     """Compute Local Pearson Absolute (LPA) correlation.
 
@@ -286,17 +303,17 @@ def lpa_correlation(
     x = base
     y = source
 
-    def _sm(v: Tensor) -> Tensor:
-        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
+    if pack_moments:
+        sw, swx, swy, swxx, swyy, swxy = _smoothed_weighted_moments_3d(
+            x, y, w, sigma, kernel_type
+        )
+    else:
+        def _sm(v: Tensor) -> Tensor:
+            return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    # Smoothed weighted statistics (all as 3D volumes)
-    sw = _sm(w).clamp(min=1e-10)
-
-    swx = _sm(w * x)
-    swy = _sm(w * y)
-    swxx = _sm(w * x * x)
-    swyy = _sm(w * y * y)
-    swxy = _sm(w * x * y)
+        sw, swx, swy = _sm(w), _sm(w * x), _sm(w * y)
+        swxx, swyy, swxy = _sm(w * x * x), _sm(w * y * y), _sm(w * x * y)
+    sw = sw.clamp(min=1e-10)
 
     # Local means
     mx = swx / sw
@@ -328,6 +345,8 @@ def lpc_correlation(
     weight: Tensor | None = None,
     sigma: float = 4.0,
     kernel_type: str = "gauss",
+    *,
+    pack_moments: bool = False,
 ) -> Tensor:
     """Compute Local Pearson Correlation (LPC) for cross-modality alignment.
 
@@ -358,16 +377,17 @@ def lpc_correlation(
     x = base
     y = source
 
-    def _sm(v: Tensor) -> Tensor:
-        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
+    if pack_moments:
+        sw, swx, swy, swxx, swyy, swxy = _smoothed_weighted_moments_3d(
+            x, y, w, sigma, kernel_type
+        )
+    else:
+        def _sm(v: Tensor) -> Tensor:
+            return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    sw = _sm(w).clamp(min=1e-10)
-
-    swx = _sm(w * x)
-    swy = _sm(w * y)
-    swxx = _sm(w * x * x)
-    swyy = _sm(w * y * y)
-    swxy = _sm(w * x * y)
+        sw, swx, swy = _sm(w), _sm(w * x), _sm(w * y)
+        swxx, swyy, swxy = _sm(w * x * x), _sm(w * y * y), _sm(w * x * y)
+    sw = sw.clamp(min=1e-10)
 
     mx = swx / sw
     my = swy / sw

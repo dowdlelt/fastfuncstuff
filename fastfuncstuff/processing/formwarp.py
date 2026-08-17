@@ -293,9 +293,23 @@ def image_metric(
     if metric == "mse":
         return (weight * (a - b) ** 2).sum() / weight.sum().clamp(min=_EPS)
     if metric == "lpa":
-        return -lpa_correlation(a, b, weight, sigma=lpa_sigma, kernel_type=lpa_kernel)
+        return -lpa_correlation(
+            a,
+            b,
+            weight,
+            sigma=lpa_sigma,
+            kernel_type=lpa_kernel,
+            pack_moments=True,
+        )
     if metric == "lpc":
-        return -lpc_correlation(a, b, weight, sigma=lpa_sigma, kernel_type=lpa_kernel)
+        return -lpc_correlation(
+            a,
+            b,
+            weight,
+            sigma=lpa_sigma,
+            kernel_type=lpa_kernel,
+            pack_moments=True,
+        )
     if metric == "pearson":
         return -pearson_correlation(a.reshape(-1), b.reshape(-1), weight.reshape(-1))
     # Anything else is looked up in the shared registry, so a metric declared
