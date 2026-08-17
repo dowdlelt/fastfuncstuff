@@ -35,6 +35,7 @@ from fastfuncstuff.processing.warpqc import (
     FAIL,
     format_warpqc,
     pad_mask_to_field,
+    regularity_cautions,
     regularity_verdict,
     remedies,
     warp_regularity,
@@ -136,16 +137,18 @@ def main(argv: list[str] | None = None) -> int:
             qc,
             args.max_neg_voxels,
             args.max_neg_frac,
-            args.min_jac,
-            args.max_jac,
             args.marginal_neg_frac,
         )
+        # Reported, never graded on: an extreme Jacobian is unusual anatomy, not
+        # broken anatomy. See regularity_cautions.
+        cautions = regularity_cautions(qc, args.min_jac, args.max_jac)
         worst_ok = worst_ok and grade != FAIL
         results[Path(path).name] = {
             **qc.as_dict(),
             "grade": grade,
             "reasons": reasons,
-            "remedies": remedies(reasons),
+            "cautions": cautions,
+            "remedies": remedies(reasons + cautions),
         }
         if args.verb >= 1:
             print(format_warpqc(qc, Path(path).name))

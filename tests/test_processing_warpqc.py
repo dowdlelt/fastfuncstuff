@@ -6,6 +6,9 @@ import torch
 from fastfuncstuff.processing.warpqc import (
     FAIL,
     MARGINAL,
+    UNCONSTRAINED_MARGIN,
+    gate_margin,
+    regularity_cautions,
     PASS,
     regularity_verdict,
     remedies,
@@ -56,10 +59,31 @@ class TestJacobian:
         assert grade == FAIL
         assert any("folding" in r for r in reasons)
 
-    def test_over_expansion_is_caught(self):
-        grade, reasons = regularity_verdict(warp_regularity(*_ramp(5.0)))
+    def test_over_expansion_is_a_caution_not_a_verdict(self):
+        """An extreme Jacobian is unusual anatomy, not impossible anatomy.
+
+        Heads differ in shape and ventricles vary enormously, so a percentile
+        past an arbitrary bound is worth saying out loud and not worth vetoing —
+        unlike folding, which no head does at all.
+        """
+        qc = warp_regularity(*_ramp(5.0))
+        grade, reasons = regularity_verdict(qc)
+        assert grade == PASS and reasons == []
+        assert any("over-expansion" in c for c in regularity_cautions(qc))
+
+    def test_a_caution_never_masks_a_fold(self):
+        """Both tripped at once must still fail: the rule outranks the notice."""
+        qc = warp_regularity(*_ramp(-1.5))
+        grade, reasons = regularity_verdict(qc)
         assert grade == FAIL
-        assert any("over-expansion" in r for r in reasons)
+        assert any("folding" in r for r in reasons)
+        assert regularity_cautions(qc)  # still reported, just not why it failed
+
+    def test_clearance_ignores_the_cautions_it_reports(self):
+        """A warp can be heavily compressed and still be nowhere near failing."""
+        qc = warp_regularity(*_ramp(5.0))
+        assert regularity_cautions(qc)  # extreme
+        assert gate_margin(qc) == UNCONSTRAINED_MARGIN  # ... and nothing folded
 
 
 class TestNegativeTolerance:

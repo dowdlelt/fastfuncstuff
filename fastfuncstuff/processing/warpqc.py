@@ -205,8 +205,6 @@ def regularity_verdict(
     qc: WarpQC,
     max_neg_voxels: int = DEFAULT_MAX_NEG_VOXELS,
     max_neg_frac: float = DEFAULT_MAX_NEG_FRAC,
-    min_jac: float = DEFAULT_MIN_JAC,
-    max_jac: float = DEFAULT_MAX_JAC,
     marginal_neg_frac: float = DEFAULT_MARGINAL_NEG_FRAC,
 ) -> tuple[str, list[str]]:
     """Grade a warp's regularity: returns (``pass``/``marginal``/``fail``, reasons).
@@ -217,14 +215,16 @@ def regularity_verdict(
     thing we have seen and it is nearly sound — push regularization up a notch
     and re-fit, rather than throwing it away.
 
+    **Only folding can fail.** The dividing line is whether a criterion states
+    something anatomy cannot do or merely something it rarely does. Tissue cannot
+    turn inside out, so a folded field is wrong whatever it scores. Everything
+    else here is a threshold on a continuum with real anatomical variation on both
+    sides, and a threshold like that earns a caution, not a veto.
+
     That is the general shape of these failures. Every one of them is fixed by a
     knob the search is already walking, so a bad grade is a **direction**, not
-    just a veto — see :data:`REMEDY`.
-
-    The Jacobian bounds are checked at the 1st/99th percentile rather than the
-    extremes, so one pathological voxel does not veto an otherwise sound warp,
-    while a genuinely over-warped field — which distorts whole regions — moves
-    the percentiles.
+    just a veto — see :data:`REMEDY`. For the bounds that no longer grade, see
+    :func:`regularity_cautions`.
     """
     reasons: list[str] = []
     grade = PASS
@@ -238,16 +238,59 @@ def regularity_verdict(
         # Localised folding is recoverable; widespread folding is not.
         grade = MARGINAL if qc.jac_neg_frac <= marginal_neg_frac else FAIL
 
-    # A Jacobian percentile out of bounds is systematic distortion across whole
-    # regions, not a local defect, so it is never merely marginal.
-    if qc.jac_p01 < min_jac:
-        reasons.append(f"over-compression: 1st pct det(J) = {qc.jac_p01:.3f} < {min_jac}")
-        grade = FAIL
-    if qc.jac_p99 > max_jac:
-        reasons.append(f"over-expansion: 99th pct det(J) = {qc.jac_p99:.3f} > {max_jac}")
-        grade = FAIL
-
     return grade, reasons
+
+
+def regularity_cautions(
+    qc: WarpQC,
+    min_jac: float = DEFAULT_MIN_JAC,
+    max_jac: float = DEFAULT_MAX_JAC,
+) -> list[str]:
+    """Things worth saying about a warp that do not make it wrong.
+
+    Extreme-but-positive Jacobians live here rather than in the verdict. A det(J)
+    of 0.2 is *unusual*, not impossible: heads are different shapes and ventricles
+    vary enormously between people, so a fifth of the volume across one percent of
+    the brain is plausible anatomy meeting a constant nobody derived. Measured on
+    T1->MNI, this bound alone condemned 67 of 435 warps that had not a single
+    folded voxel between them -- and the settings it condemned were the ones that
+    matched the template best.
+
+    Saying it out loud still matters. The field is working hard somewhere, the
+    percentile makes that regional rather than one bad voxel, and it is the
+    direction the search is being pulled in. It just does not get a veto.
+    """
+    out = []
+    if qc.jac_p01 < min_jac:
+        out.append(f"over-compression: 1st pct det(J) = {qc.jac_p01:.3f} < {min_jac}")
+    if qc.jac_p99 > max_jac:
+        out.append(f"over-expansion: 99th pct det(J) = {qc.jac_p99:.3f} > {max_jac}")
+    return out
+
+
+def gate_margin(
+    qc: WarpQC,
+    max_neg_voxels: int = DEFAULT_MAX_NEG_VOXELS,
+    max_neg_frac: float = DEFAULT_MAX_NEG_FRAC,
+) -> float:
+    """Distance to the only thing that can actually fail a warp: folding.
+
+    Deliberately narrower than :func:`regularity_margin`, and the two answer
+    different questions. That one includes the Jacobian cautions because the
+    *searcher* needs to feel them coming; this one includes only the criterion
+    that decides pass/fail, because a config's clearance has to be measured
+    against the line it can actually be rejected at. Measuring clearance on a
+    criterion that no longer gates would demote exactly the warps that were just
+    ruled acceptable.
+
+    A field with nothing folded is as clear as clear gets, so it returns the
+    saturation value rather than a number that would invite comparing two clean
+    warps on how nearly they folded.
+    """
+    if qc.jac_neg_count == 0:
+        return UNCONSTRAINED_MARGIN
+    neg_budget = max(max_neg_voxels, max_neg_frac * qc.n_voxels)
+    return max(-MARGIN_LIMIT, math.log((neg_budget + 1.0) / (qc.jac_neg_count + 1.0)))
 
 
 def regularity_margin(
@@ -257,7 +300,15 @@ def regularity_margin(
     min_jac: float = DEFAULT_MIN_JAC,
     max_jac: float = DEFAULT_MAX_JAC,
 ) -> float:
-    """How much room a warp has before it fails: > 0 passes, <= 0 does not.
+    """How much room a warp has before it trips a criterion: > 0 is clear of all of
+    them, <= 0 is not.
+
+    Note this is *not* the same line as :func:`regularity_verdict`'s pass/fail:
+    only folding fails there, while the margin keeps measuring distance to the
+    Jacobian bounds too. A field can be MARGINAL for over-compression and still be
+    the one to ship. Kept that way on purpose — the searcher needs to feel the
+    bounds approaching to steer away from them, and dropping them from the margin
+    would make it blind to exactly the direction the cautions warn about.
 
     :func:`regularity_verdict` answers the question a user asks; this answers the
     question a *searcher* asks. A pass/fail label says only which side of the
