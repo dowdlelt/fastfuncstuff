@@ -104,9 +104,10 @@ class BackendSpec:
 
 
 # --- qwarp ------------------------------------------------------------------
-# Cost lives in the coarse levels, not the fine ones: -minpatch buys much less
-# time back than you would expect (measured 45.0s vs 45.7s), so schedule knobs
-# here are about quality, not speed.
+# Under the Gauss-Newton solver the fine levels are half the fit: measured on a
+# 193^3 T1->MNI pair, 25.1 s/fit at -minpatch 25 against 44.9 at 5. (The earlier
+# note here claimed 45.0 vs 45.7 and predates the solver change.) That time is
+# not detail-resolving -- see the -minpatch docstring for what it actually buys.
 
 QWARP = BackendSpec(
     name="qwarp",
@@ -128,10 +129,15 @@ QWARP = BackendSpec(
             (5, 9, 13, 19, 25),
             13,
             "schedule",
-            "Finest patch size in voxels; smaller resolves more detail -- and costs "
-            "sharply more: measured 15-27 s/fit at 25 against 137-240 s at 2-5 on a "
-            "193^3 pair. Floored at AFNI's 5; below that the patch has fewer voxels "
-            "than the basis has parameters.",
+            "Finest patch size in voxels. NOT simply 'smaller resolves more detail': "
+            "on a 193^3 T1->MNI grid (5 subjects x 3 hfactor_q, every fit) the levels "
+            "from 19 to 13 over-COMPRESS the field -- 1st pct det(J) falls 0.274 -> "
+            "0.200, under the 0.25 gate -- and the levels below 9 relax it back to "
+            "0.274, trading image match for regularity (lncc -0.677 at 13, -0.634 at "
+            "5). Stopping anywhere in 19..9 failed on 15 of 15 fits; 25 and 5 passed "
+            "on 15 of 15. Run the fine levels or stop above them, never between. "
+            "Floored at AFNI's 5; below that the patch has fewer voxels than the "
+            "basis has parameters.",
             bounds=(5, None),
         ),
         ParamSpec(
