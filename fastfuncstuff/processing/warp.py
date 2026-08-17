@@ -34,6 +34,7 @@ from torch import Tensor
 
 from .._compile import safe_compile
 from ..memory import plan_nonlinear_memory
+from ..utils import _prefers_cuda_batching
 
 try:
     from tqdm import tqdm as _tqdm
@@ -1507,16 +1508,21 @@ def _warpomatic(
 # ---------------------------------------------------------------------------
 
 
-def _gn_steepest_descent_images(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
-    """Assemble direction-major GN Jacobian columns without list-plus-cat copies."""
-    if g.device.type == "cpu":
-        return torch.cat(
-            [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(g.shape[0])], dim=-1
-        )
+def _gn_steepest_descent_images_broadcast(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
+    """Broadcast direction-major GN Jacobian columns on any tensor device."""
     d, b, v = g.shape
     nb = bt.shape[1]
     scaled = (hw * g).permute(1, 2, 0).unsqueeze(-1) * bt[None, :, None, :]
     return scaled.reshape(b, v, d * nb)
+
+
+def _gn_steepest_descent_images(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
+    """Assemble direction-major GN Jacobian columns using the measured device path."""
+    if _prefers_cuda_batching(g.device):
+        return _gn_steepest_descent_images_broadcast(g, hw, bt)
+    return torch.cat(
+        [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(g.shape[0])], dim=-1
+    )
 
 
 def _gn_normal_eqs_3d(

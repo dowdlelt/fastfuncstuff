@@ -21,7 +21,7 @@ from fastfuncstuff.processing.warp import (
     _filter_patches,
     _generate_patch_grid,
     _get_basis_config,
-    _gn_steepest_descent_images,
+    _gn_steepest_descent_images_broadcast,
     _maybe_compile,
     _pad_volume,
 )
@@ -38,7 +38,7 @@ def test_gn_steepest_descent_images_matches_direction_major_cat(n_dims):
     expected = torch.cat(
         [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(n_dims)], dim=-1
     )
-    actual = _gn_steepest_descent_images(g, hw, bt)
+    actual = _gn_steepest_descent_images_broadcast(g, hw, bt)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 

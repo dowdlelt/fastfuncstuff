@@ -47,6 +47,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from fastfuncstuff.memory import plan_nonlinear_memory
+from fastfuncstuff.utils import _prefers_cuda_batching
 
 try:
     from tqdm import tqdm as _tqdm
@@ -54,9 +55,9 @@ except ImportError:  # pragma: no cover - tqdm is a hard dep in practice
     _tqdm = None
 
 from .cost import (
+    _packed_lpa_correlation,
+    _packed_lpc_correlation,
     _separable_smooth_3d,
-    lpa_correlation,
-    lpc_correlation,
     pearson_correlation,
 )
 from .interp import (
@@ -298,23 +299,9 @@ def image_metric(
     if metric == "mse":
         return (weight * (a - b) ** 2).sum() / weight.sum().clamp(min=_EPS)
     if metric == "lpa":
-        return -lpa_correlation(
-            a,
-            b,
-            weight,
-            sigma=lpa_sigma,
-            kernel_type=lpa_kernel,
-            pack_moments=True,
-        )
+        return -_packed_lpa_correlation(a, b, weight, lpa_sigma, lpa_kernel)
     if metric == "lpc":
-        return -lpc_correlation(
-            a,
-            b,
-            weight,
-            sigma=lpa_sigma,
-            kernel_type=lpa_kernel,
-            pack_moments=True,
-        )
+        return -_packed_lpc_correlation(a, b, weight, lpa_sigma, lpa_kernel)
     if metric == "pearson":
         return -pearson_correlation(a.reshape(-1), b.reshape(-1), weight.reshape(-1))
     # Anything else is looked up in the shared registry, so a metric declared
@@ -438,38 +425,27 @@ def invert_displacement_field(
     return ex, ey, ez
 
 
-def _invert_displacement_field_pair(
+def _invert_displacement_field_pair_batched(
     first: Field,
     second: Field,
     n_iter: int = 8,
     voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> tuple[Field, Field]:
-    """Invert two independent fields in one sampling stream on CUDA.
-
-    The CPU grid sampler does not benefit from a batch of two, so retain the scalar
-    implementation there. CUDA pays substantial fixed launch and grid-construction
-    overhead per fixed-point step; using grid_sample's native batch dimension removes
-    half of those launches without coupling the two inversions mathematically.
-    """
-    if first[0].device.type != "cuda":
-        return (
-            invert_displacement_field(*first, n_iter=n_iter, voxel_grid=voxel_grid),
-            invert_displacement_field(*second, n_iter=n_iter, voxel_grid=voxel_grid),
-        )
-
+    """Invert two independent fields through one batched sampling stream."""
     nz, ny, nx = first[0].shape
     device = first[0].device
     if voxel_grid is None:
         kk, jj, ii = torch.meshgrid(
-            torch.arange(nz, dtype=torch.float32, device=device),
-            torch.arange(ny, dtype=torch.float32, device=device),
-            torch.arange(nx, dtype=torch.float32, device=device),
+            torch.arange(nz, dtype=first[0].dtype, device=device),
+            torch.arange(ny, dtype=first[0].dtype, device=device),
+            torch.arange(nx, dtype=first[0].dtype, device=device),
             indexing="ij",
         )
     else:
         kk, jj, ii = voxel_grid
 
     fields = torch.stack((torch.stack(first), torch.stack(second)))
+    kk, jj, ii = (coord.to(dtype=fields.dtype) for coord in (kk, jj, ii))
     ex, ey, ez = -fields[:, 0], -fields[:, 1], -fields[:, 2]
     for _ in range(n_iter):
         sx = (ii.unsqueeze(0) + ex).reshape(2, 1, -1)
@@ -481,6 +457,21 @@ def _invert_displacement_field_pair(
         ez = -dz.reshape(2, nz, ny, nx)
 
     return (ex[0], ey[0], ez[0]), (ex[1], ey[1], ez[1])
+
+
+def _invert_displacement_field_pair(
+    first: Field,
+    second: Field,
+    n_iter: int = 8,
+    voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
+) -> tuple[Field, Field]:
+    """Invert two fields using the measured implementation for their device."""
+    if _prefers_cuda_batching(first[0].device):
+        return _invert_displacement_field_pair_batched(first, second, n_iter, voxel_grid)
+    return (
+        invert_displacement_field(*first, n_iter=n_iter, voxel_grid=voxel_grid),
+        invert_displacement_field(*second, n_iter=n_iter, voxel_grid=voxel_grid),
+    )
 
 
 # ---------------------------------------------------------------------------

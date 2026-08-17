@@ -768,8 +768,12 @@ def estimate_nonlinear_memory_bytes(
     voxels = int(shape[0] * shape[1] * shape[2])
     if engine == "formwarp":
         # Images/weights, four forward/inverse 3-channel fields, best snapshots,
-        # autograd leaves/gradients, warped midpoints, and smoothing scratch.
-        volume_equivalents = 40
+        # autograd leaves/gradients, warped midpoints, and backend convolution
+        # workspaces. Measured at 193x229x193 on CUDA: packed LPA peaked at 5.82
+        # GiB (183 equivalents) and box CC at 7.66 GiB (241 equivalents). Model
+        # the larger branch with a small margin; tensor-live counts alone badly
+        # underpredict the allocator peak because they omit backend workspaces.
+        volume_equivalents = 250
     elif engine == "optiwarp":
         # Images/weights, forward/best/update fields, gradients, composition,
         # Jacobian and smoothing scratch. LK is the largest force model.

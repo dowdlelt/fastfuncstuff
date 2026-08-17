@@ -260,7 +260,65 @@ def _smoothed_weighted_moments_3d(
         (weight, weight * x, weight * y, weight * x * x, weight * y * y, weight * x * y)
     )[None]
     smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
-    return tuple(smoothed.unbind(0))  # type: ignore[return-value]
+    return smoothed[0], smoothed[1], smoothed[2], smoothed[3], smoothed[4], smoothed[5]
+
+
+def _local_pearson_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+) -> Tensor:
+    """Build the local Pearson field from already-filtered weighted moments."""
+    sw, swx, swy, swxx, swyy, swxy = moments
+    sw = sw.clamp(min=1e-10)
+    mx = swx / sw
+    my = swy / sw
+    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
+    vyy = (swyy / sw - my * my).clamp(min=1e-10)
+    vxy = swxy / sw - mx * my
+    return vxy / (vxx * vyy).sqrt()
+
+
+def _lpa_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    weight: Tensor | None,
+) -> Tensor:
+    local_abs_corr = _local_pearson_from_moments(moments).abs()
+    if weight is None:
+        return local_abs_corr.mean()
+    return (weight * local_abs_corr).sum() / weight.sum().clamp(min=1e-10)
+
+
+def _lpc_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    weight: Tensor | None,
+) -> Tensor:
+    local_corr = _local_pearson_from_moments(moments).clamp(-0.99, 0.99)
+    z = torch.atanh(local_corr)
+    z_weighted = z * z.abs()
+    if weight is None:
+        return -z_weighted.mean()
+    return -(weight * z_weighted).sum() / weight.sum().clamp(min=1e-10)
+
+
+def _packed_lpa_correlation(
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    sigma: float,
+    kernel_type: str,
+) -> Tensor:
+    moments = _smoothed_weighted_moments_3d(base, source, weight, sigma, kernel_type)
+    return _lpa_from_moments(moments, weight)
+
+
+def _packed_lpc_correlation(
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    sigma: float,
+    kernel_type: str,
+) -> Tensor:
+    moments = _smoothed_weighted_moments_3d(base, source, weight, sigma, kernel_type)
+    return _lpc_from_moments(moments, weight)
 
 
 def lpa_correlation(
@@ -269,8 +327,6 @@ def lpa_correlation(
     weight: Tensor | None = None,
     sigma: float = 4.0,
     kernel_type: str = "gauss",
-    *,
-    pack_moments: bool = False,
 ) -> Tensor:
     """Compute Local Pearson Absolute (LPA) correlation.
 
@@ -303,40 +359,11 @@ def lpa_correlation(
     x = base
     y = source
 
-    if pack_moments:
-        sw, swx, swy, swxx, swyy, swxy = _smoothed_weighted_moments_3d(
-            x, y, w, sigma, kernel_type
-        )
-    else:
-        def _sm(v: Tensor) -> Tensor:
-            return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
+    def _sm(v: Tensor) -> Tensor:
+        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-        sw, swx, swy = _sm(w), _sm(w * x), _sm(w * y)
-        swxx, swyy, swxy = _sm(w * x * x), _sm(w * y * y), _sm(w * x * y)
-    sw = sw.clamp(min=1e-10)
-
-    # Local means
-    mx = swx / sw
-    my = swy / sw
-
-    # Local variances and covariance
-    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
-    vyy = (swyy / sw - my * my).clamp(min=1e-10)
-    vxy = swxy / sw - mx * my
-
-    # Local correlation
-    local_corr = vxy / (vxx * vyy).sqrt()
-
-    # Take absolute value (LPA = local pearson absolute)
-    local_abs_corr = local_corr.abs()
-
-    # Weighted mean
-    if weight is not None:
-        result = (weight * local_abs_corr).sum() / weight.sum().clamp(min=1e-10)
-    else:
-        result = local_abs_corr.mean()
-
-    return result
+    moments = (_sm(w), _sm(w * x), _sm(w * y), _sm(w * x * x), _sm(w * y * y), _sm(w * x * y))
+    return _lpa_from_moments(moments, weight)
 
 
 def lpc_correlation(
@@ -345,8 +372,6 @@ def lpc_correlation(
     weight: Tensor | None = None,
     sigma: float = 4.0,
     kernel_type: str = "gauss",
-    *,
-    pack_moments: bool = False,
 ) -> Tensor:
     """Compute Local Pearson Correlation (LPC) for cross-modality alignment.
 
@@ -377,38 +402,11 @@ def lpc_correlation(
     x = base
     y = source
 
-    if pack_moments:
-        sw, swx, swy, swxx, swyy, swxy = _smoothed_weighted_moments_3d(
-            x, y, w, sigma, kernel_type
-        )
-    else:
-        def _sm(v: Tensor) -> Tensor:
-            return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
+    def _sm(v: Tensor) -> Tensor:
+        return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-        sw, swx, swy = _sm(w), _sm(w * x), _sm(w * y)
-        swxx, swyy, swxy = _sm(w * x * x), _sm(w * y * y), _sm(w * x * y)
-    sw = sw.clamp(min=1e-10)
-
-    mx = swx / sw
-    my = swy / sw
-
-    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
-    vyy = (swyy / sw - my * my).clamp(min=1e-10)
-    vxy = swxy / sw - mx * my
-
-    local_corr = (vxy / (vxx * vyy).sqrt()).clamp(-0.99, 0.99)
-
-    # Fisher Z transform + z*|z| weighting (AFNI-style)
-    z = torch.atanh(local_corr)
-    z_weighted = z * z.abs()
-
-    # AFNI minimizes mean(z*|z|); we negate so higher = better
-    if weight is not None:
-        lpc_afni = (weight * z_weighted).sum() / weight.sum().clamp(min=1e-10)
-    else:
-        lpc_afni = z_weighted.mean()
-
-    return -lpc_afni
+    moments = (_sm(w), _sm(w * x), _sm(w * y), _sm(w * x * x), _sm(w * y * y), _sm(w * x * y))
+    return _lpc_from_moments(moments, weight)
 
 
 def lpa_cost_patch(
