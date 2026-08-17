@@ -189,7 +189,13 @@ class Referee:
         margin = clearance = UNCONSTRAINED_MARGIN
         if field is not None:
             xd, yd, zd = field
-            mask = pad_mask_to_field(self.brain, tuple(xd.shape))
+            lower_padding = None
+            if tuple(xd.shape) != tuple(self.brain.shape):
+                from .warp import _compute_support_padding
+
+                p = _compute_support_padding(self.base)
+                lower_padding = (p[0], p[2], p[4])
+            mask = pad_mask_to_field(self.brain, tuple(xd.shape), lower_padding_xyz=lower_padding)
             w = warp_regularity(xd, yd, zd, mask=mask, voxdims=self.voxdims)
             grade, reasons = regularity_verdict(w)
             cautions = regularity_cautions(w)

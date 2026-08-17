@@ -50,7 +50,15 @@ from fastfuncstuff.processing.io import (
 )
 from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
-from fastfuncstuff.processing.warp import QwarpConfig, _compute_padding, _pad_volume, qwarp
+from fastfuncstuff.processing.warp import (
+    Padding3D,
+    QwarpConfig,
+    _compute_support_padding,
+    _crop_padding,
+    _pad_volume_faces,
+    _padding_faces,
+    qwarp,
+)
 from fastfuncstuff.processing.weight import _gaussian_smooth_3d
 from fastfuncstuff.utils import REGISTRATION_TF32
 
@@ -1099,10 +1107,8 @@ class _LevelDumper:
 
     def _crop(self, warped: Tensor) -> Tensor:
         warped = warped.detach().cpu()
-        px, py, pz = self.padding if self.padding is not None else (0, 0, 0)
-        if px or py or pz:
-            return warped[pz : pz + self.nz, py : py + self.ny, px : px + self.nx]
-        return warped
+        padding = self.padding if self.padding is not None else (0, 0, 0)
+        return _crop_padding(warped, padding, (self.nz, self.ny, self.nx))
 
     def __call__(self, level: int, xd: Tensor, yd: Tensor, zd: Tensor, warped: Tensor) -> None:
         from fastfuncstuff.processing.io import save_image, save_warp_field
@@ -1262,9 +1268,7 @@ def _apply_warp_to_volume(
     xd: Tensor,
     yd: Tensor,
     zd: Tensor,
-    pad_x: int,
-    pad_y: int,
-    pad_z: int,
+    padding: Padding3D,
     device: torch.device,
     interp: str = "wsinc5",
 ) -> Tensor:
@@ -1273,19 +1277,19 @@ def _apply_warp_to_volume(
     Args:
         source: (nz, ny, nx) original unpadded source volume (CPU).
         xd, yd, zd: (nz_pad, ny_pad, nx_pad) displacement fields in voxels (CPU).
-        pad_x, pad_y, pad_z: Padding amounts.
+        padding: Symmetric or per-face padding amounts.
         device: GPU device for computation.
 
     Returns:
         (nz, ny, nx) warped and cropped result (CPU).
     """
     nz, ny, nx = source.shape
-    source_p = _pad_volume(source.float().to(device), pad_x, pad_y, pad_z)
+    source_p = _pad_volume_faces(source.float().to(device), padding)
     xd_gpu = xd.float().to(device)
     yd_gpu = yd.float().to(device)
     zd_gpu = zd.float().to(device)
     warped_full = warp_image(source_p, xd_gpu, yd_gpu, zd_gpu, mode=interp)
-    warped = warped_full[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx]
+    warped = _crop_padding(warped_full, padding, (nz, ny, nx))
     result = warped.cpu()
     del source_p, xd_gpu, yd_gpu, zd_gpu, warped_full, warped
     return result
@@ -1297,9 +1301,7 @@ def _extract_warp_pcs(
     do_x: bool,
     do_y: bool,
     do_z: bool,
-    pad_x: int,
-    pad_y: int,
-    pad_z: int,
+    padding: Padding3D,
     nx: int,
     ny: int,
     nz: int,
@@ -1329,29 +1331,17 @@ def _extract_warp_pcs(
         xd, yd, zd = all_warps_raw[t]
         parts = []
         if do_x:
-            crop = (
-                xd[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx]
-                if (pad_x or pad_y or pad_z)
-                else xd
-            )
+            crop = _crop_padding(xd, padding, (nz, ny, nx))
             parts.append(crop.reshape(-1))
             if t == 0:
                 axis_labels.append("X")
         if do_y:
-            crop = (
-                yd[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx]
-                if (pad_x or pad_y or pad_z)
-                else yd
-            )
+            crop = _crop_padding(yd, padding, (nz, ny, nx))
             parts.append(crop.reshape(-1))
             if t == 0:
                 axis_labels.append("Y")
         if do_z:
-            crop = (
-                zd[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx]
-                if (pad_x or pad_y or pad_z)
-                else zd
-            )
+            crop = _crop_padding(zd, padding, (nz, ny, nx))
             parts.append(crop.reshape(-1))
             if t == 0:
                 axis_labels.append("Z")
@@ -1557,8 +1547,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Base: {nx}x{ny}x{nz}, Source: {nx}x{ny}x{nz} x {nt}t")
         print(f"Loaded in {time.time() - t0:.1f}s")
 
-    pad_x, pad_y, pad_z = _compute_padding(nx, ny, nz)
-    padded_shape = (nz + 2 * pad_z, ny + 2 * pad_y, nx + 2 * pad_x)
+    mem_padding = _compute_support_padding(base_3d)
+    px0, px1, py0, py1, pz0, pz1 = mem_padding
+    padded_shape = (nz + pz0 + pz1, ny + py0 + py1, nx + px0 + px1)
     predicted, available = plan_nonlinear_memory(padded_shape, device, "qwarp")
     if args.gpu_mem is not None:
         available = min(available, int(args.gpu_mem * 2**30))
@@ -1755,11 +1746,11 @@ def main(argv: list[str] | None = None) -> int:
     # Compute padding for warp field header
     use_pad = not args.nopad
     if use_pad:
-        warp_padding = _compute_padding(nx, ny, nz)
-        pad_x, pad_y, pad_z = warp_padding
+        warp_padding = _compute_support_padding(base_3d)
     else:
         warp_padding = None
-        pad_x, pad_y, pad_z = 0, 0, 0
+    padding: Padding3D = warp_padding if warp_padding is not None else (0, 0, 0)
+    pad_x, pad_x_hi, pad_y, pad_y_hi, pad_z, pad_z_hi = _padding_faces(padding)
 
     # Per-level dump callback:
     #   -save_intermediates -> warp + image files in {prefix}_levels/
@@ -1832,7 +1823,7 @@ def main(argv: list[str] | None = None) -> int:
         # For 'first' base method (internal base only): write an identity (zero) warp for vol 0
         # so the warp file count matches the timeseries length.
         if args.base_method == "first" and not source_is_4d:
-            padded_shape = (nz + 2 * pad_z, ny + 2 * pad_y, nx + 2 * pad_x)
+            padded_shape = (nz + pad_z + pad_z_hi, ny + pad_y + pad_y_hi, nx + pad_x + pad_x_hi)
             zero_xd = torch.zeros(padded_shape)
             zero_yd = torch.zeros(padded_shape)
             zero_zd = torch.zeros(padded_shape)
@@ -1910,17 +1901,17 @@ def main(argv: list[str] | None = None) -> int:
                     src_gpu = src_vol.float().to(device)
                     for cand_warp, cand_src in warp_buffer:
                         # Pad source and warp, apply, crop, compute cost
-                        src_p = _pad_volume(src_gpu, pad_x, pad_y, pad_z)
+                        src_p = _pad_volume_faces(src_gpu, padding)
                         cxd = cand_warp[0].float().to(device)
                         cyd = cand_warp[1].float().to(device)
                         czd = cand_warp[2].float().to(device)
                         # Pad the unpadded warp to padded grid for application
-                        cxd_p = _pad_volume(cxd, pad_x, pad_y, pad_z)
-                        cyd_p = _pad_volume(cyd, pad_x, pad_y, pad_z)
-                        czd_p = _pad_volume(czd, pad_x, pad_y, pad_z)
+                        cxd_p = _pad_volume_faces(cxd, padding)
+                        cyd_p = _pad_volume_faces(cyd, padding)
+                        czd_p = _pad_volume_faces(czd, padding)
                         warped_test = warp_image_linear(src_p, cxd_p, cyd_p, czd_p)
                         # Crop to unpadded and compute correlation with base
-                        wt = warped_test[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx]
+                        wt = _crop_padding(warped_test, padding, (nz, ny, nx))
                         # Simple global Pearson correlation
                         bf = base_gpu.reshape(-1)
                         wf = wt.reshape(-1)
@@ -1995,14 +1986,9 @@ def main(argv: list[str] | None = None) -> int:
 
             # Chain: crop padded warp back to unpadded size, add to buffer
             if chain_warps:
-                if pad_x > 0 or pad_y > 0 or pad_z > 0:
-                    unpadded_warp = (
-                        xd_cpu[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx],
-                        yd_cpu[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx],
-                        zd_cpu[pad_z : pad_z + nz, pad_y : pad_y + ny, pad_x : pad_x + nx],
-                    )
-                else:
-                    unpadded_warp = (xd_cpu, yd_cpu, zd_cpu)
+                unpadded_warp = tuple(
+                    _crop_padding(comp, padding, (nz, ny, nx)) for comp in (xd_cpu, yd_cpu, zd_cpu)
+                )
                 warp_buffer.append((unpadded_warp, src_idx))
             elif not collect_warps:
                 del xd_cpu, yd_cpu, zd_cpu
@@ -2090,9 +2076,7 @@ def main(argv: list[str] | None = None) -> int:
                     sxd,
                     syd,
                     szd,
-                    pad_x,
-                    pad_y,
-                    pad_z,
+                    padding,
                     device,
                     interp=args.final,
                 )
@@ -2118,9 +2102,7 @@ def main(argv: list[str] | None = None) -> int:
                 do_x=not args.noXdis,
                 do_y=not args.noYdis,
                 do_z=not args.noZdis,
-                pad_x=pad_x,
-                pad_y=pad_y,
-                pad_z=pad_z,
+                padding=padding,
                 nx=nx,
                 ny=ny,
                 nz=nz,
@@ -2200,9 +2182,7 @@ def main(argv: list[str] | None = None) -> int:
                     do_x=not args.noXdis,
                     do_y=not args.noYdis,
                     do_z=not args.noZdis,
-                    pad_x=pad_x,
-                    pad_y=pad_y,
-                    pad_z=pad_z,
+                    padding=padding,
                     nx=nx,
                     ny=ny,
                     nz=nz,

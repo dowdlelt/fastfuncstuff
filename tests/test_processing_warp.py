@@ -17,6 +17,8 @@ from fastfuncstuff.processing.warp import (
     _checkerboard_phases,
     _compute_hfactor,
     _compute_padding,
+    _compute_support_padding,
+    _crop_padding,
     _dedup_last_wins,
     _filter_patches,
     _generate_patch_grid,
@@ -24,6 +26,7 @@ from fastfuncstuff.processing.warp import (
     _gn_steepest_descent_images_broadcast,
     _maybe_compile,
     _pad_volume,
+    _pad_volume_faces,
 )
 
 DEVICE = torch.device("cpu")
@@ -160,6 +163,40 @@ class TestComputePadding:
         assert px == 3
         assert py == 3
         assert pz == 3
+
+
+class TestComputeSupportPadding:
+    def test_reuses_existing_blank_margin(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+
+        assert _compute_support_padding(base) == (3, 3, 3, 3, 3, 3)
+
+    def test_adds_only_edge_margin_shortfall(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, :32] = 100.0
+
+        # round(0.1234 * 64) + 1 == 9. Tissue touches x-, while all other
+        # faces already have at least the requested blank margin.
+        assert _compute_support_padding(base) == (9, 3, 3, 3, 3, 3)
+
+    def test_asymmetric_pad_crop_roundtrip(self):
+        vol = torch.randn(8, 10, 12)
+        padding = (1, 2, 3, 4, 5, 6)
+
+        padded = _pad_volume_faces(vol, padding)
+        recovered = _crop_padding(padded, padding, tuple(vol.shape))
+
+        assert padded.shape == (19, 17, 15)
+        torch.testing.assert_close(recovered, vol, atol=0, rtol=0)
+
+    # ---------------------------------------------------------------------------
+
+    def test_initial_warp_minimum_can_enlarge_margin(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+
+        assert _compute_support_padding(base, minimum_xyz=(20, 15, 10)) == (4, 4, 3, 3, 3, 3)
 
 
 # ---------------------------------------------------------------------------

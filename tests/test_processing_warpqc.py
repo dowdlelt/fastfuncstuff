@@ -1,15 +1,17 @@
 """Tests for processing/warpqc.py — deformation-regularity metrics."""
 
+import numpy as np
 import pytest
 import torch
 
 from fastfuncstuff.processing.warpqc import (
     FAIL,
     MARGINAL,
+    PASS,
     UNCONSTRAINED_MARGIN,
     gate_margin,
+    pad_mask_to_field,
     regularity_cautions,
-    PASS,
     regularity_verdict,
     remedies,
     warp_regularity,
@@ -131,6 +133,29 @@ class TestMask:
         mask[:4, :4, :4] = 1  # a corner
         qc = warp_regularity(xd, yd, zd, mask=mask)
         assert qc.n_voxels == 64
+
+    def test_asymmetric_field_placement_uses_affines(self):
+        mask = torch.arange(3 * 4 * 5).reshape(3, 4, 5)
+        mask_affine = np.diag([2.0, 3.0, 4.0, 1.0])
+        field_affine = mask_affine.copy()
+        lower_xyz = (2, 3, 4)
+        field_affine[:3, 3] += mask_affine[:3, :3] @ -np.array(lower_xyz)
+
+        placed = pad_mask_to_field(
+            mask,
+            (10, 12, 14),
+            mask_affine=mask_affine,
+            field_affine=field_affine,
+        )
+
+        expected = torch.zeros(10, 12, 14, dtype=mask.dtype)
+        expected[4:7, 3:7, 2:7] = mask
+        torch.testing.assert_close(placed, expected, atol=0, rtol=0)
+
+    def test_explicit_lower_padding_matches_affine_placement(self):
+        mask = torch.ones(3, 4, 5)
+        placed = pad_mask_to_field(mask, (10, 12, 14), lower_padding_xyz=(2, 3, 4))
+        assert placed[4:7, 3:7, 2:7].sum() == mask.numel()
 
     def test_empty_mask_raises(self):
         with pytest.raises(ValueError, match="no voxels"):

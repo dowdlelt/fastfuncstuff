@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 from dataclasses import asdict, dataclass
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -182,21 +183,40 @@ def warp_regularity(
     )
 
 
-def pad_mask_to_field(mask: Tensor, field_shape: tuple[int, int, int]) -> Tensor:
-    """Centre a base-grid mask inside a larger (padded) warp grid.
+def pad_mask_to_field(
+    mask: Tensor,
+    field_shape: tuple[int, int, int],
+    *,
+    mask_affine: np.ndarray | None = None,
+    field_affine: np.ndarray | None = None,
+    lower_padding_xyz: tuple[int, int, int] | None = None,
+) -> Tensor:
+    """Place a base-grid mask inside a larger padded warp grid.
 
-    ``ffs_qwarp`` solves on a padded volume and saves the field on that grid, so
-    a brain mask built on the base grid is smaller than the field it has to
-    select from. The padding is symmetric, so centring recovers the alignment.
+    Prefer affine-derived placement for saved fields, or explicit lower-face
+    padding for in-memory fields. Centre placement remains only for legacy
+    symmetric warps whose geometry is unavailable.
     """
     if tuple(mask.shape) == tuple(field_shape):
         return mask
     out = torch.zeros(field_shape, dtype=mask.dtype, device=mask.device)
-    offs = [(f - m) // 2 for f, m in zip(field_shape, mask.shape, strict=True)]
+    if mask_affine is not None and field_affine is not None:
+        origin = np.linalg.solve(field_affine, mask_affine @ np.array([0.0, 0.0, 0.0, 1.0]))
+        ox, oy, oz = (int(round(v)) for v in origin[:3])
+        offs = [oz, oy, ox]
+    elif lower_padding_xyz is not None:
+        ox, oy, oz = lower_padding_xyz
+        offs = [oz, oy, ox]
+    else:
+        offs = [(f - m) // 2 for f, m in zip(field_shape, mask.shape, strict=True)]
     if any(o < 0 for o in offs):
         raise ValueError(f"mask {tuple(mask.shape)} is larger than the field {tuple(field_shape)}")
     z, y, x = offs
     nz, ny, nx = mask.shape
+    if z + nz > field_shape[0] or y + ny > field_shape[1] or x + nx > field_shape[2]:
+        raise ValueError(
+            f"mask {tuple(mask.shape)} at offset {(z, y, x)} exceeds field {field_shape}"
+        )
     out[z : z + nz, y : y + ny, x : x + nx] = mask
     return out
 

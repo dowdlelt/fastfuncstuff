@@ -7,13 +7,15 @@ keeps ffs_qwarp / ffs_locomoco / ffs_util_pcwarp interchangeable on either forma
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 import torch
 
 nib = pytest.importorskip("nibabel")
 
-from fastfuncstuff.processing.io import load_warp_series, save_warp_series
+from fastfuncstuff.processing.io import load_warp_series, save_warp_field, save_warp_series
 
 
 def _synth_series(T=6, nz=5, ny=6, nx=7, seed=0):
@@ -23,6 +25,44 @@ def _synth_series(T=6, nz=5, ny=6, nx=7, seed=0):
     yd = torch.rand(T, nz, ny, nx, generator=g) * 2.0
     zd = torch.zeros(T, nz, ny, nx)  # inactive axis
     return xd, yd, zd
+
+
+def test_asymmetric_padding_shifts_origin_by_lower_faces(tmp_path):
+    affine = np.array(
+        [[2.0, 0.1, 0.0, 10.0], [0.0, 3.0, 0.2, 20.0], [0.0, 0.0, 4.0, 30.0], [0, 0, 0, 1]]
+    )
+    padding = (2, 9, 3, 8, 4, 7)
+    expected = affine.copy()
+    expected[:3, 3] += affine[:3, :3] @ np.array([-2.0, -3.0, -4.0])
+    xd, yd, zd = _synth_series(T=2)
+
+    single = tmp_path / "single.nii.gz"
+    save_warp_field(xd[0], yd[0], zd[0], single, affine=affine, padding=padding)
+    np.testing.assert_allclose(nib.load(single).affine, expected)
+
+    series = tmp_path / "series.nii.gz"
+    save_warp_series(xd, yd, zd, series, as_5d=True, affine=affine, units="voxels", padding=padding)
+    np.testing.assert_allclose(nib.load(series).affine, expected)
+
+
+def test_warpqc_converts_saved_afni_mm_back_to_voxels(tmp_path):
+    from fastfuncstuff.cli.util_warpqc import main as warpqc_main
+
+    nz, ny, nx = 12, 13, 14
+    xx = torch.arange(nx, dtype=torch.float32).view(1, 1, nx).expand(nz, ny, nx)
+    xd = 0.2 * xx
+    zero = torch.zeros_like(xd)
+    affine = np.diag([2.0, 3.0, 4.0, 1.0])
+    warp = tmp_path / "ramp_WARP.nii.gz"
+    report = tmp_path / "qc.json"
+    save_warp_field(xd, zero, zero, warp, affine=affine, units="mm")
+
+    assert (
+        warpqc_main(["-warp", str(warp), "-json", str(report), "-device", "cpu", "-verb", "0"]) == 0
+    )
+    qc = json.loads(report.read_text())[warp.name]
+    assert qc["jac_neg_count"] == 0
+    assert qc["jac_p50"] == pytest.approx(1.2, abs=1e-5)
 
 
 def test_5d_and_folder_roundtrip_match(tmp_path):
