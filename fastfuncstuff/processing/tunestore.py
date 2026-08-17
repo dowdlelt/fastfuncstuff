@@ -26,9 +26,32 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from .warpqc import FAIL, MARGINAL, PASS
+from .warpqc import (
+    FAIL,
+    MARGIN_LIMIT,
+    MARGINAL,
+    PASS,
+    WarpQC,
+    gate_margin,
+    regularity_cautions,
+    regularity_margin,
+    regularity_verdict,
+)
 
 GRADE_ORDER = {PASS: 0, MARGINAL: 1, FAIL: 2}
+
+# A config that clears the regularity gate by less than this many pooled
+# between-subject sigmas is reported as NARROW and sorted below the clean passes.
+#
+# The unit matters more than the number. Clearance measured in *absolute* log
+# units needs a constant nobody can defend; measured in units of how far the
+# margin is observed to move when the same config is fit on a different brain,
+# "narrow" means something checkable: the pass is a property of the subjects
+# that happened to be drawn, not of the setting. Measured at 0.27 log units on
+# T1->MNI, which is most of the whole passing range -- so this demotes more than
+# it looks like it should, and that is the finding, not a mis-calibration.
+NARROW_CLEARANCE_Z = 1.0
+NARROW = "narrow"
 
 
 BASELINE = "(baseline)"
@@ -214,11 +237,19 @@ class Trial:
     scores: dict[str, float] = field(default_factory=dict)
     grade: str = PASS
     reasons: list[str] = field(default_factory=list)
+    # Things true of the warp that do not make it wrong -- extreme-but-positive
+    # Jacobians. Recorded separately from `reasons` so that a caution can never be
+    # mistaken for a rejection by anything reading the table.
+    cautions: list[str] = field(default_factory=list)
     warpqc: dict[str, Any] = field(default_factory=dict)
     # Continuous distance from the regularity gate, > 0 == passing. The grade is
     # what a user reads; this is what the adaptive searcher steers by, because a
     # label carries no gradient and this boundary is a cliff.
     margin: float = 0.0
+    # Distance to the pass/fail line specifically (folding), as opposed to `margin`
+    # above, which also counts the cautions so the searcher can feel them coming.
+    # Clearance has to be measured against the line a config can be rejected at.
+    gate_margin: float = 0.0
     # Per-level convergence telemetry (formwarp.LevelStats.as_dict()). Answers the
     # question the iteration knobs raise but cannot settle on their own: was this
     # config starved of iterations, or did it over-run and fall back?
@@ -258,12 +289,94 @@ class ConfigResult:
     # Seconds per megavoxel of the base grid, so a timing survives being quoted on
     # a different problem size. Raw seconds do not.
     seconds_per_mvox: float = 0.0
+    # Worst subject's distance from the regularity gate, and that distance in units
+    # of how much it moves between subjects. The grade says which side of the gate
+    # the worst subject landed on; these say whether it landed there by enough to
+    # expect the next subject to land there too.
+    margin_min: float = 0.0
+    margin_z: float | None = None  # None when the run cannot estimate the sigma
+    # Distinct caution kinds raised by any subject. Shown, never ranked on.
+    cautions: list[str] = field(default_factory=list)
     is_baseline: bool = False
 
     def label(self) -> str:
         if not self.config:
             return "(defaults)"
         return " ".join(f"{k}={v}" for k, v in sorted(self.config.items()))
+
+    @property
+    def narrow(self) -> bool:
+        """Passed the gate, but by less than it moves from one subject to the next."""
+        return (
+            self.grade == PASS
+            and not self.is_baseline
+            and self.margin_z is not None
+            and self.margin_z < NARROW_CLEARANCE_Z
+        )
+
+    @property
+    def band(self) -> str:
+        """What to print in the grade column, and what the ordering keys on."""
+        return NARROW if self.narrow else self.grade
+
+
+# Margins below this are not "close to the gate", they are a warp that came apart:
+# at -0.5 the 1st-percentile det(J) is 0.15 against a 0.25 gate. They are dropped
+# from the spread estimate as censored, because the failed side is unbounded and a
+# handful of blowups otherwise sets the scale for everything -- measured, they take
+# the estimate from 0.07 to 0.27, while including or excluding *mild* failures
+# moves it by 0.002. The cut is where the answer stops depending on the cut.
+NEAR_GATE_FLOOR = -0.5
+
+# Below this many deviations a per-backend estimate is noise, and a backend that
+# happened to sit near the gate all run would report a tiny spread and call its
+# own squeakers safe. Fall back to the pooled estimate.
+MIN_SIGMA_SAMPLES = 8
+
+
+def margin_subject_sigma(trials: Sequence[Trial]) -> dict[str | None, float]:
+    """How much the gate margin moves when a fixed config meets a different brain.
+
+    Pooled *within-config* deviation, so it measures subject-to-subject variation
+    and not the between-config variation the search deliberately created. Keyed by
+    backend, with ``None`` holding the pooled estimate for backends that have too
+    few repeats of their own; an empty dict means the run never fit one config on
+    two subjects and so cannot answer.
+
+    Per backend because they genuinely differ -- measured on T1->MNI, qwarp's
+    margin moves 0.015 between brains and formwarp's moves 0.10, so one global
+    number would call qwarp's real clearance narrow and formwarp's noise safe.
+
+    Truncation is the known bias: a config that failed outright on one subject
+    contributes nothing above the floor, and those are the volatile ones. The
+    estimate is therefore a floor on the true spread, which is the safe direction
+    for a criterion that exists to catch configs that pass by luck.
+    """
+    by_key: dict[tuple[str, int], list[float]] = {}
+    for t in trials:
+        if NEAR_GATE_FLOOR < t.gate_margin < MARGIN_LIMIT:
+            by_key.setdefault((t.backend, t.config_id), []).append(t.gate_margin)
+
+    devs: dict[str, list[float]] = {}
+    for (backend, _cid), vals in by_key.items():
+        if len(vals) >= 2:
+            mu = statistics.fmean(vals)
+            devs.setdefault(backend, []).extend(v - mu for v in vals)
+
+    pooled = [d for v in devs.values() for d in v]
+    if len(pooled) < 2:
+        return {}
+
+    out: dict[str | None, float] = {}
+    sigma_pooled = statistics.pstdev(pooled)
+    if sigma_pooled > 0:
+        out[None] = sigma_pooled
+    for backend, v in devs.items():
+        if len(v) >= MIN_SIGMA_SAMPLES:
+            sigma = statistics.pstdev(v)
+            if sigma > 0:
+                out[backend] = sigma
+    return out
 
 
 class TrialStore:
@@ -359,6 +472,32 @@ class TrialStore:
             RunMeta(**{k: v for k, v in r.items() if k in run_known}) for r in raw.get("runs", [])
         ]
         self._next_trial = max((t.trial_id for t in self.trials), default=0)
+        self._regrade()
+
+    def _regrade(self) -> None:
+        """Re-derive every grade from the stored measurements under today's policy.
+
+        What a warp measured is a fact; whether that counts as a failure is a
+        policy, and this project has already changed it once (over-compression was
+        a hard fail until it was pointed out that a det(J) of 0.2 is unusual
+        anatomy rather than impossible anatomy). Keeping the stored verdict would
+        leave every table ever written frozen under the rules that happened to be
+        in force that afternoon, and silently mixed with tables written under the
+        new ones — a comparability trap of exactly the kind ``RunMeta`` exists to
+        catch.
+
+        The raw ``WarpQC`` is recorded, so the grade never has to be the thing that
+        persists. Trials from before it was recorded keep whatever they were given.
+        """
+        known = {f.name for f in fields(WarpQC)}
+        for t in self.trials:
+            if not t.warpqc or not known <= set(t.warpqc):
+                continue
+            qc = WarpQC(**{k: v for k, v in t.warpqc.items() if k in known})
+            t.grade, t.reasons = regularity_verdict(qc)
+            t.cautions = regularity_cautions(qc)
+            t.margin = regularity_margin(qc)
+            t.gate_margin = gate_margin(qc)
 
     # --- scoring ------------------------------------------------------------
 
@@ -408,12 +547,21 @@ class TrialStore:
         marginal above every failing one, *then* sorts by score. A better
         similarity score never buys its way past a folded warp — that inversion
         is the whole failure mode this tool exists to prevent.
+
+        A pass by a hair is its own band. PASS/FAIL is a threshold on a continuous
+        quantity, so a config that cleared it by less than the margin's own
+        between-subject spread did not demonstrate a setting that works — it
+        demonstrated a draw of subjects that happened to land on the near side.
+        Sorting those below the clean passes stops the search's own pressure
+        towards less regularization (which always scores better, right up to the
+        gate) from being rewarded through configs that barely survive it.
         """
         by_config: dict[int, list[Trial]] = {}
         for t in self.trials:
             by_config.setdefault(t.config_id, []).append(t)
 
         mvox = (self.runs[-1].n_voxels / 1e6) if self.runs else 0.0
+        sigmas = margin_subject_sigma(self.trials)
 
         out = []
         for cid, ts in by_config.items():
@@ -428,6 +576,10 @@ class TrialStore:
                 for n in sorted(names)
             }
             seconds = statistics.fmean([t.seconds for t in ts])
+            # The worst subject, for the same reason the grade is the worst grade.
+            margin_min = min(t.gate_margin for t in ts)
+            sigma = sigmas.get(ts[0].backend, sigmas.get(None))
+            caution_kinds = sorted({c.split(":")[0] for t in ts for c in t.cautions})
             out.append(
                 ConfigResult(
                     config_id=cid,
@@ -441,10 +593,13 @@ class TrialStore:
                     seconds_mean=seconds,
                     abs_scores=abs_scores,
                     seconds_per_mvox=(seconds / mvox) if mvox else 0.0,
+                    margin_min=margin_min,
+                    cautions=caution_kinds,
+                    margin_z=(margin_min / sigma) if sigma else None,
                     is_baseline=ts[0].backend == BASELINE,
                 )
             )
-        out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.score_mean))
+        out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.narrow, r.score_mean))
         return out
 
     def baseline(self) -> ConfigResult | None:
@@ -653,6 +808,16 @@ class IterationAdvice:
         return "about right"
 
 
+def _has_iteration_telemetry(stats: dict) -> bool:
+    """Whether a per-level record came from an iterative solver.
+
+    qwarp writes per-patch records into the same field: it optimises shrinking
+    patches rather than taking steps, so it has no iteration count, no best
+    iterate, and nothing to recommend a ceiling for.
+    """
+    return "iters_run" in stats
+
+
 def recommend_iterations(store: TrialStore, headroom: float = 2.0) -> list[IterationAdvice]:
     """Read the iteration ceiling back out of what the levels actually used.
 
@@ -666,7 +831,8 @@ def recommend_iterations(store: TrialStore, headroom: float = 2.0) -> list[Itera
     rows: dict[tuple[str, int], list[dict]] = {}
     for t in store.trials:
         for lev, stats in enumerate(t.levels):
-            rows.setdefault((t.backend, lev), []).append(stats)
+            if _has_iteration_telemetry(stats):
+                rows.setdefault((t.backend, lev), []).append(stats)
 
     out = []
     for (backend, lev), stats in sorted(rows.items()):
@@ -826,7 +992,8 @@ def format_convergence(store: TrialStore) -> str:
     rows: dict[tuple[str, int], list[dict]] = {}
     for t in store.trials:
         for lev, stats in enumerate(t.levels):
-            rows.setdefault((t.backend, lev), []).append(stats)
+            if _has_iteration_telemetry(stats):
+                rows.setdefault((t.backend, lev), []).append(stats)
     if not rows:
         return "  (no convergence telemetry recorded)"
 
@@ -1007,14 +1174,32 @@ def format_guide(store: TrialStore, recipe: str) -> str:
     out += ["## Recommended settings", ""]
     seen: set[str] = set()
     for r in results:
-        if r.is_baseline or r.grade != PASS or r.backend in seen:
+        # A screened-but-unconfirmed config is one brain's opinion. It belongs in
+        # the table, where its n is visible, and not in a recommendation — the
+        # search deliberately screens on a single subject, so the top of the
+        # ranking is full of settings nobody has reproduced yet. This is the brake
+        # that used to be supplied by the regularity gate failing the extreme
+        # configs; now that an extreme Jacobian is only a caution, it is the only
+        # one, and "two brains agreed" is a better reason to trust a setting than
+        # "one brain did not fold".
+        if r.is_baseline or r.grade != PASS or r.backend in seen or r.n_subjects < 2:
             continue
         seen.add(r.backend)
+        note = f" — CAUTION: {', '.join(r.cautions)}" if r.cautions else ""
         out.append(
             f"- **{r.backend}**: `{r.label()}` — {r.seconds_mean:.1f}s/fit"
             + (f" ({r.seconds_per_mvox:.1f}s per megavoxel)" if r.seconds_per_mvox else "")
+            + note
         )
     out.append("")
+    if any(r.cautions for r in results if r.backend in seen and not r.is_baseline):
+        out += [
+            "A caution means the deformation is extreme somewhere — heavily compressed "
+            "or expanded — without ever inverting. It is reported and not ranked on, "
+            "because heads and ventricles vary enough that the bound is a notice "
+            "rather than a verdict. Look at the warp before shipping one.",
+            "",
+        ]
 
     imp = knob_importance(store)
     if imp:
@@ -1055,16 +1240,23 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
     base = next((r for r in results if r.is_baseline), None)
     b_val = base.abs_scores.get(metric) if (base and metric) else None
 
-    head = f"  {'#':>3s}  {'backend':16s} {'score':>8s} {'+/-':>7s} {'grade':9s} {'s/fit':>6s}"
+    head = (
+        f"  {'#':>3s}  {'backend':16s} {'score':>8s} {'+/-':>7s} {'grade':9s} "
+        f"{'clear':>6s} {'s/fit':>6s}"
+    )
     if metric:
         head += f" {metric:>9s}"
         if b_val is not None:
             head += f" {'vs base':>9s}"
     lines = [head + "  settings", "  " + "-" * (len(head) + 30)]
     for r in results[:limit]:
+        clear = f"{r.margin_z:6.2f}" if r.margin_z is not None else f"{'-':>6s}"
+        # A caution rides in the grade column rather than a column of its own: it
+        # is a footnote on the verdict, and giving it a column would imply it ranks.
+        band = r.band.upper() + ("*" if r.cautions else "")
         row = (
             f"  {r.config_id:>3d}  {r.backend:16s} {r.score_mean:8.4f} "
-            f"{r.score_spread:7.4f} {r.grade.upper():9s} {r.seconds_mean:6.1f}"
+            f"{r.score_spread:7.4f} {band:9s} {clear} {r.seconds_mean:6.1f}"
         )
         if metric:
             v = r.abs_scores.get(metric)
@@ -1079,6 +1271,20 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
         lines.append(
             f"  'score' is a rank within this run (lower better); '{metric}' is the raw "
             "value,\n  which is the column that means anything outside it."
+        )
+    shown = results[:limit]
+    if any(r.cautions for r in shown):
+        kinds = sorted({c for r in shown for c in r.cautions})
+        lines.append(
+            f"  '*' carries a caution ({', '.join(kinds)}): the deformation is extreme\n"
+            "  somewhere but never inverts. Reported, never ranked on -- heads and\n"
+            "  ventricles vary enough that the bound is a notice, not a verdict."
+        )
+    if any(r.narrow for r in shown):
+        lines.append(
+            "  'clear' is how far the worst subject sat from the regularity gate, in\n"
+            "  units of how far that distance moves between subjects. NARROW means under\n"
+            "  1 -- it passed, but not by enough to expect the next brain to pass too."
         )
     if b_val is None:
         lines.append(

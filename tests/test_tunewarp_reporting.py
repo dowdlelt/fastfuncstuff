@@ -21,6 +21,7 @@ from fastfuncstuff.processing.tunestore import (
     format_runs,
     headline_metric,
     knob_importance,
+    margin_subject_sigma,
 )
 
 
@@ -298,3 +299,61 @@ class TestExpansionBounds:
         before = max(axis.values)
         assert axis.grow(+1)
         assert max(axis.values) > before
+
+
+class TestGateClearance:
+    """A pass by a hair is not the same result as a pass with room."""
+
+    def _store(self, tmp_path):
+        """Two configs that both pass, one of them barely.
+
+        The stable pair sets the subject-to-subject spread; the squeaker scores
+        better, as an under-regularized warp always does, and clears the gate by
+        far less than that spread.
+        """
+        s = TrialStore(tmp_path / "t.json")
+        s.runs.append(_meta())
+        for subj, margin in (("s1", 0.50), ("s2", 0.56)):
+            s.add("formwarp", subj, {"total_var": 1.0}, [], scores={"ls": 0.45}, gate_margin=margin)
+        for subj, margin in (("s1", 0.01), ("s2", 0.07)):
+            s.add("formwarp", subj, {"total_var": 0.0}, [], scores={"ls": 0.30}, gate_margin=margin)
+        s.compute_consensus(["ls"])
+        return s
+
+    def test_spread_is_measured_within_a_config_not_across_them(self, tmp_path):
+        sigmas = margin_subject_sigma(self._store(tmp_path).trials)
+        # 0.03 either side of each config's own mean; the 0.5 gap *between* the two
+        # configs is what the search created on purpose and must not be counted as
+        # subject variation.
+        assert sigmas[None] == pytest.approx(0.03, abs=1e-9)
+
+    def test_a_blown_up_warp_does_not_set_the_scale(self, tmp_path):
+        s = self._store(tmp_path)
+        for subj, margin in (("s1", -3.5), ("s2", 0.4)):
+            s.add("formwarp", subj, {"total_var": 9.0}, [], scores={"ls": 0.9}, gate_margin=margin)
+        assert margin_subject_sigma(s.trials)[None] == pytest.approx(0.03, abs=1e-9)
+
+    def test_a_narrow_pass_sorts_below_a_clean_one_it_outscores(self, tmp_path):
+        results = [r for r in self._store(tmp_path).results() if not r.is_baseline]
+        assert [r.band for r in results] == ["pass", "narrow"]
+        # ... and the demoted one is there on merit: it has the better score.
+        assert results[1].score_mean < results[0].score_mean
+
+    def test_clearance_is_reported_in_units_of_that_spread(self, tmp_path):
+        clean, narrow = self._store(tmp_path).results()
+        assert clean.margin_z == pytest.approx(0.50 / 0.03, rel=1e-6)
+        assert narrow.margin_z == pytest.approx(0.01 / 0.03, rel=1e-6)
+
+    def test_a_run_with_no_repeats_declines_to_guess(self, tmp_path):
+        s = TrialStore(tmp_path / "t.json")
+        s.runs.append(_meta())
+        s.add("formwarp", "s1", {"total_var": 0.0}, [], scores={"ls": 0.3}, gate_margin=0.01)
+        s.compute_consensus(["ls"])
+        assert margin_subject_sigma(s.trials) == {}
+        # No estimate means no demotion -- unknown clearance is not narrow clearance.
+        assert s.results()[0].band == "pass"
+
+    def test_the_table_explains_a_demotion_it_shows(self, tmp_path):
+        table = format_results_table(self._store(tmp_path).results())
+        assert "NARROW" in table
+        assert "clear" in table

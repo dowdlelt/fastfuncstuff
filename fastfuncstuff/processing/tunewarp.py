@@ -47,7 +47,9 @@ from .warpqc import (
     FAIL,
     FAILED_MARGIN,
     UNCONSTRAINED_MARGIN,
+    gate_margin,
     pad_mask_to_field,
+    regularity_cautions,
     regularity_margin,
     regularity_verdict,
     warp_regularity,
@@ -180,24 +182,28 @@ class Referee:
         scores = evaluate_metrics(inp, panel)
         del inp
 
-        grade, reasons, qc = "pass", [], {}
+        grade, reasons, cautions, qc = "pass", [], [], {}
         # A field-less result (an affine-only backend) has nothing to fold, so it
         # gets the best margin rather than a missing one — absent evidence of a
         # boundary is not evidence of being on the wrong side of it.
-        margin = UNCONSTRAINED_MARGIN
+        margin = clearance = UNCONSTRAINED_MARGIN
         if field is not None:
             xd, yd, zd = field
             mask = pad_mask_to_field(self.brain, tuple(xd.shape))
             w = warp_regularity(xd, yd, zd, mask=mask, voxdims=self.voxdims)
             grade, reasons = regularity_verdict(w)
+            cautions = regularity_cautions(w)
             margin = regularity_margin(w)
+            clearance = gate_margin(w)
             qc = w.as_dict()
         return {
             "scores": scores,
             "grade": grade,
             "reasons": reasons,
+            "cautions": cautions,
             "warpqc": qc,
             "margin": margin,
+            "gate_margin": clearance,
         }
 
 
