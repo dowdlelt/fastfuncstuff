@@ -40,15 +40,20 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_coverage_args,
+    add_deterministic_arg,
     add_device_arg,
+    add_recipe_arg,
     add_verbose_arg,
+    apply_recipe_preset,
     combine_brain_masks,
+    enable_determinism,
     image_support,
     parse_prefix,
     sanitize_volume,
     setup_device,
     spinner,
 )
+from fastfuncstuff.processing.formwarp import METRICS
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
 from fastfuncstuff.processing.mask import data_coverage_mask
@@ -64,6 +69,24 @@ from fastfuncstuff.processing.optiwarp import (
 )
 from fastfuncstuff.processing.warp import QwarpConfig
 from fastfuncstuff.utils import REGISTRATION_TF32
+
+
+def _fmt_schedule(values) -> str:
+    """A schedule tuple as the ANTs-style ``4x2x1`` string argparse shows as default."""
+    return "x".join(f"{v:g}" for v in values)
+
+
+# Argparse defaults are READ FROM the engine's config dataclass, never re-typed
+# here. A default that lives in two places drifts, and it did: the iteration
+# ceiling was raised in the engine after measuring that the old one starved the
+# finest level, and this CLI kept passing the old value, so every command-line
+# run silently kept the schedule the change existed to fix. The dataclass is the
+# single source of truth; this is a view of it.
+# Which PRESETS family `-type` should look up for this tool. The optiwarp
+# force models share a parameter set, so one entry covers all three.
+_PRESET_BACKEND = "optiwarp_demons"
+
+_D = OptiwarpConfig()
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -306,14 +329,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-match_sigma",
         "-match-sigma",
         type=float,
-        default=6.0,
+        default=_D.match_sigma,
         help="Neighborhood sigma (voxels) for -match localnorm.",
     )
     flow.add_argument(
         "-demons_noise",
         "-demons-noise",
         type=float,
-        default=1.0,
+        default=_D.demons_noise,
         help="Demons normalization K: intensity difference (in prepped units) at which "
         "the force is damped. Smaller = more conservative.",
     )
@@ -321,14 +344,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-lk_radius",
         "-lk-radius",
         type=int,
-        default=2,
+        default=_D.lk_radius,
         help="Lucas-Kanade neighborhood half-width in voxels (window (2r+1)^3).",
     )
     flow.add_argument(
         "-lk_reg",
         "-lk-reg",
         type=float,
-        default=1e-2,
+        default=_D.lk_reg,
         help="Ridge on the LK structure tensor, relative to its mean trace.",
     )
     flow.add_argument(
@@ -338,7 +361,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-hs_iters",
         "-hs-iters",
         type=int,
-        default=20,
+        default=_D.hs_iters,
         help="Horn-Schunck Jacobi iterations per flow solve.",
     )
 
@@ -356,21 +379,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-max_step",
         "-max-step",
         type=float,
-        default=1.0,
+        default=_D.max_step,
         help="Cap on the largest per-iteration displacement, in voxels.",
     )
     reg.add_argument(
         "-update_sigma",
         "-update-sigma",
         type=float,
-        default=1.0,
+        default=_D.update_sigma,
         help="Fluid regularization: update-field Gaussian sigma (voxels; 0=off).",
     )
     reg.add_argument(
         "-total_sigma",
         "-total-sigma",
         type=float,
-        default=1.0,
+        default=_D.total_sigma,
         help="Elastic/diffusion regularization: total-field Gaussian sigma (voxels; "
         "0=off, which lets the field get loose at small scales).",
     )
@@ -378,7 +401,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-invert_iters",
         "-invert-iters",
         type=int,
-        default=8,
+        default=_D.invert_iters,
         help="Fixed-point iterations for displacement-field inversion.",
     )
 
@@ -390,13 +413,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     mr.add_argument(
         "-smooth",
         type=str,
-        default="2x1x0",
+        default=_fmt_schedule(_D.smoothing_sigmas),
         help="Per-level Gaussian pre-smoothing sigmas in voxels, e.g. 2x1x0.",
     )
     mr.add_argument(
         "-iters",
         type=str,
-        default="100x70x40",
+        default=_fmt_schedule(_D.iterations),
         help="Per-level max iteration counts, e.g. 100x70x40 (an upper bound; a level "
         "usually stops earlier via convergence).",
     )
@@ -404,7 +427,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-conv_window",
         "-conv-window",
         type=int,
-        default=10,
+        default=_D.convergence_window,
         help="Trailing-window size for convergence/early-stopping. <=0 disables it "
         "(run the full -iters). The best-metric warp is always returned, so running "
         "to exhaustion never over-warps.",
@@ -413,7 +436,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-conv_thresh",
         "-conv-thresh",
         type=float,
-        default=1e-6,
+        default=_D.convergence_threshold,
         help="Convergence slope threshold; larger stops sooner.",
     )
 
@@ -421,7 +444,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     met = p.add_argument_group("monitoring metric")
     met.add_argument(
         "-metric",
-        choices=("cc", "lpa", "lpc", "pearson", "mse"),
+        # From the shared registry, not a second hand-maintained list: a metric
+        # declared differentiable there is optimisable here by construction.
+        choices=METRICS,
         default="cc",
         help="Metric used to pick the best iterate and detect convergence. The flow "
         "equation drives the update; this decides which iterate to keep.",
@@ -430,14 +455,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-cc_radius",
         "-cc-radius",
         type=int,
-        default=4,
+        default=_D.cc_radius,
         help="CC neighborhood half-width in voxels (window (2r+1)^3).",
     )
     met.add_argument(
         "-lpa_sigma",
         "-lpa-sigma",
         type=float,
-        default=4.0,
+        default=_D.lpa_sigma,
         help="Neighborhood size (voxels) for the lpa/lpc metrics.",
     )
     met.add_argument(
@@ -510,12 +535,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Interpolation for the final warped image.",
     )
 
+    add_recipe_arg(p, _PRESET_BACKEND)
+    add_deterministic_arg(p)
     add_device_arg(
         p,
         extra="On Apple Silicon, MPS is useful for LK/HS on full-size volumes; CPU is often as fast for demons.",
     )
     add_verbose_arg(p)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # After parsing, so that "did the user type this flag" is answerable from argv
+    # rather than guessed by comparing values against defaults.
+    apply_recipe_preset(args, _PRESET_BACKEND, argv, verb=getattr(args, "verb", 1))
+    return args
 
 
 def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
@@ -574,6 +605,8 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     # Select device (prefer CUDA > MPS > CPU), honouring -device end to end.
     device = setup_device(args.device, tf32=REGISTRATION_TF32)

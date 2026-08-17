@@ -123,11 +123,19 @@ class AffineAlignConfig:
     twopass: bool = True
     coarse_range: float = 30.0  # rotation half-range, degrees
     coarse_step: float = 5.0  # rotation step, degrees
-    coarse_shift_frac: float = 0.32  # translation half-range (fraction of grid)
+    coarse_shift_frac: float = 0.321  # translation half-range (fraction of grid)
     coarse_shift_steps: int = 7  # samples per translation axis (odd, incl. 0)
     coarse_scale_range: float = 0.20  # scale half-range (fraction)
     range_scale: float = 1.0  # global shrink for all coarse ranges + bounds
-    tbest: int = 3  # best coarse candidates to carry into refinement
+    # Best coarse candidates carried into refinement. None -> resolved per cost
+    # by `_default_tbest`, because "more trials" is only free on the blok path.
+    tbest: int | None = None
+    # Joint-coarse seed grid: samples per translation axis and per rotation axis,
+    # so the seed count is n_trans^3 * n_rot^3 (+ a few random). Rotation is
+    # sampled finer because cmass already fixes translation but never rotation.
+    coarse_n_trans: int = 3
+    coarse_n_rot: int | None = None  # None -> derived from coarse_range/coarse_step
+    coarse_n_random: int = 32  # extra random joint seeds, for robustness
 
     # Refinement tuning. Iteration counts are ceilings; Adam stops early on a
     # relative-tolerance plateau, so generous caps are cheap when converged.
@@ -164,6 +172,10 @@ class AffineAlignConfig:
     # Verbosity
     verb: int = 1
 
+    def __post_init__(self):
+        if self.tbest is None:
+            self.tbest = _default_tbest(self.cost)
+
 
 # ---------------------------------------------------------------------------
 # Cost function dispatch
@@ -171,6 +183,81 @@ class AffineAlignConfig:
 
 # Costs that need the blok lattice (AFNI-faithful local Pearson).
 _BLOK_COSTS = ("lpa", "lpc")
+
+# Default coarse candidates to refine, by cost family. The blok costs refine
+# their trials as one batched, point-subsampled Adam, so trials are nearly free
+# up to ~10 (measured: tbest 1..10 all inside the run-to-run spread) and keeping
+# more of the coarse lottery costs nothing. The other costs refine on the full
+# grid without that batching, where each extra trial is paid in full — measured
+# on one pair, tbest 3 -> 10 took ls from 34s to 86s and nmi from 60s to 159s.
+_TBEST_DEFAULT_BLOK = 10
+_TBEST_DEFAULT_OTHER = 3
+
+
+def _default_tbest(cost: str) -> int:
+    return _TBEST_DEFAULT_BLOK if _base_cost(cost) in _BLOK_COSTS else _TBEST_DEFAULT_OTHER
+
+
+# AFNI's lpc+/lpa+ combination weights (DEFAULT_MICHO_* in 3dAllineate.c), as
+# (hel, mi, nmi, crA). The overlap term is carried separately by -ov, since it
+# needs the source coverage map rather than the joint histogram. lpa+ drops the
+# MI term (3dAllineate.c, 27 May 2021), which is the only difference.
+_MICHO_LPC = (0.4, 0.2, 0.2, 0.4)
+_MICHO_LPA = (0.4, 0.0, 0.2, 0.4)
+_MICHO_OV = 0.4
+
+_COMBO_COSTS = {
+    "lpc+": ("lpc", _MICHO_LPC, False),
+    "lpa+": ("lpa", _MICHO_LPA, False),
+    "lpc+zz": ("lpc", _MICHO_LPC, True),
+    "lpa+zz": ("lpa", _MICHO_LPA, True),
+}
+
+
+def _parse_cost(name: str) -> tuple[str, tuple[float, float, float, float] | None, bool]:
+    """Split a cost name into (base cost, combination weights, ZZ final flag).
+
+    ``lpc+``/``lpa+`` add weighted hel/mi/nmi/crA terms to the local-Pearson
+    cost, which makes the basin wider and the search more robust. ``+ZZ`` then
+    drops those terms for the final polish, so the answer is a pure lpc/lpa
+    optimum that the combination merely helped to find.
+    """
+    key = name.lower()
+    if key in _COMBO_COSTS:
+        return _COMBO_COSTS[key]
+    return name, None, False
+
+
+def _base_cost(name: str) -> str:
+    return _parse_cost(name)[0]
+
+
+def _micho_terms(ctx: CostContext, base_v: Tensor, warped_v: Tensor, weight_v) -> Tensor:
+    """The lpc+/lpa+ extra terms, in ffs (higher == better) units.
+
+    Each of AFNI's four extra functionals, converted to our sign convention, is
+    just the standalone ffs cost, so the combination collapses to a plain
+    weighted sum ``base + sum(w_i * term_i)`` (the constant offsets AFNI carries
+    do not affect the optimum).
+    """
+    base_v = base_v.reshape(-1)
+    warped_v = warped_v.reshape(-1)
+    weight_v = None if weight_v is None else weight_v.reshape(-1)
+    idx = ctx.micho_subset(base_v.numel(), base_v.device)
+    if idx is not None:
+        base_v = base_v[idx]
+        warped_v = warped_v[idx]
+        weight_v = None if weight_v is None else weight_v[idx]
+    return cost_hist.combo_terms(
+        base_v,
+        warped_v,
+        ctx.micho,  # type: ignore[arg-type]
+        weight=weight_v,
+        base_clip=ctx.base_clip,
+        source_clip=ctx.source_clip,
+    )
+
+
 # Costs built from the 2D joint histogram.
 _HIST_COSTS = ("mi", "nmi", "je", "hel", "cru", "cra", "crm")
 
@@ -207,11 +294,40 @@ class CostContext:
     src_cov: Tensor | None = None
     base_dom: Tensor | None = None
     ov_denom: float = 1.0
+    # lpc+/lpa+ combination weights (hel, mi, nmi, crA); None == a pure cost.
+    # ``micho_zfinal`` is AFNI's +ZZ: drop them for the final polish.
+    micho: tuple[float, float, float, float] | None = None
+    micho_zfinal: bool = False
+    # Points used for the combination's joint histogram. The extra functionals
+    # are a basin-widening prior, not the precision term, and a 97x97 histogram
+    # is already well determined by ~10^5 samples — while the index_add backward
+    # over every match point is what makes the combined costs slow (measured
+    # fwd+bwd at 11 trials: 95 ms/iteration on 896k points, 12 ms on 100k).
+    micho_npts: int = 100_000
+    _micho_idx: dict = None  # type: ignore[assignment]
     _blok_cache: dict = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self._blok_cache is None:
             self._blok_cache = {}
+        if self._micho_idx is None:
+            self._micho_idx = {}
+
+    def micho_subset(self, n: int, device) -> Tensor | None:
+        """Fixed random subset of ``n`` point positions for the combination terms.
+
+        Cached and deterministic, so the combined cost surface is stable across
+        iterations the way the main match-point set is. ``None`` means "use all
+        of them" (the input is already small enough).
+        """
+        if n <= self.micho_npts:
+            return None
+        idx = self._micho_idx.get(n)
+        if idx is None:
+            g = torch.Generator(device="cpu").manual_seed(4242)
+            idx = torch.randperm(n, generator=g)[: self.micho_npts].to(device)
+            self._micho_idx[n] = idx
+        return idx
 
     def blokset(self, shape, voxdims, device, blokrad_mm=None) -> BlokSet:
         """Get (or build + cache) the blok assignment for one grid.
@@ -266,6 +382,13 @@ class SampleSet:
 
 
 _SAMPLE_DEFAULT_FRAC = 0.47  # AFNI 3dAllineate default: 47% of the in-mask voxels
+
+# Cap on rotation samples per axis in the joint coarse grid. Seed count goes as
+# n_rot^3, and the batched evaluation is launch-bound (so nearly free) up to
+# ~20k seeds, then roughly linear: measured 3.4k -> 0.83s, 20k -> 0.99s,
+# 91k -> 2.94s, 166k -> 4.68s. 19 samples/axis is ~185k seeds, the most that
+# buys tickets at a defensible price; -hugerange is what reaches for it.
+_MAX_COARSE_ROT_SAMPLES = 19
 
 
 def _build_sample_set(
@@ -406,6 +529,9 @@ def _compute_cost(
             cost = cost_hist.cr_cost(base, warped, mode=mode, **kw)
     else:
         raise ValueError(f"Unknown cost function: {name}")
+
+    if ctx.micho is not None:
+        cost = cost + _micho_terms(ctx, base, warped, weight)
 
     # Overlap penalty (subtracted because we maximise; AFNI adds it to a cost it
     # minimises). Only when -ov is set and a transform is available.
@@ -649,6 +775,8 @@ def _compute_param_bounds(
     base_shape: tuple[int, int, int],
     cmass_shift: np.ndarray | None = None,
     range_scale: float = 1.0,
+    rot_range: float = 30.0,
+    shift_frac: float = 0.321,
 ) -> np.ndarray:
     """Compute AFNI-style parameter bounds.
 
@@ -667,12 +795,13 @@ def _compute_param_bounds(
     rs = range_scale
 
     # Translation range: ±32% of FOV (* range_scale), centered at cmass.
-    tx, ty, tz = 0.321 * rs * (nx - 1), 0.321 * rs * (ny - 1), 0.321 * rs * (nz - 1)
+    sf = shift_frac * rs
+    tx, ty, tz = sf * (nx - 1), sf * (ny - 1), sf * (nz - 1)
     bounds[0] = [cmass_shift[0] - tx, cmass_shift[0] + tx]
     bounds[1] = [cmass_shift[1] - ty, cmass_shift[1] + ty]
     bounds[2] = [cmass_shift[2] - tz, cmass_shift[2] + tz]
 
-    bounds[3:6] = [-30.0 * rs, 30.0 * rs]  # rotations (degrees)
+    bounds[3:6] = [-rot_range * rs, rot_range * rs]  # rotations (degrees)
     sc = 0.20 * rs  # scale half-range (±20%)
     bounds[6:9] = [1.0 - sc, 1.0 + sc]
     bounds[9:12] = [-0.1111 * rs, 0.1111 * rs]  # shears
@@ -830,11 +959,23 @@ def _coarse_search_joint(
     base_pts = base_blur.reshape(-1)[idx_c]
     blokset_c = assign_bloks_points(coords_mm, ctx.bloktype, blokrad_c, device=device)
 
-    # --- joint seed set: grid over (3 translations x 3 rotations per axis) ---
+    # --- joint seed set: grid over (n_t translations x n_r rotations per axis) ---
     def _axis(lo, hi, n):
         return torch.linspace(float(lo), float(hi), n, device=device)
 
-    n_t, n_r = 3, 5  # rotation finer (cmass fixes translation, not rotation)
+    # Rotation density follows -coarse_step across the (already -coarse_range
+    # wide) bounds; -coarse_n_rot overrides it outright. Seeds are cheap: the
+    # batched evaluation is launch-bound, so 3.4k -> 20k seeds costs ~0.2s.
+    # What is NOT cheap is being wrong about the *range* — seeds packed more
+    # densely into a box that excludes the answer never find it.
+    n_t = config.coarse_n_trans
+    if config.coarse_n_rot is not None:
+        n_r = config.coarse_n_rot
+    else:
+        span = float(bounds[3, 1] - bounds[3, 0])
+        n_r = int(
+            min(_MAX_COARSE_ROT_SAMPLES, max(3, round(span / max(config.coarse_step, 0.5)) + 1))
+        )
     tax = [_axis(bounds[a, 0], bounds[a, 1], n_t) for a in range(3)]
     rax = [_axis(bounds[3 + a, 0], bounds[3 + a, 1], n_r) for a in range(3)]
     tg = torch.meshgrid(*tax, indexing="ij")
@@ -846,13 +987,14 @@ def _coarse_search_joint(
     seeds[:, 3:6] = rots.repeat(nt3, 1)
 
     # plus a handful of random joint seeds (deterministic) for robustness
-    n_rand = 32
-    g = torch.Generator(device="cpu").manual_seed(2024)
-    rnd = _base_params(n_rand, torch.zeros(n_rand, 3, device=device), device)
-    for a in range(6):
-        lo, hi = float(bounds[a, 0]), float(bounds[a, 1])
-        rnd[:, a] = torch.rand(n_rand, generator=g).to(device) * (hi - lo) + lo
-    seeds = torch.cat([seeds, rnd], dim=0)
+    n_rand = config.coarse_n_random
+    if n_rand > 0:
+        g = torch.Generator(device="cpu").manual_seed(2024)
+        rnd = _base_params(n_rand, torch.zeros(n_rand, 3, device=device), device)
+        for a in range(6):
+            lo, hi = float(bounds[a, 0]), float(bounds[a, 1])
+            rnd[:, a] = torch.rand(n_rand, generator=g).to(device) * (hi - lo) + lo
+        seeds = torch.cat([seeds, rnd], dim=0)
 
     # --- batched subsampled evaluation of every seed ---
     matrices = params_to_matrix_batched(seeds)
@@ -1264,6 +1406,12 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
         )  # (T, M)
         val = local_pearson_value_batched(base_pts, warped, weight_s, blokset, ctx.ppow)  # (T,)
         c = (-val) if is_lpc else val.abs()
+        if ctx.micho is not None:
+            # The histogram terms are per-transform and not batched; T is small
+            # (tbest+1), so a loop costs a few kernels, not a rewrite.
+            c = c + torch.stack(
+                [_micho_terms(ctx, base_pts, warped[t], weight_s) for t in range(warped.shape[0])]
+            )
         if ctx.ov_weight > 0.0 and ctx.src_cov is not None:
             pens = torch.stack(
                 [
@@ -1584,6 +1732,8 @@ def _refine_progressive(
             )
             val = local_pearson_value(base_pts, warped_s, samp.weight_s, blokset_s, ppow=ctx.ppow)
             c = (-val) if is_lpc else val.abs()
+            if ctx.micho is not None:
+                c = c + _micho_terms(ctx, base_pts, warped_s, samp.weight_s)
             if ctx.ov_weight > 0.0 and ctx.src_cov is not None:
                 c = c - ctx.ov_weight * _overlap_penalty(ctx, matrix, ctx.src_cov.shape)
             return c
@@ -1684,6 +1834,15 @@ def _refine_progressive(
     if config.powell_maxfev > 0:
         if verb >= 1:
             print("  Powell polish (full resolution):")
+
+        # AFNI's +ZZ: the combination widened the basin and got us here, but the
+        # answer we want is the pure lpc/lpa optimum, so drop the extra terms
+        # before the final pass. Mutating ctx is deliberate — every cost closure
+        # captures ctx and nothing else, so this switches all of them at once.
+        if ctx.micho is not None and ctx.micho_zfinal:
+            if verb >= 1:
+                print(f"    +ZZ: finishing on pure {ctx.name} (combination terms dropped)")
+            ctx.micho = None
 
         polish_cost_fn = (
             _sampled_cost_fn(base, source, ctx.blokrad_mm, sample) if use_sample else None
@@ -1930,13 +2089,16 @@ def allineate(
     # Build the cost context (blok geometry + histogram clips), reused for
     # every cost evaluation in this run.
     voxdims = _voxdims_from_header(base_header)
+    cost_name, micho, micho_zfinal = _parse_cost(config.cost)
     blokrad_mm = config.blokrad
-    if config.cost in _BLOK_COSTS and blokrad_mm is None:
+    if cost_name in _BLOK_COSTS and blokrad_mm is None:
         from .cost_blok import auto_blok_radius
 
         blokrad_mm = auto_blok_radius(voxdims, config.bloktype)
     base_clip = source_clip = None
-    if config.cost in _HIST_COSTS:
+    # The lpc+/lpa+ combinations lean on the histogram functionals too, so they
+    # need the same clip ranges the pure histogram costs get.
+    if cost_name in _HIST_COSTS or micho is not None:
         base_clip = clip_range(base_opt)
         source_clip = clip_range(source_opt)
 
@@ -1955,7 +2117,9 @@ def allineate(
         ov_denom = float(min(base_dom.sum().item(), src_cov.sum().item()))
 
     ctx = CostContext(
-        name=config.cost,
+        name=cost_name,
+        micho=micho,
+        micho_zfinal=micho_zfinal,
         sigma=config.lpa_sigma,
         kernel=config.lpa_kernel,
         bloktype=config.bloktype,
@@ -1977,14 +2141,19 @@ def allineate(
     init_params = identity_params(device=device)
 
     # Parameter bounds centred on identity (the residual after the baked shift).
-    bounds = _compute_param_bounds(base_opt.shape, range_scale=config.range_scale)
+    bounds = _compute_param_bounds(
+        base_opt.shape,
+        range_scale=config.range_scale,
+        rot_range=config.coarse_range,
+        shift_frac=config.coarse_shift_frac,
+    )
 
     # Match-point subsampling for the blok costs: build a fixed random subset of
     # the weight domain once (point-wise sampling), shared by the joint coarse
     # search and the refinement, so both are O(n_match) instead of O(all voxels)
     # and the bloks are populated only by brain points, not the background.
     sample = None
-    if config.cost in _BLOK_COSTS:
+    if cost_name in _BLOK_COSTS:
         sample = _build_sample_set(
             base_opt, weight_opt, voxdims, config.n_match, config.bloktype, device
         )
@@ -2147,7 +2316,7 @@ def allineate(
         # not the whole grid, so it isn't diluted by background bloks, and it's
         # free (no extra full-grid blok lattice to build). Other costs print the
         # full-grid value of the final warp.
-        if config.cost in _BLOK_COSTS and sample is not None:
+        if cost_name in _BLOK_COSTS and sample is not None:
             print(f"Final cost ({config.cost}, in-mask): {best_refine_cost:.6f}")
         else:
             final_cost = _compute_cost(base, warped, weight, ctx, voxdims)

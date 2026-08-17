@@ -900,3 +900,292 @@ class TestWarpStateMutation:
         ws.warped_source = torch.randn(8, 16, 16)
         assert ws.xd.shape == (8, 16, 16)
         assert ws.cost == pytest.approx(666.666)
+
+
+class TestGaussNewtonPatchOptimizer:
+    """GN replaces Adam's backward pass with normal equations built directly.
+
+    Measured on a real 193^3 T1->MNI fit: backward was 58% of runtime and Adam
+    needed ~24 evaluations per patch group. GN reaches AFNI-equivalent alignment in
+    13.1s against Adam's 35.0s and 3dQwarp's 543s.
+    """
+
+    def _pair(self, n=24):
+        import numpy as np
+        import torch
+
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n // 2
+
+        def blob(cx, r, amp=100.0):
+            return (
+                amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))
+            ).astype(np.float32)
+
+        base = torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0))
+        moving = torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0))
+        return base, moving
+
+    def _run(self, **kw):
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        cfg = QwarpConfig(verb=0, cost_method="pearclp", minpatch=9, **kw)
+        return qwarp(base, moving, config=cfg, device=torch.device("cpu"))
+
+    def test_gauss_newton_improves_the_alignment(self):
+        import torch
+
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, moving = self._pair()
+        warped, *_ = self._run(optimizer="gn")
+        before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
+        after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+        assert after < before
+        assert torch.isfinite(warped).all()
+
+    def test_lands_near_the_adam_answer(self):
+        """Different route, same destination -- within a tolerance, since the two
+        optimisers do genuinely converge to different local points."""
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, _ = self._pair()
+        adam, *_ = self._run()
+        gn, *_ = self._run(optimizer="gn")
+        a = evaluate_metrics(MetricInputs(base=base, moving=adam), ["ls"])["ls"]
+        g = evaluate_metrics(MetricInputs(base=base, moving=gn), ["ls"])["ls"]
+        assert abs(a - g) < 0.15, f"GN diverged from Adam: {g:.4f} vs {a:.4f}"
+
+    def test_produces_a_sound_warp(self):
+        from fastfuncstuff.processing.mask import automask
+        from fastfuncstuff.processing.warpqc import regularity_verdict, warp_regularity
+
+        base, _ = self._pair()
+        _, xd, yd, zd = self._run(optimizer="gn")
+        off = [(a - b) // 2 for a, b in zip(xd.shape, base.shape, strict=True)]
+        sl = tuple(slice(o, o + s) for o, s in zip(off, base.shape, strict=True))
+        qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
+        assert regularity_verdict(qc)[0] != "fail"
+
+    def test_is_deterministic(self):
+        import torch
+
+        a = self._run(optimizer="gn")[0]
+        b = self._run(optimizer="gn")[0]
+        assert torch.equal(a, b)
+
+    def test_falls_back_to_adam_for_costs_without_a_surrogate(self):
+        """The descriptor costs have no least-squares residual, so GN cannot apply
+        -- and asking for it must not silently produce a different (or broken)
+        answer. lpa and lncc DO have one, via locally normalised residuals; see
+        TestGaussNewtonLocalCosts."""
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        dev = torch.device("cpu")
+        plain = qwarp(
+            base, moving, config=QwarpConfig(verb=0, cost_method="mind", minpatch=9), device=dev
+        )[0]
+        asked = qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method="mind", minpatch=9, optimizer="gn"),
+            device=dev,
+        )[0]
+        assert torch.equal(plain, asked)
+
+    def test_adam_remains_the_default(self):
+        """GN is opt-in: it lands on AFNI's answer where Adam lands slightly past
+        it, so the safer route stays the default until the benchmark says otherwise."""
+        from fastfuncstuff.processing.warp import QwarpConfig
+
+        assert QwarpConfig().optimizer == "adam"
+
+
+class TestGaussNewtonLocalCosts:
+    """The local-Pearson costs get GN through a locally normalised residual.
+
+    lpa has no residual form of its own -- AFNI aggregates z*|z| over Fisher-z
+    transformed local correlations -- but minimising the squared difference of
+    locally normalised patches maximises local correlation, which points the same
+    way. Measured on a real 193^3 fit: lpa Adam 96.7s -> GN 15.9s, with GN slightly
+    *better* on ls, mi and lncc.
+    """
+
+    def _pair(self, n=24):
+        import numpy as np
+        import torch
+
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n // 2
+
+        def blob(cx, r, amp=100.0):
+            return (
+                amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))
+            ).astype(np.float32)
+
+        return (
+            torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0)),
+            torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0)),
+        )
+
+    def _run(self, cost, **kw):
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        return qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, **kw),
+            device=torch.device("cpu"),
+        )
+
+    @pytest.mark.parametrize("cost", ["lpa", "lncc"])
+    def test_local_gn_improves_alignment(self, cost):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, moving = self._pair()
+        warped, *_ = self._run(cost, optimizer="gn")
+        before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
+        after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+        assert after < before
+
+    @pytest.mark.parametrize("cost", ["lpa", "lncc"])
+    def test_local_gn_tracks_the_adam_answer(self, cost):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        base, _ = self._pair()
+        a = evaluate_metrics(MetricInputs(base=base, moving=self._run(cost)[0]), ["ls"])["ls"]
+        g = evaluate_metrics(
+            MetricInputs(base=base, moving=self._run(cost, optimizer="gn")[0]), ["ls"]
+        )["ls"]
+        assert abs(a - g) < 0.15, f"{cost}: GN {g:.4f} vs Adam {a:.4f}"
+
+    def test_lpc_is_excluded_from_gauss_newton(self):
+        """lpc rewards anti-correlation. A sum-of-squares residual between
+        normalised patches can only pull them together, so the surrogate would
+        point the wrong way -- it must fall back rather than optimise backwards."""
+        import torch
+
+        plain = self._run("lpc")[0]
+        asked = self._run("lpc", optimizer="gn")[0]
+        assert torch.equal(plain, asked)
+
+    def test_local_gn_produces_a_sound_warp(self):
+        from fastfuncstuff.processing.mask import automask
+        from fastfuncstuff.processing.warpqc import regularity_verdict, warp_regularity
+
+        base, _ = self._pair()
+        _, xd, yd, zd = self._run("lpa", optimizer="gn")
+        off = [(a - b) // 2 for a, b in zip(xd.shape, base.shape, strict=True)]
+        sl = tuple(slice(o, o + s) for o, s in zip(off, base.shape, strict=True))
+        qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
+        assert regularity_verdict(qc)[0] != "fail"
+
+
+class TestHybridOptimizer:
+    """Gauss-Newton to travel, a short Adam pass to close the surrogate's gap.
+
+    GN optimises a least-squares stand-in; Adam optimises the reported cost. On a
+    real 193^3 fit that difference was worth ls 0.3384 against 0.2977 on pearclp.
+    The hybrid spends a few autograd steps to recover it: lpa 94.8s -> 29.0s at
+    Adam's exact quality (0.3543 vs 0.3541), pearclp 35.5s -> 26.8s at 0.3019.
+    """
+
+    def _pair(self, n=24):
+        import numpy as np
+        import torch
+
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n // 2
+
+        def blob(cx, r, amp=100.0):
+            return (
+                amp * np.exp(-(((x - cx) ** 2 + (y - c) ** 2 + (z - c) ** 2) / (2 * r**2)))
+            ).astype(np.float32)
+
+        return (
+            torch.from_numpy(blob(c, n / 5) + blob(c - n / 5, n / 12, 40.0)),
+            torch.from_numpy(blob(c + 1.5, n / 4.5) + blob(c - n / 5 + 1.5, n / 12, 40.0)),
+        )
+
+    def _ls(self, cost, optimizer):
+        import torch
+
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        warped, *_ = qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, optimizer=optimizer),
+            device=torch.device("cpu"),
+        )
+        return evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+
+    @pytest.mark.parametrize("cost", ["pearclp", "lpa"])
+    def test_hybrid_is_no_worse_than_gauss_newton_alone(self, cost):
+        """The polish starts from GN's answer and only accepts improvements, so it
+        cannot hand back something worse than what it was given."""
+        assert self._ls(cost, "hybrid") <= self._ls(cost, "gn") + 1e-6
+
+    def test_polish_warm_starts_rather_than_restarting(self):
+        """A polish that began from zeros would throw away GN's work and just be a
+        short (and therefore bad) Adam run."""
+        import torch
+
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_batched
+
+        target = torch.tensor([[0.3, -0.2]])
+
+        def cost(p):
+            return ((p - target) ** 2).sum(dim=1)
+
+        cold, _, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=2, lr=0.01
+        )
+        warm, _, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=2, lr=0.01, init=target.clone()
+        )
+        assert float(cost(warm)) < float(cost(cold))
+
+    def test_warm_start_never_returns_worse_than_its_init(self):
+        import torch
+
+        from fastfuncstuff.processing.optimizer import optimize_warp_params_batched
+
+        good = torch.tensor([[0.5, 0.5]])
+
+        def cost(p):
+            return ((p - good) ** 2).sum(dim=1)
+
+        out, costs, _ = optimize_warp_params_batched(
+            cost, 1, 2, 1.0, torch.device("cpu"), max_iter=3, lr=0.5, init=good.clone()
+        )
+        assert float(costs[0]) <= 1e-6
+
+    def test_hybrid_falls_back_where_gauss_newton_does(self):
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._pair()
+        dev = torch.device("cpu")
+        plain = qwarp(
+            base, moving, config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9), device=dev
+        )[0]
+        asked = qwarp(
+            base,
+            moving,
+            config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9, optimizer="hybrid"),
+            device=dev,
+        )[0]
+        assert torch.equal(plain, asked)

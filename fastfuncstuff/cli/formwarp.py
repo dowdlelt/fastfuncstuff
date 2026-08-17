@@ -31,10 +31,14 @@ import torch
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
+    add_deterministic_arg,
     add_device_arg,
+    add_recipe_arg,
     add_verbose_arg,
+    apply_recipe_preset,
     collect_batch_jobs,
     combine_brain_masks,
+    enable_determinism,
     image_support,
     parse_prefix,
     run_batch_jobs,
@@ -55,6 +59,24 @@ from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
 from fastfuncstuff.processing.mask import data_coverage_mask
 from fastfuncstuff.utils import REGISTRATION_TF32
+
+
+def _fmt_schedule(values) -> str:
+    """A schedule tuple as the ANTs-style ``4x2x1`` string argparse shows as default."""
+    return "x".join(f"{v:g}" for v in values)
+
+
+# Argparse defaults are READ FROM the engine's config dataclass, never re-typed
+# here. A default that lives in two places drifts, and it did: the iteration
+# ceiling was raised in the engine after measuring that the old one starved the
+# finest level, and this CLI kept passing the old value, so every command-line
+# run silently kept the schedule the change existed to fix. The dataclass is the
+# single source of truth; this is a view of it.
+# Which PRESETS family `-type` should look up for this tool. The optiwarp
+# force models share a parameter set, so one entry covers all three.
+_PRESET_BACKEND = "formwarp"
+
+_D = SynConfig()
 
 
 def _int_list(spec: str) -> tuple[int, ...]:
@@ -224,20 +246,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-metric",
         choices=METRICS,
         default="cc",
-        help="Image metric (cc=neighborhood cross-correlation, the SyN default).",
+        help="Image metric. cc=neighborhood cross-correlation (the SyN default); "
+        "lncc is the same thing under its registry name; mse=squared difference "
+        "(same-modality only); ngf=normalized gradient fields and mind/mindssc="
+        "modality-independent neighbourhood descriptors, all three of which are "
+        "invariant to a contrast inversion and so are the cross-modal choices.",
     )
     p.add_argument(
         "-cc_radius",
         "-cc-radius",
         type=int,
-        default=4,
+        default=_D.cc_radius,
         help="CC neighborhood half-width in voxels (window (2r+1)^3).",
     )
     p.add_argument(
         "-lpa_sigma",
         "-lpa-sigma",
         type=float,
-        default=4.0,
+        default=_D.lpa_sigma,
         help="Neighborhood size (voxels) for the lpa/lpc metrics.",
     )
     p.add_argument(
@@ -253,28 +279,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-grad_step",
         "-grad-step",
         type=float,
-        default=0.25,
+        default=_D.grad_step,
         help="Max per-iteration displacement in voxels (SyN gradientStep).",
     )
     p.add_argument(
         "-update_var",
         "-update-var",
         type=float,
-        default=3.0,
+        default=_D.update_var,
         help="Fluid regularization: update-field Gaussian sigma (voxels).",
     )
     p.add_argument(
         "-total_var",
         "-total-var",
         type=float,
-        default=0.0,
+        default=_D.total_var,
         help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off).",
     )
     p.add_argument(
         "-invert_iters",
         "-invert-iters",
         type=int,
-        default=8,
+        default=_D.invert_iters,
         help="Fixed-point iterations for displacement-field inversion.",
     )
 
@@ -285,13 +311,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "-smooth",
         type=str,
-        default="2x1x0",
+        default=_fmt_schedule(_D.smoothing_sigmas),
         help="Per-level Gaussian pre-smoothing sigmas in voxels, e.g. 2x1x0.",
     )
     p.add_argument(
         "-iters",
         type=str,
-        default="100x70x40",
+        default=_fmt_schedule(_D.iterations),
         help="Per-level max iteration counts, e.g. 100x70x40 (an upper bound; "
         "a level usually stops earlier via convergence).",
     )
@@ -299,7 +325,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-conv_window",
         "-conv-window",
         type=int,
-        default=10,
+        default=_D.convergence_window,
         help="Trailing-window size for convergence/early-stopping. <=0 disables "
         "early stopping (run the full -iters). The best-cost warp is always "
         "returned, so running to exhaustion never over-warps.",
@@ -308,7 +334,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-conv_thresh",
         "-conv-thresh",
         type=float,
-        default=1e-6,
+        default=_D.convergence_threshold,
         help="Convergence slope threshold; larger stops sooner.",
     )
 
@@ -350,12 +376,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # Device
+    add_recipe_arg(p, _PRESET_BACKEND)
+    add_deterministic_arg(p)
     add_device_arg(
         p,
         extra="On Apple Silicon use CPU: MPS falls back to CPU for SyN's 3-D grid-sample backward pass.",
     )
     add_verbose_arg(p)
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    # After parsing, so that "did the user type this flag" is answerable from argv
+    # rather than guessed by comparing values against defaults.
+    apply_recipe_preset(args, _PRESET_BACKEND, argv, verb=getattr(args, "verb", 1))
+    return args
 
 
 def _select_device(args: argparse.Namespace) -> torch.device:
@@ -421,6 +453,8 @@ def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     if args.batch is not None or args.batch_run:
         # One process, many registrations: SyN's fixed costs (CUDA context,

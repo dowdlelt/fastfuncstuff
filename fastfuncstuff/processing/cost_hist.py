@@ -290,6 +290,44 @@ def hel_cost(base, warped, weight=None, nbin=None, base_clip=None, source_clip=N
     return 1.0 - aff
 
 
+def combo_terms(
+    base,
+    warped,
+    weights: tuple[float, float, float, float],
+    weight=None,
+    nbin=None,
+    base_clip=None,
+    source_clip=None,
+) -> Tensor:
+    """Weighted (hel, mi, nmi, crA) sum in ffs convention, from ONE histogram.
+
+    This is the extra half of AFNI's lpc+/lpa+ combination. Calling the four
+    ``*_cost`` helpers instead would build four *identical* joint histograms —
+    the dominant cost in the combination (a build is ~1.4 ms on 900k points,
+    against ~0.9 ms for the whole local-Pearson cost it is being added to), so
+    sharing the histogram is most of the difference between a usable combined
+    cost and an unusable one.
+    """
+    w_hel, w_mi, w_nmi, w_cra = weights
+    h = build_joint_hist(base, warped, weight, nbin, base_clip, source_clip)
+    total = None
+
+    def _add(acc, term):
+        return term if acc is None else acc + term
+
+    if w_hel:
+        total = _add(total, w_hel * (1.0 - hellinger(h)))
+    if w_mi:
+        total = _add(total, w_mi * mutual_info(h))
+    if w_nmi:
+        total = _add(total, w_nmi * -norm_mutinf(h))
+    if w_cra:
+        total = _add(total, w_cra * (1.0 - 0.5 * (_corr_ratio_yx(h) + _corr_ratio_xy(h))))
+    if total is None:
+        return torch.zeros((), device=h.xyc.device)
+    return total
+
+
 def cr_cost(
     base, warped, weight=None, mode="u", nbin=None, base_clip=None, source_clip=None
 ) -> Tensor:

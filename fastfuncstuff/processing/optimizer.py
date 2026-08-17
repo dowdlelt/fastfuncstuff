@@ -168,6 +168,7 @@ def optimize_warp_params_batched(
     tolerance: float = 1e-4,
     patience: int = 5,
     clip_group_size: int | None = None,
+    init: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, BatchOptStats]:
     """Optimize parameters for B patches simultaneously using autograd.
 
@@ -185,6 +186,8 @@ def optimize_warp_params_batched(
         tolerance: Per-patch relative-improvement threshold for "stalled".
         patience: Consecutive stalled steps before a patch is considered
             converged. The loop stops only once ALL patches have converged.
+        init: Optional (B, n_params) starting point; zeros (the identity warp) if
+            omitted.
         clip_group_size: If set, clip the gradient norm independently over
             consecutive groups of this many rows (to ``max_norm=1.0`` each),
             instead of one global norm over the whole batch. Used by the
@@ -197,7 +200,16 @@ def optimize_warp_params_batched(
     Returns:
         (best_params, best_costs, stats): (B, n_params), (B,), and budget stats.
     """
-    params = torch.zeros(B, n_params, device=device, dtype=torch.float32, requires_grad=True)
+    # ``init`` warm-starts from another optimiser's answer (the hybrid hands over
+    # Gauss-Newton's). Safe in either direction: the initial point is evaluated
+    # below and only ever replaced by something better, so a polish pass cannot
+    # return worse than what it was given.
+    start = (
+        torch.zeros(B, n_params, device=device, dtype=torch.float32)
+        if init is None
+        else init.detach().clone().to(device=device, dtype=torch.float32)
+    )
+    params = start.requires_grad_(True)
 
     optimizer = torch.optim.Adam([params], lr=lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max_iter)
@@ -264,3 +276,95 @@ def optimize_warp_params_batched(
     # Patches still improving (not yet stalled) when we ran out of budget.
     hit_budget = int((no_improve < patience).sum().item()) if steps_run >= max_iter else 0
     return best_params, best_costs, BatchOptStats(steps_run, B, hit_budget)
+
+
+def optimize_warp_params_gauss_newton(
+    normal_eqs_fn: Callable[[Tensor], tuple[Tensor, Tensor]],
+    cost_fn: Callable[[Tensor], Tensor],
+    B: int,
+    n_params: int,
+    param_max: float,
+    device: torch.device,
+    max_iter: int = 8,
+    lam0: float = 1e-3,
+    tolerance: float = 1e-5,
+) -> tuple[Tensor, Tensor, BatchOptStats]:
+    """Levenberg-damped Gauss-Newton over B patches at once.
+
+    The alternative to :func:`optimize_warp_params_batched`, which reaches the same
+    place by Adam. Adam needs a backward pass per step, and on a real 193^3 fit that
+    was 58% of the whole runtime for ~24 steps per patch group. Gauss-Newton builds
+    ``(JᵀJ, Jᵀr)`` directly from the steepest-descent images, so there is no backward
+    pass at all, and a quadratic model converges in single-figure iterations.
+
+    **GN proposes, the true cost decides.** The normal equations are built from a
+    least-squares surrogate (the zero-normalised NCC residual), which is not exactly
+    the functional the engine reports -- ``pearclp`` clips, for one. So every step is
+    accepted only if it improves the *real* cost, and rejected steps raise the
+    damping. That keeps the answer defined by the cost the user asked for while
+    letting the surrogate do the steering, and it makes a poor local quadratic model
+    a slowdown rather than a wrong result.
+
+    Damping is per patch: patches in a batch are separate problems and one badly
+    conditioned patch must not force caution on the rest -- to each according to its
+    need.
+
+    Args:
+        normal_eqs_fn: params (B, n) -> (hmat (B, n, n), grad (B, n)).
+        cost_fn: params (B, n) -> (B,) true cost, lower is better.
+        B, n_params, param_max: batch size, parameters per patch, box bound.
+        max_iter: GN iterations (each is one solve plus one cost evaluation).
+        lam0: initial Levenberg damping, relative to the diagonal of JᵀJ.
+        tolerance: stop once every patch improves by less than this, relatively.
+
+    Returns:
+        (best_params, best_costs, stats).
+    """
+    params = torch.zeros(B, n_params, device=device, dtype=torch.float32)
+    best_costs = cost_fn(params).detach()
+    best_params = params.clone()
+    lam = torch.full((B, 1, 1), lam0, device=device, dtype=torch.float32)
+    eye = torch.eye(n_params, device=device, dtype=torch.float32).expand(B, -1, -1)
+
+    n_evals = 1
+    iters_done = 0
+    for _ in range(max_iter):
+        iters_done += 1
+        hmat, grad = normal_eqs_fn(best_params)
+
+        # Marquardt scaling: damp each parameter by its own curvature rather than
+        # by a shared absolute value, so the step is invariant to how the basis
+        # happens to be scaled.
+        diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-12)
+        damped = hmat + lam * torch.diag_embed(diag) + 1e-9 * eye
+        try:
+            delta = torch.linalg.solve(damped, grad.unsqueeze(-1)).squeeze(-1)
+        except RuntimeError:
+            delta = torch.linalg.lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
+        delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
+
+        trial = (best_params + delta).clamp(-param_max, param_max)
+        trial_costs = cost_fn(trial).detach()
+        n_evals += 1
+
+        better = trial_costs < best_costs
+        rel = (best_costs - trial_costs).abs() / best_costs.abs().clamp_min(1e-12)
+        best_params = torch.where(better.unsqueeze(-1), trial, best_params)
+        best_costs = torch.where(better, trial_costs, best_costs)
+        # Classic Levenberg feedback, per patch: trust the model more when it
+        # worked, less when it did not.
+        lam = torch.where(
+            better.view(B, 1, 1), (lam * 0.33).clamp_min(1e-9), (lam * 4.0).clamp_max(1e6)
+        )
+
+        if bool(((~better) | (rel < tolerance)).all()):
+            break
+
+    stats = BatchOptStats(
+        steps_run=iters_done,
+        n_patches=B,
+        # A GN loop that used its whole budget is one whose quadratic model never
+        # settled; same meaning as the Adam path's, so the same telemetry reads it.
+        hit_budget=B if iters_done >= max_iter else 0,
+    )
+    return best_params, best_costs, stats

@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -50,6 +51,7 @@ from .cost import (
     BatchedIncrementalCorrelation,
     IncrementalCorrelation,
     _auto_clip,
+    _make_kernel_1d,
     batched_lpa_cost,
 )
 from .cost_blok import (
@@ -61,13 +63,20 @@ from .cost_blok import (
 from .interp import (
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
+    batched_interp_3ch,
     batched_trilinear_interpolate,
     batched_trilinear_interpolate_multi,
     trilinear_interpolate,
     warp_image,
 )
-from .optimizer import optimize_warp_params_batched, optimize_warp_params_torch
-from .penalty import compute_jacobian_energy, compute_penalty_batched
+from .metrics import PATCH_METRICS, batched_patch_cost
+from .optimizer import (
+    BatchOptStats,
+    optimize_warp_params_batched,
+    optimize_warp_params_gauss_newton,
+    optimize_warp_params_torch,
+)
+from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
 from .weight import compute_weight_image
 
 # Cache for torch.compile'd building-block functions (stable identity, compiled once)
@@ -171,6 +180,49 @@ class QwarpConfig:
     penalty_factor: float = 0.033
     """Base Jacobian-energy penalty factor. Matches AFNI's Hpen_fbase=0.033."""
 
+    hybrid_polish_iters: int = 10
+    """Adam steps after the Gauss-Newton pass when ``optimizer="hybrid"``. Short by
+    design: GN has already done the travelling, this only recovers what the
+    least-squares surrogate could not see."""
+
+    gn_iters: int = 8
+    """Gauss-Newton iterations at the *finest* levels, where a phase holds tens of
+    thousands of patches and an iteration is expensive.
+
+    Measured as a binding ceiling, not a generous one: at 8 iterations the loop was
+    still improving the cost in 88-93% of patch groups. Raising it costs time
+    linearly, so the ceiling is scaled by how cheap the level is -- see
+    :attr:`gn_iters_coarse`."""
+
+    gn_iters_coarse: int = 8
+    """Gauss-Newton ceiling where a phase holds few patches. Equal to
+    :attr:`gn_iters` by default, i.e. the taper is off.
+
+    The idea it implements is sound and was measured: residual left at a coarse
+    level does not stay there, so spending more iterations early should reduce what
+    the fine levels have to undo. Raising this to 32 does improve the result --
+    ls 0.2320 against 0.2363, about four times the run-to-run noise.
+
+    It is off because the premise that coarse levels are *cheap* turned out to be
+    false. A coarse phase holds 16 patches against a fine phase's 67000, but each
+    patch is correspondingly enormous, and every level covers the same volume; the
+    measured per-level times are nearly flat (4.9, 5.3, 4.9, 3.1, 2.8, 2.5, 2.5,
+    2.6, 3.2, 5.5, 9.9 s). So the taper is not a free lunch, it is a straight trade:
+    +108% runtime for +1.9% on ls. Worth it for a final warp, not for a tuning
+    sweep, so it is a choice rather than a default."""
+
+    gn_coarse_patches: int = 2000
+    """Patch count at which the coarse ceiling applies in full; above it the budget
+    tapers toward :attr:`gn_iters` as the square root of the patch count."""
+
+    cc_radius: int = 4
+    """Neighbourhood half-width for ``cost_method="lncc"``. Clamped per level so the
+    window fits inside the patch -- an oversized window makes every voxel see the same
+    whole-patch statistics, silently turning the local metric into a global one."""
+
+    mind_radius: float = 1.0
+    """Patch radius for the MIND / MIND-SSC descriptors."""
+
     penalty_first_level: int = 3
     """First level to apply penalty (no penalty before this). Matches AFNI's
     Hpen_first_lev=3; on first activation the factor is halved."""
@@ -194,10 +246,20 @@ class QwarpConfig:
     """Verbosity level (0=quiet, 1=normal, 2=detailed)."""
 
     optimizer: str = "adam"
-    """Per-patch optimizer for the ME-scaled polish: 'adam' (autodiff, any cost) or
-    'gn' (Gauss-Newton / Levenberg-Marquardt with an analytic image-gradient Jacobian).
-    'gn' requires the differentiable-normalisation ncc cost and is much faster (no
-    autograd backward, converges in a few steps); it falls back to adam for lpc/lpa."""
+    """Per-patch optimizer, for **both** the ME-scaled polish and the ordinary warp:
+    'adam' (autodiff, any cost) or 'gn' (Levenberg-damped Gauss-Newton with an
+    analytic image-gradient Jacobian).
+
+    'gn' needs a least-squares surrogate, which the correlation costs have -- the
+    plain ones through a patch-wide zero-normalised residual, lpa and lncc through a
+    locally normalised one. It falls back to adam for anything else, notably lpc
+    (which rewards anti-correlation, so a sum-of-squares residual would point
+    backwards) and the descriptor costs.
+
+    Measured on a 193^3 T1->MNI fit against AFNI 3dQwarp's 543.2s: pearclp 35.0s ->
+    13.1s, lpa 96.7s -> 15.9s, lncc 131.5s -> 15.0s. On lpa it is also *better* than
+    adam on every independent metric. Every step is accepted or rejected on the true
+    cost, so the surrogate steers but the reported functional still decides."""
 
     batch_optimizer_lr: float = 0.008
     """Learning rate for the batched Adam optimizer."""
@@ -291,6 +353,20 @@ class WarpState:
     patches_skipped: int = 0
     last_level: int = 0  # highest refinement level executed (for pyramid hand-off)
 
+    # One entry per pyramid level: patch size, the cost either side of it, how long
+    # it took, and how many patches ran. Recorded because the levels are a
+    # *trajectory*, not independent settings -- a run at minpatch 5 passes through
+    # 25, 19, 13 and 9 on the way down, so one run already contains the answer to
+    # "was going finer worth it?" that testing each minpatch separately pays for
+    # five times over. See `qwarp_level_gains`.
+    level_log: list[dict] = field(default_factory=list)
+
+    # Gradient of the (unchanging) source volume, stacked (3, nz, ny, nx). Built on
+    # first use by the Gauss-Newton path and kept, because it is the same for every
+    # patch of every level and rebuilding it per phase would cost more than the
+    # solve it feeds.
+    source_grad_3ch: Tensor = field(default_factory=lambda: torch.empty(0))
+
     # Per-level optimizer-budget telemetry (batched path only); reset each level.
     opt_steps_weighted: int = 0  # sum over batches of steps_run * B
     opt_patches_counted: int = 0  # patches that went through the batched optimizer
@@ -342,8 +418,13 @@ def qwarp(
     config: QwarpConfig | None = None,
     device: torch.device | None = None,
     pad: bool = True,
+    level_log: list[dict] | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute nonlinear warp from source to base image.
+
+    ``level_log``, if given, is filled with one record per pyramid level: patch
+    size, the cost either side of it, and how long it took. An out-parameter rather
+    than a fifth return value so existing callers are untouched.
 
     This is the main entry point, equivalent to IW3D_warp_s2bim().
 
@@ -447,6 +528,8 @@ def qwarp(
         _warpomatic_pyramid(base_p, source_p, weight_p, mask_p, state, config, device)
     else:
         _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
+    if level_log is not None:
+        level_log.extend(state.level_log)
 
     # Final warped image: apply warp to unpadded source, crop to original size.
     # Single pass through the total warp; final_interp (wsinc5 by default, like
@@ -576,6 +659,39 @@ def _checkerboard_phases(
     return phases
 
 
+def _box_sums(vol: Tensor, bounds: Tensor) -> Tensor:
+    """Sum of ``vol`` over each box in ``bounds``, in one shot.
+
+    ``bounds`` is ``(P, 6)`` as ``(kbot, ktop, jbot, jtop, ibot, itop)``, inclusive.
+    Uses a summed-area table: build the 3-D prefix sum once, then every box is eight
+    lookups, so P boxes cost eight gathers instead of P slice-and-reduce pairs.
+
+    The accumulation dtype is raised deliberately -- int64 for an integer volume,
+    float64 for a real one. A prefix sum reassociates the additions, and these sums
+    are compared against thresholds; at float32 a box near a threshold could land on
+    the other side of it and silently change which patches get optimised.
+    """
+    acc = torch.int64 if not vol.is_floating_point() else torch.float64
+    pref = torch.zeros(
+        (vol.shape[0] + 1, vol.shape[1] + 1, vol.shape[2] + 1), dtype=acc, device=vol.device
+    )
+    pref[1:, 1:, 1:] = vol.to(acc).cumsum(0).cumsum(1).cumsum(2)
+
+    k0, k1 = bounds[:, 0], bounds[:, 1] + 1
+    j0, j1 = bounds[:, 2], bounds[:, 3] + 1
+    i0, i1 = bounds[:, 4], bounds[:, 5] + 1
+    return (
+        pref[k1, j1, i1]
+        - pref[k0, j1, i1]
+        - pref[k1, j0, i1]
+        - pref[k1, j1, i0]
+        + pref[k0, j0, i1]
+        + pref[k0, j1, i0]
+        + pref[k1, j0, i0]
+        - pref[k0, j0, i0]
+    )
+
+
 def _filter_patches(
     patches: list[PatchSpec],
     weight: Tensor,
@@ -584,30 +700,44 @@ def _filter_patches(
     ny: int,
     nz: int,
 ) -> list[PatchSpec]:
-    """Filter out patches with insufficient weight/mask coverage."""
+    """Filter out patches with insufficient weight/mask coverage.
+
+    Vectorised over patches. The obvious loop -- slice each patch, sum, and call
+    ``.item()`` -- costs two CPU-GPU synchronisations per patch, and a fine level
+    considers hundreds of thousands of patches: profiled at 1.84 million ``.item()``
+    calls on one 193^3 fit, which is what left the GPU idle for stretches while
+    Python walked the list. Here the whole decision is one summed-area table and a
+    single transfer.
+    """
+    if not patches:
+        return []
+
+    keep = [
+        p
+        for p in patches
+        if not (p.itop - p.ibot < 4 and p.jtop - p.jbot < 4 and p.ktop - p.kbot < 4)
+    ]
+    if not keep:
+        return []
+
     w_avg = float(weight[mask > 0].mean().item()) if (mask > 0).any() else 1.0
-    valid = []
-    for p in patches:
-        nxh = p.itop - p.ibot + 1
-        nyh = p.jtop - p.jbot + 1
-        nzh = p.ktop - p.kbot + 1
-        n_voxels = nxh * nyh * nzh
+    bounds = torch.tensor(
+        [(p.kbot, p.ktop, p.jbot, p.jtop, p.ibot, p.itop) for p in keep],
+        device=weight.device,
+        dtype=torch.long,
+    )
+    n_voxels = (
+        (bounds[:, 1] - bounds[:, 0] + 1)
+        * (bounds[:, 3] - bounds[:, 2] + 1)
+        * (bounds[:, 5] - bounds[:, 4] + 1)
+    ).to(torch.float64)
 
-        if nxh < 5 and nyh < 5 and nzh < 5:
-            continue
+    n_masked = _box_sums(mask, bounds).to(torch.float64)
+    w_sum = _box_sums(weight, bounds)
 
-        m_patch = mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
-        w_patch = weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
-        n_masked = int(m_patch.sum().item())
-        w_sum = float(w_patch.sum().item())
-
-        if n_masked < 0.333 * n_voxels or w_sum < 0.166 * n_voxels * w_avg:
-            continue
-
-        # Check base isn't constant in this patch
-        valid.append(p)
-
-    return valid
+    ok = (n_masked >= 0.333 * n_voxels) & (w_sum >= 0.166 * n_voxels * w_avg)
+    ok_cpu = ok.cpu().tolist()  # the one synchronisation
+    return [p for p, good in zip(keep, ok_cpu, strict=True) if good]
 
 
 # ---------------------------------------------------------------------------
@@ -1316,8 +1446,25 @@ def _warpomatic(
                     print(f"  {msg}")
             break
 
+        elapsed = time.time() - t0
+        # t0 is set once before the level loop (it drives the progress bar), so
+        # `elapsed` is time-since-start. The log wants time-in-THIS-level, which is
+        # the whole point of the column -- cumulative seconds make every level look
+        # more expensive than the last by construction.
+        prev_total = state.level_log[-1]["cumulative_seconds"] if state.level_log else 0.0
+        state.level_log.append(
+            {
+                "level": lev,
+                "patch": int(xwid),
+                "cost_before": float(cost_at_start),
+                "cost_after": float(state.cost),
+                "seconds": float(elapsed - prev_total),
+                "cumulative_seconds": float(elapsed),
+                "patches_done": int(state.patches_done),
+                "patches_skipped": int(state.patches_skipped),
+            }
+        )
         if config.verb >= 1:
-            elapsed = time.time() - t0
             # Optimizer-budget readout: mean Adam steps/patch and the share of
             # patches that were still improving when they hit the iter cap (a high
             # % means raising -batch_iters would buy more warp).
@@ -1358,6 +1505,115 @@ def _warpomatic(
 # ---------------------------------------------------------------------------
 # Batched GPU patch optimization (the fast path)
 # ---------------------------------------------------------------------------
+
+
+def _gn_normal_eqs_3d(
+    w: Tensor,
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    omega: Tensor,
+    wsum: Tensor,
+    base_hat: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Zero-normalised-NCC Gauss-Newton normal equations for a 3-D patch warp.
+
+    The three-direction generalisation of :func:`_mescaled_gn_normal_eqs`, which
+    solves the same problem for a phase-encode-only field. A parameter here is
+    (direction, basis function), so the Jacobian gains a column block per active
+    direction and the solve is over ``D * nb`` unknowns instead of ``nb``.
+
+    The normalisation is the point. The cost is a *correlation*, so the residual has
+    to be taken between zero-mean unit-variance patches; differentiating that
+    normalisation is what the ``mdW`` and ``sW`` terms are. Skipping it and
+    regressing on raw intensities would solve a least-squares problem the engine is
+    not scoring.
+
+    Args:
+        w: (B, V) warped patch values at the current parameters.
+        g: (D, B, V) source-image gradient sampled at the same locations, one per
+            active direction.
+        hw: (D, 1, 1) half-width scale per active direction.
+        bt: (V, nb) basis, transposed.
+        omega: (B, V) per-voxel weight * mask.
+        wsum: (B, 1) weight sum per patch.
+        base_hat: (B, V) zero-normalised base patches.
+
+    Returns:
+        ``hmat`` (B, D*nb, D*nb) and ``grad`` (B, D*nb).
+    """
+    mw = (omega * w).sum(-1, keepdim=True) / wsum
+    sw = ((omega * w * w).sum(-1, keepdim=True) / wsum - mw * mw).clamp_min(1e-12).sqrt()
+    res = base_hat - (w - mw) / sw  # (B, V)
+
+    # Steepest-descent images, one block of nb columns per active direction.
+    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
+    jn = (dw - mdw) / sw.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
+    grad = torch.einsum("bvn,bv->bn", jnw, res)
+    return hmat, grad
+
+
+def _gn_normal_eqs_local(
+    w: Tensor,
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    omega: Tensor,
+    base_hat: Tensor,
+    kernel: Tensor,
+    dims: tuple[int, int, int],
+) -> tuple[Tensor, Tensor]:
+    """Gauss-Newton normal equations for the **local** Pearson costs.
+
+    Same construction as :func:`_gn_normal_eqs_3d` with one substitution: the
+    zero-normalisation uses locally smoothed statistics instead of one mean and one
+    standard deviation per patch. Minimising ``sum (a_hat - b_hat)^2`` over locally
+    normalised images maximises local correlation, which is what ``lpa`` scores --
+    so this is a least-squares surrogate for a cost that has no residual form of its
+    own. It is not the reported functional (AFNI aggregates ``z*|z|`` over Fisher-z
+    transformed correlations); it only has to point the same way, and the caller
+    accepts or rejects every step on the real cost.
+
+    The local mean and standard deviation of the *moving* patch are frozen at the
+    current parameters rather than differentiated. That is the standard cheap
+    approximation for local-correlation gradients, and it is what keeps the
+    Jacobian from needing its own smoothing pass per column -- with ``D*nb`` columns
+    over a patch-sized grid, that pass would cost more than the solve it feeds.
+    Freezing makes the quadratic model slightly wrong, which under an accept/reject
+    loop buys iterations rather than errors.
+
+    Args:
+        w: (B, V) warped patch values.
+        g: (D, B, V) source gradient at the same locations.
+        hw: (D, 1, 1) half-width scale per active direction.
+        bt: (V, nb) basis, transposed.
+        omega: (B, V) weight * mask.
+        base_hat: (B, V) locally normalised base patches.
+        kernel: 1-D smoothing kernel defining the neighbourhood.
+        dims: (nzh, nyh, nxh) patch shape, so (B, V) can be seen as a grid again.
+    """
+    from .cost import _batched_separable_smooth_3d
+
+    b, v = w.shape
+    nzh, nyh, nxh = dims
+
+    def sm(flat: Tensor) -> Tensor:
+        return _batched_separable_smooth_3d(flat.reshape(b, 1, nzh, nyh, nxh), kernel).reshape(b, v)
+
+    sw = sm(omega).clamp_min(1e-10)
+    mw = sm(omega * w) / sw
+    sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
+
+    res = base_hat - (w - mw) / sd
+    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    jn = dw / sd.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
+    grad = torch.einsum("bvn,bv->bn", jnw, res)
+    return hmat, grad
 
 
 def _improve_warp_batched(
@@ -1409,49 +1665,56 @@ def _improve_warp_batched(
     if n_active == 0:
         return
 
-    # Gather patch offsets
-    ibots = torch.tensor([p.ibot for p in patches], device=device, dtype=torch.float32)
-    jbots = torch.tensor([p.jbot for p in patches], device=device, dtype=torch.float32)
-    kbots = torch.tensor([p.kbot for p in patches], device=device, dtype=torch.float32)
+    # Patch offsets, built as one host->device transfer rather than three. Every
+    # patch in a phase is the same size, so the whole phase is addressable by one
+    # flat index and the gathers below are single ops instead of B slices apiece --
+    # at a fine level B is tens of thousands, and the per-patch form spent more time
+    # in Python launching kernels than the GPU spent running them.
+    # Via numpy rather than torch.tensor(list-of-tuples): torch walks a Python
+    # sequence element by element, which at tens of thousands of patches was 5.6 ms
+    # per phase and 7% of a profiled run. numpy builds the buffer in one pass and
+    # torch adopts it.
+    origins = torch.from_numpy(
+        np.fromiter(
+            (c for p in patches for c in (p.kbot, p.jbot, p.ibot)),
+            dtype=np.int64,
+            count=3 * len(patches),
+        ).reshape(len(patches), 3)
+    ).to(device)
+    kbots = origins[:, 0].to(torch.float32)
+    jbots = origins[:, 1].to(torch.float32)
+    ibots = origins[:, 2].to(torch.float32)
 
-    # Gather fixed data: base, weight, mask as (B, V) tensors
-    base_patches = torch.stack(
-        [
-            base[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
-            for p in patches
-        ]
+    # (B, V) index into the flattened volume. ii/jj/kk_flat come from a
+    # meshgrid(..., indexing="ij") over (nzh, nyh, nxh) flattened C-order, which is
+    # exactly the order `vol[kbot:ktop+1, ...].reshape(-1)` produces, so this gathers
+    # the same values in the same order as the slice it replaces.
+    _gather_idx = (
+        (origins[:, 0:1] + kk_flat.long()) * (ny * nx)
+        + (origins[:, 1:2] + jj_flat.long()) * nx
+        + (origins[:, 2:3] + ii_flat.long())
     )
-    weight_patches = torch.stack(
-        [
-            weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
-            for p in patches
-        ]
-    )
-    mask_patches = torch.stack(
-        [
-            mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1).float()
-            for p in patches
-        ]
-    )
+
+    base_patches = base.reshape(-1)[_gather_idx]
+    weight_patches = weight.reshape(-1)[_gather_idx]
+    mask_patches = mask.reshape(-1)[_gather_idx].float()
 
     # Cost selection: blok-based local Pearson (lpc/lpa, AFNI-faithful),
     # the older convolution LPA (lpa_alt), or INCOR (pearson/pearclp).
     use_blok = config.cost_method in ("lpc", "lpa")
     use_conv_lpa = config.cost_method == "lpa_alt"
+    # The registry's neighbourhood metrics, evaluated per patch. They need the 3-D
+    # block back, which a flat (B, V) patch trivially reshapes to.
+    use_patch_metric = config.cost_method in PATCH_METRICS
     blok_prep = None
     if use_blok:
-        blok_idx_patches = torch.stack(
-            [
-                blok_index_vol[
-                    p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
-                ].reshape(-1)
-                for p in patches
-            ]
-        )
+        # use_blok is only set when the caller supplied the blok index volume.
+        assert blok_index_vol is not None
+        blok_idx_patches = blok_index_vol.reshape(-1)[_gather_idx]
         blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
         _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     batch_incor = None
-    if not (use_blok or use_conv_lpa):
+    if not (use_blok or use_conv_lpa or use_patch_metric):
         batch_incor = BatchedIncrementalCorrelation(
             method=config.cost_method,
             base_clip=base_clip,
@@ -1472,17 +1735,24 @@ def _improve_warp_batched(
     if use_penalty:
         with torch.no_grad():
             je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
-            energy_global = je_global + se_global
+            energy_global = penalty_energy(je_global, se_global)
             global_energy_sum = energy_global.sum()
-            # Gather patch energies as (B,) via stacking
-            patch_energies = torch.stack(
+            # Per-patch energy sums via the same summed-area table _filter_patches
+            # uses: eight gathers for the whole phase instead of B slice-and-reduce
+            # pairs. float64 accumulation because this feeds a penalty compared
+            # against a threshold, and a prefix sum reassociates the additions.
+            _pen_bounds = torch.stack(
                 [
-                    energy_global[
-                        p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
-                    ].sum()
-                    for p in patches
-                ]
+                    origins[:, 0],
+                    origins[:, 0] + (nzh - 1),
+                    origins[:, 1],
+                    origins[:, 1] + (nyh - 1),
+                    origins[:, 2],
+                    origins[:, 2] + (nxh - 1),
+                ],
+                dim=1,
             )
+            patch_energies = _box_sums(energy_global, _pen_bounds).to(energy_global.dtype)
             external_pen = global_energy_sum - patch_energies
 
     # Axis weight scales
@@ -1554,7 +1824,19 @@ def _improve_warp_batched(
         warped_vals = warped_vals * mask_patches
 
         # Batched cost: (B,) (all conventions are higher == better here)
-        if use_blok:
+        if use_patch_metric:
+            corr = batched_patch_cost(
+                config.cost_method,
+                base_patches,
+                warped_vals,
+                weight_patches,
+                nzh,
+                nyh,
+                nxh,
+                cc_radius=config.cc_radius,
+                mind_radius=config.mind_radius,
+            )
+        elif use_blok:
             corr = _blok_value(
                 base_patches, warped_vals, weight_patches, blok_prep, config.lpc_ppow
             )
@@ -1587,18 +1869,159 @@ def _improve_warp_batched(
 
         return cost
 
-    # Run batched Adam optimizer
-    best_params, _best_costs, opt_stats = optimize_warp_params_batched(
-        batched_cost,
-        B,
-        n_active,
-        param_max,
-        device,
-        max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
-        lr=config.batch_optimizer_lr,
-        tolerance=config.batch_optimizer_tol,
-        patience=config.batch_optimizer_patience,
-    )
+    # Gauss-Newton needs a least-squares surrogate, which the correlation costs
+    # have (the zero-normalised residual) and the local-Pearson / descriptor costs
+    # do not. Where it does not apply the Adam path is used unchanged.
+    # lpa (and lncc) get the *local* surrogate; the plain correlations get the
+    # global one. lpc is excluded on purpose: it rewards anti-correlation, and a
+    # sum-of-squares residual between normalised patches can only ever pull them
+    # together, so the surrogate would point the wrong way for that cost alone.
+    gn_local = config.cost_method in ("lpa", "lpa_alt", "lncc")
+    gn_global = config.cost_method in ("pearson", "pearclp", "ncc")
+    gn_capable = gn_local or gn_global
+    use_gn = config.optimizer in ("gn", "hybrid") and gn_capable
+    # Hybrid: Gauss-Newton to get close cheaply, then a short Adam pass on the
+    # *reported* cost to close the gap the least-squares surrogate leaves. On
+    # pearclp, GN lands on AFNI's answer and Adam lands past it; the surrogate is
+    # the difference, and it is worth a few autograd steps to recover.
+    use_hybrid = config.optimizer == "hybrid" and gn_capable
+
+    if use_gn:
+        if state.source_grad_3ch.numel() == 0:
+            gz, gy, gx = torch.gradient(source)
+            state.source_grad_3ch = torch.stack([gx, gy, gz], dim=0).contiguous()
+        source_grad_3ch = state.source_grad_3ch
+        bt = basis.reshape(basis.shape[0], -1).t().contiguous()  # (V, n_basis)
+        hw_active = torch.tensor(
+            [half_widths[d] * axis_weights[d] for d in active_dims],
+            device=device,
+            dtype=torch.float32,
+        ).view(-1, 1, 1)
+        omega = (weight_patches * mask_patches).to(torch.float32)
+        wsum = omega.sum(-1, keepdim=True).clamp_min(1e-12)
+        gn_kernel = _make_kernel_1d(
+            config.lpa_kernel, min(config.lpa_sigma, (min(nzh, nyh, nxh) - 1) / 2.0), device
+        )
+        if gn_local:
+            # The base never moves, so its local statistics are computed once.
+            from .cost import _batched_separable_smooth_3d
+
+            def _sm(flat: Tensor) -> Tensor:
+                return _batched_separable_smooth_3d(
+                    flat.reshape(B, 1, nzh, nyh, nxh), gn_kernel
+                ).reshape(B, -1)
+
+            sw_b = _sm(omega).clamp_min(1e-10)
+            bm = _sm(omega * base_patches) / sw_b
+            bs = (_sm(omega * base_patches * base_patches) / sw_b - bm * bm).clamp_min(1e-10).sqrt()
+        else:
+            bm = (omega * base_patches).sum(-1, keepdim=True) / wsum
+            bs = (
+                ((omega * base_patches * base_patches).sum(-1, keepdim=True) / wsum - bm * bm)
+                .clamp_min(1e-12)
+                .sqrt()
+            )
+        base_hat = (base_patches - bm) / bs
+
+        def gn_normal_eqs(active_params: Tensor) -> tuple[Tensor, Tensor]:
+            with torch.no_grad():
+                full = active_params @ expand_mat
+                hxd_, hyd_, hzd_ = _eval_warp(basis, full, half_widths, do_xyz)
+                w_, ax_, ay_, az_ = _compose(
+                    source,
+                    state.xd,
+                    state.yd,
+                    state.zd,
+                    hxd_,
+                    hyd_,
+                    hzd_,
+                    ii_flat,
+                    jj_flat,
+                    kk_flat,
+                    ibots,
+                    jbots,
+                    kbots,
+                    nx,
+                    ny,
+                    nz,
+                    global_warp_3ch=global_warp_3ch,
+                    base_i=base_i,
+                    base_j=base_j,
+                    base_k=base_k,
+                )
+                # Sample the source gradient at the very positions the source was
+                # sampled at -- recomputed rather than returned, because it is two
+                # adds and a clamp against another grid_sample.
+                sx = (ax_ + base_i).clamp(-0.499, nx - 0.501)
+                sy = (ay_ + base_j).clamp(-0.499, ny - 0.501)
+                sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
+                gx_, gy_, gz_ = batched_interp_3ch(source_grad_3ch, sx, sy, sz)
+                gall = torch.stack([gx_, gy_, gz_], dim=0)[list(active_dims)]
+                if gn_local:
+                    return _gn_normal_eqs_local(
+                        w_ * mask_patches,
+                        gall * mask_patches,
+                        hw_active,
+                        bt,
+                        omega,
+                        base_hat,
+                        gn_kernel,
+                        (nzh, nyh, nxh),
+                    )
+                return _gn_normal_eqs_3d(
+                    w_ * mask_patches, gall * mask_patches, hw_active, bt, omega, wsum, base_hat
+                )
+
+        def gn_cost(active_params: Tensor) -> Tensor:
+            with torch.no_grad():
+                return batched_cost(active_params)
+
+        # Effort in proportion to what an iteration costs here. A phase of 16
+        # patches gets the coarse ceiling outright; one of 67000 gets the base.
+        _taper = (config.gn_coarse_patches / max(B, 1)) ** 0.5
+        gn_budget = min(
+            config.gn_iters_coarse,
+            max(config.gn_iters, int(round(config.gn_iters * _taper))),
+        )
+        best_params, _best_costs, opt_stats = optimize_warp_params_gauss_newton(
+            gn_normal_eqs,
+            gn_cost,
+            B,
+            n_active,
+            param_max,
+            device,
+            max_iter=gn_budget,
+        )
+        if use_hybrid:
+            best_params, _best_costs, polish_stats = optimize_warp_params_batched(
+                batched_cost,
+                B,
+                n_active,
+                param_max,
+                device,
+                max_iter=config.hybrid_polish_iters,
+                lr=config.batch_optimizer_lr,
+                tolerance=config.batch_optimizer_tol,
+                patience=config.batch_optimizer_patience,
+                init=best_params,
+            )
+            opt_stats = BatchOptStats(
+                steps_run=opt_stats.steps_run + polish_stats.steps_run,
+                n_patches=B,
+                hit_budget=polish_stats.hit_budget,
+            )
+    else:
+        best_params, _best_costs, opt_stats = optimize_warp_params_batched(
+            batched_cost,
+            B,
+            n_active,
+            param_max,
+            device,
+            max_iter=config.batch_optimizer_iters if max_iter is None else max_iter,
+            lr=config.batch_optimizer_lr,
+            tolerance=config.batch_optimizer_tol,
+            patience=config.batch_optimizer_patience,
+        )
     # Accumulate per-level optimizer-budget telemetry (batched path only).
     state.opt_steps_weighted += opt_stats.steps_run * opt_stats.n_patches
     state.opt_patches_counted += opt_stats.n_patches
@@ -1633,22 +2056,19 @@ def _improve_warp_batched(
         )
 
         # Write back warp AND warped_source. Patches in a phase overlap by a voxel at
-        # their seams, so this serial loop is load-bearing: the last patch in lattice
-        # order wins, matching AFNI. Any vectorised replacement must go through
-        # _dedup_last_wins -- a raw scatter would be nondeterministic there.
-        for idx_p, p in enumerate(patches):
-            state.xd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_xd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.yd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_yd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.zd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_zd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.warped_source[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = (
-                warped_vals[idx_p].reshape(nzh, nyh, nxh)
-            )
+        # their seams, so the winner at a shared voxel has to be the last patch in
+        # lattice order, matching AFNI -- a raw scatter would leave it unspecified
+        # and drift run to run. _dedup_last_wins picks exactly that winner, which is
+        # what makes the vectorised form equivalent to the serial loop it replaces
+        # rather than merely faster.
+        _w_dst, _w_src = _dedup_last_wins(_gather_idx.reshape(-1))
+        for field, vals in (
+            (state.xd, ah_xd),
+            (state.yd, ah_yd),
+            (state.zd, ah_zd),
+            (state.warped_source, warped_vals),
+        ):
+            field.reshape(-1)[_w_dst] = vals.reshape(-1)[_w_src]
 
     state.patches_done += B
 
@@ -1817,7 +2237,7 @@ def _improve_warp_batched_multi(
                 je, se = compute_jacobian_energy(
                     mstate.xd_all[v], mstate.yd_all[v], mstate.zd_all[v]
                 )
-                energy = (je + se).reshape(-1)
+                energy = penalty_energy(je, se).reshape(-1)
                 patch_e = energy[flat_idx].sum(dim=1)  # (P,)
                 external_pen[a * P : (a + 1) * P] = energy.sum() - patch_e
 
@@ -2862,7 +3282,7 @@ def _improve_warp_batched_mescaled(
     if use_penalty:
         with torch.no_grad():
             je_g, se_g = compute_jacobian_energy(state.xd, state.yd, state.zd)
-            energy_g = (je_g + se_g).reshape(-1)
+            energy_g = penalty_energy(je_g, se_g).reshape(-1)
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
