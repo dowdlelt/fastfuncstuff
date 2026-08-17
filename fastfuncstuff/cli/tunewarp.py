@@ -139,6 +139,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Adaptive only: keep every knob inside its listed range. Off by "
         "default because an optimum on a range edge means the range is wrong.",
     )
+    search.add_argument(
+        "-note",
+        default="",
+        metavar="TEXT",
+        help="One line describing what this data actually is, e.g. 'MP2RAGE 7T T1, "
+        "0.8mm, 5 healthy adults'. Stored with the run and carried into -export and "
+        "-guide. A preset is a claim that settings suit data of a KIND, and the "
+        "shape and voxel size recorded automatically do not say which kind.",
+    )
     search.add_argument("-seed", type=int, default=0, help="Adaptive only: RNG seed (default: 0)")
     search.add_argument(
         "-max_configs",
@@ -462,6 +471,7 @@ def main(argv: list[str] | None = None) -> int:
         optimize=recipe.optimize,
         panel=recipe.panel(),
         search=args.search,
+        note=args.note,
     )
 
     if args.allineate:

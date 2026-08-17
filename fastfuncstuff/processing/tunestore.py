@@ -103,6 +103,7 @@ class RunMeta:
             f"    {len(self.subjects)} subject(s), grid {shape} @ {vox} mm, "
             f"{self.n_mask_voxels} in-mask voxels\n"
             f"    device={self.device}, torch={self.torch_version}"
+            + (f"\n    data: {self.note}" if self.note else "")
         )
 
 
@@ -982,6 +983,8 @@ def format_guide(store: TrialStore, recipe: str) -> str:
             f"device {meta.device}.",
             "",
         ]
+        if meta.note:
+            out += [f"Data: {meta.note}", ""]
 
     out += ["## Is nonlinear worth it here?", ""]
     if base is not None and metric:
