@@ -194,7 +194,7 @@ def _separable_smooth_3d(
     """Apply 3D smoothing using separable convolution.
 
     Args:
-        vol: (1, 1, D, H, W) or (D, H, W) volume.
+        vol: (N, C, D, H, W) or (D, H, W) volume.
         sigma: Kernel parameter — Gaussian sigma or box radius, in voxels. A
             3-tuple gives a per-axis ``(z, y, x)`` extent, which is how a
             physical (mm) smoothing width is expressed on an anisotropic grid.
@@ -207,29 +207,41 @@ def _separable_smooth_3d(
     if squeeze:
         vol = vol[None, None]
 
+    if vol.ndim != 5:
+        raise ValueError(f"expected a 3-D or 5-D volume, got shape {tuple(vol.shape)}")
+
+    # Treat every batch/channel plane as an independent convolution group. This
+    # preserves the scalar-volume result while allowing vector fields and banks of
+    # local-statistic moments to share one padding and convolution launch per axis.
+    n_batch, n_chan, nz, ny, nx = vol.shape
+    n_groups = n_batch * n_chan
+    vol = vol.reshape(1, n_groups, nz, ny, nx)
+
     sz, sy, sx = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
 
     # Z
     if vol.shape[2] > 1:
         kernel = _make_kernel_1d(kernel_type, sz, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, :, None, None]
+        k = kernel[None, None, :, None, None].expand(n_groups, 1, -1, 1, 1)
         vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
     # Y
     if vol.shape[3] > 1:
         kernel = _make_kernel_1d(kernel_type, sy, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, :, None]
+        k = kernel[None, None, None, :, None].expand(n_groups, 1, 1, -1, 1)
         vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
     # X
     if vol.shape[4] > 1:
         kernel = _make_kernel_1d(kernel_type, sx, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, None, :]
+        k = kernel[None, None, None, None, :].expand(n_groups, 1, 1, 1, -1)
         vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
+
+    vol = vol.reshape(n_batch, n_chan, nz, ny, nx)
 
     if squeeze:
         vol = vol[0, 0]

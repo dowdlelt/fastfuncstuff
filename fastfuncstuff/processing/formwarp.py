@@ -327,11 +327,9 @@ def _smooth_field(xd: Tensor, yd: Tensor, zd: Tensor, sigma: float) -> Field:
     """Gaussian-smooth each component of a displacement field (no-op if sigma<=0)."""
     if sigma <= 0:
         return xd, yd, zd
-    return (
-        _separable_smooth_3d(xd, sigma, kernel_type="gauss"),
-        _separable_smooth_3d(yd, sigma, kernel_type="gauss"),
-        _separable_smooth_3d(zd, sigma, kernel_type="gauss"),
-    )
+    packed = torch.stack((xd, yd, zd), dim=0)[None]
+    smoothed = _separable_smooth_3d(packed, sigma, kernel_type="gauss")[0]
+    return smoothed[0], smoothed[1], smoothed[2]
 
 
 def _void_guard_field(cover: Tensor, sigma: float = 2.0) -> tuple[Tensor, ...] | None:

@@ -185,6 +185,33 @@ class TestSeparableSmooth3D:
         smoothed = _separable_smooth_3d(vol, 2.0)
         assert smoothed.shape == vol.shape
 
+    def test_multichannel_matches_individual_smoothing(self):
+        torch.manual_seed(12)
+        vol = torch.randn(2, 3, 8, 10, 12, device=DEV)
+        packed = _separable_smooth_3d(vol, 1.5)
+        individual = torch.stack(
+            [
+                torch.stack([_separable_smooth_3d(vol[n, c], 1.5) for c in range(3)])
+                for n in range(2)
+            ]
+        )
+        torch.testing.assert_close(packed, individual, atol=1e-5, rtol=1e-5)
+
+    def test_multichannel_gradient_matches_individual_smoothing(self):
+        torch.manual_seed(13)
+        packed_input = torch.randn(1, 3, 7, 9, 11, device=DEV, requires_grad=True)
+        reference_input = packed_input.detach().clone().requires_grad_(True)
+
+        _separable_smooth_3d(packed_input, 1.25).square().sum().backward()
+        sum(
+            _separable_smooth_3d(reference_input[0, c], 1.25).square().sum()
+            for c in range(3)
+        ).backward()
+
+        torch.testing.assert_close(
+            packed_input.grad, reference_input.grad, atol=1e-5, rtol=1e-5
+        )
+
     def test_box_kernel(self):
         vol = torch.randn(8, 10, 12, device=DEV)
         smoothed = _separable_smooth_3d(vol, 2.0, kernel_type="box")
