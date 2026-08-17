@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -1642,9 +1643,17 @@ def _improve_warp_batched(
     # flat index and the gathers below are single ops instead of B slices apiece --
     # at a fine level B is tens of thousands, and the per-patch form spent more time
     # in Python launching kernels than the GPU spent running them.
-    origins = torch.tensor(
-        [(p.kbot, p.jbot, p.ibot) for p in patches], device=device, dtype=torch.long
-    )
+    # Via numpy rather than torch.tensor(list-of-tuples): torch walks a Python
+    # sequence element by element, which at tens of thousands of patches was 5.6 ms
+    # per phase and 7% of a profiled run. numpy builds the buffer in one pass and
+    # torch adopts it.
+    origins = torch.from_numpy(
+        np.fromiter(
+            (c for p in patches for c in (p.kbot, p.jbot, p.ibot)),
+            dtype=np.int64,
+            count=3 * len(patches),
+        ).reshape(len(patches), 3)
+    ).to(device)
     kbots = origins[:, 0].to(torch.float32)
     jbots = origins[:, 1].to(torch.float32)
     ibots = origins[:, 2].to(torch.float32)
@@ -1672,14 +1681,9 @@ def _improve_warp_batched(
     use_patch_metric = config.cost_method in PATCH_METRICS
     blok_prep = None
     if use_blok:
-        blok_idx_patches = torch.stack(
-            [
-                blok_index_vol[
-                    p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
-                ].reshape(-1)
-                for p in patches
-            ]
-        )
+        # use_blok is only set when the caller supplied the blok index volume.
+        assert blok_index_vol is not None
+        blok_idx_patches = blok_index_vol.reshape(-1)[_gather_idx]
         blok_prep = prepare_blok_pairs(blok_idx_patches, nblok)
         _blok_value = lpc_value_pairs if config.cost_method == "lpc" else lpa_value_pairs
     batch_incor = None
@@ -1706,15 +1710,22 @@ def _improve_warp_batched(
             je_global, se_global = compute_jacobian_energy(state.xd, state.yd, state.zd)
             energy_global = penalty_energy(je_global, se_global)
             global_energy_sum = energy_global.sum()
-            # Gather patch energies as (B,) via stacking
-            patch_energies = torch.stack(
+            # Per-patch energy sums via the same summed-area table _filter_patches
+            # uses: eight gathers for the whole phase instead of B slice-and-reduce
+            # pairs. float64 accumulation because this feeds a penalty compared
+            # against a threshold, and a prefix sum reassociates the additions.
+            _pen_bounds = torch.stack(
                 [
-                    energy_global[
-                        p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1
-                    ].sum()
-                    for p in patches
-                ]
+                    origins[:, 0],
+                    origins[:, 0] + (nzh - 1),
+                    origins[:, 1],
+                    origins[:, 1] + (nyh - 1),
+                    origins[:, 2],
+                    origins[:, 2] + (nxh - 1),
+                ],
+                dim=1,
             )
+            patch_energies = _box_sums(energy_global, _pen_bounds).to(energy_global.dtype)
             external_pen = global_energy_sum - patch_energies
 
     # Axis weight scales
@@ -2011,22 +2022,19 @@ def _improve_warp_batched(
         )
 
         # Write back warp AND warped_source. Patches in a phase overlap by a voxel at
-        # their seams, so this serial loop is load-bearing: the last patch in lattice
-        # order wins, matching AFNI. Any vectorised replacement must go through
-        # _dedup_last_wins -- a raw scatter would be nondeterministic there.
-        for idx_p, p in enumerate(patches):
-            state.xd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_xd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.yd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_yd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.zd[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = ah_zd[
-                idx_p
-            ].reshape(nzh, nyh, nxh)
-            state.warped_source[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1] = (
-                warped_vals[idx_p].reshape(nzh, nyh, nxh)
-            )
+        # their seams, so the winner at a shared voxel has to be the last patch in
+        # lattice order, matching AFNI -- a raw scatter would leave it unspecified
+        # and drift run to run. _dedup_last_wins picks exactly that winner, which is
+        # what makes the vectorised form equivalent to the serial loop it replaces
+        # rather than merely faster.
+        _w_dst, _w_src = _dedup_last_wins(_gather_idx.reshape(-1))
+        for field, vals in (
+            (state.xd, ah_xd),
+            (state.yd, ah_yd),
+            (state.zd, ah_zd),
+            (state.warped_source, warped_vals),
+        ):
+            field.reshape(-1)[_w_dst] = vals.reshape(-1)[_w_src]
 
     state.patches_done += B
 
