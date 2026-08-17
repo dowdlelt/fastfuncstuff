@@ -16,6 +16,7 @@ from fastfuncstuff.processing.formwarp import (
     SynConfig,
     _apply_axis_flags,
     _convergence_value,
+    _invert_displacement_field_pair,
     formwarp,
     invert_displacement_field,
 )
@@ -86,6 +87,17 @@ def test_invert_displacement_field_roundtrip():
     dxe = trilinear_interpolate(xd, sx, sy, sz).reshape(nz, ny, nx)
     resid = (dxe + ex)[2:-2, 2:-2, 2:-2].abs().max().item()
     assert resid < 0.1
+
+
+def test_paired_field_inversion_matches_independent_inversions():
+    fields = tuple(
+        tuple(torch.randn(9, 10, 11) * 0.15 for _ in range(3)) for _ in range(2)
+    )
+    expected = tuple(invert_displacement_field(*field, n_iter=5) for field in fields)
+    actual = _invert_displacement_field_pair(fields[0], fields[1], n_iter=5)
+    for expected_field, actual_field in zip(expected, actual, strict=True):
+        for expected_axis, actual_axis in zip(expected_field, actual_field, strict=True):
+            torch.testing.assert_close(actual_axis, expected_axis, rtol=0.0, atol=0.0)
 
 
 def test_formwarp_recovers_known_shift():

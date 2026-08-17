@@ -59,7 +59,12 @@ from .cost import (
     lpc_correlation,
     pearson_correlation,
 )
-from .interp import _grid_sample_3d, trilinear_interpolate_multi, warp_image
+from .interp import (
+    _grid_sample_3d,
+    batched_interp_3ch_multi,
+    trilinear_interpolate_multi,
+    warp_image,
+)
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 
@@ -433,6 +438,51 @@ def invert_displacement_field(
     return ex, ey, ez
 
 
+def _invert_displacement_field_pair(
+    first: Field,
+    second: Field,
+    n_iter: int = 8,
+    voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
+) -> tuple[Field, Field]:
+    """Invert two independent fields in one sampling stream on CUDA.
+
+    The CPU grid sampler does not benefit from a batch of two, so retain the scalar
+    implementation there. CUDA pays substantial fixed launch and grid-construction
+    overhead per fixed-point step; using grid_sample's native batch dimension removes
+    half of those launches without coupling the two inversions mathematically.
+    """
+    if first[0].device.type != "cuda":
+        return (
+            invert_displacement_field(*first, n_iter=n_iter, voxel_grid=voxel_grid),
+            invert_displacement_field(*second, n_iter=n_iter, voxel_grid=voxel_grid),
+        )
+
+    nz, ny, nx = first[0].shape
+    device = first[0].device
+    if voxel_grid is None:
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(nz, dtype=torch.float32, device=device),
+            torch.arange(ny, dtype=torch.float32, device=device),
+            torch.arange(nx, dtype=torch.float32, device=device),
+            indexing="ij",
+        )
+    else:
+        kk, jj, ii = voxel_grid
+
+    fields = torch.stack((torch.stack(first), torch.stack(second)))
+    ex, ey, ez = -fields[:, 0], -fields[:, 1], -fields[:, 2]
+    for _ in range(n_iter):
+        sx = (ii.unsqueeze(0) + ex).reshape(2, 1, -1)
+        sy = (jj.unsqueeze(0) + ey).reshape(2, 1, -1)
+        sz = (kk.unsqueeze(0) + ez).reshape(2, 1, -1)
+        dx, dy, dz = batched_interp_3ch_multi(fields, sx, sy, sz)
+        ex = -dx.reshape(2, nz, ny, nx)
+        ey = -dy.reshape(2, nz, ny, nx)
+        ez = -dz.reshape(2, nz, ny, nx)
+
+    return (ex[0], ey[0], ez[0]), (ex[1], ey[1], ez[1])
+
+
 # ---------------------------------------------------------------------------
 # Multiresolution helpers
 # ---------------------------------------------------------------------------
@@ -781,10 +831,12 @@ def _syn_level(
             mxd, myd, mzd = _apply_axis_flags(mxd, myd, mzd, flags)
 
         # Re-derive inverses, then re-derive forwards from them (symmetrize).
-        ifxd, ifyd, ifzd = invert_displacement_field(fxd, fyd, fzd, config.invert_iters, voxel_grid)
-        fxd, fyd, fzd = invert_displacement_field(ifxd, ifyd, ifzd, config.invert_iters, voxel_grid)
-        imxd, imyd, imzd = invert_displacement_field(mxd, myd, mzd, config.invert_iters, voxel_grid)
-        mxd, myd, mzd = invert_displacement_field(imxd, imyd, imzd, config.invert_iters, voxel_grid)
+        (ifxd, ifyd, ifzd), (imxd, imyd, imzd) = _invert_displacement_field_pair(
+            (fxd, fyd, fzd), (mxd, myd, mzd), config.invert_iters, voxel_grid
+        )
+        (fxd, fyd, fzd), (mxd, myd, mzd) = _invert_displacement_field_pair(
+            (ifxd, ifyd, ifzd), (imxd, imyd, imzd), config.invert_iters, voxel_grid
+        )
 
     if bar is not None:
         bar.close()
