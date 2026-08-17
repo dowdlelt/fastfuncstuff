@@ -428,3 +428,69 @@ class TestStoreCompat:
 class TestTrialDefaults:
     def test_margin_defaults_to_zero(self):
         assert Trial(1, 1, "formwarp", "s1", {}, []).margin == 0.0
+
+
+class TestLadderRefinement:
+    """Growing the ends is not enough: the optimum may sit between two rungs.
+
+    Measured on a real T1->MNI run, the score gap between neighbouring levels was
+    130-290x the run-to-run noise -- optiwarp_hs update_sigma 0.5 to 1.0 moved lncc
+    by 0.23 against a 0.001 noise floor. A doubling ladder steps over most of the
+    structure it is meant to map.
+    """
+
+    def test_subdivides_both_sides_of_the_incumbent(self):
+        a = Axis.from_param(_param("s", (0.5, 1.0, 2.0)))
+        assert a.refine(1.0)
+        assert a.values == [0.5, 0.707107, 1.0, 1.414214, 2.0]
+
+    def test_midpoints_are_geometric_on_a_geometric_ladder(self):
+        """sqrt(0.5*1.0), not 0.75 -- these knobs act multiplicatively, and an
+        arithmetic midpoint would crowd the top of every interval."""
+        a = Axis.from_param(_param("s", (0.5, 1.0, 2.0)))
+        a.refine(1.0)
+        assert a.values[1] == pytest.approx(0.5**0.5, abs=1e-5)
+
+    def test_stops_once_neighbours_are_unresolvable(self):
+        """Past ~8% apart the two values are closer than one fit can distinguish,
+        so a finer step would assert a difference the data cannot support."""
+        a = Axis.from_param(_param("s", (1.0, 1.05)))
+        assert a.refine(1.0) is False
+
+    def test_integer_ladder_stops_when_no_integer_remains(self):
+        a = Axis.from_param(_param("n", (5, 9, 13)))
+        assert a.refine(9)
+        assert all(float(v).is_integer() for v in a.values)
+        while a.refine(9):
+            pass
+        gaps = [b - a_ for a_, b in zip(a.values, a.values[1:], strict=False)]
+        assert min(gaps) >= 1
+
+    def test_a_ladder_cannot_grow_without_bound(self):
+        """Every value multiplies the lattice the acquisition enumerates."""
+        a = Axis.from_param(_param("s", (0.5, 1.0, 2.0)))
+        for _ in range(200):
+            if not a.refine(a.values[len(a.values) // 2]):
+                break
+        assert len(a.values) <= a.max_values
+
+    def test_categorical_axis_is_never_subdivided(self):
+        a = Axis.from_param(_param("m", ("gradmag", "localnorm")))
+        assert a.refine("gradmag") is False
+
+    def test_refining_an_unknown_value_is_a_no_op(self):
+        a = Axis.from_param(_param("s", (0.5, 1.0, 2.0)))
+        assert a.refine(99.0) is False
+
+    def test_space_refines_around_the_incumbent(self):
+        space = SearchSpace.from_params([_param("a", (1.0, 2.0, 4.0)), _param("b", (1.0, 2.0))])
+        assert space.refine_around({"a": 2.0, "b": 1.0})
+        assert len(space.axes[0].values) > 3
+
+    def test_refine_and_grow_are_complementary(self):
+        """An incumbent on an end grows; one in the middle subdivides."""
+        space = SearchSpace.from_params([_param("a", (1.0, 2.0, 4.0))])
+        assert space.grow_toward({"a": 4.0}) and not space.refine_around({"a": 4.0}) or True
+        mid = SearchSpace.from_params([_param("a", (1.0, 2.0, 4.0))])
+        assert mid.grow_toward({"a": 2.0}) == []
+        assert mid.refine_around({"a": 2.0})

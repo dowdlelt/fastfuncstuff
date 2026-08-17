@@ -63,6 +63,7 @@ class Axis:
     numeric: bool
     lo: float | None = None  # hard bound; regularization cannot go below zero
     hi: float | None = None
+    max_values: int = 20  # ladders stop subdividing before the lattice explodes
 
     @classmethod
     def from_param(cls, p: ParamSpec) -> Axis:
@@ -110,6 +111,63 @@ class Axis:
                 return False
         self.values = sorted([*v, nxt])
         return True
+
+    def refine(self, value: Any) -> bool:
+        """Insert midpoints either side of ``value``. True if the ladder changed.
+
+        The counterpart to :meth:`grow`, which only ever extends the ends. Without
+        this the search can reach a listed value but never anything *between* two of
+        them, so an optimum sitting between rungs is unreachable however long it runs.
+
+        Not hypothetical. On a real T1->MNI run the score gap between neighbouring
+        levels ran 130-290x the run-to-run noise -- optiwarp_hs ``update_sigma``
+        0.5 to 1.0 moved lncc by 0.23 against a noise floor of 0.001 -- so a
+        doubling ladder steps clean over most of the structure it is meant to map.
+
+        Subdivision is geometric where the ladder is, and stops at
+        :data:`MIN_RELATIVE_STEP`: past that two neighbours are closer together than
+        one fit can distinguish, so a finer step would assert a difference the data
+        cannot support.
+        """
+        if not self.numeric or len(self.values) < 2:
+            return False
+        if len(self.values) >= self.max_values:
+            return False
+        try:
+            i = next(k for k, x in enumerate(self.values) if abs(float(x) - float(value)) < 1e-9)
+        except (StopIteration, TypeError, ValueError):
+            return False
+
+        integral = all(_is_numeric(x) and float(x).is_integer() for x in self.values)
+        # Both neighbours are read before anything is inserted. Doing it in the loop
+        # shifts the indices under the second pass, which silently bisects the wrong
+        # interval -- it produced 0.85 (between 0.71 and 1.0) where 1.41 (between 1.0
+        # and 2.0) was intended.
+        neighbours = [float(self.values[j]) for j in (i - 1, i + 1) if 0 <= j < len(self.values)]
+        centre = float(self.values[i])
+        added = False
+        for other in neighbours:
+            lo, hi = sorted((centre, other))
+            if integral and hi - lo <= 1:
+                continue  # no integer sits between them
+            scale = max(abs(hi), abs(lo))
+            if scale > 0 and (hi - lo) <= MIN_RELATIVE_STEP * scale:
+                continue  # finer than a single fit can resolve
+            mid = math.sqrt(lo * hi) if lo > 0 and hi / lo >= 1.8 else 0.5 * (lo + hi)
+            mid = int(round(mid)) if integral else round(mid, 6)
+            if any(abs(float(mid) - float(x)) < 1e-9 for x in self.values):
+                continue
+            self.values = sorted([*self.values, mid])
+            added = True
+        return added
+
+
+MIN_RELATIVE_STEP = 0.08
+"""Stop subdividing once neighbouring values are within 8% of each other.
+
+Below that the difference stops being resolvable against the noise of a single
+fit, so a finer step buys a distinction the data cannot support.
+"""
 
 
 @dataclass
@@ -187,6 +245,23 @@ class SearchSpace:
             elif abs(v - float(a.values[-1])) < 1e-9:
                 out.append((a.key, +1))
         return out
+
+    def refine_around(self, config: dict) -> list[str]:
+        """Subdivide every ladder around the value this config uses.
+
+        Paired with :meth:`grow_toward`, which handles the other case: extend where
+        the incumbent is pinned against an end, subdivide where it sits between two
+        rungs. To each according to its need.
+        """
+        refined = []
+        for axis in self.axes:
+            if axis.key not in config:
+                continue
+            before = list(axis.values)
+            if axis.refine(config[axis.key]):
+                new = [v for v in axis.values if v not in before]
+                refined.append(f"{axis.key} +{'/'.join(str(v) for v in new)}")
+        return refined
 
     def grow_toward(self, config: dict) -> list[str]:
         """Extend every ladder this config is pinned against. Returns descriptions."""

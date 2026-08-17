@@ -666,9 +666,17 @@ def run_adaptive(
                     )
 
             if plan.expand:
-                grown = space.grow_toward(_incumbent(_observations(store, backend, panel)) or {})
+                incumbent = _incumbent(_observations(store, backend, panel)) or {}
+                grown = space.grow_toward(incumbent)
                 if grown and verb >= 1:
                     print(f"  expanded: {', '.join(grown)}")
+                # Extend where the incumbent is pinned against an end, subdivide
+                # where it sits between two rungs. Without the second the search can
+                # reach a listed value but nothing between two of them, and the gaps
+                # here are large: measured 130-290x the run-to-run noise.
+                refined = space.refine_around(incumbent)
+                if refined and verb >= 1:
+                    print(f"  refined: {', '.join(refined)}")
 
             store.compute_consensus(panel)
             store.save()
