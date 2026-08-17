@@ -631,6 +631,39 @@ def _checkerboard_phases(
     return phases
 
 
+def _box_sums(vol: Tensor, bounds: Tensor) -> Tensor:
+    """Sum of ``vol`` over each box in ``bounds``, in one shot.
+
+    ``bounds`` is ``(P, 6)`` as ``(kbot, ktop, jbot, jtop, ibot, itop)``, inclusive.
+    Uses a summed-area table: build the 3-D prefix sum once, then every box is eight
+    lookups, so P boxes cost eight gathers instead of P slice-and-reduce pairs.
+
+    The accumulation dtype is raised deliberately -- int64 for an integer volume,
+    float64 for a real one. A prefix sum reassociates the additions, and these sums
+    are compared against thresholds; at float32 a box near a threshold could land on
+    the other side of it and silently change which patches get optimised.
+    """
+    acc = torch.int64 if not vol.is_floating_point() else torch.float64
+    pref = torch.zeros(
+        (vol.shape[0] + 1, vol.shape[1] + 1, vol.shape[2] + 1), dtype=acc, device=vol.device
+    )
+    pref[1:, 1:, 1:] = vol.to(acc).cumsum(0).cumsum(1).cumsum(2)
+
+    k0, k1 = bounds[:, 0], bounds[:, 1] + 1
+    j0, j1 = bounds[:, 2], bounds[:, 3] + 1
+    i0, i1 = bounds[:, 4], bounds[:, 5] + 1
+    return (
+        pref[k1, j1, i1]
+        - pref[k0, j1, i1]
+        - pref[k1, j0, i1]
+        - pref[k1, j1, i0]
+        + pref[k0, j0, i1]
+        + pref[k0, j1, i0]
+        + pref[k1, j0, i0]
+        - pref[k0, j0, i0]
+    )
+
+
 def _filter_patches(
     patches: list[PatchSpec],
     weight: Tensor,
@@ -639,30 +672,44 @@ def _filter_patches(
     ny: int,
     nz: int,
 ) -> list[PatchSpec]:
-    """Filter out patches with insufficient weight/mask coverage."""
+    """Filter out patches with insufficient weight/mask coverage.
+
+    Vectorised over patches. The obvious loop -- slice each patch, sum, and call
+    ``.item()`` -- costs two CPU-GPU synchronisations per patch, and a fine level
+    considers hundreds of thousands of patches: profiled at 1.84 million ``.item()``
+    calls on one 193^3 fit, which is what left the GPU idle for stretches while
+    Python walked the list. Here the whole decision is one summed-area table and a
+    single transfer.
+    """
+    if not patches:
+        return []
+
+    keep = [
+        p
+        for p in patches
+        if not (p.itop - p.ibot < 4 and p.jtop - p.jbot < 4 and p.ktop - p.kbot < 4)
+    ]
+    if not keep:
+        return []
+
     w_avg = float(weight[mask > 0].mean().item()) if (mask > 0).any() else 1.0
-    valid = []
-    for p in patches:
-        nxh = p.itop - p.ibot + 1
-        nyh = p.jtop - p.jbot + 1
-        nzh = p.ktop - p.kbot + 1
-        n_voxels = nxh * nyh * nzh
+    bounds = torch.tensor(
+        [(p.kbot, p.ktop, p.jbot, p.jtop, p.ibot, p.itop) for p in keep],
+        device=weight.device,
+        dtype=torch.long,
+    )
+    n_voxels = (
+        (bounds[:, 1] - bounds[:, 0] + 1)
+        * (bounds[:, 3] - bounds[:, 2] + 1)
+        * (bounds[:, 5] - bounds[:, 4] + 1)
+    ).to(torch.float64)
 
-        if nxh < 5 and nyh < 5 and nzh < 5:
-            continue
+    n_masked = _box_sums(mask, bounds).to(torch.float64)
+    w_sum = _box_sums(weight, bounds)
 
-        m_patch = mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
-        w_patch = weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1]
-        n_masked = int(m_patch.sum().item())
-        w_sum = float(w_patch.sum().item())
-
-        if n_masked < 0.333 * n_voxels or w_sum < 0.166 * n_voxels * w_avg:
-            continue
-
-        # Check base isn't constant in this patch
-        valid.append(p)
-
-    return valid
+    ok = (n_masked >= 0.333 * n_voxels) & (w_sum >= 0.166 * n_voxels * w_avg)
+    ok_cpu = ok.cpu().tolist()  # the one synchronisation
+    return [p for p, good in zip(keep, ok_cpu, strict=True) if good]
 
 
 # ---------------------------------------------------------------------------
@@ -1372,13 +1419,19 @@ def _warpomatic(
             break
 
         elapsed = time.time() - t0
+        # t0 is set once before the level loop (it drives the progress bar), so
+        # `elapsed` is time-since-start. The log wants time-in-THIS-level, which is
+        # the whole point of the column -- cumulative seconds make every level look
+        # more expensive than the last by construction.
+        prev_total = state.level_log[-1]["cumulative_seconds"] if state.level_log else 0.0
         state.level_log.append(
             {
                 "level": lev,
                 "patch": int(xwid),
                 "cost_before": float(cost_at_start),
                 "cost_after": float(state.cost),
-                "seconds": float(elapsed),
+                "seconds": float(elapsed - prev_total),
+                "cumulative_seconds": float(elapsed),
                 "patches_done": int(state.patches_done),
                 "patches_skipped": int(state.patches_skipped),
             }
@@ -1584,30 +1637,31 @@ def _improve_warp_batched(
     if n_active == 0:
         return
 
-    # Gather patch offsets
-    ibots = torch.tensor([p.ibot for p in patches], device=device, dtype=torch.float32)
-    jbots = torch.tensor([p.jbot for p in patches], device=device, dtype=torch.float32)
-    kbots = torch.tensor([p.kbot for p in patches], device=device, dtype=torch.float32)
+    # Patch offsets, built as one host->device transfer rather than three. Every
+    # patch in a phase is the same size, so the whole phase is addressable by one
+    # flat index and the gathers below are single ops instead of B slices apiece --
+    # at a fine level B is tens of thousands, and the per-patch form spent more time
+    # in Python launching kernels than the GPU spent running them.
+    origins = torch.tensor(
+        [(p.kbot, p.jbot, p.ibot) for p in patches], device=device, dtype=torch.long
+    )
+    kbots = origins[:, 0].to(torch.float32)
+    jbots = origins[:, 1].to(torch.float32)
+    ibots = origins[:, 2].to(torch.float32)
 
-    # Gather fixed data: base, weight, mask as (B, V) tensors
-    base_patches = torch.stack(
-        [
-            base[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
-            for p in patches
-        ]
+    # (B, V) index into the flattened volume. ii/jj/kk_flat come from a
+    # meshgrid(..., indexing="ij") over (nzh, nyh, nxh) flattened C-order, which is
+    # exactly the order `vol[kbot:ktop+1, ...].reshape(-1)` produces, so this gathers
+    # the same values in the same order as the slice it replaces.
+    _gather_idx = (
+        (origins[:, 0:1] + kk_flat.long()) * (ny * nx)
+        + (origins[:, 1:2] + jj_flat.long()) * nx
+        + (origins[:, 2:3] + ii_flat.long())
     )
-    weight_patches = torch.stack(
-        [
-            weight[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1)
-            for p in patches
-        ]
-    )
-    mask_patches = torch.stack(
-        [
-            mask[p.kbot : p.ktop + 1, p.jbot : p.jtop + 1, p.ibot : p.itop + 1].reshape(-1).float()
-            for p in patches
-        ]
-    )
+
+    base_patches = base.reshape(-1)[_gather_idx]
+    weight_patches = weight.reshape(-1)[_gather_idx]
+    mask_patches = mask.reshape(-1)[_gather_idx].float()
 
     # Cost selection: blok-based local Pearson (lpc/lpa, AFNI-faithful),
     # the older convolution LPA (lpa_alt), or INCOR (pearson/pearclp).
