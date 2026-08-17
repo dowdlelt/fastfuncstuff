@@ -186,7 +186,34 @@ class QwarpConfig:
     least-squares surrogate could not see."""
 
     gn_iters: int = 8
-    """Gauss-Newton iterations per patch group (one solve + one cost evaluation)."""
+    """Gauss-Newton iterations at the *finest* levels, where a phase holds tens of
+    thousands of patches and an iteration is expensive.
+
+    Measured as a binding ceiling, not a generous one: at 8 iterations the loop was
+    still improving the cost in 88-93% of patch groups. Raising it costs time
+    linearly, so the ceiling is scaled by how cheap the level is -- see
+    :attr:`gn_iters_coarse`."""
+
+    gn_iters_coarse: int = 8
+    """Gauss-Newton ceiling where a phase holds few patches. Equal to
+    :attr:`gn_iters` by default, i.e. the taper is off.
+
+    The idea it implements is sound and was measured: residual left at a coarse
+    level does not stay there, so spending more iterations early should reduce what
+    the fine levels have to undo. Raising this to 32 does improve the result --
+    ls 0.2320 against 0.2363, about four times the run-to-run noise.
+
+    It is off because the premise that coarse levels are *cheap* turned out to be
+    false. A coarse phase holds 16 patches against a fine phase's 67000, but each
+    patch is correspondingly enormous, and every level covers the same volume; the
+    measured per-level times are nearly flat (4.9, 5.3, 4.9, 3.1, 2.8, 2.5, 2.5,
+    2.6, 3.2, 5.5, 9.9 s). So the taper is not a free lunch, it is a straight trade:
+    +108% runtime for +1.9% on ls. Worth it for a final warp, not for a tuning
+    sweep, so it is a choice rather than a default."""
+
+    gn_coarse_patches: int = 2000
+    """Patch count at which the coarse ceiling applies in full; above it the budget
+    tapers toward :attr:`gn_iters` as the square root of the patch count."""
 
     cc_radius: int = 4
     """Neighbourhood half-width for ``cost_method="lncc"``. Clamped per level so the
@@ -1949,6 +1976,13 @@ def _improve_warp_batched(
             with torch.no_grad():
                 return batched_cost(active_params)
 
+        # Effort in proportion to what an iteration costs here. A phase of 16
+        # patches gets the coarse ceiling outright; one of 67000 gets the base.
+        _taper = (config.gn_coarse_patches / max(B, 1)) ** 0.5
+        gn_budget = min(
+            config.gn_iters_coarse,
+            max(config.gn_iters, int(round(config.gn_iters * _taper))),
+        )
         best_params, _best_costs, opt_stats = optimize_warp_params_gauss_newton(
             gn_normal_eqs,
             gn_cost,
@@ -1956,7 +1990,7 @@ def _improve_warp_batched(
             n_active,
             param_max,
             device,
-            max_iter=config.gn_iters,
+            max_iter=gn_budget,
         )
         if use_hybrid:
             best_params, _best_costs, polish_stats = optimize_warp_params_batched(

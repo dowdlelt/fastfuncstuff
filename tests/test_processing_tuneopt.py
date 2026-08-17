@@ -494,3 +494,51 @@ class TestLadderRefinement:
         mid = SearchSpace.from_params([_param("a", (1.0, 2.0, 4.0))])
         assert mid.grow_toward({"a": 2.0}) == []
         assert mid.refine_around({"a": 2.0})
+
+
+class TestSingleSubjectRun:
+    """One base and one source is a legitimate way to run this, if a weak one.
+
+    There is nothing to confirm a candidate against, so every screened config is
+    taken on its own evidence. The search must still work -- expand, refine and
+    rank -- rather than fall over on an empty confirmation set.
+    """
+
+    def test_screen_and_confirm_degrade_gracefully(self):
+        """With one subject the confirmation set is empty; propose must still run."""
+        space = _space()
+        oracle = Oracle()
+        rng = np.random.default_rng(0)
+        obs = [oracle(c) for c in propose(space, [], 3, rng)]
+        more = propose(space, obs, 3, rng)
+        assert more, "the search stalled with a single subject's worth of evidence"
+
+    def test_refinement_still_applies(self):
+        space = SearchSpace.from_params([_param("a", (1.0, 2.0, 4.0))])
+        assert space.refine_around({"a": 2.0})
+
+    def test_reports_survive_one_subject(self, tmp_path):
+        """score_spread is 0 and consensus ranks over a single subject; nothing
+        may divide by the number of *other* subjects."""
+        from fastfuncstuff.processing.tunestore import (
+            BASELINE,
+            TrialStore,
+            format_guide,
+            format_results_table,
+            knob_importance,
+        )
+
+        s = TrialStore(tmp_path / "t.json")
+        s.add(BASELINE, "only", {}, [], scores={"ls": 0.6, "lncc": -0.05})
+        for reg in (0.0, 1.0):
+            s.add(
+                "formwarp",
+                "only",
+                {"total_var": reg},
+                [],
+                scores={"ls": 0.3 + reg / 10, "lncc": -0.2 + reg / 10},
+            )
+        s.compute_consensus(["ls", "lncc"])
+        assert "vs base" in format_results_table(s.results())
+        assert "1 subject" in format_guide(s, "MNI_T1") or "Caveats" in format_guide(s, "MNI_T1")
+        knob_importance(s)  # must not raise on a single-subject store
