@@ -1507,6 +1507,18 @@ def _warpomatic(
 # ---------------------------------------------------------------------------
 
 
+def _gn_steepest_descent_images(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
+    """Assemble direction-major GN Jacobian columns without list-plus-cat copies."""
+    if g.device.type == "cpu":
+        return torch.cat(
+            [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(g.shape[0])], dim=-1
+        )
+    d, b, v = g.shape
+    nb = bt.shape[1]
+    scaled = (hw * g).permute(1, 2, 0).unsqueeze(-1) * bt[None, :, None, :]
+    return scaled.reshape(b, v, d * nb)
+
+
 def _gn_normal_eqs_3d(
     w: Tensor,
     g: Tensor,
@@ -1547,7 +1559,7 @@ def _gn_normal_eqs_3d(
     res = base_hat - (w - mw) / sw  # (B, V)
 
     # Steepest-descent images, one block of nb columns per active direction.
-    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    dw = _gn_steepest_descent_images(g, hw, bt)
     mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
     jn = (dw - mdw) / sw.unsqueeze(-1)
     jnw = jn * omega.unsqueeze(-1)
@@ -1608,7 +1620,7 @@ def _gn_normal_eqs_local(
     sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
 
     res = base_hat - (w - mw) / sd
-    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    dw = _gn_steepest_descent_images(g, hw, bt)
     jn = dw / sd.unsqueeze(-1)
     jnw = jn * omega.unsqueeze(-1)
     hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)

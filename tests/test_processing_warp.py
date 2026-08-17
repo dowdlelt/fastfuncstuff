@@ -21,11 +21,25 @@ from fastfuncstuff.processing.warp import (
     _filter_patches,
     _generate_patch_grid,
     _get_basis_config,
+    _gn_steepest_descent_images,
     _maybe_compile,
     _pad_volume,
 )
 
 DEVICE = torch.device("cpu")
+
+
+@pytest.mark.parametrize("n_dims", [1, 2, 3])
+def test_gn_steepest_descent_images_matches_direction_major_cat(n_dims):
+    torch.manual_seed(41)
+    g = torch.randn(n_dims, 4, 35, device=DEVICE)
+    hw = torch.rand(n_dims, 1, 1, device=DEVICE)
+    bt = torch.randn(35, 4, device=DEVICE)
+    expected = torch.cat(
+        [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(n_dims)], dim=-1
+    )
+    actual = _gn_steepest_descent_images(g, hw, bt)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
