@@ -30,8 +30,10 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from fastfuncstuff.cli_utils import (
+    add_deterministic_arg,
     add_device_arg,
     add_verbose_arg,
+    enable_determinism,
     parse_prefix,
     setup_device,
     spinner,
@@ -783,6 +785,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "GPU / Hardware",
         "Device selection and memory management.",
     )
+    add_deterministic_arg(g_hw)
     add_device_arg(
         g_hw,
         extra="On Apple Silicon use CPU: MPS is much slower because 3-D grid-sample backward falls back to CPU.",
@@ -1396,6 +1399,8 @@ def _extract_warp_pcs(
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     # Select device (prefer CUDA > MPS > CPU)
     device_spec = args.device

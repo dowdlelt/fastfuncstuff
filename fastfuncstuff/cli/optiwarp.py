@@ -40,11 +40,13 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_coverage_args,
+    add_deterministic_arg,
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
     apply_recipe_preset,
     combine_brain_masks,
+    enable_determinism,
     image_support,
     parse_prefix,
     sanitize_volume,
@@ -534,6 +536,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     add_recipe_arg(p, _PRESET_BACKEND)
+    add_deterministic_arg(p)
     add_device_arg(
         p,
         extra="On Apple Silicon, MPS is useful for LK/HS on full-size volumes; CPU is often as fast for demons.",
@@ -602,6 +605,8 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     # Select device (prefer CUDA > MPS > CPU), honouring -device end to end.
     device = setup_device(args.device, tf32=REGISTRATION_TF32)

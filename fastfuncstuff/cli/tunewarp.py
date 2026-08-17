@@ -36,7 +36,13 @@ import argparse
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
+from fastfuncstuff.cli_utils import (
+    add_deterministic_arg,
+    add_device_arg,
+    add_verbose_arg,
+    enable_determinism,
+    setup_device,
+)
 from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
@@ -219,6 +225,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "whether every subject agrees. This is the output you build a default on.",
     )
 
+    add_deterministic_arg(parser)
+
     add_device_arg(parser)
     add_verbose_arg(parser)
     return parser.parse_args(argv)
@@ -358,6 +366,8 @@ def _build_pairs(args: argparse.Namespace, pairing: str) -> list[SubjectPair]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
     out = Path(args.out)
     store = TrialStore(out / "trials.json")
 

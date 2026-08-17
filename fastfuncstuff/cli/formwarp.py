@@ -31,12 +31,14 @@ import torch
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
+    add_deterministic_arg,
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
     apply_recipe_preset,
     collect_batch_jobs,
     combine_brain_masks,
+    enable_determinism,
     image_support,
     parse_prefix,
     run_batch_jobs,
@@ -375,6 +377,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     # Device
     add_recipe_arg(p, _PRESET_BACKEND)
+    add_deterministic_arg(p)
     add_device_arg(
         p,
         extra="On Apple Silicon use CPU: MPS falls back to CPU for SyN's 3-D grid-sample backward pass.",
@@ -450,6 +453,8 @@ def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     if args.batch is not None or args.batch_run:
         # One process, many registrations: SyN's fixed costs (CUDA context,

@@ -542,3 +542,24 @@ class TestSingleSubjectRun:
         assert "vs base" in format_results_table(s.results())
         assert "1 subject" in format_guide(s, "MNI_T1") or "Caveats" in format_guide(s, "MNI_T1")
         knob_importance(s)  # must not raise on a single-subject store
+
+
+class TestCliHelpFormatting:
+    """argparse %-formats help text, so a literal percent must be doubled.
+
+    A bare "40%" in one help string read as a `%o` conversion and crashed `-help`
+    for every tool that registered it -- the flag still parsed, so only running
+    -help revealed it.
+    """
+
+    @pytest.mark.parametrize("mod", ["qwarp", "optiwarp", "formwarp", "tunewarp"])
+    def test_help_renders(self, mod):
+        import importlib
+
+        m = importlib.import_module(f"fastfuncstuff.cli.{mod}")
+        parser_text = None
+        try:
+            m.parse_args(["-help"])
+        except SystemExit:
+            parser_text = "rendered"
+        assert parser_text == "rendered"

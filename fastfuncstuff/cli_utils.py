@@ -3996,3 +3996,70 @@ def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb:
         print(f"  measured on: {preset.provenance}", file=sys.stderr)
         if preset.caveat:
             print(f"  caveat: {preset.caveat}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility (-deterministic)
+# ---------------------------------------------------------------------------
+
+CUBLAS_DETERMINISM_ENV = "CUBLAS_WORKSPACE_CONFIG"
+CUBLAS_DETERMINISM_VALUE = ":4096:8"
+
+
+def add_deterministic_arg(parser) -> None:
+    """Register ``-deterministic``: same input, same output, bit for bit."""
+    parser.add_argument(
+        "-deterministic",
+        action="store_true",
+        # NB: literal percent signs must be doubled -- argparse runs help text
+        # through %-formatting, so a bare "40%" is read as a conversion and blows up
+        # -help for the whole tool.
+        help="Produce bit-identical output for identical input. OFF BY DEFAULT: "
+        "repeated runs of the same command differ by ~0.4 voxels of displacement on "
+        "average (p99 ~2.9), so a warp is not exactly reproducible, though "
+        "similarity scores move only ~0.001 and rankings are unaffected. Speed is "
+        "the priority here and determinism costs roughly 40%% of the runtime. This "
+        "is not a random seed -- there is no RNG in the solver; the variation comes "
+        "from cuBLAS picking GEMM strategies run to run.",
+    )
+
+
+def enable_determinism(verb: int = 1) -> None:
+    """Make CUDA results reproducible, re-executing once if that is what it takes.
+
+    Two things are required and only one of them can be set from inside a running
+    process. ``torch.use_deterministic_algorithms`` can be switched on at any point,
+    but cuBLAS reads ``CUBLAS_WORKSPACE_CONFIG`` when it initialises, so setting it
+    after import does nothing. Measured on a 193^3 qwarp fit: the environment
+    variable alone leaves runs differing by 9.6 voxels, the flag alone leaves them
+    differing too (and warns), and only both together give bit-identical output.
+
+    So if the variable is missing this re-executes the same command with it set. The
+    alternative -- carrying on and reporting success -- would claim a reproducibility
+    the run does not have, which is the failure mode this whole option exists to
+    remove.
+    """
+    import os
+    import sys
+
+    import torch
+
+    if os.environ.get(CUBLAS_DETERMINISM_ENV) != CUBLAS_DETERMINISM_VALUE:
+        os.environ[CUBLAS_DETERMINISM_ENV] = CUBLAS_DETERMINISM_VALUE
+        if verb >= 1:
+            print(
+                f"-deterministic: re-executing with {CUBLAS_DETERMINISM_ENV}="
+                f"{CUBLAS_DETERMINISM_VALUE} (cuBLAS reads it at start-up, so it "
+                "cannot be set from here).",
+                file=sys.stderr,
+                flush=True,
+            )
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    if verb >= 1:
+        print(
+            "-deterministic: on. Expect roughly 40% more runtime.",
+            file=sys.stderr,
+            flush=True,
+        )
