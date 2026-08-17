@@ -515,9 +515,7 @@ def _flow_hs(
     dy = torch.zeros_like(warped)
     dz = torch.zeros_like(warped)
     for _ in range(n_iter):
-        ax = _separable_smooth_3d(dx, 1.0, kernel_type="gauss")
-        ay = _separable_smooth_3d(dy, 1.0, kernel_type="gauss")
-        az = _separable_smooth_3d(dz, 1.0, kernel_type="gauss")
+        ax, ay, az = _smooth_field(dx, dy, dz, 1.0)
         resid = (gx * ax + gy * ay + gz * az + diff) / denom
         dx = ax - gx * resid
         dy = ay - gy * resid
