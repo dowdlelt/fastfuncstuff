@@ -58,7 +58,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                  and suspicious within subject.
   |disp|         how far voxels moved, in mm.
   bending        how wiggly the field is; compare between candidates, not
-                 against an absolute number.
+                 against an absolute number -- and only between candidates on
+                 the same grid, since it averages over the whole field and
+                 padding differs with each base's support box.
 """,
     )
     parser.add_argument(
@@ -75,6 +77,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "recommended: the field outside the brain is unconstrained, and letting "
         "it into the percentiles buries real folding in noise. Aligned from the "
         "mask and warp affines when the warp sits on a padded grid.",
+    )
+    parser.add_argument(
+        "-units",
+        "--units",
+        choices=["mm", "voxels"],
+        default="mm",
+        help="Displacement units on disk. Every ffs tool that saves a warp for "
+        "AFNI interop writes DICOM mm (the default); ffs_util_pcwarp writes raw "
+        "voxel displacements, which need -units voxels to be read correctly.",
     )
 
     gate = parser.add_argument_group("Pass/fail thresholds")
@@ -133,10 +144,11 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.warp:
         xd, yd, zd, header = load_warp_field(path, device=device)
         cardinal = compute_cardinal_affine(header["affine"])
-        # save_warp_field writes AFNI DICOM-mm. Convert DICOM -> NIfTI/RAS mm,
-        # then into the padded field grid's voxel coordinates before derivatives.
-        xd, yd, zd = _nifti_mm_to_voxels(-xd, -yd, zd, cardinal)
         voxdims = tuple(float(abs(cardinal[i, i])) or 1.0 for i in range(3))
+        if args.units == "mm":
+            # save_warp_field writes AFNI DICOM-mm. Convert DICOM -> NIfTI/RAS mm,
+            # then into the padded field grid's voxel coordinates before derivatives.
+            xd, yd, zd = _nifti_mm_to_voxels(-xd, -yd, zd, cardinal)
         m = (
             None
             if mask is None
