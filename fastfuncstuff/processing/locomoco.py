@@ -1332,6 +1332,7 @@ def _estimate_static(
     first_n=None,
     diag=None,
     hpf_sigma=0.0,
+    gate=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
@@ -1342,6 +1343,11 @@ def _estimate_static(
     ``diag`` (a dict) opts into the xcorr searchlight diagnostics: it is filled with
     ``conf`` ``(nt, nS, H, W)`` and, when ``diag["curve_frame"]`` is set, ``curve``
     ``(nd, nS, H, W)`` for that frame — both in canonical layout, empty for flow/phase.
+
+    ``gate`` ``(nS, H, W)`` scales the flow down outside the head before the
+    correction is resampled. Applying it here rather than to the returned series is
+    what keeps the correction a single pass: gating afterwards means re-resampling
+    every slice from the raw data with the gated field.
     """
     nt, ns, hh, ww = vol.shape
     win = _time_window(vol, 0, first_n)
@@ -1383,6 +1389,9 @@ def _estimate_static(
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
         curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
         u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
+        if gate is not None:
+            gate_s = gate[s].to(device)
+            u, v = u * gate_s, v * gate_s
         corrected[:, s] = _correct_pe(
             moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius
         ).cpu()
@@ -1735,6 +1744,10 @@ def estimate_residual_flow(
         Outside the head (and outside data coverage) the displacement becomes ~0, so
         the resample is the identity there and the voxels pass through untouched
         instead of being yanked by a phantom warp.
+
+        Only the progressive-reference path needs this: `_estimate_static` takes the
+        gate directly and applies it before it resamples, so the fixed-reference path
+        never builds the corrected series twice.
         """
         if soft is None:
             return u, v, corr
@@ -1779,8 +1792,10 @@ def estimate_residual_flow(
             first_n=first_n,
             diag=diag,
             hpf_sigma=hpf_sigma,
+            gate=soft,
         )
-    u_all, v_all, corrected = _gate(u_all, v_all, corrected)
+    if progressive:
+        u_all, v_all, corrected = _gate(u_all, v_all, corrected)
     # Outer reference-refinement (shared engine): rebuild the reference from the
     # corrected series and re-register, converging the template out of its bias. The
     # aggregate honours -ref and -first_n; the step is the in-brain rms of the stacked
@@ -1802,8 +1817,8 @@ def estimate_residual_flow(
                 ref_override=new_ref,
                 diag=diag,
                 hpf_sigma=hpf_sigma,
+                gate=soft,
             )
-            u, v, corr = _gate(u, v, corr)
             return (u, v), corr
 
         # Frames per step-rms chunk, sized so the difference stays around 64 MiB
