@@ -263,6 +263,35 @@ def _smoothed_weighted_moments_3d(
     return smoothed[0], smoothed[1], smoothed[2], smoothed[3], smoothed[4], smoothed[5]
 
 
+def _smoothed_weighted_fixed_moments_3d(
+    fixed: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Filter the three moments invariant while one image is repeatedly warped."""
+    moments = torch.stack((weight, weight * fixed, weight * fixed * fixed))[None]
+    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
+    return smoothed[0], smoothed[1], smoothed[2]
+
+
+def _smoothed_weighted_moments_3d_from_fixed(
+    moving: Tensor,
+    fixed: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+    fixed_moments: tuple[Tensor, Tensor, Tensor],
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Filter only moving-side/cross moments and combine with a fixed-side cache."""
+    dynamic = torch.stack((weight * moving, weight * moving * moving, weight * moving * fixed))[
+        None
+    ]
+    smoothed = _separable_smooth_3d(dynamic, sigma, kernel_type=kernel_type)[0]
+    sw, swf, swff = fixed_moments
+    return sw, smoothed[0], swf, smoothed[1], swff, smoothed[2]
+
+
 def _local_pearson_from_moments(
     moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
 ) -> Tensor:

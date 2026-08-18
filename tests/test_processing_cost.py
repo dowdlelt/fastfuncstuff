@@ -11,7 +11,9 @@ from fastfuncstuff.processing.cost import (
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
+    _smoothed_weighted_fixed_moments_3d,
     _smoothed_weighted_moments_3d,
+    _smoothed_weighted_moments_3d_from_fixed,
     auto_box_radius,
     batched_lpa_cost,
     clipped_pearson_correlation,
@@ -233,6 +235,26 @@ class TestSeparableSmooth3D:
         sum(v.square().sum() for v in packed).backward()
         sum(v.square().sum() for v in reference).backward()
         torch.testing.assert_close(packed_y.grad, reference_y.grad, atol=1e-5, rtol=1e-5)
+
+    def test_fixed_moment_cache_matches_six_channel_bank(self):
+        torch.manual_seed(15)
+        moving = torch.randn(7, 9, 11, device=DEV)
+        fixed = torch.randn(7, 9, 11, device=DEV)
+        weight = torch.rand(7, 9, 11, device=DEV)
+
+        reference = _smoothed_weighted_moments_3d(moving, fixed, weight, 1.5, "gauss")
+        fixed_moments = _smoothed_weighted_fixed_moments_3d(fixed, weight, 1.5, "gauss")
+        cached = _smoothed_weighted_moments_3d_from_fixed(
+            moving,
+            fixed,
+            weight,
+            1.5,
+            "gauss",
+            fixed_moments,
+        )
+
+        for actual, expected in zip(cached, reference, strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_box_kernel(self):
         vol = torch.randn(8, 10, 12, device=DEV)
