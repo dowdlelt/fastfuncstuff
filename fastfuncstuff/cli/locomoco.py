@@ -1658,11 +1658,16 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             with spinner(f"Writing {Path(estem).name}_warp{ext}"):
                 warp_path = save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
             print(f"  • echo {j + 1} warp (ffs_nwarp, axis {axis}): {warp_path}")
+        # Materialized once per echo for both the write and the QC maps below --
+        # see the single-echo block for why the repeat call is not free.
+        want_corrected = not args.no_corrected or (_want_qc(args) and _want_corrected_qc(args))
+        corrected_series = res.corrected_series() if want_corrected else None
         if not args.no_corrected:
+            assert corrected_series is not None
             corr_path = f"{estem}_locomoco{ext}"
             with spinner(f"Writing {Path(corr_path).name}"):
                 save_nifti(
-                    _neg_clip(res.corrected_series().numpy(), args.allow_neg),
+                    _neg_clip(corrected_series.numpy(), args.allow_neg),
                     corr_path,
                     affine=affine,
                 )
@@ -1673,10 +1678,15 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
                 save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
             print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
         if _want_qc(args):
-            corrected = res.corrected_series().numpy() if _want_corrected_qc(args) else None
+            corrected = (
+                corrected_series.numpy()
+                if corrected_series is not None and _want_corrected_qc(args)
+                else None
+            )
             _write_qc_diag(
                 args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
             )
+        del corrected_series
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -2086,11 +2096,26 @@ def main(argv: list[str] | None = None) -> int:
     if args.want_pcs is not None:
         _write_warp_pcs(result.warp_components(), stem, args.want_pcs)
 
+    # One materialization for every consumer below. On the estimator paths that
+    # hold the series in canonical axis order, corrected_series() is a permute +
+    # contiguous -- a full copy of the 4-D series (a GB for a long single-echo
+    # run), so calling it once per output is what made writing cost more than
+    # estimating. _neg_clip is out-of-place, so sharing one tensor is exact.
+    want_corrected = (
+        not args.no_corrected
+        or args.save_mean
+        or args.save_max
+        or args.save_min
+        or (_want_qc(args) and _want_corrected_qc(args))
+    )
+    corrected_series = result.corrected_series() if want_corrected else None
+
     if not args.no_corrected:
+        assert corrected_series is not None
         corr_path = f"{stem}_locomoco{ext}"
         with spinner(f"Writing {Path(corr_path).name}"):
             save_nifti(
-                _neg_clip(result.corrected_series().numpy(), args.allow_neg),
+                _neg_clip(corrected_series.numpy(), args.allow_neg),
                 corr_path,
                 affine=affine,
             )
@@ -2105,20 +2130,26 @@ def main(argv: list[str] | None = None) -> int:
     ):
         if not want:
             continue
+        assert corrected_series is not None
         out_path = f"{stem}_locomoco_{which}{ext}"
         with spinner(f"Writing {Path(out_path).name}"):
             save_nifti(
-                _neg_clip(reduce(result.corrected_series()).numpy(), args.allow_neg),
+                _neg_clip(reduce(corrected_series).numpy(), args.allow_neg),
                 out_path,
                 affine=affine,
             )
         print(f"  • corrected {which}: {out_path}")
 
     if _want_qc(args):
-        # corrected_series() is cheap (cached / reshape) and works even with
-        # -no_corrected; only materialize it when a corrected QC map is wanted.
-        corrected = result.corrected_series().numpy() if _want_corrected_qc(args) else None
+        # Works even with -no_corrected; only the QC maps that read the corrected
+        # series get it.
+        corrected = (
+            corrected_series.numpy()
+            if corrected_series is not None and _want_corrected_qc(args)
+            else None
+        )
         _write_qc_diag(args, corrected, data, f"{stem}_locomoco", f"{stem}_orig", ext, affine)
+    del corrected_series
 
     if not args.no_flow:
         if dual:
