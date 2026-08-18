@@ -325,6 +325,43 @@ def test_phase_flow_batch_chunking_matches_across_batch_sizes():
         assert torch.allclose(batched_u[i], solo_u[0], atol=1e-5)
 
 
+def test_phase_patch_tiling_matches_im2col_ordering():
+    """The strided-view tiling must reproduce F.unfold's patch order exactly.
+
+    `_phase_slope_dense` reads bins out of per-patch FFTs, so the tiling's element
+    order is load-bearing: transposing the two unfold axes, or the two within-patch
+    axes, still yields a plausible-looking field while FFT'ing across the wrong
+    direction. Tensor.unfold replaced F.unfold there for speed; this pins the
+    contract that made the swap legal.
+    """
+    n, h, w, p, stride = 3, 40, 36, 16, 8
+    pad = p // 2
+    x = torch.randn(n, 1, h + 2 * pad, w + 2 * pad)
+    lh = (h + 2 * pad - p) // stride + 1
+    lw = (w + 2 * pad - p) // stride + 1
+
+    im2col = F.unfold(x, kernel_size=p, stride=stride).transpose(1, 2).reshape(n * lh * lw, p, p)
+    views = x[:, 0].unfold(1, p, stride).unfold(2, p, stride).reshape(n * lh * lw, p, p)
+
+    assert torch.equal(views, im2col)
+
+
+def test_phase_slope_recovers_known_shift_both_pe_axes():
+    """The dense phase-slope kernel returns the pull displacement for a known shift."""
+    base = torch.from_numpy(_phantom(nx=48, ny=48, nz=1)[:, :, 0])[None]
+    for pe_is_u, pe_dim in ((True, 2), (False, 1)):
+        for roll in (1, -1):
+            moved = torch.roll(base, shifts=roll, dims=pe_dim)
+            field = _lm._phase_slope_dense(
+                base, moved, pe_is_u=pe_is_u, patch=16, stride=8, max_shift=3.0
+            )
+            # Patch-local phase slope reads a whole-image shift low (the patch is not
+            # circular), so check the sign and that it is a substantial fraction.
+            got = float(field[:, 12:-12, 12:-12].mean())
+            assert got * roll > 0, f"pull sign flipped for roll={roll}, pe_is_u={pe_is_u}"
+            assert 0.3 < abs(got) < 1.2, f"pull magnitude {got} off for roll={roll}"
+
+
 def test_xcorr_search_matches_translation():
     # Direct check of the cross-correlation searchlight primitive: a +1.2 shift along
     # W(u) must come back as a -1.2 pull, with no spurious H(v) component.
