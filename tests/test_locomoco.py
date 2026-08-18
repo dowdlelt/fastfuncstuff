@@ -346,6 +346,40 @@ def test_phase_patch_tiling_matches_im2col_ordering():
     assert torch.equal(views, im2col)
 
 
+def test_phase_slope_convolution_form_matches_patch_form():
+    """The two `_phase_slope_dense` implementations must agree on structured data.
+
+    Above a patch-buffer size threshold the kernel reads bins 1..kmax as strided
+    convolutions instead of materializing patches and FFT'ing them. The forms are
+    the same DFT bins, so they agree to float rounding wherever the cross-power
+    magnitude determines a phase -- which is what this checks, on a smooth phantom
+    rather than noise (random images have undetermined phase, and there the two
+    round to opposite sides of a wrap and clamp to opposite ends of max_shift).
+    """
+    base = torch.from_numpy(_phantom(nx=56, ny=52, nz=1)[:, :, 0])[None]
+    moved = torch.roll(base, shifts=1, dims=2)
+    big = 400  # over the threshold -> convolution form
+    small = 4  # under it -> patch form
+    for pe_is_u in (True, False):
+        conv = _lm._phase_slope_dense(
+            base.expand(big, -1, -1).contiguous(),
+            moved.expand(big, -1, -1).contiguous(),
+            pe_is_u=pe_is_u,
+            patch=16,
+            stride=8,
+            max_shift=3.0,
+        )
+        direct = _lm._phase_slope_dense(
+            base.expand(small, -1, -1).contiguous(),
+            moved.expand(small, -1, -1).contiguous(),
+            pe_is_u=pe_is_u,
+            patch=16,
+            stride=8,
+            max_shift=3.0,
+        )
+        torch.testing.assert_close(conv[:small], direct, atol=1e-4, rtol=1e-4)
+
+
 def test_phase_slope_recovers_known_shift_both_pe_axes():
     """The dense phase-slope kernel returns the pull displacement for a known shift."""
     base = torch.from_numpy(_phantom(nx=48, ny=48, nz=1)[:, :, 0])[None]

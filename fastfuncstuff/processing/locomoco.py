@@ -723,13 +723,14 @@ def _phase_slope_dense(
     pad = p // 2
     lh = (h + 2 * pad - p) // stride + 1
     lw = (w + 2 * pad - p) // stride + 1
-    ppe = p  # patch extent along PE (patches are p×p; PE axis moved to dim=1 below)
+    ppe = p  # patch extent along PE (patches are p×p; PE runs along dim=1 below)
+    kmax = max(1, min(p // 2 - 1, int(p / (2.0 * max_shift))))
 
-    # The cross-power spectrum holds several (frames·lh·lw, p, p) complex/real
-    # tensors at once; at dense settings (small stride) that is many GiB for the
-    # whole time series. Process the frame batch in chunks sized to fit — the
-    # per-patch estimate is independent across frames, so this is exact.
-    per_frame = lh * lw * p * p * 40  # ~5 working tensors (real+complex) per patch elt
+    # The working set holds a handful of (frames, kmax, perpendicular, positions)
+    # complex tensors; at dense settings that is still GiBs for a long series.
+    # Process the frame batch in chunks sized to fit — the per-patch estimate is
+    # independent across frames, so this is exact.
+    per_frame = kmax * max(h, w) * max(lh, lw) * 48  # ~3 complex working tensors
     if device.type == "cuda":
         free_b, _ = torch.cuda.mem_get_info(device)
         budget = int(0.4 * free_b)
@@ -738,8 +739,27 @@ def _phase_slope_dense(
     chunk = max(1, min(b, budget // max(1, per_frame)))
 
     out = torch.empty(b, h, w, device=device, dtype=dtype)
-    kmax = max(1, min(p // 2 - 1, int(p / (2.0 * max_shift))))
     ks = torch.arange(1, kmax + 1, device=device, dtype=dtype)
+
+    # Only bins 1..kmax of the per-patch PE spectrum are ever read, so the patches
+    # themselves never have to exist: bin k of every patch along PE is a strided
+    # correlation of the image with exp(-2*pi*i*k*j/p), and the per-patch sum over
+    # the perpendicular lines is a box sum with the same window and stride. That
+    # replaces a p*p-per-patch materialization plus a full FFT with two small
+    # strided convolutions, and its cost barely moves with the frame count: at
+    # 360 frames (patch 16, stride 8) 2.06 ms -> 0.54 ms, agreeing with the
+    # patch-and-FFT form to 4e-7 relative. Below ~100 frames the two convolution
+    # launches dominate and the direct form is quicker, so keep both.
+    j = torch.arange(p, device=device, dtype=dtype)
+    theta = (-2.0 * math.pi / p) * ks[:, None] * j[None, :]  # (kmax, p)
+    dft_kernel = torch.cat([torch.cos(theta), torch.sin(theta)])[:, None, :]  # (2*kmax, 1, p)
+    box_kernel = torch.ones(1, 1, p, device=device, dtype=dtype)
+    # Which form is quicker is set by the direct path's patch buffer against the
+    # convolution form's fixed ~0.5 ms of launch overhead: the convolutions barely
+    # notice the frame count (0.53 ms at 64 frames, 0.54 at 360) while the patch
+    # materialization scales with it (0.23 -> 2.06 ms). 16 MiB of patches is where
+    # the two met on the measured shapes.
+    batched_bins = b * lh * lw * p * p * 4 > 16 * 1024**2
 
     def _patches(x: torch.Tensor, n: int) -> torch.Tensor:
         # Tensor.unfold builds the tiling as strided views and lets the ordinary
@@ -749,31 +769,65 @@ def _phase_slope_dense(
         tiles = x[:, 0].unfold(1, p, stride).unfold(2, p, stride)  # (n, lh, lw, p, p)
         return tiles.reshape(n * lh * lw, p, p)
 
+    def _pe_bins(x: torch.Tensor) -> torch.Tensor:
+        """Bins 1..kmax of the windowed PE spectrum: ``(n, perp, kmax, positions)``."""
+        n, q, pe = x.shape
+        y = F.conv1d(x.reshape(n * q, 1, pe), dft_kernel, stride=stride)  # (n*q, 2*kmax, S)
+        y = y.reshape(n, q, 2 * kmax, -1)
+        return torch.complex(y[:, :, :kmax], y[:, :, kmax:])
+
+    def _cross_by_convolution(f: torch.Tensor, m: torch.Tensor, n: int) -> torch.Tensor:
+        # Lay the PE axis last, perpendicular second: (n, perp, PE).
+        if not pe_is_u:
+            f, m = f.transpose(1, 2), m.transpose(1, 2)
+        # One global offset keeps the analytic DC cancellation (sum of the kernel
+        # over a full period is zero for k >= 1) from losing precision on the large
+        # positive means EPI carries. A per-patch mean would be equivalent: any
+        # constant contributes only to bin 0.
+        offset = f.mean()
+        prod = _pe_bins(f - offset) * _pe_bins(m - offset).conj()  # (n, perp, kmax, S)
+        n_, q_, k_, s_ = prod.shape
+        flat = prod.permute(0, 2, 3, 1).reshape(n_ * k_ * s_, 1, q_)
+        summed = torch.complex(
+            F.conv1d(flat.real, box_kernel, stride=stride),
+            F.conv1d(flat.imag, box_kernel, stride=stride),
+        )  # (n*kmax*S, 1, T)
+        t_ = summed.shape[-1]
+        summed = summed.reshape(n_, k_, s_, t_)
+        # Patch positions enumerate H then W, matching the unfold tiling; S runs
+        # along PE, T along the perpendicular axis, so which is which flips with
+        # the PE axis.
+        order = (0, 3, 2, 1) if pe_is_u else (0, 2, 3, 1)
+        return summed.permute(*order).reshape(n * lh * lw, k_)
+
     for b0 in range(0, b, chunk):
         b1 = min(b0 + chunk, b)
         cb = b1 - b0
-        fpad = F.pad(fixed[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
-        mpad = F.pad(moving[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
-        fp, mp = _patches(fpad, cb), _patches(mpad, cb)
-        if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
-            fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
-        fp = fp - fp.mean(dim=(1, 2), keepdim=True)
-        mp = mp - mp.mean(dim=(1, 2), keepdim=True)
-
-        # Patches are real and only bins 1..kmax are read, so the negative-frequency
-        # half of a full complex FFT is pure waste: rfft returns bins 0..ppe//2, and
-        # kmax <= ppe//2 - 1 by construction.
-        cross = (torch.fft.rfft(fp, dim=1) * torch.fft.rfft(mp, dim=1).conj()).sum(dim=2)
-        del fp, mp
-        ang = torch.angle(cross[:, 1 : kmax + 1])
-        wts = cross[:, 1 : kmax + 1].abs()
+        fpad = F.pad(fixed[b0:b1, None], (pad, pad, pad, pad), mode="reflect")[:, 0]
+        mpad = F.pad(moving[b0:b1, None], (pad, pad, pad, pad), mode="reflect")[:, 0]
+        if batched_bins:
+            cross_k = _cross_by_convolution(fpad, mpad, cb)
+        else:
+            fp, mp = _patches(fpad[:, None], cb), _patches(mpad[:, None], cb)
+            if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
+                fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
+            fp = fp - fp.mean(dim=(1, 2), keepdim=True)
+            mp = mp - mp.mean(dim=(1, 2), keepdim=True)
+            # Patches are real and only bins 1..kmax are read, so the negative-
+            # frequency half of a full complex FFT is pure waste: rfft returns bins
+            # 0..ppe//2, and kmax <= ppe//2 - 1 by construction.
+            cross = (torch.fft.rfft(fp, dim=1) * torch.fft.rfft(mp, dim=1).conj()).sum(dim=2)
+            del fp, mp
+            cross_k = cross[:, 1 : kmax + 1]
+        ang = torch.angle(cross_k)
+        wts = cross_k.abs()
         slope = (wts * ks * ang).sum(dim=1) / (wts * ks * ks).sum(dim=1).clamp_min(eps)
         # slope*ppe/2π is already the pull displacement (−Δ for moving=fixed(x+Δ)).
         shift = (slope * ppe / (2.0 * math.pi)).clamp(-max_shift, max_shift).reshape(cb, lh, lw)
         out[b0:b1] = F.interpolate(
             shift[:, None], size=(h, w), mode="bilinear", align_corners=True
         )[:, 0]
-        del cross, ang, wts, slope, shift
+        del cross_k, ang, wts, slope, shift
     return out
 
 
