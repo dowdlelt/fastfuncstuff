@@ -43,13 +43,12 @@ from fastfuncstuff.processing.affine import resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import (
     load_image,
-    load_warp_field,
     save_image,
     save_warp_field,
     save_warp_series,
 )
 from fastfuncstuff.processing.mask import automask
-from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz
+from fastfuncstuff.processing.nwarpforge import _regrid_to_dxyz, load_warp, prepare_warp_for_grid
 from fastfuncstuff.processing.warp import (
     Padding3D,
     QwarpConfig,
@@ -1547,8 +1546,24 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Base: {nx}x{ny}x{nz}, Source: {nx}x{ny}x{nz} x {nt}t")
         print(f"Loaded in {time.time() - t0:.1f}s")
 
-    mem_padding = _compute_support_padding(base_3d)
-    px0, px1, py0, py1, pz0, pz1 = mem_padding
+    initial_warp = None
+    if args.iniwarp is not None:
+        ini = prepare_warp_for_grid(
+            load_warp(args.iniwarp, device=torch.device("cpu"), units="mm"),
+            tuple(base_3d.shape),
+            base_info["affine"],
+            torch.device("cpu"),
+            verb=args.verb,
+        )
+        initial_warp = (ini.xd, ini.yd, ini.zd)
+        if args.verb >= 1:
+            print(f"Loaded initial warp: {args.iniwarp}")
+
+    use_pad = not args.nopad
+    warp_padding = _compute_support_padding(base_3d, initial_warp=initial_warp) if use_pad else None
+    padding: Padding3D = warp_padding if warp_padding is not None else (0, 0, 0)
+
+    px0, px1, py0, py1, pz0, pz1 = _padding_faces(padding)
     padded_shape = (nz + pz0 + pz1, ny + py0 + py1, nx + px0 + px1)
     predicted, available = plan_nonlinear_memory(padded_shape, device, "qwarp")
     if args.gpu_mem is not None:
@@ -1731,25 +1746,10 @@ def main(argv: list[str] | None = None) -> int:
         with spinner(f"Loading {Path(args.useweight).name}"):
             weight, _ = load_image(args.useweight, device=torch.device("cpu"))
 
-    # Load initial warp if provided
-    initial_warp = None
-    if args.iniwarp is not None:
-        ini_xd, ini_yd, ini_zd, _ = load_warp_field(args.iniwarp, device=torch.device("cpu"))
-        initial_warp = (ini_xd, ini_yd, ini_zd)
-        if args.verb >= 1:
-            print(f"Loaded initial warp: {args.iniwarp}")
-
     # Output prefix (strip extension; -prefix out.nii.zst requests zstd-compressed output)
     pfx = parse_prefix(args.prefix)
     prefix, nii_ext = pfx.stem, pfx.nifti_ext
 
-    # Compute padding for warp field header
-    use_pad = not args.nopad
-    if use_pad:
-        warp_padding = _compute_support_padding(base_3d)
-    else:
-        warp_padding = None
-    padding: Padding3D = warp_padding if warp_padding is not None else (0, 0, 0)
     pad_x, pad_x_hi, pad_y, pad_y_hi, pad_z, pad_z_hi = _padding_faces(padding)
 
     # Per-level dump callback:
@@ -1958,6 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_warp=chosen_warp if chain_warps else initial_warp,
                 config=vol_config,
                 device=device,
+                padding=padding,
                 pad=use_pad,
             )
 
@@ -2140,6 +2141,7 @@ def main(argv: list[str] | None = None) -> int:
                 initial_warp=initial_warp,
                 config=t_config,
                 device=device,
+                padding=padding,
                 pad=use_pad,
             )
 

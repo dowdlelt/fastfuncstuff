@@ -16,7 +16,6 @@ from fastfuncstuff.processing.warp import (
     _autobox,
     _checkerboard_phases,
     _compute_hfactor,
-    _compute_padding,
     _compute_support_padding,
     _crop_padding,
     _dedup_last_wins,
@@ -131,40 +130,6 @@ class TestPatchSpec:
         assert p.gk == 1
 
 
-# ---------------------------------------------------------------------------
-# _compute_padding
-# ---------------------------------------------------------------------------
-
-
-class TestComputePadding:
-    def test_small_volume(self):
-        """Small volumes should get minimum padding of 3."""
-        px, py, pz = _compute_padding(10, 10, 10)
-        assert px >= 3
-        assert py >= 3
-        assert pz >= 3
-
-    def test_formula(self):
-        """Check the AFNI formula: ceil(0.1234 * dim) + 1, min 3."""
-        nx, ny, nz = 64, 64, 32
-        px, py, pz = _compute_padding(nx, ny, nz)
-        assert px == max(3, math.ceil(0.1234 * nx) + 1)
-        assert py == max(3, math.ceil(0.1234 * ny) + 1)
-        assert pz == max(3, math.ceil(0.1234 * nz) + 1)
-
-    def test_asymmetric(self):
-        """Different dimensions should give different padding."""
-        px, py, pz = _compute_padding(100, 50, 20)
-        assert px > py > pz
-
-    def test_very_small(self):
-        """Tiny dimensions should still get padding of 3."""
-        px, py, pz = _compute_padding(1, 1, 1)
-        assert px == 3
-        assert py == 3
-        assert pz == 3
-
-
 class TestComputeSupportPadding:
     def test_reuses_existing_blank_margin(self):
         base = torch.zeros(64, 64, 64)
@@ -197,6 +162,18 @@ class TestComputeSupportPadding:
         base[16:48, 16:48, 16:48] = 100.0
 
         assert _compute_support_padding(base, minimum_xyz=(20, 15, 10)) == (4, 4, 3, 3, 3, 3)
+
+    def test_initial_warp_ignores_air_outlier(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+        xd = torch.zeros_like(base)
+        xd[20, 20, 20] = 20.0
+        xd[0, 0, 0] = 100.0
+        zero = torch.zeros_like(base)
+
+        padding = _compute_support_padding(base, initial_warp=(xd, zero, zero))
+
+        assert padding == (7, 7, 3, 3, 3, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -833,6 +810,23 @@ class TestPatchWriteBackDedup:
             verb=0,
         )
         warp_mod.qwarp(base, base.clone(), config=cfg, device=torch.device("cpu"), pad=False)
+
+    def test_qwarp_rejects_mismatched_initial_warp_with_explicit_padding(self):
+        """A caller-provided plan must not bypass initial-warp geometry checks."""
+        from fastfuncstuff.processing.warp import qwarp
+
+        base = torch.rand(12, 12, 12) + 0.1
+        wrong = torch.zeros(10, 12, 12)
+        zero = torch.zeros_like(wrong)
+
+        with pytest.raises(ValueError, match="initial warp components"):
+            qwarp(
+                base,
+                base.clone(),
+                initial_warp=(wrong, zero, zero),
+                padding=(3, 3, 3, 3, 3, 3),
+                device=torch.device("cpu"),
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -205,13 +205,10 @@ class TestSeparableSmooth3D:
 
         _separable_smooth_3d(packed_input, 1.25).square().sum().backward()
         sum(
-            _separable_smooth_3d(reference_input[0, c], 1.25).square().sum()
-            for c in range(3)
+            _separable_smooth_3d(reference_input[0, c], 1.25).square().sum() for c in range(3)
         ).backward()
 
-        torch.testing.assert_close(
-            packed_input.grad, reference_input.grad, atol=1e-5, rtol=1e-5
-        )
+        torch.testing.assert_close(packed_input.grad, reference_input.grad, atol=1e-5, rtol=1e-5)
 
     def test_packed_weighted_moments_match_individual_filters_and_gradients(self):
         torch.manual_seed(14)

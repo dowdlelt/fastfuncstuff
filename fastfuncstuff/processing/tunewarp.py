@@ -191,10 +191,18 @@ class Referee:
             xd, yd, zd = field
             lower_padding = None
             if tuple(xd.shape) != tuple(self.brain.shape):
-                from .warp import _compute_support_padding
+                from .warp import _compute_support_padding, _padding_faces
 
                 p = _compute_support_padding(self.base)
-                lower_padding = (p[0], p[2], p[4])
+                px0, px1, py0, py1, pz0, pz1 = _padding_faces(p)
+                expected = (
+                    self.brain.shape[0] + pz0 + pz1,
+                    self.brain.shape[1] + py0 + py1,
+                    self.brain.shape[2] + px0 + px1,
+                )
+                if tuple(xd.shape) != expected:
+                    raise ValueError(f"qwarp field shape {tuple(xd.shape)} != planned {expected}")
+                lower_padding = (px0, py0, pz0)
             mask = pad_mask_to_field(self.brain, tuple(xd.shape), lower_padding_xyz=lower_padding)
             w = warp_regularity(xd, yd, zd, mask=mask, voxdims=self.voxdims)
             grade, reasons = regularity_verdict(w)

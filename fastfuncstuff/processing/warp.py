@@ -389,19 +389,6 @@ class PatchSpec:
     gk: int
 
 
-def _compute_padding(nx: int, ny: int, nz: int) -> tuple[int, int, int]:
-    """Compute AFNI-style internal padding per axis.
-
-    Uses ~12.34% of each dimension + 1, with minimum of 3 voxels per side.
-    """
-    import math
-
-    pad_x = max(3, int(math.ceil(0.1234 * nx)) + 1)
-    pad_y = max(3, int(math.ceil(0.1234 * ny)) + 1)
-    pad_z = max(3, int(math.ceil(0.1234 * nz)) + 1)
-    return pad_x, pad_y, pad_z
-
-
 Padding3D = tuple[int, int, int] | tuple[int, int, int, int, int, int]
 
 
@@ -416,29 +403,41 @@ def _padding_faces(padding: Padding3D) -> tuple[int, int, int, int, int, int]:
 def _compute_support_padding(
     base: Tensor,
     minimum_xyz: tuple[int, int, int] = (9, 9, 9),
+    initial_warp: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> tuple[int, int, int, int, int, int]:
     """AFNI qwarp padding from thresholded base support, per volume face.
 
     Matches the zero-padding rule in AFNI `3dQwarp.c`: threshold at
     `0.33 * THD_cliplevel(base, 0.22)`, find the support box, then add only the
     shortfall needed to leave `rintf(0.1234 * dimension) + 1` blank slices, with
-    at least three newly padded slices on every face. `minimum_xyz` carries AFNI's
-    default nine-voxel floor and is the extension point for known affine shifts.
+    at least three newly padded slices on every face. An initial warp enlarges the
+    minimum from displacement inside the fixed-image support only; unconstrained
+    values in air cannot inflate the work grid.
     """
     if base.ndim != 3:
         raise ValueError(f"base must be 3-D, got shape {tuple(base.shape)}")
     nz, ny, nx = base.shape
     clip = 0.33 * _thd_cliplevel(base, 0.22)
-    support = (base >= clip).nonzero(as_tuple=False)
-    if support.numel() == 0:
+    support = (base >= clip) & (base != 0)
+    if not bool(support.any()):
         i0 = j0 = k0 = 0
         i1, j1, k1 = nx - 1, ny - 1, nz - 1
     else:
-        lo = support.amin(dim=0)
-        hi = support.amax(dim=0)
-        k0, j0, i0 = (int(v) for v in lo)
-        k1, j1, i1 = (int(v) for v in hi)
+        kz = torch.where(support.any(dim=(1, 2)))[0]
+        jy = torch.where(support.any(dim=(0, 2)))[0]
+        ix = torch.where(support.any(dim=(0, 1)))[0]
+        k0, k1 = int(kz[0]), int(kz[-1])
+        j0, j1 = int(jy[0]), int(jy[-1])
+        i0, i1 = int(ix[0]), int(ix[-1])
 
+    if initial_warp is not None:
+        if any(tuple(component.shape) != tuple(base.shape) for component in initial_warp):
+            raise ValueError("initial warp components must match the unpadded base shape")
+        active = (slice(k0, k1 + 1), slice(j0, j1 + 1), slice(i0, i1 + 1))
+        minimum_xyz = tuple(
+            max(floor, int(torch.ceil(component[active].detach().abs().max()).item()) + 3)
+            for floor, component in zip(minimum_xyz, initial_warp, strict=True)
+        )
     tx = max(int(round(0.1234 * nx)) + 1, minimum_xyz[0])
     ty = max(int(round(0.1234 * ny)) + 1, minimum_xyz[1])
     tz = max(int(round(0.1234 * nz)) + 1, minimum_xyz[2])
@@ -490,6 +489,7 @@ def qwarp(
     device: torch.device | None = None,
     pad: bool = True,
     level_log: list[dict] | None = None,
+    padding: Padding3D | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute nonlinear warp from source to base image.
 
@@ -512,6 +512,8 @@ def qwarp(
         config: QwarpConfig settings. Uses defaults if None.
         device: Torch device. Inferred from base if None.
         pad: Apply AFNI-style internal zero-padding (default True).
+        padding: Optional precomputed padding shared with planning and output I/O.
+            When supplied, qwarp uses it verbatim instead of deriving it again.
 
     Returns:
         (warped_image, warp_xd, warp_yd, warp_zd):
@@ -531,16 +533,16 @@ def qwarp(
     base = base.float().to(device)
     source = source.float().to(device)
     nz_orig, ny_orig, nx_orig = base.shape
+    if initial_warp is not None and any(
+        tuple(component.shape) != tuple(base.shape) for component in initial_warp
+    ):
+        raise ValueError("initial warp components must match the unpadded base shape")
 
-    minimum_xyz = (9, 9, 9)
-    if initial_warp is not None:
-        # AFNI enlarges its minimum exterior margin for an initial deformation.
-        # Three extra slices keep displaced support away from the zero-valued basis edge.
-        minimum_xyz = tuple(
-            max(9, int(torch.ceil(component.detach().abs().max()).item()) + 3)
-            for component in initial_warp
-        )
-    padding = _compute_support_padding(base, minimum_xyz) if pad else (0, 0, 0, 0, 0, 0)
+    if padding is None:
+        padding = _compute_support_padding(base, initial_warp=initial_warp) if pad else (0, 0, 0)
+    elif not pad and any(padding):
+        raise ValueError("explicit nonzero padding conflicts with pad=False")
+    padding = _padding_faces(padding)
     do_pad = any(padding)
 
     if do_pad:
