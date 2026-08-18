@@ -838,7 +838,7 @@ def _write_warp_timeseries(
     indices: list[int],
     zpad: int,
     base_info: dict,
-    warp_padding: tuple[int, int, int] | None,
+    warp_padding: Padding3D | None,
     tag: str = "WARP",
     verb: int = 1,
 ) -> str:
@@ -1082,7 +1082,7 @@ class _LevelDumper:
         self,
         prefix: str,
         base_info: dict,
-        padding: tuple[int, int, int] | None,
+        padding: Padding3D | None,
         nx: int,
         ny: int,
         nz: int,
