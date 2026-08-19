@@ -703,7 +703,6 @@ def fit_shifted_hrf(
         # includes the constant term, so it is exactly "variance left after
         # the nuisance model".
         ss_ref = ss_y.clamp_min(1e-12)
-        r2_fixed_out[start:end] = (1.0 - sse0 / ss_ref).clamp(-10, 1).float().cpu().numpy()
         dof = max(1, n_t - n_blocks - nz)
         sigma2 = (sse0 / dof).clamp_min(1e-30)
         lam_tau = (
@@ -731,8 +730,20 @@ def fit_shifted_hrf(
             A = _solve_amplitudes(
                 gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch, amp_lam
             )
+            # sigma^2 above deliberately stays on the bootstrap fit -- deriving
+            # it from a solve that used lambda(sigma^2) would be circular.
         else:
             amp_lam = amp_ridge
+
+        # tau=0 baseline, measured on the SAME estimator that produces r2.
+        # It used to be recorded from the bootstrap solve, so under -amp-ridge
+        # auto it described a different ridge than the final fit and could come
+        # out ABOVE r2 -- a "no-latency baseline" that beat the model it was
+        # supposed to baseline.  Caught by the first -atlas run: 0.562 vs 0.558.
+        sse0 = (
+            ss_y - torch.einsum("vb,vb->v", A, proj[ar_b[:, None], gi.T, ar_v[None, :]].T)
+        ).clamp_min(1e-30)
+        r2_fixed_out[start:end] = (1.0 - sse0 / ss_ref).clamp(-10, 1).float().cpu().numpy()
         # Record what was actually applied.  The fixed path stores its factor
         # as-is (relative to mean(diag(XtX))); the auto path stores absolute
         # lambda.  The two are not on one scale -- the metadata records which

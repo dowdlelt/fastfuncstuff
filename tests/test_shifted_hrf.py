@@ -1096,3 +1096,48 @@ def test_xval_detects_a_delay_smaller_than_one_tau_step():
     # grid-index aggregation returned exactly 0.0 here.
     assert gain != 0.0, "delay gain is exactly zero -- the aggregation quantised it away again"
     assert gain > 0.0, f"a real sub-step delay should help held-out prediction; got {gain:+.5f}"
+
+
+def test_tau0_baseline_is_measured_on_the_same_estimator(setup):
+    """r2_fixed must baseline the model that produced r2, under every ridge.
+
+    Bug of record, caught by the first -atlas run: it reported task R2 0.558
+    with a "tau=0 baseline" of 0.562 -- a no-latency baseline BEATING the
+    model it exists to baseline, which is impossible for nested fits.
+
+    Cause: ``r2_fixed`` was recorded from the bootstrap solve that
+    ``-amp-ridge auto`` runs to obtain sigma^2, so under auto it described a
+    different (weaker) ridge than the final fit.  Freeing the delays cannot
+    lower in-sample fit at a FIXED ridge, so any such inversion means the two
+    numbers are not describing one estimator.
+    """
+    h, _, block_onsets, polys = setup
+    nb = len(block_onsets)
+    # LOW SNR on purpose.  The inversion only appears where the auto lambda
+    # greatly exceeds the fixed bootstrap, i.e. where sigma^2 is large:
+    # measured pre-fix at noise 0.25/0.5/1/2/4 -> +0.119/+0.083/+0.018/
+    # -0.029/-0.066.  A quieter test passes on the buggy code.
+    rng = np.random.default_rng(5)
+    tau = rng.uniform(-1.5, 1.5, size=(25, nb))
+    amps = rng.uniform(0.5, 3.0, size=(25, nb))
+    y = _simulate(h, block_onsets, tau, amps) + rng.normal(0, 3.0, (25, NTP))
+    kw = dict(
+        data=torch.from_numpy(y),
+        block_onsets=block_onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=torch.from_numpy(polys),
+        tau_max=2.0,
+        tau_step=0.25,
+        n_sweeps=3,
+        delay_prior_sd=None,  # no tau prior: the search then purely maximises fit
+        device=CPU,
+    )
+    for ridge in ("auto", 1e-3, 0.0):
+        r = fit_shifted_hrf(**kw, amp_ridge=ridge)
+        gap = np.median(r.r2 - r.r2_fixed)
+        assert gap >= -1e-6, (
+            f"-amp-ridge {ridge!r}: tau=0 baseline beat the full fit by "
+            f"{-gap:.4f}; r2_fixed is not measured on the same estimator as r2"
+        )
