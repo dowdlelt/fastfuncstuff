@@ -1664,7 +1664,14 @@ def _refine_powell(
     params_phys = _denormalize(full_norm, bounds)
 
     if verb >= 1:
-        print(f"    {desc}: cost={final_cost:.6f} ({counter[0]} evals)")
+        # Report the gain, not just the endpoint: the polish costs a few hundred
+        # cost evaluations, and "accepted" is not the same as "worth it" -- on a
+        # same-modality pair the improvement is often in the 6th decimal.
+        gain = final_cost - start_cost
+        print(
+            f"    {desc}: cost={final_cost:.6f} (start={start_cost:.6f}, "
+            f"gain={gain:+.2e}, {counter[0]} evals)"
+        )
 
     return params_phys, final_cost
 
@@ -1830,19 +1837,31 @@ def _refine_progressive(
 
     best_cost, best_params = trials[0]
 
+    # AFNI's +ZZ: the combination widened the basin and got us here, but the
+    # answer we want is the pure lpc/lpa optimum, so drop the extra terms before
+    # the final pass. Mutating ctx is deliberate — every cost closure captures ctx
+    # and nothing else, so this switches all of them at once.
+    #
+    # This must stay OUTSIDE the polish block. It used to live inside it, so
+    # -fast / -superfast (which set powell_maxfev=0) silently returned the
+    # *combined* optimum for a +ZZ cost — the one thing +ZZ exists to avoid.
+    if ctx.micho is not None and ctx.micho_zfinal:
+        if verb >= 1:
+            print(f"    +ZZ: finishing on pure {ctx.name} (combination terms dropped)")
+        ctx.micho = None
+        if config.powell_maxfev <= 0:
+            # Nothing downstream will re-optimize, so the reported cost must at
+            # least be the pure one the caller asked for, not the combined one.
+            with torch.no_grad():
+                _m = params_to_matrix(torch.tensor(best_params, dtype=torch.float32, device=device))
+                _w = apply_affine_interp(source, _m, ctx.interp, base.shape, zero_outside=True)
+                best_cost = float(_compute_cost(base, _w, weight, ctx, voxdims, matrix=_m))
+                del _w
+
     # --- Powell polish (single pass, tighter convergence) ---
     if config.powell_maxfev > 0:
         if verb >= 1:
             print("  Powell polish (full resolution):")
-
-        # AFNI's +ZZ: the combination widened the basin and got us here, but the
-        # answer we want is the pure lpc/lpa optimum, so drop the extra terms
-        # before the final pass. Mutating ctx is deliberate — every cost closure
-        # captures ctx and nothing else, so this switches all of them at once.
-        if ctx.micho is not None and ctx.micho_zfinal:
-            if verb >= 1:
-                print(f"    +ZZ: finishing on pure {ctx.name} (combination terms dropped)")
-            ctx.micho = None
 
         polish_cost_fn = (
             _sampled_cost_fn(base, source, ctx.blokrad_mm, sample) if use_sample else None

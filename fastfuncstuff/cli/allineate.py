@@ -6,9 +6,10 @@ Usage:
     allineate -base ref.nii -source mov.nii -prefix out.nii -1Dmatrix_save mat.aff12.1D
 
 Speed presets:
-    -fast       : Skip Powell polish, fewer iterations (~2x faster)
-    -superfast  : Skip coarse search + Powell, minimal Adam (~5x faster, small motion only)
+    -fast       : Fewer iterations (~2x faster)
+    -superfast  : Skip coarse search, minimal Adam (~5x faster, small motion only)
     Default is balanced quality/speed. For maximum accuracy, use -slow.
+    The Powell polish is opt-in (-polish); +ZZ costs always get it.
 """
 
 from __future__ import annotations
@@ -159,10 +160,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="allineate",
         description="GPU-accelerated affine/rigid alignment (inspired by 3dAllineate)",
         epilog="""Speed/quality presets:
-  -superfast  Onepass, <=150 Adam iters, no Powell (small motion only)
-  -fast       <=300 Adam iters, no Powell (~2x faster)
-  (default)   <=400 Adam iters + 500 Powell evals (early-stops on plateau)
-  -slow       300 iters at 2x, 400 at full-res, 2000 Powell evals
+  -superfast  Onepass, <=150 Adam iters (small motion only)
+  -fast       <=300 Adam iters (~2x faster)
+  (default)   <=400 Adam iters, early-stops on plateau
+  -slow       600 iters at 2x, 800 at full-res, 2000 Powell evals
+  -polish     add the Powell polish (automatic for +ZZ costs)
 
 Examples:
   # Standard brain alignment:
@@ -508,6 +510,23 @@ Examples:
         "-slow", action="store_true", help="Thorough: <=600/800 Adam iters, 2000 Powell evals"
     )
     speed_group.add_argument(
+        "-polish",
+        action="store_true",
+        help="Run the final Powell polish. Off by default: on same-modality data it "
+        "moves the cost by ~1e-5 relative (below this tool's ~2e-2 run-to-run spread) "
+        "for ~15%% of the runtime, and on cross-modal lpc it more often drifts out of "
+        "the basin and gets rejected. It is still applied automatically for +ZZ costs, "
+        "where it is not a polish but the step that re-optimizes on the pure cost.",
+    )
+    speed_group.add_argument(
+        "-no_polish",
+        "-no-polish",
+        dest="no_polish",
+        action="store_true",
+        help="Never polish, even for a +ZZ cost. The +ZZ combination terms are still "
+        "dropped, so the reported cost stays the pure one -- it just is not re-optimized.",
+    )
+    speed_group.add_argument(
         "-lr",
         "-adam_lr",
         dest="adam_lr",
@@ -686,7 +705,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     # lets hard cases keep improving instead of cutting off mid-descent.
     adam_iters_2x = 300
     adam_iters_1x = 400
-    powell_maxfev = 500
+    # The polish is opt-in. Measured on same-modality EPI->EPI lpa it was rejected
+    # by the never-worse guard in 4 of 9 pairs and gained at most 9e-5 on a cost of
+    # ~3.6 in the rest -- below allineate's own ~2e-2 run-to-run spread -- for ~15%
+    # of the runtime. A +ZZ cost is the exception: there the "polish" is the pass
+    # that re-optimizes on the pure cost after the basin-widening terms are dropped,
+    # so it stays on unless -no_polish.
+    _is_zz = args.cost.lower().endswith("+zz")
+    powell_maxfev = 500 if (args.polish or _is_zz) and not args.no_polish else 0
     twopass = not args.onepass
 
     # Apply presets
@@ -706,7 +732,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     elif args.slow:
         adam_iters_2x = 600
         adam_iters_1x = 800
-        powell_maxfev = 2000
+        # -slow is a request for maximum accuracy, so it opts into the polish.
+        powell_maxfev = 0 if args.no_polish else 2000
         if verb >= 1:
             print("Mode: slow (<=600/800 iters, 2000 Powell evals)")
 
