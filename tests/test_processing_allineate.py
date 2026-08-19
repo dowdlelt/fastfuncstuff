@@ -31,6 +31,8 @@ from fastfuncstuff.processing.allineate import (
     _normalize_t,
     _parse_cost,
     _refine_adam_normalized,
+    _refine_cmaes_batched,
+    _refine_pattern_batched,
     _refine_powell,
     _rotation_candidates,
     _smooth_to_resolution,
@@ -1295,3 +1297,85 @@ def test_dxyz_output_samples_correct_world_location():
     expected = 1.0 * ix + oa2[0, 3]  # world-x at each output column
     got = w2[os2[0] // 2, os2[1] // 2, 2 : os2[2] - 2].numpy()  # interior row (avoid OOB edges)
     assert np.allclose(got, expected[2 : os2[2] - 2], atol=1e-2)
+
+
+class TestDerivativeFreeRefinement:
+    """The batched derivative-free optimizers (-optimizer pattern / cmaes).
+
+    Both exist because the batched cost is nearly free in the batch dimension
+    while sequential steps are not, so they spend a population on search instead
+    of a backward pass on a gradient. What has to hold is that they actually
+    optimize: a quadratic bowl with a known optimum is enough to catch a sign
+    error, a broken covariance update, or a search that never moves.
+    """
+
+    @staticmethod
+    def _bowl(target_norm, bounds, device):
+        """A batched cost (higher better) peaking at ``target_norm``, correlated axes.
+
+        The off-diagonal coupling matters: a diagonal bowl is solved by a
+        coordinate search, so it would not distinguish the two methods at all.
+        """
+        from fastfuncstuff.processing.affine import params_to_matrix_batched  # noqa: F401
+
+        bmin, span = _bounds_to_torch(bounds, device)
+        tgt = torch.as_tensor(target_norm, dtype=torch.float32, device=device)
+
+        def cost(matrices):
+            # Recover the normalized params from the matrix translation column,
+            # which is what both optimizers vary here.
+            t = matrices[:, :3, 3]
+            d = t - tgt[None, :3] * span[None, :3] - bmin[None, :3]
+            skew = d[:, 0] * d[:, 1] * 0.9  # correlated valley
+            return -(d.pow(2).sum(dim=1) + skew)
+
+        return cost
+
+    @pytest.mark.parametrize("refine", [_refine_pattern_batched, _refine_cmaes_batched])
+    def test_improves_on_its_starting_point(self, refine):
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = self._bowl(_normalize(start, bounds) + 0.02, bounds, device)
+
+        out, costs = refine([start], config, bounds, device, cost, verb=0, n_iters=60)
+
+        assert out.shape == (1, 12)
+        assert np.all(np.isfinite(out))
+        start_cost = float(cost(_batched_cost_matrix(start, device)).item())
+        assert costs[0] >= start_cost, "refinement returned a worse point than it started from"
+
+    def test_cmaes_is_reproducible(self):
+        """Seeded sampling: an alignment that moves run to run is unusable downstream."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = self._bowl(_normalize(start, bounds) + 0.02, bounds, device)
+
+        a, ca = _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=40)
+        b, cb = _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=40)
+        np.testing.assert_array_equal(a, b)
+        np.testing.assert_array_equal(ca, cb)
+
+    def test_cmaes_handles_several_trials_at_once(self):
+        """T trials share one batched evaluation; each must keep its own state."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        starts = [_identity_physical() for _ in range(3)]
+        cost = self._bowl(_normalize(starts[0], bounds) + 0.02, bounds, device)
+
+        out, costs = _refine_cmaes_batched(starts, config, bounds, device, cost, verb=0, n_iters=30)
+        assert out.shape == (3, 12)
+        assert costs.shape == (3,)
+        assert np.all(np.isfinite(costs))
+
+
+def _batched_cost_matrix(params_phys, device):
+    """(1,4,4) matrix for a single physical parameter vector."""
+    from fastfuncstuff.processing.affine import params_to_matrix_batched
+
+    t = torch.as_tensor(params_phys, dtype=torch.float32, device=device)[None, :]
+    return params_to_matrix_batched(t)

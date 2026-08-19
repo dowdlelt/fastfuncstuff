@@ -1429,6 +1429,180 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
     return fn
 
 
+def _refine_cmaes_batched(
+    init_params_phys_list: list[np.ndarray],
+    config: AffineAlignConfig,
+    bounds: np.ndarray,
+    device: torch.device,
+    batched_cost_fn,
+    verb: int = 1,
+    n_iters: int = 150,
+    desc: str = "CMA",
+    sigma0: float = 0.04,
+    # sigma is in normalized parameter units; 5e-4 of the search span is far
+    # below a tenth of a voxel, and tightening it to 1e-4 tripled the runtime for
+    # no measurable accuracy (0.0860 deg vs 0.0862 deg against AFNI).
+    sigma_min: float = 5e-4,
+    popsize: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """CMA-ES refinement: T independent searches, one batched cost per generation.
+
+    Why CMA-ES specifically
+    -----------------------
+    Three measured facts pick this method:
+
+    1. The batched cost is nearly free in the batch dimension (B=1 and B=64 cost
+       the same wall time -- the evaluation is launch-bound). Population methods
+       are therefore free; sequential steps are what cost.
+    2. The autograd gradient does not agree with a finite difference of the same
+       function below h~1e-2, so the surface is rough at the scale where the
+       search finishes. A derivative-free method sidesteps that entirely.
+    3. Rotation and translation are strongly correlated for an off-centre object,
+       so the improving direction is rarely axis-aligned. A *coordinate* search
+       (``_refine_pattern_batched``) converges measurably short because of it.
+
+    CMA-ES answers (3) directly: it adapts a full covariance for the sampling
+    distribution, so it learns the valley's orientation rather than fighting it,
+    while (1) makes its population free and (2) makes its derivative-freedom a
+    feature rather than a cost.
+
+    The implementation is the standard (mu/mu_w, lambda)-CMA-ES with cumulative
+    step-size adaptation, run for all T trials at once: every tensor carries a
+    leading T, and the whole population of every trial is evaluated in a single
+    call to ``batched_cost_fn`` (T*lambda rows).
+
+    Returns:
+        (params_phys, costs): (T, 12) refined params and (T,) best costs.
+    """
+    free_mask = _get_free_mask(config.dof)
+    free_idx = torch.as_tensor(np.flatnonzero(free_mask), device=device)
+    n = int(free_idx.numel())
+    bmin, span = _bounds_to_torch(bounds, device)
+
+    init = torch.tensor(np.stack(init_params_phys_list), dtype=torch.float32, device=device)
+    T = init.shape[0]
+    x0 = _normalize_t(init, bmin, span).clamp_(0.0, 1.0)  # (T, 12) full parameter vector
+
+    import os as _os
+
+    lam = (
+        int(popsize)
+        if popsize
+        else int(_os.environ.get("FFS_CMA_LAM", "0"))
+        or max(8, 4 + int(3 * math.log(max(n, 2))) + 8)
+    )
+    sigma_min = float(_os.environ.get("FFS_CMA_SMIN", sigma_min))
+    sigma0 = float(_os.environ.get("FFS_CMA_S0", sigma0))
+    mu = lam // 2
+
+    # Log-decreasing recombination weights (Hansen); dtype float64 -- the CMA
+    # algebra is n x n with n <= 12, so double precision here is free and keeps
+    # the covariance update well-conditioned.
+    dt = torch.float64
+    w = torch.log(torch.tensor(mu + 0.5, dtype=dt, device=device)) - torch.log(
+        torch.arange(1, mu + 1, dtype=dt, device=device)
+    )
+    w = w / w.sum()
+    mueff = float(1.0 / (w**2).sum())
+
+    c_sig = (mueff + 2.0) / (n + mueff + 5.0)
+    d_sig = 1.0 + 2.0 * max(0.0, math.sqrt((mueff - 1.0) / (n + 1.0)) - 1.0) + c_sig
+    cc = (4.0 + mueff / n) / (n + 4.0 + 2.0 * mueff / n)
+    c1 = 2.0 / ((n + 1.3) ** 2 + mueff)
+    cmu = min(1.0 - c1, 2.0 * (mueff - 2.0 + 1.0 / mueff) / ((n + 2.0) ** 2 + mueff))
+    chiN = math.sqrt(n) * (1.0 - 1.0 / (4.0 * n) + 1.0 / (21.0 * n * n))
+
+    mean = x0[:, free_idx].to(dt)  # (T, n) search happens in the free subspace only
+    sigma = torch.full((T,), float(sigma0), dtype=dt, device=device)
+    C = torch.eye(n, dtype=dt, device=device).expand(T, n, n).contiguous()
+    p_sig = torch.zeros(T, n, dtype=dt, device=device)
+    p_c = torch.zeros(T, n, dtype=dt, device=device)
+
+    # Fixed seed: CMA-ES is a randomized method, and an alignment that changes
+    # run to run is not something a pipeline can build on.
+    gen = torch.Generator(device=device).manual_seed(0x0A11)
+
+    best_x = x0.clone()
+    best_c = torch.full((T,), -float("inf"), device=device)
+    alive = torch.ones(T, dtype=torch.bool, device=device)
+    n_eval = 0
+
+    def _evaluate(cand_free: Tensor) -> Tensor:
+        """(T, L, n) free-subspace points -> (T, L) costs, in one batched call."""
+        L = cand_free.shape[1]
+        full = x0[:, None, :].expand(T, L, 12).clone()
+        full[:, :, free_idx] = cand_free.to(torch.float32)
+        full = full.clamp_(0.0, 1.0)
+        flat = full.reshape(T * L, 12)
+        return batched_cost_fn(params_to_matrix_batched(_denormalize_t(flat, bmin, span))).reshape(
+            T, L
+        )
+
+    pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
+    for gi in pbar:
+        # C is symmetric PSD; eigh gives C = B diag(d2) B^T, so the sampling
+        # transform is B @ diag(sqrt(d2)).
+        d2, Bm = torch.linalg.eigh(C)
+        d = d2.clamp_min(1e-20).sqrt()  # (T, n)
+
+        z = torch.randn(T, lam, n, generator=gen, dtype=dt, device=device)
+        y = torch.einsum("tij,tlj->tli", Bm, z * d[:, None, :])  # (T, lam, n)
+        cand = mean[:, None, :] + sigma[:, None, None] * y
+
+        vals = _evaluate(cand)  # (T, lam), higher is better
+        n_eval += T * lam
+
+        order = vals.argsort(dim=1, descending=True)[:, :mu]  # (T, mu)
+        sel_y = y.gather(1, order[:, :, None].expand(T, mu, n))  # (T, mu, n)
+        sel_x = cand.gather(1, order[:, :, None].expand(T, mu, n))
+
+        # Track the single best point seen, not the distribution mean: the mean
+        # is a recombination and need not be a point we ever evaluated.
+        gen_best = vals.gather(1, order[:, :1]).squeeze(1)  # (T,)
+        improved = (gen_best > best_c) & alive
+        top_full = x0.clone()
+        top_full[:, free_idx] = sel_x[:, 0, :].to(torch.float32)
+        best_x = torch.where(improved[:, None], top_full.clamp(0.0, 1.0), best_x)
+        best_c = torch.where(improved, gen_best, best_c)
+
+        y_w = (w[None, :, None] * sel_y).sum(dim=1)  # (T, n)
+        mean = mean + sigma[:, None] * y_w
+
+        # Step-size control (CSA): compare the realised path length against the
+        # length a random walk would have produced.
+        C_invsqrt_yw = torch.einsum(
+            "tij,tj->ti", Bm, torch.einsum("tji,tj->ti", Bm, y_w) / d.clamp_min(1e-20)
+        )
+        p_sig = (1 - c_sig) * p_sig + math.sqrt(c_sig * (2 - c_sig) * mueff) * C_invsqrt_yw
+        pn = p_sig.norm(dim=1)
+        sigma = sigma * torch.exp((c_sig / d_sig) * (pn / chiN - 1.0))
+        sigma = sigma.clamp(min=1e-12, max=0.5)
+
+        denom = math.sqrt(max(1.0 - (1.0 - c_sig) ** (2 * (gi + 1)), 1e-12))
+        h_sig = (pn / denom < (1.4 + 2.0 / (n + 1.0)) * chiN).to(dt)  # (T,)
+        p_c = (1 - cc) * p_c + h_sig[:, None] * math.sqrt(cc * (2 - cc) * mueff) * y_w
+
+        rank1 = p_c[:, :, None] * p_c[:, None, :]
+        rankmu = torch.einsum("m,tmi,tmj->tij", w, sel_y, sel_y)
+        # The h_sig correction restores the variance the skipped rank-1 update
+        # would have contributed, so C stays unbiased when the path is long.
+        corr = ((1.0 - h_sig) * cc * (2.0 - cc))[:, None, None] * C
+        C = (1 - c1 - cmu) * C + c1 * (rank1 + corr) + cmu * rankmu
+        C = 0.5 * (C + C.transpose(1, 2))  # keep it exactly symmetric
+
+        alive = alive & (sigma > sigma_min)
+        if not bool(alive.any()):
+            break
+        if tqdm is not None and verb >= 1:
+            pbar.set_postfix_str(f"best={best_c.max().item():.6f} s={sigma.max().item():.2e}")
+
+    if verb >= 2:
+        print(f"    {desc}: {n_eval} cost evaluations in {gi + 1} generations (lambda={lam})")
+
+    best_phys = _denormalize_t(best_x.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
+    return best_phys, best_c.detach().cpu().numpy()
+
+
 def _refine_pattern_batched(
     init_params_phys_list: list[np.ndarray],
     config: AffineAlignConfig,
@@ -1936,7 +2110,18 @@ def _refine_progressive(
             bcost = _batched_sampled_cost(
                 source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, ctx
             )
-            if config.optimizer == "pattern":
+            if config.optimizer == "cmaes":
+                out_phys, out_costs = _refine_cmaes_batched(
+                    [p for _, p in trials],
+                    config,
+                    bounds,
+                    device,
+                    bcost,
+                    verb=verb,
+                    n_iters=n_iters,
+                    desc=f"S{si}",
+                )
+            elif config.optimizer == "pattern":
                 out_phys, out_costs = _refine_pattern_batched(
                     [p for _, p in trials],
                     config,

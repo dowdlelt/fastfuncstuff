@@ -548,13 +548,14 @@ Examples:
     add_deterministic_arg(hw_group)
     hw_group.add_argument(
         "-optimizer",
-        choices=("adam", "pattern"),
+        choices=("adam", "pattern", "cmaes"),
         default="adam",
         help="Refinement optimizer. 'adam' is autograd + Adam. 'pattern' is a "
-        "batched derivative-free coordinate search: it spends the (free) batch "
-        "dimension on a full coordinate line search per step instead of on a "
-        "backward pass, which is both faster and better suited to this cost's "
-        "small-scale roughness.",
+        "batched derivative-free coordinate search. 'cmaes' is batched CMA-ES, "
+        "which additionally adapts a covariance and so follows the correlated "
+        "rotation/translation valley that defeats a coordinate stencil. Both "
+        "spend the (free) batch dimension on search instead of on a backward "
+        "pass, which suits this cost's small-scale roughness.",
     )
     hw_group.add_argument(
         "-compile",
