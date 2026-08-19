@@ -194,7 +194,7 @@ def _separable_smooth_3d(
     """Apply 3D smoothing using separable convolution.
 
     Args:
-        vol: (1, 1, D, H, W) or (D, H, W) volume.
+        vol: (N, C, D, H, W) or (D, H, W) volume.
         sigma: Kernel parameter — Gaussian sigma or box radius, in voxels. A
             3-tuple gives a per-axis ``(z, y, x)`` extent, which is how a
             physical (mm) smoothing width is expressed on an anisotropic grid.
@@ -207,33 +207,147 @@ def _separable_smooth_3d(
     if squeeze:
         vol = vol[None, None]
 
+    if vol.ndim != 5:
+        raise ValueError(f"expected a 3-D or 5-D volume, got shape {tuple(vol.shape)}")
+
+    # Treat every batch/channel plane as an independent convolution group. This
+    # preserves the scalar-volume result while allowing vector fields and banks of
+    # local-statistic moments to share one padding and convolution launch per axis.
+    n_batch, n_chan, nz, ny, nx = vol.shape
+    n_groups = n_batch * n_chan
+    vol = vol.reshape(1, n_groups, nz, ny, nx)
+
     sz, sy, sx = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
 
     # Z
     if vol.shape[2] > 1:
         kernel = _make_kernel_1d(kernel_type, sz, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, :, None, None]
+        k = kernel[None, None, :, None, None].expand(n_groups, 1, -1, 1, 1)
         vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
     # Y
     if vol.shape[3] > 1:
         kernel = _make_kernel_1d(kernel_type, sy, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, :, None]
+        k = kernel[None, None, None, :, None].expand(n_groups, 1, 1, -1, 1)
         vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
     # X
     if vol.shape[4] > 1:
         kernel = _make_kernel_1d(kernel_type, sx, vol.device)
         radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, None, :]
+        k = kernel[None, None, None, None, :].expand(n_groups, 1, 1, 1, -1)
         vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k)
+        vol = F.conv3d(vol, k, groups=n_groups)
+
+    vol = vol.reshape(n_batch, n_chan, nz, ny, nx)
 
     if squeeze:
         vol = vol[0, 0]
     return vol
+
+
+def _smoothed_weighted_moments_3d(
+    x: Tensor,
+    y: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Filter the six weighted local-correlation moments as one channel bank."""
+    moments = torch.stack(
+        (weight, weight * x, weight * y, weight * x * x, weight * y * y, weight * x * y)
+    )[None]
+    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
+    return smoothed[0], smoothed[1], smoothed[2], smoothed[3], smoothed[4], smoothed[5]
+
+
+def _smoothed_weighted_fixed_moments_3d(
+    fixed: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Filter the three moments invariant while one image is repeatedly warped."""
+    moments = torch.stack((weight, weight * fixed, weight * fixed * fixed))[None]
+    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
+    return smoothed[0], smoothed[1], smoothed[2]
+
+
+def _smoothed_weighted_moments_3d_from_fixed(
+    moving: Tensor,
+    fixed: Tensor,
+    weight: Tensor,
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+    fixed_moments: tuple[Tensor, Tensor, Tensor],
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """Filter only moving-side/cross moments and combine with a fixed-side cache."""
+    dynamic = torch.stack((weight * moving, weight * moving * moving, weight * moving * fixed))[
+        None
+    ]
+    smoothed = _separable_smooth_3d(dynamic, sigma, kernel_type=kernel_type)[0]
+    sw, swf, swff = fixed_moments
+    return sw, smoothed[0], swf, smoothed[1], swff, smoothed[2]
+
+
+def _local_pearson_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+) -> Tensor:
+    """Build the local Pearson field from already-filtered weighted moments."""
+    sw, swx, swy, swxx, swyy, swxy = moments
+    sw = sw.clamp(min=1e-10)
+    mx = swx / sw
+    my = swy / sw
+    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
+    vyy = (swyy / sw - my * my).clamp(min=1e-10)
+    vxy = swxy / sw - mx * my
+    return vxy / (vxx * vyy).sqrt()
+
+
+def _lpa_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    weight: Tensor | None,
+) -> Tensor:
+    local_abs_corr = _local_pearson_from_moments(moments).abs()
+    if weight is None:
+        return local_abs_corr.mean()
+    return (weight * local_abs_corr).sum() / weight.sum().clamp(min=1e-10)
+
+
+def _lpc_from_moments(
+    moments: tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor],
+    weight: Tensor | None,
+) -> Tensor:
+    local_corr = _local_pearson_from_moments(moments).clamp(-0.99, 0.99)
+    z = torch.atanh(local_corr)
+    z_weighted = z * z.abs()
+    if weight is None:
+        return -z_weighted.mean()
+    return -(weight * z_weighted).sum() / weight.sum().clamp(min=1e-10)
+
+
+def _packed_lpa_correlation(
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    sigma: float,
+    kernel_type: str,
+) -> Tensor:
+    moments = _smoothed_weighted_moments_3d(base, source, weight, sigma, kernel_type)
+    return _lpa_from_moments(moments, weight)
+
+
+def _packed_lpc_correlation(
+    base: Tensor,
+    source: Tensor,
+    weight: Tensor,
+    sigma: float,
+    kernel_type: str,
+) -> Tensor:
+    moments = _smoothed_weighted_moments_3d(base, source, weight, sigma, kernel_type)
+    return _lpc_from_moments(moments, weight)
 
 
 def lpa_correlation(
@@ -277,37 +391,8 @@ def lpa_correlation(
     def _sm(v: Tensor) -> Tensor:
         return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    # Smoothed weighted statistics (all as 3D volumes)
-    sw = _sm(w).clamp(min=1e-10)
-
-    swx = _sm(w * x)
-    swy = _sm(w * y)
-    swxx = _sm(w * x * x)
-    swyy = _sm(w * y * y)
-    swxy = _sm(w * x * y)
-
-    # Local means
-    mx = swx / sw
-    my = swy / sw
-
-    # Local variances and covariance
-    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
-    vyy = (swyy / sw - my * my).clamp(min=1e-10)
-    vxy = swxy / sw - mx * my
-
-    # Local correlation
-    local_corr = vxy / (vxx * vyy).sqrt()
-
-    # Take absolute value (LPA = local pearson absolute)
-    local_abs_corr = local_corr.abs()
-
-    # Weighted mean
-    if weight is not None:
-        result = (weight * local_abs_corr).sum() / weight.sum().clamp(min=1e-10)
-    else:
-        result = local_abs_corr.mean()
-
-    return result
+    moments = (_sm(w), _sm(w * x), _sm(w * y), _sm(w * x * x), _sm(w * y * y), _sm(w * x * y))
+    return _lpa_from_moments(moments, weight)
 
 
 def lpc_correlation(
@@ -349,34 +434,8 @@ def lpc_correlation(
     def _sm(v: Tensor) -> Tensor:
         return _separable_smooth_3d(v, sigma, kernel_type=kernel_type)
 
-    sw = _sm(w).clamp(min=1e-10)
-
-    swx = _sm(w * x)
-    swy = _sm(w * y)
-    swxx = _sm(w * x * x)
-    swyy = _sm(w * y * y)
-    swxy = _sm(w * x * y)
-
-    mx = swx / sw
-    my = swy / sw
-
-    vxx = (swxx / sw - mx * mx).clamp(min=1e-10)
-    vyy = (swyy / sw - my * my).clamp(min=1e-10)
-    vxy = swxy / sw - mx * my
-
-    local_corr = (vxy / (vxx * vyy).sqrt()).clamp(-0.99, 0.99)
-
-    # Fisher Z transform + z*|z| weighting (AFNI-style)
-    z = torch.atanh(local_corr)
-    z_weighted = z * z.abs()
-
-    # AFNI minimizes mean(z*|z|); we negate so higher = better
-    if weight is not None:
-        lpc_afni = (weight * z_weighted).sum() / weight.sum().clamp(min=1e-10)
-    else:
-        lpc_afni = z_weighted.mean()
-
-    return -lpc_afni
+    moments = (_sm(w), _sm(w * x), _sm(w * y), _sm(w * x * x), _sm(w * y * y), _sm(w * x * y))
+    return _lpc_from_moments(moments, weight)
 
 
 def lpa_cost_patch(

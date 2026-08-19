@@ -723,13 +723,14 @@ def _phase_slope_dense(
     pad = p // 2
     lh = (h + 2 * pad - p) // stride + 1
     lw = (w + 2 * pad - p) // stride + 1
-    ppe = p  # patch extent along PE (patches are p×p; PE axis moved to dim=1 below)
+    ppe = p  # patch extent along PE (patches are p×p; PE runs along dim=1 below)
+    kmax = max(1, min(p // 2 - 1, int(p / (2.0 * max_shift))))
 
-    # The cross-power spectrum holds several (frames·lh·lw, p, p) complex/real
-    # tensors at once; at dense settings (small stride) that is many GiB for the
-    # whole time series. Process the frame batch in chunks sized to fit — the
-    # per-patch estimate is independent across frames, so this is exact.
-    per_frame = lh * lw * p * p * 40  # ~5 working tensors (real+complex) per patch elt
+    # The working set holds a handful of (frames, kmax, perpendicular, positions)
+    # complex tensors; at dense settings that is still GiBs for a long series.
+    # Process the frame batch in chunks sized to fit — the per-patch estimate is
+    # independent across frames, so this is exact.
+    per_frame = kmax * max(h, w) * max(lh, lw) * 48  # ~3 complex working tensors
     if device.type == "cuda":
         free_b, _ = torch.cuda.mem_get_info(device)
         budget = int(0.4 * free_b)
@@ -738,35 +739,95 @@ def _phase_slope_dense(
     chunk = max(1, min(b, budget // max(1, per_frame)))
 
     out = torch.empty(b, h, w, device=device, dtype=dtype)
-    kmax = max(1, min(p // 2 - 1, int(p / (2.0 * max_shift))))
     ks = torch.arange(1, kmax + 1, device=device, dtype=dtype)
 
+    # Only bins 1..kmax of the per-patch PE spectrum are ever read, so the patches
+    # themselves never have to exist: bin k of every patch along PE is a strided
+    # correlation of the image with exp(-2*pi*i*k*j/p), and the per-patch sum over
+    # the perpendicular lines is a box sum with the same window and stride. That
+    # replaces a p*p-per-patch materialization plus a full FFT with two small
+    # strided convolutions, and its cost barely moves with the frame count: at
+    # 360 frames (patch 16, stride 8) 2.06 ms -> 0.54 ms, agreeing with the
+    # patch-and-FFT form to 4e-7 relative. Below ~100 frames the two convolution
+    # launches dominate and the direct form is quicker, so keep both.
+    j = torch.arange(p, device=device, dtype=dtype)
+    theta = (-2.0 * math.pi / p) * ks[:, None] * j[None, :]  # (kmax, p)
+    dft_kernel = torch.cat([torch.cos(theta), torch.sin(theta)])[:, None, :]  # (2*kmax, 1, p)
+    box_kernel = torch.ones(1, 1, p, device=device, dtype=dtype)
+    # Which form is quicker is set by the direct path's patch buffer against the
+    # convolution form's fixed ~0.5 ms of launch overhead: the convolutions barely
+    # notice the frame count (0.53 ms at 64 frames, 0.54 at 360) while the patch
+    # materialization scales with it (0.23 -> 2.06 ms). 16 MiB of patches is where
+    # the two met on the measured shapes.
+    batched_bins = b * lh * lw * p * p * 4 > 16 * 1024**2
+
     def _patches(x: torch.Tensor, n: int) -> torch.Tensor:
-        cols = F.unfold(x, kernel_size=p, stride=stride)  # (n, p*p, L)
-        return cols.transpose(1, 2).reshape(n * lh * lw, p, p)
+        # Tensor.unfold builds the tiling as strided views and lets the ordinary
+        # copy kernel materialize it; F.unfold routes the same bytes through
+        # im2col, which is ~5x slower here (9.6 ms -> 2.0 ms for the unfold+FFT
+        # chain at 360 frames, patch 16, stride 8) for a bit-identical result.
+        tiles = x[:, 0].unfold(1, p, stride).unfold(2, p, stride)  # (n, lh, lw, p, p)
+        return tiles.reshape(n * lh * lw, p, p)
+
+    def _pe_bins(x: torch.Tensor) -> torch.Tensor:
+        """Bins 1..kmax of the windowed PE spectrum: ``(n, perp, kmax, positions)``."""
+        n, q, pe = x.shape
+        y = F.conv1d(x.reshape(n * q, 1, pe), dft_kernel, stride=stride)  # (n*q, 2*kmax, S)
+        y = y.reshape(n, q, 2 * kmax, -1)
+        return torch.complex(y[:, :, :kmax], y[:, :, kmax:])
+
+    def _cross_by_convolution(f: torch.Tensor, m: torch.Tensor, n: int) -> torch.Tensor:
+        # Lay the PE axis last, perpendicular second: (n, perp, PE).
+        if not pe_is_u:
+            f, m = f.transpose(1, 2), m.transpose(1, 2)
+        # One global offset keeps the analytic DC cancellation (sum of the kernel
+        # over a full period is zero for k >= 1) from losing precision on the large
+        # positive means EPI carries. A per-patch mean would be equivalent: any
+        # constant contributes only to bin 0.
+        offset = f.mean()
+        prod = _pe_bins(f - offset) * _pe_bins(m - offset).conj()  # (n, perp, kmax, S)
+        n_, q_, k_, s_ = prod.shape
+        flat = prod.permute(0, 2, 3, 1).reshape(n_ * k_ * s_, 1, q_)
+        summed = torch.complex(
+            F.conv1d(flat.real, box_kernel, stride=stride),
+            F.conv1d(flat.imag, box_kernel, stride=stride),
+        )  # (n*kmax*S, 1, T)
+        t_ = summed.shape[-1]
+        summed = summed.reshape(n_, k_, s_, t_)
+        # Patch positions enumerate H then W, matching the unfold tiling; S runs
+        # along PE, T along the perpendicular axis, so which is which flips with
+        # the PE axis.
+        order = (0, 3, 2, 1) if pe_is_u else (0, 2, 3, 1)
+        return summed.permute(*order).reshape(n * lh * lw, k_)
 
     for b0 in range(0, b, chunk):
         b1 = min(b0 + chunk, b)
         cb = b1 - b0
-        fpad = F.pad(fixed[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
-        mpad = F.pad(moving[b0:b1, None], (pad, pad, pad, pad), mode="reflect")
-        fp, mp = _patches(fpad, cb), _patches(mpad, cb)
-        if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
-            fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
-        fp = fp - fp.mean(dim=(1, 2), keepdim=True)
-        mp = mp - mp.mean(dim=(1, 2), keepdim=True)
-
-        cross = (torch.fft.fft(fp, dim=1) * torch.fft.fft(mp, dim=1).conj()).sum(dim=2)  # (N, ppe)
-        del fp, mp
-        ang = torch.angle(cross[:, 1 : kmax + 1])
-        wts = cross[:, 1 : kmax + 1].abs()
+        fpad = F.pad(fixed[b0:b1, None], (pad, pad, pad, pad), mode="reflect")[:, 0]
+        mpad = F.pad(moving[b0:b1, None], (pad, pad, pad, pad), mode="reflect")[:, 0]
+        if batched_bins:
+            cross_k = _cross_by_convolution(fpad, mpad, cb)
+        else:
+            fp, mp = _patches(fpad[:, None], cb), _patches(mpad[:, None], cb)
+            if pe_is_u:  # PE along W (dim=2) -> move it to dim=1 for the FFT
+                fp, mp = fp.transpose(1, 2), mp.transpose(1, 2)
+            fp = fp - fp.mean(dim=(1, 2), keepdim=True)
+            mp = mp - mp.mean(dim=(1, 2), keepdim=True)
+            # Patches are real and only bins 1..kmax are read, so the negative-
+            # frequency half of a full complex FFT is pure waste: rfft returns bins
+            # 0..ppe//2, and kmax <= ppe//2 - 1 by construction.
+            cross = (torch.fft.rfft(fp, dim=1) * torch.fft.rfft(mp, dim=1).conj()).sum(dim=2)
+            del fp, mp
+            cross_k = cross[:, 1 : kmax + 1]
+        ang = torch.angle(cross_k)
+        wts = cross_k.abs()
         slope = (wts * ks * ang).sum(dim=1) / (wts * ks * ks).sum(dim=1).clamp_min(eps)
         # slope*ppe/2π is already the pull displacement (−Δ for moving=fixed(x+Δ)).
         shift = (slope * ppe / (2.0 * math.pi)).clamp(-max_shift, max_shift).reshape(cb, lh, lw)
         out[b0:b1] = F.interpolate(
             shift[:, None], size=(h, w), mode="bilinear", align_corners=True
         )[:, 0]
-        del cross, ang, wts, slope, shift
+        del cross_k, ang, wts, slope, shift
     return out
 
 
@@ -1325,6 +1386,7 @@ def _estimate_static(
     first_n=None,
     diag=None,
     hpf_sigma=0.0,
+    gate=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
@@ -1335,6 +1397,11 @@ def _estimate_static(
     ``diag`` (a dict) opts into the xcorr searchlight diagnostics: it is filled with
     ``conf`` ``(nt, nS, H, W)`` and, when ``diag["curve_frame"]`` is set, ``curve``
     ``(nd, nS, H, W)`` for that frame — both in canonical layout, empty for flow/phase.
+
+    ``gate`` ``(nS, H, W)`` scales the flow down outside the head before the
+    correction is resampled. Applying it here rather than to the returned series is
+    what keeps the correction a single pass: gating afterwards means re-resampling
+    every slice from the raw data with the gated field.
     """
     nt, ns, hh, ww = vol.shape
     win = _time_window(vol, 0, first_n)
@@ -1376,6 +1443,9 @@ def _estimate_static(
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
         curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
         u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
+        if gate is not None:
+            gate_s = gate[s].to(device)
+            u, v = u * gate_s, v * gate_s
         corrected[:, s] = _correct_pe(
             moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius
         ).cpu()
@@ -1673,7 +1743,7 @@ def estimate_residual_flow(
 
     perm = [3, slice_axis, a0, a1]
     vol = torch.from_numpy(np.ascontiguousarray(data)).permute(perm).contiguous()
-    nt, ns = vol.shape[0], vol.shape[1]
+    nt, ns, hh, ww = vol.shape
     if verbose:
         print(
             f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, slice_axis, is_3dacq=False, dual=dual)}"
@@ -1728,6 +1798,10 @@ def estimate_residual_flow(
         Outside the head (and outside data coverage) the displacement becomes ~0, so
         the resample is the identity there and the voxels pass through untouched
         instead of being yanked by a phantom warp.
+
+        Only the progressive-reference path needs this: `_estimate_static` takes the
+        gate directly and applies it before it resamples, so the fixed-reference path
+        never builds the corrected series twice.
         """
         if soft is None:
             return u, v, corr
@@ -1772,8 +1846,10 @@ def estimate_residual_flow(
             first_n=first_n,
             diag=diag,
             hpf_sigma=hpf_sigma,
+            gate=soft,
         )
-    u_all, v_all, corrected = _gate(u_all, v_all, corrected)
+    if progressive:
+        u_all, v_all, corrected = _gate(u_all, v_all, corrected)
     # Outer reference-refinement (shared engine): rebuild the reference from the
     # corrected series and re-register, converging the template out of its bias. The
     # aggregate honours -ref and -first_n; the step is the in-brain rms of the stacked
@@ -1795,17 +1871,30 @@ def estimate_residual_flow(
                 ref_override=new_ref,
                 diag=diag,
                 hpf_sigma=hpf_sigma,
+                gate=soft,
             )
-            u, v, corr = _gate(u, v, corr)
-            return torch.stack([u, v]), corr
+            return (u, v), corr
 
-        def _brain_rms_2d(delta):
-            d = delta[:, :, brain]  # (2, nt, N_brain)
-            return float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+        # Frames per step-rms chunk, sized so the difference stays around 64 MiB
+        # however long the run is. Differencing the whole series at once, as the
+        # step used to, costs a pair of full-size buffers to then keep only the
+        # in-brain voxels; chunking is both smaller and measurably faster (1.6 s
+        # -> 0.8 s at 360x65x112x104).
+        rms_chunk = max(1, (64 * 1024**2) // max(1, ns * hh * ww * 4))
 
-        stacked, corrected = _refine_loop(
+        def _brain_rms_2d(disp, prev):
+            total, count = 0.0, 0
+            for new_c, old_c in zip(disp, prev, strict=True):
+                for t0 in range(0, new_c.shape[0], rms_chunk):
+                    sl = slice(t0, t0 + rms_chunk)
+                    d = (new_c[sl] - old_c[sl])[:, brain]
+                    total += float(d.pow(2).sum())
+                    count += d.numel()
+            return (total / count) ** 0.5 if count else 0.0
+
+        pair, corrected = _refine_loop(
             _est_2d,
-            torch.stack([u_all, v_all]),
+            (u_all, v_all),
             corrected,
             reduce_ref=lambda c: _refine_reduce(c, ref_mode, 0, first_n),
             brain_rms=_brain_rms_2d,
@@ -1815,7 +1904,7 @@ def estimate_residual_flow(
             max_shift=max_shift,
             verbose=verbose,
         )
-        u_all, v_all = stacked[0], stacked[1]
+        u_all, v_all = pair
 
     if jacobian:
         # Conserve signal along PE: where the unwarp stretches a region (Jacobian > 1)
@@ -2833,9 +2922,11 @@ def _refine_loop(
     - ``estimate(new_ref) -> (disp, corrected)`` re-runs the per-frame estimator.
     - ``reduce_ref(corrected) -> new_ref`` aggregates the corrected series (honouring
       ``-ref`` / ``-first_n``) into the next reference.
-    - ``brain_rms(Δdisp) -> float`` is the in-brain rms of a displacement change — the
-      step size, layout-specific so each caller supplies its own (its ``disp`` may be a
-      stacked ``(2,…)`` u/v or a plain ``(…,T)`` field).
+    - ``brain_rms(disp, prev) -> float`` is the in-brain rms of the change between two
+      iterates — the step size. The caller measures it rather than receiving a
+      difference, because ``disp`` is opaque here (a ``(u, v)`` pair, a stacked field,
+      a plain ``(…,T)`` one) and because differencing whole multi-GiB series to then
+      keep only the in-brain voxels is the wrong order of operations.
 
     A pass whose step grows markedly (>1.5× the previous, or > ``max_shift`` outright) is
     compounding an over-warped reference: roll it back and stop. ``-converge`` /
@@ -2848,7 +2939,7 @@ def _refine_loop(
     for i in range(refine_rounds):
         saved = (disp, corrected)  # roll back to here if this pass diverges
         disp, corrected = estimate(reduce_ref(corrected))
-        step = brain_rms(disp - prev)
+        step = brain_rms(disp, prev)
         if verbose:
             print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
         if step > max_shift or (prev_step is not None and step > 1.5 * prev_step):
@@ -3012,7 +3103,7 @@ def _run_3dacq_plain(
             disp,
             corrected,
             reduce_ref=lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device),
-            brain_rms=lambda delta: float(delta[brain].pow(2).mean().sqrt()),
+            brain_rms=lambda d, p: float((d[brain] - p[brain]).pow(2).mean().sqrt()),
             refine_rounds=refine_rounds,
             converge=converge,
             converge_rel=converge_rel,
@@ -3643,8 +3734,8 @@ def estimate_residual_flow_multiecho(
             w_new = _gate_me(_solve_w(new_refs, f"refine {_pass['n']}/{refine_rounds}"))
             return w_new, w_new
 
-        def _brain_rms_me(delta):
-            d = delta[brain] if brain is not None else delta
+        def _brain_rms_me(disp, prev):
+            d = (disp[brain] - prev[brain]) if brain is not None else (disp - prev)
             return float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
 
         w, _ = _refine_loop(

@@ -70,7 +70,13 @@ try:
 except ImportError:  # pragma: no cover - tqdm is a hard dep in practice
     _tqdm = None
 
-from .cost import _separable_smooth_3d
+from .cost import (
+    _lpa_from_moments,
+    _lpc_from_moments,
+    _separable_smooth_3d,
+    _smoothed_weighted_fixed_moments_3d,
+    _smoothed_weighted_moments_3d_from_fixed,
+)
 from .formwarp import (
     NO_X_DISP,
     NO_Y_DISP,
@@ -515,9 +521,7 @@ def _flow_hs(
     dy = torch.zeros_like(warped)
     dz = torch.zeros_like(warped)
     for _ in range(n_iter):
-        ax = _separable_smooth_3d(dx, 1.0, kernel_type="gauss")
-        ay = _separable_smooth_3d(dy, 1.0, kernel_type="gauss")
-        az = _separable_smooth_3d(dz, 1.0, kernel_type="gauss")
+        ax, ay, az = _smooth_field(dx, dy, dz, 1.0)
         resid = (gx * ax + gy * ay + gz * az + diff) / denom
         dx = ax - gx * resid
         dy = ay - gy * resid
@@ -592,6 +596,12 @@ def _optiflow_level(
     jac = jacobian_determinant(*fwd)
     n_damped = 0
 
+    fixed_moments = None
+    if cfg.metric in ("lpa", "lpc"):
+        fixed_moments = _smoothed_weighted_fixed_moments_3d(
+            fixed, weight, cfg.lpa_sigma, cfg.lpa_kernel
+        )
+
     bar = None
     if _tqdm is not None and cfg.verb >= 1 and n_iter >= 5:
         bar = _tqdm(total=n_iter, desc=f"optiflow {level_tag}", leave=True)
@@ -600,17 +610,33 @@ def _optiflow_level(
         for _ in range(n_iter):
             warped = warp_image_linear(moving, fwd[0], fwd[1], fwd[2], voxel_grid=voxel_grid)
 
-            cost_val = float(
-                image_metric(
+            if fixed_moments is not None:
+                moments = _smoothed_weighted_moments_3d_from_fixed(
                     warped,
                     fixed,
                     weight,
-                    metric=cfg.metric,
-                    cc_radius=cfg.cc_radius,
-                    lpa_sigma=cfg.lpa_sigma,
-                    lpa_kernel=cfg.lpa_kernel,
+                    cfg.lpa_sigma,
+                    cfg.lpa_kernel,
+                    fixed_moments,
                 )
-            )
+                correlation = (
+                    _lpa_from_moments(moments, weight)
+                    if cfg.metric == "lpa"
+                    else _lpc_from_moments(moments, weight)
+                )
+                cost_val = float(-correlation)
+            else:
+                cost_val = float(
+                    image_metric(
+                        warped,
+                        fixed,
+                        weight,
+                        metric=cfg.metric,
+                        cc_radius=cfg.cc_radius,
+                        lpa_sigma=cfg.lpa_sigma,
+                        lpa_kernel=cfg.lpa_kernel,
+                    )
+                )
             costs.append(cost_val)
             # The legality of `fwd` was established when it was built, at the end of
             # the previous iteration, so no determinant is recomputed here.

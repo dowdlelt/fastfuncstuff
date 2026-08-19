@@ -26,6 +26,7 @@ from pathlib import Path
 
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
 from fastfuncstuff.processing.io import load_image, load_warp_field
+from fastfuncstuff.processing.nwarpforge import _nifti_mm_to_voxels, compute_cardinal_affine
 from fastfuncstuff.processing.warpqc import (
     DEFAULT_MARGINAL_NEG_FRAC,
     DEFAULT_MAX_JAC,
@@ -57,7 +58,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                  and suspicious within subject.
   |disp|         how far voxels moved, in mm.
   bending        how wiggly the field is; compare between candidates, not
-                 against an absolute number.
+                 against an absolute number -- and only between candidates on
+                 the same grid, since it averages over the whole field and
+                 padding differs with each base's support box.
 """,
     )
     parser.add_argument(
@@ -72,8 +75,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Restrict statistics to this mask (nonzero = in). Strongly "
         "recommended: the field outside the brain is unconstrained, and letting "
-        "it into the percentiles buries real folding in noise. Automatically "
-        "centred if the warp sits on a padded grid (ffs_qwarp does this).",
+        "it into the percentiles buries real folding in noise. Aligned from the "
+        "mask and warp affines when the warp sits on a padded grid.",
+    )
+    parser.add_argument(
+        "-units",
+        "--units",
+        choices=["mm", "voxels"],
+        default="mm",
+        help="Displacement units on disk. Every ffs tool that saves a warp for "
+        "AFNI interop writes DICOM mm (the default); ffs_util_pcwarp writes raw "
+        "voxel displacements, which need -units voxels to be read correctly.",
     )
 
     gate = parser.add_argument_group("Pass/fail thresholds")
@@ -123,15 +135,30 @@ def main(argv: list[str] | None = None) -> int:
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     mask = None
+    mask_info = None
     if args.mask:
-        m, _ = load_image(args.mask, device=device)
+        m, mask_info = load_image(args.mask, device=device)
         mask = (m > 0).float()
 
     results, worst_ok = {}, True
     for path in args.warp:
         xd, yd, zd, header = load_warp_field(path, device=device)
-        voxdims = tuple(float(abs(header["affine"][i, i])) or 1.0 for i in range(3))
-        m = None if mask is None else pad_mask_to_field(mask, tuple(xd.shape))
+        cardinal = compute_cardinal_affine(header["affine"])
+        voxdims = tuple(float(abs(cardinal[i, i])) or 1.0 for i in range(3))
+        if args.units == "mm":
+            # save_warp_field writes AFNI DICOM-mm. Convert DICOM -> NIfTI/RAS mm,
+            # then into the padded field grid's voxel coordinates before derivatives.
+            xd, yd, zd = _nifti_mm_to_voxels(-xd, -yd, zd, cardinal)
+        m = (
+            None
+            if mask is None
+            else pad_mask_to_field(
+                mask,
+                tuple(xd.shape),
+                mask_affine=mask_info["affine"],
+                field_affine=header["affine"],
+            )
+        )
         qc = warp_regularity(xd, yd, zd, mask=m, voxdims=voxdims)
         grade, reasons = regularity_verdict(
             qc,

@@ -247,7 +247,7 @@ def save_warp_field(
     header_info: dict | None = None,
     affine: np.ndarray | None = None,
     units: str = "voxels",
-    padding: tuple[int, int, int] | None = None,
+    padding: tuple[int, int, int] | tuple[int, int, int, int, int, int] | None = None,
     use_pigz: bool = True,
 ) -> None:
     """Save displacement warp field as a 4D NIfTI.
@@ -268,8 +268,9 @@ def save_warp_field(
         header_info: Dict from load_image with 'affine' and 'header'.
         affine: 4x4 affine matrix.
         units: "voxels" (default) or "mm" (AFNI-compatible).
-        padding: (pad_x, pad_y, pad_z) if warp is on a padded grid.
-            The affine origin will be shifted to account for padding.
+        padding: Symmetric ``(x, y, z)`` or per-face
+            ``(x-, x+, y-, y+, z-, z+)`` padding. The affine origin is shifted
+            by the three lower-face amounts.
     """
     _require_nibabel()
 
@@ -283,7 +284,10 @@ def save_warp_field(
 
     # Shift affine origin to account for padding
     if padding is not None:
-        pad_x, pad_y, pad_z = padding
+        if len(padding) == 3:
+            pad_x, pad_y, pad_z = padding
+        else:
+            pad_x, _, pad_y, _, pad_z, _ = padding
         if pad_x > 0 or pad_y > 0 or pad_z > 0:
             # The padded grid starts pad voxels earlier in each direction
             # New origin = old_origin + affine[:3,:3] @ (-pad_x, -pad_y, -pad_z)
@@ -414,7 +418,7 @@ def save_warp_series(
     header_info: dict | None = None,
     affine: np.ndarray | None = None,
     units: str = "mm",
-    padding: tuple[int, int, int] | None = None,
+    padding: tuple[int, int, int] | tuple[int, int, int, int, int, int] | None = None,
     frame_prefix: str = "warp",
     frame_ext: str = ".nii.gz",
 ) -> str:
@@ -428,8 +432,9 @@ def save_warp_series(
             directory (created; frames written as ``{frame_prefix}_{t:05d}{ext}``).
         as_5d: True → single 5D ``(nx, ny, nz, T, 3)`` file; False → per-frame folder.
         units: "mm" (AFNI DICOM-mm on disk, default) or "voxels".
-        padding: (pad_x, pad_y, pad_z) if the warp is on a padded grid; the affine
-            origin is shifted once, up front, exactly like :func:`save_warp_field`.
+        padding: Symmetric ``(x, y, z)`` or per-face
+            ``(x-, x+, y-, y+, z-, z+)`` padding; the affine origin is shifted
+            once by the lower-face amounts, exactly like :func:`save_warp_field`.
 
     Returns:
         The path to hand ``ffs_nwarp -nwarp``: the 5D file, or a ``{prefix}_*{ext}``
@@ -442,7 +447,10 @@ def save_warp_series(
     else:
         affine = affine.copy()
     if padding is not None:
-        pad_x, pad_y, pad_z = padding
+        if len(padding) == 3:
+            pad_x, pad_y, pad_z = padding
+        else:
+            pad_x, _, pad_y, _, pad_z, _ = padding
         if pad_x > 0 or pad_y > 0 or pad_z > 0:
             affine[:3, 3] += affine[:3, :3] @ np.array([-pad_x, -pad_y, -pad_z], dtype=np.float64)
 

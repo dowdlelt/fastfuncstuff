@@ -165,6 +165,21 @@ class Referee:
             hist_cliplevel=True,
         )
         self.brain = automask(self.base, device=device)
+        self._qwarp_padding: tuple[int, int, int, int, int, int] | None = None
+
+    @property
+    def qwarp_padding(self) -> tuple[int, int, int, int, int, int]:
+        """The padding qwarp derives from this base, computed once per referee.
+
+        Every trial warps the same ``self.base``, so the support box -- and the
+        cliplevel histogram behind it -- is a property of the referee, not of the
+        trial.
+        """
+        if self._qwarp_padding is None:
+            from .warp import _compute_support_padding
+
+            self._qwarp_padding = _compute_support_padding(self.base)
+        return self._qwarp_padding
 
     def score(
         self, warped: torch.Tensor, field: tuple | None, panel: list[str] | None = None
@@ -189,7 +204,18 @@ class Referee:
         margin = clearance = UNCONSTRAINED_MARGIN
         if field is not None:
             xd, yd, zd = field
-            mask = pad_mask_to_field(self.brain, tuple(xd.shape))
+            lower_padding = None
+            if tuple(xd.shape) != tuple(self.brain.shape):
+                px0, px1, py0, py1, pz0, pz1 = self.qwarp_padding
+                expected = (
+                    self.brain.shape[0] + pz0 + pz1,
+                    self.brain.shape[1] + py0 + py1,
+                    self.brain.shape[2] + px0 + px1,
+                )
+                if tuple(xd.shape) != expected:
+                    raise ValueError(f"qwarp field shape {tuple(xd.shape)} != planned {expected}")
+                lower_padding = (px0, py0, pz0)
+            mask = pad_mask_to_field(self.brain, tuple(xd.shape), lower_padding_xyz=lower_padding)
             w = warp_regularity(xd, yd, zd, mask=mask, voxdims=self.voxdims)
             grade, reasons = regularity_verdict(w)
             cautions = regularity_cautions(w)

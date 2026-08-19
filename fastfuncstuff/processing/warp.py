@@ -34,6 +34,7 @@ from torch import Tensor
 
 from .._compile import safe_compile
 from ..memory import plan_nonlinear_memory
+from ..utils import _prefers_cuda_batching
 
 try:
     from tqdm import tqdm as _tqdm
@@ -77,7 +78,7 @@ from .optimizer import (
     optimize_warp_params_torch,
 )
 from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
-from .weight import compute_weight_image
+from .weight import _thd_cliplevel, compute_weight_image
 
 # Cache for torch.compile'd building-block functions (stable identity, compiled once)
 _compile_cache: dict[str, Callable[..., Any]] = {}
@@ -388,25 +389,94 @@ class PatchSpec:
     gk: int
 
 
-def _compute_padding(nx: int, ny: int, nz: int) -> tuple[int, int, int]:
-    """Compute AFNI-style internal padding per axis.
+Padding3D = tuple[int, int, int] | tuple[int, int, int, int, int, int]
 
-    Uses ~12.34% of each dimension + 1, with minimum of 3 voxels per side.
+
+def _padding_faces(padding: Padding3D) -> tuple[int, int, int, int, int, int]:
+    """Return `(x-, x+, y-, y+, z-, z+)`, accepting legacy symmetric padding."""
+    if len(padding) == 3:
+        px, py, pz = padding
+        return px, px, py, py, pz, pz
+    return padding
+
+
+def _compute_support_padding(
+    base: Tensor,
+    minimum_xyz: tuple[int, int, int] = (9, 9, 9),
+    initial_warp: tuple[Tensor, Tensor, Tensor] | None = None,
+) -> tuple[int, int, int, int, int, int]:
+    """AFNI qwarp padding from thresholded base support, per volume face.
+
+    Matches the zero-padding rule in AFNI `3dQwarp.c`: threshold at
+    `0.33 * THD_cliplevel(base, 0.22)`, find the support box, then add only the
+    shortfall needed to leave `rintf(0.1234 * dimension) + 1` blank slices, with
+    at least three newly padded slices on every face. An initial warp enlarges the
+    minimum from displacement inside the fixed-image support only; unconstrained
+    values in air cannot inflate the work grid.
     """
-    import math
+    if base.ndim != 3:
+        raise ValueError(f"base must be 3-D, got shape {tuple(base.shape)}")
+    nz, ny, nx = base.shape
+    clip = 0.33 * _thd_cliplevel(base, 0.22)
+    support = (base >= clip) & (base != 0)
+    if not bool(support.any()):
+        i0 = j0 = k0 = 0
+        i1, j1, k1 = nx - 1, ny - 1, nz - 1
+    else:
+        kz = torch.where(support.any(dim=(1, 2)))[0]
+        jy = torch.where(support.any(dim=(0, 2)))[0]
+        ix = torch.where(support.any(dim=(0, 1)))[0]
+        k0, k1 = int(kz[0]), int(kz[-1])
+        j0, j1 = int(jy[0]), int(jy[-1])
+        i0, i1 = int(ix[0]), int(ix[-1])
 
-    pad_x = max(3, int(math.ceil(0.1234 * nx)) + 1)
-    pad_y = max(3, int(math.ceil(0.1234 * ny)) + 1)
-    pad_z = max(3, int(math.ceil(0.1234 * nz)) + 1)
-    return pad_x, pad_y, pad_z
+    if initial_warp is not None:
+        if any(tuple(component.shape) != tuple(base.shape) for component in initial_warp):
+            raise ValueError("initial warp components must match the unpadded base shape")
+        active = (slice(k0, k1 + 1), slice(j0, j1 + 1), slice(i0, i1 + 1))
+        minimum_xyz = tuple(
+            max(floor, int(torch.ceil(component[active].detach().abs().max()).item()) + 3)
+            for floor, component in zip(minimum_xyz, initial_warp, strict=True)
+        )
+    tx = max(int(round(0.1234 * nx)) + 1, minimum_xyz[0])
+    ty = max(int(round(0.1234 * ny)) + 1, minimum_xyz[1])
+    tz = max(int(round(0.1234 * nz)) + 1, minimum_xyz[2])
+    return (
+        max(3, tx - i0),
+        max(3, tx - (nx - 1 - i1)),
+        max(3, ty - j0),
+        max(3, ty - (ny - 1 - j1)),
+        max(3, tz - k0),
+        max(3, tz - (nz - 1 - k1)),
+    )
 
 
-def _pad_volume(vol: Tensor, pad_x: int, pad_y: int, pad_z: int) -> Tensor:
+def _pad_volume(
+    vol: Tensor,
+    pad_x: int | tuple[int, int],
+    pad_y: int | tuple[int, int],
+    pad_z: int | tuple[int, int],
+) -> Tensor:
     """Zero-pad a 3D volume symmetrically."""
     # F.pad order: (x_left, x_right, y_left, y_right, z_left, z_right)
     import torch.nn.functional as F
 
-    return F.pad(vol, (pad_x, pad_x, pad_y, pad_y, pad_z, pad_z), mode="constant", value=0)
+    px0, px1 = (pad_x, pad_x) if isinstance(pad_x, int) else pad_x
+    py0, py1 = (pad_y, pad_y) if isinstance(pad_y, int) else pad_y
+    pz0, pz1 = (pad_z, pad_z) if isinstance(pad_z, int) else pad_z
+    return F.pad(vol, (px0, px1, py0, py1, pz0, pz1), mode="constant", value=0)
+
+
+def _pad_volume_faces(vol: Tensor, padding: Padding3D) -> Tensor:
+    px0, px1, py0, py1, pz0, pz1 = _padding_faces(padding)
+    return _pad_volume(vol, (px0, px1), (py0, py1), (pz0, pz1))
+
+
+def _crop_padding(vol: Tensor, padding: Padding3D, shape: tuple[int, int, int]) -> Tensor:
+    """Crop a padded tensor back to `(nz, ny, nx)` using its lower-face offset."""
+    px0, _, py0, _, pz0, _ = _padding_faces(padding)
+    nz, ny, nx = shape
+    return vol[..., pz0 : pz0 + nz, py0 : py0 + ny, px0 : px0 + nx]
 
 
 def qwarp(
@@ -419,6 +489,7 @@ def qwarp(
     device: torch.device | None = None,
     pad: bool = True,
     level_log: list[dict] | None = None,
+    padding: Padding3D | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute nonlinear warp from source to base image.
 
@@ -441,6 +512,8 @@ def qwarp(
         config: QwarpConfig settings. Uses defaults if None.
         device: Torch device. Inferred from base if None.
         pad: Apply AFNI-style internal zero-padding (default True).
+        padding: Optional precomputed padding shared with planning and output I/O.
+            When supplied, qwarp uses it verbatim instead of deriving it again.
 
     Returns:
         (warped_image, warp_xd, warp_yd, warp_zd):
@@ -460,19 +533,25 @@ def qwarp(
     base = base.float().to(device)
     source = source.float().to(device)
     nz_orig, ny_orig, nx_orig = base.shape
+    if initial_warp is not None and any(
+        tuple(component.shape) != tuple(base.shape) for component in initial_warp
+    ):
+        raise ValueError("initial warp components must match the unpadded base shape")
 
-    # Internal padding
-    if pad:
-        pad_x, pad_y, pad_z = _compute_padding(nx_orig, ny_orig, nz_orig)
-    else:
-        pad_x, pad_y, pad_z = 0, 0, 0
+    if padding is None:
+        padding = _compute_support_padding(base, initial_warp=initial_warp) if pad else (0, 0, 0)
+    elif not pad and any(padding):
+        raise ValueError("explicit nonzero padding conflicts with pad=False")
+    padding = _padding_faces(padding)
+    do_pad = any(padding)
 
-    if pad_x > 0 or pad_y > 0 or pad_z > 0:
-        base_p = _pad_volume(base, pad_x, pad_y, pad_z)
-        source_p = _pad_volume(source, pad_x, pad_y, pad_z)
+    if do_pad:
+        base_p = _pad_volume_faces(base, padding)
+        source_p = _pad_volume_faces(source, padding)
         if config.verb >= 1:
+            px0, px1, py0, py1, pz0, pz1 = padding
             print(
-                f"qwarp_torch: padding +{pad_x},{pad_y},{pad_z} => "
+                f"qwarp_torch: padding x={px0}/{px1}, y={py0}/{py1}, z={pz0}/{pz1} => "
                 f"{base_p.shape[2]}x{base_p.shape[1]}x{base_p.shape[0]}"
             )
     else:
@@ -491,8 +570,8 @@ def qwarp(
         weight_p = compute_weight_image(base_p)
     else:
         weight_p = (
-            _pad_volume(weight.float().to(device), pad_x, pad_y, pad_z)
-            if (pad_x > 0 or pad_y > 0 or pad_z > 0)
+            _pad_volume_faces(weight.float().to(device), padding)
+            if do_pad
             else weight.float().to(device)
         )
 
@@ -500,8 +579,8 @@ def qwarp(
         mask_p = (weight_p > 0).byte()
     else:
         mask_p = (
-            _pad_volume(mask.byte().to(device).float(), pad_x, pad_y, pad_z).byte()
-            if (pad_x > 0 or pad_y > 0 or pad_z > 0)
+            _pad_volume_faces(mask.byte().to(device).float(), padding).byte()
+            if do_pad
             else mask.byte().to(device)
         )
 
@@ -509,10 +588,10 @@ def qwarp(
 
     if initial_warp is not None:
         # Pad the initial warp if needed
-        if pad_x > 0 or pad_y > 0 or pad_z > 0:
-            state.xd = _pad_volume(initial_warp[0].float().to(device), pad_x, pad_y, pad_z)
-            state.yd = _pad_volume(initial_warp[1].float().to(device), pad_x, pad_y, pad_z)
-            state.zd = _pad_volume(initial_warp[2].float().to(device), pad_x, pad_y, pad_z)
+        if do_pad:
+            state.xd = _pad_volume_faces(initial_warp[0].float().to(device), padding)
+            state.yd = _pad_volume_faces(initial_warp[1].float().to(device), padding)
+            state.zd = _pad_volume_faces(initial_warp[2].float().to(device), padding)
         else:
             state.xd = initial_warp[0].float().to(device)
             state.yd = initial_warp[1].float().to(device)
@@ -535,7 +614,7 @@ def qwarp(
     # Single pass through the total warp; final_interp (wsinc5 by default, like
     # 3dQwarp) is where output sharpness comes from.
     warped_full = warp_image(source_p, state.xd, state.yd, state.zd, mode=config.final_interp)
-    warped = warped_full[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+    warped = _crop_padding(warped_full, padding, (nz_orig, ny_orig, nx_orig))
 
     # Return full padded warp field (caller/io.py handles grid info)
     return warped, state.xd, state.yd, state.zd
@@ -1507,6 +1586,23 @@ def _warpomatic(
 # ---------------------------------------------------------------------------
 
 
+def _gn_steepest_descent_images_broadcast(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
+    """Broadcast direction-major GN Jacobian columns on any tensor device."""
+    d, b, v = g.shape
+    nb = bt.shape[1]
+    scaled = (hw * g).permute(1, 2, 0).unsqueeze(-1) * bt[None, :, None, :]
+    return scaled.reshape(b, v, d * nb)
+
+
+def _gn_steepest_descent_images(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
+    """Assemble direction-major GN Jacobian columns using the measured device path."""
+    if _prefers_cuda_batching(g.device):
+        return _gn_steepest_descent_images_broadcast(g, hw, bt)
+    return torch.cat(
+        [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(g.shape[0])], dim=-1
+    )
+
+
 def _gn_normal_eqs_3d(
     w: Tensor,
     g: Tensor,
@@ -1547,7 +1643,7 @@ def _gn_normal_eqs_3d(
     res = base_hat - (w - mw) / sw  # (B, V)
 
     # Steepest-descent images, one block of nb columns per active direction.
-    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    dw = _gn_steepest_descent_images(g, hw, bt)
     mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
     jn = (dw - mdw) / sw.unsqueeze(-1)
     jnw = jn * omega.unsqueeze(-1)
@@ -1608,7 +1704,7 @@ def _gn_normal_eqs_local(
     sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
 
     res = base_hat - (w - mw) / sd
-    dw = torch.cat([(hw[d] * g[d]).unsqueeze(-1) * bt for d in range(g.shape[0])], dim=-1)
+    dw = _gn_steepest_descent_images(g, hw, bt)
     jn = dw / sd.unsqueeze(-1)
     jnw = jn * omega.unsqueeze(-1)
     hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
@@ -2813,15 +2909,11 @@ def qwarp_batch(
     N = sources.shape[0]
     nz_orig, ny_orig, nx_orig = base.shape
 
-    if pad:
-        pad_x, pad_y, pad_z = _compute_padding(nx_orig, ny_orig, nz_orig)
-    else:
-        pad_x, pad_y, pad_z = 0, 0, 0
-
-    do_pad = pad_x > 0 or pad_y > 0 or pad_z > 0
+    padding = _compute_support_padding(base) if pad else (0, 0, 0, 0, 0, 0)
+    do_pad = any(padding)
     if do_pad:
-        base_p = _pad_volume(base, pad_x, pad_y, pad_z)
-        sources_p = torch.stack([_pad_volume(sources[v], pad_x, pad_y, pad_z) for v in range(N)])
+        base_p = _pad_volume_faces(base, padding)
+        sources_p = torch.stack([_pad_volume_faces(sources[v], padding) for v in range(N)])
     else:
         base_p = base
         sources_p = sources
@@ -2837,12 +2929,12 @@ def qwarp_batch(
         weight_p = compute_weight_image(base_p)
     else:
         w = weight.float().to(device)
-        weight_p = _pad_volume(w, pad_x, pad_y, pad_z) if do_pad else w
+        weight_p = _pad_volume_faces(w, padding) if do_pad else w
     if mask is None:
         mask_p = (weight_p > 0).byte()
     else:
         m = mask.byte().to(device)
-        mask_p = _pad_volume(m.float(), pad_x, pad_y, pad_z).byte() if do_pad else m
+        mask_p = _pad_volume_faces(m.float(), padding).byte() if do_pad else m
 
     mstate = MultiWarpState(
         xd_all=torch.zeros(N, nz, ny, nx, device=device),
@@ -2866,7 +2958,7 @@ def qwarp_batch(
             mstate.zd_all[v],
             mode=config.final_interp,
         )
-        warped[v] = wf[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+        warped[v] = _crop_padding(wf, padding, (nz_orig, ny_orig, nx_orig))
 
     return warped, mstate.xd_all, mstate.yd_all, mstate.zd_all
 
@@ -3003,7 +3095,7 @@ class _MELevelPlan:
 
 @dataclass
 class _MEScaledPlan:
-    pad: tuple[int, int, int]  # pad_x, pad_y, pad_z
+    pad: tuple[int, int, int, int, int, int]  # x-, x+, y-, y+, z-, z+
     do_pad: bool
     orig: tuple[int, int, int]  # nz_orig, ny_orig, nx_orig
     padded: tuple[int, int, int]  # nz, ny, nx
@@ -3052,11 +3144,12 @@ def _build_mescaled_plan(
     E = base_echoes.shape[0]
     nz_orig, ny_orig, nx_orig = base_echoes.shape[1:]
 
-    pad_x, pad_y, pad_z = _compute_padding(nx_orig, ny_orig, nz_orig) if pad else (0, 0, 0)
-    do_pad = pad_x > 0 or pad_y > 0 or pad_z > 0
+    base_mean = base_echoes.mean(0)
+    padding = _compute_support_padding(base_mean) if pad else (0, 0, 0, 0, 0, 0)
+    do_pad = any(padding)
 
     base_p = (
-        torch.stack([_pad_volume(base_echoes[e], pad_x, pad_y, pad_z) for e in range(E)])
+        torch.stack([_pad_volume_faces(base_echoes[e], padding) for e in range(E)])
         if do_pad
         else base_echoes
     )
@@ -3066,12 +3159,12 @@ def _build_mescaled_plan(
         weight_p = compute_weight_image(base_p.mean(0))
     else:
         w = weight.float().to(device)
-        weight_p = _pad_volume(w, pad_x, pad_y, pad_z) if do_pad else w
+        weight_p = _pad_volume_faces(w, padding) if do_pad else w
     if mask is None:
         mask_p = (weight_p > 0).byte()
     else:
         m = mask.byte().to(device)
-        mask_p = _pad_volume(m.float(), pad_x, pad_y, pad_z).byte() if do_pad else m
+        mask_p = _pad_volume_faces(m.float(), padding).byte() if do_pad else m
 
     do_xyz = (pe_grid_axis == 0, pe_grid_axis == 1, pe_grid_axis == 2)
     use_ncc = config.cost_method == "ncc"
@@ -3229,7 +3322,7 @@ def _build_mescaled_plan(
         )
 
     return _MEScaledPlan(
-        pad=(pad_x, pad_y, pad_z),
+        pad=padding,
         do_pad=do_pad,
         orig=(nz_orig, ny_orig, nx_orig),
         padded=(nz, ny, nx),
@@ -3469,14 +3562,14 @@ def _solve_mescaled_frame(
     device: torch.device,
 ) -> tuple[Tensor, Tensor]:
     """Solve one frame's ME-scaled PE-only polish against a prebuilt ``plan``."""
-    pad_x, pad_y, pad_z = plan.pad
+    padding = plan.pad
     nz, ny, nx = plan.padded
     nz_orig, ny_orig, nx_orig = plan.orig
     E = source_echoes.shape[0]
 
     source_echoes = source_echoes.float().to(device)
     source_p = (
-        torch.stack([_pad_volume(source_echoes[e], pad_x, pad_y, pad_z) for e in range(E)])
+        torch.stack([_pad_volume_faces(source_echoes[e], padding) for e in range(E)])
         if plan.do_pad
         else source_echoes
     )
@@ -3487,7 +3580,7 @@ def _solve_mescaled_frame(
     state.zd = torch.zeros(nz, ny, nx, device=device)
     if seed_field is not None:
         seed = seed_field.float().to(device)
-        seed_p = _pad_volume(seed, pad_x, pad_y, pad_z) if plan.do_pad else seed
+        seed_p = _pad_volume_faces(seed, padding) if plan.do_pad else seed
         (state.xd, state.yd, state.zd)[plan.pe_grid_axis][...] = seed_p
 
     for level in plan.levels:
@@ -3517,10 +3610,10 @@ def _solve_mescaled_frame(
         wf = warp_image(
             source_p[e], ae * state.xd, ae * state.yd, ae * state.zd, mode=config.final_interp
         )
-        warped[e] = wf[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+        warped[e] = _crop_padding(wf, padding, (nz_orig, ny_orig, nx_orig))
 
     field_pad = (state.xd, state.yd, state.zd)[plan.pe_grid_axis]
-    field = field_pad[pad_z : pad_z + nz_orig, pad_y : pad_y + ny_orig, pad_x : pad_x + nx_orig]
+    field = _crop_padding(field_pad, padding, (nz_orig, ny_orig, nx_orig))
     return warped, field.contiguous()
 
 

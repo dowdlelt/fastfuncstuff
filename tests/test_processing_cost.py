@@ -11,6 +11,9 @@ from fastfuncstuff.processing.cost import (
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
+    _smoothed_weighted_fixed_moments_3d,
+    _smoothed_weighted_moments_3d,
+    _smoothed_weighted_moments_3d_from_fixed,
     auto_box_radius,
     batched_lpa_cost,
     clipped_pearson_correlation,
@@ -184,6 +187,74 @@ class TestSeparableSmooth3D:
         vol = torch.randn(1, 1, 8, 10, 12, device=DEV)
         smoothed = _separable_smooth_3d(vol, 2.0)
         assert smoothed.shape == vol.shape
+
+    def test_multichannel_matches_individual_smoothing(self):
+        torch.manual_seed(12)
+        vol = torch.randn(2, 3, 8, 10, 12, device=DEV)
+        packed = _separable_smooth_3d(vol, 1.5)
+        individual = torch.stack(
+            [
+                torch.stack([_separable_smooth_3d(vol[n, c], 1.5) for c in range(3)])
+                for n in range(2)
+            ]
+        )
+        torch.testing.assert_close(packed, individual, atol=1e-5, rtol=1e-5)
+
+    def test_multichannel_gradient_matches_individual_smoothing(self):
+        torch.manual_seed(13)
+        packed_input = torch.randn(1, 3, 7, 9, 11, device=DEV, requires_grad=True)
+        reference_input = packed_input.detach().clone().requires_grad_(True)
+
+        _separable_smooth_3d(packed_input, 1.25).square().sum().backward()
+        sum(
+            _separable_smooth_3d(reference_input[0, c], 1.25).square().sum() for c in range(3)
+        ).backward()
+
+        torch.testing.assert_close(packed_input.grad, reference_input.grad, atol=1e-5, rtol=1e-5)
+
+    def test_packed_weighted_moments_match_individual_filters_and_gradients(self):
+        torch.manual_seed(14)
+        x = torch.randn(7, 9, 11, device=DEV)
+        packed_y = torch.randn(7, 9, 11, device=DEV, requires_grad=True)
+        reference_y = packed_y.detach().clone().requires_grad_(True)
+        weight = torch.rand(7, 9, 11, device=DEV)
+
+        packed = _smoothed_weighted_moments_3d(x, packed_y, weight, 1.5, "gauss")
+        reference_inputs = (
+            weight,
+            weight * x,
+            weight * reference_y,
+            weight * x * x,
+            weight * reference_y * reference_y,
+            weight * x * reference_y,
+        )
+        reference = tuple(_separable_smooth_3d(v, 1.5) for v in reference_inputs)
+
+        for actual, expected in zip(packed, reference, strict=True):
+            torch.testing.assert_close(actual, expected, atol=1e-5, rtol=1e-5)
+        sum(v.square().sum() for v in packed).backward()
+        sum(v.square().sum() for v in reference).backward()
+        torch.testing.assert_close(packed_y.grad, reference_y.grad, atol=1e-5, rtol=1e-5)
+
+    def test_fixed_moment_cache_matches_six_channel_bank(self):
+        torch.manual_seed(15)
+        moving = torch.randn(7, 9, 11, device=DEV)
+        fixed = torch.randn(7, 9, 11, device=DEV)
+        weight = torch.rand(7, 9, 11, device=DEV)
+
+        reference = _smoothed_weighted_moments_3d(moving, fixed, weight, 1.5, "gauss")
+        fixed_moments = _smoothed_weighted_fixed_moments_3d(fixed, weight, 1.5, "gauss")
+        cached = _smoothed_weighted_moments_3d_from_fixed(
+            moving,
+            fixed,
+            weight,
+            1.5,
+            "gauss",
+            fixed_moments,
+        )
+
+        for actual, expected in zip(cached, reference, strict=True):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
     def test_box_kernel(self):
         vol = torch.randn(8, 10, 12, device=DEV)

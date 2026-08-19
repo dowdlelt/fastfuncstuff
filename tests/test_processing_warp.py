@@ -16,16 +16,32 @@ from fastfuncstuff.processing.warp import (
     _autobox,
     _checkerboard_phases,
     _compute_hfactor,
-    _compute_padding,
+    _compute_support_padding,
+    _crop_padding,
     _dedup_last_wins,
     _filter_patches,
     _generate_patch_grid,
     _get_basis_config,
+    _gn_steepest_descent_images_broadcast,
     _maybe_compile,
     _pad_volume,
+    _pad_volume_faces,
 )
 
 DEVICE = torch.device("cpu")
+
+
+@pytest.mark.parametrize("n_dims", [1, 2, 3])
+def test_gn_steepest_descent_images_matches_direction_major_cat(n_dims):
+    torch.manual_seed(41)
+    g = torch.randn(n_dims, 4, 35, device=DEVICE)
+    hw = torch.rand(n_dims, 1, 1, device=DEVICE)
+    bt = torch.randn(35, 4, device=DEVICE)
+    expected = torch.cat(
+        [(hw[axis] * g[axis]).unsqueeze(-1) * bt for axis in range(n_dims)], dim=-1
+    )
+    actual = _gn_steepest_descent_images_broadcast(g, hw, bt)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
 # ---------------------------------------------------------------------------
@@ -114,38 +130,50 @@ class TestPatchSpec:
         assert p.gk == 1
 
 
-# ---------------------------------------------------------------------------
-# _compute_padding
-# ---------------------------------------------------------------------------
+class TestComputeSupportPadding:
+    def test_reuses_existing_blank_margin(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
 
+        assert _compute_support_padding(base) == (3, 3, 3, 3, 3, 3)
 
-class TestComputePadding:
-    def test_small_volume(self):
-        """Small volumes should get minimum padding of 3."""
-        px, py, pz = _compute_padding(10, 10, 10)
-        assert px >= 3
-        assert py >= 3
-        assert pz >= 3
+    def test_adds_only_edge_margin_shortfall(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, :32] = 100.0
 
-    def test_formula(self):
-        """Check the AFNI formula: ceil(0.1234 * dim) + 1, min 3."""
-        nx, ny, nz = 64, 64, 32
-        px, py, pz = _compute_padding(nx, ny, nz)
-        assert px == max(3, math.ceil(0.1234 * nx) + 1)
-        assert py == max(3, math.ceil(0.1234 * ny) + 1)
-        assert pz == max(3, math.ceil(0.1234 * nz) + 1)
+        # round(0.1234 * 64) + 1 == 9. Tissue touches x-, while all other
+        # faces already have at least the requested blank margin.
+        assert _compute_support_padding(base) == (9, 3, 3, 3, 3, 3)
 
-    def test_asymmetric(self):
-        """Different dimensions should give different padding."""
-        px, py, pz = _compute_padding(100, 50, 20)
-        assert px > py > pz
+    def test_asymmetric_pad_crop_roundtrip(self):
+        vol = torch.randn(8, 10, 12)
+        padding = (1, 2, 3, 4, 5, 6)
 
-    def test_very_small(self):
-        """Tiny dimensions should still get padding of 3."""
-        px, py, pz = _compute_padding(1, 1, 1)
-        assert px == 3
-        assert py == 3
-        assert pz == 3
+        padded = _pad_volume_faces(vol, padding)
+        recovered = _crop_padding(padded, padding, tuple(vol.shape))
+
+        assert padded.shape == (19, 17, 15)
+        torch.testing.assert_close(recovered, vol, atol=0, rtol=0)
+
+    # ---------------------------------------------------------------------------
+
+    def test_initial_warp_minimum_can_enlarge_margin(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+
+        assert _compute_support_padding(base, minimum_xyz=(20, 15, 10)) == (4, 4, 3, 3, 3, 3)
+
+    def test_initial_warp_ignores_air_outlier(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+        xd = torch.zeros_like(base)
+        xd[20, 20, 20] = 20.0
+        xd[0, 0, 0] = 100.0
+        zero = torch.zeros_like(base)
+
+        padding = _compute_support_padding(base, initial_warp=(xd, zero, zero))
+
+        assert padding == (7, 7, 3, 3, 3, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -782,6 +810,23 @@ class TestPatchWriteBackDedup:
             verb=0,
         )
         warp_mod.qwarp(base, base.clone(), config=cfg, device=torch.device("cpu"), pad=False)
+
+    def test_qwarp_rejects_mismatched_initial_warp_with_explicit_padding(self):
+        """A caller-provided plan must not bypass initial-warp geometry checks."""
+        from fastfuncstuff.processing.warp import qwarp
+
+        base = torch.rand(12, 12, 12) + 0.1
+        wrong = torch.zeros(10, 12, 12)
+        zero = torch.zeros_like(wrong)
+
+        with pytest.raises(ValueError, match="initial warp components"):
+            qwarp(
+                base,
+                base.clone(),
+                initial_warp=(wrong, zero, zero),
+                padding=(3, 3, 3, 3, 3, 3),
+                device=torch.device("cpu"),
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -384,15 +384,15 @@ def test_slicewise_single_echo_untouched_by_te_scaling():
     base = _smooth_volume(nz, ny, nx, seed=10)
     w_true = _slice_discontinuous_pe_field(nz, ny, nx, amp=1.0)
     z0 = torch.zeros_like(w_true)
-    src = torch.stack(
-        [warp_image(base, z0, -(0.9 + 0.1 * t) * w_true, z0, "linear") for t in range(T)], dim=-1
-    )
     seed_series = torch.zeros(nz, ny, nx, T)
 
-    def _run(n_echo: int, alpha):
+    def _run(vol, n_echo: int, alpha):
+        src = torch.stack(
+            [warp_image(vol, z0, -(0.9 + 0.1 * t) * w_true, z0, "linear") for t in range(T)], dim=-1
+        )
         cfg = QwarpConfig(minpatch=7, cost_method="ncc", verb=0, optimizer="gn")
         _, field = qwarp_pe_scaled_polish_series(
-            base[None].expand(n_echo, -1, -1, -1),
+            vol[None].expand(n_echo, -1, -1, -1),
             src[None].expand(n_echo, -1, -1, -1, -1),
             seed_series,
             pe_grid_axis=1,
@@ -404,15 +404,27 @@ def test_slicewise_single_echo_untouched_by_te_scaling():
         )
         return field
 
-    f_none = _run(1, None)
-    f_one = _run(1, torch.tensor([1.0]))
+    f_none = _run(base, 1, None)
+    f_one = _run(base, 1, torch.tensor([1.0]))
     assert torch.equal(f_none, f_one), "alpha=[1] must be identical to no alpha at E=1"
 
+    def _q99(x):
+        return float(torch.quantile(x.reshape(-1), 0.99))
+
     # Duplicating the echo doubles hmat, grad and the LM damping alike, so the step is
-    # algebraically identical -- in float32 only a handful of patches sitting on the
-    # accept/reject tie can flip, so judge the bulk of the field, not the max.
-    f_dup = _run(2, torch.tensor([1.0, 1.0]))
-    # (a flip moves one whole patch, so tolerate a patch's worth of outliers)
+    # algebraically identical -- but only up to float32. On a volume this small, most
+    # of the padded grid is air (AFNI's 9-voxel margin floor dominates the
+    # ceil(0.1234*n)+1 rule here), so a good fraction of patches sit on the
+    # accept/reject tie and the accepted field is chaotically sensitive to *any*
+    # perturbation. Calibrate against that instead of guessing an absolute bound:
+    # rescaling the data by 1+1e-6 cannot change the true displacement, so whatever it
+    # moves is this problem's own noise floor. A real E-dependence would push past it
+    # and would grow with the echo count; a tie-flip stays inside it.
+    floor = (_run(base * (1 + 1e-6), 1, None) - f_none).abs()
+    f_dup = _run(base, 2, torch.tensor([1.0, 1.0]))
     d = (f_dup - f_none).abs()
     assert float(d.median()) < 1e-5, "a duplicated echo changed the E=1 solution"
-    assert float((d > 1e-4).float().mean()) < 0.01, "too much of the field moved"
+    assert _q99(d) <= max(3.0 * _q99(floor), 1e-4), (
+        f"echo duplication moved the field past its own noise floor: "
+        f"q99 {_q99(d):.3e} vs floor {_q99(floor):.3e}"
+    )

@@ -1089,3 +1089,8 @@ def parabolic_peak_offset(
     can5 = (peak_idx >= 2) & (peak_idx <= n - 3)
     can3 = (peak_idx >= 1) & (peak_idx <= n - 2)
     return torch.where(can5, vtx5, torch.where(can3, vtx3, torch.zeros_like(vtx5)))
+
+
+def _prefers_cuda_batching(device: torch.device) -> bool:
+    """Whether measured CUDA-only batching specializations should be selected."""
+    return device.type == "cuda"
