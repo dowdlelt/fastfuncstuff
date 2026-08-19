@@ -389,3 +389,31 @@ def test_emitted_batch_stage_is_valid_bash(tmp_path):
         # bash -n parses without executing: catches quoting/printf mistakes in the
         # batch-manifest construction.
         subprocess.run(["bash", "-n", str(script)], check=True)
+
+
+# --------------------------------------------------------------------------
+# ffs_util_automask._expected_outputs
+# --------------------------------------------------------------------------
+
+
+def test_automask_expected_outputs_is_the_prefix():
+    from fastfuncstuff.cli.automask import _expected_outputs, parse_args
+
+    a = parse_args(["-input", "mean.nii", "-prefix", "mask.nii.gz"])
+    assert _expected_outputs(a) == ["mask.nii.gz"]
+
+
+def test_automask_batch_makes_io_flags_optional():
+    """-batch alone must parse: the per-run args live in the manifest."""
+    from fastfuncstuff.cli.automask import parse_args
+
+    a = parse_args(["-batch", "runs.txt", "-device", "cpu"])
+    assert a.batch == "runs.txt" and a.input is None and a.prefix is None
+
+
+def test_automask_batch_run_rejects_a_run_missing_its_output():
+    from fastfuncstuff.cli.automask import _validate_batch_run, parse_args
+
+    _validate_batch_run(parse_args(["-input", "m.nii", "-prefix", "o.nii"]))
+    with pytest.raises(ValueError, match="-prefix"):
+        _validate_batch_run(parse_args(["-input", "m.nii"]))

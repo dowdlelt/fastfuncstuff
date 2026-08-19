@@ -15,14 +15,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 
-# The inductor policy has to be in force before any compiled kernel first runs.
-# It used to be applied from fastfuncstuff/__init__.py, which is now lazy — this
-# module is the next-best chokepoint: everything that touches torch in this tree
-# goes through it for device/dtype handling.
-from fastfuncstuff._compile import configure_inductor
-
-configure_inductor()
-
 if TYPE_CHECKING:
     pass
 

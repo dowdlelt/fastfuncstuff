@@ -9,10 +9,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shlex
+import sys
 import time
 from pathlib import Path
 
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+import torch
+
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_verbose_arg,
+    collect_batch_jobs,
+    run_batch_jobs,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.utils import REGISTRATION_TF32
@@ -23,8 +34,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="ffs_util_automask",
         description="Create a binary brain mask from a 3D volume (GPU, AFNI-compatible)",
     )
-    parser.add_argument("-input", required=True, help="Input volume (.nii/.nii.gz)")
-    parser.add_argument("-prefix", required=True, help="Output mask file")
+    parser.add_argument(
+        "-input", default=None, help="Input volume (.nii/.nii.gz) [required unless -batch]"
+    )
+    parser.add_argument("-prefix", default=None, help="Output mask file [required unless -batch]")
     parser.add_argument(
         "-clfrac",
         type=float,
@@ -46,19 +59,70 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # Keep -clip_frac as hidden alias for backwards compat
     parser.add_argument("-clip_frac", type=float, default=None, help=argparse.SUPPRESS)
     parser.add_argument("-device", default=None, help="PyTorch device (cuda, mps, cpu)")
+    add_batch_args(
+        parser,
+        tool="ffs_util_automask",
+        what="brain masks",
+        example="-input mean.nii -prefix mask.nii",
+        skip_note="-prefix",
+    )
     add_verbose_arg(parser, default=1)
 
     return parser.parse_args(argv)
 
 
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip."""
+    return [args.prefix] if args.prefix else []
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -input/-prefix."""
+    missing = [f for f in ("input", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
 
+    if args.batch is not None or args.batch_run:
+        # One process, many masks: masking a single mean image is far quicker than
+        # the interpreter/torch/CUDA startup around it, so a shell loop over N runs
+        # is almost entirely fixed cost. Here it is paid once.
+        run_batch_jobs(
+            tool="ffs_util_automask",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=setup_device(args.device, tf32=REGISTRATION_TF32),
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_dispatch_run,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return
+
+    missing = [f for f in ("input", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "Error: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    _dispatch_run(args, setup_device(args.device, tf32=REGISTRATION_TF32))
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
+    """Mask one self-contained input volume (the entire per-volume body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     # Handle backwards-compat alias
     clip_frac = args.clip_frac if args.clip_frac is not None else args.clfrac
-
-    # Device selection
-    device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     verb = args.verb
     if verb >= 1:

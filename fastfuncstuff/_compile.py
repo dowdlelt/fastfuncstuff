@@ -43,8 +43,9 @@ _warned_fallback = False
 def configure_inductor() -> None:
     """Apply the inductor policy once. Safe to call repeatedly and before any compile.
 
-    The inductor config is read at *compile* time (first call of a compiled fn), so
-    setting it at import — before any kernel is invoked — is sufficient and global.
+    Call this before a compiled function is first *invoked*, not at import — the
+    inductor config is read at compile time, and importing it is expensive.
+    :func:`safe_compile` already does so; callers rarely need this directly.
     """
     global _configured
     if _configured:
@@ -66,10 +67,6 @@ def configure_inductor() -> None:
         pass
 
 
-# Apply at import so it is in effect before any compiled kernel is first called.
-configure_inductor()
-
-
 def safe_compile(fn: Callable | None = None, **compile_kwargs: Any) -> Callable:
     """``torch.compile`` with the shared inductor policy and a permanent eager fallback.
 
@@ -81,19 +78,26 @@ def safe_compile(fn: Callable | None = None, **compile_kwargs: Any) -> Callable:
     if fn is None:
         return functools.partial(safe_compile, **compile_kwargs)
 
-    configure_inductor()
-    try:
-        compiled = torch.compile(fn, **compile_kwargs)
-    except Exception:
-        return fn  # compile unavailable entirely → just run eager
-
-    state = {"disabled": False}
+    # Everything inductor-related is deferred to the first *call*. Both
+    # `torch.compile()` and `import torch._inductor.config` drag in dynamo and
+    # sympy (~1 s), and most modules wrap their kernels at import time — so doing
+    # this eagerly taxed every CLI startup, including ones that never run a kernel.
+    state: dict[str, Any] = {"disabled": False, "compiled": None}
 
     @functools.wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         global _warned_fallback
         if state["disabled"]:
             return fn(*args, **kwargs)
+        compiled = state["compiled"]
+        if compiled is None:
+            configure_inductor()
+            try:
+                compiled = torch.compile(fn, **compile_kwargs)
+            except Exception:
+                state["disabled"] = True  # compile unavailable entirely → run eager
+                return fn(*args, **kwargs)
+            state["compiled"] = compiled
         try:
             return compiled(*args, **kwargs)
         except Exception as e:  # inductor/clang failures are Exception subclasses

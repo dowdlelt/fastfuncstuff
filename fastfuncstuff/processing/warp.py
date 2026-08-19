@@ -246,10 +246,21 @@ class QwarpConfig:
     verb: int = 1
     """Verbosity level (0=quiet, 1=normal, 2=detailed)."""
 
-    optimizer: str = "adam"
+    optimizer: str = "gn"
     """Per-patch optimizer, for **both** the ME-scaled polish and the ordinary warp:
-    'adam' (autodiff, any cost) or 'gn' (Levenberg-damped Gauss-Newton with an
-    analytic image-gradient Jacobian).
+    'gn' (Levenberg-damped Gauss-Newton with an analytic image-gradient Jacobian,
+    the default) or 'adam' (autodiff, any cost).
+
+    'gn' is the default because it is faster *and* better wherever it applies, and
+    it degrades to 'adam' automatically where it does not (see gn_capable), so the
+    choice costs nothing on the costs it cannot serve. On the benchmark's
+    anat->MNI lpa fit it is 140.8s -> 22.7s with r against AFNI's anatQQ going
+    0.8302 -> 0.8305. The reason is structural: Adam needs a backward pass per
+    step and converges in ~60 iterations per level, while GN builds (JtJ, Jtr)
+    from the steepest-descent images with no backward at all and converges in ~8.
+    ('hybrid' adds a short Adam polish after GN; measured *worse* on lpa --
+    44.1s and r=0.8218 -- because Adam is unreliable on this cost's rough
+    surface. It remains available for costs where the surrogate leaves a gap.)
 
     'gn' needs a least-squares surrogate, which the correlation costs have -- the
     plain ones through a patch-wide zero-normalised residual, lpa and lncc through a

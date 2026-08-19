@@ -121,28 +121,39 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run ffs_allineate for all cross-run pairs."""
-    total = 0.0
+    """Run ffs_allineate for all cross-run pairs, in one batched process.
+
+    Nine pairs invoked separately pay the interpreter/torch/CUDA startup nine
+    times, which is ~20 s of the stage on top of the alignments themselves.
+    -batch pays it once; the per-pair alignment is unchanged.
+    """
     ref = _ref_mean(ctx)
+    jobs = []
     for task, run in _align_pairs(ctx):
         mat = _ffs_mat(ctx, task, run)
         if mat.exists() and not ctx.force_ffs:
             continue
-        src = _src_mean(ctx, task, run)
-        al_out = _ffs_aligned(ctx, task, run)
-        elapsed, _ = run_timed(
-            f"ffs_allineate -cost lpa -lpa_kernel box -lpa_sigma 0 -onepass "
+        jobs.append(
+            f"-cost lpa -lpa_kernel box -lpa_sigma 0 -onepass "
             f"-interp cubic -final cubic "
             f"-source_automask -autoweight -rigid "
-            f"-base {ref} -source {src} "
-            f"-prefix {al_out} "
+            f"-base {ref} -source {_src_mean(ctx, task, run)} "
+            f"-prefix {_ffs_aligned(ctx, task, run)} "
             f"-1Dmatrix_save {mat}"
-            f"{ctx.ffs_device_flag()}",
-            label=f"ffs_allineate mean {task} run-{run} → ref",
-            cwd=ctx.processing_dir,
         )
-        total += elapsed
-    return total
+
+    if not jobs:
+        return 0.0
+
+    manifest = ctx.processing_dir / "ffs_crossalign_batch.txt"
+    manifest.write_text("\n".join(jobs) + "\n")
+
+    elapsed, _ = run_timed(
+        f"ffs_allineate -batch {manifest}{ctx.ffs_device_flag()}",
+        label=f"ffs_allineate crossalign batch ({len(jobs)} pairs)",
+        cwd=ctx.processing_dir,
+    )
+    return elapsed
 
 
 def validate(ctx: BenchmarkContext) -> dict:
