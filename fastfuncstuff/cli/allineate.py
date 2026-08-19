@@ -544,6 +544,16 @@ Examples:
         extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
     )
     hw_group.add_argument(
+        "-optimizer",
+        choices=("adam", "pattern"),
+        default="adam",
+        help="Refinement optimizer. 'adam' is autograd + Adam. 'pattern' is a "
+        "batched derivative-free coordinate search: it spends the (free) batch "
+        "dimension on a full coordinate line search per step instead of on a "
+        "backward pass, which is both faster and better suited to this cost's "
+        "small-scale roughness.",
+    )
+    hw_group.add_argument(
         "-compile",
         action="store_true",
         help="torch.compile the batched refinement forward to cut per-iteration "
@@ -757,6 +767,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         ov=_resolve_ov(args),
         n_match=args.n_match,
         compile=args.compile,
+        optimizer=args.optimizer,
         twopass=twopass,
         coarse_range=args.coarse_range,
         coarse_step=args.coarse_step,
