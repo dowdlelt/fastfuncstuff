@@ -69,21 +69,32 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run ffs_util_automask for all mean images."""
-    total = 0.0
+    """Run ffs_util_automask for all mean images, in one batched process.
+
+    Masking one mean image takes ~0.02 s -- two orders of magnitude less than the
+    interpreter/torch/CUDA startup around it -- so a per-run invocation would time
+    the startup ten times over and report it as masking cost. -batch pays it once.
+    """
+    jobs = []
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             out = _ffs_mask(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
                 continue
-            src = _mean_path(ctx, task, run)
-            elapsed, _ = run_timed(
-                f"ffs_util_automask -input {src} -prefix {out}{ctx.ffs_device_flag()}",
-                label=f"ffs_util_automask {task} run-{run}",
-                cwd=ctx.processing_dir,
-            )
-            total += elapsed
-    return total
+            jobs.append(f"-input {_mean_path(ctx, task, run)} -prefix {out}")
+
+    if not jobs:
+        return 0.0
+
+    manifest = ctx.processing_dir / "ffs_automask_batch.txt"
+    manifest.write_text("\n".join(jobs) + "\n")
+
+    elapsed, _ = run_timed(
+        f"ffs_util_automask -batch {manifest}{ctx.ffs_device_flag()}",
+        label=f"ffs_util_automask batch ({len(jobs)} runs)",
+        cwd=ctx.processing_dir,
+    )
+    return elapsed
 
 
 def validate(ctx: BenchmarkContext) -> dict:
