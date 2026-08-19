@@ -25,9 +25,11 @@ import torch
 
 from fastfuncstuff.cli_utils import (
     add_batch_args,
+    add_deterministic_arg,
     add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
+    enable_determinism,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -543,6 +545,7 @@ Examples:
         hw_group,
         extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
     )
+    add_deterministic_arg(hw_group)
     hw_group.add_argument(
         "-optimizer",
         choices=("adam", "pattern"),
@@ -603,6 +606,11 @@ def _validate_batch_run(run_args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> None:
     """Main CLI entry point for allineate."""
     args = parse_args(argv)
+
+    # Before any work: enable_determinism may re-exec to get CUBLAS_WORKSPACE_CONFIG
+    # in place, and for a batch that has to happen once, up front, not per run.
+    if getattr(args, "deterministic", False):
+        enable_determinism(getattr(args, "verb", 1))
 
     if args.batch is not None or args.batch_run:
         # One process, many alignments: the Python/CUDA/torch.compile startup is
