@@ -1025,8 +1025,6 @@ def xval_shifted_hrf(
         raise ValueError(f"cross-validation needs >= 2 runs; got {n_runs}")
     n_cond = len(per_run_condition_onsets[0])
     n_voxels = per_run_data[0].shape[0]
-    tau_grid = np.arange(-tau_max, tau_max + 0.5 * tau_step, tau_step, dtype=np.float64)
-    zero_idx = int(np.argmin(np.abs(tau_grid)))
 
     folds = [list(range(i, min(i + leave_n_out, n_runs))) for i in range(0, n_runs, leave_n_out)]
     folds = [f for f in folds if f and len(f) < n_runs]
@@ -1035,8 +1033,8 @@ def xval_shifted_hrf(
     num_0 = np.zeros(n_voxels)
     den = np.zeros(n_voxels)
 
-    for test_runs in tqdm(
-        folds, total=len(folds), desc="  Shifted xval folds", unit="fold", leave=True
+    for fold_i, test_runs in enumerate(
+        tqdm(folds, total=len(folds), desc="  Shifted xval folds", unit="fold", leave=True)
     ):
         train_runs = [r for r in range(n_runs) if r not in test_runs]
         n_tp_train = [int(per_run_data[r].shape[1]) for r in train_runs]
@@ -1118,22 +1116,66 @@ def xval_shifted_hrf(
 
         # collapse to condition level per voxel: mean amplitude, median grid index
         bc = np.asarray(block_cond)
-        # delays are exactly on-grid, so the index recovers by rounding
-        gidx = np.rint((fit.delays.astype(np.float64) + tau_max) / tau_step).astype(np.int64)
-        gidx = np.clip(gidx, 0, tau_grid.size - 1)
+        # Collapse each condition's trials to a per-voxel (A_c, tau_c).
+        #
+        # tau_c is a CONTINUOUS mean in seconds, scored against a test-run bank
+        # built on a much finer grid than the fit used.  It used to be the
+        # median of the trials' *grid indices*, which cost the test twice over:
+        #
+        #  1. it rounded the delays back onto the fit grid, discarding the
+        #     sub-grid refinement they already carry, and
+        #  2. it could not represent a condition-level delay smaller than one
+        #     tau_step -- and that is the normal case, not a corner.  Per-trial
+        #     delays scatter widely but average out, so the condition-level
+        #     signal is much smaller than the per-trial one: measured sd
+        #     0.146 s against a 0.25 s default step, i.e. 0.59 of a step.
+        #
+        # The consequence was silent and total.  On a real 192-trial dataset
+        # 80.2 % of (voxel, condition) aggregates landed on exactly the zero
+        # index, which makes the "shift" and "tau=0" models byte-identical and
+        # their difference exactly 0.00000 -- reported as "delays do NOT
+        # generalise" when nothing had been measured at all.
+        #
+        # A fine bank is cheap here precisely because this is condition level:
+        # it is (n_cond, G_fine, n_tp) with n_cond ~ 10, not n_trials ~ 200.
         A_c = np.zeros((n_voxels, n_cond), dtype=np.float64)
-        g_c = np.full((n_voxels, n_cond), zero_idx, dtype=np.int64)
+        tau_c = np.zeros((n_voxels, n_cond), dtype=np.float64)
         for c in range(n_cond):
             sel = bc == c
             if not sel.any():
                 continue
             A_c[:, c] = fit.amplitudes[:, sel].mean(axis=1)
-            g_c[:, c] = np.rint(np.median(gidx[:, sel], axis=1)).astype(np.int64)
+            tau_c[:, c] = fit.delays[:, sel].astype(np.float64).mean(axis=1)
         del fit
+
+        # Fine scoring grid: quantisation here must be negligible against the
+        # condition-level spread, which is the quantity being tested.
+        fine_step = max(min(tau_step / 25.0, 0.02), 1e-3)
+        tau_fine = np.arange(-tau_max, tau_max + 0.5 * fine_step, fine_step, dtype=np.float64)
+        if tau_fine.size > 2001:  # keep the bank bounded on a very wide search
+            tau_fine = np.linspace(-tau_max, tau_max, 2001)
+            fine_step = float(tau_fine[1] - tau_fine[0]) if tau_fine.size > 1 else fine_step
+        zero_fine = int(np.argmin(np.abs(tau_fine)))
+        g_c = np.clip(
+            np.rint((tau_c - tau_fine[0]) / fine_step).astype(np.int64), 0, tau_fine.size - 1
+        )
+        if verbose and fold_i == 0:
+            spread = float(tau_c.std())
+            print(
+                f"    condition-level delay spread {spread:.3f}s "
+                f"vs tau_step {tau_step:.3f}s ({spread / max(tau_step, 1e-9):.2f} steps); "
+                f"scored on a {fine_step:.3f}s grid"
+            )
+            if spread < 0.25 * tau_step:
+                print(
+                    "    WARNING: the condition-level delay is far below the search step. "
+                    "The delay gain is measurable but the delays themselves are barely "
+                    "resolved -- consider a finer -tau-step."
+                )
 
         A_t = torch.from_numpy(A_c).to(device)
         g_t = torch.from_numpy(g_c).to(device)
-        g_zero = torch.full_like(g_t, zero_idx)
+        g_zero = torch.full_like(g_t, zero_fine)
 
         for r in test_runs:
             n_tp_r = int(per_run_data[r].shape[1])
@@ -1160,8 +1202,8 @@ def xval_shifted_hrf(
                 if vsel.size == 0:
                     continue
                 bank_test = build_shifted_design_bank(
-                    test_onsets, curve, hrf_dt, tau_grid, tr, n_tp_r, device=device
-                )  # (n_cond, G, T)
+                    test_onsets, curve, hrf_dt, tau_fine, tr, n_tp_r, device=device
+                )  # (n_cond, G_fine, T)
                 vt = torch.from_numpy(vsel).to(device)
                 for gsel, acc in ((g_t, num_s), (g_zero, num_0)):
                     cols = bank_test[ar_c.unsqueeze(0), gsel[vt]]  # (nvs, n_cond, T)

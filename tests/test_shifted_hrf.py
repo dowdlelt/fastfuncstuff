@@ -1020,3 +1020,79 @@ def test_amp_ridge_prevents_delay_search_from_blowing_up_amplitudes():
     assert (np.abs(scale - 1.0) < 0.2).all(), f"amplitude scale drifted: {scale.round(3)}"
     # the runaway spread is what it is meant to remove
     assert np.mean([x[4] for x in res]) < np.mean([x[3] for x in res])
+
+
+def test_xval_detects_a_delay_smaller_than_one_tau_step():
+    """Bug of record: the validator could not see a sub-step delay.
+
+    The condition-level delay is much smaller than the per-trial one -- trials
+    scatter but average out -- so it routinely lands below ``tau_step``.
+    Measured on a real 192-trial dataset: condition-level spread 0.146 s
+    against the 0.25 s default step, i.e. 0.59 of a step.
+
+    Aggregation used to take the MEDIAN of the trials' grid *indices*, which
+    both discarded the sub-grid refinement the delays already carry and could
+    not represent anything finer than one step.  80.2 % of (voxel, condition)
+    aggregates collapsed onto the zero index, making the two scored models
+    byte-identical and their difference exactly 0.00000 -- which printed as
+    "delays do NOT generalise" without having measured anything.
+
+    Scoring now uses a continuous mean against a fine test-run bank.  This
+    pins the case that was silently unmeasurable.
+    """
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives
+    from fastfuncstuff.design.shifted_hrf import xval_shifted_hrf
+
+    dev = torch.device("cpu")
+    tr, n_tp, n_runs, n_cond = 1.0, 220, 3, 2
+    dt, dur = 0.1, 32.0
+    h = (
+        get_spm_hrf_with_derivatives(microtime_dt=dt, hrf_duration=dur, n_basis=1, device=dev)
+        .cpu()
+        .numpy()[0]
+    )
+    h = h / np.abs(h).max()
+
+    rng = np.random.default_rng(3)
+    onsets = [np.arange(8.0 + 3.0 * c, n_tp * tr - 40, 14.0) for c in range(n_cond)]
+    per_run_onsets = [[onsets[c] for c in range(n_cond)] for _ in range(n_runs)]
+
+    # TRUE delay: run-stable, per voxel, and deliberately BELOW one tau_step.
+    tau_step = 0.5
+    n_vox = 30
+    true_tau = rng.choice([-0.2, +0.2], size=n_vox)  # 0.4 of a step
+    th = np.arange(h.size) * dt
+    tg = np.arange(n_tp) * tr
+    runs = []
+    for _r in range(n_runs):
+        y = np.zeros((n_vox, n_tp))
+        for c in range(n_cond):
+            for o in onsets[c]:
+                for v in range(n_vox):
+                    y[v] += 2.0 * np.interp(tg - o - true_tau[v], th, h, left=0.0, right=0.0)
+        y += rng.normal(0, 0.25, y.shape)
+        runs.append(torch.from_numpy(y))
+
+    r2_shift, r2_tau0 = xval_shifted_hrf(
+        per_run_data=runs,
+        per_run_condition_onsets=per_run_onsets,
+        hrf=h,
+        hrf_dt=dt,
+        tr=tr,
+        polort=1,
+        single_trials=False,
+        tau_max=2.0,
+        tau_step=tau_step,
+        delay_prior_sd=None,
+        n_sweeps=3,
+        device=dev,
+        verbose=False,
+    )
+    gain = np.median(r2_shift - r2_tau0)
+    # The whole point: a sub-step delay must produce a NON-ZERO gain.  The old
+    # grid-index aggregation returned exactly 0.0 here.
+    assert gain != 0.0, "delay gain is exactly zero -- the aggregation quantised it away again"
+    assert gain > 0.0, f"a real sub-step delay should help held-out prediction; got {gain:+.5f}"
