@@ -79,6 +79,7 @@ def test_noiseless_recovery_is_exact(setup):
         tau_step=0.25,
         n_sweeps=4,
         delay_prior_sd=None,  # no shrinkage: we want the raw optimum
+        amp_ridge=0.0,  # ditto -- this pins the SOLVER, not the default prior
         refine_delays=False,  # this test is about the GRID search itself
         device=CPU,
     )
@@ -86,6 +87,42 @@ def test_noiseless_recovery_is_exact(setup):
     # tau exact on the vast majority of trials, amplitude close everywhere
     assert np.mean(np.abs(r.delays - tau) < 1e-6) > 0.9
     np.testing.assert_allclose(np.median(r.amplitudes / amps), 1.0, rtol=0.02)
+
+
+def test_default_amp_ridge_costs_little_on_clean_data(setup):
+    """What the default amplitude prior costs when there is nothing to shrink.
+
+    ``AMP_RIDGE_DEFAULT`` exists for noisy, tightly-packed designs where the
+    delay search can drive ``cond(XtX)`` to 1e5.  On clean well-separated
+    data it can only hurt, so this bounds the damage: a couple of percent of
+    amplitude, not a collapse.  If this drifts, the default moved.
+    """
+    h, _, block_onsets, polys = setup
+    nb = len(block_onsets)
+    rng = np.random.default_rng(0)
+    tau = rng.choice(np.arange(-2.0, 2.01, 0.5), size=(20, nb))
+    amps = rng.uniform(0.5, 3.0, size=(20, nb))
+    y = _simulate(h, block_onsets, tau, amps)
+    kw = dict(
+        data=torch.from_numpy(y),
+        block_onsets=block_onsets,
+        hrf=h,
+        hrf_dt=DT,
+        tr=TR,
+        nuisance=torch.from_numpy(polys),
+        tau_max=3.0,
+        tau_step=0.25,
+        n_sweeps=4,
+        delay_prior_sd=None,
+        refine_delays=False,
+        device=CPU,
+    )
+    off = fit_shifted_hrf(**kw, amp_ridge=0.0)
+    on = fit_shifted_hrf(**kw)  # AMP_RIDGE_DEFAULT
+    assert np.median(on.r2) > 0.99, f"default ridge cost too much R2: {np.median(on.r2):.4f}"
+    scale = float(np.median(on.amplitudes / amps))
+    assert 0.95 < scale < 1.02, f"default ridge shrank amplitude to {scale:.3f}"
+    assert np.median(off.r2) >= np.median(on.r2)
 
 
 def test_delays_never_exceed_the_bound(setup):
@@ -887,3 +924,99 @@ def test_load_shape_index_map_converts_base_and_checks_range(tmp_path):
         _load_shape_index_map(
             str(path), n_shapes=20, volume_shape=(4, 3, 2), mask=None, n_voxels=24
         )
+
+
+def test_amp_ridge_prevents_delay_search_from_blowing_up_amplitudes():
+    """The delay search can slide overlapping trials into near-coincidence.
+
+    Nothing in the profiled per-block objective sees the JOINT conditioning,
+    so the search is free to move two overlapping trials on top of each
+    other -- which improves in-sample fit, because the resulting
+    (+huge, -huge) amplitude pair absorbs noise.  Bug of record, on a real
+    192-trial 2.05 s-ISI dataset: ``cond(XtX)`` was 61.7 at delay=0 but had
+    a median of 1.1e5 at the fitted delays (82 % of voxels above 1e4).
+    Per-trial amplitudes came back with sd 20.9 against an independent
+    ``ffs_reml`` condition-beta sd of 0.75, and a lag-1 autocorrelation of
+    -0.42 in onset order -- the alternating-sign signature.
+
+    The old 1e-8 was jitter to keep the batched Cholesky well-posed, not a
+    prior, and is powerless at that conditioning.  Fixing it took agreement
+    with the independent REML fit from 0.29 to 0.54 on that dataset.
+
+    Averaged over seeds because the per-seed gap is small (~0.06) next to
+    its seed-to-seed spread; one seed would make this a coin flip.
+    """
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives
+    from fastfuncstuff.design.shifted_hrf import build_blockdiag_polys, fit_shifted_hrf
+
+    dev = torch.device("cpu")
+    tr, n_tp, n_runs, n_vox = 0.5, 240, 2, 16
+    dt, dur = 0.1, 32.0
+    h = (
+        get_spm_hrf_with_derivatives(microtime_dt=dt, hrf_duration=dur, n_basis=1, device=dev)
+        .cpu()
+        .numpy()[0]
+    )
+    h = h / np.abs(h).max()
+    run_bounds = [(r * n_tp, (r + 1) * n_tp) for r in range(n_runs)]
+    tg = np.arange(n_tp * n_runs) * tr
+    th = np.arange(h.size) * dt
+
+    def one_seed(seed):
+        rng = np.random.default_rng(seed)
+        # Tight, jittered ISI -- the regime that gives the search room to collide trials.
+        onsets, t = [], 6.0
+        while t < n_tp * tr - 35:
+            onsets.append(t)
+            t += rng.uniform(1.2, 2.0)
+        block_onsets = [np.array([o + r * n_tp * tr]) for r in range(n_runs) for o in onsets]
+        nb = len(block_onsets)
+        a_true = rng.normal(1.0, 0.35, (n_vox, nb))
+        d_true = rng.normal(0.0, 0.5, (n_vox, nb))
+        y = np.zeros((n_vox, n_tp * n_runs))
+        for b, o in enumerate(block_onsets):
+            r0, r1 = run_bounds[int(o[0] // (n_tp * tr))]
+            for v in range(n_vox):
+                col = np.interp(tg - o[0] - d_true[v, b], th, h, left=0.0, right=0.0).copy()
+                col[:r0] = 0.0
+                col[r1:] = 0.0
+                y[v] += a_true[v, b] * col
+        y += rng.normal(0, 0.5, y.shape)
+        kw = dict(
+            data=y,
+            block_onsets=block_onsets,
+            hrf=h,
+            hrf_dt=dt,
+            tr=tr,
+            nuisance=build_blockdiag_polys([n_tp] * n_runs, 2, dev),
+            tau_max=2.0,
+            tau_step=0.5,
+            run_bounds=run_bounds,
+            n_sweeps=3,
+            delay_prior_sd=0.75,
+            device=dev,
+        )
+        off = fit_shifted_hrf(**kw, amp_ridge=0.0)  # floors to the old 1e-8
+        on = fit_shifted_hrf(**kw, amp_ridge=1e-3)
+        return (
+            np.corrcoef(off.amplitudes.ravel(), a_true.ravel())[0, 1],
+            np.corrcoef(on.amplitudes.ravel(), a_true.ravel())[0, 1],
+            float(on.amplitudes.mean() / a_true.mean()),
+            float(off.amplitudes.std()),
+            float(on.amplitudes.std()),
+        )
+
+    res = [one_seed(s) for s in range(4)]
+    r_off = np.array([x[0] for x in res])
+    r_on = np.array([x[1] for x in res])
+    gap = r_on - r_off
+    assert gap.mean() > 0.02, f"ridge barely helped: mean gap {gap.mean():+.4f} ({gap.round(3)})"
+    assert (gap > 0).all(), f"ridge hurt on some seed: {gap.round(3)}"
+    # ...and it must not win by shrinking amplitude away: scale stays honest
+    scale = np.array([x[2] for x in res])
+    assert (np.abs(scale - 1.0) < 0.2).all(), f"amplitude scale drifted: {scale.round(3)}"
+    # the runaway spread is what it is meant to remove
+    assert np.mean([x[4] for x in res]) < np.mean([x[3] for x in res])

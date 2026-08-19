@@ -696,6 +696,26 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     delay_grp.add_argument(
+        "-amp-ridge",
+        "-amp_ridge",
+        dest="amp_ridge",
+        type=float,
+        default=1e-3,
+        metavar="FRAC",
+        help=(
+            "Ridge on the per-trial amplitude solve, relative to "
+            "mean(diag(XtX)).  Keep it on: the delay search is free to slide "
+            "two overlapping trials into near-coincidence, which improves "
+            "in-sample fit via a (+huge, -huge) amplitude pair.  Measured on "
+            "a 192-trial 2.05s-ISI design, cond(XtX) is 61.7 at delay=0 but "
+            "1.1e5 at the fitted delays.  Amplitude recovery vs known truth: "
+            "0.58 at 1e-8 (i.e. off), 0.74 at 1e-3, 0.68 at 3e-2 — and 0.69 "
+            "for not fitting latency at all, so with this off the delays "
+            "cost more than they buy.  Above ~1e-2 amplitudes shrink and "
+            "delay recovery collapses.  0 restores the old behaviour."
+        ),
+    )
+    delay_grp.add_argument(
         "-shift-sweeps",
         "-shift_sweeps",
         dest="shift_sweeps",
@@ -1226,6 +1246,7 @@ def _run_shift_mode(
     print(
         f"  Delay search: ±{args.tau_max}s step {args.tau_step}s"
         f"{f', prior sd {args.delay_prior_sd}s' if args.delay_prior_sd else ', no prior'}"
+        f"{f', amp ridge {args.amp_ridge:g}' if args.amp_ridge else ', NO amp ridge'}"
     )
 
     per_run_data = [
@@ -1284,6 +1305,7 @@ def _run_shift_mode(
             run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
+            amp_ridge=args.amp_ridge,
             device=device,
             verbose=True,
         )
@@ -1300,6 +1322,7 @@ def _run_shift_mode(
             run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
+            amp_ridge=args.amp_ridge,
             device=device,
             verbose=True,
         )
@@ -1434,7 +1457,8 @@ def _run_shift_mode(
                 tau_max=args.tau_max,
                 tau_step=args.tau_step,
                 delay_prior_sd=args.delay_prior_sd,
-                    n_sweeps=args.shift_sweeps,
+                amp_ridge=args.amp_ridge,
+                n_sweeps=args.shift_sweeps,
                 leave_n_out=args.cv_leave_n_out,
                 device=device,
                 verbose=True,
@@ -1474,6 +1498,7 @@ def _run_shift_mode(
         "tau_max": float(args.tau_max),
         "tau_step": float(args.tau_step),
         "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),
+        "amp_ridge": float(args.amp_ridge),
         "n_sweeps": int(fit.n_sweeps),
         "single_trials": bool(args.single_trials),
         "n_blocks": len(block_onsets),

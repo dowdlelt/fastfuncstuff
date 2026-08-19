@@ -68,6 +68,12 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.utils import get_device, parabolic_peak_offset
 
+AMP_RIDGE_DEFAULT = 1e-3
+"""Default ridge on the amplitude solve (relative to ``mean(diag(XtX))``).
+
+See :func:`_solve_amplitudes` for the measurements behind this value.
+"""
+
 
 @dataclass
 class ShiftedHRFResult:
@@ -273,6 +279,7 @@ def _solve_amplitudes(
     ar_v: Tensor,
     n_blocks: int,
     amp_batch: int,
+    amp_ridge: float = AMP_RIDGE_DEFAULT,
 ) -> Tensor:
     """Exact joint amplitude solve given every block's chosen grid index.
 
@@ -296,6 +303,30 @@ def _solve_amplitudes(
     nbr_idx : (NB, W) long, nbr_w : (NB, W) float
         Neighbour indices and a 0/1 weight masking the padding.
     ar_b, ar_w, ar_v : aranges over blocks, band width, and voxels.
+    amp_ridge : float
+        Ridge on the amplitude solve, relative to ``mean(diag(XtX))``.  This
+        is a **statistical** prior, not the numerical jitter it replaced.
+
+        The delay search chooses each block's shift to maximise fit, and it
+        is free to slide two overlapping trials into near-coincidence --
+        which improves in-sample fit, because the resulting (+huge, -huge)
+        amplitude pair absorbs noise.  Nothing in the profiled per-block
+        objective sees the joint conditioning, so nothing prevents it.
+        Measured on a 192-trial 2.05 s-ISI design: ``cond(XtX)`` is 61.7 at
+        tau=0 but has a median of 1.1e5 at the fitted delays, with 82 % of
+        voxels above 1e4 -- and those voxels carry amplitudes an order of
+        magnitude too large.  The old 1e-8 was sized to keep the batched
+        Cholesky well-posed and is powerless against that.
+
+        Recovery of known per-trial amplitudes on that design, r vs truth:
+        0.575 at 1e-8, **0.744 at 1e-3**, 0.745 at 1e-2, 0.684 at 3e-2.  For
+        reference, not modelling latency at all scores 0.688 -- so as
+        shipped, freeing the delays cost more amplitude accuracy than the
+        latency was worth, and 1e-3 reverses that.  Past ~1e-2 amplitude
+        shrinks visibly (mean 0.98 -> 0.83 -> 0.61) and delay recovery
+        collapses with it.  Delay recovery also improves at 1e-3 (0.567 ->
+        0.589), because a stabilised ``A`` feeds the next sweep's search.
+
     amp_batch : int
         Voxels per sub-batch.  Sub-batching here is what keeps the
         ``(nb_v, NB, NB)`` allocation from dictating the caller's chunk
@@ -336,9 +367,10 @@ def _solve_amplitudes(
             (band_vals * nbr_w.view(n_blocks, 1, band_w)).permute(1, 0, 2),
         )
         Xty = proj[ar_b[:, None], g_b, ar_v[s:e][None, :]].T  # (nb_v, NB)
-        # Overlapping trials at short ISI make XtX near-singular; a relative
-        # jitter keeps the batched solve well-posed without biasing A.
-        ridge = 1e-8 * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+        # Ridge relative to the mean diagonal.  Floored at the old 1e-8 so the
+        # batched Cholesky stays well-posed even when a caller asks for none.
+        _fac = max(float(amp_ridge), 1e-8)
+        ridge = _fac * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
         XtX = XtX + ridge[:, None, None] * eye
         out[s:e] = torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
         del XtX, Xty, ridge, band_vals, gi_nb
@@ -370,6 +402,7 @@ def fit_shifted_hrf(
     run_bounds: list[tuple[int, int]] | None = None,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
+    amp_ridge: float = AMP_RIDGE_DEFAULT,
     refine_delays: bool = True,
     device: torch.device | None = None,
     chunk_size: int | None = None,
@@ -415,6 +448,12 @@ def fit_shifted_hrf(
         true 1.0 at low SNR with a free ±3 s search).  Shrinking ``τ``
         toward the voxel's central latency removes most of that.  Pass
         ``None`` to disable and get the raw per-trial optimum.
+    amp_ridge : float
+        Ridge on the amplitude solve, relative to ``mean(diag(XtX))``.  The
+        delay search can slide overlapping trials into near-coincidence and
+        blow the amplitudes up; this is what stops it.  See
+        :func:`_solve_amplitudes` for the measurements.  Set to 0 for the
+        old (numerical-only) behaviour.
 
     Returns
     -------
@@ -594,7 +633,7 @@ def fit_shifted_hrf(
 
         ar_v = torch.arange(nv, device=device)
         A = _solve_amplitudes(
-            gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch
+            gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch, amp_ridge
         )
         # σ² for the τ prior, taken from the τ=0 fit.  With A solved
         # exactly, SSE = ‖y‖² − Aᵀ(Xᵀy), so no prediction is needed.
@@ -665,7 +704,17 @@ def fit_shifted_hrf(
                     gain = gain - lam_sweep.unsqueeze(0) * dev_tau**2
                 gi[:, b] = torch.argmax(gain, dim=0)
             A = _solve_amplitudes(
-                gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch
+                gi,
+                banded,
+                proj,
+                nbr_idx_t,
+                nbr_w_t,
+                ar_b,
+                ar_w,
+                ar_v,
+                n_blocks,
+                amp_batch,
+                amp_ridge,
             )
 
         # ---- sub-grid delay refinement --------------------------------
@@ -809,6 +858,7 @@ def xval_shifted_hrf(
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     delay_prior_sd: float | None = 0.75,
+    amp_ridge: float = AMP_RIDGE_DEFAULT,
     n_sweeps: int = 4,
     leave_n_out: int = 1,
     device: torch.device | None = None,
@@ -948,6 +998,7 @@ def xval_shifted_hrf(
                 tau_step=tau_step,
                 n_sweeps=n_sweeps,
                 delay_prior_sd=delay_prior_sd,
+                amp_ridge=amp_ridge,
                 device=device,
                 verbose=False,
             )
@@ -965,6 +1016,7 @@ def xval_shifted_hrf(
                 tau_step=tau_step,
                 n_sweeps=n_sweeps,
                 delay_prior_sd=delay_prior_sd,
+                amp_ridge=amp_ridge,
                 device=device,
                 verbose=False,
             )
@@ -1303,6 +1355,7 @@ def fit_shifted_hrf_per_voxel_shape(
     tau_step: float = 0.25,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
+    amp_ridge: float = AMP_RIDGE_DEFAULT,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> tuple[ShiftedHRFResult, np.ndarray]:
@@ -1386,6 +1439,7 @@ def fit_shifted_hrf_per_voxel_shape(
             run_bounds=run_bounds,
             n_sweeps=n_sweeps,
             delay_prior_sd=delay_prior_sd,
+            amp_ridge=amp_ridge,
             device=device,
             verbose=False,
         )
