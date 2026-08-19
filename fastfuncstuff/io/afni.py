@@ -2823,6 +2823,45 @@ def _nib_save_chunked(img, path: str) -> None:
         img.to_file_map({k: FileHolder(filename=path, fileobj=wrapped) for k in img.file_map})
 
 
+@functools.lru_cache(maxsize=8)
+def _reference_geometry_cached(path: str, mtime_ns: int, size: int):
+    """Affine + header of a reference image, keyed on its on-disk identity.
+
+    Only the geometry is retained -- never the data array -- so an entry
+    costs a few KB regardless of how big the reference file is.
+    """
+    ref_img = load_nifti(path)
+    return ref_img.affine, ref_img.header.copy()
+
+
+def _reference_geometry(reference_img: str | Path) -> tuple[np.ndarray, Any]:
+    """Affine + header from ``reference_img``, reading each file at most once.
+
+    ``save_nifti`` is called once per output map, and every call used to
+    re-read ``reference_img`` in full just to copy its affine and header.
+    The near-universal caller pattern is ``reference_img=args.input[0]`` --
+    a compressed 4-D input -- so a tool writing N maps paid N full
+    decompressions of the same file.  Measured on a 1 GB ``.nii.zst``:
+    1.80 s per call, i.e. 54 s of a 158 s ``ffs_fitbasis`` run spent
+    re-reading one file 30 times, against 0.026 s for the write itself.
+
+    Keyed on (resolved path, mtime_ns, size) so a reference rewritten
+    mid-run is re-read rather than served stale.  Callers mutate what they
+    get back (``set_data_shape``, extensions, brick labels), so both pieces
+    are copied out of the cache on every call.
+    """
+    try:
+        p = Path(reference_img)
+        st = p.stat()
+        affine, header = _reference_geometry_cached(str(p.resolve()), st.st_mtime_ns, st.st_size)
+    except OSError:
+        # Unstattable (exotic path, race, permissions) -- fall back to the
+        # uncached read rather than failing a write that used to work.
+        ref_img = load_nifti(reference_img)
+        return ref_img.affine, ref_img.header.copy()
+    return affine.copy(), header.copy()
+
+
 def save_nifti(
     data: np.ndarray,
     output_path: str | Path,
@@ -2867,9 +2906,7 @@ def save_nifti(
 
     # Get affine and header info
     if reference_img is not None:
-        ref_img = load_nifti(reference_img)
-        affine = ref_img.affine
-        header = ref_img.header.copy()
+        affine, header = _reference_geometry(reference_img)
     elif header is not None:
         header = header.copy()
         if affine is None:
