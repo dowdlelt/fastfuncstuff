@@ -116,10 +116,13 @@ class AffineAlignConfig:
     # blok cost) to cut per-iteration kernel-launch overhead. Also enabled by the
     # FFS_ALLINEATE_COMPILE=1 environment variable.
     compile: bool = False
-    # "adam" = autograd + Adam (legacy); "pattern" = batched derivative-free
-    # coordinate search. See _refine_pattern_batched for why the latter suits a
-    # 6-12 parameter, launch-bound, jagged-surface problem.
-    optimizer: str = "adam"
+    # "cmaes" = batched CMA-ES (default), "adam" = autograd + Adam (the previous
+    # default, kept as an escape hatch), "pattern" = batched coordinate search.
+    # See _refine_cmaes_batched for the measurements that pick CMA-ES: the batch
+    # dimension is nearly free while sequential steps are not, the gradient is
+    # unreliable at the scale the search finishes, and the improving direction is
+    # rarely axis-aligned.
+    optimizer: str = "cmaes"
 
     # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
     # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
@@ -1444,6 +1447,7 @@ def _refine_cmaes_batched(
     # no measurable accuracy (0.0860 deg vs 0.0862 deg against AFNI).
     sigma_min: float = 5e-4,
     popsize: int | None = None,
+    state: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """CMA-ES refinement: T independent searches, one batched cost per generation.
 
@@ -1517,6 +1521,18 @@ def _refine_cmaes_batched(
     C = torch.eye(n, dtype=dt, device=device).expand(T, n, n).contiguous()
     p_sig = torch.zeros(T, n, dtype=dt, device=device)
     p_c = torch.zeros(T, n, dtype=dt, device=device)
+
+    # Warm start across resolution stages. C is what CMA-ES *learns* -- the
+    # correlation structure of the problem (for an off-centre object, how
+    # rotation trades against translation). Blurring the images changes the
+    # sharpness of the optimum, not that geometry, so relearning C from the
+    # identity at every stage repeats the expensive part of the search. The
+    # step size deliberately does NOT carry over: it has converged to the
+    # previous stage's precision, and the new stage needs to move again.
+    if state and state.get("C") is not None and state["C"].shape == C.shape:
+        C = state["C"].clone()
+        p_c = state["p_c"].clone()
+        p_sig = state["p_sig"].clone()
 
     # Fixed seed: CMA-ES is a randomized method, and an alignment that changes
     # run to run is not something a pipeline can build on.
@@ -1598,6 +1614,9 @@ def _refine_cmaes_batched(
 
     if verb >= 2:
         print(f"    {desc}: {n_eval} cost evaluations in {gi + 1} generations (lambda={lam})")
+
+    if state is not None:
+        state["C"], state["p_c"], state["p_sig"] = C, p_c, p_sig
 
     best_phys = _denormalize_t(best_x.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()
     return best_phys, best_c.detach().cpu().numpy()
@@ -2089,6 +2108,7 @@ def _refine_progressive(
         stages.append((2.0, config.adam_iters_2x, config.adam_lr_2x, True))
     stages.append((0.0, config.adam_iters_1x, config.adam_lr, False))
 
+    cma_state: dict = {}  # CMA-ES covariance carried between resolution stages
     for si, (sigma_vox, n_iters, lr, dedup_after) in enumerate(stages):
         if sigma_vox > 0.0:
             base_s = _separable_smooth_3d(base, sigma_vox)
@@ -2111,6 +2131,13 @@ def _refine_progressive(
                 source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, ctx
             )
             if config.optimizer == "cmaes":
+                # Stage-aware search scale. A stage blurred to sigma_vox cannot
+                # see structure finer than its blur, so converging the parameters
+                # tighter than that is pure waste -- and it was most of the cost:
+                # the blur stage was spending 293 generations to the full-res
+                # stage's 47. Conversely the full-res stage starts from the blur
+                # stage's answer, so it wants a narrow initial sigma, not a wide
+                # one. Both scale off the same blur level.
                 out_phys, out_costs = _refine_cmaes_batched(
                     [p for _, p in trials],
                     config,
@@ -2120,6 +2147,9 @@ def _refine_progressive(
                     verb=verb,
                     n_iters=n_iters,
                     desc=f"S{si}",
+                    sigma0=0.05 if sigma_vox > 0 else 0.03,
+                    sigma_min=2e-4 * (1.0 + 8.0 * sigma_vox),
+                    state=cma_state,
                 )
             elif config.optimizer == "pattern":
                 out_phys, out_costs = _refine_pattern_batched(

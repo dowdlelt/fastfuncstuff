@@ -549,8 +549,9 @@ Examples:
     hw_group.add_argument(
         "-optimizer",
         choices=("adam", "pattern", "cmaes"),
-        default="adam",
-        help="Refinement optimizer. 'adam' is autograd + Adam. 'pattern' is a "
+        default="cmaes",
+        help="Refinement optimizer (default cmaes). 'adam' is autograd + Adam, "
+        "the previous default. 'pattern' is a "
         "batched derivative-free coordinate search. 'cmaes' is batched CMA-ES, "
         "which additionally adapts a covariance and so follows the correlated "
         "rotation/translation valley that defeats a coordinate stencil. Both "
