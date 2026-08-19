@@ -131,26 +131,174 @@ class _HelpFormatter(
     argparse.RawDescriptionHelpFormatter,
     argparse.ArgumentDefaultsHelpFormatter,
 ):
-    pass
+    """Repo help style, minus two sources of pure noise.
+
+    ``(default: None)`` / ``(default: False)`` are dropped: for every flag
+    here those mean "off" or "auto", which the help text already says, and
+    they accounted for a third of the ``(default: ...)`` lines.
+
+    Hyphen/underscore spelling variants collapse to one entry.  Every
+    ``-foo-bar`` also accepts ``-foo_bar`` (documented once in the epilog);
+    printing both doubled the width of ~20 entries to say nothing.  An alias
+    that is *not* a mere spelling variant — ``-parametrisation``, ``-quiet``
+    — still prints, because it carries information.
+    """
+
+    def _get_help_string(self, action):
+        if action.default is None or action.default is False:
+            return action.help
+        return super()._get_help_string(action)
+
+    def _format_action_invocation(self, action):
+        if not action.option_strings:
+            return super()._format_action_invocation(action)
+        canon = action.option_strings[0]
+
+        def norm(s: str) -> str:
+            return s.replace("_", "-")
+
+        shown = [canon] + [o for o in action.option_strings[1:] if norm(o) != norm(canon)]
+        if action.nargs == 0:
+            return ", ".join(shown)
+        args = self._format_args(action, self._get_default_metavar_for_optional(action))
+        return ", ".join(shown) + " " + args
+
+
+_USAGE = (
+    "ffs_fitbasis -input RUN [RUN ...] -prefix OUT\n"
+    "                    (-events TSV [TSV ...] | -onsets FILE [FILE ...] -durations D [D ...])\n"
+    "                    [-parametrization {linear,shift}] [-single-trials] [-xval-r2]\n"
+    "                    [-model M] [-reg R] [-shift-hrf SRC] [-tau-max S] [...]\n"
+    "\n"
+    "                    Run with -h for the grouped flag list."
+)
+
+_DESCRIPTION = """\
+[BETA] Per-condition or per-trial response estimation: amplitude alone, or
+amplitude AND latency together.
+
+  Two models, chosen by -parametrization.  This is the first decision and it
+  decides which of the groups below apply to you:
+
+    linear   K basis columns per block (SPMG1/2/3 or FLOBS), free betas,
+             constrained by a shape prior (-reg).  Estimates AMPLITUDE.
+             Latency via the SPMG2 derivative ratio does not work — measured
+             r=0.03 against known truth, with no valid operating point.
+
+    shift    ONE column per block: the HRF shifted exactly, with a free
+             amplitude and a box-bounded delay reported in seconds.  This is
+             the path that recovers per-trial LATENCY (measured r=0.69).
+             Works with any HRF shape and needs no temporal derivative.
+             -model and -reg are ignored here — there are no basis
+             coefficients to choose or constrain.
+
+  A "block" is one condition, or one trial with -single-trials.
+
+  Rationale, measurements and open questions live in the wiki note
+  "ffs_fitbasis latency rework"; this help states behaviour only.
+"""
+
+_EPILOG = """\
+EXAMPLES
+
+  # Per-trial amplitudes, GLMsingle-style (the ffs_ridge alternative).
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -single-trials -reg cone \\
+               -mask brain_mask.nii.gz -prefix out/sub01
+
+  # Per-trial amplitude AND latency, with the held-out validator that says
+  # whether the latencies are real.
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -parametrization shift -single-trials -xval-r2 \\
+               -mask brain_mask.nii.gz -prefix out/sub01_shift
+
+  # Same, but each voxel keeps its own HRF from an ffs_hrfopt index map.
+  # Absolute delay then splits between shape TTP and the delay map — read
+  # _shift_delay_dev_<cond> for the clean per-trial quantity.
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -parametrization shift -single-trials -xval-r2 \\
+               -shift-shape-index out/sub01_hrf_index.nii.gz \\
+               -mask brain_mask.nii.gz -prefix out/sub01_shift
+
+  # Per-condition fit with AFNI-style onsets and denoising components.
+  ffs_fitbasis -input run*.nii.gz -onsets faces.1D houses.1D -durations 2.0 \\
+               -reg cone -ortvec_glob 'out/sub01_run*_pcs.1D' pcs \\
+               -polort 4 -prefix out/sub01_cond
+
+READING THE OUTPUT
+
+  shift:   _shift_amplitude_<cond>  per-block amplitude, data units
+           _shift_delay_<cond>      per-block delay, seconds
+           _shift_delay_dev_<cond>  delay minus the voxel's own mean delay —
+                                    the quantity that survives a per-voxel
+                                    shape, and the one to use for per-trial
+                                    timing
+           _shift_xvalr2            held-out R² (-xval-r2).  THIS is the
+                                    task-responsiveness map.
+           _shift_xvalr2_delay_gain held-out gain from freeing the delays.
+                                    >0 means the latencies are real; <=0
+                                    means they are not.
+  linear:  _amplitude_<cond>, _pcweights_<cond>, _iresp_<cond>, _r2, _xvalr2
+
+  In-sample R² is NOT evidence of a task response, and r2 minus r2_tau0 is
+  NOT evidence of latency: n_blocks free parameters buy in-sample fit even
+  on data simulated with none.  Threshold the held-out maps.
+
+NOTES
+
+  - Every -foo-bar flag also accepts -foo_bar.  Only one spelling is listed.
+  - -flobs-dt and -flobs-window set the HRF sampling grid for BOTH
+    parametrisations despite the name.
+  - Never combine -polort 0 with per-run nuisance blocks (rank-deficient).
+"""
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ffs_fitbasis",
-        description=(
-            "[BETA] Constrained basis-set HRF fitting "
-            "(SPMG1/SPMG2/SPMG3/FLOBS) with optional shape prior, "
-            "single-trial mode (LSA or LSS), per-voxel ARMA(1,1) "
-            "prewhitening, and a filmbabe-style VB loop.  Outputs "
-            "and flag set are evolving — see "
-            "wiki/notes/ffs_fitbasis_changes.md for the current "
-            "behaviour and open questions, especially around "
-            "single-trial validation."
-        ),
+        usage=_USAGE,
+        description=_DESCRIPTION,
+        epilog=_EPILOG,
         formatter_class=_HelpFormatter,
     )
 
-    req = parser.add_argument_group("Required Arguments")
+    # ── STEP 1: the two decisions that scope everything else ───────────
+    # -parametrization used to sit in group 5 of 11, AFTER the -model /
+    # -reg flags it renders inert, so a top-down reader spent their
+    # attention on flags that do not apply to them.  It leads now.
+    step1 = parser.add_argument_group(
+        "STEP 1 — Model and unit of analysis",
+        description=(
+            "The two flags that decide which groups below apply to you.  Read these first."
+        ),
+    )
+    step1.add_argument(
+        "-parametrization",
+        "-parametrisation",
+        dest="parametrization",
+        choices=["linear", "shift"],
+        default="linear",
+        help=(
+            "linear — K basis columns per block, free betas, constrained by "
+            "-reg; estimates amplitude.  shift — one exactly-shifted column "
+            "per block, giving a free amplitude AND a bounded delay in "
+            "seconds; the only path here that recovers latency.  "
+            "-model / -reg are ignored under shift."
+        ),
+    )
+    step1.add_argument(
+        "-single-trials",
+        "-single_trials",
+        dest="single_trials",
+        action="store_true",
+        help=(
+            "Fit one block per TRIAL instead of per condition (both "
+            "parametrisations).  Output is stacked 4-D per condition, time = "
+            "trial number, for 2nd-level analyses across trials."
+        ),
+    )
+
+    req = parser.add_argument_group("Required arguments")
     req.add_argument("-input", nargs="+", required=True, help="Input fMRI run files.")
     req.add_argument("-prefix", required=True, help="Output prefix (e.g. out/sub01_fb).")
 
@@ -162,14 +310,14 @@ def create_parser() -> argparse.ArgumentParser:
         "-durations",
         nargs="+",
         default=None,
-        help="Stimulus durations (s); one per condition (or single value).",
+        help="Stimulus durations (s); one per condition (or single value).  Required with -onsets.",
     )
     onset_grp.add_argument(
         "-events",
         nargs="+",
         default=None,
         metavar="TSV",
-        help="BIDS *_events.tsv files, one per run.",
+        help="BIDS *_events.tsv files, one per run.  Paired with -input BY POSITION, never sorted.",
     )
     # Each event-related flag accepts both hyphen and underscore forms
     # (``-event-cols`` and ``-event_cols``) so muscle memory from AFNI /
@@ -214,16 +362,21 @@ def create_parser() -> argparse.ArgumentParser:
         help="Round event durations to N decimals before grouping.",
     )
 
-    model_grp = parser.add_argument_group("Model + constraint")
+    # ══ LINEAR parametrisation ═════════════════════════════════════════
+    model_grp = parser.add_argument_group(
+        "[linear] Basis set and shape prior",
+        description="Ignored with -parametrization shift.",
+    )
     model_grp.add_argument(
         "-model",
         choices=["SPMG1", "SPMG2", "SPMG3", "FLOBS"],
         default="SPMG2",
         help=(
-            "Basis-set model.  SPMG1=canonical only (no shape variation), "
-            "SPMG2=canonical+temporal derivative, SPMG3=+ dispersion "
-            "derivative, FLOBS=K eigenHRFs from half-cosine samples + "
-            "empirical MVN(m, C) prior."
+            "Basis set.  SPMG1=canonical only; SPMG2=+temporal derivative; "
+            "SPMG3=+dispersion derivative; FLOBS=K eigenHRFs from half-cosine "
+            "samples with an empirical MVN(m, C) prior.  Note SPMG2's "
+            "derivative ratio does NOT give usable latency — use "
+            "-parametrization shift for that."
         ),
     )
     model_grp.add_argument(
@@ -231,189 +384,167 @@ def create_parser() -> argparse.ArgumentParser:
         choices=["none", "ridge", "mvn", "mvn-shape", "cone", "fracridge"],
         default="cone",
         help=(
-            "Regularisation / shape prior:\n"
-            "  none      — plain OLS, no shape constraint (see how it fails);\n"
-            "  ridge     — diagonal generalised ridge with hand-picked weights;\n"
-            "  cone      — DEFAULT.  Scale-invariant shape prior, the "
-            "faithful filmbabe form: β must lie near the ray {s·m} with "
-            "tolerance ∝ s, where s is a free per-block size parameter "
-            "(TR04MW2 §2.4; filmbabe_vb_flobs.cc gam_Beta).  Constrains "
-            "SHAPE only — amplitude is entirely free, and negative BOLD "
-            "keeps its shape and sign.  Use this;\n"
-            "  mvn       — full MVN(m, C) prior with a FIXED mean.  "
-            "BIASED: m comes from peak-normalised HRF samples, so this is "
-            "an amplitude prior in data units — it drags every voxel "
-            "toward peak ≈ 0.8 (true 3.0 → 1.37, true 0.2 → 0.72).  Kept "
-            "for reproducing older runs; prefer -reg cone;\n"
-            "  mvn-shape — amplitude-decoupled prior: constrain only the "
-            "*shape* direction orthogonal to the prior mean; leave "
-            "amplitude unconstrained.  Fixes amplitude over-shrinkage on "
-            "high-SNR voxels.\n"
-            "  fracridge — Rokem & Kay (2020) fractional ridge.  No HRF "
-            "prior at all; instead CV picks the per-voxel fraction of "
-            "||β_OLS|| to keep (-fracs grid).  Bypasses prior tuning "
-            "entirely — let the data decide how much shrinkage each "
-            "voxel needs."
-        ),
-    )
-    model_grp.add_argument(
-        "-single-trials",
-        "-single_trials",
-        dest="single_trials",
-        action="store_true",
-        help=(
-            "Fit one block of basis regressors per TRIAL instead of per "
-            "condition.  Amplitudes / shapes recovered per trial; the "
-            "shape prior is applied independently to each trial's "
-            "coefficient block.  GLMsingle-style output suitable for "
-            "2nd-level analyses across trials."
+            "Shape prior on the basis coefficients.\n"
+            "  cone      DEFAULT.  Scale-invariant: constrains the shape "
+            "DIRECTION of beta only, leaving amplitude entirely free, and "
+            "keeps the sign so negative BOLD survives.  Use this.\n"
+            "  mvn-shape constrains only the shape direction orthogonal to "
+            "the prior mean; amplitude unconstrained.\n"
+            "  fracridge no HRF prior; CV picks each voxel's fraction of "
+            "||beta_OLS|| to keep (see -fracs).\n"
+            "  none      plain OLS, no constraint.\n"
+            "  ridge, mvn  legacy — see the Legacy group at the end."
         ),
     )
 
-    shift_grp = parser.add_argument_group(
-        "Shifted-HRF parametrisation (per-trial latency)",
-        description=(
-            "An alternative MODEL, not another -reg.  Instead of K basis "
-            "columns per block with free betas, each block gets ONE column "
-            "— the HRF shifted exactly — plus a free amplitude and a "
-            "box-bounded delay reported directly in seconds.  This is the "
-            "only path here that recovers per-trial latency: the SPMG2 "
-            "derivative ratio measured r≈0.03 against known truth, this "
-            "measures r≈0.69.  Most -reg values are meaningless under it "
-            "(there are no basis coefficients left to regularise)."
-        ),
+    reg_opts = parser.add_argument_group(
+        "[linear] Prior strength",
+        description="How hard the -reg prior pulls.  Ignored with -reg none.",
     )
-    shift_grp.add_argument(
-        "-parametrization",
-        "-parametrisation",
-        dest="parametrization",
-        choices=["linear", "shift"],
-        default="linear",
+    reg_opts.add_argument(
+        "-prior-weight",
+        "-prior_weight",
+        dest="prior_weight",
+        default="auto",
+        metavar="VALUE",
         help=(
-            "linear (default) — K basis columns per block, free betas, "
-            "constrained by -reg.  shift — one exactly-shifted column per "
-            "block with amplitude + bounded delay."
+            "'auto' uses the Bayesian-optimal weight sigma^2 from an OLS "
+            "pre-pass.  A float multiplies it (2.0 = twice as strong)."
         ),
     )
-    shift_grp.add_argument(
-        "-shift-hrf",
-        "-shift_hrf",
-        dest="shift_hrf",
-        default="canonical",
-        metavar="SOURCE",
+    reg_opts.add_argument(
+        "-lambda-mode",
+        "-lambda_mode",
+        dest="lambda_mode",
+        choices=["global", "voxelwise", "auto"],
+        default="auto",
         help=(
-            "Response shape for -parametrization shift.  'canonical' (SPM), "
-            "'library' / 'glmsingle', or a path to a one-column text file "
-            "sampled at -flobs-dt.  Any shape works — exact shifting needs "
-            "no temporal derivative, so a curve from ffs_hrfopt / "
-            "ffs_librarian drops straight in."
+            "Per-voxel lambda.  auto → voxelwise with -single-trials, global "
+            "otherwise.  voxelwise gives high-SNR voxels less shrinkage; "
+            "costs little (voxels are binned by sigma^2 quantile)."
         ),
     )
-    shift_grp.add_argument(
-        "-shift-shapes",
-        "-shift_shapes",
-        dest="shift_shapes",
-        default=None,
-        metavar="SOURCE",
-        help=(
-            "Select a per-voxel response shape before fitting delays, from "
-            "'library' (20 double-gammas), 'pighs' (half-cosines), "
-            "'flobs' (curves drawn from the empirical FLOBS coefficient "
-            "prior, so every candidate is a shape that prior calls "
-            "sensible), or a path to a custom HRF library TSV (ffs_librarian "
-            "output).  Overrides -shift-hrf; defaults to 'library' when "
-            "-shift-shape-index is given.  Two stages on purpose: "
-            "shape is chosen at zero delay, then delays are fit within "
-            "each shape group — with both free at once a wrong shape can "
-            "masquerade as a delay and neither means what it says.  Cheap, "
-            "because the design bank depends on the shape, not the voxel."
-        ),
-    )
-    shift_grp.add_argument(
-        "-shift-shape-index",
-        "-shift_shape_index",
-        dest="shift_shape_index",
-        default=None,
-        metavar="MAP",
-        help=(
-            "Skip shape selection and take the per-voxel shape from an "
-            "existing HRF index map — sub-brick 0 of "
-            "{prefix}_hrf_index.nii.gz from ffs_hrfopt (1-based indices "
-            "into the HRF library).  -shift-shapes then only supplies the "
-            "curves, and must be the SAME library the indices were fit "
-            "against (default 'library'; pass the ffs_librarian TSV if you "
-            "ran ffs_hrfopt -hrf-library).  Preferred over letting this "
-            "tool pick: ffs_hrfopt selects on cross-validated R² and can "
-            "run on denoised data, where the selection here is in-sample "
-            "at zero delay."
-        ),
-    )
-    shift_grp.add_argument(
-        "-shift-n-shapes",
-        "-shift_n_shapes",
-        dest="shift_n_shapes",
+    reg_opts.add_argument(
+        "-lambda-n-bins",
+        "-lambda_n_bins",
+        dest="lambda_n_bins",
         type=int,
         default=20,
         metavar="N",
-        help="Candidate count for -shift-shapes pighs / flobs (library is fixed at 20).",
+        help="sigma^2 quantile bins for -lambda-mode voxelwise.",
     )
-    shift_grp.add_argument(
-        "-tau-max",
-        "-tau_max",
-        dest="tau_max",
-        type=float,
-        default=2.0,
-        metavar="SECONDS",
+    reg_opts.add_argument(
+        "-fracs",
+        dest="fracs",
+        default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
+        metavar="LIST",
         help=(
-            "Hard bound on the per-block delay.  Set it wide enough to "
-            "contain the real latency spread: truth OUTSIDE the bound does "
-            "not clamp gracefully — the amplitude solve compensates via "
-            "overlapping trials and emits alternating signed amplitudes."
-        ),
-    )
-    shift_grp.add_argument(
-        "-tau-step",
-        "-tau_step",
-        dest="tau_step",
-        type=float,
-        default=0.25,
-        metavar="SECONDS",
-        help="Delay search grid spacing.  Finer costs linearly in the gram table.",
-    )
-    shift_grp.add_argument(
-        "-delay-prior-sd",
-        "-delay_prior_sd",
-        dest="delay_prior_sd",
-        type=float,
-        default=0.75,
-        metavar="SECONDS",
-        help=(
-            "Std of a Gaussian prior shrinking each block's delay toward "
-            "the voxel's own mean delay.  Not optional in spirit: latency "
-            "is chosen by maximising fit, so at low SNR the winning delay "
-            "partly fits noise and inflates amplitude (measured 1.86 vs a "
-            "true 1.0 unshrunk; 1.15 shrunk).  Pass 0 to disable."
-        ),
-    )
-    shift_grp.add_argument(
-        "-shift-sweeps",
-        "-shift_sweeps",
-        dest="shift_sweeps",
-        type=int,
-        default=4,
-        metavar="N",
-        help=(
-            "Coordinate-descent sweeps over blocks (amplitudes re-solved "
-            "after each).  Affects the delay SCALE, not just convergence: "
-            "the prior's centre is re-estimated each sweep, so too few "
-            "sweeps leaves delays compressed toward zero (measured 1.09 / "
-            "1.15 / 1.18 s against a true 1.20 s at 2 / 4 / 8 sweeps).  "
-            "Raise it if absolute delay magnitudes matter to you."
+            "-reg fracridge ONLY.  Comma-separated grid of the fraction of "
+            "||beta_OLS|| to retain (1.0=OLS, →0=max shrinkage); CV picks "
+            "the best per voxel."
         ),
     )
 
-    # FLOBS-specific knobs (each flag accepts hyphen + underscore forms)
-    flobs_opts = parser.add_argument_group("FLOBS Options (-model FLOBS)")
+    noise_opts = parser.add_argument_group(
+        "[linear] Temporal noise model",
+        description="Ignored with -parametrization shift.",
+    )
+    noise_opts.add_argument(
+        "-prewhiten",
+        dest="prewhiten",
+        choices=["none", "arma11", "arma11-voxel"],
+        default="none",
+        help=(
+            "none — i.i.d. white noise.  arma11 — one global ARMA(1,1) via "
+            "REML.  arma11-voxel — per-voxel (a, b) via REML grid search "
+            "(3dREMLfit / filmbabe style), which suppresses the "
+            "trial-to-trial amplitude oscillation autocorrelated noise "
+            "induces.  Not supported with -reg fracridge."
+        ),
+    )
+    noise_opts.add_argument(
+        "-vb-iters",
+        "-vb_iters",
+        dest="vb_iters",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "-prewhiten arma11-voxel ONLY.  Variational-Bayes iterations "
+            "re-estimating (a, b) from the constrained-fit residuals.  0 = "
+            "single pass; 2-3 is the FSL norm and more rarely helps."
+        ),
+    )
+    noise_opts.add_argument(
+        "-vb-tol",
+        "-vb_tol",
+        dest="vb_tol",
+        type=float,
+        default=0.05,
+        metavar="FLOAT",
+        help="Stop the VB loop when median |da|+|db| falls below this.",
+    )
+    noise_opts.add_argument(
+        "-vb-update-prior",
+        dest="vb_update_prior",
+        action="store_true",
+        help=(
+            "Also update the per-voxel prior precision each VB iteration "
+            "(the full filmbabe scheme).  Only meaningful with -reg in "
+            "{ridge, mvn, mvn-shape}."
+        ),
+    )
+
+    st_opts = parser.add_argument_group(
+        "[linear] Single-trial estimator",
+        description="Requires -single-trials.  Ignored with -parametrization shift.",
+    )
+    st_opts.add_argument(
+        "-lss",
+        dest="lss",
+        action="store_true",
+        help=(
+            "Least-Squares-Separate (Mumford 2012 / 3dLSS / GLMsingle 'L') "
+            "instead of all-at-once LSA: one small design per trial, which "
+            "reduces trial-to-trial collinearity at tight ISIs.  Supports "
+            "-reg in {none, ridge, mvn, mvn-shape}; not -reg fracridge, "
+            "-prewhiten arma11-voxel, -vb-iters, or -prior-from."
+        ),
+    )
+    st_opts.add_argument(
+        "-lss-exclude",
+        "-lss_exclude",
+        dest="lss_exclude",
+        nargs="+",
+        default=[],
+        metavar="COND",
+        help=(
+            "Conditions that contribute their summed regressor to every LSS "
+            "design but are not fit per-trial; their betas come from the "
+            "parallel LSA pre-fit."
+        ),
+    )
+    st_opts.add_argument(
+        "-prior-from",
+        "-prior_from",
+        dest="prior_from",
+        choices=["none", "per-condition"],
+        default="none",
+        help=(
+            "per-condition — run a per-condition fit first and use its betas "
+            "as the prior mean for every trial of that condition at that "
+            "voxel (the GLMsingle shrinkage philosophy).  Rejects -reg "
+            "mvn-shape and -reg fracridge."
+        ),
+    )
+
+    flobs_opts = parser.add_argument_group(
+        "[linear] FLOBS basis (-model FLOBS)",
+        description=(
+            "-flobs-dt and -flobs-window also set the HRF sampling grid\n"
+            "for -parametrization shift, despite the name."
+        ),
+    )
     flobs_opts.add_argument(
         "-flobs-n-basis",
         "-flobs_n_basis",
@@ -439,7 +570,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=32.0,
         metavar="SECONDS",
-        help="FLOBS basis duration (s).",
+        help="HRF duration (s).  Used by both parametrisations.",
     )
     flobs_opts.add_argument(
         "-flobs-dt",
@@ -448,7 +579,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         metavar="SECONDS",
-        help="FLOBS basis sample spacing (s).",
+        help="HRF sample spacing (s).  Used by both parametrisations.",
     )
     flobs_opts.add_argument(
         "-flobs-seed",
@@ -459,80 +590,175 @@ def create_parser() -> argparse.ArgumentParser:
         help="Seed for the half-cosine sampler.",
     )
 
-    # SPMG/ridge knobs (used when -reg ridge or -reg mvn with SPMG models)
-    spmg_opts = parser.add_argument_group("SPMG Prior Options (-model SPMG*)")
-    spmg_opts.add_argument(
-        "-canonical-std",
-        "-canonical_std",
-        dest="canonical_std",
-        type=float,
-        default=5.0,
-        help="Prior std on the canonical-amplitude coefficient (weak prior).",
+    # ══ SHIFT parametrisation ══════════════════════════════════════════
+    shape_grp = parser.add_argument_group(
+        "[shift] Response shape",
+        description=(
+            "Requires -parametrization shift.  Exact shifting needs no temporal\n"
+            "derivative, so any curve works — a per-voxel HRF from ffs_hrfopt /\n"
+            "ffs_librarian drops straight in."
+        ),
     )
-    spmg_opts.add_argument(
-        "-derivative-std",
-        "-derivative_std",
-        dest="derivative_std",
-        type=float,
-        default=0.3,
-        help="Prior std on the temporal-derivative coefficient (tight).",
+    shape_grp.add_argument(
+        "-shift-hrf",
+        "-shift_hrf",
+        dest="shift_hrf",
+        default="canonical",
+        metavar="SOURCE",
+        help=(
+            "One shape for all voxels: 'canonical' (SPM), 'library' / "
+            "'glmsingle', or a path to a one-column text file sampled at "
+            "-flobs-dt.  Use this when you want ONE clean absolute delay "
+            "map, since all timing is then forced into the delay."
+        ),
     )
-    spmg_opts.add_argument(
-        "-dispersion-std",
-        "-dispersion_std",
-        dest="dispersion_std",
-        type=float,
-        default=0.2,
-        help="Prior std on the dispersion-derivative coefficient (SPMG3).",
+    shape_grp.add_argument(
+        "-shift-shapes",
+        "-shift_shapes",
+        dest="shift_shapes",
+        default=None,
+        metavar="SOURCE",
+        help=(
+            "Select a per-voxel shape instead, from 'library' (20 "
+            "double-gammas), 'pighs', 'flobs', or a path to a custom HRF "
+            "library TSV.  Overrides -shift-hrf.  WARNING: a library that "
+            "varies peak time competes with the delay parameter (both move "
+            "the response in time), so absolute delay is then NOT separable "
+            "from the selected shape's TTP — read _shift_delay_dev_<cond> "
+            "for per-trial timing and _shift_mean_timing for the total."
+        ),
+    )
+    shape_grp.add_argument(
+        "-shift-shape-index",
+        "-shift_shape_index",
+        dest="shift_shape_index",
+        default=None,
+        metavar="MAP",
+        help=(
+            "Take the per-voxel shape from an existing map instead of "
+            "selecting it here — sub-brick 0 of {prefix}_hrf_index.nii.gz "
+            "from ffs_hrfopt (1-based).  Preferred: ffs_hrfopt selects on "
+            "cross-validated R².  -shift-shapes must then name the SAME "
+            "library the indices were fit against (default 'library'); "
+            "nothing can detect a mismatch beyond the index range."
+        ),
+    )
+    shape_grp.add_argument(
+        "-shift-n-shapes",
+        "-shift_n_shapes",
+        dest="shift_n_shapes",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Candidate count for -shift-shapes pighs / flobs (library is fixed at 20).",
     )
 
-    # Cross-validation
-    cv_opts = parser.add_argument_group("Cross-validation (regularization sanity check)")
+    delay_grp = parser.add_argument_group(
+        "[shift] Delay search",
+        description="Requires -parametrization shift.",
+    )
+    delay_grp.add_argument(
+        "-tau-max",
+        "-tau_max",
+        dest="tau_max",
+        type=float,
+        default=2.0,
+        metavar="SECONDS",
+        help=(
+            "Hard bound on the per-block delay.  Set it wide enough to "
+            "contain the real spread: truth OUTSIDE the bound does NOT clamp "
+            "gracefully — the amplitude solve compensates through "
+            "overlapping trials and emits alternating signed amplitudes."
+        ),
+    )
+    delay_grp.add_argument(
+        "-tau-step",
+        "-tau_step",
+        dest="tau_step",
+        type=float,
+        default=0.25,
+        metavar="SECONDS",
+        help="Delay grid spacing.  Costs linearly in the gram table.",
+    )
+    delay_grp.add_argument(
+        "-delay-prior-sd",
+        "-delay_prior_sd",
+        dest="delay_prior_sd",
+        type=float,
+        default=0.75,
+        metavar="SECONDS",
+        help=(
+            "Std of a Gaussian prior shrinking each block's delay toward the "
+            "voxel's OWN mean delay (not toward zero, which would bias every "
+            "genuine delay).  Keep it on: delay is chosen by maximising fit, "
+            "so at low SNR the winner partly fits noise and inflates "
+            "amplitude with it.  Pass 0 to disable."
+        ),
+    )
+    delay_grp.add_argument(
+        "-amp-ridge",
+        "-amp_ridge",
+        dest="amp_ridge",
+        default="auto",
+        metavar="auto|FRAC",
+        help=(
+            "Ridge on the per-trial amplitude solve.  Keep it on: the delay "
+            "search is free to slide two overlapping trials into "
+            "near-coincidence, which improves in-sample fit via a "
+            "(+huge, -huge) amplitude pair.  Measured on a 192-trial "
+            "2.05s-ISI design, cond(XtX) is 61.7 at delay=0 but 1.1e5 at the "
+            "fitted delays.\n"
+            "  auto (DEFAULT) — per-voxel empirical Bayes, λ_v = σ²_v/τ²_v, "
+            "with τ² by method of moments off the delay=0 fit.  σ² spans "
+            "orders of magnitude across a brain, so no single fixed value "
+            "suits both high- and low-SNR voxels; measured better than every "
+            "fixed value at BOTH extremes.  Costs nothing — σ² is already "
+            "computed for the delay prior.  Emits a λ diagnostic map.\n"
+            "  FRAC — a fixed factor relative to mean(diag(XtX)).  Amplitude "
+            "recovery vs known truth: 0.58 at 1e-8 (off), 0.74 at 1e-3, 0.68 "
+            "at 3e-2, against 0.69 for not fitting latency at all — so with "
+            "this off the delays cost more than they buy.  Above ~1e-2 "
+            "amplitudes shrink and delay recovery collapses.\n"
+            "  0 — off (numerical floor only), the pre-fix behaviour."
+        ),
+    )
+    delay_grp.add_argument(
+        "-shift-sweeps",
+        "-shift_sweeps",
+        dest="shift_sweeps",
+        type=int,
+        default=4,
+        metavar="N",
+        help=(
+            "Coordinate-descent sweeps over blocks.  Affects the delay "
+            "SCALE, not just convergence — the prior's centre is "
+            "re-estimated each sweep, so too few leaves delays compressed "
+            "toward zero.  Raise it if absolute magnitudes matter."
+        ),
+    )
+
+    # ══ Both parametrisations ══════════════════════════════════════════
+    cv_opts = parser.add_argument_group(
+        "Validation",
+        description=(
+            "In-sample R² does not identify task-responsive voxels, and the\n"
+            "in-sample latency gain does not show latency is real — free\n"
+            "parameters buy in-sample fit regardless.  These are the maps that\n"
+            "answer those questions."
+        ),
+    )
     cv_opts.add_argument(
         "-xval-r2",
         "-xval_r2",
         dest="xval_r2",
         action="store_true",
         help=(
-            "Emit a per-voxel **held-out R² volume** (LORO) for the "
-            "user's chosen -reg / -prior-weight config.  Writes "
-            "<prefix>_fitbasis_xvalr2.nii.gz alongside the in-sample "
-            "<prefix>_fitbasis_r2.nii.gz.\n"
-            "  Per-condition mode: standard LORO — fit on N−1 runs, "
-            "predict held-out run with the per-condition task betas.\n"
-            "  Single-trial mode: train fits single-trial on N−1 runs, "
-            "averages within-condition trial betas, predicts the "
-            "held-out run with the per-condition design.  Catches the "
-            "case where single-trial estimates collectively fail to "
-            "capture the per-condition response (oscillation around "
-            "the mean, runaway shrinkage, etc.).\n"
-            "  Skips ARMA prewhitening / VB iteration inside the xval "
-            "for speed."
+            "Emit held-out (LORO) R².  Both parametrisations.  Under shift "
+            "it also writes _xvalr2_tau0 and _xvalr2_delay_gain — the latter "
+            "is the map that says whether the delays are real (>0 = yes).  "
+            "Single-trial mode scores condition-level generalisation, since "
+            "per-trial parameters cannot predict a held-out run."
         ),
-    )
-    cv_opts.add_argument(
-        "-cv-runs",
-        "-cv_runs",
-        dest="cv_runs",
-        action="store_true",
-        help=(
-            "Run LORO cross-validation over a grid of prior-weight "
-            "multipliers (+ OLS baseline) and emit per-voxel held-out "
-            "R² maps.  Use this to validate that the constraint is "
-            "actually helping rather than over-shrinking amplitudes.  "
-            "Adds two output files: <prefix>_fitbasis_cv_r2.tsv "
-            "(median R² per weight) and <prefix>_fitbasis_cv_r2_per_weight"
-            ".nii.gz (4-D, one volume per weight).  Also emits "
-            "<prefix>_fitbasis_cv_argmax.nii.gz (3-D, per-voxel best weight)."
-        ),
-    )
-    cv_opts.add_argument(
-        "-cv-grid",
-        "-cv_grid",
-        dest="cv_grid",
-        default="0.1,0.3,1.0,3.0,10.0",
-        metavar="W1,W2,...",
-        help="Comma-separated grid of prior-weight multipliers to evaluate.",
     )
     cv_opts.add_argument(
         "-cv-leave-n-out",
@@ -541,206 +767,71 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         metavar="N",
-        help="Number of runs left out per CV fold (1 = LORO).",
+        help="Runs left out per fold (1 = LORO).  Both parametrisations.",
     )
-
-    # Constraint strength
-    reg_opts = parser.add_argument_group("Constraint strength")
-    reg_opts.add_argument(
-        "-lambda-mode",
-        "-lambda_mode",
-        dest="lambda_mode",
-        choices=["global", "voxelwise", "auto"],
-        default="auto",
-        help=(
-            "How λ is set per voxel.  ``auto`` (default): voxelwise "
-            "when -single-trials is set (per-trial DOF is too low to "
-            "tolerate a global λ at 9.4T-style SNR variation), global "
-            "otherwise.  ``global``: one scalar λ for every voxel "
-            "from σ²_mean across the brain mask.  ``voxelwise``: "
-            "per-voxel λ_v = σ²_v from that voxel's own OLS residual "
-            "variance — Bayesian-honest at the voxel scale (high-SNR "
-            "voxels get less shrinkage, low-SNR more).  Implementation "
-            "bins voxels by σ² quantile (-lambda-n-bins, default 20) "
-            "and Cholesky-factors one matrix per bin; negligible "
-            "extra cost."
-        ),
-    )
-    reg_opts.add_argument(
-        "-lambda-n-bins",
-        "-lambda_n_bins",
-        dest="lambda_n_bins",
-        type=int,
-        default=20,
-        metavar="N",
-        help="σ² quantile bins for -lambda-mode voxelwise.",
-    )
-    reg_opts.add_argument(
-        "-prior-weight",
-        "-prior_weight",
-        dest="prior_weight",
-        default="auto",
-        metavar="VALUE",
-        help=(
-            "Strength of the shape prior.  'auto' uses the Bayesian-"
-            "optimal weight σ² (estimated from an OLS pre-pass).  A "
-            "float overrides as a multiplier on σ² (e.g. 2.0 = twice "
-            "as strong).  Ignored when -reg none."
-        ),
-    )
-    reg_opts.add_argument(
-        "-prewhiten",
-        dest="prewhiten",
-        choices=["none", "arma11", "arma11-voxel"],
-        default="none",
-        help=(
-            "Temporal-noise model.  ``none`` (default): i.i.d. white "
-            "noise (standard OLS / ridge / fracridge assumption).  "
-            "``arma11``: single global ARMA(1,1) (a, b) estimated "
-            "from the OLS-residual mean timeseries via REML grid "
-            "search; prewhiten data + design per run before fitting. "
-            "``arma11-voxel``: per-voxel (a, b) via REML grid search "
-            "(AFNI 3dREMLfit / FSL filmbabe-style noise model); bin "
-            "voxels by grid cell, apply each cell's Cholesky factor, "
-            "and run the constrained fit per cell.  Suppresses the "
-            "trial-to-trial amplitude oscillation that autocorrelated "
-            "noise induces.  Not yet supported with -reg fracridge."
-        ),
-    )
-    reg_opts.add_argument(
-        "-vb-iters",
-        "-vb_iters",
-        dest="vb_iters",
-        type=int,
-        default=0,
-        metavar="N",
-        help=(
-            "Variational-Bayes iteration count for -prewhiten arma11-voxel "
-            "(FSL filmbabe-style loop, TR04MW2 §3).  ``0`` (default) runs "
-            "the single-pass per-voxel ARMA path.  ``N >= 1`` re-estimates "
-            "(a, b) from the current constrained-fit residuals and re-fits, "
-            "stopping early when the median |Δ(a, b)| < -vb-tol or N is "
-            "reached.  2-3 iterations is the FSL norm; more rarely helps."
-        ),
-    )
-    reg_opts.add_argument(
-        "-vb-tol",
-        "-vb_tol",
-        dest="vb_tol",
-        type=float,
-        default=0.05,
-        metavar="FLOAT",
-        help=(
-            "Convergence threshold on median |Δa| + |Δb| across voxels "
-            "between successive VB iterations.  Default 0.05 (one grid "
-            "step in a; tighter values rarely change the final β)."
-        ),
-    )
-    reg_opts.add_argument(
-        "-lss",
-        dest="lss",
+    cv_opts.add_argument(
+        "-cv-runs",
+        "-cv_runs",
+        dest="cv_runs",
         action="store_true",
         help=(
-            "Least-Squares-Separate single-trial estimator (Mumford 2012, "
-            "also AFNI 3dLSS / GLMsingle 'L'-mode).  For each trial, fit a "
-            "small design with cols [trial_t | rest_of_cond_c | "
-            "per_other_cond] — the shape prior penalises only the "
-            "current trial's K cols; the rest are nuisance.  Reduces "
-            "trial-to-trial collinearity that the all-at-once LSA path "
-            "suffers from with tightly-packed trials.  Requires "
-            "-single-trials.  Currently supports -reg in {none, ridge, "
-            "mvn, mvn-shape}.  Composes with -prewhiten arma11 (global) "
-            "and -xval-r2; deferred for -prewhiten arma11-voxel, "
-            "-vb-iters, -prior-from per-condition, -reg fracridge."
+            "[linear] Sweep -prior-weight over a grid with LORO and emit "
+            "per-voxel held-out R² per weight, plus a per-voxel argmax map.  "
+            "Use it to check the constraint helps rather than over-shrinks."
         ),
     )
-    reg_opts.add_argument(
-        "-lss-exclude",
-        "-lss_exclude",
-        dest="lss_exclude",
-        nargs="+",
-        default=[],
-        metavar="COND",
-        help=(
-            "Conditions to exclude from LSS — they contribute their "
-            "summed regressor to every LSS design but are not fit "
-            "per-trial.  These conditions' main betas come from the "
-            "parallel LSA pre-fit.  Useful when only certain conditions "
-            "need trial-level estimates."
-        ),
-    )
-    reg_opts.add_argument(
-        "-prior-from",
-        "-prior_from",
-        dest="prior_from",
-        choices=["none", "per-condition"],
-        default="none",
-        help=(
-            "Empirical-Bayes source for the per-voxel prior mean.  "
-            "``none`` (default): use the model's default prior mean "
-            "(zero for SPMG, the empirical FLOBS mean for FLOBS).  "
-            "``per-condition``: run a plain per-condition constrained "
-            "fit first, take the resulting (n_vox, n_cond, K) betas, "
-            "and use them as the prior mean for *every trial of that "
-            "condition at that voxel* in the subsequent single-trial "
-            "fit.  This is the GLMsingle / LSS shrinkage philosophy: "
-            "anchor trial estimates to the condition average, let "
-            "deviations only emerge where the data demands them.  "
-            "Requires -single-trials; rejects -reg mvn-shape and "
-            "fracridge (rotation / CV-loop incompatibilities)."
-        ),
-    )
-    reg_opts.add_argument(
-        "-vb-update-prior",
-        dest="vb_update_prior",
-        action="store_true",
-        help=(
-            "Inside the VB loop, also update the per-voxel prior "
-            "precision β_size each iteration (TR04MW2 §3, gamma "
-            "posterior).  Without this flag the loop only updates "
-            "(a, b); with it the loop updates (a, b) AND β_size, "
-            "matching the full filmbabe VB scheme.  Only meaningful "
-            "with -reg in {ridge, mvn, mvn-shape} since fracridge "
-            "and none have no prior precision to update."
-        ),
-    )
-    reg_opts.add_argument(
-        "-fracs",
-        dest="fracs",
-        default="0.1,0.2,0.3,0.4,0.5,0.6,0.7,0.8,0.9,1.0",
-        metavar="LIST",
-        help=(
-            "Comma-separated frac grid for -reg fracridge.  Each frac "
-            "is the fraction of ||β_OLS|| to retain (1.0=OLS, →0=max "
-            "shrinkage).  CV picks the best per voxel.  Default 0.1…1.0 "
-            "by 0.1."
-        ),
+    cv_opts.add_argument(
+        "-cv-grid",
+        "-cv_grid",
+        dest="cv_grid",
+        default="0.1,0.3,1.0,3.0,10.0",
+        metavar="W1,W2,...",
+        help="[linear] Prior-weight multipliers for -cv-runs.",
     )
 
-    # Processing
     proc = parser.add_argument_group("Processing")
     proc.add_argument(
         "-tr", type=float, default=None, help="TR in seconds; read from header if omitted."
     )
     proc.add_argument("-mask", default=None, help="Brain mask NIfTI.")
     proc.add_argument(
+        "-atlas",
+        default=None,
+        metavar="LABELS",
+        help=(
+            "Integer label volume, aligned to -input.  Averages each parcel's "
+            "voxel timeseries and fits ONE timeseries per parcel instead of "
+            "one per voxel.  Averaging BEFORE the fit (not after) is the "
+            "point: the delay search itself sees the sqrt(N)-cleaner signal, "
+            "rather than smoothing noisy per-voxel estimates afterwards.  "
+            "Results are painted back into every voxel of their parcel, so "
+            "all the usual maps still come out, plus a per-parcel TSV.  "
+            "Turns a 292k-voxel fit into a few hundred rows, so sweeps over "
+            "-tau-max / -delay-prior-sd become interactive.  Currently "
+            "-parametrization shift only."
+        ),
+    )
+    proc.add_argument(
+        "-do_blur",
+        "-do-blur",
+        dest="do_blur",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help=(
+            "3-D Gaussian spatial smoothing, FWHM in mm, applied BEFORE masking "
+            "so edges do not bleed.  Typical 4-8 mm.  Raises SNR everywhere at "
+            "the cost of spatial specificity — for a targeted question prefer "
+            "-atlas, which buys the same averaging inside regions you chose."
+        ),
+    )
+    proc.add_argument(
         "-polort",
         type=int,
         default=None,
-        help="Polynomial drift order (per run).  None → auto via run duration.",
+        help="Per-run polynomial drift order.  None → auto from run duration.",
     )
     add_device_arg(proc, default="auto")
-
-    nuis_grp = parser.add_argument_group(
-        "External nuisance regressors",
-        description=(
-            "Motion, physio, or denoising components (e.g. ffs_denoise / "
-            "ffs_denoisatorial PC timeseries).  Columns join the per-run "
-            "polynomial block-diagonal, so they stay run-specific, and are "
-            "projected out alongside drift before the amplitudes are read."
-        ),
-    )
-    add_ortvec_arguments(nuis_grp)
     proc.add_argument(
         "-debug-design",
         "-debug_design",
@@ -752,8 +843,21 @@ def create_parser() -> argparse.ArgumentParser:
     add_trim_args(proc)
     add_verbose_arg(proc, default=1)
 
-    # I/O extras
-    out = parser.add_argument_group("Output")
+    nuis_grp = parser.add_argument_group(
+        "External nuisance regressors",
+        description=(
+            "Motion, physio, or denoising components (ffs_denoise /\n"
+            "ffs_denoisatorial PC timeseries).  Columns join the per-run\n"
+            "polynomial block-diagonal, so they stay run-specific, and are\n"
+            "projected out before the amplitudes are read."
+        ),
+    )
+    add_ortvec_arguments(nuis_grp)
+
+    out = parser.add_argument_group(
+        "Output",
+        description="iresp applies to -parametrization linear only.",
+    )
     # iresp save defaults differ by mode:
     #   per-condition:  ON  (small tensor, useful for inspection)
     #   single-trial:   OFF (typically tens of GB; explicit opt-in)
@@ -767,10 +871,9 @@ def create_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "Force-save reconstructed per-block HRF as 4-D iresp NIfTI. "
-            "Default: ON for per-condition fits (small), OFF for "
-            "single-trial fits (typically tens of GB).  Pass this "
-            "flag to force it on in single-trial mode."
+            "Force-save the reconstructed per-block HRF as a 4-D iresp "
+            "NIfTI.  Default ON per-condition (small), OFF per-trial "
+            "(typically tens of GB)."
         ),
     )
     out.add_argument(
@@ -788,14 +891,59 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SECONDS",
         help=(
-            "Time-axis resolution (s) for saved iresp NIfTIs.  Default: "
-            "TR.  The internal basis stays at -flobs-dt (default 0.1 s) "
-            "for accurate amplitude computation; only the SAVED iresp "
-            "is resampled.  Coarser values shrink iresp files by the "
-            "ratio (typically 10-20×) — there's no reason to ship fMRI "
-            "data sampled at 10 ms on a 1.5 s TR.  Pass an explicit "
-            "value like 0.5 for sub-TR HRF inspection."
+            "Time resolution (s) of SAVED iresp NIfTIs; default TR.  The "
+            "internal basis stays at -flobs-dt for amplitude accuracy, so "
+            "this only shrinks the files (typically 10-20x)."
         ),
+    )
+
+    # ══ Legacy ═════════════════════════════════════════════════════════
+    legacy = parser.add_argument_group(
+        "Legacy — kept for reproducing older runs",
+        description=(
+            "These still work and are unchanged; they are collected here\n"
+            "because something measured better has superseded each.\n"
+            "\n"
+            "  -reg mvn    An amplitude prior in data units, not a shape\n"
+            "              prior: its mean comes from peak-normalised HRFs,\n"
+            "              so it drags every voxel toward peak ~0.8\n"
+            "              (measured: true 3.0 → 1.37, true 0.2 → 0.72).\n"
+            "              This affected per-condition fits too.  Superseded\n"
+            "              by -reg cone, which constrains shape only.\n"
+            "  -reg ridge  Diagonal generalised ridge with hand-picked\n"
+            "              weights.  Transparent, but -reg cone is the\n"
+            "              principled form."
+        ),
+    )
+    legacy.add_argument(
+        "-canonical-std",
+        "-canonical_std",
+        dest="canonical_std",
+        type=float,
+        default=5.0,
+        help="Prior std on the canonical coefficient.  -reg ridge/mvn with -model SPMG* only.",
+    )
+    legacy.add_argument(
+        "-derivative-std",
+        "-derivative_std",
+        dest="derivative_std",
+        type=float,
+        default=0.3,
+        help=(
+            "Prior std on the temporal-derivative coefficient.  -reg "
+            "ridge/mvn with -model SPMG* only.  Tuning this for LATENCY is "
+            "futile — there is no valid operating point (left free the "
+            "derivative ratio runs to ±5 s; tightened it collapses to "
+            "±0.15 s and carries nothing).  Use -parametrization shift."
+        ),
+    )
+    legacy.add_argument(
+        "-dispersion-std",
+        "-dispersion_std",
+        dest="dispersion_std",
+        type=float,
+        default=0.2,
+        help="Prior std on the dispersion coefficient.  -reg ridge/mvn with -model SPMG3 only.",
     )
 
     return parser
@@ -1030,6 +1178,8 @@ def _run_shift_mode(
     device: torch.device,
     nii_ext: str,
     extra_regs_per_run: list[torch.Tensor] | None = None,
+    parcel_of_voxel: np.ndarray | None = None,
+    parcel_labels: list[int] | None = None,
 ) -> int:
     """-parametrization shift: per-block amplitude + bounded latency.
 
@@ -1136,6 +1286,7 @@ def _run_shift_mode(
     print(
         f"  Delay search: ±{args.tau_max}s step {args.tau_step}s"
         f"{f', prior sd {args.delay_prior_sd}s' if args.delay_prior_sd else ', no prior'}"
+        f", amp ridge {args.amp_ridge if isinstance(args.amp_ridge, str) else f'{args.amp_ridge:g}'}"
     )
 
     per_run_data = [
@@ -1194,6 +1345,7 @@ def _run_shift_mode(
             run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
+            amp_ridge=args.amp_ridge,
             device=device,
             verbose=True,
         )
@@ -1210,6 +1362,7 @@ def _run_shift_mode(
             run_bounds=run_bounds,
             n_sweeps=args.shift_sweeps,
             delay_prior_sd=args.delay_prior_sd,
+            amp_ridge=args.amp_ridge,
             device=device,
             verbose=True,
         )
@@ -1220,6 +1373,14 @@ def _run_shift_mode(
     nx, ny, nz = volume_shape
 
     def _to_volume(masked: np.ndarray) -> np.ndarray:
+        # With -atlas the rows are parcels, not voxels: paint each parcel's
+        # value into every voxel that belongs to it.  Voxels the atlas did not
+        # label stay zero.
+        if parcel_of_voxel is not None:
+            ok = parcel_of_voxel >= 0
+            painted = np.zeros((parcel_of_voxel.size,) + tuple(masked.shape[1:]), dtype=np.float32)
+            painted[ok] = masked[parcel_of_voxel[ok]]
+            masked = painted
         out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
         out = np.zeros(out_shape, dtype=np.float32)
         if mask is not None:
@@ -1228,10 +1389,38 @@ def _run_shift_mode(
             out = masked.reshape(out_shape)
         return out
 
+    if parcel_of_voxel is not None and parcel_labels:
+        # The parcel-level numbers are the actual estimates; the painted maps
+        # are a convenience view of them.  Ship them as a table too.
+        tsv = f"{args.prefix}_fitbasis_shift_parcels.tsv"
+        hdr = ["label", "n_voxels", "r2", "r2_tau0", "fstat", "amp_lambda", "mean_delay"]
+        rows = []
+        for i, lab in enumerate(parcel_labels):
+            rows.append(
+                [
+                    lab,
+                    int((parcel_of_voxel == i).sum()),
+                    float(fit.r2[i]),
+                    float(fit.r2_fixed[i]),
+                    float(fit.fstat[i]),
+                    float(fit.amp_lambda[i]),
+                    float(fit.delays[i].mean()),
+                ]
+            )
+        with open(tsv, "w") as fh:
+            fh.write("\t".join(hdr) + "\n")
+            for r in rows:
+                fh.write(
+                    "\t".join(f"{v:.6g}" if isinstance(v, float) else str(v) for v in r) + "\n"
+                )
+        print(f"  Wrote {tsv}  ({len(rows)} parcels)")
+
     for arr, name in (
         (fit.r2, "r2"),
         (fit.r2_fixed, "r2_tau0"),
         (fit.r2_total, "r2_incl_drift"),
+        (fit.fstat, "fstat"),
+        (fit.amp_lambda, "amp_lambda"),
     ):
         path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
         with spinner(f"Writing {Path(path).name}"):
@@ -1344,6 +1533,7 @@ def _run_shift_mode(
                 tau_max=args.tau_max,
                 tau_step=args.tau_step,
                 delay_prior_sd=args.delay_prior_sd,
+                amp_ridge=args.amp_ridge,
                 n_sweeps=args.shift_sweeps,
                 leave_n_out=args.cv_leave_n_out,
                 device=device,
@@ -1384,11 +1574,14 @@ def _run_shift_mode(
         "tau_max": float(args.tau_max),
         "tau_step": float(args.tau_step),
         "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),
+        "amp_ridge": (args.amp_ridge if isinstance(args.amp_ridge, str) else float(args.amp_ridge)),
+        "fstat_df": list(fit.fstat_df),
         "n_sweeps": int(fit.n_sweeps),
         "single_trials": bool(args.single_trials),
         "n_blocks": len(block_onsets),
         "condition_labels": list(condition_labels),
         "polort": int(polort),
+        "blur_fwhm": args.do_blur,
         "r2_median_task_relative": float(np.median(fit.r2)),
         "r2_tau0_median": float(np.median(fit.r2_fixed)),
         "r2_median_incl_drift": float(np.median(fit.r2_total)),
@@ -1411,6 +1604,19 @@ def main() -> int:
 
     if getattr(args, "delay_prior_sd", None) is not None and args.delay_prior_sd <= 0:
         args.delay_prior_sd = None
+
+    if isinstance(getattr(args, "amp_ridge", None), str):
+        if args.amp_ridge.strip().lower() == "auto":
+            args.amp_ridge = "auto"
+        else:
+            try:
+                args.amp_ridge = float(args.amp_ridge)
+            except ValueError:
+                print(
+                    f"ERROR: -amp-ridge must be 'auto' or a number; got {args.amp_ridge!r}",
+                    file=sys.stderr,
+                )
+                return 1
 
     if args.shift_shape_index and args.parametrization != "shift":
         print(
@@ -1489,7 +1695,7 @@ def main() -> int:
         input_files=input_files,
         tr=args.tr,
         mask_file=args.mask,
-        blur_fwhm=None,
+        blur_fwhm=args.do_blur,
         do_scale=True,
         device=device,
         force_cpu=True,
@@ -1526,6 +1732,58 @@ def main() -> int:
         print(f"  Rounded onsets to nearest TR (threshold={args.round_onsets:.2f}).")
 
     print(f"  Data: {n_voxels:,} voxels × {n_timepoints} TR ({n_runs} runs, TR={tr}s)")
+
+    # ── Optional parcellation ──────────────────────────────────────
+    # Collapse to one timeseries per atlas label BEFORE fitting.  Everything
+    # downstream then works on parcels; ``parcel_of_voxel`` paints the results
+    # back so the output maps keep their usual voxel geometry.
+    parcel_of_voxel: np.ndarray | None = None
+    parcel_labels: list[int] = []
+    if args.atlas:
+        if args.parametrization != "shift":
+            print(
+                "ERROR: -atlas is currently implemented for -parametrization shift only.",
+                file=sys.stderr,
+            )
+            return 1
+        from fastfuncstuff.io.afni import load_nifti
+
+        atlas_img = load_nifti(args.atlas)
+        atlas = np.asarray(atlas_img.dataobj)
+        if atlas.shape[:3] != tuple(volume_shape):
+            print(
+                f"ERROR: -atlas shape {atlas.shape[:3]} does not match the "
+                f"input grid {tuple(volume_shape)}.  Resample it first "
+                f"(ffs_util_resample).",
+                file=sys.stderr,
+            )
+            return 1
+        lab_v = (atlas[mask] if mask is not None else atlas.reshape(-1)).astype(np.int64)
+        parcel_labels = [int(x) for x in np.unique(lab_v) if x > 0]
+        if not parcel_labels:
+            print("ERROR: -atlas contains no positive labels inside the mask.", file=sys.stderr)
+            return 1
+        lut = {lab: i for i, lab in enumerate(parcel_labels)}
+        parcel_of_voxel = np.full(lab_v.shape, -1, dtype=np.int64)
+        for lab, i in lut.items():
+            parcel_of_voxel[lab_v == lab] = i
+        pdata = torch.zeros((len(parcel_labels), data.shape[1]), dtype=data.dtype)
+        counts = []
+        for i in range(len(parcel_labels)):
+            sel = parcel_of_voxel == i
+            counts.append(int(sel.sum()))
+            pdata[i] = data[torch.from_numpy(np.flatnonzero(sel))].mean(dim=0)
+        data = pdata
+        print(
+            f"  Atlas: {len(parcel_labels)} parcel(s) from {args.atlas} — "
+            f"{int((parcel_of_voxel >= 0).sum()):,}/{n_voxels:,} masked voxels assigned, "
+            f"median parcel {int(np.median(counts))} voxels"
+        )
+        print(
+            "  Fitting one timeseries PER PARCEL; maps are painted back into "
+            "every voxel of their parcel."
+        )
+        n_voxels = data.shape[0]
 
     # ── Build basis + prior ────────────────────────────────────────
     # Resolve -lambda-mode auto: voxelwise for single-trial fits
@@ -1694,6 +1952,8 @@ def main() -> int:
             device=device,
             nii_ext=nii_ext,
             extra_regs_per_run=extra_regs_per_run,
+            parcel_of_voxel=parcel_of_voxel,
+            parcel_labels=parcel_labels,
         )
 
     # Build per-run design with K basis cols per block
