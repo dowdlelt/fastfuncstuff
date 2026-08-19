@@ -548,10 +548,14 @@ Examples:
     add_deterministic_arg(hw_group)
     hw_group.add_argument(
         "-optimizer",
-        choices=("adam", "pattern", "cmaes"),
-        default="cmaes",
-        help="Refinement optimizer (default cmaes). 'adam' is autograd + Adam, "
-        "the previous default. 'pattern' is a "
+        choices=("auto", "adam", "pattern", "cmaes"),
+        default="auto",
+        help="Refinement optimizer. 'auto' (default) picks per stage: CMA-ES "
+        "while the cost evaluation is launch-bound (small/subsampled problems, "
+        "where its population is free and it is ~4.7x faster), Adam once a "
+        "generation's work -- points x trials x population -- would be real "
+        "compute (big volumes with many trials, where CMA-ES is ~2x slower). "
+        "'adam' is autograd + Adam. 'pattern' is a "
         "batched derivative-free coordinate search. 'cmaes' is batched CMA-ES, "
         "which additionally adapts a covariance and so follows the correlated "
         "rotation/translation valley that defeats a coordinate stencil. Both "

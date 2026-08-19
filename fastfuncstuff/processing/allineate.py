@@ -116,13 +116,9 @@ class AffineAlignConfig:
     # blok cost) to cut per-iteration kernel-launch overhead. Also enabled by the
     # FFS_ALLINEATE_COMPILE=1 environment variable.
     compile: bool = False
-    # "cmaes" = batched CMA-ES (default), "adam" = autograd + Adam (the previous
-    # default, kept as an escape hatch), "pattern" = batched coordinate search.
-    # See _refine_cmaes_batched for the measurements that pick CMA-ES: the batch
-    # dimension is nearly free while sequential steps are not, the gradient is
-    # unreliable at the scale the search finishes, and the improving direction is
-    # rarely axis-aligned.
-    optimizer: str = "cmaes"
+    # "auto" (default) picks per stage, see _pick_optimizer. "cmaes" = batched
+    # CMA-ES, "adam" = autograd + Adam, "pattern" = batched coordinate search.
+    optimizer: str = "auto"
 
     # Coarse search. Ranges mirror 3dAllineate's defaults: angle ±30°,
     # shift ±32% of grid size, scale ±20%. ``range_scale`` shrinks all of them
@@ -1432,6 +1428,33 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
     return fn
 
 
+# CMA-ES's population is free only while the cost evaluation is launch-bound.
+# Past that it is a straight multiplier on real work and Adam, which evaluates one
+# candidate per step, wins. The deciding quantity is the work in one generation:
+# (match points) x (trials) x (population). Measured on anat->MNI (903,700 points,
+# affine, population 19) by sweeping -tbest, which varies only the trial count:
+#
+#   trials   work    adam     cmaes
+#        2    34M   26.27s   20.23s   <- CMA-ES
+#        4    69M   26.79s   21.95s   <- CMA-ES
+#        6   103M   21.78s   29.44s   <- Adam
+#       11   189M   23.08s   40.80s   <- Adam
+#
+# So the crossover sits between 69M and 103M. Note this is checked PER STAGE, and
+# it has to be: twopass explores wide (many trials) and then refines (the trials
+# are deduplicated between resolution stages), so a single alignment legitimately
+# wants Adam for its first stage and CMA-ES for its second.
+_BATCH_FREE_WORK = 8.5e7
+
+
+def _pick_optimizer(requested: str, n_points: int, n_trials: int, n_free: int) -> str:
+    """Resolve ``-optimizer auto`` for one refinement stage."""
+    if requested != "auto":
+        return requested
+    lam = max(8, 4 + int(3 * math.log(max(n_free, 2))) + 8)
+    return "cmaes" if n_points * n_trials * lam <= _BATCH_FREE_WORK else "adam"
+
+
 def _refine_cmaes_batched(
     init_params_phys_list: list[np.ndarray],
     config: AffineAlignConfig,
@@ -2130,7 +2153,15 @@ def _refine_progressive(
             bcost = _batched_sampled_cost(
                 source_s, sample.points_xyz, base_pts, sample.weight_s, blokset_s, ctx
             )
-            if config.optimizer == "cmaes":
+            stage_opt = _pick_optimizer(
+                config.optimizer,
+                sample.idx_flat.numel(),
+                len(trials),
+                int(_get_free_mask(config.dof).sum()),
+            )
+            if verb >= 2:
+                print(f"    optimizer={stage_opt} ({len(trials)} trials)")
+            if stage_opt == "cmaes":
                 # Stage-aware search scale. A stage blurred to sigma_vox cannot
                 # see structure finer than its blur, so converging the parameters
                 # tighter than that is pure waste -- and it was most of the cost:
@@ -2151,7 +2182,7 @@ def _refine_progressive(
                     sigma_min=2e-4 * (1.0 + 8.0 * sigma_vox),
                     state=cma_state,
                 )
-            elif config.optimizer == "pattern":
+            elif stage_opt == "pattern":
                 out_phys, out_costs = _refine_pattern_batched(
                     [p for _, p in trials],
                     config,
