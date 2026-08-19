@@ -699,20 +699,27 @@ def create_parser() -> argparse.ArgumentParser:
         "-amp-ridge",
         "-amp_ridge",
         dest="amp_ridge",
-        type=float,
-        default=1e-3,
-        metavar="FRAC",
+        default="auto",
+        metavar="auto|FRAC",
         help=(
-            "Ridge on the per-trial amplitude solve, relative to "
-            "mean(diag(XtX)).  Keep it on: the delay search is free to slide "
-            "two overlapping trials into near-coincidence, which improves "
-            "in-sample fit via a (+huge, -huge) amplitude pair.  Measured on "
-            "a 192-trial 2.05s-ISI design, cond(XtX) is 61.7 at delay=0 but "
-            "1.1e5 at the fitted delays.  Amplitude recovery vs known truth: "
-            "0.58 at 1e-8 (i.e. off), 0.74 at 1e-3, 0.68 at 3e-2 — and 0.69 "
-            "for not fitting latency at all, so with this off the delays "
-            "cost more than they buy.  Above ~1e-2 amplitudes shrink and "
-            "delay recovery collapses.  0 restores the old behaviour."
+            "Ridge on the per-trial amplitude solve.  Keep it on: the delay "
+            "search is free to slide two overlapping trials into "
+            "near-coincidence, which improves in-sample fit via a "
+            "(+huge, -huge) amplitude pair.  Measured on a 192-trial "
+            "2.05s-ISI design, cond(XtX) is 61.7 at delay=0 but 1.1e5 at the "
+            "fitted delays.\n"
+            "  auto (DEFAULT) — per-voxel empirical Bayes, λ_v = σ²_v/τ²_v, "
+            "with τ² by method of moments off the delay=0 fit.  σ² spans "
+            "orders of magnitude across a brain, so no single fixed value "
+            "suits both high- and low-SNR voxels; measured better than every "
+            "fixed value at BOTH extremes.  Costs nothing — σ² is already "
+            "computed for the delay prior.  Emits a λ diagnostic map.\n"
+            "  FRAC — a fixed factor relative to mean(diag(XtX)).  Amplitude "
+            "recovery vs known truth: 0.58 at 1e-8 (off), 0.74 at 1e-3, 0.68 "
+            "at 3e-2, against 0.69 for not fitting latency at all — so with "
+            "this off the delays cost more than they buy.  Above ~1e-2 "
+            "amplitudes shrink and delay recovery collapses.\n"
+            "  0 — off (numerical floor only), the pre-fix behaviour."
         ),
     )
     delay_grp.add_argument(
@@ -787,12 +794,6 @@ def create_parser() -> argparse.ArgumentParser:
         "-tr", type=float, default=None, help="TR in seconds; read from header if omitted."
     )
     proc.add_argument("-mask", default=None, help="Brain mask NIfTI.")
-    proc.add_argument(
-        "-polort",
-        type=int,
-        default=None,
-        help="Per-run polynomial drift order.  None → auto from run duration.",
-    )
     add_device_arg(proc, default="auto")
     proc.add_argument(
         "-debug-design",
@@ -1246,7 +1247,7 @@ def _run_shift_mode(
     print(
         f"  Delay search: ±{args.tau_max}s step {args.tau_step}s"
         f"{f', prior sd {args.delay_prior_sd}s' if args.delay_prior_sd else ', no prior'}"
-        f"{f', amp ridge {args.amp_ridge:g}' if args.amp_ridge else ', NO amp ridge'}"
+        f", amp ridge {args.amp_ridge if isinstance(args.amp_ridge, str) else f'{args.amp_ridge:g}'}"
     )
 
     per_run_data = [
@@ -1345,6 +1346,8 @@ def _run_shift_mode(
         (fit.r2, "r2"),
         (fit.r2_fixed, "r2_tau0"),
         (fit.r2_total, "r2_incl_drift"),
+        (fit.fstat, "fstat"),
+        (fit.amp_lambda, "amp_lambda"),
     ):
         path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
         with spinner(f"Writing {Path(path).name}"):
@@ -1498,7 +1501,8 @@ def _run_shift_mode(
         "tau_max": float(args.tau_max),
         "tau_step": float(args.tau_step),
         "delay_prior_sd": (None if args.delay_prior_sd is None else float(args.delay_prior_sd)),
-        "amp_ridge": float(args.amp_ridge),
+        "amp_ridge": (args.amp_ridge if isinstance(args.amp_ridge, str) else float(args.amp_ridge)),
+        "fstat_df": list(fit.fstat_df),
         "n_sweeps": int(fit.n_sweeps),
         "single_trials": bool(args.single_trials),
         "n_blocks": len(block_onsets),
@@ -1526,6 +1530,19 @@ def main() -> int:
 
     if getattr(args, "delay_prior_sd", None) is not None and args.delay_prior_sd <= 0:
         args.delay_prior_sd = None
+
+    if isinstance(getattr(args, "amp_ridge", None), str):
+        if args.amp_ridge.strip().lower() == "auto":
+            args.amp_ridge = "auto"
+        else:
+            try:
+                args.amp_ridge = float(args.amp_ridge)
+            except ValueError:
+                print(
+                    f"ERROR: -amp-ridge must be 'auto' or a number; got {args.amp_ridge!r}",
+                    file=sys.stderr,
+                )
+                return 1
 
     if args.shift_shape_index and args.parametrization != "shift":
         print(

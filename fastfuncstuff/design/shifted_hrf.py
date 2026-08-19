@@ -117,6 +117,30 @@ class ShiftedHRFResult:
         found anything.  Deciding whether a delay map is believable needs
         held-out prediction (LORO), a split-half correlation of the
         per-trial delays, or a permutation null.
+    fstat : np.ndarray, shape (n_voxels,)
+        Task F against the nuisance-only model, from ``r2`` (so also relative
+        to non-drift variance).  Unlike R² this is charged for the parameters
+        spent: ``n_blocks`` amplitudes plus ``n_blocks`` delays.
+
+        Read it as a ranking statistic, not a calibrated p-value.  The delays
+        are **grid-searched, not linearly fit**, and selecting the best of
+        ``n_grid`` candidates costs more than the one df charged here -- there
+        is no clean closed form for how much.  The sensitivity is real: on a
+        192-trial fit the median F is 2.83 charging amplitudes only, 1.15
+        charging one df per delay (what this reports), and 0.13 charging the
+        full log2(n_grid) search cost, i.e. "99.7 % of voxels respond" to
+        "0.3 %" on an assumption nobody can pin down.  For a calibrated answer
+        use the held-out map from :func:`xval_shifted_hrf`, which sidesteps
+        the degrees-of-freedom question entirely by scoring unseen data.
+    amp_lambda : np.ndarray, shape (n_voxels,)
+        The ridge actually applied to each voxel's amplitude solve, in
+        absolute units (added to ``diag(XtX)``).  Saved because a per-voxel
+        hyperparameter should ship its own map ([[Per-voxel optimization]]):
+        a lambda map that is flat means the empirical-Bayes step found nothing
+        to adapt to, and one that tracks the R² map means it is doing its job.
+    fstat_df : (int, int)
+        ``(numerator, denominator)`` df actually charged, so the caller can
+        re-derive a p-value or recompute under a different assumption.
     n_sweeps : int
         Coordinate-descent sweeps actually run.
     tau_grid : np.ndarray
@@ -128,6 +152,9 @@ class ShiftedHRFResult:
     r2: np.ndarray
     r2_fixed: np.ndarray
     r2_total: np.ndarray
+    fstat: np.ndarray
+    fstat_df: tuple[int, int]
+    amp_lambda: np.ndarray
     n_sweeps: int
     tau_grid: np.ndarray
 
@@ -279,7 +306,7 @@ def _solve_amplitudes(
     ar_v: Tensor,
     n_blocks: int,
     amp_batch: int,
-    amp_ridge: float = AMP_RIDGE_DEFAULT,
+    amp_ridge: float | Tensor = AMP_RIDGE_DEFAULT,
 ) -> Tensor:
     """Exact joint amplitude solve given every block's chosen grid index.
 
@@ -367,10 +394,18 @@ def _solve_amplitudes(
             (band_vals * nbr_w.view(n_blocks, 1, band_w)).permute(1, 0, 2),
         )
         Xty = proj[ar_b[:, None], g_b, ar_v[s:e][None, :]].T  # (nb_v, NB)
-        # Ridge relative to the mean diagonal.  Floored at the old 1e-8 so the
-        # batched Cholesky stays well-posed even when a caller asks for none.
-        _fac = max(float(amp_ridge), 1e-8)
-        ridge = _fac * torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+        # Two forms.  A float is a factor RELATIVE to the mean diagonal; a
+        # tensor is an ABSOLUTE per-voxel lambda (the empirical-Bayes path,
+        # sigma^2_v / tau^2_v, which is not expressible as one global factor
+        # because sigma^2 varies by orders of magnitude across a brain).
+        _scale = torch.diagonal(XtX, dim1=1, dim2=2).mean(dim=1).clamp_min(1e-30)
+        if isinstance(amp_ridge, Tensor):
+            ridge = amp_ridge[s:e].to(XtX.dtype).clamp_min(0.0)
+        else:
+            ridge = max(float(amp_ridge), 0.0) * _scale
+        # Floor at the old 1e-8 relative so the batched Cholesky stays
+        # well-posed even where the prior asks for (almost) nothing.
+        ridge = torch.maximum(ridge, 1e-8 * _scale)
         XtX = XtX + ridge[:, None, None] * eye
         out[s:e] = torch.linalg.solve(XtX, Xty.unsqueeze(-1)).squeeze(-1)
         del XtX, Xty, ridge, band_vals, gi_nb
@@ -402,7 +437,7 @@ def fit_shifted_hrf(
     run_bounds: list[tuple[int, int]] | None = None,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
-    amp_ridge: float = AMP_RIDGE_DEFAULT,
+    amp_ridge: float | str = AMP_RIDGE_DEFAULT,
     refine_delays: bool = True,
     device: torch.device | None = None,
     chunk_size: int | None = None,
@@ -566,6 +601,20 @@ def fit_shifted_hrf(
         )
     del bank_raw
 
+    # At tau=0 every voxel shares one design, so the OLS variance factor
+    # [(XtX)^-1]_bb is a single vector rather than a per-voxel quantity.  That
+    # is what makes the empirical-Bayes lambda below essentially free.
+    _auto_ridge = isinstance(amp_ridge, str) and amp_ridge == "auto"
+    dinv0 = None
+    if _auto_ridge:
+        X0 = bank[:, zero_idx, :]  # (NB, T)
+        G0 = X0 @ X0.T
+        G0 = G0 + 1e-10 * torch.diagonal(G0).mean().clamp_min(1e-30) * torch.eye(
+            n_blocks, dtype=G0.dtype, device=device
+        )
+        dinv0 = torch.diagonal(torch.linalg.inv(G0)).clamp_min(0.0)
+        del X0, G0
+
     tau_t = torch.as_tensor(tau_grid, device=device)
     # Gaussian prior on tau expressed in the grid's own units.  Scaled by
     # sigma^2 below so it competes with SSE on equal footing.
@@ -604,10 +653,15 @@ def fit_shifted_hrf(
 
     amps = np.zeros((n_voxels, n_blocks), dtype=np.float32)
     delays = np.zeros((n_voxels, n_blocks), dtype=np.float32)
+    lam_out = np.zeros(n_voxels, dtype=np.float32)
     r2_out = np.zeros(n_voxels, dtype=np.float32)
     r2_fixed_out = np.zeros(n_voxels, dtype=np.float32)
     r2_total_out = np.zeros(n_voxels, dtype=np.float32)
     nz = 0 if Z is None else Z.shape[1]
+    # Parameters actually spent: one amplitude per block, plus one delay per
+    # block when the search has anywhere to go (n_grid == 1 means pinned).
+    p_model = n_blocks * (2 if n_grid > 1 else 1)
+    df_den = max(1, n_t - nz - p_model)
 
     n_chunks = (n_voxels + chunk_size - 1) // chunk_size
     ar_b = torch.arange(n_blocks, device=device)
@@ -632,8 +686,12 @@ def fit_shifted_hrf(
         gi = torch.full((nv, n_blocks), zero_idx, dtype=torch.long, device=device)
 
         ar_v = torch.arange(nv, device=device)
+        # The auto path needs sigma^2 to set lambda, and sigma^2 comes from a
+        # fit -- so bootstrap this first solve with the fixed default, then
+        # derive lambda and re-solve before the sweeps begin.
+        _ridge_now = AMP_RIDGE_DEFAULT if _auto_ridge else amp_ridge
         A = _solve_amplitudes(
-            gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch, amp_ridge
+            gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch, _ridge_now
         )
         # σ² for the τ prior, taken from the τ=0 fit.  With A solved
         # exactly, SSE = ‖y‖² − Aᵀ(Xᵀy), so no prediction is needed.
@@ -651,6 +709,37 @@ def fit_shifted_hrf(
         lam_tau = (
             None if delay_prior_sd is None else sigma2 / float(delay_prior_sd) ** 2
         )  # (nv,) weight on (tau - tau_bar)^2
+
+        if _auto_ridge:
+            # Empirical-Bayes ridge: lambda_v = sigma^2_v / tau^2_v, the exact
+            # posterior weight for a Gaussian prior A ~ N(0, tau^2) under noise
+            # sigma^2.  A fixed RELATIVE factor cannot express this: sigma^2
+            # spans orders of magnitude across a brain, so one factor is too
+            # strong where SNR is high and too weak where it is low -- the
+            # [[Per-voxel optimization]] complaint exactly.
+            #
+            # tau^2 by method of moments off the tau=0 fit.  The observed
+            # second moment is E[A^2] = tau^2 + sigma^2 * [(XtX)^-1]_bb, so
+            # subtract the sampling part instead of treating all the spread as
+            # signal.  Floored at 5 % of the observed moment because a voxel
+            # whose amplitudes are pure noise would otherwise demand infinite
+            # ridge and have its amplitudes crushed to zero.
+            assert dinv0 is not None
+            a2 = (A**2).mean(dim=1)
+            tau2 = (a2 - sigma2 * dinv0.mean()).clamp_min(0.05 * a2.clamp_min(1e-30))
+            amp_lam = (sigma2 / tau2).clamp_min(0.0)
+            A = _solve_amplitudes(
+                gi, banded, proj, nbr_idx_t, nbr_w_t, ar_b, ar_w, ar_v, n_blocks, amp_batch, amp_lam
+            )
+        else:
+            amp_lam = amp_ridge
+        # Record what was actually applied.  The fixed path stores its factor
+        # as-is (relative to mean(diag(XtX))); the auto path stores absolute
+        # lambda.  The two are not on one scale -- the metadata records which
+        # mode ran, and a map is only comparable within a mode.
+        lam_out[start:end] = (
+            amp_lam.float().cpu().numpy() if isinstance(amp_lam, Tensor) else float(amp_lam)
+        )
 
         for _sweep in range(max(1, n_sweeps)):
             # Mean-field centre for the delay prior: the voxel's OWN mean
@@ -714,7 +803,7 @@ def fit_shifted_hrf(
                 ar_v,
                 n_blocks,
                 amp_batch,
-                amp_ridge,
+                amp_lam,
             )
 
         # ---- sub-grid delay refinement --------------------------------
@@ -772,12 +861,17 @@ def fit_shifted_hrf(
             f"{float(np.median(r2_total_out)):.3f}, "
             f"Δ={gained:+.4f} — free parameters, NOT evidence of real latency)"
         )
+    r2c = np.clip(r2_out.astype(np.float64), 0.0, 1.0 - 1e-9)
+    fstat = ((r2c / p_model) / ((1.0 - r2c) / df_den)).astype(np.float32)
     return ShiftedHRFResult(
         amplitudes=amps,
         delays=delays,
         r2=r2_out,
         r2_fixed=r2_fixed_out,
         r2_total=r2_total_out,
+        fstat=fstat,
+        fstat_df=(int(p_model), int(df_den)),
+        amp_lambda=lam_out,
         n_sweeps=int(max(1, n_sweeps)),
         tau_grid=tau_grid,
     )
@@ -858,7 +952,7 @@ def xval_shifted_hrf(
     tau_max: float = 2.0,
     tau_step: float = 0.25,
     delay_prior_sd: float | None = 0.75,
-    amp_ridge: float = AMP_RIDGE_DEFAULT,
+    amp_ridge: float | str = AMP_RIDGE_DEFAULT,
     n_sweeps: int = 4,
     leave_n_out: int = 1,
     device: torch.device | None = None,
@@ -1355,7 +1449,7 @@ def fit_shifted_hrf_per_voxel_shape(
     tau_step: float = 0.25,
     n_sweeps: int = 4,
     delay_prior_sd: float | None = 0.75,
-    amp_ridge: float = AMP_RIDGE_DEFAULT,
+    amp_ridge: float | str = AMP_RIDGE_DEFAULT,
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> tuple[ShiftedHRFResult, np.ndarray]:
@@ -1411,6 +1505,9 @@ def fit_shifted_hrf_per_voxel_shape(
     r2 = np.zeros(n_voxels, dtype=np.float32)
     r2_fixed = np.zeros(n_voxels, dtype=np.float32)
     r2_total = np.zeros(n_voxels, dtype=np.float32)
+    fstat = np.zeros(n_voxels, dtype=np.float32)
+    lam = np.zeros(n_voxels, dtype=np.float32)
+    fstat_df = (n_blocks * 2, max(1, int(y_src.shape[1]) - n_blocks * 2))
     tau_grid = np.arange(-tau_max, tau_max + 0.5 * tau_step, tau_step, dtype=np.float64)
     sweeps = 1
 
@@ -1448,6 +1545,9 @@ def fit_shifted_hrf_per_voxel_shape(
         r2[sel] = sub.r2
         r2_fixed[sel] = sub.r2_fixed
         r2_total[sel] = sub.r2_total
+        fstat[sel] = sub.fstat
+        lam[sel] = sub.amp_lambda
+        fstat_df = sub.fstat_df  # identical across groups: same blocks, same nuisance
         sweeps = max(sweeps, sub.n_sweeps)
 
     if verbose:
@@ -1464,6 +1564,9 @@ def fit_shifted_hrf_per_voxel_shape(
             r2=r2,
             r2_fixed=r2_fixed,
             r2_total=r2_total,
+            fstat=fstat,
+            fstat_df=fstat_df,
+            amp_lambda=lam,
             n_sweeps=sweeps,
             tau_grid=tau_grid,
         ),
