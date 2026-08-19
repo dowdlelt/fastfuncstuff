@@ -149,6 +149,13 @@ def run_ref(ctx: BenchmarkContext) -> float:
     return elapsed
 
 
+# -no_guard: these stages test GLM *numerics* against AFNI, and AFNI has no
+# equivalent of ffs_reml's missing-data guard. The benchmark's inputs are percent
+# signal change (3dcalc a/b*100), so outside and at the edge of the brain they hit
+# exact zeros and negatives within a run -- exactly what the guard drops. Leaving
+# it on makes ffs zero ~25% of voxels that AFNI fits, which reads as a parity
+# failure (beta r ~0.06-0.75) when the shared voxels agree to r=1.0000. The guard
+# has its own coverage in tests/test_glm_missing.py.
 def run_ffs(ctx: BenchmarkContext) -> float:
     """Run ffs_reml OLS using the IM design matrix."""
     ffs = _ffs_dir(ctx)
@@ -168,7 +175,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
         f"-use_double "
         f"-Obuck {_ffs_bucket(ctx)} "
         f"-mask {mask} "
-        f"-tout"
+        f"-tout -no_guard"
         f"{ctx.ffs_device_flag()}",
         label="ffs_reml IM OLS",
         cwd=ffs,
