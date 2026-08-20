@@ -18,7 +18,7 @@ from __future__ import annotations
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -34,6 +34,7 @@ from .affine import (
     apply_affine_batched,
     apply_affine_interp,
     apply_affine_wsinc5,
+    batched_sample_bytes_per_point,
     identity_params,
     params_to_matrix,
     params_to_matrix_batched,
@@ -962,6 +963,14 @@ def _coarse_search_joint(
     base_pts = base_blur.reshape(-1)[idx_c]
     blokset_c = assign_bloks_points(coords_mm, ctx.bloktype, blokrad_c, device=device)
 
+    # The coarse pass always interpolates linearly, whatever -interp asks for.
+    # It ranks seeds on a 2-voxel-blurred volume at 40k subsampled points, where
+    # a higher-order kernel is below the noise of the blur -- but it is not free:
+    # the separable sampler costs ~2x the bytes per point of grid_sample and is
+    # far slower per evaluation. -interp still governs the fine refinement, which
+    # is where kernel choice actually moves the answer.
+    ctx_c = replace(ctx, interp="linear") if ctx.interp != "linear" else ctx
+
     # --- joint seed set: grid over (n_t translations x n_r rotations per axis) ---
     def _axis(lo, hi, n):
         return torch.linspace(float(lo), float(hi), n, device=device)
@@ -1002,12 +1011,21 @@ def _coarse_search_joint(
     # --- batched subsampled evaluation of every seed ---
     matrices = params_to_matrix_batched(seeds)
     B = matrices.shape[0]
-    chunk = compute_registration_candidate_batch_size(n_coarse, B, device, bytes_per_point=40)
+    chunk = compute_registration_candidate_batch_size(
+        n_coarse,
+        B,
+        device,
+        bytes_per_point=batched_sample_bytes_per_point(ctx_c.interp),
+    )
     costs = []
     for s in range(0, B, chunk):
         with torch.no_grad():
             wb = sample_affine_at_points_batched(
-                source_blur, matrices[s : s + chunk], pts_xyz, zero_outside=True, interp=ctx.interp
+                source_blur,
+                matrices[s : s + chunk],
+                pts_xyz,
+                zero_outside=True,
+                interp=ctx_c.interp,
             )
             val = local_pearson_value_batched(base_pts, wb, weight_c, blokset_c, ctx.ppow)
         costs.append((-val) if is_lpc else val.abs())
@@ -1020,7 +1038,7 @@ def _coarse_search_joint(
     # busy (launch-bound otherwise). The fine refinement does the heavy lifting.
     nkeep = min(B, config.tbest + 2)
     top = costs.topk(nkeep).indices.tolist()
-    coarse_cost = _batched_sampled_cost(source_blur, pts_xyz, base_pts, weight_c, blokset_c, ctx)
+    coarse_cost = _batched_sampled_cost(source_blur, pts_xyz, base_pts, weight_c, blokset_c, ctx_c)
     out_phys, out_costs = _refine_adam_batched(
         [seeds[i].cpu().numpy() for i in top],
         config,
@@ -1355,7 +1373,7 @@ def _refine_adam_normalized(
 
         # On-device best tracking — no sync, so the GPU can keep going.
         with torch.no_grad():
-            cur = cost.detach()
+            cur = cost
             improved = cur > best_cost_t
             best_norm = torch.where(improved, cand_norm, best_norm)
             best_cost_t = torch.maximum(best_cost_t, cur)
@@ -1404,6 +1422,25 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
     is_lpc = ctx.name == "lpc"
 
     def fn(matrices: Tensor) -> Tensor:
+        # CMA-ES hands us population x trials matrices at once (289 of them for a
+        # rigid fit at -tbest 16), and M is the full match-point set -- hundreds
+        # of millions of sampled points, tens of GiB. Split the candidate axis
+        # when nothing needs the graph; the costs are independent per candidate,
+        # so this is arithmetically identical. Autograd (Adam) can't be split
+        # for free -- it retains the activations either way -- but there T is
+        # only the trial count.
+        if not torch.is_grad_enabled() and matrices.shape[0] > 1:
+            step = compute_registration_candidate_batch_size(
+                points_xyz.shape[0],
+                matrices.shape[0],
+                matrices.device,
+                bytes_per_point=batched_sample_bytes_per_point(ctx.interp),
+            )
+            if step < matrices.shape[0]:
+                return torch.cat(
+                    [fn(matrices[s : s + step]) for s in range(0, matrices.shape[0], step)]
+                )
+
         warped = sample_affine_at_points_batched(
             source_stage, matrices, points_xyz, zero_outside=True, interp=ctx.interp
         )  # (T, M)
@@ -1425,6 +1462,16 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
             c = c - ctx.ov_weight * pens
         return c
 
+    def grad_batch_limit() -> int:
+        """Trials whose *backward* graphs fit at once (see _refine_adam_batched)."""
+        return compute_registration_candidate_batch_size(
+            points_xyz.shape[0],
+            4096,
+            points_xyz.device,
+            bytes_per_point=batched_sample_bytes_per_point(ctx.interp, grad=True),
+        )
+
+    fn.grad_batch_limit = grad_batch_limit  # ty: ignore[unresolved-attribute]
     return fn
 
 
@@ -1846,6 +1893,29 @@ def _refine_adam_batched(
     use_compile = compile_fwd or os.environ.get("FFS_ALLINEATE_COMPILE") == "1"
     forward = torch.compile(_forward) if use_compile else _forward
 
+    # The trials are independent rows, so the backward can be taken a slice at a
+    # time and Adam still sees the same gradient -- autograd accumulates into the
+    # leaf. It has to be: a grad-enabled sample retains every gather chunk's
+    # saved tensors until backward, so one step over all T trials at full match
+    # -point count is the largest allocation the whole alignment makes (it is
+    # what OOM'd a 16 GB card at -interp cubic -tbest 16). Cost fns that don't
+    # publish a limit (the full-volume ones) keep the single-shot path.
+    limit = getattr(batched_cost_fn, "grad_batch_limit", None)
+    tchunk = min(T, limit()) if limit is not None else T
+
+    def _cost_and_grad() -> Tensor:
+        """Forward+backward over all T trials, in slices that fit; returns (T,)."""
+        if tchunk >= T:
+            cost = forward(params_norm)
+            (-cost.sum()).backward()
+            return cost.detach()
+        parts = []
+        for s0 in range(0, T, tchunk):
+            c = forward(params_norm[s0 : s0 + tchunk])
+            (-c.sum()).backward()
+            parts.append(c.detach())
+        return torch.cat(parts)
+
     pbar = _tqdm_bar(range(n_iters), total=n_iters, desc=desc, disable=verb < 1)
     for it in pbar:
         optimizer.zero_grad()
@@ -1853,8 +1923,7 @@ def _refine_adam_batched(
             params_norm.data[:, ~free_mask] = identity_norm[~free_mask]
             params_norm.data.clamp_(0.0, 1.0)
         cand_norm = params_norm.detach().clone()
-        cost = forward(params_norm)  # (T,)
-        (-cost.sum()).backward()
+        cost = _cost_and_grad()  # (T,)
         if params_norm.grad is not None:
             params_norm.grad.data[:, ~free_mask] = 0.0
         optimizer.step()
@@ -2603,6 +2672,14 @@ def allineate(
         trial_params_list = _coarse_search_joint(
             base_opt, source_opt, sample, ctx, config, bounds, device, verb
         )
+        # The coarse pass allocates in far bigger blocks than the refinement
+        # (thousands of candidates x 40k points vs a handful x the full match
+        # set), and the caching allocator keeps them reserved afterwards. They
+        # are ours to reuse, so this costs nothing we need -- but holding ~6 GiB
+        # of dead blocks for the rest of the run makes the tool look like it
+        # owns the card, and starves anything else the user has on it.
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     else:
         # Other costs: the split translation→rotation sweep on a downsampled grid.
         min_dim = min(base_opt.shape)

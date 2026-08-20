@@ -31,11 +31,56 @@ from fastfuncstuff.memory import (
     reset_memory_config,
     set_memory_config,
 )
+from fastfuncstuff.processing.affine import batched_sample_bytes_per_point
 
 
 def test_registration_candidate_batch_uses_shared_memory_budget():
     with patch("fastfuncstuff.memory.get_available_memory", return_value=52 * 1000):
         assert compute_registration_candidate_batch_size(100, 50, torch.device("cpu")) == 10
+
+
+def test_registration_candidate_batch_respects_point_budget():
+    """A big memory budget must not license an unbounded points-per-launch peak.
+
+    Bug of record: the coarse search took 4096 candidates x 40k points in one
+    call (12.9 GiB of coordinate scratch) because only the candidate count was
+    capped.
+    """
+    with patch("fastfuncstuff.memory.get_available_memory", return_value=64 * 1024**3):
+        assert (
+            compute_registration_candidate_batch_size(
+                40_000, 4096, torch.device("cpu"), bytes_per_point=80, max_points=30_000_000
+            )
+            == 750
+        )
+
+
+def test_registration_candidate_point_budget_scales_with_the_device():
+    """The default budget follows the hardware, so it is not a one-GPU constant."""
+    cpu = torch.device("cpu")
+    with patch("fastfuncstuff.memory.get_available_memory", return_value=64 * 1024**3):
+        with patch("fastfuncstuff.memory.saturating_point_count", return_value=4_000_000):
+            small = compute_registration_candidate_batch_size(40_000, 4096, cpu, bytes_per_point=80)
+        with patch("fastfuncstuff.memory.saturating_point_count", return_value=64_000_000):
+            big = compute_registration_candidate_batch_size(40_000, 4096, cpu, bytes_per_point=80)
+    assert small == 100
+    assert big == 1600
+
+
+def test_registration_candidate_batch_is_smaller_for_costlier_points():
+    """The separable (cubic/wsinc5) sampler costs far more per point than linear."""
+    cpu = torch.device("cpu")
+    with patch("fastfuncstuff.memory.get_available_memory", return_value=200 * 1024**2):
+        linear = compute_registration_candidate_batch_size(
+            40_000, 4096, cpu, bytes_per_point=batched_sample_bytes_per_point("linear")
+        )
+        cubic = compute_registration_candidate_batch_size(
+            40_000, 4096, cpu, bytes_per_point=batched_sample_bytes_per_point("cubic")
+        )
+        cubic_grad = compute_registration_candidate_batch_size(
+            40_000, 4096, cpu, bytes_per_point=batched_sample_bytes_per_point("cubic", grad=True)
+        )
+    assert cubic_grad < cubic < linear
 
 
 def test_nonlinear_memory_models_scale_and_order_engines():
