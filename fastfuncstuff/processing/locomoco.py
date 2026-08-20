@@ -945,6 +945,19 @@ def _geometry_report(
     dims = [int(shape[0]), int(shape[1]), int(shape[2])]
     L = _AXIS_LETTER
     if is_3dacq:
+        if dual:
+            # Two encode axes: the informative statement is which plane they span and
+            # which axis is left un-encoded, not which planes "view" a single axis.
+            other = next(a for a in (0, 1, 2) if a not in (pe_axis, slice_axis))
+            enc = sorted((pe_axis, other))
+            return (
+                f"geometry: 3-D joint solve — primary PE axis {pe_axis} ({L[pe_axis]}, "
+                f"{dims[pe_axis]} vox) + partition axis {other} ({L[other]}, {dims[other]} "
+                f"vox), spanning the {L[enc[0]]}×{L[enc[1]]} plane "
+                f"({dims[enc[0]]}×{dims[enc[1]]}); axis {slice_axis} ({L[slice_axis]}) is "
+                f"un-encoded. Both fields are solved at once, with no ratio assumed "
+                f"between them"
+            )
         o0, o1 = (a for a in (0, 1, 2) if a != pe_axis)
         return (
             f"geometry: 3-D solve — PE axis {pe_axis} ({L[pe_axis]}, {dims[pe_axis]} vox) is "
@@ -1077,6 +1090,9 @@ class LocomocoResult:
     a0: int = 0  # in-plane NIfTI axis carrying v (rows/H)
     a1: int = 1  # in-plane NIfTI axis carrying u (cols/W)
     dual: bool = False  # two PE axes: both u and v are real displacements
+    pe_axis2: int | None = None  # partition (2nd PE) axis, dual runs only
+    # Per-voxel separability of the two axes, (nx,ny,nz,T); see optical_flow_lk_3d_axes.
+    sep_map: torch.Tensor | None = None
     # ── rotation-aware (idea 2) extras — None for the plain idea-1 path ──
     reproject_weights: torch.Tensor | None = None  # (T, 3) per-frame axis weights
     corrected_nifti: torch.Tensor | None = None  # precomputed (nx,ny,nz,T) 3-D-warp series
@@ -1125,6 +1141,41 @@ class LocomocoResult:
                 (self.a0, self._to_nifti(self.v_canon)),
             ]
         return [(self.pe_axis, self.pe_displacement())]
+
+    def pe_displacements(self) -> list[tuple[str, int, torch.Tensor]]:
+        """``(label, nifti_axis, signed_displacement)`` per encode axis, PRIMARY first.
+
+        The dual-run counterpart of :meth:`pe_displacement`, and what the CLI writes as
+        ``_flow_pe1`` / ``_flow_pe2``. Two SIGNED 4-D maps beat the
+        ``_flowmag``/``_flowang`` pair here: the sign along each named physical axis is
+        the quantity of interest (which way the partition wiggle went this frame), and a
+        magnitude/angle pair buries that in a polar coordinate nobody wants to scrub.
+        Magnitude/angle stay for the legacy 2-D slicewise dual case, where the two axes
+        are two halves of one in-plane vector rather than two separate artifacts.
+        """
+        if not self.dual or self.pe_axis2 is None:
+            return [("pe1", self.pe_axis, self.pe_displacement())]
+        u = self._to_nifti(self.u_canon)
+        v = self._to_nifti(self.v_canon)
+
+        def pick(ax: int) -> torch.Tensor:
+            return u if ax == self.a1 else v
+
+        return [
+            ("pe1", self.pe_axis, pick(self.pe_axis)),
+            ("pe2", self.pe_axis2, pick(self.pe_axis2)),
+        ]
+
+    def coupling(self, mask: torch.Tensor | None = None) -> dict | None:
+        """Measured relationship between the two fields, or None for a single-axis run.
+
+        See :func:`dual_field_coupling` — a diagnostic only; no ratio between the two
+        fields was assumed while solving them.
+        """
+        if not self.dual or self.pe_axis2 is None:
+            return None
+        comps = self.pe_displacements()
+        return dual_field_coupling(comps[0][2], comps[1][2], mask)
 
     def flow_magnitude(self) -> torch.Tensor:
         """Per-frame displacement magnitude ``sqrt(u²+v²)`` ``(nx,ny,nz,T)`` (voxels)."""
@@ -1623,6 +1674,7 @@ def estimate_residual_flow(
     automask_sigma: float = 3.0,
     coverage_erode: int | None = 1,
     is_3dacq: bool = False,
+    pe_axis2: int | None = None,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
@@ -1655,6 +1707,13 @@ def estimate_residual_flow(
 
     ``max_shift`` bounds the phase/xcorr search (residual motion is sub- to a few
     voxels).
+
+    ``pe_axis2`` (3-D-acquired data only, i.e. with ``is_3dacq``) is the PARTITION /
+    2nd phase-encode axis. Giving it solves the primary-PE and partition fields
+    simultaneously and independently — see :func:`_run_3dacq_plain`. It is a different
+    thing from ``dual`` below: ``dual`` is a 2-D multi-slice acquisition encoded on two
+    in-plane axes, where the two components are two halves of one in-plane vector;
+    ``pe_axis2`` is one 3-D acquisition carrying two physically distinct artifacts.
 
     ``dual`` (two PE axes, e.g. a 3-D-EPI acquisition phase-encoded on both in-plane
     axes) estimates BOTH in-plane components and warps/saves both — ``slice_axis``
@@ -1732,6 +1791,7 @@ def estimate_residual_flow(
             warp_interp=warp_interp,
             warp_radius=warp_radius,
             hpf_sigma=hpf_sigma,
+            pe_axis2=pe_axis2,
             device=device,
             verbose=verbose,
         )
@@ -2398,30 +2458,62 @@ def estimate_residual_flow_rotaware(
 # (strictly better than running the two cuts and averaging their 2-D marginals).
 
 
-def _blur3d_b(vol: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Separable 3-D Gaussian blur of a batch of volumes ``(B, X, Y, Z)``."""
+def _blur3d_b(vol: torch.Tensor, sigma: float, skip_axis: int | None = None) -> torch.Tensor:
+    """Separable 3-D Gaussian blur of a batch of volumes ``(B, X, Y, Z)``.
+
+    ``skip_axis`` leaves one axis unblurred — the slice axis of a 2-D multi-slice
+    acquisition, where each slice is sampled at its own instant so pooling across
+    slices would average over acquisition times rather than over signal.
+    """
     if sigma <= 0:
         return vol
     k = _gaussian_kernel1d(sigma, vol.device, vol.dtype)
     r = (k.numel() - 1) // 2
     x = vol.unsqueeze(1)
-    x = F.conv3d(F.pad(x, (0, 0, 0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1, 1))
-    x = F.conv3d(F.pad(x, (0, 0, r, r, 0, 0), mode="replicate"), k.view(1, 1, 1, -1, 1))
-    x = F.conv3d(F.pad(x, (r, r, 0, 0, 0, 0), mode="replicate"), k.view(1, 1, 1, 1, -1))
+    pads = ((0, 0, 0, 0, r, r), (0, 0, r, r, 0, 0), (r, r, 0, 0, 0, 0))
+    views = ((1, 1, -1, 1, 1), (1, 1, 1, -1, 1), (1, 1, 1, 1, -1))
+    for ax in range(3):
+        if ax == skip_axis:
+            continue
+        x = F.conv3d(F.pad(x, pads[ax], mode="replicate"), k.view(*views[ax]))
     return x.squeeze(1)
 
 
-def _spatial_highpass3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+def _pyr_down3d(vol: torch.Tensor, skip_axis: int | None = None) -> torch.Tensor:
+    """One pyramid step on ``(B, X, Y, Z)``, not downsampling ``skip_axis``."""
+    ks = [2, 2, 2]
+    if skip_axis is not None:
+        ks[skip_axis] = 1
+    return F.avg_pool3d(_blur3d_b(vol, 1.0, skip_axis).unsqueeze(1), tuple(ks)).squeeze(1)
+
+
+def _pyr_min_extent(shape, skip_axis: int | None) -> int:
+    """Smallest extent among the axes a pyramid step would actually shrink.
+
+    The depth guard must ignore an un-downsampled slice axis: a 20-slice 2-D run has
+    plenty of in-plane room to pyramid, and letting ``nz=20`` cap the depth would
+    silently give a slicewise solve less motion reach than the equivalent 3-D one.
+    """
+    dims = [int(d) for i, d in enumerate(shape) if i != skip_axis]
+    return min(dims) if dims else 0
+
+
+def _spatial_highpass3d(
+    vol: torch.Tensor, sigma: float, skip_axis: int | None = None
+) -> torch.Tensor:
     """Unsharp 3-D spatial high-pass of a batch of volumes ``(B, X, Y, Z)``.
 
     The 3-D twin of :func:`_spatial_highpass` for the 3-D-acquisition paths — strips
     spatially-smooth non-motion intensity changes (drift, respiration B0) from the
     frames fed to the flow while keeping the edges that encode the shift. Estimation
     only; the correction still resamples the raw series. Experimental (``-hpf_spatial``).
+
+    ``skip_axis`` keeps the high-pass in-plane for a 2-D multi-slice run, so a slice is
+    never high-passed against its neighbours' (differently-timed) intensities.
     """
     if sigma <= 0:
         return vol
-    return vol - _blur3d_b(vol, sigma)
+    return vol - _blur3d_b(vol, sigma, skip_axis)
 
 
 MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag")
@@ -2560,6 +2652,53 @@ def _shift3d_axis(
     grid = torch.stack([comps[2], comps[1], comps[0]], dim=-1)  # (B,X,Y,Z,3): last = (W=Z,H=Y,D=X)
     if mode == "bicubic":
         mode = "bilinear"
+    out = F.grid_sample(
+        vol.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
+    )
+    return out.squeeze(1)
+
+
+def _shift3d_axes(
+    vol: torch.Tensor,
+    shifts: list[torch.Tensor],
+    axes: list[int],
+    mode: str = "bilinear",
+    radius: int = 3,
+) -> torch.Tensor:
+    """Sample ``(B,X,Y,Z)`` at ``coord + shift`` along ONE OR TWO axes simultaneously.
+
+    The multi-axis generalisation of :func:`_shift3d_axis`. A single axis delegates
+    straight back to it, keeping the scalar fast path and the lanczos (windowed-sinc)
+    resampler. Two axes are a genuine 2-D warp, so they go through ``grid_sample``:
+    there is no separable 1-D gather for a joint displacement, and applying two 1-D
+    gathers in sequence resamples the already-resampled image (double interpolation
+    blur, and the second shift is read at the wrong location).
+
+    ``lanczos`` is a 1-D resampler and silently degrades to trilinear for two axes —
+    the same restriction the 2-D dual-PE path already carries.
+    """
+    if len(axes) == 1:
+        return _shift3d_axis(vol, shifts[0], axes[0], mode=mode, radius=radius)
+
+    b, X, Y, Z = vol.shape
+    dev, dt = vol.device, vol.dtype
+    xs, ys, zs = torch.meshgrid(
+        torch.arange(X, device=dev, dtype=dt),
+        torch.arange(Y, device=dev, dtype=dt),
+        torch.arange(Z, device=dev, dtype=dt),
+        indexing="ij",
+    )
+    n = (X, Y, Z)
+    comps = [
+        (2.0 * xs / max(X - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+        (2.0 * ys / max(Y - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+        (2.0 * zs / max(Z - 1, 1) - 1.0)[None].expand(b, X, Y, Z),
+    ]
+    for ax, sh in zip(axes, shifts, strict=True):
+        comps[ax] = comps[ax] + sh * (2.0 / max(n[ax] - 1, 1))
+    grid = torch.stack([comps[2], comps[1], comps[0]], dim=-1)  # last = (W=Z, H=Y, D=X)
+    if mode in ("bicubic", "lanczos"):
+        mode = "bilinear"  # grid_sample 3-D has trilinear or nearest only
     out = F.grid_sample(
         vol.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
     )
@@ -2831,6 +2970,163 @@ def _build_flow3d_fn(
     return f
 
 
+def _build_flow3d_axes_fn(
+    backend: str,
+    axes: list[int],
+    alphas: torch.Tensor,
+    *,
+    n_levels: int,
+    n_iters: int,
+    window_sigma: float,
+    max_shift: float,
+    trial_step: float,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+    peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    xcorr_passes: int = 3,
+    sep_floor: float = 1e-2,
+    slicewise_axis: int | None = None,
+):
+    """Build a ``(fixed_list, moving_list) -> list[field]`` estimator over 1-2 axes.
+
+    The axes-aware counterpart of :func:`_build_flow3d_fn`, dispatching to
+    :func:`optical_flow_lk_3d_axes` / :func:`xcorr_search_flow_3d_axes`. One axis and one
+    echo reproduces the single-axis builder; the returned ``f`` fills ``conf_out`` /
+    ``curve_out`` / ``sep_out`` with whatever the chosen backend can supply.
+
+    The flow backend takes a ``max_shift`` trust region for TWO axes but not for one.
+    That asymmetry is deliberate and matches the existing 2-D pair: 1-DOF
+    :func:`optical_flow_lk_3d` has no clamp, 2-DOF :func:`optical_flow_lk_2d` does. A
+    coupled 2×2 inverse has a divergence mode the scalar update simply does not have —
+    where ``sep`` sits near its floor the inverse amplifies, so the dual path needs the
+    bound the 1-DOF path never did. Clamping the single-axis case here instead would
+    silently change every existing ``-is_3dacq`` run.
+    """
+    if backend == "flow":
+
+        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None):
+            return optical_flow_lk_3d_axes(
+                fixed_list,
+                moving_list,
+                axes,
+                alphas,
+                n_levels=n_levels,
+                n_iters=n_iters,
+                window_sigma=window_sigma,
+                warp_interp=warp_interp,
+                warp_radius=warp_radius,
+                max_disp=max_shift if len(axes) == 2 else None,
+                sep_floor=sep_floor,
+                sep_out=sep_out,
+                slicewise_axis=slicewise_axis,
+            )
+    elif backend == "xcorr":
+
+        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None):
+            fields, confs = xcorr_search_flow_3d_axes(
+                fixed_list,
+                moving_list,
+                axes,
+                alphas,
+                max_shift=max_shift,
+                window_sigma=window_sigma,
+                trial_step=trial_step,
+                noshift_margin=noshift_margin,
+                reg_sigma=reg_sigma,
+                peak_mode=peak_mode,
+                search_min_steps=search_min_steps,
+                n_passes=xcorr_passes,
+                warp_interp=warp_interp,
+                warp_radius=warp_radius,
+                curve_out=curve_out,
+                slicewise_axis=slicewise_axis,
+            )
+            if conf_out is not None:
+                conf_out.extend(confs)
+            return fields
+    elif backend == "phase":
+        raise ValueError("phase backend has no 3-D path yet; use -backend flow or xcorr.")
+    else:
+        raise ValueError(
+            f"Unknown backend {backend!r}; expected flow | xcorr (phase: no 3-D path)."
+        )
+    return f
+
+
+def dual_field_coupling(
+    d1: torch.Tensor,
+    d2: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> dict:
+    """Measure how related two independently-solved displacement fields turned out.
+
+    ``d1`` / ``d2`` are ``(nx,ny,nz,T)`` signed displacements along the primary PE and
+    partition axes. NOTHING here feeds back into the estimate — the two fields are solved
+    without any assumed ratio precisely so that this measurement means something. If the
+    primary-PE and partition wiggles share a physical source (one off-resonance field
+    δ(r,t) seen through two different effective dwell times) the fields will come back
+    proportional; if they are separate mechanisms they will not.
+
+    ``mask`` is an optional ``(nx,ny,nz)`` bool restricting every statistic to brain —
+    air voxels carry no displacement and would otherwise inflate every correlation toward
+    whatever the gating left behind.
+
+    Returns a dict with:
+
+    - ``r`` — Pearson r over all in-mask voxels × frames. The headline number.
+    - ``kappa`` — the free least-squares ratio ``d2 ≈ kappa·d1``, in voxels per voxel.
+      Only interpretable alongside ``r``: a slope through an uncorrelated cloud is noise.
+    - ``kappa_r2`` — variance of ``d2`` explained by ``kappa·d1``.
+    - ``r_per_frame`` — ``(T,)`` spatial correlation frame by frame. A field pair that is
+      coupled by physics is coupled in EVERY frame; a run-average r driven by a handful of
+      big-motion frames is a different (and weaker) claim.
+    - ``r_per_voxel`` — ``(nx,ny,nz)`` temporal correlation, so the coupling can be seen
+      to be spatially structured (or not).
+    - ``rms1`` / ``rms2`` — in-mask rms of each field (voxels), for scale.
+    """
+    if d1.shape != d2.shape:
+        raise ValueError(f"fields must share a shape, got {tuple(d1.shape)} vs {tuple(d2.shape)}")
+    m = (
+        torch.ones(d1.shape[:3], dtype=torch.bool, device=d1.device)
+        if mask is None
+        else mask.to(d1.device).bool()
+    )
+    a = d1[m]  # (nvox, T)
+    b = d2[m]
+
+    def _pearson(x: torch.Tensor, y: torch.Tensor, dim: int | None = None) -> torch.Tensor:
+        xc = x - x.mean(dim=dim, keepdim=dim is not None)
+        yc = y - y.mean(dim=dim, keepdim=dim is not None)
+        num = (xc * yc).sum(dim=dim)
+        den = (xc.pow(2).sum(dim=dim) * yc.pow(2).sum(dim=dim)).sqrt()
+        return num / den.clamp_min(1e-12)
+
+    flat_a, flat_b = a.reshape(-1), b.reshape(-1)
+    denom = flat_a.pow(2).sum().clamp_min(1e-12)
+    kappa = float((flat_a * flat_b).sum() / denom)
+    resid = flat_b - kappa * flat_a
+    var_b = (flat_b - flat_b.mean()).pow(2).sum().clamp_min(1e-12)
+    return {
+        "r": float(_pearson(flat_a, flat_b)),
+        "kappa": kappa,
+        "kappa_r2": float(1.0 - resid.pow(2).sum() / var_b),
+        "r_per_frame": _pearson(a, b, dim=0).cpu(),  # (T,)
+        "r_per_voxel": _scatter_masked(_pearson(a, b, dim=1), m),  # (nx,ny,nz)
+        "rms1": float(a.pow(2).mean().sqrt()),
+        "rms2": float(b.pow(2).mean().sqrt()),
+    }
+
+
+def _scatter_masked(vals: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    """Put a per-in-mask-voxel vector back into a full ``mask``-shaped volume (0 outside)."""
+    out = torch.zeros(mask.shape, dtype=vals.dtype, device=vals.device)
+    out[mask] = vals
+    return out.cpu()
+
+
 def _time_window(series: torch.Tensor, dim: int, first_n: int | None) -> torch.Tensor:
     """Restrict ``series`` to its first ``first_n`` frames along ``dim`` (None = all).
 
@@ -2991,22 +3287,49 @@ def _run_3dacq_plain(
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    pe_axis2: int | None = None,
+    xcorr_passes: int = 3,
+    sep_floor: float = 1e-2,
 ) -> LocomocoResult:
-    """Plain (moco-frame) residual PE motion for 3-D-acquired EPI: a single 3-D solve."""
+    """Plain (moco-frame) residual motion for 3-D-acquired EPI: a single 3-D solve.
+
+    ``pe_axis`` is the primary phase-encode axis. Passing ``pe_axis2`` (the partition /
+    2nd phase-encode axis) solves BOTH simultaneously and independently — see
+    :func:`optical_flow_lk_3d_axes` for why that is a joint 2x2 rather than two
+    restricted solves, and :func:`dual_field_coupling` for the diagnostic that measures,
+    after the fact, whether the two fields turned out related.
+    """
     nx, ny, nz, nt = data.shape
-    disp_slice = (
-        display_slice if display_slice != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
-    )
+    dual = pe_axis2 is not None
+    if dual and pe_axis2 == pe_axis:
+        raise ValueError(f"the two encode axes must differ, got pe_axis=pe_axis2={pe_axis}")
+    axes = [pe_axis] if not dual else [pe_axis, pe_axis2]
+    if dual:
+        # Both encode axes must lie in the display plane, so the un-encoded third axis is
+        # the one we cut along — the same forcing the 2-D dual-PE path applies.
+        disp_slice = next(a for a in (0, 1, 2) if a not in axes)
+    else:
+        disp_slice = (
+            display_slice
+            if display_slice != pe_axis
+            else next(a for a in (0, 1, 2) if a != pe_axis)
+        )
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
     if verbose:
-        print(f"🌀 locomoco {_geometry_report(data.shape, pe_axis, disp_slice, is_3dacq=True)}")
+        print(
+            f"🌀 locomoco "
+            f"{_geometry_report(data.shape, pe_axis, disp_slice, is_3dacq=True, dual=dual)}"
+        )
 
     vol4d = torch.from_numpy(np.ascontiguousarray(data)).float()
-    flow3d = _build_flow3d_fn(
+    # Single echo: no per-echo scaling to apply, so every axis gets alpha = 1.
+    alphas = torch.ones(len(axes), 1)
+    flow3d = _build_flow3d_axes_fn(
         backend,
-        pe_axis,
+        axes,
+        alphas,
         n_levels=n_levels,
         n_iters=n_iters,
         window_sigma=window_sigma,
@@ -3016,6 +3339,10 @@ def _run_3dacq_plain(
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
         search_min_steps=search_min_steps,
+        warp_interp=warp_interp,
+        warp_radius=warp_radius,
+        xcorr_passes=xcorr_passes,
+        sep_floor=sep_floor,
     )
 
     # xcorr searchlight diagnostics, filled by the LAST estimate pass (see _refine_loop):
@@ -3033,29 +3360,44 @@ def _run_3dacq_plain(
             x = _blur3d_b(x, smooth_sigma)
         return x[0]
 
-    def _estimate(ref_vol: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    # Dual runs also carry the per-voxel separability of the two axes (flow backend).
+    sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
+
+    def _estimate(ref_vol: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         fxb = _prep(ref_vol)
-        disp = torch.zeros(nx, ny, nz, nt)
+        disps = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         corrected = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
             mv = vol4d[..., t].to(device)
             mvb = _prep(mv)
             conf_acc: list[torch.Tensor] | None = [] if xc else None
             curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
-            d = flow3d(fxb[None], mvb[None], conf_out=conf_acc, curve_out=curve_acc)[0]
-            corrected[..., t] = _shift3d_axis(
-                mv[None], d[None], pe_axis, mode=warp_interp, radius=warp_radius
+            sep_acc: list[torch.Tensor] | None = [] if sep_field is not None else None
+            d = flow3d(
+                [fxb[None]], [mvb[None]], conf_out=conf_acc, curve_out=curve_acc, sep_out=sep_acc
+            )
+            corrected[..., t] = _shift3d_axes(
+                mv[None], d, axes, mode=warp_interp, radius=warp_radius
             )[0].cpu()
-            disp[..., t] = d.cpu()
+            for k in range(len(axes)):
+                disps[k][..., t] = d[k][0].cpu()
             if conf_field is not None and conf_acc:
-                conf_field[..., t] = conf_acc[0][0].cpu()
+                # Dual: a voxel is only as trustworthy as its WEAKER axis, so the two
+                # searchlight qualities combine by min. `sep_map` is where the dual-only
+                # ambiguity (which axis was indeterminate) is recorded.
+                c = conf_acc[0][0]
+                for extra in conf_acc[1:]:
+                    c = torch.minimum(c, extra[0])
+                conf_field[..., t] = c.cpu()
+            if sep_acc:
+                sep_field[..., t] = sep_acc[0][0].cpu()
             if curve_acc is not None:
                 curve_box["curve"] = (
                     torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
                 )
                 rr = float(max(1, int(np.ceil(max_shift))))
                 curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
-        return disp, corrected
+        return disps, corrected
 
     # Gate before the first refine pass, not after the last: refine rebuilds its next
     # reference from `corrected`, so ungated no-data flow would be baked into the
@@ -3075,15 +3417,15 @@ def _run_3dacq_plain(
         )
         soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
 
-    def _gate3d(d, corr):
+    def _gate3d(d: list[torch.Tensor], corr):
         if soft_xyz is None:
             return d, corr
-        d = d * soft_xyz[..., None]
+        d = [x * soft_xyz[..., None] for x in d]
         for t in range(nt):
-            corr[..., t] = _shift3d_axis(
+            corr[..., t] = _shift3d_axes(
                 vol4d[..., t].to(device)[None],
-                d[..., t].to(device)[None],
-                pe_axis,
+                [x[..., t].to(device)[None] for x in d],
+                axes,
                 mode=warp_interp,
                 radius=warp_radius,
             )[0].cpu()
@@ -3103,7 +3445,12 @@ def _run_3dacq_plain(
             disp,
             corrected,
             reduce_ref=lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device),
-            brain_rms=lambda d, p: float((d[brain] - p[brain]).pow(2).mean().sqrt()),
+            # The step is the total move across BOTH axes, so a dual run converges only
+            # when neither component is still shifting.
+            brain_rms=lambda d, p: float(
+                sum(float((a[brain] - b[brain]).pow(2).mean()) for a, b in zip(d, p, strict=True))
+                ** 0.5
+            ),
             refine_rounds=refine_rounds,
             converge=converge,
             converge_rel=converge_rel,
@@ -3111,22 +3458,35 @@ def _run_3dacq_plain(
             verbose=verbose,
         )
 
-    p_canon = disp.permute(perm4).contiguous()
-    u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-    v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+    # Canonical layout: u carries axis a1, v carries a0. Single-PE fills only the PE
+    # component and leaves the other zero; dual fills both with real displacements.
+    canon = [d.permute(perm4).contiguous() for d in disp]
+    by_axis = dict(zip(axes, canon, strict=True))
+    zero = torch.zeros_like(canon[0])
+    u_canon = by_axis.get(a1, zero)
+    v_canon = by_axis.get(a0, zero)
     if verbose:
-        ap = disp.abs()
-        sel = ap[ap > 0]
-        med = float(sel.median()) if sel.numel() else 0.0
-        print(
-            f"🌀 locomoco 3D-acq: {nt} frames, PE axis {pe_axis}, backend={backend}, "
-            f"ref={ref_mode} (single 3-D solve, no slicing); |disp| median {med:.3f} vox, "
-            f"max {float(ap.max()):.3f} vox"
-        )
+        for k, ax in enumerate(axes):
+            ap = disp[k].abs()
+            sel = ap[ap > 0]
+            med = float(sel.median()) if sel.numel() else 0.0
+            label = "PE" if k == 0 else "partition"
+            print(
+                f"🌀 locomoco 3D-acq: {nt} frames, {label} axis {ax}, backend={backend}, "
+                f"ref={ref_mode} (single 3-D solve, no slicing); |disp| median {med:.3f} vox, "
+                f"max {float(ap.max()):.3f} vox"
+            )
+        if sep_field is not None:
+            s = sep_field[sep_field > 0]
+            if s.numel():
+                print(
+                    f"   axis separability: median {float(s.median()):.3f} "
+                    f"(1 = axes cleanly separable, 0 = aperture-ambiguous)"
+                )
     return LocomocoResult(
         u_canon=u_canon,
         v_canon=v_canon,
-        corrected_canon=torch.zeros_like(p_canon),
+        corrected_canon=torch.zeros_like(canon[0]),
         perm=perm4,
         pe_flow_is_u=pe_flow_is_u,
         pe_axis=pe_axis,
@@ -3134,7 +3494,9 @@ def _run_3dacq_plain(
         orig_shape=(nx, ny, nz, nt),
         a0=a0,
         a1=a1,
-        dual=False,
+        dual=dual,
+        pe_axis2=pe_axis2,
+        sep_map=sep_field,
         corrected_nifti=corrected,
         confidence=conf_field,
         corr_curve=curve_box["curve"],
@@ -3245,6 +3607,183 @@ def optical_flow_lk_3d_multiecho(
     return disp
 
 
+# ── the unified axes × echoes solver ──────────────────────────────────────────
+# Every 3-D-acquired locomoco case is one call to :func:`optical_flow_lk_3d_axes`
+# with a different (axes, alphas) table — the seven cases in the CLI help are not
+# seven algorithms, they are seven rows:
+#
+#   case                                   axes        alphas
+#   3-D, primary PE                        [pe1]       [[1]]
+#   3-D ME, primary PE (TE-independent)    [pe1]       [[1, 1, …, 1]]
+#   3-D, partition, single echo            [pe2]       [[1]]
+#   3-D ME, partition (TE-dependent)       [pe2]       [[TE_e/TE_1]]
+#   3-D, primary + partition, single echo  [pe1, pe2]  [[1], [1]]
+#   3-D ME, primary + partition            [pe1, pe2]  [[1, …], [TE_e/TE_1]]
+#
+# The two fields are solved SIMULTANEOUSLY and INDEPENDENTLY: no ratio between them
+# is assumed, because the two artifacts plausibly have different physical sources
+# (a dwell-time shift along the primary PE axis is TE-independent, while the
+# partition-direction wiggle scales with TE). Whether the two recovered fields turn
+# out correlated is a measurement this code is built to make, not an input to it.
+#
+# Identifiability differs sharply between the single- and multi-echo dual cases:
+#
+#   * MULTI-ECHO dual is well posed. The two axes carry DIFFERENT per-echo scaling
+#     laws, so the echo axis itself separates them — the pooled normal equations
+#     stay well conditioned even where the local image gradient is degenerate.
+#   * SINGLE-ECHO dual has only geometry to lean on. The two components separate
+#     wherever the pooling window contains edges of differing orientation, and
+#     collapse into each other on a locally straight edge (the aperture problem).
+#     That is not a bug to hide: `sep_out` returns the per-voxel separability so the
+#     ambiguity is visible on a map instead of silently redistributed between axes.
+
+
+def optical_flow_lk_3d_axes(
+    fixed_list: list[torch.Tensor],
+    moving_list: list[torch.Tensor],
+    axes: list[int],
+    alphas: torch.Tensor,
+    *,
+    n_levels: int = 3,
+    n_iters: int = 4,
+    window_sigma: float = 2.0,
+    reg: float = 1e-3,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    match: str = "none",
+    match_sigma: float = 2.0,
+    max_disp: float | None = None,
+    sep_floor: float = 1e-2,
+    sep_out: list[torch.Tensor] | None = None,
+    slicewise_axis: int | None = None,
+) -> list[torch.Tensor]:
+    """Shared-field pyramidal LK over 1-2 encode axes and 1-N echoes, ``(B,X,Y,Z)``.
+
+    Solves for one shared field ``w_k`` per entry of ``axes`` such that echo ``e`` is
+    warped along axis ``k`` by ``alphas[k, e] · w_k``. ``alphas`` is ``(n_axes, E)``.
+    Returns one ``(B,X,Y,Z)`` field per axis, in ``axes`` order.
+
+    The Gauss-Newton normal equations are pooled over echoes AND coupled across axes::
+
+        A[k,l] = Σ_e α_k,e·α_l,e·⟨g_k·g_l⟩        b[k] = -Σ_e α_k,e·⟨g_k·r⟩
+
+    under a 3-D Gaussian window ``⟨·⟩``. One axis reduces exactly to the scalar update
+    ``-Σ_e α_e⟨g·r⟩ / (Σ_e α_e²⟨g²⟩ + reg)``, i.e. to
+    :func:`optical_flow_lk_3d_multiecho`, and at ``E=1, alpha=[[1]]`` to
+    :func:`optical_flow_lk_3d`.
+
+    Two axes solve the 2×2 directly rather than alternating two 1-DOF solves. That
+    distinction is the whole point: two restricted solves each absorb the other axis's
+    shift wherever the local edge is oblique, and averaging them does not undo it.
+
+    Conditioning is handled in the NORMALISED coordinate ``sep = 1 - ⟨g1g2⟩²/(⟨g1²⟩⟨g2²⟩)``
+    — the pooled Gram matrix's determinant divided by the product of its diagonal, so
+    ``sep ∈ [0, 1]``: 1 where the two axes' gradients are orthogonal over the window
+    (perfectly separable), 0 on a straight edge (fully ambiguous). Clamping ``sep`` at
+    ``sep_floor`` bounds the step where the data cannot tell the axes apart, and is
+    scale-free in a way a raw determinant floor is not (the determinant carries image
+    contrast units, so any absolute floor would be a different constraint per dataset).
+    ``sep_out``, if given, receives the map.
+
+    Pooling over echoes needs no explicit SNR weighting: ``g_e`` and the residual both
+    scale with echo amplitude ``s_e``, so the step is ``T + Σ s_e·N_e / Σ s_e²``, whose
+    noise variance is ``σ²/Σ s_e²`` — already the inverse-variance-optimal combination
+    under constant noise across echoes. Every echo with signal left lowers the variance.
+    An explicit per-echo weight was implemented and measured: it changed nothing, and was
+    removed rather than left as a dead knob.
+
+    ``slicewise_axis`` makes the solve 2-D multi-slice: the pooling window, the pyramid
+    blur and the pyramid downsampling all skip that axis, so each slice is solved from
+    its own data alone. That is the right geometry when every slice is acquired at its
+    own instant — pooling across slices would be averaging over acquisition times, not
+    over signal. The echoes still pool normally, because all echoes of a given slice
+    ARE sampled together: that is exactly the multi-echo win in a 2-D acquisition, more
+    evidence per slice-time without smearing across slice-times.
+    """
+    if len(axes) not in (1, 2):
+        raise ValueError(f"optical_flow_lk_3d_axes takes 1 or 2 axes, got {axes}")
+    if len(axes) == 2 and axes[0] == axes[1]:
+        raise ValueError(f"the two axes must differ, got {axes}")
+    if slicewise_axis is not None and slicewise_axis in axes:
+        raise ValueError(
+            f"slicewise_axis ({slicewise_axis}) must differ from every encode axis "
+            f"({axes}): the encode directions have to lie inside the slice plane."
+        )
+    if alphas.shape[0] != len(axes) or alphas.shape[1] != len(fixed_list):
+        raise ValueError(
+            f"alphas must be (n_axes, n_echoes) = ({len(axes)}, {len(fixed_list)}), "
+            f"got {tuple(alphas.shape)}"
+        )
+    if match != "none":
+        fixed_list = [_match_prep(f, match, match_sigma) for f in fixed_list]
+        moving_list = [_match_prep(m, match, match_sigma) for m in moving_list]
+
+    n_ax, n_echo = len(axes), len(fixed_list)
+    fpyr = [[f] for f in fixed_list]
+    mpyr = [[m] for m in moving_list]
+    for _ in range(n_levels - 1):
+        if _pyr_min_extent(fpyr[0][-1].shape[1:], slicewise_axis) < 8:
+            break
+        for j in range(n_echo):
+            fpyr[j].append(_pyr_down3d(fpyr[j][-1], slicewise_axis))
+            mpyr[j].append(_pyr_down3d(mpyr[j][-1], slicewise_axis))
+    nlev = len(fpyr[0])
+
+    disp = [torch.zeros_like(fpyr[0][-1]) for _ in range(n_ax)]
+    sep_map: torch.Tensor | None = None
+    for lvl in range(nlev - 1, -1, -1):
+        fx0 = fpyr[0][lvl]
+        if disp[0].shape[1:] != fx0.shape[1:]:
+            for k, ax in enumerate(axes):
+                # Each component rescales by ITS OWN axis ratio, not a shared one: an
+                # anisotropic pyramid step would otherwise skew the two components
+                # relative to each other.
+                scale = fx0.shape[ax + 1] / disp[k].shape[ax + 1]
+                disp[k] = (
+                    F.interpolate(
+                        disp[k].unsqueeze(1),
+                        size=tuple(fx0.shape[1:]),
+                        mode="trilinear",
+                        align_corners=True,
+                    ).squeeze(1)
+                    * scale
+                )
+        for _ in range(n_iters):
+            a = [[torch.zeros_like(disp[0]) for _ in range(n_ax)] for _ in range(n_ax)]
+            b = [torch.zeros_like(disp[0]) for _ in range(n_ax)]
+            for j in range(n_echo):
+                shifts = [float(alphas[k, j]) * disp[k] for k in range(n_ax)]
+                mw = _shift3d_axes(mpyr[j][lvl], shifts, axes, mode=warp_interp, radius=warp_radius)
+                it = mw - fpyr[j][lvl]
+                g = [_grad_axis_3d(mw, ax) for ax in axes]
+                for k in range(n_ax):
+                    ak = float(alphas[k, j])
+                    b[k] = b[k] - ak * _blur3d_b(g[k] * it, window_sigma, slicewise_axis)
+                    for m in range(k, n_ax):
+                        am = float(alphas[m, j])
+                        a[k][m] = a[k][m] + (ak * am) * _blur3d_b(
+                            g[k] * g[m], window_sigma, slicewise_axis
+                        )
+            if n_ax == 1:
+                disp[0] = disp[0] + b[0] / (a[0][0] + reg)
+            else:
+                a11 = a[0][0] + reg
+                a22 = a[1][1] + reg
+                a12 = a[0][1]
+                prod = a11 * a22
+                sep = (1.0 - (a12 * a12) / prod).clamp(0.0, 1.0)
+                sep_map = sep
+                det = prod * sep.clamp_min(sep_floor)
+                disp[0] = disp[0] + (a22 * b[0] - a12 * b[1]) / det
+                disp[1] = disp[1] + (a11 * b[1] - a12 * b[0]) / det
+            if max_disp is not None:
+                for k in range(n_ax):
+                    disp[k] = disp[k].clamp(-max_disp, max_disp)
+    if sep_out is not None and sep_map is not None:
+        sep_out.append(sep_map)
+    return disp
+
+
 def xcorr_search_flow_3d_multiecho(
     fixed_list: list[torch.Tensor],
     moving_list: list[torch.Tensor],
@@ -3263,6 +3802,7 @@ def xcorr_search_flow_3d_multiecho(
     search_min_steps: int = 5,
     ambiguity_frac: float = 0.5,
     curve_out: list[torch.Tensor] | None = None,
+    slicewise_axis: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Shared-parameter 3-D xcorr searchlight across echoes — TE-linearity enforced.
 
@@ -3293,7 +3833,8 @@ def xcorr_search_flow_3d_multiecho(
     r = float(max(1, int(math.ceil(max_shift))))
 
     def _win(x: torch.Tensor) -> torch.Tensor:
-        return _blur3d_b(x, window_sigma)
+        # slicewise: the searchlight is a 2-D disc in the slice plane, never a 3-D ball
+        return _blur3d_b(x, window_sigma, slicewise_axis)
 
     # One sinc-exact shifter per echo (forward FFT precomputed once); echo j is shifted by
     # ratio[j]·s at each offset. See :func:`_fourier_shifter` / xcorr_search_flow_3d.
@@ -3328,7 +3869,7 @@ def xcorr_search_flow_3d_multiecho(
             noshift_margin,
             reg_sigma,
             ambiguity_frac,
-            lambda x: _blur3d_b(x, reg_sigma),
+            lambda x: _blur3d_b(x, reg_sigma, slicewise_axis),
             curve_out,
             min_steps=search_min_steps,
         )
@@ -3382,9 +3923,109 @@ def xcorr_search_flow_3d_multiecho(
         trial_step=trial_step,
         noshift_margin=noshift_margin,
         reg_sigma=reg_sigma,
-        blur=lambda x: _blur3d_b(x, reg_sigma),
+        blur=lambda x: _blur3d_b(x, reg_sigma, slicewise_axis),
     )
     return s_field / float(alpha[m]), conf  # echo-1 scale (alpha_1 = 1)
+
+
+def xcorr_search_flow_3d_axes(
+    fixed_list: list[torch.Tensor],
+    moving_list: list[torch.Tensor],
+    axes: list[int],
+    alphas: torch.Tensor,
+    *,
+    max_shift: float = 3.0,
+    window_sigma: float = 2.0,
+    trial_step: float = 0.5,
+    weights: list[torch.Tensor] | None = None,
+    noshift_margin: float = 0.0,
+    reg_sigma: float = 1.5,
+    fourier_shift: bool = True,
+    peak_mode: str = "first_peak",
+    search_min_steps: int = 5,
+    n_passes: int = 3,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    curve_out: list[torch.Tensor] | None = None,
+    slicewise_axis: int | None = None,
+) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+    """The xcorr counterpart of :func:`optical_flow_lk_3d_axes` — 1-2 axes, 1-N echoes.
+
+    One axis delegates straight to :func:`xcorr_search_flow_3d_multiecho`. Two axes are
+    searched SEPARABLY, alternating for ``n_passes``: a joint 2-D offset grid would cost
+    O(trials²) per voxel, which the 2-D dual-PE path already declined to pay for the same
+    reason.
+
+    Each half-pass is a true block-coordinate step, not an increment: the moving volumes
+    are pre-warped by the OTHER axis's current estimate only, so the search along this
+    axis sees the other one already corrected and re-solves its own component in full.
+    Assigning the result (rather than accumulating a residual search on top of a
+    partly-warped image) keeps every pass a search over the original intensities, so the
+    sub-voxel parabola fit never compounds its own quantisation, and the estimate stays
+    inside ``max_shift`` by construction.
+
+    Returns ``(fields, confs)``, one per axis in ``axes`` order, each in echo-1 units
+    (``alphas[k, e] · fields[k]`` is echo ``e``'s shift along ``axes[k]``).
+
+    ``curve_out`` (the correlation landscape) is only captured for the single-axis case —
+    under alternation there is no single landscape, each axis has one per pass.
+    """
+    if len(axes) not in (1, 2):
+        raise ValueError(f"xcorr_search_flow_3d_axes takes 1 or 2 axes, got {axes}")
+    if len(axes) == 2 and axes[0] == axes[1]:
+        raise ValueError(f"the two axes must differ, got {axes}")
+    if slicewise_axis is not None and slicewise_axis in axes:
+        raise ValueError(
+            f"slicewise_axis ({slicewise_axis}) must differ from every encode axis "
+            f"({axes}): the encode directions have to lie inside the slice plane."
+        )
+    if alphas.shape[0] != len(axes) or alphas.shape[1] != len(fixed_list):
+        raise ValueError(
+            f"alphas must be (n_axes, n_echoes) = ({len(axes)}, {len(fixed_list)}), "
+            f"got {tuple(alphas.shape)}"
+        )
+
+    def _search(mv: list[torch.Tensor], k: int, curves):
+        return xcorr_search_flow_3d_multiecho(
+            fixed_list,
+            mv,
+            alphas[k],
+            axes[k],
+            max_shift=max_shift,
+            window_sigma=window_sigma,
+            trial_step=trial_step,
+            weights=weights,
+            noshift_margin=noshift_margin,
+            reg_sigma=reg_sigma,
+            fourier_shift=fourier_shift,
+            peak_mode=peak_mode,
+            search_min_steps=search_min_steps,
+            curve_out=curves,
+            slicewise_axis=slicewise_axis,
+        )
+
+    if len(axes) == 1:
+        w, conf = _search(moving_list, 0, curve_out)
+        return [w], [conf]
+
+    n_echo = len(fixed_list)
+    w = [torch.zeros_like(fixed_list[0]) for _ in axes]
+    confs = [torch.zeros_like(fixed_list[0]) for _ in axes]
+    for _ in range(n_passes):
+        for k in (0, 1):
+            other = 1 - k
+            mv = [
+                _shift3d_axes(
+                    moving_list[j],
+                    [float(alphas[other, j]) * w[other]],
+                    [axes[other]],
+                    mode=warp_interp,
+                    radius=warp_radius,
+                )
+                for j in range(n_echo)
+            ]
+            w[k], confs[k] = _search(mv, k, None)
+    return w, confs
 
 
 @dataclass
@@ -3411,6 +4052,12 @@ class MultiEchoLocomocoResult:
     # the divisor is a display choice — and ÷echo1 is unreadable when echo 1 is the
     # inter-echo anchor (alpha_1 ≈ 0 blows every other entry up).
     alpha_label: str = "alpha(÷echo1)"
+    # ── two encode axes: the PRIMARY phase-encode field alongside the partition one ──
+    # `w_field` / `pe_axis` / `alpha` always describe the axis the per-echo scaling law
+    # applies to — the partition axis in a dual run. The primary-PE field is flat across
+    # echoes by construction (alpha = 1), so it needs no scaling vector of its own.
+    w_field_pe1: torch.Tensor | None = None  # (nx,ny,nz,T) primary-PE displacement
+    pe_axis1: int | None = None
 
 
 def _rank1_factor_echoes(disps: torch.Tensor, alpha_init: torch.Tensor, n_iter: int = 8):
@@ -3469,15 +4116,27 @@ def estimate_residual_flow_multiecho(
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    pe_axis2: int | None = None,
+    xcorr_passes: int = 3,
+    sep_floor: float = 1e-2,
+    slicewise: bool = False,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
-    """Joint residual partition-direction motion for multi-echo 3-D EPI.
+    """Joint residual encode-axis motion for multi-echo EPI.
 
     ``datas`` is the list of E moco'd 4-D series (one per echo, identical grid + T);
     ``echo_times`` the matching TEs in ms. ``pe_axis`` is the corrected direction (the
-    slice/partition axis for 3-D EPI, so PE==slice is fine). All echoes are treated as
-    one 3-D-acquired series (no per-slice fields).
+    slice/partition axis for 3-D EPI, so PE==slice is fine). By default all echoes are
+    treated as one 3-D-acquired series (no per-slice fields).
+
+    ``slicewise=True`` is the 2-D MULTI-SLICE case instead: one field per slice, solved
+    from that slice's own data, with ``slice_axis`` excluded from every pooling window
+    and from the pyramid. Echoes still pool — every echo of a given slice is acquired at
+    the same instant, so they are independent looks at ONE displacement. That is the
+    whole multi-echo win here: more evidence per slice-time, without smearing across
+    slice-times. A 2-D acquisition has no partition direction, so this is a single-axis,
+    TE-INDEPENDENT solve — pass ``flat_scaling=True``.
 
     Learns a shared field ``w(r,t)`` and per-echo scaling ``alpha`` under the model
     ``disp_e = alpha_e · w``:
@@ -3495,6 +4154,16 @@ def estimate_residual_flow_multiecho(
        series (motion removed → sharp) and re-solve, converging the template out of its
        motion-blur bias — the same knob as the single-echo ``-refine`` and the dominant
        lever on recovered MAGNITUDE (a blurred initial reference biases displacement low).
+
+    ``pe_axis2`` adds the PARTITION axis alongside ``pe_axis`` (then read as the PRIMARY
+    phase encode) and solves both shared fields at once. The two carry DIFFERENT, known
+    per-echo scaling laws — primary PE is flat (``alpha=1``, TE-independent), partition
+    is ``TE_e/TE_1`` — and that difference is what makes the two-axis multi-echo case
+    well posed where the single-echo one is not: the echo axis separates the axes even
+    where the local image gradient cannot. Only the PARTITION alpha is ever learned; the
+    primary axis stays pinned flat, because its TE-independence is the physical premise
+    the whole decomposition rests on and freeing it would let the two laws collapse onto
+    each other. See :func:`optical_flow_lk_3d_axes`.
 
     Returns per-echo :class:`LocomocoResult`\\ s (warp ``alpha_e·w``, echo warped by it)
     plus the shared ``alpha`` / linearity diagnostics.
@@ -3517,24 +4186,51 @@ def estimate_residual_flow_multiecho(
     if any(t <= 0 for t in echo_times):
         raise ValueError(f"-echo_times must all be > 0 ms, got {echo_times}.")
     nx, ny, nz, nt = shp
+
+    # Geometry first: whether this is a 2-D multi-slice or a 3-D solve decides what the
+    # shared validation should even be checking (PE == slice is fine in 3-D, fatal in 2-D).
+    dual = pe_axis2 is not None
+    if dual and pe_axis2 == pe_axis:
+        raise ValueError(f"the two encode axes must differ, got pe_axis=pe_axis2={pe_axis}")
+    if slicewise and dual:
+        raise ValueError("a 2-D multi-slice acquisition has no partition direction; drop pe_axis2.")
+    axes = [pe_axis] if not dual else [pe_axis, pe_axis2]
+    if dual:
+        disp_slice = next(a for a in (0, 1, 2) if a not in axes)
+    elif slicewise:
+        if slice_axis == pe_axis:
+            raise ValueError(
+                f"slicewise needs the PE axis inside the slice plane, but slice_axis and "
+                f"pe_axis are both {pe_axis}."
+            )
+        disp_slice = slice_axis
+    else:
+        disp_slice = (
+            slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
+        )
+    # The axis every pooling window and pyramid step must leave alone (None = 3-D solve).
+    sw_axis = disp_slice if slicewise else None
+
     _validate_estimation_inputs(
         shp,
         pe_axis,
         slice_axis,
-        is_3dacq=True,
+        is_3dacq=not slicewise,
         max_shift=max_shift,
         trial_step=trial_step,
         window_sigma=window_sigma,
         verbose=verbose,
     )
 
-    disp_slice = slice_axis if slice_axis != pe_axis else next(a for a in (0, 1, 2) if a != pe_axis)
     a0, a1 = sorted(a for a in (0, 1, 2) if a != disp_slice)
     pe_flow_is_u = pe_axis == a1
     perm4 = [3, disp_slice, a0, a1]
+    n_ax = len(axes)
     if verbose:
         print(
-            f"🌀 locomoco {_geometry_report(shp, pe_axis, disp_slice, is_3dacq=True)}  × {e} echoes"
+            f"🌀 locomoco "
+            f"{_geometry_report(shp, pe_axis, disp_slice, is_3dacq=not slicewise, dual=dual)}"
+            f"  × {e} echoes"
         )
 
     te = torch.tensor([float(x) for x in echo_times], dtype=torch.float32)
@@ -3543,9 +4239,9 @@ def estimate_residual_flow_multiecho(
     # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
     # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
     def _prep(v: torch.Tensor) -> torch.Tensor:
-        x = _spatial_highpass3d(v[None], hpf_sigma)
+        x = _spatial_highpass3d(v[None], hpf_sigma, sw_axis)
         if smooth_sigma > 0:
-            x = _blur3d_b(x, smooth_sigma)
+            x = _blur3d_b(x, smooth_sigma, sw_axis)
         return x[0]
 
     refs = [_prep(_select_ref_vol(v, ref_mode, first_n).to(device)) for v in vols]
@@ -3557,9 +4253,10 @@ def estimate_residual_flow_multiecho(
     # Single-echo backend estimator — used to LEARN alpha (rank-1 factor of one per-echo
     # pass) and, for xcorr, to solve the shared field itself. Persistent bars (leave=True)
     # so a long run stays visible.
-    flow3d = _build_flow3d_fn(
+    flow3d = _build_flow3d_axes_fn(
         backend,
-        pe_axis,
+        axes,
+        torch.ones(n_ax, 1),  # one echo at a time: no cross-echo scaling to apply
         n_levels=n_levels,
         n_iters=n_iters,
         window_sigma=window_sigma,
@@ -3569,6 +4266,11 @@ def estimate_residual_flow_multiecho(
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
         search_min_steps=search_min_steps,
+        warp_interp=warp_interp,
+        warp_radius=warp_radius,
+        xcorr_passes=xcorr_passes,
+        sep_floor=sep_floor,
+        slicewise_axis=sw_axis,
     )
 
     # Confidence map from the pooled searchlight (fixed/flat-scaling xcorr path only — the
@@ -3576,53 +4278,70 @@ def estimate_residual_flow_multiecho(
     # final _pooled_xcorr call and surfaced on the result for a `-save_confidence` diag.
     pooled_conf = torch.zeros(nx, ny, nz, nt)
     have_pooled_conf = False
+    # Per-voxel separability of the two axes (flow backend only) — see optical_flow_lk_3d_axes.
+    sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
     curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
     corr_curve: torch.Tensor | None = None
     corr_offsets: torch.Tensor | None = None
 
     def _per_echo_estimate(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
-        out = torch.zeros(e, nx, ny, nz, nt)
+        """Each echo solved ALONE, ``(n_ax, e, nx, ny, nz, nt)`` — the input to alpha learning."""
+        out = torch.zeros(n_ax, e, nx, ny, nz, nt)
         for j in range(e):
             for t in tqdm(
                 range(nt), desc=f"me {tag} e{j + 1}/{e}", unit="frame", leave=True, disable=nt < 3
             ):
                 mv = vols[j][..., t].to(device)
                 mvb = _prep(mv)
-                out[j, ..., t] = flow3d(cur_refs[j][None], mvb[None])[0].cpu()
+                fields = flow3d([cur_refs[j][None]], [mvb[None]])
+                for k in range(n_ax):
+                    out[k, j, ..., t] = fields[k][0].cpu()
         return out
 
-    def _project(flat: torch.Tensor) -> torch.Tensor:
-        """Least-squares project the per-echo estimates (e, R) onto the current alpha."""
-        return (alpha[:, None] * flat).sum(0) / max(float((alpha * alpha).sum()), 1e-12)
+    def _project(flat: torch.Tensor, k: int) -> torch.Tensor:
+        """Least-squares project axis ``k``'s per-echo estimates (e, R) onto its alpha."""
+        a = alphas[k]
+        return (a[:, None] * flat).sum(0) / max(float((a * a).sum()), 1e-12)
 
-    def _joint_lk(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
-        out = torch.zeros(nx, ny, nz, nt)
+    def _joint_lk(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
+        out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
-            out[..., t] = optical_flow_lk_3d_multiecho(
+            sep_acc: list[torch.Tensor] | None = [] if (dual and sep_field is not None) else None
+            fields = optical_flow_lk_3d_axes(
                 [r[None] for r in cur_refs],
                 [m[None] for m in movs],
-                alpha,
-                pe_axis,
+                axes,
+                alphas,
                 n_levels=n_levels,
                 n_iters=n_iters,
                 window_sigma=window_sigma,
                 warp_interp=warp_interp,
                 warp_radius=warp_radius,
-            )[0].cpu()
+                max_disp=max_shift if dual else None,
+                sep_floor=sep_floor,
+                sep_out=sep_acc,
+                slicewise_axis=sw_axis,
+            )
+            for k in range(n_ax):
+                out[k][..., t] = fields[k][0].cpu()
+            if sep_acc and sep_field is not None:
+                sep_field[..., t] = sep_acc[0][0].cpu()
         return out
 
-    def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+    def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
         nonlocal have_pooled_conf, corr_curve, corr_offsets
-        out = torch.zeros(nx, ny, nz, nt)
+        out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
-            curve_acc: list[torch.Tensor] | None = [] if t == curve_frame else None
-            w_be, c_be = xcorr_search_flow_3d_multiecho(
+            # The correlation landscape is a single-axis concept; under alternation each
+            # axis has one per pass, so it is captured only for the one-axis case.
+            curve_acc: list[torch.Tensor] | None = [] if (t == curve_frame and not dual) else None
+            w_be, c_be = xcorr_search_flow_3d_axes(
                 [r[None] for r in cur_refs],
                 [m[None] for m in movs],
-                alpha,
-                pe_axis,
+                axes,
+                alphas,
                 max_shift=max_shift,
                 window_sigma=window_sigma,
                 trial_step=trial_step,
@@ -3630,10 +4349,19 @@ def estimate_residual_flow_multiecho(
                 reg_sigma=reg_sigma,
                 peak_mode=peak_mode,
                 search_min_steps=search_min_steps,
+                n_passes=xcorr_passes,
+                warp_interp=warp_interp,
+                warp_radius=warp_radius,
                 curve_out=curve_acc,
+                slicewise_axis=sw_axis,
             )
-            out[..., t] = w_be[0].cpu()
-            pooled_conf[..., t] = c_be[0].cpu()
+            for k in range(n_ax):
+                out[k][..., t] = w_be[k][0].cpu()
+            # A voxel is only as trustworthy as its weaker axis.
+            conf = c_be[0][0]
+            for extra in c_be[1:]:
+                conf = torch.minimum(conf, extra[0])
+            pooled_conf[..., t] = conf.cpu()
             if curve_acc is not None:
                 corr_curve = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
                 rr = float(max(1, int(np.ceil(max_shift))))
@@ -3641,7 +4369,7 @@ def estimate_residual_flow_multiecho(
         have_pooled_conf = True
         return out
 
-    def _solve_w(cur_refs: list[torch.Tensor], tag: str) -> torch.Tensor:
+    def _solve_w(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
         # flow: image-space shared-field pooled LK. xcorr with FIXED alpha: shared-parameter
         # searchlight pooling every echo into one informed search (the "best of both"). xcorr
         # while LEARNING alpha: per-echo estimate + project (the per-echo fields are needed to
@@ -3650,16 +4378,16 @@ def estimate_residual_flow_multiecho(
             return _joint_lk(cur_refs, tag)
         if not learn:
             return _pooled_xcorr(cur_refs, tag)
-        return _project(_per_echo_estimate(cur_refs, tag).reshape(e, -1)).reshape(nx, ny, nz, nt)
+        per = _per_echo_estimate(cur_refs, tag)
+        return [_project(per[k].reshape(e, -1), k).reshape(nx, ny, nz, nt) for k in range(n_ax)]
 
-    def _corrected_echo(cur_w: torch.Tensor, j: int) -> torch.Tensor:
-        disp_e = alpha[j] * cur_w
+    def _corrected_echo(cur_w: list[torch.Tensor], j: int) -> torch.Tensor:
         out = torch.zeros(nx, ny, nz, nt)
         for t in range(nt):
-            out[..., t] = _shift3d_axis(
+            out[..., t] = _shift3d_axes(
                 vols[j][..., t].to(device)[None],
-                disp_e[..., t].to(device)[None],
-                pe_axis,
+                [float(alphas[k, j]) * cur_w[k][..., t].to(device)[None] for k in range(n_ax)],
+                axes,
                 mode=warp_interp,
                 radius=warp_radius,
             )[0].cpu()
@@ -3673,19 +4401,42 @@ def estimate_residual_flow_multiecho(
     if alpha_override is not None:
         if alpha_override.shape != (e,):
             raise ValueError(f"alpha_override must be ({e},), got {tuple(alpha_override.shape)}.")
-        alpha = alpha_override.float().clone()
+        partition_alpha = alpha_override.float().clone()
     else:
-        alpha = torch.ones(e) if flat_scaling else te / float(te[0])
+        partition_alpha = torch.ones(e) if flat_scaling else te / float(te[0])
+    if dual:
+        # The two laws must DIFFER — that difference is what separates the axes across
+        # echoes. Primary PE is pinned flat (TE-independent by construction); only the
+        # partition row is ever learned.
+        alphas = torch.stack([torch.ones(e), partition_alpha])
+        # Identical laws collapse the advantage: if the partition scales flat too, the
+        # echo axis carries no information distinguishing the axes and the solve degrades
+        # to the (ill-posed on straight edges) single-echo dual case with more SNR. Worth
+        # saying out loud, because the run still "works" and the numbers still look fine.
+        spread = float((partition_alpha / partition_alpha.abs().max().clamp_min(1e-12)).std())
+        if spread < 1e-3 and verbose:
+            print(
+                "   ⚠ both encode axes have the SAME per-echo scaling law, so the echo "
+                "axis cannot separate them — the split between axes now rests on image "
+                "structure alone (check _locomoco_sep). Drop -me_flat_scaling to let the "
+                "partition axis scale with TE."
+            )
+    else:
+        alphas = partition_alpha[None]
     if learn:
-        disp0 = _per_echo_estimate(refs, "init").reshape(e, -1)
-        alpha, _ = _rank1_factor_echoes(disp0, alpha)
+        disp0 = _per_echo_estimate(refs, "init")
+        # Learn only the partition row; row 0 of a dual solve stays flat.
+        k_learn = n_ax - 1
+        learned, _ = _rank1_factor_echoes(disp0[k_learn].reshape(e, -1), alphas[k_learn])
+        alphas[k_learn] = learned
         w = (
             _joint_lk(refs, "joint")
             if backend == "flow"
-            else _project(disp0).reshape(nx, ny, nz, nt)
+            else [_project(disp0[k].reshape(e, -1), k).reshape(nx, ny, nz, nt) for k in range(n_ax)]
         )
     else:
         w = _solve_w(refs, "joint" if backend == "flow" else "solve")
+    alpha = alphas[-1]  # the reported/diagnosed law is the partition one
 
     # Gate every solve, not just the last: _reduce_me derives each echo's next reference
     # from w, so ungated no-data flow would go straight into the refined template.
@@ -3702,11 +4453,15 @@ def estimate_residual_flow_multiecho(
             automask_sigma,
             device,
             coverage_erode=coverage_erode,
+            # 2-D multi-slice: margin/feather are in-plane concepts, per slice.
+            in_plane=slicewise,
         )
         soft_xyz = soft.permute(_inv_perm([disp_slice, a0, a1])).contiguous()
 
-    def _gate_me(field):
-        return field if soft_xyz is None else field * soft_xyz[..., None]
+    def _gate_me(fields: list[torch.Tensor]) -> list[torch.Tensor]:
+        if soft_xyz is None:
+            return fields
+        return [f * soft_xyz[..., None] for f in fields]
 
     w = _gate_me(w)
 
@@ -3720,7 +4475,9 @@ def estimate_residual_flow_multiecho(
         # State is w itself (corrected is derived per echo on demand); the shared engine
         # carries corrected == w. brain is None until w has signal, so brain_rms falls
         # back to the whole field. Each solve's tqdm label tracks the pass number.
-        brain = _brain_mask_from(w.abs().mean(dim=3)) if float(w.abs().max()) > 0 else None
+        tot = torch.stack([f.abs() for f in w], 0).sum(0)
+        brain = _brain_mask_from(tot.mean(dim=3)) if float(tot.max()) > 0 else None
+        del tot
         _pass = {"n": 0}
 
         def _reduce_me(cur_w):
@@ -3735,8 +4492,14 @@ def estimate_residual_flow_multiecho(
             return w_new, w_new
 
         def _brain_rms_me(disp, prev):
-            d = (disp[brain] - prev[brain]) if brain is not None else (disp - prev)
-            return float(d.pow(2).mean().sqrt()) if d.numel() else 0.0
+            # Total move across every axis: a dual run converges only when neither
+            # component is still shifting.
+            acc = 0.0
+            for a, b in zip(disp, prev, strict=True):
+                d = (a[brain] - b[brain]) if brain is not None else (a - b)
+                if d.numel():
+                    acc += float(d.pow(2).mean())
+            return acc**0.5
 
         w, _ = _refine_loop(
             _est_me,
@@ -3753,20 +4516,22 @@ def estimate_residual_flow_multiecho(
 
     # Build per-echo results: echo e warped by alpha_e · w.
     per_echo: list[LocomocoResult] = []
+    sep_canon = None if sep_field is None else sep_field
     for j in range(e):
-        disp_e = (alpha[j] * w).contiguous()
         # Materializing the corrected 4-D series (a per-frame warp of every echo) is
         # pure waste when the caller won't write it (-no_corrected); the warp field and
         # diagnostics don't need it. Refine builds its own corrected internally above.
         corrected = _corrected_echo(w, j) if want_corrected else None
-        p_canon = disp_e.permute(perm4).contiguous()
-        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        canon = [
+            (alphas[k, j] * w[k]).contiguous().permute(perm4).contiguous() for k in range(n_ax)
+        ]
+        by_axis = dict(zip(axes, canon, strict=True))
+        zero = torch.zeros_like(canon[0])
         per_echo.append(
             LocomocoResult(
-                u_canon=u_canon,
-                v_canon=v_canon,
-                corrected_canon=torch.zeros_like(p_canon),
+                u_canon=by_axis.get(a1, zero),
+                v_canon=by_axis.get(a0, zero),
+                corrected_canon=torch.zeros_like(canon[0]),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
                 pe_axis=pe_axis,
@@ -3774,7 +4539,9 @@ def estimate_residual_flow_multiecho(
                 orig_shape=(nx, ny, nz, nt),
                 a0=a0,
                 a1=a1,
-                dual=False,
+                dual=dual,
+                pe_axis2=pe_axis2,
+                sep_map=sep_canon,
                 corrected_nifti=corrected,
             )
         )
@@ -3791,7 +4558,7 @@ def estimate_residual_flow_multiecho(
         r2 = 1.0
 
     if verbose:
-        ap = w.abs()
+        ap = w[-1].abs()
         sel = ap[ap > 0]
         med = float(sel.median()) if sel.numel() else 0.0
         a_str = ", ".join(f"{float(x):.3f}" for x in alpha)
@@ -3802,22 +4569,40 @@ def estimate_residual_flow_multiecho(
             tag = "·  FLAT scaling (alpha=1, all echoes shift equally)"
         else:
             tag = "·  fixed to TE ratio"
+        which = f"partition axis {pe_axis2}" if dual else f"PE axis {pe_axis}"
         print(
-            f"🌀 locomoco ME-3D: {e} echoes (TE {te_str} ms), {nt} frames, PE axis {pe_axis}, "
+            f"🌀 locomoco ME-3D: {e} echoes (TE {te_str} ms), {nt} frames, {which}, "
             f"backend={backend}; shared |w| median {med:.3f} vox, max {float(ap.max()):.3f} vox"
         )
         print(f"   alpha (÷echo1) = [{a_str}]  {tag}")
+        if dual:
+            p1 = w[0].abs()
+            s1 = p1[p1 > 0]
+            print(
+                f"   primary PE axis {pe_axis} (alpha pinned FLAT, TE-independent): "
+                f"|w| median {float(s1.median()) if s1.numel() else 0.0:.3f} vox, "
+                f"max {float(p1.max()):.3f} vox"
+            )
+            if sep_field is not None:
+                sv = sep_field[sep_field > 0]
+                if sv.numel():
+                    print(
+                        f"   axis separability: median {float(sv.median()):.3f} "
+                        f"(multi-echo separates the axes by their differing TE laws)"
+                    )
 
     return MultiEchoLocomocoResult(
         per_echo=per_echo,
         alpha=alpha,
         echo_times=te,
-        w_field=w,
-        pe_axis=pe_axis,
+        w_field=w[-1],
+        pe_axis=axes[-1],
         linearity_r2=r2,
         confidence=pooled_conf if have_pooled_conf else None,
         corr_curve=corr_curve,
         corr_offsets=corr_offsets,
+        w_field_pe1=w[0] if dual else None,
+        pe_axis1=pe_axis if dual else None,
     )
 
 
@@ -4149,6 +4934,16 @@ def polish_me_result(
     nx, ny, nz, nt = w.shape
     alpha = result.alpha
     pe_axis = result.pe_axis
+    # Two encode axes: the primary-PE field rides alongside, with its own (flat) law.
+    dual = result.w_field_pe1 is not None and result.pe_axis1 is not None
+    axes = [result.pe_axis1, pe_axis] if dual else [pe_axis]
+    w_axes = [result.w_field_pe1, w] if dual else [w]
+    # Per-CHANNEL scaling: channel `pe_axis1` is flat across echoes, channel `pe_axis`
+    # carries the TE law. A single alpha_e would apply the TE law to both.
+    alpha_ch = torch.ones(3, e)
+    alpha_ch[pe_axis] = alpha
+    if dual:
+        alpha_ch[result.pe_axis1] = torch.ones(e)
 
     # Reference = temporal median of the corrected series (refined template). The
     # moving data is the corrected series (polish) or the raw echoes (full backend).
@@ -4180,7 +4975,9 @@ def polish_me_result(
         ).contiguous()
     else:
         source_series = torch.stack([c.permute(2, 1, 0, 3).contiguous() for c in corr_series])
-    seed_series = torch.zeros(nz, ny, nx, nt)  # start from zero (residual, or full from raw)
+    # One seed per encode axis; zero either way (residual for the polish, the full field
+    # from raw for the backend).
+    seed_series = torch.zeros(len(axes), nz, ny, nx, nt)
 
     # Gauss-Newton on the ncc cost: analytic image-gradient Jacobian (no autograd),
     # converges in a few steps. Starts near the solution (polish) or from the full
@@ -4200,8 +4997,8 @@ def polish_me_result(
         base_echoes,
         source_series,
         seed_series,
-        pe_axis,  # PE displacement channel label is shared between NIfTI-xyz and qwarp grid
-        alpha=alpha,
+        axes,  # displacement channel labels are shared between NIfTI-xyz and qwarp grid
+        alpha=alpha_ch,
         config=cfg,
         n_levels=n_levels,
         device=device,
@@ -4209,38 +5006,44 @@ def polish_me_result(
         slicewise_axis=slicewise_axis,
     )
 
-    r = resid.permute(2, 1, 0, 3).contiguous()  # (nx, ny, nz, T) qwarp field, echo-1 scale
+    # (A, nz, ny, nx, T) -> one (nx, ny, nz, T) field per encode axis, echo-1 scale.
+    r_axes = [resid[k].permute(2, 1, 0, 3).contiguous() for k in range(len(axes))]
     # Polish adds to the estimator field; the full backend IS the field.
-    w_new = r if full else w + r
+    w_axes_new = [r if full else wk + r for wk, r in zip(w_axes, r_axes, strict=True)]
+    w_new = w_axes_new[-1]
     warped_nifti = [warped[j].permute(2, 1, 0, 3).contiguous() for j in range(e)]
 
     perm4, pe_flow_is_u = ref.perm, ref.pe_flow_is_u
     a0, a1, disp_slice = ref.a0, ref.a1, ref.slice_axis
     per_echo: list[LocomocoResult] = []
     for j in range(e):
-        disp_e = (float(alpha[j]) * w_new).contiguous()
-        p_canon = disp_e.permute(perm4).contiguous()
-        u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
-        v_canon = torch.zeros_like(p_canon) if pe_flow_is_u else p_canon
+        canon = [
+            (float(alpha_ch[ax, j]) * wk).contiguous().permute(perm4).contiguous()
+            for ax, wk in zip(axes, w_axes_new, strict=True)
+        ]
+        by_axis = dict(zip(axes, canon, strict=True))
+        zero = torch.zeros_like(canon[0])
         per_echo.append(
             LocomocoResult(
-                u_canon=u_canon,
-                v_canon=v_canon,
-                corrected_canon=torch.zeros_like(p_canon),
+                u_canon=by_axis.get(a1, zero),
+                v_canon=by_axis.get(a0, zero),
+                corrected_canon=torch.zeros_like(canon[0]),
                 perm=perm4,
                 pe_flow_is_u=pe_flow_is_u,
-                pe_axis=pe_axis,
+                pe_axis=axes[0] if dual else pe_axis,
                 slice_axis=disp_slice,
                 orig_shape=(nx, ny, nz, nt),
                 a0=a0,
                 a1=a1,
-                dual=False,
+                dual=dual,
+                pe_axis2=axes[-1] if dual else None,
+                sep_map=ref.sep_map,
                 corrected_nifti=warped_nifti[j],
             )
         )
 
     if verbose:
-        rr = r.abs()
+        rr = r_axes[-1].abs()
         sel = rr[rr > 0]
         med = float(sel.median()) if sel.numel() else 0.0
         tag = "field |w|" if full else "residual |r|"
@@ -4262,6 +5065,8 @@ def polish_me_result(
         w_field=w_new,
         pe_axis=pe_axis,
         linearity_r2=result.linearity_r2,
+        w_field_pe1=w_axes_new[0] if dual else None,
+        pe_axis1=axes[0] if dual else None,
     )
 
 

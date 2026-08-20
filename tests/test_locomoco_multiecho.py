@@ -761,7 +761,8 @@ def test_cli_want_pcs_written_with_no_warp(tmp_path):
             *paths,
             "-prefix",
             stem,
-            "-pe_dir",
+            # -me_3depi corrects the PARTITION direction, now spelled -pe_dir2
+            "-pe_dir2",
             "IS",
             "-backend",
             "flow",

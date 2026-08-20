@@ -1,23 +1,26 @@
 """``ffs_locomoco`` — residual non-linear motion correction via GPU optical flow.
 
 Estimates the frame-to-frame residual displacement that rigid motion correction
-leaves behind in single-echo EPI (mostly along the phase-encode axis) by treating
-each slice's time course as a movie and running batched optical flow against a
-reference frame. Writes:
+leaves behind in EPI — the part that lives along the encode axes and so is not a
+rigid body move — by treating the time course as a movie and registering each frame
+to a reference with batched optical flow, phase correlation, cross correlation or
+qwarp patches.
 
-  * ``{prefix}_warp``             — per-frame DICOM-mm warp for ``ffs_nwarp``; a
-                                    5-D ``.nii.gz`` file (default) or a folder of
-                                    numbered 4-D frames (``-warp_format folder``)
-  * ``{prefix}_locomoco.nii.gz``  — the non-linear-motion-corrected series
-  * ``{prefix}_locomoco_mean.nii.gz`` — temporal mean of the corrected series
-                                    (with ``-save_mean``); a registration target
-  * ``{prefix}_flow.nii.gz``      — 4-D signed PE flow (voxels; sign = direction),
-                                    scrub it like a timeseries
-  * ``{prefix}_flow.mp4``         — a contact-sheet movie of the flow, colored by
-                                    the circular-phase wheel (hue = direction).
-                                    mp4 via system ffmpeg if present, else gif.
+Up to TWO encode axes are corrected:
 
-See ``processing/locomoco.py`` for the method.
+  * ``-pe_dir1`` the PRIMARY phase encode. In-plane distortion, NOT echo-time
+    dependent (every echo shifts alike). Slicewise unless ``-is_3depi``.
+  * ``-pe_dir2`` the PARTITION / 2nd phase encode of a 3-D EPI. Echo-time DEPENDENT
+    (echo ``e`` shifts by ``TE_e/TE_1`` times the shared field).
+
+Given both, they are solved simultaneously and independently — no ratio between them
+is assumed, since the two artifacts plausibly have different physical sources — and
+their measured relationship is written out as a diagnostic rather than presumed.
+
+Writes the corrected series, the equivalent per-frame warp for ``ffs_nwarp``, a
+signed flow map per encode axis, and (for two axes) the separability and coupling
+diagnostics. Run ``ffs_locomoco -h`` for the case table and the full output guide;
+see ``processing/locomoco.py`` for the method.
 """
 
 from __future__ import annotations
@@ -54,94 +57,171 @@ class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescrip
 
 
 _EPILOG = """\
-reading the outputs (3D = one value/voxel, 4D = a time series):
+WHICH CASE ARE YOU IN?  — set the encode axes; the rest has working defaults.
 
-  _locomoco.nii.gz   (4D)  THE CORRECTED SERIES — your cleaned data. The residual
-      non-linear PE-axis motion that rigid moco left behind is resampled out. This
-      is the deliverable if you just want corrected images. With -jacobian its
-      intensities are also signal-conserved (stretched regions dim, compressed
-      brighten); without it, geometry only. Skip with -no_corrected.
+  what you are correcting                        flags
+  ----------------------------------------------------------------------------
+  2-D multi-slice, primary-PE distortion         -pe_dir1 AP
+  2-D multi-slice MULTI-ECHO, primary PE         -pe_dir1 AP -me_flat_scaling
+      (one shift per slice; every echo sees          -echo_times ...   (2+ -input)
+       the same one, so the echoes are extra
+       evidence for it -- the MEDIC-comparable
+       case, from magnitude alone)
+  3-D EPI, primary-PE distortion                 -pe_dir1 AP -is_3depi
+  3-D multi-echo, primary-PE distortion          -pe_dir1 AP -me_3depi -me_flat_scaling
+      (same shift on every echo)                     -echo_times ...
+  3-D EPI, partition wiggle, single echo         -pe_dir2 IS
+  3-D multi-echo, partition wiggle               -pe_dir2 IS -me_3depi -echo_times ...
+      (shift scales with TE)
+  3-D EPI, BOTH, single echo                     -pe_dir1 AP -pe_dir2 IS
+  3-D multi-echo, BOTH                           -pe_dir1 AP -pe_dir2 IS -me_3depi
+      (flat on PE, TE-scaled on partition)           -echo_times ...
 
-  _warp / _warp.nii.gz     THE TRANSFORM — the SAME correction as a per-frame
-      DICOM-mm displacement field for ffs_nwarp, instead of pre-resampled data.
-      Use it to fold this step into ONE interpolation with your other transforms,
-      e.g. ffs_nwarp -nwarp 'sub_warp moco.aff12.1D' = rigid-then-nonlinear in a
-      single resample (less blur than applying _locomoco on already-resampled
-      data). 5-D (nx,ny,nz,T,3) by default, or a folder of per-frame 4D files with
-      -warp_format folder. You want EITHER this or _locomoco, rarely both. Skip
-      with -no_warp.
+  Multi-echo is triggered by passing several -input with -echo_times. 2-D multi-slice
+  is the default there, exactly as on the single-echo path; -me_3depi / -is_3depi opts
+  into the 3-D solve. Any echo count from 2 upward works on every path.
 
-  _flow.nii.gz       (4D)  THE DIAGNOSTIC — signed residual PE displacement per
-      frame, in VOXELS; sign = direction along the PE axis. This is literally how
-      much motion rigid moco MISSED, per voxel per frame. Scrub it like a series.
+THE TWO ENCODE AXES
+
+  -pe_dir1  PRIMARY phase encode (a.k.a. -pe_dir / -pe). In-plane distortion.
+            NOT echo-time dependent — every echo shifts by the same amount.
+            Slicewise unless -is_3depi.
+  -pe_dir2  PARTITION / 2nd phase encode (a.k.a. -partition_dir). 3-D EPI only,
+            so it implies -is_3depi. Echo-time DEPENDENT — echo e shifts by
+            TE_e/TE_1 times the shared field. Can be given ALONE (e.g. MEDIC or a
+            fieldmap already fixed the primary axis), or with -pe_dir1.
+
+  Given both, the two fields are solved SIMULTANEOUSLY and INDEPENDENTLY. No ratio
+  between them is assumed, because the two artifacts plausibly arise from different
+  physical sources. Whether they nonetheless move together is something this tool
+  MEASURES rather than presumes — see _locomoco_coupling.txt below.
+
+  How well the two axes can be told apart differs by case. MULTI-ECHO is the easy
+  one: the axes scale differently with TE (primary PE flat, partition TE-scaled), so
+  the echo axis itself separates them — which is also why -me_flat_scaling with two
+  axes warns: it makes both laws identical and throws that advantage away.
+  SINGLE-ECHO has only image structure to go on — the two shifts separate where the
+  local neighbourhood holds edges of more than one orientation, and go ambiguous
+  along a locally straight edge. _locomoco_sep maps exactly that, per voxel
+  (1 = cleanly separable, 0 = ambiguous). Read the two flow maps with it open.
+
+  `-pe_dir AP IS` (two values) is shorthand for `-pe_dir1 AP -pe_dir2 IS`. Unlike
+  the explicit -pe_dir2 it does NOT imply 3-D, so an existing 2-D multi-slice
+  dual-PE command line keeps its old meaning.
+
+READING THE OUTPUTS  (3D = one value/voxel, 4D = a time series)
+
+ the deliverable —
+
+  _locomoco.nii.gz   (4D)  THE CORRECTED SERIES. The residual non-linear motion that
+      rigid moco left behind is resampled out. This is what you want if you just want
+      corrected images. With -jacobian the intensities are also signal-conserved
+      (stretched regions dim, compressed brighten); without it, geometry only.
+      Skip with -no_corrected.
+
+  _locomoco_mean.nii.gz  [-save_mean]  Temporal mean of the corrected series — a
+      sharp, motion-reduced registration target.
+
+  _locomoco_max / _min.nii.gz  [-save_max / -save_min]  Coverage images: max is the
+      union of every voxel ever imaged (edges the mean dims because motion took them
+      out of the FoV), min is 0 wherever any single volume lost the voxel.
+
+ the transform —
+
+  _warp / _warp.nii.gz     The SAME correction as a per-frame DICOM-mm displacement
+      field for ffs_nwarp, instead of pre-resampled data. Use it to fold this step
+      into ONE interpolation with your other transforms, e.g.
+      ffs_nwarp -nwarp 'sub_warp moco.aff12.1D' = rigid-then-nonlinear in a single
+      resample (less blur than applying _locomoco to already-resampled data). 5-D
+      (nx,ny,nz,T,3) by default, or per-frame 4-D files with -warp_format folder.
+      With two encode axes both components ride in the one 5-D file. You want EITHER
+      this or _locomoco, rarely both. Skip with -no_warp.
+
+ the diagnostics —
+
+  _flow.nii.gz       (4D)  SIGNED residual displacement per frame, in VOXELS; sign =
+      direction along the encode axis. This is literally how much motion rigid moco
+      MISSED, per voxel per frame. Scrub it like a series.
       QC: it should be spatially STRUCTURED (largest at tissue/air boundaries and
-      where PE distortion lives), coherent frame-to-frame, and ~0 in static tissue
-      — not salt-and-pepper. Big coherent values = real residual motion caught;
-      noise-like everywhere = little to correct (or phase/tissue SNR too low to
-      trust). It is NOT the warp (voxels vs DICOM-mm) — don't feed it to ffs_nwarp.
-      Skip with -no_flow.
+      where PE distortion lives), coherent frame-to-frame, and ~0 in static tissue —
+      not salt-and-pepper. Big coherent values = real residual motion caught;
+      noise-like everywhere = little to correct (or SNR too low to trust). It is NOT
+      the warp (voxels vs DICOM-mm) — don't feed it to ffs_nwarp. Skip with -no_flow.
 
-  _flow.mp4 / .gif         THE QUICK-LOOK — a contact-sheet movie of _flow, colored
-      by a circular-phase wheel (hue = direction, brightness = magnitude). Fastest
-      QC there is: look for coherent within-brain flow that pulses with the time
-      course, vs. random speckle (= nothing real to correct). mp4 via system
-      ffmpeg if present, else gif. Skip with -no_movie.
+  _flow_pe1 / _flow_pe2.nii.gz  (4D)  With TWO encode axes, _flow splits into one
+      signed map per axis: pe1 = primary phase encode, pe2 = partition. Two signed
+      maps rather than a magnitude/angle pair, because these are two distinct
+      artifacts along two named axes, not two halves of one vector.
 
-  _locomoco_pcs.1D   [with -want_pcs N]  DENOISING REGRESSORS — the top-N temporal
-      PCs of the warp (unit variance; variance-explained in the header). A handful
-      of timecourses that summarize the structured residual motion; add them as
-      nuisance columns in your GLM.
+  _locomoco_sep.nii.gz  (4D)  [two axes, -backend flow]  Per-voxel SEPARABILITY of
+      the two axes: 1 where their gradients are orthogonal over the pooling window
+      (the split between axes is well determined), 0 on a straight edge (the split is
+      arbitrary and the regulariser picked it). Low sep is not a failure — it is the
+      map telling you where not to believe the per-axis split.
 
-  _locomoco_mean.nii.gz  [with -save_mean]  Temporal mean of the corrected series
-      — a sharp, motion-reduced registration target.
+  _locomoco_coupling.txt / _coupling_r.nii.gz / _coupling_r.1D  [two axes]
+      THE COUPLING MEASUREMENT. Correlation r between the two fields, the free
+      least-squares ratio kappa (d2 ~ kappa*d1) with its R2, plus r per voxel (3D)
+      and per frame (1D). High |r| with high kappa R2 = evidence the primary-PE and
+      partition wiggles share one off-resonance source seen through two effective
+      dwell times; low |r| = separate mechanisms. Computed only over voxels that
+      moved AND were separable, so it reports a finding rather than the regulariser.
 
-  _locomoco_max.nii.gz / _locomoco_min.nii.gz  [with -save_max / -save_min]
-      Coverage images: the max is the union of every voxel ever imaged (edges the
-      mean dims because motion took them out of the FoV), the min is 0 wherever
-      any single volume lost the voxel.
+  _flow.mp4 / .gif   THE QUICK-LOOK — contact-sheet movie of _flow, colored by a
+      circular-phase wheel (hue = direction, brightness = magnitude). Fastest QC
+      there is: coherent within-brain flow pulsing with the time course vs. random
+      speckle. mp4 via system ffmpeg if present, else gif. Skip with -no_movie.
 
-  dual -pe_dir: _flow has no single signed scalar (the shift is a 2-D vector), so
-      it is written as _flowmag.nii.gz (magnitude, voxels) + _flowang.nii.gz
-      (direction, degrees 0-360) instead.
+  _locomoco_pcs.1D   [-want_pcs N]  DENOISING REGRESSORS — top-N temporal PCs of the
+      warp (unit variance; variance-explained in the header). Add them as nuisance
+      columns in your GLM.
+
+  legacy 2-D dual-PE (two in-plane axes on multi-slice data): the two components ARE
+      one in-plane vector there, so they are written as _flowmag.nii.gz (voxels) +
+      _flowang.nii.gz (degrees 0-360) instead of _flow_pe1/_flow_pe2.
 
   Note: -backend flow/phase/xcorr changes precision and speed, not WHICH files you
-      get — all three write the same set. -jacobian only changes _locomoco
-      intensities, never the warp/flow geometry.
+  get. -jacobian only changes _locomoco intensities, never the warp/flow geometry.
 
-backends (all estimate the SAME residual PE-axis shift — pick on speed/quality;
-numbers are mean |err| recovering known shifts on a 0.8 mm real brain):
+BACKENDS  (all estimate the SAME residual shift — pick on speed/quality; numbers are
+mean |err| recovering known shifts on a 0.8 mm real brain)
 
   flow   pyramidal Lucas-Kanade optical flow. Most precise (~0.006 vox), slowest.
+         The only backend with a 3-D two-axis joint solve and a _sep map.
          reads: -full_2d -levels -iters -window
   phase  phase-correlation searchlight — shift from the FFT phase-ramp along PE.
-         Fastest, near-flow accuracy on real tissue (~0.013 vox).
+         Fastest, near-flow accuracy on real tissue (~0.013 vox). 2-D only.
          reads: -patch -stride -iters -max_shift
   xcorr  magnitude cross-correlation searchlight — slide along PE, peak local corr.
-         Robust, single-shot (~0.028 vox).
+         Robust, single-shot (~0.028 vox). Two axes are searched separably.
          reads: -window -max_shift -xcorr_step
+  qwarp  fine nonlinear patches own the whole field. Two encode axes are solved as
+         ONE coupled Gauss-Newton system per patch (not two independent fits).
+         reads: -qwarp_minpatch -qwarp_levels -qwarp_iters -qwarp_cost -qwarp_optimizer
 
 which flag feeds which backend:
 
   flag           flow   phase  xcorr   meaning
-  -ref            ✓      ✓      ✓       reference frame (all)
-  -do_blur        ✓      ✓      ✓       pre-blur noisy frames (all)
-  -hpf_spatial    ✓      ✓      ✓       estimate on spatial high-pass (all, experimental)
-  -full_2d        ✓      -      -       2-D vs PE-only flow
-  -levels         ✓      -      -       optical-flow pyramid levels
-  -iters          ✓      ✓      -       flow: LK passes / phase: warp-refine passes
-  -window         ✓      -      ✓       flow: LK window / xcorr: searchlight radius
-  -max_shift      -      ✓      ✓       search bound (voxels)
-  -xcorr_step     -      -      ✓       xcorr trial spacing (sub-voxel knob)
-  -patch          -      ✓      -       phase FFT patch side
-  -stride         -      ✓      -       phase patch spacing
+  -ref            *      *      *       reference frame (all)
+  -do_blur        *      *      *       pre-blur noisy frames (all)
+  -hpf_spatial    *      *      *       estimate on spatial high-pass (all, experimental)
+  -full_2d        *      -      -       2-D vs PE-only flow
+  -levels         *      -      -       optical-flow pyramid levels
+  -iters          *      *      -       flow: LK passes / phase: warp-refine passes
+  -window         *      -      *       flow: LK window / xcorr: searchlight radius
+  -max_shift      -      *      *       search bound (voxels)
+  -xcorr_step     -      -      *       xcorr trial spacing (sub-voxel knob)
+  -patch          -      *      -       phase FFT patch side
+  -stride         -      *      -       phase patch spacing
 
-tuning (turning the knobs):
+TUNING  (turning the knobs)
 
   -window     up = smoother, more robust, but blurs fine local shifts; down =
               sharper, follows small structure, noisier. 2 is a good middle.
   -max_shift  set just above the biggest residual shift you expect (this data is
               sub- to a few voxels). Smaller = faster xcorr (fewer trials) + a
-              tighter phase no-wrap band; too small clips real motion.
+              tighter phase no-wrap band; too small clips real motion. With two
+              axes it is also the flow solver's trust region.
   -patch      bigger = less phase leakage per pass (needs fewer -iters), coarser
               field; smaller = finer field but wants more -iters. 16 default.
   -stride     smaller = denser, smoother field, more FFTs; ~patch/2 = NORDIC-style
@@ -153,37 +233,43 @@ tuning (turning the knobs):
   -levels     more pyramid levels handle bigger motion but risk aliasing on thin
               slices.
 
-accuracy (trade time for exactness — all backends):
+ACCURACY  (trade time for exactness — all backends)
 
   -warp_interp bicubic   faithful resampler for the estimation iterations (removes
                          bilinear damping); helped flow on local-field tests, neutral
                          for phase/xcorr. Final warp is wsinc5 via ffs_nwarp regardless.
+                         lanczos is 1-D only, so it is unavailable with two axes.
   -refine N              rebuild the reference from the corrected series (sharp, motion
                          removed) and re-register N more times; converges the template
                          out of its bias (measurably tighter frame alignment).
   -jacobian              conserve PE signal — stretched regions dim, compressed brighten
-                         (J = det(I+∇disp)). Off by default; for data with real B0
+                         (J = det(I+grad disp)). Off by default; for data with real B0
                          pile-up, not a purely geometric shift.
   -workhard / -superhard presets over the above + more iters + denser search
-                         (~3-5× / ~15-30× time). Explicit flags override the preset.
+                         (~3-5x / ~15-30x time). Explicit flags override the preset.
 
-dual phase-encode (rare — e.g. 3-D EPI encoded on two in-plane axes):
+EXAMPLES
 
-  Give two -pe_dir (e.g. -pe_dir AP IS). Both in-plane axes are estimated and BOTH
-  warp components saved; -slice_axis is forced to the third (un-encoded) axis so
-  both PE axes lie in the slice plane (AP+IS -> slice on L-R). flow does this
-  natively; phase reads one phase-ramp per axis; xcorr searches the axes separably
-  (no O(trials²) grid). The single signed flow map splits into a magnitude
-  (_flowmag) + angle (_flowang, degrees) pair, since a 2-D vector has no single
-  signed scalar.
+  # 2-D multi-slice, optical flow, PE-only, automask on
+  ffs_locomoco -input moco.nii.gz -prefix sub -pe_dir1 AP
 
-examples:
+  # 3-D EPI: primary PE and partition solved together, single echo
+  ffs_locomoco -i moco.nii.gz -o sub -pe_dir1 AP -pe_dir2 IS -refine 2
 
-  # default: optical flow, PE-only, automask on
-  ffs_locomoco -input moco.nii.gz -prefix sub -pe_dir AP
+  # partition only — MEDIC already corrected the primary axis
+  ffs_locomoco -i medic_out.nii.gz -o sub -pe_dir2 IS
 
-  # dual phase-encode: both AP and IS, slice forced to L-R
-  ffs_locomoco -i moco.nii.gz -o sub -pe_dir AP IS -backend phase
+  # 2-D multi-slice multi-echo: one per-slice PE field, pooled over echoes
+  ffs_locomoco -i e1.nii.gz e2.nii.gz e3.nii.gz -o sub -pe_dir1 AP \\
+      -echo_times 12 30 48 -me_flat_scaling -refine 2
+
+  # multi-echo 3-D EPI, TE-scaled partition wiggle
+  ffs_locomoco -i e1.nii.gz e2.nii.gz e3.nii.gz -o sub -pe_dir2 IS \\
+      -me_3depi -echo_times 12 30 48
+
+  # multi-echo, BOTH axes — the well-posed case: flat on PE, TE-scaled on partition
+  ffs_locomoco -i e1.nii.gz e2.nii.gz e3.nii.gz -o sub -pe_dir1 AP -pe_dir2 IS \\
+      -me_3depi -echo_times 12 30 48 -refine 2
 
   # phase backend, denser field + more refine passes
   ffs_locomoco -i moco.nii.gz -o sub -pe AP -backend phase -patch 12 -stride 4 -iters 6
@@ -193,6 +279,13 @@ examples:
 
   # progressive reference + blur first for noisy data
   ffs_locomoco -i moco.nii.gz -o sub -pe AP -ref first_mean -do_blur 2
+
+  # two axes with a fine nonlinear polish (Gauss-Newton is the default optimizer)
+  ffs_locomoco -i moco.nii.gz -o sub -pe_dir1 AP -pe_dir2 IS -final_qwarp
+
+  # let qwarp own the whole two-axis field instead of the searchlight
+  ffs_locomoco -i moco.nii.gz -o sub -pe_dir1 AP -pe_dir2 IS \\
+      -backend qwarp -qwarp_levels 4 -qwarp_minpatch 9
 """
 
 
@@ -243,14 +336,30 @@ def create_parser() -> argparse.ArgumentParser:
     )
     io.add_argument(
         "-pe_dir",
+        "-pe_dir1",
         "-pe",
-        required=True,
+        default=None,
         nargs="+",
         metavar="DIR",
-        help="Phase-encode direction(s): AP/PA/LR/RL/IS/SI or an axis letter x/y/z. "
-        "Motion is corrected along this axis. Give TWO (e.g. -pe_dir AP IS) for a "
-        "dual-phase-encode acquisition — both in-plane axes are estimated and both "
-        "warps saved (-slice_axis is then forced to the remaining, third axis).",
+        dest="pe_dir",
+        help="PRIMARY phase-encode direction: AP/PA/LR/RL/IS/SI or an axis letter x/y/z. "
+        "This is the in-plane distortion axis, and it is NOT echo-time dependent (every "
+        "echo shifts by the same amount). Giving TWO directions here is shorthand for "
+        "'-pe_dir1 A -pe_dir2 B'.",
+    )
+    io.add_argument(
+        "-pe_dir2",
+        "-partition_dir",
+        "-partition",
+        default=None,
+        metavar="DIR",
+        dest="pe_dir2",
+        help="PARTITION (2nd phase-encode) direction, for 3-D EPI. Implies -is_3depi. The "
+        "partition wiggle is echo-time DEPENDENT (echo e shifts by TE_e/TE_1 times the "
+        "shared field) — that is what distinguishes it from -pe_dir1, and with multiple "
+        "echoes it is what lets the two be told apart. Can be given alone (e.g. after "
+        "MEDIC has already corrected the primary axis) or together with -pe_dir1 to solve "
+        "both at once. One of -pe_dir1 / -pe_dir2 is required.",
     )
     io.add_argument(
         "-slice_axis",
@@ -264,8 +373,10 @@ def create_parser() -> argparse.ArgumentParser:
     )
     io.add_argument(
         "-is_3dacq",
+        "-is_3depi",
         "-3d",
         action="store_true",
+        dest="is_3dacq",
         help="Data is 3-D-acquired EPI (single-shot / 3-D EPI), not 2-D multi-slice. Then "
         "there are no per-slice fields, so residual distortion is estimated as ONE 3-D PE "
         "field (3-D pooling + through-plane regularisation) instead of slice-by-slice — "
@@ -1070,6 +1181,84 @@ def _apply_preset(args) -> str | None:
     return name
 
 
+def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> None:
+    """Write the two-encode-axis extras: the separability map and the coupling report.
+
+    Both exist to answer the question the joint solve deliberately does NOT assume an
+    answer to. The two fields are estimated with no ratio tying them together, so:
+
+    * ``_sep`` says WHERE the data could tell the axes apart at all (an aperture-
+      ambiguous voxel's split between the axes is arbitrary, and a coupling measured
+      over such voxels would be an artifact of the regulariser, not a finding).
+    * ``_coupling.txt`` / ``_coupling_r.1D`` say whether, where they COULD be told
+      apart, they nonetheless moved together — which is the evidence for or against the
+      two artifacts sharing a physical source.
+    """
+    if result.pe_axis2 is None:
+        return
+    import numpy as np
+
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    if result.sep_map is not None:
+        spath = f"{stem}_locomoco_sep{ext}"
+        with spinner(f"Writing {Path(spath).name}"):
+            save_nifti(result.sep_map.numpy(), spath, affine=affine)
+        print(
+            f"  • axis separability 4D (1 = axes cleanly separable, 0 = aperture-"
+            f"ambiguous): {spath}"
+        )
+
+    # Restrict the coupling stats to voxels that actually moved — air contributes only
+    # the gating's leftovers and would drag every correlation toward it.
+    comps = result.pe_displacements()
+    d1, d2 = comps[0][2], comps[1][2]
+    energy = (d1.abs() + d2.abs()).mean(dim=3)
+    mask = energy > 0.1 * float(energy.max()) if float(energy.max()) > 0 else None
+    if result.sep_map is not None and mask is not None:
+        # and to voxels where the split between axes was actually determined
+        mask = mask & (result.sep_map.mean(dim=3) > 0.2)
+    if mask is not None and not bool(mask.any()):
+        mask = None
+    c = result.coupling(mask)
+    if c is None:
+        return
+
+    rpath = f"{stem}_locomoco_coupling_r{ext}"
+    with spinner(f"Writing {Path(rpath).name}"):
+        save_nifti(c["r_per_voxel"].numpy(), rpath, affine=affine)
+    frame_path = f"{stem}_locomoco_coupling_r.1D"
+    np.savetxt(
+        frame_path,
+        c["r_per_frame"].numpy(),
+        fmt="%.6f",
+        header="per-frame spatial correlation between the primary-PE and partition fields",
+    )
+    txt = (
+        f"ffs_locomoco two-axis coupling report\n"
+        f"  primary PE axis : {comps[0][1]}   rms {c['rms1']:.4f} vox\n"
+        f"  partition axis  : {comps[1][1]}   rms {c['rms2']:.4f} vox\n"
+        f"  correlation r   : {c['r']:+.4f}\n"
+        f"  ratio kappa     : {c['kappa']:+.4f} vox/vox   (R2 {c['kappa_r2']:.4f})\n"
+        f"\n"
+        f"  The two fields were solved INDEPENDENTLY -- no ratio was imposed. A high |r|\n"
+        f"  with a high kappa R2 is evidence the primary-PE and partition wiggles share\n"
+        f"  one off-resonance source seen through two effective dwell times. A low |r|\n"
+        f"  says they are separate mechanisms. Read it alongside the _sep map: voxels\n"
+        f"  where the axes were not separable were excluded from these statistics.\n"
+    )
+    cpath = f"{stem}_locomoco_coupling.txt"
+    Path(cpath).write_text(txt)
+    print(f"  • per-voxel coupling r 3D: {rpath}")
+    print(f"  • per-frame coupling r: {frame_path}")
+    print(f"  • coupling report: {cpath}")
+    print(
+        f"    r = {c['r']:+.4f}, kappa = {c['kappa']:+.4f} vox/vox (R² {c['kappa_r2']:.3f})"
+        f"  [{'coupled' if abs(c['r']) > 0.5 else 'largely independent'}]"
+    )
+
+
 def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
     """Write -save_confidence / -save_corr_curve maps — shared by single- and multi-echo.
 
@@ -1257,7 +1446,20 @@ def _write_qc_diag(args, corrected, original, corr_stem, orig_stem, ext, affine)
             _save_tsnr(original, f"{orig_stem}_tsnr", ext, affine)
 
 
-def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
+def _pe_label(args) -> str:
+    """How to name the solved axis in a banner: the direction the user actually gave.
+
+    ``-pe_dir2`` alone collapses onto ``pe_axis`` upstream, so ``args.pe_dir`` is None
+    there and printing it reads as "PE None".
+    """
+    if args.pe_dir:
+        return " ".join(args.pe_dir)
+    return f"{args.pe_dir2} (partition)"
+
+
+def _run_multiecho(
+    args, pe_axis, slice_axis, dual, device, stem, ext, *, pe_axis2=None, slicewise=False
+) -> int:
     """Multi-echo 3-D EPI: joint shared-field estimate, per-echo warp + corrected out."""
     import numpy as np
 
@@ -1419,7 +1621,9 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
     prepass_backend = "flow" if qwarp_backend else args.backend
 
     print(
-        f"🌀 ffs_locomoco -me_3depi: {len(datas)} echoes  shape={datas[0].shape}  device={device}"
+        f"🌀 ffs_locomoco multi-echo "
+        f"({'2-D slicewise' if slicewise else '3-D'}): {len(datas)} echoes  "
+        f"shape={datas[0].shape}  device={device}"
     )
     if args.me_interecho:
         mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
@@ -1448,7 +1652,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         # qwarp owns the whole field and the reference is a plain median of the raw
         # echoes (no flow estimation), so the flow-tuning / ref / refine flags don't apply.
         print(
-            f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend=qwarp "
+            f"   TEs [{te_str}] ms, PE {_pe_label(args)} (axis {pe_axis}), backend=qwarp "
             f"(reference: median of raw echoes, no flow pass), scaling={scaling}, "
             f"automask={'on' if automask else 'off'}"
         )
@@ -1458,7 +1662,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
         )
     else:
         print(
-            f"   TEs [{te_str}] ms, PE {args.pe_dir} (axis {pe_axis}), backend={args.backend}, "
+            f"   TEs [{te_str}] ms, PE {_pe_label(args)} (axis {pe_axis}), backend={args.backend}, "
             f"{ref_note}, mode={mode}, scaling={scaling}, "
             f"levels={args.levels}, iters={args.iters}, {refine_note}, "
             f"automask={'on' if automask else 'off'}"
@@ -1617,6 +1821,8 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
+            pe_axis2=pe_axis2,
+            slicewise=slicewise,
             device=device,
         )
 
@@ -1673,10 +1879,21 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
                 )
             print(f"  • echo {j + 1} corrected series: {corr_path}")
         if not args.no_flow:
-            flow_path = f"{estem}_flow{ext}"
-            with spinner(f"Writing {Path(flow_path).name}"):
-                save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
-            print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
+            if res.pe_axis2 is not None:
+                names = {"pe1": "primary PE", "pe2": "partition"}
+                for label, axis, field in res.pe_displacements():
+                    fpath = f"{estem}_flow_{label}{ext}"
+                    with spinner(f"Writing {Path(fpath).name}"):
+                        save_nifti(field.numpy(), fpath, affine=affine)
+                    print(
+                        f"  • echo {j + 1} signed {names[label]} flow 4D "
+                        f"(voxels, axis {axis}): {fpath}"
+                    )
+            else:
+                flow_path = f"{estem}_flow{ext}"
+                with spinner(f"Writing {Path(flow_path).name}"):
+                    save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
+                print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
         if _want_qc(args):
             corrected = (
                 corrected_series.numpy()
@@ -1687,6 +1904,12 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
                 args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
             )
         del corrected_series
+
+    # Two-axis extras. Echo 1 carries alpha = 1 on BOTH axes (primary PE is flat by
+    # construction, and the partition law is normalised to echo 1), so its per-echo
+    # fields ARE the shared fields — the coupling measured on it is the shared-field
+    # coupling, not one echo's view of it.
+    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args)
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -1705,7 +1928,7 @@ def _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext) -> int:
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
-    print("✅ ffs_locomoco -me_3depi complete.")
+    print("✅ ffs_locomoco multi-echo complete.")
     return 0
 
 
@@ -1713,7 +1936,19 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.processing.locomoco import normalize_axis_argv
 
     raw = sys.argv[1:] if argv is None else argv
-    raw = normalize_axis_argv(raw, {"-pe_dir", "-pe", "-slice_axis", "-slice"})
+    raw = normalize_axis_argv(
+        raw,
+        {
+            "-pe_dir",
+            "-pe_dir1",
+            "-pe",
+            "-pe_dir2",
+            "-partition_dir",
+            "-partition",
+            "-slice_axis",
+            "-slice",
+        },
+    )
     args = create_parser().parse_args(raw)
     preset = _apply_preset(args)
 
@@ -1733,19 +1968,95 @@ def main(argv: list[str] | None = None) -> int:
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow, resolve_pe_axis
 
-    pe_axes = [resolve_pe_axis(d) for d in args.pe_dir]
-    if len(pe_axes) > 2:
-        print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe_axes)}.", file=sys.stderr)
+    # ── which encode axes are we solving? ────────────────────────────────────
+    # -pe_dir1 is the PRIMARY (in-plane) phase encode; -pe_dir2 the PARTITION. Two values
+    # on -pe_dir is shorthand for both. The explicit -pe_dir2 flag implies 3-D acquisition
+    # (a partition direction is a 3-D concept); the two-value shorthand does NOT, so an
+    # existing 2-D multi-slice `-pe_dir AP IS` command line keeps its old meaning.
+    if not args.pe_dir and args.pe_dir2 is None:
+        print(
+            "❌ give at least one encode direction: -pe_dir1 (primary phase encode) "
+            "and/or -pe_dir2 (partition).",
+            file=sys.stderr,
+        )
         return 2
-    dual = len(pe_axes) == 2
+    pe1_list = [resolve_pe_axis(d) for d in (args.pe_dir or [])]
+    if len(pe1_list) > 2:
+        print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe1_list)}.", file=sys.stderr)
+        return 2
+    if len(pe1_list) == 2 and args.pe_dir2 is not None:
+        print(
+            "❌ give EITHER two directions to -pe_dir (shorthand) OR -pe_dir2, not both.",
+            file=sys.stderr,
+        )
+        return 2
+    partition_only = False
+    if len(pe1_list) == 2:
+        pe_axis, pe_axis2 = pe1_list
+    elif not pe1_list:
+        # -pe_dir2 alone: a single-axis solve along the PARTITION direction (e.g. the
+        # primary axis is already corrected, by MEDIC or a fieldmap). Downstream this is
+        # an ordinary one-axis run; only the labelling and the multi-echo scaling law
+        # differ, so collapse it onto pe_axis and remember which axis it really is.
+        pe_axis = resolve_pe_axis(args.pe_dir2)
+        pe_axis2 = None
+        partition_only = True
+        args.is_3dacq = True
+    else:
+        pe_axis = pe1_list[0]
+        pe_axis2 = resolve_pe_axis(args.pe_dir2) if args.pe_dir2 is not None else None
+        if pe_axis2 is not None:
+            args.is_3dacq = True
+    two_axes = pe_axis2 is not None
+    if two_axes and pe_axis == pe_axis2:
+        print(
+            f"❌ the primary PE and partition directions must differ, both resolved to "
+            f"axis {pe_axis}.",
+            file=sys.stderr,
+        )
+        return 2
+    # `dual` = the LEGACY 2-D multi-slice two-in-plane-axis mode (one in-plane vector).
+    # `dual3d` = the 3-D joint solve: two physically distinct artifacts, solved
+    # simultaneously and independently.
+    dual = two_axes and not args.is_3dacq
+    dual3d = two_axes and args.is_3dacq
+    pe_axes = [pe_axis, pe_axis2] if two_axes else [pe_axis]
+
+    if me_mode:
+        if two_axes and (args.me_interecho or args.me_estimate_from is not None):
+            which = "-me_interecho" if args.me_interecho else "-me_estimate_from"
+            print(
+                f"❌ {which} is single encode-axis only; drop -pe_dir2 (or the second "
+                f"-pe_dir) to use it.",
+                file=sys.stderr,
+            )
+            return 2
+        me_is_3d = args.me_3depi or args.is_3dacq
+        if me_is_3d and args.pe_dir2 is None and not two_axes and not args.me_flat_scaling:
+            # -pe_dir used to mean the PARTITION axis under -me_3depi. It now means the
+            # primary PE axis everywhere. Remapping silently would point an existing
+            # command line at a different physical axis and still produce plausible
+            # output, so make the rename explicit instead. -me_flat_scaling is exempt:
+            # it explicitly asks for a TE-INDEPENDENT solve, which is what the primary
+            # PE axis is, so `-pe_dir X -me_flat_scaling` is an unambiguous request.
+            print(
+                f"❌ -me_3depi: -pe_dir now means the PRIMARY phase-encode axis "
+                f"(it used to mean the partition axis). For the TE-scaled partition "
+                f"wiggle this tool has always corrected, say:\n"
+                f"      -pe_dir2 {args.pe_dir[0]}      (or -partition_dir {args.pe_dir[0]})\n"
+                f"   For a TE-INDEPENDENT primary-PE solve across echoes, keep -pe_dir "
+                f"and add -me_flat_scaling.",
+                file=sys.stderr,
+            )
+            return 2
 
     # Lanczos is a 1-D (single-PE-axis) resampler. A single -pe_dir correction is a shift
     # along one axis (2-D slicewise, 3-D-acq, or the joint multi-echo solve) — all fine.
     # dual (two -pe_dir) and rotation-aware are genuine 2-D/3-D warps via grid_sample, which
     # has no lanczos mode; block them rather than crash.
     if args.warp_interp == "lanczos":
-        if dual or rotaware:
-            which = "dual -pe_dir (2-D warp)" if dual else "rotation-aware (3-D warp)"
+        if two_axes or rotaware:
+            which = "two encode axes (2-D warp)" if two_axes else "rotation-aware (3-D warp)"
             print(
                 f"❌ -warp_interp lanczos is single phase-encode only; {which} needs "
                 "bilinear/bicubic.",
@@ -1759,36 +2070,31 @@ def main(argv: list[str] | None = None) -> int:
             )
 
     slice_axis = args.slice_axis
-    if args.is_3dacq and dual:
-        print("❌ -is_3dacq is single phase-encode only (one -pe_dir).", file=sys.stderr)
-        return 2
     if args.is_3dacq and args.backend == "phase":
         print(
             "❌ -is_3dacq has no 'phase' backend yet; use -backend flow or xcorr.", file=sys.stderr
         )
         return 2
-    if dual:
-        if pe_axes[0] == pe_axes[1]:
-            print(f"❌ the two -pe_dir must be different axes, got {args.pe_dir}.", file=sys.stderr)
-            return 2
-        third = next(a for a in (0, 1, 2) if a not in pe_axes)  # the un-encoded axis
+    if two_axes:
+        # Both encode axes must lie in the display plane, so we cut along the third.
+        # For dual3d this is only a display/movie choice (the solve is one 3-D pass and
+        # re-derives the same axis itself); for the legacy 2-D dual it is structural.
+        third = next(a for a in (0, 1, 2) if a not in pe_axes)
         if slice_axis != third:
+            which = "-pe_dir1/-pe_dir2" if dual3d else "dual -pe_dir"
             print(
-                f"ℹ️  dual -pe_dir: forcing -slice_axis to {third} (the axis not phase-"
-                f"encoded) so both PE axes lie in the slice plane.",
+                f"ℹ️  {which}: forcing -slice_axis to {third} (the un-encoded axis) so "
+                f"both encode axes lie in the slice plane.",
             )
         slice_axis = third
-        pe_axis = pe_axes[0]  # representative; dual estimates both in-plane axes
-    else:
-        pe_axis = pe_axes[0]
-        # Under -is_3dacq / -me_3depi the slice axis is only a display hint, PE==slice ok.
-        if pe_axis == slice_axis and not args.is_3dacq and not me_mode:
-            print(
-                f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
-                "direction must lie in the slice plane — pick a different -slice_axis.",
-                file=sys.stderr,
-            )
-            return 2
+    # Under -is_3dacq / -me_3depi the slice axis is only a display hint, PE==slice ok.
+    elif pe_axis == slice_axis and not args.is_3dacq and not me_mode:
+        print(
+            f"❌ PE axis ({pe_axis}) and -slice_axis ({slice_axis}) coincide. The PE "
+            "direction must lie in the slice plane — pick a different -slice_axis.",
+            file=sys.stderr,
+        )
+        return 2
 
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
@@ -1796,9 +2102,21 @@ def main(argv: list[str] | None = None) -> int:
 
     from fastfuncstuff.cli_utils import spinner
 
-    # Multi-echo 3-D EPI: several inputs, one shared field scaled per echo.
+    # Multi-echo: several inputs, one shared field per encode axis, scaled per echo.
+    # 2-D multi-slice is the default; -me_3depi / -is_3depi opts into the 3-D solve,
+    # exactly as -is_3depi does on the single-echo path.
     if me_mode:
-        return _run_multiecho(args, pe_axis, slice_axis, dual, device, stem, ext)
+        return _run_multiecho(
+            args,
+            pe_axis,
+            slice_axis,
+            dual,
+            device,
+            stem,
+            ext,
+            pe_axis2=pe_axis2 if dual3d else None,
+            slicewise=not (args.me_3depi or args.is_3dacq),
+        )
 
     # Single-echo qwarp: same idea as ME with E=1 -- no echo scaling, just register each
     # frame to the refined median via ncc. -backend qwarp lets qwarp own the field;
@@ -1806,9 +2124,6 @@ def main(argv: list[str] | None = None) -> int:
     qwarp_backend = args.backend == "qwarp"
     if qwarp_backend or args.final_qwarp:
         which = "backend" if qwarp_backend else "polish"
-        if dual:
-            print(f"❌ qwarp {which} is single phase-encode only (one -pe_dir).", file=sys.stderr)
-            return 2
         if rotaware:
             print(f"❌ qwarp {which} is not supported with rotation-aware mode.", file=sys.stderr)
             return 2
@@ -1822,7 +2137,7 @@ def main(argv: list[str] | None = None) -> int:
     prepass_backend = "flow" if qwarp_backend else args.backend
     # -backend qwarp owns the whole field, so the flow estimation is skipped (qwarp+dual
     # / qwarp+rotaware already errored above, so reaching here means neither is set).
-    skip_flow_qwarp = qwarp_backend and not rotaware and not dual
+    skip_flow_qwarp = qwarp_backend and not rotaware
     if len(args.input) != 1:
         print(
             f"❌ single-echo mode takes ONE -input (got {len(args.input)}); use -me_3depi for "
@@ -1875,7 +2190,9 @@ def main(argv: list[str] | None = None) -> int:
         if automask
         else "off"
     )
-    if dual:
+    if dual3d:
+        mode = f"2-axis joint {args.backend}"
+    elif dual:
         mode = "2-D dual-PE"
     elif args.backend == "flow":
         mode = f"{'1-D PE' if pe_only else '2-D'} flow"
@@ -1885,8 +2202,19 @@ def main(argv: list[str] | None = None) -> int:
     if preset:
         acc_desc = f"[{preset}] " + acc_desc
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
+    if dual3d:
+        axes_desc = (
+            f"primary PE {args.pe_dir[0]} (axis {pe_axis}) + partition "
+            f"{args.pe_dir2 or args.pe_dir[1]} (axis {pe_axis2})"
+        )
+    elif dual:
+        axes_desc = f"dual in-plane PE {args.pe_dir} (axes {pe_axes})"
+    elif partition_only:
+        axes_desc = f"partition {args.pe_dir2} (axis {pe_axis}), primary PE assumed corrected"
+    else:
+        axes_desc = f"PE {args.pe_dir[0]} (axis {pe_axis})"
     print(
-        f"   PE {args.pe_dir} (axes {pe_axes}), slice axis={slice_axis}, backend={args.backend}, "
+        f"   {axes_desc}, slice axis={slice_axis}, backend={args.backend}, "
         f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
         f"{mode}, automask={mask_desc}"
     )
@@ -2021,6 +2349,7 @@ def main(argv: list[str] | None = None) -> int:
             first_n=args.first_n,
             jacobian=args.jacobian,
             is_3dacq=args.is_3dacq,
+            pe_axis2=pe_axis2 if dual3d else None,
             automask=automask,
             automask_dilate=args.automask_dilate,
             automask_sigma=args.automask_sigma,
@@ -2046,14 +2375,25 @@ def main(argv: list[str] | None = None) -> int:
         )
         # On the skip-flow path there is no estimated field (the placeholder canonical
         # tensors make pe_displacement() invalid); qwarp owns the field, so seed zeros.
-        w_seed = torch.zeros(result.orig_shape) if skip_flow_qwarp else result.pe_displacement()
+        if skip_flow_qwarp:
+            w_seed = torch.zeros(result.orig_shape)
+            w_seed1 = torch.zeros(result.orig_shape) if dual3d else None
+        elif dual3d:
+            comps = result.pe_displacements()
+            w_seed1, w_seed = comps[0][2], comps[1][2]
+        else:
+            w_seed, w_seed1 = result.pe_displacement(), None
         wrapped = MultiEchoLocomocoResult(
             per_echo=[result],
             alpha=torch.tensor([1.0]),
             echo_times=torch.tensor([1.0]),
             w_field=w_seed,
-            pe_axis=result.pe_axis,
+            # Single echo: pe_axis names the axis the (trivial) scaling law applies to,
+            # which for a two-axis run is the partition — matching the ME convention.
+            pe_axis=pe_axis2 if dual3d else result.pe_axis,
             linearity_r2=1.0,
+            w_field_pe1=w_seed1,
+            pe_axis1=pe_axis if dual3d else None,
         )
         polished = polish_me_result(
             wrapped,
@@ -2152,7 +2492,17 @@ def main(argv: list[str] | None = None) -> int:
     del corrected_series
 
     if not args.no_flow:
-        if dual:
+        if result.pe_axis2 is not None:
+            # Two physically distinct artifacts: write each as its OWN signed map. The
+            # magnitude/angle pair below is for the legacy in-plane-vector case, where the
+            # two components really are one vector; here they are not.
+            names = {"pe1": "primary PE", "pe2": "partition"}
+            for label, axis, field in result.pe_displacements():
+                fpath = f"{stem}_flow_{label}{ext}"
+                with spinner(f"Writing {Path(fpath).name}"):
+                    save_nifti(field.numpy(), fpath, affine=affine)
+                print(f"  • signed {names[label]} flow 4D (voxels, axis {axis}): {fpath}")
+        elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
             with spinner(f"Writing {Path(mag_path).name}"):
@@ -2168,6 +2518,8 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"  • signed PE flow 4D (voxels, ± = direction; scrub like a series): {flow_path}"
             )
+
+    _write_dual_axis_diagnostics(result, stem, ext, affine, args)
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 

@@ -23,7 +23,7 @@ Key speedups vs serial version:
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -3008,6 +3008,25 @@ def _weighted_pearson_patches(base: Tensor, warped: Tensor, weight: Tensor) -> T
     return cxy / (vx.clamp_min(1e-12) * vy.clamp_min(1e-12)).sqrt()
 
 
+def _alpha_per_channel(alpha: Tensor, n_echo: int, device: torch.device) -> Tensor:
+    """Normalise a per-echo scaling into a per-CHANNEL one, ``(3, E)``.
+
+    Accepts ``(E,)`` — one law shared by every displacement channel, the single-encode-
+    axis case — or ``(3, E)``, one law per xyz channel. Two encode axes need the latter:
+    the primary phase encode is flat across echoes while the partition scales with TE, so
+    collapsing them to one vector would apply the wrong law to one of the two channels.
+    Inactive channels get 1.0, which is inert because their displacement stays zero.
+    """
+    a = alpha.float().to(device)
+    if a.ndim == 1:
+        if a.shape[0] != n_echo:
+            raise ValueError(f"alpha must be ({n_echo},) or (3, {n_echo}); got {tuple(a.shape)}.")
+        return a[None].expand(3, n_echo).contiguous()
+    if a.shape != (3, n_echo):
+        raise ValueError(f"alpha must be ({n_echo},) or (3, {n_echo}); got {tuple(a.shape)}.")
+    return a.contiguous()
+
+
 def _mescaled_gn_normal_eqs(
     w: Tensor,
     g: Tensor,
@@ -3031,27 +3050,38 @@ def _mescaled_gn_normal_eqs(
     across frames. ``a4hw = alpha_e * half_width_pe`` folds the two python scalars in
     so the compiled signature carries no recompiling constant.
 
+    ``A`` encode axes are solved JOINTLY: the parameter vector is axis-major
+    (``[axis0 basis coeffs, axis1 basis coeffs]``) and the steepest-descent images are
+    the per-axis blocks concatenated along the basis dimension, so ``hmat`` becomes the
+    coupled ``(A·nb)²`` system rather than ``A`` independent ones. Solving them coupled
+    is the same point the per-voxel LK 2×2 makes one level down: two separate
+    single-axis fits each absorb the other axis's displacement wherever the patch
+    gradient is oblique to both.
+
     Args:
         w: ``(E, B, V)`` warped patch values at the current params.
-        g: ``(E, B, V)`` PE image gradient sampled at the same locations.
-        a4hw: ``(E, 1, 1, 1)`` per-echo ``alpha_e * hw_pe``.
+        g: ``(A, E, B, V)`` per-axis image gradient sampled at the same locations.
+        a4hw: ``(A, E, 1, 1, 1)`` per-axis, per-echo ``alpha_a,e * hw_a``.
         bt: ``(V, nb)`` basis transpose.
         omega: ``(1, B, V)`` per-voxel weight*mask.
         wsum: ``(1, B, 1)`` weight sum per patch.
         base_hat: ``(E, B, V)`` zero-normalised reference patches.
 
     Returns:
-        ``hmat`` ``(B, nb, nb)`` and ``grad`` ``(B, nb)``.
+        ``hmat`` ``(B, A·nb, A·nb)`` and ``grad`` ``(B, A·nb)``.
     """
     mW = (omega * w).sum(-1, keepdim=True) / wsum
     sW = ((omega * w * w).sum(-1, keepdim=True) / wsum - mW * mW).clamp_min(1e-12).sqrt()
     res = (w - mW) / sW - base_hat  # (E, B, V)
-    dW = a4hw * g.unsqueeze(-1) * bt  # (E, B, V, nb) steepest-descent images
+    dWa = a4hw * g.unsqueeze(-1) * bt  # (A, E, B, V, nb) per-axis steepest-descent
+    a_n, e_n, b_n, v_n, nb_n = dWa.shape
+    # axis-major flatten so the last dim lines up with the (B, A·nb) parameter vector
+    dW = dWa.permute(1, 2, 3, 0, 4).reshape(e_n, b_n, v_n, a_n * nb_n)
     mdW = (omega.unsqueeze(-1) * dW).sum(2, keepdim=True) / wsum.unsqueeze(-1)
     jn = (dW - mdW) / sW.unsqueeze(-1)  # zero-normalised Jacobian
     jnw = jn * omega.unsqueeze(-1)
-    hmat = torch.einsum("ebvn,ebvm->bnm", jnw, jn)  # (B, nb, nb)
-    grad = torch.einsum("ebvn,ebv->bn", jnw, res)  # (B, nb)
+    hmat = torch.einsum("ebvn,ebvm->bnm", jnw, jn)  # (B, A·nb, A·nb)
+    grad = torch.einsum("ebvn,ebv->bn", jnw, res)  # (B, A·nb)
     return hmat, grad
 
 
@@ -3110,7 +3140,7 @@ class _MEScaledPlan:
     do_pad: bool
     orig: tuple[int, int, int]  # nz_orig, ny_orig, nx_orig
     padded: tuple[int, int, int]  # nz, ny, nx
-    pe_grid_axis: int
+    pe_grid_axes: tuple[int, ...]
     do_xyz: tuple[bool, bool, bool]
     n_active: int
     levels: list[_MELevelPlan]
@@ -3120,7 +3150,7 @@ class _MEScaledPlan:
 
 def _build_mescaled_plan(
     base_echoes: Tensor,
-    pe_grid_axis: int,
+    pe_grid_axes: Sequence[int],
     weight: Tensor | None,
     mask: Tensor | None,
     config: QwarpConfig,
@@ -3141,15 +3171,20 @@ def _build_mescaled_plan(
     That is the right geometry for 2-D multi-slice acquisitions, where each slice is
     sampled at its own instant and the field is genuinely discontinuous through
     plane -- a cubic patch spanning ``minpatch`` slices would smooth across
-    acquisition times. Must differ from ``pe_grid_axis`` (PE has to lie in-plane).
+    acquisition times. Must differ from every encode axis (they have to lie in-plane).
+
+    ``pe_grid_axes`` is one or two displacement channels; a bare int is accepted as the
+    single-axis spelling.
     """
+    pe_grid_axes = (pe_grid_axes,) if isinstance(pe_grid_axes, int) else tuple(pe_grid_axes)
     if slicewise_axis is not None:
         if slicewise_axis not in (0, 1, 2):
             raise ValueError(f"slicewise_axis must be 0, 1, 2 or None; got {slicewise_axis}.")
-        if slicewise_axis == pe_grid_axis:
+        if slicewise_axis in pe_grid_axes:
             raise ValueError(
-                f"slicewise_axis ({slicewise_axis}) must differ from pe_grid_axis "
-                f"({pe_grid_axis}): PE must lie inside the patch plane to be solvable."
+                f"slicewise_axis ({slicewise_axis}) must differ from every encode axis "
+                f"({list(pe_grid_axes)}): the encode directions must lie inside the patch "
+                f"plane to be solvable."
             )
     base_echoes = base_echoes.float().to(device)
     E = base_echoes.shape[0]
@@ -3177,7 +3212,7 @@ def _build_mescaled_plan(
         m = mask.byte().to(device)
         mask_p = _pad_volume_faces(m.float(), padding).byte() if do_pad else m
 
-    do_xyz = (pe_grid_axis == 0, pe_grid_axis == 1, pe_grid_axis == 2)
+    do_xyz = (0 in pe_grid_axes, 1 in pe_grid_axes, 2 in pe_grid_axes)
     use_ncc = config.cost_method == "ncc"
     if use_ncc:
         blok_index_vol = None
@@ -3337,7 +3372,7 @@ def _build_mescaled_plan(
         do_pad=do_pad,
         orig=(nz_orig, ny_orig, nx_orig),
         padded=(nz, ny, nx),
-        pe_grid_axis=pe_grid_axis,
+        pe_grid_axes=tuple(pe_grid_axes),
         do_xyz=do_xyz,
         n_active=n_active,
         levels=levels,
@@ -3390,7 +3425,11 @@ def _improve_warp_batched_mescaled(
             external_pen = energy_g.sum() - energy_g[phase.gather_idx].sum(-1)
 
     global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
-    a_e = alpha.view(E, 1, 1)  # (E,1,1) per-echo TE scaling for broadcast
+    # Per-CHANNEL, per-echo scaling: with two encode axes the laws differ (primary PE is
+    # flat across echoes, partition scales with TE), so one shared alpha_e would apply the
+    # wrong law to one of the two channels. (3, E) with 1.0 on inactive channels.
+    alpha_ch = _alpha_per_channel(alpha, E, device)
+    a_x, a_y, a_z = (alpha_ch[d].view(E, 1, 1) for d in range(3))
 
     # Optional torch.compile of the stable building blocks. The plan geometry is
     # frame-invariant, so shapes are identical across every frame of the series and
@@ -3406,9 +3445,9 @@ def _improve_warp_batched_mescaled(
         """(B,) mean -corr over echoes for the shared displacement ``ah``."""
         if use_ncc:
             # All echoes sampled at alpha_e*ah in ONE grid_sample (E as the batch dim).
-            sx = (base_i[None] + a_e * ah_xd[None]).clamp(-0.499, nx - 0.501)
-            sy = (base_j[None] + a_e * ah_yd[None]).clamp(-0.499, ny - 0.501)
-            sz = (base_k[None] + a_e * ah_zd[None]).clamp(-0.499, nz - 0.501)
+            sx = (base_i[None] + a_x * ah_xd[None]).clamp(-0.499, nx - 0.501)
+            sy = (base_j[None] + a_y * ah_yd[None]).clamp(-0.499, ny - 0.501)
+            sz = (base_k[None] + a_z * ah_zd[None]).clamp(-0.499, nz - 0.501)
             warped = batched_trilinear_interpolate_multi(source_echoes, sx, sy, sz)
             warped = warped * mask_patches[None]
             r = _weighted_pearson_patches(base_echo_patches, warped, weight_patches[None])
@@ -3467,26 +3506,41 @@ def _improve_warp_batched_mescaled(
         return cost
 
     def _gn_solve(gn_iters: int) -> Tensor:
-        """Batched Levenberg-Marquardt on the normalised-NCC cost (PE-only).
+        """Batched Levenberg-Marquardt on the normalised-NCC cost, over 1-2 encode axes.
 
         The warp is linear in the params (``d = hw*(p@B)``), so the residual
         Jacobian is ``(alpha_e/sW) * gradS · (hw·Bᵀ)`` -- an analytic image-gradient
-        term, no autograd. Per patch we assemble the tiny ``n_basis×n_basis`` normal
-        equations (summed over echoes, weighted, mean-centred = zero-normalised LK),
-        take a damped step, and accept it only if the exact NCC cost improves
-        (per-patch damping ``lam`` up on reject, down on accept)."""
-        pe = active_dims[0]
-        hw_pe = float(half_widths[pe])
+        term, no autograd. Per patch we assemble the tiny ``(A·nb)×(A·nb)`` normal
+        equations (summed over echoes AND coupled across axes, weighted, mean-centred =
+        zero-normalised LK), take a damped step, and accept it only if the exact NCC
+        cost improves (per-patch damping ``lam`` up on reject, down on accept).
+
+        With two axes the parameter vector is axis-major and the two blocks are solved
+        COUPLED, not as two independent single-axis fits -- see
+        :func:`_mescaled_gn_normal_eqs`. The LM damping already regularises the
+        near-singular case, which here is a patch whose gradient is oblique to both
+        axes (the aperture problem at patch scale)."""
         bmat = basis  # (nb, V)
         bt = bmat.t()  # (V, nb)
         nb = bmat.shape[0]
-        pe_dim = (2, 1, 0)[pe]  # PE grid axis -> tensor dim in (nz, ny, nx)
-        gpe = (
-            torch.roll(source_echoes, -1, pe_dim + 1) - torch.roll(source_echoes, 1, pe_dim + 1)
-        ) * 0.5  # ∂S/∂(PE voxel), one per echo
+        n_ax = len(active_dims)
+        hw_ax = [float(half_widths[d]) for d in active_dims]
+        # ∂S/∂(voxel) along each active axis, one per echo
+        g_ax = torch.stack(
+            [
+                (
+                    torch.roll(source_echoes, -1, (2, 1, 0)[d] + 1)
+                    - torch.roll(source_echoes, 1, (2, 1, 0)[d] + 1)
+                )
+                * 0.5
+                for d in active_dims
+            ]
+        )  # (A, E, nz, ny, nx)
         omega = (weight_patches * mask_patches)[None]  # (1, B, V)
         wsum = omega.sum(-1, keepdim=True).clamp_min(1e-6)  # (1, B, 1)
-        a4hw = alpha.view(E, 1, 1, 1) * hw_pe  # per-echo alpha_e * hw_pe (folds scalars)
+        a4hw = torch.stack(
+            [alpha_ch[d].view(E, 1, 1, 1) * hw_ax[k] for k, d in enumerate(active_dims)]
+        )  # (A, E, 1, 1, 1)
 
         base = base_echo_patches  # (E, B, V)
         mB = (omega * base).sum(-1, keepdim=True) / wsum
@@ -3494,15 +3548,15 @@ def _improve_warp_batched_mescaled(
         base_hat = (base - mB) / sB
 
         def _forward(p: Tensor):
-            d = hw_pe * (p @ bmat)  # (B, V)
-            zero = torch.zeros_like(d)
-            hxd, hyd, hzd = (
-                (d, zero, zero) if pe == 0 else (zero, d, zero) if pe == 1 else (zero, zero, d)
-            )
+            chans = [None, None, None]
+            for k, d in enumerate(active_dims):
+                chans[d] = hw_ax[k] * (p[:, k * nb : (k + 1) * nb] @ bmat)  # (B, V)
+            zero = torch.zeros(p.shape[0], bmat.shape[1], device=p.device, dtype=p.dtype)
+            hxd, hyd, hzd = (c if c is not None else zero for c in chans)
             _wv, ax, ay, az = _compose(hxd, hyd, hzd)
-            sx = (base_i[None] + a_e * ax[None]).clamp(-0.499, nx - 0.501)
-            sy = (base_j[None] + a_e * ay[None]).clamp(-0.499, ny - 0.501)
-            sz = (base_k[None] + a_e * az[None]).clamp(-0.499, nz - 0.501)
+            sx = (base_i[None] + a_x * ax[None]).clamp(-0.499, nx - 0.501)
+            sy = (base_j[None] + a_y * ay[None]).clamp(-0.499, ny - 0.501)
+            sz = (base_k[None] + a_z * az[None]).clamp(-0.499, nz - 0.501)
             w = batched_trilinear_interpolate_multi(source_echoes, sx, sy, sz)  # (E,B,V)
             return w, sx, sy, sz
 
@@ -3512,14 +3566,16 @@ def _improve_warp_batched_mescaled(
             res = (w - mW) / sW - base_hat
             return ((omega * res * res).sum(-1) / wsum.squeeze(-1)).sum(0)  # (E,B)->(B,)
 
-        p = torch.zeros(B, nb, device=device)
+        p = torch.zeros(B, n_ax * nb, device=device)
         w0, *_ = _forward(p)
         best_cost = _cost(w0)
         best_p = p.clone()
         lam = torch.full((B,), 1e-2, device=device)
         for _it in range(gn_iters):
             w, sx, sy, sz = _forward(best_p)
-            g = batched_trilinear_interpolate_multi(gpe, sx, sy, sz)  # (E,B,V)
+            g = torch.stack(
+                [batched_trilinear_interpolate_multi(g_ax[k], sx, sy, sz) for k in range(n_ax)]
+            )  # (A, E, B, V)
             hmat, grad = _gn_normal_eqs(w, g, a4hw, bt, omega, wsum, base_hat)
             diag = torch.diagonal(hmat, dim1=-2, dim2=-1).clamp_min(1e-9)
             amat = hmat + lam[:, None, None] * torch.diag_embed(diag)
@@ -3590,9 +3646,18 @@ def _solve_mescaled_frame(
     state.yd = torch.zeros(nz, ny, nx, device=device)
     state.zd = torch.zeros(nz, ny, nx, device=device)
     if seed_field is not None:
-        seed = seed_field.float().to(device)
-        seed_p = _pad_volume_faces(seed, padding) if plan.do_pad else seed
-        (state.xd, state.yd, state.zd)[plan.pe_grid_axis][...] = seed_p
+        # One (nz,ny,nx) seed per encode axis, in plan.pe_grid_axes order; a bare 3-D
+        # tensor is the single-axis spelling.
+        seeds = [seed_field] if seed_field.ndim == 3 else list(seed_field)
+        if len(seeds) != len(plan.pe_grid_axes):
+            raise ValueError(
+                f"seed_field has {len(seeds)} field(s) but there are "
+                f"{len(plan.pe_grid_axes)} encode axes."
+            )
+        for ax, sd in zip(plan.pe_grid_axes, seeds, strict=True):
+            sdd = sd.float().to(device)
+            sd_p = _pad_volume_faces(sdd, padding) if plan.do_pad else sdd
+            (state.xd, state.yd, state.zd)[ax][...] = sd_p
 
     for level in plan.levels:
         # The penalty's h**0.25 term has infinite gradient at an all-zero field, which
@@ -3616,22 +3681,33 @@ def _solve_mescaled_frame(
             )
 
     warped = torch.empty(E, nz_orig, ny_orig, nx_orig, device=device)
+    alpha_ch = _alpha_per_channel(alpha, E, device)
     for e in range(E):
-        ae = float(alpha[e])
+        # Each CHANNEL carries its own law: with two encode axes a single alpha_e would
+        # scale the flat primary-PE channel by the partition's TE ratio.
+        ax_e, ay_e, az_e = (float(alpha_ch[d, e]) for d in range(3))
         wf = warp_image(
-            source_p[e], ae * state.xd, ae * state.yd, ae * state.zd, mode=config.final_interp
+            source_p[e],
+            ax_e * state.xd,
+            ay_e * state.yd,
+            az_e * state.zd,
+            mode=config.final_interp,
         )
         warped[e] = _crop_padding(wf, padding, (nz_orig, ny_orig, nx_orig))
 
-    field_pad = (state.xd, state.yd, state.zd)[plan.pe_grid_axis]
-    field = _crop_padding(field_pad, padding, (nz_orig, ny_orig, nx_orig))
-    return warped, field.contiguous()
+    fields = torch.stack(
+        [
+            _crop_padding((state.xd, state.yd, state.zd)[ax], padding, (nz_orig, ny_orig, nx_orig))
+            for ax in plan.pe_grid_axes
+        ]
+    )  # (A, nz, ny, nx)
+    return warped, fields.contiguous()
 
 
 def qwarp_pe_scaled_polish(
     base_echoes: Tensor,
     source_echoes: Tensor,
-    pe_grid_axis: int,
+    pe_grid_axis: int | Sequence[int],
     alpha: Tensor | None = None,
     seed_field: Tensor | None = None,
     weight: Tensor | None = None,
@@ -3655,10 +3731,15 @@ def qwarp_pe_scaled_polish(
         base_echoes: ``(E, nz, ny, nx)`` per-echo reference (one TR, all echoes).
         source_echoes: ``(E, nz, ny, nx)`` per-echo moving volume to align.
         pe_grid_axis: which displacement channel carries PE — 0=x (fastest, ``nx``),
-            1=y (``ny``), 2=z (``nz``); the other two channels are held at zero.
-        alpha: ``(E,)`` fixed per-echo TE scaling (echo-1 relative). ``None`` => ones
-            (flat scaling / single echo).
-        seed_field: ``(nz, ny, nx)`` seed PE displacement (voxels). ``None`` => zeros.
+            1=y (``ny``), 2=z (``nz``); the other channels are held at zero. A PAIR
+            (e.g. ``(0, 1)``) solves both encode axes jointly — one coupled
+            ``(A·nb)²`` Gauss-Newton system per patch, not two independent fits.
+        alpha: ``(E,)`` fixed per-echo TE scaling (echo-1 relative), or ``(3, E)`` to
+            give each xyz channel ITS OWN law — required with two encode axes, where
+            the primary PE is flat across echoes and the partition scales with TE.
+            ``None`` => ones (flat scaling / single echo).
+        seed_field: ``(nz, ny, nx)`` seed PE displacement (voxels), or ``(A, nz, ny, nx)``
+            one per encode axis. ``None`` => zeros.
         weight, mask: optional shared ``(nz, ny, nx)`` weight/mask (auto if None).
         config: :class:`QwarpConfig`; ``minpatch`` sets the finest level and
             ``cost_method`` must be ``lpc``/``lpa``.
@@ -3672,8 +3753,9 @@ def qwarp_pe_scaled_polish(
 
     Returns:
         ``(warped, field)`` where ``warped`` is ``(E, nz, ny, nx)`` each source warped
-        by ``alpha_e * w``, and ``field`` is the ``(nz, ny, nx)`` polished PE
-        displacement (voxels), both cropped back to the original grid.
+        by ``alpha_e * w``, and ``field`` is ``(A, nz, ny, nx)`` — the polished
+        displacement per encode axis (voxels), in ``pe_grid_axis`` order — both cropped
+        back to the original grid.
     """
     if config is None:
         config = QwarpConfig()
@@ -3682,8 +3764,11 @@ def qwarp_pe_scaled_polish(
             f"qwarp_pe_scaled_polish uses ncc (patch Pearson) or lpc/lpa (blok-local); "
             f"got cost_method={config.cost_method!r}."
         )
-    if pe_grid_axis not in (0, 1, 2):
-        raise ValueError(f"pe_grid_axis must be 0, 1 or 2; got {pe_grid_axis}.")
+    axes = [pe_grid_axis] if isinstance(pe_grid_axis, int) else list(pe_grid_axis)
+    if not axes or len(axes) > 2:
+        raise ValueError(f"pe_grid_axis takes 1 or 2 axes; got {pe_grid_axis}.")
+    if any(a not in (0, 1, 2) for a in axes) or len(set(axes)) != len(axes):
+        raise ValueError(f"encode axes must be distinct values in 0/1/2; got {pe_grid_axis}.")
     if source_echoes.dim() != 4 or base_echoes.dim() != 4:
         raise ValueError("base_echoes/source_echoes must be (E, nz, ny, nx).")
 
@@ -3696,7 +3781,7 @@ def qwarp_pe_scaled_polish(
     alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
 
     plan = _build_mescaled_plan(
-        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, pad, slicewise_axis
+        base_echoes, axes, weight, mask, config, device, n_levels, pad, slicewise_axis
     )
     return _solve_mescaled_frame(plan, source_echoes, seed_field, alpha, config, device)
 
@@ -3705,7 +3790,7 @@ def qwarp_pe_scaled_polish_series(
     base_echoes: Tensor,
     source_series: Tensor,
     seed_series: Tensor,
-    pe_grid_axis: int,
+    pe_grid_axis: int | Sequence[int],
     alpha: Tensor | None = None,
     weight: Tensor | None = None,
     mask: Tensor | None = None,
@@ -3731,10 +3816,12 @@ def qwarp_pe_scaled_polish_series(
         base_echoes: ``(E, nz, ny, nx)`` per-echo reference template (motion-free).
         source_series: ``(E, nz, ny, nx, T)`` per-echo moving series.
         seed_series: ``(nz, ny, nx, T)`` per-frame seed PE displacement (voxels,
-            echo-1 scale) -- e.g. locomoco's shared field ``w``.
-        pe_grid_axis: PE displacement channel (0=x, 1=y, 2=z); see
-            :func:`qwarp_pe_scaled_polish`.
-        alpha: ``(E,)`` fixed per-echo TE scaling (echo-1 relative). ``None`` => ones.
+            echo-1 scale) -- e.g. locomoco's shared field ``w`` -- or
+            ``(A, nz, ny, nx, T)``, one per encode axis.
+        pe_grid_axis: PE displacement channel (0=x, 1=y, 2=z), or a pair of them to
+            solve both encode axes jointly; see :func:`qwarp_pe_scaled_polish`.
+        alpha: ``(E,)`` per-echo TE scaling, or ``(3, E)`` for a per-channel law (needed
+            with two encode axes). ``None`` => ones.
         weight, mask: optional shared ``(nz, ny, nx)`` weight/mask (auto if None).
         config: :class:`QwarpConfig`; ``cost_method`` must be ``ncc``/``lpc``/``lpa``.
         n_levels: fine levels per frame.
@@ -3744,16 +3831,21 @@ def qwarp_pe_scaled_polish_series(
 
     Returns:
         ``(warped, field)`` with ``warped`` ``(E, nz, ny, nx, T)`` and ``field``
-        ``(nz, ny, nx, T)`` the polished per-frame PE displacement.
+        ``(A, nz, ny, nx, T)`` the polished per-frame displacement per encode axis.
     """
     if source_series.dim() != 5:
         raise ValueError(
             f"source_series must be (E, nz, ny, nx, T); got {tuple(source_series.shape)}"
         )
     E, nz, ny, nx, T = source_series.shape
-    if seed_series.shape != (nz, ny, nx, T):
+    axes = [pe_grid_axis] if isinstance(pe_grid_axis, int) else list(pe_grid_axis)
+    n_ax = len(axes)
+    if seed_series.dim() == 4:
+        seed_series = seed_series[None]  # the single-axis spelling
+    if seed_series.shape != (n_ax, nz, ny, nx, T):
         raise ValueError(
-            f"seed_series must be (nz, ny, nx, T)={(nz, ny, nx, T)}; got {tuple(seed_series.shape)}"
+            f"seed_series must be (nz, ny, nx, T)={(nz, ny, nx, T)} or "
+            f"(A, nz, ny, nx, T)={(n_ax, nz, ny, nx, T)}; got {tuple(seed_series.shape)}"
         )
     if config is None:
         config = QwarpConfig()
@@ -3763,11 +3855,11 @@ def qwarp_pe_scaled_polish_series(
 
     # Build the frame-invariant geometry + base/weight/mask gathers ONCE.
     plan = _build_mescaled_plan(
-        base_echoes, pe_grid_axis, weight, mask, config, device, n_levels, True, slicewise_axis
+        base_echoes, axes, weight, mask, config, device, n_levels, True, slicewise_axis
     )
 
     warped = torch.empty(E, nz, ny, nx, T)
-    field = torch.empty(nz, ny, nx, T)
+    field = torch.empty(n_ax, nz, ny, nx, T)
 
     frames = range(T)
     if show_progress and _tqdm is not None and T > 1:
@@ -3782,7 +3874,7 @@ def qwarp_pe_scaled_polish_series(
                 plan, source_series[..., t], seed_series[..., t], alpha, config, device
             )
             warped[..., t] = w_t.cpu()
-            field[..., t] = f_t.cpu()
+            field[..., t] = f_t.cpu()  # (A, nz, ny, nx)
 
     return warped, field
 
