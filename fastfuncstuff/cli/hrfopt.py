@@ -79,6 +79,12 @@ try:
         fit_glm_hrf_library_with_xval,
         save_hrf_selection_results,
     )
+    from fastfuncstuff.design.stim_vec import (
+        add_stim_vec_arguments,
+        append_stim_vecs_to_single_trial_design,
+        collect_stim_vec_blocks,
+        stim_vec_bucket_labels,
+    )
     from fastfuncstuff.io.afni import save_nifti
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
@@ -376,6 +382,7 @@ Notes:
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
     add_ortvec_arguments(proc_opts)
+    add_stim_vec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
         type=float,
@@ -817,6 +824,22 @@ def main():
         verbose=(args.verb >= 1),
         trim=trim,
     )
+    # Continuous stimulus vectors join the STIM design, re-convolved with each
+    # candidate HRF inside the selection loop. Leaving a strong background in the
+    # residual would let it steer which HRF wins.
+    stim_vec_blocks = collect_stim_vec_blocks(
+        args,
+        run_starts,
+        n_timepoints,
+        trim=trim,
+        verbose=(args.verb >= 1),
+    )
+
+    # One label per task COLUMN for the output writers. condition_labels itself
+    # stays pristine: it is the CONDITION list, and the single-trial builders
+    # would read an extra entry as an extra condition.
+    task_column_labels = list(condition_labels) + stim_vec_bucket_labels(stim_vec_blocks)
+
     # Legacy variable retained for back-compat fields (metadata + delta-denoise label).
     ortvec_files = [(f, label) for f, label in args.ortvec] if args.ortvec else None
 
@@ -952,6 +975,22 @@ def main():
                 device=device,
             )
 
+            # Stim vectors ride along, convolved with THIS candidate HRF, but
+            # they are not trials: n_trials below stays the trial count and the
+            # betas are sliced back to it.
+            n_trial_cols_st = int(st_design.shape[1])
+            st_design, _ = append_stim_vecs_to_single_trial_design(
+                stim_vec_blocks,
+                st_design,
+                hrf_library=hrf_library[hrf_idx].reshape(1, -1),
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                run_starts=run_starts,
+                device=device,
+                verbose=False,
+            )
+
             # Project nuisance from single-trial design (per-run, matching data projection)
             projected_st_design = st_design.clone()
             for run_idx in range(n_runs):
@@ -969,7 +1008,7 @@ def main():
 
             # Lazy-init canonical_betas now that we know n_trials
             if canonical_betas is None:
-                n_trials = projected_st_design.shape[1]
+                n_trials = n_trial_cols_st
                 canonical_betas = torch.zeros(n_voxels, n_trials)
 
             # Fit OLS in voxel chunks (projected data stays on CPU, stream to GPU)
@@ -987,7 +1026,7 @@ def main():
 
                 # Store canonical (idx 0) betas for beta-series CV
                 if hrf_idx == 0:
-                    canonical_betas[c0:c1] = chunk_betas.cpu()
+                    canonical_betas[c0:c1] = chunk_betas[:, :n_trials].cpu()
 
             if args.verb >= 1 and hrf_idx % 5 == 0:
                 col_r2 = fit_r2_all[:, hrf_idx]
@@ -1023,7 +1062,7 @@ def main():
                 idx = vox_indices[c0:c1]
                 chunk_data = projected_data[idx].to(device)
                 chunk_betas = torch.linalg.lstsq(proj_design_dev, chunk_data.T).solution.T
-                best_betas[idx] = chunk_betas.cpu()
+                best_betas[idx] = chunk_betas[:, :n_trials].cpu()
 
         del projected_designs_cache  # Free ~240 MB
 
@@ -1148,6 +1187,7 @@ def main():
                 microtime_onset=0,  # Default: sample at start of TR
                 device=device,
                 verbose=args.verb >= 1,
+                stim_vec_blocks=stim_vec_blocks,
             )
 
             # Update results
@@ -1180,6 +1220,7 @@ def main():
             debug=args.debug,
             debug_prefix=args.prefix,
             condition_labels=condition_labels,
+            stim_vec_blocks=stim_vec_blocks,
         )
 
         # ========== -delta_denoise: second pass without ortvec ==========
@@ -1206,6 +1247,9 @@ def main():
                 polort=args.polort,
                 ortvec_files=None,
                 nuisance_blocks=[],  # the whole point — strip user nuisance
+                # Stim vectors are NOT nuisance, so they stay in both passes;
+                # -delta_denoise isolates the effect of -ortvec alone.
+                stim_vec_blocks=stim_vec_blocks,
                 canonical_mode=args.canonical,
                 device=device,
                 verbose=args.verb >= 1,
@@ -1250,6 +1294,7 @@ def main():
             condition_labels=condition_labels,
             device=device,
             verbose=args.verb >= 1,
+            stim_vec_blocks=stim_vec_blocks,
         )
 
         results.final_results = final_results
@@ -1326,7 +1371,7 @@ def main():
         volume_shape=volume_shape,
         affine=affine,
         voxel_mask=voxel_mask,
-        condition_labels=condition_labels,
+        condition_labels=task_column_labels,
         run_starts=run_starts,
         save_all_hrf_designs=args.save_hrf_designs,
         onsets=onset_matrix if args.save_hrf_designs else None,
@@ -1385,7 +1430,7 @@ def main():
             volume_shape=volume_shape,
             affine=affine,
             voxel_mask=voxel_mask,
-            condition_labels=condition_labels,
+            condition_labels=task_column_labels,
             run_starts=run_starts,
             save_all_hrf_designs=False,  # one set of designs is enough
             onsets=None,

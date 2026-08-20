@@ -81,6 +81,11 @@ try:
     )
     from fastfuncstuff.design.hrf import get_hrf_library
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
+    from fastfuncstuff.design.stim_vec import (
+        add_stim_vec_arguments,
+        append_stim_vecs_to_single_trial_design,
+        bucket_labels_from_groups,
+    )
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.glm.ridge import load_hrf_indices
     from fastfuncstuff.io.afni import (
@@ -490,6 +495,7 @@ Notes:
         help="Polynomial order for drift modeling (default: auto based on run length)",
     )
     add_ortvec_arguments(proc_opts)
+    add_stim_vec_arguments(proc_opts)
     proc_opts.add_argument(
         "-microtime_dt",
         type=float,
@@ -1904,6 +1910,58 @@ def main():
         n_voxels=n_voxels,
     )
 
+    # --- Continuous stimulus vectors (-stim_event_vec / -stim_vec) ---
+    # These join the TASK block, not the nuisance block, which is what makes the
+    # noise pool and the PC selection treat an oscillating background as signal
+    # to be explained rather than noise to be removed.
+    from fastfuncstuff.design.stim_vec import (
+        append_stim_vecs_to_task_design,
+        collect_stim_vec_blocks,
+    )
+
+    stim_vec_blocks = collect_stim_vec_blocks(
+        args, run_starts, n_timepoints, trim=trim, verbose=(args.verb >= 1)
+    )
+    stim_vec_labels: list[str] = []
+    # One label per task COLUMN (conditions, then any stim vectors).
+    task_column_labels = list(condition_labels)
+    if stim_vec_blocks:
+        # build_task_design_from_args returns exactly one of the two.
+        if task_design is not None:
+            n_task_before_vec = int(task_design.shape[1])
+        else:
+            assert designs_by_hrf is not None
+            n_task_before_vec = int(next(iter(designs_by_hrf.values())).shape[1])
+        task_design, designs_by_hrf, stim_vec_labels, stim_vec_groups = (
+            append_stim_vecs_to_task_design(
+                stim_vec_blocks,
+                task_design=task_design,
+                designs_by_hrf=designs_by_hrf,
+                hrf_library=hrf_library,
+                hrf_model_name=hrf_model_name,
+                is_fir_model=is_fir_model,
+                n_basis=n_basis,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                run_starts=run_starts,
+                device=device,
+            )
+        )
+        # condition_labels itself must stay pristine -- it is the CONDITION list,
+        # consumed by create_single_trial_design and save_single_trial_results,
+        # which would mistake an extra entry for an extra condition. The bucket
+        # writer instead wants one label per task COLUMN, and can only be
+        # extended when the two already line up (they do not under FIR/TENT,
+        # where a single label covers n_basis columns).
+        if len(condition_labels) == n_task_before_vec:
+            task_column_labels = list(condition_labels) + bucket_labels_from_groups(stim_vec_groups)
+        else:
+            print(
+                "  NOTE: stim vector betas are fit but not labelled in the bucket "
+                "(multi-basis design)"
+            )
+
     # Build polynomial nuisance regressors PER RUN
     # -------------------------------------------
     # CRITICAL: Nuisance regressors are RUN-SPECIFIC (each run has its own drift)
@@ -2132,6 +2190,28 @@ def main():
             n_basis=n_basis if not is_fir_model else 1,
         )
 
+        # Stim vectors ride along as extra always-fit task columns so the trial
+        # betas are estimated with the background accounted for. n_trial_cols is
+        # captured BEFORE the append: everything trial-indexed downstream
+        # (trial_cond_ids, the trial table, the saved beta series) must only
+        # ever see the first n_trial_cols columns.
+        n_trial_cols = int(st_design.shape[-1])
+        st_design, _st_vec_labels = append_stim_vecs_to_single_trial_design(
+            stim_vec_blocks,
+            st_design,
+            hrf_library=hrf_library,
+            hrf_model_name=hrf_model_name,
+            is_fir_model=is_fir_model,
+            n_basis=n_basis if not is_fir_model else 1,
+            n_timepoints=n_timepoints,
+            tr=args.tr,
+            microtime_dt=args.microtime_dt,
+            run_starts=run_starts,
+            device=device,
+            verbose=True,
+        )
+        n_stim_vec_cols = int(st_design.shape[-1]) - n_trial_cols
+
         per_voxel_st = st_design.ndim == 3  # (n_unique_hrfs, n_timepoints, n_trials * n_basis)
         n_columns = (
             trial_labels.__len__() if hasattr(trial_labels, "__len__") else len(trial_labels)
@@ -2150,7 +2230,6 @@ def main():
             assert hrf_indices is not None
             hrf_indices_dev = hrf_indices.to(data.device)
             unique_hrfs = torch.unique(hrf_indices_dev).tolist()
-            n_trials = st_design.shape[-1]
             n_conditions_st = int(trial_cond_ids.max().item()) + 1
             print(f"  Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs")
 
@@ -2163,7 +2242,7 @@ def main():
         def _condition_design_for_hrf(hrf_idx: int) -> torch.Tensor:
             cached = _cond_design_by_hrf.get(hrf_idx)
             if cached is None:
-                hrf_st_design = st_design[hrf_idx]  # (n_tp, n_trials)
+                hrf_st_design = st_design[hrf_idx][:, :n_trial_cols]  # (n_tp, n_trials)
                 cached = torch.zeros(n_timepoints, n_conditions_st, device=device)
                 for c in range(n_conditions_st):
                     cond_mask = trial_cond_ids == c
@@ -2465,10 +2544,7 @@ def main():
             print("  Scoring in single-trial beta space (-cv_design single)")
 
             # Determine n_trials from the design
-            if not per_voxel_st:
-                n_trials_st = st_design.shape[1]
-            else:
-                n_trials_st = st_design.shape[2]  # (n_unique_hrfs, n_tp, n_trials)
+            n_trials_st = n_trial_cols  # stim vector columns are not trials
 
             # Collect all betas: (n_pc_counts, n_voxels, n_trials) on CPU
             all_st_betas = torch.zeros(n_pc_counts, n_voxels_st, n_trials_st)
@@ -2489,7 +2565,7 @@ def main():
                 if not per_voxel_st:
                     # Standard 2D path
                     full_design = torch.cat([st_design, nuisance_design], dim=1)
-                    task_indices = list(range(st_design.shape[1]))
+                    task_indices = list(range(st_design.shape[1]))  # trials + stim vectors
                     glm_results = fit_glm(
                         cv_data,
                         full_design,
@@ -2500,13 +2576,13 @@ def main():
                         task_indices=task_indices,
                     )
                     assert glm_results.betas is not None  # set by fit_glm above
-                    all_st_betas[n_pcs] = glm_results.betas.cpu()
+                    all_st_betas[n_pcs] = glm_results.betas[:, :n_trials_st].cpu()
                 else:
                     # Per-voxel HRF path: group by HRF index
-                    task_indices = list(range(n_trials_st))
+                    task_indices = list(range(n_trials_st + n_stim_vec_cols))
                     for hrf_idx in unique_hrfs:
                         voxel_mask = hrf_indices_dev == hrf_idx
-                        group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials)
+                        group_design_2d = st_design[hrf_idx]  # (n_tp, n_trials + n_vec)
                         full_design = torch.cat([group_design_2d, nuisance_design], dim=1)
                         glm_results = fit_glm(
                             cv_data[voxel_mask],
@@ -2518,7 +2594,7 @@ def main():
                             task_indices=task_indices,
                         )
                         assert glm_results.betas is not None  # set by fit_glm above
-                        all_st_betas[n_pcs, voxel_mask] = glm_results.betas.cpu()
+                        all_st_betas[n_pcs, voxel_mask] = glm_results.betas[:, :n_trials_st].cpu()
 
             # Batch beta-space CV across all PC counts at once
             print("  Computing beta-space CV R² for all PC counts (batch)...")
@@ -2615,7 +2691,7 @@ def main():
         if not per_voxel_st:
             # Standard 2D path
             full_design_final = torch.cat([st_design, nuisance_design_final], dim=1)
-            task_indices_final = list(range(st_design.shape[1]))
+            task_indices_final = list(range(st_design.shape[1]))  # trials + stim vectors
             glm_results_final = fit_glm(
                 data,
                 full_design_final,
@@ -2629,11 +2705,13 @@ def main():
             # fit_glm always populates betas; the Optional is for callers that
             # request a stats-only fit, which this is not.
             assert final_betas is not None
+            # Trial-indexed from here on: drop the stim vector columns.
+            final_betas = final_betas[:, :n_trial_cols]
         else:
             # Per-voxel HRF path: group by HRF index
             print(f"  Fitting {len(unique_hrfs)} HRF groups...")
-            final_betas = torch.zeros(n_voxels_st, n_trials, device=data.device)
-            task_indices_final = list(range(n_trials))
+            final_betas = torch.zeros(n_voxels_st, n_trial_cols, device=data.device)
+            task_indices_final = list(range(n_trial_cols + n_stim_vec_cols))
             for i_hrf, hrf_idx in enumerate(
                 tqdm(unique_hrfs, desc="  HRF groups", disable=not args.verb >= 1)
             ):
@@ -2655,7 +2733,9 @@ def main():
                         start_tp = run_starts[run_idx]
                         end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
                         run_trial_mask = trial_run_ids == run_idx
-                        run_design = group_design_2d[start_tp:end_tp, run_trial_mask]
+                        run_design = group_design_2d[start_tp:end_tp, :n_trial_cols][
+                            :, run_trial_mask
+                        ]
                         design_energy = run_design.abs().sum().item()
                         n_nonzero = (run_design.abs() > 1e-6).sum().item()
                         data_run = data[voxel_mask][:, start_tp:end_tp]
@@ -2675,7 +2755,7 @@ def main():
                     task_indices=task_indices_final,
                 )
                 assert glm_results_final.betas is not None  # set by fit_glm above
-                final_betas[voxel_mask] = glm_results_final.betas
+                final_betas[voxel_mask] = glm_results_final.betas[:, :n_trial_cols]
             assert glm_results_final.r2 is not None  # set by fit_glm above
             print(f"  Complete. Mean R² = {glm_results_final.r2.mean().item():.3f}")
 
@@ -3383,7 +3463,7 @@ def main():
                     volume_shape=volume_shape,
                     affine=affine,
                     model_type="initial",
-                    condition_labels=condition_labels,
+                    condition_labels=task_column_labels,
                     voxel_mask=voxel_mask,
                     n_timepoints=n_timepoints,
                     n_regressors=n_total_regs_initial,
@@ -3457,7 +3537,7 @@ def main():
                     volume_shape=volume_shape,
                     affine=affine,
                     model_type="denoised",
-                    condition_labels=condition_labels,
+                    condition_labels=task_column_labels,
                     voxel_mask=voxel_mask,
                     n_timepoints=n_timepoints,
                     n_regressors=n_total_regs_final,

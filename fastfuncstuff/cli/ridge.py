@@ -72,6 +72,15 @@ try:
         trim_spec_from_args,
     )
     from fastfuncstuff.design.hrf import get_hrf_library
+    from fastfuncstuff.design.stim_vec import (
+        add_stim_vec_arguments,
+        build_stim_vec_design,
+        collect_stim_vec_blocks,
+        recover_stim_vec_betas,
+        residualize_stim_vecs,
+        resolve_stim_vec_hrf,
+        stim_vec_bucket_labels,
+    )
     from fastfuncstuff.glm.ridge import (
         create_single_trial_design,
         fit_ridge_single_trial,
@@ -302,6 +311,21 @@ Notes:
 
     # Processing options
     proc_opts = parser.add_argument_group("Processing Options")
+    add_stim_vec_arguments(proc_opts)
+    proc_opts.add_argument(
+        "-stim_vec_ridge",
+        "-stim-vec-ridge",
+        dest="stim_vec_ridge",
+        choices=["unpenalized", "penalized"],
+        default="unpenalized",
+        help=(
+            "How stim vectors enter the ridge fit. 'unpenalized' (default) fits them "
+            "at full strength alongside the shrunk trial regressors, so a background "
+            "soaks up all of its variance and leaves the trial betas clean; "
+            "'penalized' puts them in the shrunk block with the trials. Only applies "
+            "with -single_trials."
+        ),
+    )
     proc_opts.add_argument(
         "-mask",
         type=str,
@@ -623,6 +647,22 @@ def main():
         )
     )
 
+    # --- Continuous stimulus vectors (-stim_event_vec / -stim_vec) ---
+    # Never split into trials: they describe a continuous input, so they ride
+    # along as extra task columns and are dropped again before anything
+    # trial-indexed sees the betas.
+    stim_vec_blocks = collect_stim_vec_blocks(
+        args, run_starts, n_timepoints, trim=trim, verbose=(args.verb >= 1)
+    )
+    stim_vec_labels = stim_vec_bucket_labels(stim_vec_blocks)
+    if stim_vec_blocks and not args.single_trials:
+        print(
+            "ERROR: -stim_event_vec / -stim_vec need -single_trials in ffs_ridge. "
+            "The timeseries-CV path folds nuisance in per run, which would give a "
+            "shared stimulus vector one beta per run instead of one overall."
+        )
+        sys.exit(1)
+
     n_columns = len(trial_labels)
     n_condition_cols = condition_design.shape[1]
     # For SPMG1: n_columns = n_trials, n_condition_cols = n_conditions
@@ -729,20 +769,93 @@ def main():
         per_voxel_design = design_matrix.ndim == 3
         _hib = metric_higher_is_better(args.metric)
 
+        def _vec_design_for(hrf_kernel=None):
+            """Stim vector columns convolved with one HRF (None = the design's)."""
+            if hrf_kernel is not None:
+                bases = hrf_kernel.reshape(1, -1)
+            else:
+                bases, _note = resolve_stim_vec_hrf(
+                    hrf_model_name,
+                    is_fir_model=False,
+                    n_basis=n_basis,
+                    microtime_dt=args.microtime_dt,
+                    device=device,
+                )
+            vec, _labels, _groups = build_stim_vec_design(
+                stim_vec_blocks,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                hrf_bases=bases,
+                run_starts=run_starts,
+                device=device,
+            )
+            return vec
+
+        # In penalized mode the vectors join the shrunk design up front; in
+        # unpenalized mode they are held back and projected out instead (exactly
+        # equivalent to fitting them jointly without a penalty -- Frisch-Waugh).
+        penalize_vecs = stim_vec_blocks and args.stim_vec_ridge == "penalized"
+        n_trial_cols = int(design_matrix.shape[-1])
+        stim_vec_betas = None
+        if penalize_vecs:
+            if per_voxel_design:
+                assert hrf_indices is not None
+                design_matrix = torch.stack(
+                    [
+                        torch.cat([design_matrix[h], _vec_design_for(hrf_library[h])], dim=1)
+                        for h in range(design_matrix.shape[0])
+                    ],
+                    dim=0,
+                )
+            else:
+                design_matrix = torch.cat([design_matrix, _vec_design_for()], dim=1)
+            print(f"  Stim vectors penalized with the trials (+{len(stim_vec_labels)} columns)")
+
         if not per_voxel_design:
             # ---- Standard path: single design for all voxels ----
             print("Projecting nuisance from data and design...")
             # data_clean returned on CPU for large datasets (project_out_nuisance_per_run
             # allocates output on "cpu" when chunking is needed, see xval.py:211)
-            data_clean, design_clean = project_out_nuisance_per_run(
-                data, design_matrix, nuisance_per_run, run_starts, device=device
+            _unpenalized = bool(stim_vec_blocks) and not penalize_vecs
+            _proj_design = (
+                torch.cat([design_matrix, _vec_design_for()], dim=1)
+                if _unpenalized
+                else design_matrix
             )
+            data_clean, design_clean = project_out_nuisance_per_run(
+                data, _proj_design, nuisance_per_run, run_starts, device=device
+            )
+            _vec_q = None
+            if _unpenalized:
+                # Stage two: remove the (already nuisance-residualized) vectors
+                # globally. Composed with stage one this is the residual of a
+                # joint regression on [nuisance | stim vectors], so the ridge fit
+                # below returns the joint model's trial betas with the vectors
+                # entering unpenalized.
+                design_clean, vec_clean = (
+                    design_clean[:, :n_trial_cols],
+                    design_clean[:, n_trial_cols:],
+                )
+                # Keep the stage-one (nuisance-only) data AND design: the
+                # back-substitution below needs the design *before* the vectors
+                # were projected out of it, or the b-dependent term vanishes.
+                _data_pre_vec = data_clean
+                _design_pre_vec = design_clean
+                data_clean, design_clean, _vec_q, _vec_r = residualize_stim_vecs(
+                    data_clean,
+                    design_clean,
+                    vec_clean,
+                    device=device,
+                    chunk_size=args.chunk_size if args.chunk_size > 0 else None,
+                )
+                print(f"  Stim vectors fit unpenalized ({len(stim_vec_labels)} column(s))")
 
             # Pre-move design to device once (small: n_timepoints × n_trials)
             design_clean_dev = design_clean.to(device)
 
             # Allocate output accumulators on CPU
-            n_cols = design_matrix.shape[1]
+            n_cols = design_clean.shape[1]
             final_betas = torch.zeros(n_voxels, n_cols)  # CPU
             xval_r2 = torch.zeros(n_voxels)  # CPU
             full_r2 = torch.zeros(n_voxels)  # CPU
@@ -791,6 +904,9 @@ def main():
                 # ≈ OLS betas for high-SNR voxels, shrunken-to-zero for low-SNR.
                 # Then exclude frac=1.0 from selection (always regularise a bit).
                 chunk_betas_all = chunk_coefs.permute(1, 2, 0)  # (n_fracs, chunk, n_cols)
+                # Beta-space CV is indexed by trial, so any penalized stim
+                # vector columns must not reach it.
+                chunk_betas_all = chunk_betas_all[:, :, :n_trial_cols]
                 n_fracs = len(fracs)
                 xval = single_trial_cv_helper(
                     chunk_betas_all,
@@ -844,6 +960,23 @@ def main():
                 predicted = betas_chunk @ design_clean_dev.T  # (chunk, n_tp)
                 full_r2[c0:c1] = compute_r2_metric(data_chunk, predicted, metric="cod").cpu()
 
+            if _vec_q is not None:
+                # Back-substitute the other half of the Frisch-Waugh split, so
+                # the background is reported and not merely absorbed.
+                stim_vec_betas = recover_stim_vec_betas(
+                    _data_pre_vec,
+                    _design_pre_vec,
+                    final_betas,
+                    _vec_q,
+                    _vec_r,
+                    chunk_size=args.chunk_size if args.chunk_size > 0 else None,
+                )
+                del _data_pre_vec, _design_pre_vec
+
+            if penalize_vecs:
+                stim_vec_betas = final_betas[:, n_trial_cols:].cpu()
+                final_betas = final_betas[:, :n_trial_cols]
+
             # Move summary stats to device for downstream printing / saving
             xval_r2 = xval_r2.to(device)
             full_r2 = full_r2.to(device)
@@ -858,8 +991,10 @@ def main():
             unique_hrfs = torch.unique(hrf_indices).tolist()
             print(f"Per-voxel HRF mode: {len(unique_hrfs)} unique HRFs")
 
-            # Allocate outputs
-            final_betas = torch.zeros(n_voxels, n_columns, device=device)
+            # Allocate outputs. Under -stim_vec_ridge penalized the design is
+            # wider than the trial count; the vector columns are split off again
+            # once the fit is done.
+            final_betas = torch.zeros(n_voxels, int(design_matrix.shape[-1]), device=device)
             xval_r2 = torch.zeros(n_voxels, device=device)
             full_r2 = torch.zeros(n_voxels, device=device)
             optimal_fracs = torch.zeros(n_voxels, device=device)
@@ -897,13 +1032,31 @@ def main():
 
                 # Get this group's 2D design and project nuisance
                 group_design_2d = design_matrix[hrf_idx]  # (n_timepoints, n_trials)
+                _group_unpenalized = bool(stim_vec_blocks) and not penalize_vecs
+                _group_proj_design = (
+                    torch.cat([group_design_2d, _vec_design_for(hrf_library[hrf_idx])], dim=1)
+                    if _group_unpenalized
+                    else group_design_2d
+                )
                 _, design_clean_group = project_out_nuisance_per_run(
                     data[:1],  # minimal data, we only need the projected design
-                    group_design_2d,
+                    _group_proj_design,
                     nuisance_per_run,
                     run_starts,
                     device=device,
                 )
+                _group_q = None
+                if _group_unpenalized:
+                    # Same two-stage split as the shared-design path, but this
+                    # group's vectors carry this group's HRF, so the projection
+                    # has to happen per group rather than once on data_clean.
+                    _group_vec_clean = design_clean_group[:, n_trial_cols:]
+                    design_clean_group = design_clean_group[:, :n_trial_cols]
+                    _group_design_pre_vec = design_clean_group
+                    _group_q, _group_r = torch.linalg.qr(_group_vec_clean.to(device).float())
+                    design_clean_group = design_clean_group - _group_q @ (
+                        _group_q.T @ design_clean_group
+                    )
 
                 # Process this HRF group in chunks to avoid OOM on large groups
                 for gc0 in range(0, n_group, args.chunk_size):
@@ -917,6 +1070,12 @@ def main():
 
                     # Extract data using integer indexing
                     chunk_data_clean = data_clean[chunk_voxel_idx]  # (chunk, n_timepoints)
+                    _chunk_pre_vec = None
+                    if _group_q is not None:
+                        _chunk_pre_vec = chunk_data_clean.to(device)
+                        chunk_data_clean = (
+                            _chunk_pre_vec.T - _group_q @ (_group_q.T @ _chunk_pre_vec.T)
+                        ).T
 
                     # Fit ridge for all fractions
                     chunk_coefs = _fit_ridge_multiple_fracs(
@@ -928,6 +1087,7 @@ def main():
                     # GLMsingle pattern: score against OLS (frac=1, last index)
                     # test betas, then exclude frac=1.0 from selection.
                     all_chunk_betas = chunk_coefs.permute(1, 2, 0)  # (n_fracs, chunk, n_trials)
+                    all_chunk_betas = all_chunk_betas[:, :, :n_trial_cols]
                     n_fracs_pv = len(fracs)
                     xval = single_trial_cv_helper(
                         all_chunk_betas,
@@ -967,6 +1127,13 @@ def main():
                         chunk_final_betas *= scale_factors.unsqueeze(1)
 
                     final_betas[chunk_voxel_idx_dev] = chunk_final_betas
+                    if _group_q is not None:
+                        if stim_vec_betas is None:
+                            stim_vec_betas = torch.zeros(n_voxels, _group_q.shape[1], device="cpu")
+                        _resid = _chunk_pre_vec - chunk_final_betas @ _group_design_pre_vec.T
+                        stim_vec_betas[chunk_voxel_idx] = torch.linalg.solve_triangular(
+                            _group_r, _group_q.T @ _resid.T, upper=True
+                        ).T.cpu()
 
                     # Full-model R²: task variance explained after nuisance projection
                     predicted_full = chunk_final_betas @ design_clean_group.T  # (chunk, n_tp)
@@ -977,6 +1144,10 @@ def main():
 
                     # Cleanup
                     del chunk_coefs, chunk_final_betas, chunk_data_clean
+
+            if penalize_vecs:
+                stim_vec_betas = final_betas[:, n_trial_cols:].cpu()
+                final_betas = final_betas[:, :n_trial_cols]
 
         print()
         print(
@@ -1051,6 +1222,17 @@ def main():
 
         # Also save ridge-specific outputs
         voxel_mask_np = mask_flat if mask is not None else None
+        if stim_vec_betas is not None:
+            # The background is modelled, so report it: one sub-brick per stim
+            # vector column, beside the trial betas rather than inside them.
+            save_4d_nifti(
+                stim_vec_betas,
+                f"{args.prefix}_stim_vec_betas{_nii_ext}",
+                vol_shape,
+                affine,
+                voxel_mask_np,
+            )
+            print(f"  {args.prefix}_stim_vec_betas{_nii_ext}  ({', '.join(stim_vec_labels)})")
         save_volume_nifti(
             full_r2,
             f"{args.prefix}_single_trial_full_r2{_nii_ext}",

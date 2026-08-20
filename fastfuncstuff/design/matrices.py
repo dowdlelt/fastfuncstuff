@@ -276,6 +276,130 @@ def convolve_hrf_microtime(
     return design
 
 
+def convolve_tr_locked(
+    values: torch.Tensor,
+    hrf_microtime: torch.Tensor,
+    n_timepoints: int,
+    tr: float = 1.0,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
+    run_starts: list[int] | None = None,
+    normalize_peak: bool = True,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Convolve TR-locked continuous regressors with an HRF, at TR resolution.
+
+    For a regressor that is *already* sampled on the TR grid -- an oscillating
+    background, a motion-energy trace, a hand-built spike train -- there is no
+    sub-TR information to preserve, so upsampling to microtime can only invent
+    detail and then throw it away. Worse, the interpolation is destructive for
+    exactly the shapes this is meant to accept: linear interpolation smears a
+    one-TR delta across two TRs and ramps the edges of a block.
+
+    Decimating the microtime HRF instead is *exact*, not an approximation. If
+    the TR-locked input is placed on the microtime grid as an impulse train,
+    ``y_micro[m] = sum_n a[n] h_micro[m - n*B]``; sampling that at
+    ``m = microtime_onset + j*B`` gives ``sum_n a[n] h_micro[microtime_onset +
+    (j-n)*B]``, i.e. a plain TR-resolution convolution against
+    ``h_micro[microtime_onset::B]``. Decimating at ``microtime_onset`` is what
+    puts these columns on the same sampling phase as the event columns from
+    :func:`convolve_hrf_microtime`, so the two can sit in one design.
+
+    Note this is NOT :func:`convolve_hrf_microtime`: that one segments each
+    column into contiguous non-zero regions and rescales every region to peak
+    1.0, which for a curve that crosses zero would treat each half-cycle as its
+    own "event" and independently renormalise it -- destroying the waveform.
+
+    Parameters
+    ----------
+    values : torch.Tensor
+        ``(n_timepoints, n_columns)`` regressors at TR resolution. 1-D input is
+        treated as a single column.
+    hrf_microtime : torch.Tensor
+        ``(n_hrf_bins,)`` HRF at ``microtime_dt`` resolution, as the rest of the
+        design pipeline builds it.
+    n_timepoints : int
+        Total (concatenated) TR count; must match ``values``.
+    tr, microtime_dt : float
+        Used only to derive the decimation stride ``bins_per_tr``.
+    microtime_onset : int
+        Which microtime bin within a TR the data is sampled at. Must match what
+        the event design used, or the two blocks sit at different phases.
+    run_starts : list of int, optional
+        Run boundaries in TR units. Each run is convolved independently so an
+        HRF tail cannot bleed across a boundary.
+    normalize_peak : bool
+        Divide each output column by its ``max(|y|)`` over the whole
+        concatenated timecourse. Absolute so a signed regressor keeps its sign,
+        and one scale per column (not per run) so runs stay comparable.
+
+    Returns
+    -------
+    torch.Tensor
+        ``(n_timepoints, n_columns)`` convolved design block.
+    """
+    if device is None:
+        device = get_device()
+
+    values = to_tensor(values, device=device)
+    hrf_microtime = to_tensor(hrf_microtime, device=device)
+    if values.ndim == 1:
+        values = values.unsqueeze(1)
+    if values.shape[0] != n_timepoints:
+        raise ValueError(f"values has {values.shape[0]} rows, expected n_timepoints={n_timepoints}")
+
+    bins_per_tr = int(round(tr / microtime_dt))
+    if bins_per_tr < 1:
+        raise ValueError(f"tr={tr} / microtime_dt={microtime_dt} gives bins_per_tr={bins_per_tr}")
+    if not (0 <= microtime_onset < bins_per_tr):
+        raise ValueError(
+            f"microtime_onset={microtime_onset} out of range [0, {bins_per_tr}) for tr={tr}"
+        )
+    hrf_tr = hrf_microtime[microtime_onset::bins_per_tr]
+    if hrf_tr.numel() == 0:
+        raise ValueError(
+            f"HRF has {hrf_microtime.numel()} microtime bins, too short to decimate at "
+            f"stride {bins_per_tr} from offset {microtime_onset}"
+        )
+
+    n_columns = values.shape[1]
+    # Depthwise: one group per column, so a single launch convolves every
+    # column with the same kernel without summing across them.
+    kernel = hrf_tr.flip(0).view(1, 1, -1).expand(n_columns, 1, -1).contiguous()
+    hrf_len = hrf_tr.numel()
+
+    bounds = _run_bounds(run_starts, n_timepoints)
+    out = torch.zeros(n_timepoints, n_columns, device=device, dtype=values.dtype)
+    for start, end in bounds:
+        segment = values[start:end].T.unsqueeze(0).contiguous()  # (1, C, T_run)
+        # Causal: padding=hrf_len-1 on both sides then trimming the right tail
+        # leaves output[t] depending only on input[<=t], with zero history at
+        # the run start (no bleed from the previous run).
+        convolved = F.conv1d(segment, kernel, padding=hrf_len - 1, groups=n_columns)
+        out[start:end] = convolved[0, :, : end - start].T
+
+    if normalize_peak:
+        peaks = out.abs().amax(dim=0)
+        peaks = torch.where(peaks > 0, peaks, torch.ones_like(peaks))
+        out = out / peaks
+
+    return out.to(torch.get_default_dtype()).contiguous()
+
+
+def _run_bounds(run_starts: list[int] | None, n_timepoints: int) -> list[tuple[int, int]]:
+    """``[(start, end), ...]`` per run; one whole-length span when unset."""
+    if not run_starts:
+        return [(0, n_timepoints)]
+    if run_starts[0] != 0:
+        raise ValueError("run_starts must start at 0")
+    if any(run_starts[i] >= run_starts[i + 1] for i in range(len(run_starts) - 1)):
+        raise ValueError("run_starts must be strictly increasing")
+    if run_starts[-1] >= n_timepoints:
+        raise ValueError("run_starts contains out-of-range index")
+    ends = list(run_starts[1:]) + [n_timepoints]
+    return list(zip(run_starts, ends, strict=True))
+
+
 def make_fir_design(
     onsets: torch.Tensor,
     n_lags: int,

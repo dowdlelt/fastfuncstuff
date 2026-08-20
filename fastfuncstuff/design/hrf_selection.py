@@ -597,6 +597,42 @@ def _evaluate_hrfs_insample(
     return r2_out.cpu()
 
 
+def _append_stim_vec_columns(
+    stim_design: torch.Tensor,
+    stim_vec_blocks,
+    hrf: torch.Tensor,
+    *,
+    n_timepoints: int,
+    tr: float,
+    microtime_dt: float,
+    microtime_onset: int = 0,
+    run_starts: list[int] | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Append continuous stim-vector columns, convolved with *this* HRF.
+
+    Called inside every per-HRF loop so a background regressor is re-convolved
+    with each candidate HRF rather than being frozen at the canonical shape.
+    That matters: if the background were held fixed, its residual would push HRF
+    selection around, and the whole point of the flag is that it should not.
+    """
+    if not stim_vec_blocks:
+        return stim_design
+    from fastfuncstuff.design.stim_vec import build_stim_vec_design
+
+    vec_design, _labels, _groups = build_stim_vec_design(
+        stim_vec_blocks,
+        n_timepoints=n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        hrf_bases=hrf.reshape(1, -1),
+        microtime_onset=microtime_onset,
+        run_starts=run_starts,
+        device=device,
+    )
+    return torch.cat([stim_design, vec_design], dim=1)
+
+
 def fit_glm_hrf_library_with_xval(
     data: torch.Tensor,
     onsets: torch.Tensor,
@@ -623,6 +659,7 @@ def fit_glm_hrf_library_with_xval(
     debug_prefix: str | None = None,
     condition_labels: list[str] | None = None,
     final_fit_data: torch.Tensor | None = None,
+    stim_vec_blocks: list | None = None,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated or in-sample R².
@@ -975,6 +1012,18 @@ def fit_glm_hrf_library_with_xval(
             run_starts=run_starts,
             device=device,
         )
+        assert isinstance(stim_design, torch.Tensor)
+        stim_design = _append_stim_vec_columns(
+            stim_design,
+            stim_vec_blocks,
+            hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            run_starts=run_starts,
+            device=device,
+        )
         projected = _project_design_with_q_factors(
             stim_design, q_factors, run_starts, n_timepoints, n_runs, device
         )
@@ -1030,6 +1079,17 @@ def fit_glm_hrf_library_with_xval(
     # return_single_trials defaults False here, so convolve_hrf_microtime
     # always returns a Tensor, never the (tensor, trial_info) tuple form.
     assert isinstance(canonical_design, torch.Tensor)
+    canonical_design = _append_stim_vec_columns(
+        canonical_design,
+        stim_vec_blocks,
+        canonical_hrf,
+        n_timepoints=n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        run_starts=run_starts,
+        device=device,
+    )
     projected_canonical_design = _project_design_with_q_factors(
         canonical_design, q_factors, run_starts, n_timepoints, n_runs, device
     )
@@ -1367,6 +1427,7 @@ def fit_glm_hrf_library_with_xval(
         device=device,
         verbose=verbose,
         chunk_size=chunk_size,
+        stim_vec_blocks=stim_vec_blocks,
     )
 
     # Build metadata for ARMA reuse
@@ -1480,6 +1541,7 @@ def _fit_voxelwise_hrf(
     device: torch.device,
     verbose: bool,
     chunk_size: int | None,
+    stim_vec_blocks: list | None = None,
 ) -> GLMResults:
     """
     Fit GLM with voxel-wise HRFs by grouping voxels with same HRF.
@@ -1503,10 +1565,16 @@ def _fit_voxelwise_hrf(
     n_conditions = onsets.shape[1]
     _n_nuisance_cols = nuisance_design.shape[1]
 
+    # The stim design is the conditions plus any continuous stim vectors, which
+    # get a beta like any other task column.
+    from fastfuncstuff.design.stim_vec import stim_vec_total_columns
+
+    n_stim_cols = n_conditions + stim_vec_total_columns(stim_vec_blocks)
+
     # Initialize output tensors
-    all_betas = torch.zeros(n_voxels, n_conditions, device=device)
+    all_betas = torch.zeros(n_voxels, n_stim_cols, device=device)
     all_r2 = torch.zeros(n_voxels, device=device)
-    all_tstats = torch.zeros(n_voxels, n_conditions, device=device)
+    all_tstats = torch.zeros(n_voxels, n_stim_cols, device=device)
     all_sigma2 = torch.zeros(n_voxels, device=device)
     all_fstats = torch.zeros(n_voxels, device=device)
 
@@ -1545,13 +1613,25 @@ def _fit_voxelwise_hrf(
             run_starts=run_starts,
             device=device,
         )
+        assert isinstance(stim_design, torch.Tensor)
+        stim_design = _append_stim_vec_columns(
+            stim_design,
+            stim_vec_blocks,
+            hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            run_starts=run_starts,
+            device=device,
+        )
 
         # Chunk within HRF group if too large (to avoid OOM)
         # Use smaller chunks for GPU to prevent memory issues
         max_voxels_per_chunk = estimate_chunk_size(
             n_voxels=n_group_voxels,
             n_timepoints=n_timepoints,
-            n_regressors=n_conditions + nuisance_design.shape[1],
+            n_regressors=n_stim_cols + nuisance_design.shape[1],
             device=device,
             operation="glm",
             max_chunk_size=n_group_voxels,
@@ -1655,6 +1735,7 @@ def _fit_voxelwise_hrf_canonical(
     microtime_onset: int,
     device: torch.device,
     verbose: bool = False,
+    stim_vec_blocks: list | None = None,
 ) -> GLMResults:
     """
     Fit GLM with canonical HRF for all voxels (for comparison with per-voxel optimal HRFs).
@@ -1707,6 +1788,17 @@ def _fit_voxelwise_hrf_canonical(
         microtime_onset=microtime_onset,
         device=device,
     )
+    assert isinstance(stim_design, torch.Tensor)
+    stim_design = _append_stim_vec_columns(
+        stim_design,
+        stim_vec_blocks,
+        canonical_hrf,
+        n_timepoints=n_timepoints,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        device=device,
+    )
 
     # Follow 3dDenoisefast pattern: pass task design + nuisance separately.
     # max_poly_degree=-1 prevents duplicate polynomials (already in nuisance_design).
@@ -1752,6 +1844,7 @@ def _fit_voxelwise_hrf_single_trial(
     condition_labels: list[str],
     device: torch.device,
     verbose: bool = False,
+    stim_vec_blocks: list | None = None,
 ) -> GLMResults:
     """
     Fit single-trial GLM with per-voxel optimal HRFs, grouped by HRF for efficiency.
@@ -1868,6 +1961,18 @@ def _fit_voxelwise_hrf_single_trial(
             device=device,
         )
         # st_design is (n_timepoints, n_trials) for this HRF
+        # Stim vectors ride along after the trials; the beta extraction below
+        # already slices back to the first n_trials columns.
+        st_design = _append_stim_vec_columns(
+            st_design,
+            stim_vec_blocks,
+            hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            run_starts=run_starts,
+            device=device,
+        )
 
         # Build full design: [single_trial | nuisance] so drift is modeled
         full_design = torch.cat([st_design, nuisance_design.to(st_design.device)], dim=1)

@@ -71,6 +71,7 @@ def write_single_trials_output(
     design_matrix: np.ndarray,
     stim_indices: list[int],
     stim_labels: list[str] | None,
+    n_stim_keep: int | None = None,
 ) -> Path:
     """
     Write single-trial betas reordered by presentation time.
@@ -87,12 +88,23 @@ def write_single_trials_output(
         Column indices for stimulus regressors
     stim_labels : list of str, optional
         Labels for stimulus regressors
+    n_stim_keep : int, optional
+        Keep only the first N stimulus columns. The task block can end in
+        columns that are not trials -- a continuous ``-stim_event_vec``
+        background, say -- and those have no onset time to sort by and no row
+        in the companion trial table, so they must not reach a file whose whole
+        contract is "one sub-brick per trial, in presentation order".
 
     Returns
     -------
     output_path : Path
         Path to written file
     """
+    if n_stim_keep is not None:
+        stim_indices = list(stim_indices)[:n_stim_keep]
+        if stim_labels is not None:
+            stim_labels = list(stim_labels)[:n_stim_keep]
+
     # Extract onset times for each stimulus column
     onset_times = extract_onset_times_from_design(design_matrix, stim_indices)
 
@@ -100,6 +112,8 @@ def write_single_trials_output(
     sort_indices = sorted(range(len(onset_times)), key=lambda i: (onset_times[i], i))
 
     # Reorder betas by onset time
+    # Task columns lead the design, so beta column i is stim column i whether
+    # `results` holds the full beta set or only the stimulus ones.
     betas_np = _ensure_numpy(results.betas)
     betas_reordered = betas_np[:, sort_indices]  # (n_voxels, n_stimuli)
 

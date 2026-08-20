@@ -58,6 +58,13 @@ try:
     from fastfuncstuff.design.builder import (
         create_onset_matrix_microtime,
     )
+    from fastfuncstuff.design.stim_vec import (
+        add_stim_vec_arguments,
+        append_stim_vecs_to_task_design,
+        build_stim_vec_design,
+        collect_stim_vec_blocks,
+        resolve_stim_vec_hrf,
+    )
     from fastfuncstuff.glm.outputs import (
         slice_glm_results,
         write_glm_bucket_as_nifti,
@@ -1001,6 +1008,7 @@ Examples:
         help="Polynomial order (default: auto based on run length)",
     )
     add_ortvec_arguments(onset_group)
+    add_stim_vec_arguments(onset_group)
     onset_group.add_argument(
         "-canonical",
         type=str,
@@ -1797,6 +1805,15 @@ def main():
     from fastfuncstuff.io.afni import read_afni_design_matrix
 
     if args.matrix:
+        if args.stim_event_vec or args.stim_vec:
+            print(
+                "ERROR: -stim_event_vec / -stim_vec build design columns, so they only "
+                "apply to the onset-based path (-events / -onsets). With -matrix the "
+                "columns must already be in the .xmat.1D -- declare them as a "
+                "[[stim_vec]] block in your design.toml and let ffs_design_spec "
+                "compile them in."
+            )
+            sys.exit(1)
         # Load design matrix from file
         design_info = read_afni_design_matrix(args.matrix)
         # Echo a summary so -matrix / -spec runs confirm run structure, polort
@@ -2112,6 +2129,46 @@ def main():
             n_conditions = len(trial_labels)
             is_single_trial = True
 
+        # --- Continuous stimulus vectors (-stim_event_vec / -stim_vec) ---
+        # Appended AFTER the single-trial rewrite on purpose: a stim vector
+        # describes a continuous input (an oscillating background), so there is
+        # no trial to split it into. It stays one column per input column and
+        # soaks up its own variance while the trial betas are estimated around
+        # it. Living in the task block (not the nuisance block) is what gives it
+        # a beta and a t-stat, and what makes cross-validation fit it on the
+        # training runs instead of projecting it out.
+        stim_vec_blocks = collect_stim_vec_blocks(
+            args,
+            run_starts,
+            n_timepoints,
+            trim=trim,
+            verbose=True,
+        )
+        stim_vec_labels: list[str] = []
+        stim_vec_groups: list[tuple[str, int, int]] = []
+        if stim_vec_blocks:
+            print()
+            print(f"Adding {len(stim_vec_blocks)} continuous stimulus vector block(s)...")
+            task_design, designs_by_hrf, stim_vec_labels, stim_vec_groups = (
+                append_stim_vecs_to_task_design(
+                    stim_vec_blocks,
+                    task_design=None if per_voxel_hrf_mode else task_design,
+                    designs_by_hrf=designs_by_hrf if per_voxel_hrf_mode else None,
+                    hrf_library=hrf_library_obj,
+                    hrf_model_name=hrf_model_name,
+                    is_fir_model=is_fir_model,
+                    n_basis=n_basis,
+                    n_timepoints=n_timepoints,
+                    tr=args.tr,
+                    microtime_dt=args.microtime_dt,
+                    run_starts=run_starts,
+                    device=device,
+                )
+            )
+            if per_voxel_hrf_mode:
+                assert designs_by_hrf is not None
+                task_design = designs_by_hrf[next(iter(designs_by_hrf.keys()))]
+
         # Build nuisance design (polynomials + ortvec)
         print()
         print("Building nuisance regressors...")
@@ -2166,6 +2223,10 @@ def main():
             for cond_label in condition_labels_full:
                 column_labels.append(f"{cond_label}#0")
 
+        # Stim vector columns sit at the end of the task block, so their labels
+        # go in before the nuisance ones.
+        column_labels.extend(stim_vec_labels)
+
         # Add nuisance labels
         _nuisance_label_offset = len(column_labels)
         for run_idx in range(n_runs):
@@ -2192,6 +2253,14 @@ def main():
             stim_bots = list(range(n_conditions))
             stim_tops = list(range(n_conditions))
 
+        # One stim class per vector block, so a multi-column vector gets a
+        # single grouped F-test rather than N unrelated one-column classes.
+        stim_labels_all = list(condition_labels)
+        for vec_label, bot, top in stim_vec_groups:
+            stim_bots.append(bot)
+            stim_tops.append(top)
+            stim_labels_all.append(vec_label)
+
         full_design_np = full_design.cpu().numpy()
         design_info = {
             "matrix": full_design_np,
@@ -2204,7 +2273,10 @@ def main():
             "nuisance_indices": nuisance_indices,
             "stim_bots": stim_bots,
             "stim_tops": stim_tops,
-            "stim_labels": condition_labels,  # Use original (unexpanded) labels
+            "stim_labels": stim_labels_all,  # Original (unexpanded) labels + stim vectors
+            # Task columns that are NOT trials/conditions, so the single-trial
+            # writers can drop them (they have no onset and no trial-table row).
+            "stim_vec_indices": [i for _, bot, top in stim_vec_groups for i in range(bot, top + 1)],
             "run_starts": run_starts,
             "n_runs": n_runs,
         }
@@ -2247,6 +2319,34 @@ def main():
         print(f"  Single-trial design: {st_design.shape}")
         n_trials = st_design.shape[1]
 
+        # Stim vectors ride along in the task block so the background is
+        # modelled rather than left in the residual, but they are not trials:
+        # the beta-space CV and the saved outputs only ever see the first
+        # n_trials columns.
+        st_vec_blocks = collect_stim_vec_blocks(
+            args, run_starts, n_timepoints, trim=trim, verbose=True
+        )
+        st_vec_labels: list[str] = []
+        if st_vec_blocks:
+            st_hrf_bases, _st_hrf_note = resolve_stim_vec_hrf(
+                hrf_model_name,
+                is_fir_model=is_fir_model,
+                n_basis=n_basis,
+                microtime_dt=args.microtime_dt,
+                device=device,
+            )
+            st_vec_design, st_vec_labels, _ = build_stim_vec_design(
+                st_vec_blocks,
+                n_timepoints=n_timepoints,
+                tr=args.tr,
+                microtime_dt=args.microtime_dt,
+                hrf_bases=st_hrf_bases,
+                run_starts=run_starts,
+                device=device,
+            )
+            st_design = torch.cat([st_design, st_vec_design], dim=1)
+            print(f"  + {len(st_vec_labels)} stim vector column(s)")
+
         # 2. Build wide design: [single_trial | nuisance]
         # Note: design_info was already created with condition-level design
         # We need to rebuild it with single-trial design
@@ -2267,8 +2367,9 @@ def main():
         )
 
         full_design_st = torch.cat([st_design, nuisance_design_st], dim=1)
-        task_indices_st = list(range(n_trials))
-        nuisance_indices_st = list(range(n_trials, full_design_st.shape[1]))
+        n_task_st = st_design.shape[1]
+        task_indices_st = list(range(n_task_st))
+        nuisance_indices_st = list(range(n_task_st, full_design_st.shape[1]))
 
         print(f"  Full design (wide): {full_design_st.shape}")
         print(f"    Task columns (single-trial): {n_trials}")
@@ -2295,7 +2396,7 @@ def main():
         # only accepts a design_info dict, not raw matrix/indices kwargs).
         design_info_st = {
             "matrix": full_design_st.cpu().numpy(),
-            "column_labels": trial_labels + nuisance_labels_st,
+            "column_labels": trial_labels + st_vec_labels + nuisance_labels_st,
             "stim_bots": task_indices_st,
             "stim_tops": task_indices_st,
             "run_starts": run_starts,
@@ -2324,7 +2425,9 @@ def main():
 
         # 4. Extract single-trial betas
         assert results_st.betas is not None
-        st_betas = results_st.betas  # (n_voxels, n_trials)
+        # Drop the stim-vector columns: everything downstream is indexed by
+        # trial (trial_cond_ids / trial_run_ids / trial_labels).
+        st_betas = results_st.betas[:, :n_trials]  # (n_voxels, n_trials)
         print(f"  Single-trial betas: {st_betas.shape}")
 
         # 5. Beta-space CV
@@ -2579,6 +2682,8 @@ def main():
                             callback_design_info["matrix"],
                             stim_indices,
                             stim_labels,
+                            n_stim_keep=len(stim_indices)
+                            - len(callback_design_info.get("stim_vec_indices") or []),
                         )
                     else:
                         print(
@@ -3442,6 +3547,7 @@ def main():
                 design_info["matrix"],
                 stim_idx,
                 stim_lbls,
+                n_stim_keep=len(stim_idx) - len(design_info.get("stim_vec_indices") or []),
             )
         else:
             print("  ⚠️  Skipping REML single-trial output: no stimulus columns in design")
