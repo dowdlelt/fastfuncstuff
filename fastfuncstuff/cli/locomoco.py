@@ -123,17 +123,17 @@ numbers are mean |err| recovering known shifts on a 0.8 mm real brain):
 which flag feeds which backend:
 
   flag           flow   phase  xcorr   meaning
-  -ref            ·      ·      ·       reference frame (all)
-  -do_blur        ·      ·      ·       pre-blur noisy frames (all)
-  -hpf_spatial    ·      ·      ·       estimate on spatial high-pass (all, experimental)
-  -full_2d        ·      -      -       2-D vs PE-only flow
-  -levels         ·      -      -       optical-flow pyramid levels
-  -iters          ·      ·      -       flow: LK passes / phase: warp-refine passes
-  -window         ·      -      ·       flow: LK window / xcorr: searchlight radius
-  -max_shift      -      ·      ·       search bound (voxels)
-  -xcorr_step     -      -      ·       xcorr trial spacing (sub-voxel knob)
-  -patch          -      ·      -       phase FFT patch side
-  -stride         -      ·      -       phase patch spacing
+  -ref            ✓      ✓      ✓       reference frame (all)
+  -do_blur        ✓      ✓      ✓       pre-blur noisy frames (all)
+  -hpf_spatial    ✓      ✓      ✓       estimate on spatial high-pass (all, experimental)
+  -full_2d        ✓      -      -       2-D vs PE-only flow
+  -levels         ✓      -      -       optical-flow pyramid levels
+  -iters          ✓      ✓      -       flow: LK passes / phase: warp-refine passes
+  -window         ✓      -      ✓       flow: LK window / xcorr: searchlight radius
+  -max_shift      -      ✓      ✓       search bound (voxels)
+  -xcorr_step     -      -      ✓       xcorr trial spacing (sub-voxel knob)
+  -patch          -      ✓      -       phase FFT patch side
+  -stride         -      ✓      -       phase patch spacing
 
 tuning (turning the knobs):
 
