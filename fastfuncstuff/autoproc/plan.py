@@ -62,6 +62,11 @@ class Options:
     # Named nuisance sources for the GLM, keys of config.GLM_ORTVEC (e.g.
     # ["motion", "motion_deriv", "locomoco"]). Empty = no nuisance regressors.
     glm_ortvec: list[str] = field(default_factory=list)
+    # Continuous stimulus vectors for the GLM: (LABEL[:mod], path-or-glob) pairs,
+    # each becoming one [[stim_vec]] block. `{task}` in the path is substituted
+    # per task. Unlike glm_ortvec these are user-supplied files -- nothing in the
+    # pipeline produces them -- so they are named directly rather than by key.
+    glm_stim_vec: list[tuple[str, str]] = field(default_factory=list)
     # Extra ffs_reml flags appended to the GLM command, as one string.
     glm_opts: str = ""
     # TRs dropped from each end of every run at GLM time (ffs_reml

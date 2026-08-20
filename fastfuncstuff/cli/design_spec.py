@@ -582,6 +582,91 @@ def _trim_1d_for_compile(
     return out
 
 
+def _build_stim_vec_for_compile(
+    stim_vec_specs,
+    n_timepoints_per_run: list[int],
+    tr: float,
+    hrf_models: list[str],
+    trim=None,
+):
+    """Turn ``[[stim_vec]]`` blocks into design columns + labels.
+
+    Returns ``(columns, labels)`` -- ``columns`` is
+    ``(total_timepoints, k)`` or None when there is nothing to add.
+
+    The default HRF follows the design: if every event uses the same bare model
+    the vectors ride that one, otherwise SPMG1. A per-block ``hrf =`` overrides.
+    Compiling to an xmat is what makes ``-stim_event_vec`` usable with
+    ``ffs_reml -matrix``, which otherwise refuses the flag -- the columns have to
+    reach the matrix somehow, and the spec is that somehow.
+    """
+    import glob as glob_module
+
+    from fastfuncstuff.cli_utils import _infer_run_indices_from_filenames
+    from fastfuncstuff.design.stim_vec import (
+        build_stim_vec_design,
+        load_stim_vec_block,
+        resolve_stim_vec_hrf,
+    )
+
+    if not stim_vec_specs:
+        return None, []
+
+    n_runs = len(n_timepoints_per_run)
+    total_tp = sum(n_timepoints_per_run)
+    run_starts = [0]
+    for n in n_timepoints_per_run[:-1]:
+        run_starts.append(run_starts[-1] + n)
+
+    # The design's own model, when the events agree on one.
+    bases = {m.split("(", 1)[0].upper() for m in hrf_models}
+    default_model = bases.pop() if len(bases) == 1 else "SPMG1"
+
+    columns: list[np.ndarray] = []
+    labels: list[str] = []
+    for sv in stim_vec_specs:
+        if sv.scope == "glob":
+            matched = sorted(Path(x) for x in glob_module.glob(sv.pattern or ""))
+            if not matched:
+                raise ValueError(f"stim_vec '{sv.label}': pattern {sv.pattern!r} matched no files")
+            order = _infer_run_indices_from_filenames(
+                [m.name for m in matched], n_runs=n_runs, allow_sequential_fallback=True
+            )
+            paths = [p for _, p in sorted(zip(order, matched, strict=True))]
+        else:
+            paths = [Path(sv.file or "")]
+
+        block = load_stim_vec_block(
+            f"{sv.label}:{sv.mod}" if sv.mod != "none" else sv.label,
+            paths,
+            run_starts,
+            total_tp,
+            preconvolved=not sv.convolve,
+            trim=trim,
+        )
+        model = sv.hrf or default_model
+        hrf_bases, _note = resolve_stim_vec_hrf(
+            model,
+            is_fir_model=model.upper().startswith(("TENT", "FIR")),
+            n_basis=None,
+            microtime_dt=0.1,
+            device=None,
+        )
+        design, block_labels, _groups = build_stim_vec_design(
+            [block],
+            n_timepoints=total_tp,
+            tr=tr,
+            microtime_dt=0.1,
+            hrf_bases=hrf_bases,
+            run_starts=run_starts,
+            device=None,
+        )
+        columns.append(design.cpu().numpy())
+        labels.extend(block_labels)
+
+    return np.concatenate(columns, axis=1), labels
+
+
 def _resolve_nuisance_for_compile(
     nuisance: list[NuisanceSpec],
     n_runs: int,
@@ -829,6 +914,14 @@ def _do_compile(args: argparse.Namespace) -> int:
     # so say so before the design is built.
     _warn_sparse_conditions(timing_files, stim_labels, len(spec.meta.runs))
 
+    stim_vec_cols, stim_vec_labels = _build_stim_vec_for_compile(
+        spec.stim_vec,
+        n_timepoints_per_run=spec.meta.n_timepoints_per_run,
+        tr=spec.meta.tr,
+        hrf_models=hrf_models,
+        trim=trim,
+    )
+
     design, regressor_labels, run_starts, metadata = build_design_matrix(
         timing_files=[str(p) for p in timing_files],
         stim_labels=stim_labels,
@@ -839,6 +932,8 @@ def _do_compile(args: argparse.Namespace) -> int:
         im_mode=im_modes,
         padortvec_files=[(str(p), l, r) for p, l, r in padortvec_files] or None,
         ortvec_files=[(str(p), l) for p, l in ortvec_files] or None,
+        stim_vec_columns=stim_vec_cols,
+        stim_vec_labels=stim_vec_labels or None,
     )
 
     # Reorder columns to AFNI's canonical polort → stim → nuisance layout.
@@ -854,8 +949,11 @@ def _do_compile(args: argparse.Namespace) -> int:
     # Resolve contrasts against stim_labels (the expanded labels we actually
     # built, including any ``_durN`` splits).
     glt_contrasts: list[tuple[str | list[str], str]] = []
+    # Stim vectors go in as `extra_labels`: addressable by name, but kept out of
+    # glob and ALLOTHERS expansion, because a `*` in a task contrast almost never
+    # means "and the background".
     for c in spec.contrasts:
-        rows = resolve_contrast(c, stim_labels)
+        rows = resolve_contrast(c, stim_labels, extra_labels=[sv.label for sv in spec.stim_vec])
         if len(rows) == 1:
             glt_contrasts.append((_resolved_row_to_sym(rows[0]), c.label))
         else:
@@ -890,6 +988,8 @@ def _do_compile(args: argparse.Namespace) -> int:
         print(f"Compiled {args.spec} -> {args.xmat}", file=sys.stderr)
         print(f"  {design.shape[0]} TRs × {design.shape[1]} regressors", file=sys.stderr)
         print(f"  Stim labels: {stim_labels}", file=sys.stderr)
+        if stim_vec_labels:
+            print(f"  Stim vectors: {stim_vec_labels}", file=sys.stderr)
         if glt_contrasts:
             print(f"  Contrasts: {[lbl for _, lbl in glt_contrasts]}", file=sys.stderr)
 

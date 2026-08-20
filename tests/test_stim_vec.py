@@ -10,6 +10,8 @@ path in convolve_hrf_microtime, and it must not be resampled.
 from __future__ import annotations
 
 import argparse
+import tempfile
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -451,3 +453,184 @@ def test_two_stage_projection_reproduces_the_joint_ols_fit():
 
     vec_betas = recover_stim_vec_betas(data_1, trials_1, trial_betas, q, r)
     assert torch.allclose(vec_betas.T, joint_betas[n_trials : n_trials + 2], atol=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# design.toml [[stim_vec]] section
+# ---------------------------------------------------------------------------
+
+
+def _write_min_spec(tmp_path, stim_vec_toml: str) -> str:
+    spec = tmp_path / "design.toml"
+    spec.write_text(
+        "[meta]\n"
+        "tr = 1.0\n"
+        "n_timepoints_per_run = [20, 20]\n"
+        'runs = [{ bold = "r1.nii.gz", events = "r1.tsv" }, '
+        '{ bold = "r2.nii.gz", events = "r2.tsv" }]\n'
+        "\n[[events]]\n"
+        'trial_type = "condA"\n' + stim_vec_toml
+    )
+    return str(spec)
+
+
+def test_spec_round_trip_of_a_stim_vec_block(tmp_path):
+    from fastfuncstuff.design.spec import load_spec, write_spec
+
+    path = _write_min_spec(
+        tmp_path,
+        '\n[[stim_vec]]\nlabel = "background"\nfile = "bg.1D"\nscope = "full"\nmod = "abs"\n',
+    )
+    spec = load_spec(path)
+    assert len(spec.stim_vec) == 1
+    sv = spec.stim_vec[0]
+    assert (sv.label, sv.file, sv.scope, sv.mod, sv.convolve) == (
+        "background",
+        "bg.1D",
+        "full",
+        "abs",
+        True,
+    )
+
+    # write → load must preserve it, or an edited spec silently loses the block.
+    out = tmp_path / "again.toml"
+    write_spec(spec, out)
+    again = load_spec(out)
+    assert [(s.label, s.file, s.scope, s.mod, s.convolve) for s in again.stim_vec] == [
+        ("background", "bg.1D", "full", "abs", True)
+    ]
+
+
+def test_spec_round_trip_preserves_preconvolved_and_glob(tmp_path):
+    from fastfuncstuff.design.spec import load_spec, write_spec
+
+    path = _write_min_spec(
+        tmp_path,
+        "\n[[stim_vec]]\n"
+        'label = "pupil"\nfile = "pupil.1D"\nconvolve = false\n'
+        "\n[[stim_vec]]\n"
+        'label = "motenergy"\npattern = "me_run-*.1D"\nscope = "glob"\n',
+    )
+    spec = load_spec(path)
+    out = tmp_path / "again.toml"
+    write_spec(spec, out)
+    again = load_spec(out)
+    assert [(s.label, s.scope, s.convolve, s.pattern) for s in again.stim_vec] == [
+        ("pupil", "full", False, None),
+        ("motenergy", "glob", True, "me_run-*.1D"),
+    ]
+
+
+def test_spec_rejects_bad_stim_vec_blocks(tmp_path):
+    from fastfuncstuff.design.spec import load_spec
+
+    with pytest.raises(ValueError, match="missing 'label'"):
+        load_spec(_write_min_spec(tmp_path, '\n[[stim_vec]]\nfile = "bg.1D"\n'))
+    with pytest.raises(ValueError, match="mod must be one of"):
+        load_spec(
+            _write_min_spec(
+                tmp_path, '\n[[stim_vec]]\nlabel = "bg"\nfile = "bg.1D"\nmod = "nope"\n'
+            )
+        )
+    # 'run:N' is a nuisance concept; a stim vector is one shared regressor.
+    with pytest.raises(ValueError, match="scope must be 'full' or 'glob'"):
+        load_spec(
+            _write_min_spec(
+                tmp_path, '\n[[stim_vec]]\nlabel = "bg"\nfile = "bg.1D"\nscope = "run:1"\n'
+            )
+        )
+    with pytest.raises(ValueError, match="used more than once"):
+        load_spec(
+            _write_min_spec(
+                tmp_path,
+                '\n[[stim_vec]]\nlabel = "bg"\nfile = "a.1D"\n'
+                '\n[[stim_vec]]\nlabel = "bg"\nfile = "b.1D"\n',
+            )
+        )
+
+
+def test_stim_vec_columns_land_in_the_stim_block_not_nuisance():
+    """The whole reason for a dedicated builder argument rather than
+    ``extra_regressors``: extra_indices are nuisance, and these are stimuli."""
+    from fastfuncstuff.design.builder import build_design_matrix
+
+    with tempfile.TemporaryDirectory() as td:
+        timing = Path(td) / "condA.1D"
+        timing.write_text("2 8\n3 9\n")
+        cols = np.stack([np.linspace(0, 1, 40), np.linspace(1, 0, 40)], axis=1)
+        design, labels, _run_starts, meta = build_design_matrix(
+            timing_files=[str(timing)],
+            stim_labels=["condA"],
+            n_timepoints_per_run=[20, 20],
+            tr=1.0,
+            polort=1,
+            stim_vec_columns=cols,
+            stim_vec_labels=["background#0", "background#1"],
+        )
+        stim = meta["stim_indices"]
+        # The builder already suffixes its own stim columns, so the vectors'
+        # `LABEL#k` naming is the same convention, not a second one.
+        assert [labels[i] for i in stim] == ["condA#0", "background#0", "background#1"]
+        assert not set(stim) & set(meta["nuisance_indices"])
+        assert meta["extra_indices"] == []
+        # Contiguous, so the xmat's StimBots/StimTops stay a clean range.
+        assert stim == list(range(min(stim), max(stim) + 1))
+        assert np.allclose(design[:, stim[1:]], cols)
+
+
+def test_stim_vec_column_count_is_validated():
+    from fastfuncstuff.design.builder import build_design_matrix
+
+    with tempfile.TemporaryDirectory() as td:
+        timing = Path(td) / "condA.1D"
+        timing.write_text("2\n3\n")
+        with pytest.raises(ValueError, match="stim_vec_columns has"):
+            build_design_matrix(
+                timing_files=[str(timing)],
+                stim_labels=["condA"],
+                n_timepoints_per_run=[20, 20],
+                tr=1.0,
+                polort=1,
+                stim_vec_columns=np.zeros((37, 1)),
+            )
+
+
+def test_contrasts_can_name_a_stim_vec_but_wildcards_skip_it():
+    """A background must be contrastable by name, but `*` / ALLOTHERS in a task
+    contrast almost never means "and the background"."""
+    from fastfuncstuff.design.spec import ContrastSpec, resolve_contrast
+
+    stim = ["condA", "condB"]
+    extra = ["background"]
+
+    row = resolve_contrast(
+        ContrastSpec(label="c", sym="+1*condA -1*background"), stim, extra_labels=extra
+    )[0]
+    assert set(row) == {"condA", "background"}
+
+    allothers = resolve_contrast(
+        ContrastSpec(label="c", sym="+1*condA -1*ALLOTHERS"), stim, extra_labels=extra
+    )[0]
+    assert set(allothers) == {"condA", "condB"}
+
+    glob_row = resolve_contrast(ContrastSpec(label="c", sym="+1*cond*"), stim, extra_labels=extra)[
+        0
+    ]
+    assert set(glob_row) == {"condA", "condB"}
+
+
+def test_autoproc_stim_vec_specs_substitute_task_and_detect_globs():
+    from fastfuncstuff.autoproc.glm import stim_vec_specs
+    from fastfuncstuff.autoproc.plan import Options
+
+    opt = Options(
+        glm_stim_vec=[
+            ("background:abs", "stim/bg_task-{task}.1D"),
+            ("motenergy", "stim/me_task-{task}_run-*.1D"),
+        ]
+    )
+    got = stim_vec_specs("forest", opt)
+    assert [(s.label, s.scope, s.file, s.pattern, s.mod) for s in got] == [
+        ("background", "full", "stim/bg_task-forest.1D", None, "abs"),
+        ("motenergy", "glob", None, "stim/me_task-forest_run-*.1D", "none"),
+    ]

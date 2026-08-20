@@ -333,6 +333,23 @@ def build_parser() -> argparse.ArgumentParser:
         "is not in the pipeline is dropped (with a warning if you named it).",
     )
     g.add_argument(
+        "-glm_stim_vec",
+        "-glm-stim-vec",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("LABEL", "PATH"),
+        help="continuous TR-locked stimulus vector for the GLM: a regressor given "
+        "as one number per TR rather than as onsets (an oscillating background, a "
+        "motion-energy trace). Becomes one [[stim_vec]] block in the design TOML — "
+        "a STIMULUS, so it gets a beta and a t-stat, not a nuisance regressor. "
+        "PATH may be a single full-length file or a glob matching one file per run, "
+        "and may contain {task}. LABEL takes the same modifier suffix as the design "
+        "TOML (LABEL:abs rectifies, LABEL:deriv differences). Repeatable. For a "
+        "pre-convolved vector, add `convolve = false` to the block afterwards — the "
+        "TOML is the model.",
+    )
+    g.add_argument(
         "-glm_opts",
         "-glm-opts",
         default=None,
@@ -941,6 +958,7 @@ def main(argv: list[str] | None = None) -> int:
         distortion=(False if args.no_distortion else rget("distortion", True)),
         run_glm=(False if args.no_glm else rget("run_glm", True)),
         glm_ortvec=_resolve_glm_ortvec(args, recipe),
+        glm_stim_vec=[(lbl, path) for lbl, path in (args.glm_stim_vec or [])],
         glm_opts=args.glm_opts or "",
         glm_drop_first=args.glm_drop_first,
         glm_drop_last=args.glm_drop_last,

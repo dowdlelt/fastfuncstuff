@@ -169,6 +169,35 @@ def nuisance_specs(task: str, opt) -> tuple[list, list[str]]:
     return out, skipped
 
 
+def stim_vec_specs(task: str, opt) -> list:
+    """``[StimVecSpec]`` for ``opt.glm_stim_vec``, with ``{task}`` substituted.
+
+    A path containing a glob metacharacter becomes ``scope="glob"`` (one file per
+    run, concatenated into one shared column); anything else is a single
+    full-length file. No ``requires`` check as there is for nuisance sources:
+    these files come from the user's stimulus code, not from a pipeline stage,
+    so there is no stage whose absence would invalidate them.
+    """
+    from fastfuncstuff.design.spec import StimVecSpec
+    from fastfuncstuff.design.stim_vec import split_label_mod
+
+    out = []
+    for raw_label, raw_path in opt.glm_stim_vec:
+        label, mod = split_label_mod(raw_label)
+        path = raw_path.format(task=task)
+        is_glob = any(ch in path for ch in "*?[")
+        out.append(
+            StimVecSpec(
+                label=label,
+                file=None if is_glob else path,
+                pattern=path if is_glob else None,
+                scope="glob" if is_glob else "full",
+                mod=mod,
+            )
+        )
+    return out
+
+
 def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
     """Timepoints the preprocessed run will have: the raw header's count minus
     any trailing noise volumes the pipeline trims up front."""
@@ -238,6 +267,7 @@ def write_design_specs(
         # per-partition time, and the design must be sampled at the volume TR.
         trs = {opt.tr} if opt.tr is not None else {pr.bold.tr for pr in prs if pr.bold.tr}
         nuisance, _skipped = nuisance_specs(task, opt)
+        stim_vecs = stim_vec_specs(task, opt)
         event_cols, _warn = resolve_event_cols(task, scan_paths, opt)
         try:
             spec, notes = build_stub_spec(
@@ -247,6 +277,7 @@ def write_design_specs(
                 n_timepoints_per_run=[_n_timepoints(pr, opt.noise_vols) for pr in prs],
                 event_cols=event_cols,
                 nuisance=nuisance,
+                stim_vec=stim_vecs,
             )
         except (ValueError, OSError) as exc:
             rows.append((task, str(dest), f"skipped: {exc}"))
@@ -268,6 +299,8 @@ def write_design_specs(
                 "  - [[events]] one block per trial type found in the events TSVs; set hrf/mode.\n"
                 "  - [[nuisance]] the regressors -glm_ortvec selected; patterns resolve at GLM\n"
                 "    time, so the files they name do not exist yet.\n"
+                "  - [[stim_vec]] continuous TR-locked stimulus vectors (-glm_stim_vec);\n"
+                "    modelled as stimuli, not confounds. None unless you asked for them.\n"
                 "  - [[contrasts]] none are guessed — add the ones your question needs.\n"
                 "The runs listed below are this script's stage10 outputs; n_timepoints_per_run\n"
                 "was read from the raw BIDS headers (preprocessing preserves run length).\n"

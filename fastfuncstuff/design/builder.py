@@ -847,6 +847,8 @@ def build_design_matrix(
     ortvec_files: list[tuple[str | Path, str]] | None = None,
     extra_regressors: list[np.ndarray] | None = None,
     extra_regressor_labels: list[str] | None = None,
+    stim_vec_columns: np.ndarray | None = None,
+    stim_vec_labels: list[str] | None = None,
 ) -> tuple[np.ndarray, list[str], list[int], dict]:
     """
     Build complete GLM design matrix from onset files and nuisance regressors
@@ -894,6 +896,14 @@ def build_design_matrix(
         Each array: (total_timepoints,) or (total_timepoints, n_cols)
     extra_regressor_labels : list of str, optional
         Labels for extra regressors
+    stim_vec_columns : np.ndarray, optional
+        ``(total_timepoints, k)`` continuous stimulus-vector columns, already
+        convolved (see :mod:`fastfuncstuff.design.stim_vec`). Appended after the
+        onset-derived stimulus columns and, unlike ``extra_regressors``, counted
+        as **stimulus**: they land in ``stim_indices``, so they get a beta, a
+        t-stat and an xmat stim group rather than being treated as nuisance.
+    stim_vec_labels : list of str, optional
+        One label per stim-vector column (``LABEL#k`` form).
 
     Returns
     -------
@@ -1083,8 +1093,33 @@ def build_design_matrix(
             else:
                 n_extra_cols += reg.shape[1]
 
+    # Continuous stimulus vectors: extra STIM columns, not extra nuisance.
+    n_stim_vec_cols = 0
+    if stim_vec_columns is not None:
+        stim_vec_columns = np.asarray(stim_vec_columns)
+        if stim_vec_columns.ndim == 1:
+            stim_vec_columns = stim_vec_columns.reshape(-1, 1)
+        if stim_vec_columns.shape[0] != total_timepoints:
+            raise ValueError(
+                f"stim_vec_columns has {stim_vec_columns.shape[0]} rows, "
+                f"but total timepoints is {total_timepoints}"
+            )
+        n_stim_vec_cols = stim_vec_columns.shape[1]
+        if stim_vec_labels is not None and len(stim_vec_labels) != n_stim_vec_cols:
+            raise ValueError(
+                f"stim_vec_labels has {len(stim_vec_labels)} entries for "
+                f"{n_stim_vec_cols} stim-vector columns"
+            )
+
     # Total columns (use n_stim_cols which accounts for IM mode)
-    n_total_cols = n_polort_cols + n_padortvec_cols + n_ortvec_cols + n_stim_cols + n_extra_cols
+    n_total_cols = (
+        n_polort_cols
+        + n_padortvec_cols
+        + n_ortvec_cols
+        + n_stim_cols
+        + n_stim_vec_cols
+        + n_extra_cols
+    )
     design_matrix = np.zeros((total_timepoints, n_total_cols))
 
     # Track column indices
@@ -1254,6 +1289,16 @@ def build_design_matrix(
                 design_matrix[:, col_idx] = block_cols[:, next(block_iter)]
             stim_indices.append(col_idx)
             regressor_labels.append(label)
+            col_idx += 1
+
+    # 3b. Continuous stimulus vectors, immediately after the onset-derived stim
+    # columns so the whole stim block stays contiguous.
+    if n_stim_vec_cols:
+        assert stim_vec_columns is not None
+        for c in range(n_stim_vec_cols):
+            design_matrix[:, col_idx] = stim_vec_columns[:, c]
+            stim_indices.append(col_idx)
+            regressor_labels.append(stim_vec_labels[c] if stim_vec_labels else f"stimvec_{c}#0")
             col_idx += 1
 
     # 4. Add extra regressors (if any)

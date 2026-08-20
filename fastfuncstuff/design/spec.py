@@ -92,6 +92,41 @@ class NuisanceSpec:
 
 
 @dataclass
+class StimVecSpec:
+    """A continuous TR-locked stimulus vector — an oscillating background, a
+    motion-energy trace — that is modelled as a stimulus but does not live in an
+    events TSV.
+
+    It cannot: an events file describes discrete trials, and this is a number
+    per TR. So it gets its own section rather than being bent into the events
+    schema. BIDS has no home for it either; that is a limitation of BIDS, not a
+    reason to model the thing wrongly.
+
+    Mirrors ``ffs_reml``'s ``-stim_event_vec`` / ``-stim_vec``:
+
+    - ``scope = "full"`` — ``file`` has one row per *concatenated* timepoint.
+    - ``scope = "glob"`` — ``pattern`` matches one file per run (run index
+      inferred from the filename, BIDS ``_run-NN_`` preferred); the runs are
+      concatenated into one shared column, NOT zero-padded per run. A stim
+      vector is one regressor with one beta across the experiment.
+
+    ``convolve = false`` is the ``-stim_vec`` case: the file already holds the
+    convolved regressor and is used verbatim.
+    """
+
+    label: str = ""
+    file: str | None = None  # required unless scope == "glob"
+    scope: str = "full"  # "full" | "glob"
+    pattern: str | None = None  # required when scope == "glob"
+    # Applied per run, BEFORE convolution. See design.stim_vec.STIM_VEC_MODS.
+    mod: str = "none"
+    convolve: bool = True
+    # Bare model name, or "" to follow the design's own HRF. Same rationale as
+    # EventSpec.hrf: the explicit-argument form is a user override.
+    hrf: str = ""
+
+
+@dataclass
 class ContrastSpec:
     label: str
     sym: str | list[str]  # str = t-test, list = F-test rows
@@ -103,6 +138,7 @@ class Spec:
     meta: MetaSpec
     events: list[EventSpec]
     nuisance: list[NuisanceSpec] = field(default_factory=list)
+    stim_vec: list[StimVecSpec] = field(default_factory=list)
     contrasts: list[ContrastSpec] = field(default_factory=list)
 
 
@@ -186,6 +222,7 @@ def build_stub_spec(
     drop_trial_types: list[str] | None = None,
     default_hrf: str = "SPMG1",
     nuisance: list[NuisanceSpec] | None = None,
+    stim_vec: list[StimVecSpec] | None = None,
 ) -> tuple[Spec, dict[str, str]]:
     """Build a stub Spec (+ per-trial-type informational notes) from BOLD
     headers and events TSVs.
@@ -250,7 +287,15 @@ def build_stub_spec(
         )
         for tt in trial_types
     }
-    return Spec(meta=meta, events=events, nuisance=list(nuisance or [])), notes
+    return (
+        Spec(
+            meta=meta,
+            events=events,
+            nuisance=list(nuisance or []),
+            stim_vec=list(stim_vec or []),
+        ),
+        notes,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +310,7 @@ def load_spec(path: str | Path) -> Spec:
     # stay loadable from anywhere. NUISANCE_TRANSFORMS lives beside the code that
     # applies it, so the TOML validator and the GLM can never disagree.
     from fastfuncstuff.cli_utils import NUISANCE_TRANSFORMS
+    from fastfuncstuff.design.stim_vec import STIM_VEC_MODS
 
     with open(path, "rb") as fh:
         raw = tomllib.load(fh)
@@ -322,6 +368,39 @@ def load_spec(path: str | Path) -> Spec:
             )
         nuisance.append(n)
 
+    stim_vec: list[StimVecSpec] = []
+    for sv_raw in raw.get("stim_vec", []):
+        sv = StimVecSpec(**sv_raw)
+        if not sv.label:
+            raise ValueError(f"{path}: [[stim_vec]] block missing 'label'")
+        if sv.scope == "glob":
+            if not sv.pattern:
+                raise ValueError(f"{path}: stim_vec '{sv.label}' has scope='glob' but no pattern")
+        elif sv.scope == "full":
+            if not sv.file:
+                raise ValueError(f"{path}: stim_vec '{sv.label}' (scope='full') needs 'file'")
+        else:
+            raise ValueError(
+                f"{path}: stim_vec '{sv.label}': scope must be 'full' or 'glob' "
+                f"(got {sv.scope!r}). A stim vector is one shared regressor with one "
+                f"beta, so there is no per-run 'run:N' form."
+            )
+        if sv.mod not in STIM_VEC_MODS:
+            raise ValueError(
+                f"{path}: stim_vec '{sv.label}': mod must be one of "
+                f"{', '.join(STIM_VEC_MODS)} (got {sv.mod!r})"
+            )
+        stim_vec.append(sv)
+
+    seen_sv = set()
+    for sv in stim_vec:
+        if sv.label in seen_sv:
+            raise ValueError(
+                f"{path}: stim_vec label {sv.label!r} used more than once; labels name "
+                f"the design columns and must be unique"
+            )
+        seen_sv.add(sv.label)
+
     contrasts = [ContrastSpec(**c) for c in raw.get("contrasts", [])]
 
     # Validate enums
@@ -332,7 +411,13 @@ def load_spec(path: str | Path) -> Spec:
         if c.balance not in ("none", "sum1", "zero"):
             raise ValueError(f"contrast '{c.label}': balance must be none|sum1|zero")
 
-    return Spec(meta=meta, events=events, nuisance=nuisance, contrasts=contrasts)
+    return Spec(
+        meta=meta,
+        events=events,
+        nuisance=nuisance,
+        stim_vec=stim_vec,
+        contrasts=contrasts,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -601,6 +686,107 @@ def write_spec(
         lines.append(
             "# ---------------------------------------------------------------------------"
         )
+    lines.append("")
+    lines.append("# ===========================================================================")
+    lines.append("# [[stim_vec]] — continuous TR-locked stimulus vectors: a regressor supplied")
+    lines.append("# as one number per TR rather than as a list of onsets. An oscillating")
+    lines.append("# background, a motion-energy trace, a luminance timecourse.")
+    lines.append("#")
+    lines.append("# These are STIMULI, not nuisance: they get a beta, a t-stat and their own")
+    lines.append("# xmat stim group, and downstream tools fit them on the training runs during")
+    lines.append("# cross-validation rather than projecting them out. They are never split into")
+    lines.append("# single trials — there is no trial to split.")
+    lines.append("#")
+    lines.append("# They live here rather than in the events.tsv because an events file")
+    lines.append("# describes discrete trials and this is a number per TR. BIDS has no slot")
+    lines.append("# for it; that is a gap in BIDS, not a reason to model the thing wrongly.")
+    lines.append("# ===========================================================================")
+    lines.append("#")
+    lines.append("# Fields:")
+    lines.append("#")
+    lines.append("# label     Name written into the xmat column header (and the output")
+    lines.append("#           sub-bricks). Multi-column files get '#0', '#1', … suffixes, and")
+    lines.append("#           stay ONE stim group, so an F-test covers the whole block.")
+    lines.append("#")
+    lines.append("# file      Path to a 1D file: one row per TR, one column per regressor.")
+    lines.append('#           Ignored when scope = "glob"; required otherwise.')
+    lines.append("#")
+    lines.append("# scope     How the file's rows map onto the concatenated run grid:")
+    lines.append("#")
+    lines.append('#           "full"  The file spans all runs (sum(n_timepoints_per_run) rows).')
+    lines.append("#")
+    lines.append('#           "glob"  The pattern field matches one file per run, each one run')
+    lines.append("#                    long; the run index is inferred from the filename (BIDS")
+    lines.append("#                    '_run-NN_' preferred). The runs are CONCATENATED into one")
+    lines.append("#                    shared column — NOT zero-padded per run the way")
+    lines.append("#                    [[nuisance]] does it. A stim vector is one regressor with")
+    lines.append("#                    one beta across the whole experiment, so there is no")
+    lines.append('#                    per-run "run:N" form here.')
+    lines.append("#")
+    lines.append('# pattern   Shell glob — only set this when scope = "glob".')
+    lines.append("#")
+    lines.append("# mod       Transform applied PER RUN, before convolution. Per run because a")
+    lines.append("#           difference across a run boundary turns the between-run offset into")
+    lines.append("#           a spike that then eats real signal.")
+    lines.append('#             "none"       Use the file as-is. Default.')
+    lines.append('#             "abs"        Rectify. For inputs where sign is meaningless — a')
+    lines.append("#                          background contrast that oscillates through zero")
+    lines.append("#                          drives the same response either side of it.")
+    lines.append('#             "deriv"      Backward difference (1d_tool.py -derivative).')
+    lines.append('#             "deriv_back" Explicit synonym of "deriv".')
+    lines.append('#             "deriv_fwd"  Forward difference (1d_tool.py -forward_diff).')
+    lines.append('#             "deriv_abs"  Rectified derivative, |d[t]| — "amount of change"')
+    lines.append("#                          regardless of direction.")
+    lines.append("#")
+    lines.append("# convolve  true  (default) The file is a neural-level input; it is convolved")
+    lines.append("#                 here with the HRF and peak-normalised so max|column| = 1.")
+    lines.append("#                 The vector is NOT resampled: a TR-locked input has no")
+    lines.append("#                 sub-TR detail, so the HRF is decimated to the TR grid")
+    lines.append("#                 instead. Deltas, blocks and smooth curves all survive.")
+    lines.append("#           false The file already holds the convolved regressor and is used")
+    lines.append("#                 verbatim, with no rescaling (ffs_reml's -stim_vec).")
+    lines.append("#")
+    lines.append('# hrf       HRF to convolve with, when convolve = true. Leave unset (or "")')
+    lines.append("#           to follow the design's own model. SPMG2/SPMG3 give the vector the")
+    lines.append("#           same derivative columns the events get. FIR/TENT have no basis")
+    lines.append("#           analogue for a continuous input, so those fall back to SPMG1.")
+    if not spec.stim_vec:
+        lines.append("#")
+        lines.append("# (None declared. Add [[stim_vec]] blocks below if your paradigm has a")
+        lines.append("#  continuous regressor that is part of the model, not a confound.)")
+        lines.append("#")
+        lines.append("# Examples:")
+        lines.append("#")
+        lines.append("# [[stim_vec]]                        # oscillating background, rectified")
+        lines.append('# label = "background"')
+        lines.append('# file = "background.1D"')
+        lines.append('# scope = "full"')
+        lines.append('# mod = "abs"')
+        lines.append("#")
+        lines.append("# [[stim_vec]]                        # one file per run, concatenated")
+        lines.append('# label = "motion_energy"')
+        lines.append('# pattern = "stim/motenergy_run-*.1D"')
+        lines.append('# scope = "glob"')
+        lines.append("#")
+        lines.append("# [[stim_vec]]                        # already convolved, used as-is")
+        lines.append('# label = "pupil"')
+        lines.append('# file = "pupil_conv.1D"')
+        lines.append("# convolve = false")
+    for sv in spec.stim_vec:
+        lines.append("")
+        lines.append("[[stim_vec]]")
+        lines.append(f'label = "{sv.label}"')
+        if sv.scope == "glob":
+            lines.append(f'pattern = "{sv.pattern}"')
+        else:
+            lines.append(f'file = "{sv.file}"')
+        lines.append(f'scope = "{sv.scope}"')
+        lines.append(f'mod = "{sv.mod}"')
+        if not sv.convolve:
+            lines.append("convolve = false")
+        if sv.hrf:
+            lines.append(f'hrf = "{sv.hrf}"')
+    lines.append("")
     lines.append("# ===========================================================================")
     lines.append("# [[contrasts]] — symbolic linear contrasts evaluated against the resolved")
     lines.append("# stim labels (each [[events]] entry contributes one or more — multi-column")
@@ -700,6 +886,7 @@ def resolve_contrast_row(
     sym: str,
     stim_labels: list[str],
     balance: str = "none",
+    extra_labels: list[str] | None = None,
 ) -> dict[str, tuple[float, tuple[int, int] | None]]:
     """
     Expand one symbolic contrast row into ``{label: (weight, range_or_None)}``
@@ -715,7 +902,15 @@ def resolve_contrast_row(
       ``w/(N - k_explicit)``.
     - ``balance`` post-processing: ``"sum1"`` divides every weight by the sum;
       ``"zero"`` adds a constant so weights sum to 0.
+
+    ``extra_labels`` are addressable by exact name but are excluded from glob
+    matches and from ALLOTHERS. That is what continuous stim vectors want: a
+    background is a stimulus you can contrast against explicitly, but a ``*`` or
+    an ALLOTHERS in a task contrast almost never means "and the background".
     """
+    extra = list(extra_labels or [])
+    addressable = list(stim_labels) + extra
+
     s = sym.strip()
     if s.upper().startswith("SYM:"):
         s = s[4:].strip()
@@ -750,8 +945,8 @@ def resolve_contrast_row(
                 resolved[lbl] = (resolved.get(lbl, (0.0, None))[0] + share, None)
                 explicit_labels.add(lbl)
         else:
-            if label not in stim_labels:
-                raise ValueError(f"Contrast label '{label}' not in stim labels: {stim_labels}")
+            if label not in addressable:
+                raise ValueError(f"Contrast label '{label}' not in stim labels: {addressable}")
             # Accumulate so '+1*A +1*A' sums (rare but well-defined).
             prev = resolved.get(label, (0.0, None))
             resolved[label] = (prev[0] + weight, rng)
@@ -790,9 +985,10 @@ def resolve_contrast_row(
 def resolve_contrast(
     spec: ContrastSpec,
     stim_labels: list[str],
+    extra_labels: list[str] | None = None,
 ) -> list[dict[str, tuple[float, tuple[int, int] | None]]]:
     """Resolve a ContrastSpec into a list of resolved rows (1 = t-test, >1 = F)."""
     sym = spec.sym
     if isinstance(sym, list):
-        return [resolve_contrast_row(row, stim_labels, spec.balance) for row in sym]
-    return [resolve_contrast_row(sym, stim_labels, spec.balance)]
+        return [resolve_contrast_row(row, stim_labels, spec.balance, extra_labels) for row in sym]
+    return [resolve_contrast_row(sym, stim_labels, spec.balance, extra_labels)]
