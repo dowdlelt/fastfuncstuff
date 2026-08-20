@@ -25,12 +25,19 @@ with more ops as needed.
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    collect_batch_jobs,
+    run_batch_jobs,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.processing.io import load_image, save_image
 
 # Expression helpers exposed to -expr (3dcalc-style), kept intentionally small.
@@ -71,13 +78,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "-input",
         nargs="+",
-        required=True,
         metavar="FILE",
         help="One or more datasets (.nii/.nii.gz/.nii.zst). Bound to "
         "a, b, c, ... for -expr, in the order given.",
     )
-    p.add_argument("-prefix", required=True, metavar="FILE", help="Output path.")
-    grp = p.add_mutually_exclusive_group(required=True)
+    p.add_argument("-prefix", metavar="FILE", help="Output path. [required unless -batch]")
+    grp = p.add_mutually_exclusive_group()
     for op in _REDUCTIONS:
         grp.add_argument(
             f"-{op}",
@@ -109,7 +115,28 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("-mask", metavar="FILE", help="Only compute inside mask>0; zero elsewhere.")
     p.add_argument("-device", default="cpu", help="torch device (cpu/cuda).")
     p.add_argument("-overwrite", action="store_true")
+    add_batch_args(
+        p,
+        tool="ffs_util_3dmath",
+        what="voxelwise math jobs",
+        example="-input a.nii b.nii -mean -prefix mean.nii.gz",
+        skip_note="-prefix",
+    )
     return p
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip."""
+    return [args.prefix] if args.prefix else []
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: the flags argparse would have enforced."""
+    missing = [f for f in ("input", "prefix") if not getattr(run_args, f, None)]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+    if run_args.op is None and run_args.expr is None:
+        raise ValueError("run has no operation (-mean/-max/.../-tcat/-expr)")
 
 
 def _resolve_labels(
@@ -142,16 +169,46 @@ def _resolve_labels(
     return None
 
 
-def main() -> int:
-    args = _build_parser().parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
 
+    if args.batch is not None or args.batch_run:
+        # Reductions and tcats are seconds of I/O around ~2s of interpreter and
+        # torch startup, and autoproc emits a dozen of them (session means,
+        # grandmeans, every QC stack). One process pays that once.
+        run_batch_jobs(
+            tool="ffs_util_3dmath",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=setup_device(args.device),
+            parse_line=lambda line: _build_parser().parse_args(shlex.split(line)),
+            dispatch=_dispatch_run,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+        )
+        return 0
+
+    try:
+        _validate_batch_run(args)
+        _dispatch_run(args, setup_device(args.device))
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _dispatch_run(args: argparse.Namespace, dev: torch.device) -> None:
+    """Run one self-contained math job (the whole per-output body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit. Bad requests raise so that a
+    batch records the failure and carries on with the remaining jobs."""
     from pathlib import Path
 
     if Path(args.prefix).exists() and not args.overwrite:
-        print(f"ERROR: {args.prefix} exists (use -overwrite).", file=sys.stderr)
-        return 1
+        raise ValueError(f"{args.prefix} exists (use -overwrite)")
 
-    dev = setup_device(args.device)
     # -tcat stacks along time, so only the spatial lattice has to agree; every
     # other op is voxelwise and needs the full shape to match.
     key = (lambda s: s[-3:]) if args.op == "tcat" else (lambda s: s)
@@ -161,11 +218,7 @@ def main() -> int:
         if hdr0 is None:
             hdr0, shape0 = h, key(tuple(d.shape))
         elif key(tuple(d.shape)) != shape0:
-            print(
-                f"ERROR: shape mismatch: {f} is {tuple(d.shape)}, expected {shape0}.",
-                file=sys.stderr,
-            )
-            return 1
+            raise ValueError(f"shape mismatch: {f} is {tuple(d.shape)}, expected {shape0}")
         vols.append(d.to(dev).float())
 
     if args.op == "tcat":
@@ -177,15 +230,13 @@ def main() -> int:
         # -expr: bind inputs to a, b, c, ... as numpy arrays.
         names = [chr(ord("a") + i) for i in range(len(vols))]
         if len(vols) > 26:
-            print("ERROR: -expr supports at most 26 inputs (a..z).", file=sys.stderr)
-            return 1
+            raise ValueError("-expr supports at most 26 inputs (a..z)")
         env = {n: v.cpu().numpy() for n, v in zip(names, vols, strict=True)}
         env.update(_EXPR_FUNCS)
         try:
             res = eval(args.expr, {"__builtins__": {}}, env)  # noqa: S307 (3dcalc-style)
         except Exception as exc:  # noqa: BLE001
-            print(f"ERROR: could not evaluate -expr {args.expr!r}: {exc}", file=sys.stderr)
-            return 1
+            raise ValueError(f"could not evaluate -expr {args.expr!r}: {exc}") from exc
         out = torch.as_tensor(np.asarray(res, dtype=np.float32), device=dev)
         if out.shape != vols[0].shape:
             out = out.expand(vols[0].shape).clone()
@@ -200,7 +251,6 @@ def main() -> int:
     with spinner(f"Writing {Path(args.prefix).name}"):
         save_image(out.cpu(), args.prefix, header_info=hdr0, brick_labels=labels)
     print(f"ffs_util_3dmath: wrote {args.prefix}  ({tuple(out.shape)})")
-    return 0
 
 
 if __name__ == "__main__":

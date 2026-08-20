@@ -179,6 +179,23 @@ def _batch_launch(tool: str, var: str, skip_var: str, indent: str = "") -> str:
     )
 
 
+def _math_batch(var: str, path: str, jobs: list[list[str]], indent: str = "") -> list[str]:
+    """A manifest + one batched ``ffs_util_3dmath`` for a group of math jobs.
+
+    Reductions are a few seconds of I/O each around ~2s of interpreter+torch
+    startup, so a loop of them is nearly all fixed cost. ``jobs`` are the same
+    per-flag token lists :func:`_ffs` takes, minus ``-device`` (the batch picks
+    the device once)."""
+    if not jobs:
+        return []
+    out = [f'{indent}{var}="{path}"; : > "${var}"']
+    out += [_manifest_line(var, parts, indent=indent) for parts in jobs]
+    out.append(
+        f'{indent}if [ -s "${var}" ]; then ffs_util_3dmath -batch "${var}" -device "$DEVICE"; fi'
+    )
+    return out
+
+
 def _anat_lin_files(opt) -> list[str]:
     """The anat-matrix link(s) at the chain head, per reference mode:
     * explicit ref_file → the user's ``-ref_transforms`` (nwarp order), if any;
@@ -669,15 +686,18 @@ def _qc_call(out_stem: str, items: QCItems, indent: str = "") -> str:
 
 
 def _qc_block(title: str, calls: list[str]) -> str:
-    """A stage's QC lines under one echo, or "" when the stage has no groups."""
+    """A stage's QC lines under one echo, or "" when the stage has no groups.
+
+    Ends with ``qc_flush`` so the stage's stacks are built by one batched
+    ffs_util_3dmath instead of one process per stack."""
     live = [c for c in calls if c]
     if not live:
         return ""
-    return "\n".join([f"echo {shlex.quote('== QC: ' + title + ' ==')}", *live])
+    return "\n".join([f"echo {shlex.quote('== QC: ' + title + ' ==')}", *live, "qc_flush"])
 
 
-def _qc_helper(plan: Plan) -> str:
-    """The ``qc_tcat`` shell function, emitted once near the top of the script.
+def _qc_helper(plan: Plan, script_stem: str) -> str:
+    """The ``qc_tcat`` / ``qc_flush`` shell functions, emitted once near the top.
 
     Missing inputs skip the stack rather than failing: a QC group can name a file
     an optional stage did not write (a nonlinear refinement that was turned off
@@ -686,25 +706,37 @@ def _qc_helper(plan: Plan) -> str:
     """
     if not _qc_on(plan):
         return ""
-    return """
+    return f"""
 # ============================ QC stacks =====================================
 # qc_tcat OUT "LABELS..." INPUT... — concatenate images that SHOULD be aligned
 # into one 4-D file. Scroll its time axis in a viewer: any jump between
 # sub-bricks is a registration failure at that stage, and the sub-brick label
 # names the run/session/fieldmap responsible. `ls *.QC.*` is all of them.
+# qc_tcat only QUEUES the stack; the qc_flush at the end of each stage's QC
+# block builds every stack queued since the last flush in ONE process. A stack
+# is a few seconds of I/O around ~2s of interpreter+torch startup, so the loop
+# was almost entirely fixed cost. Flushing per stage (not once at the end)
+# keeps a stage's QC available before the next stage consumes its outputs.
 skip_qc=1          # 1 = keep an existing QC stack; 0 = rebuild every one
-qc_tcat() {
+qcbatch="{script_stem}_qcbatch.txt"; : > "$qcbatch"
+qc_tcat() {{
   local out="$1" labs="$2"; shift 2
   [ "$skip_qc" -eq 1 ] && [ -f "$out" ] && return 0
-  local f
+  local f line
   for f in "$@"; do
-    # ${f%%[*} drops any sub-brick selector: only the tools parse "file.nii[0]".
-    [ -f "${f%%[*}" ] || { echo "  QC skip $(basename "$out"): missing $f"; return 0; }
+    # ${{f%%[*}} drops any sub-brick selector: only the tools parse "file.nii[0]".
+    [ -f "${{f%%[*}}" ] || {{ echo "  QC skip $(basename "$out"): missing $f"; return 0; }}
   done
   # $labs is deliberately unquoted: it is a space-separated label list.
-  ffs_util_3dmath -input "$@" -tcat -labels $labs \\
-    -prefix "$out" -overwrite -device "$DEVICE"
-}
+  line="-tcat -overwrite -prefix \\"$out\\" -labels $labs -input"
+  for f in "$@"; do line="$line \\"$f\\""; done
+  printf '%s\\n' "$line" >> "$qcbatch"
+}}
+qc_flush() {{
+  [ -s "$qcbatch" ] || return 0
+  ffs_util_3dmath -batch "$qcbatch" -device "$DEVICE"
+  : > "$qcbatch"
+}}
 """
 
 
@@ -1087,10 +1119,25 @@ NOISE_VOLS={opt.noise_vols}{phase_fmt}
 
 mkdir -p "$OUT"; cd "$OUT"
 
+# ---- wall-clock tic/toc ------------------------------------------------------
+# SECONDS is bash's own monotonic counter, so this survives `set -e` and costs
+# nothing. The trap fires on success, on error and on ^C, so a run that dies
+# halfway still tells you how far it got before it did.
+SECONDS=0
+_ffs_toc() {{
+  local rc=$? h=$((SECONDS/3600)) m=$(((SECONDS%3600)/60)) s=$((SECONDS%60))
+  printf '\n== ffs_autoproc: %s after %02d:%02d:%02d (%ds) ==\n' \
+    "$([ "$rc" -eq 0 ] && echo finished || echo "FAILED (exit $rc)")" \
+    "$h" "$m" "$s" "$SECONDS"
+  return "$rc"
+}}
+trap _ffs_toc EXIT
+
 # ---- coarse per-stage re-run toggles (1 = skip stage output if it exists) ---
 # The batched moco + final stages pass their toggle to the tool as -batch_skip.
 skip_nordic=1 skip_moco={_skip_default(opt)} skip_locomoco=1 skip_blip=1
-skip_xfmap=1  skip_xrun=1 skip_xses=1 skip_anat=1 skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
+skip_xfmap=1  skip_xrun=1 skip_runmean=1 skip_xses=1 skip_anat=1
+skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
 """
 
 
@@ -1395,24 +1442,38 @@ ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
 """
 
 
-def _stage_locomoco(plan: Plan) -> str:
+def _stage_locomoco(plan: Plan, script_stem: str) -> str:
     if not plan.options.locomoco:
         return ""
+    parts = [
+        '-input "stage02.moco.${FRAG[$k]}.nii$FMT"',
+        '-prefix "${nlstem}.nii$FMT"',
+        '-pe_dir "${pe:-y}"',
+        *_split_flags(config.DEFAULT_OPTS["locomoco"]),
+        "-warp_format 5d",
+        "-save_mean",
+        "-save_max",
+        "-save_min",
+    ]
     return f"""
 # ============================ stage03: locomoco (residual NL motion) ========
 # Input is stage02's rigid-corrected 4D (written only when this stage runs), NOT
 # the moco mean: locomoco estimates a warp per volume, so it needs the time axis.
 # Its own mean (_locomoco_mean) is what the rest of the chain aligns from.
+# Batched: the loop only WRITES the manifest, then ONE ffs_locomoco does every
+# run. The flow backend's torch.compile warmup is per-PROCESS, so a shell loop
+# paid it N times. skip_locomoco=1 → -batch_skip; the tool checks the _warp AND
+# the lane reductions, so a working directory from before the coverage lanes
+# existed re-runs and produces them instead of resuming into a stage07 that
+# cannot find its inputs.
 echo '== stage03: locomoco =='
+lmbatch="{script_stem}_locomocobatch.txt"; : > "$lmbatch"
 for k in "${{RUN_KEYS[@]}}"; do
   nlstem="stage03.nlmoco.${{FRAG[$k]}}"
-  # The max is checked alongside the warp so a working directory from before the
-  # coverage lanes existed re-runs and produces them, instead of resuming into a
-  # stage07 that cannot find its inputs.
-  [ "$skip_locomoco" -eq 1 ] && [ -f "${{nlstem}}_warp.nii$FMT" ] && [ -f "${{nlstem}}_locomoco_max.nii$FMT" ] && continue
   pe="${{PEDIR[$k]}}"; pe="${{pe//[!a-zA-Z]/}}"
-{_ffs("ffs_locomoco", ['-input "stage02.moco.${FRAG[$k]}.nii$FMT"', '-prefix "${nlstem}.nii$FMT"', '-pe_dir "${pe:-y}"', *_split_flags(config.DEFAULT_OPTS["locomoco"]), "-warp_format 5d", "-save_mean", "-save_max", "-save_min", '-device "$DEVICE"'])}
+{_manifest_line("lmbatch", parts)}
 done
+{_batch_launch("ffs_locomoco", "lmbatch", "skip_locomoco")}
 """
 
 
@@ -1425,7 +1486,7 @@ def _fmap_pe(pr: PlanRun) -> str:
     return (pr.fmap.pe_dir if pr.fmap else None) or pr.bold.pe_dir or "j"
 
 
-def _stage_blip(plan: Plan) -> str:
+def _stage_blip(plan: Plan, script_stem: str) -> str:
     groups: dict[tuple, PlanRun] = {}
     for pr in plan.runs:
         if pr.fmap is None:
@@ -1437,6 +1498,9 @@ def _stage_blip(plan: Plan) -> str:
     tool = "b0fmap" if kinds == {"b0"} else "blipflip"
     out = ["", f"# ============================ stage04: fieldmap ({tool}) " + "=" * 18]
     out.append("echo '== stage04: distortion correction =='")
+    # The blip pairs are batched into one ffs_blipflip; GRE fieldmaps have no
+    # batch mode and stay one call each.
+    blip_jobs: list[list[str]] = []
     for pr in groups.values():
         assert pr.fmap is not None
         st = _fmap_stem(pr, "blip")
@@ -1450,8 +1514,7 @@ def _stage_blip(plan: Plan) -> str:
         # next to the fieldmap — NOT this loop's representative run, which is
         # whichever one the group dict happened to see first).
         up = pr.fmap_forward or pr.bold.rep
-        cmd = _ffs(
-            "ffs_blipflip",
+        blip_jobs.append(
             [
                 f"-blip_up {shlex.quote(str(up))}",
                 f"-blip_down {shlex.quote(str(pr.fmap.reverse_path))}",
@@ -1459,10 +1522,12 @@ def _stage_blip(plan: Plan) -> str:
                 ro,
                 *_split_flags(config.DEFAULT_OPTS["blip"]),
                 f'-prefix "{st}.nii$FMT"',
-                '-device "$DEVICE"',
-            ],
+            ]
         )
-        out.append(f'if [ "$skip_blip" -ne 1 ] || [ ! -f "{st}_warp.nii$FMT" ]; then\n{cmd}\nfi')
+    if blip_jobs:
+        out.append(f'bfbatch="{script_stem}_blipbatch.txt"; : > "$bfbatch"')
+        out += [_manifest_line("bfbatch", parts, indent="") for parts in blip_jobs]
+        out.append(_batch_launch("ffs_blipflip", "bfbatch", "skip_blip"))
     return "\n".join(out) + "\n"
 
 
@@ -1761,7 +1826,7 @@ fwbatch="{fwbatch}"; : > "$fwbatch"
 """
 
 
-def _stage_grandmean(plan: Plan) -> str:
+def _stage_grandmean(plan: Plan, script_stem: str) -> str:
     """stage07: the two *within*-session mean levels — runmean then sesmean.
 
     THE grandmean is not built here. Session means still sit in their own session
@@ -1778,48 +1843,53 @@ def _stage_grandmean(plan: Plan) -> str:
     # grid, so runs from different fmap groups average in one space. A no-fmap
     # session's anchor run defines that grid and has no pre-chain, so it is
     # skipped here and feeds the session mean directly.
+    # Batched: one manifest over EVERY (run, lane) pair, then ONE ffs_nwarp. With
+    # four lanes this stage used to be 4*N processes whose per-image work — one
+    # small 3-D resample — is dwarfed by interpreter + CUDA + torch.compile
+    # startup. -batch_skip reproduces the old per-file [ -f ] guard.
+    runbatch = f"{script_stem}_runmeanbatch.txt"
+    out.append(f'rmbatch="{runbatch}"; : > "$rmbatch"')
+    out.append('for k in "${RUN_KEYS[@]}"; do')
+    out.append('  [ -z "${PRECHAIN[$k]:-}" ] && continue   # anchor run, already on the grid')
     for lane in _lanes(plan):
         suffix = f".src-{_src(lane)}" if _src(lane) else ""
-        runmean_cmd = _ffs(
-            "ffs_nwarp",
-            [
-                f'-source "{_run_level_var(lane)}"',
-                '-nwarp "${PRECHAIN[$k]}"',
-                '${JAC[$k]:+-jac "${JAC[$k]}"}',
-                '-master "${REFGRID[$k]}"',
-                *_lane_nwarp_flags(lane),
-                f'-prefix "stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"',
-                '-device "$DEVICE"',
-            ],
-        )
-        label = {LANE_SBREF: "SBRefs", LANE_MEAN: "run means"}.get(lane, f"run {lane}es")
-        out.append(f"echo '== stage07: {label} (→ session common grid) =='")
+        label = {LANE_SBREF: "SBRef", LANE_MEAN: "mean"}.get(lane, lane)
+        out.append(f"  # {label} lane")
         out.append(
-            'for k in "${RUN_KEYS[@]}"; do\n'
-            '  [ -z "${PRECHAIN[$k]:-}" ] && continue   # anchor run, already on the grid\n'
-            f'  pm="stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"\n'
-            '  [ -f "$pm" ] && continue\n'
-            f"{runmean_cmd}\n"
-            "done"
-        )
-    out.append("echo '== stage07: session means =='")
-    for lane in _lanes(plan):
-        for ses, prs in by_ses.items():
-            aligned = " ".join(f'"{_aligned_mean(pr, lane)}"' for pr in prs)
-            out.append(
-                _ffs(
-                    "ffs_util_3dmath",
-                    [
-                        f"-input {aligned}",
-                        # Per lane: means average, maxes take the max, mins the min.
-                        _lane_reduce(lane),
-                        f'-prefix "{_sesmean(ses, lane)}"',
-                        "-overwrite",
-                        '-device "$DEVICE"',
-                    ],
-                    indent="",
-                )
+            _manifest_line(
+                "rmbatch",
+                [
+                    f'-source "{_run_level_var(lane)}"',
+                    '-nwarp "${PRECHAIN[$k]}"',
+                    '${JAC[$k]:+-jac "${JAC[$k]}"}',
+                    '-master "${REFGRID[$k]}"',
+                    *_lane_nwarp_flags(lane),
+                    f'-prefix "stage07.runmean.${{FRAG[$k]}}{suffix}.nii$FMT"',
+                ],
             )
+        )
+    out.append("done")
+    lanes_note = ", ".join(
+        {LANE_SBREF: "SBRefs", LANE_MEAN: "means"}.get(ln, f"{ln}es") for ln in _lanes(plan)
+    )
+    out.append(f"echo '== stage07: run {lanes_note} (→ session common grid) =='")
+    out.append(_batch_launch("ffs_nwarp", "rmbatch", "skip_runmean"))
+    out.append("echo '== stage07: session means =='")
+    out += _math_batch(
+        "smbatch",
+        f"{script_stem}_sesmeanbatch.txt",
+        [
+            [
+                f"-input {' '.join(chr(34) + _aligned_mean(pr, lane) + chr(34) for pr in prs)}",
+                # Per lane: means average, maxes take the max, mins the min.
+                _lane_reduce(lane),
+                f'-prefix "{_sesmean(ses, lane)}"',
+                "-overwrite",
+            ]
+            for lane in _lanes(plan)
+            for ses, prs in by_ses.items()
+        ],
+    )
     out.append(_qc_runmean(plan))
     return "\n".join(p for p in out if p) + "\n"
 
@@ -1956,21 +2026,19 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
     # every run has data). This is the default target the anat alignment (stage09)
     # uses; the SBRef lane's sibling is what -anat_source sbmean selects.
     out.append("echo '== stage08: grandmean (all runs, in one space) =='")
-    for lane in _lanes(plan):
-        allm = " ".join(f'"{_gmrun_image(pr, lane)}"' for pr in plan.runs)
-        out.append(
-            _ffs(
-                "ffs_util_3dmath",
-                [
-                    f"-input {allm}",
-                    _lane_reduce(lane),
-                    f'-prefix "{_grandmean(lane)}"',
-                    "-overwrite",
-                    '-device "$DEVICE"',
-                ],
-                indent="",
-            )
-        )
+    out += _math_batch(
+        "gmeanbatch",
+        f"{script_stem}_grandmeanbatch.txt",
+        [
+            [
+                f"-input {' '.join(chr(34) + _gmrun_image(pr, lane) + chr(34) for pr in plan.runs)}",
+                _lane_reduce(lane),
+                f'-prefix "{_grandmean(lane)}"',
+                "-overwrite",
+            ]
+            for lane in _lanes(plan)
+        ],
+    )
     out.append(_qc_grandmean(plan))
     return "\n".join(p for p in out if p) + "\n"
 
@@ -2691,8 +2759,8 @@ def write_script(
 
     ``script_stem`` is the basename (no extension) of the script being written;
     every batched stage names its manifest file after it (``_mocobatch.txt``,
-    ``_xrunbatch.txt`` / ``_xrunnlbatch.txt``, ``_xsesbatch.txt`` /
-    ``_xsesnlbatch.txt``, ``_nwarpbatch.txt``) so they sit beside the script's
+    ``_xrunbatch.txt`` / ``_xrunnlbatch.txt``, ``_runmeanbatch.txt``,
+    ``_xsesbatch.txt`` / ``_xsesnlbatch.txt``, ``_nwarpbatch.txt``) so they sit beside the script's
     outputs and don't collide across sibling subjects.
 
     ``invocation`` is the ffs_autoproc command line that produced this script; it
@@ -2701,16 +2769,16 @@ def write_script(
         _header(plan, out_dir, invocation),
         _data_arrays(plan),
         _preflight(plan, bids_root),
-        _qc_helper(plan),
+        _qc_helper(plan, script_stem),
         _stage_nordic(plan),
         _stage_unwrap(plan),
         _stage_tshift(plan),
         _stage_moco(plan, script_stem),
-        _stage_locomoco(plan),
-        _stage_blip(plan),
+        _stage_locomoco(plan, script_stem),
+        _stage_blip(plan, script_stem),
         _stage_xfmap(plan, script_stem),
         _stage_xrun(plan, script_stem),
-        _stage_grandmean(plan),
+        _stage_grandmean(plan, script_stem),
         _stage_xses(plan, script_stem),
         _stage_xref(plan),
         _stage_anat(plan),

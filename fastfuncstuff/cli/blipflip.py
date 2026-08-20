@@ -45,13 +45,21 @@ METHOD / CREDIT
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 from datetime import datetime
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_device_arg, parse_prefix, setup_device
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_device_arg,
+    collect_batch_jobs,
+    parse_prefix,
+    run_batch_jobs,
+    setup_device,
+)
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -93,7 +101,6 @@ def create_parser() -> argparse.ArgumentParser:
         "-pe_dir",
         "-pe-dir",
         nargs="+",
-        required=True,
         metavar="DIR",
         help="Phase-encode direction of the blip_up (or of each -imain image): one of "
         "i/j/k (or x/y/z) with optional trailing '-'. The blip_down is the opposite.",
@@ -118,7 +125,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     out = parser.add_argument_group("Outputs")
-    out.add_argument("-prefix", required=True, help="Output prefix (stem[.nii.gz]).")
+    out.add_argument("-prefix", help="Output prefix (stem[.nii.gz]) [required unless -batch].")
     out.add_argument(
         "-warp_for",
         choices=("up", "down"),
@@ -262,6 +269,13 @@ def create_parser() -> argparse.ArgumentParser:
         extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
     )
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
+    add_batch_args(
+        parser,
+        tool="ffs_blipflip",
+        what="fieldmap solves",
+        example="-blip_up up.nii.gz -blip_down down.nii.gz -pe_dir j -prefix dc",
+        skip_note="-prefix (its _warp and _unwarped images)",
+    )
     return parser
 
 
@@ -336,13 +350,9 @@ def _build_config(name: str):
     return TopupConfig()  # b02b0 defaults (9 levels)
 
 
-def main(argv: list[str] | None = None) -> int:
-    from fastfuncstuff.processing import topup as T
-    from fastfuncstuff.processing.io import save_warp_field
-    from fastfuncstuff.processing.medic import PE_AXIS_MAP, invert_displacement_pe
-
-    args = create_parser().parse_args(argv)
-    device_spec = args.device
+def _resolve_device(device_spec) -> torch.device:
+    """Device for a blipflip run: auto falls back to CPU without CUDA, and MPS is
+    refused outright (the CG reductions are float64)."""
     if (
         device_spec is None or str(device_spec).lower() == "auto"
     ) and not torch.cuda.is_available():
@@ -353,6 +363,73 @@ def main(argv: list[str] | None = None) -> int:
             "ffs_blipflip: MPS cannot run the required float64 CG reductions; "
             "use -device cpu on Mac."
         )
+    return device
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    The warp is the estimate; the unwarped stack is checked with it because the
+    cross-fmap stage reads that, not the warp."""
+    if not args.prefix:
+        return []
+    pinfo = parse_prefix(args.prefix)
+    outs = [f"{pinfo.stem}_warp{pinfo.nifti_ext}"]
+    if not args.no_unwarped:
+        outs.append(f"{pinfo.stem}_unwarped{pinfo.nifti_ext}")
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: the flags argparse would have enforced."""
+    missing = [f for f in ("pe_dir", "prefix") if not getattr(run_args, f, None)]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = create_parser().parse_args(argv)
+
+    if args.batch is not None or args.batch_run:
+        # A fieldmap solve is seconds of GN on a B-spline field wrapped in ~2s of
+        # interpreter/CUDA startup, and a session has one per blip-up/down pair.
+        run_batch_jobs(
+            tool="ffs_blipflip",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=_resolve_device(args.device),
+            parse_line=lambda line: create_parser().parse_args(shlex.split(line)),
+            dispatch=_dispatch_raising,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+        )
+        return 0
+
+    try:
+        _validate_batch_run(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc} (or use -batch FILE / -batch_run ARGS).", file=sys.stderr)
+        return 2
+
+    return _dispatch_run(args, _resolve_device(args.device))
+
+
+def _dispatch_raising(args: argparse.Namespace, device: torch.device) -> None:
+    rc = _dispatch_run(args, device)
+    if rc:
+        raise ValueError(f"run exited {rc}")
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
+    """Solve one blip-up/down pair (the whole per-fieldmap body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
+    from fastfuncstuff.processing import topup as T
+    from fastfuncstuff.processing.io import save_warp_field
+    from fastfuncstuff.processing.medic import PE_AXIS_MAP, invert_displacement_pe
+
     pinfo = parse_prefix(args.prefix)
     stem, ext = pinfo.stem, pinfo.nifti_ext
 

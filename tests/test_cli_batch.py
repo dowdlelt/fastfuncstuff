@@ -417,3 +417,98 @@ def test_automask_batch_run_rejects_a_run_missing_its_output():
     _validate_batch_run(parse_args(["-input", "m.nii", "-prefix", "o.nii"]))
     with pytest.raises(ValueError, match="-prefix"):
         _validate_batch_run(parse_args(["-input", "m.nii"]))
+
+
+# --------------------------------------------------------------------------
+# ffs_locomoco / ffs_blipflip / ffs_util_3dmath batch surfaces
+# --------------------------------------------------------------------------
+
+
+def test_locomoco_expected_outputs_covers_the_lane_reductions():
+    """-batch_skip must check the images stage07 reads, not just the warp: a
+    working directory from before -save_max existed has the warp but no max."""
+    from fastfuncstuff.cli.locomoco import _expected_outputs, _parse
+
+    a = _parse(["-input", "r.nii.gz", "-prefix", "nl.nii.zst", "-pe_dir", "y"])
+    assert _expected_outputs(a) == ["nl_warp.nii.zst"]
+
+    a = _parse(
+        ["-input", "r.nii.gz", "-prefix", "nl.nii.zst", "-pe_dir", "y", "-save_max", "-save_mean"]
+    )
+    assert _expected_outputs(a) == [
+        "nl_warp.nii.zst",
+        "nl_locomoco_mean.nii.zst",
+        "nl_locomoco_max.nii.zst",
+    ]
+
+
+def test_locomoco_batch_makes_io_flags_optional():
+    from fastfuncstuff.cli.locomoco import _parse
+
+    a = _parse(["-batch", "runs.txt", "-device", "cpu"])
+    assert a.batch == "runs.txt" and a.input is None and a.prefix is None
+
+
+def test_locomoco_batch_run_rejects_a_run_missing_its_output():
+    from fastfuncstuff.cli.locomoco import _parse, _validate_batch_run
+
+    _validate_batch_run(_parse(["-input", "r.nii", "-prefix", "o.nii", "-pe_dir", "y"]))
+    with pytest.raises(ValueError, match="-prefix"):
+        _validate_batch_run(_parse(["-input", "r.nii", "-pe_dir", "y"]))
+
+
+def test_blipflip_expected_outputs_names_the_warp_and_unwarped():
+    from fastfuncstuff.cli.blipflip import _expected_outputs, create_parser
+
+    argv = ["-blip_up", "u.nii", "-blip_down", "d.nii", "-pe_dir", "j", "-prefix", "dc.nii.zst"]
+    a = create_parser().parse_args(argv)
+    assert _expected_outputs(a) == ["dc_warp.nii.zst", "dc_unwarped.nii.zst"]
+    a = create_parser().parse_args([*argv, "-no_unwarped"])
+    assert _expected_outputs(a) == ["dc_warp.nii.zst"]
+
+
+def test_blipflip_batch_makes_io_flags_optional():
+    from fastfuncstuff.cli.blipflip import create_parser
+
+    a = create_parser().parse_args(["-batch", "runs.txt", "-device", "cpu"])
+    assert a.batch == "runs.txt" and a.prefix is None and a.pe_dir is None
+
+
+def test_3dmath_batch_requires_an_operation_per_run():
+    from fastfuncstuff.cli.util_3dmath import _build_parser, _validate_batch_run
+
+    p = _build_parser()
+    _validate_batch_run(p.parse_args(["-input", "a.nii", "-mean", "-prefix", "o.nii"]))
+    with pytest.raises(ValueError, match="no operation"):
+        _validate_batch_run(p.parse_args(["-input", "a.nii", "-prefix", "o.nii"]))
+    with pytest.raises(ValueError, match="-prefix"):
+        _validate_batch_run(p.parse_args(["-input", "a.nii", "-mean"]))
+
+
+def test_emit_locomoco_blip_and_runmean_stages_are_batched():
+    """The three stages that used to be shell loops of one process per run."""
+    from fastfuncstuff.autoproc.emit import write_script
+
+    s = write_script(_tiny_plan(locomoco=True), "wd", bids_root="/bids", script_stem="proc_sub-X")
+    assert 'lmbatch="proc_sub-X_locomocobatch.txt"' in s
+    assert 'ffs_locomoco -batch "$lmbatch"' in s
+    # stage07 pushes every coverage lane through ONE nwarp batch, not one per lane.
+    assert 'rmbatch="proc_sub-X_runmeanbatch.txt"' in s
+    assert 'ffs_nwarp -batch "$rmbatch"' in s
+    stage07 = s[s.index("stage07: run + session means") : s.index("stage08:")]
+    assert "ffs_nwarp \\\n" not in stage07, "stage07 still launches a solo ffs_nwarp per run"
+    # session means and grandmeans are one ffs_util_3dmath each, not one per lane.
+    assert 'smbatch="proc_sub-X_sesmeanbatch.txt"' in s
+    assert 'gmeanbatch="proc_sub-X_grandmeanbatch.txt"' in s
+
+
+def test_emit_qc_stacks_are_queued_and_flushed_per_stage():
+    """qc_tcat only appends to a manifest; each stage's QC block ends in a flush
+    so one ffs_util_3dmath builds every stack that stage queued."""
+    from fastfuncstuff.autoproc.emit import write_script
+
+    s = write_script(_tiny_plan(), "wd", bids_root="/bids", script_stem="proc_sub-X")
+    assert 'qcbatch="proc_sub-X_qcbatch.txt"' in s
+    assert 'ffs_util_3dmath -batch "$qcbatch"' in s
+    # every emitted qc_tcat call is followed (eventually) by a flush
+    assert s.count("qc_flush") >= 2  # the definition plus at least one call

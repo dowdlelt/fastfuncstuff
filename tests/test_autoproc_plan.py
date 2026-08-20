@@ -167,16 +167,16 @@ def test_mean_levels_are_named_for_what_they_average():
         ],
     )
     s = write_script(build_plan(subj, Options(ref_ses="01")), "wd", bids_root="/bids")
-    assert '-prefix "stage07.sesmean.ses-01.nii$FMT"' in s
-    assert '-prefix "stage07.sesmean.ses-02.nii$FMT"' in s
-    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    assert '-prefix \\"stage07.sesmean.ses-01.nii$FMT\\"' in s
+    assert '-prefix \\"stage07.sesmean.ses-02.nii$FMT\\"' in s
+    assert '-prefix \\"stage08.grandmean.nii$FMT\\"' in s
     # The old names are gone entirely.
     assert "premean" not in s and "stage07.grandmean" not in s
     # Session means are built before the alignment that makes the grandmean valid.
     assert s.index("stage07.sesmean.ses-02") < s.index("stage08: cross-session")
-    assert s.index("stage08: cross-session") < s.index('-prefix "stage08.grandmean.nii$FMT"')
+    assert s.index("stage08: cross-session") < s.index('-prefix \\"stage08.grandmean.nii$FMT\\"')
     # Exactly one command writes the grandmean.
-    assert s.count('-prefix "stage08.grandmean.nii$FMT"') == 1
+    assert s.count('-prefix \\"stage08.grandmean.nii$FMT\\"') == 1
 
 
 def test_single_session_grandmean_has_the_same_single_producer():
@@ -184,9 +184,9 @@ def test_single_session_grandmean_has_the_same_single_producer():
     rather than a stage07 `cp` — same name, same stage, either way."""
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
     s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
-    assert '-prefix "stage08.grandmean.nii$FMT"' in s
-    assert s.count('-prefix "stage08.grandmean.nii$FMT"') == 1
-    assert '"stage07.sesmean.ses-01.nii$FMT"' in s
+    assert '-prefix \\"stage08.grandmean.nii$FMT\\"' in s
+    assert s.count('-prefix \\"stage08.grandmean.nii$FMT\\"') == 1
+    assert '\\"stage07.sesmean.ses-01.nii$FMT\\"' in s
     assert "cross-session alignment" not in s  # nothing to align
 
 
@@ -293,7 +293,7 @@ def test_locomoco_consumes_the_moco_timeseries_not_the_mean():
 
     s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root="/bids")
     assert '-prefix \\"${mstem}.nii$FMT\\"' in s
-    assert '-input "stage02.moco.${FRAG[$k]}.nii$FMT"' in s
+    assert '-input \\"stage02.moco.${FRAG[$k]}.nii$FMT\\"' in s
     # and the mean that goes downstream is locomoco's, not moco's
     assert "stage03.nlmoco.ses-01.task-foo.run-1_locomoco_mean.nii$FMT" in s
 
@@ -527,7 +527,7 @@ def test_anat_source_ref_fmap_uses_the_reference_blip_mean():
     assert '-source "stage04.blip.ses-SM.fmap-floc_unwarped.nii$FMT[0]"' in s
     assert '-source "stage08.grandmean.nii$FMT"' not in s
     # The grandmean is still built (QC + xses/xref inputs) — only the anat moved.
-    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    assert '-prefix \\"stage08.grandmean.nii$FMT\\"' in s
 
 
 def test_anat_source_mean_fmap_averages_the_aligned_group_means():
@@ -1022,8 +1022,8 @@ def test_sbref_lane_estimates_transforms_and_keeps_the_mean_lane():
     # per run in stage08b (not by re-warping each lane's session mean).
     assert '-prefix \\"stage08.gmrun.ses-02.task-t.run-1.nii$FMT\\"' in s
     assert '-prefix \\"stage08.gmrun.ses-02.task-t.run-1.src-sbref.nii$FMT\\"' in s
-    assert '-prefix "stage08.grandmean.src-sbref.nii$FMT"' in s
-    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    assert '-prefix \\"stage08.grandmean.src-sbref.nii$FMT\\"' in s
+    assert '-prefix \\"stage08.grandmean.nii$FMT\\"' in s
 
     # Both lanes' session means are built from their own runmeans.
     assert "stage07.runmean.ses-01.task-t.run-2.src-sbref.nii$FMT" in s
@@ -1249,13 +1249,13 @@ def test_coverage_lanes_are_built_from_moco_and_composite_by_their_own_rule():
         assert f'-save_{which} \\"${{mstem}}_{which}.nii$FMT\\"' in s
     # ...and each lane composites with its own reduction, not -mean for all.
     for lane, flag in (("src-max", "-max"), ("src-min", "-min")):
-        block = [b for b in s.split("ffs_util_3dmath") if f"sesmean.ses-01.{lane}" in b]
+        block = [ln for ln in s.splitlines() if f"sesmean.ses-01.{lane}" in ln and "-prefix" in ln]
         assert block and flag in block[0], lane
     # The min lane resamples linearly (its information is the zero boundary, which
     # wsinc5 rings across); every other lane keeps the sharp default.
     blocks = {
         lane: [
-            b for b in s.split("ffs_nwarp") if f'-prefix "stage07.runmean.${{FRAG[$k]}}{lane}' in b
+            ln for ln in s.splitlines() if f'-prefix \\"stage07.runmean.${{FRAG[$k]}}{lane}' in ln
         ]
         for lane in (".src-min", ".src-max")
     }
@@ -1287,7 +1287,7 @@ def test_grandmean_is_rebuilt_from_moco_space_in_one_interpolation():
     # the reference session needs no extra pass — its runmean already IS the image
     assert "stage08.gmrun.ses-01" not in s
     # and the grandmean is composited from runs, not from session means
-    gmean = [b for b in s.split("ffs_util_3dmath") if 'prefix "stage08.grandmean.nii' in b][0]
+    gmean = [ln for ln in s.splitlines() if 'prefix \\"stage08.grandmean.nii' in ln][0]
     assert "gmrun.ses-02" in gmean and "sesmean" not in gmean
 
 
@@ -1297,7 +1297,7 @@ def test_single_session_needs_no_grandmean_checkpoint():
     subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
     s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
     assert "stage08b" not in s and "gmrun" not in s
-    assert '-prefix "stage08.grandmean.nii$FMT"' in s
+    assert '-prefix \\"stage08.grandmean.nii$FMT\\"' in s
 
 
 # ---------------------------------------------------------------------------

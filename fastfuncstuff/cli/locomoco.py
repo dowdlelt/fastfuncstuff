@@ -26,13 +26,20 @@ see ``processing/locomoco.py`` for the method.
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_utils import add_device_arg, setup_device
+from fastfuncstuff.cli_utils import (
+    add_batch_args,
+    add_device_arg,
+    collect_batch_jobs,
+    run_batch_jobs,
+    setup_device,
+)
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -303,9 +310,8 @@ def create_parser() -> argparse.ArgumentParser:
     io.add_argument(
         "-input",
         "-i",
-        required=True,
         nargs="+",
-        help="4D motion-corrected NIfTI series. Pass ONE for normal single-echo use; pass "
+        help="4D motion-corrected NIfTI series [required unless -batch]. Pass ONE for normal single-echo use; pass "
         "SEVERAL (with -me_3depi and -echo_times) for multi-echo 3-D EPI — the echoes are "
         "jointly corrected by one shared partition-direction field scaled per echo.",
     )
@@ -330,8 +336,7 @@ def create_parser() -> argparse.ArgumentParser:
     io.add_argument(
         "-prefix",
         "-o",
-        required=True,
-        help="Output stem. A trailing .nii.gz/.nii.zst/.nii is stripped and sets the "
+        help="Output stem [required unless -batch]. A trailing .nii.gz/.nii.zst/.nii is stripped and sets the "
         "output format for the NIfTI outputs (default .nii.gz).",
     )
     io.add_argument(
@@ -1066,6 +1071,13 @@ def create_parser() -> argparse.ArgumentParser:
     add_device_arg(
         hw,
         extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
+    )
+    add_batch_args(
+        p,
+        tool="ffs_locomoco",
+        what="residual-motion estimates",
+        example="-input run1.nii.gz -prefix nlmoco_run1.nii.gz -pe_dir y",
+        skip_note="-prefix (its _warp and any -save_mean/-save_max/-save_min images)",
     )
     return p
 
@@ -1932,24 +1944,97 @@ def _run_multiecho(
     return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def _parse(argv: list[str]) -> argparse.Namespace:
+    """Parse one ffs_locomoco command line. Shared by the solo path and by every
+    -batch manifest line, so a batched run is byte-identical to a solo one."""
     from fastfuncstuff.processing.locomoco import normalize_axis_argv
 
-    raw = sys.argv[1:] if argv is None else argv
-    raw = normalize_axis_argv(
-        raw,
-        {
-            "-pe_dir",
-            "-pe_dir1",
-            "-pe",
-            "-pe_dir2",
-            "-partition_dir",
-            "-partition",
-            "-slice_axis",
-            "-slice",
-        },
+    return create_parser().parse_args(
+        normalize_axis_argv(
+            argv,
+            {
+                "-pe_dir",
+                "-pe_dir1",
+                "-pe",
+                "-pe_dir2",
+                "-partition_dir",
+                "-partition",
+                "-slice_axis",
+                "-slice",
+            },
+        )
     )
-    args = create_parser().parse_args(raw)
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    The warp is the estimate itself; the lane reductions are checked alongside it
+    because a working directory from before those flags existed has the warp but
+    not the images the next stage reads."""
+    if not args.prefix:
+        return []
+    stem, ext = _split_prefix(args.prefix)
+    outs = [f"{stem}_warp{ext}"]
+    for which in ("mean", "max", "min"):
+        if getattr(args, f"save_{which}", False):
+            outs.append(f"{stem}_locomoco_{which}{ext}")
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -input/-prefix."""
+    missing = [f for f in ("input", "prefix") if not getattr(run_args, f, None)]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw = sys.argv[1:] if argv is None else argv
+    args = _parse(raw)
+
+    if args.batch is not None or args.batch_run:
+        # A locomoco run is a real chunk of GPU work, but the flow backend's
+        # torch.compile warmup is paid per PROCESS — over a session's worth of
+        # runs that dominates. One process warms up once and reuses the kernels.
+        run_batch_jobs(
+            tool="ffs_locomoco",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=setup_device(args.device, tf32=REGISTRATION_TF32),
+            parse_line=lambda line: _parse(shlex.split(line)),
+            # _dispatch_run reports bad requests with a nonzero return, not an
+            # exception; the batch runner only counts raises, so translate.
+            dispatch=_dispatch_raising,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+        )
+        return 0
+
+    try:
+        _validate_batch_run(args)
+    except ValueError as exc:
+        print(
+            f"❌ {exc} (or use -batch FILE / -batch_run ARGS).",
+            file=sys.stderr,
+        )
+        return 2
+
+    return _dispatch_run(args, None)
+
+
+def _dispatch_raising(args: argparse.Namespace, device: torch.device) -> None:
+    rc = _dispatch_run(args, device)
+    if rc:
+        raise ValueError(f"run exited {rc}")
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
+    """Estimate one dataset's residual motion (the whole per-input body).
+
+    ``device`` is None on the solo path (resolve it here) and pre-resolved by the
+    batch runner, so the batch chooses a device once for all of its runs."""
     preset = _apply_preset(args)
 
     # Multi-echo 3-D EPI is a single 3-D-acquired solve, so (like -is_3dacq) the PE
@@ -2096,7 +2181,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
-    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    if device is None:
+        device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     stem, ext = _split_prefix(args.prefix)
 
