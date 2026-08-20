@@ -386,6 +386,12 @@ class SampleSet:
 
 
 _SAMPLE_DEFAULT_FRAC = 0.47  # AFNI 3dAllineate default: 47% of the in-mask voxels
+# Floor on the match-point count (3dAllineate.c:4378, applied there to explicit
+# -nmatch values too). A tight mask can put 47% at a few thousand points, which
+# is a needlessly noisy cost surface -- and on GPU it is free to fix, since the
+# refinement is launch-bound below ~300k points and a bigger sample costs the
+# same wall time. Clamped to the domain size, so small volumes just use it all.
+_SAMPLE_MIN_POINTS = 9999
 
 # Cap on rotation samples per axis in the joint coarse grid. Seed count goes as
 # n_rot^3, and the batched evaluation is launch-bound (so nearly free) up to
@@ -409,8 +415,9 @@ def _build_sample_set(
     fades the FOV edge); without a weight it falls back to nonzero base voxels.
     ``n_match`` is interpreted like 3dAllineate's npt_match but unit-free:
     ``<= 0`` -> default 47% of the domain; ``<= 1.0`` -> that *fraction* of the
-    domain (so 1.0 == all); ``> 1.0`` -> that many points (e.g. 150000).
-    Returns None if the domain is too small to bother subsampling.
+    domain (so 1.0 == all); ``> 1.0`` -> that many points (e.g. 150000). Every
+    path is then floored at ``_SAMPLE_MIN_POINTS`` and clamped to the domain,
+    as AFNI does. Returns None if the domain is too small to bother subsampling.
     """
     _, ny, nx = base_opt.shape
     if weight_opt is not None:
@@ -427,6 +434,7 @@ def _build_sample_set(
         budget = int(n_match * n_dom)
     else:
         budget = int(n_match)
+    budget = min(max(budget, _SAMPLE_MIN_POINTS), n_dom)
     if budget >= n_dom:
         idx_flat = domain
     else:

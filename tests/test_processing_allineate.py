@@ -1425,3 +1425,41 @@ class TestOptimizerAutoSelection:
     def test_explicit_choice_is_never_overridden(self, explicit):
         assert _pick_optimizer(explicit, 903_700, 11, 12) == explicit
         assert _pick_optimizer(explicit, 1, 1, 6) == explicit
+
+class TestMatchPointFloor:
+    """A tight mask must not put the cost on a handful of points (AFNI's 9999)."""
+
+    @staticmethod
+    def _domain_volume(n_vox: int, shape=(24, 24, 24)):
+        """A volume with exactly ``n_vox`` nonzero voxels."""
+        vol = torch.zeros(shape)
+        vol.reshape(-1)[:n_vox] = 1.0
+        return vol
+
+    def test_small_domain_is_floored_not_thinned(self):
+        from fastfuncstuff.processing.allineate import _SAMPLE_MIN_POINTS, _build_sample_set
+
+        n_dom = 12000
+        base = self._domain_volume(n_dom)
+        sample = _build_sample_set(base, None, (1.0, 1.0, 1.0), 0.0, "tohd", torch.device("cpu"))
+        assert sample is not None
+        # 47% of 12000 is 5640 -- the floor lifts it instead.
+        assert sample.idx_flat.numel() == _SAMPLE_MIN_POINTS
+
+    def test_floor_never_exceeds_the_domain(self):
+        from fastfuncstuff.processing.allineate import _build_sample_set
+
+        n_dom = 4000  # smaller than the floor
+        base = self._domain_volume(n_dom)
+        sample = _build_sample_set(base, None, (1.0, 1.0, 1.0), 0.0, "tohd", torch.device("cpu"))
+        assert sample is not None
+        assert sample.idx_flat.numel() == n_dom
+
+    def test_large_domain_keeps_the_47_percent_default(self):
+        from fastfuncstuff.processing.allineate import _SAMPLE_DEFAULT_FRAC, _build_sample_set
+
+        n_dom = 100_000
+        base = self._domain_volume(n_dom, shape=(50, 50, 50))
+        sample = _build_sample_set(base, None, (1.0, 1.0, 1.0), 0.0, "tohd", torch.device("cpu"))
+        assert sample is not None
+        assert sample.idx_flat.numel() == int(_SAMPLE_DEFAULT_FRAC * n_dom)
