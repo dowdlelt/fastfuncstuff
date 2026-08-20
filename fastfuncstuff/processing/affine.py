@@ -973,6 +973,34 @@ def sample_affine_at_points(
     return vals
 
 
+def batched_sample_bytes_per_point(interp: str, *, grad: bool = False) -> int:
+    """Peak bytes per (candidate, point) pair inside :func:`sample_affine_at_points_batched`.
+
+    Callers size their candidate chunk from this. The branches are not remotely
+    alike, and modelling them all with the grid_sample number is what OOM'd the
+    coarse search on a cubic run:
+
+    linear     : homogeneous coords (16) + normalized grid (12) + values and the
+                 out-of-bounds mask (~9), with gx/gy/gz freed at the stack.
+    separable  : homogeneous coords (16) plus the flat-coordinate working set of
+                 :func:`_separable_resample_3d` -- contiguous x/y/z copies (12),
+                 floor/round bases (12), in-bounds/tiny/heavy masks (3), the
+                 int64 survivor index (8), gathered survivor coords (12), the
+                 result (4) -- and values plus the mask (~9). The gather slab
+                 itself is chunked separately by ``_resample_chunk_size``.
+
+    ``grad`` is a different regime, not a correction factor. Nothing transient
+    can be freed: every gather chunk's saved tensors stay live until backward,
+    so the ``ntaps**2`` slab and the three int64 tap-index grids the forward
+    pass frees per chunk are all retained at once. Measured at 588 B/point for
+    cubic (17 trials x 1.22M points peaked at 12.2 GiB); 600 with a little
+    headroom.
+    """
+    if interp == "linear":
+        return 60 if grad else 45
+    return 600 if grad else 80
+
+
 def sample_affine_at_points_batched(
     source: Tensor,
     matrices: Tensor,
@@ -999,13 +1027,18 @@ def sample_affine_at_points_batched(
     sx, sy, sz = src[..., 0], src[..., 1], src[..., 2]  # (B, M)
 
     snz, sny, snx = source.shape
-    gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
-    gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
-    gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
 
     if interp == "linear":
+        # Normalized grid coords are grid_sample's alone -- building them for the
+        # separable branch too cost three (B, M) float tensors nobody reads,
+        # which at coarse-search batch sizes is gigabytes.
+        gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
+        gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
+        gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
         grid = torch.stack([gx, gy, gz], dim=-1).view(1, B, M, 1, 3)
+        del gx, gy, gz
         vals = _grid_sample_3d(source[None, None], grid).reshape(B, M)
+        del grid
     else:
         vals = _separable_resample_3d(source, sx, sy, sz, interp).reshape(B, M)
 

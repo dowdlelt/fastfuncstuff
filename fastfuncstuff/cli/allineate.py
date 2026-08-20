@@ -498,6 +498,18 @@ Examples:
     search_group.add_argument(
         "-noautocrop", action="store_true", help="Disable auto-cropping of zero margins"
     )
+    search_group.add_argument(
+        "-work_dxyz",
+        "-work-dxyz",
+        default="auto",
+        metavar="auto|off|MM",
+        help="Voxel size (mm) the SEARCH runs at. 'auto' (default) uses the "
+        "coarser of the base and source spacings -- aligning a 3 mm EPI on a "
+        "1 mm anat grid costs 27x the voxels and resolves nothing the EPI does "
+        "not; 'off' searches on the base's own grid; a number forces that "
+        "spacing. The fit is mapped back exactly, so the saved matrix and the "
+        "output volume are on the base grid either way.",
+    )
 
     # --- Speed/quality presets ---
     speed_group = parser.add_argument_group("Speed/quality")
@@ -573,6 +585,26 @@ Examples:
 
     args = parser.parse_args(argv)
     return args
+
+
+def _parse_work_dxyz(value: str | float | None) -> str | float:
+    """``-work_dxyz`` -> what AffineAlignConfig wants: "auto", "off", or mm."""
+    if value is None:
+        return "auto"
+    if isinstance(value, (int, float)):
+        return float(value)
+    v = value.strip().lower()
+    if v in ("auto", "off", "none"):
+        return v
+    try:
+        mm = float(v)
+    except ValueError:
+        raise SystemExit(
+            f"-work_dxyz: expected auto, off, or a size in mm, got {value!r}"
+        ) from None
+    if mm <= 0:
+        raise SystemExit(f"-work_dxyz: size must be positive, got {mm}")
+    return mm
 
 
 def _select_device(device_arg: str | None) -> torch.device:
@@ -807,6 +839,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         source_automask=args.source_automask,
         autoweight=not args.noautoweight,
         autocrop=not args.noautocrop,
+        work_dxyz=_parse_work_dxyz(args.work_dxyz),
         device=str(device),
         verb=verb,
     )

@@ -211,13 +211,11 @@ def get_available_memory(
         Fraction of available memory to use (0 < safety_factor <= 1).
         If None, uses config defaults (0.5 for GPU, 0.75 for CPU).
     empty_cache : bool, default True
-        Release the CUDA caching allocator's free blocks before reading
-        ``memory_reserved`` so ``total - reserved`` reflects truly-free memory.
-        This forces a device sync and churns the allocator, so hot paths that
-        size a chunk on *every* call (e.g. the separable resampler) should pass
-        ``False``: skipping it leaves cached-but-free blocks counted in
-        ``reserved``, which only ever *underestimates* free memory (smaller,
-        safe chunks) since a new allocation can still reuse the reserved pool.
+        Release the CUDA caching allocator's free blocks before measuring, so
+        the driver sees them as free. This forces a device sync and churns the
+        allocator, so hot paths that size a chunk on *every* call (e.g. the
+        separable resampler) should pass ``False``; the figure stays correct
+        either way, since cached-but-unallocated blocks are added back below.
 
     Returns
     -------
@@ -226,7 +224,9 @@ def get_available_memory(
 
     Notes
     -----
-    - For GPU: Returns free GPU memory * gpu_safety_factor (default 50%)
+    - For GPU: free memory as the *driver* reports it (so memory held by other
+      processes on the card is excluded), plus this process's cached-but-
+      unallocated blocks, times gpu_safety_factor (default 50%)
     - For CPU: Queries actual system RAM via psutil, uses cpu_safety_factor (default 75%)
     - For MPS: Uses unified memory estimate based on system RAM
     """
@@ -238,9 +238,18 @@ def get_available_memory(
         try:
             if empty_cache:
                 torch.cuda.empty_cache()
+            # ``total - reserved`` counts memory that OTHER processes hold as
+            # ours to spend -- on a shared card that silently overstates free
+            # VRAM by however much they use, and every chunk sized from it is
+            # too big (bug-of-record: allineate's coarse search OOM'd at a
+            # modelled-correct chunk because 1.5 GiB belonged to another job).
+            # The driver's figure is the truth about other processes; our own
+            # cached-but-unallocated blocks are excluded from it yet are
+            # reusable, so add them back.
+            driver_free, _total = torch.cuda.mem_get_info(device)
             reserved = torch.cuda.memory_reserved(device)
-            total = torch.cuda.get_device_properties(device).total_memory
-            free = total - reserved
+            allocated = torch.cuda.memory_allocated(device)
+            free = driver_free + max(0, reserved - allocated)
             return int(free * safety_factor)
         except Exception:
             return 2 * 1024**3
@@ -732,6 +741,37 @@ def compute_moco_resample_batch_size(
     return batch_size
 
 
+# Points in flight needed to keep one streaming multiprocessor at its peak
+# rate for these element-wise gather/reduce kernels. Hardware-relative on
+# purpose: 30M points saturated a 70-SM RTX 5070 Ti (the size the coarse search
+# used before it was sized from a memory model alone), and the figure that
+# transfers to a bigger or smaller GPU is the per-SM one, not the total.
+_SATURATING_POINTS_PER_SM = 430_000
+# CPU has no SM count; a few hundred thousand points per core is where the
+# per-element kernels stop being loop-overhead-bound.
+_SATURATING_POINTS_PER_CORE = 300_000
+
+
+def saturating_point_count(device: torch.device) -> int:
+    """Points in one batched launch past which the device is already at peak.
+
+    Sizing a batch purely by free memory answers "what fits", which on an idle
+    large-VRAM card is far more than "what the GPU can use at once". This is the
+    second bound, and it scales with the device's parallelism the way the memory
+    bound scales with its VRAM.
+    """
+    if device.type == "cuda":
+        try:
+            sms = torch.cuda.get_device_properties(device).multi_processor_count
+        except Exception:
+            sms = 32
+        return int(sms) * _SATURATING_POINTS_PER_SM
+    if device.type == "mps":
+        # No queryable core count; MPS is a small-GPU regime, so assume one.
+        return 16 * _SATURATING_POINTS_PER_SM
+    return max(1, os.cpu_count() or 1) * _SATURATING_POINTS_PER_CORE
+
+
 def compute_registration_candidate_batch_size(
     n_points: int,
     n_candidates: int,
@@ -739,18 +779,38 @@ def compute_registration_candidate_batch_size(
     *,
     bytes_per_point: int = 52,
     max_batch_size: int = 4096,
+    max_points: int | None = None,
 ) -> int:
     """Plan a batch of affine candidates evaluated over spatial points.
 
     ``bytes_per_point`` covers candidate-specific coordinates, sampling grids,
-    interpolated values, and backend scratch. Available memory and safety
-    factors come from this module so registration shares the global policy.
+    interpolated values, and backend scratch; see
+    ``processing/affine.py:batched_sample_bytes_per_point`` for the per-interp
+    model. Available memory and safety factors come from this module so
+    registration shares the global policy.
+
+    ``batch * n_points`` is additionally capped at ``max_points``, which
+    defaults to :func:`saturating_point_count` for the device. The memory bound
+    alone would spend a whole idle card on a single launch, and that is not the
+    binding constraint: a batch large enough to fill every SM already runs at
+    the device's peak rate, so the doublings past it buy no throughput and only
+    make the peak fragile against whatever else lands on the GPU mid-run. Both
+    bounds scale with the hardware -- the memory one with VRAM, this one with
+    the parallelism there is to fill.
     """
     if n_points < 1 or n_candidates < 1:
         return 1
     available = get_available_memory(device)
     per_candidate = max(1, n_points * bytes_per_point)
-    return max(1, min(n_candidates, max_batch_size, available // per_candidate))
+    return max(
+        1,
+        min(
+            n_candidates,
+            max_batch_size,
+            max(1, (max_points or saturating_point_count(device)) // n_points),
+            available // per_candidate,
+        ),
+    )
 
 
 def estimate_nonlinear_memory_bytes(
