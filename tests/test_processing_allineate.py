@@ -1426,6 +1426,91 @@ class TestOptimizerAutoSelection:
         assert _pick_optimizer(explicit, 903_700, 11, 12) == explicit
         assert _pick_optimizer(explicit, 1, 1, 6) == explicit
 
+
+class TestWorkGrid:
+    """The search runs on the coarser of the two grids; the fit maps back exactly."""
+
+    @staticmethod
+    def _headers(base_mm, src_mm):
+        base_aff = np.diag([base_mm, base_mm, base_mm, 1.0])
+        src_aff = np.diag([src_mm, src_mm, src_mm, 1.0])
+        return {"affine": base_aff}, {"affine": src_aff}
+
+    def test_decimates_to_the_coarser_source(self):
+        from fastfuncstuff.processing.allineate import _plan_work_grid
+
+        base = _sphere_volume((40, 40, 40), center=(20, 20, 20), radius=8)
+        bh, sh = self._headers(1.0, 2.0)
+        work, work_header, full_to_work = _plan_work_grid(
+            base, bh, sh, "auto", torch.device("cpu"), verb=0
+        )
+        assert full_to_work is not None
+        assert work.shape == (20, 20, 20)
+        assert np.allclose(np.diag(work_header["affine"])[:3], 2.0)
+
+    def test_no_op_when_the_source_is_not_coarser(self):
+        from fastfuncstuff.processing.allineate import _plan_work_grid
+
+        base = _sphere_volume((32, 32, 32), center=(16, 16, 16), radius=6)
+        bh, sh = self._headers(1.0, 1.0)
+        work, work_header, full_to_work = _plan_work_grid(
+            base, bh, sh, "auto", torch.device("cpu"), verb=0
+        )
+        assert full_to_work is None
+        assert work is base and work_header is bh
+
+    def test_never_upsamples_an_already_coarse_base(self):
+        from fastfuncstuff.processing.allineate import _plan_work_grid
+
+        base = _sphere_volume((32, 32, 32), center=(16, 16, 16), radius=6)
+        bh, sh = self._headers(3.0, 1.0)  # base coarser than source
+        _, _, full_to_work = _plan_work_grid(base, bh, sh, "auto", torch.device("cpu"), verb=0)
+        assert full_to_work is None
+
+    def test_mapping_back_is_exact(self):
+        """A fit found on the work grid must mean the same mm-space transform.
+
+        This is the whole premise: decimating the base changes what the search
+        costs, never what the answer is. Take a known base->source voxel map on
+        the work grid, carry it back with ``full_to_work``, and both must convert
+        to the same DICOM matrix.
+        """
+        from fastfuncstuff.processing.affine import voxel_matrix_to_dicom
+        from fastfuncstuff.processing.allineate import _plan_work_grid
+
+        base = _sphere_volume((40, 40, 40), center=(20, 20, 20), radius=8)
+        bh, sh = self._headers(1.0, 2.0)
+        _, work_header, full_to_work = _plan_work_grid(
+            base, bh, sh, "auto", torch.device("cpu"), verb=0
+        )
+        m_work = torch.eye(4)
+        m_work[0, 3], m_work[1, 3], m_work[2, 3] = 1.5, -0.75, 0.25  # work voxels
+        m_full = m_work @ full_to_work
+
+        d_work = voxel_matrix_to_dicom(m_work, work_header["affine"], sh["affine"])
+        d_full = voxel_matrix_to_dicom(m_full, bh["affine"], sh["affine"])
+        assert torch.allclose(d_work, d_full, atol=1e-4)
+
+    def test_output_stays_on_the_callers_grid(self):
+        base = _sphere_volume((32, 32, 32), center=(16, 16, 16), radius=7)
+        source = _sphere_volume((16, 16, 16), center=(8, 8, 8), radius=3.5)
+        bh, sh = self._headers(1.0, 2.0)
+        cfg = AffineAlignConfig(
+            cost="ls",
+            dof="rigid",
+            twopass=False,
+            powell_maxfev=0,
+            adam_iters_1x=10,
+            adam_iters_2x=5,
+            autocrop=False,
+            autoweight=False,
+            verb=0,
+        )
+        matrix, warped = allineate(base, source, config=cfg, base_header=bh, source_header=sh)
+        assert warped.shape == base.shape
+        assert matrix.shape == (4, 4)
+
+
 class TestMatchPointFloor:
     """A tight mask must not put the cost on a handful of points (AFNI's 9999)."""
 

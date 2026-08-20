@@ -35,7 +35,9 @@ from .affine import (
     apply_affine_interp,
     apply_affine_wsinc5,
     batched_sample_bytes_per_point,
+    grid_from_dxyz,
     identity_params,
+    matrix_to_params,
     params_to_matrix,
     params_to_matrix_batched,
     sample_affine_at_points,
@@ -169,6 +171,11 @@ class AffineAlignConfig:
 
     # Cropping
     autocrop: bool = True  # crop zero margins from base for optimization
+
+    # Optimisation grid resolution, in mm. "auto" runs the search on the coarser
+    # of the two images' voxel sizes, "off" always uses the base's own grid, and
+    # a number forces that spacing. See _plan_work_grid.
+    work_dxyz: str | float = "auto"
 
     # Device
     device: str | None = None
@@ -2140,6 +2147,7 @@ def _refine_progressive(
     device: torch.device,
     verb: int = 1,
     sample: SampleSet | None = None,
+    skip_blur: bool = False,
 ) -> tuple[np.ndarray, float]:
     """Progressive multi-resolution refinement: Adam (GPU) + Powell polish.
 
@@ -2204,7 +2212,10 @@ def _refine_progressive(
     # for ≳300k points), so a per-stage point ramp bought no speed and only made
     # the blur trajectories noisier (changing how many trials survived dedup).
     stages: list[tuple[float, int, float, bool]] = []
-    if min(base.shape) > 16:
+    if min(base.shape) > 16 and not skip_blur:
+        # ``skip_blur``: the ladder already ran the basin-widening stage on the
+        # coarse work grid, and re-running it here would throw away that answer's
+        # precision before the sharp stage ever sees it.
         stages.append((2.0, config.adam_iters_2x, config.adam_lr_2x, True))
     stages.append((0.0, config.adam_iters_1x, config.adam_lr, False))
 
@@ -2394,56 +2405,132 @@ def _compute_grid_matrix(
     return source_xyz2ijk @ base_ijk2xyz
 
 
+def _plan_work_grid(
+    base: Tensor,
+    base_header: dict | None,
+    source_header: dict | None,
+    spec: str | float,
+    device: torch.device,
+    verb: int,
+) -> tuple[Tensor, dict | None, Tensor | None]:
+    """Choose the grid the optimisation runs on: never finer than either image.
+
+    The alignment used to run on the base's grid unconditionally, which for the
+    usual cross-modal case (1 mm anat base, 1.6-3 mm EPI source) means
+    *upsampling* the EPI by 4-30x in voxel count and then paying for every cost
+    evaluation at that inflated size. It buys nothing: interpolation invents no
+    detail, and the transform can only be constrained by structure both images
+    actually resolve, i.e. by the coarser of the two.
+
+    So the search runs on a grid at the coarser spacing -- same FOV, same centre,
+    same orientation (``affine.py:grid_from_dxyz``), only fewer samples -- and
+    the fit is mapped back afterwards. That mapping is exact, not an
+    approximation: the returned ``full_to_work`` right-multiplies the fitted
+    matrix, whose *source* side is native-source voxels either way, so the final
+    matrix, the reported DICOM parameters and the output volume are all in the
+    caller's original base grid. When the two images already match in resolution
+    (two hi-res anatomicals) nothing is decimated and this is a no-op.
+
+    Returns ``(base_for_optimisation, header_for_it, full_to_work)``, with
+    ``full_to_work`` None when the base grid is used as-is.
+    """
+    if base_header is None or source_header is None or "affine" not in base_header:
+        return base, base_header, None
+    if isinstance(spec, str) and spec.lower() in ("off", "none", "0"):
+        return base, base_header, None
+
+    base_vox = np.asarray(_voxdims_from_header(base_header), dtype=np.float64)
+    if isinstance(spec, str):
+        # The source's *finest* axis, not its coarsest: a 1.6x1.6x3 mm EPI still
+        # resolves 1.6 mm in-plane, and throwing that away to match the slice
+        # direction would cost real alignment accuracy.
+        target = float(min(_voxdims_from_header(source_header)))
+    else:
+        target = float(spec)
+
+    # Never upsample: an axis already coarser than the target keeps its spacing.
+    dxyz = np.maximum(base_vox, target)
+    if np.all(dxyz <= base_vox * 1.05):
+        return base, base_header, None
+
+    work_affine, work_shape = grid_from_dxyz(base_header["affine"], tuple(base.shape), dxyz)
+    if min(work_shape) < 16:
+        # Degenerate grid (a very thin slab, or a nonsense -work_dxyz); the
+        # search needs enough samples for the blok lattice to mean anything.
+        return base, base_header, None
+
+    # Anti-alias before decimating -- lpc reads local structure, and aliased
+    # high-frequency detail is exactly the kind of false structure it latches on
+    # to. Sigma is per-axis in *base* voxels, so an anisotropic base is handled.
+    factors = dxyz / base_vox
+    sigma_xyz = tuple(float(max(0.0, 0.5 * (f - 1.0))) for f in factors)
+    smoothed = (
+        _separable_smooth_3d(base, (sigma_xyz[2], sigma_xyz[1], sigma_xyz[0]))
+        if max(sigma_xyz) > 0.0
+        else base
+    )
+    work_to_full = _compute_grid_matrix(base_header["affine"], work_affine, device)
+    base_work = apply_affine(smoothed, work_to_full, work_shape, zero_outside=True)
+
+    work_header = dict(base_header)
+    work_header["affine"] = work_affine
+    full_to_work = _compute_grid_matrix(work_affine, base_header["affine"], device)
+
+    if verb >= 1:
+        d = ", ".join(f"{v:.2f}" for v in dxyz)
+        print(
+            f"Optimisation grid: {tuple(base.shape)} -> {work_shape} at ({d}) mm "
+            f"({base.numel() / max(1, int(np.prod(work_shape))):.1f}x fewer voxels)"
+        )
+    return base_work, work_header, full_to_work
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
 
-def allineate(
-    base: Tensor,
-    source: Tensor,
-    config: AffineAlignConfig | None = None,
-    base_header: dict | None = None,
-    source_header: dict | None = None,
-    save_automask_path: str | None = None,
-    save_cmass_path: str | None = None,
-    save_weight_path: str | None = None,
-) -> tuple[Tensor, Tensor]:
-    """GPU-accelerated affine/rigid alignment.
+@dataclass
+class _GridSetup:
+    """Everything the search needs, built for one optimisation grid.
 
-    Aligns source to base using a 3-stage pipeline:
-      1. Center-of-mass pre-alignment
-      2. GPU-parallel coarse rotation search
-      3. Progressive refinement (Adam GPU + Powell polish)
-
-    Args:
-        base: (nz, ny, nx) base/reference image.
-        source: (nz, ny, nx) source/moving image.
-        config: Alignment configuration.
-        base_header: Header info from load_image.
-        source_header: Header info from load_image.
-        save_automask_path: If set, save the computed automask here.
-        save_cmass_path: If set, save the source positioned by the cmass shift
-            alone (no rotation/scale), on the base grid — lets you eyeball the
-            initial placement and reproduce it with config.cmass_direct.
-
-    Returns:
-        (matrix, warped):
-            matrix: (4, 4) affine mapping base voxels → source (native) voxels.
-            warped: the aligned source image on the base grid.
+    Built once normally, twice when the resolution ladder runs (see
+    _plan_work_grid): the coarse pass and the blurred refinement on the work
+    grid, the final sharp stage on the base's own grid. Which is why this is a
+    function and not 200 lines inline -- the two grids must be prepared by
+    exactly the same code, or the fit carried between them means different
+    things on either side.
     """
-    if config is None:
-        config = AffineAlignConfig()
 
-    if config.device is not None:
-        device = torch.device(config.device)
-    else:
-        device = base.device
+    base: Tensor
+    base_opt: Tensor
+    source_opt: Tensor
+    weight: Tensor | None
+    weight_opt: Tensor | None
+    align_matrix: Tensor
+    crop_offset: tuple[int, int, int] | None
+    ctx: CostContext
+    voxdims: tuple[float, float, float]
+    bounds: np.ndarray
+    sample: SampleSet | None
+    init_params: Tensor
 
-    base = base.to(device)
-    source_native = source.to(device)
-    verb = config.verb
 
+def _prepare_grid(
+    base: Tensor,
+    base_header: dict | None,
+    source_native: Tensor,
+    source_header: dict | None,
+    config: AffineAlignConfig,
+    device: torch.device,
+    verb: int,
+    *,
+    save_automask_path: str | None = None,
+    save_weight_path: str | None = None,
+    force_cross_grid: bool = False,
+) -> _GridSetup:
+    """Resample the source onto ``base``'s grid and build the cost machinery."""
+    source_native = source_native.to(device)
     # Pre-resample the source onto the base grid, folding in the center-of-mass
     # (or manual) shift BEFORE resampling. Computing the shift on the native
     # volumes and baking it into the base→source map is what makes very different
@@ -2458,11 +2545,15 @@ def allineate(
     grid_matrix = None
     source_validity = None
     cross_grid = (
-        base_header is not None and source_header is not None and source.shape != base.shape
+        base_header is not None and source_header is not None and source_native.shape != base.shape
     )
+    if force_cross_grid:
+        # A decimated base is a different grid from the source by construction,
+        # even in the rare case the shapes happen to match.
+        cross_grid = True
     if cross_grid:
         if verb >= 1:
-            print(f"Resampling source {source.shape} to base grid {base.shape}")
+            print(f"Resampling source {source_native.shape} to base grid {base.shape}")
         grid_matrix = _compute_grid_matrix(source_header["affine"], base_header["affine"], device)
 
     cmass_shift = np.zeros(3)
@@ -2560,18 +2651,9 @@ def allineate(
         print(f"Allineate: {config.dof} alignment, cost={config.cost}")
         print(f"  Base shape: {base.shape}, device: {device}")
 
-    # Free source_native from GPU during optimization — it's only needed
-    # for final resampling. Can be large (e.g., 320³ anat = 131 MB).
-    if source_native.shape != base.shape:
-        source_native = source_native.cpu()
-
     # Auto-crop: remove zero margins for faster optimization
     # We optimize on the cropped grid, then adjust the final matrix
     crop_offset = None
-    _base_full = base
-    _source_on_base_full = source_on_base
-    _weight_full = weight
-
     if config.autocrop:
         base_crop, source_crop, weight_crop, offset = _crop_volumes(base, source_on_base, weight)
         if base_crop.shape != base.shape:
@@ -2670,6 +2752,99 @@ def allineate(
             print(
                 f"  Match-point subsampling: {sample.idx_flat.numel()} points (of {n_dom} in domain)"
             )
+    return _GridSetup(
+        base=base,
+        base_opt=base_opt,
+        source_opt=source_opt,
+        weight=weight,
+        weight_opt=weight_opt,
+        align_matrix=align_matrix,
+        crop_offset=crop_offset,
+        ctx=ctx,
+        voxdims=voxdims,
+        bounds=bounds,
+        sample=sample,
+        init_params=init_params,
+    )
+
+
+def allineate(
+    base: Tensor,
+    source: Tensor,
+    config: AffineAlignConfig | None = None,
+    base_header: dict | None = None,
+    source_header: dict | None = None,
+    save_automask_path: str | None = None,
+    save_cmass_path: str | None = None,
+    save_weight_path: str | None = None,
+) -> tuple[Tensor, Tensor]:
+    """GPU-accelerated affine/rigid alignment.
+
+    Aligns source to base using a 3-stage pipeline:
+      1. Center-of-mass pre-alignment
+      2. GPU-parallel coarse rotation search
+      3. Progressive refinement (Adam GPU + Powell polish)
+
+    Args:
+        base: (nz, ny, nx) base/reference image.
+        source: (nz, ny, nx) source/moving image.
+        config: Alignment configuration.
+        base_header: Header info from load_image.
+        source_header: Header info from load_image.
+        save_automask_path: If set, save the computed automask here.
+        save_cmass_path: If set, save the source positioned by the cmass shift
+            alone (no rotation/scale), on the base grid — lets you eyeball the
+            initial placement and reproduce it with config.cmass_direct.
+
+    Returns:
+        (matrix, warped):
+            matrix: (4, 4) affine mapping base voxels → source (native) voxels.
+            warped: the aligned source image on the base grid.
+    """
+    if config is None:
+        config = AffineAlignConfig()
+
+    if config.device is not None:
+        device = torch.device(config.device)
+    else:
+        device = base.device
+
+    base = base.to(device)
+    source_native = source.to(device)
+    verb = config.verb
+
+    # Everything below optimises on ``base``; ``base_out`` is what the caller
+    # asked for and what the output is written on. They differ when the source is
+    # the coarser image -- see _plan_work_grid.
+    base_out, base_header_out = base, base_header
+    base, base_header, full_to_work = _plan_work_grid(
+        base, base_header, source_header, config.work_dxyz, device, verb
+    )
+
+    setup = _prepare_grid(
+        base,
+        base_header,
+        source_native,
+        source_header,
+        config,
+        device,
+        verb,
+        # With the ladder on, the diagnostics describe the final (base-grid)
+        # pass, not the coarse one, so they are written by the second prep.
+        save_automask_path=None if full_to_work is not None else save_automask_path,
+        save_weight_path=None if full_to_work is not None else save_weight_path,
+        force_cross_grid=full_to_work is not None,
+    )
+    base_opt, source_opt, weight_opt = setup.base_opt, setup.source_opt, setup.weight_opt
+    weight = setup.weight
+    ctx, voxdims, bounds, sample = setup.ctx, setup.voxdims, setup.bounds, setup.sample
+    init_params = setup.init_params
+    cost_name = ctx.name
+
+    # Free source_native from GPU during optimization — it's only needed for the
+    # final resample. Can be large (e.g., 320³ anat = 131 MB).
+    if source_native.shape != base.shape:
+        source_native = source_native.cpu()
 
     # Stage 2: coarse search to seed the refinement.
     if not config.twopass:
@@ -2763,26 +2938,99 @@ def allineate(
     )
 
     # Build final matrix — adjust for crop offset if needed.
-    def _residual_to_final(residual: Tensor) -> Tensor:
-        """Map a cropped-base→cropped-source residual to the full base→native pull.
+    def _crop_conj(residual: Tensor, offset, forward: bool = True) -> Tensor:
+        """Move a residual between cropped-base and full-base voxel coordinates.
 
         The residual maps cropped-base voxels → cropped-source voxels. Source was
         cropped identically, so undo the crop by conjugating with the offset
-        (full_base_voxel = crop_base_voxel + offset → T(+off) @ M @ T(-off)), then
-        compose ``align_matrix`` — the base→source map that already carries the
-        cmass shift the source was resampled through.
+        (full_base_voxel = crop_base_voxel + offset → T(+off) @ M @ T(-off)).
+        ``forward=False`` conjugates the other way, which is how a fit from one
+        grid is handed to another grid's (differently cropped) refinement.
         """
-        if crop_offset is not None:
-            x_off, y_off, z_off = crop_offset
-            T_pos = torch.eye(4, device=device, dtype=torch.float32)
-            T_neg = torch.eye(4, device=device, dtype=torch.float32)
-            T_pos[0, 3], T_pos[1, 3], T_pos[2, 3] = float(x_off), float(y_off), float(z_off)
-            T_neg[0, 3], T_neg[1, 3], T_neg[2, 3] = float(-x_off), float(-y_off), float(-z_off)
-            residual = T_pos @ residual @ T_neg
-        return align_matrix @ residual
+        if offset is None:
+            return residual
+        x_off, y_off, z_off = offset
+        sign = 1.0 if forward else -1.0
+        T_pos = torch.eye(4, device=device, dtype=torch.float32)
+        T_neg = torch.eye(4, device=device, dtype=torch.float32)
+        T_pos[0, 3], T_pos[1, 3], T_pos[2, 3] = (
+            sign * float(x_off),
+            sign * float(y_off),
+            sign * float(z_off),
+        )
+        T_neg[0, 3], T_neg[1, 3], T_neg[2, 3] = (
+            -sign * float(x_off),
+            -sign * float(y_off),
+            -sign * float(z_off),
+        )
+        return T_pos @ residual @ T_neg
+
+    def _residual_to_final(residual: Tensor, stp: _GridSetup, to_base: Tensor | None) -> Tensor:
+        """Cropped residual on ``stp``'s grid → the caller's base→native pull.
+
+        ``align_matrix`` is the base→source map that already carries the cmass
+        shift the source was resampled through. ``to_base`` (full base voxel →
+        work voxel) undoes a decimated optimisation grid: the source side of the
+        matrix is native voxels either way, so only the base side needs mapping,
+        and right-multiplying does it exactly.
+        """
+        final = stp.align_matrix @ _crop_conj(residual, stp.crop_offset)
+        return final if to_base is None else final @ to_base
 
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
-    final_matrix = _residual_to_final(params_to_matrix(best_t))
+    final_matrix = _residual_to_final(params_to_matrix(best_t), setup, full_to_work)
+
+    if full_to_work is not None:
+        # --- resolution ladder, second rung ---------------------------------
+        # The coarse search and the basin-widening stage ran on the work grid,
+        # which is all they need: they are looking for the right *basin*. The
+        # sharp stage is what sets the final precision, and it is worth the
+        # base's own resolution -- measured on a 1 mm anat / 1.6 mm EPI pair,
+        # finishing on the work grid cost 1.6% of the full-resolution lpc while
+        # finishing here costs a few seconds. Same prep code on both rungs, so
+        # the fit means the same thing on either side of the hand-off.
+        if verb >= 1:
+            print(f"Final stage at base resolution {tuple(base_out.shape)}:")
+        setup = _prepare_grid(
+            base_out,
+            base_header_out,
+            source_native,
+            source_header,
+            config,
+            device,
+            verb,
+            save_automask_path=save_automask_path,
+            save_weight_path=save_weight_path,
+        )
+        residual_f = _crop_conj(
+            torch.linalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
+        )
+        best_params_phys, best_refine_cost = _refine_progressive(
+            setup.base_opt,
+            setup.source_opt,
+            setup.weight_opt,
+            [matrix_to_params(residual_f).cpu().numpy()],
+            config,
+            setup.ctx,
+            setup.voxdims,
+            setup.bounds,
+            device,
+            verb,
+            sample=setup.sample,
+            skip_blur=True,
+        )
+        best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
+        final_matrix = _residual_to_final(params_to_matrix(best_t), setup, None)
+        # Downstream (the final-cost report) now reads the base grid directly.
+        base, weight, ctx, voxdims, sample = (
+            setup.base,
+            setup.weight,
+            setup.ctx,
+            setup.voxdims,
+            setup.sample,
+        )
+        init_params, full_to_work = setup.init_params, None
+        source_native = source_native.to(device)
 
     # AFNI-style final-fit parameter report. The final matrix is voxel base->
     # source; convert to AFNI DICOM mm when both affines are known so the numbers
@@ -2790,9 +3038,9 @@ def allineate(
     if verb >= 1:
         from .affine import decompose_affine_sdu, format_final_fit_params, voxel_matrix_to_dicom
 
-        if base_header is not None and source_header is not None:
+        if base_header_out is not None and source_header is not None:
             m_report = voxel_matrix_to_dicom(
-                final_matrix, base_header["affine"], source_header["affine"]
+                final_matrix, base_header_out["affine"], source_header["affine"]
             )
             space = "DICOM mm"
         else:
@@ -2811,20 +3059,22 @@ def allineate(
     if save_cmass_path is not None:
         from .io import save_image
 
-        cmass_final = _residual_to_final(params_to_matrix(init_params))
+        cmass_final = _residual_to_final(params_to_matrix(init_params), setup, full_to_work)
         if config.final_interp == "wsinc5":
-            cmass_warped = apply_affine_wsinc5(source_native, cmass_final, base.shape)
+            cmass_warped = apply_affine_wsinc5(source_native, cmass_final, base_out.shape)
         else:
-            cmass_warped = apply_affine(source_native, cmass_final, base.shape, zero_outside=True)
-        save_image(cmass_warped, save_cmass_path, header_info=base_header)
+            cmass_warped = apply_affine(
+                source_native, cmass_final, base_out.shape, zero_outside=True
+            )
+        save_image(cmass_warped, save_cmass_path, header_info=base_header_out)
         if verb >= 1:
             print(f"  Saved cmass-shifted source: {save_cmass_path}")
     if config.final_interp == "wsinc5":
         if verb >= 1:
             print("Applying final wsinc5 interpolation...")
-        warped = apply_affine_wsinc5(source_native, final_matrix, base.shape)
+        warped = apply_affine_wsinc5(source_native, final_matrix, base_out.shape)
     else:
-        warped = apply_affine(source_native, final_matrix, base.shape, zero_outside=True)
+        warped = apply_affine(source_native, final_matrix, base_out.shape, zero_outside=True)
 
     if verb >= 1:
         # For blok costs, report the in-mask cost the optimiser actually achieved
@@ -2835,7 +3085,19 @@ def allineate(
         if cost_name in _BLOK_COSTS and sample is not None:
             print(f"Final cost ({config.cost}, in-mask): {best_refine_cost:.6f}")
         else:
-            final_cost = _compute_cost(base, warped, weight, ctx, voxdims)
+            # Scored on the optimisation grid, where `weight` and `voxdims` live;
+            # re-warping there costs one linear resample of a small volume.
+            cost_warped = (
+                warped
+                if full_to_work is None
+                else apply_affine(
+                    source_native,
+                    final_matrix @ torch.linalg.inv(full_to_work),
+                    base.shape,
+                    zero_outside=True,
+                )
+            )
+            final_cost = _compute_cost(base, cost_warped, weight, ctx, voxdims)
             print(f"Final cost: {final_cost.item():.6f}")
 
     return final_matrix, warped
