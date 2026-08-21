@@ -55,6 +55,7 @@ def _run_with_followers(tmp_path, follower_affine, follower_shape_factor):
             "-source_follower", str(tmp_path / "fol.nii"),
             "-follower_prefix", str(tmp_path / "out_fol.nii"),
             "-device", "cpu",
+            "-final", "linear",
             "-fast",
             "-verb", "0",
         ]

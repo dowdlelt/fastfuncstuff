@@ -359,9 +359,9 @@ Examples:
     interp_group.add_argument(
         "-final",
         choices=["linear", "cubic", "wsinc5"],
-        default="linear",
+        default="wsinc5",
         dest="final_interp",
-        help="For output image (default: linear). wsinc5 gives sharpest results",
+        help="For output image (default: wsinc5). Use linear for compatibility/speed",
     )
     interp_group.add_argument(
         "-no_neg",

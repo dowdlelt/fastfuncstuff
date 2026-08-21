@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from fastfuncstuff.processing.spacetime import (
@@ -41,7 +42,14 @@ def _linear_interp_series(series: torch.Tensor, t: float) -> float:
 
 def test_temporal_kernel_weights_support_and_symmetry():
     d = torch.linspace(-10, 10, 401)
-    for method, half in (("linear", 1), ("cubic", 2), ("wsinc5", 5), ("wsinc9", 9)):
+    for method, half in (
+        ("linear", 1),
+        ("cubic", 2),
+        ("quintic", 3),
+        ("heptic", 4),
+        ("wsinc5", 5),
+        ("wsinc9", 9),
+    ):
         w = temporal_kernel_weights(d, method)
         # zero outside the support
         assert torch.all(w[d.abs() >= half] == 0.0)
@@ -52,6 +60,15 @@ def test_temporal_kernel_weights_support_and_symmetry():
         assert abs(float(temporal_kernel_weights(torch.tensor([0.0]), method)) - 1.0) < 1e-6
         for k in range(1, half):
             assert abs(float(temporal_kernel_weights(torch.tensor([float(k)]), method))) < 1e-6
+
+
+@pytest.mark.parametrize("method,half", [("quintic", 3), ("heptic", 4)])
+def test_polynomial_temporal_weights_form_partition_of_unity(method, half):
+    for tcoord in torch.linspace(-0.49, 0.49, 19):
+        base = int(torch.floor(tcoord))
+        frames = torch.arange(base - (half - 1), base + half + 1, dtype=torch.float32)
+        weights = temporal_kernel_weights(tcoord - frames, method)
+        torch.testing.assert_close(weights.sum(), torch.tensor(1.0), atol=2e-6, rtol=0)
 
 
 def test_interp_slice_times_linear():
@@ -136,3 +153,31 @@ def test_cubic_runs_finite_and_close_to_linear():
         assert torch.isfinite(cub).all()
         # Smooth low-freq signal: cubic and linear agree closely.
         assert (cub - lin).abs().max() < 0.05
+
+
+def test_wsinc_no_neg_clamps_after_signed_temporal_accumulation():
+    nt, nz, ny, nx = 20, 2, 1, 1
+    source = torch.zeros(nt, nz, ny, nx)
+    source[8] = 1.0
+    sx, sy, sz = _identity_coords(nz, ny, nx)
+    st = torch.tensor([0.0, 0.5])
+
+    plain = apply_spacetime_sample(
+        source, sx, sy, sz, 10, 1.0, 0.25, st, tinterp="wsinc5", interp="linear"
+    )
+    clamped = apply_spacetime_sample(
+        source,
+        sx,
+        sy,
+        sz,
+        10,
+        1.0,
+        0.25,
+        st,
+        tinterp="wsinc5",
+        interp="linear",
+        no_neg=True,
+    )
+
+    assert plain.min() < 0.0
+    assert clamped.min() >= 0.0

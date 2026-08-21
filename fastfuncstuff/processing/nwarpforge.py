@@ -1654,7 +1654,7 @@ def nwarpforge(
     slice_times: list[float] | None = None,
     tr: float | None = None,
     tzero: float | None = None,
-    tinterp: str = "cubic",
+    tinterp: str = "heptic",
     follow_tissue: bool = True,
     jac_axis: int | None = None,
     jac_match: str | None = None,
@@ -1723,7 +1723,8 @@ def nwarpforge(
         tzero: Reference time within the TR all slices align to (seconds).
             Defaults to the mean of slice_times (matches 3dTshift).
         tinterp: Temporal interpolation kernel for the joint path ("linear",
-            "cubic", "wsinc5", "wsinc9"; default "cubic"). Fourier is not
+            "cubic", "quintic", "heptic", "wsinc5", "wsinc9"; default
+            "heptic"). Fourier is not
             available here -- the per-voxel continuous shift is not a single
             per-slice phase rotation.
         jac_axis: If set (0=x/i, 1=y/j, 2=z/k), multiply the warped magnitude by

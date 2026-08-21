@@ -269,9 +269,9 @@ Examples:
     )
     st_group.add_argument(
         "-tinterp",
-        choices=["linear", "cubic", "wsinc5", "wsinc9"],
-        default="cubic",
-        help="Temporal interpolation kernel for -tpattern (default cubic). "
+        choices=["linear", "cubic", "quintic", "heptic", "wsinc5", "wsinc9"],
+        default="heptic",
+        help="Temporal interpolation kernel for -tpattern (default heptic). "
         "Fourier is unavailable on the joint path (the per-voxel shift is not "
         "a single per-slice phase rotation).",
     )

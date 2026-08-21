@@ -72,11 +72,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-rmode",
-        default="NN",
+        default="wsinc5",
         metavar="RESAM",
         help="Interpolation: NN, Li, Cu, Bk (3dresample's set) or quintic, "
-        "heptic, wsinc5 (sharper, ours). Default NN. Ignored when the grids "
-        "differ only by axis order or whole voxels — that path is exact.",
+        "heptic, wsinc5 (sharper, ours). Default wsinc5; pass NN for atlas/label "
+        "data. Ignored when the grids differ only by axis order or whole voxels — "
+        "that path is exact.",
     )
     parser.add_argument(
         "-bound_type",

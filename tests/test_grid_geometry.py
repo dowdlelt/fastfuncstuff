@@ -13,6 +13,8 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.cli.util_resample import parse_args as parse_resample_args
+from fastfuncstuff.processing import grid as grid_module
 from fastfuncstuff.processing.grid import (
     afni_orient_code,
     as_index_map,
@@ -38,6 +40,32 @@ AFFINE = np.array(
 SHAPE = (55, 73, 61)  # (nz, ny, nx)
 
 _LPS = np.array([-1.0, -1.0, 1.0])
+
+
+def test_resample_defaults_to_high_fidelity_and_labels_remain_explicit():
+    args = parse_resample_args(["-input", "in.nii", "-prefix", "out.nii"])
+    assert args.rmode == "wsinc5"
+
+
+def test_single_volume_high_order_resample_stays_3d(monkeypatch):
+    seen = []
+
+    def record(source, sx, sy, sz, interp):
+        seen.append((source.shape, interp))
+        return torch.zeros_like(sx)
+
+    monkeypatch.setattr(grid_module, "_separable_resample_3d", record)
+    source = torch.ones(1, 4, 5, 6)
+    z, y, x = torch.meshgrid(
+        torch.arange(4, dtype=torch.float32),
+        torch.arange(5, dtype=torch.float32),
+        torch.arange(6, dtype=torch.float32),
+        indexing="ij",
+    )
+    out = grid_module._sample_batch(source, x + 0.2, y, z, "wsinc5")
+
+    assert seen == [(source.shape[1:], "wsinc5")]
+    assert out.shape == source.shape
 
 
 def _grid(shape, affine):

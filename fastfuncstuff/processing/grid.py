@@ -444,7 +444,10 @@ def _sample_batch(source: Tensor, sx: Tensor, sy: Tensor, sz: Tensor, interp: st
         vals[:, oob] = 0.0
         return vals.reshape((n_ch, *out_shape))
 
-    out = _separable_resample_3d(source, sx, sy, sz, interp)
+    if n_ch == 1:
+        out = _separable_resample_3d(source[0], sx, sy, sz, interp)[None]
+    else:
+        out = _separable_resample_3d(source, sx, sy, sz, interp)
     if interp == "cubic":
         out = _afni_cubic_edges(source, sx, sy, sz, out)
     return out

@@ -58,7 +58,41 @@ from .interp import warp_image_multi
 from .slicetime import _m3_window, _sinc
 
 # Temporal kernel half-widths (number of taps on each side of the sample point).
-_KERNEL_HALFWIDTH = {"linear": 1, "cubic": 2, "wsinc5": 5, "wsinc9": 9}
+_KERNEL_HALFWIDTH = {
+    "linear": 1,
+    "cubic": 2,
+    "quintic": 3,
+    "heptic": 4,
+    "wsinc5": 5,
+    "wsinc9": 9,
+}
+
+
+def _lagrange_temporal_weight(dist: Tensor, order: int) -> Tensor:
+    """Cardinal Lagrange weight at signed sample distance ``dist``."""
+    half = order // 2
+    frac = dist - torch.floor(dist)
+    offset = -torch.floor(dist).to(torch.int64)
+    nodes = range(-half, half + 2)
+    product = torch.ones_like(dist)
+    for node in nodes:
+        product = product * (frac - node)
+
+    # prod_{m != n}(n-m), ordered by n=-half..half+1.
+    denominators = (
+        (-120.0, 24.0, -12.0, 12.0, -24.0, 120.0)
+        if order == 5
+        else (-5040.0, 720.0, -240.0, 144.0, -144.0, 240.0, -720.0, 5040.0)
+    )
+    in_support = (offset >= -half) & (offset <= half + 1)
+    index = (offset + half).clamp(0, order)
+    denominator = dist.new_tensor(denominators)[index]
+    delta = frac - offset.to(frac.dtype)
+    at_node = delta.abs() < 1e-7
+    safe_delta = torch.where(at_node, torch.ones_like(delta), delta)
+    weight = product / (safe_delta * denominator)
+    weight = torch.where(at_node, torch.ones_like(weight), weight)
+    return torch.where(in_support, weight, torch.zeros_like(weight))
 
 
 def temporal_kernel_weights(dist: Tensor, method: str) -> Tensor:
@@ -71,6 +105,7 @@ def temporal_kernel_weights(dist: Tensor, method: str) -> Tensor:
     - ``linear``: tent, support (-1, 1).
     - ``cubic``: Keys cubic convolution with a=-0.5 (Catmull-Rom), support (-2, 2).
       Matches the temporal kernel already used by ``slicetime.temporal_resample``.
+    - ``quintic`` / ``heptic``: 6/8-tap Lagrange interpolation.
     - ``wsinc5`` / ``wsinc9``: windowed sinc, half-width 5 / 9 (min-sidelobe M3
       window), reusing the same kernel pieces as ``ffs_slicetime``.
     """
@@ -85,6 +120,10 @@ def temporal_kernel_weights(dist: Tensor, method: str) -> Tensor:
         w_far = a * ad3 - 5.0 * a * ad2 + 8.0 * a * ad - 4.0 * a
         w = torch.where(ad < 1.0, w_near, w_far)
         return torch.where(ad < 2.0, w, torch.zeros_like(w))
+    if method == "quintic":
+        return _lagrange_temporal_weight(dist, 5)
+    if method == "heptic":
+        return _lagrange_temporal_weight(dist, 7)
     if method in ("wsinc5", "wsinc9"):
         half = _KERNEL_HALFWIDTH[method]
         w = _sinc(dist) * _m3_window(dist / half)
@@ -117,7 +156,7 @@ def apply_spacetime_sample(
     tr: float,
     tzero: float,
     slice_times: Tensor,
-    tinterp: str = "cubic",
+    tinterp: str = "heptic",
     interp: str = "wsinc5",
     no_neg: bool | Sequence[bool] = False,
 ) -> Tensor | list[Tensor]:
@@ -146,7 +185,8 @@ def apply_spacetime_sample(
     slice_times : (snz,) tensor
         Per-slice acquisition offsets (seconds), on ``source``'s device.
     tinterp : str
-        Temporal kernel: ``linear``, ``cubic`` (default), ``wsinc5``, ``wsinc9``.
+        Temporal kernel: ``linear``, ``cubic``, ``quintic``, ``heptic`` (default),
+        ``wsinc5``, or ``wsinc9``.
     interp : str
         Spatial kernel for sampling each source frame (matches ``ffs_nwarp``
         ``-interp``; default ``wsinc5``).
@@ -217,7 +257,12 @@ def apply_spacetime_sample(
                 accs[c] += w * s_f
             wsum += w
 
-    outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
+    outs = [
+        (acc / wsum.clamp_min(1e-8)).clamp_min(0.0)
+        if no_neg_ch[c]
+        else acc / wsum.clamp_min(1e-8)
+        for c, acc in enumerate(accs)
+    ]
     return outs if multi else outs[0]
 
 
@@ -293,7 +338,7 @@ class TissueFollowingSampler:
         tzero: float,
         slice_times: Tensor,
         device: torch.device,
-        tinterp: str = "cubic",
+        tinterp: str = "heptic",
         interp: str = "wsinc5",
         no_neg: bool | Sequence[bool] = False,
         n_out: int | None = None,
@@ -470,5 +515,10 @@ class TissueFollowingSampler:
             for stale in [k for k in cache if k < f]:
                 del cache[stale]
 
-        outs = [acc / wsum.clamp_min(1e-8) for acc in accs]
+        outs = [
+            (acc / wsum.clamp_min(1e-8)).clamp_min(0.0)
+            if self.no_neg_ch[c]
+            else acc / wsum.clamp_min(1e-8)
+            for c, acc in enumerate(accs)
+        ]
         return outs if self.multi else outs[0]

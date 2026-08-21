@@ -163,7 +163,7 @@ class AffineAlignConfig:
 
     # Interpolation
     interp: str = "linear"  # "linear" or "cubic"
-    final_interp: str = "linear"
+    final_interp: str = "wsinc5"
 
     # Masking
     source_automask: bool = False

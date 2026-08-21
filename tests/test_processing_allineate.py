@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.cli.allineate import parse_args as parse_allineate_args
 from fastfuncstuff.processing.allineate import (
     AffineAlignConfig,
     CostContext,
@@ -78,6 +79,10 @@ class TestAffineAlignConfig:
         assert cfg.cost == "lpa"
         assert cfg.twopass is True
         assert cfg.cmass is True
+        assert cfg.final_interp == "wsinc5"
+
+        args = parse_allineate_args(["-base", "base.nii", "-source", "source.nii"])
+        assert args.final_interp == "wsinc5"
         assert cfg.autocrop is True
 
     def test_custom(self):
