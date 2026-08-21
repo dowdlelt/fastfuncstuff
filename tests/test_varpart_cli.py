@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+import torch
 
 nib = pytest.importorskip("nibabel")
 
@@ -24,7 +25,7 @@ from test_variance_partition import (  # noqa: E402
     make_crossed_table,
 )
 
-from fastfuncstuff.cli.varpart import CEILING_FLOOR, main  # noqa: E402
+from fastfuncstuff.cli.varpart import CEILING_FLOOR, _summarize_effects, main  # noqa: E402
 
 
 def _fixture(tmp_path, shape=(4, 4, 3), noise=1.0, seed=0, drop_col=None):
@@ -62,6 +63,23 @@ def _run(args):
         sys.argv = argv
 
 
+def test_summary_pools_explained_sums_of_squares():
+    rows = _summarize_effects(
+        {"unique_task": torch.tensor([-0.2, 0.8])},
+        heldout_sst=torch.tensor([1.0, 3.0]),
+        noise_ceiling=torch.tensor([0.5, 1.0]),
+    )
+
+    row = rows[0]
+    assert row["pooled_cv_r2"] == pytest.approx(0.55)
+    assert row["pooled_frac_ceiling"] == pytest.approx(2.2 / 3.5)
+    assert row["median_frac_ceiling"] == pytest.approx(0.2)
+    assert row["q25_frac_ceiling"] == pytest.approx(-0.1)
+    assert row["q75_frac_ceiling"] == pytest.approx(0.5)
+    assert row["positive_frac_reliable"] == pytest.approx(0.5)
+    assert row["n_units"] == row["n_reliable"] == 2
+
+
 def test_voxel_mode_writes_expected_subbricks(tmp_path):
     betas, tsv, shape, _ = _fixture(tmp_path)
     out = tmp_path / "vp"
@@ -86,17 +104,25 @@ def test_voxel_mode_writes_expected_subbricks(tmp_path):
     assert img.shape[:3] == shape
     assert img.shape[3] == 23
     assert (tmp_path / "vp_varpart.json").exists()
+    summary = list(csv.DictReader(open(tmp_path / "vp_summary.tsv"), delimiter="\t"))
+    assert [row["effect"] for row in summary] == [
+        "unique_stim",
+        "unique_task",
+        "interaction",
+        "r2_full",
+    ]
 
     import json
 
     meta = json.loads((tmp_path / "vp_varpart.json").read_text())
     assert meta["unit"] == "voxel"
+    assert meta["nested_gamma"] is True
     assert meta["factors"] == ["stim", "task"]
     # Balanced crossed design: shared variance must come out ~0.
     assert abs(meta["diagnostics"]["shared_abs_median"]) < 0.02
 
 
-def test_atlas_mode_writes_roi_table(tmp_path):
+def test_atlas_mode_writes_roi_table_and_summary(tmp_path, capsys):
     betas, tsv, shape, _ = _fixture(tmp_path)
     atlas = tmp_path / "atlas.nii.gz"
     lab = (np.arange(int(np.prod(shape))) % 4 + 1).reshape(shape).astype(np.int16)
@@ -121,6 +147,14 @@ def test_atlas_mode_writes_roi_table(tmp_path):
         )
         == 0
     )
+
+    terminal = capsys.readouterr().out
+    assert "Overall variance summary (parcels)" in terminal
+    assert "unique_stim" in terminal
+
+    summary = list(csv.DictReader(open(str(out) + "_summary.tsv"), delimiter="\t"))
+    assert len(summary) == 4
+    assert all(int(row["n_units"]) == 4 for row in summary)
 
     rows = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))
     assert len(rows) == 4
@@ -307,13 +341,16 @@ def _base_args(betas, tsv, out):
 def test_drop_trials_excludes_matching_rows(tmp_path, capsys):
     betas, tsv, _, n_tr = _fixture(tmp_path)
     out = tmp_path / "dropped"
-    assert _run([*_base_args(betas, tsv, out), "-drop_trials", "run", "r0"]) == 0
+    assert (
+        _run([*_base_args(betas, tsv, out), "-drop_trials", "run", "r0", "-no_nested_gamma"]) == 0
+    )
     txt = capsys.readouterr().out
     assert "-drop_trials run=r0" in txt
     meta = json.loads(Path(f"{out}_varpart.json").read_text())
     assert meta["n_trials_in_table"] == n_tr
     assert meta["n_trials"] < n_tr
     assert meta["dropped_trials"] == [["run", "r0"]]
+    assert meta["nested_gamma"] is False
 
 
 def test_drop_trials_is_repeatable(tmp_path):
@@ -329,6 +366,7 @@ def test_drop_trials_is_repeatable(tmp_path):
                 "-drop_trials",
                 "run",
                 "r1",
+                "-no_nested_gamma",
             ]
         )
         == 0

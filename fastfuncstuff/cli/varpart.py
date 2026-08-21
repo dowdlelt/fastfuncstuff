@@ -49,6 +49,63 @@ class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefa
 CEILING_FLOOR = 0.01
 
 
+def _summarize_effects(
+    effect_maps: dict[str, torch.Tensor],
+    heldout_sst: torch.Tensor,
+    noise_ceiling: torch.Tensor,
+) -> list[dict[str, str | int | float]]:
+    """Pool unit-wise CV-R2 effects without averaging ratios.
+
+    Voxel mode treats voxels as units; atlas mode treats parcels as units. Each unit is
+    weighted by its held-out total sum of squares, so pooling reconstructs the explained
+    sum of squares over the complete mask rather than giving a flat voxel or parcel the
+    same influence as a strongly varying one.
+    """
+    sst = heldout_sst.detach().cpu().to(torch.float64)
+    ceiling = noise_ceiling.detach().cpu().to(torch.float64)
+    finite_base = torch.isfinite(sst) & torch.isfinite(ceiling) & (sst > 0)
+    reliable = finite_base & (ceiling > CEILING_FLOOR)
+    obtainable_ss = (sst[reliable] * ceiling[reliable]).sum()
+
+    rows: list[dict[str, str | int | float]] = []
+    for effect, values in effect_maps.items():
+        val = values.detach().cpu().to(torch.float64)
+        finite = finite_base & torch.isfinite(val)
+        effect_reliable = reliable & torch.isfinite(val)
+        pooled = (
+            (sst[finite] * val[finite]).sum() / sst[finite].sum()
+            if finite.any()
+            else torch.tensor(float("nan"))
+        )
+        pooled_frac = (
+            (sst[effect_reliable] * val[effect_reliable]).sum() / obtainable_ss
+            if effect_reliable.any() and obtainable_ss > 0
+            else torch.tensor(float("nan"))
+        )
+        ratios = val[effect_reliable] / ceiling[effect_reliable]
+        if ratios.numel():
+            q25, median, q75 = torch.quantile(
+                ratios, torch.tensor([0.25, 0.5, 0.75], dtype=ratios.dtype)
+            )
+            positive_frac = (val[effect_reliable] > 0).to(torch.float64).mean()
+        else:
+            q25 = median = q75 = positive_frac = torch.tensor(float("nan"))
+        rows.append(
+            {
+                "effect": effect,
+                "pooled_cv_r2": float(pooled),
+                "pooled_frac_ceiling": float(pooled_frac),
+                "median_frac_ceiling": float(median),
+                "q25_frac_ceiling": float(q25),
+                "q75_frac_ceiling": float(q75),
+                "positive_frac_reliable": float(positive_frac),
+                "n_units": int(finite.sum()),
+                "n_reliable": int(effect_reliable.sum()),
+            }
+        )
+    return rows
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_varpart",
@@ -59,11 +116,20 @@ OUTPUTS
 =======
   {prefix}.nii.gz         one sub-brick per measure below (parcel-painted with -atlas)
   {prefix}_roi.tsv        with -atlas: the same measures, one row per ROI
+  {prefix}_summary.tsv    pooled whole-mask variance summary, one row per effect
   {prefix}_varpart.json   factors, level-name mapping, dropped trials, diagnostics
 
 Everything is computed on HELD-OUT repeats (leave-one-repeat-out CV). "Explains"
 always means predicted out of sample, never fitted. Below, A and B are your two
 -factors, in the order you gave them.
+
+Band shrinkage is selected inside each outer fold's training data by default,
+so the reporting repeat is untouched by coefficient OR hyperparameter fitting.
+This costs roughly 3x for the observed maps. -no_nested_gamma restores the
+original faster reporting-fold selection; its raw R2 is mildly optimistic.
+Permutation always repeats the selected mode and may cost more than 3x because
+nested selection needs the general trial-space engine.
+
 
 TWO FACTORS OR MORE? The names below describe the two-factor case, which is what
 most of the maps are about. -factors accepts any number; see "Three or more
@@ -370,6 +436,30 @@ mapping back to the original labels is written to {prefix}_varpart.json).
             "counterpart of the hard rank sweep (0 = skip it)"
         ),
     )
+    gamma_mode = opt.add_mutually_exclusive_group()
+    gamma_mode.add_argument(
+        "-nested_gamma",
+        "-nested-gamma",
+        dest="nested_gamma",
+        action="store_true",
+        default=True,
+        help=(
+            "Select each outer fold's band shrinkage using inner folds confined to its "
+            "training data (default; honest held-out R2)"
+        ),
+    )
+    gamma_mode.add_argument(
+        "-no_nested_gamma",
+        "-no-nested-gamma",
+        "-reporting_fold_gamma",
+        "-reporting-fold-gamma",
+        dest="nested_gamma",
+        action="store_false",
+        help=(
+            "Compatibility/fast mode: select one gamma on the reporting-fold predictions. "
+            "R2 is mildly optimistic, but this avoids the roughly 3x nested-CV cost."
+        ),
+    )
     opt.add_argument(
         "-perm",
         type=int,
@@ -620,6 +710,7 @@ def main() -> int:
         min_ncsnr_for_rank=args.min_ncsnr_for_rank,
         min_interaction_frac_ceiling=args.min_interaction_frac_ceiling,
         n_nuclear_taus=args.nuclear_taus,
+        nested_gamma=args.nested_gamma,
         strict_run_locality=args.strict_run_locality,
         device=device,
         verbose=not args.quiet,
@@ -651,6 +742,9 @@ def main() -> int:
         print("       treat the partition as approximate and check for dropped trials.")
     for pair, frac in d["rank_undetermined_frac_per_pair"].items():
         print(f"   rank undetermined for {pair} (ncsnr < {args.min_ncsnr_for_rank}): {frac:.1%}")
+    print(
+        f"   gamma selection: {'nested inner folds' if args.nested_gamma else 'reporting folds (legacy)'}"
+    )
     nested = d.get("factors_nested_in_run") or {}
     if nested:
         # partition_variance already printed the full explanation; keep a one-line marker
@@ -682,6 +776,7 @@ def main() -> int:
             seed=args.seed,
             strict_run_locality=args.strict_run_locality,
             device=device,
+            nested_gamma=args.nested_gamma,
             verbose=not args.quiet,
         )
 
@@ -762,6 +857,39 @@ def main() -> int:
     info = parse_prefix(args.prefix)
     stem = info.stem
 
+    assert res.heldout_sst is not None and res.noise_ceiling is not None
+    summary_maps = {f"unique_{name}": maps[f"unique_{name}"] for name in factor_names}
+    if len(factor_names) > 2:
+        summary_maps.update({name: maps[name] for name in maps if name.startswith("band_")})
+    summary_maps["interaction"] = maps["interaction"]
+    summary_maps["r2_full"] = maps["r2_full"]
+    summary_rows = _summarize_effects(summary_maps, res.heldout_sst, res.noise_ceiling)
+
+    summary_tsv = f"{stem}_summary.tsv"
+    summary_fields = list(summary_rows[0])
+    with open(summary_tsv, "w", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=summary_fields, delimiter="	")
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+    unit_label = "parcels" if roi_ids is not None else "voxels"
+    print(f"\n📈 Overall variance summary ({unit_label})")
+    print("   effect                       CV-R²   obtainable   median [IQR]        positive")
+    for row in summary_rows:
+        print(
+            f"   {str(row['effect']):<28} "
+            f"{float(row['pooled_cv_r2']):>7.3f}   "
+            f"{float(row['pooled_frac_ceiling']):>9.1%}   "
+            f"{float(row['median_frac_ceiling']):>6.1%} "
+            f"[{float(row['q25_frac_ceiling']):>6.1%}, "
+            f"{float(row['q75_frac_ceiling']):>6.1%}]   "
+            f"{float(row['positive_frac_reliable']):>7.1%}"
+        )
+    print(
+        f"   reliable units: {summary_rows[0]['n_reliable']}/{summary_rows[0]['n_units']} "
+        f"(noise ceiling > {CEILING_FLOOR:g})"
+    )
+    print(f"💾 Wrote {summary_tsv}")
     names = list(maps)
     stacked = np.zeros((*vol_shape, len(maps)), dtype=np.float32)
 
@@ -810,6 +938,7 @@ def main() -> int:
         "diagnostics": {
             k: (v if not isinstance(v, np.generic) else v.item()) for k, v in d.items()
         },
+        "nested_gamma": args.nested_gamma,
         "min_ncsnr_for_rank": args.min_ncsnr_for_rank,
         "n_perms": args.perm,
     }

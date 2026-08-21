@@ -15,10 +15,13 @@ import torch
 from fastfuncstuff.stats.variance_partition import (
     BALANCE_TOL,
     _build_cell_ops,
+    _build_nested_fold_solvers,
     _build_trial_ops,
     _cellspace_partials,
+    _nested_partials,
     _orthonormal_contrasts,
     _partition_stats,
+    _solve_gammas,
     _trialspace_partials,
     build_factor_design,
     build_repeat_folds,
@@ -112,6 +115,34 @@ def test_derive_repeat_index_matches_explicit():
     design = build_factor_design(factors)
     derived = derive_repeat_index(design)
     np.testing.assert_array_equal(derived, rep)
+
+
+def test_nested_gamma_never_reads_its_outer_test_responses():
+    factors, rep, _ = make_crossed_table(n_stim=3, n_task=3, n_rep=3, seed=4)
+    design = build_factor_design(factors)
+    band_order = list(design.band_order)
+    bands = {name: mat.float() for name, mat in design.bands.items()}
+    slices = {}
+    offset = 0
+    for name in band_order:
+        width = bands[name].shape[1]
+        slices[name] = slice(offset, offset + width)
+        offset += width
+
+    folds_np, _ = build_repeat_folds(rep)
+    folds = [(torch.as_tensor(train), torch.as_tensor(test)) for train, test in folds_np]
+    inner = _build_nested_fold_solvers(bands, band_order, folds)
+    y = torch.randn(5, len(rep), generator=torch.Generator().manual_seed(8))
+    active = list(range(len(band_order)))
+
+    before = _solve_gammas(*_nested_partials(y, bands, band_order, slices, inner[0]), active)
+    contaminated = y.clone()
+    contaminated[:, folds[0][1]] += 1000 * torch.randn_like(contaminated[:, folds[0][1]])
+    after = _solve_gammas(
+        *_nested_partials(contaminated, bands, band_order, slices, inner[0]), active
+    )
+
+    torch.testing.assert_close(before, after, atol=0, rtol=0)
 
 
 def test_fold_builder_flags_run_leak():
@@ -496,13 +527,44 @@ def test_cellspace_engine_matches_general_path():
     ops = _build_cell_ops(design, folds, torch.device("cpu"))
     fast = _partition_stats(*_cellspace_partials(betas, ops), build_stat_specs(design))
 
-    slow = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
+    slow = partition_variance(
+        betas, factors, repeat=rep, run=run, nested_gamma=False, verbose=False
+    )
 
     torch.testing.assert_close(fast["unique_a"], slow.unique["stim"], atol=1e-4, rtol=0)
     torch.testing.assert_close(fast["unique_b"], slow.unique["task"], atol=1e-4, rtol=0)
     torch.testing.assert_close(fast["interaction"], slow.interaction, atol=1e-4, rtol=0)
     torch.testing.assert_close(
         fast["band_stim:task"], slow.band_unique["stim:task"], atol=1e-4, rtol=0
+    )
+
+
+def test_nested_permutation_observed_matches_reported_estimator():
+    betas, factors, rep, run = _perm_data(0.5, n_vox=8, seed=19)
+    reported = partition_variance(
+        betas, factors, repeat=rep, run=run, nested_gamma=True, verbose=False
+    )
+    perm = permutation_test(
+        betas,
+        factors,
+        repeat=rep,
+        run=run,
+        statistics=("unique_stim", "unique_task", "interaction"),
+        n_perms=1,
+        seed=2,
+        nested_gamma=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    torch.testing.assert_close(
+        perm.observed["unique_stim"], reported.unique["stim"], atol=2e-4, rtol=0
+    )
+    torch.testing.assert_close(
+        perm.observed["unique_task"], reported.unique["task"], atol=2e-4, rtol=0
+    )
+    torch.testing.assert_close(
+        perm.observed["interaction"], reported.interaction, atol=2e-4, rtol=0
     )
 
 
@@ -905,8 +967,10 @@ def test_additive_run_nuisance_lands_only_on_the_nested_factor():
     )
     contaminated = clean + offsets[:, ri]
 
-    a = partition_variance(clean, factors, repeat=rep, run=run, verbose=False)
-    b = partition_variance(contaminated, factors, repeat=rep, run=run, verbose=False)
+    a = partition_variance(clean, factors, repeat=rep, run=run, nested_gamma=False, verbose=False)
+    b = partition_variance(
+        contaminated, factors, repeat=rep, run=run, nested_gamma=False, verbose=False
+    )
 
     # Task soaks up the entire run-level offset...
     assert b.unique["task"].mean() > 2.0 * a.unique["task"].mean()

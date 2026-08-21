@@ -27,10 +27,12 @@ Three facts about this design shape the whole implementation:
    That scalar is exactly the fractional-ridge ``frac`` of :mod:`fastfuncstuff.glm.ridge`.
 
 Because predictions are *linear* in the per-band gammas, the optimal gammas come from a
-tiny per-voxel least-squares solve rather than a grid search. Selection therefore happens
-on the reporting folds and the R2 is mildly optimistic; the partition is a set of
-differences under an identical procedure so the optimism is largely common-mode, and the
-permutation null (which re-runs selection inside each permutation) calibrates the rest.
+tiny per-voxel least-squares solve rather than a grid search. By default each outer fold's
+gammas are selected from inner predictions confined to its training data, so the reported
+R2 is genuinely held out. Setting nested_gamma to false restores the original faster
+procedure: one gamma is selected on the assembled reporting-fold predictions, making raw
+R2 mildly optimistic. The permutation null re-runs whichever selection mode produced the
+observed statistic.
 
 Two consequences of the gammas being *clamped* to [0, 1] are worth knowing before reading
 the maps. First, the clamp is what makes shared variance ``C`` depart from exactly zero on
@@ -150,6 +152,7 @@ class VarPartResult:
 
     ncsnr: Tensor | None = None
     noise_ceiling: Tensor | None = None
+    heldout_sst: Tensor | None = None
     diagnostics: dict = field(default_factory=dict)
 
 
@@ -486,6 +489,58 @@ def _solve_gammas(
     return _solve_gammas_from_gram(gram, rhs)
 
 
+def _build_nested_fold_solvers(
+    band_mats: dict[str, Tensor],
+    band_order: list[str],
+    folds: list[tuple[Tensor, Tensor]],
+) -> list[list[tuple[Tensor, Tensor, Tensor]]]:
+    """Precompute inner solvers for outer-fold gamma selection."""
+    out: list[list[tuple[Tensor, Tensor, Tensor]]] = []
+    for outer_i, (outer_train, _) in enumerate(folds):
+        inner: list[tuple[Tensor, Tensor, Tensor]] = []
+        for inner_i, (_, inner_val) in enumerate(folds):
+            if inner_i == outer_i:
+                continue
+            inner_train = outer_train[~torch.isin(outer_train, inner_val)]
+            if inner_train.numel() == 0 or inner_val.numel() == 0:
+                continue
+            x = torch.cat(
+                [torch.ones(len(inner_train), 1, device=inner_train.device)]
+                + [band_mats[n][inner_train] for n in band_order],
+                dim=1,
+            )
+            inner.append((inner_train, inner_val, torch.linalg.pinv(x.double()).float()))
+        if not inner:
+            raise ValueError(
+                "nested gamma selection needs at least 3 repeat folds; use "
+                "nested_gamma=False to restore reporting-fold gamma selection"
+            )
+        out.append(inner)
+    return out
+
+
+def _nested_partials(
+    y: Tensor,
+    band_mats: dict[str, Tensor],
+    band_order: list[str],
+    band_slices: dict[str, slice],
+    inner_ops: list[tuple[Tensor, Tensor, Tensor]],
+) -> tuple[Tensor, Tensor]:
+    """Predictions made wholly inside one outer training set."""
+    partial_blocks = []
+    target_blocks = []
+    for train, val, solver in inner_ops:
+        coef = y[:, train] @ solver.T
+        target_blocks.append(y[:, val] - coef[:, 0:1])
+        block = torch.empty(y.shape[0], len(val), len(band_order), dtype=y.dtype, device=y.device)
+        for bi, name in enumerate(band_order):
+            sl = band_slices[name]
+            cb = coef[:, 1 + sl.start : 1 + sl.stop]
+            block[:, :, bi] = cb @ band_mats[name][val].T
+        partial_blocks.append(block)
+    return torch.cat(partial_blocks, dim=1), torch.cat(target_blocks, dim=1)
+
+
 def _abs_cos(x: Tensor, y: Tensor) -> Tensor:
     """|cos| between corresponding rows. Sign-free, because singular vectors have no sign."""
     num = (x * y).sum(dim=-1).abs()
@@ -596,6 +651,7 @@ def partition_variance(
     min_interaction_frac_ceiling: float = 0.02,
     n_nuclear_taus: int = 11,
     strict_run_locality: bool = False,
+    nested_gamma: bool = True,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = True,
@@ -635,6 +691,13 @@ def partition_variance(
         continuous counterpart of the hard rank sweep. Thresholds are fractions of each
         voxel's leading singular value, spanning 0 (full interaction) to 1 (none). Set to
         0 to skip it.
+
+    nested_gamma
+        Select a separate gamma for each outer fold using inner predictions made only
+        from that outer fold's training trials. Enabled by default so held-out R2 is
+        untouched by hyperparameter selection. Requires at least three repeat folds.
+        Disable for the original faster reporting-fold procedure, whose R2 is mildly
+        optimistic.
 
     Returns
     -------
@@ -724,6 +787,7 @@ def partition_variance(
     nuclear_r2_out = {p: torch.zeros(n_vox) for p in pair_bands}
     nuclear_tau_out = {p: torch.zeros(n_vox) for p in pair_bands}
     nuclear_gain_out = {p: torch.zeros(n_vox) for p in pair_bands}
+    heldout_sst_out = torch.zeros(n_vox)
     # Alignment is per (pair band, parent factor): the left singular vector against one
     # parent's main effect, the right against the other's.
     align_out = {(p, side): torch.zeros(n_vox) for p in pair_bands for side in (0, 1)}
@@ -741,6 +805,9 @@ def partition_variance(
         )
         for tr, te in folds
     ]
+    nested_solvers = (
+        _build_nested_fold_solvers(band_mats, band_order, fold_t) if nested_gamma else None
+    )
 
     # Per-fold band pseudoinverses. Under leave-one-repeat-out on a balanced design the
     # training set keeps n-1 repeats of every cell, so it stays balanced and each band's
@@ -854,22 +921,49 @@ def partition_variance(
                 del u, s, vh, b_i, run_r, run_s, p_other
             del coef
 
+        nested_inner = (
+            [
+                _nested_partials(y, band_mats, band_order, band_slices, nested_solvers[fi])
+                for fi in range(n_folds)
+            ]
+            if nested_gamma and nested_solvers is not None
+            else None
+        )
+
         gam_full = torch.zeros(nvc, n_bands, device=device)
+        gam_full_fold: Tensor | None = None
         for mname, active_names in models.items():
             if not active_names:
                 pred = torch.zeros_like(target)
             else:
                 active = [band_index[n] for n in active_names]
-                gam = _solve_gammas(partials, target, active)
-                pred = torch.einsum("vtb,vb->vt", partials[:, :, active], gam)
+                if nested_gamma:
+                    assert nested_inner is not None
+                    gam_folds = torch.stack(
+                        [_solve_gammas(*nested_inner[fi], active) for fi in range(n_folds)],
+                        dim=1,
+                    )
+                    pred = torch.zeros_like(target)
+                    for fi, (_, te) in enumerate(fold_t):
+                        pred[:, te] = torch.einsum(
+                            "vtb,vb->vt", partials[:, te][:, :, active], gam_folds[:, fi]
+                        )
+                    if mname == "M_full":
+                        gam_full_fold = gam_folds
+                        gam_full = gam_folds.mean(dim=1)
+                else:
+                    gam = _solve_gammas(partials, target, active)
+                    pred = torch.einsum("vtb,vb->vt", partials[:, :, active], gam)
+                    if mname == "M_full":
+                        gam_full = gam
                 if mname == "M_full":
-                    gam_full = gam
                     for k, n in enumerate(active_names):
-                        gam_out[n][c0:c1] = gam[:, k].cpu()
+                        gam_out[n][c0:c1] = gam_full[:, k].cpu()
             r2_out[mname][c0:c1] = _r2_from_pred(target, pred).cpu()
 
         sst = (target * target).sum(dim=1)
         ss_tot = ((target - target.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
+        heldout_sst_out[c0:c1] = ss_tot.cpu()
 
         for pname in pair_bands:
             mr = pair_rank[pname]
@@ -888,21 +982,40 @@ def partition_variance(
             # models are the same predictor family: rank_r2[:, mr] IS R2(M_full), and
             # rank_r2[:, 0] is the full model with this band removed.
             #
-            # The gammas are deliberately NOT re-fitted per rank. They are selected on the
-            # reporting folds (see the module docstring), which is harmless for the model R2
-            # -- the optimism is common-mode across a set of differences -- but an argmax
-            # over ranks is a selection, and that is precisely where common-mode optimism
-            # stops cancelling. Re-fitting gives the sweep a free scalar per variant and
-            # additive voxels then climb to spurious rank 2-6. Holding the gammas fixed
+            # The gammas are deliberately NOT re-fitted per rank. They are selected on
+            # inner folds by default (or reporting folds in compatibility mode), then held
+            # fixed across variants. Re-fitting would give the sweep a free scalar per
+            # variant and additive voxels then climb to spurious rank 2-6. Holding them fixed
             # restores the one-sided error property the rank map is read under: a pure-noise
             # component adds variance at fixed weight, so it can only ever hurt, and every
             # selection error is a miss rather than an invention.
-            gram, rhs = _sweep_systems(
-                acc[pname].sum(dim=1), gm, rh, torch.zeros((), device=device), None
-            )
-            rank_r2_out[pname][c0:c1] = (
-                1.0 - _ss_res_from_gram(gram, rhs, sst[:, None], gam_s) / (ss_tot[:, None] + 1e-12)
-            ).cpu()
+            if nested_gamma:
+                assert gam_full_fold is not None
+                rank_ss_res = torch.zeros(nvc, mr + 1, device=device)
+                for fi, (_, te) in enumerate(fold_t):
+                    po = partials[:, te][:, :, other]
+                    gm_i = torch.einsum("vtb,vtc->vbc", po, po)
+                    rh_i = torch.einsum("vtb,vt->vb", po, target[:, te])
+                    gram_i, rhs_i = _sweep_systems(
+                        acc[pname][:, fi], gm_i, rh_i, torch.zeros((), device=device), None
+                    )
+                    gf = gam_full_fold[:, fi]
+                    gf = torch.cat(
+                        [gf[:, other], gf[:, band_index[pname] : band_index[pname] + 1]],
+                        dim=1,
+                    )
+                    rank_ss_res += _ss_res_from_gram(
+                        gram_i, rhs_i, (target[:, te] ** 2).sum(dim=1)[:, None], gf[:, None]
+                    )
+                rank_r2_out[pname][c0:c1] = (1.0 - rank_ss_res / (ss_tot[:, None] + 1e-12)).cpu()
+            else:
+                gram, rhs = _sweep_systems(
+                    acc[pname].sum(dim=1), gm, rh, torch.zeros((), device=device), None
+                )
+                rank_r2_out[pname][c0:c1] = (
+                    1.0
+                    - _ss_res_from_gram(gram, rhs, sst[:, None], gam_s) / (ss_tot[:, None] + 1e-12)
+                ).cpu()
 
             if n_taus > 0 and mr > 0:
                 # Nuclear (singular-value soft-threshold) sweep: a continuous relaxation of
@@ -918,10 +1031,33 @@ def partition_variance(
                 r_sel = (sv[:, :, None, :] > tau[:, None, :, None]).sum(dim=-1)  # (nvc,F,T)
                 idx = r_sel.unsqueeze(-1).expand(-1, -1, -1, _acc_width(n_other))
                 acc_sel = torch.gather(acc[pname], 2, idx)  # (nvc, F, T, w)
-                gram_t, rhs_t = _sweep_systems(acc_sel, gm, rh, tau[:, None, :], fold_dim=1)
-                r2_t = 1.0 - _ss_res_from_gram(gram_t, rhs_t, sst[:, None], gam_s) / (
-                    ss_tot[:, None] + 1e-12
-                )
+                if nested_gamma:
+                    assert gam_full_fold is not None
+                    nuclear_ss_res = torch.zeros(nvc, n_taus, device=device)
+                    for fi, (_, te) in enumerate(fold_t):
+                        po = partials[:, te][:, :, other]
+                        gm_i = torch.einsum("vtb,vtc->vbc", po, po)
+                        rh_i = torch.einsum("vtb,vt->vb", po, target[:, te])
+                        gram_i, rhs_i = _sweep_systems(
+                            acc_sel[:, fi], gm_i, rh_i, tau, fold_dim=None
+                        )
+                        gf = gam_full_fold[:, fi]
+                        gf = torch.cat(
+                            [gf[:, other], gf[:, band_index[pname] : band_index[pname] + 1]],
+                            dim=1,
+                        )
+                        nuclear_ss_res += _ss_res_from_gram(
+                            gram_i,
+                            rhs_i,
+                            (target[:, te] ** 2).sum(dim=1)[:, None],
+                            gf[:, None],
+                        )
+                    r2_t = 1.0 - nuclear_ss_res / (ss_tot[:, None] + 1e-12)
+                else:
+                    gram_t, rhs_t = _sweep_systems(acc_sel, gm, rh, tau[:, None, :], fold_dim=1)
+                    r2_t = 1.0 - _ss_res_from_gram(gram_t, rhs_t, sst[:, None], gam_s) / (
+                        ss_tot[:, None] + 1e-12
+                    )
                 # Referenced to this family's own no-interaction endpoint (tau = s1, every
                 # singular value thresholded away), not to R2(M_add), so the gain is >= 0 by
                 # construction and is not contaminated by a gamma difference between models.
@@ -936,8 +1072,8 @@ def partition_variance(
                 nuclear_r2_out[pname][c0:c1] = r2_t.gather(1, sel[:, None]).squeeze(1).cpu()
                 nuclear_tau_out[pname][c0:c1] = tau_fracs[sel].cpu()
                 nuclear_gain_out[pname][c0:c1] = gain_t.gather(1, sel[:, None]).squeeze(1).cpu()
-                del gain_t, best_t, ok, sel, gram_t, rhs_t, r2_t, acc_sel, idx, r_sel
-            del gm, rh, p_other, gram, rhs
+                del gain_t, best_t, ok, sel, r2_t, acc_sel, idx, r_sel
+            del gm, rh, p_other
 
         for key, val in align.items():
             align_out[key][c0:c1] = (val / n_folds).cpu()
@@ -1048,6 +1184,7 @@ def partition_variance(
         "bands": list(band_order),
         "max_rank_per_pair": dict(pair_rank),
         "shared_abs_median": float(shared.abs().median()),
+        "nested_gamma": nested_gamma,
         "min_ncsnr_for_rank": min_ncsnr_for_rank,
         "min_interaction_frac_ceiling": min_interaction_frac_ceiling,
         "rank_undetermined_frac_per_pair": {
@@ -1090,6 +1227,7 @@ def partition_variance(
         pair_gain_alignment=pair_align,
         ncsnr=ncsnr,
         noise_ceiling=noise_ceiling.cpu(),
+        heldout_sst=heldout_sst_out,
         diagnostics=diagnostics,
     )
 
@@ -1133,8 +1271,8 @@ def partition_variance(
 # Exchangeability blocks are runs: single-trial beta noise carries run-level structure
 # (shared drift, motion, noise PCs), so free permutation across runs is anticonservative.
 #
-# Crucially the per-band gamma selection re-runs inside every permutation, so the null
-# absorbs the selection optimism that makes the raw R2 values mildly optimistic.
+# Gamma selection re-runs inside every permutation using the same nested or compatibility
+# procedure as the observed statistic.
 # ---------------------------------------------------------------------------
 
 
@@ -1452,6 +1590,38 @@ def _partition_stats(
     return out
 
 
+def _partition_stats_nested(
+    y: Tensor,
+    ops: _TrialOps,
+    nested_solvers: list[list[tuple[Tensor, Tensor, Tensor]]],
+    specs: dict[str, _StatSpec],
+    keys: tuple[str, ...],
+) -> dict[str, Tensor]:
+    """Statistics with gamma selected strictly inside each outer training fold."""
+    partials, target = _trialspace_partials(y, ops)
+    nested_inner = [
+        _nested_partials(y, ops.band_mats, ops.band_order, ops.band_slices, nested_solvers[fi])
+        for fi in range(len(ops.folds))
+    ]
+    needed: set[tuple[int, ...]] = set()
+    for key in keys:
+        needed.update((specs[key].full, specs[key].reduced))
+
+    r2: dict[tuple[int, ...], Tensor] = {}
+    for active_t in needed:
+        if not active_t:
+            pred = torch.zeros_like(target)
+        else:
+            active = list(active_t)
+            pred = torch.zeros_like(target)
+            for fi, (_, te, _) in enumerate(ops.folds):
+                gam = _solve_gammas(*nested_inner[fi], active)
+                pred[:, te] = torch.einsum("vtb,vb->vt", partials[:, te][:, :, active], gam)
+        r2[active_t] = _r2_from_pred(target, pred)
+
+    return {key: r2[specs[key].full] - r2[specs[key].reduced] for key in keys}
+
+
 def _reduced_fit_cells(y: Tensor, ops: _CellOps, bands: tuple[int, ...]) -> Tensor:
     """Fitted values of a reduced model, in cell space, using every repeat.
 
@@ -1587,6 +1757,7 @@ def permutation_test(
     n_perms: int = 1000,
     seed: int = 0,
     strict_run_locality: bool = False,
+    nested_gamma: bool = True,
     device: torch.device | None = None,
     chunk_size: int | None = None,
     verbose: bool = True,
@@ -1641,7 +1812,7 @@ def permutation_test(
     # makes the *partition* approximate -- it does not make the null invalid, because the
     # null is computed by the identical estimator under the identical design.
     ops: _CellOps | _TrialOps
-    if design.balanced:
+    if design.balanced and not nested_gamma:
         ops = _build_cell_ops(design, folds, device)
         partials_of = _cellspace_partials
 
@@ -1658,13 +1829,25 @@ def permutation_test(
             assert isinstance(trial_ops, _TrialOps)
             return _reduced_fit_trials(y, trial_ops, bands)
 
-        if verbose:
+        if verbose and not design.balanced:
             print(
                 f"   ⚠️  design is not balanced (max off-diagonal Gram "
                 f"{design.max_offdiag:.2e}); using the general trial-space permutation "
                 "engine, ~10x slower per permutation. The partition itself is approximate "
                 "under imbalance — check shared |C| before reading the p-values."
             )
+
+    if isinstance(ops, _TrialOps):
+        for spec in specs.values():
+            bands = tuple(sorted(spec.reduced))
+            if bands in ops.reduced_solvers:
+                continue
+            x = torch.cat(
+                [torch.ones(design.n_trials, 1, device=device)]
+                + [ops.band_mats[ops.band_order[i]] for i in bands],
+                dim=1,
+            )
+            ops.reduced_solvers[bands] = (x, torch.linalg.pinv(x.double()).float())
 
     if run is None:
         blocks = np.zeros(design.n_trials, dtype=np.int64)
@@ -1687,13 +1870,29 @@ def permutation_test(
             operation="xval",
         )
 
+    if nested_gamma:
+        trial_ops = ops
+        assert isinstance(trial_ops, _TrialOps)
+        fold_pairs = [(tr, te) for tr, te, _ in trial_ops.folds]
+        nested_perm_solvers = _build_nested_fold_solvers(
+            trial_ops.band_mats, trial_ops.band_order, fold_pairs
+        )
+
+        def stats_of(y: Tensor, keys: tuple[str, ...]) -> dict[str, Tensor]:
+            return _partition_stats_nested(y, trial_ops, nested_perm_solvers, specs, keys)
+
+    else:
+
+        def stats_of(y: Tensor, keys: tuple[str, ...]) -> dict[str, Tensor]:
+            return _partition_stats(*partials_of(y, ops), specs, keys)
+
     # Observed statistics, computed by the same engine the permutations use so that the
     # comparison is exact rather than merely close.
     observed: dict[str, Tensor] = {k: torch.zeros(n_vox) for k in statistics}
     for c0 in range(0, n_vox, chunk_size):
         c1 = min(c0 + chunk_size, n_vox)
         chunk = betas_t[c0:c1].to(device)
-        stats = _partition_stats(*partials_of(chunk, ops), specs, statistics)
+        stats = stats_of(chunk, statistics)
         for key in statistics:
             observed[key][c0:c1] = stats[key].cpu()
 
@@ -1735,7 +1934,8 @@ def permutation_test(
             "blocked_by_run": run is not None,
             "balanced": design.balanced,
             "max_offdiag_gram": design.max_offdiag,
-            "engine": "cell-space" if design.balanced else "trial-space",
+            "engine": "cell-space" if isinstance(ops, _CellOps) else "trial-space",
+            "nested_gamma": nested_gamma,
             "factors_nested_in_run": nested,
             "permutation_scheme": scheme_of,
             **fold_diag,
@@ -1782,7 +1982,7 @@ def permutation_test(
                 obs_chunk = obs_dev[c0:c1]
                 for p in range(n_perms):
                     y_star = fit_trials + resid[:, perms[p]]
-                    stats = _partition_stats(*partials_of(y_star, ops), specs, (key,))
+                    stats = stats_of(y_star, (key,))
                     s = stats[key]
                     null_max[p] = torch.maximum(null_max[p], s.max())
                     count_ge[c0:c1] += (s >= obs_chunk).to(torch.int32)
