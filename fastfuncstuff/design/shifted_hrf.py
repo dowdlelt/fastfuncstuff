@@ -275,21 +275,28 @@ def build_shifted_design_bank(
         valid = (i0 >= 0) & (i0 < n_h - 1)
         i0c = i0.clamp(0, n_h - 2)
         vals = torch.where(valid, h[i0c] * (1.0 - frac) + h[i0c + 1] * frac, torch.zeros_like(frac))
-        col = vals.sum(dim=(0, 1))
         if run_bounds is not None:
-            # confine to the run containing this block's first onset
-            t0 = float(ons.min())
-            keep = None
-            for r0, r1 in run_bounds:
-                if r0 * tr <= t0 < r1 * tr:
-                    keep = (r0, r1)
-                    break
-            if keep is None:
-                keep = run_bounds[-1]
-            m = torch.zeros(n_timepoints, dtype=col.dtype, device=device)
-            m[keep[0] : keep[1]] = 1.0
-            col = col * m
+            # Confine each EVENT's response to the run that event lives in,
+            # so a stimulus near a run boundary cannot spill its tail into
+            # the next run's samples.
+            #
+            # Per event, not per block: a condition-level block holds every
+            # repetition of that condition across the whole session, so
+            # masking the summed column by the run of its *first* onset
+            # silently zeroed every run after the first.  At 3 runs that
+            # discarded two thirds of the evidence for the very shift being
+            # estimated, and the fit still "worked" -- it just fitted run 1.
+            m = torch.zeros((ons.size, n_timepoints), dtype=vals.dtype, device=device)
+            for e, t0 in enumerate(ons.tolist()):
+                r0, r1 = run_bounds[-1]
+                for a, b_ in run_bounds:
+                    if a * tr <= t0 < b_ * tr:
+                        r0, r1 = a, b_
+                        break
+                m[e, r0:r1] = 1.0
+            vals = vals * m.view(-1, 1, 1, n_timepoints)
             del m
+        col = vals.sum(dim=(0, 1))
         bank[b] = col
         del lag, pos, i0, frac, valid, i0c, vals, col
     return bank

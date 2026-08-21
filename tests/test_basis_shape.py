@@ -771,3 +771,59 @@ class TestShiftParity:
         src = inspect.getsource(shifted_hrf.xval_shifted_hrf)
         assert "vox_chunk" in src, "per-voxel chunking missing from the xval predict loop"
         assert "_memory_budget" in src, "chunk size must come from the memory budget"
+
+
+class TestConditionBlocksSpanRuns:
+    """A condition-level block holds every repetition across the session.
+
+    Regression: build_shifted_design_bank masked the summed column to the
+    run containing the block's FIRST onset, which zeroed every run after
+    the first.  At 3 runs that discarded two thirds of the evidence for
+    the shift being estimated, and the fit still "worked" -- it fitted run
+    one.  The mask has to be per EVENT.
+    """
+
+    TR = 1.0
+    N_TP = 200
+    RUNS = [(0, 100), (100, 200)]
+
+    def _hrf(self):
+        return (
+            get_spm_canonical_hrf(
+                microtime_dt=DT, hrf_duration=DURATION, device=torch.device("cpu")
+            )
+            .numpy()
+            .astype(np.float64)
+        )
+
+    def _col(self, onsets):
+        from fastfuncstuff.design.shifted_hrf import build_shifted_design_bank
+
+        return build_shifted_design_bank(
+            [np.asarray(onsets, dtype=float)],
+            self._hrf(),
+            DT,
+            np.array([0.0]),
+            self.TR,
+            self.N_TP,
+            run_bounds=self.RUNS,
+            device=torch.device("cpu"),
+        )[0, 0].numpy()
+
+    def test_every_run_contributes(self):
+        col = self._col([10.0, 30.0, 50.0, 110.0, 130.0, 150.0])
+        e1 = float((col[:100] ** 2).sum())
+        e2 = float((col[100:] ** 2).sum())
+        assert e2 > 0.0, "run 2 was zeroed — the per-block mask is back"
+        assert e1 == pytest.approx(e2, rel=1e-6), "runs should contribute equally here"
+
+    def test_a_late_event_still_cannot_spill_across_the_boundary(self):
+        """The masking exists for a reason; the fix must not remove it."""
+        col = self._col([95.0])
+        assert float((col[100:] ** 2).sum()) == 0.0
+
+    def test_events_are_confined_to_their_own_run(self):
+        first = self._col([10.0])
+        second = self._col([110.0])
+        assert float((first[100:] ** 2).sum()) == 0.0
+        assert float((second[:100] ** 2).sum()) == 0.0
