@@ -827,3 +827,88 @@ class TestConditionBlocksSpanRuns:
         second = self._col([110.0])
         assert float((first[100:] ** 2).sum()) == 0.0
         assert float((second[:100] ** 2).sum()) == 0.0
+
+
+class TestSweepConvergence:
+    """Coordinate descent must report whether it finished, not just that it ran."""
+
+    def _fit(self, n_cond=8, n_sweeps=12, tol=1e-3, tsnr=30, nvox=60):
+        from fastfuncstuff.design import shifted_hrf as SH
+
+        cpu = torch.device("cpu")
+        tr, n_tp, n_run, n_ev = 0.5, 300, 2, 8
+        h = (
+            get_spm_canonical_hrf(microtime_dt=DT, hrf_duration=DURATION, device=cpu)
+            .numpy()
+            .astype(np.float64)
+        )
+        h = h / np.abs(h).max()
+        rng = np.random.default_rng(3)
+        true = np.linspace(-1.2, 1.2, n_cond)
+        offs = np.arange(n_run) * n_tp * tr
+        ons = [[] for _ in range(n_cond)]
+        for r in range(n_run):
+            slots = np.sort(rng.uniform(8, n_tp * tr - 35, n_cond * n_ev))
+            order = rng.permutation(np.repeat(np.arange(n_cond), n_ev))
+            for c in range(n_cond):
+                ons[c].append(np.sort(slots[order == c]) + offs[r])
+        blocks = [np.concatenate(ons[c]) for c in range(n_cond)]
+        total = n_run * n_tp
+        rb = [(r * n_tp, (r + 1) * n_tp) for r in range(n_run)]
+        taus = np.arange(-2, 2.001, 0.25)
+        bank = SH.build_shifted_design_bank(
+            blocks, h, DT, taus, tr, total, durations=[1.0] * n_cond, run_bounds=rb, device=cpu
+        ).numpy()
+        y = sum(bank[c, int(np.argmin(np.abs(taus - true[c])))] for c in range(n_cond))
+        y = y / np.abs(y).max()
+        Y = np.tile(y, (nvox, 1)) + rng.normal(0, 1.0 / tsnr, (nvox, total))
+        Z = np.zeros((total, 3 * n_run))
+        for r in range(n_run):
+            leg = np.polynomial.legendre.legvander(np.linspace(-1, 1, n_tp), 2)
+            Z[r * n_tp : (r + 1) * n_tp, 3 * r : 3 * r + 3] = leg
+        return SH.fit_shifted_hrf(
+            data=torch.tensor(Y),
+            block_onsets=blocks,
+            hrf=h,
+            hrf_dt=DT,
+            tr=tr,
+            durations=[1.0] * n_cond,
+            nuisance=torch.tensor(Z),
+            run_bounds=rb,
+            tau_max=2.0,
+            tau_step=0.25,
+            n_sweeps=n_sweeps,
+            sweep_tol=tol,
+            delay_prior_sd=0.75,
+            device=cpu,
+            verbose=False,
+        )
+
+    def test_n_sweeps_reports_what_ran_not_the_cap(self):
+        """A capped fit used to report itself as converged."""
+        fit = self._fit(n_sweeps=12)
+        assert fit.n_sweeps <= 12
+        assert fit.converged is (fit.n_sweeps < 12)
+
+    def test_early_stopping_beats_the_cap_on_an_easy_fit(self):
+        fit = self._fit(n_cond=4, n_sweeps=12)
+        assert fit.converged
+        assert fit.n_sweeps < 12, "4 conditions should not need the full cap"
+
+    def test_minimum_sweeps_is_respected(self):
+        """Sweep 1 runs unshrunk on purpose, so stopping at 1-2 is never right."""
+        fit = self._fit(n_cond=4, n_sweeps=12, tol=1.0)
+        assert fit.n_sweeps >= 4
+
+    def test_a_low_cap_is_reported_as_not_converged(self):
+        fit = self._fit(n_cond=8, n_sweeps=3)
+        assert fit.n_sweeps == 3
+        assert not fit.converged
+        assert fit.sweep_moved and fit.sweep_moved[-1] > 0
+
+    def test_movement_decreases(self):
+        """The trace has to be monotone-ish or the loop is not descending."""
+        fit = self._fit(n_cond=8, n_sweeps=12, tol=0.0)
+        moved = fit.sweep_moved[1:]  # sweep 1 has nothing to compare against
+        assert moved[0] > moved[-1]
+        assert moved[-1] < 0.01

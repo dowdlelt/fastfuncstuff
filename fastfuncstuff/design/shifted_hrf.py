@@ -58,7 +58,7 @@ Cost per coordinate step is O(n_blocks) rather than O(n_timepoints).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -142,7 +142,16 @@ class ShiftedHRFResult:
         ``(numerator, denominator)`` df actually charged, so the caller can
         re-derive a p-value or recompute under a different assumption.
     n_sweeps : int
-        Coordinate-descent sweeps actually run.
+        Coordinate-descent sweeps actually run (the max over voxel chunks).
+    sweep_moved : list[float]
+        Fraction of (voxel, block) grid indices that MOVED on each sweep,
+        for the last chunk.  The convergence trace: once it reaches zero
+        no later sweep can change anything, since coordinate descent on a
+        finite grid either moves an index or does not.
+    converged : bool
+        False when the sweep cap was reached with indices still moving,
+        i.e. the delays are still being estimated and ``-shift-sweeps``
+        is too low for this data.
     tau_grid : np.ndarray
         The candidate shifts searched, in seconds.
     """
@@ -157,6 +166,8 @@ class ShiftedHRFResult:
     amp_lambda: np.ndarray
     n_sweeps: int
     tau_grid: np.ndarray
+    sweep_moved: list[float] = field(default_factory=list)
+    converged: bool = True
 
 
 def _memory_budget(device: torch.device, fraction: float = 0.6) -> int:
@@ -302,6 +313,23 @@ def build_shifted_design_bank(
     return bank
 
 
+def _sweep_summary(used: list[int], trace: list[list[float]], cap: int) -> str:
+    """How many coordinate sweeps the fit actually needed.
+
+    Reported because it is the one number that says whether the outer loop
+    ran to convergence or was cut off by the cap -- and until sweeps stop
+    moving indices, the delays are still being estimated.
+    """
+    if not used:
+        return "0 sweep(s)"
+    hi = max(used)
+    tail = max((t[-1] for t in trace if t), default=0.0)
+    if hi < cap:
+        return f"{hi} sweep(s), converged"
+    moved = f"{tail:.2%}" if tail >= 1e-4 else f"{tail:.1e}"
+    return f"{hi} sweep(s), hit the -shift-sweeps cap with {moved} of delays still moving"
+
+
 def _solve_amplitudes(
     gi: Tensor,
     banded: Tensor,
@@ -442,7 +470,9 @@ def fit_shifted_hrf(
     tau_step: float = 0.25,
     durations: list[float] | None = None,
     run_bounds: list[tuple[int, int]] | None = None,
-    n_sweeps: int = 4,
+    n_sweeps: int = 12,
+    min_sweeps: int = 4,
+    sweep_tol: float = 1e-3,
     delay_prior_sd: float | None = 0.75,
     amp_ridge: float | str = AMP_RIDGE_DEFAULT,
     refine_delays: bool = True,
@@ -538,6 +568,8 @@ def fit_shifted_hrf(
         run_bounds=run_bounds,
         device=device,
     )
+    sweeps_used: list[int] = []
+    moved_trace: list[list[float]] = []
     bank_raw = bank
     bank = _project_out(bank, Z)  # (NB, G, T)
     flat = bank.reshape(n_blocks * n_grid, n_t)
@@ -759,7 +791,11 @@ def fit_shifted_hrf(
             amp_lam.float().cpu().numpy() if isinstance(amp_lam, Tensor) else float(amp_lam)
         )
 
+        gi_prev: Tensor | None = None
+        swept = 0
+        sweep_moved: list[float] = []
         for _sweep in range(max(1, n_sweeps)):
+            swept = _sweep + 1
             # Mean-field centre for the delay prior: the voxel's OWN mean
             # delay across blocks, recomputed once per sweep and held
             # fixed within it (updating mid-sweep feeds back on itself).
@@ -823,6 +859,21 @@ def fit_shifted_hrf(
                 amp_batch,
                 amp_lam,
             )
+            # Coordinate descent on a finite grid either moves a (voxel,
+            # block) to a new index or it does not, so "converged" is exact
+            # here rather than a tolerance: once no index moves, no later
+            # sweep can move one either.  Sweeps 1 and 2 are never counted --
+            # sweep 1 runs unshrunk on purpose (see above), so the first
+            # comparison that means anything is sweep 2 against sweep 3.
+            moved_frac = 1.0
+            if gi_prev is not None:
+                moved_frac = float((gi != gi_prev).to(torch.float32).mean())
+            sweep_moved.append(moved_frac)
+            gi_prev = gi.clone()
+            if _sweep + 1 >= max(min_sweeps, 3) and moved_frac <= sweep_tol:
+                break
+        sweeps_used.append(swept)
+        moved_trace.append(sweep_moved)
 
         # ---- sub-grid delay refinement --------------------------------
         # The grid search reports delays quantised to tau_step, which shows
@@ -873,7 +924,8 @@ def fit_shifted_hrf(
         gained = float(np.median(r2_out - r2_fixed_out))
         print(
             f"  Shifted-HRF: {n_blocks} blocks, grid ±{tau_max}s/{tau_step}s, "
-            f"{n_sweeps} sweep(s).  median task R² {float(np.median(r2_out)):.3f} "
+            f"{_sweep_summary(sweeps_used, moved_trace, n_sweeps)}.  "
+            f"median task R² {float(np.median(r2_out)):.3f} "
             f"(in-sample, vs non-drift variance; τ=0 baseline "
             f"{float(np.median(r2_fixed_out)):.3f}; incl. drift "
             f"{float(np.median(r2_total_out)):.3f}, "
@@ -890,8 +942,13 @@ def fit_shifted_hrf(
         fstat=fstat,
         fstat_df=(int(p_model), int(df_den)),
         amp_lambda=lam_out,
-        n_sweeps=int(max(1, n_sweeps)),
+        # What actually RAN, not what was allowed: the cap is an input, the
+        # sweep count is a result, and conflating them made a capped fit
+        # report itself as converged.
+        n_sweeps=int(max(sweeps_used)) if sweeps_used else 0,
         tau_grid=tau_grid,
+        sweep_moved=(moved_trace[-1] if moved_trace else []),
+        converged=(max(sweeps_used) < n_sweeps if sweeps_used else True),
     )
 
 
@@ -972,7 +1029,9 @@ def xval_shifted_hrf(
     tau_step: float = 0.25,
     delay_prior_sd: float | None = 0.75,
     amp_ridge: float | str = AMP_RIDGE_DEFAULT,
-    n_sweeps: int = 4,
+    n_sweeps: int = 12,
+    min_sweeps: int = 4,
+    sweep_tol: float = 1e-3,
     leave_n_out: int = 1,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -1109,6 +1168,8 @@ def xval_shifted_hrf(
                 tau_max=tau_max,
                 tau_step=tau_step,
                 n_sweeps=n_sweeps,
+                min_sweeps=min_sweeps,
+                sweep_tol=sweep_tol,
                 delay_prior_sd=delay_prior_sd,
                 amp_ridge=amp_ridge,
                 device=device,
@@ -1128,6 +1189,8 @@ def xval_shifted_hrf(
                 tau_max=tau_max,
                 tau_step=tau_step,
                 n_sweeps=n_sweeps,
+                min_sweeps=min_sweeps,
+                sweep_tol=sweep_tol,
                 delay_prior_sd=delay_prior_sd,
                 amp_ridge=amp_ridge,
                 device=device,
@@ -1527,7 +1590,9 @@ def fit_shifted_hrf_per_voxel_shape(
     run_bounds: list[tuple[int, int]] | None = None,
     tau_max: float = 2.0,
     tau_step: float = 0.25,
-    n_sweeps: int = 4,
+    n_sweeps: int = 12,
+    min_sweeps: int = 4,
+    sweep_tol: float = 1e-3,
     delay_prior_sd: float | None = 0.75,
     amp_ridge: float | str = AMP_RIDGE_DEFAULT,
     device: torch.device | None = None,
@@ -1590,6 +1655,8 @@ def fit_shifted_hrf_per_voxel_shape(
     fstat_df = (n_blocks * 2, max(1, int(y_src.shape[1]) - n_blocks * 2))
     tau_grid = np.arange(-tau_max, tau_max + 0.5 * tau_step, tau_step, dtype=np.float64)
     sweeps = 1
+    all_converged = True
+    last_moved = 0.0
 
     used = np.unique(shape_index)
     for si in tqdm(
@@ -1615,6 +1682,8 @@ def fit_shifted_hrf_per_voxel_shape(
             durations=durations,
             run_bounds=run_bounds,
             n_sweeps=n_sweeps,
+            min_sweeps=min_sweeps,
+            sweep_tol=sweep_tol,
             delay_prior_sd=delay_prior_sd,
             amp_ridge=amp_ridge,
             device=device,
@@ -1629,10 +1698,22 @@ def fit_shifted_hrf_per_voxel_shape(
         lam[sel] = sub.amp_lambda
         fstat_df = sub.fstat_df  # identical across groups: same blocks, same nuisance
         sweeps = max(sweeps, sub.n_sweeps)
+        all_converged = all_converged and sub.converged
+        if sub.sweep_moved:
+            last_moved = max(last_moved, sub.sweep_moved[-1])
 
     if verbose:
+        conv = (
+            f"{sweeps} sweep(s), converged"
+            if all_converged
+            else (
+                f"{sweeps} sweep(s), hit the -shift-sweeps cap with "
+                + (f"{last_moved:.2%}" if last_moved >= 1e-4 else f"{last_moved:.1e}")
+                + " of delays still moving"
+            )
+        )
         print(
-            f"  Shift fit across {used.size} occupied shape group(s): "
+            f"  Shift fit across {used.size} occupied shape group(s): {conv}.  "
             f"median task R² {float(np.median(r2)):.3f} "
             f"(vs non-drift variance; τ=0 baseline "
             f"{float(np.median(r2_fixed)):.3f})"
@@ -1648,6 +1729,8 @@ def fit_shifted_hrf_per_voxel_shape(
             fstat_df=fstat_df,
             amp_lambda=lam,
             n_sweeps=sweeps,
+            converged=all_converged,
+            sweep_moved=[last_moved],
             tau_grid=tau_grid,
         ),
         shape_index,
