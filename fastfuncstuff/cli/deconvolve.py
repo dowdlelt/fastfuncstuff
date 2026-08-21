@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -64,18 +65,34 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+        add_cv_metric_arg,
+        add_cv_strategy_arg,
         add_device_arg,
+        add_load_threads_arg,
+        add_ortvec_arguments,
+        add_trim_args,
         add_verbose_arg,
+        append_nuisance_blocks,
+        apply_trim_to_timing,
         auto_polort,
+        collect_nuisance_blocks,
+        load_and_preprocess_runs,
+        parse_cv_strategy,
+        parse_input_files,
         parse_prefix,
+        parse_timing_spec,
+        preflight_check,
+        print_cli_header,
+        run_lengths_from_starts,
         setup_device,
+        spinner,
+        trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
         legendre_polynomials,
-        parse_afni_timing_file,
+        pack_for_shared_task_glm,
     )
     from fastfuncstuff.design.matrices import (
-        build_glm_design,  # noqa: F401
         is_tr_locked,
         make_csplin_design,
         make_tent_design,
@@ -83,15 +100,7 @@ try:
     )
     from fastfuncstuff.glm.core import fit_glm
     from fastfuncstuff.glm.xval import compute_r2_metric
-    from fastfuncstuff.io.afni import (
-        get_tr_from_file,
-        load_afni_mask,
-        load_nifti,
-        onsets_to_tr_matrix,  # noqa: F401
-        save_nifti,
-        to_voxel_major,
-    )
-    from fastfuncstuff.utils import get_device  # noqa: F401
+    from fastfuncstuff.io.afni import save_nifti
 except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
@@ -391,13 +400,84 @@ def parse_args():
         help="Override TR from input files (seconds)",
     )
 
+    proc_opts.add_argument(
+        "-do_blur",
+        "-do-blur",
+        dest="do_blur",
+        type=float,
+        default=None,
+        metavar="FWHM",
+        help=(
+            "3-D Gaussian spatial smoothing, FWHM in mm, applied per run BEFORE "
+            "masking so edges do not bleed.  Typical values: 4-8 mm."
+        ),
+    )
+
+    proc_opts.add_argument(
+        "-do_scale",
+        "-do-scale",
+        dest="do_scale",
+        action="store_true",
+        help=(
+            "Scale each voxel per run to mean=100, so the estimated HRF is in "
+            "percent-signal-change units (values clipped at 200)."
+        ),
+    )
+
+    add_load_threads_arg(proc_opts)
+    add_trim_args(proc_opts)
+
+    # External nuisance regressors
+    nuis_opts = parser.add_argument_group(
+        "External Nuisance Regressors",
+        description=(
+            "Motion, physio, or denoising components (ffs_denoise /\n"
+            "ffs_denoisatorial PC timeseries).  Columns join the per-run\n"
+            "polynomial block diagonal, so they stay run-specific."
+        ),
+    )
+    add_ortvec_arguments(nuis_opts)
+
     # Output options
     out_opts = parser.add_argument_group("Output Options")
     out_opts.add_argument(
         "-save-betas",
+        "-save_betas",
+        dest="save_betas",
         action="store_true",
         help="Save beta coefficients as 4D NIfTI file",
     )
+
+    out_opts.add_argument(
+        "-save-r2",
+        "-save_r2",
+        dest="save_r2",
+        action="store_true",
+        help=(
+            "Save the in-sample full-model R² map ({prefix}_r2).  Includes the "
+            "polynomial / nuisance columns, so it is optimistic by construction "
+            "and rises with every basis function added — use -save-xval-r2 to "
+            "judge whether a window is actually earning its regressors."
+        ),
+    )
+
+    out_opts.add_argument(
+        "-save-xval-r2",
+        "-save_xval_r2",
+        dest="save_xval_r2",
+        action="store_true",
+        help=(
+            "Save a cross-validated R² map ({prefix}_xval_r2): fit the shared "
+            "HRF on the training runs, predict the held-out run, score the "
+            "concatenated predictions.  Polynomials and -ortvec columns are "
+            "projected out fold-locally (never from the full dataset), so the "
+            "number is the honest referee for 'does this deconvolution "
+            "generalise'.  See -cv_strategy / -cv_metric."
+        ),
+    )
+
+    add_cv_strategy_arg(out_opts)
+    add_cv_metric_arg(out_opts, dest="cv_metric", default="cod")
 
     out_opts.add_argument(
         "-save-design",
@@ -559,14 +639,6 @@ def parse_tent_windows(tent_window_args, n_conditions):
         )
 
 
-def print_help(parser):
-    """Print help message with examples"""
-    print(__doc__)
-    print("\nCommand-line options:")
-    print("=" * 70)
-    parser.print_help()
-
-
 def _fit_noise_gaussian(r2_vals: np.ndarray) -> tuple[float, float]:
     """
     Estimate the noise component of a LORO R² distribution.
@@ -634,7 +706,7 @@ def _loro_r2_per_voxel(
 
 
 def _compute_loro_r2_matrix(
-    data_list: list[np.ndarray],
+    data_list: list[torch.Tensor],
     onsets_per_condition: list,
     model: str,
     bot: float,
@@ -664,14 +736,15 @@ def _compute_loro_r2_matrix(
     r2_matrix : ndarray, shape (n_candidates, n_vox), float32
         Median LORO R² across folds for each candidate window × active voxel.
     vox_idx : ndarray, shape (n_vox,), int
-        Indices into the flattened voxel axis of *data_list* (0 … nx*ny*nz-1).
+        Indices into the voxel axis of *data_list* (i.e. loaded/masked voxels,
+        not full-volume indices — the caller maps them back).
     """
     n_tp_per_run = [d.shape[1] for d in data_list]
     n_voxels_total = data_list[0].shape[0]
 
     # ── Coarse background filter ─────────────────────────────────────────────
     rng = np.random.default_rng(42)
-    var_proxy = data_list[0].var(axis=1)
+    var_proxy = data_list[0].var(dim=1).cpu().numpy()
     nonzero = var_proxy[var_proxy > 0]
     if len(nonzero) == 0:
         active_idx = np.arange(n_voxels_total)
@@ -697,7 +770,7 @@ def _compute_loro_r2_matrix(
     data_clean: list[torch.Tensor] = []
 
     for run_idx, n_tp in enumerate(n_tp_per_run):
-        data_r = torch.tensor(data_xval[run_idx], dtype=torch.float32, device=device)
+        data_r = data_xval[run_idx].to(device=device, dtype=torch.float32)
         if polort >= 0:
             poly_np = legendre_polynomials(n_tp, polort)
             poly_r = torch.tensor(poly_np, dtype=torch.float32, device=device)
@@ -748,7 +821,7 @@ def _compute_loro_r2_matrix(
 
 
 def _xval_tent_top(
-    data_list: list[np.ndarray],
+    data_list: list[torch.Tensor],
     onsets_per_condition: list,
     model: str,
     bot: float,
@@ -827,6 +900,73 @@ def _xval_tent_top(
     return best_top, best_r2
 
 
+def _announce_written(paths: list[str] | str, elapsed: float, verb: int) -> None:
+    """One line per file written: the name plus what the write cost.
+
+    Every write here is wrapped in a ``spinner(leave=False)`` so a long save
+    still shows motion; this is the completion notice the spinner defers to.
+    Leaving the spinner's own line in place as well printed each file twice.
+    """
+    if verb < 1:
+        return
+    for p in [paths] if isinstance(paths, str) else paths:
+        print(f"  ✓ {p}  ({elapsed:.1f}s)")
+
+
+def _compute_xval_r2_map(
+    *,
+    packed,
+    run_starts: list[int],
+    n_runs: int,
+    cv_strategy: str,
+    metric: str,
+    device: torch.device,
+    verbose: bool,
+) -> np.ndarray | None:
+    """Cross-validated R² per voxel for the packed shared-task design.
+
+    Delegates to :func:`glm.xval.compute_xval_r2`, which is the one place that
+    knows how to split by run, project the nuisance **fold-locally**, and score
+    the concatenated held-out predictions. Projecting polynomials from the full
+    dataset before splitting is the classic way to leak training variance into
+    the held-out fold ([[LORO cross-validation]]) — hence the delegation rather
+    than a second implementation here.
+
+    Returns ``None`` when there are too few runs to split.
+    """
+    from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+
+    if n_runs < 2:
+        return None
+
+    n_task = packed.n_task_cols
+    n_cols = packed.design_concat.shape[1]
+    cv_splits = generate_cv_splits(n_runs=n_runs, strategy=parse_cv_strategy(cv_strategy))
+    if not cv_splits:
+        return None
+
+    if verbose:
+        print(f"\nCross-validated R² ({cv_strategy}, metric={metric})...")
+
+    result = compute_xval_r2(
+        data=packed.data_concat,
+        design_matrix=packed.design_concat,
+        run_starts=list(run_starts),
+        # The packed layout is task-first, so the nuisance is simply the tail.
+        # Block-diagonal columns go all-zero once a run is held out; the
+        # projector drops them rather than inverting a singular matrix.
+        stim_indices=list(range(n_task)),
+        nuisance_indices=list(range(n_task, n_cols)),
+        cv_splits=cv_splits,
+        metric=metric,
+        device=device,
+        verbose=verbose,
+    )
+    r2 = result["r2"]
+    assert isinstance(r2, torch.Tensor)
+    return r2.cpu().numpy().astype(np.float32)
+
+
 def main():
     """Main CLI entry point"""
     parser = parse_args()
@@ -834,6 +974,7 @@ def main():
 
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem  # overwrite with clean stem
+    Path(args.prefix).parent.mkdir(parents=True, exist_ok=True)
     _nii_ext = pfx.nifti_ext
 
     # Setup device — -device takes precedence over legacy --cpu flag
@@ -843,7 +984,8 @@ def main():
         print(f"Using device: {device}")
 
     # Validate design source
-    n_runs = len(args.input)
+    input_files = parse_input_files(args.input)
+    n_runs = len(input_files)
     if not args.onsets and not args.events:
         print("ERROR: Must specify -onsets or -events", file=sys.stderr)
         return 1
@@ -854,137 +996,99 @@ def main():
         print("ERROR: -event-ignore and -event-cols require -events", file=sys.stderr)
         return 1
 
-    # ── BIDS events: parse early so we have n_conditions/labels/onsets before data load ──
-    condition_durations: list[float] | None = None  # stimulus durations for auto-window
-    if args.events:
-        if len(args.events) not in (1, n_runs):
-            print(
-                f"ERROR: -events requires one TSV per run or a single shared TSV: "
-                f"got {len(args.events)} events files but {n_runs} input datasets.",
-                file=sys.stderr,
-            )
-            return 1
-        from fastfuncstuff.design.bids_events import (
-            check_events_pairing,
-            parse_bids_events,
-        )
-
-        # Events pair with -input by position; verify that when both sides carry
-        # sub/ses/task/run entities. A mispairing is otherwise silent.
-        try:
-            check_events_pairing(list(args.input), list(args.events), n_runs=n_runs)
-        except ValueError as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-
-        event_cols = tuple(args.event_cols) if args.event_cols else None
-        try:
-            bids_onsets, bids_durations, bids_labels = parse_bids_events(
-                event_files=args.events,
-                event_ignore=args.event_ignore,
-                event_cols=event_cols,
-                n_runs=n_runs,
-            )
-        except (FileNotFoundError, ValueError) as exc:
-            print(f"ERROR: {exc}", file=sys.stderr)
-            return 1
-        n_conditions = len(bids_labels)
-        # User-supplied -labels override BIDS trial_type names
-        if args.labels:
-            if len(args.labels) != n_conditions:
-                print(
-                    f"ERROR: -labels count ({len(args.labels)}) does not match "
-                    f"number of BIDS conditions ({n_conditions}: {bids_labels})",
-                    file=sys.stderr,
-                )
-                return 1
-            condition_labels = args.labels
-        else:
-            condition_labels = bids_labels
-        onsets_per_condition = bids_onsets
-        condition_durations = bids_durations  # used for auto-window estimation
-
-    else:
-        # ── AFNI timing files: labels determined now, onsets loaded after data ──
-        n_conditions = len(args.onsets)
-        if args.labels:
-            if len(args.labels) != n_conditions:
-                print(
-                    f"ERROR: Number of labels ({len(args.labels)}) must match "
-                    f"number of onset files ({n_conditions})",
-                    file=sys.stderr,
-                )
-                return 1
-            condition_labels = args.labels
-        else:
-            condition_labels = _labels_from_timing_files(args.onsets)
-        onsets_per_condition = None  # loaded below, after data
-
     if args.verb >= 1:
-        print(f"\n{'=' * 70}")
-        print("Fast fMRI Deconvolution")
-        print(f"{'=' * 70}")
+        print_cli_header("ffs_deconvolve", "FIR / TENT / CSPLIN deconvolution")
         print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("\nInput:")
-        print(f"  Runs: {n_runs}")
-        print(f"  Conditions: {n_conditions}")
-        print(f"  Condition labels: {', '.join(condition_labels)}")
+        print(f"  Compute device: {device}")
 
-    # Load data
-    if args.verb >= 1:
-        print("\nLoading fMRI data...")
+    # ── Event timing ─────────────────────────────────────────────────────────
+    # One parser for both BIDS -events TSVs and AFNI -onsets timing files, so
+    # the one-TSV-broadcast convention and the -input pairing check behave the
+    # same here as in every other GLM tool.  Parsed before the load because the
+    # condition list validates -window / -add-lag / -labels counts.
+    try:
+        timing = parse_timing_spec(
+            events=args.events,
+            onsets=args.onsets,
+            durations_arg=args.durations,
+            n_runs=n_runs,
+            event_ignore=args.event_ignore,
+            event_cols=tuple(args.event_cols) if args.event_cols else None,
+            round_durations=args.round_durations,
+            input_files=input_files,
+            verbose=args.verb >= 1,
+            allow_missing_durations=True,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
-    # data_list stores 2D (n_voxels, n_tp) arrays per run (float32)
-    data_list = []
-    n_timepoints_per_run = []
-    tr_values = []
-    nx = ny = nz = None
+    n_conditions = timing.n_conditions
+    # Stimulus durations drive auto-window estimation; None means "not known",
+    # in which case -window / -duration must supply the window.
+    condition_durations: list[float] | None = timing.durations if timing.durations_given else None
 
-    for i, input_file in enumerate(tqdm(args.input, desc="Loading runs", unit="run")):  # noqa: B007
-        if not Path(input_file).exists():
-            print(f"ERROR: Input file not found: {input_file}", file=sys.stderr)
-            return 1
-
-        # Load data as float32 (matches reml.py pattern)
-        img = load_nifti(input_file)
-        data = img.get_fdata(dtype=np.float32)
-
-        if data.ndim != 4:
-            print(f"ERROR: Expected 4D data, got {data.ndim}D: {input_file}", file=sys.stderr)
-            return 1
-
-        # Get TR
-        if args.tr is None:
-            tr = get_tr_from_file(input_file)
-            tr_values.append(tr)
-        else:
-            tr = args.tr
-
-        # Store spatial dims from first run
-        if nx is None:
-            nx, ny, nz = data.shape[:3]
-
-        n_tp = data.shape[3]
-        n_timepoints_per_run.append(n_tp)
-
-        # Flatten to 2D immediately to avoid large 4D concatenation later.
-        # Shared primitive: a plain reshape here is a single-threaded reversal
-        # of the whole run and would dominate load time.
-        data_list.append(to_voxel_major(data))
-
-    # Check TR consistency
-    if args.tr is None:
-        if len(set(tr_values)) > 1:
+    # User-supplied -labels override BIDS trial_type / timing-file names
+    if args.labels:
+        if len(args.labels) != n_conditions:
             print(
-                f"ERROR: Inconsistent TRs across runs: {tr_values}. Use -tr to override.",
+                f"ERROR: -labels count ({len(args.labels)}) does not match "
+                f"number of conditions ({n_conditions}: {timing.condition_labels})",
                 file=sys.stderr,
             )
             return 1
-        tr = tr_values[0]
+        condition_labels = list(args.labels)
+    else:
+        condition_labels = list(timing.condition_labels)
+
+    preflight_check(
+        input_files=input_files,
+        onset_files=args.onsets,
+        ortvec_files=None,
+    )
+
+    # ── Load data ────────────────────────────────────────────────────────────
+    # Shared loader: threaded decode (-load_threads), optional per-run blur
+    # (-do_blur) before masking, percent-signal scaling (-do_scale) and
+    # -drop_first/-drop_last trimming all happen here rather than in a
+    # deconvolve-only copy of the load path.
+    load_result = load_and_preprocess_runs(
+        input_files=input_files,
+        tr=args.tr,
+        mask_file=args.mask,
+        blur_fwhm=args.do_blur,
+        do_scale=args.do_scale,
+        device=device,
+        force_cpu=True,  # per-run views are sliced on CPU, streamed to GPU by fit_glm
+        verbose=args.verb >= 1,
+        load_threads=args.load_threads,
+        drop_first=args.drop_first,
+        drop_last=args.drop_last,
+    )
+
+    data = load_result.data  # (n_voxels_loaded, n_timepoints), CPU float32
+    run_starts = list(load_result.run_starts)
+    n_timepoints = load_result.n_timepoints
+    tr = load_result.tr
+    mask = load_result.mask
+    nx, ny, nz = load_result.volume_shape
+    n_timepoints_per_run = run_lengths_from_starts(run_starts, n_timepoints)
+    n_voxels_loaded = data.shape[0]
+
+    # Timing describes the file on disk; shift it onto the retained window
+    # before -round-onsets or any window estimation touches the onsets.
+    trim = trim_spec_from_args(args, tr=tr)
+    apply_trim_to_timing(
+        timing,
+        trim,
+        run_lengths_tr=n_timepoints_per_run,
+        n_runs=n_runs,
+        verbose=args.verb >= 1,
+    )
+    onsets_per_condition = timing.all_onsets
 
     if args.verb >= 1:
-        print(f"  TR: {tr}s")
-        print(f"  Total timepoints: {sum(n_timepoints_per_run)}")
+        print(f"  Total timepoints: {n_timepoints} across {n_runs} runs")
 
     # Resolve polort: "A" → AFNI auto formula based on run duration
     polort_str = str(args.polort).strip().upper()
@@ -1002,77 +1106,48 @@ def main():
             )
             return 1
 
-    if args.verb >= 1:
-        print(f"  Data shape: {nx} x {ny} x {nz}")
-
-    # Load mask if provided
-    mask = None
-    if args.mask:
+    # ── External nuisance (-ortvec family) ───────────────────────────────────
+    # Kept per-run on the block diagonal alongside the polynomials: components
+    # estimated on one run do not describe the others ([[Block-diagonal
+    # nuisance]]).
+    try:
+        nuisance_blocks = collect_nuisance_blocks(
+            args,
+            run_starts=run_starts,
+            n_timepoints=n_timepoints,
+            verbose=args.verb >= 1,
+            trim=trim,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    extra_regs_per_run: list[torch.Tensor] | None = None
+    if nuisance_blocks:
+        extra_regs_per_run = append_nuisance_blocks(
+            [torch.zeros((n, 0), dtype=torch.float32) for n in n_timepoints_per_run],
+            nuisance_blocks,
+            run_starts,
+            n_timepoints,
+        )
         if args.verb >= 1:
-            print(f"\nLoading mask: {args.mask}")
-        mask = load_afni_mask(args.mask)
-
-        # Check mask shape
-        if mask.shape != (nx, ny, nz):
+            n_extra = extra_regs_per_run[0].shape[1]
             print(
-                f"ERROR: Mask shape {mask.shape} doesn't match data shape {(nx, ny, nz)}",
-                file=sys.stderr,
-            )
-            return 1
-
-        n_voxels = np.sum(mask)
-        if args.verb >= 1:
-            print(
-                f"  Mask: {n_voxels} / {nx * ny * nz} voxels ({100 * n_voxels / (nx * ny * nz):.1f}%)"
+                f"  External nuisance: {n_extra} column(s) per run "
+                f"({n_extra * n_runs} total, block-diagonal)"
             )
 
-    # Load onsets
-    if args.onsets:
-        # ── AFNI timing files ────────────────────────────────────────────────
-        if args.verb >= 1:
-            print("\nLoading onset timing files...")
+    # Per-run views of the loaded (already masked) data.  Slices are views, so
+    # this costs nothing until pack_for_shared_task_glm concatenates.
+    data_list = [data[:, s : s + n] for s, n in zip(run_starts, n_timepoints_per_run, strict=True)]
 
-        onsets_per_condition = []
-        for onset_file in args.onsets:
-            if args.verb >= 1:
-                print(f"  {onset_file}")
-
-            onsets_by_run = parse_afni_timing_file(onset_file)
-
-            if len(onsets_by_run) != n_runs:
-                print(
-                    f"ERROR: Timing file {onset_file} has {len(onsets_by_run)} runs, "
-                    f"but expected {n_runs} runs",
-                    file=sys.stderr,
-                )
-                return 1
-
-            onsets_per_condition.append(onsets_by_run)
-
-        # Parse per-condition stimulus durations for auto-window estimation
-        if args.durations:
-            from fastfuncstuff.design.builder import parse_durations
-
-            condition_durations = parse_durations(args.durations, n_conditions, condition_labels)
-            if args.verb >= 1:
-                if len(set(condition_durations)) == 1:
-                    print(f"  Stimulus duration (all conditions): {condition_durations[0]:.3f}s")
-                else:
-                    for lbl, dur in zip(condition_labels, condition_durations, strict=False):
-                        print(f"  {lbl}: {dur:.3f}s")
-
-    else:
-        # BIDS path: onsets_per_condition already set above
-        if args.verb >= 1:
-            # Listed in pairing order. This print used to sort independently of the
-            # parse, which made a genuine mispairing look like a display quirk.
-            print("\nBIDS events files (in -input pairing order):")
-            for ep in args.events:
-                print(f"  {ep}")
-            print()
-            for cidx, lbl in enumerate(condition_labels):
-                n_ev = sum(len(onsets_per_condition[cidx][r]) for r in range(n_runs))
-                print(f"  {lbl}: {n_ev} events  (duration={condition_durations[cidx]:.3f}s)")  # type: ignore[index]
+    def _to_volume(masked: np.ndarray) -> np.ndarray:
+        """Place (n_voxels_loaded, ...) values back into the full 3-D volume."""
+        out_shape = (nx, ny, nz) + tuple(masked.shape[1:])
+        if mask is not None:
+            out = np.zeros(out_shape, dtype=np.float32)
+            out[mask, ...] = masked
+            return out
+        return np.ascontiguousarray(masked, dtype=np.float32).reshape(out_shape)
 
     # ── Optional onset / duration rounding ──────────────────────────────────
     if args.round_onsets is not None:
@@ -1154,7 +1229,6 @@ def main():
         # globals for the *entire* main() function (Python's lexical
         # scope), breaking the FIR/TENT save paths below.  So just
         # import the FLOBS-specific helpers here.
-        from fastfuncstuff.design.builder import pack_for_shared_task_glm
         from fastfuncstuff.design.flobs import (
             fit_flobs_constrained,
             generate_flobs_basis,
@@ -1214,12 +1288,8 @@ def main():
                 torch.from_numpy(np.concatenate(cond_blocks, axis=1).astype(np.float32))
             )
 
-        # Per-run data list
-        if mask is not None:
-            mask_flat = mask.flatten()
-            per_run_data = [torch.from_numpy(d[mask_flat, :].astype(np.float32)) for d in data_list]
-        else:
-            per_run_data = [torch.from_numpy(d.astype(np.float32)) for d in data_list]
+        # Per-run data list (the loader already applied -mask)
+        per_run_data = data_list
 
         # Canonical shared-task multi-run GLM packing (same helper the
         # FIR/TENT path uses) — task block shared across runs,
@@ -1233,6 +1303,8 @@ def main():
                 for c in range(n_conditions)
                 for b in range(args.flobs_n_basis)
             ],
+            extra_regressors_per_run=extra_regs_per_run,
+            drop_empty_nuisance=True,
             device=torch.device("cpu"),
         )
         if args.verb >= 1:
@@ -1302,16 +1374,6 @@ def main():
             )
             print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}   constrained: {fit.r2.mean():.3f}")
 
-        def _to_volume(masked_data: np.ndarray, ndim_extra: int) -> np.ndarray:
-            """Place masked-voxel data back into the full volume."""
-            out_shape = (nx, ny, nz) + tuple(masked_data.shape[1:])
-            out = np.zeros(out_shape, dtype=np.float32)
-            if mask is not None:
-                out[mask, ...] = masked_data
-            else:
-                out = masked_data.reshape(out_shape)
-            return out
-
         # ── Save FLOBS basis (one TSV, shared across conditions) ────
         basis_path = f"{args.prefix}_flobs_basis.tsv"
         np.savetxt(
@@ -1326,21 +1388,19 @@ def main():
         # ── Save R² volumes ─────────────────────────────────────────
         # Two maps: constrained (the published one) and unconstrained
         # (so the user can see *where the prior changed the fit*).
-        from fastfuncstuff.cli_utils import spinner
-
-        with spinner("Writing FLOBS R² maps"):
-            for r2_arr, suffix in (
-                (fit.r2, ""),
-                (fit.r2_ols, "_unconstrained"),
-            ):
-                r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
+        for r2_arr, suffix in (
+            (fit.r2, ""),
+            (fit.r2_ols, "_unconstrained"),
+        ):
+            r2_path = f"{args.prefix}_flobs_r2{suffix}{_nii_ext}"
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(r2_path).name}", enabled=args.verb >= 1, leave=False):
                 save_nifti(
-                    _to_volume(r2_arr[:, None], 0).squeeze(-1),
+                    _to_volume(r2_arr[:, None]).squeeze(-1),
                     output_path=r2_path,
-                    reference_img=args.input[0],
+                    reference_img=input_files[0],
                 )
-                if args.verb >= 1:
-                    print(f"  Wrote {r2_path}")
+            _announce_written(r2_path, time.perf_counter() - t_write, args.verb)
 
         # ── Per-condition iresp (reconstructed HRF) — BOTH fits ────
         if args.flobs_save_iresp:
@@ -1352,20 +1412,24 @@ def main():
                 (fit.hrfs, ""),
                 (fit.hrfs_ols, "_unconstrained"),
             ):
-                iresp_vol = _to_volume(hrfs_arr, 2)
-                iresp_files = save_iresp(
-                    iresp=iresp_vol,
-                    output_prefix=f"{args.prefix}_flobs",
-                    condition_labels=[f"{lbl}{fit_suffix}" for lbl in condition_labels],
-                    tr=basis.dt,
-                    bot=0.0,
-                    top=basis.duration - basis.dt,
-                    reference_img=args.input[0],
-                    nii_ext=_nii_ext,
-                )
-                if args.verb >= 1:
-                    for f in iresp_files:
-                        print(f"  Wrote {f}")
+                iresp_vol = _to_volume(hrfs_arr)
+                t_write = time.perf_counter()
+                with spinner(
+                    f"Writing FLOBS iresp{fit_suffix or ' (constrained)'}",
+                    enabled=args.verb >= 1,
+                    leave=False,
+                ):
+                    iresp_files = save_iresp(
+                        iresp=iresp_vol,
+                        output_prefix=f"{args.prefix}_flobs",
+                        condition_labels=[f"{lbl}{fit_suffix}" for lbl in condition_labels],
+                        tr=basis.dt,
+                        bot=0.0,
+                        top=basis.duration - basis.dt,
+                        reference_img=input_files[0],
+                        nii_ext=_nii_ext,
+                    )
+                _announce_written(iresp_files, time.perf_counter() - t_write, args.verb)
 
         # ── Per-condition PC weights + amplitude — BOTH fits ───────
         for cond_idx, label in enumerate(condition_labels):
@@ -1373,15 +1437,19 @@ def main():
                 (task_betas, amplitude, ""),
                 (task_betas_ols, amplitude_ols, "_unconstrained"),
             ):
-                weights_4d = _to_volume(tbetas[:, cond_idx, :], 1)
+                weights_4d = _to_volume(tbetas[:, cond_idx, :])
                 weights_path = f"{args.prefix}_flobs_pcweights_{label}{suffix}{_nii_ext}"
-                save_nifti(weights_4d, output_path=weights_path, reference_img=args.input[0])
-                amp_3d = _to_volume(amps[:, cond_idx][:, None], 0).squeeze(-1)
+                amp_3d = _to_volume(amps[:, cond_idx][:, None]).squeeze(-1)
                 amp_path = f"{args.prefix}_flobs_amplitude_{label}{suffix}{_nii_ext}"
-                save_nifti(amp_3d, output_path=amp_path, reference_img=args.input[0])
-                if args.verb >= 1:
-                    print(f"  Wrote {weights_path}")
-                    print(f"  Wrote {amp_path}")
+                t_write = time.perf_counter()
+                with spinner(
+                    f"Writing FLOBS maps: {label}{suffix}", enabled=args.verb >= 1, leave=False
+                ):
+                    save_nifti(weights_4d, output_path=weights_path, reference_img=input_files[0])
+                    save_nifti(amp_3d, output_path=amp_path, reference_img=input_files[0])
+                _announce_written(
+                    [weights_path, amp_path], time.perf_counter() - t_write, args.verb
+                )
 
         if args.verb >= 1:
             print(f"\n{'=' * 70}")
@@ -1569,7 +1637,6 @@ def main():
     if _do_per_voxel:
         zero_edges_pv = model in ("TENTzero", "CSPLINzero")
         use_csplin_pv = model in ("CSPLIN", "CSPLINzero")
-        n_all_voxels = nx * ny * nz
 
         # 1. LORO R² for every candidate window, all active voxels (no subsampling cap)
         if args.verb >= 1:
@@ -1587,35 +1654,47 @@ def main():
             verbose=args.verb >= 1,
             max_voxels=500_000,
         )
-        # r2_matrix: (n_candidates, n_vox); vox_idx: flat [0, nx*ny*nz)
+        # r2_matrix: (n_candidates, n_vox); vox_idx indexes the LOADED voxel axis
 
         # 2. Per-voxel argmax → best candidate index → best top value
         best_cand_per_vox = np.argmax(r2_matrix, axis=0)  # (n_vox,)
         best_top_per_vox = np.array([_pv_tops[i] for i in best_cand_per_vox], dtype=np.float32)
 
         # 3. Save r2_by_window map (4D: one volume per candidate)
-        r2_bw_vol = np.zeros((n_all_voxels, len(_pv_tops)), dtype=np.float32)
-        r2_bw_vol[vox_idx] = r2_matrix.T
-        r2_bw_vol = r2_bw_vol.reshape(nx, ny, nz, len(_pv_tops))
+        r2_bw = np.zeros((n_voxels_loaded, len(_pv_tops)), dtype=np.float32)
+        r2_bw[vox_idx] = r2_matrix.T
         r2_bw_file = f"{args.prefix}_r2_by_window{_nii_ext}"
-        from fastfuncstuff.cli_utils import spinner
-
-        with spinner(f"Writing {Path(r2_bw_file).name}"):
-            save_nifti(r2_bw_vol, r2_bw_file, reference_img=args.input[0])
-        del r2_bw_vol
-        if args.verb >= 1:
-            print(f"  Saved: {r2_bw_file}")
+        t_write = time.perf_counter()
+        with spinner(f"Writing {Path(r2_bw_file).name}", enabled=args.verb >= 1, leave=False):
+            save_nifti(_to_volume(r2_bw), r2_bw_file, reference_img=input_files[0])
+        _announce_written(r2_bw_file, time.perf_counter() - t_write, args.verb)
+        del r2_bw
 
         # 4. Save windowsize map (3D: winning top in seconds)
-        ws_vol = np.zeros(n_all_voxels, dtype=np.float32)
-        ws_vol[vox_idx] = best_top_per_vox
-        ws_vol = ws_vol.reshape(nx, ny, nz)
+        ws = np.zeros((n_voxels_loaded, 1), dtype=np.float32)
+        ws[vox_idx, 0] = best_top_per_vox
         ws_file = f"{args.prefix}_windowsize{_nii_ext}"
-        with spinner(f"Writing {Path(ws_file).name}"):
-            save_nifti(ws_vol, ws_file, reference_img=args.input[0])
-        del ws_vol
-        if args.verb >= 1:
-            print(f"  Saved: {ws_file}")
+        t_write = time.perf_counter()
+        with spinner(f"Writing {Path(ws_file).name}", enabled=args.verb >= 1, leave=False):
+            save_nifti(_to_volume(ws).squeeze(-1), ws_file, reference_img=input_files[0])
+        _announce_written(ws_file, time.perf_counter() - t_write, args.verb)
+        del ws
+
+        # 4b. The winning candidate's LORO R² IS a cross-validated R² map, so
+        # -save-xval-r2 costs nothing extra here. It is optimistically biased
+        # (the window was chosen per voxel on this same CV score) — a nested
+        # split would be needed to remove that, which this mode does not do.
+        if args.save_xval_r2:
+            xr2 = np.zeros((n_voxels_loaded, 1), dtype=np.float32)
+            xr2[vox_idx, 0] = r2_matrix[best_cand_per_vox, np.arange(len(vox_idx))]
+            xr2_file = f"{args.prefix}_xval_r2{_nii_ext}"
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(xr2_file).name}", enabled=args.verb >= 1, leave=False):
+                save_nifti(_to_volume(xr2).squeeze(-1), xr2_file, reference_img=input_files[0])
+            _announce_written(xr2_file, time.perf_counter() - t_write, args.verb)
+            del xr2
+            if args.verb >= 1:
+                print("      R² of each voxel's winning window")
 
         # 5. Output dimensions: max window → max_n_knots timepoints per condition
         max_top_pv = max(_pv_tops)
@@ -1628,88 +1707,69 @@ def main():
                 f"(max window {_pv_bot:.1f}–{max_top_pv:.2f}s)"
             )
 
-        # 6. Assemble full data tensor (unmasked; vox_idx is in full flat space)
-        data_full_pv = np.concatenate(data_list, axis=1)  # (n_all_vox, total_tp)
-        del data_list
-        data_tensor_pv = torch.tensor(data_full_pv, dtype=torch.float32, device="cpu")
-        del data_full_pv
+        # 6. The loaded data, already concatenated across runs by the loader.
+        data_tensor_pv = data
 
-        # Map voxels not in vox_idx (background) to the nominal top as fallback
+        # Map voxels not in vox_idx (below the variance floor) to the nominal
+        # top as fallback
         fallback_top = min(_pv_tops, key=lambda t: abs(t - _pv_nom_top))
-        full_best_top = np.full(n_all_voxels, fallback_top, dtype=np.float32)
+        full_best_top = np.full(n_voxels_loaded, fallback_top, dtype=np.float32)
         full_best_top[vox_idx] = best_top_per_vox
 
-        # 7. Assemble per-voxel betas: one (n_all_voxels, max_n_basis_out) array per condition
+        # 7. Assemble per-voxel betas: one (n_voxels_loaded, max_n_basis_out) per condition
         assembled_betas = [
-            np.zeros((n_all_voxels, max_n_basis_out), dtype=np.float32) for _ in range(n_conditions)
+            np.zeros((n_voxels_loaded, max_n_basis_out), dtype=np.float32)
+            for _ in range(n_conditions)
         ]
 
         unique_tops_pv = sorted(set(full_best_top.tolist()))
         if args.verb >= 1:
             print(f"\n  Fitting GLMs for {len(unique_tops_pv)} unique winning windows...")
 
-        def _build_full_design_for_top(top_val: float) -> torch.Tensor:
-            """Build stimulus + poly design for all runs concatenated."""
-            stim_parts = []
+        def _per_run_designs_for_top(top_val: float) -> list[torch.Tensor]:
+            """Per-run task-only designs for one candidate window top."""
+            out = []
             for run_idx, n_tp in enumerate(n_timepoints_per_run):
                 cond_parts = []
+                fn = make_csplin_design if use_csplin_pv else make_tent_design
                 for cond_idx in range(n_conditions):
-                    onset_times = onsets_per_condition[cond_idx][run_idx]
-                    if use_csplin_pv:
-                        d_c = make_csplin_design(
-                            onset_times_list=[onset_times],
+                    cond_parts.append(
+                        fn(
+                            onset_times_list=[onsets_per_condition[cond_idx][run_idx]],
                             bot=_pv_bot,
                             top=top_val,
                             tr=tr,
                             n_timepoints=n_tp,
                             n_basis=args.tent_n_basis,
-                            zero_edges=(model == "CSPLINzero"),
-                            device=device,
+                            zero_edges=zero_edges_pv,
+                            device=torch.device("cpu"),
                         )
-                    else:
-                        d_c = make_tent_design(
-                            onset_times_list=[onset_times],
-                            bot=_pv_bot,
-                            top=top_val,
-                            tr=tr,
-                            n_timepoints=n_tp,
-                            n_basis=args.tent_n_basis,
-                            zero_edges=(model == "TENTzero"),
-                            device=device,
-                        )
-                    cond_parts.append(d_c)
-                stim_parts.append(torch.cat(cond_parts, dim=1))
-            design_stim = torch.cat(stim_parts, dim=0)
-
-            if args.polort < 0:
-                return design_stim
-
-            n_poly_per_run = args.polort + 1
-            total_poly_cols = len(n_timepoints_per_run) * n_poly_per_run
-            poly_full = np.zeros((sum(n_timepoints_per_run), total_poly_cols))
-            tr_start = col_start = 0
-            for run_idx, n_tp in enumerate(n_timepoints_per_run):  # noqa: B007
-                poly_run = legendre_polynomials(n_tp, args.polort)
-                poly_full[tr_start : tr_start + n_tp, col_start : col_start + n_poly_per_run] = (
-                    poly_run
-                )
-                tr_start += n_tp
-                col_start += n_poly_per_run
-            poly_tensor = torch.tensor(poly_full, dtype=torch.float32, device=device)
-            return torch.cat([design_stim, poly_tensor], dim=1)
+                    )
+                out.append(torch.cat(cond_parts, dim=1))
+            return out
 
         for top_k in tqdm(unique_tops_pv, desc="  Fitting", disable=not args.verb >= 1):
             vox_this_top = np.where(full_best_top == top_k)[0]
             n_knots_k = round((top_k - _pv_bot) / tr) + 1
             n_regs_k = n_knots_k - 2 if zero_edges_pv else n_knots_k
-            n_stim_k = n_conditions * n_regs_k
-
-            design_k = _build_full_design_for_top(top_k)
 
             data_sub = data_tensor_pv[vox_this_top, :]
+            # Same canonical packing as the single-window path: shared task
+            # block, per-run polynomials + external nuisance block-diagonal.
+            packed_k = pack_for_shared_task_glm(
+                per_run_data=[
+                    data_sub[:, st : st + n]
+                    for st, n in zip(run_starts, n_timepoints_per_run, strict=True)
+                ],
+                per_run_task_designs=_per_run_designs_for_top(top_k),
+                polort=args.polort,
+                extra_regressors_per_run=extra_regs_per_run,
+                drop_empty_nuisance=True,
+                device=torch.device("cpu"),
+            )
             results_k = fit_glm(
-                data=data_sub,
-                design=design_k,
+                data=packed_k.data_concat,
+                design=packed_k.design_concat,
                 tr=tr,
                 max_poly_degree=-1,
                 device=device,
@@ -1718,7 +1778,7 @@ def main():
                 verbose=False,
                 debug_memory=args.debug_memory,
             )
-            betas_stim_k = results_k.betas[:, :n_stim_k].cpu().numpy()
+            betas_stim_k = results_k.betas[:, : packed_k.n_task_cols].cpu().numpy()
 
             for cond_idx in range(n_conditions):
                 cond_start = cond_idx * n_regs_k
@@ -1741,23 +1801,28 @@ def main():
 
         output_files_pv = []
         for cond_idx in range(n_conditions):
-            betas_4d = assembled_betas[cond_idx].reshape(nx, ny, nz, max_n_basis_out)
+            betas_4d = _to_volume(assembled_betas[cond_idx])
             iresp_cond = betas_4d[:, :, :, np.newaxis, :]
-            files = save_iresp(
-                iresp=iresp_cond,
-                output_prefix=args.prefix,
-                condition_labels=[condition_labels[cond_idx]],
-                tr=tr,
-                bot=_pv_bot,
-                top=max_top_pv,
-                reference_img=args.input[0],
-                nii_ext=_nii_ext,
-            )
+            t_write = time.perf_counter()
+            with spinner(
+                f"Writing iresp: {condition_labels[cond_idx]}",
+                enabled=args.verb >= 1,
+                leave=False,
+            ):
+                files = save_iresp(
+                    iresp=iresp_cond,
+                    output_prefix=args.prefix,
+                    condition_labels=[condition_labels[cond_idx]],
+                    tr=tr,
+                    bot=_pv_bot,
+                    top=max_top_pv,
+                    reference_img=input_files[0],
+                    nii_ext=_nii_ext,
+                )
+            _announce_written(files, time.perf_counter() - t_write, args.verb)
             output_files_pv.extend(files)
 
         if args.verb >= 1:
-            for f in output_files_pv:
-                print(f"  ✓ {f}")
             print(f"\n{'=' * 70}")
             print("✓ Per-voxel deconvolution complete!")
             print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1813,15 +1878,9 @@ def main():
     column_labels = list(design_result.column_labels)
     n_stimulus_regressors = sum(n_basis_per_condition_list)
 
-    # design_full is *only* used by the save_design / save_design_plot
-    # diagnostic paths below; the actual fit operates on the per-run
-    # list (so fit_glm owns block-diagonal polynomial nuisance — see
-    # the fit_glm call near the end of this function).  Reconstruct
-    # the row-concat for those output artifacts.
-    design_full = torch.cat(per_run_designs, dim=0)
-
     if args.verb >= 1:
-        print(f"  Design matrix shape: {design_full.shape}")
+        n_task_rows = sum(d.shape[0] for d in per_run_designs)
+        print(f"  Task design shape: ({n_task_rows}, {per_run_designs[0].shape[1]})")
         if len(set(n_basis_per_condition_list)) == 1:
             print(
                 f"  Stimulus regressors: {n_stimulus_regressors} ({n_basis_per_condition_list[0]} per condition)"
@@ -1837,6 +1896,50 @@ def main():
     # was the historical foot-gun — both can produce the same result
     # but the duplication has caused real bugs.  Now there's exactly
     # one place where polys enter the design: pack_for_shared_task_glm.
+
+    # Prepare data and pack into the canonical shared-task GLM form.
+    #
+    # The canonical multi-run fMRI GLM is::
+    #
+    #   [  task block  | run0_poly | run1_poly | ... ]
+    #   [   (shared    |   ↑↑↑    |    0      |     ]
+    #   [   across     |   run0    |          |     ]
+    #   [   runs)      |    0     |   run1   |     ]
+    #
+    # i.e. ONE set of task betas estimated jointly across all runs +
+    # per-run polynomial nuisance on a block diagonal (polys absorb
+    # run-specific means / drifts / trends, which are NOT shared).
+    # ``fit_glm`` alone does NOT produce this when handed per-run lists
+    # — it block-diagonalizes the task block too, estimating per-run
+    # betas (1/n_runs of the data per estimate, much noisier).
+    #
+    # ``pack_for_shared_task_glm`` builds the canonical concatenated
+    # form once; the fit then runs with ``max_poly_degree=-1`` to
+    # suppress ``fit_glm``'s auto-poly path (polys are already in the
+    # packed design — don't double-count them).
+    if args.verb >= 1:
+        print("\nPreparing data for GLM (shared task + block-diag polys)...")
+
+    per_run_data = data_list  # loader already applied -mask / -do_blur / -do_scale
+
+    packed = pack_for_shared_task_glm(
+        per_run_data=per_run_data,
+        per_run_task_designs=per_run_designs,
+        polort=args.polort,
+        task_column_labels=column_labels,
+        extra_regressors_per_run=extra_regs_per_run,
+        # OLS solve: a per-run nuisance block supplied for only some runs
+        # leaves all-zero columns in the others' diagonal slots.
+        drop_empty_nuisance=True,
+        device=torch.device("cpu"),
+    )
+
+    # The save-design / save-plot artefacts below are written from the fully
+    # augmented (task + polys + external nuisance) packed form, so what lands
+    # on disk is exactly what fit_glm sees.
+    design_full = packed.design_concat
+    column_labels = packed.column_labels
+    n_stimulus_regressors = packed.n_task_cols
 
     # Save design matrix if requested
     if args.save_design:
@@ -1883,6 +1986,13 @@ def main():
                 f.write(
                     f"#   Total polynomial regressors: {len(n_timepoints_per_run) * (args.polort + 1)}\n"
                 )
+
+            if extra_regs_per_run is not None:
+                n_extra = extra_regs_per_run[0].shape[1]
+                f.write("#\n")
+                f.write("# External nuisance (zero-padded per run):\n")
+                f.write(f"#   Regressors per run: {n_extra}\n")
+                f.write(f"#   Total: {n_extra * len(n_timepoints_per_run)}\n")
 
             f.write("#\n")
             f.write("# Column labels:\n")
@@ -1969,11 +2079,10 @@ def main():
                 x_tick_labels.append(condition_labels[cond_idx])
                 basis_idx += n_basis
 
-            if args.polort >= 0:
-                # Add label for polynomials
-                poly_n = design_np.shape[1] - n_stimulus_regressors
-                x_tick_positions.append(n_stimulus_regressors + poly_n / 2)
-                x_tick_labels.append("polort")
+            n_nuisance_cols = design_np.shape[1] - n_stimulus_regressors
+            if n_nuisance_cols > 0:
+                x_tick_positions.append(n_stimulus_regressors + n_nuisance_cols / 2)
+                x_tick_labels.append("nuisance")
 
             ax.set_xticks(x_tick_positions)
             ax.set_xticklabels(x_tick_labels)
@@ -1991,53 +2100,6 @@ def main():
         except ImportError:
             print("WARNING: matplotlib not available, skipping design plot", file=sys.stderr)
 
-    # Prepare data and pack into the canonical shared-task GLM form.
-    #
-    # The canonical multi-run fMRI GLM is::
-    #
-    #   [  task block  | run0_poly | run1_poly | ... ]
-    #   [   (shared    |   ↑↑↑    |    0      |     ]
-    #   [   across     |   run0    |          |     ]
-    #   [   runs)      |    0     |   run1   |     ]
-    #
-    # i.e. ONE set of task betas estimated jointly across all runs +
-    # per-run polynomial nuisance on a block diagonal (polys absorb
-    # run-specific means / drifts / trends, which are NOT shared).
-    # ``fit_glm`` alone does NOT produce this when handed per-run lists
-    # — it block-diagonalizes the task block too, estimating per-run
-    # betas (1/n_runs of the data per estimate, much noisier).
-    #
-    # ``pack_for_shared_task_glm`` builds the canonical concatenated
-    # form once; the fit then runs with ``max_poly_degree=-1`` to
-    # suppress ``fit_glm``'s auto-poly path (polys are already in the
-    # packed design — don't double-count them).
-    if args.verb >= 1:
-        print("\nPreparing data for GLM (shared task + block-diag polys)...")
-
-    from fastfuncstuff.design.builder import pack_for_shared_task_glm
-
-    if mask is not None:
-        mask_flat = mask.flatten()
-        per_run_data = [torch.from_numpy(d[mask_flat, :].astype(np.float32)) for d in data_list]
-    else:
-        per_run_data = [torch.from_numpy(d.astype(np.float32)) for d in data_list]
-    del data_list
-
-    packed = pack_for_shared_task_glm(
-        per_run_data=per_run_data,
-        per_run_task_designs=per_run_designs,
-        polort=args.polort,
-        task_column_labels=column_labels,
-        device=torch.device("cpu"),
-    )
-
-    # Replace the save-design / save-plot artefact with the fully
-    # augmented (task + polys) packed form so what we save matches
-    # what fit_glm sees.
-    design_full = packed.design_concat
-    column_labels = packed.column_labels
-    n_stimulus_regressors = packed.n_task_cols
-
     if args.verb >= 1:
         n_vox_total = packed.data_concat.shape[0]
         n_poly_cols = packed.design_concat.shape[1] - packed.n_task_cols
@@ -2045,11 +2107,11 @@ def main():
             f"  Data: ({n_vox_total}, {packed.design_concat.shape[0]}) "
             f"across {len(per_run_data)} runs"
         )
+        n_poly_total = ((args.polort + 1) if args.polort >= 0 else 0) * len(per_run_data)
         print(
-            f"  Design: {packed.design_concat.shape}  "
-            f"({packed.n_task_cols} task + {n_poly_cols} nuisance "
-            f"= {(args.polort + 1) if args.polort >= 0 else 0} polys × "
-            f"{len(per_run_data)} runs on the block diagonal)"
+            f"  Design: {tuple(packed.design_concat.shape)}  "
+            f"({packed.n_task_cols} task + {n_poly_cols} block-diagonal nuisance "
+            f"= {n_poly_total} poly + {n_poly_cols - n_poly_total} external)"
         )
         print("\nFitting GLM (chunked for GPU memory)...")
 
@@ -2068,6 +2130,50 @@ def main():
 
     if args.verb >= 1:
         print("  ✓ GLM fit complete")
+
+    # ── R² maps ──────────────────────────────────────────────────────────────
+    if args.save_r2:
+        if results.r2 is None:
+            print("WARNING: fit_glm returned no R²; skipping -save-r2", file=sys.stderr)
+        else:
+            r2_file = f"{args.prefix}_r2{_nii_ext}"
+            r2_vol = _to_volume(results.r2.cpu().numpy().reshape(-1, 1)).squeeze(-1)
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(r2_file).name}", enabled=args.verb >= 1, leave=False):
+                save_nifti(r2_vol, r2_file, reference_img=input_files[0])
+            _announce_written(r2_file, time.perf_counter() - t_write, args.verb)
+            if args.verb >= 1:
+                print(f"      in-sample, mean R² = {float(results.r2.mean()):.4f}")
+            del r2_vol
+
+    if args.save_xval_r2:
+        xval_r2_map = _compute_xval_r2_map(
+            packed=packed,
+            run_starts=run_starts,
+            n_runs=n_runs,
+            cv_strategy=args.cv_strategy,
+            metric=args.cv_metric,
+            device=device,
+            verbose=args.verb >= 1,
+        )
+        if xval_r2_map is None:
+            print(
+                "WARNING: -save-xval-r2 needs ≥2 runs; skipping.",
+                file=sys.stderr,
+            )
+        else:
+            xr2_file = f"{args.prefix}_xval_r2{_nii_ext}"
+            xr2_vol = _to_volume(xval_r2_map.reshape(-1, 1)).squeeze(-1)
+            t_write = time.perf_counter()
+            with spinner(f"Writing {Path(xr2_file).name}", enabled=args.verb >= 1, leave=False):
+                save_nifti(xr2_vol, xr2_file, reference_img=input_files[0])
+            _announce_written(xr2_file, time.perf_counter() - t_write, args.verb)
+            if args.verb >= 1:
+                print(
+                    f"      held-out, median R² = {float(np.median(xval_r2_map)):.4f}, "
+                    f"max {float(xval_r2_map.max()):.4f}"
+                )
+            del xr2_vol
 
     # Extract HRF estimates (only stimulus betas, not polynomials)
     if args.verb >= 1:
@@ -2090,11 +2196,7 @@ def main():
         beta_col_idx += n_basis
 
         # Reshape to 4D (nx, ny, nz, n_basis)
-        if mask is not None:
-            betas_4d = np.zeros((nx, ny, nz, n_basis))
-            betas_4d[mask, :] = betas_cond
-        else:
-            betas_4d = betas_cond.reshape(nx, ny, nz, n_basis)
+        betas_4d = _to_volume(betas_cond)
 
         # For zero-edge models (TENTzero/CSPLINzero) the first and last basis
         # functions were dropped (forced to zero). Pad them back so the saved
@@ -2117,22 +2219,26 @@ def main():
             bot_for_save, top_for_save = tent_windows[cond_idx]
 
         # Save this condition
-        files = save_iresp(
-            iresp=iresp_cond,
-            output_prefix=args.prefix,
-            condition_labels=[condition_labels[cond_idx]],
-            tr=tr,
-            bot=bot_for_save,
-            top=top_for_save,
-            reference_img=args.input[0],
-            nii_ext=_nii_ext,
-        )
+        t_write = time.perf_counter()
+        with spinner(
+            f"Writing iresp: {condition_labels[cond_idx]}",
+            enabled=args.verb >= 1,
+            leave=False,
+        ):
+            files = save_iresp(
+                iresp=iresp_cond,
+                output_prefix=args.prefix,
+                condition_labels=[condition_labels[cond_idx]],
+                tr=tr,
+                bot=bot_for_save,
+                top=top_for_save,
+                reference_img=input_files[0],
+                nii_ext=_nii_ext,
+            )
+        _announce_written(files, time.perf_counter() - t_write, args.verb)
         output_files.extend(files)
 
-    if args.verb >= 1:
-        for f in output_files:
-            print(f"  ✓ {f}")
-    else:
+    if args.verb < 1:
         print("Created HRF estimate files:")
         for f in output_files:
             print(f"  {f}")
@@ -2143,21 +2249,14 @@ def main():
             print("\nSaving beta coefficients...")
 
         # Reshape betas back to 4D
-        betas_4d = np.zeros((nx, ny, nz, n_stimulus_regressors))
-        if mask is not None:
-            betas_4d[mask, :] = betas_stimulus
-        else:
-            betas_4d = betas_stimulus.reshape(nx, ny, nz, n_stimulus_regressors)
+        betas_4d = _to_volume(betas_stimulus)
 
         # Save as 4D NIfTI
         beta_file = f"{args.prefix}_betas{_nii_ext}"
-        from fastfuncstuff.cli_utils import spinner
-
-        with spinner(f"Writing {Path(beta_file).name}"):
-            save_nifti(betas_4d, beta_file, reference_img=args.input[0])
-
-        if args.verb >= 1:
-            print(f"  ✓ {beta_file}")
+        t_write = time.perf_counter()
+        with spinner(f"Writing {Path(beta_file).name}", enabled=args.verb >= 1, leave=False):
+            save_nifti(betas_4d, beta_file, reference_img=input_files[0])
+        _announce_written(beta_file, time.perf_counter() - t_write, args.verb)
 
     # Done
     if args.verb >= 1:
