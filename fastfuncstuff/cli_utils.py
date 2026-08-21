@@ -2364,6 +2364,10 @@ class TimingSpec:
     condition_labels: list[str]
     from_events: bool
     onset_files: list[str] | None = None
+    durations_given: bool = True
+    """False when ``-onsets`` was used without ``-durations`` and the caller
+    allowed it (see ``allow_missing_durations``); ``durations`` is then all
+    zeros and must not be read as a stimulus length."""
 
     @property
     def n_conditions(self) -> int:
@@ -2383,6 +2387,7 @@ def parse_timing_spec(
     verbose: bool = True,
     trim: TrimSpec | None = None,
     run_lengths_tr: list[int] | None = None,
+    allow_missing_durations: bool = False,
 ) -> TimingSpec:
     """Parse the timing spec of an ``ffs_*`` GLM tool into a common structure.
 
@@ -2447,9 +2452,18 @@ def parse_timing_spec(
             raise FileNotFoundError(f"Onset file not found: {missing[0]}")
 
         condition_labels = clean_condition_labels([Path(f).stem for f in onsets])
-        durations = parse_durations(durations_arg, len(onsets), condition_labels)
-        if round_durations is not None:
-            durations = [round(d, round_durations) for d in durations]
+        # ffs_deconvolve can size its HRF window from -window/-duration instead,
+        # so it is the one caller allowed to omit -durations entirely; every
+        # other tool guards on it before calling and gets the hard error.
+        durations_given = bool(durations_arg)
+        if not durations_given:
+            if not allow_missing_durations:
+                raise ValueError("-durations is required with -onsets")
+            durations = [0.0] * len(onsets)
+        else:
+            durations = parse_durations(durations_arg, len(onsets), condition_labels)
+            if round_durations is not None:
+                durations = [round(d, round_durations) for d in durations]
 
         all_onsets = []
         for onset_file in onsets:
@@ -2467,6 +2481,7 @@ def parse_timing_spec(
             condition_labels=condition_labels,
             from_events=False,
             onset_files=list(onsets),
+            durations_given=durations_given,
         )
 
     # Shift AFTER parsing, so both timing formats get it and the numbers printed
@@ -2478,10 +2493,8 @@ def parse_timing_spec(
         print(f"  Conditions: {spec.n_conditions} ({', '.join(spec.condition_labels)})")
         for cidx, label in enumerate(spec.condition_labels):
             n_events = sum(len(spec.all_onsets[cidx][r]) for r in range(n_runs))
-            print(
-                f"    {label}: {n_events} events across {n_runs} runs "
-                f"(duration={spec.durations[cidx]:.3f}s)"
-            )
+            dur_note = f" (duration={spec.durations[cidx]:.3f}s)" if spec.durations_given else ""
+            print(f"    {label}: {n_events} events across {n_runs} runs{dur_note}")
 
     return spec
 
