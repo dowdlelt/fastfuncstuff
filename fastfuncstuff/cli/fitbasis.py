@@ -246,27 +246,42 @@ EXAMPLES
 
 READING THE OUTPUT
 
-  shift:   _shift_amplitude_<cond>  per-block amplitude, data units
-           _shift_delay_<cond>      per-block delay, seconds
-           _shift_delay_dev_<cond>  delay minus the voxel's own mean delay —
-                                    the quantity that survives a per-voxel
-                                    shape, and the one to use for per-trial
-                                    timing
-           _shift_xvalr2            held-out R² (-xval-r2).  THIS is the
-                                    task-responsiveness map.
-           _shift_xvalr2_delay_gain held-out gain from freeing the delays.
-                                    >0 means the latencies are real; <=0
-                                    means they are not.
-  linear:  Everything below is a LABELLED 4-D bucket, not one file per
-           condition, and every bucket ends with the same two QC sub-bricks
-           so you can threshold inside the same dataset:
-               xvalR2   held-out R² (-xval-r2).  The honest referee.
-               taskR2   in-sample R² of the task model.  Inflated by free
-                        parameters — use it to see WHERE the task explains
-                        signal, never as a threshold.
+  Both parametrisations write the SAME labelled 4-D buckets, so a linear
+  fit and a shift fit of the same data compare sub-brick for sub-brick.
+  Every bucket you might threshold ends with the same two QC sub-bricks:
 
-           _amplitude       one sub-brick per condition, data units
-           _shape           -save-shape.  Interleaved per condition:
+      xvalR2   held-out R² (-xval-r2).  The honest referee.
+      taskR2   in-sample task R², task variance over NON-drift variance.
+               Shows WHERE the task explains signal; free parameters
+               inflate it, so never threshold on it.
+
+  _amplitude       one sub-brick per condition, data units
+  _shape           interleaved per condition, value beside the map that
+                   gates it: <cond>_latency (s), <cond>_latency_dev,
+                   <cond>_valid, plus <cond>_shape_r2 / _fwhm /
+                   _dispersion on the linear side
+  _diagnostics     taskR2 and its variants; shift adds taskR2_tau0,
+                   taskR2_incl_drift, fstat, amp_lambda
+  _hrf_index       curve selected per voxel; shift adds shape_ttp and
+                   mean_timing (TTP + mean delay), which is how the
+                   shape/delay timing confound stays decomposable
+  _hrf_shapes.tsv  the candidate curves themselves
+  _xvalr2          held-out R²; shift adds xvalR2_tau0 and
+                   xvalR2_delay_gain — the latter answers "are the
+                   delays real": >0 yes, <=0 no
+
+  READ _latency_dev, not _latency, whenever -hrf named a SET.  Absolute
+  latency is then measured against the curve that voxel selected, so a
+  curve peaking late shifts every condition in it alike; the deviation is
+  what survives.  Under shift the same confound is explicit — the chosen
+  curve's TTP absorbs part of the timing, which is why _hrf_index carries
+  shape_ttp and mean_timing.
+
+  linear-only extras:
+           _basisweights    raw coefficients, <cond>_base / _dLatency /
+                            _dWidth.  -no-basis to skip.
+           _iresp_<cond>    reconstructed response, 4-D over time
+           _shape sub-bricks, in full:
                             <cond>_latency      seconds
                             <cond>_latency_dev  latency minus this voxel's
                                                 own mean across conditions.
@@ -1745,6 +1760,7 @@ def _run_shift_mode(
     n_tp_per_run: list[int],
     all_onsets,
     condition_labels: list[str],
+    condition_durations: list[float],
     tr: float,
     polort: int,
     volume_shape,
@@ -1762,7 +1778,6 @@ def _run_shift_mode(
     delay maps rather than basis-coefficient maps — there are no basis
     coefficients in this model.
     """
-    from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.design.shifted_hrf import (
         append_blockdiag_extras,
         build_blockdiag_polys,
@@ -1789,7 +1804,7 @@ def _run_shift_mode(
             f"basis to choose\n"
             f"           and no prior on coefficients to apply.  The response "
             f"shape comes\n"
-            f"           from -shift-hrf (currently {args.shift_hrf!r}); the delay "
+            f"           from -hrf (currently {args.hrf!r}); the delay "
             f"prior from\n"
             f"           -delay-prior-sd.  Use -parametrization linear if you "
             f"wanted -derivatives {args.derivatives} / -reg {args.reg}."
@@ -1852,9 +1867,9 @@ def _run_shift_mode(
                 "        map, use a single -shift-hrf instead."
             )
     else:
-        hrf = _resolve_shift_hrf(args.shift_hrf, args.flobs_dt, args.flobs_window)
+        hrf = _resolve_shift_hrf(args.hrf, args.flobs_dt, args.flobs_window)
         print(
-            f"  HRF source: {args.shift_hrf}  ({hrf.size} samples @ "
+            f"  HRF source: {args.hrf}  ({hrf.size} samples @ "
             f"{args.flobs_dt}s, peak-normalised)  [one shape for all voxels]"
         )
     print(
@@ -1893,6 +1908,11 @@ def _run_shift_mode(
         merged = [np.atleast_1d(all_onsets[c][r]) + offsets[r] for r in range(n_runs)]
         cond_block_onsets.append(np.concatenate(merged) if merged else np.array([]))
     print(f"  Blocks: {len(block_onsets)}")
+    # Shift used to ignore -durations entirely: it modelled every event as an
+    # impulse and let the delay search absorb the mismatch, so a 4 s block
+    # read as ~0.8 s of spurious latency.  Same bug the linear path had; the
+    # design-bank builder already took durations, the CLI never passed them.
+    shift_block_durations = [condition_durations[c] for c in block_cond]
 
     # Sample-index run boundaries: keeps each block's response inside its own
     # run (an event in the last ~32 s of a run would otherwise spill its tail
@@ -1906,6 +1926,7 @@ def _run_shift_mode(
     shape_index = None
     if shapes is not None:
         fit, shape_index = fit_shifted_hrf_per_voxel_shape(
+            durations=shift_block_durations,
             data=data,
             block_onsets=block_onsets,
             selection_block_onsets=cond_block_onsets,
@@ -1925,6 +1946,7 @@ def _run_shift_mode(
         )
     else:
         fit = fit_shifted_hrf(
+            durations=shift_block_durations,
             data=data,
             block_onsets=block_onsets,
             hrf=hrf,
@@ -1989,93 +2011,8 @@ def _run_shift_mode(
                 )
         print(f"  Wrote {tsv}  ({len(rows)} parcels)")
 
-    for arr, name in (
-        (fit.r2, "r2"),
-        (fit.r2_fixed, "r2_tau0"),
-        (fit.r2_total, "r2_incl_drift"),
-        (fit.fstat, "fstat"),
-        (fit.amp_lambda, "amp_lambda"),
-    ):
-        path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
-        with spinner(f"Writing {Path(path).name}"):
-            save_nifti(
-                _to_volume(arr[:, None]).squeeze(-1),
-                output_path=path,
-                reference_img=args.input[0],
-            )
-        print(f"  Wrote {path}")
-    print(
-        "  NOTE: _r2 is TASK variance / NON-DRIFT variance — the nuisance is\n"
-        "        removed from both terms, so drift is not credited to the model.\n"
-        "        _r2_incl_drift uses raw total variance (what most tools print)\n"
-        "        and is inflated by the polynomial model: with -polort 4 over 10\n"
-        "        runs that is 50 nuisance columns absorbing real variance.\n"
-        "        Neither is evidence of task response on its own — n_blocks free\n"
-        "        amplitudes buy in-sample fit too.  For a task-responsiveness\n"
-        "        map use the held-out _xvalr2 from -xval-r2; for latency, use\n"
-        "        _xvalr2_delay_gain.  r2 minus r2_tau0 is in-sample and proves\n"
-        "        nothing."
-    )
-
-    if shape_index is not None and shapes is not None:
-        path = f"{args.prefix}_fitbasis_shift_shape_index{nii_ext}"
-        with spinner(f"Writing {Path(path).name}"):
-            save_nifti(
-                _to_volume(shape_index.astype(np.float32)[:, None]).squeeze(-1),
-                output_path=path,
-                reference_img=args.input[0],
-            )
-        print(f"  Wrote {path}  (int index into the curves TSV below)")
-        curves_path = f"{args.prefix}_fitbasis_shift_shapes.tsv"
-        np.savetxt(
-            curves_path,
-            shapes.T,
-            fmt="%.10g",
-            delimiter="\t",
-            header="\t".join(shape_labels),
-            comments="",
-        )
-        print(f"  Wrote {curves_path}  (columns = candidates @ {args.flobs_dt}s)")
-
-        # The selected shape absorbs part of the voxel's mean timing, so the
-        # delay map alone understates it.  Emit the two pieces that make the
-        # confound decomposable rather than destructive: time-to-peak of the
-        # chosen curve, and TTP + mean delay, which recovers the true mean
-        # timing (verified to sum exactly at good SNR).
-        ttp = shape_time_to_peak(shapes, args.flobs_dt)[shape_index]
-        mean_timing = ttp + fit.delays.mean(axis=1)
-        for arr, name, note in (
-            (ttp, "shape_ttp", "time-to-peak of each voxel's selected curve (s)"),
-            (mean_timing, "mean_timing", "TTP + mean delay = mean response timing (s)"),
-        ):
-            path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
-            save_nifti(
-                _to_volume(arr.astype(np.float32)[:, None]).squeeze(-1),
-                output_path=path,
-                reference_img=args.input[0],
-            )
-            print(f"  Wrote {path}  ({note})")
-
-    cond_idx: dict[str, list[int]] = {}
-    for b, c in enumerate(block_cond):
-        cond_idx.setdefault(condition_labels[c], []).append(b)
-    # Per-trial deviation from each voxel's OWN mean delay.  This is the
-    # quantity that survives the shape/delay confound: the shape is fixed
-    # within a voxel across trials, so it cannot absorb trial-to-trial
-    # variation.  Verified to track true jitter at r=0.61 (noise sd 0.3)
-    # even when the voxel's absolute delay was absorbed into its shape.
-    delay_dev = fit.delays - fit.delays.mean(axis=1, keepdims=True)
-    for cond, idxs in cond_idx.items():
-        for arr, name in (
-            (fit.amplitudes, "amplitude"),
-            (fit.delays, "delay"),
-            (delay_dev, "delay_dev"),
-        ):
-            vol = _to_volume(arr[:, idxs])
-            path = f"{args.prefix}_fitbasis_shift_{name}_{cond}{nii_ext}"
-            save_nifti(vol, output_path=path, reference_img=args.input[0])
-            print(f"  Wrote {path}  (n_blocks={len(idxs)})")
-
+    # ── Held-out validation first, so it can ride inside the buckets ──
+    xval_maps: list[tuple[str, np.ndarray]] = []
     if args.xval_r2:
         if n_runs < 2:
             print("  -xval-r2 needs ≥2 runs; skipping.")
@@ -2086,11 +2023,12 @@ def _run_shift_mode(
                     "  NOTE: the imported shape assignment is held FIXED across\n"
                     "        folds (it is an input to this model, not something\n"
                     "        fitted here).  If it was selected on these same runs,\n"
-                    "        _xvalr2 is optimistic by that much; _xvalr2_delay_gain\n"
+                    "        xvalR2 is optimistic by that much; xvalR2_delay_gain\n"
                     "        is not, since both scored models carry the same shape\n"
                     "        and only the delays are refit per fold."
                 )
             r2_shift, r2_tau0 = xval_shifted_hrf(
+                durations=list(condition_durations),
                 per_run_data=per_run_data,
                 per_run_condition_onsets=[
                     [np.atleast_1d(all_onsets[c][r]) for c in range(len(condition_labels))]
@@ -2113,30 +2051,140 @@ def _run_shift_mode(
                 device=device,
                 verbose=True,
             )
+            xval_maps = [
+                ("xvalR2", r2_shift),
+                ("xvalR2_tau0", r2_tau0),
+                ("xvalR2_delay_gain", r2_shift - r2_tau0),
+            ]
+
+    # Same QC contract as the linear path: the honest referee first, the
+    # in-sample task R2 next, in every bucket the user might threshold.
+    qc_bricks: list[tuple[str, np.ndarray]] = []
+    if xval_maps:
+        qc_bricks.append(("xvalR2", np.asarray(xval_maps[0][1], dtype=np.float32)))
+    qc_bricks.append(("taskR2", np.asarray(fit.r2, dtype=np.float32)))
+
+    if xval_maps:
+        _save_bucket(
+            [np.asarray(a, dtype=np.float32) for _, a in xval_maps],
+            [n for n, _ in xval_maps],
+            f"{args.prefix}_fitbasis_xvalr2{nii_ext}",
+            to_volume=_to_volume,
+            reference_img=args.input[0],
+        )
+        print(
+            "  xvalR2_delay_gain is the map that answers 'is the delay real':\n"
+            "  positive = the estimated delays predicted held-out runs better\n"
+            "  than pinning them to zero; ≤0 = they did not."
+        )
+
+    # Everything that is a diagnostic rather than a result, in one place.
+    _save_bucket(
+        [fit.r2, fit.r2_fixed, fit.r2_total, fit.fstat, fit.amp_lambda],
+        ["taskR2", "taskR2_tau0", "taskR2_incl_drift", "fstat", "amp_lambda"],
+        f"{args.prefix}_fitbasis_diagnostics{nii_ext}",
+        to_volume=_to_volume,
+        reference_img=args.input[0],
+    )
+    print(
+        "  NOTE: taskR2 is TASK variance / NON-DRIFT variance — the nuisance is\n"
+        "        removed from both terms, so drift is not credited to the model.\n"
+        "        taskR2_incl_drift uses raw total variance (what most tools print)\n"
+        "        and is inflated by the polynomial model.  Neither is evidence of\n"
+        "        task response on its own — n_blocks free amplitudes buy in-sample\n"
+        "        fit too.  Threshold on xvalR2; for latency, on xvalR2_delay_gain."
+    )
+
+    if shape_index is not None and shapes is not None:
+        # The selected shape absorbs part of the voxel's mean timing, so the
+        # delay map alone understates it.  Emit the pieces that make the
+        # confound decomposable rather than destructive: time-to-peak of the
+        # chosen curve, and TTP + mean delay, which recovers the true mean
+        # timing (verified to sum exactly at good SNR).
+        ttp = shape_time_to_peak(shapes, args.flobs_dt)[shape_index]
+        _save_bucket(
+            [shape_index.astype(np.float32) + 1.0, ttp, ttp + fit.delays.mean(axis=1)],
+            ["hrf_index", "shape_ttp", "mean_timing"],
+            f"{args.prefix}_fitbasis_hrf_index{nii_ext}",
+            to_volume=_to_volume,
+            reference_img=args.input[0],
+        )
+        curves_path = f"{args.prefix}_fitbasis_hrf_shapes.tsv"
+        np.savetxt(
+            curves_path,
+            shapes.T,
+            fmt="%.10g",
+            delimiter="\t",
+            header="\t".join(shape_labels),
+            comments="",
+        )
+        print(f"  Wrote {curves_path}  (columns = candidates @ {args.flobs_dt}s)")
+
+    cond_idx: dict[str, list[int]] = {}
+    for b, c in enumerate(block_cond):
+        cond_idx.setdefault(condition_labels[c], []).append(b)
+    # Per-block deviation from each voxel's OWN mean delay.  This is the
+    # quantity that survives the shape/delay confound: the shape is fixed
+    # within a voxel, so it cannot absorb block-to-block variation.
+    delay_dev = fit.delays - fit.delays.mean(axis=1, keepdims=True)
+    # A delay sitting on the search rail was not estimated, it was clamped —
+    # the same thing `valid` means on the linear side.
+    delay_valid = (np.abs(fit.delays) < args.tau_max - 1e-9).astype(np.float32)
+
+    if all(len(idxs) == 1 for idxs in cond_idx.values()):
+        # Per-condition: one bucket each, named and ordered to match the
+        # linear parametrisation so the two are directly comparable.
+        _save_bucket(
+            [fit.amplitudes[:, idxs[0]] for idxs in cond_idx.values()],
+            list(cond_idx.keys()),
+            f"{args.prefix}_fitbasis_amplitude{nii_ext}",
+            to_volume=_to_volume,
+            reference_img=args.input[0],
+            qc=qc_bricks,
+        )
+        arrays, labels = [], []
+        for cond, idxs in cond_idx.items():
+            b = idxs[0]
             for arr, name in (
-                (r2_shift, "xvalr2"),
-                (r2_tau0, "xvalr2_tau0"),
-                (r2_shift - r2_tau0, "xvalr2_delay_gain"),
+                (fit.delays[:, b], "latency"),
+                (delay_dev[:, b], "latency_dev"),
+                (delay_valid[:, b], "valid"),
             ):
-                path = f"{args.prefix}_fitbasis_shift_{name}{nii_ext}"
+                arrays.append(np.asarray(arr, dtype=np.float32))
+                labels.append(f"{cond}_{name}")
+        _save_bucket(
+            arrays,
+            labels,
+            f"{args.prefix}_fitbasis_shape{nii_ext}",
+            to_volume=_to_volume,
+            reference_img=args.input[0],
+            qc=qc_bricks,
+        )
+    else:
+        # Single-trial: the sub-brick axis is TRIALS, so conditions cannot
+        # share a bucket without colliding with it.
+        for cond, idxs in cond_idx.items():
+            for arr, name in (
+                (fit.amplitudes, "amplitude"),
+                (fit.delays, "latency"),
+                (delay_dev, "latency_dev"),
+                (delay_valid, "valid"),
+            ):
+                path = f"{args.prefix}_fitbasis_{name}_{cond}{nii_ext}"
                 save_nifti(
-                    _to_volume(arr[:, None]).squeeze(-1),
+                    _to_volume(arr[:, idxs]),
                     output_path=path,
                     reference_img=args.input[0],
+                    brick_labels=[f"{cond}_{name}_{t:03d}" for t in range(len(idxs))],
                 )
-                print(f"  Wrote {path}")
-            print(
-                "  _xvalr2_delay_gain is the map that answers 'is the delay real':\n"
-                "  positive = the estimated delays predicted held-out runs better\n"
-                "  than pinning them to zero; ≤0 = they did not."
-            )
+                print(f"  Wrote {path}  (n_trials={len(idxs)})")
 
     meta = {
         "tool": "ffs_fitbasis",
         "parametrization": "shift",
         "started": datetime.now().isoformat(timespec="seconds"),
         "tr": float(tr),
-        "hrf_source": (args.shift_hrf if shapes is None else f"per-voxel:{shape_source}"),
+        "hrf_source": (args.hrf if shapes is None else f"per-voxel:{shape_source}"),
         "n_shape_candidates": (0 if shapes is None else int(shapes.shape[0])),
         "shape_index_source": (
             "imported" if imported_index is not None else ("fitted" if shapes is not None else None)
@@ -2572,6 +2620,10 @@ def main() -> int:
             n_tp_per_run=n_tp_per_run,
             all_onsets=all_onsets,
             condition_labels=list(condition_labels),
+            condition_durations=[
+                float(timing.durations[c]) if timing.durations_given else 0.0
+                for c in range(len(condition_labels))
+            ],
             tr=tr,
             polort=polort_resolved,
             volume_shape=volume_shape,
@@ -3835,6 +3887,19 @@ def main() -> int:
     if xval_r2 is not None:
         qc_bricks.append(("xvalR2", np.asarray(xval_r2, dtype=np.float32)))
     qc_bricks.append(("taskR2", np.asarray(fit.r2, dtype=np.float32)))
+
+    # Diagnostics bucket, named to match the shift parametrisation's so the
+    # two are comparable file for file.
+    _diag = [(np.asarray(fit.r2, dtype=np.float32), "taskR2")]
+    if write_ols:
+        _diag.append((np.asarray(fit.r2_ols, dtype=np.float32), "taskR2_unconstrained"))
+    _save_bucket(
+        [a for a, _ in _diag],
+        [n for _, n in _diag],
+        f"{args.prefix}_fitbasis_diagnostics{nii_ext}",
+        to_volume=_to_volume,
+        reference_img=args.input[0],
+    )
 
     # ── Per-block outputs ──────────────────────────────────────────
     # Single-trial mode: amplitude maps stack across trials per cond

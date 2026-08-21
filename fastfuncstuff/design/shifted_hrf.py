@@ -957,6 +957,7 @@ def xval_shifted_hrf(
     polort: int,
     *,
     single_trials: bool,
+    durations: list[float] | None = None,
     shapes: np.ndarray | None = None,
     shape_index: np.ndarray | None = None,
     extra_regs_per_run: list[Tensor] | None = None,
@@ -1090,6 +1091,7 @@ def xval_shifted_hrf(
             fit, fold_shape_idx = fit_shifted_hrf_per_voxel_shape(
                 data=y_train,
                 block_onsets=block_onsets,
+                durations=durations,
                 selection_block_onsets=sel_blocks,
                 shapes=shapes,
                 shape_index=shape_index,
@@ -1110,6 +1112,7 @@ def xval_shifted_hrf(
             fit = fit_shifted_hrf(
                 data=y_train,
                 block_onsets=block_onsets,
+                durations=durations,
                 hrf=hrf,
                 hrf_dt=hrf_dt,
                 run_bounds=train_bounds,
@@ -1209,20 +1212,37 @@ def xval_shifted_hrf(
                     (shapes[si], np.flatnonzero(fold_shape_idx == si))
                     for si in np.unique(fold_shape_idx)
                 ]
+            # Per-voxel design columns are gathered, so the prediction step
+            # costs (nv, n_cond, T) float64 -- 6 GB for a 219k-voxel shape
+            # group at 8 conditions, which is what used to OOM here after
+            # the fit had already succeeded.  Chunk it against the same
+            # free-memory budget the fit uses.
+            vox_bytes = (n_cond + 4) * n_tp_r * 8
+            vox_chunk = max(256, int(_memory_budget(device, 0.5) // max(vox_bytes, 1)))
             for curve, vsel in groups:
                 if vsel.size == 0:
                     continue
                 bank_test = build_shifted_design_bank(
-                    test_onsets, curve, hrf_dt, tau_fine, tr, n_tp_r, device=device
+                    test_onsets,
+                    curve,
+                    hrf_dt,
+                    tau_fine,
+                    tr,
+                    n_tp_r,
+                    durations=durations,
+                    device=device,
                 )  # (n_cond, G_fine, T)
-                vt = torch.from_numpy(vsel).to(device)
-                for gsel, acc in ((g_t, num_s), (g_zero, num_0)):
-                    cols = bank_test[ar_c.unsqueeze(0), gsel[vt]]  # (nvs, n_cond, T)
-                    pred = torch.einsum("vc,vct->vt", A_t[vt], cols)
-                    pred = _project_out(pred, Z_test)
-                    acc[vsel] += ((y_p[vt] - pred) ** 2).sum(dim=1).cpu().numpy()
-                    del cols, pred
-                del bank_test, vt
+                for lo in range(0, vsel.size, vox_chunk):
+                    vpart = vsel[lo : lo + vox_chunk]
+                    vt = torch.from_numpy(vpart).to(device)
+                    for gsel, acc in ((g_t, num_s), (g_zero, num_0)):
+                        cols = bank_test[ar_c.unsqueeze(0), gsel[vt]]  # (nvs, n_cond, T)
+                        pred = torch.einsum("vc,vct->vt", A_t[vt], cols)
+                        pred = _project_out(pred, Z_test)
+                        acc[vpart] += ((y_p[vt] - pred) ** 2).sum(dim=1).cpu().numpy()
+                        del cols, pred
+                    del vt
+                del bank_test
             del y_test, y_p, ss_tot
 
     den_safe = np.maximum(den, 1e-12)

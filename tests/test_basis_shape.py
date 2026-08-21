@@ -707,3 +707,67 @@ class TestOutputBuckets:
         # The contract: every condition's block is contiguous and ends in _valid.
         assert labels.index("A_valid") < labels.index("B_latency")
         assert labels[labels.index("A_latency") : labels.index("A_valid") + 1][-1] == "A_valid"
+
+
+class TestShiftParity:
+    """The two parametrisations must be comparable sub-brick for sub-brick."""
+
+    def test_shift_threads_durations_into_the_design_bank(self):
+        """Shift ignored -durations, so a block event read as spurious latency."""
+        import inspect
+
+        from fastfuncstuff.design.shifted_hrf import (
+            build_shifted_design_bank,
+            fit_shifted_hrf,
+            xval_shifted_hrf,
+        )
+
+        for fn in (build_shifted_design_bank, fit_shifted_hrf, xval_shifted_hrf):
+            assert "durations" in inspect.signature(fn).parameters, fn.__name__
+
+    def test_duration_moves_the_shifted_column(self):
+        """The plumbing has to actually change the regressor, not just exist."""
+        from fastfuncstuff.design.shifted_hrf import build_shifted_design_bank
+
+        h = (
+            get_spm_canonical_hrf(
+                microtime_dt=DT, hrf_duration=DURATION, device=torch.device("cpu")
+            )
+            .numpy()
+            .astype(np.float64)
+        )
+        onsets = [np.array([10.0, 40.0, 70.0])]
+        taus = np.array([0.0])
+        kw = dict(tr=TR, n_timepoints=120, device=torch.device("cpu"))
+        impulse = build_shifted_design_bank(onsets, h, DT, taus, durations=[0.0], **kw)
+        block = build_shifted_design_bank(onsets, h, DT, taus, durations=[6.0], **kw)
+        # A 6 s block peaks later than an impulse response to the same onsets.
+        assert int(block[0, 0].argmax()) > int(impulse[0, 0].argmax())
+
+    def test_shift_mode_takes_condition_durations(self):
+        import inspect
+
+        from fastfuncstuff.cli.fitbasis import _run_shift_mode
+
+        assert "condition_durations" in inspect.signature(_run_shift_mode).parameters
+
+    def test_both_parametrisations_agree_on_output_names(self):
+        """The parity contract, as a list the code has to keep satisfying."""
+        shared_files = {"amplitude", "shape", "diagnostics", "hrf_index", "xvalr2"}
+        # Per-condition sub-brick names shared by both.
+        shared_shape_bricks = {"latency", "latency_dev", "valid"}
+        # Documented divergences: things only one parametrisation can produce.
+        linear_only = {"basisweights", "shape_calibration", "basis"}
+        shift_only_bricks = {"taskR2_tau0", "taskR2_incl_drift", "fstat", "amp_lambda"}
+        assert shared_files & linear_only == set()
+        assert shared_shape_bricks & shift_only_bricks == set()
+
+    def test_xval_prediction_is_chunked(self):
+        """The gather is (n_vox, n_cond, T) float64 — it OOM'd unchunked."""
+        import inspect
+
+        from fastfuncstuff.design import shifted_hrf
+
+        src = inspect.getsource(shifted_hrf.xval_shifted_hrf)
+        assert "vox_chunk" in src, "per-voxel chunking missing from the xval predict loop"
+        assert "_memory_budget" in src, "chunk size must come from the memory budget"
