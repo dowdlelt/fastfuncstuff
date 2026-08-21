@@ -1437,6 +1437,8 @@ def _estimate_static(
     first_n=None,
     diag=None,
     hpf_sigma=0.0,
+    match="none",
+    match_sigma=6.0,
     gate=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
@@ -1487,8 +1489,8 @@ def _estimate_static(
         fixed_raw = ref[s].to(device).unsqueeze(0).expand(nt, hh, ww).contiguous().float()
         # Estimation source (optionally high-passed) is distinct from moving_raw, which
         # _correct_pe resamples — the correction keeps the raw intensities.
-        est_fixed = _spatial_highpass(fixed_raw, hpf_sigma)
-        est_moving = _spatial_highpass(moving_raw, hpf_sigma)
+        est_fixed = _spatial_highpass(_match_prep2d(fixed_raw, match, match_sigma), hpf_sigma)
+        est_moving = _spatial_highpass(_match_prep2d(moving_raw, match, match_sigma), hpf_sigma)
         fixed = _blur2d(est_fixed, smooth_sigma) if smooth_sigma > 0 else est_fixed
         moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
@@ -1528,6 +1530,8 @@ def _estimate_cumulative(
     warp_interp="bilinear",
     warp_radius=3,
     hpf_sigma=0.0,
+    match="none",
+    match_sigma=6.0,
 ):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
@@ -1554,8 +1558,8 @@ def _estimate_cumulative(
         else:  # first_mean
             ref = running_sum / t
         moving_raw = vol[t].to(device).float()
-        est_fixed = _spatial_highpass(ref, hpf_sigma)
-        est_moving = _spatial_highpass(moving_raw, hpf_sigma)
+        est_fixed = _spatial_highpass(_match_prep2d(ref, match, match_sigma), hpf_sigma)
+        est_moving = _spatial_highpass(_match_prep2d(moving_raw, match, match_sigma), hpf_sigma)
         fixed = _blur2d(est_fixed, smooth_sigma) if smooth_sigma > 0 else est_fixed
         moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
         u, v = flow_fn(fixed, moving)
@@ -1681,6 +1685,8 @@ def estimate_residual_flow(
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     hpf_sigma: float = 0.0,
+    match: str = "none",
+    match_sigma: float = 6.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1741,6 +1747,15 @@ def estimate_residual_flow(
     intensity changes (drift, respiration B0) out of the flow while preserving the
     edges that encode the shift; the correction still resamples the raw series.
 
+    ``match`` is the stronger form of the same idea and applies to the same
+    estimation-only frames: ``localnorm`` divides out a local SCALE as well as a local
+    mean, so a multiplicative gain change cancels. Reach for it when frame intensity
+    varies over the run — a pre-steady-state ramp being the loud case, where T1
+    saturation gives the first frames a gain that varies across TISSUE (measured
+    0.94–1.39 on one 1.2mm run) and so survives any per-frame rescale. Only the
+    brightness-constancy backends need it: ``xcorr`` normalizes inside its own
+    correlation window and is already immune.
+
     ``automask`` (off here; on by the CLI) soft-gates the flow by a feathered brain
     mask — a dilated 3dAutomask of the time-mean, Gaussian-blurred by
     ``automask_sigma`` voxels — so optical flow's wild guesses in the pure-noise air
@@ -1791,6 +1806,8 @@ def estimate_residual_flow(
             warp_interp=warp_interp,
             warp_radius=warp_radius,
             hpf_sigma=hpf_sigma,
+            match=match,
+            match_sigma=match_sigma,
             pe_axis2=pe_axis2,
             device=device,
             verbose=verbose,
@@ -1891,6 +1908,8 @@ def estimate_residual_flow(
             warp_interp,
             warp_radius,
             hpf_sigma=hpf_sigma,
+            match=match,
+            match_sigma=match_sigma,
         )
     else:
         u_all, v_all, corrected = _estimate_static(
@@ -1906,6 +1925,8 @@ def estimate_residual_flow(
             first_n=first_n,
             diag=diag,
             hpf_sigma=hpf_sigma,
+            match=match,
+            match_sigma=match_sigma,
             gate=soft,
         )
     if progressive:
@@ -1931,6 +1952,8 @@ def estimate_residual_flow(
                 ref_override=new_ref,
                 diag=diag,
                 hpf_sigma=hpf_sigma,
+                match=match,
+                match_sigma=match_sigma,
                 gate=soft,
             )
             return (u, v), corr
@@ -2546,6 +2569,57 @@ def _match_prep(vol: torch.Tensor, mode: str, sigma: float = 2.0) -> torch.Tenso
         mu = _blur3d_b(vol, sigma)
         var = _blur3d_b(vol * vol, sigma) - mu * mu
         return (vol - mu) / var.clamp(min=1e-12).sqrt()
+    raise ValueError(f"unknown match mode {mode!r}; choose from {MATCH_MODES}")
+
+
+def _sd_floor(sd: torch.Tensor, frac: float) -> torch.Tensor:
+    """``frac`` x the 90th-percentile local sd, as a floor for a local-z-score divide.
+
+    Subsampled before the quantile: ``torch.quantile`` refuses tensors past ~16M
+    elements, and a whole slice's time course clears that on a long run.
+    """
+    flat = sd.reshape(-1)
+    if flat.numel() > 1_000_000:
+        flat = flat[:: flat.numel() // 1_000_000 + 1]
+    return frac * torch.quantile(flat, 0.9)
+
+
+def _match_prep2d(
+    img: torch.Tensor, mode: str, sigma: float = 6.0, floor_frac: float = 0.1
+) -> torch.Tensor:
+    """2-D twin of :func:`_match_prep` for the slicewise ``(B, H, W)`` estimation path.
+
+    Same modes; what it defends against differs. ``_match_prep`` matches two ECHOES
+    whose contrast differs by construction. This matches FRAMES of one series whose
+    intensity moves — the pre-steady-state ramp being the loud case: on a 1.2mm run
+    here frame 0 was only 8% brighter overall, but its gain relative to steady state
+    ran 0.94-1.39 ACROSS the brain (T1 saturation is tissue-dependent), so no per-frame
+    rescale touches it. LK reads that gain as displacement; ``localnorm`` divides out a
+    local scale as well as a local mean, which ``hpf_sigma`` (subtract only) cannot.
+
+    Fully gain-invariant estimation already exists — ``-backend xcorr`` normalizes
+    inside its correlation window — so this is for callers who want the LK backend.
+
+    ``floor_frac`` floors the local sd before the divide. Without it the division
+    rescales pure air noise to unit variance and the flow chases it: measured mean
+    |v| in air 0.66 vs 0.40 voxels, with the in-brain result unchanged either way.
+    """
+    if mode == "none":
+        return img
+    if mode == "gradmag":
+        b = _blur2d(img, 1.0)
+        gx, gy = _spatial_gradients(b)
+        mag = (gx * gx + gy * gy).clamp(min=1e-12).sqrt()
+        return _match_prep2d(mag, "localnorm", sigma, floor_frac)
+    if mode == "meanstd":
+        dims = (1, 2)
+        mu = img.mean(dim=dims, keepdim=True)
+        sd = img.std(dim=dims, keepdim=True).clamp(min=1e-6)
+        return (img - mu) / sd
+    if mode == "localnorm":
+        mu = _blur2d(img, sigma)
+        sd = (_blur2d(img * img, sigma) - mu * mu).clamp(min=0).sqrt()
+        return (img - mu) / sd.clamp(min=_sd_floor(sd, floor_frac))
     raise ValueError(f"unknown match mode {mode!r}; choose from {MATCH_MODES}")
 
 
@@ -3287,6 +3361,8 @@ def _run_3dacq_plain(
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    match: str = "none",
+    match_sigma: float = 6.0,
     pe_axis2: int | None = None,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
@@ -3352,10 +3428,11 @@ def _run_3dacq_plain(
     curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
     curve_box: dict[str, torch.Tensor | None] = {"curve": None, "offsets": None}
 
-    # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
-    # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
+    # Estimation prep: optional intensity match and spatial high-pass (raw kept for the
+    # resample), then the existing estimation blur. Identity at the defaults. v is a
+    # single (X,Y,Z) vol.
     def _prep(v: torch.Tensor) -> torch.Tensor:
-        x = _spatial_highpass3d(v[None], hpf_sigma)
+        x = _spatial_highpass3d(_match_prep(v[None], match, match_sigma), hpf_sigma)
         if smooth_sigma > 0:
             x = _blur3d_b(x, smooth_sigma)
         return x[0]

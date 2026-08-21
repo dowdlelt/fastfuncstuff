@@ -212,6 +212,7 @@ which flag feeds which backend:
   -ref            *      *      *       reference frame (all)
   -do_blur        *      *      *       pre-blur noisy frames (all)
   -hpf_spatial    *      *      *       estimate on spatial high-pass (all, experimental)
+  -match          *      *      -       gain-invariant estimation (xcorr already is)
   -full_2d        *      -      -       2-D vs PE-only flow
   -levels         *      -      -       optical-flow pyramid levels
   -iters          *      *      -       flow: LK passes / phase: warp-refine passes
@@ -643,6 +644,36 @@ def create_parser() -> argparse.ArgumentParser:
         "resamples the RAW series (true intensities preserved). Works for slicewise, "
         "3-D-acq, and -me_3depi paths. 0 = off. Not supported with rotation-aware mode. "
         "No clear advantage over the plain path observed yet — a knob to experiment with.",
+    )
+    est.add_argument(
+        "-match",
+        "-tmatch",
+        choices=("none", "meanstd", "localnorm", "gradmag"),
+        default="none",
+        help="[flow, phase] Intensity matching applied to the ESTIMATION frames only, "
+        "before -hpf_spatial and -do_blur. Reach for this when frame intensity VARIES "
+        "OVER THE RUN — the pre-steady-state ramp (first frames brighter until T1 "
+        "saturation settles), or any other non-motion fluctuation. Optical flow assumes "
+        "a voxel keeps its intensity as it moves, so it reads that brightness change as "
+        "displacement: on one 1.2mm run the LK field for frame 0 was 4.5x the "
+        "steady-state median and spatially incoherent. 'localnorm' local z-scores both "
+        "sides, which cancels a MULTIPLICATIVE gain (-hpf_spatial only subtracts, so it "
+        "cannot); 'gradmag' keeps locally-normalized gradient magnitude (edges only); "
+        "'meanstd' is a global rescale — near-useless for the ramp, whose gain varies "
+        "0.94-1.39 across tissue. Inert for -backend xcorr, which normalizes inside its "
+        "own correlation window and is already immune. The correction still resamples "
+        "the RAW series. Single-echo path only (slicewise and 3-D-acq); the multi-echo "
+        "entries carry -me_match for their cross-TE matching. Not supported with "
+        "rotation-aware mode. Default none.",
+    )
+    est.add_argument(
+        "-match_sigma",
+        "-match-sigma",
+        type=float,
+        default=6.0,
+        metavar="VOX",
+        help="[-match localnorm/gradmag] Gaussian sigma (VOXELS) of the neighbourhood the "
+        "local mean/scale is measured over. Default 6.",
     )
 
     flow = p.add_argument_group("Optical-flow backend (-backend flow)")
@@ -2261,6 +2292,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         smooth_sigma = (args.do_blur / 2.35482) / max(inplane_mm, 1e-6) if args.do_blur > 0 else 0.0
         hpf_sigma = args.hpf_spatial / max(inplane_mm, 1e-6) if args.hpf_spatial > 0 else 0.0
 
+    if args.match != "none" and rotaware:
+        raise SystemExit(
+            "❌ -match is not supported with rotation-aware mode yet.",
+        )
     if args.hpf_spatial > 0 and rotaware:
         print(
             "❌ -hpf_spatial is not supported with rotation-aware mode yet.",
@@ -2306,6 +2341,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     )
     if hpf_sigma > 0:
         print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
+    if args.match != "none":
+        print(f"   ⚗️  estimation intensity match: {args.match} (σ={args.match_sigma:g}vox)")
     print(f"   accuracy: {acc_desc}")
     if qwarp_backend:
         print(
@@ -2446,6 +2483,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             hpf_sigma=hpf_sigma,
+            match=args.match,
+            match_sigma=args.match_sigma,
             device=device,
         )
 

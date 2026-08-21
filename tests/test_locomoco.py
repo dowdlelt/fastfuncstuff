@@ -1532,3 +1532,54 @@ def test_hpf_spatial_multiecho_runs_and_keeps_raw_intensities():
     for j, pe_res in enumerate(res.per_echo):
         corr = pe_res.corrected_series().numpy()
         assert corr.mean() == pytest.approx(float(datas[j].mean()), rel=0.05)
+
+
+def test_match_localnorm_beats_highpass_under_multiplicative_gain():
+    """A per-frame MULTIPLICATIVE gain that varies in space is what the pre-steady-state
+    ramp looks like (T1 saturation is tissue-dependent, so the first frames are brighter
+    by a factor that is not constant across the brain). ``hpf_sigma`` only SUBTRACTS a
+    blurred copy, which cannot cancel a gain riding on the structure; ``match=localnorm``
+    divides a local scale out too, so it can. Guards the distinction between the two.
+    """
+    base = _phantom()
+    nx, ny, nz = base.shape
+    shifts = np.array([0.0, 0.6, -0.8, 1.1, -0.5], np.float32)
+    yy = (np.arange(ny) / ny).astype(np.float32)[None, :, None]
+    gains = np.array([0.0, 0.35, -0.30, 0.40, -0.25], np.float32)
+    data = np.zeros((*base.shape, len(shifts)), np.float32)
+    for t, sh in enumerate(shifts):
+        data[..., t] = _shift_along_y(base, float(sh)) * (1.0 + gains[t] * yy)
+    common = dict(
+        pe_axis=1,
+        slice_axis=2,
+        ref_mode="first",
+        n_iters=6,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    def maxerr(res):
+        pe = res.pe_displacement().numpy()
+        est = np.median(pe.reshape(-1, pe.shape[-1]), axis=0)
+        return float(np.abs(est + shifts).max())  # pull disp recovers -shift
+
+    e_plain = maxerr(estimate_residual_flow(data, **common))
+    e_hpf = maxerr(estimate_residual_flow(data, hpf_sigma=6.0, **common))
+    e_match = maxerr(estimate_residual_flow(data, match="localnorm", match_sigma=6.0, **common))
+    assert e_match < e_hpf < e_plain
+
+
+def test_match_correction_keeps_raw_intensities(known_shift_series):
+    """``match`` transforms the ESTIMATION frames only — local z-scoring leaves a
+    near-zero-mean image, so a corrected series near that level would mean the prepped
+    data leaked into ``_correct_pe`` instead of the raw series."""
+    data, _ = known_shift_series
+    res = estimate_residual_flow(
+        data,
+        pe_axis=1,
+        slice_axis=2,
+        match="localnorm",
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert res.corrected_series().mean() > 0.5 * float(data.mean())
