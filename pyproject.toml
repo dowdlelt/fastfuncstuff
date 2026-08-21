@@ -130,6 +130,8 @@ ffs_spatial_xcorr = "fastfuncstuff.cli.spatial_xcorr:main"
 ffs_varpart = "fastfuncstuff.cli.varpart:main"
 # Benchmark / testing
 ffs_benchmark = "fastfuncstuff.cli.benchmark:main"
+# Shell completions
+ffs_completion = "fastfuncstuff.cli.completion:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
