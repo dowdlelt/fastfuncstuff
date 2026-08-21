@@ -1591,6 +1591,22 @@ def collect_nuisance_blocks(
             print(f"  -{p}ortvec_run: {path} (label={label}, run={run_idx}, transform={tf})")
     for pattern, raw_label in getattr(args, f"{p}ortvec_glob", None) or []:
         label, tf = split_label_transform(raw_label)
+        # An unquoted PATTERN is expanded by the shell before argparse sees it.
+        # With 3+ matches argparse rejects the leftovers, but with exactly 2 the
+        # call parses cleanly and the LABEL silently becomes the second
+        # filename -- the glob then matches one run and every other run is
+        # zero-padded, i.e. a plausible-looking fit with the nuisance missing
+        # from most of the data. A label that names an existing file is the
+        # tell; a real label never does.
+        if Path(raw_label).exists():
+            # Best-effort reconstruction of what the user meant to type: put the
+            # wildcard back where the run number is.
+            suggestion = re.sub(r"(?<=run[-_])\d+", "*", pattern) or pattern
+            raise ValueError(
+                f"-{p}ortvec_glob LABEL {raw_label!r} is an existing file, which means the "
+                f"shell expanded PATTERN before argparse saw it. Quote the pattern, e.g. "
+                f"-{p}ortvec_glob '{suggestion}' <label>"
+            )
         block = make_nuisance_block_from_glob(
             pattern,
             label,
