@@ -73,15 +73,48 @@ _DIR_METAVARS = {"DIR", "DIRECTORY", "DATA_DIR", "OUT_DIR"}
 _DEVICE_WORDS = ("auto", "cpu", "cuda", "mps")
 
 
+def _display_strings(option_strings: list[str]) -> list[str]:
+    """One spelling per NAME, keeping the order argparse was given.
+
+    Every ffs flag accepts both ``-foo-bar`` and ``-foo_bar``, and several
+    carry a renamed predecessor as well.  Offering all of them doubles the
+    completion list (measured on ffs_fitbasis: 71 flags, 132 spellings)
+    without adding a single new thing the user can do.
+
+    Deduping on the hyphen-normalised key rather than "drop anything with an
+    underscore" matters: flags like ``-drop_first`` are *documented* with the
+    underscore and only alias to ``-drop-first``, so a blanket rule would
+    hide the primary name and surface the alias.  Keeping the first spelling
+    of each distinct name keeps whatever argparse was told is primary, and
+    still lists genuinely different names (``-drop_first`` and
+    ``-skip_first``) separately.
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for opt in option_strings:
+        key = opt.replace("_", "-")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(opt)
+    return out
+
+
 @dataclass
 class OptionSpec:
     """One flag, reduced to what a shell needs to complete it."""
 
     option_strings: list[str]
+    """Every accepted spelling — what a shell must MATCH against."""
     help: str = ""
     choices: list[str] = field(default_factory=list)
     takes_value: bool = False
     completes: str = "none"  # "none" | "file" | "dir" | "choices" | "device"
+
+    @property
+    def display_strings(self) -> list[str]:
+        """The spellings a shell should OFFER.  See :func:`_display_strings`."""
+        return _display_strings(self.option_strings)
 
 
 class _ParserGrabbedError(Exception):
@@ -227,7 +260,7 @@ def _shell_quote(text: str) -> str:
 def render_bash(prog: str, specs: list[OptionSpec]) -> str:
     """A single ``complete -F`` function for one tool."""
     func = "_" + prog.replace("-", "_")
-    all_flags = " ".join(opt for s in specs for opt in s.option_strings)
+    all_flags = " ".join(opt for s in specs for opt in s.display_strings)
 
     file_flags, dir_flags, opaque_flags = [], [], []
     choice_cases = []
@@ -239,6 +272,9 @@ def render_bash(prog: str, specs: list[OptionSpec]) -> str:
             # A number or free text. Offering the directory listing here is
             # worse than offering nothing -- it looks like a suggestion.
             opaque_flags.extend(spec.option_strings)
+        # NB: the case patterns and the file/dir lists below deliberately use
+        # every spelling, not just the offered one -- what to complete AFTER a
+        # flag has to work for whichever alias the user actually typed.
         if spec.completes == "device":
             choice_cases.append(
                 f'        {pattern})\n            _opts="{" ".join(_DEVICE_WORDS)}"\n            ;;'
@@ -314,7 +350,11 @@ def _fish_flag_args(option: str) -> str:
 def render_fish(prog: str, specs: list[OptionSpec]) -> str:
     lines = [f"# fish completions for {prog}", f"complete -c {prog} -e", ""]
     for spec in specs:
-        for option in spec.option_strings:
+        # Only the offered spellings: fish has no hidden completion, so
+        # registering an alias is the same act as suggesting it.  Typing an
+        # unregistered alias in full still works, it just falls back to fish's
+        # default argument completion.
+        for option in spec.display_strings:
             bits = [f"complete -c {prog}", _fish_flag_args(option)]
             if spec.takes_value:
                 bits.append("-r")

@@ -75,6 +75,36 @@ class TestDescribe:
         spec = next(s for s in describe(parser) if "-do_blur" in s.option_strings)
         assert spec.option_strings == ["-do_blur", "-do-blur"]
 
+    def test_hyphen_underscore_variants_collapse_to_one_offer(self):
+        """Both spellings parse; only one should clutter the completion list."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-hrf-shapes", "-hrf_shapes", dest="hrf_shapes")
+        spec = next(s for s in describe(parser) if "-hrf-shapes" in s.option_strings)
+        assert spec.option_strings == ["-hrf-shapes", "-hrf_shapes"]  # still MATCHED
+        assert spec.display_strings == ["-hrf-shapes"]  # only one OFFERED
+
+    def test_genuinely_different_names_are_both_offered(self):
+        """A renamed flag keeping its predecessor is two names, not one alias."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "-hrf-shapes", "-hrf_shapes", "-shift-shapes", "-shift_shapes", dest="hrf_shapes"
+        )
+        spec = next(s for s in describe(parser) if "-hrf-shapes" in s.option_strings)
+        assert spec.display_strings == ["-hrf-shapes", "-shift-shapes"]
+
+    def test_underscore_primary_is_not_hidden_by_its_hyphen_alias(self):
+        """Why the rule is "first of each name", not "drop underscores".
+
+        -drop_first is the documented name and -drop-first only its alias, so
+        a blanket underscore filter would offer the alias and hide the flag.
+        """
+        parser = argparse.ArgumentParser()
+        parser.add_argument(
+            "-drop_first", "-drop-first", "-skip_first", "-skip-first", dest="drop_first", type=int
+        )
+        spec = next(s for s in describe(parser) if "-drop_first" in s.option_strings)
+        assert spec.display_strings == ["-drop_first", "-skip_first"]
+
     def test_help_is_collapsed_to_one_line(self):
         parser = argparse.ArgumentParser()
         parser.add_argument("-x2", help="line one\n    and  line   two")
@@ -129,6 +159,25 @@ class TestRenderFish:
 
 
 @pytest.mark.skipif(not shutil.which("bash"), reason="bash not available")
+def test_bash_offers_one_spelling_but_still_matches_aliases():
+    """The split that makes deduping safe: suggest one, match all.
+
+    What to complete AFTER a flag has to work for whichever alias the user
+    typed, even though only one spelling is ever suggested.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-hrf-select", "-hrf_select", dest="hrf_select", choices=["xval", "full", "none"]
+    )
+    script = render_bash("ffs_demo", describe(parser))
+    suggest = [ln for ln in script.splitlines() if "compgen -W" in ln and "$_opts" not in ln]
+    assert len(suggest) == 1
+    assert "-hrf-select" in suggest[0]
+    assert "-hrf_select" not in suggest[0], "alias leaked into the suggestion list"
+    # ...but both spellings still select the choice list.
+    assert "-hrf-select|-hrf_select)" in script
+
+
 def test_generated_bash_is_syntactically_valid():
     parser = load_parser("fastfuncstuff.cli.deconvolve")
     assert parser is not None
