@@ -3257,6 +3257,7 @@ def compute_xval_r2_per_voxel(
     prior_weight: float | str,
     *,
     single_trials: bool,
+    basis_functions_per_cond: np.ndarray | None = None,
     single_trial_betas: np.ndarray | None = None,
     block_labels: list[str] | None = None,
     cone_prior: bool = False,
@@ -3323,7 +3324,11 @@ def compute_xval_r2_per_voxel(
         for c in range(n_cond):
             bd = build_pc_basis_design_per_run(
                 onsets_per_run=[all_onsets[c][r]],
-                pcs=basis_functions,
+                pcs=(
+                    basis_functions
+                    if basis_functions_per_cond is None
+                    else basis_functions_per_cond[c]
+                ),
                 lag_times=basis_lag_times,
                 tr=tr,
                 n_timepoints_per_run=[n_tp_per_run[r]],

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ffs_fitbasis — constrained basis-set HRF fits (SPMG1/SPMG2/SPMG3/FLOBS).
+ffs_fitbasis — per-condition response estimation: amplitude, latency, width.
 
 This is the parametric / basis-set counterpart to [[ffs_deconvolve]].
 Where ``ffs_deconvolve`` does non-parametric FIR/TENT/CSPLIN
@@ -11,15 +11,16 @@ combination can't produce nonsense HRFs.
 
 Three things this tool can do that ``ffs_deconvolve`` cannot:
 
-1. **SPMG2 / SPMG3** — canonical + temporal-derivative (± dispersion-
-   derivative) — recovering both amplitude AND latency per
-   condition/trial.
-2. **FLOBS** — K=3 eigenHRFs derived from half-cosine HRF samples
-   (Woolrich, Behrens, Smith 2004 TR04MW2), with an empirical MVN(m, C)
-   shape prior.
+1. **A response shape per voxel** (``-hrf library``/``pighs``, or an
+   imported ``-hrf-index``), with ``-derivatives`` letting each condition
+   depart from it — and ``-save-shape`` reporting that departure as
+   latency and width in seconds.
+2. **FLOBS** (``-flobs``) — K=3 eigenHRFs derived from half-cosine HRF
+   samples (Woolrich, Behrens, Smith 2004 TR04MW2), with an empirical
+   MVN(m, C) shape prior.
 3. **Single-trial fits** (``-single-trials``) — one block of basis
    regressors per trial, with the prior applied per-trial.  This is
-   where unconstrained SPMG2/3 fits famously go off the rails at short
+   where unconstrained derivative fits famously go off the rails at short
    ISIs; the constraint pulls each trial's coefficients back toward
    sensible HRF shapes.
 
@@ -46,14 +47,15 @@ Outputs (per condition for the default fit, per trial with
 ``-single-trials``):
 
 - ``{prefix}_fitbasis_basis.tsv``                — the K basis functions
-- ``{prefix}_fitbasis_r2.nii.gz``                — fit R²
-- ``{prefix}_fitbasis_r2_unconstrained.nii.gz``  — OLS R² for comparison
-- ``{prefix}_fitbasis_iresp_<cond>.nii.gz``      — reconstructed HRF (4-D)
-- ``{prefix}_fitbasis_iresp_<cond>_unconstrained.nii.gz``
-- ``{prefix}_fitbasis_pcweights_<cond>.nii.gz``  — coefficient maps
-- ``{prefix}_fitbasis_pcweights_<cond>_unconstrained.nii.gz``
-- ``{prefix}_fitbasis_amplitude_<cond>.nii.gz``  — peak amplitude for 2nd-level
-- ``{prefix}_fitbasis_amplitude_<cond>_unconstrained.nii.gz``
+- ``{prefix}_fitbasis_amplitude.nii.gz``        — peak amplitude, one
+  sub-brick per condition, + xvalR2 / taskR2
+- ``{prefix}_fitbasis_shape.nii.gz``            — latency (s), validity and
+  friends, interleaved per condition, + xvalR2 / taskR2
+- ``{prefix}_fitbasis_basisweights.nii.gz``     — raw coefficients
+  (``-no-basis`` to skip)
+- ``{prefix}_fitbasis_xvalr2.nii.gz``           — held-out R² (``-xval-r2``)
+- ``{prefix}_fitbasis_hrf_index.nii.gz``        — selected curve per voxel
+- ``{prefix}_fitbasis_iresp_<cond>.nii.gz``     — reconstructed HRF (4-D)
 - ``{prefix}_fitbasis_metadata.json``            — full provenance
 
 With ``-single-trials``: filenames carry ``_trial<NNN>`` suffix
@@ -168,7 +170,7 @@ _USAGE = (
     "ffs_fitbasis -input RUN [RUN ...] -prefix OUT\n"
     "                    (-events TSV [TSV ...] | -onsets FILE [FILE ...] -durations D [D ...])\n"
     "                    [-parametrization {linear,shift}] [-single-trials] [-xval-r2]\n"
-    "                    [-model M] [-reg R] [-shift-hrf SRC] [-tau-max S] [...]\n"
+    "                    [-hrf SRC] [-derivatives D] [-reg R] [-save-shape] [...]\n"
     "\n"
     "                    Run with -h for the grouped flag list."
 )
@@ -180,17 +182,19 @@ amplitude AND latency together.
   Two models, chosen by -parametrization.  This is the first decision and it
   decides which of the groups below apply to you:
 
-    linear   K basis columns per block (SPMG1/2/3 or FLOBS), free betas,
-             constrained by a shape prior (-reg).  Estimates AMPLITUDE.
-             Latency via the SPMG2 derivative ratio does not work — measured
-             r=0.03 against known truth, with no valid operating point.
+    linear   The -hrf curve plus its -derivatives, per block, optionally
+             constrained by -reg.  Estimates AMPLITUDE — and, PER CONDITION
+             with -save-shape, latency in seconds (plus width, with
+             -derivatives time+width) by inverting the derivative ratios.
+             That readout does NOT survive per trial: one trial's base
+             coefficient is too noisy and the ratio runs to +-5 s
+             (measured r=0.03).
 
     shift    ONE column per block: the HRF shifted exactly, with a free
              amplitude and a box-bounded delay reported in seconds.  This is
              the path that recovers per-trial LATENCY (measured r=0.69).
-             Works with any HRF shape and needs no temporal derivative.
-             -model and -reg are ignored here — there are no basis
-             coefficients to choose or constrain.
+             Works with any -hrf shape and needs no derivative at all, so
+             -derivatives and -reg are ignored here.
 
   A "block" is one condition, or one trial with -single-trials.
 
@@ -200,6 +204,10 @@ amplitude AND latency together.
 
 _EPILOG = """\
 EXAMPLES
+
+  # Simplest useful run: one amplitude per condition, no prior.
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -derivatives none -prefix out/sub01_amp
 
   # Per-trial amplitudes, GLMsingle-style (the ffs_ridge alternative).
   ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
@@ -220,6 +228,17 @@ EXAMPLES
                -shift-shape-index out/sub01_hrf_index.nii.gz \\
                -mask brain_mask.nii.gz -prefix out/sub01_shift
 
+  # Per-voxel HRF chosen by held-out R2, then per-condition latency
+  # relative to each voxel's own curve.  Read _latency_dev for contrasts.
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -hrf library -derivatives time+width -save-shape \\
+               -mask brain_mask.nii.gz -prefix out/sub01_hrf
+
+  # Same, reusing an ffs_hrfopt selection instead of re-running it.
+  ffs_fitbasis -input run*.nii.gz -events sub01_run*_events.tsv \\
+               -hrf library -hrf-index out/sub01_hrf_index.nii.gz \\
+               -derivatives time+width -save-shape -prefix out/sub01_hrf
+
   # Per-condition fit with AFNI-style onsets and denoising components.
   ffs_fitbasis -input run*.nii.gz -onsets faces.1D houses.1D -durations 2.0 \\
                -reg cone -ortvec_glob 'out/sub01_run*_pcs.1D' pcs \\
@@ -238,7 +257,34 @@ READING THE OUTPUT
            _shift_xvalr2_delay_gain held-out gain from freeing the delays.
                                     >0 means the latencies are real; <=0
                                     means they are not.
-  linear:  _amplitude_<cond>, _pcweights_<cond>, _iresp_<cond>, _r2, _xvalr2
+  linear:  Everything below is a LABELLED 4-D bucket, not one file per
+           condition, and every bucket ends with the same two QC sub-bricks
+           so you can threshold inside the same dataset:
+               xvalR2   held-out R² (-xval-r2).  The honest referee.
+               taskR2   in-sample R² of the task model.  Inflated by free
+                        parameters — use it to see WHERE the task explains
+                        signal, never as a threshold.
+
+           _amplitude       one sub-brick per condition, data units
+           _shape           -save-shape.  Interleaved per condition:
+                            <cond>_latency      seconds
+                            <cond>_latency_dev  latency minus this voxel's
+                                                own mean across conditions.
+                                                READ THIS when -hrf named a
+                                                set: absolute latency is
+                                                measured against the curve
+                                                that voxel selected.
+                            <cond>_fwhm         seconds (-derivatives
+                            <cond>_dispersion   time+width only)
+                            <cond>_shape_r2     calibration quality
+                            <cond>_valid        0 = clamped to the envelope;
+                                                threshold on this
+           _basisweights    raw coefficients, <cond>_base / _dLatency /
+                            _dWidth.  -no-basis to skip.
+           _hrf_index       curve selected per voxel (1-based) + its
+                            selection R².  Feeds -hrf-index.
+           _iresp_<cond>    reconstructed response, 4-D over time
+           _xvalr2          the held-out map on its own, for convenience
 
   In-sample R² is NOT evidence of a task response, and r2 minus r2_tau0 is
   NOT evidence of latency: n_blocks free parameters buy in-sample fit even
@@ -267,9 +313,11 @@ def create_parser() -> argparse.ArgumentParser:
     # -reg flags it renders inert, so a top-down reader spent their
     # attention on flags that do not apply to them.  It leads now.
     step1 = parser.add_argument_group(
-        "STEP 1 — Model and unit of analysis",
+        "STEP 1 — Parametrisation and unit of analysis",
         description=(
-            "The two flags that decide which groups below apply to you.  Read these first."
+            "The two flags that decide which groups below apply to you.  Read these first.\n"
+            "The rest of the help is in the order you decide things: what shape,\n"
+            "how much freedom around it, how it is constrained, what comes out."
         ),
     )
     step1.add_argument(
@@ -310,7 +358,13 @@ def create_parser() -> argparse.ArgumentParser:
         "-durations",
         nargs="+",
         default=None,
-        help="Stimulus durations (s); one per condition (or single value).  Required with -onsets.",
+        help=(
+            "Stimulus durations (s); one per condition (or single value).  "
+            "Required with -onsets.  Convolved into the basis, so a block "
+            "design is modelled as a block — omitting it (0) models every "
+            "event as an impulse, which mis-times the predicted peak by "
+            "roughly D/2 and mis-scales the amplitude."
+        ),
     )
     onset_grp.add_argument(
         "-events",
@@ -362,43 +416,162 @@ def create_parser() -> argparse.ArgumentParser:
         help="Round event durations to N decimals before grouping.",
     )
 
+    # ══ STEP 2 — the response shape ════════════════════════════════════
+    hrf_grp = parser.add_argument_group(
+        "STEP 2 — Response shape (the HRF).  BOTH parametrisations",
+        description=(
+            "Give each voxel its own response shape, then model on top of it.\n"
+            "Applies to BOTH parametrisations, and is the ffs_hrfopt approach\n"
+            "folded in: score every candidate curve against the whole dataset\n"
+            "and keep the best one per voxel.\n"
+            "\n"
+            "  linear  the derivative columns are built around each voxel's own\n"
+            "          curve, so -save-shape reports each CONDITION's departure\n"
+            "          from a shape that already fits that voxel.\n"
+            "  shift   the exactly-shifted column uses each voxel's own curve.\n"
+            "\n"
+            "-shift-shapes / -shift-shape-index / -shift-n-shapes remain as\n"
+            "aliases for the flags below."
+        ),
+    )
+    hrf_grp.add_argument(
+        "-hrf",
+        "-basis-hrf",
+        "-basis_hrf",
+        "-hrf-shapes",
+        "-hrf_shapes",
+        "-shift-shapes",
+        "-shift_shapes",
+        "-shift-hrf",
+        "-shift_hrf",
+        dest="hrf",
+        default="canonical",
+        metavar="SOURCE",
+        help=(
+            "The response shape everything else is built on.\n"
+            "  ONE curve for every voxel:\n"
+            "    canonical   the SPM curve (DEFAULT)\n"
+            "    glmsingle   the GLMsingle single curve\n"
+            "    FILE        one column of numbers sampled at -flobs-dt, "
+            "e.g. a subject- or ROI-level curve from ffs_hrfopt\n"
+            "  A SET, selected PER VOXEL (see -hrf-select):\n"
+            "    library     the 20 double-gammas ffs_hrfopt uses\n"
+            "    pighs       half-cosine curves stratified over peak time\n"
+            "    flobs       curves drawn from the FLOBS prior\n"
+            "Naming a set is what turns per-voxel selection on.  Getting the "
+            "shape right first is the point: the -derivatives columns then "
+            "encode each CONDITION's departure from a curve that already fits "
+            "that voxel, instead of spending themselves correcting a wrong "
+            "average shape."
+        ),
+    )
+    hrf_grp.add_argument(
+        "-hrf-index",
+        "-hrf_index",
+        "-shift-shape-index",
+        "-shift_shape_index",
+        dest="hrf_index",
+        default=None,
+        metavar="MAP",
+        help=(
+            "Skip selection and IMPORT the per-voxel curve assignment — "
+            "sub-brick 0 of {prefix}_hrf_index.nii.gz from ffs_hrfopt or from "
+            "an earlier ffs_fitbasis run (1-based).  -hrf must then name the "
+            "SAME set the indices were fit against (default 'library'); "
+            "nothing can detect a mismatch beyond the index range.  Must be on "
+            "the -input grid, from the same -mask."
+        ),
+    )
+    hrf_grp.add_argument(
+        "-hrf-select",
+        "-hrf_select",
+        dest="hrf_select",
+        choices=["full", "xval", "none"],
+        default="full",
+        help=(
+            "How to pick each voxel's curve when -hrf names a SET.  "
+            "full (DEFAULT) scores every candidate in-sample across the whole "
+            "dataset, which is GLMsingle's FITHRF and what ffs_hrfopt does by "
+            "default.  xval scores leave-one-run-out instead — slower, and the "
+            "stricter referee if you suspect the selection is fitting noise.  "
+            "none takes curve 0 for every voxel.  Ignored with -hrf-index."
+        ),
+    )
+    hrf_grp.add_argument(
+        "-hrf-n-shapes",
+        "-hrf_n_shapes",
+        "-shift-n-shapes",
+        "-shift_n_shapes",
+        dest="hrf_n_shapes",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Candidate count for -hrf pighs / flobs (library is fixed at 20).",
+    )
+
     # ══ LINEAR parametrisation ═════════════════════════════════════════
     model_grp = parser.add_argument_group(
-        "[linear] Basis set and shape prior",
-        description="Ignored with -parametrization shift.",
-    )
-    model_grp.add_argument(
-        "-model",
-        choices=["SPMG1", "SPMG2", "SPMG3", "FLOBS"],
-        default="SPMG2",
-        help=(
-            "Basis set.  SPMG1=canonical only; SPMG2=+temporal derivative; "
-            "SPMG3=+dispersion derivative; FLOBS=K eigenHRFs from half-cosine "
-            "samples with an empirical MVN(m, C) prior.  Note SPMG2's "
-            "derivative ratio does NOT give usable latency — use "
-            "-parametrization shift for that."
+        "STEP 3 — Freedom around that shape.  [linear]",
+        description=(
+            "How much each CONDITION may depart from the STEP 2 curve.\n"
+            "Ignored with -parametrization shift."
         ),
     )
     model_grp.add_argument(
+        "-derivatives",
+        "-deriv",
+        dest="derivatives",
+        choices=["none", "time", "time+width"],
+        default="time",
+        help=(
+            "How much freedom each condition gets AROUND the -hrf curve.\n"
+            "  none        1 column per condition — amplitude only, a plain "
+            "GLM against that shape.\n"
+            "  time        DEFAULT.  + the latency derivative, so a condition "
+            "can respond earlier or later than the curve.\n"
+            "  time+width  + the width derivative, so it can also be narrower "
+            "or broader.\n"
+            "-save-shape turns these coefficients back into seconds.  With "
+            "-hrf canonical these are exactly SPMG1 / SPMG2 / SPMG3; with any "
+            "other curve they are the same construction around that curve."
+        ),
+    )
+    model_grp.add_argument(
+        "-flobs",
+        dest="use_flobs",
+        action="store_true",
+        help=(
+            "Use K FLOBS eigen-HRFs with an empirical MVN(m, C) prior instead "
+            "of a curve plus derivatives.  A different basis family, so -hrf "
+            "and -derivatives do not apply and -save-shape cannot read "
+            "latency off it."
+        ),
+    )
+    # ══ STEP 4 — regularisation ════════════════════════════════════════
+    reg_grp = parser.add_argument_group(
+        "STEP 4 — Regularisation.  [linear]",
+        description="Ignored with -parametrization shift.",
+    )
+    reg_grp.add_argument(
         "-reg",
-        choices=["none", "ridge", "mvn", "mvn-shape", "cone", "fracridge"],
-        default="cone",
+        choices=["none", "cone", "mvn-shape", "fracridge", "ridge", "mvn"],
+        default="none",
         help=(
             "Shape prior on the basis coefficients.\n"
-            "  cone      DEFAULT.  Scale-invariant: constrains the shape "
+            "  none      DEFAULT.  Plain OLS — no prior at all.\n"
+            "  cone      Scale-invariant: constrains the shape "
             "DIRECTION of beta only, leaving amplitude entirely free, and "
             "keeps the sign so negative BOLD survives.  Use this.\n"
             "  mvn-shape constrains only the shape direction orthogonal to "
             "the prior mean; amplitude unconstrained.\n"
             "  fracridge no HRF prior; CV picks each voxel's fraction of "
             "||beta_OLS|| to keep (see -fracs).\n"
-            "  none      plain OLS, no constraint.\n"
             "  ridge, mvn  legacy — see the Legacy group at the end."
         ),
     )
 
     reg_opts = parser.add_argument_group(
-        "[linear] Prior strength",
+        "STEP 4b — Prior strength.  [linear]",
         description="How hard the -reg prior pulls.  Ignored with -reg none.",
     )
     reg_opts.add_argument(
@@ -539,7 +712,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     flobs_opts = parser.add_argument_group(
-        "[linear] FLOBS basis (-model FLOBS)",
+        "STEP 3b — FLOBS basis (-flobs)",
         description=(
             "-flobs-dt and -flobs-window also set the HRF sampling grid\n"
             "for -parametrization shift, despite the name."
@@ -588,69 +761,6 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Seed for the half-cosine sampler.",
-    )
-
-    # ══ SHIFT parametrisation ══════════════════════════════════════════
-    shape_grp = parser.add_argument_group(
-        "[shift] Response shape",
-        description=(
-            "Requires -parametrization shift.  Exact shifting needs no temporal\n"
-            "derivative, so any curve works — a per-voxel HRF from ffs_hrfopt /\n"
-            "ffs_librarian drops straight in."
-        ),
-    )
-    shape_grp.add_argument(
-        "-shift-hrf",
-        "-shift_hrf",
-        dest="shift_hrf",
-        default="canonical",
-        metavar="SOURCE",
-        help=(
-            "One shape for all voxels: 'canonical' (SPM), 'library' / "
-            "'glmsingle', or a path to a one-column text file sampled at "
-            "-flobs-dt.  Use this when you want ONE clean absolute delay "
-            "map, since all timing is then forced into the delay."
-        ),
-    )
-    shape_grp.add_argument(
-        "-shift-shapes",
-        "-shift_shapes",
-        dest="shift_shapes",
-        default=None,
-        metavar="SOURCE",
-        help=(
-            "Select a per-voxel shape instead, from 'library' (20 "
-            "double-gammas), 'pighs', 'flobs', or a path to a custom HRF "
-            "library TSV.  Overrides -shift-hrf.  WARNING: a library that "
-            "varies peak time competes with the delay parameter (both move "
-            "the response in time), so absolute delay is then NOT separable "
-            "from the selected shape's TTP — read _shift_delay_dev_<cond> "
-            "for per-trial timing and _shift_mean_timing for the total."
-        ),
-    )
-    shape_grp.add_argument(
-        "-shift-shape-index",
-        "-shift_shape_index",
-        dest="shift_shape_index",
-        default=None,
-        metavar="MAP",
-        help=(
-            "Take the per-voxel shape from an existing map instead of "
-            "selecting it here — sub-brick 0 of {prefix}_hrf_index.nii.gz "
-            "from ffs_hrfopt (1-based).  Preferred: ffs_hrfopt selects on "
-            "cross-validated R².  -shift-shapes must then name the SAME "
-            "library the indices were fit against (default 'library'); "
-            "nothing can detect a mismatch beyond the index range."
-        ),
-    )
-    shape_grp.add_argument(
-        "-shift-n-shapes",
-        "-shift_n_shapes",
-        dest="shift_n_shapes",
-        type=int,
-        default=20,
-        metavar="N",
-        help="Candidate count for -shift-shapes pighs / flobs (library is fixed at 20).",
     )
 
     delay_grp = parser.add_argument_group(
@@ -855,7 +965,7 @@ def create_parser() -> argparse.ArgumentParser:
     add_ortvec_arguments(nuis_grp)
 
     out = parser.add_argument_group(
-        "Output",
+        "STEP 5 — Outputs",
         description="iresp applies to -parametrization linear only.",
     )
     # iresp save defaults differ by mode:
@@ -885,6 +995,21 @@ def create_parser() -> argparse.ArgumentParser:
         help="Force iresp save off (only PC weights + amplitude maps emitted).",
     )
     out.add_argument(
+        "-no-basis",
+        "-no_basis",
+        "-no-basisweights",
+        dest="no_basisweights",
+        action="store_true",
+        default=False,
+        help=(
+            "Skip the raw basis-coefficient bucket.  Those are the fitted "
+            "coefficients themselves — one sub-brick per (condition, basis "
+            "column) — which are what -save-shape converts into seconds and "
+            "what the amplitude map is reconstructed from.  Useful for "
+            "debugging a fit; rarely what you threshold."
+        ),
+    )
+    out.add_argument(
         "-iresp-dt",
         "-iresp_dt",
         dest="iresp_dt",
@@ -894,6 +1019,55 @@ def create_parser() -> argparse.ArgumentParser:
             "Time resolution (s) of SAVED iresp NIfTIs; default TR.  The "
             "internal basis stays at -flobs-dt for amplitude accuracy, so "
             "this only shrinks the files (typically 10-20x)."
+        ),
+    )
+
+    out.add_argument(
+        "-save-shape",
+        "-save_shape",
+        dest="save_shape",
+        action="store_true",
+        default=False,
+        help=(
+            "Convert the derivative coefficients into a per-condition "
+            "LATENCY map in seconds (and, with -derivatives time+width, a "
+            "WIDTH map as FWHM in seconds plus the width multiplier).  Needs "
+            "-parametrization linear with -derivatives time or time+width, "
+            "per condition "
+            "(not -single-trials: the ratio needs a well-determined beta_c, "
+            "which one trial does not give — use -parametrization shift "
+            "there).  Read off the UNPENALISED betas, since -reg cone "
+            "constrains the very shape direction being measured.  Latency is "
+            "measured against the condition's own modelled response, "
+            "-durations included, so zero means 'on time for this stimulus' "
+            "and the value is comparable across conditions of differing "
+            "length."
+        ),
+    )
+    out.add_argument(
+        "-shape-tau-max",
+        "-shape_tau_max",
+        dest="shape_tau_max",
+        type=float,
+        default=1.5,
+        metavar="SECONDS",
+        help=(
+            "Half-width of the calibrated latency range for -save-shape "
+            "(default 1.5).  Past ~2 s the basis stops representing a "
+            "shifted HRF at all (shape R2 ~0.94), so widening this trades "
+            "range for meaning."
+        ),
+    )
+    out.add_argument(
+        "-shape-r2-floor",
+        "-shape_r2_floor",
+        dest="shape_r2_floor",
+        type=float,
+        default=0.95,
+        metavar="R2",
+        help=(
+            "Drop calibration grid points the basis reproduces worse than "
+            "this (default 0.95).  Sets the edge of the validity mask."
         ),
     )
 
@@ -916,6 +1090,17 @@ def create_parser() -> argparse.ArgumentParser:
         ),
     )
     legacy.add_argument(
+        "-model",
+        choices=["SPMG1", "SPMG2", "SPMG3", "FLOBS"],
+        default=None,
+        help=(
+            "Superseded by -hrf + -derivatives, which separate 'which curve' "
+            "from 'how much freedom around it' — the old name said SPMG even "
+            "when the curve came from a library.  SPMG1/2/3 map to "
+            "-derivatives none/time/time+width, FLOBS to -flobs."
+        ),
+    )
+    legacy.add_argument(
         "-canonical-std",
         "-canonical_std",
         dest="canonical_std",
@@ -931,10 +1116,12 @@ def create_parser() -> argparse.ArgumentParser:
         default=0.3,
         help=(
             "Prior std on the temporal-derivative coefficient.  -reg "
-            "ridge/mvn with -model SPMG* only.  Tuning this for LATENCY is "
-            "futile — there is no valid operating point (left free the "
-            "derivative ratio runs to ±5 s; tightened it collapses to "
-            "±0.15 s and carries nothing).  Use -parametrization shift."
+            "ridge/mvn with -model SPMG* only.  Tuning this to extract "
+            "LATENCY is futile — there is no valid operating point (left free "
+            "the per-trial derivative ratio runs to ±5 s; tightened it "
+            "collapses to ±0.15 s and carries nothing).  Per condition, read "
+            "latency with -save-shape off an unpenalised fit; per trial, use "
+            "-parametrization shift."
         ),
     )
     legacy.add_argument(
@@ -1031,9 +1218,93 @@ def _build_prior(
     return base_m, base_C
 
 
+_HRF_SETS = {"library", "pighs", "flobs"}
+
+
+def _hrf_set_name(spec: str | None) -> str | None:
+    """The set name in ``-hrf``, or None when it names a single curve.
+
+    Naming a set is what turns per-voxel selection on, so this one
+    predicate decides between "one curve everywhere" and "a curve per
+    voxel" for both parametrisations.
+    """
+    if spec is None:
+        return None
+    key = str(spec).strip().lower()
+    return key if key in _HRF_SETS else None
+
+
+_BASIS_COL_NAMES = ("base", "dLatency", "dWidth")
+
+
+def _save_bucket(
+    arrays: list[np.ndarray],
+    labels: list[str],
+    path: str,
+    *,
+    to_volume,
+    reference_img: str,
+    qc: list[tuple[str, np.ndarray]] | None = None,
+) -> None:
+    """Write one labelled 4-D bucket, with the QC maps appended.
+
+    Anything a user might threshold ships with the map they would
+    threshold it BY in the same dataset — held-out R2, and the
+    task-explained R2.  Writing them as separate files meant loading two
+    datasets and hoping the grids matched; as sub-bricks an AFNI viewer
+    can set the threshold from the same file.
+    """
+    stack = list(arrays)
+    names = list(labels)
+    for name, arr in qc or []:
+        stack.append(arr)
+        names.append(name)
+    vol = to_volume(np.stack([np.asarray(a, dtype=np.float32) for a in stack], axis=1))
+    save_nifti(vol, output_path=path, reference_img=reference_img, brick_labels=names)
+    print(
+        f"  Wrote {path}  ({len(names)} sub-bricks: {', '.join(names[:4])}"
+        + (", …" if len(names) > 4 else "")
+        + ")"
+    )
+
+
+def _print_r2(fit, reg: str) -> None:
+    """R2 line that does not claim a constraint the run did not apply.
+
+    Under ``-reg none`` both numbers come from the same OLS solve, so
+    printing "OLS / constrained" side by side invited the reader to look
+    for a difference that cannot exist.
+    """
+    if reg == "none":
+        print(f"  R² mean: {fit.r2.mean():.3f}  (OLS — no prior applied)")
+    else:
+        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  -reg {reg}: {fit.r2.mean():.3f}")
+
+
+def _shape_summary(args) -> str:
+    """One line naming the actual model, for the log.
+
+    Printing "SPMG2" while the curve came from a library was the thing
+    that made runs unreadable — the name has to track what was asked for.
+    """
+    if args.use_flobs:
+        return f"FLOBS ({args.flobs_n_basis} eigen-HRFs)"
+    set_name = _hrf_set_name(args.hrf)
+    if args.hrf_index:
+        shape = f"per-voxel from {args.hrf_index}"
+    elif set_name:
+        shape = f"per-voxel from {set_name} (-hrf-select {args.hrf_select})"
+    else:
+        shape = str(args.hrf)
+    extra = {"none": "amplitude only", "time": "+ latency", "time+width": "+ latency + width"}[
+        args.derivatives
+    ]
+    return f"{shape}, {extra}"
+
+
 def _build_basis(args) -> FLOBSBasis:
     """Construct the basis FLOBSBasis container from the chosen model."""
-    if args.model == "FLOBS":
+    if args.use_flobs:
         return generate_flobs_basis(
             n_basis=args.flobs_n_basis,
             n_samples=args.flobs_n_samples,
@@ -1041,12 +1312,317 @@ def _build_basis(args) -> FLOBSBasis:
             dt=args.flobs_dt,
             seed=args.flobs_seed,
         )
-    n_basis_map = {"SPMG1": 1, "SPMG2": 2, "SPMG3": 3}
-    return generate_spmg_basis(
-        n_basis=n_basis_map[args.model],
-        duration=args.flobs_window,
-        dt=args.flobs_dt,
+    n_basis = 1 + {"none": 0, "time": 1, "time+width": 2}[args.derivatives]
+    if str(args.hrf).strip().lower() == "canonical":
+        # Keep the hand-written SPM path for the default so existing
+        # runs stay bit-identical; make_derivative_basis reproduces it
+        # to r > 0.999 but "reproduces" is not "is".
+        return generate_spmg_basis(
+            n_basis=n_basis,
+            duration=args.flobs_window,
+            dt=args.flobs_dt,
+        )
+
+    from fastfuncstuff.design.flobs import FLOBSBasis
+    from fastfuncstuff.design.hrf import make_derivative_basis
+
+    base = _resolve_shift_hrf(args.hrf, args.flobs_dt, args.flobs_window)
+    G = make_derivative_basis(base, args.flobs_dt, n_basis)
+    norms = np.linalg.norm(G, axis=1, keepdims=True)
+    G = G / np.where(norms > 1e-12, norms, 1.0)
+    return FLOBSBasis(
+        basis_functions=G,
+        eigenvalues=np.ones(n_basis, dtype=np.float64),
+        m=np.zeros(n_basis, dtype=np.float64),
+        C=np.eye(n_basis, dtype=np.float64),
+        dt=float(args.flobs_dt),
+        duration=float(args.flobs_window),
+        n_samples=0,
+        parametrization={"derivatives": args.derivatives, "hrf": str(args.hrf)},
     )
+
+
+def _build_block_bases(
+    basis: FLOBSBasis,
+    durations_per_block: list[float],
+) -> np.ndarray:
+    """Per-block basis curves, each convolved with that block's stimulus.
+
+    A GLM regressor for a D-second event is the HRF convolved with a
+    D-second boxcar.  Blocks can differ in D (one condition is a 1 s
+    cue, another an 8 s block), so the basis is per block rather than
+    global.
+
+    Rows are re-L2-normalised afterwards, matching what
+    ``generate_spmg_basis`` hands out — the ``-reg`` priors are tuned
+    against that scaling, and the latency calibration is measured in
+    design space so it absorbs the change either way.
+    """
+    from fastfuncstuff.design.hrf import convolve_curves_with_duration
+
+    out = np.empty((len(durations_per_block),) + basis.basis_functions.shape, dtype=np.float64)
+    for b, dur in enumerate(durations_per_block):
+        G = convolve_curves_with_duration(
+            basis.basis_functions, basis.dt, float(dur), normalize=False
+        )
+        norms = np.linalg.norm(G, axis=1, keepdims=True)
+        out[b] = G / np.where(norms > 1e-12, norms, 1.0)
+    return out
+
+
+def _shape_readout(
+    *,
+    n_deriv: int,
+    betas_ols: np.ndarray,
+    per_run_designs: list[np.ndarray],
+    block_onsets_per_run: list[list[np.ndarray]],
+    basis_lag_times: np.ndarray,
+    basis_dt: float,
+    basis_mode: str,
+    tr: float,
+    n_tp_per_run: list[int],
+    n_basis: int,
+    tau_max: float,
+    r2_floor: float,
+    base_hrf: np.ndarray | None,
+    block_durations: list[float],
+) -> tuple[list[dict[str, np.ndarray]], list]:
+    """Per-condition latency (and width) from the SPMG derivative ratios.
+
+    One :class:`ShapeCalibration` per block, because the ratio a given
+    latency produces depends on that block's own onset pattern.  The
+    calibration targets are built with the *same* convolution routine
+    that produced the design, so basis normalisation, duration handling
+    and TR sampling all match by construction rather than by assumption.
+    """
+    from fastfuncstuff.design.basis_shape import (
+        ShapeCalibration,
+        build_shape_hrf_bank,
+        calibrate_shape_ratios,
+        invert_shape_ratios,
+    )
+    from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+
+    taus = np.arange(-tau_max, tau_max + 1e-9, min(0.1, tau_max / 12.0))
+    dispersions = np.arange(0.7, 1.451, 0.05) if n_deriv == 2 else np.array([1.0])
+    duration = float(basis_lag_times[-1] + basis_dt)
+
+    design_concat = np.concatenate([np.asarray(d, dtype=np.float64) for d in per_run_designs], 0)
+    n_runs = len(per_run_designs)
+    n_blocks = len(block_onsets_per_run)
+
+    # One bank per distinct stimulus duration: the calibration targets
+    # have to be regressors for the real stimulus, not for an impulse,
+    # or the map is being inverted against the wrong family.
+    banks: dict[float, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+
+    out: list[dict[str, np.ndarray]] = []
+    calibs: list[ShapeCalibration] = []
+    for b_idx in range(n_blocks):
+        key = round(float(block_durations[b_idx]), 4)
+        if key not in banks:
+            banks[key] = build_shape_hrf_bank(
+                taus,
+                dispersions,
+                dt=basis_dt,
+                duration=duration,
+                base_hrf=base_hrf,
+                stim_duration=key,
+            )
+        bank, bank_lags, fwhm = banks[key]
+
+        targets = np.concatenate(
+            build_pc_basis_design_per_run(
+                onsets_per_run=[block_onsets_per_run[b_idx][r] for r in range(n_runs)],
+                pcs=bank,
+                lag_times=bank_lags,
+                tr=tr,
+                n_timepoints_per_run=n_tp_per_run,
+                basis=basis_mode,
+            ),
+            axis=0,
+        ).astype(np.float64)
+
+        block_design = design_concat[:, b_idx * n_basis : (b_idx + 1) * n_basis]
+        calib = calibrate_shape_ratios(block_design, targets, taus, dispersions, fwhm)
+
+        beta_c = betas_ols[:, b_idx, 0]
+        # A near-zero canonical beta is what destroys the ratio; at the
+        # condition level it means "no response here", not "latency is
+        # huge".  Send those through as NaN so they land outside the
+        # hull and come back flagged invalid.
+        safe = np.where(np.abs(beta_c) > 1e-12, beta_c, np.nan)
+        r_t = betas_ols[:, b_idx, 1] / safe
+        r_d = betas_ols[:, b_idx, 2] / safe if n_basis == 3 else None
+        out.append(invert_shape_ratios(calib, r_t, r_d, shape_r2_floor=r2_floor))
+        calibs.append(calib)
+
+    return out, calibs
+
+
+def _fit_shape_groups(
+    *,
+    hrf_index: np.ndarray,
+    shapes: np.ndarray,
+    n_basis: int,
+    block_durations: list[float],
+    block_onsets_per_run: list[list[np.ndarray]],
+    per_run_data: list[torch.Tensor],
+    basis_dt: float,
+    basis_mode: str,
+    tr: float,
+    n_tp_per_run: list[int],
+    fit_one,
+) -> tuple[object, np.ndarray, list[np.ndarray], dict[int, list[np.ndarray]]]:
+    """Fit voxels in groups, one per distinct per-voxel HRF.
+
+    A per-voxel response shape means a per-voxel design, which sounds
+    ruinous but is not: the shapes come from a library of ~20 curves, so
+    there are at most 20 distinct designs no matter how many voxels.
+    Group by curve, build one design per group, fit that group's voxels.
+
+    ``fit_one(voxel_idx, per_run_designs) -> FLOBSFitResult`` is the
+    caller's existing single-design fit path, so every ``-reg`` branch
+    behaves here exactly as it does without shape selection.
+
+    Returns the stitched fit, the per-curve basis stack (small — indexed
+    by curve, never expanded to per-voxel, which would run to tens of GB
+    on a real volume), the group voxel-index arrays, and each occupied
+    group's design so the latency calibration can reuse it.
+    """
+    from fastfuncstuff.design.hrf import convolve_curves_with_duration, make_derivative_basis
+    from fastfuncstuff.design.hrf_derive import build_pc_basis_design_per_run
+
+    n_blocks = len(block_onsets_per_run)
+    n_runs = len(per_run_data)
+    n_vox = int(hrf_index.size)
+    groups = [np.where(hrf_index == k)[0] for k in range(shapes.shape[0])]
+    active = [(k, idx) for k, idx in enumerate(groups) if idx.size]
+    print(f"  Shape groups to fit: {len(active)} of {shapes.shape[0]} curves occupied")
+
+    betas = r2 = betas_ols = r2_ols = None
+    group_bases = np.empty((shapes.shape[0], n_blocks, n_basis, shapes.shape[1]), dtype=np.float64)
+    group_designs: dict[int, list[np.ndarray]] = {}
+    sigma2_sum = 0.0
+    pw_sum = 0.0
+
+    for k, idx in tqdm(active, desc="  Shape groups", leave=True, disable=len(active) <= 1):
+        G = make_derivative_basis(shapes[k], basis_dt, n_basis)
+        for b, dur in enumerate(block_durations):
+            Gb = convolve_curves_with_duration(G, basis_dt, float(dur), normalize=False)
+            norms = np.linalg.norm(Gb, axis=1, keepdims=True)
+            group_bases[k, b] = Gb / np.where(norms > 1e-12, norms, 1.0)
+
+        designs: list[torch.Tensor] = []
+        for r in range(n_runs):
+            cols = [
+                build_pc_basis_design_per_run(
+                    onsets_per_run=[block_onsets_per_run[b][r]],
+                    pcs=group_bases[k, b],
+                    lag_times=np.arange(shapes.shape[1]) * basis_dt,
+                    tr=tr,
+                    n_timepoints_per_run=[n_tp_per_run[r]],
+                    basis=basis_mode,
+                )[0]
+                for b in range(n_blocks)
+            ]
+            designs.append(torch.from_numpy(np.concatenate(cols, axis=1).astype(np.float32)))
+
+        group_designs[k] = [d.numpy() for d in designs]
+        gfit = fit_one(idx, designs)
+        if betas is None:
+            betas = np.zeros((n_vox, gfit.betas.shape[1]), dtype=np.float32)
+            betas_ols = np.zeros_like(betas)
+            r2 = np.zeros(n_vox, dtype=np.float32)
+            r2_ols = np.zeros(n_vox, dtype=np.float32)
+        betas[idx] = gfit.betas[:, : betas.shape[1]]
+        betas_ols[idx] = gfit.betas_ols[:, : betas.shape[1]]
+        r2[idx] = np.asarray(gfit.r2, dtype=np.float32)
+        r2_ols[idx] = np.asarray(gfit.r2_ols, dtype=np.float32)
+        sigma2_sum += float(gfit.sigma2_mean) * idx.size
+        pw_sum += float(gfit.effective_prior_weight) * idx.size
+
+    from fastfuncstuff.design.flobs import FLOBSFitResult
+
+    stitched = FLOBSFitResult(
+        betas=betas,
+        hrfs=None,  # type: ignore[arg-type]
+        r2=r2,
+        betas_ols=betas_ols,
+        hrfs_ols=None,  # type: ignore[arg-type]
+        r2_ols=r2_ols,
+        sigma2_mean=sigma2_sum / max(1, n_vox),
+        effective_prior_weight=pw_sum / max(1, n_vox),
+        n_iter=1,
+    )
+    return stitched, group_bases, groups, group_designs
+
+
+def _select_hrf_per_voxel(
+    *,
+    shapes: np.ndarray,
+    per_run_data: list[torch.Tensor],
+    all_onsets: list[list[np.ndarray]],
+    durations: list[float],
+    run_starts: list[int],
+    n_timepoints: int,
+    tr: float,
+    dt: float,
+    polort: int,
+    extra_regs_per_run: list[torch.Tensor] | None,
+    select_mode: str,
+    device: torch.device,
+    verbose: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Pick each voxel's response curve by scoring the whole dataset.
+
+    This is ``ffs_hrfopt``'s procedure, reused rather than reimplemented
+    (:func:`~fastfuncstuff.design.hrf_selection.fit_glm_hrf_library_with_xval`):
+    fit every candidate curve against all the data and keep the one that
+    scores best per voxel.  ``select_mode='xval'`` scores leave-one-run-out,
+    which is the referee that does not reward overfitting; a single run has
+    no held-out data, so it falls back to in-sample.
+
+    Returns ``(index, score)``, both ``(n_voxels,)``, index 0-based.
+    """
+    from fastfuncstuff.design.builder import create_onset_matrix_microtime
+    from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
+
+    onset_matrix = create_onset_matrix_microtime(
+        all_onsets,
+        list(run_starts),
+        tr,
+        n_timepoints,
+        dt,
+        stim_durations=list(durations),
+        device=device,
+    )
+    data = torch.cat([d for d in per_run_data], dim=1)
+
+    extra = None
+    if extra_regs_per_run is not None:
+        extra = torch.cat([e for e in extra_regs_per_run], dim=0)
+
+    res = fit_glm_hrf_library_with_xval(
+        data=data,
+        onsets=onset_matrix,
+        hrf_library=torch.from_numpy(np.ascontiguousarray(shapes)).to(device).float(),
+        tr=tr,
+        run_starts=list(run_starts),
+        stim_durations=list(durations),
+        polort=polort,
+        extra_regressors=extra,
+        microtime_dt=dt,
+        select_mode=select_mode,
+        device=device,
+        verbose=verbose,
+        # Only the index is wanted: ffs_fitbasis immediately refits with its
+        # own derivative basis, so the engine's own full refit is discarded.
+        skip_final_fit=True,
+    )
+    idx = res.hrf_index.detach().cpu().numpy().astype(np.int64)
+    score = res.xval_r2_best.detach().cpu().numpy().astype(np.float32)
+    return idx, score
 
 
 def _resolve_prior_weight_arg(arg: str | float, reg: str) -> float | str:
@@ -1129,17 +1705,15 @@ def _load_shape_index_map(
 
     p = Path(path).expanduser()
     if not p.exists():
-        raise FileNotFoundError(f"-shift-shape-index {path!r} does not exist.")
+        raise FileNotFoundError(f"-hrf-index {path!r} does not exist.")
     vol = np.asanyarray(load_nifti(str(p)).dataobj)
     if vol.ndim == 4:
         vol = vol[..., 0]
     elif vol.ndim != 3:
-        raise ValueError(
-            f"-shift-shape-index {path!r}: expected a 3-D or 4-D volume, got {vol.shape}."
-        )
+        raise ValueError(f"-hrf-index {path!r}: expected a 3-D or 4-D volume, got {vol.shape}.")
     if tuple(vol.shape) != tuple(volume_shape):
         raise ValueError(
-            f"-shift-shape-index {path!r} has grid {vol.shape} but the input "
+            f"-hrf-index {path!r} has grid {vol.shape} but the input "
             f"data has {tuple(volume_shape)}.  The index map must be on the "
             "same grid as -input (same ffs_hrfopt run, or resampled first)."
         )
@@ -1147,7 +1721,7 @@ def _load_shape_index_map(
     idx = idx[mask] if mask is not None else idx.reshape(-1)
     if idx.size != n_voxels:
         raise ValueError(
-            f"-shift-shape-index {path!r} yielded {idx.size} voxels but the "
+            f"-hrf-index {path!r} yielded {idx.size} voxels but the "
             f"data has {n_voxels}.  Use the same -mask as the ffs_hrfopt run."
         )
     # 1-based (hrfopt convention) → 0-based; unset voxels (0) become shape 0.
@@ -1155,7 +1729,7 @@ def _load_shape_index_map(
     too_big = out >= n_shapes
     if too_big.any():
         raise ValueError(
-            f"-shift-shape-index {path!r} contains index "
+            f"-hrf-index {path!r} contains index "
             f"{int(idx[too_big].max())} (1-based) but the shape library has "
             f"only {n_shapes} curves.  The map was fit against a different "
             "library — pass it via -shift-shapes."
@@ -1218,7 +1792,7 @@ def _run_shift_mode(
             f"           from -shift-hrf (currently {args.shift_hrf!r}); the delay "
             f"prior from\n"
             f"           -delay-prior-sd.  Use -parametrization linear if you "
-            f"wanted {args.model}/{args.reg}."
+            f"wanted -derivatives {args.derivatives} / -reg {args.reg}."
         )
 
     print("\n  Parametrisation: shift (amplitude + bounded latency per block)")
@@ -1228,20 +1802,20 @@ def _run_shift_mode(
     # An imported index map only says WHICH curve each voxel took; the curves
     # themselves still have to be rebuilt here, and the default library is
     # what ffs_hrfopt uses unless the user pointed it elsewhere.
-    shape_source = args.shift_shapes or ("library" if args.shift_shape_index else None)
+    shape_source = _hrf_set_name(args.hrf) or ("library" if args.hrf_index else None)
     if shape_source:
         shapes, shape_labels = build_shape_library(
             shape_source,
             args.flobs_dt,
             args.flobs_window,
-            n_hrfs=args.shift_n_shapes,
-            drop_empty=args.shift_shape_index is None,
+            n_hrfs=args.hrf_n_shapes,
+            drop_empty=args.hrf_index is None,
         )
         hrf = shapes[0]
-        if args.shift_shape_index:
+        if args.hrf_index:
             try:
                 imported_index = _load_shape_index_map(
-                    args.shift_shape_index,
+                    args.hrf_index,
                     n_shapes=shapes.shape[0],
                     volume_shape=volume_shape,
                     mask=mask,
@@ -1253,7 +1827,7 @@ def _run_shift_mode(
             n_used = int(np.unique(imported_index).size)
             print(
                 f"  Shape source: {shape_source} — {shapes.shape[0]} curves, "
-                f"assignment IMPORTED from {args.shift_shape_index} "
+                f"assignment IMPORTED from {args.hrf_index} "
                 f"({n_used} distinct shape(s) in the mask)"
             )
             print(
@@ -1567,7 +2141,7 @@ def _run_shift_mode(
         "shape_index_source": (
             "imported" if imported_index is not None else ("fitted" if shapes is not None else None)
         ),
-        "shape_index_map": args.shift_shape_index,
+        "shape_index_map": args.hrf_index,
         "ortvec_columns_per_run": (
             0 if extra_regs_per_run is None else int(extra_regs_per_run[0].shape[1])
         ),
@@ -1602,8 +2176,50 @@ def main() -> int:
         return 0
     args = parser.parse_args()
 
+    # Legacy -model -> (-flobs, -derivatives).  Explicit new flags win, and
+    # saying both contradictory things is an error rather than a coin toss.
+    if args.model is not None:
+        mapped = {"SPMG1": "none", "SPMG2": "time", "SPMG3": "time+width"}
+        given = {a.split("=")[0] for a in sys.argv[1:]}
+        if args.model == "FLOBS":
+            args.use_flobs = True
+        elif given & {"-derivatives", "-deriv"} and args.derivatives != mapped[args.model]:
+            parser.error(
+                f"-model {args.model} means -derivatives {mapped[args.model]}, "
+                f"but -derivatives {args.derivatives} was also given."
+            )
+        else:
+            args.derivatives = mapped[args.model]
+        print(
+            f"  NOTE: -model {args.model} is superseded by "
+            + ("-flobs" if args.model == "FLOBS" else f"-derivatives {args.derivatives}")
+        )
+
+    n_deriv = {"none": 0, "time": 1, "time+width": 2}[args.derivatives]
+
     if getattr(args, "delay_prior_sd", None) is not None and args.delay_prior_sd <= 0:
         args.delay_prior_sd = None
+
+    if args.save_shape:
+        # Each of these makes the readout meaningless rather than merely
+        # worse, so they are errors, not warnings.
+        if args.parametrization != "linear":
+            parser.error(
+                "-save-shape needs -parametrization linear; the shift "
+                "parametrisation already reports delay in seconds directly."
+            )
+        if args.use_flobs or n_deriv < 1:
+            parser.error(
+                "-save-shape needs -derivatives time or time+width"
+                + (" (-flobs has no derivative columns)" if args.use_flobs else "")
+                + "; there is no derivative coefficient to read latency from."
+            )
+        if args.single_trials:
+            parser.error(
+                "-save-shape is a per-condition readout.  Per trial, beta_c is "
+                "not well enough determined for the ratio (measured: it runs to "
+                "±5 s in ~45% of trials) — use -parametrization shift instead."
+            )
 
     if isinstance(getattr(args, "amp_ridge", None), str):
         if args.amp_ridge.strip().lower() == "auto":
@@ -1618,21 +2234,12 @@ def main() -> int:
                 )
                 return 1
 
-    if args.shift_shape_index and args.parametrization != "shift":
-        print(
-            "ERROR: -shift-shape-index only applies to -parametrization shift. "
-            "The linear parametrisation has no per-voxel HRF — the basis set "
-            "IS its shape model, so an index map has nothing to select.",
-            file=sys.stderr,
-        )
-        return 1
-
     pfx = parse_prefix(args.prefix)
     args.prefix = pfx.stem
     nii_ext = pfx.nifti_ext
 
     print("=" * 72)
-    print(" ffs_fitbasis — constrained basis-set HRF fits")
+    print(" ffs_fitbasis — per-condition response estimation")
     print("=" * 72)
     print(f"  Started: {datetime.now().isoformat(timespec='seconds')}")
     print(f"  Prefix:  {args.prefix}")
@@ -1807,13 +2414,13 @@ def main() -> int:
     _shift_mode = args.parametrization == "shift"
     if not _shift_mode:
         print(
-            f"\n  Model: {args.model}    Regularisation: {args.reg}    "
-            f"Single-trials: {args.single_trials}"
+            f"\n  Response shape: {_shape_summary(args)}"
+            f"\n  Regularisation: {args.reg}    Single-trials: {args.single_trials}"
         )
     basis = _build_basis(args)
     n_basis = basis.basis_functions.shape[0]
     prior_m, prior_C = _build_prior(
-        model=args.model,
+        model="FLOBS" if args.use_flobs else f"SPMG{n_basis}",
         reg=args.reg,
         basis=basis,
         canonical_std=args.canonical_std,
@@ -1823,8 +2430,8 @@ def main() -> int:
     pw = _resolve_prior_weight_arg(args.prior_weight, args.reg)
     if not _shift_mode:
         print(
-            f"  Basis: {n_basis} fns × {basis.basis_functions.shape[1]} samples "
-            f"(dt={basis.dt}s, window={basis.duration:.1f}s)"
+            f"  Columns per condition: {n_basis} "
+            f"(curves at dt={basis.dt}s over {basis.duration:.1f}s)"
         )
     # Only print prior info when the prior is actually applied.  With
     # -reg none, m/C/λ are all zeros / unused — printing them is noise
@@ -1908,6 +2515,7 @@ def main() -> int:
     # condition's onset list to a separate one-event-per-block.
     block_labels: list[str] = []
     block_onsets_per_run: list[list[np.ndarray]] = []
+    block_cond_idx: list[int] = []
     if args.single_trials:
         for cond_idx, cond_label in enumerate(condition_labels):
             cond_runs = all_onsets[cond_idx]
@@ -1921,13 +2529,32 @@ def main() -> int:
                     ]
                     block_labels.append(f"{cond_label}_trial{trial_num_global:03d}_run{r + 1}")
                     block_onsets_per_run.append(per_run)
+                    block_cond_idx.append(cond_idx)
                     trial_num_global += 1
     else:
         for cond_idx, cond_label in enumerate(condition_labels):
             block_labels.append(cond_label)
             block_onsets_per_run.append(all_onsets[cond_idx])
+            block_cond_idx.append(cond_idx)
 
     n_blocks = len(block_labels)
+
+    # ── Stimulus durations into the basis ──────────────────────────
+    # Previously the linear path built impulse regressors and ignored
+    # -durations entirely, which delays the modelled peak by ~D/2 and
+    # mis-scales the amplitude.  Durations are per condition (the
+    # repo's timing model); a block inherits its condition's.
+    block_durations = [
+        float(timing.durations[c]) if timing.durations_given else 0.0 for c in block_cond_idx
+    ]
+    block_bases = _build_block_bases(basis, block_durations)
+
+    uniq_dur = sorted({round(d, 4) for d in block_durations})
+    if any(d > basis.dt for d in uniq_dur):
+        shown = ", ".join(f"{d:g}s" for d in uniq_dur)
+        print(f"  Stimulus duration convolved into the basis: {shown}")
+    else:
+        print("  Stimulus duration: impulse (0s) — regressors are the bare HRF.")
     print(
         f"  Blocks to fit: {n_blocks}  ({'one per trial' if args.single_trials else 'one per condition'})"
     )
@@ -1956,6 +2583,27 @@ def main() -> int:
             parcel_labels=parcel_labels,
         )
 
+    # ── Per-voxel HRF shape (shared by both parametrisations) ──────
+    hrf_shapes: np.ndarray | None = None
+    hrf_shape_labels: list[str] = []
+    hrf_index: np.ndarray | None = None
+    hrf_index_score: np.ndarray | None = None
+    shape_source = _hrf_set_name(args.hrf) or ("library" if args.hrf_index else None)
+    if shape_source:
+        from fastfuncstuff.design.shifted_hrf import build_shape_library
+
+        hrf_shapes, hrf_shape_labels = build_shape_library(
+            shape_source,
+            args.flobs_dt,
+            args.flobs_window,
+            n_hrfs=args.hrf_n_shapes,
+            # An imported index numbers rows of the SOURCE library, so
+            # dropping a degenerate curve here would renumber everything
+            # after it.
+            drop_empty=args.hrf_index is None,
+        )
+        print(f"  HRF shape candidates: {hrf_shapes.shape[0]} ({shape_source})")
+
     # Build per-run design with K basis cols per block
     per_run_designs: list[torch.Tensor] = []
     for r in range(n_runs):
@@ -1964,7 +2612,7 @@ def main() -> int:
             # Use the helper's onsets-per-run path: one-condition view.
             bd = build_pc_basis_design_per_run(
                 onsets_per_run=[block_onsets_per_run[b_idx][r]],
-                pcs=basis.basis_functions,
+                pcs=block_bases[b_idx],
                 lag_times=basis_lag_times,
                 tr=tr,
                 n_timepoints_per_run=[n_tp_per_run[r]],
@@ -2023,7 +2671,14 @@ def main() -> int:
             print(
                 f"\n  Empirical Bayes: per-condition pre-fit "
                 f"({len(condition_labels)} cond × K={n_basis} on "
-                f"{args.model} / {args.reg})…"
+                f"-derivatives {args.derivatives} / -reg {args.reg})…"
+            )
+            cond_bases = _build_block_bases(
+                basis,
+                [
+                    float(timing.durations[c]) if timing.durations_given else 0.0
+                    for c in range(len(condition_labels))
+                ],
             )
             pc_designs: list[torch.Tensor] = []
             for r in range(n_runs):
@@ -2031,7 +2686,7 @@ def main() -> int:
                 for c in range(len(condition_labels)):
                     bd = build_pc_basis_design_per_run(
                         onsets_per_run=[all_onsets[c][r]],
-                        pcs=basis.basis_functions,
+                        pcs=cond_bases[c],
                         lag_times=basis_lag_times,
                         tr=tr,
                         n_timepoints_per_run=[n_tp_per_run[r]],
@@ -2197,6 +2852,72 @@ def main() -> int:
     # inside the dispatch block below.
     task_column_labels = [f"{lbl}#PC{b}" for lbl in block_labels for b in range(n_basis)]
     if arma_cells is None:
+        # ── Per-voxel HRF selection (linear path) ──────────────────
+        if hrf_shapes is not None:
+            unsupported = [
+                name
+                for name, bad in (
+                    ("-prewhiten " + str(args.prewhiten), args.prewhiten != "none"),
+                    ("-lss", args.lss),
+                    ("-prior-from " + str(args.prior_from), args.prior_from != "none"),
+                    ("-reg fracridge", args.reg == "fracridge"),
+                    ("-cv-runs", args.cv_runs),
+                )
+                if bad
+            ]
+            if unsupported:
+                print(
+                    f"ERROR: -hrf-shapes does not yet combine with "
+                    f"{', '.join(unsupported)} under -parametrization linear.  "
+                    "Each of those has its own per-voxel binning or CV loop "
+                    "that would have to be crossed with the shape groups; "
+                    "re-run without it, or use -parametrization shift.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            if args.hrf_index:
+                try:
+                    hrf_index = _load_shape_index_map(
+                        args.hrf_index,
+                        n_shapes=hrf_shapes.shape[0],
+                        volume_shape=volume_shape,
+                        mask=mask,
+                        n_voxels=per_run_data[0].shape[0],
+                    )
+                except (FileNotFoundError, ValueError) as exc:
+                    print(f"ERROR: {exc}", file=sys.stderr)
+                    return 1
+                print(f"  HRF assignment IMPORTED from {args.hrf_index}")
+            elif args.hrf_select == "none":
+                hrf_index = np.zeros(per_run_data[0].shape[0], dtype=np.int64)
+            else:
+                print(f"\n── Selecting one HRF per voxel ({args.hrf_select}) ──")
+                hrf_index, hrf_index_score = _select_hrf_per_voxel(
+                    shapes=hrf_shapes,
+                    per_run_data=per_run_data,
+                    all_onsets=all_onsets,
+                    durations=[
+                        float(timing.durations[c]) if timing.durations_given else 0.0
+                        for c in range(len(condition_labels))
+                    ],
+                    run_starts=list(run_starts),
+                    n_timepoints=n_timepoints,
+                    tr=tr,
+                    dt=basis.dt,
+                    polort=polort_resolved,
+                    extra_regs_per_run=extra_regs_per_run,
+                    select_mode=args.hrf_select,
+                    device=device,
+                    verbose=args.verb >= 1,
+                )
+            occupied = np.bincount(hrf_index, minlength=hrf_shapes.shape[0])
+            print(
+                f"  Curves in use: {int((occupied > 0).sum())}/{hrf_shapes.shape[0]}  "
+                f"(modal curve {int(np.argmax(occupied)) + 1} holds "
+                f"{100 * occupied.max() / max(1, hrf_index.size):.0f}% of voxels)"
+            )
+
         packed = pack_for_shared_task_glm(
             per_run_data=per_run_data,
             per_run_task_designs=per_run_designs,
@@ -2228,7 +2949,7 @@ def main() -> int:
     # blocks it can hit tens of GB.  Skip it inside the solver; we
     # build amplitude / iresp downstream in voxel chunks via the
     # memory module's chunk-size estimator.
-    print(f"\n  Fitting ({args.model} × {args.reg}) …")
+    print("\n  Fitting …")
     if args.lss:
         if not args.single_trials:
             print("ERROR: -lss requires -single-trials.")
@@ -2402,7 +3123,7 @@ def main() -> int:
             f"σ²_mean={fit.sigma2_mean:.4g}, "
             f"effective λ_mean={fit.effective_prior_weight:.4g}"
         )
-        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
+        _print_r2(fit, args.reg)
 
         # ── VB iterative loop (filmbabe §3) ────────────────────────
         # Each iteration:
@@ -2586,6 +3307,62 @@ def main() -> int:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
+    elif hrf_index is not None:
+        # Per-voxel HRF: one design per distinct curve, not per voxel.
+        # ``fit_one`` re-enters the ordinary single-design path on a
+        # voxel subset, so each -reg branch behaves exactly as it does
+        # without shape selection.
+        def _fit_one(voxel_idx: np.ndarray, designs: list[torch.Tensor]):
+            packed_g = pack_for_shared_task_glm(
+                per_run_data=[d[voxel_idx] for d in per_run_data],
+                per_run_task_designs=designs,
+                polort=polort_resolved,
+                task_column_labels=task_column_labels,
+                extra_regressors_per_run=extra_regs_per_run,
+                device=device,
+            )
+            td = packed_g.design_concat[:, : packed_g.n_task_cols]
+            nz = (
+                packed_g.design_concat[:, packed_g.n_task_cols :]
+                if packed_g.design_concat.shape[1] > packed_g.n_task_cols
+                else None
+            )
+            common = dict(
+                data=packed_g.data_concat,
+                design_task=td,
+                basis_functions=basis.basis_functions,
+                prior_mean=prior_m,
+                prior_cov=prior_C,
+                n_blocks=n_blocks,
+                nuisance=nz,
+                prior_weight=pw,
+                device=device,
+                lambda_mode=args.lambda_mode,
+                reconstruct_hrfs=False,
+            )
+            if args.reg == "cone":
+                return fit_basis_cone_prior(**common, verbose=False)
+            return fit_basis_constrained_ridge(**common, lambda_n_bins=args.lambda_n_bins)
+
+        fit, group_bases, shape_groups, group_designs = _fit_shape_groups(
+            hrf_index=hrf_index,
+            shapes=hrf_shapes,
+            n_basis=n_basis,
+            block_durations=block_durations,
+            block_onsets_per_run=block_onsets_per_run,
+            per_run_data=per_run_data,
+            basis_dt=basis.dt,
+            basis_mode=basis_mode,
+            tr=tr,
+            n_tp_per_run=n_tp_per_run,
+            fit_one=_fit_one,
+        )
+        print(
+            f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
+            f"effective λ={fit.effective_prior_weight:.4g}"
+        )
+        _print_r2(fit, args.reg)
+
     elif args.reg == "fracridge":
         # fracridge has its own per-run nuisance projection and
         # SVD-based multi-frac solver, so it bypasses the packed
@@ -2643,7 +3420,7 @@ def main() -> int:
             f"λ_mean={fit.effective_prior_weight:.4g}, "
             f"{fit.n_iter} IRLS iter(s)"
         )
-        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
+        _print_r2(fit, args.reg)
     else:
         fit = fit_basis_constrained_ridge(
             data=packed.data_concat,
@@ -2663,7 +3440,7 @@ def main() -> int:
             f"  ✓ Fit complete.  σ²_mean={fit.sigma2_mean:.4g}, "
             f"effective λ={fit.effective_prior_weight:.4g}"
         )
-        print(f"  R² mean — OLS: {fit.r2_ols.mean():.3f}  constrained: {fit.r2.mean():.3f}")
+        _print_r2(fit, args.reg)
 
     # ── Stage cleanup: release fit-stage GPU tensors ───────────────
     # Everything downstream (amplitude / iresp reconstruction,
@@ -2718,6 +3495,87 @@ def main() -> int:
     task_betas = fit.betas[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)
     task_betas_ols = fit.betas_ols[:, :n_task_cols].reshape(n_vox_masked, n_blocks, n_basis)
 
+    # ── Latency / width readout from the derivative coefficients ────
+    # Deliberately on the OLS betas: -reg cone's prior mean points along
+    # the canonical axis and penalises angular deviation from it, which
+    # is shrinkage of exactly the ratio being measured here.
+    shape_maps: list[dict[str, np.ndarray]] | None = None
+    shape_calibs: list = []
+    shape_calib_note = ""
+    if args.save_shape:
+        from fastfuncstuff.design.basis_shape import usable_region
+
+        print("\n── Latency / width readout (SPMG derivative ratios) ──")
+        print(f"  Calibrating {n_blocks} condition(s) over ±{args.shape_tau_max:g} s")
+        readout_kw = dict(
+            n_deriv=n_deriv,
+            block_onsets_per_run=block_onsets_per_run,
+            basis_lag_times=basis_lag_times,
+            basis_dt=basis.dt,
+            basis_mode=basis_mode,
+            tr=tr,
+            n_tp_per_run=list(n_tp_per_run),
+            n_basis=n_basis,
+            tau_max=args.shape_tau_max,
+            r2_floor=args.shape_r2_floor,
+            block_durations=block_durations,
+        )
+
+        if hrf_index is None:
+            shape_maps, shape_calibs = _shape_readout(
+                betas_ols=task_betas_ols,
+                per_run_designs=[d.cpu().numpy() for d in per_run_designs],
+                base_hrf=None
+                if str(args.hrf).strip().lower() == "canonical"
+                else _resolve_shift_hrf(args.hrf, basis.dt, basis.duration),
+                **readout_kw,
+            )
+        else:
+            # The ratio a given latency produces depends on the curve the
+            # derivatives were built around, so the calibration is per
+            # shape GROUP as well as per condition.  Voxels are scattered
+            # back into whole-volume maps afterwards.
+            assert hrf_shapes is not None
+            n_vox_sel = task_betas_ols.shape[0]
+            keys = ["latency", "dispersion", "fwhm", "shape_r2"]
+            acc: list[dict[str, np.ndarray]] = [
+                {k: np.full(n_vox_sel, np.nan, dtype=np.float64) for k in keys}
+                | {"valid": np.zeros(n_vox_sel, dtype=bool)}
+                for _ in range(n_blocks)
+            ]
+            occupied = [(k, idx) for k, idx in enumerate(shape_groups) if idx.size]
+            for k, idx in tqdm(
+                occupied, desc="  Calibrating groups", leave=True, disable=len(occupied) <= 1
+            ):
+                g_maps, g_cals = _shape_readout(
+                    betas_ols=task_betas_ols[idx],
+                    per_run_designs=group_designs[k],
+                    base_hrf=hrf_shapes[k],
+                    **readout_kw,
+                )
+                for b in range(n_blocks):
+                    for key in keys:
+                        acc[b][key][idx] = g_maps[b][key]
+                    acc[b]["valid"][idx] = g_maps[b]["valid"]
+                if k == int(np.bincount(hrf_index, minlength=hrf_shapes.shape[0]).argmax()):
+                    shape_calibs = g_cals  # modal curve, for the calibration TSV
+            shape_maps = acc
+            shape_calib_note = "  (calibration TSV is the modal curve's; the map is per-group)"
+        for lbl, res, calib in zip(block_labels, shape_maps, shape_calibs, strict=False):
+            frac = float(np.mean(res["valid"]))
+            med = float(np.median(res["latency"][res["valid"]])) if frac > 0 else float("nan")
+            keep = usable_region(calib, args.shape_r2_floor)
+            rows = np.where(keep.any(axis=1))[0]
+            env = (
+                f"[{calib.taus[rows[0]]:+.2f},{calib.taus[rows[-1]]:+.2f}]s"
+                if rows.size
+                else "EMPTY"
+            )
+            print(
+                f"    {lbl}: envelope {env}, {frac * 100:.1f}% in range, "
+                f"median latency {med:+.3f} s"
+            )
+
     # Amplitude = peak of reconstructed HRF per (voxel, block).  Computed
     # in voxel chunks via the memory module so we never materialise the
     # full (n_voxels × n_blocks × n_t) HRF tensor — in single-trial mode
@@ -2746,13 +3604,27 @@ def main() -> int:
     src_times = np.arange(n_t_basis) * basis.dt
     n_t_iresp = max(1, int(np.floor((basis.duration - basis.dt) / iresp_dt)) + 1)
     dst_times = np.arange(n_t_iresp) * iresp_dt
-    basis_iresp = np.stack(
-        [np.interp(dst_times, src_times, basis.basis_functions[k]) for k in range(n_basis)],
-        axis=0,
-    ).astype(np.float64)  # (K, n_t_iresp)
+
+    # Per BLOCK, because each block's basis carries its own stimulus
+    # duration — a 1 s cue and an 8 s block do not share a regressor
+    # shape, so they must not share a reconstruction basis either.
+    def _resample(curves: np.ndarray) -> np.ndarray:
+        """(..., K, n_t_basis) -> (..., K, n_t_iresp)."""
+        flat = curves.reshape(-1, curves.shape[-1])
+        out = np.stack([np.interp(dst_times, src_times, row) for row in flat], axis=0)
+        return out.reshape(curves.shape[:-1] + (dst_times.size,)).astype(np.float64)
+
+    # Per-curve, NOT per-voxel: a per-voxel basis stack would be
+    # n_vox x n_blocks x K x n_t, which is tens of GB on a real volume.
+    # The chunk loop gathers each voxel's curve out of this instead.
+    basis_iresp_groups = (
+        _resample(group_bases) if hrf_index is not None else None
+    )  # (n_shapes, n_blocks, K, n_t_iresp)
+    basis_iresp = _resample(block_bases)  # (n_blocks, K, n_t_iresp)
+    _resp_note = "response" if args.save_iresp_off else "iresp / response"
     print(
-        f"  iresp / amplitude grid: dt={iresp_dt:.3f}s × {n_t_iresp} "
-        f"samples (basis stored at {basis.dt:.3f}s × {n_t_basis})"
+        f"  Reconstruction grid ({_resp_note}): dt={iresp_dt:.3f}s × "
+        f"{n_t_iresp} samples (curves stored at {basis.dt:.3f}s × {n_t_basis})"
     )
 
     # Chunk size: amplitude peak-finding and (optional) iresp save
@@ -2775,7 +3647,7 @@ def main() -> int:
     avail_bytes = get_available_memory(torch.device("cpu"))
     chunk_from_hrf = max(1, int(avail_bytes * 0.25 / max(bytes_per_vox, 1)))
     chunk_size = min(chunk_size, chunk_from_hrf)
-    print(f"  Amplitude/iresp chunking: {chunk_size:,} voxels per chunk (n_blocks={n_blocks})")
+    print(f"  Reconstruction chunking: {chunk_size:,} voxels per chunk (n_blocks={n_blocks})")
 
     amplitude = np.zeros((n_vox_masked, n_blocks), dtype=np.float32)
     amplitude_ols = np.zeros_like(amplitude)
@@ -2854,31 +3726,52 @@ def main() -> int:
         # smooth near its extremum; in exchange the per-voxel cost
         # drops ~15× vs the basis.dt reconstruction (critical for
         # single-trial mode with hundreds of blocks).
-        hrfs_chunk = task_betas[start:end] @ basis_iresp
-        hrfs_ols_chunk = task_betas_ols[start:end] @ basis_iresp
+        if basis_iresp_groups is None:
+            hrfs_chunk = np.einsum("vbk,bkt->vbt", task_betas[start:end], basis_iresp)
+            hrfs_ols_chunk = np.einsum("vbk,bkt->vbt", task_betas_ols[start:end], basis_iresp)
+        else:
+            gb = basis_iresp_groups[hrf_index[start:end]]  # (chunk, n_blocks, K, n_t)
+            hrfs_chunk = np.einsum("vbk,vbkt->vbt", task_betas[start:end], gb)
+            hrfs_ols_chunk = np.einsum("vbk,vbkt->vbt", task_betas_ols[start:end], gb)
         amplitude[start:end] = _signed_peak(hrfs_chunk).astype(np.float32)
         amplitude_ols[start:end] = _signed_peak(hrfs_ols_chunk).astype(np.float32)
         if iresp_buf is not None:
             iresp_buf[start:end] = hrfs_chunk.astype(np.float32)
             iresp_buf_ols[start:end] = hrfs_ols_chunk.astype(np.float32)
 
+    if hrf_index is not None and hrf_shapes is not None:
+        # 1-based on disk, matching ffs_hrfopt's convention, so the map
+        # round-trips straight back in through -hrf-index.
+        bucket = [(hrf_index + 1).astype(np.float32)]
+        labels = ["hrf_index"]
+        if hrf_index_score is not None:
+            bucket.append(hrf_index_score.astype(np.float32))
+            labels.append("hrf_select_r2")
+        idx_path = f"{args.prefix}_fitbasis_hrf_index{nii_ext}"
+        save_nifti(
+            _to_volume(np.stack(bucket, axis=1)),
+            output_path=idx_path,
+            reference_img=args.input[0],
+            brick_labels=labels,
+        )
+        print(f"  Wrote {idx_path}")
+        shapes_path = f"{args.prefix}_fitbasis_hrf_shapes.tsv"
+        np.savetxt(shapes_path, hrf_shapes.T, fmt="%.10g", delimiter="\t")
+        print(f"  Wrote {shapes_path}")
+
     # Basis TSV (shared)
     basis_path = f"{args.prefix}_fitbasis_basis.tsv"
     np.savetxt(basis_path, basis.basis_functions.T, fmt="%.10g", delimiter="\t")
     print(f"  Wrote {basis_path}")
 
-    # R² volumes (constrained + unconstrained)
     from fastfuncstuff.cli_utils import spinner
 
-    with spinner("Writing R² maps"):
-        for arr, sfx in ((fit.r2, ""), (fit.r2_ols, "_unconstrained")):
-            path = f"{args.prefix}_fitbasis_r2{sfx}{nii_ext}"
-            save_nifti(
-                _to_volume(arr[:, None]).squeeze(-1),
-                output_path=path,
-                reference_img=args.input[0],
-            )
-            print(f"  Wrote {path}")
+    # The in-sample R2 is not written on its own any more: as a standalone
+    # map it invites thresholding by a number that free parameters inflate.
+    # It rides along as a labelled sub-brick of each bucket instead, next to
+    # the held-out R2 that is the honest referee.
+    xval_r2: np.ndarray | None = None
+    write_ols = args.reg != "none"  # with no prior, "constrained" IS the OLS fit
 
     # ── Cross-validated R² (held-out) ──────────────────────────────
     # Per the user's choice of -reg + -prior-weight, do LORO with
@@ -2895,11 +3788,18 @@ def main() -> int:
         elif per_run_data_orig is None:
             print("  -xval-r2 requested but per_run_data_orig was not saved (internal); skipping.")
         else:
-            xval_r2 = compute_xval_r2_per_voxel(
+            xval_r2 = compute_xval_r2_per_voxel(  # noqa: F841 — consumed by the buckets
                 per_run_data=per_run_data_orig,
                 all_onsets=all_onsets,
                 condition_labels=list(condition_labels),
                 basis_functions=basis.basis_functions,
+                basis_functions_per_cond=_build_block_bases(
+                    basis,
+                    [
+                        float(timing.durations[c]) if timing.durations_given else 0.0
+                        for c in range(len(condition_labels))
+                    ],
+                ),
                 basis_lag_times=basis_lag_times,
                 basis_mode=basis_mode,
                 tr=tr,
@@ -2930,6 +3830,12 @@ def main() -> int:
                 f"max={float(np.max(xval_r2)):.3f})"
             )
 
+    # QC sub-bricks every bucket carries: the honest referee first.
+    qc_bricks: list[tuple[str, np.ndarray]] = []
+    if xval_r2 is not None:
+        qc_bricks.append(("xvalR2", np.asarray(xval_r2, dtype=np.float32)))
+    qc_bricks.append(("taskR2", np.asarray(fit.r2, dtype=np.float32)))
+
     # ── Per-block outputs ──────────────────────────────────────────
     # Single-trial mode: amplitude maps stack across trials per cond
     # for downstream 2nd-level convenience.  iresp & pcweights are still
@@ -2951,7 +3857,10 @@ def main() -> int:
             leave=False,
             disable=len(per_cond_trial_idx) <= 1,
         ):
-            for amps, sfx in ((amplitude, ""), (amplitude_ols, "_unconstrained")):
+            _amp_variants = [(amplitude, "")]
+            if write_ols:
+                _amp_variants.append((amplitude_ols, "_unconstrained"))
+            for amps, sfx in _amp_variants:
                 amp_stack = amps[:, idxs]  # (n_vox, n_trials_for_cond)
                 amp_vol = _to_volume(amp_stack)  # (nx, ny, nz, n_trials)
                 path = f"{args.prefix}_fitbasis_amplitude_{cond}{sfx}{nii_ext}"
@@ -2961,7 +3870,10 @@ def main() -> int:
         if save_full_iresp and iresp_buf is not None:
             # Per-trial iresp 4-D (time axis = HRF basis-dt).  Only
             # available when the iresp buffer fit in memory above.
-            for hrfs_arr, sfx in ((iresp_buf, ""), (iresp_buf_ols, "_unconstrained")):
+            _iresp_variants = [(iresp_buf, "")]
+            if write_ols:
+                _iresp_variants.append((iresp_buf_ols, "_unconstrained"))
+            for hrfs_arr, sfx in _iresp_variants:
                 iresp_vol = _to_volume(hrfs_arr)
                 save_iresp(
                     iresp=iresp_vol,
@@ -2973,7 +3885,7 @@ def main() -> int:
                     reference_img=args.input[0],
                     nii_ext=nii_ext,
                 )
-            print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
+            print(f"  Wrote {n_blocks} × {len(_iresp_variants)} iresp file(s).")
 
         # Basis weights per trial (optional but useful for diagnostics).
         # One 4-D NIfTI per basis function: time axis = trial number.
@@ -2991,7 +3903,10 @@ def main() -> int:
         ):
             stack = task_betas[:, idxs, :]  # (n_vox, n_trials, K)
             stack_ols = task_betas_ols[:, idxs, :]
-            for arr, sfx in ((stack, ""), (stack_ols, "_unconstrained")):
+            _stack_variants = [(stack, "")]
+            if write_ols:
+                _stack_variants.append((stack_ols, "_unconstrained"))
+            for arr, sfx in _stack_variants:
                 for b in range(n_basis):
                     # (n_vox, n_trials) → (nx, ny, nz, n_trials)
                     vol_4d = _to_volume(arr[:, :, b])
@@ -3002,7 +3917,10 @@ def main() -> int:
     else:
         # Per-condition outputs (the simple case)
         if save_full_iresp and iresp_buf is not None:
-            for hrfs_arr, sfx in ((iresp_buf, ""), (iresp_buf_ols, "_unconstrained")):
+            _iresp_variants = [(iresp_buf, "")]
+            if write_ols:
+                _iresp_variants.append((iresp_buf_ols, "_unconstrained"))
+            for hrfs_arr, sfx in _iresp_variants:
                 iresp_vol = _to_volume(hrfs_arr)
                 save_iresp(
                     iresp=iresp_vol,
@@ -3014,21 +3932,91 @@ def main() -> int:
                     reference_img=args.input[0],
                     nii_ext=nii_ext,
                 )
-            print(f"  Wrote {n_blocks} × 2 iresp files (constrained + unconstrained).")
+            print(f"  Wrote {n_blocks} × {len(_iresp_variants)} iresp file(s).")
 
-        for b_idx, lbl in enumerate(block_labels):
-            for tbetas, amps, sfx in (
-                (task_betas, amplitude, ""),
-                (task_betas_ols, amplitude_ols, "_unconstrained"),
-            ):
-                w = _to_volume(tbetas[:, b_idx, :])
-                a = _to_volume(amps[:, b_idx][:, None]).squeeze(-1)
-                w_path = f"{args.prefix}_fitbasis_basisweights_{lbl}{sfx}{nii_ext}"
-                a_path = f"{args.prefix}_fitbasis_amplitude_{lbl}{sfx}{nii_ext}"
-                save_nifti(w, output_path=w_path, reference_img=args.input[0])
-                save_nifti(a, output_path=a_path, reference_img=args.input[0])
-                print(f"  Wrote {w_path}")
-                print(f"  Wrote {a_path}")
+        # One labelled bucket per quantity instead of 2 x n_conditions
+        # loose files: 8 conditions used to mean 32 volumes whose only
+        # distinguishing feature was the filename.
+        variants = [(task_betas, amplitude, "")]
+        if write_ols:
+            variants.append((task_betas_ols, amplitude_ols, "_unconstrained"))
+        for tbetas, amps, sfx in variants:
+            _save_bucket(
+                [amps[:, b] for b in range(n_blocks)],
+                list(block_labels),
+                f"{args.prefix}_fitbasis_amplitude{sfx}{nii_ext}",
+                to_volume=_to_volume,
+                reference_img=args.input[0],
+                qc=qc_bricks,
+            )
+            if not args.no_basisweights:
+                _save_bucket(
+                    [tbetas[:, b, k] for b in range(n_blocks) for k in range(n_basis)],
+                    [
+                        f"{lbl}_{name}"
+                        for lbl in block_labels
+                        for name in _BASIS_COL_NAMES[:n_basis]
+                    ],
+                    f"{args.prefix}_fitbasis_basisweights{sfx}{nii_ext}",
+                    to_volume=_to_volume,
+                    reference_img=args.input[0],
+                    qc=qc_bricks,
+                )
+
+    if shape_maps is not None:
+        # SPMG2 holds width at canonical by construction, so writing a
+        # constant map would only invite it being interpreted.
+        # Latency minus the voxel's own mean across conditions.  When each
+        # voxel selected its own curve, absolute latency is measured
+        # against THAT curve, so a curve peaking 0.2 s late shifts every
+        # condition in that voxel alike — measured, and it is the same
+        # trap -shift-shapes documents for the delay parameter.  The
+        # deviation is what survives: cross-condition deltas came back
+        # +0.628 / +1.493 against a true +0.600 / +1.500.
+        if n_blocks > 1:
+            lat_stack = np.stack([m["latency"] for m in shape_maps], axis=1)
+            with np.errstate(invalid="ignore"):
+                lat_mean = np.nanmean(lat_stack, axis=1, keepdims=True)
+            for b in range(n_blocks):
+                shape_maps[b]["latency_dev"] = lat_stack[:, b] - lat_mean[:, 0]
+
+        # Interleaved per condition, so the value and the map you threshold
+        # it BY sit next to each other: latency_A, valid_A, latency_B, ...
+        # then the QC bricks.  Separate _latency and _valid files meant
+        # loading two datasets to look at one thing.
+        per_cond = ["latency"]
+        if n_blocks > 1:
+            per_cond.append("latency_dev")
+        if n_deriv == 2:
+            per_cond += ["fwhm", "dispersion"]
+        per_cond += ["shape_r2", "valid"]
+
+        arrays, labels = [], []
+        for b, lbl in enumerate(block_labels):
+            for name in per_cond:
+                arrays.append(np.asarray(shape_maps[b][name], dtype=np.float32))
+                labels.append(f"{lbl}_{name}")
+        _save_bucket(
+            arrays,
+            labels,
+            f"{args.prefix}_fitbasis_shape{nii_ext}",
+            to_volume=_to_volume,
+            reference_img=args.input[0],
+            qc=qc_bricks,
+        )
+
+        calib_tsv = f"{args.prefix}_fitbasis_shape_calibration.tsv"
+        with open(calib_tsv, "w") as fh:
+            fh.write("condition\ttau_s\tdispersion\tfwhm_s\tratio_t\tratio_d\tshape_r2\n")
+            for lbl, calib in zip(block_labels, shape_calibs, strict=True):
+                for i, tau in enumerate(calib.taus):
+                    for j, disp in enumerate(calib.dispersions):
+                        rd = "" if calib.ratio_d is None else f"{calib.ratio_d[i, j]:.6f}"
+                        fh.write(
+                            f"{lbl}\t{tau:.4f}\t{disp:.4f}\t{calib.fwhm[i, j]:.4f}\t"
+                            f"{calib.ratio_t[i, j]:.6f}\t{rd}\t{calib.shape_r2[i, j]:.6f}\n"
+                        )
+        print(f"  Wrote {calib_tsv}{shape_calib_note}")
 
     # ── Cross-validation (regularization sanity check) ──────────────
     # When -cv-runs is set, run LORO across a grid of prior-weight
@@ -3212,7 +4200,8 @@ def main() -> int:
         "tool": "ffs_fitbasis",
         "started": datetime.now().isoformat(timespec="seconds"),
         "tr": float(tr),
-        "model": args.model,
+        "derivatives": args.derivatives,
+        "hrf": args.hrf,
         "regularisation": args.reg,
         "single_trials": bool(args.single_trials),
         "n_basis": int(n_basis),

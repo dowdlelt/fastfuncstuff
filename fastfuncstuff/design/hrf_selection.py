@@ -659,6 +659,7 @@ def fit_glm_hrf_library_with_xval(
     debug_prefix: str | None = None,
     condition_labels: list[str] | None = None,
     final_fit_data: torch.Tensor | None = None,
+    skip_final_fit: bool = False,
     stim_vec_blocks: list | None = None,
 ) -> HRFSelectionResults:
     """
@@ -1359,34 +1360,38 @@ def fit_glm_hrf_library_with_xval(
         r2_label = "xval R²" if select_mode == "xval" else "in-sample R²"
         print(f"  Canonical HRF mean {r2_label}: {xval_r2_canonical.mean().item():.4f}")
 
-    # Fit full dataset with canonical HRF to get betas/tstats for comparison
-    # NOTE: For final fit, we need the full (unprojected) data and design with nuisance
-    if verbose:
-        print("  Fitting full dataset with canonical HRF...")
-
     # Build block-diagonal nuisance for final fit (used by fit_glm and _fit_voxelwise_hrf)
     nuisance_design = torch.block_diag(*nuisance_blocks_per_run)
 
-    # Follow 3dDenoisefast pattern: pass task design + nuisance separately.
-    # fit_glm concatenates them internally and knows which columns are task vs nuisance.
-    # max_poly_degree=-1 prevents adding duplicate polynomials (already in nuisance_design).
-    canonical_glm_results = fit_glm(
-        data=data,
-        design=canonical_design,  # Task-only design
-        tr=tr,
-        max_poly_degree=-1,  # No additional polynomials — already in extra_regressors
-        extra_regressors=nuisance_design,  # Nuisance passed separately
-        device=device,
-        verbose=False,
-        preload_data_to_device=(data.device == device),  # Stream chunks if data on CPU
-    )
+    # Fit full dataset with canonical HRF to get betas/tstats for comparison.
+    # NOTE: For final fit, we need the full (unprojected) data and design with nuisance.
+    # skip_final_fit callers want only hrf_index, and this baseline exists purely
+    # for the "what if we had not optimised" comparison they never read.
+    canonical_glm_results = None
+    if not skip_final_fit:
+        if verbose:
+            print("  Fitting full dataset with canonical HRF...")
+
+        # Follow 3dDenoisefast pattern: pass task design + nuisance separately.
+        # fit_glm concatenates them internally and knows which columns are task
+        # vs nuisance.  max_poly_degree=-1 prevents adding duplicate
+        # polynomials (already in nuisance_design).
+        canonical_glm_results = fit_glm(
+            data=data,
+            design=canonical_design,  # Task-only design
+            tr=tr,
+            max_poly_degree=-1,  # No additional polynomials — already in extra_regressors
+            extra_regressors=nuisance_design,  # Nuisance passed separately
+            device=device,
+            verbose=False,
+            preload_data_to_device=(data.device == device),  # Stream chunks if data on CPU
+        )
+        if verbose:
+            assert canonical_glm_results.r2 is not None  # fit_glm always computes r2
+            print(f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}")
 
     # Store the canonical design matrix (task + nuisance) for saving
     canonical_design_matrix = torch.cat([canonical_design, nuisance_design], dim=1)
-
-    if verbose:
-        assert canonical_glm_results.r2 is not None  # fit_glm always computes r2
-        print(f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}")
 
     # Select best HRF per voxel based on median CV R²
     hrf_index = xval_r2_median_all.argmax(dim=1)  # (n_voxels,)
@@ -1410,25 +1415,30 @@ def fit_glm_hrf_library_with_xval(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Final fit: refit entire dataset with voxel-wise optimal HRFs
-    if verbose:
-        print("Refitting full dataset with voxel-wise optimal HRFs...")
+    # Final fit: refit entire dataset with voxel-wise optimal HRFs.
+    # Callers that only want `hrf_index` (ffs_fitbasis re-fits with its own
+    # derivative basis straight afterwards) pass skip_final_fit and save the
+    # whole pass — measured ~10 s and a full beta array on a 728k-voxel run.
+    final_results = None
+    if not skip_final_fit:
+        if verbose:
+            print("Refitting full dataset with voxel-wise optimal HRFs...")
 
-    final_results = _fit_voxelwise_hrf(
-        data=data if final_fit_data is None else final_fit_data,
-        onsets=onsets,
-        hrf_library=hrf_library,
-        hrf_index=hrf_index,
-        nuisance_design=nuisance_design,
-        run_starts=run_starts,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        microtime_onset=microtime_onset,
-        device=device,
-        verbose=verbose,
-        chunk_size=chunk_size,
-        stim_vec_blocks=stim_vec_blocks,
-    )
+        final_results = _fit_voxelwise_hrf(
+            data=data if final_fit_data is None else final_fit_data,
+            onsets=onsets,
+            hrf_library=hrf_library,
+            hrf_index=hrf_index,
+            nuisance_design=nuisance_design,
+            run_starts=run_starts,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+            verbose=verbose,
+            chunk_size=chunk_size,
+            stim_vec_blocks=stim_vec_blocks,
+        )
 
     # Build metadata for ARMA reuse
     hrf_metadata = {
@@ -1520,9 +1530,12 @@ def fit_glm_hrf_library_with_xval(
         print("HRF SELECTION COMPLETE")
         print("=" * 70)
         print("  Best HRF per voxel stored in hrf_index")
-        assert final_results.betas is not None and final_results.r2 is not None  # fit_glm output
-        print(f"  Final betas shape: {final_results.betas.shape}")
-        print(f"  Final R² mean: {final_results.r2.mean().item():.4f}")
+        if final_results is not None:
+            assert final_results.betas is not None and final_results.r2 is not None
+            print(f"  Final betas shape: {final_results.betas.shape}")
+            print(f"  Final R² mean: {final_results.r2.mean().item():.4f}")
+        else:
+            print("  Final refit skipped (caller refits with its own basis)")
         print()
 
     return results

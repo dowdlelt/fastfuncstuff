@@ -1372,3 +1372,143 @@ def get_spm_hrf_with_derivatives(
     hrf_set = torch.stack(basis_functions, dim=0)
 
     return hrf_set
+
+
+def convolve_curves_with_duration(
+    curves: np.ndarray,
+    dt: float,
+    duration: float,
+    *,
+    normalize: bool = True,
+) -> np.ndarray:
+    """Convolve response curves with a stimulus boxcar of ``duration``.
+
+    A GLM regressor for a D-second event is the HRF convolved with a
+    D-second boxcar, not the impulse response.  Skipping this delays the
+    modelled peak by roughly ``D/2`` and mis-scales the amplitude, so any
+    tool claiming a "vanilla GLM" has to do it.
+
+    Parameters
+    ----------
+    curves : (K, n_t) or (n_t,)
+        Response curves on a uniform ``dt`` grid.  A whole basis set is
+        passed at once **on purpose**: every row is scaled by one shared
+        factor (see ``normalize``), which keeps the ratios between basis
+        coefficients — and therefore the latency readout built on them —
+        meaning the same thing before and after.
+    dt : float
+        Sample spacing of ``curves``, seconds.
+    duration : float
+        Stimulus duration, seconds.  ``<= dt`` returns ``curves``
+        unchanged (an impulse is already what the caller has).
+    normalize : bool, default True
+        Rescale so the *first* row keeps the peak absolute value it had
+        before convolution.  This is AFNI's ``BLOCK`` / ``SPMG1(d)``
+        convention and matches :func:`get_spmg1_hrf`, which makes betas
+        comparable across conditions of differing duration.  Pass False
+        for the raw linear prediction, where a longer stimulus simply
+        produces a larger response.
+
+    Returns
+    -------
+    (K, n_t) or (n_t,), matching the input's dimensionality.
+    """
+    arr = np.asarray(curves, dtype=np.float64)
+    squeeze = arr.ndim == 1
+    if squeeze:
+        arr = arr[None, :]
+    if arr.ndim != 2:
+        raise ValueError(f"curves must be 1-D or 2-D; got shape {arr.shape}")
+    if dt <= 0:
+        raise ValueError(f"dt must be positive; got {dt}")
+    if duration <= dt:
+        return arr[0] if squeeze else arr
+
+    n_t = arr.shape[1]
+    n_box = int(round(duration / dt))
+    box = np.ones(n_box, dtype=np.float64)
+    # * dt keeps this an integral rather than a sample count, so the
+    # result does not depend on the grid spacing.
+    out = np.stack([np.convolve(arr[k], box)[:n_t] * dt for k in range(arr.shape[0])], axis=0)
+
+    if normalize:
+        pre = float(np.max(np.abs(arr[0])))
+        post = float(np.max(np.abs(out[0])))
+        if post > 0 and pre > 0:
+            out *= pre / post
+
+    return out[0] if squeeze else out
+
+
+def make_derivative_basis(
+    hrf: np.ndarray,
+    dt: float,
+    n_basis: int = 2,
+    *,
+    shift_step: float = 0.1,
+    width_step: float = 0.01,
+) -> np.ndarray:
+    """Build a ``[h, dh/dtau, dh/dwidth]`` basis around an arbitrary HRF.
+
+    Generalises SPMG2 / SPMG3 to any response shape — a library curve, a
+    PIGHS curve, or a per-voxel HRF from ``ffs_hrfopt``.  The point is to
+    get the *general* shape right first and let the derivative columns
+    absorb per-condition departures from it, which is both a better fit
+    and a latency readout relative to a shape that actually belongs to
+    that voxel.
+
+    A numerical derivative is a fine stand-in for an analytic one here
+    (measured corr 0.9995 against the SPM analytic form), so no closed
+    form is needed for the input curve.
+
+    Parameters
+    ----------
+    hrf : (n_t,)
+        Base response curve on a uniform ``dt`` grid.
+    dt : float
+        Sample spacing, seconds.
+    n_basis : {1, 2, 3}
+        1 = base only, 2 = + latency derivative, 3 = + width derivative.
+    shift_step : float, default 0.1
+        Finite-difference step for the latency derivative, seconds.
+        Matches :func:`get_spm_time_derivative`, so the resulting ratio
+        keeps the same scale as the SPMG2/3 path.
+    width_step : float, default 0.01
+        Finite-difference step for the width derivative.
+
+    Returns
+    -------
+    (n_basis, n_t)
+
+    Notes
+    -----
+    The width derivative scales time **about the curve's own peak** --
+    ``h_w(t) = h(peak + (t - peak) / w)`` -- rather than about zero.
+    Scaling about zero moves the peak proportionally, which makes width
+    nearly collinear with latency and leaves the joint
+    (latency, width) map badly conditioned; anchoring at the peak keeps
+    the two directions distinguishable.  Sign matches
+    :func:`get_spm_dispersion_derivative`: positive coefficient means a
+    wider response.
+    """
+    h = np.asarray(hrf, dtype=np.float64).ravel()
+    if n_basis not in (1, 2, 3):
+        raise ValueError(f"n_basis must be 1, 2, or 3; got {n_basis}")
+    if h.size < 3:
+        raise ValueError(f"hrf needs at least 3 samples; got {h.size}")
+
+    t = np.arange(h.size, dtype=np.float64) * dt
+    rows = [h]
+
+    if n_basis >= 2:
+        # d/dtau of h(t - tau) at tau=0, by the same forward difference
+        # get_spm_time_derivative uses (shift the curve later by a step).
+        shifted = np.interp(t - shift_step, t, h, left=0.0, right=0.0)
+        rows.append((shifted - h) / shift_step)
+
+    if n_basis >= 3:
+        peak_t = t[int(np.argmax(np.abs(h)))]
+        widened = np.interp(peak_t + (t - peak_t) / (1.0 + width_step), t, h, left=0.0, right=0.0)
+        rows.append((widened - h) / width_step)
+
+    return np.stack(rows, axis=0)
