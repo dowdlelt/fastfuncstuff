@@ -2319,6 +2319,7 @@ def pack_for_shared_task_glm(
     *,
     task_column_labels: list[str] | None = None,
     extra_regressors_per_run: list[torch.Tensor] | None = None,
+    drop_empty_nuisance: bool = False,
     device: torch.device | None = None,
 ) -> PackedSharedTaskDesign:
     """Pack per-run task designs into the canonical "shared-task + block-diagonal-polys" GLM form.
@@ -2372,6 +2373,15 @@ def pack_for_shared_task_glm(
         polynomial block in the block-diagonal section, so they
         remain run-specific (no shared external nuisance — that's the
         canonical convention).
+    drop_empty_nuisance : bool, default False
+        Drop nuisance columns that are identically zero across every
+        run.  ``append_nuisance_blocks`` pads all runs to a common
+        width, so a block supplied for one run only (``-ortvec_run``)
+        leaves genuinely empty columns in the *other* runs' diagonal
+        slots.  Projection-based callers do not care — QR discards
+        them — but an unpenalised ``fit_glm`` solve is then rank
+        deficient and the betas blow up.  Set this when the packed
+        design goes straight to OLS.
     device : torch.device, optional
         Device for the output tensors.  ``None`` → CPU.
 
@@ -2487,6 +2497,16 @@ def pack_for_shared_task_glm(
                 labels.append(f"run{r + 1}_poly{k}")
         for k in range(n_extra):
             labels.append(f"run{r + 1}_extra{k}")
+
+    if drop_empty_nuisance and design_concat.shape[1] > n_task:
+        nuis = design_concat[:, n_task:]
+        keep = (nuis.abs().amax(dim=0) > 0).tolist()
+        if not all(keep):
+            keep_idx = [n_task + i for i, k in enumerate(keep) if k]
+            design_concat = torch.cat(
+                [design_concat[:, :n_task], design_concat[:, keep_idx]], dim=1
+            )
+            labels = labels[:n_task] + [labels[i] for i in keep_idx]
 
     return PackedSharedTaskDesign(
         data_concat=data_concat,
