@@ -4962,6 +4962,48 @@ def make_raw_reference_result(
     )
 
 
+def _rewarp_raw_single_pass(
+    raw_datas: list[np.ndarray],
+    w_axes: list[torch.Tensor],
+    axes: list[int],
+    alpha_ch: torch.Tensor,
+    device: torch.device,
+    verbose: bool,
+) -> list[torch.Tensor]:
+    """Warp the RAW echoes by the TOTAL field in one wsinc5 pass, ``(nx, ny, nz, T)`` each.
+
+    The qwarp polish registers the CORRECTED series, so its own warped output has been
+    resampled twice: once by the estimator (``-warp_interp``, bilinear by default) and
+    again by qwarp. The second pass cannot put back what the first one blurred, and it
+    also leaves the saved series describing a slightly different transform from the saved
+    warp, which is the additive total ``w + r``. Applying that total to the raw data
+    instead costs one extra resample of the raw and removes both problems.
+    """
+    from .interp import warp_image
+
+    nx, ny, nz, nt = w_axes[0].shape
+    out = []
+    for j, raw_j in enumerate(raw_datas):
+        raw = torch.from_numpy(np.ascontiguousarray(raw_j)).float()  # (nx, ny, nz, T)
+        dst = torch.empty(nx, ny, nz, nt)
+        chans = [torch.zeros(nz, ny, nx, device=device) for _ in range(3)]
+        for t in tqdm(
+            range(nt),
+            desc=f"qwarp resample (echo {j + 1})",
+            unit="frame",
+            leave=True,
+            disable=nt < 2 or not verbose,
+        ):
+            for c in chans:
+                c.zero_()
+            for k, ax in enumerate(axes):
+                chans[ax] = (float(alpha_ch[ax, j]) * w_axes[k][..., t]).permute(2, 1, 0).to(device)
+            src = raw[..., t].permute(2, 1, 0).contiguous().to(device)
+            dst[..., t] = warp_image(src, *chans, mode="wsinc5").permute(2, 1, 0).cpu()
+        out.append(dst.contiguous())
+    return out
+
+
 def polish_me_result(
     result: MultiEchoLocomocoResult,
     *,
@@ -4985,6 +5027,9 @@ def polish_me_result(
     * ``full=False`` (**polish**, ``-final_qwarp``): register the *corrected* series
       (seed 0) to the reference, finding the residual ``r`` the estimator's search
       couldn't resolve; total field is ``w + r``. Sign-safe (no seeding with ``w``).
+      Given ``raw_datas`` the returned series is the RAW data warped once by ``w + r``
+      rather than qwarp's twice-resampled output; see
+      :func:`_rewarp_raw_single_pass`.
     * ``full=True`` (**backend**, ``-backend qwarp``): register the *raw* echoes
       (``raw_datas``, seed 0) to the reference -- qwarp owns the whole field, output is
       just the qwarp field (the flow pass only built the reference). Needs a fuller
@@ -5089,6 +5134,14 @@ def polish_me_result(
     w_axes_new = [r if full else wk + r for wk, r in zip(w_axes, r_axes, strict=True)]
     w_new = w_axes_new[-1]
     warped_nifti = [warped[j].permute(2, 1, 0, 3).contiguous() for j in range(e)]
+    if not full and raw_datas is not None:
+        # Prefer one resample of the raw over qwarp's second pass on already-corrected
+        # data -- see :func:`_rewarp_raw_single_pass`. Only the polish needs this; the
+        # full backend already registers raw.
+        del warped
+        warped_nifti = _rewarp_raw_single_pass(
+            raw_datas, w_axes_new, list(axes), alpha_ch, dev, verbose
+        )
 
     perm4, pe_flow_is_u = ref.perm, ref.pe_flow_is_u
     a0, a1, disp_slice = ref.a0, ref.a1, ref.slice_axis

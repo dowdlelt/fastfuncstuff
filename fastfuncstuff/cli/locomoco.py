@@ -1892,7 +1892,7 @@ def _run_multiecho(
             compile=args.qwarp_compile,
             full=qwarp_backend,
             slicewise=False,  # -me_3depi is 3-D-acquired: through-plane continuity is real
-            raw_datas=datas if qwarp_backend else None,
+            raw_datas=datas,
             device=device,
         )
 
@@ -2532,7 +2532,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             # 2-D multi-slice: each slice is its own acquisition instant, so the qwarp
             # patches stay 2-D like the estimator. -is_3dacq is one shot -> 3-D patches.
             slicewise=not (args.is_3dacq or args.qwarp_3d),
-            raw_datas=[data] if qwarp_backend else None,
+            # Polish takes raw too: it warps it once by the composed w+r instead of
+            # resampling the already-corrected series a second time.
+            raw_datas=[data],
             device=device,
         )
         result = polished.per_echo[0]

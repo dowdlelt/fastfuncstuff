@@ -794,3 +794,49 @@ def test_cli_want_pcs_written_with_no_warp(tmp_path):
     arr = np.loadtxt(pcs)
     assert arr.ndim == 2 and arr.shape[0] == n_frames  # one row per frame
     assert 1 <= arr.shape[1] <= 4  # up to n_pcs columns
+
+
+def test_polish_single_pass_is_sharper_than_double_resample():
+    """The qwarp polish registers the CORRECTED series, so its own warped output has been
+    resampled twice — the estimator's pass plus qwarp's. Given ``raw_datas`` it must
+    instead warp the RAW echoes once by the composed total ``w + r``, which keeps edge
+    energy the second pass cannot restore, and makes the returned series describe the
+    same transform as the saved field.
+
+    Temporal variance is deliberately NOT the assertion: the double-resampled series has
+    the LOWER variance of the two, because interpolation blur suppresses variance without
+    correcting anything. Sharpness is what separates them.
+    """
+    tes = [12.0, 30.0]
+    shifts = [0.0, 0.7, -0.6, 0.4, -0.5]
+    datas, _ = _make_multiecho(tes, shifts)
+    res = estimate_residual_flow_multiecho(
+        datas,
+        tes,
+        pe_axis=PE,
+        slice_axis=PE,
+        warp_interp="bilinear",  # the default, and the pass whose blur we refuse to keep
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    common = dict(
+        minpatch=5,
+        n_levels=1,
+        iters=4,
+        cost="ncc",
+        optimizer="gn",
+        full=False,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    double = polish_me_result(res, raw_datas=None, **common)
+    single = polish_me_result(res, raw_datas=datas, **common)
+
+    # Same transform either way, so the saved fields must agree.
+    assert torch.allclose(double.w_field, single.w_field, atol=1e-5)
+
+    def sharpness(r):
+        v = torch.as_tensor(r.per_echo[0].corrected_series()).float().numpy()
+        return float(np.abs(np.diff(np.median(v, axis=3), axis=PE)).mean())
+
+    assert sharpness(single) > sharpness(double)
