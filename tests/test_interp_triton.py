@@ -62,3 +62,18 @@ def test_custom_wsinc_settings_keep_portable_path(monkeypatch):
     monkeypatch.setattr(interp, "separable_resample_3d_triton", forbidden)
     interp._separable_resample_3d(source, x, y, z, "wsinc5")
     interp._wsinc5_params.cache_clear()
+
+
+def test_single_source_multi_path_reaches_fused_dispatch(monkeypatch):
+    source, x, y, z = _case()
+    calls = []
+
+    def record(source_arg, x_arg, y_arg, z_arg, kernel):
+        calls.append((source_arg.shape, kernel))
+        return torch.zeros_like(x_arg)
+
+    monkeypatch.setattr(interp, "separable_resample_3d_triton", record)
+    out = interp.warp_image_multi([source], x, y, z, mode="wsinc5")
+
+    assert calls == [(source.shape, "wsinc5")]
+    assert out[0].shape == x.shape

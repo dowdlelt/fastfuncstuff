@@ -384,6 +384,16 @@ def warp_image_multi(
         torch.arange(out_nx, dtype=torch.float32, device=device),
         indexing="ij",
     )
+    if len(sources) == 1:
+        # Keep a singleton source genuinely 3-D.  nwarp's per-frame path uses
+        # this multi-channel entry point even when there is only magnitude data;
+        # stacking it would hide the fused CUDA kernel behind the channel-batched
+        # portable fallback.
+        return [
+            _separable_resample_3d(
+                sources[0], ii + warp_xd, jj + warp_yd, kk + warp_zd, mode
+            )
+        ]
     stack = torch.stack(tuple(sources), dim=0)  # (C, nz, ny, nx)
     out = _separable_resample_3d(stack, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
     return list(out.unbind(0))
