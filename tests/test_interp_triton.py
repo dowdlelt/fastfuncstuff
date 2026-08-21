@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
+
 import pytest
 import torch
 
 from fastfuncstuff.processing import interp
+
+nwarpforge_module = importlib.import_module("fastfuncstuff.processing.nwarpforge")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -77,3 +81,19 @@ def test_single_source_multi_path_reaches_fused_dispatch(monkeypatch):
 
     assert calls == [(source.shape, "wsinc5")]
     assert out[0].shape == x.shape
+
+
+def test_warp_components_reach_scalar_fused_dispatch(monkeypatch):
+    source, x, y, z = _case()
+    fields = (source, source + 1.0, source + 2.0)
+    calls = []
+
+    def record(source_arg, x_arg, y_arg, z_arg, kernel):
+        calls.append((source_arg.ndim, kernel))
+        return torch.zeros_like(x_arg)
+
+    monkeypatch.setattr(nwarpforge_module, "_separable_resample_3d", record)
+    out = nwarpforge_module._sample_fields(fields, x, y, z, interp="cubic")
+
+    assert calls == [(3, "cubic")] * 3
+    assert len(out) == 3 and all(component.shape == x.shape for component in out)

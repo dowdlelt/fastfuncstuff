@@ -16,6 +16,7 @@ Key functions:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -58,8 +59,8 @@ def _sample_fields(
     possible, so a sharper kernel here preserves warp detail (matches AFNI using
     the interp kernel for the warp itself, not just the data).
     """
-    stack = torch.stack(fields, dim=0)
     if interp == "linear":
+        stack = torch.stack(fields, dim=0)
         sampled = trilinear_interpolate_multi(stack, x, y, z).T
         return tuple(sampled.unbind(0))
     # Edge-extend out-of-bounds (clamp coords to the field) instead of the
@@ -70,6 +71,19 @@ def _sample_fields(
     xc = x.clamp(0, nx - 1)
     yc = y.clamp(0, ny - 1)
     zc = z.clamp(0, nz - 1)
+    if (
+        fields[0].device.type == "cuda"
+        and all(field.dtype == torch.float32 and field.ndim == 3 for field in fields)
+        and os.environ.get("FFS_NWARP_NO_FUSED_FIELDS") != "1"
+    ):
+        # The fused dispatcher is scalar-volume only.  Three small fused launches
+        # are substantially cheaper on CUDA than hiding displacement components
+        # behind the portable (C,z,y,x) gather, even though the latter shares its
+        # coordinate setup.  CPU/MPS keep that channel-sharing path below.
+        return tuple(
+            _separable_resample_3d(field, xc, yc, zc, interp) for field in fields
+        )
+    stack = torch.stack(fields, dim=0)
     sampled = _separable_resample_3d(stack, xc, yc, zc, interp)
     return tuple(sampled.unbind(0))
 
