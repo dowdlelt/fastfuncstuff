@@ -38,6 +38,11 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+try:
+    from .locomoco_interp_triton import shift1d_lanczos_triton, shift2d_triton
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
 
 # Phase-encode direction letters -> NIfTI spatial axis (x=0, y=1, z=2). Only the
@@ -158,7 +163,11 @@ def _plane_meshgrid(
 
 
 def _warp2d(
-    img: torch.Tensor, u: torch.Tensor, v: torch.Tensor, mode: str = "bilinear"
+    img: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    mode: str = "bilinear",
+    radius: int = 3,
 ) -> torch.Tensor:
     """Sample ``img`` at ``(x + u, y + v)`` (u along W, v along H). ``(B, H, W)``.
 
@@ -170,8 +179,19 @@ def _warp2d(
     the pooling window anyway, so a 2-D estimation warp falls back to bilinear; the 1-D PE
     correction takes the true lanczos path in :func:`_correct_pe`.
     """
+    needs_grad = torch.is_grad_enabled() and (
+        img.requires_grad or u.requires_grad or v.requires_grad
+    )
+    if (
+        shift2d_triton is not None
+        and img.device.type == "cuda"
+        and img.dtype == torch.float32
+        and mode in ("bicubic", "lanczos")
+        and not needs_grad
+    ):
+        return shift2d_triton(img, v, u, 1, 2, mode, radius)
     if mode == "lanczos":
-        mode = "bilinear"
+        return _shift2d_high_order(img, v, u, 1, 2, mode="lanczos", radius=radius)
     _, h, w = img.shape
     ys, xs = _plane_meshgrid(h, w, img.device, img.dtype)
     gxn = 2.0 * (xs.unsqueeze(0) + u) / max(w - 1, 1) - 1.0
@@ -181,6 +201,22 @@ def _warp2d(
         img.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
     )
     return out.squeeze(1)
+
+
+def _warp2d_pe(
+    img: torch.Tensor,
+    u: torch.Tensor,
+    v: torch.Tensor,
+    mode: str,
+    radius: int,
+    *,
+    pe_is_u: bool,
+    two_dimensional: bool,
+) -> torch.Tensor:
+    """Use the warp's active dimensionality rather than the image tensor rank."""
+    if mode == "lanczos" and not two_dimensional:
+        return _shift1d_windowed_sinc(img, u if pe_is_u else v, 1 if pe_is_u else 0, radius)
+    return _warp2d(img, u, v, mode, radius)
 
 
 def optical_flow_lk_2d(
@@ -193,6 +229,7 @@ def optical_flow_lk_2d(
     reg: float = 1e-3,
     pe_only_axis: int | None = None,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
     max_shift: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense pyramidal Lucas-Kanade optical flow for a batch of 2-D image pairs.
@@ -244,7 +281,15 @@ def optical_flow_lk_2d(
             )
 
         for _ in range(n_iters):
-            mv_w = _warp2d(mv_l, u, v, warp_interp)
+            mv_w = _warp2d_pe(
+                mv_l,
+                u,
+                v,
+                warp_interp,
+                warp_radius,
+                pe_is_u=pe_only_axis == 0,
+                two_dimensional=pe_only_axis is None,
+            )
             it = mv_w - fx_l
             ix, iy = _spatial_gradients(mv_w)
             if pe_only_axis is not None:
@@ -627,6 +672,7 @@ def xcorr_search_flow_2d(
     dual: bool = False,
     n_passes: int = 3,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     conf_out: list[torch.Tensor] | None = None,
@@ -666,7 +712,15 @@ def xcorr_search_flow_2d(
     u = torch.zeros_like(fixed)
     v = torch.zeros_like(fixed)
     for _ in range(n_passes):
-        mw = _warp2d(moving, u, v, warp_interp)
+        mw = _warp2d_pe(
+            moving,
+            u,
+            v,
+            warp_interp,
+            warp_radius,
+            pe_is_u=pe_is_u,
+            two_dimensional=dual,
+        )
         du, _ = _xcorr_shift_1d(
             fixed,
             mw,
@@ -680,7 +734,15 @@ def xcorr_search_flow_2d(
             reg_sigma,
         )
         u = u + du
-        mw = _warp2d(moving, u, v, warp_interp)
+        mw = _warp2d_pe(
+            moving,
+            u,
+            v,
+            warp_interp,
+            warp_radius,
+            pe_is_u=pe_is_u,
+            two_dimensional=dual,
+        )
         dv, _ = _xcorr_shift_1d(
             fixed,
             mw,
@@ -842,6 +904,7 @@ def phase_correlation_flow_2d(
     n_iters: int = 5,
     dual: bool = False,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Phase-correlation searchlight backend (FFT phase ramp along PE).
 
@@ -863,7 +926,15 @@ def phase_correlation_flow_2d(
     u = torch.zeros_like(fixed)
     v = torch.zeros_like(fixed)
     for _ in range(n_iters):
-        mw = _warp2d(moving, u, v, warp_interp)
+        mw = _warp2d_pe(
+            moving,
+            u,
+            v,
+            warp_interp,
+            warp_radius,
+            pe_is_u=pe_is_u,
+            two_dimensional=dual,
+        )
         # Clamp the ACCUMULATED field, not just each increment: this is residual
         # motion (small), so max_shift bounds the total displacement. Otherwise n_iters
         # increments each capped at max_shift let low-signal patches random-walk to
@@ -1410,17 +1481,17 @@ def _correct_pe(
 
     Single-PE keeps only the PE-axis component; ``dual`` (two PE axes) uses both.
     A single-PE correction is a 1-D shift along one in-plane axis, so ``lanczos`` routes it
-    through the windowed-sinc gather along that axis; ``dual`` is a genuine 2-D warp and stays
-    on ``_warp2d`` (grid_sample has no lanczos — the CLI blocks ``lanczos`` for dual).
+    through the windowed-sinc gather along that axis; ``dual`` is a genuine 2-D warp and uses
+    the tensor-product Lanczos kernel over both active axes.
     """
     if warp_interp == "lanczos" and not dual:
         pe_shift, ax = (u, 1) if pe_flow_is_u else (v, 0)  # u→W (axis 1), v→H (axis 0)
         return _shift1d_windowed_sinc(moving_raw, pe_shift, ax, radius=warp_radius)
     if dual:
-        return _warp2d(moving_raw, u, v, warp_interp)
+        return _warp2d(moving_raw, u, v, warp_interp, warp_radius)
     uc = u if pe_flow_is_u else torch.zeros_like(u)
     vc = torch.zeros_like(v) if pe_flow_is_u else v
-    return _warp2d(moving_raw, uc, vc, warp_interp)
+    return _warp2d(moving_raw, uc, vc, warp_interp, warp_radius)
 
 
 def _estimate_static(
@@ -1583,6 +1654,7 @@ def _build_flow_fn(
     n_iters: int,
     window_sigma: float,
     warp_interp: str,
+    warp_radius: int,
     patch: int,
     stride: int,
     max_shift: float,
@@ -1611,6 +1683,7 @@ def _build_flow_fn(
                 window_sigma=window_sigma,
                 pe_only_axis=pe_only_axis,
                 warp_interp=warp_interp,
+                warp_radius=warp_radius,
                 max_shift=max_shift,
             )
     elif backend == "phase":
@@ -1626,6 +1699,7 @@ def _build_flow_fn(
                 n_iters=n_iters,
                 dual=dual,
                 warp_interp=warp_interp,
+                warp_radius=warp_radius,
             )
     elif backend == "xcorr":
 
@@ -1639,6 +1713,7 @@ def _build_flow_fn(
                 trial_step=trial_step,
                 dual=dual,
                 warp_interp=warp_interp,
+                warp_radius=warp_radius,
                 noshift_margin=noshift_margin,
                 reg_sigma=reg_sigma,
                 conf_out=conf_out,
@@ -1735,9 +1810,9 @@ def estimate_residual_flow(
     ``first_median`` also holds the corrected series on the GPU.
 
     Accuracy levers (trade time for exactness of the recovered value):
-    ``warp_interp`` (``bilinear`` | ``bicubic``) is the resampler for the estimation
-    iterations and the correction — ``bicubic`` removes the bilinear damping bias so
-    iterations converge to the true shift. ``refine_rounds`` re-registers against the
+    ``warp_interp`` selects linear, cubic-convolution, or Lanczos resampling for both
+    estimation and correction. Lanczos preserves the high-frequency structure that
+    bilinear interpolation removes from later refine templates. ``refine_rounds`` re-registers against the
     corrected-data mean that many extra times, converging the reference template out
     of its bias. ``jacobian`` scales the corrected series by the PE Jacobian so signal
     is conserved (stretched regions dim, compressed regions brighten).
@@ -1835,6 +1910,7 @@ def estimate_residual_flow(
         n_iters=n_iters,
         window_sigma=window_sigma,
         warp_interp=warp_interp,
+        warp_radius=warp_radius,
         patch=patch,
         stride=stride,
         max_shift=max_shift,
@@ -2298,6 +2374,7 @@ def estimate_residual_flow_rotaware(
         n_iters=n_iters,
         window_sigma=window_sigma,
         warp_interp=warp_interp,
+        warp_radius=3,
         patch=patch,
         stride=stride,
         max_shift=max_shift,
@@ -2654,6 +2731,17 @@ def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3)
     vol[i + s]``); taps are border-clamped like its ``padding_mode="border"``.
     """
     dim = axis + 1  # batch is dim 0; spatial ``axis`` (0-based) → tensor dim. Any rank ≥ 2.
+    needs_grad = torch.is_grad_enabled() and (
+        vol.requires_grad or (isinstance(shift, torch.Tensor) and shift.requires_grad)
+    )
+    if (
+        shift1d_lanczos_triton is not None
+        and vol.device.type == "cuda"
+        and vol.dtype == torch.float32
+        and isinstance(shift, torch.Tensor)
+        and not needs_grad
+    ):
+        return shift1d_lanczos_triton(vol, shift, dim, radius)
     n = vol.shape[dim]
     ishape = [1] * vol.ndim
     ishape[dim] = n
@@ -2673,6 +2761,75 @@ def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3)
         num = num + w * vol.gather(dim, tap)
         den = den + w
     return num / den
+
+
+def _shift2d_high_order(
+    vol: torch.Tensor,
+    shift0: torch.Tensor,
+    shift1: torch.Tensor,
+    dim0: int,
+    dim1: int,
+    *,
+    mode: str,
+    radius: int = 3,
+) -> torch.Tensor:
+    """Portable tensor-product cubic/Lanczos over two active dimensions.
+
+    This is the CPU/MPS and differentiable fallback for the fused CUDA kernel.
+    It samples only the dimensions the displacement can move, irrespective of
+    whether ``vol`` stores 2-D slices or 3-D EPI volumes.
+    """
+    if mode not in ("bicubic", "lanczos"):
+        raise ValueError(f"unsupported 2-D high-order mode {mode!r}")
+    vol = vol.contiguous()
+    shape = vol.shape
+    size0, size1 = shape[dim0], shape[dim1]
+    stride0, stride1 = vol.stride(dim0), vol.stride(dim1)
+    flat = vol.reshape(-1)
+    idx = torch.arange(flat.numel(), device=vol.device)
+    p0 = torch.div(idx, stride0, rounding_mode="floor") % size0
+    p1 = torch.div(idx, stride1, rounding_mode="floor") % size1
+    row = idx - p0 * stride0 - p1 * stride1
+    c0 = p0.to(vol.dtype) + shift0.expand(shape).reshape(-1)
+    c1 = p1.to(vol.dtype) + shift1.expand(shape).reshape(-1)
+    b0, b1 = c0.floor().long(), c1.floor().long()
+    f0, f1 = c0 - b0, c1 - b1
+
+    if mode == "lanczos":
+        offsets = range(-(radius - 1), radius + 1)
+
+        def weights(frac, k):
+            x = frac - k
+            return torch.sinc(x) * torch.sinc(x / float(radius))
+
+    else:
+        offsets = range(-1, 3)
+
+        def weights(frac, k):
+            a = -0.75
+            if k == -1:
+                x = frac + 1.0
+                return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+            if k == 0:
+                x = frac
+                return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+            if k == 1:
+                x = 1.0 - frac
+                return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0
+            x = 2.0 - frac
+            return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a
+
+    w0 = [weights(f0, k) for k in offsets]
+    w1 = [weights(f1, k) for k in offsets]
+    acc = torch.zeros_like(flat)
+    for j, k0 in enumerate(offsets):
+        t0 = (b0 + k0).clamp(0, size0 - 1)
+        for k, k1 in enumerate(offsets):
+            t1 = (b1 + k1).clamp(0, size1 - 1)
+            acc = acc + w0[j] * w1[k] * flat[(row + t0 * stride0 + t1 * stride1).long()]
+    if mode == "lanczos":
+        acc = acc / (torch.stack(w0).sum(0) * torch.stack(w1).sum(0))
+    return acc.reshape(shape)
 
 
 def _shift3d_axis(
@@ -2743,13 +2900,9 @@ def _shift3d_axes(
 
     The multi-axis generalisation of :func:`_shift3d_axis`. A single axis delegates
     straight back to it, keeping the scalar fast path and the lanczos (windowed-sinc)
-    resampler. Two axes are a genuine 2-D warp, so they go through ``grid_sample``:
-    there is no separable 1-D gather for a joint displacement, and applying two 1-D
-    gathers in sequence resamples the already-resampled image (double interpolation
-    blur, and the second shift is read at the wrong location).
-
-    ``lanczos`` is a 1-D resampler and silently degrades to trilinear for two axes —
-    the same restriction the 2-D dual-PE path already carries.
+    resampler. Two axes are a genuine 2-D tensor-product interpolation evaluated in
+    one pass; applying two 1-D gathers in sequence would resample twice and read the
+    second displacement at the wrong location.
     """
     if len(axes) == 1:
         return _shift3d_axis(vol, shifts[0], axes[0], mode=mode, radius=radius)
@@ -2771,8 +2924,35 @@ def _shift3d_axes(
     for ax, sh in zip(axes, shifts, strict=True):
         comps[ax] = comps[ax] + sh * (2.0 / max(n[ax] - 1, 1))
     grid = torch.stack([comps[2], comps[1], comps[0]], dim=-1)  # last = (W=Z, H=Y, D=X)
+    needs_grad = torch.is_grad_enabled() and (
+        vol.requires_grad or any(sh.requires_grad for sh in shifts)
+    )
+    if (
+        shift2d_triton is not None
+        and vol.device.type == "cuda"
+        and vol.dtype == torch.float32
+        and mode in ("bicubic", "lanczos")
+        and not needs_grad
+    ):
+        return shift2d_triton(
+            vol,
+            shifts[0],
+            shifts[1],
+            axes[0] + 1,
+            axes[1] + 1,
+            mode,
+            radius,
+        )
     if mode in ("bicubic", "lanczos"):
-        mode = "bilinear"  # grid_sample 3-D has trilinear or nearest only
+        return _shift2d_high_order(
+            vol,
+            shifts[0],
+            shifts[1],
+            axes[0] + 1,
+            axes[1] + 1,
+            mode=mode,
+            radius=radius,
+        )
     out = F.grid_sample(
         vol.unsqueeze(1), grid, mode=mode, padding_mode="border", align_corners=True
     )
@@ -4973,7 +5153,7 @@ def _rewarp_raw_single_pass(
     """Warp the RAW echoes by the TOTAL field in one wsinc5 pass, ``(nx, ny, nz, T)`` each.
 
     The qwarp polish registers the CORRECTED series, so its own warped output has been
-    resampled twice: once by the estimator (``-warp_interp``, bilinear by default) and
+    resampled twice: once by the estimator (historically bilinear) and
     again by qwarp. The second pass cannot put back what the first one blurred, and it
     also leaves the saved series describing a slightly different transform from the saved
     warp, which is the additive total ``w + r``. Applying that total to the raw data

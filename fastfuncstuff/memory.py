@@ -1326,6 +1326,21 @@ def dyn_chunk_estimator(
     return chunk_size
 
 
+def bytes_per_voxel_interp_triton(ntaps: int) -> int:
+    """Transient bytes per output point for staged fused interpolation.
+
+    The wide-kernel CUDA path stores one float32 XY contraction per Z tap.
+    Coordinate copies and output account for four further float32 values.
+    The source volume is persistent and deliberately excluded.
+    """
+    return (ntaps + 4) * 4
+
+
+def bytes_per_voxel_locomoco_interp(n_active_axes: int) -> int:
+    """Transient float32 storage for fused active-axis interpolation."""
+    return (n_active_axes + 1) * 4  # expanded shift(s) plus output
+
+
 def estimate_chunk_size(
     n_voxels: int,
     n_timepoints: int,

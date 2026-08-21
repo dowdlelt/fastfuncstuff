@@ -806,14 +806,14 @@ def create_parser() -> argparse.ArgumentParser:
     acc = p.add_argument_group("Accuracy (trade time for exactness)")
     acc.add_argument(
         "-warp_interp",
-        default="bilinear",
-        choices=("bilinear", "bicubic", "lanczos"),
-        help="[all] Resampler for the estimation iterations and the correction. "
+        default="auto",
+        choices=("auto", "bilinear", "bicubic", "lanczos"),
+        help="[all] Resampler for the estimation iterations and the correction. 'auto' "
+        "uses Lanczos for 1-D/2-D PE warps and bicubic for rotation-aware 3-D. "
         "'bicubic' removes the bilinear damping bias so the iterations converge to the "
         "true shift (biggest gain on smooth data); costs a little more per warp. "
-        "'lanczos' is a windowed sinc along the PE axis (half-width -warp_radius) for any "
-        "SINGLE phase-encode path (2-D slicewise, 3-D-acq, or the joint multi-echo solve — "
-        "not dual/rotation-aware, which are 2-D/3-D warps). It preserves sub-voxel signal "
+        "'lanczos' is a separable windowed sinc over the active PE axis/axes (half-width "
+        "-warp_radius): 1-D for single PE and 2-D for dual PE on CUDA. It preserves sub-voxel signal "
         "that trilinear blurs out of the CORRECTED output and the refine template; the shift "
         "estimate itself is set by the pooling window, so this is about output fidelity, not "
         "shift accuracy. Costs ~2× per warp and passes more thermal noise — verify on your data.",
@@ -1186,7 +1186,7 @@ _PRESET_DEFAULTS = {
     "levels": 3,
     "stride": 8,
     "xcorr_step": 0.5,
-    "warp_interp": "bilinear",
+    "warp_interp": "auto",
     "refine": 0,
 }
 _PRESETS = {
@@ -1195,7 +1195,6 @@ _PRESETS = {
         "levels": 4,
         "stride": 4,
         "xcorr_step": 0.25,
-        "warp_interp": "bicubic",
         "refine": 1,
     },
     "superhard": {
@@ -1203,10 +1202,16 @@ _PRESETS = {
         "levels": 5,
         "stride": 2,
         "xcorr_step": 0.25,
-        "warp_interp": "bicubic",
         "refine": 3,
     },
 }
+
+
+def _resolve_warp_interp(requested: str, *, rotaware: bool) -> str:
+    """Resolve the CLI's geometry-aware high-fidelity default."""
+    if requested != "auto":
+        return requested
+    return "bicubic" if rotaware else "lanczos"
 
 
 def _apply_preset(args) -> str | None:
@@ -2137,6 +2142,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     dual = two_axes and not args.is_3dacq
     dual3d = two_axes and args.is_3dacq
     pe_axes = [pe_axis, pe_axis2] if two_axes else [pe_axis]
+    args.warp_interp = _resolve_warp_interp(args.warp_interp, rotaware=rotaware)
 
     if me_mode:
         if two_axes and (args.me_interecho or args.me_estimate_from is not None):
@@ -2166,15 +2172,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             )
             return 2
 
-    # Lanczos is a 1-D (single-PE-axis) resampler. A single -pe_dir correction is a shift
-    # along one axis (2-D slicewise, 3-D-acq, or the joint multi-echo solve) — all fine.
-    # dual (two -pe_dir) and rotation-aware are genuine 2-D/3-D warps via grid_sample, which
-    # has no lanczos mode; block them rather than crash.
+    # Rotation-aware synthesis is a genuine arbitrary 3-D warp and still has no
+    # Lanczos implementation. Dual PE is only a 2-D warp and now has a fused CUDA path.
     if args.warp_interp == "lanczos":
-        if two_axes or rotaware:
-            which = "two encode axes (2-D warp)" if two_axes else "rotation-aware (3-D warp)"
+        if rotaware:
             print(
-                f"❌ -warp_interp lanczos is single phase-encode only; {which} needs "
+                "❌ -warp_interp lanczos does not yet support rotation-aware 3-D warps; use "
                 "bilinear/bicubic.",
                 file=sys.stderr,
             )

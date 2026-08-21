@@ -24,6 +24,11 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+try:
+    from .interp_triton import separable_resample_3d_triton
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    separable_resample_3d_triton = None
+
 
 def _grid_sample_3d(
     input: Tensor,
@@ -949,6 +954,25 @@ def _separable_resample_3d(
         Resampled volume with same shape as coordinate arrays (a leading ``C`` axis
         is prepended when ``source`` is channel-batched).
     """
+    needs_grad = torch.is_grad_enabled() and (
+        source.requires_grad
+        or x_coords.requires_grad
+        or y_coords.requires_grad
+        or z_coords.requires_grad
+    )
+    default_wsinc = kernel_name != "wsinc5" or _wsinc5_params() == (5, 5.001, 0.0, False)
+    if (
+        separable_resample_3d_triton is not None
+        and source.device.type == "cuda"
+        and source.dtype == torch.float32
+        and source.dim() == 3
+        and x_coords.numel() >= 65536
+        and not needs_grad
+        and default_wsinc
+        and os.environ.get("FFS_INTERP_NO_TRITON") != "1"
+    ):
+        return separable_resample_3d_triton(source, x_coords, y_coords, z_coords, kernel_name)
+
     kernel_fn, _, use_floor = _KERNELS[kernel_name]
     H = _kernel_half_width(kernel_name)  # wsinc5 honors AFNI_WSINC5_RADIUS
     batched = source.dim() == 4
