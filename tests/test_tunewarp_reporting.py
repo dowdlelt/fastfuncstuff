@@ -483,3 +483,95 @@ def test_results_table_shows_roughness(tmp_path):
     assert "frontier" in out
     body = out.split("frontier", 1)[1]
     assert body.index("0.0200") < body.index("0.4300")
+
+
+# --- resting on the fold guard ----------------------------------------------
+
+
+def _pinned_store(tmp_path):
+    """Two sound configs: one running on the guard, one nowhere near it."""
+    from fastfuncstuff.processing.warpqc import FOLD_GUARD_FLOOR
+
+    s = TrialStore(tmp_path / "t.json")
+    s.runs.append(_meta())
+    for cfg, ls, bend, jmin in (
+        # Best similarity in the run -- and only legal because the damping held it.
+        ({"total_var": 0.0}, 0.20, 1.32, FOLD_GUARD_FLOOR),
+        ({"total_var": 2.0}, 0.28, 0.02, 0.85),
+    ):
+        for subj in ("s1", "s2"):
+            s.add(
+                "formwarp",
+                subj,
+                cfg,
+                [],
+                scores={"ls": ls, "lncc": -0.9 + ls / 10},
+                seconds=1.0,
+                warpqc={"bending_energy": bend, "jac_min": jmin, "jac_neg_count": 0},
+            )
+    s.compute_consensus(["ls", "lncc"])
+    return s
+
+
+def test_guard_pinned_config_is_demoted_below_a_clean_pass(tmp_path):
+    """The similarity winner loses the top row when the guard is what saved it."""
+    from fastfuncstuff.processing.tunestore import PINNED
+
+    results = _pinned_store(tmp_path).results()
+    ranked = [r for r in results if not r.is_baseline]
+    assert ranked[0].config == {"total_var": 2.0}  # the clean one now leads
+    pinned = next(r for r in ranked if r.config == {"total_var": 0.0})
+    assert pinned.guard_pinned and pinned.band == PINNED
+    assert pinned.grade == "pass"  # it did not fold, so it still cannot FAIL
+    assert pinned.score_mean < ranked[0].score_mean  # ... and it still scores better
+
+
+def test_guard_pinned_config_is_not_offered_on_the_frontier(tmp_path):
+    """'Smoother than the one the damping barely saved' is not a trade to offer."""
+    results = _pinned_store(tmp_path).results()
+    assert not next(r for r in results if r.config == {"total_var": 0.0}).pareto
+
+
+def test_guard_pinned_is_explained_in_the_table(tmp_path):
+    out = format_results_table(_pinned_store(tmp_path).results())
+    assert "PINNED" in out and "anti-fold floor" in out
+
+
+def test_jac_floor_is_one_number_across_the_solvers():
+    """The QC's notion of 'on the floor' has to be the floor the solvers target."""
+    from fastfuncstuff.processing.formwarp import FOLD_GUARD_FLOOR, SynConfig
+    from fastfuncstuff.processing.optiwarp import OptiwarpConfig
+
+    assert SynConfig().jac_floor == FOLD_GUARD_FLOOR
+    assert OptiwarpConfig().jac_floor == FOLD_GUARD_FLOOR
+
+
+def test_guard_pinned_predicate_and_caution():
+    from fastfuncstuff.processing.warpqc import (
+        FOLD_GUARD_FLOOR,
+        WarpQC,
+        guard_pinned,
+        regularity_cautions,
+    )
+
+    def qc(jac_min):
+        return WarpQC(
+            n_voxels=1000,
+            jac_neg_count=0,
+            jac_neg_frac=0.0,
+            jac_min=jac_min,
+            jac_p01=0.9,
+            jac_p50=1.0,
+            jac_p99=1.1,
+            jac_max=1.2,
+            bending_energy=0.0,
+            disp_mean_mm=0.1,
+            disp_p99_mm=0.2,
+            disp_max_mm=0.3,
+        )
+
+    assert guard_pinned(qc(FOLD_GUARD_FLOOR))
+    assert guard_pinned(qc(0.0503))  # what the solver actually returns when pinned
+    assert not guard_pinned(qc(0.30))
+    assert any("guard-limited" in c for c in regularity_cautions(qc(FOLD_GUARD_FLOOR)))
+    assert not any("guard-limited" in c for c in regularity_cautions(qc(0.30)))

@@ -21,6 +21,7 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from .formwarp import FOLD_GUARD_FLOOR
 from .optiwarp import jacobian_determinant
 from .penalty import _central_diff_batched
 
@@ -54,6 +55,35 @@ DEFAULT_MIN_JAC = 0.25  # ... and likewise compression
 DEFAULT_MARGINAL_NEG_FRAC = 5e-3  # 0.5% of in-mask voxels
 
 PASS, MARGINAL, FAIL = "pass", "marginal", "fail"
+
+# A returned warp whose min det(J) is within this factor of the floor did not
+# merely come close to folding -- it is sitting ON the guard, which means the
+# damping is the only thing holding it together.
+GUARD_PINNED_RATIO = 1.10
+
+
+def guard_pinned(qc: WarpQC, floor: float = FOLD_GUARD_FLOOR) -> bool:
+    """True when the anti-fold damping, not the regularization, is what saved this warp.
+
+    The most useful diagnostic in the whole QC, and the one that took longest to
+    see, because it looks like an ordinary number. ``jac_min = 0.050`` reads as "a
+    warp with a small minimum Jacobian"; it actually means the field spent the run
+    trying to invert and was clamped every time. The solver *targets* this value,
+    so landing on it is not a coincidence -- it is the signature of a config whose
+    regularization is too low, running on the guard.
+
+    Measured on a 7T epi2epi run: the five configs pinned on every subject averaged
+    a bending energy of 1.32, against 0.021 for the 122 that never approached the
+    floor -- 64x the roughness for 0.05 of lncc. And the mechanism is not
+    theoretical: one pinned config met a subject where the guard could not hold,
+    reported NO LEGAL ITERATE, and folded outright.
+
+    This is what lets the report demote those configs without inventing a
+    roughness threshold. The floor is already a declared parameter of the solver;
+    all this does is notice when a result is resting on it.
+    """
+    return qc.jac_min < floor * GUARD_PINNED_RATIO
+
 
 # What to do about each failure mode. Regularity failures are *directional*:
 # every one of them is fixed by moving a knob the tuner is already walking, so a
@@ -281,6 +311,12 @@ def regularity_cautions(
     direction the search is being pulled in. It just does not get a veto.
     """
     out = []
+    if guard_pinned(qc):
+        out.append(
+            f"guard-limited: min det(J) = {qc.jac_min:.3f} sits on the solver's "
+            f"fold-guard floor ({FOLD_GUARD_FLOOR}) -- the damping is holding this "
+            "warp together, not its regularization"
+        )
     if qc.jac_p01 < min_jac:
         out.append(f"over-compression: 1st pct det(J) = {qc.jac_p01:.3f} < {min_jac}")
     if qc.jac_p99 > max_jac:

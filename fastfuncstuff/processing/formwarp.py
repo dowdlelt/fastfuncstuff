@@ -94,6 +94,14 @@ def _all_metrics() -> tuple[str, ...]:
 METRICS = _all_metrics()
 
 
+# The fold guard's own target: the flow/SyN solvers damp an update wherever the
+# prospective det(J) would fall below this, and refuse to snapshot an iterate whose
+# minimum is under it. Declared here rather than in `warpqc` -- which is the module
+# that has to interpret it -- because warpqc imports from optiwarp which imports
+# from here, so this is the bottom of that chain.
+FOLD_GUARD_FLOOR = 0.05
+
+
 @dataclass
 class SynConfig:
     """Configuration for the SyN engine."""
@@ -172,7 +180,7 @@ class SynConfig:
     neighbourhood that would fold. When nothing would fold it costs two determinants
     per iteration and changes nothing."""
 
-    jac_floor: float = 0.05
+    jac_floor: float = FOLD_GUARD_FLOOR
     """Prospective ``det(J)`` below which :attr:`fold_guard` damps a step. Guarded on
     each half field rather than on the composed warp: the halves are what
     ``invert_displacement_field`` has to invert, and an inverted half is where a folded

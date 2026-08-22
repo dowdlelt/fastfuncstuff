@@ -78,6 +78,7 @@ from .cost import (
     _smoothed_weighted_moments_3d_from_fixed,
 )
 from .formwarp import (
+    FOLD_GUARD_FLOOR,
     NO_X_DISP,
     NO_Y_DISP,
     NO_Z_DISP,
@@ -195,7 +196,7 @@ class OptiwarpConfig:
     of the field to take its full step. In the common case (nothing would fold) it
     costs one determinant per iteration and changes nothing."""
 
-    jac_floor: float = 0.05
+    jac_floor: float = FOLD_GUARD_FLOOR
     """Prospective ``det(J)`` below which :attr:`fold_guard` damps an update. Above 0
     rather than at it, because a voxel arriving exactly at zero is one interpolation
     error away from inverted; this keeps a margin. Deliberately looser than the QC

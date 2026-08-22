@@ -28,6 +28,8 @@ from typing import Any
 
 from .warpqc import (
     FAIL,
+    FOLD_GUARD_FLOOR,
+    GUARD_PINNED_RATIO,
     MARGIN_LIMIT,
     MARGINAL,
     PASS,
@@ -39,6 +41,12 @@ from .warpqc import (
 )
 
 GRADE_ORDER = {PASS: 0, MARGINAL: 1, FAIL: 2}
+
+
+def guard_pinned_value(jac_min: float) -> bool:
+    """`warpqc.guard_pinned` on a bare number, for trials stored as plain dicts."""
+    return jac_min < FOLD_GUARD_FLOOR * GUARD_PINNED_RATIO
+
 
 # A config that clears the regularity gate by less than this many pooled
 # between-subject sigmas is reported as NARROW and sorted below the clean passes.
@@ -52,6 +60,14 @@ GRADE_ORDER = {PASS: 0, MARGINAL: 1, FAIL: 2}
 # it looks like it should, and that is the finding, not a mis-calibration.
 NARROW_CLEARANCE_Z = 1.0
 NARROW = "narrow"
+
+# A config whose returned warp sits ON the solver's anti-fold floor is reported as
+# PINNED and sorted with the narrow passes. It did not fold, so it cannot fail --
+# but `warpqc.guard_pinned` explains why it is not a result either: the damping is
+# what kept it legal, and the same settings met a subject where the guard could not
+# hold and folded outright. This is the one demotion that needs no invented
+# constant, because the floor is already a declared parameter of the solver.
+PINNED = "pinned"
 
 
 BASELINE = "(baseline)"
@@ -308,6 +324,8 @@ class ConfigResult:
     # a thing a brain does.
     bending_mean: float = 0.0
     jac_min_worst: float = 1.0
+    # Any subject whose warp came back resting on the solver's fold-guard floor.
+    guard_pinned: bool = False
     # True when no other config is at least as similar *and* smoother -- i.e. this
     # row is a real choice on the accuracy/smoothness trade rather than a config
     # that is simply beaten on both.
@@ -329,9 +347,19 @@ class ConfigResult:
         )
 
     @property
+    def demoted(self) -> bool:
+        """Passed, but not on its own merits — sorted below the clean passes."""
+        return self.grade == PASS and not self.is_baseline and (self.narrow or self.guard_pinned)
+
+    @property
     def band(self) -> str:
         """What to print in the grade column, and what the ordering keys on."""
-        return NARROW if self.narrow else self.grade
+        if self.grade == PASS and not self.is_baseline:
+            if self.guard_pinned:
+                return PINNED  # named before NARROW: it is the more specific finding
+            if self.narrow:
+                return NARROW
+        return self.grade
 
 
 # Margins below this are not "close to the gate", they are a warp that came apart:
@@ -617,10 +645,14 @@ class TrialStore:
                     jac_min_worst=min(
                         [float(t.warpqc.get("jac_min", 1.0)) for t in ts], default=1.0
                     ),
+                    guard_pinned=any(
+                        t.warpqc and guard_pinned_value(float(t.warpqc.get("jac_min", 1.0)))
+                        for t in ts
+                    ),
                 )
             )
         _mark_pareto(out, score_key)
-        out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.narrow, r.score_mean))
+        out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.demoted, r.score_mean))
         return out
 
     def baseline(self) -> ConfigResult | None:
@@ -1341,6 +1373,14 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
             "  somewhere but never inverts. Reported, never ranked on -- heads and\n"
             "  ventricles vary enough that the bound is a notice, not a verdict."
         )
+    if any(r.band == PINNED for r in shown):
+        lines.append(
+            "  PINNED: the warp came back resting on the solver's anti-fold floor\n"
+            "  (det(J) = 0.05, the value the guard targets), so the damping is what kept\n"
+            "  it legal rather than its regularization. It did not fold, so it does not\n"
+            "  fail -- but it is running on the guard, and the same settings fold outright\n"
+            "  on a subject where the guard cannot hold."
+        )
     if any(r.narrow for r in shown):
         lines.append(
             "  'clear' is how far the worst subject sat from the regularity gate, in\n"
@@ -1377,7 +1417,12 @@ def _mark_pareto(results: list[ConfigResult], score_key: str) -> None:
     Only graded-equal rows compete, so a folded config cannot dominate a sound one
     out of the frontier by being smooth about it.
     """
-    candidates = [r for r in results if not r.is_baseline and r.grade == PASS]
+    # A guard-pinned config is excluded outright rather than merely ranked low. The
+    # frontier's job is to name the choices worth making, and "smoother than the one
+    # the damping barely saved" is not a trade anyone should be offered.
+    candidates = [
+        r for r in results if not r.is_baseline and r.grade == PASS and not r.guard_pinned
+    ]
     for r in candidates:
         r.pareto = not any(
             o is not r and o.score_mean <= r.score_mean and o.bending_mean < r.bending_mean
