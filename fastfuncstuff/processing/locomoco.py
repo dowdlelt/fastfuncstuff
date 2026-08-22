@@ -45,6 +45,28 @@ except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
 
+# Latched when a fused launch actually fails on this machine.
+_fused_shift_unavailable = False
+
+
+def _try_fused(fn, *args):
+    """Run a fused CUDA shift, or return None so the caller takes the portable path.
+
+    A GPU or driver that cannot build the kernel must cost one failed attempt,
+    not abort the run and not retry once per frame.
+    """
+    global _fused_shift_unavailable
+    if fn is None or _fused_shift_unavailable:
+        return None
+    try:
+        return fn(*args)
+    except AssertionError:
+        raise  # a failed assertion is a bug here, not a missing GPU capability
+    except Exception as exc:  # pragma: no cover - needs a Triton-hostile GPU
+        _fused_shift_unavailable = True
+        print(f"** fused CUDA shift unavailable ({type(exc).__name__}: {exc}); using PyTorch")
+        return None
+
 # Phase-encode direction letters -> NIfTI spatial axis (x=0, y=1, z=2). Only the
 # AXIS matters for building the movie / placing the warp component; the sign of
 # the displacement is data-driven (it falls out of the optical flow).
@@ -183,13 +205,14 @@ def _warp2d(
         img.requires_grad or u.requires_grad or v.requires_grad
     )
     if (
-        shift2d_triton is not None
-        and img.device.type == "cuda"
+        img.device.type == "cuda"
         and img.dtype == torch.float32
         and mode in ("bicubic", "lanczos")
         and not needs_grad
     ):
-        return shift2d_triton(img, v, u, 1, 2, mode, radius)
+        fused = _try_fused(shift2d_triton, img, v, u, 1, 2, mode, radius)
+        if fused is not None:
+            return fused
     if mode == "lanczos":
         return _shift2d_high_order(img, v, u, 1, 2, mode="lanczos", radius=radius)
     _, h, w = img.shape
@@ -2299,6 +2322,7 @@ def estimate_residual_flow_rotaware(
     patch: int = 16,
     stride: int = 8,
     warp_interp: str = "bilinear",
+    warp_radius: int = 3,
     fuse: str = "auto",
     fuse_thresh: float = 0.05,
     fuse_weight: float = 1.0,
@@ -2374,7 +2398,7 @@ def estimate_residual_flow_rotaware(
         n_iters=n_iters,
         window_sigma=window_sigma,
         warp_interp=warp_interp,
-        warp_radius=3,
+        warp_radius=warp_radius,
         patch=patch,
         stride=stride,
         max_shift=max_shift,
@@ -2735,13 +2759,14 @@ def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3)
         vol.requires_grad or (isinstance(shift, torch.Tensor) and shift.requires_grad)
     )
     if (
-        shift1d_lanczos_triton is not None
-        and vol.device.type == "cuda"
+        vol.device.type == "cuda"
         and vol.dtype == torch.float32
         and isinstance(shift, torch.Tensor)
         and not needs_grad
     ):
-        return shift1d_lanczos_triton(vol, shift, dim, radius)
+        fused = _try_fused(shift1d_lanczos_triton, vol, shift, dim, radius)
+        if fused is not None:
+            return fused
     n = vol.shape[dim]
     ishape = [1] * vol.ndim
     ishape[dim] = n
@@ -2928,21 +2953,16 @@ def _shift3d_axes(
         vol.requires_grad or any(sh.requires_grad for sh in shifts)
     )
     if (
-        shift2d_triton is not None
-        and vol.device.type == "cuda"
+        vol.device.type == "cuda"
         and vol.dtype == torch.float32
         and mode in ("bicubic", "lanczos")
         and not needs_grad
     ):
-        return shift2d_triton(
-            vol,
-            shifts[0],
-            shifts[1],
-            axes[0] + 1,
-            axes[1] + 1,
-            mode,
-            radius,
+        fused = _try_fused(
+            shift2d_triton, vol, shifts[0], shifts[1], axes[0] + 1, axes[1] + 1, mode, radius
         )
+        if fused is not None:
+            return fused
     if mode in ("bicubic", "lanczos"):
         return _shift2d_high_order(
             vol,

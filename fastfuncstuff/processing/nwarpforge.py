@@ -80,9 +80,7 @@ def _sample_fields(
         # are substantially cheaper on CUDA than hiding displacement components
         # behind the portable (C,z,y,x) gather, even though the latter shares its
         # coordinate setup.  CPU/MPS keep that channel-sharing path below.
-        return tuple(
-            _separable_resample_3d(field, xc, yc, zc, interp) for field in fields
-        )
+        return tuple(_separable_resample_3d(field, xc, yc, zc, interp) for field in fields)
     stack = torch.stack(fields, dim=0)
     sampled = _separable_resample_3d(stack, xc, yc, zc, interp)
     return tuple(sampled.unbind(0))

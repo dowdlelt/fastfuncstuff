@@ -2426,6 +2426,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             patch=args.patch,
             stride=args.stride,
             warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             fuse=args.fuse,
             fuse_thresh=args.fuse_thresh,
             fuse_weight=args.fuse_weight,

@@ -37,9 +37,46 @@ def test_fused_matches_portable(monkeypatch, kernel):
     monkeypatch.setenv("FFS_INTERP_NO_TRITON", "1")
     expected = interp._separable_resample_3d(source, x, y, z, kernel)
     monkeypatch.delenv("FFS_INTERP_NO_TRITON")
+
+    # Count the fused calls: the dispatcher has a minimum point count, so a
+    # smaller case here would compare the portable path against itself and pass
+    # while testing nothing.
+    fused = interp.separable_resample_3d_triton
+    calls = []
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return fused(*args, **kwargs)
+
+    monkeypatch.setattr(interp, "separable_resample_3d_triton", counting)
     got = interp._separable_resample_3d(source, x, y, z, kernel)
+
+    assert calls, "the fused path was not taken -- the parity check would be vacuous"
     assert torch.allclose(got, expected, atol=6e-6, rtol=2e-5)
     assert got[0, 0, 0] == 0
+
+
+def test_launch_failure_falls_back_to_portable(monkeypatch):
+    """A GPU that cannot build the kernel must degrade, not abort the run."""
+    source, x, y, z = _case()
+    monkeypatch.setenv("FFS_INTERP_NO_TRITON", "1")
+    expected = interp._separable_resample_3d(source, x, y, z, "cubic")
+    monkeypatch.delenv("FFS_INTERP_NO_TRITON")
+
+    calls = []
+
+    def exploding(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("no PTX for you")
+
+    monkeypatch.setattr(interp, "separable_resample_3d_triton", exploding)
+    monkeypatch.setattr(interp, "_triton_interp_unavailable", False)
+    got = interp._separable_resample_3d(source, x, y, z, "cubic")
+    assert torch.allclose(got, expected, atol=6e-6, rtol=2e-5)
+
+    # Latched: the second call does not pay for another failure.
+    interp._separable_resample_3d(source, x, y, z, "cubic")
+    assert len(calls) == 1
 
 
 def test_coordinate_gradients_keep_portable_path(monkeypatch):

@@ -258,9 +258,7 @@ def apply_spacetime_sample(
             wsum += w
 
     outs = [
-        (acc / wsum.clamp_min(1e-8)).clamp_min(0.0)
-        if no_neg_ch[c]
-        else acc / wsum.clamp_min(1e-8)
+        (acc / wsum.clamp_min(1e-8)).clamp_min(0.0) if no_neg_ch[c] else acc / wsum.clamp_min(1e-8)
         for c, acc in enumerate(accs)
     ]
     return outs if multi else outs[0]

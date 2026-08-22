@@ -1336,11 +1336,6 @@ def bytes_per_voxel_interp_triton(ntaps: int) -> int:
     return (ntaps + 4) * 4
 
 
-def bytes_per_voxel_locomoco_interp(n_active_axes: int) -> int:
-    """Transient float32 storage for fused active-axis interpolation."""
-    return (n_active_axes + 1) * 4  # expanded shift(s) plus output
-
-
 def estimate_chunk_size(
     n_voxels: int,
     n_timepoints: int,

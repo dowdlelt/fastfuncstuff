@@ -88,16 +88,35 @@ def test_autograd_keeps_portable_2d_path(monkeypatch):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fused_launch_chunking_is_exact(monkeypatch):
-    from fastfuncstuff import memory
+@pytest.mark.parametrize("mode", ["bicubic", "lanczos"])
+def test_fused_accepts_a_broadcast_shift_field(mode):
+    """A per-slice shift arrives as a broadcast view, not a full field."""
     from fastfuncstuff.processing.locomoco_interp_triton import shift2d_triton
 
     torch.manual_seed(8)
-    vol = torch.randn(2, 11, 13, device="cuda")
-    v = torch.randn_like(vol) * 0.3
-    u = torch.randn_like(vol) * 0.3
-    reference = shift2d_triton(vol, v, u, 1, 2, "lanczos", 3)
-    # 12 bytes/point gives ~41 points/launch: several non-aligned chunks.
-    monkeypatch.setattr(memory, "get_available_memory", lambda *args, **kwargs: 500)
-    chunked = shift2d_triton(vol, v, u, 1, 2, "lanczos", 3)
-    assert torch.equal(chunked, reference)
+    vol = torch.randn(3, 11, 13, device="cuda")
+    v = torch.randn(3, 1, 1, device="cuda") * 0.3
+    u = torch.randn(3, 1, 1, device="cuda") * 0.3
+    got = shift2d_triton(vol, v, u, 1, 2, mode, 3)
+    expected = shift2d_triton(
+        vol, v.expand_as(vol).contiguous(), u.expand_as(vol).contiguous(), 1, 2, mode, 3
+    )
+    assert torch.equal(got, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_launch_failure_falls_back_to_portable(monkeypatch):
+    """A GPU that cannot build the kernel must degrade, not abort the run."""
+    vol = torch.randn(2, 9, 10, 11, device="cuda")
+    shift = torch.randn_like(vol) * 0.3
+    monkeypatch.setattr(lm, "shift1d_lanczos_triton", None)
+    expected = lm._shift1d_windowed_sinc(vol, shift, 1, radius=3)
+
+    def exploding(*args, **kwargs):
+        raise RuntimeError("no PTX for you")
+
+    monkeypatch.setattr(lm, "shift1d_lanczos_triton", exploding)
+    monkeypatch.setattr(lm, "_fused_shift_unavailable", False)
+    got = lm._shift1d_windowed_sinc(vol, shift, 1, radius=3)
+    assert torch.allclose(got, expected, atol=2e-6, rtol=2e-5)
+    assert lm._fused_shift_unavailable

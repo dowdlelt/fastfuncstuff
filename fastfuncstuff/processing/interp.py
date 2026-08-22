@@ -29,6 +29,17 @@ try:
 except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     separable_resample_3d_triton = None
 
+# Set when a fused launch actually fails on this machine (see _separable_resample_3d).
+_triton_interp_unavailable = False
+
+
+def _set_triton_interp_unavailable(message: str) -> None:
+    """Latch the fused path off for the rest of the process and say so once."""
+    global _triton_interp_unavailable
+    if not _triton_interp_unavailable:
+        _triton_interp_unavailable = True
+        print(f"** {message}")
+
 
 def _grid_sample_3d(
     input: Tensor,
@@ -389,11 +400,7 @@ def warp_image_multi(
         # this multi-channel entry point even when there is only magnitude data;
         # stacking it would hide the fused CUDA kernel behind the channel-batched
         # portable fallback.
-        return [
-            _separable_resample_3d(
-                sources[0], ii + warp_xd, jj + warp_yd, kk + warp_zd, mode
-            )
-        ]
+        return [_separable_resample_3d(sources[0], ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)]
     stack = torch.stack(tuple(sources), dim=0)  # (C, nz, ny, nx)
     out = _separable_resample_3d(stack, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
     return list(out.unbind(0))
@@ -973,15 +980,29 @@ def _separable_resample_3d(
     default_wsinc = kernel_name != "wsinc5" or _wsinc5_params() == (5, 5.001, 0.0, False)
     if (
         separable_resample_3d_triton is not None
+        and not _triton_interp_unavailable
         and source.device.type == "cuda"
         and source.dtype == torch.float32
         and source.dim() == 3
         and x_coords.numel() >= 65536
         and not needs_grad
         and default_wsinc
+        and not _already_compiling()
         and os.environ.get("FFS_INTERP_NO_TRITON") != "1"
     ):
-        return separable_resample_3d_triton(source, x_coords, y_coords, z_coords, kernel_name)
+        try:
+            return separable_resample_3d_triton(source, x_coords, y_coords, z_coords, kernel_name)
+        except AssertionError:
+            raise  # a failed assertion is a bug here, not a missing GPU capability
+        except Exception as exc:  # pragma: no cover - needs a Triton-hostile GPU
+            # A driver or architecture that cannot build the kernel must degrade
+            # to the portable gather, not abort a run mid-series. Latch it off so
+            # the failure costs one attempt, not one per frame. Safe to mutate the
+            # global here: the gate above keeps us out of any dynamo trace.
+            _set_triton_interp_unavailable(
+                f"fused CUDA interpolation unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to the portable resampler"
+            )
 
     kernel_fn, _, use_floor = _KERNELS[kernel_name]
     H = _kernel_half_width(kernel_name)  # wsinc5 honors AFNI_WSINC5_RADIUS

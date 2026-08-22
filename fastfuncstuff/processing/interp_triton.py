@@ -84,9 +84,12 @@ def _resample_kernel(
     nz: tl.constexpr,
     MODE: tl.constexpr,
     H: tl.constexpr,
+    IDX: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    # IDX is int32 for every real grid and int64 only past 2**31 points, which
+    # the host picks per launch: int64 addressing measured ~2.7x slower here.
+    p = tl.program_id(0).to(IDX) * BLOCK + tl.arange(0, BLOCK).to(IDX)
     pmask = p < n_points
     x = tl.load(xp + p, mask=pmask, other=-1.0)
     y = tl.load(yp + p, mask=pmask, other=-1.0)
@@ -105,29 +108,28 @@ def _resample_kernel(
     zb = tl.floor(z).to(tl.int32)
     fx, fy, fz = x - xb, y - yb, z - zb
 
-    # AFNI wsinc5 normalizes each axis. Polynomial kernels already sum to one.
-    sx = tl.zeros([BLOCK], tl.float32)
-    sy = tl.zeros([BLOCK], tl.float32)
-    sz = tl.zeros([BLOCK], tl.float32)
-    for k in tl.static_range(-(H - 1), H + 1):
-        sx += _weight(fx, k, MODE)
-        sy += _weight(fy, k, MODE)
-        sz += _weight(fz, k, MODE)
-    norm = tl.where(
-        MODE == 72,
-        1.0 / (tl.maximum(sx, 1.0e-10) * tl.maximum(sy, 1.0e-10) * tl.maximum(sz, 1.0e-10)),
-        1.0,
-    )
+    # AFNI wsinc5 normalizes each axis; the polynomial kernels already sum to
+    # one, so the accumulation is skipped for them at compile time.
+    norm = tl.full([BLOCK], 1.0, tl.float32)
+    if MODE == 72:
+        sx = tl.zeros([BLOCK], tl.float32)
+        sy = tl.zeros([BLOCK], tl.float32)
+        sz = tl.zeros([BLOCK], tl.float32)
+        for k in tl.static_range(-(H - 1), H + 1):
+            sx += _weight(fx, k, MODE)
+            sy += _weight(fy, k, MODE)
+            sz += _weight(fz, k, MODE)
+        norm = 1.0 / (tl.maximum(sx, 1.0e-10) * tl.maximum(sy, 1.0e-10) * tl.maximum(sz, 1.0e-10))
 
     acc = tl.zeros([BLOCK], tl.float32)
     for kz in tl.static_range(-(H - 1), H + 1):
-        iz = tl.minimum(tl.maximum(zb + kz, 0), nz - 1)
+        iz = tl.minimum(tl.maximum(zb + kz, 0), nz - 1).to(IDX)
         wz = _weight(fz, kz, MODE)
         for ky in tl.static_range(-(H - 1), H + 1):
-            iy = tl.minimum(tl.maximum(yb + ky, 0), ny - 1)
+            iy = tl.minimum(tl.maximum(yb + ky, 0), ny - 1).to(IDX)
             wyz = _weight(fy, ky, MODE) * wz
             for kx in tl.static_range(-(H - 1), H + 1):
-                ix = tl.minimum(tl.maximum(xb + kx, 0), nx - 1)
+                ix = tl.minimum(tl.maximum(xb + kx, 0), nx - 1).to(IDX)
                 val = tl.load(source + (iz * ny + iy) * nx + ix, mask=inside, other=0.0)
                 acc += val * _weight(fx, kx, MODE) * wyz
     tl.store(out + p, acc * norm, mask=pmask)
@@ -148,7 +150,11 @@ def _resample_xy_kernel(
     H: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Contract X/Y for one Z tap per program-row."""
+    """Contract X/Y for one Z tap per program-row.
+
+    Indices stay int32: the caller caps the chunk so ``ntaps * n_points`` -- which
+    reaches 2**31 an order of magnitude sooner than ``n_points`` alone -- fits.
+    """
     p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     kt = tl.program_id(1)
     kz = kt - (H - 1)
@@ -220,12 +226,13 @@ def separable_resample_3d_triton(
 
     out_shape = x.shape
     x, y, z = (v.reshape(-1).contiguous() for v in (x, y, z))
+    src = source.contiguous()  # hoisted: a non-contiguous source would copy per chunk
     out = torch.empty(x.numel(), dtype=source.dtype, device=source.device)
     h = {"cubic": 2, "quintic": 3, "heptic": 4, "wsinc5": 5}[kernel]
     block = 128
     if kernel in ("cubic", "quintic"):
         _resample_kernel[(triton.cdiv(x.numel(), block),)](
-            source.contiguous(),
+            src,
             x,
             y,
             z,
@@ -236,19 +243,23 @@ def separable_resample_3d_triton(
             source.shape[0],
             MODE=_MODE_ID[kernel],
             H=h,
+            IDX=tl.int64 if x.numel() >= 2**31 else tl.int32,
             BLOCK=block,
         )
     else:
         ntaps = 2 * h
         avail = get_available_memory(source.device, empty_cache=False)
         per_point = bytes_per_voxel_interp_triton(ntaps)
-        chunk = max(1, min(x.numel(), int(avail // per_point)))
+        # Second cap: the staged kernels address the plane buffer as
+        # ``tap * n_points + p`` in int32, which overflows before the memory does
+        # on a large card.
+        chunk = max(1, min(x.numel(), int(avail // per_point), (2**31 - 1) // ntaps))
         for start in range(0, x.numel(), chunk):
             end = min(start + chunk, x.numel())
             xc, yc, zc = x[start:end], y[start:end], z[start:end]
             planes = torch.empty((ntaps, end - start), dtype=source.dtype, device=source.device)
             _resample_xy_kernel[(triton.cdiv(end - start, block), ntaps)](
-                source.contiguous(),
+                src,
                 xc,
                 yc,
                 zc,
