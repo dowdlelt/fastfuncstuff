@@ -33,7 +33,7 @@ from .allineate import _voxdims_from_header
 from .io import load_image, save_image
 from .mask import automask
 from .metrics import MetricInputs, evaluate_metrics
-from .tuneopt import Observation, SearchSpace, config_key, propose
+from .tuneopt import Observation, SearchSpace, config_key, propose, scalarize_balanced
 from .tunespec import (
     BACKENDS,
     QWARP_TUNE_OPTIMIZER,
@@ -547,27 +547,41 @@ def _observations(store: TrialStore, backend: str, panel: list[str]) -> list[Obs
     trials = [t for t in store.trials if t.backend == backend]
     scores = panel_scores(trials, panel)
     return [
-        Observation(config=t.config, score=scores[t.trial_id], margin=t.margin)
+        Observation(
+            config=t.config,
+            score=scores[t.trial_id],
+            margin=t.margin,
+            roughness=float(t.warpqc.get("bending_energy", 0.0)),
+        )
         for t in trials
         if t.trial_id in scores
     ]
 
 
 def _incumbent(observations: list[Observation]) -> dict | None:
-    """Best config so far: feasible ones first, then by mean score."""
+    """Best config so far: feasible ones first, then by the balanced frontier trade.
+
+    Which config this is decides where the ladders grow and subdivide, so ranking
+    it on similarity alone does not merely mis-report a winner -- it aims the *next*
+    batch. On a 7T epi2epi run the similarity-best config was the roughest one in
+    the study, so every expansion pushed the regularization ladders further toward
+    zero, and the search spent its budget refining the corner it should have been
+    backing out of. Scoring the incumbent at an even similarity/roughness weight
+    keeps the ladders centred on the trade rather than on one end of it.
+    """
     if not observations:
         return None
-    agg: dict[tuple, list[Observation]] = {}
-    for o in observations:
-        agg.setdefault(config_key(o.config), []).append(o)
-    ranked = sorted(
-        agg.values(),
-        key=lambda os: (
-            0 if min(o.margin for o in os) > 0 else 1,
-            statistics.fmean([o.score for o in os]),
-        ),
-    )
-    return ranked[0][0].config
+    balanced = scalarize_balanced(observations)
+    agg: dict[tuple, list[float]] = {}
+    feasible: dict[tuple, bool] = {}
+    configs: dict[tuple, dict] = {}
+    for o, v in zip(observations, balanced, strict=True):
+        k = config_key(o.config)
+        agg.setdefault(k, []).append(v)
+        feasible[k] = feasible.get(k, True) and o.margin > 0
+        configs[k] = o.config
+    best = min(agg, key=lambda k: (0 if feasible[k] else 1, statistics.fmean(agg[k])))
+    return configs[best]
 
 
 def run_adaptive(

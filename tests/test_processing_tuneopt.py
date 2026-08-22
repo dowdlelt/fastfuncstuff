@@ -20,6 +20,8 @@ from fastfuncstuff.processing.tuneopt import (
     Axis,
     Observation,
     SearchSpace,
+    _scalarize,
+    _weighted,
     config_key,
     propose,
 )
@@ -563,6 +565,8 @@ class TestCliHelpFormatting:
         except SystemExit:
             parser_text = "rendered"
         assert parser_text == "rendered"
+
+
 # --- the dead zone just above zero ------------------------------------------
 #
 # Bugs of record, all three from one 7T epi2epi run (2026-08-22).
@@ -619,3 +623,71 @@ def test_gauss_kernel_dead_zone_is_real():
     assert not torch.allclose(_gauss_kernel_1d(GAUSS_SIGMA_RESOLUTION, dev), identity)
 
 
+# --- chasing the frontier rather than the score -----------------------------
+
+
+def _frontier_space():
+    """One knob: raising it smooths the field and costs a little similarity."""
+    return SearchSpace.from_params([_param("reg", (0.0, 0.25, 0.5, 1.0, 2.0, 4.0))])
+
+
+def _frontier_obs(reg: float) -> Observation:
+    """A response surface with the shape the 7T epi2epi run actually had.
+
+    Similarity improves monotonically as regularization drops -- that is the whole
+    problem -- while roughness explodes at the bottom end. Nothing folds, so the
+    feasibility GP has nothing to say and only the objective can steer.
+    """
+    return Observation(
+        config={"reg": reg},
+        score=reg,  # lower reg = better similarity
+        margin=1.0,  # never folds; the gate cannot save us here
+        roughness=10.0 / (reg + 0.05),  # ... but the field comes apart down there
+    )
+
+
+def test_similarity_only_target_walks_into_the_rough_corner():
+    """The behaviour being fixed, pinned so it cannot come back unnoticed."""
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    stripped = [Observation(o.config, o.score, o.margin) for o in obs]  # no roughness
+    rng = np.random.default_rng(0)
+    target = _scalarize(stripped, rng)
+    # With nothing to trade against, the target IS the score: monotone in reg.
+    assert list(np.argsort(target)) == list(np.argsort([o.score for o in stripped]))
+
+
+def test_roughness_pulls_the_target_off_the_rough_end():
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    # At a weight that cares about roughness at all, the similarity-best config
+    # (reg=0, the roughest) must no longer be the best target.
+    best_at = []
+    for w in (0.1, 0.3, 0.5, 0.7):
+        t = _weighted(obs, w)
+        best_at.append(obs[int(np.argmin(t))].config["reg"])
+    assert all(r > 0.0 for r in best_at), best_at
+
+
+def test_random_weights_sweep_the_frontier():
+    """One batch chases one point on the trade; the run as a whole covers it."""
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    rng = np.random.default_rng(3)
+    winners = {obs[int(np.argmin(_scalarize(obs, rng)))].config["reg"] for _ in range(60)}
+    assert len(winners) >= 3, winners
+
+
+def test_incumbent_is_not_the_roughest_config():
+    """The incumbent aims ladder growth, so ranking it on similarity aims it wrong."""
+    from fastfuncstuff.processing.tunewarp import _incumbent
+
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    inc = _incumbent(obs)
+    assert inc is not None and inc["reg"] > 0.0, inc
+
+
+def test_infeasible_never_wins_the_incumbent():
+    """Folding still trumps the trade: a folded config cannot be the incumbent."""
+    from fastfuncstuff.processing.tunewarp import _incumbent
+
+    obs = [_frontier_obs(r) for r in (0.25, 0.5, 1.0)]
+    obs.append(Observation({"reg": 99.0}, score=-100.0, margin=-1.0, roughness=0.0))
+    assert _incumbent(obs) != {"reg": 99.0}

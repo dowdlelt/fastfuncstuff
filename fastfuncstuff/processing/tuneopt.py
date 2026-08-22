@@ -398,6 +398,7 @@ class Observation:
     config: dict
     score: float  # lower is better
     margin: float  # > 0 is a passing warp, per warpqc.regularity_margin
+    roughness: float = 0.0  # bending energy of the field; lower is better
 
 
 def propose(
@@ -413,6 +414,25 @@ def propose(
     Below ``min_fit`` observations there is nothing to fit, so the batch is
     space-filling instead — maximin over the lattice, which is the honest thing
     to do when the surrogate would just be interpolating noise.
+
+    **The target is the frontier, not the score.** Fitting the GP to similarity
+    alone asks the surrogate to find the settings that fit hardest, and it obliges:
+    on a 7T epi2epi run the search walked to no smoothing and a two-sample stopping
+    window, which is a demons solver taking three enormous unregularised steps and
+    memorising thermal noise. The metric it was handed rewarded that, so the search
+    was not malfunctioning -- it was being asked the wrong question.
+
+    So each batch scalarises the two objectives -- similarity and field roughness --
+    under a *randomly drawn* weight (Knowles' ParEGO). One batch chases one point on
+    the accuracy/smoothness trade; successive batches sweep the weight and populate
+    the whole frontier. This is deliberately not a fixed penalty: a penalty needs a
+    constant nobody can defend and commits the whole run to one point on a curve
+    whose interesting property is its *shape* -- the flat stretch where roughness
+    grows 20x for a hundredth of similarity is the finding, and you only see it by
+    having candidates along the length of it.
+
+    Roughness enters as log1p: bending energy is heavy-tailed, and on raw values a
+    single warp that came apart sets the normalising scale for every other config.
     """
     tried = {config_key(o.config) for o in observations}
     pool = [c for c in space.lattice(cap=cap, rng=rng) if config_key(c) not in tried]
@@ -425,7 +445,8 @@ def propose(
         return [pool[i] for i in _maximin(xc, n, rng, seed=seed)]
 
     xo = space.encode([o.config for o in observations])
-    score_gp = GP.fit(xo, np.array([o.score for o in observations]))
+    target = _scalarize(observations, rng)
+    score_gp = GP.fit(xo, target)
     mu, sd = score_gp.predict(xc)
 
     # Feasibility is a *separate* surface with its own geometry, so it gets its
@@ -439,12 +460,63 @@ def propose(
         m_mu, m_sd = GP.fit(xo, margins).predict(xc)
         p_feasible = _norm_cdf(m_mu / np.clip(m_sd, 1e-6, None))
 
-    feasible_scores = [o.score for o in observations if o.margin > 0]
-    best = (
-        min(feasible_scores) if feasible_scores else float(np.min([o.score for o in observations]))
-    )
+    # The improvement reference has to be on the same scale the GP was fitted to,
+    # so it comes from the scalarised target rather than the raw score.
+    feasible = [t for t, o in zip(target, observations, strict=True) if o.margin > 0]
+    best = float(min(feasible)) if feasible else float(np.min(target))
     acq = _expected_improvement(mu, sd, best) * p_feasible
     return [pool[i] for i in _greedy_batch(acq, xc, n)]
+
+
+# Chebyshev scalarisation keeps a candidate honest on its *worst* objective, which
+# is what makes it reach the concave parts of a frontier that a weighted sum skips
+# over entirely. The small linear term breaks ties between points the max cannot
+# distinguish, and is why the augmented form is the one everybody uses.
+CHEBYSHEV_RHO = 0.05
+
+
+def _unit(values: np.ndarray) -> np.ndarray:
+    """Rescale to [0, 1]. A constant objective becomes all-zero: it cannot discriminate."""
+    lo, hi = float(values.min()), float(values.max())
+    return (values - lo) / (hi - lo) if hi > lo else np.zeros_like(values)
+
+
+def scalarize_weight(rng: np.random.Generator) -> float:
+    """Draw one batch's similarity/roughness weight. 1.0 is pure similarity."""
+    return float(rng.uniform())
+
+
+def scalarize_balanced(observations: list[Observation]) -> np.ndarray:
+    """The scalarisation at an even weight — for judging, not for proposing.
+
+    ``propose`` draws its weight at random precisely so that the *search* does not
+    commit to one point on the frontier. Anything that has to name a single best
+    config so far (which is what steers ladder growth) needs the opposite: a fixed,
+    reproducible weight, so the answer does not move because the RNG advanced.
+    """
+    return _weighted(observations, 0.5)
+
+
+def _scalarize(observations: list[Observation], rng: np.random.Generator) -> np.ndarray:
+    """Fold (similarity, roughness) into the one number the GP regresses on.
+
+    See :func:`propose` for why the weight is random rather than chosen.
+    """
+    score = _unit(np.array([o.score for o in observations], dtype=float))
+    rough = _unit(np.log1p(np.array([max(o.roughness, 0.0) for o in observations], dtype=float)))
+    if not rough.any():
+        return score  # no roughness recorded (or all identical); nothing to trade against
+    return _weighted(observations, scalarize_weight(rng))
+
+
+def _weighted(observations: list[Observation], w: float) -> np.ndarray:
+    """Augmented Chebyshev over (similarity, roughness) at weight ``w``."""
+    score = _unit(np.array([o.score for o in observations], dtype=float))
+    rough = _unit(np.log1p(np.array([max(o.roughness, 0.0) for o in observations], dtype=float)))
+    if not rough.any():
+        return score
+    a, b = w * score, (1.0 - w) * rough
+    return np.maximum(a, b) + CHEBYSHEV_RHO * (a + b)
 
 
 def _expected_improvement(mu: np.ndarray, sd: np.ndarray, best: float) -> np.ndarray:
