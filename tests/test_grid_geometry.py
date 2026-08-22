@@ -20,6 +20,7 @@ from fastfuncstuff.processing.grid import (
     as_index_map,
     crop_affine,
     grid_extent_rai,
+    looks_like_label_data,
     reorient_grid,
     resample_grid,
     resample_to_grid,
@@ -44,7 +45,21 @@ _LPS = np.array([-1.0, -1.0, 1.0])
 
 def test_resample_defaults_to_high_fidelity_and_labels_remain_explicit():
     args = parse_resample_args(["-input", "in.nii", "-prefix", "out.nii"])
-    assert args.rmode == "wsinc5"
+    assert args.rmode is None  # resolved from the data, once it is loaded
+    assert parse_resample_args(["-input", "i", "-prefix", "o", "-rmode", "NN"]).rmode == "NN"
+
+
+def test_label_heuristic_separates_atlases_from_images():
+    torch.manual_seed(11)
+    atlas = torch.randint(0, 90, (12, 13, 14)).float()
+    assert looks_like_label_data(atlas)
+    # An int16-valued anatomical is integral too; the distinct-value count is
+    # what keeps it off the nearest-neighbour path.
+    anat = torch.randint(0, 4000, (12, 13, 14)).float()
+    assert not looks_like_label_data(anat)
+    assert not looks_like_label_data(torch.randn(12, 13, 14))
+    # A binary mask is labels; so is an empty volume of one value.
+    assert looks_like_label_data((torch.randn(12, 13, 14) > 0).float())
 
 
 def test_single_volume_high_order_resample_stays_3d(monkeypatch):

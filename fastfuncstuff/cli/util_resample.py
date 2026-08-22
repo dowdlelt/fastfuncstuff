@@ -30,6 +30,7 @@ from fastfuncstuff.processing.grid import (
     BOUND_TYPES,
     RMODES,
     afni_orient_code,
+    looks_like_label_data,
     reorient_grid,
     resample_grid,
     resample_to_grid,
@@ -72,12 +73,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "-rmode",
-        default="wsinc5",
+        default=None,
         metavar="RESAM",
         help="Interpolation: NN, Li, Cu, Bk (3dresample's set) or quintic, "
-        "heptic, wsinc5 (sharper, ours). Default wsinc5; pass NN for atlas/label "
-        "data. Ignored when the grids differ only by axis order or whole voxels — "
-        "that path is exact.",
+        "heptic, wsinc5 (sharper, ours). Default wsinc5, except that label-like "
+        "input (integral, few distinct values) falls back to NN unless you name a "
+        "mode yourself. Ignored when the grids differ only by axis order or whole "
+        "voxels — that path is exact.",
     )
     parser.add_argument(
         "-bound_type",
@@ -156,13 +158,30 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(
             f"** illegal bound_type '{args.bound_type}'; choose from {sorted(BOUND_TYPES)}"
         )
-    interp = RMODES.get(args.rmode.lower())
-    if interp is None:
-        raise SystemExit(f"** invalid resample mode <{args.rmode}>")
+    if args.rmode is not None:
+        interp = RMODES.get(args.rmode.lower())
+        if interp is None:
+            raise SystemExit(f"** invalid resample mode <{args.rmode}>")
+    else:
+        interp = None  # resolved once the data is loaded (see below)
 
     t0 = time.time()
     with spinner(f"Loading {Path(args.input).name}"):
         vol, header = load_image(args.input, device=device)
+    if interp is None:
+        # wsinc5 is the right default for images and the wrong one for atlases.
+        # The user never sees a label map ring -- it just quietly acquires values
+        # that name no region -- so pick NN for them and say so out loud.
+        if looks_like_label_data(vol):
+            interp = "nearest"
+            if verb >= 1:
+                print(
+                    "++ input looks like labels (integral, few distinct values): "
+                    "using -rmode NN. Pass -rmode wsinc5 to override."
+                )
+        else:
+            interp = "wsinc5"
+
     src_affine = header["affine"]
     src_shape = tuple(vol.shape[-3:])
     src_vox = np.linalg.norm(src_affine[:3, :3], axis=0)

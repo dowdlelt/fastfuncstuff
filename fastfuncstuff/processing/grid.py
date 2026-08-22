@@ -60,6 +60,38 @@ RMODES = {
 }
 
 
+def looks_like_label_data(vol, max_labels: int = 256, sample_cap: int = 2_000_000) -> bool:
+    """True when a volume is plausibly an atlas / label / mask dataset.
+
+    Interpolating labels with a smooth kernel invents values that never existed
+    (label 3 between labels 2 and 4), and the damage is invisible in a viewer, so
+    a high-fidelity *default* has to recognise this case. Integrality alone is not
+    enough -- plenty of real EPI and anatomicals are stored as int16 -- so we also
+    require a small number of distinct values, which separates a 100-region atlas
+    from a 4000-grey-level image.
+
+    Args:
+        vol: (..., nz, ny, nx) tensor of voxel values.
+        max_labels: distinct-value ceiling that still counts as labels.
+        sample_cap: stop the unique() from sorting an entire 4-D series.
+
+    Returns:
+        Whether the data looks like labels rather than a continuous image.
+    """
+    import torch
+
+    flat = vol.reshape(-1)
+    if flat.numel() > sample_cap:
+        flat = flat[:: flat.numel() // sample_cap + 1]
+    if flat.numel() == 0:
+        return False
+    if not torch.is_floating_point(flat):
+        flat = flat.float()
+    if not bool(torch.isfinite(flat).all()) or not bool((flat == flat.round()).all()):
+        return False
+    return int(torch.unique(flat).numel()) <= max_labels
+
+
 # ---------------------------------------------------------------------------
 # Orientation
 # ---------------------------------------------------------------------------
