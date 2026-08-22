@@ -563,3 +563,59 @@ class TestCliHelpFormatting:
         except SystemExit:
             parser_text = "rendered"
         assert parser_text == "rendered"
+# --- the dead zone just above zero ------------------------------------------
+#
+# Bugs of record, all three from one 7T epi2epi run (2026-08-22).
+
+
+def test_refine_does_not_bisect_toward_zero_forever():
+    """An interval touching zero used to be immune to the relative-step guard.
+
+    With lo == 0, ``hi - lo`` *equals* ``max(|hi|, |lo|)``, so the test
+    ``(hi - lo) <= MIN_RELATIVE_STEP * scale`` could never fire and the ladder
+    subdivided [0, 0.5] down to 0.0078 -- fifteen fits into a region where the
+    knob computes the same answer as 0.
+    """
+    axis = Axis.from_param(_param("total_sigma", (0.0, 0.5, 1.0, 2.0)))
+    for _ in range(30):
+        axis.refine(0.0)
+        axis.refine(min(v for v in axis.values if v > 0))
+    positives = [v for v in axis.values if v > 0]
+    assert min(positives) >= 0.1, axis.values
+
+
+def test_gaussian_sigma_axis_refuses_its_dead_zone():
+    """Below ParamSpec.resolution a sigma is bit-identical to zero, so never propose one."""
+    p = ParamSpec(
+        "fake.total_sigma",
+        "-total_sigma",
+        (0.0, 0.5, 1.0, 2.0),
+        1.0,
+        "regularization",
+        resolution=0.25,
+    )
+    axis = Axis.from_param(p)
+    for _ in range(30):
+        for v in list(axis.values):
+            axis.refine(v)
+        axis.grow(-1)
+    assert not any(0.0 < v < 0.25 for v in axis.values), axis.values
+    # 0.0 itself is still a legal, meaningful setting -- this is a dead zone, not a bound.
+    assert 0.0 in axis.values
+
+
+def test_gauss_kernel_dead_zone_is_real():
+    """The premise of the two tests above, measured rather than asserted."""
+    import torch
+
+    from fastfuncstuff.processing.cost import _gauss_kernel_1d
+    from fastfuncstuff.processing.tunespec import GAUSS_SIGMA_RESOLUTION
+
+    dev = torch.device("cpu")
+    identity = torch.tensor([0.0, 1.0, 0.0])
+    assert torch.allclose(_gauss_kernel_1d(0.0078125, dev), identity)
+    assert torch.allclose(_gauss_kernel_1d(0.146447, dev), identity)
+    # ... and the resolution we picked is the first sigma that actually convolves.
+    assert not torch.allclose(_gauss_kernel_1d(GAUSS_SIGMA_RESOLUTION, dev), identity)
+
+

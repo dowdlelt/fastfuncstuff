@@ -64,6 +64,10 @@ class Axis:
     lo: float | None = None  # hard bound; regularization cannot go below zero
     hi: float | None = None
     max_values: int = 20  # ladders stop subdividing before the lattice explodes
+    # Smallest magnitude the backend can act on, from ParamSpec.resolution. Zero
+    # stays legal; the open interval (0, resolution) does not, because a value in
+    # there computes the same answer as 0 while costing a fit to discover it.
+    resolution: float | None = None
 
     @classmethod
     def from_param(cls, p: ParamSpec) -> Axis:
@@ -77,7 +81,11 @@ class Axis:
             # ladder should walk past into nonsense.
             if lo is None and min(vals) >= 0:
                 lo = 0.0
-        return cls(key=p.key, values=vals, numeric=numeric, lo=lo, hi=hi)
+        return cls(key=p.key, values=vals, numeric=numeric, lo=lo, hi=hi, resolution=p.resolution)
+
+    def _inert(self, value: float) -> bool:
+        """True if ``value`` is inside the axis's dead zone just above zero."""
+        return self.resolution is not None and 0.0 < abs(value) < self.resolution
 
     def grow(self, direction: int) -> bool:
         """Extend the ladder one step down (-1) or up (+1). True if it changed.
@@ -103,6 +111,8 @@ class Axis:
                 nxt = min(nxt, self.hi)
 
         nxt = round(float(nxt), 6)
+        if self._inert(nxt):
+            nxt = 0.0  # the dead zone collapses onto the value it is identical to
         if any(abs(nxt - x) < 1e-9 for x in v):
             return False  # already there, or clamped onto the bound
         if all(_is_numeric(x) and float(x).is_integer() for x in v):
@@ -145,16 +155,24 @@ class Axis:
         # and 2.0) was intended.
         neighbours = [float(self.values[j]) for j in (i - 1, i + 1) if 0 <= j < len(self.values)]
         centre = float(self.values[i])
+        # An interval that touches zero cannot be judged against its own endpoints:
+        # with lo == 0, `hi - lo` *equals* max(|hi|, |lo|), so a relative test can
+        # never fire and the interval bisects toward zero forever. The scale that
+        # means something there is the ladder's own span -- the knob's resolution is
+        # set by its dynamic range, not by how near zero you happen to have wandered.
+        span = abs(float(self.values[-1]) - float(self.values[0]))
         added = False
         for other in neighbours:
             lo, hi = sorted((centre, other))
             if integral and hi - lo <= 1:
                 continue  # no integer sits between them
-            scale = max(abs(hi), abs(lo))
+            scale = span if lo == 0.0 else max(abs(hi), abs(lo))
             if scale > 0 and (hi - lo) <= MIN_RELATIVE_STEP * scale:
                 continue  # finer than a single fit can resolve
             mid = math.sqrt(lo * hi) if lo > 0 and hi / lo >= 1.8 else 0.5 * (lo + hi)
             mid = int(round(mid)) if integral else round(mid, 6)
+            if self._inert(mid):
+                continue  # computes the same answer as 0.0; not worth a fit
             if any(abs(float(mid) - float(x)) < 1e-9 for x in self.values):
                 continue
             self.values = sorted([*self.values, mid])

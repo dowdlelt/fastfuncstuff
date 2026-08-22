@@ -29,6 +29,13 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 
+# Below this sigma a discrete Gaussian kernel degenerates: `cost._gauss_kernel_1d`
+# floors its radius at 1 voxel, and at sigma <= ~0.15 both wings underflow to zero,
+# leaving [0, 1, 0] -- an identity convolution. 0.25 is the first sigma whose wings
+# survive in float32, so it is the smallest value that is *not* just a slow no-op.
+GAUSS_SIGMA_RESOLUTION = 0.25
+
+
 @dataclass(frozen=True)
 class ParamSpec:
     """One tunable knob on one backend.
@@ -57,6 +64,18 @@ class ParamSpec:
     # below minpatch 5 an 8-voxel patch carries 24 cubic parameters, so the fit is
     # underdetermined and "passes" only because the box constraint bounds it.
     bounds: tuple[float | None, float | None] = (None, None)
+    # Smallest magnitude that is distinguishable from zero for this knob. Not a
+    # bound -- 0.0 itself stays legal -- but the search may not propose a value in
+    # the open interval (0, resolution), because the backend cannot act on one.
+    #
+    # Bug of record: every Gaussian-sigma knob has such a zone. `_gauss_kernel_1d`
+    # floors its radius at 1 voxel, so for sigma <= ~0.15 both wings underflow and
+    # the kernel is exactly [0, 1, 0] -- bit-identical to sigma=0, at the price of
+    # a conv3d. On a 7T epi2epi run the adaptive search bisected [0, 0.5] down to
+    # 0.0078 and spent ~15 fits there; `-effects` then reported total_sigma=0.0078
+    # as the best level with "100% of subjects agree", which was the other knobs'
+    # effect wearing a dead knob's name.
+    resolution: float | None = None
 
     @property
     def config_attr(self) -> str:
@@ -177,6 +196,7 @@ FORMWARP = BackendSpec(
             0.0,
             "regularization",
             "Elastic (total-field) smoothing. Off by default, per ANTs.",
+            resolution=GAUSS_SIGMA_RESOLUTION,
         ),
         ParamSpec(
             "formwarp.update_var",
@@ -185,6 +205,7 @@ FORMWARP = BackendSpec(
             3.0,
             "regularization",
             "Fluid (update-field) smoothing.",
+            resolution=GAUSS_SIGMA_RESOLUTION,
         ),
         ParamSpec(
             "formwarp.grad_step",
@@ -245,6 +266,7 @@ _OW_SHARED = (
         "Elastic (total-field) smoothing. On T1->MNI, 0.0 and 0.5 fold on every "
         "subject and 1.0 is the lowest that does not -- i.e. the default is "
         "already the best legal value, and lower merely scores better by folding.",
+        resolution=GAUSS_SIGMA_RESOLUTION,
     ),
     ParamSpec(
         "optiwarp.update_sigma",
@@ -253,6 +275,7 @@ _OW_SHARED = (
         1.0,
         "regularization",
         "Fluid (update-field) smoothing.",
+        resolution=GAUSS_SIGMA_RESOLUTION,
     ),
     ParamSpec(
         "optiwarp.match",
