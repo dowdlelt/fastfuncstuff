@@ -10,8 +10,8 @@ from fastfuncstuff.processing.affine import (
     params_to_matrix_batched,
 )
 from fastfuncstuff.processing.cost import _separable_smooth_3d
-from fastfuncstuff.processing.ffs_moco import compute_derivative_images
-from fastfuncstuff.processing.moco_reweight import compute_reweight
+from fastfuncstuff.processing.ffs_moco import MocoConfig, compute_derivative_images
+from fastfuncstuff.processing.moco_reweight import compute_residual_reweight, compute_reweight
 from fastfuncstuff.processing.weight import compute_weight_image
 
 DEVICE = torch.device("cpu")
@@ -156,3 +156,43 @@ def test_reweight_low_motion_guard():
 
     assert not res.applied
     assert torch.equal(res.weight.cpu(), weight0.cpu())
+
+
+def test_residual_reweight_softly_penalizes_discordant_region():
+    shape = (20, 32, 32)
+    base = _structured_base(shape, seed=8).to(DEVICE)
+    weight0 = compute_weight_image(base).to(DEVICE)
+    artifact = (slice(3, 17), slice(3, 16), slice(3, 16))
+    series, motions = _make_series(base, nt=24, artifact_region=artifact)
+
+    res = compute_residual_reweight(
+        base,
+        series,
+        weight0,
+        _global_matrices(motions),
+        config=MocoConfig(
+            base_index=0,
+            final_interp="cubic",
+            use_shear=False,
+            device="cpu",
+            verb=0,
+        ),
+        voxdims=(1.0, 1.0, 1.0),
+        smooth_fwhm=3.0,
+        device=DEVICE,
+        verb=0,
+    )
+
+    assert res.applied
+    multiplier = res.weight / weight0.clamp(min=1e-20)
+    art_mask = torch.zeros(shape, dtype=torch.bool)
+    art_mask[artifact] = True
+    far_mask = torch.zeros(shape, dtype=torch.bool)
+    far_mask[10:18, 20:30, 20:30] = True
+    art = multiplier[art_mask & (weight0 > 0)]
+    far = multiplier[far_mask & (weight0 > 0)]
+
+    assert 0.1 <= float(art.median()) < 1.0
+    assert float(art.median()) + 0.2 < float(far.median())
+    assert torch.all(res.weight <= weight0 + 1e-6)
+    assert torch.any((res.weight > 0) & (res.weight < weight0))

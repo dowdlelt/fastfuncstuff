@@ -1,32 +1,9 @@
-"""Data-driven weight refinement for ffs_moco (``-reweight``).
+"""Data-driven weight refinement for ``ffs_moco -reweight``.
 
-A pre-pass, conceptually like ``-twopass``: instead of trusting every bright
-voxel in the registration weight, it *looks at the data* to learn which regions
-move consistently with the head and drops the rest (bright artifacts, vessels,
-ghosts that pull the rigid fit without tracking real motion).
-
-The base is tiled into space-filling **bloks** (the same lattice ffs uses for
-LPC/LPA, ``cost_blok.assign_bloks``). The agreement test is built on one fact
-about small patches: a ~5-voxel-radius blok **cannot observe rotation** — over
-such a small region a rotation's displacement field is nearly constant, so it is
-collinear with a translation and the optimizer can't separate them. A small
-patch *can* reliably estimate its **local displacement** (a 3-DOF translation:
-"my content moved by this much"). So we:
-
-1. Estimate the **global** 6-DOF rigid motion per TR (the whole brain has ample
-   leverage to see rotation — this is well posed). This is the consensus.
-2. Estimate each patch's **3-DOF local displacement** per TR (well posed).
-3. For each patch, predict the displacement the *global* motion implies **at that
-   patch's location** (``M_global @ x_patch - x_patch``) — this bakes in the
-   location-dependent rotation, so good patches on opposite sides of the head are
-   both expected to move as observed, not flagged for moving oppositely.
-4. Detrend (Legendre polort) and correlate measured-vs-predicted displacement per
-   axis. A patch that agrees on enough axes is kept; one that is uncorrelated or
-   anti-correlated (moves against what the head is doing) is zeroed out.
-
-The per-patch rigid parametrisation and coordinate origin match the whole-image
-pass, so the global estimate here is directly comparable to the main estimation.
-This is ffs_moco-only and rigid; it does not touch ffs_allineate.
+The active method runs a preliminary whole-head fit, compares spatially smoothed
+residual energy before and after alignment, and softly downweights regions that
+improve less than the brain-wide trend. The older patch-motion experiment is
+retained below as a characterization reference, but is not exposed by the CLI.
 """
 
 from __future__ import annotations
@@ -43,6 +20,7 @@ from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.utils import linalg_device, warn_mps_float32_precision
 
 from .affine import _build_homo_coords, identity_params, params_to_matrix_batched
+from .cost import _separable_smooth_3d
 from .cost_blok import assign_bloks
 from .interp import _separable_resample_3d
 
@@ -61,6 +39,145 @@ class ReweightResult:
     n_kept: int
     n_patches: int
     applied: bool  # False if the low-motion guard skipped reweighting
+
+
+def compute_residual_reweight(
+    base: Tensor,
+    timeseries: Tensor,
+    weight0: Tensor,
+    global_matrices: Tensor,
+    *,
+    config,
+    voxdims: tuple[float, float, float],
+    smooth_fwhm: float = 6.0,
+    tolerance: float = 1.1,
+    strength: float = 2.0,
+    weight_floor: float = 0.1,
+    min_motion: float = 0.05,
+    device: torch.device | None = None,
+    verb: int = 1,
+) -> ReweightResult:
+    """Learn a soft reliability weight from pre/post-alignment residuals.
+
+    The preliminary whole-brain fit supplies ``global_matrices``. We apply it
+    once, accumulate the squared residual before and after alignment, then
+    spatially smooth those two energy maps. Regions whose post/pre ratio is
+    worse than the brain-wide ratio are softly downweighted. This asks whether
+    a region follows the global alignment without requiring a small patch to
+    estimate an underdetermined local rigid transform.
+
+    The learned map is fixed across time. Its floor is deliberately non-zero:
+    discrepant anatomy still contributes weakly instead of disappearing from
+    the objective altogether.
+    """
+    if device is None:
+        device = base.device
+    if smooth_fwhm <= 0:
+        raise ValueError("smooth_fwhm must be positive")
+    if tolerance < 1:
+        raise ValueError("tolerance must be at least 1")
+    if strength <= 0:
+        raise ValueError("strength must be positive")
+    if not 0 < weight_floor <= 1:
+        raise ValueError("weight_floor must be in (0, 1]")
+
+    nt, nz, ny, nx = timeseries.shape
+    corners = torch.tensor(
+        [
+            [x, y, z, 1.0]
+            for z in (0.0, float(nz - 1))
+            for y in (0.0, float(ny - 1))
+            for x in (0.0, float(nx - 1))
+        ],
+        dtype=torch.float64,
+    )
+    mats64 = global_matrices.to(dtype=torch.float64, device="cpu")
+    moved = torch.einsum("tij,cj->tci", mats64, corners)[..., :3] - corners[None, :, :3]
+    motion_amp = float(moved.std(dim=0).max())
+    if motion_amp < min_motion:
+        if verb >= 1:
+            print(
+                f"  -reweight: global motion below threshold "
+                f"({motion_amp:.3g} vox); keeping original weight"
+            )
+        return ReweightResult(
+            weight=weight0,
+            patch_labels=torch.zeros_like(weight0, dtype=torch.int32),
+            n_kept=0,
+            n_patches=0,
+            applied=False,
+        )
+
+    # Reuse the tested, memory-planned fast resampling path. This import is lazy
+    # because ffs_moco itself loads the reweight module only inside moco().
+    from .ffs_moco import resample_timeseries
+
+    aligned, _ = resample_timeseries(
+        timeseries,
+        global_matrices,
+        config,
+        device,
+        base_copy_idx=config.base_index,
+        disable_pbar=verb == 0,
+    )
+
+    base_cpu = base.detach().to(device="cpu", dtype=torch.float32)
+    pre_energy = torch.zeros_like(base_cpu)
+    post_energy = torch.zeros_like(base_cpu)
+    for t in range(nt):
+        if t == config.base_index:
+            continue
+        raw = timeseries[t].to(device="cpu", dtype=torch.float32)
+        corrected = aligned[t].to(dtype=torch.float32)
+        pre_energy.add_((base_cpu - raw).square_())
+        post_energy.add_((base_cpu - corrected).square_())
+    del aligned
+
+    sigma_xyz = tuple(smooth_fwhm / 2.35482 / max(v, 1e-6) for v in voxdims)
+    sigma_zyx = (sigma_xyz[2], sigma_xyz[1], sigma_xyz[0])
+    energies = torch.stack((pre_energy, post_energy), dim=0).to(device)[:, None]
+    energies = _separable_smooth_3d(energies, sigma_zyx)[:, 0]
+    pre_s, post_s = energies[0], energies[1]
+
+    mask = weight0 > 0
+    if not bool(mask.any()):
+        return ReweightResult(
+            weight=weight0,
+            patch_labels=torch.zeros_like(weight0, dtype=torch.int32),
+            n_kept=0,
+            n_patches=0,
+            applied=False,
+        )
+
+    # A small data-scaled floor prevents meaningless ratios in flat background.
+    floor = 0.01 * pre_s[mask].median().clamp(min=torch.finfo(pre_s.dtype).tiny)
+    global_ratio = (post_s[mask].sum() + floor) / (pre_s[mask].sum() + floor)
+    local_ratio = (post_s + floor) / (pre_s + floor)
+    relative_ratio = local_ratio / global_ratio.clamp(min=torch.finfo(pre_s.dtype).tiny)
+
+    multiplier = (tolerance / relative_ratio).clamp(max=1.0).pow(strength)
+    multiplier = multiplier.clamp(min=weight_floor, max=1.0)
+    weight1 = weight0 * multiplier
+
+    # The legacy patch-label output now acts as a simple diagnostic: one marks
+    # voxels whose continuous registration weight changed.
+    changed = mask & (multiplier < 0.999)
+    labels = changed.to(torch.int32)
+    if verb >= 1:
+        changed_fraction = float(changed.sum()) / max(int(mask.sum()), 1)
+        print(
+            f"  -reweight: residual ratio {float(global_ratio):.4f}; "
+            f"soft-downweighted {100 * changed_fraction:.1f}% of weighted voxels "
+            f"(FWHM={smooth_fwhm:g} mm, floor={weight_floor:g})"
+        )
+
+    return ReweightResult(
+        weight=weight1,
+        patch_labels=labels,
+        n_kept=int((mask & ~changed).sum()),
+        n_patches=int(mask.sum()),
+        applied=True,
+    )
 
 
 def _auto_polort(nt: int, tr: float) -> int:

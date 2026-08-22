@@ -150,6 +150,23 @@ def test_moco_expected_outputs_single_echo():
     assert "m.1D" in outs
 
 
+def test_moco_reweight_tolerance_parses_and_validates(capsys):
+    from fastfuncstuff.cli.moco import _validate_run_args, parse_args
+
+    args = parse_args(
+        ["-input", "epi.nii.gz", "-prefix", "out", "-reweight", "-reweight-tolerance", "1.35"]
+    )
+    assert args.reweight_tolerance == pytest.approx(1.35)
+    _validate_run_args(args)
+
+    bad = parse_args(
+        ["-input", "epi.nii.gz", "-prefix", "out", "-reweight", "-reweight_tolerance", "0.9"]
+    )
+    with pytest.raises(SystemExit):
+        _validate_run_args(bad)
+    assert "must be >= 1" in capsys.readouterr().err
+
+
 def test_moco_expected_outputs_multi_echo_prefixes_each():
     from fastfuncstuff.cli.moco import _expected_outputs, parse_args
 

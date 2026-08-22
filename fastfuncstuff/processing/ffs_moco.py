@@ -84,12 +84,7 @@ class MocoConfig:
 
     # -reweight: data-driven weight refinement pre-pass (see moco_reweight.py).
     reweight: bool = False
-    reweight_minparams: int = 2  # of 3 displacement axes that must agree to keep a patch
-    reweight_rmin: float = 0.1  # per-axis correlation threshold
-    reweight_polort: int = -1  # detrend degree; <0 = auto (1 + floor(nt*TR/150))
-    reweight_bloktype: str = "rhdd"  # "rhdd", "tohd", or "cube"
-    reweight_blokrad: float = 0.0  # blok radius (mm); 0 = auto ~555 voxels
-    reweight_maxiter: int = 6  # GN iters for the cheap per-patch estimate
+    reweight_tolerance: float = 1.1  # no penalty within this multiple of the global ratio
     reweight_min_motion: float = 0.05  # guard: skip if global motion below this
     # When set, use these directly instead of recomputing (used by the recursive
     # global/preweight estimate so it reuses the full estimation path without
@@ -124,7 +119,7 @@ class MocoResult:
     # Populated only when -reweight ran (else None).
     weight_orig: Tensor | None = None  # (nz, ny, nx) original weight
     weight_refined: Tensor | None = None  # (nz, ny, nx) reweighted weight
-    patch_labels: Tensor | None = None  # (nz, ny, nx) int patch label map
+    patch_labels: Tensor | None = None  # (nz, ny, nx) legacy-named downweighted mask
     params_preweight: np.ndarray | None = None  # (nt, 6) params under original weight
     reweight_applied: bool = False  # False if the low-motion guard skipped it
 
@@ -1114,14 +1109,14 @@ def moco(
     # recompute entirely — same base_est, so the derivatives are identical.
     derivs = config.derivs_override
 
-    # ── -reweight pre-pass: learn which patches carry consistent motion and
-    #    drop the rest from the weight before building the normal equations. ──
+    # ── -reweight pre-pass: learn a soft residual-reliability map before
+    #    building the final normal equations. ──
     reweight_out: tuple | None = None  # (weight_orig, refined, labels, applied)
     params_preweight = None
     if config.reweight and config.weight_override is None:
         from dataclasses import replace
 
-        from .moco_reweight import compute_reweight
+        from .moco_reweight import compute_residual_reweight
 
         t0 = time.time()
         derivs = compute_derivative_images(
@@ -1153,30 +1148,14 @@ def moco(
 
         affine = header_info["affine"] if header_info else np.eye(4)
         voxdims = tuple(float(v) for v in _get_voxel_sizes(affine))
-        tr = 2.0
-        try:
-            hdr = header_info.get("header") if header_info else None
-            if hdr is not None:
-                z = hdr.get_zooms()
-                if len(z) >= 4 and float(z[3]) > 0:
-                    tr = float(z[3])
-        except Exception:
-            pass
-
-        rw = compute_reweight(
+        rw = compute_residual_reweight(
             base_est,
             timeseries,
             weight0,
-            derivs,
             global_matrices,
+            config=config,
             voxdims=voxdims,
-            tr=tr,
-            bloktype=config.reweight_bloktype,
-            blokrad=config.reweight_blokrad,
-            minparams=config.reweight_minparams,
-            rmin=config.reweight_rmin,
-            polort=config.reweight_polort,
-            max_iter=config.reweight_maxiter,
+            tolerance=config.reweight_tolerance,
             min_motion=config.reweight_min_motion,
             device=device,
             verb=config.verb,

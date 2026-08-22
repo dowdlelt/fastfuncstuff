@@ -317,60 +317,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     rw_group.add_argument(
         "-reweight",
         action="store_true",
-        help="Pre-pass that drops weight regions whose local displacement doesn't "
-        "match what the global head motion predicts there (removes bright "
-        "artifacts/ghosts that mislead alignment). Like -twopass, it looks at the "
-        "data first, then runs the normal estimation with the refined weight.",
+        help="Pre-pass that softly downweights regions whose residual improves less "
+        "than the brain-wide trend under an initial whole-head alignment. Like "
+        "-twopass, it looks at the data first, then reruns estimation with the "
+        "refined weight.",
     )
     rw_group.add_argument(
-        "-reweight_minparams",
-        "-reweight-minparams",
-        dest="reweight_minparams",
-        type=int,
-        default=2,
-        help="Keep a patch if its displacement agrees with the global-motion "
-        "prediction on at least this many of the 3 axes (default: 2).",
-    )
-    rw_group.add_argument(
-        "-reweight_rmin",
-        "-reweight-rmin",
-        dest="reweight_rmin",
+        "-reweight_tolerance",
+        "-reweight-tolerance",
+        dest="reweight_tolerance",
         type=float,
-        default=0.1,
-        help="Per-axis correlation threshold for 'agrees' (default: 0.1).",
-    )
-    rw_group.add_argument(
-        "-reweight_polort",
-        "-reweight-polort",
-        dest="reweight_polort",
-        type=int,
-        default=-1,
-        help="Detrend degree for the per-patch time-courses before correlating "
-        "(default: -1 = auto, 1 + floor(nt*TR/150)).",
-    )
-    rw_group.add_argument(
-        "-reweight_bloktype",
-        "-reweight-bloktype",
-        dest="reweight_bloktype",
-        choices=["rhdd", "tohd", "cube"],
-        default="rhdd",
-        help="Space-filling patch shape (default: rhdd, AFNI's LPC default).",
-    )
-    rw_group.add_argument(
-        "-reweight_blokrad",
-        "-reweight-blokrad",
-        dest="reweight_blokrad",
-        type=float,
-        default=0.0,
-        help="Patch radius in mm (default: 0 = auto, ~555 voxels/patch).",
-    )
-    rw_group.add_argument(
-        "-reweight_maxiter",
-        "-reweight-maxiter",
-        dest="reweight_maxiter",
-        type=int,
-        default=6,
-        help="Gauss-Newton iterations for the cheap per-patch estimate (default: 6).",
+        default=1.1,
+        help="Leave a region unchanged when its post/pre residual ratio is no "
+        "more than this multiple of the brain-wide ratio; larger values are "
+        "more conservative (default: 1.1; must be >= 1).",
     )
     rw_group.add_argument(
         "-save_weight",
@@ -380,8 +340,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         const=_WEIGHT_FROM_PREFIX,
         default=None,
         metavar="PREFIX",
-        help="Save the original weight, the reweighted weight, and the patch "
-        "label map (random id per kept patch). With no value, derives the paths "
+        help="Save the original weight, the soft reweighted weight, and a binary "
+        "map of downweighted voxels. With no value, derives the paths "
         "from -prefix.",
     )
 
@@ -799,12 +759,7 @@ def _build_config(
         verb=verb,
         debug_memory=args.debug_memory,
         reweight=args.reweight,
-        reweight_minparams=args.reweight_minparams,
-        reweight_rmin=args.reweight_rmin,
-        reweight_polort=args.reweight_polort,
-        reweight_bloktype=args.reweight_bloktype,
-        reweight_blokrad=args.reweight_blokrad,
-        reweight_maxiter=args.reweight_maxiter,
+        reweight_tolerance=args.reweight_tolerance,
     )
 
 
@@ -856,7 +811,7 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
     """Save the single-instance outputs (one per run, independent of echo).
 
     Covers the motion parameters, affine matrices, dfile, max-displacement,
-    iteration counts, and reweight weight/patch images. The corrected series
+    iteration counts, and reweight weight/diagnostic images. The corrected series
     and its mean are handled per echo by the caller.
     """
     # Motion parameters
@@ -906,7 +861,7 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
         if verb >= 1:
             print(f"Saved iterfile: {args.iterfile}")
 
-    # Reweight weight images + patch label map (single, estimated once).
+    # Reweight weight images + downweighted-voxel map (single, estimated once).
     if args.save_weight is not None:
         if not args.reweight:
             print(
@@ -915,7 +870,8 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
             )
         elif result.weight_refined is None or result.patch_labels is None:
             print(
-                "Warning: reweight did not run (no patches / guard); skipping -save_weight.",
+                "Warning: reweight did not run (empty weight / low-motion guard); "
+                "skipping -save_weight.",
                 file=sys.stderr,
             )
         else:
@@ -933,7 +889,7 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
             w_orig = pfx.with_suffix("weight_orig")
             w_new = pfx.with_suffix("weight_reweight")
             w_patch = pfx.with_suffix("patches")
-            with spinner(f"Writing weight/patch maps ({pfx.stem})", enabled=verb >= 1):
+            with spinner(f"Writing reweight maps ({pfx.stem})", enabled=verb >= 1):
                 save_image(result.weight_orig, w_orig, header_info=header_info)
                 save_image(result.weight_refined, w_new, header_info=header_info)
                 save_image(result.patch_labels.float(), w_patch, header_info=header_info)
@@ -998,6 +954,10 @@ def _validate_run_args(args: argparse.Namespace) -> None:
     Shared by the standalone path and every -batch line so a manifest run is
     validated exactly like the equivalent solo invocation.
     """
+    if args.reweight_tolerance < 1:
+        print("Error: -reweight_tolerance must be >= 1.", file=sys.stderr)
+        sys.exit(1)
+
     # Guard against a run that would produce nothing.
     _any_output = any(
         getattr(args, name, None) is not None
@@ -1278,7 +1238,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
             if val is not None:
                 outs.extend(_sibling(val, tag) for tag in echo_tags)
 
-    # Reweight weight/patch maps — only written when reweight actually runs.
+    # Reweight weight/diagnostic maps — only written when reweight actually runs.
     if args.save_weight is not None and args.reweight:
         wv = args.prefix if args.save_weight is _WEIGHT_FROM_PREFIX else args.save_weight
         if wv is not None:

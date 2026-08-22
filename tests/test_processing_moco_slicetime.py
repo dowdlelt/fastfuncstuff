@@ -40,6 +40,8 @@ class TestMocoConfig:
         assert cfg.chain_init is False  # independent per-volume estimation by default
         assert isinstance(cfg.chain_init, bool)
         assert isinstance(cfg.twopass, bool)
+        assert cfg.reweight is False
+        assert cfg.reweight_tolerance == pytest.approx(1.1)
         assert cfg.device is None
 
 
