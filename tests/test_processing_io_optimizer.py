@@ -1,8 +1,10 @@
 """Tests for processing/io.py and processing/optimizer.py."""
 
+import nibabel as nib
 import numpy as np
 import torch
 
+import fastfuncstuff.processing.io as processing_io
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
 from fastfuncstuff.processing.optimizer import (
     _coordinate_descent,
@@ -72,6 +74,25 @@ class TestLoadSaveImage:
         save_image(vol, path, affine=affine)
         _, info = load_image(path)
         np.testing.assert_allclose(info["affine"], affine, atol=1e-6)
+
+    def test_load_uses_shared_axis_reversal(self, monkeypatch):
+        source = np.asfortranarray(np.arange(4 * 5 * 6 * 7, dtype=np.float32).reshape(4, 5, 6, 7))
+        image = nib.Nifti1Image(source, np.eye(4))
+        captured = {}
+        real_from_numpy = torch.from_numpy
+
+        def capture(array):
+            captured["array"] = array
+            return real_from_numpy(array)
+
+        monkeypatch.setattr(processing_io, "load_nifti", lambda _path: image)
+        monkeypatch.setattr(processing_io.torch, "from_numpy", capture)
+
+        loaded, _ = processing_io.load_image("ignored.nii")
+
+        assert np.shares_memory(captured["array"], source)
+        assert loaded.is_contiguous()
+        torch.testing.assert_close(loaded, real_from_numpy(source.transpose(3, 2, 1, 0)))
 
     def test_device_placement(self, tmp_path):
         vol = torch.randn(4, 4, 4)

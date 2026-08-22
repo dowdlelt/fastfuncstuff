@@ -180,13 +180,12 @@ def load_image(path: str | Path, device: torch.device | None = None) -> tuple[Te
     # NIfTI convention: (x, y, z [, t]) -> we want (z, y, x [, t transposed])
     # nibabel loads as (i, j, k [, t]) in file order
     if data.ndim == 3:
-        # (nx, ny, nz) in NIfTI -> transpose to (nz, ny, nx) for our convention
-        data = data.transpose(2, 1, 0)
-        tensor = torch.from_numpy(data.copy())
+        # Reversing native NIfTI's Fortran-order axes is already a contiguous
+        # view in our order. Torch retains the numpy owner (and its mmap), so a
+        # second raw-sized copy is unnecessary even after the temp path is gone.
+        tensor = torch.from_numpy(data.transpose(2, 1, 0))
     elif data.ndim == 4:
-        # (nx, ny, nz, nt) -> (nt, nz, ny, nx)
-        data = data.transpose(3, 2, 1, 0)
-        tensor = torch.from_numpy(data.copy())
+        tensor = torch.from_numpy(data.transpose(3, 2, 1, 0))
     else:
         raise ValueError(f"Expected 3D or 4D NIfTI, got {data.ndim}D")
 
