@@ -357,6 +357,8 @@ class TestGateClearance:
         table = format_results_table(self._store(tmp_path).results())
         assert "NARROW" in table
         assert "clear" in table
+
+
 # --- reproduce ---------------------------------------------------------------
 
 
@@ -416,3 +418,68 @@ def test_commands_for_covers_subjects_the_config_never_met(tmp_path):
         assert cmd[cmd.index("-base") + 1] == f"{subj}_b.nii"
         assert cmd[cmd.index("-source") + 1] == f"{subj}_s.nii"
         assert cmd[cmd.index("-total_var") + 1] == "0.5"
+
+
+# --- the two axes the ranking cannot see ------------------------------------
+
+
+def _rough_store(tmp_path):
+    """Two configs: one slightly more similar, one far smoother. Both sound."""
+    s = TrialStore(tmp_path / "t.json")
+    s.runs.append(_meta())
+    for cfg, ls, bend, jmin in (
+        ({"total_var": 0.0}, 0.20, 0.43, 0.06),  # the loosest legal field
+        ({"total_var": 1.0}, 0.23, 0.02, 0.47),  # 20x smoother for 3% of score
+    ):
+        for subj in ("s1", "s2"):
+            s.add(
+                "formwarp",
+                subj,
+                cfg,
+                [],
+                scores={"ls": ls, "lncc": -0.9 + ls / 10},
+                seconds=1.0,
+                warpqc={"bending_energy": bend, "jac_min": jmin, "jac_neg_count": 0},
+            )
+    s.compute_consensus(["ls", "lncc"])
+    return s
+
+
+def test_smooth_runner_up_is_on_the_frontier(tmp_path):
+    """The scalar ranking cannot express 'as good and 20x smoother'; the frontier can."""
+    results = _rough_store(tmp_path).results()
+    rough = next(r for r in results if r.config == {"total_var": 0.0})
+    smooth = next(r for r in results if r.config == {"total_var": 1.0})
+
+    assert rough.score_mean < smooth.score_mean  # rough still wins the rank
+    assert rough.bending_mean > 10 * smooth.bending_mean
+    assert rough.jac_min_worst < smooth.jac_min_worst
+    assert rough.pareto and smooth.pareto  # neither dominates: it is a real choice
+
+
+def test_dominated_config_is_not_on_the_frontier(tmp_path):
+    s = _rough_store(tmp_path)
+    for subj in ("s1", "s2"):  # worse score AND rougher than both
+        s.add(
+            "formwarp",
+            subj,
+            {"total_var": 9.0},
+            [],
+            scores={"ls": 0.90, "lncc": -0.1},
+            seconds=1.0,
+            warpqc={"bending_energy": 5.0, "jac_min": 0.01, "jac_neg_count": 0},
+        )
+    s.compute_consensus(["ls", "lncc"])
+    results = s.results()
+    assert not next(r for r in results if r.config == {"total_var": 9.0}).pareto
+
+
+def test_results_table_shows_roughness(tmp_path):
+    out = format_results_table(_rough_store(tmp_path).results())
+    assert "bend" in out and "jacmin" in out
+    assert "+" in out  # frontier marker, distinct from the caution '*'
+    # The frontier gets its own block, smoothest first -- the ranked table cannot
+    # show it, because its interesting half sits below the configs that win on score.
+    assert "frontier" in out
+    body = out.split("frontier", 1)[1]
+    assert body.index("0.0200") < body.index("0.4300")

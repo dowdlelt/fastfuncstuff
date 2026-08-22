@@ -298,6 +298,20 @@ class ConfigResult:
     # Distinct caution kinds raised by any subject. Shown, never ranked on.
     cautions: list[str] = field(default_factory=list)
     is_baseline: bool = False
+    # How rough the deformation is, and how hard it squashes. The gate only asks
+    # whether the field *inverted*; these ask whether it is shaped like anatomy.
+    # Both are needed because the ranking cannot see either: every similarity
+    # functional improves monotonically with overfit, so the top row is the loosest
+    # field that has not yet folded. Measured on a 7T epi2epi run, the crowned
+    # config bought 3% of lncc over a neighbouring one by spending 20x the bending
+    # energy and squashing a voxel to 6% of its volume -- foldless, legal, and not
+    # a thing a brain does.
+    bending_mean: float = 0.0
+    jac_min_worst: float = 1.0
+    # True when no other config is at least as similar *and* smoother -- i.e. this
+    # row is a real choice on the accuracy/smoothness trade rather than a config
+    # that is simply beaten on both.
+    pareto: bool = False
 
     def label(self) -> str:
         if not self.config:
@@ -597,8 +611,15 @@ class TrialStore:
                     cautions=caution_kinds,
                     margin_z=(margin_min / sigma) if sigma else None,
                     is_baseline=ts[0].backend == BASELINE,
+                    bending_mean=statistics.fmean(
+                        [float(t.warpqc.get("bending_energy", 0.0)) for t in ts]
+                    ),
+                    jac_min_worst=min(
+                        [float(t.warpqc.get("jac_min", 1.0)) for t in ts], default=1.0
+                    ),
                 )
             )
+        _mark_pareto(out, score_key)
         out.sort(key=lambda r: (GRADE_ORDER.get(r.grade, 3), r.narrow, r.score_mean))
         return out
 
@@ -1281,7 +1302,7 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
 
     head = (
         f"  {'#':>3s}  {'backend':16s} {'score':>8s} {'+/-':>7s} {'grade':9s} "
-        f"{'clear':>6s} {'s/fit':>6s}"
+        f"{'clear':>6s} {'s/fit':>6s} {'bend':>8s} {'jacmin':>7s}"
     )
     if metric:
         head += f" {metric:>9s}"
@@ -1294,8 +1315,9 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
         # is a footnote on the verdict, and giving it a column would imply it ranks.
         band = r.band.upper() + ("*" if r.cautions else "")
         row = (
-            f"  {r.config_id:>3d}  {r.backend:16s} {r.score_mean:8.4f} "
-            f"{r.score_spread:7.4f} {band:9s} {clear} {r.seconds_mean:6.1f}"
+            f"  {r.config_id:>3d}{'+' if r.pareto else ' '} {r.backend:16s} {r.score_mean:8.4f} "
+            f"{r.score_spread:7.4f} {band:9s} {clear} {r.seconds_mean:6.1f} "
+            f"{r.bending_mean:8.4f} {r.jac_min_worst:7.3f}"
         )
         if metric:
             v = r.abs_scores.get(metric)
@@ -1329,7 +1351,78 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
         lines.append(
             "  No baseline row: this run cannot say whether any setting beat doing nothing."
         )
+    lines.append(
+        "  'bend' is bending energy (mean squared 2nd derivative of the displacement),\n"
+        "  'jacmin' the worst det(J). Neither is ranked on -- every functional in the jury\n"
+        "  improves with overfit, so 'score' alone always crowns the loosest field that has\n"
+        "  not folded. A '+' after the id marks a config nothing else beats on BOTH counts."
+    )
+    lines.append(_format_frontier(results))
     lines.append("  Reproduce one with:  ffs_tunewarp ... -reproduce N   (keeps the outputs)")
+    lines.append("  -reproduce runs the config on EVERY subject, not only the ones it was")
+    lines.append("  screened on.")
+    return "\n".join(lines)
+
+
+def _mark_pareto(results: list[ConfigResult], score_key: str) -> None:
+    """Flag the configs that are not beaten on both similarity and smoothness.
+
+    The whole tension this tool runs into is that similarity and regularity are
+    two objectives being reported as one number. A scalar cannot express "as good
+    as the winner and twenty times smoother", so it ranks that config 20th and the
+    operator has to find it by hand. The frontier can: a row is on it when nothing
+    else is at least as similar *and* smoother, which is a statement about the
+    trade rather than a threshold somebody had to invent.
+
+    Only graded-equal rows compete, so a folded config cannot dominate a sound one
+    out of the frontier by being smooth about it.
+    """
+    candidates = [r for r in results if not r.is_baseline and r.grade == PASS]
+    for r in candidates:
+        r.pareto = not any(
+            o is not r and o.score_mean <= r.score_mean and o.bending_mean < r.bending_mean
+            for o in candidates
+        )
+
+
+def _format_frontier(results: list[ConfigResult]) -> str:
+    """The accuracy/smoothness trade-off, as the short table it actually is.
+
+    Printed separately because the ranked table cannot show it: the frontier's
+    interesting half sits *below* the loose configs that win on score, and asking
+    someone to scan 150 rows for a marker is asking them not to. Sorted smoothest
+    first, because that is the direction you read it -- start at the field you
+    would believe and walk up until the score is good enough.
+    """
+    front = [r for r in results if r.pareto]
+    if len(front) < 2:
+        return ""
+    metric = headline_metric(results)
+    front.sort(key=lambda r: r.bending_mean)
+    head = (
+        f"  {'#':>4s} {'backend':16s} {'score':>8s} {'bend':>8s} {'jacmin':>7s} "
+        f"{'s/fit':>6s} {'n':>2s}" + (f" {metric:>9s}" if metric else "")
+    )
+    lines = ["", "  Accuracy/smoothness frontier -- smoothest first:", head, "  " + "-" * len(head)]
+    for r in front:
+        row = (
+            f"  {r.config_id:>4d} {r.backend:16s} {r.score_mean:8.4f} "
+            f"{r.bending_mean:8.4f} {r.jac_min_worst:7.3f} {r.seconds_mean:6.1f} "
+            f"{r.n_subjects:2d}"
+        )
+        if metric:
+            v = r.abs_scores.get(metric)
+            row += f" {v:9.4f}" if v is not None else f" {'-':>9s}"
+        lines.append(row)
+    lines.append(
+        "  Walk UP from the bottom and stop where the score stops being worth the\n"
+        "  roughness. A gap of a few hundredths in score across a 10x jump in 'bend'\n"
+        "  is the ranking paying for detail that is not anatomy.\n"
+        "  Mind 'n': adaptive search screens most candidates on ONE brain, and a rank\n"
+        "  moves a median of 10 places between brains, so comparing an n=1 row against\n"
+        "  an n=3 row compares the subjects as much as the settings. Confirm a row you\n"
+        "  like with -reproduce before believing it."
+    )
     return "\n".join(lines)
 
 
