@@ -67,6 +67,7 @@ def _try_fused(fn, *args):
         print(f"** fused CUDA shift unavailable ({type(exc).__name__}: {exc}); using PyTorch")
         return None
 
+
 # Phase-encode direction letters -> NIfTI spatial axis (x=0, y=1, z=2). Only the
 # AXIS matters for building the movie / placing the warp component; the sign of
 # the displacement is data-driven (it falls out of the optical flow).
@@ -4911,6 +4912,8 @@ def estimate_residual_flow_me_scaled(
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
+    warp_interp: str = "lanczos",
+    warp_radius: int = 3,
     hpf_sigma: float = 0.0,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -4929,6 +4932,10 @@ def estimate_residual_flow_me_scaled(
     ``linearity_r2`` is 1.0 by construction (the scaling is applied, not fitted).
     ``flat_scaling=True`` applies the SAME field to every echo (``alpha_e = 1``) — for
     acquisitions whose partition wiggle is TE-independent.
+
+    ``warp_interp`` controls both the selected echo's correction/refine template and
+    the one-pass application of its scaled field to every other echo. Lanczos is the
+    default so none of those corrected series inherits linear-interpolation blur.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -4966,6 +4973,8 @@ def estimate_residual_flow_me_scaled(
         reg_sigma=reg_sigma,
         peak_mode=peak_mode,
         search_min_steps=search_min_steps,
+        warp_interp=warp_interp,
+        warp_radius=warp_radius,
         hpf_sigma=hpf_sigma,
         device=device,
         verbose=verbose,
@@ -4993,7 +5002,11 @@ def estimate_residual_flow_me_scaled(
         corrected = torch.zeros(nx, ny, nz, nt)
         for t in range(nt):
             corrected[..., t] = _shift3d_axis(
-                vol_j[..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+                vol_j[..., t].to(device)[None],
+                disp_e[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
             )[0].cpu()
         p_canon = disp_e.permute(perm4).contiguous()
         u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
@@ -5423,6 +5436,8 @@ def estimate_residual_flow_me_interecho(
     hpf_sigma: float = 0.0,
     match: str = "localnorm",
     match_sigma: float = 2.0,
+    warp_interp: str = "lanczos",
+    warp_radius: int = 3,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -5447,6 +5462,10 @@ def estimate_residual_flow_me_interecho(
     that is common to every echo — follow with a temporal pass (the joint / scaled modes)
     if that residual matters. ``w`` is stored at the echo1→echo2 step scale and ``alpha``
     counts steps from echo 1 (``alpha_1 = 0``); ``linearity_r2`` is 1.0 (imposed).
+
+    The final correction is a one-axis resample of each raw echo. ``warp_interp``
+    defaults to Lanczos so a later temporal refine starts from a sharp corrected
+    stack rather than a stack already softened by linear interpolation.
 
     ``backend="flow"`` registers images of DIFFERENT contrast (echo n vs n−1 differ by a
     T2* decay factor everywhere), which breaks LK's brightness-constancy assumption, so
@@ -5620,7 +5639,11 @@ def estimate_residual_flow_me_interecho(
         corrected = torch.zeros(nx, ny, nz, nt)
         for t in range(nt):
             corrected[..., t] = _shift3d_axis(
-                vols[j][..., t].to(device)[None], disp_e[..., t].to(device)[None], pe_axis
+                vols[j][..., t].to(device)[None],
+                disp_e[..., t].to(device)[None],
+                pe_axis,
+                mode=warp_interp,
+                radius=warp_radius,
             )[0].cpu()
         p_canon = disp_e.permute(perm4).contiguous()
         u_canon = p_canon if pe_flow_is_u else torch.zeros_like(p_canon)
@@ -5790,7 +5813,7 @@ def refine_interecho_temporally(
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
-    warp_interp: str = "bilinear",
+    warp_interp: str = "lanczos",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
     want_corrected: bool = True,

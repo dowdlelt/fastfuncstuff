@@ -9,11 +9,13 @@ from fastfuncstuff.processing import locomoco as lm
 
 
 def test_cli_auto_prefers_fidelity_by_geometry():
-    from fastfuncstuff.cli.locomoco import _resolve_warp_interp
+    from fastfuncstuff.cli.locomoco import _resolve_warp_interp, _warp_kernel_label
 
     assert _resolve_warp_interp("auto", rotaware=False) == "lanczos"
     assert _resolve_warp_interp("auto", rotaware=True) == "bicubic"
     assert _resolve_warp_interp("bilinear", rotaware=False) == "bilinear"
+    assert _warp_kernel_label("lanczos", 5) == "Lanczos-5"
+    assert _warp_kernel_label("bicubic", 3) == "bicubic"
 
 
 def test_portable_2d_cubic_matches_grid_sample():

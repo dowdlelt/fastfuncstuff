@@ -1214,6 +1214,11 @@ def _resolve_warp_interp(requested: str, *, rotaware: bool) -> str:
     return "bicubic" if rotaware else "lanczos"
 
 
+def _warp_kernel_label(interp: str, radius: int) -> str:
+    """User-facing name for the actual correction resampler."""
+    return f"Lanczos-{radius}" if interp == "lanczos" else interp
+
+
 def _apply_preset(args) -> str | None:
     """Fill accuracy knobs from -workhard/-superhard, but let explicit flags win.
 
@@ -1673,6 +1678,12 @@ def _run_multiecho(
         f"({'2-D slicewise' if slicewise else '3-D'}): {len(datas)} echoes  "
         f"shape={datas[0].shape}  device={device}"
     )
+    if qwarp_backend:
+        print("   final data resampling kernel: wsinc5 (qwarp)")
+    else:
+        print(
+            f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}"
+        )
     if args.me_interecho:
         mode, scaling = "inter-echo (align stack per TR)", "linear-in-TE (anchor=echo1)"
         if args.me_interecho_refine:
@@ -1765,6 +1776,8 @@ def _run_multiecho(
             hpf_sigma=hpf_sigma,
             match=args.me_match,
             match_sigma=args.me_match_sigma,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             device=device,
         )
         if args.me_interecho_refine:
@@ -1833,6 +1846,8 @@ def _run_multiecho(
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
             device=device,
         )
@@ -2182,12 +2197,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 file=sys.stderr,
             )
             return 2
-        if args.me_interecho or args.me_estimate_from is not None:
-            print(
-                "ℹ️  -warp_interp lanczos affects only the joint solve; -me_interecho / "
-                "-me_estimate_from ignore it (they resample bilinear)."
-            )
-
     slice_axis = args.slice_axis
     if args.is_3dacq and args.backend == "phase":
         print(
@@ -2322,10 +2331,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         mode = f"{'1-D PE' if pe_only else '2-D'} flow"
     else:
         mode = args.backend
-    acc_desc = f"warp={args.warp_interp}, refine={args.refine}, jacobian={'on' if args.jacobian else 'off'}"
+    acc_desc = f"refine={args.refine}, jacobian={'on' if args.jacobian else 'off'}"
     if preset:
         acc_desc = f"[{preset}] " + acc_desc
     print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
+    print(f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}")
     if dual3d:
         axes_desc = (
             f"primary PE {args.pe_dir[0]} (axis {pe_axis}) + partition "

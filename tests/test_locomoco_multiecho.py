@@ -7,6 +7,8 @@ contrast. The joint solve must (a) recover the per-echo scaling ratios (∝ TE),
 common grid so its temporal variance collapses.
 """
 
+import inspect
+
 import numpy as np
 import torch
 
@@ -381,6 +383,18 @@ def test_interecho_aligns_stack_to_anchor():
     corr_list = [r.corrected_series().numpy() for r in res.per_echo]
     for t in (2, 4):
         assert _spread(corr_list, t) < _spread(datas, t)
+
+
+def test_special_multiecho_paths_default_to_lanczos():
+    """Inter-echo and selected-echo paths must not regress to blurry linear sampling."""
+    from fastfuncstuff.processing.locomoco import refine_interecho_temporally
+
+    for fn in (
+        estimate_residual_flow_me_interecho,
+        estimate_residual_flow_me_scaled,
+        refine_interecho_temporally,
+    ):
+        assert inspect.signature(fn).parameters["warp_interp"].default == "lanczos"
 
 
 def _interecho_stack(tes, hs, decay=12.0):
