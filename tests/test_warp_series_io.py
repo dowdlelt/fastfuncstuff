@@ -88,11 +88,17 @@ def test_5d_and_folder_roundtrip_match(tmp_path):
     torch.testing.assert_close(z5, zf)
 
 
-def test_voxels_roundtrip_is_identity(tmp_path):
-    """units='voxels' with an axis-aligned affine round-trips the raw values."""
+@pytest.mark.parametrize("extension", [".nii.gz", ".nii.zst"])
+def test_voxels_roundtrip_is_identity(tmp_path, extension):
+    """5D warps round-trip through gzip and the parallel-zstd path."""
+    if extension == ".nii.zst":
+        import shutil
+
+        if shutil.which("zstd") is None:
+            pytest.skip("zstd not installed")
     xd, yd, zd = _synth_series()
     affine = np.diag([3.0, 3.0, 3.0, 1.0])
-    f5 = tmp_path / "w.nii.gz"
+    f5 = tmp_path / f"w{extension}"
     save_warp_series(xd, yd, zd, f5, as_5d=True, affine=affine, units="voxels")
     x5, y5, z5, _, _ = load_warp_series(f5)
     torch.testing.assert_close(x5, xd)

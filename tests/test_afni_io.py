@@ -169,6 +169,59 @@ class TestZstRoundtrip:
         assert np.allclose(img.get_fdata(), data, rtol=1e-5)
         assert np.allclose(img.affine, affine)
 
+    def test_decode_command_uses_only_its_cpu_share(self, monkeypatch):
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setattr(afni.shutil, "which", lambda name: f"/usr/bin/{name}")
+        assert afni._zstd_decode_command("big.nii.zst", 3) == [
+            "pzstd",
+            "-q",
+            "-d",
+            "-p",
+            "3",
+            "-c",
+            "big.nii.zst",
+        ]
+
+    def test_decode_command_falls_back_to_stock_zstd(self, monkeypatch):
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setattr(afni.shutil, "which", lambda _name: None)
+        assert afni._zstd_decode_command("big.nii.zst", 8) == [
+            "zstd",
+            "-dc",
+            "big.nii.zst",
+        ]
+        assert afni._zstd_decode_command("big.nii.zst", 1) == [
+            "zstd",
+            "-dc",
+            "big.nii.zst",
+        ]
+
+    def test_broken_pzstd_retries_stock_decoder(self, monkeypatch):
+        import io
+        import subprocess
+
+        from fastfuncstuff.io import afni
+
+        monkeypatch.setattr(afni.shutil, "which", lambda name: f"/usr/bin/{name}")
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if len(calls) == 1:
+                kwargs["stdout"].write(b"partial")
+                raise subprocess.CalledProcessError(1, cmd)
+            assert kwargs["stdout"].tell() == 0
+            kwargs["stdout"].write(b"decoded")
+
+        monkeypatch.setattr(afni.subprocess, "run", fake_run)
+        output = io.BytesIO()
+        afni._run_zstd_decode("big.nii.zst", output, 4)
+        assert calls[0][0] == "pzstd"
+        assert calls[1] == ["zstd", "-dc", "big.nii.zst"]
+        assert output.getvalue() == b"decoded"
+
     def test_replace_afni_extension_roundtrips_zst(self):
         from fastfuncstuff.io.afni import replace_afni_extension
 

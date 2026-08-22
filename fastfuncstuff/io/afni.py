@@ -137,7 +137,42 @@ def _require_zstd() -> None:
         ) from err
 
 
-def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
+def _zstd_decode_command(filepath: str | Path, threads: int | None = None) -> list[str]:
+    """Return the fastest available safe command for decoding one zstd file.
+
+    Pzstd can only decode concurrently when the writer split the stream into
+    independent frames. Its output is still ordinary concatenated zstd, so
+    stock ``zstd`` remains a complete fallback for files written on another
+    machine or in an environment without pzstd.
+    """
+    if threads is None:
+        n_cpu, _ = resolve_cpu_threads()
+        threads = min(8, n_cpu)
+    threads = max(1, int(threads))
+    if threads > 1 and shutil.which("pzstd") is not None:
+        return ["pzstd", "-q", "-d", "-p", str(threads), "-c", str(filepath)]
+    return ["zstd", "-dc", str(filepath)]
+
+
+def _run_zstd_decode(filepath: str | Path, out_file, threads: int | None = None) -> None:
+    """Decode to an open file, retrying stock zstd if pzstd is unusable."""
+    cmd = _zstd_decode_command(filepath, threads)
+    try:
+        subprocess.run(cmd, stdout=out_file, check=True, stderr=subprocess.PIPE)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        if cmd[0] == "zstd":
+            raise
+        out_file.seek(0)
+        out_file.truncate()
+        subprocess.run(
+            ["zstd", "-dc", str(filepath)],
+            stdout=out_file,
+            check=True,
+            stderr=subprocess.PIPE,
+        )
+
+
+def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
 
@@ -189,14 +224,11 @@ def load_nifti(filepath: str | Path) -> nib.Nifti1Image:
             tmp_path = tmp.name
 
         try:
-            # Decompress: zstd -dc input.nii.zst > output.nii
+            # Pzstd-written files contain independent frames and decode in
+            # parallel. Stock-zstd files and installations without pzstd take
+            # the unchanged serial fallback path.
             with open(tmp_path, "wb") as out_file:
-                subprocess.run(
-                    ["zstd", "-dc", str(filepath)],
-                    stdout=out_file,
-                    check=True,
-                    stderr=subprocess.PIPE,
-                )
+                _run_zstd_decode(filepath, out_file, zstd_threads)
 
             # Load the decompressed file
             img = nib.load(tmp_path)
@@ -976,7 +1008,7 @@ def _load_run_array(
     is returned; otherwise the result is a numpy array, reordered with
     ``n_threads`` host threads.
     """
-    img = load_nifti(run_file)
+    img = load_nifti(run_file, zstd_threads=n_threads)
     data_np = img.get_fdata(dtype=np.float32)
 
     if data_np.ndim not in (2, 4):
@@ -2023,15 +2055,31 @@ def _compress_gz(src: Path, dst: Path, remove_original: bool) -> Path:
 
 
 def _compress_zst(src: Path, dst: Path, remove_original: bool) -> Path:
-    """Compress *src* (.nii) → *dst* (.nii.zst) using zstd with all cores."""
+    """Compress *src* (.nii) → *dst* (.nii.zst) using available CPU cores."""
     zstd = shutil.which("zstd")
     if zstd is None:
         raise RuntimeError(
             "zstd is not installed or not in PATH.  "
             "Install zstd to write .nii.zst files (e.g. apt install zstd)."
         )
-    # -T0 = use all physical cores, -f = overwrite, --rm = remove source
-    cmd = ["zstd", "-T0", "-f"]
+    n_cpu, _ = resolve_cpu_threads()
+    n_threads = max(1, n_cpu)
+    pzstd = shutil.which("pzstd")
+    if pzstd is not None and n_threads > 1:
+        # Independent frames enable parallel reads later. The stream remains
+        # decodable by every conforming zstd decoder, including our fallback.
+        cmd = [pzstd, "-q", "-p", str(n_threads), "-f"]
+        if remove_original:
+            cmd.append("--rm")
+        cmd.extend([str(src), "-o", str(dst)])
+        try:
+            subprocess.run(cmd, check=True, capture_output=True)
+            return dst
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            if not src.exists():
+                raise
+
+    cmd = [zstd, f"-T{n_threads}", "-f"]
     if remove_original:
         cmd.append("--rm")
     cmd.extend([str(src), "-o", str(dst)])
