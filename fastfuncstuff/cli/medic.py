@@ -539,7 +539,8 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 70)
         print("MEDIC distortion correction (ffs_medic; warpkit estimate + GPU apply)")
         print("=" * 70)
-        print(f"Start: {datetime.now():%Y-%m-%d %H:%M:%S}   Device: {device}")
+        print(f"Start: {datetime.now():%Y-%m-%d %H:%M:%S}\nDevice: {device}")
+        print(f"Spatial resampling kernel: {args.interp}")
         print("\nLoading echoes...")
 
     with spinner(f"Loading {len(args.magnitude)} magnitude echo(es)"):

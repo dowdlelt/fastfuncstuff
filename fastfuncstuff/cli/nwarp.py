@@ -24,6 +24,7 @@ from fastfuncstuff.cli_utils import (
     collect_batch_jobs,
     run_batch_jobs,
     setup_device,
+    spinner,
 )
 from fastfuncstuff.processing.io import derive_prefixed_output_path
 from fastfuncstuff.processing.nwarpforge import (
@@ -391,10 +392,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
-        print(f"ffs_nwarp: device={device}")
-        print(f"ffs_nwarp: interp={args.interp}")
+        print(f"ffs_nwarp\n  device: {device}")
         if args.phase:
-            print(f"ffs_nwarp: phase_warp={args.phase_warp}")
+            print(f"  phase warp: {args.phase_warp}")
 
     # Parse time_range if provided
     time_range = None
@@ -419,7 +419,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if ainterp is None:
         ainterp = "cubic"
     if verb >= 1:
-        print(f"ffs_nwarp: ainterp={ainterp}")
+        print("  interpolation kernels:")
+        print(f"    final data resampling: {args.interp}")
+        print(f"    warp-field composition: {ainterp}")
+        if args.tpattern is not None:
+            print(f"    temporal resampling: {args.tinterp}")
+        print()
 
     jac_axis = None
     jac_match = None
@@ -501,6 +506,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         follow_tissue=args.follow_tissue,
         jac_axis=jac_axis,
         jac_match=jac_match,
+        progress=lambda message: spinner(message, enabled=verb >= 1),
     )
 
     if verb >= 1:

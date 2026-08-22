@@ -3025,16 +3025,13 @@ def save_nifti(
     out = Path(output_path)
     out_str = str(out)
 
-    # Big writes go through an uncompressed temp file plus an external compressor, which
-    # on a multi-GB single-trial bucket is minutes of apparent hang. Announce the size and
-    # report the elapsed time so the run does not look wedged. Threshold keeps the routine
-    # silent for the many small parameter maps written per run.
+    # Big writes can otherwise look wedged. Keep this fallback factual and compact;
+    # CLI spinner contexts suppress it and provide their own live status + timing.
     _nbytes = int(data.nbytes)
     _announce = _nbytes >= _BIG_WRITE_BYTES and not io_progress_suppressed()
     if _announce:
         print(
-            f"    ⏳ writing {out.name} ({_nbytes / 1e9:.2f} GB uncompressed)"
-            f" — compressing, this can take a while...",
+            f"    Writing {out.name} ({_nbytes / 1e9:.2f} GB uncompressed)",
             flush=True,
         )
     _t_write = time.time()
@@ -3061,6 +3058,6 @@ def save_nifti(
         _elapsed = time.time() - _t_write
         try:
             _on_disk = out.stat().st_size / 1e9
-            print(f"    ✓ wrote {out.name} ({_on_disk:.2f} GB) in {_elapsed:.1f}s", flush=True)
+            print(f"    Wrote {out.name} ({_on_disk:.2f} GB) in {_elapsed:.1f}s", flush=True)
         except OSError:
-            print(f"    ✓ wrote {out.name} in {_elapsed:.1f}s", flush=True)
+            print(f"    Wrote {out.name} in {_elapsed:.1f}s", flush=True)

@@ -1,7 +1,7 @@
 """Progress reporting: the spinner is the single voice for a wrapped write.
 
 Bug of record: a big moco write printed four lines for one file — the writer's
-own "compressing, this can take a while" + "wrote ... in 2.0s", the spinner's
+own write announcement + "Wrote ... in 2.0s", the spinner's
 "done (2.3s)", and the CLI's "Saved: ...".
 """
 
@@ -28,7 +28,10 @@ def test_spinner_suppresses_writer_announcement(tmp_path, capsys, monkeypatch):
     affine = np.eye(4)
 
     afni_io.save_nifti(data, str(tmp_path / "loud.nii"), affine=affine)
-    assert "wrote loud.nii" in capsys.readouterr().out
+    loud = capsys.readouterr().out
+    assert "Writing loud.nii" in loud
+    assert "Wrote loud.nii" in loud
+    assert "take a while" not in loud
 
     with spinner("Writing quiet.nii"):
         afni_io.save_nifti(data, str(tmp_path / "quiet.nii"), affine=affine)

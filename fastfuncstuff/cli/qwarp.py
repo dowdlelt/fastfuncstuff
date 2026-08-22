@@ -1414,7 +1414,12 @@ def main(argv: list[str] | None = None) -> int:
         print("WARNING: No accelerator available, running on CPU (will be slow)")
 
     if args.verb >= 1:
-        print(f"qwarp_torch: device={device}")
+        print(
+            f"ffs_qwarp\n  device: {device}\n"
+            "  interpolation kernels:\n"
+            f"    deformation estimation: {args.interp}\n"
+            f"    final data resampling: {args.final}\n"
+        )
 
     # Load images
     t0 = time.time()

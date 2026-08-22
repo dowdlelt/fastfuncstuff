@@ -212,7 +212,9 @@ def main(argv: list[str] | None = None) -> None:
         args.method = "linear" if args.tween else "fourier"
 
     if verb >= 1:
-        print(f"slicetime: device={device}, method={args.method}")
+        print(
+            f"ffs_slicetime\n  device: {device}\n  temporal interpolation kernel: {args.method}\n"
+        )
 
     t0 = time.time()
     with spinner(f"Loading {Path(args.input).name}"):

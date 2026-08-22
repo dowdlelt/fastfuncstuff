@@ -686,7 +686,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
-        print(f"allineate: device={device}")
+        print(
+            f"ffs_allineate\n  device: {device}\n"
+            "  interpolation kernels:\n"
+            f"    alignment estimation: {args.interp}\n"
+            f"    final data resampling: {args.final_interp}\n"
+        )
 
     # Validate follower pairing before the (long) alignment, not after it.
     _follower_pairs(args)

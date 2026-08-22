@@ -1302,7 +1302,15 @@ def main(argv: list[str] | None = None) -> None:
     device = _select_device(args.device)
     verb = args.verb
     if verb >= 1:
-        print(f"ffs_moco: device={device}")
+        print(f"ffs_moco\n  device: {device}")
+        print(
+            "  interpolation kernels:\n"
+            f"    motion estimation: {args.interp}\n"
+            f"    final data resampling: {args.final_interp}"
+        )
+        if args.tpattern is not None:
+            print(f"    temporal resampling: {args.tinterp}")
+        print()
 
     _dispatch_run(args, device, verb)
 
@@ -1439,7 +1447,7 @@ def _run_multi_echo(
                 base_est = _blur_volume(bsrc.to(device=device, dtype=dtype), args.blur)
 
             if verb >= 1:
-                print(f"Resampling echo {echo_num}: {path}")
+                print(f"Resampling echo {echo_num} with {config.final_interp}: {path}")
             aligned, rms_after = resample_timeseries(
                 echo,
                 matrices,

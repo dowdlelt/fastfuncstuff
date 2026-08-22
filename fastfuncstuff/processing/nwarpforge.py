@@ -16,7 +16,10 @@ Key functions:
 
 from __future__ import annotations
 
+import contextlib
 import os
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -1670,6 +1673,7 @@ def nwarpforge(
     follow_tissue: bool = True,
     jac_axis: int | None = None,
     jac_match: str | None = None,
+    progress: Callable[[str], AbstractContextManager[None]] | None = None,
 ) -> None:
     """Main pipeline: compose warps and apply to source.
 
@@ -1759,6 +1763,8 @@ def nwarpforge(
             frame to frame (e.g. a brain edge sweeping in and out of a voxel), at
             ~1% GPU cost over the frozen path. Set False for the frozen-pose
             behaviour. See processing/spacetime.py:TissueFollowingSampler.
+        progress: Optional context-manager factory for opaque loads and writes. The CLI
+            supplies its shared spinner; library callers remain silent by default.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1940,6 +1946,7 @@ def nwarpforge(
         print(f"  [{a[1, 0]:9.5f} {a[1, 1]:9.5f} {a[1, 2]:9.5f} {a[1, 3]:9.5f}]")
         print(f"  [{a[2, 0]:9.5f} {a[2, 1]:9.5f} {a[2, 2]:9.5f} {a[2, 3]:9.5f}]")
 
+    progress_context = progress or (lambda _message: contextlib.nullcontext())
     transforms: list[Transform] = []
     max_time_points = 1
 
@@ -1955,30 +1962,23 @@ def nwarpforge(
                 raise FileNotFoundError(f"-nwarp pattern matched no files: {spec}")
             if len(matches) > 1:
                 # Keep the 5-D field on CPU; at_time() streams each frame to GPU.
-                tv = load_time_varying_warp_from_files(
-                    matches, device=torch.device("cpu"), debug=debug
-                )
+                with progress_context(f"Loading {len(matches)} warp files matching {spec}"):
+                    tv = load_time_varying_warp_from_files(
+                        matches, device=torch.device("cpu"), debug=debug
+                    )
                 tv.device = device
                 transforms.append(tv)
                 max_time_points = max(max_time_points, tv.n_time)
-                if verb >= 1:
-                    print(
-                        f"Loading time-varying warp: {tv.n_time} frames from "
-                        f"{len(matches)} files matching {spec}"
-                    )
                 continue
             spec = matches[0]
 
         kind = identify_transform_type(spec)
-        if verb >= 1:
-            print(f"Loading {kind}: {spec}")
 
         if kind == "affine":
-            xform = load_affine_1D(spec, affine_for_matrices, device=device, debug=debug)
+            with progress_context(f"Loading affine {spec}"):
+                xform = load_affine_1D(spec, affine_for_matrices, device=device, debug=debug)
             transforms.append(xform)
             max_time_points = max(max_time_points, xform.matrices.shape[0])
-            if verb >= 1:
-                print(f"  Affine: {xform.matrices.shape[0]} time point(s)")
             if debug:
                 m = xform.matrices[0].cpu().numpy()
                 print("  [DEBUG] Matrix after conversion (t=0):")
@@ -1988,17 +1988,15 @@ def nwarpforge(
                 print(f"    [{m[3, 0]:9.5f} {m[3, 1]:9.5f} {m[3, 2]:9.5f} {m[3, 3]:9.5f}]")
         elif _is_time_varying_warp(spec):
             # Keep the 5-D field on CPU; at_time() streams each frame to GPU.
-            tv = load_time_varying_warp(spec, device=torch.device("cpu"), debug=debug)
+            with progress_context(f"Loading time-varying warp {spec}"):
+                tv = load_time_varying_warp(spec, device=torch.device("cpu"), debug=debug)
             tv.device = device
             transforms.append(tv)
             max_time_points = max(max_time_points, tv.n_time)
-            if verb >= 1:
-                print(f"  Time-varying warp: {tv.n_time} frames, spatial {tv.spatial_shape}")
         else:
-            xform = load_warp(spec, device=device, debug=debug)
+            with progress_context(f"Loading nonlinear warp {spec}"):
+                xform = load_warp(spec, device=device, debug=debug)
             transforms.append(xform)
-            if verb >= 1:
-                print(f"  Warp: {xform.shape}")
             if debug:
                 print("  [DEBUG] Warp displacement ranges:")
                 print(f"    xd: [{xform.xd.min().item():.3f}, {xform.xd.max().item():.3f}]")
@@ -2516,10 +2514,8 @@ def nwarpforge(
         out_hdr = None
 
     output_header = {"affine": output_affine, "header": out_hdr}
-    save_image(output, prefix, header_info=output_header)
-
-    if verb >= 1:
-        print(f"Saved: {prefix}")
+    with progress_context(f"Writing {prefix}"):
+        save_image(output, prefix, header_info=output_header)
 
     # Temporal reductions of the warped series. max/min are coverage images: a
     # voxel that left the FoV (motion, or the warp itself) is 0 in the volumes
@@ -2538,9 +2534,8 @@ def nwarpforge(
                 print(f"-save_{which} requested, but output is not 4D; skipping")
             continue
         out_path = derive_prefixed_output_path(prefix, which)
-        save_image(reduce(output), out_path, header_info=output_header)
-        if verb >= 1:
-            print(f"Saved {which}: {out_path}")
+        with progress_context(f"Writing {which} {out_path}"):
+            save_image(reduce(output), out_path, header_info=output_header)
 
     if save_first_last_flag:
         save_first_last(output, prefix, header_info=output_header, verb=verb)
@@ -2552,6 +2547,5 @@ def nwarpforge(
             phase_output = torch.stack(phase_volumes)
         else:
             phase_output = phase_volumes[0]
-        save_image(phase_output, phase_prefix, header_info=output_header)
-        if verb >= 1:
-            print(f"Saved phase: {phase_prefix}")
+        with progress_context(f"Writing phase {phase_prefix}"):
+            save_image(phase_output, phase_prefix, header_info=output_header)

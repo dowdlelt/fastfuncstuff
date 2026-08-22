@@ -614,7 +614,10 @@ def main(argv: list[str] | None = None) -> int:
         print("WARNING: no GPU available, running on CPU")
 
     if args.verb >= 1:
-        print(f"ffs_optiwarp: device={device}")
+        print(
+            f"ffs_optiwarp\n  device: {device}\n"
+            f"  final data resampling kernel: {args.final_interp}\n"
+        )
 
     t0 = time.time()
     with spinner(f"Loading {Path(args.base).name}"):

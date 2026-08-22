@@ -490,7 +490,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     Both the standalone path and every batch job go through here, so a manifest
     line reproduces a solo invocation bit-for-bit."""
     if args.verb >= 1:
-        print(f"ffs_formwarp: device={device}")
+        print(
+            f"ffs_formwarp\n  device: {device}\n"
+            f"  final data resampling kernel: {args.final_interp}\n"
+        )
 
     t0 = time.time()
     with spinner(f"Loading {Path(args.base).name}"):
