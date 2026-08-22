@@ -357,3 +357,62 @@ class TestGateClearance:
         table = format_results_table(self._store(tmp_path).results())
         assert "NARROW" in table
         assert "clear" in table
+# --- reproduce ---------------------------------------------------------------
+
+
+def test_commands_for_covers_subjects_the_config_never_met(tmp_path):
+    """Adaptive search screens on one brain, so ``-reproduce`` used to yield one file.
+
+    The config an operator most wants to eyeball is an interesting row that was
+    never confirmed -- which is exactly the one with a single recorded trial.
+    """
+    s = TrialStore(tmp_path / "t.json")
+    s.runs.append(_meta(subjects=["s1", "s2", "s3"]))
+    for subj in ("s1", "s2", "s3"):
+        s.add(
+            "formwarp",
+            subj,
+            {"total_var": 1.0},
+            [
+                "ffs_formwarp",
+                "-base",
+                f"{subj}_b.nii",
+                "-source",
+                f"{subj}_s.nii",
+                "-prefix",
+                "out",
+                "-total_var",
+                "1.0",
+            ],
+            scores={"ls": 0.4},
+            seconds=1.0,
+        )
+    # Screened on s2 only.
+    s.add(
+        "formwarp",
+        "s2",
+        {"total_var": 0.5},
+        [
+            "ffs_formwarp",
+            "-base",
+            "s2_b.nii",
+            "-source",
+            "s2_s.nii",
+            "-prefix",
+            "out",
+            "-total_var",
+            "0.5",
+        ],
+        scores={"ls": 0.3},
+        seconds=1.0,
+    )
+    cid = s.config_id("formwarp", {"total_var": 0.5})
+
+    assert len(s.commands_for(cid, all_subjects=False)) == 1
+    cmds = s.commands_for(cid)
+    assert sorted(subj for subj, _ in cmds) == ["s1", "s2", "s3"]
+    for subj, cmd in cmds:
+        # Right images, and still the config's own knobs.
+        assert cmd[cmd.index("-base") + 1] == f"{subj}_b.nii"
+        assert cmd[cmd.index("-source") + 1] == f"{subj}_s.nii"
+        assert cmd[cmd.index("-total_var") + 1] == "0.5"

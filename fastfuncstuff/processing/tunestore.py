@@ -608,9 +608,48 @@ class TrialStore:
 
     # --- reproduction -------------------------------------------------------
 
-    def commands_for(self, config_id: int) -> list[tuple[str, list[str]]]:
-        """(subject, command) for every trial of a config — what to re-run."""
-        return [(t.subject, t.command) for t in self.trials if t.config_id == config_id]
+    def commands_for(
+        self, config_id: int, all_subjects: bool = True
+    ) -> list[tuple[str, list[str]]]:
+        """(subject, command) for a config — what to re-run.
+
+        ``all_subjects`` (the default) also synthesises a command for every subject
+        the config was never *tried* on. That is the normal case, not an edge case:
+        adaptive search screens most candidates on one brain, so re-running only the
+        trials that exist gives one image for a config screened once — which is
+        exactly the config you most want to see on everybody before trusting it.
+
+        The synthetic command is the config's own command with ``-base``/``-source``
+        swapped for the missing subject's, taken from any trial that used them, so
+        the knobs are still the ones that were rendered and scored.
+        """
+        mine = [t for t in self.trials if t.config_id == config_id]
+        out = [(t.subject, list(t.command)) for t in mine]
+        if not all_subjects or not mine:
+            return out
+
+        template = next((t for t in mine if t.command), None)
+        if template is None:
+            return out
+        backend, seen = template.backend, {t.subject for t in mine}
+        # Where each subject's images live, per the trials that did run.
+        pairs: dict[str, tuple[str, str]] = {}
+        for t in self.trials:
+            if t.subject in seen or t.subject in pairs or t.backend != backend or not t.command:
+                continue
+            try:
+                b = t.command[t.command.index("-base") + 1]
+                sv = t.command[t.command.index("-source") + 1]
+            except (ValueError, IndexError):  # pragma: no cover - malformed record
+                continue
+            pairs[t.subject] = (b, sv)
+
+        for subject, (base, source) in pairs.items():
+            cmd = list(template.command)
+            cmd[cmd.index("-base") + 1] = base
+            cmd[cmd.index("-source") + 1] = source
+            out.append((subject, cmd))
+        return out
 
 
 @dataclass

@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from .allineate import _voxdims_from_header
-from .io import load_image
+from .io import load_image, save_image
 from .mask import automask
 from .metrics import MetricInputs, evaluate_metrics
 from .tuneopt import Observation, SearchSpace, config_key, propose
@@ -254,7 +254,6 @@ def affine_align(
     """
     from .allineate import AffineAlignConfig
     from .allineate import allineate as run_allineate
-    from .io import save_image
 
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cache = out_dir / "affine"
@@ -744,7 +743,13 @@ def reproduce(
     timeout: float | None = None,
     verb: int = 1,
 ) -> list[Path]:
-    """Re-run every fit of one config, keeping the outputs so they can be looked at."""
+    """Re-run a config on **every** subject, keeping the outputs so they can be looked at.
+
+    Every subject, not every recorded trial. Adaptive search screens most candidates
+    on one brain, so the config you most want to eyeball -- an interesting row that
+    was never confirmed -- is exactly the one whose recorded trials are a single fit.
+    ``commands_for`` synthesises the missing ones from the same rendered command.
+    """
     out_root = work_dir / "kept" / f"config{config_id:04d}"
     out_root.mkdir(parents=True, exist_ok=True)
     written = []
@@ -758,4 +763,40 @@ def reproduce(
             print(f"  {subject}: {' '.join(cmd)}", flush=True)
         subprocess.run(cmd, timeout=timeout, check=False)
         written.append(target)
+        written += _keep_inputs(cmd, out_root, subject, verb)
     return written
+
+
+def _keep_inputs(cmd: list[str], out_root: Path, subject: str, verb: int) -> list[Path]:
+    """Drop this trial's base and affine-aligned source beside its output.
+
+    A warped volume on its own answers nothing -- the question is always "closer
+    to the target than the input was?", which needs all three open at once. They
+    are *materialised* rather than copied because the recorded paths carry sub-brick
+    selectors and .zst compression (``..._unwarped.nii.zst[0]``), so a copy would
+    hand back a 4D archive to sub-brick by hand. What lands here is the exact
+    volume the fit saw.
+
+    Named with the same ``{subject}_`` prefix as the output, which is what keeps
+    five subjects' identically-named stage files from colliding in one directory.
+    """
+    out: list[Path] = []
+    for flag, tag in (("-base", "base"), ("-source", "source_lin")):
+        try:
+            src = cmd[cmd.index(flag) + 1]
+        except (ValueError, IndexError):  # pragma: no cover - malformed command
+            continue
+        dest = out_root / f"{subject}_{tag}.nii.gz"
+        out.append(dest)
+        if dest.exists():
+            continue  # same inputs for every config; write them once
+        try:
+            vol, hdr = load_image(src)
+            if vol.ndim == 4:
+                vol = vol[0]
+            save_image(vol, dest, hdr)
+        except (OSError, ValueError, RuntimeError) as exc:
+            if verb >= 1:
+                print(f"    (could not keep {flag} {src}: {exc})", flush=True)
+            out.pop()
+    return out
