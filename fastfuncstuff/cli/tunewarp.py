@@ -117,8 +117,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     search.add_argument(
         "-screen",
         type=int,
-        default=1,
-        help="Adaptive only: subjects a fresh candidate is tried on (default: 1)",
+        default=2,
+        help="Adaptive only: subjects a fresh candidate is tried on (default: 2). "
+        "One is not enough: on a 7T epi2epi run the same config's rank moved a "
+        "median of 10 places (and up to 43, of ~150) depending on which brain it "
+        "met, so a single screen promotes and kills candidates by which subject "
+        "came up. Two costs twice the screening -- which is the cheap half -- and "
+        "buys a candidate that survived disagreement.",
     )
     search.add_argument(
         "-confirm",
