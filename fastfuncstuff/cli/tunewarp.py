@@ -5,23 +5,47 @@ Command: ffs_tunewarp (registered as entry point in pyproject.toml)
 Answers "what settings work for data like this", not "what is the best warp for
 this one pair". You give it a few already-affine-aligned subjects, it fits every
 backend across its own parameter grid, scores each result with functionals the
-backend did not optimise plus a deformation-regularity check, and prints a
-ranked table you pick a number out of.
+backend did not optimise plus a deformation-regularity check, and prints the
+accuracy/smoothness trade-off you pick a row out of.
 
 It is a dev tool for building defaults, so it is allowed to take a while — but
 it is not allowed to fill your disk. Trial outputs are scored and deleted;
 only the numbers and the exact command survive. When a row looks interesting,
-``-reproduce N`` re-runs it and keeps the images so you can actually look.
+``-reproduce N`` re-runs it on every subject and keeps the images, alongside the
+base and the affine-aligned source, so you can actually look.
+
+**A tuning directory has a long life.** The expected shape is not one big run:
+it is a small run early in a study to get a direction, and more subjects folded
+in later to sharpen it. So pointing a second invocation at the same ``-out``
+picks up where the last one left off rather than starting over — the ladders are
+rebuilt from the trials already recorded, screening goes to whichever subjects
+the table knows least about (which puts a newly added brain first without being
+told it is new), values that folded every time they were tried are dropped, and a
+backend stops once the frontier stops moving. That last one makes ``-budget`` a
+ceiling rather than a promise: asking for 300 fits on a space that is already
+mapped costs about 60.
+
+Resuming assumes the *engines* have not changed under the stored trials. The run
+records its commit and says so up front when they differ; it is a warning rather
+than a refusal, because only you can judge whether a given commit moved numbers.
 
 Usage:
-    # search (one base, many sources)
-    ffs_tunewarp -type MNI_T1 -base mni.nii.gz -source s1.nii.gz s2.nii.gz s3.nii.gz \\
+    # start a study (one base, many sources)
+    ffs_tunewarp -type MNI_T1 -base mni.nii.gz -source s1.nii.gz s2.nii.gz \
                  -out tune_mni
 
-    # look at what has been tried
-    ffs_tunewarp -out tune_mni -list
+    # later: two more subjects, same directory. Prior fits are reused; the new
+    # brains are screened first; it stops when it stops learning.
+    ffs_tunewarp -type MNI_T1 -base mni.nii.gz \
+                 -source s1.nii.gz s2.nii.gz s3.nii.gz s4.nii.gz \
+                 -out tune_mni -budget 200
 
-    # rebuild config 7's warps and keep them
+    # read the answer
+    ffs_tunewarp -out tune_mni -list        # ranked table + the frontier
+    ffs_tunewarp -out tune_mni -effects     # what each knob does
+    ffs_tunewarp -out tune_mni -importance  # which knobs to stop searching
+
+    # look at a row, on every subject
     ffs_tunewarp -out tune_mni -reproduce 7
 
 Sources must be affine-aligned to the base. Pass ``-allineate`` to have that
@@ -55,6 +79,7 @@ from fastfuncstuff.processing.tunestore import (
     format_level_gains,
     format_reproduce,
     format_results_table,
+    format_resume,
     format_runs,
     knob_effects,
     knob_importance,
@@ -152,6 +177,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "0.8mm, 5 healthy adults'. Stored with the run and carried into -export and "
         "-guide. A preset is a claim that settings suit data of a KIND, and the "
         "shape and voxel size recorded automatically do not say which kind.",
+    )
+    search.add_argument(
+        "-patience",
+        type=int,
+        default=3,
+        help="Adaptive only: stop a backend after this many rounds fail to grow the "
+        "accuracy/smoothness frontier by -tol (default: 3; 0 spends the whole budget). "
+        "This makes -budget a ceiling rather than a promise, so asking for more fits "
+        "than the space can use costs nothing.",
+    )
+    search.add_argument(
+        "-tol",
+        type=float,
+        default=0.02,
+        help="Adaptive only: relative growth in the frontier's dominated area, per "
+        "round, that counts as progress (default: 0.02). A judgement dial, not a "
+        "measured constant: nothing can tell you how much better is worth another ten "
+        "fits. Raise it to stop sooner on a rough answer, lower it to keep refining.",
     )
     search.add_argument("-seed", type=int, default=0, help="Adaptive only: RNG seed (default: 0)")
     search.add_argument(
@@ -256,27 +299,36 @@ def _epilog() -> str:
                 lines.append(f"  {'':10s}   {chunk}")
         lines.append("")
     lines += [
-        "Examples (MNI tuning, start to finish):",
+        "A study, start to finish:",
         "",
-        "  # 1. search everything, affine included (-allineate does step 0 for you)",
+        "  # 1. early in the study: a few subjects, affine included",
+        "  ffs_tunewarp -type MNI_T1 -allineate \\",
+        "               -base MNI152_2009_template.nii.gz \\",
+        "               -source sub-00{1,2,3}/SUMA/brain.nii.gz \\",
+        "               -out tune_mni",
+        "",
+        "  # 2. read what it found",
+        "  ffs_tunewarp -out tune_mni -list         # ranked configs + the frontier",
+        "  ffs_tunewarp -out tune_mni -effects      # what each knob does",
+        "  ffs_tunewarp -out tune_mni -importance   # which knobs never mattered",
+        "",
+        "  # 3. look at a row you like -- on every subject, next to its inputs",
+        "  ffs_tunewarp -out tune_mni -reproduce 23",
+        "",
+        "  # 4. LATER: more subjects, same directory. Earlier fits are reused, the",
+        "  #    new brains are screened first, and it stops when it stops learning,",
+        "  #    so a generous -budget costs only what the space can actually use.",
         "  ffs_tunewarp -type MNI_T1 -allineate \\",
         "               -base MNI152_2009_template.nii.gz \\",
         "               -source sub-*/SUMA/brain.nii.gz \\",
-        "               -out tune_mni",
+        "               -out tune_mni -budget 200",
         "",
-        "  # 2. or spend the budget only on what you do not already know",
+        "  # 5. spend the budget only on what you do not already know",
         "  ffs_tunewarp -type MNI_T1 ... -out tune_mni \\",
         "               -fix qwarp.minpatch=13 qwarp.hfactor_q=0.5",
         "",
-        "  # 2b. exhaustive instead, when you want every cell of the factorial",
+        "  # 5b. exhaustive instead, when you want every cell of the factorial",
         "  ffs_tunewarp -type MNI_T1 ... -out tune_mni -search grid",
-        "",
-        "  # 3. read the answer",
-        "  ffs_tunewarp -out tune_mni -effects      # what each knob does",
-        "  ffs_tunewarp -out tune_mni -list         # ranked configs",
-        "",
-        "  # 4. look at the winner",
-        "  ffs_tunewarp -out tune_mni -reproduce 23",
         "",
         "Pairing:",
         "  one_base   -base ONE -source A B C     (each source vs the same base)",
@@ -293,11 +345,31 @@ def _epilog() -> str:
         "first -- and excluding the optimised cost excludes its whole family, since",
         "lpa/lpa+/lpc/lpc+ are all the same number wearing different signs.",
         "",
-        "Expect the ranking to sit on the fold boundary. Less regularization always",
-        "scores better, because folding is what buys the score, so the top row is",
-        "normally the least regularization that is still legal rather than an",
-        "optimum. -effects is the safer read: it separates 'how good when it works'",
-        "from 'how often does it work'.",
+        "Reading the table:",
+        "",
+        "  Every functional in the jury improves with overfit, and the gate fails only",
+        "  on FOLDING -- det(J) > 0 is a topology check, not a smoothness one. So the",
+        "  top row is the loosest field that is still legal, never an optimum, and the",
+        "  'score' column on its own cannot tell you otherwise.",
+        "",
+        "  'bend' (bending energy) and 'jacmin' are printed next to it for that reason,",
+        "  and the FRONTIER table below the ranking is the one to read: it lists the",
+        "  configs nothing else beats on both similarity and smoothness, smoothest",
+        "  first. Walk up it and stop where the score stops being worth the roughness.",
+        "  A 10x jump in 'bend' for a few hundredths of score is the ranking paying for",
+        "  detail that is not anatomy.",
+        "",
+        "  PINNED means the warp came back resting on the solver's own anti-fold floor,",
+        "  so the damping is what kept it legal rather than its regularization. Those",
+        "  are demoted and kept off the frontier: the same settings fold outright on a",
+        "  subject where the guard cannot hold.",
+        "",
+        "  Mind the 'n' column. Screening deliberately spends few fits on most",
+        "  candidates, so a row measured on one brain and one measured on four are not",
+        "  comparable; -reproduce a row before believing it.",
+        "",
+        "  -effects is the safer read for a knob: it separates 'how good when it works'",
+        "  from 'how often does it work'.",
     ]
     return "\n".join(lines)
 
@@ -479,6 +551,14 @@ def main(argv: list[str] | None = None) -> int:
         note=args.note,
     )
 
+    # After begin_run, so `warnings()` can compare the earlier runs against the one
+    # about to happen -- and before any fitting, because "these trials were scored by
+    # a different build" is worth knowing while it can still change your mind.
+    if args.verb >= 1 and (resume := format_resume(store, [p.name for p in pairs])):
+        print("\n" + resume)
+        for w in store.warnings():
+            print(f"  ! {w}")
+
     if args.allineate:
         if args.verb >= 1:
             print(f"\nStep 0: affine ({recipe.optimize}) for {len(pairs)} subject(s)")
@@ -492,6 +572,8 @@ def main(argv: list[str] | None = None) -> int:
             batch=args.batch,
             expand=not args.no_expand,
             seed=args.seed,
+            patience=args.patience,
+            tol=args.tol,
         )
         run_adaptive(
             pairs,
@@ -517,12 +599,12 @@ def main(argv: list[str] | None = None) -> int:
 
     store.compute_consensus(recipe.panel())
     store.save()
-    warn = store.warnings()
-    if warn:
+    if (warn := store.warnings()) and args.verb < 1:
+        # Already said before the fits when verbose; repeated here only for a quiet
+        # run, where this is the first and last chance to say it.
         print("\nThis directory holds earlier runs that may not be comparable:")
         for w in warn:
             print(f"  - {w}")
-        print("  Folded in anyway; the trials are tagged with which run produced them.")
     print("\n" + format_results_table(store.results(), limit=args.top))
     print("\nPer-knob effects:\n")
     print(format_knob_effects(knob_effects(store)))
