@@ -8,6 +8,7 @@ data loading, and output formatting.
 
 from __future__ import annotations
 
+import argparse
 import contextlib
 import glob as glob_module
 import itertools
@@ -3709,6 +3710,25 @@ def collect_batch_jobs(
     return jobs
 
 
+# Outer settings that describe the BATCH rather than a run, so a run must not
+# inherit them: -batch/-batch_run would trip the no-nesting guard on every line,
+# and -batch_skip/-device are decided once for the whole batch by the runner.
+_BATCH_ONLY_ARGS = frozenset({"batch", "batch_run", "batch_skip", "device"})
+
+
+def _run_defaults(defaults) -> argparse.Namespace | None:
+    """A fresh copy of the outer args to seed one run's parse with.
+
+    Fresh per run because argparse writes into the namespace it is given, so a
+    shared one would leak the first run's settings into the second.
+    """
+    if defaults is None:
+        return None
+    return argparse.Namespace(
+        **{k: v for k, v in vars(defaults).items() if k not in _BATCH_ONLY_ARGS}
+    )
+
+
 def run_batch_jobs(
     *,
     tool: str,
@@ -3721,6 +3741,7 @@ def run_batch_jobs(
     expected_outputs=None,
     skip_existing: bool = False,
     verb: int = 1,
+    defaults=None,
 ) -> None:
     """Run every collected batch job in this one process, isolating failures.
 
@@ -3751,6 +3772,16 @@ def run_batch_jobs(
         Concrete output paths the run would write; required for ``skip_existing``.
     skip_existing : bool
         When True, a run whose ``expected_outputs`` all already exist is skipped.
+    defaults : Namespace, optional
+        The outer command's own args. Every setting on it becomes the DEFAULT for
+        each run, which the run's own line overrides flag by flag.
+
+        Bug of record: without this, a flag outside -batch was silently dropped.
+        `ffs_optiwarp -force lk -batch runs.txt` ran demons -- the default -- on
+        every pair, and nothing said so; the same held for every batchable tool
+        and every flag. Shared settings are exactly what one wants to state once,
+        and a manifest is already per-run, so "outer = default, line = override"
+        is the only reading that does not make a whole run wrong in silence.
     """
     import os
 
@@ -3766,7 +3797,7 @@ def run_batch_jobs(
     bar = tqdm(jobs, desc=desc, unit="run", leave=True, disable=len(jobs) == 1)
     for label, line in bar:
         try:
-            run_args = parse_line(line)
+            run_args = parse_line(line, _run_defaults(defaults))
             if is_nested is not None and is_nested(run_args):
                 raise ValueError("-batch/-batch_run cannot be nested inside a run")
             if validate is not None:

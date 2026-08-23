@@ -35,7 +35,9 @@ from fastfuncstuff.processing.nwarpforge import (
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ffs_nwarp",
         description="GPU-accelerated multi-warp composition and application",
@@ -321,7 +323,7 @@ Examples:
         help="Print detailed debug info (matrices, warp stats)",
     )
 
-    return parser.parse_args(argv)
+    return parser.parse_args(argv, namespace or argparse.Namespace())
 
 
 def _select_device(device_arg: str | None) -> torch.device:
@@ -363,7 +365,8 @@ def main(argv: list[str] | None = None) -> None:
             tool="ffs_nwarp",
             jobs=jobs,
             device=device,
-            parse_line=lambda line: parse_args(shlex.split(line)),
+            parse_line=lambda line, base: parse_args(shlex.split(line), base),
+            defaults=args,
             dispatch=_dispatch_run,
             validate=_validate_batch_run,
             is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,

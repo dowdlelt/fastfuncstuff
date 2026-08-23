@@ -126,7 +126,9 @@ def _run_estimation(args, data, config, header_info, base_vol, input_file, verb)
     return moco_spacetime(data, config, header_info=header_info, base_vol=base_vol)
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         prog="ffs_moco",
@@ -619,7 +621,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # `-axis -k` looks like an option flag to argparse; rewrite the axis token.
     if argv is None:
         argv = sys.argv[1:]
-    args = parser.parse_args(normalize_axis_argv(list(argv), {"-axis"}))
+    args = parser.parse_args(
+        normalize_axis_argv(list(argv), {"-axis"}), namespace or argparse.Namespace()
+    )
     return args
 
 
@@ -1272,7 +1276,8 @@ def _run_batch(args: argparse.Namespace) -> None:
         tool="ffs_moco",
         jobs=jobs,
         device=device,
-        parse_line=lambda line: parse_args(shlex.split(line)),
+        parse_line=lambda line, base: parse_args(shlex.split(line), base),
+        defaults=args,
         dispatch=lambda run_args, dev: _dispatch_run(run_args, dev, run_args.verb),
         validate=_validate_batch_run,
         is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,

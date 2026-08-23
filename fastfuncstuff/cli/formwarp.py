@@ -184,7 +184,9 @@ usually grids/headers, not tuning -- see the -matrix help text.
 """
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="ffs_formwarp",
         description="GPU SyN (symmetric normalization) nonlinear registration.",
@@ -383,7 +385,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         extra="On Apple Silicon use CPU: MPS falls back to CPU for SyN's 3-D grid-sample backward pass.",
     )
     add_verbose_arg(p)
-    args = p.parse_args(argv)
+    args = p.parse_args(argv, namespace or argparse.Namespace())
     # After parsing, so that "did the user type this flag" is answerable from argv
     # rather than guessed by comparing values against defaults.
     apply_recipe_preset(args, _PRESET_BACKEND, argv, verb=getattr(args, "verb", 1))
@@ -463,7 +465,8 @@ def main(argv: list[str] | None = None) -> int:
             tool="ffs_formwarp",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=_select_device(args),
-            parse_line=lambda line: parse_args(shlex.split(line)),
+            parse_line=lambda line, base: parse_args(shlex.split(line), base),
+            defaults=args,
             dispatch=_batch_dispatch,
             validate=_validate_batch_run,
             is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,

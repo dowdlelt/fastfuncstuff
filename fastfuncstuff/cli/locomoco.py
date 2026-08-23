@@ -1995,7 +1995,7 @@ def _run_multiecho(
     return 0
 
 
-def _parse(argv: list[str]) -> argparse.Namespace:
+def _parse(argv: list[str], namespace: argparse.Namespace | None = None) -> argparse.Namespace:
     """Parse one ffs_locomoco command line. Shared by the solo path and by every
     -batch manifest line, so a batched run is byte-identical to a solo one."""
     from fastfuncstuff.processing.locomoco import normalize_axis_argv
@@ -2013,7 +2013,8 @@ def _parse(argv: list[str]) -> argparse.Namespace:
                 "-slice_axis",
                 "-slice",
             },
-        )
+        ),
+        namespace or argparse.Namespace(),
     )
 
 
@@ -2052,7 +2053,8 @@ def main(argv: list[str] | None = None) -> int:
             tool="ffs_locomoco",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=setup_device(args.device, tf32=REGISTRATION_TF32),
-            parse_line=lambda line: _parse(shlex.split(line)),
+            parse_line=lambda line, base: _parse(shlex.split(line), base),
+            defaults=args,
             # _dispatch_run reports bad requests with a nonzero return, not an
             # exception; the batch runner only counts raises, so translate.
             dispatch=_dispatch_raising,

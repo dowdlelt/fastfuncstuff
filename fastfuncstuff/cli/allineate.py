@@ -156,7 +156,9 @@ def _resolve_ov(args: argparse.Namespace) -> float:
     return 0.4 if args.cost.lower().startswith(("lpa+", "lpc+")) else 0.0
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
         prog="allineate",
@@ -583,7 +585,7 @@ Examples:
     )
     add_verbose_arg(hw_group, default=1)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv, namespace or argparse.Namespace())
     return args
 
 
@@ -657,7 +659,8 @@ def main(argv: list[str] | None = None) -> None:
             tool="ffs_allineate",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=_select_device(args.device),
-            parse_line=lambda line: parse_args(shlex.split(line)),
+            parse_line=lambda line, base: parse_args(shlex.split(line), base),
+            defaults=args,
             dispatch=_dispatch_run,
             validate=_validate_batch_run,
             is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,

@@ -168,7 +168,9 @@ which level introduced the damage, then cut there with -maxlev (or -early_stop).
 """
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         prog="qwarp",
         description=(
@@ -887,7 +889,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print GPU memory estimate for the input data and exit without running registration",
     )
 
-    return p.parse_args(argv)
+    return p.parse_args(argv, namespace or argparse.Namespace())
 
 
 def _zeropad_width(n: int) -> int:
@@ -1537,7 +1539,8 @@ def main(argv: list[str] | None = None) -> int:
             tool="ffs_qwarp",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=_select_device(args),
-            parse_line=lambda line: parse_args(shlex.split(line)),
+            parse_line=lambda line, base: parse_args(shlex.split(line), base),
+            defaults=args,
             dispatch=_batch_dispatch,
             validate=_validate_batch_run,
             is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,

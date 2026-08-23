@@ -64,7 +64,7 @@ def test_run_batch_skips_when_outputs_exist(tmp_path, capsys):
     jobs = [("run 1", "done"), ("run 2", "todo")]
     dispatched: list[str] = []
 
-    def parse_line(line: str) -> argparse.Namespace:
+    def parse_line(line: str, base=None) -> argparse.Namespace:
         return _ns(out=str(done if line == "done" else todo))
 
     run_batch_jobs(
@@ -90,7 +90,7 @@ def test_run_batch_no_skip_runs_all(tmp_path):
         tool="ffs_test",
         jobs=[("run 1", "done")],
         device=torch.device("cpu"),
-        parse_line=lambda line: _ns(out=str(done)),
+        parse_line=lambda line, base: _ns(out=str(done)),
         dispatch=lambda a, d: dispatched.append(a.out),
         expected_outputs=lambda a: [a.out],
         skip_existing=False,  # skip disabled → runs even though the file exists
@@ -112,7 +112,7 @@ def test_run_batch_isolates_failures(capsys):
             tool="ffs_test",
             jobs=[("run 1", "good"), ("run 2", "bad"), ("run 3", "good2")],
             device=torch.device("cpu"),
-            parse_line=lambda line: _ns(tag="good2" if line == "good2" else line),
+            parse_line=lambda line, base: _ns(tag="good2" if line == "good2" else line),
             dispatch=dispatch,
             verb=1,
         )
@@ -127,7 +127,7 @@ def test_run_batch_rejects_nested_batch(capsys):
             tool="ffs_test",
             jobs=[("run 1", "x")],
             device=torch.device("cpu"),
-            parse_line=lambda line: _ns(nested=True),
+            parse_line=lambda line, base: _ns(nested=True),
             dispatch=lambda a, d: None,
             is_nested=lambda a: a.nested,
             verb=1,
@@ -648,3 +648,80 @@ def test_qwarp_batch_is_not_shadowed_by_its_optimizer_flags():
 
     a = parse_args(["-batch", "runs.txt", "-batch_iters", "7"])
     assert a.batch == "runs.txt" and a.batch_iters == 7
+
+
+# --------------------------------------------------------------------------
+# Outer flags are per-run defaults
+# --------------------------------------------------------------------------
+
+
+def test_outer_flags_reach_every_run():
+    """Bug of record: a flag outside -batch was silently dropped.
+
+    `ffs_optiwarp -force lk -batch runs.txt` ran demons -- the default -- on every
+    pair, and nothing said so. Under autoproc that meant asking for optiwarp_lk
+    and getting demons: a whole study's worth of warps from the wrong engine, with
+    a script that reads as though it asked for the right one.
+    """
+    seen = []
+    run_batch_jobs(
+        tool="t",
+        jobs=[("line 1", "-prefix a"), ("line 2", "-prefix b")],
+        device=torch.device("cpu"),
+        parse_line=lambda line, base: _parse_toy(line, base),
+        dispatch=lambda ra, dev: seen.append((ra.prefix, ra.force)),
+        defaults=_parse_toy("-force lk"),
+    )
+    assert seen == [("a", "lk"), ("b", "lk")]
+
+
+def test_a_run_line_overrides_the_outer_default():
+    seen = []
+    run_batch_jobs(
+        tool="t",
+        jobs=[("line 1", "-prefix a"), ("line 2", "-prefix b -force demons")],
+        device=torch.device("cpu"),
+        parse_line=lambda line, base: _parse_toy(line, base),
+        dispatch=lambda ra, dev: seen.append((ra.prefix, ra.force)),
+        defaults=_parse_toy("-force lk"),
+    )
+    assert seen == [("a", "lk"), ("b", "demons")]
+
+
+def test_one_runs_settings_do_not_leak_into_the_next():
+    """argparse writes into the namespace it is handed, so each run needs its own."""
+    seen = []
+    run_batch_jobs(
+        tool="t",
+        jobs=[("line 1", "-prefix a -force demons"), ("line 2", "-prefix b")],
+        device=torch.device("cpu"),
+        parse_line=lambda line, base: _parse_toy(line, base),
+        dispatch=lambda ra, dev: seen.append((ra.prefix, ra.force)),
+        defaults=_parse_toy("-force lk"),
+    )
+    assert seen == [("a", "demons"), ("b", "lk")]
+
+
+def test_batch_only_flags_are_not_inherited_by_a_run():
+    """-batch on the outer command must not make every line look nested."""
+    seen = []
+    run_batch_jobs(
+        tool="t",
+        jobs=[("line 1", "-prefix a")],
+        device=torch.device("cpu"),
+        parse_line=lambda line, base: _parse_toy(line, base),
+        dispatch=lambda ra, dev: seen.append(ra.prefix),
+        is_nested=lambda ra: getattr(ra, "batch", None) is not None,
+        defaults=_parse_toy("-batch runs.txt -force lk"),
+    )
+    assert seen == ["a"]
+
+
+def _parse_toy(line: str, base=None) -> argparse.Namespace:
+    import shlex
+
+    p = argparse.ArgumentParser()
+    p.add_argument("-prefix", default=None)
+    p.add_argument("-force", default="demons")
+    p.add_argument("-batch", default=None)
+    return p.parse_args(shlex.split(line), base)

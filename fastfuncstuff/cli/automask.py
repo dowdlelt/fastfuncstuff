@@ -29,7 +29,9 @@ from fastfuncstuff.processing.mask import automask
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+def parse_args(
+    argv: list[str] | None = None, namespace: argparse.Namespace | None = None
+) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ffs_util_automask",
         description="Create a binary brain mask from a 3D volume (GPU, AFNI-compatible)",
@@ -68,7 +70,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_verbose_arg(parser, default=1)
 
-    return parser.parse_args(argv)
+    return parser.parse_args(argv, namespace or argparse.Namespace())
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:
@@ -94,7 +96,8 @@ def main(argv: list[str] | None = None) -> None:
             tool="ffs_util_automask",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=setup_device(args.device, tf32=REGISTRATION_TF32),
-            parse_line=lambda line: parse_args(shlex.split(line)),
+            parse_line=lambda line, base: parse_args(shlex.split(line), base),
+            defaults=args,
             dispatch=_dispatch_run,
             validate=_validate_batch_run,
             is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
