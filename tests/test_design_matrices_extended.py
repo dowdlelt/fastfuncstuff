@@ -467,3 +467,86 @@ class TestOnsetsToTrMatrix:
             device=DEVICE,
         )
         assert design[:, 0].nonzero().flatten().tolist() == [1]
+
+
+class TestJointBasisAnchorScaling:
+    """A jointly fitted basis set shares one scale, set by the anchor (first)
+    curve. Peak-normalising each basis separately rescales beta1 by
+    peak(h)/peak(h') and every latency read off the ratio is wrong by that
+    factor -- 2.56x for SPMG2's time derivative."""
+
+    @staticmethod
+    def _spmg_setup(n_basis):
+        from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives
+
+        bases = get_spm_hrf_with_derivatives(
+            microtime_dt=0.05, hrf_duration=32.0, n_basis=n_basis, device=DEVICE
+        )
+        onsets = [[np.arange(5.0, 280.0, 23.0)]]
+        return bases, onsets
+
+    def test_anchor_keeps_unit_peak_amplitude(self):
+        """beta0 must still carry AFNI's unit-peak amplitude convention."""
+        bases, onsets = self._spmg_setup(3)
+        design = build_event_design_microtime(
+            onsets, [0.0], bases, [300], tr=1.0, microtime_dt=0.05, device=DEVICE
+        )
+        assert isinstance(design, torch.Tensor)
+        # Sampled at TR, so the microtime peak is bracketed, not hit exactly.
+        assert design[:, 0].max().item() == pytest.approx(1.0, abs=0.02)
+
+    def test_derivatives_are_not_individually_peak_normalized(self):
+        bases, onsets = self._spmg_setup(3)
+        design = build_event_design_microtime(
+            onsets, [0.0], bases, [300], tr=1.0, microtime_dt=0.05, device=DEVICE
+        )
+        assert isinstance(design, torch.Tensor)
+        # The derivative columns are genuinely smaller than the canonical one.
+        # Under the old per-basis scaling all three peaked at 1.0.
+        for col in (1, 2):
+            assert design[:, col].abs().max().item() < 0.9
+
+    @pytest.mark.parametrize("true_delta", [0.0, 0.3, 0.6, -0.4])
+    def test_beta_ratio_recovers_latency_in_seconds(self, true_delta):
+        """The property the scaling exists to protect: b1/b0 is the shift, in
+        seconds, with no calibration factor."""
+        from fastfuncstuff.design.hrf import get_spmg1_hrf
+
+        dt = 0.05
+        bases, onsets = self._spmg_setup(2)
+        design = build_event_design_microtime(
+            onsets, [0.0], bases, [300], tr=1.0, microtime_dt=dt, device=DEVICE
+        )
+        assert isinstance(design, torch.Tensor)
+
+        hrf = get_spmg1_hrf(
+            microtime_dt=dt,
+            stim_duration=0.0,
+            hrf_duration=32.0,
+            normalize_peak=True,
+            device=DEVICE,
+        )
+        shift_bins = int(round(true_delta / dt))
+        shifted = torch.roll(hrf, shift_bins)
+        if shift_bins > 0:
+            shifted[:shift_bins] = 0
+        truth = build_event_design_microtime(
+            onsets, [0.0], shifted, [300], tr=1.0, microtime_dt=dt, device=DEVICE
+        )
+        assert isinstance(truth, torch.Tensor)
+
+        betas = torch.linalg.lstsq(design, truth[:, :1]).solution.flatten()
+        assert betas[0].item() == pytest.approx(1.0, abs=0.05)
+        assert (betas[1] / betas[0]).item() == pytest.approx(true_delta, abs=0.02)
+
+    def test_library_curves_are_still_unit_peak_each(self):
+        """A library is n *alternative* HRFs fitted one at a time, not a joint
+        set, so each must keep its own unit peak."""
+        # tr == microtime_dt samples every bin, so the column peak is the
+        # kernel peak exactly -- this tests the scaling, not TR sampling.
+        for row in self._spmg_setup(3)[0]:
+            design = build_event_design_microtime(
+                [[np.array([5.0])]], [0.0], row, [800], tr=0.05, microtime_dt=0.05, device=DEVICE
+            )
+            assert isinstance(design, torch.Tensor)
+            assert design[:, 0].abs().max().item() == pytest.approx(1.0, abs=1e-5)

@@ -100,6 +100,19 @@ def build_event_design_microtime(
     # One response kernel per condition and basis.  Duration is applied here,
     # before events are shifted and added, which makes overlap linear while
     # preserving AFNI's unit-peak SPMG1(d)/library-event convention.
+    #
+    # THE WHOLE SET SHARES ONE SCALE: every basis is divided by the *anchor*
+    # (first) basis's peak, not by its own.  A joint set is not n independent
+    # regressors -- the derivatives are only interpretable relative to the curve
+    # they are derivatives of.  h(t - d) ~= h(t) - d * h'(t), so beta1/beta0
+    # recovers the latency d only while h and h' are on a common scale.
+    # Peak-normalising each basis separately silently rescales beta1 by
+    # peak(h)/peak(h') -- 2.56x for SPMG2's time derivative, 2.08x for SPMG3's
+    # dispersion term -- and every latency read off those betas is wrong by
+    # that factor.  Anchoring keeps beta0 at AFNI's unit-peak amplitude while
+    # leaving the ratios physically meaningful.  Same rule for any jointly
+    # fitted family (FLOBS, derivative bases): scale by the anchor, never
+    # per curve.
     responses: list[list[torch.Tensor]] = []
     for duration in durations:
         duration_bins = max(1, int(np.round(float(duration) / microtime_dt)))
@@ -111,10 +124,10 @@ def build_event_design_microtime(
                 basis.flip(0).view(1, 1, -1),
                 padding=basis.numel() - 1,
             ).reshape(-1)[: basis.numel() + duration_bins - 1]
-            peak = response.abs().max()
-            if peak > 0:
-                response = response / peak
             cond_responses.append(response)
+        anchor_peak = cond_responses[0].abs().max()
+        if anchor_peak > 0:
+            cond_responses = [response / anchor_peak for response in cond_responses]
         responses.append(cond_responses)
 
     events = sorted(
