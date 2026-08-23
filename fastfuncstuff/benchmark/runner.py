@@ -64,11 +64,22 @@ class BenchmarkContext:
     def ffs_tag(self) -> str:
         """File/directory name tag identifying the FFS device variant.
 
-        Empty string for the default (GPU / auto-detected) build, ``"_cpu"``
-        for a CPU-forced run. Used by stage helpers to keep CPU-only outputs
-        from overwriting GPU outputs on the same dataset.
+        CUDA keeps the historical empty tag. CPU and MPS outputs are tagged so
+        explicit or auto-selected backends cannot overwrite one another.
         """
-        return "_cpu" if self.device == "cpu" else ""
+        arch_id = self.ffs_arch_id
+        if arch_id == "cpu":
+            return "_cpu"
+        if arch_id.startswith("mps-"):
+            return "_mps"
+        return ""
+
+    @property
+    def ffs_arch_id(self) -> str:
+        """Architecture ID for the device this benchmark actually requested."""
+        from .arch import get_ffs_arch_id
+
+        return get_ffs_arch_id(self.device)
 
     @property
     def ffs_prefix(self) -> str:
@@ -664,6 +675,7 @@ def run_stages(
             config=ctx.config,
             stage_results=stage_results,
             stage_validations=stage_validations,
+            device_spec=ctx.device,
         )
 
     return results

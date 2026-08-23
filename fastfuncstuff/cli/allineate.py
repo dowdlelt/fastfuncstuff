@@ -555,7 +555,7 @@ Examples:
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
         hw_group,
-        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
+        extra="On Apple Silicon, auto uses CPU; pass mps explicitly to experiment with Metal.",
     )
     add_deterministic_arg(hw_group)
     hw_group.add_argument(
@@ -608,7 +608,7 @@ def _parse_work_dxyz(value: str | float | None) -> str | float:
 
 
 def _select_device(device_arg: str | None) -> torch.device:
-    """Honour ``-device`` if given, else CUDA > MPS > CPU."""
+    """Honour ``-device`` if given, else use the canonical CUDA > CPU policy."""
     return setup_device(device_arg, tf32=REGISTRATION_TF32)
 
 

@@ -1391,7 +1391,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "deterministic", False):
         enable_determinism(getattr(args, "verb", 1))
 
-    # Select device (prefer CUDA > MPS > CPU)
+    # Select device (prefer CUDA > CPU; explicit MPS remains available).
     device_spec = args.device
     if (
         device_spec is None or str(device_spec).lower() == "auto"

@@ -304,7 +304,7 @@ Examples:
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
         hw_group,
-        extra="MPS is recommended on Mac for full-size volumes; small grids may be faster on CPU.",
+        extra="On Apple Silicon, auto uses CPU; pass mps explicitly to experiment with Metal.",
     )
     add_verbose_arg(hw_group, default=1)
 
@@ -325,7 +325,7 @@ Examples:
 
 
 def _select_device(device_arg: str | None) -> torch.device:
-    """Resolve -device (explicit wins, else cuda → mps → cpu)."""
+    """Resolve -device (explicit wins, else CUDA → CPU)."""
     return setup_device(device_arg, tf32=REGISTRATION_TF32)
 
 

@@ -144,6 +144,7 @@ exclude = ["tests*", "examples*"]
 [tool.setuptools.package-data]
 "fastfuncstuff.design" = ["*.tsv"]
 "fastfuncstuff.benchmark.configs" = ["*.yaml"]
+"fastfuncstuff.benchmark" = ["assets/*.m"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

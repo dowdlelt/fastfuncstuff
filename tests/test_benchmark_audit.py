@@ -77,6 +77,37 @@ def _ctx(tmp_path) -> BenchmarkContext:
     return BenchmarkContext(data_dir=tmp_path, dataset_id="testds")
 
 
+def test_benchmark_device_identity_honours_forced_cpu(tmp_path, monkeypatch):
+    """Available MPS hardware must not label a forced-CPU timing as MPS."""
+    from fastfuncstuff.benchmark.arch import get_ffs_arch_id
+
+    monkeypatch.setattr("torch.backends.mps.is_available", lambda: True)
+    assert get_ffs_arch_id("cpu") == "cpu"
+    assert get_ffs_arch_id("cpu,8") == "cpu"
+    assert get_ffs_arch_id("mps").startswith("mps-")
+    assert BenchmarkContext(data_dir=tmp_path, device="cpu,8").ffs_tag == "_cpu"
+    assert BenchmarkContext(data_dir=tmp_path, device="mps").ffs_tag == "_mps"
+
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    assert get_ffs_arch_id("auto") == "cpu"
+    assert BenchmarkContext(data_dir=tmp_path, device="auto").ffs_tag == "_cpu"
+
+    from fastfuncstuff.benchmark.timing_cache import append_run, load_cache
+
+    append_run(tmp_path, {"fake": {"ffs_seconds": 1.0}}, device_spec="cpu,8")
+    cached = load_cache(tmp_path)["runs"][-1]
+    assert cached["ffs_arch_id"] == "cpu"
+    assert cached["hardware"]["requested_device"] == "cpu,8"
+
+
+def test_glmsingle_matlab_helper_is_packaged(tmp_path):
+    from fastfuncstuff.benchmark.stages.glmsingle_matlab import _matlab_script
+
+    script = _matlab_script(_ctx(tmp_path))
+    assert script.exists()
+    assert script.parent.name == "assets"
+
+
 def test_missing_validation_inputs_helper(tmp_path):
     present = tmp_path / "present.nii"
     present.write_text("x")

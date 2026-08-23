@@ -1,6 +1,6 @@
 """Run MATLAB GLMsingle via `matlab -batch`.
 
-This stage runs the MATLAB script test_data/run_glmsingle_comparison.m
+This stage runs the packaged MATLAB script benchmark/assets/run_glmsingle_comparison.m
 which executes GLMsingle (Types B, C, D) and exports NIfTI files for
 benchmark comparison. It's a prerequisite for all glmsingle_* stages.
 
@@ -64,10 +64,8 @@ def _runs(ctx: BenchmarkContext) -> list[int]:
 
 def _matlab_script(ctx: BenchmarkContext) -> Path:
     """Find the MATLAB comparison script."""
-    # Project root: fastfuncstuff/benchmark/stages/glmsingle_matlab.py -> ../../..
-    project_root = Path(__file__).resolve().parents[3]
     candidates = [
-        project_root / "test_data" / "run_glmsingle_comparison.m",
+        Path(__file__).resolve().parents[1] / "assets" / "run_glmsingle_comparison.m",
         ctx.data_dir.parent / "run_glmsingle_comparison.m",
         ctx.data_dir / "run_glmsingle_comparison.m",
     ]

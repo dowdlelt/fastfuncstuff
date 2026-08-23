@@ -1509,6 +1509,11 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
 _BATCH_FREE_WORK = 8.5e7
 
 
+def _cma_state_dtype(device: torch.device) -> torch.dtype:
+    """Use double CMA state except on Metal, which has no float64 tensors."""
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
 def _pick_optimizer(requested: str, n_points: int, n_trials: int, n_free: int) -> str:
     """Resolve ``-optimizer auto`` for one refinement stage."""
     if requested != "auto":
@@ -1584,10 +1589,10 @@ def _refine_cmaes_batched(
     sigma0 = float(_os.environ.get("FFS_CMA_S0", sigma0))
     mu = lam // 2
 
-    # Log-decreasing recombination weights (Hansen); dtype float64 -- the CMA
-    # algebra is n x n with n <= 12, so double precision here is free and keeps
-    # the covariance update well-conditioned.
-    dt = torch.float64
+    # The CMA algebra is n x n with n <= 12, so float64 is effectively free
+    # and keeps the covariance update well-conditioned on CPU and CUDA. Only
+    # MPS steps down to float32 because Metal cannot create float64 tensors.
+    dt = _cma_state_dtype(device)
     w = torch.log(torch.tensor(mu + 0.5, dtype=dt, device=device)) - torch.log(
         torch.arange(1, mu + 1, dtype=dt, device=device)
     )

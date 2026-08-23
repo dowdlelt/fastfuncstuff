@@ -71,12 +71,16 @@ class TestGetDevice:
         with pytest.raises(ValueError, match="Unknown prefer_device"):
             get_device(prefer_device="tpu")
 
-    def test_auto_select_mps_when_available(self):
-        """Test auto-selecting MPS when available (and CUDA is not)."""
+    def test_auto_prefers_cpu_over_mps(self):
+        """MPS is explicit-only because its operator coverage is incomplete."""
         with mock.patch("torch.cuda.is_available", return_value=False):
             with mock.patch("torch.backends.mps.is_available", return_value=True):
                 device = get_device()
-                assert device.type == "mps"
+                assert device.type == "cpu"
+
+    def test_explicit_mps_is_honoured(self):
+        with mock.patch("torch.backends.mps.is_available", return_value=True):
+            assert get_device("mps").type == "mps"
 
     def test_auto_select_cuda_when_mps_unavailable(self):
         """Test auto-selecting CUDA when MPS unavailable on non-Mac"""

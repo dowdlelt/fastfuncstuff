@@ -607,7 +607,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
         hw_group,
-        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
+        extra="On Apple Silicon, auto uses CPU; pass mps explicitly to experiment with Metal.",
     )
     add_verbose_arg(hw_group, default=1)
     hw_group.add_argument(

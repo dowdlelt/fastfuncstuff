@@ -279,6 +279,9 @@ def main(argv: list[str] | None = None) -> int:
     # Print dataset header
     tasks_summary = ", ".join(f"{t}({len(r)} runs)" for t, r in ctx.all_task_run_pairs())
     print(f"Dataset: {ctx.dataset_id}  sub-{ctx.subject}/ses-{ctx.session}  {tasks_summary}")
+    import fastfuncstuff
+
+    print(f"FFS code: {Path(fastfuncstuff.__file__).resolve().parent}")
     print(f"Data directory: {data_dir}")
     print(f"Stages: {', '.join(s.name for s in stages)}")
     mode = "validate-only" if ctx.validate_only else "ref-only" if ctx.ref_only else "full"
@@ -297,7 +300,9 @@ def main(argv: list[str] | None = None) -> int:
 
         for r in results:
             if r.ref_time is None or r.ffs_time is None:
-                cached_ref, cached_ffs = get_cached_timing(data_dir, r.stage_name)
+                cached_ref, cached_ffs = get_cached_timing(
+                    data_dir, r.stage_name, device_spec=ctx.device
+                )
                 if r.ref_time is None and cached_ref is not None:
                     r.ref_time = cached_ref
                 if r.ffs_time is None and cached_ffs is not None:
@@ -305,9 +310,13 @@ def main(argv: list[str] | None = None) -> int:
 
     # Report
     if args.report:
-        print_timing_report(results, data_dir=data_dir, config=ctx.config)
+        print_timing_report(
+            results, data_dir=data_dir, config=ctx.config, ffs_arch_id=ctx.ffs_arch_id
+        )
     else:
-        print_validation_report(results, config=ctx.config, data_dir=data_dir)
+        print_validation_report(
+            results, config=ctx.config, data_dir=data_dir, ffs_arch_id=ctx.ffs_arch_id
+        )
 
     if args.json:
         save_json_report(results, args.json, config=ctx.config)

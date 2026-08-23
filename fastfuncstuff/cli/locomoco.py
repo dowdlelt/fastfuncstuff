@@ -1101,7 +1101,7 @@ def create_parser() -> argparse.ArgumentParser:
     hw = p.add_argument_group("Hardware")
     add_device_arg(
         hw,
-        extra="On Apple Silicon, MPS is recommended for typical full-size brain volumes; CPU may win on small jobs.",
+        extra="On Apple Silicon, auto uses CPU; pass mps explicitly to experiment with Metal.",
     )
     add_batch_args(
         p,

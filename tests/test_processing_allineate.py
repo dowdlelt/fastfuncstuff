@@ -13,6 +13,7 @@ from fastfuncstuff.processing.allineate import (
     _batched_cost,
     _bounds_to_torch,
     _center_of_mass,
+    _cma_state_dtype,
     _cmass_translation,
     _compute_cost,
     _compute_grid_matrix,
@@ -1314,6 +1315,11 @@ class TestDerivativeFreeRefinement:
     optimize: a quadratic bowl with a known optimum is enough to catch a sign
     error, a broken covariance update, or a search that never moves.
     """
+
+    def test_cma_state_uses_device_supported_dtype(self):
+        assert _cma_state_dtype(torch.device("cpu")) == torch.float64
+        assert _cma_state_dtype(torch.device("mps")) == torch.float32
+        assert _cma_state_dtype(torch.device("cuda")) == torch.float64
 
     @staticmethod
     def _bowl(target_norm, bounds, device):

@@ -166,6 +166,47 @@ def test_build_design_matrix_condition_missing_from_some_runs(tmp_path):
     assert np.all(rare_col[2 * n_tp :] == 0)
 
 
+def test_spmg_design_has_no_fractional_tr_microtime_drift(tmp_path):
+    """A 1.75 s TR must not become 1.8 s after microtime quantization."""
+    timing = tmp_path / "events.1D"
+    timing.write_text("17.5 350.0\n")  # exactly TR 10 and TR 200
+
+    design, labels, _, _ = build_design_matrix(
+        timing_files=[timing],
+        stim_labels=["event"],
+        n_timepoints_per_run=[260],
+        tr=1.75,
+        polort=-1,
+        hrf_models="SPMG1(0)",
+    )
+    stim = design[:, labels.index("event#0")]
+    np.testing.assert_allclose(stim[10:29], stim[200:219], atol=2e-6)
+
+
+def test_spmg_touching_events_remain_additive(tmp_path):
+    """Touching duration events retain identity instead of merging before normalization."""
+    combined = tmp_path / "combined.1D"
+    first = tmp_path / "first.1D"
+    second = tmp_path / "second.1D"
+    combined.write_text("17.5 20.5\n")
+    first.write_text("17.5\n")
+    second.write_text("20.5\n")
+
+    design, labels, _, _ = build_design_matrix(
+        timing_files=[combined, first, second],
+        stim_labels=["combined", "first", "second"],
+        n_timepoints_per_run=[60],
+        tr=1.75,
+        polort=-1,
+        hrf_models="SPMG1(3)",
+    )
+    np.testing.assert_allclose(
+        design[:, labels.index("combined#0")],
+        design[:, labels.index("first#0")] + design[:, labels.index("second#0")],
+        atol=2e-6,
+    )
+
+
 def test_build_design_matrix_rejects_all_empty_condition(tmp_path):
     """A condition with no events anywhere is an all-zero regressor — refuse
     it rather than emitting a rank-deficient design."""

@@ -32,6 +32,7 @@ def print_validation_report(
     results: list[StageResult],
     config: Any = None,
     data_dir: Path | None = None,
+    ffs_arch_id: str | None = None,
 ) -> None:
     """Print a validation-only report table to terminal.
 
@@ -41,7 +42,7 @@ def print_validation_report(
     from .timing_cache import _get_git_info
 
     ref_id = get_ref_arch_id()
-    ffs_id = get_ffs_arch_id()
+    ffs_id = ffs_arch_id or get_ffs_arch_id()
     git = _get_git_info()
 
     header = f"\nBENCHMARK VALIDATION  ref={ref_id}  ffs={ffs_id}"
@@ -87,7 +88,7 @@ def print_validation_report(
     # Detailed metrics + historical comparison
     _print_stage_details(results)
     if data_dir:
-        _print_regression_analysis(results, data_dir, git)
+        _print_regression_analysis(results, data_dir, git, ffs_id)
 
 
 def _print_timing_summary(
@@ -255,6 +256,7 @@ def print_timing_report(
     results: list[StageResult],
     data_dir: Path | None = None,
     config: Any = None,
+    ffs_arch_id: str | None = None,
 ) -> None:
     """Print a full timing + validation report table.
 
@@ -268,7 +270,7 @@ def print_timing_report(
     from .timing_cache import _get_git_info
 
     my_ref_id = get_ref_arch_id()
-    my_ffs_id = get_ffs_arch_id()
+    my_ffs_id = ffs_arch_id or get_ffs_arch_id()
     git = _get_git_info()
 
     # Pre-fetch cached ref timings for stages where ref didn't run this time.
@@ -366,7 +368,7 @@ def print_timing_report(
     # Detailed metrics + historical comparison
     _print_stage_details(results)
     if data_dir:
-        _print_regression_analysis(results, data_dir, git)
+        _print_regression_analysis(results, data_dir, git, my_ffs_id)
 
 
 # ---------------------------------------------------------------------------
@@ -484,6 +486,7 @@ def _print_regression_analysis(
     results: list[StageResult],
     data_dir: Path,
     current_git: dict[str, Any],
+    ffs_arch_id: str,
 ) -> None:
     """Compare current metrics against the previous run and flag regressions."""
     from .timing_cache import (
@@ -493,7 +496,7 @@ def _print_regression_analysis(
     )
 
     current_commit = current_git.get("commit", "")
-    prev_run = get_previous_run(data_dir, current_commit=current_commit)
+    prev_run = get_previous_run(data_dir, current_commit=current_commit, ffs_arch_id=ffs_arch_id)
     if prev_run is None:
         return  # no history to compare against
 
@@ -580,12 +583,13 @@ def _print_regression_analysis(
         print(f"  {' | '.join(parts)}")
 
     # FFS timing trend (if we have historical data)
-    _print_ffs_timing_trend(results, data_dir)
+    _print_ffs_timing_trend(results, data_dir, ffs_arch_id)
 
 
 def _print_ffs_timing_trend(
     results: list[StageResult],
     data_dir: Path,
+    ffs_arch_id: str,
 ) -> None:
     """Show FFS timing trend across recent runs."""
     from .timing_cache import get_recent_runs
@@ -599,7 +603,7 @@ def _print_ffs_timing_trend(
     # stages we care about (e.g. previous invocations that benchmarked only a
     # different sub-pipeline) and still show ~9 useful columns of history.
     max_cols = 9
-    raw_recent = get_recent_runs(data_dir, max_runs=50)
+    raw_recent = get_recent_runs(data_dir, ffs_arch_id=ffs_arch_id, max_runs=50)
     recent = [
         run
         for run in raw_recent

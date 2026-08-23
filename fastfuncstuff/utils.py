@@ -51,8 +51,9 @@ def get_device(prefer_device: str | None = None) -> torch.device:
     This is a CUDA-first codebase with a first-class CPU fallback; Apple Silicon
     (MPS) is supported as a best-effort third device. An explicitly requested
     backend is always honoured end-to-end — we never silently override the
-    caller's choice. When no preference is given we auto-detect: CUDA where
-    available, then MPS on Apple Silicon, then CPU.
+    caller's choice. When no preference is given we use CUDA where available
+    and CPU otherwise. MPS remains an explicit opt-in: its incomplete operator
+    and float64 support make it a poor general default even on fast Apple GPUs.
 
     On MPS the only hard limitation is float64 (the Metal backend has no float64
     support at all); numerically sensitive steps fall back to CPU-float64 via
@@ -101,7 +102,7 @@ def get_device(prefer_device: str | None = None) -> torch.device:
         return torch.device("cuda")
 
     if torch.backends.mps.is_available():
-        return torch.device("mps")
+        return torch.device("cpu")
 
     warnings.warn(
         "No GPU backend detected; falling back to CPU execution. Performance will be limited.",

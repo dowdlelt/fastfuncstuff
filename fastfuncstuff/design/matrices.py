@@ -276,6 +276,58 @@ def convolve_hrf_microtime(
     return design
 
 
+def convolve_event_onsets_microtime(
+    all_onsets: list[list[np.ndarray]],
+    hrfs: list[torch.Tensor],
+    n_timepoints_per_run: list[int],
+    tr: float = 1.0,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Add independently normalized event responses on a run-local microtime grid.
+
+    Unlike a binary boxcar matrix, the event list preserves trial identity when
+    events touch or overlap. That matters for duration-normalized bases such as
+    ``SPMG1(d)``: two adjacent events are the sum of two normalized responses,
+    not one longer response normalized after the events have been merged.
+    """
+    if device is None:
+        device = get_device()
+    if len(all_onsets) != len(hrfs):
+        raise ValueError("all_onsets and hrfs must have one entry per condition")
+
+    bins_per_tr = int(round(tr / microtime_dt))
+    if not 0 <= microtime_onset < bins_per_tr:
+        raise ValueError(f"microtime_onset must be in [0, {bins_per_tr}), got {microtime_onset}")
+
+    total_timepoints = sum(n_timepoints_per_run)
+    design = torch.zeros(total_timepoints, len(all_onsets), device=device)
+    run_start_tr = 0
+    for run_idx, n_run_tp in enumerate(n_timepoints_per_run):
+        n_run_bins = n_run_tp * bins_per_tr
+        sample = torch.arange(
+            microtime_onset, n_run_bins, bins_per_tr, device=device, dtype=torch.long
+        )
+        for cond_idx, (cond_runs, hrf_in) in enumerate(zip(all_onsets, hrfs, strict=True)):
+            if run_idx >= len(cond_runs):
+                raise ValueError(
+                    f"condition {cond_idx} has {len(cond_runs)} runs; expected {len(n_timepoints_per_run)}"
+                )
+            hrf = to_tensor(hrf_in, device=device)
+            response = torch.zeros(n_run_bins, device=device, dtype=hrf.dtype)
+            for onset in np.asarray(cond_runs[run_idx], dtype=np.float64):
+                start = int(np.round(float(onset) / microtime_dt))
+                dst0 = max(0, start)
+                src0 = max(0, -start)
+                n_copy = min(n_run_bins - dst0, hrf.numel() - src0)
+                if n_copy > 0:
+                    response[dst0 : dst0 + n_copy] += hrf[src0 : src0 + n_copy]
+            design[run_start_tr : run_start_tr + n_run_tp, cond_idx] = response[sample]
+        run_start_tr += n_run_tp
+    return design
+
+
 def convolve_tr_locked(
     values: torch.Tensor,
     hrf_microtime: torch.Tensor,

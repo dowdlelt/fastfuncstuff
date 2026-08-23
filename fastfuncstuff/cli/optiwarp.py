@@ -608,7 +608,7 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "deterministic", False):
         enable_determinism(getattr(args, "verb", 1))
 
-    # Select device (prefer CUDA > MPS > CPU), honouring -device end to end.
+    # Select device (prefer CUDA > CPU), honouring explicit MPS end to end.
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
     if device.type == "cpu" and args.device is None and args.verb >= 1:
         print("WARNING: no GPU available, running on CPU")

@@ -1175,20 +1175,22 @@ def build_design_matrix(
 
     # 3. Add stimulus regressors via the microtime pipeline.
     # ------------------------------------------------------------------
-    # All stim regressors are built at microtime_dt = 0.1 s (the codebase
-    # convention) via:
-    #   1) get_spmg1_hrf(microtime_dt)               — proper AFNI SPMG1
-    #   2) create_onset_matrix_microtime(...)         — boxcar at microtime
-    #   3) convolve_hrf_microtime(...)                — convolve, peak-norm,
-    #                                                   downsample to TR
+    # All stimulus regressors use a roughly 0.1 s microtime grid. SPMG1 adds
+    # independently normalized event responses; BLOCK samples its boxcar at
+    # the acquired TR grid.
     # Sub-TR events (duration < TR/2) survive correctly because everything
     # below the TR grid lives on the fine grid until the final downsample.
     # ------------------------------------------------------------------
     from fastfuncstuff.design.hrf import get_spmg1_hrf
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.design.matrices import convolve_event_onsets_microtime
     from fastfuncstuff.utils import get_device as _get_device
 
-    microtime_dt = 0.1
+    # Keep the microtime grid exactly commensurate with the acquired TR. A
+    # fixed 0.1 s step turns TR=1.75 into round(17.5)=18 bins, i.e. an
+    # effective 1.8 s TR, and the stimulus columns drift progressively earlier
+    # through every run. About 0.1 s is enough resolution; exact TR boundaries
+    # are more important than the nominal decimal step.
+    microtime_dt = tr / max(1, round(tr / 0.1))
     stim_device = _get_device()
 
     # Split stim conditions by HRF type. Each condition is either:
@@ -1249,25 +1251,25 @@ def build_design_matrix(
 
         # SPMG1 path.
         if spmg_mask.any():
-            hrf_micro = get_spmg1_hrf(
-                microtime_dt=microtime_dt,
-                stim_duration=0.0,
-                hrf_duration=32.0,
-                normalize_peak=True,
-                device=stim_device,
-            )
-            convolved = convolve_hrf_microtime(
-                onsets_microtime=onset_matrix[:, spmg_mask],
-                hrf=hrf_micro,
-                n_timepoints=total_timepoints,
+            spmg_indices = np.flatnonzero(spmg_mask).tolist()
+            spmg_hrfs = [
+                get_spmg1_hrf(
+                    microtime_dt=microtime_dt,
+                    stim_duration=expanded_durations[k],
+                    hrf_duration=32.0,
+                    normalize_peak=True,
+                    device=stim_device,
+                )
+                for k in spmg_indices
+            ]
+            convolved = convolve_event_onsets_microtime(
+                all_onsets=[expanded_onsets[k] for k in spmg_indices],
+                hrfs=spmg_hrfs,
+                n_timepoints_per_run=n_timepoints_per_run,
                 tr=tr,
                 microtime_dt=microtime_dt,
-                run_starts=run_starts,
                 device=stim_device,
             )
-            # return_single_trials defaults False here, so convolve_hrf_microtime
-            # always returns a Tensor, never the (tensor, trial_info) tuple form.
-            assert isinstance(convolved, torch.Tensor)
             spmg_cols = convolved.cpu().numpy()
         else:
             spmg_cols = None

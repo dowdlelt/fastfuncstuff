@@ -134,10 +134,12 @@ def _get_git_info() -> dict[str, Any]:
     """Capture current git state: commit, branch, message, dirty flag."""
     import subprocess
 
+    source_root = Path(__file__).resolve().parents[2]
+
     def _run(args: list[str]) -> str:
         try:
             return subprocess.run(
-                args,
+                ["git", "-C", str(source_root), *args[1:]],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -157,6 +159,7 @@ def _get_git_info() -> dict[str, Any]:
         "branch": branch,
         "message": message,
         "dirty": dirty,
+        "source_root": str(source_root),
     }
 
 
@@ -270,6 +273,7 @@ def append_run(
     config: Any = None,
     stage_results: dict[str, dict[str, Any]] | None = None,
     stage_validations: dict[str, dict[str, Any]] | None = None,
+    device_spec: str | None = None,
 ) -> None:
     """Append one benchmark run to the cache.
 
@@ -286,7 +290,7 @@ def append_run(
     Every call creates a new entry — nothing is overwritten.
     """
     cache = load_cache(data_dir)
-    hw = get_hardware_info()
+    hw = get_hardware_info(device_spec)
 
     stages: dict[str, Any] = {}
 
@@ -331,7 +335,7 @@ def append_run(
         "id": str(uuid.uuid4()),
         "timestamp": datetime.now(UTC).isoformat(),
         "ref_arch_id": get_ref_arch_id(),
-        "ffs_arch_id": get_ffs_arch_id(),
+        "ffs_arch_id": get_ffs_arch_id(device_spec),
         "hardware": hw,
         "dataset_id": dataset_id,
         "git": _get_git_info(),
@@ -456,6 +460,7 @@ def get_cached_timing(
     data_dir: Path,
     stage_name: str,
     dataset_id: str = "",
+    device_spec: str | None = None,
 ) -> tuple[float | None, float | None]:
     """Get latest (ref_seconds, ffs_seconds) for current machine's archs.
 
@@ -466,7 +471,7 @@ def get_cached_timing(
     """
     cache = load_cache(data_dir)
     my_ref_id = get_ref_arch_id()
-    my_ffs_id = get_ffs_arch_id()
+    my_ffs_id = get_ffs_arch_id(device_spec)
 
     ref_val: float | None = None
     ffs_val: float | None = None
