@@ -20,9 +20,11 @@ from fastfuncstuff.processing.tuneopt import (
     Axis,
     Observation,
     SearchSpace,
+    _frontier_points,
     _scalarize,
     _weighted,
     config_key,
+    frontier_hypervolume,
     propose,
 )
 from fastfuncstuff.processing.tunespec import ParamSpec
@@ -691,3 +693,141 @@ def test_infeasible_never_wins_the_incumbent():
     obs = [_frontier_obs(r) for r in (0.25, 0.5, 1.0)]
     obs.append(Observation({"reg": 99.0}, score=-100.0, margin=-1.0, roughness=0.0))
     assert _incumbent(obs) != {"reg": 99.0}
+
+
+# --- resuming a study rather than restarting it -----------------------------
+
+
+def test_seed_from_restores_a_ladder_the_recipe_never_had():
+    """455 fits took one real study's lattice from 78 values to 211. Keep them."""
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5, 1.0, 2.0))])
+    obs = [Observation({"reg": v}, score=1.0, margin=1.0) for v in (0.25, 0.75, 1.5, 4.0)]
+    added = space.seed_from(obs)
+    assert space.axes[0].values == [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0]
+    assert added and "reg +4" in added[0]
+
+
+def test_seed_from_refuses_dead_zone_values_from_an_older_store():
+    """A table written before ParamSpec.resolution existed must not resurrect them."""
+    p = ParamSpec(
+        "fake.total_sigma",
+        "-total_sigma",
+        (0.0, 0.5, 1.0),
+        1.0,
+        "regularization",
+        resolution=0.25,
+    )
+    space = SearchSpace.from_params([p])
+    obs = [Observation({"total_sigma": v}, score=1.0, margin=1.0) for v in (0.0078, 0.0156, 0.75)]
+    space.seed_from(obs)
+    assert not any(0.0 < v < 0.25 for v in space.axes[0].values)
+    assert 0.75 in space.axes[0].values  # ... but a real value is still absorbed
+
+
+def test_seed_from_is_idempotent():
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5, 1.0))])
+    obs = [Observation({"reg": 0.25}, score=1.0, margin=1.0)]
+    assert space.seed_from(obs)
+    assert not space.seed_from(obs)
+
+
+def test_prune_drops_a_value_that_folded_every_time():
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5, 1.0, 2.0))])
+    obs = [Observation({"reg": 0.0}, score=-9.0, margin=-1.0) for _ in range(3)]
+    obs += [Observation({"reg": 1.0}, score=0.0, margin=1.0) for _ in range(3)]
+    dropped = space.prune_infeasible(obs)
+    assert dropped == ["reg=0.0"]
+    assert 0.0 not in space.axes[0].values
+
+
+def test_prune_keeps_a_value_that_merely_scores_badly():
+    """Scoring worse is not grounds for removal — the frontier exists to say so."""
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5, 1.0, 2.0))])
+    obs = [Observation({"reg": 2.0}, score=99.0, margin=1.0) for _ in range(5)]
+    assert space.prune_infeasible(obs) == []
+    assert 2.0 in space.axes[0].values
+
+
+def test_prune_waits_for_a_second_failure():
+    """One fold is a property of the config it was tried in, not of the value."""
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5, 1.0))])
+    assert space.prune_infeasible([Observation({"reg": 0.0}, score=0.0, margin=-1.0)]) == []
+
+
+def test_prune_never_empties_an_axis():
+    space = SearchSpace.from_params([_param("reg", (0.0, 0.5))])
+    obs = [Observation({"reg": v}, score=0.0, margin=-1.0) for v in (0.0, 0.0, 0.5, 0.5)]
+    space.prune_infeasible(obs)
+    assert space.axes[0].values  # a knob with nothing to vary is worse than a bad knob
+
+
+def _obs(reg, score, rough, margin=1.0):
+    return Observation({"reg": reg}, score=score, margin=margin, roughness=rough)
+
+
+def test_a_folded_config_cannot_move_the_area():
+    """Infeasible points are not on the frontier and do not set its scale either."""
+    base = [_obs(0.0, 0.0, 10.0), _obs(1.0, 5.0, 0.1)]
+    assert frontier_hypervolume(base + [_obs(3.0, -9.0, 0.0, margin=-1.0)]) == pytest.approx(
+        frontier_hypervolume(base)
+    )
+
+
+def test_a_dominated_config_cannot_move_the_area():
+    """Bug of record: scaling by the spread of *everything tried* let a config that
+    was worse on both objectives enlarge the box and so make the frontier look
+    better -- 0.17 to 0.66 off one bad point, which would reset the staleness
+    counter for finding something bad. The scale comes from the frontier itself."""
+    base = [_obs(0.0, 0.0, 10.0), _obs(1.0, 5.0, 0.1)]
+    assert frontier_hypervolume(base + [_obs(2.0, 6.0, 20.0)]) == pytest.approx(
+        frontier_hypervolume(base)
+    )
+
+
+def test_hypervolume_grows_when_a_config_beats_the_frontier():
+    base = [_obs(0.0, 0.0, 10.0), _obs(1.0, 5.0, 1.0)]
+    better = [*base, _obs(2.0, 1.0, 1.5)]  # between the two, and beats the line
+    assert frontier_hypervolume(better) > frontier_hypervolume(base)
+
+
+def test_hypervolume_is_the_criterion_point_counting_could_not_be():
+    """The bug this replaced: with two continuous objectives almost nothing is
+    strictly dominated, so "did the frontier gain a point?" is nearly always yes
+    and the search never stops -- measured, a two-knob space ran 60 fits without
+    the count ever going stale. Area is the question that saturates."""
+
+    def line(step):
+        """A frontier of equally spaced points along one trade-off."""
+        n = int(20 / step)
+        return [_obs(float(i), i * step, 20.0 - i * step) for i in range(n + 1)]
+
+    coarse, medium, fine = line(4.0), line(2.0), line(1.0)
+    # Every added point is un-dominated, so a point count keeps saying "still
+    # learning" forever -- which is exactly why it could not end a search.
+    assert len(_frontier_points(coarse)) < len(_frontier_points(medium))
+    assert len(_frontier_points(medium)) < len(_frontier_points(fine))
+
+    # Area says something a count cannot: each doubling of the frontier's density
+    # buys less than the one before, so a relative tolerance eventually stops it.
+    first = frontier_hypervolume(medium) - frontier_hypervolume(coarse)
+    second = frontier_hypervolume(fine) - frontier_hypervolume(medium)
+    assert 0 < second < first
+
+
+def test_hypervolume_aggregates_subjects_of_one_config():
+    obs = [
+        Observation({"reg": 1.0}, score=s, margin=1.0, roughness=r)
+        for s, r in ((0.0, 1.0), (2.0, 3.0))
+    ]
+    assert len(_frontier_points(obs)) == 1
+
+
+def test_hypervolume_is_zero_before_there_is_a_trade():
+    assert frontier_hypervolume([]) == 0.0
+    assert frontier_hypervolume([_obs(0.0, 1.0, 1.0)]) == 0.0
+
+
+def test_two_point_frontier_has_area():
+    """A reference corner on the observed maximum would score this exactly zero,
+    because both points normalise straight onto the corners."""
+    assert frontier_hypervolume([_obs(0.0, 0.0, 10.0), _obs(1.0, 10.0, 0.0)]) > 0.0

@@ -1324,6 +1324,42 @@ def format_guide(store: TrialStore, recipe: str) -> str:
     return "\n".join(out)
 
 
+def format_resume(store: TrialStore, subject_names: Sequence[str]) -> str:
+    """What a run is inheriting from this directory, said before any fits start.
+
+    A resume that silently looks like a fresh run is the one place this tool can
+    waste a lot of somebody's evening: the operator cannot tell whether the prior
+    trials were picked up until the fits are already going. So say it up front --
+    what is here, which subjects are new, and which of the ones on the command
+    line the store has never seen.
+    """
+    if not store.trials:
+        return ""
+    known = {t.subject for t in store.trials}
+    fresh = [n for n in subject_names if n not in known]
+    returning = [n for n in subject_names if n in known]
+    absent = sorted(known - set(subject_names) - {BASELINE})
+
+    real = [t for t in store.trials if t.backend != BASELINE]
+    lines = [
+        f"Resuming: {len(real)} earlier fit(s) over {len({t.config_id for t in real})} "
+        f"config(s), from {len(store.runs)} run(s)."
+    ]
+    if returning:
+        lines.append(f"  carried over: {', '.join(returning)}")
+    if fresh:
+        lines.append(
+            f"  NEW this run: {', '.join(fresh)} -- screened first, being the only "
+            "subject(s) carrying information the table does not already have"
+        )
+    if absent:
+        lines.append(
+            f"  in the table but not on this command line: {', '.join(absent)}. "
+            "Their trials still inform the surrogate; they will not get new fits."
+        )
+    return "\n".join(lines)
+
+
 def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
     """The table the user reads, and picks a number out of to reproduce."""
     if not results:

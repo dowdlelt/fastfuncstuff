@@ -18,6 +18,7 @@ from fastfuncstuff.processing.tunestore import (
     format_guide,
     format_importance,
     format_results_table,
+    format_resume,
     format_runs,
     headline_metric,
     knob_importance,
@@ -575,3 +576,74 @@ def test_guard_pinned_predicate_and_caution():
     assert not guard_pinned(qc(0.30))
     assert any("guard-limited" in c for c in regularity_cautions(qc(FOLD_GUARD_FLOOR)))
     assert not any("guard-limited" in c for c in regularity_cautions(qc(0.30)))
+
+
+# --- resuming a study -------------------------------------------------------
+
+
+def _resume_store(tmp_path, subjects=("s1", "s2")):
+    s = TrialStore(tmp_path / "t.json")
+    s.runs.append(_meta(subjects=list(subjects)))
+    for i, subj in enumerate(subjects):
+        for reg in (0.0, 1.0):
+            s.add(
+                "formwarp",
+                subj,
+                {"total_var": reg},
+                [],
+                scores={"ls": 0.3 + reg / 10},
+                seconds=1.0,
+                warpqc={"bending_energy": 0.1, "jac_min": 0.5, "jac_neg_count": i},
+            )
+    return s
+
+
+def test_screening_goes_to_the_subject_with_the_least_evidence(tmp_path):
+    """A newly added brain must not wait its turn behind four already screened."""
+    from fastfuncstuff.processing.tunewarp import SubjectPair, _screen_pairs
+
+    store = _resume_store(tmp_path, subjects=("s1", "s2"))
+    pairs = [SubjectPair(n, f"{n}_b.nii", f"{n}_s.nii") for n in ("s1", "s2", "s3_new")]
+    picked = _screen_pairs(pairs, store, "formwarp", 1, round_no=0)
+    assert [p.name for p in picked] == ["s3_new"]
+
+
+def test_screening_rotation_survives_on_a_balanced_study(tmp_path):
+    """With nothing to distinguish them, ties break on the rotation as before."""
+    from fastfuncstuff.processing.tunewarp import SubjectPair, _screen_pairs
+
+    store = TrialStore(tmp_path / "t.json")
+    store.runs.append(_meta())
+    pairs = [SubjectPair(n, f"{n}_b", f"{n}_s") for n in ("a", "b", "c")]
+    picked = [_screen_pairs(pairs, store, "formwarp", 1, r)[0].name for r in range(3)]
+    assert sorted(picked) == ["a", "b", "c"]
+
+
+def test_screening_counts_only_this_backend(tmp_path):
+    """Evidence about qwarp says nothing about what demons needs to be screened on."""
+    from fastfuncstuff.processing.tunewarp import SubjectPair, _screen_pairs
+
+    store = TrialStore(tmp_path / "t.json")
+    store.runs.append(_meta())
+    for _ in range(20):
+        store.add("qwarp", "s1", {"minpatch": 9}, [], scores={"ls": 0.3}, seconds=1.0)
+    pairs = [SubjectPair(n, f"{n}_b", f"{n}_s") for n in ("s1", "s2")]
+    assert _screen_pairs(pairs, store, "formwarp", 1, round_no=0)[0].name == "s1"
+
+
+def test_format_resume_names_the_new_subject(tmp_path):
+    out = format_resume(_resume_store(tmp_path), ["s1", "s2", "s3_new"])
+    assert "Resuming" in out and "4 earlier fit(s)" in out
+    assert "NEW this run: s3_new" in out
+    assert "carried over: s1, s2" in out
+
+
+def test_format_resume_flags_a_subject_dropped_from_the_command_line(tmp_path):
+    out = format_resume(_resume_store(tmp_path), ["s1"])
+    assert "not on this command line: s2" in out
+
+
+def test_format_resume_is_silent_on_a_fresh_directory(tmp_path):
+    s = TrialStore(tmp_path / "t.json")
+    s.runs.append(_meta())
+    assert format_resume(s, ["s1"]) == ""

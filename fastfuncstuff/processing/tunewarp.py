@@ -33,7 +33,14 @@ from .allineate import _voxdims_from_header
 from .io import load_image, save_image
 from .mask import automask
 from .metrics import MetricInputs, evaluate_metrics
-from .tuneopt import Observation, SearchSpace, config_key, propose, scalarize_balanced
+from .tuneopt import (
+    Observation,
+    SearchSpace,
+    config_key,
+    frontier_hypervolume,
+    propose,
+    scalarize_balanced,
+)
 from .tunespec import (
     BACKENDS,
     QWARP_TUNE_OPTIMIZER,
@@ -501,6 +508,16 @@ class AdaptivePlan:
     batch: int = 4  # candidates proposed per surrogate refit
     expand: bool = True  # grow a ladder when the incumbent sits on its end
     seed: int = 0
+    # Rounds that may pass without meaningfully enlarging the accuracy/smoothness
+    # frontier before the backend is called done. 0 disables the check.
+    patience: int = 3
+    # What "meaningfully" means: relative growth in the frontier's dominated area
+    # over one round. Unlike the fold-guard floor this is a judgement dial and not a
+    # derived constant -- there is no measurement that says how much better is worth
+    # another ten fits. Measured on a 7T epi2epi study, a converged backend still
+    # crept up 0.3-0.6% per four fits, so 2% per round is "still learning something"
+    # and below it is decimal places.
+    tol: float = 0.02
 
 
 def panel_scores(trials: list, panel: list[str]) -> dict[int, float]:
@@ -609,9 +626,27 @@ def run_adaptive(
     4. **Expand** any ladder the incumbent is sitting on the end of, because an
        optimum at a range edge is a statement about the range, not the optimum.
 
-    The screening subject rotates between batches. Within a batch it is held
-    fixed so the candidates are compared against each other on the same brain,
-    but a screen that never rotated would tune to one head.
+    Within a batch the screening brains are held fixed so the candidates are
+    compared against each other on the same head; between batches they move to
+    whichever subjects this backend has the least evidence about.
+
+    **Resuming is the normal case, not a special one.** A tuning study has a long
+    life: run it early to get a direction, add subjects later to sharpen it. So a
+    second invocation against the same directory picks up where the first left off
+    rather than starting over --
+
+    * the ladders are rebuilt from the configs already in the store, so the
+      subdivisions the earlier run paid fits for are not re-derived;
+    * screening goes to the subjects with the least evidence, which puts a newly
+      added brain first without being told it is new;
+    * ladder values that folded every time they were tried are dropped;
+    * and the backend stops once several rounds pass without a new point on the
+      frontier, so a large ``-budget`` is a ceiling rather than a promise.
+
+    All of which assumes the *engines* have not changed underneath the stored
+    trials. `TrialStore.warnings` is what catches that; it is a warning rather
+    than a refusal because only the operator can judge whether a given commit
+    moved the numbers.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     names = backends or list(recipe.backends)
@@ -645,8 +680,23 @@ def run_adaptive(
         if verb >= 1:
             print(f"\n{backend}: budget {plan.budget} fits over {len(space.axes)} knob(s)")
 
+        # Everything the store already knows about this backend, folded into the
+        # ladders before the first proposal. See SearchSpace.seed_from.
+        prior = _observations(store, backend, panel)
+        if prior:
+            seeded = space.seed_from(prior)
+            pruned = space.prune_infeasible(prior)
+            if verb >= 1:
+                print(f"  resuming from {len(prior)} earlier fit(s)")
+                if seeded:
+                    print(f"  ladders restored: {', '.join(seeded)}")
+                if pruned:
+                    print(f"  dropped (folded every time): {', '.join(pruned)}")
+
         spent = 0
         round_no = 0
+        stale = 0
+        best_hv = frontier_hypervolume(prior)
         while spent < plan.budget:
             obs = _observations(store, backend, panel)
             batch = propose(space, obs, plan.batch, rng)
@@ -662,9 +712,9 @@ def run_adaptive(
                     print(f"  expanded: {', '.join(grown)}")
                 continue
 
-            # One screening brain per round, rotated, so within-round comparisons
-            # are like-for-like without the search fitting itself to one head.
-            screen_pairs = [pairs[(round_no + i) % len(pairs)] for i in range(plan.screen)]
+            # Within a round the screening brains are held fixed, so the batch's
+            # candidates are compared against each other on the same head.
+            screen_pairs = _screen_pairs(pairs, store, backend, plan.screen, round_no)
             round_no += 1
 
             for config in batch:
@@ -726,8 +776,50 @@ def run_adaptive(
             store.compute_consensus(panel)
             store.save()
 
+            # A round that put nothing new on the frontier did not change the answer;
+            # it measured the inside of a trade-off that is already mapped. Several in
+            # a row is the search telling you it is done, and spending the rest of the
+            # budget past that point buys decimal places nobody reads.
+            if plan.patience > 0:
+                hv = frontier_hypervolume(_observations(store, backend, panel))
+                grew = hv > best_hv * (1.0 + plan.tol)
+                stale = 0 if grew else stale + 1
+                best_hv = max(best_hv, hv)
+                if stale >= plan.patience:
+                    if verb >= 1:
+                        print(
+                            f"  converged: {stale} rounds without growing the frontier "
+                            f"by {plan.tol:.0%} ({spent}/{plan.budget} fits used)"
+                        )
+                    break
+
         store.compute_consensus(panel)
         store.save()
+
+
+def _screen_pairs(
+    pairs: list[SubjectPair], store: TrialStore, backend: str, n: int, round_no: int
+) -> list[SubjectPair]:
+    """Which brains to screen this round: the ones this backend knows least about.
+
+    A plain rotation is right on a fresh run and wrong on every resume. Adding a
+    subject to an existing study is the normal way this tool gets used, and under
+    a rotation the new brain -- the only one carrying information the store does
+    not already have -- waits its turn behind four that have been screened for
+    hundreds of fits. Ordering by how little evidence a subject has puts it first
+    automatically, and needs no flag to say "this one is new".
+
+    Ties break on the rotation, so a fresh run where every subject has nothing
+    behaves exactly as it did before, and a balanced study keeps cycling.
+    """
+    seen: dict[str, int] = dict.fromkeys((p.name for p in pairs), 0)
+    for t in store.trials:
+        if t.backend == backend and t.subject in seen:
+            seen[t.subject] += 1
+    order = sorted(
+        range(len(pairs)), key=lambda i: (seen[pairs[i].name], (i - round_no) % len(pairs))
+    )
+    return [pairs[i] for i in order[:n]]
 
 
 def _promising(store: TrialStore, backend: str, panel: list[str], config: dict) -> bool:

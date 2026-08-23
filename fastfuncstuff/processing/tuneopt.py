@@ -122,6 +122,37 @@ class Axis:
         self.values = sorted([*v, nxt])
         return True
 
+    def absorb(self, value: Any) -> bool:
+        """Put a value the ladder does not have back onto it. True if it changed.
+
+        The counterpart to persistence: a resumed run rebuilds its ladders from the
+        configs the store already holds, rather than restarting at the recipe grid
+        and re-deriving every subdivision a batch of fits at a time.
+        """
+        if any(_hashable(v) == _hashable(value) for v in self.values):
+            return False
+        if not self.numeric:
+            self.values = [*self.values, value]
+            return True
+        if not _is_numeric(value) or self._inert(float(value)):
+            return False  # a dead-zone value from a store written before that rule
+        self.values = sorted([*self.values, value])
+        return True
+
+    def drop(self, value: Any) -> bool:
+        """Remove a value from the ladder. True if it was there.
+
+        Never empties the ladder, and never removes the only value left on an axis:
+        a knob with nothing to vary is worse than a knob with one bad setting.
+        """
+        if len(self.values) <= 1:
+            return False
+        keep = [v for v in self.values if _hashable(v) != _hashable(value)]
+        if len(keep) == len(self.values):
+            return False
+        self.values = keep
+        return True
+
     def refine(self, value: Any) -> bool:
         """Insert midpoints either side of ``value``. True if the ladder changed.
 
@@ -201,6 +232,56 @@ class SearchSpace:
     ) -> SearchSpace:
         pins = dict(pins or {})
         return cls(axes=[Axis.from_param(p) for p in params if p.key not in pins], pins=pins)
+
+    def seed_from(self, observations: list[Observation]) -> list[str]:
+        """Rebuild the ladders from configs a previous run already tried.
+
+        Without this a resumed run starts at the recipe grid and has to *re-derive*
+        every subdivision the earlier run paid for -- and each grow or refine step
+        is only justified by a batch of fits, so the cost is not the arithmetic, it
+        is the fits. Measured on a 7T epi2epi study: 455 fits took a 78-value
+        lattice to 211 values, and all 133 of those subdivisions were thrown away by
+        the next invocation.
+
+        Every value ever tried is in the trial table, so the ladder is implied by
+        the data and does not need its own persisted state -- which also means a
+        store written by an older build seeds correctly, and one written before a
+        rule like `ParamSpec.resolution` existed has its dead-zone values dropped
+        on the way in rather than resurrected.
+        """
+        added: list[str] = []
+        for axis in self.axes:
+            new = [
+                v
+                for o in observations
+                if (v := o.config.get(axis.key)) is not None and axis.absorb(v)
+            ]
+            if new:
+                added.append(f"{axis.key} +{len(new)}")
+        return added
+
+    def prune_infeasible(self, observations: list[Observation], min_trials: int = 2) -> list[str]:
+        """Drop ladder values that have never once produced a warp that held together.
+
+        The safe half of "do not waste time on the bad edges". Scoring *worse* is
+        not grounds for removing a value -- the frontier is precisely the argument
+        that a worse score can be the better setting -- but a value that folded on
+        every one of several tries is not a trade-off, it is a dead end, and the
+        lattice keeps offering it to the acquisition for exploration.
+
+        Requires ``min_trials`` failures before acting, because one fold is a
+        property of the config it was tried in, not of the value.
+        """
+        dropped: list[str] = []
+        for axis in self.axes:
+            for value in list(axis.values):
+                seen = [
+                    o for o in observations if _hashable(o.config.get(axis.key)) == _hashable(value)
+                ]
+                if len(seen) >= min_trials and all(o.margin <= 0 for o in seen):
+                    if axis.drop(value):
+                        dropped.append(f"{axis.key}={value}")
+        return dropped
 
     @property
     def keys(self) -> list[str]:
@@ -484,6 +565,88 @@ def _unit(values: np.ndarray) -> np.ndarray:
 def scalarize_weight(rng: np.random.Generator) -> float:
     """Draw one batch's similarity/roughness weight. 1.0 is pure similarity."""
     return float(rng.uniform())
+
+
+HV_REFERENCE = 1.1
+"""Where the hypervolume's reference corner sits, in units of the normalised range.
+
+Outside [0, 1] on purpose. On the boundary the best and worst points of a frontier
+land exactly on the corners and dominate zero area, so a sound two-point trade-off
+would measure as no trade-off at all.
+"""
+
+
+def _frontier_points(observations: list[Observation]) -> list[tuple[float, float]]:
+    """Un-dominated (similarity, roughness) pairs, one per config, feasible only.
+
+    Aggregated per config first: two subjects at the same settings are two noisy
+    reads of one point, not two points.
+    """
+    agg: dict[tuple, list[Observation]] = {}
+    for o in observations:
+        if o.margin > 0:
+            agg.setdefault(config_key(o.config), []).append(o)
+    pts = [
+        (
+            float(np.mean([o.score for o in os])),
+            float(np.mean([max(o.roughness, 0.0) for o in os])),
+        )
+        for os in agg.values()
+    ]
+    return [
+        p
+        for i, p in enumerate(pts)
+        if not any(j != i and q[0] <= p[0] and q[1] < p[1] for j, q in enumerate(pts))
+    ]
+
+
+def frontier_hypervolume(observations: list[Observation]) -> float:
+    """How much of the objective square the frontier dominates, in [0, 1].
+
+    The convergence signal, and the second attempt at one. Counting *points* on
+    the frontier does not work: with two continuous objectives, almost any config
+    that is not strictly dominated joins it, so "did this round add a point?" is
+    nearly always yes and the search never stops. Measured on a real study, a
+    two-knob space ran 60 fits without the point count ever going stale.
+
+    Area is the honest question. It grows when a round finds something genuinely
+    better on either objective, and barely moves when a round fills in between
+    points already mapped -- which is exactly the difference between refining the
+    answer and refining the fifth decimal place of it.
+
+    Both objectives are normalised over the feasible points seen so far, so this
+    is a fraction rather than a quantity in anybody's units. That makes the
+    reference move when a new extreme appears; that is intended, since a moving
+    reference means something genuinely new turned up.
+
+    The reference sits *outside* the observed range (:data:`HV_REFERENCE`) rather
+    than on the worst observed value. On the boundary the two extreme points of any
+    frontier normalise exactly onto the corners and dominate nothing, so the area
+    of a perfectly good two-point trade-off comes out zero.
+    """
+    pts = _frontier_points(observations)
+    if len(pts) < 2:
+        return 0.0
+    # Scaled by the frontier's OWN extent, never by the spread of everything tried.
+    # Normalising over all feasible points lets a config that is worse on both
+    # objectives enlarge the box and so make the frontier look better: measured, one
+    # strictly dominated point took the area from 0.17 to 0.66, which would have
+    # reset the staleness counter for finding something bad.
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    xlo, xhi = min(xs), max(xs)
+    ylo, yhi = min(ys), max(ys)
+    xr, yr = (xhi - xlo) or 1.0, (yhi - ylo) or 1.0
+    norm = sorted(((p[0] - xlo) / xr, (p[1] - ylo) / yr) for p in pts)
+
+    # Sorted by x ascending the frontier's y is non-increasing, so the strip
+    # [x_i, x_i+1) is covered up to height 1 - y_i against the (1, 1) reference.
+    ref = HV_REFERENCE
+    hv, n = 0.0, len(norm)
+    for i, (x, y) in enumerate(norm):
+        nxt = norm[i + 1][0] if i + 1 < n else ref
+        hv += (nxt - x) * (ref - y)
+    return hv / (ref * ref)
 
 
 def scalarize_balanced(observations: list[Observation]) -> np.ndarray:
