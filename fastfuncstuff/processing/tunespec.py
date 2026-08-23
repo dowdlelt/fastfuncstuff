@@ -63,6 +63,13 @@ class ParamSpec:
     # knobs where going further is *meaningless* rather than merely unusual --
     # below minpatch 5 an 8-voxel patch carries 24 cubic parameters, so the fit is
     # underdetermined and "passes" only because the box constraint bounds it.
+    #
+    # The free zero floor is wrong for a knob whose zero DISABLES it rather than
+    # meaning "none of it": a stopping window of 0 turns early stopping off, which
+    # is a different experiment, not a smaller amount of the same one. Measured: a
+    # -explore round refining toward small windows grew the ladder to conv_window=0
+    # and spent a fit running every iteration of the ceiling for no quality gain,
+    # which is exactly what the help text says the ladder excludes.
     bounds: tuple[float | None, float | None] = (None, None)
     # Smallest magnitude that is distinguishable from zero for this knob. Not a
     # bound -- 0.0 itself stays legal -- but the search may not propose a value in
@@ -238,6 +245,7 @@ FORMWARP = BackendSpec(
             "no quality gain, and whether stopping is premature is already answerable "
             "from best_iter vs iters_run.",
             attr="convergence_window",
+            bounds=(1, None),
         ),
         ParamSpec(
             "formwarp.conv_threshold",
@@ -309,6 +317,7 @@ _OW_SHARED = (
         "quality gain, and whether stopping is premature is already answerable from "
         "best_iter vs iters_run.",
         attr="convergence_window",
+        bounds=(1, None),
     ),
     ParamSpec(
         "optiwarp.conv_threshold",

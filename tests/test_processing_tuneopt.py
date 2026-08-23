@@ -992,3 +992,20 @@ def test_a_band_is_read_the_same_way_it_was_cut():
     band = (0.95, 1.05)
     assert len(in_band(obs, band)) == 2
     assert _incumbent(obs, band) == {"reg": 1.0}  # the smoother of the two
+
+
+def test_a_stopping_window_never_grows_down_to_disabled():
+    """0 turns early stopping OFF -- a different experiment, not less of the same one.
+
+    The zero floor an axis gets for free is right for magnitudes and wrong here, and
+    the difference is invisible until a ladder refined toward small windows walks
+    onto it: measured on a -explore round, conv_window reached 0 and spent a fit
+    running every iteration of the ceiling for no quality gain.
+    """
+    from fastfuncstuff.processing.tunespec import find_param
+
+    for dotted in ("optiwarp.conv_window", "formwarp.conv_window"):
+        axis = Axis.from_param(find_param(dotted))
+        for _ in range(20):
+            axis.grow(-1)
+        assert min(axis.values) >= 1, (dotted, axis.values)
