@@ -768,6 +768,16 @@ def render_command(
     return cmd
 
 
+def qwarp_cost_for(optimize: str) -> str:
+    """The recipe's cost in qwarp's own vocabulary.
+
+    One function so the fit and the reproduce command cannot disagree: "ls" is
+    the allineate spelling of the whole-image Pearson that qwarp calls pearclp,
+    and a recipe that pins it must run and print the same thing.
+    """
+    return "pearclp" if optimize == "ls" else optimize
+
+
 def _metric_for(spec: BackendSpec, recipe: Recipe) -> str:
     """Translate the recipe's cost into what this backend calls it.
 
@@ -776,7 +786,7 @@ def _metric_for(spec: BackendSpec, recipe: Recipe) -> str:
     metric that behaves most like it.
     """
     if spec.name == "qwarp":
-        return recipe.optimize
+        return qwarp_cost_for(recipe.optimize)
     if recipe.optimize in ("lpa", "lpc"):
         return recipe.optimize
     return "cc"

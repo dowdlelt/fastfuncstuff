@@ -429,6 +429,44 @@ class TestFlagsMatchTheRealCLIs:
                     checked += 1
         assert checked > 50, "the sweep should actually be covering the parameter table"
 
+    def test_whole_rendered_command_parses(self):
+        """The metric flag and the fixed args are part of the command too.
+
+        `test_every_flag_parses` only checked the tunable ParamSpecs, so
+        `-cost lpa` — which qwarp had no `-cost` flag for at all, only
+        one-flag-each `-lpa`/`-lpc` — reached the user as a reproduce line the
+        tool rejected outright.
+        """
+        import importlib
+
+        from fastfuncstuff.processing.tunespec import RECIPES, render_command, resolve_tunable
+
+        checked = 0
+        for recipe in RECIPES.values():
+            for backend in recipe.backends:
+                config = {p.key: p.values[0] for p in resolve_tunable(recipe, backend)}
+                cmd = render_command(backend, "b.nii", "s.nii", "o.nii.gz", config, recipe)
+                mod = importlib.import_module(f"fastfuncstuff.cli.{self.CLI_MODULE[backend]}")
+                try:
+                    mod.parse_args(cmd[1:])
+                except SystemExit:
+                    raise AssertionError(
+                        f"{recipe.name}/{backend}: {' '.join(cmd)} is not a valid command"
+                    ) from None
+                checked += 1
+        assert checked >= len(RECIPES)
+
+    def test_qwarp_runs_the_cost_it_prints(self):
+        """The reproduce line has to name the cost the in-process fit used."""
+        from fastfuncstuff.cli.qwarp import _resolve_cost
+        from fastfuncstuff.cli.qwarp import parse_args as qwarp_args
+        from fastfuncstuff.processing.tunespec import qwarp_cost_for
+
+        for optimize in ("ls", "lpa", "lpc"):
+            printed = qwarp_cost_for(optimize)
+            args = qwarp_args(["-base", "b", "-source", "s", "-prefix", "o", "-cost", printed])
+            assert _resolve_cost(args) == qwarp_cost_for(optimize)
+
     def test_rendered_command_round_trips_to_the_right_value(self):
         """Not just accepted — parsed back as the value the search set."""
         import importlib

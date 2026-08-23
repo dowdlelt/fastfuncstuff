@@ -46,6 +46,7 @@ from .tunespec import (
     QWARP_TUNE_OPTIMIZER,
     Recipe,
     fixed_for,
+    qwarp_cost_for,
     render_command,
     resolve_tunable,
 )
@@ -91,7 +92,7 @@ def _run_qwarp(base, source, config, recipe, device):
 
     cfg = QwarpConfig(verb=0, optimizer=QWARP_TUNE_OPTIMIZER)
     if recipe is not None:
-        cfg.cost_method = "pearclp" if recipe.optimize == "ls" else recipe.optimize
+        cfg.cost_method = qwarp_cost_for(recipe.optimize)
     _apply_config(cfg, "qwarp", config)
     # The pyramid levels are a trajectory: a run at minpatch 5 passes through every
     # coarser patch size on the way. Recording what each level cost and bought means
