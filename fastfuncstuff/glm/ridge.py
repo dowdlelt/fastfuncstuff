@@ -393,7 +393,6 @@ def create_single_trial_design(
         Condition-level design (sum of trials per condition, with basis functions)
     """
     from fastfuncstuff.design.hrf import get_canonical_hrf
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
 
     device = device or torch.device("cpu")
     n_conditions = len(onsets_by_condition)
@@ -402,14 +401,12 @@ def create_single_trial_design(
         condition_labels = [f"cond{i + 1:02d}" for i in range(n_conditions)]
 
     # Count total trials across all conditions and runs
-    total_trials = 0
     trial_info = []  # (condition_idx, run_idx, trial_idx_in_run, onset_time)
 
     for cond_idx, runs_onsets in enumerate(onsets_by_condition):
         for run_idx, run_onsets in enumerate(runs_onsets):
             for trial_idx, onset_time in enumerate(run_onsets):
                 trial_info.append((cond_idx, run_idx, trial_idx, onset_time))
-                total_trials += 1
 
     # Sort trials chronologically by absolute onset time
     # This matches GLMsingle's convention and makes betas directly comparable
@@ -418,7 +415,6 @@ def create_single_trial_design(
     # Generate trial labels and condition IDs
     # Track repeat number per condition (how many times we've seen each condition)
     trial_labels = []
-    trial_condition_ids = []
     repeat_counter = {}  # condition_idx -> current repeat number
 
     for cond_idx, _run_idx, _trial_idx, _onset_time in trial_info:
@@ -430,44 +426,25 @@ def create_single_trial_design(
 
         label = f"{condition_labels[cond_idx]}_{repeat_num:03d}"
         trial_labels.append(label)
-        trial_condition_ids.append(cond_idx)
-    trial_condition_ids = torch.tensor(trial_condition_ids, dtype=torch.long, device=device)
 
-    # Extract run IDs for each trial
-    trial_run_ids = torch.tensor(
-        [run_idx for _, run_idx, _, _ in trial_info],
-        dtype=torch.long,
-        device=device,
-    )
+    from fastfuncstuff.design.matrices import build_event_design_microtime
 
-    # Create onset matrix at microtime resolution
-    bins_per_tr = int(round(tr / microtime_dt))
-    n_microtime = n_timepoints * bins_per_tr
+    run_ends = run_starts[1:] + [n_timepoints]
+    n_timepoints_per_run = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
 
-    # Build single-trial onset matrix (microtime)
-    onset_matrix_micro = torch.zeros(n_microtime, total_trials, dtype=torch.float32, device=device)
-
-    for trial_idx, (cond_idx, run_idx, _trial_in_run, onset_time) in enumerate(trial_info):
-        # Convert onset time to microtime bin
-        # CRITICAL: Use bins_per_tr-based offset (not TR-based) to avoid drift
-        # This must match convolve_hrf_microtime's sampling grid
-        # See design_builder.py:create_onset_matrix_microtime for reference
-        run_start_micro = run_starts[run_idx] * bins_per_tr
-        onset_bin = run_start_micro + int(round(onset_time / microtime_dt))
-
-        # Duration in microtime bins
-        duration_bins = int(round(durations[cond_idx] / microtime_dt))
-
-        # Set boxcar (handle edge cases)
-        start_bin = max(0, onset_bin)
-        if duration_bins == 0:
-            # Instantaneous event: set single bin
-            onset_matrix_micro[start_bin, trial_idx] = 1.0
-        else:
-            # Boxcar event: set range
-            end_bin = min(n_microtime, onset_bin + duration_bins)
-            if end_bin > start_bin:
-                onset_matrix_micro[start_bin:end_bin, trial_idx] = 1.0
+    def _build(hrf_bases: torch.Tensor):
+        result = build_event_design_microtime(
+            all_onsets=onsets_by_condition,
+            durations=durations,
+            hrf_bases=hrf_bases,
+            n_timepoints_per_run=n_timepoints_per_run,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+            return_single_trials=True,
+        )
+        assert isinstance(result, tuple)
+        return result
 
     # Apply HRF convolution (with optional derivatives for SPMG2/SPMG3)
     if hrf_index_per_voxel is None:
@@ -485,31 +462,7 @@ def create_single_trial_design(
                 device=device,
             )  # Shape: (n_basis, hrf_length)
 
-            # Convolve each basis function with onset matrix
-            designs_per_basis = []
-            for basis_idx in range(n_basis):
-                hrf_basis = hrf_set[basis_idx]
-                design_basis = convolve_hrf_microtime(
-                    onset_matrix_micro,
-                    hrf_basis,
-                    n_timepoints=n_timepoints,
-                    tr=tr,
-                    microtime_dt=microtime_dt,
-                    run_starts=run_starts,
-                    device=device,
-                    return_single_trials=False,
-                )  # (n_timepoints, n_trials)
-                designs_per_basis.append(design_basis)
-
-            # Interleave columns: trial1_canonical, trial1_timederiv, ..., trial2_canonical, ...
-            design_columns = []
-            for trial_idx in range(total_trials):
-                for basis_idx in range(n_basis):
-                    design_columns.append(
-                        designs_per_basis[basis_idx][:, trial_idx : trial_idx + 1]
-                    )
-
-            design_matrix = torch.cat(design_columns, dim=1)  # (n_timepoints, n_trials * n_basis)
+            condition_design, design_matrix, trial_condition_ids, trial_run_ids = _build(hrf_set)
 
             # Expand trial labels with basis suffixes
             basis_suffixes = {
@@ -519,45 +472,16 @@ def create_single_trial_design(
             suffixes = basis_suffixes[n_basis]
 
             expanded_trial_labels = []
-            expanded_condition_ids = []
-            expanded_run_ids = []
-            for trial_idx, label in enumerate(trial_labels):
+            for label in trial_labels:
                 for suffix in suffixes:
                     expanded_trial_labels.append(label + suffix)
-                    expanded_condition_ids.append(trial_condition_ids[trial_idx].item())
-                    expanded_run_ids.append(trial_run_ids[trial_idx].item())
 
             trial_labels = expanded_trial_labels
-            trial_condition_ids = torch.tensor(
-                expanded_condition_ids, dtype=torch.long, device=device
-            )
-            trial_run_ids = torch.tensor(expanded_run_ids, dtype=torch.long, device=device)
-
-            # Build condition_design: sum trials within each condition, for each basis
-            condition_design = torch.zeros(
-                n_timepoints, n_conditions * n_basis, dtype=torch.float32, device=device
-            )
-            for cond_idx in range(n_conditions):
-                for basis_idx in range(n_basis):
-                    # Find columns for this condition and basis
-                    # Columns are interleaved, so condition X basis Y is at positions: X*n_basis*trials_per_cond + trial*n_basis + Y
-                    # Actually simpler: check trial_condition_ids and trial label suffix
-                    col_idx_out = cond_idx * n_basis + basis_idx
-                    suffix = suffixes[basis_idx]
-
-                    # Sum all columns that match this condition and suffix
-                    for col_idx, label in enumerate(trial_labels):
-                        if label.endswith(suffix):
-                            # Extract condition from label (before the _XXX suffix)
-                            cond_label = condition_labels[cond_idx]
-                            if label.startswith(cond_label + "_") and label.endswith(suffix):
-                                condition_design[:, col_idx_out] += design_matrix[:, col_idx]
 
         else:
             # Standard single-basis (SPMG1, glmsingle)
             if hrf_library is None or len(hrf_library) == 0:
                 # Use canonical HRF at microtime resolution (NOT TR resolution!)
-                # convolve_hrf_microtime expects HRF at the same microtime_dt as the onset matrix
                 hrf = get_canonical_hrf(
                     stim_duration=0.0, tr=microtime_dt, duration=32.0, device=device
                 )
@@ -565,42 +489,7 @@ def create_single_trial_design(
                 # Use first HRF from library (should already be at microtime resolution)
                 hrf = hrf_library[0].to(device)
 
-            # Convolve - returns (n_timepoints, n_trials)
-            design_matrix = convolve_hrf_microtime(
-                onset_matrix_micro,
-                hrf,
-                n_timepoints=n_timepoints,
-                tr=tr,
-                microtime_dt=microtime_dt,
-                run_starts=run_starts,
-                device=device,
-                return_single_trials=False,
-            )
-            assert isinstance(design_matrix, torch.Tensor)  # return_single_trials=False => Tensor
-
-            # Enforce run boundaries: zero HRF tails that bleed into neighbouring runs.
-            # Run boundaries are hard walls — nothing from one run reaches into another.
-            # Without this, near-zero columns in the training design cause condition
-            # numbers ~1e7, making OLS betas wildly unstable during CV.
-            run_ends = run_starts[1:] + [n_timepoints]  # exclusive end TR for each run
-            for run_idx in range(len(run_starts)):
-                trial_mask_run = trial_run_ids == run_idx
-                if trial_mask_run.any():
-                    run_start_tp = run_starts[run_idx]
-                    run_end_tp = run_ends[run_idx]
-                    if run_start_tp > 0:
-                        design_matrix[:run_start_tp, trial_mask_run] = 0.0
-                    if run_end_tp < n_timepoints:
-                        design_matrix[run_end_tp:, trial_mask_run] = 0.0
-
-            # Build condition_design by summing trials within each condition
-            condition_design = torch.zeros(
-                n_timepoints, n_conditions, dtype=torch.float32, device=device
-            )
-            for cond_idx in range(n_conditions):
-                cond_mask = trial_condition_ids == cond_idx
-                if cond_mask.sum() > 0:
-                    condition_design[:, cond_idx] = design_matrix[:, cond_mask].sum(dim=1)
+            condition_design, design_matrix, trial_condition_ids, trial_run_ids = _build(hrf)
 
         return design_matrix, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
@@ -621,48 +510,23 @@ def create_single_trial_design(
 
         # Pre-compute convolved designs for each HRF
         designs_by_hrf = []
+        condition_design = None
         for hrf_idx in range(n_hrfs):
             hrf = hrf_library[hrf_idx].to(device)
-            design_tr = convolve_hrf_microtime(
-                onset_matrix_micro,
-                hrf,
-                n_timepoints=n_timepoints,
-                tr=tr,
-                microtime_dt=microtime_dt,
-                run_starts=run_starts,
-                device=device,
-                return_single_trials=False,
-            )
+            cond_design, design_tr, ids, run_ids = _build(hrf)
+            if condition_design is None:
+                condition_design = cond_design
+                trial_condition_ids = ids
+                trial_run_ids = run_ids
             designs_by_hrf.append(design_tr)
 
         # Stack: (n_hrfs, n_timepoints, n_trials)
         designs_stacked = torch.stack(designs_by_hrf, dim=0)
 
-        # Enforce run boundaries: zero HRF tails that bleed across runs
-        run_ends = run_starts[1:] + [n_timepoints]
-        for run_idx in range(len(run_starts)):
-            trial_mask_run = trial_run_ids == run_idx
-            if trial_mask_run.any():
-                run_start_tp = run_starts[run_idx]
-                run_end_tp = run_ends[run_idx]
-                if run_start_tp > 0:
-                    designs_stacked[:, :run_start_tp, trial_mask_run] = 0.0
-                if run_end_tp < n_timepoints:
-                    designs_stacked[:, run_end_tp:, trial_mask_run] = 0.0
-
         # Return per-HRF designs — NOT expanded to per-voxel!
         # Downstream code groups voxels by hrf_index and uses designs_stacked[hrf_idx]
 
-        # Build condition_design using first HRF design (for CV prediction)
-        first_design = designs_by_hrf[0]  # (n_timepoints, n_trials)
-        condition_design = torch.zeros(
-            n_timepoints, n_conditions, dtype=torch.float32, device=device
-        )
-        for cond_idx in range(n_conditions):
-            cond_mask = trial_condition_ids == cond_idx
-            if cond_mask.sum() > 0:
-                condition_design[:, cond_idx] = first_design[:, cond_mask].sum(dim=1)
-
+        assert condition_design is not None
         return designs_stacked, trial_labels, trial_condition_ids, trial_run_ids, condition_design
 
 

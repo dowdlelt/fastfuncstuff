@@ -649,6 +649,8 @@ def fit_pathfinder(
     run_starts: list[int],
     nuisance_per_run: list[torch.Tensor],
     cv_splits: list[tuple[list[int], list[int]]],
+    event_onsets: list[list[np.ndarray]] | None = None,
+    durations: list[float] | None = None,
     r2_threshold: float = 0.05,
     max_pcs: int = 20,
     variance_threshold: float = 0.95,
@@ -682,6 +684,34 @@ def fit_pathfinder(
     _bins_per_tr = int(round(tr / microtime_dt))
     n_conditions = onset_matrix.shape[1]
 
+    def _event_design(hrf: torch.Tensor) -> torch.Tensor:
+        if event_onsets is None:
+            design = convolve_hrf_microtime(
+                onset_matrix,
+                hrf,
+                n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                device=device,
+            )
+            assert isinstance(design, torch.Tensor)
+            return design
+        from fastfuncstuff.design.matrices import build_event_design_microtime
+
+        ends = run_starts[1:] + [n_timepoints]
+        run_lengths = [end - start for start, end in zip(run_starts, ends, strict=True)]
+        design = build_event_design_microtime(
+            event_onsets,
+            durations or [0.0] * len(event_onsets),
+            hrf,
+            run_lengths,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+        assert isinstance(design, torch.Tensor)
+        return design
+
     if verbose:
         print("=" * 70)
         print("JOINT HRF + DENOISING OPTIMIZATION")
@@ -710,14 +740,7 @@ def fit_pathfinder(
     )
 
     # Build canonical design matrix
-    canonical_design = convolve_hrf_microtime(
-        onset_matrix,
-        canonical_hrf,
-        n_timepoints,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        device=device,
-    )
+    canonical_design = _event_design(canonical_hrf)
 
     # Project out nuisance (for CV)
     projected_data_init, projected_design_init = project_out_nuisance_per_run(
@@ -787,15 +810,7 @@ def fit_pathfinder(
         hrf = hrf_library[hrf_idx]
 
         # 1. Build task design matrix for this HRF
-        stim_design = convolve_hrf_microtime(
-            onset_matrix,
-            hrf,
-            n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            device=device,
-        )
-        assert isinstance(stim_design, torch.Tensor)  # return_single_trials defaults False
+        stim_design = _event_design(hrf)
         n_stim_cols = stim_design.shape[1]
 
         # 2. Compute initial xval R² (task-only) to identify noise pool
@@ -987,14 +1002,7 @@ def fit_pathfinder(
 
         # Build design with this HRF
         hrf = hrf_library[hrf_idx_int]
-        stim_design = convolve_hrf_microtime(
-            onset_matrix,
-            hrf,
-            n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            device=device,
-        )
+        stim_design = _event_design(hrf)
 
         # Combine: [task | nuisance | noise_pcs]
         components = [stim_design, nuisance_block_diag]
@@ -1564,6 +1572,8 @@ def main():
         run_starts=run_starts,
         nuisance_per_run=nuisance_per_run,
         cv_splits=cv_splits,
+        event_onsets=all_onsets,
+        durations=durations,
         r2_threshold=args.r2_threshold,
         max_pcs=args.max_pcs,
         variance_threshold=args.variance_threshold,

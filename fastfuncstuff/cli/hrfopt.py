@@ -1188,6 +1188,9 @@ def main():
                 device=device,
                 verbose=args.verb >= 1,
                 stim_vec_blocks=stim_vec_blocks,
+                event_onsets=all_onsets,
+                stim_durations=durations,
+                run_starts=run_starts,
             )
 
             # Update results
@@ -1221,6 +1224,7 @@ def main():
             debug_prefix=args.prefix,
             condition_labels=condition_labels,
             stim_vec_blocks=stim_vec_blocks,
+            event_onsets=all_onsets,
         )
 
         # ========== -delta_denoise: second pass without ortvec ==========
@@ -1259,6 +1263,7 @@ def main():
                 debug=False,  # don't double-write debug artifacts
                 debug_prefix=args.prefix,
                 condition_labels=condition_labels,
+                event_onsets=all_onsets,
             )
 
     if cv_data is not data:

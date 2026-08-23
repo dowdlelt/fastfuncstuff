@@ -19,6 +19,7 @@ _LAZY: dict[str, str] = {
     "get_canonical_hrf_library": "fastfuncstuff.design.hrf",
     "get_hrf_library": "fastfuncstuff.design.hrf",
     "pighs_halfcos": "fastfuncstuff.design.hrf",
+    "build_event_design_microtime": "fastfuncstuff.design.matrices",
     "build_glm_design": "fastfuncstuff.design.matrices",
     "convolve_hrf": "fastfuncstuff.design.matrices",
     "convolve_hrf_microtime": "fastfuncstuff.design.matrices",
@@ -39,6 +40,7 @@ if TYPE_CHECKING:
         pighs_halfcos,
     )
     from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
         build_glm_design,
         convolve_hrf,
         convolve_hrf_microtime,

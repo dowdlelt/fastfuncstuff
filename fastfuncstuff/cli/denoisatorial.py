@@ -890,6 +890,7 @@ def build_task_designs(
         fir_top=fir_top,
         n_basis=n_basis,
         all_onsets=all_onsets,
+        stim_durations=durations,
         onset_matrix_micro=onset_matrix_micro,
         n_conditions=n_conditions,
         n_timepoints=n_timepoints,

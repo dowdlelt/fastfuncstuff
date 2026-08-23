@@ -812,32 +812,23 @@ def _run_single_ica(
     if bids_task_onsets is not None:
         # BIDS path: use pre-parsed all_onsets and durations
         try:
-            from fastfuncstuff.design.builder import create_onset_matrix_microtime
             from fastfuncstuff.design.hrf import get_spmg1_hrf
-            from fastfuncstuff.design.matrices import convolve_hrf_microtime
+            from fastfuncstuff.design.matrices import build_event_design_microtime
 
             n_bids_conds = len(bids_task_onsets)
             # Extract this run's onsets (wrapped in list for single-run onset matrix)
             onsets_this_run = [[bids_task_onsets[cidx][run_idx]] for cidx in range(n_bids_conds)]
-            onset_mt = create_onset_matrix_microtime(
-                all_onsets=onsets_this_run,
-                run_starts=[0],
-                tr=tr,
-                n_timepoints=n_t,
-                microtime_dt=args.microtime_dt,
-                stim_durations=bids_task_durations,
-                device=device,
-            )
             hrf = get_spmg1_hrf(microtime_dt=args.microtime_dt, device=device)
-            design_tc = convolve_hrf_microtime(
-                onsets_microtime=onset_mt,
-                hrf=hrf,
-                n_timepoints=n_t,
+            design_tc = build_event_design_microtime(
+                all_onsets=onsets_this_run,
+                durations=bids_task_durations,
+                hrf_bases=hrf,
+                n_timepoints_per_run=[n_t],
                 tr=tr,
                 microtime_dt=args.microtime_dt,
-                run_starts=[0],
                 device=device,
             )
+            assert isinstance(design_tc, torch.Tensor)
             cond_labels = bids_task_labels
             cond_durations = bids_task_durations
             design_tc = ica_postprocess.preprocess_design_for_correlation(

@@ -12,6 +12,133 @@ import torch.nn.functional as F
 from fastfuncstuff.utils import get_device, to_tensor
 
 
+def build_event_design_microtime(
+    all_onsets: list[list[np.ndarray]],
+    durations: list[float],
+    hrf_bases: torch.Tensor,
+    n_timepoints_per_run: list[int],
+    tr: float = 1.0,
+    microtime_dt: float = 0.1,
+    microtime_onset: int = 0,
+    device: torch.device | None = None,
+    return_single_trials: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build HRF regressors from the original event list.
+
+    Every event is duration-convolved and peak-normalized independently before
+    condition columns are formed by addition.  Event identity therefore survives
+    touching and overlapping boxcars.  ``hrf_bases`` contains impulse responses
+    at ``microtime_dt`` and may be one curve or a canonical-plus-derivatives set;
+    output columns are interleaved condition-major, then basis-major.
+
+    When ``return_single_trials`` is true, also return the chronological
+    single-trial design (basis columns interleaved per trial), expanded condition
+    IDs, and expanded run IDs.  The condition design is constructed from those
+    same event responses, so condition-level and single-trial code cannot diverge.
+    """
+    if device is None:
+        device = get_device()
+    if len(all_onsets) != len(durations):
+        raise ValueError("all_onsets and durations must have one entry per condition")
+    if any(len(cond_runs) != len(n_timepoints_per_run) for cond_runs in all_onsets):
+        raise ValueError("every condition must have one onset array per run")
+
+    bases = to_tensor(hrf_bases, device=device)
+    if bases.ndim == 1:
+        bases = bases.unsqueeze(0)
+    if bases.ndim != 2:
+        raise ValueError("hrf_bases must have shape (n_bases, n_microtime_samples)")
+
+    bins_per_tr = int(round(tr / microtime_dt))
+    if bins_per_tr < 1:
+        raise ValueError("microtime_dt must not exceed tr")
+    if not 0 <= microtime_onset < bins_per_tr:
+        raise ValueError(f"microtime_onset must be in [0, {bins_per_tr}), got {microtime_onset}")
+
+    n_conditions = len(all_onsets)
+    n_basis = int(bases.shape[0])
+    total_timepoints = sum(n_timepoints_per_run)
+    condition_design = torch.zeros(
+        total_timepoints, n_conditions * n_basis, device=device, dtype=bases.dtype
+    )
+
+    # One response kernel per condition and basis.  Duration is applied here,
+    # before events are shifted and added, which makes overlap linear while
+    # preserving AFNI's unit-peak SPMG1(d)/library-event convention.
+    responses: list[list[torch.Tensor]] = []
+    for duration in durations:
+        duration_bins = max(1, int(np.round(float(duration) / microtime_dt)))
+        boxcar = torch.ones(duration_bins, device=device, dtype=bases.dtype)
+        cond_responses = []
+        for basis in bases:
+            response = F.conv1d(
+                boxcar.view(1, 1, -1),
+                basis.flip(0).view(1, 1, -1),
+                padding=basis.numel() - 1,
+            ).reshape(-1)[: basis.numel() + duration_bins - 1]
+            peak = response.abs().max()
+            if peak > 0:
+                response = response / peak
+            cond_responses.append(response)
+        responses.append(cond_responses)
+
+    events = sorted(
+        (
+            (run_idx, float(onset), cond_idx)
+            for cond_idx, cond_runs in enumerate(all_onsets)
+            for run_idx, run_onsets in enumerate(cond_runs)
+            for onset in np.asarray(run_onsets, dtype=np.float64)
+        ),
+        key=lambda event: (event[0], event[1], event[2]),
+    )
+    trial_design = None
+    trial_condition_ids: list[int] = []
+    trial_run_ids: list[int] = []
+    if return_single_trials:
+        trial_design = torch.zeros(
+            total_timepoints, len(events) * n_basis, device=device, dtype=bases.dtype
+        )
+
+    run_start_tr = 0
+    run_offsets = []
+    for n_run_tp in n_timepoints_per_run:
+        run_offsets.append(run_start_tr)
+        run_start_tr += n_run_tp
+
+    for trial_idx, (run_idx, onset, cond_idx) in enumerate(events):
+        n_run_tp = n_timepoints_per_run[run_idx]
+        n_run_bins = n_run_tp * bins_per_tr
+        sample_bins = torch.arange(
+            microtime_onset, n_run_bins, bins_per_tr, device=device, dtype=torch.long
+        )
+        onset_bin = int(np.round(onset / microtime_dt))
+        for basis_idx, response_kernel in enumerate(responses[cond_idx]):
+            response = torch.zeros(n_run_bins, device=device, dtype=bases.dtype)
+            dst0 = max(0, onset_bin)
+            src0 = max(0, -onset_bin)
+            n_copy = min(n_run_bins - dst0, response_kernel.numel() - src0)
+            if n_copy > 0:
+                response[dst0 : dst0 + n_copy] = response_kernel[src0 : src0 + n_copy]
+            sampled = response[sample_bins]
+            cond_col = cond_idx * n_basis + basis_idx
+            start = run_offsets[run_idx]
+            condition_design[start : start + n_run_tp, cond_col] += sampled
+            if trial_design is not None:
+                trial_col = trial_idx * n_basis + basis_idx
+                trial_design[start : start + n_run_tp, trial_col] = sampled
+                trial_condition_ids.append(cond_idx)
+                trial_run_ids.append(run_idx)
+
+    if trial_design is None:
+        return condition_design
+    return (
+        condition_design,
+        trial_design,
+        torch.tensor(trial_condition_ids, device=device, dtype=torch.long),
+        torch.tensor(trial_run_ids, device=device, dtype=torch.long),
+    )
+
+
 def convolve_hrf(
     onsets: torch.Tensor,
     hrf: torch.Tensor,
@@ -86,10 +213,14 @@ def convolve_hrf_microtime(
     """
     Convolve onset matrix with HRF using microtime (sub-TR) resolution.
 
-    Uses single-trial convolution approach: each event is convolved separately,
-    scaled to peak=1.0, then summed within condition. This guarantees:
+    Segments each input column into contiguous regions, convolves each region,
+    and scales it to peak 1.0. This is retained for already-sampled matrices and
+    compatibility. Raw event timing must use :func:`build_event_design_microtime`:
+    once duration boxes share an edge or overlap, this sampled representation
+    cannot recover the original event identities.
+
+    For separable regions this guarantees:
     - Each event peaks at 1.0 regardless of stimulus duration
-    - Overlapping events sum linearly (peak > 1.0 if they overlap)
     - Duration affects response *shape* (wider) but not *height*
 
     Parameters
@@ -97,7 +228,8 @@ def convolve_hrf_microtime(
     onsets_microtime : torch.Tensor
         (n_microtime_points, n_conditions) onset matrix at microtime_dt resolution.
         Values can be binary (0/1) or boxcar (constant value during stimulus).
-        Each contiguous non-zero region is treated as a separate event.
+        Each contiguous non-zero region is treated as one event; touching or
+        overlapping original events are therefore not representable here.
         n_microtime_points should equal n_timepoints * (tr / microtime_dt).
     hrf : torch.Tensor
         (n_hrf_microtime_timepoints,) hemodynamic response function at microtime_dt
@@ -273,58 +405,6 @@ def convolve_hrf_microtime(
 
     if return_single_trials:
         return design, single_trial_designs
-    return design
-
-
-def convolve_event_onsets_microtime(
-    all_onsets: list[list[np.ndarray]],
-    hrfs: list[torch.Tensor],
-    n_timepoints_per_run: list[int],
-    tr: float = 1.0,
-    microtime_dt: float = 0.1,
-    microtime_onset: int = 0,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    """Add independently normalized event responses on a run-local microtime grid.
-
-    Unlike a binary boxcar matrix, the event list preserves trial identity when
-    events touch or overlap. That matters for duration-normalized bases such as
-    ``SPMG1(d)``: two adjacent events are the sum of two normalized responses,
-    not one longer response normalized after the events have been merged.
-    """
-    if device is None:
-        device = get_device()
-    if len(all_onsets) != len(hrfs):
-        raise ValueError("all_onsets and hrfs must have one entry per condition")
-
-    bins_per_tr = int(round(tr / microtime_dt))
-    if not 0 <= microtime_onset < bins_per_tr:
-        raise ValueError(f"microtime_onset must be in [0, {bins_per_tr}), got {microtime_onset}")
-
-    total_timepoints = sum(n_timepoints_per_run)
-    design = torch.zeros(total_timepoints, len(all_onsets), device=device)
-    run_start_tr = 0
-    for run_idx, n_run_tp in enumerate(n_timepoints_per_run):
-        n_run_bins = n_run_tp * bins_per_tr
-        sample = torch.arange(
-            microtime_onset, n_run_bins, bins_per_tr, device=device, dtype=torch.long
-        )
-        for cond_idx, (cond_runs, hrf_in) in enumerate(zip(all_onsets, hrfs, strict=True)):
-            if run_idx >= len(cond_runs):
-                raise ValueError(
-                    f"condition {cond_idx} has {len(cond_runs)} runs; expected {len(n_timepoints_per_run)}"
-                )
-            hrf = to_tensor(hrf_in, device=device)
-            response = torch.zeros(n_run_bins, device=device, dtype=hrf.dtype)
-            for onset in np.asarray(cond_runs[run_idx], dtype=np.float64):
-                start = int(np.round(float(onset) / microtime_dt))
-                dst0 = max(0, start)
-                src0 = max(0, -start)
-                n_copy = min(n_run_bins - dst0, hrf.numel() - src0)
-                if n_copy > 0:
-                    response[dst0 : dst0 + n_copy] += hrf[src0 : src0 + n_copy]
-            design[run_start_tr : run_start_tr + n_run_tp, cond_idx] = response[sample]
-        run_start_tr += n_run_tp
     return design
 
 

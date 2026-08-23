@@ -33,12 +33,10 @@ from tqdm.auto import tqdm
 from fastfuncstuff._compile import safe_compile
 from fastfuncstuff.denoise.sequential import estimate_noise_component_caps_per_run
 from fastfuncstuff.design.builder import (
-    create_onset_matrix_microtime,
     parse_afni_timing_file,
     parse_durations,
 )
 from fastfuncstuff.design.hrf import get_spmg1_hrf
-from fastfuncstuff.design.matrices import convolve_hrf_microtime
 from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.utils import to_linalg_f64, to_tensor
 
@@ -2145,28 +2143,18 @@ def build_task_design_for_run(
                 )
             onsets_this_run.append([cond_runs[run_idx]])
 
-    onset_mt = create_onset_matrix_microtime(
-        all_onsets=onsets_this_run,
-        run_starts=[0],
-        tr=tr,
-        n_timepoints=n_timepoints,
-        microtime_dt=microtime_dt,
-        stim_durations=durations,
-        device=device,
-    )
-
     hrf = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
-    design = convolve_hrf_microtime(
-        onsets_microtime=onset_mt,
-        hrf=hrf,
-        n_timepoints=n_timepoints,
+    from fastfuncstuff.design.matrices import build_event_design_microtime
+
+    design = build_event_design_microtime(
+        all_onsets=onsets_this_run,
+        durations=durations,
+        hrf_bases=hrf,
+        n_timepoints_per_run=[n_timepoints],
         tr=tr,
         microtime_dt=microtime_dt,
-        run_starts=[0],
         device=device,
     )
-    # return_single_trials defaults False here, so convolve_hrf_microtime
-    # always returns a Tensor, never the (tensor, trial_info) tuple form.
     assert isinstance(design, torch.Tensor)
     return design, labels, durations
 

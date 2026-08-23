@@ -1182,7 +1182,7 @@ def build_design_matrix(
     # below the TR grid lives on the fine grid until the final downsample.
     # ------------------------------------------------------------------
     from fastfuncstuff.design.hrf import get_spmg1_hrf
-    from fastfuncstuff.design.matrices import convolve_event_onsets_microtime
+    from fastfuncstuff.design.matrices import build_event_design_microtime
     from fastfuncstuff.utils import get_device as _get_device
 
     # Keep the microtime grid exactly commensurate with the acquired TR. A
@@ -1252,24 +1252,23 @@ def build_design_matrix(
         # SPMG1 path.
         if spmg_mask.any():
             spmg_indices = np.flatnonzero(spmg_mask).tolist()
-            spmg_hrfs = [
-                get_spmg1_hrf(
-                    microtime_dt=microtime_dt,
-                    stim_duration=expanded_durations[k],
-                    hrf_duration=32.0,
-                    normalize_peak=True,
-                    device=stim_device,
-                )
-                for k in spmg_indices
-            ]
-            convolved = convolve_event_onsets_microtime(
+            spmg_hrf = get_spmg1_hrf(
+                microtime_dt=microtime_dt,
+                stim_duration=0.0,
+                hrf_duration=32.0,
+                normalize_peak=True,
+                device=stim_device,
+            )
+            convolved = build_event_design_microtime(
                 all_onsets=[expanded_onsets[k] for k in spmg_indices],
-                hrfs=spmg_hrfs,
+                durations=[expanded_durations[k] for k in spmg_indices],
+                hrf_bases=spmg_hrf,
                 n_timepoints_per_run=n_timepoints_per_run,
                 tr=tr,
                 microtime_dt=microtime_dt,
                 device=stim_device,
             )
+            assert isinstance(convolved, torch.Tensor)
             spmg_cols = convolved.cpu().numpy()
         else:
             spmg_cols = None

@@ -15,6 +15,7 @@ import torch
 
 from fastfuncstuff.design.matrices import (
     basis_csplin,
+    build_event_design_microtime,
     build_glm_design,
     convolve_design_hrf,
     generate_random_onsets,
@@ -25,6 +26,55 @@ from fastfuncstuff.design.matrices import (
 )
 
 DEVICE = torch.device("cpu")
+
+
+class TestEventDesignMicrotime:
+    @pytest.mark.parametrize("onsets", [[2.0, 5.0], [2.0, 4.0]])
+    def test_touching_and_overlapping_events_are_sums_of_trials(self, onsets):
+        """Condition columns must be sums of original events for any HRF basis."""
+        bases = torch.tensor(
+            [
+                [0.0, 0.4, 1.0, 0.5, 0.1],
+                [0.0, 1.0, 0.0, -0.5, 0.0],
+            ]
+        )
+        result = build_event_design_microtime(
+            all_onsets=[[np.asarray(onsets)]],
+            durations=[3.0],
+            hrf_bases=bases,
+            n_timepoints_per_run=[30],
+            tr=1.0,
+            microtime_dt=0.5,
+            return_single_trials=True,
+            device=DEVICE,
+        )
+        condition, trials, condition_ids, run_ids = result
+
+        assert condition.shape == (30, 2)
+        assert trials.shape == (30, 4)
+        assert condition_ids.tolist() == [0, 0, 0, 0]
+        assert run_ids.tolist() == [0, 0, 0, 0]
+        torch.testing.assert_close(condition[:, 0], trials[:, 0] + trials[:, 2])
+        torch.testing.assert_close(condition[:, 1], trials[:, 1] + trials[:, 3])
+
+    def test_combined_condition_equals_separate_event_conditions(self):
+        """An arbitrary library HRF obeys linear superposition across event labels."""
+        hrf = torch.tensor([0.0, 0.25, 1.0, 0.7, 0.2, -0.1])
+        design = build_event_design_microtime(
+            all_onsets=[
+                [np.array([2.0, 5.0])],
+                [np.array([2.0])],
+                [np.array([5.0])],
+            ],
+            durations=[3.0, 3.0, 3.0],
+            hrf_bases=hrf,
+            n_timepoints_per_run=[30],
+            tr=1.0,
+            microtime_dt=0.5,
+            device=DEVICE,
+        )
+        assert isinstance(design, torch.Tensor)
+        torch.testing.assert_close(design[:, 0], design[:, 1] + design[:, 2])
 
 
 class TestBasisCsplin:

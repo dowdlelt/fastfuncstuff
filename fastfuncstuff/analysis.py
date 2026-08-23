@@ -13,7 +13,7 @@ import torch
 from tqdm import tqdm
 
 from fastfuncstuff.design.hrf import get_hrf_library
-from fastfuncstuff.design.matrices import build_glm_design, convolve_hrf_microtime
+from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
 from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
 from fastfuncstuff.io.afni import (
@@ -220,6 +220,13 @@ def analyze_from_onsets(
 
     # 3. Read onset files and convert to binary matrix
     onset_data = read_afni_onset_files(onset_files)
+    event_run_starts = run_starts
+    if event_run_starts is None:
+        n_event_runs = len(onset_data[0])
+        if n_timepoints % n_event_runs != 0:
+            raise ValueError("run_starts are required when concatenated runs have unequal lengths")
+        run_len = n_timepoints // n_event_runs
+        event_run_starts = [run_len * run for run in range(n_event_runs)]
     onsets = onsets_to_binary_matrix(
         onset_data,
         n_timepoints,
@@ -256,27 +263,31 @@ def analyze_from_onsets(
         # Get HRF at microtime resolution
         hrf = get_hrf_library(
             mode="single",
-            stim_duration=stim_duration,
+            stim_duration=0.0,
             microtime_dt=microtime_dt,
             device=device,
         )
-        # Use microtime convolution and downsample
-        design = convolve_hrf_microtime(
-            onsets,
+        from fastfuncstuff.design.matrices import build_event_design_microtime
+
+        run_ends = event_run_starts[1:] + [n_timepoints]
+        design = build_event_design_microtime(
+            onset_data,
+            [stim_duration] * len(onset_data),
             hrf,
-            n_timepoints,
+            [end - start for start, end in zip(event_run_starts, run_ends, strict=True)],
             tr=tr,
             microtime_dt=microtime_dt,
             microtime_onset=microtime_onset,
             device=device,
         )
+        assert isinstance(design, torch.Tensor)
 
     elif hrf_mode in ["library", "pighs", "flobs"]:
         # HRF library - will fit with library below
         # Note: 'flobs' is kept for backwards compatibility but 'pighs' is preferred
         hrf_library = get_hrf_library(
             mode="library" if hrf_mode == "library" else "pighs",
-            stim_duration=stim_duration,
+            stim_duration=0.0,
             microtime_dt=microtime_dt,
             n_hrfs=n_hrfs,
             device=device,
@@ -311,6 +322,9 @@ def analyze_from_onsets(
                 microtime_dt=microtime_dt,
                 microtime_onset=microtime_onset,
                 n_timepoints=n_timepoints,
+                event_onsets=onset_data,
+                stim_durations=[stim_duration] * len(onset_data),
+                run_starts=event_run_starts,
                 **glm_kwargs,
             )
             # Store HRF indices in results

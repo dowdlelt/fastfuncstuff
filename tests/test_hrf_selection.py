@@ -111,6 +111,59 @@ def _build_hrf_test_inputs(
     return data, onset_matrix, hrf_library, run_starts, n_tp_total, tr
 
 
+def test_condition_level_library_uses_raw_events_not_binary_regions(monkeypatch):
+    """Library selection must not reconstruct trials from merged duration boxes."""
+    from fastfuncstuff.design.hrf_selection import fit_glm_hrf_library_with_xval
+    from fastfuncstuff.design.matrices import build_event_design_microtime
+
+    tr = 1.0
+    dt = 0.5
+    run_starts = [0, 20]
+    event_onsets = [[np.array([2.0, 5.0]), np.array([2.0, 4.0])]]
+    durations = [3.0]
+    library = torch.tensor(
+        [
+            [0.0, 0.4, 1.0, 0.5, 0.1, 0.0],
+            [0.0, 0.2, 0.7, 1.0, 0.6, 0.2],
+        ]
+    )
+    truth = build_event_design_microtime(
+        event_onsets,
+        durations,
+        library[1],
+        [20, 20],
+        tr=tr,
+        microtime_dt=dt,
+        device=torch.device("cpu"),
+    )
+    assert isinstance(truth, torch.Tensor)
+    data = truth.T.repeat(4, 1)
+    sampled_placeholder = torch.zeros(80, 1)
+
+    def _legacy_path_is_a_bug(*args, **kwargs):
+        raise AssertionError("raw events unexpectedly fell back to binary-region convolution")
+
+    monkeypatch.setattr(
+        "fastfuncstuff.design.hrf_selection.convolve_hrf_microtime", _legacy_path_is_a_bug
+    )
+    result = fit_glm_hrf_library_with_xval(
+        data=data,
+        onsets=sampled_placeholder,
+        hrf_library=library,
+        tr=tr,
+        run_starts=run_starts,
+        stim_durations=durations,
+        microtime_dt=dt,
+        polort=-1,
+        select_mode="full",
+        skip_final_fit=True,
+        event_onsets=event_onsets,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert result.hrf_index.shape == (4,)
+
+
 @pytest.fixture
 def device():
     return get_device()

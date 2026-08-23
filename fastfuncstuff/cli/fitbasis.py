@@ -1652,6 +1652,7 @@ def _select_hrf_per_voxel(
         # Only the index is wanted: ffs_fitbasis immediately refits with its
         # own derivative basis, so the engine's own full refit is discarded.
         skip_final_fit=True,
+        event_onsets=all_onsets,
     )
     idx = res.hrf_index.detach().cpu().numpy().astype(np.int64)
     score = res.xval_r2_best.detach().cpu().numpy().astype(np.float32)

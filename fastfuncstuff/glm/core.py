@@ -1208,6 +1208,9 @@ def fit_glm_hrf_library(
     microtime_dt: float = 0.1,
     microtime_onset: int = 0,
     n_timepoints: int | None = None,
+    event_onsets: list[list[np.ndarray]] | None = None,
+    stim_durations: list[float] | None = None,
+    run_starts: list[int] | None = None,
     **kwargs,
 ) -> tuple[GLMResults, torch.Tensor, torch.Tensor]:
     """
@@ -1276,16 +1279,33 @@ def fit_glm_hrf_library(
         # Convolve design with this HRF
         hrf = hrf_library[hrf_idx]
 
-        # Convolve at microtime resolution and downsample to TR
-        convolved_design = convolve_hrf_microtime(
-            design,
-            hrf,
-            n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            microtime_onset=microtime_onset,
-            device=device,
-        )
+        if event_onsets is None:
+            convolved_design = convolve_hrf_microtime(
+                design,
+                hrf,
+                n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                device=device,
+            )
+        else:
+            from fastfuncstuff.design.matrices import build_event_design_microtime
+
+            starts = run_starts or [0]
+            ends = starts[1:] + [n_timepoints]
+            run_lengths = [end - start for start, end in zip(starts, ends, strict=True)]
+            convolved_design = build_event_design_microtime(
+                event_onsets,
+                stim_durations or [0.0] * len(event_onsets),
+                hrf,
+                run_lengths,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                device=device,
+            )
+            assert isinstance(convolved_design, torch.Tensor)
 
         # Fit GLM for each HRF
         fit_kwargs = kwargs.copy()

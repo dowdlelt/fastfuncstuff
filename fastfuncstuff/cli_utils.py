@@ -3200,6 +3200,7 @@ def build_task_design_from_args(
     fir_top: float | None,
     n_basis: int | None,
     all_onsets: list,
+    stim_durations: list[float],
     onset_matrix_micro: torch.Tensor,
     n_conditions: int,
     n_timepoints: int,
@@ -3273,10 +3274,26 @@ def build_task_design_from_args(
 
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.matrices import (
-        convolve_hrf_microtime,
+        build_event_design_microtime,
         make_fir_design,
         make_tent_design,
     )
+
+    run_ends = run_starts[1:] + [n_timepoints]
+    n_timepoints_per_run = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
+
+    def _event_design(hrf_bases: torch.Tensor) -> torch.Tensor:
+        design = build_event_design_microtime(
+            all_onsets=all_onsets,
+            durations=stim_durations,
+            hrf_bases=hrf_bases,
+            n_timepoints_per_run=n_timepoints_per_run,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            device=device,
+        )
+        assert isinstance(design, torch.Tensor)
+        return design
 
     if hrf_opt:
         # Per-voxel HRF mode: build designs_by_hrf dict
@@ -3294,15 +3311,7 @@ def build_task_design_from_args(
         designs_by_hrf = {}
         for hrf_idx_val in unique_hrf_indices:
             hrf_kernel = hrf_library[hrf_idx_val]
-            design_for_hrf = convolve_hrf_microtime(
-                onsets_microtime=onset_matrix_micro,
-                hrf=hrf_kernel,
-                n_timepoints=n_timepoints,
-                tr=tr,
-                microtime_dt=microtime_dt,
-                device=device,
-            )
-            assert isinstance(design_for_hrf, torch.Tensor)
+            design_for_hrf = _event_design(hrf_kernel)
             designs_by_hrf[hrf_idx_val] = design_for_hrf
 
         print(f"  Created {len(designs_by_hrf)} HRF-specific design matrices")
@@ -3374,31 +3383,7 @@ def build_task_design_from_args(
                     device=device,
                 )
 
-                # Convolve each basis function with onset matrix
-                # Result: list of (n_timepoints, n_conditions) matrices
-                design_per_basis = []
-                for basis_idx in range(n_basis):
-                    hrf_basis = hrf_set[basis_idx]  # Single HRF from the set
-                    design_basis = convolve_hrf_microtime(
-                        onsets_microtime=onset_matrix_micro,
-                        hrf=hrf_basis,
-                        n_timepoints=n_timepoints,
-                        tr=tr,
-                        microtime_dt=microtime_dt,
-                        device=device,
-                    )
-                    design_per_basis.append(design_basis)
-
-                # Interleave columns: cond1_canonical, cond1_timederiv, ..., cond2_canonical, ...
-                # For each condition, stack all basis functions
-                task_columns = []
-                for cond_idx in range(n_conditions):
-                    for basis_idx in range(n_basis):
-                        # Extract this condition's column from this basis
-                        task_columns.append(design_per_basis[basis_idx][:, cond_idx : cond_idx + 1])
-
-                # Concatenate all columns
-                task_design = torch.cat(task_columns, dim=1)
+                task_design = _event_design(hrf_set)
                 print(
                     f"  Design shape: {task_design.shape[0]} timepoints × {task_design.shape[1]} regressors"
                 )
@@ -3413,14 +3398,7 @@ def build_task_design_from_args(
                     normalize_peak=True,
                     device=device,
                 )
-                task_design = convolve_hrf_microtime(
-                    onsets_microtime=onset_matrix_micro,
-                    hrf=hrf,
-                    n_timepoints=n_timepoints,
-                    tr=tr,
-                    microtime_dt=microtime_dt,
-                    device=device,
-                )
+                task_design = _event_design(hrf)
             elif hrf_model_name == "GLMSINGLE":
                 print("  Using canonical GLMsingle HRF")
                 hrf = get_hrf_library(
@@ -3430,14 +3408,7 @@ def build_task_design_from_args(
                     hrf_duration=32.0,
                     device=device,
                 )
-                task_design = convolve_hrf_microtime(
-                    onsets_microtime=onset_matrix_micro,
-                    hrf=hrf,
-                    n_timepoints=n_timepoints,
-                    tr=tr,
-                    microtime_dt=microtime_dt,
-                    device=device,
-                )
+                task_design = _event_design(hrf)
             else:
                 print(f"ERROR: Unknown canonical HRF: {hrf_model_name}")
                 sys.exit(1)

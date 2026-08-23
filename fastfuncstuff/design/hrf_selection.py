@@ -661,6 +661,7 @@ def fit_glm_hrf_library_with_xval(
     final_fit_data: torch.Tensor | None = None,
     skip_final_fit: bool = False,
     stim_vec_blocks: list | None = None,
+    event_onsets: list[list[np.ndarray]] | None = None,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated or in-sample R².
@@ -803,6 +804,38 @@ def fit_glm_hrf_library_with_xval(
 
     n_hrfs = hrf_library.shape[0]
     n_runs = len(run_starts)
+
+    def _event_safe_design(hrf: torch.Tensor) -> torch.Tensor:
+        if event_onsets is None:
+            design = convolve_hrf_microtime(
+                onsets,
+                hrf,
+                n_timepoints_data,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                run_starts=run_starts,
+                device=device,
+            )
+            assert isinstance(design, torch.Tensor)
+            return design
+        from .matrices import build_event_design_microtime
+
+        durations = stim_durations or [0.0] * len(event_onsets)
+        run_ends = run_starts[1:] + [n_timepoints_data]
+        run_lengths = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
+        design = build_event_design_microtime(
+            all_onsets=event_onsets,
+            durations=durations,
+            hrf_bases=hrf,
+            n_timepoints_per_run=run_lengths,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
+        assert isinstance(design, torch.Tensor)
+        return design
 
     # Auto-fallback: CV requires ≥ 2 runs
     if select_mode == "xval" and n_runs < 2:
@@ -1003,17 +1036,7 @@ def fit_glm_hrf_library_with_xval(
     all_projected_designs = []
     for hrf_idx in range(n_hrfs):
         hrf = hrf_library[hrf_idx]
-        stim_design = convolve_hrf_microtime(
-            onsets,
-            hrf,
-            n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            microtime_onset=microtime_onset,
-            run_starts=run_starts,
-            device=device,
-        )
-        assert isinstance(stim_design, torch.Tensor)
+        stim_design = _event_safe_design(hrf)
         stim_design = _append_stim_vec_columns(
             stim_design,
             stim_vec_blocks,
@@ -1067,19 +1090,7 @@ def fit_glm_hrf_library_with_xval(
     if verbose:
         print(f"  Using {canonical_label} canonical HRF for baseline comparison")
 
-    canonical_design = convolve_hrf_microtime(
-        onsets,
-        canonical_hrf,
-        n_timepoints,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        microtime_onset=microtime_onset,
-        run_starts=run_starts,
-        device=device,
-    )
-    # return_single_trials defaults False here, so convolve_hrf_microtime
-    # always returns a Tensor, never the (tensor, trial_info) tuple form.
-    assert isinstance(canonical_design, torch.Tensor)
+    canonical_design = _event_safe_design(canonical_hrf)
     canonical_design = _append_stim_vec_columns(
         canonical_design,
         stim_vec_blocks,
@@ -1438,6 +1449,8 @@ def fit_glm_hrf_library_with_xval(
             verbose=verbose,
             chunk_size=chunk_size,
             stim_vec_blocks=stim_vec_blocks,
+            event_onsets=event_onsets,
+            stim_durations=stim_durations,
         )
 
     # Build metadata for ARMA reuse
@@ -1555,6 +1568,8 @@ def _fit_voxelwise_hrf(
     verbose: bool,
     chunk_size: int | None,
     stim_vec_blocks: list | None = None,
+    event_onsets: list[list[np.ndarray]] | None = None,
+    stim_durations: list[float] | None = None,
 ) -> GLMResults:
     """
     Fit GLM with voxel-wise HRFs by grouping voxels with same HRF.
@@ -1616,17 +1631,34 @@ def _fit_voxelwise_hrf(
         # Convolve with this HRF (do this once for the group)
         hrf = hrf_library[hrf_idx_int]
 
-        stim_design = convolve_hrf_microtime(
-            onsets,
-            hrf,
-            n_timepoints,
-            tr=tr,
-            microtime_dt=microtime_dt,
-            microtime_onset=microtime_onset,
-            run_starts=run_starts,
-            device=device,
-        )
-        assert isinstance(stim_design, torch.Tensor)
+        if event_onsets is None:
+            stim_design = convolve_hrf_microtime(
+                onsets,
+                hrf,
+                n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                run_starts=run_starts,
+                device=device,
+            )
+            assert isinstance(stim_design, torch.Tensor)
+        else:
+            from .matrices import build_event_design_microtime
+
+            run_ends = run_starts[1:] + [n_timepoints]
+            run_lengths = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
+            stim_design = build_event_design_microtime(
+                event_onsets,
+                stim_durations or [0.0] * len(event_onsets),
+                hrf,
+                run_lengths,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                device=device,
+            )
+            assert isinstance(stim_design, torch.Tensor)
         stim_design = _append_stim_vec_columns(
             stim_design,
             stim_vec_blocks,
@@ -1749,6 +1781,9 @@ def _fit_voxelwise_hrf_canonical(
     device: torch.device,
     verbose: bool = False,
     stim_vec_blocks: list | None = None,
+    event_onsets: list[list[np.ndarray]] | None = None,
+    stim_durations: list[float] | None = None,
+    run_starts: list[int] | None = None,
 ) -> GLMResults:
     """
     Fit GLM with canonical HRF for all voxels (for comparison with per-voxel optimal HRFs).
@@ -1792,16 +1827,37 @@ def _fit_voxelwise_hrf_canonical(
         print("  Fitting canonical HRF (all voxels, one design matrix)...")
 
     # Create single design matrix with canonical HRF
-    stim_design = convolve_hrf_microtime(
-        onsets,
-        canonical_hrf,
-        n_timepoints=n_timepoints,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        microtime_onset=microtime_onset,
-        device=device,
-    )
-    assert isinstance(stim_design, torch.Tensor)
+    if event_onsets is None:
+        stim_design = convolve_hrf_microtime(
+            onsets,
+            canonical_hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
+        assert isinstance(stim_design, torch.Tensor)
+    else:
+        from .matrices import build_event_design_microtime
+
+        n_runs = len(event_onsets[0]) if event_onsets else 1
+        starts = run_starts or [0]
+        if len(starts) != n_runs:
+            raise ValueError("event_onsets and run_starts must describe the same runs")
+        ends = starts[1:] + [n_timepoints]
+        run_lengths = [end - start for start, end in zip(starts, ends, strict=True)]
+        stim_design = build_event_design_microtime(
+            event_onsets,
+            stim_durations or [0.0] * len(event_onsets),
+            canonical_hrf,
+            run_lengths,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
+        assert isinstance(stim_design, torch.Tensor)
     stim_design = _append_stim_vec_columns(
         stim_design,
         stim_vec_blocks,
