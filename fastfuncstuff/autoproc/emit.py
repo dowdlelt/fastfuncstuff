@@ -40,7 +40,6 @@ _TOOLS = [
     "ffs_blipflip",
     "ffs_util_b0fmap",
     "ffs_allineate",
-    "ffs_formwarp",
     "ffs_segment",
     "ffs_nwarp",
     "ffs_util_3dmath",
@@ -145,6 +144,16 @@ def _split_flags(opts: str) -> list[str]:
     return groups
 
 
+def _nl_tool(opt, stage: str) -> str:
+    """The command that estimates one nonlinear stage, per that stage's backend.
+
+    The engines are interchangeable to a stage -- they all take -matrix,
+    -warp_prefix and -batch -- so which one runs is a per-stage setting rather
+    than something the emitter knows. What differs between them is the op string,
+    which travels separately (config.nl_stage_opts / -<stage>_opts)."""
+    return config.nl_command(getattr(opt, f"{stage}_backend", config.DEFAULT_NL_BACKEND))
+
+
 def _ffs(tool: str, parts: list[str], indent: str = "  ") -> str:
     """Render an ffs_* call one flag per line with ``\\`` continuations, indented.
     ``parts`` are per-flag tokens (mix of literals and bash ``${...}``)."""
@@ -221,7 +230,7 @@ def _nl_source_args(in_source: bool, aligned: str, native: str, matrix: str) -> 
     """The -source (and maybe -matrix) args for a nonlinear refinement stage.
 
     Default: refine the image the linear stage already produced, on the base grid.
-    ``in_source``: hand ffs_formwarp the linear stage's matrix and the *un*-allineated
+    ``in_source``: hand the backend the linear stage's matrix and the *un*-allineated
     input instead, and it inverts the matrix, pulls the base onto the source's grid and
     solves there -- the source is never resampled. The resulting warp lives in source
     space and therefore acts on the data BEFORE its affine, which is why plan.py swaps
@@ -1266,7 +1275,22 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # romeo (MRItools) is an external dependency, only needed with -phase_proc.
-    tools = [*_TOOLS, "romeo"] if _phase_on(plan) else _TOOLS
+    # Only the *command* is checked, not the flags that fix a backend's identity
+    # ("ffs_optiwarp -force demons" is one executable), and only for the stages
+    # this script actually runs -- a missing tool nobody calls is not a problem.
+    opt = plan.options
+    nl_tools = [
+        _nl_tool(opt, stage).split()[0]
+        for stage, on in (
+            ("xrun_nl", opt.xrun_nonlin),
+            ("xfmap_nl", opt.xfmap_nonlin),
+            ("xses_nl", opt.xses_nonlin or opt.grand_reference_nonlin),
+        )
+        if on
+    ]
+    tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
+    if _phase_on(plan):
+        tools = [*tools, "romeo"]
     return f"""
 # =============================== stage: preflight ===========================
 echo '== preflight: inputs + tools =='
@@ -1708,7 +1732,7 @@ def _stage_xfmap(plan: Plan, script_stem: str) -> str:
     if groups:
         out.append(_batch_launch("ffs_allineate", "albatch", "skip_xfmap"))
         if opt.xfmap_nonlin:
-            out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xfmap"))
+            out.append(_batch_launch(_nl_tool(opt, "xfmap_nl"), "fwbatch", "skip_xfmap"))
     if fmapmean_sessions:
         # mean_fmap: within a session every group's mean is now on that session's
         # reference-fmap grid, so averaging them is a straight voxelwise mean (more
@@ -1761,7 +1785,7 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
             )
             + "\n"
         )
-        nl_launch = "\n" + _batch_launch("ffs_formwarp", "fwbatch", "skip_xrun")
+        nl_launch = "\n" + _batch_launch(_nl_tool(opt, "xrun_nl"), "fwbatch", "skip_xrun")
     # The aligned images the pyramid actually consumes are stage07's runmeans
     # (both lanes, one shared matrix); these -prefix outputs are alignment QC, so
     # they carry the lane that produced them. The matrix never does.
@@ -1807,7 +1831,7 @@ def _stage_xrun(plan: Plan, script_stem: str) -> str:
 # Align each run to its anchor (fmap group forward image, or the session's first
 # run when there are no fmaps). Saves a matrix that composes into the chain.
 # Batched: the loop only WRITES the manifests, then ONE ffs_allineate (and one
-# ffs_formwarp) process does every run — Python/CUDA/torch.compile startup is
+# nonlinear backend) process does every run — Python/CUDA/torch.compile startup is
 # paid once instead of once per run. The nonlinear batch runs after the linear
 # one because its source is that run's linear output.
 # skip_xrun=1 → -batch_skip (skip runs whose outputs already exist).
@@ -1969,7 +1993,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
             )
         )
     # Same batching as stage06: the per-session manifests are written first, then
-    # ONE ffs_allineate (and one ffs_formwarp) process handles every session.
+    # ONE ffs_allineate (and one nonlinear backend) process handles every session.
     nonref = [s for s in sessions if s != ref]
     if nonref:
         out.append(f'albatch="{script_stem}_xsesbatch.txt"; : > "$albatch"')
@@ -2015,7 +2039,7 @@ def _stage_xses(plan: Plan, script_stem: str) -> str:
     if nonref:
         out.append(_batch_launch("ffs_allineate", "albatch", "skip_xses"))
         if opt.xses_nonlin:
-            out.append(_batch_launch("ffs_formwarp", "fwbatch", "skip_xses"))
+            out.append(_batch_launch(_nl_tool(opt, "xses_nl"), "fwbatch", "skip_xses"))
     out.append(_qc_xses(plan))
     out.append(_stage_gmrun(plan, script_stem))
 
@@ -2123,7 +2147,7 @@ def _stage_xref(plan: Plan) -> str:
     if opt.grand_reference_nonlin:
         nl = (
             _ffs(
-                "ffs_formwarp",
+                _nl_tool(opt, "xses_nl"),
                 [
                     '-base "$REFGM_EXT"',
                     '-source "stage09.xref_lin.nii$FMT"',

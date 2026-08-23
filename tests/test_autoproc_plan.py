@@ -1663,3 +1663,109 @@ def test_borrowed_forward_is_the_run_acquired_next_to_the_fieldmap():
     del fmap.json["AcquisitionTime"]
     plan = build_plan(Subject("X", [Session("01", runs, [fmap])]), Options())
     assert all(pr.fmap_forward.endswith("task-expres_run-1_bold.nii.gz") for pr in plan.runs)
+
+
+# ---------------------------------------------------------------------------
+# Which engine runs a nonlinear stage
+# ---------------------------------------------------------------------------
+
+
+def _two_session_subject() -> Subject:
+    return Subject(
+        "X",
+        [Session("01", [_run("01", "foo", "1")]), Session("02", [_run("02", "foo", "1")])],
+    )
+
+
+def test_nonlinear_backend_is_per_stage():
+    """One script can run different engines at different stages.
+
+    The stages are different problems -- cross-run is a small residual between two
+    images of one head minutes apart, cross-session can be a different day and a
+    different shim -- so a study that measured them separately has to be able to
+    say so.
+    """
+    subj = _two_session_subject()
+    script = write_script(
+        build_plan(
+            subj,
+            Options(
+                ref_ses="01",
+                xrun_nonlin=True,
+                xses_nonlin=True,
+                xrun_nl_backend="optiwarp_demons",
+                xses_nl_backend="qwarp",
+            ),
+        ),
+        "wd",
+        bids_root="/bids",
+    )
+    launches = set(re.findall(r"(ffs_\w+(?: -\w+ \w+)*) -batch ", script))
+    assert any(ln.startswith("ffs_optiwarp -force demons") for ln in launches), launches
+    assert any(ln.startswith("ffs_qwarp") for ln in launches), launches
+    assert not any(ln.startswith("ffs_formwarp") for ln in launches), launches
+
+
+def test_the_force_model_travels_with_the_optiwarp_backend():
+    """-force demons is not a knob, it is which engine this is.
+
+    The three optical-flow backends are one executable told apart by it, so it has
+    to ride with the command and not with the tunable op string -- otherwise
+    picking optiwarp_lk and overriding -xrun_nl_opts would silently run demons.
+    """
+    subj = _two_session_subject()
+    script = write_script(
+        build_plan(subj, Options(xrun_nonlin=True, xrun_nl_backend="optiwarp_lk")),
+        "wd",
+        bids_root="/bids",
+    )
+    assert "ffs_optiwarp -force lk -batch" in script
+
+
+def test_preflight_checks_the_backend_the_script_will_call():
+    """A script that never runs formwarp must not fail preflight for lacking it."""
+    subj = _two_session_subject()
+    script = write_script(
+        build_plan(subj, Options(xrun_nonlin=True, xrun_nl_backend="optiwarp_demons")),
+        "wd",
+        bids_root="/bids",
+    )
+    tools = re.search(r"for t in ([^;]+); do", script).group(1).split()
+    assert "ffs_optiwarp" in tools and "ffs_formwarp" not in tools
+    # and the identity flag is not mistaken for a command
+    assert "-force" not in tools and "demons" not in tools
+
+
+def test_a_linear_only_script_names_no_nonlinear_tool():
+    subj = _two_session_subject()
+    script = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    tools = re.search(r"for t in ([^;]+); do", script).group(1).split()
+    assert not [t for t in tools if t in ("ffs_formwarp", "ffs_optiwarp", "ffs_qwarp")], tools
+
+
+def test_backend_choice_moves_the_default_op_string():
+    """An unset -<stage>_nl_opts means 'this backend's baseline', not formwarp's.
+
+    formwarp's string carries -cc_radius/-update_var, which optiwarp and qwarp do
+    not have; handing it to them would fail at the stage rather than at generation.
+    """
+    from fastfuncstuff.autoproc import config
+
+    for backend in config.nl_backends():
+        opts = config.nl_stage_opts(backend, "xrun_nl")
+        if backend != "formwarp":
+            assert "-update_var" not in opts and "-cc_radius" not in opts, (backend, opts)
+
+
+def test_every_backend_baseline_is_spelled_correctly():
+    """The baselines are checked against each engine's own parser, as -*_opts are.
+
+    A default nobody typed is exactly the string a typo survives longest in.
+    """
+    from fastfuncstuff.autoproc import config, optcheck
+
+    for backend in config.nl_backends():
+        module = config.nl_command(backend).split()[0].removeprefix("ffs_")
+        for stage in config.NL_STAGE_KEYS:
+            errs = optcheck.check_opts(stage, config.nl_stage_opts(backend, stage), module=module)
+            assert not errs, errs

@@ -98,6 +98,14 @@ class Options:
     xrun_nonlin_in_source: bool = False
     xfmap_nonlin_in_source: bool = False
     xses_nonlin_in_source: bool = False
+    # Which engine estimates each nonlinear refinement. Per stage because the
+    # stages are different problems: cross-run is a small residual between two
+    # images of one head minutes apart, cross-session can be a different day and
+    # a different shim. `-nl_backend` sets all three; the per-stage flags exist
+    # because a study that measured them separately should be able to say so.
+    xrun_nl_backend: str = config.DEFAULT_NL_BACKEND
+    xfmap_nl_backend: str = config.DEFAULT_NL_BACKEND
+    xses_nl_backend: str = config.DEFAULT_NL_BACKEND
     ref_ses: str | None = None
     fmap_ref: list[str] | None = None
     # -ref_image: which EPI-contrast image REPRESENTS a level. One vocabulary at

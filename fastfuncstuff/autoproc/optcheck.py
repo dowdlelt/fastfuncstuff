@@ -28,6 +28,8 @@ STAGE_TOOL: dict[str, str] = {
     "blip": "blipflip",
     "b0fmap": "util_b0fmap",
     "xrun": "allineate",
+    # The nonlinear stages' engine is a runtime choice; this is only the default
+    # (see cli/autoproc.py, which passes the resolved one).
     "xrun_nl": "formwarp",
     "xfmap": "allineate",
     "xfmap_nl": "formwarp",
@@ -108,13 +110,18 @@ def _grab_parser(module: str) -> argparse.ArgumentParser | None:
     return None
 
 
-def check_opts(key: str, opts: str) -> list[str]:
+def check_opts(key: str, opts: str, module: str | None = None) -> list[str]:
     """Errors for flags in ``opts`` that the stage's tool does not accept.
 
     Empty when everything is spelled right, the stage has no ffs parser (ROMEO),
     or the parser could not be obtained — a validator that cannot validate must
-    not block script generation."""
-    module = STAGE_TOOL.get(key)
+    not block script generation.
+
+    ``module`` overrides the stage's usual tool, for the nonlinear stages: their
+    engine is chosen at runtime, and validating `-xrun_nl_opts` against formwarp
+    when optiwarp is what will run turns a real typo into a pass and a correct
+    flag into an error."""
+    module = module or STAGE_TOOL.get(key)
     if module is None or not opts.strip():
         return []
     parser = _grab_parser(module)

@@ -295,6 +295,34 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="nonlinear cross-session refinement",
     )
+    g.add_argument(
+        "-nl_backend",
+        "-nl-backend",
+        default=None,
+        metavar="NAME",
+        help="Engine for every nonlinear cross-run/fmap/session refinement "
+        f"(default: {config.DEFAULT_NL_BACKEND}). One of: "
+        + ", ".join(config.nl_backends())
+        + ". These are the same backends ffs_tunewarp measures, under the same "
+        "names, so a tuning run's conclusion names the thing you set here. The "
+        "settings themselves are separate: pass them with -xrun_nl_opts and its "
+        "siblings, whose defaults follow the backend you pick.",
+    )
+    for _stage, _what in (
+        ("xrun", "cross-run"),
+        ("xfmap", "cross-fmap-group"),
+        ("xses", "cross-session"),
+    ):
+        g.add_argument(
+            f"-{_stage}_nl_backend",
+            f"-{_stage}-nl-backend",
+            default=None,
+            metavar="NAME",
+            help=f"engine for the {_what} nonlinear step only, overriding "
+            "-nl_backend. The stages are different problems -- cross-run is a "
+            "small residual between two images of one head minutes apart, "
+            "cross-session can be a different day and a different shim.",
+        )
     for _stage, _what in (
         ("xrun", "cross-run"),
         ("xfmap", "cross-fmap-group"),
@@ -307,7 +335,7 @@ def build_parser() -> argparse.ArgumentParser:
             const=True,
             default=None,
             help=f"estimate the {_what} nonlinear warp in the SOURCE's frame: pass the "
-            "linear stage's matrix and its un-allineated input to ffs_formwarp, which "
+            "linear stage's matrix and its un-allineated input to the backend, which "
             "inverts the matrix and pulls the base onto the source grid. The source is "
             "never resampled, and the warp swaps places with its affine in the nwarp "
             "chain. NOTE: this relocates a clipped FoV rather than recovering it (the "
@@ -500,16 +528,43 @@ def _resolve_anat(args) -> tuple[str | None, str | None]:
     return None, args.tpm_source
 
 
+def _resolve_nl_backends(args) -> dict[str, str]:
+    """Which engine runs each nonlinear stage: per-stage flag, then -nl_backend.
+
+    Validated here rather than by argparse ``choices`` so the error can name the
+    tuner: these are ffs_tunewarp's backend names, and a typo is far more often a
+    half-remembered name than an unsupported engine.
+    """
+    known = config.nl_backends()
+    out: dict[str, str] = {}
+    for stage in config.NL_STAGE_KEYS:
+        chosen = (
+            getattr(args, f"{stage}_backend", None) or args.nl_backend or config.DEFAULT_NL_BACKEND
+        )
+        if chosen not in known:
+            raise SystemExit(
+                f"unknown nonlinear backend {chosen!r}. Known: {', '.join(known)} "
+                "(the same names ffs_tunewarp reports)."
+            )
+        out[f"{stage}_backend"] = chosen
+    return out
+
+
 def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[str], list[str]]:
     """Return (errors, warnings). Non-empty errors ⇒ do not write the script."""
     errors: list[str] = []
     warnings: list[str] = []
 
     # Typo in an override: catch it now, not when the script reaches that stage.
+    # A nonlinear stage is checked against the engine that will actually run it.
+    nl_module = {
+        key: config.nl_command(getattr(opt, f"{key}_backend")).split()[0].removeprefix("ffs_")
+        for key in config.NL_STAGE_KEYS
+    }
     for key in (*config.STAGE_OPT_KEYS, "glm"):
         val = getattr(args, f"{key}_opts", None)
         if val:
-            errors += optcheck.check_opts(key, val)
+            errors += optcheck.check_opts(key, val, module=nl_module.get(key))
 
     needs_anat = opt.go_to_anat and not opt.grand_reference and not opt.ref_file
     if needs_anat and anat_path is None:
@@ -908,6 +963,15 @@ def main(argv: list[str] | None = None) -> int:
     def eff(argval, field, default=False):
         return argval if argval is not None else rget(field, default)
 
+    # Backend first, opt strings second: an unset -<stage>_nl_opts means "whatever
+    # this backend's baseline is", which is not knowable until the backend is. An
+    # explicit override still wins, so a user who passes both gets what they typed
+    # even where the two disagree.
+    nl_backends = _resolve_nl_backends(args)
+    for key in config.NL_STAGE_KEYS:
+        if getattr(args, f"{key}_opts", None) is None:
+            config.DEFAULT_OPTS[key] = config.nl_stage_opts(nl_backends[f"{key}_backend"], key)
+
     # per-stage opt overrides mutate the shared defaults for this run.
     for key in config.STAGE_OPT_KEYS:
         val = getattr(args, f"{key}_opts", None)
@@ -972,6 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
         xrun_nonlin_in_source=eff(args.xrun_nonlin_in_source, "xrun_nonlin_in_source"),
         xfmap_nonlin_in_source=eff(args.xfmap_nonlin_in_source, "xfmap_nonlin_in_source"),
         xses_nonlin_in_source=eff(args.xses_nonlin_in_source, "xses_nonlin_in_source"),
+        **nl_backends,
         ref_ses=args.ref_ses,
         fmap_ref=args.fmap_ref,
         ref_image=args.ref_image,

@@ -66,6 +66,62 @@ DEFAULT_OPTS: dict[str, str] = {
     "unwrap": "-t epi -v",
 }
 
+# ---------------------------------------------------------------------------
+# Nonlinear backends for the cross-run / cross-fmap / cross-session refinements.
+#
+# The engines are interchangeable to the *pipeline* -- every one of them takes
+# -matrix, -warp_prefix and the -batch trio, which is what a stage addresses a
+# backend by -- and different in what they compute and in the knobs that shape
+# it, which is what the per-stage `-<key>_opts` string carries.
+#
+# The registry itself is tunespec's, not a second copy: ffs_tunewarp measures
+# these same backends, and a name that means one thing to the tuner and another
+# to the pipeline is how a tuned setting ends up applied to the wrong engine.
+# ---------------------------------------------------------------------------
+NL_STAGE_KEYS: tuple[str, ...] = ("xrun_nl", "xfmap_nl", "xses_nl")
+DEFAULT_NL_BACKEND = "formwarp"
+
+
+def nl_backends() -> tuple[str, ...]:
+    from fastfuncstuff.processing.tunespec import BACKENDS
+
+    return tuple(BACKENDS)
+
+
+def nl_command(backend: str) -> str:
+    """The executable for a backend, plus whatever fixes its identity.
+
+    ``-force demons`` is not a tunable knob, it is *which engine this is* -- the
+    three optical-flow backends are one command told apart by it.
+    """
+    from fastfuncstuff.processing.tunespec import BACKEND_FIXED_ARGS, BACKENDS
+
+    return " ".join([BACKENDS[backend].command, *BACKEND_FIXED_ARGS.get(backend, [])])
+
+
+# Baseline op string per backend for the nonlinear stages. Deliberately NOT the
+# settings any tuning run measured: those belong in `-<stage>_opts` (or, once
+# they have earned it, in the engine's own defaults via tunespec.PRESETS), and
+# baking a measured number in here would make it a default nobody could see they
+# were relying on. What IS here is the pipeline's own opinion, the same one the
+# formwarp string states: judge on lpa (same modality, same brain) and resample
+# the final image sharply, because these means feed the grandmean and a soft
+# kernel compounds down the chain.
+NL_BACKEND_OPTS: dict[str, str] = {
+    "optiwarp_demons": "-metric lpa -final_interp wsinc5",
+    "optiwarp_lk": "-metric lpa -final_interp wsinc5",
+    "optiwarp_hs": "-metric lpa -final_interp wsinc5",
+    "qwarp": "-cost lpa -final wsinc5",
+}
+
+
+def nl_stage_opts(backend: str, stage: str) -> str:
+    """The default op string for one nonlinear stage under one backend."""
+    if backend == DEFAULT_NL_BACKEND:
+        return DEFAULT_OPTS[stage]
+    return NL_BACKEND_OPTS[backend]
+
+
 # Stages exposed as ``-<key>_opts`` on the CLI, in pipeline order. Anything in
 # DEFAULT_OPTS should be here — the emitter reads DEFAULT_OPTS, so an unlisted
 # key is a stage the user silently cannot tune. The grid utilities
