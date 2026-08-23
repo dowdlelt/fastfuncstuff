@@ -90,6 +90,7 @@ try:
         parse_input_files,
         parse_prefix,
         preflight_check,
+        resolve_microtime_dt,
         run_lengths_from_starts,
         setup_device,
         trim_spec_from_args,
@@ -2391,6 +2392,9 @@ def main() -> int:
     n_timepoints = load_result.n_timepoints
     if args.tr is None:
         args.tr = tr
+    # -flobs-dt is both the HRF sampling grid and the convolution grid here,
+    # so snapping it keeps the curves and the design on the same bins.
+    args.flobs_dt = resolve_microtime_dt(args.tr, args.flobs_dt)
 
     # Shift timing onto the retained window before rounding touches the onsets.
     trim = trim_spec_from_args(args, tr=tr)

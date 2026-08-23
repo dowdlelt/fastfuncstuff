@@ -1182,15 +1182,13 @@ def build_design_matrix(
     # below the TR grid lives on the fine grid until the final downsample.
     # ------------------------------------------------------------------
     from fastfuncstuff.design.hrf import get_spmg1_hrf
-    from fastfuncstuff.design.matrices import build_event_design_microtime
+    from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
+        commensurate_microtime_dt,
+    )
     from fastfuncstuff.utils import get_device as _get_device
 
-    # Keep the microtime grid exactly commensurate with the acquired TR. A
-    # fixed 0.1 s step turns TR=1.75 into round(17.5)=18 bins, i.e. an
-    # effective 1.8 s TR, and the stimulus columns drift progressively earlier
-    # through every run. About 0.1 s is enough resolution; exact TR boundaries
-    # are more important than the nominal decimal step.
-    microtime_dt = tr / max(1, round(tr / 0.1))
+    microtime_dt = commensurate_microtime_dt(tr, 0.1)
     stim_device = _get_device()
 
     # Split stim conditions by HRF type. Each condition is either:

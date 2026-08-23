@@ -13,7 +13,11 @@ import torch
 from tqdm import tqdm
 
 from fastfuncstuff.design.hrf import get_hrf_library
-from fastfuncstuff.design.matrices import build_glm_design
+from fastfuncstuff.design.matrices import (
+    bins_per_tr_exact,
+    build_glm_design,
+    commensurate_microtime_dt,
+)
 from fastfuncstuff.glm.arma import ARMA11Results, fit_glm_arma11, get_default_arma_grids
 from fastfuncstuff.glm.core import GLMResults, fit_glm, fit_glm_hrf_library
 from fastfuncstuff.io.afni import (
@@ -236,10 +240,11 @@ def analyze_from_onsets(
         microtime_dt=microtime_dt,
     )
 
-    bins_per_tr = int(round(tr / microtime_dt))
+    microtime_dt = commensurate_microtime_dt(tr, microtime_dt)
+    bins_per_tr = bins_per_tr_exact(tr, microtime_dt)
     if verbose:
         print(
-            f"📐 Microtime: dt={microtime_dt}s ({bins_per_tr} bins/TR), "
+            f"📐 Microtime: dt={microtime_dt:.6f}s ({bins_per_tr} bins/TR), "
             f"sampling at bin {microtime_onset}"
         )
 

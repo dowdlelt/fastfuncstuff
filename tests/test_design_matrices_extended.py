@@ -15,14 +15,17 @@ import torch
 
 from fastfuncstuff.design.matrices import (
     basis_csplin,
+    bins_per_tr_exact,
     build_event_design_microtime,
     build_glm_design,
+    commensurate_microtime_dt,
     convolve_design_hrf,
     generate_random_onsets,
     is_tr_locked,
     make_csplin_design,
     make_singletrialdesign,
     make_tent_design,
+    onsets_to_tr_matrix,
 )
 
 DEVICE = torch.device("cpu")
@@ -375,3 +378,92 @@ class TestGenerateRandomOnsets:
             device=DEVICE,
         )
         assert onsets.shape[1] == 2
+
+
+class TestMicrotimeCommensurability:
+    """TR=1.75 with a nominal 0.1s step gives round(17.5)=18 bins, an effective
+    1.8s TR, and stimulus columns slide progressively earlier through the run."""
+
+    @pytest.mark.parametrize("tr", [1.75, 3.542, 2.13, 0.372, 12.345678, 0.729, 1.0, 2.0, 1 / 3])
+    def test_snapped_grid_divides_any_tr_exactly(self, tr):
+        dt = commensurate_microtime_dt(tr, 0.1)
+        bins = bins_per_tr_exact(tr, dt)
+        assert bins >= 1
+        # A TR boundary 2000 TRs in must still land on a sampled bin.
+        assert abs(2000 * bins * dt - 2000 * tr) < 1e-6
+        # Resolution stays near the request; commensurability is the priority.
+        assert 0.05 <= dt <= 0.15 or bins == 1
+
+    def test_incommensurate_grid_is_refused(self):
+        with pytest.raises(ValueError, match="not commensurate"):
+            bins_per_tr_exact(1.75, 0.1)
+
+    def test_event_design_refuses_drifting_grid(self):
+        hrf = torch.tensor([0.0, 1.0, 0.5])
+        with pytest.raises(ValueError, match="not commensurate"):
+            build_event_design_microtime(
+                all_onsets=[[np.array([0.0])]],
+                durations=[0.0],
+                hrf_bases=hrf,
+                n_timepoints_per_run=[20],
+                tr=1.75,
+                microtime_dt=0.1,
+                device=DEVICE,
+            )
+
+    def test_late_events_do_not_drift_on_a_snapped_grid(self):
+        """The regression: an event's response must peak the same distance
+        after onset at the end of a run as at the start."""
+        tr, n_tp = 1.75, 120
+        dt = commensurate_microtime_dt(tr, 0.1)
+        # Delta HRF: the column's nonzero TR marks exactly where the onset landed.
+        hrf = torch.zeros(int(round(32.0 / dt)))
+        hrf[0] = 1.0
+        for k in (0, 30, 60, 90):
+            design = build_event_design_microtime(
+                all_onsets=[[np.array([k * tr])]],
+                durations=[0.0],
+                hrf_bases=hrf,
+                n_timepoints_per_run=[n_tp],
+                tr=tr,
+                microtime_dt=dt,
+                device=DEVICE,
+            )
+            assert isinstance(design, torch.Tensor)
+            assert int(design[:, 0].argmax()) == k, f"event at TR {k} drifted"
+
+
+class TestOnsetsToTrMatrix:
+    def test_off_grid_events_are_rounded_not_dropped(self):
+        """Strided decimation of a microtime matrix deleted these outright."""
+        design, max_shift = onsets_to_tr_matrix(
+            all_onsets=[[np.array([1.4, 5.4, 8.0])]],
+            run_starts=[0],
+            n_timepoints=20,
+            tr=2.0,
+            durations=[0.0],
+            device=DEVICE,
+        )
+        assert design[:, 0].nonzero().flatten().tolist() == [1, 3, 4]
+        assert max_shift == pytest.approx(0.6)
+
+    def test_blocks_span_every_covered_tr_per_run(self):
+        design, _ = onsets_to_tr_matrix(
+            all_onsets=[[np.array([1.4]), np.array([3.0])]],
+            run_starts=[0, 10],
+            n_timepoints=20,
+            tr=2.0,
+            durations=[5.0],
+            device=DEVICE,
+        )
+        assert design[:, 0].nonzero().flatten().tolist() == [1, 2, 3, 12, 13, 14]
+
+    def test_events_beyond_the_run_are_still_dropped(self):
+        design, _ = onsets_to_tr_matrix(
+            all_onsets=[[np.array([2.0, 999.0])]],
+            run_starts=[0],
+            n_timepoints=10,
+            tr=2.0,
+            device=DEVICE,
+        )
+        assert design[:, 0].nonzero().flatten().tolist() == [1]

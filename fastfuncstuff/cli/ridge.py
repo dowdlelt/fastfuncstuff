@@ -64,6 +64,7 @@ try:
         parse_cv_strategy,
         parse_prefix,
         preflight_check,
+        resolve_microtime_dt,
         run_lengths_from_starts,
         save_4d_nifti,
         save_volume_nifti,
@@ -500,6 +501,7 @@ def main():
         print(f"  TR from header: {args.tr}s")
     else:
         print(f"  TR (specified): {args.tr}s")
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     # Shift event timing to the retained window before anything else touches the
     # onsets (rounding below included) -- see design/trim.py.

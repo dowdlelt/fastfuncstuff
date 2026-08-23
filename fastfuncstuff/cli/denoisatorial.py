@@ -61,6 +61,7 @@ try:
         parse_input_files,
         parse_prefix,
         print_cli_header,
+        resolve_microtime_dt,
         run_lengths_from_starts,
         setup_device,
         trim_spec_from_args,
@@ -1091,6 +1092,7 @@ def main():
     if args.tr is None:
         args.tr = load_result.tr
 
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
     # Timing was parsed before the load, so the -drop_first shift lands here.
     trim = trim_spec_from_args(args, tr=args.tr)
     apply_trim_to_timing(

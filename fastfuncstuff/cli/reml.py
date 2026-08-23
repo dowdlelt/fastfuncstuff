@@ -53,6 +53,7 @@ try:
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
+        resolve_microtime_dt,
         trim_spec_from_args,
     )
     from fastfuncstuff.design.builder import (
@@ -1681,6 +1682,7 @@ def main():
         tr = get_tr_from_file(input_files[0])
         args.tr = tr
         print(f"⏱️  TR: {tr:.3f} seconds (from header)")
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     trim = trim_spec_from_args(args, tr=tr)
     if trim.active and args.matrix and not _matrix_from_spec:

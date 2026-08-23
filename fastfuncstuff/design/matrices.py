@@ -12,6 +12,43 @@ import torch.nn.functional as F
 from fastfuncstuff.utils import get_device, to_tensor
 
 
+def commensurate_microtime_dt(tr: float, target_dt: float = 0.1) -> float:
+    """Snap ``target_dt`` to the largest step that divides ``tr`` exactly.
+
+    A fixed 0.1 s step turns TR=1.75 into ``round(17.5) = 18`` bins, i.e. an
+    effective 1.8 s TR, and every stimulus column drifts progressively earlier
+    through the run (3.5 s of error by TR 60).  Roughly 0.1 s of resolution is
+    plenty; landing on exact TR boundaries is what actually matters, so trade
+    the nominal decimal step for commensurability.
+    """
+    if tr <= 0:
+        raise ValueError(f"tr must be positive, got {tr}")
+    if target_dt <= 0:
+        raise ValueError(f"target_dt must be positive, got {target_dt}")
+    return tr / max(1, round(tr / target_dt))
+
+
+def bins_per_tr_exact(tr: float, microtime_dt: float) -> int:
+    """Microtime bins per TR, refusing grids that do not divide the TR.
+
+    Callers must snap with :func:`commensurate_microtime_dt` first.  Rounding
+    here instead would silently resample the data onto a different TR.
+    """
+    ratio = tr / microtime_dt
+    bins = int(round(ratio))
+    if bins < 1:
+        raise ValueError(f"microtime_dt={microtime_dt} must not exceed tr={tr}")
+    if abs(ratio - bins) > 1e-9 * max(1.0, ratio):
+        raise ValueError(
+            f"microtime_dt={microtime_dt} is not commensurate with tr={tr}: "
+            f"{ratio:.6f} bins/TR. Stimulus timing would drift by "
+            f"{abs(ratio - bins) * microtime_dt:.4f} s per TR. Snap the grid with "
+            f"design.matrices.commensurate_microtime_dt(tr, {microtime_dt}) "
+            f"-> {commensurate_microtime_dt(tr, microtime_dt):.6f}."
+        )
+    return bins
+
+
 def build_event_design_microtime(
     all_onsets: list[list[np.ndarray]],
     durations: list[float],
@@ -49,9 +86,7 @@ def build_event_design_microtime(
     if bases.ndim != 2:
         raise ValueError("hrf_bases must have shape (n_bases, n_microtime_samples)")
 
-    bins_per_tr = int(round(tr / microtime_dt))
-    if bins_per_tr < 1:
-        raise ValueError("microtime_dt must not exceed tr")
+    bins_per_tr = bins_per_tr_exact(tr, microtime_dt)
     if not 0 <= microtime_onset < bins_per_tr:
         raise ValueError(f"microtime_onset must be in [0, {bins_per_tr}), got {microtime_onset}")
 
@@ -253,6 +288,66 @@ def build_task_design(
     # return_single_trials is never set here, so both paths return a Tensor.
     assert isinstance(design, torch.Tensor)
     return design
+
+
+def onsets_to_tr_matrix(
+    all_onsets: list[list[np.ndarray]],
+    run_starts: list[int],
+    n_timepoints: int,
+    tr: float,
+    durations: list[float] | None = None,
+    device: torch.device | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Round event onsets onto the TR grid without ever dropping an event.
+
+    FIR/TENT bases index lags in whole TRs, so the timing has to be quantised
+    somewhere.  Doing it by strided-decimating a microtime onset matrix
+    (``onset_matrix_micro[::bins_per_tr]``) silently *deletes* every event that
+    does not land exactly on a TR boundary — at TR=2 s, onsets of 1.4 s and
+    5.4 s both vanish.  Rounding to the nearest TR keeps every event and costs
+    at most half a TR of timing accuracy, which is the deal a user implicitly
+    accepts by asking for FIR.  The returned worst-case shift lets the caller
+    say how big that cost was.
+
+    Returns the (n_timepoints, n_conditions) binary matrix and the largest
+    absolute onset shift in seconds.
+    """
+    if device is None:
+        device = get_device()
+    if tr <= 0:
+        raise ValueError(f"tr must be positive, got {tr}")
+
+    n_conditions = len(all_onsets)
+    design = torch.zeros(n_timepoints, n_conditions, device=device)
+    run_lengths = run_lengths_from_starts(run_starts, n_timepoints)
+    max_shift = 0.0
+
+    for cond_idx, cond_runs in enumerate(all_onsets):
+        if len(cond_runs) != len(run_lengths):
+            raise ValueError(
+                f"condition {cond_idx} has {len(cond_runs)} runs; expected {len(run_lengths)}"
+            )
+        duration = float(durations[cond_idx]) if durations is not None else 0.0
+        for run_idx, run_onsets in enumerate(cond_runs):
+            n_run_tp = run_lengths[run_idx]
+            offset = run_starts[run_idx]
+            for onset in np.asarray(run_onsets, dtype=np.float64).ravel():
+                onset_tr = int(round(float(onset) / tr))
+                if onset_tr < 0 or onset_tr >= n_run_tp:
+                    # Genuinely outside the run: dropping is correct, not a
+                    # quantisation artefact. Upstream -allow_late_events decides
+                    # whether such events reach us at all.
+                    continue
+                max_shift = max(max_shift, abs(onset_tr * tr - float(onset)))
+                design[offset + onset_tr, cond_idx] = 1.0
+                if duration > 0:
+                    # Blocks stay "on" for every TR their boxcar covers, matching
+                    # the sampled-boxcar behaviour this replaces.
+                    last_tr = min(n_run_tp - 1, int(np.floor((float(onset) + duration) / tr)))
+                    for t in range(onset_tr + 1, last_tr + 1):
+                        design[offset + t, cond_idx] = 1.0
+
+    return design, max_shift
 
 
 def convolve_hrf_microtime(

@@ -2143,8 +2143,13 @@ def build_task_design_for_run(
                 )
             onsets_this_run.append([cond_runs[run_idx]])
 
+    from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
+        commensurate_microtime_dt,
+    )
+
+    microtime_dt = commensurate_microtime_dt(tr, microtime_dt)
     hrf = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
-    from fastfuncstuff.design.matrices import build_event_design_microtime
 
     design = build_event_design_microtime(
         all_onsets=onsets_this_run,

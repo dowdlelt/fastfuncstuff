@@ -2255,6 +2255,27 @@ def add_device_arg(
     )
 
 
+def resolve_microtime_dt(tr: float, requested_dt: float, verbose: bool = True) -> float:
+    """Snap a requested microtime step onto a grid that divides ``tr`` exactly.
+
+    ``-microtime_dt`` goes through here, the way ``-device`` goes through
+    :func:`setup_device`. A nominal 0.1 s step is not commensurate with most
+    real TRs: TR=1.75 gives ``round(17.5) = 18`` bins, an effective 1.8 s TR,
+    and stimulus columns slide ~3.5 s early by TR 60. The snapped step divides
+    any TR exactly -- 3.542 s becomes 35 bins of 0.101200 s -- so the decimal
+    value is cosmetic and exact TR boundaries are what we keep.
+    """
+    from fastfuncstuff.design.matrices import commensurate_microtime_dt
+
+    dt = commensurate_microtime_dt(tr, requested_dt)
+    if verbose and abs(dt - requested_dt) > 1e-9:
+        print(
+            f"  Microtime: dt {requested_dt}s -> {dt:.6f}s "
+            f"({round(tr / dt)} bins/TR) to divide TR={tr}s exactly"
+        )
+    return dt
+
+
 def setup_device(
     device_spec: str | None,
     *,
@@ -3279,6 +3300,7 @@ def build_task_design_from_args(
         build_task_design,
         make_fir_design,
         make_tent_design,
+        onsets_to_tr_matrix,
     )
 
     def _event_design(hrf_bases: torch.Tensor) -> torch.Tensor:
@@ -3325,9 +3347,20 @@ def build_task_design_from_args(
             )
 
             if hrf_model_name == "FIR":
-                bins_per_tr = int(round(tr / microtime_dt))
-                onset_matrix_tr = onset_matrix_micro[::bins_per_tr, :]
-                onset_matrix_tr = onset_matrix_tr[:n_timepoints, :]
+                onset_matrix_tr, max_shift = onsets_to_tr_matrix(
+                    all_onsets=all_onsets,
+                    run_starts=run_starts,
+                    n_timepoints=n_timepoints,
+                    tr=tr,
+                    durations=stim_durations,
+                    device=device,
+                )
+                if max_shift > 1e-6:
+                    print(
+                        f"  FIR lags are whole TRs: onsets rounded to the TR grid "
+                        f"(largest shift {max_shift:.3f}s of a {tr:.3f}s TR). "
+                        f"Use TENT/TENTZERO to keep sub-TR onset timing."
+                    )
                 task_design = make_fir_design(
                     onsets=onset_matrix_tr,
                     n_lags=n_basis,

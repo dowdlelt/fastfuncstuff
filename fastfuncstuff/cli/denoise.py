@@ -62,6 +62,7 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        resolve_microtime_dt,
         run_lengths_from_starts,
         save_volume_nifti,
         setup_device,
@@ -1661,6 +1662,7 @@ def main():
     # Update args.tr with loaded value (for later use)
     if args.tr is None:
         args.tr = load_result.tr
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     # Timing was parsed before the load, so the -drop_first shift lands here,
     # before the HRF/design machinery reads the onsets.

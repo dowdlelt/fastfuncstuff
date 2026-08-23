@@ -63,6 +63,7 @@ try:
         parse_cv_strategy,
         parse_input_files,
         parse_prefix,
+        resolve_microtime_dt,
         setup_device,
         spinner,
     )
@@ -1443,6 +1444,7 @@ def main():
             sys.exit(1)
     else:
         print(f"  TR (specified): {args.tr}s")
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     n_voxels, n_timepoints = data.shape
 

@@ -62,6 +62,7 @@ try:
         parse_prefix,
         preflight_check,
         resolve_cv_design,
+        resolve_microtime_dt,
         run_lengths_from_starts,
         save_volume_nifti,
         setup_device,
@@ -729,6 +730,7 @@ def main():
         print(f"  TR from header: {tr}s")
     else:
         print(f"  TR (specified): {args.tr}s")
+    args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     print(f"  Data shape: {data.shape} ({n_voxels:,} voxels x {n_timepoints} timepoints)")
     print(f"  Volume shape: {volume_shape}")

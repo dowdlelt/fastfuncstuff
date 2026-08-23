@@ -813,19 +813,24 @@ def _run_single_ica(
         # BIDS path: use pre-parsed all_onsets and durations
         try:
             from fastfuncstuff.design.hrf import get_spmg1_hrf
-            from fastfuncstuff.design.matrices import build_event_design_microtime
+            from fastfuncstuff.design.matrices import (
+                build_event_design_microtime,
+                commensurate_microtime_dt,
+            )
 
             n_bids_conds = len(bids_task_onsets)
             # Extract this run's onsets (wrapped in list for single-run onset matrix)
             onsets_this_run = [[bids_task_onsets[cidx][run_idx]] for cidx in range(n_bids_conds)]
-            hrf = get_spmg1_hrf(microtime_dt=args.microtime_dt, device=device)
+            # TR is resolved per run here, so the grid is snapped per run too.
+            microtime_dt = commensurate_microtime_dt(tr, args.microtime_dt)
+            hrf = get_spmg1_hrf(microtime_dt=microtime_dt, device=device)
             design_tc = build_event_design_microtime(
                 all_onsets=onsets_this_run,
                 durations=bids_task_durations,
                 hrf_bases=hrf,
                 n_timepoints_per_run=[n_t],
                 tr=tr,
-                microtime_dt=args.microtime_dt,
+                microtime_dt=microtime_dt,
                 device=device,
             )
             assert isinstance(design_tc, torch.Tensor)
