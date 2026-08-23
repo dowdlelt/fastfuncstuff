@@ -46,7 +46,7 @@ from fastfuncstuff.cli_utils import (
     setup_device,
     spinner,
 )
-from fastfuncstuff.processing.affine import apply_affine_interp, load_matrix_1D
+from fastfuncstuff.processing.affine import base_into_source_frame
 from fastfuncstuff.processing.formwarp import (
     METRICS,
     NO_X_DISP,
@@ -516,17 +516,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     out_info = base_info
     if args.matrix is not None:
         src_shape = tuple(source.shape[1:]) if source.ndim == 4 else tuple(source.shape)
-        m_b2s = load_matrix_1D(args.matrix, base_info["affine"], source_info["affine"])
-        m_s2b = torch.linalg.inv(m_b2s.double()).float().to(device)
         with spinner(f"Resampling base onto the {Path(args.source).name} grid"):
-            base = apply_affine_interp(
-                base.float().to(device),
-                m_s2b,
-                interp="wsinc5",
-                output_shape=src_shape,
-                zero_outside=True,
-            ).cpu()
-        out_info = source_info
+            base, out_info = base_into_source_frame(
+                base, base_info, src_shape, source_info, args.matrix, device
+            )
         if args.verb >= 1:
             print(f"Base resampled into source space: grid {src_shape[::-1]}")
 

@@ -32,6 +32,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import shlex
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -39,20 +40,24 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.cli_utils import (
+    add_batch_args,
     add_coverage_args,
     add_deterministic_arg,
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
     apply_recipe_preset,
+    collect_batch_jobs,
     combine_brain_masks,
     enable_determinism,
     image_support,
     parse_prefix,
+    run_batch_jobs,
     sanitize_volume,
     setup_device,
     spinner,
 )
+from fastfuncstuff.processing.affine import base_into_source_frame
 from fastfuncstuff.processing.formwarp import METRICS
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field, save_warp_series
@@ -264,9 +269,49 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # I/O
-    p.add_argument("-base", required=True, help="Fixed/target image (3D).")
-    p.add_argument("-source", required=True, help="Moving image to deform (3D or 4D series).")
-    p.add_argument("-prefix", required=True, help="Output path for the warped image.")
+    p.add_argument(
+        "-base", default=None, help="Fixed/target image (3D) [required unless -batch]."
+    )
+    p.add_argument(
+        "-source",
+        default=None,
+        help="Moving image to deform (3D or 4D series) [required unless -batch].",
+    )
+    p.add_argument(
+        "-prefix", default=None, help="Output path for the warped image [required unless -batch]."
+    )
+    add_batch_args(
+        p,
+        tool="ffs_optiwarp",
+        what="optical-flow registrations",
+        example="-base ref.nii.gz -source run2.nii.gz -prefix run2_nl.nii.gz -save_warp",
+        skip_note="-prefix / -warp_prefix",
+    )
+    p.add_argument(
+        "-warp_prefix",
+        "-warp-prefix",
+        default=None,
+        help="Name the warp/inverse/Jacobian outputs off THIS stem instead of "
+        "-prefix. For the case where several runs write their own warped image but "
+        "share one warp -- naming both off -prefix would have them overwrite each "
+        "other's field.",
+    )
+    p.add_argument(
+        "-matrix",
+        "-1Dmatrix",
+        "-1Dmatrix_apply",
+        default=None,
+        help="An .aff12.1D affine (as ffs_allineate -1Dmatrix_save writes) taking the "
+        "SOURCE to the base. Given this, the source is NOT expected to be pre-aligned: "
+        "the matrix is inverted and the BASE is resampled (wsinc5) onto the source's "
+        "own grid, and the flow is estimated there. The source is never resampled, so "
+        "it keeps every voxel it acquired. Everything written out -- warped image and "
+        "warp fields -- is then on the SOURCE grid; carry it to base space with the "
+        "warp applied to the source first: "
+        "ffs_nwarp -source src.nii -nwarp 'matrix.aff12.1D out_WARP.nii' -master base.nii. "
+        "NOTE: this does not recover a clipped FoV, it relocates it -- the base is what "
+        "falls out of frame now, and the fixed image is the one interpolated.",
+    )
     p.add_argument(
         "-save_warp",
         "-save-warp",
@@ -603,16 +648,92 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
     )
 
 
+def _select_device(args: argparse.Namespace) -> torch.device:
+    """Device for a run or a whole batch (prefer CUDA > CPU, honour explicit MPS)."""
+    device = setup_device(args.device, tf32=REGISTRATION_TF32)
+    if device.type == "cpu" and args.device is None and args.verb >= 1:
+        print("WARNING: no GPU available, running on CPU")
+    return device
+
+
+def _warp_stem(args: argparse.Namespace, pfx) -> str:
+    """Stem the warp outputs hang off: ``-warp_prefix`` when given, else ``-prefix``."""
+    wp = getattr(args, "warp_prefix", None)
+    return parse_prefix(wp).stem if wp else pfx.stem
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    Mirrors what ``_dispatch_run`` actually saves, warp files included, or a
+    re-run would skip a job whose warp was never written. A timeseries run with
+    ``-warp_format folder`` writes directories under these stems rather than
+    files, so such a job is simply never skipped -- safe."""
+    pfx = parse_prefix(args.prefix)
+    prefix, ext = _warp_stem(args, pfx), pfx.nifti_ext
+    outs: list[str] = [pfx.as_file()]
+    if args.save_warp:
+        outs.append(f"{prefix}_WARP{ext}")
+    if args.save_inverse:
+        outs.append(f"{prefix}_WARPINV{ext}")
+    if args.save_jacobian:
+        outs.append(f"{prefix}_JAC{ext}")
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -base/-source/-prefix."""
+    missing = [f for f in ("base", "source", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
+def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
+    """Batch adapter: turn a nonzero return (a grid mismatch, say) into an
+    exception so the shared runner records the job as failed."""
+    rc = _dispatch_run(run_args, device)
+    if rc != 0:
+        raise ValueError(f"run failed (exit {rc})")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "deterministic", False):
         enable_determinism(getattr(args, "verb", 1))
 
-    # Select device (prefer CUDA > CPU), honouring explicit MPS end to end.
-    device = setup_device(args.device, tf32=REGISTRATION_TF32)
-    if device.type == "cpu" and args.device is None and args.verb >= 1:
-        print("WARNING: no GPU available, running on CPU")
+    if args.batch is not None or args.batch_run:
+        # One process, many registrations: the fixed costs (CUDA context,
+        # torch.compile warmup on the resampler) are paid once, not per pair.
+        run_batch_jobs(
+            tool="ffs_optiwarp",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=_select_device(args),
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_batch_dispatch,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return 0
 
+    missing = [f for f in ("base", "source", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "ERROR: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS)."
+        )
+        return 1
+
+    return _dispatch_run(args, _select_device(args))
+
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
+    """Register one self-contained base/source pair (the entire per-pair body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     if args.verb >= 1:
         print(
             f"ffs_optiwarp\n  device: {device}\n"
@@ -623,7 +744,7 @@ def main(argv: list[str] | None = None) -> int:
     with spinner(f"Loading {Path(args.base).name}"):
         base, base_info = load_image(args.base, device=torch.device("cpu"))
     with spinner(f"Loading {Path(args.source).name}"):
-        source, _ = load_image(args.source, device=torch.device("cpu"))
+        source, source_info = load_image(args.source, device=torch.device("cpu"))
 
     base = sanitize_volume(base, "-base", args.verb)
     source = sanitize_volume(source, "-source", args.verb)
@@ -635,10 +756,25 @@ def main(argv: list[str] | None = None) -> int:
 
     timeseries = source.ndim == 4
     src_shape = tuple(source.shape[1:]) if timeseries else tuple(source.shape)
+
+    # -matrix: solve in the source's own frame instead of expecting a pre-aligned
+    # source. Everything after this point is identical to the pre-aligned path --
+    # the only difference is which grid "the grid" means, hence which header the
+    # outputs carry.
+    out_info = base_info
+    if args.matrix is not None:
+        with spinner(f"Resampling base onto the {Path(args.source).name} grid"):
+            base, out_info = base_into_source_frame(
+                base, base_info, src_shape, source_info, args.matrix, device
+            )
+        if args.verb >= 1:
+            print(f"Base resampled into source space: grid {src_shape[::-1]}")
+
     if src_shape != tuple(base.shape):
         print(
             f"ERROR: base {tuple(base.shape)} and source {src_shape} must be on the "
-            "same grid (resample first, e.g. ffs_allineate)."
+            "same grid (resample first with ffs_allineate, or pass that alignment "
+            "as -matrix)."
         )
         return 1
 
@@ -672,7 +808,7 @@ def main(argv: list[str] | None = None) -> int:
 
     config = _build_config(args)
     pfx = parse_prefix(args.prefix)
-    prefix, nii_ext = pfx.stem, pfx.nifti_ext
+    warp_stem, nii_ext = _warp_stem(args, pfx), pfx.nifti_ext
 
     if timeseries:
         return _run_timeseries(
@@ -683,8 +819,9 @@ def main(argv: list[str] | None = None) -> int:
             mask,
             base_cover,
             config,
-            base_info,
-            prefix,
+            out_info,
+            pfx.stem,
+            warp_stem,
             nii_ext,
             device,
             t0,
@@ -703,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
 
     warped_path = pfx.as_file()
     with spinner(f"Writing {Path(warped_path).name}"):
-        save_image(res.warped, warped_path, header_info=base_info)
+        save_image(res.warped, warped_path, header_info=out_info)
     if args.verb >= 1:
         print(f"Saved warped image: {warped_path}")
 
@@ -714,20 +851,20 @@ def main(argv: list[str] | None = None) -> int:
                 triple[1].cpu(),
                 triple[2].cpu(),
                 path,
-                header_info=base_info,
+                header_info=out_info,
                 units="mm",
             )
         if args.verb >= 1:
             print(f"Saved {label}: {path}")
 
     if args.save_warp:
-        _save_warp(res.fwd, f"{prefix}_WARP{nii_ext}", "moving->fixed warp")
+        _save_warp(res.fwd, f"{warp_stem}_WARP{nii_ext}", "moving->fixed warp")
     if args.save_inverse:
-        _save_warp(res.inv, f"{prefix}_WARPINV{nii_ext}", "fixed->moving inverse warp")
+        _save_warp(res.inv, f"{warp_stem}_WARPINV{nii_ext}", "fixed->moving inverse warp")
     if args.save_jacobian:
-        jac_path = f"{prefix}_JAC{nii_ext}"
+        jac_path = f"{warp_stem}_JAC{nii_ext}"
         with spinner(f"Writing {Path(jac_path).name}"):
-            save_image(res.jacobian.cpu(), jac_path, header_info=base_info)
+            save_image(res.jacobian.cpu(), jac_path, header_info=out_info)
         if args.verb >= 1:
             print(f"Saved Jacobian map: {jac_path}")
 
@@ -737,7 +874,19 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _run_timeseries(
-    args, base, source, weight, mask, base_cover, config, base_info, prefix, nii_ext, device, t0
+    args,
+    base,
+    source,
+    weight,
+    mask,
+    base_cover,
+    config,
+    out_info,
+    prefix,
+    warp_stem,
+    nii_ext,
+    device,
+    t0,
 ) -> int:
     """Register every volume of a 4D source to the 3D base (per-volume optical flow).
 
@@ -785,7 +934,7 @@ def _run_timeseries(
 
     warped_path = f"{prefix}{nii_ext}"
     with spinner(f"Writing {Path(warped_path).name}"):
-        save_image(torch.stack(warped_frames), warped_path, header_info=base_info)
+        save_image(torch.stack(warped_frames), warped_path, header_info=out_info)
     if args.verb >= 1:
         print(f"Saved warped series: {warped_path} ({n_t} volumes)")
 
@@ -794,9 +943,9 @@ def _run_timeseries(
         xs = torch.stack([f[0] for f in frames])
         ys = torch.stack([f[1] for f in frames])
         zs = torch.stack([f[2] for f in frames])
-        dest = f"{prefix}_{tag}{nii_ext}" if as_5d else f"{prefix}_{tag}"
+        dest = f"{warp_stem}_{tag}{nii_ext}" if as_5d else f"{warp_stem}_{tag}"
         with spinner(f"Writing {Path(dest).name}"):
-            out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=base_info, units="mm")
+            out = save_warp_series(xs, ys, zs, dest, as_5d=as_5d, header_info=out_info, units="mm")
         if args.verb >= 1:
             fmt = "5D" if as_5d else "folder"
             print(f"Saved {label} ({fmt}): {out}")

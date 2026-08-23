@@ -1432,3 +1432,38 @@ def resample_to_base_grid(
     M = source_xyz2ijk @ base_ijk2xyz  # (4, 4): base voxel → source voxel
 
     return apply_affine(source, M, output_shape=base_shape)
+
+
+def base_into_source_frame(
+    base: Tensor,
+    base_info: dict,
+    source_shape: tuple[int, ...],
+    source_info: dict,
+    matrix_path: str | Path,
+    device: torch.device,
+) -> tuple[Tensor, dict]:
+    """Pull the base onto the source's own grid, given source->base as a matrix.
+
+    The ``-matrix`` half of every nonlinear registration CLI: instead of the caller
+    resampling the source onto the base grid and handing over the result, they hand
+    over the *un*-resampled source and the affine that would have moved it. The
+    matrix is inverted, the base is pulled onto the source's grid, and the warp is
+    solved there, so the source keeps every voxel it acquired and is interpolated
+    exactly once -- when the whole chain is finally applied.
+
+    Shared by the backends rather than reimplemented per tool: the inversion, the
+    interpolation kernel and which header the outputs inherit all have to agree
+    across them, or a chain built by one and consumed by another composes in the
+    wrong frame. Returns the resampled base and the header info the outputs carry
+    (the source's, since that is now the grid everything lives on).
+    """
+    m_b2s = load_matrix_1D(matrix_path, base_info["affine"], source_info["affine"])
+    m_s2b = torch.linalg.inv(m_b2s.double()).float().to(device)
+    resampled = apply_affine_interp(
+        base.float().to(device),
+        m_s2b,
+        interp="wsinc5",
+        output_shape=tuple(source_shape),
+        zero_outside=True,
+    ).cpu()
+    return resampled, source_info

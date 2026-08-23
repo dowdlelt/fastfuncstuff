@@ -281,6 +281,82 @@ def test_formwarp_expected_outputs_names_the_warps():
     assert outs == ["w.nii.zst", "w_WARP.nii.zst", "w_WARPINV.nii.zst"]
 
 
+def test_optiwarp_expected_outputs_names_the_warps():
+    from fastfuncstuff.cli.optiwarp import _expected_outputs, parse_args
+
+    a = parse_args(
+        [
+            "-base",
+            "f.nii",
+            "-source",
+            "m.nii",
+            "-prefix",
+            "w.nii.zst",
+            "-save_warp",
+            "-save_jacobian",
+        ]
+    )
+    assert _expected_outputs(a) == ["w.nii.zst", "w_WARP.nii.zst", "w_JAC.nii.zst"]
+
+
+def test_optiwarp_warp_prefix_moves_only_the_warps():
+    """Several runs write their own warped image but share one field.
+
+    Naming both off -prefix would have them overwrite each other's warp, which is
+    why the autoproc cross-run stage needs the two stems to be separable.
+    """
+    from fastfuncstuff.cli.optiwarp import _expected_outputs, parse_args
+
+    a = parse_args(
+        [
+            "-base",
+            "f.nii",
+            "-source",
+            "m.nii",
+            "-prefix",
+            "laneA.nii.gz",
+            "-warp_prefix",
+            "shared",
+            "-save_warp",
+        ]
+    )
+    assert _expected_outputs(a) == ["laneA.nii.gz", "shared_WARP.nii.gz"]
+
+
+def test_optiwarp_batch_makes_io_flags_optional():
+    """-base/-source/-prefix come from the manifest line, not the outer command."""
+    from fastfuncstuff.cli.optiwarp import parse_args
+
+    a = parse_args(["-batch", "runs.txt"])
+    assert a.base is None and a.source is None and a.prefix is None
+
+
+def test_optiwarp_batch_run_rejects_a_run_missing_its_prefix():
+    from fastfuncstuff.cli.optiwarp import _validate_batch_run, parse_args
+
+    with pytest.raises(ValueError, match="-prefix"):
+        _validate_batch_run(parse_args(["-base", "f.nii", "-source", "m.nii"]))
+
+
+def test_nonlinear_backends_share_the_structural_flags():
+    """The three flags autoproc's nonlinear stages need, on every backend.
+
+    Backends differ in what they compute and in the knobs that shape it; they must
+    NOT differ in how a pipeline addresses them. -matrix (solve in the source's
+    frame), -warp_prefix (several images, one shared field) and the -batch trio
+    (one process per stage) are the pipeline's requirements, so a backend without
+    them cannot be offered as a choice at all.
+    """
+    import importlib
+
+    for tool in ("formwarp", "optiwarp", "qwarp"):
+        mod = importlib.import_module(f"fastfuncstuff.cli.{tool}")
+        args = mod.parse_args(["-batch", "runs.txt"])
+        for flag in ("matrix", "warp_prefix", "batch", "batch_run", "batch_skip"):
+            assert hasattr(args, flag), f"{tool} is missing -{flag}"
+        assert args.base is None and args.source is None and args.prefix is None, tool
+
+
 # --------------------------------------------------------------------------
 # autoproc emitter: batched stages
 # --------------------------------------------------------------------------
