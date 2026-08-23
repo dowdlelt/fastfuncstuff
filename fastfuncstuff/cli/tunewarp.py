@@ -246,6 +246,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
     act.add_argument(
+        "-plot",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="FILE.png",
+        help="Write the accuracy/smoothness frontier as a scatter: bending energy "
+        "against score, one marker per config (shape=backend, area=seconds per "
+        "fit, colour=grade, the number inside is the id -reproduce takes). "
+        "Written automatically after a search; pass this with -list to redraw an "
+        "existing table, optionally to a path of your choosing "
+        "[default: OUT/frontier.png]",
+    )
+    act.add_argument(
+        "-no_plot",
+        "-no-plot",
+        action="store_true",
+        help="Skip the frontier PNG a finished search would otherwise write",
+    )
+    act.add_argument(
         "-runs",
         action="store_true",
         help="What produced the trials in this directory -- code, machine and data -- "
@@ -450,6 +469,25 @@ def _build_pairs(args: argparse.Namespace, pairing: str) -> list[SubjectPair]:
     return [SubjectPair(n, b, s) for n, b, s in zip(names, bases, sources, strict=True)]
 
 
+def _write_plot(store, path, recipe: str | None) -> None:
+    """Draw the frontier, and let a missing matplotlib be a note rather than a failure.
+
+    A run that produced a good table and no picture is still a successful run, so
+    this never raises: the fits are the expensive part and they are already done.
+    """
+    from ..processing.tuneplot import plot_frontier
+
+    try:
+        written = plot_frontier(store.results(), path, recipe=recipe or "")
+    except ImportError:
+        print("  (no frontier plot: matplotlib is not installed)")
+        return
+    if written:
+        print(f"\nFrontier plot: {written}")
+    else:
+        print("  (no frontier plot: no config in this table produced a warp)")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "deterministic", False):
@@ -459,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if (
         args.list
+        or args.plot is not None
         or args.effects
         or args.convergence
         or args.export
@@ -490,6 +529,8 @@ def main(argv: list[str] | None = None) -> int:
             print(format_convergence(store))
         if args.list:
             print(format_results_table(store.results(), limit=args.top))
+        if args.plot is not None:
+            _write_plot(store, args.plot or out / "frontier.png", args.recipe)
         return 0
 
     if args.reproduce is not None:
@@ -606,6 +647,8 @@ def main(argv: list[str] | None = None) -> int:
         for w in warn:
             print(f"  - {w}")
     print("\n" + format_results_table(store.results(), limit=args.top))
+    if not args.no_plot:
+        _write_plot(store, args.plot or out / "frontier.png", recipe.name)
     print("\nPer-knob effects:\n")
     print(format_knob_effects(knob_effects(store)))
     print("\nIteration ceilings:\n")
