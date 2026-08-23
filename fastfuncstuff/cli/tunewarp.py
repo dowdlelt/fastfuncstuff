@@ -106,7 +106,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_epilog(),
     )
-    parser.add_argument("-out", required=True, help="Working directory (holds the trial table)")
+    parser.add_argument(
+        "-out", required=True, metavar="DIR", help="Working directory (holds the trial table)"
+    )
     parser.add_argument(
         "-type",
         dest="recipe",

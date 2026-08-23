@@ -23,14 +23,15 @@ import contextlib
 import importlib
 import inspect
 import io
+import re
 import sys
 import warnings
 from dataclasses import dataclass, field
 
-# Metavars and dest names that should complete to filenames. The ffs tools take
-# NIfTI (.nii/.nii.gz/.nii.zst), AFNI (.HEAD/.BRIK), .1D regressors and BIDS
-# .tsv events, so the completion stays unfiltered rather than guessing an
-# extension list and hiding the file the user actually wants.
+# Metavars that name a path. The ffs tools take NIfTI (.nii/.nii.gz/.nii.zst),
+# AFNI (.HEAD/.BRIK), .1D regressors and BIDS .tsv events, so the completion
+# stays unfiltered rather than guessing an extension list and hiding the file
+# the user actually wants.
 _FILE_METAVARS = {
     "FILE",
     "TSV",
@@ -47,24 +48,33 @@ _FILE_METAVARS = {
     "LABELS",
     "MATRIX",
     "JSON",
+    "MAP",
+    "NPZ",
+    "SOURCE",
+    "SPEC",
+    "WARP",
+    "XMAT",
 }
-_FILE_DEST_HINTS = (
-    "input",
-    "mask",
-    "events",
-    "onsets",
-    "prefix",
-    "ortvec",
-    "matrix",
-    "base",
-    "source",
-    "target",
-    "anat",
-    "warp",
-    "cache",
-    "config",
-    "atlas",
-    "weight",
+# Suffixes that make a metavar self-evidently a filename -- MASK.nii.gz,
+# MOCO.aff12.1D, FILE.1D, WARP.nii.gz. Authors write these instead of a bare
+# FILE precisely because the extension is the useful part; the completion
+# should read them rather than treat them as unrecognised.
+_FILE_METAVAR_SUFFIXES = (
+    ".1D",
+    ".NII",
+    ".NII.GZ",
+    ".NII.ZST",
+    ".HEAD",
+    ".BRIK",
+    ".H5",
+    ".JSON",
+    ".TSV",
+    ".TXT",
+    ".NPZ",
+    ".TOML",
+    ".YAML",
+    ".PNG",
+    ".CSV",
 )
 _DIR_METAVARS = {"DIR", "DIRECTORY", "DATA_DIR", "OUT_DIR"}
 # -device is registered once, by cli_utils.add_device_arg, so one word list
@@ -189,7 +199,45 @@ def load_parser(module_name: str) -> argparse.ArgumentParser | None:
         sys.argv = original_argv
 
 
+def _metavar_names(action: argparse.Action) -> list[str]:
+    """Every token in an action's metavar, upper-cased.
+
+    Tuple metavars (``-stim TIMING_FILE HRF_MODEL LABEL``) and alternation
+    metavars (``-adjust_dof MAP|N``) both describe more than one thing; a shell
+    completing after the flag cannot tell which slot it is filling, so any
+    path-shaped token is enough to offer filenames.
+    """
+    metavar = action.metavar
+    if isinstance(metavar, str):
+        raw = [metavar]
+    elif isinstance(metavar, tuple):
+        raw = [str(m) for m in metavar]
+    else:
+        return []
+    return [tok.upper() for part in raw for tok in re.split(r"[|\s]+", part) if tok]
+
+
+def _looks_like_path(name: str) -> bool:
+    return name in _FILE_METAVARS or "FILE" in name or name.endswith(_FILE_METAVAR_SUFFIXES)
+
+
 def _completion_kind(action: argparse.Action) -> str:
+    """What a shell should offer after this flag.
+
+    The default is **file** completion, not silence.  This toolbox is mostly
+    paths in and paths out: of the flags that take a value, the ones that are
+    provably not paths are provably so (``type=int``/``float``, or an explicit
+    metavar the author chose to say VALUE / SECONDS / LABEL).  Everything left
+    over -- ``-out``, ``-Rbeta``, ``-dfile``, ``-master`` -- is a path far more
+    often than not, and completing nothing there is indistinguishable from a
+    broken completion script (bug of record: ``ffs_tunewarp -out ./so<TAB>``
+    just beeped).
+
+    So an *unrecognised* argument falls back to files, which is also what bash
+    does with no completion installed at all.  To suppress that for a genuinely
+    free-form flag, give it ``type=`` or a metavar -- both are worth having in
+    ``-help`` anyway.
+    """
     if action.choices:
         return "choices"
 
@@ -199,28 +247,23 @@ def _completion_kind(action: argparse.Action) -> str:
         # (cuda,0 / cpu,8) are documented in cli_utils.parse_device_arg.
         return "device"
 
-    # A numeric flag never wants a filename, whatever its dest is called
-    # (-round_onsets THRESHOLD would otherwise match the "onsets" hint below).
+    # A numeric flag never wants a filename, whatever its metavar says
+    # (-round_onsets THRESHOLD is a float, not a path).
     if action.type in (int, float):
         return "none"
 
-    names: list[str] = []
-    metavar = action.metavar
-    if isinstance(metavar, str):
-        names.append(metavar.upper())
-    elif isinstance(metavar, tuple):
-        names.extend(str(m).upper() for m in metavar)
+    names = _metavar_names(action)
+    if names:
+        if any(n in _DIR_METAVARS for n in names):
+            return "dir"
+        if any(_looks_like_path(n) for n in names):
+            return "file"
+        # An explicit metavar the author chose (THRESHOLD, VALUE, SECONDS)
+        # that names nothing path-shaped is a statement that the argument is
+        # not a path, and outranks the file default.
+        return "none"
 
-    if any(n in _DIR_METAVARS for n in names):
-        return "dir"
-    if any(n in _FILE_METAVARS for n in names):
-        return "file"
-    # The dest-name fallback only applies when there is no metavar to go on.
-    # An explicit metavar the author chose (THRESHOLD, VALUE, SECONDS) is a
-    # statement that the argument is not a path, and outranks the guess.
-    if not names and any(hint in dest for hint in _FILE_DEST_HINTS):
-        return "file"
-    return "none"
+    return "file"
 
 
 def describe(parser: argparse.ArgumentParser) -> list[OptionSpec]:

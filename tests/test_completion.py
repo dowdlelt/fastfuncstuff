@@ -56,10 +56,32 @@ class TestCompletionKind:
         action = parser.add_argument("-flobs_prior_weight", metavar="VALUE")
         assert _completion_kind(action) == "none"
 
-    def test_dest_hint_applies_when_there_is_no_metavar(self):
+    def test_unannotated_flag_falls_back_to_files(self):
+        """ffs_tunewarp -out ./so<TAB> used to beep: no type, no metavar."""
         parser = argparse.ArgumentParser()
-        action = parser.add_argument("-mask")
+        assert _completion_kind(parser.add_argument("-out")) == "file"
+        assert _completion_kind(parser.add_argument("-mask")) == "file"
+
+    def test_metavar_extension_is_read_as_a_path(self):
+        parser = argparse.ArgumentParser()
+        assert (
+            _completion_kind(parser.add_argument("-useweight", metavar="WEIGHT.nii.gz")) == "file"
+        )
+        assert _completion_kind(parser.add_argument("-aff12", metavar="MOCO.aff12.1D")) == "file"
+        assert _completion_kind(parser.add_argument("-plot", metavar="FILE.png")) == "file"
+
+    def test_tuple_metavar_completes_files_when_any_slot_is_one(self):
+        """-stim TIMING_FILE HRF_MODEL LABEL: the shell cannot tell which slot."""
+        parser = argparse.ArgumentParser()
+        action = parser.add_argument(
+            "-stim", nargs=3, metavar=("TIMING_FILE", "HRF_MODEL", "LABEL")
+        )
         assert _completion_kind(action) == "file"
+
+    def test_alternation_metavar_splits_on_pipe(self):
+        parser = argparse.ArgumentParser()
+        assert _completion_kind(parser.add_argument("-adjust_dof", metavar="MAP|N")) == "file"
+        assert _completion_kind(parser.add_argument("-work_dxyz", metavar="auto|off|MM")) == "none"
 
 
 class TestDescribe:
