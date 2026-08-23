@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import shlex
 import sys
 import time
 from collections import deque
@@ -30,16 +31,19 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from fastfuncstuff.cli_utils import (
+    add_batch_args,
     add_deterministic_arg,
     add_device_arg,
     add_verbose_arg,
+    collect_batch_jobs,
     enable_determinism,
     parse_prefix,
+    run_batch_jobs,
     setup_device,
     spinner,
 )
 from fastfuncstuff.memory import plan_nonlinear_memory
-from fastfuncstuff.processing.affine import resample_to_base_grid
+from fastfuncstuff.processing.affine import base_into_source_frame, resample_to_base_grid
 from fastfuncstuff.processing.interp import WARP_INTERP_MODES, warp_image, warp_image_linear
 from fastfuncstuff.processing.io import (
     load_image,
@@ -189,8 +193,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     g_io.add_argument(
         "-base",
-        required=True,
-        help="Base (target/reference) image (.nii/.nii.gz). "
+        default=None,
+        help="Base (target/reference) image (.nii/.nii.gz) [required unless -batch]. "
         "If 4D and -source is omitted, enters timeseries mode",
     )
     g_io.add_argument(
@@ -211,9 +215,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     g_io.add_argument(
         "-prefix",
-        required=True,
-        help="Output prefix. Produces {prefix}.nii.gz (warped image) "
-        "and {prefix}_WARP*.nii.gz (displacement fields)",
+        default=None,
+        help="Output prefix [required unless -batch]. Produces {prefix}.nii.gz "
+        "(warped image) and {prefix}_WARP*.nii.gz (displacement fields)",
+    )
+    g_io.add_argument(
+        "-warp_prefix",
+        "-warp-prefix",
+        default=None,
+        help="Name the warp outputs off THIS stem instead of -prefix. For the case "
+        "where several sources write their own warped image but share one warp -- "
+        "naming both off -prefix would have them overwrite each other's field.",
+    )
+    g_io.add_argument(
+        "-matrix",
+        "-1Dmatrix",
+        "-1Dmatrix_apply",
+        default=None,
+        help="An .aff12.1D affine (as ffs_allineate -1Dmatrix_save writes) taking the "
+        "SOURCE to the base. Given this, the source is NOT expected to be pre-aligned: "
+        "the matrix is inverted and the BASE is resampled (wsinc5) onto the source's "
+        "own grid, and the warp is estimated there, so the source keeps every voxel it "
+        "acquired. Outputs are then on the SOURCE grid; carry them to base space with "
+        "the warp applied first: ffs_nwarp -source src.nii -nwarp 'matrix.aff12.1D "
+        "out_WARP.nii' -master base.nii. Not available in timeseries mode.",
+    )
+    add_batch_args(
+        g_io,
+        tool="ffs_qwarp",
+        what="patch-warp registrations",
+        example="-base ref.nii.gz -source run2.nii.gz -prefix run2_nl.nii.gz",
+        skip_note="-prefix / -warp_prefix",
     )
     g_io.add_argument(
         "-dxyz",
@@ -1458,12 +1490,76 @@ def _extract_warp_pcs(
         print(f"Saved: {out_path}")
 
 
+def _warp_stem(args: argparse.Namespace, pfx) -> str:
+    """Stem the warp outputs hang off: ``-warp_prefix`` when given, else ``-prefix``."""
+    wp = getattr(args, "warp_prefix", None)
+    return parse_prefix(wp).stem if wp else pfx.stem
+
+
+def _expected_outputs(args: argparse.Namespace) -> list[str]:
+    """Concrete output paths a solo run of ``args`` would write, for -batch_skip.
+
+    The 3D path only. A timeseries run writes a folder (or a 5D file) whose name
+    depends on the mode it resolves to at load time, so such a job is never
+    skipped -- safe, and the pipeline's nonlinear stages are all 3D anyway."""
+    pfx = parse_prefix(args.prefix)
+    outs = [pfx.as_file()]
+    if not args.no_save_warp:
+        # The warp is written .nii.gz regardless of the prefix's own extension.
+        outs.append(f"{_warp_stem(args, pfx)}_WARP.nii.gz")
+    return outs
+
+
+def _validate_batch_run(run_args: argparse.Namespace) -> None:
+    """Per-run validation for a batch job: needs -base/-prefix (source may be
+    omitted, which is qwarp's single-file timeseries mode)."""
+    missing = [f for f in ("base", "prefix") if getattr(run_args, f, None) is None]
+    if missing:
+        raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
+
+
+def _batch_dispatch(run_args: argparse.Namespace, device: torch.device) -> None:
+    """Batch adapter: turn a nonzero return into an exception so the shared runner
+    records the job as failed."""
+    rc = _dispatch_run(run_args, device)
+    if rc != 0:
+        raise ValueError(f"run failed (exit {rc})")
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "deterministic", False):
         enable_determinism(getattr(args, "verb", 1))
 
-    # Select device (prefer CUDA > CPU; explicit MPS remains available).
+    if args.batch is not None or args.batch_run:
+        # One process, many registrations: CUDA context and warmup are paid once.
+        run_batch_jobs(
+            tool="ffs_qwarp",
+            jobs=collect_batch_jobs(args.batch, args.batch_run),
+            device=_select_device(args),
+            parse_line=lambda line: parse_args(shlex.split(line)),
+            dispatch=_batch_dispatch,
+            validate=_validate_batch_run,
+            is_nested=lambda ra: ra.batch is not None or ra.batch_run is not None,
+            expected_outputs=_expected_outputs,
+            skip_existing=args.batch_skip,
+            verb=args.verb,
+        )
+        return 0
+
+    missing = [f for f in ("base", "prefix") if getattr(args, f, None) is None]
+    if missing:
+        print(
+            "ERROR: " + ", ".join("-" + m for m in missing) + " required "
+            "(or use -batch FILE / -batch_run ARGS)."
+        )
+        return 1
+
+    return _dispatch_run(args, _select_device(args))
+
+
+def _select_device(args: argparse.Namespace) -> torch.device:
+    """Device for a run or a whole batch (prefer CUDA > CPU; explicit MPS honoured)."""
     device_spec = args.device
     if (
         device_spec is None or str(device_spec).lower() == "auto"
@@ -1484,7 +1580,14 @@ def main(argv: list[str] | None = None) -> int:
         and not torch.backends.mps.is_available()
     ):
         print("WARNING: No accelerator available, running on CPU (will be slow)")
+    return device
 
+
+def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
+    """Register one self-contained job (the entire per-pair body).
+
+    Both the standalone path and every batch job go through here, so a manifest
+    line reproduces a solo invocation bit-for-bit."""
     if args.verb >= 1:
         print(
             f"ffs_qwarp\n  device: {device}\n"
@@ -1510,6 +1613,21 @@ def main(argv: list[str] | None = None) -> int:
             # 4D source: fold into timeseries mode with external base
             source_is_4d = True
             timeseries_mode = True
+
+    # -matrix: solve in the source's own frame instead of expecting a pre-aligned
+    # source. Only the 3D path -- in timeseries mode "the source" is a series with
+    # its own per-volume alignment, which one matrix cannot describe.
+    if args.matrix is not None:
+        if timeseries_mode:
+            print("ERROR: -matrix is not available in timeseries mode.")
+            return 1
+        src_shape = tuple(source_data.shape)
+        with spinner(f"Resampling base onto the {Path(args.source).name} grid"):
+            base_data, base_info = base_into_source_frame(
+                base_data, base_info, src_shape, source_info, args.matrix, device
+            )
+        if args.verb >= 1:
+            print(f"Base resampled into source space: grid {src_shape[::-1]}")
 
     if timeseries_mode:
         if source_is_4d:
@@ -1818,6 +1936,8 @@ def main(argv: list[str] | None = None) -> int:
     # Output prefix (strip extension; -prefix out.nii.zst requests zstd-compressed output)
     pfx = parse_prefix(args.prefix)
     prefix, nii_ext = pfx.stem, pfx.nifti_ext
+    # The warped image keeps -prefix; only the fields follow -warp_prefix.
+    warp_stem = _warp_stem(args, pfx)
 
     pad_x, pad_x_hi, pad_y, pad_y_hi, pad_z, pad_z_hi = _padding_faces(padding)
 
@@ -1877,13 +1997,13 @@ def main(argv: list[str] | None = None) -> int:
         stream_files = not args.no_save_warp and not as_5d
 
         # Create warp output directory (folder mode, or for the PC .1D output).
-        warp_dir = f"{prefix}_warps"
+        warp_dir = f"{warp_stem}_warps"
         if (not args.no_save_warp and not as_5d) or do_warp_pcs:
             os.makedirs(warp_dir, exist_ok=True)
             if args.verb >= 1 and not as_5d:
                 print(f"Warp output directory: {warp_dir}/")
         # Base name for warp files inside the directory
-        warp_basename = os.path.basename(prefix)
+        warp_basename = os.path.basename(warp_stem)
 
         # Keep raw voxel-unit warps in CPU RAM when temporal smoothing / PCs / 5D need them.
         all_warps_raw: list[tuple[Tensor, Tensor, Tensor]] = []
@@ -2232,8 +2352,8 @@ def main(argv: list[str] | None = None) -> int:
                     [(all_xd[t], all_yd[t], all_zd[t]) for t in range(nt)],
                     as_5d=args.warp_format == "5d",
                     prefix=prefix,
-                    warp_dir=f"{prefix}_warps",
-                    warp_basename=os.path.basename(prefix),
+                    warp_dir=f"{warp_stem}_warps",
+                    warp_basename=os.path.basename(warp_stem),
                     indices=list(range(nt)),
                     zpad=_zeropad_width(nt),
                     base_info=base_info,
@@ -2243,9 +2363,9 @@ def main(argv: list[str] | None = None) -> int:
 
             # Extract warp PCs if requested
             if args.n_pcs > 0 and nt > 1:
-                warp_dir = f"{prefix}_warps"
+                warp_dir = f"{warp_stem}_warps"
                 os.makedirs(warp_dir, exist_ok=True)
-                warp_basename = os.path.basename(prefix)
+                warp_basename = os.path.basename(warp_stem)
                 all_warps_raw = [(all_xd[t], all_yd[t], all_zd[t]) for t in range(nt)]
                 _extract_warp_pcs(
                     all_warps_raw,
@@ -2268,7 +2388,7 @@ def main(argv: list[str] | None = None) -> int:
                     all_xd[0],
                     all_yd[0],
                     all_zd[0],
-                    f"{prefix}_WARP.nii.gz",
+                    f"{warp_stem}_WARP.nii.gz",
                     header_info=base_info,
                     padding=warp_padding,
                     units="mm",

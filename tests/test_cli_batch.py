@@ -605,3 +605,46 @@ def test_emit_qc_stacks_are_queued_and_flushed_per_stage():
     assert 'ffs_util_3dmath -batch "$qcbatch"' in s
     # every emitted qc_tcat call is followed (eventually) by a flush
     assert s.count("qc_flush") >= 2  # the definition plus at least one call
+
+
+def test_qwarp_expected_outputs_names_the_warp_gz_regardless_of_prefix_ext():
+    """qwarp writes its warp .nii.gz even when the image is zstd -- mirror that.
+
+    -batch_skip compares paths, so a guess that follows the prefix's extension
+    would never match the file on disk and every job would re-run.
+    """
+    from fastfuncstuff.cli.qwarp import _expected_outputs, parse_args
+
+    a = parse_args(["-base", "f.nii", "-source", "m.nii", "-prefix", "w.nii.zst"])
+    assert _expected_outputs(a) == ["w.nii.zst", "w_WARP.nii.gz"]
+
+
+def test_qwarp_warp_prefix_moves_only_the_warp():
+    from fastfuncstuff.cli.qwarp import _expected_outputs, parse_args
+
+    a = parse_args(
+        ["-base", "f.nii", "-source", "m.nii", "-prefix", "laneA.nii.gz", "-warp_prefix", "shared"]
+    )
+    assert _expected_outputs(a) == ["laneA.nii.gz", "shared_WARP.nii.gz"]
+
+
+def test_qwarp_batch_run_rejects_a_run_missing_its_prefix():
+    """-source may be absent (single-file timeseries mode); -base/-prefix may not."""
+    from fastfuncstuff.cli.qwarp import _validate_batch_run, parse_args
+
+    _validate_batch_run(parse_args(["-base", "series.nii", "-prefix", "out.nii"]))
+    with pytest.raises(ValueError, match="-prefix"):
+        _validate_batch_run(parse_args(["-base", "f.nii", "-source", "m.nii"]))
+
+
+def test_qwarp_batch_is_not_shadowed_by_its_optimizer_flags():
+    """-batch_lr/-batch_iters/-batch_tol/-batch_patience are the Adam optimizer's.
+
+    They predate the manifest flag and share its prefix, so before -batch existed
+    argparse resolved a bare -batch as an ambiguous abbreviation of them. An exact
+    match wins over abbreviation, but only while -batch itself is defined.
+    """
+    from fastfuncstuff.cli.qwarp import parse_args
+
+    a = parse_args(["-batch", "runs.txt", "-batch_iters", "7"])
+    assert a.batch == "runs.txt" and a.batch_iters == 7
