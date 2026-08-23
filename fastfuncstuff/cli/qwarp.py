@@ -132,11 +132,15 @@ TOO MUCH WARP (anatomy distorted, ripples, folding)
 
 WRONG-LOOKING WARP / CROSS-MODAL PAIRS
 --------------------------------------
-The default cost (-pcl, clipped Pearson) assumes the two images brighten together.
-For contrast-inverted pairs (EPI to anat) use -lpc; for same-contrast but locally
-varying gain use -lpa. Both are the AFNI blok local Pearson; -lpa_alt is the older
-Gaussian/box-neighborhood version, tuned by -lpa_sigma / -lpa_kernel. A globally
-"good" cost with a locally wrong warp usually means the weight, not the cost.
+The default cost (-cost pearclp, clipped Pearson) assumes the two images brighten
+together. For contrast-inverted pairs (EPI to anat) use -cost lpc; for same-contrast
+but locally varying gain use -cost lpa. Both are the AFNI blok local Pearson;
+-cost lpa_alt is the older Gaussian/box-neighborhood version, tuned by -lpa_sigma /
+-lpa_kernel. Beyond the AFNI set the engine also optimizes -cost lncc (windowed
+local NCC, -cc_radius), mse, and the two cross-modal descriptors -cost ngf (gradient
+orientation) and -cost mind / mindssc (neighborhood self-similarity, -mind_radius) --
+structurally different evidence when a Pearson variant cannot see the alignment. A
+globally "good" cost with a locally wrong warp usually means the weight, not the cost.
 
 TOO SLOW
 --------
@@ -578,6 +582,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Pearson correlation variants work well for same-modality images.",
     )
     g_cost.add_argument(
+        "-cost",
+        "-cost_method",
+        dest="cost",
+        default=None,
+        choices=sorted(QWARP_COST_ALIASES),
+        metavar="NAME",
+        help="Similarity metric, by name. The engine supports more costs than "
+        "the one-flag-each shorthands below expose: pearclp/pcl (clipped "
+        "Pearson, the default), pearson/pear, lpa, lpc, lpa_alt, and the "
+        "neighbourhood metrics lncc (local NCC, tuned by -cc_radius), mse, "
+        "ngf (normalized gradient field -- cross-modal, edge-driven), and "
+        "mind / mindssc (self-similarity descriptors, cross-modal, tuned by "
+        "-mind_radius). Gauss-Newton covers pearclp/pearson/lpa/lpa_alt/lncc; "
+        "the rest fall back to Adam. Overrides the shorthand flags",
+    )
+    g_cost.add_argument(
         "-pcl",
         action="store_true",
         default=True,
@@ -625,6 +645,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="LPA neighborhood kernel: gauss=Gaussian weighting "
         "(default), box=uniform weighting (like AFNI's "
         "space-filling blocks)",
+    )
+    g_cost.add_argument(
+        "-cc_radius",
+        type=int,
+        default=4,
+        metavar="VOXELS",
+        help="Neighborhood half-width for -cost lncc. Clamped per level so the "
+        "window fits inside the patch -- an oversized window makes every voxel "
+        "see the same whole-patch statistics, silently turning the local "
+        "metric into a global one [default: %(default)s]",
+    )
+    g_cost.add_argument(
+        "-mind_radius",
+        type=float,
+        default=1.0,
+        metavar="VOXELS",
+        help="Patch radius for the -cost mind / mindssc descriptors [default: %(default)s]",
     )
     g_cost.add_argument(
         "-penfac",
@@ -874,6 +911,41 @@ def _write_warp_timeseries(
     if verb >= 1:
         print(f"Saved {len(warps)} warps to {warp_dir}/")
     return f"{warp_dir}/"
+
+
+# The engine's cost vocabulary, plus the spellings other tools use for the same
+# thing. `ffs_tunewarp` renders reproduce commands from the recipe's cost name,
+# which is the allineate spelling ("ls"), so the CLI has to accept it.
+QWARP_COST_ALIASES: dict[str, str] = {
+    "pcl": "pearclp",
+    "pearclp": "pearclp",
+    "ls": "pearclp",
+    "pear": "pearson",
+    "pearson": "pearson",
+    "lpa": "lpa",
+    "lpc": "lpc",
+    "lpa_alt": "lpa_alt",
+    "lncc": "lncc",
+    "mse": "mse",
+    "ngf": "ngf",
+    "mind": "mind",
+    "mindssc": "mindssc",
+}
+
+
+def _resolve_cost(args) -> str:
+    """Cost method from -cost, else from the legacy one-flag-each shorthands."""
+    if args.cost is not None:
+        return QWARP_COST_ALIASES[args.cost]
+    if args.lpc:
+        return "lpc"
+    if args.lpa:
+        return "lpa"
+    if args.lpa_alt:
+        return "lpa_alt"
+    if args.pear:
+        return "pearson"
+    return "pearclp"
 
 
 def _read_motion_params(filepath: str) -> list[tuple[float, float, float, float, float, float]]:
@@ -1622,17 +1694,7 @@ def main(argv: list[str] | None = None) -> int:
         use_quintic=args.quintic,
         use_lite=not args.nolite,
         workhard=tuple(args.workhard) if args.workhard else None,
-        cost_method=(
-            "lpc"
-            if args.lpc
-            else "lpa"
-            if args.lpa
-            else "lpa_alt"
-            if args.lpa_alt
-            else "pearson"
-            if args.pear
-            else "pearclp"
-        ),
+        cost_method=_resolve_cost(args),
         penalty_factor=args.penfac,
         penalty_first_level=args.penalty_first_level,
         warp_flags=warp_flags,
@@ -1647,6 +1709,8 @@ def main(argv: list[str] | None = None) -> int:
         maxdisp=args.maxdisp,
         lpa_sigma=lpa_sigma_val,
         lpa_kernel=args.lpa_kernel,
+        cc_radius=args.cc_radius,
+        mind_radius=args.mind_radius,
         level_stop_tol=args.level_stop,
         compile=args.compile,
         pyramid_factor=args.pyramid,
