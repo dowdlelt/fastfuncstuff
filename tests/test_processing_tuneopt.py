@@ -25,7 +25,9 @@ from fastfuncstuff.processing.tuneopt import (
     _weighted,
     config_key,
     frontier_hypervolume,
+    in_band,
     propose,
+    score_bands,
 )
 from fastfuncstuff.processing.tunespec import ParamSpec
 from fastfuncstuff.processing.tunestore import Trial, TrialStore, knob_effects
@@ -831,3 +833,162 @@ def test_two_point_frontier_has_area():
     """A reference corner on the observed maximum would score this exactly zero,
     because both points normalise straight onto the corners."""
     assert frontier_hypervolume([_obs(0.0, 0.0, 10.0), _obs(1.0, 10.0, 0.0)]) > 0.0
+
+
+# --- backing out of the corner ----------------------------------------------
+# Expected improvement answers one question, and once a study has found its
+# optimum that question has no answers left worth spending fits on. What a study
+# then needs is the room *beside* the winner: settings that give up a little
+# similarity for a field worth believing. These pin that the band machinery
+# reaches configs the default acquisition provably cannot propose.
+
+
+def test_bands_span_the_good_half_and_stop_at_the_median():
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    bands = score_bands(obs, 3)
+    assert len(bands) == 3
+    assert bands[0][0] == min(o.score for o in obs)
+    # 'reach' is the median: filling the worse half is regressing, not backing off.
+    assert bands[-1][1] <= float(np.median([o.score for o in obs])) + 1e-9
+    assert all(lo < hi for lo, hi in bands)
+    assert [b[0] for b in bands] == sorted(b[0] for b in bands)
+
+
+def test_bands_ignore_configs_that_folded():
+    obs = [_frontier_obs(r) for r in (0.5, 1.0, 2.0)]
+    obs.append(Observation({"reg": -9.0}, score=-99.0, margin=-1.0, roughness=0.0))
+    assert score_bands(obs, 2)[0][0] == 0.5  # not the folded config's -99
+
+
+def test_bands_need_a_field_to_quantile():
+    assert score_bands([_frontier_obs(0.5)], 3) == []
+    assert score_bands([], 3) == []
+
+
+def _reg_space() -> SearchSpace:
+    """A ladder finer than the observations, so there is somewhere to be sent."""
+    return SearchSpace.from_params([_param("reg", tuple(round(0.2 * k, 2) for k in range(21)))])
+
+
+def test_a_band_proposes_settings_beside_the_optimum_not_at_it():
+    """The point of the feature: aim at 'a little worse', land there."""
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    space = _reg_space()
+    rng = np.random.default_rng(0)
+    picked = [c["reg"] for c in propose(space, obs, 3, rng, band=(0.6, 1.6))]
+    # score == reg on this surface, so the band is a claim about reg directly.
+    assert picked and all(0.4 <= r <= 1.8 for r in picked), picked
+
+
+def test_the_default_acquisition_cannot_be_aimed_at_a_level():
+    """Why the flag exists rather than being a matter of running longer.
+
+    The default is not blind to the frontier -- the random scalarisation walks up
+    and down it, which is the whole ParEGO argument. What it cannot do is be *sent*
+    somewhere: asked over many draws for settings around one score, it answers with
+    the whole range and spends most of a budget re-measuring the end it likes. The
+    band is that same acquisition with an address on it.
+    """
+    obs = [_frontier_obs(r) for r in (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)]
+    space = _reg_space()
+    band = (0.6, 1.6)
+
+    def hit_rate(**kw) -> float:
+        picked = [
+            c["reg"]
+            for seed in range(8)
+            for c in propose(space, obs, 3, np.random.default_rng(seed), **kw)
+        ]
+        return sum(band[0] <= r <= band[1] for r in picked) / len(picked)
+
+    assert hit_rate(band=band) == 1.0
+    assert hit_rate() < 0.7  # and the misses are scattered the length of the range
+
+
+def test_a_band_still_answers_to_the_feasibility_surface():
+    """Backing off the optimum is not a licence to cross the fold boundary.
+
+    Feasibility multiplies the band the same way it multiplies improvement, so a
+    band that straddles the fold boundary is proposed only on its legal side.
+    """
+    regs = (0.0, 0.4, 0.8, 1.2, 1.6, 2.0)
+
+    def picks(fold_below: float) -> list[float]:
+        obs = [
+            Observation(
+                {"reg": r},
+                score=r,
+                margin=(-1.0 if r < fold_below else 1.0),
+                roughness=1.0,  # flat, so only the band and the gate can steer
+            )
+            for r in regs
+        ]
+        # One candidate per draw: a batch is deliberately spread out (see
+        # _greedy_batch), so its later members are chosen for being far from the
+        # earlier ones and say nothing about what the acquisition preferred.
+        return [
+            c["reg"]
+            for seed in range(6)
+            for c in propose(_reg_space(), obs, 1, np.random.default_rng(seed), band=(0.0, 1.4))
+        ]
+
+    assert set(picks(-1.0)) == {0.6}  # nothing folds: the band is filled from inside
+    assert set(picks(1.0)) == {1.0}  # it folds below 1.0, so the band takes its legal end
+
+
+def test_a_band_prefers_the_smoother_way_to_score_the_same():
+    """A band asks for the smoothest field at a level, not for any field at it."""
+    params = [
+        _param("reg", tuple(round(0.25 * k, 2) for k in range(2, 10))),
+        _param("smooth", (0.0, 1.0)),
+    ]
+    space = SearchSpace.from_params(params)
+    obs = [
+        Observation(
+            config={"reg": reg, "smooth": sm},
+            score=reg,  # smooth does not move the score at all ...
+            margin=1.0,
+            roughness=(4.0 if sm == 0.0 else 1.0),  # ... only the roughness
+        )
+        for reg in (0.5, 1.0, 1.5, 2.0)
+        for sm in (0.0, 1.0)
+    ]
+    rng = np.random.default_rng(0)
+    picked = propose(space, obs, 3, rng, band=(0.9, 1.6))
+    assert picked and all(c["smooth"] == 1.0 for c in picked), picked
+
+
+def test_band_incumbent_is_the_smoothest_config_in_the_band():
+    """Ladder refinement follows the band, or it drills the corner all over again."""
+    from fastfuncstuff.processing.tunewarp import _incumbent
+
+    obs = [
+        Observation({"reg": 1.0, "smooth": 0.0}, score=1.0, margin=1.0, roughness=5.0),
+        Observation({"reg": 1.1, "smooth": 1.0}, score=1.1, margin=1.0, roughness=0.5),
+        Observation({"reg": 0.0, "smooth": 0.0}, score=0.0, margin=1.0, roughness=9.0),
+    ]
+    assert _incumbent(obs, band=(0.9, 1.2)) == {"reg": 1.1, "smooth": 1.0}
+    # An empty band refines nothing rather than falling back to the global best,
+    # which would aim the ladders straight back at the corner.
+    assert _incumbent(obs, band=(4.0, 5.0)) is None
+
+
+def test_a_band_is_read_the_same_way_it_was_cut():
+    """Bug of record: a band with configs in it reported itself empty.
+
+    The edges are quantiles of per-config *means*, so membership has to be tested
+    on the same means. Testing raw trials instead emptied every band narrower than
+    the between-subject scatter -- on a real 7T store, band 2 of 5 held six configs
+    and offered no incumbent, so the ladders never refined where the search was
+    actually working.
+    """
+    from fastfuncstuff.processing.tunewarp import _incumbent
+
+    obs = [
+        Observation({"reg": 1.0}, score=s, margin=1.0, roughness=2.0)
+        for s in (0.6, 1.4)  # mean 1.0; neither trial is inside the band
+    ]
+    obs += [Observation({"reg": 2.0}, score=s, margin=1.0, roughness=9.0) for s in (0.7, 1.3)]
+    band = (0.95, 1.05)
+    assert len(in_band(obs, band)) == 2
+    assert _incumbent(obs, band) == {"reg": 1.0}  # the smoother of the two

@@ -1507,6 +1507,85 @@ def _format_frontier(results: list[ConfigResult]) -> str:
     return "\n".join(lines)
 
 
+def format_bands(results: list[ConfigResult], n: int = 5) -> str:
+    """One representative setting per score level, per backend.
+
+    The frontier answers "what are the choices worth making"; this answers the
+    question a study asks *after* it has found its optimum -- what does giving up
+    a little similarity buy, and which settings buy it. It is per backend on
+    purpose, unlike the frontier: a demons config that another backend dominates
+    is still the answer to "what should I run if I am running demons".
+
+    Levels are equal slices of score from the best passing config down to the
+    median, and each shows the SMOOTHEST config that scored there -- the rest of a
+    level being rougher for no gain. Equal slices rather than equal counts because
+    an EMPTY level is the useful output: it is a stretch of the trade-off the
+    search jumped clean over, and `-explore` is what fills it in.
+    """
+    lines: list[str] = []
+    for backend in sorted({r.backend for r in results if not r.is_baseline}):
+        passing = [
+            r
+            for r in results
+            if r.backend == backend and r.grade == PASS and not r.is_baseline and not r.guard_pinned
+        ]
+        if len(passing) < n + 1:
+            continue  # too few configs to cut into levels without inventing them
+        scores = sorted(r.score_mean for r in passing)
+        floor, ceiling = scores[0], _quantile(scores, 0.5)
+        if not ceiling > floor:
+            continue
+        edges = [floor + (ceiling - floor) * k / n for k in range(n + 1)]
+        rows = []
+        for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:], strict=True)):
+            # Half-open, or a config sitting exactly on an edge is reported as the
+            # answer for two different levels.
+            last = i == n - 1
+            here = [r for r in passing if lo <= r.score_mean <= hi if last or r.score_mean < hi]
+            best = min(here, key=lambda r: r.bending_mean) if here else None
+            rows.append((lo, hi, len(here), best))
+        if not any(r[3] for r in rows):
+            continue
+        head = (
+            f"  {'#':>4s} {'score':>16s} {'n@':>3s} {'bend':>8s} {'jacmin':>7s} "
+            f"{'s/fit':>6s}  settings"
+        )
+        lines += ["", f"  {backend} -- smoothest setting at each score level:", head]
+        lines.append("  " + "-" * len(head))
+        for lo, hi, count, r in rows:
+            if r is None:
+                lines.append(
+                    f"  {'-':>4s} {lo:7.3f}..{hi:<7.3f} {0:>3d} {'':8s} {'':7s} {'':6s}  "
+                    "(nothing scored here -- see -explore)"
+                )
+                continue
+            lines.append(
+                f"  {r.config_id:>4d} {lo:7.3f}..{hi:<7.3f} {count:>3d} {r.bending_mean:8.4f} "
+                f"{r.jac_min_worst:7.3f} {r.seconds_mean:6.1f}  {r.label()}"
+            )
+    if not lines:
+        return "  (not enough passing configs per backend to cut into levels)"
+    lines.append(
+        "\n  Read DOWN from the top row and stop where the warp stops being one you\n"
+        "  would defend on a subject the tuner never saw. The top row is the study's\n"
+        "  optimum; the rows under it are what it costs to be less aggressive, which\n"
+        "  is a question the ranking cannot be asked. 'n@' is how many configs scored\n"
+        "  at that level: a level holding one config, or none, is a stretch of the\n"
+        "  trade-off the search jumped over, and -explore is what fills it in."
+    )
+    return "\n".join(lines)
+
+
+def _quantile(sorted_values: list[float], q: float) -> float:
+    """Linear-interpolated quantile of an already-sorted list."""
+    if not sorted_values:
+        return 0.0
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)  # pos is never negative, so truncation is the floor
+    hi = min(lo + 1, len(sorted_values) - 1)
+    return sorted_values[lo] + (pos - lo) * (sorted_values[hi] - sorted_values[lo])
+
+
 def format_reproduce(store: TrialStore, config_id: int, out_dir: str | Path) -> str:
     """What re-running a config would do — the commands, verbatim."""
     cmds = store.commands_for(config_id)

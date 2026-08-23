@@ -42,8 +42,13 @@ Usage:
 
     # read the answer
     ffs_tunewarp -out tune_mni -list        # ranked table + the frontier
+    ffs_tunewarp -out tune_mni -bands       # what backing off the winner costs
     ffs_tunewarp -out tune_mni -effects     # what each knob does
     ffs_tunewarp -out tune_mni -importance  # which knobs to stop searching
+
+    # once the corner is found: fill in the room beside it rather than chase it
+    ffs_tunewarp -type MNI_T1 -base mni.nii.gz -source s1.nii.gz s2.nii.gz \
+                 -out tune_mni -explore -patience 0 -budget 60
 
     # look at a row, on every subject
     ffs_tunewarp -out tune_mni -reproduce 7
@@ -70,6 +75,7 @@ from fastfuncstuff.cli_utils import (
 from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
+    format_bands,
     format_convergence,
     format_export,
     format_guide,
@@ -198,6 +204,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "measured constant: nothing can tell you how much better is worth another ten "
         "fits. Raise it to stop sooner on a rough answer, lower it to keep refining.",
     )
+    search.add_argument(
+        "-explore",
+        nargs="?",
+        type=int,
+        const=5,
+        default=0,
+        metavar="N",
+        help="Adaptive only: spend the budget filling in the settings BESIDE the "
+        "winner instead of chasing it. The score range from the best result down to "
+        "the median is cut into N bands (default: 5 when the flag is given bare), "
+        "and each round asks for the smoothest field that scores in one of them. "
+        "Use it once a search has already found its corner: the default acquisition "
+        "sweeps the accuracy/smoothness trade at a random weight and cannot be SENT "
+        "anywhere, so it keeps re-measuring the end it likes and the less-aggressive "
+        "warps beside the optimum stay thinly sampled. "
+        "Pair it with -patience 0 -- filling a band adds a small frontier point at "
+        "a time, which the default convergence test can read as no progress.",
+    )
     search.add_argument("-seed", type=int, default=0, help="Adaptive only: RNG seed (default: 0)")
     search.add_argument(
         "-max_configs",
@@ -295,6 +319,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Per-level iteration report: what ceiling each backend actually needs, "
         "and whether it was starved or over-ran and fell back to an earlier iterate.",
+    )
+    act.add_argument(
+        "-bands",
+        nargs="?",
+        type=int,
+        const=5,
+        default=0,
+        metavar="N",
+        help="Per backend, the SMOOTHEST setting found at each of N score levels "
+        "(default: 5). The ranked table names the winner and the frontier names the "
+        "choices worth making across backends; this names what backing off the "
+        "winner costs and buys, for one backend at a time. A level holding a single "
+        "config is one the search barely visited -- see -explore.",
     )
     act.add_argument(
         "-effects",
@@ -501,6 +538,7 @@ def main(argv: list[str] | None = None) -> int:
         args.list
         or args.plot is not None
         or args.effects
+        or args.bands
         or args.convergence
         or args.export
         or args.runs
@@ -519,6 +557,8 @@ def main(argv: list[str] | None = None) -> int:
             print(format_guide(store, args.recipe))
         if args.effects:
             print(format_knob_effects(knob_effects(store)))
+        if args.bands:
+            print(format_bands(store.results(), args.bands))
         if args.export:
             if not args.recipe:
                 raise SystemExit("-export needs -type, since a preset is keyed by recipe")
@@ -617,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
             seed=args.seed,
             patience=args.patience,
             tol=args.tol,
+            explore=args.explore,
         )
         run_adaptive(
             pairs,

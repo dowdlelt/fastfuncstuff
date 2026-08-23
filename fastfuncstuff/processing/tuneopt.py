@@ -211,6 +211,13 @@ class Axis:
         return added
 
 
+BAND_FLOOR = 1e-3
+"""How much of the band's own probability mass the smoothness aim must keep.
+
+Below this the aim has effectively vetoed every candidate, which is a statement
+that the band is mapped rather than a ranking of what to try next.
+"""
+
 MIN_RELATIVE_STEP = 0.08
 """Stop subdividing once neighbouring values are within 8% of each other.
 
@@ -489,6 +496,7 @@ def propose(
     rng: np.random.Generator,
     cap: int = 20000,
     min_fit: int = 5,
+    band: tuple[float, float] | None = None,
 ) -> list[dict]:
     """The next ``n`` configs to try, by constrained expected improvement.
 
@@ -514,6 +522,11 @@ def propose(
 
     Roughness enters as log1p: bending energy is heavy-tailed, and on raw values a
     single warp that came apart sets the normalising scale for every other config.
+
+    ``band`` switches the question from "what is better" to "what else scores about
+    *this* well, more smoothly" -- see :func:`score_bands`. Improvement is not a
+    useful target once the corner has been found, and a study needs the settings
+    beside the winner as much as the winner.
     """
     tried = {config_key(o.config) for o in observations}
     pool = [c for c in space.lattice(cap=cap, rng=rng) if config_key(c) not in tried]
@@ -526,9 +539,6 @@ def propose(
         return [pool[i] for i in _maximin(xc, n, rng, seed=seed)]
 
     xo = space.encode([o.config for o in observations])
-    target = _scalarize(observations, rng)
-    score_gp = GP.fit(xo, target)
-    mu, sd = score_gp.predict(xc)
 
     # Feasibility is a *separate* surface with its own geometry, so it gets its
     # own GP rather than being folded into the score as a penalty. A penalty
@@ -541,12 +551,130 @@ def propose(
         m_mu, m_sd = GP.fit(xo, margins).predict(xc)
         p_feasible = _norm_cdf(m_mu / np.clip(m_sd, 1e-6, None))
 
+    if band is not None:
+        acq = _band_acquisition(space, observations, pool, xo, xc, band) * p_feasible
+        return [pool[i] for i in _greedy_batch(acq, xc, n)]
+
+    target = _scalarize(observations, rng)
+    score_gp = GP.fit(xo, target)
+    mu, sd = score_gp.predict(xc)
+
     # The improvement reference has to be on the same scale the GP was fitted to,
     # so it comes from the scalarised target rather than the raw score.
     feasible = [t for t, o in zip(target, observations, strict=True) if o.margin > 0]
     best = float(min(feasible)) if feasible else float(np.min(target))
     acq = _expected_improvement(mu, sd, best) * p_feasible
     return [pool[i] for i in _greedy_batch(acq, xc, n)]
+
+
+def score_bands(
+    observations: list[Observation], n: int = 5, reach: float = 0.5
+) -> list[tuple[float, float]]:
+    """Score intervals worth filling in, from the best result to ``reach`` of the field.
+
+    The default search asks one question -- what is the best setting -- and answers
+    it by walking into the corner where the least regularization that still passes
+    the gate lives. That corner is real, but a study also needs the settings *next
+    to* it: the ones that give up a little similarity for a field you would believe
+    on a subject the tuner never saw. Expected improvement will never propose those,
+    because they are by construction not improvements.
+
+    So the room is cut into bands and each is filled deliberately. The cut is into
+    equal *widths* of score, not equal counts: quantile bands would hold the same
+    number of configs by construction and so could never point at the place the
+    search skipped over, which is the whole complaint -- a study walks from a score
+    of 6 to a score of 16 with nothing in between and the gap is invisible to any
+    rank-based cut. An empty band is a finding, and it is the band that most needs
+    a fit spent in it.
+
+    The ends come from the data: the best result, and the ``reach`` quantile of the
+    field (the median by default). Beyond that lie settings already known to be
+    worse, and filling those in is not backing off, it is regressing.
+
+    Feasible configs only. A degenerate range yields no bands, since nothing can
+    land strictly inside one.
+    """
+    scores = sorted(score for _, score, _ in feasible_configs(observations))
+    if len(scores) < 2 or n < 1:
+        return []
+    lo, hi = scores[0], float(np.quantile(scores, reach))
+    if not hi > lo:
+        return []
+    edges = [lo + (hi - lo) * k / n for k in range(n + 1)]
+    return [(lo, hi) for lo, hi in zip(edges[:-1], edges[1:], strict=True) if hi > lo]
+
+
+def feasible_configs(observations: list[Observation]) -> list[tuple[dict, float, float]]:
+    """One (config, score, roughness) per feasible config, averaged over subjects.
+
+    Several trials at the same settings are several noisy reads of one point, and
+    everything that reasons about *where a config sits* -- which band it is in,
+    which is the smoothest one there -- has to agree with how the bands were cut.
+    Testing raw trials instead makes a narrow band read as empty because its
+    members' individual fits scattered outside it. The surrogate is the one thing
+    that keeps the trials apart: it is modelling that scatter on purpose (see
+    :class:`Observation`).
+    """
+    agg: dict[tuple, list[Observation]] = {}
+    for o in observations:
+        if o.margin > 0:
+            agg.setdefault(config_key(o.config), []).append(o)
+    return [
+        (
+            os[0].config,
+            float(np.mean([o.score for o in os])),
+            float(np.mean([max(o.roughness, 0.0) for o in os])),
+        )
+        for os in agg.values()
+    ]
+
+
+def in_band(
+    observations: list[Observation], band: tuple[float, float]
+) -> list[tuple[dict, float, float]]:
+    """The feasible configs whose mean score falls inside ``band``."""
+    lo, hi = band
+    return [c for c in feasible_configs(observations) if lo <= c[1] <= hi]
+
+
+def _band_acquisition(
+    space: SearchSpace,
+    observations: list[Observation],
+    pool: list[dict],
+    xo: np.ndarray,
+    xc: np.ndarray,
+    band: tuple[float, float],
+) -> np.ndarray:
+    """Probability of landing in ``band``, times of being smoother than what is there.
+
+    Two factors, because "fill this band" alone would be answered by re-measuring
+    the configs that already sit in it. What the band is being asked for is the
+    *smoothest* way to score around there, so the second factor is the probability
+    of beating the roughness of the best field already known at that level -- which
+    is expected improvement again, just aimed sideways along the frontier rather
+    than down it.
+
+    With nothing yet observed inside the band there is no roughness to beat, and
+    the factor drops out: anything that lands there is new information. The factor
+    also drops out once it has nothing left to offer -- when no candidate is
+    credibly smoother than what the band already holds, keeping it would return an
+    all-zero acquisition and the batch would be chosen by tie-breaking alone. The
+    band still has a question at that point ("what else scores here"), so it falls
+    back to asking that one.
+    """
+    lo, hi = band
+    mu, sd = GP.fit(xo, np.array([o.score for o in observations], dtype=float)).predict(xc)
+    sd = np.clip(sd, 1e-6, None)
+    acq = _norm_cdf((hi - mu) / sd) - _norm_cdf((lo - mu) / sd)
+
+    rough = np.array([max(o.roughness, 0.0) for o in observations], dtype=float)
+    inside = [r for _, _, r in in_band(observations, band)]
+    if not inside or not rough.any():
+        return acq
+    r_mu, r_sd = GP.fit(xo, np.log1p(rough)).predict(xc)
+    reference = math.log1p(min(inside))
+    aimed = acq * _norm_cdf((reference - r_mu) / np.clip(r_sd, 1e-6, None))
+    return aimed if aimed.max() > BAND_FLOOR * max(acq.max(), 1e-12) else acq
 
 
 # Chebyshev scalarisation keeps a candidate honest on its *worst* objective, which

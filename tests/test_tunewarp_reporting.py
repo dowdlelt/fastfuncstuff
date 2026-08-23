@@ -12,9 +12,11 @@ import pytest
 
 from fastfuncstuff.processing.tunestore import (
     BASELINE,
+    ConfigResult,
     RunMeta,
     TrialStore,
     comparability_warnings,
+    format_bands,
     format_guide,
     format_importance,
     format_results_table,
@@ -647,3 +649,53 @@ def test_format_resume_is_silent_on_a_fresh_directory(tmp_path):
     s = TrialStore(tmp_path / "t.json")
     s.runs.append(_meta())
     assert format_resume(s, ["s1"]) == ""
+
+
+# --- what backing off the optimum costs -------------------------------------
+
+
+def _cfg(cid: int, score: float, bend: float, backend: str = "demons") -> ConfigResult:
+    return ConfigResult(
+        config_id=cid,
+        backend=backend,
+        config={"reg": cid},
+        n_subjects=3,
+        score_mean=score,
+        score_spread=0.1,
+        grade="pass",
+        reasons=[],
+        seconds_mean=1.0,
+        bending_mean=bend,
+    )
+
+
+class TestBands:
+    def test_names_the_smoothest_config_at_a_level_not_the_best_scoring(self):
+        rows = [
+            _cfg(1, 1.0, 0.9),  # the study's optimum, and its roughest field
+            _cfg(2, 1.4, 0.2),  # barely worse, four times smoother -- the point
+            _cfg(3, 5.0, 0.5),
+            _cfg(4, 7.0, 0.4),
+            _cfg(5, 9.0, 0.3),
+            _cfg(6, 11.0, 0.1),
+        ]
+        out = format_bands(rows, 5)
+        first = [ln for ln in out.splitlines() if ln.strip().startswith(("1 ", "2 "))]
+        assert first and first[0].split()[0] == "2", out
+
+    def test_an_empty_level_is_reported_rather_than_skipped(self):
+        """The gap IS the finding: it is where the search never spent a fit."""
+        rows = [_cfg(i, s, 0.5) for i, s in enumerate((1.0, 1.2, 1.4, 9.0, 9.2, 20.0), start=1)]
+        out = format_bands(rows, 5)
+        assert "nothing scored here" in out
+
+    def test_a_backend_with_too_few_configs_is_left_out(self):
+        """Cutting three configs into five levels reports structure that is not there."""
+        assert "demons" not in format_bands([_cfg(1, 1.0, 0.5), _cfg(2, 2.0, 0.4)], 5)
+
+    def test_folded_and_baseline_configs_never_represent_a_level(self):
+        rows = [_cfg(i, float(i), 0.5) for i in range(1, 8)]
+        rows.append(_cfg(99, 1.5, 0.0001))
+        rows[-1].grade = "fail"
+        out = format_bands(rows, 5)
+        assert " 99 " not in out, out

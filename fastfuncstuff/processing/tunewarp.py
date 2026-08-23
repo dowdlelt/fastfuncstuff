@@ -38,8 +38,10 @@ from .tuneopt import (
     SearchSpace,
     config_key,
     frontier_hypervolume,
+    in_band,
     propose,
     scalarize_balanced,
+    score_bands,
 )
 from .tunespec import (
     BACKENDS,
@@ -519,6 +521,10 @@ class AdaptivePlan:
     # crept up 0.3-0.6% per four fits, so 2% per round is "still learning something"
     # and below it is decimal places.
     tol: float = 0.02
+    # Bands of the score range to fill in deliberately instead of chasing the best
+    # setting. 0 is off. See tuneopt.score_bands for what a band is and why the
+    # default search cannot reach them.
+    explore: int = 0
 
 
 def panel_scores(trials: list, panel: list[str]) -> dict[int, float]:
@@ -576,8 +582,14 @@ def _observations(store: TrialStore, backend: str, panel: list[str]) -> list[Obs
     ]
 
 
-def _incumbent(observations: list[Observation]) -> dict | None:
+def _incumbent(
+    observations: list[Observation], band: tuple[float, float] | None = None
+) -> dict | None:
     """Best config so far: feasible ones first, then by the balanced frontier trade.
+
+    With ``band`` set the question is instead "the best config *at this level*",
+    which is the smoothest feasible one inside the band -- exploring rounds must
+    refine around where they are working, not around the global winner.
 
     Which config this is decides where the ladders grow and subdivide, so ranking
     it on similarity alone does not merely mis-report a winner -- it aims the *next*
@@ -587,6 +599,15 @@ def _incumbent(observations: list[Observation]) -> dict | None:
     backing out of. Scoring the incumbent at an even similarity/roughness weight
     keeps the ladders centred on the trade rather than on one end of it.
     """
+    if band is not None:
+        inside = in_band(observations, band)
+        # Falling back to the global incumbent would aim the ladders at the corner
+        # again, which is the one thing an exploring round is not for. An empty band
+        # simply gets no refinement this round; the next batch to land in it will
+        # give the ladders something to centre on.
+        if not inside:
+            return None
+        return min(inside, key=lambda c: (c[2], c[1]))[0]
     if not observations:
         return None
     balanced = scalarize_balanced(observations)
@@ -700,7 +721,20 @@ def run_adaptive(
         best_hv = frontier_hypervolume(prior)
         while spent < plan.budget:
             obs = _observations(store, backend, panel)
-            batch = propose(space, obs, plan.batch, rng)
+            # Bands are recomputed every round rather than fixed at the start: they
+            # are quantiles of what has been measured, so a round that finds a new
+            # best moves the whole ladder with it instead of filling a room whose
+            # floor has since dropped.
+            bands = score_bands(obs, plan.explore) if plan.explore else []
+            band = bands[round_no % len(bands)] if bands else None
+            if band is not None and verb >= 1:
+                held = len(in_band(obs, band))
+                k = round_no % len(bands)
+                print(
+                    f"  exploring band {k + 1}/{len(bands)} "
+                    f"(score {band[0]:+.3f}..{band[1]:+.3f}, {held} config(s) there)"
+                )
+            batch = propose(space, obs, plan.batch, rng, band=band)
             if not batch:
                 # The lattice is exhausted. Growing it is the only way forward,
                 # and if nothing can grow the space is genuinely finished.
@@ -762,7 +796,7 @@ def run_adaptive(
                     )
 
             if plan.expand:
-                incumbent = _incumbent(_observations(store, backend, panel)) or {}
+                incumbent = _incumbent(_observations(store, backend, panel), band) or {}
                 grown = space.grow_toward(incumbent)
                 if grown and verb >= 1:
                     print(f"  expanded: {', '.join(grown)}")
