@@ -199,6 +199,62 @@ def convolve_hrf(
     return design.to(torch.get_default_dtype()).contiguous()
 
 
+def run_lengths_from_starts(run_starts: list[int], n_timepoints: int) -> list[int]:
+    """Per-run TR counts from concatenated run start indices."""
+    run_ends = list(run_starts[1:]) + [n_timepoints]
+    return [end - start for start, end in zip(run_starts, run_ends, strict=True)]
+
+
+def build_task_design(
+    hrf_bases: torch.Tensor,
+    n_timepoints: int,
+    run_starts: list[int],
+    tr: float,
+    microtime_dt: float,
+    microtime_onset: int = 0,
+    event_onsets: list[list[np.ndarray]] | None = None,
+    durations: list[float] | None = None,
+    onsets_microtime: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Convolve stimulus timing with ``hrf_bases``, preferring the event list.
+
+    ``event_onsets`` goes through :func:`build_event_design_microtime`, which
+    preserves event identity when duration boxcars touch or overlap.  The
+    ``onsets_microtime`` fallback exists only for callers that never had the
+    event list (already-sampled onset matrices); it cannot represent touching
+    events.  Every caller that has both should pass both, so the event path is
+    taken and the matrix is ignored.
+    """
+    if event_onsets is not None:
+        design = build_event_design_microtime(
+            all_onsets=event_onsets,
+            durations=list(durations) if durations is not None else [0.0] * len(event_onsets),
+            hrf_bases=hrf_bases,
+            n_timepoints_per_run=run_lengths_from_starts(run_starts, n_timepoints),
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            device=device,
+        )
+    elif onsets_microtime is not None:
+        design = convolve_hrf_microtime(
+            onsets_microtime,
+            hrf_bases,
+            n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            run_starts=run_starts,
+            device=device,
+        )
+    else:
+        raise ValueError("build_task_design needs either event_onsets or onsets_microtime")
+    # return_single_trials is never set here, so both paths return a Tensor.
+    assert isinstance(design, torch.Tensor)
+    return design
+
+
 def convolve_hrf_microtime(
     onsets_microtime: torch.Tensor,
     hrf: torch.Tensor,

@@ -427,10 +427,13 @@ def create_single_trial_design(
         label = f"{condition_labels[cond_idx]}_{repeat_num:03d}"
         trial_labels.append(label)
 
-    from fastfuncstuff.design.matrices import build_event_design_microtime
+    from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
+        run_lengths_from_starts,
+    )
 
-    run_ends = run_starts[1:] + [n_timepoints]
-    n_timepoints_per_run = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
+    n_timepoints_per_run = run_lengths_from_starts(run_starts, n_timepoints)
+    expected_condition_order = [cond_idx for cond_idx, _, _, _ in trial_info]
 
     def _build(hrf_bases: torch.Tensor):
         result = build_event_design_microtime(
@@ -444,6 +447,16 @@ def create_single_trial_design(
             return_single_trials=True,
         )
         assert isinstance(result, tuple)
+        # trial_labels come from the sort above; the columns come from
+        # build_event_design_microtime's own sort. They agree today, but a
+        # label attached to the wrong beta is a silent, unrecoverable error,
+        # so check rather than trust. n_basis columns share each trial.
+        n_per_trial = result[1].shape[1] // len(expected_condition_order)
+        if result[2][::n_per_trial].tolist() != expected_condition_order:
+            raise RuntimeError(
+                "single-trial column order disagrees with trial_labels order; "
+                "the two trial sorts have drifted apart"
+            )
         return result
 
     # Apply HRF convolution (with optional derivatives for SPMG2/SPMG3)

@@ -73,7 +73,7 @@ try:
     from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.hrf_selection import load_nuisance_file  # noqa: F401
-    from fastfuncstuff.design.matrices import convolve_hrf_microtime
+    from fastfuncstuff.design.matrices import build_task_design
     from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
     from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
     from fastfuncstuff.glm.xval import (
@@ -685,32 +685,17 @@ def fit_pathfinder(
     n_conditions = onset_matrix.shape[1]
 
     def _event_design(hrf: torch.Tensor) -> torch.Tensor:
-        if event_onsets is None:
-            design = convolve_hrf_microtime(
-                onset_matrix,
-                hrf,
-                n_timepoints,
-                tr=tr,
-                microtime_dt=microtime_dt,
-                device=device,
-            )
-            assert isinstance(design, torch.Tensor)
-            return design
-        from fastfuncstuff.design.matrices import build_event_design_microtime
-
-        ends = run_starts[1:] + [n_timepoints]
-        run_lengths = [end - start for start, end in zip(run_starts, ends, strict=True)]
-        design = build_event_design_microtime(
-            event_onsets,
-            durations or [0.0] * len(event_onsets),
+        return build_task_design(
             hrf,
-            run_lengths,
+            n_timepoints,
+            run_starts,
             tr=tr,
             microtime_dt=microtime_dt,
+            event_onsets=event_onsets,
+            durations=durations,
+            onsets_microtime=onset_matrix,
             device=device,
         )
-        assert isinstance(design, torch.Tensor)
-        return design
 
     if verbose:
         print("=" * 70)

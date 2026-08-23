@@ -1263,12 +1263,14 @@ def _slice_full_length_per_run(
 
 
 def run_lengths_from_starts(run_starts: list[int], n_timepoints: int) -> list[int]:
-    """Per-run TR counts implied by ``run_starts`` and the concatenated length."""
-    n_runs = len(run_starts)
-    return [
-        (run_starts[i + 1] if i < n_runs - 1 else n_timepoints) - run_starts[i]
-        for i in range(n_runs)
-    ]
+    """Per-run TR counts implied by ``run_starts`` and the concatenated length.
+
+    Re-exported from :mod:`fastfuncstuff.design.matrices` so CLI and library
+    code cannot drift apart on how runs are split.
+    """
+    from fastfuncstuff.design.matrices import run_lengths_from_starts as _impl
+
+    return _impl(run_starts, n_timepoints)
 
 
 def make_nuisance_block_from_full_length(
@@ -3274,26 +3276,22 @@ def build_task_design_from_args(
 
     from fastfuncstuff.design.hrf import get_hrf_library, get_spmg1_hrf
     from fastfuncstuff.design.matrices import (
-        build_event_design_microtime,
+        build_task_design,
         make_fir_design,
         make_tent_design,
     )
 
-    run_ends = run_starts[1:] + [n_timepoints]
-    n_timepoints_per_run = [end - start for start, end in zip(run_starts, run_ends, strict=True)]
-
     def _event_design(hrf_bases: torch.Tensor) -> torch.Tensor:
-        design = build_event_design_microtime(
-            all_onsets=all_onsets,
-            durations=stim_durations,
-            hrf_bases=hrf_bases,
-            n_timepoints_per_run=n_timepoints_per_run,
+        return build_task_design(
+            hrf_bases,
+            n_timepoints,
+            run_starts,
             tr=tr,
             microtime_dt=microtime_dt,
+            event_onsets=all_onsets,
+            durations=stim_durations,
             device=device,
         )
-        assert isinstance(design, torch.Tensor)
-        return design
 
     if hrf_opt:
         # Per-voxel HRF mode: build designs_by_hrf dict

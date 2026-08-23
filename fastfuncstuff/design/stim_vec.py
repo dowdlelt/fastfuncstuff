@@ -131,8 +131,8 @@ def _load_per_run_segments(
     form is a convenience for people whose stimulus is generated alongside each
     run, not a different model.
     """
-    from fastfuncstuff.cli_utils import run_lengths_from_starts
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
+    from fastfuncstuff.design.matrices import run_lengths_from_starts
     from fastfuncstuff.design.trim import trim_run_series
 
     lengths = run_lengths_from_starts(run_starts, n_timepoints)

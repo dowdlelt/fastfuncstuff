@@ -143,8 +143,10 @@ def test_condition_level_library_uses_raw_events_not_binary_regions(monkeypatch)
     def _legacy_path_is_a_bug(*args, **kwargs):
         raise AssertionError("raw events unexpectedly fell back to binary-region convolution")
 
+    # Patch at the definition, not at an import alias, so the legacy path is
+    # caught wherever in the library it might be reached from.
     monkeypatch.setattr(
-        "fastfuncstuff.design.hrf_selection.convolve_hrf_microtime", _legacy_path_is_a_bug
+        "fastfuncstuff.design.matrices.convolve_hrf_microtime", _legacy_path_is_a_bug
     )
     result = fit_glm_hrf_library_with_xval(
         data=data,
