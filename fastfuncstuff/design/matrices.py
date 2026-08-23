@@ -149,33 +149,65 @@ def build_event_design_microtime(
 
     run_start_tr = 0
     run_offsets = []
+    run_sample_bins = []
     for n_run_tp in n_timepoints_per_run:
         run_offsets.append(run_start_tr)
         run_start_tr += n_run_tp
-
-    for trial_idx, (run_idx, onset, cond_idx) in enumerate(events):
-        n_run_tp = n_timepoints_per_run[run_idx]
-        n_run_bins = n_run_tp * bins_per_tr
-        sample_bins = torch.arange(
-            microtime_onset, n_run_bins, bins_per_tr, device=device, dtype=torch.long
+        run_sample_bins.append(
+            torch.arange(
+                microtime_onset,
+                n_run_tp * bins_per_tr,
+                bins_per_tr,
+                device=device,
+                dtype=torch.long,
+            )
         )
-        onset_bin = int(np.round(onset / microtime_dt))
+
+    if return_single_trials:
+        # One id per COLUMN, not per trial: the n_basis columns of a trial each
+        # carry that trial's condition and run.
+        trial_condition_ids = [cond_idx for _, _, cond_idx in events for _ in range(n_basis)]
+        trial_run_ids = [run_idx for run_idx, _, _ in events for _ in range(n_basis)]
+
+    # Events sharing a run and condition share a kernel, so they are gathered as
+    # one batch: sampling never materialises the microtime run buffer, it reads
+    # the kernel at (sample_bin - onset_bin).  A per-event Python loop here cost
+    # ~6000 tiny kernel launches on a real run list, which made a CUDA device
+    # about 3x SLOWER than CPU for design construction.
+    groups: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    for trial_idx, (run_idx, onset, cond_idx) in enumerate(events):
+        groups.setdefault((run_idx, cond_idx), []).append(
+            (int(np.round(onset / microtime_dt)), trial_idx)
+        )
+
+    for (run_idx, cond_idx), members in groups.items():
+        n_run_tp = n_timepoints_per_run[run_idx]
+        start = run_offsets[run_idx]
+        sample_bins = run_sample_bins[run_idx]
+        onset_bins = torch.tensor(
+            [onset_bin for onset_bin, _ in members], device=device, dtype=torch.long
+        )
+        trial_idxs = [trial_idx for _, trial_idx in members]
+
+        # (n_events, n_timepoints) offsets into the response kernel.
+        offsets = sample_bins.unsqueeze(0) - onset_bins.unsqueeze(1)
         for basis_idx, response_kernel in enumerate(responses[cond_idx]):
-            response = torch.zeros(n_run_bins, device=device, dtype=bases.dtype)
-            dst0 = max(0, onset_bin)
-            src0 = max(0, -onset_bin)
-            n_copy = min(n_run_bins - dst0, response_kernel.numel() - src0)
-            if n_copy > 0:
-                response[dst0 : dst0 + n_copy] = response_kernel[src0 : src0 + n_copy]
-            sampled = response[sample_bins]
+            n_kernel = response_kernel.numel()
+            valid = (offsets >= 0) & (offsets < n_kernel)
+            sampled = torch.where(
+                valid,
+                response_kernel[offsets.clamp(0, n_kernel - 1)],
+                torch.zeros((), device=device, dtype=bases.dtype),
+            )
             cond_col = cond_idx * n_basis + basis_idx
-            start = run_offsets[run_idx]
-            condition_design[start : start + n_run_tp, cond_col] += sampled
+            condition_design[start : start + n_run_tp, cond_col] += sampled.sum(dim=0)
             if trial_design is not None:
-                trial_col = trial_idx * n_basis + basis_idx
-                trial_design[start : start + n_run_tp, trial_col] = sampled
-                trial_condition_ids.append(cond_idx)
-                trial_run_ids.append(run_idx)
+                trial_cols = torch.tensor(
+                    [trial_idx * n_basis + basis_idx for trial_idx in trial_idxs],
+                    device=device,
+                    dtype=torch.long,
+                )
+                trial_design[start : start + n_run_tp].index_copy_(1, trial_cols, sampled.T)
 
     if trial_design is None:
         return condition_design
