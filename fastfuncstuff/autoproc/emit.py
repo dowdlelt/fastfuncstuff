@@ -946,10 +946,15 @@ def _qc_anat(plan: Plan) -> str:
     alignment check, as the two images that are supposed to overlay."""
     if not (_qc_on(plan) and _own_anat(plan.options)):
         return ""
+    src = effective_anat_source(plan)
     items: QCItems = [
         (_anat_box(), "anat"),
-        (_al_anat(plan), f"{effective_anat_source(plan)}_al_anat"),
+        (_al_anat(plan), f"{src}_al_anat"),
     ]
+    if plan.options.anat_nonlin:
+        # Both states, so the nonlinear link is visible as the step between them —
+        # and so the one the final grid is built from is the one you can see.
+        items.append((_al_anat_nl(plan), f"{src}_al_anat_nl"))
     return _qc_block("EPI → anat", [_qc_call(_qc_stem("anat"), items)])
 
 
@@ -2284,6 +2289,7 @@ def _stage_anat(plan: Plan) -> str:
             f'if [ "$skip_anat" -ne 1 ] || [ ! -f "stage09.nlanat_invwarp.nii$FMT" ]; then\n'
             f"{seg}\nfi"
         )
+        out.append(_anat_nl_anchor_call(plan))
     out.append(_qc_anat(plan))
     return "\n".join(p for p in out if p) + "\n"
 
@@ -2374,8 +2380,75 @@ def _al_anat(plan: Plan) -> str:
 
     Named for the source that made it (``stage09.grandmean_al_anat``,
     ``stage09.sbmean_al_anat``, …): it is EPI data sitting on the anat grid, not
-    an anatomical, and the distinction decides what you should be looking at."""
+    an anatomical, and the distinction decides what you should be looking at.
+
+    This one is the AFFINE result — ffs_allineate's own output, which is what the
+    cross-modal alignment QC wants to show. With -anat_nonlin it is NOT the state
+    the data ends up in; see :func:`_al_anat_nl`."""
     return f"stage09.{effective_anat_source(plan)}_al_anat.nii$FMT"
+
+
+def _al_anat_nl(plan: Plan) -> str:
+    """The same anchor with the nonlinear anat link applied too (-anat_nonlin).
+
+    ``anat_nl`` (the ffs_segment invwarp) is estimated *after* the affine, so
+    ffs_allineate's ``_al_anat`` output is one link short of what every run's
+    CHAIN actually does. That link is a real, PE-axis-only deformation of several
+    voxels, so an ``_al_anat`` derived grid/mask/QC describes a brain shape the
+    data never lands in. This image is the anchor pushed through the whole head
+    of the chain, and is what stage10a boxes, masks and QCs against."""
+    return f"stage09.{effective_anat_source(plan)}_al_anat_nl.nii$FMT"
+
+
+def _anat_head_chain(plan: Plan) -> list[str]:
+    """The chain links that act at or above ``anat_nl`` — the ones the anat-source
+    anchor still needs.
+
+    The anchor already has everything below ``anat_nl`` baked in (it lives on the
+    grandmean/reference-session grid), so applying exactly this head slice puts it
+    where the data ends up. Resolved through :func:`chain_files` off a run's own
+    ``warp_chain``, so the borrowed-matrix and external-reference modes get their
+    extra links (``xref_*``) for free instead of being special-cased."""
+    if not plan.runs:
+        return []
+    pr = plan.runs[0]
+    toks = list(pr.warp_chain)
+    if "anat_nl" not in toks:
+        return []
+    head = toks[: toks.index("anat_nl") + 1]
+    return chain_files(pr, ".nii$FMT", plan.options, tokens=head)
+
+
+def _anat_nl_anchor_call(plan: Plan) -> str:
+    """The ffs_nwarp that builds :func:`_al_anat_nl`, or "" when there is nothing
+    to apply.
+
+    Only for a locally-computed anat: the borrowing modes take their grid from the
+    reference results dir, so the link that matters there is the *reference's*
+    anat_nl, already baked into the image :func:`_final_master` globs."""
+    if not (plan.options.anat_nonlin and _own_anat(plan.options)):
+        return ""
+    head = _anat_head_chain(plan)
+    if not head:
+        return ""
+    out = _al_anat_nl(plan)
+    call = _ffs(
+        "ffs_nwarp",
+        [
+            f'-source "{_anat_source_image(plan)}"',
+            f'-nwarp "{" ".join(head)}"',
+            f'-master "{_anat_box()}"',
+            *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+            f'-prefix "{out}"',
+            '-device "$DEVICE"',
+        ],
+    )
+    return (
+        "# The anchor through the SAME head-of-chain the data gets (affine + the\n"
+        "# segment invwarp). ffs_allineate's _al_anat stops at the affine, so it is\n"
+        "# the wrong shape to box the output grid or automask from.\n"
+        f'[ -f "{out}" ] || \\\n{call}'
+    )
 
 
 def _final_master(plan: Plan) -> str:
@@ -2394,8 +2467,13 @@ def _final_master(plan: Plan) -> str:
         gr = opt.grand_reference.rstrip("/")
         # `|| true` so a miss leaves MASTER empty for the guard below to report,
         # rather than tripping `set -o pipefail` with no explanation.
-        return f"$(ls {gr}/stage09.*_al_anat.nii* 2>/dev/null | head -1 || true)"
-    return _al_anat(plan)
+        # _al_anat_nl first: with -anat_nonlin that is the shape the reference's
+        # own data landed in, and the affine-only _al_anat is one link short of it.
+        return (
+            f"$(ls {gr}/stage09.*_al_anat_nl.nii* {gr}/stage09.*_al_anat.nii* "
+            "2>/dev/null | head -1 || true)"
+        )
+    return _al_anat_nl(plan) if opt.anat_nonlin else _al_anat(plan)
 
 
 def _final_dxyz_default(plan: Plan) -> str:
@@ -2413,7 +2491,11 @@ def _stage_warpmaster(plan: Plan) -> str:
 
     The warpmaster is the anat-space EPI target autoboxed to the EPI's own
     coverage and resampled to the EPI voxel size — it fixes the exact position +
-    spacing every run's timeseries lands on (stage10 ``-master``). The EPI FOV is
+    spacing every run's timeseries lands on (stage10 ``-master``). That target has
+    to be the anchor in the state the *data* ends up in: with -anat_nonlin it is
+    :func:`_al_anat_nl`, not ffs_allineate's affine-only ``_al_anat``, or the
+    output FOV, the automask and the final QC's sub-brick 0 all describe a brain
+    shape several PE-axis voxels away from the one the runs land in. The EPI FOV is
     usually a slab, not the whole head, so this crop is what keeps the output from
     carrying the anat's empty space. epi_mask is a dilated automask on that grid,
     used to mask the GLM. Two anat underlays come out of this: the whole-brain

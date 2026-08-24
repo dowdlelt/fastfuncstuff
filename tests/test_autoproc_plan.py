@@ -1769,3 +1769,33 @@ def test_every_backend_baseline_is_spelled_correctly():
         for stage in config.NL_STAGE_KEYS:
             errs = optcheck.check_opts(stage, config.nl_stage_opts(backend, stage), module=module)
             assert not errs, errs
+
+
+def test_warpmaster_anchor_carries_the_nonlinear_anat_link():
+    """The grid/mask/QC anchor must be in the shape the DATA ends up in.
+
+    ffs_allineate's ``_al_anat`` stops at the affine, but with -anat_nonlin every
+    run's CHAIN also gets the segment invwarp — a real PE-axis deformation. Boxing
+    and automasking the affine-only image gave an output FOV and a GLM mask for a
+    brain shape nothing lands in, and put a differently-distorted sub-brick 0 at
+    the head of the final QC stack. Bug of record: sub-3001 ses-fast, ±6.1 mm.
+    """
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
+    nl_plan = build_plan(subj, Options(go_to_anat=True, anat_nonlin=True, tpm="/tpm.nii.gz"))
+    nl = write_script(nl_plan, "wd", bids_root="/bids")
+    anchor = '-source "stage08.grandmean.nii$FMT"'
+    # The nl anchor is built from the SAME source allineate took, through the head
+    # of the chain (affine + invwarp), onto the anat grid.
+    assert '-prefix "stage09.grandmean_al_anat_nl.nii$FMT"' in nl
+    assert '-nwarp "stage09.anat.aff12.1D stage09.nlanat_invwarp.nii$FMT"' in nl
+    assert nl.count(anchor) >= 2  # allineate's source and the nwarp's are one image
+    # ... and it, not the affine-only image, is what the grid and mask come from.
+    assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_anat_nl.nii$FMT}"' in nl
+    # Its links are exactly the head of a run's chain, in order.
+    chain = _chain(nl_plan, ("01", "foo", "1"))
+    assert chain[: chain.index("anat_nl") + 1] == ["anat_lin", "anat_nl"]
+
+    # Affine-only pipeline: no extra image, and the affine anchor still rules.
+    lin = write_script(build_plan(subj, Options(go_to_anat=True)), "wd", bids_root="/bids")
+    assert "_al_anat_nl" not in lin
+    assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_anat.nii$FMT}"' in lin
