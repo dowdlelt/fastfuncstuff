@@ -1172,3 +1172,73 @@ class TestZeroVarianceVoxelHandling:
                 device=torch.device("cpu"),
                 verbose=False,
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-run accumulation in _evaluate_hrfs_batched (LORO path)
+# ---------------------------------------------------------------------------
+# The LORO path used to concatenate the training data for every fold — a copy
+# of the whole dataset, per fold. It now accumulates per run and subtracts the
+# held-out runs. FFS_HRF_XVAL_LEGACY=1 restores the original loop, which is what
+# these tests compare against.
+
+
+def _hrf_batched_case(n_designs=4, rank_deficient=False, seed=7):
+    torch.manual_seed(seed)
+    n_runs, tp, n_vox, n_stim = 5, 40, 90, 3
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+
+    designs = []
+    for d in range(n_designs):
+        design = torch.zeros(n_tp, n_stim)
+        for c in range(n_stim):
+            design[(c + d + 1) :: (5 + c), c] = 1.0
+        if rank_deficient and d == 1:
+            # Exact collinearity: the solve must still give the minimum-norm
+            # answer, as the explicit pinv over the design did.
+            design[:, n_stim - 1] = design[:, 0]
+        designs.append(design)
+
+    data = torch.randn(n_vox, n_tp) * 0.4 + torch.randn(n_vox, n_stim) @ designs[0].T
+    return data, designs, run_starts
+
+
+@pytest.mark.parametrize(
+    "cv_strategy,n_perms,n_designs,rank_deficient,chunk_size",
+    [
+        (1, 100, 4, False, None),  # LORO: the rewritten path
+        (1, 100, 4, True, None),  # rank-deficient design
+        (1, 100, 4, False, 19),  # multiple voxel chunks
+        (1, 100, 1, False, None),  # single design
+        (0.6, 5, 4, False, None),  # split-half: Path B, untouched
+        (2, 6, 4, False, None),  # leave-2-out: Path B, untouched
+    ],
+)
+def test_evaluate_hrfs_batched_per_run_matches_legacy(
+    monkeypatch, cv_strategy, n_perms, n_designs, rank_deficient, chunk_size
+):
+    """Per-run accumulation must reproduce the fold-outer loop."""
+    from fastfuncstuff.design.hrf_selection import _evaluate_hrfs_batched
+    from fastfuncstuff.glm.xval import generate_cv_splits
+
+    data, designs, run_starts = _hrf_batched_case(n_designs, rank_deficient)
+    splits = generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms)
+    kwargs = dict(
+        projected_data=data,
+        projected_designs=designs,
+        run_starts=run_starts,
+        cv_splits=splits,
+        device=torch.device("cpu"),
+        metric="cod",
+        chunk_size=chunk_size,
+        verbose=False,
+    )
+
+    monkeypatch.delenv("FFS_HRF_XVAL_LEGACY", raising=False)
+    fast = _evaluate_hrfs_batched(**kwargs)
+
+    monkeypatch.setenv("FFS_HRF_XVAL_LEGACY", "1")
+    legacy = _evaluate_hrfs_batched(**kwargs)
+
+    assert torch.abs(fast - legacy).max() < 1e-4

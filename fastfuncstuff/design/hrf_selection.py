@@ -11,6 +11,7 @@ Key function: fit_glm_hrf_library_with_xval()
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -288,6 +289,7 @@ def _evaluate_hrfs_batched(
 
     # Pre-slice data by runs (views, no copy)
     run_ends = run_starts[1:] + [n_timepoints]
+    n_runs = len(run_starts)
     data_by_run = [projected_data[:, s:e] for s, e in zip(run_starts, run_ends, strict=False)]
 
     # Pre-slice designs by runs
@@ -326,6 +328,90 @@ def _evaluate_hrfs_batched(
         if verbose:
             data_loc = "GPU" if data_on_device else "CPU (streaming chunks to GPU)"
             print(f"  Compute device: {device} | Data: {data_loc}")
+
+        # ------------------------------------------------------------------
+        # Per-run accumulation: a fold never materialises its training data
+        # ------------------------------------------------------------------
+        # betas = pinv(X_train) @ y_train is identically (X'X)^+ (X'y), and both
+        # X'X and X'y are sums over runs. CV splits are complementary, so each
+        # fold is the all-run total minus its held-out runs. That removes the
+        # per-fold `cat` of the training data — which was a copy of the whole
+        # dataset, for every fold — and shrinks the pseudo-inverse from
+        # (n_train_timepoints x n_reg) to (n_reg x n_reg).
+        #
+        # FFS_HRF_XVAL_LEGACY=1 forces the original fold-outer loop.
+        if os.environ.get("FFS_HRF_XVAL_LEGACY", "") != "1":
+            n_reg = projected_designs[0].shape[1]
+            # (n_designs, run_length, n_reg) per run, so one batched matmul
+            # serves every design at once.
+            designs_stack_by_run = [
+                torch.stack([designs_by_run[d][r] for d in range(n_designs)], dim=0).to(device)
+                for r in range(n_runs)
+            ]
+
+            # Normal-equation blocks per run, in float64: forming X'X squares the
+            # condition number, and these matrices are tiny, so the promotion is
+            # free insurance. Rank-deficient designs (missing events) still get
+            # the minimum-norm solution via pinv, as pinv(X) == (X'X)^+ X'.
+            xtx_by_run = [
+                torch.matmul(stack.transpose(1, 2).double(), stack.double())
+                for stack in designs_stack_by_run
+            ]
+            xtx_total = torch.stack(xtx_by_run, dim=0).sum(dim=0)  # (n_designs, n_reg, n_reg)
+
+            fold_plans = []
+            for _train_runs, test_runs in cv_splits:
+                xtx_train = xtx_total.clone()
+                for r in test_runs:
+                    xtx_train -= xtx_by_run[r]
+                # Small enough that CPU float64 is both fast and the most robust
+                # place to factor (also sidesteps the MPS pinv fallback).
+                pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device)
+                test_stack = torch.cat(
+                    [designs_stack_by_run[r] for r in test_runs], dim=1
+                )  # (n_designs, n_test_tps, n_reg)
+                fold_plans.append((test_runs, pinv_xtx, test_stack))
+
+            for cs in range(0, n_voxels, chunk_size):
+                ce = min(cs + chunk_size, n_voxels)
+
+                # Pass 1: X'y over every run, so no fold touches the training data
+                xty_total = torch.zeros(
+                    n_designs, n_reg, ce - cs, dtype=torch.float64, device=device
+                )
+                for r in range(n_runs):
+                    y_run = data_by_run[r][cs:ce].to(device)
+                    xty_total += torch.matmul(
+                        designs_stack_by_run[r].transpose(1, 2).double(), y_run.T.double()
+                    )
+                    del y_run
+
+                # Pass 2: folds, touching only their held-out runs
+                for test_runs, pinv_xtx, test_stack in fold_plans:
+                    y_test = torch.cat([data_by_run[r][cs:ce] for r in test_runs], dim=1).to(device)
+                    xty_test = torch.matmul(test_stack.transpose(1, 2).double(), y_test.T.double())
+                    betas = torch.matmul(pinv_xtx, xty_total - xty_test).float()
+
+                    # Per design rather than batched: yhat for all designs at once
+                    # would be (n_designs, n_test_tps, chunk), which is the one
+                    # tensor here big enough to matter.
+                    for d_idx in range(n_designs):
+                        yhat = torch.matmul(test_stack[d_idx], betas[d_idx]).T  # (chunk, T_test)
+                        resid = y_test - yhat
+                        sum_ss_res[cs:ce, d_idx] += (
+                            (resid * resid).sum(dim=1).to(accumulator_device)
+                        )
+                        del yhat, resid
+
+                    del y_test, xty_test, betas
+
+                del xty_total
+
+            del designs_stack_by_run, xtx_by_run, fold_plans
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+            return (1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)).cpu()
 
         split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
         for train_runs, test_runs in split_iter:
