@@ -2051,7 +2051,7 @@ def fit_denoising_model(
     return_loadings: bool = False,
     polort: int | None = 2,
     pcstop: float = 1.05,
-    pcR2cutoff: float | None = None,
+    pcR2cutoff: float | None = 0.05,
     noise_method: Literal["pca", "ica"] = "pca",
     auto_component_caps: bool = False,
     auto_component_estimate_max: int | None = None,
@@ -2126,21 +2126,23 @@ def fit_denoising_model(
           E.g., 1.05 means stop when within 5% of max (default, more robust).
         - If < 0: Use exactly abs(pcstop) PCs (user override).
         - If == 1.0: Use pure argmax (pick maximum).
-    pcR2cutoff : float, optional
-        R² cutoff for PC count selection. If provided, only voxels that achieve
+    pcR2cutoff : float, optional, default=0.05
+        R² cutoff for PC count selection: only voxels that achieve
         R² > pcR2cutoff in at least one PC count are used for computing the
         selection curve. This is more robust than using all criteria voxels
         because it focuses on voxels that actually respond to denoising.
-        GLMdenoise default is 0.05.
+        The default matches GLMdenoise. Passing 0 (or None) selects on every
+        voxel with any positive R², which on noisy data is nearly the whole
+        brain and flattens the selection curve.
     min_noise_voxels : int, default=100
         Minimum voxels required in noise pool
     max_noise_fraction : float, default=0.95
         Maximum fraction of voxels in noise pool
     polort : int, default=2
-        Polynomial order to project out from noise pool before PCA.
-        This prevents slow drift from dominating extracted components.
         Unused. Kept for API compatibility: drift is supplied by the caller in
         ``nuisance`` (per run), never built here.
+        Polynomial order to project out from noise pool before PCA.
+        This prevents slow drift from dominating extracted components.
         Set to -1 to disable polynomial projection.
     cv_strategy : int or float, default=1
         Cross-validation strategy:
@@ -2184,12 +2186,12 @@ def fit_denoising_model(
     """
     device = device or get_device()
 
+    from tqdm import tqdm
+
     # Validate inputs
     if design_matrix is None and designs_by_hrf is None:
         raise ValueError("Either design_matrix or designs_by_hrf must be provided")
     if run_starts is None:
-    from tqdm import tqdm
-
         raise ValueError("run_starts must be provided")
 
     if design_matrix is not None and designs_by_hrf is not None:
@@ -2224,8 +2226,6 @@ def fit_denoising_model(
                 nuisance_per_run.append(nuisance[start_tp:end_tp, :])
 
     if verbose:
-        print(f"\n{'=' * 70}")
-    if verbose:
         # Report the drift/nuisance the model will actually use. This function
         # never builds drift itself -- the caller supplies it per run, and
         # ffs_denoise picks each run's degree from that run's own duration, so
@@ -2242,6 +2242,8 @@ def fit_denoising_model(
                     f"(varies with run length across {n_runs} runs)"
                 )
 
+    if verbose:
+        print(f"\n{'=' * 70}")
         if per_hrf_mode:
             print("Cross-Validated Denoising Pipeline (Per-Voxel HRF Mode)")
         else:
@@ -2282,9 +2284,9 @@ def fit_denoising_model(
             disable=not verbose or len(unique_hrf_indices) < 2,
         )
         for hrf_idx in group_iter:
-            group_iter.set_postfix_str(f"HRF {hrf_idx}: {n_voxels_group:,} vox")
             voxel_mask = hrf_indices == hrf_idx
             n_voxels_group = voxel_mask.sum().item()
+            group_iter.set_postfix_str(f"HRF {hrf_idx}: {n_voxels_group:,} vox")
 
             # Data may live on CPU while the compute device is CUDA (datasets too
             # large for VRAM); the selection mask has to follow the data, not the
@@ -2733,10 +2735,10 @@ def fit_denoising_model(
                 n_perms=n_perms,
                 chunk_size=chunk_size,
                 preload_data_to_device=preload_data_to_device,
-                progress_desc=f"    HRF {hrf_idx} ({n_voxels_group:,} vox)",
-                progress_leave=False,
                 device=device,
                 verbose=False,  # Suppress per-group verbosity
+                progress_desc=f"    HRF {hrf_idx} ({n_voxels_group:,} vox)",
+                progress_leave=False,
             )
 
             # Scatter results back to full array
@@ -2799,6 +2801,9 @@ def fit_denoising_model(
             )
 
         if n_selected > 0:
+            # criteria_mask_final is exactly "R² > pcR2cutoff in any PC count",
+            # so it is the selection mask the caller is promised.
+            pcselection_mask = criteria_mask_final
             r2_by_n_components = np.median(r2_criteria, axis=0)
             r2_median_by_n_components = r2_by_n_components
 

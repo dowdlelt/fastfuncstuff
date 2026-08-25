@@ -324,10 +324,11 @@ Notes:
     denoise_opts.add_argument(
         "-pcR2cutoff",
         type=float,
-        default=None,
-        help="R² cutoff for PC selection (GLMdenoise default: 0.05). "
-        "If set, only voxels with max R² > cutoff across any PC count are used "
-        "to compute the selection curve. More robust to noisy voxels.",
+        default=0.05,
+        help="R² cutoff for PC selection (default: 0.05, matching GLMdenoise). "
+        "Only voxels with max R² > cutoff across any PC count are used "
+        "to compute the selection curve. More robust to noisy voxels. "
+        "Use 0 to select on every voxel with any positive R².",
     )
     denoise_opts.add_argument(
         "-brainthresh",
