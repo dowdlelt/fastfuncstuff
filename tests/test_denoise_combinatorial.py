@@ -958,3 +958,75 @@ class TestWholeBrainPcSource:
         assert abs_corr(pool_pcs[:, 0], brain_pcs[:, 0]) < 0.5, (
             "the two PC sources must differ, or guarding the baseline is pointless"
         )
+
+
+# ---------------------------------------------------------------------------
+# Q-based combination evaluation
+# ---------------------------------------------------------------------------
+# evaluate_all_combinations_for_run used to build an explicit (T, T) projector
+# per PC combination. It now factors the polynomial part out once and expresses
+# every combination-dependent term as a (k x V) projection.
+# FFS_COMBO_LEGACY=1 restores the explicit-projector version.
+
+
+def _combo_eval_case(T=60, k=4, V=50, n_cond=3, n_poly=4, zero_poly=False):
+    import numpy as np
+
+    torch.manual_seed(3)
+    design = torch.zeros(T, n_cond)
+    for c in range(n_cond):
+        design[(c + 1) :: (5 + c), c] = 1.0
+    if n_poly > 0:
+        poly = torch.stack([torch.linspace(-1, 1, T) ** d for d in range(n_poly)], dim=1)
+    else:
+        poly = torch.zeros(T, 0)
+    if zero_poly:
+        poly = torch.zeros_like(poly)  # all-zero columns are stripped as degenerate
+    return dict(
+        run_data_criteria=torch.randn(V, T),
+        run_design=design,
+        betas_criteria=torch.randn(V, n_cond),
+        poly_nuisance=poly,
+        noise_pcs=torch.randn(T, k),
+        variance_ratios=np.linspace(0.1, 0.01, k),
+    )
+
+
+@pytest.mark.parametrize(
+    "k,n_cond,n_poly,zero_poly,chunk",
+    [
+        (4, 3, 4, False, None),
+        (6, 3, 4, False, None),  # 64 combinations
+        (4, 3, 0, False, None),  # no polynomial nuisance at all
+        (4, 1, 4, False, None),  # single condition
+        (4, 3, 4, True, None),  # polynomial columns all zero
+        (4, 3, 4, False, 7),  # multiple voxel chunks
+    ],
+)
+def test_evaluate_all_combinations_q_based_matches_legacy(
+    monkeypatch, k, n_cond, n_poly, zero_poly, chunk
+):
+    """Q-based projection must reproduce the explicit (T, T) projector result."""
+    from fastfuncstuff.denoise.combinatorial import (
+        evaluate_all_combinations_for_run,
+        generate_all_pc_combinations,
+    )
+
+    case = _combo_eval_case(k=k, n_cond=n_cond, n_poly=n_poly, zero_poly=zero_poly)
+    call = dict(
+        **case,
+        combinations=generate_all_pc_combinations(k),
+        device=torch.device("cpu"),
+        criteria_chunk_size=chunk,
+        verbose=False,
+        return_raw_cod=True,
+    )
+
+    monkeypatch.delenv("FFS_COMBO_LEGACY", raising=False)
+    fast_cod, fast_var = evaluate_all_combinations_for_run(**call)
+
+    monkeypatch.setenv("FFS_COMBO_LEGACY", "1")
+    legacy_cod, legacy_var = evaluate_all_combinations_for_run(**call)
+
+    assert np.abs(fast_cod - legacy_cod).max() < 1e-4
+    assert np.allclose(fast_var, legacy_var)

@@ -18,6 +18,7 @@ Algorithm (per outer fold):
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from itertools import combinations as itertools_combinations
 
@@ -52,8 +53,11 @@ def _combination_work_chunks(
     combo_batch = max(1, min(n_combos, 512, int(available * 0.35) // projection_bytes))
     transient_bytes_per_voxel = max(combo_batch * (3 * n_timepoints + 4) * 4, 1)
     voxel_cap = cfg.max_chunk_size_gpu if device.type in {"cuda", "mps"} else cfg.max_chunk_size_cpu
-    voxel_chunk = max(1, min(n_voxels, voxel_cap, int(available * 0.55) // transient_bytes_per_voxel))
+    voxel_chunk = max(
+        1, min(n_voxels, voxel_cap, int(available * 0.55) // transient_bytes_per_voxel)
+    )
     return combo_batch, voxel_chunk
+
 
 # ============================================================================
 # Data structures
@@ -285,6 +289,125 @@ def evaluate_all_combinations_for_run(
         poly_nuis_clean = poly_nuis[:, nonzero_cols]
     else:
         poly_nuis_clean = torch.zeros(T, 0, device=device)
+
+    # =========================================================================
+    # Q-based projection (no explicit T x T projectors)
+    # =========================================================================
+    # The projector onto the complement of span(poly u PCs) factorises:
+    #     P = (I - Q_S Q_S')(I - Q_poly Q_poly')
+    # where Q_S is an orthonormal basis of the *poly-projected* PC subset. So
+    # the polynomial part is removed once, up front, instead of being rebuilt
+    # inside every one of the 2^k combination projectors -- and each combination
+    # only ever needs its (T x |S|) basis, never a (T x T) matrix.
+    #
+    # Cost per combination drops from O(T^2 * V) to O(T * |S| * V), and the
+    # batch's memory from B*T*T to B*T*k (a factor of ~T/k), which lets far more
+    # combinations share a batch.
+    #
+    # FFS_COMBO_LEGACY=1 restores the explicit-projector implementation.
+    if os.environ.get("FFS_COMBO_LEGACY", "") != "1":
+        if poly_nuis_clean.shape[1] > 0:
+            q_poly, _ = torch.linalg.qr(poly_nuis_clean)
+        else:
+            q_poly = None
+
+        def _strip_poly(mat: torch.Tensor) -> torch.Tensor:
+            """Remove the polynomial subspace from (T, m) columns."""
+            if q_poly is None:
+                return mat
+            return mat - q_poly @ (q_poly.T @ mat)
+
+        design_poly = _strip_poly(design)
+        pcs_poly = _strip_poly(pcs)  # (T, k)
+        k_pcs = pcs_poly.shape[1]
+
+        # Orthonormal basis per combination, zero-padded to k columns so that
+        # combinations of different sizes share one batched tensor (zero columns
+        # contribute nothing to Q Q'). Grouping by subset size lets the QR itself
+        # be batched: k+1 calls instead of 2^k.
+        q_by_combo = torch.zeros(n_combos, T, max(k_pcs, 1), device=device)
+        size_groups: dict[int, list[int]] = {}
+        for ci, combo in enumerate(combinations):
+            size_groups.setdefault(len(combo), []).append(ci)
+
+        for size, combo_ids in size_groups.items():
+            if size == 0:
+                continue  # empty combination: poly-only, Q stays all-zero
+            cols = torch.tensor(
+                [combinations[ci] for ci in combo_ids], dtype=torch.long, device=device
+            )  # (n_group, size)
+            sub = pcs_poly[:, cols.reshape(-1)].T.reshape(len(combo_ids), size, T)
+            sub = sub.transpose(1, 2)  # (n_group, T, size)
+            q_group, _ = torch.linalg.qr(sub)
+            idx = torch.tensor(combo_ids, dtype=torch.long, device=device)
+            q_by_combo[idx, :, :size] = q_group
+
+        all_cod = torch.zeros(n_combos, V_criteria, device="cpu")
+
+        # The residual never depends on the combination. With
+        #     e = dp - design_poly @ betas          (poly-projected residual)
+        # the cleaned residual is just (I - Q Q') e, so
+        #     SS_res = ||e||^2 - ||Q' e||^2
+        #     SS_tot = ||dp||^2 - ||Q' dp||^2 - T * mean^2
+        # Every combination-dependent term is therefore a (k x V) projection,
+        # never a (T x V) cleaned timeseries. That removes the (B, T, V)
+        # intermediates entirely -- which is where the time actually went, since
+        # those reductions are bandwidth-bound, not flop-bound.
+        #
+        # Voxel chunk outer, combinations inner: the chunk is uploaded and its
+        # poly projection and residual computed once, then shared by every
+        # combination batch, instead of being redone for each of them.
+        q_all_t = q_by_combo.transpose(1, 2)  # (n_combos, k, T)
+        q_all_col_sums = q_by_combo.sum(dim=1)  # (n_combos, k) == Q' 1
+
+        chunk_iter = range(0, V_criteria, chunk_size)
+        for chunk_start in tqdm(
+            list(chunk_iter), desc="  Evaluating combos", leave=True, disable=not verbose
+        ):
+            chunk_end = min(chunk_start + chunk_size, V_criteria)
+            data_chunk = run_data_criteria[chunk_start:chunk_end, :].to(device)
+            betas_chunk = betas[chunk_start:chunk_end, :]
+
+            dp = _strip_poly(data_chunk.T)  # (T, chunk)
+            resid_poly = dp - design_poly @ betas_chunk.T  # (T, chunk)
+
+            ss_e = (resid_poly * resid_poly).sum(dim=0, dtype=torch.float64)
+            ss_dp = (dp * dp).sum(dim=0, dtype=torch.float64)
+            sum_dp = dp.sum(dim=0, dtype=torch.float64)
+
+            for combo_batch_start in range(0, n_combos, combo_batch_size):
+                combo_batch_end = min(combo_batch_start + combo_batch_size, n_combos)
+                q_batch_t = q_all_t[combo_batch_start:combo_batch_end]  # (B, k, T)
+                q_col_sums = q_all_col_sums[combo_batch_start:combo_batch_end]  # (B, k)
+
+                a_proj = q_batch_t @ dp  # (B, k, chunk)
+                e_proj = q_batch_t @ resid_poly  # (B, k, chunk)
+
+                # Reduce over k (a dozen terms) in float32, then subtract in
+                # float64: the cancellation risk is in the subtraction, not in
+                # the short sum, and float64 reductions over the (B, k, V)
+                # tensors run at a small fraction of float32 rate on consumer
+                # cards -- which is where the remaining time was going.
+                ss_res = ss_e - (e_proj * e_proj).sum(dim=1).double()
+                ss_clean = ss_dp - (a_proj * a_proj).sum(dim=1).double()
+                mean_clean = (sum_dp - (q_col_sums.unsqueeze(-1) * a_proj).sum(dim=1).double()) / T
+                ss_tot = ss_clean - T * mean_clean * mean_clean
+                cod_chunk = (1.0 - ss_res / ss_tot.clamp(min=1e-10)).float()
+
+                all_cod[combo_batch_start:combo_batch_end, chunk_start:chunk_end] = cod_chunk.cpu()
+                del a_proj, e_proj, cod_chunk
+
+            del data_chunk, dp, resid_poly
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+        var_explained = np.array(
+            [sum(variance_ratios[pc] for pc in combo) for combo in combinations]
+        )
+        if return_raw_cod:
+            return all_cod.numpy(), var_explained
+        return all_cod.median(dim=1).values.numpy(), var_explained
 
     # CRITICAL: For 8192 combos, P_all would be 7.4 GB - must batch combos
     # Process combos in batches: build projections, evaluate all voxels, accumulate
