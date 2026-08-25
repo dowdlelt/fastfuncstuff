@@ -1230,3 +1230,160 @@ def test_three_factor_cellspace_and_trialspace_engines_agree():
     )
     for key in keys:
         torch.testing.assert_close(cell[key], trial[key], atol=2e-4, rtol=2e-3)
+
+
+# ── Classical ANOVA ───────────────────────────────────────────────────────────
+#
+# The ANOVA exists to be an *independent* check on the cross-validated partition, so the
+# tests that earn their place are the ones that would catch it silently agreeing with
+# varpart for the wrong reason: Type-III sums of squares recomputed from scratch, and the
+# df-inflation that makes in-sample eta2 unusable on a wide band.
+
+
+def _anova_reference(y, factor_codes):
+    """Type-III SS by brute force: build every design with numpy and drop one term."""
+    names = list(factor_codes)
+    n = len(factor_codes[names[0]])
+    cols = {}
+    for name in names:
+        lev = np.unique(factor_codes[name])
+        d = np.zeros((n, len(lev) - 1))
+        idx = np.searchsorted(lev, factor_codes[name])
+        for j in range(len(lev) - 1):
+            d[idx == j, j] = 1.0
+            d[idx == len(lev) - 1, j] = -1.0  # sum-to-zero coding
+        cols[name] = d
+    inter = np.einsum("ti,tj->tij", cols[names[0]], cols[names[1]]).reshape(n, -1)
+    cols[":".join(names)] = inter
+    order = [*names, ":".join(names)]
+
+    def ssr(active):
+        x = np.concatenate([np.ones((n, 1))] + [cols[k] for k in active], axis=1)
+        resid = y - x @ np.linalg.lstsq(x, y, rcond=None)[0]
+        return float(resid @ resid), int(np.linalg.matrix_rank(x))
+
+    ssr_full, rank_full = ssr(order)
+    return {
+        k: (
+            ssr([o for o in order if o != k])[0] - ssr_full,
+            rank_full - ssr([o for o in order if o != k])[1],
+        )
+        for k in order
+    }, ssr_full
+
+
+@pytest.mark.parametrize("drop_frac", [0.0, 0.2])
+def test_anova_matches_type_three_sums_of_squares(drop_frac):
+    """Drop-one SS and df, against an independent numpy build of the same models.
+
+    Run unbalanced too: dropping trials is the normal state of this data, and Type III is
+    chosen precisely because it stays defined there. A projection-partition shortcut would
+    pass the balanced case and fail this one.
+    """
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    rng = np.random.default_rng(3)
+    n_a, n_b, n_rep = 4, 5, 3
+    a = np.repeat(np.arange(n_a), n_b * n_rep)
+    b = np.tile(np.repeat(np.arange(n_b), n_rep), n_a)
+    y = rng.normal(size=a.size)
+    keep = rng.random(a.size) >= drop_frac
+    a, b, y = a[keep], b[keep], y[keep]
+
+    res = anova_partition(y[None, :], {"A": a, "B": b}, device=torch.device("cpu"), verbose=False)
+    ref, ssr_full = _anova_reference(y, {"A": a, "B": b})
+
+    for band in ("A", "B", "A:B"):
+        ss_ref, df_ref = ref[band]
+        assert res.df[band] == df_ref
+        assert float(res.ss[band][0]) == pytest.approx(ss_ref, rel=1e-4, abs=1e-8)
+    assert float(res.ss_resid[0]) == pytest.approx(ssr_full, rel=1e-5)
+
+
+def test_anova_error_term_is_replicate_scatter():
+    """Pure error equals the full-model residual exactly when the model is saturated.
+
+    This is the check that the error term is really within-cell scatter and not a second
+    copy of the model residual: they coincide here *because* the saturated cell-mean model
+    has nothing left to explain, and the noise ceiling built from it is therefore
+    model-free.
+    """
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    factors, _, _ = make_crossed_table(n_stim=5, n_task=4, n_rep=3)
+    y = synth_betas(factors, a=np.random.default_rng(0).normal(size=(3, 5)), noise=1.0)
+    res = anova_partition(y, factors, device=torch.device("cpu"), verbose=False)
+
+    assert res.diagnostics["saturated"]
+    assert res.df_error == res.df_resid
+    torch.testing.assert_close(res.ss_error, res.ss_resid, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        res.noise_ceiling, 1.0 - res.ss_resid / res.ss_total, rtol=1e-4, atol=1e-4
+    )
+
+
+def test_anova_eta2_inflates_with_df_but_omega2_does_not():
+    """The whole reason omega2 is reported alongside eta2, measured on pure noise.
+
+    A 380-column interaction band explains ~df/(n-1) of the variance with no signal
+    present at all. Quoting eta2 there would make the interaction the dominant effect in
+    every voxel in the brain. omega2 subtracts that expectation and must sit at zero.
+    """
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    factors, _, _ = make_crossed_table()
+    n_trials = len(factors["stim"])
+    y = torch.as_tensor(np.random.default_rng(7).normal(size=(64, n_trials)), dtype=torch.float32)
+    res = anova_partition(y, factors, device=torch.device("cpu"), verbose=False)
+
+    band = "stim:task"
+    expected = res.df[band] / (n_trials - 1)
+    assert expected > 0.25  # 380 df against 1260 trials
+    assert float(res.eta2[band].mean()) == pytest.approx(expected, abs=0.02)
+    assert abs(float(res.omega2[band].mean())) < 0.03
+    # And the F test stays calibrated where the naive effect size does not.
+    assert float((res.p[band] < 0.05).float().mean()) < 0.15
+
+
+def test_anova_bands_sum_to_r2_full_only_under_balance():
+    """Type-III non-additivity is the imbalance diagnostic, so it must actually appear."""
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    factors, _, _ = make_crossed_table(n_stim=5, n_task=4, n_rep=3)
+    rng = np.random.default_rng(11)
+    y = synth_betas(factors, a=rng.normal(size=(4, 5)), b=rng.normal(size=(4, 4)), noise=1.0)
+
+    res = anova_partition(y, factors, device=torch.device("cpu"), verbose=False)
+    total = sum(res.eta2[b] for b in res.diagnostics["bands"])
+    torch.testing.assert_close(total, res.r2_full, rtol=1e-3, atol=1e-3)
+
+    keep = rng.random(len(factors["stim"])) >= 0.25
+    unbal = {k: v[keep] for k, v in factors.items()}
+    res_u = anova_partition(y[:, keep], unbal, device=torch.device("cpu"), verbose=False)
+    assert not res_u.diagnostics["balanced"]
+    total_u = sum(res_u.eta2[b] for b in res_u.diagnostics["bands"])
+    assert float((total_u - res_u.r2_full).abs().max()) > 1e-3
+
+
+def test_anova_survives_missing_cells():
+    """Whole empty cells make the saturated design rank deficient; df must shrink, not lie."""
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    factors, _, _ = make_crossed_table(n_stim=4, n_task=5, n_rep=3)
+    s, t = factors["stim"], factors["task"]
+    keep = ~((s == 2) & (t == 3)) & ~((s == 0) & (t == 1))
+    y = synth_betas(factors, a=np.random.default_rng(5).normal(size=(4, 4)), noise=1.0)[:, keep]
+    kept = {k: v[keep] for k, v in factors.items()}
+    res = anova_partition(y, kept, device=torch.device("cpu"), verbose=False)
+    assert res.diagnostics["cells_occupied"] == 18
+    assert res.df["stim:task"] < (4 - 1) * (5 - 1)
+    assert torch.isfinite(res.r2_full).all() and torch.isfinite(res.omega2["stim:task"]).all()
+
+
+def test_anova_needs_replicates():
+    from fastfuncstuff.stats.variance_partition import anova_partition
+
+    factors, _, _ = make_crossed_table(n_stim=4, n_task=5, n_rep=1)
+    y = synth_betas(factors, a=np.random.default_rng(0).normal(size=(2, 4)), noise=1.0)
+    with pytest.raises(ValueError, match="replicate trials"):
+        anova_partition(y, factors, device=torch.device("cpu"), verbose=False)

@@ -29,6 +29,7 @@ try:
     )
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.stats.variance_partition import (
+        anova_partition,
         build_roi_weights,
         collapse_to_rois,
         paint_rois_to_voxels,
@@ -103,6 +104,67 @@ def _summarize_effects(
                 "n_reliable": int(effect_reliable.sum()),
             }
         )
+    return rows
+
+
+def _anova_rows(res, band_order: list[str]) -> list[dict[str, str | int | float]]:
+    """Pool the per-unit ANOVA into one row per band, plus a saturated-model row.
+
+    Pooling is on sums of squares, not on ratios: the effect sizes are recomputed from
+    mask-wide SS totals so a flat voxel does not carry the same weight as a strongly
+    varying one. That matches how ``_summarize_effects`` pools the cross-validated R2, so
+    the two tables can be read side by side.
+    """
+    ss_tot = float(res.ss_total.sum())
+    ss_err = float(res.ss_error.sum())
+    ms_err = ss_err / res.df_error
+
+    def row(effect, dfb, ss_b, per_unit_eta2, per_unit_omega2, per_unit_p):
+        eta2 = ss_b / ss_tot if ss_tot > 0 else float("nan")
+        omega2 = (ss_b - dfb * ms_err) / (ss_tot + ms_err) if ss_tot > 0 else float("nan")
+        med = lambda t: float(t.detach().cpu().to(torch.float64).median())  # noqa: E731
+        return {
+            "effect": effect,
+            "df": dfb,
+            "pooled_eta2": eta2,
+            "pooled_omega2": omega2,
+            "pooled_F": (ss_b / dfb) / ms_err if ms_err > 0 else float("nan"),
+            "median_eta2": med(per_unit_eta2),
+            "median_omega2": med(per_unit_omega2),
+            "frac_units_p05": float((per_unit_p < 0.05).to(torch.float64).mean()),
+            # What a band this wide collects from noise alone: E[SS_b] = df_b * sigma^2
+            # under the null, with sigma^2 estimated by the replicate scatter. This is the
+            # term omega2 subtracts, printed next to eta2 so the inflation is visible
+            # rather than argued. A df-only fraction would overstate it wherever other
+            # bands already explain much of the variance.
+            "eta2_null_expected": dfb * ms_err / ss_tot if ss_tot > 0 else float("nan"),
+        }
+
+    rows = [
+        row(
+            band,
+            res.df[band],
+            float(res.ss[band].sum()),
+            res.eta2[band],
+            res.omega2[band],
+            res.p[band],
+        )
+        for band in band_order
+    ]
+    ss_model = float((res.ss_total - res.ss_resid).clamp_min(0).sum())
+    omega2_full = (
+        res.r2_full * res.ss_total - res.diagnostics["df_model"] * (res.ss_error / res.df_error)
+    ) / (res.ss_total + res.ss_error / res.df_error).clamp_min(1e-12)
+    rows.append(
+        row(
+            "r2_full",
+            res.diagnostics["df_model"],
+            ss_model,
+            res.r2_full,
+            omega2_full,
+            res.p_full,
+        )
+    )
     return rows
 
 
@@ -207,6 +269,7 @@ OUTPUTS
   {prefix}.nii.gz         one sub-brick per measure below (parcel-painted with -atlas)
   {prefix}_roi.tsv        with -atlas: the same measures, one row per ROI
   {prefix}_summary.tsv    pooled whole-mask variance summary, one row per effect
+  {prefix}_anova.tsv      with -anova: classical Type-III ANOVA, one row per band
   {prefix}_significance.tsv     with -perm: significant-unit counts per effect
   {prefix}_significant_rois.tsv with -perm -atlas: every ROI at pFWE < 0.05
   {prefix}_varpart.json   factors, level-name mapping, dropped trials, diagnostics,
@@ -624,6 +687,18 @@ mapping back to the original labels is written to {prefix}_varpart.json).
             "you expected repeats to be spread across runs and want to be told they are not."
         ),
     )
+    opt.add_argument(
+        "-anova",
+        action="store_true",
+        help=(
+            "Also run a classical in-sample factorial ANOVA over the same bands and write "
+            "{prefix}_anova.tsv plus anova_* sub-bricks. Independent of the cross-validated "
+            "partition: Type-III sums of squares, F-tested against pure within-cell error. "
+            "Costs a second or two. Its R² is NOT held out and rises with degrees of "
+            "freedom whether or not there is signal, so read omega2 rather than eta2 when "
+            "quoting a number"
+        ),
+    )
     opt.add_argument("-seed", type=int, default=0, help="RNG seed for permutations")
     opt.add_argument("-device", default=None, help="cuda | cpu | mps (default: auto)")
     opt.add_argument("-quiet", action="store_true", help="Suppress progress bars")
@@ -850,6 +925,10 @@ def main() -> int:
         verbose=not args.quiet,
     )
 
+    anova_res = None
+    if args.anova:
+        anova_res = anova_partition(betas, factor_codes, device=device, verbose=not args.quiet)
+
     assert res.shared is not None and res.interaction is not None
     d = res.diagnostics
     print("\n📊 Diagnostics")
@@ -970,6 +1049,18 @@ def main() -> int:
         frac = torch.where(obtainable, maps[source] / ceiling.clamp_min(CEILING_FLOOR), zero)
         maps[f"{source}_frac_ceiling"] = frac
 
+    if anova_res is not None:
+        for band in anova_res.diagnostics["bands"]:
+            maps[f"anova_eta2_{tag(band)}"] = anova_res.eta2[band]
+            maps[f"anova_omega2_{tag(band)}"] = anova_res.omega2[band]
+            maps[f"anova_F_{tag(band)}"] = anova_res.f[band]
+            maps[f"oneminusp_anova_{tag(band)}"] = 1.0 - anova_res.p[band]
+        maps["anova_r2_full"] = anova_res.r2_full
+        maps["anova_r2_full_adj"] = anova_res.r2_full_adj
+        # Replicate scatter is a model-free ceiling; it should track ncsnr's, and where the
+        # two disagree one of the two estimators is being told something the other is not.
+        maps["anova_noise_ceiling"] = anova_res.noise_ceiling
+
     perm_map_names: dict[str, str] = {}
     if perm_res is not None:
         # Stored as 1 - p so that "significant" is the *high* end: threshold the map at
@@ -1065,6 +1156,50 @@ def main() -> int:
         f"(Δ {total - full:+.4f})"
     )
     print(f"💾 Wrote {summary_tsv}")
+
+    if anova_res is not None:
+        anova_rows = _anova_rows(anova_res, anova_res.diagnostics["bands"])
+        anova_tsv = f"{stem}_anova.tsv"
+        with open(anova_tsv, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(anova_rows[0]), delimiter="\t")
+            writer.writeheader()
+            writer.writerows(anova_rows)
+
+        ad = anova_res.diagnostics
+        print(f"\n🧮 Classical ANOVA ({unit_label}, in-sample, Type III, pure-error F)")
+        print(
+            "   effect                          df       η²       ω²"
+            "        F   p<.05 units   η² expected at null"
+        )
+        for row in anova_rows:
+            print(
+                f"   {str(row['effect']):<28} "
+                f"{int(row['df']):>5}  "
+                f"{float(row['pooled_eta2']):>7.3f}  "
+                f"{float(row['pooled_omega2']):>7.3f}  "
+                f"{float(row['pooled_F']):>7.2f}   "
+                f"{float(row['frac_units_p05']):>10.1%}   "
+                f"{float(row['eta2_null_expected']):>18.3f}"
+            )
+        print(
+            f"   pure error: {ad['df_error']} df from replicate scatter"
+            f" ({ad['cells_occupied']}/{ad['cells_total']} cells occupied,"
+            f" saturated={ad['saturated']})"
+        )
+        # The last column is what a band of this width collects from noise alone. When eta2
+        # is not clearly above it, the band explained nothing and omega2 is the honest read.
+        print(
+            "   η² is in-sample and inflates with df — compare each row against the last "
+            "column,\n   and quote ω² (their difference, rescaled) rather than η² outside "
+            "this table."
+        )
+        band_eta2 = sum(float(r["pooled_eta2"]) for r in anova_rows[:-1])
+        full_eta2 = float(anova_rows[-1]["pooled_eta2"])
+        print(
+            f"   partition check: bands sum to {band_eta2:+.4f} vs r2_full {full_eta2:+.4f} "
+            f"(Δ {band_eta2 - full_eta2:+.4f}; exactly 0 only under balance)"
+        )
+        print(f"💾 Wrote {anova_tsv}")
 
     sig_rows: list[dict[str, str | int | float]] = []
     sig_units: dict[str, list] = {}
@@ -1181,6 +1316,14 @@ def main() -> int:
         "min_ncsnr_for_rank": args.min_ncsnr_for_rank,
         "n_perms": args.perm,
     }
+    if anova_res is not None:
+        meta["anova"] = {
+            "per_band": anova_rows,
+            "diagnostics": {
+                k: (v if not isinstance(v, np.generic) else v.item())
+                for k, v in anova_res.diagnostics.items()
+            },
+        }
     if perm_res is not None:
         meta["significance"] = {
             "alpha": 0.05,

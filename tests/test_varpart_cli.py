@@ -627,3 +627,43 @@ def test_frac_ceiling_is_zero_where_nothing_is_obtainable(tmp_path):
     for r in dead:
         for src in ("unique_stim", "interaction", "r2_full"):
             assert float(r[f"{src}_frac_ceiling"]) == 0.0
+
+
+def test_anova_writes_its_own_table_and_subbricks(tmp_path, capsys):
+    """-anova is an independent second opinion, so it must land in its own file.
+
+    The fixture is purely additive, which makes the interaction row the informative one:
+    its in-sample eta2 is large (380 df) while omega2 collapses to zero. If a future change
+    ever reported eta2 alone, this catches it.
+    """
+    betas, tsv, _, _ = _fixture(tmp_path)
+    out = tmp_path / "vp"
+    assert _run(_base_args(betas, tsv, out) + ["-anova", "-device", "cpu"]) == 0
+
+    rows = list(csv.DictReader(open(str(out) + "_anova.tsv"), delimiter="\t"))
+    by_effect = {r["effect"]: r for r in rows}
+    assert set(by_effect) == {"stim", "task", "stim:task", "r2_full"}
+    assert int(by_effect["stim:task"]["df"]) == (N_STIM - 1) * (N_TASK - 1)
+
+    inter = by_effect["stim:task"]
+    assert float(inter["pooled_eta2"]) > 0.05  # df inflation, not signal
+    assert abs(float(inter["pooled_omega2"])) < 0.02
+    assert float(inter["pooled_eta2"]) == pytest.approx(
+        float(inter["eta2_null_expected"]), abs=0.02
+    )
+    for factor in ("stim", "task"):
+        assert float(by_effect[factor]["pooled_omega2"]) > 0.1
+
+    img = nib.load(str(out) + ".nii.gz")
+    meta = json.load(open(str(out) + "_varpart.json"))
+    assert meta["anova"]["diagnostics"]["saturated"] is True
+    assert img.shape[-1] > 0
+    assert "Classical ANOVA" in capsys.readouterr().out
+
+
+def test_anova_is_off_by_default(tmp_path):
+    betas, tsv, _, _ = _fixture(tmp_path)
+    out = tmp_path / "vp"
+    assert _run(_base_args(betas, tsv, out) + ["-device", "cpu"]) == 0
+    assert not (tmp_path / "vp_anova.tsv").exists()
+    assert "anova" not in json.load(open(str(out) + "_varpart.json"))

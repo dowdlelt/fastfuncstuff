@@ -70,6 +70,9 @@ BALANCE_TOL = 1e-6
 # model could not reach 1% of the variance there, so the ratio is noise over noise.
 NC_FLOOR_FOR_RATIO = 0.01
 
+# Sums of squares below this are a constant voxel; dividing by them makes noise.
+_SS_FLOOR = 1e-12
+
 
 @dataclass
 class FactorDesign:
@@ -2003,6 +2006,246 @@ def permutation_test(
 # ---------------------------------------------------------------------------
 # ROI collapsing
 # ---------------------------------------------------------------------------
+
+
+# ── Classical ANOVA ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class AnovaResult:
+    """Per-voxel classical factorial ANOVA over the same bands as the partition.
+
+    Every field except ``df`` and ``diagnostics`` is a ``(n_voxels,)`` tensor, keyed by
+    band name where it is a dict.
+    """
+
+    ss: dict[str, Tensor] = field(default_factory=dict)  # Type-III sums of squares
+    df: dict[str, int] = field(default_factory=dict)
+    f: dict[str, Tensor] = field(default_factory=dict)
+    p: dict[str, Tensor] = field(default_factory=dict)
+    eta2: dict[str, Tensor] = field(default_factory=dict)  # SS_b / SS_total
+    eta2_partial: dict[str, Tensor] = field(default_factory=dict)  # SS_b / (SS_b + SS_err)
+    omega2: dict[str, Tensor] = field(default_factory=dict)
+    r2_full: Tensor | None = None
+    r2_full_adj: Tensor | None = None
+    f_full: Tensor | None = None  # saturated model against pure error
+    p_full: Tensor | None = None
+    ss_total: Tensor | None = None
+    ss_error: Tensor | None = None  # pure (within-cell) error
+    ss_resid: Tensor | None = None  # full-model residual
+    noise_ceiling: Tensor | None = None  # 1 - ss_error/ss_total
+    df_error: int = 0
+    df_resid: int = 0
+    diagnostics: dict = field(default_factory=dict)
+
+
+def _column_space(x: Tensor) -> tuple[Tensor, int]:
+    """Orthonormal basis for the column space of ``x``, plus its numerical rank.
+
+    Residual sums of squares come from ``||y||^2 - ||y Q||^2`` rather than from an explicit
+    fit, which is both cheaper and stable when dropped trials leave the design rank
+    deficient -- the normal case here, not an edge case.
+    """
+    u, s, _ = torch.linalg.svd(x.double(), full_matrices=False)
+    tol = float(s.max()) * max(x.shape) * torch.finfo(torch.float64).eps if s.numel() else 0.0
+    rank = int((s > tol).sum())
+    return u[:, :rank].contiguous().float(), rank
+
+
+def anova_partition(
+    betas: Tensor | np.ndarray,
+    factor_codes: dict[str, np.ndarray],
+    device: torch.device | None = None,
+    chunk_size: int | None = None,
+    verbose: bool = True,
+) -> AnovaResult:
+    """Classical in-sample factorial ANOVA on the same bands :func:`partition_variance` uses.
+
+    This is the textbook analysis, offered as an *independent check* on the cross-validated
+    partition and as a number that is easy to explain to a reader. It shares the design
+    construction and nothing else: no folds, no shrinkage, no permutation. Sums of squares
+    are Type III (each band's residual increase when it alone is dropped from the saturated
+    model), which is what makes it well defined on the unbalanced, missing-cell designs that
+    dropping trials produces. On a perfectly balanced design the bands are orthogonal and
+    Type III coincides with the simple projection partition.
+
+    The error term is **pure error**: the within-cell scatter of replicate trials. It does
+    not assume the model is correct, and with a saturated model on complete cells it equals
+    the full-model residual exactly (checked in ``diagnostics``). ``1 - ss_error/ss_total``
+    is therefore an ANOVA-native noise ceiling, independent of the ``ncsnr`` estimator that
+    :func:`partition_variance` reports.
+
+    **Read the effect sizes knowing what inflates them.** In-sample R2 rises with degrees of
+    freedom whether or not there is signal: a band with ``p_b`` columns explains about
+    ``p_b / (n_trials - 1)`` of the variance under a pure-noise null. On a 20x21x3 design the
+    interaction band has 380 df against 1260 trials, so it collects ~0.30 of the variance
+    from nothing at all, and ``r2_full`` collects ~0.33. ``eta2`` carries that inflation in
+    full; ``omega2`` subtracts its expectation and is the honest one to quote. Neither is a
+    substitute for the cross-validated partition, which is the estimate that survives being
+    shown new data.
+
+    One consequence of Type III worth knowing before reading the table: the band ``eta2``
+    values sum to ``r2_full`` only when the design is balanced. Under imbalance the bands
+    overlap, each one's drop-one SS includes variance another band could also have claimed,
+    and the sum overshoots. That overshoot is itself the imbalance diagnostic -- the ANOVA
+    counterpart of the partition's ``shared`` map.
+
+    Parameters
+    ----------
+    betas
+        (n_voxels, n_trials) single-trial estimates, same convention as
+        :func:`partition_variance`.
+    factor_codes
+        Factor name -> per-trial labels. Two or more factors.
+
+    Returns
+    -------
+    AnovaResult
+        Per-band SS/df/F/p and effect sizes, plus the model and pure-error terms.
+    """
+    from scipy.stats import f as f_dist
+
+    if device is None:
+        device = get_device()
+
+    design = build_factor_design(factor_codes)
+    n_trials = design.n_trials
+
+    betas_t = torch.as_tensor(np.asarray(betas)) if not isinstance(betas, Tensor) else betas
+    if betas_t.shape[1] != n_trials:
+        raise ValueError(
+            f"betas has {betas_t.shape[1]} trials but the factor table has {n_trials}; "
+            "one row per volume is required, with excluded trials dropped from both."
+        )
+    betas_t = betas_t.to(torch.float32)
+    n_vox = betas_t.shape[0]
+    band_order = list(design.band_order)
+
+    ones = torch.ones(n_trials, 1, dtype=torch.float64)
+    band_cols = {n: design.bands[n].double() for n in band_order}
+    q_full, rank_full = _column_space(torch.cat([ones] + [band_cols[n] for n in band_order], dim=1))
+    q_drop: dict[str, Tensor] = {}
+    df_band: dict[str, int] = {}
+    for name in band_order:
+        keep = [band_cols[n] for n in band_order if n != name]
+        q, rank = _column_space(torch.cat([ones] + keep, dim=1))
+        q_drop[name] = q.to(device)
+        df_band[name] = rank_full - rank
+    q_full = q_full.to(device)
+
+    # Pure error: replicate scatter within each cell. Model-free, so it stays a valid F
+    # denominator even where the saturated model is not the truth. Cells seen once
+    # contribute nothing and cost no df.
+    cell_flat = flat_cell_index(design).to(device)
+    occupied, cell_of_trial = torch.unique(cell_flat, return_inverse=True)
+    n_occupied = int(occupied.numel())
+    counts = torch.bincount(cell_of_trial, minlength=n_occupied).clamp_min(1).float()
+    df_error = n_trials - n_occupied
+    df_resid = n_trials - rank_full
+    if df_error <= 0:
+        raise ValueError(
+            "the ANOVA needs replicate trials for its pure-error term, but every cell "
+            "occurs exactly once; there is nothing to test against"
+        )
+
+    if chunk_size is None:
+        chunk_size = estimate_chunk_size(
+            n_voxels=n_vox,
+            n_timepoints=n_trials,
+            n_regressors=rank_full + 1,
+            device=device,
+            operation="glm",
+        )
+
+    ss_band = {n: torch.zeros(n_vox) for n in band_order}
+    ss_total_out = torch.zeros(n_vox)
+    ss_error_out = torch.zeros(n_vox)
+    ss_resid_out = torch.zeros(n_vox)
+
+    n_chunks = (n_vox + chunk_size - 1) // chunk_size
+    for c0 in tqdm(
+        range(0, n_vox, chunk_size),
+        total=n_chunks,
+        desc="anova",
+        leave=True,
+        disable=not verbose or n_chunks < 2,
+    ):
+        c1 = min(c0 + chunk_size, n_vox)
+        y = betas_t[c0:c1].to(device)
+        nvc = c1 - c0
+
+        centred = y - y.mean(dim=1, keepdim=True)
+        ss_total = (centred * centred).sum(dim=1)
+        ss_total_out[c0:c1] = ss_total.cpu()
+
+        cell_sum = torch.zeros(nvc, n_occupied, device=device)
+        cell_sum.index_add_(1, cell_of_trial, y)
+        cell_mean = cell_sum / counts
+        resid_pure = y - cell_mean[:, cell_of_trial]
+        ss_error_out[c0:c1] = (resid_pure * resid_pure).sum(dim=1).cpu()
+        del cell_sum, cell_mean, resid_pure
+
+        ss_y = (y * y).sum(dim=1)
+        fit_full = ((y @ q_full) ** 2).sum(dim=1)
+        ss_resid_full = ss_y - fit_full
+        ss_resid_out[c0:c1] = ss_resid_full.cpu()
+        for name in band_order:
+            ss_resid_drop = ss_y - ((y @ q_drop[name]) ** 2).sum(dim=1)
+            ss_band[name][c0:c1] = (ss_resid_drop - ss_resid_full).clamp_min(0).cpu()
+        del y, centred, ss_y, fit_full, ss_resid_full
+
+    ms_error = ss_error_out / df_error
+    ss_model = (ss_total_out - ss_resid_out).clamp_min(0)
+    df_model = max(rank_full - 1, 1)
+    f_full = (ss_model / df_model) / ms_error.clamp_min(_SS_FLOOR)
+    res = AnovaResult(
+        df=df_band,
+        r2_full=1.0 - ss_resid_out / ss_total_out.clamp_min(_SS_FLOOR),
+        r2_full_adj=1.0
+        - (ss_resid_out / max(df_resid, 1)) / (ss_total_out / (n_trials - 1)).clamp_min(_SS_FLOOR),
+        f_full=f_full,
+        p_full=torch.as_tensor(
+            f_dist.sf(f_full.double().numpy(), df_model, df_error), dtype=torch.float32
+        ),
+        ss_total=ss_total_out,
+        ss_error=ss_error_out,
+        ss_resid=ss_resid_out,
+        noise_ceiling=1.0 - ss_error_out / ss_total_out.clamp_min(_SS_FLOOR),
+        df_error=df_error,
+        df_resid=df_resid,
+    )
+    for name in band_order:
+        ss_b = ss_band[name]
+        db = max(df_band[name], 1)
+        f_stat = (ss_b / db) / ms_error.clamp_min(_SS_FLOOR)
+        res.ss[name] = ss_b
+        res.f[name] = f_stat
+        res.p[name] = torch.as_tensor(
+            f_dist.sf(f_stat.double().numpy(), db, df_error), dtype=torch.float32
+        )
+        res.eta2[name] = ss_b / ss_total_out.clamp_min(_SS_FLOOR)
+        res.eta2_partial[name] = ss_b / (ss_b + ss_error_out).clamp_min(_SS_FLOOR)
+        # Omega-squared subtracts the variance a band of this width collects from noise
+        # alone. Without it a 380-column interaction band reads as the dominant effect in
+        # every voxel in the brain, white matter included.
+        res.omega2[name] = (ss_b - db * ms_error) / (ss_total_out + ms_error).clamp_min(_SS_FLOOR)
+
+    res.diagnostics = {
+        "balanced": design.balanced,
+        "max_offdiag_gram": design.max_offdiag,
+        "n_trials": n_trials,
+        "cells_occupied": n_occupied,
+        "cells_total": int(np.prod([len(lv) for lv in design.levels])),
+        "rank_full": rank_full,
+        "df_error": df_error,
+        "df_resid": df_resid,
+        "saturated": rank_full == n_occupied,
+        "df_null_r2_full": (rank_full - 1) / (n_trials - 1),
+        "df_null_eta2": {n: df_band[n] / (n_trials - 1) for n in band_order},
+        "df_model": df_model,
+        "bands": band_order,
+    }
+    return res
 
 
 def build_roi_weights(
