@@ -1164,3 +1164,82 @@ class TestSingleTrialCVHelper:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Per-run accumulation fast path in compute_xval_r2
+# ---------------------------------------------------------------------------
+# compute_xval_r2 is shared by ffs_denoise, ffs_deconvolve, ffs_pathfinder,
+# hrf_selection and the combinatorial denoiser, so the fast path is pinned
+# against the legacy streaming loop rather than against stored numbers. The
+# legacy loop is reachable at runtime via FFS_XVAL_LEGACY=1.
+
+
+def _xval_fast_path_case(missing=False, with_nuisance=False, seed=5):
+    import torch
+
+    torch.manual_seed(seed)
+    n_runs, tp, n_vox, n_stim = 5, 40, 80, 4
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+    n_cols = n_stim + (3 * n_runs if with_nuisance else 0)
+
+    design = torch.zeros(n_tp, n_cols)
+    for c in range(n_stim):
+        design[(c + 1) :: (5 + c), c] = 1.0
+    if missing:
+        # A condition absent from run 0 makes its column zero in some folds.
+        design[0:tp, n_stim - 1] = 0.0
+    if with_nuisance:
+        for r in range(n_runs):
+            sl = slice(run_starts[r], run_starts[r] + tp)
+            for d in range(3):
+                design[sl, n_stim + r * 3 + d] = torch.linspace(-1, 1, tp) ** d
+
+    data = torch.randn(n_vox, n_tp) * 0.4 + torch.randn(n_vox, n_stim) @ design[:, :n_stim].T
+    return data, design, run_starts, n_stim, n_cols
+
+
+@pytest.mark.parametrize(
+    "cv_strategy,n_perms,strategy,missing,with_nuisance,batch_size",
+    [
+        (1, 100, "zero", False, False, None),
+        (1, 100, "nuisance", False, False, None),
+        (1, 100, "zero", True, False, None),  # missing events
+        (1, 100, "nuisance", True, False, None),
+        (2, 6, "zero", False, False, None),  # non-LORO: full accumulators
+        (0.6, 5, "zero", False, False, None),  # split-half
+        (1, 100, "zero", False, True, None),  # nuisance_indices -> legacy path
+        (1, 100, "zero", False, False, 17),  # multiple voxel batches
+    ],
+)
+def test_xval_fast_path_matches_legacy(
+    monkeypatch, cv_strategy, n_perms, strategy, missing, with_nuisance, batch_size
+):
+    """Per-run accumulation must reproduce the streaming loop exactly."""
+    import torch
+
+    from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+
+    data, design, run_starts, n_stim, n_cols = _xval_fast_path_case(missing, with_nuisance)
+    splits = generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms)
+    kwargs = dict(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        stim_indices=list(range(n_stim)),
+        nuisance_indices=list(range(n_stim, n_cols)) if with_nuisance else [],
+        cv_splits=splits,
+        metric="cod",
+        zero_event_strategy=strategy,
+        device=torch.device("cpu"),
+        batch_size=batch_size,
+        verbose=False,
+    )
+
+    monkeypatch.delenv("FFS_XVAL_LEGACY", raising=False)
+    fast = compute_xval_r2(**kwargs)["r2"]
+
+    monkeypatch.setenv("FFS_XVAL_LEGACY", "1")
+    legacy = compute_xval_r2(**kwargs)["r2"]
+

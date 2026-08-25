@@ -8,6 +8,7 @@ methods and model selection (e.g., HRF choice).
 
 from __future__ import annotations
 
+import os
 from itertools import combinations
 
 import numpy as np
@@ -848,6 +849,81 @@ def _cap_batch_to_free_vram(
 
 
 @torch.inference_mode()
+def _plan_fold_designs(
+    train_stim_design: torch.Tensor,
+    test_stim_design: torch.Tensor,
+    zero_event_strategy: str,
+    train_runs: list[int],
+    test_runs: list[int],
+    device: torch.device,
+    announce: bool = False,
+) -> dict:
+    """Work out which stimulus columns are usable in one CV fold.
+
+    A condition can be absent from the training runs, the test runs, or both
+    (rare designs, or any leave-N-out split of an unbalanced study). This is
+    purely a function of the design, not of the data, so it is shared by both
+    the streaming and the per-run-accumulation paths — keeping the two from
+    drifting apart on the awkward cases.
+
+    Returns the column masks plus ``fit_mask``, the columns actually entering
+    the OLS fit under the requested strategy.
+    """
+    n_stim = train_stim_design.shape[1]
+    train_zero_mask = train_stim_design.abs().sum(dim=0) < 1e-10
+    test_zero_mask = test_stim_design.abs().sum(dim=0) < 1e-10
+
+    train_present_mask = ~train_zero_mask
+    test_present_mask = ~test_zero_mask
+    unpredictable_mask = train_present_mask & test_zero_mask
+    test_only_mask = train_zero_mask & test_present_mask
+    predictable_mask = train_present_mask & test_present_mask
+
+    if train_zero_mask.any() or test_zero_mask.any():
+        if announce:
+            unpredictable_cols = [i for i, u in enumerate(unpredictable_mask) if u]
+            test_only_cols = [i for i, t in enumerate(test_only_mask) if t]
+            print(f"\n{'=' * 80}")
+            print("INFO: Handling missing events across train/test splits")
+            print(f"{'=' * 80}")
+            print(f"Train-only events: {len(unpredictable_cols)} - {unpredictable_cols}")
+            print(f"Test-only events: {len(test_only_cols)} - {test_only_cols}")
+            print(f"Predictable events: {predictable_mask.sum().item()}")
+            print(f"Strategy: '{zero_event_strategy}'")
+            print(f"{'=' * 80}\n")
+
+        if not predictable_mask.any():
+            raise ValueError(
+                f"No overlapping events between train {train_runs} and test {test_runs}! "
+                f"All {n_stim} stimulus columns are zero in train or test."
+            )
+
+        if zero_event_strategy == "zero":
+            fit_mask = train_present_mask
+        elif zero_event_strategy == "nuisance":
+            fit_mask = predictable_mask
+        else:
+            raise ValueError(f"Unknown zero_event_strategy: '{zero_event_strategy}'")
+    else:
+        if announce:
+            print(f"    No missing events - full overlap ({n_stim} conditions)")
+        train_present_mask = torch.ones(n_stim, dtype=torch.bool, device=device)
+        test_present_mask = torch.ones(n_stim, dtype=torch.bool, device=device)
+        predictable_mask = train_present_mask
+        unpredictable_mask = torch.zeros(n_stim, dtype=torch.bool, device=device)
+        test_only_mask = torch.zeros(n_stim, dtype=torch.bool, device=device)
+        fit_mask = train_present_mask
+
+    return {
+        "train_present_mask": train_present_mask,
+        "test_present_mask": test_present_mask,
+        "predictable_mask": predictable_mask,
+        "unpredictable_mask": unpredictable_mask,
+        "test_only_mask": test_only_mask,
+        "fit_mask": fit_mask,
+    }
+
+
 def compute_xval_r2(
     data: torch.Tensor,
     design_matrix: np.ndarray | torch.Tensor,
@@ -1165,8 +1241,159 @@ def compute_xval_r2(
 
         split_info.append((train_tps, test_tps))
 
-    # Process CV splits
-    for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
+    # =========================================================================
+    # Per-run accumulation fast path
+    # =========================================================================
+    # When the caller has already removed nuisance (nuisance_indices empty --
+    # the project-first house style), no per-fold projection touches the data,
+    # and the only things a fold needs from the training set are X'X and X'y.
+    # Both are sums over runs, and generate_cv_splits always emits
+    # train == complement(test), so each fold is "all-run totals minus the
+    # held-out runs". That replaces a full-length gather of the training data
+    # per fold with two contiguous passes over the batch.
+    #
+    # FFS_XVAL_LEGACY=1 forces the original streaming loop, as an escape hatch
+    # if this path is ever suspected in a result.
+    use_per_run_path = len(nuisance_indices) == 0 and os.environ.get("FFS_XVAL_LEGACY", "") != "1"
+
+    if use_per_run_path:
+        stim_design_all = design_matrix[:, stim_indices]  # (n_timepoints, n_stim)
+        run_bounds = [(run_starts[r], run_starts[r] + int(run_lengths[r])) for r in range(n_runs)]
+        xtx_all = stim_design_all.T @ stim_design_all
+
+        # Per-fold work that depends only on the design, done once for all batches
+        fold_plans = []
+        for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
+            train_tps, test_tps = split_info[split_idx]
+            train_stim_design = stim_design_all[train_tps, :]
+            test_stim_design = stim_design_all[test_tps, :]
+
+            plan = _plan_fold_designs(
+                train_stim_design=train_stim_design,
+                test_stim_design=test_stim_design,
+                zero_event_strategy=zero_event_strategy,
+                train_runs=train_runs,
+                test_runs=test_runs,
+                device=device,
+                announce=bool(split_idx == 0 and verbose),
+            )
+            fit_mask = plan["fit_mask"]
+
+            xtx_train = xtx_all - test_stim_design.T @ test_stim_design
+            xtx_fit = xtx_train[fit_mask][:, fit_mask]
+            xtx_fit_inv = torch.linalg.inv(
+                xtx_fit + 1e-6 * torch.eye(xtx_fit.shape[0], device=device)
+            )
+
+            # 'nuisance' strategy projects train-only/test-only events out of the
+            # test data; built from the whole test set, as in the legacy path.
+            p_unpred = None
+            if zero_event_strategy == "nuisance":
+                events_to_project = plan["unpredictable_mask"] | plan["test_only_mask"]
+                if events_to_project.any():
+                    to_project = test_stim_design[:, events_to_project]
+                    xuxu = to_project.T @ to_project
+                    xuxu_inv = torch.linalg.inv(
+                        xuxu + 1e-6 * torch.eye(xuxu.shape[0], device=device)
+                    )
+                    p_unpred = to_project @ xuxu_inv @ to_project.T
+
+            plan.update(
+                {
+                    "test_runs": test_runs,
+                    "test_tps": test_tps,
+                    "test_stim_design": test_stim_design,
+                    "xtx_fit_inv": xtx_fit_inv,
+                    "p_unpred": p_unpred,
+                }
+            )
+            fold_plans.append(plan)
+
+            if not use_fast_r2:
+                count_per_timepoint[test_tps] += 1.0
+
+        n_stim_all = stim_design_all.shape[1]
+
+        for batch_start in range(0, n_voxels, effective_batch_size):
+            batch_end = min(batch_start + effective_batch_size, n_voxels)
+            batch_slice = slice(batch_start, batch_end)
+
+            # Pass 1: X'y over every run, so no fold has to touch the training data
+            xty_all = torch.zeros(
+                n_stim_all, batch_end - batch_start, dtype=torch.float32, device=device
+            )
+            for r in range(n_runs):
+                start_tp, end_tp = run_bounds[r]
+                y_run = data[batch_slice, start_tp:end_tp].to(device)
+                xty_all += stim_design_all[start_tp:end_tp, :].T @ y_run.T
+                del y_run
+
+            # Pass 2: folds, touching only their held-out runs
+            for plan in fold_plans:
+                test_tps = plan["test_tps"]
+                fit_mask = plan["fit_mask"]
+                test_data_batch = torch.cat(
+                    [
+                        data[batch_slice, run_bounds[r][0] : run_bounds[r][1]]
+                        for r in plan["test_runs"]
+                    ],
+                    dim=1,
+                ).to(device)
+
+                xty_train = xty_all - plan["test_stim_design"].T @ test_data_batch.T
+                betas_fit = plan["xtx_fit_inv"] @ xty_train[fit_mask]
+
+                if plan["p_unpred"] is not None:
+                    test_data_batch = test_data_batch - (plan["p_unpred"] @ test_data_batch.T).T
+
+                if zero_event_strategy == "zero":
+                    betas_full = torch.zeros(n_stim_all, betas_fit.shape[1], device=device)
+                    betas_full[plan["train_present_mask"], :] = betas_fit
+                    test_stim_present = plan["test_stim_design"][:, plan["test_present_mask"]]
+                    predictions_batch = (
+                        test_stim_present @ betas_full[plan["test_present_mask"], :]
+                    ).T
+                else:
+                    test_stim_predictable = plan["test_stim_design"][:, plan["predictable_mask"]]
+                    predictions_batch = (test_stim_predictable @ betas_fit).T
+
+                if use_fast_r2:
+                    # float64 accumulation without materialising float64 copies
+                    # (MPS has no float64, so reduce in float32 there).
+                    if test_data_batch.device.type == "mps":
+                        red_dtype = torch.float32
+                    else:
+                        red_dtype = torch.float64
+                    residuals = test_data_batch - predictions_batch
+                    ss_res_batch = (residuals * residuals).sum(dim=1, dtype=red_dtype)
+                    sum_actual_batch = test_data_batch.sum(dim=1, dtype=red_dtype)
+                    sum_sq_actual_batch = (test_data_batch * test_data_batch).sum(
+                        dim=1, dtype=red_dtype
+                    )
+                    ss_res_accumulator[batch_slice] += ss_res_batch.to(accumulator_device).double()
+                    sum_actual[batch_slice] += sum_actual_batch.to(accumulator_device).double()
+                    sum_sq_actual[batch_slice] += sum_sq_actual_batch.to(
+                        accumulator_device
+                    ).double()
+                    count_timepoints[batch_slice] += len(test_tps)
+                else:
+                    pred_accumulator[batch_slice, test_tps] += predictions_batch.to(
+                        accumulator_device
+                    )
+                    actual_accumulator[batch_slice, test_tps] += test_data_batch.to(
+                        accumulator_device
+                    )
+
+                del test_data_batch, predictions_batch, betas_fit, xty_train
+
+            del xty_all
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # Process CV splits (empty when the per-run fast path above already ran)
+    legacy_splits = [] if use_per_run_path else list(enumerate(cv_splits))
+    for split_idx, (train_runs, test_runs) in legacy_splits:
         if verbose:
             print(f"  Split {split_idx + 1}/{n_splits}: Train {train_runs} | Test {test_runs}")
 
@@ -1199,63 +1426,22 @@ def compute_xval_r2(
         train_stim_design = train_design_clean[:, stim_indices]
         test_stim_design = test_design_clean[:, stim_indices]
 
-        # 4b. Detect zero columns in stimulus indices (missing events across runs)
-        train_stim_norms = train_stim_design.abs().sum(dim=0)
-        test_stim_norms = test_stim_design.abs().sum(dim=0)
-
-        train_zero_mask = train_stim_norms < 1e-10
-        test_zero_mask = test_stim_norms < 1e-10
-
-        train_present_mask = ~train_zero_mask
-        test_present_mask = ~test_zero_mask
-        unpredictable_mask = train_present_mask & test_zero_mask
-        test_only_mask = train_zero_mask & test_present_mask
-        predictable_mask = train_present_mask & test_present_mask
-
-        # Handle missing events
-        if train_zero_mask.any() or test_zero_mask.any():
-            unpredictable_cols = [i for i, unpred in enumerate(unpredictable_mask) if unpred]
-            test_only_cols = [i for i, test_only in enumerate(test_only_mask) if test_only]
-
-            if split_idx == 0 and verbose:
-                print(f"\n{'=' * 80}")
-                print("INFO: Handling missing events across train/test splits")
-                print(f"{'=' * 80}")
-                print(f"Train-only events: {len(unpredictable_cols)} - {unpredictable_cols}")
-                print(f"Test-only events: {len(test_only_cols)} - {test_only_cols}")
-                print(f"Predictable events: {predictable_mask.sum().item()}")
-                print(f"Strategy: '{zero_event_strategy}'")
-                print(f"{'=' * 80}\n")
-
-            if not predictable_mask.any():
-                raise ValueError(
-                    f"No overlapping events between train {train_runs} and test {test_runs}! "
-                    f"All {len(stim_indices)} stimulus columns are zero in train or test."
-                )
-
-            if zero_event_strategy == "zero":
-                train_stim_design_fit = train_stim_design[:, train_present_mask]
-            elif zero_event_strategy == "nuisance":
-                train_stim_design_fit = train_stim_design[:, predictable_mask]
-            else:
-                raise ValueError(f"Unknown zero_event_strategy: '{zero_event_strategy}'")
-        else:
-            if split_idx == 0 and verbose:
-                print(f"    No missing events - full overlap ({len(stim_indices)} conditions)")
-            train_stim_design_fit = train_stim_design
-            train_present_mask = torch.ones(
-                train_stim_design.shape[1], dtype=torch.bool, device=device
-            )
-            test_present_mask = torch.ones(
-                test_stim_design.shape[1], dtype=torch.bool, device=device
-            )
-            predictable_mask = train_present_mask
-            unpredictable_mask = torch.zeros(
-                train_stim_design.shape[1], dtype=torch.bool, device=device
-            )
-            test_only_mask = torch.zeros(
-                train_stim_design.shape[1], dtype=torch.bool, device=device
-            )
+        # 4b. Which stimulus columns are usable in this fold (design-only decision)
+        plan = _plan_fold_designs(
+            train_stim_design=train_stim_design,
+            test_stim_design=test_stim_design,
+            zero_event_strategy=zero_event_strategy,
+            train_runs=train_runs,
+            test_runs=test_runs,
+            device=device,
+            announce=bool(split_idx == 0 and verbose),
+        )
+        train_present_mask = plan["train_present_mask"]
+        test_present_mask = plan["test_present_mask"]
+        predictable_mask = plan["predictable_mask"]
+        unpredictable_mask = plan["unpredictable_mask"]
+        test_only_mask = plan["test_only_mask"]
+        train_stim_design_fit = train_stim_design[:, plan["fit_mask"]]
 
         # =========================================================================
         # OPTIMIZATION 1: Pre-compute OLS pseudoinverse ONCE per split
