@@ -23,6 +23,9 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     collect_batch_jobs,
     parse_prefix,
+    print_cli_footer,
+    print_cli_header,
+    print_cli_section,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -1170,7 +1173,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device, verb: int) -> 
         _run_multi_echo(args, input_files, device, verb, reg_mean, reg_index)
 
     if verb >= 1:
-        print(f"Total time: {time.time() - t0:.2f}s")
+        print_cli_footer("ffs_moco", elapsed_seconds=time.time() - t0)
 
 
 def _expected_outputs(args: argparse.Namespace) -> list[str]:
@@ -1307,7 +1310,9 @@ def main(argv: list[str] | None = None) -> None:
     device = _select_device(args.device)
     verb = args.verb
     if verb >= 1:
-        print(f"ffs_moco\n  device: {device}")
+        print_cli_header("ffs_moco", "Rigid-body motion correction")
+        print_cli_section("Configuration", leading_blank=False)
+        print(f"  Device: {device}")
         print(
             "  interpolation kernels:\n"
             f"    motion estimation: {args.interp}\n"
@@ -1325,8 +1330,10 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
     t0 = time.time()
     data, header_info = _load_trimmed(input_file, args.skip_first, args.skip_last, verb)
     if verb >= 1:
-        print(f"Input: {input_file} {tuple(data.shape)} ({data.shape[0]} volumes)")
-        print(f"Load time: {time.time() - t0:.2f}s")
+        print_cli_section("Input")
+    if verb >= 1:
+        print(f"  File: {input_file}")
+        print(f"  Data: {tuple(data.shape)} ({data.shape[0]} volumes, {time.time() - t0:.2f}s)")
 
     base_vol, base_index = _parse_base(args, verb)
 
@@ -1337,10 +1344,15 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         args, device, verb, skip_resample=not need_aligned, base_index=base_index
     )
 
+    if verb >= 1:
+        print_cli_section("Estimating motion")
     t1 = time.time()
     result = _run_estimation(args, data, config, header_info, base_vol, input_file, verb)
     if verb >= 1:
-        print(f"Total registration: {time.time() - t1:.2f}s")
+        print(f"  Registration: {time.time() - t1:.2f}s")
+
+    if verb >= 1:
+        print_cli_section("Outputs")
 
     # Corrected timeseries (skipped when -prefix is omitted).
     if args.prefix is not None:
@@ -1383,9 +1395,9 @@ def _run_multi_echo(
 
     n_echoes = len(input_files)
     if verb >= 1:
+        print_cli_section("Input")
         which = "mean" if reg_mean else f"echo {reg_index + 1}"
-        print(f"Multi-echo: {n_echoes} echoes, estimating motion from {which}")
-
+        print(f"  Multi-echo: {n_echoes} echoes; estimation source: {which}")
     base_vol, base_index = _parse_base(args, verb)
 
     # -me_3depi: take the TE-dependent partition shift out FIRST, so the rigid
@@ -1409,10 +1421,12 @@ def _run_multi_echo(
     # Estimate once — matrices only. Each echo (including the reg echo) is
     # resampled separately below from its own data, so skip Pass 2 here.
     config = _build_config(args, device, verb, skip_resample=True, base_index=base_index)
+    if verb >= 1:
+        print_cli_section("Estimating motion")
     t1 = time.time()
     result = moco(reg_data, config, header_info=header_info, base_vol=base_vol)
     if verb >= 1:
-        print(f"Total registration: {time.time() - t1:.2f}s")
+        print(f"  Registration: {time.time() - t1:.2f}s")
     # The dfile's post-alignment RMS must be measured against the SHIFT-CORRECTED
     # base, since that is the geometry the matrices were estimated in.
     reg_base_shifted = reg_data[base_index].clone() if est is not None else None
@@ -1429,6 +1443,8 @@ def _run_multi_echo(
         # is nonzero and lives in the matrix we are about to fold.
         base_copy_idx = -1 if est is not None else (base_index if base_vol is None else -1)
         dtype = torch.float32
+        if verb >= 1:
+            print_cli_section("Resampling and outputs")
         for i, path in enumerate(input_files):
             echo_num = i + 1
             echo, echo_hdr = _load_trimmed(path, args.skip_first, args.skip_last, verb)

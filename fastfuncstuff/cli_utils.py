@@ -323,7 +323,29 @@ def parse_cv_strategy(cv_str: str) -> int | float:
         sys.exit(1)
 
 
-def print_cli_header(tool_name: str, subtitle: str = ""):
+CLI_RULE_WIDTH = 70
+
+
+def print_cli_section(title: str, *, leading_blank: bool = True) -> None:
+    """Print a consistently spaced section heading for interactive CLI output."""
+    if leading_blank:
+        print()
+    print(title)
+    print("-" * CLI_RULE_WIDTH)
+
+
+def print_cli_footer(tool_name: str, *, elapsed_seconds: float | None = None) -> None:
+    """Print a standard completion block with an optional elapsed time."""
+    print()
+    print("=" * CLI_RULE_WIDTH)
+    print(f"{tool_name} complete")
+    if elapsed_seconds is not None:
+        print(f"Elapsed: {elapsed_seconds:.1f}s")
+    print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * CLI_RULE_WIDTH)
+
+
+def print_cli_header(tool_name: str, subtitle: str = "") -> None:
     """
     Print standardized CLI header with timestamp.
 
@@ -334,11 +356,11 @@ def print_cli_header(tool_name: str, subtitle: str = ""):
     subtitle : str, optional
         Additional subtitle text to display
     """
-    print("=" * 70)
-    print(f"{tool_name}")
+    print("=" * CLI_RULE_WIDTH)
+    print(tool_name)
     if subtitle:
         print(subtitle)
-    print("=" * 70)
+    print("=" * CLI_RULE_WIDTH)
     print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 

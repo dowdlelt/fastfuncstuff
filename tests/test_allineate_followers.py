@@ -110,3 +110,32 @@ def test_mismatched_follower_prefix_count_errors(tmp_path):
                 "-verb", "0",
             ]
         )  # fmt: skip
+
+
+def test_matrix_apply_preserves_every_4d_source_volume(tmp_path):
+    """Bug of record: matrix-apply returned after writing source volume zero."""
+    affine = np.eye(4)
+    base = _phantom(16)
+    source = np.stack([base, base * 2.0, base * 3.0], axis=-1)
+    nib.save(nib.Nifti1Image(base.transpose(2, 1, 0), affine), tmp_path / "base.nii")
+    nib.save(
+        nib.Nifti1Image(source.transpose(2, 1, 0, 3), affine),
+        tmp_path / "source_4d.nii",
+    )
+    matrix = tmp_path / "identity.aff12.1D"
+    np.savetxt(matrix, np.eye(4, dtype=np.float32)[:3])
+
+    main(
+        [
+            "-base", str(tmp_path / "base.nii"),
+            "-source", str(tmp_path / "source_4d.nii"),
+            "-prefix", str(tmp_path / "out_4d.nii"),
+            "-1Dmatrix_apply", str(matrix),
+            "-final", "linear",
+            "-device", "cpu",
+            "-verb", "0",
+        ]
+    )  # fmt: skip
+
+    result = nib.load(tmp_path / "out_4d.nii").get_fdata()
+    assert result.shape == source.shape

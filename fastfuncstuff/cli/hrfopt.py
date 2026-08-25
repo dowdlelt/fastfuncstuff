@@ -24,7 +24,6 @@ For help:
 
 import argparse
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -513,18 +512,16 @@ Notes:
 
 def print_header(args):
     """Print program header"""
-    print("=" * 70)
-    print("3dHRFoptfast - GPU-Accelerated Cross-Validated HRF Optimization")
-    print("=" * 70)
-    print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+    from fastfuncstuff.cli_utils import print_cli_header
+
+    print_cli_header("ffs_hrfopt", "GPU-accelerated cross-validated HRF optimization")
 
 
 def print_summary(args, n_runs: int, n_conditions: int, n_voxels: int, condition_labels: list[str]):
     """Print analysis summary"""
-    print("=" * 70)
-    print("📋 Analysis Summary")
-    print("=" * 70)
+    from fastfuncstuff.cli_utils import print_cli_section
+
+    print_cli_section("Analysis summary", leading_blank=False)
     print(f"  Input runs: {n_runs}")
     print(f"  Conditions: {n_conditions} - {condition_labels}")
     print(f"  TR: {args.tr}s")
@@ -537,7 +534,6 @@ def print_summary(args, n_runs: int, n_conditions: int, n_voxels: int, condition
     print(f"  Microtime: dt={args.microtime_dt}s ({bins_per_tr} bins/TR)")
     print()
     print(f"  Output prefix: {args.prefix}")
-    print("=" * 70)
     print()
 
 
@@ -1594,19 +1590,14 @@ def main():
         ]
 
     # Print output summary
-    print()
-    print("=" * 70)
-    print("📁 Output Files")
-    print("=" * 70)
+    from fastfuncstuff.cli_utils import print_cli_footer, print_cli_section
+
+    print_cli_section("Output files")
     for output_type, filepath in output_files.items():
         print(f"  {output_type}: {filepath}")
-    print("=" * 70)
 
     # Print final summary
-    print()
-    print("=" * 70)
-    print("✅ 3dHRFoptfast Complete!")
-    print("=" * 70)
+    print_cli_section("Summary")
     print(f"  Mean xval R²: {results.xval_r2_best.mean().item():.4f}")
     if results.xval_r2_canonical is not None:
         canonical_r2 = results.xval_r2_canonical.mean().item()
@@ -1624,9 +1615,7 @@ def main():
         if count > 0:
             pct = 100 * count / n_voxels
             print(f"    HRF {i}: {count:,} voxels ({pct:.1f}%)")
-    print()
-    print(f"🕐 Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+    print_cli_footer("ffs_hrfopt")
 
 
 if __name__ == "__main__":

@@ -38,7 +38,6 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -405,11 +404,9 @@ Notes:
 
 def print_header():
     """Print program header"""
-    print("=" * 70)
-    print("ffs_pathfinder - Joint HRF + Denoising Optimization")
-    print("=" * 70)
-    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+    from fastfuncstuff.cli_utils import print_cli_header
+
+    print_cli_header("ffs_pathfinder", "Joint HRF and denoising optimization")
 
 
 def cross_validate_denoising_for_hrf(
@@ -1598,18 +1595,13 @@ def main():
         nii_ext=_nii_ext,
     )
 
-    print()
-    print("=" * 70)
-    print("Output Files")
-    print("=" * 70)
+    from fastfuncstuff.cli_utils import print_cli_footer, print_cli_section
+
+    print_cli_section("Output files")
     for output_type, filepath in output_files.items():
         print(f"  {output_type}: {filepath}")
-    print("=" * 70)
 
-    print()
-    print("=" * 70)
-    print("ffs_pathfinder Complete!")
-    print("=" * 70)
+    print_cli_section("Summary")
     print(f"  Global optimal PCs: {results.optimal_n_pcs}")
     print(f"  Mean denoised xval R²: {results.xval_r2_best.mean().item():.4f}")
     print(f"  Median denoised xval R²: {results.xval_r2_best.median().item():.4f}")
@@ -1619,9 +1611,7 @@ def main():
         if count > 0:
             pct = 100 * count / n_voxels
             print(f"    HRF {i + 1}: {count:,} voxels ({pct:.1f}%)")
-    print()
-    print(f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+    print_cli_footer("ffs_pathfinder")
 
 
 if __name__ == "__main__":

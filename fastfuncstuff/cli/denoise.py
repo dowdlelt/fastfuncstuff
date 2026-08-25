@@ -25,7 +25,6 @@ For help:
 import argparse
 import json
 import sys
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -655,11 +654,9 @@ Notes:
 
 def print_header(args):
     """Print program header"""
-    print("=" * 70)
-    print("3dDenoisefast - GPU-Accelerated Cross-Validated Denoising")
-    print("=" * 70)
-    print(f"🕐 Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print()
+    from fastfuncstuff.cli_utils import print_cli_header
+
+    print_cli_header("ffs_denoise", "GPU-accelerated cross-validated denoising")
 
 
 def _select_design_for_visualization(
@@ -3622,28 +3619,21 @@ def main():
             )
         output_files.update(snr_files)
 
-    print()
-    print("=" * 70)
-    print("📁 Output Files")
-    print("=" * 70)
+    from fastfuncstuff.cli_utils import print_cli_footer, print_cli_section
+
+    print_cli_section("Output files")
     for output_type, filepath in output_files.items():
         print(f"  {output_type}: {filepath}")
-    print("=" * 70)
 
     # Print summary
-    print()
-    print("=" * 70)
-    print("✅ 3dDenoisefast Complete!")
-    print("=" * 70)
+    print_cli_section("Summary")
     print(f"  Noise pool: {results.metadata['n_noise_voxels']:,} voxels")
     print(f"  Criteria: {results.metadata['n_criteria_voxels']:,} voxels")
     print(f"  Baseline R²: {results.baseline_r2:.4f}")
     print(f"  Optimal R²: {results.optimal_r2:.4f}")
     print(f"  Improvement: {results.improvement:+.4f}")
     print(f"  Optimal PCs: {results.optimal_n_components}")
-    print()
-    print(f"🕐 Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 70)
+    print_cli_footer("ffs_denoise")
 
 
 if __name__ == "__main__":

@@ -22,6 +22,9 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_verbose_arg,
     collect_batch_jobs,
+    print_cli_footer,
+    print_cli_header,
+    print_cli_section,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -395,9 +398,18 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
-        print(f"ffs_nwarp\n  device: {device}")
+        print_cli_header("ffs_nwarp", "Compose and apply spatial transforms")
+        print_cli_section("Inputs", leading_blank=False)
+        print(f"  Source: {args.source}")
+        print(f"  Master: {args.master or 'source grid'}")
+        print(f"  Output: {args.prefix}")
         if args.phase:
-            print(f"  phase warp: {args.phase_warp}")
+            print(f"  Phase:  {args.phase}")
+        print_cli_section("Configuration")
+        print(f"  Device: {device}")
+        print(f"  Data interpolation: {args.interp}")
+        if args.phase:
+            print(f"  Phase interpolation: {args.phase_warp} ({args.phase_units})")
 
     # Parse time_range if provided
     time_range = None
@@ -407,8 +419,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             time_range = (int(parts[0]), int(parts[1]))
         else:
             time_range = (0, int(parts[0]))
-        if verb >= 1:
-            print(f"ffs_nwarp: time_range={time_range}")
 
     # -ainterp resamples the *warp fields* during composition, not the data. A
     # displacement field is smooth/band-limited, so cubic reproduces it to
@@ -422,12 +432,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if ainterp is None:
         ainterp = "cubic"
     if verb >= 1:
-        print("  interpolation kernels:")
-        print(f"    final data resampling: {args.interp}")
-        print(f"    warp-field composition: {ainterp}")
+        print(f"  Warp interpolation: {ainterp}")
+        print(f"  Time range: {time_range or 'all volumes'}")
         if args.tpattern is not None:
-            print(f"    temporal resampling: {args.tinterp}")
-        print()
+            print(f"  Temporal interpolation: {args.tinterp}")
 
     jac_axis = None
     jac_match = None
@@ -439,15 +447,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         jac_axis = parse_pe_axis(axis_str)
         if verb >= 1:
             tail = f", fieldmap '{jac_match}'" if jac_match else ""
-            print(
-                f"ffs_nwarp: Jacobian modulation on phase-encode axis '{axis_str}' (axis {jac_axis}){tail}"
-            )
+            print(f"  Jacobian modulation: PE {axis_str} (axis {jac_axis}){tail}")
 
     nwarp_specs = parse_nwarp_string(args.nwarp)
     if verb >= 1:
-        print(f"ffs_nwarp: chain has {len(nwarp_specs)} transform(s)")
+        print_cli_section(f"Transform chain ({len(nwarp_specs)} transforms)")
+        print("  Applied top to bottom; each transform feeds the next.")
         for i, spec in enumerate(nwarp_specs):
-            print(f"  [{i}] {spec}")
+            print(f"  {i + 1:>2}. {spec}")
 
     # Slice timing: load per-slice offsets and resolve TR (header when not given).
     slice_times = None
@@ -473,11 +480,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             raise SystemExit("ffs_nwarp: -tpattern needs a TR; none in header, pass -TR.")
         if verb >= 1:
             print(
-                f"ffs_nwarp: slice timing {len(slice_times)} slices from "
-                f"{args.tpattern}, TR={tr:.4f}s, tinterp={args.tinterp}"
+                f"  Slice timing: {len(slice_times)} slices, TR={tr:.4f}s, pattern={args.tpattern}"
             )
 
     t0 = time.time()
+    if verb >= 1:
+        print_cli_section("Applying transforms")
 
     nwarpforge(
         source_path=args.source,
@@ -513,7 +521,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     )
 
     if verb >= 1:
-        print(f"ffs_nwarp: total time {time.time() - t0:.2f}s")
+        print_cli_footer("ffs_nwarp", elapsed_seconds=time.time() - t0)
 
 
 if __name__ == "__main__":

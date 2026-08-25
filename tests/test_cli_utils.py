@@ -25,11 +25,33 @@ from fastfuncstuff.cli_utils import (
     parse_cv_strategy,
     parse_device_arg,
     parse_input_files,
+    print_cli_footer,
+    print_cli_header,
+    print_cli_section,
 )
 
 # ============================================================================
 # Layer 1: Small Tests - Unit tests for core utility functions
 # ============================================================================
+
+
+def test_presentation_helpers_use_one_ascii_visual_language(capsys):
+    print_cli_header("ffs_example", "Example workflow")
+    print_cli_section("Inputs", leading_blank=False)
+    print("  Runs: 2")
+    print_cli_footer("ffs_example", elapsed_seconds=1.25)
+
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0] == "=" * 70
+    assert lines[1:3] == ["ffs_example", "Example workflow"]
+    assert lines[3] == "=" * 70
+    assert lines[4].startswith("Started: ")
+    assert lines[6:9] == ["Inputs", "-" * 70, "  Runs: 2"]
+    assert lines[10] == "=" * 70
+    assert lines[11:13] == ["ffs_example complete", "Elapsed: 1.2s"]
+    assert lines[13].startswith("Finished: ")
+    assert lines[14] == "=" * 70
+    assert all(line.isascii() for line in lines)
 
 
 class TestCliUtilsCoreFunctions:

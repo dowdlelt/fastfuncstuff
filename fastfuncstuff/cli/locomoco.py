@@ -37,6 +37,9 @@ from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
     collect_batch_jobs,
+    print_cli_footer,
+    print_cli_header,
+    print_cli_section,
     run_batch_jobs,
     setup_device,
 )
@@ -1673,10 +1676,11 @@ def _run_multiecho(
     # The estimator that runs is the reference-building pass (flow for the qwarp backend).
     prepass_backend = "flow" if qwarp_backend else args.backend
 
+    print_cli_header("ffs_locomoco", "Residual nonlinear motion correction")
+    print_cli_section("Configuration", leading_blank=False)
     print(
-        f"🌀 ffs_locomoco multi-echo "
-        f"({'2-D slicewise' if slicewise else '3-D'}): {len(datas)} echoes  "
-        f"shape={datas[0].shape}  device={device}"
+        f"   multi-echo ({'2-D slicewise' if slicewise else '3-D'}): "
+        f"{len(datas)} echoes, shape={datas[0].shape}, device={device}"
     )
     if qwarp_backend:
         print("   final data resampling kernel: wsinc5 (qwarp)")
@@ -1916,7 +1920,7 @@ def _run_multiecho(
             device=device,
         )
 
-    print("💾 Writing outputs...")
+    print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
     for j, res in enumerate(result.per_echo):
         estem = f"{stem}_e{j + 1}"
@@ -1991,7 +1995,7 @@ def _run_multiecho(
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
-    print("✅ ffs_locomoco multi-echo complete.")
+    print_cli_footer("ffs_locomoco")
     return 0
 
 
@@ -2336,7 +2340,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     acc_desc = f"refine={args.refine}, jacobian={'on' if args.jacobian else 'off'}"
     if preset:
         acc_desc = f"[{preset}] " + acc_desc
-    print(f"🌀 ffs_locomoco: {args.input}  shape={data.shape}  device={device}")
+    print_cli_header("ffs_locomoco", "Residual nonlinear motion correction")
+    print_cli_section("Configuration", leading_blank=False)
+    print(f"   input: {args.input}, shape={data.shape}, device={device}")
     print(f"   data resampling kernel: {_warp_kernel_label(args.warp_interp, args.warp_radius)}")
     if dual3d:
         axes_desc = (
@@ -2555,7 +2561,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         result = polished.per_echo[0]
 
-    print("💾 Writing outputs...")
+    print_cli_section("Outputs")
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
 
@@ -2674,7 +2680,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             actual = _write_movie(frames, movie_path, args.fps, fmt)
         print(f"  • flow movie (circular-phase wheel): {actual}")
 
-    print("✅ ffs_locomoco complete.")
+    print_cli_footer("ffs_locomoco")
     return 0
 
 

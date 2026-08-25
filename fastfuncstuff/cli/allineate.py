@@ -30,6 +30,9 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     collect_batch_jobs,
     enable_determinism,
+    print_cli_footer,
+    print_cli_header,
+    print_cli_section,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -689,12 +692,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     line reproduces a solo invocation bit-for-bit."""
     verb = args.verb
     if verb >= 1:
-        print(
-            f"ffs_allineate\n  device: {device}\n"
-            "  interpolation kernels:\n"
-            f"    alignment estimation: {args.interp}\n"
-            f"    final data resampling: {args.final_interp}\n"
-        )
+        print_cli_header("ffs_allineate", "Affine and rigid-body registration")
 
     # Validate follower pairing before the (long) alignment, not after it.
     _follower_pairs(args)
@@ -710,7 +708,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if base.ndim == 4:
         idx = args.base_index if args.base_index is not None else 0
         if verb >= 1:
-            print(f"Using volume {idx} from 4D base ({base.shape[0]} volumes)")
+            print(f"  Base volume: {idx} of {base.shape[0]}")
         base = base[idx]
 
     # Handle 4D source
@@ -719,12 +717,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         source_4d = source
         source = source[0]
         if verb >= 1:
-            print(f"Source is 4D ({source_4d.shape[0]} volumes), aligning first volume")
+            print(f"  Estimation volume: first of {source_4d.shape[0]}")
 
     if verb >= 1:
-        print(f"Base: {args.base} {base.shape}")
-        print(f"Source: {args.source} {source.shape}")
-        print(f"Load time: {time.time() - t0:.2f}s")
+        print_cli_section("Inputs", leading_blank=False)
+        print(f"  Base:   {args.base} {tuple(base.shape)}")
+        print(f"  Source: {args.source} {tuple(source.shape)}")
+        print(f"  Output: {args.prefix}")
+        print(f"  Loaded: {time.time() - t0:.2f}s")
 
     # Output grid: the base's grid by default, or a -dxyz master grid (base space/FOV/centre
     # at a new voxel size). The transform is applied into `out_shape` and saved with `out_affine`.
@@ -738,7 +738,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     if getattr(args, "1Dmatrix_apply", None) is not None:
         matrix_path = getattr(args, "1Dmatrix_apply")
         if verb >= 1:
-            print(f"Applying matrix from {matrix_path}")
+            print_cli_section("Applying existing transform")
+            print(f"  Matrix: {matrix_path}")
 
         matrix = load_matrix_1D(
             matrix_path,
@@ -747,14 +748,33 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         )
         matrix = matrix.to(device)
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
-        warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
+        if source_4d is None:
+            warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
+        else:
+            if verb >= 1:
+                print(f"  Volumes: {source_4d.shape[0]}")
+            warped = torch.stack(
+                [_resample(vol, om, out_shape, args.final_interp, args.no_neg) for vol in source_4d]
+            )
+        if verb >= 1:
+            print_cli_section("Outputs")
         with spinner(f"Writing {Path(args.prefix).name}"):
             save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
-            print(f"Saved: {args.prefix}")
+            print(f"  Aligned data: {args.prefix}")
         _apply_followers(
             args, om, base_header, source_header["affine"], out_affine, out_shape, device
         )
+        if source_4d is not None and args.save_mean:
+            mean_path = derive_mean_output_path(args.prefix)
+            with spinner(f"Writing {Path(mean_path).name}"):
+                save_image(
+                    warped.mean(dim=0), mean_path, header_info=base_header, affine=out_affine
+                )
+            if verb >= 1:
+                print(f"  Mean: {mean_path}")
+        if verb >= 1:
+            print_cli_footer("ffs_allineate", elapsed_seconds=time.time() - t0)
         return
 
     # --- Build config with speed/quality presets ---
@@ -780,26 +800,24 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
     twopass = not args.onepass
 
     # Apply presets
+    preset = "standard"
     if args.superfast:
         adam_iters_2x = 150
         adam_iters_1x = 150
         powell_maxfev = 0
         twopass = False
-        if verb >= 1:
-            print("Mode: superfast (onepass, <=150 iters, no Powell)")
+        preset = "superfast"
     elif args.fast:
         adam_iters_2x = 300
         adam_iters_1x = 300
         powell_maxfev = 0
-        if verb >= 1:
-            print("Mode: fast (<=300 iters, no Powell)")
+        preset = "fast"
     elif args.slow:
         adam_iters_2x = 600
         adam_iters_1x = 800
         # -slow is a request for maximum accuracy, so it opts into the polish.
         powell_maxfev = 0 if args.no_polish else 2000
-        if verb >= 1:
-            print("Mode: slow (<=600/800 iters, 2000 Powell evals)")
+        preset = "slow"
 
     # Auto-size box radius if requested
     lpa_sigma = args.lpa_sigma
@@ -852,6 +870,18 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         verb=verb,
     )
 
+    if verb >= 1:
+        print_cli_section("Configuration")
+        print(f"  Transform: {dof}")
+        print(f"  Cost: {args.cost}")
+        print(f"  Preset: {preset}")
+        print(f"  Optimizer: {args.optimizer}")
+        print(f"  Search: {'two-pass' if twopass else 'one-pass'}")
+        print(f"  Center of mass: {'off' if args.nocmass else 'on'}")
+        print(f"  Estimation interpolation: {args.interp}")
+        print(f"  Final interpolation: {args.final_interp}")
+        print(f"  Device: {device}")
+        print_cli_section("Estimating transform")
     # --- Run alignment ---
     t1 = time.time()
     matrix, warped = allineate(
@@ -865,9 +895,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         save_weight_path=args.save_weight,
     )
 
-    if verb >= 1:
-        print(f"Alignment time: {time.time() - t1:.2f}s")
-
     # --- Save outputs ---
     # -dxyz: re-resample onto the master grid at the requested voxel size (allineate returned
     # `warped` on the base grid). Same transform, finer/coarser output.
@@ -876,10 +903,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
     elif args.no_neg:
         warped = warped.clamp_min(0.0)
-    with spinner(f"Writing {Path(args.prefix).name}"):
-        save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
     if verb >= 1:
-        print(f"Saved: {args.prefix}")
+        print_cli_section("Outputs")
+    if source_4d is None:
+        with spinner(f"Writing {Path(args.prefix).name}"):
+            save_image(warped, args.prefix, header_info=base_header, affine=out_affine)
+        if verb >= 1:
+            print(f"  Aligned data: {args.prefix}")
 
     _apply_followers(
         args,
@@ -900,12 +930,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             source_affine=source_header["affine"],
         )
         if verb >= 1:
-            print(f"Saved matrix: {matrix_save_path}")
+            print(f"  Matrix: {matrix_save_path}")
 
     # --- Apply to all 4D volumes ---
     if source_4d is not None:
         if verb >= 1:
-            print(f"Applying alignment to all {source_4d.shape[0]} volumes...")
+            print(f"  Resampling {source_4d.shape[0]} source volumes")
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
         aligned_vols = [
             _resample(source_4d[t], om, out_shape, args.final_interp, args.no_neg)
@@ -915,7 +945,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         with spinner(f"Writing {Path(args.prefix).name}"):
             save_image(result_4d, args.prefix, header_info=base_header, affine=out_affine)
         if verb >= 1:
-            print(f"Saved 4D result: {args.prefix}")
+            print(f"  Aligned data: {args.prefix}")
 
         if args.save_mean:
             mean_path = derive_mean_output_path(args.prefix)
@@ -923,12 +953,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
             with spinner(f"Writing {Path(mean_path).name}"):
                 save_image(mean_image, mean_path, header_info=base_header, affine=out_affine)
             if verb >= 1:
-                print(f"Saved mean: {mean_path}")
+                print(f"  Mean: {mean_path}")
     elif args.save_mean and verb >= 1:
-        print("-save_mean requested, but source is not 4D; skipping mean output")
+        print("  Mean: skipped (source is 3D)")
 
     if verb >= 1:
-        print(f"Total time: {time.time() - t0:.2f}s")
+        print(f"  Alignment: {time.time() - t1:.2f}s")
+        print_cli_footer("ffs_allineate", elapsed_seconds=time.time() - t0)
 
 
 if __name__ == "__main__":
