@@ -1243,3 +1243,68 @@ def test_xval_fast_path_matches_legacy(
     monkeypatch.setenv("FFS_XVAL_LEGACY", "1")
     legacy = compute_xval_r2(**kwargs)["r2"]
 
+    assert torch.abs(fast - legacy).max() < 1e-5
+
+
+# ---------------------------------------------------------------------------
+# Chunk-outer fast path in single_trial_cv_helper (ffs_ridge beta-space CV)
+# ---------------------------------------------------------------------------
+
+
+def _beta_cv_case(n_variants=3, n_vox=40, n_runs=5, n_cond=6, trials_per_run=8, empty_cond=False):
+    torch.manual_seed(9)
+    n_trials = n_runs * trials_per_run
+    betas = torch.randn(n_variants, n_vox, n_trials)
+    conditions = torch.randint(0, n_cond, (n_trials,))
+    if empty_cond:
+        # A condition present in only one run is absent from that fold's
+        # training set, so its train count is zero.
+        conditions[conditions == n_cond - 1] = 0
+        conditions[3] = n_cond - 1
+    run_ids = torch.arange(n_trials) // trials_per_run
+    return betas, conditions, run_ids, n_runs
+
+
+@pytest.mark.parametrize(
+    "metric,kwargs,empty_cond,cv_strategy,n_perms",
+    [
+        ("cod", {}, False, 1, 100),
+        ("sse", {}, False, 1, 100),
+        ("corr", {}, False, 1, 100),
+        ("corr2", {}, False, 1, 100),
+        ("cod", {"zscore_by_run": True}, False, 1, 100),
+        ("cod", {"test_variant_idx": 2}, False, 1, 100),
+        ("cod", {}, True, 1, 100),  # condition missing from a training set
+        ("sse", {}, True, 1, 100),
+        ("cod", {"chunk_size": 7}, False, 1, 100),  # multiple voxel chunks
+        ("sse", {"chunk_size": 7}, False, 1, 100),
+        ("cod", {}, False, 2, 6),  # leave-two-runs-out
+    ],
+)
+def test_single_trial_cv_chunk_outer_matches_legacy(
+    monkeypatch, metric, kwargs, empty_cond, cv_strategy, n_perms
+):
+    """Per-condition totals minus held-out trials must match the fold-outer loop."""
+    from fastfuncstuff.glm.xval import generate_cv_splits, single_trial_cv_helper
+
+    betas, conditions, run_ids, n_runs = _beta_cv_case(empty_cond=empty_cond)
+    splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+    call = dict(
+        beta_variants=betas,
+        trial_condition_ids=conditions,
+        trial_run_ids=run_ids,
+        cv_splits=splits,
+        metric=metric,
+        device=torch.device("cpu"),
+        verbose=False,
+        **kwargs,
+    )
+
+    monkeypatch.delenv("FFS_RIDGE_CV_LEGACY", raising=False)
+    fast = single_trial_cv_helper(**call)["r2"]
+
+    monkeypatch.setenv("FFS_RIDGE_CV_LEGACY", "1")
+    legacy = single_trial_cv_helper(**call)["r2"]
+
+    scale = max(1.0, float(legacy.abs().max()))
+    assert torch.abs(fast - legacy).max() / scale < 1e-5

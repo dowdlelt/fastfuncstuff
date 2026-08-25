@@ -1850,6 +1850,175 @@ def single_trial_cv_helper(
                 beta_variants[v, :, run_mask] = (beta_variants[v, :, run_mask] - mu) / sigma
 
     # =========================================================================
+    # Chunk-outer fast path
+    # =========================================================================
+    # The fold loop only ever needs, per condition, the sum (and for SSE the sum
+    # of squares) over the *training* trials. Those are sums over runs, and the
+    # CV splits partition the runs, so each fold is the all-trial total minus its
+    # held-out trials — no per-fold gather over the training set, and no reason
+    # to re-upload the same betas once per fold.
+    #
+    # Only conditions that actually appear in the test set can contribute, so the
+    # per-fold work is proportional to the held-out trials rather than to
+    # n_conditions.
+    #
+    # FFS_RIDGE_CV_LEGACY=1 forces the original fold-outer loop.
+    all_run_ids = set(torch.unique(trial_run_ids).tolist())
+    splits_partition_runs = all(
+        set(tr) | set(te) == all_run_ids and not (set(tr) & set(te)) for tr, te in cv_splits
+    )
+    use_chunk_outer = splits_partition_runs and os.environ.get("FFS_RIDGE_CV_LEGACY", "") != "1"
+
+    if use_chunk_outer:
+        cond_ids_dev = trial_condition_ids.to(device)
+        total_count = torch.bincount(cond_ids_dev, minlength=n_conditions).to(
+            device=device, dtype=torch.float32
+        )
+
+        # Per-fold trial bookkeeping (voxel-independent, done once)
+        folds = []
+        for train_runs, test_runs in cv_splits:  # noqa: B007
+            test_mask = torch.zeros(n_trials, dtype=torch.bool, device=device)
+            for r in test_runs:
+                test_mask |= trial_run_ids == r
+            test_indices = torch.where(test_mask)[0]
+            if len(test_indices) == 0:
+                continue
+            test_conditions = cond_ids_dev[test_indices]
+            uniq_conds, inv = torch.unique(test_conditions, return_inverse=True)
+            test_counts = torch.bincount(inv, minlength=uniq_conds.numel()).to(torch.float32)
+            folds.append((test_indices, uniq_conds, inv, test_counts))
+
+        total_test_trials = sum(len(f[0]) for f in folds)
+
+        is_sse = metric == "sse"
+        if is_sse:
+            sse_accum = torch.zeros(n_variants, n_voxels, device="cpu")
+        else:
+            # Sufficient statistics for cod/corr/corr2 over the concatenated test
+            # trials — replaces materialising the full predicted/actual matrices,
+            # which at production scale is several GB of host memory.
+            stat_shape = (n_variants, n_voxels)
+            acc_sum_y = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+            acc_sum_p = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+            acc_sum_yy = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+            acc_sum_pp = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+            acc_sum_yp = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+            acc_ss_res = torch.zeros(stat_shape, dtype=torch.float64, device="cpu")
+
+        for chunk_start in range(0, n_voxels, chunk_size):
+            chunk_end = min(chunk_start + chunk_size, n_voxels)
+            chunk_slice = slice(chunk_start, chunk_end)
+            n_chunk = chunk_end - chunk_start
+
+            # Uploaded once per chunk instead of once per (fold, chunk)
+            betas_chunk = beta_variants[:, chunk_slice, :].to(device)
+
+            total_sum = torch.zeros(n_variants, n_chunk, n_conditions, device=device).index_add_(
+                2, cond_ids_dev, betas_chunk
+            )
+            total_sum_sq = None
+            if is_sse:
+                total_sum_sq = torch.zeros(
+                    n_variants, n_chunk, n_conditions, device=device
+                ).index_add_(2, cond_ids_dev, betas_chunk * betas_chunk)
+
+            for test_indices, uniq_conds, inv, test_counts in folds:
+                test_betas = betas_chunk[:, :, test_indices]  # (n_var, n_chunk, n_test)
+
+                # Train totals for the conditions present in this test set
+                test_sum = torch.zeros(
+                    n_variants, n_chunk, uniq_conds.numel(), device=device
+                ).index_add_(2, inv, test_betas)
+                train_sum = total_sum[:, :, uniq_conds] - test_sum
+                train_count = total_count[uniq_conds] - test_counts
+
+                if is_sse:
+                    test_sum_sq = torch.zeros(
+                        n_variants, n_chunk, uniq_conds.numel(), device=device
+                    ).index_add_(2, inv, test_betas * test_betas)
+                    train_sum_sq = total_sum_sq[:, :, uniq_conds] - test_sum_sq
+
+                    # GLMsingle calcbadness: each test trial against every
+                    # matching-condition training trial, expanded algebraically.
+                    ref_test = betas_chunk[int(test_variant_idx), :, test_indices]
+                    n_train_per_test = train_count[inv]  # (n_test,)
+                    sum_train_per_test = train_sum[:, :, inv]  # (n_var, n_chunk, n_test)
+                    sum_sq_train_per_test = train_sum_sq[:, :, inv]
+                    sse_per_test = (
+                        n_train_per_test * ref_test.unsqueeze(0) ** 2
+                        - 2 * ref_test.unsqueeze(0) * sum_train_per_test
+                        + sum_sq_train_per_test
+                    )
+                    sse_accum[:, chunk_slice] += sse_per_test.sum(dim=-1).cpu()
+                    del test_sum_sq, train_sum_sq, sse_per_test
+                else:
+                    cond_avg = train_sum / train_count.clamp(min=1.0)
+                    predicted = cond_avg[:, :, inv]  # (n_var, n_chunk, n_test)
+                    if test_variant_idx is not None:
+                        ref_test = betas_chunk[int(test_variant_idx), :, test_indices]
+                        actual = ref_test.unsqueeze(0).expand(n_variants, -1, -1)
+                    else:
+                        actual = test_betas
+
+                    resid = actual - predicted
+                    acc_sum_y[:, chunk_slice] += actual.sum(dim=-1, dtype=torch.float64).cpu()
+                    acc_sum_p[:, chunk_slice] += predicted.sum(dim=-1, dtype=torch.float64).cpu()
+                    acc_sum_yy[:, chunk_slice] += (
+                        (actual * actual).sum(dim=-1, dtype=torch.float64).cpu()
+                    )
+                    acc_sum_pp[:, chunk_slice] += (
+                        (predicted * predicted).sum(dim=-1, dtype=torch.float64).cpu()
+                    )
+                    acc_sum_yp[:, chunk_slice] += (
+                        (actual * predicted).sum(dim=-1, dtype=torch.float64).cpu()
+                    )
+                    acc_ss_res[:, chunk_slice] += (
+                        (resid * resid).sum(dim=-1, dtype=torch.float64).cpu()
+                    )
+                    del cond_avg, predicted, actual, resid
+
+                del test_betas, test_sum, train_sum
+
+            del betas_chunk, total_sum, total_sum_sq
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        if is_sse:
+            r2 = sse_accum
+        else:
+            n_pts = float(total_test_trials)
+            if metric == "cod":
+                ss_tot = acc_sum_yy - acc_sum_y**2 / n_pts
+                r2 = (1.0 - acc_ss_res / (ss_tot + 1e-10)).float()
+            else:
+                # Pearson from sufficient statistics
+                cov = acc_sum_yp - acc_sum_y * acc_sum_p / n_pts
+                var_y = acc_sum_yy - acc_sum_y**2 / n_pts
+                var_p = acc_sum_pp - acc_sum_p**2 / n_pts
+                corr = cov / (
+                    torch.sqrt(var_y.clamp(min=0)) * torch.sqrt(var_p.clamp(min=0)) + 1e-10
+                )
+                r2 = (corr**2).float() if metric == "corr2" else corr.float()
+
+        if verbose:
+            r2_mean = r2.mean(dim=1)
+            label = "mean SSE" if is_sse else "mean R²"
+            for v in range(min(n_variants, 5)):
+                val = f"{r2_mean[v]:.1f}" if is_sse else f"{r2_mean[v]:.4f}"
+                print(f"  Variant {v}: {label}={val}")
+            if n_variants > 5:
+                print(f"  ... ({n_variants - 5} more variants)")
+            print(f"  ({total_test_trials} test trials across {n_splits} folds)")
+
+        return {
+            "r2": r2,
+            "r2_mean": r2.mean(dim=1),
+            "n_splits": n_splits,
+            "n_test_trials_total": total_test_trials,
+        }
+
+    # =========================================================================
     # Build fold masks once
     # =========================================================================
     fold_info = []
