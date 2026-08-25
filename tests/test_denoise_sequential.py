@@ -760,3 +760,152 @@ class TestComputeXvalR2OptimalFull:
             device=DEVICE,
         )
         assert r2_all.shape == (120,)
+
+
+# ---------------------------------------------------------------------------
+# Frisch-Waugh-Lovell fast path for cross_validate_noise_pcs
+# ---------------------------------------------------------------------------
+
+
+def _fwl_case(n_runs=4, tp=40, n_vox=90, max_comp=3, ragged=False):
+    """Synthetic multi-run dataset with task signal, PC noise and drift."""
+    torch.manual_seed(11)
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+
+    design = torch.zeros(n_tp, 3)
+    design[2::9, 0] = 1.0
+    design[5::13, 1] = 1.0
+    design[1::7, 2] = 1.0
+
+    nuisance = [construct_polynomial_matrix(tp, 3, DEVICE).float() for _ in range(n_runs)]
+    # A run with fewer components than requested exercises the ragged branch of
+    # the nested projector (a real case: component caps differ per run).
+    pcs = [torch.randn(tp, 2 if (ragged and r == 1) else max_comp) for r in range(n_runs)]
+
+    data = torch.randn(n_vox, n_tp) * 0.5 + torch.randn(n_vox, 3) @ design.T
+    for r in range(n_runs):
+        sl = slice(run_starts[r], run_starts[r] + tp)
+        data[:, sl] += torch.randn(n_vox, pcs[r].shape[1]) @ pcs[r].T
+        data[:, sl] += torch.randn(n_vox, nuisance[r].shape[1]) @ nuisance[r].T * 2.0
+
+    return dict(
+        data=data,
+        design_matrix=design,
+        noise_pcs=pcs,
+        run_starts=run_starts,
+        tr=1.0,
+        max_components=max_comp,
+        nuisance=nuisance,
+        device=DEVICE,
+    )
+
+
+def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
+    """Reference R² built the slow, obvious way: fit [X | zero-padded PCs] directly.
+
+    This is the formulation the fast path replaced. It exists here so the
+    Frisch-Waugh-Lovell identity is checked against something independent
+    rather than against a stored snapshot.
+
+    Mirrors the pipeline's "concatenated predictions" semantics: each fold
+    writes its test-run predictions into a full-length timeseries (so with
+    overlapping test sets the last fold to cover a timepoint wins), and R² is
+    computed once at the end.
+    """
+    from fastfuncstuff.glm.xval import (
+        compute_r2_metric,
+        generate_cv_splits,
+        project_out_nuisance_per_run,
+    )
+
+    data = case["data"]
+    design = case["design_matrix"]
+    pcs = case["noise_pcs"]
+    run_starts = case["run_starts"]
+    max_comp = case["max_components"]
+    n_tp = data.shape[1]
+    n_vox = data.shape[0]
+    n_runs = len(run_starts)
+    run_ends = [run_starts[i + 1] if i < n_runs - 1 else n_tp for i in range(n_runs)]
+
+    data_p, design_p = project_out_nuisance_per_run(
+        data=data,
+        design=design,
+        nuisance_per_run=case["nuisance"],
+        run_starts=run_starts,
+        device=DEVICE,
+    )
+
+    r2_maps = np.zeros((n_vox, max_comp + 1), dtype=np.float64)
+    splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+
+    for k in range(max_comp + 1):
+        pred = torch.zeros(n_vox, n_tp, dtype=torch.float64)
+
+        for train_runs, test_runs in splits:
+            tr_tps = torch.cat([torch.arange(run_starts[r], run_ends[r]) for r in train_runs])
+            te_tps = torch.cat([torch.arange(run_starts[r], run_ends[r]) for r in test_runs])
+
+            # Zero-padded block-diagonal PC block over the training runs
+            blocks = []
+            for pos, r in enumerate(train_runs):
+                run_len = run_ends[r] - run_starts[r]
+                pad = torch.zeros(run_len, len(train_runs) * k)
+                n_use = min(k, pcs[r].shape[1])
+                if n_use > 0:
+                    pad[:, pos * k : pos * k + n_use] = pcs[r][:, :n_use]
+                blocks.append(pad)
+            x_full = design_p[tr_tps, :]
+            if k > 0:
+                x_full = torch.cat([x_full, torch.cat(blocks, dim=0)], dim=1)
+
+            pinv = torch.linalg.pinv(x_full.double(), rcond=1e-6)
+            betas = (pinv @ data_p[:, tr_tps].double().T)[: design.shape[1], :]
+            y_pred = design_p[te_tps, :].double() @ betas
+
+            pred[:, te_tps] = y_pred.T
+
+        r2_maps[:, k] = compute_r2_metric(data_p.double(), pred, metric="cod").numpy()
+
+    return r2_maps
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_cross_validate_noise_pcs_matches_explicit_full_model(ragged):
+    """The FWL fast path must reproduce an explicit [X | PC] fit, per PC count.
+
+    Task betas of the full model equal those of the PC-residualized reduced
+    model; if that identity is ever broken the R² curve silently changes.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case(ragged=ragged)
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    reference = _explicit_full_model_r2(case, cv_strategy=1)
+
+    assert np.abs(fast - reference).max() < 1e-4
+
+
+def test_cross_validate_noise_pcs_chunking_is_invariant():
+    """Chunk size must not change results: folds combine per-run totals."""
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    whole, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    chunked, _ = cross_validate_noise_pcs(**case, cv_strategy=1, chunk_size=17)
+
+    assert np.abs(whole - chunked).max() < 1e-5
+
+
+def test_cross_validate_noise_pcs_non_loro_matches_explicit():
+    """Leave-two-out uses the full-accumulator path; it must agree too."""
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=2, n_perms=6)
+    reference = _explicit_full_model_r2(case, cv_strategy=2, n_perms=6)
+
+    assert np.abs(fast - reference).max() < 1e-4

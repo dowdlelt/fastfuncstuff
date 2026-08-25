@@ -87,6 +87,83 @@ def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
     return Q.to(matrix.device)
 
 
+def _nested_orthonormal_basis(pcs: torch.Tensor, tol: float = 1e-8) -> torch.Tensor:
+    """Orthonormalize PC columns so that the first k columns span the first k PCs.
+
+    Modified Gram-Schmidt rather than QR because the *nesting* matters: the CV
+    sweep tests PC counts 0..K and each count must see the projector for exactly
+    its own leading columns. Degenerate columns come back as zeros, which makes
+    them contribute nothing to the projection — the same thing a pseudo-inverse
+    does with a rank-deficient regressor block.
+    """
+    n_tp, k = pcs.shape
+    q = torch.zeros_like(pcs)
+    for j in range(k):
+        v = pcs[:, j].clone()
+        for i in range(j):
+            qi = q[:, i]
+            v = v - qi * torch.dot(qi, v)
+        col_norm = torch.linalg.vector_norm(v)
+        if col_norm > tol * max(1.0, float(torch.linalg.vector_norm(pcs[:, j]))):
+            q[:, j] = v / col_norm
+    return q
+
+
+def _residualize_design_by_pc_count(
+    design_run: torch.Tensor,
+    pc_basis: torch.Tensor,
+    max_components: int,
+) -> torch.Tensor:
+    """Design with the leading k PCs projected out, for every k in 0..max_components.
+
+    Frisch-Waugh-Lovell: the task betas of [X | PC] equal those of the regression
+    of the PC-residualized data on the PC-residualized X. Because the PC block is
+    block-diagonal over runs, this residualization is *per run* and therefore the
+    same in every CV fold — which is why it can be hoisted this far out.
+
+    Returns (max_components + 1, run_length, n_task).
+    """
+    n_available = pc_basis.shape[1]
+    out = torch.empty(
+        (max_components + 1, design_run.shape[0], design_run.shape[1]),
+        dtype=design_run.dtype,
+        device=design_run.device,
+    )
+    current = design_run.clone()
+    out[0] = current
+    for k in range(1, max_components + 1):
+        if k <= n_available:
+            q_col = pc_basis[:, k - 1 : k]  # (run_length, 1)
+            current = current - q_col @ (q_col.T @ current)
+        # k > n_available: this run has no k-th component, so the projector for
+        # count k is the same one count n_available already applied.
+        out[k] = current
+    return out
+
+
+def _solve_task_betas(gram: torch.Tensor, xty: torch.Tensor) -> torch.Tensor:
+    """Solve ``gram @ B = xty`` for every PC count at once.
+
+    ``gram`` is (n_pc_counts, n_task, n_task) and ``xty`` is
+    (n_pc_counts, n_task, n_voxels). Promoted to float64 for the solve because
+    that is the numerically sensitive step; the result is cast back for storage.
+    """
+    use_f64 = gram.device.type != "mps"  # MPS has no float64
+    solve_dtype = torch.float64 if use_f64 else torch.float32
+    gram_s = gram.to(solve_dtype)
+    xty_s = xty.to(solve_dtype)
+    try:
+        betas = torch.linalg.solve(gram_s, xty_s)
+        if not torch.isfinite(betas).all():
+            raise RuntimeError("non-finite betas")
+    except (torch._C._LinAlgError, RuntimeError):  # ty: ignore[unresolved-attribute]
+        # Rank-deficient design (e.g. a condition absent from the training runs):
+        # the pseudo-inverse gives the minimum-norm solution, matching what the
+        # explicit pinv over the full regressor block used to do.
+        betas = torch.linalg.pinv(gram_s, rcond=1e-6) @ xty_s
+    return betas.to(xty.dtype)
+
+
 def _compute_local_run_starts(
     run_indices: list[int],
     run_starts: list[int],
@@ -1156,6 +1233,8 @@ def cross_validate_noise_pcs(
     verbose: bool = False,
     designs_by_hrf: dict | None = None,
     hrf_indices: torch.Tensor | None = None,
+    progress_desc: str = "Denoising CV",
+    progress_leave: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -1329,27 +1408,9 @@ def cross_validate_noise_pcs(
     cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
     n_splits = len(cv_splits)
 
-    # Precompute run timepoint index tensors once (CPU)
-    run_time_indices = []
-    for run_idx in range(n_runs):
-        start_tp = run_starts[run_idx]
-        end_tp = run_starts[run_idx + 1] if run_idx < n_runs - 1 else n_timepoints
-        run_time_indices.append(torch.arange(start_tp, end_tp, dtype=torch.long))
-
-    # Precompute per-fold train/test indices once (avoids rebuilding per chunk)
-    fold_index_info = []
-    for train_runs, test_runs in cv_splits:
-        train_tps_t = torch.cat([run_time_indices[run_idx] for run_idx in train_runs], dim=0)
-        test_tps_t = torch.cat([run_time_indices[run_idx] for run_idx in test_runs], dim=0)
-        fold_index_info.append(
-            {
-                "train_runs": train_runs,
-                "test_runs": test_runs,
-                "train_tps_t": train_tps_t,
-                "test_tps_t": test_tps_t,
-                "test_tps_list": test_tps_t.tolist(),
-            }
-        )
+    # Folds are addressed by run, not by timepoint: every quantity the CV loop
+    # needs is accumulated per run and combined, so the old per-fold timepoint
+    # index tensors (and the chunk-sized gathers they drove) are gone.
 
     # Cache noise PCs on compute device once (tiny tensors; avoids repeated transfers)
     noise_pcs_on_device = [
@@ -1364,12 +1425,13 @@ def cross_validate_noise_pcs(
     else:
         cv_desc = f"{cv_strategy:.0%} train split ({n_splits} folds)"
 
-    print(f"\n{'=' * 70}")
-    print(f"Cross-validating noise PC denoising (0 to {max_components} PCs)")
-    print(f"Strategy: {cv_desc}")
-    print(f"Total voxels: {n_voxels:,} (processing ALL voxels)")
-    print("Method: GLMdenoise-style concatenated predictions")
-    print(f"{'=' * 70}")
+    if verbose:
+        print(f"\n{'=' * 70}")
+        print(f"Cross-validating noise PC denoising (0 to {max_components} PCs)")
+        print(f"Strategy: {cv_desc}")
+        print(f"Total voxels: {n_voxels:,} (processing ALL voxels)")
+        print("Method: GLMdenoise-style concatenated predictions")
+        print(f"{'=' * 70}")
 
     # =========================================================================
     # GLMdenoise-style: Accumulate predictions across folds, compute R² once
@@ -1441,18 +1503,20 @@ def cross_validate_noise_pcs(
     # Only small matrices (design) can go to proj_device
     data_cpu = data.cpu() if data.device.type != "cpu" else data
     design_matrix_cpu = design_matrix.to(proj_device)  # Small, can stay on proj_device
+    n_task_regs = design_matrix_cpu.shape[1]
 
     # Output: R² maps for all voxels and all PC counts
     r2_maps = np.zeros((n_voxels, max_components + 1), dtype=np.float32)
 
-    if is_loro:
-        print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
-        print("Memory strategy: LORO streaming stats (minimal memory)")
-        print(f"Projection device: {proj_device} (GPU acceleration enabled)")
-    else:
-        print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
-        print("Memory strategy: accumulate predictions per chunk, compute R², discard")
-        print(f"Projection device: {proj_device} (CPU to save GPU memory)")
+    if verbose:
+        if is_loro:
+            print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
+            print("Memory strategy: LORO streaming stats (minimal memory)")
+            print(f"Projection device: {proj_device} (GPU acceleration enabled)")
+        else:
+            print(f"\nProcessing {n_voxels:,} voxels in chunks of {voxel_chunk_size:,}")
+            print("Memory strategy: accumulate predictions per chunk, compute R², discard")
+            print(f"Projection device: {proj_device} (CPU to save GPU memory)")
 
     n_chunks = (n_voxels + voxel_chunk_size - 1) // voxel_chunk_size
 
@@ -1460,9 +1524,64 @@ def cross_validate_noise_pcs(
     try:
         from tqdm import tqdm
 
-        chunk_iter = tqdm(range(n_chunks), desc="Denoising CV", unit="chunk")
+        chunk_iter = tqdm(range(n_chunks), desc=progress_desc, unit="chunk", leave=progress_leave)
     except ImportError:
         chunk_iter = range(n_chunks)
+
+    # =========================================================================
+    # Hoist everything that does not depend on the voxel chunk or the CV fold
+    # =========================================================================
+    # Three facts make this possible, all of them consequences of the nuisance
+    # and PC blocks being block-diagonal over runs:
+    #   1. A run's nuisance projector is built from the polynomial basis alone,
+    #      so it is identical whether that run is train or test in a given fold.
+    #   2. The PC-residualized design is therefore also per-run and fold-free.
+    #   3. train == complement(test) for every strategy generate_cv_splits
+    #      emits, so a fold's cross-products are the all-run totals minus the
+    #      test runs' contributions.
+    run_slices = [
+        (run_starts[r], run_starts[r + 1] if r < n_runs - 1 else n_timepoints)
+        for r in range(n_runs)
+    ]
+
+    # Per-run nuisance-projected design, then the PC-residualized version of it
+    # for every PC count. Small: (n_runs, max_components+1, run_len, n_task).
+    xtilde_by_run: list[torch.Tensor] = []
+    gram_by_run: list[torch.Tensor] = []
+    for r in range(n_runs):
+        start_tp, end_tp = run_slices[r]
+        design_run = design_matrix_cpu[start_tp:end_tp, :].to(proj_device)
+        q_nuis_run = q_factors_all[r] if q_factors_all is not None else None
+        if q_nuis_run is not None:
+            q_nuis = q_nuis_run.to(proj_device)
+            design_run = design_run - q_nuis @ (q_nuis.T @ design_run)
+
+        pc_basis = _nested_orthonormal_basis(noise_pcs_on_device[r].to(proj_device))
+        xt = _residualize_design_by_pc_count(design_run, pc_basis, max_components)
+        xtilde_by_run.append(xt)
+        # (max_components+1, n_task, n_task)
+        gram_by_run.append(torch.matmul(xt.transpose(1, 2), xt))
+
+    gram_total = torch.stack(gram_by_run, dim=0).sum(dim=0)
+    design_proj_by_run = [xt[0] for xt in xtilde_by_run]  # k=0 is nuisance-only
+
+    accum_dev = linalg_device(device)
+    # MPS has no float64; reduce in float32 there and promote on the accumulator.
+    reduce_dtype = torch.float32 if accum_dev.type == "mps" else torch.float64
+
+    def _load_run(chunk_cpu: torch.Tensor, run_idx: int) -> torch.Tensor:
+        """Nuisance-projected data for one run of one voxel chunk, on proj_device.
+
+        The slice is contiguous in time, so this is a straight copy rather than
+        the fold-sized gather the per-fold formulation needed.
+        """
+        start_tp, end_tp = run_slices[run_idx]
+        y_run = chunk_cpu[:, start_tp:end_tp].to(proj_device)
+        q_nuis_run = q_factors_all[run_idx] if q_factors_all is not None else None
+        if q_nuis_run is not None:
+            q_nuis = q_nuis_run.to(proj_device)
+            y_run = y_run - (q_nuis @ (q_nuis.T @ y_run.T)).T
+        return y_run
 
     # Process voxels in chunks to manage memory
     for chunk_idx in chunk_iter:
@@ -1473,296 +1592,122 @@ def cross_validate_noise_pcs(
         # Get actual data for this chunk
         chunk_data_cpu = data_cpu[chunk_start:chunk_end, :]
 
+        # ------------------------------------------------------------------
+        # One pass over the chunk: X̃'y totals and, for LORO, the R² denominator
+        # ------------------------------------------------------------------
+        # (max_components+1, n_task, chunk) — the only chunk-sized cross-product
+        # the fold loop needs, accumulated once instead of once per fold.
+        xty_total = torch.zeros(
+            (max_components + 1, n_task_regs, chunk_size_actual),
+            dtype=torch.float32,
+            device=proj_device,
+        )
         if is_loro:
-            # Streaming stats: accumulate ss_res, sum, sum_sq for each PC count.
-            # float64 accumulators; kept on GPU (CUDA) to avoid 1000s of transfers,
-            # but on CPU for MPS, which has no float64 (they're tiny, ~24 B/voxel).
-            accum_dev = linalg_device(device)
-            ss_res_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
-                for _ in range(max_components + 1)
-            ]
-            sum_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
-                for _ in range(max_components + 1)
-            ]
-            sum_sq_actual_by_pc = [
-                torch.zeros(chunk_size_actual, dtype=torch.float64, device=accum_dev)
-                for _ in range(max_components + 1)
-            ]
+            # Every timepoint is a test timepoint exactly once, so the actual-data
+            # statistics are totals over all runs and do not vary with PC count.
+            sum_actual = torch.zeros(chunk_size_actual, dtype=reduce_dtype, device=accum_dev)
+            sum_sq_actual = torch.zeros(chunk_size_actual, dtype=reduce_dtype, device=accum_dev)
+            ss_res_by_pc = torch.zeros(
+                (max_components + 1, chunk_size_actual), dtype=reduce_dtype, device=accum_dev
+            )
         else:
-            # Full accumulator mode for non-LORO CV
-            # CRITICAL: Full accumulators are HUGE (chunk_voxels × timepoints × n_PCs)
-            # For 50k voxels × 1065 TPs × 21 PCs = 4.5GB
-            # Must use CPU to avoid GPU OOM
-            accumulator_device = torch.device("cpu")
             pred_by_pc_chunk = [
-                torch.zeros(
-                    chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device
-                )
+                torch.zeros(chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu")
                 for _ in range(max_components + 1)
             ]
             actual_projected_chunk = torch.zeros(
-                chunk_size_actual, n_timepoints, dtype=torch.float32, device=accumulator_device
+                chunk_size_actual, n_timepoints, dtype=torch.float32, device="cpu"
             )
 
-        # Cross-validation loop: accumulate predictions or stats for this chunk
-        for fold_info in fold_index_info:
-            train_runs = fold_info["train_runs"]
-            test_runs = fold_info["test_runs"]
-            train_tps_t = fold_info["train_tps_t"]
-            test_tps_t = fold_info["test_tps_t"]
-            test_tps_list = fold_info["test_tps_list"]
-
-            # Extract train/test data for THIS CHUNK
-            chunk_data_train = chunk_data_cpu[:, train_tps_t]
-            chunk_data_test = chunk_data_cpu[:, test_tps_t]
-
-            design_train = design_matrix_cpu[train_tps_t, :]
-            design_test = design_matrix_cpu[test_tps_t, :]
-
-            # ================================================================
-            # PROJECT-FIRST APPROACH (GLMdenoise-style)
-            # Project nuisance from data and design per run
-            # ================================================================
-            if nuisance_per_run is not None:
-                # Project out nuisance from TRAINING data and design per run.
-                # Reuse the per-run QR factors precomputed above (q_factors_all)
-                # — the QR depends only on each run's nuisance, not on the fold.
-                train_run_starts_local = _compute_local_run_starts(
-                    train_runs, run_starts, n_timepoints
-                )
-                train_nuisance_per_run = [nuisance_per_run[i] for i in train_runs]
-                train_q_factors = (
-                    [q_factors_all[i] for i in train_runs] if q_factors_all is not None else None
-                )
-
-                data_train_projected, design_train_projected = project_out_nuisance_per_run(
-                    data=chunk_data_train,
-                    design=design_train,
-                    nuisance_per_run=train_nuisance_per_run,
-                    run_starts=train_run_starts_local,
-                    device=proj_device,
-                    precomputed_q_factors=train_q_factors,
-                )
-
-                # Project out nuisance from TEST data and design (same trick).
-                test_run_starts_local = _compute_local_run_starts(
-                    test_runs, run_starts, n_timepoints
-                )
-                test_nuisance_per_run = [nuisance_per_run[i] for i in test_runs]
-                test_q_factors = (
-                    [q_factors_all[i] for i in test_runs] if q_factors_all is not None else None
-                )
-
-                data_test_projected, design_test_projected = project_out_nuisance_per_run(
-                    data=chunk_data_test,
-                    design=design_test,
-                    nuisance_per_run=test_nuisance_per_run,
-                    run_starts=test_run_starts_local,
-                    device=proj_device,
-                    precomputed_q_factors=test_q_factors,
-                )
+        for r in range(n_runs):
+            y_run = _load_run(chunk_data_cpu, r)
+            # (K+1, n_task, run_len) @ (run_len, chunk) -> (K+1, n_task, chunk)
+            xty_total += torch.matmul(xtilde_by_run[r].transpose(1, 2), y_run.T)
+            if is_loro:
+                sum_actual += y_run.sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                sum_sq_actual += (y_run * y_run).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
             else:
-                # No nuisance - no projection needed
-                data_train_projected = chunk_data_train
-                design_train_projected = design_train
-                data_test_projected = chunk_data_test
-                design_test_projected = design_test
+                start_tp, end_tp = run_slices[r]
+                actual_projected_chunk[:, start_tp:end_tp] = y_run.cpu()
+            del y_run
 
-            # Collect training run PCs (already nuisance-projected during extraction)
-            train_noise_pcs_list = [noise_pcs_on_device[run_idx] for run_idx in train_runs]
+        # ------------------------------------------------------------------
+        # Fold loop: only the held-out runs are touched
+        # ------------------------------------------------------------------
+        for _train_runs, test_runs in cv_splits:
+            test_data = {r: _load_run(chunk_data_cpu, r) for r in test_runs}
 
-            # ================================================================
-            # Pre-compute pseudo-inverses for ALL PC counts
-            # ================================================================
-            # CRITICAL: Now that data_cpu stays on CPU, we have GPU memory for this!
-            # Computing pinv on GPU is MUCH faster (840 calls per chunk = 21 PCs × 40 folds)
-            # Matrices are small: (n_train_tps, n_regs) ≈ (11k, 800) ≈ 35 MB
-            n_task_regs = design_train_projected.shape[1]
-            pinv_task_list = []
+            xty_train = xty_total.clone()
+            gram_train = gram_total.clone()
+            for r in test_runs:
+                xty_train -= torch.matmul(xtilde_by_run[r].transpose(1, 2), test_data[r].T)
+                gram_train -= gram_by_run[r]
 
-            # Move design to proj_device for fast pinv computation
-            design_train_dev = design_train_projected.to(proj_device)
+            # Solve all PC counts at once: (K+1, n_task, n_task) \ (K+1, n_task, chunk).
+            # The PC block never enters here — FWL folded it into X̃ — so this is a
+            # n_task-sized solve instead of a pinv over (n_task + n_runs*n_pcs).
+            betas = _solve_task_betas(gram_train, xty_train)
 
-            for n_pcs in range(max_components + 1):
-                components = [design_train_dev]
-
-                if n_pcs > 0:
-                    # Build zero-padded PC matrix on proj_device for fast computation
-                    n_train_runs = len(train_noise_pcs_list)
-                    pc_padded_blocks = []
-
-                    for block_idx, pcs_run in enumerate(train_noise_pcs_list):
-                        run_length = pcs_run.shape[0]
-                        n_available = pcs_run.shape[1]
-                        n_use = min(n_pcs, n_available)
-
-                        padded = torch.zeros((run_length, n_train_runs * n_pcs), device=proj_device)
-                        start_col = block_idx * n_pcs
-                        end_col = start_col + n_use
-                        padded[:, start_col:end_col] = pcs_run[:, :n_use].to(proj_device)
-
-                        pc_padded_blocks.append(padded)
-
-                    pc_combined = torch.cat(pc_padded_blocks, dim=0)
-                    components.append(pc_combined)
-
-                x_full = torch.cat(components, dim=1)
-
-                # Compute pseudo-inverse for task betas only (on proj_device = GPU for speed!)
-                # Memory-efficient: Compute (X'X)^-1 @ X' (small matrix)
-                # Numerical stability: Use rcond to handle ill-conditioning
-                #
-                # x_full: (n_timepoints, n_regressors) = (n_tps, n_task + n_pcs)
-                # X'X: (n_regs, n_regs) - small matrix, ~2 MB for 800 regressors
-                # GPU acceleration: 10-100x faster than CPU for SVD/pinv
-                try:
-                    # Try X'X approach first (memory efficient, ~20x less memory than direct pinv)
-                    xtx = x_full.T @ x_full  # (n_regs, n_regs)
-                    xtx_inv = torch.linalg.pinv(xtx, rcond=1e-6)  # Add rcond for stability
-                    pinv_full = xtx_inv @ x_full.T  # (n_regs, n_tps)
-                    pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
-                except (torch._C._LinAlgError, RuntimeError) as e:  # ty: ignore[unresolved-attribute]
-                    # Fall back to direct pinv on X (more memory, but more stable)
-                    # Catches both LinAlgError and RuntimeError (MKL errors appear as RuntimeError)
-                    if n_pcs == 0:
-                        # Only warn once per fold
-                        print(
-                            f"  Warning: X'X ill-conditioned ({type(e).__name__}), using direct pinv"
+            for r in test_runs:
+                y_test = test_data[r]
+                start_tp, end_tp = run_slices[r]
+                design_test = design_proj_by_run[r]  # (run_len, n_task)
+                for n_pcs in range(max_components + 1):
+                    # (run_len, n_task) @ (n_task, chunk) -> (run_len, chunk)
+                    y_pred = (design_test @ betas[n_pcs]).T
+                    if is_loro:
+                        resid = y_test - y_pred
+                        ss_res_by_pc[n_pcs] += (
+                            (resid * resid).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
                         )
-                    try:
-                        pinv_full = torch.linalg.pinv(x_full, rcond=1e-5)  # (n_regs, n_tps)
-                        pinv_task = pinv_full[:n_task_regs, :]  # (n_task_regs, n_tps)
-                    except (torch._C._LinAlgError, RuntimeError):  # ty: ignore[unresolved-attribute]
-                        # Last resort: very conservative rcond
-                        if n_pcs == 0:
-                            print("  Warning: Using very conservative rcond=1e-4 for stability")
-                        pinv_full = torch.linalg.pinv(x_full, rcond=1e-4)
-                        pinv_task = pinv_full[:n_task_regs, :]
-
-                # Result already on proj_device, move to final device if different
-                pinv_task_list.append(pinv_task.to(device))
-
-            design_test_gpu = design_test_projected.to(device)
-
-            # Move projected data to GPU once (before PC loop) for efficiency
-            # When chunking, projection returns CPU data - move to GPU for computation
-            data_train_gpu = data_train_projected.to(device)
-            data_test_gpu = data_test_projected.to(device)
-
-            # ================================================================
-            # Fit and predict for ALL PC counts
-            # ================================================================
-            # Get projected test data for R² computation (predictions are in projected space)
-            if nuisance_per_run is not None:
-                test_actual_projected = data_test_gpu
-            else:
-                test_actual_projected = chunk_data_test.to(device)
-
-            for n_pcs in range(max_components + 1):
-                pinv_task = pinv_task_list[n_pcs]
-
-                # Fit: betas = pinv @ Y (data_train_gpu already on GPU from above)
-                betas = (pinv_task @ data_train_gpu.T).T  # (chunk, n_task_regs)
-
-                # Predict: y_pred = X @ betas
-                y_pred = (design_test_gpu @ betas.T).T  # (chunk, n_test_tps)
-
-                if is_loro:
-                    # Streaming stats: accumulate ss_res, sum_actual, sum_sq_actual.
-                    # CUDA/CPU promote to float64 on-device; MPS has no float64, so
-                    # reduce in float32 on-device and promote to float64 on the CPU
-                    # accumulators (.to(accum_dev).to(float64) — device before dtype).
-                    if test_actual_projected.device.type == "mps":
-                        residuals = test_actual_projected - y_pred
-                        ss_res_fold = (residuals**2).sum(dim=1)
-                        sum_fold = test_actual_projected.sum(dim=1)
-                        sum_sq_fold = (test_actual_projected**2).sum(dim=1)
                     else:
-                        test_actual_f64 = test_actual_projected.double()
-                        y_pred_f64 = y_pred.double()
-                        residuals = test_actual_f64 - y_pred_f64
-                        ss_res_fold = (residuals**2).sum(dim=1)
-                        sum_fold = test_actual_f64.sum(dim=1)
-                        sum_sq_fold = (test_actual_f64**2).sum(dim=1)
+                        pred_by_pc_chunk[n_pcs][:, start_tp:end_tp] = y_pred.cpu()
+                del y_test
+            del test_data, xty_train, gram_train, betas
 
-                    ss_res_by_pc[n_pcs] += ss_res_fold.to(accum_dev).to(torch.float64)
-                    sum_actual_by_pc[n_pcs] += sum_fold.to(accum_dev).to(torch.float64)
-                    sum_sq_actual_by_pc[n_pcs] += sum_sq_fold.to(accum_dev).to(torch.float64)
-                else:
-                    # Full accumulator mode: store predictions
-                    # Move to accumulator device (GPU if doing GPU projections, otherwise CPU)
-                    pred_by_pc_chunk[n_pcs][:, test_tps_list] = y_pred.to(
-                        pred_by_pc_chunk[n_pcs].device
-                    )
-
-            # For non-LORO mode, store projected actuals
-            if not is_loro:
-                if nuisance_per_run is not None:
-                    actual_projected_chunk[:, test_tps_list] = data_test_projected.to(
-                        actual_projected_chunk.device
-                    )
-                else:
-                    actual_projected_chunk[:, test_tps_list] = chunk_data_test.to(
-                        actual_projected_chunk.device
-                    )
-
-        # ================================================================
+        # ------------------------------------------------------------------
         # Compute R² for this chunk
-        # ================================================================
+        # ------------------------------------------------------------------
         if is_loro:
-            # Streaming stats: compute R² from accumulated stats (on GPU)
-            # In LORO, each voxel sees all timepoints exactly once
             for n_pcs in range(max_components + 1):
-                ss_res = ss_res_by_pc[n_pcs]
-                sum_act = sum_actual_by_pc[n_pcs]
-                sum_sq_act = sum_sq_actual_by_pc[n_pcs]
-
-                # Compute R² from streaming statistics
-                r2 = compute_r2_from_sufficient_stats(ss_res, sum_act, sum_sq_act, n_timepoints)
+                r2 = compute_r2_from_sufficient_stats(
+                    ss_res_by_pc[n_pcs].double(),
+                    sum_actual.double(),
+                    sum_sq_actual.double(),
+                    n_timepoints,
+                )
                 r2_maps[chunk_start:chunk_end, n_pcs] = r2.cpu().numpy()
-
-            # Free chunk memory
-            del ss_res_by_pc, sum_actual_by_pc, sum_sq_actual_by_pc, chunk_data_cpu
+            del ss_res_by_pc, sum_actual, sum_sq_actual, chunk_data_cpu
         else:
-            # Full accumulator mode: compute R² from full predictions
             for n_pcs in range(max_components + 1):
-                pred = pred_by_pc_chunk[n_pcs]  # (chunk_size, n_timepoints)
-                actual = actual_projected_chunk  # (chunk_size, n_timepoints) - PROJECTED data
-
-                # Compute R² per voxel using unified function
-                r2 = compute_r2_metric(actual, pred, metric="cod")
-
-                # Move to CPU if on GPU before converting to numpy
+                r2 = compute_r2_metric(
+                    actual_projected_chunk, pred_by_pc_chunk[n_pcs], metric="cod"
+                )
                 r2_maps[chunk_start:chunk_end, n_pcs] = (
                     r2.cpu().numpy() if r2.is_cuda else r2.numpy()
                 )
-
-            # Free chunk memory
             del pred_by_pc_chunk, chunk_data_cpu, actual_projected_chunk
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        del xty_total
 
     # ================================================================
     # Compute summary statistics
     # ================================================================
-    print("\n" + "=" * 70)
-    print("R² computation complete")
-    print("=" * 70)
-
     # Summary: median R² across ALL voxels for each PC count
     r2_summary = np.median(r2_maps, axis=0)
 
-    print(f"  Baseline (0 PCs): median R² = {r2_summary[0]:.4f}")
-    best_idx = int(np.argmax(r2_summary))
-    print(f"  Best ({best_idx} PCs): median R² = {r2_summary[best_idx]:.4f}")
-    print(f"  Improvement: {r2_summary[best_idx] - r2_summary[0]:+.4f}")
+    if verbose:
+        print("\n" + "=" * 70)
+        print("R² computation complete")
+        print("=" * 70)
+        print(f"  Baseline (0 PCs): median R² = {r2_summary[0]:.4f}")
+        best_idx = int(np.argmax(r2_summary))
+        print(f"  Best ({best_idx} PCs): median R² = {r2_summary[best_idx]:.4f}")
+        print(f"  Improvement: {r2_summary[best_idx] - r2_summary[0]:+.4f}")
 
-    # Count voxels with positive R² in any PC count (for criteria selection info)
-    n_positive_any = np.sum(np.any(r2_maps > 0, axis=1))
-    print(f"  Voxels with R² > 0 in any PC count: {n_positive_any:,} / {n_voxels:,}")
+        # Count voxels with positive R² in any PC count (for criteria selection info)
+        n_positive_any = np.sum(np.any(r2_maps > 0, axis=1))
+        print(f"  Voxels with R² > 0 in any PC count: {n_positive_any:,} / {n_voxels:,}")
 
     return r2_maps, r2_summary
 
