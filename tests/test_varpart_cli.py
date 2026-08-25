@@ -109,8 +109,18 @@ def test_voxel_mode_writes_expected_subbricks(tmp_path):
         "unique_stim",
         "unique_task",
         "interaction",
+        "shared",
         "r2_full",
     ]
+    # Dominance is a property of the competing partition pieces only; shared and r2_full
+    # are not competitors and must stay blank rather than reading as "never wins".
+    by_effect = {row["effect"]: row for row in summary}
+    assert by_effect["shared"]["n_dominant"] == ""
+    assert by_effect["r2_full"]["frac_dominant"] == ""
+    dominant = [
+        int(by_effect[e]["n_dominant"]) for e in ("unique_stim", "unique_task", "interaction")
+    ]
+    assert sum(dominant) <= int(summary[0]["n_units"])
 
     import json
 
@@ -153,8 +163,9 @@ def test_atlas_mode_writes_roi_table_and_summary(tmp_path, capsys):
     assert "unique_stim" in terminal
 
     summary = list(csv.DictReader(open(str(out) + "_summary.tsv"), delimiter="\t"))
-    assert len(summary) == 4
+    assert len(summary) == 5
     assert all(int(row["n_units"]) == 4 for row in summary)
+    assert "partition check:" in terminal
 
     rows = list(csv.DictReader(open(str(out) + "_roi.tsv"), delimiter="\t"))
     assert len(rows) == 4
@@ -210,6 +221,95 @@ def test_permutation_adds_pvalue_columns(tmp_path):
     assert not any(k.startswith(("p_unc", "p_fwe")) for k in rows[0])
     meta = json.loads(Path(f"{out}_varpart.json").read_text())
     assert "1 - p" in meta["p_map_convention"]
+
+
+def test_significance_summary_counts_parcels(tmp_path, capsys):
+    betas, tsv, shape, _ = _fixture(tmp_path, noise=0.5)
+    atlas = tmp_path / "atlas.nii.gz"
+    lab = (np.arange(int(np.prod(shape))) % 4 + 1).reshape(shape).astype(np.int16)
+    nib.save(nib.Nifti1Image(lab, np.eye(4)), atlas)
+
+    out = tmp_path / "vpsig"
+    assert (
+        _run(
+            [
+                "-betas",
+                str(betas),
+                "-trials",
+                str(tsv),
+                "-factors",
+                "stim,task",
+                "-atlas",
+                str(atlas),
+                "-perm",
+                "40",
+                "-prefix",
+                str(out),
+                "-quiet",
+            ]
+        )
+        == 0
+    )
+    terminal = capsys.readouterr().out
+    assert "Significance (40 permutations, 4 parcels)" in terminal
+
+    sig = list(csv.DictReader(open(str(out) + "_significance.tsv"), delimiter="\t"))
+    assert {r["effect"] for r in sig} == {"unique_stim", "unique_task", "interaction"}
+    for row in sig:
+        assert int(row["n_units"]) == 4
+        # FWE correction can only remove units, never add them.
+        assert int(row["n_sig_fwe_p05"]) <= int(row["n_sig_unc_p05"]) <= 4
+        assert int(row["n_sig_fwe_p01"]) <= int(row["n_sig_fwe_p05"])
+        # 1/(N+1) is the smallest reachable p; the maps are float32, hence the slack.
+        assert float(row["min_p_fwe"]) >= 1.0 / 41 - 1e-6
+
+    # The per-parcel listing must agree with the counts, ROI ids and all.
+    listed = list(csv.DictReader(open(str(out) + "_significant_rois.tsv"), delimiter="\t"))
+    for row in sig:
+        hits = [r for r in listed if r["effect"] == row["effect"]]
+        assert len(hits) == int(row["n_sig_fwe_p05"])
+        assert all(float(r["p_fwe"]) < 0.05 for r in hits)
+        assert all(int(r["roi"]) in (1, 2, 3, 4) for r in hits)
+        # Strongest first, so the top of the list is what a figure caption quotes.
+        assert [float(r["value"]) for r in hits] == sorted(
+            (float(r["value"]) for r in hits), reverse=True
+        )
+
+    meta = json.loads(Path(f"{out}_varpart.json").read_text())
+    counts = {r["effect"]: r for r in meta["significance"]["per_effect"]}
+    assert counts["unique_stim"]["n_sig_fwe_p05"] == len(
+        meta["significance"]["significant_rois"]["unique_stim"]
+    )
+
+
+def test_too_few_permutations_is_called_out(tmp_path, capsys):
+    betas, tsv, shape, _ = _fixture(tmp_path)
+    atlas = tmp_path / "atlas.nii.gz"
+    nib.save(nib.Nifti1Image(np.ones(shape, dtype=np.int16), np.eye(4)), atlas)
+    out = tmp_path / "vpfew"
+    assert (
+        _run(
+            [
+                "-betas",
+                str(betas),
+                "-trials",
+                str(tsv),
+                "-factors",
+                "stim,task",
+                "-atlas",
+                str(atlas),
+                "-perm",
+                "5",
+                "-prefix",
+                str(out),
+                "-quiet",
+            ]
+        )
+        == 0
+    )
+    # 5 permutations floor p at 1/6: a table of zeros there means "too few permutations",
+    # not "no effect", and the tool has to say which.
+    assert "nothing can reach p < 0.05" in capsys.readouterr().out
 
 
 def test_pvalues_are_stored_complemented(tmp_path):

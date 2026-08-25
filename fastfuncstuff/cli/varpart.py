@@ -106,6 +106,96 @@ def _summarize_effects(
     return rows
 
 
+def _dominance_rows(
+    effect_maps: dict[str, torch.Tensor],
+    heldout_sst: torch.Tensor,
+    noise_ceiling: torch.Tensor,
+) -> tuple[list[dict[str, str | int | float]], int, int]:
+    """Count reliable units whose largest effect is each effect.
+
+    Pooled variance answers "how much of the brain does this effect explain"; it does
+    not answer "where does it win". A factor can carry a small share of the total and
+    still be the dominant effect over a sizeable, coherent territory -- which is the
+    thing a reader is actually looking for in the preference map. Returns the rows plus
+    (units with a winner, reliable units); the gap between those two is units where
+    every effect is negative, i.e. where nothing beat the unit's own mean.
+    """
+    sst = heldout_sst.detach().cpu().to(torch.float64)
+    ceiling = noise_ceiling.detach().cpu().to(torch.float64)
+    reliable = torch.isfinite(sst) & (sst > 0) & torch.isfinite(ceiling) & (ceiling > CEILING_FLOOR)
+    names = list(effect_maps)
+    if not names or not bool(reliable.any()):
+        return [], 0, int(reliable.sum())
+
+    stack = torch.stack([effect_maps[n].detach().cpu().to(torch.float64) for n in names])
+    stack = torch.nan_to_num(stack, nan=float("-inf"))
+    winner = stack.argmax(dim=0)
+    # A unit where every effect is negative has no winner: the model did worse than the
+    # unit's own mean there, and naming the least-bad effect "dominant" is reading noise.
+    has_winner = reliable & (stack.max(dim=0).values > 0)
+    total = int(has_winner.sum())
+    rows: list[dict[str, str | int | float]] = []
+    for i, name in enumerate(names):
+        n = int((has_winner & (winner == i)).sum())
+        rows.append(
+            {
+                "effect": name,
+                "n_dominant": n,
+                "frac_dominant": (n / total) if total else float("nan"),
+            }
+        )
+    return rows, total, int(reliable.sum())
+
+
+def _significance_rows(
+    p_uncorrected: dict[str, torch.Tensor],
+    p_fwe: dict[str, torch.Tensor],
+    names: dict[str, str],
+) -> list[dict[str, str | int | float]]:
+    """Count units passing each threshold, per tested statistic.
+
+    The p-maps already say which unit is significant; nobody can read a count off a
+    volume, and with -atlas the count *is* the headline result ("33 of 400 parcels").
+    ``names`` maps the permutation key to the map name it was written under.
+    """
+    rows: list[dict[str, str | int | float]] = []
+    for key, fwe_t in p_fwe.items():
+        unc = p_uncorrected[key].detach().cpu().to(torch.float64)
+        fwe = fwe_t.detach().cpu().to(torch.float64)
+        rows.append(
+            {
+                "effect": names.get(key, key),
+                "n_units": int(fwe.numel()),
+                "n_sig_unc_p05": int((unc < 0.05).sum()),
+                "n_sig_fwe_p05": int((fwe < 0.05).sum()),
+                "n_sig_fwe_p01": int((fwe < 0.01).sum()),
+                "frac_sig_fwe_p05": float((fwe < 0.05).to(torch.float64).mean()),
+                "min_p_fwe": float(fwe.min()),
+                "min_p_unc": float(unc.min()),
+            }
+        )
+    return rows
+
+
+def _significant_unit_ids(
+    p_fwe: torch.Tensor,
+    effect: torch.Tensor,
+    unit_ids: list,
+    alpha: float = 0.05,
+) -> list:
+    """Unit ids passing FWE *alpha*, strongest effect first.
+
+    Ordered by effect size rather than by p, because the max-statistic null saturates:
+    at 1000 permutations every parcel well past the null shares p = 1/1001, and sorting
+    on a tied column would hand back an arbitrary order.
+    """
+    fwe = p_fwe.detach().cpu().to(torch.float64)
+    val = effect.detach().cpu().to(torch.float64)
+    hits = torch.nonzero(fwe < alpha, as_tuple=False).flatten()
+    order = torch.argsort(val[hits], descending=True)
+    return [unit_ids[int(i)] for i in hits[order]]
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_varpart",
@@ -117,7 +207,51 @@ OUTPUTS
   {prefix}.nii.gz         one sub-brick per measure below (parcel-painted with -atlas)
   {prefix}_roi.tsv        with -atlas: the same measures, one row per ROI
   {prefix}_summary.tsv    pooled whole-mask variance summary, one row per effect
-  {prefix}_varpart.json   factors, level-name mapping, dropped trials, diagnostics
+  {prefix}_significance.tsv     with -perm: significant-unit counts per effect
+  {prefix}_significant_rois.tsv with -perm -atlas: every ROI at pFWE < 0.05
+  {prefix}_varpart.json   factors, level-name mapping, dropped trials, diagnostics,
+                          and the significance counts
+
+WHAT THE SUMMARY BLOCKS SAY
+===========================
+Two tables are printed at the end and written alongside the maps, because the
+question "so how much of the brain does task explain" is not answerable by eye
+from a volume.
+
+Overall variance summary -- one row per effect, over the whole mask:
+  CV-R2       Pooled held-out R2: the explained sum of squares summed over units,
+              divided by the total. Units are weighted by their own held-out SST,
+              so a flat voxel does not count as much as a strongly varying one.
+              This is a total, NOT the average of the per-voxel R2 values.
+  obtainable  The same pooled quantity as a fraction of what the noise ceiling
+              ever allowed. "task explains 12% of the obtainable signal."
+  median [IQR]  The per-unit distribution of effect/noise_ceiling, over reliable
+              units only. Pooled and median disagree when the effect is
+              concentrated: a strong effect in a few high-variance units gives a
+              large pooled value and a small median.
+  positive    Fraction of reliable units where the effect is above 0 at all.
+  dominant    Fraction of reliable units where this effect is the LARGEST of the
+              partition pieces. This is the "territory" number -- an effect can
+              carry a small share of total variance and still win in a large,
+              coherent region. Blank for `shared` and `r2_full`, which do not
+              compete. Units where every piece is negative have no winner and are
+              excluded from the denominator (the counts are in the reported line).
+  partition check   The pieces summed against r2_full. They are not required to
+              match exactly -- the per-band shrinkage is clamped to [0, 1] -- but
+              a large delta means read the pieces as an ordering rather than as a
+              decomposition. Under a balanced crossed design it is ~0.
+
+Significance (with -perm) -- one row per tested statistic:
+  p<.05 unc   Units passing the uncorrected null. Expect ~5% of units by chance;
+              compare the count against that before reading anything into it.
+  pFWE<.05    Units passing the max-statistic family-wise null. With -atlas this
+  pFWE<.01    is the number to report: "33 of 400 parcels, pFWE < 0.05".
+  min pFWE    The smallest p any unit reached. It cannot go below 1/(N+1), so with
+              too few permutations a column of zeros means "not enough
+              permutations", not "no effect" -- the tool says so when that bites.
+With -atlas the significant ROI ids are listed per effect, strongest effect first
+(NOT smallest p first: the max-stat null saturates and ties every strong parcel at
+the same floor), and written to {prefix}_significant_rois.tsv with their values.
 
 Everything is computed on HELD-OUT repeats (leave-one-repeat-out CV). "Explains"
 always means predicted out of sample, never fitted. Below, A and B are your two
@@ -836,6 +970,7 @@ def main() -> int:
         frac = torch.where(obtainable, maps[source] / ceiling.clamp_min(CEILING_FLOOR), zero)
         maps[f"{source}_frac_ceiling"] = frac
 
+    perm_map_names: dict[str, str] = {}
     if perm_res is not None:
         # Stored as 1 - p so that "significant" is the *high* end: threshold the map at
         # 0.95 for p < 0.05 and every viewer's one-sided threshold slider does the right
@@ -851,6 +986,7 @@ def main() -> int:
             }
         for key in perm_res.p_fwe:
             base = tag(rename.get(key, key))
+            perm_map_names[key] = base
             maps[f"oneminusp_unc_{base}"] = 1.0 - perm_res.p_uncorrected[key]
             maps[f"oneminusp_fwe_{base}"] = 1.0 - perm_res.p_fwe[key]
 
@@ -858,12 +994,31 @@ def main() -> int:
     stem = info.stem
 
     assert res.heldout_sst is not None and res.noise_ceiling is not None
-    summary_maps = {f"unique_{name}": maps[f"unique_{name}"] for name in factor_names}
+    # The pieces the partition splits the full model into: with two factors that is the
+    # two uniquenesses plus the interaction, above two it is the 2^k - 1 bands (which
+    # already include every main effect, so unique_* would double-count them here).
     if len(factor_names) > 2:
-        summary_maps.update({name: maps[name] for name in maps if name.startswith("band_")})
-    summary_maps["interaction"] = maps["interaction"]
+        partition_maps = {n: maps[n] for n in maps if n.startswith("band_")}
+    else:
+        partition_maps = {f"unique_{name}": maps[f"unique_{name}"] for name in factor_names}
+        partition_maps["interaction"] = maps["interaction"]
+    summary_maps = dict(partition_maps)
+    for name in factor_names:
+        summary_maps.setdefault(f"unique_{name}", maps[f"unique_{name}"])
+    summary_maps["shared"] = maps["shared"]
     summary_maps["r2_full"] = maps["r2_full"]
     summary_rows = _summarize_effects(summary_maps, res.heldout_sst, res.noise_ceiling)
+
+    dominance, n_with_winner, n_reliable = _dominance_rows(
+        partition_maps, res.heldout_sst, res.noise_ceiling
+    )
+    dom_by_effect = {str(r["effect"]): r for r in dominance}
+    for row in summary_rows:
+        dom = dom_by_effect.get(str(row["effect"]))
+        # shared and r2_full are not competitors in the partition, so they have no
+        # dominance count -- an empty cell, not a zero, which would read as "never wins".
+        row["n_dominant"] = dom["n_dominant"] if dom else ""
+        row["frac_dominant"] = dom["frac_dominant"] if dom else ""
 
     summary_tsv = f"{stem}_summary.tsv"
     summary_fields = list(summary_rows[0])
@@ -874,8 +1029,12 @@ def main() -> int:
 
     unit_label = "parcels" if roi_ids is not None else "voxels"
     print(f"\n📈 Overall variance summary ({unit_label})")
-    print("   effect                       CV-R²   obtainable   median [IQR]        positive")
+    print(
+        "   effect                       CV-R²   obtainable   median [IQR]"
+        "        positive   dominant"
+    )
     for row in summary_rows:
+        dom = f"{float(row['frac_dominant']):>7.1%}" if row["frac_dominant"] != "" else "      —"
         print(
             f"   {str(row['effect']):<28} "
             f"{float(row['pooled_cv_r2']):>7.3f}   "
@@ -883,13 +1042,93 @@ def main() -> int:
             f"{float(row['median_frac_ceiling']):>6.1%} "
             f"[{float(row['q25_frac_ceiling']):>6.1%}, "
             f"{float(row['q75_frac_ceiling']):>6.1%}]   "
-            f"{float(row['positive_frac_reliable']):>7.1%}"
+            f"{float(row['positive_frac_reliable']):>7.1%}   {dom}"
         )
     print(
-        f"   reliable units: {summary_rows[0]['n_reliable']}/{summary_rows[0]['n_units']} "
-        f"(noise ceiling > {CEILING_FLOOR:g})"
+        f"   reliable units: {n_reliable}/{summary_rows[0]['n_units']} "
+        f"(noise ceiling > {CEILING_FLOOR:g}); "
+        f"{n_with_winner} with a positive effect to be dominant"
+    )
+
+    # The partition is only meaningful if its pieces reconstruct the full model. They do
+    # not have to sum EXACTLY -- per-band shrinkage is clamped to [0, 1], and a band that
+    # hits the boundary in one nested model but not another breaks additivity -- so print
+    # the residual rather than asserting on it. A large gap means read the pieces as
+    # ordering, not as a decomposition.
+    pooled = {str(r["effect"]): float(r["pooled_cv_r2"]) for r in summary_rows}
+    parts = [pooled[n] for n in partition_maps] + (
+        [pooled["shared"]] if len(factor_names) == 2 else []
+    )
+    total, full = sum(parts), pooled["r2_full"]
+    print(
+        f"   partition check: pieces sum to {total:+.4f} vs r2_full {full:+.4f} "
+        f"(Δ {total - full:+.4f})"
     )
     print(f"💾 Wrote {summary_tsv}")
+
+    sig_rows: list[dict[str, str | int | float]] = []
+    sig_units: dict[str, list] = {}
+    if perm_res is not None:
+        sig_rows = _significance_rows(perm_res.p_uncorrected, perm_res.p_fwe, perm_map_names)
+        sig_tsv = f"{stem}_significance.tsv"
+        with open(sig_tsv, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=list(sig_rows[0]), delimiter="	")
+            writer.writeheader()
+            writer.writerows(sig_rows)
+
+        n_units = int(sig_rows[0]["n_units"])
+        print(f"\n🎯 Significance ({args.perm} permutations, {n_units} {unit_label})")
+        print("   effect                       p<.05 unc     pFWE<.05     pFWE<.01   min pFWE")
+        for row in sig_rows:
+            print(
+                f"   {str(row['effect']):<28} "
+                f"{int(row['n_sig_unc_p05']):>9,}   "
+                f"{int(row['n_sig_fwe_p05']):>10,}   "
+                f"{int(row['n_sig_fwe_p01']):>10,}   "
+                f"{float(row['min_p_fwe']):>8.4f}"
+            )
+        # The smallest reachable p is 1/(N+1): with 18 permutations nothing can clear
+        # 0.05 no matter how strong the effect, and a table of zeros then means "too few
+        # permutations", not "no effect".
+        floor_p = 1.0 / (args.perm + 1)
+        if floor_p > 0.05:
+            print(
+                f"   ⚠️  {args.perm} permutations put the smallest possible p at "
+                f"{floor_p:.3f}: nothing can reach p < 0.05. Use -perm 1000 or more."
+            )
+        elif floor_p > 0.01:
+            print(f"   note: p is floored at {floor_p:.4f}; pFWE < 0.01 is unreachable here.")
+
+        if roi_ids is not None:
+            for key, base in perm_map_names.items():
+                ids = _significant_unit_ids(perm_res.p_fwe[key], maps[base], roi_ids)
+                sig_units[base] = ids
+                shown = ", ".join(str(i) for i in ids[:12])
+                more = f" … (+{len(ids) - 12} more)" if len(ids) > 12 else ""
+                print(
+                    f"   {base}: {len(ids)}/{len(roi_ids)} parcels pFWE<0.05"
+                    + (f" — {shown}{more}" if ids else "")
+                )
+            roi_sig_tsv = f"{stem}_significant_rois.tsv"
+            with open(roi_sig_tsv, "w", newline="") as fh:
+                w = csv.writer(fh, delimiter="	")
+                w.writerow(["effect", "roi", "value", "p_unc", "p_fwe"])
+                for key, base in perm_map_names.items():
+                    index = {rid: i for i, rid in enumerate(roi_ids)}
+                    for rid in sig_units[base]:
+                        i = index[rid]
+                        w.writerow(
+                            [
+                                base,
+                                rid,
+                                f"{float(maps[base][i]):.6g}",
+                                f"{float(perm_res.p_uncorrected[key][i]):.6g}",
+                                f"{float(perm_res.p_fwe[key][i]):.6g}",
+                            ]
+                        )
+            print(f"💾 Wrote {roi_sig_tsv} (parcels with pFWE < 0.05, strongest first)")
+        print(f"💾 Wrote {sig_tsv}")
+
     names = list(maps)
     stacked = np.zeros((*vol_shape, len(maps)), dtype=np.float32)
 
@@ -943,6 +1182,11 @@ def main() -> int:
         "n_perms": args.perm,
     }
     if perm_res is not None:
+        meta["significance"] = {
+            "alpha": 0.05,
+            "per_effect": sig_rows,
+            "significant_rois": sig_units,  # empty without -atlas: voxel indices are not ids
+        }
         meta["p_map_convention"] = "oneminusp_* sub-bricks store 1 - p (threshold 0.95 for p<0.05)"
         meta["perm_diagnostics"] = {
             k: (v if not isinstance(v, np.generic) else v.item())
