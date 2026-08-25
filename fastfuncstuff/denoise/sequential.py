@@ -2186,6 +2186,8 @@ def fit_denoising_model(
     if design_matrix is None and designs_by_hrf is None:
         raise ValueError("Either design_matrix or designs_by_hrf must be provided")
     if run_starts is None:
+    from tqdm import tqdm
+
         raise ValueError("run_starts must be provided")
 
     if design_matrix is not None and designs_by_hrf is not None:
@@ -2276,15 +2278,22 @@ def fit_denoising_model(
         cv_splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
 
         # Process each HRF group to compute baseline R²
-        for hrf_idx in unique_hrf_indices:
+        group_iter = tqdm(
+            unique_hrf_indices,
+            desc="  Baseline R² by HRF",
+            unit="group",
+            leave=True,
+            disable=not verbose or len(unique_hrf_indices) < 2,
+        )
+        for hrf_idx in group_iter:
+            group_iter.set_postfix_str(f"HRF {hrf_idx}: {n_voxels_group:,} vox")
             voxel_mask = hrf_indices == hrf_idx
             n_voxels_group = voxel_mask.sum().item()
 
-            if verbose:
-                print(f"    HRF {hrf_idx}: {n_voxels_group:,} voxels")
-
-            # Extract data and design for this group
-            group_data = data[voxel_mask, :]
+            # Data may live on CPU while the compute device is CUDA (datasets too
+            # large for VRAM); the selection mask has to follow the data, not the
+            # compute device.
+            group_data = data[voxel_mask.to(data.device), :]
             group_design = designs_by_hrf[hrf_idx]
             n_task_cols = group_design.shape[1]
 
@@ -2294,7 +2303,7 @@ def fit_denoising_model(
                 design=group_design,
                 nuisance_per_run=nuisance_per_run_local,
                 run_starts=run_starts,
-                device=group_data.device,
+                device=device,
             )
 
             # Compute cross-validated R² for this group
@@ -2316,7 +2325,9 @@ def fit_denoising_model(
             # Store R² values for this group (ensure same device)
             group_r2 = xval_results["r2"]
             assert isinstance(group_r2, torch.Tensor)
-            initial_r2[voxel_mask] = group_r2.to(initial_r2.device)  # Task-only R²
+            initial_r2[voxel_mask.to(initial_r2.device)] = group_r2.to(
+                initial_r2.device
+            )  # Task-only R²
 
         if verbose:
             print(f"\n  Unified noise pool created from {n_voxels:,} voxels across all HRFs")
@@ -2696,12 +2707,17 @@ def fit_denoising_model(
         if verbose:
             print(f"  Processing {len(unique_hrf_indices)} HRF groups with shared PCs")
 
-        for hrf_idx in unique_hrf_indices:
+        group_iter = tqdm(
+            unique_hrf_indices,
+            desc="  PC selection by HRF",
+            unit="group",
+            leave=True,
+            disable=not verbose or len(unique_hrf_indices) < 2,
+        )
+        for hrf_idx in group_iter:
             voxel_mask = hrf_indices == hrf_idx
             n_voxels_group = voxel_mask.sum().item()
-
-            if verbose:
-                print(f"    HRF {hrf_idx}: {n_voxels_group:,} voxels")
+            group_iter.set_postfix_str(f"HRF {hrf_idx}: {n_voxels_group:,} vox")
 
             # Extract data and design for this group
             group_data = data[voxel_mask, :]
@@ -2721,6 +2737,8 @@ def fit_denoising_model(
                 n_perms=n_perms,
                 chunk_size=chunk_size,
                 preload_data_to_device=preload_data_to_device,
+                progress_desc=f"    HRF {hrf_idx} ({n_voxels_group:,} vox)",
+                progress_leave=False,
                 device=device,
                 verbose=False,  # Suppress per-group verbosity
             )

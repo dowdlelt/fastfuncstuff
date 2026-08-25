@@ -763,6 +763,59 @@ class TestComputeXvalR2OptimalFull:
 
 
 # ---------------------------------------------------------------------------
+# Per-HRF mode with CPU-resident data (large-dataset path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a second device to mix")
+def test_per_hrf_baseline_r2_with_cpu_resident_data():
+    """Per-voxel HRF mode must work when data stays on CPU but device is CUDA.
+
+    Datasets too large for VRAM are loaded to CPU and streamed; the HRF-group
+    selection mask lives on the compute device, so indexing has to follow the
+    data rather than the compute device.
+    """
+    from fastfuncstuff.denoise.sequential import fit_denoising_model
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    n_runs, n_tp_run, n_voxels = 4, 60, 500
+    run_starts = [i * n_tp_run for i in range(n_runs)]
+    n_tp = n_runs * n_tp_run
+
+    designs_by_hrf = {}
+    for hrf_idx in (0, 1):
+        design = torch.zeros(n_tp, 2, device=device)
+        design[hrf_idx::7, 0] = 1.0
+        design[(hrf_idx + 3) :: 11, 1] = 1.0
+        designs_by_hrf[hrf_idx] = design
+
+    hrf_indices = torch.zeros(n_voxels, dtype=torch.long, device=device)
+    hrf_indices[n_voxels // 2 :] = 1
+
+    data = torch.randn(n_voxels, n_tp)  # deliberately CPU while device is CUDA
+    betas = torch.randn(n_voxels, 2) * 3.0
+    betas[::3] = 0.0  # leave a genuine noise pool
+    for hrf_idx in (0, 1):
+        group = (hrf_indices == hrf_idx).cpu()
+        data[group] += betas[group] @ designs_by_hrf[hrf_idx].cpu().T
+
+    results = fit_denoising_model(
+        data=data,
+        designs_by_hrf=designs_by_hrf,
+        hrf_indices=hrf_indices,
+        run_starts=run_starts,
+        tr=1.0,
+        max_components=3,
+        device=device,
+        verbose=False,
+    )
+
+    assert results.xval_r2_per_voxel.shape[0] == n_voxels
+    assert np.isfinite(results.xval_r2_per_voxel).any()
+
+
+# ---------------------------------------------------------------------------
 # Frisch-Waugh-Lovell fast path for cross_validate_noise_pcs
 # ---------------------------------------------------------------------------
 
