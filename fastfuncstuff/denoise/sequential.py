@@ -2139,6 +2139,8 @@ def fit_denoising_model(
     polort : int, default=2
         Polynomial order to project out from noise pool before PCA.
         This prevents slow drift from dominating extracted components.
+        Unused. Kept for API compatibility: drift is supplied by the caller in
+        ``nuisance`` (per run), never built here.
         Set to -1 to disable polynomial projection.
     cv_strategy : int or float, default=1
         Cross-validation strategy:
@@ -2206,29 +2208,6 @@ def fit_denoising_model(
     if hrf_indices is not None:
         hrf_indices = hrf_indices.to(device)
 
-    # Auto-determine polort based on run length if not specified
-    # Uses AFNI formula: 1 + floor(run_duration / 150)
-    if polort is None:
-        from fastfuncstuff.cli_utils import (
-            auto_polort,
-            compute_run_lengths,
-            get_average_run_duration,
-        )
-
-        run_lengths = compute_run_lengths(run_starts, n_timepoints)
-        avg_run_duration_sec = get_average_run_duration(run_lengths, tr)
-        polort = auto_polort(avg_run_duration_sec, formula="afni")
-
-        if verbose:
-            median_run_length = (
-                int(torch.tensor(run_lengths).median().item())
-                if len(run_lengths) > 1
-                else run_lengths[0]
-            )
-            print(
-                f"\nAuto-determined polort={polort} (median run: {median_run_length} TRs = {avg_run_duration_sec:.1f}s)"
-            )
-
     # Convert nuisance to list format for consistent handling
     # This ensures extract_noise_pcs_per_run gets the exact same nuisance
     # matrices that will be used in the GLM model
@@ -2246,6 +2225,23 @@ def fit_denoising_model(
 
     if verbose:
         print(f"\n{'=' * 70}")
+    if verbose:
+        # Report the drift/nuisance the model will actually use. This function
+        # never builds drift itself -- the caller supplies it per run, and
+        # ffs_denoise picks each run's degree from that run's own duration, so
+        # the widths legitimately differ between runs.
+        if nuisance_per_run is None:
+            print("\nNuisance: none supplied (task + PCs only)")
+        else:
+            widths = [n.shape[1] for n in nuisance_per_run]
+            if min(widths) == max(widths):
+                print(f"\nNuisance: {widths[0]} regressors per run (all {n_runs} runs)")
+            else:
+                print(
+                    f"\nNuisance: {min(widths)}-{max(widths)} regressors per run "
+                    f"(varies with run length across {n_runs} runs)"
+                )
+
         if per_hrf_mode:
             print("Cross-Validated Denoising Pipeline (Per-Voxel HRF Mode)")
         else:
