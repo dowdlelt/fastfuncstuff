@@ -80,6 +80,7 @@ def test_summary_pools_explained_sums_of_squares():
     assert row["n_units"] == row["n_reliable"] == 2
 
 
+@pytest.mark.gpu
 def test_voxel_mode_writes_expected_subbricks(tmp_path):
     betas, tsv, shape, _ = _fixture(tmp_path)
     out = tmp_path / "vp"
@@ -132,6 +133,7 @@ def test_voxel_mode_writes_expected_subbricks(tmp_path):
     assert abs(meta["diagnostics"]["shared_abs_median"]) < 0.02
 
 
+@pytest.mark.gpu
 def test_atlas_mode_writes_roi_table_and_summary(tmp_path, capsys):
     betas, tsv, shape, _ = _fixture(tmp_path)
     atlas = tmp_path / "atlas.nii.gz"
@@ -184,6 +186,7 @@ def test_atlas_mode_writes_roi_table_and_summary(tmp_path, capsys):
         assert np.isclose(vals.flat[0], float(row["unique_stim"]), atol=1e-5)
 
 
+@pytest.mark.gpu
 def test_permutation_adds_pvalue_columns(tmp_path):
     betas, tsv, shape, _ = _fixture(tmp_path)
     atlas = tmp_path / "atlas.nii.gz"
@@ -223,6 +226,7 @@ def test_permutation_adds_pvalue_columns(tmp_path):
     assert "1 - p" in meta["p_map_convention"]
 
 
+@pytest.mark.gpu
 def test_significance_summary_counts_parcels(tmp_path, capsys):
     betas, tsv, shape, _ = _fixture(tmp_path, noise=0.5)
     atlas = tmp_path / "atlas.nii.gz"
@@ -282,6 +286,7 @@ def test_significance_summary_counts_parcels(tmp_path, capsys):
     )
 
 
+@pytest.mark.gpu
 def test_too_few_permutations_is_called_out(tmp_path, capsys):
     betas, tsv, shape, _ = _fixture(tmp_path)
     atlas = tmp_path / "atlas.nii.gz"
@@ -312,6 +317,7 @@ def test_too_few_permutations_is_called_out(tmp_path, capsys):
     assert "nothing can reach p < 0.05" in capsys.readouterr().out
 
 
+@pytest.mark.gpu
 def test_pvalues_are_stored_complemented(tmp_path):
     """A real effect must score HIGH and an absent one LOW -- the raw-p convention inverts
     both, so this ordering is what actually distinguishes the two conventions.
@@ -340,6 +346,7 @@ def test_pvalues_are_stored_complemented(tmp_path):
         assert (1.0 - real) * 41 == pytest.approx(round((1.0 - real) * 41), abs=1e-3)
 
 
+@pytest.mark.gpu
 def test_trial_count_mismatch_is_a_clear_error(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
     short = tmp_path / "short.csv"
@@ -365,6 +372,7 @@ def test_trial_count_mismatch_is_a_clear_error(tmp_path):
         )
 
 
+@pytest.mark.gpu
 def test_missing_factor_column_names_available_columns(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
     with pytest.raises(SystemExit, match="column 'nope' not found"):
@@ -383,6 +391,7 @@ def test_missing_factor_column_names_available_columns(tmp_path):
         )
 
 
+@pytest.mark.gpu
 def test_requires_at_least_two_factors(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
     with pytest.raises(SystemExit, match="at least 2 column names"):
@@ -401,6 +410,7 @@ def test_requires_at_least_two_factors(tmp_path):
         )
 
 
+@pytest.mark.gpu
 def test_runs_without_run_or_repeat_columns(tmp_path):
     """repeat is derivable from cell order; run only gates the locality check."""
     betas, tsv, _, _ = _fixture(tmp_path, drop_col="repeat")
@@ -438,6 +448,7 @@ def _base_args(betas, tsv, out):
     ]
 
 
+@pytest.mark.gpu
 def test_drop_trials_excludes_matching_rows(tmp_path, capsys):
     betas, tsv, _, n_tr = _fixture(tmp_path)
     out = tmp_path / "dropped"
@@ -453,6 +464,7 @@ def test_drop_trials_excludes_matching_rows(tmp_path, capsys):
     assert meta["nested_gamma"] is False
 
 
+@pytest.mark.gpu
 def test_drop_trials_is_repeatable(tmp_path):
     betas, tsv, _, n_tr = _fixture(tmp_path)
     out = tmp_path / "dropped2"
@@ -475,6 +487,7 @@ def test_drop_trials_is_repeatable(tmp_path):
     assert 0 < meta["n_trials"] < n_tr
 
 
+@pytest.mark.gpu
 def test_drop_trials_rejects_a_label_that_matches_nothing(tmp_path):
     """A silent no-op here means analysing trials the user believes were excluded."""
     betas, tsv, _, _ = _fixture(tmp_path)
@@ -482,12 +495,14 @@ def test_drop_trials_rejects_a_label_that_matches_nothing(tmp_path):
         _run([*_base_args(betas, tsv, tmp_path / "x"), "-drop_trials", "run", "r99"])
 
 
+@pytest.mark.gpu
 def test_drop_trials_rejects_an_unknown_column(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
     with pytest.raises(SystemExit, match="column 'session' not found"):
         _run([*_base_args(betas, tsv, tmp_path / "x"), "-drop_trials", "session", "1"])
 
 
+@pytest.mark.gpu
 def test_beta_count_is_checked_against_the_undropped_table(tmp_path):
     betas, tsv, _, _ = _fixture(tmp_path)
     short = tmp_path / "short.csv"
@@ -510,6 +525,7 @@ def test_beta_count_is_checked_against_the_undropped_table(tmp_path):
         )
 
 
+@pytest.mark.gpu
 def test_free_text_levels_are_sanitized_and_recorded(tmp_path):
     """Levels with spaces/punctuation become identifiers; the mapping is written out."""
     betas, tsv, _, _ = _fixture(tmp_path)
@@ -547,6 +563,7 @@ def _messy_question_table(tmp_path, tsv):
     return out
 
 
+@pytest.mark.gpu
 def test_drop_trials_matches_free_text_across_whitespace_variants(tmp_path, capsys):
     """The label as typed must drop the whole level, not just the exactly-spelled rows."""
     betas, tsv, _, _ = _fixture(tmp_path)
@@ -564,6 +581,7 @@ def test_drop_trials_matches_free_text_across_whitespace_variants(tmp_path, caps
     assert meta["n_trials"] == len(rows) - len(remaining)
 
 
+@pytest.mark.gpu
 def test_drop_trials_accepts_the_sanitized_identifier(tmp_path):
     """The identifier from level_names / map names is a legitimate thing to paste back in."""
     betas, tsv, _, _ = _fixture(tmp_path)
@@ -577,6 +595,7 @@ def test_drop_trials_accepts_the_sanitized_identifier(tmp_path):
     assert meta["n_trials"] == len(rows) - sum("shown 0" in r["task"] for r in rows)
 
 
+@pytest.mark.gpu
 def test_frac_ceiling_maps_are_the_ratio_to_the_noise_ceiling(tmp_path):
     """R2 alone cannot say "is this good"; divided by the ceiling it can."""
     betas, tsv, shape, _ = _fixture(tmp_path)
@@ -595,6 +614,7 @@ def test_frac_ceiling_maps_are_the_ratio_to_the_noise_ceiling(tmp_path):
         assert float(row[f"{src}_frac_ceiling"]) == pytest.approx(expected, rel=1e-4)
 
 
+@pytest.mark.gpu
 def test_frac_ceiling_is_zero_where_nothing_is_obtainable(tmp_path):
     """Pure noise gives a ~0 ceiling; the ratio must not paint noise/noise over it."""
     rng = np.random.default_rng(0)

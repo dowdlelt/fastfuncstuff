@@ -44,6 +44,10 @@ All of these are spelled out under `../fmri_wiki/principles/`. Don't re-derive t
 
 Per-module tests are colocated under `tests/`. Add a test for any new primitive — synthetic data is fine; we're verifying correctness, not benchmarking. The bar is "the test would have caught a real bug we hit", not coverage for its own sake.
 
+**Tests do not touch the GPU by default.** A `pytest -m gpu` marker is deselected via `addopts`, because test problems are tiny but still fall through `get_device()` onto CUDA — a routine test run then competes with whatever real fit is on the card. Mark any new test that lets a device default happen; pass `device=torch.device("cpu")` explicitly where the test doesn't need a GPU, which is most of the time. Run the GPU set deliberately with `pytest -m gpu`, and **ask before doing so** — someone is usually fitting.
+
+Gotcha: pytest's `-m` is single-valued, so a command-line `-m` *replaces* the default rather than composing with it. `-m "not slow"` silently re-enables every GPU test; use `-m "not slow and not gpu"`.
+
 ## Type checking and linting
 
 `ty` (Astral) for type checks, `ruff` for lint/format. Both fast enough to run on every change:

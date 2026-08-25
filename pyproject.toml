@@ -147,6 +147,13 @@ exclude = ["tests*", "examples*"]
 "fastfuncstuff.benchmark" = ["assets/*.m"]
 
 [tool.pytest.ini_options]
+# Deselect GPU-touching tests by default. Most of this suite's problems are tiny, but
+# they fall through to get_device() and claim CUDA, which makes a routine `pytest tests/`
+# compete with whatever real fit is running on the card. Run them deliberately with
+# `pytest -m gpu`. NOTE: -m is single-valued, so a command-line -m REPLACES this rather
+# than adding to it -- `pytest -m "not slow"` re-enables the GPU tests. Use
+# `-m "not slow and not gpu"`.
+addopts = "-m 'not gpu'"
 testpaths = ["tests"]
 python_files = "test_*.py"
 python_classes = "Test*"

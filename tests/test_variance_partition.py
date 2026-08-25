@@ -178,6 +178,7 @@ def test_interleaved_runs_are_not_a_leak():
     assert diag["run_locality_ok"], diag["run_leaks"]
 
 
+@pytest.mark.gpu
 def test_partition_warns_but_proceeds_on_run_leak(capsys):
     """Repeats inside a run are a legitimate design; they inflate R2, they do not abort."""
     factors, rep, _ = make_crossed_table()
@@ -187,6 +188,7 @@ def test_partition_warns_but_proceeds_on_run_leak(capsys):
     assert "repeats inside one run" in capsys.readouterr().out
 
 
+@pytest.mark.gpu
 def test_partition_rejects_run_leak_under_strict():
     factors, rep, _ = make_crossed_table()
     betas = synth_betas(factors, a=np.zeros((4, N_STIM)), noise=1.0)
@@ -201,6 +203,7 @@ def test_partition_rejects_run_leak_under_strict():
         )
 
 
+@pytest.mark.gpu
 def test_shared_variance_is_near_zero_on_balanced_design():
     """Exhaustive crossing makes S and T orthogonal, so C has nothing to find."""
     rng = np.random.default_rng(1)
@@ -217,6 +220,7 @@ def test_shared_variance_is_near_zero_on_balanced_design():
     assert res.diagnostics["shared_abs_median"] < 0.02
 
 
+@pytest.mark.gpu
 def test_preference_index_tracks_the_dominant_factor():
     rng = np.random.default_rng(3)
     factors, rep, run = make_crossed_table()
@@ -237,6 +241,7 @@ def test_preference_index_tracks_the_dominant_factor():
     assert res.unique["task"][n_each:].median() > res.unique["stim"][n_each:].median()
 
 
+@pytest.mark.gpu
 def test_rank1_interaction_recovered_at_three_repeats():
     """The load-bearing test: a real rank-1 interaction must survive n=3.
 
@@ -294,6 +299,7 @@ def test_rank1_interaction_recovered_at_three_repeats():
     assert res.rank_e[n_each:].float().median() == 1
 
 
+@pytest.mark.gpu
 def test_rank_is_undetermined_not_zero_below_the_snr_floor():
     """Low-SNR voxels must not be reported as task-invariant.
 
@@ -337,6 +343,7 @@ def test_rank_is_undetermined_not_zero_below_the_snr_floor():
     assert res.diagnostics["rank_undetermined_frac"] > 0.4
 
 
+@pytest.mark.gpu
 def test_additive_only_data_selects_rank_zero():
     rng = np.random.default_rng(7)
     factors, rep, run = make_crossed_table()
@@ -352,6 +359,7 @@ def test_additive_only_data_selects_rank_zero():
     assert res.gammas["stim:task"].median() < 0.3
 
 
+@pytest.mark.gpu
 def test_low_snr_additive_truth_does_not_invent_rank():
     """The one-sided error property: misses are acceptable, inventions are not.
 
@@ -382,6 +390,7 @@ def test_low_snr_additive_truth_does_not_invent_rank():
     assert (unmasked.rank_e > 0).float().mean() < 0.02
 
 
+@pytest.mark.gpu
 def test_rank_curve_endpoint_is_the_full_model():
     """The sweep and the reported models must be the same predictor family.
 
@@ -405,6 +414,7 @@ def test_rank_curve_endpoint_is_the_full_model():
     torch.testing.assert_close(res.rank_r2[:, -1], res.r2["M_full"], atol=1e-4, rtol=0)
 
 
+@pytest.mark.gpu
 def test_gain_alignment_separates_gain_from_reorganization():
     """A multiplicative gain is rank 1 ALIGNED with the main effect; reorganisation is not.
 
@@ -438,6 +448,7 @@ def test_gain_alignment_separates_gain_from_reorganization():
     assert (align[~resolved] == 0).all()
 
 
+@pytest.mark.gpu
 def test_nuclear_sweep_tracks_the_interaction_and_stays_nonnegative():
     rng = np.random.default_rng(37)
     factors, rep, run = make_crossed_table()
@@ -462,6 +473,7 @@ def test_nuclear_sweep_tracks_the_interaction_and_stays_nonnegative():
     assert off.nuclear_gain is None
 
 
+@pytest.mark.gpu
 def test_noise_ceiling_orders_by_snr():
     rng = np.random.default_rng(9)
     factors, rep, run = make_crossed_table()
@@ -486,6 +498,7 @@ def test_requires_two_factors():
         build_factor_design({"stim": factors["stim"]})
 
 
+@pytest.mark.gpu
 def test_trial_count_mismatch_is_rejected():
     factors, rep, run = make_crossed_table()
     betas = torch.zeros(5, len(factors["stim"]) - 1)
@@ -514,6 +527,7 @@ def _perm_data(amp, *, n_vox=100, seed=0, with_task=True):
     return synth_betas(factors, a=a, b=b, e=e, noise=1.0, seed=seed + 50), factors, rep, run
 
 
+@pytest.mark.gpu
 def test_cellspace_engine_matches_general_path():
     """The permutation engine must compute the *same* statistic as the reported one.
 
@@ -539,6 +553,7 @@ def test_cellspace_engine_matches_general_path():
     )
 
 
+@pytest.mark.gpu
 def test_nested_permutation_observed_matches_reported_estimator():
     betas, factors, rep, run = _perm_data(0.5, n_vox=8, seed=19)
     reported = partition_variance(
@@ -568,6 +583,7 @@ def test_nested_permutation_observed_matches_reported_estimator():
     )
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_null_is_not_degenerate():
     """The null max must be a live distribution, not a point mass at zero.
@@ -593,6 +609,7 @@ def test_null_is_not_degenerate():
     assert null_max.std() > 0
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_interaction_null_controls_type_one_error():
     """Additive-only truth: no voxel should survive FWE, and uncorrected p stays nominal."""
@@ -614,6 +631,7 @@ def test_interaction_null_controls_type_one_error():
     assert (p_unc < 0.05).float().mean() <= 0.15
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_interaction_null_has_power():
     """A real rank-1 interaction must survive FWE correction."""
@@ -631,6 +649,7 @@ def test_interaction_null_has_power():
     assert (res.p_fwe["interaction"] < 0.05).float().mean() > 0.8
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_unique_task_null_controls_type_one_error():
     """Stimulus effect present, task effect absent: unique_b must not be significant."""
@@ -671,6 +690,7 @@ def test_trialspace_engine_matches_cellspace_when_balanced():
         torch.testing.assert_close(cell_stats[key], trial_stats[key], atol=2e-4, rtol=2e-3)
 
 
+@pytest.mark.gpu
 def test_permutation_runs_on_unbalanced_design(capsys):
     """Dropping trials leaves unequal repeats; inference falls back, it does not refuse."""
     betas, factors, rep, run = _perm_data(0.0, n_vox=10, seed=16)
@@ -698,6 +718,7 @@ def test_permutation_runs_on_unbalanced_design(capsys):
         assert res.null_max[key].std() > 0
 
 
+@pytest.mark.gpu
 def test_permutation_rejects_unknown_statistic():
     betas, factors, rep, run = _perm_data(0.0, n_vox=10, seed=17)
     with pytest.raises(ValueError, match="unknown statistics"):
@@ -706,6 +727,7 @@ def test_permutation_rejects_unknown_statistic():
         )
 
 
+@pytest.mark.gpu
 def test_permutation_warns_without_run_blocks():
     betas, factors, rep, _ = _perm_data(0.0, n_vox=10, seed=18)
     with pytest.warns(UserWarning, match="anticonservative"):
@@ -720,6 +742,7 @@ def test_permutation_warns_without_run_blocks():
         )
 
 
+@pytest.mark.gpu
 def test_rank_masking_can_be_disabled():
     betas, factors, rep, run = _perm_data(0.0, n_vox=20, seed=22)
     res = partition_variance(
@@ -782,6 +805,7 @@ class TestRoiCollapse:
         with pytest.raises(ValueError, match="3-D .* or 4-D"):
             build_roi_weights(np.zeros((2, 2)))
 
+    @pytest.mark.gpu
     def test_collapsing_raises_the_noise_ceiling(self):
         """The point of -atlas beyond speed: averaging lifts ncsnr past the rank floor."""
         from fastfuncstuff.stats.variance_partition import build_roi_weights, collapse_to_rois
@@ -849,6 +873,7 @@ class TestPaintRoisToVoxels:
         assert painted.tolist() == [2.0, 2.0, 15.0, 15.0]
 
 
+@pytest.mark.gpu
 @pytest.mark.slow
 def test_unbalanced_null_stays_calibrated():
     """The fallback engine has to be a real test, not just one that runs.
@@ -922,6 +947,7 @@ def _run_nested_betas(task_effect, run_noise, seed, n_vox=60):
     return torch.as_tensor(y, dtype=torch.float32), factors, rep, run
 
 
+@pytest.mark.gpu
 def test_run_nesting_is_detected_and_reported(capsys):
     betas, factors, rep, run = _run_nested_betas(0.0, 1.0, seed=3)
     res = partition_variance(betas, factors, repeat=rep, run=run, verbose=True)
@@ -938,6 +964,7 @@ def test_run_nesting_is_detected_and_reported(capsys):
     assert detect_run_nesting(crossed, None) == {}
 
 
+@pytest.mark.gpu
 def test_additive_run_nuisance_lands_only_on_the_nested_factor():
     """The reason the interaction survives a run-locked design -- and its one caveat.
 
@@ -995,6 +1022,7 @@ def test_additive_run_nuisance_lands_only_on_the_nested_factor():
     )
 
 
+@pytest.mark.gpu
 def test_whole_run_permutation_has_power_where_within_run_has_none():
     """Within-run permutation cannot test a run-nested factor -- at all.
 
@@ -1031,6 +1059,7 @@ def test_whole_run_permutation_has_power_where_within_run_has_none():
     assert res_i.diagnostics["permutation_scheme"]["interaction"] == "within_run"
 
 
+@pytest.mark.gpu
 def test_whole_run_permutation_controls_type_one_error():
     """Run-level noise must not read as a task effect once the error term is right."""
     betas, factors, rep, run = _run_nested_betas(0.0, 1.5, seed=11, n_vox=200)
@@ -1128,6 +1157,7 @@ def _three_factor_betas(seed=0, n_vox=90, noise_sd=0.6):
     return torch.as_tensor(y, dtype=torch.float32), factors, rep, run, third
 
 
+@pytest.mark.gpu
 def test_three_factor_partition_attributes_each_effect_to_its_own_band():
     """The payoff of k factors: a noise-level gain and a task reorganisation separate.
 
@@ -1153,6 +1183,7 @@ def test_three_factor_partition_attributes_each_effect_to_its_own_band():
     assert res.shared.abs().median() < 0.02
 
 
+@pytest.mark.gpu
 def test_three_factor_gain_alignment_names_the_modulated_factor():
     betas, factors, rep, run, third = _three_factor_betas(seed=3)
     res = partition_variance(betas, factors, repeat=rep, run=run, verbose=False)
@@ -1173,6 +1204,7 @@ def test_three_factor_gain_alignment_names_the_modulated_factor():
     assert res.diagnostics["max_rank_per_pair"]["stim:task"] == 2
 
 
+@pytest.mark.gpu
 def test_three_factor_flat_aliases_are_empty_but_pair_dicts_are_not():
     """Above two factors "the" interaction is ambiguous, so the flat fields stay unset."""
     betas, factors, rep, run, _ = _three_factor_betas(seed=4, n_vox=12)
@@ -1193,6 +1225,7 @@ def test_three_factor_flat_aliases_are_empty_but_pair_dicts_are_not():
     torch.testing.assert_close(two.rank_e, two.pair_rank_e["stim:task"])
 
 
+@pytest.mark.gpu
 def test_three_factor_permutation_uses_the_right_scheme_per_statistic():
     betas, factors, rep, run, _ = _three_factor_betas(seed=5, n_vox=30)
     res = permutation_test(
