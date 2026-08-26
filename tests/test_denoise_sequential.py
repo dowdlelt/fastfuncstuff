@@ -1423,3 +1423,39 @@ def test_nuisance_strategy_is_a_no_op_when_every_condition_spans_runs():
     nuis, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="nuisance")
 
     np.testing.assert_array_equal(zero, nuis)
+
+
+def test_both_fit_denoising_model_call_sites_pass_the_same_options():
+    """The per-HRF and single-HRF branches of ffs_denoise must not drift apart.
+
+    Bug of record: -noise_ceiling worked on the single-HRF branch and did
+    nothing on the per-HRF one, because only the single-HRF call passed
+    compute_noise_ceiling. Nothing failed and nothing warned -- the ceiling was
+    simply absent, and the R2 came out as a plain 3-D map that looked exactly
+    like a run without the flag.
+
+    Two long, near-identical keyword call sites are the shape of problem that
+    keeps producing this, so the check is on the source: whatever one branch
+    forwards, the other must forward too.
+    """
+    import ast
+    import inspect
+
+    from fastfuncstuff.cli import denoise as denoise_cli
+
+    tree = ast.parse(inspect.getsource(denoise_cli))
+    call_kwargs = [
+        {kw.arg for kw in node.keywords if kw.arg is not None}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "fit_denoising_model"
+    ]
+
+    assert len(call_kwargs) == 2, f"expected 2 call sites, found {len(call_kwargs)}"
+    per_hrf, single_hrf = call_kwargs
+    # Only the design arguments legitimately differ between the two branches.
+    design_only = {"design_matrix", "designs_by_hrf", "hrf_indices"}
+    assert (per_hrf ^ single_hrf) <= design_only, "call sites disagree on: " + ", ".join(
+        sorted((per_hrf ^ single_hrf) - design_only)
+    )

@@ -64,7 +64,6 @@ try:
         resolve_microtime_dt,
         run_lengths_from_starts,
         save_r2_ceiling_stack,
-        save_volume_nifti,
         setup_device,
         spinner,
         summarize_trial_repeats,
@@ -2891,22 +2890,24 @@ def main():
         )
 
         if beta_ceiling is not None and beta_ceiling.result.n_usable:
-            for values, name in (
-                (beta_ceiling.ncsnr_map, "ncsnr"),
-                (beta_ceiling.result.ceiling, "noise_ceiling"),
-                (beta_ceiling.explainable, "explainable_r2"),
-            ):
-                if values is None:
-                    continue
-                path = f"{args.prefix}_{name}.nii.gz"
-                save_volume_nifti(
-                    values,
-                    path,
-                    volume_shape,
-                    affine,
-                    voxel_mask.numpy() if voxel_mask is not None else None,
-                )
-                output_files[name] = path
+            # Rewrite the R2 map save_single_trial_results just wrote, now with
+            # the ceiling built from THAT map beside it as labelled sub-briks.
+            # Same path on purpose: one canonical filename, and no way to read
+            # the R2 without the ceiling that makes it interpretable.
+            output_files["single_trial_xval"] = save_r2_ceiling_stack(
+                [
+                    (final_r2_cod, "xval_R2"),
+                    (beta_ceiling.result.ceiling, "noise_ceiling"),
+                    (beta_ceiling.explainable, "explainable_R2"),
+                    (beta_ceiling.ncsnr_map, "ncsnr"),
+                ],
+                output_files["single_trial_xval"],
+                volume_shape,
+                affine,
+                mask_flat=voxel_mask.numpy() if voxel_mask is not None else None,
+                header=nifti_header,
+            )
+            output_files["single_trial_xval_r2"] = output_files["single_trial_xval"]
 
         # Also save PC selection curve
         np.save(f"{args.prefix}_pc_selection_curve.npy", r2_by_pc.cpu().numpy())
@@ -3251,6 +3252,7 @@ def main():
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
+            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro"),
             nuisance=nuisance_per_run,
             polort=args.polort,
             min_noise_voxels=args.min_noise_voxels,
