@@ -177,6 +177,29 @@ READING THE OUTPUTS  (3D = one value/voxel, 4D = a time series)
       dwell times; low |r| = separate mechanisms. Computed only over voxels that
       moved AND were separable, so it reports a finding rather than the regulariser.
 
+  _taskr_pe1.nii.gz / _taskrms_pe1.nii.gz / _taskr_data.nii.gz +
+  _locomoco_taskcoupling.txt   [-events]  IS THE FIELD READING BOLD AS MOTION?
+      Every backend closes a brightness-constancy data term, so a strong block design
+      hands it an intensity change on the very edges it tracks. _taskr is the SIGNED
+      partial correlation between the field and each condition (conditions on the 4th
+      axis); _taskrms is the task-explained part in VOXELS. Both are DESCRIPTIVE -- a
+      few blocks is ~2 degrees of freedom, so no surrogate can make one voxel's r
+      significant, and the report says so rather than pretending otherwise.
+
+      THE VERDICT IS kappa, in the report: a brightness-constancy estimator explains
+      an intensity change dI by a shift d with g*d = dI, so if it is absorbing BOLD
+      then (PE gradient x beta_field) should EQUAL beta_data across voxels. kappa near
+      +/-1 with a real R2 = contamination; near 0 = the field's task response is not
+      the BOLD response, i.e. real task-correlated motion you must NOT remove. Unlike
+      a correlation, kappa survives negative BOLD and the gradient flipping across an
+      edge -- both cancel in the ratio.
+
+      Add -detask to ACT on it: the task-locked part is removed from the field and
+      every output (warp, corrected series, flow, PCs, movie) is derived from the
+      cleaned field, with the removed part written as _flow_*_taskpart. Drift is fitted
+      but NOT subtracted -- a drifting displacement is real motion. The diagnosis above
+      always measures the ORIGINAL field, so the report and the fix read as one story.
+
   _flow.mp4 / .gif   THE QUICK-LOOK — contact-sheet movie of _flow, colored by a
       circular-phase wheel (hue = direction, brightness = magnitude). Fastest QC
       there is: coherent within-brain flow pulsing with the time course vs. random
@@ -959,6 +982,92 @@ def create_parser() -> argparse.ArgumentParser:
         "wedge. The feather width is peeled on top of this automatically.",
     )
 
+    task = p.add_argument_group("Task-coupling diagnostic (-events)")
+    task.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv for THIS run — switches on the task-coupling "
+        "diagnostic. Every backend here closes a brightness-constancy data term, so a "
+        "strong block design gives it an intensity change it cannot distinguish from a "
+        "sub-voxel shift. This measures how much of the estimated field the task "
+        "explains (over a circular-shift null), and whether that lands on top of the "
+        "BOLD response — which is what separates 'BOLD leaked into the estimate' from "
+        "'the subject moved with the task'. Writes {prefix}_taskr2_* maps and a report. "
+        "Diagnostic only: nothing about the correction changes.",
+    )
+    task.add_argument(
+        "-event_ignore",
+        "-event-ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude from the task design (e.g. fixation).",
+    )
+    task.add_argument(
+        "-event_cols",
+        "-event-cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom -events column names. Default: onset duration trial_type.",
+    )
+    task.add_argument(
+        "-tr",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Repetition time for the task design. Default: the NIfTI header pixdim[4].",
+    )
+    task.add_argument(
+        "-task_polort",
+        "-task-polort",
+        type=int,
+        default=None,
+        metavar="DEG",
+        help="Legendre drift degree removed from the field AND the design before the "
+        "fit, so the R2 is partial and a slow drift in the field cannot be charged to a "
+        "long block. Default: AFNI's 1 + floor(run_seconds/150).",
+    )
+    task.add_argument(
+        "-detask",
+        action="store_true",
+        help="REMOVE the task-locked part of the field, keeping drift and everything "
+        "else, and derive EVERY output from the cleaned field — warp, corrected series, "
+        "flow maps, PCs, movie. The diagnostic above still measures the ORIGINAL field "
+        "(measuring the fix's own output would always say 'no task'), and the part that "
+        "was removed is written as {prefix}_flow_*_taskpart so nothing is hidden. "
+        "Polynomials go into the fit but NOT the subtraction — a slowly drifting "
+        "displacement is real residual motion, and the warp PCs routinely carry a "
+        "poly-like component that IS that motion. The corrected series is re-resampled "
+        "from the RAW input, never from the already-corrected one. Not wired for the "
+        "multi-echo path (one shared field scaled per echo).",
+    )
+    task.add_argument(
+        "-task_thresh",
+        "-task-thresh",
+        type=float,
+        default=None,
+        metavar="R",
+        help="Absolute |r| cut on the DATA's task map that defines 'where the task is'. "
+        "The headline number is then how much of the FIELD's task-locked displacement "
+        "falls inside that mask, against the share of voxels it occupies — 1.0x means "
+        "the field's task coupling is spread like the brain and has nothing to do with "
+        "where the task is. Default: use -task_top_frac instead.",
+    )
+    task.add_argument(
+        "-task_top_frac",
+        "-task-top-frac",
+        type=float,
+        default=0.1,
+        metavar="FRAC",
+        help="Fraction of voxels, ranked by the DATA's own task-R2, that count as "
+        "'where the data responds' — the stratum the report headlines and the verdict "
+        "is judged on. A whole-brain median is mostly non-responding tissue and buries "
+        "a real effect confined to active cortex. Default 0.1.",
+    )
+
     out = p.add_argument_group("Outputs")
     out.add_argument("-no_warp", action="store_true", help="Skip the per-frame warp file.")
     out.add_argument(
@@ -1235,6 +1344,321 @@ def _apply_preset(args) -> str | None:
         if getattr(args, knob) == _PRESET_DEFAULTS[knob]:  # user left it default → preset sets it
             setattr(args, knob, val)
     return name
+
+
+def _resolve_tr(args, img) -> float | None:
+    """TR for the task design: -tr wins, else the header's pixdim[4].
+
+    Returns None (with a message) rather than guessing — a wrong TR misaligns every
+    block, and the failure is silent in the worst way: the design still builds, still
+    fits, and reports "no coupling".
+
+    An implausible header value is REFUSED rather than used. Plenty of real EPI headers
+    carry a pixdim[4] in the wrong units or left at a slice time (0.0534 on the run that
+    exposed this), which would make a 120-frame run 6.4 seconds long and push every
+    event past the end of it.
+    """
+    if args.tr is not None:
+        return float(args.tr)
+    zooms = img.header.get_zooms()
+    tr = float(zooms[3]) if len(zooms) > 3 else 0.0
+
+    def _refuse(why: str) -> None:
+        print(f"  ⚠️  task coupling skipped: {why}")
+        if args.detask:
+            # Never let a requested FIX vanish quietly just because the diagnostic
+            # could not run — the outputs would silently be the uncleaned field.
+            print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
+
+    if tr <= 0:
+        _refuse("no TR in the header — pass -tr SEC.")
+        return None
+    if not 0.1 <= tr <= 20.0:
+        _refuse(
+            f"header TR is {tr:g}s, which is not a plausible fMRI TR (expected "
+            "0.1-20 s). 3-D EPI often puts the shot time in pixdim[4] rather than the "
+            "volume TR — pass -tr SEC explicitly."
+        )
+        return None
+    return tr
+
+
+def _task_design_from_events(args, n_timepoints: int, tr: float, device):
+    """Convolved (T, K) task design for the coupling diagnostic, plus condition labels.
+
+    Goes through the same ``parse_bids_events`` -> ``build_task_design`` path every
+    other ffs GLM uses, so a design that works for -events elsewhere works here.
+    """
+    import torch
+
+    from fastfuncstuff.design.bids_events import parse_bids_events
+    from fastfuncstuff.design.builder import spm_canonical_hrf
+    from fastfuncstuff.design.matrices import build_task_design, commensurate_microtime_dt
+
+    onsets, durations, labels = parse_bids_events(
+        event_files=list(args.events),
+        event_ignore=args.event_ignore,
+        event_cols=tuple(args.event_cols) if args.event_cols else None,
+        n_runs=1,
+    )
+    # Catch a wrong TR HERE, where the numbers are still interpretable, rather than
+    # letting an all-zero design fall through to an empty condition list far downstream.
+    run_seconds = n_timepoints * tr
+    latest = max(
+        (float(o.max()) for cond in onsets for o in cond if len(o)),
+        default=0.0,
+    )
+    if latest >= run_seconds:
+        raise ValueError(
+            f"every event starts at or after the end of the run: last onset "
+            f"{latest:g}s, run length {run_seconds:g}s ({n_timepoints} frames x "
+            f"{tr:g}s TR). The TR is almost certainly wrong — pass -tr SEC."
+        )
+
+    dt = commensurate_microtime_dt(tr)
+    hrf = torch.tensor(spm_canonical_hrf(tr=dt), dtype=torch.float64, device=device)
+    design = build_task_design(
+        hrf_bases=hrf,
+        n_timepoints=n_timepoints,
+        run_starts=[0],
+        tr=tr,
+        microtime_dt=dt,
+        event_onsets=onsets,
+        durations=durations,
+        device=device,
+    )
+    keep = [k for k in range(design.shape[1]) if float(design[:, k].abs().max()) > 0]
+    if not keep:
+        raise ValueError(
+            f"the task design is all zeros for every condition at TR {tr:g}s over "
+            f"{n_timepoints} frames. Check -tr and that the events file covers this run."
+        )
+    if len(keep) < design.shape[1]:
+        dropped = [labels[k] for k in range(design.shape[1]) if k not in keep]
+        print(f"  ⚠️  dropping condition(s) with no events in this run: {', '.join(dropped)}")
+        design = design[:, keep]
+        labels = [labels[k] for k in keep]
+    return design, labels
+
+
+def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
+    """Measure how task-locked the estimated field is, and whether that is BOLD.
+
+    The statistic, the null and the strata are explained in
+    :mod:`fastfuncstuff.stats.task_coupling`. Shared by the single- and multi-echo
+    paths: both expose ``pe_displacements()``, so each encode axis is scored on its
+    own — the primary-PE and partition fields can be contaminated to different
+    degrees and one pooled number would hide it.
+    """
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.locomoco import _brain_mask_from
+    from fastfuncstuff.stats.task_coupling import (
+        co_location,
+        contamination_slope,
+        default_polort,
+        format_task_coupling_report,
+        pe_gradient,
+        responding_mask,
+        task_coupling,
+        task_enrichment,
+    )
+
+    n_t = data.shape[3]
+    design, labels = _task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    print(
+        f"  Task coupling: {len(labels)} condition(s) ({', '.join(labels)}), "
+        f"TR {tr:g}s, polort {polort}"
+    )
+
+    series = torch.as_tensor(np.ascontiguousarray(data))
+    reference = series.mean(dim=3)
+    mask = _brain_mask_from(reference.abs())
+
+    kwargs = dict(polort=polort, mask=mask, labels=labels)
+    # The BOLD response itself, measured the same way — the reference the field's
+    # coupling is compared AGAINST, and what defines "where the data responds".
+    data_tc = task_coupling(series, design, **kwargs)
+    resp, quiet, cut = responding_mask(data_tc.r, mask, args.task_top_frac, thresh=args.task_thresh)
+    how = "cut" if args.task_thresh is not None else f"top {args.task_top_frac * 100:.0f}%"
+    print(
+        f"  Active mask: {int(resp.sum())} voxels with data |r| > {cut:.3f} ({how}) "
+        f"= {100 * int(resp.sum()) / max(1, int((mask > 0).sum())):.1f}% of the brain"
+    )
+
+    report: list[str] = []
+    for label, axis, field in result.pe_displacements():
+        tc = task_coupling(field, design, **kwargs)
+        coloc = co_location(tc.r, data_tc.r, mask)
+        r_sum, q_sum = tc.summarize(resp), tc.summarize(quiet)
+        name = "PE displacement" if label == "pe1" else "partition displacement"
+        # The gradient must be along THIS axis: a partition-direction displacement
+        # produces an intensity change through the partition-direction gradient, and
+        # using the primary-PE gradient for it would test the wrong relation.
+        conds = r_sum.get("conditions") or []
+        if not conds:
+            raise ValueError("no voxel in the active mask carries temporal variance in the field")
+        best_k = max(range(len(conds)), key=lambda k: conds[k]["abs_r_median"])
+        slope = contamination_slope(
+            tc.beta, data_tc.beta, pe_gradient(reference, axis), resp, condition=best_k
+        )
+        enrich = task_enrichment(tc, resp, mask)
+        report.append(
+            format_task_coupling_report(
+                tc,
+                data_tc,
+                coloc,
+                units="voxels",
+                label=f"{name} (axis {axis})",
+                responding=r_sum,
+                quiet=q_sum,
+                top_frac=args.task_top_frac,
+                slope=slope,
+                enrichment=enrich,
+                active_thresh=cut,
+            )
+        )
+        best = r_sum["conditions"][best_k]
+        print(
+            f"  • {name}: ENRICHMENT {enrich['enrichment']:.2f}x "
+            f"({enrich['energy_share'] * 100:.1f}% of task-locked displacement in "
+            f"{enrich['voxel_share'] * 100:.1f}% of voxels); |r| {best['abs_r_median']:.3f} "
+            f"there ({best['label']}); kappa {slope['kappa']:+.3f} (R² {slope['r2']:.3f})"
+        )
+        # One 4-D file per axis, conditions on the 4th axis — a viewer scrubs the
+        # conditions, and one file per condition would flood the output directory.
+        for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms)):
+            path = f"{stem}_{kind}_{label}{ext}"
+            with spinner(f"Writing {Path(path).name}"):
+                save_nifti(
+                    arr.float().squeeze(-1).numpy()
+                    if kind == "taskr" and arr.shape[-1] == 1
+                    else arr.float().numpy(),
+                    path,
+                    affine=affine,
+                )
+        print(f"    {stem}_taskr_{label}{ext} · {stem}_taskrms_{label}{ext}")
+
+    dpath = f"{stem}_taskr_data{ext}"
+    with spinner(f"Writing {Path(dpath).name}"):
+        dr = data_tc.r.float()
+        save_nifti((dr.squeeze(-1) if dr.shape[-1] == 1 else dr).numpy(), dpath, affine=affine)
+    print(f"  • data coupling r (the BOLD response, for co-location): {dpath}")
+
+    tpath = f"{stem}_locomoco_taskcoupling.txt"
+    Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
+    print(f"  • task-coupling report: {tpath}")
+    for block in report:
+        print()
+        print("\n".join("    " + ln for ln in block.rstrip().splitlines()))
+    return design, polort
+
+
+def _pc_task_correlation(components, design, polort) -> float:
+    """|corr| of the top temporal PC of the field with the drift-residualized task.
+
+    The number that says whether the nuisance regressors are safe to use. Measured
+    against the DETRENDED regressor because the GLM these PCs enter carries
+    polynomials too, so the slow component the task shares with drift is not the
+    task's to claim.
+    """
+    import torch
+
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+
+    n_t = components[0][1].shape[-1]
+    m = torch.cat([c.reshape(-1, n_t) for _, c in components], dim=0).double()
+    m = m - m.mean(dim=1, keepdim=True)
+    keep = m.norm(dim=1) > 0
+    if not bool(keep.any()):
+        return 0.0
+    pc = torch.linalg.svd(m[keep], full_matrices=False)[2][0]
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, device=pc.device, dtype=torch.float64)
+    )
+    x = torch.as_tensor(design, dtype=torch.float64)[:, 0]
+    x = x - q_n @ (q_n.T @ x)
+    denom = float(pc.norm() * x.norm())
+    return abs(float(pc.dot(x) / denom)) if denom > 0 else 0.0
+
+
+def _task_stage(result, data, stem, ext, affine, args, tr, device):
+    """Diagnose the ORIGINAL field, then optionally hand back a de-tasked one.
+
+    Ordering is the whole point of this function existing. The diagnostic must see the
+    field as estimated — measuring after the fix would report the fix's own output and
+    always say "no task" — while ``-detask`` has to land BEFORE the warp, corrected
+    series, flow maps, PCs and movie are written, so that every output describes one
+    field rather than a mix of cleaned and uncleaned.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.locomoco import detask_result
+
+    try:
+        design, polort = _write_task_diagnostics(result, data, stem, ext, affine, args, tr)
+    except (ValueError, RuntimeError) as exc:
+        # A diagnostic must never destroy a finished fit. The estimation above can be
+        # minutes of GPU time; losing it to a bad -tr or an empty mask is the wrong
+        # trade. -detask is refused loudly, because silently skipping the fix the user
+        # asked for would be worse than the crash.
+        print(f"  ⚠️  task coupling skipped: {exc}")
+        if args.detask:
+            print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
+        return result
+
+    if not args.detask:
+        return result
+
+    print("  ── de-tasking (everything below is derived from the CLEANED field) ──")
+    raw_components = [(ax, f) for _, ax, f in result.pe_displacements()]
+    cleaned, removed, note = detask_result(
+        result,
+        data,
+        design,
+        polort,
+        warp_interp=args.warp_interp,
+        warp_radius=args.warp_radius,
+        device=device,
+    )
+
+    for (label, _, new_field), (_, _, task_part) in zip(
+        cleaned.pe_displacements(), removed, strict=True
+    ):
+        path = f"{stem}_flow_{label}_taskpart{ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_nifti(task_part.float().numpy(), path, affine=affine)
+        raw = dict(raw_components)[
+            next(ax for lbl, ax, _ in result.pe_displacements() if lbl == label)
+        ]
+        rms_before = float((raw**2).mean().sqrt())
+        rms_after = float((new_field**2).mean().sqrt())
+        pct = 100 * (1 - rms_after / rms_before) if rms_before > 0 else 0.0
+        print(
+            f"  • {label}: rms {rms_before:.4f} -> {rms_after:.4f} vox ({pct:.1f}% removed); "
+            f"drift KEPT (polort {polort} fitted, not subtracted)"
+        )
+        print(f"    removed component: {path}")
+
+    if args.want_pcs is not None:
+        before = _pc_task_correlation(raw_components, design, polort)
+        after = _pc_task_correlation(
+            [(ax, f) for _, ax, f in cleaned.pe_displacements()], design, polort
+        )
+        print(
+            f"  • top warp PC vs task: |r| {before:.3f} -> {after:.3f}  "
+            "(a task-correlated nuisance regressor removes real BOLD in a GLM)"
+        )
+    if note:
+        print(f"  ⚠️  {note}; the flow/warp/PCs below ARE cleaned.")
+    else:
+        print("    corrected series re-resampled from the RAW input with the cleaned field.")
+    return cleaned
 
 
 def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> None:
@@ -1583,6 +2007,7 @@ def _run_multiecho(
             return 2
         if affine is None:
             affine = img.affine.copy()
+            tr_sec = _resolve_tr(args, img) if args.events else None
         datas.append(d)
 
     smooth_sigma = 0.0
@@ -1978,6 +2403,19 @@ def _run_multiecho(
     # coupling, not one echo's view of it.
     _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args)
 
+    if args.events and tr_sec:
+        # Echo 1's series and the shared field: the coupling question is about the ONE
+        # field every echo is corrected by, not each echo's scaled copy of it.
+        _write_task_diagnostics(result.per_echo[0], datas[0], stem, ext, affine, args, tr_sec)
+        if args.detask:
+            # The multi-echo correction is one SHARED field scaled per echo; de-tasking
+            # it means re-deriving every echo's warp and series from the cleaned w, which
+            # is not wired yet. Refusing beats silently cleaning one echo's copy.
+            print(
+                "  ⚠️  -detask is not wired for the multi-echo path (the shared field is "
+                "scaled per echo); the outputs below are NOT de-tasked."
+            )
+
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
     with open(alpha_path, "w") as f:
@@ -2289,6 +2727,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         print(f"❌ -input must be 4D, got shape {data.shape}", file=sys.stderr)
         return 2
     affine = img.affine.copy()
+    tr_sec = _resolve_tr(args, img) if args.events else None
 
     # Correlation-curve frame (xcorr diagnostics): bare -save_corr_curve (const -1) → middle.
     corr_curve_frame = None
@@ -2562,6 +3001,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         result = polished.per_echo[0]
 
     print_cli_section("Outputs")
+
+    # Task coupling runs BEFORE any output: it must measure the ORIGINAL field (running
+    # it after -detask would report the fix's own output and always say "no task"), and
+    # -detask has to replace the field before the warp/corrected series are written.
+    if args.events and tr_sec:
+        result = _task_stage(result, data, stem, ext, affine, args, tr_sec, device)
+
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
 

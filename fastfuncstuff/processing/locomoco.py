@@ -2168,6 +2168,81 @@ def estimate_residual_flow(
 # and the per-volume moco matrices (voxel + DICOM).
 
 
+def detask_result(
+    result,
+    data: np.ndarray,
+    design,
+    polort: int,
+    *,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    device: torch.device | None = None,
+):
+    """Remove the task-locked part of a field and RE-DERIVE the corrected series from it.
+
+    Returns ``(cleaned_result, removed_components, note)``.  ``note`` is None when the
+    corrected series was genuinely rebuilt, or a string explaining why it could not be
+    (rotation-aware runs reproject the field through per-frame head rotations, so the
+    correction is not a plain per-axis pull and re-deriving it here would be wrong).
+
+    Cleaning goes through the NIfTI-order view and permutes back, rather than acting on
+    ``u_canon`` directly: the canonical layout does not put time on a fixed axis across
+    the slicewise and 3-D paths, and assuming it does silently multiplies the design
+    against a spatial axis.  Writing the result back into the canonical fields means
+    every derived product (``pe_displacements``, ``warp_components``, the PCs, the warp)
+    inherits the cleaned field with no second code path to keep in sync.
+
+    The resample is redone from the RAW input rather than adjusted from the existing
+    corrected series: warping a warped series would stack a second interpolation, which
+    is the trap :doc:`the interpolation-stacking audit </locomoco>` already caught once
+    in the qwarp polish.
+    """
+    from dataclasses import replace
+
+    from fastfuncstuff.stats.task_coupling import project_task_out
+
+    def _clean(canon: torch.Tensor):
+        nifti = result._to_nifti(canon)  # (nx, ny, nz, T) — time last, always
+        keep, drop = project_task_out(nifti, design, polort)
+        back = list(result.perm)
+        return keep.permute(back).contiguous(), drop.permute(back).contiguous()
+
+    (u_clean, u_task), (v_clean, v_task) = _clean(result.u_canon), _clean(result.v_canon)
+    cleaned = replace(result, u_canon=u_clean, v_canon=v_clean)
+    removed = replace(result, u_canon=u_task, v_canon=v_task).pe_displacements()
+
+    if result.reproject_weights is not None:
+        return (
+            cleaned,
+            removed,
+            (
+                "rotation-aware mode: the correction reprojects the field through each "
+                "frame's head rotation, so the corrected series was NOT re-derived"
+            ),
+        )
+
+    if device is None:
+        device = torch.device("cpu")
+    comps = cleaned.pe_displacements()
+    axes = [ax for _, ax, _ in comps]
+    fields = [f for _, _, f in comps]
+    series = torch.from_numpy(np.ascontiguousarray(data)).float()
+    corrected = torch.zeros_like(series)
+    for t in tqdm(range(series.shape[3]), desc="detask resample", unit="frame", leave=True):
+        corrected[..., t] = (
+            _shift3d_axes(
+                series[..., t].to(device)[None],
+                [f[..., t].to(device)[None] for f in fields],
+                axes,
+                mode=warp_interp,
+                radius=warp_radius,
+            )[0]
+            .cpu()
+            .float()
+        )
+    return replace(cleaned, corrected_nifti=corrected), removed, None
+
+
 def _inv_perm(perm: list[int]) -> list[int]:
     inv = [0] * len(perm)
     for i, p in enumerate(perm):
