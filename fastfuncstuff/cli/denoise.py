@@ -304,6 +304,21 @@ Notes:
         "range 0.01-0.10 depending on data quality.",
     )
     denoise_opts.add_argument(
+        "-zero_event",
+        "-zero-event",
+        type=str,
+        choices=["zero", "nuisance"],
+        default="zero",
+        help="How cross-validation treats a condition whose events all fall inside a "
+        "fold's held-out runs, leaving that fold with no beta for it. 'zero' (default) "
+        "predicts zero and charges its BOLD to the residual; 'nuisance' removes it from "
+        "both the held-out data and the prediction design, so the fold is not scored on "
+        "what it could not have known. Matters because the R² it feeds is thresholded "
+        "absolutely to split noise pool from criteria: under 'zero' a design with "
+        "run-confined conditions shifts the whole R² distribution down and moves both "
+        "masks. Identical either way when every condition appears in every run.",
+    )
+    denoise_opts.add_argument(
         "-noise",
         type=str,
         choices=["pca", "ica"],
@@ -2289,7 +2304,7 @@ def main():
                     nuisance_indices=[],
                     cv_splits=cv_splits,
                     metric=metric,
-                    zero_event_strategy="zero",
+                    zero_event_strategy=args.zero_event,
                     device=device,
                     verbose=False,
                 )
@@ -2321,7 +2336,7 @@ def main():
                     nuisance_indices=[],
                     cv_splits=cv_splits,
                     metric=metric,
-                    zero_event_strategy="zero",
+                    zero_event_strategy=args.zero_event,
                     device=device,
                     verbose=False,
                 )
@@ -3232,6 +3247,7 @@ def main():
             run_starts=run_starts,
             tr=args.tr,
             r2_threshold=args.r2_threshold,
+            zero_event_strategy=args.zero_event,
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
@@ -3270,6 +3286,7 @@ def main():
             run_starts=run_starts,
             tr=args.tr,
             r2_threshold=args.r2_threshold,
+            zero_event_strategy=args.zero_event,
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,

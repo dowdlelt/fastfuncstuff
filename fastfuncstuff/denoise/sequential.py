@@ -2155,6 +2155,7 @@ def fit_denoising_model(
     cv_strategy: int | float = 1,
     n_perms: int = 100,
     r2_method: str = "auto",
+    zero_event_strategy: str = "zero",
     device: torch.device | None = None,
     verbose: bool = False,
     designs_by_hrf: dict | None = None,
@@ -2241,6 +2242,25 @@ def fit_denoising_model(
     n_perms : int, default=100
         Maximum number of CV permutations for random splits.
         For LORO, this should be >= n_runs to get all splits.
+    zero_event_strategy : {'zero', 'nuisance'}, default='zero'
+        How the initial R2 treats a condition whose events all fall inside a
+        fold's held-out runs, so that fold has no beta for it.
+
+        - ``'zero'`` predicts zero for it, charging its BOLD to the residual.
+        - ``'nuisance'`` removes it from both the held-out data and the
+          prediction design, declining to score the fold on what it could not
+          have known.
+
+        This is not cosmetic: the initial R2 is thresholded absolutely to split
+        noise pool from criteria, so a design where some conditions are confined
+        to single runs shifts the whole distribution down under ``'zero'`` and
+        moves both masks. The voxels that flip are the marginal-SNR ones nearest
+        the threshold, which is the worst possible composition for a noise pool
+        whose PCs are then projected out of every voxel.
+
+        ``'zero'`` remains the default because it is what every published
+        GLMdenoise result used. Where every condition appears in every run the
+        two are identical and neither costs anything.
     device : torch.device, optional
         Device for computation
     verbose : bool, default=False
@@ -2408,7 +2428,7 @@ def fit_denoising_model(
                 nuisance_indices=[],
                 cv_splits=cv_splits,
                 metric="cod",
-                zero_event_strategy="zero",
+                zero_event_strategy=zero_event_strategy,
                 device=device,
                 batch_size=chunk_size,
                 r2_method=r2_method,
@@ -2483,7 +2503,7 @@ def fit_denoising_model(
             nuisance_indices=[],
             cv_splits=cv_splits,
             metric="cod",
-            zero_event_strategy="zero",
+            zero_event_strategy=zero_event_strategy,
             device=device,
             batch_size=chunk_size,
             r2_method=r2_method,
