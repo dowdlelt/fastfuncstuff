@@ -768,3 +768,98 @@ def test_explainable_r2_tracks_how_much_of_the_design_is_measurable():
 
     assert medians[3] > 1.2, medians
     assert medians[9] <= 1.0, medians
+
+
+def _wide_vs_narrow_designs(n_runs=9, tp=200, n_prompts=180):
+    """One column per prompt, each prompt occurring exactly once, plus a 2-condition
+    collapse of the same events. The comparison a rich event design forces."""
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+    wide = torch.zeros(n_tp, n_prompts)
+    for c in range(n_prompts):
+        start = (c % n_runs) * tp + 10 + (c // n_runs) * 9
+        wide[start : start + 4, c] = 1.0
+    narrow = torch.zeros(n_tp, 2)
+    for c in range(n_prompts):
+        narrow[:, c % 2] += wide[:, c]
+    nuisance = [
+        construct_polynomial_matrix(tp, 3, torch.device("cpu")).float() for _ in range(n_runs)
+    ]
+    return wide, narrow, nuisance, run_starts
+
+
+def _df_ceiling(data, design, nuisance, run_starts):
+    from fastfuncstuff.stats.noise_ceiling import df_ceiling_by_voxel_group
+
+    return df_ceiling_by_voxel_group(
+        data=data,
+        nuisance_per_run=nuisance,
+        run_starts=run_starts,
+        design_matrix=design,
+        device=torch.device("cpu"),
+    ).ceiling.nanmedian()
+
+
+def _add_drift(data, nuisance, run_starts, tp):
+    for r, block in enumerate(nuisance):
+        sl = slice(run_starts[r], run_starts[r] + tp)
+        data[:, sl] += torch.randn(data.shape[0], block.shape[1]) @ block.T * 2.0
+    return data
+
+
+def test_df_ceiling_does_not_reward_a_model_for_having_more_columns():
+    """Free parameters must not buy ceiling. This is why df is comparable ACROSS models.
+
+    The two-half ceiling cannot rank a 2-condition model against a 180-condition
+    one at all, because the wide model's conditions never repeat. The df ceiling
+    can, because it subtracts p * sigma2 -- exactly the fit that p free columns
+    extract from noise. So when the truth really is two conditions, the wide
+    model's 178 extra columns must buy it essentially nothing.
+    """
+    torch.manual_seed(11)
+    n_runs, tp, n_vox = 9, 200, 400
+    wide, narrow, nuisance, run_starts = _wide_vs_narrow_designs(n_runs, tp)
+
+    betas = torch.randn(n_vox, 2) * 2.0
+    data = betas @ narrow.T + torch.randn(n_vox, n_runs * tp) * 2.0
+    data = _add_drift(data, nuisance, run_starts, tp)
+
+    narrow_ceiling = _df_ceiling(data, narrow, nuisance, run_starts)
+    wide_ceiling = _df_ceiling(data, wide, nuisance, run_starts)
+
+    assert abs(float(wide_ceiling) - float(narrow_ceiling)) < 0.02, (
+        f"178 columns of pure overfit moved the ceiling: "
+        f"{float(narrow_ceiling):.4f} -> {float(wide_ceiling):.4f}"
+    )
+
+
+def test_df_ceiling_credits_a_wide_model_when_the_signal_really_is_wide():
+    """The correction must not be so blunt that real per-condition signal vanishes.
+
+    Pairs with the overfit test: together they say the ceiling tracks signal
+    rather than column count in both directions.
+    """
+    torch.manual_seed(11)
+    n_runs, tp, n_vox = 9, 200, 400
+    wide, narrow, nuisance, run_starts = _wide_vs_narrow_designs(n_runs, tp)
+
+    betas = torch.randn(n_vox, wide.shape[1]) * 2.0
+    data = betas @ wide.T + torch.randn(n_vox, n_runs * tp) * 2.0
+    data = _add_drift(data, nuisance, run_starts, tp)
+
+    assert float(_df_ceiling(data, wide, nuisance, run_starts)) > 0.15
+    # The 2-condition model genuinely cannot represent prompt-specific responses.
+    assert float(_df_ceiling(data, narrow, nuisance, run_starts)) < 0.02
+
+
+def test_df_ceiling_is_zero_on_pure_noise_for_both_designs():
+    """The df correction has to be exact, not approximate, or wide designs drift up."""
+    torch.manual_seed(11)
+    n_runs, tp, n_vox = 9, 200, 400
+    wide, narrow, nuisance, run_starts = _wide_vs_narrow_designs(n_runs, tp)
+    data = _add_drift(torch.randn(n_vox, n_runs * tp) * 2.0, nuisance, run_starts, tp)
+
+    assert float(_df_ceiling(data, narrow, nuisance, run_starts)) < 0.01
+    assert float(_df_ceiling(data, wide, nuisance, run_starts)) < 0.01

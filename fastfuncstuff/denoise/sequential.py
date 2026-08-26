@@ -2216,6 +2216,7 @@ def fit_denoising_model(
     n_perms: int = 100,
     r2_method: str = "auto",
     zero_event_strategy: str = "zero",
+    ceiling_method: str = "auto",
     device: torch.device | None = None,
     verbose: bool = False,
     designs_by_hrf: dict | None = None,
@@ -3069,7 +3070,10 @@ def fit_denoising_model(
     initial_explainable_r2: torch.Tensor | None = None
     noise_ceiling_notes: list[str] = []
     if compute_noise_ceiling and (design_matrix is not None or designs_by_hrf is not None):
-        from fastfuncstuff.stats.noise_ceiling import loro_ceiling_by_voxel_group
+        from fastfuncstuff.stats.noise_ceiling import (
+            df_ceiling_by_voxel_group,
+            loro_ceiling_by_voxel_group,
+        )
 
         if verbose:
             print(f"\nNoise ceiling at {optimal_n_components} PCs:")
@@ -3077,23 +3081,45 @@ def fit_denoising_model(
         ceiling_splits = generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms)
 
         def _ceiling_at(n_pcs: int, label: str):
-            return loro_ceiling_by_voxel_group(
+            ceiling_nuisance = _nuisance_with_pcs(
+                nuisance, noise_pcs, run_starts, n_pcs, data.shape[1]
+            )
+            common = dict(
                 data=data,
-                nuisance_per_run=_nuisance_with_pcs(
-                    nuisance, noise_pcs, run_starts, n_pcs, data.shape[1]
-                ),
+                nuisance_per_run=ceiling_nuisance,
                 run_starts=run_starts,
-                cv_splits=ceiling_splits,
                 design_matrix=design_matrix,
                 designs_by_hrf=designs_by_hrf,
                 hrf_indices=hrf_indices,
                 device=device,
+                show_progress=verbose,
+            )
+
+            def _df():
+                return df_ceiling_by_voxel_group(
+                    **common, progress_desc=f"  {label} df ceiling by HRF"
+                )
+
+            if ceiling_method == "df":
+                return _df()
+
+            result = loro_ceiling_by_voxel_group(
+                **common,
+                cv_splits=ceiling_splits,
                 # The ceiling's denominator must be the SS_tot the R2 was
                 # divided by, so it follows the same missing-event policy.
                 zero_event_strategy=zero_event_strategy,
                 progress_desc=f"  {label} ceiling by HRF",
-                show_progress=verbose,
             )
+            # The documented behaviour of 'auto': the two-half estimator needs
+            # runs it can split, and when it has none there is no ceiling at all
+            # rather than a bad one, so fall through to the estimator that needs
+            # no repeats. An explicit -noise_ceiling loro is left to fail loudly.
+            if ceiling_method == "auto" and result.n_usable == 0:
+                if verbose:
+                    print("  No fold could be split in two; using the df ceiling instead.")
+                return _df()
+            return result
 
         # The initial R2 is scored on data with no PCs removed, the optimal R2 on
         # data with `optimal_n_components` removed. Those are different

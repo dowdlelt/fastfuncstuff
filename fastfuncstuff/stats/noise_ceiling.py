@@ -183,6 +183,124 @@ def loro_ceiling_by_voxel_group(
     return merge_voxel_group_ceilings(groups, n_voxels=data.shape[0])
 
 
+def df_ceiling_by_voxel_group(
+    *,
+    data: torch.Tensor,
+    nuisance_per_run: list[torch.Tensor],
+    run_starts: list[int],
+    design_matrix: torch.Tensor | None = None,
+    designs_by_hrf: dict | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
+    chunk_size: int | None = None,
+    progress_desc: str = "  df ceiling by HRF",
+    show_progress: bool = False,
+) -> CeilingResult:
+    """Degrees-of-freedom ceiling for a timeseries design, needing no repeats.
+
+    The counterpart to :func:`loro_ceiling_by_voxel_group` for designs the
+    two-half split cannot measure. It fits the task design in-sample and
+    corrects the fitted sum of squares for the free parameters that produced it
+    (see :func:`df_corrected_ceiling`), so it asks only "how much task-locked
+    variance is really here", which needs one estimate rather than two.
+
+    That independence from repeats is exactly what makes it usable on a design
+    where every condition occurs once, and also what limits it: the answer is
+    conditional on the design being right. A design that omits a real effect
+    gets a confidently low ceiling. See the warning in
+    :func:`df_corrected_ceiling`.
+
+    The residual variance is taken on the degrees of freedom that remain after
+    BOTH the task columns and the per-run nuisance block -- polynomials and the
+    selected noise PCs included. Counting only the task columns would understate
+    sigma2, which inflates the corrected signal and hands back a ceiling that is
+    too high in precisely the wide designs this function exists for.
+    """
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+    from fastfuncstuff.utils import pinv_f64
+
+    n_timepoints = data.shape[1]
+    # Block-diagonal, so every run's columns cost their own degrees of freedom.
+    n_nuisance_cols = sum(int(block.shape[1]) for block in nuisance_per_run)
+
+    def _one(subset_data: torch.Tensor, subset_design: torch.Tensor) -> CeilingResult:
+        projected_data, projected_design = project_out_nuisance_per_run(
+            data=subset_data,
+            design=subset_design,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=subset_data.device,
+        )
+        work = device if device is not None else projected_data.device
+        design = projected_design.to(work)
+        n_task = int(design.shape[1])
+        solver = pinv_f64(design)  # (n_task, n_timepoints), fold-sized
+
+        n_voxels = projected_data.shape[0]
+        step = chunk_size or estimate_chunk_size(
+            n_voxels=n_voxels,
+            n_timepoints=n_timepoints,
+            n_regressors=n_task,
+            device=work,
+            operation="glm",
+        )
+        ss_model = torch.zeros(n_voxels, dtype=torch.float64)
+        ss_res = torch.zeros(n_voxels, dtype=torch.float64)
+        ss_total = torch.zeros(n_voxels, dtype=torch.float64)
+        for start in range(0, n_voxels, step):
+            stop = min(start + step, n_voxels)
+            block = projected_data[start:stop].to(work)
+            fitted = design @ (solver @ block.T)  # (n_timepoints, chunk)
+            residual = block.T - fitted
+            ss_model[start:stop] = fitted.square().sum(dim=0, dtype=torch.float64).cpu()
+            ss_res[start:stop] = residual.square().sum(dim=0, dtype=torch.float64).cpu()
+            # Nuisance projection removed the intercept, so the data is already
+            # centred and this is the same SS_total the R2 divides by.
+            ss_total[start:stop] = block.square().sum(dim=1, dtype=torch.float64).cpu()
+            del block, fitted, residual
+
+        del projected_data, projected_design
+        if work.type == "cuda":
+            torch.cuda.empty_cache()
+
+        dof = n_timepoints - n_nuisance_cols - n_task
+        if dof <= 0:
+            return CeilingResult(
+                ceiling=torch.full((n_voxels,), torch.nan, dtype=torch.float32),
+                method="df",
+                n_usable=0,
+                notes=[
+                    f"design has no residual degrees of freedom "
+                    f"({n_task} task + {n_nuisance_cols} nuisance columns for "
+                    f"{n_timepoints} timepoints); the df ceiling is undefined"
+                ],
+            )
+        return df_corrected_ceiling(ss_model, ss_total, ss_res / dof, n_timepoints, n_task)
+
+    if designs_by_hrf is None:
+        if design_matrix is None:
+            raise ValueError("pass either design_matrix or designs_by_hrf")
+        return _one(data, design_matrix)
+
+    if hrf_indices is None:
+        raise ValueError("designs_by_hrf requires hrf_indices")
+
+    from tqdm import tqdm
+
+    groups: list[tuple[torch.Tensor, CeilingResult]] = []
+    group_iter = tqdm(
+        torch.unique(hrf_indices).tolist(),
+        desc=progress_desc,
+        unit="group",
+        leave=True,
+        disable=not show_progress or len(designs_by_hrf) < 2,
+    )
+    for hrf_idx in group_iter:
+        voxel_mask = hrf_indices == hrf_idx
+        groups.append((voxel_mask, _one(data[voxel_mask, :], designs_by_hrf[hrf_idx])))
+    return merge_voxel_group_ceilings(groups, n_voxels=data.shape[0])
+
+
 def merge_voxel_group_ceilings(
     groups: list[tuple[torch.Tensor, CeilingResult]],
     n_voxels: int,
