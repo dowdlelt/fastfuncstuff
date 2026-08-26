@@ -715,3 +715,129 @@ def test_xval_multiple_runs_missing_events():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+
+
+def _collinear_missing_event_dataset(
+    overlap: bool, n_voxels: int = 60, n_tps: int = 60, seed: int = 7
+):
+    """Two runs; run 2 carries a condition that run 1 never sees.
+
+    With ``overlap=True`` that unpredictable condition's boxcar sits directly on
+    top of a predictable one, which is the case the FWL fix exists for. Data is
+    noiseless and exactly linear in the design, so a correct estimator recovers
+    R2 = 1 in the subspace it is allowed to be scored in.
+    """
+    rng = np.random.RandomState(seed)
+    n_stim = 3  # cols 0,1 predictable; col 2 present only in run 2
+
+    stim = torch.zeros(2 * n_tps, n_stim)
+    for start in range(0, n_tps, 20):  # col 0 in both runs
+        stim[start : start + 6, 0] = 1.0
+        stim[n_tps + start : n_tps + start + 6, 0] = 1.0
+    for start in range(8, n_tps, 20):  # col 1 in both runs
+        stim[start : start + 6, 1] = 1.0
+        stim[n_tps + start : n_tps + start + 6, 1] = 1.0
+    # col 2: run 2 only, half-overlapping col 0's blocks or clear of everything.
+    # PARTIAL overlap on purpose: a col 2 laid exactly on col 0 would make the two
+    # indistinguishable inside run 2, so the fold that trains there could not
+    # separate them and R2 < 1 would be the correct answer rather than a bug.
+    offset = 3 if overlap else 14
+    for start in range(offset, n_tps, 20):
+        stim[n_tps + start : n_tps + start + 6, 2] = 1.0
+
+    betas = torch.from_numpy(rng.randn(n_voxels, n_stim).astype(np.float32))
+    data = betas @ stim.T  # noiseless
+
+    return data, stim, [0, n_tps], list(range(n_stim))
+
+
+@pytest.mark.parametrize("overlap", [True, False])
+def test_nuisance_strategy_is_not_penalised_by_collinear_missing_events(overlap):
+    """'nuisance' must project the prediction design, not just the test data.
+
+    Bug of record: the projector was applied to the held-out data while the
+    design used to predict it was left alone. Whatever a predictable condition
+    shared with an unpredictable one was then removed from one side only and
+    landed in the residual as fabricated error -- so R2 fell precisely when an
+    unmodellable event sat near a real one, which is the opposite of what the
+    strategy is for. Noiseless data makes the correct answer exactly 1.0.
+    """
+    data, stim, run_starts, stim_indices = _collinear_missing_event_dataset(overlap)
+
+    results = compute_xval_r2(
+        data=data,
+        design_matrix=stim,
+        run_starts=run_starts,
+        stim_indices=stim_indices,
+        nuisance_indices=[],
+        cv_splits=generate_cv_splits(n_runs=2, strategy=1),
+        metric="cod",
+        zero_event_strategy="nuisance",
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    r2 = results["r2"].median().item()
+    assert r2 > 0.99, f"overlap={overlap}: 'nuisance' should recover R2~1, got {r2:.4f}"
+
+
+def test_nuisance_beats_zero_when_an_event_is_unpredictable():
+    """The whole point of the strategy: don't score a fold on what it couldn't know.
+
+    'zero' has no beta for the run-2-only condition, so its variance is charged
+    to the residual and R2 collapses. 'nuisance' declines to score that subspace.
+    """
+    data, stim, run_starts, stim_indices = _collinear_missing_event_dataset(overlap=True)
+
+    scores = {}
+    for strategy in ("zero", "nuisance"):
+        results = compute_xval_r2(
+            data=data,
+            design_matrix=stim,
+            run_starts=run_starts,
+            stim_indices=stim_indices,
+            nuisance_indices=[],
+            cv_splits=generate_cv_splits(n_runs=2, strategy=1),
+            metric="cod",
+            zero_event_strategy=strategy,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+        scores[strategy] = results["r2"].median().item()
+
+    assert scores["nuisance"] > scores["zero"], scores
+
+
+def test_unpredictable_basis_ignores_train_only_columns():
+    """Train-only columns are zero across the test set and must not enter the basis.
+
+    They used to, as all-zero columns, which is what made the ridge-stabilised
+    inverse necessary in the first place.
+    """
+    from fastfuncstuff.glm.xval import _plan_fold_designs
+
+    n_tps, n_stim = 40, 3
+    train = torch.zeros(n_tps, n_stim)
+    test = torch.zeros(n_tps, n_stim)
+    train[:10, 0] = 1.0
+    test[:10, 0] = 1.0  # predictable
+    train[10:20, 1] = 1.0  # train-only: absent from test
+    test[20:30, 2] = 1.0  # test-only: the genuinely unpredictable one
+
+    plan = _plan_fold_designs(
+        train_stim_design=train,
+        test_stim_design=test,
+        zero_event_strategy="nuisance",
+        train_runs=[0],
+        test_runs=[1],
+        device=torch.device("cpu"),
+        announce=False,
+    )
+
+    assert plan["unpredictable_mask"].tolist() == [False, True, False]
+    assert plan["test_only_mask"].tolist() == [False, False, True]
+    basis = plan["unpred_basis"]
+    assert basis is not None
+    assert basis.shape == (n_tps, 1), "only the test-only column spans the removed subspace"
+    # Orthonormal, and orthogonal to the predictable design it was applied to.
+    assert torch.allclose(basis.T @ basis, torch.eye(1), atol=1e-5)
+    assert torch.allclose(basis.T @ plan["test_stim_predictable"], torch.zeros(1, 2), atol=1e-5)

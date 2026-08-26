@@ -16,6 +16,7 @@ import torch
 
 from fastfuncstuff._compile import safe_compile
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
+from fastfuncstuff.utils import factor_device
 
 
 def compute_qr_projectors(
@@ -849,6 +850,44 @@ def _cap_batch_to_free_vram(
 
 
 @torch.inference_mode()
+def _unpredictable_basis(
+    test_stim_design: torch.Tensor,
+    test_only_mask: torch.Tensor,
+    rcond: float = 1e-6,
+) -> torch.Tensor | None:
+    """Orthonormal basis for the events this fold had no chance of predicting.
+
+    A condition whose events all fall inside the held-out runs has no beta from
+    training, so under ``zero_event_strategy="nuisance"`` its contribution is
+    removed from the held-out data rather than scored as error. Only
+    ``test_only_mask`` belongs here: the train-only columns are zero across the
+    whole test set by definition, so including them added zero columns to the
+    basis, which is what forced the old ridge-stabilised inverse.
+
+    Returns an orthonormal (n_test_tps, k) basis rather than the (T, T)
+    projector the old code materialised -- k is the number of unpredictable
+    conditions, so applying it twice is O(T*k) instead of O(T^2), and it is an
+    exact orthogonal projector rather than the shrunken one that
+    ``inv(X'X + 1e-6 I)`` produces. ``None`` when there is nothing to remove.
+    """
+    cols = test_stim_design[:, test_only_mask]
+    if cols.shape[1] == 0:
+        return None
+    work = factor_device(cols.device)
+    u, sv, _ = torch.linalg.svd(cols.to(device=work, dtype=torch.float64), full_matrices=False)
+    keep = sv > rcond * sv[0]
+    if not bool(keep.any()):
+        return None
+    return u[:, keep].to(device=cols.device, dtype=cols.dtype)
+
+
+def _project_out_basis(values: torch.Tensor, basis: torch.Tensor, time_dim: int) -> torch.Tensor:
+    """Remove ``basis``'s span from ``values`` along its timepoint axis."""
+    if time_dim == 0:  # (n_timepoints, n_cols), a design
+        return values - basis @ (basis.T @ values)
+    return values - (values @ basis) @ basis.T  # (n_voxels, n_timepoints), data
+
+
 def _plan_fold_designs(
     train_stim_design: torch.Tensor,
     test_stim_design: torch.Tensor,
@@ -898,12 +937,16 @@ def _plan_fold_designs(
                 f"All {n_stim} stimulus columns are zero in train or test."
             )
 
-        if zero_event_strategy == "zero":
-            fit_mask = train_present_mask
-        elif zero_event_strategy == "nuisance":
-            fit_mask = predictable_mask
-        else:
+        if zero_event_strategy not in ("zero", "nuisance"):
             raise ValueError(f"Unknown zero_event_strategy: '{zero_event_strategy}'")
+        # Both strategies fit everything the training runs can see. 'nuisance'
+        # used to fit only the predictable columns, which left a train-only
+        # column's variance in the training data to bias the betas that were
+        # kept -- omitted-variable bias, visible only when the dropped column is
+        # collinear with a kept one, and buying nothing even when it is not
+        # (a train-only column is zero across the test set, so it could never
+        # have entered the prediction). The strategies differ on the test side.
+        fit_mask = train_present_mask
     else:
         if announce:
             print(f"    No missing events - full overlap ({n_stim} conditions)")
@@ -914,6 +957,23 @@ def _plan_fold_designs(
         test_only_mask = torch.zeros(n_stim, dtype=torch.bool, device=device)
         fit_mask = train_present_mask
 
+    # Under 'nuisance' the unpredictable events are removed from the held-out
+    # DATA, so they must be removed from the design used to predict it as well:
+    # anything a predictable condition shares with them is then dropped from both
+    # sides instead of appearing in the data-side residual as fabricated error.
+    # This is Frisch-Waugh-Lovell -- R2 is evaluated in the subspace orthogonal to
+    # the unpredictable events. A temporally adjacent unpredictable event costs
+    # power (a smaller subspace to be scored in), not accuracy.
+    unpred_basis: torch.Tensor | None = None
+    if zero_event_strategy == "nuisance":
+        unpred_basis = _unpredictable_basis(test_stim_design, test_only_mask)
+    test_stim_predictable = test_stim_design[:, predictable_mask]
+    if unpred_basis is not None:
+        test_stim_predictable = _project_out_basis(test_stim_predictable, unpred_basis, time_dim=0)
+    # betas are indexed by the fit columns, so selecting the predictable ones out
+    # of them needs the mask re-expressed in that basis, not the full-design one.
+    predictable_within_fit = predictable_mask[fit_mask]
+
     return {
         "train_present_mask": train_present_mask,
         "test_present_mask": test_present_mask,
@@ -921,6 +981,9 @@ def _plan_fold_designs(
         "unpredictable_mask": unpredictable_mask,
         "test_only_mask": test_only_mask,
         "fit_mask": fit_mask,
+        "unpred_basis": unpred_basis,
+        "test_stim_predictable": test_stim_predictable,
+        "predictable_within_fit": predictable_within_fit,
     }
 
 
@@ -1285,26 +1348,12 @@ def compute_xval_r2(
                 xtx_fit + 1e-6 * torch.eye(xtx_fit.shape[0], device=device)
             )
 
-            # 'nuisance' strategy projects train-only/test-only events out of the
-            # test data; built from the whole test set, as in the legacy path.
-            p_unpred = None
-            if zero_event_strategy == "nuisance":
-                events_to_project = plan["unpredictable_mask"] | plan["test_only_mask"]
-                if events_to_project.any():
-                    to_project = test_stim_design[:, events_to_project]
-                    xuxu = to_project.T @ to_project
-                    xuxu_inv = torch.linalg.inv(
-                        xuxu + 1e-6 * torch.eye(xuxu.shape[0], device=device)
-                    )
-                    p_unpred = to_project @ xuxu_inv @ to_project.T
-
             plan.update(
                 {
                     "test_runs": test_runs,
                     "test_tps": test_tps,
                     "test_stim_design": test_stim_design,
                     "xtx_fit_inv": xtx_fit_inv,
-                    "p_unpred": p_unpred,
                 }
             )
             fold_plans.append(plan)
@@ -1343,8 +1392,12 @@ def compute_xval_r2(
                 xty_train = xty_all - plan["test_stim_design"].T @ test_data_batch.T
                 betas_fit = plan["xtx_fit_inv"] @ xty_train[fit_mask]
 
-                if plan["p_unpred"] is not None:
-                    test_data_batch = test_data_batch - (plan["p_unpred"] @ test_data_batch.T).T
+                # Data and prediction design get the SAME projection; the design
+                # side was done once per fold in _plan_fold_designs.
+                if plan["unpred_basis"] is not None:
+                    test_data_batch = _project_out_basis(
+                        test_data_batch, plan["unpred_basis"], time_dim=1
+                    )
 
                 if zero_event_strategy == "zero":
                     betas_full = torch.zeros(n_stim_all, betas_fit.shape[1], device=device)
@@ -1354,8 +1407,9 @@ def compute_xval_r2(
                         test_stim_present @ betas_full[plan["test_present_mask"], :]
                     ).T
                 else:
-                    test_stim_predictable = plan["test_stim_design"][:, plan["predictable_mask"]]
-                    predictions_batch = (test_stim_predictable @ betas_fit).T
+                    predictions_batch = (
+                        plan["test_stim_predictable"] @ betas_fit[plan["predictable_within_fit"]]
+                    ).T
 
                 if use_fast_r2:
                     # float64 accumulation without materialising float64 copies
@@ -1441,6 +1495,9 @@ def compute_xval_r2(
         predictable_mask = plan["predictable_mask"]
         unpredictable_mask = plan["unpredictable_mask"]
         test_only_mask = plan["test_only_mask"]
+        unpred_basis = plan["unpred_basis"]
+        test_stim_predictable = plan["test_stim_predictable"]
+        predictable_within_fit = plan["predictable_within_fit"]
         train_stim_design_fit = train_stim_design[:, plan["fit_mask"]]
 
         # =========================================================================
@@ -1487,6 +1544,10 @@ def compute_xval_r2(
             predictable_mask = predictable_mask.cpu()
             unpredictable_mask = unpredictable_mask.cpu()
             test_only_mask = test_only_mask.cpu()
+            if unpred_basis is not None:
+                unpred_basis = unpred_basis.cpu()
+            test_stim_predictable = test_stim_predictable.cpu()
+            predictable_within_fit = predictable_within_fit.cpu()
             if verbose:
                 print(
                     f"    Using CPU-only path (batch size {effective_batch_size} < 20k threshold)"
@@ -1533,17 +1594,11 @@ def compute_xval_r2(
                     test_data_batch - (Q_test_batch @ (Q_test_batch.T @ test_data_batch.T)).T
                 )
 
-            # Additional projection for 'nuisance' strategy
-            if zero_event_strategy == "nuisance":
-                events_to_project = unpredictable_mask | test_only_mask
-                if events_to_project.any():
-                    test_to_project = stim_design_test[:, events_to_project]
-                    XuXu = test_to_project.T @ test_to_project
-                    XuXu_inv = torch.linalg.inv(
-                        XuXu + 1e-6 * torch.eye(XuXu.shape[0], device=compute_device)
-                    )
-                    P_unpred = test_to_project @ XuXu_inv @ test_to_project.T
-                    test_data_batch = test_data_batch - (P_unpred @ test_data_batch.T).T
+            # Additional projection for 'nuisance' strategy. Data and prediction
+            # design get the SAME projection; the design side was done once per
+            # fold in _plan_fold_designs.
+            if unpred_basis is not None:
+                test_data_batch = _project_out_basis(test_data_batch, unpred_basis, time_dim=1)
 
             # OLS fit using precomputed pseudoinverse (OPTIMIZATION 1)
             if use_cpu_only_path:
@@ -1560,8 +1615,7 @@ def compute_xval_r2(
                 betas_test_present = betas_full[test_present_mask, :]
                 predictions_batch = (test_stim_present @ betas_test_present).T
             elif zero_event_strategy == "nuisance":
-                test_stim_predictable = stim_design_test[:, predictable_mask]
-                predictions_batch = (test_stim_predictable @ betas_fit).T
+                predictions_batch = (test_stim_predictable @ betas_fit[predictable_within_fit]).T
             else:
                 raise ValueError(f"Invalid strategy: {zero_event_strategy}")
 
