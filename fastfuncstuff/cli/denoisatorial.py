@@ -50,6 +50,7 @@ try:
         LoadResult,
         add_device_arg,
         add_load_threads_arg,
+        add_noise_ceiling_args,
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
@@ -146,8 +147,14 @@ Examples:
 
 Outputs:
     Core outputs:
-        {prefix}_initial_r2.nii.gz               - Initial xval R2 (task-only)
-        {prefix}_optimized_xval_r2.nii.gz         - Xval R2 with optimal per-run PCs
+        {prefix}_initial_r2.nii.gz               - Initial xval R2 (task-only, no PCs).
+                                                   With -noise_ceiling, a 3-volume stack:
+                                                   initial_R2, noise_ceiling, explainable_R2.
+        {prefix}_optimized_xval_r2.nii.gz         - Xval R2 with optimal per-run PCs. With
+                                                   -noise_ceiling, the same 3-volume stack,
+                                                   built at the SELECTED PC combination.
+                                                   explainable_R2 (R2/ceiling) is the number
+                                                   to compare across tools and designs.
         {prefix}_noise_pool_mask.nii.gz           - Noise pool voxels
         {prefix}_run{NN}_optimal_pcs.json         - Optimal PC indices per run
         {prefix}_run{NN}_selected_PCs.txt         - Selected PC timecourses per run
@@ -552,6 +559,11 @@ Notes:
     )
     add_load_threads_arg(proc_opts)
     add_trim_args(proc_opts)
+    add_noise_ceiling_args(
+        proc_opts,
+        stage_note="Built at the per-run PC sets this tool selected, so the ceiling "
+        "and the optimized R2 share a denominator.",
+    )
     add_verbose_arg(proc_opts, default=0)
     proc_opts.add_argument(
         "-dry_run",
@@ -655,6 +667,8 @@ def save_combinatorial_results(
     plots_mode: str = "no",
     save_pcs_mode: str = "timecourse",
     nii_ext: str = ".nii.gz",
+    initial_ceiling_layers: list | None = None,
+    optimized_ceiling_layers: list | None = None,
 ) -> dict:
     """Save combinatorial denoising results to disk."""
     output_files = {}
@@ -679,23 +693,21 @@ def save_combinatorial_results(
     if prefix_dir != Path("."):
         prefix_dir.mkdir(parents=True, exist_ok=True)
 
-    from fastfuncstuff.cli_utils import spinner
+    # 1-2. The two R2 stacks. Each carries the ceiling built at ITS OWN PC set --
+    # none for the initial R2, the selected per-run combination for the optimized
+    # one -- because a ceiling only bounds an R2 with the same denominator.
+    from fastfuncstuff.cli_utils import save_r2_ceiling_stack, spinner
 
-    # 1. Initial R2 volume
-    initial_r2_vol = to_volume(initial_r2_full)
-    initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
-    with spinner(f"Writing {Path(initial_r2_path).name}"):
-        save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine)
-    output_files["initial_r2"] = initial_r2_path
-    print(f"  Saved: {initial_r2_path}")
-
-    # 2. Optimized R2 volume
-    opt_r2_vol = to_volume(optimized_r2_full)
-    opt_r2_path = f"{output_prefix}_optimized_xval_r2{nii_ext}"
-    with spinner(f"Writing {Path(opt_r2_path).name}"):
-        save_nifti(opt_r2_vol, output_path=opt_r2_path, affine=affine)
-    output_files["optimized_xval_r2"] = opt_r2_path
-    print(f"  Saved: {opt_r2_path}")
+    for key, r2_map, layers in (
+        ("initial_r2", initial_r2_full, initial_ceiling_layers or []),
+        ("optimized_xval_r2", optimized_r2_full, optimized_ceiling_layers or []),
+    ):
+        label = "initial_R2" if key == "initial_r2" else "optimized_xval_R2"
+        path = f"{output_prefix}_{key}{nii_ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_r2_ceiling_stack([(r2_map, label), *layers], path, volume_shape, affine, mask_flat)
+        output_files[key] = path
+        print(f"  Saved: {path}")
 
     # 3. Noise pool mask
     noise_pool_vol = to_volume(results.noise_pool_mask)
@@ -1453,6 +1465,70 @@ def main():
     print(f"  Improvement: {improvement:+.4f} (median)")
 
     # ======================================================================
+    # Step 4a (optional): the ceilings that make those R2s comparable
+    # ======================================================================
+    initial_ceiling_layers: list = []
+    optimized_ceiling_layers: list = []
+    if args.noise_ceiling in ("auto", "loro"):
+        from fastfuncstuff.glm.xval import generate_cv_splits
+        from fastfuncstuff.stats.noise_ceiling import loro_ceiling_by_voxel_group
+
+        print()
+        print("Noise ceiling:")
+        ceiling_splits = generate_cv_splits(len(run_starts), strategy=1)
+
+        def _ceiling(nuis, label):
+            result = loro_ceiling_by_voxel_group(
+                data=data,
+                nuisance_per_run=nuis,
+                run_starts=run_starts,
+                cv_splits=ceiling_splits,
+                design_matrix=None if designs_by_hrf else task_design,
+                designs_by_hrf=designs_by_hrf,
+                hrf_indices=hrf_indices,
+                device=device,
+                progress_desc=f"  {label} ceiling by HRF",
+                show_progress=True,
+            )
+            for note in result.notes:
+                print(f"  NOTE: {note}")
+            return result
+
+        # The initial R2 sees no PCs; the optimized R2 sees each run's SELECTED
+        # combination -- an arbitrary subset here, not a leading-k prefix, which
+        # is exactly why the ceiling has to be rebuilt rather than reused.
+        initial_result = _ceiling(nuisance_per_run, "Initial")
+        if initial_result.n_usable:
+            initial_explainable = initial_result.explainable_r2(initial_r2.detach().cpu())
+            print(f"  Initial (0 PCs): {initial_result.summarize(initial_explainable)}")
+            initial_ceiling_layers = [
+                (initial_result.ceiling, "noise_ceiling"),
+                (initial_explainable, "explainable_R2"),
+            ]
+
+        nuisance_with_pcs = []
+        for run_idx, base in enumerate(nuisance_per_run):
+            selected = list(results.per_run_results[run_idx].optimal_combination)
+            if not selected:
+                nuisance_with_pcs.append(base)
+                continue
+            pcs = results.noise_pcs_per_run[run_idx]
+            pcs = pcs if torch.is_tensor(pcs) else torch.as_tensor(pcs)
+            block = pcs[:, selected].to(device=base.device, dtype=base.dtype)
+            nuisance_with_pcs.append(torch.cat([base, block], dim=1))
+
+        optimized_result = _ceiling(nuisance_with_pcs, "Optimized")
+        if optimized_result.n_usable:
+            optimized_explainable = optimized_result.explainable_r2(optimized_r2.detach().cpu())
+            print(
+                f"  Optimized (selected PCs): {optimized_result.summarize(optimized_explainable)}"
+            )
+            optimized_ceiling_layers = [
+                (optimized_result.ceiling, "noise_ceiling"),
+                (optimized_explainable, "explainable_R2"),
+            ]
+
+    # ======================================================================
     # Step 4b (optional): GLMdenoise-style baseline comparison
     # ======================================================================
     # When -compare is set, run the standard incremental noise-PC sweep
@@ -1926,6 +2002,8 @@ def main():
         plots_mode=args.plots,
         save_pcs_mode=args.save_pcs,
         nii_ext=_nii_ext,
+        initial_ceiling_layers=initial_ceiling_layers,
+        optimized_ceiling_layers=optimized_ceiling_layers,
     )
 
     def _flat_to_vol(flat_t: torch.Tensor) -> np.ndarray:

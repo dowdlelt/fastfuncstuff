@@ -63,7 +63,7 @@ try:
         resolve_cv_design,
         resolve_microtime_dt,
         run_lengths_from_starts,
-        save_volume_nifti,
+        save_r2_ceiling_stack,
         setup_device,
         spinner,
         summarize_trial_repeats,
@@ -1383,25 +1383,24 @@ def main():
     )
 
     if beta_ceiling is not None and beta_ceiling.result.n_usable:
-        for values, name in (
-            (beta_ceiling.ncsnr_map, "ncsnr"),
-            (beta_ceiling.result.ceiling, "noise_ceiling"),
-            (beta_ceiling.explainable, "explainable_r2"),
-        ):
-            if values is None:
-                continue
-            path = f"{args.prefix}_{name}{_nii_ext}"
-            save_volume_nifti(
-                values,
-                path,
-                volume_shape,
-                affine,
-                voxel_mask.numpy() if voxel_mask is not None else None,
-            )
-            output_files[name] = path
-            print(f"  {path}")
+        # Restacked onto _hrfopt_xval_r2, the beta-space CV map the ceiling was
+        # built from -- NOT _xval_r2, which is the in-sample best-HRF R2. Those
+        # two live on different scales and their ratio would mean nothing.
+        output_files["hrfopt_xval_r2"] = save_r2_ceiling_stack(
+            [
+                (hrfopt_xval_r2, "hrfopt_xval_R2"),
+                (beta_ceiling.result.ceiling, "noise_ceiling"),
+                (beta_ceiling.explainable, "explainable_R2"),
+                (beta_ceiling.ncsnr_map, "ncsnr"),
+            ],
+            f"{args.prefix}_hrfopt_xval_r2{_nii_ext}",
+            volume_shape,
+            affine,
+            voxel_mask.numpy() if voxel_mask is not None else None,
+        )
+        print(f"  {output_files['hrfopt_xval_r2']}")
     if beta_ceiling is not None and beta_ceiling.explainable_withheld_because:
-        print(f"  (no explainable_r2: {beta_ceiling.explainable_withheld_because})")
+        print(f"  (no explainable_R2: {beta_ceiling.explainable_withheld_because})")
 
     # Restore final_results for custom saving
     if args.single_trials and final_results_temp is not None:

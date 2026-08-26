@@ -1153,18 +1153,7 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
     affine = geometry.get("affine")
     header = geometry.get("nifti_header")
 
-    def _save(values: _torch.Tensor, name: str) -> None:
-        if volume_shape is None:
-            print(f"  ⚠️  no volume geometry available; {name} not written")
-            return
-        vol = _voxels_to_4d_volume(
-            values.detach().cpu().numpy()[:, None], volume_shape, voxel_mask
-        )[..., 0]
-        path = f"{prefix}_{name}.nii.gz"
-        save_nifti(vol, path, affine=affine, header=header)
-        print(f"  • {name}: {path}")
-
-    _save(xval_r2, "xval_r2")
+    ceiling_layers: list = []
 
     if args.noise_ceiling in ("auto", "loro"):
         from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
@@ -1183,8 +1172,26 @@ def _run_condition_xval(args, results, design_info, fmri_data, device, geometry=
         for note in ceiling.notes:
             print(f"  NOTE: {note}")
         if ceiling.n_usable:
-            _save(ceiling.ceiling, "noise_ceiling")
-            _save(ceiling.explainable_r2(xval_r2), "explainable_r2")
+            ceiling_layers = [
+                (ceiling.ceiling, "noise_ceiling"),
+                (ceiling.explainable_r2(xval_r2), "explainable_R2"),
+            ]
+
+    # One stack, so the R2 can never be read without the ceiling that scales it.
+    if volume_shape is None:
+        print("  ⚠️  no volume geometry available; xval_r2 not written")
+    else:
+        from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+
+        path = save_r2_ceiling_stack(
+            [(xval_r2, "xval_R2"), *ceiling_layers],
+            f"{prefix}_xval_r2.nii.gz",
+            volume_shape,
+            affine,
+            mask_flat=None if voxel_mask is None else np.asarray(voxel_mask).reshape(-1),
+            header=header,
+        )
+        print(f"  • xval_r2: {path}")
 
 
 def _derive_rvar_path(rbuck_path: str) -> str:

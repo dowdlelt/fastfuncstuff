@@ -67,6 +67,7 @@ try:
         resolve_microtime_dt,
         run_lengths_from_starts,
         save_4d_nifti,
+        save_r2_ceiling_stack,
         save_volume_nifti,
         setup_device,
         spinner,
@@ -1280,23 +1281,23 @@ def main():
                 print(f"  NOTE: {note}")
 
             if ceiling.result.n_usable:
-                for values, name in (
-                    (ceiling.ncsnr_map, "ncsnr"),
-                    (ceiling.result.ceiling, "noise_ceiling"),
-                    (ceiling.explainable, "explainable_r2"),
-                ):
-                    if values is None:
-                        continue
-                    save_volume_nifti(
-                        values,
-                        f"{args.prefix}_{name}{_nii_ext}",
-                        vol_shape,
-                        affine,
-                        voxel_mask_np,
-                    )
-                    print(f"  {args.prefix}_{name}{_nii_ext}")
+                # Stacked onto the very R2 the ceiling was built from, not onto
+                # whichever map has the closest filename.
+                path = save_r2_ceiling_stack(
+                    [
+                        (xval_r2, "xval_R2"),
+                        (ceiling.result.ceiling, "noise_ceiling"),
+                        (ceiling.explainable, "explainable_R2"),
+                        (ceiling.ncsnr_map, "ncsnr"),
+                    ],
+                    f"{args.prefix}_xval_r2{_nii_ext}",
+                    vol_shape,
+                    affine,
+                    voxel_mask_np,
+                )
+                print(f"  {path}")
                 if ceiling.explainable_withheld_because:
-                    print(f"  (no explainable_r2: {ceiling.explainable_withheld_because})")
+                    print(f"  (no explainable_R2: {ceiling.explainable_withheld_because})")
 
     else:
         # ========== EXISTING OUTPUT MODE ==========

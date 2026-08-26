@@ -63,6 +63,7 @@ try:
         resolve_cv_design,
         resolve_microtime_dt,
         run_lengths_from_starts,
+        save_r2_ceiling_stack,
         save_volume_nifti,
         setup_device,
         spinner,
@@ -154,22 +155,27 @@ Outputs:
     Core outputs (always saved):
         {prefix}_noise_pool_mask.nii.gz       - Noise pool voxels (low task R²)
         {prefix}_criteria_mask.nii.gz         - Criteria voxels (high task R²)
-        {prefix}_initial_r2.nii.gz            - Initial xval R² (task-only)
-        {prefix}_noise_ceiling.nii.gz         - [-noise_ceiling] largest xval R² this
-                                                DESIGN could reach at the selected PC
-                                                count -- the reproducible fraction of
-                                                held-out variance. NaN where not
-                                                estimable (too few runs to split).
-        {prefix}_explainable_r2.nii.gz        - [-noise_ceiling] xval_r2 / noise_ceiling:
-                                                the fraction of the ACHIEVABLE variance
-                                                captured. 1.0 = everything that
-                                                reproduces at all. Slightly above 1 is
-                                                noise in the ceiling, not a better model.
-                                                NaN where the ceiling is under 0.01 and
-                                                the fraction is undefined.
-        {prefix}_xval_r2_optimal.nii.gz       - Xval R² at optimal PC count (criteria voxels)
-        {prefix}_xval_r2_optimal_full.nii.gz  - Xval R² at optimal PC count (all voxels)
-        {prefix}_xval_r2_optimal_per_fold.nii.gz - Per-fold xval R² at optimal PCs (4D)
+        {prefix}_initial_r2.nii.gz            - Initial xval R² (task-only, 0 PCs).
+                                                With -noise_ceiling, a 3-volume stack:
+                                                initial_R2, noise_ceiling, explainable_R2.
+        {prefix}_xval_r2_optimal.nii.gz       - Xval R² at the optimal PC count (|R²| > 1
+                                                and invalid voxels zeroed). With
+                                                -noise_ceiling, a 3-volume stack:
+                                                xval_R2, noise_ceiling, explainable_R2.
+
+        Each stack carries the ceiling built at ITS OWN PC count, because the two
+        R²s are scored on differently-projected data and a ceiling only bounds an
+        R² with the same denominator. The sub-briks are:
+          noise_ceiling  - largest xval R² this DESIGN could reach: the
+                           reproducible fraction of held-out variance. NaN where
+                           not estimable (too few runs to split in two).
+          explainable_R2 - xval_R2 / noise_ceiling, the fraction of the ACHIEVABLE
+                           variance captured. 1.0 = everything that reproduces at
+                           all; slightly above 1 is noise in the ceiling, not a
+                           better model. NaN where the ceiling is under 0.01 and
+                           the fraction is undefined. This is the number to
+                           compare ACROSS designs -- raw R² is not comparable when
+                           the designs differ in what they can predict.
         {prefix}_xval_r2_by_npcs.npy          - CV R² for each number of PCs
         {prefix}_metadata.json                - Full metadata for reproducibility
 
@@ -846,44 +852,41 @@ def save_denoising_results(
     save_nifti(criteria_vol, output_path=criteria_path, affine=affine, header=nifti_header)
     output_files["criteria_mask"] = criteria_path
 
-    # 3. Initial R²
-    initial_r2_vol = to_volume(results.noise_pool_r2.cpu().numpy().astype(np.float32))
-    initial_r2_path = f"{output_prefix}_initial_r2{nii_ext}"
-    save_nifti(initial_r2_vol, output_path=initial_r2_path, affine=affine, header=nifti_header)
-    output_files["initial_r2"] = initial_r2_path
-
-    # 3b. Xval R² at optimal PC count (criteria voxels only)
-    if results.xval_r2_optimal is not None:
-        xval_opt_vol = to_volume(results.xval_r2_optimal.cpu().numpy().astype(np.float32))
-        xval_opt_path = f"{output_prefix}_xval_r2_optimal{nii_ext}"
-        save_nifti(xval_opt_vol, output_path=xval_opt_path, affine=affine, header=nifti_header)
-        output_files["xval_r2_optimal"] = xval_opt_path
-
-    # 3c. Xval R² at optimal PC count (all voxels)
-    if results.xval_r2_optimal_full is not None:
-        xval_opt_full_vol = to_volume(results.xval_r2_optimal_full.cpu().numpy().astype(np.float32))
-        xval_opt_full_path = f"{output_prefix}_xval_r2_optimal_full{nii_ext}"
-        save_nifti(
-            xval_opt_full_vol, output_path=xval_opt_full_path, affine=affine, header=nifti_header
-        )
-        output_files["xval_r2_optimal_full"] = xval_opt_full_path
-
-    # 3c-ii. Noise ceiling and the explainable-R2 map it makes possible.
+    # 3. The two R² stacks. Each one carries its R² map, the ceiling built at
+    # that R²'s own PC count, and the ratio, as labelled sub-briks -- so a map is
+    # never read without the ceiling that makes it interpretable, and the two
+    # ceilings can never be swapped (they have different denominators).
+    #
     # NaN, not 0, where the ceiling was not estimable: "no ceiling here" and
     # "nothing reproduces here" are different findings and must stay distinct.
-    if results.noise_ceiling is not None:
-        ceiling_vol = to_volume(results.noise_ceiling.cpu().numpy().astype(np.float32))
-        ceiling_path = f"{output_prefix}_noise_ceiling{nii_ext}"
-        save_nifti(ceiling_vol, output_path=ceiling_path, affine=affine, header=nifti_header)
-        output_files["noise_ceiling"] = ceiling_path
-
-    if results.explainable_r2 is not None:
-        explainable_vol = to_volume(results.explainable_r2.cpu().numpy().astype(np.float32))
-        explainable_path = f"{output_prefix}_explainable_r2{nii_ext}"
-        save_nifti(
-            explainable_vol, output_path=explainable_path, affine=affine, header=nifti_header
+    def _save_r2_stack(key: str, r2_map, ceiling, explainable, r2_label: str) -> None:
+        output_files[key] = save_r2_ceiling_stack(
+            [(r2_map, r2_label), (ceiling, "noise_ceiling"), (explainable, "explainable_R2")],
+            f"{output_prefix}_{key}{nii_ext}",
+            volume_shape,
+            affine,
+            mask_flat=voxel_mask_np,
+            header=nifti_header,
         )
-        output_files["explainable_r2"] = explainable_path
+
+    _save_r2_stack(
+        "initial_r2",
+        results.noise_pool_r2,
+        results.initial_noise_ceiling,
+        results.initial_explainable_r2,
+        "initial_R2",
+    )
+
+    # The cleaned map (|R²| > 1 and invalid voxels zeroed) is the one to look at;
+    # the raw sibling it used to be written beside differed nowhere else.
+    if results.xval_r2_optimal_full is not None:
+        _save_r2_stack(
+            "xval_r2_optimal",
+            results.xval_r2_optimal_full,
+            results.noise_ceiling,
+            results.explainable_r2,
+            "xval_R2",
+        )
 
     # 3d. Per-fold xval R² at optimal PCs (4D)
     if results.xval_r2_optimal_per_fold is not None:
@@ -3221,21 +3224,6 @@ def main():
         # fit_denoising_model handles the per-HRF logic internally
         print()
         print(f"Fitting denoising model with per-voxel HRFs ({len(designs_by_hrf)} unique HRFs)...")
-        if args.noise_ceiling != "off":
-            # TODO: wire the ceiling through the per-HRF group loop. Not a
-            # conceptual obstacle -- a voxel with its own HRF has its own design
-            # and so its own ceiling, which is what a per-voxel ceiling *is*, and
-            # var(y) is design-free so the groups stay on one common scale. The
-            # loop shape already exists in sequential.py (mask by hrf_indices,
-            # run with designs_by_hrf[idx], scatter rows back); groups partition
-            # the voxels, so only the design-side factorisations multiply, not
-            # the passes over the brain. What is missing is merging the
-            # per-group CeilingResults (maps concatenate, but notes and
-            # skipped-fold counts must combine, not come from the last group).
-            print(
-                "  NOTE: -noise_ceiling is not yet supported with per-voxel HRFs; "
-                "no ceiling will be written."
-            )
 
         results = fit_denoising_model(
             data=cv_data,
