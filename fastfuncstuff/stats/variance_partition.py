@@ -60,7 +60,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
-from fastfuncstuff.utils import get_device
+from fastfuncstuff.utils import get_device, pinv_f64
 
 # Off-diagonal Gram mass above this fraction of the diagonal means the bands are no longer
 # orthogonal and the closed-form decoupling in this module does not hold.
@@ -512,7 +512,7 @@ def _build_nested_fold_solvers(
                 + [band_mats[n][inner_train] for n in band_order],
                 dim=1,
             )
-            inner.append((inner_train, inner_val, torch.linalg.pinv(x.double()).float()))
+            inner.append((inner_train, inner_val, pinv_f64(x)))
         if not inner:
             raise ValueError(
                 "nested gamma selection needs at least 3 repeat folds; use "
@@ -821,7 +821,7 @@ def partition_variance(
         design_tr = torch.cat(
             [torch.ones(len(tr), 1, device=device)] + [band_mats[n][tr] for n in band_order], dim=1
         )
-        fold_solvers.append(torch.linalg.pinv(design_tr.double()).float())
+        fold_solvers.append(pinv_f64(design_tr))
 
     n_chunks = (n_vox + chunk_size - 1) // chunk_size
     for c0 in tqdm(
@@ -1453,7 +1453,7 @@ def _build_trial_ops(
         x_tr = torch.cat(
             [torch.ones(len(tr), 1, device=device)] + [band_mats[n][tr] for n in band_order], dim=1
         )
-        fold_ops.append((tr, te, torch.linalg.pinv(x_tr.double()).float()))
+        fold_ops.append((tr, te, pinv_f64(x_tr)))
 
     # Freedman-Lane reduced fits, on the whole dataset. Under imbalance a reduced model is
     # not a sub-vector of the full fit, so each one gets its own solve. Every statistic's
@@ -1467,7 +1467,7 @@ def _build_trial_ops(
             + [band_mats[band_order[i]] for i in bands],
             dim=1,
         )
-        reduced[bands] = (x, torch.linalg.pinv(x.double()).float())
+        reduced[bands] = (x, pinv_f64(x))
     for f in range(design.n_factors):
         involved = {band_order.index(n) for n in design.bands_involving(f)}
         bands = tuple(i for i in range(len(band_order)) if i not in involved)
@@ -1476,7 +1476,7 @@ def _build_trial_ops(
         cols = [torch.ones(design.n_trials, 1, device=device)]
         cols += [band_mats[band_order[i]] for i in bands]
         x = torch.cat(cols, dim=1)
-        reduced[bands] = (x, torch.linalg.pinv(x.double()).float())
+        reduced[bands] = (x, pinv_f64(x))
 
     return _TrialOps(
         band_mats=band_mats,
@@ -1850,7 +1850,7 @@ def permutation_test(
                 + [ops.band_mats[ops.band_order[i]] for i in bands],
                 dim=1,
             )
-            ops.reduced_solvers[bands] = (x, torch.linalg.pinv(x.double()).float())
+            ops.reduced_solvers[bands] = (x, pinv_f64(x))
 
     if run is None:
         blocks = np.zeros(design.n_trials, dtype=np.int64)

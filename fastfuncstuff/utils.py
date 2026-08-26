@@ -123,6 +123,49 @@ def linalg_device(device: torch.device) -> torch.device:
     return torch.device("cpu") if device.type == "mps" else device
 
 
+def factor_device(device: torch.device) -> torch.device:
+    """Where to run a *small* float64 factorization: pinv, SVD, eigh, inv, Cholesky.
+
+    A different question from :func:`linalg_device`, which asks where float64
+    arithmetic is *possible*. This asks where a fold- or design-sized float64
+    factorization is *fastest*, and on a consumer CUDA card the answer is the
+    CPU: float64 runs at 1/64 rate there, and at these sizes cuSOLVER's cost is
+    dominated by per-call latency rather than arithmetic. Measured on an
+    RTX 5070 Ti, CUDA against CPU:
+
+        pinv (21, 141, 141)   f64    794 ms  vs    44 ms   (18x)
+        pinv (1, 153, 153)    f64   38.5 ms  vs   3.3 ms   (12x)
+        pinv (1890, 462)      f64    216 ms  vs    50 ms   (4.3x)
+        pinv (1, 2048, 2048)  f64   3041 ms  vs  1622 ms   (1.9x)
+
+    The CPU won at every float64 size measured. Two exceptions worth knowing:
+    a *large batch of tiny* matrices -- (100, 32, 32) went 5.6 ms on CUDA
+    against 13.4 ms on CPU -- where the batch saturates the card and the
+    transfer does not pay for itself; and float32, which is not affected at all
+    (CUDA pinv stayed within 1.5x of CPU everywhere and won outright from
+    N=512 up). Leave float32 factorizations where they are.
+
+    Only use this when the result is small and reused -- a fold plan, a design
+    solver, a projector -- never for anything carrying a voxel axis, where the
+    transfer would dwarf what the factorization saves.
+    """
+    return torch.device("cpu") if device.type in ("cuda", "mps") else device
+
+
+def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:
+    """Pseudo-inverse computed in float64 on :func:`factor_device`.
+
+    Returned in the input's dtype and on the input's device, so this is a drop-in
+    for ``torch.linalg.pinv(x.double()).to(x.dtype)`` that does not pay the
+    consumer-GPU float64 penalty. For a symmetric positive semi-definite matrix
+    prefer an ``eigh``-based inverse instead, which is the same answer for a
+    fraction of the cost.
+    """
+    work = factor_device(matrix.device)
+    inverse = torch.linalg.pinv(matrix.to(device=work, dtype=torch.float64))
+    return inverse.to(device=matrix.device, dtype=matrix.dtype)
+
+
 def accum_dtype(device: torch.device) -> torch.dtype:
     """Return the dtype for reduction accumulators (sum-of-squares, R², RSS).
 

@@ -276,5 +276,121 @@ class TestOptimalChunkSize:
         assert chunk_size >= 1000
 
 
+class TestFactorDevice:
+    """Small float64 factorizations belong on the CPU when the data is on CUDA."""
+
+    def test_cuda_and_mps_factor_on_cpu(self):
+        from fastfuncstuff.utils import factor_device
+
+        assert factor_device(torch.device("cuda")).type == "cpu"
+        assert factor_device(torch.device("mps")).type == "cpu"
+
+    def test_cpu_stays_put(self):
+        from fastfuncstuff.utils import factor_device
+
+        assert factor_device(torch.device("cpu")).type == "cpu"
+
+    def test_distinct_from_linalg_device(self):
+        """The two answer different questions and must not be conflated.
+
+        linalg_device asks where float64 arithmetic is possible (CUDA: yes, so
+        no-op); factor_device asks where a small float64 factorization is fast
+        (CUDA: no, 1/64 rate plus cuSOLVER latency). Voxel-sized accumulators
+        follow the first; fold-sized factorizations follow the second.
+        """
+        from fastfuncstuff.utils import factor_device, linalg_device
+
+        assert linalg_device(torch.device("cuda")).type == "cuda"
+        assert factor_device(torch.device("cuda")).type == "cpu"
+
+
+class TestPinvF64:
+    def test_matches_float64_pinv_and_round_trips_dtype(self):
+        from fastfuncstuff.utils import pinv_f64
+
+        torch.manual_seed(0)
+        x = torch.randn(60, 12)
+        reference = torch.linalg.pinv(x.double()).float()
+        result = pinv_f64(x)
+
+        assert result.dtype == x.dtype
+        assert result.device == x.device
+        assert torch.allclose(result, reference, atol=1e-6)
+
+    def test_beats_float32_pinv_on_an_ill_conditioned_design(self):
+        """The float64 promotion is the point; a float32 pinv loses accuracy."""
+        from fastfuncstuff.utils import pinv_f64
+
+        torch.manual_seed(1)
+        x = torch.randn(200, 20)
+        x[:, 1] = x[:, 0] + 1e-4 * torch.randn(200)  # nearly collinear pair
+        exact = torch.linalg.pinv(x.double())
+
+        promoted = (pinv_f64(x).double() - exact).abs().max()
+        native = (torch.linalg.pinv(x).double() - exact).abs().max()
+        assert promoted < native
+
+
+class TestSaveR2CeilingStack:
+    """The family's shared R2-plus-ceiling writer."""
+
+    @staticmethod
+    def _read(path):
+        import nibabel as nib
+
+        return nib.load(path)
+
+    def test_stacks_in_order_with_labels(self, tmp_path):
+        from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+
+        r2 = np.arange(8, dtype=np.float32)
+        ceiling = r2 + 10.0
+        explainable = r2 + 20.0
+        path = save_r2_ceiling_stack(
+            [(r2, "xval_R2"), (ceiling, "noise_ceiling"), (explainable, "explainable_R2")],
+            str(tmp_path / "s.nii.gz"),
+            (2, 2, 2),
+            np.eye(4),
+        )
+        image = self._read(path)
+        assert image.shape == (2, 2, 2, 3)
+        for index, expected in enumerate((r2, ceiling, explainable)):
+            assert np.allclose(image.get_fdata()[..., index].ravel(), expected)
+
+    def test_none_layers_drop_out_leaving_a_plain_3d_map(self, tmp_path):
+        """No ceiling must give a 3-D map, not a one-volume stack."""
+        from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+
+        path = save_r2_ceiling_stack(
+            [(np.arange(8, dtype=np.float32), "xval_R2"), (None, "noise_ceiling")],
+            str(tmp_path / "s.nii.gz"),
+            (2, 2, 2),
+            np.eye(4),
+        )
+        assert self._read(path).shape == (2, 2, 2)
+
+    def test_masked_input_is_unmasked_onto_the_grid(self, tmp_path):
+        from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+
+        mask = np.zeros(8, dtype=bool)
+        mask[[1, 4]] = True
+        path = save_r2_ceiling_stack(
+            [(np.array([5.0, 7.0], dtype=np.float32), "xval_R2")],
+            str(tmp_path / "s.nii.gz"),
+            (2, 2, 2),
+            np.eye(4),
+            mask_flat=mask,
+        )
+        assert np.allclose(self._read(path).get_fdata().ravel(), [0, 5, 0, 0, 7, 0, 0, 0])
+
+    def test_all_none_is_an_error_not_an_empty_file(self, tmp_path):
+        from fastfuncstuff.cli_utils import save_r2_ceiling_stack
+
+        with pytest.raises(ValueError):
+            save_r2_ceiling_stack(
+                [(None, "xval_R2")], str(tmp_path / "s.nii.gz"), (2, 2, 2), np.eye(4)
+            )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
