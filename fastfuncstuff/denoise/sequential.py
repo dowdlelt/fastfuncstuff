@@ -70,6 +70,8 @@ from fastfuncstuff.decomposition.ica import FastICA
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.glm.core import fit_glm
 from fastfuncstuff.glm.xval import (
+    _project_out_basis,
+    _unpredictable_basis,
     compute_r2_from_sufficient_stats,
     compute_r2_metric,
     compute_xval_r2,
@@ -1254,6 +1256,7 @@ def cross_validate_noise_pcs(
     progress_desc: str = "Denoising CV",
     progress_leave: bool = True,
     announce_missing: bool = False,
+    zero_event_strategy: str = "zero",
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -1309,6 +1312,16 @@ def cross_validate_noise_pcs(
         Print how many conditions each fold must drop because they are absent
         from its training runs. Lets the per-HRF caller, which runs the groups
         with ``verbose=False``, still report the fact once.
+    zero_event_strategy : {'zero', 'nuisance'}, default='zero'
+        What to do about a condition a fold cannot fit. ``'zero'`` predicts zero
+        for it, charging its BOLD to the residual; ``'nuisance'`` removes it from
+        both the held-out run and the design used to predict that run.
+
+        The PC-count curve is read for its shape, so a uniform shift matters less
+        here than it does for the noise-pool split -- but it still matters:
+        ``pcR2cutoff`` picks the voxels that vote on the curve by an absolute
+        per-voxel R2 threshold, so a downward shift changes the electorate. Wired
+        identically to the initial R2 so the two agree.
 
     Returns
     -------
@@ -1359,6 +1372,7 @@ def cross_validate_noise_pcs(
                 preload_data_to_device=preload_data_to_device,
                 device=device,
                 verbose=verbose,
+                zero_event_strategy=zero_event_strategy,
             )
             r2_maps[voxel_mask.numpy(), :] = group_maps
 
@@ -1596,9 +1610,9 @@ def cross_validate_noise_pcs(
     # It still earns its place in the folds that *do* see it, where it absorbs
     # its own variance and keeps the repeated conditions' betas clean -- so the
     # column stays in the design and is dropped only from the folds that cannot
-    # fit it, predicting zero for it there. Same policy as
-    # ``glm/xval.py:_plan_fold_designs`` under ``zero_event_strategy="zero"``,
-    # which is what the baseline R2 stage of this pipeline already applies.
+    # fit it. What happens to it then is ``zero_event_strategy``, matching
+    # ``glm/xval.py:_plan_fold_designs``: predict zero for it, or remove it from
+    # the held-out run so the fold is not scored on it at all.
     #
     # The Gram matrix, the drop mask and the inverse are functions of the fold
     # alone. Building them here rather than inside the chunk loop is what keeps
@@ -1629,6 +1643,33 @@ def cross_validate_noise_pcs(
             gram_train -= gram_by_run[r]
         gram_fit = gram_train[:, fit_mask, :][:, :, fit_mask]
 
+        # Under 'nuisance' the conditions this fold cannot fit are removed from
+        # the held-out run instead of being scored as error. The basis is per
+        # test RUN, not per fold: which columns are unpredictable is a property
+        # of the run being scored. Same treatment as compute_xval_r2, through
+        # the same two helpers, so the two R2s in this pipeline agree.
+        unpred_basis_by_run: dict[int, torch.Tensor] = {}
+        if zero_event_strategy == "nuisance":
+            for r in test_runs:
+                test_only = (~fit_mask) & col_present_by_run[r]
+                basis = _unpredictable_basis(design_proj_by_run[r], test_only)
+                if basis is not None:
+                    unpred_basis_by_run[r] = basis
+
+        # Held-out prediction uses the task design with nuisance removed but PCs
+        # left in, per PC count only through the betas. Columns in fit_mask that
+        # this run never saw are zero here, so they contribute nothing.
+        design_test_fit = {}
+        for r in test_runs:
+            design_r = design_proj_by_run[r][:, fit_mask]
+            basis = unpred_basis_by_run.get(r)
+            if basis is not None:
+                # The SAME projection the held-out data gets below: applying it
+                # to one side only would put their shared variance in the
+                # residual as fabricated error.
+                design_r = _project_out_basis(design_r, basis, time_dim=0)
+            design_test_fit[r] = design_r.contiguous()
+
         fold_plans.append(
             {
                 "test_runs": test_runs,
@@ -1636,13 +1677,14 @@ def cross_validate_noise_pcs(
                 # skips a chunk-sized gather of the right-hand side.
                 "fit_mask": None if n_fit == n_task_regs else fit_mask,
                 "gram_inv": _invert_fold_gram(gram_fit),
-                # Held-out prediction uses the task design with nuisance removed
-                # but PCs left in, per PC count only through the betas.
-                "design_test_fit": {
-                    r: design_proj_by_run[r][:, fit_mask].contiguous() for r in test_runs
-                },
+                "design_test_fit": design_test_fit,
+                "unpred_basis_by_run": unpred_basis_by_run,
             }
         )
+
+    # Whether any fold actually removes something. When nothing is projected the
+    # accumulation below stays exactly where it was, so 'zero' is untouched.
+    any_projection = any(bool(plan["unpred_basis_by_run"]) for plan in fold_plans)
 
     if (verbose or announce_missing) and max(n_dropped_by_fold) > 0:
         print(
@@ -1709,12 +1751,17 @@ def cross_validate_noise_pcs(
             y_run = _load_run(chunk_data_cpu, r)
             # (K+1, n_task, run_len) @ (run_len, chunk) -> (K+1, n_task, chunk)
             xty_total += torch.matmul(xtilde_by_run[r].transpose(1, 2), y_run.T)
-            if is_loro:
-                sum_actual += y_run.sum(dim=1, dtype=reduce_dtype).to(accum_dev)
-                sum_sq_actual += (y_run * y_run).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
-            else:
-                start_tp, end_tp = run_slices[r]
-                actual_projected_chunk[:, start_tp:end_tp] = y_run.cpu()
+            # R2's denominator has to be measured on whatever its numerator is
+            # measured on. Under 'nuisance' the held-out data is projected, so
+            # these move into the fold loop and are accumulated from there
+            # instead; training still uses the unprojected run above.
+            if not any_projection:
+                if is_loro:
+                    sum_actual += y_run.sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                    sum_sq_actual += (y_run * y_run).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                else:
+                    start_tp, end_tp = run_slices[r]
+                    actual_projected_chunk[:, start_tp:end_tp] = y_run.cpu()
             del y_run
 
         # ------------------------------------------------------------------
@@ -1741,6 +1788,19 @@ def cross_validate_noise_pcs(
                 y_test = test_data[r]
                 start_tp, end_tp = run_slices[r]
                 design_test = plan["design_test_fit"][r]  # (run_len, n_fit)
+                basis = plan["unpred_basis_by_run"].get(r)
+                if basis is not None:
+                    y_test = _project_out_basis(y_test, basis, time_dim=1)
+                if any_projection:
+                    # LORO scores each timepoint exactly once, so accumulating
+                    # here covers the whole timeseries with no double counting.
+                    if is_loro:
+                        sum_actual += y_test.sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                        sum_sq_actual += (
+                            (y_test * y_test).sum(dim=1, dtype=reduce_dtype).to(accum_dev)
+                        )
+                    else:
+                        actual_projected_chunk[:, start_tp:end_tp] = y_test.cpu()
                 for n_pcs in range(max_components + 1):
                     # (run_len, n_fit) @ (n_fit, chunk) -> (run_len, chunk)
                     y_pred = (design_test @ betas_fit[n_pcs]).T
@@ -2857,6 +2917,7 @@ def fit_denoising_model(
                 # The zero-column pattern is a property of the timing, not of
                 # the HRF, so one group's report covers all of them.
                 announce_missing=bool(verbose and hrf_idx == unique_hrf_indices[0]),
+                zero_event_strategy=zero_event_strategy,
             )
 
             # Scatter results back to full array
@@ -2882,6 +2943,7 @@ def fit_denoising_model(
             preload_data_to_device=preload_data_to_device,
             device=device,
             verbose=verbose,
+            zero_event_strategy=zero_event_strategy,
         )
 
     # Determine criteria voxels: R² > threshold in ANY PC count (GLMdenoise Step 7)

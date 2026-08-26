@@ -959,7 +959,7 @@ def _fwl_case(n_runs=4, tp=40, n_vox=90, max_comp=3, ragged=False):
     )
 
 
-def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
+def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100, zero_event_strategy="zero"):
     """Reference R² built the slow, obvious way: fit [X | zero-padded PCs] directly.
 
     This is the formulation the fast path replaced. It exists here so the
@@ -970,6 +970,11 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
     writes its test-run predictions into a full-length timeseries (so with
     overlapping test sets the last fold to cover a timepoint wins), and R² is
     computed once at the end.
+
+    Under ``zero_event_strategy="nuisance"`` the held-out data AND the design
+    predicting it both lose the span of the conditions that fold cannot fit,
+    built here with an explicit pinv projector rather than the SVD basis the
+    fast path uses -- so the two agree on the mathematics, not on the code.
     """
     from fastfuncstuff.glm.xval import (
         compute_r2_metric,
@@ -997,6 +1002,9 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
 
     r2_maps = np.zeros((n_vox, max_comp + 1), dtype=np.float64)
     splits = generate_cv_splits(n_runs, strategy=cv_strategy, n_perms=n_perms)
+    # 'nuisance' scores against projected data, so the denominator is rebuilt
+    # here fold by fold rather than taken from data_p.
+    actual = data_p.double().clone()
 
     for k in range(max_comp + 1):
         pred = torch.zeros(n_vox, n_tp, dtype=torch.float64)
@@ -1026,11 +1034,27 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
 
             pinv = torch.linalg.pinv(x_full.double(), rcond=1e-6)
             betas = (pinv @ data_p[:, tr_tps].double().T)[:n_fit, :]
-            y_pred = design_p[te_tps, :][:, fit_mask].double() @ betas
+            design_te = design_p[te_tps, :][:, fit_mask].double()
 
+            if zero_event_strategy == "nuisance":
+                # Per test RUN, since which columns are unpredictable depends on
+                # the run being scored, not on the fold.
+                for r in test_runs:
+                    r_tps = torch.arange(run_starts[r], run_ends[r])
+                    local = torch.searchsorted(te_tps, r_tps)
+                    unpred = (~fit_mask) & (design[r_tps, :].abs().sum(dim=0) > 1e-10)
+                    if not bool(unpred.any()):
+                        continue
+                    x_u = design_p[r_tps, :][:, unpred].double()
+                    proj = x_u @ torch.linalg.pinv(x_u, rcond=1e-6)
+                    design_te[local, :] -= proj @ design_te[local, :]
+                    actual[:, r_tps] -= (proj @ actual[:, r_tps].T).T
+
+            y_pred = design_te @ betas
             pred[:, te_tps] = y_pred.T
 
-        r2_maps[:, k] = compute_r2_metric(data_p.double(), pred, metric="cod").numpy()
+        r2_maps[:, k] = compute_r2_metric(actual, pred, metric="cod").numpy()
+        actual = data_p.double().clone()  # rebuilt per PC count
 
     return r2_maps
 
@@ -1251,3 +1275,151 @@ def test_r2_stack_subbriks_are_in_label_order(tmp_path):
         (results.noise_pool_r2, results.initial_noise_ceiling, results.initial_explainable_r2)
     ):
         assert np.allclose(initial[..., index].ravel(), expected.numpy(), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# zero_event_strategy wiring for the PC-count curve
+# ---------------------------------------------------------------------------
+
+
+def _run_confined_case(amp=6.0, overlap=False, n_runs=4, tp=60, n_vox=90, max_comp=3):
+    """A dense, strong condition that fires only in run 0.
+
+    The LORO fold holding out run 0 trains on runs 1-3, where that column is
+    all zero, so it has no beta for it. ``amp`` scales only that condition, and
+    ``overlap`` slides it onto condition 0's blocks (|r| = 0.66 against 0.02).
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    torch.manual_seed(11)
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+
+    # Boxcars, so the confined condition can be made to genuinely share variance
+    # with a predictable one. Stick functions at different offsets have disjoint
+    # support and stay near-orthogonal however they are slid, which is exactly
+    # the regime where a one-sided projection is invisible.
+    design = torch.zeros(n_tp, 3)
+    offset = 1 if overlap else 3  # |r| with condition 0: 0.66 against 0.02
+    for start in range(0, tp, 16):
+        design[start : start + 4, 0] = 1.0
+        design[start + 6 : start + 10, 1] = 1.0
+        for run in range(n_runs):  # conditions 0 and 1 fire in every run
+            base = run * tp + start
+            design[base : base + 4, 0] = 1.0
+            design[base + 6 : base + 10, 1] = 1.0
+        design[start + offset : start + offset + 4, 2] = 1.0  # run 0 only
+
+    nuisance = [construct_polynomial_matrix(tp, 3, DEVICE).float() for _ in range(n_runs)]
+    pcs = [torch.randn(tp, max_comp) for _ in range(n_runs)]
+
+    betas = torch.randn(n_vox, 3)
+    betas[:, 2] *= amp
+    data = torch.randn(n_vox, n_tp) * 0.5 + betas @ design.T
+    for r in range(n_runs):
+        sl = slice(run_starts[r], run_starts[r] + tp)
+        data[:, sl] += torch.randn(n_vox, max_comp) @ pcs[r].T
+        data[:, sl] += torch.randn(n_vox, nuisance[r].shape[1]) @ nuisance[r].T * 2.0
+
+    return dict(
+        data=data,
+        design_matrix=design,
+        noise_pcs=pcs,
+        run_starts=run_starts,
+        tr=1.0,
+        max_components=max_comp,
+        nuisance=nuisance,
+        device=DEVICE,
+    )
+
+
+def test_zero_strategy_curve_is_unchanged_by_the_wiring():
+    """'zero' is the default and every published result used it: it must not move.
+
+    R2's denominator moved into the fold loop so it can be measured on the
+    projected held-out data, gated on a projection actually happening. This pins
+    the gate: with nothing projected the numbers must be bit-identical, not close.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _run_confined_case()
+    explicit, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="zero")
+    default, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+
+    np.testing.assert_array_equal(explicit, default)
+    # And it still matches the slow reference, which is a 'zero' formulation.
+    assert np.abs(default - _explicit_full_model_r2(case, cv_strategy=1)).max() < 1e-4
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_nuisance_curve_ignores_the_unpredictable_condition_entirely(overlap):
+    """The whole claim of the strategy, stated as an invariance.
+
+    Scaling a condition no fold can fit changes how much variance 'zero' is
+    charged for, and its curve sags accordingly. 'nuisance' removes that
+    subspace from the scoring, so its curve must not move at all -- the
+    unpredictable condition's amplitude is simply not part of the measurement.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    weak = _run_confined_case(amp=1.0, overlap=overlap)
+    strong = _run_confined_case(amp=6.0, overlap=overlap)
+
+    n_weak, _ = cross_validate_noise_pcs(**weak, cv_strategy=1, zero_event_strategy="nuisance")
+    n_strong, _ = cross_validate_noise_pcs(**strong, cv_strategy=1, zero_event_strategy="nuisance")
+    z_weak, _ = cross_validate_noise_pcs(**weak, cv_strategy=1, zero_event_strategy="zero")
+    z_strong, _ = cross_validate_noise_pcs(**strong, cv_strategy=1, zero_event_strategy="zero")
+
+    assert np.abs(np.median(n_weak, axis=0) - np.median(n_strong, axis=0)).max() < 1e-4
+    # ... and that this is a real invariance rather than a curve that never moves.
+    assert np.median(z_weak, axis=0).min() - np.median(z_strong, axis=0).min() > 0.005
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_nuisance_curve_matches_the_explicit_projected_model(overlap):
+    """The fast path must reproduce an explicit fold-by-fold projection.
+
+    The reference builds its projector with pinv on the design columns, the fast
+    path with a truncated SVD basis applied twice, so agreement is about the
+    mathematics rather than shared code. This is what pins the projection to
+    both sides: projecting the held-out data without the design that predicts it
+    passes every cruder check when the columns are near-orthogonal
+    (``overlap=False``, |r| = 0.02) and only shows up under real sharing
+    (``overlap=True``, |r| = 0.66).
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _run_confined_case(overlap=overlap)
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="nuisance")
+    reference = _explicit_full_model_r2(case, cv_strategy=1, zero_event_strategy="nuisance")
+
+    assert np.abs(fast - reference).max() < 1e-4
+
+
+def test_nuisance_curve_beats_zero_when_the_lost_condition_is_separable(overlap=False):
+    """With little sharing, declining to score the subspace is a clear win.
+
+    Stated only for the near-orthogonal case on purpose. Once the unpredictable
+    condition shares most of its variance with a real one, removing its subspace
+    removes signal that was scorable, and 'nuisance' legitimately falls below
+    'zero' -- that is the cost of not inventing error, not a regression.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _run_confined_case(overlap=overlap)
+    zero, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="zero")
+    nuis, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="nuisance")
+
+    assert np.isfinite(nuis).all() and nuis.max() <= 1.0
+    assert (np.median(nuis, axis=0) > np.median(zero, axis=0)).all()
+
+
+def test_nuisance_strategy_is_a_no_op_when_every_condition_spans_runs():
+    """No condition is ever unpredictable, so there is nothing to remove."""
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()  # all three conditions fire in every run
+    zero, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="zero")
+    nuis, _ = cross_validate_noise_pcs(**case, cv_strategy=1, zero_event_strategy="nuisance")
+
+    np.testing.assert_array_equal(zero, nuis)
