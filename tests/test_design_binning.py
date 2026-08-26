@@ -91,3 +91,30 @@ def test_report_names_the_conditions():
     txt = format_bin_report(info, ["checkerboard"])
     assert "checkerboard=" in txt
     assert f"{info['n_bins']} bins" in txt
+
+
+@pytest.mark.parametrize(
+    ("ref", "paired", "stat"),
+    [
+        ("mean", False, "mean"),
+        ("median", False, "median"),
+        ("max", False, "max"),
+        ("first_mean", False, "first_mean"),
+        ("paired", True, "mean"),
+        ("paired_mean", True, "mean"),
+        ("paired_median", True, "median"),
+    ],
+)
+def test_ref_paired_splits_into_bins_and_statistic(ref, paired, stat):
+    """`-ref paired[_stat]` is one user-facing name over two independent axes.
+
+    Which frames form the reference, and what statistic reduces them, are separate
+    questions; the library keeps them separate and only the CLI name is compound —
+    the same shape as the existing first_mean / first_median.
+    """
+    from fastfuncstuff.cli.locomoco import parse_ref_mode
+
+    is_paired, statistic, label = parse_ref_mode(ref)
+    assert is_paired is paired
+    assert statistic == stat
+    assert label == ref  # the banner keeps the name the user typed

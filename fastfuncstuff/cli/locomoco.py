@@ -628,12 +628,19 @@ def create_parser() -> argparse.ArgumentParser:
     est.add_argument(
         "-ref",
         default=None,
-        help="[all] Reference: static mean | median | max | first | <frame index>, or "
+        help="[all] Reference: static mean | median | max | first | <frame index>; "
         "PROGRESSIVE first_mean / first_median — frame t registers to the running "
         "mean/median of the already-corrected earlier frames (a bootstrapped template; "
-        "frame 0 is the seed). Progressive modes are sequential and slower. 'max' takes "
-        "the temporal maximum, which fills slices later frames rotate out of the FoV and "
-        "is a high-signal target. Default: max for rotation-aware mode, mean otherwise.",
+        "frame 0 is the seed), sequential and slower; or CONDITION-PAIRED paired / "
+        "paired_mean / paired_median (needs -events + a TR) — frames are binned by "
+        "predicted BOLD state and each registers to the template of its OWN bin, so the "
+        "task response is common-mode within the pair and cancels. That is prevention "
+        "for the contamination -detask cures, with no HRF fit and nothing assumed about "
+        "how it enters; see -task_bin_width. 3-D solve only, not with -backend qwarp. "
+        "'max' takes the temporal maximum, which fills slices later frames rotate out of "
+        "the FoV and is a high-signal target; it has no paired form, because a max over "
+        "one bin's frames is a noise envelope, not a template. Default: max for "
+        "rotation-aware mode, mean otherwise.",
     )
     est.add_argument(
         "-first_n",
@@ -1031,25 +1038,12 @@ def create_parser() -> argparse.ArgumentParser:
         "long block. Default: AFNI's 1 + floor(run_seconds/150).",
     )
     task.add_argument(
-        "-paired_ref",
-        "-paired-ref",
-        action="store_true",
-        help="CONDITION-PAIRED REFERENCE: bin the frames by predicted BOLD state and "
-        "register each frame to the template of its OWN bin, so the task response is "
-        "common-mode within the pair and cancels — no HRF fit, no projection, nothing "
-        "assumed about how the contamination enters. Prevention rather than the -detask "
-        "cure, and the two compose. Binning is on the CONVOLVED design, so the slopes "
-        "get their own bins: at TR 2.5s with 50s blocks a single TR at a transition "
-        "carries up to 41%% of the full swing, which a plain ON/OFF split misplaces. "
-        "Needs -events and a TR; 3-D solve only (-is_3dacq, or two encode axes).",
-    )
-    task.add_argument(
         "-task_bin_width",
         "-task-bin-width",
         type=float,
         default=0.2,
         metavar="FRAC",
-        help="[-paired_ref] Bin size as a fraction of each condition's peak-to-peak "
+        help="[-ref paired] Bin size as a fraction of each condition's peak-to-peak "
         "swing. 0.2 (default) gives five levels: baseline, three slope steps, peak. "
         "Narrower bins match the state more tightly but thin the average that suppresses "
         "the residual field — that average is what makes the template cleaner than the "
@@ -1061,7 +1055,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         metavar="N",
-        help="[-paired_ref] Explicit level count per condition; overrides -task_bin_width.",
+        help="[-ref paired] Explicit level count per condition; overrides -task_bin_width.",
     )
     task.add_argument(
         "-task_min_frames",
@@ -1069,7 +1063,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         metavar="N",
-        help="[-paired_ref] Bins with fewer frames than this are merged into the nearest "
+        help="[-ref paired] Bins with fewer frames than this are merged into the nearest "
         "bin in state space. A template averaged over two frames suppresses the residual "
         "field by only 1/sqrt(2) and hands its own noise to every frame registered "
         "against it. Default 4.",
@@ -1485,8 +1479,30 @@ def _task_design_from_events(args, n_timepoints: int, tr: float, device):
     return design, labels
 
 
+def parse_ref_mode(ref: str) -> tuple[bool, str, str]:
+    """Split ``-ref`` into ``(paired?, within-reference statistic, display label)``.
+
+    ``-ref`` names two independent things: WHICH frames form a reference, and WHAT
+    statistic reduces them. ``paired[_mean|_median]`` follows the compound-name shape
+    the progressive ``first_mean`` / ``first_median`` modes already established, so the
+    CLI stays one flag while the library keeps taking a plain ``ref_mode`` alongside an
+    orthogonal ``paired_bins``.
+
+    The label is returned separately because every banner must keep the name the user
+    typed: reporting the split-off statistic as ``ref=median`` would hide that the run
+    was paired at all.
+
+    There is deliberately no ``paired_max``. A temporal max fills FoV dropout across a
+    whole run; over one bin's ~15 frames it is a noise envelope, not a template.
+    """
+    paired = ref.startswith("paired")
+    if not paired:
+        return False, ref, ref
+    return True, ("median" if ref.endswith("_median") else "mean"), ref
+
+
 def _paired_bins_for(args, n_timepoints: int, tr: float, device):
-    """Per-frame task-state bins for ``-paired_ref``, or None with a printed reason.
+    """Per-frame task-state bins for ``-ref paired``, or None with a printed reason.
 
     Built BEFORE the estimation, because the bins choose the reference each frame is
     registered against — unlike the diagnostic, which only reads the field afterwards.
@@ -1503,7 +1519,7 @@ def _paired_bins_for(args, n_timepoints: int, tr: float, device):
     print(format_bin_report(info, labels))
     if info["n_bins"] < 2:
         print(
-            "  ⚠️  -paired_ref: every frame landed in ONE bin, which is just the plain "
+            "  ⚠️  -ref paired: every frame landed in ONE bin, which is just the plain "
             "reference. Widen the design or lower -task_bin_width."
         )
         return None
@@ -2012,6 +2028,17 @@ def _run_multiecho(
     """Multi-echo 3-D EPI: joint shared-field estimate, per-echo warp + corrected out."""
     import numpy as np
 
+    if args.paired_ref:
+        # The shared field is solved jointly across echoes against one reference per
+        # echo; per-bin templates would have to be built per echo too. Refusing beats
+        # silently reverting to the plain reference the user did not ask for.
+        print(
+            "❌ -ref paired is not wired for the multi-echo path (one shared field "
+            "scaled per echo, so the templates would have to be per echo as well).",
+            file=sys.stderr,
+        )
+        return 2
+
     from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow_multiecho
@@ -2099,7 +2126,7 @@ def _run_multiecho(
     # main() already resolved the default; ref_explicit tells us whether the user chose it.
     if args.me_interecho and args.ref_explicit and not args.me_interecho_refine:
         print(
-            f"   ℹ️  -ref '{args.ref}' is ignored under -me_interecho: there is no temporal "
+            f"   ℹ️  -ref '{args.ref_label}' is ignored under -me_interecho: there is no temporal "
             "template — each echo registers to its adjacent lower-TE echo at the same TR. "
             "(-me_interecho_refine adds a temporal pass, which does use it.)"
         )
@@ -2198,7 +2225,7 @@ def _run_multiecho(
     # ref / refine are temporal-template knobs — inert under inter-echo unless its
     # temporal refine pass runs, which is a genuine template-based solve.
     ie_only = args.me_interecho and not args.me_interecho_refine
-    ref_note = "ref=n/a" if ie_only else f"ref={args.ref}"
+    ref_note = "ref=n/a" if ie_only else f"ref={args.ref_label}"
     if ie_only:
         refine_note = "refine=n/a"
     elif args.me_interecho:
@@ -2231,7 +2258,7 @@ def _run_multiecho(
     # warning would be misleading (qwarp estimates the full field regardless).
     if args.refine == 0 and not args.me_interecho and not qwarp_backend:
         print(
-            f"   ℹ️  refine=0: the reference ('{args.ref}') is built from the un-corrected "
+            f"   ℹ️  refine=0: the reference ('{args.ref_label}') is built from the un-corrected "
             "frames, so it still carries the wiggle and biases displacement LOW — add "
             "-refine 2/-workhard/-superhard for full magnitude."
         )
@@ -2613,6 +2640,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     args.ref_explicit = args.ref is not None
     if args.ref is None:
         args.ref = "max" if rotaware else "mean"
+    # "paired[_stat]" selects the BINS; the statistic within a bin is an independent
+    # axis, so it is split off here and the library keeps taking a plain ref_mode.
+    # Same compound-name shape as the existing first_mean / first_median.
+    args.paired_ref, args.ref, args.ref_label = parse_ref_mode(args.ref)
 
     from fastfuncstuff.io.afni import load_nifti, save_nifti
     from fastfuncstuff.processing.locomoco import estimate_residual_flow, resolve_pe_axis
@@ -2802,7 +2833,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     if args.paired_ref:
         if not (args.is_3dacq or dual3d):
             print(
-                "❌ -paired_ref needs the 3-D solve: pass -is_3dacq, or two encode axes "
+                "❌ -ref paired needs the 3-D solve: pass -is_3dacq, or two encode axes "
                 "(-pe_dir1/-pe_dir2). The 2-D slicewise path builds its reference per "
                 "slice and has not been converted.",
                 file=sys.stderr,
@@ -2810,7 +2841,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             return 2
         if qwarp_backend:
             print(
-                "❌ -paired_ref does not apply to -backend qwarp, which owns the field "
+                "❌ -ref paired does not apply to -backend qwarp, which owns the field "
                 "and registers to a median of the raw series. Use -backend flow/xcorr "
                 "(optionally with -final_qwarp).",
                 file=sys.stderr,
@@ -2818,14 +2849,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             return 2
         if not (args.events and tr_sec):
             print(
-                "❌ -paired_ref needs -events and a usable TR to know each frame's task state.",
+                "❌ -ref paired needs -events and a usable TR to know each frame's task state.",
                 file=sys.stderr,
             )
             return 2
         try:
             paired_bins = _paired_bins_for(args, data.shape[3], tr_sec, torch.device("cpu"))
         except ValueError as exc:
-            print(f"❌ -paired_ref: {exc}", file=sys.stderr)
+            print(f"❌ -ref paired: {exc}", file=sys.stderr)
             return 2
 
     # Correlation-curve frame (xcorr diagnostics): bare -save_corr_curve (const -1) → middle.
@@ -2895,7 +2926,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         axes_desc = f"PE {args.pe_dir[0]} (axis {pe_axis})"
     print(
         f"   {axes_desc}, slice axis={slice_axis}, backend={args.backend}, "
-        f"ref={args.ref}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
+        f"ref={args.ref_label}, do_blur={args.do_blur}mm (σ={smooth_sigma:.2f}vox), "
         f"{mode}, automask={mask_desc}"
     )
     if hpf_sigma > 0:

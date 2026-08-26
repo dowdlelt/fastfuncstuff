@@ -656,7 +656,7 @@ def _verdict(
             lead += f", and it is {e:.2f}x concentrated on active tissue"
         return (
             lead + ". The estimator is moving voxels, in a task-correlated way, where "
-            "voxels are task-correlated." + kap + " -paired_ref prevents it; -detask "
+            "voxels are task-correlated." + kap + " -ref paired prevents it; -detask "
             "removes it from the field you already have."
         )
     if ratio < 0.8:
