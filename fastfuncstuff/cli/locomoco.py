@@ -1031,6 +1031,50 @@ def create_parser() -> argparse.ArgumentParser:
         "long block. Default: AFNI's 1 + floor(run_seconds/150).",
     )
     task.add_argument(
+        "-paired_ref",
+        "-paired-ref",
+        action="store_true",
+        help="CONDITION-PAIRED REFERENCE: bin the frames by predicted BOLD state and "
+        "register each frame to the template of its OWN bin, so the task response is "
+        "common-mode within the pair and cancels — no HRF fit, no projection, nothing "
+        "assumed about how the contamination enters. Prevention rather than the -detask "
+        "cure, and the two compose. Binning is on the CONVOLVED design, so the slopes "
+        "get their own bins: at TR 2.5s with 50s blocks a single TR at a transition "
+        "carries up to 41%% of the full swing, which a plain ON/OFF split misplaces. "
+        "Needs -events and a TR; 3-D solve only (-is_3dacq, or two encode axes).",
+    )
+    task.add_argument(
+        "-task_bin_width",
+        "-task-bin-width",
+        type=float,
+        default=0.2,
+        metavar="FRAC",
+        help="[-paired_ref] Bin size as a fraction of each condition's peak-to-peak "
+        "swing. 0.2 (default) gives five levels: baseline, three slope steps, peak. "
+        "Narrower bins match the state more tightly but thin the average that suppresses "
+        "the residual field — that average is what makes the template cleaner than the "
+        "frames it came from, so this is the real trade.",
+    )
+    task.add_argument(
+        "-task_bins",
+        "-task-bins",
+        type=int,
+        default=None,
+        metavar="N",
+        help="[-paired_ref] Explicit level count per condition; overrides -task_bin_width.",
+    )
+    task.add_argument(
+        "-task_min_frames",
+        "-task-min-frames",
+        type=int,
+        default=4,
+        metavar="N",
+        help="[-paired_ref] Bins with fewer frames than this are merged into the nearest "
+        "bin in state space. A template averaged over two frames suppresses the residual "
+        "field by only 1/sqrt(2) and hands its own noise to every frame registered "
+        "against it. Default 4.",
+    )
+    task.add_argument(
         "-detask",
         action="store_true",
         help="REMOVE the task-locked part of the field, keeping drift and everything "
@@ -1439,6 +1483,31 @@ def _task_design_from_events(args, n_timepoints: int, tr: float, device):
         design = design[:, keep]
         labels = [labels[k] for k in keep]
     return design, labels
+
+
+def _paired_bins_for(args, n_timepoints: int, tr: float, device):
+    """Per-frame task-state bins for ``-paired_ref``, or None with a printed reason.
+
+    Built BEFORE the estimation, because the bins choose the reference each frame is
+    registered against — unlike the diagnostic, which only reads the field afterwards.
+    """
+    from fastfuncstuff.design.binning import design_state_bins, format_bin_report
+
+    design, labels = _task_design_from_events(args, n_timepoints, tr, device)
+    bin_of, info = design_state_bins(
+        design,
+        bin_width=args.task_bin_width,
+        n_bins=args.task_bins,
+        min_frames=args.task_min_frames,
+    )
+    print(format_bin_report(info, labels))
+    if info["n_bins"] < 2:
+        print(
+            "  ⚠️  -paired_ref: every frame landed in ONE bin, which is just the plain "
+            "reference. Widen the design or lower -task_bin_width."
+        )
+        return None
+    return bin_of
 
 
 def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
@@ -2729,6 +2798,36 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     affine = img.affine.copy()
     tr_sec = _resolve_tr(args, img) if args.events else None
 
+    paired_bins = None
+    if args.paired_ref:
+        if not (args.is_3dacq or dual3d):
+            print(
+                "❌ -paired_ref needs the 3-D solve: pass -is_3dacq, or two encode axes "
+                "(-pe_dir1/-pe_dir2). The 2-D slicewise path builds its reference per "
+                "slice and has not been converted.",
+                file=sys.stderr,
+            )
+            return 2
+        if qwarp_backend:
+            print(
+                "❌ -paired_ref does not apply to -backend qwarp, which owns the field "
+                "and registers to a median of the raw series. Use -backend flow/xcorr "
+                "(optionally with -final_qwarp).",
+                file=sys.stderr,
+            )
+            return 2
+        if not (args.events and tr_sec):
+            print(
+                "❌ -paired_ref needs -events and a usable TR to know each frame's task state.",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            paired_bins = _paired_bins_for(args, data.shape[3], tr_sec, torch.device("cpu"))
+        except ValueError as exc:
+            print(f"❌ -paired_ref: {exc}", file=sys.stderr)
+            return 2
+
     # Correlation-curve frame (xcorr diagnostics): bare -save_corr_curve (const -1) → middle.
     corr_curve_frame = None
     if args.save_corr_curve is not None:
@@ -2946,6 +3045,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             hpf_sigma=hpf_sigma,
             match=args.match,
             match_sigma=args.match_sigma,
+            paired_bins=paired_bins,
             device=device,
         )
 

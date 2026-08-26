@@ -119,6 +119,7 @@ class TaskCoupling:
     valid: torch.Tensor  # (nx,ny,nz) voxels with real detrended variance
     labels: list[str]
     polort: int
+    n_timepoints: int = 0
     summary: dict = dc_field(default_factory=dict)
 
     def summarize(self, mask: torch.Tensor | None = None) -> dict:
@@ -156,6 +157,23 @@ class TaskCoupling:
             "task_rms_median": float(self.task_rms.reshape(-1)[m].median()),
             "total_rms_median": float(self.total_rms.reshape(-1)[m].median()),
         }
+
+    @property
+    def chance_share(self) -> float:
+        """Task-explained rms share a field with NO task relation would show anyway.
+
+        A K-dimensional projection of a random T-vector keeps ``sqrt(K/df)`` of its
+        norm, so the share is never 0 and reading it without this reference overstates
+        every result.  It is arithmetic, not a simulation — no surrogate needed, which
+        matters here because every surrogate-based null failed (see the module
+        docstring).
+
+        A paired reference can land BELOW chance: registering within a task-state bin
+        leaves the estimator unable to express a between-bin difference, so the field
+        comes out closer to orthogonal to the design than chance would give.
+        """
+        df = max(1, self.n_timepoints - self.polort - 1)
+        return float(np.sqrt(len(self.labels) / df))
 
     @property
     def strongest(self) -> dict:
@@ -282,6 +300,7 @@ def task_coupling(
         valid=valid.reshape(spatial),
         labels=labels,
         polort=polort,
+        n_timepoints=n_t,
     )
     tc.summary = tc.summarize(mask)
     if tc.summary["n_voxels"] == 0:
@@ -534,10 +553,11 @@ def format_task_coupling_report(
                 f"|r| {c['abs_r_median']:.3f} median / {c['abs_r_p95']:.3f} p95"
             )
 
+        chance = field.chance_share
         out.append(
             f"    {'displacement':<14} {st['task_rms_median']:.4f} of "
             f"{st['total_rms_median']:.4f} {units} rms is task-explained "
-            f"({_share(st) * 100:.0f}%)"
+            f"({_share(st) * 100:.0f}%, chance ~{chance * 100:.0f}%)"
         )
         return out
 
@@ -613,35 +633,47 @@ def _verdict(
     best = max(conds, key=lambda c: c["abs_r_median"])
     where = "where the data responds" if responding else "in the mask"
 
+    # The task-explained SHARE is the robust detector, not enrichment. Enrichment is a
+    # ratio of shares, so when real motion dominates the field it is dividing two noisy
+    # numbers and tracks nothing -- measured 0.89x on a phantom whose field was 21%
+    # task-explained, and 0.77x after a fix that cut that to 1%.
+    share, chance = _share(st), field.chance_share
+    ratio = share / chance if chance > 0 else 0.0
+    e = enrichment["enrichment"] if enrichment else None
     kap = ""
     if slope is not None and slope["n"] > 100 and abs(slope["r"]) > 0.2:
         kap = (
             f" The physical test agrees: kappa {slope['kappa']:+.2f} at centred r "
-            f"{slope['r']:+.2f}, i.e. the displacement tracks the intensity change."
+            f"{slope['r']:+.2f}."
         )
 
-    if enrichment is None:
-        return f"|r| {best['abs_r_median']:.2f} {where}; no active mask to compare against."
-
-    e = enrichment["enrichment"]
-    if e >= 1.5:
+    if ratio >= 2.0 or (e is not None and e >= 1.5 and ratio >= 1.3):
+        lead = (
+            f"CONTAMINATION: {share * 100:.0f}% of the field's displacement {where} is "
+            f"task-explained, {ratio:.1f}x what an unrelated field would show"
+        )
+        if e is not None:
+            lead += f", and it is {e:.2f}x concentrated on active tissue"
         return (
-            f"CONTAMINATION: {enrichment['energy_share'] * 100:.0f}% of the field's "
-            f"task-locked displacement sits in the {enrichment['voxel_share'] * 100:.0f}% "
-            f"of voxels where the task is -- {e:.2f}x enrichment. The estimator is moving "
-            f"voxels, in a task-correlated way, where voxels are task-correlated.{kap} "
-            "A condition-paired reference or a task-weighted data term is the fix; "
-            "-detask removes it from the field you already have."
+            lead + ". The estimator is moving voxels, in a task-correlated way, where "
+            "voxels are task-correlated." + kap + " -paired_ref prevents it; -detask "
+            "removes it from the field you already have."
+        )
+    if ratio < 0.8:
+        return (
+            f"No task coupling {where}: {share * 100:.0f}% task-explained against a "
+            f"{chance * 100:.0f}% chance level, i.e. BELOW what an unrelated field "
+            "gives. Nothing to fix (a paired reference lands here by construction)."
         )
     if best["abs_r_median"] > 0.25:
         return (
-            f"Task-locked {where} (|r| {best['abs_r_median']:.2f}) but only {e:.2f}x "
-            "enriched on active tissue -- the coupling is spread like the brain, not "
-            "concentrated where the task is. That is the signature of real "
-            "task-correlated motion, or of a slow field aliasing onto a slow design. "
-            "Do not project it out without looking at the maps."
+            f"Task-locked {where} (|r| {best['abs_r_median']:.2f}) but only "
+            f"{ratio:.1f}x the chance share, and not concentrated on active tissue. "
+            "That is the signature of real task-correlated motion, or of a slow field "
+            "aliasing onto a slow design -- do not project it out without looking at "
+            "the maps."
         )
     return (
-        f"No appreciable task coupling {where} (|r| {best['abs_r_median']:.2f}), and "
-        f"{e:.2f}x enrichment on active tissue. Nothing to fix on this run."
+        f"No appreciable task coupling {where} ({share * 100:.0f}% task-explained vs "
+        f"{chance * 100:.0f}% chance). Nothing to fix on this run."
     )

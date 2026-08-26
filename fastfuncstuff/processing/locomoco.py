@@ -1786,6 +1786,7 @@ def estimate_residual_flow(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    paired_bins: torch.Tensor | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> LocomocoResult:
@@ -1908,8 +1909,16 @@ def estimate_residual_flow(
             match=match,
             match_sigma=match_sigma,
             pe_axis2=pe_axis2,
+            paired_bins=paired_bins,
             device=device,
             verbose=verbose,
+        )
+
+    if paired_bins is not None:
+        raise ValueError(
+            "the condition-paired reference is wired for the 3-D solve only "
+            "(-is_3dacq, or two encode axes). The 2-D slicewise path builds its "
+            "reference per slice and has not been converted."
         )
 
     orig_shape = (data.shape[0], data.shape[1], data.shape[2], data.shape[3])
@@ -3521,6 +3530,30 @@ def _refine_reduce(
     return c.mean(dim=dim)
 
 
+def paired_templates(
+    series: torch.Tensor, bin_of: torch.Tensor, ref_mode: str, dim: int = 3
+) -> torch.Tensor:
+    """One reference per task-state bin: ``(n_bins, ...)`` stacked along a new axis 0.
+
+    The condition-paired reference. Each frame is later registered to the template of
+    its OWN bin, so the BOLD response is common-mode within the pair and cancels — the
+    estimator never sees the intensity change it would otherwise read as displacement.
+
+    ``max`` falls back to the mean here. A per-bin max over ~15 frames is a noise
+    envelope, not a template; the FoV-filling argument that justifies ``-ref max``
+    globally does not survive being applied to a tenth of the frames.
+    """
+    n_bins = int(bin_of.max()) + 1
+    outs = []
+    for b in range(n_bins):
+        sel = series.index_select(dim, torch.nonzero(bin_of == b, as_tuple=True)[0])
+        if ref_mode in ("median", "first_median"):
+            outs.append(sel.median(dim=dim).values)
+        else:
+            outs.append(sel.mean(dim=dim))
+    return torch.stack(outs)
+
+
 def _brain_mask_from(ref_mag: torch.Tensor, thresh_frac: float = 0.1) -> torch.Tensor:
     """Coarse brain mask (``|ref| > frac·max``) so the refine step size ignores air noise."""
     m = ref_mag > thresh_frac * float(ref_mag.max())
@@ -3642,6 +3675,7 @@ def _run_3dacq_plain(
     pe_axis2: int | None = None,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
+    paired_bins: torch.Tensor | None = None,
 ) -> LocomocoResult:
     """Plain (moco-frame) residual motion for 3-D-acquired EPI: a single 3-D solve.
 
@@ -3650,6 +3684,12 @@ def _run_3dacq_plain(
     :func:`optical_flow_lk_3d_axes` for why that is a joint 2x2 rather than two
     restricted solves, and :func:`dual_field_coupling` for the diagnostic that measures,
     after the fact, whether the two fields turned out related.
+
+    ``paired_bins`` (a per-frame task-state bin id) switches on the condition-paired
+    reference: one template per bin, each frame registered to its own. Refine rebuilds
+    the templates per bin too, which is where the repeats pay off — each bin's average
+    suppresses the residual field it was built from, so the templates get geometrically
+    cleaner while staying matched in BOLD state.
     """
     nx, ny, nz, nt = data.shape
     dual = pe_axis2 is not None
@@ -3717,12 +3757,25 @@ def _run_3dacq_plain(
     sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
 
     def _estimate(ref_vol: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
-        fxb = _prep(ref_vol)
+        # One reference, or one per task-state bin. The prep runs per TEMPLATE, not per
+        # frame, so a paired run costs n_bins preps instead of 1 — not n_frames.
+        if paired_bins is None:
+            fxb_all = [_prep(ref_vol)]
+
+            def _fixed(_t: int) -> torch.Tensor:
+                return fxb_all[0]
+        else:
+            fxb_all = [_prep(ref_vol[b].to(device)) for b in range(ref_vol.shape[0])]
+
+            def _fixed(t: int) -> torch.Tensor:
+                return fxb_all[int(paired_bins[t])]
+
         disps = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         corrected = torch.zeros(nx, ny, nz, nt)
         for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
             mv = vol4d[..., t].to(device)
             mvb = _prep(mv)
+            fxb = _fixed(t)
             conf_acc: list[torch.Tensor] | None = [] if xc else None
             curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
             sep_acc: list[torch.Tensor] | None = [] if sep_field is not None else None
@@ -3787,7 +3840,14 @@ def _run_3dacq_plain(
     def _estimate_gated(ref_vol):
         return _gate3d(*_estimate(ref_vol))
 
-    disp, corrected = _estimate_gated(_select_ref_vol(vol4d, ref_mode, first_n).to(device))
+    def _initial_ref() -> torch.Tensor:
+        if paired_bins is None:
+            return _select_ref_vol(vol4d, ref_mode, first_n).to(device)
+        # -first_n is deliberately ignored for a paired reference: windowing to the early
+        # frames would drop whole task states, and a bin is only as good as its repeats.
+        return paired_templates(vol4d, paired_bins, ref_mode)
+
+    disp, corrected = _estimate_gated(_initial_ref())
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
     # shared engine: rebuild the reference from the corrected series and re-register.
     # The aggregate honours -ref and -first_n; the step is the in-brain rms of the field.
@@ -3797,7 +3857,11 @@ def _run_3dacq_plain(
             _estimate_gated,
             disp,
             corrected,
-            reduce_ref=lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device),
+            reduce_ref=(
+                (lambda c: _refine_reduce(c, ref_mode, 3, first_n).to(device))
+                if paired_bins is None
+                else (lambda c: paired_templates(c, paired_bins, ref_mode))
+            ),
             # The step is the total move across BOTH axes, so a dual run converges only
             # when neither component is still shifting.
             brain_rms=lambda d, p: float(

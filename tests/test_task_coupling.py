@@ -404,3 +404,52 @@ def test_empty_active_mask_raises_something_actionable():
     dead = torch.zeros(4, 4, 3, 1, dtype=torch.float64)
     with pytest.raises(ValueError, match="active mask is empty"):
         responding_mask(dead, mask, thresh=0.2)
+
+
+def test_paired_templates_are_matched_in_task_state():
+    """The condition-paired reference: one template per bin, each built from its own frames.
+
+    The property that makes it work is that the BOLD response is CONSTANT within a bin,
+    so it is common-mode between a frame and its template and cancels in the data term.
+    """
+    from fastfuncstuff.design.binning import design_state_bins
+    from fastfuncstuff.processing.locomoco import paired_templates
+
+    n_t = 120
+    x = _block_design(n_t, block=20)
+    bin_of, info = design_state_bins(x, bin_width=0.34, min_frames=4)
+    # a series whose intensity follows the task exactly, with no motion at all
+    series = torch.ones(4, 4, 3, n_t, dtype=torch.float64) * (100 + 20 * x[:, 0])
+    tmpl = paired_templates(series, bin_of, "mean")
+
+    assert tmpl.shape == (info["n_bins"], 4, 4, 3)
+    for b in range(info["n_bins"]):
+        frames = series[..., bin_of == b]
+        # every frame in a bin is within a bin-width of its own template
+        assert float((frames - tmpl[b][..., None]).abs().max()) < 20 * 0.34 + 1e-9
+    # ...and distinct bins really do sit at different intensities
+    means = sorted(float(tmpl[b].mean()) for b in range(info["n_bins"]))
+    assert means[-1] - means[0] > 10
+
+
+def test_paired_templates_median_and_max_fallback():
+    """max falls back to the mean: a per-bin max over ~15 frames is a noise envelope."""
+    from fastfuncstuff.processing.locomoco import paired_templates
+
+    bin_of = torch.tensor([0, 0, 0, 1, 1, 1])
+    series = torch.zeros(2, 2, 1, 6, dtype=torch.float64)
+    series[..., :3] = torch.tensor([1.0, 2.0, 30.0])
+    series[..., 3:] = torch.tensor([4.0, 5.0, 6.0])
+    med = paired_templates(series, bin_of, "median")
+    mx = paired_templates(series, bin_of, "max")
+    assert float(med[0].mean()) == pytest.approx(2.0)  # median ignores the outlier
+    assert float(mx[0].mean()) == pytest.approx(11.0)  # ...mean does not (max -> mean)
+
+
+def test_chance_share_is_arithmetic_not_a_null():
+    """The share a field with no task relation shows anyway: sqrt(K/df)."""
+    n_t = 120
+    x = _block_design(n_t)
+    tc = task_coupling(_field(n_t, seed=1), x, polort=2)
+    assert tc.n_timepoints == n_t
+    assert tc.chance_share == pytest.approx((1 / (n_t - 2 - 1)) ** 0.5, rel=1e-6)
