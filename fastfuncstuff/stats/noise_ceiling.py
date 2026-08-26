@@ -325,6 +325,7 @@ def loro_two_half_ceiling(
     sum_y_sq = torch.zeros(n_voxels, dtype=torch.float64, device=accumulator_device)
     n_points = 0
     n_usable = 0
+    n_excluded_by_fold: list[int] = []
 
     for split_idx, (train_runs, test_runs) in enumerate(cv_splits):
         # Alternating assignment, not a contiguous cut: see docstring.
@@ -345,23 +346,15 @@ def loro_two_half_ceiling(
         )
         test_stim = test_design_clean[:, stim_indices]
 
-        # The conditions this fold's TRAINING RUNS cannot supply a beta for.
-        # compute_xval_r2 under 'nuisance' removes their span from the held-out
-        # data and from the design predicting it; the ceiling has to do the same
-        # or var(y) here is not the SS_tot the R2 was divided by.
-        unpred_basis = None
-        if zero_event_strategy == "nuisance":
-            from fastfuncstuff.glm.xval import _unpredictable_basis
-
-            train_tps: list[int] = []
-            for run_idx in train_runs:
-                start = run_starts[run_idx]
-                train_tps.extend(range(start, start + run_lengths[run_idx]))
-            train_stim = design_matrix[train_tps, :][:, stim_indices]
-            test_only = (train_stim.abs().sum(dim=0) <= 1e-10) & (
-                test_stim.abs().sum(dim=0) > 1e-10
-            )
-            unpred_basis = _unpredictable_basis(test_stim, test_only)
+        # What this fold's full training set can supply a beta for -- the same
+        # question compute_xval_r2 asks, and not the same question the two
+        # halves can answer.
+        train_tps: list[int] = []
+        for run_idx in train_runs:
+            start = run_starts[run_idx]
+            train_tps.extend(range(start, start + run_lengths[run_idx]))
+        train_present = design_matrix[train_tps, :][:, stim_indices].abs().sum(dim=0) > 1e-10
+        test_present = test_stim.abs().sum(dim=0) > 1e-10
 
         half_fits = []
         usable_half = True
@@ -386,27 +379,43 @@ def loro_two_half_ceiling(
         if not usable_half:
             continue
 
-        # A condition absent from either half contributes no signal to the
-        # covariance while still sitting in the held-out variance, which biases
-        # the ceiling DOWN. Restricting both halves to the conditions all three
-        # sets share keeps the estimate honest; the count is reported so a
-        # caller can see how much of the design was usable.
-        present = (test_stim.abs().sum(dim=0) > 1e-10).clone()
+        # Only conditions both halves saw can have their reproducibility
+        # measured at all -- the covariance needs two independent estimates of
+        # the same beta. Everything else is excluded from the fit.
+        present = test_present.clone()
         for _, half_stim, _ in half_fits:
             present &= half_stim.abs().sum(dim=0) > 1e-10
         n_shared = int(present.sum().item())
         if n_shared == 0:
             continue
-        if n_shared < len(stim_indices) and split_idx == 0:
-            notes.append(
-                f"{len(stim_indices) - n_shared} of {len(stim_indices)} conditions were "
-                "missing from a training half and were excluded from the ceiling"
-            )
+        n_excluded_by_fold.append(len(stim_indices) - n_shared)
+
+        # Excluding a condition from the fit does NOT take it out of var(y), and
+        # that asymmetry is what made the ceiling too low. Which of the excluded
+        # ones belong out of the denominator depends on whether the MODEL could
+        # have captured them:
+        #
+        # * present in the test run but nowhere in training -- the model cannot
+        #   fit them either, so under 'zero' their variance is unexplainable and
+        #   belongs in the denominator, exactly as it does in the R2. Under
+        #   'nuisance' the R2 drops them, so the ceiling must too.
+        # * present in training but missing from a half -- the model DOES fit
+        #   them, so a ceiling that keeps their variance while discarding their
+        #   signal reports a bound the model routinely exceeds. Reproducibility
+        #   for them is not merely unmeasured, it is unmeasurable with two
+        #   halves: a condition confined to one run has no repeat to correlate
+        #   against. So the ceiling is stated on the subspace where the question
+        #   has an answer, and their span comes out of the denominator too.
+        drop = test_present & train_present & ~present
+        if zero_event_strategy == "nuisance":
+            drop = drop | (test_present & ~train_present)
+
+        from fastfuncstuff.glm.xval import _project_out_basis, _unpredictable_basis
+
+        unpred_basis = _unpredictable_basis(test_stim, drop)
 
         test_stim_shared = test_stim[:, present]
         if unpred_basis is not None:
-            from fastfuncstuff.glm.xval import _project_out_basis
-
             test_stim_shared = _project_out_basis(test_stim_shared, unpred_basis, time_dim=0)
         pseudo_inverses = []
         for _, half_stim, _ in half_fits:
@@ -473,6 +482,32 @@ def loro_two_half_ceiling(
 
     if n_usable < len(cv_splits):
         notes.append(f"{len(cv_splits) - n_usable} of {len(cv_splits)} folds could not be split")
+
+    # How much of the design this estimator could actually see. Reproducibility
+    # needs a condition to appear on BOTH sides of the split, so a design whose
+    # conditions repeat only a few times across runs leaves most of them
+    # unmeasurable -- their signal is missing from cov() while the R2 fits them
+    # perfectly well. The ceiling is then a LOWER BOUND and explainable_R2 runs
+    # above 1 by construction, which reads like a model beating the ceiling.
+    # Measured on synthetic 9-run data, median explainable R2 against the
+    # excluded fraction: 0/60 -> 0.96, 18/60 -> 0.92, 30/60 -> 1.05,
+    # 43/60 -> 1.45. This is not fixable by rescaling; it needs an estimator
+    # that uses condition repeats directly (see :func:`beta_space_ceiling`).
+    if n_excluded_by_fold:
+        worst = max(n_excluded_by_fold)
+        n_stim = len(stim_indices)
+        if worst:
+            notes.append(
+                f"up to {worst} of {n_stim} conditions were missing from a training "
+                "half and could not be measured"
+            )
+        if worst >= 0.25 * n_stim:
+            notes.append(
+                f"UNRELIABLE: {worst / n_stim:.0%} of conditions are unmeasurable by the "
+                "two-half split, so this ceiling is a LOWER BOUND and explainable_R2 "
+                "above 1 is expected. Conditions need to repeat across runs on both "
+                "sides of the split; use a repeat-based ceiling instead"
+            )
 
     return CeilingResult(
         ceiling=ceiling.to(data.dtype),

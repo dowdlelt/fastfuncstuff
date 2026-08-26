@@ -674,3 +674,97 @@ def test_ceiling_follows_the_strategy_rather_than_ignoring_it():
     nuis = loro_two_half_ceiling(**shared, zero_event_strategy="nuisance")
 
     assert nuis.ceiling.median() > zero.ceiling.median()
+
+
+def _sparse_repeat_design(reps, n_cond=60, n_runs=9, tp=150, n_vox=200, seed=5):
+    """Each condition appears in ``reps`` of the runs, chosen at random.
+
+    This is what a richly event-coded design looks like -- one condition per
+    distinct prompt, each recurring a handful of times across the session --
+    and it is the case the two-half ceiling cannot measure.
+    """
+    torch.manual_seed(seed)
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+    design = torch.zeros(n_tp, n_cond)
+    gen = torch.Generator().manual_seed(7)
+    for c in range(n_cond):
+        runs = (
+            list(range(n_runs))
+            if reps >= n_runs
+            else torch.randperm(n_runs, generator=gen)[:reps].tolist()
+        )
+        for j, r in enumerate(runs):
+            start = r * tp + 10 + ((c * 7 + j * 13) % (tp - 20))
+            design[start : start + 3, c] = 1.0
+    betas = torch.randn(n_vox, n_cond) * 2.0
+    data = betas @ design.T + torch.randn(n_vox, n_tp) * 2.0
+    return data, design, run_starts, n_cond
+
+
+def test_two_half_ceiling_declares_itself_unreliable_on_sparse_repeats():
+    """A ceiling the design cannot support must say so, not just be wrong.
+
+    The two-half split measures reproducibility by correlating two independent
+    estimates of the same beta, so a condition has to appear on BOTH sides of
+    the split. When most conditions repeat only a few times across runs, most
+    are unmeasurable: their signal is absent from cov() while the R2 fits them
+    perfectly well, so the ceiling is a lower bound and explainable_R2 exceeds 1
+    by construction. Measured here, median explainable R2 tracks the excluded
+    fraction monotonically -- 0/60 excluded gives 0.96, 43/60 gives 1.45 -- so
+    the number alone can never tell a user which regime they are in.
+    """
+    from fastfuncstuff.glm.xval import generate_cv_splits
+    from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+    def notes_for(reps):
+        data, design, run_starts, n_cond = _sparse_repeat_design(reps)
+        result = loro_two_half_ceiling(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=list(range(n_cond)),
+            nuisance_indices=[],
+            cv_splits=generate_cv_splits(len(run_starts), strategy=1),
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+        return result.notes
+
+    sparse = notes_for(3)
+    assert any("UNRELIABLE" in n for n in sparse), sparse
+    assert any("could not be measured" in n for n in sparse), sparse
+
+    # A design every condition spans is measurable, and must not be flagged.
+    assert not any("UNRELIABLE" in n for n in notes_for(9))
+
+
+def test_explainable_r2_tracks_how_much_of_the_design_is_measurable():
+    """Pins the mechanism itself, so a future 'fix' that rescales is caught.
+
+    The bound is exceeded because var(s) is missing conditions, not because of
+    any scaling error -- so the ratio has to fall as more of the design becomes
+    measurable, and reach <= 1 once all of it is.
+    """
+    from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+    from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+    medians = {}
+    for reps in (3, 9):
+        data, design, run_starts, n_cond = _sparse_repeat_design(reps)
+        shared = dict(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=list(range(n_cond)),
+            nuisance_indices=[],
+            cv_splits=generate_cv_splits(len(run_starts), strategy=1),
+            device=torch.device("cpu"),
+        )
+        r2 = compute_xval_r2(**shared, metric="cod", verbose=False)["r2"]
+        ceiling = loro_two_half_ceiling(**shared, verbose=False)
+        explainable = ceiling.explainable_r2(r2)
+        medians[reps] = float(explainable[~explainable.isnan()].median())
+
+    assert medians[3] > 1.2, medians
+    assert medians[9] <= 1.0, medians
