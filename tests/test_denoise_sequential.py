@@ -815,6 +815,109 @@ def test_per_hrf_baseline_r2_with_cpu_resident_data():
     assert np.isfinite(results.xval_r2_per_voxel).any()
 
 
+def test_per_hrf_mode_produces_a_noise_ceiling():
+    """The ceiling must be estimated per HRF group and merged, not skipped.
+
+    A voxel fit against its own HRF's design has its own ceiling -- that is what
+    a per-voxel ceiling is -- and var(y) is design-free, so the groups land on
+    one common scale. This used to print "not yet supported" and write nothing.
+    """
+    from fastfuncstuff.denoise.sequential import fit_denoising_model
+
+    torch.manual_seed(4)
+    device = torch.device("cpu")
+    n_runs, n_tp_run, n_voxels = 6, 60, 400
+    run_starts = [i * n_tp_run for i in range(n_runs)]
+    n_tp = n_runs * n_tp_run
+
+    designs_by_hrf = {}
+    for hrf_idx in (0, 1):
+        design = torch.zeros(n_tp, 2)
+        # Every condition appears in every run, so every fold can split in two.
+        for run in range(n_runs):
+            base = run * n_tp_run + hrf_idx
+            design[base + 2 : base + 30 : 9, 0] = 1.0
+            design[base + 5 : base + 50 : 13, 1] = 1.0
+        designs_by_hrf[hrf_idx] = design
+
+    hrf_indices = torch.zeros(n_voxels, dtype=torch.long)
+    hrf_indices[n_voxels // 2 :] = 1
+
+    data = torch.randn(n_voxels, n_tp) * 0.4
+    betas = torch.randn(n_voxels, 2) * 3.0
+    betas[1::2] = 0.0  # half the brain is a genuine noise pool
+    for hrf_idx in (0, 1):
+        group = hrf_indices == hrf_idx
+        data[group] += betas[group] @ designs_by_hrf[hrf_idx].T
+
+    results = fit_denoising_model(
+        data=data,
+        designs_by_hrf=designs_by_hrf,
+        hrf_indices=hrf_indices,
+        run_starts=run_starts,
+        tr=1.0,
+        max_components=2,
+        compute_noise_ceiling=True,
+        device=device,
+        verbose=False,
+    )
+
+    assert results.noise_ceiling is not None
+    assert results.noise_ceiling.shape == (n_voxels,)
+    # Both groups contributed: no voxel was left unclaimed by the merge.
+    assert not torch.isnan(results.noise_ceiling).all()
+    assert torch.isfinite(results.noise_ceiling[betas.abs().sum(1) > 0]).any()
+    assert results.explainable_r2 is not None
+
+    # The initial R2 is scored with no PCs removed, so it needs its own ceiling;
+    # the optimal one bounds a different denominator.
+    assert results.initial_noise_ceiling is not None
+    assert results.initial_noise_ceiling.shape == (n_voxels,)
+    assert results.initial_explainable_r2 is not None
+
+
+def test_supplied_initial_r2_gets_no_initial_ceiling():
+    """A caller-supplied initial R2 was measured elsewhere; we cannot bound it.
+
+    ffs_hrfop hands over its own xval R2. A ceiling only bounds an R2 with the
+    same denominator, and we have no way to know that one matches, so offering a
+    ceiling for it would be a bound on nothing.
+    """
+    from fastfuncstuff.denoise.sequential import fit_denoising_model
+
+    torch.manual_seed(5)
+    n_runs, n_tp_run, n_voxels = 6, 60, 400
+    run_starts = [i * n_tp_run for i in range(n_runs)]
+    n_tp = n_runs * n_tp_run
+
+    design = torch.zeros(n_tp, 2)
+    for run in range(n_runs):
+        base = run * n_tp_run
+        design[base + 2 : base + 30 : 9, 0] = 1.0
+        design[base + 5 : base + 50 : 13, 1] = 1.0
+
+    data = torch.randn(n_voxels, n_tp) * 0.4
+    betas = torch.randn(n_voxels, 2) * 3.0
+    betas[1::2] = 0.0
+    data += betas @ design.T
+
+    results = fit_denoising_model(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        tr=1.0,
+        max_components=2,
+        initial_r2=torch.rand(n_voxels) * 0.2,  # as if from another tool
+        compute_noise_ceiling=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+
+    assert results.noise_ceiling is not None  # the optimal one is still ours
+    assert results.initial_noise_ceiling is None
+    assert results.initial_explainable_r2 is None
+
+
 # ---------------------------------------------------------------------------
 # Frisch-Waugh-Lovell fast path for cross_validate_noise_pcs
 # ---------------------------------------------------------------------------
@@ -911,13 +1014,19 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100):
                 if n_use > 0:
                     pad[:, pos * k : pos * k + n_use] = pcs[r][:, :n_use]
                 blocks.append(pad)
-            x_full = design_p[tr_tps, :]
+            # A condition with no events in any training run is not estimable
+            # in this fold; it stays in the design everywhere else and predicts
+            # zero here. Identity mask when every condition spans every run.
+            fit_mask = design[tr_tps, :].abs().sum(dim=0) > 1e-10
+            n_fit = int(fit_mask.sum())
+
+            x_full = design_p[tr_tps, :][:, fit_mask]
             if k > 0:
                 x_full = torch.cat([x_full, torch.cat(blocks, dim=0)], dim=1)
 
             pinv = torch.linalg.pinv(x_full.double(), rcond=1e-6)
-            betas = (pinv @ data_p[:, tr_tps].double().T)[: design.shape[1], :]
-            y_pred = design_p[te_tps, :].double() @ betas
+            betas = (pinv @ data_p[:, tr_tps].double().T)[:n_fit, :]
+            y_pred = design_p[te_tps, :][:, fit_mask].double() @ betas
 
             pred[:, te_tps] = y_pred.T
 
@@ -942,6 +1051,79 @@ def test_cross_validate_noise_pcs_matches_explicit_full_model(ragged):
     assert np.abs(fast - reference).max() < 1e-4
 
 
+def test_cross_validate_noise_pcs_drops_conditions_absent_from_training():
+    """A condition confined to one run must be dropped from that run's fold only.
+
+    Under LORO the fold holding out run 0 sees an all-zero column for such a
+    condition, so the Gram matrix is exactly singular. Excluding the column and
+    taking the pseudo-inverse's minimum-norm solution agree here (the zero
+    column zeroes its own row of X'y too), which is why this passed before the
+    fold-plan rewrite as well -- the point of the test is that the two stay
+    agreeing, and that the other conditions' betas are not disturbed by the
+    unfittable one. Nothing covered this case at all previously.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    design = case["design_matrix"].clone()
+    run_len = case["run_starts"][1] - case["run_starts"][0]
+    design[:, 2] = 0.0
+    design[1:run_len:7, 2] = 1.0  # events only in run 0
+    case["design_matrix"] = design
+
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    reference = _explicit_full_model_r2(case, cv_strategy=1)
+
+    assert np.isfinite(fast).all()
+    assert np.abs(fast - reference).max() < 1e-4
+
+
+def test_invert_fold_gram_matches_pseudo_inverse():
+    """The eigh shortcut must equal pinv on the symmetric PSD Gram it is given.
+
+    X'X is symmetric positive semi-definite, so its eigendecomposition is its
+    SVD and the truncated inverse is the pseudo-inverse. Worth pinning: eigh was
+    chosen for speed (CUDA pinv on a fold-sized batch measured 779 ms/call
+    against 27 ms for CPU eigh), and the equivalence is what makes that legal.
+    """
+    from fastfuncstuff.denoise.sequential import _invert_fold_gram
+
+    torch.manual_seed(3)
+    a = torch.randn(5, 24, 60)
+    gram = (a @ a.transpose(1, 2)).double()
+    gram[:, -4:, :] *= 1e-6  # a near-null tail for the rcond cut to bite on
+    gram[:, :, -4:] *= 1e-6
+
+    reference = torch.linalg.pinv(gram, rcond=1e-6).float()
+    assert torch.allclose(_invert_fold_gram(gram), reference, atol=1e-5, rtol=1e-4)
+
+
+def test_cross_validate_noise_pcs_truncates_near_singular_directions():
+    """Near-collinear conditions must be truncated, not inverted.
+
+    Dropping the columns a fold cannot fit removes the *exact* singularity but
+    not the near-singular directions a wide design produces. A plain inverse
+    there is finite and catastrophically wrong -- held-out R2 in the hundreds
+    negative -- so the fold's inverse has to keep the rcond truncation that the
+    reference uses. Caught exactly this while rewriting the fold plan.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    design = case["design_matrix"]
+    run_len = case["run_starts"][1] - case["run_starts"][0]
+    # Column 2 duplicates column 0 to within 1e-7, and column 1 lives in run 0
+    # alone -- ill-conditioning and unfittability in the same design.
+    design[:, 2] = design[:, 0] + 1e-7 * torch.randn(design.shape[0])
+    design[:, 1] = 0.0
+    design[3:run_len:11, 1] = 1.0
+
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    reference = _explicit_full_model_r2(case, cv_strategy=1)
+
+    assert np.abs(fast - reference).max() < 1e-3
+
+
 def test_cross_validate_noise_pcs_chunking_is_invariant():
     """Chunk size must not change results: folds combine per-run totals."""
     from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
@@ -962,3 +1144,110 @@ def test_cross_validate_noise_pcs_non_loro_matches_explicit():
     reference = _explicit_full_model_r2(case, cv_strategy=2, n_perms=6)
 
     assert np.abs(fast - reference).max() < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Output layout: one stack per R2, carrying its own ceiling
+# ---------------------------------------------------------------------------
+
+
+def _minimal_results(with_ceiling: bool, n_voxels: int = 8):
+    """A DenoiseResults carrying only what save_denoising_results reads."""
+    from fastfuncstuff.denoise.sequential import DenoiseResults
+
+    def ramp(offset):
+        return torch.arange(n_voxels, dtype=torch.float32) / n_voxels + offset
+
+    optional = {}
+    if with_ceiling:
+        optional = dict(
+            noise_ceiling=ramp(0.5),
+            explainable_r2=ramp(0.6),
+            initial_noise_ceiling=ramp(0.7),
+            initial_explainable_r2=ramp(0.8),
+        )
+    return DenoiseResults(
+        optimal_n_components=2,
+        xval_r2_by_n_components=np.zeros(3, dtype=np.float32),
+        xval_r2_median_by_n_components=np.zeros(3, dtype=np.float32),
+        xval_r2_per_fold=np.zeros((1, 3), dtype=np.float32),
+        xval_r2_per_voxel=None,
+        xval_r2_optimal=ramp(0.1),
+        xval_r2_optimal_full=ramp(0.2),
+        xval_r2_optimal_per_fold=None,
+        noise_pool_mask=torch.ones(n_voxels, dtype=torch.bool),
+        criteria_mask=torch.ones(n_voxels, dtype=torch.bool),
+        pcselection_mask=None,
+        valid_voxel_mask=torch.ones(n_voxels, dtype=torch.bool),
+        noise_pool_r2=ramp(0.0),
+        noise_pcs_per_run=[],
+        pc_loadings_per_run=None,
+        baseline_r2=0.0,
+        optimal_r2=0.0,
+        improvement=0.0,
+        metadata={},
+        **optional,
+    )
+
+
+def _save_and_read(tmp_path, results):
+    import nibabel as nib
+
+    from fastfuncstuff.cli.denoise import save_denoising_results
+
+    files = save_denoising_results(
+        results=results,
+        output_prefix=str(tmp_path / "out"),
+        volume_shape=(2, 2, 2),
+        affine=np.eye(4),
+        run_starts=[0],
+        tr=1.0,
+        save_pcs_mode="no",
+        save_scree_plot=False,
+        nii_ext=".nii.gz",
+    )
+    return files, {k: nib.load(v) for k, v in files.items() if str(v).endswith(".nii.gz")}
+
+
+def test_r2_outputs_are_one_stack_each_with_their_own_ceiling(tmp_path):
+    """Each R2 ships with the ceiling built at its own PC count, in one file.
+
+    A ceiling only bounds an R2 with the same denominator, and the initial (0 PC)
+    and optimal R2s are scored on differently-projected data. Keeping each pair
+    in one labelled stack makes it impossible to read a map without its ceiling
+    or to pair a map with the wrong one.
+    """
+    files, images = _save_and_read(tmp_path, _minimal_results(with_ceiling=True))
+
+    for key in ("initial_r2", "xval_r2_optimal"):
+        assert images[key].shape == (2, 2, 2, 3), f"{key} should be a 3-volume stack"
+
+    # The separate sibling files these replaced must be gone.
+    for retired in ("xval_r2_optimal_full", "noise_ceiling", "explainable_r2"):
+        assert retired not in files
+
+
+def test_r2_stacks_stay_3d_without_a_ceiling(tmp_path):
+    """-noise_ceiling off must still write a plain R2 map, not a 1-volume stack."""
+    _, images = _save_and_read(tmp_path, _minimal_results(with_ceiling=False))
+
+    assert images["initial_r2"].shape == (2, 2, 2)
+    assert images["xval_r2_optimal"].shape == (2, 2, 2)
+
+
+def test_r2_stack_subbriks_are_in_label_order(tmp_path):
+    """Sub-brik 0 is the R2, 1 the ceiling, 2 the ratio -- pinned by value."""
+    results = _minimal_results(with_ceiling=True)
+    _, images = _save_and_read(tmp_path, results)
+
+    stack = images["xval_r2_optimal"].get_fdata()
+    for index, expected in enumerate(
+        (results.xval_r2_optimal_full, results.noise_ceiling, results.explainable_r2)
+    ):
+        assert np.allclose(stack[..., index].ravel(), expected.numpy(), atol=1e-6)
+
+    initial = images["initial_r2"].get_fdata()
+    for index, expected in enumerate(
+        (results.noise_pool_r2, results.initial_noise_ceiling, results.initial_explainable_r2)
+    ):
+        assert np.allclose(initial[..., index].ravel(), expected.numpy(), atol=1e-6)

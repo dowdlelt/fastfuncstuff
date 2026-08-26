@@ -77,7 +77,7 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import dyn_chunk_estimator
-from fastfuncstuff.utils import get_device, linalg_device
+from fastfuncstuff.utils import factor_device, get_device, linalg_device
 
 
 def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
@@ -141,27 +141,39 @@ def _residualize_design_by_pc_count(
     return out
 
 
-def _solve_task_betas(gram: torch.Tensor, xty: torch.Tensor) -> torch.Tensor:
-    """Solve ``gram @ B = xty`` for every PC count at once.
+def _invert_fold_gram(gram: torch.Tensor, rcond: float = 1e-6) -> torch.Tensor:
+    """Pseudo-inverse of one fold's task Gram matrix, for every PC count at once.
 
-    ``gram`` is (n_pc_counts, n_task, n_task) and ``xty`` is
-    (n_pc_counts, n_task, n_voxels). Promoted to float64 for the solve because
-    that is the numerically sensitive step; the result is cast back for storage.
+    ``gram`` is (n_pc_counts, n_fit, n_fit) and depends only on the fold, so this
+    runs once per fold rather than once per voxel chunk. Returned in float32 so
+    that applying it to the voxel-sized right-hand side is a plain float32 GEMM.
+
+    The truncation is not a fallback, it is the method. Dropping the columns a
+    fold cannot fit removes the *exact* singularity but leaves the near-singular
+    directions a wide design with few events per condition produces once each
+    run's PCs are residualized out; an untruncated inverse turns those into
+    enormous betas and a held-out R2 of minus several hundred. On a
+    well-conditioned design nothing is truncated and this is the exact inverse.
+
+    Two deliberate choices, both measured on an RTX 5070 Ti at (21, 141, 141):
+
+    * ``eigh`` rather than ``pinv``. X'X is symmetric positive semi-definite, so
+      its eigendecomposition *is* its SVD (agreement 3e-15) at a fraction of the
+      cost -- 779 ms -> 79 ms on CUDA, 47 ms -> 27 ms on CPU.
+    * factored on :func:`~fastfuncstuff.utils.factor_device`, i.e. the CPU when
+      the data is on CUDA. CUDA float64 pinv was 779 ms/call against 27 ms for
+      CPU eigh -- 98% of this function's entire runtime. See that function for
+      the measurements and for when the rule does not hold.
     """
-    use_f64 = gram.device.type != "mps"  # MPS has no float64
-    solve_dtype = torch.float64 if use_f64 else torch.float32
-    gram_s = gram.to(solve_dtype)
-    xty_s = xty.to(solve_dtype)
-    try:
-        betas = torch.linalg.solve(gram_s, xty_s)
-        if not torch.isfinite(betas).all():
-            raise RuntimeError("non-finite betas")
-    except (torch._C._LinAlgError, RuntimeError):  # ty: ignore[unresolved-attribute]
-        # Rank-deficient design (e.g. a condition absent from the training runs):
-        # the pseudo-inverse gives the minimum-norm solution, matching what the
-        # explicit pinv over the full regressor block used to do.
-        betas = torch.linalg.pinv(gram_s, rcond=1e-6) @ xty_s
-    return betas.to(xty.dtype)
+    gram_f64 = gram.to(device=factor_device(gram.device), dtype=torch.float64)
+    eigvals, eigvecs = torch.linalg.eigh(gram_f64)
+    # rcond is relative to the largest singular value, which for a PSD matrix is
+    # the largest eigenvalue. Round-off can push a null direction slightly
+    # negative; ">" drops those along with the truly small ones.
+    cutoff = rcond * eigvals.abs().amax(dim=-1, keepdim=True)
+    inv_eigvals = torch.where(eigvals > cutoff, eigvals.reciprocal(), torch.zeros_like(eigvals))
+    inv = (eigvecs * inv_eigvals.unsqueeze(-2)) @ eigvecs.transpose(-2, -1)
+    return inv.to(device=gram.device, dtype=torch.float32)
 
 
 def _compute_local_run_starts(
@@ -254,11 +266,12 @@ class DenoiseResults:
     xval_r2_median_by_n_components: np.ndarray
     xval_r2_per_fold: np.ndarray
     xval_r2_per_voxel: np.ndarray | None  # Per-voxel R² when pcR2cutoff used
-    xval_r2_optimal: torch.Tensor | None  # Per-voxel xval R² at optimal PC count
-    xval_r2_optimal_full: torch.Tensor | None  # Per-voxel xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_per_fold: np.ndarray | None  # Per-fold xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_full: torch.Tensor | None  # Per-voxel xval R² at optimal PCs (all voxels)
-    xval_r2_optimal_per_fold: np.ndarray | None  # Per-fold xval R² at optimal PCs (all voxels)
+    xval_r2_optimal: torch.Tensor | None  # Per-voxel xval R² at optimal PC count, raw
+    # Same map with |R²| > 1 and invalid voxels zeroed. Every voxel is scored in
+    # one pass now, so this is no longer "all voxels" against a criteria-only
+    # sibling — the two differ only where the cleaning bit.
+    xval_r2_optimal_full: torch.Tensor | None
+    xval_r2_optimal_per_fold: np.ndarray | None  # None: folds are concatenated, not scored apart
     noise_pool_mask: torch.Tensor
     criteria_mask: torch.Tensor
     pcselection_mask: torch.Tensor | None  # Voxels used for PC selection (if pcR2cutoff)
@@ -272,6 +285,11 @@ class DenoiseResults:
     metadata: dict
     noise_ceiling: torch.Tensor | None = None  # Per-voxel R2 ceiling at optimal PCs
     explainable_r2: torch.Tensor | None = None  # xval_r2_optimal / noise_ceiling
+    # The same pair for the initial (0 PC) R2. Separate because the two R2s are
+    # scored on differently-projected data and a ceiling only bounds an R2 with
+    # its own denominator. None when the initial R2 came from the caller.
+    initial_noise_ceiling: torch.Tensor | None = None
+    initial_explainable_r2: torch.Tensor | None = None
     noise_ceiling_notes: list[str] = field(default_factory=list)
 
 
@@ -1235,6 +1253,7 @@ def cross_validate_noise_pcs(
     hrf_indices: torch.Tensor | None = None,
     progress_desc: str = "Denoising CV",
     progress_leave: bool = True,
+    announce_missing: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Cross-validate noise PC denoising for ALL voxels.
@@ -1286,6 +1305,10 @@ def cross_validate_noise_pcs(
         Voxel chunk size for memory management
     device : torch.device, optional
         Device for computation
+    announce_missing : bool, default=False
+        Print how many conditions each fold must drop because they are absent
+        from its training runs. Lets the per-HRF caller, which runs the groups
+        with ``verbose=False``, still report the fact once.
 
     Returns
     -------
@@ -1565,6 +1588,69 @@ def cross_validate_noise_pcs(
     gram_total = torch.stack(gram_by_run, dim=0).sum(dim=0)
     design_proj_by_run = [xt[0] for xt in xtilde_by_run]  # k=0 is nuisance-only
 
+    # =========================================================================
+    # Per-fold plans: everything a fold needs that has no voxel axis
+    # =========================================================================
+    # A condition whose events all fall inside the held-out run has an all-zero
+    # column in the training runs, so its beta is not estimable in that fold.
+    # It still earns its place in the folds that *do* see it, where it absorbs
+    # its own variance and keeps the repeated conditions' betas clean -- so the
+    # column stays in the design and is dropped only from the folds that cannot
+    # fit it, predicting zero for it there. Same policy as
+    # ``glm/xval.py:_plan_fold_designs`` under ``zero_event_strategy="zero"``,
+    # which is what the baseline R2 stage of this pipeline already applies.
+    #
+    # The Gram matrix, the drop mask and the inverse are functions of the fold
+    # alone. Building them here rather than inside the chunk loop is what keeps
+    # a wide design affordable: with 153 conditions the old placement redid a
+    # float64 factorization of a (n_pc_counts, 153, 153) batch for every voxel
+    # chunk of every fold.
+    col_present_by_run = torch.stack(
+        [
+            design_matrix_cpu[start_tp:end_tp, :].abs().sum(dim=0) > 1e-10
+            for start_tp, end_tp in run_slices
+        ]
+    )  # (n_runs, n_task)
+
+    fold_plans: list[dict] = []
+    n_dropped_by_fold: list[int] = []
+    for train_runs, test_runs in cv_splits:
+        fit_mask = col_present_by_run[train_runs].any(dim=0)
+        n_fit = int(fit_mask.sum().item())
+        if n_fit == 0:
+            raise ValueError(
+                f"No task condition is present in training runs {train_runs}; "
+                "every column is empty, so this fold cannot be fit."
+            )
+        n_dropped_by_fold.append(n_task_regs - n_fit)
+
+        gram_train = gram_total.clone()
+        for r in test_runs:
+            gram_train -= gram_by_run[r]
+        gram_fit = gram_train[:, fit_mask, :][:, :, fit_mask]
+
+        fold_plans.append(
+            {
+                "test_runs": test_runs,
+                # None when every condition is fittable, so the common case
+                # skips a chunk-sized gather of the right-hand side.
+                "fit_mask": None if n_fit == n_task_regs else fit_mask,
+                "gram_inv": _invert_fold_gram(gram_fit),
+                # Held-out prediction uses the task design with nuisance removed
+                # but PCs left in, per PC count only through the betas.
+                "design_test_fit": {
+                    r: design_proj_by_run[r][:, fit_mask].contiguous() for r in test_runs
+                },
+            }
+        )
+
+    if (verbose or announce_missing) and max(n_dropped_by_fold) > 0:
+        print(
+            f"  Conditions absent from a fold's training runs: "
+            f"{min(n_dropped_by_fold)}-{max(n_dropped_by_fold)} of {n_task_regs} "
+            f"(dropped from that fold's fit, predicted as zero)"
+        )
+
     accum_dev = linalg_device(device)
     # MPS has no float64; reduce in float32 there and promote on the accumulator.
     reduce_dtype = torch.float32 if accum_dev.type == "mps" else torch.float64
@@ -1634,27 +1720,30 @@ def cross_validate_noise_pcs(
         # ------------------------------------------------------------------
         # Fold loop: only the held-out runs are touched
         # ------------------------------------------------------------------
-        for _train_runs, test_runs in cv_splits:
+        for plan in fold_plans:
+            test_runs = plan["test_runs"]
+            fit_mask = plan["fit_mask"]
             test_data = {r: _load_run(chunk_data_cpu, r) for r in test_runs}
 
             xty_train = xty_total.clone()
-            gram_train = gram_total.clone()
             for r in test_runs:
                 xty_train -= torch.matmul(xtilde_by_run[r].transpose(1, 2), test_data[r].T)
-                gram_train -= gram_by_run[r]
 
-            # Solve all PC counts at once: (K+1, n_task, n_task) \ (K+1, n_task, chunk).
-            # The PC block never enters here — FWL folded it into X̃ — so this is a
-            # n_task-sized solve instead of a pinv over (n_task + n_runs*n_pcs).
-            betas = _solve_task_betas(gram_train, xty_train)
+            # Apply the fold's pre-built inverse: a float32 batched GEMM over
+            # (K+1, n_fit, n_fit) @ (K+1, n_fit, chunk). The PC block never
+            # enters here — FWL folded it into X̃ — so this stays n_task-sized
+            # rather than a pinv over (n_task + n_runs*n_pcs). Only the fold's
+            # fittable columns take part; the rest predict zero.
+            xty_fit = xty_train if fit_mask is None else xty_train[:, fit_mask, :]
+            betas_fit = torch.matmul(plan["gram_inv"], xty_fit)
 
             for r in test_runs:
                 y_test = test_data[r]
                 start_tp, end_tp = run_slices[r]
-                design_test = design_proj_by_run[r]  # (run_len, n_task)
+                design_test = plan["design_test_fit"][r]  # (run_len, n_fit)
                 for n_pcs in range(max_components + 1):
-                    # (run_len, n_task) @ (n_task, chunk) -> (run_len, chunk)
-                    y_pred = (design_test @ betas[n_pcs]).T
+                    # (run_len, n_fit) @ (n_fit, chunk) -> (run_len, chunk)
+                    y_pred = (design_test @ betas_fit[n_pcs]).T
                     if is_loro:
                         resid = y_test - y_pred
                         ss_res_by_pc[n_pcs] += (
@@ -1663,7 +1752,7 @@ def cross_validate_noise_pcs(
                     else:
                         pred_by_pc_chunk[n_pcs][:, start_tp:end_tp] = y_pred.cpu()
                 del y_test
-            del test_data, xty_train, gram_train, betas
+            del test_data, xty_train, xty_fit, betas_fit
 
         # ------------------------------------------------------------------
         # Compute R² for this chunk
@@ -2251,6 +2340,12 @@ def fit_denoising_model(
         print(f"{'=' * 70}")
 
     # Per-HRF mode: Compute initial R² for each HRF group to build unified noise pool
+    # A caller-supplied initial R2 (ffs_hrfop hands one over) was measured by
+    # another tool, in units we cannot vouch for. A ceiling is only a bound on an
+    # R2 with the same denominator, so the initial ceiling is only offered for an
+    # R2 this function measured itself.
+    initial_r2_is_ours = initial_r2 is None
+
     if per_hrf_mode and initial_r2 is None:
         # per_hrf_mode implies designs_by_hrf/hrf_indices were both required (see guard above).
         assert designs_by_hrf is not None and hrf_indices is not None
@@ -2739,6 +2834,9 @@ def fit_denoising_model(
                 verbose=False,  # Suppress per-group verbosity
                 progress_desc=f"    HRF {hrf_idx} ({n_voxels_group:,} vox)",
                 progress_leave=False,
+                # The zero-column pattern is a property of the timing, not of
+                # the HRF, so one group's report covers all of them.
+                announce_missing=bool(verbose and hrf_idx == unique_hrf_indices[0]),
             )
 
             # Scatter results back to full array
@@ -2885,37 +2983,56 @@ def fit_denoising_model(
     # undenoised data would be a bound on a different quantity.
     noise_ceiling: torch.Tensor | None = None
     explainable_r2: torch.Tensor | None = None
+    initial_noise_ceiling: torch.Tensor | None = None
+    initial_explainable_r2: torch.Tensor | None = None
     noise_ceiling_notes: list[str] = []
-    if compute_noise_ceiling and design_matrix is not None:
-        from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+    if compute_noise_ceiling and (design_matrix is not None or designs_by_hrf is not None):
+        from fastfuncstuff.stats.noise_ceiling import loro_ceiling_by_voxel_group
 
         if verbose:
             print(f"\nNoise ceiling at {optimal_n_components} PCs:")
 
-        ceiling_nuisance = _nuisance_with_pcs(
-            nuisance, noise_pcs, run_starts, optimal_n_components, data.shape[1]
-        )
-        projected_data, projected_design = project_out_nuisance_per_run(
-            data=data,
-            design=design_matrix,
-            nuisance_per_run=ceiling_nuisance,
-            run_starts=run_starts,
-            device=data.device,
-        )
-        ceiling_result = loro_two_half_ceiling(
-            data=projected_data,
-            design_matrix=projected_design,
-            run_starts=run_starts,
-            stim_indices=list(range(projected_design.shape[1])),
-            nuisance_indices=[],  # already projected, per run
-            cv_splits=generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms),
-            device=device,
-            verbose=False,
-        )
-        del projected_data, projected_design
-        if device is not None and device.type == "cuda":
-            torch.cuda.empty_cache()
+        ceiling_splits = generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms)
 
+        def _ceiling_at(n_pcs: int, label: str):
+            return loro_ceiling_by_voxel_group(
+                data=data,
+                nuisance_per_run=_nuisance_with_pcs(
+                    nuisance, noise_pcs, run_starts, n_pcs, data.shape[1]
+                ),
+                run_starts=run_starts,
+                cv_splits=ceiling_splits,
+                design_matrix=design_matrix,
+                designs_by_hrf=designs_by_hrf,
+                hrf_indices=hrf_indices,
+                device=device,
+                progress_desc=f"  {label} ceiling by HRF",
+                show_progress=verbose,
+            )
+
+        # The initial R2 is scored on data with no PCs removed, the optimal R2 on
+        # data with `optimal_n_components` removed. Those are different
+        # denominators, so each needs a ceiling built at its own PC count -- one
+        # ceiling cannot bound both.
+        if initial_r2_is_ours and initial_r2 is not None:
+            initial_ceiling_result = _ceiling_at(0, "Initial")
+            initial_noise_ceiling = initial_ceiling_result.ceiling.cpu()
+            if initial_ceiling_result.n_usable > 0:
+                initial_explainable_r2 = initial_ceiling_result.explainable_r2(
+                    initial_r2.detach().cpu()
+                )
+            if verbose:
+                print(
+                    f"  Initial ({0} PCs): "
+                    f"{initial_ceiling_result.summarize(initial_explainable_r2)}"
+                )
+        elif verbose:
+            print(
+                "  No initial ceiling: initial R2 was supplied by the caller, so its "
+                "denominator is not ours to bound."
+            )
+
+        ceiling_result = _ceiling_at(optimal_n_components, "Optimal")
         noise_ceiling = ceiling_result.ceiling.cpu()
         noise_ceiling_notes = ceiling_result.notes
         if xval_r2_optimal_full is not None and ceiling_result.n_usable > 0:
@@ -3027,6 +3144,8 @@ def fit_denoising_model(
         xval_r2_optimal_per_fold=xval_r2_optimal_per_fold,
         noise_ceiling=noise_ceiling,
         explainable_r2=explainable_r2,
+        initial_noise_ceiling=initial_noise_ceiling,
+        initial_explainable_r2=initial_explainable_r2,
         noise_ceiling_notes=noise_ceiling_notes,
         pcselection_mask=pcselection_mask,
         noise_pool_mask=noise_pool_mask,
