@@ -101,6 +101,135 @@ class CeilingResult:
         return "; ".join(parts)
 
 
+def loro_ceiling_by_voxel_group(
+    *,
+    data: torch.Tensor,
+    nuisance_per_run: list[torch.Tensor],
+    run_starts: list[int],
+    cv_splits: list[tuple[list[int], list[int]]],
+    design_matrix: torch.Tensor | None = None,
+    designs_by_hrf: dict | None = None,
+    hrf_indices: torch.Tensor | None = None,
+    device: torch.device | None = None,
+    progress_desc: str = "  Ceiling by HRF",
+    show_progress: bool = False,
+) -> CeilingResult:
+    """A timeseries ceiling for one design, or for a per-voxel-HRF set of designs.
+
+    Wraps the three steps every caller needs in the same order: project the
+    nuisance (the *selected noise PCs included*, so the ceiling's denominator is
+    the denoised variance the R2 was actually scored against), estimate the
+    ceiling on the shared folds, and -- in per-HRF mode -- do that per group and
+    merge. Getting the PC block into ``nuisance_per_run`` is the caller's job and
+    the easiest thing to get wrong: a ceiling built on undenoised data bounds a
+    different quantity than the R2 it is meant to qualify.
+
+    Pass either ``design_matrix`` or ``designs_by_hrf`` + ``hrf_indices``.
+    """
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+
+    def _one(subset_data: torch.Tensor, subset_design: torch.Tensor) -> CeilingResult:
+        projected_data, projected_design = project_out_nuisance_per_run(
+            data=subset_data,
+            design=subset_design,
+            nuisance_per_run=nuisance_per_run,
+            run_starts=run_starts,
+            device=subset_data.device,
+        )
+        result = loro_two_half_ceiling(
+            data=projected_data,
+            design_matrix=projected_design,
+            run_starts=run_starts,
+            stim_indices=list(range(projected_design.shape[1])),
+            nuisance_indices=[],  # already projected, per run
+            cv_splits=cv_splits,
+            device=device,
+            verbose=False,
+        )
+        del projected_data, projected_design
+        if device is not None and device.type == "cuda":
+            torch.cuda.empty_cache()
+        return result
+
+    if designs_by_hrf is None:
+        if design_matrix is None:
+            raise ValueError("pass either design_matrix or designs_by_hrf")
+        return _one(data, design_matrix)
+
+    if hrf_indices is None:
+        raise ValueError("designs_by_hrf requires hrf_indices")
+
+    # Each voxel is scored against its own HRF's design, so its ceiling has to
+    # come from that design too. The groups partition the voxels and var(y) is
+    # design-free, so the maps merge onto one scale; only the design-side
+    # factorisations repeat, not the passes over the brain.
+    from tqdm import tqdm
+
+    groups: list[tuple[torch.Tensor, CeilingResult]] = []
+    group_iter = tqdm(
+        torch.unique(hrf_indices).tolist(),
+        desc=progress_desc,
+        unit="group",
+        leave=True,
+        disable=not show_progress or len(designs_by_hrf) < 2,
+    )
+    for hrf_idx in group_iter:
+        voxel_mask = hrf_indices == hrf_idx
+        groups.append((voxel_mask, _one(data[voxel_mask, :], designs_by_hrf[hrf_idx])))
+    return merge_voxel_group_ceilings(groups, n_voxels=data.shape[0])
+
+
+def merge_voxel_group_ceilings(
+    groups: list[tuple[torch.Tensor, CeilingResult]],
+    n_voxels: int,
+) -> CeilingResult:
+    """Combine ceilings estimated separately per voxel group into one map.
+
+    Per-voxel HRF modes fit each group of voxels against its own design, so the
+    ceiling has to be estimated per group as well -- a voxel with its own HRF
+    has its own design and therefore its own ceiling, which is what a per-voxel
+    ceiling *is*. The groups partition the voxels and ``var(y)`` is design-free,
+    so the maps stay on one common scale and simply scatter into place.
+
+    The bookkeeping does not scatter. ``n_usable`` counts folds that could be
+    split into two halves, which is a property of the design: a group whose
+    conditions vanish from a training half loses folds the other groups kept.
+    Taking any single group's count would hide that, so the merged count is the
+    **minimum** over groups -- the guarantee that actually holds brain-wide --
+    and a note records the spread when they disagree.
+
+    ``groups`` is a list of ``(voxel_mask, result)``; masks must be disjoint and
+    boolean over ``n_voxels``.
+    """
+    if not groups:
+        raise ValueError("merge_voxel_group_ceilings needs at least one group")
+
+    template = groups[0][1].ceiling
+    ceiling = torch.full((n_voxels,), torch.nan, dtype=template.dtype, device=template.device)
+    for mask, result in groups:
+        ceiling[mask.to(ceiling.device)] = result.ceiling.to(ceiling.device, ceiling.dtype)
+
+    usable = [result.n_usable for _, result in groups]
+    notes: list[str] = []
+    for _, result in groups:
+        for note in result.notes:
+            if note not in notes:
+                notes.append(note)
+    if min(usable) != max(usable):
+        notes.append(
+            f"folds usable for the ceiling varied across voxel groups "
+            f"({min(usable)}-{max(usable)}); the reported count is the minimum"
+        )
+
+    methods = {result.method for _, result in groups}
+    return CeilingResult(
+        ceiling=ceiling,
+        method=methods.pop() if len(methods) == 1 else "mixed",
+        n_usable=min(usable),
+        notes=notes,
+    )
+
+
 def _centered_cov_and_ss(
     first: torch.Tensor, second: torch.Tensor, actual: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

@@ -12,9 +12,12 @@ import torch
 
 from fastfuncstuff.simulation.noise import generate_ar1_noise
 from fastfuncstuff.stats.noise_ceiling import (
+    CeilingResult,
     df_corrected_ceiling,
+    loro_ceiling_by_voxel_group,
     loro_two_half_ceiling,
     mean_train_repeats,
+    merge_voxel_group_ceilings,
     ncsnr,
     ncsnr_noise_ceiling,
     zscore_betas_by_run,
@@ -33,6 +36,184 @@ def _condition_design(n_runs: int, run_length: int, n_conditions: int, seed: int
             onset = run * run_length + slot * (run_length // n_conditions)
             design[onset : onset + 6, condition] = 1.0
     return design, run_starts, n_timepoints
+
+
+class TestLoroCeilingByVoxelGroup:
+    """The shared entry point ffs_denoise and ffs_denoisatorial both call."""
+
+    @staticmethod
+    def _case(seed=7, n_runs=6, run_length=40, n_voxels=60):
+        design, run_starts, n_timepoints = _condition_design(n_runs, run_length, 3, seed=seed)
+        generator = np.random.default_rng(seed)
+        design_t = torch.from_numpy(design)
+        betas = torch.from_numpy(generator.normal(size=(n_voxels, 3)).astype(np.float32))
+        data = betas @ design_t.T
+        data = data + torch.from_numpy(
+            generator.normal(scale=0.5, size=data.shape).astype(np.float32)
+        )
+        nuisance = [torch.ones(run_length, 1) for _ in range(n_runs)]
+        splits = [([r for r in range(n_runs) if r != t], [t]) for t in range(n_runs)]
+        return data, design_t, run_starts, nuisance, splits
+
+    def test_single_design_matches_calling_loro_directly(self):
+        """The wrapper must not change the answer, only the plumbing."""
+        from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+
+        data, design, run_starts, nuisance, splits = self._case()
+
+        wrapped = loro_ceiling_by_voxel_group(
+            data=data,
+            nuisance_per_run=nuisance,
+            run_starts=run_starts,
+            cv_splits=splits,
+            design_matrix=design,
+            device=torch.device("cpu"),
+        )
+        projected_data, projected_design = project_out_nuisance_per_run(
+            data=data,
+            design=design,
+            nuisance_per_run=nuisance,
+            run_starts=run_starts,
+            device=torch.device("cpu"),
+        )
+        direct = loro_two_half_ceiling(
+            data=projected_data,
+            design_matrix=projected_design,
+            run_starts=run_starts,
+            stim_indices=list(range(projected_design.shape[1])),
+            nuisance_indices=[],
+            cv_splits=splits,
+            device=torch.device("cpu"),
+            verbose=False,
+        )
+        assert torch.allclose(wrapped.ceiling, direct.ceiling, equal_nan=True, atol=1e-5)
+
+    def test_identical_per_hrf_designs_reproduce_the_single_design_answer(self):
+        """Splitting voxels into groups that share a design must change nothing.
+
+        The groups partition the voxels and var(y) is design-free, so a two-group
+        run with the same design in both is the control that proves the merge
+        does not distort the scale.
+        """
+        data, design, run_starts, nuisance, splits = self._case()
+        hrf_indices = torch.zeros(data.shape[0], dtype=torch.long)
+        hrf_indices[data.shape[0] // 2 :] = 1
+
+        single = loro_ceiling_by_voxel_group(
+            data=data,
+            nuisance_per_run=nuisance,
+            run_starts=run_starts,
+            cv_splits=splits,
+            design_matrix=design,
+            device=torch.device("cpu"),
+        )
+        grouped = loro_ceiling_by_voxel_group(
+            data=data,
+            nuisance_per_run=nuisance,
+            run_starts=run_starts,
+            cv_splits=splits,
+            designs_by_hrf={0: design, 1: design.clone()},
+            hrf_indices=hrf_indices,
+            device=torch.device("cpu"),
+        )
+        assert torch.allclose(single.ceiling, grouped.ceiling, equal_nan=True, atol=1e-5)
+
+    def test_a_pc_block_in_the_nuisance_changes_the_ceiling(self):
+        """The PC block must reach the ceiling's denominator, not be ignored.
+
+        The optimized R2 is scored on data with the selected PCs removed. If the
+        ceiling were built without them it would bound a different quantity, and
+        the ratio would be quietly wrong rather than obviously broken.
+        """
+        data, design, run_starts, nuisance, splits = self._case()
+        generator = np.random.default_rng(99)
+        pcs = [
+            torch.from_numpy(generator.normal(size=(40, 2)).astype(np.float32)) for _ in run_starts
+        ]
+        for run, start in enumerate(run_starts):
+            loadings = torch.from_numpy(
+                generator.normal(size=(data.shape[0], 2)).astype(np.float32)
+            )
+            data[:, start : start + 40] += loadings @ pcs[run].T
+
+        without = loro_ceiling_by_voxel_group(
+            data=data,
+            nuisance_per_run=nuisance,
+            run_starts=run_starts,
+            cv_splits=splits,
+            design_matrix=design,
+            device=torch.device("cpu"),
+        )
+        with_pcs = loro_ceiling_by_voxel_group(
+            data=data,
+            nuisance_per_run=[torch.cat([n, p], dim=1) for n, p in zip(nuisance, pcs, strict=True)],
+            run_starts=run_starts,
+            cv_splits=splits,
+            design_matrix=design,
+            device=torch.device("cpu"),
+        )
+        assert not torch.allclose(without.ceiling, with_pcs.ceiling, equal_nan=True, atol=1e-3)
+
+
+class TestMergeVoxelGroupCeilings:
+    """Per-voxel-HRF modes estimate a ceiling per group; merging must not lose facts."""
+
+    def test_maps_scatter_into_their_own_voxels(self):
+        groups = [
+            (
+                torch.tensor([True, False, True, False]),
+                CeilingResult(torch.tensor([0.1, 0.3]), "loro_two_half", 4),
+            ),
+            (
+                torch.tensor([False, True, False, True]),
+                CeilingResult(torch.tensor([0.2, 0.4]), "loro_two_half", 4),
+            ),
+        ]
+        merged = merge_voxel_group_ceilings(groups, n_voxels=4)
+        assert torch.allclose(merged.ceiling, torch.tensor([0.1, 0.2, 0.3, 0.4]))
+        assert merged.n_usable == 4
+        assert merged.method == "loro_two_half"
+
+    def test_fold_count_is_the_minimum_not_the_last_group(self):
+        """A group that lost folds must not be papered over by one that did not.
+
+        n_usable is a property of the design, so a group whose conditions vanish
+        from a training half loses folds the others kept. Reporting any single
+        group's count -- the last one, as a naive loop would -- would claim a
+        guarantee that does not hold brain-wide.
+        """
+        groups = [
+            (torch.tensor([True, False]), CeilingResult(torch.tensor([0.1]), "loro_two_half", 2)),
+            (torch.tensor([False, True]), CeilingResult(torch.tensor([0.2]), "loro_two_half", 5)),
+        ]
+        merged = merge_voxel_group_ceilings(groups, n_voxels=2)
+        assert merged.n_usable == 2
+        assert any("varied across voxel groups" in note for note in merged.notes)
+
+    def test_notes_union_without_duplicates(self):
+        shared = "3 of 9 folds could not be split"
+        groups = [
+            (
+                torch.tensor([True, False]),
+                CeilingResult(torch.tensor([0.1]), "loro_two_half", 4, [shared]),
+            ),
+            (
+                torch.tensor([False, True]),
+                CeilingResult(torch.tensor([0.2]), "loro_two_half", 4, [shared, "other"]),
+            ),
+        ]
+        merged = merge_voxel_group_ceilings(groups, n_voxels=2)
+        assert merged.notes == [shared, "other"]
+
+    def test_voxels_no_group_claims_stay_nan(self):
+        groups = [
+            (
+                torch.tensor([True, False, False]),
+                CeilingResult(torch.tensor([0.1]), "loro_two_half", 4),
+            )
+        ]
+        merged = merge_voxel_group_ceilings(groups, n_voxels=3)
+        assert torch.isnan(merged.ceiling[1:]).all()
 
 
 class TestLoroTwoHalfCeiling:

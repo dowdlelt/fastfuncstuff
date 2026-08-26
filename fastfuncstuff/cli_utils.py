@@ -930,6 +930,63 @@ def save_volume_nifti(
     save_nifti(data_3d, output_path=filename, affine=affine, header=header)
 
 
+def save_r2_ceiling_stack(
+    layers: Sequence[tuple[torch.Tensor | np.ndarray | None, str]],
+    filename: str,
+    volume_shape: tuple,
+    affine: np.ndarray,
+    mask_flat: np.ndarray | None = None,
+    header: object | None = None,
+) -> str:
+    """Save an R2 map together with the ceiling that interprets it, as one stack.
+
+    A held-out R2 of 0.08 means nothing on its own -- it is excellent where the
+    reproducible signal tops out at 0.09 and poor where the ceiling is 0.4 -- so
+    the ceiling and the ``explainable_R2`` ratio belong in the same file as the
+    map they qualify, as labelled sub-briks. Loose sibling files invite two
+    mistakes this prevents: reading an R2 without its ceiling, and dividing one
+    R2 by another R2's ceiling. The second is the dangerous one, because the
+    result looks perfectly plausible.
+
+    ``layers`` is ordered ``[(r2, label), (ceiling, ...), (explainable, ...)]``;
+    entries whose map is ``None`` are dropped, so a run without a ceiling writes
+    a plain 3-D map rather than a one-volume stack. **The caller is responsible
+    for passing the R2 the ceiling was actually built from** -- for several tools
+    that is not the map with the most obvious filename.
+
+    Used by ffs_denoise, ffs_ridge, ffs_hrfopt, ffs_reml and ffs_denoisatorial so
+    the family's outputs can be read the same way and compared to each other.
+    """
+    from fastfuncstuff.io.afni import save_nifti
+
+    volumes: list[np.ndarray] = []
+    labels: list[str] = []
+    for values, label in layers:
+        if values is None:
+            continue
+        flat = values.detach().cpu().numpy() if torch.is_tensor(values) else np.asarray(values)
+        flat = flat.astype(np.float32, copy=False)
+        if mask_flat is not None:
+            full = np.zeros(mask_flat.size, dtype=np.float32)
+            full[mask_flat] = flat
+            flat = full
+        volumes.append(flat.reshape(volume_shape))
+        labels.append(label)
+
+    if not volumes:
+        raise ValueError("save_r2_ceiling_stack needs at least one non-None map")
+
+    stacked = np.stack(volumes, axis=-1) if len(volumes) > 1 else volumes[0]
+    save_nifti(
+        stacked,
+        output_path=filename,
+        affine=affine,
+        header=header,
+        brick_labels=labels if len(labels) > 1 else None,
+    )
+    return filename
+
+
 def save_4d_nifti(
     data_flat: torch.Tensor | np.ndarray,
     filename: str,
