@@ -3088,6 +3088,9 @@ def fit_denoising_model(
                 designs_by_hrf=designs_by_hrf,
                 hrf_indices=hrf_indices,
                 device=device,
+                # The ceiling's denominator must be the SS_tot the R2 was
+                # divided by, so it follows the same missing-event policy.
+                zero_event_strategy=zero_event_strategy,
                 progress_desc=f"  {label} ceiling by HRF",
                 show_progress=verbose,
             )
@@ -3108,6 +3111,11 @@ def fit_denoising_model(
                     f"  Initial ({0} PCs): "
                     f"{initial_ceiling_result.summarize(initial_explainable_r2)}"
                 )
+                # These were being dropped. The "N conditions were missing from a
+                # training half" note is the one that explains an explainable-R2
+                # map above 1, so losing it costs the user the diagnosis.
+                for note in initial_ceiling_result.notes:
+                    print(f"  NOTE: {note}")
         elif verbose:
             print(
                 "  No initial ceiling: initial R2 was supplied by the caller, so its "

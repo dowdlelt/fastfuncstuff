@@ -581,3 +581,96 @@ class TestCeilingUnderColouredNoise:
 
         assert result.n_usable == n_runs
         assert result.ceiling.median().item() == pytest.approx(expected, abs=0.02)
+
+
+def _run_confined_design(n_confined, n_shared=4, n_runs=9, tp=120, n_vox=200, seed=3):
+    """Many conditions living in exactly one run each -- the case that breaks the ratio.
+
+    A rich event-coded design (one condition per distinct prompt, say) across
+    several runs produces exactly this: most conditions appear in one run only,
+    so every LORO fold has conditions it cannot fit.
+    """
+    torch.manual_seed(seed)
+    n_cond = n_shared + n_confined
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+
+    design = torch.zeros(n_tp, n_cond)
+    for c in range(n_shared):  # present in every run
+        for r in range(n_runs):
+            design[r * tp + 3 + 4 * c : r * tp + 3 + 4 * c + 3, c] = 1.0
+    for c in range(n_confined):  # one run each
+        r = c % n_runs
+        start = r * tp + 40 + 2 * (c // n_runs) * 3 + 3 * (c % 7)
+        design[start : start + 3, n_shared + c] = 1.0
+
+    betas = torch.randn(n_vox, n_cond) * 2.0
+    data = betas @ design.T + torch.randn(n_vox, n_tp) * 2.0
+    return data, design, run_starts, n_cond
+
+
+@pytest.mark.parametrize("strategy", ["zero", "nuisance"])
+def test_ceiling_bounds_the_r2_it_is_built_against(strategy):
+    """explainable_R2 divides two numbers that must share a denominator.
+
+    Bug of record: -zero_event nuisance scores the R2 only on the subspace a
+    fold could predict, shrinking its SS_tot, while the ceiling kept dividing by
+    the full held-out variance. The ratio then ran well above 1 -- reported from
+    a real 9-run run as values of 8 and 25 -- which reads as "the model beat the
+    ceiling" when it actually means the two were never on the same scale.
+
+    A ceiling is an upper bound, so the ratio must sit at or below 1 for all but
+    a noise-sized minority of voxels, under either policy.
+    """
+    from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
+    from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+    data, design, run_starts, n_cond = _run_confined_design(n_confined=90)
+    device = torch.device("cpu")
+    splits = generate_cv_splits(len(run_starts), strategy=1)
+    shared = dict(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        stim_indices=list(range(n_cond)),
+        nuisance_indices=[],
+        cv_splits=splits,
+        device=device,
+    )
+
+    r2 = compute_xval_r2(**shared, metric="cod", zero_event_strategy=strategy, verbose=False)["r2"]
+    ceiling = loro_two_half_ceiling(**shared, zero_event_strategy=strategy, verbose=False)
+
+    explainable = ceiling.explainable_r2(r2)
+    defined = explainable[~explainable.isnan()]
+    assert defined.numel() > 50, "need enough defined voxels for this to mean anything"
+    assert defined.median() <= 1.0, f"median explainable R2 = {defined.median():.3f}"
+    # A bound that is exceeded by a fifth of the brain is not a bound.
+    assert (defined > 1.05).float().mean() < 0.1
+
+
+def test_ceiling_follows_the_strategy_rather_than_ignoring_it():
+    """The ceiling must actually move when the policy changes.
+
+    Guards the fix from being satisfied by a ceiling that quietly ignores the
+    argument: under 'nuisance' the held-out variance loses the unpredictable
+    conditions' span, so the ceiling on what remains is strictly higher.
+    """
+    from fastfuncstuff.glm.xval import generate_cv_splits
+    from fastfuncstuff.stats.noise_ceiling import loro_two_half_ceiling
+
+    data, design, run_starts, n_cond = _run_confined_design(n_confined=90)
+    shared = dict(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        stim_indices=list(range(n_cond)),
+        nuisance_indices=[],
+        cv_splits=generate_cv_splits(len(run_starts), strategy=1),
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    zero = loro_two_half_ceiling(**shared, zero_event_strategy="zero")
+    nuis = loro_two_half_ceiling(**shared, zero_event_strategy="nuisance")
+
+    assert nuis.ceiling.median() > zero.ceiling.median()

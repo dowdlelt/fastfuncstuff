@@ -111,6 +111,7 @@ def loro_ceiling_by_voxel_group(
     designs_by_hrf: dict | None = None,
     hrf_indices: torch.Tensor | None = None,
     device: torch.device | None = None,
+    zero_event_strategy: str = "zero",
     progress_desc: str = "  Ceiling by HRF",
     show_progress: bool = False,
 ) -> CeilingResult:
@@ -124,7 +125,9 @@ def loro_ceiling_by_voxel_group(
     the easiest thing to get wrong: a ceiling built on undenoised data bounds a
     different quantity than the R2 it is meant to qualify.
 
-    Pass either ``design_matrix`` or ``designs_by_hrf`` + ``hrf_indices``.
+    Pass either ``design_matrix`` or ``designs_by_hrf`` + ``hrf_indices``, and
+    the same ``zero_event_strategy`` the R2 was scored with -- see
+    :func:`loro_two_half_ceiling` for why a mismatch there is not a bound.
     """
     from fastfuncstuff.glm.xval import project_out_nuisance_per_run
 
@@ -144,6 +147,7 @@ def loro_ceiling_by_voxel_group(
             nuisance_indices=[],  # already projected, per run
             cv_splits=cv_splits,
             device=device,
+            zero_event_strategy=zero_event_strategy,
             verbose=False,
         )
         del projected_data, projected_design
@@ -260,6 +264,7 @@ def loro_two_half_ceiling(
     device: torch.device | None = None,
     batch_size: int | None = None,
     min_runs_per_half: int = 1,
+    zero_event_strategy: str = "zero",
     verbose: bool = True,
 ) -> CeilingResult:
     """Timeseries R2 ceiling from two independent predictions of held-out data.
@@ -275,9 +280,13 @@ def loro_two_half_ceiling(
 
     ``var(y)`` is the held-out data's variance -- the same denominator
     :func:`compute_xval_r2` divides by -- so the result is directly comparable
-    to the R2 it is meant to bound. **Pass the same ``cv_splits`` and the same
-    (equally preprocessed) ``data``**; a ceiling built on different folds or
-    differently projected data is not a bound on anything.
+    to the R2 it is meant to bound. **Pass the same ``cv_splits``, the same
+    (equally preprocessed) ``data``, and the same ``zero_event_strategy``**; a
+    ceiling built on different folds, differently projected data, or a different
+    missing-event policy is not a bound on anything. Under ``'nuisance'`` the R2
+    is scored only on the subspace its fold could predict, so the ceiling must
+    drop the same subspace or the ratio divides two incommensurate numbers --
+    which shows up as an explainable-R2 map running far above 1.
 
     Runs alternate between halves rather than splitting contiguously, so slow
     session drift that survived nuisance projection is shared by both halves
@@ -336,6 +345,24 @@ def loro_two_half_ceiling(
         )
         test_stim = test_design_clean[:, stim_indices]
 
+        # The conditions this fold's TRAINING RUNS cannot supply a beta for.
+        # compute_xval_r2 under 'nuisance' removes their span from the held-out
+        # data and from the design predicting it; the ceiling has to do the same
+        # or var(y) here is not the SS_tot the R2 was divided by.
+        unpred_basis = None
+        if zero_event_strategy == "nuisance":
+            from fastfuncstuff.glm.xval import _unpredictable_basis
+
+            train_tps: list[int] = []
+            for run_idx in train_runs:
+                start = run_starts[run_idx]
+                train_tps.extend(range(start, start + run_lengths[run_idx]))
+            train_stim = design_matrix[train_tps, :][:, stim_indices]
+            test_only = (train_stim.abs().sum(dim=0) <= 1e-10) & (
+                test_stim.abs().sum(dim=0) > 1e-10
+            )
+            unpred_basis = _unpredictable_basis(test_stim, test_only)
+
         half_fits = []
         usable_half = True
         for half in (half_a, half_b):
@@ -377,6 +404,10 @@ def loro_two_half_ceiling(
             )
 
         test_stim_shared = test_stim[:, present]
+        if unpred_basis is not None:
+            from fastfuncstuff.glm.xval import _project_out_basis
+
+            test_stim_shared = _project_out_basis(test_stim_shared, unpred_basis, time_dim=0)
         pseudo_inverses = []
         for _, half_stim, _ in half_fits:
             shared = half_stim[:, present]
@@ -402,6 +433,8 @@ def loro_two_half_ceiling(
             test_data = data[batch][:, test_tps].to(device)
             if q_test is not None:
                 test_data = test_data - (test_data @ q_test) @ q_test.T
+            if unpred_basis is not None:
+                test_data = _project_out_basis(test_data, unpred_basis, time_dim=1)
 
             pred_a, pred_b = predictions
             ab, a_sum, b_sum, actual = _centered_cov_and_ss(pred_a, pred_b, test_data)
