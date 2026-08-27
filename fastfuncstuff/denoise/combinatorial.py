@@ -70,7 +70,13 @@ class CombinatorialDenoiseRunResult:
 
     run_idx: int
     optimal_combination: tuple[int, ...]  # Selected PC indices
-    optimal_cod: float  # Median CoD at optimal
+    # Median CoD of the SELECTED set. In singleton mode that set is never one of
+    # the scored candidates (only singletons and the baseline are), so it is
+    # scored once more on its own rather than reported as some other combo's
+    # value -- which is what the old `median_cod[best_idx]` did, with best_idx
+    # pinned to 0, i.e. the empty set.
+    optimal_cod: float
+    baseline_cod: float  # Median CoD with no PCs removed; optimal_cod - this is the gain
     all_cod: np.ndarray  # (2^k,) CoD per combo
     all_var_explained: np.ndarray  # (2^k,) variance per combo
     all_combinations: list[tuple[int, ...]]  # All 2^k subsets
@@ -1419,13 +1425,24 @@ def fit_combinatorial_denoising(
                             positive_pcs.append(combo[0])
                             var_exp_positive += var_explained[i]
                 best_combo = tuple(positive_pcs)
-            best_idx = 0  # Not meaningful in singleton mode
+            # The chosen singletons are applied TOGETHER, and that joint set was
+            # never among the scored candidates. One extra scoring call (a single
+            # combination) buys a number that means what the summary says it does.
+            if best_combo:
+                selected_cod, _ = _score(pcs, [tuple(best_combo)], variance_ratios)
+                combo_cod = float(selected_cod[0])
+            else:
+                combo_cod = float(baseline_cod)
+            best_idx = 0  # combinations[0] is the empty set: the baseline
         else:
             best_idx, best_combo = select_optimal_combination(
                 median_cod,
                 combinations,
                 strategy=selection_strategy,
             )
+
+        if not singleton_only:
+            combo_cod = float(median_cod[best_idx])
 
         if verbose:
             # 0-indexed, matching optimal_pcs.json, the saved PC columns and the
@@ -1435,6 +1452,7 @@ def fit_combinatorial_denoising(
             if singleton_only:
                 print(f"  Selected PCs: {best_combo_display}")
                 print(f"  Baseline CoD: {median_cod[0]:.4f}")
+                print(f"  Selected CoD: {combo_cod:.4f} ({combo_cod - median_cod[0]:+.4f})")
                 if len(best_combo) > 0:
                     print(f"  Variance explained: {var_exp_positive * 100:.1f}%")
             else:
@@ -1448,7 +1466,8 @@ def fit_combinatorial_denoising(
             CombinatorialDenoiseRunResult(
                 run_idx=held_out_idx,
                 optimal_combination=best_combo,
-                optimal_cod=float(median_cod[best_idx]),
+                optimal_cod=combo_cod,
+                baseline_cod=float(median_cod[0]),
                 all_cod=median_cod,
                 all_var_explained=var_explained,
                 all_combinations=combinations,
@@ -1473,8 +1492,12 @@ def fit_combinatorial_denoising(
         print("  Combinatorial Denoising Summary")
         print(f"{'=' * 60}")
         for res in per_run_results:
-            combo_display = tuple(pc + 1 for pc in res.optimal_combination)
-            line = f"  Run {res.run_idx}: PCs {combo_display} (CoD={res.optimal_cod:.4f})"
+            combo_display = tuple(res.optimal_combination)
+            gain = res.optimal_cod - res.baseline_cod
+            line = (
+                f"  Run {res.run_idx}: PCs {combo_display} "
+                f"(CoD={res.optimal_cod:.4f}, {gain:+.4f} vs baseline)"
+            )
             if res.pc_status is not None:
                 n_rej = sum(s == "rejected_null" for s in res.pc_status)
                 line += f", {n_rej} rejected by null"

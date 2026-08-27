@@ -725,6 +725,7 @@ def save_combinatorial_results(
             "run_idx": run_idx,
             "optimal_combination": list(run_res.optimal_combination),
             "optimal_cod": float(run_res.optimal_cod),
+            "baseline_cod": float(run_res.baseline_cod),
             "n_criteria_voxels": run_res.n_criteria_voxels,
             "explained_variance_ratios": run_res.explained_variance_ratios.tolist(),
         }
@@ -800,6 +801,9 @@ def save_combinatorial_results(
         },
         "per_run_optimal_cod": {
             f"run{r.run_idx:02d}": float(r.optimal_cod) for r in results.per_run_results
+        },
+        "per_run_baseline_cod": {
+            f"run{r.run_idx:02d}": float(r.baseline_cod) for r in results.per_run_results
         },
         "condition_labels": condition_labels,
         "volume_shape": list(volume_shape),
@@ -2063,7 +2067,8 @@ def main():
     for run_res in results.per_run_results:
         print(
             f"    Run {run_res.run_idx}: PCs {run_res.optimal_combination} "
-            f"(CoD={run_res.optimal_cod:.4f})"
+            f"(CoD={run_res.optimal_cod:.4f}, "
+            f"{run_res.optimal_cod - run_res.baseline_cod:+.4f} vs baseline)"
         )
     print()
     print(f"  Outputs: {len(output_files)} files saved with prefix '{args.prefix}'")

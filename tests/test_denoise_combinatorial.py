@@ -209,6 +209,7 @@ def _make_run_results(n_runs, run_len, max_pcs=3, combos=None):
                 run_idx=r,
                 optimal_combination=(0,) if r % 2 == 0 else (0, 1),
                 optimal_cod=0.1 + r * 0.05,
+                baseline_cod=0.1,
                 all_cod=rng.random(len(combos)),
                 all_var_explained=np.array([sum(0.1 / (i + 1) for i in combo) for combo in combos]),
                 all_combinations=combos,
@@ -286,6 +287,7 @@ class TestComputeOptimizedXvalR2:
                     run_idx=r,
                     optimal_combination=(),
                     optimal_cod=0.0,
+                    baseline_cod=0.0,
                     all_cod=np.zeros(len(combos)),
                     all_var_explained=np.zeros(len(combos)),
                     all_combinations=combos,
@@ -1030,3 +1032,75 @@ def test_evaluate_all_combinations_q_based_matches_legacy(
 
     assert np.abs(fast_cod - legacy_cod).max() < 1e-4
     assert np.allclose(fast_var, legacy_var)
+
+
+class TestSingletonReportedCoD:
+    """The reported CoD must be the selected set's, not some other combination's.
+
+    Bug of record: singleton mode pinned `best_idx = 0` and then reported
+    `median_cod[best_idx]`, which is combination 0 -- the EMPTY set. Every run's
+    summary line showed the no-PC baseline while appearing to show what the
+    selection achieved, so six runs all reported ~0.114 whatever they picked, and
+    a run whose global improvement was -0.0002 looked like it had gained 0.11.
+    """
+
+    def _fit(self, **kwargs):
+        import torch
+
+        from fastfuncstuff.denoise.combinatorial import fit_combinatorial_denoising
+
+        torch.manual_seed(0)
+        n_runs, run_len, n_vox = 3, 60, 120
+        run_starts = [r * run_len for r in range(n_runs)]
+        total = n_runs * run_len
+
+        design = torch.zeros(total, 1)
+        for r in range(n_runs):
+            design[r * run_len : r * run_len + 30, 0] = 1.0
+        design -= design.mean(dim=0, keepdim=True)
+
+        data = torch.randn(n_vox, total) + design[:, 0].unsqueeze(0) * 2.0
+        nuisance = [torch.ones(run_len, 1) for _ in range(n_runs)]
+        noise_pool = torch.zeros(n_vox, dtype=torch.bool)
+        noise_pool[n_vox // 2 :] = True
+        initial_r2 = torch.full((n_vox,), 0.1)
+
+        return fit_combinatorial_denoising(
+            data=data,
+            design=design,
+            run_starts=run_starts,
+            tr=2.0,
+            nuisance_per_run=nuisance,
+            noise_pool_mask=noise_pool,
+            initial_r2=initial_r2,
+            max_pcs=3,
+            criteria_r2_threshold=0.0,
+            device=torch.device("cpu"),
+            verbose=False,
+            **kwargs,
+        )
+
+    def test_singleton_cod_is_not_the_baseline(self):
+        results = self._fit(singleton_only=True)
+
+        for run in results.per_run_results:
+            assert run.baseline_cod == run.all_cod[0], "combination 0 is the empty set"
+            if run.optimal_combination:
+                # The old code made this equality hold for every run by construction.
+                assert run.optimal_cod != run.baseline_cod
+
+    def test_empty_selection_reports_the_baseline(self):
+        """With nothing selected there is no set to score, so baseline IS the answer."""
+        results = self._fit(singleton_only=True)
+
+        for run in results.per_run_results:
+            if not run.optimal_combination:
+                assert run.optimal_cod == run.baseline_cod
+
+    def test_combination_mode_still_reports_its_winner(self):
+        results = self._fit(singleton_only=False)
+
+        for run in results.per_run_results:
+            idx = run.all_combinations.index(tuple(run.optimal_combination))
+            assert run.optimal_cod == run.all_cod[idx]
+            assert run.baseline_cod == run.all_cod[0]
