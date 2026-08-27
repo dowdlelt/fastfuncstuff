@@ -3053,11 +3053,13 @@ def fit_denoising_model(
         # If improvement is negligible, prefer no denoising PCs.
         if max_improvement < min_improvement:
             optimal_n_components = 0
-            if verbose:
-                print(
-                    f"  Max improvement {max_improvement:.4g} < min gain {min_improvement:.4g} "
-                    f"({gain_source}; curve roughness {curve_noise:.4g}); selecting 0 PCs"
-                )
+            # Unconditional, like the curve description above it: -verb defaults
+            # to 0, so gating this on verbose left "the curve peaks at 17" and
+            # "Optimal PCs: 0" on screen with nothing between them to explain it.
+            print(
+                f"  Max improvement {max_improvement:.4g} < min gain {min_improvement:.4g} "
+                f"({gain_source}; curve roughness {curve_noise:.4g}); selecting 0 PCs"
+            )
         else:
             # Find first PC count that achieves threshold * max_improvement
             # Start from 0 PCs and stop when we're within threshold of max
@@ -3073,15 +3075,14 @@ def fit_denoising_model(
                     if best_so_far >= threshold:
                         break
 
-        if verbose and pcstop != 1.0:
+        if pcstop != 1.0:
             argmax_n = int(np.argmax(r2_by_n_components))
             if optimal_n_components != argmax_n and optimal_n_components != 0:
                 print(
                     f"  Early stopping: {optimal_n_components} PCs (within {(pcstop - 1) * 100:.0f}% of max at {argmax_n} PCs)"
                 )
 
-    if verbose:
-        print(f"  → Selected {optimal_n_components} PCs")
+    print(f"  → Selected {optimal_n_components} PCs")
 
     baseline_r2 = float(r2_by_n_components[0])
     optimal_r2 = float(r2_by_n_components[optimal_n_components])
