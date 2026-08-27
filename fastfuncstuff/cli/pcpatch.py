@@ -14,7 +14,7 @@ import time
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.pcpatch import PCPatchConfig, run_pcpatch
 
@@ -38,7 +38,7 @@ def _parse_ncomps(token: str) -> tuple[str, float]:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_pcpatch",
         description="[FAILED EXPERIMENT — DO NOT USE] Patch-based residual-PC projection. "
         "The premise fails: NORDIC's residual is the near-full-rank thermal-noise floor, so "

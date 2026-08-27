@@ -38,11 +38,10 @@ Individual modulation (IM):
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg
 from fastfuncstuff.design.builder import (
     build_design_matrix,
@@ -60,7 +59,7 @@ except ImportError:
 
 def parse_args():
     """Parse command-line arguments"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="Build fMRI design matrix with simplified syntax",
         formatter_class=FfsHelpFormatter,
         epilog=__doc__,

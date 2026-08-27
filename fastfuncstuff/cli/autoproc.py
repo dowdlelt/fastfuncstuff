@@ -22,7 +22,7 @@ from fastfuncstuff.autoproc.bids import BoldRun, find_events, pair_undetermined,
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
@@ -70,7 +70,7 @@ def _device_spec(value: str) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_autoproc",
         description="Generate a readable, resumable ffs preprocessing script from a BIDS dataset.",
         epilog=config.recipe_help(),
@@ -296,33 +296,41 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="nonlinear cross-session refinement",
     )
-    g.add_argument(
-        "-nl_backend",
-        "-nl-backend",
-        default=None,
-        metavar="NAME",
-        help="Engine for every nonlinear cross-run/fmap/session refinement "
-        f"(default: {config.DEFAULT_NL_BACKEND}). One of: "
-        + ", ".join(config.nl_backends())
-        + ". These are the same backends ffs_tunewarp measures, under the same "
-        "names, so a tuning run's conclusion names the thing you set here. The "
-        "settings themselves are separate: pass them with -xrun_nl_opts and its "
-        "siblings, whose defaults follow the backend you pick.",
+    suggest(
+        g.add_argument(
+            "-nl_backend",
+            "-nl-backend",
+            default=None,
+            metavar="NAME",
+            help="Engine for every nonlinear cross-run/fmap/session refinement "
+            f"(default: {config.DEFAULT_NL_BACKEND}). One of: "
+            + ", ".join(config.nl_backends())
+            + ". These are the same backends ffs_tunewarp measures, under the same "
+            "names, so a tuning run's conclusion names the thing you set here. The "
+            "settings themselves are separate: pass them with -xrun_nl_opts and its "
+            "siblings, whose defaults follow the backend you pick.",
+        ),
+        # The live list, not a copy: a new backend shows up at the shell the day
+        # it is registered.
+        config.nl_backends(),
     )
     for _stage, _what in (
         ("xrun", "cross-run"),
         ("xfmap", "cross-fmap-group"),
         ("xses", "cross-session"),
     ):
-        g.add_argument(
-            f"-{_stage}_nl_backend",
-            f"-{_stage}-nl-backend",
-            default=None,
-            metavar="NAME",
-            help=f"engine for the {_what} nonlinear step only, overriding "
-            "-nl_backend. The stages are different problems -- cross-run is a "
-            "small residual between two images of one head minutes apart, "
-            "cross-session can be a different day and a different shim.",
+        suggest(
+            g.add_argument(
+                f"-{_stage}_nl_backend",
+                f"-{_stage}-nl-backend",
+                default=None,
+                metavar="NAME",
+                help=f"engine for the {_what} nonlinear step only, overriding "
+                "-nl_backend. The stages are different problems -- cross-run is a "
+                "small residual between two images of one head minutes apart, "
+                "cross-session can be a different day and a different shim.",
+            ),
+            config.nl_backends(),
         )
     for _stage, _what in (
         ("xrun", "cross-run"),

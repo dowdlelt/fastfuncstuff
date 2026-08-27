@@ -21,11 +21,14 @@ Conventions used below:
   MPS cannot perform. Whole-brain `ffs_pyrf` can benefit from MPS, while `ffs_ica`
   generally remains faster on the Mac CPU.
 - `-prefix` (or `-output`) is the output path; many tools write multiple files derived from this prefix.
-- Every flag accepts both spellings — `-hrf-library` and `-hrf_library` — and some carry an
-  older or shorter name as well (`-max_pcs` for `-max_comps`, `-pe` for `-pe_dir`). `-help`
-  lists the alternative names beside the flag; shell completion offers only the primary one,
-  so the TAB list has one entry per flag rather than one per spelling. Typing an alias still
-  works, and still completes its values.
+- Every flag accepts both spellings — `-hrf-library` and `-hrf_library` — without exception;
+  the parser derives the second one, so there is nothing to remember when adding a flag. Some
+  flags carry an older or shorter name as well (`-max_pcs` for `-max_comps`, `-pe` for
+  `-pe_dir`). `-help` lists the alternative names beside the flag; shell completion offers
+  only the primary one, so the TAB list has one entry per flag rather than one per spelling.
+  Typing an alias still works, and still completes its values.
+- Flags can be abbreviated as long as the prefix names one flag: `-drop_f` is `-drop_first`,
+  while `-dro` is ambiguous between `-drop_first` and `-drop_last` and says so.
 
 ## Shell completion
 

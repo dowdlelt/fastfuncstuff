@@ -25,7 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_ortvec_arguments
 from fastfuncstuff.design.bids_events import check_events_pairing
 from fastfuncstuff.design.builder import (
@@ -49,7 +49,7 @@ from fastfuncstuff.design.spec import (
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_design_spec",
         description=__doc__,
         formatter_class=FfsHelpFormatter,

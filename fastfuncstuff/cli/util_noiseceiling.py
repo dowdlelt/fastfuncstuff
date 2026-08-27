@@ -47,7 +47,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_verbose_arg,
@@ -66,7 +66,7 @@ from fastfuncstuff.stats.reliability import split_half_noise_ceiling
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_util_noiseceiling",
         description="Standalone per-voxel noise ceilings from repeated runs or single-trial betas",
         formatter_class=FfsHelpFormatter,

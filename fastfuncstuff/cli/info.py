@@ -19,7 +19,7 @@ import argparse
 import os
 import sys
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.io.dsetinfo import (
     _XFORM_NAMES,
     DatasetInfo,
@@ -287,7 +287,7 @@ def _visualize(info: DatasetInfo, args) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_info",
         description=(
             "Report dataset header information (a 3dinfo replacement that reads "

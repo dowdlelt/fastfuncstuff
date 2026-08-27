@@ -10,7 +10,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, parse_prefix, spinner
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.processing.complex import (
@@ -23,7 +23,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_util_complex",
         description=__doc__,
         formatter_class=FfsHelpFormatter,

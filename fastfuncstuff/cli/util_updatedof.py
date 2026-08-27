@@ -43,7 +43,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.stats.dof_adjust import (
     combine_dof_adjustments,
     resolve_dof_adjust_arg,
@@ -53,7 +53,7 @@ from fastfuncstuff.stats.dof_adjust import (
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_util_updatedof",
         description=__doc__,
         formatter_class=FfsHelpFormatter,

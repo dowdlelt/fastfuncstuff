@@ -45,7 +45,7 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.cli.bbr import _normalize_targets, _ribbon_wm
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain
 from fastfuncstuff.processing.bbr import (
@@ -70,7 +70,7 @@ _AXIS = {"x": 0, "y": 1, "z": 2}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_rbr",
         description=(
             "Recursive Boundary Registration — nonlinear boundary-based distortion\n"

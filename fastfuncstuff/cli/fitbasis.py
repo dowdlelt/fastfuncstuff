@@ -76,7 +76,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -281,7 +281,7 @@ NOTES
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_fitbasis",
         usage=_USAGE,
         description=_DESCRIPTION,

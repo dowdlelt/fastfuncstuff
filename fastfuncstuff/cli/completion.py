@@ -22,7 +22,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.completion import RENDERERS, describe, load_parser
 
 
@@ -78,7 +78,7 @@ def _warn_if_wrong_interpreter(names: list[str]) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_completion",
         description="Generate static bash/fish/zsh completions for the ffs_* tools.",
         formatter_class=FfsHelpFormatter,

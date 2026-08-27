@@ -52,7 +52,11 @@ from datetime import datetime
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
+
+# What -pe_dir accepts. Offered rather than enforced (choices=) because the
+# parser is deliberately lenient about how a direction is written.
+PE_DIRECTION_WORDS = ("i", "j", "k", "i-", "j-", "k-", "x", "y", "z", "x-", "y-", "z-")
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -73,7 +77,7 @@ def _int_list(s: str) -> list[int]:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_blipflip",
         description="Blip-up/blip-down susceptibility distortion correction "
         "(FSL topup-style field model; independent GPU reimplementation).",
@@ -91,13 +95,16 @@ def create_parser() -> argparse.ArgumentParser:
         help="General N-image form: two or more EPIs. Needs matching -pe_dir/-readout "
         "lists (one entry each, or one shared value).",
     )
-    inp.add_argument(
-        "-pe_dir",
-        "-pe-dir",
-        nargs="+",
-        metavar="DIR",
-        help="Phase-encode direction of the blip_up (or of each -imain image): one of "
-        "i/j/k (or x/y/z) with optional trailing '-'. The blip_down is the opposite.",
+    suggest(
+        inp.add_argument(
+            "-pe_dir",
+            "-pe-dir",
+            nargs="+",
+            metavar="DIR",
+            help="Phase-encode direction of the blip_up (or of each -imain image): one of "
+            "i/j/k (or x/y/z) with optional trailing '-'. The blip_down is the opposite.",
+        ),
+        PE_DIRECTION_WORDS,
     )
     inp.add_argument(
         "-readout",

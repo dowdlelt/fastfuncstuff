@@ -56,12 +56,12 @@ from datetime import datetime
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_util_b0fmap",
         description="B0 dual-echo GRE fieldmap -> off-resonance field -> EPI "
         "undistortion warp (SPM FieldMap-style chain; ROMEO does the unwrapping).",

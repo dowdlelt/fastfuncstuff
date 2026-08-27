@@ -46,7 +46,6 @@ For help:
 
 from __future__ import annotations
 
-import argparse
 import sys
 import time
 from datetime import datetime
@@ -56,7 +55,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401 — availability check
@@ -111,7 +110,7 @@ except ImportError as e:
 
 def parse_args():
     """Parse command-line arguments"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="Fast fMRI deconvolution with FIR/TENT models",
         formatter_class=FfsHelpFormatter,
     )

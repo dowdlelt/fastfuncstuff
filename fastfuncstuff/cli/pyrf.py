@@ -35,7 +35,7 @@ import matplotlib.image as mpimg
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_load_threads_arg,
@@ -342,7 +342,7 @@ def _hrf_select_spec(value: str) -> str:
 
 def create_parser() -> argparse.ArgumentParser:
     """Create the ffs_pyrf command-line parser."""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description=(
             "ffs_pyrf - GPU compressive-spatial-summation (CSS) population receptive "
             "field mapping. A pyre for receptive fields."

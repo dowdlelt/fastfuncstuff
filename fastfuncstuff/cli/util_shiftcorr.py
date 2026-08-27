@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.locomoco import resolve_pe_axis
@@ -82,7 +82,7 @@ examples
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_util_shiftcorr",
         description="Estimate and correct the TE-dependent partition-axis shift of "
         "multi-echo 3-D EPI/GRE, by whole-volume inter-echo cross-correlation and a "

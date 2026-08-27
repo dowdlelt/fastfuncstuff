@@ -42,7 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.bbr import (
@@ -101,7 +101,7 @@ def _ribbon_wm(lh, rh, device):
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_bbr",
         description=(
             "Boundary-Based Registration (BBR) refinement of an EPI→anat affine.\n"

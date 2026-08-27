@@ -17,7 +17,7 @@ import time
 
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -42,7 +42,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32
 def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_nwarp",
         description="GPU-accelerated multi-warp composition and application",
         epilog="""Composition order:

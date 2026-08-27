@@ -39,7 +39,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
@@ -259,7 +259,7 @@ TOO SLOW
 def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_optiwarp",
         description="GPU optical-flow (demons / Lucas-Kanade / Horn-Schunck) "
         "nonlinear registration.",

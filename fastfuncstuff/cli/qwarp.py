@@ -30,7 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
@@ -172,7 +172,7 @@ which level introduced the damage, then cut there with -maxlev (or -early_stop).
 def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="qwarp",
         description=(
             "GPU-accelerated nonlinear image registration (PyTorch port of AFNI 3dQwarp).\n"

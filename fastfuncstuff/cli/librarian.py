@@ -52,7 +52,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -112,7 +112,7 @@ def create_parser() -> argparse.ArgumentParser:
     (``-input``, ``-hrf-library``…) to match the rest of the
     ``ffs_*`` family.  Flag values use kebab-case where applicable.
     """
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_librarian",
         description=(
             "Build a custom HRF library from your own data (NSD-style "

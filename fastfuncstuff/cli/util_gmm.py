@@ -34,7 +34,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     parse_prefix,
@@ -49,7 +49,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         formatter_class=FfsHelpFormatter,
         prog="ffs_util_gmm",
         description="MELODIC-style Gaussian/Gamma mixture modelling of a statistic "

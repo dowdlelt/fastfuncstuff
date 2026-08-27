@@ -25,6 +25,15 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# Re-exported: cli_help is the torch-free home for these, but cli_utils was the
+# original import site for the formatter and is the natural one for suggest().
+from fastfuncstuff.cli_help import (  # noqa: F401
+    FfsArgumentParser,
+    FfsHelpFormatter,
+    ScannableHelpFormatter,
+    canonical_option_strings,
+    suggest,
+)
 from fastfuncstuff.design.trim import TrimSpec, TrimTimingReport, shift_onsets_for_trim
 from fastfuncstuff.utils import suppress_io_progress
 
@@ -2339,12 +2348,17 @@ def add_device_arg(
     names it. Pair with :func:`setup_device`, never with ``torch.device(...)``
     directly — bare torch rejects every comma form.
     """
-    parser_or_group.add_argument(
-        "-device",
-        default=default,
-        metavar="SPEC",
-        help="Compute device: auto, cpu, cuda, mps. Append ',N' to pin a CUDA "
-        "device (cuda,0) or cap CPU threads (cpu,8)." + (f" {extra}" if extra else ""),
+    suggest(
+        parser_or_group.add_argument(
+            "-device",
+            default=default,
+            metavar="SPEC",
+            help="Compute device: auto, cpu, cuda, mps. Append ',N' to pin a CUDA "
+            "device (cuda,0) or cap CPU threads (cpu,8)." + (f" {extra}" if extra else ""),
+        ),
+        # Not choices=: the comma forms are open-ended, which is exactly the
+        # case suggest() exists for.
+        ("auto", "cpu", "cuda", "mps"),
     )
 
 

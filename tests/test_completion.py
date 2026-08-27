@@ -14,6 +14,7 @@ import subprocess
 
 import pytest
 
+from fastfuncstuff.cli_help import suggest
 from fastfuncstuff.completion import (
     OptionSpec,
     _completion_kind,
@@ -300,3 +301,33 @@ def test_generated_zsh_loads_and_completes(tmp_path):
     proc = subprocess.run(["zsh", "-f", "-c", script], text=True, capture_output=True)
     assert proc.returncode == 0, proc.stderr
     assert "OK" in proc.stdout
+
+
+def test_hinted_values_are_offered():
+    """suggest() covers the flags choices= is too strict for."""
+    parser = argparse.ArgumentParser()
+    action = parser.add_argument("-work_dxyz", metavar="auto|off|MM", default="auto")
+    suggest(action, ("auto", "off"))
+    spec = next(s for s in describe(parser) if "-work_dxyz" in s.option_strings)
+    assert spec.completes == "choices"
+    assert spec.choices == ["auto", "off"]
+
+
+def test_a_hint_outranks_the_metavar_guess():
+    """The author's hint beats every heuristic, including type= and metavar."""
+    parser = argparse.ArgumentParser()
+    suggest(parser.add_argument("-polort", type=int, metavar="N"), (0, 3))
+    spec = next(s for s in describe(parser) if "-polort" in s.option_strings)
+    assert spec.completes == "choices"  # not "none", which type=int would give
+    assert spec.choices == ["0", "3"]
+
+
+def test_device_still_completes_for_hand_rolled_flags():
+    """32 tools register -device themselves instead of via add_device_arg.
+
+    The dest fallback is what keeps those completing until they are migrated.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-device", default="auto", help="cuda | cpu | mps")
+    spec = next(s for s in describe(parser) if "-device" in s.option_strings)
+    assert spec.completes == "device"

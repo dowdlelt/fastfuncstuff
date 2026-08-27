@@ -238,13 +238,15 @@ def _completion_kind(action: argparse.Action) -> str:
     free-form flag, give it ``type=`` or a metavar -- both are worth having in
     ``-help`` anyway.
     """
-    if action.choices:
+    if action.choices or getattr(action, "ffs_suggest", None):
+        # An explicit hint (cli_help.suggest) outranks every guess below: the
+        # author has said what the values are, whatever the metavar looks like.
         return "choices"
 
-    dest = (action.dest or "").lower()
-    if dest == "device":
-        # Every tool takes -device through the same parser; the spec forms
-        # (cuda,0 / cpu,8) are documented in cli_utils.parse_device_arg.
+    if (action.dest or "").lower() == "device":
+        # 32 tools still register -device by hand instead of going through
+        # cli_utils.add_device_arg, which is where the hint lives. Until those
+        # are migrated, match on the dest so they keep completing.
         return "device"
 
     # A numeric flag never wants a filename, whatever its metavar says
@@ -305,7 +307,7 @@ def describe(parser: argparse.ArgumentParser) -> list[OptionSpec]:
         spec = OptionSpec(
             option_strings=list(action.option_strings),
             help=help_text,
-            choices=[str(c) for c in (action.choices or [])],
+            choices=[str(c) for c in (action.choices or getattr(action, "ffs_suggest", []))],
             takes_value=bool(takes_value),
             completes=_completion_kind(action) if takes_value else "none",
         )

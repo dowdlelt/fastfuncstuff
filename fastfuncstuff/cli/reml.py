@@ -27,7 +27,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401 — availability check
@@ -230,7 +230,7 @@ def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: l
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="ffs_reml - Fast GPU-accelerated ARMA(1,1) GLM fitting",
         formatter_class=FfsHelpFormatter,
         epilog="""

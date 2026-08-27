@@ -31,7 +31,7 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     collect_batch_jobs,
@@ -71,7 +71,7 @@ _REDUCTIONS = {
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_util_3dmath",
         description=__doc__,
         formatter_class=FfsHelpFormatter,

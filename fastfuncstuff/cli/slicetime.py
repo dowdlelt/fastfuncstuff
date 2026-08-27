@@ -14,7 +14,7 @@ import json
 import time
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.io.afni import get_tr_from_file
 from fastfuncstuff.processing.io import load_image, save_image
@@ -88,7 +88,7 @@ def _resolve_tr(
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         formatter_class=FfsHelpFormatter,
         prog="ffs_slicetime",
         description="Slice-timing correction for 4D fMRI (GPU, 3dTshift-compatible)",

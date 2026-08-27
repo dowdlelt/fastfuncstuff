@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
@@ -164,7 +164,7 @@ def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="allineate",
         description="GPU-accelerated affine/rigid alignment (inspired by 3dAllineate)",
         epilog="""Speed/quality presets:
@@ -504,17 +504,21 @@ Examples:
     search_group.add_argument(
         "-noautocrop", action="store_true", help="Disable auto-cropping of zero margins"
     )
-    search_group.add_argument(
-        "-work_dxyz",
-        "-work-dxyz",
-        default="auto",
-        metavar="auto|off|MM",
-        help="Voxel size (mm) the SEARCH runs at. 'auto' (default) uses the "
-        "coarser of the base and source spacings -- aligning a 3 mm EPI on a "
-        "1 mm anat grid costs 27x the voxels and resolves nothing the EPI does "
-        "not; 'off' searches on the base's own grid; a number forces that "
-        "spacing. The fit is mapped back exactly, so the saved matrix and the "
-        "output volume are on the base grid either way.",
+    suggest(
+        search_group.add_argument(
+            "-work_dxyz",
+            "-work-dxyz",
+            default="auto",
+            metavar="auto|off|MM",
+            help="Voxel size (mm) the SEARCH runs at. 'auto' (default) uses the "
+            "coarser of the base and source spacings -- aligning a 3 mm EPI on a "
+            "1 mm anat grid costs 27x the voxels and resolves nothing the EPI does "
+            "not; 'off' searches on the base's own grid; a number forces that "
+            "spacing. The fit is mapped back exactly, so the saved matrix and the "
+            "output volume are on the base grid either way.",
+        ),
+        # The third form is a bare number, so this cannot be choices=.
+        ("auto", "off"),
     )
 
     # --- Speed/quality presets ---

@@ -20,7 +20,7 @@ from datetime import datetime
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import parse_prefix, setup_device
@@ -257,7 +257,7 @@ def _significant_unit_ids(
 
 
 def create_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_varpart",
         description="Variance partitioning for fully crossed factorial designs",
         formatter_class=FfsHelpFormatter,

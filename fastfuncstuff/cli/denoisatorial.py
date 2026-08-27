@@ -30,7 +30,6 @@ For help:
     ffs_denoisatorial -help
 """
 
-import argparse
 import json
 import sys
 from datetime import datetime
@@ -39,7 +38,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401
@@ -102,7 +101,7 @@ except ImportError as e:
 
 def create_parser():
     """Create argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="ffs_denoisatorial - Combinatorial PC Denoising",
         formatter_class=FfsHelpFormatter,
         epilog="""

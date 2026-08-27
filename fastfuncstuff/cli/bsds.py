@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 from tqdm.auto import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     parse_input_files,
     parse_prefix,
@@ -137,7 +137,7 @@ def _load_sessions(args) -> tuple[list[np.ndarray], np.ndarray | None]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         formatter_class=FfsHelpFormatter,
         prog="ffs_bsds",
         description="Bayesian Switching Dynamical Systems on ROI time series.",

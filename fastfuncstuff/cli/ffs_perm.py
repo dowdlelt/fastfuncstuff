@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import (
@@ -80,7 +80,7 @@ except ImportError as e:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_perm",
         description="GPU-accelerated nonparametric permutation testing with "
         "AFNI-style cluster correction.",

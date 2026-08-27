@@ -28,7 +28,7 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
@@ -184,7 +184,7 @@ usually grids/headers, not tuning -- see the -matrix help text.
 def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_formwarp",
         description="GPU SyN (symmetric normalization) nonlinear registration.",
         epilog=_EPILOG,

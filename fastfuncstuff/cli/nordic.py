@@ -10,7 +10,7 @@ import time
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_verbose_arg,
@@ -23,7 +23,7 @@ from fastfuncstuff.denoise.nordic_sweep import run_nordic_factor_sweep
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_nordic",
         description="NORDIC-style denoising for magnitude-only or complex (magnitude+phase) fMRI data.",
         formatter_class=FfsHelpFormatter,

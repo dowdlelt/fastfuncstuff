@@ -24,7 +24,7 @@ import json
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
 from fastfuncstuff.processing.io import load_image, load_warp_field
 from fastfuncstuff.processing.nwarpforge import _nifti_mm_to_voxels, compute_cardinal_affine
@@ -46,7 +46,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_util_warpqc",
         description="Deformation-regularity QC for a nonlinear warp field "
         "(folding, Jacobian range, displacement, bending energy).",

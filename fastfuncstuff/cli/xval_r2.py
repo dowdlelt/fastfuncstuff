@@ -11,7 +11,6 @@ Main use cases:
 - Evaluating preprocessing pipelines
 """
 
-import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, setup_device, spinner
@@ -33,7 +32,7 @@ except ImportError as e:
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="3dXvalR2fast - Fast cross-validated R² for fMRI GLM",
         formatter_class=FfsHelpFormatter,
         epilog="""

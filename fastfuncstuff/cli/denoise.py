@@ -22,7 +22,6 @@ For help:
     ffs_denoise -help
 """
 
-import argparse
 import json
 import sys
 from pathlib import Path
@@ -31,7 +30,7 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401
@@ -109,7 +108,7 @@ except ImportError as e:
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_denoise",
         description="ffs_denoise - GPU-accelerated cross-validated data-driven denoising",
         formatter_class=FfsHelpFormatter,

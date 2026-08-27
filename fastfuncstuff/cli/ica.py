@@ -39,7 +39,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 # fastfuncstuff imports
 try:
@@ -3326,7 +3326,7 @@ def _run_tensorial_ica(
 
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the ffs_ica command-line argument parser."""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="Run-wise whole-brain ICA demo / sanity-check pipeline",
         formatter_class=FfsHelpFormatter,
     )

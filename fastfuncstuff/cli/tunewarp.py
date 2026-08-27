@@ -65,7 +65,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_deterministic_arg,
     add_device_arg,
@@ -105,7 +105,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_tunewarp",
         description="Search nonlinear registration settings across backends and "
         "subjects, judged by functionals the backend did not optimise plus a "

@@ -47,7 +47,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 
 def _normalize_negative_option_values(argv: list[str] | None) -> list[str]:
@@ -79,7 +79,7 @@ def _normalize_negative_option_values(argv: list[str] | None) -> list[str]:
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="Multi-Echo DIstortion Correction (MEDIC) — warpkit estimate + GPU apply",
         formatter_class=FfsHelpFormatter,
     )

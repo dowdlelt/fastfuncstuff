@@ -22,14 +22,13 @@ For help:
     3dHRFoptfast -help
 """
 
-import argparse
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401
@@ -96,7 +95,7 @@ except ImportError as e:
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="3dHRFoptfast - Fast GPU-accelerated cross-validated HRF optimization",
         formatter_class=FfsHelpFormatter,
         epilog="""

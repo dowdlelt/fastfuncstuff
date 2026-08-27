@@ -34,7 +34,6 @@ For help:
     ffs_pathfinder -help
 """
 
-import argparse
 import json
 import sys
 from dataclasses import dataclass, field
@@ -44,7 +43,7 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
     import nibabel as nib  # noqa: F401
@@ -151,7 +150,7 @@ class PathfinderResults:
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="ffs_pathfinder - Joint HRF + Denoising Optimization",
         formatter_class=FfsHelpFormatter,
         epilog="""

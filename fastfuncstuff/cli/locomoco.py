@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -321,7 +321,7 @@ EXAMPLES
 
 
 def create_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_locomoco",
         description="Residual non-linear (PE-axis) motion correction via GPU optical "
         "flow, phase-correlation, or cross-correlation searchlights. See the notes below "

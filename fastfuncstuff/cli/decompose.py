@@ -71,13 +71,12 @@ ICASSO with automatic component selection:
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 
 import numpy as np
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.decomposition.ica import (
     FastICA,
@@ -93,7 +92,7 @@ from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
 
 def parse_args():
     """Parse command-line arguments"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="PCA and ICA decomposition for fMRI data",
         formatter_class=FfsHelpFormatter,
         epilog=__doc__,

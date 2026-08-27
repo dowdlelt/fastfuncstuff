@@ -7,13 +7,13 @@ import argparse
 import sys
 import time
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.sauna import SaunaConfig, run_sauna
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_sauna",
         description=(
             "SAUNA: Signal-Adaptive Unbiased Noise Attenuation.\n"

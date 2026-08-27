@@ -120,7 +120,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg, spinner
 
 # Printed at the end of -h. Kept self-contained (no wiki required): it tells a
@@ -307,7 +307,7 @@ HOW THE FLAGS CHANGE WHAT YOU GET
 
 
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="Phase regression for macrovascular BOLD suppression",
         epilog=_EPILOG,
         formatter_class=FfsHelpFormatter,

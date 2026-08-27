@@ -36,7 +36,6 @@ For help:
     3dRidgefast -help
 """
 
-import argparse
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +43,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 # Import fastfuncstuff modules
 try:
@@ -100,7 +99,7 @@ except ImportError as e:
 
 def create_parser():
     """Create argument parser"""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         description="3dRidgefast - GPU-accelerated ridge regression with single-trial estimation",
         formatter_class=FfsHelpFormatter,
         epilog="""

@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -134,7 +134,7 @@ def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
     """Parse command-line arguments."""
-    parser = argparse.ArgumentParser(
+    parser = FfsArgumentParser(
         prog="ffs_moco",
         description="GPU-accelerated motion correction for fMRI/fNIRS timeseries "
         "(inspired by 3dvolreg)",
@@ -269,18 +269,14 @@ def parse_args(
         "Faster but tends to under-detect TR-to-TR motion; off by default so "
         "every volume is estimated independently (matches 3dvolreg sensitivity).",
     )
-    method_group.add_argument(
-        "-chain-init",
-        dest="chain_init",
-        action="store_true",
-        help="Alias for -chain_init.",
-    )
     # Deprecated no-ops: chaining is now off by default.
     method_group.add_argument(
-        "-no_chain", dest="no_chain", action="store_true", help=argparse.SUPPRESS
-    )
-    method_group.add_argument(
-        "-nochain", dest="no_chain", action="store_true", help=argparse.SUPPRESS
+        # -nochain has no separator, so FfsArgumentParser cannot derive it.
+        "-no_chain",
+        "-nochain",
+        dest="no_chain",
+        action="store_true",
+        help=argparse.SUPPRESS,
     )
     method_group.add_argument("-automask", action="store_true", help="Use automask for weighting")
     method_group.add_argument(
@@ -310,12 +306,6 @@ def parse_args(
         dest="no_compile",
         action="store_true",
         help="Disable torch.compile for hot path (default: compile on CUDA)",
-    )
-    method_group.add_argument(
-        "-no-compile",
-        dest="no_compile",
-        action="store_true",
-        help="Alias for -no_compile.",
     )
 
     # --- Reweight (data-driven weight refinement) ---
@@ -372,9 +362,6 @@ def parse_args(
         action="store_true",
         help="Disable shear-based rigid resampling for the final pass "
         "(AFNI THD_rota_vol method); use the general affine resampler instead.",
-    )
-    interp_group.add_argument(
-        "-no-shear", dest="no_shear", action="store_true", help=argparse.SUPPRESS
     )
 
     st_group = parser.add_argument_group("Slice timing (space-time realignment)")

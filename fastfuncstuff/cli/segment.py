@@ -22,7 +22,11 @@ import sys
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
+
+# What -pe_axis accepts: a voxel axis or an anatomical direction code. Offered
+# rather than enforced, since resolve_pe_axis is case- and sign-tolerant.
+PE_AXIS_WORDS = ("x", "y", "z", "i", "j", "k", "AP", "PA", "LR", "RL", "IS", "SI")
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
@@ -92,7 +96,7 @@ def _output_ext(prefix: str) -> str:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
+    p = FfsArgumentParser(
         prog="ffs_segment",
         description=(
             "Unified Segmentation: joint bias-field correction + tissue classification\n"
@@ -234,14 +238,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-base template -source input); pass as-is, base-side->source-side. Omit to "
         "assume the input is already roughly in template space.",
     )
-    aff.add_argument(
-        "-pe_axis",
-        default=None,
-        metavar="AXIS",
-        help="Phase-encode axis for EPI PE-mode: constrain the deformation to this voxel "
-        "axis so the warp is the 1-D EPI distortion field (like ffs_rbr). Accepts axis "
-        "letters x/y/z or i/j/k, or direction codes AP/PA/LR/RL/IS/SI. Omit for a "
-        "full 3-D deformation (anatomicals).",
+    suggest(
+        aff.add_argument(
+            "-pe_axis",
+            default=None,
+            metavar="AXIS",
+            help="Phase-encode axis for EPI PE-mode: constrain the deformation to this voxel "
+            "axis so the warp is the 1-D EPI distortion field (like ffs_rbr). Accepts axis "
+            "letters x/y/z or i/j/k, or direction codes AP/PA/LR/RL/IS/SI. Omit for a "
+            "full 3-D deformation (anatomicals).",
+        ),
+        PE_AXIS_WORDS,
     )
     aff.add_argument(
         "-pe_reverse",
