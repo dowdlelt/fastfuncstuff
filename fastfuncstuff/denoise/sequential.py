@@ -1861,6 +1861,26 @@ def cross_validate_noise_pcs(
     return r2_maps, r2_summary
 
 
+def _detect_repeat_groups(
+    design_matrix: torch.Tensor,
+    run_starts: list[int],
+    n_timepoints: int,
+    atol: float = 1e-6,
+) -> list[list[int]]:
+    """Run-index groups whose per-run design block is the same.
+
+    The design is convolved rather than replayed, so two runs built from
+    identical event timing can still differ in the last bits; the default
+    tolerance accepts that and nothing else -- a genuinely different design
+    differs by order 1, not 1e-6.
+    """
+    from fastfuncstuff.stats.reliability import identical_design_groups
+
+    ends = [*run_starts[1:], n_timepoints]
+    blocks = [design_matrix[start:end, :] for start, end in zip(run_starts, ends, strict=True)]
+    return identical_design_groups(blocks, atol=atol)
+
+
 def pc_selection_floor(
     curve: np.ndarray, pc_min_gain: float | None = None
 ) -> tuple[float, float, str]:
@@ -2240,6 +2260,7 @@ def fit_denoising_model(
     r2_method: str = "auto",
     zero_event_strategy: str = "zero",
     ceiling_method: str = "auto",
+    repeat_groups: list[list[int]] | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
     designs_by_hrf: dict | None = None,
@@ -2300,6 +2321,11 @@ def fit_denoising_model(
           E.g., 1.05 means stop when within 5% of max (default, more robust).
         - If < 0: Use exactly abs(pcstop) PCs (user override).
         - If == 1.0: Use pure argmax (pick maximum).
+    repeat_groups : list of list of int, optional
+        Run-index groups whose design is identical, for ``ceiling_method
+        ='repeat'``. None auto-detects them by comparing the per-run design
+        blocks; pass explicit groups when the designs are equivalent but not
+        numerically equal (a rebuilt event file, a different microtime grid).
     pc_min_gain : float, optional
         Minimum CV-R2 gain over the 0-PC baseline required before any PC is
         kept. None (default) derives it from the curve itself: the larger of
@@ -3117,12 +3143,30 @@ def fit_denoising_model(
         from fastfuncstuff.stats.noise_ceiling import (
             df_ceiling_by_voxel_group,
             loro_ceiling_by_voxel_group,
+            repeat_ceiling,
         )
 
         if verbose:
             print(f"\nNoise ceiling at {optimal_n_components} PCs:")
 
         ceiling_splits = generate_cv_splits(len(run_starts), strategy=cv_strategy, n_perms=n_perms)
+
+        ceiling_repeat_groups = repeat_groups
+        if ceiling_method == "repeat" and ceiling_repeat_groups is None:
+            # Any one design will do: the HRF library varies the response
+            # shape, not the timing, so runs that repeat do so under all of them.
+            probe = design_matrix
+            if probe is None and designs_by_hrf:
+                probe = next(iter(designs_by_hrf.values()))
+            ceiling_repeat_groups = (
+                _detect_repeat_groups(probe, run_starts, data.shape[1]) if probe is not None else []
+            )
+            if verbose:
+                if ceiling_repeat_groups:
+                    shown = [[i + 1 for i in g] for g in ceiling_repeat_groups]
+                    print(f"  Repeated designs detected, runs (1-based): {shown}")
+                else:
+                    print("  No two runs share a design; the repeat ceiling has nothing to use.")
 
         def _ceiling_at(n_pcs: int, label: str):
             ceiling_nuisance = _nuisance_with_pcs(
@@ -3146,6 +3190,17 @@ def fit_denoising_model(
 
             if ceiling_method == "df":
                 return _df()
+
+            if ceiling_method == "repeat":
+                # Model-free, so it takes no design and needs no per-HRF split.
+                return repeat_ceiling(
+                    data=data,
+                    nuisance_per_run=ceiling_nuisance,
+                    run_starts=run_starts,
+                    repeat_groups=ceiling_repeat_groups or [],
+                    design_matrix=design_matrix,
+                    device=device,
+                )
 
             result = loro_ceiling_by_voxel_group(
                 **common,
@@ -3199,10 +3254,17 @@ def fit_denoising_model(
             explainable_r2 = ceiling_result.explainable_r2(xval_r2_optimal_full.cpu())
 
         if verbose:
+            # n_usable counts different things per estimator -- folds for the
+            # two-half ceiling, repeat pairs for this one -- so label it by method
+            # rather than calling six pairs "6 folds".
+            unit = "repeat pairs" if ceiling_result.method == "repeat" else "folds"
             if ceiling_result.n_usable == 0:
-                print("  Not estimable: no fold had enough training runs to split in two.")
+                if ceiling_result.method == "repeat":
+                    print("  Not estimable: no two runs shared a design.")
+                else:
+                    print("  Not estimable: no fold had enough training runs to split in two.")
             else:
-                print(f"  Folds used: {ceiling_result.n_usable}")
+                print(f"  {unit.capitalize()} used: {ceiling_result.n_usable}")
                 print(f"  {ceiling_result.summarize(explainable_r2)}")
             for note in noise_ceiling_notes:
                 print(f"  NOTE: {note}")

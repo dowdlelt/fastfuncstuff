@@ -30,9 +30,12 @@ too few runs to split the training set. It needs no repeats at all, but it
 bounds "the true-beta version of this design" rather than any model at all --
 it cannot tell you the design is wrong.
 
-The third estimator, for runs whose stimulus is bit-identical, lives in
-:mod:`fastfuncstuff.stats.reliability` alongside the split-half machinery it
-came from.
+:func:`repeat_ceiling` is the fourth, for the case where whole runs are repeats
+of each other: identical design means identical expected response, so the
+run-to-run correlation is the ceiling directly. It is the only one here that is
+model-free, and so the only one that can tell you the design is wrong. Its
+kernel lives in :mod:`fastfuncstuff.stats.reliability` alongside the split-half
+machinery it came from.
 """
 
 from __future__ import annotations
@@ -181,6 +184,96 @@ def loro_ceiling_by_voxel_group(
         voxel_mask = hrf_indices == hrf_idx
         groups.append((voxel_mask, _one(data[voxel_mask, :], designs_by_hrf[hrf_idx])))
     return merge_voxel_group_ceilings(groups, n_voxels=data.shape[0])
+
+
+def repeat_ceiling(
+    *,
+    data: torch.Tensor,
+    nuisance_per_run: list[torch.Tensor],
+    run_starts: list[int],
+    repeat_groups: list[list[int]],
+    design_matrix: torch.Tensor | None = None,
+    device: torch.device | None = None,
+) -> CeilingResult:
+    """A timeseries ceiling from runs whose design is identical.
+
+    When two runs present the same stimulus at the same times, their expected
+    responses are equal and any disagreement between them is noise. The
+    correlation between the two is then ``var(signal) / var(y)``, which is
+    exactly the largest R2 any model can reach on one run -- already in the
+    units the timeseries cross-validation reports, with no correction.
+
+    Unlike the other two timeseries estimators this one is **model-free**: it
+    never fits the design, so it bounds what *any* model could predict rather
+    than what this design can. That makes it the only ceiling here that can tell
+    you the design is wrong -- an explainable R2 far below 1 under this ceiling
+    and near 1 under :func:`loro_two_half_ceiling` means the design, not the
+    noise, is the limit. It is also the reason no per-HRF grouping is needed:
+    with the nuisance out, nothing about the estimate depends on the HRF.
+
+    The cost is that it needs repeated runs, which most event-related designs do
+    not have -- but block designs, retinotopy and localisers usually do, replayed
+    verbatim run after run.
+
+    The nuisance (including the selected noise PCs) is projected out per run
+    first, for two reasons that point the same way: shared drift is reproducible
+    across repeats and would be counted as signal, and the R2 being bounded was
+    scored against the denoised variance, so the ceiling must be too.
+    """
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+    from fastfuncstuff.stats.reliability import split_half_noise_ceiling
+
+    usable = [group for group in repeat_groups if len(group) > 1]
+    if not usable:
+        return CeilingResult(
+            ceiling=torch.full((data.shape[0],), torch.nan, dtype=data.dtype),
+            method="repeat",
+            n_usable=0,
+            notes=["No two runs shared a design, so no repeat ceiling was estimable."],
+        )
+
+    # project_out_nuisance_per_run projects data and design together; the design
+    # is spent here (the estimator never fits it), so a zero column stands in
+    # when the caller has none.
+    stand_in = design_matrix
+    if stand_in is None:
+        stand_in = torch.zeros((data.shape[1], 1), dtype=data.dtype, device=data.device)
+
+    projected, _ = project_out_nuisance_per_run(
+        data=data,
+        design=stand_in,
+        nuisance_per_run=nuisance_per_run,
+        run_starts=run_starts,
+        device=data.device,
+    )
+
+    ceiling = split_half_noise_ceiling(
+        data=projected,
+        repeat_groups=usable,
+        run_starts=run_starts,
+        n_timepoints=data.shape[1],
+    )
+
+    del projected
+    if device is not None and device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    notes = []
+    n_pairs = sum(len(group) * (len(group) - 1) // 2 for group in usable)
+    covered = sorted({index for group in usable for index in group})
+    if len(covered) < len(run_starts):
+        missing = [i + 1 for i in range(len(run_starts)) if i not in covered]
+        notes.append(
+            f"Runs {missing} matched no other run's design and did not contribute; "
+            "the ceiling comes only from the repeated ones."
+        )
+    if n_pairs == 1:
+        notes.append(
+            "Only one repeat pair: the ceiling is a single correlation per voxel "
+            "and is correspondingly noisy."
+        )
+
+    return CeilingResult(ceiling=ceiling.cpu(), method="repeat", n_usable=n_pairs, notes=notes)
 
 
 def df_ceiling_by_voxel_group(

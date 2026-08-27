@@ -177,21 +177,36 @@ def split_half_noise_ceiling(
     return (totals / counts).clamp_min(0.0).to(data.dtype)
 
 
-def identical_design_labels(stimulus_runs: Sequence[torch.Tensor]) -> list[int]:
-    """Label each run so that bit-identical stimulus movies share a label.
+def identical_design_labels(stimulus_runs: Sequence[torch.Tensor], atol: float = 0.0) -> list[int]:
+    """Label each run so that runs with the same expected response share a label.
 
     Detected rather than declared. A user-supplied stimulus grouping says "these
     runs probe the same thing", which is the right unit for cross-validation but
     is weaker than what a noise ceiling needs: clockwise and counter-clockwise
     wedges belong to one cross-validation group and have completely different
-    expected timecourses. Comparing the aperture movies answers the stricter
-    question directly and cannot disagree with the data.
+    expected timecourses. Comparing the runs directly answers the stricter
+    question and cannot disagree with the data.
+
+    Takes aperture movies (pRF) or per-run design-matrix blocks (GLM) -- both are
+    "the thing whose equality makes two runs repeats of each other".
+
+    ``atol`` is 0 by default, i.e. bit-identical. Raise it for designs that were
+    *convolved* rather than replayed: identical event timing can still produce
+    last-bit differences, and a tolerance of ~1e-6 accepts those without
+    accepting a genuinely different design (whose columns differ by order 1).
     """
     labels: list[int] = []
     representatives: list[torch.Tensor] = []
     for run in stimulus_runs:
         for slot, representative in enumerate(representatives):
-            if representative.shape == run.shape and torch.equal(representative, run):
+            if representative.shape != run.shape:
+                continue
+            same = (
+                torch.equal(representative, run)
+                if atol <= 0
+                else bool(torch.allclose(representative, run, rtol=0.0, atol=atol))
+            )
+            if same:
                 labels.append(slot)
                 break
         else:
@@ -200,9 +215,11 @@ def identical_design_labels(stimulus_runs: Sequence[torch.Tensor]) -> list[int]:
     return labels
 
 
-def identical_design_groups(stimulus_runs: Sequence[torch.Tensor]) -> list[list[int]]:
-    """Run-index sets sharing a bit-identical stimulus, singletons dropped."""
-    labels = identical_design_labels(stimulus_runs)
+def identical_design_groups(
+    stimulus_runs: Sequence[torch.Tensor], atol: float = 0.0
+) -> list[list[int]]:
+    """Run-index sets whose expected response is the same, singletons dropped."""
+    labels = identical_design_labels(stimulus_runs, atol=atol)
     groups: dict[int, list[int]] = {}
     for index, label in enumerate(labels):
         groups.setdefault(label, []).append(index)

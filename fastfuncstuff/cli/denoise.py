@@ -174,6 +174,10 @@ Outputs:
           noise_ceiling  - largest xval R² this DESIGN could reach: the
                            reproducible fraction of held-out variance. NaN where
                            not estimable (too few runs to split in two).
+                           With -noise_ceiling repeat it is instead what ANY
+                           model could reach, from the correlation between runs
+                           that share a design -- the one setting under which a
+                           low explainable R² can mean the design is wrong.
           explainable_R2 - xval_R2 / noise_ceiling, the fraction of the ACHIEVABLE
                            variance captured. 1.0 = everything that reproduces at
                            all; slightly above 1 is noise in the ceiling, not a
@@ -484,6 +488,19 @@ Notes:
         denoise_opts,
         stage_note="The ceiling is built at the SELECTED PC count with those PCs "
         "in the nuisance, so it bounds the denoised R2 that is actually reported.",
+    )
+    denoise_opts.add_argument(
+        "-repeat_groups",
+        "-repeat-groups",
+        dest="repeat_groups",
+        nargs="+",
+        metavar="RUNS",
+        default=None,
+        help="For -noise_ceiling repeat: which runs are repeats of each other, as "
+        "comma-separated 1-based run numbers, one group per argument "
+        "(e.g. -repeat_groups 1,2,3 4,5,6). Default is to detect them by comparing "
+        "the per-run design blocks; declare them when the designs are equivalent "
+        "but not numerically equal (a rebuilt event file, a different microtime grid).",
     )
     add_single_trial_args(
         denoise_opts,
@@ -1649,6 +1666,19 @@ def main():
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
 
+    # 1-based on the command line, 0-based everywhere inside.
+    repeat_groups: list[list[int]] | None = None
+    if args.repeat_groups:
+        repeat_groups = []
+        for spec in args.repeat_groups:
+            try:
+                runs = [int(token) - 1 for token in spec.replace(" ", "").split(",") if token]
+            except ValueError:
+                parser.error(f"-repeat_groups expects comma-separated run numbers, got {spec!r}")
+            if len(runs) < 2:
+                parser.error(f"-repeat_groups group {spec!r} needs at least two runs")
+            repeat_groups.append(runs)
+
     # "auto" stays None so the library can size the floor off the curve it computes.
     if str(args.pc_min_gain).strip().lower() == "auto":
         pc_min_gain = None
@@ -1730,6 +1760,16 @@ def main():
     n_timepoints = load_result.n_timepoints
     n_runs = load_result.n_runs
     keep_on_cpu = load_result.keep_on_cpu
+
+    # Only checkable now that the runs are loaded. A silently out-of-range index
+    # would index the wrong run rather than fail.
+    if repeat_groups is not None:
+        for group in repeat_groups:
+            bad = [index + 1 for index in group if not 0 <= index < n_runs]
+            if bad:
+                parser.error(f"-repeat_groups names run(s) {bad}, but only {n_runs} were loaded")
+    if args.noise_ceiling == "repeat" and n_runs < 2:
+        parser.error("-noise_ceiling repeat needs at least two runs")
 
     # Update args.tr with loaded value (for later use)
     if args.tr is None:
@@ -3310,7 +3350,7 @@ def main():
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
-            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df"),
+            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
             polort=args.polort,
@@ -3318,6 +3358,7 @@ def main():
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
             pc_min_gain=pc_min_gain,
+            repeat_groups=repeat_groups,
             pcR2cutoff=args.pcR2cutoff,
             noise_method=args.noise,
             auto_component_caps=args.auto_component_caps,
@@ -3352,7 +3393,7 @@ def main():
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
-            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df"),
+            compute_noise_ceiling=args.noise_ceiling in ("auto", "loro", "df", "repeat"),
             ceiling_method=args.noise_ceiling,
             nuisance=nuisance_per_run,
             polort=args.polort,
@@ -3360,6 +3401,7 @@ def main():
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
             pc_min_gain=pc_min_gain,
+            repeat_groups=repeat_groups,
             pcR2cutoff=args.pcR2cutoff,
             noise_method=args.noise,
             auto_component_caps=args.auto_component_caps,

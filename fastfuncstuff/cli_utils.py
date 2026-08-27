@@ -3166,7 +3166,7 @@ def add_noise_ceiling_args(group, *, stage_note: str = "") -> None:
         nargs="?",
         const="auto",
         default="off",
-        choices=["off", "auto", "loro", "df", "ncsnr"],
+        choices=["off", "auto", "loro", "df", "ncsnr", "repeat"],
         help="Estimate the per-voxel ceiling on the cross-validated R2 and save "
         "it alongside an explainable-R2 map (xval_r2 / ceiling -- the fraction "
         "of the achievable variance the model captured; NaN where the ceiling is "
@@ -3183,7 +3183,13 @@ def add_noise_ceiling_args(group, *, stage_note: str = "") -> None:
         "corrects the in-sample fit for degrees of freedom and needs no "
         "repeats, but bounds THIS design rather than any design. 'ncsnr' is the "
         "NSD/GLMsingle beta-space ceiling and needs conditions that repeat "
-        "across runs, not repeated runs. " + stage_note,
+        "across runs, not repeated runs. 'repeat' is for the case where whole "
+        "RUNS repeat -- identical stimulus timing, as in a block design or "
+        "localiser replayed verbatim -- and uses the run-to-run correlation "
+        "directly. Alone among these it never fits the design, so it bounds what "
+        "ANY model could predict: an explainable R2 far below 1 under 'repeat' "
+        "but near 1 under 'loro' means the design is the limit, not the noise. "
+        "Never chosen by 'auto', since repeated runs cannot be assumed. " + stage_note,
     )
 
 

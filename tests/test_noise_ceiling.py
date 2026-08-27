@@ -863,3 +863,211 @@ def test_df_ceiling_is_zero_on_pure_noise_for_both_designs():
 
     assert float(_df_ceiling(data, narrow, nuisance, run_starts)) < 0.01
     assert float(_df_ceiling(data, wide, nuisance, run_starts)) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# repeat ceiling: runs whose design is identical
+# ---------------------------------------------------------------------------
+
+
+def _repeat_dataset(n_runs=4, run_len=150, n_vox=300, drift=3.0, seed=0):
+    """Runs replaying one signal, each with independent noise and its own drift.
+
+    var(signal) = amp**2 and var(noise) = 1 per voxel, so the true ceiling is
+    amp**2 / (amp**2 + 1) analytically.
+    """
+    import torch
+
+    torch.manual_seed(seed)
+    run_starts = [i * run_len for i in range(n_runs)]
+    signal = torch.randn(run_len)
+    signal = (signal - signal.mean()) / signal.std()
+    amp = torch.linspace(0.2, 3.0, n_vox).unsqueeze(1)
+
+    ramp = torch.linspace(-1, 1, run_len)
+    data = torch.zeros(n_vox, n_runs * run_len)
+    for r in range(n_runs):
+        block = amp * signal + torch.randn(n_vox, run_len)
+        block = block + (torch.randn(n_vox, 1) * drift) * ramp
+        data[:, r * run_len : (r + 1) * run_len] = block
+
+    nuisance = [torch.stack([torch.ones(run_len), ramp, ramp**2], dim=1) for _ in range(n_runs)]
+    true_ceiling = (amp.squeeze() ** 2) / (amp.squeeze() ** 2 + 1.0)
+    return data, nuisance, run_starts, signal, true_ceiling
+
+
+def test_repeat_ceiling_recovers_the_analytic_value():
+    import torch
+
+    from fastfuncstuff.stats.noise_ceiling import repeat_ceiling
+
+    data, nuisance, run_starts, _, true_ceiling = _repeat_dataset()
+    result = repeat_ceiling(
+        data=data,
+        nuisance_per_run=nuisance,
+        run_starts=run_starts,
+        repeat_groups=[[0, 1, 2, 3]],
+    )
+
+    assert result.method == "repeat"
+    assert result.n_usable == 6  # pairs, not runs
+    assert torch.median((result.ceiling - true_ceiling).abs()) < 0.03
+
+
+def test_repeat_ceiling_is_in_the_units_of_the_xval_r2():
+    """An oracle model that knows the signal must land at explainable R2 ~= 1.
+
+    This is the property that makes the ceiling usable as a divisor, and the one
+    a units mistake breaks: a ceiling can be perfectly precise and still be the
+    wrong denominator for the R2 it is dividing.
+    """
+    import torch
+
+    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+    from fastfuncstuff.stats.noise_ceiling import repeat_ceiling
+
+    data, nuisance, run_starts, signal, _ = _repeat_dataset(seed=1)
+    n_runs, run_len, n_vox = len(run_starts), signal.shape[0], data.shape[0]
+
+    ceiling = repeat_ceiling(
+        data=data,
+        nuisance_per_run=nuisance,
+        run_starts=run_starts,
+        repeat_groups=[list(range(n_runs))],
+    ).ceiling
+
+    design = torch.cat([signal] * n_runs).unsqueeze(1)
+    projected, projected_design = project_out_nuisance_per_run(
+        data=data,
+        design=design,
+        nuisance_per_run=nuisance,
+        run_starts=run_starts,
+        device=data.device,
+    )
+
+    ss_res = torch.zeros(n_vox, dtype=torch.float64)
+    ss_tot = torch.zeros(n_vox, dtype=torch.float64)
+    for held in range(n_runs):
+        train = torch.cat(
+            [torch.arange(r * run_len, (r + 1) * run_len) for r in range(n_runs) if r != held]
+        )
+        test = torch.arange(held * run_len, (held + 1) * run_len)
+        betas = torch.linalg.pinv(projected_design[train]) @ projected[:, train].T
+        pred = (projected_design[test] @ betas).T
+        actual = projected[:, test]
+        ss_res += ((actual - pred) ** 2).sum(dim=1).double()
+        ss_tot += ((actual - actual.mean(dim=1, keepdim=True)) ** 2).sum(dim=1).double()
+
+    oracle_r2 = (1 - ss_res / ss_tot).float()
+    explainable = torch.median(oracle_r2 / ceiling)
+    assert 0.9 < explainable < 1.1, explainable
+
+
+def test_repeat_ceiling_needs_the_nuisance_projected_out():
+    """Shared drift is reproducible, so skipping the projection inflates it.
+
+    Guards the docstring's loudest warning: the drift here is common to every
+    run, which is exactly the case where an unprojected ceiling goes to ~1
+    everywhere and makes every model look terrible.
+    """
+    import torch
+
+    from fastfuncstuff.stats.reliability import split_half_noise_ceiling
+
+    data, nuisance, run_starts, _, true_ceiling = _repeat_dataset(drift=0.0, seed=2)
+    run_len = nuisance[0].shape[0]
+    n_runs = len(run_starts)
+
+    # One drift shared by every run, the way a scanner trend is.
+    shared = torch.linspace(-1, 1, run_len) * 6.0
+    drifted = data.clone()
+    for r in range(n_runs):
+        drifted[:, r * run_len : (r + 1) * run_len] += shared
+
+    unprojected = split_half_noise_ceiling(
+        data=drifted,
+        repeat_groups=[list(range(n_runs))],
+        run_starts=run_starts,
+        n_timepoints=drifted.shape[1],
+    )
+    assert torch.median(unprojected) > 0.9
+    assert torch.median(unprojected) > torch.median(true_ceiling) + 0.2
+
+
+def test_repeat_ceiling_without_repeats_is_nan_not_zero():
+    import torch
+
+    from fastfuncstuff.stats.noise_ceiling import repeat_ceiling
+
+    data, nuisance, run_starts, _, _ = _repeat_dataset(seed=3)
+    result = repeat_ceiling(
+        data=data, nuisance_per_run=nuisance, run_starts=run_starts, repeat_groups=[]
+    )
+
+    assert result.n_usable == 0
+    assert torch.isnan(result.ceiling).all()
+    assert result.notes
+
+
+def test_repeat_ceiling_notes_runs_that_did_not_contribute():
+    from fastfuncstuff.stats.noise_ceiling import repeat_ceiling
+
+    data, nuisance, run_starts, _, _ = _repeat_dataset(seed=4)
+    result = repeat_ceiling(
+        data=data,
+        nuisance_per_run=nuisance,
+        run_starts=run_starts,
+        repeat_groups=[[0, 1]],  # runs 3 and 4 match nothing
+    )
+
+    assert result.n_usable == 1
+    assert any("did not contribute" in note for note in result.notes)
+
+
+def test_detect_repeat_groups_separates_unlike_designs():
+    """Two runs of design A, one of design B, and near-equal must still match."""
+    import torch
+
+    from fastfuncstuff.denoise.sequential import _detect_repeat_groups
+
+    torch.manual_seed(5)
+    run_len = 60
+    a = torch.randn(run_len, 2)
+    b = torch.randn(run_len, 2)
+    # Run 3 is run 1 rebuilt: same timing, last-bit convolution differences.
+    a_again = a + torch.randn(run_len, 2) * 1e-9
+
+    design = torch.cat([a, b, a_again], dim=0)
+    groups = _detect_repeat_groups(design, [0, run_len, 2 * run_len], 3 * run_len)
+
+    assert groups == [[0, 2]]
+
+
+def test_repeat_ceiling_does_not_move_with_the_design():
+    """The property that makes it a design diagnostic.
+
+    The loro ceiling falls when the design misses real signal, so explainable R2
+    stays near 1 and the model looks fine. This ceiling is estimated without
+    fitting anything, so it holds still and the explainable R2 drops instead --
+    which is the answer you want. Measured end to end on synthetic data: with a
+    design missing half its blocks, repeat gave 0.50 explainable where loro gave
+    0.99.
+    """
+    import torch
+
+    from fastfuncstuff.stats.noise_ceiling import repeat_ceiling
+
+    data, nuisance, run_starts, signal, _ = _repeat_dataset(seed=7)
+    n_runs = len(run_starts)
+    groups = [list(range(n_runs))]
+
+    good = torch.cat([signal] * n_runs).unsqueeze(1)
+    wrong = torch.randn(good.shape)
+
+    kwargs = dict(data=data, nuisance_per_run=nuisance, run_starts=run_starts, repeat_groups=groups)
+    with_good = repeat_ceiling(**kwargs, design_matrix=good).ceiling
+    with_wrong = repeat_ceiling(**kwargs, design_matrix=wrong).ceiling
+    with_none = repeat_ceiling(**kwargs, design_matrix=None).ceiling
+
+    torch.testing.assert_close(with_good, with_wrong)
+    torch.testing.assert_close(with_good, with_none)
