@@ -994,6 +994,7 @@ def save_4d_nifti(
     affine: np.ndarray,
     mask_flat: np.ndarray | None = None,
     header: object | None = None,
+    brick_labels: list[str] | None = None,
 ):
     """
     Reshape (n_voxels, n_volumes) flat data to 4D and save as NIfTI file.
@@ -1012,6 +1013,9 @@ def save_4d_nifti(
         Flattened brain mask. If provided, unmasks data before saving.
     header : nibabel header, optional
         NIfTI header to preserve (AFNI space/view info, etc.).
+    brick_labels : list of str, optional
+        Per-volume labels. Worth passing whenever the fourth axis is not time --
+        an unlabelled stack of parameter maps is unreadable in a viewer.
     """
     from fastfuncstuff.io.afni import save_nifti
 
@@ -1031,7 +1035,16 @@ def save_4d_nifti(
     else:
         data_4d = data_np.reshape((*volume_shape, n_vols))
 
-    save_nifti(data_4d, output_path=filename, affine=affine, header=header)
+    if brick_labels is not None and len(brick_labels) != n_vols:
+        raise ValueError(f"brick_labels has {len(brick_labels)} entries for {n_vols} volumes")
+
+    save_nifti(
+        data_4d,
+        output_path=filename,
+        affine=affine,
+        header=header,
+        brick_labels=brick_labels,
+    )
 
 
 # ============================================================================

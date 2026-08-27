@@ -314,3 +314,38 @@ class TestCliUtilsE2E:
     def test_full_preprocessing_workflow(self):
         """Test complete preprocessing workflow using cli_utils functions."""
         pass
+
+
+def test_save_4d_nifti_brick_labels_round_trip(tmp_path):
+    """Labels must reach the file; an unlabelled parameter stack is unreadable."""
+    import nibabel as nib
+    import numpy as np
+
+    from fastfuncstuff.cli_utils import save_4d_nifti
+
+    shape = (6, 5, 4)
+    mask = np.zeros(int(np.prod(shape)), dtype=bool)
+    mask[::3] = True
+    n_vox, n_vols = int(mask.sum()), 5
+    data = np.arange(n_vox * n_vols, dtype=np.float32).reshape(n_vox, n_vols)
+
+    out = str(tmp_path / "stack.nii.gz")
+    labels = [f"npc{k:02d}" for k in range(n_vols)]
+    save_4d_nifti(data, out, shape, np.eye(4), mask_flat=mask, brick_labels=labels)
+
+    img = nib.load(out)
+    assert img.shape == (*shape, n_vols)
+    unmasked = img.get_fdata().reshape(-1, n_vols)[mask]
+    np.testing.assert_allclose(unmasked, data)
+
+
+def test_save_4d_nifti_rejects_mismatched_labels(tmp_path):
+    """A label list that does not match the volume count is a caller bug, not a warning."""
+    import numpy as np
+    import pytest
+
+    from fastfuncstuff.cli_utils import save_4d_nifti
+
+    data = np.zeros((10, 4), dtype=np.float32)
+    with pytest.raises(ValueError, match="brick_labels"):
+        save_4d_nifti(data, str(tmp_path / "x.nii.gz"), (10, 1, 1), np.eye(4), brick_labels=["a"])
