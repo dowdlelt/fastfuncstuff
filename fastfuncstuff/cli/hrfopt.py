@@ -38,6 +38,7 @@ except ImportError:
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
+    ScannableHelpFormatter,
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
@@ -92,8 +93,8 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
+class _HelpFormatter(ScannableHelpFormatter):
+    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 def create_parser():

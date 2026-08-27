@@ -37,6 +37,7 @@ except ImportError:
 try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
+    ScannableHelpFormatter,
         add_cv_strategy_arg,
         add_device_arg,
         add_noise_ceiling_args,
@@ -226,8 +227,8 @@ def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: l
     return onset_times
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
+class _HelpFormatter(ScannableHelpFormatter):
+    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 def create_parser():

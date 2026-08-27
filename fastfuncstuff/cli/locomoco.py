@@ -34,6 +34,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_utils import (
+    ScannableHelpFormatter,
     add_batch_args,
     add_device_arg,
     collect_batch_jobs,
@@ -62,46 +63,8 @@ def _split_prefix(prefix: str) -> tuple[str, str]:
     return prefix, ".nii.gz"
 
 
-class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    """Show each arg's default, keep the epilog's layout, and honour newlines in help.
-
-    argparse re-flows every help string into one paragraph, which turns a flag that
-    documents four choices into an unscannable wall. Explicit newlines are kept here (and
-    a hanging indent is carried onto the wrapped continuation), so a help string can put
-    one choice per line while long lines still wrap to the terminal.
-    """
-
-    def _get_help_string(self, action):
-        if action.default is None:
-            # "(default: None)" is never information — the real default is computed later
-            # (see -ref) or the flag is simply optional.
-            return action.help
-        text = super()._get_help_string(action)
-        if text and "\n" in text and text.endswith(")"):
-            # " (default: X)" tacked onto the last line of a choice list reads as part of
-            # that choice. Break it out onto its own line once the help is multi-line.
-            head, _, tail = text.rpartition(" (default:")
-            return f"{head}\n(default:{tail}" if head else text
-        return text
-
-    def _split_lines(self, text: str, width: int) -> list[str]:
-        import re
-        import textwrap
-
-        out: list[str] = []
-        for line in text.splitlines():
-            if not line.strip():
-                out.append("")
-                continue
-            # An indented "  key   meaning" line hangs under the MEANING, so a wrapped
-            # choice stays visually one block instead of drifting back under its key.
-            m = re.match(r"(\s+\S+\s\s+)", line)
-            lead = len(line) - len(line.lstrip())
-            # Cap the hang: a long key (CONDITION-PAIRED) would otherwise push its own
-            # continuations most of the way across the terminal.
-            hang = " " * min(len(m.group(1)), lead + 12) if m else " " * lead
-            out.extend(textwrap.wrap(line, width, subsequent_indent=hang) or [""])
-        return out
+class _HelpFormatter(ScannableHelpFormatter):
+    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 _EPILOG = """\

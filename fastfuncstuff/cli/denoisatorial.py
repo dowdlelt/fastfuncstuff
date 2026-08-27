@@ -48,6 +48,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        ScannableHelpFormatter,
         add_device_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
@@ -98,8 +99,8 @@ except ImportError as e:
 # ============================================================================
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
+class _HelpFormatter(ScannableHelpFormatter):
+    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 def create_parser():
