@@ -854,3 +854,53 @@ def test_polish_single_pass_is_sharper_than_double_resample():
         return float(np.abs(np.diff(np.median(v, axis=3), axis=PE)).mean())
 
     assert sharpness(single) > sharpness(double)
+
+
+def test_qwarp_refine_rebuilds_the_template_and_moves_the_field():
+    """`-refine` under `-backend qwarp` must actually re-solve, not silently no-op.
+
+    The first template is a reduction of the RAW echoes, still carrying the distortion,
+    so it is blurred by it and biases the field low. A refine pass rebuilds the template
+    from the corrected series and re-solves from seed 0, which has to land somewhere
+    different — an identical field would mean the loop never ran.
+    """
+    tes = [12.0, 30.0, 48.0]
+    datas, _ = _make_multiecho(tes, [0.0, 0.5, -0.4, 0.3, -0.5])
+    res = make_raw_reference_me_result(datas, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    common = dict(
+        minpatch=5,
+        n_levels=1,
+        iters=4,
+        cost="ncc",
+        optimizer="gn",
+        full=True,
+        raw_datas=datas,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    once = polish_me_result(res, refine=0, **common)
+    twice = polish_me_result(res, refine=1, **common)
+    assert twice.w_field.shape == once.w_field.shape
+    assert torch.isfinite(twice.w_field).all()
+    assert not torch.allclose(once.w_field, twice.w_field), "the refine pass did nothing"
+
+
+def test_qwarp_ref_mode_changes_the_template():
+    """The template reduction was pinned to the median; `-ref` has to reach it now."""
+    tes = [12.0, 30.0, 48.0]
+    datas, _ = _make_multiecho(tes, [0.0, 0.5, -0.4, 0.3, -0.5])
+    res = make_raw_reference_me_result(datas, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    common = dict(
+        minpatch=5,
+        n_levels=1,
+        iters=4,
+        cost="ncc",
+        optimizer="gn",
+        full=True,
+        raw_datas=datas,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    med = polish_me_result(res, ref_mode="median", **common)
+    mean = polish_me_result(res, ref_mode="mean", **common)
+    assert not torch.allclose(med.w_field, mean.w_field), "ref_mode never reached the template"

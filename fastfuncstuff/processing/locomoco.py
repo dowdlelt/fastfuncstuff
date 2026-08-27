@@ -3530,6 +3530,15 @@ def _refine_reduce(
     return c.mean(dim=dim)
 
 
+def _refine_reduce_label(ref_mode: str) -> str:
+    """Human name for what :func:`_refine_reduce` will actually do with ``ref_mode``."""
+    if ref_mode in ("median", "first_median"):
+        return "median"
+    if ref_mode == "max":
+        return "max"
+    return "mean"
+
+
 def paired_templates(
     series: torch.Tensor, bin_of: torch.Tensor, ref_mode: str, dim: int = 3
 ) -> torch.Tensor:
@@ -5368,6 +5377,8 @@ def polish_me_result(
     full: bool = False,
     slicewise: bool = True,
     raw_datas: list[np.ndarray] | None = None,
+    ref_mode: str = "median",
+    refine: int = 0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -5394,6 +5405,17 @@ def polish_me_result(
     i.e. across acquisition times. Pass ``slicewise=False`` for 3-D-acquired EPI
     (``-is_3dacq`` / ``-me_3depi``), where the volume is one shot and through-plane
     continuity is real.
+
+    ``ref_mode`` picks the temporal reduction that builds the template (``median`` --
+    robust to a few bad frames -- ``mean``, or ``max``); ``first``/index fall back to the
+    mean, as in :func:`_refine_reduce`, because one frame is a noisy template.
+
+    ``refine`` runs the whole registration more than once, rebuilding the template from
+    the series the previous pass corrected. Same idea as the estimator's ``-refine``: the
+    first template is built from data that still carries the distortion, so it is blurred
+    by it and biases the field LOW. Each pass re-solves from seed 0 against the sharper
+    template -- never seeded with the previous field, so a pass can walk a bad step back
+    instead of compounding it.
 
     Both are JOINT: one shared PE field, every echo scored at ``alpha_e·field``.
     Returns a new :class:`MultiEchoLocomocoResult` the CLI writes exactly like the
@@ -5426,18 +5448,14 @@ def polish_me_result(
         if device is not None
         else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     )
+    red = _refine_reduce_label(ref_mode)
     if verbose:
         print(
-            f"   ⏳ building reference (temporal median of {nt} frames × {e} echoes) "
+            f"   ⏳ building reference (temporal {red} of {nt} frames × {e} echoes) "
             "and preparing the series…",
             flush=True,
         )
     corr_series = [result.per_echo[j].corrected_series().float() for j in range(e)]
-    # The temporal median is a 225-deep sort per voxel -- slow on CPU; run it on the GPU
-    # (each echo transiently, freed after) when we have one. base_echoes stays on `dev`.
-    base_echoes = torch.stack(
-        [c.to(dev).median(dim=-1).values.permute(2, 1, 0).contiguous() for c in corr_series]
-    )
     if full:
         if raw_datas is None:
             raise ValueError("polish_me_result(full=True) needs raw_datas (the raw echoes).")
@@ -5467,30 +5485,55 @@ def polish_me_result(
     # slice_axis and pe_axis are both NIfTI axes, which the qwarp grid labels the same
     # way (channel 0=x); the (z,y,x) storage order is handled inside the plan.
     slicewise_axis = ref.slice_axis if slicewise else None
-    warped, resid = qwarp_pe_scaled_polish_series(
-        base_echoes,
-        source_series,
-        seed_series,
-        axes,  # displacement channel labels are shared between NIfTI-xyz and qwarp grid
-        alpha=alpha_ch,
-        config=cfg,
-        n_levels=n_levels,
-        device=device,
-        show_progress=verbose,
-        slicewise_axis=slicewise_axis,
-    )
 
-    # (A, nz, ny, nx, T) -> one (nx, ny, nz, T) field per encode axis, echo-1 scale.
-    r_axes = [resid[k].permute(2, 1, 0, 3).contiguous() for k in range(len(axes))]
-    # Polish adds to the estimator field; the full backend IS the field.
-    w_axes_new = [r if full else wk + r for wk, r in zip(w_axes, r_axes, strict=True)]
+    # The template starts from the series the estimator corrected (the raw echoes on the
+    # full-backend path, where no estimate ran) and is REBUILT from each pass's output.
+    template = corr_series
+    w_axes_new: list[torch.Tensor] = []
+    r_axes: list[torch.Tensor] = []
+    warped_nifti: list[torch.Tensor] = []
+    for it in range(int(refine) + 1):
+        # The temporal reduction is a full sort per voxel for the median -- slow on CPU;
+        # run it on the GPU (each echo transiently, freed after) when we have one.
+        base_echoes = torch.stack(
+            [_refine_reduce(c.to(dev), ref_mode, 3).permute(2, 1, 0).contiguous() for c in template]
+        )
+        warped, resid = qwarp_pe_scaled_polish_series(
+            base_echoes,
+            source_series,
+            seed_series,
+            axes,  # displacement channel labels are shared between NIfTI-xyz and qwarp grid
+            alpha=alpha_ch,
+            config=cfg,
+            n_levels=n_levels,
+            device=device,
+            show_progress=verbose,
+            slicewise_axis=slicewise_axis,
+        )
+        del base_echoes
+        # (A, nz, ny, nx, T) -> one (nx, ny, nz, T) field per encode axis, echo-1 scale.
+        r_axes = [resid[k].permute(2, 1, 0, 3).contiguous() for k in range(len(axes))]
+        # Polish adds to the estimator field; the full backend IS the field.
+        prev = w_axes_new
+        w_axes_new = [r if full else wk + r for wk, r in zip(w_axes, r_axes, strict=True)]
+        warped_nifti = [warped[j].permute(2, 1, 0, 3).contiguous() for j in range(e)]
+        del warped, resid
+        if it < int(refine):
+            # Next pass registers the SAME source against a template built from this
+            # pass's output — re-solved from seed 0, never seeded with the field above.
+            template = warped_nifti
+        if verbose and prev:
+            d = torch.stack([(a - b) for a, b in zip(w_axes_new, prev, strict=True)])
+            moved = d[d != 0]
+            rms = float(moved.pow(2).mean().sqrt()) if moved.numel() else 0.0
+            print(f"   qwarp refine pass {it}/{int(refine)}: Δfield rms {rms:.4f} vox")
+    del template, source_series, seed_series
     w_new = w_axes_new[-1]
-    warped_nifti = [warped[j].permute(2, 1, 0, 3).contiguous() for j in range(e)]
     if not full and raw_datas is not None:
         # Prefer one resample of the raw over qwarp's second pass on already-corrected
         # data -- see :func:`_rewarp_raw_single_pass`. Only the polish needs this; the
         # full backend already registers raw.
-        del warped
+        del warped_nifti
         warped_nifti = _rewarp_raw_single_pass(
             raw_datas, w_axes_new, list(axes), alpha_ch, dev, verbose
         )

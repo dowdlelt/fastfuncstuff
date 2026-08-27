@@ -611,6 +611,21 @@ def create_parser() -> argparse.ArgumentParser:
         "-final_qwarp polish and -backend qwarp. Benchmark before trusting on a new box; "
         "falls back to eager if inductor is unavailable.",
     )
+    me.add_argument(
+        "-qwarp_refine",
+        "-qwarp-refine",
+        type=int,
+        default=None,
+        dest="qwarp_refine",
+        help="Re-run the qwarp registration N extra times, each against a template rebuilt "
+        "from the previous pass's corrected series (re-solved from seed 0, never seeded "
+        "with the previous field). The first template is built from data that still "
+        "carries the distortion, so it is blurred by it and biases the field LOW — the "
+        "same reason the estimator has -refine. Defaults to -refine under -backend qwarp "
+        "(where no flow pass runs, so -refine has nothing else to do) and to 0 for the "
+        "-final_qwarp polish (whose template the flow refine already sharpened). Each "
+        "pass costs a full qwarp sweep.",
+    )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
@@ -620,10 +635,11 @@ def create_parser() -> argparse.ArgumentParser:
         "(default) pyramidal Lucas-Kanade optical flow — most precise, slowest; "
         "'phase' phase-correlation searchlight (FFT phase-ramp along PE) — fastest, "
         "near-flow accuracy; 'xcorr' magnitude cross-correlation searchlight (slide "
-        "along PE, peak local correlation) — robust, single-shot; 'qwarp' (ME 3-D-EPI only) "
-        "builds a refined median reference with a flow -refine pass, then lets the joint "
-        "TE-scaled qwarp own the whole field (raw echoes → reference; the -qwarp_* flags "
-        "apply, the flow-tuning flags only affect the reference pass). See epilog for tuning.",
+        "along PE, peak local correlation) — robust, single-shot; 'qwarp' skips the flow "
+        "estimate entirely and lets the joint TE-scaled qwarp own the whole field (raw "
+        "frames → a temporal reduction of themselves; -ref picks the reduction, -refine "
+        "rebuilds it from the corrected series and re-solves). For already-moco'd input; "
+        "for residual motion use -backend flow -final_qwarp. See epilog for tuning.",
     )
     est.add_argument(
         "-ref",
@@ -865,11 +881,13 @@ def create_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         metavar="ROUNDS",
-        help="[plain path only] Outer reference-refinement rounds (the max cap when "
+        help="[plain path + -backend qwarp] Outer reference-refinement rounds (the max cap when "
         "-converge is set). After the first estimate, rebuild the reference from the "
         "corrected series (motion removed → sharp, and aggregated per -ref: a max stays "
         "FoV-filled) and re-register the original frames against it. Each pass prints its "
-        "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off.",
+        "step size (RMS displacement change, in-brain). 1–3 tightens the values; 0 = off. "
+        "Under -backend qwarp there is no flow pass, so this drives the QWARP passes "
+        "instead (override with -qwarp_refine).",
     )
     acc.add_argument(
         "-converge",
@@ -1746,6 +1764,25 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     return cleaned
 
 
+def _qwarp_template_args(args, qwarp_backend: bool) -> tuple[str, int]:
+    """``(ref_mode, refine)`` for the qwarp template — the two knobs it used to pin.
+
+    The template was hard-wired to a temporal median built once. ``-ref`` now reaches it,
+    but only when the user actually typed one: the resolved default is ``mean`` (``max``
+    rotation-aware) and a median template is the more robust choice for registration, so
+    defaulting to ``args.ref`` would silently change every existing command. ``-refine``
+    drives the qwarp passes under ``-backend qwarp``, where no flow pass runs and it is
+    otherwise inert; the ``-final_qwarp`` polish stays at one pass unless asked, since the
+    flow refine already sharpened the template it registers against.
+    """
+    ref_mode = args.ref if getattr(args, "ref_explicit", False) else "median"
+    if args.qwarp_refine is not None:
+        refine = max(0, int(args.qwarp_refine))
+    else:
+        refine = max(0, int(args.refine)) if qwarp_backend else 0
+    return ref_mode, refine
+
+
 def _brain_mask_for_coupling(data, shape) -> torch.Tensor | None:
     """Binary (nx,ny,nz) brain mask from the mean volume, or None if it can't be built.
 
@@ -2234,6 +2271,7 @@ def _run_multiecho(
     # joint TE-scaled qwarp owns the whole field (raw echoes -> reference). The arg-only
     # validity checks already ran before the data load.
     qwarp_backend = args.backend == "qwarp"
+    qwarp_ref_mode, qwarp_refine = _qwarp_template_args(args, qwarp_backend)
     # The estimator that runs is the reference-building pass (flow for the qwarp backend).
     prepass_backend = "flow" if qwarp_backend else args.backend
 
@@ -2289,7 +2327,8 @@ def _run_multiecho(
         # echoes (no flow estimation), so the flow-tuning / ref / refine flags don't apply.
         print(
             f"   TEs [{te_str}] ms, PE {_pe_label(args)} (axis {pe_axis}), backend=qwarp "
-            f"(reference: median of raw echoes, no flow pass), scaling={scaling}, "
+            f"(no flow pass), template={qwarp_ref_mode} of raw echoes, "
+            f"refine={qwarp_refine}, scaling={scaling}, "
             f"automask={'on' if automask else 'off'}"
         )
         print(
@@ -2306,8 +2345,13 @@ def _run_multiecho(
     if hpf_sigma > 0:
         print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     # The inter-echo mode has no temporal reference, so the refine bias warning is moot.
-    # Under the qwarp backend, refine only sharpens the reference, so a low-magnitude
-    # warning would be misleading (qwarp estimates the full field regardless).
+    # The qwarp backend has its own template-refine loop and its own note below.
+    if qwarp_backend and qwarp_refine == 0:
+        print(
+            f"   ℹ️  qwarp refine=0: the template ('{qwarp_ref_mode}' of the RAW echoes) still "
+            "carries the distortion, so it is blurred by it and biases the field LOW — add "
+            "-refine/-qwarp_refine 2 to rebuild it from the corrected series."
+        )
     if args.refine == 0 and not args.me_interecho and not qwarp_backend:
         print(
             f"   ℹ️  refine=0: the reference ('{args.ref_label}') is built from the un-corrected "
@@ -2476,7 +2520,10 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import polish_me_result
 
         if qwarp_backend:
-            print("🪄 qwarp backend: registering raw echoes to the median-of-raw reference...")
+            print(
+                f"🪄 qwarp backend: registering raw echoes to the {qwarp_ref_mode}-of-raw "
+                f"reference ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
+            )
         else:
             print("🪄 Polishing residual with joint TE-scaled qwarp...")
         result = polish_me_result(
@@ -2488,6 +2535,8 @@ def _run_multiecho(
             optimizer=args.qwarp_optimizer,
             compile=args.qwarp_compile,
             full=qwarp_backend,
+            ref_mode=qwarp_ref_mode,
+            refine=qwarp_refine,
             slicewise=False,  # -me_3depi is 3-D-acquired: through-plane continuity is real
             raw_datas=datas,
             device=device,
@@ -2869,6 +2918,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 file=sys.stderr,
             )
             return 2
+    qwarp_ref_mode, qwarp_refine = _qwarp_template_args(args, qwarp_backend)
     # The estimator that runs is the reference-building pass (flow for the qwarp backend).
     prepass_backend = "flow" if qwarp_backend else args.backend
     # -backend qwarp owns the whole field, so the flow estimation is skipped (qwarp+dual
@@ -2999,7 +3049,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     print(f"   accuracy: {acc_desc}")
     if qwarp_backend:
         print(
-            f"   🪄 qwarp field (E=1, ncc to median of raw, no flow pass): "
+            f"   🪄 qwarp field (E=1, ncc to {qwarp_ref_mode} of raw, refine={qwarp_refine}, "
+            f"no flow pass): "
             f"minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
             f"iters={args.qwarp_iters}, optimizer={args.qwarp_optimizer}"
         )
@@ -3149,7 +3200,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         from fastfuncstuff.processing.locomoco import MultiEchoLocomocoResult, polish_me_result
 
         print(
-            "🪄 qwarp backend: registering frames to the median-of-raw reference..."
+            f"🪄 qwarp backend: registering frames to the {qwarp_ref_mode}-of-raw "
+            f"reference ({qwarp_refine + 1} pass{'es' if qwarp_refine else ''})..."
             if qwarp_backend
             else "🪄 Polishing residual with qwarp..."
         )
@@ -3184,6 +3236,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             optimizer=args.qwarp_optimizer,
             compile=args.qwarp_compile,
             full=qwarp_backend,
+            ref_mode=qwarp_ref_mode,
+            refine=qwarp_refine,
             # 2-D multi-slice: each slice is its own acquisition instant, so the qwarp
             # patches stay 2-D like the estimator. -is_3dacq is one shot -> 3-D patches.
             slicewise=not (args.is_3dacq or args.qwarp_3d),
