@@ -21,6 +21,25 @@ Conventions used below:
   MPS cannot perform. Whole-brain `ffs_pyrf` can benefit from MPS, while `ffs_ica`
   generally remains faster on the Mac CPU.
 - `-prefix` (or `-output`) is the output path; many tools write multiple files derived from this prefix.
+- Every flag accepts both spellings — `-hrf-library` and `-hrf_library` — and some carry an
+  older or shorter name as well (`-max_pcs` for `-max_comps`, `-pe` for `-pe_dir`). `-help`
+  lists the alternative names beside the flag; shell completion offers only the primary one,
+  so the TAB list has one entry per flag rather than one per spelling. Typing an alias still
+  works, and still completes its values.
+
+## Shell completion
+
+`ffs_completion` writes static completion scripts for bash, fish and zsh. They are generated
+by introspecting the parsers once, offline, because importing a CLI costs ~2 s and no one
+wants that on a TAB press — so regenerate after adding or renaming a flag:
+
+```
+make completions          # all three shells, into the usual per-shell directories
+```
+
+Run it with the same interpreter the `ffs_*` scripts on `PATH` belong to. The tool list comes
+from that interpreter's installed metadata, so a second environment with an older install
+writes completions for only part of the toolbox; the generator warns when it detects this.
 
 ---
 

@@ -21,6 +21,7 @@ from fastfuncstuff.completion import (
     load_parser,
     render_bash,
     render_fish,
+    render_zsh,
 )
 
 
@@ -105,17 +106,23 @@ class TestDescribe:
         assert spec.option_strings == ["-hrf-shapes", "-hrf_shapes"]  # still MATCHED
         assert spec.display_strings == ["-hrf-shapes"]  # only one OFFERED
 
-    def test_genuinely_different_names_are_both_offered(self):
-        """A renamed flag keeping its predecessor is two names, not one alias."""
+    def test_renamed_flags_offer_only_the_primary_name(self):
+        """Aliases are accepted, not suggested -- however different they look.
+
+        ffs_fitbasis accepts five spellings of -hrf; listing all five makes the
+        user read the completion list five times to find one flag. The other
+        names still parse, and -help still prints them.
+        """
         parser = argparse.ArgumentParser()
         parser.add_argument(
             "-hrf-shapes", "-hrf_shapes", "-shift-shapes", "-shift_shapes", dest="hrf_shapes"
         )
         spec = next(s for s in describe(parser) if "-hrf-shapes" in s.option_strings)
-        assert spec.display_strings == ["-hrf-shapes", "-shift-shapes"]
+        assert spec.display_strings == ["-hrf-shapes"]
+        assert "-shift-shapes" in spec.option_strings  # still MATCHED
 
     def test_underscore_primary_is_not_hidden_by_its_hyphen_alias(self):
-        """Why the rule is "first of each name", not "drop underscores".
+        """Why the rule is "the first spelling", not "drop underscores".
 
         -drop_first is the documented name and -drop-first only its alias, so
         a blanket underscore filter would offer the alias and hide the flag.
@@ -125,7 +132,39 @@ class TestDescribe:
             "-drop_first", "-drop-first", "-skip_first", "-skip-first", dest="drop_first", type=int
         )
         spec = next(s for s in describe(parser) if "-drop_first" in s.option_strings)
-        assert spec.display_strings == ["-drop_first", "-skip_first"]
+        assert spec.display_strings == ["-drop_first"]
+
+    def test_dropped_separator_variants_collapse_too(self):
+        """-nocoverage vs -no_coverage: normalising _ to - alone misses these.
+
+        Ten tools had a pair like this reach the generated completions as two
+        entries, because the old key only replaced underscores with hyphens.
+        """
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-no_coverage", "-nocoverage", dest="no_coverage", action="store_true")
+        specs = [s for s in describe(parser) if "-no_coverage" in s.option_strings]
+        assert len(specs) == 1
+        assert specs[0].display_strings == ["-no_coverage"]
+
+    def test_alias_registered_as_a_second_argument_is_merged(self):
+        """ffs_moco registers -chain-init as its own add_argument, not an alias.
+
+        Per-action deduping cannot see that the two are one flag, so both
+        reached the completion list.
+        """
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-chain_init", dest="chain_init", action="store_true")
+        parser.add_argument("-chain-init", dest="chain_init", action="store_true")
+        specs = [s for s in describe(parser) if "chain" in s.option_strings[0]]
+        assert len(specs) == 1
+        assert specs[0].display_strings == ["-chain_init"]
+        assert "-chain-init" in specs[0].option_strings  # still MATCHED
+
+    def test_suppressed_flags_are_not_offered(self):
+        """A hidden flag used to be offered with "==SUPPRESS==" as its help."""
+        parser = argparse.ArgumentParser()
+        parser.add_argument("-secret", help=argparse.SUPPRESS)
+        assert not [s for s in describe(parser) if "-secret" in s.option_strings]
 
     def test_help_is_collapsed_to_one_line(self):
         parser = argparse.ArgumentParser()
@@ -223,3 +262,41 @@ def test_generated_fish_loads_and_completes(tmp_path):
     assert proc.returncode == 0, proc.stderr
     offered = {line.split("\t")[0] for line in proc.stdout.splitlines()}
     assert {"TENT", "TENTzero", "FIR", "CSPLIN"} <= offered
+
+
+def test_generated_zsh_quoting_is_balanced():
+    """The hazard in an _arguments spec is quoting, and bash grades that.
+
+    zsh is not installed everywhere, but the two shells share the word grammar,
+    so ``bash -n`` catches an unbalanced quote or a broken continuation -- which
+    is what ffs help text full of ``[``, ``]``, ``:`` and apostrophes threatens.
+    """
+    parser = load_parser("fastfuncstuff.cli.allineate")
+    assert parser is not None
+    script = render_zsh("ffs_allineate", describe(parser))
+    proc = subprocess.run(["bash", "-n"], input=script, text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_zsh_escapes_the_characters_that_end_a_spec():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-cost", choices=["lpa", "lpc"], help="[BETA] pick: don't guess")
+    script = render_zsh("ffs_demo", describe(parser))
+    line = next(ln for ln in script.splitlines() if "-cost" in ln)
+    assert r"\[BETA\]" in line
+    assert r"pick\:" in line
+    assert "(lpa lpc)" in line
+
+
+@pytest.mark.skipif(not shutil.which("zsh"), reason="zsh not available")
+def test_generated_zsh_loads_and_completes(tmp_path):
+    parser = load_parser("fastfuncstuff.cli.deconvolve")
+    assert parser is not None
+    (tmp_path / "_ffs_deconvolve").write_text(render_zsh("ffs_deconvolve", describe(parser)))
+    script = (
+        f"fpath=({tmp_path} $fpath); autoload -Uz compinit; compinit -u; "
+        "autoload -Uz _ffs_deconvolve; print OK"
+    )
+    proc = subprocess.run(["zsh", "-f", "-c", script], text=True, capture_output=True)
+    assert proc.returncode == 0, proc.stderr
+    assert "OK" in proc.stdout

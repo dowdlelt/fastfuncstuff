@@ -83,31 +83,31 @@ _DIR_METAVARS = {"DIR", "DIRECTORY", "DATA_DIR", "OUT_DIR"}
 _DEVICE_WORDS = ("auto", "cpu", "cuda", "mps")
 
 
+def _norm(option: str) -> str:
+    """The key two spellings of one flag share.  See :func:`canonical_option_strings`."""
+    return option.replace("_", "").replace("-", "")
+
+
 def _display_strings(option_strings: list[str]) -> list[str]:
-    """One spelling per NAME, keeping the order argparse was given.
+    """The single spelling a shell should OFFER.
 
-    Every ffs flag accepts both ``-foo-bar`` and ``-foo_bar``, and several
-    carry a renamed predecessor as well.  Offering all of them doubles the
-    completion list (measured on ffs_fitbasis: 71 flags, 132 spellings)
-    without adding a single new thing the user can do.
+    Aliases are *accepted*, never *suggested*.  ffs_fitbasis alone accepts 85
+    spellings for 73 flags, and a completion list that shows -hrf, -basis-hrf,
+    -hrf-shapes, -shift-shapes and -shift-hrf as five entries is a list the
+    user has to read five times to find one flag.  Which alias is which is a
+    question for ``-help``, where the full set still prints (see
+    :class:`fastfuncstuff.cli_help.FfsHelpFormatter`); TAB's job is to name the
+    flag once.
 
-    Deduping on the hyphen-normalised key rather than "drop anything with an
-    underscore" matters: flags like ``-drop_first`` are *documented* with the
-    underscore and only alias to ``-drop-first``, so a blanket rule would
-    hide the primary name and surface the alias.  Keeping the first spelling
-    of each distinct name keeps whatever argparse was told is primary, and
-    still lists genuinely different names (``-drop_first`` and
-    ``-skip_first``) separately.
+    Anchoring on the FIRST spelling keeps whatever argparse was told is
+    primary: ``-drop_first`` is documented with the underscore and only aliases
+    to ``-drop-first``, so any "prefer the dash form" rule would surface the
+    alias and hide the flag.
+
+    Matching is unaffected -- :func:`render_bash` still keys its ``case`` on
+    every spelling, so value completion works for whichever one was typed.
     """
-    seen: set[str] = set()
-    out: list[str] = []
-    for opt in option_strings:
-        key = opt.replace("_", "-")
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(opt)
-    return out
+    return option_strings[:1]
 
 
 @dataclass
@@ -269,14 +269,32 @@ def _completion_kind(action: argparse.Action) -> str:
 def describe(parser: argparse.ArgumentParser) -> list[OptionSpec]:
     """Flatten a parser into :class:`OptionSpec`, groups and all."""
     specs: list[OptionSpec] = []
-    seen: set[str] = set()
+    by_key: dict[str, OptionSpec] = {}
     for action in parser._actions:
         if not action.option_strings:
             continue  # positionals: shells fall back to file completion anyway
-        key = action.option_strings[0]
-        if key in seen:
+        if action.help is argparse.SUPPRESS:
+            # A deliberately hidden flag. It used to be offered anyway, with the
+            # literal string "==SUPPRESS==" as its description (four tools).
             continue
-        seen.add(key)
+
+        keys = [_norm(opt) for opt in action.option_strings]
+        merged = next((by_key[k] for k in keys if k in by_key), None)
+        if merged is not None:
+            # A second add_argument for what is really one flag -- ffs_moco
+            # registers -chain-init separately from -chain_init rather than as
+            # an alias of it. Per-ACTION deduping cannot see that, so the pair
+            # reached the completions twice. Keep the extra spellings matchable
+            # and stop there.
+            # Exact spellings, not normalised keys: the whole point is that
+            # -chain-init stays matchable even though it normalises onto the
+            # -chain_init that is already here.
+            known = set(merged.option_strings)
+            merged.option_strings.extend(opt for opt in action.option_strings if opt not in known)
+            for key in keys:
+                by_key.setdefault(key, merged)
+            continue
+
         takes_value = action.nargs != 0 and not isinstance(
             action, argparse._StoreTrueAction | argparse._StoreFalseAction | argparse._HelpAction
         )
@@ -284,15 +302,16 @@ def describe(parser: argparse.ArgumentParser) -> list[OptionSpec]:
         help_text = " ".join((action.help or "").split())
         if len(help_text) > 90:
             help_text = help_text[:87].rstrip() + "..."
-        specs.append(
-            OptionSpec(
-                option_strings=list(action.option_strings),
-                help=help_text,
-                choices=[str(c) for c in (action.choices or [])],
-                takes_value=bool(takes_value),
-                completes=_completion_kind(action) if takes_value else "none",
-            )
+        spec = OptionSpec(
+            option_strings=list(action.option_strings),
+            help=help_text,
+            choices=[str(c) for c in (action.choices or [])],
+            takes_value=bool(takes_value),
+            completes=_completion_kind(action) if takes_value else "none",
         )
+        specs.append(spec)
+        for key in keys:
+            by_key[key] = spec
     return specs
 
 
@@ -421,4 +440,51 @@ def render_fish(prog: str, specs: list[OptionSpec]) -> str:
     return "\n".join(lines) + "\n"
 
 
-RENDERERS = {"bash": render_bash, "fish": render_fish}
+def _zsh_quote(text: str) -> str:
+    """Escape a description for one ``_arguments`` spec.
+
+    ``_arguments`` parses the spec itself, so ``[``, ``]`` and ``:`` inside a
+    description terminate it early -- and ffs help text is full of all three
+    (``-adjust_dof MAP|N``, ``lpa=local Pearson``, ``[BETA]``).
+    """
+    for char in ("\\", "[", "]", ":"):
+        text = text.replace(char, "\\" + char)
+    return text.replace("'", "'\\''")
+
+
+def render_zsh(prog: str, specs: list[OptionSpec]) -> str:
+    """An ``_arguments``-based completer, which is what buys descriptions.
+
+    zsh is the only one of the three that shows a flag's help beside the flag
+    the way fish does; bash's ``compgen`` has nowhere to put it.
+    """
+    func = "_" + prog.replace("-", "_")
+    lines = [f"#compdef {prog}", "", f"{func}() {{", "    _arguments -S \\"]
+    specs_out = []
+    for spec in specs:
+        for option in spec.display_strings:
+            desc = f"[{_zsh_quote(spec.help)}]" if spec.help else ""
+            if not spec.takes_value:
+                specs_out.append(f"'{option}{desc}'")
+                continue
+            metavar = spec.option_strings[0].lstrip("-").upper()
+            if spec.completes == "device":
+                action = f"({' '.join(_DEVICE_WORDS)})"
+            elif spec.completes == "choices":
+                action = f"({' '.join(_zsh_quote(c) for c in spec.choices)})"
+            elif spec.completes == "file":
+                action = "_files"
+            elif spec.completes == "dir":
+                action = "_files -/"
+            else:
+                action = " "  # a number or free text: complete nothing, not the cwd
+            specs_out.append(f"'{option}{desc}:{metavar}:{action}'")
+    lines.extend("        " + spec_line + " \\" for spec_line in specs_out)
+    lines.append("        '*:file:_files'")
+    lines.append("}")
+    lines.append("")
+    lines.append(f'{func} "$@"')
+    return "\n".join(lines) + "\n"
+
+
+RENDERERS = {"bash": render_bash, "fish": render_fish, "zsh": render_zsh}
