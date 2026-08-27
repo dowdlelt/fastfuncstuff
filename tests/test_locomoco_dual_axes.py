@@ -1007,3 +1007,21 @@ def test_detask_without_events_is_refused(tmp_path):
         ]
     )  # fmt: skip
     assert rc == 2
+
+
+def test_help_keeps_explicit_newlines_and_hides_none_defaults():
+    """The help formatter is load-bearing: argparse would re-flow every choice list.
+
+    Without the _split_lines override a flag that documents four backends renders as one
+    unscannable paragraph, so the newlines in those help strings are silently lost.
+    """
+    from fastfuncstuff.cli.locomoco import create_parser
+
+    text = create_parser().format_help()
+    # One choice per line, indented under its flag.
+    assert "\n                          flow   " in text
+    assert "\n                          qwarp  " in text
+    # A "(default: X)" appended to the last choice would read as part of that choice.
+    assert "\n                        (default: ncc)" in text
+    # "(default: None)" is noise — -ref's real default is computed after parsing.
+    assert "default: None" not in text

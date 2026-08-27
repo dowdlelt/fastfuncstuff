@@ -63,7 +63,45 @@ def _split_prefix(prefix: str) -> tuple[str, str]:
 
 
 class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    """Show each arg's default AND keep the epilog's hand-formatted layout."""
+    """Show each arg's default, keep the epilog's layout, and honour newlines in help.
+
+    argparse re-flows every help string into one paragraph, which turns a flag that
+    documents four choices into an unscannable wall. Explicit newlines are kept here (and
+    a hanging indent is carried onto the wrapped continuation), so a help string can put
+    one choice per line while long lines still wrap to the terminal.
+    """
+
+    def _get_help_string(self, action):
+        if action.default is None:
+            # "(default: None)" is never information — the real default is computed later
+            # (see -ref) or the flag is simply optional.
+            return action.help
+        text = super()._get_help_string(action)
+        if text and "\n" in text and text.endswith(")"):
+            # " (default: X)" tacked onto the last line of a choice list reads as part of
+            # that choice. Break it out onto its own line once the help is multi-line.
+            head, _, tail = text.rpartition(" (default:")
+            return f"{head}\n(default:{tail}" if head else text
+        return text
+
+    def _split_lines(self, text: str, width: int) -> list[str]:
+        import re
+        import textwrap
+
+        out: list[str] = []
+        for line in text.splitlines():
+            if not line.strip():
+                out.append("")
+                continue
+            # An indented "  key   meaning" line hangs under the MEANING, so a wrapped
+            # choice stays visually one block instead of drifting back under its key.
+            m = re.match(r"(\s+\S+\s\s+)", line)
+            lead = len(line) - len(line.lstrip())
+            # Cap the hang: a long key (CONDITION-PAIRED) would otherwise push its own
+            # continuations most of the way across the terminal.
+            hang = " " * min(len(m.group(1)), lead + 12) if m else " " * lead
+            out.extend(textwrap.wrap(line, width, subsequent_indent=hang) or [""])
+        return out
 
 
 _EPILOG = """\
@@ -494,169 +532,108 @@ def create_parser() -> argparse.ArgumentParser:
         "-me_refine_scaling",
         choices=("affine", "step", "flat", "te", "learn"),
         default="affine",
-        help="[-me_interecho_refine] Per-echo scaling model for the refine pass. The leftover "
-        "after inter-echo has TWO parts: (a) TE_1·g, echo 1's OWN distortion — inter-echo "
-        "aligns echoes to each other, never to undistorted anatomy, so this survives "
-        "identically on every echo (FLAT); and (b) (TE_e−TE_1)·delta, the ladder error if the "
-        "pass found 1.0 vox where the truth was 1.5 — the shortfall grows with TE and is zero "
-        "at the anchor (STEP). 'affine' (default) runs both as two pooled solves and so spans "
-        "the whole family; 'step' / 'flat' / 'te' run one law only; 'learn' fits alpha from the "
-        "data (the only mode that is NOT a single pooled solve — rank-1 factoring needs each "
-        "echo estimated separately first) and is the way to data-check which law dominates.",
+        help="[-me_interecho_refine] Per-echo scaling model for the refine pass.\n"
+        "What inter-echo leaves behind has TWO parts, and they scale with TE differently:\n"
+        "  (a) TE_1·g — echo 1's OWN distortion. Inter-echo aligns the echoes to each other,"
+        " never to undistorted anatomy, so this survives identically on every echo. FLAT.\n"
+        "  (b) (TE_e−TE_1)·delta — the ladder error, e.g. the pass found 1.0 vox where the"
+        " truth was 1.5. The shortfall grows with TE and is zero at the anchor. STEP.\n"
+        "  affine  run both as two pooled solves, spanning the whole family.\n"
+        "  step    the ladder law alone.\n"
+        "  flat    echo 1's own distortion alone.\n"
+        "  te      plain TE-proportional.\n"
+        "  learn   fit alpha from the data. The only mode that is NOT a single pooled solve —"
+        " rank-1 factoring needs every echo estimated separately first — and the way to"
+        " data-check which law actually dominates.",
     )
     me.add_argument(
         "-me_match",
         choices=("none", "meanstd", "localnorm", "gradmag"),
         default="localnorm",
-        help="[-me_interecho -backend flow] Intensity matching applied to each echo pair before "
-        "the LK solve. Optical flow assumes brightness constancy, which consecutive echoes "
-        "violate by construction (T2* dims the later echo everywhere) — unmatched, the decay "
-        "step is read as displacement and the field diverges. 'localnorm' (default) local "
-        "z-scores both sides; 'gradmag' registers locally-normalized gradient magnitude (edges "
-        "only, the most contrast-agnostic); 'meanstd' is a global rescale; 'none' is the raw "
-        "residual. Inert for -backend xcorr (correlation is already scale-invariant).",
+        help="[-me_interecho -backend flow] Intensity matching applied to each ECHO PAIR before"
+        " the LK solve. The cross-TE counterpart of -match (which matches frames over TIME, and"
+        " is ignored on the multi-echo path).\n"
+        "Optical flow assumes brightness constancy, which consecutive echoes violate by"
+        " construction — T2* dims the later echo everywhere. Unmatched, that decay step is read"
+        " as displacement and the field diverges.\n"
+        "  none       the raw residual.\n"
+        "  localnorm  local z-score both sides.\n"
+        "  gradmag    locally-normalized gradient magnitude — edges only, the most"
+        " contrast-agnostic.\n"
+        "  meanstd    one global rescale.\n"
+        "Neighbourhood size is -me_match_sigma. Inert for -backend xcorr (correlation is"
+        " already scale-invariant).",
     )
     me.add_argument(
         "-me_match_sigma",
         type=float,
         default=2.0,
         metavar="VOX",
-        help="Neighbourhood sigma (voxels) for -me_match localnorm/gradmag. Default 2.",
+        help="[-me_match localnorm/gradmag] Gaussian sigma, in VOXELS, of the neighbourhood the"
+        " local mean and scale are measured over.\n"
+        "A CONTRAST scale, independent of the motion scale -window: matching finishes on the"
+        " echo pair before the LK solve starts, which then pools gradients over -window on the"
+        " matched data.\n"
+        "Much tighter than -match_sigma (6) on purpose. -match cancels a smooth"
+        " illumination-like drift, so it wants a wide mean; the T2* difference between two"
+        " echoes tracks tissue and follows anatomy closely, so the mean has to be local enough"
+        " to follow it. Widen it if the late echo has dropped out over a region larger than the"
+        " window.",
     )
     me.add_argument(
         "-me_estimate_from",
         "-me_from",
         default=None,
-        help="RECOMMENDED once TE-linearity is established: estimate the shared field on ONE echo "
-        "and scale to the rest by TE ratio (no joint solve, no per-echo passes). "
-        "'last' (largest, easiest-to-detect shifts) | 'mid' | 'first' | a 1-based echo index. "
-        "Runs the full single-echo -is_3dacq estimator (incl. -refine/-superhard) on that echo; "
-        "every other echo's warp is (TE_e/TE_k)·w. Much faster and often steadier than the joint "
-        "solve; use the joint path (omit this) only to also DATA-CHECK the scaling.",
-    )
-    me.add_argument(
-        "-final_qwarp",
-        action="store_true",
-        help="After a flow/xcorr/phase estimate, POLISH the residual with a few fine PE-only "
-        "nonlinear qwarp levels under the joint TE-scaled objective (one shared residual field "
-        "r, every echo scored at alpha_e·r). Removes the sub-voxel wiggle the search can't "
-        "resolve; total field is w+r. Configured by the -qwarp_* flags below. Needs the "
-        "corrected series (not compatible with -no_corrected). Use -backend qwarp instead to "
-        "let qwarp own the whole field. Works single-echo too; for 2-D multi-slice data the "
-        "patches are 2-D slicewise (see -qwarp_3d).",
-    )
-    me.add_argument(
-        "-qwarp_3d",
-        "-qwarp-3d",
-        action="store_true",
-        dest="qwarp_3d",
-        help="Use isotropic 3-D qwarp patches on 2-D multi-slice data. By default (2-D "
-        "acquisition, no -is_3dacq) the patches are 2-D and one slice thick, matching the "
-        "slicewise estimator: each slice is acquired at its own instant, so a 3-D patch would "
-        "smooth the residual field across acquisition times. Set this only if you know the "
-        "residual field really is smooth through plane. Implied by -is_3dacq / -me_3depi.",
-    )
-    me.add_argument(
-        "-qwarp_minpatch",
-        "-final_qwarp_minpatch",
-        type=int,
-        default=7,
-        dest="qwarp_minpatch",
-        help="Finest qwarp patch size (voxels), in-plane only when the patches are 2-D "
-        "slicewise. Default 7 for the -final_qwarp polish; try 9 for -backend qwarp. Applies "
-        "to both the polish and the full qwarp backend.",
-    )
-    me.add_argument(
-        "-qwarp_levels",
-        "-final_qwarp_levels",
-        type=int,
-        default=2,
-        dest="qwarp_levels",
-        help="Number of qwarp levels (coarsest is ~minpatch/0.75^(n-1)). Default 2 for the "
-        "polish; try 4 for -backend qwarp (needs more reach from scratch).",
-    )
-    me.add_argument(
-        "-qwarp_iters",
-        "-final_qwarp_iters",
-        type=int,
-        default=10,
-        dest="qwarp_iters",
-        help="Per-patch optimizer iterations. The GN solver converges in a few steps, so this "
-        "is a generous cap, not a dial. Default 10.",
-    )
-    me.add_argument(
-        "-qwarp_cost",
-        default="ncc",
-        choices=("ncc", "lpa", "lpc"),
-        help="qwarp patch cost. 'ncc' (default, weighted Pearson) is right for the "
-        "same-contrast polish and enables the Gauss-Newton optimizer; lpa/lpc are the "
-        "AFNI-faithful blok-local costs (autodiff Adam only).",
-    )
-    me.add_argument(
-        "-qwarp_optimizer",
-        default="gn",
-        choices=("gn", "adam"),
-        help="qwarp per-patch optimizer. 'gn' (default) Gauss-Newton with an analytic "
-        "image-gradient Jacobian — no autograd, converges in a few steps (~5x faster); needs "
-        "-qwarp_cost ncc (falls back to adam otherwise). 'adam' the autodiff optimizer.",
-    )
-    me.add_argument(
-        "-qwarp_compile",
-        "-qwarp-compile",
-        action="store_true",
-        dest="qwarp_compile",
-        help="Experimental (CUDA only, off by default): torch.compile the per-frame qwarp "
-        "building blocks. The plan geometry is identical across frames, so the compile "
-        "warmup is paid once and amortized over the whole series. Applies to both the "
-        "-final_qwarp polish and -backend qwarp. Benchmark before trusting on a new box; "
-        "falls back to eager if inductor is unavailable.",
-    )
-    me.add_argument(
-        "-qwarp_refine",
-        "-qwarp-refine",
-        type=int,
-        default=None,
-        dest="qwarp_refine",
-        help="Re-run the qwarp registration N extra times, each against a template rebuilt "
-        "from the previous pass's corrected series (re-solved from seed 0, never seeded "
-        "with the previous field). The first template is built from data that still "
-        "carries the distortion, so it is blurred by it and biases the field LOW — the "
-        "same reason the estimator has -refine. Defaults to -refine under -backend qwarp "
-        "(where no flow pass runs, so -refine has nothing else to do) and to 0 for the "
-        "-final_qwarp polish (whose template the flow refine already sharpened). Each "
-        "pass costs a full qwarp sweep.",
+        help="RECOMMENDED once TE-linearity is established. Estimate the shared field on ONE"
+        " echo and scale to the rest by the TE ratio — no joint solve, no per-echo passes.\n"
+        "  last   the largest TE, whose shifts are the easiest to detect.\n"
+        "  mid    the middle echo.\n"
+        "  first  the shortest TE.\n"
+        "  <N>    a 1-based echo index.\n"
+        "Runs the full single-echo -is_3dacq estimator on that echo (-refine / -superhard and"
+        " the rest all apply); every other echo's warp is (TE_e/TE_k)·w. Much faster and often"
+        " steadier than the joint solve. Omit it and use the joint path only when you also want"
+        " to DATA-CHECK the scaling.",
     )
     est = p.add_argument_group("Estimation — all backends")
     est.add_argument(
         "-backend",
         default="flow",
         choices=("flow", "phase", "xcorr", "qwarp"),
-        help="Displacement estimator (all measure the same PE shift): 'flow' "
-        "(default) pyramidal Lucas-Kanade optical flow — most precise, slowest; "
-        "'phase' phase-correlation searchlight (FFT phase-ramp along PE) — fastest, "
-        "near-flow accuracy; 'xcorr' magnitude cross-correlation searchlight (slide "
-        "along PE, peak local correlation) — robust, single-shot; 'qwarp' skips the flow "
-        "estimate entirely and lets the joint TE-scaled qwarp own the whole field (raw "
-        "frames → a temporal reduction of themselves; -ref picks the reduction, -refine "
-        "rebuilds it from the corrected series and re-solves). For already-moco'd input; "
-        "for residual motion use -backend flow -final_qwarp. See epilog for tuning.",
+        help="Displacement estimator. All four measure the same PE shift.\n"
+        "  flow   pyramidal Lucas-Kanade optical flow. Most precise, slowest."
+        " Tuned by -levels / -iters / -window.\n"
+        "  phase  phase-correlation searchlight (FFT phase ramp along PE). Fastest, and close"
+        " to flow in accuracy. Its window is -patch, not -window.\n"
+        "  xcorr  magnitude cross-correlation searchlight: slide along PE, take the peak local"
+        " correlation. Robust and single-shot; already scale-invariant, so the"
+        " intensity-matching flags are inert for it.\n"
+        "  qwarp  no flow estimate at all — the joint TE-scaled qwarp owns the whole field,"
+        " registering the raw frames to a temporal reduction of themselves (-ref picks the"
+        " reduction, -refine rebuilds it from the corrected series and re-solves). For input"
+        " that is ALREADY motion corrected; for residual motion use -backend flow"
+        " -final_qwarp.\n"
+        "See the epilog for tuning.",
     )
     est.add_argument(
         "-ref",
         default=None,
-        help="[all] Reference: static mean | median | max | first | <frame index>; "
-        "PROGRESSIVE first_mean / first_median — frame t registers to the running "
-        "mean/median of the already-corrected earlier frames (a bootstrapped template; "
-        "frame 0 is the seed), sequential and slower; or CONDITION-PAIRED paired / "
-        "paired_mean / paired_median (needs -events + a TR) — frames are binned by "
-        "predicted BOLD state and each registers to the template of its OWN bin, so the "
-        "task response is common-mode within the pair and cancels. That is prevention "
-        "for the contamination -detask cures, with no HRF fit and nothing assumed about "
-        "how it enters; see -task_bin_width. 3-D solve only, not with -backend qwarp. "
-        "'max' takes the temporal maximum, which fills slices later frames rotate out of "
-        "the FoV and is a high-signal target; it has no paired form, because a max over "
-        "one bin's frames is a noise envelope, not a template. Default: max for "
-        "rotation-aware mode, mean otherwise.",
+        help="[all] What every frame is registered TO. Three families:\n"
+        "  STATIC  mean | median | max | first | <frame index> — one template for the whole"
+        " run. 'max' takes the temporal maximum, which fills slices that later frames rotate"
+        " out of the FoV and is a high-signal target.\n"
+        "  PROGRESSIVE  first_mean | first_median — frame t registers to the running"
+        " mean/median of the already-corrected EARLIER frames (a bootstrapped template, frame"
+        " 0 the seed). Sequential, so slower.\n"
+        "  CONDITION-PAIRED  paired | paired_mean | paired_median — needs -events and a TR."
+        " Frames are binned by predicted BOLD state and each registers to the template of its"
+        " OWN bin, so the task response is common-mode within the pair and cancels. This is"
+        " PREVENTION for the contamination -detask cures, with no HRF fit and nothing assumed"
+        " about how the response enters; see -task_bin_width. 3-D solve only, and not with"
+        " -backend qwarp. 'max' has no paired form — a max over one bin's frames is a noise"
+        " envelope, not a template.\n"
+        "Also selects the aggregation for -refine, and (when given explicitly) the qwarp"
+        " template. Default: max for rotation-aware mode, mean otherwise.",
     )
     est.add_argument(
         "-first_n",
@@ -699,21 +676,25 @@ def create_parser() -> argparse.ArgumentParser:
         "-tmatch",
         choices=("none", "meanstd", "localnorm", "gradmag"),
         default="none",
-        help="[flow, phase] Intensity matching applied to the ESTIMATION frames only, "
-        "before -hpf_spatial and -do_blur. Reach for this when frame intensity VARIES "
-        "OVER THE RUN — the pre-steady-state ramp (first frames brighter until T1 "
-        "saturation settles), or any other non-motion fluctuation. Optical flow assumes "
-        "a voxel keeps its intensity as it moves, so it reads that brightness change as "
-        "displacement: on one 1.2mm run the LK field for frame 0 was 4.5x the "
-        "steady-state median and spatially incoherent. 'localnorm' local z-scores both "
-        "sides, which cancels a MULTIPLICATIVE gain (-hpf_spatial only subtracts, so it "
-        "cannot); 'gradmag' keeps locally-normalized gradient magnitude (edges only); "
-        "'meanstd' is a global rescale — near-useless for the ramp, whose gain varies "
-        "0.94-1.39 across tissue. Inert for -backend xcorr, which normalizes inside its "
-        "own correlation window and is already immune. The correction still resamples "
-        "the RAW series. Single-echo path only (slicewise and 3-D-acq); the multi-echo "
-        "entries carry -me_match for their cross-TE matching. Not supported with "
-        "rotation-aware mode. Default none.",
+        help="[flow, phase] Intensity matching applied to the ESTIMATION frames only, before"
+        " -hpf_spatial and -do_blur. The corrected output still resamples the RAW series"
+        " either way.\n"
+        "Reach for this when frame intensity varies OVER THE RUN: the pre-steady-state ramp"
+        " (first frames brighter until T1 saturation settles), or any other non-motion"
+        " fluctuation. Optical flow assumes a voxel keeps its intensity as it moves, so it"
+        " reads a brightness change as displacement — on one 1.2 mm run the LK field for"
+        " frame 0 came out 4.5x the steady-state median and spatially incoherent.\n"
+        "  none       the raw residual.\n"
+        "  localnorm  local z-score both sides. Cancels a MULTIPLICATIVE gain, which"
+        " -hpf_spatial cannot (it only subtracts). The usual choice.\n"
+        "  gradmag    locally-normalized gradient magnitude — edges only, the most"
+        " contrast-agnostic.\n"
+        "  meanstd    one global rescale per frame. Near-useless for the ramp, whose gain"
+        " varies 0.94-1.39 across tissue.\n"
+        "Neighbourhood size is -match_sigma; it does not interact with -window.\n"
+        "Inert for -backend xcorr (it normalizes inside its own correlation window)."
+        " SINGLE-ECHO path only — multi-echo runs use -me_match for their cross-TE matching"
+        " and IGNORE this flag. Not supported with rotation-aware mode.",
     )
     est.add_argument(
         "-match_sigma",
@@ -721,8 +702,16 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=6.0,
         metavar="VOX",
-        help="[-match localnorm/gradmag] Gaussian sigma (VOXELS) of the neighbourhood the "
-        "local mean/scale is measured over. Default 6.",
+        help="[-match localnorm/gradmag] Gaussian sigma, in VOXELS, of the neighbourhood the"
+        " local mean and scale are measured over.\n"
+        "This is a CONTRAST scale, not a motion scale. It wants to be wide enough that the"
+        " local mean tracks the illumination-like drift you are cancelling rather than the"
+        " anatomy you are trying to match: too small and the z-score flattens the very edges"
+        " the estimator tracks, too large and it stops following a spatially varying gain."
+        " The default is deliberately wider than the flow -window.\n"
+        "It does NOT interact with -window. Matching runs to completion on the frames first;"
+        " the estimator then pools gradients over -window on the already-matched data. Two"
+        " independent knobs on two different stages.",
     )
 
     flow = p.add_argument_group("Optical-flow backend (-backend flow)")
@@ -748,21 +737,29 @@ def create_parser() -> argparse.ArgumentParser:
         "-iters",
         type=int,
         default=4,
-        help="[flow, phase] Refinement iterations. flow: LK warp-and-update passes per "
-        "pyramid level. phase: whole-field warp-and-re-read passes that cancel the "
-        "single-patch leakage bias. More = better convergence for larger motion, "
-        "linear cost. xcorr ignores it (single-shot).",
+        help="[flow, phase] Refinement iterations INSIDE one estimate (not the outer"
+        " -refine reference loop).\n"
+        "  flow   LK warp-and-update passes per pyramid level.\n"
+        "  phase  whole-field warp-and-re-read passes, which cancel the single-patch"
+        " leakage bias.\n"
+        "  xcorr  ignores it; it is single-shot.\n"
+        "More = better convergence for larger motion, at linear cost.",
     )
     tune.add_argument(
         "-window",
         type=float,
         default=2.0,
         metavar="SIGMA",
-        help="[flow, xcorr] Neighbourhood Gaussian sigma (voxels). flow: the LK "
-        "gradient-pooling window (locally-constant-flow assumption). xcorr: the "
-        "searchlight radius the local correlation is measured over. Larger = smoother, "
-        "more robust, blurs fine local shifts; smaller = sharper, noisier. phase "
-        "ignores it (its window is -patch).",
+        help="[flow, xcorr] Neighbourhood Gaussian sigma, in VOXELS, over which the"
+        " DISPLACEMENT is pooled.\n"
+        "  flow   the LK gradient-pooling window — the scale over which flow is assumed"
+        " locally constant.\n"
+        "  xcorr  the searchlight radius the local correlation is measured over.\n"
+        "  phase  ignores it; its window is -patch.\n"
+        "Larger = smoother and more robust, but blurs fine local shifts; smaller = sharper"
+        " and noisier. This is a MOTION scale, and is independent of the contrast scales"
+        " -match_sigma / -me_match_sigma: intensity matching finishes before the estimator"
+        " runs, and the estimator then pools over -window on the matched data.",
     )
 
     search = p.add_argument_group("Searchlight backends (-backend phase / xcorr)")
@@ -852,20 +849,127 @@ def create_parser() -> argparse.ArgumentParser:
         "~patch/2 is a good overlap.",
     )
 
+    qw = p.add_argument_group(
+        "Nonlinear qwarp (-final_qwarp polish / -backend qwarp)",
+        "A PE-only nonlinear warp under the joint TE-scaled objective. It either POLISHES\n"
+        "the residual a flow/phase/xcorr estimate could not resolve (-final_qwarp; the\n"
+        "total field is w+r), or OWNS the whole field on its own (-backend qwarp, no flow\n"
+        "pass at all). Every -qwarp_* knob below applies to both.",
+    )
+    qw.add_argument(
+        "-final_qwarp",
+        action="store_true",
+        help="After a flow/xcorr/phase estimate, POLISH the residual with a few fine PE-only "
+        "nonlinear qwarp levels under the joint TE-scaled objective (one shared residual field "
+        "r, every echo scored at alpha_e·r). Removes the sub-voxel wiggle the search can't "
+        "resolve; total field is w+r. Configured by the -qwarp_* flags below. Needs the "
+        "corrected series (not compatible with -no_corrected). Use -backend qwarp instead to "
+        "let qwarp own the whole field. Works single-echo too; for 2-D multi-slice data the "
+        "patches are 2-D slicewise (see -qwarp_3d).",
+    )
+    qw.add_argument(
+        "-qwarp_3d",
+        "-qwarp-3d",
+        action="store_true",
+        dest="qwarp_3d",
+        help="Use isotropic 3-D qwarp patches on 2-D multi-slice data. By default (2-D "
+        "acquisition, no -is_3dacq) the patches are 2-D and one slice thick, matching the "
+        "slicewise estimator: each slice is acquired at its own instant, so a 3-D patch would "
+        "smooth the residual field across acquisition times. Set this only if you know the "
+        "residual field really is smooth through plane. Implied by -is_3dacq / -me_3depi.",
+    )
+    qw.add_argument(
+        "-qwarp_minpatch",
+        "-final_qwarp_minpatch",
+        type=int,
+        default=7,
+        dest="qwarp_minpatch",
+        help="Finest qwarp patch size (voxels), in-plane only when the patches are 2-D "
+        "slicewise.\n"
+        "The default suits the -final_qwarp polish; try 9 for -backend qwarp, which has the"
+        " whole field to find rather than a residual.",
+    )
+    qw.add_argument(
+        "-qwarp_levels",
+        "-final_qwarp_levels",
+        type=int,
+        default=2,
+        dest="qwarp_levels",
+        help="Number of qwarp levels; the coarsest is ~minpatch/0.75^(n-1).\n"
+        "The default suits the -final_qwarp polish; try 4 for -backend qwarp, which needs more"
+        " reach starting from scratch.",
+    )
+    qw.add_argument(
+        "-qwarp_iters",
+        "-final_qwarp_iters",
+        type=int,
+        default=10,
+        dest="qwarp_iters",
+        help="Per-patch optimizer iterations. The GN solver converges in a few steps, so this"
+        " is a generous cap, not a dial.",
+    )
+    qw.add_argument(
+        "-qwarp_cost",
+        default="ncc",
+        choices=("ncc", "lpa", "lpc"),
+        help="qwarp patch cost.\n"
+        "  ncc  weighted Pearson. Right for the same-contrast job this is, and the only cost"
+        " the Gauss-Newton optimizer supports.\n"
+        "  lpa  AFNI-faithful blok-local Pearson, absolute value. Autodiff Adam only.\n"
+        "  lpc  AFNI-faithful blok-local Pearson, signed. Autodiff Adam only.",
+    )
+    qw.add_argument(
+        "-qwarp_optimizer",
+        default="gn",
+        choices=("gn", "adam"),
+        help="qwarp per-patch optimizer.\n"
+        "  gn    Gauss-Newton with an analytic image-gradient Jacobian. No autograd, and it"
+        " converges in a few steps (~5x faster). Needs -qwarp_cost ncc, and falls back to adam"
+        " otherwise.\n"
+        "  adam  the autodiff optimizer. Required for the lpa/lpc costs.",
+    )
+    qw.add_argument(
+        "-qwarp_compile",
+        "-qwarp-compile",
+        action="store_true",
+        dest="qwarp_compile",
+        help="Experimental (CUDA only, off by default): torch.compile the per-frame qwarp "
+        "building blocks. The plan geometry is identical across frames, so the compile "
+        "warmup is paid once and amortized over the whole series. Applies to both the "
+        "-final_qwarp polish and -backend qwarp. Benchmark before trusting on a new box; "
+        "falls back to eager if inductor is unavailable.",
+    )
+    qw.add_argument(
+        "-qwarp_refine",
+        "-qwarp-refine",
+        type=int,
+        default=None,
+        dest="qwarp_refine",
+        help="Re-run the qwarp registration N extra times, each against a template rebuilt "
+        "from the previous pass's corrected series (re-solved from seed 0, never seeded "
+        "with the previous field). The first template is built from data that still "
+        "carries the distortion, so it is blurred by it and biases the field LOW — the "
+        "same reason the estimator has -refine. Defaults to -refine under -backend qwarp "
+        "(where no flow pass runs, so -refine has nothing else to do) and to 0 for the "
+        "-final_qwarp polish (whose template the flow refine already sharpened). Each "
+        "pass costs a full qwarp sweep.",
+    )
     acc = p.add_argument_group("Accuracy (trade time for exactness)")
     acc.add_argument(
         "-warp_interp",
         default="auto",
         choices=("auto", "bilinear", "bicubic", "lanczos"),
-        help="[all] Resampler for the estimation iterations and the correction. 'auto' "
-        "uses Lanczos for 1-D/2-D PE warps and bicubic for rotation-aware 3-D. "
-        "'bicubic' removes the bilinear damping bias so the iterations converge to the "
-        "true shift (biggest gain on smooth data); costs a little more per warp. "
-        "'lanczos' is a separable windowed sinc over the active PE axis/axes (half-width "
-        "-warp_radius): 1-D for single PE and 2-D for dual PE on CUDA. It preserves sub-voxel signal "
-        "that trilinear blurs out of the CORRECTED output and the refine template; the shift "
-        "estimate itself is set by the pooling window, so this is about output fidelity, not "
-        "shift accuracy. Costs ~2× per warp and passes more thermal noise — verify on your data.",
+        help="[all] Resampler for the estimation iterations and the correction.\n"
+        "  auto      Lanczos for 1-D/2-D PE warps, bicubic for rotation-aware 3-D.\n"
+        "  bilinear  cheapest, and damps the signal it moves.\n"
+        "  bicubic   removes the bilinear damping bias, so the iterations converge to the true"
+        " shift. Biggest gain on smooth data; costs a little more per warp.\n"
+        "  lanczos   separable windowed sinc over the active PE axis/axes (half-width"
+        " -warp_radius): 1-D for single PE, 2-D for dual PE on CUDA. Preserves sub-voxel signal"
+        " that trilinear blurs out of the CORRECTED output and the refine template. ~2x per"
+        " warp, and it passes more thermal noise — verify on your data.\n"
+        "This is about OUTPUT fidelity, not shift accuracy: the shift estimate itself is set by"
+        " the pooling window (-window), not by the resampler.",
     )
     acc.add_argument(
         "-warp_radius",
@@ -2300,6 +2404,15 @@ def _run_multiecho(
             scaling = "fixed(TE)"
         else:
             scaling = "learned"
+    if args.match != "none":
+        # -match is wired only into the single-echo estimator. On the multi-echo path it
+        # was accepted and dropped, which is a bad trap for exactly the run that needs it
+        # (a pre-steady-state ramp is per-FRAME and hits every echo).
+        which = "-me_match" if args.me_interecho else "no cross-frame matching"
+        print(
+            f"   ⚠️  -match {args.match} is single-echo only and is IGNORED here; the "
+            f"multi-echo path uses {which}."
+        )
     if args.detask:
         # The late warning fires only after the whole solve; a run can be many minutes of
         # work before the user learns nothing was de-tasked. Say it up front too.
