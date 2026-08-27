@@ -489,6 +489,12 @@ def evaluate_all_combinations_for_run(
     return median_cod, var_explained
 
 
+# A candidate direction counts as new only if the nuisance projection leaves this
+# fraction of it standing. Set for float32 data, whose roundoff after projecting
+# out a column it already contains lands around 1e-6 relative.
+_SPAN_TOL = 1e-4
+
+
 def evaluate_combinations_cross_run(
     data_criteria: torch.Tensor,
     run_starts: list[int],
@@ -544,8 +550,9 @@ def evaluate_combinations_cross_run(
     var_explained : np.ndarray
         ``(n_combos,)`` summed variance ratios, or zeros when not supplied.
     """
-    from fastfuncstuff.glm.moments import compute_run_moments, run_bounds, solve_from_moments
-    from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+    from fastfuncstuff.glm.moments import run_bounds
+    from fastfuncstuff.glm.xval import compute_qr_projectors
+    from fastfuncstuff.memory import estimate_chunk_size
 
     n_runs = len(run_starts)
     other_runs = [h for h in range(n_runs) if h != target_run]
@@ -553,6 +560,7 @@ def evaluate_combinations_cross_run(
         raise ValueError("cross-run criterion needs at least 2 runs")
 
     n_criteria = data_criteria.shape[0]
+    n_combos = len(combinations)
 
     if designs_by_hrf is not None:
         if criteria_hrf_indices is None:
@@ -565,85 +573,167 @@ def evaluate_combinations_cross_run(
         assert design is not None
         groups = [(None, design)]
 
-    ss_res = torch.zeros(len(combinations), n_criteria, dtype=torch.float64)
+    ss_res = torch.zeros(n_combos, n_criteria, dtype=torch.float64)
     ss_tot = torch.zeros(n_criteria, dtype=torch.float64)
 
+    # The nuisance does not vary with the HRF group or the candidate, so the QR
+    # factors are built once for the whole call instead of once per candidate.
+    q_factors = compute_qr_projectors(nuisance_per_run, run_starts, device=device)
+    bounds = {r: run_bounds(run_starts, n_timepoints, r) for r in range(n_runs)}
+
+    def _project(mat: torch.Tensor, run_idx: int) -> torch.Tensor:
+        """Remove run ``run_idx``'s nuisance from a ``(run_length, m)`` matrix."""
+        q = q_factors[run_idx]
+        return mat if q is None else mat - q @ (q.T @ mat)
+
+    run_len_target = bounds[target_run][1] - bounds[target_run][0]
+    # Same column count for every group: the HRF library varies the response
+    # shape, not the number of conditions.
+    n_task_cols = groups[0][1].shape[1]
+
     for voxel_mask, group_design in groups:
-        group_slice = slice(None) if voxel_mask is None else voxel_mask
         n_group = n_criteria if voxel_mask is None else int(voxel_mask.sum().item())
         if n_group == 0:
             continue
-
-        # Blocks for every run other than the target: these never change with
-        # the candidate, so they are built once.
-        base = compute_run_moments(
-            data=data_criteria,
-            run_starts=run_starts,
-            nuisance_per_run=nuisance_per_run,
-            design=group_design,
-            device=device,
-            voxel_mask=voxel_mask,
-            runs=other_runs,
+        group_idx = (
+            torch.arange(n_criteria)
+            if voxel_mask is None
+            else torch.nonzero(voxel_mask, as_tuple=True)[0]
         )
-        base_xtx = dict(zip(other_runs, base.xtx, strict=True))
-        base_xty = dict(zip(other_runs, base.xty, strict=True))
 
-        # Each h's own target: polynomials only, fixed across candidates.
-        targets = {}
-        for h in other_runs:
-            h_start, h_end = run_bounds(run_starts, n_timepoints, h)
-            h_data = data_criteria[:, h_start:h_end]
-            if voxel_mask is not None:
-                h_data = h_data[voxel_mask, :]
-            h_proj, h_design_proj = project_out_nuisance_per_run(
-                data=h_data,
-                design=group_design[h_start:h_end, :],
-                nuisance_per_run=[nuisance_per_run[h]],
-                run_starts=[0],
-                device=device,
-            )
-            targets[h] = (h_proj.to(device), h_design_proj.to(device))
+        # ---- design side: no voxels involved, so once per group ----
+        x_by_run = {
+            r: _project(group_design[bounds[r][0] : bounds[r][1], :].to(device), r)
+            for r in range(n_runs)
+        }
+        xtx_by_run = {r: x.T.double() @ x.double() for r, x in x_by_run.items()}
+        sum_xtx_other = sum(xtx_by_run[r] for r in other_runs)
 
-        group_ss_tot = torch.zeros(n_group, dtype=torch.float64, device=device)
-        for h in other_runs:
-            actual = targets[h][0]
-            centred = actual - actual.mean(dim=1, keepdim=True)
-            group_ss_tot += (centred**2).sum(dim=1).double()
-        ss_tot[group_slice] = group_ss_tot.cpu()
+        # What each candidate adds BEYOND the base nuisance, as an orthonormal
+        # basis. span(nuisance, pcs) == span(nuisance, q), so appending q
+        # reproduces the joint projection exactly -- which is what turns the
+        # per-candidate re-projection into a rank-m downdate of the base moments
+        # and lets every candidate be built at once.
+        pcs_proj = _project(pcs.to(device=device, dtype=x_by_run[target_run].dtype), target_run)
+        x_target = x_by_run[target_run].double()
 
-        for ci, combo in enumerate(combinations):
-            target_nuisance = list(nuisance_per_run)
-            if len(combo) > 0:
-                cols = pcs[:, list(combo)].to(
-                    nuisance_per_run[target_run].device, nuisance_per_run[target_run].dtype
+        # Singletons are the overwhelming case (-singleton_only, and the null pass
+        # is k*N of them), and for a single column the orthonormal basis is just a
+        # normalisation -- so they are built as one batch rather than one QR each.
+        # A per-candidate QR loop here cost more than everything else combined once
+        # the rest was batched.
+        single_slot = [ci for ci, c in enumerate(combinations) if len(c) == 1]
+        multi_slot = [ci for ci, c in enumerate(combinations) if len(c) > 1]
+
+        q_cols = torch.zeros(
+            pcs_proj.shape[0], len(combinations), device=device, dtype=torch.float64
+        )
+        a_rows = torch.zeros(len(combinations), n_task_cols, device=device, dtype=torch.float64)
+        active = torch.zeros(len(combinations), dtype=torch.bool, device=device)
+
+        if single_slot:
+            picked = [combinations[ci][0] for ci in single_slot]
+            cols = pcs_proj[:, picked].double()
+            norms = cols.norm(dim=0)
+            # "Did this column survive the projection?" is a question about the
+            # column, so the tolerance is relative to its OWN pre-projection norm,
+            # not to the matrix. A PC already inside the nuisance span projects to
+            # float32 roundoff -- around 1e-6 of itself, which a matrix-relative
+            # threshold happily accepts and then normalises into a unit vector of
+            # pure noise, changing the answer by 1e-4.
+            ok = norms > _SPAN_TOL * pcs[:, picked].to(cols).norm(dim=0).clamp(min=1e-30)
+            cols = torch.where(ok.unsqueeze(0), cols / norms.clamp(min=1e-30), 0.0)
+            slots = torch.tensor(single_slot, device=device)
+            q_cols[:, slots] = cols
+            a_rows[slots] = cols.T @ x_target
+            active[slots] = ok
+
+        # Multi-column candidates still need a real QR, but only the -singleton_only
+        # off path builds any, and then only 2^k - k - 1 of them.
+        multi_extra: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        for ci in multi_slot:
+            block = pcs_proj[:, list(combinations[ci])]
+            q_block, r_block = torch.linalg.qr(block)
+            # QR normalises every column it returns, including the ones it
+            # manufactured for a rank-deficient block, so the Q norms carry no
+            # information. The R diagonal is what says whether a column added
+            # anything, measured against the source column as above.
+            source = pcs[:, list(combinations[ci])].to(block).norm(dim=0).clamp(min=1e-30)
+            keep = r_block.diagonal().abs() > _SPAN_TOL * source
+            q_block = q_block[:, keep].double()
+            if q_block.shape[1]:
+                multi_extra[ci] = (q_block, q_block.T @ x_target)
+
+        xtx_cand = xtx_by_run[target_run].unsqueeze(0).repeat(len(combinations), 1, 1)
+        xtx_cand -= torch.where(
+            active.view(-1, 1, 1), a_rows.unsqueeze(2) * a_rows.unsqueeze(1), 0.0
+        )
+        for ci, (_, a_blk) in multi_extra.items():
+            xtx_cand[ci] = xtx_by_run[target_run] - a_blk.T @ a_blk
+
+        n_cond = group_design.shape[1]
+        # (n_combos, n_h, C, C) -- every system this group needs. Candidate n with
+        # held-out h is fit on the other runs minus h, plus the target run
+        # carrying candidate n, and all those terms are already in hand.
+        a_stack = torch.stack(
+            [sum_xtx_other - xtx_by_run[h] + xtx_cand for h in other_runs], dim=1
+        ) + 1e-6 * torch.eye(n_cond, device=device, dtype=torch.float64)
+
+        chunk = estimate_chunk_size(
+            n_voxels=n_group,
+            n_timepoints=run_len_target,
+            n_regressors=n_cond,
+            device=device,
+            operation="cross_run_combos",
+            n_trials=len(other_runs),
+            n_designs=n_combos,
+        )
+        group_data = data_criteria if voxel_mask is None else data_criteria[voxel_mask, :]
+
+        for lo in range(0, n_group, chunk):
+            hi = min(lo + chunk, n_group)
+            block = group_data[lo:hi, :].to(device)
+            d_by_run = {
+                r: _project(block[:, bounds[r][0] : bounds[r][1]].T, r) for r in range(n_runs)
+            }
+            xty_by_run = {r: x_by_run[r].T.double() @ d_by_run[r].double() for r in range(n_runs)}
+            sum_xty_other = sum(xty_by_run[r] for r in other_runs)
+
+            target_data = d_by_run[target_run].double()
+            # (n_combos, C, chunk) in one shot: q'D for every candidate, then the
+            # outer product with its a-row. No Python loop over candidates.
+            qd = q_cols.T @ target_data
+            xty_cand = xty_by_run[target_run].unsqueeze(0) - torch.einsum("nc,nv->ncv", a_rows, qd)
+            for ci, (q_blk, a_blk) in multi_extra.items():
+                xty_cand[ci] = xty_by_run[target_run] - a_blk.T @ (q_blk.T @ target_data)
+            chunk_res = torch.zeros(n_combos, hi - lo, dtype=torch.float64, device=device)
+            chunk_tot = torch.zeros(hi - lo, dtype=torch.float64, device=device)
+            # Held-out runs are looped, candidates are batched. Batching h too
+            # would hold (n_combos, n_h, C, chunk) twice -- right-hand sides and
+            # betas -- for a handful of saved launches, and that product is what
+            # sets the peak. Looping it divides the peak by n_h and costs nothing
+            # measurable now that the candidate axis carries the batch.
+            for slot, h in enumerate(other_runs):
+                actual = d_by_run[h].double()
+                beta = torch.linalg.solve(
+                    a_stack[:, slot], sum_xty_other - xty_by_run[h] + xty_cand
                 )
-                target_nuisance[target_run] = torch.cat([nuisance_per_run[target_run], cols], dim=1)
-            cand = compute_run_moments(
-                data=data_criteria,
-                run_starts=run_starts,
-                nuisance_per_run=target_nuisance,
-                design=group_design,
-                device=device,
-                voxel_mask=voxel_mask,
-                runs=[target_run],
-            )
-
-            combo_ss_res = torch.zeros(n_group, dtype=torch.float64, device=device)
-            for h in other_runs:
-                fit_runs = [r for r in other_runs if r != h]
-                betas = solve_from_moments(
-                    [base_xtx[r] for r in fit_runs] + [cand.xtx[0]],
-                    [base_xty[r] for r in fit_runs] + [cand.xty[0]],
-                    device=device,
+                # |y - Xb|^2 = |y|^2 - 2 b'X'y + b'X'Xb, entirely in condition
+                # space: no (n_combos, run_length, chunk) prediction is ever built,
+                # which is what keeps the batch affordable.
+                chunk_res += (
+                    (actual * actual).sum(dim=0).unsqueeze(0)
+                    - 2.0 * (beta * xty_by_run[h].unsqueeze(0)).sum(dim=1)
+                    + torch.einsum("ncv,cd,ndv->nv", beta, xtx_by_run[h], beta)
                 )
-                actual, h_design_proj = targets[h]
-                pred = betas.T @ h_design_proj.T
-                combo_ss_res += ((actual - pred) ** 2).sum(dim=1).double()
-                del betas, pred
-            ss_res[ci, group_slice] = combo_ss_res.cpu()
-            del cand, combo_ss_res
+                centred = actual - actual.mean(dim=0, keepdim=True)
+                chunk_tot += (centred * centred).sum(dim=0)
 
-        del base, base_xtx, base_xty, targets
+            ss_res[:, group_idx[lo:hi]] = chunk_res.cpu()
+            ss_tot[group_idx[lo:hi]] = chunk_tot.cpu()
+            del block, d_by_run, xty_by_run, xty_cand, chunk_res, chunk_tot
+
+        del x_by_run, xtx_by_run, xtx_cand, a_stack, q_cols, a_rows, multi_extra
         if device.type == "cuda":
             torch.cuda.empty_cache()
 

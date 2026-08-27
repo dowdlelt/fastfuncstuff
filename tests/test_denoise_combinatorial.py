@@ -1104,3 +1104,140 @@ class TestSingletonReportedCoD:
             idx = run.all_combinations.index(tuple(run.optimal_combination))
             assert run.optimal_cod == run.all_cod[idx]
             assert run.baseline_cod == run.all_cod[0]
+
+
+class TestCrossRunBatchedParity:
+    """The batched scorer must equal a first-principles fit, not just its own history.
+
+    evaluate_combinations_cross_run builds every candidate's moments as a rank-m
+    downdate of the base moments and scores residuals in condition space
+    (|y|^2 - 2b'X'y + b'X'Xb) rather than forming predictions. Both are exact
+    rearrangements, so a plain lstsq reference is the right thing to check
+    against -- and the one that would catch an algebra slip that a
+    regression-style golden test would happily enshrine.
+    """
+
+    @staticmethod
+    def _reference(case, combinations):
+        """Project, fit and score every (candidate, held-out run) pair explicitly."""
+        import torch
+
+        from fastfuncstuff.glm.xval import project_out_nuisance_per_run
+
+        data, starts = case["data_criteria"], case["run_starts"]
+        n_tp, design = case["n_timepoints"], case["design"]
+        nuisance, target = case["nuisance_per_run"], case["target_run"]
+        n_runs = len(starts)
+        other = [h for h in range(n_runs) if h != target]
+        ends = [*starts[1:], n_tp]
+        ss_res = torch.zeros(len(combinations), data.shape[0], dtype=torch.float64)
+        ss_tot = torch.zeros(data.shape[0], dtype=torch.float64)
+
+        def proj(run_idx, extra=None):
+            nus = nuisance[run_idx]
+            if extra is not None:
+                nus = torch.cat([nus, extra], dim=1)
+            s, e = starts[run_idx], ends[run_idx]
+            d, x = project_out_nuisance_per_run(
+                data=data[:, s:e],
+                design=design[s:e, :],
+                nuisance_per_run=[nus],
+                run_starts=[0],
+                device=case["device"],
+            )
+            return d.double(), x.double()
+
+        base = {r: proj(r) for r in range(n_runs)}
+        for h in other:
+            centred = base[h][0] - base[h][0].mean(dim=1, keepdim=True)
+            ss_tot += (centred * centred).sum(dim=1)
+
+        for ci, combo in enumerate(combinations):
+            y_t, x_t = proj(target, case["pcs"][:, list(combo)] if combo else None)
+            for h in other:
+                fit = [r for r in other if r != h]
+                xtx = sum(base[r][1].T @ base[r][1] for r in fit) + x_t.T @ x_t
+                xty = sum(base[r][1].T @ base[r][0].T for r in fit) + x_t.T @ y_t.T
+                xtx = xtx + 1e-6 * torch.eye(xtx.shape[0], dtype=torch.float64)
+                resid = base[h][0].T - base[h][1] @ torch.linalg.solve(xtx, xty)
+                ss_res[ci] += (resid * resid).sum(dim=0)
+
+        cod = 1.0 - ss_res / ss_tot.clamp(min=1e-10).unsqueeze(0)
+        return cod.median(dim=1).values.numpy()
+
+    @staticmethod
+    def _case(n_criteria=250, run_len=50, n_runs=4, n_cond=2, k=3, seed=0):
+        import torch
+
+        g = torch.Generator().manual_seed(seed)
+        n_tp = run_len * n_runs
+        return dict(
+            data_criteria=torch.randn(n_criteria, n_tp, generator=g),
+            run_starts=[r * run_len for r in range(n_runs)],
+            n_timepoints=n_tp,
+            nuisance_per_run=[torch.randn(run_len, 4, generator=g) for _ in range(n_runs)],
+            target_run=0,
+            pcs=torch.randn(run_len, k, generator=g),
+            design=torch.randn(n_tp, n_cond, generator=g),
+            designs_by_hrf=None,
+            criteria_hrf_indices=None,
+            device=torch.device("cpu"),
+        )
+
+    def test_singletons_match_explicit_fits(self):
+        import numpy as np
+
+        from fastfuncstuff.denoise.combinatorial import evaluate_combinations_cross_run
+
+        case = self._case()
+        combos = [(), (0,), (1,), (2,)]
+        got = evaluate_combinations_cross_run(combinations=combos, **case)[0]
+        assert np.abs(got - self._reference(case, combos)).max() < 1e-8
+
+    def test_multi_column_candidates_match_explicit_fits(self):
+        """The rank-m path: a QR basis, not the batched normalisation."""
+        import numpy as np
+
+        from fastfuncstuff.denoise.combinatorial import evaluate_combinations_cross_run
+
+        case = self._case(n_cond=3, seed=1)
+        combos = [(), (0,), (1, 2), (0, 1, 2)]
+        got = evaluate_combinations_cross_run(combinations=combos, **case)[0]
+        assert np.abs(got - self._reference(case, combos)).max() < 1e-8
+
+    def test_candidate_inside_the_nuisance_span_is_a_no_op(self):
+        """A PC the nuisance already contains adds nothing and must not divide by ~0."""
+        import numpy as np
+
+        from fastfuncstuff.denoise.combinatorial import evaluate_combinations_cross_run
+
+        case = self._case(seed=2)
+        # Make PC 0 an exact copy of a nuisance column for the target run.
+        case["pcs"][:, 0] = case["nuisance_per_run"][case["target_run"]][:, 1]
+        got = evaluate_combinations_cross_run(combinations=[(), (0,)], **case)[0]
+        assert np.all(np.isfinite(got))
+        assert abs(got[1] - got[0]) < 1e-9
+
+    def test_voxel_chunking_does_not_change_the_answer(self):
+        import numpy as np
+
+        from fastfuncstuff.denoise import combinatorial as C
+
+        case = self._case(n_criteria=900, seed=3)
+        combos = [(), (0,), (1,), (2,)]
+        whole = C.evaluate_combinations_cross_run(combinations=combos, **case)[0]
+
+        # The scorer imports estimate_chunk_size inside the function, so the patch
+        # has to land on the source module, not on combinatorial's namespace.
+        from fastfuncstuff import memory
+
+        real = memory.estimate_chunk_size
+        calls = []
+        try:
+            memory.estimate_chunk_size = lambda **kw: (calls.append(kw), 100)[1]
+            chunked = C.evaluate_combinations_cross_run(combinations=combos, **case)[0]
+        finally:
+            memory.estimate_chunk_size = real
+
+        assert calls, "the scorer must size its chunks through memory.py, not a constant"
+        assert np.abs(whole - chunked).max() < 1e-10

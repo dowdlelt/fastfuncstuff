@@ -546,6 +546,45 @@ def bytes_per_voxel_denoise(
     return (6 * n_timepoints + n_noise_pcs) * 4
 
 
+def bytes_per_voxel_cross_run_combos(
+    n_timepoints_run: int,
+    n_other_runs: int,
+    n_combos: int,
+    n_conditions: int,
+) -> int:
+    """Bytes per voxel for the batched cross-run combination scorer.
+
+    The batched form never materialises a prediction timeseries -- residuals come
+    from ``|y|^2 - 2*b'p + b'Gb`` in condition space -- so the pressure is the
+    per-candidate beta stack, ``(n_combos, n_conditions)`` per voxel in float64,
+    not anything of length ``n_timepoints``. What does scale with time is the
+    projected data held for the target run and each held-out run.
+
+    Parameters
+    ----------
+    n_timepoints_run : int
+        Timepoints in one run.
+    n_other_runs : int
+        Runs scored against, i.e. ``n_runs - 1``.
+    n_combos : int
+        Candidate PC sets evaluated together. With ``-null_surrogates N`` this is
+        ``k * N + 1``, which is what makes the batch worth planning for.
+    n_conditions : int
+        Task design columns.
+    """
+    # Projected data, held for every run at once so each is projected once.
+    data = (n_other_runs + 1) * n_timepoints_run * 4
+    # The three float64 (n_combos, n_conditions, chunk) tensors alive together:
+    # the candidate moments, one held-out run's right-hand sides, and its betas.
+    # Measured against torch.cuda.max_memory_allocated -- an earlier version of
+    # this estimate omitted the right-hand-side stack and ran 2.8x under, which
+    # is the kind of error that only shows up as an OOM on someone's big dataset.
+    per_combo = 3 * n_combos * n_conditions * 8
+    # Running sums, plus the solve's own workspace.
+    scratch = n_combos * 8 + n_other_runs * n_conditions * 8 + n_combos * n_conditions * 8
+    return data + per_combo + scratch
+
+
 def bytes_per_voxel_ica_varnorm(
     n_timepoints: int,
 ) -> int:
@@ -1438,6 +1477,13 @@ def estimate_chunk_size(
             n_timepoints,
             n_regressors,
             n_fractions=n_fractions,
+        )
+    elif operation == "cross_run_combos":
+        bytes_per_voxel = bytes_per_voxel_cross_run_combos(
+            n_timepoints_run=n_timepoints,
+            n_other_runs=max(1, n_trials),
+            n_combos=max(1, n_designs),
+            n_conditions=n_regressors,
         )
     elif operation == "denoise":
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
