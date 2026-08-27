@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-3dDenoisefast - Fast cross-validated data-driven denoising using GPU acceleration
+ffs_denoise - Fast cross-validated data-driven denoising using GPU acceleration
 
 This tool implements adaptive denoising via noise pool PCA:
 1. Identify noise pool voxels (low task R²) and criteria voxels (high task R²)
@@ -12,14 +12,14 @@ The key anti-overfitting strategy: we denoise training data but predict non-deno
 test data, ensuring we're improving signal recovery rather than just fitting noise removal.
 
 Basic usage:
-    3dDenoisefast -input run1.nii.gz run2.nii.gz run3.nii.gz \\
+    ffs_denoise -input run1.nii.gz run2.nii.gz run3.nii.gz \\
                   -onsets cond1.txt cond2.txt \\
                   -durations 2.0 5.0 \\
                   -tr 2.0 \\
                   -prefix subject01_denoised
 
 For help:
-    3dDenoisefast -help
+    ffs_denoise -help
 """
 
 import argparse
@@ -41,6 +41,7 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
+        ScannableHelpFormatter,
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
@@ -105,51 +106,53 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
+class _HelpFormatter(ScannableHelpFormatter):
+    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
-        description="3dDenoisefast - Fast GPU-accelerated cross-validated denoising",
+        prog="ffs_denoise",
+        description="ffs_denoise - GPU-accelerated cross-validated data-driven denoising",
         formatter_class=_HelpFormatter,
         epilog="""
 Examples:
-  # Basic denoising with automatic R² threshold
-  3dDenoisefast -input run1.nii.gz run2.nii.gz run3.nii.gz \\
-                -onsets cond1.txt cond2.txt \\
-                -durations 2.0 \\
-                -tr 2.0 \\
-                -prefix subject01_denoised
+  # Basic denoising; the R2 threshold splits noise pool from criteria voxels
+  ffs_denoise -input run*.nii.gz \\
+              -onsets cond1.txt cond2.txt \\
+              -durations 2.0 \\
+              -tr 2.0 \\
+              -prefix sub01_denoised
 
-  # With full diagnostic plots and model fit outputs
-  3dDenoisefast -input run*.nii.gz \\
-                -onsets face.txt house.txt \\
-                -durations 2.0 \\
-                -tr 2.0 \\
-                -plots full \\
-                -save_model_fit \\
-                -prefix sub01_full_diagnostics
+  # BIDS events, motion regressors, and the full diagnostic figure set
+  ffs_denoise -input run*.nii.gz \\
+              -events events.tsv \\
+              -tr 2.0 \\
+              -ortvec motion_all.1D motion \\
+              -plots full \\
+              -save_model_fit \\
+              -prefix sub01_full
 
-    # With mask and spatial component weight maps
-  3dDenoisefast -input run*.nii.gz \\
-                -onsets stim.txt \\
-                -durations 1.0 \\
-                -tr 2.0 \\
-                -mask brain_mask.nii.gz \\
-                                -noise ica \\
-                                -max_comps 30 \\
-                -save_pcs both \\
-                -prefix masked_denoised
+  # Masked, ICA components, and both timecourse and spatial PC outputs
+  ffs_denoise -input run*.nii.gz \\
+              -onsets stim.txt \\
+              -durations 1.0 \\
+              -tr 2.0 \\
+              -mask brain_mask.nii.gz \\
+              -noise ica \\
+              -max_comps 30 \\
+              -save_pcs both \\
+              -prefix sub01_masked
 
-  # With motion nuisance regressors
-  3dDenoisefast -input run*.nii.gz \\
-                -onsets face.txt house.txt \\
-                -durations 2.0 \\
-                -tr 2.0 \\
-                -ortvec motion_all.1D motion \\
-                -prefix sub01_motion_denoised
+  # Repeated runs (same stimulus every run): the model-free ceiling, plus the
+  # per-PC R2 volume for checking whether a flat curve hides a local gain
+  ffs_denoise -input run*.nii.gz \\
+              -events events.tsv \\
+              -tr 2.0 \\
+              -noise_ceiling repeat \\
+              -save_r2_by_pc \\
+              -prefix sub01_ceiling
 
 Outputs:
     Core outputs (always saved):
@@ -298,198 +301,222 @@ Notes:
         help="Round stimulus durations to PLACES decimal places.",
     )
 
-    # Denoising options
-    denoise_opts = parser.add_argument_group("Denoising Options")
-    denoise_opts.add_argument(
+    # One group per stage of the pipeline, in the order the stages run. The old
+    # single "Denoising Options" list ran to 35 flags covering four unrelated
+    # decisions, so nothing could be found in it.
+    pool_opts = parser.add_argument_group(
+        "Noise pool selection (which voxels the components come FROM)"
+    )
+    comp_opts = parser.add_argument_group(
+        "Noise component extraction (getting components OUT of the pool)"
+    )
+    npc_opts = parser.add_argument_group("PC count selection (how many components to keep)")
+    eval_opts = parser.add_argument_group(
+        "Cross-validation and noise ceiling (how the count is judged)"
+    )
+    trial_opts = parser.add_argument_group("Single-trial betas")
+    pool_opts.add_argument(
         "-r2_threshold",
         type=float,
         default=0.05,
-        help="Cross-validated R² threshold for noise pool selection (default: 0.05). "
-        "Voxels with CV R² < threshold are noise pool, >= threshold are criteria. "
-        "R² is computed using condition-level design (not single-trial) with COD metric "
-        "on a 0-1 scale. For unmasked data, use -brainthresh to exclude background "
-        "voxels first, otherwise most voxels will have R²≈0 and flood the noise pool. "
-        "GLMsingle auto-determines this via GMM (findtailthreshold); typical values "
-        "range 0.01-0.10 depending on data quality.",
+        help="Cross-validated R² threshold splitting the brain in two.\n"
+        "  below     the NOISE POOL. The task does not explain these voxels, so whatever they"
+        " share is nuisance, and the components are extracted from them.\n"
+        "  at/above  the CRITERIA voxels, where denoising is judged.\n"
+        "R² here is condition-level (never single-trial), COD metric, 0-1 scale. Typical values"
+        " are 0.01-0.10 depending on data quality; GLMsingle picks it automatically with a GMM"
+        " (findtailthreshold).\n"
+        "On unmasked data set -brainthresh, -mask or -automask FIRST: background voxels score"
+        " R²≈0, fall below any threshold, and flood the pool.",
     )
-    denoise_opts.add_argument(
+    pool_opts.add_argument(
         "-zero_event",
         "-zero-event",
         type=str,
         choices=["zero", "nuisance"],
         default="zero",
-        help="How cross-validation treats a condition whose events all fall inside a "
-        "fold's held-out runs, leaving that fold with no beta for it. 'zero' (default) "
-        "predicts zero and charges its BOLD to the residual; 'nuisance' removes it from "
-        "both the held-out data and the prediction design, so the fold is not scored on "
-        "what it could not have known. Matters because the R² it feeds is thresholded "
-        "absolutely to split noise pool from criteria: under 'zero' a design with "
-        "run-confined conditions shifts the whole R² distribution down and moves both "
-        "masks. Identical either way when every condition appears in every run.",
+        help="What to do with a condition whose events all fall inside a fold's held-out runs,"
+        " leaving that fold with no beta for it.\n"
+        "  zero      predict zero and charge its BOLD to the residual.\n"
+        "  nuisance  drop it from both the held-out data and the prediction design, so the fold"
+        " is not scored on what it could not have known.\n"
+        "Not cosmetic: the R² this feeds is thresholded ABSOLUTELY to split noise pool from"
+        " criteria, so under 'zero' a design with run-confined conditions shifts the whole R²"
+        " distribution down and moves both masks. Identical either way when every condition"
+        " appears in every run.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-noise",
         type=str,
         choices=["pca", "ica"],
         default="pca",
-        help="Noise component method: 'pca' (default) or 'ica'.",
+        help="How to summarise the noise pool's shared structure.\n"
+        "  pca  orthogonal components, ordered by variance explained.\n"
+        "  ica  spatially independent components; slower, and see -ica_restarts.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-max_comps",
         "-max_pcs",
         dest="max_comps",
         type=int,
         default=20,
-        help="Maximum number of noise components to test (default: 20). Alias: -max_pcs",
+        help="How many components to extract and sweep. The selection curve is evaluated at"
+        " every count from 0 to this, so raising it costs time linearly. Alias: -max_pcs.",
     )
-    denoise_opts.add_argument(
+    npc_opts.add_argument(
         "-pcstop",
         type=float,
         default=1.05,
-        help="PC selection stopping threshold (default: 1.05, GLMdenoise-style). "
-        ">=1: Stop when R² is within (pcstop-1)*100%% of max (e.g., 1.05 = 5%%). "
-        "<0: Use exactly abs(pcstop) PCs (user override). "
-        "=1: Pure argmax (pick maximum R²).",
+        help="Where to stop on the selection curve. Parsimony rule, GLMdenoise-style.\n"
+        "  >1   stop at the first count within (pcstop-1)*100%% of the peak, e.g. 1.05 = within"
+        " 5%%. Prefers the smaller model when the curve has flattened.\n"
+        "  =1   pure argmax: take the peak wherever it is.\n"
+        "  <0   override: use exactly abs(pcstop) PCs and ignore the curve.\n"
+        "The floor on whether there is ANY gain to chase is -pc_min_gain, not this.",
     )
-    denoise_opts.add_argument(
-        "-save_r2_by_pc",
-        "-save-r2-by-pc",
-        dest="save_r2_by_pc",
-        action="store_true",
-        help="Save per-voxel xval R² at EVERY tested PC count as a labelled 4D file "
-        "({prefix}_xval_r2_by_pc.nii.gz, sub-brik k = k PCs). This is the "
-        "un-aggregated version of the selection curve: the curve is its median "
-        "over criteria voxels, so this is where you look to see whether a gain is "
-        "confined to a region or spread thin.",
-    )
-    denoise_opts.add_argument(
+    npc_opts.add_argument(
         "-pc_min_gain",
         "-pc-min-gain",
         dest="pc_min_gain",
         type=str,
         default="auto",
-        help="Minimum CV-R2 gain over the 0-PC baseline before any PC is kept "
-        "(default: auto = max(1%% of baseline R2, 2x the curve's roughness)). "
-        "A flat, noise-only selection curve otherwise selects PCs for nothing. "
-        "Pass a float for an absolute floor, or 0 to accept any positive gain.",
+        help="How much the curve must rise above its 0-PC baseline before ANY component is"
+        " kept. A flat, noise-only curve otherwise selects components for nothing.\n"
+        "  auto   max(1%% of the baseline R², twice the curve's own step-to-step roughness).\n"
+        "  FLOAT  an absolute floor in R² units.\n"
+        "  0      accept any positive gain.\n"
+        "Where to stop ONCE there is a gain is -pcstop.",
     )
-    denoise_opts.add_argument(
+    npc_opts.add_argument(
         "-pcR2cutoff",
         type=float,
         default=0.05,
-        help="R² cutoff for PC selection (default: 0.05, matching GLMdenoise). "
-        "Only voxels with max R² > cutoff across any PC count are used "
-        "to compute the selection curve. More robust to noisy voxels. "
-        "Use 0 to select on every voxel with any positive R².",
+        help="Which voxels the selection curve is a median OVER: only those whose R² exceeds"
+        " this at some PC count. Matches GLMdenoise, and keeps voxels with no signal from"
+        " flattening the curve.\n"
+        "Use 0 to select on every voxel with any positive R². Note this is a selection on the"
+        " plotted quantity, so compare against the all-voxel curve on the summary figure before"
+        " trusting a small gain.",
     )
-    denoise_opts.add_argument(
+    npc_opts.add_argument(
+        "-save_r2_by_pc",
+        "-save-r2-by-pc",
+        dest="save_r2_by_pc",
+        action="store_true",
+        help="Write per-voxel xval R² at EVERY tested count to {prefix}_xval_r2_by_pc.nii.gz,"
+        " sub-brik k = k PCs (labelled npc00..npcN).\n"
+        "This is the un-aggregated selection curve -- the curve is its median over criteria"
+        " voxels -- so it is where you look to see whether a gain is real but confined to one"
+        " region, or spread too thin to survive a median.",
+    )
+    pool_opts.add_argument(
         "-brainthresh",
         nargs=2,
         type=float,
         metavar=("PERCENTILE", "FRACTION"),
         default=None,
-        help="Signal intensity threshold to exclude non-brain voxels from noise pool. "
-        "Computed from raw (unscaled) mean volume: thresh = percentile(mean, P) * F. "
-        "Voxels with mean intensity BELOW this threshold are excluded. "
-        "GLMsingle default: '99 0.1' (99th percentile × 0.1). "
-        "Defaults to '99 0.5' (the GLMdenoise default) when none of -mask, "
-        "-automask or -brainthresh is given, since otherwise background voxels "
-        "(R²≈0) dominate the noise pool. Pass '-brainthresh 0 0' to disable. "
-        "Example: -brainthresh 99 0.5 (more conservative, excludes dim voxels).",
+        help="Intensity floor for the noise pool, as PERCENTILE and FRACTION of it.\n"
+        "  thresh = percentile(mean_volume, P) * F, on the RAW (unscaled) mean; voxels dimmer"
+        " than that are excluded.\n"
+        "  99 0.5   the GLMdenoise value, and what is used when none of -mask, -automask or"
+        " -brainthresh is given -- otherwise background voxels (R²≈0) dominate the pool.\n"
+        "  99 0.1   the GLMsingle value, more permissive.\n"
+        "  0 0      disable.",
     )
-    denoise_opts.add_argument(
+    pool_opts.add_argument(
         "-min_noise_voxels",
         type=int,
         default=100,
-        help="Minimum voxels required in noise pool (default: 100)",
+        help="Minimum voxels the noise pool must contain before components are extracted.",
     )
-    denoise_opts.add_argument(
+    pool_opts.add_argument(
         "-max_noise_fraction",
         type=float,
         default=0.95,
-        help="Maximum fraction of voxels in noise pool (default: 0.5)",
+        help="Maximum fraction of voxels allowed into the noise pool. A pool at this ceiling"
+        " usually means the R² threshold is too high or the brain was never masked.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-variance_threshold",
         type=float,
         default=0.95,
-        help="Cumulative variance threshold for PC extraction (default: 0.95)",
+        help="Stop extracting components once they explain this cumulative fraction of the"
+        " noise pool's variance, even if -max_comps has not been reached.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-auto_component_caps",
         action="store_true",
         help=(
-            "Estimate per-run component caps independently of denoising CV "
-            "(noise-pool spectrum only), then extract only top components per run."
+            "Cap each run's component count from its own noise-pool spectrum, before and"
+            " independently of the denoising CV, rather than extracting -max_comps everywhere."
         ),
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-auto_component_min",
         type=int,
         default=5,
-        help="Minimum per-run component cap when -auto_component_caps is enabled (default: 5)",
+        help="Floor on the per-run cap that -auto_component_caps estimates.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-auto_component_var_threshold",
         type=float,
         default=0.90,
         help=(
-            "Variance target used by independent cap estimator (default: 0.90). "
-            "Lower values are more conservative."
+            "Variance target for the -auto_component_caps estimator. Lower is more conservative."
         ),
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-auto_component_estimate_max",
         type=int,
         default=None,
         help=(
-            "Upper bound used only for independent component-count estimation. "
-            "If not set, defaults to 2x -max_comps. Denoising sweep still uses -max_comps."
+            "Ceiling for the -auto_component_caps estimator only; defaults to 2x"
+            " -max_comps. The denoising sweep still stops at -max_comps."
         ),
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-auto_component_no_mp",
         action="store_true",
         help=(
-            "Disable soft Marchenko-Pastur prior in independent cap estimation. "
-            "Useful if MP assumptions are not trusted for your dataset."
+            "Drop the soft Marchenko-Pastur prior from -auto_component_caps, for data"
+            " whose noise is not plausibly white."
         ),
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-ica_restarts",
         type=int,
         default=5,
         help=(
-            "Number of ICA random restarts per run; best non-Gaussian solution is kept "
-            "(default: 5). Increase for more robust ICA at higher compute cost."
+            "ICA restarts per run; the most non-Gaussian solution is kept. More restarts"
+            " buy robustness with compute."
         ),
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-ica_max_iter",
         type=int,
         default=1000,
-        help="Maximum FastICA iterations per restart (default: 1000)",
+        help="Maximum FastICA iterations per restart.",
     )
-    denoise_opts.add_argument(
+    comp_opts.add_argument(
         "-ica_tol",
         type=float,
         default=1e-6,
-        help="FastICA convergence tolerance per restart (default: 1e-6)",
+        help="FastICA convergence tolerance per restart.",
     )
-    add_cv_strategy_arg(denoise_opts)
-    denoise_opts.add_argument(
+    add_cv_strategy_arg(eval_opts)
+    eval_opts.add_argument(
         "-n_perms",
         type=int,
         default=100,
-        help="Max number of CV permutations for random splits (default: 100)",
+        help="Cap on CV permutations for random (non-LORO) splits.",
     )
-    add_cv_metric_arg(denoise_opts)
+    add_cv_metric_arg(eval_opts)
     add_noise_ceiling_args(
-        denoise_opts,
+        eval_opts,
         stage_note="The ceiling is built at the SELECTED PC count with those PCs "
         "in the nuisance, so it bounds the denoised R2 that is actually reported.",
     )
-    denoise_opts.add_argument(
+    eval_opts.add_argument(
         "-repeat_groups",
         "-repeat-groups",
         dest="repeat_groups",
@@ -503,13 +530,13 @@ Notes:
         "but not numerically equal (a rebuilt event file, a different microtime grid).",
     )
     add_single_trial_args(
-        denoise_opts,
+        trial_opts,
         emit_help="Estimate and save one beta per trial (GLMsingle-style) instead "
         "of one beta per condition. By default the PC count is then chosen by "
         "beta-space CV; see -cv_design to select it on the condition-level "
         "design instead (required when conditions do not repeat across runs).",
     )
-    denoise_opts.add_argument(
+    trial_opts.add_argument(
         "-zscore_by_run",
         action="store_true",
         default=False,
@@ -526,8 +553,8 @@ Notes:
     proc_opts.add_argument(
         "-automask",
         action="store_true",
-        help="Compute brain mask automatically from mean EPI (AFNI-style automask "
-        "with dilate=4). Applied before brainthresh. Mutually exclusive with -mask.",
+        help="Derive the brain mask from the mean EPI (AFNI-style automask, dilate=4), applied"
+        " before -brainthresh. Mutually exclusive with -mask.",
     )
     proc_opts.add_argument(
         "-keep_constant_voxels",
@@ -566,18 +593,21 @@ Notes:
         "-microtime_dt",
         type=float,
         default=0.1,
-        help="Microtime resolution in seconds (default: 0.1)",
+        help="Microtime resolution the design is built at, in seconds, before decimation to\n"
+        "the TR grid. Must divide the TR.",
     )
     proc_opts.add_argument(
         "-hrf_model",
         type=str,
         default="spmg1",
-        help="HRF model: 'spmg1' (default), 'spmg2', 'spmg3', 'glmsingle', 'FIR', 'TENT', or 'TENT(bot,top,n)'. "
-        "SPMG2 = canonical + temporal derivative (2 basis). "
-        "SPMG3 = canonical + time + dispersion derivatives (3 basis). "
-        "FIR/TENT windows are estimated from the stimulus durations (stimulus + "
-        "HRF tail); override with -fir_duration. "
-        "Example: -hrf_model TENT(0,15,6) creates 6 tent bases from 0-15s.",
+        help="Response shape the design is built from.\n"
+        "  spmg1      the SPM canonical HRF alone.\n"
+        "  spmg2      canonical + temporal derivative (2 basis functions).\n"
+        "  spmg3      canonical + temporal + dispersion derivatives (3 basis functions).\n"
+        "  glmsingle  the GLMsingle library HRF.\n"
+        "  FIR, TENT  shape-free. The window is taken from the stimulus durations (stimulus +"
+        " HRF tail) unless -fir_duration says otherwise.\n"
+        "  TENT(bot,top,n)  an explicit window, e.g. TENT(0,15,6) for 6 tent bases over 0-15 s.",
     )
     proc_opts.add_argument(
         "-fir_duration",
@@ -630,17 +660,19 @@ Notes:
     proc_opts.add_argument(
         "-dry_run",
         action="store_true",
-        help="Fast testing mode: load only first run, generate synthetic data for rest. "
-        "Results are nonsensical but pipeline runs quickly for testing.",
+        help="Testing mode: load only the first run and synthesise the rest. The pipeline runs"
+        " end to end in seconds; the results mean nothing.",
     )
     proc_opts.add_argument(
         "-R2method",
         type=str,
         choices=["auto", "fast", "slow"],
         default="auto",
-        help="R² computation method. 'fast' uses streaming stats (~3MB vs ~8GB memory), "
-        "requires LORO CV. 'slow' stores full timeseries (for non-LORO CV). "
-        "'auto' selects based on CV strategy (default: auto).",
+        help="How held-out R² is accumulated.\n"
+        "  auto  pick from the CV strategy. Leave it here.\n"
+        "  fast  streaming sufficient statistics, ~3 MB against ~8 GB. LORO only, since it needs"
+        " each timepoint scored exactly once.\n"
+        "  slow  keep the full predicted timeseries. Required for overlapping (non-LORO) splits.",
     )
 
     # Output options
@@ -650,7 +682,11 @@ Notes:
         type=str,
         choices=["no", "yes", "full"],
         default="no",
-        help="Save diagnostic plots: 'no' (none), 'yes' (summary), 'full' (summary + per-PC plots)",
+        help="Diagnostic figures to write.\n"
+        "  no    none.\n"
+        "  yes   the summary figure: selection curve, gain against the floor, R² distribution.\n"
+        "  full  the summary plus one figure per component -- timecourse with the runs laid out"
+        " left to right, and multi-planar cuts of its spatial weights under each run.",
     )
     out_opts.add_argument(
         "-no_scree_plot",
@@ -682,7 +718,11 @@ Notes:
         type=str,
         choices=["no", "timecourse", "spatial", "both"],
         default="timecourse",
-        help="Save noise PCs: 'no', 'timecourse' (default: .pt file), 'spatial' (NIfTI weight maps), 'both'",
+        help="Which parts of the noise components to write out.\n"
+        "  no          neither.\n"
+        "  timecourse  the per-run component timecourses, as a .pt file.\n"
+        "  spatial     the per-component weight maps, as NIfTI.\n"
+        "  both        both of the above.",
     )
     out_opts.add_argument(
         "-component_map_space",
@@ -690,9 +730,11 @@ Notes:
         choices=["full", "noise_pool"],
         default="full",
         help=(
-            "Spatial map strategy for component diagnostics: "
-            "'full' (default, refit component weights to all brain voxels) or "
-            "'noise_pool' (show extraction-space weights only)."
+            "Where the per-component spatial maps are defined.\n"
+            "  full        refit each component's weights to every brain voxel, so the map shows"
+            " where the component reaches, not just where it came from.\n"
+            "  noise_pool  show the extraction-space weights only. Cheaper, and the map is then"
+            " blank outside the pool."
         ),
     )
     out_opts.add_argument(
@@ -703,16 +745,15 @@ Notes:
     out_opts.add_argument(
         "-snr",
         action="store_true",
-        help="Compute and save SNR (signal-to-noise ratio) outputs. "
-        "Creates SNR volumes before/after denoising and scatter plot comparison. "
-        "Computes both residual-based SNR and bootstrap-based SNR (if -numboots > 0).",
+        help="Write SNR volumes before and after denoising, plus a scatter comparing them."
+        " Residual-based always; bootstrap-based as well when -numboots > 0.",
     )
     out_opts.add_argument(
         "-numboots",
         type=int,
         default=0,
-        help="Number of bootstrap iterations for SE estimation (default: 0 = no bootstrapping). "
-        "Recommended: 100-1000 for robust SE. Enables bootstrap-based SNR if -snr is also set.",
+        help="Bootstrap iterations for beta standard errors. 0 disables it; 100-1000 gives a"
+        " stable SE. Also enables the bootstrap-based SNR map when -snr is set.",
     )
 
     return parser
@@ -3322,7 +3363,7 @@ def main():
 
         print()
         print("=" * 70)
-        print("✅ 3dDenoisefast (single-trial mode) Complete!")
+        print("✅ ffs_denoise (single-trial mode) Complete!")
         print("=" * 70)
         print(f"  Optimal PCs: {optimal_pcs}")
         print(f"  Final median beta-space R²: {final_r2_cod.median():.4f}")
