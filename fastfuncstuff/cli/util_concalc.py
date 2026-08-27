@@ -39,6 +39,7 @@ import torch
 
 from fastfuncstuff.cli.design_spec import _do_compile as _design_spec_compile
 from fastfuncstuff.cli.design_spec import _resolve_spec_path
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
@@ -53,7 +54,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_util_concalc",
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
     p.add_argument(
         "-stats", required=True, metavar="FILE", help="Original Rbuck output (NIfTI). Read for β."

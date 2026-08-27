@@ -16,6 +16,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.completion import RENDERERS, describe, load_parser
 
 
@@ -50,7 +51,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ffs_completion",
         description="Generate static bash/fish completions for the ffs_* tools.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=__doc__,
     )
     parser.add_argument(

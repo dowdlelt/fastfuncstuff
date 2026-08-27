@@ -31,6 +31,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     import nibabel as nib  # noqa: F401
 except ImportError:
@@ -41,7 +43,6 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
-        ScannableHelpFormatter,
         add_cv_blur_arg,
         add_cv_metric_arg,
         add_cv_strategy_arg,
@@ -106,16 +107,12 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(ScannableHelpFormatter):
-    """The shared scannable formatter; kept as a local name for this module's parser."""
-
-
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         prog="ffs_denoise",
         description="ffs_denoise - GPU-accelerated cross-validated data-driven denoising",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Basic denoising; the R2 threshold splits noise pool from criteria voxels

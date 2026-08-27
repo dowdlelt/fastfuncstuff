@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image
 from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
@@ -33,6 +34,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=FfsHelpFormatter,
         prog="ffs_util_fwhm",
         description="Whole-volume spatial smoothness (classic Forman FWHM + mixed "
         "ACF model), GPU, matching AFNI 3dFWHMx. Intended for model residuals.",

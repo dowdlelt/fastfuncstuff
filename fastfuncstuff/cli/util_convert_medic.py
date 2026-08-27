@@ -43,20 +43,14 @@ from pathlib import Path
 
 import numpy as np
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
-
-
-class _HelpFormatter(
-    argparse.RawDescriptionHelpFormatter,
-    argparse.ArgumentDefaultsHelpFormatter,
-):
-    pass
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Convert warpkit MEDIC output into ffs_nwarp-compatible warps",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
     src = parser.add_argument_group("Input (give exactly one)")
     src.add_argument(

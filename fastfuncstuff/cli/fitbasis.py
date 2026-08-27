@@ -76,6 +76,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     from fastfuncstuff.cli_utils import (
         add_device_arg,
@@ -128,43 +130,6 @@ except ImportError as e:
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     print("Make sure fastfuncstuff is installed: pip install -e .")
     sys.exit(1)
-
-
-class _HelpFormatter(
-    argparse.RawDescriptionHelpFormatter,
-    argparse.ArgumentDefaultsHelpFormatter,
-):
-    """Repo help style, minus two sources of pure noise.
-
-    ``(default: None)`` / ``(default: False)`` are dropped: for every flag
-    here those mean "off" or "auto", which the help text already says, and
-    they accounted for a third of the ``(default: ...)`` lines.
-
-    Hyphen/underscore spelling variants collapse to one entry.  Every
-    ``-foo-bar`` also accepts ``-foo_bar`` (documented once in the epilog);
-    printing both doubled the width of ~20 entries to say nothing.  An alias
-    that is *not* a mere spelling variant — ``-parametrisation``, ``-quiet``
-    — still prints, because it carries information.
-    """
-
-    def _get_help_string(self, action):
-        if action.default is None or action.default is False:
-            return action.help
-        return super()._get_help_string(action)
-
-    def _format_action_invocation(self, action):
-        if not action.option_strings:
-            return super()._format_action_invocation(action)
-        canon = action.option_strings[0]
-
-        def norm(s: str) -> str:
-            return s.replace("_", "-")
-
-        shown = [canon] + [o for o in action.option_strings[1:] if norm(o) != norm(canon)]
-        if action.nargs == 0:
-            return ", ".join(shown)
-        args = self._format_args(action, self._get_default_metavar_for_optional(action))
-        return ", ".join(shown) + " " + args
 
 
 _USAGE = (
@@ -321,7 +286,7 @@ def create_parser() -> argparse.ArgumentParser:
         usage=_USAGE,
         description=_DESCRIPTION,
         epilog=_EPILOG,
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # ── STEP 1: the two decisions that scope everything else ───────────

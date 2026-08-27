@@ -24,6 +24,7 @@ import json
 import sys
 from pathlib import Path
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
 from fastfuncstuff.processing.io import load_image, load_warp_field
 from fastfuncstuff.processing.nwarpforge import _nifti_mm_to_voxels, compute_cardinal_affine
@@ -49,7 +50,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="ffs_util_warpqc",
         description="Deformation-regularity QC for a nonlinear warp field "
         "(folding, Jacobian range, displacement, bending energy).",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""Reading the output:
   det(J) < 0     the map folded there — tissue turned inside out. A handful of
                  voxels grazing zero is stencil noise; a region of them is not.

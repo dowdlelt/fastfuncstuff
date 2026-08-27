@@ -20,6 +20,8 @@ from datetime import datetime
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     from fastfuncstuff.cli_utils import parse_prefix, setup_device
     from fastfuncstuff.design.trial_table import (
@@ -39,10 +41,6 @@ try:
 except ImportError as e:  # pragma: no cover - install-time guard
     print(f"ERROR: Could not import fastfuncstuff: {e}")
     sys.exit(1)
-
-
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
 
 
 # Noise ceiling below which the *_frac_ceiling ratios are reported as 0: an oracle model
@@ -262,7 +260,7 @@ def create_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_varpart",
         description="Variance partitioning for fully crossed factorial designs",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 OUTPUTS
 =======

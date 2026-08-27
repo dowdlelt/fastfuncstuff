@@ -56,6 +56,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.design.builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncstuff.design.matrices import (
@@ -177,14 +178,9 @@ def parse_n_knots(n_knots_args, n_conditions):
 
 
 def main():
-    class _HelpFormatter(
-        argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter
-    ):
-        """Show defaults while preserving raw description formatting."""
-
     parser = argparse.ArgumentParser(
         description="TPS HRF estimation with cross-validated smoothness selection",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=__doc__,
     )
 

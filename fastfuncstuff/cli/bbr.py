@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain, save_matrix_1D
 from fastfuncstuff.processing.bbr import (
@@ -112,7 +113,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "geometric boundary, not intensity similarity. It refines the AFFINE only;\n"
             "for the local (nonlinear) distortion an affine can't fix, run ffs_rbr next."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=(
             "Direction convention:\n"
             "  The .aff12.1D must map anat(base) -> epi(source), i.e. saved by\n"

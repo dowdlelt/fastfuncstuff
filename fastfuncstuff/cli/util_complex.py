@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, parse_prefix, spinner
 from fastfuncstuff.memory import get_available_memory
 from fastfuncstuff.processing.complex import (
@@ -25,7 +26,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ffs_util_complex",
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""Examples:
   ffs_util_complex -mag magnitude.nii.gz -phase phase.nii.gz -prefix complex
   ffs_util_complex -mag magnitude.nii.gz -phase phase_raw.nii.gz \\

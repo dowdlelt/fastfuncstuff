@@ -22,6 +22,7 @@ from fastfuncstuff.autoproc.bids import BoldRun, find_events, pair_undetermined,
 from fastfuncstuff.autoproc.emit import write_script
 from fastfuncstuff.autoproc.glm import STIMULI_DIR, write_design_specs
 from fastfuncstuff.autoproc.plan import Options, build_plan
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
@@ -73,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ffs_autoproc",
         description="Generate a readable, resumable ffs preprocessing script from a BIDS dataset.",
         epilog=config.recipe_help(),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     g = p.add_argument_group("inputs & scope")

@@ -39,6 +39,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 # fastfuncstuff imports
 try:
     from fastfuncstuff.cli_utils import (
@@ -3322,28 +3324,11 @@ def _run_tensorial_ica(
     return tensor_meta
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting.
-
-    Skip the auto-appended ``(default: ...)`` when the help text already names a
-    default, and skip it for ``store_false`` aliases (they share ``dest`` with
-    their positive partner, so the auto value is misleading).
-    """
-
-    def _get_help_string(self, action):
-        help_str = action.help or ""
-        if "default" in help_str.lower():
-            return help_str
-        if isinstance(action, argparse._StoreFalseAction):
-            return help_str
-        return super()._get_help_string(action)
-
-
 def build_parser() -> argparse.ArgumentParser:
     """Build and return the ffs_ica command-line argument parser."""
     parser = argparse.ArgumentParser(
         description="Run-wise whole-brain ICA demo / sanity-check pipeline",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     req = parser.add_argument_group("Required")

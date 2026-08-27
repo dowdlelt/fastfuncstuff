@@ -44,6 +44,8 @@ import numpy as np
 import torch
 from tqdm.auto import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     import nibabel as nib  # noqa: F401
 except ImportError:
@@ -147,15 +149,11 @@ class PathfinderResults:
     metadata: dict = field(default_factory=dict)
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
-
-
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="ffs_pathfinder - Joint HRF + Denoising Optimization",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Basic joint optimization

@@ -39,6 +39,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_coverage_args,
@@ -102,10 +103,6 @@ def _int_list(spec: str) -> tuple[int, ...]:
 def _float_list(spec: str) -> tuple[float, ...]:
     """Parse an ANTs-style ``2x1x0`` (or ``2,1,0``) spec into a tuple of floats."""
     return tuple(float(p) for p in spec.replace(",", "x").split("x") if p != "")
-
-
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults on each option, but leave the epilog's layout alone."""
 
 
 _EPILOG = """\
@@ -267,7 +264,7 @@ def parse_args(
         description="GPU optical-flow (demons / Lucas-Kanade / Horn-Schunck) "
         "nonlinear registration.",
         epilog=_EPILOG,
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # I/O

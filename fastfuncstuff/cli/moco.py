@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -166,7 +167,7 @@ def parse_args(
   # Drop the first 4 and last 2 volumes of every input:
   ffs_moco -input epi.nii.gz -prefix epi_mc.nii.gz -skip_first 4 -skip_last 2
 """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # --- Input/Output ---

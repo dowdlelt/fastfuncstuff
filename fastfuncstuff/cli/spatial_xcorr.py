@@ -35,6 +35,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.utils import REGISTRATION_TF32
 
 
@@ -42,7 +43,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="ffs_spatial_xcorr",
         description="Spatial cross-correlation between 4D NIfTI volumes",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""Masking:
   The final mask is always the INTERSECTION of all mask sources:
     -mask        Single mask applied to both datasets.

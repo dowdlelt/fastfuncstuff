@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.stats.localstat import (
@@ -35,6 +36,7 @@ _DEFAULT_NBHD = {"ACF": "SPHERE(-9.666)", "FWHM": "SPHERE(-2.0)"}
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=FfsHelpFormatter,
         prog="ffs_util_localstat",
         description="Per-voxel local spatial statistics on a neighborhood (GPU, "
         "AFNI 3dLocalstat/3dLocalACF compatible).",

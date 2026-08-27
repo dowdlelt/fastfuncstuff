@@ -21,6 +21,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, spinner
 from fastfuncstuff.processing import multiecho as me
 from fastfuncstuff.processing.io import load_image, save_image
@@ -29,6 +30,7 @@ from fastfuncstuff.utils import configure_torch_backends
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=FfsHelpFormatter,
         prog="ffs_t2smap",
         description="Multi-echo T2*/S0 fitting, optimal combination, and "
         "leave-one-echo-out QC (GPU, tedana t2smap compatible).",

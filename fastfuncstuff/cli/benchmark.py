@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg
 
 
@@ -19,7 +20,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Default: OpenNeuro ds005165 (sub-01, ses-01).\n"
             "Use -validate-only to compare existing outputs without re-running tools."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
     parser.add_argument(
         "-config",

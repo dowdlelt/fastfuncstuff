@@ -35,6 +35,7 @@ import matplotlib.image as mpimg
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_load_threads_arg,
@@ -339,12 +340,6 @@ def _hrf_select_spec(value: str) -> str:
     )
 
 
-class _PyrfHelpFormatter(
-    argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter
-):
-    """Show each flag's default, but leave the epilog's own layout alone."""
-
-
 def create_parser() -> argparse.ArgumentParser:
     """Create the ffs_pyrf command-line parser."""
     parser = argparse.ArgumentParser(
@@ -353,7 +348,7 @@ def create_parser() -> argparse.ArgumentParser:
             "field mapping. A pyre for receptive fields."
         ),
         epilog=_EPILOG,
-        formatter_class=_PyrfHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
     required = parser.add_argument_group("required arguments")
     required.add_argument("-input", nargs="+", required=True, help="fMRI run(s), one file per run")

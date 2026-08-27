@@ -33,8 +33,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
-    ScannableHelpFormatter,
     add_batch_args,
     add_device_arg,
     collect_batch_jobs,
@@ -61,10 +61,6 @@ def _split_prefix(prefix: str) -> tuple[str, str]:
         if prefix.endswith(ext):
             return prefix[: -len(ext)], ext
     return prefix, ".nii.gz"
-
-
-class _HelpFormatter(ScannableHelpFormatter):
-    """The shared scannable formatter; kept as a local name for this module's parser."""
 
 
 _EPILOG = """\
@@ -331,7 +327,7 @@ def create_parser() -> argparse.ArgumentParser:
         "flow, phase-correlation, or cross-correlation searchlights. See the notes below "
         "for how to read each output, which -flag applies to which -backend, and how to "
         "tune each.",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=_EPILOG,
     )
     io = p.add_argument_group("Input/Output")

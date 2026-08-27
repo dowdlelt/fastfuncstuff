@@ -14,12 +14,9 @@ import time
 
 import numpy as np
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.pcpatch import PCPatchConfig, run_pcpatch
-
-
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    pass
 
 
 def _parse_ncomps(token: str) -> tuple[str, float]:
@@ -47,7 +44,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "The premise fails: NORDIC's residual is the near-full-rank thermal-noise floor, so "
         "this over-removes and guts signal. Use 'ffs_nordic -retain_dof' to cap DoF loss, or "
         "'ffs_reml -adjust_dof' to account for it. Kept only for the record.",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 [FAILED EXPERIMENT] This tool does not work as intended and is retained only for
 reproducibility of the write-up (fmri_wiki/concepts/Residual PC projection.md).

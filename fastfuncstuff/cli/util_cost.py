@@ -32,6 +32,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_1D
 from fastfuncstuff.processing.allcost import (
@@ -58,7 +59,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="ffs_util_cost",
         description="Report all alignment cost functionals for an image pair "
         "(AFNI 3dAllineate -allcostX). Lower is better for every value.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=_epilog(),
     )
     parser.add_argument("-base", required=True, help="Base/reference dataset")

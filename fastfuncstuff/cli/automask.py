@@ -16,6 +16,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_verbose_arg,
@@ -33,6 +34,7 @@ def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=FfsHelpFormatter,
         prog="ffs_util_automask",
         description="Create a binary brain mask from a 3D volume (GPU, AFNI-compatible)",
     )

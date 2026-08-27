@@ -30,6 +30,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     from fastfuncstuff.cli_utils import (
         add_device_arg,
@@ -77,46 +79,12 @@ except ImportError as e:
 # ---------------------------------------------------------------------------
 
 
-class _CleanHelpFormatter(argparse.RawDescriptionHelpFormatter):
-    """Hide ``-foo_bar`` aliases when a ``-foo-bar`` form exists.
-
-    Both forms remain accepted by argparse; only the dash form is shown in
-    the help and usage line — keeps the help readable while still honouring
-    the project's "accept both" convention.
-    """
-
-    def _filter(self, option_strings: list[str]) -> list[str]:
-        dash = [s for s in option_strings if "_" not in s]
-        return dash or list(option_strings)
-
-    def _format_action_invocation(self, action):
-        if not action.option_strings:
-            return super()._format_action_invocation(action)
-        opts = self._filter(action.option_strings)
-        if action.nargs == 0:
-            return ", ".join(opts)
-        args_str = self._format_args(action, self._get_default_metavar_for_optional(action))
-        return ", ".join(f"{o} {args_str}" for o in opts)
-
-    def _format_actions_usage(self, actions, groups):
-        # Drop underscore aliases from the usage line by rewriting each
-        # action's option_strings to its filtered form for one render.
-        saved = [a.option_strings for a in actions]
-        try:
-            for a in actions:
-                a.option_strings = self._filter(a.option_strings)
-            return super()._format_actions_usage(actions, groups)
-        finally:
-            for a, orig in zip(actions, saved, strict=False):
-                a.option_strings = orig
-
-
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="ffs_perm",
         description="GPU-accelerated nonparametric permutation testing with "
         "AFNI-style cluster correction.",
-        formatter_class=_CleanHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     inp = p.add_argument_group("Inputs")

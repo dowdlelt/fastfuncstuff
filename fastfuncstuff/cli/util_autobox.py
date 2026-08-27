@@ -19,6 +19,7 @@ import sys
 import time
 from pathlib import Path
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_device_arg, spinner
 from fastfuncstuff.processing.autobox import (
     DEFAULT_CLFRAC,
@@ -34,6 +35,7 @@ from fastfuncstuff.utils import REGISTRATION_TF32, configure_torch_backends
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        formatter_class=FfsHelpFormatter,
         prog="ffs_util_autobox",
         description="Crop a dataset to the box around its non-zero data, "
         "preserving the header geometry (GPU, matching AFNI 3dAutobox).",

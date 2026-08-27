@@ -77,6 +77,7 @@ from pathlib import Path
 
 import numpy as np
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.decomposition.ica import (
     FastICA,
@@ -90,15 +91,11 @@ from fastfuncstuff.decomposition.tools import parse_num_comps_spec
 from fastfuncstuff.io.afni import get_tr_from_file, load_fmri_data
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
-
-
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="PCA and ICA decomposition for fMRI data",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=__doc__,
     )
 

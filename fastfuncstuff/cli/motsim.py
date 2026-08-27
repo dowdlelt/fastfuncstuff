@@ -12,6 +12,7 @@ from pathlib import Path
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
@@ -37,7 +38,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Applies motion parameters to a reference EPI to simulate motion-induced "
             "signal changes, then extracts PCs as regressors of no interest."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # ── I/O ──

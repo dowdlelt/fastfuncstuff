@@ -34,13 +34,14 @@ import sys
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device
 
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Extract temporal PCs from ffs_qwarp warp displacement files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=(
             "Examples:\n"
             "  ffs_util_pcwarp -warp_dir sub01_warps -n_pcs 5\n"

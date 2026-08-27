@@ -56,6 +56,8 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     import nibabel as nib  # noqa: F401 — availability check
 except ImportError:
@@ -107,15 +109,11 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Show defaults while preserving raw description formatting."""
-
-
 def parse_args():
     """Parse command-line arguments"""
     parser = argparse.ArgumentParser(
         description="Fast fMRI deconvolution with FIR/TENT models",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # Required arguments

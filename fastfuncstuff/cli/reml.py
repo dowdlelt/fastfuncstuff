@@ -27,6 +27,8 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     import nibabel as nib  # noqa: F401 — availability check
 except ImportError:
@@ -37,7 +39,6 @@ except ImportError:
 try:
     from fastfuncstuff.analysis import analyze_from_design_matrix
     from fastfuncstuff.cli_utils import (
-    ScannableHelpFormatter,
         add_cv_strategy_arg,
         add_device_arg,
         add_noise_ceiling_args,
@@ -227,15 +228,11 @@ def extract_onset_times_from_design(design_matrix: np.ndarray, column_indices: l
     return onset_times
 
 
-class _HelpFormatter(ScannableHelpFormatter):
-    """The shared scannable formatter; kept as a local name for this module's parser."""
-
-
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="ffs_reml - Fast GPU-accelerated ARMA(1,1) GLM fitting",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Basic REML analysis with main bucket output

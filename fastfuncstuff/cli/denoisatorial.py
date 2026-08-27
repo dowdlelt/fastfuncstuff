@@ -39,6 +39,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     import nibabel as nib  # noqa: F401
 except ImportError:
@@ -48,7 +50,6 @@ except ImportError:
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
-        ScannableHelpFormatter,
         add_device_arg,
         add_load_threads_arg,
         add_noise_ceiling_args,
@@ -99,15 +100,11 @@ except ImportError as e:
 # ============================================================================
 
 
-class _HelpFormatter(ScannableHelpFormatter):
-    """The shared scannable formatter; kept as a local name for this module's parser."""
-
-
 def create_parser():
     """Create argument parser."""
     parser = argparse.ArgumentParser(
         description="ffs_denoisatorial - Combinatorial PC Denoising",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Basic combinatorial denoising (7 PCs, 128 combinations)

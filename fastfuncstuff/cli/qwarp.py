@@ -30,6 +30,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
@@ -185,7 +186,7 @@ def parse_args(
             "mean/median base instead. Per-volume warps are saved alongside the 4D output."
         ),
         epilog=_EPILOG,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # ── Input / Output ──────────────────────────────────────────────────

@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.locomoco import resolve_pe_axis
@@ -29,11 +30,6 @@ from fastfuncstuff.processing.shiftcorr import (
     save_shift_tables,
 )
 from fastfuncstuff.utils import REGISTRATION_TF32
-
-
-class _HelpFormatter(argparse.ArgumentDefaultsHelpFormatter, argparse.RawDescriptionHelpFormatter):
-    """Show each arg's default AND keep the epilog's hand-formatted layout."""
-
 
 _EPILOG = """\
 what this corrects
@@ -92,7 +88,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "multi-echo 3-D EPI/GRE, by whole-volume inter-echo cross-correlation and a "
         "sinc-exact Fourier shift.",
         epilog=_EPILOG,
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
     p.add_argument(
         "-input",

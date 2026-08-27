@@ -7,12 +7,9 @@ import argparse
 import sys
 import time
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, print_cli_header, setup_device
 from fastfuncstuff.denoise.sauna import SaunaConfig, run_sauna
-
-
-class _HelpFormatter(argparse.RawDescriptionHelpFormatter, argparse.ArgumentDefaultsHelpFormatter):
-    """Preserve examples while showing defaults."""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -23,7 +20,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "Next-gen fMRI denoiser using noise-volume g-factor estimation\n"
             "and Gavish-Donoho optimal singular value shrinkage."
         ),
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Complex data with 3 trailing noise volumes

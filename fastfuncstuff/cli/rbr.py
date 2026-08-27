@@ -45,6 +45,7 @@ from pathlib import Path
 import torch
 
 from fastfuncstuff.cli.bbr import _normalize_targets, _ribbon_wm
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import apply_affine, load_matrix_chain
 from fastfuncstuff.processing.bbr import (
@@ -81,7 +82,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "starts in the closest linear space and the residual stays within the BBR\n"
             "capture range."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=(
             "Direction / stack convention: identical to ffs_bbr. The .aff12.1D maps\n"
             "  anat(base) -> epi(source); pass the native EPI to -epi. Multiple affines\n"

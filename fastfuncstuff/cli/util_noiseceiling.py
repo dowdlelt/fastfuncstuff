@@ -47,6 +47,7 @@ import sys
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_verbose_arg,
@@ -68,7 +69,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ffs_util_noiseceiling",
         description="Standalone per-voxel noise ceilings from repeated runs or single-trial betas",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Repeated movie: runs 1-3 saw movie A, runs 4-6 saw movie B

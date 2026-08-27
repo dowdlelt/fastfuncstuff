@@ -44,11 +44,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 # Import fastfuncstuff modules
 try:
     from fastfuncstuff.cli_utils import (
         LoadResult,
-        ScannableHelpFormatter,
         add_cv_metric_arg,
         add_cv_strategy_arg,
         add_device_arg,
@@ -97,15 +98,11 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(ScannableHelpFormatter):
-    """The shared scannable formatter; kept as a local name for this module's parser."""
-
-
 def create_parser():
     """Create argument parser"""
     parser = argparse.ArgumentParser(
         description="3dRidgefast - GPU-accelerated ridge regression with single-trial estimation",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Basic single-trial ridge regression

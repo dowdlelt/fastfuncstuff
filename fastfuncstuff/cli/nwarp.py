@@ -17,6 +17,7 @@ import time
 
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -72,7 +73,7 @@ Examples:
       -master template.nii \\
       -prefix epi_4d_warped.nii
 """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     io_group = parser.add_argument_group("Input/Output")

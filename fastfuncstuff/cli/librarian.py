@@ -52,6 +52,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
+
 try:
     from fastfuncstuff.cli_utils import (
         add_load_threads_arg,
@@ -98,13 +100,6 @@ except ImportError as e:
     sys.exit(1)
 
 
-class _HelpFormatter(
-    argparse.RawDescriptionHelpFormatter,
-    argparse.ArgumentDefaultsHelpFormatter,
-):
-    """Match the formatter used by other ffs_* CLIs."""
-
-
 # ----------------------------------------------------------------------------
 # CLI parser
 # ----------------------------------------------------------------------------
@@ -123,7 +118,7 @@ def create_parser() -> argparse.ArgumentParser:
             "Build a custom HRF library from your own data (NSD-style "
             "FIR -> SVD -> manifold -> double-gamma)."
         ),
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog="""
 Examples:
   # Single library across all events (BIDS)

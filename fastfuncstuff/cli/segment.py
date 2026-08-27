@@ -22,6 +22,7 @@ import sys
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_device_arg, setup_device, spinner
 from fastfuncstuff.processing.affine import load_matrix_chain
 from fastfuncstuff.processing.io import load_image, save_image, save_warp_field
@@ -99,7 +100,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "New Segment (spm_preproc8) — GM/WM tissue maps validated to Dice >0.92 —\n"
             "in seconds rather than minutes."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=(
             "WHAT THE KNOBS DO (all have sensible SPM defaults; touch these only to\n"
             "steer a specific behaviour):\n"

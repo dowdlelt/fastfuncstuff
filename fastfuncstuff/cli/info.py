@@ -19,6 +19,7 @@ import argparse
 import os
 import sys
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.io.dsetinfo import (
     _XFORM_NAMES,
     DatasetInfo,
@@ -293,7 +294,7 @@ def build_parser() -> argparse.ArgumentParser:
             ".nii, .nii.gz, .nii.zst and AFNI HEAD/BRIK without decompressing the "
             "image data), optionally drawing the volume in the terminal."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=(
             "examples:\n"
             "  ffs_info run.nii.zst                  # full report\n"

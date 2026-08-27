@@ -52,6 +52,7 @@ from datetime import datetime
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -61,13 +62,6 @@ from fastfuncstuff.cli_utils import (
     setup_device,
 )
 from fastfuncstuff.utils import REGISTRATION_TF32
-
-
-class _HelpFormatter(
-    argparse.RawDescriptionHelpFormatter,
-    argparse.ArgumentDefaultsHelpFormatter,
-):
-    pass
 
 
 def _float_list(s: str) -> list[float]:
@@ -83,7 +77,7 @@ def create_parser() -> argparse.ArgumentParser:
         prog="ffs_blipflip",
         description="Blip-up/blip-down susceptibility distortion correction "
         "(FSL topup-style field model; independent GPU reimplementation).",
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
         epilog=__doc__.split("METHOD / CREDIT")[1].strip(),
     )
 

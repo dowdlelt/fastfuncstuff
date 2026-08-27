@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
@@ -190,7 +191,7 @@ Examples:
   allineate -base mni.nii -source subj_ss.nii -prefix out_ss.nii \\
             -source_follower subj.nii -follower_prefix out_orig.nii
 """,
-        formatter_class=argparse.RawDescriptionHelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # --- Input/Output ---

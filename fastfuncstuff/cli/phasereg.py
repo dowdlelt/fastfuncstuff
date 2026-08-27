@@ -120,15 +120,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from fastfuncstuff.cli_help import FfsHelpFormatter
 from fastfuncstuff.cli_utils import add_ortvec_arguments, add_verbose_arg, spinner
-
-
-class _HelpFormatter(
-    argparse.RawDescriptionHelpFormatter,
-    argparse.ArgumentDefaultsHelpFormatter,
-):
-    pass
-
 
 # Printed at the end of -h. Kept self-contained (no wiki required): it tells a
 # first-time user what each file is FOR and how to read it, then how the flags
@@ -317,7 +310,7 @@ def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Phase regression for macrovascular BOLD suppression",
         epilog=_EPILOG,
-        formatter_class=_HelpFormatter,
+        formatter_class=FfsHelpFormatter,
     )
 
     # ── Required ─────────────────────────────────────────────────────────
