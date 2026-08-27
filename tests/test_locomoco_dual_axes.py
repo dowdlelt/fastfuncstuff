@@ -962,3 +962,48 @@ def test_two_echoes_linearity_r2_is_not_a_free_pass():
     te3 = torch.tensor([10.0, 30.0, 50.0])
     junk = torch.randn(3, 6, 6, 6, 4)
     assert _affine_in_te_r2(junk, te3) < 0.9
+
+
+def test_coupling_map_is_nan_outside_the_measured_mask(tmp_path):
+    """r = 0 is a real answer, so unmeasured voxels must not be written as 0.
+
+    Bug of record: the coupling map gated on displacement ENERGY (>10% of max), which on
+    real data keeps air (where the feathered gate leaves residual flow) and drops brain
+    (where the wiggle is genuinely sub-voxel) — half the FoV came back a hard 0 and read
+    as a failed map.
+    """
+    import nibabel as nib
+    import numpy as np
+
+    inp = _mkseries(tmp_path)
+    stem = str(tmp_path / "nanmask")
+    rc = _run(
+        [
+            "-input", inp, "-prefix", stem, "-pe_dir", "x", "-pe_dir2", "y",
+            "-ref", "0", "-device", "cpu", "-no_movie", "-no_warp", "-levels", "1",
+            "-iters", "1",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    from pathlib import Path
+
+    r = np.asarray(nib.load(f"{stem}_locomoco_coupling_r.nii.gz").dataobj)
+    assert Path(f"{stem}_locomoco_coupling_r.nii.gz").exists()
+    # Something was measured, and whatever was not is NaN rather than a spurious zero.
+    assert np.isfinite(r).any()
+    assert not (np.isfinite(r) & (r == 0)).all()
+    unmeasured = ~np.isfinite(r)
+    if unmeasured.any():
+        assert np.isnan(r[unmeasured]).all()
+
+
+def test_detask_without_events_is_refused(tmp_path):
+    """-detask needs a design; alone it was a silent no-op through the whole run."""
+    inp = _mkseries(tmp_path)
+    rc = _run(
+        [
+            "-input", inp, "-prefix", str(tmp_path / "dt"), "-pe_dir", "x",
+            "-device", "cpu", "-no_movie", "-no_warp", "-detask",
+        ]
+    )  # fmt: skip
+    assert rc == 2

@@ -1746,7 +1746,30 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     return cleaned
 
 
-def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> None:
+def _brain_mask_for_coupling(data, shape) -> torch.Tensor | None:
+    """Binary (nx,ny,nz) brain mask from the mean volume, or None if it can't be built.
+
+    The coupling statistics need a mask of where the DATA is, not of where the estimated
+    flow happens to be large — the two disagree badly, because the feathered gate leaves
+    more residual flow outside the head than inside it. Built on the CPU: it is one
+    automask over a mean volume, next to nothing beside the solve that just ran.
+    """
+    if data is None:
+        return None
+    try:
+        from fastfuncstuff.processing.mask import automask
+
+        ref = torch.from_numpy(np.ascontiguousarray(np.asarray(data).mean(axis=3))).float()
+        if tuple(ref.shape) != tuple(shape):
+            return None
+        m = automask(ref.permute(2, 1, 0).contiguous(), device=torch.device("cpu"))
+        return m.permute(2, 1, 0).contiguous().bool()
+    except Exception:
+        # A diagnostic mask is never worth failing the run over; fall back to the caller's.
+        return None
+
+
+def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data=None) -> None:
     """Write the two-encode-axis extras: the separability map and the coupling report.
 
     Both exist to answer the question the joint solve deliberately does NOT assume an
@@ -1775,12 +1798,17 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> N
             f"ambiguous): {spath}"
         )
 
-    # Restrict the coupling stats to voxels that actually moved — air contributes only
-    # the gating's leftovers and would drag every correlation toward it.
+    # Restrict the coupling stats to BRAIN. This used to gate on displacement energy
+    # ("voxels that actually moved"), which is backwards on real data: the feathered
+    # automask leaves more residual flow in air and at the FoV edge than the brain's
+    # genuinely sub-voxel wiggle, so a 10%-of-max energy threshold kept 59% of air and
+    # only 39% of brain on a 2 mm ME run — it selected the noise it meant to exclude.
     comps = result.pe_displacements()
     d1, d2 = comps[0][2], comps[1][2]
-    energy = (d1.abs() + d2.abs()).mean(dim=3)
-    mask = energy > 0.1 * float(energy.max()) if float(energy.max()) > 0 else None
+    mask = _brain_mask_for_coupling(data, d1.shape[:3])
+    if mask is None:
+        energy = (d1.abs() + d2.abs()).mean(dim=3)
+        mask = energy > 0.1 * float(energy.max()) if float(energy.max()) > 0 else None
     if result.sep_map is not None and mask is not None:
         # and to voxels where the split between axes was actually determined
         mask = mask & (result.sep_map.mean(dim=3) > 0.2)
@@ -1791,8 +1819,14 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> N
         return
 
     rpath = f"{stem}_locomoco_coupling_r{ext}"
+    # Unmeasured voxels are NaN, not 0: r = 0 is a legitimate result ("measured, and the
+    # two fields are unrelated here"), so filling the out-of-mask half with zeros made a
+    # perfectly ordinary map look like it had failed over half the volume.
+    r_vox = c["r_per_voxel"].clone()
+    if mask is not None:
+        r_vox[~mask] = float("nan")
     with spinner(f"Writing {Path(rpath).name}"):
-        save_nifti(c["r_per_voxel"].numpy(), rpath, affine=affine)
+        save_nifti(r_vox.numpy(), rpath, affine=affine)
     frame_path = f"{stem}_locomoco_coupling_r.1D"
     np.savetxt(
         frame_path,
@@ -1815,7 +1849,13 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args) -> N
     )
     cpath = f"{stem}_locomoco_coupling.txt"
     Path(cpath).write_text(txt)
-    print(f"  • per-voxel coupling r 3D: {rpath}")
+    cov = (
+        f"{int(mask.sum())} voxels ({100.0 * float(mask.float().mean()):.1f}% of the FoV);"
+        " elsewhere NaN"
+        if mask is not None
+        else "whole FoV"
+    )
+    print(f"  • per-voxel coupling r 3D [{cov}]: {rpath}")
     print(f"  • per-frame coupling r: {frame_path}")
     print(f"  • coupling report: {cpath}")
     print(
@@ -2222,6 +2262,18 @@ def _run_multiecho(
             scaling = "fixed(TE)"
         else:
             scaling = "learned"
+    if args.detask:
+        # The late warning fires only after the whole solve; a run can be many minutes of
+        # work before the user learns nothing was de-tasked. Say it up front too.
+        print(
+            "   ⚠️  -detask is not wired for the multi-echo path — the outputs will NOT "
+            "be de-tasked (the task diagnostic is still written)."
+        )
+    if pe_axis2 is not None:
+        # Two axes carry two DIFFERENT laws, and only the partition one is settable:
+        # the primary PE row is pinned alpha=1 by construction. A bare "scaling=fixed(TE)"
+        # reads as if it applied to both, so name the axis each law belongs to.
+        scaling = f"primary PE flat(alpha=1) / partition {scaling}"
     # ref / refine are temporal-template knobs — inert under inter-echo unless its
     # temporal refine pass runs, which is a genuine template-based solve.
     ie_only = args.me_interecho and not args.me_interecho_refine
@@ -2497,7 +2549,7 @@ def _run_multiecho(
     # construction, and the partition law is normalised to echo 1), so its per-echo
     # fields ARE the shared fields — the coupling measured on it is the shared-field
     # coupling, not one echo's view of it.
-    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args)
+    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, datas[0])
 
     if args.events and tr_sec:
         # Echo 1's series and the shared field: the coupling question is about the ONE
@@ -2627,6 +2679,17 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     ``device`` is None on the solo path (resolve it here) and pre-resolved by the
     batch runner, so the batch chooses a device once for all of its runs."""
     preset = _apply_preset(args)
+
+    # -detask has nothing to key on without a design, and the task stage it lives in is
+    # gated on -events — so a lone -detask is a silent no-op all the way through. Say so
+    # here rather than let a run finish looking de-tasked.
+    if args.detask and not args.events:
+        print(
+            "❌ -detask needs -events (the task-locked part is defined by the design); "
+            "nothing would be removed.",
+            file=sys.stderr,
+        )
+        return 2
 
     # Multi-echo 3-D EPI is a single 3-D-acquired solve, so (like -is_3dacq) the PE
     # direction is allowed to coincide with the slice axis.
@@ -3245,7 +3308,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 f"  • signed PE flow 4D (voxels, ± = direction; scrub like a series): {flow_path}"
             )
 
-    _write_dual_axis_diagnostics(result, stem, ext, affine, args)
+    _write_dual_axis_diagnostics(result, stem, ext, affine, args, data)
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
