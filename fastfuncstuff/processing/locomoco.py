@@ -2728,7 +2728,9 @@ def _spatial_highpass3d(
 MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag")
 
 
-def _match_prep(vol: torch.Tensor, mode: str, sigma: float = 2.0) -> torch.Tensor:
+def _match_prep(
+    vol: torch.Tensor, mode: str, sigma: float = 2.0, skip_axis: int | None = None
+) -> torch.Tensor:
     """Make brightness constancy approximately true for a cross-contrast ``(B,X,Y,Z)`` pair.
 
     Same modes and semantics as :func:`fastfuncstuff.processing.optiwarp.prep_intensity`
@@ -2738,22 +2740,33 @@ def _match_prep(vol: torch.Tensor, mode: str, sigma: float = 2.0) -> torch.Tenso
     echo everywhere, and that intensity step is gradient-shaped, so the Gauss-Newton
     solve reads it as displacement and runs away. Removing a LOCAL mean/scale (or
     dropping to gradient magnitude) takes the decay out and leaves the geometry.
+
+    The same machinery serves the cross-TIME job (``-match``): a frame whose brightness
+    drifts over the run violates constancy exactly as a later echo does.
+
+    ``skip_axis`` leaves one axis out of the local neighbourhood (and, for ``gradmag``,
+    out of the gradient), for a 2-D multi-slice acquisition where each slice is sampled
+    at its own instant.
     """
     if mode == "none":
         return vol
     if mode == "gradmag":
-        b = _blur3d_b(vol, 1.0)
-        gx, gy, gz = (_grad_axis_3d(b, a) for a in (0, 1, 2))
-        mag = (gx * gx + gy * gy + gz * gz).clamp(min=1e-12).sqrt()
-        return _match_prep(mag, "localnorm", sigma)
+        b = _blur3d_b(vol, 1.0, skip_axis)
+        axes = [a for a in (0, 1, 2) if a != skip_axis]
+        sq = torch.zeros_like(b)
+        for a in axes:
+            g = _grad_axis_3d(b, a)
+            sq = sq + g * g
+        mag = sq.clamp(min=1e-12).sqrt()
+        return _match_prep(mag, "localnorm", sigma, skip_axis)
     if mode == "meanstd":
         dims = (1, 2, 3)
         mu = vol.mean(dim=dims, keepdim=True)
         sd = vol.std(dim=dims, keepdim=True).clamp(min=1e-6)
         return (vol - mu) / sd
     if mode == "localnorm":
-        mu = _blur3d_b(vol, sigma)
-        var = _blur3d_b(vol * vol, sigma) - mu * mu
+        mu = _blur3d_b(vol, sigma, skip_axis)
+        var = _blur3d_b(vol * vol, sigma, skip_axis) - mu * mu
         return (vol - mu) / var.clamp(min=1e-12).sqrt()
     raise ValueError(f"unknown match mode {mode!r}; choose from {MATCH_MODES}")
 
@@ -4542,6 +4555,8 @@ def estimate_residual_flow_multiecho(
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    match: str = "none",
+    match_sigma: float = 6.0,
     pe_axis2: int | None = None,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
@@ -4665,7 +4680,12 @@ def estimate_residual_flow_multiecho(
     # Estimation prep: optional spatial high-pass (raw kept for the resample), then the
     # existing estimation blur. Identity when both sigmas are 0. v is a single (X,Y,Z) vol.
     def _prep(v: torch.Tensor) -> torch.Tensor:
-        x = _spatial_highpass3d(v[None], hpf_sigma, sw_axis)
+        # Cross-TIME matching, applied per echo and to both sides. Each echo is normalised
+        # against itself, so the TE relationship the joint solve depends on is untouched:
+        # `alphas` scales the DISPLACEMENT field, never the intensities.
+        x = _spatial_highpass3d(
+            _match_prep(v[None], match, match_sigma, sw_axis), hpf_sigma, sw_axis
+        )
         if smooth_sigma > 0:
             x = _blur3d_b(x, smooth_sigma, sw_axis)
         return x[0]
@@ -5063,6 +5083,8 @@ def estimate_residual_flow_me_scaled(
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    match: str = "none",
+    match_sigma: float = 6.0,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -5124,6 +5146,8 @@ def estimate_residual_flow_me_scaled(
         warp_interp=warp_interp,
         warp_radius=warp_radius,
         hpf_sigma=hpf_sigma,
+        match=match,
+        match_sigma=match_sigma,
         device=device,
         verbose=verbose,
     )
@@ -5998,6 +6022,8 @@ def refine_interecho_temporally(
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
+    match: str = "none",
+    match_sigma: float = 6.0,
     want_corrected: bool = True,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -6143,6 +6169,8 @@ def refine_interecho_temporally(
             warp_interp=warp_interp,
             warp_radius=warp_radius,
             hpf_sigma=hpf_sigma,
+            match=match,
+            match_sigma=match_sigma,
             device=device,
             verbose=verbose,
         )

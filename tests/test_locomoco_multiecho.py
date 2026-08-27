@@ -904,3 +904,66 @@ def test_qwarp_ref_mode_changes_the_template():
     med = polish_me_result(res, ref_mode="median", **common)
     mean = polish_me_result(res, ref_mode="mean", **common)
     assert not torch.allclose(med.w_field, mean.w_field), "ref_mode never reached the template"
+
+
+def test_match_rescues_the_multiecho_flow_from_a_brightness_ramp():
+    """-match has to REACH the multi-echo joint solve, not just be accepted.
+
+    A per-frame gain (the pre-steady-state ramp) violates brightness constancy, and LK
+    works from the raw residual moving-fixed, so it reads the gain as displacement. The
+    frames here carry NO motion at all, so any field the estimator returns is pure gain
+    artifact — and -match localnorm has to shrink it.
+    """
+    tes = [12.0, 30.0, 48.0]
+    nt = 6
+    datas, _ = _make_multiecho(tes, [0.0] * nt)
+    # A smooth, spatially varying gain that decays over the run — the T1 saturation ramp.
+    nx, ny, nz, _ = datas[0].shape
+    grad = np.linspace(0.8, 1.4, nx, dtype=np.float32)[:, None, None]
+    ramped = []
+    for d in datas:
+        out = d.copy()
+        for t in range(nt):
+            out[..., t] *= 1.0 + (0.35 * (1.0 - t / (nt - 1))) * grad
+        ramped.append(out)
+
+    common = dict(
+        pe_axis=PE,
+        slice_axis=PE,
+        n_levels=3,
+        n_iters=8,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    raw = estimate_residual_flow_multiecho(ramped, tes, match="none", **common)
+    matched = estimate_residual_flow_multiecho(
+        ramped, tes, match="localnorm", match_sigma=6.0, **common
+    )
+    core = torch.from_numpy(_phantom() > np.percentile(_phantom(), 40))
+    spurious_raw = float(raw.w_field[core].abs().mean())
+    spurious_matched = float(matched.w_field[core].abs().mean())
+    # Measured 2.95 vox unmatched vs 0.06 matched: this is not a marginal effect.
+    assert spurious_raw > 1.0, spurious_raw
+    assert spurious_matched < 0.2 * spurious_raw, (spurious_raw, spurious_matched)
+
+    # The same ramp does nothing to the qwarp backend, whose per-patch ncc is invariant
+    # to an affine intensity change inside the patch. This is why -match is not wired
+    # into it, and the help says so.
+    clean = make_raw_reference_me_result(datas, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    dirty = make_raw_reference_me_result(ramped, tes, pe_axis=PE, slice_axis=PE, verbose=False)
+    qcommon = dict(
+        minpatch=5,
+        n_levels=1,
+        iters=6,
+        cost="ncc",
+        optimizer="gn",
+        full=True,
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    q_clean = polish_me_result(clean, raw_datas=datas, **qcommon)
+    q_dirty = polish_me_result(dirty, raw_datas=ramped, **qcommon)
+    assert float(q_dirty.w_field[core].abs().mean()) < 0.05
+    assert float(q_dirty.w_field[core].abs().mean()) < 0.05 + float(
+        q_clean.w_field[core].abs().mean()
+    )

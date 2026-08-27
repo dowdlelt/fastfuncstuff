@@ -608,7 +608,9 @@ def create_parser() -> argparse.ArgumentParser:
         "  xcorr  magnitude cross-correlation searchlight: slide along PE, take the peak local"
         " correlation. Robust and single-shot; already scale-invariant, so the"
         " intensity-matching flags are inert for it.\n"
-        "  qwarp  no flow estimate at all — the joint TE-scaled qwarp owns the whole field,"
+        "  qwarp  no flow estimate at all — the joint TE-scaled qwarp owns the whole field."
+        " Its per-patch ncc is invariant to an affine intensity change inside the patch, so"
+        " it needs none of the -match machinery;"
         " registering the raw frames to a temporal reduction of themselves (-ref picks the"
         " reduction, -refine rebuilds it from the corrected series and re-solves). For input"
         " that is ALREADY motion corrected; for residual motion use -backend flow"
@@ -692,9 +694,17 @@ def create_parser() -> argparse.ArgumentParser:
         "  meanstd    one global rescale per frame. Near-useless for the ramp, whose gain"
         " varies 0.94-1.39 across tissue.\n"
         "Neighbourhood size is -match_sigma; it does not interact with -window.\n"
-        "Inert for -backend xcorr (it normalizes inside its own correlation window)."
-        " SINGLE-ECHO path only — multi-echo runs use -me_match for their cross-TE matching"
-        " and IGNORE this flag. Not supported with rotation-aware mode.",
+        "This is really a FLOW fix. LK works from the raw residual moving−fixed, so a gain"
+        " enters the solve as if it were displacement and there is nothing in the cost to"
+        " remove it. The correlation-based estimators are already immune, because a Pearson"
+        " r is invariant to any affine intensity change within its window: -backend xcorr"
+        " normalizes inside its own searchlight, and the qwarp paths (-final_qwarp,"
+        " -backend qwarp) score ncc per patch on the RAW data and never see this flag."
+        " -backend phase is in between — the phase-only normalization handles a global"
+        " gain, but not one that varies across the volume.\n"
+        "Applies to single-echo AND multi-echo runs (each echo is matched against itself,"
+        " over TIME). The cross-TE counterpart is -me_match. Not supported with"
+        " rotation-aware mode.",
     )
     est.add_argument(
         "-match_sigma",
@@ -2405,14 +2415,26 @@ def _run_multiecho(
         else:
             scaling = "learned"
     if args.match != "none":
-        # -match is wired only into the single-echo estimator. On the multi-echo path it
-        # was accepted and dropped, which is a bad trap for exactly the run that needs it
-        # (a pre-steady-state ramp is per-FRAME and hits every echo).
-        which = "-me_match" if args.me_interecho else "no cross-frame matching"
-        print(
-            f"   ⚠️  -match {args.match} is single-echo only and is IGNORED here; the "
-            f"multi-echo path uses {which}."
-        )
+        if qwarp_backend:
+            # No flow estimate runs, and qwarp registers raw data under a per-patch
+            # correlation that is already invariant to a smooth gain.
+            print(
+                f"   ⚠️  -match {args.match} needs a flow/phase estimate; -backend qwarp "
+                "registers the RAW frames, so it is IGNORED."
+            )
+        elif args.me_interecho and not args.me_interecho_refine:
+            # The inter-echo pass registers echo to echo, never frame to frame, so there
+            # is no cross-TIME comparison for -match to fix; -me_match is its knob.
+            print(
+                f"   ⚗️  cross-TE intensity match: {args.me_match} "
+                f"(σ={args.me_match_sigma:g}vox) — -match {args.match} is inert without "
+                "-me_interecho_refine (the inter-echo pass has no temporal reference)."
+            )
+        else:
+            print(
+                f"   ⚗️  estimation intensity match: {args.match} "
+                f"(σ={args.match_sigma:g}vox, cross-TIME, per echo)"
+            )
     if args.detask:
         # The late warning fires only after the whole solve; a run can be many minutes of
         # work before the user learns nothing was de-tasked. Say it up front too.
@@ -2540,6 +2562,8 @@ def _run_multiecho(
                 automask_sigma=args.automask_sigma,
                 coverage_erode=None if args.nocoverage else args.coverage_erode,
                 scaling=args.me_refine_scaling,
+                match=args.match,
+                match_sigma=args.match_sigma,
                 noshift_margin=args.noshift_margin,
                 reg_sigma=args.reg_sigma,
                 peak_mode="argmax" if args.argmax else "first_peak",
@@ -2580,6 +2604,8 @@ def _run_multiecho(
             reg_sigma=args.reg_sigma,
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
+            match=args.match,
+            match_sigma=args.match_sigma,
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
@@ -2618,6 +2644,8 @@ def _run_multiecho(
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
+            match=args.match,
+            match_sigma=args.match_sigma,
             pe_axis2=pe_axis2,
             slicewise=slicewise,
             device=device,
@@ -3158,7 +3186,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     if hpf_sigma > 0:
         print(f"   ⚗️  estimation spatial high-pass: {args.hpf_spatial}mm (σ={hpf_sigma:.2f}vox)")
     if args.match != "none":
-        print(f"   ⚗️  estimation intensity match: {args.match} (σ={args.match_sigma:g}vox)")
+        note = " — inert here, qwarp scores ncc on the RAW data" if qwarp_backend else ""
+        print(f"   ⚗️  estimation intensity match: {args.match} (σ={args.match_sigma:g}vox){note}")
     print(f"   accuracy: {acc_desc}")
     if qwarp_backend:
         print(
