@@ -1064,6 +1064,75 @@ def plot_noise_pool_pca_scree(
     return fig
 
 
+# Multi-planar cut geometry for the denoising PC figures.
+#
+# Each plane is transposed so the anatomical superior axis runs up the page
+# under origin="lower": rows are the second-named axis, columns the first.
+_PLANE_SPECS = (
+    ("Sagittal", 0, 2, 1),  # cut along x, rows = z, cols = y
+    ("Coronal", 1, 2, 0),  # cut along y, rows = z, cols = x
+    ("Axial", 2, 1, 0),  # cut along z, rows = y, cols = x
+)
+
+
+def _plane_slice(vol: np.ndarray, cut_ax: int, idx: int, row_ax: int) -> np.ndarray:
+    """Take one 2-D cut with `row_ax` as the vertical (row) axis."""
+    cut = np.take(vol, idx, axis=cut_ax)
+    # np.take drops cut_ax, so the surviving axes keep their relative order.
+    remaining = [a for a in range(3) if a != cut_ax]
+    return cut if remaining[0] == row_ax else cut.T
+
+
+def _cut_indices(mask_vol: np.ndarray | None, cut_ax: int, n_cut: int, extent: int) -> np.ndarray:
+    """Evenly spaced cuts inside the mask's extent along `cut_ax`.
+
+    The old code hardcoded a 5-voxel inset from each end, which inverts the
+    range on a thin slab (a 12-slice slab has no interior left). Work in
+    fractions of the mask extent instead so slabs and whole brains both land
+    on interior cuts.
+    """
+    lo, hi = 0, extent - 1
+    if mask_vol is not None:
+        present = np.where(mask_vol.any(axis=tuple(a for a in range(3) if a != cut_ax)))[0]
+        if present.size:
+            lo, hi = int(present.min()), int(present.max())
+
+    span = hi - lo
+    fracs = (np.arange(n_cut) + 1.0) / (n_cut + 1.0)
+    return np.clip(np.round(lo + fracs * span).astype(int), 0, extent - 1)
+
+
+def _mask_bbox(mask_vol: np.ndarray, pad: int = 2) -> tuple[slice, slice, slice]:
+    """Tightest box containing the mask, padded by `pad` voxels per side.
+
+    Without this the montage draws the whole acquisition box, and on a slab the
+    empty surround is most of the picture.
+    """
+    box = []
+    for ax in range(3):
+        present = np.where(mask_vol.any(axis=tuple(a for a in range(3) if a != ax)))[0]
+        if present.size:
+            lo = max(0, int(present.min()) - pad)
+            hi = min(mask_vol.shape[ax], int(present.max()) + 1 + pad)
+        else:
+            lo, hi = 0, mask_vol.shape[ax]
+        box.append(slice(lo, hi))
+    return box[0], box[1], box[2]
+
+
+def _montage_2d(cuts: list[np.ndarray], pad: int = 2) -> np.ndarray:
+    """Lay cuts of one plane side by side with a NaN gutter between them."""
+    if len(cuts) == 1:
+        return cuts[0]
+    gutter = np.full((cuts[0].shape[0], pad), np.nan)
+    pieces: list[np.ndarray] = []
+    for i, cut in enumerate(cuts):
+        if i:
+            pieces.append(gutter)
+        pieces.append(cut)
+    return np.hstack(pieces)
+
+
 def plot_denoising_pcs(
     noise_pcs_per_run: list[torch.Tensor | np.ndarray],
     run_starts: list[int],
@@ -1073,7 +1142,7 @@ def plot_denoising_pcs(
     voxel_mask: np.ndarray | None = None,
     noise_pool_mask: np.ndarray | None = None,
     n_pcs_to_show: int = 5,
-    n_slices: int = 5,
+    n_slices: int = 3,
     slice_axis: str = "x",
     tr: float = 2.0,
     optimal_n_pcs: int | None = None,
@@ -1110,11 +1179,12 @@ def plot_denoising_pcs(
         Required when pc_weights_per_run is provided.
     n_pcs_to_show : int, default=5
         Number of PCs to visualize.
-    n_slices : int, default=5
-        Number of slices to show per run.
+    n_slices : int, default=3
+        Number of cuts per plane, per run. All three planes are always drawn.
     slice_axis : str, default='x'
-        Axis along which to slice ('x', 'y', or 'z').
-        'x' = sagittal (L/R), 'y' = coronal (A/P), 'z' = axial (I/S)
+        Which plane is drawn first ('x' = sagittal, 'y' = coronal, 'z' = axial).
+        The other two follow; no axis is ever dropped, which is what made thin
+        slabs unreadable when a single axis was chosen.
     tr : float, default=2.0
         Repetition time in seconds (for x-axis time labels).
     optimal_n_pcs : int, optional
@@ -1166,9 +1236,31 @@ def plot_denoising_pcs(
     max_pcs_available = min(pc.shape[1] for pc in pcs_np)
     n_pcs_to_show = min(n_pcs_to_show, max_pcs_available)
 
-    # Determine slice axis index
-    axis_map = {"x": 0, "y": 1, "z": 2}
-    slice_ax_idx = axis_map.get(slice_axis.lower(), 0)
+    # All three planes are always drawn; slice_axis only picks which leads.
+    lead_ax = {"x": 0, "y": 1, "z": 2}.get(slice_axis.lower(), 0)
+    plane_specs = sorted(_PLANE_SPECS, key=lambda spec: spec[1] != lead_ax)
+
+    # Mask geometry is the same for every PC, so resolve it once. Cropping to the
+    # mask box is what keeps the brain, not the surround, at figure scale.
+    mask_vol = None
+    crop = (slice(None), slice(None), slice(None))
+    disp_shape = tuple(volume_shape) if volume_shape is not None else None
+
+    if volume_shape is not None and voxel_mask is not None:
+        # The support of the weights, built by the same two-level scatter the
+        # weights themselves go through. Where the PCs were never estimated
+        # (brain voxels outside the noise pool) is background, not zero loading.
+        support = np.zeros(int(np.prod(volume_shape)), dtype=bool)
+        if noise_pool_mask is not None:
+            brain = np.zeros(int(voxel_mask.sum()), dtype=bool)
+            brain[noise_pool_mask] = True
+            support[voxel_mask] = brain
+        else:
+            support[voxel_mask] = True
+        mask_vol = support.reshape(volume_shape)
+        crop = _mask_bbox(mask_vol)
+        mask_vol = mask_vol[crop]
+        disp_shape = mask_vol.shape
 
     figs = []
 
@@ -1181,25 +1273,55 @@ def plot_denoising_pcs(
             pc_label += f" ({status} in optimal {optimal_n_pcs}-PC model)"
 
         # Create figure layout:
-        # Row 0: full-width timecourse
-        # Row 1-N: one slice per run, stacked vertically
+        # Row 0: full-width timecourse, spanning every run column
+        # Rows 1-3: one plane (sagittal / coronal / axial) per row; column r
+        #           holds run r's cuts, so they sit under that run's timecourse
         has_weights = pc_weights_per_run is not None and volume_shape is not None
 
-        if has_weights:
-            # GridSpec: (1 + n_slices) rows, 1 column
-            # First row: timecourse (taller)
-            # Remaining rows: one slice position per row, showing all runs L→R (shorter, equal height)
-            fig = plt.figure(figsize=(32, 4 + 3 * n_slices))
-            height_ratios = [2] + [1] * n_slices  # Timecourse gets more space
-            gs = GridSpec(1 + n_slices, 1, figure=fig, height_ratios=height_ratios, hspace=0.3)
-            ax_tc = fig.add_subplot(gs[0, 0])  # Timecourse in first row
-        else:
-            fig, ax_tc = plt.subplots(1, 1, figsize=(32, 4))
-
-        # --- Top panel: Full-width timecourse ---
-        # Compute total timepoints
-        total_tps = sum(pc.shape[0] for pc in pcs_np)
+        run_lengths = [pc.shape[0] for pc in pcs_np]
+        total_tps = sum(run_lengths)
         _time_axis = np.arange(total_tps) * tr
+
+        fig_w = 32.0
+        tc_h = 4.0
+
+        if has_weights:
+            sx, sy, sz = voxel_sizes if voxel_sizes is not None else (1.0, 1.0, 1.0)
+            mm = (float(sx), float(sy), float(sz))
+
+            # Each plane row is sized from the physical shape of its montage, so a
+            # thin slab gets a short-and-wide sagittal row instead of being
+            # squashed into an equal-height one. Size against the narrowest run
+            # column so no row overflows the figure.
+            min_col_w = fig_w * (min(run_lengths) / total_tps)
+            plane_row_h = []
+            for _name, _cut_ax, row_ax, col_ax in plane_specs:
+                h_mm = disp_shape[row_ax] * mm[row_ax]
+                w_mm = n_slices * disp_shape[col_ax] * mm[col_ax]
+                plane_row_h.append(max(0.6, min_col_w * h_mm / w_mm))
+
+            # Two gridspecs rather than one four-row grid: the timecourse needs
+            # room for its axis labels while the plane rows want to sit tight
+            # against each other, and a single hspace cannot do both.
+            pane_h = sum(plane_row_h)
+            fig_h = tc_h + pane_h + 1.4
+            fig = plt.figure(figsize=(fig_w, fig_h))
+
+            split = (pane_h + 0.5) / fig_h
+            gs_tc = fig.add_gridspec(1, 1, top=1.0 - 0.7 / fig_h, bottom=split + 0.35 / fig_h)
+            gs = fig.add_gridspec(
+                3,
+                n_runs,
+                top=split,
+                bottom=0.3 / fig_h,
+                height_ratios=plane_row_h,
+                width_ratios=run_lengths,
+                hspace=0.14,
+                wspace=0.02,
+            )
+            ax_tc = fig.add_subplot(gs_tc[0, 0])
+        else:
+            fig, ax_tc = plt.subplots(1, 1, figsize=(fig_w, tc_h))
 
         # Plot each run with different color
         colors = plt.cm.tab10(np.linspace(0, 1, n_runs))
@@ -1220,7 +1342,7 @@ def plot_denoising_pcs(
 
         ax_tc.set_xlabel("Time (s)", fontsize=11)
         ax_tc.set_ylabel("PC Amplitude (a.u.)", fontsize=11)
-        ax_tc.set_title(f"Timecourse: {pc_label}", fontsize=12, fontweight="bold")
+        ax_tc.set_title("Run-concatenated timecourse", fontsize=11)
         ax_tc.set_xlim(0, total_tps * tr)
         ax_tc.grid(True, alpha=0.3)
 
@@ -1272,19 +1394,34 @@ def plot_denoising_pcs(
         else:
             ax_tc.set_facecolor("#ffe6e6")  # Light red
 
-        # --- Bottom panels: Spatial weights organized by slice ---
-        # Each row shows all runs for the same slice (matching temporal organization)
+        # --- Bottom panels: multi-planar cuts, one column per run ---
+        # Column r sits directly beneath run r's segment of the timecourse
+        # (GridSpec width_ratios are the run lengths), so a spatial pattern can
+        # be read against the timecourse wobble that produced it.
         if has_weights:
-            # First pass: extract slices for all runs
-            all_run_slices = []  # list of (run_idx, slice_idx, slice_2d, weights) tuples
+            # One scale for every run and plane of this PC, so brightness
+            # differences between columns mean something.
+            all_w = np.concatenate(
+                [np.abs(w[:, pc_idx]) for w in pc_weights_per_run if pc_idx < w.shape[1] and w.size]
+            )
+            vmax = float(np.percentile(all_w, 98)) if all_w.size else 1.0
+            if not np.isfinite(vmax) or vmax <= 0:
+                vmax = 1.0
+
+            cmap = plt.get_cmap("RdBu_r").copy()
+            # Out-of-mask voxels and the gutters between cuts are NaN. They have
+            # to be a colour the map cannot produce: zero weight is white in
+            # RdBu_r, so leaving background at zero made "no data" and "no
+            # loading" identical.
+            cmap.set_bad(color="black")
 
             for run_idx, weights in enumerate(pc_weights_per_run):
-                if pc_idx >= weights.shape[1]:
+                if run_idx >= n_runs or pc_idx >= weights.shape[1]:
                     continue
 
                 # Reshape weights to volume (two-level masking)
                 run_weights = weights[:, pc_idx]
-                vol = np.zeros(np.prod(volume_shape))
+                vol = np.zeros(int(np.prod(volume_shape)))
 
                 # TODO - fit PCs to whole brain mask - so we can see how they fit in all areas and
                 # plot all voxels, not just noise pool. We would also want to save those nii (4d, per run, of pcs)
@@ -1292,125 +1429,48 @@ def plot_denoising_pcs(
                     # Create intermediate brain volume
                     brain_vol = np.zeros(voxel_mask.sum())
                     brain_vol[noise_pool_mask] = run_weights
-                    # Map to full volume
                     vol[voxel_mask] = brain_vol
                 elif voxel_mask is not None:
                     vol[voxel_mask] = run_weights
                 else:
                     vol = run_weights
+                vol = vol.reshape(volume_shape)[crop]
+                if mask_vol is not None:
+                    vol = np.where(mask_vol, vol, np.nan)
 
-                vol = vol.reshape(volume_shape)
+                for plane_idx, (name, cut_ax, row_ax, col_ax) in enumerate(plane_specs):
+                    idxs = _cut_indices(mask_vol, cut_ax, n_slices, disp_shape[cut_ax])
+                    montage = _montage_2d([_plane_slice(vol, cut_ax, int(i), row_ax) for i in idxs])
 
-                # Extract slices along specified axis
-                # Find mask extent along slice axis to evenly space slices
-                if voxel_mask is not None:
-                    mask_vol = np.zeros(np.prod(volume_shape), dtype=bool)
-                    mask_vol[voxel_mask] = True
-                    mask_vol = mask_vol.reshape(volume_shape)
+                    ax = fig.add_subplot(gs[plane_idx, run_idx])
+                    ax.axis("off")
+                    ax.imshow(
+                        montage,
+                        cmap=cmap,
+                        vmin=-vmax,
+                        vmax=vmax,
+                        # Data aspect is mm-per-row over mm-per-column; the old
+                        # code folded in the voxel *counts* too and stretched
+                        # every non-cubic volume.
+                        aspect=mm[row_ax] / mm[col_ax],
+                        origin="lower",
+                        interpolation="nearest",
+                    )
 
-                    # Find min/max indices with mask data along slice axis
-                    slice_indices_with_data = np.where(
-                        mask_vol.any(axis=tuple(i for i in range(3) if i != slice_ax_idx))
-                    )[0]
-                    if len(slice_indices_with_data) > 0:
-                        min_idx = slice_indices_with_data.min()
-                        max_idx = slice_indices_with_data.max()
-                    else:
-                        min_idx, max_idx = 0, volume_shape[slice_ax_idx] - 1
-                else:
-                    min_idx, max_idx = 0, volume_shape[slice_ax_idx] - 1
-
-                # Select n_slices evenly spaced
-                slice_indices = np.linspace(min_idx + 5, max_idx - 5, n_slices, dtype=int)
-
-                # Extract slices
-                for slice_idx, idx in enumerate(slice_indices):
-                    if slice_ax_idx == 0:  # Sagittal (x-axis)
-                        slice_2d = vol[idx, :, :]
-                    elif slice_ax_idx == 1:  # Coronal (y-axis)
-                        slice_2d = vol[:, idx, :]
-                    else:  # Axial (z-axis)
-                        slice_2d = vol[:, :, idx]
-
-                    # Flip vertically to match neurological orientation
-                    slice_2d = np.flipud(slice_2d)
-
-                    all_run_slices.append((run_idx, slice_idx, slice_2d, run_weights))
-
-            # Second pass: organize by slice number (not run)
-            # Each row = one slice position across all runs
-            for slice_idx in range(n_slices):
-                # Collect all runs for this slice
-                slices_for_this_position = [
-                    (run_idx, slice_2d, weights)
-                    for (r_idx, s_idx, slice_2d, weights) in all_run_slices
-                    if s_idx == slice_idx
-                ]
-
-                if not slices_for_this_position:
-                    continue
-
-                # Stack slices horizontally: run1, run2, run3, ... (like timecourse)
-                montage_slices = [slice_2d for (_, slice_2d, _) in slices_for_this_position]
-                montage = np.hstack(montage_slices)
-
-                # Use weights from first run for colormap scaling (all runs should be similar)
-                representative_weights = slices_for_this_position[0][2]
-                vmax = np.percentile(np.abs(representative_weights), 98)
-
-                # Calculate aspect ratio to preserve voxel shape (avoid stretching/squishing)
-                # Get slice dimensions from a single run's slice
-                single_slice = montage_slices[0]
-                slice_height, slice_width = single_slice.shape
-
-                if voxel_sizes is not None and volume_shape is not None:
-                    # Use physical dimensions based on voxel sizes
-                    sx, sy, sz = voxel_sizes
-                    nx, ny, nz = volume_shape
-                    # Calculate aspect based on slice axis
-                    # aspect = height / width (physical dimensions)
-                    if slice_ax_idx == 0:  # Sagittal (y-z plane)
-                        aspect = (ny * sy) / (nz * sz)
-                    elif slice_ax_idx == 1:  # Coronal (x-z plane)
-                        aspect = (nx * sx) / (nz * sz)
-                    else:  # Axial (x-y plane)
-                        aspect = (nx * sx) / (ny * sy)
-                elif volume_shape is not None:
-                    # Assume isotropic voxels, use dimension ratios
-                    nx, ny, nz = volume_shape
-                    if slice_ax_idx == 0:  # Sagittal (y-z plane)
-                        aspect = ny / nz
-                    elif slice_ax_idx == 1:  # Coronal (x-z plane)
-                        aspect = nx / nz
-                    else:  # Axial (x-y plane)
-                        aspect = nx / ny
-                else:
-                    # Fallback: use the actual slice dimensions
-                    aspect = slice_height / slice_width
-
-                # Create subplot for this slice position (row slice_idx+1, column 0)
-                ax = fig.add_subplot(gs[slice_idx + 1, 0])
-                ax.axis("off")
-
-                # Show with symmetric colormap and proper aspect ratio
-                _im = ax.imshow(
-                    montage,
-                    cmap="RdBu_r",
-                    vmin=-vmax,
-                    vmax=vmax,
-                    aspect=aspect,
-                    origin="lower",  # Already flipped above
-                )
-
-                # Title showing slice number and run organization
-                ax.set_title(
-                    f"Slice {slice_idx + 1}/{n_slices} (Runs 1-{n_runs}, left to right)",
-                    fontsize=11,
-                    loc="left",
-                )
-
-                # Add colorbar to the right
-                # plt.colorbar(im, ax=ax, fraction=0.02, pad=0.02, label="Weight")
+                    if plane_idx == 0:
+                        ax.set_title(f"Run {run_idx + 1}", fontsize=11, fontweight="bold")
+                    if run_idx == 0:
+                        ax.text(
+                            -0.01,
+                            0.5,
+                            name,
+                            transform=ax.transAxes,
+                            rotation=90,
+                            ha="right",
+                            va="center",
+                            fontsize=10,
+                            color="dimgray",
+                        )
 
         plt.suptitle(pc_label, fontsize=14, fontweight="bold", y=0.98)
 
@@ -1436,6 +1496,9 @@ def plot_denoising_summary(
     r2_threshold: float = 0.05,
     n_noise_voxels: int | None = None,
     n_criteria_voxels: int | None = None,
+    xval_r2_all_voxels: np.ndarray | None = None,
+    min_gain: float | None = None,
+    n_cv_folds: int | None = None,
     output_path: str | None = None,
     figsize: tuple[int, int] = (14, 10),
 ) -> plt.Figure:
@@ -1464,6 +1527,19 @@ def plot_denoising_summary(
         Number of voxels in noise pool.
     n_criteria_voxels : int, optional
         Number of voxels in criteria mask.
+    xval_r2_all_voxels : ndarray, optional
+        The same curve over every voxel rather than the criteria subset. Drawn
+        on a twin axis: the selection curve rising while this one falls is the
+        signature of selection bias, not of denoising.
+    n_cv_folds : int, optional
+        How many CV folds actually ran. The scoring convention concatenates
+        every held-out run's predictions and takes ONE R2 per voxel, so
+        `xval_r2_per_fold` has a single row no matter how many runs there
+        were — deriving the fold count from its shape reported "1 fold" on a
+        six-run dataset.
+    min_gain : float, optional
+        Gain floor the selection had to clear. Drawn as a band above baseline so
+        a flat curve is visibly flat instead of auto-scaled into a landscape.
     output_path : str, optional
         If provided, save figure to this path.
     figsize : tuple, default=(14, 10)
@@ -1478,22 +1554,27 @@ def plot_denoising_summary(
     gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
 
     max_components = len(xval_r2_by_n_components) - 1
-    n_folds = xval_r2_per_fold.shape[0]
+    n_rows = xval_r2_per_fold.shape[0]
+    # One row means the folds were concatenated before scoring, not that one
+    # fold ran. Only trust the row count as a fold count when there are several.
+    n_folds = n_cv_folds if n_cv_folds is not None else n_rows
+    scored_per_fold = n_rows > 1
 
     # --- Panel 1: CV R² by number of PCs ---
     ax1 = fig.add_subplot(gs[0, 0])
 
     # Plot per-fold lines (thin, transparent) with a single legend entry
-    for fold_idx in range(n_folds):
-        label = f"Per-fold R² (n={n_folds})" if fold_idx == 0 else "_nolegend_"
-        ax1.plot(
-            range(max_components + 1),
-            xval_r2_per_fold[fold_idx, :],
-            color="gray",
-            alpha=0.4,
-            linewidth=1,
-            label=label,
-        )
+    if scored_per_fold:
+        for fold_idx in range(n_rows):
+            label = f"Per-fold R² (n={n_rows})" if fold_idx == 0 else "_nolegend_"
+            ax1.plot(
+                range(max_components + 1),
+                xval_r2_per_fold[fold_idx, :],
+                color="gray",
+                alpha=0.4,
+                linewidth=1,
+                label=label,
+            )
 
     # Plot median/mean (thick)
     ax1.plot(
@@ -1502,7 +1583,7 @@ def plot_denoising_summary(
         "b-o",
         linewidth=2,
         markersize=6,
-        label=f"Median R² (n={n_folds} folds)",
+        label="Median R² (criteria voxels)",
     )
 
     # Mark optimal
@@ -1522,27 +1603,102 @@ def plot_denoising_summary(
         marker="*",
     )
 
+    # The gain floor, drawn as a band. Without it an auto-scaled y-axis makes a
+    # 2e-4 wobble on a 0.11 baseline look like a real selection curve.
+    if min_gain is not None:
+        base = float(xval_r2_by_n_components[0])
+        ax1.axhspan(
+            base,
+            base + float(min_gain),
+            color="gray",
+            alpha=0.15,
+            label=f"Below min gain ({min_gain:.2g})",
+        )
+        # Keep the band in view even when the curve never reaches it.
+        lo, hi = ax1.get_ylim()
+        ax1.set_ylim(min(lo, base - 0.2 * min_gain), max(hi, base + 1.2 * min_gain))
+
+    if xval_r2_all_voxels is not None:
+        ax1b = ax1.twinx()
+        ax1b.plot(
+            range(len(xval_r2_all_voxels)),
+            np.asarray(xval_r2_all_voxels),
+            color="darkorange",
+            linewidth=1.5,
+            linestyle=":",
+            label="All voxels (right axis)",
+        )
+        # No y-label: it collides with the neighbouring panel's. The legend says it.
+        ax1b.tick_params(axis="y", labelcolor="darkorange", labelsize=8)
+        ax1b.legend(loc="upper right", fontsize=8)
+
     ax1.set_xlabel("Number of Noise PCs")
     ax1.set_ylabel("Cross-Validated R²")
-    ax1.set_title("Denoising Performance (Leave-One-Run-Out CV)")
+    fold_note = (
+        f"{n_folds} folds, predictions concatenated"
+        if not scored_per_fold
+        else f"{n_folds} folds, scored separately"
+    )
+    ax1.set_title(f"Denoising Performance (LORO CV; {fold_note})")
     ax1.legend(loc="lower right")
     ax1.grid(True, alpha=0.3)
 
-    # --- Panel 2: Heatmap of R² per fold/PC ---
+    # --- Panel 2 ---
     ax2 = fig.add_subplot(gs[0, 1])
 
-    im = ax2.imshow(xval_r2_per_fold, aspect="auto", cmap="viridis")
-    ax2.set_xlabel("Number of Noise PCs")
-    ax2.set_ylabel("CV Fold (Run)")
-    ax2.set_title("R² per Fold × PC Count")
-    ax2.set_yticks(range(n_folds))
-    ax2.set_yticklabels([f"Run {i + 1}" for i in range(n_folds)])
+    if scored_per_fold:
+        # Heatmap of R² per fold/PC
+        im = ax2.imshow(xval_r2_per_fold, aspect="auto", cmap="viridis")
+        ax2.set_xlabel("Number of Noise PCs")
+        ax2.set_ylabel("CV Fold (Run)")
+        ax2.set_title("R² per Fold × PC Count")
+        ax2.set_yticks(range(n_rows))
+        ax2.set_yticklabels([f"Run {i + 1}" for i in range(n_rows)])
 
-    # Mark optimal column
-    ax2.axvline(optimal_n_components - 0.5, color="red", linewidth=2)
-    ax2.axvline(optimal_n_components + 0.5, color="red", linewidth=2)
+        # Mark optimal column
+        ax2.axvline(optimal_n_components - 0.5, color="red", linewidth=2)
+        ax2.axvline(optimal_n_components + 0.5, color="red", linewidth=2)
 
-    plt.colorbar(im, ax=ax2, label="R²", shrink=0.8)
+        plt.colorbar(im, ax=ax2, label="R²", shrink=0.8)
+    else:
+        # A single-row heatmap is just the panel-1 curve rendered as colour. Show
+        # the decision instead: gain over baseline against the floor it must clear.
+        gain = np.asarray(xval_r2_by_n_components) - float(xval_r2_by_n_components[0])
+        ax2.plot(range(max_components + 1), gain, "b-o", linewidth=2, markersize=5)
+        ax2.axhline(0, color="black", linewidth=1)
+
+        if min_gain is not None:
+            ax2.axhspan(
+                -abs(float(min_gain)) * 0.25,
+                float(min_gain),
+                color="gray",
+                alpha=0.18,
+                label=f"Below min gain ({min_gain:.2g})",
+            )
+
+        if xval_r2_all_voxels is not None:
+            all_v = np.asarray(xval_r2_all_voxels)
+            ax2.plot(
+                range(len(all_v)),
+                all_v - float(all_v[0]),
+                color="darkorange",
+                linestyle=":",
+                linewidth=1.5,
+                label="All voxels",
+            )
+
+        ax2.axvline(
+            optimal_n_components,
+            color="red",
+            linestyle="--",
+            linewidth=2,
+            label=f"Selected: {optimal_n_components} PCs",
+        )
+        ax2.set_xlabel("Number of Noise PCs")
+        ax2.set_ylabel("Δ R² vs 0 PCs")
+        ax2.set_title("Gain over baseline (the selection criterion)")
+        ax2.legend(loc="best", fontsize=8)
+        ax2.grid(True, alpha=0.3)
 
     # --- Panel 3: Initial R² distribution ---
     ax3 = fig.add_subplot(gs[1, 0])

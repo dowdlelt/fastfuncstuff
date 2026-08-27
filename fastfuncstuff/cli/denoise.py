@@ -63,6 +63,7 @@ try:
         resolve_cv_design,
         resolve_microtime_dt,
         run_lengths_from_starts,
+        save_4d_nifti,
         save_r2_ceiling_stack,
         setup_device,
         spinner,
@@ -161,6 +162,11 @@ Outputs:
                                                 and invalid voxels zeroed). With
                                                 -noise_ceiling, a 3-volume stack:
                                                 xval_R2, noise_ceiling, explainable_R2.
+        {prefix}_xval_r2_by_pc.nii.gz         - With -save_r2_by_pc: per-voxel xval R²
+                                                at every tested PC count, sub-brik k =
+                                                k PCs (labelled npc00..npcN). The
+                                                selection curve is this file's median
+                                                over criteria voxels.
 
         Each stack carries the ceiling built at ITS OWN PC count, because the two
         R²s are scored on differently-projected data and a ceiling only bounds an
@@ -340,6 +346,28 @@ Notes:
         ">=1: Stop when R² is within (pcstop-1)*100%% of max (e.g., 1.05 = 5%%). "
         "<0: Use exactly abs(pcstop) PCs (user override). "
         "=1: Pure argmax (pick maximum R²).",
+    )
+    denoise_opts.add_argument(
+        "-save_r2_by_pc",
+        "-save-r2-by-pc",
+        dest="save_r2_by_pc",
+        action="store_true",
+        help="Save per-voxel xval R² at EVERY tested PC count as a labelled 4D file "
+        "({prefix}_xval_r2_by_pc.nii.gz, sub-brik k = k PCs). This is the "
+        "un-aggregated version of the selection curve: the curve is its median "
+        "over criteria voxels, so this is where you look to see whether a gain is "
+        "confined to a region or spread thin.",
+    )
+    denoise_opts.add_argument(
+        "-pc_min_gain",
+        "-pc-min-gain",
+        dest="pc_min_gain",
+        type=str,
+        default="auto",
+        help="Minimum CV-R2 gain over the 0-PC baseline before any PC is kept "
+        "(default: auto = max(1%% of baseline R2, 2x the curve's roughness)). "
+        "A flat, noise-only selection curve otherwise selects PCs for nothing. "
+        "Pass a float for an absolute floor, or 0 to accept any positive gain.",
     )
     denoise_opts.add_argument(
         "-pcR2cutoff",
@@ -796,6 +824,7 @@ def save_denoising_results(
     save_pcs_mode: str = "timecourse",
     condition_labels: list[str] | None = None,
     save_scree_plot: bool = True,
+    save_r2_by_pc: bool = False,
     nii_ext: str = ".nii.gz",
     nifti_header: object | None = None,
 ):
@@ -913,6 +942,22 @@ def save_denoising_results(
         fold_path = f"{output_prefix}_xval_r2_optimal_per_fold{nii_ext}"
         save_nifti(fold_4d, output_path=fold_path, affine=affine, header=nifti_header)
         output_files["xval_r2_optimal_per_fold"] = fold_path
+
+    # 3e. Per-voxel xval R² at every tested PC count (4D, sub-brik k = k PCs).
+    # The selection curve is the median of this over criteria voxels; a flat
+    # curve can hide a real gain in a small region, and only this file shows it.
+    if save_r2_by_pc and results.xval_r2_per_voxel is not None:
+        r2_by_pc_path = f"{output_prefix}_xval_r2_by_pc{nii_ext}"
+        save_4d_nifti(
+            np.asarray(results.xval_r2_per_voxel, dtype=np.float32),
+            r2_by_pc_path,
+            volume_shape,
+            affine,
+            mask_flat=voxel_mask_np,
+            header=nifti_header,
+            brick_labels=[f"npc{k:02d}" for k in range(results.xval_r2_per_voxel.shape[1])],
+        )
+        output_files["xval_r2_by_pc"] = r2_by_pc_path
 
     # 4. CV R² arrays
     xval_r2_path = f"{output_prefix}_xval_r2_by_npcs.npy"
@@ -1066,6 +1111,9 @@ def save_denoising_results(
                 r2_threshold=results.metadata["r2_threshold"],
                 n_noise_voxels=results.metadata["n_noise_voxels"],
                 n_criteria_voxels=results.metadata["n_criteria_voxels"],
+                xval_r2_all_voxels=results.metadata.get("xval_r2_all_voxels"),
+                min_gain=results.metadata.get("pc_selection_min_gain"),
+                n_cv_folds=results.metadata.get("n_runs"),
                 output_path=f"{fig_prefix}/denoising_summary.png",
             )
             output_files["denoising_summary_plot"] = f"{fig_prefix}/denoising_summary.png"
@@ -1120,7 +1168,7 @@ def save_denoising_results(
                     n_pcs_to_show=results.metadata.get(
                         "extraction_max_components", results.metadata.get("max_components", 0)
                     ),
-                    n_slices=5,
+                    n_slices=3,
                     slice_axis=slice_axis,
                     tr=tr,
                     optimal_n_pcs=results.optimal_n_components,
@@ -1600,6 +1648,15 @@ def main():
 
     # Parse CV strategy
     cv_strategy = parse_cv_strategy(args.cv_strategy)
+
+    # "auto" stays None so the library can size the floor off the curve it computes.
+    if str(args.pc_min_gain).strip().lower() == "auto":
+        pc_min_gain = None
+    else:
+        try:
+            pc_min_gain = float(args.pc_min_gain)
+        except ValueError:
+            parser.error(f"-pc_min_gain must be 'auto' or a float, got {args.pc_min_gain!r}")
     if args.verb >= 1:
         print(f"  CV strategy: {cv_strategy}")
 
@@ -3148,6 +3205,7 @@ def main():
                     r2_threshold=args.r2_threshold,
                     n_noise_voxels=int(n_noise),
                     n_criteria_voxels=int(n_criteria),
+                    n_cv_folds=n_runs,
                     output_path=f"{figs_dir}/denoising_summary.png",
                 )
                 output_files["denoising_summary_plot"] = f"{figs_dir}/denoising_summary.png"
@@ -3203,7 +3261,7 @@ def main():
                         voxel_mask=voxel_mask_np,
                         noise_pool_mask=noise_pool_mask_for_plot,
                         n_pcs_to_show=n_pcs_to_show,
-                        n_slices=5,
+                        n_slices=3,
                         slice_axis=args.plot_ax,
                         tr=args.tr,
                         optimal_n_pcs=optimal_pcs,
@@ -3259,6 +3317,7 @@ def main():
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
+            pc_min_gain=pc_min_gain,
             pcR2cutoff=args.pcR2cutoff,
             noise_method=args.noise,
             auto_component_caps=args.auto_component_caps,
@@ -3300,6 +3359,7 @@ def main():
             min_noise_voxels=args.min_noise_voxels,
             max_noise_fraction=args.max_noise_fraction,
             pcstop=args.pcstop,
+            pc_min_gain=pc_min_gain,
             pcR2cutoff=args.pcR2cutoff,
             noise_method=args.noise,
             auto_component_caps=args.auto_component_caps,
@@ -3363,6 +3423,7 @@ def main():
             save_pcs_mode=args.save_pcs,
             condition_labels=condition_labels,
             save_scree_plot=args.scree_plot,
+            save_r2_by_pc=args.save_r2_by_pc,
             nii_ext=_nii_ext,
             nifti_header=nifti_header,
         )
