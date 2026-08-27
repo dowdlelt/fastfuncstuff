@@ -1861,6 +1861,25 @@ def cross_validate_noise_pcs(
     return r2_maps, r2_summary
 
 
+def pc_selection_floor(
+    curve: np.ndarray, pc_min_gain: float | None = None
+) -> tuple[float, float, str]:
+    """Minimum CV-R2 gain over baseline before any noise PC is worth keeping.
+
+    The floor has to be scaled to the curve, not absolute: a median over
+    criteria voxels wobbles by ~1e-4 between adjacent PC counts, so the old
+    fixed 1e-6 floor let pure noise select nearly every component off a
+    visually flat curve. Take the larger of 1% of the baseline R2 and twice the
+    curve's own step-to-step roughness.
+
+    Returns (floor, roughness, source).
+    """
+    roughness = float(np.median(np.abs(np.diff(curve)))) if len(curve) > 1 else 0.0
+    if pc_min_gain is None:
+        return max(0.01 * abs(float(curve[0])), 2.0 * roughness, 1e-6), roughness, "auto"
+    return float(pc_min_gain), roughness, "user"
+
+
 def select_optimal_pcs(
     r2_maps: np.ndarray,
     threshold: float = 0.0,
@@ -1911,9 +1930,12 @@ def select_optimal_pcs(
 
     optimal_n_pcs = int(np.argmax(r2_agg))
 
+    # Deliberately not phrased as a decision: pcstop and the gain floor still get
+    # a say downstream, and this used to print "Best (17 PCs)" on a run that
+    # went on to select 0, which read as a bug.
     print(f"  Baseline (0 PCs): {metric} R² = {r2_agg[0]:.4f}")
-    print(f"  Best ({optimal_n_pcs} PCs): {metric} R² = {r2_agg[optimal_n_pcs]:.4f}")
-    print(f"  Improvement: {r2_agg[optimal_n_pcs] - r2_agg[0]:+.4f}")
+    print(f"  Curve peaks at {optimal_n_pcs} PCs: {metric} R² = {r2_agg[optimal_n_pcs]:.4f}")
+    print(f"  Peak gain over baseline: {r2_agg[optimal_n_pcs] - r2_agg[0]:+.4f} (not yet a choice)")
 
     return optimal_n_pcs, criteria_mask
 
@@ -2200,6 +2222,7 @@ def fit_denoising_model(
     return_loadings: bool = False,
     polort: int | None = 2,
     pcstop: float = 1.05,
+    pc_min_gain: float | None = None,
     pcR2cutoff: float | None = 0.05,
     noise_method: Literal["pca", "ica"] = "pca",
     auto_component_caps: bool = False,
@@ -2277,6 +2300,11 @@ def fit_denoising_model(
           E.g., 1.05 means stop when within 5% of max (default, more robust).
         - If < 0: Use exactly abs(pcstop) PCs (user override).
         - If == 1.0: Use pure argmax (pick maximum).
+    pc_min_gain : float, optional
+        Minimum CV-R2 gain over the 0-PC baseline required before any PC is
+        kept. None (default) derives it from the curve itself: the larger of
+        1% of the baseline R2 and twice the curve's step-to-step roughness.
+        Pass 0.0 to accept any positive gain (the pre-2026-08 behaviour).
     pcR2cutoff : float, optional, default=0.05
         R² cutoff for PC count selection: only voxels that achieve
         R² > pcR2cutoff in at least one PC count are used for computing the
@@ -2967,6 +2995,12 @@ def fit_denoising_model(
     # Provide a single-row array for backward compatibility with visualization
     r2_per_fold = r2_summary.reshape(1, -1)  # (1, max_components+1)
 
+    # The all-voxel curve, kept apart because pcR2cutoff below replaces the
+    # selection curve with a criteria-voxel median. Plotting the two together
+    # is how you see selection bias: the criteria curve can rise while the
+    # whole-brain one falls.
+    r2_all_voxels = r2_summary.copy()
+
     # Apply pcR2cutoff: already handled in select_optimal_pcs above
     # But we can recompute the selection curve using criteria voxels if needed
     pcselection_mask: np.ndarray | None = None
@@ -2993,12 +3027,13 @@ def fit_denoising_model(
 
             if verbose:
                 print(
-                    f"  Recomputed curve: Best R² = {r2_by_n_components[optimal_n_components]:.4f} at {optimal_n_components} PCs"
+                    f"  Recomputed curve peaks at {optimal_n_components} PCs: "
+                    f"R² = {r2_by_n_components[optimal_n_components]:.4f}"
                 )
 
     # Select optimal number of components using GLMdenoise-style early stopping
-    # This is more robust to noise than pure argmax
-    min_improvement = 1e-6  # ignore tiny numerical gains in CV R²
+    # This is more robust to noise than pure argmax.
+    min_improvement, curve_noise, gain_source = pc_selection_floor(r2_by_n_components, pc_min_gain)
 
     if pcstop < 0:
         # User override: use exactly this many PCs
@@ -3020,7 +3055,8 @@ def fit_denoising_model(
             optimal_n_components = 0
             if verbose:
                 print(
-                    f"  Max improvement {max_improvement:.4g} < {min_improvement:.4g}; selecting 0 PCs"
+                    f"  Max improvement {max_improvement:.4g} < min gain {min_improvement:.4g} "
+                    f"({gain_source}; curve roughness {curve_noise:.4g}); selecting 0 PCs"
                 )
         else:
             # Find first PC count that achieves threshold * max_improvement
@@ -3039,14 +3075,21 @@ def fit_denoising_model(
 
         if verbose and pcstop != 1.0:
             argmax_n = int(np.argmax(r2_by_n_components))
-            if optimal_n_components != argmax_n:
+            if optimal_n_components != argmax_n and optimal_n_components != 0:
                 print(
                     f"  Early stopping: {optimal_n_components} PCs (within {(pcstop - 1) * 100:.0f}% of max at {argmax_n} PCs)"
                 )
 
+    if verbose:
+        print(f"  → Selected {optimal_n_components} PCs")
+
     baseline_r2 = float(r2_by_n_components[0])
     optimal_r2 = float(r2_by_n_components[optimal_n_components])
     improvement = optimal_r2 - baseline_r2
+
+    # Downstream plots label this array "per fold"; make it the curve the
+    # selection actually used rather than a stale whole-brain copy.
+    r2_per_fold = r2_by_n_components.reshape(1, -1)
 
     # Build per-voxel xval R² map at optimal PC count
     # Now we have R² for ALL voxels, not just criteria
@@ -3214,6 +3257,10 @@ def fit_denoising_model(
         "ica_max_iter": int(ica_max_iter),
         "ica_tol": float(ica_tol),
         "noise_pool_pca_scree_max_components": scree_eval_max,
+        "pc_selection_min_gain": float(min_improvement),
+        "pc_selection_min_gain_source": gain_source,
+        "pc_selection_curve_roughness": float(curve_noise),
+        "xval_r2_all_voxels": r2_all_voxels.tolist(),
     }
 
     if ic_variance_ratio_per_run is not None:

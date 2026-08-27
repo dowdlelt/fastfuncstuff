@@ -1459,3 +1459,47 @@ def test_both_fit_denoising_model_call_sites_pass_the_same_options():
     assert (per_hrf ^ single_hrf) <= design_only, "call sites disagree on: " + ", ".join(
         sorted((per_hrf ^ single_hrf) - design_only)
     )
+
+
+def test_flat_selection_curve_selects_zero_pcs():
+    """A noise-only CV curve must select 0 PCs, not chase its own wobble.
+
+    Bug of record: with an absolute 1e-6 floor, a curve that rose 2e-4 over a
+    0.11 baseline (about 3x its own step-to-step roughness) selected 16 of 20
+    PCs on real breath-hold data.
+    """
+    import numpy as np
+
+    from fastfuncstuff.denoise.sequential import pc_selection_floor
+
+    rng = np.random.default_rng(0)
+    curve = 0.10957 + rng.normal(scale=8e-5, size=21)
+    curve[0] = 0.10957
+
+    floor, roughness, source = pc_selection_floor(curve)
+    assert source == "auto"
+    assert roughness > 0
+    assert (curve - curve[0]).max() < floor
+
+
+def test_real_gain_clears_the_auto_floor():
+    """A curve with a genuine denoising gain still selects PCs."""
+    import numpy as np
+
+    from fastfuncstuff.denoise.sequential import pc_selection_floor
+
+    curve = 0.10957 + 0.02 * (1.0 - np.exp(-np.arange(21) / 3.0))
+    floor, _, _ = pc_selection_floor(curve)
+    assert (curve - curve[0]).max() > floor
+
+
+def test_explicit_min_gain_overrides_the_auto_floor():
+    """-pc_min_gain 0 restores "any positive gain counts"."""
+    import numpy as np
+
+    from fastfuncstuff.denoise.sequential import pc_selection_floor
+
+    curve = np.array([0.1, 0.1001, 0.1002])
+    floor, _, source = pc_selection_floor(curve, pc_min_gain=0.0)
+    assert source == "user"
+    assert (curve - curve[0]).max() > floor
