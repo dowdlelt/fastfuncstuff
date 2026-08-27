@@ -1065,7 +1065,7 @@ def fit_combinatorial_denoising(
     criteria_fallback_percentile: float = 5.0,
     selection_strategy: str = "argmax",
     singleton_only: bool = False,
-    criterion: str = "within_run",
+    criterion: str = "cross_run",
     n_null_surrogates: int = 0,
     null_percentile: float = 95.0,
     null_seed: int = 0,
@@ -1113,16 +1113,19 @@ def fit_combinatorial_denoising(
         Strategy for selecting optimal combination (see select_optimal_combination).
     singleton_only : bool, default=False
         Evaluate each PC alone rather than all 2^k subsets.
-    criterion : {"within_run", "cross_run"}, default="within_run"
-        How a candidate PC set is scored. ``within_run`` holds the training
-        betas fixed and asks how well they explain what is left of the held-out
-        run after removal — the historical rule, which scores a removal on the
-        *scoring* side while the denoising is later applied on the *fitting*
-        side, and whose SS_tot moves with the candidate. ``cross_run`` matches
-        deployment: the run's PCs are removed while it contributes to the betas,
-        and the betas are scored on the other runs, which are never cleaned. The
-        scored target is then identical across candidates, so SS_tot is fixed
-        and only better betas can win. Needs >= 3 runs and costs more.
+    criterion : {"cross_run", "within_run"}, default="cross_run"
+        How a candidate PC set is scored. ``cross_run`` matches deployment: the
+        run's PCs are removed while it contributes to the betas, and the betas
+        are scored on the other runs, which are never cleaned. The scored target
+        is then identical across candidates, so SS_tot is fixed and only better
+        betas can win. ``within_run`` is the historical rule — it holds the
+        training betas fixed and asks how well they explain what is *left* of the
+        held-out run after removal, which scores a removal on the scoring side
+        while the denoising is later applied on the fitting side, and re-derives
+        SS_tot from the cleaned data so CoD rises mechanically with any variance
+        removed. Measured at +0.0078 against +0.0001 for the same PCs on the same
+        data; it is kept for comparison, not as a default. Both need >= 3 runs,
+        which combinatorial denoising already requires.
     n_null_surrogates : int, default=0
         Phase-randomised surrogates per PC for the singleton null. 0 keeps the
         historical bare ``delta > 0`` rule, which has no noise floor: CoD rises

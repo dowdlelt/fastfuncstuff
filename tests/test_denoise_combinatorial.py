@@ -1241,3 +1241,60 @@ class TestCrossRunBatchedParity:
 
         assert calls, "the scorer must size its chunks through memory.py, not a constant"
         assert np.abs(whole - chunked).max() < 1e-10
+
+
+class TestCriterionDefault:
+    """cross_run is the default in both layers.
+
+    within_run rewards removing variance for its own sake, so it should not be
+    what anyone gets by accident. Its >= 3 run requirement is the same one
+    combinatorial denoising already imposes, so there is no dataset that reaches
+    the scorer and cannot use it.
+    """
+
+    def test_library_default_is_cross_run(self):
+        import inspect
+
+        from fastfuncstuff.denoise.combinatorial import fit_combinatorial_denoising
+
+        sig = inspect.signature(fit_combinatorial_denoising)
+        assert sig.parameters["criterion"].default == "cross_run"
+
+    def test_cli_default_is_cross_run(self):
+        from fastfuncstuff.cli.denoisatorial import create_parser
+
+        args = create_parser().parse_args(
+            ["-input", "a.nii", "-events", "e.tsv", "-prefix", "p", "-tr", "2.0"]
+        )
+        # None means "not given"; main resolves it, so the flag itself must not
+        # silently carry within_run.
+        assert args.criterion is None
+        assert (args.criterion or "cross_run") == "cross_run"
+
+    def test_within_run_is_still_reachable(self):
+        from fastfuncstuff.cli.denoisatorial import create_parser
+
+        args = create_parser().parse_args(
+            [
+                "-input",
+                "a.nii",
+                "-events",
+                "e.tsv",
+                "-prefix",
+                "p",
+                "-tr",
+                "2.0",
+                "-criterion",
+                "within_run",
+            ]
+        )
+        assert args.criterion == "within_run"
+
+    def test_null_surrogates_stays_off_by_default(self):
+        """Encouraged in the help, but it changes which PCs are selected."""
+        from fastfuncstuff.cli.denoisatorial import create_parser
+
+        args = create_parser().parse_args(
+            ["-input", "a.nii", "-events", "e.tsv", "-prefix", "p", "-tr", "2.0"]
+        )
+        assert args.null_surrogates == 0

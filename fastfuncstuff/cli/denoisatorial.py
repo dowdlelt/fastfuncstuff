@@ -146,6 +146,17 @@ Examples:
                     -plots full \\
                     -prefix sub01_full_diagnostics
 
+  # Recommended for most datasets: score each PC on its own (fast, k+1 candidates
+  # instead of 2^k) and make it beat phase-randomised surrogates of itself before
+  # it is kept. Without -null_surrogates the rule is a bare "delta > 0", which has
+  # no magnitude floor and keeps about half of any set of useless PCs.
+  ffs_denoisatorial -input run*.nii.gz \\
+                    -events events.tsv \\
+                    -tr 2.0 \\
+                    -singleton_only \\
+                    -null_surrogates 20 \\
+                    -prefix sub01_singleton_null
+
 Outputs:
     Core outputs:
         {prefix}_initial_r2.nii.gz               - Initial xval R2 (task-only, no PCs).
@@ -319,17 +330,19 @@ Notes:
     combo_opts.add_argument(
         "-criterion",
         choices=["within_run", "cross_run"],
-        default="within_run",
-        help="How a candidate PC set is scored. 'within_run' (default) holds the "
-        "training betas fixed and asks how well they explain what is left of the "
-        "held-out run after removal. 'cross_run' matches how the denoising is "
-        "actually used: the run's PCs are removed while that run contributes to "
-        "the betas, and those betas are scored on the OTHER runs, which are never "
-        "cleaned. Because the scored target never changes with the candidate, "
-        "SS_tot is fixed and a candidate can only win by producing better betas — "
-        "the mechanical CoD gain from removing variance is gone. Also puts N-1 "
-        "runs of evidence behind each decision instead of one. Needs >= 3 runs "
-        "and costs more.",
+        default=None,  # resolved to cross_run below; None only marks "not given"
+        help="How a candidate PC set is scored.\n"
+        "  cross_run   (default) Remove the run's PCs while that run"
+        " contributes to the betas, then score those betas on the OTHER runs, which are never"
+        " cleaned. This is how the denoising is actually used. Because the scored target never"
+        " changes with the candidate, SS_tot is fixed and a candidate can only win by producing"
+        " better betas. It also puts N-1 runs of evidence behind each decision instead of one.\n"
+        "  within_run  Hold the training betas fixed and ask how well they explain what is LEFT"
+        " of the held-out run after removal. Re-derives SS_tot from the cleaned data, so CoD"
+        " rises mechanically whenever residual variance is removed — and a noise PC is by"
+        " construction a direction the design does not explain, so it takes disproportionately"
+        " from the residual. Measured at +0.0078 vs +0.0001 for the same PCs on the same data."
+        " Kept for comparison; not a default.",
     )
     combo_opts.add_argument(
         "-whole_brain_noise_pool",
@@ -351,13 +364,16 @@ Notes:
         type=int,
         default=0,
         metavar="N",
-        help="Calibrate singleton selection against N phase-randomised surrogates "
-        "per PC (recommended: 20; 0 = off). A bare 'delta > 0' has no noise floor: "
-        "CoD rises mechanically whenever residual variance is removed, so regressors "
-        "unrelated to the data clear zero about half the time and their degrees of "
-        "freedom cost you on unseen data. Each surrogate keeps its PC's variance and "
-        "spectrum but carries no real structure, so a PC must beat its own surrogates "
-        "to be kept. Requires -singleton_only.",
+        help="Calibrate singleton selection against N phase-randomised surrogates per PC."
+        " 0 = off, 20 is the recommended setting and worth turning on.\n"
+        "Without it, selection is a bare 'delta > 0' sign test with no magnitude floor, so"
+        " under a true null each PC clears about half the time and you keep roughly half of"
+        " them for nothing, paying their degrees of freedom on unseen data. Each surrogate"
+        " keeps its PC's variance and spectrum but carries no real structure, so a PC has to"
+        " beat its own surrogates to survive.\n"
+        "It is off by default only because it changes which PCs are selected; it is not"
+        " expensive — the scorer batches every candidate, so 20 surrogates cost far less than"
+        " the name suggests. Requires -singleton_only.",
     )
     combo_opts.add_argument(
         "-null_percentile",
@@ -998,9 +1014,10 @@ def main():
     if args.null_surrogates < 0:
         print("ERROR: -null_surrogates must be >= 0")
         sys.exit(1)
-    if args.criterion == "cross_run" and len(parse_input_files(args.input)) < 3:
-        print("ERROR: -criterion cross_run needs at least 3 runs")
-        sys.exit(1)
+    # cross_run's >= 3 run requirement is the same one combinatorial denoising
+    # already imposes (outer LORO plus an inner LORO), so it can simply be the
+    # default -- there is no run count that reaches here and cannot use it.
+    criterion = args.criterion or "cross_run"
     if args.null_surrogates > 0 and not args.singleton_only:
         print("ERROR: -null_surrogates requires -singleton_only")
         sys.exit(1)
@@ -1430,7 +1447,7 @@ def main():
         criteria_fallback_percentile=args.criteria_fallback_pct,
         selection_strategy=args.selection_strategy,
         singleton_only=args.singleton_only,
-        criterion=args.criterion,
+        criterion=criterion,
         n_null_surrogates=args.null_surrogates,
         null_percentile=args.null_percentile,
         null_seed=args.null_seed,
