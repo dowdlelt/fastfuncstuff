@@ -934,3 +934,23 @@ def test_reconvolution_r_is_none_without_a_duration_correction():
     betas, lag = _block_response_betas(n=600)
     res = derive_library(betas, np.full(600, 0.5), lag, n_pcs=3, n_hrfs=8, r2_threshold=0.0)
     assert res.reconvolution_r is None
+
+
+def test_reconvolution_leakage_catches_a_late_impulse_lobe():
+    # The re-convolution r compares only np.convolve(h, box)[:n_t] -- the part
+    # of the prediction that lands INSIDE the window.  An impulse lobe at 26 s
+    # convolves to 26-46 s, falls off the end of a 34 s window, and never
+    # enters the correlation: a real 6-PC library read r=0.998 while carrying
+    # exactly that.  Leakage is the number that sees it.
+    dt, n_t, n_box = 0.1, 341, 200
+    t = np.arange(n_t) * dt
+    clean = gamma.pdf(t, 5.0, scale=1.0) - 0.17 * gamma.pdf(t, 16.0, scale=1.0)
+    clean = clean / clean.max()
+    with_lobe = clean + 0.8 * np.exp(-((t - 26) ** 2) / 4)
+
+    def leakage(h):
+        full = np.convolve(h, np.ones(n_box))
+        return float(np.abs(full[n_t:]).sum() / np.abs(full).sum())
+
+    assert leakage(with_lobe) > leakage(clean) + 0.05
+    assert leakage(clean) < 0.15

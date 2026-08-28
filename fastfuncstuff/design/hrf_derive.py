@@ -2137,6 +2137,7 @@ class LibraryResult:
     # angle (== shape correlation) from each voxel to its best library entry.
     coverage: dict | None = None
     reconvolution_r: np.ndarray | None = None  # per-entry, library ⊛ boxcar vs `raw`
+    reconvolution_leakage: np.ndarray | None = None  # per-entry, |conv| energy past the window
     # Provenance for the future deconvolution step (see module docstring).
     # event_durations is the per-group event-duration metadata (seconds);
     # duration_convolved=True means the library entries are the duration-
@@ -2529,18 +2530,31 @@ def derive_library(
     # fit through that ringing can look plausible while no longer describing
     # the data.
     reconvolution_r = None
+    reconvolution_leakage = None
     if fitted_deconvolved is not None and do_deconv:
         n_box_chk = max(1, int(round(float(deconvolve_duration) / target_dt)))
         n_t = raw.shape[1]
         rs = np.zeros(fitted_deconvolved.shape[0])
+        leak = np.zeros(fitted_deconvolved.shape[0])
         for i in range(fitted_deconvolved.shape[0]):
-            pred = np.convolve(fitted_deconvolved[i], np.ones(n_box_chk))[:n_t]
+            full = np.convolve(fitted_deconvolved[i], np.ones(n_box_chk))
+            pred = full[:n_t]
+            # How much of the response this entry predicts lands BEYOND the
+            # window we can compare against.  Without this, the r above is a
+            # passing grade on the part of the prediction we happen to look at:
+            # a late impulse lobe convolves to D seconds past itself, falls off
+            # the end, and never enters the correlation.  Measured at 13-38% on
+            # a real 6-PC library whose r read 0.998 while its impulse
+            # responses had lobes at 26 s.
+            total = float(np.abs(full).sum())
+            leak[i] = float(np.abs(full[n_t:]).sum() / total) if total > 0 else np.nan
             peak = float(np.max(pred))
             if peak <= 0:
                 rs[i] = np.nan
                 continue
             rs[i] = float(np.corrcoef(raw[i], pred / peak)[0, 1])
         reconvolution_r = rs
+        reconvolution_leakage = leak
 
     return LibraryResult(
         raw=raw,
@@ -2556,6 +2570,7 @@ def derive_library(
         n_dropped_invalid=n_invalid,
         coverage=coverage,
         reconvolution_r=reconvolution_r,
+        reconvolution_leakage=reconvolution_leakage,
         event_durations=(
             np.asarray(event_durations, dtype=float) if event_durations is not None else None
         ),

@@ -1284,6 +1284,24 @@ def derive_and_write_library(
                     "-deconv-method fit, which keeps the boxcar in the forward "
                     "model and never inverts."
                 )
+        if lib.reconvolution_leakage is not None:
+            lk = lib.reconvolution_leakage[np.isfinite(lib.reconvolution_leakage)]
+            if lk.size:
+                print(
+                    f"    Off-window leakage: {100 * np.median(lk):.1f}% median, "
+                    f"{100 * lk.max():.1f}% worst of the predicted response falls "
+                    f"beyond the {lag_times[-1]:.0f}s window"
+                )
+                if lk.max() > 0.15:
+                    print(
+                        "      HINT: the r above only compares the part of the "
+                        "prediction that lands INSIDE the window, so it cannot "
+                        "see this.  High leakage means the impulse response has "
+                        "late lobes whose consequences fall off the end — check "
+                        "_qc_reconvolution.png, and see whether the extra PCs are "
+                        "carrying late-lag structure rather than HRF shape "
+                        "(_qc_pcs.png).  Fewer -n-pcs is the usual fix."
+                    )
 
     if lib.coverage is not None:
         cov = lib.coverage
@@ -1373,6 +1391,16 @@ def derive_and_write_library(
         ),
         "reconvolution_r_min": (
             float(np.nanmin(lib.reconvolution_r)) if lib.reconvolution_r is not None else None
+        ),
+        "reconvolution_leakage_median": (
+            float(np.nanmedian(lib.reconvolution_leakage))
+            if lib.reconvolution_leakage is not None
+            else None
+        ),
+        "reconvolution_leakage_max": (
+            float(np.nanmax(lib.reconvolution_leakage))
+            if lib.reconvolution_leakage is not None
+            else None
         ),
         "manifold_mode": args.manifold,
         "coverage": (
