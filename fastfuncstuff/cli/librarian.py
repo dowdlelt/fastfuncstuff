@@ -348,11 +348,12 @@ Notes:
         dest="save_fir_volume",
         action="store_true",
         help=(
-            "Also write the per-voxel FIR betas as a 4-D NIfTI, time = FIR\n"
-            "lag.  The R2 map says where the fit worked; this says what it\n"
-            "found, so a voxel's own measured response can be laid next to\n"
-            "the library entry ffs_hrfopt selected for it (which writes a\n"
-            "matching TR-sampled volume with -save_selected_tr)."
+            "Also write the per-voxel FIR betas as a 4-D NIfTI,\n"
+            "time = FIR lag.  The R2 map says WHERE the fit worked;\n"
+            "this says WHAT it found, so a voxel's own measured\n"
+            "response can be laid next to the library entry\n"
+            "ffs_hrfopt picked for it -- pair it with that tool's\n"
+            "-save_selected_tr, which writes the matching grid."
         ),
     )
     fir_grp.add_argument(

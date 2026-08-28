@@ -2398,6 +2398,8 @@ def save_hrf_selection_results(
     onsets: torch.Tensor | None = None,
     save_plots: bool = False,
     nii_ext: str = ".nii.gz",
+    selected_tr_dt: float | None = None,
+    microtime_dt: float = 0.1,
 ) -> dict[str, str | list[str]]:
     """
     Save HRF selection results to disk.
@@ -2552,6 +2554,19 @@ def save_hrf_selection_results(
         selected = hrf_lib[idx, :]  # (n_voxels, n_hrf_timepoints)
         _save_volume_4d(selected, selected_hrfs_file, volume_shape, affine, voxel_mask)
         output_files["selected_hrfs"] = selected_hrfs_file
+
+        if selected_tr_dt:
+            # The same curves decimated onto a coarse grid, so they can be laid
+            # voxel-for-voxel against ffs_librarian's -save_fir_volume output.
+            # Decimate rather than resample: the FIR estimate IS the response
+            # sampled at those instants, so taking the matching samples is the
+            # like-for-like comparison, and interpolating first would smooth
+            # the fine curve into something the FIR never claimed to be.
+            step = max(1, int(round(selected_tr_dt / microtime_dt)))
+            selected_tr = selected[:, ::step]
+            tr_file = f"{output_prefix}_selected_hrfs_tr{nii_ext}"
+            _save_volume_4d(selected_tr, tr_file, volume_shape, affine, voxel_mask)
+            output_files["selected_hrfs_tr"] = tr_file
 
     # 5. Save HRF library for ARMA reuse
     hrf_lib_file = f"{output_prefix}_hrf_library.pt"

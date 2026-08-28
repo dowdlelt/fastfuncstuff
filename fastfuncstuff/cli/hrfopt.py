@@ -275,6 +275,27 @@ Notes:
         ),
     )
     hrf_opts.add_argument(
+        "-save_selected_tr",
+        "-save-selected-tr",
+        dest="save_selected_tr",
+        nargs="?",
+        const="tr",
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Also write the selected HRF decimated onto a coarse\n"
+            "grid: {prefix}_selected_hrfs_tr.nii.gz.  Bare flag uses\n"
+            "the run TR; give a number for another spacing.\n"
+            "\n"
+            "{prefix}_selected_hrfs.nii.gz is at -microtime_dt\n"
+            "(0.1s), right for reuse but awkward to compare with a\n"
+            "FIR estimate.  Matching the FIR lag spacing puts this\n"
+            "beside ffs_librarian -save_fir_volume voxel for voxel,\n"
+            "so 'is this voxel's HRF anything like the response it\n"
+            "actually showed?' is a two-volume comparison."
+        ),
+    )
+    hrf_opts.add_argument(
         "-hrf-library-raw",
         dest="hrf_library_raw",
         default=None,
@@ -563,6 +584,30 @@ def print_summary(args, n_runs: int, n_conditions: int, n_voxels: int, condition
     print()
     print(f"  Output prefix: {args.prefix}")
     print()
+
+
+def _selected_tr_dt(args) -> float | None:
+    """Resolve -save_selected_tr into a sampling interval, or None if unset.
+
+    Bare flag means "the run TR", which is the spacing a TR-locked FIR uses
+    and therefore the one that lines this volume up with ffs_librarian's FIR
+    betas.  An explicit number covers the sub-TR case, where the FIR window
+    was built on a finer grid than the acquisition.
+    """
+    spec = getattr(args, "save_selected_tr", None)
+    if spec is None:
+        return None
+    if spec == "tr":
+        return float(args.tr)
+    try:
+        dt = float(spec)
+    except (TypeError, ValueError):
+        print(f"ERROR: -save_selected_tr expects a number of seconds; got {spec!r}")
+        sys.exit(1)
+    if dt <= 0:
+        print(f"ERROR: -save_selected_tr must be positive; got {dt}")
+        sys.exit(1)
+    return dt
 
 
 def _resolve_raw_library(args, durations):
@@ -1484,6 +1529,8 @@ def main():
         onsets=onset_matrix if args.save_hrf_designs else None,
         save_plots=args.save_plots,
         nii_ext=_nii_ext,
+        selected_tr_dt=_selected_tr_dt(args),
+        microtime_dt=args.microtime_dt,
     )
 
     if beta_ceiling is not None and beta_ceiling.result.n_usable:
