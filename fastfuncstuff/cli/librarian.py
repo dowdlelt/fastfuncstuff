@@ -1267,6 +1267,24 @@ def derive_and_write_library(
             f"reconstruction had no dominant positive peak (not HRF-like); "
             f"library has {lib.raw.shape[0]} entries."
         )
+    if lib.reconvolution_r is not None:
+        rr = lib.reconvolution_r[np.isfinite(lib.reconvolution_r)]
+        if rr.size:
+            print(
+                f"    Re-convolution check: library ⊛ {deconv_duration:.1f}s boxcar vs "
+                f"the curve it came from — r median {np.median(rr):.4f}, "
+                f"worst {rr.min():.4f}"
+            )
+            if rr.min() < 0.98:
+                print(
+                    "      HINT: an entry that does not re-convolve back onto its "
+                    "own curve is not describing the data.  On -deconv-method "
+                    "wiener this usually means the explicit inverse rang and the "
+                    "fit smoothed the ringing rather than the signal; try "
+                    "-deconv-method fit, which keeps the boxcar in the forward "
+                    "model and never inverts."
+                )
+
     if lib.coverage is not None:
         cov = lib.coverage
         # cos(angle) is exactly the shape correlation between a voxel's HRF
@@ -1350,6 +1368,12 @@ def derive_and_write_library(
         "n_selected_voxels": int(lib.selected_voxels.size),
         "n_library_entries": int(lib.raw.shape[0]),
         "n_dropped_invalid": int(lib.n_dropped_invalid),
+        "reconvolution_r_median": (
+            float(np.nanmedian(lib.reconvolution_r)) if lib.reconvolution_r is not None else None
+        ),
+        "reconvolution_r_min": (
+            float(np.nanmin(lib.reconvolution_r)) if lib.reconvolution_r is not None else None
+        ),
         "manifold_mode": args.manifold,
         "coverage": (
             {k: v for k, v in lib.coverage.items() if k != "angles_deg"}

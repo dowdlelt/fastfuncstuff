@@ -853,3 +853,84 @@ def test_shape_model_none_still_skips_the_fit():
     )
     assert res.fitted is None
     assert res.shape_model == "none"
+
+
+def _block_response_betas(n=1500, seed=5):
+    """FIR betas that are responses to a 20 s block, with an off-family bump."""
+    rng = np.random.default_rng(seed)
+    lag = np.arange(0, 36, 2.0)
+    t_fine = np.arange(0, 36, 0.1)
+    rows = []
+    for lat, wid, c, bump in zip(
+        rng.uniform(4, 7, n),
+        rng.uniform(0.8, 1.6, n),
+        rng.uniform(0.05, 0.35, n),
+        rng.uniform(0, 0.35, n),
+        strict=True,
+    ):
+        imp = (
+            gamma.pdf(t_fine, lat / wid, scale=wid)
+            - c * gamma.pdf(t_fine, 16.0, scale=1.0)
+            + bump * np.exp(-((t_fine - 14) ** 2) / 8)
+        )
+        blk = np.convolve(imp, np.ones(200))[: t_fine.size]
+        rows.append(np.interp(lag, t_fine, blk / np.abs(blk).max()))
+    return np.array(rows) + rng.normal(0, 0.02, (n, lag.size)), lag
+
+
+@pytest.mark.parametrize("deconv_method", ["fit", "wiener"])
+def test_shape_model_is_honoured_on_every_deconv_path(deconv_method):
+    # Regression: shape_model="spline" was wired into the boxcar-fit branch and
+    # the no-deconvolution branch but NOT into the wiener branch, which kept
+    # calling fit_double_gamma.  The shipped library was then a double-gamma
+    # fit while the QC panel title, the final-library label and the metadata
+    # all said "spline" -- on the one path where the choice matters most.
+    betas, lag = _block_response_betas()
+    res = derive_library(
+        betas,
+        np.full(betas.shape[0], 0.5),
+        lag,
+        n_pcs=3,
+        n_hrfs=12,
+        manifold_mode="kmeans",
+        fit_gamma=True,
+        shape_model="spline",
+        deconvolve_duration=20.0,
+        deconv_method=deconv_method,
+        r2_threshold=0.0,
+    )
+    assert res.shape_model == "spline"
+    assert res.gamma_params_deconvolved, "no impulse-space fit was recorded"
+    # The spline's param dict carries "lambda"; the double-gamma's carries "a1".
+    for p in res.gamma_params_deconvolved:
+        assert "lambda" in p, f"library entry fitted with the wrong family: {sorted(p)}"
+
+
+@pytest.mark.parametrize("deconv_method", ["fit", "wiener"])
+def test_library_reconvolves_onto_the_curve_it_came_from(deconv_method):
+    # The end-to-end referee for the duration correction: downstream consumers
+    # re-convolve the library entry with the event boxcar, so if that does not
+    # reproduce the curve the entry was derived from, the entry is wrong.
+    betas, lag = _block_response_betas()
+    res = derive_library(
+        betas,
+        np.full(betas.shape[0], 0.5),
+        lag,
+        n_pcs=3,
+        n_hrfs=12,
+        manifold_mode="kmeans",
+        fit_gamma=True,
+        shape_model="spline",
+        deconvolve_duration=20.0,
+        deconv_method=deconv_method,
+        r2_threshold=0.0,
+    )
+    rr = res.reconvolution_r
+    assert rr is not None and np.isfinite(rr).all()
+    assert rr.min() > 0.98, f"worst entry re-convolves at r={rr.min():.4f}"
+
+
+def test_reconvolution_r_is_none_without_a_duration_correction():
+    betas, lag = _block_response_betas(n=600)
+    res = derive_library(betas, np.full(600, 0.5), lag, n_pcs=3, n_hrfs=8, r2_threshold=0.0)
+    assert res.reconvolution_r is None

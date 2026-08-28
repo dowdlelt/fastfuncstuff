@@ -2136,6 +2136,7 @@ class LibraryResult:
     # manifold_coverage() of the final entries against the selected voxels:
     # angle (== shape correlation) from each voxel to its best library entry.
     coverage: dict | None = None
+    reconvolution_r: np.ndarray | None = None  # per-entry, library ⊛ boxcar vs `raw`
     # Provenance for the future deconvolution step (see module docstring).
     # event_durations is the per-group event-duration metadata (seconds);
     # duration_convolved=True means the library entries are the duration-
@@ -2437,9 +2438,9 @@ def derive_library(
     boxcar_fit_path = do_deconv and method == "fit"
 
     if fit_gamma and not boxcar_fit_path:
-        # `raw` is already an impulse response here (no duration to correct,
-        # or the wiener path removes it below), so the family is fit to it
-        # directly, with no boxcar in the model.
+        # Smooth `raw` itself, with no boxcar in the model: either there is no
+        # duration to correct, or the wiener branch below strips it separately.
+        # Either way this is the duration-convolved QC curve, not the library.
         fitted = np.zeros_like(raw)
         for i in range(raw.shape[0]):
             if shape_model == "spline":
@@ -2506,13 +2507,40 @@ def derive_library(
             normalize_peak=True,
         )
         if fit_gamma:
-            # Gamma-fit in impulse-response space, not a fit of the
-            # convolved curve.
+            # Fit in impulse-response space, not a fit of the convolved curve.
+            # The boxcar is already gone, so there is none in the model here.
             fitted_deconvolved = np.zeros_like(raw_deconvolved)
             for i in range(raw_deconvolved.shape[0]):
-                fit, p = fit_double_gamma(raw_deconvolved[i], dt=target_dt)
+                if shape_model == "spline":
+                    fit, p = fit_spline_through_boxcar(
+                        raw_deconvolved[i], duration=0.0, dt=target_dt, n_knots=spline_knots
+                    )
+                else:
+                    fit, p = fit_double_gamma(raw_deconvolved[i], dt=target_dt)
                 fitted_deconvolved[i] = fit
                 gamma_params_deconvolved.append(p)
+
+    # Closing the loop: a library entry is only correct if putting it back
+    # through the event boxcar reproduces the curve it was derived from --
+    # which is precisely what every downstream consumer does at modelling
+    # time.  Cheap, and the only end-to-end statement about the duration
+    # correction, so it is always computed.  It matters most on the wiener
+    # path, where the explicit inverse rings at multiples of 1/D and a smooth
+    # fit through that ringing can look plausible while no longer describing
+    # the data.
+    reconvolution_r = None
+    if fitted_deconvolved is not None and do_deconv:
+        n_box_chk = max(1, int(round(float(deconvolve_duration) / target_dt)))
+        n_t = raw.shape[1]
+        rs = np.zeros(fitted_deconvolved.shape[0])
+        for i in range(fitted_deconvolved.shape[0]):
+            pred = np.convolve(fitted_deconvolved[i], np.ones(n_box_chk))[:n_t]
+            peak = float(np.max(pred))
+            if peak <= 0:
+                rs[i] = np.nan
+                continue
+            rs[i] = float(np.corrcoef(raw[i], pred / peak)[0, 1])
+        reconvolution_r = rs
 
     return LibraryResult(
         raw=raw,
@@ -2527,6 +2555,7 @@ def derive_library(
         gamma_params_deconvolved=gamma_params_deconvolved,
         n_dropped_invalid=n_invalid,
         coverage=coverage,
+        reconvolution_r=reconvolution_r,
         event_durations=(
             np.asarray(event_durations, dtype=float) if event_durations is not None else None
         ),
