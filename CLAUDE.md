@@ -87,6 +87,7 @@ Update `../fmri_wiki/log.md` chronologically when you ingest a new source or fin
 - **Names**: prefer descriptive (`vb_basis`) over branded (don't put external project names like "filmbabe" in identifiers; reference them in comments only).
 - **Comments**: write *why*, not *what*. Identifiers tell what; comments are for hidden constraints, surprising trade-offs, and bug-of-record references. Default to no comment.
 - **Commits**: imperative subject, one logical change per commit, body explains the why and any non-obvious trade-off.
+- **Commit progressively.** Land each logical change as soon as it is green — tests pass, lint clean — rather than batching several into one commit at the end of a session. Small grouped commits are easy to revert one at a time, and an uncommitted working tree is the only thing standing between a stray `git checkout -- .` (or a bad merge, or a crash) and re-deriving thinking you already did. If the next edit would start a *different* logical change, commit the current one first.
 
 ## What "done" looks like
 
