@@ -60,6 +60,7 @@ try:
         add_ortvec_arguments,
         add_trim_args,
         add_verbose_arg,
+        apply_automask,
         apply_trim_to_timing,
         collect_nuisance_blocks,
         load_and_preprocess_runs,
@@ -338,6 +339,18 @@ Notes:
         "-mask",
         default=None,
         help="Brain mask NIfTI (optional).",
+    )
+    fir_grp.add_argument(
+        "-automask",
+        action="store_true",
+        help=(
+            "Derive an AFNI-style brain mask from the data and fit only "
+            "inside it (intersected with -mask if both are given).  Without "
+            "this, every voxel in the bounding box is fit -- typically 3-4x "
+            "more than the brain -- which costs memory and time and lets air "
+            "and edge voxels, whose FIR shapes are noise, into the density "
+            "the HRF library is derived from."
+        ),
     )
     fir_grp.add_argument(
         "-microtime-dt",
@@ -1648,6 +1661,15 @@ def main() -> None:
     if args.tr is None:
         args.tr = tr
 
+    if args.automask:
+        data, _, mask_flat, n_voxels = apply_automask(
+            data,
+            list(run_starts),
+            volume_shape,
+            mask_flat,
+            verbose=args.verb >= 1,
+        )
+
     # Shift timing onto the retained window before onsets are snapped to TRs.
     trim = trim_spec_from_args(args, tr=tr)
     apply_trim_to_timing(
@@ -1777,12 +1799,19 @@ def main() -> None:
             extra_regressors_per_run=extra_per_run,
             device=torch.device("cpu"),
         )
+        # The loader deliberately keeps a large dataset on the CPU and streams
+        # chunks to the GPU, and pack_for_shared_task_glm above honours that.
+        # fit_glm's preload default is the legacy True, which would copy the
+        # whole concatenated matrix back onto the card before the chunked loop
+        # ever runs -- 8.24 GB for 27 runs, an OOM on a 16 GB card, on data the
+        # loader had already decided not to put there.
         res = fit_glm(
             data=pk.data_concat,
             design=pk.design_concat,
             tr=tr,
             max_poly_degree=-1,
             device=device,
+            preload_data_to_device=(pk.data_concat.device == device),
             verbose=verbose,
             want_r2_run=False,
             debug_design=args.debug_design,
