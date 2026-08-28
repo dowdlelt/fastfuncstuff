@@ -2386,6 +2386,25 @@ def save_design_diagnostic_figure(
     print(f"  Design diagnostic figure saved: {output_path}")
 
 
+def _library_is_duration_convolved(hrf_metadata) -> bool:
+    """Did the saved library's curves already contain the stimulus boxcar?
+
+    Read off the durations the model was actually built with: all-zero means
+    the design used impulse onsets, which is only correct when the curves carry
+    the duration themselves.  Recording it costs nothing and a consumer
+    reloading the library has no other way to tell -- guessing wrong either
+    double-convolves the design or drops the duration entirely, and both are
+    silent.
+    """
+    durs = (hrf_metadata or {}).get("stim_durations")
+    if not durs:
+        return False
+    try:
+        return all(float(d) == 0.0 for d in durs)
+    except (TypeError, ValueError):
+        return False
+
+
 def save_hrf_selection_results(
     results: HRFSelectionResults,
     output_prefix: str,
@@ -2576,6 +2595,13 @@ def save_hrf_selection_results(
             "hrf_index": results.hrf_index,
             "hrf_group_indices": results.hrf_group_indices,
             "metadata": results.hrf_metadata,
+            # Whether these curves already contain the stimulus boxcar.  A
+            # consumer reloading this library has no other way to tell, and
+            # guessing wrong either double-convolves the design or drops the
+            # duration entirely -- both silent.  Derived from the durations the
+            # model was actually built with: all-zero means the curves carried
+            # the duration themselves.
+            "duration_convolved": _library_is_duration_convolved(results.hrf_metadata),
         },
         hrf_lib_file,
     )

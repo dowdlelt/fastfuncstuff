@@ -1978,6 +1978,7 @@ def main():
         # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
         hrf_library_obj = None
         hrf_indices_obj = None
+        model_durations = durations
         if args.hrfopt_prefix:
             from fastfuncstuff.glm.ridge import load_hrf_indices
 
@@ -2000,6 +2001,17 @@ def main():
             with spinner(f"Loading {Path(hrf_lib_file).name}"):
                 hrf_lib_data = torch.load(hrf_lib_file, weights_only=False)
             hrf_library_obj = hrf_lib_data["hrf_library"].to(device)
+            # A duration-convolved library carries the boxcar itself, so this
+            # design must be built from impulses.  ffs_hrfopt records which
+            # kind it saved; inheriting the fact beats asking the user to
+            # remember, since getting it wrong is silent either way.
+            if hrf_lib_data.get("duration_convolved"):
+                model_durations = [0.0] * len(durations)
+                print(
+                    "  Library is duration-convolved: building the design's "
+                    "onsets as IMPULSES\n  (the duration is already inside the "
+                    "curves, not applied here)"
+                )
             unique_hrfs, counts = torch.unique(hrf_indices_obj, return_counts=True)
             print(f"  HRF library shape: {tuple(hrf_library_obj.shape)}")
             print(
@@ -2017,7 +2029,7 @@ def main():
             fir_top=fir_top,
             n_basis=n_basis,
             all_onsets=all_onsets,
-            stim_durations=durations,
+            stim_durations=model_durations,
             onset_matrix_micro=onset_matrix_micro,
             n_conditions=n_conditions,
             n_timepoints=n_timepoints,

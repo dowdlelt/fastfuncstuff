@@ -99,3 +99,30 @@ def test_every_library_tool_registers_both_flags(tool):
         registered.update(action.option_strings)
     assert "-hrf-library" in registered, f"{tool} lost -hrf-library"
     assert "-hrf-library-raw" in registered, f"{tool} has no -hrf-library-raw"
+
+
+# ---------- the fact travels with the library, not with the user -------------
+
+
+def test_saved_library_records_whether_it_is_duration_convolved():
+    """ffs_reml reloads a library from ffs_hrfopt's .pt and has no flag for it.
+
+    Rather than ask the user to remember which kind they built -- a choice that
+    is silent in both directions -- the fact is derived from the durations the
+    model was built with and stored alongside the curves.  All-zero durations
+    mean the design used impulse onsets, which is only correct when the curves
+    carry the duration themselves.
+    """
+    from fastfuncstuff.design.hrf_selection import _library_is_duration_convolved
+
+    assert _library_is_duration_convolved({"stim_durations": [0.0]}) is True
+    assert _library_is_duration_convolved({"stim_durations": [0.0, 0.0]}) is True
+    assert _library_is_duration_convolved({"stim_durations": [20.0]}) is False
+    assert _library_is_duration_convolved({"stim_durations": [0.0, 2.0]}) is False
+    # Absent or unusable metadata must read as "not duration-convolved": that
+    # is the status quo for every library written before this was recorded,
+    # and the safe default, since it leaves the duration in the design.
+    assert _library_is_duration_convolved({}) is False
+    assert _library_is_duration_convolved(None) is False
+    assert _library_is_duration_convolved({"stim_durations": []}) is False
+    assert _library_is_duration_convolved({"stim_durations": ["x"]}) is False
