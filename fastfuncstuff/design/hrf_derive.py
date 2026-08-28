@@ -27,13 +27,25 @@ Overview of the pipeline (matches NSD paper supplement):
    Decomposition Method of Chen et al. 2021 used in the NSD paper to
    visualize HRF-shape variation independent of amplitude.
 
-5. **Manifold tracing** — :func:`trace_manifold_auto` (default) or
-   :func:`trace_manifold_grid` (fallback) or
-   :func:`trace_manifold_from_points` (override).  For K=3 the unit
-   vectors live on the 2-sphere; we trace a 1-D path that follows the
-   density ridge of the histogram in spherical coordinates.  ``n_points``
-   evenly spaced (in angle) samples along this path give the HRF
-   "library" — same shape diversity as NSD's 20-HRF canonical library.
+5. **Manifold sampling** — pick ``n_points`` directions out of the
+   density on the unit sphere.  Two families, and the choice is a claim
+   about the data:
+
+   * **1-D curve** — :func:`trace_manifold_auto` (default) walks the
+     density *ridge*, so ``n_points`` samples spaced ``angular_step_deg``
+     apart trace the principal path through the cloud and adjacent
+     library indices hold similar HRFs.  This is NSD's model of HRF
+     variation: one family running early-to-late.
+     :func:`trace_manifold_grid` is a density-blind 1-D fallback.
+   * **Filled region** — :func:`trace_manifold_blob` covers the cloud's
+     support evenly and :func:`trace_manifold_kmeans` covers it in
+     proportion to voxel count.  Use these when the cloud has genuine
+     width the curve misses; :func:`manifold_coverage` is the referee.
+
+   Every sampler here works at **any K**.  The ridge walk used to be
+   capped at K=3 by a Fibonacci-sphere grid, which is also what made it
+   trace a straight line instead of the density (see :func:`_mean_shift`).
+   :func:`trace_manifold_from_points` overrides with clicked points.
 
 6. **Reconstruction & re-sampling** — :func:`reconstruct_timecourses`.
    Each manifold point ``w`` reconstructs a TR-resolution HRF as
@@ -57,10 +69,14 @@ Design notes
   caller before the FIR fit; this module sees only the resulting impulse
   responses.  That keeps the algorithm a "library builder" rather than
   a condition-aware HRF model.
-- **K=3 by default.**  Lower K leaves you with a 1-D arc that's barely
-  a "manifold"; higher K loses the planar density-tracing trick.  K=3 is
-  what NSD used and is the well-tested path; other values are allowed
-  but auto-manifold tracing falls back to PCA-based 1-D ordering.
+- **K=3 by default, but not a limit.**  K=3 is what NSD used and is the
+  well-tested path; K=2 leaves a 1-D arc that is barely a "manifold".
+  Higher K is fully supported by every sampler — the ridge walk is
+  mean-shift-based and the region fillers are data-candidate-based, so
+  none of them needs a grid on the sphere.  Raising K is worth doing when
+  the eigenvalue spectrum has no elbow at 3 and ``manifold_coverage``
+  reports a poorly-served tail; the QC heatmap stays a (PC2, PC3)
+  projection and no longer shows the whole story.
 
 Duration handling
 -----------------
@@ -271,8 +287,12 @@ def svd_decompose(
         Each row is one voxel's estimated HRF shape over the FIR window.
     n_pcs : int, default 3
         Number of singular components to keep.  3 is the well-validated
-        NSD choice; 2 collapses the manifold to a 1-D arc, 4+ loses the
-        planar-density-tracing trick used by :func:`trace_manifold_auto`.
+        NSD choice and keeps the whole cloud visible in the QC heatmap;
+        2 collapses the manifold to a 1-D arc.  4+ is supported by every
+        sampler (:func:`trace_manifold_auto` included), at the cost of the
+        heatmap becoming a projection — check the eigenvalue spectrum for
+        an elbow and :func:`manifold_coverage` for a poorly-served tail
+        before spending the extra dimensions.
     unit_normalize : bool, default True
         Divide each voxel's FIR vector by its L2 norm before SVD.
         Almost always what you want for HRF-shape extraction.  Set to
@@ -500,103 +520,238 @@ def _spherical_kde(
     return np.exp((cos_sim - 1.0) / sigma2).sum(axis=1)
 
 
-def _fibonacci_sphere(n: int) -> np.ndarray:
-    """Generate ``n`` near-uniformly spaced points on the unit 2-sphere.
+def _kde_sources(data: np.ndarray, max_n: int = 20000) -> np.ndarray:
+    """Thin ``data`` to at most ``max_n`` rows for use as KDE kernel centres.
 
-    Uses the golden-angle spiral.  Returns shape ``(n, 3)``.
+    A KDE is an *average* over its sources, so its shape is essentially
+    unchanged by evaluating it on a fraction of them, while the cost of
+    every density evaluation falls in proportion.  The walk below queries
+    the density a few hundred times, so this is the difference between a
+    fraction of a second and a minute on a whole-brain library.
+
+    The subsample is a fixed stride rather than an RNG draw: it needs no
+    seed, is reproducible across runs, and — because row order here is
+    voxel order — spreads the sources over the whole brain instead of
+    concentrating them in one slab.
     """
-    indices = np.arange(n, dtype=np.float64) + 0.5
-    phi = np.arccos(1 - 2 * indices / n)  # polar angle in [0, π]
-    theta = np.pi * (1 + 5**0.5) * indices  # golden-angle azimuth
-    return np.column_stack([np.sin(phi) * np.cos(theta), np.sin(phi) * np.sin(theta), np.cos(phi)])
+    if data.shape[0] <= max_n:
+        return data
+    return data[:: int(np.ceil(data.shape[0] / max_n))]
 
 
-def _tangent_basis(p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Two orthonormal vectors spanning the tangent plane at unit vector ``p``."""
-    aux = np.array([1.0, 0.0, 0.0]) if abs(p[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-    e1 = np.cross(p, aux)
-    e1 /= np.linalg.norm(e1)
-    e2 = np.cross(p, e1)
-    return e1, e2
+def _tangent_basis(p: np.ndarray) -> np.ndarray:
+    """Orthonormal basis ``(K, K-1)`` of the tangent space at unit vector ``p``.
+
+    The K=3 version of this used ``np.cross`` twice, which is the reason
+    ridge tracing was capped at three PCs.  A QR of ``[p | I]`` puts ``p``
+    (up to sign) in the first column and an orthonormal basis of its
+    complement in the rest, for any K, at negligible cost — K is 3-6 here.
+    """
+    k = p.shape[0]
+    q, _ = np.linalg.qr(np.column_stack([p, np.eye(k)]))
+    return q[:, 1:k]
+
+
+def _kernel_weights(point: np.ndarray, data: np.ndarray, sigma2: float) -> np.ndarray:
+    """Per-source vMF-like kernel weights of ``data`` around ``point``."""
+    return np.exp((data @ point - 1.0) / sigma2)
+
+
+def _density_at(point: np.ndarray, data: np.ndarray, sigma2: float) -> float:
+    """Spherical KDE evaluated at a single ``point``."""
+    return float(_kernel_weights(point, data, sigma2).sum())
+
+
+def _mean_shift(
+    point: np.ndarray,
+    data: np.ndarray,
+    sigma2: float,
+    *,
+    forbid_direction: np.ndarray | None = None,
+    max_step_rad: float,
+    max_total_rad: float,
+    n_iter: int = 12,
+    tol: float = 1e-9,
+) -> np.ndarray:
+    """Move ``point`` uphill to the local KDE mode, on the sphere.
+
+    Each iteration takes the kernel-weighted mean of the data around
+    ``point``, converts it to a tangential direction, and makes a geodesic
+    hop of at most ``max_step_rad`` that way.  This is mean shift, so it
+    converges on the density mode rather than on whichever precomputed
+    grid point happened to be nearest.
+
+    ``max_step_rad`` caps one hop and ``max_total_rad`` caps the whole
+    excursion from ``point``.  The total budget is the one that matters:
+    without it, twelve iterations of a 6 degree cap let a "local" snap
+    travel 72 degrees, which showed up as library entries 38 degrees apart
+    where 6 was asked for.
+
+    ``forbid_direction`` (a unit tangent) is projected out of every hop.
+    That is what makes this a *ridge* correction instead of a mode
+    collapse: when walking along a ridge, the point must be free to slide
+    sideways onto the crest but must not be allowed to slide backwards
+    along the crest into the peak it came from.  Subspace-constrained mean
+    shift, in the usual principal-curve sense.
+
+    Why this replaces a grid snap.  The old correction chose the densest
+    point of a 4096-point Fibonacci sphere within half a step.  That grid
+    has ~3.1 degree spacing, and the cone it searched had a 3 degree
+    half-angle, so it held a MEDIAN OF ONE CANDIDATE: the correction was a
+    no-op, the walk was an uncorrected geodesic extrapolation — a great
+    circle, i.e. a straight line — and it drifted off a clean synthetic
+    ridge by up to 8 degrees over 20 points while emitting samples spaced
+    3.9-6.2 degrees apart instead of the 6 requested.  Raising the grid
+    resolution is not a fix: matching 3 degrees on S^3 needs ~260k points
+    and on S^4 ~16M, so the grid is also exactly what capped the whole
+    method at K=3.  Mean shift is continuous (no resolution floor) and
+    dimension-agnostic (no grid), which is why one change fixes both.
+    """
+    cur = point
+    for _ in range(n_iter):
+        w = _kernel_weights(cur, data, sigma2)
+        total = float(w.sum())
+        if total <= 0.0:
+            break
+        mean = (w @ data) / total
+        # Tangential component of the weighted mean: the uphill direction.
+        v = mean - cur * float(cur @ mean)
+        if forbid_direction is not None:
+            v = v - forbid_direction * float(forbid_direction @ v)
+        nv = float(np.linalg.norm(v))
+        if nv < tol:
+            break
+        along = float(cur @ mean)
+        # arctan2 gives the geodesic angle to the shifted mean; when the mean
+        # sits behind us (along <= 0) the kernel has caught a far-off lobe, so
+        # take the capped step rather than trusting the angle.
+        angle = np.arctan2(nv, along) if along > 0.0 else max_step_rad
+        angle = min(angle, max_step_rad)
+        nxt = cur * np.cos(angle) + (v / nv) * np.sin(angle)
+        nxt /= np.linalg.norm(nxt)
+        travelled = float(np.arccos(np.clip(nxt @ point, -1.0, 1.0)))
+        if travelled > max_total_rad:
+            # Spend exactly the remaining budget along the same geodesic and
+            # stop: past here we are no longer correcting, we are wandering.
+            u = nxt - point * float(point @ nxt)
+            nu = float(np.linalg.norm(u))
+            if nu > tol:
+                cur = point * np.cos(max_total_rad) + (u / nu) * np.sin(max_total_rad)
+                cur /= np.linalg.norm(cur)
+            break
+        converged = float(nxt @ cur) > 1.0 - tol
+        cur = nxt
+        if converged:
+            break
+    return cur
 
 
 def _local_ridge_direction(
-    start: np.ndarray,
-    grid: np.ndarray,
-    density: np.ndarray,
-    step_rad: float,
+    point: np.ndarray,
+    data: np.ndarray,
+    sigma2: float,
 ) -> np.ndarray:
-    """Principal tangent direction of the density ridge at ``start``.
+    """Direction the density ridge runs at ``point``: local tangent-space PCA.
 
-    Takes grid points within ``2 × step_rad`` of ``start``, expresses them
-    in the tangent plane at ``start``, and returns the top eigenvector of
-    their density-weighted covariance.  That is the direction the ridge
-    runs, which seeds the two-sided walk.
+    Expresses the kernel-weighted neighbourhood in the tangent space at
+    ``point`` and returns the top eigenvector of its weighted covariance,
+    mapped back to the ambient space.  For K=3 the tangent space is a
+    plane and this is the old behaviour; for K>3 it is a (K-1)-space and
+    the same eigenvector is still "the way the ridge goes".
     """
-    e1, e2 = _tangent_basis(start)
-    near = (grid @ start) > np.cos(2.0 * step_rad)
-    if near.sum() < 3:
-        return e1
-    coords = np.column_stack([grid[near] @ e1, grid[near] @ e2])
-    w = density[near]
+    basis = _tangent_basis(point)  # (K, K-1)
+    w = _kernel_weights(point, data, sigma2)
     total = float(w.sum())
-    if total <= 0:
-        return e1
-    cov = (coords * w[:, None]).T @ coords / total
+    if total <= 0.0:
+        return basis[:, 0]
+    # Sources more than a few bandwidths away contribute nothing but cost.
+    near = w > w.max() * 1e-6
+    w = w[near]
+    coords = data[near] @ basis  # (n_near, K-1)
+    if coords.shape[0] < 3:
+        return basis[:, 0]
+    total = float(w.sum())
+    mu = (w @ coords) / total
+    centred = coords - mu
+    cov = (centred * w[:, None]).T @ centred / total
     _, evecs = np.linalg.eigh(cov)
-    d = evecs[:, -1]  # largest eigenvalue last from eigh
-    direction = d[0] * e1 + d[1] * e2
-    norm = np.linalg.norm(direction)
-    return direction / norm if norm > 1e-12 else e1
+    direction = basis @ evecs[:, -1]  # largest eigenvalue last from eigh
+    norm = float(np.linalg.norm(direction))
+    return direction / norm if norm > 1e-12 else basis[:, 0]
 
 
 def _walk_ridge_one_way(
     start: np.ndarray,
     tangent: np.ndarray,
-    grid: np.ndarray,
-    density: np.ndarray,
+    data: np.ndarray,
+    sigma2: float,
     n_steps: int,
     step_rad: float,
     floor: float,
-    snap_cone: float = 0.5,
 ) -> list[np.ndarray]:
     """Predict-and-correct walk along a density ridge in ONE direction.
 
-    Each step takes a geodesic hop of ``step_rad`` from the current point
-    along the current tangent (the *predict*), then snaps to the highest-
-    density grid point within a cone of half-angle ``snap_cone × step_rad``
-    around that target (the *correct*).  The tangent is then recomputed as
-    the geodesic direction actually travelled, so it carries forward.
+    Each step hops ``step_rad`` along the current tangent (the *predict*),
+    then mean-shifts onto the ridge crest with motion along the direction
+    of travel forbidden (the *correct*).  The tangent is then recomputed
+    as the geodesic direction actually travelled, so it carries forward.
 
-    Carrying the tangent is what makes this a directed walk.  The previous
+    Carrying the tangent is what makes this a directed walk.  An earlier
     implementation chose purely by density within an annulus and forbade
     only near-exact repeats, which let it fold back and re-traverse the
-    same arc a few degrees off — emitting duplicate library entries while
-    never reaching one end of the ridge.
+    same arc a few degrees off.  The turn guard below closes the same door
+    for the mean-shift correction: a hairpin means the ridge ended and the
+    walk is about to double back, so stop.
 
     Returns the points visited *excluding* ``start``.
     """
     out: list[np.ndarray] = []
     cur = start
     tan = tangent
-    cos_cone = np.cos(snap_cone * step_rad)
     for _ in range(n_steps):
-        target = cur * np.cos(step_rad) + tan * np.sin(step_rad)
-        target /= np.linalg.norm(target)
-        in_cone = (grid @ target) >= cos_cone
-        if not in_cone.any():
+        # Predict a hop of `hop`, correct onto the crest, then re-predict once
+        # with the hop rescaled by how far we actually got.  The correction is
+        # perpendicular to the direction of travel, so on a curving ridge it
+        # pulls the point back inside the geodesic and the achieved spacing
+        # comes up short -- 3.8 degrees for a requested 6 on a tightly curved
+        # arc.  One rescale is enough to land on the requested spacing, which
+        # is what `angular_step_deg` promises the caller.
+        hop = step_rad
+        nxt = None
+        for _attempt in range(2):
+            target = cur * np.cos(hop) + tan * np.sin(hop)
+            target /= np.linalg.norm(target)
+            # Parallel-transport the tangent along the geodesic we just hopped
+            # down, so the correction is forbidden from moving along the ridge
+            # AT THE POINT IT ACTS ON rather than one step back.
+            tan_at_target = -cur * np.sin(hop) + tan * np.cos(hop)
+            nxt = _mean_shift(
+                target,
+                data,
+                sigma2,
+                forbid_direction=tan_at_target,
+                max_step_rad=step_rad,
+                max_total_rad=step_rad,
+            )
+            achieved = float(np.arccos(np.clip(cur @ nxt, -1.0, 1.0)))
+            if achieved < 1e-9:
+                break
+            scale = float(np.clip(step_rad / achieved, 0.5, 2.0))
+            if abs(scale - 1.0) < 0.02:
+                break
+            hop = hop * scale
+        if nxt is None:
             break
-        cand = np.where(in_cone, density, -np.inf)
-        nxt = grid[int(cand.argmax())]
-        if density[int(cand.argmax())] < floor:
+        if _density_at(nxt, data, sigma2) < floor:
             break
-        # Recompute the tangent as the direction actually travelled, so the
-        # walk keeps going the way it was going rather than re-deciding.
         new_tan = nxt - cur * float(cur @ nxt)
-        norm = np.linalg.norm(new_tan)
+        norm = float(np.linalg.norm(new_tan))
         if norm < 1e-12:
             break
-        tan = new_tan / norm
+        new_tan /= norm
+        if float(new_tan @ tan) <= 0.0:
+            break  # hairpin: the ridge ended and we are turning back
+        tan = new_tan
         cur = nxt
         out.append(cur)
     return out
@@ -607,47 +762,42 @@ def trace_manifold_auto(
     n_points: int = 20,
     angular_step_deg: float = 6.0,
     bandwidth_deg: float = 8.0,
-    n_grid: int = 4096,
     density_floor_frac: float = 0.05,
 ) -> np.ndarray:
-    """Trace a 1-D density ridge across the unit sphere (K=3 only).
+    """Trace a 1-D density ridge across the unit sphere, in any dimension.
 
     Two-sided predict-and-correct walk:
 
-    1. Build a near-uniform Fibonacci grid of ``n_grid`` candidate
-       directions on the 2-sphere.
-    2. Compute the spherical-KDE density of ``unit_vectors`` at each
-       grid point (bandwidth = ``bandwidth_deg``).
-    3. Start at the global density peak and estimate the ridge's local
-       tangent direction there (:func:`_local_ridge_direction`).
-    4. Walk ``+tangent`` and ``-tangent`` away from the peak, splitting
+    1. Evaluate the spherical KDE (bandwidth ``bandwidth_deg``) at the
+       voxel directions themselves and mean-shift the densest one to
+       convergence, giving the density mode.
+    2. Estimate the ridge's local tangent direction there
+       (:func:`_local_ridge_direction`).
+    3. Walk ``+tangent`` and ``-tangent`` away from the mode, splitting
        the ``n_points`` budget between the two arms; if one arm
        terminates early its remaining budget goes to the other.  Each
-       step is a geodesic hop of ``angular_step_deg`` followed by a snap
-       to the densest grid point nearby (:func:`_walk_ridge_one_way`).
-    5. Stop an arm when density drops below
+       step is a geodesic hop of ``angular_step_deg`` followed by a
+       mean-shift back onto the crest (:func:`_walk_ridge_one_way`).
+    4. Stop an arm when density drops below
        ``density_floor_frac × peak_density``.
 
     This automates what NSD did by hand — ``hrf_constructmanifold.m``
     has a human click 12 points on the (PC2, PC3) density heatmap and
     then great-circle-interpolates between them at 6° spacing.  The
-    walk here is deliberately simple and is **not** principal curves or
-    graph-based ridge extraction; for pathological densities use
+    walk here is deliberately simple; for pathological densities use
     :func:`trace_manifold_from_points` to supply clicked points
     directly, exactly as NSD did.
 
-    This replaces an earlier annulus-and-density walk that carried no
-    direction and forbade only near-exact repeats.  That version folded
-    back on itself and re-traversed the ridge a few degrees off — half
-    the returned points were near-duplicates and one end of the ridge
-    was never reached.
+    Any K >= 2.  The correction step used to snap to the nearest point of
+    a Fibonacci 2-sphere, which both capped the method at K=3 and — with
+    only ~1 grid point inside the snap cone — left the walk tracing an
+    uncorrected great circle instead of the data's curve.  See
+    :func:`_mean_shift` for the measurements.
 
     Parameters
     ----------
-    unit_vectors : np.ndarray, shape (n_voxels, 3)
+    unit_vectors : np.ndarray, shape (n_voxels, K)
         Unit-norm voxel directions from :func:`project_unit_sphere`.
-        Pass only ``K == 3``; for other K use :func:`trace_manifold_grid`
-        or supply explicit points.
     n_points : int, default 20
         Maximum number of manifold samples to emit.
     angular_step_deg : float, default 6.0
@@ -656,55 +806,56 @@ def trace_manifold_auto(
     bandwidth_deg : float, default 8.0
         Width of the spherical KDE kernel.  Larger = smoother density
         but blurs across the manifold.
-    n_grid : int, default 4096
-        Number of Fibonacci-sphere candidate directions.  Higher gives
-        a smoother walk at O(n_grid · n_data) cost; 4096 has been
-        adequate in testing.
     density_floor_frac : float, default 0.05
         Stop walking when density drops below this fraction of the
         starting peak.
 
     Returns
     -------
-    manifold : np.ndarray, shape (n_actual, 3)
+    manifold : np.ndarray, shape (n_actual, K)
         Ordered manifold points on the unit sphere.
         ``n_actual <= n_points`` (early termination is allowed).
 
     Raises
     ------
     ValueError
-        If ``unit_vectors.shape[1] != 3``.
+        If ``unit_vectors`` has fewer than 2 columns.
     """
-    if unit_vectors.shape[1] != 3:
+    if unit_vectors.shape[1] < 2:
         raise ValueError(
-            "trace_manifold_auto requires K=3 (got "
-            f"K={unit_vectors.shape[1]}); use trace_manifold_grid or supply points."
+            f"trace_manifold_auto needs K>=2 (got K={unit_vectors.shape[1]}); "
+            "a 1-D embedding has no manifold to trace."
         )
 
-    # Drop zero rows (filtered-out voxels) so they don't tug the density to 0.
-    nz_mask = np.linalg.norm(unit_vectors, axis=1) > 0.5
-    data = unit_vectors[nz_mask]
-    if data.size == 0:
-        raise ValueError("No non-zero unit vectors to trace.")
-
-    grid = _fibonacci_sphere(n_grid)  # (n_grid, 3)
-    bw = np.deg2rad(bandwidth_deg)
-    density = _spherical_kde(grid, data, bw)  # (n_grid,)
-
+    data = _nonzero_rows(unit_vectors)
+    sources = _kde_sources(data)
+    sigma2 = np.deg2rad(bandwidth_deg) ** 2
     step_rad = np.deg2rad(angular_step_deg)
-    peak_idx = int(density.argmax())
-    start = grid[peak_idx]
-    floor = float(density[peak_idx]) * density_floor_frac
 
-    tangent = _local_ridge_direction(start, grid, density, step_rad)
+    # Seed at the densest voxel direction, then mean-shift it to the actual
+    # mode: the densest *sample* is only within a nearest-neighbour spacing
+    # of the mode, and the whole point of this rewrite is not to inherit a
+    # discretization error from the thing we happen to evaluate on.
+    seed_pool = _kde_sources(data, max_n=4096)
+    seed_density = _spherical_kde(seed_pool, sources, np.deg2rad(bandwidth_deg))
+    start = _mean_shift(
+        seed_pool[int(seed_density.argmax())],
+        sources,
+        sigma2,
+        max_step_rad=step_rad,
+        max_total_rad=5.0 * np.deg2rad(bandwidth_deg),
+    )
+    floor = _density_at(start, sources, sigma2) * density_floor_frac
+
+    tangent = _local_ridge_direction(start, sources, sigma2)
 
     # Split the budget either side of the peak.  Walk both arms with the
     # full remaining budget available to each, then trim: an arm that
     # dies early (ridge ends, density floor) hands its slots to the other.
     budget = n_points - 1
     n_fwd_target = budget // 2 + budget % 2
-    forward = _walk_ridge_one_way(start, tangent, grid, density, budget, step_rad, floor)
-    backward = _walk_ridge_one_way(start, -tangent, grid, density, budget, step_rad, floor)
+    forward = _walk_ridge_one_way(start, tangent, sources, sigma2, budget, step_rad, floor)
+    backward = _walk_ridge_one_way(start, -tangent, sources, sigma2, budget, step_rad, floor)
 
     n_fwd = min(len(forward), n_fwd_target)
     n_bwd = min(len(backward), budget - n_fwd)
@@ -746,9 +897,9 @@ def trace_manifold_blob(
     n_points: int = 20,
     bandwidth_deg: float = 8.0,
     density_floor_frac: float = 0.05,
-    n_grid: int = 4096,
+    n_candidates: int = 4096,
 ) -> np.ndarray:
-    """Cover the **2-D** density blob evenly, instead of tracing a 1-D arc.
+    """Cover the density blob's **support** evenly, instead of tracing a 1-D arc.
 
     A ridge walk assumes HRF-shape variation is essentially
     one-dimensional — a single family running from early to late.  That is
@@ -758,14 +909,19 @@ def trace_manifold_blob(
 
     This sampler makes no such assumption:
 
-    1. Spherical-KDE density on a Fibonacci grid (as
-       :func:`trace_manifold_auto`).
-    2. Keep grid points whose density is at least
-       ``density_floor_frac × peak`` — that masked set *is* the blob.
+    1. Spherical-KDE density evaluated at the voxel directions themselves.
+    2. Keep the directions whose density is at least
+       ``density_floor_frac × peak`` — that set *is* the blob.
     3. Farthest-point-sample ``n_points`` of them, starting at the density
        peak, giving near-uniform angular coverage of the support.
 
-    The result is **not** an ordered curve — with a 2-D point set there is
+    Candidates are voxel directions rather than points of a Fibonacci
+    sphere.  That makes the sampler work at any K — a grid fine enough to
+    resolve S^3 needs ~260k points and S^4 ~16M, so the grid was what
+    pinned this to K=3 — and it also guarantees every candidate sits where
+    voxels actually are, which a grid does not.
+
+    The result is **not** an ordered curve — with a filled region there is
     no meaningful "next" entry — so neighbouring library indices need not
     be similar.  :func:`derive_library` still sorts the output by
     time-to-peak for a deterministic, interpretable order, but adjacency
@@ -774,11 +930,13 @@ def trace_manifold_blob(
     Use this when the sphere-density QC plot shows a genuinely round or
     forked blob rather than a clean arc, or when
     :func:`manifold_coverage` reports a large tail of poorly-covered
-    voxels under ``auto``.
+    voxels under ``auto``.  Compare with :func:`trace_manifold_kmeans`,
+    which fills the same region in proportion to voxel count rather than
+    evenly.
 
     Parameters
     ----------
-    unit_vectors : np.ndarray, shape (n_voxels, 3)
+    unit_vectors : np.ndarray, shape (n_voxels, K)
         Unit-norm voxel directions from :func:`project_unit_sphere`.
     n_points : int, default 20
         Exact number of library entries to emit (unlike ``auto``, which
@@ -786,31 +944,34 @@ def trace_manifold_blob(
     bandwidth_deg : float, default 8.0
         Spherical KDE bandwidth.
     density_floor_frac : float, default 0.05
-        Grid points below this fraction of peak density are outside the
+        Directions below this fraction of peak density are outside the
         blob.  Raise it to sample only the dense core; lower it to chase
         the tails.
-    n_grid : int, default 4096
-        Fibonacci-grid resolution.
+    n_candidates : int, default 4096
+        Cap on how many voxel directions are considered as candidates.
+        Farthest-point sampling is O(n_candidates × n_points), so this
+        bounds the cost on a whole-brain library.
 
     Returns
     -------
-    manifold : np.ndarray, shape (n_actual, 3)
-        ``n_actual == min(n_points, #grid points above the floor)``.
+    manifold : np.ndarray, shape (n_actual, K)
+        ``n_actual == min(n_points, #candidates above the floor)``.
     """
-    if unit_vectors.shape[1] != 3:
-        raise ValueError(f"trace_manifold_blob requires K=3 (got K={unit_vectors.shape[1]}).")
+    if unit_vectors.shape[1] < 2:
+        raise ValueError(f"trace_manifold_blob needs K>=2 (got K={unit_vectors.shape[1]}).")
     data = _nonzero_rows(unit_vectors)
+    sources = _kde_sources(data)
+    candidates = _kde_sources(data, max_n=n_candidates)
 
-    grid = _fibonacci_sphere(n_grid)
-    density = _spherical_kde(grid, data, np.deg2rad(bandwidth_deg))
+    density = _spherical_kde(candidates, sources, np.deg2rad(bandwidth_deg))
     peak_idx = int(density.argmax())
     inside = density >= density[peak_idx] * density_floor_frac
-    candidates = grid[inside]
-    if candidates.shape[0] == 0:
-        raise ValueError("No grid points above the density floor.")
+    kept = candidates[inside]
+    if kept.shape[0] == 0:
+        raise ValueError("No candidate directions above the density floor.")
     # Index of the density peak within the masked subset.
     start = int(density[inside].argmax())
-    return _farthest_point_sample(candidates, n_points, start)
+    return _farthest_point_sample(kept, n_points, start)
 
 
 def trace_manifold_kmeans(
@@ -1920,26 +2081,25 @@ def derive_library(
     unit = project_unit_sphere(weights_for_sphere, sign_flip_by_first=True)
 
     # QC: 2D histogram on the (PC2, PC3) plane — this is NSD's
-    # "unit-circle heatmap" used to visually pick the density ridge.
+    # "unit-circle heatmap" used to visually pick the density ridge.  At
+    # K>3 it is a projection of the cloud rather than the whole of it, but
+    # a partial view beats the no view that gating this on K==3 gave.
     sphere_hist2d = None
     sphere_hist_edges = None
-    if n_pcs == 3:
+    if n_pcs >= 3:
         # Match NSD's bin grid (loadings ∈ [-1.5, 1.5], step 0.02).
         edges = np.arange(-1.5, 1.5 + 0.02, 0.02)
         sphere_hist2d, _, _ = np.histogram2d(unit[:, 1], unit[:, 2], bins=(edges, edges))
         sphere_hist_edges = edges
 
     if manifold_mode == "auto":
-        if n_pcs != 3:
-            # Auto needs the 2-sphere; k-means is the K-agnostic fallback.
-            manifold = trace_manifold_kmeans(unit, n_points=n_hrfs, seed=seed)
-        else:
-            manifold = trace_manifold_auto(
-                unit,
-                n_points=n_hrfs,
-                angular_step_deg=angular_step_deg,
-                bandwidth_deg=bandwidth_deg,
-            )
+        manifold = trace_manifold_auto(
+            unit,
+            n_points=n_hrfs,
+            angular_step_deg=angular_step_deg,
+            bandwidth_deg=bandwidth_deg,
+            density_floor_frac=density_floor_frac,
+        )
     elif manifold_mode == "blob":
         manifold = trace_manifold_blob(
             unit,
@@ -2011,24 +2171,52 @@ def derive_library(
     gamma_params_deconvolved: list[dict] = []
     duration_convolved_flag = not do_deconv
 
-    if fit_gamma:
+    boxcar_fit_path = do_deconv and method == "fit"
+
+    if fit_gamma and not boxcar_fit_path:
+        # `raw` is already an impulse response here (no duration to correct,
+        # or the wiener path removes it below), so a bare double-gamma is the
+        # right family to fit.
         fitted = np.zeros_like(raw)
         for i in range(raw.shape[0]):
             fit, p = fit_double_gamma(raw[i], dt=target_dt)
             fitted[i] = fit
             gamma_params.append(p)
 
-    if do_deconv and method == "fit":
+    if boxcar_fit_path:
         # NSD-faithful: the boxcar lives in the forward model, so the
         # fitted parameters already describe the impulse response.  No
         # numerical inverse, hence no raw_deconvolved counterpart.
+        #
+        # `fitted` -- the duration-convolved QC curve -- is this same fit
+        # pushed back THROUGH the boxcar, not an independent bare-double-gamma
+        # fit of `raw`.  It used to be the latter, which asked an impulse
+        # response family to reproduce a 20 s block response: it cannot, so
+        # every fit saturated (a1 pinned at its upper bound 12.0 in every case
+        # measured, c slammed to 0 or 1), correlated only r=0.75-0.89 with the
+        # curve it was drawn against, and manufactured excursions to -0.48
+        # where the raw cubic reached -0.13 -- the fitter cancelling a fast
+        # rise the block response does not have. Pushing the honest fit back
+        # through the boxcar reproduces the raw curve at r=1.0000.
         fitted_deconvolved = np.zeros_like(raw)
+        fitted = np.zeros_like(raw)
+        t_grid = np.arange(raw.shape[1], dtype=np.float64) * target_dt
+        n_box = max(1, int(round(float(deconvolve_duration) / target_dt)))
         for i in range(raw.shape[0]):
             fit, p = fit_double_gamma_through_boxcar(
                 raw[i], duration=float(deconvolve_duration), dt=target_dt
             )
             fitted_deconvolved[i] = fit
             gamma_params_deconvolved.append(p)
+            if p["fit_ok"]:
+                pred = _double_gamma_boxcar(
+                    t_grid, p["a1"], p["b1"], p["a2"], p["b2"], p["c"], p["amp"], n_box=n_box
+                )
+                peak = float(np.max(pred))
+                fitted[i] = pred / peak if peak > 0 else pred
+            else:
+                fitted[i] = raw[i]
+            gamma_params.append(p)
     elif do_deconv:
         raw_deconvolved = deconvolve_event_duration(
             raw,

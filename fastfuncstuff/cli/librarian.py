@@ -1068,12 +1068,16 @@ def write_qc_artifacts(
         ("raw cubic — impulse (deconvolved)", lib.raw_deconvolved, "-"),
         ("gamma fit — impulse (final library)", lib.fitted_deconvolved, "--"),
     ]
+    # Shared x (same lag axis throughout) but independent y: the four panels
+    # are all peak-normalized to 1, so a shared y-scale spends the whole axis
+    # on that common peak and flattens the undershoot and the spread between
+    # entries -- which is the part of these curves worth looking at.
     fig, axes = plt.subplots(
         len(panels),
         1,
         figsize=(8, 1.9 * len(panels)),
         sharex=True,
-        sharey=True,
+        sharey=False,
     )
     for ax, (title, data, linestyle) in zip(axes, panels, strict=False):
         ax.axhline(0, color="0.6", lw=0.5)
@@ -1245,11 +1249,25 @@ def derive_and_write_library(
             f"{cov['median_shape_r']:.4f}, p10 {cov['p10_shape_r']:.4f}"
         )
         if args.manifold == "auto" and cov["p90_deg"] > 20.0:
-            print(
-                "      HINT: a large p90 means many voxels sit off the 1-D "
-                "ridge.  Try -manifold kmeans (or blob) to sample the "
-                "density in 2-D and compare these numbers."
-            )
+            # Two different causes look identical in the coverage numbers, and
+            # the cure is opposite, so separate them here.  A walk that used
+            # its whole budget never reached the end of the ridge; one that
+            # stopped early found the ridge's end and the leftover voxels are
+            # genuinely off-ridge.
+            if lib.raw.shape[0] >= args.n_hrfs:
+                span = args.n_hrfs * args.angular_step
+                print(
+                    f"      HINT: the walk used all {args.n_hrfs} entries "
+                    f"without reaching the end of the ridge, so it covered "
+                    f"only ~{span:.0f}° of it and the rest of the data is "
+                    f"unrepresented.  Raise -n-hrfs or -angular-step."
+                )
+            else:
+                print(
+                    "      HINT: a large p90 means many voxels sit off the "
+                    "1-D ridge.  Try -manifold kmeans (or blob) to sample "
+                    "the density in 2-D and compare these numbers."
+                )
 
     raw_path = Path(f"{args.prefix}{gtag}_hrfraw.tsv")
     pcs_path = Path(f"{args.prefix}{gtag}_pcs.tsv")

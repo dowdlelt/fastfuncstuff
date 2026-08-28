@@ -171,16 +171,18 @@ def test_trace_manifold_auto_returns_unit_points():
     # Random Gaussian noise on the sphere
     pts = rng.standard_normal((1000, 3))
     pts /= np.linalg.norm(pts, axis=1, keepdims=True)
-    out = trace_manifold_auto(pts, n_points=10, angular_step_deg=8.0, n_grid=2048)
+    out = trace_manifold_auto(pts, n_points=10, angular_step_deg=8.0)
     assert out.shape[1] == 3
     assert out.shape[0] <= 10
     np.testing.assert_allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-10)
 
 
-def test_trace_manifold_auto_rejects_non_3d():
-    pts = np.eye(4)
-    with pytest.raises(ValueError, match="K=3"):
-        trace_manifold_auto(pts)
+def test_trace_manifold_auto_rejects_1d():
+    # K=1 has no manifold to trace.  K>=4 is now supported (see
+    # test_trace_manifold_auto_traces_curve_in_high_dimensions) -- it used to
+    # raise here because the walk snapped to a Fibonacci 2-sphere.
+    with pytest.raises(ValueError, match="K>=2"):
+        trace_manifold_auto(np.ones((10, 1)))
 
 
 def test_trace_manifold_grid_exact_count():
@@ -362,7 +364,10 @@ def test_trace_manifold_does_not_double_back():
     v /= np.linalg.norm(v, axis=1, keepdims=True)
 
     pts = trace_manifold_auto(v, n_points=20, angular_step_deg=6.0, bandwidth_deg=8.0)
-    assert pts.shape == (20, 3)
+    # The ridge spans 80 degrees, so a 6-degree walk runs out of ridge before
+    # it runs out of budget.  Stopping short is correct; doubling back is not.
+    assert pts.shape[1] == 3
+    assert 12 <= pts.shape[0] <= 20
 
     walked = np.degrees(np.arctan2(pts[:, 1], pts[:, 0]))
     diffs = np.diff(walked)
@@ -580,3 +585,153 @@ def test_select_library_voxels_drops_constant_high_r2_voxels():
     sel = select_library_voxels(betas, r2, threshold=0.1)
     assert sel.size == 50
     assert sel.min() >= 50
+
+
+# ---------- ridge tracing: follows density, and does so in any K --------------
+
+
+def _curved_ridge(k: int, n: int = 20000, scatter: float = 0.03, span: float = 1.2, seed: int = 1):
+    """A genuinely CURVED 1-D ridge embedded in S^(k-1), plus off-ridge scatter.
+
+    Curvature is the whole point: a straight (great-circle) ridge cannot
+    distinguish a walk that follows the density from one that merely
+    extrapolates along its starting tangent.
+    """
+    rng = np.random.default_rng(seed)
+    t = rng.uniform(-span, span, n)
+    cols = [np.cos(t), np.sin(t), 0.35 * np.sin(2 * t)]
+    cols += [0.25 * np.cos((j + 1) * t) for j in range(max(0, k - 3))]
+    p = np.column_stack(cols[:k]) + rng.normal(0, scatter, (n, k))
+    p /= np.linalg.norm(p, axis=1, keepdims=True)
+    p *= np.sign(p[:, 0:1])
+    return p / np.linalg.norm(p, axis=1, keepdims=True)
+
+
+def test_trace_manifold_auto_follows_a_curved_ridge():
+    # Regression: the correction step used to snap to the densest point of a
+    # 4096-point Fibonacci sphere within half a step.  That grid has ~3.1 deg
+    # spacing and the snap cone had a 3 deg half-angle, so it held a MEDIAN OF
+    # ONE candidate -- the correction was a no-op and the walk was an
+    # uncorrected geodesic, i.e. a straight line, drifting off this ridge by
+    # up to 8 deg.  Mean shift is continuous and has no such resolution floor.
+    col = np.radians(50.0)
+    rng = np.random.default_rng(0)
+    t = rng.uniform(-1.4, 1.4, 20000)
+    v = np.column_stack(
+        [np.sin(col) * np.cos(t), np.sin(col) * np.sin(t), np.cos(col) * np.ones_like(t)]
+    )
+    v += rng.normal(0, 0.02, v.shape)
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+    v *= np.sign(v[:, 0:1])
+    v /= np.linalg.norm(v, axis=1, keepdims=True)
+
+    pts = trace_manifold_auto(v, n_points=20, angular_step_deg=6.0)
+
+    # Every sample must sit ON the small circle it was drawn from.
+    drift = np.degrees(np.abs(np.arccos(np.clip(pts[:, 2], -1, 1)) - col))
+    assert np.median(drift) < 1.0, f"walk leaves the ridge: median drift {np.median(drift):.2f} deg"
+    assert drift.max() < 3.0, f"walk leaves the ridge: max drift {drift.max():.2f} deg"
+
+
+def test_trace_manifold_auto_honours_the_requested_spacing():
+    # The perpendicular correction pulls a step back inside the geodesic, so
+    # without the re-prediction pass the achieved spacing came up ~35% short
+    # on a curved ridge; an early version that capped only the per-ITERATION
+    # mean-shift hop (not the total excursion) overshot to 38 deg.
+    v = _curved_ridge(3)
+    pts = trace_manifold_auto(v, n_points=20, angular_step_deg=6.0)
+    spacing = np.degrees(np.arccos(np.clip(np.sum(pts[:-1] * pts[1:], axis=1), -1, 1)))
+    assert spacing.min() > 4.5, f"steps too short: {spacing.min():.2f} deg"
+    assert spacing.max() < 8.0, f"steps too long: {spacing.max():.2f} deg"
+
+
+@pytest.mark.parametrize("k", [3, 4, 5, 6])
+def test_manifold_samplers_all_work_in_k_dimensions(k):
+    # Ridge tracing was capped at K=3 by a Fibonacci 2-sphere grid, and so was
+    # `blob`.  A grid cannot be the fix -- matching 3 deg on S^3 needs ~260k
+    # points and on S^4 ~16M -- so both are now grid-free.
+    v = _curved_ridge(k)
+    for sampler in (
+        lambda: trace_manifold_auto(v, n_points=24, angular_step_deg=8.0),
+        lambda: trace_manifold_blob(v, 24),
+        lambda: trace_manifold_kmeans(v, 24),
+        lambda: trace_manifold_grid(v, 24),
+    ):
+        out = sampler()
+        assert out.shape[1] == k
+        assert out.shape[0] <= 24
+        np.testing.assert_allclose(np.linalg.norm(out, axis=1), 1.0, atol=1e-10)
+        # Every sampler must actually represent the cloud it came from.
+        assert manifold_coverage(v, out)["p90_deg"] < 15.0
+
+
+def test_trace_manifold_auto_beats_a_great_circle_in_high_dimensions():
+    # The concrete claim: in 5-D the walk tracks the curve rather than the
+    # tangent it started on.  A great circle through the same endpoints is the
+    # thing the old grid-snapped walk degenerated into.
+    v = _curved_ridge(5)
+    pts = trace_manifold_auto(v, n_points=30, angular_step_deg=6.0)
+    n = pts.shape[0]
+    a, b = pts[0], pts[-1]
+    # Great-circle interpolation between the same two ends, same count.
+    omega = np.arccos(np.clip(a @ b, -1, 1))
+    frac = np.linspace(0, 1, n)[:, None]
+    chord = (np.sin((1 - frac) * omega) * a + np.sin(frac * omega) * b) / np.sin(omega)
+    chord /= np.linalg.norm(chord, axis=1, keepdims=True)
+
+    walked = manifold_coverage(v, pts)["median_deg"]
+    straight = manifold_coverage(v, chord)["median_deg"]
+    assert walked < straight, (
+        f"walk ({walked:.2f} deg) no better than a straight line ({straight:.2f})"
+    )
+
+
+# ---------- gamma fit must not be duration-blind on block designs ------------
+
+
+def test_duration_convolved_gamma_curve_tracks_the_raw_curve():
+    # Regression: the "gamma fit - duration-convolved" QC curve was an
+    # INDEPENDENT bare double-gamma fit of `raw`.  For a 20 s block, `raw` is a
+    # plateau that an impulse-response family cannot make, so every fit
+    # saturated (a1 pinned at its upper bound 12.0 in every case measured, c
+    # slammed to a bound) and manufactured excursions to -0.48 where the raw
+    # cubic reached -0.13.  It is now the boxcar fit pushed back through the
+    # boxcar, so it must track the curve it is drawn against.
+    rng = np.random.default_rng(3)
+    lag = np.arange(0, 36, 2.0)
+    t_fine = np.arange(0, 36, 0.1)
+    n_box = 200  # 20 s at dt=0.1
+    n = 2000
+    lat = rng.uniform(4, 7, n)
+    wid = rng.uniform(0.8, 1.6, n)
+    cs = rng.uniform(0.05, 0.35, n)
+    rows = []
+    for i in range(n):
+        imp = gamma.pdf(t_fine, lat[i] / wid[i], scale=wid[i]) - cs[i] * gamma.pdf(
+            t_fine, 16.0, scale=1.0
+        )
+        blk = np.convolve(imp, np.ones(n_box))[: t_fine.size]
+        rows.append(np.interp(lag, t_fine, blk / np.abs(blk).max()))
+    betas = np.array(rows) + rng.normal(0, 0.02, (n, lag.size))
+
+    res = derive_library(
+        betas,
+        np.full(n, 0.5),
+        lag,
+        n_pcs=3,
+        n_hrfs=20,
+        fit_gamma=True,
+        deconvolve_duration=20.0,
+        deconv_method="fit",
+        r2_threshold=0.0,
+    )
+
+    assert res.fitted is not None and res.fitted_deconvolved is not None
+    r = np.array([np.corrcoef(res.raw[i], res.fitted[i])[0, 1] for i in range(res.raw.shape[0])])
+    assert r.min() > 0.99, f"duration-convolved gamma curve does not track raw: r={r.min():.4f}"
+    # And it must not invent an excursion the raw curve does not have.
+    assert res.fitted.min() > res.raw.min() - 0.05
+
+    # The impulse fit itself must not be sitting on the a1 bound.
+    a1 = np.array([p["a1"] for p in res.gamma_params_deconvolved])
+    assert (a1 < 11.99).any(), "every boxcar fit pinned at the a1 upper bound"
