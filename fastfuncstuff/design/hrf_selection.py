@@ -242,11 +242,9 @@ def _evaluate_hrfs_batched(
       Exact and cheap (O(n_voxels × n_designs) memory).
 
     **Split-half / k-fold** (timepoints in multiple test folds):
-      Accumulate predicted timeseries (sum_yhat) across folds → divide by
-      per-timepoint count → compute R² from averaged predictions.
-      Matches GLMdenoise/compute_xval_r2 "slow" path, avoids the
-      prediction-variance bias that makes all HRFs look equally bad.
-      Memory: O(n_designs × chunk × n_timepoints) per voxel chunk.
+      Accumulate per-run sufficient statistics, average fold betas for each
+      held-out run, then predict every run once. This is algebraically identical
+      to averaging full predictions without repeatedly streaming the dataset.
 
     Parameters
     ----------
@@ -285,6 +283,8 @@ def _evaluate_hrfs_batched(
             device=device,
             operation="hrf_xval",
             n_designs=n_designs,
+            n_runs=len(run_starts),
+            n_splits=n_splits,
         )
 
     # Pre-slice data by runs (views, no copy)
@@ -459,35 +459,18 @@ def _evaluate_hrfs_batched(
     # --- Path B follows (guard clause above returned for LORO) ---------------
     # This is an intentional early-return guard rather than a giant else-block.
     # =========================================================================
-    # Path B: Split-half / k-fold -- prediction averaging (chunk-outer).
+    # Path B: Split-half / k-fold -- prediction averaging via sufficient stats.
     #
-    # For split-half each timepoint appears in ~n_splits/2 test folds.
-    # Averaging predictions across folds before computing R² removes the
-    # between-fold beta variance, which otherwise swamps the small R² differences
-    # between neighbouring HRFs and makes all curves look flat/negative.
-    #
-    # Precompute all fold x design pseudoinverses (tiny matrices, ~30-100 MB)
-    # so the inner chunk loop only does cheap matmuls.
+    # Prediction is linear in beta. Average the fold betas for every run first,
+    # then predict that run once. This is exactly the same as averaging its
+    # predictions, without rereading half the dataset for every fold.
     # =========================================================================
-
-    # Per-timepoint test count (for averaging).
-    count_per_tp = n_test_per_tp.float()
 
     # Warn when n_train < n_test (training set smaller than test set).
     # Having more test data than training data is an unusual split that increases
-    # beta variance per fold.  For HRF shapes far from the true BOLD response (e.g.
-    # slow purely-positive HRFs at the library extremes whose design columns lose
-    # energy to polynomial projection, or early-peak HRFs mismatched to the true
-    # response), a handful of folds can produce sign-flipped betas that dominate the
-    # prediction average → very negative R² for those specific HRFs.  LORO is immune
-    # because each TP is tested once (Path A: SS_res accumulation).
-    #
-    # TODO: investigate further — empirically observed with 9 runs / strategy=0.5
-    # (HRFs 4 and 17-19, 0-indexed) but NOT for HRFs 0-3 (even earlier peaks).
-    # Mechanism: fewer training runs → lower effective SNR for wrong-HRF designs →
-    # sign-flipping OLS betas in specific folds → averaged prediction anti-correlated
-    # with data.  Worth testing with other datasets to characterise the threshold.
-    # Rule of thumb that has worked: cv_strategy >= 5/n_runs (e.g. 0.6 for 9 runs).
+    # beta variance per fold. For HRF shapes far from the true BOLD response, a
+    # handful of folds can produce sign-flipped betas that dominate the prediction
+    # average and produce very negative R² for those specific HRFs.
     n_train_per_fold = len(cv_splits[0][0])
     n_test_per_fold = len(cv_splits[0][1])
     n_total_runs = n_train_per_fold + n_test_per_fold
@@ -506,27 +489,39 @@ def _evaluate_hrfs_batched(
         warnings.warn(msg, stacklevel=4)
 
     if verbose:
-        print(f"  Precomputing {n_splits} x {n_designs} pseudoinverses for split-half CV...")
-    all_pinvs: list[list[torch.Tensor]] = []
-    for _fold_idx, (train_runs, _) in enumerate(cv_splits):
-        pinvs_fold = []
-        for d_idx in range(n_designs):
-            X_train = torch.cat([designs_by_run[d_idx][r] for r in train_runs], dim=0).to(device)
-            pinv_X = _pinv_for_compute(X_train, device)
-            pinvs_fold.append(pinv_X)
-        all_pinvs.append(pinvs_fold)
+        print(f"  Planning {n_splits} split-half folds from per-run sufficient statistics...")
 
-    # Compute chunk_size that keeps sum_yhat (n_designs x chunk x n_tp) in GPU memory.
-    if device.type == "cuda":
-        try:
-            free_mem = torch.cuda.mem_get_info()[0]
-            bytes_per_vox = n_designs * n_timepoints * 4
-            split_chunk = max(100, int(free_mem * 0.4 / bytes_per_vox))
-        except Exception:
-            split_chunk = chunk_size or n_voxels
-        chunk_size = min(chunk_size or n_voxels, split_chunk)
-    elif chunk_size is None:
-        chunk_size = n_voxels
+    n_reg = projected_designs[0].shape[1]
+    designs_stack_by_run = [
+        torch.stack([designs_by_run[d][r] for d in range(n_designs)], dim=0).to(device)
+        for r in range(n_runs)
+    ]
+    xtx_by_run = torch.stack(
+        [
+            torch.matmul(stack.transpose(1, 2).double(), stack.double())
+            for stack in designs_stack_by_run
+        ],
+        dim=0,
+    )  # (run, design, reg, reg)
+
+    train_membership = torch.zeros(n_splits, n_runs, dtype=torch.float64, device=device)
+    test_membership = torch.zeros(n_splits, n_runs, dtype=torch.float32, device=device)
+    for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
+        train_membership[fold_idx, train_runs] = 1.0
+        test_membership[fold_idx, test_runs] = 1.0
+
+    xtx_train = torch.einsum("fr,rdpq->fdpq", train_membership, xtx_by_run)
+    # These matrices are tiny; CPU float64 is robust and avoids MPS fallback.
+    pinv_xtx = torch.linalg.pinv(xtx_train.cpu()).to(device)
+    del xtx_train
+
+    test_count_by_run = test_membership.sum(dim=0)
+    if bool((test_count_by_run == 0).any()):
+        missing_runs = torch.where(test_count_by_run == 0)[0].tolist()
+        raise ValueError(
+            "CV splits never test run(s) "
+            f"{missing_runs}; increase -n_perms so every run receives a prediction"
+        )
 
     output_device = device if data_on_device else torch.device("cpu")
     r2_out = torch.zeros(n_voxels, n_designs, device=output_device)
@@ -539,43 +534,72 @@ def _evaluate_hrfs_batched(
         ce = min(cs + chunk_size, n_voxels)
         chunk_len = ce - cs
 
-        # Prediction accumulator: (n_designs, chunk, n_tp) on device.
-        sum_yhat = torch.zeros(n_designs, chunk_len, n_timepoints, device=device)
+        # One X'Y contraction per run. Fold training statistics are then just a
+        # matrix multiplication by the fold/run membership matrix.
+        xty_by_run = []
+        for r in range(n_runs):
+            y_run = data_by_run[r][cs:ce].to(device)
+            xty_by_run.append(
+                torch.matmul(designs_stack_by_run[r].transpose(1, 2).double(), y_run.T.double())
+            )
+            del y_run
+        xty_by_run_t = torch.stack(xty_by_run, dim=0)  # (run, design, reg, chunk)
+        xty_train = torch.matmul(
+            train_membership,
+            xty_by_run_t.reshape(n_runs, -1),
+        ).reshape(n_splits, n_designs, n_reg, chunk_len)
+        fold_betas = torch.matmul(pinv_xtx, xty_train).float()
 
-        for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
-            train_chunk = torch.cat([data_by_run[r][cs:ce] for r in train_runs], dim=1)
-            if not data_on_device:
-                train_chunk = train_chunk.to(device)
+        # For a run, X @ mean(beta) is identical to mean(X @ beta). Collapse
+        # all folds here so every held-out run is predicted exactly once.
+        mean_betas_by_run = torch.matmul(
+            test_membership.T,
+            fold_betas.reshape(n_splits, -1),
+        ).reshape(n_runs, n_designs, n_reg, chunk_len)
+        mean_betas_by_run /= test_count_by_run[:, None, None, None]
 
-            for d_idx in range(n_designs):
-                betas = all_pinvs[fold_idx][d_idx] @ train_chunk.T  # (n_stim, chunk)
+        sum_ss_res = torch.zeros(chunk_len, n_designs, device=device)
+        sum_pred = torch.zeros_like(sum_ss_res) if metric in ("corr", "corr2") else None
+        sum_pred2 = torch.zeros_like(sum_ss_res) if metric in ("corr", "corr2") else None
+        sum_data_pred = torch.zeros_like(sum_ss_res) if metric in ("corr", "corr2") else None
 
-                # Accumulate per test run using contiguous slices.
-                for r in test_runs:
-                    r_start, r_end = run_starts[r], run_ends[r]
-                    test_design_r = designs_by_run[d_idx][r].to(device)
-                    yhat_r = (test_design_r @ betas).T  # (chunk, T_r)
-                    sum_yhat[d_idx, :, r_start:r_end] += yhat_r
+        for r in range(n_runs):
+            y_run = data_by_run[r][cs:ce].to(device)
+            yhat = torch.matmul(
+                designs_stack_by_run[r], mean_betas_by_run[r]
+            )  # (design, time, chunk)
+            y_run_t = y_run.T.unsqueeze(0)
+            resid = yhat - y_run_t
+            sum_ss_res += (resid * resid).sum(dim=1).T
+            if sum_pred is not None and sum_pred2 is not None and sum_data_pred is not None:
+                sum_pred += yhat.sum(dim=1).T
+                sum_pred2 += (yhat * yhat).sum(dim=1).T
+                sum_data_pred += (yhat * y_run_t).sum(dim=1).T
+            del y_run, yhat, y_run_t, resid
 
-            del train_chunk
-
-        # R2 from averaged predictions.
-        data_chunk = projected_data[cs:ce]
-        if not data_on_device:
-            data_chunk = data_chunk.to(device)
-        count_d = count_per_tp.to(device)
         ss_tot_chunk = ss_tot_global[cs:ce].to(device)
+        if metric == "cod":
+            scores = 1.0 - sum_ss_res / ss_tot_chunk.unsqueeze(1)
+        elif metric in ("corr", "corr2"):
+            assert sum_pred is not None and sum_pred2 is not None and sum_data_pred is not None
+            sum_data = sum_y_all[cs:ce].to(device).unsqueeze(1)
+            cov = sum_data_pred - sum_data * sum_pred / n_timepoints
+            var_pred = sum_pred2 - sum_pred * sum_pred / n_timepoints
+            corr = cov / (
+                torch.sqrt(ss_tot_chunk.clamp(min=0)).unsqueeze(1)
+                * torch.sqrt(var_pred.clamp(min=0))
+                + 1e-10
+            )
+            scores = corr * corr if metric == "corr2" else corr
+        else:
+            raise ValueError(f"Unknown metric {metric!r}; choose 'cod', 'corr', or 'corr2'")
+        r2_out[cs:ce] = scores.to(output_device)
 
-        for d_idx in range(n_designs):
-            avg_yhat_d = sum_yhat[d_idx] / count_d  # (chunk, n_tp)
-            ss_res = ((data_chunk - avg_yhat_d) ** 2).sum(dim=1)
-            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).to(output_device)
-
-        del sum_yhat, data_chunk
+        del xty_by_run, xty_by_run_t, xty_train, fold_betas, mean_betas_by_run
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    del all_pinvs
+    del designs_stack_by_run, xtx_by_run, pinv_xtx
     return r2_out.cpu()
 
 
@@ -1065,7 +1089,15 @@ def fit_glm_hrf_library_with_xval(
     else:
         projected_data = torch.zeros_like(data)
         n_chunks = (n_voxels + effective_chunk_size - 1) // effective_chunk_size
-        for chunk_idx in range(n_chunks):
+        projection_chunks = range(n_chunks)
+        if verbose:
+            projection_chunks = tqdm(
+                projection_chunks,
+                total=n_chunks,
+                desc="Nuisance projection",
+                disable=n_chunks <= 1,
+            )
+        for chunk_idx in projection_chunks:
             cs = chunk_idx * effective_chunk_size
             ce = min(cs + effective_chunk_size, n_voxels)
             for run_idx in range(n_runs):
@@ -1107,7 +1139,12 @@ def fit_glm_hrf_library_with_xval(
         print("Pre-computing projected designs for all HRFs...")
 
     all_projected_designs = []
-    for hrf_idx in range(n_hrfs):
+    hrf_indices = tqdm(
+        range(n_hrfs),
+        desc="HRF designs",
+        disable=not verbose or n_hrfs <= 1,
+    )
+    for hrf_idx in hrf_indices:
         hrf = hrf_library[hrf_idx]
         stim_design = _event_safe_design(hrf)
         stim_design = _append_stim_vec_columns(

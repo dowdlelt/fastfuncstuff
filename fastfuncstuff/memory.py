@@ -353,6 +353,8 @@ def bytes_per_voxel_hrf_xval(
     n_timepoints: int,
     n_regressors: int,
     n_designs: int,
+    n_runs: int = 1,
+    n_splits: int = 1,
 ) -> int:
     """Conservative working memory for HRF-library cross-validation.
 
@@ -361,7 +363,14 @@ def bytes_per_voxel_hrf_xval(
     case makes both paths safe. The extra three time-series terms cover input
     data, residual/reduction temporaries, and output statistics.
     """
-    return (n_designs * (n_timepoints + n_regressors) + 3 * n_timepoints) * 4
+    prediction_bound = (n_designs * (n_timepoints + n_regressors) + 3 * n_timepoints) * 4
+    # Split-half keeps float64 X'Y statistics for every run and fold, then
+    # float32 fold/mean betas. This replaces the full-timeseries prediction
+    # accumulator and matters when there are many runs or stimulus columns.
+    sufficient_stats_bound = (
+        12 * (n_runs + n_splits) * n_designs * n_regressors + 3 * n_timepoints * 4
+    )
+    return max(prediction_bound, sufficient_stats_bound)
 
 
 def bytes_per_voxel_prf(
@@ -1388,6 +1397,8 @@ def estimate_chunk_size(
     n_fractions: int = 100,
     n_trials: int = 1,
     n_designs: int = 1,
+    n_runs: int = 1,
+    n_splits: int = 1,
     verbose: bool = False,
 ) -> int:
     """
@@ -1471,7 +1482,9 @@ def estimate_chunk_size(
     elif operation == "xval":
         bytes_per_voxel = bytes_per_voxel_xval(n_timepoints, n_regressors)
     elif operation == "hrf_xval":
-        bytes_per_voxel = bytes_per_voxel_hrf_xval(n_timepoints, n_regressors, n_designs)
+        bytes_per_voxel = bytes_per_voxel_hrf_xval(
+            n_timepoints, n_regressors, n_designs, n_runs=n_runs, n_splits=n_splits
+        )
     elif operation == "ridge":
         bytes_per_voxel = bytes_per_voxel_ridge(
             n_timepoints,

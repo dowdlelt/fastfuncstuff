@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 from itertools import combinations
+from math import comb
 
 import numpy as np
 import torch
@@ -331,21 +332,7 @@ def generate_cv_splits(
                 f"n_train={n_train} (must be > 0 and < n_runs)"
             )
 
-        # Generate all possible combinations
-        all_splits = []
-        for train_runs in combinations(run_indices, n_train):
-            train_runs = list(train_runs)
-            test_runs = [r for r in run_indices if r not in train_runs]
-            all_splits.append((train_runs, test_runs))
-
-        # If we have more combinations than requested, sample randomly
-        if len(all_splits) > n_perms:
-            import random
-
-            random.seed(42)  # Reproducible
-            all_splits = random.sample(all_splits, n_perms)
-
-        return all_splits
+        return _sample_run_splits(run_indices, n_train, n_perms)
 
     elif isinstance(strategy, int):
         # Leave-N-out
@@ -353,24 +340,56 @@ def generate_cv_splits(
         if n_test <= 0 or n_test >= n_runs:
             raise ValueError(f"strategy={strategy} must be > 0 and < n_runs={n_runs}")
 
-        # Generate all possible test sets
-        all_splits = []
-        for test_runs in combinations(run_indices, n_test):
-            test_runs = list(test_runs)
-            train_runs = [r for r in run_indices if r not in test_runs]
-            all_splits.append((train_runs, test_runs))
-
-        # If we have more combinations than requested, sample randomly
-        if len(all_splits) > n_perms:
-            import random
-
-            random.seed(42)  # Reproducible
-            all_splits = random.sample(all_splits, n_perms)
-
-        return all_splits
+        # The helper samples training sets, so use the complementary size here.
+        return _sample_run_splits(run_indices, n_runs - n_test, n_perms)
 
     else:
         raise ValueError(f"strategy must be float or int, got {type(strategy)}")
+
+
+def _sample_run_splits(
+    run_indices: list[int],
+    n_train: int,
+    n_perms: int,
+) -> list[tuple[list[int], list[int]]]:
+    """Enumerate small split spaces and sample large ones without materialising them."""
+    import random
+
+    n_possible = comb(len(run_indices), n_train)
+    if n_possible <= n_perms:
+        train_sets = list(combinations(run_indices, n_train))
+    else:
+        # Rejection sampling is effectively collision-free for the large spaces
+        # that motivated this branch (e.g. C(100, 50) ~= 1e29). It also remains
+        # cheap near the boundary: at worst n_perms unique draws from a space of
+        # n_perms + 1 possibilities.
+        rng = random.Random(42)
+        sampled: set[tuple[int, ...]] = set()
+        n_runs = len(run_indices)
+        n_test = n_runs - n_train
+        coverage_possible = n_perms * n_train >= n_runs and n_perms * n_test >= n_runs
+        if coverage_possible:
+            # Seed the sample with the minimum number of balanced cyclic splits.
+            # For a 50/50 split and n_perms=2 these are exact complements, so
+            # every run is tested once rather than relying on an astronomically
+            # unlikely random complementary draw.
+            shuffled = list(run_indices)
+            rng.shuffle(shuffled)
+            n_coverage = max(
+                (n_runs + n_train - 1) // n_train,
+                (n_runs + n_test - 1) // n_test,
+            )
+            for split_idx in range(n_coverage):
+                start = split_idx * n_train
+                sampled.add(
+                    tuple(sorted(shuffled[(start + offset) % n_runs] for offset in range(n_train)))
+                )
+        while len(sampled) < n_perms:
+            sampled.add(tuple(sorted(rng.sample(run_indices, n_train))))
+        train_sets = sorted(sampled)
+
+    all_runs = set(run_indices)
+    return [(list(train), sorted(all_runs.difference(train))) for train in train_sets]
 
 
 def slice_by_runs(

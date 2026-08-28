@@ -1241,3 +1241,45 @@ def test_evaluate_hrfs_batched_per_run_matches_legacy(
     legacy = _evaluate_hrfs_batched(**kwargs)
 
     assert torch.abs(fast - legacy).max() < 1e-4
+
+
+@pytest.mark.parametrize("metric", ["cod", "corr", "corr2"])
+def test_split_half_sufficient_stats_matches_explicit_prediction_average(metric):
+    """Averaging held-out betas per run must equal averaging full predictions."""
+    from fastfuncstuff.design.hrf_selection import _evaluate_hrfs_batched
+    from fastfuncstuff.glm.xval import compute_r2_metric, generate_cv_splits
+
+    data, designs, run_starts = _hrf_batched_case(n_designs=3)
+    splits = generate_cv_splits(len(run_starts), strategy=0.6, n_perms=5)
+    actual = _evaluate_hrfs_batched(
+        projected_data=data,
+        projected_designs=designs,
+        run_starts=run_starts,
+        cv_splits=splits,
+        device=torch.device("cpu"),
+        metric=metric,
+        chunk_size=19,
+        verbose=False,
+    )
+
+    run_ends = run_starts[1:] + [data.shape[1]]
+    expected = []
+    for design in designs:
+        prediction_sum = torch.zeros_like(data)
+        prediction_count = torch.zeros(data.shape[1])
+        for train_runs, test_runs in splits:
+            train_design = torch.cat(
+                [design[run_starts[r] : run_ends[r]] for r in train_runs], dim=0
+            )
+            train_data = torch.cat(
+                [data[:, run_starts[r] : run_ends[r]] for r in train_runs], dim=1
+            )
+            betas = torch.linalg.pinv(train_design) @ train_data.T
+            for r in test_runs:
+                rs, re = run_starts[r], run_ends[r]
+                prediction_sum[:, rs:re] += (design[rs:re] @ betas).T
+                prediction_count[rs:re] += 1
+        expected.append(compute_r2_metric(data, prediction_sum / prediction_count, metric))
+
+    expected_t = torch.stack(expected, dim=1)
+    assert torch.allclose(actual, expected_t, atol=1e-4, rtol=1e-4)

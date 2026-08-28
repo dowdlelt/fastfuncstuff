@@ -52,6 +52,22 @@ class TestGenerateCvSplits:
             assert len(train) == 3  # 60% of 5 = 3
             assert len(test) == 2
 
+    def test_hundred_run_split_half_samples_directly_with_full_coverage(self):
+        """Large split spaces must be sampled, not materialised combinatorially."""
+        splits = generate_cv_splits(n_runs=100, strategy=0.5, n_perms=100)
+        assert len(splits) == 100
+        assert len({tuple(train) for train, _ in splits}) == 100
+        assert all(len(train) == 50 and len(test) == 50 for train, test in splits)
+        assert set().union(*(set(train) for train, _ in splits)) == set(range(100))
+        assert set().union(*(set(test) for _, test in splits)) == set(range(100))
+
+    def test_two_split_halves_are_complementary(self):
+        """Two folds should give each run one train and one test appearance."""
+        splits = generate_cv_splits(n_runs=100, strategy=0.5, n_perms=2)
+        assert len(splits) == 2
+        assert set(splits[0][0]) == set(splits[1][1])
+        assert set(splits[0][1]) == set(splits[1][0])
+
 
 class TestComputeR2Metric:
     @pytest.fixture

@@ -155,6 +155,9 @@ def test_hrf_xval_memory_scales_with_library_size():
     assert library > small
     assert library == (20 * (300 + 20) + 3 * 300) * 4
 
+    many_runs = bytes_per_voxel_hrf_xval(300, 20, 20, n_runs=100, n_splits=100)
+    assert many_runs > library
+
 
 class TestGlobalConfig:
     """Tests for global configuration management."""
