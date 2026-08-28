@@ -1965,18 +1965,19 @@ def derive_library(
 
         - ``"auto"`` — 1-D density ridge (:func:`trace_manifold_auto`),
           NSD's model of HRF variation.  Ordered, adjacent entries are
-          similar.  Falls back to ``"kmeans"`` when ``n_pcs != 3``.
-        - ``"blob"`` — even 2-D coverage of the blob's support
-          (:func:`trace_manifold_blob`).
-        - ``"kmeans"`` — 2-D coverage weighted by voxel density
+          similar.  Any K.
+        - ``"blob"`` — even coverage of the density region's support
+          (:func:`trace_manifold_blob`).  Any K.
+        - ``"kmeans"`` — coverage weighted by voxel density
           (:func:`trace_manifold_kmeans`); minimizes expected shape
           mismatch.  Any K.
         - ``"grid"`` — 1-D ordering along the first PCA axis (a legacy
           name; not actually a grid).
         - ``"points"`` — user-supplied, requires ``manifold_points``.
 
-        The 2-D modes drop the "neighbouring index ⇒ similar HRF"
-        property; check ``LibraryResult.coverage`` to see what they buy.
+        The region-filling modes drop the "neighbouring index ⇒ similar
+        HRF" property; check ``LibraryResult.coverage`` to see what they
+        buy.
     density_floor_frac : float, default 0.05
         ``manifold_mode="blob"`` only — fraction of peak KDE density that
         still counts as inside the blob.
