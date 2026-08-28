@@ -51,6 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.interpolate import PchipInterpolator
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
@@ -84,6 +85,7 @@ try:
         crossval_n_pcs,
         derive_library,
         select_library_voxels,
+        smooth_with_penalized_spline,
         stack_subject_betas,
         svd_decompose,
     )
@@ -1522,22 +1524,62 @@ def derive_and_write_library(
 
     write_tsv(raw_path, lib.raw)
     print(f"    Wrote {raw_path}   [duration-convolved cubic recon]")
-    # Carry the lag grid in a comment header.  The PCs are sampled at the FIR
-    # lag spacing, not the 0.1 s the library files use, and without the times
-    # a consumer cannot resample them onto its own grid -- it has to guess the
-    # TR.  np.loadtxt skips '#' by default, so this stays readable by anything
-    # already parsing the file.
+    # Write the PCs on the SAME fine grid as every other curve file here.
+    # The SVD produces them at the FIR lag spacing (18 samples at TR=2s, say),
+    # which made this the one output a consumer had to resample -- and it could
+    # not, because the file carried no time axis.  PCHIP onto target_dt matches
+    # what reconstruct_timecourses does to lift manifold points off the same
+    # grid: monotonic, and it does not ring past the last lag the way a natural
+    # cubic spline does.  The header states the sampling either way.
+    target_dt = float(lib.target_times[1] - lib.target_times[0])
+    pcs_fine = np.stack(
+        [
+            PchipInterpolator(lag_times, lib.svd.pcs[k])(
+                np.clip(lib.target_times, lag_times[0], lag_times[-1])
+            )
+            for k in range(lib.svd.pcs.shape[0])
+        ]
+    )
     np.savetxt(
         pcs_path,
-        lib.svd.pcs.T,
+        pcs_fine.T,
         fmt="%.10g",
         delimiter="\t",
         header=(
-            "ffs_librarian temporal PCs — rows = lag samples, columns = PCs\n"
-            "lag_times_s: " + " ".join(f"{x:g}" for x in lag_times)
+            "ffs_librarian temporal PCs — rows = time samples, columns = PCs\n"
+            f"dt_s: {target_dt:g}\n"
+            f"n_samples: {pcs_fine.shape[1]}\n"
+            "resampled from the FIR lag grid by PCHIP: " + " ".join(f"{x:g}" for x in lag_times)
         ),
     )
-    print(f"    Wrote {pcs_path}")
+    print(f"    Wrote {pcs_path}   [PCHIP recon of the FIR-grid PCs]")
+
+    # A penalized-spline version alongside the raw one.  PCHIP interpolates --
+    # it passes exactly through the FIR-grid samples, noise included -- so the
+    # fine-grid curve is as rough as the estimate it came from.  A downstream
+    # basis wants the smooth version; anyone checking what the SVD actually
+    # produced wants the raw one.  Both, then, and the caller picks.
+    pcs_smooth = np.stack(
+        [
+            smooth_with_penalized_spline(pcs_fine[k], dt=target_dt, n_knots=args.spline_knots)[0]
+            for k in range(pcs_fine.shape[0])
+        ]
+    )
+    pcs_smooth_path = Path(f"{args.prefix}{gtag}_pcs_smooth.tsv")
+    np.savetxt(
+        pcs_smooth_path,
+        pcs_smooth.T,
+        fmt="%.10g",
+        delimiter="\t",
+        header=(
+            "ffs_librarian temporal PCs, penalized-spline smoothed — "
+            "rows = time samples, columns = PCs\n"
+            f"dt_s: {target_dt:g}\n"
+            f"n_samples: {pcs_smooth.shape[1]}\n"
+            f"smoothing weight per PC chosen by GCV; n_knots={args.spline_knots}"
+        ),
+    )
+    print(f"    Wrote {pcs_smooth_path}   [penalized-spline smoothed]")
 
     if lib.raw_deconvolved is not None:
         raw_imp_path = Path(f"{args.prefix}{gtag}_hrfraw_imp.tsv")

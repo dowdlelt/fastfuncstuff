@@ -1731,6 +1731,45 @@ def _penalized_ls_gcv(
     return best[1], best[2], best[3]
 
 
+def smooth_with_penalized_spline(
+    curve: np.ndarray,
+    dt: float = 0.1,
+    n_knots: int = 12,
+    degree: int = 3,
+    lambdas: np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Penalized-spline smooth of an arbitrary curve, weight chosen by GCV.
+
+    The bare smoother behind :func:`fit_spline_through_boxcar`, without any of
+    that function's HRF-specific machinery -- no boxcar in the model, no peak
+    normalization, and no "the positive lobe must dominate" check.  All three
+    are wrong for a PC.  Peak normalization is meaningless for an orthonormal
+    basis vector, and a PC's SIGN is arbitrary, so a validity test keyed on
+    the positive lobe rejects a curve on a coin flip: on a real 3-PC set, PC3
+    passes as written and fails negated.
+
+    Returns ``(smoothed, params)`` with ``lambda`` and ``edof`` in the dict.
+    Falls back to the input curve unchanged if the solve fails.
+    """
+    from fastfuncstuff.design.matrices import make_penalty_matrix
+
+    n = curve.size
+    if lambdas is None:
+        lambdas = np.logspace(-6, 4, 40)
+    try:
+        basis = _bspline_basis(n, dt, n_knots, degree)
+        penalty = make_penalty_matrix(basis.shape[1], order=2)
+        beta, lam, edof = _penalized_ls_gcv(basis, curve, penalty, lambdas)
+        return basis @ beta, {"lambda": float(lam), "edof": float(edof), "fit_ok": True}
+    except Exception as exc:  # noqa: BLE001 — caller keeps the raw curve
+        return curve.copy(), {
+            "lambda": float("nan"),
+            "edof": float("nan"),
+            "fit_ok": False,
+            "error": repr(exc),
+        }
+
+
 def fit_spline_through_boxcar(
     timecourse: np.ndarray,
     duration: float,

@@ -435,6 +435,13 @@ def create_parser() -> argparse.ArgumentParser:
             "    glmsingle   the GLMsingle single curve\n"
             "    FILE        one column of numbers sampled at -flobs-dt, "
             "e.g. a subject- or ROI-level curve from ffs_hrfopt\n"
+            "  A JOINT BASIS, all columns fitted together:\n"
+            "    pcs         the data-derived temporal PCs from\n"
+            "                ffs_librarian (-hrf-pcs FILE).  Same\n"
+            "                shape of model as SPMG3, but the columns\n"
+            "                come from YOUR data instead of being a\n"
+            "                canonical curve and its derivatives, so\n"
+            "                -derivatives does not apply.\n"
             "  A SET, selected PER VOXEL (see -hrf-select):\n"
             "    library     the 20 double-gammas ffs_hrfopt uses\n"
             "    pighs       half-cosine curves stratified over peak time\n"
@@ -444,6 +451,30 @@ def create_parser() -> argparse.ArgumentParser:
             "encode each CONDITION's departure from a curve that already fits "
             "that voxel, instead of spending themselves correcting a wrong "
             "average shape."
+        ),
+    )
+    hrf_grp.add_argument(
+        "-hrf-pcs",
+        "-hrf_pcs",
+        dest="hrf_pcs",
+        default=None,
+        metavar="TSV",
+        help=(
+            "Required by -hrf pcs.  Prefer ffs_librarian's\n"
+            "{prefix}_pcs_smooth.tsv -- the penalized-spline version,\n"
+            "which is what behaves as a basis.  {prefix}_pcs.tsv also\n"
+            "works but interpolates the FIR-grid estimate exactly, so\n"
+            "it carries that estimate's noise.\n"
+            "\n"
+            "Rows are time samples, columns are PCs; the sampling is\n"
+            "read from the file header and the curves are resampled\n"
+            "onto -flobs-dt / -flobs-window.\n"
+            "\n"
+            "Fitting these jointly is how you find out whether K\n"
+            "data-derived components beat a canonical HRF plus\n"
+            "derivatives on HELD-OUT data — which is the question\n"
+            "ffs_librarian's own -crossval-pcs cannot answer, since\n"
+            "it only scores reconstruction of the FIR betas."
         ),
     )
     hrf_grp.add_argument(
@@ -1301,6 +1332,78 @@ def _shape_summary(args) -> str:
     return f"{shape}, {extra}"
 
 
+def _load_pc_basis(path: str, dt: float, duration: float) -> np.ndarray:
+    """Load ffs_librarian temporal PCs as a joint basis, resampled to ``dt``.
+
+    The file is ``{prefix}_pcs.tsv``: rows are time samples, columns are PCs,
+    and a ``#`` header states the sampling -- ``dt_s`` for current files, which
+    ffs_librarian writes on the same 0.1 s grid as its library TSVs, or
+    ``lag_times_s`` for the brief period they were written on the raw FIR lag
+    grid.  Files predating both headers fall back to assuming the samples span
+    ``duration`` evenly, which is right whenever the FIR window and
+    ``-flobs-window`` agree, and is stated when it happens.
+
+    PCHIP for the resampling, matching what ffs_librarian itself uses to lift
+    manifold points off the lag grid: it is monotonic and does not overshoot,
+    where a natural cubic spline rings past the last lag.
+    """
+    from scipy.interpolate import PchipInterpolator
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"-hrf-pcs file not found: {p}")
+
+    # _pcs.tsv is a PCHIP interpolation of the FIR-grid PCs, so it passes
+    # exactly through the estimated samples -- noise included -- and arrives
+    # here as rough as the estimate was.  _pcs_smooth.tsv is the penalized
+    # spline version, which is what a basis wants.  Point at it rather than
+    # switching silently: which file was asked for is the user's business.
+    if p.name.endswith("_pcs.tsv"):
+        smooth = p.with_name(p.name.replace("_pcs.tsv", "_pcs_smooth.tsv"))
+        if smooth.exists():
+            print(
+                f"  NOTE: {smooth.name} sits beside this file.  It is the "
+                f"penalized-spline\n        version of the same PCs and is "
+                f"the better basis; {p.name} interpolates\n        the FIR-grid "
+                f"estimate exactly, noise and all."
+            )
+
+    src_dt = None
+    lag_times = None
+    for line in p.read_text().splitlines():
+        if not line.startswith("#"):
+            break
+        if "dt_s:" in line:
+            src_dt = float(line.split("dt_s:")[1].split()[0])
+        elif "lag_times_s:" in line:
+            lag_times = np.array([float(x) for x in line.split("lag_times_s:")[1].split()])
+
+    pcs = np.loadtxt(p)
+    if pcs.ndim == 1:
+        pcs = pcs[:, None]
+    n_lag, n_pc = pcs.shape
+
+    if src_dt is not None:
+        lag_times = np.arange(n_lag) * src_dt
+    elif lag_times is None:
+        lag_times = np.linspace(0.0, duration, n_lag)
+        print(
+            f"  NOTE: {p.name} carries no sampling header (written before that "
+            f"was added); assuming its {n_lag} samples span {duration:g}s evenly."
+        )
+    if lag_times.size != n_lag:
+        raise ValueError(
+            f"{p.name}: header lists {lag_times.size} lag times but the file has {n_lag} rows"
+        )
+
+    n_out = int(np.floor(duration / dt)) + 1
+    t_out = np.clip(np.arange(n_out) * dt, lag_times[0], lag_times[-1])
+    basis = np.stack([PchipInterpolator(lag_times, pcs[:, k])(t_out) for k in range(n_pc)])
+
+    norms = np.linalg.norm(basis, axis=1, keepdims=True)
+    return basis / np.where(norms > 1e-12, norms, 1.0)
+
+
 def _build_basis(args) -> FLOBSBasis:
     """Construct the basis FLOBSBasis container from the chosen model."""
     if args.use_flobs:
@@ -1311,6 +1414,25 @@ def _build_basis(args) -> FLOBSBasis:
             dt=args.flobs_dt,
             seed=args.flobs_seed,
         )
+    if str(args.hrf).strip().lower() == "pcs":
+        # A data-derived joint basis: the PCs are fitted TOGETHER, exactly as
+        # SPMG3's three columns are, so this rides the existing multi-basis
+        # path and -derivatives does not apply (the PCs already span the
+        # shape variation the derivatives would approximate).
+        from fastfuncstuff.design.flobs import FLOBSBasis
+
+        G = _load_pc_basis(args.hrf_pcs, args.flobs_dt, args.flobs_window)
+        return FLOBSBasis(
+            basis_functions=G,
+            eigenvalues=np.ones(G.shape[0], dtype=np.float64),
+            m=np.zeros(G.shape[0], dtype=np.float64),
+            C=np.eye(G.shape[0], dtype=np.float64),
+            dt=float(args.flobs_dt),
+            duration=float(args.flobs_window),
+            n_samples=0,
+            parametrization={"derivatives": "pcs", "hrf": f"pcs:{args.hrf_pcs}"},
+        )
+
     n_basis = 1 + {"none": 0, "time": 1, "time+width": 2}[args.derivatives]
     if str(args.hrf).strip().lower() == "canonical":
         # Keep the hand-written SPM path for the default so existing
@@ -2283,6 +2405,12 @@ def main() -> int:
     # ── Validate event input ────────────────────────────────────────
     has_onsets = bool(args.onsets)
     has_events = bool(args.events)
+    if str(args.hrf).strip().lower() == "pcs" and not args.hrf_pcs:
+        print("ERROR: -hrf pcs needs -hrf-pcs FILE (ffs_librarian's {prefix}_pcs.tsv).")
+        return 1
+    if args.hrf_pcs and str(args.hrf).strip().lower() != "pcs":
+        print(f"ERROR: -hrf-pcs given but -hrf is {args.hrf!r}; pass -hrf pcs to use it.")
+        return 1
     if has_onsets == has_events:
         print("ERROR: Specify exactly one of -onsets/-durations or -events.")
         return 1
