@@ -136,3 +136,67 @@ def test_no_note_when_the_smooth_file_is_absent(tmp_path, capsys):
     _write_fine(tmp_path, _native_pcs(), name="sub01_pcs.tsv")
     _load_pc_basis(str(tmp_path / "sub01_pcs.tsv"), 0.1, 34.0)
     assert "pcs_smooth" not in capsys.readouterr().out
+
+
+# ---------- -hrf pcs:N -------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        ("pcs", 0),
+        ("pcs:1", 1),
+        ("pcs:6", 6),
+        ("PCS:3", 3),
+        (" pcs:2 ", 2),
+        ("canonical", None),
+        ("library", None),
+        ("/some/curve.tsv", None),
+    ],
+)
+def test_parse_pcs_spec(spec, expected):
+    from fastfuncstuff.cli.fitbasis import _parse_pcs_spec
+
+    assert _parse_pcs_spec(spec) == expected
+
+
+@pytest.mark.parametrize("spec", ["pcs:0", "pcs:x", "pcs:-1", "pcs:"])
+def test_parse_pcs_spec_rejects_nonsense(spec):
+    from fastfuncstuff.cli.fitbasis import _parse_pcs_spec
+
+    with pytest.raises(ValueError, match="pcs:N"):
+        _parse_pcs_spec(spec)
+
+
+def test_pcs_n_takes_the_leading_columns(tmp_path):
+    # The whole point of :N -- PCs are variance-ordered, so the first N from a
+    # wide file must be bit-identical to what a narrower file would give.  That
+    # is what makes a K sweep against one library run comparable.
+    pcs = _native_pcs(n_pc=6)
+    wide = _write_fine(tmp_path, pcs, name="wide_pcs.tsv")
+    narrow = _write_fine(tmp_path, pcs[:3], name="narrow_pcs.tsv")
+
+    sliced = _load_pc_basis(str(wide), 0.1, 34.0, n_pcs=3)
+    whole = _load_pc_basis(str(narrow), 0.1, 34.0)
+    assert sliced.shape == whole.shape == (3, 341)
+    np.testing.assert_allclose(sliced, whole, atol=1e-12)
+
+
+def test_pcs_n_defaults_to_all(tmp_path):
+    path = _write_fine(tmp_path, _native_pcs(n_pc=6))
+    assert _load_pc_basis(str(path), 0.1, 34.0).shape[0] == 6
+    assert _load_pc_basis(str(path), 0.1, 34.0, n_pcs=None).shape[0] == 6
+
+
+def test_asking_for_more_pcs_than_the_file_holds_raises(tmp_path):
+    path = _write_fine(tmp_path, _native_pcs(n_pc=3))
+    with pytest.raises(ValueError, match="holds only 3 PCs"):
+        _load_pc_basis(str(path), 0.1, 34.0, n_pcs=6)
+
+
+def test_each_sliced_basis_stays_unit_norm(tmp_path):
+    path = _write_fine(tmp_path, _native_pcs(n_pc=6))
+    for k in range(1, 7):
+        basis = _load_pc_basis(str(path), 0.1, 34.0, n_pcs=k)
+        assert basis.shape[0] == k
+        np.testing.assert_allclose(np.linalg.norm(basis, axis=1), 1.0, atol=1e-10)

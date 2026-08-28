@@ -436,12 +436,17 @@ def create_parser() -> argparse.ArgumentParser:
             "    FILE        one column of numbers sampled at -flobs-dt, "
             "e.g. a subject- or ROI-level curve from ffs_hrfopt\n"
             "  A JOINT BASIS, all columns fitted together:\n"
-            "    pcs         the data-derived temporal PCs from\n"
+            "    pcs         data-derived temporal PCs from\n"
             "                ffs_librarian (-hrf-pcs FILE).  Same\n"
-            "                shape of model as SPMG3, but the columns\n"
-            "                come from YOUR data instead of being a\n"
-            "                canonical curve and its derivatives, so\n"
-            "                -derivatives does not apply.\n"
+            "                model shape as SPMG3, but the columns\n"
+            "                come from YOUR data rather than a\n"
+            "                canonical curve and its derivatives,\n"
+            "                so -derivatives does not apply.\n"
+            "    pcs:N       the first N.  PCs are ordered by size,\n"
+            "                so this is the nested subset a smaller\n"
+            "                librarian run gives: one -n-pcs 6 file\n"
+            "                sweeps K=1..6 under -xval-r2.  Bare\n"
+            "                'pcs' means all of them.\n"
             "  A SET, selected PER VOXEL (see -hrf-select):\n"
             "    library     the 20 double-gammas ffs_hrfopt uses\n"
             "    pighs       half-cosine curves stratified over peak time\n"
@@ -1251,6 +1256,31 @@ def _build_prior(
 _HRF_SETS = {"library", "pighs", "flobs"}
 
 
+def _parse_pcs_spec(spec) -> int | None:
+    """``pcs`` / ``pcs:N`` -> how many PCs to use, else None.
+
+    Returns 0 for a bare ``pcs`` meaning "all of them", N for ``pcs:N``.
+    None means the spec is not a PC basis at all, which is how every other
+    ``-hrf`` value keeps its existing path.
+
+    The point of ``:N`` is that the PCs are ordered by variance, so the first
+    N are a nested subset: one ffs_librarian run at -n-pcs 6 then supports
+    testing K = 1..6 here against the same file, and the held-out R2 curve is
+    comparable across K because nothing but the column count changed.
+    """
+    if spec is None:
+        return None
+    key = str(spec).strip().lower()
+    if key == "pcs":
+        return 0
+    if not key.startswith("pcs:"):
+        return None
+    tail = key[4:]
+    if not tail.isdigit() or int(tail) < 1:
+        raise ValueError(f"-hrf {spec!r}: expected pcs:N with N a positive integer")
+    return int(tail)
+
+
 def _hrf_set_name(spec: str | None) -> str | None:
     """The set name in ``-hrf``, or None when it names a single curve.
 
@@ -1319,6 +1349,10 @@ def _shape_summary(args) -> str:
     """
     if args.use_flobs:
         return f"FLOBS ({args.flobs_n_basis} eigen-HRFs)"
+    n_pcs_wanted = _parse_pcs_spec(args.hrf)
+    if n_pcs_wanted is not None:
+        how_many = f"first {n_pcs_wanted}" if n_pcs_wanted else "all"
+        return f"data-derived PCs ({how_many}) from {args.hrf_pcs}, fitted jointly"
     set_name = _hrf_set_name(args.hrf)
     if args.hrf_index:
         shape = f"per-voxel from {args.hrf_index}"
@@ -1332,7 +1366,7 @@ def _shape_summary(args) -> str:
     return f"{shape}, {extra}"
 
 
-def _load_pc_basis(path: str, dt: float, duration: float) -> np.ndarray:
+def _load_pc_basis(path: str, dt: float, duration: float, n_pcs: int | None = None) -> np.ndarray:
     """Load ffs_librarian temporal PCs as a joint basis, resampled to ``dt``.
 
     The file is ``{prefix}_pcs.tsv``: rows are time samples, columns are PCs,
@@ -1346,6 +1380,10 @@ def _load_pc_basis(path: str, dt: float, duration: float) -> np.ndarray:
     PCHIP for the resampling, matching what ffs_librarian itself uses to lift
     manifold points off the lag grid: it is monotonic and does not overshoot,
     where a natural cubic spline rings past the last lag.
+
+    ``n_pcs`` keeps only the leading N columns.  They are ordered by variance,
+    so that is the nested subset a narrower ffs_librarian run would have
+    produced -- one 6-PC file therefore serves a whole K sweep.
     """
     from scipy.interpolate import PchipInterpolator
 
@@ -1396,6 +1434,19 @@ def _load_pc_basis(path: str, dt: float, duration: float) -> np.ndarray:
             f"{p.name}: header lists {lag_times.size} lag times but the file has {n_lag} rows"
         )
 
+    if n_pcs is not None:
+        if n_pcs > n_pc:
+            raise ValueError(
+                f"-hrf pcs:{n_pcs} but {p.name} holds only {n_pc} PC"
+                f"{'s' if n_pc != 1 else ''}; rebuild the library with a larger "
+                f"-n-pcs, or ask for fewer."
+            )
+        # The PCs are variance-ordered, so the first N is the nested subset --
+        # taking them from a wider file is the same basis a narrower run would
+        # have produced, which is what makes a K sweep comparable.
+        pcs = pcs[:, :n_pcs]
+        n_pc = n_pcs
+
     n_out = int(np.floor(duration / dt)) + 1
     t_out = np.clip(np.arange(n_out) * dt, lag_times[0], lag_times[-1])
     basis = np.stack([PchipInterpolator(lag_times, pcs[:, k])(t_out) for k in range(n_pc)])
@@ -1414,14 +1465,17 @@ def _build_basis(args) -> FLOBSBasis:
             dt=args.flobs_dt,
             seed=args.flobs_seed,
         )
-    if str(args.hrf).strip().lower() == "pcs":
+    n_pcs_wanted = _parse_pcs_spec(args.hrf)
+    if n_pcs_wanted is not None:
         # A data-derived joint basis: the PCs are fitted TOGETHER, exactly as
         # SPMG3's three columns are, so this rides the existing multi-basis
         # path and -derivatives does not apply (the PCs already span the
         # shape variation the derivatives would approximate).
         from fastfuncstuff.design.flobs import FLOBSBasis
 
-        G = _load_pc_basis(args.hrf_pcs, args.flobs_dt, args.flobs_window)
+        G = _load_pc_basis(
+            args.hrf_pcs, args.flobs_dt, args.flobs_window, n_pcs=n_pcs_wanted or None
+        )
         return FLOBSBasis(
             basis_functions=G,
             eigenvalues=np.ones(G.shape[0], dtype=np.float64),
@@ -2405,10 +2459,15 @@ def main() -> int:
     # ── Validate event input ────────────────────────────────────────
     has_onsets = bool(args.onsets)
     has_events = bool(args.events)
-    if str(args.hrf).strip().lower() == "pcs" and not args.hrf_pcs:
-        print("ERROR: -hrf pcs needs -hrf-pcs FILE (ffs_librarian's {prefix}_pcs.tsv).")
+    try:
+        _pcs_spec = _parse_pcs_spec(args.hrf)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
         return 1
-    if args.hrf_pcs and str(args.hrf).strip().lower() != "pcs":
+    if _pcs_spec is not None and not args.hrf_pcs:
+        print("ERROR: -hrf pcs needs -hrf-pcs FILE (ffs_librarian's {prefix}_pcs_smooth.tsv).")
+        return 1
+    if args.hrf_pcs and _pcs_spec is None:
         print(f"ERROR: -hrf-pcs given but -hrf is {args.hrf!r}; pass -hrf pcs to use it.")
         return 1
     if has_onsets == has_events:
