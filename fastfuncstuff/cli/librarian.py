@@ -1522,7 +1522,21 @@ def derive_and_write_library(
 
     write_tsv(raw_path, lib.raw)
     print(f"    Wrote {raw_path}   [duration-convolved cubic recon]")
-    np.savetxt(pcs_path, lib.svd.pcs.T, fmt="%.10g", delimiter="\t")
+    # Carry the lag grid in a comment header.  The PCs are sampled at the FIR
+    # lag spacing, not the 0.1 s the library files use, and without the times
+    # a consumer cannot resample them onto its own grid -- it has to guess the
+    # TR.  np.loadtxt skips '#' by default, so this stays readable by anything
+    # already parsing the file.
+    np.savetxt(
+        pcs_path,
+        lib.svd.pcs.T,
+        fmt="%.10g",
+        delimiter="\t",
+        header=(
+            "ffs_librarian temporal PCs — rows = lag samples, columns = PCs\n"
+            "lag_times_s: " + " ".join(f"{x:g}" for x in lag_times)
+        ),
+    )
     print(f"    Wrote {pcs_path}")
 
     if lib.raw_deconvolved is not None:
