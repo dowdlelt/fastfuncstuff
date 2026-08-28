@@ -4234,3 +4234,140 @@ def enable_determinism(verb: int = 1) -> None:
             file=sys.stderr,
             flush=True,
         )
+
+
+# ---------------------------------------------------------------------------
+# Custom HRF libraries: impulse-response vs duration-convolved
+# ---------------------------------------------------------------------------
+
+
+def add_hrf_library_args(group, *, dest_prefix: str = "hrf_library") -> None:
+    """Register ``-hrf-library`` / ``-hrf-library-raw`` on one argument group.
+
+    ffs_librarian emits two library files that are indistinguishable by
+    inspection -- ``{prefix}_hrflibrary.tsv`` holds impulse responses and
+    ``{prefix}_hrfraw.tsv`` holds the response to an event of the duration it
+    was measured at -- so which flag was used is the only record of which kind
+    is in hand.  Registering both from one place keeps that distinction spelled
+    the same way in every tool that can consume a library.
+    """
+    group.add_argument(
+        f"-{dest_prefix.replace('_', '-')}",
+        dest=dest_prefix,
+        default=None,
+        metavar="TSV",
+        help=(
+            "Custom HRF library of IMPULSE RESPONSES, e.g.\n"
+            "ffs_librarian's {prefix}_hrflibrary.tsv.  The stimulus\n"
+            "duration is applied here, by building the design's\n"
+            "onsets as boxcars."
+        ),
+    )
+    group.add_argument(
+        f"-{dest_prefix.replace('_', '-')}-raw",
+        f"-{dest_prefix}_raw",
+        dest=f"{dest_prefix}_raw",
+        default=None,
+        metavar="TSV",
+        help=(
+            "Custom HRF library that is already DURATION-CONVOLVED,\n"
+            "e.g. ffs_librarian's {prefix}_hrfraw.tsv.  The design's\n"
+            "onsets are built as IMPULSES instead, because the curve\n"
+            "already carries the duration; convolving again would\n"
+            "apply it twice.\n"
+            "\n"
+            "Use it when ffs_librarian warned that the impulse\n"
+            "deconvolution was not identifiable for your design.\n"
+            "Mutually exclusive with the flag above."
+        ),
+    )
+
+
+def resolve_hrf_library_spec(
+    args,
+    durations,
+    *,
+    dest_prefix: str = "hrf_library",
+    verbose: bool = True,
+) -> tuple[str | None, list[float], bool]:
+    """Resolve the two library flags into (path, model_durations, is_raw).
+
+    ``model_durations`` is what every part of the MODEL must use.  For a
+    duration-convolved library it is all zeros: the curve already contains the
+    boxcar, so the design has to be built from impulses.
+
+    That has to reach EVERY site that builds the design, not just the one that
+    looks most like "the onsets".  In ffs_hrfopt it did not, and the cost was
+    silent: ``build_task_design`` prefers the event list over the onset matrix
+    and re-applies ``stim_durations`` itself, so a design was built with the
+    duration counted twice, looked like a perfectly ordinary regressor, and
+    selected the library entry ranked 19th of 20 by fit to the voxels' own FIR
+    curves for 98 of 100 sampled voxels.
+
+    Nothing in a library TSV records which kind it is, so the sidecar
+    ffs_librarian writes beside it is checked when present.
+    """
+    import json
+    import re
+
+    path = getattr(args, dest_prefix, None)
+    raw_path = getattr(args, f"{dest_prefix}_raw", None)
+    durations = list(durations) if durations is not None else []
+
+    if raw_path is None:
+        return path, durations, False
+    if path:
+        print(
+            f"ERROR: -{dest_prefix.replace('_', '-')} and "
+            f"-{dest_prefix.replace('_', '-')}-raw are mutually exclusive.\n"
+            "       The first takes impulse responses ({prefix}_hrflibrary.tsv);\n"
+            "       the second takes duration-convolved curves ({prefix}_hrfraw.tsv)."
+        )
+        sys.exit(1)
+
+    p = Path(raw_path)
+    if not p.exists():
+        print(f"ERROR: library file not found: {p}")
+        sys.exit(1)
+
+    # The sidecar's `duration_convolved` describes the FINAL LIBRARY, not
+    # _hrfraw.tsv: the raw reconstruction is duration-convolved by construction
+    # and reads false there whenever a deconvolution ran, which is most of the
+    # time.  So which file was passed decides, and the flag matters only for
+    # the library file.
+    meta_path = Path(re.sub(r"_(hrfraw|hrflibrary)\.tsv$", "_metadata.json", str(p)))
+    meta = {}
+    if meta_path.exists() and meta_path != p:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+
+    if p.name.endswith("_hrflibrary.tsv") and meta.get("duration_convolved") is False:
+        print(
+            f"ERROR: {p.name} holds IMPULSE responses -- {meta_path.name} records\n"
+            f"       duration_convolved=false.  Pass it with "
+            f"-{dest_prefix.replace('_', '-')} instead; the -raw form would drop\n"
+            "       the stimulus duration from the model entirely.\n"
+            "       For the duration-convolved curves use the _hrfraw.tsv beside it."
+        )
+        sys.exit(1)
+
+    groups = meta.get("groups") or []
+    lib_duration = groups[0].get("median_duration_s") if len(groups) == 1 else None
+    if lib_duration is not None and durations:
+        want = float(np.median(np.asarray(durations, dtype=float)))
+        if abs(want - float(lib_duration)) > 0.5:
+            print(
+                f"  ⚠️  WARNING: the library was built at {float(lib_duration):.2f}s events "
+                f"but -durations gives {want:.2f}s.\n"
+                "      A duration-convolved library only describes the duration it was "
+                "measured at; these curves will not match your design."
+            )
+
+    if verbose:
+        print("  Duration-convolved library: building the design's onsets as IMPULSES")
+        print("  (the duration is already inside the library curves, not applied here)")
+        if lib_duration is not None:
+            print(f"  Library was measured at {float(lib_duration):.2f}s events")
+    return raw_path, [0.0] * len(durations), True

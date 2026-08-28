@@ -573,8 +573,26 @@ Notes:
         default=None,
         metavar="TSV",
         help=(
-            "Custom HRF library TSV (e.g. from ffs_librarian); used when "
-            "the per-voxel HRF library is loaded for denoising."
+            "Custom HRF library of IMPULSE RESPONSES (ffs_librarian's\n"
+            "{prefix}_hrflibrary.tsv); used when the per-voxel HRF\n"
+            "library is loaded for denoising.  The stimulus duration\n"
+            "is applied by the design's onsets."
+        ),
+    )
+    proc_opts.add_argument(
+        "-hrf-library-raw",
+        "-hrf_library_raw",
+        dest="hrf_library_raw",
+        type=str,
+        default=None,
+        metavar="TSV",
+        help=(
+            "As above but for a DURATION-CONVOLVED library\n"
+            "(ffs_librarian's {prefix}_hrfraw.tsv).  The onsets are\n"
+            "built as IMPULSES instead, since the curve already\n"
+            "carries the duration -- convolving again applies it\n"
+            "twice.  Match whichever form ffs_hrfopt used to produce\n"
+            "the indices being loaded."
         ),
     )
     proc_opts.add_argument(
@@ -1826,12 +1844,21 @@ def main():
 
     # HRF model parsing needs the TR (FIR/TENT derive their basis count from it),
     # so it has to wait until the header has been read.
-    from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
+    from fastfuncstuff.cli_utils import (
+        parse_hrf_model_args,
+        resolve_hrf_library_spec,
+        validate_hrf_compatibility,
+    )
+
+    # A duration-convolved library carries the boxcar itself, so the design
+    # must be built from impulses -- and that has to reach the design builder,
+    # not just the onset construction (see cli_utils.resolve_hrf_library_spec).
+    args.hrf_library, model_durations, _raw_library = resolve_hrf_library_spec(args, durations)
 
     hrf_info = parse_hrf_model_args(
         hrf_model_arg=args.hrf_model,
         canonical_arg=args.canonical,
-        durations=durations,
+        durations=model_durations,
         condition_labels=condition_labels,
         tr=args.tr,
         fir_window_s=args.fir_duration,

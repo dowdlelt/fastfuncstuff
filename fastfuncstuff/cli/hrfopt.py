@@ -613,6 +613,46 @@ def _selected_tr_dt(args) -> float | None:
 def _resolve_raw_library(args, durations):
     """Validate -hrf-library-raw and return the onset durations to build with.
 
+    Thin wrapper over :func:`cli_utils.resolve_hrf_library_spec` so every tool
+    that can take a custom library resolves the two flags identically; the
+    reasoning lives there.
+    """
+    from fastfuncstuff.cli_utils import resolve_hrf_library_spec
+
+    path, model_durations, is_raw = resolve_hrf_library_spec(args, durations)
+    if is_raw:
+        args.hrf_library = path
+        args.hrf_mode = "library"
+    return model_durations, is_raw
+
+
+def _selected_tr_dt(args) -> float | None:
+    """Resolve -save_selected_tr into a sampling interval, or None if unset.
+
+    Bare flag means "the run TR", which is the spacing a TR-locked FIR uses
+    and therefore the one that lines this volume up with ffs_librarian's FIR
+    betas.  An explicit number covers the sub-TR case, where the FIR window
+    was built on a finer grid than the acquisition.
+    """
+    spec = getattr(args, "save_selected_tr", None)
+    if spec is None:
+        return None
+    if spec == "tr":
+        return float(args.tr)
+    try:
+        dt = float(spec)
+    except (TypeError, ValueError):
+        print(f"ERROR: -save_selected_tr expects a number of seconds; got {spec!r}")
+        sys.exit(1)
+    if dt <= 0:
+        print(f"ERROR: -save_selected_tr must be positive; got {dt}")
+        sys.exit(1)
+    return dt
+
+
+def _resolve_raw_library(args, durations):
+    """Validate -hrf-library-raw and return the onset durations to build with.
+
     A duration-convolved library already contains the boxcar, so the onset
     matrix must be built from IMPULSES -- otherwise the duration is applied
     twice and every regressor is wrong in a way nothing downstream detects.

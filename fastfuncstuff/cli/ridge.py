@@ -303,8 +303,26 @@ Notes:
         default=None,
         metavar="TSV",
         help=(
-            "Custom HRF library TSV (e.g. from ffs_librarian).  Used "
-            "when per-voxel HRF indices are loaded via -hrf_opt."
+            "Custom HRF library of IMPULSE RESPONSES (e.g.\n"
+            "ffs_librarian's {prefix}_hrflibrary.tsv).  Used when\n"
+            "per-voxel HRF indices are loaded via -hrf_opt.  The\n"
+            "stimulus duration is applied by the design's onsets."
+        ),
+    )
+    integ_opts.add_argument(
+        "-hrf-library-raw",
+        "-hrf_library_raw",
+        dest="hrf_library_raw",
+        type=str,
+        default=None,
+        metavar="TSV",
+        help=(
+            "As above but for a DURATION-CONVOLVED library\n"
+            "(ffs_librarian's {prefix}_hrfraw.tsv).  The onsets are\n"
+            "built as IMPULSES instead, since the curve already\n"
+            "carries the duration -- convolving again applies it\n"
+            "twice.  Match whichever form ffs_hrfopt used to produce\n"
+            "the indices you are loading."
         ),
     )
 
@@ -525,14 +543,19 @@ def main():
     # 4. HRF model args and validation
     # ========================================================================
     print()
-    from fastfuncstuff.cli_utils import parse_hrf_model_args
+    from fastfuncstuff.cli_utils import parse_hrf_model_args, resolve_hrf_library_spec
 
     # Note: 3dRidgefast doesn't support FIR (use condition-level tools for that)
     # But it DOES support SPMG2/SPMG3 for single-trial with derivatives
+    # A duration-convolved library carries the boxcar itself, so the design
+    # must be built from impulses -- and that has to reach the design builder,
+    # not just the onset construction (see cli_utils.resolve_hrf_library_spec).
+    args.hrf_library, model_durations, _raw_library = resolve_hrf_library_spec(args, durations)
+
     hrf_info = parse_hrf_model_args(
         hrf_model_arg=args.hrf_model if hasattr(args, "hrf_model") else "spmg1",
         canonical_arg=None,  # 3dRidgefast doesn't have -canonical
-        durations=durations,
+        durations=model_durations,
         condition_labels=condition_labels,
         tr=args.tr,
     )
