@@ -22,6 +22,8 @@ For help:
     3dHRFoptfast -help
 """
 
+import json
+import re
 import sys
 from pathlib import Path
 
@@ -265,9 +267,38 @@ Notes:
         default=None,
         metavar="TSV",
         help=(
-            "Path to a custom HRF library TSV (same format as "
-            "getcanonicalhrflibrary.tsv, e.g. produced by ffs_librarian). "
-            "Used only when -hrf_mode library."
+            "Path to a custom HRF library TSV of IMPULSE RESPONSES (same "
+            "format as getcanonicalhrflibrary.tsv; ffs_librarian writes this "
+            "as {prefix}_hrflibrary.tsv).  The stimulus duration is applied "
+            "here, by building the onset matrix as boxcars.  Used only when "
+            "-hrf_mode library."
+        ),
+    )
+    hrf_opts.add_argument(
+        "-hrf-library-raw",
+        dest="hrf_library_raw",
+        default=None,
+        metavar="TSV",
+        help=(
+            "Path to a DURATION-CONVOLVED library: ffs_librarian's\n"
+            "{prefix}_hrfraw.tsv, whose curves are already the\n"
+            "response to an event of the duration they were\n"
+            "measured at.\n"
+            "\n"
+            "Convolving those with a boxcar again would count the\n"
+            "duration twice, so this loader builds the onset matrix\n"
+            "as IMPULSES and lets the curve carry the duration.\n"
+            "Everything downstream -- per-voxel selection, xval, the\n"
+            "saved index map -- is unchanged.\n"
+            "\n"
+            "Use it when ffs_librarian warned that the impulse\n"
+            "deconvolution was not identifiable for your design.\n"
+            "The duration-convolved curves are sound in that case\n"
+            "even though the impulse library is not.\n"
+            "\n"
+            "Valid only if -durations matches what the library was\n"
+            "built at; the sidecar {prefix}_metadata.json is checked\n"
+            "when present.  Mutually exclusive with -hrf-library."
         ),
     )
 
@@ -534,6 +565,80 @@ def print_summary(args, n_runs: int, n_conditions: int, n_voxels: int, condition
     print()
 
 
+def _resolve_raw_library(args, durations):
+    """Validate -hrf-library-raw and return the onset durations to build with.
+
+    A duration-convolved library already contains the boxcar, so the onset
+    matrix must be built from IMPULSES -- otherwise the duration is applied
+    twice and every regressor is wrong in a way nothing downstream detects.
+
+    Nothing in the TSV itself records which kind of library it is, so the
+    sidecar metadata ffs_librarian writes next to it is checked when present.
+    Getting this backwards is silent, so it is worth the stat() call.
+
+    Note that the sidecar's ``duration_convolved`` describes the final library
+    file, NOT ``_hrfraw.tsv``: the raw cubic reconstruction is
+    duration-convolved by construction, and reads false there whenever a
+    deconvolution ran -- which is most of the time.
+    """
+    if args.hrf_library_raw is None:
+        return durations, False
+    if args.hrf_library:
+        print("ERROR: -hrf-library and -hrf-library-raw are mutually exclusive.")
+        print("       -hrf-library takes impulse responses ({prefix}_hrflibrary.tsv);")
+        print("       -hrf-library-raw takes duration-convolved curves ({prefix}_hrfraw.tsv).")
+        sys.exit(1)
+
+    raw_path = Path(args.hrf_library_raw)
+    if not raw_path.exists():
+        print(f"ERROR: -hrf-library-raw file not found: {raw_path}")
+        sys.exit(1)
+
+    # The sidecar's `duration_convolved` describes the FINAL LIBRARY
+    # ({prefix}_hrflibrary.tsv), not {prefix}_hrfraw.tsv -- the raw cubic
+    # reconstruction is duration-convolved by construction and stays that way
+    # whether or not a deconvolution ran.  So which file was passed decides,
+    # and the flag only matters for the library file.
+    meta_path = Path(re.sub(r"_(hrfraw|hrflibrary)\.tsv$", "_metadata.json", str(raw_path)))
+    meta = {}
+    if meta_path.exists() and meta_path != raw_path:
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            meta = {}
+
+    if raw_path.name.endswith("_hrflibrary.tsv") and meta.get("duration_convolved") is False:
+        print(
+            f"ERROR: {raw_path.name} holds IMPULSE responses -- {meta_path.name} records\n"
+            f"       duration_convolved=false, meaning the duration was deconvolved out.\n"
+            f"       Pass it with -hrf-library instead; -hrf-library-raw would drop the\n"
+            f"       stimulus duration from the model entirely.\n"
+            f"       For the duration-convolved curves use the _hrfraw.tsv beside it."
+        )
+        sys.exit(1)
+
+    groups = meta.get("groups") or []
+    lib_duration = groups[0].get("median_duration_s") if len(groups) == 1 else None
+
+    if lib_duration is not None and durations is not None and len(durations):
+        want = float(np.median(np.asarray(durations, dtype=float)))
+        if abs(want - float(lib_duration)) > 0.5:
+            print(
+                f"  ⚠️  WARNING: the library was built at {float(lib_duration):.2f}s events "
+                f"but -durations gives {want:.2f}s.\n"
+                f"      A duration-convolved library only describes the duration it was "
+                f"measured at; these curves will not match your design."
+            )
+
+    args.hrf_library = args.hrf_library_raw
+    args.hrf_mode = "library"
+    print("  Duration-convolved library: building the onset matrix as IMPULSES")
+    print("  (the duration is already inside the library curves, not applied here)")
+    if lib_duration is not None:
+        print(f"  Library was measured at {float(lib_duration):.2f}s events")
+    return [0.0] * len(durations), True
+
+
 def main():
     parser = create_parser()
 
@@ -755,13 +860,14 @@ def main():
 
     # Build microtime onset matrix
     # This creates a (n_microtime, n_conditions) matrix with boxcar values
+    onset_durations, raw_library = _resolve_raw_library(args, durations)
     onset_matrix = create_onset_matrix_microtime(
         all_onsets,
         run_starts,
         args.tr,
         n_timepoints,
         args.microtime_dt,
-        stim_durations=durations,
+        stim_durations=onset_durations,
         device=device,
     )
 
@@ -798,7 +904,8 @@ def main():
         **pighs_kwargs,
     )
     if args.hrf_library:
-        print(f"  Loaded custom HRF library from {args.hrf_library}")
+        kind = "duration-convolved" if raw_library else "impulse-response"
+        print(f"  Loaded custom HRF library from {args.hrf_library}  [{kind}]")
 
     print(f"  HRF library shape: {hrf_library.shape}")
     print(
