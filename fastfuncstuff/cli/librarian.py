@@ -343,6 +343,19 @@ Notes:
         help="Brain mask NIfTI (optional).",
     )
     fir_grp.add_argument(
+        "-save_fir_volume",
+        "-save-fir-volume",
+        dest="save_fir_volume",
+        action="store_true",
+        help=(
+            "Also write the per-voxel FIR betas as a 4-D NIfTI, time = FIR\n"
+            "lag.  The R2 map says where the fit worked; this says what it\n"
+            "found, so a voxel's own measured response can be laid next to\n"
+            "the library entry ffs_hrfopt selected for it (which writes a\n"
+            "matching TR-sampled volume with -save_selected_tr)."
+        ),
+    )
+    fir_grp.add_argument(
         "-automask",
         action="store_true",
         help=(
@@ -947,6 +960,39 @@ def write_r2_volume(
         save_nifti(vol.reshape(volume_shape), output_path=str(path), affine=affine)
 
 
+def write_fir_volume(
+    betas: np.ndarray,
+    mask_flat: np.ndarray,
+    volume_shape: tuple[int, int, int],
+    path: Path,
+    affine: np.ndarray,
+    lag_times: np.ndarray,
+    tr: float,
+) -> None:
+    """Save the per-voxel FIR betas as a 4-D NIfTI, time = FIR lag.
+
+    The R2 map already told you WHERE the FIR fit worked; this is WHAT it
+    found there, which is the only way to put a voxel's own measured response
+    next to the library entry that got selected for it.  Deriving a library
+    from these betas and then discarding them left no way to check the tool
+    against its own input.
+
+    The 4th dimension is lag, not time, so TR is set to the FIR lag spacing --
+    a viewer's time axis then reads in seconds-since-event directly.
+    """
+    n_lags = betas.shape[1]
+    vol = np.zeros((int(np.prod(volume_shape)), n_lags), dtype=np.float32)
+    vol[mask_flat] = betas.astype(np.float32)
+    lag_dt = float(lag_times[1] - lag_times[0]) if lag_times.size > 1 else float(tr)
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(
+            vol.reshape(*volume_shape, n_lags),
+            output_path=str(path),
+            affine=affine,
+            tr=lag_dt,
+        )
+
+
 def _warn_deconvolution_unidentifiable(lib, lag_times, duration_s, leakage) -> bool:
     """Warn when the impulse library is not identifiable from this design.
 
@@ -1409,6 +1455,7 @@ def derive_and_write_library(
     precomputed_svd=None,
     precomputed_selection: np.ndarray | None = None,
     r2_volume: tuple | None = None,
+    fir_volume: tuple | None = None,
     extra_group_meta: dict | None = None,
 ):
     """Derive one library from FIR betas and write all its artifacts.
@@ -1605,6 +1652,10 @@ def derive_and_write_library(
     if r2_volume is not None:
         r2_map, mask_flat, volume_shape, affine, r2_path = r2_volume
         write_r2_volume(r2_map, mask_flat, volume_shape, r2_path, affine)
+    if fir_volume is not None:
+        fir_betas, fir_mask, fir_shape, fir_affine, fir_path, fir_tr = fir_volume
+        write_fir_volume(fir_betas, fir_mask, fir_shape, fir_path, fir_affine, lag_times, fir_tr)
+        print(f"    Wrote {fir_path}   [per-voxel FIR betas, time = lag]")
         print(f"    Wrote {r2_path}")
 
     qc_artifacts = write_qc_artifacts(
@@ -2494,6 +2545,18 @@ def main() -> None:
                 volume_shape,
                 affine,
                 Path(f"{args.prefix}{gtag}_fir_r2{nii_ext}"),
+            ),
+            fir_volume=(
+                (
+                    betas_in,
+                    mask_flat,
+                    volume_shape,
+                    affine,
+                    Path(f"{args.prefix}{gtag}_fir_betas{nii_ext}"),
+                    tr,
+                )
+                if args.save_fir_volume
+                else None
             ),
         )
 
