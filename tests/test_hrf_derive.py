@@ -33,6 +33,7 @@ from fastfuncstuff.design.hrf_derive import (
     derive_library,
     fit_double_gamma,
     fit_double_gamma_through_boxcar,
+    fit_spline_through_boxcar,
     manifold_coverage,
     project_unit_sphere,
     reconstruct_timecourses,
@@ -735,3 +736,120 @@ def test_duration_convolved_gamma_curve_tracks_the_raw_curve():
     # The impulse fit itself must not be sitting on the a1 bound.
     a1 = np.array([p["a1"] for p in res.gamma_params_deconvolved])
     assert (a1 < 11.99).any(), "every boxcar fit pinned at the a1 upper bound"
+
+
+# ---------- penalized-spline shape model -------------------------------------
+
+
+def _impulse_and_block(
+    bump: float = 0.0, dt: float = 0.1, window: float = 36.0, block: float = 20.0
+):
+    """A double-gamma impulse (optionally + an off-family bump) and its block response."""
+    t = np.arange(0, window, dt)
+    imp = gamma.pdf(t, 5.0, scale=1.0) - 0.17 * gamma.pdf(t, 16.0, scale=1.0)
+    if bump:
+        imp = imp + bump * np.exp(-((t - 14) ** 2) / 8)
+    imp = imp / imp.max()
+    blk = np.convolve(imp, np.ones(int(round(block / dt))))[: t.size]
+    return t, imp, blk / blk.max()
+
+
+def test_spline_recovers_a_true_double_gamma():
+    # The spline must cost almost nothing when the double-gamma family was
+    # right, or it is not a safe default to offer.
+    _, imp, blk = _impulse_and_block()
+    fit, p = fit_spline_through_boxcar(blk, duration=20.0, dt=0.1)
+    assert p["fit_ok"]
+    assert np.corrcoef(imp, fit)[0, 1] > 0.99
+
+
+def test_spline_beats_double_gamma_off_family():
+    # The whole point: an impulse response carrying structure the
+    # double-gamma cannot express.  Measured 0.99 vs 0.89.
+    _, imp, blk = _impulse_and_block(bump=0.30)
+    spline_fit, _ = fit_spline_through_boxcar(blk, duration=20.0, dt=0.1)
+    gamma_fit, _ = fit_double_gamma_through_boxcar(blk, duration=20.0, dt=0.1)
+    r_spline = np.corrcoef(imp, spline_fit)[0, 1]
+    r_gamma = np.corrcoef(imp, gamma_fit)[0, 1]
+    assert r_spline > r_gamma + 0.05, f"spline {r_spline:.4f} vs gamma {r_gamma:.4f}"
+    assert r_spline > 0.97
+
+
+def test_spline_drops_unidentifiable_basis_functions():
+    # Convolution with a D-second boxcar leaves the late impulse response
+    # barely constrained -- with T=36 and D=20 the final convolved design
+    # column carries 4% of the strongest -- and a second-difference penalty
+    # cannot hold it because its null space is exactly {constant, linear}, so
+    # a tail ramp is free.  The unidentifiable directions are dropped instead.
+    _, _, blk = _impulse_and_block()
+    _, p = fit_spline_through_boxcar(blk, duration=20.0, dt=0.1)
+    assert p["n_basis_kept"] < p["n_basis_total"]
+
+    # And the tail must stay put under noise, which is what the drop buys.
+    rng = np.random.default_rng(0)
+    t = np.arange(0, 36, 0.1)
+    tails = []
+    for _ in range(8):
+        noise = np.interp(t, np.linspace(0, 36, 18), rng.normal(0, 0.05, 18))
+        fit, _ = fit_spline_through_boxcar(blk + noise, duration=20.0, dt=0.1)
+        tails.append(np.abs(fit[-50:]).max())
+    assert np.median(tails) < 0.25, f"tail runs away under noise: {np.median(tails):.3f}"
+
+
+def test_spline_library_is_reconvolvable():
+    # A library entry is only useful if convolving it back with the event
+    # boxcar reproduces the curve it was derived from -- that is exactly what
+    # downstream consumers do at modelling time.
+    rng = np.random.default_rng(11)
+    lag = np.arange(0, 36, 2.0)
+    t_fine = np.arange(0, 36, 0.1)
+    n_box, n = 200, 1500
+    rows = []
+    for lat, wid, c, bump in zip(
+        rng.uniform(4, 7, n),
+        rng.uniform(0.8, 1.6, n),
+        rng.uniform(0.05, 0.35, n),
+        rng.uniform(0, 0.35, n),
+        strict=True,
+    ):
+        imp = (
+            gamma.pdf(t_fine, lat / wid, scale=wid)
+            - c * gamma.pdf(t_fine, 16.0, scale=1.0)
+            + bump * np.exp(-((t_fine - 14) ** 2) / 8)
+        )
+        blk = np.convolve(imp, np.ones(n_box))[: t_fine.size]
+        rows.append(np.interp(lag, t_fine, blk / np.abs(blk).max()))
+    betas = np.array(rows) + rng.normal(0, 0.02, (n, lag.size))
+
+    res = derive_library(
+        betas,
+        np.full(n, 0.5),
+        lag,
+        n_pcs=3,
+        n_hrfs=12,
+        manifold_mode="kmeans",
+        fit_gamma=True,
+        shape_model="spline",
+        deconvolve_duration=20.0,
+        deconv_method="fit",
+        r2_threshold=0.0,
+    )
+    assert res.shape_model == "spline"
+    assert res.fitted_deconvolved is not None
+
+    n_t = res.raw.shape[1]
+    for i in range(res.fitted_deconvolved.shape[0]):
+        pred = np.convolve(res.fitted_deconvolved[i], np.ones(n_box))[:n_t]
+        assert np.corrcoef(res.raw[i], pred / pred.max())[0, 1] > 0.99
+
+
+def test_shape_model_none_still_skips_the_fit():
+    _, _, blk = _impulse_and_block()
+    lag = np.arange(0, 36, 2.0)
+    rng = np.random.default_rng(2)
+    betas = rng.standard_normal((500, lag.size)) * 0.1 + np.interp(lag, np.arange(0, 36, 0.1), blk)
+    res = derive_library(
+        betas, np.full(500, 0.5), lag, n_pcs=3, n_hrfs=8, fit_gamma=False, r2_threshold=0.0
+    )
+    assert res.fitted is None
+    assert res.shape_model == "none"

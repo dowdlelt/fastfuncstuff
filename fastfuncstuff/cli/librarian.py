@@ -482,12 +482,38 @@ Notes:
     )
     derive_grp.add_argument(
         "-fit-gamma",
-        choices=["double", "none"],
+        choices=["double", "spline", "none"],
         default="double",
         help=(
-            "Final parametric smoothing of each manifold HRF.  'double' "
-            "= SPM double-gamma fit (drop-in replacement); 'none' = emit "
-            "only the raw cubic reconstruction."
+            "Final parametric smoothing of each manifold HRF.\n"
+            "  double  SPM double-gamma (NSD-faithful, most\n"
+            "          noise-robust).  Regularizes by SHAPE:\n"
+            "          ~2-3 effective DOF, so variation the\n"
+            "          family cannot express is flattened out.\n"
+            "  spline  Penalized cubic B-spline, smoothness\n"
+            "          picked per curve by GCV.  Regularizes by\n"
+            "          SMOOTHNESS, so any shape is reachable.\n"
+            "          Recovers an off-family impulse at r=0.99\n"
+            "          where double manages 0.89, and costs\n"
+            "          little when double was right (r>=0.993).\n"
+            "          Less noise-robust (r=0.93 vs 0.99 at the\n"
+            "          highest noise tested).  Pair with a\n"
+            "          raised -n-pcs, or the extra dimensions\n"
+            "          get flattened right back out.\n"
+            "  none    Raw cubic reconstruction only (forces\n"
+            "          -deconv-method wiener)."
+        ),
+    )
+    derive_grp.add_argument(
+        "-spline-knots",
+        type=int,
+        default=12,
+        metavar="N",
+        help=(
+            "-fit-gamma spline only: evenly spaced knots across the FIR "
+            "window.  The penalty, not the knot count, controls "
+            "smoothness, so more knots buy resolution rather than "
+            "overfitting -- but they cost conditioning."
         ),
     )
     derive_grp.add_argument(
@@ -1059,14 +1085,15 @@ def write_qc_artifacts(
     # whose unused rows are blank when deconvolution / gamma fitting
     # were skipped, so a user comparing runs gets the same layout.
     n = lib.raw.shape[0]
+    _fit_label = {"spline": "spline fit", "double": "gamma fit"}.get(lib.shape_model, "fit")
     cmap = plt.get_cmap("turbo")
     colors = [cmap(i / max(n - 1, 1)) for i in range(n)]
 
     panels = [
         ("raw cubic — duration-convolved", lib.raw, "-"),
-        ("gamma fit — duration-convolved", lib.fitted, "--"),
+        (f"{_fit_label} — duration-convolved", lib.fitted, "--"),
         ("raw cubic — impulse (deconvolved)", lib.raw_deconvolved, "-"),
-        ("gamma fit — impulse (final library)", lib.fitted_deconvolved, "--"),
+        (f"{_fit_label} — impulse (final library)", lib.fitted_deconvolved, "--"),
     ]
     # Shared x (same lag axis throughout) but independent y: the four panels
     # are all peak-normalized to 1, so a shared y-scale spends the whole axis
@@ -1206,7 +1233,8 @@ def derive_and_write_library(
                 f"    Wiener deconvolving {deconv_duration:.2f}s boxcar (SNR={args.deconv_snr:g})"
             )
         else:
-            print(f"    Fitting double-gamma through a {deconv_duration:.2f}s boxcar")
+            family = "penalized spline" if args.fit_gamma == "spline" else "double-gamma"
+            print(f"    Fitting {family} through a {deconv_duration:.2f}s boxcar")
 
     lib = derive_library(
         betas,
@@ -1221,7 +1249,9 @@ def derive_and_write_library(
         manifold_mode=args.manifold,
         manifold_points=manifold_points,
         density_floor_frac=args.density_floor,
-        fit_gamma=(args.fit_gamma == "double"),
+        fit_gamma=(args.fit_gamma != "none"),
+        shape_model=("spline" if args.fit_gamma == "spline" else "double"),
+        spline_knots=int(args.spline_knots),
         seed=args.seed,
         event_durations=event_durations_arr,
         refit_weights=refit_weights,
@@ -1286,10 +1316,12 @@ def derive_and_write_library(
     if lib.fitted_deconvolved is not None:
         final_library, final_label = (
             lib.fitted_deconvolved,
-            "gamma through boxcar" if args.deconv_method == "fit" else "deconv+gamma",
+            f"{lib.shape_model} through boxcar"
+            if args.deconv_method == "fit"
+            else f"deconv+{lib.shape_model}",
         )
     elif lib.fitted is not None:
-        final_library, final_label = lib.fitted, "gamma (duration-convolved)"
+        final_library, final_label = lib.fitted, f"{lib.shape_model} (duration-convolved)"
     elif lib.raw_deconvolved is not None:
         final_library, final_label = lib.raw_deconvolved, "deconv raw"
     lib_path = Path(f"{args.prefix}{gtag}_hrflibrary.tsv")
@@ -2074,6 +2106,8 @@ def main() -> None:
         "group_per_condition": group_per_cond,
         "split_mode": "stacked" if use_stacking else ("single" if n_groups == 1 else "separate"),
         "r2_mode": args.r2_mode,
+        "shape_model": args.fit_gamma,
+        "spline_knots": int(args.spline_knots) if args.fit_gamma == "spline" else None,
         "deconv_method": args.deconv_method,
         "refit_pcs": args.refit_pcs == "on",
         "polort": int(polort_resolved),
