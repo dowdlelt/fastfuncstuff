@@ -110,13 +110,7 @@ class TestEvaluateAllCosts:
         src = _blob(shift=(2, 0, 0), seed=1)
         v = evaluate_all_costs(_inputs(base, src))
         w_hel, w_mi, w_nmi, w_cra, _ = MICHO_LPA
-        expect = (
-            v["lpa"]
-            + w_hel * v["hel"]
-            + w_mi * v["mi"]
-            + w_nmi * v["nmi"]
-            + w_cra * v["crA"]
-        )
+        expect = v["lpa"] + w_hel * v["hel"] + w_mi * v["mi"] + w_nmi * v["nmi"] + w_cra * v["crA"]
         assert abs(v["lpa+"] - expect) < 1e-5
 
 
@@ -133,7 +127,7 @@ class TestBuildCostInputs:
         assert inp.base.numel() < base.numel()
 
     def test_n_match_subsamples(self):
-        base = _blob()
+        base = _blob(shape=(52, 56, 52))
         weight = (base > 0.05).float()
         full = build_cost_inputs(base, base, weight, (1.0, 1.0, 1.0), n_match=1.0)
         half = build_cost_inputs(base, base, weight, (1.0, 1.0, 1.0), n_match=0.5)

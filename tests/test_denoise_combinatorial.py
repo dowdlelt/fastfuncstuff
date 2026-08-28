@@ -18,12 +18,11 @@ from fastfuncstuff.denoise.combinatorial import (
     generate_all_pc_combinations,
     select_optimal_combination,
 )
-from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 class TestGenerateAllPcCombinations:
@@ -490,9 +489,13 @@ class TestPhaseRandomize:
         a = phase_randomize(x, 5, generator=torch.Generator().manual_seed(7))
         b = phase_randomize(x, 5, generator=torch.Generator().manual_seed(7))
         torch.testing.assert_close(a, b)
-        if torch.cuda.is_available():
-            c = phase_randomize(x.cuda(), 5, generator=torch.Generator().manual_seed(7))
-            torch.testing.assert_close(a, c.cpu(), rtol=1e-4, atol=1e-4)
+
+    @pytest.mark.gpu
+    def test_seed_reproduces_across_cuda(self):
+        x = torch.randn(128, 3)
+        cpu = phase_randomize(x, 5, generator=torch.Generator().manual_seed(7))
+        cuda = phase_randomize(x.cuda(), 5, generator=torch.Generator().manual_seed(7))
+        torch.testing.assert_close(cpu, cuda.cpu(), rtol=1e-4, atol=1e-4)
 
 
 class TestSelectSingletonsAgainstNull:

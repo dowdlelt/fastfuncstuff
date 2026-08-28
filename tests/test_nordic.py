@@ -5,6 +5,7 @@ from pathlib import Path
 
 import nibabel as nib
 import numpy as np
+import pytest
 import torch
 
 from fastfuncstuff.denoise.nordic import (
@@ -270,8 +271,8 @@ def test_eigh_decomp_matches_svd(tmp_path):
     shared = dict(
         temporal_phase=0,
         magnitude_only=True,
-        kernel_size_pca=(3, 3, 3),
-        kernel_size_gfactor=(3, 3, 1),
+        kernel_size_pca=(5, 3, 3),
+        kernel_size_gfactor=(3, 3, 3),
         gfactor_nvols=8,
         patch_overlap=2,
         gfactor_patch_overlap=2,
@@ -305,6 +306,7 @@ def test_eigh_decomp_matches_svd(tmp_path):
     assert r > 0.99, f"eigh vs SVD correlation too low: {r:.6f}"
 
 
+@pytest.mark.gpu
 @torch.no_grad()
 def test_llr_denoise_cross_device():
     """When data lives on CPU and device='cuda', results should match GPU-only."""

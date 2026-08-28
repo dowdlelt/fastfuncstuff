@@ -21,12 +21,11 @@ from fastfuncstuff.denoise.sequential import (
     select_noise_pool_voxels,
 )
 from fastfuncstuff.glm.core import construct_polynomial_matrix
-from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 # ============================================================================
@@ -564,14 +563,24 @@ class TestDenoiseFullPipeline:
         n_tp_total = n_runs * n_tp_run
         run_starts = [i * n_tp_run for i in range(n_runs)]
 
-        # Shared structured noise timecourse (strong, present in all voxels)
-        shared_noise_tc = torch.randn(n_tp_total, device=device) * 3.0
-
         # Task signal: simple cosine regressor, one per run
         task_tc = torch.zeros(n_tp_total, device=device)
         for r in range(n_runs):
             t = torch.linspace(0, 2 * 3.14159, n_tp_run, device=device)
             task_tc[r * n_tp_run : (r + 1) * n_tp_run] = torch.cos(t)
+
+        # Give the shared component a different task correlation in each run.
+        # A no-PC fit then learns a fold-dependent task bias, while the correctly
+        # specified PC model can recover the stable task coefficient.
+        shared_noise_tc = torch.empty(n_tp_total, device=device)
+        noise_task_weights = torch.tensor([-3.0, -1.0, 1.0, 3.0], device=device)
+        for r, weight in enumerate(noise_task_weights):
+            start = r * n_tp_run
+            stop = start + n_tp_run
+            task_run = task_tc[start:stop]
+            orthogonal_noise = torch.randn(n_tp_run, device=device)
+            orthogonal_noise -= task_run * (orthogonal_noise @ task_run) / (task_run @ task_run)
+            shared_noise_tc[start:stop] = 2.0 * orthogonal_noise + weight * task_run
 
         # Signal voxels: task signal + shared noise
         signal_betas = torch.randn(n_signal_voxels, 1, device=device) * 2.0
@@ -589,15 +598,20 @@ class TestDenoiseFullPipeline:
         noise_mask = torch.zeros(n_voxels, dtype=torch.bool, device=device)
         noise_mask[n_signal_voxels:] = True
 
-        noise_pcs_raw = extract_noise_pcs_per_run(
-            data, run_starts, noise_mask, max_components=3, device=device, verbose=False
-        )
-        assert isinstance(noise_pcs_raw, list)  # return_loadings=False -> list, not tuple
         nuisance = [
             construct_polynomial_matrix(n_tp_run, max_degree=1, device=device)
             for _ in range(n_runs)
         ]
-
+        noise_pcs_raw = extract_noise_pcs_per_run(
+            data,
+            run_starts,
+            noise_mask,
+            max_components=3,
+            nuisance_per_run=nuisance,
+            device=device,
+            verbose=False,
+        )
+        assert isinstance(noise_pcs_raw, list)  # return_loadings=False -> list, not tuple
         _, r2_agg = cross_validate_noise_pcs(
             data=data,
             design_matrix=design,

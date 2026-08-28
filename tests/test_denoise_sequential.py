@@ -767,6 +767,7 @@ class TestComputeXvalR2OptimalFull:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a second device to mix")
 def test_per_hrf_baseline_r2_with_cpu_resident_data():
     """Per-voxel HRF mode must work when data stays on CPU but device is CUDA.

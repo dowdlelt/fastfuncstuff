@@ -24,12 +24,11 @@ from fastfuncstuff.glm.ridge import (
 )
 from fastfuncstuff.glm.xval import generate_cv_splits
 from fastfuncstuff.simulation.core import simulate_fmri_run
-from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
@@ -37,8 +36,6 @@ def deterministic_rng():
     """Stabilize stochastic ridge tests to avoid flaky CI behavior."""
     np.random.seed(12345)
     torch.manual_seed(12345)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(12345)
 
 
 # ============================================================================

@@ -767,6 +767,7 @@ class TestPatchWriteBackDedup:
                 seen |= vox
         assert overlapping > 0, "patches within a phase are disjoint -- dedup unnecessary?"
 
+    @pytest.mark.gpu
     @pytest.mark.slow
     def test_qwarp_batch_is_deterministic(self):
         """The batched multi-volume write-back must not depend on scatter luck."""
@@ -787,6 +788,8 @@ class TestPatchWriteBackDedup:
         z0 = torch.zeros_like(w)
         sources = torch.stack([warp_image(base, z0, -s * w, z0, mode="linear") for s in (0.8, 1.0)])
 
+        base = base.cuda()
+        sources = sources.cuda()
         cfg = QwarpConfig(minpatch=9, cost_method="lpa", verb=0)
         a = qwarp_batch(base, sources, config=cfg)
         b = qwarp_batch(base, sources, config=cfg)
@@ -828,15 +831,14 @@ class TestPatchWriteBackDedup:
                 device=torch.device("cpu"),
             )
 
+    # ---------------------------------------------------------------------------
+    # WarpState mutation patterns
+    # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# WarpState mutation patterns
-# ---------------------------------------------------------------------------
+    """Opt-in coarse-to-fine resolution pyramid (config.pyramid_factor)."""
 
 
 class TestPyramid:
-    """Opt-in coarse-to-fine resolution pyramid (config.pyramid_factor)."""
-
     def _base_and_source(self):
         from fastfuncstuff.processing.interp import warp_image_linear
 
@@ -866,13 +868,14 @@ class TestPyramid:
     def test_default_off(self):
         assert QwarpConfig().pyramid_factor == 1
 
+    @pytest.mark.gpu
     @pytest.mark.slow
     def test_pyramid_runs_and_improves(self):
         # GPU-first project: exercise the full multi-level path on CUDA (fast),
         # and only a tiny smoke on CPU so the suite isn't pegged for seconds.
         from fastfuncstuff.processing.warp import _global_correlation, qwarp
 
-        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dev = torch.device("cuda")
         max_level = 5 if dev.type == "cuda" else 1
         b, s = self._base_and_source()
         b, s = b.to(dev), s.to(dev)
@@ -947,6 +950,7 @@ class TestWarpStateMutation:
         assert ws.cost == pytest.approx(666.666)
 
 
+@pytest.mark.gpu
 class TestGaussNewtonPatchOptimizer:
     """GN replaces Adam's backward pass with normal equations built directly.
 
@@ -978,7 +982,7 @@ class TestGaussNewtonPatchOptimizer:
 
         base, moving = self._pair()
         cfg = QwarpConfig(verb=0, cost_method="pearclp", minpatch=9, **kw)
-        return qwarp(base, moving, config=cfg, device=torch.device("cpu"))
+        return qwarp(base, moving, config=cfg, device=torch.device("cuda"))
 
     def test_gauss_newton_improves_the_alignment(self):
         import torch
@@ -1032,7 +1036,7 @@ class TestGaussNewtonPatchOptimizer:
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
 
         base, moving = self._pair()
-        dev = torch.device("cpu")
+        dev = torch.device("cuda")
         plain = qwarp(
             base, moving, config=QwarpConfig(verb=0, cost_method="mind", minpatch=9), device=dev
         )[0]
@@ -1062,6 +1066,7 @@ class TestGaussNewtonPatchOptimizer:
         assert QwarpConfig().optimizer == "gn"
 
 
+@pytest.mark.gpu
 class TestGaussNewtonLocalCosts:
     """The local-Pearson costs get GN through a locally normalised residual.
 
@@ -1099,7 +1104,7 @@ class TestGaussNewtonLocalCosts:
             base,
             moving,
             config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, **kw),
-            device=torch.device("cpu"),
+            device=torch.device("cuda"),
         )
 
     @pytest.mark.parametrize("cost", ["lpa", "lncc"])
@@ -1144,9 +1149,8 @@ class TestGaussNewtonLocalCosts:
         qc = warp_regularity(xd[sl], yd[sl], zd[sl], mask=automask(base))
         assert regularity_verdict(qc)[0] != "fail"
 
-
-class TestHybridOptimizer:
     """Gauss-Newton to travel, a short Adam pass to close the surrogate's gap.
+class TestHybridOptimizer:
 
     GN optimises a least-squares stand-in; Adam optimises the reported cost. On a
     real 193^3 fit that difference was worth ls 0.3384 against 0.2977 on pearclp.
@@ -1182,10 +1186,11 @@ class TestHybridOptimizer:
             base,
             moving,
             config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, optimizer=optimizer),
-            device=torch.device("cpu"),
+            device=torch.device("cuda"),
         )
         return evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
 
+    @pytest.mark.gpu
     @pytest.mark.parametrize("cost", ["pearclp", "lpa"])
     def test_hybrid_is_no_worse_than_gauss_newton_alone(self, cost):
         """The polish starts from GN's answer and only accepts improvements, so it
@@ -1227,13 +1232,14 @@ class TestHybridOptimizer:
         )
         assert float(costs[0]) <= 1e-6
 
+    @pytest.mark.gpu
     def test_hybrid_falls_back_where_gauss_newton_does(self):
         import torch
 
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
 
         base, moving = self._pair()
-        dev = torch.device("cpu")
+        dev = torch.device("cuda")
         plain = qwarp(
             base, moving, config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9), device=dev
         )[0]

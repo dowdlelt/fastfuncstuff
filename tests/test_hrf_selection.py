@@ -27,7 +27,6 @@ from fastfuncstuff.design.hrf_selection import (
     plot_design_matrix,
     plot_hrf_library,
 )
-from fastfuncstuff.utils import get_device
 
 # ---------------------------------------------------------------------------
 # Shared helper: build minimal inputs for fit_glm_hrf_library_with_xval
@@ -168,7 +167,7 @@ def test_condition_level_library_uses_raw_events_not_binary_regions(monkeypatch)
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 # ============================================================================

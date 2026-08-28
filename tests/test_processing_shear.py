@@ -5,6 +5,7 @@ mapping as resample_affine_fast for small rigid rotations + shifts, which is
 the regime motion correction operates in.
 """
 
+import pytest
 import torch
 
 from fastfuncstuff.processing.affine import (
@@ -132,6 +133,7 @@ def test_decomposition_validity_mask_batched():
     assert bool(valid.all())
 
 
+@pytest.mark.gpu
 def test_batched_moco_estimation_cuda():
     """Whole-batch shear GN estimation runs and tracks the per-volume path.
 

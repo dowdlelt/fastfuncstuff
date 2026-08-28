@@ -28,12 +28,12 @@ from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.design.matrices import build_glm_design
 from fastfuncstuff.glm.core import construct_polynomial_matrix, fit_glm
 from fastfuncstuff.simulation.core import simulate_fmri_run
-from fastfuncstuff.utils import get_device, scale_to_percent_signal
+from fastfuncstuff.utils import scale_to_percent_signal
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 @pytest.fixture

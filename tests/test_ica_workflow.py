@@ -112,17 +112,12 @@ class TestSanitizeFiniteTensor:
 
     def test_preserves_device(self):
         """Test that device is preserved."""
-        if torch.cuda.is_available():
-            device = torch.device("cuda:0")
-        else:
-            device = torch.device("cpu")
+        device = torch.device("cpu")
 
         t = torch.tensor([1.0, 2.0, 3.0], device=device)
         result = sanitize_finite_tensor(t, "test")
         # Check same device type
         assert result.device.type == device.type
-        if device.type == "cuda":
-            assert result.device.index == device.index
 
     def test_clones_tensor(self):
         """Test that result is a new tensor."""

@@ -52,7 +52,7 @@ def _to_ffs(vol, mask):
 
 
 def _device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return torch.device("cpu")
 
 
 def test_classic_fwhm_recovers_isotropic_width():

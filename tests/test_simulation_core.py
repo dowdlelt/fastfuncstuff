@@ -14,7 +14,6 @@ import torch
 
 from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.simulation.core import simulate_fmri_experiment, simulate_fmri_run
-from fastfuncstuff.utils import get_device
 
 
 class TestSingleRunSimulation:
@@ -22,7 +21,7 @@ class TestSingleRunSimulation:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_basic_simulation(self, device):
         """Test basic single-run simulation."""
@@ -236,7 +235,7 @@ class TestMultiRunExperiment:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_basic_multi_run(self, device):
         """Test basic multi-run experiment."""
@@ -286,7 +285,7 @@ class TestSimulationEdgeCases:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_single_timepoint(self, device):
         """Test with minimal timepoints."""
@@ -423,7 +422,7 @@ class TestCreateParametricVoxels:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_basic_parametric_voxels(self, device):
         """Test basic parametric voxel creation."""
@@ -511,7 +510,7 @@ class TestSimulateBatchExperiments:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_basic_batch_experiments(self, device):
         """Test basic batch experiment simulation."""
@@ -553,7 +552,7 @@ class TestSimulationFileWriting:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_write_afni_onset_files(self, device, tmp_path):
         """Test AFNI onset file writing."""
@@ -659,7 +658,7 @@ class TestSaveSimulationOutputs:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_save_simulation_outputs_basic(self, device, tmp_path):
         """Test basic simulation output saving."""

@@ -111,6 +111,7 @@ def test_pca_vs_sklearn(n_samples, n_features, n_components):
     )
 
 
+@pytest.mark.gpu
 def test_pca_gpu_execution():
     """Verify PCA runs on GPU if available"""
     if not torch.cuda.is_available():

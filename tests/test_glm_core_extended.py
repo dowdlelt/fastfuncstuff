@@ -18,7 +18,6 @@ from fastfuncstuff.glm.core import (
     orthogonalize_design,
     percent_bold_change,
 )
-from fastfuncstuff.utils import get_device
 
 
 class TestPolynomialMatrix:
@@ -26,7 +25,7 @@ class TestPolynomialMatrix:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_construct_polynomial_basic(self, device):
         """Test constructing polynomial matrix with different degrees."""
@@ -126,7 +125,7 @@ class TestOrthogonalizeDesign:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_orthogonalize_basic(self, device):
         """Test basic orthogonalization."""
@@ -210,7 +209,7 @@ class TestPercentBoldChange:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_percent_bold_basic(self, device):
         """Test basic percent BOLD change computation."""
@@ -272,7 +271,7 @@ class TestGLMChunkSize:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_chunk_size(self, device):
         """Test that chunk_size parameter works."""
@@ -336,7 +335,7 @@ class TestGLMResidualsAndPredicted:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_residuals(self, device):
         """Test that residuals are computed correctly."""
@@ -423,7 +422,7 @@ class TestGLMPolynomialRegressors:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_linear_trend(self, device):
         """Test GLM removes linear trend."""
@@ -487,7 +486,7 @@ class TestGLMExtraRegressors:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_motion_regressors(self, device):
         """Test GLM with motion nuisance regressors."""
@@ -550,7 +549,7 @@ class TestGLMNumericalStability:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_very_small_values(self, device):
         """Test GLM with very small data values."""

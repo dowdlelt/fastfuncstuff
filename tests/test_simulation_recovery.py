@@ -959,11 +959,13 @@ class TestDenoiseRecovery:
             "High-R² task voxels should be excluded."
         )
 
-    def test_optimal_pcs_greater_than_zero_with_shared_noise(self):
+    def test_irrelevant_shared_noise_does_not_force_pc_selection(self):
+        """Shared variance alone is not evidence that its PCs are useful nuisance.
+
+        These random-walk PCs are not reliably related to the task. Held-out R²,
+        rather than their mere presence, must keep the selected count at zero.
         """
-        When strong shared noise PCs are injected, the optimal PC count
-        should be > 0.
-        """
+
         from fastfuncstuff.denoise.sequential import fit_denoising_model
 
         inp = self._build_denoise_inputs(n_true_pcs=3, task_snr=3.0)
@@ -979,8 +981,8 @@ class TestDenoiseRecovery:
             device=CPU,
             verbose=False,
         )
-        assert results.optimal_n_components > 0, (
-            f"Expected optimal_n_components > 0 when shared noise PCs are present, "
+        assert results.optimal_n_components == 0, (
+            f"Shared variance without held-out R² gain should select 0 PCs, "
             f"got {results.optimal_n_components}"
         )
 

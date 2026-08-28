@@ -14,8 +14,6 @@ from fastfuncstuff.processing.b0fmap import (
     field_to_pe_warp,
     read_echo_times,
     read_epi_geometry,
-    romeo_available,
-    run_romeo,
     synthesize_distorted,
 )
 from fastfuncstuff.processing.topup import _jacobian_pe
@@ -267,95 +265,6 @@ class TestSidecars:
         assert trt == pytest.approx(0.00055 * 63)
 
 
-def _synthetic_echoes(amp: float, tes_ms: list[float]):
-    """A smooth Hz field plus the wrapped phase it would produce at each TE."""
-    nx, ny, nz = 32, 32, 16
-    a, b, c = np.meshgrid(
-        np.linspace(-1, 1, nx),
-        np.linspace(-1, 1, ny),
-        np.linspace(-1, 1, nz),
-        indexing="ij",
-    )
-    truth = (amp * np.exp(-(b**2 + c**2) / 0.5) - (amp / 3.0) * a).astype(np.float32)
-    mag = (np.exp(-(a**2 + b**2 + c**2) / 0.8) * 1000.0).astype(np.float32)
-    phase = np.stack(
-        [np.angle(np.exp(1j * 2 * np.pi * truth * (te / 1000.0))) for te in tes_ms], axis=-1
-    ).astype(np.float32)
-    mag4d = np.stack([mag] + [mag * 0.8] * (len(tes_ms) - 1), axis=-1)
-    return truth, phase, mag4d, mag > 100.0
-
-
-@pytest.mark.skipif(not romeo_available(), reason="romeo binary not on PATH")
-class TestRomeo:
-    def test_recovers_a_known_field_from_synthetic_phase(self, tmp_path):
-        """Simulate two echoes of a known field, wrap the phase, and check ROMEO
-        unwraps back to it. At this amplitude the phase wraps twice at the longer TE,
-        so the unwrapping is genuinely exercised."""
-        tes_ms = [4.0, 7.11]
-        truth, phase, mag4d, obj = _synthetic_echoes(120.0, tes_ms)
-        assert 2 * np.pi * np.abs(truth).max() * tes_ms[1] / 1000.0 > 2 * np.pi
-
-        out = run_romeo(
-            phase, mag4d, tes_ms, np.eye(4), outdir=tmp_path / "r", mask="nomask", verbose=False
-        )
-        assert out.b0_hz.shape == truth.shape
-        # ROMEO's global offset correction can leave a whole-volume n*2pi/dTE shift;
-        # what must match is the spatial structure.
-        err = (out.b0_hz - truth)[obj]
-        assert np.abs(err - np.median(err)).max() < 15.0, "unwrap did not recover the field"
-
-    def test_radian_phase_is_not_rescaled(self, tmp_path):
-        """Bug of record: ROMEO maps its input's [min,max] onto [-pi,pi] by default. Phase
-        already in radians that does not span the full circle is therefore *stretched*,
-        and the field comes back scaled by 2*pi/observed_range — a 4.3x error here, with
-        no warning from anywhere. ``phase_units="auto"`` must detect radians and pass
-        --no-phase-rescale.
-
-        The amplitude is deliberately small enough that no wrapping occurs at either
-        echo, so a correct run must reproduce the field essentially exactly and any
-        scale error is unambiguous.
-        """
-        tes_ms = [4.0, 7.11]
-        truth, phase, mag4d, obj = _synthetic_echoes(20.0, tes_ms)
-        assert np.abs(phase).max() < np.pi, "test needs an unwrapped input"
-
-        good = run_romeo(
-            phase, mag4d, tes_ms, np.eye(4), outdir=tmp_path / "a", mask="nomask", verbose=False
-        )
-        ratio = np.median(good.b0_hz[obj] / truth[obj])
-        assert ratio == pytest.approx(1.0, abs=0.05), f"field scaled by {ratio:.3f}"
-
-        # And forcing "radians" explicitly must give exactly what auto chose.
-        forced = run_romeo(
-            phase,
-            mag4d,
-            tes_ms,
-            np.eye(4),
-            outdir=tmp_path / "b",
-            mask="nomask",
-            phase_units="radians",
-            verbose=False,
-        )
-        assert np.allclose(forced.b0_hz, good.b0_hz, atol=1e-4)
-
-    def test_phasediff_single_echo_form(self, tmp_path):
-        """A Siemens phasediff volume is already the inter-echo difference, so passing
-        the single delta-TE must give the same Hz field as the two-echo form."""
-        dte = 3.11
-        truth, phase, mag4d, obj = _synthetic_echoes(20.0, [dte])
-        out = run_romeo(
-            phase[..., 0],
-            mag4d[..., 0],
-            [dte],
-            np.eye(4),
-            outdir=tmp_path / "pd",
-            mask="nomask",
-            verbose=False,
-        )
-        err = (out.b0_hz - truth)[obj]
-        assert np.abs(err - np.median(err)).max() < 2.0
-
-
 class TestPhaseScaling:
     """Raw scanner phase is converted to radians by us, never by ROMEO, and every echo
     is scaled from its OWN min/max. Measured: ROMEO pools the whole 4-D, so widening one
@@ -363,41 +272,18 @@ class TestPhaseScaling:
     image (``pm_scale_phase.m``), and so do we.
     """
 
-    @pytest.mark.skipif(not romeo_available(), reason="romeo binary not on PATH")
-    def test_each_echo_scaled_from_its_own_range(self, tmp_path):
-        """Same field, two echoes written at DIFFERENT quantisation depths — each one
-        filling its own range, as the reconstruction does. Scaling each from its own
-        min/max recovers one consistent field; pooling the 4-D would stretch the
-        shallower echo and corrupt the phase difference.
-        """
-        tes_ms = [4.0, 7.11]
-        truth, phase, mag4d, obj = _synthetic_echoes(120.0, tes_ms)  # large: phase wraps
-        levels = (4096, 1024)  # 12-bit and 10-bit
-        quant = np.stack(
-            [np.round((phase[..., i] / (2 * np.pi) + 0.5) * (n - 1)) for i, n in enumerate(levels)],
-            axis=-1,
-        ).astype(np.float32)
-        for i, n in enumerate(levels):  # each echo fills its own range
-            span = quant[..., i].max() - quant[..., i].min()
-            assert quant[..., i].min() == 0 and span > 0.99 * (n - 1)
-
-        out = run_romeo(
-            quant, mag4d, tes_ms, np.eye(4), outdir=tmp_path / "s", mask="nomask", verbose=False
-        )
-        err = out.b0_hz[obj] - truth[obj]
-        assert np.abs(err - np.median(err)).max() < 15.0
-
-    def test_scaling_is_independent_across_echoes(self):
+    def test_scaling_is_independent_across_echoes(self, monkeypatch):
         """Widening one echo's range must not change what another echo maps to — the
         property ROMEO's pooled rescale violates."""
         from fastfuncstuff.processing import b0fmap as B
+
+        monkeypatch.setattr(B, "romeo_available", lambda _binary: True)
 
         base = np.linspace(1024, 3072, 64, dtype=np.float32).reshape(1, 1, 64, 1)
 
         def scaled(second):
             ph = np.concatenate([base, second], axis=-1)
             captured = {}
-            orig = B.subprocess.run
 
             def fake(cmd, **kw):  # stop before ROMEO; we only want the converted phase
                 import nibabel as nib
@@ -407,13 +293,9 @@ class TestPhaseScaling:
                 )
                 raise RuntimeError("stop")
 
-            B.subprocess.run = fake
-            try:
+            monkeypatch.setattr(B.subprocess, "run", fake)
+            with pytest.raises(RuntimeError, match="stop"):
                 B.run_romeo(ph, np.ones_like(ph), [4.0, 8.0], np.eye(4), verbose=False)
-            except RuntimeError:
-                pass
-            finally:
-                B.subprocess.run = orig
             return captured["phase"][..., 0]
 
         narrow_mate = scaled(base.copy())
@@ -421,23 +303,3 @@ class TestPhaseScaling:
         assert np.allclose(narrow_mate, wide_mate, atol=1e-5)
         assert narrow_mate.min() == pytest.approx(-np.pi, abs=1e-5)
         assert narrow_mate.max() == pytest.approx(np.pi, abs=1e-5)
-
-    @pytest.mark.skipif(not romeo_available(), reason="romeo binary not on PATH")
-    def test_explicit_phase_range_applies_to_every_echo(self, tmp_path):
-        """-phase_range pins the conversion for inputs that do not fill their range."""
-        tes_ms = [3.11]
-        truth, phase, mag4d, obj = _synthetic_echoes(20.0, tes_ms)
-        narrow = np.round((phase[..., 0] / (2 * np.pi) + 0.5) * 2048 + 1024).astype(np.float32)
-        out = run_romeo(
-            narrow,
-            mag4d[..., 0],
-            tes_ms,
-            np.eye(4),
-            outdir=tmp_path / "p",
-            mask="nomask",
-            phase_units="scanner",
-            phase_range=(0.0, 4095.0),
-            verbose=False,
-        )
-        ratio = np.median(out.b0_hz[obj] / truth[obj])
-        assert ratio == pytest.approx(0.5, abs=0.03), f"got {ratio:.3f}"

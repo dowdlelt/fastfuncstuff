@@ -37,12 +37,7 @@ from fastfuncstuff.glm.outputs import (
 @pytest.fixture
 def device():
     """Get available device."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
+    return torch.device("cpu")
 
 
 @pytest.fixture

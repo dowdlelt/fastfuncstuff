@@ -66,7 +66,10 @@ def _corr(a: torch.Tensor, b: torch.Tensor, m: torch.Tensor) -> float:
     return float((a * b).sum() / (a.norm() * b.norm() + 1e-12))
 
 
-@pytest.mark.parametrize("cost,optimizer", [("ncc", "gn"), ("ncc", "adam"), ("lpa", "adam")])
+@pytest.mark.parametrize(
+    "cost,optimizer",
+    [("ncc", "gn"), ("ncc", "adam"), pytest.param("lpa", "adam", marks=pytest.mark.gpu)],
+)
 def test_single_echo_recovers_field_and_improves_alignment(cost, optimizer):
     nz, ny, nx = 10, 24, 24
     base = _smooth_volume(nz, ny, nx, seed=0)
@@ -234,6 +237,7 @@ def test_series_polishes_every_frame():
             )
 
 
+@pytest.mark.gpu
 def test_series_compile_flag_matches_eager():
     """The opt-in fast path (``compile=True``) stays close to the eager path.
 
@@ -273,7 +277,7 @@ def test_series_compile_flag_matches_eager():
     f_eager = _run(False)
     f_fast = _run(True)
     assert torch.isfinite(f_fast).all()
-    tol = 5e-3 if torch.cuda.is_available() else 0.0  # exact on CPU (compile is a no-op)
+    tol = 0.0  # this test runs on CPU, where compile is a no-op
     assert (f_fast - f_eager).abs().median() <= tol
 
 

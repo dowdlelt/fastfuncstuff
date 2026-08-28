@@ -4,18 +4,19 @@ Pytest configuration for fastfuncstuff tests.
 
 import os
 
-import pytest
-import torch
-
 # Cap CPU threads for the whole test session. Test problems are tiny, so torch's
 # default intra-op pool (one thread per core) mostly spins up threads to do
 # near-nothing: it momentarily pegs every core without speeding the suite up, and
 # it oversubscribes badly when a test spawns its own worker pool. A small fixed cap
 # keeps the suite well-behaved (and reduction order deterministic across machines)
 # without slowing the little real work there is. The env vars also cover numpy/BLAS
-# and are inherited by spawned worker processes; setdefault respects an explicit
-# override from the caller.
-_TEST_THREADS = str(min(4, os.cpu_count() or 1))
+# and are inherited by spawned worker processes. FFS_TEST_NUM_THREADS is the one
+# explicit escape hatch; ambient BLAS defaults must not silently claim the machine.
+try:
+    _TEST_THREADS = max(1, int(os.environ.get("FFS_TEST_NUM_THREADS", "4")))
+except ValueError:
+    _TEST_THREADS = 4
+_TEST_THREADS = min(_TEST_THREADS, os.cpu_count() or 1)
 for _var in (
     "OMP_NUM_THREADS",
     "MKL_NUM_THREADS",
@@ -23,8 +24,13 @@ for _var in (
     "NUMEXPR_NUM_THREADS",
     "VECLIB_MAXIMUM_THREADS",
 ):
-    os.environ.setdefault(_var, _TEST_THREADS)
-torch.set_num_threads(int(_TEST_THREADS))
+    os.environ[_var] = str(_TEST_THREADS)
+
+import pytest  # noqa: E402
+import torch  # noqa: E402
+
+torch.set_num_threads(_TEST_THREADS)
+torch.set_num_interop_threads(min(2, _TEST_THREADS))
 
 # Bump dynamo recompile cache size: many tests trigger compiled kernels
 # (e.g. glm.xval._cod_kernel_compiled) with varying shapes, dtypes, devices,
@@ -57,20 +63,24 @@ def pytest_configure(config):
 
 @pytest.fixture(scope="session")
 def device():
-    """Provide device for all tests."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps")
-    else:
-        return torch.device("cpu")
+    """Ordinary tests are CPU-only; GPU tests must opt in with @pytest.mark.gpu."""
+    return torch.device("cpu")
 
 
 @pytest.fixture(autouse=True)
-def reset_random_seed():
-    """Reset random seed before each test for reproducibility."""
+def cpu_backend_by_default(monkeypatch, request):
+    """Prevent unmarked tests and library defaults from discovering accelerators."""
+    if request.node.get_closest_marker("gpu") is None:
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+        if hasattr(torch.backends, "mps"):
+            monkeypatch.setattr(torch.backends.mps, "is_available", lambda: False)
+
+
+@pytest.fixture(autouse=True)
+def reset_random_seed(request):
+    """Reset only the RNGs that the selected test is allowed to use."""
     torch.manual_seed(42)
-    if torch.cuda.is_available():
+    if request.node.get_closest_marker("gpu") is not None and torch.cuda.is_available():
         torch.cuda.manual_seed_all(42)
 
 

@@ -14,7 +14,6 @@ import pytest
 import torch
 
 from fastfuncstuff.glm.core import fit_glm
-from fastfuncstuff.utils import get_device
 
 
 class TestBasicGLM:
@@ -22,7 +21,7 @@ class TestBasicGLM:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_simple_glm_fit(self, device):
         """Test basic GLM fit with known signal."""
@@ -121,7 +120,7 @@ class TestGLMStatistics:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_tstat_computation(self, device):
         """Test t-statistic computation."""
@@ -242,7 +241,7 @@ class TestGLMEdgeCases:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_glm_with_constant(self, device):
         """Test GLM with constant regressor (intercept)."""
@@ -353,7 +352,7 @@ class TestGLMBatchProcessing:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_multiple_voxel_batches(self, device):
         """Test GLM processes all voxels correctly."""
@@ -408,7 +407,7 @@ class TestGLMResultsToSpatial:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_to_spatial_3d(self, device):
         """Test reshaping results back to 3D spatial format."""
@@ -458,7 +457,7 @@ class TestGLM4DInput:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_4d_data_input(self, device):
         """Test GLM with 4D (nx, ny, nz, nt) data input."""
@@ -492,7 +491,7 @@ class TestGLMMultiRun:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_multi_run_fit(self, device):
         """Test GLM with list of runs."""
@@ -550,7 +549,7 @@ class TestGLMAdvancedFeatures:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_use_double_precision(self, device):
         """Test GLM with double precision."""
@@ -656,7 +655,7 @@ class TestGLMContrasts:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_basic_contrast(self, device):
         """Test basic single-row contrast (t-test)."""

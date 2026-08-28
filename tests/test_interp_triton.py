@@ -11,7 +11,10 @@ from fastfuncstuff.processing import interp
 
 nwarpforge_module = importlib.import_module("fastfuncstuff.processing.nwarpforge")
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+pytestmark = [
+    pytest.mark.gpu,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+]
 
 
 def _case(n: int = 41):

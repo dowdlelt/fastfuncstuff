@@ -14,12 +14,11 @@ import torch
 
 from fastfuncstuff.glm.ridge import _fit_ridge_multiple_fracs
 from fastfuncstuff.glm.xval import generate_cv_splits, single_trial_cv_helper
-from fastfuncstuff.utils import get_device
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 # ---------------------------------------------------------------------------

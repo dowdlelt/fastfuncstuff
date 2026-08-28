@@ -1861,7 +1861,17 @@ def moco_spacetime(
     # and no nested slice-timing (avoid recursion).
     from dataclasses import replace
 
-    est_cfg = replace(config, slice_times=None, skip_resample=True, verb=max(0, config.verb - 1))
+    # The CPU/MPS shear approximation is accurate for a one-shot rigid fit, but
+    # its interpolation residual is re-fit and compounded by this alternating loop.
+    # It reverses the expected reduction in stimulus-correlated motion, so keep
+    # the sensitive refinement on the exact gather; CUDA uses its fused batch path.
+    est_cfg = replace(
+        config,
+        slice_times=None,
+        skip_resample=True,
+        verb=max(0, config.verb - 1),
+        use_shear=config.use_shear and device.type == "cuda",
+    )
 
     result: MocoResult | None = None
     for it in range(n_iters):

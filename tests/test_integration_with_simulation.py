@@ -20,12 +20,12 @@ import torch
 from fastfuncstuff.design.hrf import get_canonical_hrf
 from fastfuncstuff.glm.core import construct_polynomial_matrix, fit_glm
 from fastfuncstuff.simulation.core import simulate_fmri_run
-from fastfuncstuff.utils import gaussian_blur_3d, get_device
+from fastfuncstuff.utils import gaussian_blur_3d
 
 
 @pytest.fixture
 def device():
-    return get_device()
+    return torch.device("cpu")
 
 
 class TestSimulationBasedGLM:

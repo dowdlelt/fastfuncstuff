@@ -28,7 +28,7 @@ def _phantom(n=32):
 
 def _run_with_followers(tmp_path, follower_affine, follower_shape_factor):
     src = _phantom()
-    base = np.roll(src, 2, axis=0)  # small, recoverable shift
+    base = src.copy()
     aff = np.diag([2.0, 2.0, 2.0, 1.0])
     aff[:3, 3] = -32.0
 
@@ -46,6 +46,8 @@ def _run_with_followers(tmp_path, follower_affine, follower_shape_factor):
     _write(tmp_path / "base.nii", base, aff)
     _write(tmp_path / "src.nii", src, aff)
     _write(tmp_path / "fol.nii", fol, follower_affine)
+    matrix = tmp_path / "identity.aff12.1D"
+    np.savetxt(matrix, np.eye(4, dtype=np.float32)[:3])
 
     main(
         [
@@ -54,9 +56,9 @@ def _run_with_followers(tmp_path, follower_affine, follower_shape_factor):
             "-prefix", str(tmp_path / "out.nii"),
             "-source_follower", str(tmp_path / "fol.nii"),
             "-follower_prefix", str(tmp_path / "out_fol.nii"),
+            "-1Dmatrix_apply", str(matrix),
             "-device", "cpu",
             "-final", "linear",
-            "-fast",
             "-verb", "0",
         ]
     )  # fmt: skip

@@ -12,7 +12,6 @@ import pytest
 import torch
 
 import fastfuncstuff as ffs
-from fastfuncstuff.utils import get_device
 
 
 class TestOLSContrasts:
@@ -20,7 +19,7 @@ class TestOLSContrasts:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     @pytest.fixture
     def block_design(self, device):
@@ -233,7 +232,7 @@ class TestARMAContrasts:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     @pytest.fixture
     def block_design(self, device):
@@ -352,7 +351,7 @@ class TestContrastFromDesign:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     @pytest.fixture
     def mock_design_info(self):
@@ -427,7 +426,7 @@ class TestContrastEdgeCases:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_contrast_wrong_dimensions(self, device):
         """Test that error is raised for wrong contrast dimensions."""
@@ -488,7 +487,7 @@ class TestContrastIntegration:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_ols_vs_arma_contrasts(self, device):
         """Test that OLS and ARMA give similar contrasts with block design + strong signal.

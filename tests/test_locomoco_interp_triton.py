@@ -51,6 +51,7 @@ def test_lanczos_beats_linear_on_subvoxel_high_frequency_signal():
     assert lanczos_rmse < 0.2 * linear_rmse
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("axis", [0, 1, 2])
 def test_fused_1d_lanczos_matches_portable(monkeypatch, axis):
@@ -63,6 +64,7 @@ def test_fused_1d_lanczos_matches_portable(monkeypatch, axis):
     assert torch.allclose(fused, portable, atol=2e-6, rtol=2e-5)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", ["bicubic", "lanczos"])
 def test_fused_2d_embedded_in_3d_matches_portable(monkeypatch, mode):
@@ -75,6 +77,7 @@ def test_fused_2d_embedded_in_3d_matches_portable(monkeypatch, mode):
     assert torch.allclose(fused, portable, atol=7e-6, rtol=3e-5)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_autograd_keeps_portable_2d_path(monkeypatch):
     vol = torch.randn(1, 9, 10, device="cuda")
@@ -89,6 +92,7 @@ def test_autograd_keeps_portable_2d_path(monkeypatch):
     assert u.grad is not None and v.grad is not None
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("mode", ["bicubic", "lanczos"])
 def test_fused_accepts_a_broadcast_shift_field(mode):
@@ -106,6 +110,7 @@ def test_fused_accepts_a_broadcast_shift_field(mode):
     assert torch.equal(got, expected)
 
 
+@pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_launch_failure_falls_back_to_portable(monkeypatch):
     """A GPU that cannot build the kernel must degrade, not abort the run."""

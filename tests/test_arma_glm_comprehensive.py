@@ -106,13 +106,13 @@ class TestARMAHelpers:
 class TestMemoryManagement:
     """Test memory heuristics and batch sizing."""
 
-    @patch("torch.cuda.get_device_properties")
+    @patch("torch.cuda.mem_get_info")
     @patch("torch.cuda.memory_reserved")
     @patch("torch.cuda.memory_allocated")
-    def test_get_adaptive_batch_size_cuda(self, mock_alloc, mock_reserved, mock_props):
+    def test_get_adaptive_batch_size_cuda(self, mock_alloc, mock_reserved, mock_mem_info):
         """Test batch sizing on CUDA."""
         # Mock a small GPU so the memory budget — not the placeholder cap — limits the batch.
-        mock_props.return_value.total_memory = 256 * 1024**2  # 256 MB
+        mock_mem_info.return_value = (256 * 1024**2, 256 * 1024**2)
         mock_reserved.return_value = 0
         mock_alloc.return_value = 0
 

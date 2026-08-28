@@ -14,7 +14,6 @@ import torch
 
 from fastfuncstuff.glm.arma import build_arma11_covariance
 from fastfuncstuff.simulation.noise import generate_arma_noise
-from fastfuncstuff.utils import get_device
 
 
 class TestARMANoiseGeneration:
@@ -22,7 +21,7 @@ class TestARMANoiseGeneration:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_ar1_noise_generation(self, device):
         """Test AR(1) noise generation."""
@@ -147,7 +146,7 @@ class TestARMA11Covariance:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_covariance_symmetry(self, device):
         """Test that covariance matrix is symmetric."""
@@ -227,7 +226,7 @@ class TestARMAParameterValidation:
 
     @pytest.fixture
     def device(self):
-        return get_device()
+        return torch.device("cpu")
 
     def test_zero_parameters(self, device):
         """Test ARMA(0,0) is white noise."""

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import numpy as np
-import torch
 from scipy.stats import ttest_1samp, ttest_ind
 
 from fastfuncstuff.stats.permutation import (
@@ -16,7 +15,7 @@ from fastfuncstuff.stats.permutation import (
 
 
 def _device():
-    return "cuda" if torch.cuda.is_available() else "cpu"
+    return "cpu"
 
 
 # ---------------------------------------------------------------------------

@@ -130,7 +130,7 @@ def test_icasso_main_function():
     X = M_true @ S_true
 
     # Force GPU if available
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device("cpu")
 
     results = icasso(
         X,

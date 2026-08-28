@@ -276,6 +276,7 @@ def test_blur_log_prior_smooths_and_preserves_shape():
     assert rough(blurred) < rough(log_prior)
 
 
+@pytest.mark.gpu
 def test_dual_echo_reverse_pe_drives_one_warp():
     """Dual-echo PE mode: forward (+s) and reverse (−s) distortions drive a single
     PE-constrained warp; the reverse is applied with the opposite sign."""
@@ -308,6 +309,7 @@ def test_dual_echo_reverse_pe_drives_one_warp():
         )  # fmt: skip
 
 
+@pytest.mark.gpu
 def test_fit_segment_blur_tpms_runs_coarse_to_fine():
     """A coarse blurred-TPM pass still converges to a sensible, finite fit."""
     torch.manual_seed(0)
@@ -366,6 +368,7 @@ def test_fit_segment_chunking_matches_whole_batch():
     assert torch.allclose(whole["wp"], chunked["wp"], atol=5e-3)
 
 
+@pytest.mark.gpu
 def test_fit_segment_float32_tracks_float64():
     """The float32 hot path recovers essentially the same tissue means as float64."""
     torch.manual_seed(0)
@@ -606,6 +609,7 @@ def test_fit_segment_single_in_list_equals_bare():
     assert bare["coef"].shape == listed["coef"].shape == (1, *bare["bias_shape"])
 
 
+@pytest.mark.gpu
 def test_warp_aggressiveness_knobs_increase_displacement():
     """warp_lr / warp_iters up and reg down all make the deformation move more."""
     torch.manual_seed(0)
@@ -1215,6 +1219,7 @@ def test_split_after_waits_for_the_bias_before_expanding_gaussians():
     )
 
 
+@pytest.mark.gpu
 def test_warp_reg_in_node_units_survives_a_coarser_samp():
     """The deformation prior lives in NODE units, so a coarser ``samp`` must not freeze it.
 
@@ -1248,6 +1253,7 @@ def test_warp_reg_in_node_units_survives_a_coarser_samp():
     assert d_coarse > 0.5 * d_fine, f"coarse samp under-deformed: {d_coarse} vs {d_fine}"
 
 
+@pytest.mark.gpu
 def test_fit_recovers_known_bias_field():
     """The joint fit recovers a known smooth multiplicative bias — a regression guard for
     the change-of-variables Jacobian term (+Σ log|bias|) in the bias objective.
@@ -1283,6 +1289,7 @@ def test_fit_recovers_known_bias_field():
     assert corr < -0.85  # correction field is the (near-exact) inverse of the injected shading
 
 
+@pytest.mark.gpu
 def test_gauss_newton_warp_solver_deforms_and_improves():
     """The GN warp solver moves the field and raises the data log-likelihood.
 
