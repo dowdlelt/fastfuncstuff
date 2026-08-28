@@ -945,6 +945,85 @@ def write_r2_volume(
         save_nifti(vol.reshape(volume_shape), output_path=str(path), affine=affine)
 
 
+def _warn_deconvolution_unidentifiable(lib, lag_times, duration_s, leakage) -> bool:
+    """Warn when the impulse library is not identifiable from this design.
+
+    ``conv(h, box_D)`` reports only ``h(t) - h(t-D)``, so any ``D``-periodic
+    component of ``h`` is invisible to the data.  With short events -- what
+    this tool was built for -- ``D`` is small, that component is a fast wiggle,
+    and the smoothness of any sane shape family suppresses it.  With long
+    blocks it is a slow undulation the fit is free to invent, and it lands
+    where nothing can contradict it: past the end of the window.
+
+    Duration alone is NOT the trigger, which is why two symptoms are required.
+    Synthetic 20 s blocks that really are ``hrf ⊛ boxcar`` deconvolve cleanly
+    (3% leakage, no tail PC).  What breaks it is a measured curve that is not
+    a boxcar convolution of any HRF -- an onset/offset response is the case in
+    hand -- because then the impulse response has to absorb neural dynamics,
+    and the only place it can put them without contradicting the data is
+    outside the window.  Leakage measures that; late-lag PC energy says the
+    shape variation lives where the deconvolution cannot pin it down.
+    Measured on real 20 s block data with a visible offset response: 17%
+    median leakage, PC2 carrying 74% of its energy in the last third, and
+    impulse responses oscillating through four lobes that re-convolved to
+    r>0.995 inside the window and -1.0 just outside it.
+
+    Returns whether the warning fired, so the caller can record it.
+    """
+    if leakage.size == 0:
+        return False
+    pcs = lib.svd.pcs
+    third = max(1, pcs.shape[1] // 3)
+    late_frac = []
+    for k in range(pcs.shape[0]):
+        energy = float((pcs[k] ** 2).sum())
+        late_frac.append(float((pcs[k][-third:] ** 2).sum() / energy) if energy > 0 else 0.0)
+    tail_pcs = [k + 1 for k, f in enumerate(late_frac) if f > 0.5]
+
+    if float(np.median(leakage)) <= 0.15 or not tail_pcs:
+        return False
+
+    window = float(lag_times[-1])
+    pc_phrase = (
+        f"PC{tail_pcs[0]} puts"
+        if len(tail_pcs) == 1
+        else f"PCs {', '.join(str(k) for k in tail_pcs)} put"
+    )
+    print(
+        f"\n    ⚠️  DECONVOLUTION NOT IDENTIFIABLE for this design — the impulse\n"
+        f"        library is unreliable.  The duration-convolved curves are fine.\n"
+        f"\n"
+        f"        {100 * np.median(leakage):.0f}% of the predicted response (median) lands beyond the\n"
+        f"        {window:.0f}s window, and {pc_phrase} most of "
+        f"{'their' if len(tail_pcs) > 1 else 'its'} energy in\n"
+        f"        the last third of the lag range.\n"
+        f"\n"
+        f"        conv(h,box) reports only h(t)-h(t-{duration_s:.0f}s), so any {duration_s:.0f}s-periodic\n"
+        f"        component of h is invisible to the data.  At {duration_s:.0f}s that component is\n"
+        f"        a slow undulation no smoothness penalty suppresses, and it lands\n"
+        f"        past the end of the window where nothing can contradict it.\n"
+        f"\n"
+        f"        Duration alone does not cause this: a clean block response\n"
+        f"        deconvolves fine at {duration_s:.0f}s.  What triggers it is a measured curve\n"
+        f"        that is not (some HRF) ⊛ boxcar at all — an onset/offset\n"
+        f"        response, say — which forces the impulse to absorb NEURAL\n"
+        f"        dynamics it cannot represent.  That is a real finding about the\n"
+        f"        data, not a fitting failure.\n"
+        f"\n"
+        f"        Trust the _hrfraw.tsv curves (duration-convolved); the\n"
+        f"        _qc_reconvolution.png figure shows the problem.  Options:\n"
+        f"          -deconvolve-duration off   keep the library duration-convolved\n"
+        f"                                     (then do NOT feed it to a consumer\n"
+        f"                                      that re-convolves)\n"
+        f"          -fit-gamma double          rigid enough that it cannot express\n"
+        f"                                     the artifact\n"
+        f"        Or model onset and offset as separate events, so the FIR\n"
+        f"        estimates the two transients directly instead of asking one\n"
+        f"        impulse response to encode both.\n"
+    )
+    return True
+
+
 def write_qc_artifacts(
     lib,  # LibraryResult from hrf_derive
     lag_times: np.ndarray,
@@ -1404,16 +1483,7 @@ def derive_and_write_library(
                     f"{100 * lk.max():.1f}% worst of the predicted response falls "
                     f"beyond the {lag_times[-1]:.0f}s window"
                 )
-                if lk.max() > 0.15:
-                    print(
-                        "      HINT: the r above only compares the part of the "
-                        "prediction that lands INSIDE the window, so it cannot "
-                        "see this.  High leakage means the impulse response has "
-                        "late lobes whose consequences fall off the end — check "
-                        "_qc_reconvolution.png, and see whether the extra PCs are "
-                        "carrying late-lag structure rather than HRF shape "
-                        "(_qc_pcs.png).  Fewer -n-pcs is the usual fix."
-                    )
+                _warn_deconvolution_unidentifiable(lib, lag_times, float(deconv_duration), lk)
 
     if lib.coverage is not None:
         cov = lib.coverage

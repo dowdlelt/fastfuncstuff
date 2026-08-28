@@ -954,3 +954,97 @@ def test_reconvolution_leakage_catches_a_late_impulse_lobe():
 
     assert leakage(with_lobe) > leakage(clean) + 0.05
     assert leakage(clean) < 0.15
+
+
+# ---------- the identifiability warning --------------------------------------
+
+
+def _library_for_duration(duration_s, n=2500, seed=0, offset_response=0.0, sustain_lo=1.0):
+    """Derive a library from FIR curves that are responses to a `duration_s` block.
+
+    ``offset_response`` adds a neural transient at the block's OFFSET and
+    ``sustain_lo`` is the floor on how much sustained boxcar drive a voxel
+    gets, so ``sustain_lo=0`` makes some voxels purely offset-driven.  Those
+    are the case where the measured curve is genuinely not ``hrf ⊛ boxcar``
+    for any hrf, and recovering an impulse response would mean asking the
+    vascular filter to absorb neural dynamics.
+    """
+    rng = np.random.default_rng(seed)
+    lag = np.arange(0, 36, 2.0)
+    t_fine = np.arange(0, 36, 0.1)
+    n_box = max(1, int(round(duration_s / 0.1)))
+    neural = np.zeros(t_fine.size)
+    neural[:n_box] = 1.0
+    rows = []
+    for lat, wid, c, off, sus in zip(
+        rng.uniform(4, 7, n),
+        rng.uniform(0.8, 1.6, n),
+        rng.uniform(0.05, 0.35, n),
+        rng.uniform(0, offset_response, n) if offset_response else np.zeros(n),
+        rng.uniform(sustain_lo, 1.0, n),
+        strict=True,
+    ):
+        imp = gamma.pdf(t_fine, lat / wid, scale=wid) - c * gamma.pdf(t_fine, 16.0, scale=1.0)
+        drive = sus * neural
+        if off:
+            drive = drive + off * np.exp(-((t_fine - duration_s) ** 2) / 2.0)
+        blk = np.convolve(imp, drive)[: t_fine.size]
+        rows.append(np.interp(lag, t_fine, blk / np.abs(blk).max()))
+    betas = np.array(rows) + rng.normal(0, 0.02, (n, lag.size))
+    res = derive_library(
+        betas,
+        np.full(n, 0.5),
+        lag,
+        n_pcs=3,
+        n_hrfs=20,
+        manifold_mode="kmeans",
+        fit_gamma=True,
+        shape_model="spline",
+        deconvolve_duration=duration_s,
+        deconv_method="fit",
+        r2_threshold=0.0,
+    )
+    return res, lag
+
+
+def test_short_events_leak_almost_nothing():
+    # The regime ffs_librarian targets.  A 2 s boxcar is nearly a delta, so the
+    # D-periodic component the convolution cannot see is a fast wiggle that any
+    # smooth family suppresses on its own.
+    res, _ = _library_for_duration(2.0)
+    leak = res.reconvolution_leakage
+    assert leak is not None
+    assert np.nanmedian(leak) < 0.05, f"median leakage {np.nanmedian(leak):.3f}"
+
+
+def test_a_long_block_alone_is_not_the_problem():
+    # Worth pinning: when the data really IS hrf ⊛ boxcar, a 20 s block
+    # deconvolves cleanly.  Duration alone does not break identifiability --
+    # which is why the warning below requires a second symptom.
+    res, _ = _library_for_duration(20.0)
+    assert np.nanmedian(res.reconvolution_leakage) < 0.10
+
+
+def test_identifiability_warning_fires_on_an_offset_response():
+    from fastfuncstuff.cli.librarian import _warn_deconvolution_unidentifiable
+
+    short, lag_s = _library_for_duration(2.0)
+    assert not _warn_deconvolution_unidentifiable(
+        short, lag_s, 2.0, short.reconvolution_leakage[np.isfinite(short.reconvolution_leakage)]
+    )
+
+    clean, lag_c = _library_for_duration(20.0)
+    assert not _warn_deconvolution_unidentifiable(
+        clean, lag_c, 20.0, clean.reconvolution_leakage[np.isfinite(clean.reconvolution_leakage)]
+    )
+
+    # Neural drive that is a mixture of sustained boxcar and an offset
+    # transient, with some voxels purely offset-driven.  The measured curve is
+    # then not `hrf ⊛ boxcar` for ANY hrf, so the deconvolution bends the
+    # impulse response into shapes that fit inside the window and mean nothing
+    # outside it.  Real 20 s block data with a visible offset response leaked
+    # 17%; this reaches 27%.
+    bad, lag_b = _library_for_duration(20.0, offset_response=1.0, sustain_lo=0.0)
+    leak = bad.reconvolution_leakage[np.isfinite(bad.reconvolution_leakage)]
+    fired = _warn_deconvolution_unidentifiable(bad, lag_b, 20.0, leak)
+    assert fired, f"no warning for an offset-response design (leakage {np.nanmedian(leak):.3f})"
