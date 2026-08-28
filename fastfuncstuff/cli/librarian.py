@@ -951,6 +951,7 @@ def write_qc_artifacts(
     group_label: str,
     prefix: str,
     gtag: str,
+    duration_s: float = 0.0,
     verbose: int = 1,
 ) -> dict:
     """Emit the QC artifacts that let a human sanity-check the library.
@@ -1142,6 +1143,117 @@ def write_qc_artifacts(
     fig.savefig(overlay_png, dpi=120)
     plt.close(fig)
     artifacts["library_overlay_png"] = str(overlay_png)
+
+    # ---- Temporal PCs -------------------------------------------------------
+    # Every library entry is a linear combination of these, so they are the
+    # hard ceiling on what shapes the library can express -- and the place a
+    # bad -n-pcs choice is visible.  For a long-block design the rise and
+    # plateau are dictated by the boxcar, so the only room left for the higher
+    # PCs to vary is the LATE lags; sampling those directions then produces
+    # "HRFs" whose energy sits at the end of the window.  A PC whose energy is
+    # concentrated in the last third is the warning sign.
+    pcs = lib.svd.pcs
+    n_pcs = pcs.shape[0]
+    var = lib.svd.eigvals**2
+    var = var / max(var.sum(), 1e-30)
+    third = max(1, len(lag_times) // 3)
+    fig, axes = plt.subplots(n_pcs, 1, figsize=(7, 1.5 * n_pcs), sharex=True)
+    axes = np.atleast_1d(axes)
+    for k, ax in enumerate(axes):
+        v = pcs[k] / max(float(np.abs(pcs[k]).max()), 1e-30)
+        # Fraction of the PC's ENERGY in the last third, not its peak height
+        # there: PC1 is a block response whose plateau is still high at the
+        # boundary before it decays, so a peak-magnitude test flags it every
+        # time.  A third of the window should hold about a third of the
+        # energy; well over half means the PC is describing the tail.
+        energy = float((v**2).sum())
+        late = float((v[-third:] ** 2).sum() / energy) if energy > 0 else 0.0
+        colour = "C3" if late > 0.5 else "C0"
+        ax.plot(lag_times, v, "o-", color=colour, ms=3)
+        ax.axhline(0, color="0.6", lw=0.5)
+        ax.axvspan(lag_times[-third], lag_times[-1], color="0.9", zorder=0)
+        ax.set_ylabel(f"PC{k + 1}")
+        ax.set_title(
+            f"PC{k + 1} — {100 * var[k]:.2f}% of variance"
+            + (
+                f"   ⚠ {100 * late:.0f}% of energy in the late lags (tail, not shape)"
+                if late > 0.5
+                else ""
+            ),
+            fontsize=9,
+            loc="left",
+        )
+    axes[-1].set_xlabel("lag (s)")
+    fig.suptitle(
+        f"Temporal PCs — group '{group_label}'  ·  shaded = last third of the window",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    pcs_png = Path(f"{prefix}{gtag}_qc_pcs.png")
+    fig.savefig(pcs_png, dpi=120)
+    plt.close(fig)
+    artifacts["pcs_png"] = str(pcs_png)
+
+    # ---- Re-convolution, on the FULL time axis ------------------------------
+    # The one figure that shows whether a library entry is usable: take the
+    # impulse response, convolve it back with the event boxcar, and compare
+    # against the curve it was derived from.
+    #
+    # The x-axis deliberately runs past the FIR window, out to where the full
+    # convolution actually ends.  Truncating it at the window is exactly the
+    # mistake the numeric check made: a lobe at 26 s convolves to 26-46 s, so
+    # on a 34 s axis its consequences are invisible and the entry looks fine.
+    # The shaded region past the window is the part no data ever constrained.
+    if lib.fitted_deconvolved is not None and lib.reconvolution_r is not None:
+        n_entries, n_t = lib.raw.shape
+        target_dt = float(lag_times[-1]) / (n_t - 1) if n_t > 1 else 0.1
+        n_box = max(1, int(round(float(duration_s) / target_dt)))
+        t_win = np.arange(n_t) * target_dt
+        t_full = np.arange(n_t + n_box - 1) * target_dt
+
+        # Span the library rather than take the first N: adjacent entries are
+        # near-duplicates under an ordered manifold and would overlay.
+        n_show = min(12, n_entries)
+        idx = np.unique(np.linspace(0, n_entries - 1, n_show).astype(int))
+        ncol = 4
+        nrow = int(np.ceil(len(idx) / ncol))
+        fig, axes = plt.subplots(
+            nrow, ncol, figsize=(4.2 * ncol, 2.8 * nrow), sharex=True, squeeze=False
+        )
+        for ax_i, ax in enumerate(axes.ravel()):
+            if ax_i >= len(idx):
+                ax.axis("off")
+                continue
+            i = int(idx[ax_i])
+            imp = lib.fitted_deconvolved[i]
+            full = np.convolve(imp, np.ones(n_box))
+            peak = float(np.max(full))
+            recon = full / peak if peak > 0 else full
+            ax.axvspan(t_win[-1], t_full[-1], color="0.92", zorder=0)
+            ax.axhline(0, color="0.6", lw=0.5)
+            ax.plot(t_win, lib.raw[i], "-", color="C0", lw=1.8, label="raw (data)")
+            ax.plot(t_full, recon, "--", color="C3", lw=1.5, label="impulse ⊛ boxcar")
+            ax.plot(t_win, imp, "-", color="C2", lw=1.0, alpha=0.8, label="impulse (library)")
+            ax.axvline(t_win[-1], color="0.4", lw=0.8, ls=":")
+            leak = lib.reconvolution_leakage[i] if lib.reconvolution_leakage is not None else np.nan
+            ax.set_title(
+                f"HRF {i}   r={lib.reconvolution_r[i]:.4f}   leak={100 * leak:.0f}%",
+                fontsize=9,
+            )
+            if ax_i == 0:
+                ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
+        for ax in axes[-1]:
+            ax.set_xlabel("time (s)")
+        fig.suptitle(
+            f"Re-convolution check — group '{group_label}'  ·  shaded = beyond the "
+            f"{t_win[-1]:.0f}s FIR window, where nothing constrained the fit",
+            fontsize=10,
+        )
+        fig.tight_layout()
+        recon_png = Path(f"{prefix}{gtag}_qc_reconvolution.png")
+        fig.savefig(recon_png, dpi=110)
+        plt.close(fig)
+        artifacts["reconvolution_png"] = str(recon_png)
 
     return artifacts
 
@@ -1370,7 +1482,13 @@ def derive_and_write_library(
         print(f"    Wrote {r2_path}")
 
     qc_artifacts = write_qc_artifacts(
-        lib, lag_times, label_for_output, args.prefix, gtag, verbose=args.verb
+        lib,
+        lag_times,
+        label_for_output,
+        args.prefix,
+        gtag,
+        duration_s=float(deconv_duration or 0.0),
+        verbose=args.verb,
     )
     for kind, path in qc_artifacts.items():
         print(f"    Wrote {path}   [QC: {kind}]")
