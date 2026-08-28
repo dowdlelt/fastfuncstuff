@@ -905,7 +905,14 @@ def main():
 
     # Build microtime onset matrix
     # This creates a (n_microtime, n_conditions) matrix with boxcar values
+    # `onset_durations` is what every part of the MODEL must use.  With a
+    # duration-convolved library the curve already contains the boxcar, so the
+    # design has to be built from impulses -- and that means everywhere, not
+    # just here: build_task_design prefers the event list over this matrix and
+    # re-applies `stim_durations` itself, so leaving the real durations in the
+    # downstream calls silently double-convolves and nothing detects it.
     onset_durations, raw_library = _resolve_raw_library(args, durations)
+    model_durations = onset_durations
     onset_matrix = create_onset_matrix_microtime(
         all_onsets,
         run_starts,
@@ -1336,7 +1343,7 @@ def main():
                 verbose=args.verb >= 1,
                 stim_vec_blocks=stim_vec_blocks,
                 event_onsets=all_onsets,
-                stim_durations=durations,
+                stim_durations=model_durations,
                 run_starts=run_starts,
             )
 
@@ -1353,7 +1360,7 @@ def main():
             hrf_library=hrf_library,
             tr=args.tr,
             run_starts=run_starts,
-            stim_durations=durations,
+            stim_durations=model_durations,
             cv_strategy=cv_strategy,
             n_perms=args.n_perms,
             metric=args.metric,
@@ -1390,7 +1397,7 @@ def main():
                 hrf_library=hrf_library,
                 tr=args.tr,
                 run_starts=run_starts,
-                stim_durations=durations,
+                stim_durations=model_durations,
                 cv_strategy=cv_strategy,
                 n_perms=args.n_perms,
                 metric=args.metric,

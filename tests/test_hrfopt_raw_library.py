@@ -113,3 +113,58 @@ def test_no_sidecar_still_works(tmp_path):
     tsv = _write(tmp_path, "sub01_hrfraw.tsv", meta=None)
     durations, raw = _resolve_raw_library(_args(raw=str(tsv)), [np.float64(20.0)])
     assert raw is True and durations == [0.0]
+
+
+def test_raw_library_design_is_not_double_convolved():
+    """The invariant the flag exists for, checked on the design itself.
+
+    Zeroing the onset MATRIX is not enough: build_task_design prefers the event
+    list over that matrix and applies `stim_durations` itself, so leaving the
+    real durations in the downstream calls re-applies the boxcar to a curve
+    that already contains one.  Nothing downstream detects it -- the design is
+    a perfectly ordinary-looking regressor, just of the wrong shape.
+
+    Measured on real data before the fix: hrfopt's reported per-HRF R2 profile
+    correlated +0.956 with what a double-convolved design predicts and -0.438
+    with the correct one, and it selected the entry ranked 19th of 20 by fit to
+    the voxels' own FIR curves for 98 of 100 sampled voxels.
+    """
+    import numpy as np
+
+    dt, n_t, tr = 0.1, 164, 2.0
+    n_mt = int(n_t * tr / dt)
+    onsets = [10.0, 70.0, 130.0, 190.0, 250.0]
+    # A library curve that is already the response to a 20 s block.
+    t = np.arange(320) * dt
+    impulse = np.exp(-((t - 5.0) ** 2) / 8.0)
+    curve = np.convolve(impulse, np.ones(int(20.0 / dt)))[: t.size]
+    curve = curve / curve.max()
+
+    def design(duration):
+        x = np.zeros(n_mt)
+        if duration > 0:
+            for o in onsets:
+                x[int(o / dt) : int((o + duration) / dt)] = 1.0
+        else:
+            for o in onsets:
+                x[int(round(o / dt))] = 1.0
+        return np.convolve(x, curve)[:n_mt].reshape(n_t, int(tr / dt)).mean(1)
+
+    correct = design(0.0)
+    doubled = design(20.0)
+
+    # The FIRST response only -- onsets are 60 s apart, so the window up to the
+    # second event isolates one.  Peak LATENCY is the discriminator, not width:
+    # convolving a 20 s-block response with another 20 s boxcar barely widens
+    # it (10 -> 11 TRs) but pushes its peak several seconds later, which is
+    # what makes a different library entry look like the better fit.
+    first = slice(0, int(60.0 / tr))
+    peak_correct = int(correct[first].argmax())
+    peak_doubled = int(doubled[first].argmax())
+    assert peak_doubled >= peak_correct + 2, (
+        f"double convolution not detectable: peak at TR {peak_correct} vs {peak_doubled}"
+    )
+
+    # And they are different enough that a selection would land elsewhere.
+    c = np.corrcoef(correct, doubled)[0, 1]
+    assert c < 0.90, f"designs too similar to distinguish (r={c:.4f})"
