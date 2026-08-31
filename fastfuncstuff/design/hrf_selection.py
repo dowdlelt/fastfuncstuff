@@ -30,6 +30,8 @@ from fastfuncstuff.utils import get_device, to_tensor
 
 from .hrf import get_hrf_library
 from .matrices import build_task_design
+from .onset_offset import DEFAULT_VIF_MAX as OSO_DEFAULT_VIF_MAX
+from .onset_offset import OSOPlan, expand_events, plan_onset_offset
 
 
 def load_nuisance_file(
@@ -181,6 +183,15 @@ class HRFSelectionResults:
 
     # Store canonical HRF design matrix for comparison/saving
     canonical_design_matrix: torch.Tensor | None = None
+
+    # Onset/offset expansion: which conditions got SUS/ON/OFF columns and where
+    # those columns sit in the beta array. None when -oso_mode off.
+    oso_plan: OSOPlan | None = None
+
+    # (n_voxels,) best CV R2 WITH the onset/offset columns minus best without,
+    # both cross-validated. Only populated when the gain diagnostic is asked
+    # for, since it costs a second selection pass.
+    oso_gain: torch.Tensor | None = None
 
 
 def _project_design_with_q_factors(
@@ -777,6 +788,9 @@ def fit_glm_hrf_library_with_xval(
     skip_final_fit: bool = False,
     stim_vec_blocks: list | None = None,
     event_onsets: list[list[np.ndarray]] | None = None,
+    oso_mode: str = "off",
+    oso_vif_max: float = OSO_DEFAULT_VIF_MAX,
+    oso_gain: bool = False,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated or in-sample R².
@@ -851,6 +865,22 @@ def fit_glm_hrf_library_with_xval(
         Print progress information
     chunk_size : int, optional
         Number of voxels to process at once (auto if None)
+    oso_mode : str, default='off'
+        Onset/offset expansion (see :mod:`fastfuncstuff.design.onset_offset`):
+        - 'off': one sustained regressor per condition, as before.
+        - 'joint': select the HRF and fit with SUS/ON/OFF columns together, so
+          the transients cannot leak into which HRF is chosen.
+        - 'staged': select the HRF on the sustained-only design, then add the
+          onset/offset columns for the final fit.
+        'joint' and 'staged' both gate per condition on the design's own
+        conditioning, so short-event conditions silently keep one column.
+    oso_vif_max : float
+        Gate threshold: a condition whose SUS/ON/OFF triple has a worse VIF than
+        this keeps its single sustained column.
+    oso_gain : bool, default=False
+        Also cross-validate the sustained-only family, so ``oso_gain`` reports
+        per voxel whether the extra columns paid for themselves.  Costs a second
+        selection pass over the data.
     select_mode : str, default='xval'
         HRF selection criterion:
         - 'xval': cross-validated R² (LORO or split-half, controlled by cv_strategy).
@@ -920,7 +950,60 @@ def fit_glm_hrf_library_with_xval(
     n_hrfs = hrf_library.shape[0]
     n_runs = len(run_starts)
 
-    def _event_safe_design(hrf: torch.Tensor) -> torch.Tensor:
+    # ---------------------------------------------------------------- OSO
+    # The onset/offset expansion lives in CONDITION space: SUS/ON/OFF are three
+    # ordinary conditions sharing one impulse response, so every design below is
+    # built by the same call with a longer event list.  Two families exist while
+    # -oso_mode staged is running, which selects on the narrow one and fits the
+    # wide one; joint uses the wide one throughout.
+    oso_plan = plan_onset_offset(
+        mode=oso_mode,
+        event_onsets=event_onsets,
+        durations=stim_durations,
+        condition_labels=condition_labels,
+        hrf_library=hrf_library,
+        n_timepoints=n_timepoints_data,
+        run_starts=run_starts,
+        tr=tr,
+        microtime_dt=microtime_dt,
+        microtime_onset=microtime_onset,
+        vif_max=oso_vif_max,
+        device=device,
+        verbose=verbose,
+    )
+    base_events, base_durations = event_onsets, stim_durations
+    if oso_plan.active:
+        assert event_onsets is not None and stim_durations is not None
+        oso_events, oso_durations, _, _ = expand_events(
+            event_onsets, list(stim_durations), condition_labels, oso_plan.enabled
+        )
+    else:
+        oso_events, oso_durations = base_events, base_durations
+
+    # The selection family and the final-fit family, which differ only in staged
+    # mode.  Everything downstream reads these rather than the raw event list.
+    if oso_plan.active and oso_mode == "joint":
+        select_events, select_durations = oso_events, oso_durations
+    else:
+        select_events, select_durations = base_events, base_durations
+    fit_events, fit_durations = (
+        (oso_events, oso_durations)
+        if oso_plan.active
+        else (
+            base_events,
+            base_durations,
+        )
+    )
+
+    def _event_safe_design(
+        hrf: torch.Tensor,
+        events: list[list[np.ndarray]] | None = None,
+        durations: list[float] | None = None,
+    ) -> torch.Tensor:
+        # The sampled onset matrix is only a valid fallback for the UNEXPANDED
+        # design: it has one column per original condition and cannot represent
+        # an ON or OFF column, so an expanded call must never reach it.
+        expanded = events is not None and events is not base_events
         return build_task_design(
             hrf,
             n_timepoints_data,
@@ -928,9 +1011,9 @@ def fit_glm_hrf_library_with_xval(
             tr=tr,
             microtime_dt=microtime_dt,
             microtime_onset=microtime_onset,
-            event_onsets=event_onsets,
-            durations=stim_durations,
-            onsets_microtime=onsets,
+            event_onsets=event_onsets if events is None else events,
+            durations=stim_durations if durations is None else durations,
+            onsets_microtime=None if expanded else onsets,
             device=device,
         )
 
@@ -1146,7 +1229,7 @@ def fit_glm_hrf_library_with_xval(
     )
     for hrf_idx in hrf_indices:
         hrf = hrf_library[hrf_idx]
-        stim_design = _event_safe_design(hrf)
+        stim_design = _event_safe_design(hrf, select_events, select_durations)
         stim_design = _append_stim_vec_columns(
             stim_design,
             stim_vec_blocks,
@@ -1200,7 +1283,11 @@ def fit_glm_hrf_library_with_xval(
     if verbose:
         print(f"  Using {canonical_label} canonical HRF for baseline comparison")
 
-    canonical_design = _event_safe_design(canonical_hrf)
+    # The xval baseline holds the MODEL fixed and varies only the HRF, so it
+    # follows the selection family; the full-data baseline is compared against
+    # the final fit's betas, so it follows the fit family.  Same object unless
+    # -oso_mode staged is running.
+    canonical_design = _event_safe_design(canonical_hrf, select_events, select_durations)
     canonical_design = _append_stim_vec_columns(
         canonical_design,
         stim_vec_blocks,
@@ -1215,6 +1302,20 @@ def fit_glm_hrf_library_with_xval(
     projected_canonical_design = _project_design_with_q_factors(
         canonical_design, q_factors, run_starts, n_timepoints, n_runs, device
     )
+
+    canonical_design_fit = canonical_design
+    if select_events is not fit_events:
+        canonical_design_fit = _append_stim_vec_columns(
+            _event_safe_design(canonical_hrf, fit_events, fit_durations),
+            stim_vec_blocks,
+            canonical_hrf,
+            n_timepoints=n_timepoints,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            run_starts=run_starts,
+            device=device,
+        )
 
     # =========================================================================
     # Debug: save design diagnostic figures + print detailed stats
@@ -1471,6 +1572,79 @@ def fit_glm_hrf_library_with_xval(
         assert isinstance(canonical_xval["r2"], torch.Tensor)
         xval_r2_canonical = canonical_xval["r2"].to(device)
 
+    # =========================================================================
+    # OSO gain: cross-validate the OTHER design family so the extra columns can
+    # be judged rather than assumed.  Both sides are held out, so this is an
+    # honest per-voxel model comparison -- and it is opt-in because it is a
+    # second pass over the data.  The families have different column counts, so
+    # they cannot share one batched call: _evaluate_hrfs_batched stacks its
+    # designs into a single tensor.
+    # =========================================================================
+    oso_gain_map = None
+    if oso_gain and oso_plan.active:
+        selected_is_oso = select_events is oso_events
+        other_events, other_durations = (
+            (base_events, base_durations) if selected_is_oso else (oso_events, oso_durations)
+        )
+        if verbose:
+            other_label = "sustained-only" if selected_is_oso else "onset/offset"
+            print(f"  OSO gain: cross-validating the {other_label} family as well...")
+
+        other_projected = []
+        for hrf_idx in tqdm(
+            range(n_hrfs), desc="OSO gain designs", disable=not verbose or n_hrfs <= 1
+        ):
+            hrf = hrf_library[hrf_idx]
+            other_design = _append_stim_vec_columns(
+                _event_safe_design(hrf, other_events, other_durations),
+                stim_vec_blocks,
+                hrf,
+                n_timepoints=n_timepoints,
+                tr=tr,
+                microtime_dt=microtime_dt,
+                microtime_onset=microtime_onset,
+                run_starts=run_starts,
+                device=device,
+            )
+            other_projected.append(
+                _project_design_with_q_factors(
+                    other_design, q_factors, run_starts, n_timepoints, n_runs, device
+                )
+            )
+
+        if select_mode == "full":
+            r2_other = _evaluate_hrfs_insample(
+                projected_data=projected_data,
+                projected_designs=other_projected,
+                device=device,
+                chunk_size=effective_chunk_size,
+                verbose=verbose,
+            )
+        else:
+            r2_other = _evaluate_hrfs_batched(
+                projected_data=projected_data,
+                projected_designs=other_projected,
+                run_starts=run_starts,
+                cv_splits=cv_splits,
+                device=device,
+                metric=metric,
+                chunk_size=effective_chunk_size,
+                verbose=verbose,
+            )
+        best_other = r2_other.to(device).max(dim=1).values
+        best_selected = xval_r2_median_all.max(dim=1).values
+        # Always signed OSO-minus-sustained, whichever family was selected on.
+        oso_gain_map = best_selected - best_other if selected_is_oso else best_other - best_selected
+        if verbose:
+            frac = float((oso_gain_map > 0).float().mean())
+            print(
+                f"  OSO gain: median {float(oso_gain_map.median()):+.5f}, "
+                f"positive in {100 * frac:.1f}% of voxels"
+            )
+        del other_projected, r2_other, best_other, best_selected
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     xval_r2_std_all = torch.zeros(n_voxels, n_hrfs, device=device)
 
     # Clear GPU cache after evaluation
@@ -1499,7 +1673,7 @@ def fit_glm_hrf_library_with_xval(
         # polynomials (already in nuisance_design).
         canonical_glm_results = fit_glm(
             data=data,
-            design=canonical_design,  # Task-only design
+            design=canonical_design_fit,  # Task-only design
             tr=tr,
             max_poly_degree=-1,  # No additional polynomials — already in extra_regressors
             extra_regressors=nuisance_design,  # Nuisance passed separately
@@ -1512,7 +1686,7 @@ def fit_glm_hrf_library_with_xval(
             print(f"  Canonical HRF full-data R²: {canonical_glm_results.r2.mean().item():.4f}")
 
     # Store the canonical design matrix (task + nuisance) for saving
-    canonical_design_matrix = torch.cat([canonical_design, nuisance_design], dim=1)
+    canonical_design_matrix = torch.cat([canonical_design_fit, nuisance_design], dim=1)
 
     # Select best HRF per voxel based on median CV R²
     hrf_index = xval_r2_median_all.argmax(dim=1)  # (n_voxels,)
@@ -1559,8 +1733,9 @@ def fit_glm_hrf_library_with_xval(
             verbose=verbose,
             chunk_size=chunk_size,
             stim_vec_blocks=stim_vec_blocks,
-            event_onsets=event_onsets,
-            stim_durations=stim_durations,
+            event_onsets=fit_events,
+            stim_durations=fit_durations,
+            n_conditions=len(fit_durations) if fit_durations is not None else None,
         )
 
     # Build metadata for ARMA reuse
@@ -1584,6 +1759,8 @@ def fit_glm_hrf_library_with_xval(
         "n_timepoints": n_timepoints,
         "n_runs": n_runs,
         "hrf_usage_counts": torch.bincount(hrf_index, minlength=n_hrfs).cpu().tolist(),
+        "oso": oso_plan.to_metadata(),
+        "task_column_labels": list(oso_plan.labels) if oso_plan.labels else None,
     }
 
     # Build HRF group indices for efficient ARMA reuse (index into active voxels)
@@ -1612,6 +1789,7 @@ def fit_glm_hrf_library_with_xval(
         xval_r2_std = _pad_to_full(xval_r2_std)
         xval_r2_median_all = _pad_to_full(xval_r2_median_all)
         xval_r2_canonical = _pad_to_full(xval_r2_canonical)
+        oso_gain_map = _pad_to_full(oso_gain_map)
 
         for _glm_res in [final_results, canonical_glm_results]:
             if _glm_res is None:
@@ -1646,6 +1824,8 @@ def fit_glm_hrf_library_with_xval(
         hrf_group_indices={k: v.cpu() for k, v in hrf_group_indices.items()},
         design_matrix=design_matrix_ref,
         canonical_design_matrix=canonical_design_matrix.cpu(),
+        oso_plan=oso_plan,
+        oso_gain=None if oso_gain_map is None else oso_gain_map.cpu(),
     )
 
     if verbose:
@@ -1681,6 +1861,7 @@ def _fit_voxelwise_hrf(
     stim_vec_blocks: list | None = None,
     event_onsets: list[list[np.ndarray]] | None = None,
     stim_durations: list[float] | None = None,
+    n_conditions: int | None = None,
 ) -> GLMResults:
     """
     Fit GLM with voxel-wise HRFs by grouping voxels with same HRF.
@@ -1701,7 +1882,11 @@ def _fit_voxelwise_hrf(
     bins_per_tr = int(round(tr / microtime_dt))
     n_timepoints = onsets.shape[0] // bins_per_tr
 
-    n_conditions = onsets.shape[1]
+    # The microtime onset matrix has one column per ORIGINAL condition, so it
+    # cannot be trusted to count the design's columns once the onset/offset
+    # expansion has added its own; the caller passes the expanded count.
+    if n_conditions is None:
+        n_conditions = onsets.shape[1]
     _n_nuisance_cols = nuisance_design.shape[1]
 
     # The stim design is the conditions plus any continuous stim vectors, which
