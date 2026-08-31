@@ -791,6 +791,7 @@ def fit_glm_hrf_library_with_xval(
     oso_mode: str = "off",
     oso_vif_max: float = OSO_DEFAULT_VIF_MAX,
     oso_gain: bool = False,
+    oso_plan: OSOPlan | None = None,
 ) -> HRFSelectionResults:
     """
     Select best HRF per voxel using cross-validated or in-sample R².
@@ -881,6 +882,11 @@ def fit_glm_hrf_library_with_xval(
         Also cross-validate the sustained-only family, so ``oso_gain`` reports
         per voxel whether the extra columns paid for themselves.  Costs a second
         selection pass over the data.
+    oso_plan : OSOPlan, optional
+        A plan already built by :func:`~fastfuncstuff.design.onset_offset.
+        plan_onset_offset`.  CLIs build it up front so the user sees which
+        conditions qualified *before* a long fit starts; passing it here avoids
+        planning the same design twice.
     select_mode : str, default='xval'
         HRF selection criterion:
         - 'xval': cross-validated R² (LORO or split-half, controlled by cv_strategy).
@@ -956,21 +962,26 @@ def fit_glm_hrf_library_with_xval(
     # built by the same call with a longer event list.  Two families exist while
     # -oso_mode staged is running, which selects on the narrow one and fits the
     # wide one; joint uses the wide one throughout.
-    oso_plan = plan_onset_offset(
-        mode=oso_mode,
-        event_onsets=event_onsets,
-        durations=stim_durations,
-        condition_labels=condition_labels,
-        hrf_library=hrf_library,
-        n_timepoints=n_timepoints_data,
-        run_starts=run_starts,
-        tr=tr,
-        microtime_dt=microtime_dt,
-        microtime_onset=microtime_onset,
-        vif_max=oso_vif_max,
-        device=device,
-        verbose=verbose,
-    )
+    if oso_plan is not None and oso_plan.mode != oso_mode:
+        raise ValueError(
+            f"oso_plan was built for mode {oso_plan.mode!r} but oso_mode is {oso_mode!r}"
+        )
+    if oso_plan is None:
+        oso_plan = plan_onset_offset(
+            mode=oso_mode,
+            event_onsets=event_onsets,
+            durations=stim_durations,
+            condition_labels=condition_labels,
+            hrf_library=hrf_library,
+            n_timepoints=n_timepoints_data,
+            run_starts=run_starts,
+            tr=tr,
+            microtime_dt=microtime_dt,
+            microtime_onset=microtime_onset,
+            vif_max=oso_vif_max,
+            device=device,
+            verbose=verbose,
+        )
     base_events, base_durations = event_onsets, stim_durations
     if oso_plan.active:
         assert event_onsets is not None and stim_durations is not None

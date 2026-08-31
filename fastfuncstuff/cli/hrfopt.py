@@ -321,6 +321,57 @@ Notes:
         ),
     )
 
+    # Onset/offset expansion
+    oso_opts = parser.add_argument_group("Onset/Offset Options (block designs)")
+    oso_opts.add_argument(
+        "-oso_mode",
+        choices=["off", "joint", "staged"],
+        default="off",
+        help=(
+            "Add onset and offset impulse regressors beside each\n"
+            "condition's sustained boxcar, all convolved with the\n"
+            "same candidate HRF, so a block response splits into\n"
+            "sustained + transients (three betas per condition):\n"
+            "\n"
+            "  off     one sustained regressor per condition.\n"
+            "  joint   select the HRF and fit with all three\n"
+            "          columns present.  Recommended: the\n"
+            "          transients cannot then leak into which HRF\n"
+            "          is chosen.\n"
+            "  staged  select the HRF on the sustained-only design,\n"
+            "          then add onset/offset for the final fit.\n"
+            "\n"
+            "Needs long events: onset, offset and sustained are the\n"
+            "same regressor for short trials, so each condition is\n"
+            "gated on the design's own conditioning and short ones\n"
+            "silently keep their single column.  Writes\n"
+            "{prefix}_waveshape.nii.gz (the w and asymmetry indices)."
+        ),
+    )
+    oso_opts.add_argument(
+        "-oso_vif_max",
+        type=float,
+        default=None,
+        help=(
+            "Gate threshold for -oso_mode (default 5.0): a condition\n"
+            "whose SUS/ON/OFF triple is worse conditioned than this\n"
+            "keeps its single sustained column.  Worst-case VIF over\n"
+            "the canonical library is 1.1 for 20s blocks, 5.9 at 4s,\n"
+            "71 at 2s."
+        ),
+    )
+    oso_opts.add_argument(
+        "-oso_gain",
+        action="store_true",
+        help=(
+            "Also cross-validate the sustained-only model, and write\n"
+            "{prefix}_oso_gain.nii.gz: held-out R2 with the extra\n"
+            "columns minus without, per voxel.  The honest test of\n"
+            "whether they paid for themselves -- and it costs a\n"
+            "second selection pass over the data."
+        ),
+    )
+
     # PIGHS-specific options
     pighs_opts = parser.add_argument_group("PIGHS Options (only used with -hrf_mode pighs)")
     pighs_opts.add_argument(
@@ -754,6 +805,30 @@ def main():
         )
         sys.exit(1)
 
+    from fastfuncstuff.design.onset_offset import DEFAULT_VIF_MAX as OSO_DEFAULT_VIF_MAX
+
+    oso_vif_max = OSO_DEFAULT_VIF_MAX if args.oso_vif_max is None else args.oso_vif_max
+    if args.oso_mode != "off":
+        # Both of these build their own designs from the raw event list and
+        # would quietly ignore the onset/offset columns, so the outputs would
+        # not be the model the flag asked for.
+        if cv_design == "single":
+            print(
+                "ERROR: -oso_mode is not supported with single-trial HRF selection.\n"
+                "       Re-run with -cv_design condition."
+            )
+            sys.exit(1)
+        if args.single_trials:
+            print(
+                "ERROR: -oso_mode and -single_trials are incompatible: a single-trial\n"
+                "       design has one column per trial and no sustained/transient\n"
+                "       split to make."
+            )
+            sys.exit(1)
+    if args.oso_gain and args.oso_mode == "off":
+        print("ERROR: -oso_gain needs -oso_mode joint or staged (there is nothing to compare).")
+        sys.exit(1)
+
     # Pre-flight checks (before slow data loading)
     preflight_check(
         input_files=input_files,
@@ -929,10 +1004,42 @@ def main():
         verbose=(args.verb >= 1),
     )
 
+    # Plan the onset/offset expansion HERE rather than inside the fit, so which
+    # conditions qualified is on screen before a long fit starts -- and printed
+    # even at -verb 0, like the -cv_design switch: a silently different design
+    # is exactly the thing that gets misread later.
+    from fastfuncstuff.design.onset_offset import plan_onset_offset
+
+    if args.oso_mode != "off" and raw_library:
+        print(
+            "ERROR: -oso_mode cannot be combined with -hrf-library-raw.  A\n"
+            "       duration-convolved library carries the boxcar inside its curves, so\n"
+            "       the model's events are impulses and the sustained and onset columns\n"
+            "       would be the same regressor."
+        )
+        sys.exit(1)
+
+    oso_plan = plan_onset_offset(
+        mode=args.oso_mode,
+        event_onsets=all_onsets,
+        durations=model_durations,
+        condition_labels=condition_labels,
+        hrf_library=hrf_library,
+        n_timepoints=n_timepoints,
+        run_starts=run_starts,
+        tr=args.tr,
+        microtime_dt=args.microtime_dt,
+        vif_max=oso_vif_max,
+        device=device,
+        verbose=args.oso_mode != "off",
+    )
+
     # One label per task COLUMN for the output writers. condition_labels itself
     # stays pristine: it is the CONDITION list, and the single-trial builders
-    # would read an extra entry as an extra condition.
-    task_column_labels = list(condition_labels) + stim_vec_bucket_labels(stim_vec_blocks)
+    # would read an extra entry as an extra condition.  The onset/offset
+    # expansion adds columns, so the label list follows the expanded design.
+    base_task_labels = list(oso_plan.labels) if oso_plan.active else list(condition_labels)
+    task_column_labels = base_task_labels + stim_vec_bucket_labels(stim_vec_blocks)
 
     # Legacy variable retained for back-compat fields (metadata + delta-denoise label).
     ortvec_files = [(f, label) for f, label in args.ortvec] if args.ortvec else None
@@ -1319,6 +1426,10 @@ def main():
             condition_labels=condition_labels,
             stim_vec_blocks=stim_vec_blocks,
             event_onsets=all_onsets,
+            oso_mode=args.oso_mode,
+            oso_vif_max=oso_vif_max,
+            oso_gain=args.oso_gain,
+            oso_plan=oso_plan,
         )
 
         # ========== -delta_denoise: second pass without ortvec ==========
@@ -1358,6 +1469,13 @@ def main():
                 debug_prefix=args.prefix,
                 condition_labels=condition_labels,
                 event_onsets=all_onsets,
+                oso_mode=args.oso_mode,
+                oso_vif_max=oso_vif_max,
+                oso_plan=oso_plan,
+                # The gain map is about the model, and the model is held fixed
+                # across the two passes -- computing it twice would only pay for
+                # a second selection pass to answer the same question.
+                oso_gain=False,
             )
 
     if cv_data is not data:
@@ -1479,6 +1597,41 @@ def main():
         selected_tr_dt=_selected_tr_dt(args),
         microtime_dt=args.microtime_dt,
     )
+
+    # ---- Onset/offset diagnostics ----
+    if oso_plan.active and results.final_results is not None:
+        from fastfuncstuff.design.onset_offset import waveshape_maps
+
+        # w and the asymmetry go in ONE labelled bucket per condition pair: they
+        # are two readings of the same three betas, and reading w without seeing
+        # which transient dominates is how the published index loses the
+        # accumulator/adapter axis in the first place.
+        wave = waveshape_maps(results.final_results.betas, oso_plan)
+        if wave:
+            output_files["waveshape"] = save_r2_ceiling_stack(
+                [(v, k) for k, v in wave.items()],
+                f"{args.prefix}_waveshape{_nii_ext}",
+                volume_shape,
+                affine,
+                voxel_mask.numpy() if voxel_mask is not None else None,
+            )
+            print(f"  {output_files['waveshape']}")
+
+    if results.oso_gain is not None:
+        gain = results.oso_gain
+        output_files["oso_gain"] = save_r2_ceiling_stack(
+            [(gain, "oso_gain_R2")],
+            f"{args.prefix}_oso_gain{_nii_ext}",
+            volume_shape,
+            affine,
+            voxel_mask.numpy() if voxel_mask is not None else None,
+        )
+        print(f"  {output_files['oso_gain']}")
+        print(
+            f"    held-out R2 with onset/offset minus without: median "
+            f"{float(gain.median()):+.5f}, positive in "
+            f"{100 * float((gain > 0).float().mean()):.1f}% of voxels"
+        )
 
     if beta_ceiling is not None and beta_ceiling.result.n_usable:
         # Restacked onto _hrfopt_xval_r2, the beta-space CV map the ceiling was
