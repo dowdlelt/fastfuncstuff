@@ -557,6 +557,25 @@ def project_out_nuisance(
     return data_cleaned, design_cleaned
 
 
+# Below this, a timeseries has no variance to explain and CoD is undefined.
+_SS_TOT_FLOOR = 1e-10
+
+
+def _cod_ratio(ss_res: torch.Tensor, ss_tot: torch.Tensor) -> torch.Tensor:
+    """1 - SS_res/SS_tot, with the degenerate case scored 0 rather than 1.
+
+    A constant timeseries has SS_tot == 0, and a model that predicts it
+    exactly has SS_res == 0 too.  Nudging SS_tot by an epsilon turns that into
+    1 - 0 = 1 -- a perfect score for a voxel with no signal to explain.  Those voxels then win HRF/hyperparameter selection and drag
+    median R2 upwards.  CoD is undefined when there is no variance to explain;
+    0 is the honest value here, and unlike NaN it survives the medians and
+    argmaxes downstream without poisoning them.
+    """
+    degenerate = ss_tot <= _SS_TOT_FLOOR
+    r2 = 1.0 - (ss_res / torch.clamp(ss_tot, min=_SS_TOT_FLOOR))
+    return torch.where(degenerate, torch.zeros_like(r2), torch.clamp(r2, max=1.0))
+
+
 @torch.inference_mode()
 def _cod_kernel(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     """Pure-tensor coefficient-of-determination kernel.
@@ -570,8 +589,7 @@ def _cod_kernel(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
     ss_res = ((y_true - y_pred) ** 2).sum(dim=1)
     y_mean = y_true.mean(dim=1, keepdim=True)
     ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
-    r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
-    return torch.clamp(r2, max=1.0)
+    return _cod_ratio(ss_res, ss_tot)
 
 
 @torch.inference_mode()
@@ -585,8 +603,7 @@ def _cod_from_ss_res_kernel(y_true: torch.Tensor, ss_res: torch.Tensor) -> torch
     """
     y_mean = y_true.mean(dim=1, keepdim=True)
     ss_tot = ((y_true - y_mean) ** 2).sum(dim=1)
-    r2 = 1.0 - (ss_res / (ss_tot + 1e-10))
-    return torch.clamp(r2, max=1.0)
+    return _cod_ratio(ss_res, ss_tot)
 
 
 # Compile through the central policy: PCH disabled (no stale-cache crashes) plus a
@@ -1334,9 +1351,28 @@ def compute_xval_r2(
     # held-out runs". That replaces a full-length gather of the training data
     # per fold with two contiguous passes over the batch.
     #
+    # That subtraction is only the training set when train IS the complement of
+    # test, which generate_cv_splits guarantees but a caller-supplied split does
+    # not: a split that holds runs out of BOTH sides silently trains on them,
+    # and on a three-run [train 0 | test 1 | run 2 unused] split the difference
+    # is R2 -2449 against a true 1.0.  So it is checked, not assumed.
+    #
     # FFS_XVAL_LEGACY=1 forces the original streaming loop, as an escape hatch
     # if this path is ever suspected in a result.
-    use_per_run_path = len(nuisance_indices) == 0 and os.environ.get("FFS_XVAL_LEGACY", "") != "1"
+    splits_are_complementary = all(
+        set(train_runs) == set(range(n_runs)) - set(test_runs)
+        for train_runs, test_runs in cv_splits
+    )
+    use_per_run_path = (
+        len(nuisance_indices) == 0
+        and splits_are_complementary
+        and os.environ.get("FFS_XVAL_LEGACY", "") != "1"
+    )
+    if not splits_are_complementary and verbose:
+        print(
+            "  Splits are not train == complement(test); using the general "
+            "per-fold path (the run-total subtraction does not apply)."
+        )
 
     if use_per_run_path:
         stim_design_all = design_matrix[:, stim_indices]  # (n_timepoints, n_stim)

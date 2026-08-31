@@ -29,6 +29,7 @@ from tqdm import tqdm
 from fastfuncstuff.decomposition.pca import PCA
 from fastfuncstuff.denoise.sequential import _compute_local_run_starts
 from fastfuncstuff.glm.xval import (
+    _cod_ratio,
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
@@ -398,7 +399,7 @@ def evaluate_all_combinations_for_run(
                 ss_clean = ss_dp - (a_proj * a_proj).sum(dim=1).double()
                 mean_clean = (sum_dp - (q_col_sums.unsqueeze(-1) * a_proj).sum(dim=1).double()) / T
                 ss_tot = ss_clean - T * mean_clean * mean_clean
-                cod_chunk = (1.0 - ss_res / ss_tot.clamp(min=1e-10)).float()
+                cod_chunk = _cod_ratio(ss_res, ss_tot).float()
 
                 all_cod[combo_batch_start:combo_batch_end, chunk_start:chunk_end] = cod_chunk.cpu()
                 del a_proj, e_proj, cod_chunk
@@ -465,7 +466,7 @@ def evaluate_all_combinations_for_run(
             ss_res = ((data_clean_chunk - pred_chunk) ** 2).sum(dim=1)
             data_mean = data_clean_chunk.mean(dim=1, keepdim=True)
             ss_tot = ((data_clean_chunk - data_mean) ** 2).sum(dim=1)
-            cod_chunk = 1.0 - ss_res / ss_tot.clamp(min=1e-10)
+            cod_chunk = _cod_ratio(ss_res, ss_tot)
 
             # Store directly to CPU
             all_cod[combo_batch_start:combo_batch_end, chunk_start:chunk_end] = cod_chunk.cpu()
@@ -737,7 +738,7 @@ def evaluate_combinations_cross_run(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    cod = 1.0 - ss_res / ss_tot.clamp(min=1e-10).unsqueeze(0)
+    cod = _cod_ratio(ss_res, ss_tot.unsqueeze(0))
     median_cod = cod.median(dim=1).values.numpy().astype(np.float64)
     if variance_ratios is None:
         var_explained = np.zeros(len(combinations))

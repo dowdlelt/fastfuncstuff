@@ -78,6 +78,7 @@ try:
     from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
     from fastfuncstuff.glm.outputs import write_glm_bucket_as_nifti
     from fastfuncstuff.glm.xval import (
+        _cod_ratio,
         compute_xval_r2,
         generate_cv_splits,
         project_out_nuisance_per_run,
@@ -619,7 +620,7 @@ def cross_validate_denoising_for_hrf(
             residuals = chunk_test.unsqueeze(0) - y_pred_all
             ss_res_all = (residuals**2).sum(dim=2)
             ss_tot = ((chunk_test - chunk_test.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-            r2_all = 1 - (ss_res_all / (ss_tot.unsqueeze(0) + 1e-10))
+            r2_all = _cod_ratio(ss_res_all, ss_tot.unsqueeze(0))
 
             for n_pcs in range(max_pcs + 1):
                 r2_accum[n_pcs].append(r2_all[n_pcs].cpu())
