@@ -771,12 +771,9 @@ def compute_r2_from_sufficient_stats(
     mean_actual = sum_actual / n_timepoints
     ss_tot = sum_sq_actual - n_timepoints * (mean_actual**2)
 
-    # Coefficient of determination
-    r2 = 1.0 - ss_res / (ss_tot + 1e-10)
-
-    # Clamp max to 1.0 (values > 1 indicate numerical issues)
-    # Note: R² CAN be negative (model worse than mean) - that's valid information
-    r2 = torch.clamp(r2, max=1.0)
+    # Coefficient of determination.  Note: R² CAN be negative (model worse
+    # than the mean) -- that's valid information; only the >1 side is clamped.
+    r2 = _cod_ratio(ss_res, ss_tot)
 
     return r2.float()
 
@@ -1768,7 +1765,7 @@ def compute_xval_r2(
         ss_tot = sum_sq_act - n_pts * (mean_actual**2)
 
         # R² = 1 - SS_res / SS_tot
-        r2_final = (1.0 - ss_res / (ss_tot + 1e-10)).float()
+        r2_final = _cod_ratio(ss_res, ss_tot).float()
 
         # Free accumulators
         del ss_res_accumulator, sum_actual, sum_sq_actual, count_timepoints
@@ -2099,7 +2096,7 @@ def single_trial_cv_helper(
             n_pts = float(total_test_trials)
             if metric == "cod":
                 ss_tot = acc_sum_yy - acc_sum_y**2 / n_pts
-                r2 = (1.0 - acc_ss_res / (ss_tot + 1e-10)).float()
+                r2 = _cod_ratio(acc_ss_res, ss_tot).float()
             else:
                 # Pearson from sufficient statistics
                 cov = acc_sum_yp - acc_sum_y * acc_sum_p / n_pts

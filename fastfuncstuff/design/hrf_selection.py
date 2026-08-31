@@ -21,6 +21,7 @@ from tqdm.auto import tqdm
 
 from fastfuncstuff.glm.core import GLMResults, construct_polynomial_matrix, fit_glm
 from fastfuncstuff.glm.xval import (
+    _cod_ratio,
     compute_xval_r2,
     generate_cv_splits,
     project_out_nuisance_per_run,
@@ -326,7 +327,10 @@ def _evaluate_hrfs_batched(
     else:
         sum_y_all = projected_data.sum(dim=1)
         sum_y2_all = (projected_data**2).sum(dim=1)
-    ss_tot_global = (sum_y2_all - sum_y_all**2 / n_timepoints).clamp(min=1e-10)
+    # Left UNCLAMPED: _cod_ratio needs to see a zero to recognise a voxel with
+    # no variance to explain.  Clamping it to 1e-10 first turns a constant
+    # voxel into a perfect score.
+    ss_tot_global = sum_y2_all - sum_y_all**2 / n_timepoints
 
     # =========================================================================
     # Path A: LORO -- fold-outer, SS_res accumulation.
@@ -422,7 +426,7 @@ def _evaluate_hrfs_batched(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-            return (1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)).cpu()
+            return _cod_ratio(sum_ss_res, ss_tot_global.unsqueeze(1)).cpu()
 
         split_iter = tqdm(cv_splits, desc="CV splits") if verbose else cv_splits
         for train_runs, test_runs in split_iter:
@@ -465,7 +469,7 @@ def _evaluate_hrfs_batched(
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
-        return (1.0 - sum_ss_res / ss_tot_global.unsqueeze(1)).cpu()
+        return _cod_ratio(sum_ss_res, ss_tot_global.unsqueeze(1)).cpu()
 
     # --- Path B follows (guard clause above returned for LORO) ---------------
     # This is an intentional early-return guard rather than a giant else-block.
@@ -590,7 +594,7 @@ def _evaluate_hrfs_batched(
 
         ss_tot_chunk = ss_tot_global[cs:ce].to(device)
         if metric == "cod":
-            scores = 1.0 - sum_ss_res / ss_tot_chunk.unsqueeze(1)
+            scores = _cod_ratio(sum_ss_res, ss_tot_chunk.unsqueeze(1))
         elif metric in ("corr", "corr2"):
             assert sum_pred is not None and sum_pred2 is not None and sum_data_pred is not None
             sum_data = sum_y_all[cs:ce].to(device).unsqueeze(1)
@@ -683,7 +687,7 @@ def _evaluate_hrfs_insample(
     # SS_tot: mean-subtracted variance per voxel (same denominator as CV path)
     sum_y = projected_data.sum(dim=1)
     sum_y2 = (projected_data**2).sum(dim=1)
-    ss_tot = (sum_y2 - sum_y**2 / n_timepoints).clamp(min=1e-10)
+    ss_tot = sum_y2 - sum_y**2 / n_timepoints  # unclamped: see _cod_ratio
 
     output_device = device if data_on_device else torch.device("cpu")
     r2_out = torch.zeros(n_voxels, n_designs, device=output_device)
@@ -713,7 +717,7 @@ def _evaluate_hrfs_insample(
             betas = pinvs[d_idx] @ data_chunk.T
             yhat = (designs_gpu[d_idx] @ betas).T
             ss_res = ((data_chunk - yhat) ** 2).sum(dim=1)
-            r2_out[cs:ce, d_idx] = (1.0 - ss_res / ss_tot_chunk).to(output_device)
+            r2_out[cs:ce, d_idx] = _cod_ratio(ss_res, ss_tot_chunk).to(output_device)
 
         del data_chunk
         if device.type == "cuda":
@@ -1412,7 +1416,7 @@ def fit_glm_hrf_library_with_xval(
         _y = projected_data[: min(1000, n_voxels), :]
         _ss_res = ((_y - _pred) ** 2).sum(dim=1)
         _ss_tot = ((_y - _y.mean(dim=1, keepdim=True)) ** 2).sum(dim=1)
-        _r2_quick = 1 - _ss_res / _ss_tot.clamp(min=1e-10)
+        _r2_quick = _cod_ratio(_ss_res, _ss_tot)
         print(
             f"  In-sample R² (first {min(1000, n_voxels)} voxels): "
             f"mean={_r2_quick.mean():.4f} median={_r2_quick.median():.4f} "

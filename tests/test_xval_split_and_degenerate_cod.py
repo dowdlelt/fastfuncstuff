@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from fastfuncstuff.glm.xval import _cod_kernel, _cod_ratio, compute_xval_r2
@@ -86,10 +87,63 @@ def test_complete_loro_split_still_uses_the_fast_path_and_agrees():
     assert torch.allclose(fast, legacy, atol=1e-4)
 
 
-def test_constant_voxel_does_not_score_one():
+def test_constant_voxel_does_not_score_one_in_the_kernel():
     y = torch.full((1, 20), 7.0)
     assert _cod_kernel(y, y.clone()).item() == 0.0
     assert _cod_kernel(y, y + 1.0).item() == 0.0
+
+
+@pytest.mark.parametrize("r2_method", ["fast", "slow"])
+def test_constant_voxel_does_not_score_one_through_compute_xval_r2(r2_method):
+    """Through the public entry point, on BOTH finalisation paths.
+
+    Patching _cod_kernel alone did not fix this: the LORO fast path finalises
+    from its own sufficient-statistic accumulators and the slow path from its
+    own averaged timeseries, and both carried the epsilon.  A test that calls
+    the kernel directly passes while the default production path still returns
+    0.9989 for a voxel with nothing in it.
+    """
+    _, design, run_starts = _three_run_problem()
+    n_tp = design.shape[0]
+
+    # One constant voxel and one real one, so a bug cannot hide in an
+    # all-degenerate batch.
+    real = (torch.randn(1, 2) @ design.T) + 0.01 * torch.randn(1, n_tp)
+    data = torch.cat([torch.full((1, n_tp), 7.0), real], dim=0)
+
+    r2 = compute_xval_r2(
+        data=data,
+        design_matrix=design,
+        run_starts=run_starts,
+        stim_indices=[0, 1],
+        nuisance_indices=[],
+        cv_splits=[([1, 2], [0]), ([0, 2], [1]), ([0, 1], [2])],
+        device=torch.device("cpu"),
+        r2_method=r2_method,
+        verbose=False,
+    )["r2"]
+
+    assert r2[0].item() == 0.0, f"constant voxel scored {r2[0].item():.4f} on the {r2_method} path"
+    assert r2[1].item() > 0.9  # the real voxel is unaffected
+
+
+def test_constant_voxel_does_not_score_one_in_hrf_selection():
+    """The HRF-selection scorers clamped SS_tot before dividing, same effect."""
+    from fastfuncstuff.design.hrf_selection import _evaluate_hrfs_insample
+
+    _, design, _ = _three_run_problem()
+    n_tp = design.shape[0]
+    real = (torch.randn(1, 2) @ design.T) + 0.01 * torch.randn(1, n_tp)
+    data = torch.cat([torch.full((1, n_tp), 7.0), real], dim=0)
+
+    r2 = _evaluate_hrfs_insample(
+        projected_data=data,
+        projected_designs=[design],
+        device=torch.device("cpu"),
+        verbose=False,
+    )
+    assert r2[0, 0].item() == 0.0
+    assert r2[1, 0].item() > 0.9
 
 
 def test_cod_ratio_is_unchanged_where_there_is_variance():
