@@ -21,7 +21,13 @@ import torch
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
 try:
-    from fastfuncstuff.cli_utils import parse_input_files, parse_prefix, setup_device, spinner
+    from fastfuncstuff.cli_utils import (
+        add_device_arg,
+        parse_input_files,
+        parse_prefix,
+        setup_device,
+        spinner,
+    )
     from fastfuncstuff.glm.xval import compute_xval_r2, generate_cv_splits
     from fastfuncstuff.io.afni import extract_design_metadata, load_nifti, read_afni_design_matrix
 except ImportError as e:
@@ -179,20 +185,7 @@ Notes:
         metavar="N",
         help="Voxels per batch for projection (auto-detected if not specified)",
     )
-    comp_opts.add_argument(
-        "-data_chunk_size",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Voxels to load to GPU at once (auto-detected if not specified). For very large datasets that don't fit on GPU.",
-    )
-    comp_opts.add_argument(
-        "-device",
-        type=str,
-        default=None,
-        choices=["cpu", "cuda", "mps"],
-        help="Compute device (auto-detected if not specified)",
-    )
+    add_device_arg(comp_opts)
     comp_opts.add_argument(
         "-R2method",
         type=str,
@@ -352,6 +345,7 @@ def main():
         zero_event_strategy=args.zero_event,
         device=device,
         batch_size=args.batch_size,
+        r2_method=args.R2method,
         verbose=True,
     )
 

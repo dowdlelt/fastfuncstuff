@@ -417,6 +417,7 @@ def cross_validate_denoising_for_hrf(
     max_pcs: int,
     cv_splits: list[tuple[list[int], list[int]]],
     device: torch.device,
+    cv_metric: str = "median",
     chunk_size: int | None = None,
     verbose: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -426,7 +427,8 @@ def cross_validate_denoising_for_hrf(
     Returns
     -------
     r2_by_n_pcs : np.ndarray
-        (max_pcs+1,) Median CV R² for each number of PCs
+        (max_pcs+1,) CV R² for each number of PCs, aggregated across voxels
+        and then across folds by ``cv_metric``
     r2_per_voxel : np.ndarray
         (n_criteria, max_pcs+1) Per-voxel CV R² at each PC count
     """
@@ -625,13 +627,17 @@ def cross_validate_denoising_for_hrf(
             for n_pcs in range(max_pcs + 1):
                 r2_accum[n_pcs].append(r2_all[n_pcs].cpu())
 
-        # Aggregate
+        # Aggregate.  -cv_metric picks the summary at BOTH steps: a median
+        # across voxels paired with a mean across folds would be neither.
         for n_pcs in range(max_pcs + 1):
             all_r2 = torch.cat(r2_accum[n_pcs])
-            r2_per_fold[fold_idx, n_pcs] = all_r2.median().item()
+            r2_per_fold[fold_idx, n_pcs] = (
+                all_r2.mean().item() if cv_metric == "mean" else all_r2.median().item()
+            )
             r2_per_voxel_accum[:, n_pcs] += all_r2.numpy()
 
-    r2_by_n_pcs = np.median(r2_per_fold, axis=0)
+    fold_agg = np.mean if cv_metric == "mean" else np.median
+    r2_by_n_pcs = fold_agg(r2_per_fold, axis=0)
     r2_per_voxel = r2_per_voxel_accum / n_splits
 
     return r2_by_n_pcs, r2_per_voxel
@@ -655,6 +661,7 @@ def fit_pathfinder(
     pcstop: float = 1.05,
     microtime_dt: float = 0.1,
     metric: str = "cod",
+    cv_metric: str = "median",
     device: torch.device = None,
     chunk_size: int | None = None,
     verbose: bool = True,
@@ -862,6 +869,7 @@ def fit_pathfinder(
             max_pcs=max_pcs,
             cv_splits=cv_splits,
             device=device,
+            cv_metric=cv_metric,
             chunk_size=chunk_size,
             verbose=False,
         )
@@ -1567,6 +1575,7 @@ def main():
         pcstop=args.pcstop,
         microtime_dt=args.microtime_dt,
         metric=args.metric,
+        cv_metric=args.cv_metric,
         device=device,
         chunk_size=args.batch_size,
         verbose=args.verb >= 1,

@@ -1917,15 +1917,16 @@ def fit_penalized_glm_cv(
     lambda_values: list[float],
     run_boundaries: list[tuple[int, int]],
     device: torch.device | None = None,
+    cv_method: str = "loro",
     verbose: bool = False,
 ) -> tuple[float, np.ndarray]:
     """
-    Cross-validate smoothness parameter λ using LORO (leave-one-run-out)
+    Cross-validate smoothness parameter λ over run-based folds
 
     For each λ value:
-    1. For each run, fit model on all other runs
-    2. Predict left-out run and compute MSE
-    3. Average MSE across runs
+    1. For each fold, fit model on the training runs
+    2. Predict the held-out runs and compute MSE
+    3. Average MSE across folds
 
     Select λ with minimum average prediction error.
 
@@ -1941,6 +1942,10 @@ def fit_penalized_glm_cv(
         Grid of λ values to search over
     run_boundaries : list of tuple
         [(start_tr, end_tr), ...] for each run
+    cv_method : {'loro', 'split_half'}
+        'loro' holds out one run per fold; 'split_half' holds out half the
+        runs at a time (two folds), which is what you want when runs are
+        short enough that a single held-out run is a noisy referee.
     device : torch.device, optional
         Device for computation
     verbose : bool, optional
@@ -1983,22 +1988,36 @@ def fit_penalized_glm_cv(
     D = torch.from_numpy(penalty_matrix).to(device).float()
     DTD = D.T @ D  # (n_basis, n_basis)
 
+    # Folds as lists of held-out run indices.  Train is always the complement.
+    if cv_method == "loro":
+        test_run_folds = [[r] for r in range(n_runs)]
+    elif cv_method == "split_half":
+        if n_runs < 2:
+            raise ValueError("cv_method='split_half' needs at least 2 runs")
+        half = n_runs // 2
+        test_run_folds = [list(range(half)), list(range(half, n_runs))]
+    else:
+        raise ValueError(f"cv_method must be 'loro' or 'split_half', got '{cv_method}'")
+
     # Storage for CV errors
     cv_errors = np.zeros(len(lambda_values))
 
     if verbose:
-        print(f"\n  Cross-validating {len(lambda_values)} λ values (LORO with {n_runs} runs)...")
+        print(
+            f"\n  Cross-validating {len(lambda_values)} λ values "
+            f"({cv_method} with {n_runs} runs, {len(test_run_folds)} folds)..."
+        )
 
     # Grid search over λ
     for lambda_idx, lam in enumerate(lambda_values):
         run_errors = []
 
-        # LORO: leave each run out
-        for test_run_idx in range(n_runs):
+        for test_runs in test_run_folds:
             # Get train and test indices
             train_mask = torch.ones(n_timepoints, dtype=torch.bool, device=device)
-            test_start, test_end = run_boundaries[test_run_idx]
-            train_mask[test_start:test_end] = False
+            for test_run_idx in test_runs:
+                test_start, test_end = run_boundaries[test_run_idx]
+                train_mask[test_start:test_end] = False
 
             # Split data and design
             X_train = design[train_mask, :]  # (n_train, n_basis)
@@ -2021,14 +2040,14 @@ def fit_penalized_glm_cv(
                 # Fallback to lstsq if singular
                 betas = torch.linalg.lstsq(penalized_XTX, XTy).solution
 
-            # Predict test run
+            # Predict the held-out runs
             y_pred = (X_test @ betas).T  # (n_voxels, n_test)
 
-            # Compute MSE for this run
+            # Compute MSE for this fold
             mse = torch.mean((y_test - y_pred) ** 2).item()
             run_errors.append(mse)
 
-        # Average error across runs
+        # Average error across folds
         cv_errors[lambda_idx] = np.mean(run_errors)
 
         if verbose and lambda_idx % max(1, len(lambda_values) // 5) == 0:

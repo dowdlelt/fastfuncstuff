@@ -56,7 +56,13 @@ import numpy as np
 import torch
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, parse_prefix, setup_device, spinner
+from fastfuncstuff.cli_utils import (
+    add_device_arg,
+    add_verbose_arg,
+    parse_prefix,
+    setup_device,
+    spinner,
+)
 from fastfuncstuff.design.builder import legendre_polynomials, parse_afni_timing_file
 from fastfuncstuff.design.matrices import (
     fit_penalized_glm,
@@ -243,12 +249,7 @@ def main():
     )
 
     # Computational
-    parser.add_argument(
-        "-device",
-        choices=["cpu", "cuda", "auto"],
-        default="auto",
-        help="Computation device. Default: auto",
-    )
+    add_device_arg(parser, default="auto")
     parser.add_argument(
         "-chunk-size",
         type=int,
@@ -657,6 +658,7 @@ def main():
             lambda_values=lambda_values,
             run_boundaries=run_boundaries,
             device=device,
+            cv_method=args.cv_method,
             verbose=args.verb >= 1,
         )
 
@@ -704,6 +706,7 @@ def main():
                     lambda_values=lambda_values,
                     run_boundaries=run_boundaries,
                     device=device,
+                    cv_method=args.cv_method,
                     verbose=False,
                 )
 
