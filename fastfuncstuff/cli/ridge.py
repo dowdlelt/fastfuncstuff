@@ -656,7 +656,7 @@ def main():
     design_matrix, trial_labels, trial_condition_ids, trial_run_ids, condition_design = (
         create_single_trial_design(
             onsets_by_condition=all_onsets,
-            durations=durations,
+            durations=model_durations,
             run_starts=run_starts,
             tr=args.tr,
             n_timepoints=n_timepoints,

@@ -2061,7 +2061,7 @@ def main():
         tr=args.tr,
         n_timepoints=n_timepoints,
         microtime_dt=args.microtime_dt,
-        stim_durations=durations,
+        stim_durations=model_durations,
         device=device,
     )
 
@@ -2075,7 +2075,7 @@ def main():
         fir_top=fir_top,
         n_basis=n_basis,
         all_onsets=all_onsets,
-        stim_durations=durations,
+        stim_durations=model_durations,
         onset_matrix_micro=onset_matrix_micro,
         n_conditions=n_conditions,
         n_timepoints=n_timepoints,
@@ -2342,7 +2342,7 @@ def main():
         st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = (
             create_single_trial_design(
                 onsets_by_condition=all_onsets,
-                durations=durations,
+                durations=model_durations,
                 run_starts=run_starts,
                 tr=args.tr,
                 n_timepoints=n_timepoints,

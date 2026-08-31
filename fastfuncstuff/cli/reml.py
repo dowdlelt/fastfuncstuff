@@ -1967,14 +1967,6 @@ def main():
             polort = args.polort
             print(f"  Polort: {polort}")
 
-        # Build microtime onset matrix
-        print()
-        print("Building onset matrix at microtime resolution...")
-        onset_matrix_micro = create_onset_matrix_microtime(
-            all_onsets, run_starts, tr, n_timepoints, args.microtime_dt, durations, device
-        )
-        print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
-
         # Per-voxel HRF: load assignments + library if -hrfopt_prefix set
         hrf_library_obj = None
         hrf_indices_obj = None
@@ -2017,6 +2009,16 @@ def main():
             print(
                 f"  {len(unique_hrfs)} unique HRFs across {hrf_indices_obj.numel():,} volume voxels"
             )
+
+        # The onset matrix is built AFTER the library is resolved: a
+        # duration-convolved library carries the boxcar itself, so its design
+        # has to start from impulses here too, not only in the builder call.
+        print()
+        print("Building onset matrix at microtime resolution...")
+        onset_matrix_micro = create_onset_matrix_microtime(
+            all_onsets, run_starts, tr, n_timepoints, args.microtime_dt, model_durations, device
+        )
+        print(f"  Onset matrix shape: {onset_matrix_micro.shape}")
 
         # Build task design matrix using refactored function
         print()
@@ -2088,7 +2090,7 @@ def main():
             st_design_out, trial_labels, trial_cond_ids, trial_run_ids, _cond_design = (
                 create_single_trial_design(
                     onsets_by_condition=all_onsets,
-                    durations=durations,
+                    durations=model_durations,
                     run_starts=run_starts,
                     tr=args.tr,
                     n_timepoints=n_timepoints,
@@ -2327,6 +2329,10 @@ def main():
         st_design, trial_labels, trial_cond_ids, trial_run_ids, cond_design = (
             create_single_trial_design(
                 onsets_by_condition=all_onsets,
+                # canonical-hrf: this design carries no library, so the boxcar
+                # is not already inside the response and the PHYSICAL duration
+                # is the right one.  (-beta_cv ignoring -hrfopt_prefix is a
+                # separate gap.)
                 durations=durations,
                 run_starts=run_starts,
                 tr=args.tr,

@@ -1166,7 +1166,7 @@ def main():
             # Build single-trial design with this HRF
             st_design, labels, cond_ids, run_ids, cond_design = create_single_trial_design(
                 onsets_by_condition=all_onsets,
-                durations=durations,
+                durations=model_durations,
                 run_starts=run_starts,
                 tr=args.tr,
                 n_timepoints=n_timepoints,
@@ -1503,7 +1503,7 @@ def main():
             hrf_library=hrf_library_list,
             hrf_index=results.hrf_index,
             nuisance_design=nuisance_design,
-            durations=durations,
+            durations=model_durations,
             run_starts=run_starts,
             tr=tr,
             n_timepoints=n_timepoints,
