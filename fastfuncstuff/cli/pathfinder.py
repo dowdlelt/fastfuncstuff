@@ -757,7 +757,10 @@ def fit_pathfinder(
         data=data,
         design=full_canonical_design,
         tr=tr,
-        max_poly_degree=0,  # Already in design
+        # -1, not 0: degree 0 ADDS a per-run constant, and nuisance_block_diag
+        # already carries one per run.  Two constants per run is rank
+        # deficient and only shows up as a pinv fallback.
+        max_poly_degree=-1,
         device=device,
         verbose=False,
         task_indices=list(range(n_conditions)),
@@ -995,7 +998,7 @@ def fit_pathfinder(
             group_data,
             full_design,
             tr=tr,
-            max_poly_degree=0,
+            max_poly_degree=-1,  # per-run constants are already in nuisance_block_diag
             device=device,
             verbose=False,
             task_indices=list(range(n_conditions)),
