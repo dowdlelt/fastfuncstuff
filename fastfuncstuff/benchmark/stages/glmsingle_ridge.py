@@ -63,6 +63,23 @@ def _onset_files(ctx: BenchmarkContext) -> list[Path]:
     return [ctx.timing_dir / f"onsets.{task}.times.{c}.txt" for c in _stim_labels(ctx)]
 
 
+def validation_inputs(ctx: BenchmarkContext) -> list[Path]:
+    """Files validate() reads on both sides of the comparison.
+
+    Declaring them makes a missing output read INCOMPLETE with the file named,
+    instead of a silently NaN metric.
+    """
+    gs = ctx.glmsingle_dir
+    ffs = ctx.ffs_ridge_dir
+    return [
+        gs / "glmsingle_fracvalue.nii.gz",
+        gs / "glmsingle_mask.nii.gz",
+        gs / "glmsingle_betas_D.nii.gz",
+        ffs / "ridge_optimal_frac.nii.gz",
+        ffs / "ridge_single_trial_betas.nii.gz",
+    ]
+
+
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     missing = []
     gs = ctx.glmsingle_dir
@@ -216,13 +233,23 @@ def validate(ctx: BenchmarkContext) -> dict:
             )
     results["beta_timeseries_corr"] = beta_corr
 
-    passed = True
+    # Fail closed on a metric that could not be computed.  Skipping the
+    # threshold for a NaN meant an ffs_ridge that exited 0 without writing
+    # either output validated as PASS against nothing at all.
+    missing = [
+        name
+        for name, value in (("fracvalue_corr", frac_corr), ("beta_timeseries_corr", beta_corr))
+        if np.isnan(value)
+    ]
+    passed = not missing
     if not np.isnan(frac_corr):
         passed = passed and frac_corr >= THRESHOLDS["fracvalue_corr"]
     if not np.isnan(beta_corr):
         passed = passed and beta_corr >= THRESHOLDS["beta_timeseries_corr"]
 
     summary = f"frac r={frac_corr:.4f}, beta ts r={beta_corr:.4f}"
+    if missing:
+        summary += f" | not computed: {', '.join(missing)}"
     results["passed"] = passed
     results["summary"] = summary
     return results

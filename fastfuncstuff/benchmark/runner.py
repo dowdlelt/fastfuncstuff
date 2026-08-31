@@ -266,10 +266,13 @@ class StageResult:
     # earlier run, so a run crash must hard-override to FAIL -- otherwise a
     # command that never produced fresh output is silently reported PASS.
     ffs_crashed: bool = False
+    # Same for the reference tool: if it raised, whatever the comparison read
+    # on the reference side is stale too, and "PASS" would mean nothing.
+    ref_crashed: bool = False
 
     @property
     def status(self) -> str:
-        if self.ffs_crashed:
+        if self.ffs_crashed or self.ref_crashed:
             return "FAIL"
         if self.incomplete:
             return "INCOMPLETE"
@@ -567,6 +570,7 @@ def run_stages(
                 result.ref_time = stage.run_ref(ctx)
             except Exception as e:
                 result.errors.append(f"Ref: {e}")
+                result.ref_crashed = True
                 print(f"  Ref error: {e}")
 
         # In ref_only mode, skip FFS only for stages that have a ref tool to time.
@@ -629,12 +633,12 @@ def run_stages(
         # "passed" against stale outputs from an earlier run, but this invocation
         # produced no fresh output, so the stage failed. Surface it plainly instead
         # of a misleading PASS.
-        if result.ffs_crashed:
+        if result.ffs_crashed or result.ref_crashed:
             result.passed = False
             result.incomplete = False
-            crash_detail = next(
-                (e for e in result.errors if e.startswith("FFS:")), "FFS tool crashed"
-            )
+            prefix = "FFS:" if result.ffs_crashed else "Ref:"
+            fallback = "FFS tool crashed" if result.ffs_crashed else "reference tool crashed"
+            crash_detail = next((e for e in result.errors if e.startswith(prefix)), fallback)
             prior = f" (validation on stale output: {result.summary})" if result.summary else ""
             result.summary = f"{crash_detail}{prior}"
 

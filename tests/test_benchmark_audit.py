@@ -7,6 +7,7 @@ result with an actionable message, not a raw I/O error after the expensive run.
 from __future__ import annotations
 
 import types
+from pathlib import Path
 
 import nibabel as nib
 import numpy as np
@@ -171,6 +172,76 @@ def test_run_stages_crash_fails_over_stale_validation(tmp_path, capsys):
     assert "exit code 1" in r.summary
     assert "stale" in r.summary  # names that the r=0.99 was on stale output
     assert "FAIL" in capsys.readouterr().out
+
+
+def test_run_stages_ref_crash_fails_over_stale_validation(tmp_path, capsys):
+    """Same for the reference side.
+
+    Only the FFS crash hard-overrode the verdict; a reference tool that raised
+    was appended to errors and then validation compared two stale files and
+    reported PASS -- which was also eligible to be cached.
+    """
+    present = tmp_path / "stale.nii"
+    present.write_text("x")
+
+    def run_ref(ctx):
+        raise RuntimeError("reference crashed")
+
+    stage = types.SimpleNamespace(
+        name="fake",
+        check_prerequisites=lambda ctx: [],
+        run_ref=run_ref,
+        run_ffs=lambda ctx: 1.0,
+        validate=lambda ctx: {"passed": True, "summary": "r=0.99"},
+        validation_inputs=lambda ctx: [present],
+    )
+    r = run_stages([stage], _ctx(tmp_path))[0]
+    assert r.ref_crashed is True
+    assert r.passed is False
+    assert r.status == "FAIL"
+    assert "reference crashed" in r.summary
+    assert "stale" in r.summary
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_glmsingle_ridge_validator_fails_when_a_metric_is_not_computed(tmp_path, monkeypatch):
+    """A stage whose outputs are absent must not validate as PASS.
+
+    `passed` started at True and each threshold was skipped for a NaN, so an
+    ffs_ridge that exited 0 without writing either output validated against
+    nothing at all -- with valid MATLAB files on the other side.
+    """
+    from fastfuncstuff.benchmark import validation as bench_validation
+    from fastfuncstuff.benchmark.stages import glmsingle_ridge
+
+    gs = tmp_path / "glmsingle"
+    gs.mkdir()
+    ffs = tmp_path / "ffs_ridge"
+    ffs.mkdir()
+
+    # Reference side present and readable; FFS side absent entirely.
+    monkeypatch.setattr(
+        bench_validation,
+        "_load_dataobj",
+        lambda path, *a, **k: np.ones((4, 4, 4, 3), dtype=np.float32),
+    )
+    ctx = types.SimpleNamespace(glmsingle_dir=gs, ffs_ridge_dir=ffs)
+
+    results = glmsingle_ridge.validate(ctx)
+    assert np.isnan(results["fracvalue_corr"])
+    assert np.isnan(results["beta_timeseries_corr"])
+    assert results["passed"] is False
+    assert "not computed" in results["summary"]
+
+
+def test_glmsingle_ridge_declares_what_validate_reads():
+    """Missing outputs should read INCOMPLETE with the file named."""
+    from fastfuncstuff.benchmark.stages import glmsingle_ridge
+
+    ctx = types.SimpleNamespace(glmsingle_dir=Path("/gs"), ffs_ridge_dir=Path("/ffs"))
+    names = {p.name for p in glmsingle_ridge.validation_inputs(ctx)}
+    assert "ridge_single_trial_betas.nii.gz" in names
+    assert "glmsingle_betas_D.nii.gz" in names
 
 
 def test_run_stages_passes_when_inputs_present(tmp_path):
