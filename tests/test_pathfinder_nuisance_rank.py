@@ -1,9 +1,14 @@
-"""PathFinder must not duplicate the per-run constant.
+"""PathFinder must not add a constant on top of its own per-run constants.
 
 ``max_poly_degree=0`` does not mean "no polynomials" -- degree 0 IS the
-constant, one per run.  PathFinder builds its own block-diagonal nuisance with
-per-run Legendre blocks (polort >= 0, so a constant is already in there) and
-then asked fit_glm for degree 0 on top, making the design rank deficient.  The
+constant.  PathFinder builds its own block-diagonal nuisance with per-run
+Legendre blocks (polort >= 0, so a constant per run is already in there) and
+then asked fit_glm for degree 0 on top.
+
+PathFinder hands fit_glm ONE concatenated data/design pair, so fit_glm sees a
+single run and appends a single GLOBAL constant -- not one per run.  That is
+still exactly redundant: the global constant is the sum of the per-run
+constants, so it lies in their span and the design is rank deficient.  The
 only symptom is a pinv fallback and non-identifiable nuisance coefficients.
 """
 
@@ -29,12 +34,19 @@ def _pathfinder_like_design(n_runs=2, n_tp=40, polort=1, device=torch.device("cp
 
 def test_degree_zero_on_top_of_block_diag_is_rank_deficient():
     task, nuisance = _pathfinder_like_design()
-    n_tp = nuisance.shape[0] // 2
+    n_total = nuisance.shape[0]
 
-    # What PathFinder used to ask for: fit_glm adds one more constant per run.
-    extra = torch.block_diag(*[construct_polynomial_matrix(n_tp, 0, torch.device("cpu"))] * 2)
-    duplicated = torch.cat([task, nuisance, extra], dim=1)
-    assert torch.linalg.matrix_rank(duplicated.double()) < duplicated.shape[1]
+    # What PathFinder used to ask for.  The concatenated design is one "run" to
+    # fit_glm, so it appends ONE global constant -- the sum of the per-run
+    # constants already present, hence exactly redundant.
+    global_const = construct_polynomial_matrix(n_total, 0, torch.device("cpu"))
+    assert global_const.shape == (n_total, 1)
+    duplicated = torch.cat([task, nuisance, global_const], dim=1)
+    assert torch.linalg.matrix_rank(duplicated.double()) == duplicated.shape[1] - 1
+
+    # And it really is the sum of the run constants, not merely correlated.
+    run_constants = nuisance[:, [0, nuisance.shape[1] // 2]]
+    assert torch.allclose(run_constants.sum(dim=1, keepdim=True), global_const)
 
     # What it asks for now (-1 adds nothing).
     clean = torch.cat([task, nuisance], dim=1)

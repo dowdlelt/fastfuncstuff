@@ -1020,6 +1020,58 @@ def _plan_fold_designs(
     }
 
 
+def validate_cv_splits(
+    cv_splits: list[tuple[list[int], list[int]]],
+    n_runs: int,
+) -> dict[str, bool]:
+    """Check a caller-supplied split list and describe its shape.
+
+    Raises on the malformations that are always a mistake -- a run index out
+    of range, a run listed twice inside one side of a split, a run in both
+    train and test -- and returns the two properties the optimised paths are
+    allowed to assume:
+
+    ``complementary``
+        every split has train == complement(test).  The per-run fast path
+        builds training statistics as "all-run totals minus the held-out
+        runs", which is the training set only under this property.
+    ``covers_all_runs``
+        the test sets together touch every run.  Without it a score is over a
+        subset of the data, which is legitimate but must not be reported as
+        if it covered everything.
+
+    Both are returned rather than enforced: a caller may legitimately want a
+    partial split, but no code path may silently assume otherwise.
+    """
+    if not cv_splits:
+        raise ValueError("cv_splits is empty")
+
+    all_runs = set(range(n_runs))
+    tested: set[int] = set()
+    complementary = True
+
+    for i, (train_runs, test_runs) in enumerate(cv_splits):
+        for name, runs in (("train", train_runs), ("test", test_runs)):
+            bad = [r for r in runs if not 0 <= r < n_runs]
+            if bad:
+                raise ValueError(
+                    f"cv_splits[{i}] {name} has run index/indices {bad} outside [0, {n_runs})"
+                )
+            if len(set(runs)) != len(runs):
+                raise ValueError(
+                    f"cv_splits[{i}] {name} lists a run more than once: {runs}. "
+                    "A duplicate silently double-weights that run."
+                )
+        both = set(train_runs) & set(test_runs)
+        if both:
+            raise ValueError(f"cv_splits[{i}] has run(s) {sorted(both)} in BOTH train and test")
+        if set(train_runs) != all_runs - set(test_runs):
+            complementary = False
+        tested |= set(test_runs)
+
+    return {"complementary": complementary, "covers_all_runs": tested == all_runs}
+
+
 def compute_xval_r2(
     data: torch.Tensor,
     design_matrix: np.ndarray | torch.Tensor,
@@ -1162,8 +1214,12 @@ def compute_xval_r2(
     # Compute run lengths using the same pattern as slice_by_runs
     run_lengths = np.diff(run_starts + [n_timepoints])
 
-    # Check if this is LORO (each timepoint tested exactly once)
-    # by verifying test sets are disjoint and cover all timepoints
+    split_shape = validate_cv_splits(cv_splits, n_runs)
+
+    # Check if this is LORO (each timepoint tested AT MOST once) by verifying
+    # the test sets are disjoint.  Complete coverage is checked separately --
+    # the fast path's accumulators are self-consistent over whatever was
+    # tested, so a partial split is scored honestly rather than refused.
     all_test_tps = set()
     is_loro = True
     for _, test_runs in cv_splits:
@@ -1177,6 +1233,9 @@ def compute_xval_r2(
             all_test_tps |= test_tps_run
         if not is_loro:
             break
+
+    if not split_shape["covers_all_runs"] and verbose:
+        print("  Note: the test sets do not cover every run; R² is over the tested runs only.")
 
     # Determine effective r2_method
     if r2_method == "auto":
@@ -1356,10 +1415,7 @@ def compute_xval_r2(
     #
     # FFS_XVAL_LEGACY=1 forces the original streaming loop, as an escape hatch
     # if this path is ever suspected in a result.
-    splits_are_complementary = all(
-        set(train_runs) == set(range(n_runs)) - set(test_runs)
-        for train_runs, test_runs in cv_splits
-    )
+    splits_are_complementary = split_shape["complementary"]
     use_per_run_path = (
         len(nuisance_indices) == 0
         and splits_are_complementary
@@ -1772,7 +1828,24 @@ def compute_xval_r2(
 
     else:
         # SLOW MODE: Average predictions if needed, then compute R²
-        count_per_timepoint = count_per_timepoint.clamp(min=1)  # Avoid division by zero
+        #
+        # A timepoint no fold tested has count 0.  Clamping it to 1 leaves a
+        # (0, 0) pair in both accumulators, which adds no residual but drags
+        # the mean towards zero and inflates SS_tot -- an R² flattered by the
+        # data that was never held out.  Drop those timepoints instead; what
+        # remains is a genuine score over what was actually tested.
+        tested = count_per_timepoint > 0
+        if not bool(tested.all()):
+            n_untested = int((~tested).sum())
+            if verbose:
+                print(
+                    f"  {n_untested} timepoint(s) are in no fold's test set; "
+                    "scoring on the tested timepoints only."
+                )
+            pred_accumulator = pred_accumulator[:, tested]
+            actual_accumulator = actual_accumulator[:, tested]
+            count_per_timepoint = count_per_timepoint[tested]
+
         pred_accumulator = pred_accumulator / count_per_timepoint.unsqueeze(0)
         actual_accumulator = actual_accumulator / count_per_timepoint.unsqueeze(0)
 

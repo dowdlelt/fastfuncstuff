@@ -14,7 +14,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from fastfuncstuff.glm.xval import _cod_kernel, _cod_ratio, compute_xval_r2
+from fastfuncstuff.glm.xval import (
+    _cod_kernel,
+    _cod_ratio,
+    compute_xval_r2,
+    validate_cv_splits,
+)
 
 
 def _three_run_problem(n_tp=30, n_voxels=8, seed=0, rogue_run=None):
@@ -150,3 +155,87 @@ def test_cod_ratio_is_unchanged_where_there_is_variance():
     ss_res = torch.tensor([1.0, 0.0, 4.0])
     ss_tot = torch.tensor([4.0, 4.0, 4.0])
     assert torch.allclose(_cod_ratio(ss_res, ss_tot), torch.tensor([0.75, 1.0, 0.0]))
+
+
+# --------------------------------------------------------------------------
+# Central split validation
+# --------------------------------------------------------------------------
+
+
+def test_out_of_range_run_index_is_refused():
+    with pytest.raises(ValueError, match="outside"):
+        validate_cv_splits([([0, 1], [5])], n_runs=3)
+
+
+def test_duplicate_run_in_one_side_is_refused():
+    """A duplicate passes a set-based complement check while double-weighting."""
+    with pytest.raises(ValueError, match="more than once"):
+        validate_cv_splits([([0, 0, 1], [2])], n_runs=3)
+
+
+def test_run_in_both_train_and_test_is_refused():
+    with pytest.raises(ValueError, match="BOTH train and test"):
+        validate_cv_splits([([0, 1], [1])], n_runs=3)
+
+
+def test_empty_splits_are_refused():
+    with pytest.raises(ValueError, match="empty"):
+        validate_cv_splits([], n_runs=3)
+
+
+def test_split_shape_reports_complementarity_and_coverage():
+    loro = [([1, 2], [0]), ([0, 2], [1]), ([0, 1], [2])]
+    assert validate_cv_splits(loro, 3) == {"complementary": True, "covers_all_runs": True}
+
+    # Run 2 in neither side: not complementary, and not full coverage.
+    assert validate_cv_splits([([0], [1])], 3) == {
+        "complementary": False,
+        "covers_all_runs": False,
+    }
+
+    # Complementary but only two of three runs ever tested.
+    partial = [([1, 2], [0]), ([0, 2], [1])]
+    assert validate_cv_splits(partial, 3) == {
+        "complementary": True,
+        "covers_all_runs": False,
+    }
+
+
+def test_slow_path_ignores_never_tested_timepoints():
+    """A timepoint no fold tested must not enter the denominator.
+
+    Zero-filling it added no residual but pulled the mean towards zero and
+    inflated SS_tot, flattering R² with data that was never held out.  The
+    fast path accumulates only over what it tested, so it is the honest
+    reference the slow path has to match.
+    """
+    torch.manual_seed(1)
+    n_tp, total = 30, 90
+    run_starts = [0, n_tp, 2 * n_tp]
+    design = torch.zeros(total, 2)
+    design[:, 0] = torch.sin(torch.arange(total, dtype=torch.float32) * 0.4)
+    design[:, 1] = torch.cos(torch.arange(total, dtype=torch.float32) * 0.23)
+    # Noisy on purpose: the honest R² is low, so an inflated one stands out.
+    data = torch.randn(6, 2) @ design.T + 1.5 * torch.randn(6, total)
+
+    # Two complementary folds over runs 0 and 1; run 2 is never tested.
+    partial = [([1], [0]), ([0], [1])]
+
+    def score(r2_method):
+        return compute_xval_r2(
+            data=data,
+            design_matrix=design,
+            run_starts=run_starts,
+            stim_indices=[0, 1],
+            nuisance_indices=[],
+            cv_splits=partial,
+            device=torch.device("cpu"),
+            r2_method=r2_method,
+            verbose=False,
+        )["r2"]
+
+    fast, slow = score("fast"), score("slow")
+    assert torch.allclose(fast, slow, atol=1e-4), (
+        f"slow path median {slow.median():.4f} vs fast {fast.median():.4f} -- "
+        "the untested run is still in the denominator"
+    )

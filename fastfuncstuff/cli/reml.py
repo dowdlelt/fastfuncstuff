@@ -496,7 +496,9 @@ Examples:
             "regressor (GLMsingle-style) and fits trial-specific betas, then writes "
             "them ordered chronologically. LABEL is inserted into filenames: "
             "ols_LABEL_single.nii.gz, reml_LABEL_single.nii.gz. Requires -events or "
-            "-onsets/-durations; not compatible with -matrix, -hrfopt_prefix, or FIR/TENT."
+            "-onsets/-durations; not compatible with -matrix or FIR/TENT. Combines "
+            "with -hrfopt_prefix for per-voxel HRFs (unlike -beta_cv, which is "
+            "canonical-HRF only)."
         ),
     )
 
@@ -1410,6 +1412,20 @@ def main():
         args.xval_r2 = True
     elif args.cv_design == "single":
         args.beta_cv = True
+
+    # The single-trial beta-space CV design is built with the canonical HRF
+    # and takes no HRF library, so -hrfopt_prefix would be silently ignored
+    # for the part of the run the user asked it for.  Refuse rather than
+    # quietly analyse a different model than the flags describe.
+    if args.beta_cv and args.hrfopt_prefix:
+        print(
+            "ERROR: -beta_cv (-cv_design single) does not support per-voxel HRFs.\n"
+            "       The single-trial CV design is built with the canonical HRF, so\n"
+            f"       -hrfopt_prefix {args.hrfopt_prefix} would be ignored.\n"
+            "       Use -cv_design condition (-xval_r2) to cross-validate WITH the\n"
+            "       per-voxel library, or drop -hrfopt_prefix to accept the canonical HRF."
+        )
+        sys.exit(1)
 
     # Show help if no arguments provided (argparse handles -h/-help itself)
     if not filtered_argv:
@@ -2331,8 +2347,8 @@ def main():
                 onsets_by_condition=all_onsets,
                 # canonical-hrf: this design carries no library, so the boxcar
                 # is not already inside the response and the PHYSICAL duration
-                # is the right one.  (-beta_cv ignoring -hrfopt_prefix is a
-                # separate gap.)
+                # is the right one.  -beta_cv with -hrfopt_prefix is refused in
+                # preflight, so no library can be in play here.
                 durations=durations,
                 run_starts=run_starts,
                 tr=args.tr,

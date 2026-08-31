@@ -1910,6 +1910,22 @@ def make_tps_design(
     return design
 
 
+def run_cv_folds(cv_method: str, n_runs: int) -> list[list[int]]:
+    """Held-out run indices per fold.  Train is always the complement.
+
+    Separated out so the fold structure can be tested without running a fit --
+    "the flag is read somewhere" is not evidence that it changed the folds.
+    """
+    if cv_method == "loro":
+        return [[r] for r in range(n_runs)]
+    if cv_method == "split_half":
+        if n_runs < 2:
+            raise ValueError("cv_method='split_half' needs at least 2 runs")
+        half = n_runs // 2
+        return [list(range(half)), list(range(half, n_runs))]
+    raise ValueError(f"cv_method must be 'loro' or 'split_half', got '{cv_method}'")
+
+
 def fit_penalized_glm_cv(
     data: torch.Tensor,
     design: torch.Tensor,
@@ -1988,16 +2004,7 @@ def fit_penalized_glm_cv(
     D = torch.from_numpy(penalty_matrix).to(device).float()
     DTD = D.T @ D  # (n_basis, n_basis)
 
-    # Folds as lists of held-out run indices.  Train is always the complement.
-    if cv_method == "loro":
-        test_run_folds = [[r] for r in range(n_runs)]
-    elif cv_method == "split_half":
-        if n_runs < 2:
-            raise ValueError("cv_method='split_half' needs at least 2 runs")
-        half = n_runs // 2
-        test_run_folds = [list(range(half)), list(range(half, n_runs))]
-    else:
-        raise ValueError(f"cv_method must be 'loro' or 'split_half', got '{cv_method}'")
+    test_run_folds = run_cv_folds(cv_method, n_runs)
 
     # Storage for CV errors
     cv_errors = np.zeros(len(lambda_values))

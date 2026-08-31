@@ -439,9 +439,12 @@ def cross_validate_denoising_for_hrf(
     n_splits = len(cv_splits)
     n_criteria = criteria_mask.sum().item()
 
-    # Storage for CV results
+    # Storage for CV results.  The per-voxel scores are kept per fold rather
+    # than summed: they pick the winning HRF per voxel downstream, so they have
+    # to be aggregated by the same -cv_metric as the PC curve.  float32 --
+    # n_criteria can be six figures.
     r2_per_fold = np.zeros((n_splits, max_pcs + 1))
-    r2_per_voxel_accum = np.zeros((n_criteria, max_pcs + 1))
+    r2_per_voxel_folds = np.zeros((n_splits, n_criteria, max_pcs + 1), dtype=np.float32)
 
     for fold_idx, (train_runs, test_runs) in enumerate(cv_splits):
         # Build train/test indices
@@ -627,18 +630,21 @@ def cross_validate_denoising_for_hrf(
             for n_pcs in range(max_pcs + 1):
                 r2_accum[n_pcs].append(r2_all[n_pcs].cpu())
 
-        # Aggregate.  -cv_metric picks the summary at BOTH steps: a median
-        # across voxels paired with a mean across folds would be neither.
+        # Aggregate.  -cv_metric picks the summary EVERYWHERE a fold or a voxel
+        # is collapsed: across voxels within a fold, across folds for the PC
+        # curve, and across folds for the per-voxel scores that select the HRF.
+        # A median PC curve read off mean-across-fold voxel scores would be two
+        # different estimators wearing one flag.
         for n_pcs in range(max_pcs + 1):
             all_r2 = torch.cat(r2_accum[n_pcs])
             r2_per_fold[fold_idx, n_pcs] = (
                 all_r2.mean().item() if cv_metric == "mean" else all_r2.median().item()
             )
-            r2_per_voxel_accum[:, n_pcs] += all_r2.numpy()
+            r2_per_voxel_folds[fold_idx, :, n_pcs] = all_r2.numpy()
 
     fold_agg = np.mean if cv_metric == "mean" else np.median
     r2_by_n_pcs = fold_agg(r2_per_fold, axis=0)
-    r2_per_voxel = r2_per_voxel_accum / n_splits
+    r2_per_voxel = fold_agg(r2_per_voxel_folds, axis=0)
 
     return r2_by_n_pcs, r2_per_voxel
 
@@ -765,9 +771,11 @@ def fit_pathfinder(
         data=data,
         design=full_canonical_design,
         tr=tr,
-        # -1, not 0: degree 0 ADDS a per-run constant, and nuisance_block_diag
-        # already carries one per run.  Two constants per run is rank
-        # deficient and only shows up as a pinv fallback.
+        # -1, not 0: degree 0 ADDS a constant.  The design here is already
+        # concatenated, so fit_glm sees one run and appends one GLOBAL
+        # constant -- which is the sum of the per-run constants already in
+        # nuisance_block_diag, so it lies in their span.  Rank deficient, and
+        # it only shows up as a pinv fallback.
         max_poly_degree=-1,
         device=device,
         verbose=False,
@@ -1007,7 +1015,7 @@ def fit_pathfinder(
             group_data,
             full_design,
             tr=tr,
-            max_poly_degree=-1,  # per-run constants are already in nuisance_block_diag
+            max_poly_degree=-1,  # a global constant would be the sum of the run constants
             device=device,
             verbose=False,
             task_indices=list(range(n_conditions)),
