@@ -343,6 +343,29 @@ def print_cli_section(title: str, *, leading_blank: bool = True) -> None:
     print("-" * CLI_RULE_WIDTH)
 
 
+def print_cli_subsection(title: str) -> None:
+    """A ``===== TITLE =====`` band for a stage inside the Outputs block.
+
+    The Outputs block grew several multi-line stages -- task coupling, PC maps, warp
+    rejection, de-tasking -- and a run of bullets with no separation reads as one
+    undifferentiated wall. This is deliberately louder than
+    :func:`print_cli_section`'s underline so a stage boundary is findable when
+    scrolling back through a long log.
+    """
+    print()
+    # A title too long to centre gets its own rule rather than a bare line with no
+    # banner at all -- these headings run to a full sentence and silently losing the
+    # rule is exactly when the output is hardest to scan.
+    if len(title) + 6 > CLI_RULE_WIDTH:
+        print("=" * CLI_RULE_WIDTH)
+        print(title)
+        print("=" * CLI_RULE_WIDTH)
+        return
+    pad = CLI_RULE_WIDTH - len(title) - 2
+    left = pad // 2
+    print(f"{'=' * left} {title} {'=' * (pad - left)}", flush=True)
+
+
 def print_cli_footer(tool_name: str, *, elapsed_seconds: float | None = None) -> None:
     """Print a standard completion block with an optional elapsed time."""
     print()

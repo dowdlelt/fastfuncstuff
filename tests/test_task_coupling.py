@@ -19,8 +19,11 @@ from fastfuncstuff.stats.task_coupling import (
     co_location,
     contamination_slope,
     default_polort,
+    design_notch_bins,
     enrichment_curve,
+    filter_task_band,
     format_task_coupling_report,
+    notch_basis,
     pe_gradient,
     responding_mask,
     task_coupling,
@@ -349,7 +352,6 @@ def test_detask_result_rebuilds_the_corrected_series_from_raw():
     n_t = 60
     nx, ny, nz = 8, 8, 4
     x = _block_design(n_t, block=10)
-    xt = x[:, 0]
     rng = np.random.default_rng(0)
     data = rng.normal(100, 10, (nx, ny, nz, n_t)).astype(np.float32)
 
@@ -572,3 +574,501 @@ def test_verdict_flags_contamination_the_median_statistic_missed():
 
     assert "CONTAMINATION" in report(contaminated)
     assert "CONTAMINATION" not in report(innocent)
+
+
+def test_notch_selects_one_line_for_a_block_design_not_a_shoulder():
+    """Peak-relative, not median-relative — the bug this rule was rewritten to avoid.
+
+    A 15-cycle 20s block design puts 91% of its power in ONE bin. Contrast against the
+    median bin was the first rule and is not equivalent: the median sits ~2000x below
+    the fundamental, so a 10x-the-median cut lands inside the low-frequency shoulder
+    that drift removal leaves behind and selects nine bins instead of one.
+    """
+    n_t, tr, period = 120, 2.5, 20.0
+    box = np.zeros(int(n_t * tr / 0.1))
+    for on in range(10, int(n_t * tr), int(period)):
+        box[int(on / 0.1) : int((on + period / 2) / 0.1)] = 1.0
+    k = np.exp(-np.arange(0, 320) / 30.0)
+    conv = np.convolve(box, k / k.sum())[: len(box)]
+    design = torch.tensor(conv[(np.arange(n_t) * tr / 0.1).astype(int)])[:, None]
+
+    bins, info = design_notch_bins(design, polort=3)
+    fundamental = int(round(n_t * tr / period))  # 15 cycles over the run
+    assert fundamental in bins
+    # The shoulder is what the median-contrast rule wrongly swept up. Every kept bin
+    # must be the fundamental or one of its harmonics, never the low-frequency skirt.
+    assert not any(1 <= b < fundamental for b in bins), bins
+    assert all(b % fundamental == 0 for b in bins), bins
+    assert info["spectrum_frac"] < 0.05
+    assert notch_basis(n_t, bins, polort=3).shape[1] == 2 * len(bins)
+
+    # widen adds sidebands, for amplitude non-stationarity across blocks -- not for
+    # HRF width, which can only narrow the design's spectrum.
+    wide, _ = design_notch_bins(design, polort=3, widen=1)
+    assert set(wide) == {b + d for b in bins for d in (-1, 0, 1)}
+    assert notch_basis(n_t, wide, polort=3).shape[1] == 2 * len(wide)
+
+
+def test_notch_refuses_a_broadband_design_instead_of_eating_the_data():
+    """A jittered event-related design has no line to notch; saying so beats notching."""
+    rng = np.random.default_rng(0)
+    hi = np.zeros(120)
+    for onset in rng.uniform(0, 290, 40):
+        hi[int(onset / 2.5)] = 1.0
+    k = np.exp(-np.arange(0, 12) / 3.0)
+    design = torch.tensor(np.convolve(hi, k / k.sum())[:120])[:, None]
+    with pytest.raises(ValueError, match="broadband"):
+        design_notch_bins(design, polort=3)
+
+
+def test_notch_warns_between_the_cheap_and_the_refused_band():
+    """15-50% of the spectrum is expensive but allowed, with a warning attached.
+
+    Bulk head motion is spectrally BROAD, so removing a sixth of the spectrum can still
+    leave it estimable. Whether it does is not knowable from the design -- only from
+    whether the resulting field still tracks motion -- so the ceiling is permissive and
+    the cost is announced rather than silently enforced.
+    """
+    rng = np.random.default_rng(3)
+    hi = np.zeros(120)
+    for onset in np.clip(np.arange(10, 300, 20) + rng.normal(0, 2.0, 15), 0, 295):
+        hi[int(onset / 2.5) : int(onset / 2.5) + 4] = 1.0
+    k = np.exp(-np.arange(0, 12) / 3.0)
+    design = torch.tensor(np.convolve(hi, k / k.sum())[:120])[:, None]
+
+    bins, info = design_notch_bins(design, polort=3)
+    assert 0.15 < info["spectrum_frac"] <= 0.50, info["spectrum_frac"]
+    assert info["warning"] and "CHECK" in info["warning"]
+    # Below the warn level there is no warning at all.
+    clean = np.zeros(120)
+    for onset in range(10, 300, 20):
+        clean[int(onset / 2.5) : int(onset / 2.5) + 4] = 1.0
+    tidy = torch.tensor(np.convolve(clean, k / k.sum())[:120])[:, None]
+    _, tidy_info = design_notch_bins(tidy, polort=3)
+    assert tidy_info["warning"] is None, tidy_info
+
+
+def test_filter_task_band_removes_the_line_and_keeps_the_drift():
+    """The split that matters: the task line goes, a slow drift stays.
+
+    A drifting displacement is real residual motion -- the same reason project_task_out
+    fits the polynomials but does not subtract them.
+    """
+    n_t = 120
+    t = np.arange(n_t)
+    design = torch.tensor(np.cos(2 * np.pi * 15 * t / n_t))[:, None]
+    drift = 3.0 * np.linspace(-1, 1, n_t) ** 2
+    rng = np.random.default_rng(1)
+    series = torch.tensor(
+        drift + 2.0 * np.cos(2 * np.pi * 15 * t / n_t) + rng.normal(0, 0.1, (4, 4, 3, n_t))
+    )
+
+    bins, _ = design_notch_bins(design, polort=3)
+    basis = notch_basis(n_t, bins, polort=3)
+    out = filter_task_band(series, basis)
+
+    def line_power(x):
+        v = np.asarray(x).reshape(-1, n_t)
+        return float((np.abs(np.fft.rfft(v, axis=1))[:, 15] ** 2).mean())
+
+    assert line_power(out) < 1e-3 * line_power(series)
+    # The drift survives: correlation of each voxel's mean-removed course with it.
+    d = drift - drift.mean()
+    kept = np.asarray(out).reshape(-1, n_t).mean(0)
+    kept = kept - kept.mean()
+    assert float(np.corrcoef(kept, d)[0, 1]) > 0.99
+
+
+def test_parse_detask_modes():
+    from fastfuncstuff.cli.locomoco import parse_detask
+
+    assert parse_detask(None) == (False, None)
+    assert parse_detask("field") == (True, None)  # bare -detask, via const
+    assert parse_detask("filter") == (False, 0)
+    assert parse_detask("filter:2") == (False, 2)
+    assert parse_detask("FILTER:0") == (False, 0)
+    for bad in ("filter:x", "both", "filter:-1"):
+        with pytest.raises(ValueError):
+            parse_detask(bad)
+
+
+@pytest.mark.slow
+def test_cli_detask_filter_actually_reaches_the_estimator(tmp_path):
+    """The notch must change the FIELD, not just print that it ran.
+
+    Regression of record: the filter was wired into the multi-echo runner only, so a
+    single-echo run parsed the flag, took the branch, and produced a field identical to
+    an unfiltered one. Asserting on the printed line would have passed; asserting on
+    the field is what catches it.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 120, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 300, 20):  # 15 whole cycles of a 20s period
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (20, 22, 12, n_t)).astype(np.float32)
+    series[5:12, 6:14, 3:8] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 300, 20))
+    )
+
+    def run(stem, *extra):
+        assert (
+            main(
+                [
+                    "-i",
+                    str(src),
+                    "-o",
+                    f"{stem}.nii.gz",
+                    "-pe_dir1",
+                    "AP",
+                    "-pe_dir2",
+                    "IS",
+                    "-backend",
+                    "flow",
+                    "-refine",
+                    "1",
+                    "-events",
+                    str(ev),
+                    "-tr",
+                    str(tr),
+                    "-device",
+                    "cpu",
+                    *extra,
+                ]
+            )
+            == 0
+        )
+        return nib.load(f"{stem}_flow_pe1.nii.gz").get_fdata(dtype=np.float32)
+
+    base = run(str(tmp_path / "base"))
+    filt = run(str(tmp_path / "filt"), "-detask", "filter")
+    assert base.shape == filt.shape
+    assert not np.allclose(base, filt), "the notch did not reach the estimator"
+
+    # And it removed the task band it claimed to: the fundamental is bin 15 over 120
+    # frames with a 20s period at TR 2.5.
+    def line_power(field):
+        v = field.reshape(-1, n_t)
+        v = v - v.mean(axis=1, keepdims=True)
+        p = np.abs(np.fft.rfft(v, axis=1)) ** 2
+        return float(p[:, 15].sum() / p.sum())
+
+    assert line_power(filt) < 0.5 * line_power(base), (line_power(base), line_power(filt))
+
+
+def test_parse_warp_recon_specs():
+    from fastfuncstuff.cli.locomoco import parse_warp_recon
+
+    assert parse_warp_recon(None) == (None, None, None)
+    assert parse_warp_recon("pcs") == (None, None, "pcs")
+    assert parse_warp_recon("pcs:all") == (None, None, "pcs")
+    assert parse_warp_recon("pcs:5") == (5, None, "pcs")
+    # Below 1 is a variance FRACTION -- unambiguous, since a count below 1 is meaningless.
+    assert parse_warp_recon("pcs:0.8") == (None, 0.8, "pcs")
+    # ICA has no natural "all": it needs a rank, and no variance rule locates the good
+    # one (95% of the variance resolved to 105 components, deep in the over-splitting
+    # regime on a real run), so bare 'ica' searches for it.
+    assert parse_warp_recon("ica") == ("sweep", None, "ica")
+    assert parse_warp_recon("ica:sweep") == ("sweep", None, "ica")
+    with pytest.raises(ValueError, match="only defined for ica"):
+        parse_warp_recon("pcs:sweep")
+    assert parse_warp_recon("ica:60") == (60, None, "ica")
+    assert parse_warp_recon("ica:0.9") == (None, 0.9, "ica")
+    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5", "ica:x"):
+        with pytest.raises(ValueError):
+            parse_warp_recon(bad)
+
+
+def test_warp_pc_basis_keeps_the_loading_per_axis_and_round_trips():
+    """A component contaminated on ONE axis must score high there and low on the other.
+
+    The whole reason the shared temporal basis is safe: each component carries its own
+    spatial loading per encode axis, so rejection is a per-(component, axis) decision
+    even though the dictionary is common. And keeping every component must reproduce
+    the input exactly -- a reconstruction that quietly loses the temporal mean would
+    move every voxel by its own average displacement.
+    """
+    from fastfuncstuff.processing.locomoco import warp_pc_basis, warp_pc_reconstruct
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 80, (12, 12, 6)
+    t = np.arange(n_t)
+    resp = np.sin(2 * np.pi * 3 * t / n_t)  # shared, brain-wide
+    task = np.sin(2 * np.pi * 10 * t / n_t)
+    blob = np.zeros(shape, bool)
+    blob[3:7, 3:7, 2:4] = True  # 32 of 864 voxels
+
+    f1 = rng.normal(0, 0.05, (*shape, n_t)) + 0.5 * resp
+    f2 = rng.normal(0, 0.05, (*shape, n_t)) + 0.3 * resp
+    f1 += 0.8 * blob[..., None] * task  # contamination on axis 1 ONLY
+    comps = [(1, torch.tensor(f1)), (2, torch.tensor(f2))]
+
+    u, loadings, _means, _var = warp_pc_basis(comps)
+    mask, active = torch.ones(shape), torch.tensor(blob)
+    scored = [
+        (
+            map_enrichment(loadings[0][1][..., i], active, mask)["enrichment"],
+            map_enrichment(loadings[1][1][..., i], active, mask)["enrichment"],
+        )
+        for i in range(min(4, u.shape[1]))
+    ]
+    worst = max(range(len(scored)), key=lambda i: scored[i][0])
+    assert scored[worst][0] > 5.0, scored  # loud on the contaminated axis
+    assert scored[worst][1] < 2.0, scored  # quiet on the clean one
+
+    full = warp_pc_reconstruct(comps, keep={})
+    assert torch.allclose(full[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)
+    assert torch.allclose(full[1][1], torch.tensor(f2, dtype=torch.float32), atol=1e-4)
+
+
+@pytest.mark.slow
+def test_write_pc_maps_is_one_4d_file_per_axis_with_labels(tmp_path):
+    """The maps exist to be LOOKED at, so the identifying metadata has to survive.
+
+    One file per encode axis, component on the 4th axis, and sub-brick k of the two
+    files is the same temporal component seen on the two axes -- which is only useful
+    if the brick labels say which component and how strong it is.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+    from fastfuncstuff.io.headers import read_brick_labels
+
+    n_t, tr, rng = 60, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 150, 20):
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (14, 16, 8, n_t)).astype(np.float32)
+    series[4:9, 5:11, 2:6] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 150, 20))
+    )
+    stem = str(tmp_path / "out")
+    assert (
+        main(
+            [
+                "-i",
+                str(src),
+                "-o",
+                f"{stem}.nii.gz",
+                "-pe_dir1",
+                "AP",
+                "-pe_dir2",
+                "IS",
+                "-backend",
+                "flow",
+                "-refine",
+                "1",
+                "-events",
+                str(ev),
+                "-tr",
+                str(tr),
+                "-device",
+                "cpu",
+                "-write_pc_maps",
+                "4",
+            ]
+        )
+        == 0
+    )
+    for axis in ("pe1", "pe2"):
+        img = nib.load(f"{stem}_pcmap_{axis}.nii.gz")
+        assert img.shape[:3] == series.shape[:3]
+        assert img.shape[3] == 4
+        labels = read_brick_labels(img)
+        assert len(labels) == 4
+        assert labels[0].startswith("PC00 ") and "x" in labels[0]  # variance and enrichment
+    table = (tmp_path / "out_pcmap_scores.1D").read_text().splitlines()
+    assert table[0].startswith("# component") and "pe1" in table[0] and "pe2" in table[0]
+    assert len(table) == 5  # header + 4 components
+
+
+def test_warp_ica_basis_finds_what_pca_structurally_cannot():
+    """ICA orders by independence, PCA by variance — and that is the whole difference.
+
+    The bug of record is not a bug but a limit: contamination worth a fraction of a
+    percent of the field cannot dominate any PRINCIPAL component, so -reject saw
+    nothing on a run whose field was 8.8x task-enriched at its tail. Measured there, no
+    PC exceeded 1.25x enrichment or 0.07 correlation with the design, while the best
+    independent component reached 2.8-3.0x at 0.68. This pins the same contrast on a
+    planted case, where the planted source is deliberately low-variance.
+    """
+    from fastfuncstuff.processing.locomoco import (
+        warp_ica_basis,
+        warp_pc_basis,
+        warp_reconstruct,
+    )
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 80, (12, 12, 6)
+    t = np.arange(n_t)
+    resp = np.sin(2 * np.pi * 3 * t / n_t)  # brain-wide, high variance
+    task = np.sin(2 * np.pi * 10 * t / n_t)
+    blob = np.zeros(shape, bool)
+    blob[3:7, 3:7, 2:4] = True
+    f1 = rng.normal(0, 0.05, (*shape, n_t)) + 0.5 * resp
+    f2 = rng.normal(0, 0.05, (*shape, n_t)) + 0.3 * resp
+    f1 += 0.8 * blob[..., None] * task
+    comps = [(1, torch.tensor(f1)), (2, torch.tensor(f2))]
+    mask, active = torch.ones(shape), torch.tensor(blob)
+
+    def best_score(basis, loadings):
+        k = basis.shape[1]
+        scores = [
+            map_enrichment(loadings[0][1][..., i], active, mask)["enrichment"] for i in range(k)
+        ]
+        i = int(np.argmax(scores))
+        tc = basis[:, i].numpy() - basis[:, i].numpy().mean()
+        x = task - task.mean()
+        denom = np.linalg.norm(tc) * np.linalg.norm(x)
+        return scores[i], abs(float(tc @ x / denom)) if denom > 0 else 0.0
+
+    ica = warp_ica_basis(comps, pca_components=0.95, device=torch.device("cpu"))
+    assert ica is not None
+    e_ica, r_ica = best_score(ica[0], ica[1])
+    assert e_ica > 5.0, e_ica
+    assert r_ica > 0.8, r_ica
+
+    # Reconstruction shares one formula with the PC path, and is LOSSY here by
+    # construction: the PCA rank is chosen before the rotation, so 5% of the variance is
+    # already gone. That is the trade the flag's help spells out.
+    full = warp_reconstruct(ica[0], ica[1], ica[2], keep={})
+    resid = float((full[0][1] - torch.tensor(f1, dtype=torch.float32)).pow(2).mean().sqrt())
+    assert resid < 0.5 * float(np.std(f1)), resid
+
+    # The PC basis at full rank round-trips exactly, unlike ICA.
+    pcs = warp_pc_basis(comps, device=torch.device("cpu"))
+    assert pcs is not None
+    exact = warp_reconstruct(pcs[0], pcs[1], pcs[2], keep={})
+    assert torch.allclose(exact[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)
+
+
+def test_warp_project_out_removes_only_the_named_timecourses():
+    """Reject by projection on the FULL-rank field, not by rebuilding from a truncation.
+
+    The bug of record: -warp_recon ica at 95% variance rejected NOTHING on a real run
+    and still cost 21.5% of the field's rms, because rebuilding from an ICA basis
+    discards whatever the PCA reduction dropped. A projection cannot do that -- it
+    touches only the span it is given.
+    """
+    from fastfuncstuff.processing.locomoco import warp_project_out
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 100, (8, 8, 4)
+    t = np.arange(n_t)
+    bad = np.sin(2 * np.pi * 7 * t / n_t)
+    good = np.cos(2 * np.pi * 3 * t / n_t)
+    field = rng.normal(0, 0.1, (*shape, n_t)) + 1.0 * bad + 0.7 * good + 5.0
+    comps = [(1, torch.tensor(field))]
+
+    out = warp_project_out(comps, {1: torch.tensor(bad)[:, None].double()})
+    cleaned = out[0][1].numpy()
+
+    def amplitude(x, v):
+        v = v - v.mean()
+        flat = x.reshape(-1, n_t)
+        flat = flat - flat.mean(axis=1, keepdims=True)
+        return float(np.abs(flat @ v).mean() / np.linalg.norm(v) ** 2)
+
+    assert amplitude(cleaned, bad) < 1e-5 * amplitude(field, bad)
+    # Everything else survives untouched -- including the temporal mean, which is not a
+    # component and would otherwise drag every voxel's average displacement with it.
+    assert abs(amplitude(cleaned, good) - amplitude(field, good)) < 1e-4
+    assert abs(float(cleaned.mean()) - float(field.mean())) < 1e-3
+    # And an empty request is exactly identity, not a lossy round trip.
+    same = warp_project_out(comps, {})
+    assert np.abs(same[0][1].numpy() - field.astype(np.float32)).max() == 0.0
+
+
+@pytest.mark.slow
+def test_reject_writes_plottable_timecourses_and_an_after_map(tmp_path):
+    """Rejection has to be inspectable: what was removed, and whether it worked.
+
+    Two gaps a real run exposed. The dropped components existed only as a printed
+    enrichment, so there was nothing to plot against the design; and the _taskr maps
+    are measured BEFORE the fix by design, which left no after to compare them with.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 120, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 300, 20):
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (16, 18, 8, n_t)).astype(np.float32)
+    series[4:10, 5:12, 2:6] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 300, 20))
+    )
+    stem = str(tmp_path / "out")
+    assert (
+        main(
+            [
+                "-i",
+                str(src),
+                "-o",
+                f"{stem}.nii.gz",
+                "-pe_dir1",
+                "AP",
+                "-pe_dir2",
+                "IS",
+                "-backend",
+                "flow",
+                "-refine",
+                "1",
+                "-events",
+                str(ev),
+                "-tr",
+                str(tr),
+                "-device",
+                "cpu",
+                "-warp_recon",
+                "ica:30",
+                "-reject",
+            ]
+        )
+        == 0
+    )
+    rejected = tmp_path / "out_locomoco_rejected.1D"
+    assert rejected.exists()
+    lines = rejected.read_text().splitlines()
+    head = [ln for ln in lines if ln.startswith("#")][-1]  # the column-name line
+    table = np.loadtxt(rejected)
+    assert table.shape[0] == n_t and table.shape[1] >= 2
+    # z-scored, so the columns are directly comparable on one axis.
+    assert np.allclose(table.std(axis=0), 1.0, atol=1e-6)
+    # ONE column per component, never one per (component, axis). The temporal basis is
+    # shared across the encode axes, so a component rejected on both had its identical
+    # time course written twice and read as two findings when it was one.
+    names = head.replace("#", "").split()
+    assert names[0] == "design"
+    assert len(names) == len(set(names)), names
+    for j in range(1, table.shape[1]):
+        for i in range(1, j):
+            assert not np.allclose(table[:, i], table[:, j]), (names[i], names[j])
+
+    # The after maps exist and are a real second measurement, not a copy of the before.
+    for axis in ("pe1", "pe2"):
+        before = nib.load(f"{stem}_taskr_{axis}.nii.gz").get_fdata(dtype=np.float32)
+        after = nib.load(f"{stem}_taskr_{axis}_after.nii.gz").get_fdata(dtype=np.float32)
+        assert before.shape == after.shape
+        assert not np.allclose(before, after)

@@ -41,6 +41,7 @@ from fastfuncstuff.cli_utils import (
     print_cli_footer,
     print_cli_header,
     print_cli_section,
+    print_cli_subsection,
     run_batch_jobs,
     setup_device,
 )
@@ -1182,9 +1183,104 @@ def create_parser() -> argparse.ArgumentParser:
         "against it. Default 4.",
     )
     task.add_argument(
+        "-write_pc_maps",
+        "-write-pc-maps",
+        nargs="?",
+        type=int,
+        const=-1,
+        default=None,
+        metavar="N",
+        help="Write the warp PCs' SPATIAL loadings for eyeballing: one 4-D file per\n"
+        "encode axis ({prefix}_pcmap_pe1 / _pcmap_pe2), component on the 4th axis.\n"
+        "Bare = every component; N = the top N by variance.\n"
+        "One file PER AXIS because the temporal basis is shared but each component has\n"
+        "its own loading on each axis — sub-brick k of the two files is the same\n"
+        "component seen two ways. Loadings are raw and signed; the brick label carries\n"
+        "the variance share, and the task enrichment too when -events is given.\n"
+        "Works without -events (unscored). The temporal side is -want_pcs, which writes\n"
+        "the matching time courses as .1D.",
+    )
+    task.add_argument(
+        "-warp_recon",
+        "-warp-recon",
+        default=None,
+        metavar="SPEC",
+        help="Rebuild the field from its warp PCs before any output is derived. SPEC is\n"
+        "'pcs' (all components -- a no-op on its own, the useful form with -reject),\n"
+        "'pcs:N' (the top N by variance), or 'pcs:0.F' (however many components reach\n"
+        "that FRACTION of the variance, e.g. pcs:0.8 for 80%%). A value below 1 is read\n"
+        "as a fraction; it travels better between runs than a fixed count.\n"
+        "'ica' runs FastICA and SWEEPS for the rank (ica:N or ica:0.F to fix it).\n"
+        "Use it when -reject finds nothing: PCA\n"
+        "orders by VARIANCE, so contamination worth a fraction of a percent cannot\n"
+        "surface in any component, while ICA orders by independence. Measured on a\n"
+        "contaminated 0.8mm run, no principal component exceeded 1.25x enrichment or\n"
+        "0.07 correlation with the design; the best independent component reached\n"
+        "2.8-3.0x with a time course correlating 0.68. The rank has an interior\n"
+        "optimum that no variance rule locates -- 20 missed the source, 60 found it,\n"
+        "105 and 119 over-split it, and 95%% of the variance resolves to 105 -- so the\n"
+        "rank is searched for, not guessed. Rejection is then a PROJECTION of the bad\n"
+        "time courses out of the FULL-rank field, so nothing is lost to the ICA rank\n"
+        "itself; the decomposition only names what to remove.\n"
+        "Independent of -want_pcs, which only chooses how many PC time courses are\n"
+        "WRITTEN as regressors -- the reconstruction uses whatever SPEC says.\n"
+        "The leading components carry the bulk of the\n"
+        "motion; truncating denoises the warp. Whether the task rides in them is a\n"
+        "property of the RUN, not a law -- on a sparse checkerboard response it does\n"
+        "not (all five leading PCs sat BELOW chance at the task line), but a global\n"
+        "response such as a breath-hold puts it in an early component, so -reject is\n"
+        "the part to rely on.",
+    )
+    task.add_argument(
+        "-reject",
+        nargs="?",
+        type=float,
+        const=2.0,
+        default=None,
+        metavar="E",
+        help="[-warp_recon] Also drop any component whose SPATIAL weights are more than\n"
+        "E-fold concentrated on activated tissue (default %(default)s when given bare,\n"
+        "1.0 = spread like the brain). Needs -events.\n"
+        "Scored on WHERE the weights live, not on the component's correlation with the\n"
+        "design: a block design is ~2 degrees of freedom, so a temporal correlation\n"
+        "cannot be thresholded, while an energy share against the active mask has a\n"
+        "no-relation value of 1.0 by construction and needs no null.\n"
+        "Bites when the response is WIDESPREAD (a breath-hold). A sparse response is\n"
+        "too small a share of the field's variance for PCA to isolate -- measured, the\n"
+        "contaminated voxels were 0.65%% of the mask carrying 0.70%% of the energy, and\n"
+        "no component scored above 1.25x while the field was 8.8x enriched at its tail.\n"
+        "For that case use -detask filter or -detask field; this says so at runtime.\n"
+        "The decision is per COMPONENT PER AXIS -- the temporal basis is shared, but\n"
+        "each component carries its own spatial loading on each encode axis, so one\n"
+        "can be dropped from the primary PE and kept on the partition.",
+    )
+    task.add_argument(
         "-detask",
-        action="store_true",
-        help="REMOVE the task-locked part of the field, keeping drift and everything "
+        nargs="?",
+        const="field",
+        default=None,
+        metavar="MODE",
+        help="MODE is 'field' (the default when -detask is given bare) or 'filter[:N]'.\n\n"
+        "  filter[:N]  NOTCH the task's frequency band out of the images the ESTIMATOR\n"
+        "              sees, before it runs, and resample the raw input with the\n"
+        "              resulting field. The field is then never contaminated, so\n"
+        "              nothing can bleed through the iterative solve into other frames\n"
+        "              -- which is the one thing 'field' cannot offer, since it cleans\n"
+        "              a field the task already helped produce. The band is chosen from\n"
+        "              the design's own spectrum: every line carrying at least 1%% of the\n"
+        "              strongest one. N widens it by N bins either side, for amplitude\n"
+        "              non-stationarity across blocks (adaptation, attention drift). It\n"
+        "              is NOT for HRF width -- convolution multiplies spectra, so a\n"
+        "              wider HRF narrows the design's band and can never spread energy\n"
+        "              into bins the stimulus does not occupy.\n"
+        "              Needs a near-periodic design. Onset jitter past ~0.5s of a 20s\n"
+        "              period costs bins fast (1 bin at 0.25s, 7 at 1s, 14 at 2s); a\n"
+        "              design costing over 15%% of the spectrum WARNS (bulk motion is\n"
+        "              spectrally broad, so a wide notch may still be fine -- check the\n"
+        "              field still tracks motion) and over 50%% is REFUSED. Several\n"
+        "              conditions are fine -- the cost scales with the number of\n"
+        "              distinct PERIODS, not conditions.\n\n"
+        "  field       REMOVE the task-locked part of the field, keeping drift and everything "
         "else, and derive EVERY output from the cleaned field — warp, corrected series, "
         "flow maps, PCs, movie. The diagnostic above still measures the ORIGINAL field "
         "(measuring the fix's own output would always say 'no task'), and the part that "
@@ -1516,7 +1612,7 @@ def _resolve_tr(args, img) -> float | None:
 
     def _refuse(why: str) -> None:
         print(f"  ⚠️  task coupling skipped: {why}")
-        if args.detask:
+        if args.detask_field:
             # Never let a requested FIX vanish quietly just because the diagnostic
             # could not run — the outputs would silently be the uncleaned field.
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
@@ -1639,6 +1735,35 @@ def _paired_bins_for(args, n_timepoints: int, tr: float, device):
     return bin_of
 
 
+def parse_detask(value):
+    """``-detask`` MODE -> ``(clean_field, notch_widen)``.
+
+    ``None`` -> (False, None); ``field`` -> (True, None); ``filter`` / ``filter:N`` ->
+    (False, N). The two are alternatives, not a pipeline: filtering removes the band
+    before the estimator runs, so there is nothing left for the field projection to
+    take out, and running both would only spend the degrees of freedom twice.
+    """
+    if value is None:
+        return False, None
+    text = str(value).strip().lower()
+    if text == "field":
+        return True, None
+    if text == "filter":
+        return False, 0
+    if text.startswith("filter:"):
+        tail = text.split(":", 1)[1]
+        try:
+            widen = int(tail)
+        except ValueError:
+            raise ValueError(
+                f"-detask filter:N needs an integer widening in bins, got {tail!r}"
+            ) from None
+        if widen < 0:
+            raise ValueError(f"-detask filter:N needs N >= 0, got {widen}")
+        return False, widen
+    raise ValueError(f"-detask MODE must be 'field' or 'filter[:N]', got {value!r}")
+
+
 def _pe_axis_name(label: str, axis: int, args) -> str:
     """``pe1 (primary PE AP, axis 1)`` — the filename stem first, then what it means.
 
@@ -1716,6 +1841,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     )
 
     report: list[str] = []
+    pending: list[tuple] = []
     for label, axis, field in result.pe_displacements():
         tc = task_coupling(field, design, **kwargs)
         coloc = co_location(tc.r, data_tc.r, mask)
@@ -1757,39 +1883,40 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
             if tail
             else f"enrichment {enrich['enrichment']:.2f}x"
         )
+        # Each axis gets its own banner: the two findings lines per axis ran together
+        # into one block, and pe1 vs pe2 is the first thing a reader is looking for.
+        print_cli_subsection(name)
         print(
-            f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
             f"{best['abs_r_p95']:.3f} p95 in the active mask ({best['label']}), "
             f"kappa {slope['kappa']:+.3f}"
         )
         # The verdict sentence, and only that. The full stratum table goes to the .txt:
         # it was echoed here in full for every axis, which buried the one line that
         # actually says what to do.
-        print(f"    {report[-1].rstrip().splitlines()[-1].strip()}")
+        print(f"  {report[-1].rstrip().splitlines()[-1].strip()}")
         # One 4-D file per axis, conditions on the 4th axis — a viewer scrubs the
         # conditions, and one file per condition would flood the output directory.
-        for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms)):
-            path = f"{stem}_{kind}_{label}{ext}"
-            with spinner(f"Writing {Path(path).name}"):
-                save_nifti(
-                    arr.float().squeeze(-1).numpy()
-                    if kind == "taskr" and arr.shape[-1] == 1
-                    else arr.float().numpy(),
-                    path,
-                    affine=affine,
-                )
-        print(f"    {stem}_taskr_{label}{ext} · {stem}_taskrms_{label}{ext}")
+        # Queued, not written here: the findings above are what a reader scans, and
+        # interleaving file names between them is what made this block unreadable.
+        pending += [
+            (f"{stem}_{kind}_{label}{ext}", arr, kind == "taskr")
+            for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms))
+        ]
 
-    dpath = f"{stem}_taskr_data{ext}"
-    with spinner(f"Writing {Path(dpath).name}"):
-        dr = data_tc.r.float()
-        save_nifti((dr.squeeze(-1) if dr.shape[-1] == 1 else dr).numpy(), dpath, affine=affine)
-    print(f"  • data coupling r (the BOLD response, for co-location): {dpath}")
-
-    tpath = f"{stem}_locomoco_taskcoupling.txt"
-    Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
-    print(f"  • task-coupling report: {tpath}")
-    return design, polort
+    pending.append((f"{stem}_taskr_data{ext}", data_tc.r, True))
+    Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
+    print()
+    for path, arr, squeeze in pending:
+        with spinner(f"Writing {Path(path).name}"):
+            a = arr.float()
+            save_nifti(
+                (a.squeeze(-1) if squeeze and a.shape[-1] == 1 else a).numpy(),
+                path,
+                affine=affine,
+            )
+    args._task_labels = labels
+    return design, polort, resp, mask
 
 
 def _pc_task_correlation(components, design, polort) -> float:
@@ -1821,6 +1948,423 @@ def _pc_task_correlation(components, design, polort) -> float:
     return abs(float(pc.dot(x) / denom)) if denom > 0 else 0.0
 
 
+def parse_warp_recon(value):
+    """``-warp_recon`` SPEC -> ``(count, variance_fraction, method)``.
+
+    ``pcs`` keeps every principal component (exact), ``pcs:N`` the top N, ``pcs:0.8``
+    however many reach 80% of the variance. ``ica`` runs FastICA over a PCA reduction
+    that defaults to 95% of the variance, ``ica:N`` / ``ica:0.F`` set that rank
+    explicitly.
+
+    A value below 1 is read as a FRACTION, which is unambiguous because a count below
+    1 is meaningless, and it is the more portable request -- the number of components
+    worth keeping is a property of the run, not a constant.
+    """
+    if value is None:
+        return None, None, None
+    text = str(value).strip().lower()
+    method, _, tail = text.partition(":")
+    if method not in ("pcs", "ica"):
+        raise ValueError(f"-warp_recon SPEC must start with 'pcs' or 'ica', got {value!r}")
+    # ICA has no natural "all": it needs a rank to reduce to, and the full rank
+    # over-splits (measured: 60 components found the task source, 119 lost it again).
+    if tail == "sweep":
+        if method != "ica":
+            raise ValueError("-warp_recon sweep is only defined for ica")
+        return "sweep", None, method
+    if tail in ("", "all"):
+        # 0.95 of the variance was the first default and is a BAD one: on a real run it
+        # resolved to 105 of 119 components, which is the over-splitting regime (the
+        # same sweep found 60 components isolating the task source and 119 losing it
+        # again). Bare 'ica' therefore searches for the rank instead of guessing it.
+        return ("sweep" if method == "ica" else None), None, method
+    try:
+        num = float(tail)
+    except ValueError:
+        raise ValueError(
+            f"-warp_recon {method}:N needs an integer, a variance fraction below 1, or "
+            f"'all', got {tail!r}"
+        ) from None
+    if num <= 0:
+        raise ValueError(f"-warp_recon {method}:N needs a positive value, got {tail!r}")
+    if num < 1:
+        return None, num, method
+    if float(num).is_integer():
+        return int(num), None, method
+    raise ValueError(
+        f"-warp_recon {method}:{tail} is ambiguous: below 1 is a variance fraction, "
+        "1 or more must be a whole number of components."
+    )
+
+
+def _ica_rank_sweep(comps, resp, mask, ranks, device):
+    """Best ICA rank by peak task enrichment — the rank is not guessable a priori.
+
+    Measured on one real field: 20 components missed the task source entirely (1.75x),
+    60 found it (2.79x), 105 and 119 lost it again to over-splitting (1.42x, 2.27x).
+    There is an interior optimum and no variance rule locates it -- 95% of the variance
+    landed on 105, deep in the failing regime -- so it is searched for instead.
+
+    Coarse grid then a local refine rather than a trisection: the criterion is not
+    guaranteed unimodal, and one ICA fit is seconds, so a grid that cannot be fooled is
+    cheaper than a bisection that can.
+    """
+    from fastfuncstuff.processing.locomoco import warp_ica_basis
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    def score(rank):
+        got = warp_ica_basis(comps, n_components=rank, pca_components=rank, device=device)
+        if got is None:
+            return 0.0, None
+        basis, loadings, means, var = got
+        k = basis.shape[1]
+        peak = max(
+            map_enrichment(load[..., i], resp, mask)["enrichment"]
+            for _ax, load in loadings
+            for i in range(k)
+        )
+        return peak, (basis, loadings, means, var)
+
+    seen: dict[int, float] = {}
+    best_rank, best_peak, best_got = ranks[0], -1.0, None
+    for rank in ranks:
+        peak, got = score(rank)
+        seen[rank] = peak
+        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x")
+        if peak > best_peak:
+            best_rank, best_peak, best_got = rank, peak, got
+    # One refine pass halfway to each neighbour of the winner.
+    order = sorted(seen)
+    i = order.index(best_rank)
+    refine = []
+    if i > 0:
+        refine.append((order[i - 1] + best_rank) // 2)
+    if i < len(order) - 1:
+        refine.append((best_rank + order[i + 1]) // 2)
+    for rank in refine:
+        if rank in seen or rank < 2:
+            continue
+        peak, got = score(rank)
+        seen[rank] = peak
+        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x  (refine)")
+        if peak > best_peak:
+            best_rank, best_peak, best_got = rank, peak, got
+    print(f"    → rank {best_rank} wins at {best_peak:.2f}x")
+    return best_rank, best_got
+
+
+def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, args):
+    """Re-measure task coupling on the FIXED field and write the after maps.
+
+    The diagnostic above deliberately measures the field AS ESTIMATED -- scoring the
+    fix's own output would always report success. But that leaves nothing to compare
+    against, so the same measurement is repeated on the cleaned field and written with
+    an ``_after`` suffix. Two ``_taskr`` maps of the same run, before and after, are
+    what actually answer "did it work".
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.task_coupling import (
+        enrichment_curve,
+        task_coupling,
+        task_enrichment,
+    )
+
+    print_cli_subsection("TASK COUPLING AFTER THE FIX")
+    pending: list[tuple] = []
+    for label, axis, field in result.pe_displacements():
+        name = _pe_axis_name(label, axis, args)
+        tc = task_coupling(field, design, polort=polort, mask=mask, labels=args._task_labels)
+        summary = tc.summarize(resp)
+        curve = enrichment_curve(tc, resp, mask)
+        tail = curve[-1] if curve else None
+        best = max(summary["conditions"], key=lambda c: c["abs_r_median"])
+        tail_txt = (
+            f"tail enrichment {tail['enrichment']:.2f}x of {tail['ceiling']:.0f}x"
+            if tail
+            else f"enrichment {task_enrichment(tc, resp, mask)['enrichment']:.2f}x"
+        )
+        print_cli_subsection(name)
+        print(
+            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"{best['abs_r_p95']:.3f} p95 in the active mask"
+        )
+        pending.append((f"{stem}_taskr_{label}_after{ext}", tc.r))
+    print()
+    for path, arr in pending:
+        with spinner(f"Writing {Path(path).name}"):
+            a = arr.float()
+            save_nifti((a.squeeze(-1) if a.shape[-1] == 1 else a).numpy(), path, affine=affine)
+
+
+def _warp_recon_stage(result, data, args, resp, mask, device):
+    """Rebuild the field from a warp decomposition, dropping task-loaded components.
+
+    ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly the
+    active mask the coupling report was computed on -- the alternative, a second
+    threshold chosen here, would let the report and the fix disagree about where the
+    task is.
+    """
+    import numpy as np
+
+    from fastfuncstuff.processing.locomoco import (
+        pc_reconstruct_result,
+        warp_ica_basis,
+        warp_pc_basis,
+        warp_project_out,
+        warp_reconstruct,
+    )
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
+    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+
+    if method == "ica" and n_pcs == "sweep":
+        if resp is None:
+            print("  ⚠️  -warp_recon ica sweep needs -events to score ranks; using 60.")
+            n_pcs, got = 60, warp_ica_basis(comps, 60, 60, device=device)
+        else:
+            n_t = comps[0][1].shape[-1]
+            top = max(4, n_t - 1)
+            grid = sorted({max(2, int(top * f)) for f in (0.15, 0.3, 0.45, 0.6, 0.8)})
+            print_cli_subsection("ICA RANK SWEEP — peak task enrichment over components")
+            n_pcs, got = _ica_rank_sweep(comps, resp, mask, grid, device)
+    elif method == "ica":
+        got = warp_ica_basis(
+            comps,
+            n_components=n_pcs,
+            pca_components=n_pcs if var_frac is None else var_frac,
+            device=device,
+        )
+    else:
+        got = warp_pc_basis(comps, n_pcs=None if var_frac is not None else n_pcs, device=device)
+    if got is None:
+        print("  ⚠️  -warp_recon: the warp is empty — nothing to reconstruct.")
+        return result
+    basis, loadings, means, var = got
+
+    if method == "pcs" and var_frac is not None:
+        # Cumulative over the FULL basis, so the fraction means what it says rather
+        # than a fraction of some earlier truncation.
+        n_pcs = int(torch.searchsorted(torch.cumsum(var, 0), float(var_frac)).item()) + 1
+        n_pcs = max(1, min(n_pcs, basis.shape[1]))
+        basis, var = basis[:, :n_pcs].contiguous(), var[:n_pcs]
+        loadings = [(ax, load[..., :n_pcs].contiguous()) for ax, load in loadings]
+        print(
+            f"  -warp_recon pcs:{var_frac:g} → {n_pcs} component(s) reach "
+            f"{float(var.sum()):.1%} of the variance"
+        )
+    k = basis.shape[1]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+
+    keep, dropped, best = {}, {}, 0.0
+    for axis, load in loadings:
+        idx = list(range(k))
+        if args.reject is not None and resp is not None:
+            scores = [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
+            best = max(best, max(scores, default=0.0))
+            idx = [i for i in range(k) if scores[i] <= args.reject]
+            dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
+        keep[axis] = idx
+
+    if method == "ica":
+        head = f"WARP TASK REJECTION — ICA rank {k}, projected from the FULL-rank field"
+    else:
+        span = f"top {k}" if n_pcs is not None else f"all {k}"
+        head = f"WARP RECONSTRUCTION — {span} principal components"
+    print_cli_subsection(head)
+    for axis, _load in loadings:
+        lbl = label_of.get(axis, f"axis{axis}")
+        drops = dropped.get(axis, [])
+        if args.reject is None:
+            print(f"  • {lbl}: {len(keep[axis])} of {k} components kept")
+        elif drops:
+            det = ", ".join(f"#{i} ({e:.1f}x)" for i, e in drops[:6])
+            # The index is into the SHARED basis, so the same number on both axes is one
+            # component scoring differently through two spatial loadings, not two finds.
+            more = f" +{len(drops) - 6} more" if len(drops) > 6 else ""
+            print(
+                f"  • {lbl}: dropped {len(drops)} task-loaded component(s) at "
+                f">{args.reject:g}x — {det}{more}"
+            )
+        else:
+            print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
+
+    if method == "ica":
+        # Reject by PROJECTION on the full-rank field, not by rebuilding from the kept
+        # components: an ICA rank is fixed before the rotation, so a reconstruction
+        # discards whatever the PCA reduction dropped even when nothing is rejected --
+        # measured, 21.5% of a real field's rms for zero benefit. The decomposition's
+        # only job is to name the bad time courses.
+        bad_tc = {
+            axis: basis[:, [i for i, _e in dropped.get(axis, [])]] for axis, _load in loadings
+        }
+        if any(v.shape[1] for v in bad_tc.values()):
+            rebuilt = warp_project_out(comps, bad_tc, device=device)
+        else:
+            rebuilt = [(ax, f.float()) for ax, f in comps]
+    else:
+        rebuilt = warp_reconstruct(basis, loadings, means, keep)
+    # What actually left the field, measured rather than inferred from a variance
+    # ratio. Under ica this is purely what was rejected -- the projection touches
+    # nothing else. Under pcs it also carries the truncation loss, which is why the two
+    # are labelled differently rather than sharing one number a reader would misread.
+    what = "removed" if method == "ica" else "removed + truncated away"
+    for (axis, new_f), (_, old_f) in zip(rebuilt, comps, strict=True):
+        lbl = label_of.get(axis, f"axis{axis}")
+        o = old_f.float()
+        resid = float((new_f - o).pow(2).mean().sqrt())
+        print(
+            f"    {lbl}: rms {float(o.std()):.4f} → {float(new_f.std()):.4f} vox; "
+            f"{what} {resid:.4f} vox "
+            f"({resid / max(float(o.std()), 1e-9) * 100:.1f}% of the field's rms)"
+        )
+
+    if args.reject is not None and not any(dropped.values()):
+        # A no-op here is a RESULT, not silence. PCA maximises variance, so a
+        # contamination that is a small share of the field's energy cannot dominate any
+        # component -- measured on a 0.8mm checkerboard run, the contaminated voxels
+        # were 0.65% of the mask carrying 0.70% of the field's energy, and no principal
+        # component scored above 1.25x while the field itself was 8.8x enriched at the
+        # tail. ICA is not variance-ordered and does better on that run (2.8-3.0x), so
+        # it is the thing to try before giving up on a decomposition.
+        extra = (
+            " Try -warp_recon ica, which is not variance-ordered and reached 2.8-3.0x "
+            "where PCA reached 1.25x on a real contaminated run."
+            if method == "pcs"
+            else ""
+        )
+        print(
+            f"    ⓘ  no component's weights are concentrated on active tissue "
+            f"(strongest {best:.2f}x vs the {args.reject:g}x cut). If the diagnostic "
+            "above says CONTAMINATION, the response is likely too SPARSE to isolate: "
+            "it is a small share of the field's variance." + extra + " Otherwise use "
+            "-detask filter (block designs) or -detask field."
+        )
+    if args.reject is not None and any(dropped.values()) and resp is not None:
+        # The design correlation of what was dropped, as corroboration. It cannot be
+        # thresholded (a block design is ~2 DoF) but a dropped component whose time
+        # course tracks the design is much easier to believe.
+        design = getattr(args, "_task_design", None)
+        if design is not None:
+            x = np.asarray(design)[:, 0]
+            x = x - x.mean()
+            for axis, drops in dropped.items():
+                if not drops:
+                    continue
+                lbl = label_of.get(axis, f"axis{axis}")
+                cs = []
+                for i, _e in drops[:4]:
+                    tc = basis[:, i].numpy()
+                    tc = tc - tc.mean()
+                    d = np.linalg.norm(tc) * np.linalg.norm(x)
+                    cs.append(f"#{i} |r|={abs(float(tc @ x / d)) if d > 0 else 0:.2f}")
+                print(f"    {lbl} dropped components vs the design: {', '.join(cs)}")
+
+    if any(dropped.values()):
+        design = getattr(args, "_task_design", None)
+        cols, names = [], []
+        if design is not None:
+            d = np.asarray(design)[:, 0].astype(float)
+            cols.append((d - d.mean()) / max(d.std(), 1e-12))
+            names.append("design")
+        # ONE column per component, not per (component, axis). The temporal basis is
+        # shared across the encode axes -- only the spatial loading differs -- so a
+        # component rejected on both axes has the SAME time course twice, and writing
+        # it twice reads as two findings when it is one.
+        who: dict[int, list[str]] = {}
+        for axis, drops in dropped.items():
+            for i, _e in drops:
+                who.setdefault(i, []).append(label_of.get(axis, f"axis{axis}"))
+        for i in sorted(who):
+            tc = basis[:, i].numpy().astype(float)
+            cols.append((tc - tc.mean()) / max(tc.std(), 1e-12))
+            names.append(f"ic{i:02d}_{'+'.join(sorted(who[i]))}")
+        rpath = f"{args._stem}_locomoco_rejected.1D"
+        # z-scored, and the design shipped in column 1: the reason to plot this is to
+        # see whether what was removed tracks the task, and that comparison is unreadable
+        # if the columns sit at different scales or the reference lives in another file.
+        header = (
+            "# z-scored; column 1 is the task design for comparison\n"
+            "# one column per COMPONENT (the temporal basis is shared across encode\n"
+            "# axes; the suffix names the axes it was rejected from)\n# "
+            + "  ".join(f"{n:>12s}" for n in names)
+        )
+        np.savetxt(rpath, np.stack(cols, axis=1), fmt="%12.6f", header=header, comments="")
+
+    out, note = pc_reconstruct_result(
+        result,
+        data,
+        keep,
+        rebuilt=rebuilt,
+        warp_interp=args.warp_interp,
+        warp_radius=args.warp_radius,
+        device=device,
+    )
+    if note:
+        print(f"  ⚠️  -warp_recon: {note}")
+    return out
+
+
+def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
+    """Write the warp PCs' SPATIAL loadings, one 4-D file per encode axis.
+
+    One file per axis, not one shared file: the temporal basis is common but every
+    component carries its own loading on each encode axis, and those are the maps that
+    differ. Sub-brick k of ``_pcmap_pe1`` and of ``_pcmap_pe2`` are the same temporal
+    component seen on the two axes, so they can be scrubbed side by side.
+
+    Loadings are written RAW and signed, not normalised per component: the amplitude is
+    the information -- it says which components carry the motion -- and a viewer scales
+    each sub-brick on its own anyway. The variance share rides in the brick label.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.locomoco import warp_pc_basis
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    want = args.write_pc_maps
+    got = warp_pc_basis(
+        [(ax, f) for _, ax, f in result.pe_displacements()],
+        n_pcs=None if want in (None, -1) else want,
+        device=device,
+    )
+    if got is None:
+        print("  ⚠️  -write_pc_maps: the warp is empty — no components to write.")
+        return
+    _u, loadings, _means, var = got
+    k = loadings[0][1].shape[-1]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+
+    scored = resp is not None and mask is not None
+    rows = []
+    for axis, load in loadings:
+        lbl = label_of.get(axis, f"axis{axis}")
+        scores = (
+            [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
+            if scored
+            else [float("nan")] * k
+        )
+        rows.append((lbl, scores))
+        names = [
+            f"PC{i:02d} {var[i]:.1%}" + (f" {scores[i]:.2f}x" if scored else "") for i in range(k)
+        ]
+        path = f"{stem}_pcmap_{lbl}{ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_nifti(load.float().numpy(), path, affine=affine, brick_labels=names)
+
+    if scored:
+        # A companion table so a map can be matched to its number without reading
+        # brick labels one at a time.
+        tpath = f"{stem}_pcmap_scores.1D"
+        header = "# component  variance  " + "  ".join(lbl for lbl, _ in rows)
+        lines = [header]
+        for i in range(k):
+            cells = "  ".join(f"{sc[i]:8.3f}" for _, sc in rows)
+            lines.append(f"{i:9d}  {float(var[i]):8.5f}  {cells}")
+        Path(tpath).write_text("\n".join(lines) + "\n")
+
+
 def _task_stage(result, data, stem, ext, affine, args, tr, device):
     """Diagnose the ORIGINAL field, then optionally hand back a de-tasked one.
 
@@ -1835,21 +2379,37 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     from fastfuncstuff.processing.locomoco import detask_result
 
     try:
-        design, polort = _write_task_diagnostics(result, data, stem, ext, affine, args, tr)
+        design, polort, resp, mask = _write_task_diagnostics(
+            result, data, stem, ext, affine, args, tr
+        )
     except (ValueError, RuntimeError) as exc:
         # A diagnostic must never destroy a finished fit. The estimation above can be
         # minutes of GPU time; losing it to a bad -tr or an empty mask is the wrong
         # trade. -detask is refused loudly, because silently skipping the fix the user
         # asked for would be worse than the crash.
         print(f"  ⚠️  task coupling skipped: {exc}")
-        if args.detask:
+        if args.detask_field:
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
+        if args.warp_recon:
+            print("  ⚠️  -warp_recon NOT applied — the outputs below are the ORIGINAL field.")
         return result
 
-    if not args.detask:
+    args._task_design = design
+    args._stem = stem
+    if args.write_pc_maps is not None:
+        _write_pc_maps(result, stem, ext, affine, args, resp, mask, device)
+
+    # PC reconstruction runs BEFORE -detask: it rebuilds the field, so a field
+    # projection afterwards acts on what was actually kept.
+    if args.warp_recon:
+        result = _warp_recon_stage(result, data, args, resp, mask, device)
+
+    if not args.detask_field:
+        if args.warp_recon:
+            _write_task_after(result, design, polort, resp, mask, stem, ext, affine, args)
         return result
 
-    print("  ── de-tasking (everything below is derived from the CLEANED field) ──")
+    print_cli_subsection("DE-TASKING — every output below comes from the CLEANED field")
     raw_components = [(ax, f) for _, ax, f in result.pe_displacements()]
     cleaned, removed, note = detask_result(
         result,
@@ -1961,10 +2521,6 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data
         spath = f"{stem}_locomoco_sep{ext}"
         with spinner(f"Writing {Path(spath).name}"):
             save_nifti(result.sep_map.numpy(), spath, affine=affine)
-        print(
-            f"  • axis separability 4D (1 = axes cleanly separable, 0 = aperture-"
-            f"ambiguous): {spath}"
-        )
 
     # Restrict the coupling stats to BRAIN. This used to gate on displacement energy
     # ("voxels that actually moved"), which is backwards on real data: the feathered
@@ -2023,9 +2579,7 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data
         if mask is not None
         else "whole FoV"
     )
-    print(f"  • per-voxel coupling r 3D [{cov}]: {rpath}")
-    print(f"  • per-frame coupling r: {frame_path}")
-    print(f"  • coupling report: {cpath}")
+    print(f"    coverage: {cov}")
     print(
         f"    r = {c['r']:+.4f}, kappa = {c['kappa']:+.4f} vox/vox (R² {c['kappa_r2']:.3f})"
         f"  [{'coupled' if abs(c['r']) > 0.5 else 'largely independent'}]"
@@ -2048,7 +2602,6 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
             p = f"{stem}_locomoco_confidence{ext}"
             with spinner(f"Writing {Path(p).name}"):
                 save_nifti(conf.numpy(), p, affine=affine)
-            print(f"  • searchlight confidence map 4D: {p}")
         else:
             print(
                 "  • -save_confidence: no map — needs -backend xcorr (the flow/phase "
@@ -2068,7 +2621,6 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
                 f.write("# ffs_locomoco corr-curve trial offsets (voxels)\n")
                 f.write("  " + "  ".join(f"{o:g}" for o in offs) + "\n")
             off_str = ", ".join(f"{o:g}" for o in offs)
-            print(f"  • per-voxel corr landscape 4D: {p}")
             print(f"    offset axis (vox): [{off_str}]  → also {op}")
         else:
             print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
@@ -2098,7 +2650,7 @@ def _write_warp_pcs(components, stem, n_pcs) -> None:
         f.write(f"# Variance explained: {var_pct}\n")
         for row in scores.numpy():
             f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
-    print(f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}")
+    print(f"    warp PCs: {scores.shape[1]} components, var {var_pct}")
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
@@ -2137,7 +2689,6 @@ def _save_tsnr(series, out_stem, ext, affine) -> None:
     path = f"{out_stem}{ext}"
     with spinner(f"Writing {Path(path).name}"):
         save_nifti(tsnr, path, affine=affine)
-    print(f"  • tSNR: {path}")
 
 
 def _save_first_last(series, out_stem, ext, affine, *, include_diff, allow_neg) -> None:
@@ -2161,7 +2712,6 @@ def _save_first_last(series, out_stem, ext, affine, *, include_diff, allow_neg) 
     path = f"{out_stem}{ext}"
     with spinner(f"Writing {Path(path).name}"):
         save_nifti(stack, path, affine=affine)
-    print(f"  • {'first/last/diff' if include_diff else 'first/last'}: {path}")
 
 
 def _write_qc_diag(args, corrected, original, corr_stem, orig_stem, ext, affine) -> None:
@@ -2228,6 +2778,42 @@ def _pe_label(args) -> str:
     if args.pe_dir:
         return " ".join(args.pe_dir)
     return f"{args.pe_dir2} (partition)"
+
+
+def _notch_estimation_data(datas, args, tr):
+    """Band-filtered copies of the series for estimation, plus a line describing the cut.
+
+    Raises ValueError with the reason if the design has no line to notch or is too
+    broadband -- both are the tool declining to run rather than notching the data.
+    """
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.stats.task_coupling import (
+        default_polort,
+        design_notch_bins,
+        filter_task_band,
+        notch_basis,
+    )
+
+    n_t = datas[0].shape[3]
+    design, labels = _task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    bins, info = design_notch_bins(design, polort, widen=args.detask_widen)
+    basis = notch_basis(n_t, bins, polort)
+    freqs = np.fft.rfftfreq(n_t, d=float(tr))
+    out = [
+        filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy() for d in datas
+    ]
+    if info.get("warning"):
+        print(f"   ⚠️  -detask filter: {info['warning']}")
+    hz = ", ".join(f"{freqs[b]:.4f}" for b in bins)
+    note = (
+        f"-detask filter: notched {len(bins)} line(s) at {hz} Hz "
+        f"({info['spectrum_frac'] * 100:.1f}% of the spectrum, {basis.shape[1]} DoF) "
+        f"from the estimation data; {len(labels)} condition(s), polort {polort}"
+    )
+    return out, note
 
 
 def _run_multiecho(
@@ -2313,6 +2899,26 @@ def _run_multiecho(
             affine = img.affine.copy()
             tr_sec = _resolve_tr(args, img) if args.events else None
         datas.append(d)
+
+    # -detask filter: notch the task band out of the images the ESTIMATOR sees. The raw
+    # `datas` are kept untouched -- the corrected series is re-resampled from them after
+    # the solve, so the only thing the filter changes is what the estimator was allowed
+    # to look at.
+    est_datas, notch_note = datas, None
+    if args.detask_widen is not None:
+        if len(datas) > 1:
+            print(
+                "❌ -detask filter is not wired for the multi-echo path (one shared "
+                "field scaled per echo).",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            est_datas, notch_note = _notch_estimation_data(datas, args, tr_sec)
+        except ValueError as exc:
+            print(f"❌ -detask filter: {exc}", file=sys.stderr)
+            return 2
+        print(f"   🔇 {notch_note}")
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
@@ -2518,7 +3124,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import make_raw_reference_me_result
 
         result = make_raw_reference_me_result(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2528,7 +3134,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_interecho
 
         result = estimate_residual_flow_me_interecho(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2558,7 +3164,7 @@ def _run_multiecho(
 
             result = refine_interecho_temporally(
                 result,
-                datas,
+                est_datas,
                 args.echo_times,
                 pe_axis,
                 slice_axis,
@@ -2596,7 +3202,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_scaled
 
         result = estimate_residual_flow_me_scaled(
-            datas,
+            est_datas,
             args.echo_times,
             est_idx,
             pe_axis,
@@ -2632,7 +3238,7 @@ def _run_multiecho(
         )
     else:
         result = estimate_residual_flow_multiecho(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2703,6 +3309,20 @@ def _run_multiecho(
             device=device,
         )
 
+    if args.detask_widen is not None:
+        # The estimator was shown band-filtered images, so the series it warped is
+        # band-filtered too. Re-derive it from the untouched input with the same field.
+        from fastfuncstuff.processing.locomoco import resample_from_raw
+
+        result.per_echo[0] = resample_from_raw(
+            result.per_echo[0],
+            datas[0],
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+            desc="notch resample",
+        )
+
     print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
     for j, res in enumerate(result.per_echo):
@@ -2712,8 +3332,7 @@ def _run_multiecho(
 
             axis, disp = res.warp_components()[0]
             with spinner(f"Writing {Path(estem).name}_warp{ext}"):
-                warp_path = save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
-            print(f"  • echo {j + 1} warp (ffs_nwarp, axis {axis}): {warp_path}")
+                save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
         # Materialized once per echo for both the write and the QC maps below --
         # see the single-echo block for why the repeat call is not free.
         want_corrected = not args.no_corrected or (_want_qc(args) and _want_corrected_qc(args))
@@ -2727,23 +3346,16 @@ def _run_multiecho(
                     corr_path,
                     affine=affine,
                 )
-            print(f"  • echo {j + 1} corrected series: {corr_path}")
         if not args.no_flow:
             if res.pe_axis2 is not None:
-                names = {"pe1": "primary PE", "pe2": "partition"}
-                for label, axis, field in res.pe_displacements():
+                for label, _axis, field in res.pe_displacements():
                     fpath = f"{estem}_flow_{label}{ext}"
                     with spinner(f"Writing {Path(fpath).name}"):
                         save_nifti(field.numpy(), fpath, affine=affine)
-                    print(
-                        f"  • echo {j + 1} signed {names[label]} flow 4D "
-                        f"(voxels, axis {axis}): {fpath}"
-                    )
             else:
                 flow_path = f"{estem}_flow{ext}"
                 with spinner(f"Writing {Path(flow_path).name}"):
                     save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
-                print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
         if _want_qc(args):
             corrected = (
                 corrected_series.numpy()
@@ -2765,7 +3377,7 @@ def _run_multiecho(
         # Echo 1's series and the shared field: the coupling question is about the ONE
         # field every echo is corrected by, not each echo's scaled copy of it.
         _write_task_diagnostics(result.per_echo[0], datas[0], stem, ext, affine, args, tr_sec)
-        if args.detask:
+        if args.detask_field:
             # The multi-echo correction is one SHARED field scaled per echo; de-tasking
             # it means re-deriving every echo's warp and series from the cleaned w, which
             # is not wired yet. Refusing beats silently cleaning one echo's copy.
@@ -2782,7 +3394,6 @@ def _run_multiecho(
         f.write(f"# echo_TE_ms   {result.alpha_label}\n")
         for te_v, a_v in zip(result.echo_times.tolist(), result.alpha.tolist(), strict=True):
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
-    print(f"  • per-echo scaling + linearity: {alpha_path}")
 
     if args.want_pcs is not None:
         # PCs of the SHARED field w: every echo's warp is alpha_e·w, so they all share
@@ -2893,6 +3504,25 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # -detask has nothing to key on without a design, and the task stage it lives in is
     # gated on -events — so a lone -detask is a silent no-op all the way through. Say so
     # here rather than let a run finish looking de-tasked.
+    try:
+        args.detask_field, args.detask_widen = parse_detask(args.detask)
+        parse_warp_recon(args.warp_recon)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    if args.reject is not None and not args.warp_recon:
+        print(
+            "❌ -reject modifies -warp_recon; pass -warp_recon pcs (or pcs:N) too.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.reject is not None and not args.events:
+        print(
+            "❌ -reject needs -events: it scores each component against WHERE the task "
+            "response is, which the design defines.",
+            file=sys.stderr,
+        )
+        return 2
     if args.detask and not args.events:
         print(
             "❌ -detask needs -events (the task-locked part is defined by the design); "
@@ -3103,6 +3733,25 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     affine = img.affine.copy()
     tr_sec = _resolve_tr(args, img) if args.events else None
 
+    # -detask filter: the estimator sees a band-filtered copy, `data` stays raw so the
+    # corrected series can be re-derived from it after the solve.
+    est_data = data
+    if args.detask_widen is not None:
+        try:
+            (est_data,), note = _notch_estimation_data([data], args, tr_sec)
+        except ValueError as exc:
+            print(f"❌ -detask filter: {exc}", file=sys.stderr)
+            return 2
+        print(f"   🔇 {note}")
+        if args.final_qwarp or args.backend == "qwarp":
+            # The polish registers raw intensities against a raw template; -match never
+            # reached it either. Say so rather than let a partially-filtered run read as
+            # a clean one.
+            print(
+                "   ⚠️  the qwarp stage still sees UNFILTERED intensities — only the "
+                "flow/xcorr estimate is notched."
+            )
+
     paired_bins = None
     if args.paired_ref:
         if not (args.is_3dacq or dual3d):
@@ -3271,7 +3920,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         result = estimate_residual_flow_rotaware(
             raw,
-            data,
+            est_data,
             mats_vox,
             mats_dicom,
             affine,
@@ -3316,7 +3965,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
     else:
         result = estimate_residual_flow(
-            data,
+            est_data,
             pe_axis,
             slice_axis,
             ref_mode=args.ref,
@@ -3411,6 +4060,20 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         result = polished.per_echo[0]
 
+    if args.detask_widen is not None:
+        # The estimator was shown band-filtered images, so the series it warped is
+        # band-filtered too. Re-derive it from the untouched input with the same field.
+        from fastfuncstuff.processing.locomoco import resample_from_raw
+
+        result = resample_from_raw(
+            result,
+            data,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+            desc="notch resample",
+        )
+
     print_cli_section("Outputs")
 
     # Task coupling runs BEFORE any output: it must measure the ORIGINAL field (running
@@ -3418,6 +4081,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # -detask has to replace the field before the warp/corrected series are written.
     if args.events and tr_sec:
         result = _task_stage(result, data, stem, ext, affine, args, tr_sec, device)
+    elif args.write_pc_maps is not None:
+        # Without -events there is no active mask, so the maps go out unscored. Looking
+        # at them is the point; the score is the optional part.
+        _write_pc_maps(result, stem, ext, affine, args, None, None, device)
 
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
@@ -3426,7 +4093,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         (primary_axis, primary_disp), *rest = comps
         as_5d = args.warp_format == "5d"
         with spinner(f"Writing {Path(stem).name}_warp{ext}"):
-            warp_path = save_medic_warp(
+            save_medic_warp(
                 primary_disp,
                 primary_axis,
                 affine,
@@ -3435,9 +4102,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 as_5d=as_5d,
                 extra_components=[(d, a) for a, d in rest],
             )
-        axes_note = f"axes {[a for a, _ in comps]}" if dual else f"axis {primary_axis}"
-        fmt_note = "5D DICOM-mm" if as_5d else "folder of 4D frames, DICOM-mm"
-        print(f"  • warp ({fmt_note}, ffs_nwarp, {axes_note}): {warp_path}")
 
     if args.want_pcs is not None:
         _write_warp_pcs(result.warp_components(), stem, args.want_pcs)
@@ -3465,7 +4129,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 corr_path,
                 affine=affine,
             )
-        print(f"  • corrected series: {corr_path}")
 
     # Temporal reductions of the corrected series ((nx, ny, nz, T) -> over T).
     # max/min are coverage images, not contrast images — see the -save_max help.
@@ -3484,7 +4147,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 out_path,
                 affine=affine,
             )
-        print(f"  • corrected {which}: {out_path}")
 
     if _want_qc(args):
         # Works even with -no_corrected; only the QC maps that read the corrected
@@ -3502,12 +4164,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             # Two physically distinct artifacts: write each as its OWN signed map. The
             # magnitude/angle pair below is for the legacy in-plane-vector case, where the
             # two components really are one vector; here they are not.
-            names = {"pe1": "primary PE", "pe2": "partition"}
-            for label, axis, field in result.pe_displacements():
+            for label, _axis, field in result.pe_displacements():
                 fpath = f"{stem}_flow_{label}{ext}"
                 with spinner(f"Writing {Path(fpath).name}"):
                     save_nifti(field.numpy(), fpath, affine=affine)
-                print(f"  • signed {names[label]} flow 4D (voxels, axis {axis}): {fpath}")
         elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
@@ -3515,8 +4175,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
             with spinner(f"Writing {Path(ang_path).name}"):
                 save_nifti(result.flow_angle().numpy(), ang_path, affine=affine)
-            print(f"  • flow magnitude 4D (voxels): {mag_path}")
-            print(f"  • flow angle 4D (degrees 0–360; direction of motion): {ang_path}")
         else:
             flow_path = f"{stem}_flow{ext}"
             with spinner(f"Writing {Path(flow_path).name}"):
@@ -3534,8 +4192,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         frames = result.flow_movie(max_mag=args.flow_max)
         movie_path = f"{stem}_flow.{fmt}"
         with spinner(f"Writing {Path(movie_path).name}"):
-            actual = _write_movie(frames, movie_path, args.fps, fmt)
-        print(f"  • flow movie (circular-phase wheel): {actual}")
+            _write_movie(frames, movie_path, args.fps, fmt)
 
     print_cli_footer("ffs_locomoco")
     return 0
