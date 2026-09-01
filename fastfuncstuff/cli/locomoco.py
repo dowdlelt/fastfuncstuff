@@ -2178,6 +2178,8 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             print(f"  • {lbl}: {len(keep[axis])} of {k} components kept")
         elif drops:
             det = ", ".join(f"#{i} ({e:.1f}x)" for i, e in drops[:6])
+            # The index is into the SHARED basis, so the same number on both axes is one
+            # component scoring differently through two spatial loadings, not two finds.
             more = f" +{len(drops) - 6} more" if len(drops) > 6 else ""
             print(
                 f"  • {lbl}: dropped {len(drops)} task-loaded component(s) at "
@@ -2264,18 +2266,27 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             d = np.asarray(design)[:, 0].astype(float)
             cols.append((d - d.mean()) / max(d.std(), 1e-12))
             names.append("design")
+        # ONE column per component, not per (component, axis). The temporal basis is
+        # shared across the encode axes -- only the spatial loading differs -- so a
+        # component rejected on both axes has the SAME time course twice, and writing
+        # it twice reads as two findings when it is one.
+        who: dict[int, list[str]] = {}
         for axis, drops in dropped.items():
-            lbl = label_of.get(axis, f"axis{axis}")
             for i, _e in drops:
-                tc = basis[:, i].numpy().astype(float)
-                cols.append((tc - tc.mean()) / max(tc.std(), 1e-12))
-                names.append(f"{lbl}_ic{i:02d}")
+                who.setdefault(i, []).append(label_of.get(axis, f"axis{axis}"))
+        for i in sorted(who):
+            tc = basis[:, i].numpy().astype(float)
+            cols.append((tc - tc.mean()) / max(tc.std(), 1e-12))
+            names.append(f"ic{i:02d}_{'+'.join(sorted(who[i]))}")
         rpath = f"{args._stem}_locomoco_rejected.1D"
         # z-scored, and the design shipped in column 1: the reason to plot this is to
         # see whether what was removed tracks the task, and that comparison is unreadable
         # if the columns sit at different scales or the reference lives in another file.
-        header = "# z-scored; column 1 is the task design for comparison\n# " + "  ".join(
-            f"{n:>12s}" for n in names
+        header = (
+            "# z-scored; column 1 is the task design for comparison\n"
+            "# one column per COMPONENT (the temporal basis is shared across encode\n"
+            "# axes; the suffix names the axes it was rejected from)\n# "
+            + "  ".join(f"{n:>12s}" for n in names)
         )
         np.savetxt(rpath, np.stack(cols, axis=1), fmt="%12.6f", header=header, comments="")
         print(f"  • rejected component time courses (plot against the design): {rpath}")

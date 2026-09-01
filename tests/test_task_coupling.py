@@ -1050,12 +1050,21 @@ def test_reject_writes_plottable_timecourses_and_an_after_map(tmp_path):
     )
     rejected = tmp_path / "out_locomoco_rejected.1D"
     assert rejected.exists()
-    head = rejected.read_text().splitlines()[1]
-    assert "design" in head  # the reference ships in the same file, or it is unplottable
+    lines = rejected.read_text().splitlines()
+    head = [ln for ln in lines if ln.startswith("#")][-1]  # the column-name line
     table = np.loadtxt(rejected)
     assert table.shape[0] == n_t and table.shape[1] >= 2
     # z-scored, so the columns are directly comparable on one axis.
     assert np.allclose(table.std(axis=0), 1.0, atol=1e-6)
+    # ONE column per component, never one per (component, axis). The temporal basis is
+    # shared across the encode axes, so a component rejected on both had its identical
+    # time course written twice and read as two findings when it was one.
+    names = head.replace("#", "").split()
+    assert names[0] == "design"
+    assert len(names) == len(set(names)), names
+    for j in range(1, table.shape[1]):
+        for i in range(1, j):
+            assert not np.allclose(table[:, i], table[:, j]), (names[i], names[j])
 
     # The after maps exist and are a real second measurement, not a copy of the before.
     for axis in ("pe1", "pe2"):
