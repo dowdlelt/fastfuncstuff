@@ -1883,15 +1883,18 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
             if tail
             else f"enrichment {enrich['enrichment']:.2f}x"
         )
+        # Each axis gets its own banner: the two findings lines per axis ran together
+        # into one block, and pe1 vs pe2 is the first thing a reader is looking for.
+        print_cli_subsection(name)
         print(
-            f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
             f"{best['abs_r_p95']:.3f} p95 in the active mask ({best['label']}), "
             f"kappa {slope['kappa']:+.3f}"
         )
         # The verdict sentence, and only that. The full stratum table goes to the .txt:
         # it was echoed here in full for every axis, which buried the one line that
         # actually says what to do.
-        print(f"    {report[-1].rstrip().splitlines()[-1].strip()}")
+        print(f"  {report[-1].rstrip().splitlines()[-1].strip()}")
         # One 4-D file per axis, conditions on the 4th axis — a viewer scrubs the
         # conditions, and one file per condition would flood the output directory.
         # Queued, not written here: the findings above are what a reader scans, and
@@ -1903,6 +1906,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
 
     pending.append((f"{stem}_taskr_data{ext}", data_tc.r, True))
     Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
+    print()
     for path, arr, squeeze in pending:
         with spinner(f"Writing {Path(path).name}"):
             a = arr.float()
@@ -2080,11 +2084,13 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
             if tail
             else f"enrichment {task_enrichment(tc, resp, mask)['enrichment']:.2f}x"
         )
+        print_cli_subsection(name)
         print(
-            f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
             f"{best['abs_r_p95']:.3f} p95 in the active mask"
         )
         pending.append((f"{stem}_taskr_{label}_after{ext}", tc.r))
+    print()
     for path, arr in pending:
         with spinner(f"Writing {Path(path).name}"):
             a = arr.float()
