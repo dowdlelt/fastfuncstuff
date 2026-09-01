@@ -1778,6 +1778,8 @@ def estimate_residual_flow(
     coverage_erode: int | None = 1,
     is_3dacq: bool = False,
     pe_axis2: int | None = None,
+    null_axis: int | None = None,
+    null_min_r2: float = 0.0,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
@@ -1892,6 +1894,8 @@ def estimate_residual_flow(
             max_shift=max_shift,
             trial_step=trial_step,
             refine_rounds=refine_rounds,
+            null_axis=null_axis,
+            null_min_r2=null_min_r2,
             converge=converge,
             converge_rel=converge_rel,
             first_n=first_n,
@@ -3879,6 +3883,8 @@ def _run_3dacq_plain(
     match_sigma: float = 6.0,
     ngf_eta_q: float = 0.5,
     pe_axis2: int | None = None,
+    null_axis: int | None = None,
+    null_min_r2: float = 0.0,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
     paired_bins: torch.Tensor | None = None,
@@ -3902,10 +3908,24 @@ def _run_3dacq_plain(
     if dual and pe_axis2 == pe_axis:
         raise ValueError(f"the two encode axes must differ, got pe_axis=pe_axis2={pe_axis}")
     axes = [pe_axis] if not dual else [pe_axis, pe_axis2]
+    # The un-encoded axis, solved alongside as a NULL channel. An EPI residual cannot
+    # be displaced along the readout direction, so whatever is estimated there is
+    # spurious -- and it is measured on the same voxels, the same edges and the same
+    # estimator as the encoded axes, which is what makes it a usable reference for
+    # what the encoded ones inherited. It is solved for and regressed out, never
+    # applied to the data.
+    n_encoded = len(axes)
+    if null_axis is not None:
+        if null_axis in axes:
+            raise ValueError(
+                f"-pe_null names axis {null_axis}, which is already an encode axis "
+                f"({axes}). The null axis has to be the un-encoded one."
+            )
+        axes = axes + [null_axis]
     if dual:
         # Both encode axes must lie in the display plane, so the un-encoded third axis is
         # the one we cut along — the same forcing the 2-D dual-PE path applies.
-        disp_slice = next(a for a in (0, 1, 2) if a not in axes)
+        disp_slice = next(a for a in (0, 1, 2) if a not in axes[:n_encoded])
     else:
         disp_slice = (
             display_slice
@@ -3991,9 +4011,10 @@ def _run_3dacq_plain(
             d = flow3d(
                 [fxb[None]], [mvb[None]], conf_out=conf_acc, curve_out=curve_acc, sep_out=sep_acc
             )
-            corrected[..., t] = _shift3d_axes(
-                mv[None], d, axes, mode=warp_interp, radius=warp_radius
-            )[0].cpu()
+            if null_axis is None:
+                corrected[..., t] = _shift3d_axes(
+                    mv[None], d, axes, mode=warp_interp, radius=warp_radius
+                )[0].cpu()
             for k in range(len(axes)):
                 disps[k][..., t] = d[k][0].cpu()
             if conf_field is not None and conf_acc:
@@ -4012,6 +4033,28 @@ def _run_3dacq_plain(
                 )
                 rr = float(max(1, int(np.ceil(max_shift))))
                 curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
+        if null_axis is not None:
+            # Inside the refine loop on purpose. Each pass rebuilds its reference from
+            # `corrected`, so a field that still carries the spurious component bakes
+            # it into the next template and the contamination compounds. Correcting
+            # here means every iterate, and every template built from one, is clean.
+            #
+            # The regression needs the whole time course, so it runs after the frame
+            # loop and the series is resampled from the RAW frames afterwards -- never
+            # along the null axis itself, whose displacement is spurious by definition
+            # and is solved for only to be read.
+            disps = null_axis_regress(disps, len(axes) - 1, min_r2=null_min_r2)
+            enc = disps[:n_encoded]
+            for t in tqdm(
+                range(nt), desc="null-axis resample", unit="frame", leave=True, disable=nt < 3
+            ):
+                corrected[..., t] = _shift3d_axes(
+                    vol4d[..., t].to(device)[None],
+                    [e[..., t].to(device) for e in enc],
+                    axes[:n_encoded],
+                    mode=warp_interp,
+                    radius=warp_radius,
+                )[0].cpu()
         return disps, corrected
 
     # Gate before the first refine pass, not after the last: refine rebuilds its next
@@ -4096,6 +4139,16 @@ def _run_3dacq_plain(
             ap = disp[k].abs()
             sel = ap[ap > 0]
             med = float(sel.median()) if sel.numel() else 0.0
+            if null_axis is not None and k == len(axes) - 1:
+                # The size of the spurious trace, which is the whole point of solving
+                # for it: a null channel reading near zero says the encoded axes had
+                # little to inherit, and a large one says they did.
+                print(
+                    f"🚫 locomoco NULL axis {ax} (un-encoded, never applied): "
+                    f"|disp| median {med:.3f} vox, max {float(ap.max()):.3f} vox "
+                    f"— regressed out of the encode axes"
+                )
+                continue
             label = "PE" if k == 0 else "partition"
             print(
                 f"🌀 locomoco 3D-acq: {nt} frames, {label} axis {ax}, backend={backend}, "
@@ -4269,6 +4322,61 @@ def optical_flow_lk_3d_multiecho(
 #     collapse into each other on a locally straight edge (the aperture problem).
 #     That is not a bug to hide: `sep_out` returns the per-voxel separability so the
 #     ambiguity is visible on a map instead of silently redistributed between axes.
+
+
+def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
+    """Remove, per voxel, the part of each encoded axis that the NULL axis predicts.
+
+    An EPI residual cannot be displaced along the readout axis -- its bandwidth is
+    orders of magnitude above the phase-encode one -- so displacement estimated there
+    is spurious by construction. That makes it a matched null channel: same voxels,
+    same edges, same estimator, no true signal. Real residual motion is B0-driven and
+    lies in the encode plane, so it does not appear there and survives; whatever
+    mechanism put a trace in the null axis put a correlated trace in the encoded ones,
+    and that part goes.
+
+    Per voxel, across TIME: ``d_k <- d_k - beta * d_null`` with ``beta`` the least
+    squares slope over frames. Empirical on purpose. The analytic version was tried
+    first and is wrong: a brightness change no motion caused is explained by the
+    minimum-norm displacement ``d = g dI / |g|^2``, which lies along the gradient and
+    suggests the fixed coefficient ``g_k / g_null``. That relation does not survive the
+    LK pooling window -- the pooled estimate's axis ratio is ``<g_k S> / <g_null S>``,
+    not ``g_k / g_null`` -- and using it AMPLIFIED the contamination on a 6% synthetic
+    gain, 0.557 to 1.003 rms, instead of cancelling it. A slope measured per voxel
+    needs no gradient model and absorbs whatever the pooling actually did.
+
+    Discarding the null channel without regressing on it is not an alternative: adding
+    the third axis only re-divides the same artifact three ways instead of two, worth
+    9% on that synthetic.
+
+    ``min_r2`` leaves a voxel untouched unless the null explains that fraction of the
+    encoded axis's variance, so a channel that is pure noise at a voxel cannot inject
+    displacement there. ``gate`` is an optional extra per-voxel mask (conditioning,
+    say). Both fail CLOSED.
+
+    ``fields`` is ``[(nx,ny,nz,T)]`` per axis; returns the same list with the encoded
+    axes corrected and the null axis passed through for diagnostics.
+    """
+    dn = fields[null_index]
+    x = dn - dn.mean(dim=-1, keepdim=True)
+    sxx = (x * x).sum(dim=-1)
+    out = list(fields)
+    for k in range(len(fields)):
+        if k == null_index:
+            continue
+        y = fields[k]
+        yc = y - y.mean(dim=-1, keepdim=True)
+        sxy = (x * yc).sum(dim=-1)
+        beta = sxy / sxx.clamp(min=1e-20)
+        keep = sxx > 0
+        if min_r2 > 0:
+            syy = (yc * yc).sum(dim=-1)
+            r2 = (sxy * sxy) / (sxx * syy).clamp(min=1e-20)
+            keep = keep & (r2 >= min_r2)
+        if gate is not None:
+            keep = keep & (gate > 0)
+        out[k] = y - torch.where(keep, beta, torch.zeros_like(beta))[..., None] * x
+    return out
 
 
 def optical_flow_lk_3d_axes(

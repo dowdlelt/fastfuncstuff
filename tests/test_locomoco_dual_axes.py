@@ -1099,3 +1099,61 @@ def test_three_axis_separability_collapses_on_a_one_dimensional_ramp():
     )
     c = (slice(None), slice(6, -6), slice(6, -6), slice(6, -6))
     assert sep and float(sep[0][c].median()) < 0.05, float(sep[0][c].median())
+
+
+def test_null_axis_regress_removes_what_the_null_predicts_and_spares_what_it_does_not():
+    """Per-voxel temporal slope, not a gradient-ratio model.
+
+    The analytic version was tried first: a brightness change no motion caused is
+    explained by the minimum-norm displacement d = g dI/|g|^2, which lies along the
+    gradient and suggests the fixed coefficient g_k/g_null. That relation does not
+    survive the LK pooling window, and using it AMPLIFIED a synthetic 6% gain's
+    contamination from 0.557 to 1.003 rms instead of cancelling it.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(0)
+    shape, n_t = (6, 5, 4), 60
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 9.0)  # what the null channel sees
+    real = torch.cos(2 * torch.pi * t / 23.0)  # genuine motion, unrelated to it
+
+    null = spurious.expand(*shape, n_t) + 0.01 * torch.randn(*shape, n_t, generator=g)
+    # Each encode axis inherits the spurious part with its OWN per-voxel coefficient,
+    # which is exactly what a fixed analytic coefficient could not have handled.
+    coef = torch.linspace(0.3, 2.0, int(torch.tensor(shape).prod())).reshape(shape)
+    encoded = coef[..., None] * spurious + 0.8 * real
+
+    out = null_axis_regress([encoded.clone(), null], null_index=1)
+    resid_spur = (out[0] - 0.8 * real).abs().mean()
+    before_spur = (encoded - 0.8 * real).abs().mean()
+    # ~93% removed, not 100%: the null channel carries measurement noise, and a slope
+    # fitted to a noisy regressor is attenuated toward zero (errors-in-variables), so
+    # the subtraction always undershoots by roughly the null's noise-to-signal ratio.
+    # That is a property of the method, not of this fixture -- a noisier null channel
+    # cancels less, which is also why -pe_null_min_r2 exists.
+    assert resid_spur < 0.10 * before_spur, (resid_spur, before_spur)
+    # The real motion survives: correlation with the truth is essentially unchanged.
+    flat = out[0].reshape(-1, n_t)
+    r = torch.nn.functional.cosine_similarity(
+        flat - flat.mean(-1, keepdim=True), (real - real.mean()).expand_as(flat), dim=-1
+    )
+    assert float(r.min()) > 0.99, float(r.min())
+    # The null channel itself is passed through untouched, for diagnostics.
+    assert torch.equal(out[1], null)
+
+
+def test_null_axis_regress_min_r2_fails_closed():
+    """A null channel that explains nothing must leave the voxel alone."""
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(1)
+    shape, n_t = (4, 4, 3), 50
+    encoded = torch.randn(*shape, n_t, generator=g)
+    null = torch.randn(*shape, n_t, generator=g)  # independent noise
+    strict = null_axis_regress([encoded.clone(), null], 1, min_r2=0.5)
+    assert torch.equal(strict[0], encoded), (strict[0] - encoded).abs().max()
+    # With no floor it still subtracts the (spurious) fitted slope, which is why the
+    # floor exists.
+    loose = null_axis_regress([encoded.clone(), null], 1, min_r2=0.0)
+    assert not torch.equal(loose[0], encoded)

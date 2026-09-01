@@ -677,6 +677,35 @@ def create_parser() -> argparse.ArgumentParser:
         " rotation-aware mode.",
     )
     est.add_argument(
+        "-pe_null",
+        "-pe-null",
+        default=None,
+        metavar="DIR",
+        help="Solve the UN-ENCODED axis alongside the encode axes as a null channel and\n"
+        "regress it out of them. An EPI residual cannot be displaced along the readout\n"
+        "direction — its bandwidth is orders of magnitude above the phase encode — so\n"
+        "any displacement estimated there is spurious, measured on the same voxels,\n"
+        "the same edges and the same estimator as the encode axes. Per voxel, the part\n"
+        "of each encode axis that the null channel predicts over TIME is subtracted;\n"
+        "real residual motion is B0-driven, lies in the encode plane, and survives.\n"
+        "The null field is NEVER applied to the data — it is solved for to be read.\n"
+        "Runs inside the refine loop, so no pass builds its template from a field that\n"
+        "still carries the spurious part.\n"
+        "The direction cannot be assumed (a partition-only run leaves two candidates),\n"
+        "so name it: -pe_null RL for a readout along x. 3-D solve only.",
+    )
+    est.add_argument(
+        "-pe_null_min_r2",
+        "-pe-null-min-r2",
+        type=float,
+        default=0.0,
+        metavar="R2",
+        help="[-pe_null] Leave a voxel alone unless the null channel explains this\n"
+        "fraction of the encode axis's variance over time. 0 corrects everywhere.\n"
+        "Raise it when the null channel is noisy: a slope fitted to noise injects the\n"
+        "displacement the flag exists to remove.",
+    )
+    est.add_argument(
         "-match_eta_q",
         "-match-eta-q",
         type=float,
@@ -3563,6 +3592,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             file=sys.stderr,
         )
         return 2
+    null_axis = resolve_pe_axis(args.pe_null) if args.pe_null else None
     pe1_list = [resolve_pe_axis(d) for d in (args.pe_dir or [])]
     if len(pe1_list) > 2:
         print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe1_list)}.", file=sys.stderr)
@@ -3976,6 +4006,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             window_sigma=args.window,
             pe_only=pe_only,
             dual=dual,
+            null_axis=null_axis,
+            null_min_r2=args.pe_null_min_r2,
             max_shift=args.max_shift,
             trial_step=args.xcorr_step,
             patch=args.patch,
