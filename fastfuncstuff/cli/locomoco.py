@@ -1841,6 +1841,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     )
 
     report: list[str] = []
+    pending: list[tuple] = []
     for label, axis, field in result.pe_displacements():
         tc = task_coupling(field, design, **kwargs)
         coloc = co_location(tc.r, data_tc.r, mask)
@@ -1893,27 +1894,23 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         print(f"    {report[-1].rstrip().splitlines()[-1].strip()}")
         # One 4-D file per axis, conditions on the 4th axis — a viewer scrubs the
         # conditions, and one file per condition would flood the output directory.
-        for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms)):
-            path = f"{stem}_{kind}_{label}{ext}"
-            with spinner(f"Writing {Path(path).name}"):
-                save_nifti(
-                    arr.float().squeeze(-1).numpy()
-                    if kind == "taskr" and arr.shape[-1] == 1
-                    else arr.float().numpy(),
-                    path,
-                    affine=affine,
-                )
-        print(f"    {stem}_taskr_{label}{ext} · {stem}_taskrms_{label}{ext}")
+        # Queued, not written here: the findings above are what a reader scans, and
+        # interleaving file names between them is what made this block unreadable.
+        pending += [
+            (f"{stem}_{kind}_{label}{ext}", arr, kind == "taskr")
+            for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms))
+        ]
 
-    dpath = f"{stem}_taskr_data{ext}"
-    with spinner(f"Writing {Path(dpath).name}"):
-        dr = data_tc.r.float()
-        save_nifti((dr.squeeze(-1) if dr.shape[-1] == 1 else dr).numpy(), dpath, affine=affine)
-    print(f"  • data coupling r (the BOLD response, for co-location): {dpath}")
-
-    tpath = f"{stem}_locomoco_taskcoupling.txt"
-    Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
-    print(f"  • task-coupling report: {tpath}")
+    pending.append((f"{stem}_taskr_data{ext}", data_tc.r, True))
+    Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
+    for path, arr, squeeze in pending:
+        with spinner(f"Writing {Path(path).name}"):
+            a = arr.float()
+            save_nifti(
+                (a.squeeze(-1) if squeeze and a.shape[-1] == 1 else a).numpy(),
+                path,
+                affine=affine,
+            )
     args._task_labels = labels
     return design, polort, resp, mask
 
@@ -2069,7 +2066,8 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
         task_enrichment,
     )
 
-    print_cli_subsection("TASK COUPLING AFTER THE FIX — compare against the block above")
+    print_cli_subsection("TASK COUPLING AFTER THE FIX")
+    pending: list[tuple] = []
     for label, axis, field in result.pe_displacements():
         name = _pe_axis_name(label, axis, args)
         tc = task_coupling(field, design, polort=polort, mask=mask, labels=args._task_labels)
@@ -2086,13 +2084,11 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
             f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
             f"{best['abs_r_p95']:.3f} p95 in the active mask"
         )
-        path = f"{stem}_taskr_{label}_after{ext}"
+        pending.append((f"{stem}_taskr_{label}_after{ext}", tc.r))
+    for path, arr in pending:
         with spinner(f"Writing {Path(path).name}"):
-            arr = tc.r.float()
-            save_nifti(
-                (arr.squeeze(-1) if arr.shape[-1] == 1 else arr).numpy(), path, affine=affine
-            )
-        print(f"    {path}")
+            a = arr.float()
+            save_nifti((a.squeeze(-1) if a.shape[-1] == 1 else a).numpy(), path, affine=affine)
 
 
 def _warp_recon_stage(result, data, args, resp, mask, device):
@@ -2289,7 +2285,6 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             + "  ".join(f"{n:>12s}" for n in names)
         )
         np.savetxt(rpath, np.stack(cols, axis=1), fmt="%12.6f", header=header, comments="")
-        print(f"  • rejected component time courses (plot against the design): {rpath}")
 
     out, note = pc_reconstruct_result(
         result,
@@ -2351,7 +2346,6 @@ def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
         path = f"{stem}_pcmap_{lbl}{ext}"
         with spinner(f"Writing {Path(path).name}"):
             save_nifti(load.float().numpy(), path, affine=affine, brick_labels=names)
-        print(f"  • {lbl} PC loadings ({k} components, brick labels carry variance): {path}")
 
     if scored:
         # A companion table so a map can be matched to its number without reading
@@ -2363,7 +2357,6 @@ def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
             cells = "  ".join(f"{sc[i]:8.3f}" for _, sc in rows)
             lines.append(f"{i:9d}  {float(var[i]):8.5f}  {cells}")
         Path(tpath).write_text("\n".join(lines) + "\n")
-        print(f"  • PC task-enrichment table (1.0 = spread like the brain): {tpath}")
 
 
 def _task_stage(result, data, stem, ext, affine, args, tr, device):
@@ -2522,10 +2515,6 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data
         spath = f"{stem}_locomoco_sep{ext}"
         with spinner(f"Writing {Path(spath).name}"):
             save_nifti(result.sep_map.numpy(), spath, affine=affine)
-        print(
-            f"  • axis separability 4D (1 = axes cleanly separable, 0 = aperture-"
-            f"ambiguous): {spath}"
-        )
 
     # Restrict the coupling stats to BRAIN. This used to gate on displacement energy
     # ("voxels that actually moved"), which is backwards on real data: the feathered
@@ -2584,9 +2573,7 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data
         if mask is not None
         else "whole FoV"
     )
-    print(f"  • per-voxel coupling r 3D [{cov}]: {rpath}")
-    print(f"  • per-frame coupling r: {frame_path}")
-    print(f"  • coupling report: {cpath}")
+    print(f"    coverage: {cov}")
     print(
         f"    r = {c['r']:+.4f}, kappa = {c['kappa']:+.4f} vox/vox (R² {c['kappa_r2']:.3f})"
         f"  [{'coupled' if abs(c['r']) > 0.5 else 'largely independent'}]"
@@ -2609,7 +2596,6 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
             p = f"{stem}_locomoco_confidence{ext}"
             with spinner(f"Writing {Path(p).name}"):
                 save_nifti(conf.numpy(), p, affine=affine)
-            print(f"  • searchlight confidence map 4D: {p}")
         else:
             print(
                 "  • -save_confidence: no map — needs -backend xcorr (the flow/phase "
@@ -2629,7 +2615,6 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
                 f.write("# ffs_locomoco corr-curve trial offsets (voxels)\n")
                 f.write("  " + "  ".join(f"{o:g}" for o in offs) + "\n")
             off_str = ", ".join(f"{o:g}" for o in offs)
-            print(f"  • per-voxel corr landscape 4D: {p}")
             print(f"    offset axis (vox): [{off_str}]  → also {op}")
         else:
             print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
@@ -2659,7 +2644,7 @@ def _write_warp_pcs(components, stem, n_pcs) -> None:
         f.write(f"# Variance explained: {var_pct}\n")
         for row in scores.numpy():
             f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
-    print(f"  • warp PCs ({scores.shape[1]}, denoising regressors, var {var_pct}): {pcs_path}")
+    print(f"    warp PCs: {scores.shape[1]} components, var {var_pct}")
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
@@ -2698,7 +2683,6 @@ def _save_tsnr(series, out_stem, ext, affine) -> None:
     path = f"{out_stem}{ext}"
     with spinner(f"Writing {Path(path).name}"):
         save_nifti(tsnr, path, affine=affine)
-    print(f"  • tSNR: {path}")
 
 
 def _save_first_last(series, out_stem, ext, affine, *, include_diff, allow_neg) -> None:
@@ -2722,7 +2706,6 @@ def _save_first_last(series, out_stem, ext, affine, *, include_diff, allow_neg) 
     path = f"{out_stem}{ext}"
     with spinner(f"Writing {Path(path).name}"):
         save_nifti(stack, path, affine=affine)
-    print(f"  • {'first/last/diff' if include_diff else 'first/last'}: {path}")
 
 
 def _write_qc_diag(args, corrected, original, corr_stem, orig_stem, ext, affine) -> None:
@@ -3343,8 +3326,7 @@ def _run_multiecho(
 
             axis, disp = res.warp_components()[0]
             with spinner(f"Writing {Path(estem).name}_warp{ext}"):
-                warp_path = save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
-            print(f"  • echo {j + 1} warp (ffs_nwarp, axis {axis}): {warp_path}")
+                save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
         # Materialized once per echo for both the write and the QC maps below --
         # see the single-echo block for why the repeat call is not free.
         want_corrected = not args.no_corrected or (_want_qc(args) and _want_corrected_qc(args))
@@ -3358,23 +3340,16 @@ def _run_multiecho(
                     corr_path,
                     affine=affine,
                 )
-            print(f"  • echo {j + 1} corrected series: {corr_path}")
         if not args.no_flow:
             if res.pe_axis2 is not None:
-                names = {"pe1": "primary PE", "pe2": "partition"}
-                for label, axis, field in res.pe_displacements():
+                for label, _axis, field in res.pe_displacements():
                     fpath = f"{estem}_flow_{label}{ext}"
                     with spinner(f"Writing {Path(fpath).name}"):
                         save_nifti(field.numpy(), fpath, affine=affine)
-                    print(
-                        f"  • echo {j + 1} signed {names[label]} flow 4D "
-                        f"(voxels, axis {axis}): {fpath}"
-                    )
             else:
                 flow_path = f"{estem}_flow{ext}"
                 with spinner(f"Writing {Path(flow_path).name}"):
                     save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
-                print(f"  • echo {j + 1} signed PE flow 4D (voxels): {flow_path}")
         if _want_qc(args):
             corrected = (
                 corrected_series.numpy()
@@ -3413,7 +3388,6 @@ def _run_multiecho(
         f.write(f"# echo_TE_ms   {result.alpha_label}\n")
         for te_v, a_v in zip(result.echo_times.tolist(), result.alpha.tolist(), strict=True):
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
-    print(f"  • per-echo scaling + linearity: {alpha_path}")
 
     if args.want_pcs is not None:
         # PCs of the SHARED field w: every echo's warp is alpha_e·w, so they all share
@@ -4113,7 +4087,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         (primary_axis, primary_disp), *rest = comps
         as_5d = args.warp_format == "5d"
         with spinner(f"Writing {Path(stem).name}_warp{ext}"):
-            warp_path = save_medic_warp(
+            save_medic_warp(
                 primary_disp,
                 primary_axis,
                 affine,
@@ -4122,9 +4096,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 as_5d=as_5d,
                 extra_components=[(d, a) for a, d in rest],
             )
-        axes_note = f"axes {[a for a, _ in comps]}" if dual else f"axis {primary_axis}"
-        fmt_note = "5D DICOM-mm" if as_5d else "folder of 4D frames, DICOM-mm"
-        print(f"  • warp ({fmt_note}, ffs_nwarp, {axes_note}): {warp_path}")
 
     if args.want_pcs is not None:
         _write_warp_pcs(result.warp_components(), stem, args.want_pcs)
@@ -4152,7 +4123,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 corr_path,
                 affine=affine,
             )
-        print(f"  • corrected series: {corr_path}")
 
     # Temporal reductions of the corrected series ((nx, ny, nz, T) -> over T).
     # max/min are coverage images, not contrast images — see the -save_max help.
@@ -4171,7 +4141,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 out_path,
                 affine=affine,
             )
-        print(f"  • corrected {which}: {out_path}")
 
     if _want_qc(args):
         # Works even with -no_corrected; only the QC maps that read the corrected
@@ -4189,12 +4158,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             # Two physically distinct artifacts: write each as its OWN signed map. The
             # magnitude/angle pair below is for the legacy in-plane-vector case, where the
             # two components really are one vector; here they are not.
-            names = {"pe1": "primary PE", "pe2": "partition"}
-            for label, axis, field in result.pe_displacements():
+            for label, _axis, field in result.pe_displacements():
                 fpath = f"{stem}_flow_{label}{ext}"
                 with spinner(f"Writing {Path(fpath).name}"):
                     save_nifti(field.numpy(), fpath, affine=affine)
-                print(f"  • signed {names[label]} flow 4D (voxels, axis {axis}): {fpath}")
         elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
@@ -4202,8 +4169,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
             with spinner(f"Writing {Path(ang_path).name}"):
                 save_nifti(result.flow_angle().numpy(), ang_path, affine=affine)
-            print(f"  • flow magnitude 4D (voxels): {mag_path}")
-            print(f"  • flow angle 4D (degrees 0–360; direction of motion): {ang_path}")
         else:
             flow_path = f"{stem}_flow{ext}"
             with spinner(f"Writing {Path(flow_path).name}"):
@@ -4221,8 +4186,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         frames = result.flow_movie(max_mag=args.flow_max)
         movie_path = f"{stem}_flow.{fmt}"
         with spinner(f"Writing {Path(movie_path).name}"):
-            actual = _write_movie(frames, movie_path, args.fps, fmt)
-        print(f"  • flow movie (circular-phase wheel): {actual}")
+            _write_movie(frames, movie_path, args.fps, fmt)
 
     print_cli_footer("ffs_locomoco")
     return 0
