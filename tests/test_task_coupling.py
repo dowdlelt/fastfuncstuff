@@ -19,6 +19,7 @@ from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.stats.task_coupling import (
     _orthonormal_basis,
     co_location,
+    component_task_fit,
     contamination_slope,
     default_polort,
     design_fit_basis,
@@ -1185,3 +1186,104 @@ def test_design_fit_basis_is_far_cheaper_than_the_notch_on_a_real_block_design()
     assert fit_dof == 5  # one per condition
     assert info["spectrum_frac"] > 0.15  # this design is NOT cheaply notchable
     assert notch_dof > 8 * fit_dof, (notch_dof, fit_dof)
+
+
+def _ar1(n, k, seed, rho=0.6):
+    """Autocorrelated noise: the thing that makes a spurious task fit possible."""
+    rng = np.random.default_rng(seed)
+    e = rng.standard_normal((n, k))
+    y = np.zeros((n, k))
+    for t in range(1, n):
+        y[t] = rho * y[t - 1] + e[t]
+    return torch.tensor(y)
+
+
+def _pilot_design(n_t=225, tr=3.5, polort=6):
+    """The real OHBMPilot04 design: 5 conditions, 18s blocks, 20s SOA in triplets."""
+    onsets = {
+        0: [12.0, 164.0, 360.0, 436.1, 572.1, 628.1],
+        1: [88.0, 224.0, 284.0, 340.0, 648.1],
+        2: [32.0, 108.0, 320.0, 456.1, 516.1, 592.1],
+        3: [52.0, 128.0, 244.0, 396.1, 496.1, 552.1],
+        4: [184.0, 204.0, 264.0, 416.1, 476.1, 668.1],
+    }
+    up = 20
+    n_up = int(n_t * tr * up)
+    t = np.arange(0, 32, 1 / up)
+    hrf = np.exp(-t / 4.0) * t**2
+    hrf /= hrf.sum()
+    cols = []
+    for k in sorted(onsets):
+        box = np.zeros(n_up)
+        for o in onsets[k]:
+            box[int(o * up) : int((o + 18.0) * up)] = 1.0
+        cols.append(np.convolve(box, hrf)[:n_up][:: int(up * tr)][:n_t])
+    return torch.tensor(np.stack(cols, axis=1))
+
+
+def test_component_task_fit_controls_the_familywise_error_rate():
+    """A criterion that fires by default must not flag noise. With 60 components a
+    nominal 0.05 per component would flag ~3 every run; the max-z null is what holds
+    the FAMILYWISE rate at 0.05 instead.
+
+    Measured over 40 trials at 400 surrogates: 3/40 runs flagged anything (0.075,
+    inside binomial noise of 0.05). This test uses fewer trials to stay fast and
+    asserts the loose bound that would still have caught an uncorrected criterion,
+    which would fire on essentially every run.
+    """
+    design = _pilot_design()
+    n_t, k = design.shape[0], 60
+    fired = sum(
+        len(
+            component_task_fit(_ar1(n_t, k, 100 + s), design, polort=6, n_surrogates=300, seed=s)[
+                "flagged"
+            ]
+        )
+        > 0
+        for s in range(12)
+    )
+    # Uncorrected, this would be ~12/12. Corrected it is ~1/12.
+    assert fired <= 4, f"{fired}/12 noise runs flagged something — the correction is not holding"
+
+
+def test_component_task_fit_finds_a_genuinely_task_locked_component():
+    """The case the SPATIAL scorer misses: a task-locked component whose energy share
+    is unremarkable. Power must rise with how strongly the task drives it."""
+    design = _pilot_design()
+    n_t, k, planted = design.shape[0], 60, 7
+
+    hits = {}
+    for snr in (0.3, 1.0):
+        found = 0
+        for s in range(8):
+            rng = np.random.default_rng(500 + s)
+            m = _ar1(n_t, k, 500 + s)
+            mix = torch.tensor(design.numpy() @ rng.standard_normal(design.shape[1]))
+            m[:, planted] = m[:, planted] + snr * mix / mix.std()
+            res = component_task_fit(m, design, polort=6, n_surrogates=300, seed=s)
+            found += planted in res["flagged"]
+        hits[snr] = found
+
+    assert hits[1.0] >= 6, hits  # a strong component is caught nearly always
+    assert hits[1.0] > hits[0.3], hits  # and power is monotone in the driving strength
+
+
+def test_component_task_fit_uses_the_omnibus_not_the_strongest_condition():
+    """The statistic is the joint R^2 on the whole design. A component driven by a
+    condition that is NOT the first must score just as well as one driven by the first
+    — conditions activate different tissue and the strongest is not known in advance.
+    """
+    design = _pilot_design()
+    n_t, k = design.shape[0], 20
+    scores = []
+    for cond in range(design.shape[1]):
+        m = _ar1(n_t, k, 7)
+        m[:, 3] = m[:, 3] + 1.2 * design[:, cond] / design[:, cond].std()
+        res = component_task_fit(m, design, polort=6, n_surrogates=300, seed=0)
+        assert 3 in res["flagged"], (cond, res["flagged"])
+        scores.append(float(res["z"][3]))
+    # No condition is privileged: every one is detected. The evidence is not equal --
+    # condition 1 has five blocks where the others have six, and fewer blocks is
+    # genuinely less power -- but no condition is structurally invisible, which is what
+    # a per-condition statistic keyed on the "strongest" label would risk.
+    assert min(scores) > 0.35 * max(scores), scores

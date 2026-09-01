@@ -692,6 +692,129 @@ def filter_task_band(
     return out.reshape(*spatial, n_t)
 
 
+def component_task_fit(
+    mixing: torch.Tensor,
+    design: torch.Tensor | np.ndarray,
+    *,
+    polort: int = 2,
+    n_surrogates: int = 2000,
+    alpha: float = 0.05,
+    seed: int = 0,
+) -> dict:
+    """How well the task explains each component's TIME COURSE, against its own null.
+
+    The temporal counterpart to :func:`map_enrichment`, and the criterion that has
+    power exactly where the spatial one does not: a component that is genuinely
+    task-locked but activates a handful of voxels scores ~1.0x on an energy share,
+    because its energy is dominated by wherever else it lives.
+
+    Why this is allowed here when the module docstring says a temporal correlation
+    cannot be thresholded. That verdict was measured on a 20 s periodic BLOCK design
+    and is true of it -- a component merely sharing that design's spectrum correlates
+    ~0.92 with it by chance, roughly 2 effective degrees of freedom. It is not a
+    general property. Measured with 2000 phase-randomised surrogates:
+
+        design                    null median   p95     eff. DoF
+        block, 20 s periodic          0.640     0.924      ~2
+        jittered event-related        0.102     0.284     ~46
+        5-cond 18 s blocks, 20 s SOA  0.12      0.34      ~31-38   (per condition)
+
+    The third row is a real acquisition (OHBMPilot04) and is the reason this exists:
+    its pooled on/off is periodic, but the scorer works per condition and each
+    condition's onsets are irregular, so the statistic has ~35 DoF rather than 2. The
+    only honest way to know which regime a run is in is to measure it, which is what
+    the surrogates here do -- there is no need to classify the design by eye.
+
+    The statistic is the OMNIBUS R^2 on the whole design, not a per-condition
+    correlation. Conditions activate different tissue and the strongest one is not
+    knowable in advance, so a per-condition maximum would need a multiplicity
+    correction over K on top of the one over components; the joint fit needs neither
+    and is the quantity "does the task explain this time course" actually asks about.
+
+    Null and correction. Each component is phase-randomised against ITS OWN amplitude
+    spectrum -- the right null direction, since a component's autocorrelation is what
+    makes a spurious fit possible, and randomising the design instead would test a
+    different hypothesis. Per-component R^2 is standardised to a z against that
+    component's surrogates, then the threshold is the ``1 - alpha`` quantile of the
+    MAX z across components per surrogate draw: familywise control, which matters
+    because a 60-component decomposition tested at a nominal 0.05 flags three by
+    chance. The max-statistic null treats components as independent, which ICA makes
+    approximately true and PCA exactly true in the temporal basis.
+
+    Returns a dict with per-component ``r2`` / ``z`` / ``p`` arrays, the ``z_cut``
+    actually applied, and ``flagged`` (indices, most-fit first).
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    m = torch.as_tensor(mixing, dtype=torch.float64)
+    if m.ndim != 2:
+        raise ValueError(f"mixing must be (T, k), got {tuple(m.shape)}")
+    n_t, k = m.shape
+    x = torch.as_tensor(np.asarray(design), dtype=torch.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    if x.shape[0] != n_t:
+        raise ValueError(f"design has {x.shape[0]} rows but the components have {n_t}")
+
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, dtype=torch.float64, device=m.device)
+    )
+    q_x = _orthonormal_basis(x - q_n @ (q_n.T @ x), scale=float(torch.linalg.matrix_norm(x, 2)))
+    if q_x.shape[1] == 0:
+        raise ValueError(
+            f"the design is entirely collinear with the polort-{polort} drift basis; "
+            "no temporal criterion is available. Lower -task_polort."
+        )
+
+    def _r2(y: torch.Tensor) -> torch.Tensor:
+        """Omnibus R^2 of each column of ``y`` (T, n) on the task subspace."""
+        yd = y - q_n @ (q_n.T @ y)
+        ss_tot = (yd * yd).sum(dim=0)
+        ss_fit = ((q_x.T @ yd) ** 2).sum(dim=0)
+        return ss_fit / ss_tot.clamp(min=1e-30)
+
+    r2 = _r2(m)
+
+    # Phase randomisation, all components at once: same amplitude spectrum, random
+    # phases. Bin 0 (and Nyquist on an even series) must keep phase 0 or the surrogate
+    # is complex -- irfft would silently discard the imaginary part otherwise.
+    g = torch.Generator().manual_seed(int(seed))
+    f = torch.fft.rfft(m - m.mean(dim=0, keepdim=True), dim=0)  # (F, k)
+    amp = f.abs()
+    n_f = amp.shape[0]
+    null = torch.empty(n_surrogates, k, dtype=torch.float64)
+    # Chunked over surrogates: (S, F, k) complex is the only large intermediate here.
+    step = max(1, min(n_surrogates, int(4e6 // max(1, n_f * k))))
+    for start in range(0, n_surrogates, step):
+        n_s = min(step, n_surrogates - start)
+        ph = torch.rand(n_s, n_f, k, generator=g, dtype=torch.float64) * (2 * np.pi)
+        ph[:, 0, :] = 0.0
+        if n_t % 2 == 0:
+            ph[:, -1, :] = 0.0
+        surr = torch.fft.irfft(amp[None] * torch.exp(1j * ph), n=n_t, dim=1)  # (S, T, k)
+        for i in range(n_s):
+            null[start + i] = _r2(surr[i])
+        del ph, surr
+
+    mu, sd = null.mean(dim=0), null.std(dim=0).clamp(min=1e-12)
+    z = (r2 - mu) / sd
+    # Empirical p with the +1 correction: a surrogate set can never license p = 0.
+    p = (null >= r2[None, :]).sum(dim=0).double().add(1.0) / (n_surrogates + 1)
+    max_z = ((null - mu[None, :]) / sd[None, :]).amax(dim=1)
+    z_cut = float(torch.quantile(max_z, 1.0 - float(alpha)))
+    flagged = [i for i in torch.argsort(z, descending=True).tolist() if float(z[i]) > z_cut]
+    return {
+        "r2": r2,
+        "z": z,
+        "p": p,
+        "z_cut": z_cut,
+        "alpha": float(alpha),
+        "n_surrogates": int(n_surrogates),
+        "null_r2_median": mu,
+        "flagged": flagged,
+    }
+
+
 def map_enrichment(
     values: torch.Tensor,
     active: torch.Tensor,
