@@ -819,3 +819,69 @@ def test_warp_pc_basis_keeps_the_loading_per_axis_and_round_trips():
     full = warp_pc_reconstruct(comps, keep={})
     assert torch.allclose(full[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)
     assert torch.allclose(full[1][1], torch.tensor(f2, dtype=torch.float32), atol=1e-4)
+
+
+@pytest.mark.slow
+def test_write_pc_maps_is_one_4d_file_per_axis_with_labels(tmp_path):
+    """The maps exist to be LOOKED at, so the identifying metadata has to survive.
+
+    One file per encode axis, component on the 4th axis, and sub-brick k of the two
+    files is the same temporal component seen on the two axes -- which is only useful
+    if the brick labels say which component and how strong it is.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+    from fastfuncstuff.io.headers import read_brick_labels
+
+    n_t, tr, rng = 60, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 150, 20):
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (14, 16, 8, n_t)).astype(np.float32)
+    series[4:9, 5:11, 2:6] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 150, 20))
+    )
+    stem = str(tmp_path / "out")
+    assert (
+        main(
+            [
+                "-i",
+                str(src),
+                "-o",
+                f"{stem}.nii.gz",
+                "-pe_dir1",
+                "AP",
+                "-pe_dir2",
+                "IS",
+                "-backend",
+                "flow",
+                "-refine",
+                "1",
+                "-events",
+                str(ev),
+                "-tr",
+                str(tr),
+                "-device",
+                "cpu",
+                "-write_pc_maps",
+                "4",
+            ]
+        )
+        == 0
+    )
+    for axis in ("pe1", "pe2"):
+        img = nib.load(f"{stem}_pcmap_{axis}.nii.gz")
+        assert img.shape[:3] == series.shape[:3]
+        assert img.shape[3] == 4
+        labels = read_brick_labels(img)
+        assert len(labels) == 4
+        assert labels[0].startswith("PC00 ") and "x" in labels[0]  # variance and enrichment
+    table = (tmp_path / "out_pcmap_scores.1D").read_text().splitlines()
+    assert table[0].startswith("# component") and "pe1" in table[0] and "pe2" in table[0]
+    assert len(table) == 5  # header + 4 components

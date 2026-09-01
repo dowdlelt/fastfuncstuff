@@ -1182,6 +1182,24 @@ def create_parser() -> argparse.ArgumentParser:
         "against it. Default 4.",
     )
     task.add_argument(
+        "-write_pc_maps",
+        "-write-pc-maps",
+        nargs="?",
+        type=int,
+        const=-1,
+        default=None,
+        metavar="N",
+        help="Write the warp PCs' SPATIAL loadings for eyeballing: one 4-D file per\n"
+        "encode axis ({prefix}_pcmap_pe1 / _pcmap_pe2), component on the 4th axis.\n"
+        "Bare = every component; N = the top N by variance.\n"
+        "One file PER AXIS because the temporal basis is shared but each component has\n"
+        "its own loading on each axis — sub-brick k of the two files is the same\n"
+        "component seen two ways. Loadings are raw and signed; the brick label carries\n"
+        "the variance share, and the task enrichment too when -events is given.\n"
+        "Works without -events (unscored). The temporal side is -want_pcs, which writes\n"
+        "the matching time courses as .1D.",
+    )
+    task.add_argument(
         "-warp_recon",
         "-warp-recon",
         default=None,
@@ -2049,6 +2067,67 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     return out
 
 
+def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
+    """Write the warp PCs' SPATIAL loadings, one 4-D file per encode axis.
+
+    One file per axis, not one shared file: the temporal basis is common but every
+    component carries its own loading on each encode axis, and those are the maps that
+    differ. Sub-brick k of ``_pcmap_pe1`` and of ``_pcmap_pe2`` are the same temporal
+    component seen on the two axes, so they can be scrubbed side by side.
+
+    Loadings are written RAW and signed, not normalised per component: the amplitude is
+    the information -- it says which components carry the motion -- and a viewer scales
+    each sub-brick on its own anyway. The variance share rides in the brick label.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.processing.locomoco import warp_pc_basis
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    want = args.write_pc_maps
+    got = warp_pc_basis(
+        [(ax, f) for _, ax, f in result.pe_displacements()],
+        n_pcs=None if want in (None, -1) else want,
+        device=device,
+    )
+    if got is None:
+        print("  ⚠️  -write_pc_maps: the warp is empty — no components to write.")
+        return
+    _u, loadings, _means, var = got
+    k = loadings[0][1].shape[-1]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+
+    scored = resp is not None and mask is not None
+    rows = []
+    for axis, load in loadings:
+        lbl = label_of.get(axis, f"axis{axis}")
+        scores = (
+            [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
+            if scored
+            else [float("nan")] * k
+        )
+        rows.append((lbl, scores))
+        names = [
+            f"PC{i:02d} {var[i]:.1%}" + (f" {scores[i]:.2f}x" if scored else "") for i in range(k)
+        ]
+        path = f"{stem}_pcmap_{lbl}{ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            save_nifti(load.float().numpy(), path, affine=affine, brick_labels=names)
+        print(f"  • {lbl} PC loadings ({k} components, brick labels carry variance): {path}")
+
+    if scored:
+        # A companion table so a map can be matched to its number without reading
+        # brick labels one at a time.
+        tpath = f"{stem}_pcmap_scores.1D"
+        header = "# component  variance  " + "  ".join(lbl for lbl, _ in rows)
+        lines = [header]
+        for i in range(k):
+            cells = "  ".join(f"{sc[i]:8.3f}" for _, sc in rows)
+            lines.append(f"{i:9d}  {float(var[i]):8.5f}  {cells}")
+        Path(tpath).write_text("\n".join(lines) + "\n")
+        print(f"  • PC task-enrichment table (1.0 = spread like the brain): {tpath}")
+
+
 def _task_stage(result, data, stem, ext, affine, args, tr, device):
     """Diagnose the ORIGINAL field, then optionally hand back a de-tasked one.
 
@@ -2077,6 +2156,9 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         if args.warp_recon:
             print("  ⚠️  -warp_recon NOT applied — the outputs below are the ORIGINAL field.")
         return result
+
+    if args.write_pc_maps is not None:
+        _write_pc_maps(result, stem, ext, affine, args, resp, mask, device)
 
     # PC reconstruction runs BEFORE -detask: it rebuilds the field, so a field
     # projection afterwards acts on what was actually kept.
@@ -3777,6 +3859,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # -detask has to replace the field before the warp/corrected series are written.
     if args.events and tr_sec:
         result = _task_stage(result, data, stem, ext, affine, args, tr_sec, device)
+    elif args.write_pc_maps is not None:
+        # Without -events there is no active mask, so the maps go out unscored. Looking
+        # at them is the point; the score is the optional part.
+        _write_pc_maps(result, stem, ext, affine, args, None, None, device)
 
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
