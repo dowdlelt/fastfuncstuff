@@ -967,3 +967,93 @@ def test_match_rescues_the_multiecho_flow_from_a_brightness_ramp():
     assert float(q_dirty.w_field[core].abs().mean()) < 0.05 + float(
         q_clean.w_field[core].abs().mean()
     )
+
+
+def test_cli_detask_ica_rejects_on_every_echo_not_just_the_first(tmp_path):
+    """-detask ica must change ALL echoes' fields, from ONE shared decomposition.
+
+    Regression for the whole class of multi-echo bug this path was full of: the task
+    stage used to run after the outputs were written and refuse outright, and the
+    natural wrong fix is to clean echo 1 (the shared field) and leave the rest.
+
+    Cleaning per echo is exact, not an approximation: echo e's field is alpha_e * w and
+    every de-task here is a LINEAR operator along time, so P(alpha_e * w) = alpha_e *
+    P(w). What would be wrong is DECOMPOSING each echo separately, which is why the
+    decomposition happens once and only the time courses are reused.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    tes = [7.61, 21.71, 35.81]
+    n_frames = 40
+    rng = np.random.default_rng(0)
+    datas, _ = _make_multiecho(tes, list(rng.normal(0, 0.35, n_frames)))
+    paths = []
+    for e, series in enumerate(datas):
+        p = tmp_path / f"e{e + 1}.nii.gz"
+        nib.save(nib.Nifti1Image(series, np.eye(4)), str(p))
+        paths.append(str(p))
+
+    # Irregular onsets, so the temporal criterion is in its informative regime.
+    ev = tmp_path / "ev.tsv"
+    with open(ev, "w") as f:
+        f.write("onset\tduration\ttrial_type\n")
+        t = 6.0
+        while t < n_frames * 2.0 - 8:
+            f.write(f"{t:.1f}\t4.0\tA\n")
+            t += rng.uniform(6, 14)
+
+    def _run(stem, extra):
+        rc = main(
+            [
+                "-input",
+                *paths,
+                "-prefix",
+                str(tmp_path / stem),
+                "-pe_dir2",
+                "IS",
+                "-backend",
+                "flow",
+                "-me_3depi",
+                "-echo_times",
+                *[str(t) for t in tes],
+                "-is_3dacq",
+                "-me_fixed_scaling",
+                "-device",
+                "cpu",
+                "-no_movie",
+                "-levels",
+                "2",
+                "-iters",
+                "2",
+                "-refine",
+                "0",
+                "-events",
+                str(ev),
+                "-tr",
+                "2.0",
+                *extra,
+            ]
+        )
+        assert rc == 0, stem
+        return [
+            np.asarray(nib.load(str(tmp_path / f"{stem}_e{j + 1}_flow.nii.gz")).dataobj)
+            for j in range(len(tes))
+        ]
+
+    base = _run("base", [])
+    cut = _run("cut", ["-detask", "ica:4", "-reject_surrogates", "200"])
+
+    # Every echo's field must have moved. Echo 1 alone changing is the bug.
+    for j in range(len(tes)):
+        assert not np.allclose(base[j], cut[j], atol=1e-6), f"echo {j + 1} field unchanged"
+
+    # And the removal is the SAME operator on every echo: after dividing out the TE
+    # scaling, what was taken from each echo agrees. This is what distinguishes one
+    # shared decomposition from three independent ones.
+    removed = [(base[j] - cut[j]) / (tes[j] / tes[0]) for j in range(len(tes))]
+    for j in (1, 2):
+        num = float(np.abs(removed[j] - removed[0]).max())
+        den = float(np.abs(removed[0]).max())
+        assert num < 0.05 * max(den, 1e-9), (j, num, den)

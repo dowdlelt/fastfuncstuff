@@ -781,18 +781,38 @@ def test_parse_warp_recon_specs():
     assert parse_warp_recon("pcs:5") == (5, None, "pcs")
     # Below 1 is a variance FRACTION -- unambiguous, since a count below 1 is meaningless.
     assert parse_warp_recon("pcs:0.8") == (None, 0.8, "pcs")
-    # ICA has no natural "all": it needs a rank, and no variance rule locates the good
-    # one (95% of the variance resolved to 105 components, deep in the over-splitting
-    # regime on a real run), so bare 'ica' searches for it.
-    assert parse_warp_recon("ica") == ("sweep", None, "ica")
-    assert parse_warp_recon("ica:sweep") == ("sweep", None, "ica")
-    with pytest.raises(ValueError, match="only defined for ica"):
+    # ICA moved to -detask ica. -warp_recon RECONSTRUCTS from principal components;
+    # ICA never reconstructed at all -- it projects task-loaded time courses out of the
+    # full-rank field, which is a de-tasking operation. The old spelling points there
+    # rather than failing with a bare "unknown method".
+    with pytest.raises(ValueError, match="moved to '-detask ica'"):
+        parse_warp_recon("ica")
+    with pytest.raises(ValueError, match="moved to '-detask ica'"):
+        parse_warp_recon("ica:60")
+    with pytest.raises(ValueError, match="only defined for -detask ica"):
         parse_warp_recon("pcs:sweep")
-    assert parse_warp_recon("ica:60") == (60, None, "ica")
-    assert parse_warp_recon("ica:0.9") == (None, 0.9, "ica")
-    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5", "ica:x"):
+    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5"):
         with pytest.raises(ValueError):
             parse_warp_recon(bad)
+
+
+def test_parse_detask_ica_specs():
+    """The rank has an interior optimum, so bare 'ica' SEARCHES rather than guessing.
+
+    Measured on a real contaminated run: 20 components missed the task source (1.75x
+    enrichment), 60 found it (2.79x), the full 119 over-split it back down (2.27x). A
+    variance fraction was the original default and resolved to 105 of 119 -- deep in
+    the over-splitting regime -- which is why no fraction is the default now.
+    """
+    from fastfuncstuff.cli.locomoco import parse_detask_ica
+
+    assert parse_detask_ica("ica") == ("sweep", None)
+    assert parse_detask_ica("ica:sweep") == ("sweep", None)
+    assert parse_detask_ica("ica:60") == (60, None)
+    assert parse_detask_ica("ica:0.9") == (None, 0.9)
+    for bad in ("ica:x", "ica:0", "ica:2.5", "ica:-3"):
+        with pytest.raises(ValueError):
+            parse_detask_ica(bad)
 
 
 def test_warp_pc_basis_keeps_the_loading_per_axis_and_round_trips():

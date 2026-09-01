@@ -1256,20 +1256,20 @@ def create_parser() -> argparse.ArgumentParser:
         "-warp-recon",
         default=None,
         metavar="SPEC",
-        help="BETA. Rebuild the field from a decomposition before any output is derived.\n"
-        "SPEC: 'pcs' (all components — identity on its own, useful with -reject),\n"
+        help="BETA. REBUILD the field from its principal components before any output is\n"
+        "derived. SPEC: 'pcs' (all components — lossless, identity on its own),\n"
         "'pcs:N' (top N by variance), 'pcs:0.F' (components reaching that FRACTION of\n"
-        "the variance), or 'ica' (FastICA, rank SWEPT; ica:N / ica:0.F to fix it).\n"
-        "Independent of -want_pcs, which only chooses how many PC time courses are\n"
-        "WRITTEN — the reconstruction uses whatever SPEC says.\n"
-        "WHAT WORKS: with -reject, ICA found a genuinely task-locked component (|r|\n"
-        "0.66 with the design) and took the partition axis from 8.5x task enrichment to\n"
-        "2.1x — the primary axis barely moved. PCA found nothing at all and cannot:\n"
-        "it orders by VARIANCE, and the contamination was 0.7%% of the field's. Rejection\n"
-        "bites when the response is WIDESPREAD (a breath-hold); a sparse one is below\n"
-        "what a variance decomposition can isolate, and the run says so.\n"
-        "'pcs' truncation is lossless at full rank; ICA rejection is a PROJECTION on\n"
-        "the full-rank field, so nothing is lost to the ICA rank itself.",
+        "the variance). Independent of -want_pcs, which only chooses how many PC time\n"
+        "courses are WRITTEN.\n"
+        "This is DENOISING by truncation. To REJECT task-loaded components, use\n"
+        "-detask ica: it projects them out of the full-rank field, which is a\n"
+        "de-tasking operation and lives with the other -detask modes.\n"
+        "PCA cannot find contamination on its own, and this is a property of the\n"
+        "method rather than a tuning problem: it orders by VARIANCE, and on a real\n"
+        "contaminated run the task part was 0.7%% of the field's — no principal\n"
+        "component exceeded 1.25x enrichment while the field itself was 8.8x at the\n"
+        "tail. Multi-echo rebuilds echo 1 only (truncation has no shared time courses\n"
+        "to reuse across echoes) and says so.",
     )
     task.add_argument(
         "-reject",
@@ -1286,6 +1286,16 @@ def create_parser() -> argparse.ArgumentParser:
         "thresholded, while an energy share against the active mask has a no-relation\n"
         "value of 1.0 by construction. Per COMPONENT PER AXIS — the temporal basis is\n"
         "shared but each component loads separately on each encode axis.",
+    )
+    task.add_argument(
+        "-reject_surrogates",
+        "-reject-surrogates",
+        type=int,
+        default=2000,
+        metavar="N",
+        help="[-detask ica] Phase-randomised surrogates for the TEMPORAL criterion's\n"
+        "null. More is a tighter familywise threshold and a better effective-DoF\n"
+        "estimate; the cost is negligible next to the decomposition. [default: %(default)s]",
     )
     task.add_argument(
         "-detask",
@@ -1330,6 +1340,30 @@ def create_parser() -> argparse.ArgumentParser:
         "              distorts the very fit being projected out, leaving a share of the\n"
         "              artifact proportional to how bad the problem was. A mitigation,\n"
         "              not a proof: read the enrichment diagnostic afterwards.\n\n"
+        "  ica[:N]     DECOMPOSE the field into independent components and PROJECT the\n"
+        "              task-loaded ones out of the FULL-RANK field. Rejection is\n"
+        "              implied — that is the whole operation. Bare 'ica' SWEEPS for the\n"
+        "              rank (it has an interior optimum: 20 components missed the task\n"
+        "              source, 60 found it, the full 119 over-split it again); ica:N\n"
+        "              or ica:0.F fixes it.\n"
+        "              TWO criteria, and a component failing EITHER is dropped:\n"
+        "                SPATIAL   — its weights are >E-fold concentrated on activated\n"
+        "                            tissue (-reject E, default 2.0). No null needed:\n"
+        "                            1.0 is 'spread like the brain' by construction.\n"
+        "                            Blind to a task-locked component driving FEW\n"
+        "                            voxels, whose energy lives elsewhere.\n"
+        "                TEMPORAL  — the design explains its TIME COURSE better than\n"
+        "                            its own phase-randomised surrogates do (omnibus\n"
+        "                            R² on the whole design, familywise-corrected\n"
+        "                            across components; -reject_surrogates sets N).\n"
+        "                            This is what catches the sparse case.\n"
+        "              The temporal test MEASURES its own effective DoF and DECLINES\n"
+        "              when it has no power, saying so — a component whose own spectrum\n"
+        "              coincides with the design's can fit it by accident. Measured:\n"
+        "              broadband components vs a periodic block design give ~195 DoF\n"
+        "              (usable), narrowband ones at that frequency give ~5 (declines).\n"
+        "              Multi-echo: ONE decomposition on the shared field, projected per\n"
+        "              echo — exact, since the projection is linear in the field.\n\n"
         "  field       REMOVE the task-locked part of the field, keeping drift and everything "
         "else, and derive EVERY output from the cleaned field — warp, corrected series, "
         "flow maps, PCs, movie. The diagnostic above still measures the ORIGINAL field "
@@ -1800,6 +1834,11 @@ def parse_detask(value):
     text = str(value).strip().lower()
     if text == "field":
         return True, None, None
+    if text == "ica" or text.startswith("ica:"):
+        # Validated here so a bad rank fails at parse time alongside the other modes;
+        # the spec itself is re-read by parse_detask_ica where it is used.
+        parse_detask_ica(text)
+        return False, None, None
     if text == "filter":
         return False, 0, None
     if text.startswith("filter:"):
@@ -1826,7 +1865,40 @@ def parse_detask(value):
         if deriv < 0:
             raise ValueError(f"-detask fit:D needs D >= 0, got {deriv}")
         return False, None, deriv
-    raise ValueError(f"-detask MODE must be 'field', 'filter[:N]' or 'fit[:D]', got {value!r}")
+    raise ValueError(
+        f"-detask MODE must be 'field', 'filter[:N]', 'fit[:D]' or 'ica[:N]', got {value!r}"
+    )
+
+
+def parse_detask_ica(value):
+    """``-detask ica`` SPEC -> ``(n_components, variance_fraction)`` or ``("sweep", None)``.
+
+    Lives beside :func:`parse_detask` rather than inside it because the ICA mode is the
+    only one whose parameter is a RANK, and the rank has an interior optimum: measured,
+    20 components missed the task source (1.75x enrichment), 60 found it (2.79x), and
+    the full 119 over-split it back down (2.27x). Bare ``ica`` therefore SEARCHES for
+    the rank instead of guessing one -- a variance fraction was the original default
+    and is a bad one, resolving to 105 of 119 components on a real run, deep in the
+    over-splitting regime.
+    """
+    text = str(value).strip().lower()
+    _, _, tail = text.partition(":")
+    if tail in ("", "sweep", "all"):
+        return "sweep", None
+    try:
+        num = float(tail)
+    except ValueError:
+        raise ValueError(
+            f"-detask ica:N needs an integer rank, a variance fraction below 1, or "
+            f"'sweep', got {tail!r}"
+        ) from None
+    if num <= 0:
+        raise ValueError(f"-detask ica:N needs a positive value, got {tail!r}")
+    if num < 1:
+        return None, num
+    if float(num).is_integer():
+        return int(num), None
+    raise ValueError(f"-detask ica:N needs an integer rank or a fraction, got {tail!r}")
 
 
 def _detask_pre_estimation(args) -> bool:
@@ -2045,20 +2117,21 @@ def parse_warp_recon(value):
         return None, None, None
     text = str(value).strip().lower()
     method, _, tail = text.partition(":")
-    if method not in ("pcs", "ica"):
-        raise ValueError(f"-warp_recon SPEC must start with 'pcs' or 'ica', got {value!r}")
+    if method == "ica":
+        raise ValueError(
+            "-warp_recon ica moved to '-detask ica' (rejection implied). -warp_recon "
+            "reconstructs from principal components; ICA never reconstructed at all — "
+            "it PROJECTS the task-loaded time courses out of the full-rank field, "
+            "which is a de-tasking operation and belongs with the other three."
+        )
+    if method != "pcs":
+        raise ValueError(f"-warp_recon SPEC must start with 'pcs', got {value!r}")
     # ICA has no natural "all": it needs a rank to reduce to, and the full rank
     # over-splits (measured: 60 components found the task source, 119 lost it again).
     if tail == "sweep":
-        if method != "ica":
-            raise ValueError("-warp_recon sweep is only defined for ica")
-        return "sweep", None, method
+        raise ValueError("-warp_recon sweep is only defined for -detask ica")
     if tail in ("", "all"):
-        # 0.95 of the variance was the first default and is a BAD one: on a real run it
-        # resolved to 105 of 119 components, which is the over-splitting regime (the
-        # same sweep found 60 components isolating the task source and 119 losing it
-        # again). Bare 'ica' therefore searches for the rank instead of guessing it.
-        return ("sweep" if method == "ica" else None), None, method
+        return None, None, method
     try:
         num = float(tail)
     except ValueError:
@@ -2178,7 +2251,7 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
             save_nifti((a.squeeze(-1) if a.shape[-1] == 1 else a).numpy(), path, affine=affine)
 
 
-def _warp_recon_stage(result, data, args, resp, mask, device):
+def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polort=2):
     """Rebuild the field from a warp decomposition, dropping task-loaded components.
 
     ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly the
@@ -2197,12 +2270,16 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     )
     from fastfuncstuff.stats.task_coupling import map_enrichment
 
-    n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
+    if args.detask_ica:
+        n_pcs, var_frac = parse_detask_ica(args.detask)
+        method = "ica"
+    else:
+        n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
     comps = [(ax, f) for _, ax, f in result.pe_displacements()]
 
     if method == "ica" and n_pcs == "sweep":
         if resp is None:
-            print("  ⚠️  -warp_recon ica sweep needs -events to score ranks; using 60.")
+            print("  ⚠️  -detask ica sweep needs -events to score ranks; using 60.")
             n_pcs, got = 60, warp_ica_basis(comps, 60, 60, device=device)
         else:
             n_t = comps[0][1].shape[-1]
@@ -2220,7 +2297,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     else:
         got = warp_pc_basis(comps, n_pcs=None if var_frac is not None else n_pcs, device=device)
     if got is None:
-        print("  ⚠️  -warp_recon: the warp is empty — nothing to reconstruct.")
+        print("  ⚠️  the warp is empty — nothing to decompose.")
         return result
     basis, loadings, means, var = got
 
@@ -2238,14 +2315,48 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     k = basis.shape[1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
 
+    # ── the TEMPORAL criterion, scored once on the SHARED basis ──────────────────
+    # The time courses are shared across encode axes, so this is one test per
+    # component, not one per component per axis. It complements the spatial score
+    # rather than replacing it: an energy share cannot see a task-locked component
+    # that drives few voxels (its energy lives elsewhere), and a temporal fit cannot
+    # see a widespread component that is not time-locked. Either firing is enough.
+    temporal = None
+    reject_on = args.reject is not None or args.detask_ica
+    if reject_on and design is not None:
+        from fastfuncstuff.stats.task_coupling import component_task_fit
+
+        try:
+            temporal = component_task_fit(
+                basis, design, polort=polort, n_surrogates=args.reject_surrogates
+            )
+        except ValueError as exc:
+            print(f"  ⚠️  temporal criterion unavailable: {exc}")
+    if temporal is not None:
+        if temporal["informative"]:
+            print(
+                f"  temporal criterion: {temporal['eff_dof']:.0f} effective DoF, a "
+                f"component needs R²>{temporal['r2_needed']:.3f} to be flagged "
+                f"(familywise α={temporal['alpha']:g} over {k} components, "
+                f"{temporal['n_surrogates']} surrogates)"
+            )
+        else:
+            # Saying WHY beats printing "none flagged", which a reader would take as
+            # evidence of a clean field rather than an absent measurement.
+            print(f"  ⚠️  temporal criterion declines: {temporal['uninformative_reason']}.")
+            print("      The spatial criterion below is carrying the decision alone.")
+
     keep, dropped, best = {}, {}, 0.0
+    temporal_bad = set(temporal["flagged"]) if temporal else set()
     for axis, load in loadings:
         idx = list(range(k))
-        if args.reject is not None and resp is not None:
+        if reject_on and resp is not None:
+            cut = args.reject if args.reject is not None else 2.0
             scores = [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
             best = max(best, max(scores, default=0.0))
-            idx = [i for i in range(k) if scores[i] <= args.reject]
-            dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
+            bad = {i for i in range(k) if scores[i] > cut} | temporal_bad
+            idx = [i for i in range(k) if i not in bad]
+            dropped[axis] = [(i, scores[i]) for i in sorted(bad)]
         keep[axis] = idx
 
     if method == "ica":
@@ -2254,22 +2365,43 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         span = f"top {k}" if n_pcs is not None else f"all {k}"
         head = f"WARP RECONSTRUCTION — {span} principal components"
     print_cli_subsection(head)
+    cut_txt = f"{args.reject:g}" if args.reject is not None else "2"
     for axis, _load in loadings:
         lbl = label_of.get(axis, f"axis{axis}")
         drops = dropped.get(axis, [])
-        if args.reject is None:
+        if not reject_on:
             print(f"  • {lbl}: {len(keep[axis])} of {k} components kept")
         elif drops:
-            det = ", ".join(f"#{i} ({e:.1f}x)" for i, e in drops[:6])
+            # WHICH criterion fired, per component. The two find different things, so
+            # collapsing them into one count would hide the fact that (say) every drop
+            # came from the temporal test and the spatial one saw nothing -- which is
+            # the expected picture for a sparse response and worth reading directly.
+            def _tag(i: int, e: float) -> str:
+                sp = e > (args.reject if args.reject is not None else 2.0)
+                tp = i in temporal_bad
+                if sp and tp:
+                    return f"#{i} ({e:.1f}x, R²={float(temporal['r2'][i]):.2f})"
+                if sp:
+                    return f"#{i} ({e:.1f}x)"
+                return f"#{i} (R²={float(temporal['r2'][i]):.2f})"
+
+            det = ", ".join(_tag(i, e) for i, e in drops[:6])
             # The index is into the SHARED basis, so the same number on both axes is one
             # component scoring differently through two spatial loadings, not two finds.
             more = f" +{len(drops) - 6} more" if len(drops) > 6 else ""
+            n_sp = sum(1 for i, e in drops if e > (args.reject if args.reject is not None else 2.0))
+            n_tp = sum(1 for i, _e in drops if i in temporal_bad)
             print(
-                f"  • {lbl}: dropped {len(drops)} task-loaded component(s) at "
-                f">{args.reject:g}x — {det}{more}"
+                f"  • {lbl}: dropped {len(drops)} task-loaded component(s) "
+                f"({n_sp} spatial >{cut_txt}x, {n_tp} temporal) — {det}{more}"
             )
         else:
-            print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
+            both = (
+                "either criterion"
+                if temporal_bad or (temporal and temporal["informative"])
+                else f">{cut_txt}x"
+            )
+            print(f"  • {lbl}: no component met {both} — nothing dropped")
 
     if method == "ica":
         # Reject by PROJECTION on the full-rank field, not by rebuilding from the kept
@@ -2301,7 +2433,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             f"({resid / max(float(o.std()), 1e-9) * 100:.1f}% of the field's rms)"
         )
 
-    if args.reject is not None and not any(dropped.values()):
+    if reject_on and not any(dropped.values()):
         # A no-op here is a RESULT, not silence. PCA maximises variance, so a
         # contamination that is a small share of the field's energy cannot dominate any
         # component -- measured on a 0.8mm checkerboard run, the contaminated voxels
@@ -2310,19 +2442,20 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         # tail. ICA is not variance-ordered and does better on that run (2.8-3.0x), so
         # it is the thing to try before giving up on a decomposition.
         extra = (
-            " Try -warp_recon ica, which is not variance-ordered and reached 2.8-3.0x "
-            "where PCA reached 1.25x on a real contaminated run."
+            " Try -detask ica, which is not variance-ordered and reached 2.8-3.0x "
+            "where PCA reached 1.25x on a real contaminated run, and which also applies "
+            "the TEMPORAL criterion a sparse component can still trip."
             if method == "pcs"
             else ""
         )
         print(
             f"    ⓘ  no component's weights are concentrated on active tissue "
-            f"(strongest {best:.2f}x vs the {args.reject:g}x cut). If the diagnostic "
+            f"(strongest {best:.2f}x vs the {cut_txt}x cut). If the diagnostic "
             "above says CONTAMINATION, the response is likely too SPARSE to isolate: "
             "it is a small share of the field's variance." + extra + " Otherwise use "
             "-detask filter (block designs) or -detask field."
         )
-    if args.reject is not None and any(dropped.values()) and resp is not None:
+    if reject_on and any(dropped.values()) and resp is not None:
         # The design correlation of what was dropped, as corroboration. It cannot be
         # thresholded (a block design is ~2 DoF) but a dropped component whose time
         # course tracks the design is much easier to believe.
@@ -2383,8 +2516,139 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         device=device,
     )
     if note:
-        print(f"  ⚠️  -warp_recon: {note}")
-    return out
+        print(f"  ⚠️  component decomposition: {note}")
+    # The bad time courses travel back to the caller so a MULTI-ECHO run can apply the
+    # SAME rejection to every echo without decomposing each one. The projection is
+    # linear and each echo's field is a scaled copy of the shared field, so projecting
+    # per echo with one shared set of time courses is exactly equivalent to cleaning
+    # the shared field and rescaling -- and far cheaper than E decompositions that
+    # would each find slightly different components.
+    return out, (bad_tc if method == "ica" else None)
+
+
+def _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr, device):
+    """Diagnose the shared multi-echo field, then optionally hand back a de-tasked one.
+
+    The multi-echo counterpart of :func:`_task_stage`, and it runs BEFORE the outputs
+    are written for the same reason that one does: the diagnostic must see the field as
+    estimated, while any fix has to land before the warps, corrected series, flow maps
+    and PCs are derived from it.
+
+    Why the fix can be applied per echo at all, which is what the "not wired" refusal
+    this replaces assumed it could not be. Echo ``e``'s field is ``alpha_e * w`` (or, on
+    a composed run, an affine-in-TE combination of two shared fields), and every de-task
+    here is a LINEAR operator applied along time. So ``P(alpha_e * w) = alpha_e * P(w)``
+    exactly: projecting each echo's own field with the shared operator is identical to
+    cleaning ``w`` and rescaling, with no approximation. What would be wrong is
+    DECOMPOSING each echo separately -- E decompositions find E slightly different
+    component sets -- so the decomposition happens once, on echo 1 (whose alpha is 1 on
+    both axes, making its per-echo fields the shared fields), and only the resulting
+    time courses are reused.
+
+    The corrected series is re-derived from each echo's RAW input, never from the series
+    the estimator already warped, so nothing stacks a second interpolation.
+    """
+    from fastfuncstuff.processing.locomoco import (
+        detask_result,
+        pc_reconstruct_result,
+        warp_project_out,
+    )
+
+    try:
+        design, polort, resp, mask = _write_task_diagnostics(
+            result.per_echo[0], echo_mean, stem, ext, affine, args, tr
+        )
+    except (ValueError, RuntimeError) as exc:
+        # A diagnostic must never destroy a finished fit -- the estimation above can be
+        # many minutes of GPU time. Any requested fix is refused loudly rather than
+        # skipped silently.
+        print(f"  ⚠️  task coupling skipped: {exc}")
+        for flag, on in (
+            ("-detask", args.detask_field),
+            ("-detask ica", args.detask_ica),
+            ("-warp_recon", bool(args.warp_recon)),
+        ):
+            if on:
+                print(f"  ⚠️  {flag} NOT applied — the outputs below are the ORIGINAL field.")
+        return result
+
+    args._task_design = design
+    args._stem = stem
+    if args.write_pc_maps is not None:
+        _write_pc_maps(result.per_echo[0], stem, ext, affine, args, resp, mask, device)
+
+    # ── component rejection / reconstruction, decomposed ONCE on the shared field ──
+    if args.warp_recon or args.detask_ica:
+        cleaned0, bad_tc = _warp_recon_stage(
+            result.per_echo[0], datas[0], args, resp, mask, device, design=design, polort=polort
+        )
+        result.per_echo[0] = cleaned0
+        if bad_tc is not None and any(v.shape[1] for v in bad_tc.values()):
+            for j in range(1, len(result.per_echo)):
+                res_j = result.per_echo[j]
+                comps_j = [(ax, f) for _, ax, f in res_j.pe_displacements()]
+                rebuilt = warp_project_out(comps_j, bad_tc, device=device)
+                out_j, note = pc_reconstruct_result(
+                    res_j,
+                    datas[j],
+                    {},  # ignored when `rebuilt` is supplied
+                    rebuilt=rebuilt,
+                    warp_interp=args.warp_interp,
+                    warp_radius=args.warp_radius,
+                    device=device,
+                )
+                if note:
+                    print(f"  ⚠️  echo {j + 1}: {note}")
+                result.per_echo[j] = out_j
+            print(
+                f"  applied the same rejection to all {len(result.per_echo)} echoes "
+                "(one shared decomposition, projected per echo)"
+            )
+        elif args.warp_recon and len(result.per_echo) > 1:
+            # -warp_recon pcs TRUNCATES rather than projecting, so there is no shared
+            # time-course set to reuse and the other echoes would silently keep their
+            # full-rank fields. Refusing beats shipping a mixed-rank result.
+            print(
+                "  ⚠️  -warp_recon pcs rebuilt echo 1 only — truncation has no shared "
+                "time courses to reuse. Use -detask ica for a multi-echo rejection."
+            )
+
+    if not args.detask_field:
+        if args.warp_recon or args.detask_ica:
+            _write_task_after(
+                result.per_echo[0], design, polort, resp, mask, stem, ext, affine, args
+            )
+        return result
+
+    print_cli_subsection("DE-TASKING — every output below comes from the CLEANED field")
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    for j, res_j in enumerate(result.per_echo):
+        cleaned, removed, note = detask_result(
+            res_j,
+            datas[j],
+            design,
+            polort,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+        )
+        if note:
+            print(f"  ⚠️  echo {j + 1}: {note}")
+        if j == 0:
+            # Only echo 1's removed part is written: the others are its alpha-scaled
+            # copies by construction, so E files would be one finding shown E times.
+            for (label, _, _new), (_, _, task_part) in zip(
+                cleaned.pe_displacements(), removed, strict=True
+            ):
+                path = f"{stem}_flow_{label}_taskpart{ext}"
+                with spinner(f"Writing {Path(path).name}"):
+                    save_nifti(task_part.float().numpy(), path, affine=affine)
+        result.per_echo[j] = cleaned
+
+    _write_task_after(result.per_echo[0], design, polort, resp, mask, stem, ext, affine, args)
+    return result
 
 
 def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
@@ -2471,8 +2735,11 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         print(f"  ⚠️  task coupling skipped: {exc}")
         if args.detask_field:
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
-        if args.warp_recon:
-            print("  ⚠️  -warp_recon NOT applied — the outputs below are the ORIGINAL field.")
+        if args.warp_recon or args.detask_ica:
+            print(
+                "  ⚠️  the component decomposition was NOT applied — the outputs below "
+                "are the ORIGINAL field."
+            )
         return result
 
     args._task_design = design
@@ -2482,11 +2749,13 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
 
     # PC reconstruction runs BEFORE -detask: it rebuilds the field, so a field
     # projection afterwards acts on what was actually kept.
-    if args.warp_recon:
-        result = _warp_recon_stage(result, data, args, resp, mask, device)
+    if args.warp_recon or args.detask_ica:
+        result, _bad_tc = _warp_recon_stage(
+            result, data, args, resp, mask, device, design=design, polort=polort
+        )
 
     if not args.detask_field:
-        if args.warp_recon:
+        if args.warp_recon or args.detask_ica:
             _write_task_after(result, design, polort, resp, mask, stem, ext, affine, args)
         return result
 
@@ -3428,6 +3697,19 @@ def _run_multiecho(
                 desc=f"detask resample e{j + 1}",
             )
 
+    # Two-axis extras. Echo 1 carries alpha = 1 on BOTH axes (primary PE is flat by
+    # construction, and the partition law is normalised to echo 1), so its per-echo
+    # fields ARE the shared fields — the coupling measured on it is the shared-field
+    # coupling, not one echo's view of it.
+    # The echo MEAN, for the same reason the task diagnostic below uses it: the brain
+    # mask this derives is a tissue mask, and the shortest echo gives the weakest
+    # contrast to build it from.
+    echo_mean = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
+    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, echo_mean)
+
+    if args.events and tr_sec:
+        result = _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr_sec, device)
+
     print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
     for j, res in enumerate(result.per_echo):
@@ -3483,37 +3765,6 @@ def _run_multiecho(
                 args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
             )
         del corrected_series
-
-    # Two-axis extras. Echo 1 carries alpha = 1 on BOTH axes (primary PE is flat by
-    # construction, and the partition law is normalised to echo 1), so its per-echo
-    # fields ARE the shared fields — the coupling measured on it is the shared-field
-    # coupling, not one echo's view of it.
-    # The echo MEAN, for the same reason the task diagnostic below uses it: the brain
-    # mask this derives is a tissue mask, and the shortest echo gives the weakest
-    # contrast to build it from.
-    echo_mean = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
-    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, echo_mean)
-
-    if args.events and tr_sec:
-        # The SHARED field, because the coupling question is about the one field every
-        # echo is corrected by rather than each echo's scaled copy of it — but the
-        # data-side task map is measured on the echo MEAN, not on echo 1. BOLD percent
-        # signal change scales with TE, so the shortest echo has the weakest response
-        # and gives the poorest "where the task is" mask, which is what the enrichment
-        # statistic is scored against. A plain mean is most of the win; a TE-weighted
-        # optimal combination would be the refinement.
-        task_data = echo_mean
-        if len(datas) > 1:
-            print(f"   ⚗️  task diagnostic: data map from the mean of {len(datas)} echoes")
-        _write_task_diagnostics(result.per_echo[0], task_data, stem, ext, affine, args, tr_sec)
-        if args.detask_field:
-            # The multi-echo correction is one SHARED field scaled per echo; de-tasking
-            # it means re-deriving every echo's warp and series from the cleaned w, which
-            # is not wired yet. Refusing beats silently cleaning one echo's copy.
-            print(
-                "  ⚠️  -detask is not wired for the multi-echo path (the shared field is "
-                "scaled per echo); the outputs below are NOT de-tasked."
-            )
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -3635,13 +3886,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # here rather than let a run finish looking de-tasked.
     try:
         args.detask_field, args.detask_widen, args.detask_fit = parse_detask(args.detask)
+        args.detask_ica = bool(args.detask) and str(args.detask).strip().lower().startswith("ica")
         parse_warp_recon(args.warp_recon)
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
         return 2
-    if args.reject is not None and not args.warp_recon:
+    if args.reject is not None and not (args.warp_recon or args.detask_ica):
         print(
-            "❌ -reject modifies -warp_recon; pass -warp_recon pcs (or pcs:N) too.",
+            "❌ -reject sets the SPATIAL threshold for a component decomposition; pass "
+            "-detask ica (rejection implied) or -warp_recon pcs too.",
             file=sys.stderr,
         )
         return 2
