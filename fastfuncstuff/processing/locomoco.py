@@ -2725,11 +2725,76 @@ def _spatial_highpass3d(
     return vol - _blur3d_b(vol, sigma, skip_axis)
 
 
-MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag")
+MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag", "ngf")
+
+
+def _ngf_component(
+    vol: torch.Tensor,
+    axis: int,
+    skip_axis: int | None = None,
+    eta_frac: float = 0.5,
+) -> torch.Tensor:
+    """Unit-gradient component along ``axis`` — the encode-axis slice of the NGF vector.
+
+    ``g_axis / sqrt(|grad|^2 + eta^2)``, the component of the normalised gradient field
+    (Haber & Modersitzki) that a 1-DOF PE-axis solve can actually use.
+    :func:`fastfuncstuff.processing.metrics.ngf_volume_cost` is the volume-to-volume
+    COST built on the same quantity; LK needs an image, not a cost, so what goes
+    through ``-match`` is the component itself.
+
+    Why this and not ``localnorm`` for BOLD contamination. A task response is
+    approximately a local multiplicative gain ``c``, and ``grad(cS) = c*grad(S) +
+    S*grad(c)``. Inside a responding region ``grad(c) ~ 0``, so the gradient DIRECTION
+    is untouched however large ``c`` is, and this transform is exactly invariant
+    there. ``localnorm`` is invariant to a local mean and scale, which covers the same
+    interior, but it still passes through the new EDGE that the boundary of the
+    response creates, and that edge is what the estimator tracks.
+
+    The honest limit: at that boundary ``S*grad(c)`` is not zero either, and it is
+    proportional to the mean signal rather than to the anatomical contrast, so where
+    anatomy is weak it can dominate the direction. Gradient orientation buys the
+    region interior, not the boundary. No intensity-based transform buys the boundary
+    — see the wiki note ``Frame brightness and brightness constancy``.
+
+    Signed, unlike ``gradmag``: an edge keeps its polarity instead of folding both
+    flanks into one ridge, so LK sees one zero crossing where gradmag shows two.
+    """
+    axes = [a for a in (0, 1, 2) if a != skip_axis]
+    if axis not in axes:
+        raise ValueError(
+            f"-match ngf needs the gradient along encode axis {axis}, but that axis is "
+            f"the excluded slice axis. Use -match localnorm for this acquisition."
+        )
+    b = _blur3d_b(vol, 1.0, skip_axis)
+    sq = torch.zeros_like(b)
+    grads = {}
+    for a in axes:
+        grads[a] = _grad_axis_3d(b, a)
+        sq = sq + grads[a] * grads[a]
+    # eta floors the denominator so flat, noisy tissue cannot contribute a
+    # full-strength random orientation. Scaled from each volume's OWN gradient
+    # magnitude: across TE the later echo's gradients are uniformly smaller, and a
+    # shared constant would floor one echo to noise and leave the other unfloored.
+    med = torch.zeros(sq.shape[0], device=sq.device, dtype=sq.dtype)
+    flat = sq.reshape(sq.shape[0], -1)
+    for i in range(flat.shape[0]):
+        v = flat[i]
+        # Subsampled before the median: this runs per frame per pyramid level, and a
+        # full sort of a 0.8mm volume is not worth an exact floor.
+        if v.numel() > 1_000_000:
+            v = v[:: v.numel() // 1_000_000 + 1]
+        pos = v[v > 0]
+        med[i] = pos.median() if pos.numel() else flat.new_tensor(1.0)
+    eta2 = (eta_frac**2) * med.reshape(-1, 1, 1, 1)
+    return grads[axis] / (sq + eta2).clamp(min=1e-12).sqrt()
 
 
 def _match_prep(
-    vol: torch.Tensor, mode: str, sigma: float = 2.0, skip_axis: int | None = None
+    vol: torch.Tensor,
+    mode: str,
+    sigma: float = 2.0,
+    skip_axis: int | None = None,
+    pe_axis: int | None = None,
 ) -> torch.Tensor:
     """Make brightness constancy approximately true for a cross-contrast ``(B,X,Y,Z)`` pair.
 
@@ -2750,6 +2815,14 @@ def _match_prep(
     """
     if mode == "none":
         return vol
+    if mode == "ngf":
+        if pe_axis is None:
+            raise ValueError(
+                "-match ngf needs the encode axis, which this estimation path does not "
+                "pass through. It is wired for the 3-D solve; use -match localnorm on "
+                "the 2-D slicewise path."
+            )
+        return _ngf_component(vol, pe_axis, skip_axis)
     if mode == "gradmag":
         b = _blur3d_b(vol, 1.0, skip_axis)
         axes = [a for a in (0, 1, 2) if a != skip_axis]
@@ -3770,7 +3843,9 @@ def _run_3dacq_plain(
     # resample), then the existing estimation blur. Identity at the defaults. v is a
     # single (X,Y,Z) vol.
     def _prep(v: torch.Tensor) -> torch.Tensor:
-        x = _spatial_highpass3d(_match_prep(v[None], match, match_sigma), hpf_sigma)
+        x = _spatial_highpass3d(
+            _match_prep(v[None], match, match_sigma, pe_axis=pe_axis), hpf_sigma
+        )
         if smooth_sigma > 0:
             x = _blur3d_b(x, smooth_sigma)
         return x[0]
@@ -4001,8 +4076,8 @@ def optical_flow_lk_3d_multiecho(
     tens of voxels instead of returning a merely-wrong small number.
     """
     if match != "none":
-        fixed_list = [_match_prep(f, match, match_sigma) for f in fixed_list]
-        moving_list = [_match_prep(m, match, match_sigma) for m in moving_list]
+        fixed_list = [_match_prep(f, match, match_sigma, pe_axis=pe_axis) for f in fixed_list]
+        moving_list = [_match_prep(m, match, match_sigma, pe_axis=pe_axis) for m in moving_list]
     e = len(fixed_list)
     fpyr = [[f] for f in fixed_list]
     mpyr = [[m] for m in moving_list]
@@ -4154,8 +4229,14 @@ def optical_flow_lk_3d_axes(
             f"got {tuple(alphas.shape)}"
         )
     if match != "none":
-        fixed_list = [_match_prep(f, match, match_sigma) for f in fixed_list]
-        moving_list = [_match_prep(m, match, match_sigma) for m in moving_list]
+        # The joint solve takes ONE image pair for both encode axes, so an
+        # axis-dependent match (ngf) has to pick one: the primary encode axis, whose
+        # displacement dominates and whose BOLD contamination is the reason the mode
+        # exists. The partition solve then runs on a rendering oriented for its
+        # neighbour -- acceptable, and the task-coupling diagnostic reports the two
+        # axes separately so the cost of that choice is visible rather than assumed.
+        fixed_list = [_match_prep(f, match, match_sigma, pe_axis=axes[0]) for f in fixed_list]
+        moving_list = [_match_prep(m, match, match_sigma, pe_axis=axes[0]) for m in moving_list]
 
     n_ax, n_echo = len(axes), len(fixed_list)
     fpyr = [[f] for f in fixed_list]
@@ -4684,7 +4765,9 @@ def estimate_residual_flow_multiecho(
         # against itself, so the TE relationship the joint solve depends on is untouched:
         # `alphas` scales the DISPLACEMENT field, never the intensities.
         x = _spatial_highpass3d(
-            _match_prep(v[None], match, match_sigma, sw_axis), hpf_sigma, sw_axis
+            _match_prep(v[None], match, match_sigma, sw_axis, pe_axis=pe_axis),
+            hpf_sigma,
+            sw_axis,
         )
         if smooth_sigma > 0:
             x = _blur3d_b(x, smooth_sigma, sw_axis)

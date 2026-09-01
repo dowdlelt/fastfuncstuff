@@ -1583,3 +1583,59 @@ def test_match_correction_keeps_raw_intensities(known_shift_series):
         verbose=False,
     )
     assert res.corrected_series().mean() > 0.5 * float(data.mean())
+
+
+def test_ngf_match_is_invariant_to_a_local_gain_where_localnorm_is_not():
+    """The property `-match ngf` exists for: a BOLD-like gain must not survive it.
+
+    A task response is approximately a local multiplicative gain, and
+    ``grad(cS) = c*grad(S) + S*grad(c)``, so on an anatomical edge inside a responding
+    region the gradient DIRECTION is untouched however large the gain is. That is
+    where the contamination measured on the 0.8mm checkerboard run lived, and where a
+    brightness-constancy solve reads the response as displacement.
+
+    Invariance is exact only where ``|grad|`` clears the eta floor -- eta is scaled
+    from the whole volume, so a LOCAL gain shifts the normalisation slightly in
+    weak-gradient tissue. Strong edges are what LK weights anyway, so that is where
+    the property is asserted.
+    """
+    from fastfuncstuff.processing.locomoco import _match_prep
+
+    # Structured, not noise: NGF is about edge ORIENTATION, and white noise has no
+    # stable orientation to preserve.
+    vol = torch.full((1, 32, 32, 32), 40.0)
+    vol[:, 6:26, 6:26, 6:26] = 160.0
+    vol[:, 12:20, 10:22, 8:24] = 90.0
+    g = torch.Generator().manual_seed(3)
+    vol = vol + torch.randn(1, 32, 32, 32, generator=g) * 2.0
+
+    gain = torch.ones(1, 32, 32, 32)
+    gain[:, 4:28, 4:28, 4:28] = 1.25  # a wide "activation", rim far from the edges tested
+
+    prepped = {
+        m: (_match_prep(vol, m, 6.0, pe_axis=1), _match_prep(vol * gain, m, 6.0, pe_axis=1))
+        for m in ("ngf", "localnorm")
+    }
+    # Anatomical edges well inside the gain region, away from its rim.
+    edge = torch.zeros(32, 32, 32, dtype=torch.bool)
+    edge[11:13, 12:20, 12:20] = True  # the inner block's face
+    edge[19:21, 12:20, 12:20] = True
+
+    drift = {}
+    for m, (base, gained) in prepped.items():
+        scale = base[0][edge].abs().mean().item()
+        drift[m] = (gained - base)[0][edge].abs().mean().item() / max(scale, 1e-12)
+    assert drift["ngf"] < 0.05, drift
+    # Not a claim that localnorm is useless -- it is the default for good reasons --
+    # only that it does not deliver THIS invariance, which is why ngf was added.
+    assert drift["localnorm"] > 4 * drift["ngf"], drift
+
+
+def test_ngf_match_says_so_when_the_encode_axis_is_unavailable():
+    from fastfuncstuff.processing.locomoco import _match_prep
+
+    vol = torch.randn(1, 12, 12, 12)
+    with pytest.raises(ValueError, match="encode axis"):
+        _match_prep(vol, "ngf", 6.0)
+    with pytest.raises(ValueError, match="localnorm"):
+        _match_prep(vol, "ngf", 6.0, skip_axis=1, pe_axis=1)

@@ -507,7 +507,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     me.add_argument(
         "-me_match",
-        choices=("none", "meanstd", "localnorm", "gradmag"),
+        choices=("none", "meanstd", "localnorm", "gradmag", "ngf"),
         default="localnorm",
         help="[-me_interecho -backend flow] Intensity matching applied to each ECHO PAIR before"
         " the LK solve. The cross-TE counterpart of -match (which matches frames over TIME, and"
@@ -517,6 +517,11 @@ def create_parser() -> argparse.ArgumentParser:
         " as displacement and the field diverges.\n"
         "  none       the raw residual.\n"
         "  localnorm  local z-score both sides.\n"
+        "  ngf        signed unit-gradient component along the encode axis. Invariant\n"
+        "             to a local multiplicative gain, so a BOLD response cannot enter\n"
+        "             the solve as brightness through the INTERIOR of a responding\n"
+        "             region; its boundary is still an edge no intensity transform\n"
+        "             removes. 3-D solve only.\n"
         "  gradmag    locally-normalized gradient magnitude — edges only, the most"
         " contrast-agnostic.\n"
         "  meanstd    one global rescale.\n"
@@ -635,7 +640,7 @@ def create_parser() -> argparse.ArgumentParser:
     est.add_argument(
         "-match",
         "-tmatch",
-        choices=("none", "meanstd", "localnorm", "gradmag"),
+        choices=("none", "meanstd", "localnorm", "gradmag", "ngf"),
         default="none",
         help="[flow, phase] Intensity matching applied to the ESTIMATION frames only, before"
         " -hpf_spatial and -do_blur. The corrected output still resamples the RAW series"
@@ -648,6 +653,11 @@ def create_parser() -> argparse.ArgumentParser:
         "  none       the raw residual.\n"
         "  localnorm  local z-score both sides. Cancels a MULTIPLICATIVE gain, which"
         " -hpf_spatial cannot (it only subtracts). The usual choice.\n"
+        "  ngf        signed unit-gradient component along the encode axis. Invariant\n"
+        "             to a local multiplicative gain, so a BOLD response cannot enter\n"
+        "             the solve as brightness through the INTERIOR of a responding\n"
+        "             region; its boundary is still an edge no intensity transform\n"
+        "             removes. 3-D solve only.\n"
         "  gradmag    locally-normalized gradient magnitude — edges only, the most"
         " contrast-agnostic.\n"
         "  meanstd    one global rescale per frame. Near-useless for the ramp, whose gain"
