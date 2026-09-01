@@ -59,6 +59,7 @@ __all__ = [
     "pe_gradient",
     "responding_mask",
     "task_enrichment",
+    "enrichment_curve",
     "project_task_out",
     "format_task_coupling_report",
 ]
@@ -473,6 +474,71 @@ def task_enrichment(
     }
 
 
+def enrichment_curve(
+    field: TaskCoupling,
+    active: torch.Tensor,
+    mask: torch.Tensor,
+    quantiles: tuple[float, ...] = (0.5, 0.9, 0.99, 0.999),
+) -> list[dict]:
+    """Enrichment on active tissue as a function of how task-locked the FIELD is.
+
+    The statistic that actually detects contamination, and the reason the first
+    version of this module reported "nothing to fix" on a run that was visibly
+    contaminated.  Every other summary here conditions on the DATA — take the decile
+    where the response lives, then average the field over it.  That is the wrong way
+    round.  Contamination obeys ``g * d = dI``, so it can only exist where the encode
+    gradient is non-zero; the active decile is mostly flat voxel interiors where
+    ``g ~ 0`` and no displacement is induced at all.  A median over it is a median
+    over the voxels that *cannot* be contaminated, and it reads clean no matter how
+    bad the tail is.
+
+    Condition on the FIELD instead: take the voxels where the field is most
+    task-locked and ask what share of THEM sit on activated tissue.  Measured on a
+    contaminated 0.8 mm checkerboard run, where the median-based verdict said
+    "no appreciable coupling":
+
+        |r_field| > 0.2  ->  3.8x      |r_field| > 0.5  ->  7.4x
+        |r_field| > 0.3  ->  5.6x      |r_field| > 0.7  ->  8.9x
+        |r_field| > 0.4  ->  6.6x      |r_field| > 0.8  ->  9.6x
+
+    against a ceiling of 10x (the active mask is a decile).  A field whose task
+    coupling is unrelated to where the task is sits at 1.0 in every row; a field
+    reading BOLD as motion climbs toward the ceiling.  It needs no null — the
+    no-relation value is 1 by construction — and no per-voxel significance, which
+    is unattainable for a block design anyway.
+
+    Returns one row per quantile with enough voxels to mean anything, each carrying
+    the ``|r|`` cut it corresponds to, the voxel count, and the enrichment.
+    """
+    m = mask.reshape(-1) > 0
+    a = (active.reshape(-1) > 0)[m]
+    strength = field.r.abs().amax(dim=-1).reshape(-1)[m]
+    vox_share = float(a.double().mean())
+    if vox_share <= 0:
+        return []
+    rows: list[dict] = []
+    for q in quantiles:
+        cut = _quantile(strength, q)
+        sel = strength > cut
+        n = int(sel.sum())
+        # Below ~200 voxels the share is quantized coarsely enough that a single blob
+        # sets it; reporting that as an enrichment invites reading noise as a trend.
+        if n < 200:
+            continue
+        frac = float((a & sel).sum()) / n
+        rows.append(
+            {
+                "quantile": q,
+                "r_cut": cut,
+                "n": n,
+                "in_active": frac,
+                "enrichment": frac / vox_share,
+                "ceiling": 1.0 / vox_share,
+            }
+        )
+    return rows
+
+
 def responding_mask(
     data_r: torch.Tensor,
     mask: torch.Tensor,
@@ -516,6 +582,7 @@ def format_task_coupling_report(
     slope: dict | None = None,
     enrichment: dict | None = None,
     active_thresh: float | None = None,
+    curve: list[dict] | None = None,
 ) -> str:
     """Compact verdict, for the saved .txt and a one-line stdout echo.
 
@@ -557,6 +624,19 @@ def format_task_coupling_report(
                 f"{share if i == 0 else '':>11}" + (f"  [{st['n_voxels']} vox]" if i == 0 else "")
             )
 
+    if curve:
+        lines += [
+            "",
+            f"  IS THE FIELD'S TASK COUPLING WHERE THE TASK IS?  "
+            f"(1.0x = unrelated, ceiling {curve[0]['ceiling']:.0f}x)",
+            f"  {'field |r| >':<18}{'n vox':>9}{'on active':>11}{'enrichment':>12}",
+        ]
+        for row in curve:
+            lines.append(
+                f"  {row['r_cut']:<18.3f}{row['n']:>9d}"
+                f"{row['in_active'] * 100:>10.1f}%{row['enrichment']:>11.2f}x"
+            )
+
     tail = []
     if enrichment is not None:
         tail.append(f"enrichment {enrichment['enrichment']:.2f}x")
@@ -573,7 +653,7 @@ def format_task_coupling_report(
             f"p95 {dc.get('abs_r_p95', 0):.3f}   ({units} rms for the field columns)"
         )
     if coloc is not None:
-        lines += ["", "  " + _verdict(field, coloc, responding, slope, enrichment)]
+        lines += ["", "  " + _verdict(field, coloc, responding, slope, enrichment, curve)]
     return "\n".join(lines) + "\n"
 
 
@@ -594,16 +674,22 @@ def _verdict(
     responding: dict | None = None,
     slope: dict | None = None,
     enrichment: dict | None = None,
+    curve: list[dict] | None = None,
 ) -> str:
     """One sentence naming which of the two mechanisms the numbers point at.
 
-    ENRICHMENT decides: it asks the question directly — are we moving voxels, in a
-    task-correlated way, where voxels are task-correlated — and its no-relation value
-    is 1 by construction rather than by simulation.  The kappa slope corroborates when
-    its centred r is real, but it cannot be the arbiter: it predicts a per-voxel
-    relation that a window-pooled estimator blurs.  Detection is judged on the
-    RESPONDING stratum; a whole-brain median is the statistic that hid the effect in
-    the first place.
+    The TAIL of :func:`enrichment_curve` decides.  Every earlier version decided on a
+    median — first over the whole brain, then over the responding decile — and both
+    are medians over voxels that carry no encode gradient and therefore cannot be
+    contaminated at all.  On the run this was rewritten for, the responding-decile
+    median put the ratio at 1.28 against a gate of 1.3 and printed "nothing to fix"
+    while the field's top percentile was 9x concentrated on activated tissue.  A
+    statistic that a threshold nudge of 0.02 flips is not measuring the effect.
+
+    kappa is corroboration, and now actually enters the decision instead of being
+    printed beside it: the physical relation it tests is exact only for an unpooled
+    estimator, so a weak kappa cannot clear a field, but a kappa of order 1 alongside
+    a rising tail is independent evidence of the same mechanism.
     """
     st = responding if responding and responding.get("n_voxels") else field.summary
     conds = st.get("conditions") or []
@@ -611,36 +697,64 @@ def _verdict(
         return "No conditions to judge."
     best = max(conds, key=lambda c: c["abs_r_median"])
     where = "where the data responds" if responding else "in the mask"
-
-    # The task-explained SHARE is the robust detector, not enrichment. Enrichment is a
-    # ratio of shares, so when real motion dominates the field it is dividing two noisy
-    # numbers and tracks nothing -- measured 0.89x on a phantom whose field was 21%
-    # task-explained, and 0.77x after a fix that cut that to 1%.
     share, chance = _share(st), field.chance_share
     ratio = share / chance if chance > 0 else 0.0
-    e = enrichment["enrichment"] if enrichment else None
-    kap = ""
-    if slope is not None and slope["n"] > 100 and abs(slope["r"]) > 0.2:
-        kap = f" Physical test agrees (kappa {slope['kappa']:+.2f}, centred r {slope['r']:+.2f})."
 
+    tail = curve[-1] if curve else None
+    # kappa near +/-1 is the physical prediction; the sign depends on the field's
+    # displacement convention, so magnitude is what carries the information.
+    phys = bool(
+        slope and slope["n"] > 100 and abs(slope["r"]) > 0.2 and 0.3 < abs(slope["kappa"]) < 3.0
+    )
+    kap = (
+        f" Physical test agrees (kappa {slope['kappa']:+.2f}, centred r {slope['r']:+.2f})."
+        if phys
+        else ""
+    )
+
+    if tail is not None:
+        e_tail = tail["enrichment"]
+        top = f"the top {(1 - tail['quantile']) * 100:g}% of the field (|r| > {tail['r_cut']:.2f})"
+        if e_tail >= 2.0 or (e_tail >= 1.5 and phys):
+            return (
+                f"CONTAMINATION: {top} is {e_tail:.1f}x concentrated on activated tissue "
+                f"(ceiling {tail['ceiling']:.0f}x, no-relation 1.0x).{kap} "
+                "Fix: -ref paired, a gain-invariant -match, or -detask on this field."
+            )
+        if ratio >= 2.0:
+            return (
+                f"TASK-LOCKED {where}: {share * 100:.0f}% task-explained, {ratio:.1f}x "
+                f"chance, but the field's own tail is only {e_tail:.1f}x concentrated on "
+                "activated tissue — real task-correlated motion, not BOLD read as motion. "
+                "Do NOT project it out without looking at the maps."
+            )
+        return (
+            f"NO APPRECIABLE COUPLING: {top} is {e_tail:.1f}x concentrated on activated "
+            f"tissue (no-relation 1.0x); {share * 100:.0f}% task-explained {where} vs "
+            f"{chance * 100:.0f}% chance."
+        )
+
+    # No curve (a caller that did not supply the masks): fall back to the share, and
+    # say which statistic is being used so the weaker verdict is not read as the strong one.
+    e = enrichment["enrichment"] if enrichment else None
     if ratio >= 2.0 or (e is not None and e >= 1.5 and ratio >= 1.3):
         conc = f", {e:.2f}x concentrated on active tissue" if e is not None else ""
         return (
-            f"CONTAMINATION {where}: {share * 100:.0f}% task-explained, {ratio:.1f}x "
-            f"chance{conc}.{kap} Fix: -ref paired, or -detask on this field."
+            f"CONTAMINATION {where} (share-based): {share * 100:.0f}% task-explained, "
+            f"{ratio:.1f}x chance{conc}.{kap} Fix: -ref paired, or -detask on this field."
         )
     if ratio < 0.8:
         return (
-            f"CLEAR {where}: {share * 100:.0f}% task-explained, BELOW the "
+            f"CLEAR {where} (share-based): {share * 100:.0f}% task-explained, BELOW the "
             f"{chance * 100:.0f}% chance level (where a paired reference lands)."
         )
     if best["abs_r_median"] > 0.25:
         return (
-            f"TASK-LOCKED {where} (|r| {best['abs_r_median']:.2f}) at only {ratio:.1f}x "
-            "chance and not on active tissue — real task-correlated motion, or a slow "
-            "field aliasing onto a slow design. Check the maps before projecting."
+            f"TASK-LOCKED {where} (share-based, |r| {best['abs_r_median']:.2f}) at only "
+            f"{ratio:.1f}x chance — real task-correlated motion, or a slow field aliasing "
+            "onto a slow design. Check the maps before projecting."
         )
     return (
-        f"NO APPRECIABLE COUPLING {where}: {share * 100:.0f}% task-explained vs "
-        f"{chance * 100:.0f}% chance."
+        f"NO APPRECIABLE COUPLING {where} (share-based): {share * 100:.0f}% "
+        f"task-explained vs {chance * 100:.0f}% chance."
     )

@@ -19,6 +19,7 @@ from fastfuncstuff.stats.task_coupling import (
     co_location,
     contamination_slope,
     default_polort,
+    enrichment_curve,
     format_task_coupling_report,
     pe_gradient,
     responding_mask,
@@ -348,6 +349,7 @@ def test_detask_result_rebuilds_the_corrected_series_from_raw():
     n_t = 60
     nx, ny, nz = 8, 8, 4
     x = _block_design(n_t, block=10)
+    xt = x[:, 0]
     rng = np.random.default_rng(0)
     data = rng.normal(100, 10, (nx, ny, nz, n_t)).astype(np.float32)
 
@@ -491,3 +493,82 @@ def test_report_is_compact_and_names_the_axis_it_is_about():
     text = format_task_coupling_report(tc, label="pe2 (partition IS, axis 2 = z)")
     assert len(text.splitlines()) <= 15, text
     assert "pe2 (partition IS, axis 2 = z)" in text.splitlines()[0]
+
+
+def _contaminated_and_innocent(rng, n_t=80):
+    """A field contaminated only inside an 'activated' blob, and one that is not.
+
+    Both are task-locked by the same amount overall. Only the first has its coupling
+    CO-LOCATED with the response, which is the thing that distinguishes BOLD read as
+    motion from real task-correlated head motion.
+    """
+    x = _block_design(n_t, block=10)
+    xt = x[:, 0]
+    shape = (16, 16, 10)
+    data = torch.as_tensor(rng.normal(size=(*shape, n_t)), dtype=torch.float64)
+    blob = torch.zeros(shape, dtype=torch.bool)
+    # Sized to the responding decile on purpose: if the blob is much smaller than the
+    # active mask, most of that mask is unresponsive noise and the enrichment ceiling
+    # collapses to a few x regardless of how contaminated the field is.
+    blob[4:12, 4:12, 3:7] = True  # 256 of 2560 voxels = the top decile
+    data[blob] += 3.0 * xt
+
+    contaminated = torch.as_tensor(rng.normal(size=(*shape, n_t)) * 0.3)
+    contaminated[blob] += 3.0 * xt  # coupling exactly where the response is
+
+    innocent = torch.as_tensor(rng.normal(size=(*shape, n_t)) * 0.3)
+    elsewhere = torch.zeros(shape, dtype=torch.bool)
+    elsewhere[12:16, 8:16, :] = True  # task-locked, but nowhere near the response
+    innocent[elsewhere] += 3.0 * xt
+    return x, data, contaminated, innocent
+
+
+def test_enrichment_curve_separates_contamination_from_task_locked_motion():
+    """The tail rises toward the ceiling for contamination and stays flat otherwise.
+
+    The bug of record: the shipped verdict decided on the MEDIAN over the responding
+    decile, which is a median over flat voxel interiors where the encode gradient is
+    zero and no displacement can be induced at all. On a real 0.8mm checkerboard run
+    it printed "no appreciable coupling" while the field's top percentile was ~9x
+    concentrated on activated tissue.
+    """
+    rng = np.random.default_rng(7)
+    x, data, contaminated, innocent = _contaminated_and_innocent(rng)
+    mask = torch.ones(data.shape[:3])
+    dtc = task_coupling(data, x, polort=2, mask=mask)
+    resp, _, _ = responding_mask(dtc.r, mask, 0.1)
+
+    bad = enrichment_curve(task_coupling(contaminated, x, polort=2, mask=mask), resp, mask)
+    good = enrichment_curve(task_coupling(innocent, x, polort=2, mask=mask), resp, mask)
+    assert bad and good
+    # Contamination: the tail is strongly concentrated on the responding voxels, and
+    # concentration RISES as the field-side threshold tightens.
+    assert bad[-1]["enrichment"] > 3.0, bad
+    assert bad[-1]["enrichment"] > bad[0]["enrichment"], bad
+    # Task-locked motion somewhere else: no concentration at any threshold.
+    assert good[-1]["enrichment"] < 1.5, good
+
+
+def test_verdict_flags_contamination_the_median_statistic_missed():
+    """End to end: the report says CONTAMINATION for the co-located field only."""
+    rng = np.random.default_rng(7)
+    x, data, contaminated, innocent = _contaminated_and_innocent(rng)
+    mask = torch.ones(data.shape[:3])
+    dtc = task_coupling(data, x, polort=2, mask=mask)
+    resp, quiet, cut = responding_mask(dtc.r, mask, 0.1)
+
+    def report(field):
+        tc = task_coupling(field, x, polort=2, mask=mask)
+        return format_task_coupling_report(
+            tc,
+            dtc,
+            co_location(tc.r, dtc.r, mask),
+            responding=tc.summarize(resp),
+            quiet=tc.summarize(quiet),
+            enrichment=task_enrichment(tc, resp, mask),
+            active_thresh=cut,
+            curve=enrichment_curve(tc, resp, mask),
+        )
+
+    assert "CONTAMINATION" in report(contaminated)
+    assert "CONTAMINATION" not in report(innocent)

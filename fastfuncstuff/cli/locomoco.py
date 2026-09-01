@@ -1662,6 +1662,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         co_location,
         contamination_slope,
         default_polort,
+        enrichment_curve,
         format_task_coupling_report,
         pe_gradient,
         responding_mask,
@@ -1709,6 +1710,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
             tc.beta, data_tc.beta, pe_gradient(reference, axis), resp, condition=best_k
         )
         enrich = task_enrichment(tc, resp, mask)
+        curve = enrichment_curve(tc, resp, mask)
         report.append(
             format_task_coupling_report(
                 tc,
@@ -1722,13 +1724,21 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
                 slope=slope,
                 enrichment=enrich,
                 active_thresh=cut,
+                curve=curve,
             )
         )
         best = r_sum["conditions"][best_k]
+        tail = curve[-1] if curve else None
+        tail_txt = (
+            f"tail enrichment {tail['enrichment']:.2f}x of {tail['ceiling']:.0f}x "
+            f"(field |r| > {tail['r_cut']:.2f})"
+            if tail
+            else f"enrichment {enrich['enrichment']:.2f}x"
+        )
         print(
-            f"  • {name}: enrichment {enrich['enrichment']:.2f}x, "
-            f"|r| {best['abs_r_median']:.3f} med / {best['abs_r_p95']:.3f} p95 in the "
-            f"active mask ({best['label']}), kappa {slope['kappa']:+.3f}"
+            f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"{best['abs_r_p95']:.3f} p95 in the active mask ({best['label']}), "
+            f"kappa {slope['kappa']:+.3f}"
         )
         # The verdict sentence, and only that. The full stratum table goes to the .txt:
         # it was echoed here in full for every axis, which buried the one line that
