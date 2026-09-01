@@ -130,8 +130,10 @@ def test_axes_validation():
     v = _blobby((12, 12, 12))
     with pytest.raises(ValueError, match="must differ"):
         optical_flow_lk_3d_axes([v], [v], [1, 1], torch.ones(2, 1))
-    with pytest.raises(ValueError, match="1 or 2 axes"):
-        optical_flow_lk_3d_axes([v], [v], [0, 1, 2], torch.ones(3, 1))
+    # Three axes are supported now (the un-encoded axis as a null channel); four is
+    # still meaningless -- a volume has three.
+    with pytest.raises(ValueError, match="1, 2 or 3 axes"):
+        optical_flow_lk_3d_axes([v], [v], [0, 1, 2, 0], torch.ones(4, 1))
     with pytest.raises(ValueError, match="alphas must be"):
         optical_flow_lk_3d_axes([v], [v], [0, 1], torch.ones(2, 3))
 
@@ -1025,3 +1027,198 @@ def test_help_keeps_explicit_newlines_and_hides_none_defaults():
     assert "\n                        (default: ncc)" in text
     # "(default: None)" is noise — -ref's real default is computed after parsing.
     assert "default: None" not in text
+
+
+def test_three_axis_recovers_three_independent_shifts():
+    """The 3x3 joint solve, for using the un-encoded axis as a null channel.
+
+    A displacement along the readout axis is not physical for an EPI residual -- the
+    readout bandwidth is orders of magnitude above the phase-encode one -- so a
+    non-zero estimate there is a spurious trace. Reading it requires solving for it,
+    which requires the 3x3.
+    """
+    fixed = _blobby(shape=(28, 30, 26))
+    d = (0.8, -0.5, 0.35)
+    moving = _shift3d_axes(fixed, [torch.full_like(fixed, x) for x in d], [0, 1, 2])
+    u = optical_flow_lk_3d_axes(
+        [fixed], [moving], [0, 1, 2], torch.ones(3, 1), n_levels=3, n_iters=8, window_sigma=2.0
+    )
+    # Same PULL convention as the two-axis test: building `moving` by sampling `fixed`
+    # at x+d means the answer is -d.
+    c = (slice(None), slice(5, -5), slice(5, -5), slice(5, -5))
+    for k, want in enumerate(d):
+        assert u[k][c].mean().item() == pytest.approx(-want, abs=0.15), (k, u[k][c].mean())
+
+
+def test_three_axis_leaves_an_unmoved_axis_near_zero():
+    """The null channel is only useful if a truly still axis reads ~0.
+
+    This is the property the whole idea rests on: if the solve smears a two-axis
+    displacement into the third, every reading of that channel is an artifact of the
+    estimator rather than of the data.
+    """
+    fixed = _blobby(shape=(28, 30, 26), seed=5)
+    moving = _shift3d_axes(
+        fixed,
+        [torch.zeros_like(fixed), torch.full_like(fixed, 0.6), torch.full_like(fixed, -0.4)],
+        [0, 1, 2],
+    )
+    u = optical_flow_lk_3d_axes(
+        [fixed], [moving], [0, 1, 2], torch.ones(3, 1), n_levels=3, n_iters=8, window_sigma=2.0
+    )
+    c = (slice(None), slice(5, -5), slice(5, -5), slice(5, -5))
+    assert abs(u[0][c].mean().item()) < 0.05, u[0][c].mean()
+    assert u[1][c].mean().item() == pytest.approx(-0.6, abs=0.15)
+    assert u[2][c].mean().item() == pytest.approx(0.4, abs=0.15)
+
+
+def test_three_axis_separability_collapses_on_a_one_dimensional_ramp():
+    """sep generalises: det over the diagonal product, 1 orthogonal and 0 singular."""
+    shape = (24, 24, 24)
+    ramp = torch.arange(shape[0], dtype=torch.float32).view(1, -1, 1, 1)
+    # Varies along x+y+z, so all three gradients are equal and the 3x3 is singular.
+    flat = (
+        (
+            ramp
+            + torch.arange(shape[1], dtype=torch.float32).view(1, 1, -1, 1)
+            + torch.arange(shape[2], dtype=torch.float32).view(1, 1, 1, -1)
+        )
+        .expand(1, *shape)
+        .contiguous()
+    )
+    sep: list[torch.Tensor] = []
+    optical_flow_lk_3d_axes(
+        [flat],
+        [flat.clone()],
+        [0, 1, 2],
+        torch.ones(3, 1),
+        n_levels=1,
+        n_iters=1,
+        window_sigma=2.0,
+        sep_out=sep,
+    )
+    c = (slice(None), slice(6, -6), slice(6, -6), slice(6, -6))
+    assert sep and float(sep[0][c].median()) < 0.05, float(sep[0][c].median())
+
+
+def test_null_axis_regress_removes_what_the_null_predicts_and_spares_what_it_does_not():
+    """Per-voxel temporal slope, not a gradient-ratio model.
+
+    The analytic version was tried first: a brightness change no motion caused is
+    explained by the minimum-norm displacement d = g dI/|g|^2, which lies along the
+    gradient and suggests the fixed coefficient g_k/g_null. That relation does not
+    survive the LK pooling window, and using it AMPLIFIED a synthetic 6% gain's
+    contamination from 0.557 to 1.003 rms instead of cancelling it.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(0)
+    shape, n_t = (6, 5, 4), 60
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 9.0)  # what the null channel sees
+    real = torch.cos(2 * torch.pi * t / 23.0)  # genuine motion, unrelated to it
+
+    null = spurious.expand(*shape, n_t) + 0.01 * torch.randn(*shape, n_t, generator=g)
+    # Each encode axis inherits the spurious part with its OWN per-voxel coefficient,
+    # which is exactly what a fixed analytic coefficient could not have handled.
+    coef = torch.linspace(0.3, 2.0, int(torch.tensor(shape).prod())).reshape(shape)
+    encoded = coef[..., None] * spurious + 0.8 * real
+
+    out = null_axis_regress([encoded.clone(), null], null_index=1)
+    resid_spur = (out[0] - 0.8 * real).abs().mean()
+    before_spur = (encoded - 0.8 * real).abs().mean()
+    # ~93% removed, not 100%: the null channel carries measurement noise, and a slope
+    # fitted to a noisy regressor is attenuated toward zero (errors-in-variables), so
+    # the subtraction always undershoots by roughly the null's noise-to-signal ratio.
+    # That is a property of the method, not of this fixture -- a noisier null channel
+    # cancels less, which is also why -pe_null_min_r2 exists.
+    assert resid_spur < 0.10 * before_spur, (resid_spur, before_spur)
+    # The real motion survives: correlation with the truth is essentially unchanged.
+    flat = out[0].reshape(-1, n_t)
+    r = torch.nn.functional.cosine_similarity(
+        flat - flat.mean(-1, keepdim=True), (real - real.mean()).expand_as(flat), dim=-1
+    )
+    assert float(r.min()) > 0.99, float(r.min())
+    # The null channel itself is passed through untouched, for diagnostics.
+    assert torch.equal(out[1], null)
+
+
+def test_null_axis_regress_min_r2_fails_closed():
+    """A null channel that explains nothing must leave the voxel alone."""
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(1)
+    shape, n_t = (4, 4, 3), 50
+    encoded = torch.randn(*shape, n_t, generator=g)
+    null = torch.randn(*shape, n_t, generator=g)  # independent noise
+    strict = null_axis_regress([encoded.clone(), null], 1, min_r2=0.5)
+    assert torch.equal(strict[0], encoded), (strict[0] - encoded).abs().max()
+    # With no floor it still subtracts the (spurious) fitted slope, which is why the
+    # floor exists.
+    loose = null_axis_regress([encoded.clone(), null], 1, min_r2=0.0)
+    assert not torch.equal(loose[0], encoded)
+
+
+def test_null_axis_regress_uses_ols_because_deming_measured_worse():
+    """Errors-in-variables is real here and correcting for it still loses.
+
+    The regressor IS an estimate, so an OLS slope is attenuated toward zero, and
+    Deming (the fit phase regression uses) is the obvious remedy. It was implemented
+    and measured worse at every noise level, including zero. Two structural reasons:
+    the objective is PREDICTION, for which OLS is minimum-MSE by construction so
+    attenuation is the correct response to a noisy regressor; and Deming treats the
+    response's variance as error, while the encode axis legitimately carries real
+    motion that is not error, so it over-removes.
+
+    This pins the OLS behaviour that replaced it: a noisier null must be trusted LESS,
+    i.e. the fitted slope shrinks rather than growing to compensate.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(4)
+    shape, n_t = (5, 4, 3), 80
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 11.0)
+    encoded = (1.4 * spurious).expand(*shape, n_t).contiguous()
+
+    removed = []
+    for noise in (0.0, 0.3):
+        null = spurious.expand(*shape, n_t) + noise * torch.randn(*shape, n_t, generator=g)
+        out = null_axis_regress([encoded.clone(), null], 1)
+        removed.append(float((encoded - out[0]).abs().mean()))
+    assert removed[0] > removed[1], removed
+
+
+def test_null_axis_regress_skip_frames_keeps_outliers_from_setting_the_slope():
+    """Pre-steady-state frames are outliers in BOTH channels, so they own the fit.
+
+    Measured on a 0.8mm run: frame 0 sat 11% above the run mean with a per-voxel gain
+    against steady state of 0.856-1.454, and the flow rms there was 1.86x the
+    steady-state level, decaying over about six frames. A least-squares slope is
+    dominated by outliers, so a handful of such frames fits the coefficient to T1
+    saturation rather than to the artifact being chased. -match localnorm reduces this
+    and cannot remove it: the gain is tissue-dependent, so it varies at tissue
+    boundaries, which is sub-window structure a local z-score leaves behind.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(2)
+    shape, n_t = (5, 4, 3), 60
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 9.0)
+    real = 0.5 * torch.cos(2 * torch.pi * t / 23.0)
+    null = spurious.expand(*shape, n_t).clone() + 0.02 * torch.randn(*shape, n_t, generator=g)
+    encoded = (1.2 * spurious + real).expand(*shape, n_t).clone()
+    # A transient in both channels at once, unrelated to the artifact being removed.
+    null[..., :5] += 6.0
+    encoded[..., :5] += 6.0
+
+    def steady_err(skip):
+        out = null_axis_regress([encoded.clone(), null.clone()], 1, skip_frames=skip)
+        return float((out[0][..., 5:] - real[5:]).abs().mean())
+
+    assert steady_err(5) < 0.1 * steady_err(0), (steady_err(5), steady_err(0))
+    # Excluded frames are still CORRECTED, not left alone: the fit skips them, the
+    # subtraction does not.
+    out = null_axis_regress([encoded.clone(), null.clone()], 1, skip_frames=5)
+    assert not torch.allclose(out[0][..., :5], encoded[..., :5])

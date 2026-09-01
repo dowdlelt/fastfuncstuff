@@ -518,11 +518,13 @@ def create_parser() -> argparse.ArgumentParser:
         " as displacement and the field diverges.\n"
         "  none       the raw residual.\n"
         "  localnorm  local z-score both sides.\n"
-        "  ngf        signed unit-gradient component along the encode axis. Invariant\n"
-        "             to a local multiplicative gain, so a BOLD response cannot enter\n"
-        "             the solve as brightness through the INTERIOR of a responding\n"
-        "             region; its boundary is still an edge no intensity transform\n"
-        "             removes. 3-D solve only.\n"
+        "  ngf        BETA. Signed unit-gradient component along the encode axis,\n"
+        "             invariant to a local multiplicative gain (drift 0.09%% under a\n"
+        "             1.25x gain, against 3.32%% for localnorm). It did NOT reduce task\n"
+        "             contamination on 0.8mm data: gradient orientation is preserved\n"
+        "             only where the response varies slowly against the anatomy, and at\n"
+        "             submillimetre it varies on the same scale. See -match_eta_q\n"
+        "             before concluding. 3-D solve only.\n"
         "  gradmag    locally-normalized gradient magnitude — edges only, the most"
         " contrast-agnostic.\n"
         "  meanstd    one global rescale.\n"
@@ -675,6 +677,55 @@ def create_parser() -> argparse.ArgumentParser:
         "Applies to single-echo AND multi-echo runs (each echo is matched against itself,"
         " over TIME). The cross-TE counterpart is -me_match. Not supported with"
         " rotation-aware mode.",
+    )
+    est.add_argument(
+        "-pe_null",
+        "-pe-null",
+        default=None,
+        metavar="DIR",
+        help="BETA — read it, do not trust it to fix anything yet.\n"
+        "Solves the UN-ENCODED axis alongside the encode axes as a null channel: an EPI\n"
+        "residual cannot be displaced along the readout direction, so whatever is\n"
+        "estimated there is spurious, measured on the same voxels and the same\n"
+        "estimator as the encode axes. The part of each encode axis that the null\n"
+        "predicts over TIME is then regressed out per voxel. The null field is never\n"
+        "applied to the data; it is written as {prefix}_flow_null.\n"
+        "WHAT ACTUALLY HAPPENS on real data: the 3-axis solve is markedly less\n"
+        "determined than the 2-axis one (separability 0.978 -> 0.880 on a 0.8mm run),\n"
+        "so real encode-plane motion leaks into the null through the aperture — it came\n"
+        "out 5x LARGER than the encode axes, the refine loop diverged a pass earlier,\n"
+        "and the correction moved task coupling only 8.9x -> 7.8x. Treat the written\n"
+        "field as a diagnostic of what the estimator invents; the regression is not\n"
+        "yet a reliable fix.\n"
+        "The direction cannot be assumed (a partition-only run leaves two candidates),\n"
+        "so name it: -pe_null RL for a readout along x. 3-D single-echo path only.",
+    )
+    est.add_argument(
+        "-pe_null_skip",
+        "-pe-null-skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="[-pe_null] Drop the first N frames from the SLOPE FIT (they are still\n"
+        "corrected). Pre-steady-state frames are outliers in the null and the encode\n"
+        "axes at once, and a least-squares slope is dominated by outliers, so a few\n"
+        "such frames set the coefficient for the whole run. Measured on a 0.8mm run:\n"
+        "frame 0 sat 11%% above the run mean with a per-voxel gain against steady state\n"
+        "of 0.856-1.454, and the flow rms there was 1.86x the steady-state level,\n"
+        "decaying over ~6 frames. -match localnorm reduces this and cannot remove it —\n"
+        "the gain is tissue-dependent, so it varies at tissue boundaries, which is\n"
+        "sub-window structure a local z-score leaves behind. Try 5-10.",
+    )
+    est.add_argument(
+        "-pe_null_min_r2",
+        "-pe-null-min-r2",
+        type=float,
+        default=0.0,
+        metavar="R2",
+        help="[-pe_null] Leave a voxel alone unless the null channel explains this\n"
+        "fraction of the encode axis's variance over time. 0 corrects everywhere.\n"
+        "Raise it when the null channel is noisy: a slope fitted to noise injects the\n"
+        "displacement the flag exists to remove.",
     )
     est.add_argument(
         "-match_eta_q",
@@ -1205,31 +1256,20 @@ def create_parser() -> argparse.ArgumentParser:
         "-warp-recon",
         default=None,
         metavar="SPEC",
-        help="Rebuild the field from its warp PCs before any output is derived. SPEC is\n"
-        "'pcs' (all components -- a no-op on its own, the useful form with -reject),\n"
-        "'pcs:N' (the top N by variance), or 'pcs:0.F' (however many components reach\n"
-        "that FRACTION of the variance, e.g. pcs:0.8 for 80%%). A value below 1 is read\n"
-        "as a fraction; it travels better between runs than a fixed count.\n"
-        "'ica' runs FastICA and SWEEPS for the rank (ica:N or ica:0.F to fix it).\n"
-        "Use it when -reject finds nothing: PCA\n"
-        "orders by VARIANCE, so contamination worth a fraction of a percent cannot\n"
-        "surface in any component, while ICA orders by independence. Measured on a\n"
-        "contaminated 0.8mm run, no principal component exceeded 1.25x enrichment or\n"
-        "0.07 correlation with the design; the best independent component reached\n"
-        "2.8-3.0x with a time course correlating 0.68. The rank has an interior\n"
-        "optimum that no variance rule locates -- 20 missed the source, 60 found it,\n"
-        "105 and 119 over-split it, and 95%% of the variance resolves to 105 -- so the\n"
-        "rank is searched for, not guessed. Rejection is then a PROJECTION of the bad\n"
-        "time courses out of the FULL-rank field, so nothing is lost to the ICA rank\n"
-        "itself; the decomposition only names what to remove.\n"
+        help="BETA. Rebuild the field from a decomposition before any output is derived.\n"
+        "SPEC: 'pcs' (all components — identity on its own, useful with -reject),\n"
+        "'pcs:N' (top N by variance), 'pcs:0.F' (components reaching that FRACTION of\n"
+        "the variance), or 'ica' (FastICA, rank SWEPT; ica:N / ica:0.F to fix it).\n"
         "Independent of -want_pcs, which only chooses how many PC time courses are\n"
-        "WRITTEN as regressors -- the reconstruction uses whatever SPEC says.\n"
-        "The leading components carry the bulk of the\n"
-        "motion; truncating denoises the warp. Whether the task rides in them is a\n"
-        "property of the RUN, not a law -- on a sparse checkerboard response it does\n"
-        "not (all five leading PCs sat BELOW chance at the task line), but a global\n"
-        "response such as a breath-hold puts it in an early component, so -reject is\n"
-        "the part to rely on.",
+        "WRITTEN — the reconstruction uses whatever SPEC says.\n"
+        "WHAT WORKS: with -reject, ICA found a genuinely task-locked component (|r|\n"
+        "0.66 with the design) and took the partition axis from 8.5x task enrichment to\n"
+        "2.1x — the primary axis barely moved. PCA found nothing at all and cannot:\n"
+        "it orders by VARIANCE, and the contamination was 0.7%% of the field's. Rejection\n"
+        "bites when the response is WIDESPREAD (a breath-hold); a sparse one is below\n"
+        "what a variance decomposition can isolate, and the run says so.\n"
+        "'pcs' truncation is lossless at full rank; ICA rejection is a PROJECTION on\n"
+        "the full-rank field, so nothing is lost to the ICA rank itself.",
     )
     task.add_argument(
         "-reject",
@@ -1241,18 +1281,11 @@ def create_parser() -> argparse.ArgumentParser:
         help="[-warp_recon] Also drop any component whose SPATIAL weights are more than\n"
         "E-fold concentrated on activated tissue (default %(default)s when given bare,\n"
         "1.0 = spread like the brain). Needs -events.\n"
-        "Scored on WHERE the weights live, not on the component's correlation with the\n"
-        "design: a block design is ~2 degrees of freedom, so a temporal correlation\n"
-        "cannot be thresholded, while an energy share against the active mask has a\n"
-        "no-relation value of 1.0 by construction and needs no null.\n"
-        "Bites when the response is WIDESPREAD (a breath-hold). A sparse response is\n"
-        "too small a share of the field's variance for PCA to isolate -- measured, the\n"
-        "contaminated voxels were 0.65%% of the mask carrying 0.70%% of the energy, and\n"
-        "no component scored above 1.25x while the field was 8.8x enriched at its tail.\n"
-        "For that case use -detask filter or -detask field; this says so at runtime.\n"
-        "The decision is per COMPONENT PER AXIS -- the temporal basis is shared, but\n"
-        "each component carries its own spatial loading on each encode axis, so one\n"
-        "can be dropped from the primary PE and kept on the partition.",
+        "Scored on WHERE the weights live, not on correlation with the design: a block\n"
+        "design is ~2 degrees of freedom, so a temporal correlation cannot be\n"
+        "thresholded, while an energy share against the active mask has a no-relation\n"
+        "value of 1.0 by construction. Per COMPONENT PER AXIS — the temporal basis is\n"
+        "shared but each component loads separately on each encode axis.",
     )
     task.add_argument(
         "-detask",
@@ -1260,25 +1293,23 @@ def create_parser() -> argparse.ArgumentParser:
         const="field",
         default=None,
         metavar="MODE",
-        help="MODE is 'field' (the default when -detask is given bare) or 'filter[:N]'.\n\n"
-        "  filter[:N]  NOTCH the task's frequency band out of the images the ESTIMATOR\n"
-        "              sees, before it runs, and resample the raw input with the\n"
-        "              resulting field. The field is then never contaminated, so\n"
-        "              nothing can bleed through the iterative solve into other frames\n"
-        "              -- which is the one thing 'field' cannot offer, since it cleans\n"
-        "              a field the task already helped produce. The band is chosen from\n"
-        "              the design's own spectrum: every line carrying at least 1%% of the\n"
-        "              strongest one. N widens it by N bins either side, for amplitude\n"
-        "              non-stationarity across blocks (adaptation, attention drift). It\n"
-        "              is NOT for HRF width -- convolution multiplies spectra, so a\n"
-        "              wider HRF narrows the design's band and can never spread energy\n"
-        "              into bins the stimulus does not occupy.\n"
-        "              Needs a near-periodic design. Onset jitter past ~0.5s of a 20s\n"
-        "              period costs bins fast (1 bin at 0.25s, 7 at 1s, 14 at 2s); a\n"
-        "              design costing over 15%% of the spectrum WARNS (bulk motion is\n"
-        "              spectrally broad, so a wide notch may still be fine -- check the\n"
-        "              field still tracks motion) and over 50%% is REFUSED. Several\n"
-        "              conditions are fine -- the cost scales with the number of\n"
+        help="MODE is 'field' (bare -detask) or 'filter[:N]'.\n\n"
+        "  filter[:N]  NOTCH the design's frequency band out of the images the\n"
+        "              ESTIMATOR sees, before it runs, then resample the raw input with\n"
+        "              the resulting field — so the field is never contaminated and\n"
+        "              nothing bleeds through the solve into other frames. The band is\n"
+        "              every line carrying at least 1%% of the strongest; N widens it by\n"
+        "              N bins either side (for amplitude drift across blocks, NOT for\n"
+        "              HRF width — a wider HRF narrows the design's band).\n"
+        "              THE WORKING FIX, and only for a near-periodic BLOCK design.\n"
+        "              Onset jitter past ~0.5s of a 20s period costs bins fast (1 bin\n"
+        "              at 0.25s, 7 at 1s, 14 at 2s), the run needs a whole number of\n"
+        "              cycles, over 15%% of the spectrum warns and over 50%% is refused.\n"
+        "              A jittered event-related design is broadband and cannot be\n"
+        "              notched — that is a limit of the METHOD, not evidence such a\n"
+        "              design is free of the contamination. Nothing here establishes\n"
+        "              that; use -events without -detask to measure it first.\n"
+        "              Several conditions are fine: the cost scales with the number of\n"
         "              distinct PERIODS, not conditions.\n\n"
         "  field       REMOVE the task-locked part of the field, keeping drift and everything "
         "else, and derive EVERY output from the cleaned field — warp, corrected series, "
@@ -3563,6 +3594,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             file=sys.stderr,
         )
         return 2
+    null_axis = resolve_pe_axis(args.pe_null) if args.pe_null else None
     pe1_list = [resolve_pe_axis(d) for d in (args.pe_dir or [])]
     if len(pe1_list) > 2:
         print(f"❌ -pe_dir takes 1 or 2 directions, got {len(pe1_list)}.", file=sys.stderr)
@@ -3976,6 +4008,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             window_sigma=args.window,
             pe_only=pe_only,
             dual=dual,
+            null_axis=null_axis,
+            null_min_r2=args.pe_null_min_r2,
+            null_skip=args.pe_null_skip,
             max_shift=args.max_shift,
             trial_step=args.xcorr_step,
             patch=args.patch,
@@ -4168,6 +4203,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 fpath = f"{stem}_flow_{label}{ext}"
                 with spinner(f"Writing {Path(fpath).name}"):
                     save_nifti(field.numpy(), fpath, affine=affine)
+            if result.null_field is not None:
+                # The un-encoded axis, as estimated and BEFORE it was regressed out.
+                # It is the diagnostic the whole flag rests on: an axis that cannot
+                # physically move, so whatever is here is what the estimator invented.
+                npath = f"{stem}_flow_null{ext}"
+                with spinner(f"Writing {Path(npath).name}"):
+                    save_nifti(result.null_field.numpy(), npath, affine=affine)
         elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
