@@ -3345,14 +3345,18 @@ def _run_multiecho(
         # band-filtered too. Re-derive it from the untouched input with the same field.
         from fastfuncstuff.processing.locomoco import resample_from_raw
 
-        result.per_echo[0] = resample_from_raw(
-            result.per_echo[0],
-            datas[0],
-            warp_interp=args.warp_interp,
-            warp_radius=args.warp_radius,
-            device=device,
-            desc="notch resample",
-        )
+        # EVERY echo, not just the first. Each per-echo series was warped from the
+        # band-filtered copy the estimator saw, so re-deriving only echo 1 would ship
+        # one raw-derived echo alongside E-1 notched ones.
+        for j, res_j in enumerate(result.per_echo):
+            result.per_echo[j] = resample_from_raw(
+                res_j,
+                datas[j],
+                warp_interp=args.warp_interp,
+                warp_radius=args.warp_radius,
+                device=device,
+                desc=f"notch resample e{j + 1}",
+            )
 
     print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
@@ -3361,9 +3365,21 @@ def _run_multiecho(
         if not args.no_warp:
             from fastfuncstuff.processing.medic import save_medic_warp
 
-            axis, disp = res.warp_components()[0]
+            # EVERY component, exactly as the single-echo path does. A dual-encode or
+            # rotation-aware result carries 2-3 axes, and writing only the first ships a
+            # warp that silently omits one of them -- the corrected series would be
+            # right while the saved warp, the thing applied to other data, is not.
+            (primary_axis, primary_disp), *rest = res.warp_components()
             with spinner(f"Writing {Path(estem).name}_warp{ext}"):
-                save_medic_warp(disp, axis, affine, estem, nii_ext=ext, as_5d=as_5d)
+                save_medic_warp(
+                    primary_disp,
+                    primary_axis,
+                    affine,
+                    estem,
+                    nii_ext=ext,
+                    as_5d=as_5d,
+                    extra_components=[(d, a) for a, d in rest],
+                )
         # Materialized once per echo for both the write and the QC maps below --
         # see the single-echo block for why the repeat call is not free.
         want_corrected = not args.no_corrected or (_want_qc(args) and _want_corrected_qc(args))
@@ -3402,7 +3418,11 @@ def _run_multiecho(
     # construction, and the partition law is normalised to echo 1), so its per-echo
     # fields ARE the shared fields — the coupling measured on it is the shared-field
     # coupling, not one echo's view of it.
-    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, datas[0])
+    # The echo MEAN, for the same reason the task diagnostic below uses it: the brain
+    # mask this derives is a tissue mask, and the shortest echo gives the weakest
+    # contrast to build it from.
+    echo_mean = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
+    _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, echo_mean)
 
     if args.events and tr_sec:
         # The SHARED field, because the coupling question is about the one field every
@@ -3412,7 +3432,7 @@ def _run_multiecho(
         # and gives the poorest "where the task is" mask, which is what the enrichment
         # statistic is scored against. A plain mean is most of the win; a TE-weighted
         # optimal combination would be the refinement.
-        task_data = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
+        task_data = echo_mean
         if len(datas) > 1:
             print(f"   ⚗️  task diagnostic: data map from the mean of {len(datas)} echoes")
         _write_task_diagnostics(result.per_echo[0], task_data, stem, ext, affine, args, tr_sec)
