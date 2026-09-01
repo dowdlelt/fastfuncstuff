@@ -2252,6 +2252,7 @@ def pc_reconstruct_result(
     keep: dict,
     n_pcs=None,
     *,
+    rebuilt=None,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     device: torch.device | None = None,
@@ -2271,8 +2272,9 @@ def pc_reconstruct_result(
     """
     from dataclasses import replace
 
-    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
-    rebuilt = warp_pc_reconstruct(comps, keep, n_pcs=n_pcs, device=device)
+    if rebuilt is None:
+        comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+        rebuilt = warp_pc_reconstruct(comps, keep, n_pcs=n_pcs, device=device)
     if rebuilt is None:
         return result, "the warp is empty -- nothing to reconstruct"
 
@@ -6473,6 +6475,114 @@ def refine_interecho_temporally(
     )
 
 
+def _warp_matrix(components, device=None, dtype=torch.float64):
+    """``(x, mean, xc, shapes, axes, widths)`` — the axes' fields as one ``(T, S)`` matrix.
+
+    Shared by the PCA and ICA decompositions so both see exactly the same columns in
+    the same order; the per-axis split on the way out is then just a column range.
+    """
+    mats, shapes, axes = [], [], []
+    for axis, disp in components:
+        if float(disp.abs().max()) == 0.0:
+            continue
+        t = disp.shape[-1]
+        mats.append(disp.contiguous().reshape(-1, t).T.contiguous())  # (T, spatial)
+        shapes.append(tuple(disp.shape[:3]))
+        axes.append(axis)
+    if not mats:
+        return None
+    widths = [m.shape[1] for m in mats]
+    x = torch.cat(mats, dim=1).to(dtype)
+    if device is not None:
+        x = x.to(device)
+    mean = x.mean(dim=0, keepdim=True)
+    return x, mean, x - mean, shapes, axes, widths
+
+
+def _split_loadings(load, mean, shapes, axes, widths, k):
+    """``(k, S)`` loadings and a ``(1, S)`` mean back into per-axis 4-D / 3-D blocks."""
+    loadings, means, start = [], [], 0
+    for axis, shape, w in zip(axes, shapes, widths, strict=True):
+        block = load[:, start : start + w].T.reshape(*shape, k)
+        loadings.append((axis, block.contiguous().cpu()))
+        means.append(mean[0, start : start + w].reshape(shape).contiguous().cpu())
+        start += w
+    return loadings, means
+
+
+def warp_reconstruct(basis, loadings, means, keep):
+    """``mean + basis[:, keep] @ loading[keep]`` per axis — one formula for PCA and ICA.
+
+    The two decompositions differ only in what the pair means. For PCA ``basis`` is the
+    orthonormal temporal factor and the loading is its projection, so the product is an
+    orthogonal projection onto the kept components. For ICA ``basis`` is the mixing
+    matrix and the loading is the independent spatial map, so the product is the same
+    sum of outer products with a non-orthogonal basis. Either way, reconstruction is
+    "add back the components you kept", and the per-voxel temporal MEAN is always
+    restored -- it is not a component, and dropping it would move every voxel by its
+    own average displacement.
+    """
+    out = []
+    for (axis, load), mean in zip(loadings, means, strict=True):
+        k_all = load.shape[-1]
+        idx = sorted(set(keep.get(axis, range(k_all))))
+        shape = tuple(load.shape[:3])
+        n_t = basis.shape[0]
+        if idx:
+            sel = torch.tensor(idx, dtype=torch.long)
+            recon = (load.reshape(-1, k_all)[:, sel] @ basis[:, sel].T).reshape(*shape, n_t)
+        else:
+            recon = torch.zeros(*shape, n_t, dtype=load.dtype)
+        out.append((axis, (recon + mean[..., None]).float()))
+    return out
+
+
+def warp_ica_basis(components, n_components=None, pca_components=0.95, device=None):
+    """Independent spatial components of a per-frame warp, in the same shape as the PCs.
+
+    Returns ``(mixing (T,k), loadings [(axis, (nx,ny,nz,k))], means, var_ratio_or_None)``
+    -- deliberately the tuple :func:`warp_pc_basis` returns, so :func:`warp_reconstruct`
+    and the rejection scorer take either without a branch.
+
+    Why ICA is here at all. PCA orders by VARIANCE, so contamination worth a fraction
+    of a percent of the field cannot surface in any component. Measured on a 0.8mm
+    checkerboard run whose field was 8.8x task-enriched at its tail: no principal
+    component exceeded 1.25x enrichment or 0.07 correlation with the design, while the
+    best INDEPENDENT component reached 2.8-3.0x enrichment with a timecourse
+    correlating 0.68 with the design. Independence is not variance, and that is the
+    whole difference.
+
+    The rank matters and has an interior optimum -- 20 components missed it (1.75x),
+    60 found it (2.79x), the full 119 over-split it back down (2.27x). ``pca_components``
+    is therefore a real knob and not a formality; it defaults to a variance fraction
+    rather than a count so it travels between runs.
+    """
+    from ..decomposition.ica import FastICA
+
+    built = _warp_matrix(components, device=device, dtype=torch.float32)
+    if built is None:
+        return None
+    x, mean, _xc, shapes, axes, widths = built
+    ica = FastICA(
+        n_components=n_components,
+        pca_components=pca_components,
+        random_state=0,
+        device=device,
+    )
+    ica.fit_transform(x)
+    if ica.components_ is None or ica.mixing_ is None:
+        raise RuntimeError("FastICA returned no components for the warp field")
+    load = ica.components_.to(torch.float64).cpu()  # (k, S) independent spatial maps
+    mixing = ica.mixing_.to(torch.float64).cpu()  # (T, k) their time courses
+    k = load.shape[0]
+    loadings, means = _split_loadings(load, mean.double().cpu(), shapes, axes, widths, k)
+    # ICA components are not variance-ordered and carry no eigenvalue, so the share of
+    # the field each one explains is measured directly rather than read off a spectrum.
+    energy = (load**2).sum(dim=1) * (mixing**2).sum(dim=0)
+    var = energy / energy.sum().clamp(min=1e-30)
+    return mixing, loadings, means, var
+
+
 def warp_pc_basis(components, n_pcs=None, device=None):
     """Shared temporal PCs of a per-frame warp, WITH the per-axis spatial loadings.
 
@@ -6493,23 +6603,11 @@ def warp_pc_basis(components, n_pcs=None, device=None):
     kept on the other. Returns ``(scores (T,k), loadings [(axis, (nx,ny,nz,k))],
     means [(nx,ny,nz)], var_ratio (k,))``, or None if the warp is empty.
     """
-    mats, shapes, axes = [], [], []
-    for axis, disp in components:
-        if float(disp.abs().max()) == 0.0:
-            continue
-        t = disp.shape[-1]
-        mats.append(disp.contiguous().reshape(-1, t).T.contiguous())  # (T, spatial)
-        shapes.append(tuple(disp.shape[:3]))
-        axes.append(axis)
-    if not mats:
+    built = _warp_matrix(components, device=device)
+    if built is None:
         return None
-    widths = [m.shape[1] for m in mats]
-    x = torch.cat(mats, dim=1).double()
-    if device is not None:
-        x = x.to(device)
+    x, mean, xc, shapes, axes, widths = built
     n_t = x.shape[0]
-    mean = x.mean(dim=0, keepdim=True)
-    xc = x - mean
     # Economy SVD on (T, S) with T ~ 100 and S in the millions: the left factor is what
     # we want and torch computes it without ever forming an S x S covariance.
     u, sv, _ = torch.linalg.svd(xc, full_matrices=False)
@@ -6519,12 +6617,7 @@ def warp_pc_basis(components, n_pcs=None, device=None):
     var = (sv[:k] ** 2) / (sv**2).sum().clamp(min=1e-30)
 
     load = u.T @ xc  # (k, S) -- component loadings over the pooled columns
-    loadings, means, start = [], [], 0
-    for axis, shape, w in zip(axes, shapes, widths, strict=True):
-        block = load[:, start : start + w].T.reshape(*shape, k)
-        loadings.append((axis, block.contiguous().cpu()))
-        means.append(mean[0, start : start + w].reshape(shape).contiguous().cpu())
-        start += w
+    loadings, means = _split_loadings(load, mean, shapes, axes, widths, k)
     return u.cpu(), loadings, means, var.cpu()
 
 
@@ -6540,19 +6633,7 @@ def warp_pc_reconstruct(components, keep, n_pcs=None, device=None):
     if got is None:
         return None
     u, loadings, means, _var = got
-    out = []
-    for (axis, load), mean in zip(loadings, means, strict=True):
-        idx = sorted(set(keep.get(axis, range(u.shape[1]))))
-        shape = tuple(load.shape[:3])
-        if idx:
-            sel = torch.tensor(idx, dtype=torch.long)
-            recon = (load.reshape(-1, load.shape[-1])[:, sel] @ u[:, sel].T).reshape(
-                *shape, u.shape[0]
-            )
-        else:
-            recon = torch.zeros(*shape, u.shape[0], dtype=load.dtype)
-        out.append((axis, (recon + mean[..., None]).float()))
-    return out
+    return warp_reconstruct(u, loadings, means, keep)
 
 
 def warp_time_pcs(

@@ -767,13 +767,17 @@ def test_cli_detask_filter_actually_reaches_the_estimator(tmp_path):
 def test_parse_warp_recon_specs():
     from fastfuncstuff.cli.locomoco import parse_warp_recon
 
-    assert parse_warp_recon(None) == (None, None)
-    assert parse_warp_recon("pcs") == (None, None)
-    assert parse_warp_recon("pcs:all") == (None, None)
-    assert parse_warp_recon("pcs:5") == (5, None)
+    assert parse_warp_recon(None) == (None, None, None)
+    assert parse_warp_recon("pcs") == (None, None, "pcs")
+    assert parse_warp_recon("pcs:all") == (None, None, "pcs")
+    assert parse_warp_recon("pcs:5") == (5, None, "pcs")
     # Below 1 is a variance FRACTION -- unambiguous, since a count below 1 is meaningless.
-    assert parse_warp_recon("pcs:0.8") == (None, 0.8)
-    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5"):
+    assert parse_warp_recon("pcs:0.8") == (None, 0.8, "pcs")
+    # ICA has no natural "all": it needs a rank to reduce to, so bare 'ica' is 95%.
+    assert parse_warp_recon("ica") == (None, 0.95, "ica")
+    assert parse_warp_recon("ica:60") == (60, None, "ica")
+    assert parse_warp_recon("ica:0.9") == (None, 0.9, "ica")
+    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5", "ica:x"):
         with pytest.raises(ValueError):
             parse_warp_recon(bad)
 
@@ -885,3 +889,64 @@ def test_write_pc_maps_is_one_4d_file_per_axis_with_labels(tmp_path):
     table = (tmp_path / "out_pcmap_scores.1D").read_text().splitlines()
     assert table[0].startswith("# component") and "pe1" in table[0] and "pe2" in table[0]
     assert len(table) == 5  # header + 4 components
+
+
+def test_warp_ica_basis_finds_what_pca_structurally_cannot():
+    """ICA orders by independence, PCA by variance — and that is the whole difference.
+
+    The bug of record is not a bug but a limit: contamination worth a fraction of a
+    percent of the field cannot dominate any PRINCIPAL component, so -reject saw
+    nothing on a run whose field was 8.8x task-enriched at its tail. Measured there, no
+    PC exceeded 1.25x enrichment or 0.07 correlation with the design, while the best
+    independent component reached 2.8-3.0x at 0.68. This pins the same contrast on a
+    planted case, where the planted source is deliberately low-variance.
+    """
+    from fastfuncstuff.processing.locomoco import (
+        warp_ica_basis,
+        warp_pc_basis,
+        warp_reconstruct,
+    )
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 80, (12, 12, 6)
+    t = np.arange(n_t)
+    resp = np.sin(2 * np.pi * 3 * t / n_t)  # brain-wide, high variance
+    task = np.sin(2 * np.pi * 10 * t / n_t)
+    blob = np.zeros(shape, bool)
+    blob[3:7, 3:7, 2:4] = True
+    f1 = rng.normal(0, 0.05, (*shape, n_t)) + 0.5 * resp
+    f2 = rng.normal(0, 0.05, (*shape, n_t)) + 0.3 * resp
+    f1 += 0.8 * blob[..., None] * task
+    comps = [(1, torch.tensor(f1)), (2, torch.tensor(f2))]
+    mask, active = torch.ones(shape), torch.tensor(blob)
+
+    def best_score(basis, loadings):
+        k = basis.shape[1]
+        scores = [
+            map_enrichment(loadings[0][1][..., i], active, mask)["enrichment"] for i in range(k)
+        ]
+        i = int(np.argmax(scores))
+        tc = basis[:, i].numpy() - basis[:, i].numpy().mean()
+        x = task - task.mean()
+        denom = np.linalg.norm(tc) * np.linalg.norm(x)
+        return scores[i], abs(float(tc @ x / denom)) if denom > 0 else 0.0
+
+    ica = warp_ica_basis(comps, pca_components=0.95, device=torch.device("cpu"))
+    assert ica is not None
+    e_ica, r_ica = best_score(ica[0], ica[1])
+    assert e_ica > 5.0, e_ica
+    assert r_ica > 0.8, r_ica
+
+    # Reconstruction shares one formula with the PC path, and is LOSSY here by
+    # construction: the PCA rank is chosen before the rotation, so 5% of the variance is
+    # already gone. That is the trade the flag's help spells out.
+    full = warp_reconstruct(ica[0], ica[1], ica[2], keep={})
+    resid = float((full[0][1] - torch.tensor(f1, dtype=torch.float32)).pow(2).mean().sqrt())
+    assert resid < 0.5 * float(np.std(f1)), resid
+
+    # The PC basis at full rank round-trips exactly, unlike ICA.
+    pcs = warp_pc_basis(comps, device=torch.device("cpu"))
+    assert pcs is not None
+    exact = warp_reconstruct(pcs[0], pcs[1], pcs[2], keep={})
+    assert torch.allclose(exact[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)

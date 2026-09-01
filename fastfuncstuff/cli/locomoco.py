@@ -1209,6 +1209,17 @@ def create_parser() -> argparse.ArgumentParser:
         "'pcs:N' (the top N by variance), or 'pcs:0.F' (however many components reach\n"
         "that FRACTION of the variance, e.g. pcs:0.8 for 80%%). A value below 1 is read\n"
         "as a fraction; it travels better between runs than a fixed count.\n"
+        "'ica' runs FastICA over a PCA reduction (default 95%% of the variance;\n"
+        "ica:N or ica:0.F to set the rank). Use it when -reject finds nothing: PCA\n"
+        "orders by VARIANCE, so contamination worth a fraction of a percent cannot\n"
+        "surface in any component, while ICA orders by independence. Measured on a\n"
+        "contaminated 0.8mm run, no principal component exceeded 1.25x enrichment or\n"
+        "0.07 correlation with the design; the best independent component reached\n"
+        "2.8-3.0x with a time course correlating 0.68. The rank has an interior\n"
+        "optimum (20 missed it, 60 found it, 119 over-split it), and unlike 'pcs' the\n"
+        "reconstruction is LOSSY -- the PCA rank is set before the rotation, so the\n"
+        "discarded variance is gone even with nothing rejected. The residual against\n"
+        "the original field is reported so that cost is visible.\n"
         "Independent of -want_pcs, which only chooses how many PC time courses are\n"
         "WRITTEN as regressors -- the reconstruction uses whatever SPEC says.\n"
         "The leading components carry the bulk of the\n"
@@ -1934,74 +1945,93 @@ def _pc_task_correlation(components, design, polort) -> float:
 
 
 def parse_warp_recon(value):
-    """``-warp_recon`` SPEC -> ``(count, variance_fraction)``, either of which may be None.
+    """``-warp_recon`` SPEC -> ``(count, variance_fraction, method)``.
 
-    ``pcs`` / ``pcs:all`` keep everything, ``pcs:N`` keeps N by variance rank, and
-    ``pcs:0.8`` keeps however many components it takes to reach 80% of the variance.
-    A value below 1 is read as a FRACTION, which is unambiguous because an integer
-    count below 1 is meaningless -- and it is the more portable request, since the
-    number of components worth keeping is a property of the run, not a constant.
+    ``pcs`` keeps every principal component (exact), ``pcs:N`` the top N, ``pcs:0.8``
+    however many reach 80% of the variance. ``ica`` runs FastICA over a PCA reduction
+    that defaults to 95% of the variance, ``ica:N`` / ``ica:0.F`` set that rank
+    explicitly.
+
+    A value below 1 is read as a FRACTION, which is unambiguous because a count below
+    1 is meaningless, and it is the more portable request -- the number of components
+    worth keeping is a property of the run, not a constant.
     """
     if value is None:
-        return None, None
+        return None, None, None
     text = str(value).strip().lower()
-    if text in ("pcs", "pcs:all"):
-        return None, None
-    if text.startswith("pcs:"):
-        tail = text.split(":", 1)[1]
-        try:
-            num = float(tail)
-        except ValueError:
-            raise ValueError(
-                f"-warp_recon pcs:N needs an integer, a variance fraction below 1, or "
-                f"'all', got {tail!r}"
-            ) from None
-        if num <= 0:
-            raise ValueError(f"-warp_recon pcs:N needs a positive value, got {tail!r}")
-        if num < 1:
-            return None, num
-        if float(num).is_integer():
-            return int(num), None
+    method, _, tail = text.partition(":")
+    if method not in ("pcs", "ica"):
+        raise ValueError(f"-warp_recon SPEC must start with 'pcs' or 'ica', got {value!r}")
+    # ICA has no natural "all": it needs a rank to reduce to, and the full rank
+    # over-splits (measured: 60 components found the task source, 119 lost it again).
+    if tail in ("", "all"):
+        return None, (0.95 if method == "ica" else None), method
+    try:
+        num = float(tail)
+    except ValueError:
         raise ValueError(
-            f"-warp_recon pcs:{tail} is ambiguous: below 1 is a variance fraction, "
-            "1 or more must be a whole number of components."
-        )
-    raise ValueError(f"-warp_recon SPEC must be 'pcs', 'pcs:N' or 'pcs:0.F', got {value!r}")
+            f"-warp_recon {method}:N needs an integer, a variance fraction below 1, or "
+            f"'all', got {tail!r}"
+        ) from None
+    if num <= 0:
+        raise ValueError(f"-warp_recon {method}:N needs a positive value, got {tail!r}")
+    if num < 1:
+        return None, num, method
+    if float(num).is_integer():
+        return int(num), None, method
+    raise ValueError(
+        f"-warp_recon {method}:{tail} is ambiguous: below 1 is a variance fraction, "
+        "1 or more must be a whole number of components."
+    )
 
 
 def _warp_recon_stage(result, data, args, resp, mask, device):
-    """Rebuild the field from its warp PCs, optionally dropping task-loaded components.
+    """Rebuild the field from a warp decomposition, dropping task-loaded components.
 
-    ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly
-    the active mask the coupling report was computed on -- the alternative, a second
+    ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly the
+    active mask the coupling report was computed on -- the alternative, a second
     threshold chosen here, would let the report and the fix disagree about where the
     task is.
     """
-    from fastfuncstuff.processing.locomoco import pc_reconstruct_result, warp_pc_basis
+    import numpy as np
+
+    from fastfuncstuff.processing.locomoco import (
+        pc_reconstruct_result,
+        warp_ica_basis,
+        warp_pc_basis,
+        warp_reconstruct,
+    )
     from fastfuncstuff.stats.task_coupling import map_enrichment
 
-    n_pcs, var_frac = parse_warp_recon(args.warp_recon)
-    got = warp_pc_basis(
-        [(ax, f) for _, ax, f in result.pe_displacements()],
-        n_pcs=None if var_frac is not None else n_pcs,
-        device=device,
-    )
+    n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
+    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+
+    if method == "ica":
+        got = warp_ica_basis(
+            comps,
+            n_components=n_pcs,
+            pca_components=n_pcs if var_frac is None else var_frac,
+            device=device,
+        )
+    else:
+        got = warp_pc_basis(comps, n_pcs=None if var_frac is not None else n_pcs, device=device)
     if got is None:
         print("  ⚠️  -warp_recon: the warp is empty — nothing to reconstruct.")
         return result
-    u, loadings, _means, var = got
-    if var_frac is not None:
-        # Cumulative over the FULL basis, so the fraction means what it says rather than
-        # a fraction of some earlier truncation.
+    basis, loadings, means, var = got
+
+    if method == "pcs" and var_frac is not None:
+        # Cumulative over the FULL basis, so the fraction means what it says rather
+        # than a fraction of some earlier truncation.
         n_pcs = int(torch.searchsorted(torch.cumsum(var, 0), float(var_frac)).item()) + 1
-        n_pcs = max(1, min(n_pcs, u.shape[1]))
-        u, var = u[:, :n_pcs].contiguous(), var[:n_pcs]
+        n_pcs = max(1, min(n_pcs, basis.shape[1]))
+        basis, var = basis[:, :n_pcs].contiguous(), var[:n_pcs]
         loadings = [(ax, load[..., :n_pcs].contiguous()) for ax, load in loadings]
         print(
             f"  -warp_recon pcs:{var_frac:g} → {n_pcs} component(s) reach "
             f"{float(var.sum()):.1%} of the variance"
         )
-    k = u.shape[1]
+    k = basis.shape[1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
 
     keep, dropped, best = {}, {}, 0.0
@@ -2014,8 +2044,9 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
         keep[axis] = idx
 
-    kept_txt = f"top {k}" if n_pcs is not None else f"all {k}"
-    print(f"  ── warp PC reconstruction ({kept_txt} components, shared temporal basis) ──")
+    how = "independent components" if method == "ica" else "principal components"
+    span = f"top {k}" if (n_pcs is not None or method == "ica") else f"all {k}"
+    print(f"  ── warp reconstruction ({span} {how}, shared temporal basis) ──")
     for axis, _load in loadings:
         lbl = label_of.get(axis, f"axis{axis}")
         drops = dropped.get(axis, [])
@@ -2030,34 +2061,67 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             )
         else:
             print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
-    shown = min(5, k)
-    print(
-        f"    leading {shown} of {k} components by variance: "
-        f"{', '.join(f'{v:.1%}' for v in var[:shown].tolist())}"
-        f" (cumulative over all {k}: {float(var.sum()):.1%})"
-    )
+
+    rebuilt = warp_reconstruct(basis, loadings, means, keep)
+    # What the truncation actually cost, measured rather than inferred from a variance
+    # ratio: an ICA rank is set BEFORE the rotation, so its reconstruction is lossy even
+    # with nothing rejected, and a user comparing runs needs that number.
+    for (axis, new_f), (_, old_f) in zip(rebuilt, comps, strict=True):
+        lbl = label_of.get(axis, f"axis{axis}")
+        o = old_f.float()
+        resid = float((new_f - o).pow(2).mean().sqrt())
+        print(
+            f"    {lbl}: rms {float(o.std()):.4f} → {float(new_f.std()):.4f} vox, "
+            f"residual vs the original field {resid:.4f} vox "
+            f"({resid / max(float(o.std()), 1e-9) * 100:.1f}%)"
+        )
+
     if args.reject is not None and not any(dropped.values()):
         # A no-op here is a RESULT, not silence. PCA maximises variance, so a
         # contamination that is a small share of the field's energy cannot dominate any
         # component -- measured on a 0.8mm checkerboard run, the contaminated voxels
-        # were 0.65% of the mask carrying 0.70% of the field's energy, and no component
-        # scored above 1.25x while the field itself was 8.8x enriched at the tail.
-        # Lowering the threshold does not reach it; it starts dropping real motion.
+        # were 0.65% of the mask carrying 0.70% of the field's energy, and no principal
+        # component scored above 1.25x while the field itself was 8.8x enriched at the
+        # tail. ICA is not variance-ordered and does better on that run (2.8-3.0x), so
+        # it is the thing to try before giving up on a decomposition.
+        extra = (
+            " Try -warp_recon ica, which is not variance-ordered and reached 2.8-3.0x "
+            "where PCA reached 1.25x on a real contaminated run."
+            if method == "pcs"
+            else ""
+        )
         print(
             f"    ⓘ  no component's weights are concentrated on active tissue "
             f"(strongest {best:.2f}x vs the {args.reject:g}x cut). If the diagnostic "
-            "above says CONTAMINATION, this is the expected answer for a SPARSE "
-            "response: it is too small a share of the field's variance for PCA to "
-            "isolate. Use -detask filter (block designs) or -detask field instead. "
-            "Rejection bites when the response is widespread — a breath-hold, say — "
-            "which is the case where truncation alone does not."
+            "above says CONTAMINATION, the response is likely too SPARSE to isolate: "
+            "it is a small share of the field's variance." + extra + " Otherwise use "
+            "-detask filter (block designs) or -detask field."
         )
+    if args.reject is not None and any(dropped.values()) and resp is not None:
+        # The design correlation of what was dropped, as corroboration. It cannot be
+        # thresholded (a block design is ~2 DoF) but a dropped component whose time
+        # course tracks the design is much easier to believe.
+        design = getattr(args, "_task_design", None)
+        if design is not None:
+            x = np.asarray(design)[:, 0]
+            x = x - x.mean()
+            for axis, drops in dropped.items():
+                if not drops:
+                    continue
+                lbl = label_of.get(axis, f"axis{axis}")
+                cs = []
+                for i, _e in drops[:4]:
+                    tc = basis[:, i].numpy()
+                    tc = tc - tc.mean()
+                    d = np.linalg.norm(tc) * np.linalg.norm(x)
+                    cs.append(f"#{i} |r|={abs(float(tc @ x / d)) if d > 0 else 0:.2f}")
+                print(f"    {lbl} dropped components vs the design: {', '.join(cs)}")
 
     out, note = pc_reconstruct_result(
         result,
         data,
         keep,
-        n_pcs=n_pcs,
+        rebuilt=rebuilt,
         warp_interp=args.warp_interp,
         warp_radius=args.warp_radius,
         device=device,
@@ -2157,6 +2221,7 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
             print("  ⚠️  -warp_recon NOT applied — the outputs below are the ORIGINAL field.")
         return result
 
+    args._task_design = design
     if args.write_pc_maps is not None:
         _write_pc_maps(result, stem, ext, affine, args, resp, mask, device)
 
