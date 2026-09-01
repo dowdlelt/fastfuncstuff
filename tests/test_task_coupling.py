@@ -19,8 +19,11 @@ from fastfuncstuff.stats.task_coupling import (
     co_location,
     contamination_slope,
     default_polort,
+    design_notch_bins,
     enrichment_curve,
+    filter_task_band,
     format_task_coupling_report,
+    notch_basis,
     pe_gradient,
     responding_mask,
     task_coupling,
@@ -349,7 +352,6 @@ def test_detask_result_rebuilds_the_corrected_series_from_raw():
     n_t = 60
     nx, ny, nz = 8, 8, 4
     x = _block_design(n_t, block=10)
-    xt = x[:, 0]
     rng = np.random.default_rng(0)
     data = rng.normal(100, 10, (nx, ny, nz, n_t)).astype(np.float32)
 
@@ -572,3 +574,79 @@ def test_verdict_flags_contamination_the_median_statistic_missed():
 
     assert "CONTAMINATION" in report(contaminated)
     assert "CONTAMINATION" not in report(innocent)
+
+
+def test_notch_selects_one_line_for_a_block_design_not_a_shoulder():
+    """Peak-relative, not median-relative — the bug this rule was rewritten to avoid.
+
+    A 15-cycle 20s block design puts 91% of its power in ONE bin. Contrast against the
+    median bin was the first rule and is not equivalent: the median sits ~2000x below
+    the fundamental, so a 10x-the-median cut lands inside the low-frequency shoulder
+    that drift removal leaves behind and selects nine bins instead of one.
+    """
+    n_t, tr, period = 120, 2.5, 20.0
+    box = np.zeros(int(n_t * tr / 0.1))
+    for on in range(10, int(n_t * tr), int(period)):
+        box[int(on / 0.1) : int((on + period / 2) / 0.1)] = 1.0
+    k = np.exp(-np.arange(0, 320) / 30.0)
+    conv = np.convolve(box, k / k.sum())[: len(box)]
+    design = torch.tensor(conv[(np.arange(n_t) * tr / 0.1).astype(int)])[:, None]
+
+    bins, info = design_notch_bins(design, polort=3)
+    fundamental = int(round(n_t * tr / period))  # 15 cycles over the run
+    assert fundamental in bins
+    # The shoulder is what the median-contrast rule wrongly swept up. Every kept bin
+    # must be the fundamental or one of its harmonics, never the low-frequency skirt.
+    assert not any(1 <= b < fundamental for b in bins), bins
+    assert all(b % fundamental == 0 for b in bins), bins
+    assert info["spectrum_frac"] < 0.05
+    assert notch_basis(n_t, bins, polort=3).shape[1] == 2 * len(bins)
+
+    # widen adds sidebands, for amplitude non-stationarity across blocks -- not for
+    # HRF width, which can only narrow the design's spectrum.
+    wide, _ = design_notch_bins(design, polort=3, widen=1)
+    assert set(wide) == {b + d for b in bins for d in (-1, 0, 1)}
+    assert notch_basis(n_t, wide, polort=3).shape[1] == 2 * len(wide)
+
+
+def test_notch_refuses_a_broadband_design_instead_of_eating_the_data():
+    """A jittered event-related design has no line to notch; saying so beats notching."""
+    rng = np.random.default_rng(0)
+    hi = np.zeros(120)
+    for onset in rng.uniform(0, 290, 40):
+        hi[int(onset / 2.5)] = 1.0
+    k = np.exp(-np.arange(0, 12) / 3.0)
+    design = torch.tensor(np.convolve(hi, k / k.sum())[:120])[:, None]
+    with pytest.raises(ValueError, match="broadband"):
+        design_notch_bins(design, polort=3)
+
+
+def test_filter_task_band_removes_the_line_and_keeps_the_drift():
+    """The split that matters: the task line goes, a slow drift stays.
+
+    A drifting displacement is real residual motion -- the same reason project_task_out
+    fits the polynomials but does not subtract them.
+    """
+    n_t = 120
+    t = np.arange(n_t)
+    design = torch.tensor(np.cos(2 * np.pi * 15 * t / n_t))[:, None]
+    drift = 3.0 * np.linspace(-1, 1, n_t) ** 2
+    rng = np.random.default_rng(1)
+    series = torch.tensor(
+        drift + 2.0 * np.cos(2 * np.pi * 15 * t / n_t) + rng.normal(0, 0.1, (4, 4, 3, n_t))
+    )
+
+    bins, _ = design_notch_bins(design, polort=3)
+    basis = notch_basis(n_t, bins, polort=3)
+    out = filter_task_band(series, basis)
+
+    def line_power(x):
+        v = np.asarray(x).reshape(-1, n_t)
+        return float((np.abs(np.fft.rfft(v, axis=1))[:, 15] ** 2).mean())
+
+    assert line_power(out) < 1e-3 * line_power(series)
+    # The drift survives: correlation of each voxel's mean-removed course with it.
+    d = drift - drift.mean()
+    kept = np.asarray(out).reshape(-1, n_t).mean(0)
+    kept = kept - kept.mean()
+    assert float(np.corrcoef(kept, d)[0, 1]) > 0.99

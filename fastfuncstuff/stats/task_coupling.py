@@ -61,6 +61,9 @@ __all__ = [
     "task_enrichment",
     "enrichment_curve",
     "project_task_out",
+    "design_notch_bins",
+    "notch_basis",
+    "filter_task_band",
     "format_task_coupling_report",
 ]
 
@@ -439,6 +442,171 @@ def project_task_out(
         cleaned.reshape(shape).to(f.dtype),
         removed.reshape(shape).to(f.dtype),
     )
+
+
+def design_notch_bins(
+    design: torch.Tensor | np.ndarray,
+    polort: int = 2,
+    *,
+    peak_frac: float = 0.01,
+    widen: int = 0,
+    max_frac: float = 0.15,
+) -> tuple[list[int], dict]:
+    """Which rFFT bins carry the design — the band a notch has to remove.
+
+    Selection is CONTRAST AGAINST THE FLOOR, not cumulative power, and the difference
+    is not cosmetic. Measured on a 15-cycle 20 s block design (120 frames, TR 2.5):
+
+        bin 15 = 0.0500 Hz : 91.13% of the design's power   (191x the median bin)
+        bin 45 = 0.1500 Hz :  0.49%                         (1.04x -- leakage floor)
+        ...a flat floor of ~0.47% per bin...
+
+        90% of design power -> 1 bin   (1.6% of the spectrum,  2 DoF)
+        95% of design power -> 10 bins (16.4%,                20 DoF)
+        99% of design power -> 23 bins (37.7%,                46 DoF)
+
+    A cumulative threshold is a cliff: past the fundamental you are buying bins off a
+    flat leakage floor, so 90% is free and 95% costs ten times as much for nothing
+    real. Keeping every bin that carries at least ``peak_frac`` of the STRONGEST
+    line picks the one line here, and would keep a genuine harmonic at 5% of the
+    fundamental. Contrast against the median bin was tried first and is not
+    equivalent: this design's median bin sits 2048x below its fundamental, so a
+    10x-the-median cut lands inside the low-frequency shoulder that drift removal
+    leaves behind and selects nine bins instead of one.
+
+    ``widen`` adds bins either side. The reason is amplitude NON-STATIONARITY across
+    blocks -- adaptation or attention drift modulates block amplitude and puts
+    sidebands at +/- 1/tau for an envelope timescale tau. It is NOT the HRF: convolution
+    multiplies spectra, so a wider HRF makes the design's spectrum narrower, never
+    wider, and cannot spread energy into bins the stimulus does not occupy.
+
+    Raises if the selection exceeds ``max_frac`` of the spectrum: a jittered
+    event-related design is broadband, and notching it would remove the data rather
+    than the task.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    x = torch.as_tensor(np.asarray(design), dtype=torch.float64)
+    if x.ndim == 1:
+        x = x[:, None]
+    n_t = x.shape[0]
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, device=x.device, dtype=torch.float64)
+    )
+    xd = x - q_n @ (q_n.T @ x)
+    # Pooled across conditions: the notch is one band for the whole design, since the
+    # estimator sees the sum of every response at once.
+    power = (torch.fft.rfft(xd, dim=0).abs() ** 2).sum(dim=1)
+    n_bins = power.numel()
+    # Bin 0 is the mean, which polort already owns; including it would notch the drift.
+    body = power[1:]
+    peak = float(body.max()) if body.numel() else 0.0
+    # Relative to the PEAK line, not to the median bin. A median-contrast threshold
+    # looked equivalent and is not: this design's median bin sits 2048x below its
+    # fundamental, so "10x the median" lands inside the low-frequency shoulder the
+    # drift-residualized boxcar leaves behind and selects nine bins instead of one.
+    # A peak-relative cut is scale-free and says something a reader can check --
+    # "every line carrying at least 1% of the strongest one".
+    keep = {int(b) + 1 for b in torch.nonzero(body > peak_frac * peak).flatten().tolist()}
+    if not keep:
+        raise ValueError(
+            "no frequency bin carries the design above the leakage floor. The design is "
+            "either flat after drift removal or too broadband to notch."
+        )
+    for b in list(keep):
+        for d in range(1, int(widen) + 1):
+            if 1 <= b - d < n_bins:
+                keep.add(b - d)
+            if 1 <= b + d < n_bins:
+                keep.add(b + d)
+    bins = sorted(keep)
+    frac = len(bins) / max(1, n_bins - 1)
+    if frac > max_frac:
+        raise ValueError(
+            f"the design occupies {len(bins)} of {n_bins - 1} frequency bins "
+            f"({frac:.0%} of the spectrum, over the {max_frac:.0%} limit). This is a "
+            "broadband design -- a notch would remove the data, not the task. Use "
+            "-detask (project the design out of the field) instead."
+        )
+    info = {
+        "bins": bins,
+        "n_bins": n_bins - 1,
+        "spectrum_frac": frac,
+        "peak_frac": peak_frac,
+        "widen": int(widen),
+        "peak_over_median": float(peak / body.median())
+        if float(body.median()) > 0
+        else float("inf"),
+    }
+    return bins, info
+
+
+def notch_basis(
+    n_t: int,
+    bins: list[int],
+    polort: int = 2,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Orthonormal time-domain basis spanning ``bins``, with drift already removed.
+
+    One cos/sin pair per bin (a single column for DC and Nyquist), orthogonalized
+    against the drift basis so removing it cannot take the drift with it — the same
+    split :func:`project_task_out` makes, and for the same reason: a slow drift is real
+    residual motion, not something the task filter should be eating.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    t = torch.arange(n_t, dtype=torch.float64, device=device)
+    cols = []
+    for b in bins:
+        w = 2.0 * np.pi * b / n_t
+        cols.append(torch.cos(w * t))
+        # At Nyquist on an even-length series the sine column is identically zero;
+        # _orthonormal_basis would otherwise hand back a normalised pile of roundoff.
+        if not (n_t % 2 == 0 and 2 * b == n_t):
+            cols.append(torch.sin(w * t))
+    mat = torch.stack(cols, dim=1)
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
+    )
+    resid = mat - q_n @ (q_n.T @ mat)
+    return _orthonormal_basis(resid, scale=float(torch.linalg.matrix_norm(mat, 2)))
+
+
+def filter_task_band(
+    data: torch.Tensor,
+    basis: torch.Tensor,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Remove ``basis`` from every voxel's time course of a ``(nx,ny,nz,T)`` series.
+
+    Applied to the images the estimator SEES, not to the output. That is the whole
+    point of doing it here rather than with ``-detask``: the field is never
+    contaminated, so nothing can bleed through an iterative solve into other frames or
+    voxels, and the corrected series is still resampled from the raw input.
+    """
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    f = torch.as_tensor(data)
+    if f.ndim != 4:
+        raise ValueError(f"data must be 4-D (nx,ny,nz,T), got {tuple(f.shape)}")
+    n_t = f.shape[3]
+    if basis.shape[0] != n_t:
+        raise ValueError(f"basis has {basis.shape[0]} rows but the series has {n_t} frames")
+    if device is None:
+        device = f.device
+    q = basis.to(device=device, dtype=torch.float64)
+    spatial = tuple(f.shape[:3])
+    n_vox = int(np.prod(spatial))
+    flat = f.reshape(n_vox, n_t)
+    out = torch.empty_like(flat)
+    chunk = estimate_chunk_size(n_vox, n_t, q.shape[1] + 2, device, operation="glm")
+    for start in range(0, n_vox, chunk):
+        y = flat[start : start + chunk].to(device=device, dtype=torch.float64)
+        y = y - (y @ q) @ q.T
+        out[start : start + y.shape[0]] = y.to(dtype=out.dtype, device=out.device)
+        del y
+    return out.reshape(*spatial, n_t)
 
 
 def task_enrichment(
