@@ -589,6 +589,73 @@ def notch_basis(
     return _orthonormal_basis(resid, scale=float(torch.linalg.matrix_norm(mat, 2)))
 
 
+def design_fit_basis(
+    design: torch.Tensor | np.ndarray,
+    polort: int = 2,
+    n_deriv: int = 0,
+    device: torch.device | None = None,
+) -> torch.Tensor:
+    """Orthonormal basis spanning the task DESIGN itself, with drift already removed.
+
+    The design-space counterpart to :func:`notch_basis`, and the third way to keep the
+    task out of the estimator. The notch works in the frequency domain and costs two
+    degrees of freedom per line it removes; this costs one per regressor. On a real
+    5-condition 18 s block design (TR 3.5, 225 frames) the notch took 43 bins = 86 DoF
+    where the design spans 5, so for anything but a tightly periodic paradigm this is
+    the far cheaper cut -- and unlike the notch it has no periodicity requirement at
+    all, which is what makes it the only estimator-side option for a broadband design.
+
+    What it cannot do, on the record so this is not rediscovered. Projecting the design
+    out removes the part of the response the CANONICAL shape explains and leaves the
+    rest: latency and width mismatch put real task variance in the residual, and the
+    estimator still sees it. ``n_deriv`` widens the subspace with successive time
+    derivatives of each regressor (1 = the temporal derivative, absorbing a few hundred
+    ms of latency; 2 adds curvature) at one more DoF per regressor per derivative,
+    which is the standard trade and the reason the knob exists.
+
+    The deeper circularity is not fixable here and is worth stating plainly: a
+    contamination severe enough to matter also distorts the very fit being projected
+    out, so the residual keeps a share of the artifact proportional to how bad the
+    problem was. This is a mitigation, not a proof of removal -- read the enrichment
+    diagnostic afterwards rather than assuming the cut worked.
+
+    Derivatives are finite differences of the CONVOLVED regressor, which is the
+    discrete form of convolving with the HRF's derivative -- no second design build,
+    and it stays correct for any basis the design was built from.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+    if x.ndim == 1:
+        x = x[:, None]
+    n_t = x.shape[0]
+    if int(n_deriv) < 0:
+        raise ValueError(f"n_deriv must be >= 0, got {n_deriv}")
+    cols = [x]
+    cur = x
+    for _ in range(int(n_deriv)):
+        # Central difference, edges held: a forward difference would shift the
+        # derivative half a frame relative to the regressor it is meant to accompany.
+        d = torch.zeros_like(cur)
+        d[1:-1] = 0.5 * (cur[2:] - cur[:-2])
+        d[0], d[-1] = cur[1] - cur[0], cur[-1] - cur[-2]
+        cols.append(d)
+        cur = d
+    mat = torch.cat(cols, dim=1)
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
+    )
+    resid = mat - q_n @ (q_n.T @ mat)
+    scale = float(torch.linalg.matrix_norm(mat, 2))
+    basis = _orthonormal_basis(resid, scale=scale)
+    if basis.shape[1] == 0:
+        raise ValueError(
+            f"the design is entirely collinear with the polort-{polort} drift basis: "
+            "there is nothing to project out. Lower -task_polort."
+        )
+    return basis
+
+
 def filter_task_band(
     data: torch.Tensor,
     basis: torch.Tensor,

@@ -15,10 +15,13 @@ import numpy as np
 import pytest
 import torch
 
+from fastfuncstuff.glm.core import construct_polynomial_matrix
 from fastfuncstuff.stats.task_coupling import (
+    _orthonormal_basis,
     co_location,
     contamination_slope,
     default_polort,
+    design_fit_basis,
     design_notch_bins,
     enrichment_curve,
     filter_task_band,
@@ -682,12 +685,16 @@ def test_filter_task_band_removes_the_line_and_keeps_the_drift():
 def test_parse_detask_modes():
     from fastfuncstuff.cli.locomoco import parse_detask
 
-    assert parse_detask(None) == (False, None)
-    assert parse_detask("field") == (True, None)  # bare -detask, via const
-    assert parse_detask("filter") == (False, 0)
-    assert parse_detask("filter:2") == (False, 2)
-    assert parse_detask("FILTER:0") == (False, 0)
-    for bad in ("filter:x", "both", "filter:-1"):
+    # (clean_field, notch_widen, fit_deriv) -- three modes, and only one is ever set.
+    assert parse_detask(None) == (False, None, None)
+    assert parse_detask("field") == (True, None, None)  # bare -detask, via const
+    assert parse_detask("filter") == (False, 0, None)
+    assert parse_detask("filter:2") == (False, 2, None)
+    assert parse_detask("FILTER:0") == (False, 0, None)
+    assert parse_detask("fit") == (False, None, 0)
+    assert parse_detask("fit:1") == (False, None, 1)
+    assert parse_detask("FIT:2") == (False, None, 2)
+    for bad in ("filter:x", "both", "filter:-1", "fit:x", "fit:-1"):
         with pytest.raises(ValueError):
             parse_detask(bad)
 
@@ -1072,3 +1079,109 @@ def test_reject_writes_plottable_timecourses_and_an_after_map(tmp_path):
         after = nib.load(f"{stem}_taskr_{axis}_after.nii.gz").get_fdata(dtype=np.float32)
         assert before.shape == after.shape
         assert not np.allclose(before, after)
+
+
+def test_design_fit_basis_removes_the_task_and_keeps_the_drift():
+    """The design-space cut must take the response out and leave slow drift alone.
+
+    Drift is real residual motion, not something a task filter should eat — the same
+    split :func:`notch_basis` and ``-detask field`` make.
+    """
+    n_t = 120
+    design = _block_design(n_t)
+    basis = design_fit_basis(design, polort=3)
+    # One column per regressor: the whole point against the notch's two per line.
+    assert basis.shape == (n_t, design.shape[1])
+    assert torch.allclose(basis.T @ basis, torch.eye(basis.shape[1], dtype=basis.dtype), atol=1e-10)
+
+    t = torch.arange(n_t, dtype=torch.float64)
+    drift = 1.0 + 0.01 * t + 3e-5 * t**2
+    series = (2.5 * design[:, 0] + drift).reshape(1, 1, 1, n_t)
+    out = filter_task_band(series, basis).reshape(-1)
+
+    # The task is gone. Orthogonality is against the BASIS -- the design after drift
+    # removal -- not the raw design: polynomials go into the fit but not the
+    # subtraction, so whatever the design shares with drift is deliberately left
+    # behind. Asserting against the raw column would be asserting the drift was eaten.
+    assert float((basis.T @ out).abs().max()) < 1e-8
+    # ...and the drift survived, which a polort-eating basis would have flattened.
+    assert float(out.std()) > 0.1 * float(drift.std())
+
+
+def test_design_fit_basis_derivatives_cost_one_dof_each_and_absorb_latency():
+    """``n_deriv`` widens the subspace by one column per regressor per derivative, and
+    the extra columns are what let a latency-shifted response be removed at all."""
+    n_t = 160
+    design = _block_design(n_t, block=16)
+    k = design.shape[1]
+    assert design_fit_basis(design, polort=3, n_deriv=1).shape[1] == 2 * k
+    assert design_fit_basis(design, polort=3, n_deriv=2).shape[1] == 3 * k
+
+    # A SUB-FRAME latency shift is what the derivative column absorbs: to first order a
+    # shifted regressor is x(t) - dt*x'(t), so the derivative spans the mismatch in the
+    # small-dt limit. Measured in the DRIFT-ORTHOGONAL subspace, because the basis
+    # deliberately leaves the design's drift-parallel part alone and that residual is
+    # an order of magnitude larger than the latency term -- comparing raw norms hides
+    # the effect entirely.
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, 3, device=torch.device("cpu"), dtype=torch.float64)
+    )
+
+    def _perp(v):
+        return v - q_n @ (q_n.T @ v)
+
+    x = design[:, 0].double()
+    ratios = []
+    for dt in (0.1, 0.3, 0.5):
+        late = ((1 - dt) * x + dt * torch.roll(x, 1)).reshape(1, 1, 1, n_t)
+        plain = _perp(filter_task_band(late, design_fit_basis(design, polort=3)).reshape(-1))
+        deriv = _perp(
+            filter_task_band(late, design_fit_basis(design, polort=3, n_deriv=1)).reshape(-1)
+        )
+        ratios.append(float(deriv.norm()) / float(plain.norm()))
+
+    # PARTIAL, not complete -- which is the point. A central difference is not exactly
+    # matched to the shift, and this design's response is sharp, so a third of the
+    # latency mismatch survives even with the derivative in. That residue is precisely
+    # the "leftover variance" -detask fit warns about; a test asserting near-total
+    # removal would be asserting something the method does not deliver.
+    assert all(r < 0.75 for r in ratios), ratios
+    # Linear in dt, so the ratio is scale-free -- confirms this is the first-order term
+    # and not an artifact of one shift size.
+    assert max(ratios) - min(ratios) < 0.02, ratios
+
+
+def test_design_fit_basis_is_far_cheaper_than_the_notch_on_a_real_block_design():
+    """The claim the -detask fit help makes, pinned: on an 18s-block design the notch
+    costs 2 DoF per line while the fit costs 1 per regressor, and the gap is large.
+
+    Built to match a real acquisition (OHBMPilot04: 5 conditions, 18s blocks at 20s SOA
+    in triplets with 36s rest gaps, TR 3.5, 225 frames), which notched 38% of the
+    spectrum -- past the warn threshold -- while spanning 5 design columns.
+    """
+    tr, n_t, up = 3.5, 225, 20
+    onsets = {
+        0: [12.0, 164.0, 360.0, 436.1, 572.1, 628.1],
+        1: [88.0, 224.0, 284.0, 340.0, 648.1],
+        2: [32.0, 108.0, 320.0, 456.1, 516.1, 592.1],
+        3: [52.0, 128.0, 244.0, 396.1, 496.1, 552.1],
+        4: [184.0, 204.0, 264.0, 416.1, 476.1, 668.1],
+    }
+    n_up = int(n_t * tr * up)
+    hrf = np.exp(-np.arange(0, 32, 1 / up) / 4.0) * (np.arange(0, 32, 1 / up) ** 2)
+    hrf = hrf / hrf.sum()
+    cols = []
+    for k in sorted(onsets):
+        box = np.zeros(n_up)
+        for o in onsets[k]:
+            box[int(o * up) : int((o + 18.0) * up)] = 1.0
+        cols.append(np.convolve(box, hrf)[:n_up][:: int(up * tr)][:n_t])
+    design = torch.tensor(np.stack(cols, axis=1))
+
+    fit_dof = design_fit_basis(design, polort=6).shape[1]
+    bins, info = design_notch_bins(design, polort=6)
+    notch_dof = notch_basis(n_t, bins, polort=6).shape[1]
+
+    assert fit_dof == 5  # one per condition
+    assert info["spectrum_frac"] > 0.15  # this design is NOT cheaply notchable
+    assert notch_dof > 8 * fit_dof, (notch_dof, fit_dof)
