@@ -1786,6 +1786,7 @@ def estimate_residual_flow(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    ngf_eta_q: float = 0.5,
     paired_bins: torch.Tensor | None = None,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -1908,6 +1909,7 @@ def estimate_residual_flow(
             hpf_sigma=hpf_sigma,
             match=match,
             match_sigma=match_sigma,
+            ngf_eta_q=ngf_eta_q,
             pe_axis2=pe_axis2,
             paired_bins=paired_bins,
             device=device,
@@ -2733,6 +2735,7 @@ def _ngf_component(
     axis: int,
     skip_axis: int | None = None,
     eta_frac: float = 0.5,
+    eta_q: float = 0.5,
 ) -> torch.Tensor:
     """Unit-gradient component along ``axis`` — the encode-axis slice of the NGF vector.
 
@@ -2758,6 +2761,15 @@ def _ngf_component(
 
     Signed, unlike ``gradmag``: an edge keeps its polarity instead of folding both
     flanks into one ridge, so LK sees one zero crossing where gradmag shows two.
+
+    ``eta_frac`` / ``eta_q`` set that floor as a fraction of the ``eta_q`` quantile of
+    the volume's own squared gradient magnitude, and they are the knob that decides
+    what counts as an edge at all. It matters more than it looks: normalisation
+    promotes EVERY gradient to unit length, so a floor set from the median of a volume
+    that is mostly low-gradient tissue hands noise-level structure the same weight LK
+    gives a real boundary. Raising ``eta_q`` toward the upper decile restricts unit
+    treatment to genuine edges and lets the rest fall away, which is the behaviour to
+    reach for when ngf estimates come out noisier than localnorm rather than cleaner.
     """
     axes = [a for a in (0, 1, 2) if a != skip_axis]
     if axis not in axes:
@@ -2775,17 +2787,17 @@ def _ngf_component(
     # full-strength random orientation. Scaled from each volume's OWN gradient
     # magnitude: across TE the later echo's gradients are uniformly smaller, and a
     # shared constant would floor one echo to noise and leave the other unfloored.
-    med = torch.zeros(sq.shape[0], device=sq.device, dtype=sq.dtype)
+    ref = torch.zeros(sq.shape[0], device=sq.device, dtype=sq.dtype)
     flat = sq.reshape(sq.shape[0], -1)
     for i in range(flat.shape[0]):
         v = flat[i]
-        # Subsampled before the median: this runs per frame per pyramid level, and a
+        # Subsampled before the quantile: this runs per frame per pyramid level, and a
         # full sort of a 0.8mm volume is not worth an exact floor.
         if v.numel() > 1_000_000:
             v = v[:: v.numel() // 1_000_000 + 1]
         pos = v[v > 0]
-        med[i] = pos.median() if pos.numel() else flat.new_tensor(1.0)
-    eta2 = (eta_frac**2) * med.reshape(-1, 1, 1, 1)
+        ref[i] = torch.quantile(pos, eta_q) if pos.numel() else flat.new_tensor(1.0)
+    eta2 = (eta_frac**2) * ref.reshape(-1, 1, 1, 1)
     return grads[axis] / (sq + eta2).clamp(min=1e-12).sqrt()
 
 
@@ -2795,6 +2807,7 @@ def _match_prep(
     sigma: float = 2.0,
     skip_axis: int | None = None,
     pe_axis: int | None = None,
+    ngf_eta_q: float = 0.5,
 ) -> torch.Tensor:
     """Make brightness constancy approximately true for a cross-contrast ``(B,X,Y,Z)`` pair.
 
@@ -2822,7 +2835,7 @@ def _match_prep(
                 "pass through. It is wired for the 3-D solve; use -match localnorm on "
                 "the 2-D slicewise path."
             )
-        return _ngf_component(vol, pe_axis, skip_axis)
+        return _ngf_component(vol, pe_axis, skip_axis, eta_q=ngf_eta_q)
     if mode == "gradmag":
         b = _blur3d_b(vol, 1.0, skip_axis)
         axes = [a for a in (0, 1, 2) if a != skip_axis]
@@ -3767,6 +3780,7 @@ def _run_3dacq_plain(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    ngf_eta_q: float = 0.5,
     pe_axis2: int | None = None,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
@@ -3844,7 +3858,8 @@ def _run_3dacq_plain(
     # single (X,Y,Z) vol.
     def _prep(v: torch.Tensor) -> torch.Tensor:
         x = _spatial_highpass3d(
-            _match_prep(v[None], match, match_sigma, pe_axis=pe_axis), hpf_sigma
+            _match_prep(v[None], match, match_sigma, pe_axis=pe_axis, ngf_eta_q=ngf_eta_q),
+            hpf_sigma,
         )
         if smooth_sigma > 0:
             x = _blur3d_b(x, smooth_sigma)
@@ -4057,6 +4072,7 @@ def optical_flow_lk_3d_multiecho(
     warp_radius: int = 3,
     match: str = "none",
     match_sigma: float = 2.0,
+    ngf_eta_q: float = 0.5,
     max_disp: float | None = None,
 ) -> torch.Tensor:
     """Shared-field 1-DOF (PE-axis) pyramidal LK across echoes ``(B,X,Y,Z)``.
@@ -4076,8 +4092,14 @@ def optical_flow_lk_3d_multiecho(
     tens of voxels instead of returning a merely-wrong small number.
     """
     if match != "none":
-        fixed_list = [_match_prep(f, match, match_sigma, pe_axis=pe_axis) for f in fixed_list]
-        moving_list = [_match_prep(m, match, match_sigma, pe_axis=pe_axis) for m in moving_list]
+        fixed_list = [
+            _match_prep(f, match, match_sigma, pe_axis=pe_axis, ngf_eta_q=ngf_eta_q)
+            for f in fixed_list
+        ]
+        moving_list = [
+            _match_prep(m, match, match_sigma, pe_axis=pe_axis, ngf_eta_q=ngf_eta_q)
+            for m in moving_list
+        ]
     e = len(fixed_list)
     fpyr = [[f] for f in fixed_list]
     mpyr = [[m] for m in moving_list]
@@ -4166,6 +4188,7 @@ def optical_flow_lk_3d_axes(
     warp_radius: int = 3,
     match: str = "none",
     match_sigma: float = 2.0,
+    ngf_eta_q: float = 0.5,
     max_disp: float | None = None,
     sep_floor: float = 1e-2,
     sep_out: list[torch.Tensor] | None = None,
@@ -4235,8 +4258,14 @@ def optical_flow_lk_3d_axes(
         # exists. The partition solve then runs on a rendering oriented for its
         # neighbour -- acceptable, and the task-coupling diagnostic reports the two
         # axes separately so the cost of that choice is visible rather than assumed.
-        fixed_list = [_match_prep(f, match, match_sigma, pe_axis=axes[0]) for f in fixed_list]
-        moving_list = [_match_prep(m, match, match_sigma, pe_axis=axes[0]) for m in moving_list]
+        fixed_list = [
+            _match_prep(f, match, match_sigma, pe_axis=axes[0], ngf_eta_q=ngf_eta_q)
+            for f in fixed_list
+        ]
+        moving_list = [
+            _match_prep(m, match, match_sigma, pe_axis=axes[0], ngf_eta_q=ngf_eta_q)
+            for m in moving_list
+        ]
 
     n_ax, n_echo = len(axes), len(fixed_list)
     fpyr = [[f] for f in fixed_list]
@@ -4638,6 +4667,7 @@ def estimate_residual_flow_multiecho(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    ngf_eta_q: float = 0.5,
     pe_axis2: int | None = None,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
@@ -4765,7 +4795,7 @@ def estimate_residual_flow_multiecho(
         # against itself, so the TE relationship the joint solve depends on is untouched:
         # `alphas` scales the DISPLACEMENT field, never the intensities.
         x = _spatial_highpass3d(
-            _match_prep(v[None], match, match_sigma, sw_axis, pe_axis=pe_axis),
+            _match_prep(v[None], match, match_sigma, sw_axis, pe_axis=pe_axis, ngf_eta_q=ngf_eta_q),
             hpf_sigma,
             sw_axis,
         )
@@ -5168,6 +5198,7 @@ def estimate_residual_flow_me_scaled(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    ngf_eta_q: float = 0.5,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> MultiEchoLocomocoResult:
@@ -5231,6 +5262,7 @@ def estimate_residual_flow_me_scaled(
         hpf_sigma=hpf_sigma,
         match=match,
         match_sigma=match_sigma,
+        ngf_eta_q=ngf_eta_q,
         device=device,
         verbose=verbose,
     )
@@ -5725,6 +5757,7 @@ def estimate_residual_flow_me_interecho(
     hpf_sigma: float = 0.0,
     match: str = "localnorm",
     match_sigma: float = 2.0,
+    ngf_eta_q: float = 0.5,
     warp_interp: str = "lanczos",
     warp_radius: int = 3,
     device: torch.device | None = None,
@@ -5881,6 +5914,7 @@ def estimate_residual_flow_me_interecho(
                 window_sigma=window_sigma,
                 match=match,
                 match_sigma=match_sigma,
+                ngf_eta_q=ngf_eta_q,
                 max_disp=max_shift / denom,
             )[0]
         else:
@@ -6107,6 +6141,7 @@ def refine_interecho_temporally(
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
+    ngf_eta_q: float = 0.5,
     want_corrected: bool = True,
     device: torch.device | None = None,
     verbose: bool = True,
@@ -6254,6 +6289,7 @@ def refine_interecho_temporally(
             hpf_sigma=hpf_sigma,
             match=match,
             match_sigma=match_sigma,
+            ngf_eta_q=ngf_eta_q,
             device=device,
             verbose=verbose,
         )

@@ -676,6 +676,18 @@ def create_parser() -> argparse.ArgumentParser:
         " rotation-aware mode.",
     )
     est.add_argument(
+        "-match_eta_q",
+        "-match-eta-q",
+        type=float,
+        default=0.5,
+        metavar="Q",
+        help="[-match ngf] Quantile of the volume's own squared gradient magnitude that\n"
+        "sets the eta floor. The knob that decides what counts as an edge: normalising\n"
+        "promotes EVERY gradient to unit length, so a floor taken from the median of a\n"
+        "mostly-flat volume hands noise-level structure the same weight LK gives a real\n"
+        "boundary. Raise it toward 0.9 when ngf comes out noisier than localnorm.",
+    )
+    est.add_argument(
         "-match_sigma",
         "-match-sigma",
         type=float,
@@ -2569,6 +2581,7 @@ def _run_multiecho(
                 scaling=args.me_refine_scaling,
                 match=args.match,
                 match_sigma=args.match_sigma,
+                ngf_eta_q=args.match_eta_q,
                 noshift_margin=args.noshift_margin,
                 reg_sigma=args.reg_sigma,
                 peak_mode="argmax" if args.argmax else "first_peak",
@@ -2611,6 +2624,7 @@ def _run_multiecho(
             search_min_steps=args.search_min_steps,
             match=args.match,
             match_sigma=args.match_sigma,
+            ngf_eta_q=args.match_eta_q,
             warp_interp=args.warp_interp,
             warp_radius=args.warp_radius,
             hpf_sigma=hpf_sigma,
@@ -2651,6 +2665,7 @@ def _run_multiecho(
             hpf_sigma=hpf_sigma,
             match=args.match,
             match_sigma=args.match_sigma,
+            ngf_eta_q=args.match_eta_q,
             pe_axis2=pe_axis2,
             slicewise=slicewise,
             device=device,
@@ -3337,6 +3352,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             hpf_sigma=hpf_sigma,
             match=args.match,
             match_sigma=args.match_sigma,
+            ngf_eta_q=args.match_eta_q,
             paired_bins=paired_bins,
             device=device,
         )
