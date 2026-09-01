@@ -6537,6 +6537,48 @@ def warp_reconstruct(basis, loadings, means, keep):
     return out
 
 
+def warp_project_out(components, bad_timecourses, device=None):
+    """Regress a set of time courses out of the FULL-rank field, per axis.
+
+    The alternative to reconstructing from kept components, and strictly better when
+    the goal is rejection rather than denoising. A decomposition is used only to FIND
+    the offending time courses; removing them is then a projection on the untruncated
+    data, so everything the decomposition did not model survives untouched. Rebuilding
+    from an ICA basis instead discards whatever the PCA reduction dropped -- measured on
+    a real run, a 95%-variance ICA cost 21.5% of the field's rms while rejecting
+    nothing at all.
+
+    ``bad_timecourses`` is ``{axis: (T, m) tensor}``; an axis with no entry is returned
+    unchanged. Per axis because a component can be contaminated on one encode axis and
+    clean on the other.
+
+    Least squares, not dot products: independent components are not orthogonal, so
+    subtracting each one's projection separately would remove their shared part more
+    than once.
+    """
+    out = []
+    for axis, disp in components:
+        bad = bad_timecourses.get(axis)
+        if bad is None or bad.shape[1] == 0:
+            out.append((axis, disp.float()))
+            continue
+        shape = tuple(disp.shape[:3])
+        n_t = disp.shape[-1]
+        x = disp.reshape(-1, n_t).T.to(torch.float64)  # (T, S)
+        if device is not None:
+            x = x.to(device)
+        a = bad.to(dtype=torch.float64, device=x.device)
+        # Centre before projecting and restore after: the per-voxel temporal mean is
+        # not part of any component, and a time course with any DC left in it would
+        # otherwise drag the mean displacement with it.
+        mean = x.mean(dim=0, keepdim=True)
+        xc = x - mean
+        q, _ = torch.linalg.qr(a - a.mean(dim=0, keepdim=True))
+        clean = xc - q @ (q.T @ xc) + mean
+        out.append((axis, clean.T.reshape(*shape, n_t).contiguous().float().cpu()))
+    return out
+
+
 def warp_ica_basis(components, n_components=None, pca_components=0.95, device=None):
     """Independent spatial components of a per-frame warp, in the same shape as the PCs.
 

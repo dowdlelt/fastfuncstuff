@@ -1209,17 +1209,18 @@ def create_parser() -> argparse.ArgumentParser:
         "'pcs:N' (the top N by variance), or 'pcs:0.F' (however many components reach\n"
         "that FRACTION of the variance, e.g. pcs:0.8 for 80%%). A value below 1 is read\n"
         "as a fraction; it travels better between runs than a fixed count.\n"
-        "'ica' runs FastICA over a PCA reduction (default 95%% of the variance;\n"
-        "ica:N or ica:0.F to set the rank). Use it when -reject finds nothing: PCA\n"
+        "'ica' runs FastICA and SWEEPS for the rank (ica:N or ica:0.F to fix it).\n"
+        "Use it when -reject finds nothing: PCA\n"
         "orders by VARIANCE, so contamination worth a fraction of a percent cannot\n"
         "surface in any component, while ICA orders by independence. Measured on a\n"
         "contaminated 0.8mm run, no principal component exceeded 1.25x enrichment or\n"
         "0.07 correlation with the design; the best independent component reached\n"
         "2.8-3.0x with a time course correlating 0.68. The rank has an interior\n"
-        "optimum (20 missed it, 60 found it, 119 over-split it), and unlike 'pcs' the\n"
-        "reconstruction is LOSSY -- the PCA rank is set before the rotation, so the\n"
-        "discarded variance is gone even with nothing rejected. The residual against\n"
-        "the original field is reported so that cost is visible.\n"
+        "optimum that no variance rule locates -- 20 missed the source, 60 found it,\n"
+        "105 and 119 over-split it, and 95%% of the variance resolves to 105 -- so the\n"
+        "rank is searched for, not guessed. Rejection is then a PROJECTION of the bad\n"
+        "time courses out of the FULL-rank field, so nothing is lost to the ICA rank\n"
+        "itself; the decomposition only names what to remove.\n"
         "Independent of -want_pcs, which only chooses how many PC time courses are\n"
         "WRITTEN as regressors -- the reconstruction uses whatever SPEC says.\n"
         "The leading components carry the bulk of the\n"
@@ -1964,8 +1965,16 @@ def parse_warp_recon(value):
         raise ValueError(f"-warp_recon SPEC must start with 'pcs' or 'ica', got {value!r}")
     # ICA has no natural "all": it needs a rank to reduce to, and the full rank
     # over-splits (measured: 60 components found the task source, 119 lost it again).
+    if tail == "sweep":
+        if method != "ica":
+            raise ValueError("-warp_recon sweep is only defined for ica")
+        return "sweep", None, method
     if tail in ("", "all"):
-        return None, (0.95 if method == "ica" else None), method
+        # 0.95 of the variance was the first default and is a BAD one: on a real run it
+        # resolved to 105 of 119 components, which is the over-splitting regime (the
+        # same sweep found 60 components isolating the task source and 119 losing it
+        # again). Bare 'ica' therefore searches for the rank instead of guessing it.
+        return ("sweep" if method == "ica" else None), None, method
     try:
         num = float(tail)
     except ValueError:
@@ -1985,6 +1994,62 @@ def parse_warp_recon(value):
     )
 
 
+def _ica_rank_sweep(comps, resp, mask, ranks, device):
+    """Best ICA rank by peak task enrichment — the rank is not guessable a priori.
+
+    Measured on one real field: 20 components missed the task source entirely (1.75x),
+    60 found it (2.79x), 105 and 119 lost it again to over-splitting (1.42x, 2.27x).
+    There is an interior optimum and no variance rule locates it -- 95% of the variance
+    landed on 105, deep in the failing regime -- so it is searched for instead.
+
+    Coarse grid then a local refine rather than a trisection: the criterion is not
+    guaranteed unimodal, and one ICA fit is seconds, so a grid that cannot be fooled is
+    cheaper than a bisection that can.
+    """
+    from fastfuncstuff.processing.locomoco import warp_ica_basis
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    def score(rank):
+        got = warp_ica_basis(comps, n_components=rank, pca_components=rank, device=device)
+        if got is None:
+            return 0.0, None
+        basis, loadings, means, var = got
+        k = basis.shape[1]
+        peak = max(
+            map_enrichment(load[..., i], resp, mask)["enrichment"]
+            for _ax, load in loadings
+            for i in range(k)
+        )
+        return peak, (basis, loadings, means, var)
+
+    seen: dict[int, float] = {}
+    best_rank, best_peak, best_got = ranks[0], -1.0, None
+    for rank in ranks:
+        peak, got = score(rank)
+        seen[rank] = peak
+        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x")
+        if peak > best_peak:
+            best_rank, best_peak, best_got = rank, peak, got
+    # One refine pass halfway to each neighbour of the winner.
+    order = sorted(seen)
+    i = order.index(best_rank)
+    refine = []
+    if i > 0:
+        refine.append((order[i - 1] + best_rank) // 2)
+    if i < len(order) - 1:
+        refine.append((best_rank + order[i + 1]) // 2)
+    for rank in refine:
+        if rank in seen or rank < 2:
+            continue
+        peak, got = score(rank)
+        seen[rank] = peak
+        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x  (refine)")
+        if peak > best_peak:
+            best_rank, best_peak, best_got = rank, peak, got
+    print(f"    → rank {best_rank} wins at {best_peak:.2f}x")
+    return best_rank, best_got
+
+
 def _warp_recon_stage(result, data, args, resp, mask, device):
     """Rebuild the field from a warp decomposition, dropping task-loaded components.
 
@@ -1999,6 +2064,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         pc_reconstruct_result,
         warp_ica_basis,
         warp_pc_basis,
+        warp_project_out,
         warp_reconstruct,
     )
     from fastfuncstuff.stats.task_coupling import map_enrichment
@@ -2006,7 +2072,17 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
     comps = [(ax, f) for _, ax, f in result.pe_displacements()]
 
-    if method == "ica":
+    if method == "ica" and n_pcs == "sweep":
+        if resp is None:
+            print("  ⚠️  -warp_recon ica sweep needs -events to score ranks; using 60.")
+            n_pcs, got = 60, warp_ica_basis(comps, 60, 60, device=device)
+        else:
+            n_t = comps[0][1].shape[-1]
+            top = max(4, n_t - 1)
+            grid = sorted({max(2, int(top * f)) for f in (0.15, 0.3, 0.45, 0.6, 0.8)})
+            print("  ── ICA rank sweep (peak task enrichment over components) ──")
+            n_pcs, got = _ica_rank_sweep(comps, resp, mask, grid, device)
+    elif method == "ica":
         got = warp_ica_basis(
             comps,
             n_components=n_pcs,
@@ -2044,9 +2120,12 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
         keep[axis] = idx
 
-    how = "independent components" if method == "ica" else "principal components"
-    span = f"top {k}" if (n_pcs is not None or method == "ica") else f"all {k}"
-    print(f"  ── warp reconstruction ({span} {how}, shared temporal basis) ──")
+    if method == "ica":
+        head = f"warp task rejection (ICA rank {k}, projected out of the FULL-rank field)"
+    else:
+        span = f"top {k}" if n_pcs is not None else f"all {k}"
+        head = f"warp reconstruction ({span} principal components, shared temporal basis)"
+    print(f"  ── {head} ──")
     for axis, _load in loadings:
         lbl = label_of.get(axis, f"axis{axis}")
         drops = dropped.get(axis, [])
@@ -2062,18 +2141,34 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         else:
             print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
 
-    rebuilt = warp_reconstruct(basis, loadings, means, keep)
-    # What the truncation actually cost, measured rather than inferred from a variance
-    # ratio: an ICA rank is set BEFORE the rotation, so its reconstruction is lossy even
-    # with nothing rejected, and a user comparing runs needs that number.
+    if method == "ica":
+        # Reject by PROJECTION on the full-rank field, not by rebuilding from the kept
+        # components: an ICA rank is fixed before the rotation, so a reconstruction
+        # discards whatever the PCA reduction dropped even when nothing is rejected --
+        # measured, 21.5% of a real field's rms for zero benefit. The decomposition's
+        # only job is to name the bad time courses.
+        bad_tc = {
+            axis: basis[:, [i for i, _e in dropped.get(axis, [])]] for axis, _load in loadings
+        }
+        if any(v.shape[1] for v in bad_tc.values()):
+            rebuilt = warp_project_out(comps, bad_tc, device=device)
+        else:
+            rebuilt = [(ax, f.float()) for ax, f in comps]
+    else:
+        rebuilt = warp_reconstruct(basis, loadings, means, keep)
+    # What actually left the field, measured rather than inferred from a variance
+    # ratio. Under ica this is purely what was rejected -- the projection touches
+    # nothing else. Under pcs it also carries the truncation loss, which is why the two
+    # are labelled differently rather than sharing one number a reader would misread.
+    what = "removed" if method == "ica" else "removed + truncated away"
     for (axis, new_f), (_, old_f) in zip(rebuilt, comps, strict=True):
         lbl = label_of.get(axis, f"axis{axis}")
         o = old_f.float()
         resid = float((new_f - o).pow(2).mean().sqrt())
         print(
-            f"    {lbl}: rms {float(o.std()):.4f} → {float(new_f.std()):.4f} vox, "
-            f"residual vs the original field {resid:.4f} vox "
-            f"({resid / max(float(o.std()), 1e-9) * 100:.1f}%)"
+            f"    {lbl}: rms {float(o.std()):.4f} → {float(new_f.std()):.4f} vox; "
+            f"{what} {resid:.4f} vox "
+            f"({resid / max(float(o.std()), 1e-9) * 100:.1f}% of the field's rms)"
         )
 
     if args.reject is not None and not any(dropped.values()):

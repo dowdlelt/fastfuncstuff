@@ -773,8 +773,13 @@ def test_parse_warp_recon_specs():
     assert parse_warp_recon("pcs:5") == (5, None, "pcs")
     # Below 1 is a variance FRACTION -- unambiguous, since a count below 1 is meaningless.
     assert parse_warp_recon("pcs:0.8") == (None, 0.8, "pcs")
-    # ICA has no natural "all": it needs a rank to reduce to, so bare 'ica' is 95%.
-    assert parse_warp_recon("ica") == (None, 0.95, "ica")
+    # ICA has no natural "all": it needs a rank, and no variance rule locates the good
+    # one (95% of the variance resolved to 105 components, deep in the over-splitting
+    # regime on a real run), so bare 'ica' searches for it.
+    assert parse_warp_recon("ica") == ("sweep", None, "ica")
+    assert parse_warp_recon("ica:sweep") == ("sweep", None, "ica")
+    with pytest.raises(ValueError, match="only defined for ica"):
+        parse_warp_recon("pcs:sweep")
     assert parse_warp_recon("ica:60") == (60, None, "ica")
     assert parse_warp_recon("ica:0.9") == (None, 0.9, "ica")
     for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5", "ica:x"):
@@ -950,3 +955,40 @@ def test_warp_ica_basis_finds_what_pca_structurally_cannot():
     assert pcs is not None
     exact = warp_reconstruct(pcs[0], pcs[1], pcs[2], keep={})
     assert torch.allclose(exact[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)
+
+
+def test_warp_project_out_removes_only_the_named_timecourses():
+    """Reject by projection on the FULL-rank field, not by rebuilding from a truncation.
+
+    The bug of record: -warp_recon ica at 95% variance rejected NOTHING on a real run
+    and still cost 21.5% of the field's rms, because rebuilding from an ICA basis
+    discards whatever the PCA reduction dropped. A projection cannot do that -- it
+    touches only the span it is given.
+    """
+    from fastfuncstuff.processing.locomoco import warp_project_out
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 100, (8, 8, 4)
+    t = np.arange(n_t)
+    bad = np.sin(2 * np.pi * 7 * t / n_t)
+    good = np.cos(2 * np.pi * 3 * t / n_t)
+    field = rng.normal(0, 0.1, (*shape, n_t)) + 1.0 * bad + 0.7 * good + 5.0
+    comps = [(1, torch.tensor(field))]
+
+    out = warp_project_out(comps, {1: torch.tensor(bad)[:, None].double()})
+    cleaned = out[0][1].numpy()
+
+    def amplitude(x, v):
+        v = v - v.mean()
+        flat = x.reshape(-1, n_t)
+        flat = flat - flat.mean(axis=1, keepdims=True)
+        return float(np.abs(flat @ v).mean() / np.linalg.norm(v) ** 2)
+
+    assert amplitude(cleaned, bad) < 1e-5 * amplitude(field, bad)
+    # Everything else survives untouched -- including the temporal mean, which is not a
+    # component and would otherwise drag every voxel's average displacement with it.
+    assert abs(amplitude(cleaned, good) - amplitude(field, good)) < 1e-4
+    assert abs(float(cleaned.mean()) - float(field.mean())) < 1e-3
+    # And an empty request is exactly identity, not a lossy round trip.
+    same = warp_project_out(comps, {})
+    assert np.abs(same[0][1].numpy() - field.astype(np.float32)).max() == 0.0
