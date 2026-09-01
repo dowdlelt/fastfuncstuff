@@ -1157,3 +1157,33 @@ def test_null_axis_regress_min_r2_fails_closed():
     # floor exists.
     loose = null_axis_regress([encoded.clone(), null], 1, min_r2=0.0)
     assert not torch.equal(loose[0], encoded)
+
+
+def test_null_axis_regress_uses_ols_because_deming_measured_worse():
+    """Errors-in-variables is real here and correcting for it still loses.
+
+    The regressor IS an estimate, so an OLS slope is attenuated toward zero, and
+    Deming (the fit phase regression uses) is the obvious remedy. It was implemented
+    and measured worse at every noise level, including zero. Two structural reasons:
+    the objective is PREDICTION, for which OLS is minimum-MSE by construction so
+    attenuation is the correct response to a noisy regressor; and Deming treats the
+    response's variance as error, while the encode axis legitimately carries real
+    motion that is not error, so it over-removes.
+
+    This pins the OLS behaviour that replaced it: a noisier null must be trusted LESS,
+    i.e. the fitted slope shrinks rather than growing to compensate.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(4)
+    shape, n_t = (5, 4, 3), 80
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 11.0)
+    encoded = (1.4 * spurious).expand(*shape, n_t).contiguous()
+
+    removed = []
+    for noise in (0.0, 0.3):
+        null = spurious.expand(*shape, n_t) + noise * torch.randn(*shape, n_t, generator=g)
+        out = null_axis_regress([encoded.clone(), null], 1)
+        removed.append(float((encoded - out[0]).abs().mean()))
+    assert removed[0] > removed[1], removed

@@ -4200,6 +4200,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 fpath = f"{stem}_flow_{label}{ext}"
                 with spinner(f"Writing {Path(fpath).name}"):
                     save_nifti(field.numpy(), fpath, affine=affine)
+            if result.null_field is not None:
+                # The un-encoded axis, as estimated and BEFORE it was regressed out.
+                # It is the diagnostic the whole flag rests on: an axis that cannot
+                # physically move, so whatever is here is what the estimator invented.
+                npath = f"{stem}_flow_null{ext}"
+                with spinner(f"Writing {Path(npath).name}"):
+                    save_nifti(result.null_field.numpy(), npath, affine=affine)
         elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"

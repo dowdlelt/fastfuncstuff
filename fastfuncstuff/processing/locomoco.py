@@ -1188,6 +1188,12 @@ class LocomocoResult:
     pe_axis2: int | None = None  # partition (2nd PE) axis, dual runs only
     # Per-voxel separability of the two axes, (nx,ny,nz,T); see optical_flow_lk_3d_axes.
     sep_map: torch.Tensor | None = None
+    # The un-encoded axis's displacement, (nx,ny,nz,T), from -pe_null. Kept because it
+    # is a DIAGNOSTIC and never a correction: it is what the estimator invented on an
+    # axis that cannot physically move, so its size and structure say how much of the
+    # encode axes to believe. Never applied to the data.
+    null_field: torch.Tensor | None = None
+    null_axis: int | None = None
     # ── rotation-aware (idea 2) extras — None for the plain idea-1 path ──
     reproject_weights: torch.Tensor | None = None  # (T, 3) per-frame axis weights
     corrected_nifti: torch.Tensor | None = None  # precomputed (nx,ny,nz,T) 3-D-warp series
@@ -4215,6 +4221,10 @@ def _run_3dacq_plain(
         dual=dual,
         pe_axis2=pe_axis2,
         sep_map=sep_field,
+        # NIfTI order already (the estimate closure builds (nx,ny,nz,T)); perm4 would
+        # convert to the canonical layout, which is not what gets written out.
+        null_field=(disp[len(axes) - 1] if null_axis is not None else None),
+        null_axis=null_axis,
         corrected_nifti=corrected,
         confidence=conf_field,
         corr_curve=curve_box["curve"],
@@ -4388,6 +4398,26 @@ def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
     the third axis only re-divides the same artifact three ways instead of two, worth
     9% on that synthetic.
 
+    Plain least squares, and Deming was implemented and measured before settling on
+    that. The regressor IS an estimate, so an OLS slope is attenuated toward zero by
+    errors-in-variables, and correcting that with the same
+    :func:`fastfuncstuff.phasereg.deming.deming_regression` phase regression uses is
+    the obvious move. It is worse at every noise level tested -- residual against the
+    truth, as noise is added to the null channel:
+
+        null noise   0.00   0.02   0.05   0.10   0.20   0.30   0.50
+        OLS        0.0286 0.0364 0.0614 0.1111 0.2189 0.3081 0.4515
+        Deming     0.1007 0.1021 0.1124 0.1474 0.2521 0.3521 0.5204
+
+    Two reasons, and they are structural rather than a tuning failure. The objective
+    here is PREDICTION -- remove the part of the encode axis the null predicts -- and
+    OLS is the minimum-MSE linear predictor by construction, so attenuation is the
+    correct response to a noisy regressor rather than a defect: a channel you measured
+    badly should be trusted less. And Deming assumes both variables measure one latent
+    with symmetric error, while the encode axis legitimately carries REAL motion that
+    is not error at all; counting it as error tilts the slope and over-removes, which
+    is why Deming loses even at zero noise. Removed rather than left as a dead knob.
+
     ``min_r2`` leaves a voxel untouched unless the null explains that fraction of the
     encoded axis's variance, so a channel that is pure noise at a voxel cannot inject
     displacement there. ``gate`` is an optional extra per-voxel mask (conditioning,
@@ -4406,14 +4436,15 @@ def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
         y = fields[k]
         yc = y - y.mean(dim=-1, keepdim=True)
         sxy = (x * yc).sum(dim=-1)
+        syy = (yc * yc).sum(dim=-1)
         beta = sxy / sxx.clamp(min=1e-20)
         keep = sxx > 0
         if min_r2 > 0:
-            syy = (yc * yc).sum(dim=-1)
             r2 = (sxy * sxy) / (sxx * syy).clamp(min=1e-20)
             keep = keep & (r2 >= min_r2)
         if gate is not None:
             keep = keep & (gate > 0)
+        beta = torch.nan_to_num(beta, nan=0.0, posinf=0.0, neginf=0.0)
         out[k] = y - torch.where(keep, beta, torch.zeros_like(beta))[..., None] * x
     return out
 
