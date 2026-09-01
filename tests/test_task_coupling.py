@@ -1404,3 +1404,45 @@ def test_warp_project_out_is_chunk_invariant_and_preserves_the_mean(monkeypatch)
     # ...and the per-voxel temporal MEAN survived. It is not a component, and dropping
     # it would move every voxel by its own average displacement.
     assert torch.allclose(out.mean(-1), disp.mean(-1).float(), atol=1e-5)
+
+
+def test_ica_rank_sweep_extends_past_a_grid_edge_winner():
+    """An argmax on the grid boundary means the grid is wrong, not that the edge is best.
+
+    Regression from a real run: the sweep's 0.15 floor (rank 33 of 224) won outright
+    with enrichment falling monotonically above it, so the optimum was never searched.
+    The sweep must now walk outward until the winner is interior.
+
+    Driven with a stub scorer rather than real ICA fits: what is under test is the
+    SEARCH, and a real decomposition would make this slow and non-deterministic.
+    """
+    from fastfuncstuff.cli import locomoco as cli
+
+    tried = []
+
+    def fake_ica(comps, n_components=None, pca_components=None, device=None):
+        tried.append(n_components)
+        # Monotonically better toward low rank, with the true optimum at 4 — well
+        # below any grid floor the coarse pass would place.
+        return (torch.zeros(8, 1), [(1, torch.zeros(2, 2, 2, 1))], [torch.zeros(2, 2, 2)], None)
+
+    def fake_enrichment(values, active, mask):
+        return {"enrichment": 100.0 / max(tried[-1], 1)}
+
+    import fastfuncstuff.processing.locomoco as loco_proc
+    import fastfuncstuff.stats.task_coupling as tc_mod
+
+    old_ica, old_enr = loco_proc.warp_ica_basis, tc_mod.map_enrichment
+    loco_proc.warp_ica_basis, tc_mod.map_enrichment = fake_ica, fake_enrichment
+    try:
+        best, _got = cli._ica_rank_sweep(
+            [(1, torch.zeros(2, 2, 2, 8))], None, None, [33, 67, 100], torch.device("cpu")
+        )
+    finally:
+        loco_proc.warp_ica_basis, tc_mod.map_enrichment = old_ica, old_enr
+
+    # It must have gone BELOW the grid floor rather than stopping at 33.
+    assert min(tried) < 33, tried
+    assert best < 33, (best, tried)
+    # ...and kept halving until it hit the floor of 2.
+    assert best <= 4, (best, tried)

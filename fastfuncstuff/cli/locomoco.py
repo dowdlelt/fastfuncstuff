@@ -2188,6 +2188,20 @@ def _ica_rank_sweep(comps, resp, mask, ranks, device):
     Coarse grid then a local refine rather than a trisection: the criterion is not
     guaranteed unimodal, and one ICA fit is seconds, so a grid that cannot be fooled is
     cheaper than a bisection that can.
+
+    The grid is weighted toward LOW ranks and self-extends when the winner lands on an
+    edge. An argmax on the boundary means the optimum was never searched, not that the
+    boundary is optimal -- seen on a real run, where the old 0.15 floor (rank 33) won
+    outright with enrichment falling monotonically above it.
+
+    A bias worth knowing when reading the numbers. ``peak`` is a MAX over the k
+    components, so a larger k gets more draws and is favoured by chance alone -- the
+    criterion is biased UPWARD in rank. So a sweep in which enrichment *falls* with rank
+    is stronger evidence for a low optimum than it looks, because the bias points the
+    other way. It also means peak enrichment is not comparable across ranks in absolute
+    terms; it is used to rank candidates, not to quantify contamination. The enrichment
+    reported in the diagnostic, which is computed on the field rather than on a
+    max-over-components, is the number to quote.
     """
     from fastfuncstuff.processing.locomoco import warp_ica_basis
     from fastfuncstuff.stats.task_coupling import map_enrichment
@@ -2212,12 +2226,41 @@ def _ica_rank_sweep(comps, resp, mask, ranks, device):
 
     seen: dict[int, float] = {}
     best_rank, best_peak, best_got = ranks[0], -1.0, None
-    for rank in ranks:
+
+    def _try(rank, tag=""):
+        nonlocal best_rank, best_peak, best_got
+        if rank in seen or rank < 2:
+            return
         peak, got = score(rank)
         seen[rank] = peak
-        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x")
+        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x{tag}")
         if peak > best_peak:
             best_rank, best_peak, best_got = rank, peak, got
+
+    for rank in ranks:
+        _try(rank)
+
+    # An argmax on the EDGE of the grid means the grid is wrong, not that the edge is
+    # optimal -- the optimum is outside what was searched. Extend outward until the
+    # winner is interior or the bound is reached. Measured on a real run this mattered:
+    # the grid floor (rank 33 of a 0.15-0.8 span) won outright with enrichment falling
+    # monotonically above it, so the true optimum was never in the search at all.
+    #
+    # Extending DOWN is nearly free -- a low-rank ICA is the fastest fit and the
+    # smallest allocation -- which is the other reason not to just widen the fixed grid
+    # and pay for the high ranks that were already losing.
+    for _ in range(5):
+        order = sorted(seen)
+        if best_rank == order[0] and best_rank > 2:
+            cand = max(2, best_rank // 2)
+        elif best_rank == order[-1] and best_rank < ranks[-1]:
+            cand = min(ranks[-1], best_rank + max(1, best_rank - order[-2]))
+        else:
+            break
+        if cand in seen:
+            break
+        _try(cand, "  (edge)")
+
     # One refine pass halfway to each neighbour of the winner.
     order = sorted(seen)
     i = order.index(best_rank)
@@ -2227,14 +2270,9 @@ def _ica_rank_sweep(comps, resp, mask, ranks, device):
     if i < len(order) - 1:
         refine.append((best_rank + order[i + 1]) // 2)
     for rank in refine:
-        if rank in seen or rank < 2:
-            continue
-        peak, got = score(rank)
-        seen[rank] = peak
-        print(f"    rank {rank:4d}: peak enrichment {peak:.2f}x  (refine)")
-        if peak > best_peak:
-            best_rank, best_peak, best_got = rank, peak, got
-    print(f"    → rank {best_rank} wins at {best_peak:.2f}x")
+        _try(rank, "  (refine)")
+    edge = " — AT THE GRID EDGE, treat as a lower bound" if best_rank == min(seen) else ""
+    print(f"    → rank {best_rank} wins at {best_peak:.2f}x{edge}")
     return best_rank, best_got
 
 
@@ -2315,7 +2353,12 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
         else:
             n_t = comps[0][1].shape[-1]
             top = max(4, n_t - 1)
-            grid = sorted({max(2, int(top * f)) for f in (0.15, 0.3, 0.45, 0.6, 0.8)})
+            # Weighted toward LOW ranks: over-splitting is the failure mode that has
+            # actually been observed (60 found the task source, 119 lost it), the
+            # optimum has landed on the old 0.15 floor on real data, and a low-rank fit
+            # is both the fastest and the smallest allocation. The edge-extension below
+            # covers whatever this still misses.
+            grid = sorted({max(2, int(top * f)) for f in (0.05, 0.1, 0.15, 0.3, 0.5, 0.75)})
             print_cli_subsection("ICA RANK SWEEP — peak task enrichment over components")
             n_pcs, got = _ica_rank_sweep(comps, resp, mask, grid, device)
     elif method == "ica":
