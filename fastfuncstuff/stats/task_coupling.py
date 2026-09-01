@@ -641,6 +641,28 @@ def map_enrichment(
     and a warp PC's spatial loading. The second is the one that matters for rejection:
     a component's correlation with the design is a 2-DoF statistic and cannot be
     thresholded, but WHERE its weights live can.
+
+    What this is NOT, so the limits are on the record. The active mask is BINARY, so
+    every voxel in the decile counts the same and the graded ``r`` values are discarded.
+    It measures concentration, not SHAPE -- a component whose energy sits inside the
+    mask arranged nothing like the response scores the same as one that traces it. And
+    the denominator is the whole brain, so large loadings anywhere else dilute the
+    score, which is what every real motion component has.
+
+    :func:`co_location` is the shape-matching alternative (Pearson between ``|field r|``
+    and ``|data r|``), and it was measured against this one rather than assumed worse.
+    On the 0.8mm checkerboard run neither finds anything, because the information is
+    not in the components:
+
+        comp 0 (31.7% var):  enrichment 1.18x,  corr(|loading|, |r|_data) +0.068
+        ...no component exceeds 1.25x or |corr| 0.07...
+        the FIELD's own task-r map:            corr(|r|_field, |r|_data) +0.386
+
+    The field is plainly co-located with the response; its principal components are
+    not. That gap is the supervised/unsupervised one -- isolating a signal worth 0.7%
+    of the field's variance needs a projection that knows what it is looking for, which
+    is :func:`project_task_out`, not a variance decomposition. Do not re-try this by
+    swapping the scorer.
     """
     m = mask.reshape(-1) > 0
     a = (active.reshape(-1) > 0) & m
