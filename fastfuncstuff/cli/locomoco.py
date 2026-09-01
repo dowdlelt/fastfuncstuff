@@ -1617,6 +1617,32 @@ def _paired_bins_for(args, n_timepoints: int, tr: float, device):
     return bin_of
 
 
+def _pe_axis_name(label: str, axis: int, args) -> str:
+    """``pe1 (primary PE AP, axis 1)`` — the filename stem first, then what it means.
+
+    Every task-coupling number is reported twice, once per encode axis, and the two
+    blocks used to be headed "PE displacement" and "partition displacement" with the
+    ``pe1``/``pe2`` suffix that names the files on disk appearing nowhere. Lead with
+    the suffix so a block and a ``_taskr_pe2.nii.gz`` are obviously the same thing.
+    """
+    letter = "xyz"[axis] if 0 <= axis < 3 else "?"
+    # A -pe_dir2-only run still labels its single field "pe1" (pe_displacements has no
+    # second axis to report), but that field IS the partition -- the same case the
+    # setup path handles by resolving pe_axis from pe_dir2. Calling it "primary PE"
+    # here would name it the one thing it is not.
+    partition_only = not args.pe_dir and args.pe_dir2 is not None
+    if label == "pe1" and not partition_only:
+        direction = args.pe_dir[0] if args.pe_dir else None
+        kind = "primary PE"
+    else:
+        direction = args.pe_dir2 or (
+            args.pe_dir[1] if args.pe_dir and len(args.pe_dir) > 1 else None
+        )
+        kind = "partition"
+    dir_txt = f" {direction}" if direction else ""
+    return f"{label} ({kind}{dir_txt}, axis {axis} = {letter})"
+
+
 def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     """Measure how task-locked the estimated field is, and whether that is BOLD.
 
@@ -1671,7 +1697,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         tc = task_coupling(field, design, **kwargs)
         coloc = co_location(tc.r, data_tc.r, mask)
         r_sum, q_sum = tc.summarize(resp), tc.summarize(quiet)
-        name = "PE displacement" if label == "pe1" else "partition displacement"
+        name = _pe_axis_name(label, axis, args)
         # The gradient must be along THIS axis: a partition-direction displacement
         # produces an intensity change through the partition-direction gradient, and
         # using the primary-PE gradient for it would test the wrong relation.
@@ -1689,7 +1715,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
                 data_tc,
                 coloc,
                 units="voxels",
-                label=f"{name} (axis {axis})",
+                label=name,
                 responding=r_sum,
                 quiet=q_sum,
                 top_frac=args.task_top_frac,
@@ -1700,11 +1726,14 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         )
         best = r_sum["conditions"][best_k]
         print(
-            f"  • {name}: ENRICHMENT {enrich['enrichment']:.2f}x "
-            f"({enrich['energy_share'] * 100:.1f}% of task-locked displacement in "
-            f"{enrich['voxel_share'] * 100:.1f}% of voxels); |r| {best['abs_r_median']:.3f} "
-            f"there ({best['label']}); kappa {slope['kappa']:+.3f} (R² {slope['r2']:.3f})"
+            f"  • {name}: enrichment {enrich['enrichment']:.2f}x, "
+            f"|r| {best['abs_r_median']:.3f} med / {best['abs_r_p95']:.3f} p95 in the "
+            f"active mask ({best['label']}), kappa {slope['kappa']:+.3f}"
         )
+        # The verdict sentence, and only that. The full stratum table goes to the .txt:
+        # it was echoed here in full for every axis, which buried the one line that
+        # actually says what to do.
+        print(f"    {report[-1].rstrip().splitlines()[-1].strip()}")
         # One 4-D file per axis, conditions on the 4th axis — a viewer scrubs the
         # conditions, and one file per condition would flood the output directory.
         for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms)):
@@ -1728,9 +1757,6 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     tpath = f"{stem}_locomoco_taskcoupling.txt"
     Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print(f"  • task-coupling report: {tpath}")
-    for block in report:
-        print()
-        print("\n".join("    " + ln for ln in block.rstrip().splitlines()))
     return design, polort
 
 

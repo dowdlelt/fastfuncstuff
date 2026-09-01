@@ -19,6 +19,7 @@ from fastfuncstuff.stats.task_coupling import (
     co_location,
     contamination_slope,
     default_polort,
+    format_task_coupling_report,
     pe_gradient,
     responding_mask,
     task_coupling,
@@ -453,3 +454,40 @@ def test_chance_share_is_arithmetic_not_a_null():
     tc = task_coupling(_field(n_t, seed=1), x, polort=2)
     assert tc.n_timepoints == n_t
     assert tc.chance_share == pytest.approx((1 / (n_t - 2 - 1)) ** 0.5, rel=1e-6)
+
+
+def test_pe_axis_name_never_calls_the_partition_the_primary_pe():
+    """A ``-pe_dir2``-only run labels its one field ``pe1`` — it is still the partition.
+
+    ``pe_displacements`` has no second axis to report on a single-axis run, so the
+    label alone cannot say which axis it is. Naming that block "primary PE" told the
+    reader the one thing it is not.
+    """
+    from types import SimpleNamespace
+
+    from fastfuncstuff.cli.locomoco import _pe_axis_name
+
+    partition_only = SimpleNamespace(pe_dir=None, pe_dir2="IS")
+    name = _pe_axis_name("pe1", 2, partition_only)
+    assert "partition" in name and "primary" not in name
+    assert "pe1" in name and "IS" in name and "axis 2" in name
+
+    both = SimpleNamespace(pe_dir=["AP"], pe_dir2="IS")
+    assert _pe_axis_name("pe1", 1, both).startswith("pe1 (primary PE AP")
+    assert _pe_axis_name("pe2", 2, both).startswith("pe2 (partition IS")
+
+
+def test_report_is_compact_and_names_the_axis_it_is_about():
+    """The report is read once per axis per run; it must fit on a screen.
+
+    It used to be ~55 lines of methodology per axis, echoed to stdout AND written to
+    the .txt, with the ``pe1``/``pe2`` suffix that names the files on disk appearing
+    nowhere in it.
+    """
+    rng = np.random.default_rng(0)
+    design = _block_design(60)
+    field = torch.as_tensor(rng.normal(size=(6, 6, 4, 60)), dtype=torch.float32)
+    tc = task_coupling(field, design, polort=2, labels=["check"])
+    text = format_task_coupling_report(tc, label="pe2 (partition IS, axis 2 = z)")
+    assert len(text.splitlines()) <= 15, text
+    assert "pe2 (partition IS, axis 2 = z)" in text.splitlines()[0]

@@ -517,82 +517,61 @@ def format_task_coupling_report(
     enrichment: dict | None = None,
     active_thresh: float | None = None,
 ) -> str:
-    """Human-readable verdict, for stdout and the saved .txt."""
+    """Compact verdict, for the saved .txt and a one-line stdout echo.
+
+    Numbers only. The reasoning behind each statistic — why signed ``r`` and not R2,
+    why there is no per-voxel significance, why every summary is stratified by the
+    data's own response — is in the module docstring and the wiki, not on stdout once
+    per axis per run.
+    """
+    chance = field.chance_share
+    n_k = len(field.labels)
     lines = [
-        "ffs task-coupling diagnostic",
-        f"  map under test   : {label}",
-        "  maps             : SIGNED partial r per condition, DESCRIPTIVE only --",
-        "                     a handful of blocks is ~2 degrees of freedom, so no",
-        "                     surrogate can make one voxel's r significant (a",
-        "                     phase-randomized null's p95 matched the true |r| to three",
-        "                     decimals at every noise level). The inference is the",
-        "                     kappa slope below, across voxels.",
-        f"  drift removed    : polort {field.polort}",
+        f"ffs task-coupling — {label}",
+        f"  design      : {n_k} condition(s) ({', '.join(field.labels)}), "
+        f"{field.n_timepoints} frames, drift polort {field.polort}",
     ]
-
     if enrichment is not None:
-        thr = f"|r|_data > {active_thresh:.3f}" if active_thresh is not None else "top voxels"
-        lines += [
-            "",
-            "  HOW MUCH OF THE FIELD'S TASK COUPLING IS WHERE THE TASK IS?",
-            f"    active mask ({thr}): {enrichment['n_active']} voxels "
-            f"= {enrichment['voxel_share'] * 100:.1f}% of the brain",
-            f"    share of the field's task-locked displacement inside it: "
-            f"{enrichment['energy_share'] * 100:.1f}%",
-            f"    ENRICHMENT {enrichment['enrichment']:.2f}x"
-            "   (1.0 = spread like the brain, i.e. unrelated to where the task is)",
-        ]
+        thr = f" at |r|_data > {active_thresh:.3f}" if active_thresh is not None else ""
+        lines.append(
+            f"  active mask : {enrichment['n_active']} vox "
+            f"({enrichment['voxel_share'] * 100:.1f}% of brain){thr}"
+        )
 
-    def _stratum(title: str, st: dict | None) -> list[str]:
+    strata = [(f"active(top{top_frac * 100:.0f}%)", responding), ("quiet", quiet)]
+    strata = [(n, s) for n, s in strata if s is not None] + [("whole mask", field.summary)]
+    lines += [
+        "",
+        f"  {'stratum':<18}{'cond':<14}{'|r| med':>9}{'|r| p95':>9}"
+        f"{'task-expl':>11}  (chance {chance * 100:.0f}%)",
+    ]
+    for name, st in strata:
         if not st or st.get("n_voxels", 0) == 0:
-            return ["", f"  {title}: (empty)"]
-        out = ["", f"  {title}  [{st['n_voxels']} voxels]"]
-        for c in st["conditions"]:
-            out.append(
-                f"    {c['label']:<14} r {c['r_median']:+.3f} median, "
-                f"|r| {c['abs_r_median']:.3f} median / {c['abs_r_p95']:.3f} p95"
+            lines.append(f"  {name:<18}(empty)")
+            continue
+        share = f"{_share(st) * 100:.0f}%"
+        for i, c in enumerate(st["conditions"]):
+            lines.append(
+                f"  {name if i == 0 else '':<18}{c['label'][:13]:<14}"
+                f"{c['abs_r_median']:>9.3f}{c['abs_r_p95']:>9.3f}"
+                f"{share if i == 0 else '':>11}" + (f"  [{st['n_voxels']} vox]" if i == 0 else "")
             )
 
-        chance = field.chance_share
-        out.append(
-            f"    {'displacement':<14} {st['task_rms_median']:.4f} of "
-            f"{st['total_rms_median']:.4f} {units} rms is task-explained "
-            f"({_share(st) * 100:.0f}%, chance ~{chance * 100:.0f}%)"
-        )
-        return out
-
-    if responding is not None:
-        lines += _stratum(
-            f"WHERE THE DATA RESPONDS (top {top_frac * 100:.0f}% of |r| in the data)",
-            responding,
-        )
-        lines += _stratum("where it does not", quiet)
-        lines += _stratum("whole mask", field.summary)
-    else:
-        lines += _stratum("whole mask", field.summary)
-
+    tail = []
+    if enrichment is not None:
+        tail.append(f"enrichment {enrichment['enrichment']:.2f}x")
+    if coloc is not None:
+        tail.append(f"co-location r {coloc:+.3f}")
+    if slope is not None:
+        tail.append(f"kappa {slope['kappa']:+.3f} (centred r {slope['r']:+.3f})")
+    if tail:
+        lines += ["", "  " + "  ·  ".join(tail)]
     if data is not None:
         dc = data.strongest
-        lines += [
-            "",
-            f"  data coupling    : r {dc.get('r_median', 0):+.3f} median, "
-            f"|r| p95 {dc.get('abs_r_p95', 0):.3f} -- the BOLD response itself",
-        ]
-    if coloc is not None:
-        lines += [f"  co-location      : r {coloc:+.4f}  (field |r| map vs data |r| map)"]
-    if slope is not None:
-        lines += [
-            "",
-            "  THE PHYSICAL TEST -- does the displacement account for the intensity change?",
-            f"    beta_data ~ kappa * (PE gradient x beta_field)   over {slope['n']} voxels",
-            f"    kappa {slope['kappa']:+.3f}   centred r {slope['r']:+.3f}   "
-            f"(through-origin R2 {slope['r2']:.3f})",
-            "    Read the CENTRED r: the through-origin R2 is inflated whenever both",
-            "    sides share a mean, so it can look strong with no covariation at all.",
-            "    Corroborating only -- this per-voxel relation is exact for an unpooled",
-            "    estimator, and LK/qwarp pool over a window, which blurs it. A weak kappa",
-            "    does NOT clear the estimator; a strong one is good evidence.",
-        ]
+        lines.append(
+            f"  data response: |r| med {dc.get('abs_r_median', 0):.3f} "
+            f"p95 {dc.get('abs_r_p95', 0):.3f}   ({units} rms for the field columns)"
+        )
     if coloc is not None:
         lines += ["", "  " + _verdict(field, coloc, responding, slope, enrichment)]
     return "\n".join(lines) + "\n"
@@ -642,38 +621,26 @@ def _verdict(
     e = enrichment["enrichment"] if enrichment else None
     kap = ""
     if slope is not None and slope["n"] > 100 and abs(slope["r"]) > 0.2:
-        kap = (
-            f" The physical test agrees: kappa {slope['kappa']:+.2f} at centred r "
-            f"{slope['r']:+.2f}."
-        )
+        kap = f" Physical test agrees (kappa {slope['kappa']:+.2f}, centred r {slope['r']:+.2f})."
 
     if ratio >= 2.0 or (e is not None and e >= 1.5 and ratio >= 1.3):
-        lead = (
-            f"CONTAMINATION: {share * 100:.0f}% of the field's displacement {where} is "
-            f"task-explained, {ratio:.1f}x what an unrelated field would show"
-        )
-        if e is not None:
-            lead += f", and it is {e:.2f}x concentrated on active tissue"
+        conc = f", {e:.2f}x concentrated on active tissue" if e is not None else ""
         return (
-            lead + ". The estimator is moving voxels, in a task-correlated way, where "
-            "voxels are task-correlated." + kap + " -ref paired prevents it; -detask "
-            "removes it from the field you already have."
+            f"CONTAMINATION {where}: {share * 100:.0f}% task-explained, {ratio:.1f}x "
+            f"chance{conc}.{kap} Fix: -ref paired, or -detask on this field."
         )
     if ratio < 0.8:
         return (
-            f"No task coupling {where}: {share * 100:.0f}% task-explained against a "
-            f"{chance * 100:.0f}% chance level, i.e. BELOW what an unrelated field "
-            "gives. Nothing to fix (a paired reference lands here by construction)."
+            f"CLEAR {where}: {share * 100:.0f}% task-explained, BELOW the "
+            f"{chance * 100:.0f}% chance level (where a paired reference lands)."
         )
     if best["abs_r_median"] > 0.25:
         return (
-            f"Task-locked {where} (|r| {best['abs_r_median']:.2f}) but only "
-            f"{ratio:.1f}x the chance share, and not concentrated on active tissue. "
-            "That is the signature of real task-correlated motion, or of a slow field "
-            "aliasing onto a slow design -- do not project it out without looking at "
-            "the maps."
+            f"TASK-LOCKED {where} (|r| {best['abs_r_median']:.2f}) at only {ratio:.1f}x "
+            "chance and not on active tissue — real task-correlated motion, or a slow "
+            "field aliasing onto a slow design. Check the maps before projecting."
         )
     return (
-        f"No appreciable task coupling {where} ({share * 100:.0f}% task-explained vs "
-        f"{chance * 100:.0f}% chance). Nothing to fix on this run."
+        f"NO APPRECIABLE COUPLING {where}: {share * 100:.0f}% task-explained vs "
+        f"{chance * 100:.0f}% chance."
     )
