@@ -1194,7 +1194,7 @@ def create_parser() -> argparse.ArgumentParser:
         "              nothing can bleed through the iterative solve into other frames\n"
         "              -- which is the one thing 'field' cannot offer, since it cleans\n"
         "              a field the task already helped produce. The band is chosen from\n"
-        "              the design's own spectrum: every line carrying at least 1% of the\n"
+        "              the design's own spectrum: every line carrying at least 1%% of the\n"
         "              strongest one. N widens it by N bins either side, for amplitude\n"
         "              non-stationarity across blocks (adaptation, attention drift). It\n"
         "              is NOT for HRF width -- convolution multiplies spectra, so a\n"
