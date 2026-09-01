@@ -767,11 +767,13 @@ def test_cli_detask_filter_actually_reaches_the_estimator(tmp_path):
 def test_parse_warp_recon_specs():
     from fastfuncstuff.cli.locomoco import parse_warp_recon
 
-    assert parse_warp_recon(None) == (None, False)
-    assert parse_warp_recon("pcs") == (None, True)
-    assert parse_warp_recon("pcs:all") == (None, True)
-    assert parse_warp_recon("pcs:5") == (5, True)
-    for bad in ("pcs:x", "eigen", "pcs:0"):
+    assert parse_warp_recon(None) == (None, None)
+    assert parse_warp_recon("pcs") == (None, None)
+    assert parse_warp_recon("pcs:all") == (None, None)
+    assert parse_warp_recon("pcs:5") == (5, None)
+    # Below 1 is a variance FRACTION -- unambiguous, since a count below 1 is meaningless.
+    assert parse_warp_recon("pcs:0.8") == (None, 0.8)
+    for bad in ("pcs:x", "eigen", "pcs:0", "pcs:2.5"):
         with pytest.raises(ValueError):
             parse_warp_recon(bad)
 

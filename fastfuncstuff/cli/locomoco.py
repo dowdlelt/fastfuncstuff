@@ -1187,8 +1187,13 @@ def create_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="SPEC",
         help="Rebuild the field from its warp PCs before any output is derived. SPEC is\n"
-        "'pcs' (all components -- a no-op on its own, the useful form with -reject) or\n"
-        "'pcs:N' (the top N by variance). The leading components carry the bulk of the\n"
+        "'pcs' (all components -- a no-op on its own, the useful form with -reject),\n"
+        "'pcs:N' (the top N by variance), or 'pcs:0.F' (however many components reach\n"
+        "that FRACTION of the variance, e.g. pcs:0.8 for 80%%). A value below 1 is read\n"
+        "as a fraction; it travels better between runs than a fixed count.\n"
+        "Independent of -want_pcs, which only chooses how many PC time courses are\n"
+        "WRITTEN as regressors -- the reconstruction uses whatever SPEC says.\n"
+        "The leading components carry the bulk of the\n"
         "motion; truncating denoises the warp. Whether the task rides in them is a\n"
         "property of the RUN, not a law -- on a sparse checkerboard response it does\n"
         "not (all five leading PCs sat BELOW chance at the task line), but a global\n"
@@ -1209,6 +1214,11 @@ def create_parser() -> argparse.ArgumentParser:
         "design: a block design is ~2 degrees of freedom, so a temporal correlation\n"
         "cannot be thresholded, while an energy share against the active mask has a\n"
         "no-relation value of 1.0 by construction and needs no null.\n"
+        "Bites when the response is WIDESPREAD (a breath-hold). A sparse response is\n"
+        "too small a share of the field's variance for PCA to isolate -- measured, the\n"
+        "contaminated voxels were 0.65%% of the mask carrying 0.70%% of the energy, and\n"
+        "no component scored above 1.25x while the field was 8.8x enriched at its tail.\n"
+        "For that case use -detask filter or -detask field; this says so at runtime.\n"
         "The decision is per COMPONENT PER AXIS -- the temporal basis is shared, but\n"
         "each component carries its own spatial loading on each encode axis, so one\n"
         "can be dropped from the primary PE and kept on the partition.",
@@ -1906,22 +1916,39 @@ def _pc_task_correlation(components, design, polort) -> float:
 
 
 def parse_warp_recon(value):
-    """``-warp_recon`` SPEC -> number of PCs to keep, or None for all."""
+    """``-warp_recon`` SPEC -> ``(count, variance_fraction)``, either of which may be None.
+
+    ``pcs`` / ``pcs:all`` keep everything, ``pcs:N`` keeps N by variance rank, and
+    ``pcs:0.8`` keeps however many components it takes to reach 80% of the variance.
+    A value below 1 is read as a FRACTION, which is unambiguous because an integer
+    count below 1 is meaningless -- and it is the more portable request, since the
+    number of components worth keeping is a property of the run, not a constant.
+    """
     if value is None:
-        return None, False
+        return None, None
     text = str(value).strip().lower()
     if text in ("pcs", "pcs:all"):
-        return None, True
+        return None, None
     if text.startswith("pcs:"):
         tail = text.split(":", 1)[1]
         try:
-            n = int(tail)
+            num = float(tail)
         except ValueError:
-            raise ValueError(f"-warp_recon pcs:N needs an integer or 'all', got {tail!r}") from None
-        if n < 1:
-            raise ValueError(f"-warp_recon pcs:N needs N >= 1, got {n}")
-        return n, True
-    raise ValueError(f"-warp_recon SPEC must be 'pcs' or 'pcs:N', got {value!r}")
+            raise ValueError(
+                f"-warp_recon pcs:N needs an integer, a variance fraction below 1, or "
+                f"'all', got {tail!r}"
+            ) from None
+        if num <= 0:
+            raise ValueError(f"-warp_recon pcs:N needs a positive value, got {tail!r}")
+        if num < 1:
+            return None, num
+        if float(num).is_integer():
+            return int(num), None
+        raise ValueError(
+            f"-warp_recon pcs:{tail} is ambiguous: below 1 is a variance fraction, "
+            "1 or more must be a whole number of components."
+        )
+    raise ValueError(f"-warp_recon SPEC must be 'pcs', 'pcs:N' or 'pcs:0.F', got {value!r}")
 
 
 def _warp_recon_stage(result, data, args, resp, mask, device):
@@ -1935,22 +1962,36 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
     from fastfuncstuff.processing.locomoco import pc_reconstruct_result, warp_pc_basis
     from fastfuncstuff.stats.task_coupling import map_enrichment
 
-    n_pcs, _ = parse_warp_recon(args.warp_recon)
+    n_pcs, var_frac = parse_warp_recon(args.warp_recon)
     got = warp_pc_basis(
-        [(ax, f) for _, ax, f in result.pe_displacements()], n_pcs=n_pcs, device=device
+        [(ax, f) for _, ax, f in result.pe_displacements()],
+        n_pcs=None if var_frac is not None else n_pcs,
+        device=device,
     )
     if got is None:
         print("  ⚠️  -warp_recon: the warp is empty — nothing to reconstruct.")
         return result
     u, loadings, _means, var = got
+    if var_frac is not None:
+        # Cumulative over the FULL basis, so the fraction means what it says rather than
+        # a fraction of some earlier truncation.
+        n_pcs = int(torch.searchsorted(torch.cumsum(var, 0), float(var_frac)).item()) + 1
+        n_pcs = max(1, min(n_pcs, u.shape[1]))
+        u, var = u[:, :n_pcs].contiguous(), var[:n_pcs]
+        loadings = [(ax, load[..., :n_pcs].contiguous()) for ax, load in loadings]
+        print(
+            f"  -warp_recon pcs:{var_frac:g} → {n_pcs} component(s) reach "
+            f"{float(var.sum()):.1%} of the variance"
+        )
     k = u.shape[1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
 
-    keep, dropped = {}, {}
+    keep, dropped, best = {}, {}, 0.0
     for axis, load in loadings:
         idx = list(range(k))
         if args.reject is not None and resp is not None:
             scores = [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
+            best = max(best, max(scores, default=0.0))
             idx = [i for i in range(k) if scores[i] <= args.reject]
             dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
         keep[axis] = idx
@@ -1971,7 +2012,28 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             )
         else:
             print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
-    print(f"    variance of the kept basis: {', '.join(f'{v:.1%}' for v in var[:5].tolist())}")
+    shown = min(5, k)
+    print(
+        f"    leading {shown} of {k} components by variance: "
+        f"{', '.join(f'{v:.1%}' for v in var[:shown].tolist())}"
+        f" (cumulative over all {k}: {float(var.sum()):.1%})"
+    )
+    if args.reject is not None and not any(dropped.values()):
+        # A no-op here is a RESULT, not silence. PCA maximises variance, so a
+        # contamination that is a small share of the field's energy cannot dominate any
+        # component -- measured on a 0.8mm checkerboard run, the contaminated voxels
+        # were 0.65% of the mask carrying 0.70% of the field's energy, and no component
+        # scored above 1.25x while the field itself was 8.8x enriched at the tail.
+        # Lowering the threshold does not reach it; it starts dropping real motion.
+        print(
+            f"    ⓘ  no component's weights are concentrated on active tissue "
+            f"(strongest {best:.2f}x vs the {args.reject:g}x cut). If the diagnostic "
+            "above says CONTAMINATION, this is the expected answer for a SPARSE "
+            "response: it is too small a share of the field's variance for PCA to "
+            "isolate. Use -detask filter (block designs) or -detask field instead. "
+            "Rejection bites when the response is widespread — a breath-hold, say — "
+            "which is the case where truncation alone does not."
+        )
 
     out, note = pc_reconstruct_result(
         result,
