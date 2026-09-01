@@ -798,11 +798,37 @@ def component_task_fit(
 
     mu, sd = null.mean(dim=0), null.std(dim=0).clamp(min=1e-12)
     z = (r2 - mu) / sd
+    # Effective degrees of freedom, read off the null rather than assumed. For an
+    # omnibus R^2 on K regressors, E[R^2] under the null is about K/df, so df is about
+    # K/mean(null). This is the number that says which REGIME the design is in -- ~2
+    # for a periodic block design, ~30-45 for a jittered or irregular one -- and it is
+    # measured per run, so no design ever has to be classified by eye.
+    null_mean = float(mu.mean())
+    eff_dof = float(q_x.shape[1] / null_mean) if null_mean > 0 else float("inf")
     # Empirical p with the +1 correction: a surrogate set can never license p = 0.
     p = (null >= r2[None, :]).sum(dim=0).double().add(1.0) / (n_surrogates + 1)
     max_z = ((null - mu[None, :]) / sd[None, :]).amax(dim=1)
     z_cut = float(torch.quantile(max_z, 1.0 - float(alpha)))
     flagged = [i for i in torch.argsort(z, descending=True).tolist() if float(z[i]) > z_cut]
+
+    # The R^2 a component would need to be flagged at all. When the null already sits
+    # near 1 -- a periodic block design, where a component sharing the design's
+    # spectrum fits it by construction -- this cut is unreachable and "nothing flagged"
+    # means "no power", not "clean". Reporting the two as the same silence is the trap
+    # this field spent a long time in; the caller is told which it is and falls back to
+    # the spatial criterion, which needs no null.
+    r2_needed = float((mu + z_cut * sd).median())
+    # Two ways to have no power, and both must gate. The cut being unreachable is one.
+    # The other is a low effective DoF: a component whose OWN spectrum coincides with
+    # the design's can fit it by accident however high the cut is set, and the
+    # phase-randomised surrogates of a narrowband component are all near-equally good
+    # fits, so the max-z correction (which assumes components are independent) is
+    # anti-conservative exactly there. Measured: broadband components against a
+    # periodic block design give ~195 effective DoF and are safe, while NARROWBAND
+    # components at that design's own frequency give ~5 and flag random-phase
+    # sinusoids that have no task relation at all. 10 separates the two regimes with
+    # room to spare -- the real designs measured sit at 30-85.
+    informative = r2_needed < 0.9 and eff_dof >= 10.0
     return {
         "r2": r2,
         "z": z,
@@ -811,7 +837,23 @@ def component_task_fit(
         "alpha": float(alpha),
         "n_surrogates": int(n_surrogates),
         "null_r2_median": mu,
-        "flagged": flagged,
+        "null_r2_mean": null_mean,
+        "eff_dof": eff_dof,
+        "r2_needed": r2_needed,
+        "informative": informative,
+        "uninformative_reason": (
+            None
+            if informative
+            else (
+                f"the null already reaches R²={r2_needed:.2f}"
+                if r2_needed >= 0.9
+                else (
+                    f"only {eff_dof:.0f} effective DoF — these components share the "
+                    "design's own frequency band, so a fit proves nothing"
+                )
+            )
+        ),
+        "flagged": flagged if informative else [],
     }
 
 

@@ -1287,3 +1287,57 @@ def test_component_task_fit_uses_the_omnibus_not_the_strongest_condition():
     # genuinely less power -- but no condition is structurally invisible, which is what
     # a per-condition statistic keyed on the "strongest" label would risk.
     assert min(scores) > 0.35 * max(scores), scores
+
+
+def _periodic_block(n_t=225, tr=3.5, period=20.0, up=20):
+    """A PURE periodic block design — the ~2 DoF case the module warns about."""
+    n_up = int(n_t * tr * up)
+    t = np.arange(0, 32, 1 / up)
+    h = np.exp(-t / 4.0) * t**2
+    h /= h.sum()
+    box = np.zeros(n_up)
+    for on in np.arange(10, n_t * tr, period):
+        box[int(on * up) : int((on + period / 2) * up)] = 1.0
+    return torch.tensor(np.convolve(box, h)[:n_up][:: int(up * tr)][:n_t])[:, None]
+
+
+def test_component_task_fit_declines_when_the_component_shares_the_design_band():
+    """ "Nothing flagged" must not mean two different things.
+
+    The danger regime is NOT a block design as such — it is a spectral coincidence
+    between a COMPONENT and the design. Measured, all against the same periodic 20 s
+    block design:
+
+        broadband (AR(1)) components   ~195 effective DoF   -> informative
+        narrowband components at 20 s    ~5 effective DoF   -> declines
+
+    A broadband component genuinely cannot fake a narrowband design, so the criterion
+    is perfectly usable on a block design as long as the components are broadband. It
+    is the narrowband case that must decline: random-phase sinusoids at the design's
+    own frequency reach R^2 0.77-0.83 with no task relation whatsoever, and the max-z
+    correction is anti-conservative there because such components are not independent.
+    """
+    design = _periodic_block()
+    n_t = design.shape[0]
+
+    broadband = component_task_fit(_ar1(n_t, 40, 11), design, polort=6, n_surrogates=400)
+    assert broadband["informative"], broadband["uninformative_reason"]
+    assert broadband["eff_dof"] > 50
+
+    rng = np.random.default_rng(0)
+    tt = np.arange(n_t) * 3.5
+    narrow = torch.tensor(
+        np.stack([np.sin(2 * np.pi * tt / 20.0 + rng.uniform(0, 2 * np.pi)) for _ in range(12)], 1)
+    )
+    res = component_task_fit(narrow, design, polort=6, n_surrogates=400)
+    assert res["eff_dof"] < 10
+    assert not res["informative"]
+    # Declining means dropping NOTHING, not dropping the lucky ones. Some of these
+    # sinusoids do cross the raw cut — that is precisely why the gate exists.
+    assert res["flagged"] == []
+    assert "effective DoF" in res["uninformative_reason"]
+
+    # The same components against an irregular design are back in the safe regime,
+    # which confirms the gate keys on the coincidence and not on the components alone.
+    ok = component_task_fit(narrow, _pilot_design(), polort=6, n_surrogates=400)
+    assert ok["informative"] and ok["eff_dof"] > 10
