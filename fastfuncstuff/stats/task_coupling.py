@@ -59,6 +59,7 @@ __all__ = [
     "pe_gradient",
     "responding_mask",
     "task_enrichment",
+    "map_enrichment",
     "enrichment_curve",
     "project_task_out",
     "design_notch_bins",
@@ -624,6 +625,38 @@ def filter_task_band(
     return out.reshape(*spatial, n_t)
 
 
+def map_enrichment(
+    values: torch.Tensor,
+    active: torch.Tensor,
+    mask: torch.Tensor,
+) -> dict:
+    """Share of a map's ENERGY inside ``active``, over the share of voxels it occupies.
+
+    1.0 means the map is spread like the brain, i.e. unrelated to where the task is.
+    Well above 1.0 means it is concentrated on activated tissue. No null is needed --
+    the no-relation value is 1 by construction, not by simulation -- which is why this
+    is the right scorer for a question with ~2 degrees of freedom in time.
+
+    Used for two different maps: a field's task-explained rms (:func:`task_enrichment`)
+    and a warp PC's spatial loading. The second is the one that matters for rejection:
+    a component's correlation with the design is a 2-DoF statistic and cannot be
+    thresholded, but WHERE its weights live can.
+    """
+    m = mask.reshape(-1) > 0
+    a = (active.reshape(-1) > 0) & m
+    energy = (values.reshape(-1)[m].double()) ** 2
+    inside = (values.reshape(-1)[a].double()) ** 2
+    total = float(energy.sum())
+    vox_share = float(a.sum()) / max(1, int(m.sum()))
+    e_share = float(inside.sum()) / total if total > 0 else 0.0
+    return {
+        "n_active": int(a.sum()),
+        "voxel_share": vox_share,
+        "energy_share": e_share,
+        "enrichment": e_share / vox_share if vox_share > 0 else 0.0,
+    }
+
+
 def task_enrichment(
     field: TaskCoupling,
     active: torch.Tensor,
@@ -642,19 +675,7 @@ def task_enrichment(
     tissue, which is what BOLD-driven displacement looks like.  It needs no null: the
     no-relation value is 1 by construction, not by simulation.
     """
-    m = mask.reshape(-1) > 0
-    a = (active.reshape(-1) > 0) & m
-    energy = (field.task_rms.reshape(-1)[m] ** 2).double()
-    inside = (field.task_rms.reshape(-1)[a] ** 2).double()
-    tot = float(energy.sum())
-    vox_share = float(a.sum()) / max(1, int(m.sum()))
-    e_share = float(inside.sum()) / tot if tot > 0 else 0.0
-    return {
-        "n_active": int(a.sum()),
-        "voxel_share": vox_share,
-        "energy_share": e_share,
-        "enrichment": e_share / vox_share if vox_share > 0 else 0.0,
-    }
+    return map_enrichment(field.task_rms, active, mask)
 
 
 def enrichment_curve(

@@ -1182,6 +1182,38 @@ def create_parser() -> argparse.ArgumentParser:
         "against it. Default 4.",
     )
     task.add_argument(
+        "-warp_recon",
+        "-warp-recon",
+        default=None,
+        metavar="SPEC",
+        help="Rebuild the field from its warp PCs before any output is derived. SPEC is\n"
+        "'pcs' (all components -- a no-op on its own, the useful form with -reject) or\n"
+        "'pcs:N' (the top N by variance). The leading components carry the bulk of the\n"
+        "motion; truncating denoises the warp. Whether the task rides in them is a\n"
+        "property of the RUN, not a law -- on a sparse checkerboard response it does\n"
+        "not (all five leading PCs sat BELOW chance at the task line), but a global\n"
+        "response such as a breath-hold puts it in an early component, so -reject is\n"
+        "the part to rely on.",
+    )
+    task.add_argument(
+        "-reject",
+        nargs="?",
+        type=float,
+        const=2.0,
+        default=None,
+        metavar="E",
+        help="[-warp_recon] Also drop any component whose SPATIAL weights are more than\n"
+        "E-fold concentrated on activated tissue (default %(default)s when given bare,\n"
+        "1.0 = spread like the brain). Needs -events.\n"
+        "Scored on WHERE the weights live, not on the component's correlation with the\n"
+        "design: a block design is ~2 degrees of freedom, so a temporal correlation\n"
+        "cannot be thresholded, while an energy share against the active mask has a\n"
+        "no-relation value of 1.0 by construction and needs no null.\n"
+        "The decision is per COMPONENT PER AXIS -- the temporal basis is shared, but\n"
+        "each component carries its own spatial loading on each encode axis, so one\n"
+        "can be dropped from the primary PE and kept on the partition.",
+    )
+    task.add_argument(
         "-detask",
         nargs="?",
         const="field",
@@ -1841,7 +1873,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     tpath = f"{stem}_locomoco_taskcoupling.txt"
     Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print(f"  • task-coupling report: {tpath}")
-    return design, polort
+    return design, polort, resp, mask
 
 
 def _pc_task_correlation(components, design, polort) -> float:
@@ -1873,6 +1905,88 @@ def _pc_task_correlation(components, design, polort) -> float:
     return abs(float(pc.dot(x) / denom)) if denom > 0 else 0.0
 
 
+def parse_warp_recon(value):
+    """``-warp_recon`` SPEC -> number of PCs to keep, or None for all."""
+    if value is None:
+        return None, False
+    text = str(value).strip().lower()
+    if text in ("pcs", "pcs:all"):
+        return None, True
+    if text.startswith("pcs:"):
+        tail = text.split(":", 1)[1]
+        try:
+            n = int(tail)
+        except ValueError:
+            raise ValueError(f"-warp_recon pcs:N needs an integer or 'all', got {tail!r}") from None
+        if n < 1:
+            raise ValueError(f"-warp_recon pcs:N needs N >= 1, got {n}")
+        return n, True
+    raise ValueError(f"-warp_recon SPEC must be 'pcs' or 'pcs:N', got {value!r}")
+
+
+def _warp_recon_stage(result, data, args, resp, mask, device):
+    """Rebuild the field from its warp PCs, optionally dropping task-loaded components.
+
+    ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly
+    the active mask the coupling report was computed on -- the alternative, a second
+    threshold chosen here, would let the report and the fix disagree about where the
+    task is.
+    """
+    from fastfuncstuff.processing.locomoco import pc_reconstruct_result, warp_pc_basis
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    n_pcs, _ = parse_warp_recon(args.warp_recon)
+    got = warp_pc_basis(
+        [(ax, f) for _, ax, f in result.pe_displacements()], n_pcs=n_pcs, device=device
+    )
+    if got is None:
+        print("  ⚠️  -warp_recon: the warp is empty — nothing to reconstruct.")
+        return result
+    u, loadings, _means, var = got
+    k = u.shape[1]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+
+    keep, dropped = {}, {}
+    for axis, load in loadings:
+        idx = list(range(k))
+        if args.reject is not None and resp is not None:
+            scores = [map_enrichment(load[..., i], resp, mask)["enrichment"] for i in range(k)]
+            idx = [i for i in range(k) if scores[i] <= args.reject]
+            dropped[axis] = [(i, scores[i]) for i in range(k) if scores[i] > args.reject]
+        keep[axis] = idx
+
+    kept_txt = f"top {k}" if n_pcs is not None else f"all {k}"
+    print(f"  ── warp PC reconstruction ({kept_txt} components, shared temporal basis) ──")
+    for axis, _load in loadings:
+        lbl = label_of.get(axis, f"axis{axis}")
+        drops = dropped.get(axis, [])
+        if args.reject is None:
+            print(f"  • {lbl}: {len(keep[axis])} of {k} components kept")
+        elif drops:
+            det = ", ".join(f"#{i} ({e:.1f}x)" for i, e in drops[:6])
+            more = f" +{len(drops) - 6} more" if len(drops) > 6 else ""
+            print(
+                f"  • {lbl}: dropped {len(drops)} task-loaded component(s) at "
+                f">{args.reject:g}x — {det}{more}"
+            )
+        else:
+            print(f"  • {lbl}: no component exceeded {args.reject:g}x — nothing dropped")
+    print(f"    variance of the kept basis: {', '.join(f'{v:.1%}' for v in var[:5].tolist())}")
+
+    out, note = pc_reconstruct_result(
+        result,
+        data,
+        keep,
+        n_pcs=n_pcs,
+        warp_interp=args.warp_interp,
+        warp_radius=args.warp_radius,
+        device=device,
+    )
+    if note:
+        print(f"  ⚠️  -warp_recon: {note}")
+    return out
+
+
 def _task_stage(result, data, stem, ext, affine, args, tr, device):
     """Diagnose the ORIGINAL field, then optionally hand back a de-tasked one.
 
@@ -1887,7 +2001,9 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
     from fastfuncstuff.processing.locomoco import detask_result
 
     try:
-        design, polort = _write_task_diagnostics(result, data, stem, ext, affine, args, tr)
+        design, polort, resp, mask = _write_task_diagnostics(
+            result, data, stem, ext, affine, args, tr
+        )
     except (ValueError, RuntimeError) as exc:
         # A diagnostic must never destroy a finished fit. The estimation above can be
         # minutes of GPU time; losing it to a bad -tr or an empty mask is the wrong
@@ -1896,7 +2012,14 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         print(f"  ⚠️  task coupling skipped: {exc}")
         if args.detask_field:
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
+        if args.warp_recon:
+            print("  ⚠️  -warp_recon NOT applied — the outputs below are the ORIGINAL field.")
         return result
+
+    # PC reconstruction runs BEFORE -detask: it rebuilds the field, so a field
+    # projection afterwards acts on what was actually kept.
+    if args.warp_recon:
+        result = _warp_recon_stage(result, data, args, resp, mask, device)
 
     if not args.detask_field:
         return result
@@ -3017,8 +3140,22 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # here rather than let a run finish looking de-tasked.
     try:
         args.detask_field, args.detask_widen = parse_detask(args.detask)
+        parse_warp_recon(args.warp_recon)
     except ValueError as exc:
         print(f"❌ {exc}", file=sys.stderr)
+        return 2
+    if args.reject is not None and not args.warp_recon:
+        print(
+            "❌ -reject modifies -warp_recon; pass -warp_recon pcs (or pcs:N) too.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.reject is not None and not args.events:
+        print(
+            "❌ -reject needs -events: it scores each component against WHERE the task "
+            "response is, which the design defines.",
+            file=sys.stderr,
+        )
         return 2
     if args.detask and not args.events:
         print(

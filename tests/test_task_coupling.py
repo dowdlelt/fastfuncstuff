@@ -762,3 +762,58 @@ def test_cli_detask_filter_actually_reaches_the_estimator(tmp_path):
         return float(p[:, 15].sum() / p.sum())
 
     assert line_power(filt) < 0.5 * line_power(base), (line_power(base), line_power(filt))
+
+
+def test_parse_warp_recon_specs():
+    from fastfuncstuff.cli.locomoco import parse_warp_recon
+
+    assert parse_warp_recon(None) == (None, False)
+    assert parse_warp_recon("pcs") == (None, True)
+    assert parse_warp_recon("pcs:all") == (None, True)
+    assert parse_warp_recon("pcs:5") == (5, True)
+    for bad in ("pcs:x", "eigen", "pcs:0"):
+        with pytest.raises(ValueError):
+            parse_warp_recon(bad)
+
+
+def test_warp_pc_basis_keeps_the_loading_per_axis_and_round_trips():
+    """A component contaminated on ONE axis must score high there and low on the other.
+
+    The whole reason the shared temporal basis is safe: each component carries its own
+    spatial loading per encode axis, so rejection is a per-(component, axis) decision
+    even though the dictionary is common. And keeping every component must reproduce
+    the input exactly -- a reconstruction that quietly loses the temporal mean would
+    move every voxel by its own average displacement.
+    """
+    from fastfuncstuff.processing.locomoco import warp_pc_basis, warp_pc_reconstruct
+    from fastfuncstuff.stats.task_coupling import map_enrichment
+
+    rng = np.random.default_rng(0)
+    n_t, shape = 80, (12, 12, 6)
+    t = np.arange(n_t)
+    resp = np.sin(2 * np.pi * 3 * t / n_t)  # shared, brain-wide
+    task = np.sin(2 * np.pi * 10 * t / n_t)
+    blob = np.zeros(shape, bool)
+    blob[3:7, 3:7, 2:4] = True  # 32 of 864 voxels
+
+    f1 = rng.normal(0, 0.05, (*shape, n_t)) + 0.5 * resp
+    f2 = rng.normal(0, 0.05, (*shape, n_t)) + 0.3 * resp
+    f1 += 0.8 * blob[..., None] * task  # contamination on axis 1 ONLY
+    comps = [(1, torch.tensor(f1)), (2, torch.tensor(f2))]
+
+    u, loadings, _means, _var = warp_pc_basis(comps)
+    mask, active = torch.ones(shape), torch.tensor(blob)
+    scored = [
+        (
+            map_enrichment(loadings[0][1][..., i], active, mask)["enrichment"],
+            map_enrichment(loadings[1][1][..., i], active, mask)["enrichment"],
+        )
+        for i in range(min(4, u.shape[1]))
+    ]
+    worst = max(range(len(scored)), key=lambda i: scored[i][0])
+    assert scored[worst][0] > 5.0, scored  # loud on the contaminated axis
+    assert scored[worst][1] < 2.0, scored  # quiet on the clean one
+
+    full = warp_pc_reconstruct(comps, keep={})
+    assert torch.allclose(full[0][1], torch.tensor(f1, dtype=torch.float32), atol=1e-4)
+    assert torch.allclose(full[1][1], torch.tensor(f2, dtype=torch.float32), atol=1e-4)

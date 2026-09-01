@@ -2246,6 +2246,67 @@ def detask_result(
     )
 
 
+def pc_reconstruct_result(
+    result,
+    data: np.ndarray,
+    keep: dict,
+    n_pcs=None,
+    *,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    device: torch.device | None = None,
+):
+    """Rebuild the field from a subset of its warp PCs and re-derive the corrected series.
+
+    Returns ``(rebuilt_result, note)``; ``note`` is None on success or the reason the
+    corrected series could not be re-derived.
+
+    Writes back through the NIfTI-order view and permutes into the canonical fields,
+    exactly as :func:`detask_result` does and for the same reason: the canonical layout
+    does not put time on a fixed axis across the slicewise and 3-D paths, so acting on
+    ``u_canon`` directly would silently mix a spatial axis into the reconstruction.
+    Going through the canonical fields also means every derived product -- the warp,
+    the PCs, the flow maps, the movie -- inherits the rebuilt field with no second code
+    path to keep in sync.
+    """
+    from dataclasses import replace
+
+    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+    rebuilt = warp_pc_reconstruct(comps, keep, n_pcs=n_pcs, device=device)
+    if rebuilt is None:
+        return result, "the warp is empty -- nothing to reconstruct"
+
+    by_axis = dict(rebuilt)
+    back = list(result.perm)
+
+    def _to_canon(axis):
+        return by_axis[axis].permute(back).contiguous()
+
+    if result.dual and result.pe_axis2 is not None:
+        u_axis = result.pe_axis if result.pe_axis == result.a1 else result.pe_axis2
+        v_axis = result.pe_axis2 if u_axis == result.pe_axis else result.pe_axis
+        out = replace(result, u_canon=_to_canon(u_axis), v_canon=_to_canon(v_axis))
+    else:
+        out = replace(result, u_canon=_to_canon(result.pe_axis))
+
+    if result.reproject_weights is not None:
+        return out, (
+            "rotation-aware mode: the correction reprojects the field through each "
+            "frame's head rotation, so the corrected series was NOT re-derived"
+        )
+    return (
+        resample_from_raw(
+            out,
+            data,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
+            device=device,
+            desc="pc recon resample",
+        ),
+        None,
+    )
+
+
 def resample_from_raw(
     result,
     data: np.ndarray,
@@ -6410,6 +6471,88 @@ def refine_interecho_temporally(
         corr_offsets=res_rf.corr_offsets,
         alpha_label="alpha(÷largest echo)",
     )
+
+
+def warp_pc_basis(components, n_pcs=None, device=None):
+    """Shared temporal PCs of a per-frame warp, WITH the per-axis spatial loadings.
+
+    ``warp_time_pcs`` returns the scores alone, which is all a nuisance regressor
+    needs; reconstruction and rejection need the loadings too, and both need them
+    split back per encode axis.
+
+    The temporal basis is deliberately SHARED across the axes -- the same
+    concatenation ``warp_time_pcs`` already does. Measured on a two-axis 0.8mm run, a
+    per-axis basis buys 0.09 points of explained variance on the primary PE and 0.22
+    on the partition, because the dominant temporal modes (respiration, drift) are
+    common even when the two fields' spatial patterns are not. The coupling report on
+    that run says the axes are "largely independent", which is about the per-voxel
+    displacement RATIO and is not in conflict.
+
+    Sharing the basis costs nothing and constrains nothing: every component carries
+    its OWN spatial loading per axis, so a component can be dropped from one axis and
+    kept on the other. Returns ``(scores (T,k), loadings [(axis, (nx,ny,nz,k))],
+    means [(nx,ny,nz)], var_ratio (k,))``, or None if the warp is empty.
+    """
+    mats, shapes, axes = [], [], []
+    for axis, disp in components:
+        if float(disp.abs().max()) == 0.0:
+            continue
+        t = disp.shape[-1]
+        mats.append(disp.contiguous().reshape(-1, t).T.contiguous())  # (T, spatial)
+        shapes.append(tuple(disp.shape[:3]))
+        axes.append(axis)
+    if not mats:
+        return None
+    widths = [m.shape[1] for m in mats]
+    x = torch.cat(mats, dim=1).double()
+    if device is not None:
+        x = x.to(device)
+    n_t = x.shape[0]
+    mean = x.mean(dim=0, keepdim=True)
+    xc = x - mean
+    # Economy SVD on (T, S) with T ~ 100 and S in the millions: the left factor is what
+    # we want and torch computes it without ever forming an S x S covariance.
+    u, sv, _ = torch.linalg.svd(xc, full_matrices=False)
+    k_max = int(min(n_t - 1, min(widths), sv.numel()))
+    k = k_max if n_pcs is None else max(1, min(int(n_pcs), k_max))
+    u = u[:, :k].contiguous()
+    var = (sv[:k] ** 2) / (sv**2).sum().clamp(min=1e-30)
+
+    load = u.T @ xc  # (k, S) -- component loadings over the pooled columns
+    loadings, means, start = [], [], 0
+    for axis, shape, w in zip(axes, shapes, widths, strict=True):
+        block = load[:, start : start + w].T.reshape(*shape, k)
+        loadings.append((axis, block.contiguous().cpu()))
+        means.append(mean[0, start : start + w].reshape(shape).contiguous().cpu())
+        start += w
+    return u.cpu(), loadings, means, var.cpu()
+
+
+def warp_pc_reconstruct(components, keep, n_pcs=None, device=None):
+    """Rebuild each axis's 4-D field from a subset of the shared temporal PCs.
+
+    ``keep`` is ``{axis: [component indices]}`` -- per axis, because a component can be
+    contaminated on one encode axis and clean on the other. The per-voxel temporal MEAN
+    is always restored: it is not a principal component, and dropping it would move
+    every voxel by its own average displacement.
+    """
+    got = warp_pc_basis(components, n_pcs=n_pcs, device=device)
+    if got is None:
+        return None
+    u, loadings, means, _var = got
+    out = []
+    for (axis, load), mean in zip(loadings, means, strict=True):
+        idx = sorted(set(keep.get(axis, range(u.shape[1]))))
+        shape = tuple(load.shape[:3])
+        if idx:
+            sel = torch.tensor(idx, dtype=torch.long)
+            recon = (load.reshape(-1, load.shape[-1])[:, sel] @ u[:, sel].T).reshape(
+                *shape, u.shape[0]
+            )
+        else:
+            recon = torch.zeros(*shape, u.shape[0], dtype=load.dtype)
+        out.append((axis, (recon + mean[..., None]).float()))
+    return out
 
 
 def warp_time_pcs(
