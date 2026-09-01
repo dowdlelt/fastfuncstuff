@@ -945,7 +945,7 @@ def _verdict(
             return (
                 f"CONTAMINATION: {top} is {e_tail:.1f}x concentrated on activated tissue "
                 f"(ceiling {tail['ceiling']:.0f}x, no-relation 1.0x).{kap} "
-                "Fix: -ref paired, a gain-invariant -match, or -detask on this field."
+                "See -detask in -help."
             )
         if ratio >= 2.0:
             return (
@@ -967,7 +967,7 @@ def _verdict(
         conc = f", {e:.2f}x concentrated on active tissue" if e is not None else ""
         return (
             f"CONTAMINATION {where} (share-based): {share * 100:.0f}% task-explained, "
-            f"{ratio:.1f}x chance{conc}.{kap} Fix: -ref paired, or -detask on this field."
+            f"{ratio:.1f}x chance{conc}.{kap} See -detask in -help."
         )
     if ratio < 0.8:
         return (

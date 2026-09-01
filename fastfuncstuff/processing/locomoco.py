@@ -4043,7 +4043,28 @@ def _run_3dacq_plain(
             # loop and the series is resampled from the RAW frames afterwards -- never
             # along the null axis itself, whose displacement is spurious by definition
             # and is solved for only to be read.
+            before = [float(d.abs().max()) for d in disps[:n_encoded]]
             disps = null_axis_regress(disps, len(axes) - 1, min_r2=null_min_r2)
+            # Re-clamp: LK bounds every step by max_shift INSIDE its iteration, but the
+            # regression runs after, so a large slope on a noisy null channel could push
+            # a voxel past a bound the estimator itself never violates. Measured on a
+            # real run before this clamp existed: the primary axis went from 3.000 vox
+            # (the bound) to 8.136.
+            if max_shift is not None:
+                for k in range(n_encoded):
+                    disps[k] = disps[k].clamp(-max_shift, max_shift)
+            if verbose:
+                grew = [
+                    (k, before[k], float(disps[k].abs().max()))
+                    for k in range(n_encoded)
+                    if float(disps[k].abs().max()) > before[k] * 1.05
+                ]
+                for k, b, a_ in grew:
+                    print(
+                        f"   ⚠  null regression GREW axis {axes[k]}'s peak "
+                        f"{b:.3f} → {a_:.3f} vox — the null channel is predicting with a "
+                        "large slope somewhere; raise -pe_null_min_r2."
+                    )
             enc = disps[:n_encoded]
             for t in tqdm(
                 range(nt), desc="null-axis resample", unit="frame", leave=True, disable=nt < 3
@@ -4143,11 +4164,29 @@ def _run_3dacq_plain(
                 # The size of the spurious trace, which is the whole point of solving
                 # for it: a null channel reading near zero says the encoded axes had
                 # little to inherit, and a large one says they did.
+                enc_med = []
+                for kk in range(n_encoded):
+                    e = disp[kk].abs()
+                    e = e[e > 0]
+                    enc_med.append(float(e.median()) if e.numel() else 0.0)
+                worst = max(enc_med) if enc_med else 0.0
                 print(
                     f"🚫 locomoco NULL axis {ax} (un-encoded, never applied): "
                     f"|disp| median {med:.3f} vox, max {float(ap.max()):.3f} vox "
                     f"— regressed out of the encode axes"
                 )
+                # The null channel should be SMALLER than the encode axes: it has no
+                # physical displacement to report, only what the estimator invented.
+                # Larger means it is absorbing real structure through the aperture, and
+                # the regression is then removing a mix rather than an artifact.
+                if worst > 0 and med > worst:
+                    print(
+                        f"   ⚠  the null channel is {med / worst:.1f}x LARGER than the "
+                        "encode axes. It should be smaller — it has no displacement to "
+                        "report. Check -pe_null names the un-encoded axis, and read the "
+                        "separability above: a poorly conditioned 3-axis solve leaks "
+                        "real motion into it, and the regression then removes a mix."
+                    )
                 continue
             label = "PE" if k == 0 else "partition"
             print(
