@@ -1183,8 +1183,29 @@ def create_parser() -> argparse.ArgumentParser:
     )
     task.add_argument(
         "-detask",
-        action="store_true",
-        help="REMOVE the task-locked part of the field, keeping drift and everything "
+        nargs="?",
+        const="field",
+        default=None,
+        metavar="MODE",
+        help="MODE is 'field' (the default when -detask is given bare) or 'filter[:N]'.\n\n"
+        "  filter[:N]  NOTCH the task's frequency band out of the images the ESTIMATOR\n"
+        "              sees, before it runs, and resample the raw input with the\n"
+        "              resulting field. The field is then never contaminated, so\n"
+        "              nothing can bleed through the iterative solve into other frames\n"
+        "              -- which is the one thing 'field' cannot offer, since it cleans\n"
+        "              a field the task already helped produce. The band is chosen from\n"
+        "              the design's own spectrum: every line carrying at least 1% of the\n"
+        "              strongest one. N widens it by N bins either side, for amplitude\n"
+        "              non-stationarity across blocks (adaptation, attention drift). It\n"
+        "              is NOT for HRF width -- convolution multiplies spectra, so a\n"
+        "              wider HRF narrows the design's band and can never spread energy\n"
+        "              into bins the stimulus does not occupy.\n"
+        "              Needs a near-periodic design. Onset jitter past ~0.5s of a 20s\n"
+        "              period costs bins fast (1 bin at 0.25s, 7 at 1s, 14 at 2s) and a\n"
+        "              broadband design is REFUSED rather than notched. Several\n"
+        "              conditions are fine -- the cost scales with the number of\n"
+        "              distinct PERIODS, not conditions.\n\n"
+        "  field       REMOVE the task-locked part of the field, keeping drift and everything "
         "else, and derive EVERY output from the cleaned field — warp, corrected series, "
         "flow maps, PCs, movie. The diagnostic above still measures the ORIGINAL field "
         "(measuring the fix's own output would always say 'no task'), and the part that "
@@ -1516,7 +1537,7 @@ def _resolve_tr(args, img) -> float | None:
 
     def _refuse(why: str) -> None:
         print(f"  ⚠️  task coupling skipped: {why}")
-        if args.detask:
+        if args.detask_field:
             # Never let a requested FIX vanish quietly just because the diagnostic
             # could not run — the outputs would silently be the uncleaned field.
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
@@ -1637,6 +1658,35 @@ def _paired_bins_for(args, n_timepoints: int, tr: float, device):
         )
         return None
     return bin_of
+
+
+def parse_detask(value):
+    """``-detask`` MODE -> ``(clean_field, notch_widen)``.
+
+    ``None`` -> (False, None); ``field`` -> (True, None); ``filter`` / ``filter:N`` ->
+    (False, N). The two are alternatives, not a pipeline: filtering removes the band
+    before the estimator runs, so there is nothing left for the field projection to
+    take out, and running both would only spend the degrees of freedom twice.
+    """
+    if value is None:
+        return False, None
+    text = str(value).strip().lower()
+    if text == "field":
+        return True, None
+    if text == "filter":
+        return False, 0
+    if text.startswith("filter:"):
+        tail = text.split(":", 1)[1]
+        try:
+            widen = int(tail)
+        except ValueError:
+            raise ValueError(
+                f"-detask filter:N needs an integer widening in bins, got {tail!r}"
+            ) from None
+        if widen < 0:
+            raise ValueError(f"-detask filter:N needs N >= 0, got {widen}")
+        return False, widen
+    raise ValueError(f"-detask MODE must be 'field' or 'filter[:N]', got {value!r}")
 
 
 def _pe_axis_name(label: str, axis: int, args) -> str:
@@ -1842,11 +1892,11 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         # trade. -detask is refused loudly, because silently skipping the fix the user
         # asked for would be worse than the crash.
         print(f"  ⚠️  task coupling skipped: {exc}")
-        if args.detask:
+        if args.detask_field:
             print("  ⚠️  -detask NOT applied — the outputs below are the ORIGINAL field.")
         return result
 
-    if not args.detask:
+    if not args.detask_field:
         return result
 
     print("  ── de-tasking (everything below is derived from the CLEANED field) ──")
@@ -2230,6 +2280,40 @@ def _pe_label(args) -> str:
     return f"{args.pe_dir2} (partition)"
 
 
+def _notch_estimation_data(datas, args, tr):
+    """Band-filtered copies of the series for estimation, plus a line describing the cut.
+
+    Raises ValueError with the reason if the design has no line to notch or is too
+    broadband -- both are the tool declining to run rather than notching the data.
+    """
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.stats.task_coupling import (
+        default_polort,
+        design_notch_bins,
+        filter_task_band,
+        notch_basis,
+    )
+
+    n_t = datas[0].shape[3]
+    design, labels = _task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    bins, info = design_notch_bins(design, polort, widen=args.detask_widen)
+    basis = notch_basis(n_t, bins, polort)
+    freqs = np.fft.rfftfreq(n_t, d=float(tr))
+    out = [
+        filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy() for d in datas
+    ]
+    hz = ", ".join(f"{freqs[b]:.4f}" for b in bins)
+    note = (
+        f"-detask filter: notched {len(bins)} line(s) at {hz} Hz "
+        f"({info['spectrum_frac'] * 100:.1f}% of the spectrum, {basis.shape[1]} DoF) "
+        f"from the estimation data; {len(labels)} condition(s), polort {polort}"
+    )
+    return out, note
+
+
 def _run_multiecho(
     args, pe_axis, slice_axis, dual, device, stem, ext, *, pe_axis2=None, slicewise=False
 ) -> int:
@@ -2313,6 +2397,26 @@ def _run_multiecho(
             affine = img.affine.copy()
             tr_sec = _resolve_tr(args, img) if args.events else None
         datas.append(d)
+
+    # -detask filter: notch the task band out of the images the ESTIMATOR sees. The raw
+    # `datas` are kept untouched -- the corrected series is re-resampled from them after
+    # the solve, so the only thing the filter changes is what the estimator was allowed
+    # to look at.
+    est_datas, notch_note = datas, None
+    if args.detask_widen is not None:
+        if len(datas) > 1:
+            print(
+                "❌ -detask filter is not wired for the multi-echo path (one shared "
+                "field scaled per echo).",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            est_datas, notch_note = _notch_estimation_data(datas, args, tr_sec)
+        except ValueError as exc:
+            print(f"❌ -detask filter: {exc}", file=sys.stderr)
+            return 2
+        print(f"   🔇 {notch_note}")
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
@@ -2518,7 +2622,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import make_raw_reference_me_result
 
         result = make_raw_reference_me_result(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2528,7 +2632,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_interecho
 
         result = estimate_residual_flow_me_interecho(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2558,7 +2662,7 @@ def _run_multiecho(
 
             result = refine_interecho_temporally(
                 result,
-                datas,
+                est_datas,
                 args.echo_times,
                 pe_axis,
                 slice_axis,
@@ -2596,7 +2700,7 @@ def _run_multiecho(
         from fastfuncstuff.processing.locomoco import estimate_residual_flow_me_scaled
 
         result = estimate_residual_flow_me_scaled(
-            datas,
+            est_datas,
             args.echo_times,
             est_idx,
             pe_axis,
@@ -2632,7 +2736,7 @@ def _run_multiecho(
         )
     else:
         result = estimate_residual_flow_multiecho(
-            datas,
+            est_datas,
             args.echo_times,
             pe_axis,
             slice_axis,
@@ -2703,6 +2807,20 @@ def _run_multiecho(
             device=device,
         )
 
+    if args.detask_widen is not None:
+        # The estimator was shown band-filtered images, so the series it warped is
+        # band-filtered too. Re-derive it from the untouched input with the same field.
+        from fastfuncstuff.processing.locomoco import resample_from_raw
+
+        result.per_echo[0] = resample_from_raw(
+            result.per_echo[0],
+            datas[0],
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+            desc="notch resample",
+        )
+
     print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
     for j, res in enumerate(result.per_echo):
@@ -2765,7 +2883,7 @@ def _run_multiecho(
         # Echo 1's series and the shared field: the coupling question is about the ONE
         # field every echo is corrected by, not each echo's scaled copy of it.
         _write_task_diagnostics(result.per_echo[0], datas[0], stem, ext, affine, args, tr_sec)
-        if args.detask:
+        if args.detask_field:
             # The multi-echo correction is one SHARED field scaled per echo; de-tasking
             # it means re-deriving every echo's warp and series from the cleaned w, which
             # is not wired yet. Refusing beats silently cleaning one echo's copy.
@@ -2893,6 +3011,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # -detask has nothing to key on without a design, and the task stage it lives in is
     # gated on -events — so a lone -detask is a silent no-op all the way through. Say so
     # here rather than let a run finish looking de-tasked.
+    try:
+        args.detask_field, args.detask_widen = parse_detask(args.detask)
+    except ValueError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return 2
     if args.detask and not args.events:
         print(
             "❌ -detask needs -events (the task-locked part is defined by the design); "
@@ -3103,6 +3226,25 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     affine = img.affine.copy()
     tr_sec = _resolve_tr(args, img) if args.events else None
 
+    # -detask filter: the estimator sees a band-filtered copy, `data` stays raw so the
+    # corrected series can be re-derived from it after the solve.
+    est_data = data
+    if args.detask_widen is not None:
+        try:
+            (est_data,), note = _notch_estimation_data([data], args, tr_sec)
+        except ValueError as exc:
+            print(f"❌ -detask filter: {exc}", file=sys.stderr)
+            return 2
+        print(f"   🔇 {note}")
+        if args.final_qwarp or args.backend == "qwarp":
+            # The polish registers raw intensities against a raw template; -match never
+            # reached it either. Say so rather than let a partially-filtered run read as
+            # a clean one.
+            print(
+                "   ⚠️  the qwarp stage still sees UNFILTERED intensities — only the "
+                "flow/xcorr estimate is notched."
+            )
+
     paired_bins = None
     if args.paired_ref:
         if not (args.is_3dacq or dual3d):
@@ -3271,7 +3413,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
         result = estimate_residual_flow_rotaware(
             raw,
-            data,
+            est_data,
             mats_vox,
             mats_dicom,
             affine,
@@ -3316,7 +3458,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         )
     else:
         result = estimate_residual_flow(
-            data,
+            est_data,
             pe_axis,
             slice_axis,
             ref_mode=args.ref,
@@ -3410,6 +3552,20 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             device=device,
         )
         result = polished.per_echo[0]
+
+    if args.detask_widen is not None:
+        # The estimator was shown band-filtered images, so the series it warped is
+        # band-filtered too. Re-derive it from the untouched input with the same field.
+        from fastfuncstuff.processing.locomoco import resample_from_raw
+
+        result = resample_from_raw(
+            result,
+            data,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+            device=device,
+            desc="notch resample",
+        )
 
     print_cli_section("Outputs")
 

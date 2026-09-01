@@ -2232,14 +2232,48 @@ def detask_result(
             ),
         )
 
+    return (
+        resample_from_raw(
+            cleaned,
+            data,
+            warp_interp=warp_interp,
+            warp_radius=warp_radius,
+            device=device,
+            desc="detask resample",
+        ),
+        removed,
+        None,
+    )
+
+
+def resample_from_raw(
+    result,
+    data: np.ndarray,
+    *,
+    warp_interp: str = "bilinear",
+    warp_radius: int = 3,
+    device: torch.device | None = None,
+    desc: str = "resample",
+):
+    """Re-derive the corrected series from the RAW input using ``result``'s field.
+
+    Two callers need this and for the same reason: the series the estimator produced
+    is not the one to keep. ``-detask`` changed the field after the fact, and
+    ``-detask filter`` estimated on a band-filtered copy of the data. Both must warp
+    the untouched input, never adjust the series the estimator already warped —
+    warping a warped series stacks a second interpolation, which is the trap the
+    interpolation-stacking audit caught in the qwarp polish.
+    """
+    from dataclasses import replace
+
     if device is None:
         device = torch.device("cpu")
-    comps = cleaned.pe_displacements()
+    comps = result.pe_displacements()
     axes = [ax for _, ax, _ in comps]
     fields = [f for _, _, f in comps]
     series = torch.from_numpy(np.ascontiguousarray(data)).float()
     corrected = torch.zeros_like(series)
-    for t in tqdm(range(series.shape[3]), desc="detask resample", unit="frame", leave=True):
+    for t in tqdm(range(series.shape[3]), desc=desc, unit="frame", leave=True):
         corrected[..., t] = (
             _shift3d_axes(
                 series[..., t].to(device)[None],
@@ -2251,7 +2285,7 @@ def detask_result(
             .cpu()
             .float()
         )
-    return replace(cleaned, corrected_nifti=corrected), removed, None
+    return replace(result, corrected_nifti=corrected)
 
 
 def _inv_perm(perm: list[int]) -> list[int]:

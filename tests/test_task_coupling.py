@@ -650,3 +650,88 @@ def test_filter_task_band_removes_the_line_and_keeps_the_drift():
     kept = np.asarray(out).reshape(-1, n_t).mean(0)
     kept = kept - kept.mean()
     assert float(np.corrcoef(kept, d)[0, 1]) > 0.99
+
+
+def test_parse_detask_modes():
+    from fastfuncstuff.cli.locomoco import parse_detask
+
+    assert parse_detask(None) == (False, None)
+    assert parse_detask("field") == (True, None)  # bare -detask, via const
+    assert parse_detask("filter") == (False, 0)
+    assert parse_detask("filter:2") == (False, 2)
+    assert parse_detask("FILTER:0") == (False, 0)
+    for bad in ("filter:x", "both", "filter:-1"):
+        with pytest.raises(ValueError):
+            parse_detask(bad)
+
+
+@pytest.mark.slow
+def test_cli_detask_filter_actually_reaches_the_estimator(tmp_path):
+    """The notch must change the FIELD, not just print that it ran.
+
+    Regression of record: the filter was wired into the multi-echo runner only, so a
+    single-echo run parsed the flag, took the branch, and produced a field identical to
+    an unfiltered one. Asserting on the printed line would have passed; asserting on
+    the field is what catches it.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 120, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 300, 20):  # 15 whole cycles of a 20s period
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (20, 22, 12, n_t)).astype(np.float32)
+    series[5:12, 6:14, 3:8] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 300, 20))
+    )
+
+    def run(stem, *extra):
+        assert (
+            main(
+                [
+                    "-i",
+                    str(src),
+                    "-o",
+                    f"{stem}.nii.gz",
+                    "-pe_dir1",
+                    "AP",
+                    "-pe_dir2",
+                    "IS",
+                    "-backend",
+                    "flow",
+                    "-refine",
+                    "1",
+                    "-events",
+                    str(ev),
+                    "-tr",
+                    str(tr),
+                    "-device",
+                    "cpu",
+                    *extra,
+                ]
+            )
+            == 0
+        )
+        return nib.load(f"{stem}_flow_pe1.nii.gz").get_fdata(dtype=np.float32)
+
+    base = run(str(tmp_path / "base"))
+    filt = run(str(tmp_path / "filt"), "-detask", "filter")
+    assert base.shape == filt.shape
+    assert not np.allclose(base, filt), "the notch did not reach the estimator"
+
+    # And it removed the task band it claimed to: the fundamental is bin 15 over 120
+    # frames with a 20s period at TR 2.5.
+    def line_power(field):
+        v = field.reshape(-1, n_t)
+        v = v - v.mean(axis=1, keepdims=True)
+        p = np.abs(np.fft.rfft(v, axis=1)) ** 2
+        return float(p[:, 15].sum() / p.sum())
+
+    assert line_power(filt) < 0.5 * line_power(base), (line_power(base), line_power(filt))
