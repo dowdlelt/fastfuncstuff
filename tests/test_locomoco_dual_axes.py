@@ -1187,3 +1187,38 @@ def test_null_axis_regress_uses_ols_because_deming_measured_worse():
         out = null_axis_regress([encoded.clone(), null], 1)
         removed.append(float((encoded - out[0]).abs().mean()))
     assert removed[0] > removed[1], removed
+
+
+def test_null_axis_regress_skip_frames_keeps_outliers_from_setting_the_slope():
+    """Pre-steady-state frames are outliers in BOTH channels, so they own the fit.
+
+    Measured on a 0.8mm run: frame 0 sat 11% above the run mean with a per-voxel gain
+    against steady state of 0.856-1.454, and the flow rms there was 1.86x the
+    steady-state level, decaying over about six frames. A least-squares slope is
+    dominated by outliers, so a handful of such frames fits the coefficient to T1
+    saturation rather than to the artifact being chased. -match localnorm reduces this
+    and cannot remove it: the gain is tissue-dependent, so it varies at tissue
+    boundaries, which is sub-window structure a local z-score leaves behind.
+    """
+    from fastfuncstuff.processing.locomoco import null_axis_regress
+
+    g = torch.Generator().manual_seed(2)
+    shape, n_t = (5, 4, 3), 60
+    t = torch.arange(n_t, dtype=torch.float32)
+    spurious = torch.sin(2 * torch.pi * t / 9.0)
+    real = 0.5 * torch.cos(2 * torch.pi * t / 23.0)
+    null = spurious.expand(*shape, n_t).clone() + 0.02 * torch.randn(*shape, n_t, generator=g)
+    encoded = (1.2 * spurious + real).expand(*shape, n_t).clone()
+    # A transient in both channels at once, unrelated to the artifact being removed.
+    null[..., :5] += 6.0
+    encoded[..., :5] += 6.0
+
+    def steady_err(skip):
+        out = null_axis_regress([encoded.clone(), null.clone()], 1, skip_frames=skip)
+        return float((out[0][..., 5:] - real[5:]).abs().mean())
+
+    assert steady_err(5) < 0.1 * steady_err(0), (steady_err(5), steady_err(0))
+    # Excluded frames are still CORRECTED, not left alone: the fit skips them, the
+    # subtraction does not.
+    out = null_axis_regress([encoded.clone(), null.clone()], 1, skip_frames=5)
+    assert not torch.allclose(out[0][..., :5], encoded[..., :5])

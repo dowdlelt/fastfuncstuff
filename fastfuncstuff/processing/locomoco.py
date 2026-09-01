@@ -1786,6 +1786,7 @@ def estimate_residual_flow(
     pe_axis2: int | None = None,
     null_axis: int | None = None,
     null_min_r2: float = 0.0,
+    null_skip: int = 0,
     noshift_margin: float = 0.0,
     reg_sigma: float = 1.5,
     peak_mode: str = "first_peak",
@@ -1902,6 +1903,7 @@ def estimate_residual_flow(
             refine_rounds=refine_rounds,
             null_axis=null_axis,
             null_min_r2=null_min_r2,
+            null_skip=null_skip,
             converge=converge,
             converge_rel=converge_rel,
             first_n=first_n,
@@ -3891,6 +3893,7 @@ def _run_3dacq_plain(
     pe_axis2: int | None = None,
     null_axis: int | None = None,
     null_min_r2: float = 0.0,
+    null_skip: int = 0,
     xcorr_passes: int = 3,
     sep_floor: float = 1e-2,
     paired_bins: torch.Tensor | None = None,
@@ -4050,7 +4053,9 @@ def _run_3dacq_plain(
             # along the null axis itself, whose displacement is spurious by definition
             # and is solved for only to be read.
             before = [float(d.abs().max()) for d in disps[:n_encoded]]
-            disps = null_axis_regress(disps, len(axes) - 1, min_r2=null_min_r2)
+            disps = null_axis_regress(
+                disps, len(axes) - 1, min_r2=null_min_r2, skip_frames=null_skip
+            )
             # Re-clamp: LK bounds every step by max_shift INSIDE its iteration, but the
             # regression runs after, so a large slope on a noisy null channel could push
             # a voxel past a bound the estimator itself never violates. Measured on a
@@ -4373,7 +4378,7 @@ def optical_flow_lk_3d_multiecho(
 #     ambiguity is visible on a map instead of silently redistributed between axes.
 
 
-def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
+def null_axis_regress(fields, null_index, min_r2=0.0, gate=None, skip_frames=0):
     """Remove, per voxel, the part of each encoded axis that the NULL axis predicts.
 
     An EPI residual cannot be displaced along the readout axis -- its bandwidth is
@@ -4418,6 +4423,17 @@ def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
     is not error at all; counting it as error tilts the slope and over-removes, which
     is why Deming loses even at zero noise. Removed rather than left as a dead knob.
 
+    ``skip_frames`` drops leading frames from the SLOPE FIT while still correcting
+    them. Pre-steady-state frames are outliers in both channels at once -- measured on
+    a 0.8mm run, frame 0 sat 11% above the run mean with a per-voxel gain against
+    steady state running 0.856 to 1.454, and the flow rms there was 1.86x the
+    steady-state level, decaying over about six frames. A least-squares slope is
+    dominated by outliers, so a handful of such frames sets ``beta`` for the whole run
+    and the correction ends up fitted to T1 saturation rather than to the artifact
+    being chased. ``-match localnorm`` reduces this but cannot remove it: the gain is
+    tissue-dependent, so it varies at tissue boundaries, which is sub-window structure
+    a local z-score leaves behind.
+
     ``min_r2`` leaves a voxel untouched unless the null explains that fraction of the
     encoded axis's variance, so a channel that is pure noise at a voxel cannot inject
     displacement there. ``gate`` is an optional extra per-voxel mask (conditioning,
@@ -4427,16 +4443,23 @@ def null_axis_regress(fields, null_index, min_r2=0.0, gate=None):
     axes corrected and the null axis passed through for diagnostics.
     """
     dn = fields[null_index]
-    x = dn - dn.mean(dim=-1, keepdim=True)
-    sxx = (x * x).sum(dim=-1)
+    n_t = dn.shape[-1]
+    k0 = max(0, min(int(skip_frames), n_t - 2))
+    # The fit sees frames k0: onward; the SUBTRACTION still covers every frame, so an
+    # excluded frame is corrected by a slope the rest of the run paid for rather than
+    # being left alone or setting the slope itself.
+    xf = dn[..., k0:]
+    xf = xf - xf.mean(dim=-1, keepdim=True)
+    sxx = (xf * xf).sum(dim=-1)
+    x = dn - dn[..., k0:].mean(dim=-1, keepdim=True)
     out = list(fields)
     for k in range(len(fields)):
         if k == null_index:
             continue
         y = fields[k]
-        yc = y - y.mean(dim=-1, keepdim=True)
-        sxy = (x * yc).sum(dim=-1)
-        syy = (yc * yc).sum(dim=-1)
+        yc = y - y[..., k0:].mean(dim=-1, keepdim=True)
+        sxy = (xf * yc[..., k0:]).sum(dim=-1)
+        syy = (yc[..., k0:] * yc[..., k0:]).sum(dim=-1)
         beta = sxy / sxx.clamp(min=1e-20)
         keep = sxx > 0
         if min_r2 > 0:

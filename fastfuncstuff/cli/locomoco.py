@@ -695,6 +695,22 @@ def create_parser() -> argparse.ArgumentParser:
         "so name it: -pe_null RL for a readout along x. 3-D solve only.",
     )
     est.add_argument(
+        "-pe_null_skip",
+        "-pe-null-skip",
+        type=int,
+        default=0,
+        metavar="N",
+        help="[-pe_null] Drop the first N frames from the SLOPE FIT (they are still\n"
+        "corrected). Pre-steady-state frames are outliers in the null and the encode\n"
+        "axes at once, and a least-squares slope is dominated by outliers, so a few\n"
+        "such frames set the coefficient for the whole run. Measured on a 0.8mm run:\n"
+        "frame 0 sat 11%% above the run mean with a per-voxel gain against steady state\n"
+        "of 0.856-1.454, and the flow rms there was 1.86x the steady-state level,\n"
+        "decaying over ~6 frames. -match localnorm reduces this and cannot remove it —\n"
+        "the gain is tissue-dependent, so it varies at tissue boundaries, which is\n"
+        "sub-window structure a local z-score leaves behind. Try 5-10.",
+    )
+    est.add_argument(
         "-pe_null_min_r2",
         "-pe-null-min-r2",
         type=float,
@@ -4008,6 +4024,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             dual=dual,
             null_axis=null_axis,
             null_min_r2=args.pe_null_min_r2,
+            null_skip=args.pe_null_skip,
             max_shift=args.max_shift,
             trial_step=args.xcorr_step,
             patch=args.patch,
