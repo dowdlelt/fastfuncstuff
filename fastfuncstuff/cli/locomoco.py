@@ -1310,7 +1310,9 @@ def create_parser() -> argparse.ArgumentParser:
         "              design is free of the contamination. Nothing here establishes\n"
         "              that; use -events without -detask to measure it first.\n"
         "              Several conditions are fine: the cost scales with the number of\n"
-        "              distinct PERIODS, not conditions.\n\n"
+        "              distinct PERIODS, not conditions. Multi-echo is supported: one\n"
+        "              basis notches every echo, since the band is a property of the\n"
+        "              DESIGN and the echoes pool into one shared field.\n\n"
         "  field       REMOVE the task-locked part of the field, keeping drift and everything "
         "else, and derive EVERY output from the cleaned field — warp, corrected series, "
         "flow maps, PCs, movie. The diagnostic above still measures the ORIGINAL field "
@@ -2937,19 +2939,23 @@ def _run_multiecho(
     # to look at.
     est_datas, notch_note = datas, None
     if args.detask_widen is not None:
-        if len(datas) > 1:
-            print(
-                "❌ -detask filter is not wired for the multi-echo path (one shared "
-                "field scaled per echo).",
-                file=sys.stderr,
-            )
-            return 2
+        # One notch basis for every echo. The band is a property of the DESIGN, not of
+        # the data, and the estimator pools the echoes into one shared field -- so
+        # filtering them with anything but the same basis would let the task back in
+        # through whichever echo was treated differently.
         try:
             est_datas, notch_note = _notch_estimation_data(datas, args, tr_sec)
         except ValueError as exc:
             print(f"❌ -detask filter: {exc}", file=sys.stderr)
             return 2
         print(f"   🔇 {notch_note}")
+        if args.final_qwarp:
+            # Same caveat the single-echo path carries: the polish registers raw
+            # intensities, so it never sees the notch.
+            print(
+                "   ⚠️  the -final_qwarp stage still sees UNFILTERED intensities — only "
+                "the flow/xcorr estimate is notched."
+            )
 
     smooth_sigma = 0.0
     hpf_sigma = 0.0
