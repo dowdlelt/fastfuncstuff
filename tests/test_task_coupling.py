@@ -621,6 +621,33 @@ def test_notch_refuses_a_broadband_design_instead_of_eating_the_data():
         design_notch_bins(design, polort=3)
 
 
+def test_notch_warns_between_the_cheap_and_the_refused_band():
+    """15-50% of the spectrum is expensive but allowed, with a warning attached.
+
+    Bulk head motion is spectrally BROAD, so removing a sixth of the spectrum can still
+    leave it estimable. Whether it does is not knowable from the design -- only from
+    whether the resulting field still tracks motion -- so the ceiling is permissive and
+    the cost is announced rather than silently enforced.
+    """
+    rng = np.random.default_rng(3)
+    hi = np.zeros(120)
+    for onset in np.clip(np.arange(10, 300, 20) + rng.normal(0, 2.0, 15), 0, 295):
+        hi[int(onset / 2.5) : int(onset / 2.5) + 4] = 1.0
+    k = np.exp(-np.arange(0, 12) / 3.0)
+    design = torch.tensor(np.convolve(hi, k / k.sum())[:120])[:, None]
+
+    bins, info = design_notch_bins(design, polort=3)
+    assert 0.15 < info["spectrum_frac"] <= 0.50, info["spectrum_frac"]
+    assert info["warning"] and "CHECK" in info["warning"]
+    # Below the warn level there is no warning at all.
+    clean = np.zeros(120)
+    for onset in range(10, 300, 20):
+        clean[int(onset / 2.5) : int(onset / 2.5) + 4] = 1.0
+    tidy = torch.tensor(np.convolve(clean, k / k.sum())[:120])[:, None]
+    _, tidy_info = design_notch_bins(tidy, polort=3)
+    assert tidy_info["warning"] is None, tidy_info
+
+
 def test_filter_task_band_removes_the_line_and_keeps_the_drift():
     """The split that matters: the task line goes, a slow drift stays.
 

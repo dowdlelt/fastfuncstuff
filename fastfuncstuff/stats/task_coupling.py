@@ -450,7 +450,8 @@ def design_notch_bins(
     *,
     peak_frac: float = 0.01,
     widen: int = 0,
-    max_frac: float = 0.15,
+    max_frac: float = 0.50,
+    warn_frac: float = 0.15,
 ) -> tuple[list[int], dict]:
     """Which rFFT bins carry the design — the band a notch has to remove.
 
@@ -528,11 +529,25 @@ def design_notch_bins(
             "broadband design -- a notch would remove the data, not the task. Use "
             "-detask (project the design out of the field) instead."
         )
+    # Between warn_frac and max_frac the notch is expensive but not obviously wrong.
+    # Bulk head motion is spectrally BROAD, so removing a sixth of the spectrum can
+    # still leave it estimable -- what breaks is not knowable from the design alone,
+    # only from whether the resulting field still tracks the motion. Hence a loud
+    # warning and a permissive ceiling rather than a hard cut at the cheap end.
+    warning = None
+    if frac > warn_frac:
+        warning = (
+            f"the notch removes {frac:.0%} of the spectrum ({len(bins)} of "
+            f"{n_bins - 1} bins, {2 * len(bins)} DoF). Bulk motion is spectrally broad "
+            "so this may still be fine, but CHECK that the field still tracks real "
+            "motion -- compare the flow rms and the warp PCs against an unfiltered run."
+        )
     info = {
         "bins": bins,
         "n_bins": n_bins - 1,
         "spectrum_frac": frac,
         "peak_frac": peak_frac,
+        "warning": warning,
         "widen": int(widen),
         "peak_over_median": float(peak / body.median())
         if float(body.median()) > 0

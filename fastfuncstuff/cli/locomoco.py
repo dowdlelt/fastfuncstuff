@@ -1201,8 +1201,10 @@ def create_parser() -> argparse.ArgumentParser:
         "              wider HRF narrows the design's band and can never spread energy\n"
         "              into bins the stimulus does not occupy.\n"
         "              Needs a near-periodic design. Onset jitter past ~0.5s of a 20s\n"
-        "              period costs bins fast (1 bin at 0.25s, 7 at 1s, 14 at 2s) and a\n"
-        "              broadband design is REFUSED rather than notched. Several\n"
+        "              period costs bins fast (1 bin at 0.25s, 7 at 1s, 14 at 2s); a\n"
+        "              design costing over 15%% of the spectrum WARNS (bulk motion is\n"
+        "              spectrally broad, so a wide notch may still be fine -- check the\n"
+        "              field still tracks motion) and over 50%% is REFUSED. Several\n"
         "              conditions are fine -- the cost scales with the number of\n"
         "              distinct PERIODS, not conditions.\n\n"
         "  field       REMOVE the task-locked part of the field, keeping drift and everything "
@@ -2305,6 +2307,8 @@ def _notch_estimation_data(datas, args, tr):
     out = [
         filter_task_band(torch.from_numpy(np.ascontiguousarray(d)), basis).numpy() for d in datas
     ]
+    if info.get("warning"):
+        print(f"   ⚠️  -detask filter: {info['warning']}")
     hz = ", ".join(f"{freqs[b]:.4f}" for b in bins)
     note = (
         f"-detask filter: notched {len(bins)} line(s) at {hz} Hz "
