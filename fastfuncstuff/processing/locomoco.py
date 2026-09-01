@@ -4334,10 +4334,10 @@ def optical_flow_lk_3d_axes(
     ARE sampled together: that is exactly the multi-echo win in a 2-D acquisition, more
     evidence per slice-time without smearing across slice-times.
     """
-    if len(axes) not in (1, 2):
-        raise ValueError(f"optical_flow_lk_3d_axes takes 1 or 2 axes, got {axes}")
-    if len(axes) == 2 and axes[0] == axes[1]:
-        raise ValueError(f"the two axes must differ, got {axes}")
+    if len(axes) not in (1, 2, 3):
+        raise ValueError(f"optical_flow_lk_3d_axes takes 1, 2 or 3 axes, got {axes}")
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"the axes must differ, got {axes}")
     if slicewise_axis is not None and slicewise_axis in axes:
         raise ValueError(
             f"slicewise_axis ({slicewise_axis}) must differ from every encode axis "
@@ -4412,7 +4412,7 @@ def optical_flow_lk_3d_axes(
                         )
             if n_ax == 1:
                 disp[0] = disp[0] + b[0] / (a[0][0] + reg)
-            else:
+            elif n_ax == 2:
                 a11 = a[0][0] + reg
                 a22 = a[1][1] + reg
                 a12 = a[0][1]
@@ -4422,6 +4422,30 @@ def optical_flow_lk_3d_axes(
                 det = prod * sep.clamp_min(sep_floor)
                 disp[0] = disp[0] + (a22 * b[0] - a12 * b[1]) / det
                 disp[1] = disp[1] + (a11 * b[1] - a12 * b[0]) / det
+            else:
+                # Three axes: the same pooled normal equations, solved by cofactors
+                # rather than a batched LU -- one 3x3 per voxel is millions of tiny
+                # systems, and the closed form is a handful of elementwise products.
+                a11, a22, a33 = a[0][0] + reg, a[1][1] + reg, a[2][2] + reg
+                a12, a13, a23 = a[0][1], a[0][2], a[1][2]
+                c11 = a22 * a33 - a23 * a23
+                c12 = a13 * a23 - a12 * a33
+                c13 = a12 * a23 - a13 * a22
+                c22 = a11 * a33 - a13 * a13
+                c23 = a13 * a12 - a11 * a23
+                c33 = a11 * a22 - a12 * a12
+                prod = a11 * a22 * a33
+                # sep generalises the 2-axis measure: det over the product of the
+                # diagonal is 1 for orthogonal gradients and 0 when the axes cannot be
+                # told apart, and stays scale-free per axis where a raw determinant
+                # floor would be a different constraint on every dataset.
+                det_raw = a11 * c11 + a12 * c12 + a13 * c13
+                sep = (det_raw / prod).clamp(0.0, 1.0)
+                sep_map = sep
+                det = prod * sep.clamp_min(sep_floor)
+                disp[0] = disp[0] + (c11 * b[0] + c12 * b[1] + c13 * b[2]) / det
+                disp[1] = disp[1] + (c12 * b[0] + c22 * b[1] + c23 * b[2]) / det
+                disp[2] = disp[2] + (c13 * b[0] + c23 * b[1] + c33 * b[2]) / det
             if max_disp is not None:
                 for k in range(n_ax):
                     disp[k] = disp[k].clamp(-max_disp, max_disp)

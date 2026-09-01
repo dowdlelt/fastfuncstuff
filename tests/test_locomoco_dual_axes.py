@@ -130,8 +130,10 @@ def test_axes_validation():
     v = _blobby((12, 12, 12))
     with pytest.raises(ValueError, match="must differ"):
         optical_flow_lk_3d_axes([v], [v], [1, 1], torch.ones(2, 1))
-    with pytest.raises(ValueError, match="1 or 2 axes"):
-        optical_flow_lk_3d_axes([v], [v], [0, 1, 2], torch.ones(3, 1))
+    # Three axes are supported now (the un-encoded axis as a null channel); four is
+    # still meaningless -- a volume has three.
+    with pytest.raises(ValueError, match="1, 2 or 3 axes"):
+        optical_flow_lk_3d_axes([v], [v], [0, 1, 2, 0], torch.ones(4, 1))
     with pytest.raises(ValueError, match="alphas must be"):
         optical_flow_lk_3d_axes([v], [v], [0, 1], torch.ones(2, 3))
 
@@ -1025,3 +1027,75 @@ def test_help_keeps_explicit_newlines_and_hides_none_defaults():
     assert "\n                        (default: ncc)" in text
     # "(default: None)" is noise — -ref's real default is computed after parsing.
     assert "default: None" not in text
+
+
+def test_three_axis_recovers_three_independent_shifts():
+    """The 3x3 joint solve, for using the un-encoded axis as a null channel.
+
+    A displacement along the readout axis is not physical for an EPI residual -- the
+    readout bandwidth is orders of magnitude above the phase-encode one -- so a
+    non-zero estimate there is a spurious trace. Reading it requires solving for it,
+    which requires the 3x3.
+    """
+    fixed = _blobby(shape=(28, 30, 26))
+    d = (0.8, -0.5, 0.35)
+    moving = _shift3d_axes(fixed, [torch.full_like(fixed, x) for x in d], [0, 1, 2])
+    u = optical_flow_lk_3d_axes(
+        [fixed], [moving], [0, 1, 2], torch.ones(3, 1), n_levels=3, n_iters=8, window_sigma=2.0
+    )
+    # Same PULL convention as the two-axis test: building `moving` by sampling `fixed`
+    # at x+d means the answer is -d.
+    c = (slice(None), slice(5, -5), slice(5, -5), slice(5, -5))
+    for k, want in enumerate(d):
+        assert u[k][c].mean().item() == pytest.approx(-want, abs=0.15), (k, u[k][c].mean())
+
+
+def test_three_axis_leaves_an_unmoved_axis_near_zero():
+    """The null channel is only useful if a truly still axis reads ~0.
+
+    This is the property the whole idea rests on: if the solve smears a two-axis
+    displacement into the third, every reading of that channel is an artifact of the
+    estimator rather than of the data.
+    """
+    fixed = _blobby(shape=(28, 30, 26), seed=5)
+    moving = _shift3d_axes(
+        fixed,
+        [torch.zeros_like(fixed), torch.full_like(fixed, 0.6), torch.full_like(fixed, -0.4)],
+        [0, 1, 2],
+    )
+    u = optical_flow_lk_3d_axes(
+        [fixed], [moving], [0, 1, 2], torch.ones(3, 1), n_levels=3, n_iters=8, window_sigma=2.0
+    )
+    c = (slice(None), slice(5, -5), slice(5, -5), slice(5, -5))
+    assert abs(u[0][c].mean().item()) < 0.05, u[0][c].mean()
+    assert u[1][c].mean().item() == pytest.approx(-0.6, abs=0.15)
+    assert u[2][c].mean().item() == pytest.approx(0.4, abs=0.15)
+
+
+def test_three_axis_separability_collapses_on_a_one_dimensional_ramp():
+    """sep generalises: det over the diagonal product, 1 orthogonal and 0 singular."""
+    shape = (24, 24, 24)
+    ramp = torch.arange(shape[0], dtype=torch.float32).view(1, -1, 1, 1)
+    # Varies along x+y+z, so all three gradients are equal and the 3x3 is singular.
+    flat = (
+        (
+            ramp
+            + torch.arange(shape[1], dtype=torch.float32).view(1, 1, -1, 1)
+            + torch.arange(shape[2], dtype=torch.float32).view(1, 1, 1, -1)
+        )
+        .expand(1, *shape)
+        .contiguous()
+    )
+    sep: list[torch.Tensor] = []
+    optical_flow_lk_3d_axes(
+        [flat],
+        [flat.clone()],
+        [0, 1, 2],
+        torch.ones(3, 1),
+        n_levels=1,
+        n_iters=1,
+        window_sigma=2.0,
+        sep_out=sep,
+    )
+    c = (slice(None), slice(6, -6), slice(6, -6), slice(6, -6))
+    assert sep and float(sep[0][c].median()) < 0.05, float(sep[0][c].median())
