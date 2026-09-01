@@ -6781,6 +6781,8 @@ def warp_project_out(components, bad_timecourses, device=None):
     subtracting each one's projection separately would remove their shared part more
     than once.
     """
+    from ..memory import estimate_chunk_size
+
     out = []
     for axis, disp in components:
         bad = bad_timecourses.get(axis)
@@ -6789,18 +6791,37 @@ def warp_project_out(components, bad_timecourses, device=None):
             continue
         shape = tuple(disp.shape[:3])
         n_t = disp.shape[-1]
-        x = disp.reshape(-1, n_t).T.to(torch.float64)  # (T, S)
-        if device is not None:
-            x = x.to(device)
-        a = bad.to(dtype=torch.float64, device=x.device)
-        # Centre before projecting and restore after: the per-voxel temporal mean is
-        # not part of any component, and a time course with any DC left in it would
-        # otherwise drag the mean displacement with it.
-        mean = x.mean(dim=0, keepdim=True)
-        xc = x - mean
+        n_vox = int(np.prod(shape))
+        dev = device if device is not None else disp.device
+        a = bad.to(dtype=torch.float64, device=dev)
+        # The basis is (T, m) with m tiny, so the QR is free and hoists out of the loop.
         q, _ = torch.linalg.qr(a - a.mean(dim=0, keepdim=True))
-        clean = xc - q @ (q.T @ xc) + mean
-        out.append((axis, clean.T.reshape(*shape, n_t).contiguous().float().cpu()))
+
+        # CHUNKED over voxels. The whole field is (T, S) and S is the full FoV: on a
+        # 160x160x114x225 run that is 5.2 GB in float64 for `x` alone, and the
+        # projection needs two more of them. That OOMed a 16 GB card on the first real
+        # multi-echo run -- the decomposition itself fits comfortably, so the memory
+        # cost lives entirely here. Time is never chunked (the projection is along it).
+        flat = disp.reshape(n_vox, n_t)
+        clean = torch.empty(n_vox, n_t, dtype=torch.float32)
+        # use_double: the projection runs in float64 (the field carries a large
+        # per-voxel mean next to a small displacement), so the planner must budget 8
+        # bytes per element or it under-sizes by exactly 2x.
+        chunk = estimate_chunk_size(
+            n_vox, n_t, q.shape[1] + 4, dev, operation="glm", use_double=True
+        )
+        for start in range(0, n_vox, chunk):
+            y = flat[start : start + chunk].to(device=dev, dtype=torch.float64).T  # (T, c)
+            # Centre before projecting and restore after: the per-voxel temporal mean is
+            # not part of any component, and a time course with any DC left in it would
+            # otherwise drag the mean displacement with it.
+            mean = y.mean(dim=0, keepdim=True)
+            yc = y - mean
+            yc -= q @ (q.T @ yc)
+            yc += mean
+            clean[start : start + y.shape[1]] = yc.T.to(dtype=torch.float32, device="cpu")
+            del y, yc, mean
+        out.append((axis, clean.reshape(*shape, n_t).contiguous()))
     return out
 
 

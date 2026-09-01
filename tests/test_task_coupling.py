@@ -1361,3 +1361,46 @@ def test_component_task_fit_declines_when_the_component_shares_the_design_band()
     # which confirms the gate keys on the coincidence and not on the components alone.
     ok = component_task_fit(narrow, _pilot_design(), polort=6, n_surrogates=400)
     assert ok["informative"] and ok["eff_dof"] > 10
+
+
+def test_warp_project_out_is_chunk_invariant_and_preserves_the_mean(monkeypatch):
+    """The projection must give the same answer at any chunk size.
+
+    Regression: this ran unchunked and materialised the whole (T, S) field in float64
+    three times over. On a real 160x160x114x225 multi-echo run that is 14.7 GB, and it
+    OOMed a 16 GB card after the ICA sweep had already filled it — the decomposition
+    fits comfortably, so the entire memory cost lived here.
+
+    Chunk-invariance is the property worth pinning, not the chunk size: a projection
+    along time is independent per voxel, so any split must be exact, and a bug that
+    mixed voxels across a chunk boundary would show up here and nowhere else.
+    """
+    import fastfuncstuff.memory as ffs_memory
+    from fastfuncstuff.processing import locomoco as loco
+
+    torch.manual_seed(0)
+    nx, ny, nz, nt, m = 7, 6, 5, 40, 3
+    # A large per-voxel mean beside a small displacement — the case float64 is for, and
+    # the one where dropping/restoring the mean incorrectly would be visible.
+    disp = torch.randn(nx, ny, nz, nt).double() * 0.3 + 1.7
+    bad = torch.randn(nt, m).double()
+    comps = [(2, disp)]
+
+    results = []
+    for chunk in (10**9, 97, 13, 1):  # one shot, then progressively silly splits
+        # Patched at the source module: warp_project_out imports it inside the call.
+        monkeypatch.setattr(ffs_memory, "estimate_chunk_size", lambda *a, **k: chunk)
+        results.append(dict(loco.warp_project_out(comps, {2: bad}))[2])
+
+    for r in results[1:]:
+        assert torch.equal(results[0], r), "chunking changed the result"
+
+    out = results[0]
+    # The named time courses are gone...
+    q, _ = torch.linalg.qr(bad - bad.mean(dim=0, keepdim=True))
+    resid = out.reshape(-1, nt).T.double()
+    resid = resid - resid.mean(dim=0, keepdim=True)
+    assert float((q.T @ resid).abs().max()) < 1e-5
+    # ...and the per-voxel temporal MEAN survived. It is not a component, and dropping
+    # it would move every voxel by its own average displacement.
+    assert torch.allclose(out.mean(-1), disp.mean(-1).float(), atol=1e-5)

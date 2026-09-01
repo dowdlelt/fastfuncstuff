@@ -26,6 +26,7 @@ see ``processing/locomoco.py`` for the method.
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -2151,6 +2152,31 @@ def parse_warp_recon(value):
     )
 
 
+def _free_device_cache(device) -> None:
+    """Hand the caching allocator's unused blocks back before a large allocation.
+
+    Freeing a tensor returns it to PyTorch's pool, not to the driver, so a later
+    allocation of a DIFFERENT size can still fail with plenty nominally free. The warp
+    decomposition and the projection that follows are both whole-field sized, which is
+    exactly the case where this matters -- see [[VRAM debugging]].
+    """
+    if device is not None and getattr(device, "type", None) == "cuda":
+        torch.cuda.empty_cache()
+
+
+def _report_vram(device, where: str) -> None:
+    """One line of device memory, so an OOM can be attributed rather than guessed at."""
+    if device is None or getattr(device, "type", None) != "cuda":
+        return
+    free_b, total_b = torch.cuda.mem_get_info(device)
+    gb = 1024.0**3
+    print(
+        f"  VRAM {where}: {(total_b - free_b) / gb:.1f} GB used of {total_b / gb:.1f} GB "
+        f"({free_b / gb:.1f} GB free; torch reserves "
+        f"{torch.cuda.memory_reserved(device) / gb:.1f} GB)"
+    )
+
+
 def _ica_rank_sweep(comps, resp, mask, ranks, device):
     """Best ICA rank by peak task enrichment — the rank is not guessable a priori.
 
@@ -2168,6 +2194,11 @@ def _ica_rank_sweep(comps, resp, mask, ranks, device):
 
     def score(rank):
         got = warp_ica_basis(comps, n_components=rank, pca_components=rank, device=device)
+        # Each fit builds TWO (T, S) copies of the whole field on the device -- 5.2 GB
+        # at 160x160x114x225 in float32 -- and the returned basis/loadings are already
+        # on the CPU. Without this the caching allocator holds every rank's working set
+        # until the process exits, and the sweep alone can fill a 16 GB card.
+        _free_device_cache(device)
         if got is None:
             return 0.0, None
         basis, loadings, means, var = got
@@ -2413,6 +2444,11 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
             axis: basis[:, [i for i, _e in dropped.get(axis, [])]] for axis, _load in loadings
         }
         if any(v.shape[1] for v in bad_tc.values()):
+            # The decomposition is done and its outputs live on the CPU; the projection
+            # that follows is whole-field sized. Give the pool back first.
+            _free_device_cache(device)
+            if os.environ.get("FFS_DEBUG_VRAM"):
+                _report_vram(device, "before the task projection")
             rebuilt = warp_project_out(comps, bad_tc, device=device)
         else:
             rebuilt = [(ax, f.float()) for ax, f in comps]
@@ -3427,13 +3463,6 @@ def _run_multiecho(
                 f"   ⚗️  estimation intensity match: {args.match} "
                 f"(σ={args.match_sigma:g}vox, cross-TIME, per echo)"
             )
-    if args.detask:
-        # The late warning fires only after the whole solve; a run can be many minutes of
-        # work before the user learns nothing was de-tasked. Say it up front too.
-        print(
-            "   ⚠️  -detask is not wired for the multi-echo path — the outputs will NOT "
-            "be de-tasked (the task diagnostic is still written)."
-        )
     if pe_axis2 is not None:
         # Two axes carry two DIFFERENT laws, and only the partition one is settable:
         # the primary PE row is pinned alpha=1 by construction. A bare "scaling=fixed(TE)"
