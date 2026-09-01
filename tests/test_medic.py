@@ -8,6 +8,8 @@ warpkit-fieldmap -> ffs_nwarp warp conversion tool.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -533,3 +535,48 @@ def test_convert_medic_fieldmap_to_warp(tmp_path):
     )
     out = np.asarray(nib.load(str(out_path)).dataobj, dtype=np.float32)
     assert np.allclose(out[:, 2:-2, :, :], ref.numpy()[:, 2:-2, :, :], atol=1e-2)
+
+
+def test_medic_warp_extra_components_survive_both_formats(tmp_path):
+    """``extra_components`` must reach disk in the per-frame format, not only the 5-D one.
+
+    Regression: the per-frame branch built its ``xyz`` triple from the PE axis alone and
+    dropped ``extra_components`` without a word, so a dual-encode (or rotation-aware)
+    run wrote a warp missing an axis. The corrected series was still correct — it is
+    computed in memory — which is exactly why the loss was invisible: only the saved
+    warp, the thing later applied to other data, was wrong.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.processing.medic import save_medic_warp
+
+    nx = ny = nz = 8
+    nt = 2
+    affine = np.diag([2.0, 2.0, 2.0, 1.0])
+    primary = torch.full((nx, ny, nz, nt), 0.75)  # axis 1
+    extra = torch.full((nx, ny, nz, nt), -0.5)  # axis 2
+
+    for as_5d in (True, False):
+        stem = str(tmp_path / f"w{int(as_5d)}")
+        spec = save_medic_warp(
+            primary,
+            1,
+            affine,
+            stem,
+            ".nii",
+            as_5d=as_5d,
+            extra_components=[(extra, 2)],
+        )
+        if as_5d:
+            got = np.asarray(nib.load(spec).dataobj, dtype=np.float32)[..., 0, :]
+        else:
+            frame = sorted(Path(f"{stem}_warp").glob("warp_*.nii"))[0]
+            # per-frame files are (nz,ny,nx,3) in the save_warp_field convention
+            got = np.asarray(nib.load(str(frame)).dataobj, dtype=np.float32)
+
+        # Both axes must carry displacement. Before the fix the per-frame format had
+        # axis 2 identically zero.
+        assert np.abs(got[..., 1]).max() > 1e-6, (as_5d, "primary axis missing")
+        assert np.abs(got[..., 2]).max() > 1e-6, (as_5d, "extra component was dropped")
+        # ...and the axis that was never written stays clean.
+        assert np.abs(got[..., 0]).max() < 1e-6, (as_5d, "unwritten axis polluted")

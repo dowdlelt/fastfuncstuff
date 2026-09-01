@@ -509,9 +509,10 @@ def save_medic_warp(
     save_warp_field (it writes one 5D file directly), so it applies the RAS->DICOM
     negation inline via ``feed_sign``. Verified against :func:`undistort_series`.
 
-    ``extra_components`` (5D path only) adds further ``(disp_pull, nifti_axis)``
-    displacements on other axes — e.g. a dual-phase-encode acquisition warped on
-    two in-plane axes at once. Each is converted with its own axis sign/scale.
+    ``extra_components`` adds further ``(disp_pull, nifti_axis)`` displacements on
+    other axes — e.g. a dual-phase-encode acquisition warped on two in-plane axes at
+    once. Each is converted with its own axis sign/scale. Honoured by BOTH on-disk
+    formats; the per-frame path used to ignore it silently.
 
     Returns the path/glob to pass to ``ffs_nwarp -nwarp`` (a ``warp_*`` wildcard
     for the default per-frame files, or the single 5D file when ``as_5d``).
@@ -543,11 +544,20 @@ def save_medic_warp(
 
     warp_dir = f"{prefix_stem}_warp"
     os.makedirs(warp_dir, exist_ok=True)
+    # Every component, exactly as the 5-D branch does. This used to write the PE axis
+    # alone and drop `extra_components` silently, so a dual-encode or rotation-aware
+    # run wrote a warp that was missing an axis -- with no error, and a corrected
+    # series that was nonetheless right, which is what made it invisible.
+    extras_np = [(c.detach().cpu().numpy(), a) for c, a in (extra_components or [])]
     for t in range(nt):
         comp = torch.from_numpy(disp_np[:, :, :, t]).permute(2, 1, 0).contiguous()
-        zeros = torch.zeros_like(comp)
-        xyz = [zeros, zeros, zeros]
+        xyz = [torch.zeros_like(comp) for _ in range(3)]
         xyz[pe_nifti_axis] = comp  # (nz,ny,nx) voxel disp on the PE axis
+        for extra, axis in extras_np:
+            # Accumulate rather than assign: nothing in this codebase currently emits
+            # two components on one axis, but summing is the correct composition if it
+            # ever does, and assignment would silently keep only the last.
+            xyz[axis] = xyz[axis] + torch.from_numpy(extra[:, :, :, t]).permute(2, 1, 0)
         save_warp_field(
             xyz[0],
             xyz[1],
