@@ -3405,9 +3405,17 @@ def _run_multiecho(
     _write_dual_axis_diagnostics(result.per_echo[0], stem, ext, affine, args, datas[0])
 
     if args.events and tr_sec:
-        # Echo 1's series and the shared field: the coupling question is about the ONE
-        # field every echo is corrected by, not each echo's scaled copy of it.
-        _write_task_diagnostics(result.per_echo[0], datas[0], stem, ext, affine, args, tr_sec)
+        # The SHARED field, because the coupling question is about the one field every
+        # echo is corrected by rather than each echo's scaled copy of it — but the
+        # data-side task map is measured on the echo MEAN, not on echo 1. BOLD percent
+        # signal change scales with TE, so the shortest echo has the weakest response
+        # and gives the poorest "where the task is" mask, which is what the enrichment
+        # statistic is scored against. A plain mean is most of the win; a TE-weighted
+        # optimal combination would be the refinement.
+        task_data = datas[0] if len(datas) == 1 else np.mean(np.stack(datas), axis=0)
+        if len(datas) > 1:
+            print(f"   ⚗️  task diagnostic: data map from the mean of {len(datas)} echoes")
+        _write_task_diagnostics(result.per_echo[0], task_data, stem, ext, affine, args, tr_sec)
         if args.detask_field:
             # The multi-echo correction is one SHARED field scaled per echo; de-tasking
             # it means re-deriving every echo's warp and series from the cleaned w, which
