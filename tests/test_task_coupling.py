@@ -992,3 +992,74 @@ def test_warp_project_out_removes_only_the_named_timecourses():
     # And an empty request is exactly identity, not a lossy round trip.
     same = warp_project_out(comps, {})
     assert np.abs(same[0][1].numpy() - field.astype(np.float32)).max() == 0.0
+
+
+@pytest.mark.slow
+def test_reject_writes_plottable_timecourses_and_an_after_map(tmp_path):
+    """Rejection has to be inspectable: what was removed, and whether it worked.
+
+    Two gaps a real run exposed. The dropped components existed only as a printed
+    enrichment, so there was nothing to plot against the design; and the _taskr maps
+    are measured BEFORE the fix by design, which left no after to compare them with.
+    """
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 120, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 300, 20):
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (16, 18, 8, n_t)).astype(np.float32)
+    series[4:10, 5:12, 2:6] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 300, 20))
+    )
+    stem = str(tmp_path / "out")
+    assert (
+        main(
+            [
+                "-i",
+                str(src),
+                "-o",
+                f"{stem}.nii.gz",
+                "-pe_dir1",
+                "AP",
+                "-pe_dir2",
+                "IS",
+                "-backend",
+                "flow",
+                "-refine",
+                "1",
+                "-events",
+                str(ev),
+                "-tr",
+                str(tr),
+                "-device",
+                "cpu",
+                "-warp_recon",
+                "ica:30",
+                "-reject",
+            ]
+        )
+        == 0
+    )
+    rejected = tmp_path / "out_locomoco_rejected.1D"
+    assert rejected.exists()
+    head = rejected.read_text().splitlines()[1]
+    assert "design" in head  # the reference ships in the same file, or it is unplottable
+    table = np.loadtxt(rejected)
+    assert table.shape[0] == n_t and table.shape[1] >= 2
+    # z-scored, so the columns are directly comparable on one axis.
+    assert np.allclose(table.std(axis=0), 1.0, atol=1e-6)
+
+    # The after maps exist and are a real second measurement, not a copy of the before.
+    for axis in ("pe1", "pe2"):
+        before = nib.load(f"{stem}_taskr_{axis}.nii.gz").get_fdata(dtype=np.float32)
+        after = nib.load(f"{stem}_taskr_{axis}_after.nii.gz").get_fdata(dtype=np.float32)
+        assert before.shape == after.shape
+        assert not np.allclose(before, after)

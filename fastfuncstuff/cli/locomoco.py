@@ -41,6 +41,7 @@ from fastfuncstuff.cli_utils import (
     print_cli_footer,
     print_cli_header,
     print_cli_section,
+    print_cli_subsection,
     run_batch_jobs,
     setup_device,
 )
@@ -1913,6 +1914,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     tpath = f"{stem}_locomoco_taskcoupling.txt"
     Path(tpath).write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print(f"  • task-coupling report: {tpath}")
+    args._task_labels = labels
     return design, polort, resp, mask
 
 
@@ -2050,6 +2052,49 @@ def _ica_rank_sweep(comps, resp, mask, ranks, device):
     return best_rank, best_got
 
 
+def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, args):
+    """Re-measure task coupling on the FIXED field and write the after maps.
+
+    The diagnostic above deliberately measures the field AS ESTIMATED -- scoring the
+    fix's own output would always report success. But that leaves nothing to compare
+    against, so the same measurement is repeated on the cleaned field and written with
+    an ``_after`` suffix. Two ``_taskr`` maps of the same run, before and after, are
+    what actually answer "did it work".
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.task_coupling import (
+        enrichment_curve,
+        task_coupling,
+        task_enrichment,
+    )
+
+    print_cli_subsection("TASK COUPLING AFTER THE FIX — compare against the block above")
+    for label, axis, field in result.pe_displacements():
+        name = _pe_axis_name(label, axis, args)
+        tc = task_coupling(field, design, polort=polort, mask=mask, labels=args._task_labels)
+        summary = tc.summarize(resp)
+        curve = enrichment_curve(tc, resp, mask)
+        tail = curve[-1] if curve else None
+        best = max(summary["conditions"], key=lambda c: c["abs_r_median"])
+        tail_txt = (
+            f"tail enrichment {tail['enrichment']:.2f}x of {tail['ceiling']:.0f}x"
+            if tail
+            else f"enrichment {task_enrichment(tc, resp, mask)['enrichment']:.2f}x"
+        )
+        print(
+            f"  • {name}: {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
+            f"{best['abs_r_p95']:.3f} p95 in the active mask"
+        )
+        path = f"{stem}_taskr_{label}_after{ext}"
+        with spinner(f"Writing {Path(path).name}"):
+            arr = tc.r.float()
+            save_nifti(
+                (arr.squeeze(-1) if arr.shape[-1] == 1 else arr).numpy(), path, affine=affine
+            )
+        print(f"    {path}")
+
+
 def _warp_recon_stage(result, data, args, resp, mask, device):
     """Rebuild the field from a warp decomposition, dropping task-loaded components.
 
@@ -2080,7 +2125,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
             n_t = comps[0][1].shape[-1]
             top = max(4, n_t - 1)
             grid = sorted({max(2, int(top * f)) for f in (0.15, 0.3, 0.45, 0.6, 0.8)})
-            print("  ── ICA rank sweep (peak task enrichment over components) ──")
+            print_cli_subsection("ICA RANK SWEEP — peak task enrichment over components")
             n_pcs, got = _ica_rank_sweep(comps, resp, mask, grid, device)
     elif method == "ica":
         got = warp_ica_basis(
@@ -2121,11 +2166,11 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
         keep[axis] = idx
 
     if method == "ica":
-        head = f"warp task rejection (ICA rank {k}, projected out of the FULL-rank field)"
+        head = f"WARP TASK REJECTION — ICA rank {k}, projected from the FULL-rank field"
     else:
         span = f"top {k}" if n_pcs is not None else f"all {k}"
-        head = f"warp reconstruction ({span} principal components, shared temporal basis)"
-    print(f"  ── {head} ──")
+        head = f"WARP RECONSTRUCTION — {span} principal components"
+    print_cli_subsection(head)
     for axis, _load in loadings:
         lbl = label_of.get(axis, f"axis{axis}")
         drops = dropped.get(axis, [])
@@ -2211,6 +2256,29 @@ def _warp_recon_stage(result, data, args, resp, mask, device):
                     d = np.linalg.norm(tc) * np.linalg.norm(x)
                     cs.append(f"#{i} |r|={abs(float(tc @ x / d)) if d > 0 else 0:.2f}")
                 print(f"    {lbl} dropped components vs the design: {', '.join(cs)}")
+
+    if any(dropped.values()):
+        design = getattr(args, "_task_design", None)
+        cols, names = [], []
+        if design is not None:
+            d = np.asarray(design)[:, 0].astype(float)
+            cols.append((d - d.mean()) / max(d.std(), 1e-12))
+            names.append("design")
+        for axis, drops in dropped.items():
+            lbl = label_of.get(axis, f"axis{axis}")
+            for i, _e in drops:
+                tc = basis[:, i].numpy().astype(float)
+                cols.append((tc - tc.mean()) / max(tc.std(), 1e-12))
+                names.append(f"{lbl}_ic{i:02d}")
+        rpath = f"{args._stem}_locomoco_rejected.1D"
+        # z-scored, and the design shipped in column 1: the reason to plot this is to
+        # see whether what was removed tracks the task, and that comparison is unreadable
+        # if the columns sit at different scales or the reference lives in another file.
+        header = "# z-scored; column 1 is the task design for comparison\n# " + "  ".join(
+            f"{n:>12s}" for n in names
+        )
+        np.savetxt(rpath, np.stack(cols, axis=1), fmt="%12.6f", header=header, comments="")
+        print(f"  • rejected component time courses (plot against the design): {rpath}")
 
     out, note = pc_reconstruct_result(
         result,
@@ -2317,6 +2385,7 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         return result
 
     args._task_design = design
+    args._stem = stem
     if args.write_pc_maps is not None:
         _write_pc_maps(result, stem, ext, affine, args, resp, mask, device)
 
@@ -2326,9 +2395,11 @@ def _task_stage(result, data, stem, ext, affine, args, tr, device):
         result = _warp_recon_stage(result, data, args, resp, mask, device)
 
     if not args.detask_field:
+        if args.warp_recon:
+            _write_task_after(result, design, polort, resp, mask, stem, ext, affine, args)
         return result
 
-    print("  ── de-tasking (everything below is derived from the CLEANED field) ──")
+    print_cli_subsection("DE-TASKING — every output below comes from the CLEANED field")
     raw_components = [(ax, f) for _, ax, f in result.pe_displacements()]
     cleaned, removed, note = detask_result(
         result,
