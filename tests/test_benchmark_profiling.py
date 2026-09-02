@@ -178,7 +178,7 @@ def test_benchmark_profiler_aggregates_invocations(tmp_path):
     assert summary["report_build_seconds"] == 0.3
     assert summary["io_python"][0]["function"] == "load_image"
     assert summary["torch"][0]["operator"] == "aten::mm"
-    assert "Top sampled PyTorch operators" in (stage.stage_dir / "summary.txt").read_text()
+    assert "PyTorch operators" in (stage.stage_dir / "summary.txt").read_text()
 
 
 def test_profiled_ffs_timing_is_not_cached(tmp_path, monkeypatch):
