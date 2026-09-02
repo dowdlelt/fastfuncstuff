@@ -677,3 +677,24 @@ class TestNordicBudgetFromFree:
         0.5x free, so the LLR batch is not starved."""
         free = 10 * self.GiB
         assert _nordic_budget_from_free(free) > free // 2
+
+
+class TestReservedAndAllocated:
+    """One allocator query instead of two dict-flattening ones."""
+
+    @pytest.mark.gpu
+    def test_matches_the_torch_helpers(self):
+        from fastfuncstuff.memory import _reserved_and_allocated
+
+        device = torch.device("cuda")
+        held = torch.zeros(1 << 20, device=device)  # something to actually report
+        reserved, allocated = _reserved_and_allocated(device)
+        assert reserved == torch.cuda.memory_reserved(device)
+        assert allocated == torch.cuda.memory_allocated(device)
+        del held
+
+    def test_cpu_budget_is_unaffected(self):
+        """get_available_memory's CPU branch never touches the CUDA allocator."""
+        from fastfuncstuff.memory import get_available_memory
+
+        assert get_available_memory(torch.device("cpu")) > 0
