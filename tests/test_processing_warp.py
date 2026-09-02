@@ -1100,12 +1100,15 @@ class TestGaussNewtonLocalCosts:
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
 
         base, moving = self._pair()
-        return qwarp(
+        out = qwarp(
             base,
             moving,
             config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, **kw),
             device=torch.device("cuda"),
         )
+        # qwarp returns device tensors; every assertion here compares against the
+        # CPU inputs, and evaluate_metrics refuses a mixed-device pair.
+        return tuple(t.cpu() for t in out)
 
     @pytest.mark.parametrize("cost", ["lpa", "lncc"])
     def test_local_gn_improves_alignment(self, cost):
@@ -1128,15 +1131,19 @@ class TestGaussNewtonLocalCosts:
         )["ls"]
         assert abs(a - g) < 0.15, f"{cost}: GN {g:.4f} vs Adam {a:.4f}"
 
-    def test_lpc_is_excluded_from_gauss_newton(self):
-        """lpc rewards anti-correlation. A sum-of-squares residual between
-        normalised patches can only pull them together, so the surrogate would
-        point the wrong way -- it must fall back rather than optimise backwards."""
+    def test_lpc_takes_the_gauss_newton_path(self):
+        """lpc used to fall back to Adam: a sum-of-squares residual between
+        normalised patches can only pull them together, and lpc wants them
+        anti-correlated. Negating base_hat moves the least-squares minimum to
+        correlation -1, so the surrogate points the right way and lpc no longer
+        has to decline the fast route. See TestGaussNewtonForLpc for the
+        quality evidence."""
         import torch
 
-        plain = self._run("lpc")[0]
-        asked = self._run("lpc", optimizer="gn")[0]
-        assert torch.equal(plain, asked)
+        adam = self._run("lpc", optimizer="adam")[0]
+        default = self._run("lpc")[0]
+        # It used to be the same tensor, because the request was declined.
+        assert not torch.equal(adam, default)
 
     def test_local_gn_produces_a_sound_warp(self):
         from fastfuncstuff.processing.mask import automask
@@ -1188,7 +1195,7 @@ class TestHybridOptimizer:
             config=QwarpConfig(verb=0, cost_method=cost, minpatch=9, optimizer=optimizer),
             device=torch.device("cuda"),
         )
-        return evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
+        return evaluate_metrics(MetricInputs(base=base, moving=warped.cpu()), ["ls"])["ls"]
 
     @pytest.mark.gpu
     @pytest.mark.parametrize("cost", ["pearclp", "lpa"])
@@ -1232,21 +1239,167 @@ class TestHybridOptimizer:
         )
         assert float(costs[0]) <= 1e-6
 
-    @pytest.mark.gpu
-    def test_hybrid_falls_back_where_gauss_newton_does(self):
+
+class TestGnScheduleResolution:
+    """Which optimizer schedule a cost resolves to.
+
+    This was an end-to-end bit-equality assertion, which cannot work: the GN
+    path is nondeterministic (the same spread that made -deterministic necessary
+    for allineate A/Bs), so two identical runs differ in the last digits. The
+    rule itself is what matters and it is worth testing directly -- no GPU, no
+    flake.
+    """
+
+    @staticmethod
+    def _resolve(cost, optimizer="gn"):
+        from fastfuncstuff.processing.warp import resolve_gn_schedule
+
+        return resolve_gn_schedule(cost, optimizer)
+
+    @pytest.mark.parametrize("cost", ["lpa", "lpa_alt", "lncc", "lpc"])
+    def test_local_costs_take_the_local_surrogate(self, cost):
+        assert self._resolve(cost).gn_local
+        assert self._resolve(cost).use_gn
+
+    @pytest.mark.parametrize("cost", ["pearson", "pearclp", "ncc"])
+    def test_plain_correlations_take_the_global_surrogate(self, cost):
+        schedule = self._resolve(cost)
+        assert schedule.gn_global and not schedule.gn_local
+        assert schedule.use_gn
+
+    @pytest.mark.parametrize("cost", ["mi", "nmi", "hel", "crM"])
+    def test_costs_without_a_residual_form_still_fall_back(self, cost):
+        schedule = self._resolve(cost)
+        assert not schedule.use_gn and not schedule.use_hybrid
+
+    def test_only_lpc_flips_the_residual_sign(self):
+        """The sign is the whole mechanism: lpc's optimum is anti-correlation,
+        so its least-squares minimum has to sit at correlation -1."""
+        assert self._resolve("lpc").gn_sign == -1.0
+        for cost in ("lpa", "lncc", "pearclp", "pearson"):
+            assert self._resolve(cost).gn_sign == 1.0
+
+    def test_lpc_takes_the_hybrid_schedule_on_a_bare_gn_request(self):
+        """Its surrogate leaves a wider gap than lpa's, so the Adam polish is
+        not optional for lpc -- both spellings select the same path."""
+        assert self._resolve("lpc", "gn").use_hybrid
+        assert self._resolve("lpc", "hybrid").use_hybrid
+
+    @pytest.mark.parametrize("cost", ["lpa", "lncc", "pearclp"])
+    def test_other_costs_only_polish_when_asked(self, cost):
+        assert not self._resolve(cost, "gn").use_hybrid
+        assert self._resolve(cost, "hybrid").use_hybrid
+
+    def test_adam_never_engages_the_gauss_newton_machinery(self):
+        for cost in ("lpc", "lpa", "pearclp"):
+            schedule = self._resolve(cost, "adam")
+            assert not schedule.use_gn and not schedule.use_hybrid
+
+
+@pytest.mark.gpu
+class TestGaussNewtonForLpc:
+    """lpc reaches the Gauss-Newton path through a sign-flipped residual.
+
+    lpc's optimum is per-blok *anti*-correlation -- the whole point for
+    inverted-contrast EPI<->T1 -- so the ordinary ``base_hat - w_hat`` residual
+    pulls the patches together and points the surrogate backwards. Negating
+    base_hat puts the least-squares minimum at correlation -1 instead, which is
+    where lpc wants to be.
+    """
+
+    N = 48
+
+    def _known_warp_pair(self):
+        """base, and an inverted-contrast copy displaced by a known field."""
+        import numpy as np
+        import torch
+        import torch.nn.functional as F
+
+        n = self.N
+        z, y, x = np.mgrid[0:n, 0:n, 0:n]
+        c = n / 2
+
+        def blob(cx, cy, cz, r, amp):
+            return amp * np.exp(-(((x - cx) ** 2 + (y - cy) ** 2 + (z - cz) ** 2) / (2 * r**2)))
+
+        struct = (
+            blob(c, c, c, n / 5, 100.0)
+            + blob(c - n / 5, c, c, n / 12, 60.0)
+            + blob(c + n / 6, c + n / 7, c, n / 14, 80.0)
+        )
+        base = torch.from_numpy(struct.astype(np.float32))
+
+        amp = 2.5
+        dx = amp * np.sin(2 * np.pi * z / n) * np.cos(2 * np.pi * y / n)
+        dy = amp * np.sin(2 * np.pi * x / n) * np.cos(2 * np.pi * z / n)
+        dz = amp * np.sin(2 * np.pi * y / n) * np.cos(2 * np.pi * x / n)
+        gz, gy, gx = np.mgrid[0:n, 0:n, 0:n]
+        grid = torch.stack(
+            [
+                torch.from_numpy(2 * (gx + dx) / (n - 1) - 1),
+                torch.from_numpy(2 * (gy + dy) / (n - 1) - 1),
+                torch.from_numpy(2 * (gz + dz) / (n - 1) - 1),
+            ],
+            dim=-1,
+        ).float()[None]
+        moved = F.grid_sample(base[None, None], grid, align_corners=True, padding_mode="border")[
+            0, 0
+        ]
+        return base, moved.max() - moved  # inverted contrast
+
+    @staticmethod
+    def _lpc(base, moving):
+        from fastfuncstuff.processing.cost_blok import assign_bloks, lpc_cost
+
+        blokset = assign_bloks(tuple(base.shape), (1.0, 1.0, 1.0), "tohd", blokrad=6.54321)
+        return float(lpc_cost(base, moving, None, blokset))  # higher is better
+
+    def test_anti_correlation_is_what_lpc_wants(self):
+        """The premise of the sign flip, asserted directly: for inverted
+        contrast the aligned pair scores best, and for matched contrast it
+        scores worst."""
+        import torch
+
+        base, _ = self._known_warp_pair()
+        inverted = base.max() - base
+        misaligned = torch.roll(inverted, shifts=(4, 4), dims=(0, 1))
+        assert self._lpc(base, inverted) > self._lpc(base, misaligned)
+        assert self._lpc(base, base) < self._lpc(base, torch.roll(base, shifts=(4, 4), dims=(0, 1)))
+
+    def test_lpc_no_longer_falls_back_to_adam(self):
         import torch
 
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
 
-        base, moving = self._pair()
-        dev = torch.device("cuda")
-        plain = qwarp(
-            base, moving, config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9), device=dev
-        )[0]
-        asked = qwarp(
+        base, moving = self._known_warp_pair()
+        before = self._lpc(base, moving)
+        warped, *_ = qwarp(
             base,
             moving,
-            config=QwarpConfig(verb=0, cost_method="lpc", minpatch=9, optimizer="hybrid"),
-            device=dev,
-        )[0]
-        assert torch.equal(plain, asked)
+            config=QwarpConfig(verb=0, cost_method="lpc", minpatch=13),
+            device=torch.device("cuda"),
+        )
+        after = self._lpc(base, warped.cpu())
+        assert after > before, f"lpc got worse: {before:.3f} -> {after:.3f}"
+        assert torch.isfinite(warped).all()
+
+    def test_at_least_matches_adam(self):
+        """The surrogate steers, the true cost decides -- so the GN route must
+        not land behind the optimiser it replaces."""
+        import torch
+
+        from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+        base, moving = self._known_warp_pair()
+        device = torch.device("cuda")
+
+        def run(optimizer):
+            warped, *_ = qwarp(
+                base,
+                moving,
+                config=QwarpConfig(verb=0, cost_method="lpc", minpatch=13, optimizer=optimizer),
+                device=device,
+            )
+            return self._lpc(base, warped.cpu())
+
+        assert run("gn") >= run("adam") * 0.95

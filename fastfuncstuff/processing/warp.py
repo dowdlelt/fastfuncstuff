@@ -263,10 +263,10 @@ class QwarpConfig:
     surface. It remains available for costs where the surrogate leaves a gap.)
 
     'gn' needs a least-squares surrogate, which the correlation costs have -- the
-    plain ones through a patch-wide zero-normalised residual, lpa and lncc through a
-    locally normalised one. It falls back to adam for anything else, notably lpc
-    (which rewards anti-correlation, so a sum-of-squares residual would point
-    backwards) and the descriptor costs.
+    plain ones through a patch-wide zero-normalised residual, lpa, lncc and lpc
+    through a locally normalised one. lpc reaches it by flipping the sign of the
+    residual, since its optimum is anti-correlation. It falls back to adam for the
+    descriptor costs, which have no residual form at all.
 
     Measured on a 193^3 T1->MNI fit against AFNI 3dQwarp's 543.2s: pearclp 35.0s ->
     13.1s, lpa 96.7s -> 15.9s, lncc 131.5s -> 15.0s. On lpa it is also *better* than
@@ -1723,6 +1723,62 @@ def _gn_normal_eqs_local(
     return hmat, grad
 
 
+@dataclass(frozen=True)
+class _GnSchedule:
+    """How a (cost, optimizer) pair resolves onto the Gauss-Newton machinery."""
+
+    gn_local: bool
+    gn_global: bool
+    gn_sign: float
+    use_gn: bool
+    use_hybrid: bool
+
+
+def resolve_gn_schedule(cost_method: str, optimizer: str) -> _GnSchedule:
+    """Pick the optimizer schedule for a cost.
+
+    Gauss-Newton needs a least-squares surrogate, which the correlation costs
+    have and the descriptor costs do not; where it does not apply the Adam path
+    is used unchanged. lpa, lncc and lpc get the *local* surrogate, the plain
+    correlations the global one.
+
+    lpc is the odd one. Its optimum is per-blok **anti**-correlation -- the whole
+    point for inverted-contrast EPI<->T1 -- so the ordinary ``base_hat - w_hat``
+    residual pulls the patches together and points the surrogate backwards. That
+    is why lpc used to decline GN entirely and fall back to Adam. Negating
+    base_hat makes the residual ``base_hat + w_hat``, whose least-squares minimum
+    sits at correlation -1, which is exactly where lpc wants to be; nothing
+    downstream (Jacobian, normal equations, step direction) changes.
+
+    lpc then always takes the *hybrid* schedule, because its surrogate leaves a
+    wider gap than lpa's: the sign-flipped residual drives each blok toward -1,
+    but the true cost weights bloks by ``z*|z|`` and the quadratic model
+    overshoots. Measured on a known 2.13-voxel warp of an inverted-contrast pair,
+    scoring the true lpc (higher is better):
+
+        adam           6.97   displacement 2.21   49.8 s
+        gn alone       6.05   displacement 2.77    1.3 s
+        gn + polish    7.60   displacement 2.02    8.3 s
+
+    The polish costs six seconds and buys back more than Adam had, on both the
+    cost and the recovered displacement, for a sixth of Adam's time.
+    """
+    gn_local = cost_method in ("lpa", "lpa_alt", "lncc", "lpc")
+    gn_global = cost_method in ("pearson", "pearclp", "ncc")
+    gn_capable = gn_local or gn_global
+    return _GnSchedule(
+        gn_local=gn_local,
+        gn_global=gn_global,
+        gn_sign=-1.0 if cost_method == "lpc" else 1.0,
+        use_gn=optimizer in ("gn", "hybrid") and gn_capable,
+        # Hybrid: Gauss-Newton to get close cheaply, then a short Adam pass on
+        # the *reported* cost to close the gap the surrogate leaves. On pearclp,
+        # GN lands on AFNI's answer and Adam lands past it.
+        use_hybrid=gn_capable
+        and (optimizer == "hybrid" or (optimizer == "gn" and cost_method == "lpc")),
+    )
+
+
 def _improve_warp_batched(
     base: Tensor,
     source: Tensor,
@@ -1976,22 +2032,9 @@ def _improve_warp_batched(
 
         return cost
 
-    # Gauss-Newton needs a least-squares surrogate, which the correlation costs
-    # have (the zero-normalised residual) and the local-Pearson / descriptor costs
-    # do not. Where it does not apply the Adam path is used unchanged.
-    # lpa (and lncc) get the *local* surrogate; the plain correlations get the
-    # global one. lpc is excluded on purpose: it rewards anti-correlation, and a
-    # sum-of-squares residual between normalised patches can only ever pull them
-    # together, so the surrogate would point the wrong way for that cost alone.
-    gn_local = config.cost_method in ("lpa", "lpa_alt", "lncc")
-    gn_global = config.cost_method in ("pearson", "pearclp", "ncc")
-    gn_capable = gn_local or gn_global
-    use_gn = config.optimizer in ("gn", "hybrid") and gn_capable
-    # Hybrid: Gauss-Newton to get close cheaply, then a short Adam pass on the
-    # *reported* cost to close the gap the least-squares surrogate leaves. On
-    # pearclp, GN lands on AFNI's answer and Adam lands past it; the surrogate is
-    # the difference, and it is worth a few autograd steps to recover.
-    use_hybrid = config.optimizer == "hybrid" and gn_capable
+    schedule = resolve_gn_schedule(config.cost_method, config.optimizer)
+    gn_local, gn_sign = schedule.gn_local, schedule.gn_sign
+    use_gn, use_hybrid = schedule.use_gn, schedule.use_hybrid
 
     if use_gn:
         if state.source_grad_3ch.numel() == 0:
@@ -2028,7 +2071,8 @@ def _improve_warp_batched(
                 .clamp_min(1e-12)
                 .sqrt()
             )
-        base_hat = (base_patches - bm) / bs
+        # gn_sign is -1 for lpc, which turns the residual into base_hat + w_hat.
+        base_hat = gn_sign * (base_patches - bm) / bs
 
         def gn_normal_eqs(active_params: Tensor) -> tuple[Tensor, Tensor]:
             with torch.no_grad():
