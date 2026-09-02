@@ -3500,6 +3500,14 @@ def _pc_variance_table(scores, var, data, args, label, stem):
 
     k = scores.shape[1]
     vd, vt, tf = got["var_data"], got["var_task"], got["task_frac"]
+    n_t = scores.shape[0]
+    n_k = 1 if design is None else int(np.asarray(design).reshape(n_t, -1).shape[1])
+    # What ONE component unrelated to anything would score. Without it a reader has no
+    # scale: five orthonormal regressors take k/(T-polort-1) of the variance by
+    # construction, and the same fraction of the task subspace.
+    df = max(1, n_t - polort - 1)
+    chance_data, chance_task = 1.0 / df, n_k / df
+
     head = f"{'PC':>4}  {'warp%':>7}  {'data%':>7}"
     if vt is not None:
         head += f"  {'task%':>7}  {'design':>7}"
@@ -3511,8 +3519,19 @@ def _pc_variance_table(scores, var, data, args, label, stem):
         rows.append(row)
     for r in rows:
         print(f"      {r}")
+    note = (
+        f"      chance per component: data {100 * chance_data:.3f}%, "
+        f"task {100 * chance_task:.3f}% (T={n_t}, polort={polort})"
+    )
     if vt is None:
-        print("      (task% needs -events)")
+        note = f"      chance per component: data {100 * chance_data:.3f}% (task% needs -events)"
+    print(note)
+    if vt is not None and n_k == 1:
+        # With one condition the task subspace is one direction, so the share of the
+        # data's task variance a component takes reduces EXACTLY to the share of the
+        # component lying in that direction. Two columns, one number -- said out loud,
+        # because reading them as two pieces of evidence would double-count.
+        print("      (one condition: task% and design are the same quantity)")
 
     suffix = f"_{label}" if label else ""
     path = f"{stem}_locomoco_pcs{suffix}_variance.1D"
@@ -3520,9 +3539,15 @@ def _pc_variance_table(scores, var, data, args, label, stem):
         f.write("# ffs_locomoco warp PC variance accounting\n")
         f.write("# warp%   share of the WARP field's variance (the PC spectrum)\n")
         f.write("# data%   share of the corrected data's drift-residualized variance\n")
+        f.write(f"# chance per component: data {100 * chance_data:.3f}%")
+        if vt is not None:
+            f.write(f", task {100 * chance_task:.3f}%")
+        f.write(f"  (T={n_t}, polort={polort})\n")
         if vt is not None:
             f.write("# task%   share of the data's TASK-explained variance\n")
             f.write("# design  share of the PC's own time course lying in the task subspace\n")
+            if n_k == 1:
+                f.write("# one condition: task% and design are the same quantity\n")
         f.write("\n".join("# " + r if i == 0 else r for i, r in enumerate(rows)) + "\n")
 
 

@@ -727,7 +727,21 @@ def component_variance_in_data(
     chunked pass over the data with two small matmuls gives every column.
 
     ``data`` is ``(nx, ny, nz, T)``, ideally the CORRECTED series: the regressors will
-    be used on the images that come out of this tool, not the ones that went in.
+    be used on the images that come out of this tool, not the ones that went in. That
+    also makes ``var_data`` the RESIDUAL motion-linked variance -- the correction has
+    already removed what it could, so what these components still explain is what a
+    regressor could still take out. Scored on the raw series it would read higher and
+    mean something different.
+
+    Note the ``var_task``/``task_frac`` pair collapses when the design has ONE column:
+    the task subspace is then a single direction, so the share of the data's task
+    variance a component takes is exactly the share of the component lying in that
+    direction. They only carry separate information with multiple conditions, where the
+    data decides which task directions matter.
+
+    Compare against chance, which is not zero: one component orthonormalized into a
+    ``T - polort - 1`` dimensional residual space takes ``1/(T-polort-1)`` of the
+    variance and ``K/(T-polort-1)`` of the task subspace by construction.
     """
     from fastfuncstuff.glm.core import construct_polynomial_matrix
     from fastfuncstuff.memory import estimate_chunk_size

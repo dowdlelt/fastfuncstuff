@@ -1584,3 +1584,27 @@ def test_component_variance_in_data_separates_task_share_from_data_share():
     # The design-aligned component is the mirror image.
     assert float(vt[1]) > 0.9
     assert float(tf[1]) > 0.9
+
+
+def test_component_variance_task_share_collapses_onto_design_overlap_at_one_condition():
+    """With a single condition the two task columns are provably one number.
+
+    The task subspace is then one direction, so the share of the data's task variance a
+    component takes IS the share of the component lying in that direction. Reading them
+    as two pieces of evidence would double-count; with two conditions they separate,
+    because the data decides which task directions carry variance.
+    """
+    from fastfuncstuff.stats.task_coupling import component_variance_in_data
+
+    n_t, shape = 100, (5, 5, 3)
+    g = torch.Generator().manual_seed(0)
+    x1 = _block_design(n_t)
+    data = torch.randn(*shape, n_t, generator=g, dtype=torch.float64)
+    u = torch.randn(n_t, 4, generator=g, dtype=torch.float64)
+
+    one = component_variance_in_data(u, data, polort=2, design=x1)
+    assert torch.allclose(one["var_task"], one["task_frac"], atol=1e-10)
+
+    x2 = torch.cat([x1, torch.roll(x1, 7, 0)], dim=1)
+    two = component_variance_in_data(u, data, polort=2, design=x2)
+    assert not torch.allclose(two["var_task"], two["task_frac"], atol=1e-4)
