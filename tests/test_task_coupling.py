@@ -1640,3 +1640,37 @@ def test_component_variance_task_frac_is_the_temporal_criterion_statistic():
         assert torch.allclose(
             cv["task_frac"], torch.as_tensor(tf["r2"], dtype=torch.float64), atol=1e-9
         )
+
+
+def test_joint_task_share_is_the_span_and_matches_the_sum_only_when_orthogonal():
+    """The joint figure is the design's overlap with the component SPAN, not a sum.
+
+    For components that are orthonormal AND already free of drift the two coincide
+    exactly. Residualizing drift out of components that carry it makes them
+    non-orthogonal, and the span then holds a DIFFERENT amount than the marginals sum
+    to — in either direction, since correlated predictors can suppress as well as
+    reinforce. That is why the joint is computed as a projection and reported
+    separately, rather than left to be added up by eye.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.stats.task_coupling import component_variance_in_data
+
+    n_t, shape = 120, (5, 5, 3)
+    g = torch.Generator().manual_seed(2)
+    x = _block_design(n_t)
+    data = torch.randn(*shape, n_t, generator=g, dtype=torch.float64)
+    qn = torch.linalg.qr(
+        construct_polynomial_matrix(n_t, 3, device=torch.device("cpu"), dtype=torch.float64)
+    )[0]
+
+    clean = torch.randn(n_t, 5, generator=g, dtype=torch.float64)
+    clean = torch.linalg.qr(clean - qn @ (qn.T @ clean))[0]
+    got = component_variance_in_data(clean, data, polort=3, design=x)
+    assert abs(got["joint_var_task"] - float(got["task_frac"].sum())) < 1e-9
+
+    drifty = torch.linalg.qr(torch.randn(n_t, 5, generator=g, dtype=torch.float64))[0]
+    drifty = torch.linalg.qr(drifty + 2.0 * qn[:, :1] + 1.5 * qn[:, 1:2])[0]
+    got = component_variance_in_data(drifty, data, polort=3, design=x)
+    assert abs(got["joint_var_task"] - float(got["task_frac"].sum())) > 1e-6
+    # Whichever way it went, the joint is a projection and so is bounded.
+    assert 0.0 <= got["joint_var_task"] <= 1.0

@@ -720,9 +720,13 @@ def component_variance_in_data(
       reported here on an interpretable scale and without the surrogate null; it is not
       a second, independent piece of evidence.
 
-    ``joint_var_data`` / ``joint_var_task`` are the figures for all components TOGETHER.
-    The per-component shares are marginal, so they overlap wherever components correlate
-    and will generally sum to more than the joint value.
+    ``joint_var_data`` / ``joint_var_task`` are the figures for all components TOGETHER
+    -- projections onto the component SPAN, not sums. They coincide with the sum of the
+    marginals only when the drift-residualized components are orthogonal; otherwise
+    correlated components can suppress as well as reinforce, so the sum can land on
+    either side of the joint and is not a meaningful quantity. Compare the joint against
+    its OWN floor, ``k/(T-polort-1)``, which is k times the per-component one: k
+    directions capture that share of any fixed direction by construction.
 
     Components are orthogonalized against the drift basis and re-orthonormalized first,
     so ``var_data`` is a partial share w.r.t. the polynomials the GLM will carry anyway,

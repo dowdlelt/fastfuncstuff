@@ -3521,10 +3521,18 @@ def _pc_variance_table(scores, var, data, args, label, stem):
         print(f"      {r}")
     # The per-component shares are MARGINAL, so they overlap where components correlate.
     # The joint figure is the one to quote for "what these k regressors remove".
-    joint = f"all {k} together: data {100 * got['joint_var_data']:.2f}%"
+    # The joint chance level is k times the per-component one, NOT the same number: k
+    # directions capture k/(T-polort-1) of any fixed direction by construction. Without
+    # it a joint task share is unreadable -- 4% of the task in a 5-component span is
+    # exactly nothing when the floor is 4.3%.
+    joint = (
+        f"all {k} together: data {100 * got['joint_var_data']:.2f}% "
+        f"(chance {100 * k * chance_data:.2f}%)"
+    )
     if got["joint_var_task"] is not None:
-        joint += f", task {100 * got['joint_var_task']:.2f}%"
-    print(f"      {joint}  (marginal shares above overlap and may sum to more)")
+        joint += f", task {100 * got['joint_var_task']:.2f}% (chance {100 * k * chance_task:.2f}%)"
+    print(f"      {joint}")
+    print("      marginal shares above are per component and overlap; the joint is the span")
     note = (
         f"      chance per component: data {100 * chance_data:.3f}%, "
         f"task {100 * chance_task:.3f}% (T={n_t}, polort={polort})"
@@ -3556,10 +3564,15 @@ def _pc_variance_table(scores, var, data, args, label, stem):
             f.write("# design  the temporal criterion's omnibus R² (not independent evidence)\n")
             if n_k == 1:
                 f.write("# one condition: task% and design are the same quantity\n")
-        f.write(f"# all {k} together: data {100 * got['joint_var_data']:.2f}%")
+        f.write(
+            f"# all {k} together: data {100 * got['joint_var_data']:.2f}% "
+            f"(chance {100 * k * chance_data:.2f}%)"
+        )
         if got["joint_var_task"] is not None:
-            f.write(f", task {100 * got['joint_var_task']:.2f}%")
-        f.write("  (per-component shares are marginal and overlap)\n")
+            f.write(
+                f", task {100 * got['joint_var_task']:.2f}% (chance {100 * k * chance_task:.2f}%)"
+            )
+        f.write("\n# per-component shares are marginal and overlap; the joint is the span\n")
         f.write("\n".join("# " + r if i == 0 else r for i, r in enumerate(rows)) + "\n")
 
 
