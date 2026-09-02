@@ -1461,13 +1461,18 @@ def test_coupling_stataux_matches_afni_correl_t2p_dof():
     """
     from fastfuncstuff.cli.locomoco import _coupling_stataux
 
-    aux = _coupling_stataux(n_t=120, polort=3, n_sub=2)
+    # n_ort counts EVERY column removed from both sides: polort+1 drift columns here.
+    aux = _coupling_stataux(n_t=120, n_ort=4, n_sub=2)
     assert set(aux) == {0, 1}
     for code, params in aux.values():
         assert code == 2  # FUNC_COR_TYPE
         nsam, nfit, nort = params
         assert (nsam, nfit, nort) == (120.0, 1.0, 4.0)
         assert nsam - nfit - nort == 120 - 3 - 2
+    # A fit that also carries 5 nuisance regressors must declare their dof, or AFNI
+    # credits it with dof it did not have.
+    ((_c, p_pc),) = set(_coupling_stataux(n_t=120, n_ort=4 + 5, n_sub=1).values())
+    assert p_pc == (120.0, 1.0, 9.0)
 
 
 def test_psc_betas_recover_a_planted_percent_signal_change():
@@ -1525,7 +1530,7 @@ def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
     psc = torch.zeros(*shape, 2)
 
     out = tmp_path / "fit.nii.gz"
-    _save_task_fit(str(out), tc, psc, labels, np.eye(4), 1, n_t)
+    _save_task_fit(str(out), tc, psc, labels, np.eye(4), 2, n_t)
 
     import nibabel as nib
 
@@ -1674,3 +1679,38 @@ def test_joint_task_share_is_the_span_and_matches_the_sum_only_when_orthogonal()
     assert abs(got["joint_var_task"] - float(got["task_frac"].sum())) > 1e-6
     # Whichever way it went, the joint is a projection and so is bounded.
     assert 0.0 <= got["joint_var_task"] <= 1.0
+
+
+def test_task_coupling_nuisance_columns_are_partialled_out():
+    """Extra nuisance columns must enter the same projection the polynomials do."""
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    n_t, shape = 120, (4, 4, 2)
+    g = torch.Generator().manual_seed(5)
+    x = _block_design(n_t)
+    xd = (x[:, 0] - x[:, 0].mean()).double()
+    nuis = torch.randn(n_t, generator=g).double()
+    nuis = nuis - xd * (nuis @ xd) / (xd @ xd)  # orthogonal to the design
+
+    data = torch.zeros(*shape, n_t, dtype=torch.float64)
+    data[0, 0, 0] = 100.0 + 3.0 * xd + 8.0 * nuis
+    mask = torch.zeros(shape)
+    mask[0, 0, 0] = 1
+
+    plain = task_coupling(data, x, polort=1, mask=mask)
+    with_n = task_coupling(data, x, polort=1, mask=mask, nuisance=nuis[:, None])
+    # The planted slope is 3. Carrying the nuisance column in the model recovers it
+    # exactly; leaving it out biases the estimate, because a column orthogonal to the
+    # RAW design is not orthogonal to it after the polynomials come out of both.
+    assert abs(float(with_n.beta[0, 0, 0, 0]) - 3.0) < 1e-6
+    assert abs(float(plain.beta[0, 0, 0, 0]) - 3.0) > 0.1
+    # And the partial correlation rises: the variance the column removed was all
+    # unexplained by the task.
+    assert float(with_n.r[0, 0, 0, 0].abs()) > float(plain.r[0, 0, 0, 0].abs()) + 0.3
+    # ...and the dof it costs is recorded, so the chance reference moves with it.
+    assert with_n.n_nuisance == 1
+    assert with_n.chance_share > plain.chance_share
+
+    # A nuisance column that IS the design leaves nothing for the task to explain.
+    with pytest.raises(ValueError, match="collinear"):
+        task_coupling(data, x, polort=1, mask=mask, nuisance=xd[:, None])

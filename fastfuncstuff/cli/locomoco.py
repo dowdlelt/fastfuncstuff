@@ -1525,7 +1525,13 @@ def create_parser() -> argparse.ArgumentParser:
         "the warp's variance each axis holds, how much of each axis the shared basis "
         "explains, and what an axis-only basis would explain. The difference is the "
         "price of sharing at the N you asked for — which is where it matters, since a "
-        "shared basis has to spend N components on the UNION of the two fields.",
+        "shared basis has to spend N components on the UNION of the two fields.\n"
+        "With -events the task fit is then RE-RUN with these PCs carried in the model "
+        "and written as {prefix}_taskfit_data_after_wpcs, so one run shows the "
+        "correction's effect on the response and the regressors' effect on it in the "
+        "same units. |r| rising while the amplitude holds is the components removing "
+        "noise; an amplitude that falls with them is task variance being spent on the "
+        "nuisance columns. The dof they cost goes into that map's fico ORT count.",
     )
     out.add_argument(
         "-pcs_per_axis",
@@ -2062,12 +2068,14 @@ def _pe_axis_name(label: str, axis: int, args) -> str:
     return f"{label} ({kind}{dir_txt}, axis {axis} = {letter})"
 
 
-def _coupling_stataux(n_t: int, polort: int, n_sub: int) -> dict:
+def _coupling_stataux(n_t: int, n_ort: int, n_sub: int) -> dict:
     """AFNI ``fico`` parameters for a drift-partial correlation map, per sub-brick.
 
     SAMPLES = timepoints, FIT-PARAMETERS = 1 (the single regressor each sub-brick is
-    correlated against), ORT-PARAMETERS = polort+1 (the Legendre drift columns removed
-    from both sides first, degrees 0..polort).
+    correlated against), ORT-PARAMETERS = every column removed from both sides first --
+    the polort+1 Legendre drift columns, plus any nuisance regressors carried in the
+    model, so a fit that spends degrees of freedom on warp PCs is not credited with the
+    dof of one that did not.
 
     AFNI reads these three straight into ``correl_t2p(rho, nsam, nfit, nort)``
     (mri_stats.c), which is ``incbeta(1 - rho^2, (nsam-nfit-nort)/2, nfit/2)`` — the
@@ -2086,7 +2094,7 @@ def _coupling_stataux(n_t: int, polort: int, n_sub: int) -> dict:
     """
     from fastfuncstuff.io.afni import stat_type_to_stataux
 
-    return {i: stat_type_to_stataux("fico", (n_t, 1, polort + 1)) for i in range(n_sub)}
+    return {i: stat_type_to_stataux("fico", (n_t, 1, n_ort)) for i in range(n_sub)}
 
 
 def _save_map(path, arr, labels, affine, stataux=None):
@@ -2109,15 +2117,15 @@ def _save_map(path, arr, labels, affine, stataux=None):
         )
 
 
-def _save_task_map(path, arr, labels, affine, *, stataux_polort=None, n_t=0):
+def _save_task_map(path, arr, labels, affine, *, n_ort=None, n_t=0):
     """A correlation-only map (the FIELD's coupling), every sub-brick tagged ``fico``."""
     a = arr.float()
     n_sub = 1 if (a.ndim == 3 or a.shape[-1] == 1) else a.shape[-1]
-    stataux = None if stataux_polort is None else _coupling_stataux(n_t, stataux_polort, n_sub)
+    stataux = None if n_ort is None else _coupling_stataux(n_t, n_ort, n_sub)
     _save_map(path, a, labels, affine, stataux)
 
 
-def _save_task_fit(path, tc, psc, labels, affine, polort, n_t):
+def _save_task_fit(path, tc, psc, labels, affine, n_ort, n_t):
     """One AFNI-style bucket per condition: amplitude, then the stat to threshold it on.
 
     Sub-bricks alternate ``{cond}_Coef`` (percent signal change) and ``{cond}_Correl``
@@ -2128,7 +2136,7 @@ def _save_task_fit(path, tc, psc, labels, affine, polort, n_t):
     import torch
 
     bricks, names, stataux = [], [], {}
-    stat = _coupling_stataux(n_t, polort, 1)[0]
+    stat = _coupling_stataux(n_t, n_ort, 1)[0]
     for k, lb in enumerate(labels):
         bricks += [psc[..., k].float(), tc.r[..., k].float()]
         names += [f"{lb}_Coef", f"{lb}_Correl"]
@@ -2277,13 +2285,16 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print()
     for path, arr, brick_labels, stat_polort in pending:
-        _save_task_map(path, arr, brick_labels, affine, stataux_polort=stat_polort, n_t=n_t)
+        n_ort = None if stat_polort is None else stat_polort + 1
+        _save_task_map(path, arr, brick_labels, affine, n_ort=n_ort, n_t=n_t)
     # The data side: the task response as it stands BEFORE any correction, as one
     # bucket of alternating amplitude and stat. `r` says where the response is, the PSC
     # beta says how big it is, and the amplitude is the half that moves when a
     # contaminated field drags a responding voxel toward the mean or blurs it.
     psc_before = _psc_betas(data_tc, design, reference, mask)
-    _save_task_fit(f"{stem}_taskfit_data{ext}", data_tc, psc_before, labels, affine, polort, n_t)
+    _save_task_fit(
+        f"{stem}_taskfit_data{ext}", data_tc, psc_before, labels, affine, polort + 1, n_t
+    )
     args._task_labels = labels
     # Everything the data-side "after" needs, so it can run at the point the corrected
     # series already exists rather than paying for a second 4-D warp to get one.
@@ -2543,10 +2554,10 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
     print()
     n_t = int(np.asarray(design).shape[0])
     for path, arr in pending:
-        _save_task_map(path, arr, args._task_labels, affine, stataux_polort=polort, n_t=n_t)
+        _save_task_map(path, arr, args._task_labels, affine, n_ort=polort + 1, n_t=n_t)
 
 
-def _write_data_task_after(corrected, stem, args):
+def _write_data_task_after(corrected, stem, args, pc_scores=None, pc_note=""):
     """Re-measure the task fit on the CORRECTED DATA, before/after.
 
     The field-side ``_after`` above answers "did the fix clean the field". This measures
@@ -2558,6 +2569,17 @@ def _write_data_task_after(corrected, stem, args):
     responding voxels toward the mean and blurs; both cut the AMPLITUDE while ``|r|``
     can barely move. The maps are written as one paired bucket per state so the two can
     be compared voxel-wise, not just as the medians printed here.
+
+    ``pc_scores`` adds a THIRD state: the same fit with the warp PCs carried in the
+    model as nuisance regressors. Every other diagnostic here describes the regressors
+    -- what share of the data they explain, how much they overlap the design -- and
+    stops one step short of the thing a user actually wants to know, which is what
+    happens to the response when they are used. This runs that model. ``|r|`` should
+    RISE if the components are removing noise (less unexplained variance under the same
+    task fit) while the amplitude holds; an amplitude that falls with them is task
+    variance being spent on the nuisance columns. The dof they cost travels into the
+    written map's ``fico`` ORT count, so AFNI does not credit this fit with the dof of
+    one that spent nothing.
     """
     st = getattr(args, "_task_after", None)
     if st is None:
@@ -2608,7 +2630,43 @@ def _write_data_task_after(corrected, stem, args):
         psc_after,
         st["labels"],
         affine,
-        st["polort"],
+        st["polort"] + 1,
+        n_t,
+    )
+    if pc_scores is None:
+        return
+
+    n_pc = int(np.asarray(pc_scores).shape[1])
+    with_pcs = task_coupling(
+        series,
+        st["design"],
+        polort=st["polort"],
+        mask=st["mask"],
+        labels=st["labels"],
+        nuisance=pc_scores,
+    )
+    psc_pcs = _psc_betas(with_pcs, st["design"], st["reference"], st["mask"])
+    print(f"  ...and with the {n_pc} warp PC(s){pc_note} carried in the model:")
+    for k, lb in enumerate(st["labels"]):
+        r1 = after.r[..., k][sel].abs()
+        r2 = with_pcs.r[..., k][sel].abs()
+        b1 = psc_after[..., k][sel].abs()
+        b2 = psc_pcs[..., k][sel].abs()
+        base = float(b1.median())
+        pct = 100.0 * (float(b2.median()) - base) / base if base > 0 else 0.0
+        print(
+            f"  {lb}: |r| {float(r1.median()):.3f} → {float(r2.median()):.3f} "
+            f"({float(r2.median()) - float(r1.median()):+.3f}), amplitude "
+            f"{base:.3f} → {float(b2.median()):.3f} %sig ({pct:+.1f}%)",
+            flush=True,
+        )
+    _save_task_fit(
+        f"{stem}_taskfit_data_after_wpcs{ext}",
+        with_pcs,
+        psc_pcs,
+        st["labels"],
+        affine,
+        st["polort"] + 1 + n_pc,
         n_t,
     )
 
@@ -3598,7 +3656,7 @@ def _pc_axis_labels(result, args):
 
 def _write_warp_pcs(
     components, stem, n_pcs, *, per_axis=False, label_of=None, data=None, args=None
-) -> None:
+):
     """Write the top-N temporal warp PCs as {stem}_locomoco_pcs*.1D.
 
     Recomputed from the in-memory warp, so it is independent of -no_warp (the warp need
@@ -3612,6 +3670,11 @@ def _write_warp_pcs(
     axes, and at the k a regressor request uses (5, typically) that is not guaranteed.
     ``per_axis`` writes a separate basis per encode axis instead — twice the regressors,
     so compare at equal total budget.
+
+    Returns ``(scores (T, k), note)`` — the regressor set as it would enter a GLM, so
+    the caller can fit the task WITH it and show what using these columns costs. Under
+    ``per_axis`` the axes' sets are concatenated, because that IS the set a GLM would
+    take. ``(None, "")`` if the warp is empty.
     """
     from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.processing.locomoco import warp_pc_axis_bases, warp_pc_basis
@@ -3626,7 +3689,8 @@ def _write_warp_pcs(
             bases = warp_pc_axis_bases(components, n_pcs=n_pcs, device=None)
         if not bases:
             print("  • warp PCs: skipped (warp is all-zero)")
-            return
+            return None, ""
+        collected = []
         for axis, scores, var in bases:
             lbl = _name(axis)
             k = scores.shape[1]
@@ -3638,15 +3702,17 @@ def _write_warp_pcs(
                 [f"{lbl}_PC{i:02d}" for i in range(k)],
             )
             print(f"    warp PCs [{lbl}]: {k} components, var {vp}")
+            collected.append((lbl, scores))
             if data is not None and args is not None:
                 _pc_variance_table(scores, var, data, args, lbl, stem)
-        return
+        note = " (" + " + ".join(f"{n} {lbl}" for lbl, sc in collected for n in [sc.shape[1]]) + ")"
+        return torch.cat([sc for _lbl, sc in collected], dim=1), note
 
     with spinner("Computing warp PCs"):
         got = warp_pc_basis(components, n_pcs=n_pcs, device=None, with_balance=True)
     if got is None:
         print("  • warp PCs: skipped (warp is all-zero)")
-        return
+        return None, ""
     u, _loadings, _means, var, balance = got
     scores = (u / u.std(dim=0, keepdim=True).clamp(min=1e-10)).float()
     k = scores.shape[1]
@@ -3661,6 +3727,7 @@ def _write_warp_pcs(
     _print_pc_balance(balance, label_of, k, indent="    ")
     if data is not None and args is not None:
         _pc_variance_table(scores, var, data, args, "", stem)
+    return scores, ""
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
@@ -4439,10 +4506,7 @@ def _run_multiecho(
 
     echo_mean_corr = None if corr_sum is None else corr_sum / len(result.per_echo)
     del corr_sum
-    if echo_mean_corr is not None:
-        _write_data_task_after(echo_mean_corr, stem, args)
-    elif getattr(args, "_task_after", None) is not None:
-        _write_data_task_after(None, stem, args)
+    pc_scores, pc_note = (None, "")
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -4460,7 +4524,7 @@ def _run_multiecho(
         # contributes both. Passing w_field alone, as this did, silently dropped the
         # primary-PE field from a dual multi-echo run's regressors. In memory regardless
         # of -no_warp.
-        _write_warp_pcs(
+        pc_scores, pc_note = _write_warp_pcs(
             [(ax, f) for _, ax, f in result.per_echo[0].pe_displacements()],
             stem,
             args.want_pcs,
@@ -4469,6 +4533,10 @@ def _run_multiecho(
             data=echo_mean_corr,
             args=args,
         )
+    if echo_mean_corr is not None:
+        _write_data_task_after(echo_mean_corr, stem, args, pc_scores, pc_note)
+    elif getattr(args, "_task_after", None) is not None:
+        _write_data_task_after(None, stem, args)
     del echo_mean_corr
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
@@ -5203,12 +5271,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         or args.want_pcs is not None
     )
     corrected_series = result.corrected_series() if want_corrected else None
-    _write_data_task_after(corrected_series, stem, args)
 
-    # After the corrected series exists, so each PC can be scored against the data it
-    # will be regressed on rather than only against the warp it came from.
+    # PCs BEFORE the task-fit report: each is scored against the data it will be
+    # regressed on, and the report then fits the task with them in the model, so one
+    # run shows the correction's effect and the regressors' effect in the same units.
+    pc_scores, pc_note = (None, "")
     if args.want_pcs is not None:
-        _write_warp_pcs(
+        pc_scores, pc_note = _write_warp_pcs(
             result.warp_components(),
             stem,
             args.want_pcs,
@@ -5217,6 +5286,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             data=corrected_series,
             args=args,
         )
+    _write_data_task_after(corrected_series, stem, args, pc_scores, pc_note)
 
     if not args.no_corrected:
         assert corrected_series is not None

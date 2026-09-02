@@ -126,6 +126,7 @@ class TaskCoupling:
     labels: list[str]
     polort: int
     n_timepoints: int = 0
+    n_nuisance: int = 0  # extra columns residualized out alongside the drift basis
     summary: dict = dc_field(default_factory=dict)
 
     def summarize(self, mask: torch.Tensor | None = None) -> dict:
@@ -178,7 +179,7 @@ class TaskCoupling:
         leaves the estimator unable to express a between-bin difference, so the field
         comes out closer to orthogonal to the design than chance would give.
         """
-        df = max(1, self.n_timepoints - self.polort - 1)
+        df = max(1, self.n_timepoints - self.polort - 1 - self.n_nuisance)
         return float(np.sqrt(len(self.labels) / df))
 
     @property
@@ -196,6 +197,7 @@ def task_coupling(
     mask: torch.Tensor | np.ndarray | None = None,
     labels: list[str] | None = None,
     device: torch.device | None = None,
+    nuisance: torch.Tensor | np.ndarray | None = None,
 ) -> TaskCoupling:
     """Signed partial correlation between a 4-D map and each task regressor.
 
@@ -209,6 +211,11 @@ def task_coupling(
     polort : int
         Legendre drift degree removed from BOTH the map and the design first, so ``r``
         is a partial correlation and slow drift cannot be charged to a long block.
+    nuisance : (T, P), optional
+        Extra columns removed alongside the drift basis, so ``r`` and ``beta`` become
+        partial with respect to those too.  This is how a candidate nuisance set is
+        judged: fit the task WITH the regressors in the model and see what happens to
+        the response, rather than inferring it from the regressors' properties.
     mask : (nx, ny, nz), optional
         Where the default summary is computed.  The maps are always full-FoV, and
         :meth:`TaskCoupling.summarize` re-summarizes over any other subset for free.
@@ -244,9 +251,19 @@ def task_coupling(
 
     # float64 for the T-sized factorizations: they are tiny, and the map's own mean can
     # be orders of magnitude above the task effect we are trying to resolve.
-    q_n = _orthonormal_basis(
-        construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
-    )
+    nuis = construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
+    n_extra = 0
+    if nuisance is not None:
+        extra = torch.as_tensor(np.asarray(nuisance), dtype=torch.float64, device=device)
+        if extra.ndim == 1:
+            extra = extra[:, None]
+        if extra.shape[0] != n_t:
+            raise ValueError(f"nuisance has {extra.shape[0]} rows but the map has {n_t}")
+        n_extra = extra.shape[1]
+        nuis = torch.cat([nuis, extra], dim=1)
+    # One basis for drift AND the extra columns: they are projected out together, so a
+    # nuisance column that duplicates drift is absorbed rather than counted twice.
+    q_n = _orthonormal_basis(nuis)
     x_scale = float(torch.linalg.matrix_norm(x, 2))
 
     def _detrended_units(cols: torch.Tensor) -> torch.Tensor:
@@ -255,8 +272,9 @@ def task_coupling(
     u_x = _detrended_units(x)
     if float(torch.linalg.matrix_norm(x - q_n @ (q_n.T @ x), 2)) < 1e-6 * x_scale:
         raise ValueError(
-            f"every task column is collinear with the polort-{polort} drift basis. "
-            "Lower -task_polort, or the design is not separable from drift at this "
+            f"every task column is collinear with the polort-{polort} drift basis"
+            + (f" plus {n_extra} nuisance column(s)" if n_extra else "")
+            + ". Lower -task_polort, or the design is not separable from drift at this "
             "block length."
         )
     # Omnibus subspace, only for the task-explained rms (a variance, so sign-free).
@@ -307,6 +325,7 @@ def task_coupling(
         labels=labels,
         polort=polort,
         n_timepoints=n_t,
+        n_nuisance=n_extra,
     )
     tc.summary = tc.summarize(mask)
     if tc.summary["n_voxels"] == 0:
