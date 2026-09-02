@@ -715,7 +715,14 @@ def component_variance_in_data(
       is the one that decides whether a regressor is safe: a nuisance column that eats
       task variance removes real BOLD in the GLM it is added to.
     * ``task_frac`` — the share of the component's OWN time course lying in the task
-      subspace, i.e. the collinearity with the design, independent of the data.
+      subspace, i.e. the collinearity with the design, independent of the data. This is
+      the SAME statistic :func:`component_task_fit` thresholds (its omnibus ``r2``),
+      reported here on an interpretable scale and without the surrogate null; it is not
+      a second, independent piece of evidence.
+
+    ``joint_var_data`` / ``joint_var_task`` are the figures for all components TOGETHER.
+    The per-component shares are marginal, so they overlap wherever components correlate
+    and will generally sum to more than the joint value.
 
     Components are orthogonalized against the drift basis and re-orthonormalized first,
     so ``var_data`` is a partial share w.r.t. the polynomials the GLM will carry anyway,
@@ -762,8 +769,19 @@ def component_variance_in_data(
     )
     # Partial w.r.t. drift, on BOTH sides: the GLM these enter carries polynomials, so
     # the slow variance they share with drift is not the component's to claim.
-    u_p = _orthonormal_basis(u - q_n @ (q_n.T @ u))
-    k = u_p.shape[1]
+    #
+    # Each component is normalized ON ITS OWN, never orthogonalized against the others.
+    # An earlier version ran the whole set through _orthonormal_basis, which returns the
+    # SVD directions of the set -- an orthogonal ROTATION of the component space. Row k
+    # was then labelled "component k" while describing a direction that was a mixture of
+    # all of them. Harmless for PCA (already orthonormal, barely rotated), wrong for ICA,
+    # whose mixing is not orthogonal at all. The price of doing it per component is that
+    # the shares OVERLAP where components correlate and so do not sum to the joint
+    # figure, which is returned separately as ``joint_var_data``.
+    u_d = u - q_n @ (q_n.T @ u)
+    u_d = u_d / u_d.norm(dim=0, keepdim=True).clamp(min=1e-30)
+    # The joint span, for the "all of them together" figure only.
+    u_j = _orthonormal_basis(u_d)
 
     q_x = None
     if design is not None:
@@ -781,10 +799,13 @@ def component_variance_in_data(
         keep = torch.as_tensor(np.asarray(mask)).reshape(-1) > 0
 
     ss_pc = torch.zeros(k, dtype=torch.float64, device=device)
+    ss_joint = torch.zeros((), dtype=torch.float64, device=device)
     ss_task_pc = torch.zeros(k, dtype=torch.float64, device=device)
+    ss_task_joint = torch.zeros((), dtype=torch.float64, device=device)
     ss_tot = torch.zeros((), dtype=torch.float64, device=device)
     ss_task = torch.zeros((), dtype=torch.float64, device=device)
-    a = None if q_x is None else q_x.T @ u_p  # (Kx, k)
+    a = None if q_x is None else q_x.T @ u_d  # (Kx, k)
+    a_j = None if q_x is None else q_x.T @ u_j
 
     flat = f.reshape(n_vox, n_t)
     chunk = estimate_chunk_size(n_vox, n_t, k + polort + 2, device, operation="glm")
@@ -799,24 +820,29 @@ def component_variance_in_data(
             y = flat[start:stop].to(device=device, dtype=torch.float64).T
         y = y - q_n @ (q_n.T @ y)
         ss_tot += (y * y).sum()
-        ss_pc += (u_p.T @ y).pow(2).sum(dim=1)
-        if q_x is not None and a is not None:
+        ss_pc += (u_d.T @ y).pow(2).sum(dim=1)
+        ss_joint += (u_j.T @ y).pow(2).sum()
+        if q_x is not None and a is not None and a_j is not None:
             b = q_x.T @ y  # (Kx, v)
             ss_task += (b * b).sum()
             ss_task_pc += (a.T @ b).pow(2).sum(dim=1)
+            ss_task_joint += (a_j.T @ b).pow(2).sum()
         del y
 
     tot = float(ss_tot.clamp(min=1e-30))
     out = {
         "var_data": (ss_pc / tot).cpu(),
+        "joint_var_data": float(ss_joint / tot),
         "total_var": tot,
         "task_frac": None if a is None else (a * a).sum(dim=0).cpu(),
         "var_task": None,
+        "joint_var_task": None,
         "total_task_var": None,
     }
     if q_x is not None:
         tt = float(ss_task.clamp(min=1e-30))
         out["var_task"] = (ss_task_pc / tt).cpu()
+        out["joint_var_task"] = float(ss_task_joint / tt)
         out["total_task_var"] = tt
     return out
 

@@ -1552,7 +1552,10 @@ def test_component_variance_in_data_recovers_a_planted_share():
     scores = torch.stack([a, b], dim=1)
 
     got = component_variance_in_data(scores, data, polort=1)
-    # Two orthogonalized components spanning the only two signals present.
+    # Two components spanning the only two signals present: JOINTLY they account for
+    # everything. The per-component shares are marginal and only sum to the joint value
+    # when the components are uncorrelated, which is why both are returned.
+    assert got["joint_var_data"] > 0.95
     assert float(got["var_data"].sum()) > 0.95
     assert got["var_task"] is None and got["task_frac"] is None
 
@@ -1608,3 +1611,32 @@ def test_component_variance_task_share_collapses_onto_design_overlap_at_one_cond
     x2 = torch.cat([x1, torch.roll(x1, 7, 0)], dim=1)
     two = component_variance_in_data(u, data, polort=2, design=x2)
     assert not torch.allclose(two["var_task"], two["task_frac"], atol=1e-4)
+
+
+def test_component_variance_task_frac_is_the_temporal_criterion_statistic():
+    """task_frac must BE component_task_fit's r2 — for ICA too, not only for PCA.
+
+    Bug of record: the components were run through _orthonormal_basis as a set, which
+    returns the SVD directions of the span — an orthogonal ROTATION of the component
+    space. Row k was then labelled "component k" while describing a mixture of all of
+    them. Barely visible for PCA (already orthonormal) and wrong for ICA, whose mixing
+    is not orthogonal at all.
+    """
+    from fastfuncstuff.stats.task_coupling import (
+        component_task_fit,
+        component_variance_in_data,
+    )
+
+    n_t, shape = 120, (5, 5, 3)
+    g = torch.Generator().manual_seed(1)
+    x = _block_design(n_t)
+    data = torch.randn(*shape, n_t, generator=g, dtype=torch.float64)
+    orthonormal = torch.linalg.qr(torch.randn(n_t, 4, generator=g, dtype=torch.float64))[0]
+    oblique = torch.randn(n_t, 4, generator=g, dtype=torch.float64)  # an ICA-like mixing
+
+    for u in (orthonormal, oblique):
+        cv = component_variance_in_data(u, data, polort=2, design=x)
+        tf = component_task_fit(u, x, polort=2, n_surrogates=50)
+        assert torch.allclose(
+            cv["task_frac"], torch.as_tensor(tf["r2"], dtype=torch.float64), atol=1e-9
+        )

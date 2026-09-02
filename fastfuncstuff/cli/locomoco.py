@@ -3519,6 +3519,12 @@ def _pc_variance_table(scores, var, data, args, label, stem):
         rows.append(row)
     for r in rows:
         print(f"      {r}")
+    # The per-component shares are MARGINAL, so they overlap where components correlate.
+    # The joint figure is the one to quote for "what these k regressors remove".
+    joint = f"all {k} together: data {100 * got['joint_var_data']:.2f}%"
+    if got["joint_var_task"] is not None:
+        joint += f", task {100 * got['joint_var_task']:.2f}%"
+    print(f"      {joint}  (marginal shares above overlap and may sum to more)")
     note = (
         f"      chance per component: data {100 * chance_data:.3f}%, "
         f"task {100 * chance_task:.3f}% (T={n_t}, polort={polort})"
@@ -3526,12 +3532,14 @@ def _pc_variance_table(scores, var, data, args, label, stem):
     if vt is None:
         note = f"      chance per component: data {100 * chance_data:.3f}% (task% needs -events)"
     print(note)
-    if vt is not None and n_k == 1:
-        # With one condition the task subspace is one direction, so the share of the
-        # data's task variance a component takes reduces EXACTLY to the share of the
-        # component lying in that direction. Two columns, one number -- said out loud,
-        # because reading them as two pieces of evidence would double-count.
-        print("      (one condition: task% and design are the same quantity)")
+    if vt is not None:
+        # `design` IS the statistic -detask ica / -reject already threshold temporally
+        # (component_task_fit's omnibus r2), on a readable scale and without the
+        # surrogate null. Not independent evidence -- and with one condition it is not
+        # even independent of task%, since a one-dimensional task subspace makes the
+        # share of the data's task variance equal the share of the component in it.
+        same = " and, with one condition, identical to task%" if n_k == 1 else ""
+        print(f"      (design is the temporal criterion's R²{same})")
 
     suffix = f"_{label}" if label else ""
     path = f"{stem}_locomoco_pcs{suffix}_variance.1D"
@@ -3545,9 +3553,13 @@ def _pc_variance_table(scores, var, data, args, label, stem):
         f.write(f"  (T={n_t}, polort={polort})\n")
         if vt is not None:
             f.write("# task%   share of the data's TASK-explained variance\n")
-            f.write("# design  share of the PC's own time course lying in the task subspace\n")
+            f.write("# design  the temporal criterion's omnibus R² (not independent evidence)\n")
             if n_k == 1:
                 f.write("# one condition: task% and design are the same quantity\n")
+        f.write(f"# all {k} together: data {100 * got['joint_var_data']:.2f}%")
+        if got["joint_var_task"] is not None:
+            f.write(f", task {100 * got['joint_var_task']:.2f}%")
+        f.write("  (per-component shares are marginal and overlap)\n")
         f.write("\n".join("# " + r if i == 0 else r for i, r in enumerate(rows)) + "\n")
 
 
