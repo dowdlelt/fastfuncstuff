@@ -741,6 +741,43 @@ def create_parser() -> argparse.ArgumentParser:
         " rotation-aware mode.",
     )
     est.add_argument(
+        "-inject_jitter",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="AMP",
+        help="[validation] Inject a KNOWN random displacement of AMP voxels rms into the "
+        "series before estimating, then report how much of it came back. The injected "
+        "field is smoothed white noise (see -inject_smooth), independent across frames "
+        "and independent of whatever residual motion the run already carries -- so that "
+        "motion cannot bias the recovery, it only lowers the correlation.\n"
+        "This is the way to answer 'is the estimator finding signal or fitting noise?' on "
+        "YOUR data rather than on a phantom: sweep -iters (or -window, or -levels) and "
+        "watch the recovered slope. A setting that is genuinely working recovers more of "
+        "the injection; one that is fitting noise leaves the slope flat while the field it "
+        "produces grows. The corrected series written under this flag has the injection "
+        "in it and is for inspection only, never for analysis." + PERAXIS,
+    )
+    est.add_argument(
+        "-inject_smooth",
+        type=float,
+        nargs="+",
+        default=[6.0],
+        metavar="SIGMA",
+        help="[validation] Spatial scale in voxels of the injected field (-inject_jitter). "
+        "Small values give the patchy, LOCAL displacement this tool usually hunts; large "
+        "values approach a bulk shift, which is easy and will flatter the estimator. Match "
+        "it to the scale you actually care about." + PERAXIS,
+    )
+    est.add_argument(
+        "-inject_seed",
+        type=int,
+        default=0,
+        metavar="N",
+        help="[validation] Seed for the injected field, so a sweep over -iters compares "
+        "runs against the SAME injection rather than a fresh one each time.",
+    )
+    est.add_argument(
         "-pe_null",
         "-pe-null",
         default=None,
@@ -4835,6 +4872,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # Multi-echo: several inputs, one shared field per encode axis, scaled per echo.
     # 2-D multi-slice is the default; -me_3depi / -is_3depi opts into the 3-D solve,
     # exactly as -is_3depi does on the single-echo path.
+    if me_mode and args.inject_jitter is not None:
+        print(
+            "❌ -inject_jitter is wired for the single-echo path only. The multi-echo "
+            "solve shares one field across echoes with a per-echo scaling, so a faithful "
+            "injection has to be applied per echo at that echo's alpha -- not yet built.",
+            file=sys.stderr,
+        )
+        return 2
     if me_mode:
         return _run_multiecho(
             args,
@@ -4886,6 +4931,35 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         return 2
     affine = img.affine.copy()
     tr_sec = _resolve_tr(args, img) if args.events else None
+
+    # -inject_jitter: put a KNOWN displacement in before anything else sees the series, so
+    # the estimator, the refine loop and the correction are all working on the injected
+    # data exactly as they would on real motion.
+    injected_fields = None
+    if args.inject_jitter is not None:
+        from fastfuncstuff.processing.locomoco import (
+            apply_jitter,
+            axis_params,
+            make_jitter_fields,
+        )
+
+        amp = [float(v) for v in axis_params(args.inject_jitter, len(pe_axes), "-inject_jitter")]
+        sm = [float(v) for v in axis_params(args.inject_smooth, len(pe_axes), "-inject_smooth")]
+        injected_fields = make_jitter_fields(data.shape, pe_axes, amp, sm, args.inject_seed, device)
+        data = apply_jitter(
+            data,
+            injected_fields,
+            pe_axes,
+            device,
+            warp_interp=args.warp_interp,
+            warp_radius=args.warp_radius,
+        )
+        axis_txt = ", ".join(
+            f"{lbl} {a:.3f} vox rms (σ {t:g})"
+            for lbl, a, t in zip(("PE1", "PE2")[: len(pe_axes)], amp, sm, strict=True)
+        )
+        print(f"   💉 injected jitter: {axis_txt}, seed {args.inject_seed}")
+        print("      the corrected series will contain the injection — inspection only.")
 
     # -detask filter/fit: the estimator sees a task-cut copy, `data` stays raw so the
     # corrected series can be re-derived from it after the solve.
@@ -5230,6 +5304,31 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             warp_radius=args.warp_radius,
             device=device,
             desc="detask resample",
+        )
+
+    if injected_fields is not None:
+        from fastfuncstuff.processing.locomoco import _brain_mask_from, jitter_recovery
+
+        print_cli_section("Injected-jitter recovery")
+        brain = _brain_mask_from(torch.from_numpy(np.abs(data).mean(axis=3)))
+        by_axis = {ax: f for _, ax, f in result.pe_displacements()}
+        for lbl, ax, inj in zip(
+            ("pe1", "pe2")[: len(pe_axes)], pe_axes, injected_fields, strict=True
+        ):
+            est = by_axis.get(ax)
+            if est is None:
+                continue
+            slope, r = jitter_recovery(est, inj.cpu(), brain)
+            print(f"   {lbl}: recovered slope {slope:+.3f}, r {r:+.3f}  (in-brain)")
+        print(
+            "   slope = fraction of the KNOWN displacement returned (1.0 = perfect, 0.0 = "
+            "blind to it);\n"
+            "   r is capped below 1 by the run's own residual motion, which is in the "
+            "estimate but not\n"
+            "   in the injection. Sweep -iters / -window / -levels and compare SLOPES: a "
+            "setting that is\n"
+            "   genuinely working recovers more, one that is fitting noise leaves the slope "
+            "flat."
         )
 
     print_cli_section("Outputs")

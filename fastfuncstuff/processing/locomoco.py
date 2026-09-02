@@ -244,6 +244,92 @@ def _warp2d_pe(
     return _warp2d(img, u, v, mode, radius)
 
 
+def make_jitter_fields(
+    shape: tuple[int, int, int, int],
+    axes: list[int],
+    amp: list[float],
+    smooth: list[float],
+    seed: int,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Known per-frame displacement fields to inject as ground truth, one per encode axis.
+
+    Each field is smoothed white noise scaled to ``amp[k]`` voxels rms — small, spatially
+    smooth, independent across frames, and independent of everything already in the data.
+    That independence is the point: the residual motion the run already carries is
+    uncorrelated with this, so it cannot bias a regression of the estimate onto the
+    injection. It only adds variance, which shows up as a lower correlation and never as
+    a wrong slope.
+
+    ``smooth[k]`` sets the spatial scale in voxels. Small values make a patchy, local
+    field of the kind this tool is usually chasing; large ones approach a bulk shift.
+    Returns ``(nx, ny, nz, T)`` per axis, on ``device``.
+    """
+    nx, ny, nz, nt = shape
+    g = torch.Generator(device="cpu").manual_seed(int(seed))
+    out = []
+    for k in range(len(axes)):
+        f = torch.randn(nt, nx, ny, nz, generator=g).to(device)
+        if smooth[k] > 0:
+            f = _blur3d_b(f, float(smooth[k]))
+        # Scale AFTER smoothing: blurring white noise cuts its variance by a factor that
+        # depends on sigma and the grid, so scaling first would give an amplitude that
+        # silently drifts with -inject_smooth.
+        rms = f.pow(2).mean().clamp_min(1e-12).sqrt()
+        out.append((f * (float(amp[k]) / rms)).permute(1, 2, 3, 0).contiguous())
+    return out
+
+
+def apply_jitter(
+    data: np.ndarray,
+    fields: list[torch.Tensor],
+    axes: list[int],
+    device: torch.device,
+    warp_interp: str = "lanczos",
+    warp_radius: int = 3,
+) -> np.ndarray:
+    """Resample ``data`` frame by frame by ``fields`` — the injection itself.
+
+    Uses the same resampler the correction does, so the injected shift and the shift the
+    estimator is asked to undo are the same operation and interpolation is not silently
+    part of what is being measured.
+    """
+    out = np.empty_like(data)
+    nt = data.shape[3]
+    for t in tqdm(range(nt), desc="inject jitter", unit="frame", leave=True, disable=nt < 3):
+        vol = torch.from_numpy(data[..., t]).to(device)[None]
+        sh = [f[..., t].to(device)[None] for f in fields]
+        out[..., t] = (
+            _shift3d_axes(vol, sh, axes, mode=warp_interp, radius=warp_radius)[0].cpu().numpy()
+        )
+    return out
+
+
+def jitter_recovery(
+    estimated: torch.Tensor, injected: torch.Tensor, mask: torch.Tensor
+) -> tuple[float, float]:
+    """``(slope, r)`` of the estimated field regressed on the injected one, in-brain.
+
+    ``slope`` is the fraction of the known displacement the estimator got back: 1.0 is
+    perfect, 0.0 is blind to it. ``r`` is how much of the estimate that injection explains
+    — necessarily below 1 because the run's own residual motion is in there too, so read
+    the slope for accuracy and r for how cleanly it separated.
+
+    Sign is normalised so a correct recovery reads positive: the estimator returns the
+    PULL displacement that undoes the shift, which is the negative of the one applied.
+    """
+    e = estimated[mask].reshape(-1).double()
+    i = injected[mask].reshape(-1).double()
+    e = e - e.mean()
+    i = i - i.mean()
+    den = float((i * i).sum())
+    if den <= 0:
+        return 0.0, 0.0
+    slope = -float((e * i).sum()) / den
+    r = -float((e * i).sum()) / max(float(e.pow(2).sum() * den) ** 0.5, 1e-12)
+    return slope, r
+
+
 def _weighted_step_rms(weight: torch.Tensor, comps: list[torch.Tensor]) -> torch.Tensor:
     """Size of one LK update, weighted by where the data can actually constrain it.
 
@@ -3912,6 +3998,12 @@ FLOW_CONV_FLOOR = 0.005
 # A level is flagged as capped only when this fraction of frames never converged: one
 # stubborn frame in a run of 300 is not a reason to tell the user to raise -iters.
 FLOW_CONV_CAPPED_FRAC = 0.25
+# A capped level whose SECOND HALF of steps shrinks by less than this per iteration is
+# reported as flattened (x) rather than still descending (*). Measured on the tail on
+# purpose: the whole-sequence slope is meaningless here because the first step is an
+# order-of-magnitude outlier that swamps it, which is what made the first cut of this
+# diagnostic a constant.
+FLOW_CONV_FLAT_RATE = 0.97
 
 
 def summarize_flow_convergence(
@@ -3922,40 +4014,46 @@ def summarize_flow_convergence(
 ) -> str:
     """One line on how the inner LK iterations converged, per pyramid level.
 
-        ``steps`` is ``(n_calls, n_levels, n_iters)`` -- the per-iteration update size that
-        :func:`optical_flow_lk_3d_axes` records, one call per frame, levels COARSEST FIRST so
-        the printed vector reads in the same direction as ``-levels``.
+            ``steps`` is ``(n_calls, n_levels, n_iters)`` -- the per-iteration update size that
+            :func:`optical_flow_lk_3d_axes` records, one call per frame, levels COARSEST FIRST so
+            the printed vector reads in the same direction as ``-levels``.
 
-    A level has settled once every later update is either below ``tol`` of the largest
-        update that level took OR below ``floor`` voxels outright -- the same two-armed
-        absolute-or-relative shape :func:`_refine_converged` uses on the outer loop, and for
-        the same reason. The relative arm carries a level that moved whole voxels and is now
-        done at its own scale; the absolute arm carries a level that never had anything to do,
-        which is the common case on an already-corrected series where the whole field is
-        hundredths of a voxel and the relative arm can never fire.
+        A level has settled once every later update is either below ``tol`` of the largest
+            update that level took OR below ``floor`` voxels outright -- the same two-armed
+            absolute-or-relative shape :func:`_refine_converged` uses on the outer loop, and for
+            the same reason. The relative arm carries a level that moved whole voxels and is now
+            done at its own scale; the absolute arm carries a level that never had anything to do,
+            which is the common case on an already-corrected series where the whole field is
+            hundredths of a voxel and the relative arm can never fire.
 
-        The peak, not the first step, is the relative denominator: the field arrives at a
-        level already upsampled from the coarser one, so its opening step is sometimes small
-        and would make a converged level look stalled.
+            The peak, not the first step, is the relative denominator: the field arrives at a
+            level already upsampled from the coarser one, so its opening step is sometimes small
+            and would make a converged level look stalled.
 
-        The criterion is still NOT the relative-improvement test the outer loop uses. These
-        tails FLATTEN -- the step ratio climbs back towards 1 as the crawl sets in -- so
-        "improved by less than x% this pass" fires in the middle of the crawl and calls it
-        converged.
+            The criterion is still NOT the relative-improvement test the outer loop uses. These
+            tails FLATTEN -- the step ratio climbs back towards 1 as the crawl sets in -- so
+            "improved by less than x% this pass" fires in the middle of the crawl and calls it
+            converged.
 
-    Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
-    voxels, to four places because the comparison it exists for is between refine passes,
-    where three rounds the change away.
+        Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
+        voxels, to four places because the comparison it exists for is between refine passes,
+        where three rounds the change away.
 
-    A capped level is NOT by itself a reason to raise ``-iters``, and the first version of
-    this said it was. Measured: on a real 1.0-vox displacement the recovered field is flat
-    from 2 iterations to 48 (it moves in the fourth decimal), while on a near-zero-motion
-    series the in-brain field GROWS monotonically with iterations -- 0.021, 0.028, 0.039,
-    0.044, 0.056, 0.075 vox at 2/4/8/12/24/48 against a truth of zero. LK descends on a
-    cost built from two frozen, noisy frames, so it converges steadily to that cost's
-    minimum, which is not zero displacement. A level that stays capped on a low-motion run
-    is reporting that the estimator still has noise to fit, and the lever for that is
-    ``-window`` or the mask, not more iterations.
+    A capped level is marked ``*`` when its steps are still shrinking and ``x`` when the
+    second half has flattened -- the difference between "it would still be moving at 24"
+    and "it has settled onto a nonzero step and is just circling". The tail is what is
+    measured, not the whole sequence: the opening step is an order-of-magnitude outlier
+    and a slope across all of it only re-reports how big that first step was.
+
+        A capped level is NOT by itself a reason to raise ``-iters``, and the first version of
+        this said it was. Measured: on a real 1.0-vox displacement the recovered field is flat
+        from 2 iterations to 48 (it moves in the fourth decimal), while on a near-zero-motion
+        series the in-brain field GROWS monotonically with iterations -- 0.021, 0.028, 0.039,
+        0.044, 0.056, 0.075 vox at 2/4/8/12/24/48 against a truth of zero. LK descends on a
+        cost built from two frozen, noisy frames, so it converges steadily to that cost's
+        minimum, which is not zero displacement. A level that stays capped on a low-motion run
+        is reporting that the estimator still has noise to fit, and the lever for that is
+        ``-window`` or the mask, not more iterations.
     """
     if steps.ndim != 3 or steps.numel() == 0:
         return ""
@@ -3981,14 +4079,29 @@ def summarize_flow_convergence(
         first = torch.where(reached, settled, torch.full_like(settled, n)).float()
         med = int(first.median().item())
         capped = float((~reached).float().mean().item()) >= FLOW_CONV_CAPPED_FRAC
+        mark = ""
         if capped:
             any_capped = True
             tail = s[~reached, -1]
             if tail.numel():
                 worst = max(worst, float(tail.median().item()))
-        marks.append(f"{med}{'*' if capped else ''}")
+            # Still descending, or flattened out? Read the shrink rate off the second
+            # half: it says whether another iteration would buy anything, where the rate
+            # over the whole sequence only re-reports how big the opening step was. Half
+            # rather than a shorter tail because three points cannot separate a slow
+            # descent from a circle.
+            k = max(3, n // 2)
+            if n >= 3:
+                rate = (s[~reached, -1] / s[~reached, -k].clamp_min(1e-12)) ** (1.0 / (k - 1))
+                mark = "x" if float(rate.median().item()) > FLOW_CONV_FLAT_RATE else "*"
+            else:
+                mark = "*"
+        marks.append(f"{med}{mark}")
     out = f"{n_iters} iters, conv @ {','.join(marks)}"
-    return f"{out}  (Δ {worst:.4f} vox)" if any_capped else out
+    if not any_capped:
+        return out
+    flat = any(m.endswith("x") for m in marks)
+    return f"{out}  (Δ {worst:.4f} vox{', flat' if flat else ''})"
 
 
 def _refine_converged(
