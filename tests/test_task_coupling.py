@@ -1536,3 +1536,51 @@ def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
     assert set(aux) == {1, 3}
     for code, params in aux.values():
         assert code == 2 and tuple(params) == (n_t, 1.0, 2.0)
+
+
+def test_component_variance_in_data_recovers_a_planted_share():
+    """A component that IS one voxel's whole signal must account for its whole variance."""
+    from fastfuncstuff.stats.task_coupling import component_variance_in_data
+
+    n_t, shape = 60, (4, 4, 2)
+    g = torch.Generator().manual_seed(3)
+    a = torch.randn(n_t, generator=g)
+    b = torch.randn(n_t, generator=g)
+    data = torch.zeros(*shape, n_t)
+    data[0, 0, 0] = 10.0 * a
+    data[1, 1, 1] = 10.0 * b
+    scores = torch.stack([a, b], dim=1)
+
+    got = component_variance_in_data(scores, data, polort=1)
+    # Two orthogonalized components spanning the only two signals present.
+    assert float(got["var_data"].sum()) > 0.95
+    assert got["var_task"] is None and got["task_frac"] is None
+
+
+def test_component_variance_in_data_separates_task_share_from_data_share():
+    """A big component orthogonal to the design must take variance but not TASK variance."""
+    from fastfuncstuff.stats.task_coupling import component_variance_in_data
+
+    n_t, shape = 120, (4, 4, 2)
+    x = _block_design(n_t)
+    g = torch.Generator().manual_seed(11)
+    # A large nuisance mode built to be orthogonal to the (detrended) design.
+    nuis = torch.randn(n_t, generator=g).double()
+    xd = (x[:, 0] - x[:, 0].mean()).double()
+    nuis = nuis - xd * (nuis @ xd) / (xd @ xd)
+
+    data = torch.zeros(*shape, n_t, dtype=torch.float64)
+    data[0, 0, 0] = 20.0 * nuis + 1.0 * xd
+    data[1, 1, 0] = 1.0 * xd
+    scores = torch.stack([nuis, xd], dim=1)
+
+    got = component_variance_in_data(scores, data, polort=1, design=x)
+    vd, vt, tf = got["var_data"], got["var_task"], got["task_frac"]
+    # The nuisance dominates the DATA variance but takes almost none of the TASK
+    # variance -- which is exactly the split the table exists to show.
+    assert float(vd[0]) > 0.9
+    assert float(vt[0]) < 0.05
+    assert float(tf[0]) < 0.05
+    # The design-aligned component is the mirror image.
+    assert float(vt[1]) > 0.9
+    assert float(tf[1]) > 0.9

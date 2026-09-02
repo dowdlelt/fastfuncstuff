@@ -65,6 +65,7 @@ __all__ = [
     "design_notch_bins",
     "notch_basis",
     "filter_task_band",
+    "component_variance_in_data",
     "format_task_coupling_report",
 ]
 
@@ -690,6 +691,120 @@ def filter_task_band(
         out[start : start + y.shape[0]] = y.to(dtype=out.dtype, device=out.device)
         del y
     return out.reshape(*spatial, n_t)
+
+
+def component_variance_in_data(
+    scores: torch.Tensor,
+    data: torch.Tensor | np.ndarray,
+    *,
+    polort: int = 2,
+    design: torch.Tensor | np.ndarray | None = None,
+    mask: torch.Tensor | np.ndarray | None = None,
+    device: torch.device | None = None,
+) -> dict:
+    """What share of the DATA each component's time course explains — and of the task.
+
+    A component's own variance ratio says how much of the WARP it is. That is not the
+    question a nuisance regressor raises. Two different questions matter and neither is
+    answered by the warp spectrum:
+
+    * ``var_data`` — the share of the data's drift-residualized variance this component
+      explains. A component can be 50% of the warp and explain a tenth of a percent of
+      the images, which is the normal and harmless case; the warp is small.
+    * ``var_task`` — the share of the data's TASK-EXPLAINED variance it explains. This
+      is the one that decides whether a regressor is safe: a nuisance column that eats
+      task variance removes real BOLD in the GLM it is added to.
+    * ``task_frac`` — the share of the component's OWN time course lying in the task
+      subspace, i.e. the collinearity with the design, independent of the data.
+
+    Components are orthogonalized against the drift basis and re-orthonormalized first,
+    so ``var_data`` is a partial share w.r.t. the polynomials the GLM will carry anyway,
+    and the per-component shares are additive rather than double-counting a common
+    trend.
+
+    Cheap by construction: nothing four-dimensional is ever formed. The task-projected
+    series is never materialized — ``u_k' (Q_x Q_x' y) = (Q_x' u_k)' (Q_x' y)`` — so one
+    chunked pass over the data with two small matmuls gives every column.
+
+    ``data`` is ``(nx, ny, nz, T)``, ideally the CORRECTED series: the regressors will
+    be used on the images that come out of this tool, not the ones that went in.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    f = torch.as_tensor(np.asarray(data) if isinstance(data, np.ndarray) else data)
+    if f.ndim != 4:
+        raise ValueError(f"data must be 4-D (nx,ny,nz,T), got {tuple(f.shape)}")
+    u = torch.as_tensor(scores, dtype=torch.float64)
+    if u.ndim != 2 or u.shape[0] != f.shape[3]:
+        raise ValueError(f"scores must be (T, k) with T={f.shape[3]}, got {tuple(u.shape)}")
+    if device is None:
+        device = f.device
+    n_t, k = u.shape
+    u = u.to(device)
+
+    q_n = _orthonormal_basis(
+        construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
+    )
+    # Partial w.r.t. drift, on BOTH sides: the GLM these enter carries polynomials, so
+    # the slow variance they share with drift is not the component's to claim.
+    u_p = _orthonormal_basis(u - q_n @ (q_n.T @ u))
+    k = u_p.shape[1]
+
+    q_x = None
+    if design is not None:
+        x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+        if x.ndim == 1:
+            x = x[:, None]
+        if x.shape[0] != n_t:
+            raise ValueError(f"design has {x.shape[0]} rows but the data has {n_t}")
+        q_x = _orthonormal_basis(x - q_n @ (q_n.T @ x), scale=float(torch.linalg.matrix_norm(x, 2)))
+
+    spatial = tuple(f.shape[:3])
+    n_vox = int(np.prod(spatial))
+    keep = None
+    if mask is not None:
+        keep = torch.as_tensor(np.asarray(mask)).reshape(-1) > 0
+
+    ss_pc = torch.zeros(k, dtype=torch.float64, device=device)
+    ss_task_pc = torch.zeros(k, dtype=torch.float64, device=device)
+    ss_tot = torch.zeros((), dtype=torch.float64, device=device)
+    ss_task = torch.zeros((), dtype=torch.float64, device=device)
+    a = None if q_x is None else q_x.T @ u_p  # (Kx, k)
+
+    flat = f.reshape(n_vox, n_t)
+    chunk = estimate_chunk_size(n_vox, n_t, k + polort + 2, device, operation="glm")
+    for start in range(0, n_vox, chunk):
+        stop = min(start + chunk, n_vox)
+        if keep is not None:
+            sel = keep[start:stop]
+            if not bool(sel.any()):
+                continue
+            y = flat[start:stop][sel].to(device=device, dtype=torch.float64).T  # (T, v)
+        else:
+            y = flat[start:stop].to(device=device, dtype=torch.float64).T
+        y = y - q_n @ (q_n.T @ y)
+        ss_tot += (y * y).sum()
+        ss_pc += (u_p.T @ y).pow(2).sum(dim=1)
+        if q_x is not None and a is not None:
+            b = q_x.T @ y  # (Kx, v)
+            ss_task += (b * b).sum()
+            ss_task_pc += (a.T @ b).pow(2).sum(dim=1)
+        del y
+
+    tot = float(ss_tot.clamp(min=1e-30))
+    out = {
+        "var_data": (ss_pc / tot).cpu(),
+        "total_var": tot,
+        "task_frac": None if a is None else (a * a).sum(dim=0).cpu(),
+        "var_task": None,
+        "total_task_var": None,
+    }
+    if q_x is not None:
+        tt = float(ss_task.clamp(min=1e-30))
+        out["var_task"] = (ss_task_pc / tt).cpu()
+        out["total_task_var"] = tt
+    return out
 
 
 def component_task_fit(

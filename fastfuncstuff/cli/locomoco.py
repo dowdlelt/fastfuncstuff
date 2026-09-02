@@ -1539,11 +1539,16 @@ def create_parser() -> argparse.ArgumentParser:
         "union. Read the balance lines the shared run prints before reaching for this: "
         "it DOUBLES the regressor count, which is real GLM degrees of freedom, so the "
         "honest comparison is against the same total budget (2N shared vs N+N).\n"
-        "SCOPE: this affects the -want_pcs regressors ONLY. -warp_recon, -detask ica, "
-        "-reject and -write_pc_maps still decompose the axes together — their rejection "
-        "is already per component PER AXIS (a component can be dropped on one axis and "
-        "kept on the other), so a shared basis constrains them far less than it "
-        "constrains a fixed-N regressor set.",
+        "SCOPE: the -want_pcs regressors and -detask ica. ICA is the case where "
+        "separating matters most: FastICA whitens on a PCA reduction allocated by "
+        "POOLED variance, so pooling lets the louder axis take most of the retained "
+        "components and leaves ICA hunting for sources in a space that barely contains "
+        "the other one. Per axis, each gets its own whitening, rank and components — "
+        "and its own familywise correction, so the two runs together test twice as "
+        "many components at the same per-family alpha.\n"
+        "-warp_recon pcs and -write_pc_maps stay pooled: their rejection is already "
+        "per component PER AXIS (a component can be dropped on one axis and kept on "
+        "the other), so a shared basis barely constrains them.",
     )
     out.add_argument(
         "-save_mean",
@@ -2608,7 +2613,7 @@ def _write_data_task_after(corrected, stem, args):
     )
 
 
-def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polort=2):
+def _warp_recon_one(result, data, args, resp, mask, device, design, polort, comps, tag):
     """Rebuild the field from a warp decomposition, dropping task-loaded components.
 
     ``resp``/``mask`` come from the task diagnostic, so ``-reject`` inherits exactly the
@@ -2619,7 +2624,6 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
     import numpy as np
 
     from fastfuncstuff.processing.locomoco import (
-        pc_reconstruct_result,
         warp_ica_basis,
         warp_pc_basis,
         warp_project_out,
@@ -2632,7 +2636,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
         method = "ica"
     else:
         n_pcs, var_frac, method = parse_warp_recon(args.warp_recon)
-    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
 
     if method == "ica" and n_pcs == "sweep":
         if resp is None:
@@ -2675,7 +2679,6 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
             f"{float(var.sum()):.1%} of the variance"
         )
     k = basis.shape[1]
-    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
     _print_component_axis_share(loadings, label_of, method)
 
     # ── the TEMPORAL criterion, scored once on the SHARED basis ──────────────────
@@ -2722,11 +2725,14 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
             dropped[axis] = [(i, scores[i]) for i in sorted(bad)]
         keep[axis] = idx
 
+    # The tag names the axis when each is decomposed on its own; without it two
+    # identical banners scroll past and the numbers under them look contradictory.
+    where = f" [{tag.lstrip('_')}]" if tag else ""
     if method == "ica":
-        head = f"WARP TASK REJECTION — ICA rank {k}, projected from the FULL-rank field"
+        head = f"WARP TASK REJECTION{where} — ICA rank {k}, from the FULL-rank field"
     else:
         span = f"top {k}" if n_pcs is not None else f"all {k}"
-        head = f"WARP RECONSTRUCTION — {span} principal components"
+        head = f"WARP RECONSTRUCTION{where} — {span} principal components"
     print_cli_subsection(head)
     cut_txt = f"{args.reject:g}" if args.reject is not None else "2"
     for axis, _load in loadings:
@@ -2862,7 +2868,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
             tc = basis[:, i].numpy().astype(float)
             cols.append((tc - tc.mean()) / max(tc.std(), 1e-12))
             names.append(f"ic{i:02d}_{'+'.join(sorted(who[i]))}")
-        rpath = f"{args._stem}_locomoco_rejected.1D"
+        rpath = f"{args._stem}_locomoco_rejected{tag}.1D"
         # z-scored, and the design shipped in column 1: the reason to plot this is to
         # see whether what was removed tracks the task, and that comparison is unreadable
         # if the columns sit at different scales or the reference lives in another file.
@@ -2873,6 +2879,64 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
             + "  ".join(f"{n:>12s}" for n in names)
         )
         np.savetxt(rpath, np.stack(cols, axis=1), fmt="%12.6f", header=header, comments="")
+
+    # The bad time courses travel back to the caller so a MULTI-ECHO run can apply the
+    # SAME rejection to every echo without decomposing each one. The projection is
+    # linear and each echo's field is a scaled copy of the shared field, so projecting
+    # per echo with one shared set of time courses is exactly equivalent to cleaning
+    # the shared field and rescaling -- and far cheaper than E decompositions that
+    # would each find slightly different components.
+    return rebuilt, keep, (bad_tc if method == "ica" else None)
+
+
+def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polort=2):
+    """Decompose the warp and drop task-loaded components — once, or once per axis.
+
+    ``-pcs_per_axis`` makes the ICA path decompose each encode axis SEPARATELY. That is
+    not cosmetic for ICA the way it is for a PC regressor set. FastICA whitens on a PCA
+    reduction of whatever matrix it is handed, and that reduction is allocated by POOLED
+    variance: hand it both axes at once and an axis holding most of the variance takes
+    most of the retained components, leaving ICA to hunt for independent sources in a
+    space that barely contains the other axis. One decomposition per axis gives each its
+    own whitening, its own rank, and its own components.
+
+    The cost is that the familywise correction in the temporal criterion is applied
+    within each axis rather than across both, so the two runs together test twice as
+    many components at the same per-family alpha. Reported per axis, and the rejected
+    time courses are written per axis too — component #0 of pe1 is not component #0 of
+    pe2 once the bases are separate, and one file would imply it was.
+
+    PCA is left pooled either way: its rejection is already per component per axis (a
+    component can be dropped on one axis and kept on the other), so a shared basis
+    barely constrains it.
+    """
+    from fastfuncstuff.processing.locomoco import pc_reconstruct_result
+
+    comps = [(ax, f) for _, ax, f in result.pe_displacements()]
+    label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+    per_axis = bool(getattr(args, "pcs_per_axis", False)) and args.detask_ica and len(comps) > 1
+    groups = (
+        [([c], f"_{label_of.get(c[0], f'axis{c[0]}')}") for c in comps]
+        if per_axis
+        else [(comps, "")]
+    )
+    if per_axis:
+        print(
+            f"  -pcs_per_axis: decomposing {len(comps)} encode axes SEPARATELY "
+            "(each gets its own whitening, rank and components)"
+        )
+
+    rebuilt: list = []
+    keep: dict = {}
+    bad_tc: dict = {}
+    for grp, tag in groups:
+        r_g, k_g, b_g = _warp_recon_one(
+            result, data, args, resp, mask, device, design, polort, grp, tag
+        )
+        rebuilt += r_g
+        keep.update(k_g)
+        if b_g:
+            bad_tc.update(b_g)
 
     out, note = pc_reconstruct_result(
         result,
@@ -2885,13 +2949,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
     )
     if note:
         print(f"  ⚠️  component decomposition: {note}")
-    # The bad time courses travel back to the caller so a MULTI-ECHO run can apply the
-    # SAME rejection to every echo without decomposing each one. The projection is
-    # linear and each echo's field is a scaled copy of the shared field, so projecting
-    # per echo with one shared set of time courses is exactly equivalent to cleaning
-    # the shared field and rescaling -- and far cheaper than E decompositions that
-    # would each find slightly different components.
-    return out, (bad_tc if method == "ica" else None)
+    return out, (bad_tc or None)
 
 
 def _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr, device):
@@ -3419,6 +3477,55 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
             print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
 
 
+def _pc_variance_table(scores, var, data, args, label, stem):
+    """Per-PC: share of the WARP, of the DATA, and of the data's TASK variance.
+
+    The warp spectrum answers "how much of the field is this component", which is not
+    what a nuisance regressor is judged on. ``data%`` is what it explains in the images
+    it will be regressed against, and ``task%`` is how much of the data's task-explained
+    variance it would take with it -- the number that says whether adding this column
+    costs real BOLD. Printed and written; nothing is computed twice.
+    """
+    from fastfuncstuff.stats.task_coupling import component_variance_in_data
+
+    st = getattr(args, "_task_after", None)
+    design = st["design"] if st else None
+    polort = st["polort"] if st else 2
+    mask = st["mask"] if st else None
+    try:
+        got = component_variance_in_data(scores, data, polort=polort, design=design, mask=mask)
+    except (ValueError, RuntimeError) as exc:
+        print(f"      ⚠️  PC variance table unavailable: {exc}")
+        return
+
+    k = scores.shape[1]
+    vd, vt, tf = got["var_data"], got["var_task"], got["task_frac"]
+    head = f"{'PC':>4}  {'warp%':>7}  {'data%':>7}"
+    if vt is not None:
+        head += f"  {'task%':>7}  {'design':>7}"
+    rows = [head]
+    for i in range(k):
+        row = f"{i:>4}  {100 * float(var[i]):7.2f}  {100 * float(vd[i]):7.3f}"
+        if vt is not None:
+            row += f"  {100 * float(vt[i]):7.3f}  {float(tf[i]):7.3f}"
+        rows.append(row)
+    for r in rows:
+        print(f"      {r}")
+    if vt is None:
+        print("      (task% needs -events)")
+
+    suffix = f"_{label}" if label else ""
+    path = f"{stem}_locomoco_pcs{suffix}_variance.1D"
+    with open(path, "w") as f:
+        f.write("# ffs_locomoco warp PC variance accounting\n")
+        f.write("# warp%   share of the WARP field's variance (the PC spectrum)\n")
+        f.write("# data%   share of the corrected data's drift-residualized variance\n")
+        if vt is not None:
+            f.write("# task%   share of the data's TASK-explained variance\n")
+            f.write("# design  share of the PC's own time course lying in the task subspace\n")
+        f.write("\n".join("# " + r if i == 0 else r for i, r in enumerate(rows)) + "\n")
+
+
 def _write_pc_1d(path, scores, var, title, labels) -> str:
     """One .1D of unit-variance PC regressors, with a labelled column header."""
     var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
@@ -3439,7 +3546,9 @@ def _pc_axis_labels(result, args):
         return {}
 
 
-def _write_warp_pcs(components, stem, n_pcs, *, per_axis=False, label_of=None) -> None:
+def _write_warp_pcs(
+    components, stem, n_pcs, *, per_axis=False, label_of=None, data=None, args=None
+) -> None:
     """Write the top-N temporal warp PCs as {stem}_locomoco_pcs*.1D.
 
     Recomputed from the in-memory warp, so it is independent of -no_warp (the warp need
@@ -3479,6 +3588,8 @@ def _write_warp_pcs(components, stem, n_pcs, *, per_axis=False, label_of=None) -
                 [f"{lbl}_PC{i:02d}" for i in range(k)],
             )
             print(f"    warp PCs [{lbl}]: {k} components, var {vp}")
+            if data is not None and args is not None:
+                _pc_variance_table(scores, var, data, args, lbl, stem)
         return
 
     with spinner("Computing warp PCs"):
@@ -3498,6 +3609,8 @@ def _write_warp_pcs(components, stem, n_pcs, *, per_axis=False, label_of=None) -
     )
     print(f"    warp PCs: {k} components, var {vp}")
     _print_pc_balance(balance, label_of, k, indent="    ")
+    if data is not None and args is not None:
+        _pc_variance_table(scores, var, data, args, "", stem)
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
@@ -4234,12 +4347,15 @@ def _run_multiecho(
         want_corrected = (
             not args.no_corrected
             or (_want_qc(args) and _want_corrected_qc(args))
-            # Echo 1's corrected series feeds the task-fit "after" below, measured on
-            # the same echo-mean the "before" was.
+            # The echo mean feeds the task-fit "after" (measured on the same echo mean
+            # the "before" was) and the per-PC data-variance table.
             or getattr(args, "_task_after", None) is not None
+            or args.want_pcs is not None
         )
         corrected_series = res.corrected_series() if want_corrected else None
-        if corrected_series is not None and getattr(args, "_task_after", None) is not None:
+        if corrected_series is not None and (
+            getattr(args, "_task_after", None) is not None or args.want_pcs is not None
+        ):
             corr_sum = corrected_series.clone() if corr_sum is None else corr_sum + corrected_series
         if not args.no_corrected:
             assert corrected_series is not None
@@ -4271,9 +4387,10 @@ def _run_multiecho(
             )
         del corrected_series
 
-    if corr_sum is not None:
-        _write_data_task_after(corr_sum / len(result.per_echo), stem, args)
-        del corr_sum
+    echo_mean_corr = None if corr_sum is None else corr_sum / len(result.per_echo)
+    del corr_sum
+    if echo_mean_corr is not None:
+        _write_data_task_after(echo_mean_corr, stem, args)
     elif getattr(args, "_task_after", None) is not None:
         _write_data_task_after(None, stem, args)
 
@@ -4299,7 +4416,10 @@ def _run_multiecho(
             args.want_pcs,
             per_axis=args.pcs_per_axis,
             label_of=_pc_axis_labels(result.per_echo[0], args),
+            data=echo_mean_corr,
+            args=args,
         )
+    del echo_mean_corr
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
@@ -5013,15 +5133,6 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 extra_components=[(d, a) for a, d in rest],
             )
 
-    if args.want_pcs is not None:
-        _write_warp_pcs(
-            result.warp_components(),
-            stem,
-            args.want_pcs,
-            per_axis=args.pcs_per_axis,
-            label_of=_pc_axis_labels(result, args),
-        )
-
     # One materialization for every consumer below. On the estimator paths that
     # hold the series in canonical axis order, corrected_series() is a permute +
     # contiguous -- a full copy of the 4-D series (a GB for a long single-echo
@@ -5037,9 +5148,25 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         # under -no_corrected. One warp, and it is what answers whether the correction
         # helped or hurt the thing the scan was collected for.
         or getattr(args, "_task_after", None) is not None
+        # The PC table scores each component against the CORRECTED images, which is
+        # what the regressors will actually be used on.
+        or args.want_pcs is not None
     )
     corrected_series = result.corrected_series() if want_corrected else None
     _write_data_task_after(corrected_series, stem, args)
+
+    # After the corrected series exists, so each PC can be scored against the data it
+    # will be regressed on rather than only against the warp it came from.
+    if args.want_pcs is not None:
+        _write_warp_pcs(
+            result.warp_components(),
+            stem,
+            args.want_pcs,
+            per_axis=args.pcs_per_axis,
+            label_of=_pc_axis_labels(result, args),
+            data=corrected_series,
+            args=args,
+        )
 
     if not args.no_corrected:
         assert corrected_series is not None
