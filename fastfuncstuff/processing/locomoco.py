@@ -3830,38 +3830,57 @@ def _brain_mask_from(ref_mag: torch.Tensor, thresh_frac: float = 0.1) -> torch.T
 
 
 # The inner LK update is judged converged once it falls to this fraction of the largest
-# update that level took. Relative, because the coarse levels move whole voxels and the
-# fine ones hundredths -- an absolute floor would read as "converged" on every fine level.
+# update that level took. Relative, so a level that moved whole voxels is not held to the
+# same step as one that moved hundredths.
 FLOW_CONV_TOL = 0.1
+# ...or once the update is this small outright, in voxels per iteration. The relative arm
+# alone is not enough, and measuring is what showed it: these step sequences drop by an
+# order of magnitude on the FIRST iteration and then crawl on a roughly harmonic tail
+# whose ratio climbs back towards 1. Ten percent of a peak set by that one outlier step is
+# then nearly unreachable -- on a real 1.5-vox displacement it takes 12 iterations to
+# reach 0.077 -- so a purely relative test reports "never converged" in every regime and
+# says nothing. This floor is a shade under the outer refine loop's own converged step
+# (~0.004 vox), below which another iteration cannot move the answer by as much as the
+# tool reports displacements to.
+FLOW_CONV_FLOOR = 0.005
 # A level is flagged as capped only when this fraction of frames never converged: one
 # stubborn frame in a run of 300 is not a reason to tell the user to raise -iters.
 FLOW_CONV_CAPPED_FRAC = 0.25
 
 
 def summarize_flow_convergence(
-    steps: torch.Tensor, n_iters: int, tol: float = FLOW_CONV_TOL
+    steps: torch.Tensor,
+    n_iters: int,
+    tol: float = FLOW_CONV_TOL,
+    floor: float = FLOW_CONV_FLOOR,
 ) -> str:
     """One line on how the inner LK iterations converged, per pyramid level.
 
-    ``steps`` is ``(n_calls, n_levels, n_iters)`` -- the per-iteration update size that
-    :func:`optical_flow_lk_3d_axes` records, one call per frame, levels COARSEST FIRST so
-    the printed vector reads in the same direction as ``-levels``.
+        ``steps`` is ``(n_calls, n_levels, n_iters)`` -- the per-iteration update size that
+        :func:`optical_flow_lk_3d_axes` records, one call per frame, levels COARSEST FIRST so
+        the printed vector reads in the same direction as ``-levels``.
 
-    A level is converged at the first iteration whose update has fallen to ``tol`` of the
-    largest update that level took. The peak, not the first step, is the denominator: the
-    field arrives at a level already upsampled from the coarser one, so its opening step
-    is sometimes small and would make a converged level look stalled.
+    A level has settled once every later update is either below ``tol`` of the largest
+        update that level took OR below ``floor`` voxels outright -- the same two-armed
+        absolute-or-relative shape :func:`_refine_converged` uses on the outer loop, and for
+        the same reason. The relative arm carries a level that moved whole voxels and is now
+        done at its own scale; the absolute arm carries a level that never had anything to do,
+        which is the common case on an already-corrected series where the whole field is
+        hundredths of a voxel and the relative arm can never fire.
 
-    Note the criterion is deliberately NOT the relative-improvement test
-    :func:`_refine_converged` uses on the outer loop. These steps decay roughly
-    geometrically, and "improved by less than x% this pass" never fires on a geometric
-    decay -- it is the right question for a sequence that plateaus, which is the outer
-    loop's shape, not this one's.
+        The peak, not the first step, is the relative denominator: the field arrives at a
+        level already upsampled from the coarser one, so its opening step is sometimes small
+        and would make a converged level look stalled.
 
-    Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
-    voxels, which is the distinction that matters: hitting the cap while still moving
-    0.14 vox/iter means raise ``-iters``, while hitting it at 0.002 vox/iter means the
-    iterations are being spent on noise and the cap is doing no harm.
+        The criterion is still NOT the relative-improvement test the outer loop uses. These
+        tails FLATTEN -- the step ratio climbs back towards 1 as the crawl sets in -- so
+        "improved by less than x% this pass" fires in the middle of the crawl and calls it
+        converged.
+
+        Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
+        voxels, which is the distinction that matters: hitting the cap while still moving
+        0.14 vox/iter means raise ``-iters``, while hitting it at 0.002 vox/iter means the
+        iterations are being spent on noise and the cap is doing no harm.
     """
     if steps.ndim != 3 or steps.numel() == 0:
         return ""
@@ -3872,7 +3891,10 @@ def summarize_flow_convergence(
     for lvl in range(steps.shape[1]):
         s = steps[:, lvl, :]  # (n_calls, n_iters)
         peak = s.max(dim=1).values.clamp_min(1e-12)
-        above = s > tol * peak[:, None]
+        # "Still working" needs BOTH arms to say so: a step large relative to this level's
+        # peak but under the floor is not worth another iteration, and neither is a step
+        # over the floor that is already a thousandth of what the level has done.
+        above = (s > tol * peak[:, None]) & (s > floor)
         # The iteration AFTER the last one still above the threshold — not the first one
         # below it. These sequences are not monotone: a level whose field arrived already
         # good can take a tiny opening step and its real step second, and "first below"

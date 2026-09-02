@@ -35,11 +35,20 @@ def test_capped_level_is_flagged_and_carries_its_final_step():
     assert out == "4 iters, conv @ 4*  (Δ 0.700 vox)"
 
 
-def test_capped_at_a_negligible_step_reads_differently():
-    # Same shape of failure, three orders of magnitude smaller: the cap is doing no harm
-    # and the printed delta is what says so.
+def test_a_level_with_nothing_to_do_converges_rather_than_capping():
+    # The same never-falls-to-10%-of-peak shape as above, three orders of magnitude
+    # smaller. This is the common case on an already-corrected series: the whole field is
+    # hundredths of a voxel, the relative arm can never fire, and the absolute arm is the
+    # only thing standing between the user and a constant, uninformative "4*".
     s = _steps([[1e-3, 9e-4, 8e-4, 7e-4]])
-    assert summarize_flow_convergence(s, 4) == "4 iters, conv @ 4*  (Δ 0.001 vox)"
+    assert summarize_flow_convergence(s, 4) == "4 iters, conv @ 1"
+
+
+def test_a_big_step_over_the_floor_still_caps():
+    # Above the floor AND above 10% of peak: genuinely still moving, and the delta is the
+    # number that says to raise -iters.
+    s = _steps([[1.0, 0.9, 0.8, 0.7]])
+    assert summarize_flow_convergence(s, 4) == "4 iters, conv @ 4*  (Δ 0.700 vox)"
 
 
 def test_levels_read_coarsest_first_and_mix():
