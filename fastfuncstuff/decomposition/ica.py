@@ -1352,3 +1352,210 @@ def select_n_components_by_stability(
         "stability_by_n_components": stability_by_n_components,
         "all_results": all_results,
     }
+
+
+# ---------------------------------------------------------------------------
+# Batched multi-restart FastICA
+# ---------------------------------------------------------------------------
+def _nonlinearity_batch(x: torch.Tensor, fun: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """``g(x)`` in place and ``E[g'(x)]`` over the sample axis, for ``(..., k, V)`` input.
+
+    The scalar-path helper chunks along dim 1, which is the component axis once a restart
+    axis is prepended; this one reduces over the last axis whatever the rank. The
+    ``E[g']`` reduction is chunked so the full-size square is never materialised.
+    """
+    n_samp = x.shape[-1]
+    chunk = min(n_samp, 200_000)
+
+    def _mean_over_samples(fn) -> torch.Tensor:
+        acc = torch.zeros(*x.shape[:-1], 1, device=x.device, dtype=x.dtype)
+        for j in range(0, n_samp, chunk):
+            acc += fn(x[..., j : j + chunk]).sum(dim=-1, keepdim=True)
+        return acc / n_samp
+
+    if fun == "logcosh":
+        x.tanh_()  # x is now g(x)
+        g_prime_mean = 1.0 - _mean_over_samples(lambda c: c.pow(2))
+        return x, g_prime_mean
+    if fun == "cube":
+        g_prime_mean = 3.0 * _mean_over_samples(lambda c: c.pow(2))
+        return x.pow_(3), g_prime_mean
+    if fun == "pow3":
+        # The kurtosis contrast, in the same folded form the scalar path uses: the generic
+        # update is term1 - g_prime_mean * W, so g(u) = 3u^2 and g_prime_mean = E[u]
+        # together produce the cubic update 3E[X u^2] - E[u] W.
+        g_prime_mean = _mean_over_samples(lambda c: c)
+        return x.pow_(2).mul_(3.0), g_prime_mean
+    if fun == "exp":
+        ex = torch.exp(-0.5 * x * x)
+        g_prime_mean = ((1.0 - x * x) * ex).mean(dim=-1, keepdim=True)
+        return x.mul_(ex), g_prime_mean
+    raise ValueError(
+        f"unknown nonlinearity {fun!r}; use logcosh, pow3, cube or exp"
+    )
+
+
+def _symmetric_decorrelation_batch(W: torch.Tensor) -> torch.Tensor:
+    """Symmetric decorrelation of a stack of unmixing matrices, ``(R, k, F)``.
+
+    ``W <- (W Wt)^(-1/2) W`` per restart, via SVD. Batched on the CPU in float64 for the
+    same reason the single-restart path promotes: with k~60 the eigenvalue spread makes a
+    float32 factorisation stall convergence, and a stack of k x k SVDs is small enough
+    that the round trip costs less than the float64 CUDA factorisation would.
+    """
+    orig_dtype, orig_device = W.dtype, W.device
+    U, _, Vt = torch.linalg.svd(W.detach().to("cpu", torch.float64), full_matrices=False)
+    return (U @ Vt).to(device=orig_device, dtype=orig_dtype)
+
+
+@torch.inference_mode()
+def fastica_batch(
+    X_white: torch.Tensor,
+    n_restarts: int,
+    n_components: int,
+    *,
+    fun: str = "logcosh",
+    max_iter: int = 200,
+    tol: float = 1e-4,
+    base_seed: int = 0,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run ``n_restarts`` symmetric FastICA fits simultaneously on shared whitened data.
+
+    The symmetric update is elementwise in the restart index -- every restart sees the
+    same ``X_white`` and differs only in its random initialisation -- so carrying a
+    leading restart axis changes nothing algorithmically and turns R serial fits into one
+    batched fit. A single fit at k=50, V=200k is a few milliseconds of arithmetic and is
+    entirely launch-bound, so the batched version costs little more than one restart.
+
+    Restarts stop independently: a converged restart is frozen rather than dropped, so the
+    result is identical to having run it alone, and iteration continues for the others.
+
+    Parameters
+    ----------
+    X_white : (n_features, n_samples) whitened data, shared across restarts.
+    n_restarts, n_components : int
+    fun, max_iter, tol : as :class:`FastICA`.
+    base_seed : int
+        Restart ``i`` is initialised from ``base_seed + i``, matching the seeds the
+        sequential path would have used.
+
+    Returns
+    -------
+    W : (R, k, n_features) unmixing matrices
+    n_iter : (R,) int tensor, iterations each restart took
+    converged : (R,) bool tensor
+    """
+    n_features, n_samples = X_white.shape
+    device, dtype = X_white.device, X_white.dtype
+
+    # Same per-restart seeding as the sequential path, so results are comparable.
+    w_init = torch.empty(n_restarts, n_components, n_features, device=device, dtype=dtype)
+    for i in range(n_restarts):
+        g = torch.Generator(device="cpu").manual_seed(int(base_seed) + i)
+        w_init[i] = torch.randn(n_components, n_features, generator=g, dtype=torch.float32).to(
+            device=device, dtype=dtype
+        )
+
+    W = _symmetric_decorrelation_batch(w_init)
+    del w_init
+
+    scale = 1.0 / n_samples
+
+    # TF32's 10-bit mantissa puts noise at ~3e-4, above the 1e-4 tolerance; convergence
+    # stalls without full float32. Same guard as the single-restart path.
+    saved_tf32: bool | None = None
+    if device.type == "cuda" and dtype == torch.float32:
+        saved_tf32 = torch.backends.cuda.matmul.allow_tf32
+        torch.backends.cuda.matmul.allow_tf32 = False
+
+    active = torch.ones(n_restarts, dtype=torch.bool, device=device)
+    n_iter = torch.zeros(n_restarts, dtype=torch.long, device=device)
+
+    pbar = tqdm(range(max_iter), desc=f"FastICA x{n_restarts}", leave=True, disable=not verbose)
+    try:
+        for it in pbar:
+            W_old = W
+            wx = W @ X_white  # (R, k, V)
+            g_wx, g_prime_mean = _nonlinearity_batch(wx, fun)
+            W_new = (g_wx @ X_white.T) * scale - g_prime_mean * W_old
+            del g_wx
+            W_new = _symmetric_decorrelation_batch(W_new)
+
+            # Per-restart convergence, same criterion as the single-restart path:
+            # 1 - min |diag(W W_old^T)|.
+            lim = torch.abs(torch.diagonal(W_new @ W_old.transpose(-2, -1), dim1=-2, dim2=-1))
+            delta = (1.0 - lim).amax(dim=-1)  # (R,)
+
+            # Freeze converged restarts so each result equals what it would have been
+            # had that restart run alone.
+            W = torch.where(active.view(-1, 1, 1), W_new, W_old)
+            n_iter = torch.where(active, torch.full_like(n_iter, it + 1), n_iter)
+            active = active & (delta >= tol)
+            if verbose:
+                pbar.set_postfix(active=int(active.sum()), delta=f"{delta.max().item():.2e}")
+            if not bool(active.any()):
+                break
+    finally:
+        pbar.close()
+        if saved_tf32 is not None:
+            torch.backends.cuda.matmul.allow_tf32 = saved_tf32
+
+    return W, n_iter, ~active
+
+
+@torch.inference_mode()
+def fastica_multi_restart(
+    X_white: torch.Tensor,
+    n_restarts: int,
+    n_components: int,
+    *,
+    fun: str = "logcosh",
+    max_iter: int = 200,
+    tol: float = 1e-4,
+    base_seed: int = 0,
+    restart_chunk: int | None = None,
+    verbose: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`fastica_batch` with the restart axis chunked to fit in memory.
+
+    The working set is dominated by the ``(R, k, V)`` projection, so the number of
+    restarts that fit at once falls out of the free memory divided by that per-restart
+    cost. ``restart_chunk`` overrides the estimate.
+    """
+    if restart_chunk is None:
+        from fastfuncstuff.memory import get_available_memory
+
+        k, v = n_components, X_white.shape[1]
+        itemsize = X_white.element_size()
+        # Live at once: wx (R,k,V), plus the g' reduction chunk and the (R,k,F) updates.
+        # A factor of 3 on the dominant term covers those without a detailed model.
+        per_restart = 3 * k * v * itemsize
+        try:
+            free = get_available_memory(X_white.device)
+        except Exception:
+            free = 0
+        restart_chunk = max(1, int(free / max(1, per_restart))) if free else 8
+        restart_chunk = min(restart_chunk, n_restarts)
+        if verbose:
+            print(f"    FastICA restart batching: {restart_chunk} at a time of {n_restarts}")
+
+    outs: list[torch.Tensor] = []
+    iters: list[torch.Tensor] = []
+    convs: list[torch.Tensor] = []
+    for start in range(0, n_restarts, restart_chunk):
+        n_this = min(restart_chunk, n_restarts - start)
+        w, it, cv = fastica_batch(
+            X_white,
+            n_this,
+            n_components,
+            fun=fun,
+            max_iter=max_iter,
+            tol=tol,
+            base_seed=base_seed + start,
+            verbose=verbose,
+        )
+        outs.append(w)
+        iters.append(it)
+        convs.append(cv)
+    return torch.cat(outs, 0), torch.cat(iters, 0), torch.cat(convs, 0)
