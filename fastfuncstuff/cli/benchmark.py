@@ -95,6 +95,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Print detailed timing report (requires timing data).",
     )
     parser.add_argument(
+        "-profile",
+        action="store_true",
+        help="Profile FFS commands that execute. Writes compact per-invocation and "
+        "stage-aggregated CPU/PyTorch/CUDA reports under processing/benchmark_profiles. "
+        "Does not imply -force-ffs and profiled timings are never cached.",
+    )
+    parser.add_argument(
+        "-profile-trace",
+        action="store_true",
+        help="With -profile, also export full Chrome/Perfetto traces. These can be very large.",
+    )
+    parser.add_argument(
         "-plot",
         type=str,
         default=None,
@@ -157,6 +169,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         sys.exit(0)
 
     args = parser.parse_args(argv)
+    if args.profile_trace and not args.profile:
+        parser.error("-profile-trace requires -profile")
     return args
 
 
@@ -274,6 +288,8 @@ def main(argv: list[str] | None = None) -> int:
         ref_only=args.ref_only,
         device=args.device,
         show_output=args.verb >= 1,
+        profile=args.profile,
+        profile_trace=args.profile_trace,
         config=config,
     )
 
@@ -293,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
         print("Verbose: streaming subprocess output")
 
     # Run
+    if ctx.profile:
+        detail = " + Chrome traces" if ctx.profile_trace else ""
+        print(f"Profiling: compact CPU/PyTorch/operator summaries{detail}")
     results = run_stages(stages, ctx)
 
     # Enrich results with cached timings if available

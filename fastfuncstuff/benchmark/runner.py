@@ -14,6 +14,7 @@ from typing import Any
 # Set by run_stages() from ctx.show_output so all stage run_timed() calls
 # inherit it without needing to thread the flag through every call site.
 _show_output: bool = False
+_profile_stage: Any = None
 
 
 @dataclass
@@ -29,6 +30,8 @@ class BenchmarkContext:
     verbose: bool = True
     device: str | None = None  # PyTorch device to pass to FFS tools (e.g. "mps", "cpu")
     show_output: bool = False  # Stream subprocess stdout/stderr when True
+    profile: bool = False  # Profile FFS commands that actually execute
+    profile_trace: bool = False  # Also export potentially large Chrome traces
     config: Any = None  # BenchmarkConfig — typed as Any to avoid circular import
 
     # Per-stage scratch: how many items each role (ref/ffs) actually ran vs the
@@ -299,9 +302,17 @@ def run_timed(
     Raises:
         RuntimeError: If command returns non-zero exit code.
     """
+    original_cmd = cmd
+    if _profile_stage is not None:
+        profiled_cmd = _profile_stage.wrap_command(cmd, label)
+        if profiled_cmd is not None:
+            cmd = profiled_cmd
+
     if verbose:
         print(f"  Running: {label}...")
-        print(f"    Command: {cmd}")
+        print(f"    Command: {original_cmd}")
+        if cmd is not original_cmd:
+            print("    Profiling: CPU/PyTorch operators (profiled timing is not cached)")
 
     start = time.monotonic()
 
@@ -514,10 +525,16 @@ def run_stages(
         - run_ref(ctx) -> float  (reference tool: AFNI, melodic, MATLAB, etc.)
         - run_ffs(ctx) -> float  (FFS tool)
     """
-    global _show_output
+    global _profile_stage, _show_output
     _show_output = ctx.show_output
     results = []
     stage_timings = {}
+    benchmark_profiler = None
+    if ctx.profile:
+        from .profiling import BenchmarkProfiler
+
+        benchmark_profiler = BenchmarkProfiler.create(ctx.processing_dir, trace=ctx.profile_trace)
+        print(f"Profiles: {benchmark_profiler.root}")
 
     # Up-front dependency advisory: if a requested stage depends on stages not in
     # this run, its upstream outputs may be missing -> it'll come back INCOMPLETE.
@@ -579,12 +596,25 @@ def run_stages(
         has_ref = hasattr(stage, "run_ref")
         skip_ffs = ctx.validate_only or (ctx.ref_only and has_ref)
         if not skip_ffs and hasattr(stage, "run_ffs"):
+            stage_profiler = benchmark_profiler.start_stage(name) if benchmark_profiler else None
+            _profile_stage = stage_profiler
             try:
-                result.ffs_time = stage.run_ffs(ctx)
+                if stage_profiler is not None and name == "ica_solver":
+                    result.ffs_time = stage_profiler.run_callable(
+                        lambda current_stage=stage: current_stage.run_ffs(ctx),
+                        label="ica_solver in-process stage",
+                        command=["ffs_benchmark", "-stages", name],
+                    )
+                else:
+                    result.ffs_time = stage.run_ffs(ctx)
             except Exception as e:
                 result.errors.append(f"FFS: {e}")
                 result.ffs_crashed = True
                 print(f"  FFS error: {e}")
+            finally:
+                _profile_stage = None
+                if benchmark_profiler is not None and stage_profiler is not None:
+                    benchmark_profiler.finish_stage(stage_profiler)
 
         # Snapshot which roles ran only part of their work (some outputs already
         # existed) so the timing is flagged partial in display and cache.
@@ -655,7 +685,8 @@ def run_stages(
         timing_entry: dict[str, Any] = {}
         if result.ref_time is not None and result.ref_time > 0:
             timing_entry["ref_seconds"] = result.ref_time
-        if result.ffs_time is not None and result.ffs_time > 0:
+        # Profiler overhead must never replace normal speed baselines.
+        if not ctx.profile and result.ffs_time is not None and result.ffs_time > 0:
             timing_entry["ffs_seconds"] = result.ffs_time
         for role, m in result.partial.items():
             timing_entry[f"{role}_partial"] = True
@@ -681,5 +712,16 @@ def run_stages(
             stage_validations=stage_validations,
             device_spec=ctx.device,
         )
+
+    if benchmark_profiler is not None:
+        manifest = benchmark_profiler.finish()
+        count = manifest["profiled_invocations"]
+        if count:
+            print(f"\nWrote {count} profile(s) to {benchmark_profiler.root}")
+        else:
+            print(
+                f"\nNo profiles were produced (FFS outputs were likely cached). "
+                f"Manifest: {benchmark_profiler.root / 'manifest.json'}"
+            )
 
     return results
