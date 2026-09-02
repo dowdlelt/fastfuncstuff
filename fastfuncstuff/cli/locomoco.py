@@ -1245,7 +1245,18 @@ def create_parser() -> argparse.ArgumentParser:
         "sub-voxel shift. This measures how much of the estimated field the task "
         "explains (over a circular-shift null), and whether that lands on top of the "
         "BOLD response — which is what separates 'BOLD leaked into the estimate' from "
-        "'the subject moved with the task'. Writes {prefix}_taskr2_* maps and a report. "
+        "'the subject moved with the task'.\n"
+        "Writes, per encode axis, {prefix}_taskr_pe1/pe2 — the field's SIGNED partial "
+        "correlation, labelled and tagged fico so AFNI thresholds it — and _taskrms_*, "
+        "its task-explained part in voxels; plus, for the DATA, {prefix}_taskr_data and "
+        "{prefix}_taskbeta_data (percent signal change), written BOTH before and, with "
+        "an _after suffix, on the corrected series. The data before/after pair is "
+        "written whenever -events is given, fix or no fix: it is how you see whether "
+        "the whole correction helped or hurt the response the scan was collected for, "
+        "and amplitude is in there because a contaminated field drags responding voxels "
+        "toward the mean and blurs, which cuts amplitude while |r| barely moves.\n"
+        "The fico p is NOMINAL — no autocorrelation correction — so it is there to "
+        "threshold and colour the maps, not to be reported.\n"
         "Diagnostic only: nothing about the correction changes.",
     )
     task.add_argument(
@@ -2022,6 +2033,85 @@ def _pe_axis_name(label: str, axis: int, args) -> str:
     return f"{label} ({kind}{dir_txt}, axis {axis} = {letter})"
 
 
+def _coupling_stataux(n_t: int, polort: int, n_sub: int) -> dict:
+    """AFNI ``fico`` parameters for a drift-partial correlation map, per sub-brick.
+
+    SAMPLES = timepoints, FIT-PARAMETERS = 1 (the single regressor each sub-brick is
+    correlated against), ORT-PARAMETERS = polort+1 (the Legendre drift columns removed
+    from both sides first, degrees 0..polort).
+
+    AFNI reads these three straight into ``correl_t2p(rho, nsam, nfit, nort)``
+    (mri_stats.c), which is ``incbeta(1 - rho^2, (nsam-nfit-nort)/2, nfit/2)`` — the
+    multiple-correlation null with ``nsam-nfit-nort`` residual dof. Our ``r`` is a
+    correlation between two vectors already projected out of a (polort+1)-dimensional
+    drift subspace, with one fitted parameter, so that is exactly T-(polort+1)-1. AFNI
+    has no R-squared stat type at all; ``fico`` is the only correlation code, and it is
+    the right one here because it keeps the SIGN that an R-squared would throw away.
+
+    That "under independence" is the whole caveat. fMRI residuals are autocorrelated and
+    nothing here corrects for it, so the p AFNI derives from this is NOMINAL and
+    anticonservative; :mod:`fastfuncstuff.stats.task_coupling` deliberately makes no
+    significance claim and this does not change that. The tag is here so the maps
+    threshold and colour like every other functional overlay, not so the p can be
+    reported.
+    """
+    from fastfuncstuff.io.afni import stat_type_to_stataux
+
+    return {i: stat_type_to_stataux("fico", (n_t, 1, polort + 1)) for i in range(n_sub)}
+
+
+def _save_task_map(path, arr, labels, affine, *, stataux_polort=None, n_t=0):
+    """Write one condition-stacked map: 4-D with labelled sub-bricks, 3-D if K == 1.
+
+    ``stataux_polort`` marks the map as a correlation and tags every sub-brick with the
+    matching ``fico``, so AFNI can threshold it and compute FDR instead of treating a
+    correlation as an unlabelled float.
+    """
+    from fastfuncstuff.cli_utils import spinner
+    from fastfuncstuff.io.afni import save_nifti
+
+    a = arr.float()
+    # A single-condition run has always written 3-D here; keep that spelling.
+    if a.ndim == 4 and a.shape[-1] == 1:
+        a = a.squeeze(-1)
+    n_sub = 1 if a.ndim == 3 else a.shape[-1]
+    stataux = None if stataux_polort is None else _coupling_stataux(n_t, stataux_polort, n_sub)
+    with spinner(f"Writing {Path(path).name}"):
+        save_nifti(
+            a.numpy(),
+            path,
+            affine=affine,
+            brick_labels=list(labels[:n_sub]),
+            brick_stataux=stataux,
+        )
+
+
+def _psc_betas(tc, design, reference, mask):
+    """Condition betas as PERCENT SIGNAL CHANGE of each voxel's own temporal mean.
+
+    ``tc.beta`` is map units per unit of regressor, so the response a condition actually
+    produces is ``beta × the regressor's peak-to-trough swing``; dividing by the voxel
+    mean and scaling by 100 puts every condition, voxel and dataset on the one axis a
+    reader can judge — a 2% response is a 2% response whatever the scanner's arbitrary
+    intensity units were. Nothing extra is fitted: the betas come out of the same solve
+    as ``r``, at no additional cost.
+    """
+    import torch
+
+    x = torch.as_tensor(np.asarray(design), dtype=torch.float32)
+    swing = (x.amax(dim=0) - x.amin(dim=0)).clamp(min=1e-12)
+    base = reference.float().abs()
+    ok = (mask > 0) & (base > 0)
+    out = torch.zeros(*tc.beta.shape[:3], tc.beta.shape[-1], dtype=torch.float32)
+    for k in range(out.shape[-1]):
+        out[..., k] = torch.where(
+            ok,
+            100.0 * tc.beta[..., k].float() * float(swing[k]) / base.clamp(min=1e-12),
+            torch.zeros_like(base),
+        )
+    return out
+
+
 def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     """Measure how task-locked the estimated field is, and whether that is BOLD.
 
@@ -2034,8 +2124,6 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     import numpy as np
     import torch
 
-    from fastfuncstuff.cli_utils import spinner
-    from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.processing.locomoco import _brain_mask_from
     from fastfuncstuff.stats.task_coupling import (
         co_location,
@@ -2132,22 +2220,42 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         # Queued, not written here: the findings above are what a reader scans, and
         # interleaving file names between them is what made this block unreadable.
         pending += [
-            (f"{stem}_{kind}_{label}{ext}", arr, kind == "taskr")
-            for kind, arr in (("taskr", tc.r), ("taskrms", tc.task_rms))
+            (f"{stem}_taskr_{label}{ext}", tc.r, labels, polort),
+            (f"{stem}_taskrms_{label}{ext}", tc.task_rms, [f"{label} task rms (vox)"], None),
         ]
 
-    pending.append((f"{stem}_taskr_data{ext}", data_tc.r, True))
+    # The data side: what the task response looks like BEFORE anything is corrected.
+    # `r` says where it is, the PSC betas say how big it is -- and it is the amplitude
+    # that shows a contaminated field dragging a voxel toward the mean, which a
+    # correlation alone can hold nearly constant while the response shrinks.
+    pending.append((f"{stem}_taskr_data{ext}", data_tc.r, labels, polort))
+    pending.append(
+        (
+            f"{stem}_taskbeta_data{ext}",
+            _psc_betas(data_tc, design, reference, mask),
+            [f"{lb} %sig" for lb in labels],
+            None,
+        )
+    )
     Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print()
-    for path, arr, squeeze in pending:
-        with spinner(f"Writing {Path(path).name}"):
-            a = arr.float()
-            save_nifti(
-                (a.squeeze(-1) if squeeze and a.shape[-1] == 1 else a).numpy(),
-                path,
-                affine=affine,
-            )
+    for path, arr, brick_labels, stat_polort in pending:
+        _save_task_map(path, arr, brick_labels, affine, stataux_polort=stat_polort, n_t=n_t)
     args._task_labels = labels
+    # Everything the data-side "after" needs, so it can run at the point the corrected
+    # series already exists rather than paying for a second 4-D warp to get one.
+    args._task_after = {
+        "design": design,
+        "polort": polort,
+        "resp": resp,
+        "mask": mask,
+        "labels": labels,
+        "before": data_tc,
+        "before_psc": pending[-1][1],
+        "reference": reference,
+        "affine": affine,
+        "ext": ext,
+    }
     return design, polort, resp, mask
 
 
@@ -2363,8 +2471,6 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
     an ``_after`` suffix. Two ``_taskr`` maps of the same run, before and after, are
     what actually answer "did it work".
     """
-    from fastfuncstuff.cli_utils import spinner
-    from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.stats.task_coupling import (
         enrichment_curve,
         task_coupling,
@@ -2392,10 +2498,92 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
         )
         pending.append((f"{stem}_taskr_{label}_after{ext}", tc.r))
     print()
+    n_t = int(np.asarray(design).shape[0])
     for path, arr in pending:
-        with spinner(f"Writing {Path(path).name}"):
-            a = arr.float()
-            save_nifti((a.squeeze(-1) if a.shape[-1] == 1 else a).numpy(), path, affine=affine)
+        _save_task_map(path, arr, args._task_labels, affine, stataux_polort=polort, n_t=n_t)
+
+
+def _write_data_task_after(corrected, stem, args):
+    """Re-measure the task fit on the CORRECTED DATA, and say what moved.
+
+    The field-side ``_after`` above answers "did the fix clean the field". This answers
+    the question the whole tool exists for: after correcting the data, does the task fit
+    better or worse than it did? It runs whenever ``-events`` is given, with or without
+    a fix — there is nothing to opt into, because the comparison is a diagnostic either
+    way and its most useful outcome is the bad one.
+
+    Both halves are reported, and they are not redundant. A contaminated field damages
+    the data in two ways a correlation alone can miss: it drags responding voxels toward
+    the mean and it blurs, both of which cut the AMPLITUDE while |r| barely moves. So
+    the PSC betas are compared alongside ``r``.
+
+    Read it against the field's own coupling, not on its own. A task-locked field warps
+    edges with the task and MANUFACTURES apparent response, which pushes the data's |r|
+    and amplitude UP. Rising numbers mean the correction helped only when the field's
+    enrichment stayed low; with a contaminated field, the same rise is the contamination.
+    """
+    st = getattr(args, "_task_after", None)
+    if st is None:
+        return
+    if corrected is None:
+        print(
+            "  ⚠️  task fit AFTER not measured: no corrected series was materialized "
+            "(-no_corrected)."
+        )
+        return
+
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    print_cli_subsection("TASK FIT AFTER CORRECTION (data, not field)")
+    ext, affine, resp = st["ext"], st["affine"], st["resp"]
+    series = torch.as_tensor(np.ascontiguousarray(np.asarray(corrected))).float()
+    after = task_coupling(
+        series,
+        st["design"],
+        polort=st["polort"],
+        mask=st["mask"],
+        labels=st["labels"],
+    )
+    # PSC is referenced to the ORIGINAL mean, not the corrected one: a changed baseline
+    # would move every percentage without any response having changed.
+    psc_after = _psc_betas(after, st["design"], st["reference"], st["mask"])
+    psc_before = st["before_psc"]
+    n_t = int(np.asarray(st["design"]).shape[0])
+
+    sel = resp > 0
+    for k, lb in enumerate(st["labels"]):
+        r0 = st["before"].r[..., k][sel].abs()
+        r1 = after.r[..., k][sel].abs()
+        b0 = psc_before[..., k][sel].abs()
+        b1 = psc_after[..., k][sel].abs()
+        d_r = float(r1.median()) - float(r0.median())
+        d_b = float(b1.median()) - float(b0.median())
+        pct = 100.0 * d_b / float(b0.median()) if float(b0.median()) > 0 else 0.0
+        print(
+            f"  {lb}: |r| {float(r0.median()):.3f} → {float(r1.median()):.3f} "
+            f"({d_r:+.3f}), amplitude {float(b0.median()):.3f} → "
+            f"{float(b1.median()):.3f} %sig ({pct:+.1f}%)",
+            flush=True,
+        )
+    print(
+        "  (median over the active mask. A rise is a real gain only where the field's "
+        "own task coupling stayed low — a task-locked field manufactures response.)",
+        flush=True,
+    )
+    _save_task_map(
+        f"{stem}_taskr_data_after{ext}",
+        after.r,
+        st["labels"],
+        affine,
+        stataux_polort=st["polort"],
+        n_t=n_t,
+    )
+    _save_task_map(
+        f"{stem}_taskbeta_data_after{ext}",
+        psc_after,
+        [f"{lb} %sig" for lb in st["labels"]],
+        affine,
+    )
 
 
 def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polort=2):
@@ -3863,6 +4051,12 @@ def _run_multiecho(
 
     print_cli_section("Outputs")
     as_5d = args.warp_format == "5d"
+    # The task-fit "after" is measured on the echo MEAN, because the "before" was
+    # (echo_mean above): comparing a single echo against a mean would mostly report the
+    # contrast difference between them. Accumulated in the loop that already
+    # materializes each echo's corrected series rather than a second pass over all of
+    # them.
+    corr_sum = None
     for j, res in enumerate(result.per_echo):
         estem = f"{stem}_e{j + 1}"
         if not args.no_warp:
@@ -3885,8 +4079,16 @@ def _run_multiecho(
                 )
         # Materialized once per echo for both the write and the QC maps below --
         # see the single-echo block for why the repeat call is not free.
-        want_corrected = not args.no_corrected or (_want_qc(args) and _want_corrected_qc(args))
+        want_corrected = (
+            not args.no_corrected
+            or (_want_qc(args) and _want_corrected_qc(args))
+            # Echo 1's corrected series feeds the task-fit "after" below, measured on
+            # the same echo-mean the "before" was.
+            or getattr(args, "_task_after", None) is not None
+        )
         corrected_series = res.corrected_series() if want_corrected else None
+        if corrected_series is not None and getattr(args, "_task_after", None) is not None:
+            corr_sum = corrected_series.clone() if corr_sum is None else corr_sum + corrected_series
         if not args.no_corrected:
             assert corrected_series is not None
             corr_path = f"{estem}_locomoco{ext}"
@@ -3916,6 +4118,12 @@ def _run_multiecho(
                 args, corrected, datas[j], f"{estem}_locomoco", f"{estem}_orig", ext, affine
             )
         del corrected_series
+
+    if corr_sum is not None:
+        _write_data_task_after(corr_sum / len(result.per_echo), stem, args)
+        del corr_sum
+    elif getattr(args, "_task_after", None) is not None:
+        _write_data_task_after(None, stem, args)
 
     # Shared scaling diagnostic: learned alpha vs echo time, and the linearity r².
     alpha_path = f"{stem}_locomoco_alpha.1D"
@@ -4657,8 +4865,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         or args.save_max
         or args.save_min
         or (_want_qc(args) and _want_corrected_qc(args))
+        # The task-fit "after" measures the corrected DATA, so it needs the series even
+        # under -no_corrected. One warp, and it is what answers whether the correction
+        # helped or hurt the thing the scan was collected for.
+        or getattr(args, "_task_after", None) is not None
     )
     corrected_series = result.corrected_series() if want_corrected else None
+    _write_data_task_after(corrected_series, stem, args)
 
     if not args.no_corrected:
         assert corrected_series is not None

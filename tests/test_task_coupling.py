@@ -1446,3 +1446,64 @@ def test_ica_rank_sweep_extends_past_a_grid_edge_winner():
     assert best < 33, (best, tried)
     # ...and kept halving until it hit the floor of 2.
     assert best <= 4, (best, tried)
+
+
+# ── the AFNI stat tag and the PSC amplitude the locomoco CLI writes ──────────────
+
+
+def test_coupling_stataux_matches_afni_correl_t2p_dof():
+    """fico params must give AFNI the dof this drift-partial correlation really has.
+
+    correl_t2p(rho, nsam, nfit, nort) = incbeta(1-rho^2, (nsam-nfit-nort)/2, nfit/2),
+    so the residual dof AFNI uses is nsam-nfit-nort. Our r correlates two vectors that
+    have already had a (polort+1)-column drift basis projected out, against one
+    regressor: T - (polort+1) - 1.
+    """
+    from fastfuncstuff.cli.locomoco import _coupling_stataux
+
+    aux = _coupling_stataux(n_t=120, polort=3, n_sub=2)
+    assert set(aux) == {0, 1}
+    for code, params in aux.values():
+        assert code == 2  # FUNC_COR_TYPE
+        nsam, nfit, nort = params
+        assert (nsam, nfit, nort) == (120.0, 1.0, 4.0)
+        assert nsam - nfit - nort == 120 - 3 - 2
+
+
+def test_psc_betas_recover_a_planted_percent_signal_change():
+    """A voxel modulated by 5% of its own mean must read ~5 %sig, whatever the units."""
+    from fastfuncstuff.cli.locomoco import _psc_betas
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    n_t = 120
+    x = _block_design(n_t)
+    base = 800.0
+    shape = (4, 4, 3)
+    series = torch.full((*shape, n_t), base)
+    series[1, 1, 1] = base * (1.0 + 0.05 * (x[:, 0] - x[:, 0].mean()))
+    mask = torch.zeros(shape)
+    mask[1, 1, 1] = 1
+    tc = task_coupling(series, x, polort=1, mask=mask)
+    psc = _psc_betas(tc, x.numpy(), series.mean(dim=3), mask)
+    # The regressor swings 0->1, so beta IS the full modulation depth.
+    assert abs(float(psc[1, 1, 1, 0]) - 5.0) < 0.2
+    # Untouched voxels are flat, not noise: a constant voxel must not score.
+    assert float(psc[0, 0, 0, 0]) == 0.0
+
+
+def test_psc_betas_are_scale_free():
+    """Doubling the intensity units must not change the percentage."""
+    from fastfuncstuff.cli.locomoco import _psc_betas
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    n_t = 100
+    x = _block_design(n_t)
+    shape = (3, 3, 2)
+    mask = torch.ones(shape)
+    out = []
+    for scale in (1.0, 37.0):
+        series = torch.full((*shape, n_t), 500.0 * scale)
+        series[0, 0, 0] = 500.0 * scale * (1.0 + 0.03 * x[:, 0])
+        tc = task_coupling(series, x, polort=1, mask=mask)
+        out.append(float(_psc_betas(tc, x.numpy(), series.mean(dim=3), mask)[0, 0, 0, 0]))
+    assert abs(out[0] - out[1]) < 1e-3
