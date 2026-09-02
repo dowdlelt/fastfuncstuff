@@ -38,7 +38,7 @@ from fastfuncstuff.decomposition.icasso import (
     compute_similarity_matrix,
     select_centrotypes,
 )
-from fastfuncstuff.utils import to_linalg_f64, to_tensor
+from fastfuncstuff.utils import to_factor_f64, to_tensor
 
 
 @dataclass
@@ -345,7 +345,7 @@ def temporal_ica(
 
     # PCA whitening of the channel covariance; keep the top n_components dims.
     cov = (x @ x.T) / float(t_total)  # (K_sica, K_sica)
-    evals, evecs = torch.linalg.eigh(to_linalg_f64(cov))
+    evals, evecs = torch.linalg.eigh(to_factor_f64(cov))
     evals = evals.flip(0).to(x.dtype)
     evecs = evecs.flip(1).to(x.dtype)
     evals = torch.clamp(evals[:n_components], min=1e-12)

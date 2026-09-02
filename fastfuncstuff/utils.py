@@ -166,6 +166,22 @@ def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:
     return inverse.to(device=matrix.device, dtype=matrix.dtype)
 
 
+def to_factor_f64(t: torch.Tensor) -> torch.Tensor:
+    """Move a tensor to float64 on its :func:`factor_device`.
+
+    The counterpart to :func:`to_linalg_f64` for the *small factorization* case:
+    use this when the float64 tensor is about to be handed to ``svd``/``eigh``/
+    ``inv``/``cholesky`` and the result is design- or component-sized. On a
+    consumer CUDA card that lands the factorization on the CPU, where float64
+    is 12-18x faster at these sizes (see :func:`factor_device`). The caller
+    casts the result back, e.g. ``result.to(device=orig.device, dtype=orig.dtype)``.
+
+    Never use it on anything carrying a voxel axis -- the transfer would dwarf
+    what the factorization saves.
+    """
+    return t.to(device=factor_device(t.device)).to(torch.float64)
+
+
 def accum_dtype(device: torch.device) -> torch.dtype:
     """Return the dtype for reduction accumulators (sum-of-squares, R², RSS).
 

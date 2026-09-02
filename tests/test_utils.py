@@ -392,5 +392,38 @@ class TestSaveR2CeilingStack:
             )
 
 
+class TestToFactorF64:
+    """to_factor_f64 sends small float64 factorizations to the CPU."""
+
+    def test_cpu_tensor_is_promoted_in_place(self):
+        from fastfuncstuff.utils import to_factor_f64
+
+        x = torch.eye(4, dtype=torch.float32)
+        out = to_factor_f64(x)
+        assert out.dtype is torch.float64
+        assert out.device.type == "cpu"
+
+    def test_cuda_tensor_lands_on_the_cpu(self):
+        """The whole point: a consumer card runs float64 at 1/64 rate."""
+        from fastfuncstuff.utils import factor_device
+
+        assert factor_device(torch.device("cuda")).type == "cpu"
+        assert factor_device(torch.device("cpu")).type == "cpu"
+
+
+class TestSymmetricDecorrelation:
+    """The FastICA whitening step must not change device or dtype."""
+
+    def test_returns_orthonormal_rows_on_the_input_device(self):
+        from fastfuncstuff.decomposition.ica import FastICA
+
+        torch.manual_seed(0)
+        w = torch.randn(6, 6, dtype=torch.float32)
+        out = FastICA._symmetric_decorrelation(w)
+        assert out.dtype is w.dtype
+        assert out.device == w.device
+        assert torch.allclose(out @ out.T, torch.eye(6), atol=1e-5)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

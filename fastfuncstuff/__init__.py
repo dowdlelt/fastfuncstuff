@@ -170,6 +170,7 @@ _LAZY: dict[str, tuple[str, str]] = {
     "simulate_fmri_experiment": ("fastfuncstuff.simulation.core", "simulate_fmri_experiment"),
     "simulate_fmri_run": ("fastfuncstuff.simulation.core", "simulate_fmri_run"),
     "slice_glm_results": ("fastfuncstuff.glm.outputs", "slice_glm_results"),
+    "to_factor_f64": ("fastfuncstuff.utils", "to_factor_f64"),
     "to_linalg_f64": ("fastfuncstuff.utils", "to_linalg_f64"),
     "to_tensor": ("fastfuncstuff.utils", "to_tensor"),
     "write_afni_bucket": ("fastfuncstuff.glm.outputs", "write_afni_bucket"),
@@ -324,6 +325,7 @@ if TYPE_CHECKING:  # type checkers and IDEs want the real bindings
         get_device,
         linalg_device,
         print_device_info,
+        to_factor_f64,
         to_linalg_f64,
         to_tensor,
     )
@@ -451,6 +453,7 @@ __all__ = [
     "get_device",
     "linalg_device",
     "print_device_info",
+    "to_factor_f64",
     "to_linalg_f64",
     "to_tensor",
     # Visualization
