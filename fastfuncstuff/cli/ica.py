@@ -491,6 +491,34 @@ def _run_single_ica(
         capture_ppca_trace=bool(args.ppca_debug_dump) or getattr(args, "trace", None) is not None,
     )
 
+    # Opt-in: replace the spectral count with a restart-stability count. Kept off by
+    # default because it overcounts -- see -help and decomposition/stability.py.
+    if getattr(args, "stability_order", False):
+        from fastfuncstuff.decomposition.stability import stability_model_order
+
+        _vsection(args.verb >= 1, "Stability-based model order")
+        t_step = time.time()
+        k_ceiling = int(pca_diag.get("mp_signal_count") or n_components)
+        k_ceiling = max(2, min(k_ceiling, int(max_auto_k)))
+        st = stability_model_order(
+            data_for_model_order.T,
+            k_max=k_ceiling,
+            n_runs=int(args.stability_runs),
+            min_stability=float(args.icasso_min_stability),
+            device=device,
+            base_seed=int(getattr(args, "seed", 0) or 0),
+            verbose=args.verb >= 2,
+        )
+        _vprint(
+            args.verb >= 1,
+            f"Stability order: k={st.k} of k_max={st.k_max} "
+            f"(Iq >= {st.min_stability}, {st.n_runs} restarts); "
+            f"spectral estimate was {n_components}",
+            t_step,
+        )
+        num_diag = {**num_diag, "stability_order": st.as_dict(), "spectral_k": int(n_components)}
+        n_components = int(st.k)
+
     ppca_debug_file = None
     if args.ppca_debug_dump and "ppca_trace" in pca_diag:
         ppca_base = Path(args.ppca_debug_dump)
@@ -1761,6 +1789,47 @@ def _run_concat_ica(
         f"Selected {order} components (mode={num_diag.get('mode', '?')})",
         t_step,
     )
+
+    # Opt-in: how many of those components survive an independent decomposition of half
+    # the runs? Reported, never used to change `order` -- it is evidence about the count
+    # you chose, and overwriting the count with it would remove the check.
+    if getattr(args, "split_half", False):
+        if len(run_lengths) < 2:
+            print("  ⚠ -split_half needs at least 2 runs; skipping.")
+        else:
+            from fastfuncstuff.decomposition.stability import split_half_reproducibility
+
+            _vsection(args.verb >= 1, "Split-half reproducibility")
+            t_sh = time.time()
+            _off = 0
+            _run_mats = []
+            for _rl in run_lengths:
+                _run_mats.append(data_tv[_off : _off + _rl].cpu().numpy())
+                _off += _rl
+            rep = split_half_reproducibility(
+                _run_mats,
+                n_components=order,
+                threshold=float(args.split_half_thresh),
+                n_splits=int(args.split_half_splits),
+                device=device,
+                base_seed=int(getattr(args, "seed", 0) or 0),
+                verbose=args.verb >= 2,
+            )
+            del _run_mats
+            _vprint(
+                args.verb >= 1,
+                f"Split-half: {rep.n_reproducible}/{order} components reproduce at "
+                f"|r| >= {rep.threshold} "
+                f"(median matched |r| = {float(np.median(rep.matched_r)):.3f})",
+                t_sh,
+            )
+            if rep.n_reproducible < 0.5 * order:
+                print(
+                    f"  ⚠ under half the components reproduce across runs; "
+                    f"{order} is likely too many."
+                )
+            num_diag = {**num_diag, "split_half": rep.as_dict()}
+
     del data_for_model_order_vt
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -3526,6 +3595,46 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional batch size for ICASSO similarity matrix",
+    )
+    ica_opts.add_argument(
+        "-stability_order",
+        action="store_true",
+        help="Choose the component count by restart-cluster stability rather than the "
+        "eigenspectrum: run -stability_runs restarts at the Marchenko-Pastur ceiling and "
+        "keep the clusters reaching -icasso_min_stability.  NOT RECOMMENDED as an "
+        "estimator: restart stability varies the initialisation but never the data, so "
+        "noise directions come back as stable as real ones and this overcounts "
+        "(measured 11 on rank-6 data).  Use -split_half for a count; this flag is here "
+        "for the Iq curve, which is a real convergence diagnostic.",
+    )
+    ica_opts.add_argument(
+        "-stability_runs",
+        type=int,
+        default=30,
+        help="Restarts for -stability_order.",
+    )
+    ica_opts.add_argument(
+        "-split_half",
+        action="store_true",
+        help="Report how many components reproduce across two disjoint halves of the "
+        "input runs: decompose each half independently, match components one-to-one by "
+        "|correlation|, and count the matches clearing -split_half_thresh.  This measures "
+        "whether a component is a property of the data rather than of the fit, which "
+        "restart stability cannot.  Reported only, never used to change the count.  "
+        "Needs >= 2 runs and costs two extra decompositions per split.",
+    )
+    ica_opts.add_argument(
+        "-split_half_thresh",
+        type=float,
+        default=0.5,
+        help="Minimum |r| for a matched component pair to count as reproducible.",
+    )
+    ica_opts.add_argument(
+        "-split_half_splits",
+        type=int,
+        default=1,
+        help="Number of random half-partitions to average over; >1 helps when the run "
+        "count is small and one partition can be unlucky.",
     )
 
     task = parser.add_argument_group("Task annotation (optional)")
