@@ -7170,6 +7170,44 @@ def warp_pc_reconstruct(components, keep, n_pcs=None, device=None):
     return warp_reconstruct(u, loadings, means, keep)
 
 
+def warp_pc_axis_bases(components, n_pcs=5, device=None):
+    """One temporal PC basis PER encode axis — the alternative to the shared basis.
+
+    :func:`warp_pc_basis` fits one basis to the two axes' fields concatenated. That is
+    right when the axes are driven by the same events, and its cost is measured per run
+    by :func:`_axis_balance`. This is the other option, for when that cost is real.
+
+    The cost is largest exactly where it is least obvious: at SMALL k. With enough
+    components a shared basis is barely a constraint, because a mode living on one axis
+    simply gets a near-zero loading on the other. But a nuisance-regressor request is
+    typically k=5, and there the shared basis has to spend five components on the UNION
+    of two processes, where a per-axis basis spends five on each. Nothing about the
+    algebra changes; what changes is whether the budget is big enough for sharing to be
+    free.
+
+    Returns ``[(axis, scores (T,k), var_ratio (k,))]``, scores normalised to unit
+    variance for direct use as .1D regressors, or ``[]`` if the warp is empty. Note the
+    regressor count doubles, which is real GLM degrees of freedom -- the comparison to
+    make is against the SAME total budget, not against five shared.
+    """
+    built = _warp_matrix(components, device=device)
+    if built is None:
+        return []
+    _x, _mean, xc, _shapes, axes, widths = built
+    out, start = [], 0
+    n_t = xc.shape[0]
+    for axis, w in zip(axes, widths, strict=True):
+        blk = xc[:, start : start + w]
+        u, sv, _ = torch.linalg.svd(blk, full_matrices=False)
+        k = max(1, min(int(n_pcs), n_t - 1, w, sv.numel()))
+        sc = u[:, :k]
+        sc = sc / sc.std(dim=0, keepdim=True).clamp(min=1e-10)
+        var = (sv[:k] ** 2) / (sv**2).sum().clamp(min=1e-30)
+        out.append((axis, sc.cpu().float(), var.cpu().float()))
+        start += w
+    return out
+
+
 def warp_time_pcs(
     components: list[tuple[int, torch.Tensor]],
     n_pcs: int = 5,

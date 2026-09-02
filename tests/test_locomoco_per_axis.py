@@ -263,3 +263,49 @@ def test_axis_balance_reports_the_louder_axis_dominating_the_shared_basis():
     loud_cost = float(loud["solo_ev"][-1] - loud["shared_ev"][-1])
     quiet_cost = float(quiet["solo_ev"][-1] - quiet["shared_ev"][-1])
     assert quiet_cost > loud_cost
+
+
+def test_per_axis_bases_beat_the_shared_one_on_their_own_axis_at_small_k():
+    """The cost of sharing is a small-k effect, which is the k a regressor request uses.
+
+    With two axes carrying largely separate temporal structure, a shared k-component
+    basis has to spend k on their union while a per-axis basis spends k on each. This
+    pins the direction; the CLI reports the size per run.
+    """
+    from fastfuncstuff.processing.locomoco import warp_pc_axis_bases, warp_pc_basis
+
+    # Two axes driven by DIFFERENT modes, so sharing genuinely costs something.
+    n_t, shape = 40, (5, 5, 3)
+    g = torch.Generator().manual_seed(7)
+    t = torch.linspace(0, 6.28, n_t)
+    f1 = torch.randn(*shape, 1, generator=g) * torch.sin(t)
+    f2 = torch.randn(*shape, 1, generator=g) * torch.cos(3 * t)
+    comps = [
+        (1, f1 + 0.05 * torch.randn(*shape, n_t, generator=g)),
+        (2, f2 + 0.05 * torch.randn(*shape, n_t, generator=g)),
+    ]
+
+    _u, _l, _m, _v, bal = warp_pc_basis(comps, n_pcs=1, with_balance=True)
+    solo = warp_pc_axis_bases(comps, n_pcs=1)
+    assert len(solo) == 2
+    # At k=1 the single shared component can only be one of the two modes, so the axis
+    # it did NOT land on is left almost entirely unexplained while its own basis would
+    # have described it completely. That asymmetry is the whole point of reporting the
+    # cost PER AXIS: a pooled explained-variance number hides which axis is paying.
+    costs = sorted(float(b["solo_ev"][0]) - float(b["shared_ev"][0]) for b in bal)
+    assert costs[0] < 0.05, costs  # the axis the component landed on pays nothing
+    assert costs[1] > 0.5, costs  # the other one pays nearly everything
+    for _ax, _scores, var in solo:
+        assert float(var[0]) > 0.9  # each axis IS rank-1 on its own
+
+
+def test_per_axis_bases_return_unit_variance_scores_per_axis():
+    from fastfuncstuff.processing.locomoco import warp_pc_axis_bases
+
+    out = warp_pc_axis_bases(_two_axis_warp(), n_pcs=3)
+    assert [ax for ax, _, _ in out] == [1, 2]
+    for _ax, scores, var in out:
+        assert scores.shape[1] == 3
+        assert torch.allclose(scores.std(dim=0), torch.ones(3), atol=1e-4)
+        assert torch.all(var.diff() <= 1e-6)  # variance-ordered
+    assert warp_pc_axis_bases([(1, torch.zeros(3, 3, 2, 10))], n_pcs=3) == []

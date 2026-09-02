@@ -1519,7 +1519,26 @@ def create_parser() -> argparse.ArgumentParser:
         help="Also save the top-N temporal PCs of the warp as {prefix}_locomoco_pcs.1D — "
         "structured residual-motion regressors that are strong denoising nuisances (the "
         "same thing ffs_util_pcwarp extracts post-hoc, here in-line). Bare flag = 5 PCs; "
-        "give a number for more/fewer. Default: off.",
+        "give a number for more/fewer. Default: off.\n"
+        "On a two-axis run this is ONE basis fitted to both encode axes' fields "
+        "concatenated, and the per-axis accounting is printed with it: what share of "
+        "the warp's variance each axis holds, how much of each axis the shared basis "
+        "explains, and what an axis-only basis would explain. The difference is the "
+        "price of sharing at the N you asked for — which is where it matters, since a "
+        "shared basis has to spend N components on the UNION of the two fields.",
+    )
+    out.add_argument(
+        "-pcs_per_axis",
+        "-pcs-per-axis",
+        action="store_true",
+        help="Fit -want_pcs SEPARATELY per encode axis: {prefix}_locomoco_pcs_pe1.1D "
+        "and _pe2.1D, N components each, instead of one shared {prefix}_locomoco_pcs.1D. "
+        "Right when the two fields are driven by different things — the primary PE "
+        "field is smooth and largely respiratory, the partition field is local and "
+        "patchy — and the shared basis is measurably spending its budget on their "
+        "union. Read the balance lines the shared run prints before reaching for this: "
+        "it DOUBLES the regressor count, which is real GLM degrees of freedom, so the "
+        "honest comparison is against the same total budget (2N shared vs N+N).",
     )
     out.add_argument(
         "-save_mean",
@@ -2652,6 +2671,7 @@ def _warp_recon_stage(result, data, args, resp, mask, device, design=None, polor
         )
     k = basis.shape[1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+    _print_component_axis_share(loadings, label_of, method)
 
     # ── the TEMPORAL criterion, scored once on the SHARED basis ──────────────────
     # The time courses are shared across encode axes, so this is one test per
@@ -2994,6 +3014,64 @@ def _me_task_stage(result, datas, echo_mean, stem, ext, affine, args, tr, device
     return result
 
 
+def _print_component_axis_share(loadings, label_of, method) -> None:
+    """How many components are single-axis, when the decomposition ran on both at once.
+
+    The decomposition sees the two encode axes' fields side by side in one matrix, so
+    every component gets a loading on BOTH — but a component that is really a PE1 mode
+    just takes a near-zero loading on PE2, and vice versa. This counts which is which:
+    the share of a component's loading energy that sits on its dominant axis.
+
+    It matters more for ICA than for PCA. FastICA whitens on a PCA reduction of the
+    POOLED matrix, so ``pca_components`` is a fraction of the POOLED variance: when one
+    axis holds most of it, the cut can keep almost none of the other axis's own
+    subspace, and ICA then hunts for independent sources in a space that barely contains
+    it. A run where nearly every component is single-axis, or where one axis owns them
+    all, is the shape that finding would take. The per-axis explained variance printed
+    by -want_pcs / -write_pc_maps says whether the quiet axis survives that cut.
+    """
+    if len(loadings) < 2:
+        return
+    import torch
+
+    energy = torch.stack(
+        [load.reshape(-1, load.shape[-1]).pow(2).sum(dim=0) for _ax, load in loadings]
+    )  # (n_axes, k)
+    share = energy / energy.sum(dim=0, keepdim=True).clamp(min=1e-30)
+    dom_share, dom_axis = share.max(dim=0)
+    names = [label_of.get(ax, f"axis{ax}") for ax, _ in loadings]
+    single = int((dom_share > 0.9).sum())
+    owned = "  ".join(f"{names[i]} {int((dom_axis == i).sum())}" for i in range(len(loadings)))
+    print(
+        f"  {method.upper()} components by axis: {owned} (of {share.shape[1]}); "
+        f"{single} are >90% one axis"
+    )
+
+
+def _print_pc_balance(balance, label_of, k, indent="  ") -> None:
+    """Is one shared temporal basis serving both encode axes, or only the louder one?
+
+    The SVD sees an UNWEIGHTED concatenation, so the axis with more variance sets the
+    basis — and per-axis tuning changes which axis that is. Reported at the k actually
+    requested, because that is where sharing is or is not free: with a large budget a
+    mode that lives on one axis just takes a near-zero loading on the other, but a
+    5-component regressor request spends five on the UNION of two processes where a
+    per-axis basis would spend five on each.
+    """
+    if len(balance) < 2:
+        return
+    total = sum(b["energy"] for b in balance) or 1.0
+    for b in balance:
+        lbl = label_of.get(b["axis"], f"axis{b['axis']}")
+        i = min(k, len(b["shared_ev"])) - 1
+        sh, so = float(b["shared_ev"][i]), float(b["solo_ev"][i])
+        print(
+            f"{indent}{lbl}: {100 * b['energy'] / total:.0f}% of the warp's variance; "
+            f"the shared {i + 1}-PC basis explains {sh:.3f} of it "
+            f"({lbl}-only basis {so:.3f}, so sharing costs {so - sh:.3f})"
+        )
+
+
 def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
     """Write the warp PCs' SPATIAL loadings, one 4-D file per encode axis.
 
@@ -3025,19 +3103,7 @@ def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
     k = loadings[0][1].shape[-1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
 
-    # Is one shared temporal basis serving both axes, or only the louder one? The
-    # concatenation the SVD sees is unweighted, so the axis with more variance sets the
-    # basis -- and per-axis tuning changes which axis that is. One line per axis.
-    if len(balance) > 1:
-        tot_energy = sum(b["energy"] for b in balance) or 1.0
-        for b in balance:
-            lbl = label_of.get(b["axis"], f"axis{b['axis']}")
-            sh, so = float(b["shared_ev"][k - 1]), float(b["solo_ev"][k - 1])
-            print(
-                f"  {lbl}: {100 * b['energy'] / tot_energy:.0f}% of the warp's variance; "
-                f"the shared {k}-PC basis explains {sh:.3f} of it "
-                f"(a {lbl}-only basis: {so:.3f}, so sharing costs {so - sh:.3f})"
-            )
+    _print_pc_balance(balance, label_of, k)
 
     scored = resp is not None and mask is not None
     rows = []
@@ -3348,31 +3414,85 @@ def _write_xcorr_diagnostics(result, stem, ext, affine, args) -> None:
             print("  • -save_corr_curve: no landscape — needs -backend xcorr.")
 
 
-def _write_warp_pcs(components, stem, n_pcs) -> None:
-    """Write the top-N temporal warp PCs as {stem}_locomoco_pcs.1D — shared by both paths.
+def _write_pc_1d(path, scores, var, title, labels) -> str:
+    """One .1D of unit-variance PC regressors, with a labelled column header."""
+    var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
+    with open(path, "w") as f:
+        f.write(f"# ffs_locomoco {title} — {scores.shape[1]} PCs, unit variance\n")
+        f.write(f"# Variance explained: {var_pct}\n")
+        f.write("# " + "  ".join(f"{lb:>9s}" for lb in labels) + "\n")
+        for row in scores.numpy():
+            f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
+    return var_pct
+
+
+def _pc_axis_labels(result, args):
+    """``{nifti_axis: 'pe1'}`` for whichever encode axes this run actually solved."""
+    try:
+        return {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+    except (AttributeError, TypeError):
+        return {}
+
+
+def _write_warp_pcs(components, stem, n_pcs, *, per_axis=False, label_of=None) -> None:
+    """Write the top-N temporal warp PCs as {stem}_locomoco_pcs*.1D.
 
     Recomputed from the in-memory warp, so it is independent of -no_warp (the warp need
     not be written to disk to extract its denoising regressors). ``components`` is the
     ``[(nifti_axis, disp)]`` list — from ``result.warp_components()`` for a single echo,
     or ``[(pe_axis, w_field)]`` for the shared multi-echo field (every echo's warp is a
     scalar multiple of it, so they share these temporal PCs).
+
+    Default is ONE basis over the axes concatenated, with the per-axis accounting
+    printed alongside it: the shared basis is only free if it is actually serving both
+    axes, and at the k a regressor request uses (5, typically) that is not guaranteed.
+    ``per_axis`` writes a separate basis per encode axis instead — twice the regressors,
+    so compare at equal total budget.
     """
     from fastfuncstuff.cli_utils import spinner
-    from fastfuncstuff.processing.locomoco import warp_time_pcs
+    from fastfuncstuff.processing.locomoco import warp_pc_axis_bases, warp_pc_basis
+
+    label_of = label_of or {}
+
+    def _name(axis):
+        return label_of.get(axis, f"axis{axis}")
+
+    if per_axis:
+        with spinner("Computing warp PCs (per axis)"):
+            bases = warp_pc_axis_bases(components, n_pcs=n_pcs, device=None)
+        if not bases:
+            print("  • warp PCs: skipped (warp is all-zero)")
+            return
+        for axis, scores, var in bases:
+            lbl = _name(axis)
+            k = scores.shape[1]
+            vp = _write_pc_1d(
+                f"{stem}_locomoco_pcs_{lbl}.1D",
+                scores,
+                var,
+                f"warp temporal PCs, {lbl} only",
+                [f"{lbl}_PC{i:02d}" for i in range(k)],
+            )
+            print(f"    warp PCs [{lbl}]: {k} components, var {vp}")
+        return
 
     with spinner("Computing warp PCs"):
-        scores, var = warp_time_pcs(components, n_pcs=n_pcs, device=None)
-    if scores is None or var is None:
+        got = warp_pc_basis(components, n_pcs=n_pcs, device=None, with_balance=True)
+    if got is None:
         print("  • warp PCs: skipped (warp is all-zero)")
         return
-    pcs_path = f"{stem}_locomoco_pcs.1D"
-    var_pct = " ".join(f"{v * 100:.2f}%" for v in var.tolist())
-    with open(pcs_path, "w") as f:
-        f.write(f"# ffs_locomoco warp temporal PCs — {scores.shape[1]} PCs, unit variance\n")
-        f.write(f"# Variance explained: {var_pct}\n")
-        for row in scores.numpy():
-            f.write("  ".join(f"{v: .6f}" for v in row) + "\n")
-    print(f"    warp PCs: {scores.shape[1]} components, var {var_pct}")
+    u, _loadings, _means, var, balance = got
+    scores = (u / u.std(dim=0, keepdim=True).clamp(min=1e-10)).float()
+    k = scores.shape[1]
+    vp = _write_pc_1d(
+        f"{stem}_locomoco_pcs.1D",
+        scores,
+        var,
+        "warp temporal PCs (shared across encode axes)",
+        [f"PC{i:02d}" for i in range(k)],
+    )
+    print(f"    warp PCs: {k} components, var {vp}")
+    _print_pc_balance(balance, label_of, k, indent="    ")
 
 
 def _neg_clip(arr: np.ndarray, allow_neg: bool) -> np.ndarray:
@@ -4162,9 +4282,19 @@ def _run_multiecho(
             f.write(f"  {te_v:10.4f}  {a_v:12.6f}\n")
 
     if args.want_pcs is not None:
-        # PCs of the SHARED field w: every echo's warp is alpha_e·w, so they all share
-        # these temporal regressors. In memory regardless of -no_warp.
-        _write_warp_pcs([(result.pe_axis, result.w_field)], stem, args.want_pcs)
+        # PCs of the SHARED fields: every echo's warp is alpha_e·(shared field), so all
+        # echoes share these temporal regressors. Taken from echo 1, whose alpha is 1 on
+        # BOTH axes -- so its per-echo fields ARE the shared ones, and a two-axis run
+        # contributes both. Passing w_field alone, as this did, silently dropped the
+        # primary-PE field from a dual multi-echo run's regressors. In memory regardless
+        # of -no_warp.
+        _write_warp_pcs(
+            [(ax, f) for _, ax, f in result.per_echo[0].pe_displacements()],
+            stem,
+            args.want_pcs,
+            per_axis=args.pcs_per_axis,
+            label_of=_pc_axis_labels(result.per_echo[0], args),
+        )
 
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
@@ -4879,7 +5009,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             )
 
     if args.want_pcs is not None:
-        _write_warp_pcs(result.warp_components(), stem, args.want_pcs)
+        _write_warp_pcs(
+            result.warp_components(),
+            stem,
+            args.want_pcs,
+            per_axis=args.pcs_per_axis,
+            label_of=_pc_axis_labels(result, args),
+        )
 
     # One materialization for every consumer below. On the estimator paths that
     # hold the series in canonical axis order, corrected_series() is a permute +
