@@ -283,7 +283,7 @@ def _aggregate_rows(
     totals: dict[tuple[Any, ...], dict[str, Any]] = {}
     numeric = (
         ("calls", "primitive_calls", "self_cpu_seconds", "cumulative_cpu_seconds")
-        if section == "python"
+        if section in {"python", "python_io"}
         else ("calls", "self_cpu_seconds", "cpu_seconds", "self_device_seconds", "device_seconds")
     )
     for invocation in invocations:
@@ -293,7 +293,7 @@ def _aggregate_rows(
             for metric in numeric:
                 if metric in row:
                     merged[metric] = merged.get(metric, 0) + row[metric]
-    sort_field = "cumulative_cpu_seconds" if section == "python" else "self_device_seconds"
+    sort_field = "cumulative_cpu_seconds" if section in {"python", "python_io"} else "self_device_seconds"
     fallback = "self_cpu_seconds"
     return sorted(
         totals.values(),
