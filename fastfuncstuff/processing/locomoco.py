@@ -1328,6 +1328,9 @@ class LocomocoResult:
     confidence: torch.Tensor | None = None  # (nx,ny,nz,T) per-voxel peak quality map
     corr_curve: torch.Tensor | None = None  # (nx,ny,nz,nd) per-voxel corr vs offset, one frame
     corr_offsets: torch.Tensor | None = None  # (nd,) trial offsets (voxels) for corr_curve
+    # -save_refine_templates: per refine sweep, {"mean","median","std"} -> (nx,ny,nz).
+    # Index 0 is the UNCORRECTED series, so the list reads as a before/after ladder.
+    refine_templates: list[dict[str, torch.Tensor]] | None = None
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
         inv = [0, 0, 0, 0]
@@ -1921,6 +1924,7 @@ def estimate_residual_flow(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    save_refine_templates: bool = False,
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
@@ -2045,6 +2049,7 @@ def estimate_residual_flow(
             peak_mode=peak_mode,
             search_min_steps=search_min_steps,
             save_corr_curve=save_corr_curve,
+            save_refine_templates=save_refine_templates,
             warp_interp=warp_interp,
             warp_radius=warp_radius,
             hpf_sigma=hpf_sigma,
@@ -3942,6 +3947,29 @@ def _refine_reduce(
     return c.mean(dim=dim)
 
 
+def refine_template_stats(series: torch.Tensor, dim: int = 3) -> dict[str, torch.Tensor]:
+    """``mean`` / ``median`` / ``std`` of a corrected series, collapsed over time.
+
+    The diagnostic behind ``-save_refine_templates``: whether a refine pass is doing real
+    work shows up as a sharper mean and a lower temporal sd, which is a claim you can look
+    at rather than infer from step sizes. Compare the SAME statistic across passes at a
+    fixed intensity scale; the mean sharpening and the sd dropping together is the signature
+    of motion actually coming out, where sd dropping while the mean blurs is the signature of
+    the series being smoothed into agreement with itself.
+
+    The mean or median is usually already being built as the next reference, but all three
+    are computed here regardless: the pass only needs the one ``-ref`` names, and the point
+    of the diagnostic is the comparison between them.
+    """
+    return {
+        "mean": series.mean(dim=dim),
+        "median": series.median(dim=dim).values,
+        # Unbiased (n-1): these are compared ACROSS passes and against the uncorrected
+        # baseline, so a consistent estimator matters more than the cheaper one.
+        "std": series.std(dim=dim, unbiased=True),
+    }
+
+
 def _refine_reduce_label(ref_mode: str) -> str:
     """Human name for what :func:`_refine_reduce` will actually do with ``ref_mode``."""
     if ref_mode in ("median", "first_median"):
@@ -4135,6 +4163,7 @@ def _refine_loop(
     max_shift: float,
     verbose: bool,
     note=None,
+    observe=None,
 ):
     """Outer reference-refinement loop — shared by the 2-D, 3-D and multi-echo paths.
 
@@ -4160,6 +4189,12 @@ def _refine_loop(
     pass's line — the estimator's own diagnostic (for flow, how its inner iterations
     converged). Kept as a callback so this loop stays ignorant of the backend, the way it
     already is about the shape of ``disp``.
+
+    ``observe(corrected)``, if given, is called with the corrected series each pass KEEPS
+    — never with one that was rolled back for diverging, so the saved ladder holds only
+    states that survived. Also a callback, for the same reason as ``note``: the series
+    layout differs between the 2-D, 3-D and multi-echo callers and this loop does not
+    need to know which it has.
     """
     if refine_rounds <= 0:
         return disp, corrected
@@ -4184,6 +4219,8 @@ def _refine_loop(
                 )
             break
         prev = disp
+        if observe is not None:
+            observe(corrected)
         reason = _refine_converged(step, prev_step, converge, converge_rel)
         prev_step = step
         if reason is not None:
@@ -4221,6 +4258,7 @@ def _run_3dacq_plain(
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
+    save_refine_templates: bool = False,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
@@ -4350,6 +4388,11 @@ def _run_3dacq_plain(
     # read back by the line each pass prints. A dict rather than a nonlocal because
     # _estimate is called through _refine_loop, which has no idea this exists.
     conv_note = {"txt": ""}
+    # -save_refine_templates. Index 0 is the RAW series: without a before, "the mean got
+    # sharper" is not a statement anyone can check.
+    templates: list[dict[str, torch.Tensor]] | None = None
+    if save_refine_templates:
+        templates = [refine_template_stats(torch.from_numpy(np.ascontiguousarray(data)))]
 
     def _estimate(ref_vol: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         # One reference, or one per task-state bin. The prep runs per TEMPLATE, not per
@@ -4499,6 +4542,8 @@ def _run_3dacq_plain(
         return paired_templates(vol4d, paired_bins, ref_mode)
 
     disp, corrected = _estimate_gated(_initial_ref())
+    if templates is not None:
+        templates.append(refine_template_stats(corrected))
     if verbose and conv_note["txt"]:
         print(f"   initial estimate:  {conv_note['txt']}")
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
@@ -4529,6 +4574,11 @@ def _run_3dacq_plain(
             max_shift=max(max_shift),
             verbose=verbose,
             note=lambda: conv_note["txt"],
+            observe=(
+                None
+                if templates is None
+                else (lambda c: templates.append(refine_template_stats(c)))
+            ),
         )
 
     # Canonical layout: u carries axis a1, v carries a0. Single-PE fills only the PE
@@ -4602,6 +4652,7 @@ def _run_3dacq_plain(
         # convert to the canonical layout, which is not what gets written out.
         null_field=(disp[len(axes) - 1] if null_axis is not None else None),
         null_axis=null_axis,
+        refine_templates=templates,
         corrected_nifti=corrected,
         confidence=conf_field,
         corr_curve=curve_box["curve"],

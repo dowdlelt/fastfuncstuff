@@ -741,6 +741,21 @@ def create_parser() -> argparse.ArgumentParser:
         " rotation-aware mode.",
     )
     est.add_argument(
+        "-save_refine_templates",
+        action="store_true",
+        help="[diagnostic] Write the mean, median and temporal sd of the series at every "
+        "refine sweep, as {prefix}_reftmpl{N}_{mean,median,std}. N=00 is the UNCORRECTED "
+        "input, N=01 is after the initial estimate, then one per refine pass -- a "
+        "before/after ladder you can flip through.\n"
+        "This is the direct way to see whether a pass did real work, rather than inferring "
+        "it from step sizes: a pass that removed motion sharpens the mean AND drops the sd "
+        "together. An sd that falls while the mean BLURS is the series being smoothed into "
+        "agreement with itself, which is the failure this is worth watching for. Compare "
+        "the same statistic across N at a fixed intensity scale.\n"
+        "Written before -detask and the later field corrections, so it reflects the "
+        "estimator's own passes. Diagnostic only.",
+    )
+    est.add_argument(
         "-inject_jitter",
         type=float,
         nargs="+",
@@ -4872,6 +4887,14 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # Multi-echo: several inputs, one shared field per encode axis, scaled per echo.
     # 2-D multi-slice is the default; -me_3depi / -is_3depi opts into the 3-D solve,
     # exactly as -is_3depi does on the single-echo path.
+    if args.save_refine_templates and not (args.is_3dacq or dual3d):
+        print(
+            "❌ -save_refine_templates is wired for the 3-D solve (-is_3dacq, or two "
+            "encode axes). The 2-D slicewise and multi-echo paths run the same refine "
+            "loop but aggregate their series differently, and the hook is not on them yet.",
+            file=sys.stderr,
+        )
+        return 2
     if me_mode and args.inject_jitter is not None:
         print(
             "❌ -inject_jitter is wired for the single-echo path only. The multi-echo "
@@ -5229,6 +5252,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             peak_mode="argmax" if args.argmax else "first_peak",
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
+            save_refine_templates=args.save_refine_templates,
             hpf_sigma=hpf_sigma,
             match=args.match,
             match_sigma=args.match_sigma,
@@ -5342,6 +5366,26 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         # Without -events there is no active mask, so the maps go out unscored. Looking
         # at them is the point; the score is the optional part.
         _write_pc_maps(result, stem, ext, affine, args, None, None, device)
+
+    refine_tmpls = result.refine_templates
+    if refine_tmpls:
+        for n, stats in enumerate(refine_tmpls):
+            for name, vol in stats.items():
+                tpath = f"{stem}_reftmpl{n:02d}_{name}{ext}"
+                with spinner(f"Writing {Path(tpath).name}"):
+                    save_nifti(vol.numpy(), tpath, affine=affine)
+        # The headline the volumes are there to support, so a sweep that changed nothing is
+        # visible without loading anything. Sharpness is deliberately NOT summarised: any
+        # scalar for it is a proxy nobody agreed on, and looking at the mean is the point
+        # of writing it out.
+        from fastfuncstuff.processing.locomoco import _brain_mask_from
+
+        bmask = _brain_mask_from(torch.from_numpy(np.abs(data).mean(axis=3)))
+        print(f"   {len(refine_tmpls)} refine templates -> {Path(stem).name}_reftmpl*")
+        for n, stats in enumerate(refine_tmpls):
+            tag = "uncorrected" if n == 0 else ("initial" if n == 1 else f"refine {n - 1}")
+            sd = float(stats["std"][bmask].mean())
+            print(f"      {tag:>12}: in-brain temporal sd {sd:.5f}")
 
     if not args.no_warp:
         from fastfuncstuff.processing.medic import save_medic_warp
