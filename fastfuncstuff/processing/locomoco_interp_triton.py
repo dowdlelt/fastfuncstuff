@@ -12,6 +12,12 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from fastfuncstuff.triton_key import install_triton_key_cache
+
+# Triton hashes its whole installation on the first kernel launch of every
+# process (~1s).  Do this before any @triton.jit function can be launched.
+install_triton_key_cache()
+
 
 @triton.jit
 def _lanczos_weight(frac, k: tl.constexpr, RADIUS: tl.constexpr):

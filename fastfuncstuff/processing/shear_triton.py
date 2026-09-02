@@ -19,7 +19,13 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from fastfuncstuff.triton_key import install_triton_key_cache
+
 from .shear import rigid_matrix_to_shears
+
+# Triton hashes its whole installation on the first kernel launch of every
+# process (~1s).  Do this before any @triton.jit function can be launched.
+install_triton_key_cache()
 
 # interp mode ids (match AFNI MRI_* where they exist)
 _MODE_ID = {"linear": 1, "cubic": 2, "quintic": 4, "heptic": 5, "wsinc5": 72}
