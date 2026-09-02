@@ -154,7 +154,7 @@ Every CLI is registered as a console script and accepts `-help`. Flag style foll
 
 | command | description |
 |---|---|
-| `ffs_ica` | MELODIC-style probabilistic ICA (Beckmann & Smith 2004). Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and *(beta)* depth-lag/mask/nuisance component classification (on TODO list for testing). |
+| `ffs_ica` | Probabilistic ICA (Beckmann & Smith 2004). Auto component count, GGM mixture-model thresholding, MIGP for temporal concat, optional ICASSO and *(beta)* depth-lag/mask/nuisance component classification (on TODO list for testing). |
 | `ffs_decompose` | ICA with an emphasis on stability via ICASSO clustering (Himberg et al. 2004). |
 | `ffs_bsds` | Bayesian switching dynamical systems on ROI time series (dynamic brain states; Taghia 2018 / Cai 2024). |
 
@@ -302,7 +302,17 @@ Active, single (agent assisted, more honestly just...agent with human sanity che
 
 ## License
 
-MIT. See `LICENSE`.
+**GPL-2.0-or-later.** See `LICENSE` for the full text and `PROVENANCE.md` for attribution.
+
+`fastfuncstuff` contains code ported from AFNI and SPM, both GPL-2-or-later, so the
+combined work has to be GPL too. It was distributed under MIT until 2026-09-02; that was
+an error, since MIT purports to grant sublicensing rights the GPL-2 code does not permit
+us to grant. Copies already obtained under MIT keep the terms they were received under.
+
+The FSL-adjacent tools — `ffs_ica`, `ffs_blipflip`, `ffs_util_gmm`, `ffs_fitbasis` — are
+implemented **from the published papers only**, with no FSL source used as a reference.
+FSL is not open source, and its non-commercial terms cannot coexist with the GPL in one
+distributed work. `PROVENANCE.md` lists which module follows which paper.
 
 ## References
 
@@ -319,8 +329,13 @@ docstrings in the relevant module:
   Kendrick Kay (http://kendrickkay.net/analyzePRF/, © 2014, CC BY 3.0), which
   `ffs_pyrf` follows for its model, seeding, and parameter conventions. Earlier
   pRF formulation: Dumoulin & Wandell (2008), *NeuroImage*.
-- MELODIC / probabilistic ICA: Beckmann & Smith (2004), *IEEE TMI*.
+- Probabilistic ICA, variance normalisation, and Gaussian-Gamma mixture modelling:
+  Beckmann & Smith (2004), *IEEE TMI* 23(2):137-152.
+- PCA model order: Minka (2000), NIPS 13:598-604; Marchenko & Pastur (1967).
 - MIGP: Smith, Hyvärinen, Varoquaux, Miller & Beckmann (2014), *NeuroImage*.
+- FastICA: Hyvärinen (1999), *IEEE TNN*. ICASSO: Himberg et al. (2004), *NeuroImage*.
+- Blip-up/blip-down distortion correction: Andersson, Skare & Ashburner (2003),
+  *NeuroImage* 20:870-888.
 - NORDIC: Moeller et al. (2021), *NeuroImage*.
 - Phase regression: Menon (2002); Curtis et al. (2014); Stanley et al. (2021);
   Liem (phaseprep, 2023).

@@ -9,7 +9,24 @@ decomposition  PCA, FastICA, ICASSO stability analysis
 simulation     Noise generation, fMRI simulation, design metrics
 io             AFNI format support, NIfTI I/O
 processing     Motion correction, alignment, non-linear warping
-cli            Command-line tools"""
+cli            Command-line tools
+
+Copyright (C) 2026 Logan Dowdle and contributors.
+
+This program is free software; you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation; either version 2 of the License, or (at your option) any later
+version.
+
+This program is distributed in the hope that it will be useful, but WITHOUT ANY
+WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A
+PARTICULAR PURPOSE.  See the GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License along with
+this program; if not, see <https://www.gnu.org/licenses/>.
+
+Portions are derived from AFNI and SPM, both GPL-2-or-later; see PROVENANCE.md
+for the full attribution."""
 
 from __future__ import annotations
 
