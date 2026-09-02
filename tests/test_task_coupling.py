@@ -1507,3 +1507,32 @@ def test_psc_betas_are_scale_free():
         tc = task_coupling(series, x, polort=1, mask=mask)
         out.append(float(_psc_betas(tc, x.numpy(), series.mean(dim=3), mask)[0, 0, 0, 0]))
     assert abs(out[0] - out[1]) < 1e-3
+
+
+def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
+    """AFNI bucket order: view sub-brick 2k, threshold on 2k+1."""
+    from fastfuncstuff.cli.locomoco import _save_task_fit
+    from fastfuncstuff.io.afni import read_brick_labels, read_brick_stataux
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    n_t = 80
+    x = torch.stack([_block_design(n_t)[:, 0], _block_design(n_t, block=20)[:, 0]], dim=1)
+    shape = (3, 3, 2)
+    series = torch.full((*shape, n_t), 500.0)
+    series[0, 0, 0] = 500.0 * (1.0 + 0.04 * x[:, 0] + 0.02 * x[:, 1])
+    labels = ["faces", "houses"]
+    tc = task_coupling(series, x, polort=1, mask=torch.ones(shape), labels=labels)
+    psc = torch.zeros(*shape, 2)
+
+    out = tmp_path / "fit.nii.gz"
+    _save_task_fit(str(out), tc, psc, labels, np.eye(4), 1, n_t)
+
+    import nibabel as nib
+
+    img = nib.load(out)
+    assert read_brick_labels(img) == ["faces_Coef", "faces_Correl", "houses_Coef", "houses_Correl"]
+    aux = read_brick_stataux(img)
+    # Only the odd sub-bricks are statistics; the betas must stay untagged.
+    assert set(aux) == {1, 3}
+    for code, params in aux.values():
+        assert code == 2 and tuple(params) == (n_t, 1.0, 2.0)
