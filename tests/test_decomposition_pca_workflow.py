@@ -9,7 +9,7 @@ import torch
 from fastfuncstuff.decomposition.pca import PCA, explained_variance_analysis
 from fastfuncstuff.decomposition.workflow import (
     apply_melodic_noise_normalization,
-    filter_voxels_for_melodic_model_order,
+    filter_low_variance_voxels,
 )
 
 DEVICE = torch.device("cpu")
@@ -289,7 +289,7 @@ class TestExplainedVarianceAnalysis:
 
 
 # ---------------------------------------------------------------------------
-# workflow: filter_voxels_for_melodic_model_order (lines 195-221)
+# workflow: filter_low_variance_voxels (lines 195-221)
 # ---------------------------------------------------------------------------
 
 
@@ -298,7 +298,7 @@ class TestFilterVoxelsForMelodicModelOrder:
         # Normal voxels + some low-variance voxels
         data = torch.randn(50, 30)
         data[:5, :] *= 1e-8  # very low variance
-        filtered, info = filter_voxels_for_melodic_model_order(data)
+        filtered, info = filter_low_variance_voxels(data)
         assert info["voxels_in"] == 50
         assert info["voxels_dropped"] >= 0
         assert filtered.shape[1] == 30
@@ -307,21 +307,21 @@ class TestFilterVoxelsForMelodicModelOrder:
     def test_degenerate_1d_input(self):
         """1D input (ndim!=2) returns as-is."""
         data = torch.randn(10)
-        filtered, info = filter_voxels_for_melodic_model_order(data)
+        filtered, info = filter_low_variance_voxels(data)
         assert torch.equal(filtered, data)
         assert info["voxels_dropped"] == 0
 
     def test_single_row(self):
         """Single row (shape[0]<2) returns as-is."""
         data = torch.randn(1, 20)
-        filtered, info = filter_voxels_for_melodic_model_order(data)
+        filtered, info = filter_low_variance_voxels(data)
         assert torch.equal(filtered, data)
         assert info["voxels_kept"] == 1
 
     def test_all_same_variance(self):
         """When all voxels have equal variance, none should be dropped."""
         data = torch.randn(20, 30)
-        filtered, info = filter_voxels_for_melodic_model_order(data)
+        filtered, info = filter_low_variance_voxels(data)
         # All roughly same std, so threshold should keep most
         assert info["voxels_dropped"] <= 5  # generous bound
 
@@ -330,7 +330,7 @@ class TestFilterVoxelsForMelodicModelOrder:
         # All constant except one outlier -- threshold logic may try to drop all
         data = torch.zeros(10, 20)
         data[0, :] = 100.0  # one big outlier makes others drop
-        filtered, info = filter_voxels_for_melodic_model_order(data)
+        filtered, info = filter_low_variance_voxels(data)
         # Should not return empty
         assert filtered.shape[0] >= 1
 

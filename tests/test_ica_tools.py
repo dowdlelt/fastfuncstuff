@@ -16,12 +16,12 @@ import torch
 
 from fastfuncstuff.decomposition.tools import (
     apply_high_pass_fft,
-    apply_melodic_voxel_varnorm,
     apply_polort_projection,
     effective_rank_from_spectrum,
     mp_spikes_from_spectrum,
     parse_num_comps_spec,
 )
+from fastfuncstuff.decomposition.varnorm import variance_normalize
 
 
 class TestParseNumCompsSpec:
@@ -251,7 +251,7 @@ class TestApplyMelodicVoxelVarNorm:
         scales = torch.linspace(0.5, 5.0, n_vox, device=device)
         data = data * scales.unsqueeze(1)
 
-        result, n_const = apply_melodic_voxel_varnorm(data)
+        result, n_const = variance_normalize(data)
 
         # Result shape should match input
         assert result.shape == data.shape
@@ -274,7 +274,7 @@ class TestApplyMelodicVoxelVarNorm:
         # Make one voxel constant
         data[2, :] = 1.0
 
-        result, n_const = apply_melodic_voxel_varnorm(data)
+        result, n_const = variance_normalize(data)
 
         # Should report at least one constant voxel
         assert n_const >= 1
@@ -287,14 +287,14 @@ class TestApplyMelodicVoxelVarNorm:
         n_time = 50
         data = torch.randn(n_vox, n_time, device=device)
 
-        result, _ = apply_melodic_voxel_varnorm(data)
+        result, _ = variance_normalize(data)
 
         assert result.shape == data.shape
 
     def test_device_consistency(self, device):
         """Test that result is on correct device."""
         data = torch.randn(5, 50, device=device)
-        result, _ = apply_melodic_voxel_varnorm(data)
+        result, _ = variance_normalize(data)
         assert result.device == device
 
 

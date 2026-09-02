@@ -616,8 +616,8 @@ def bytes_per_voxel_ica_varnorm(
     """
     Estimate memory per voxel for ICA variance normalization chunked ops.
 
-    The MELODIC varnorm step computes residual = x_t - dewhite @ ws per voxel,
-    then takes std.  When chunked, the peak per-voxel cost is:
+    The varnorm step forms the residual of a low-rank fit per voxel and takes its
+    std (see decomposition/varnorm.py).  When chunked, the peak per-voxel cost is:
       - reconstruction column (T floats)
       - residual column       (T floats)
 

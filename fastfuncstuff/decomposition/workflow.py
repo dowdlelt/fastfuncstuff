@@ -15,7 +15,8 @@ from scipy.stats import spearmanr
 from tqdm.auto import tqdm
 
 from . import postprocess as ica_postprocess
-from .tools import apply_high_pass_fft, apply_melodic_voxel_varnorm, apply_polort_projection
+from .tools import apply_high_pass_fft, apply_polort_projection
+from .varnorm import variance_normalize
 
 
 def verbose_section(verbose: bool, name: str) -> None:
@@ -161,17 +162,17 @@ def apply_voxel_variance_normalization(
     n_vox_masked: int,
     trace_dir: Path | None = None,
 ) -> tuple[torch.Tensor, str]:
-    """Apply voxel variance normalization with MELODIC-compatible path when requested."""
-    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
-        pca_dim = min(30, max(1, n_t - 1))
-        data_vox_t, n_const = apply_melodic_voxel_varnorm(
-            data_vox_t=data_vox_t,
-            pca_dim=pca_dim,
-            level=2.3,
-        )
+    """Apply voxel variance normalisation; residual-noise path for automatic model order.
+
+    Automatic model order reads the eigenspectrum, so the scale each voxel is put on
+    directly determines the answer -- hence the residual-noise estimate there rather than
+    the cheaper total-stdev divide. See :mod:`fastfuncstuff.decomposition.varnorm`.
+    """
+    if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
+        data_vox_t, n_const = variance_normalize(data_vox_t)
         norm_msg = (
-            f"Voxel-norm: MELODIC residual varnorm over {n_vox_masked:,} voxels "
-            f"(level=2.3, pca_dim={pca_dim}, {n_const} constant voxels zeroed)"
+            f"Voxel-norm: residual-noise varnorm over {n_vox_masked:,} voxels "
+            f"({n_const} constant voxels zeroed)"
         )
         if trace_dir is not None:
             import numpy as _np
@@ -201,7 +202,7 @@ def apply_voxel_variance_normalization(
 
 
 @torch.inference_mode()
-def filter_voxels_for_melodic_model_order(
+def filter_low_variance_voxels(
     data_vox_t: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
     """Apply FSL-style variability thresholding before MELODIC PPCA dim estimation.
@@ -220,8 +221,11 @@ def filter_voxels_for_melodic_model_order(
             "std_std": 0.0,
         }
 
-    # Match FSL melhlprfns.cc update_mask threshold:
-    # keep if std > max(mean(std)-3*std(std), 0.01*mean(std)).
+    # Drop near-flat voxels before model-order estimation: they contribute no signal but
+    # do distort the low end of the eigenspectrum, which is exactly what the Laplace
+    # evidence reads. The rule is a plain low-outlier test -- keep a voxel whose temporal
+    # stdev is within 3 SDs of the mean stdev -- with an absolute floor at 1% of the mean
+    # so a dataset with a tight stdev distribution does not have the test bite everywhere.
     d_std = torch.std(data_vox_t, dim=1, unbiased=True)
     std_mean = float(d_std.mean().item())
     std_std = float(torch.std(d_std, unbiased=True).item()) if d_std.numel() > 1 else 0.0

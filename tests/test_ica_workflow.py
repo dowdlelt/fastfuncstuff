@@ -150,22 +150,22 @@ class TestApplyVoxelVarianceNormalization:
         assert "legacy path" in msg
         assert result.shape == data.shape
 
-    def test_auto_uses_melodic_path(self):
-        """Test 'auto' triggers MELODIC variance normalization."""
+    def test_auto_uses_residual_noise_path(self):
+        """'auto' takes the residual-noise path, not the cheap total-stdev divide."""
         data = torch.randn(10, 50)
         result, msg = apply_voxel_variance_normalization(
             data, num_spec="auto", n_t=50, n_vox_masked=10
         )
-        assert "MELODIC" in msg
+        assert "residual-noise" in msg
         assert result.shape == data.shape
 
-    def test_melodic_uses_melodic_path(self):
-        """Test 'melodic' triggers MELODIC variance normalization."""
+    def test_laplace_uses_residual_noise_path(self):
+        """'laplace' takes the residual-noise path, since it drives model order."""
         data = torch.randn(10, 50)
         result, msg = apply_voxel_variance_normalization(
-            data, num_spec="melodic", n_t=50, n_vox_masked=10
+            data, num_spec="laplace", n_t=50, n_vox_masked=10
         )
-        assert "MELODIC" in msg
+        assert "residual-noise" in msg
         assert result.shape == data.shape
 
     def test_legacy_path_normalizes_variance(self):

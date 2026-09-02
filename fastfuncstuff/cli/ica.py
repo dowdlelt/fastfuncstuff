@@ -463,8 +463,8 @@ def _run_single_ica(
     data_for_model_order = data_vox_t
     model_order_filter_diag = None
     if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
-        data_for_model_order, model_order_filter_diag = (
-            ica_workflow.filter_voxels_for_melodic_model_order(data_vox_t=data_vox_t)
+        data_for_model_order, model_order_filter_diag = ica_workflow.filter_low_variance_voxels(
+            data_vox_t=data_vox_t
         )
         n_vox_model_order = int(data_for_model_order.shape[0])
         n_eff_for_model_order = effective_sample_size_from_resels(
@@ -1661,18 +1661,12 @@ def _run_concat_ica(
     vn_scope = "none"
     varnorm_std_np: np.ndarray | None = None
     if args.voxel_norm:
-        from fastfuncstuff.decomposition.tools import (
-            apply_varnorm_map,
-            compute_melodic_varnorm_map,
-        )
+        from fastfuncstuff.decomposition.varnorm import apply_noise_std_map, noise_std_map
 
         _vsection(args.verb >= 1, "Variance Normalization (joined on concat)")
         t_step = time.time()
-        pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
-        # compute_melodic_varnorm_map expects (V, T); our data_tv is (T, V) → pass transpose.
-        noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
-            data_tv.T, pca_dim=pca_dim_vn, level=2.3
-        )
+        # noise_std_map expects (V, T); our data_tv is (T, V) → pass transpose.
+        noise_std_v, const_mask_vn, n_const_vn = noise_std_map(data_tv.T)
         # Trace: persist FFS varnorm map BEFORE consuming/freeing it.
         _trace_dir_vn = getattr(args, "trace", None)
         if _trace_dir_vn:
@@ -1680,20 +1674,20 @@ def _run_concat_ica(
 
             _td_vn = _PathVN(_trace_dir_vn)
             _td_vn.mkdir(parents=True, exist_ok=True)
-            np.save(_td_vn / "ffs_noise_std.npy", noise_std_map.cpu().numpy())
+            np.save(_td_vn / "ffs_noise_std.npy", noise_std_v.cpu().numpy())
             np.save(_td_vn / "ffs_const_mask.npy", const_mask_vn.cpu().numpy())
-        data_tv_vt = apply_varnorm_map(data_tv.T, noise_std_map, const_mask_vn)
+        data_tv_vt = apply_noise_std_map(data_tv.T, noise_std_v, const_mask_vn)
         data_tv = data_tv_vt.T.contiguous()
         # Trace: also dump the post-varnorm concat (T,V) for direct comparison
         # to MELODIC's concat_data.nii.gz.
         if _trace_dir_vn:
             np.save(_PathVN(_trace_dir_vn) / "migp_post_varnorm.npy", data_tv.cpu().numpy())
-        # Keep noise_std_map alive for PSC computation (passed to write_melodic_compat_outputs).
-        varnorm_std_np = noise_std_map.cpu().numpy()  # (V,) in data units pre-varnorm
+        # Keep the map alive for PSC computation (passed to write_melodic_compat_outputs).
+        varnorm_std_np = noise_std_v.cpu().numpy()  # (V,) in data units pre-varnorm
         del data_tv_vt, const_mask_vn
         _vprint(
             args.verb >= 1,
-            f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant voxels",
+            f"Joined varnorm: residual-noise, {n_const_vn} constant voxels",
             t_step,
         )
         vn_scope = "joined"
@@ -1733,9 +1727,7 @@ def _run_concat_ica(
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V, T_total)
     if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
-        data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
-            data_vox_t=data_tv.T
-        )
+        data_for_model_order_vt, _ = ica_workflow.filter_low_variance_voxels(data_vox_t=data_tv.T)
         n_vox_model_order = int(data_for_model_order_vt.shape[0])
         n_eff_for_model_order = max(
             int(T_total), effective_sample_size_from_resels(n_vox_model_order, resels)
@@ -2929,23 +2921,17 @@ def _run_tensorial_ica(
     # --- Variance normalization (joined on the full stack) ------------------
     vn_scope = "none"
     if args.voxel_norm:
-        from fastfuncstuff.decomposition.tools import (
-            apply_varnorm_map,
-            compute_melodic_varnorm_map,
-        )
+        from fastfuncstuff.decomposition.varnorm import apply_noise_std_map, noise_std_map
 
         _vsection(args.verb >= 1, "Variance Normalization (joined on spatial concat)")
         t_step = time.time()
-        pca_dim_vn = min(30, max(1, int(data_tv.shape[0]) - 1))
-        noise_std_map, const_mask_vn, n_const_vn = compute_melodic_varnorm_map(
-            data_tv.T, pca_dim=pca_dim_vn, level=2.3
-        )
-        data_tv_vt = apply_varnorm_map(data_tv.T, noise_std_map, const_mask_vn)
+        noise_std_v, const_mask_vn, n_const_vn = noise_std_map(data_tv.T)
+        data_tv_vt = apply_noise_std_map(data_tv.T, noise_std_v, const_mask_vn)
         data_tv = data_tv_vt.T.contiguous()
-        del data_tv_vt, noise_std_map, const_mask_vn
+        del data_tv_vt, noise_std_v, const_mask_vn
         _vprint(
             args.verb >= 1,
-            f"Joined varnorm: pca_dim={pca_dim_vn}, {n_const_vn} constant columns",
+            f"Joined varnorm: {n_const_vn} constant columns",
             t_step,
         )
         vn_scope = "joined"
@@ -2981,9 +2967,7 @@ def _run_tensorial_ica(
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V_total, T)
     if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
-        data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
-            data_vox_t=data_tv.T
-        )
+        data_for_model_order_vt, _ = ica_workflow.filter_low_variance_voxels(data_vox_t=data_tv.T)
         n_vox_model_order = int(data_for_model_order_vt.shape[0])
         n_eff_for_model_order = effective_sample_size_from_resels(
             n_vox_model_order, resels, floor=int(T)
