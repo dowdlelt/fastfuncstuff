@@ -609,9 +609,79 @@ def icasso(
     pca_components_arr = None
     pca_variance_explained = None
 
-    iterator = range(n_runs)
-    if verbose:
-        iterator = tqdm(iterator, desc="ICASSO ICA runs")
+    # ------------------------------------------------------------------
+    # Fast path: shared data across restarts (randinit) means the PCA is bit-identical
+    # every time and the FastICA updates differ only in initialisation. Do the PCA once
+    # and run every restart as one batched fit -- a single fit is launch-bound rather
+    # than compute-bound, so R restarts cost little more than one. Bootstrap modes
+    # resample before the PCA, so they cannot share it and take the loop below.
+    # ------------------------------------------------------------------
+    if mode == "randinit" and ica_method == "fastica":
+        from .ica import FastICA, fastica_multi_restart
+
+        if verbose:
+            how = "batched" if device.type == "cuda" else "sequential"
+            print(f"FastICA: {n_runs} restarts sharing one PCA ({how}) ...")
+
+        base = FastICA(n_components=n_components, pca_components=pca_components, device=device)
+        base.verbose = False  # type: ignore[attr-defined]
+        base.fit(X)
+        assert base.pca_ is not None and base.components_ is not None
+        k_ica = int(base.components_.shape[0])
+        pca_comp_k = base.pca_.components_[:k_ica]  # (k, V) whitened maps
+        evals_k = base.pca_._eigenvalues
+        evecs_k = base.pca_._eigenvectors
+        dewhite = evecs_k @ torch.diag(torch.sqrt(evals_k))  # (T, n_pca)
+
+        evar = evals_k.cpu().numpy()
+        pca_variance_explained = evar / evar.sum()
+        pca_eigenvalues = evar.copy()
+        pca_components_arr = base.pca_.components_.cpu().numpy()
+
+        # Batch the restarts on CUDA only. A single FastICA fit is launch-bound there, so
+        # one (R, k, V) kernel beats R tiny ones. On CPU the same reshape is a large
+        # pessimisation -- measured 7x slower on the projection alone -- because the
+        # sequential version keeps the (k, V) whitened data hot in cache and reuses it
+        # every restart, while the batched form streams R times as much output through it.
+        # The shared PCA above is the win that applies to both.
+        if device.type == "cuda":
+            W_batch, _n_iter, _conv = fastica_multi_restart(
+                pca_comp_k,
+                n_restarts=n_runs,
+                n_components=k_ica,
+                fun=base.fun,
+                max_iter=base.max_iter,
+                tol=base.tol,
+                base_seed=base_seed,
+                verbose=verbose,
+            )
+        else:
+            ws = []
+            loop = range(n_runs)
+            if verbose:
+                loop = tqdm(loop, desc="FastICA restarts")
+            for i in loop:
+                base.random_state = base_seed + i
+                w_i, _ = base._fastica(pca_comp_k, k_ica)
+                ws.append(w_i)
+            W_batch = torch.stack(ws)
+            del ws
+        del base
+
+        for i in range(n_runs):
+            W_i = W_batch[i]
+            if use_corrw:
+                wd_pairs.append((W_i.cpu(), pca_comp_k.cpu()))
+            components_list.append((W_i @ pca_comp_k).cpu().numpy())
+            mixing_list.append((dewhite[:, :k_ica] @ W_i.T).cpu().numpy())
+        del W_batch
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        iterator = range(0)
+    else:
+        iterator = range(n_runs)
+        if verbose:
+            iterator = tqdm(iterator, desc="ICASSO ICA runs")
 
     for i in iterator:
         if mode == "randinit":
@@ -663,6 +733,18 @@ def icasso(
         if device.type == "cuda" and i % 10 == 9:
             torch.cuda.empty_cache()
 
+    # The requested n_components is an upper bound -- FastICA clamps it to the number of
+    # PCA components actually retained (pca_components=0.85 by default), so the estimates
+    # per run can be fewer than asked for. Everything downstream indexes into the stacked
+    # estimates, so it must use the real count, not the request.
+    k_per_run = int(components_list[0].shape[0])
+    n_total = n_runs * k_per_run
+    if verbose and k_per_run != n_components:
+        print(
+            f"  PCA retained {k_per_run} components (requested {n_components}); "
+            f"clustering {n_total} estimates"
+        )
+
     # ------------------------------------------------------------------
     # Step 2: Similarity matrix
     # ------------------------------------------------------------------
@@ -683,7 +765,7 @@ def icasso(
 
     labels, linkage_matrix = cluster_components(
         similarity,
-        n_clusters=n_components,
+        n_clusters=k_per_run,
         method=linkage_method,
     )
 
@@ -716,7 +798,7 @@ def icasso(
     needs_reproject = mode in ("bootstrap", "both")
     all_mixing = _extract_mixing_for_centrotypes(
         centrotype_indices,
-        n_components,
+        k_per_run,
         mixing_list,
         components_list,
         all_components,
