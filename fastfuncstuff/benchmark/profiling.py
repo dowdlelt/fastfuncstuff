@@ -512,7 +512,16 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
                 f"{_format_seconds(row['cumulative_cpu_seconds'])}  "
                 f"self={row['self_cpu_seconds']:.3f}  calls={row['calls']}  {location}"
             )
-        lines.extend(["", "Top sampled PyTorch operators (self device / self CPU seconds):"])
+        lines.extend(
+            [
+                "",
+                "PyTorch operators (self device / self CPU seconds).",
+                "  device: the WHOLE invocation -- CUDA collection is never toggled,",
+                "          because toggling it loses the device timings entirely.",
+                "  cpu:    the sampled windows only. The two columns do not share a",
+                "          denominator; divide device time by tool time, not by the sample.",
+            ]
+        )
         for row in summary["torch"][:25]:
             lines.append(
                 f"device={row['self_device_seconds']:.3f}  cpu={row['self_cpu_seconds']:.3f}  "
