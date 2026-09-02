@@ -1166,16 +1166,22 @@ def fit_basis_cone_prior(
     wiki note).  Measured bias on synthetic data: a true peak of 3.0 comes
     back as 1.37, a true 0.2 as 0.72.
 
-    filmbabe does not do that.  In ``filmbabe_vb_flobs.cc`` the parameter
-    vector is augmented with a free per-EV "size" scalar ``s`` that never
-    enters the design (``Y = X·Q·β``, and ``Q`` drops it), and the penalty
-    is
+    TR04MW2 does not do that.  Equation 11 reparameterises the coefficient
+    vector as a *normalised* shape vector times a free per-EV "size" scalar
+    ``s``, so that ``s`` carries all the amplitude information and the shape
+    vector carries none.  Equation 22 then puts the shape prior on the
+    coefficients *conditional* on that scalar --- the prior mean and its
+    covariance both scale with ``s`` --- with a noninformative prior on ``s``
+    itself (eq. 12 and 23).  The resulting penalty is
 
     .. math::
 
         (\\beta_b - s_b m)^T P_0 (\\beta_b - s_b m) \\; / \\; s_b^2
 
-    with ``P₀ = C⁻¹``.  The ``1/s²`` factor is filmbabe's ``gam_Beta``.
+    with ``P₀ = C⁻¹``.  Scaling the covariance by ``s²`` (rather than the
+    ``s`` of eq. 22) is our choice: it is what makes the penalty *exactly*
+    homogeneous of degree 0 in β, i.e. scale-invariant in closed form rather
+    than approximately so.  See the minimisation over ``s`` below.
     This is a **cone**: β must lie near the ray ``{s·m}``, with tolerance
     scaling as ``s``.  Amplitude is entirely free; only the *direction*
     of β is constrained.
@@ -3209,9 +3215,8 @@ def vb_update_beta_size(
         Gamma-prior hyperparameters on β_size.  ``c=d=0`` reproduces
         the non-informative MAP estimate but is **unstable**: when the
         shape prior tightens, ``||β-m||²_{C⁻¹}`` → 0 and the trace
-        term shrinks too, so β_size diverges.  Filmbabe uses weakly
-        informative ``c=d=1`` to bound the update; that's the default
-        here.  Larger ``c, d`` pull the update toward
+        term shrinks too, so β_size diverges.  We therefore default to
+        weakly informative ``c=d=1``, which bounds the update.  Larger ``c, d`` pull the update toward
         ``β_size ≈ c/d = 1`` (the prior mean) and damp adaptation.
     floor : float
         Numerical clamp on the denominator.
