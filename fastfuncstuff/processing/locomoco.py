@@ -3943,10 +3943,19 @@ def summarize_flow_convergence(
         "improved by less than x% this pass" fires in the middle of the crawl and calls it
         converged.
 
-        Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
-        voxels, which is the distinction that matters: hitting the cap while still moving
-        0.14 vox/iter means raise ``-iters``, while hitting it at 0.002 vox/iter means the
-        iterations are being spent on noise and the cap is doing no harm.
+    Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
+    voxels, to four places because the comparison it exists for is between refine passes,
+    where three rounds the change away.
+
+    A capped level is NOT by itself a reason to raise ``-iters``, and the first version of
+    this said it was. Measured: on a real 1.0-vox displacement the recovered field is flat
+    from 2 iterations to 48 (it moves in the fourth decimal), while on a near-zero-motion
+    series the in-brain field GROWS monotonically with iterations -- 0.021, 0.028, 0.039,
+    0.044, 0.056, 0.075 vox at 2/4/8/12/24/48 against a truth of zero. LK descends on a
+    cost built from two frozen, noisy frames, so it converges steadily to that cost's
+    minimum, which is not zero displacement. A level that stays capped on a low-motion run
+    is reporting that the estimator still has noise to fit, and the lever for that is
+    ``-window`` or the mask, not more iterations.
     """
     if steps.ndim != 3 or steps.numel() == 0:
         return ""
@@ -3979,7 +3988,7 @@ def summarize_flow_convergence(
                 worst = max(worst, float(tail.median().item()))
         marks.append(f"{med}{'*' if capped else ''}")
     out = f"{n_iters} iters, conv @ {','.join(marks)}"
-    return f"{out}  (Δ {worst:.3f} vox)" if any_capped else out
+    return f"{out}  (Δ {worst:.4f} vox)" if any_capped else out
 
 
 def _refine_converged(

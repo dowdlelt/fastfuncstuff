@@ -33,7 +33,7 @@ def test_capped_level_is_flagged_and_carries_its_final_step():
     # residual step ("raise -iters") is distinguishable from a negligible one.
     s = _steps([[1.0, 0.9, 0.8, 0.7]])
     out = summarize_flow_convergence(s, 4)
-    assert out == "4 iters, conv @ 4*  (Δ 0.700 vox)"
+    assert out == "4 iters, conv @ 4*  (Δ 0.7000 vox)"
 
 
 def test_a_level_with_nothing_to_do_converges_rather_than_capping():
@@ -49,7 +49,7 @@ def test_a_big_step_over_the_floor_still_caps():
     # Above the floor AND above 10% of peak: genuinely still moving, and the delta is the
     # number that says to raise -iters.
     s = _steps([[1.0, 0.9, 0.8, 0.7]])
-    assert summarize_flow_convergence(s, 4) == "4 iters, conv @ 4*  (Δ 0.700 vox)"
+    assert summarize_flow_convergence(s, 4) == "4 iters, conv @ 4*  (Δ 0.7000 vox)"
 
 
 def test_levels_read_coarsest_first_and_mix():

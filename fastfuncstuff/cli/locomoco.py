@@ -857,10 +857,16 @@ def create_parser() -> argparse.ArgumentParser:
         " leakage bias.\n"
         "  xcorr  ignores it; it is single-shot.\n"
         "More = better convergence for larger motion, at linear cost.\n"
-        "The flow backend reports what it actually needed, per pyramid level and coarsest "
-        "first: `4 iters, conv @ 2,4,3` settled well inside the cap, while a starred level "
-        "(`2,4*,3`) never settled and prints the step it was still taking. A big residual "
-        "step there means raise this; a negligible one means the cap is harmless.",
+        "The flow backend reports whether it settled, per pyramid level and coarsest "
+        "first: `4 iters, conv @ 2,4,3` settled inside the cap; a starred level (`2,4*,3`) "
+        "did not, and prints the step it was still taking.\n"
+        "Read a star as DESCRIPTION, not as advice to raise this. Measured: on a real "
+        "1-voxel displacement the recovered field is flat from 2 iterations to 48, while "
+        "on a near-zero-motion series the field GROWS with iterations (0.02 vox at 2, 0.07 "
+        "at 48, against a truth of zero) -- LK descends on a cost built from two noisy "
+        "frames and settles into ITS minimum, not onto zero. So a level that stays starred "
+        "on an already-corrected run means there is noise left to fit, and the lever is "
+        "-window or the mask rather than more iterations.",
     )
     tune.add_argument(
         "-window",
