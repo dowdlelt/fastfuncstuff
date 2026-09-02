@@ -7,7 +7,9 @@ import json
 import platform
 import re
 import shlex
+import signal
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -16,6 +18,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
+_COMPACT_TORCH_WINDOW_SECONDS = 2.0
 _SHELL_TOKENS = {"|", "||", "&&", ";", ">", ">>", "<", "2>", "2>>"}
 
 
@@ -78,7 +81,7 @@ def _use_cuda(requested_device: str | None) -> bool:
     return torch.cuda.is_available()
 
 
-def _python_rows(profiler: cProfile.Profile, limit: int = 75) -> list[dict[str, Any]]:
+def _python_rows(profiler: cProfile.Profile, limit: int | None = 75) -> list[dict[str, Any]]:
     rows = []
     import pstats
 
@@ -98,7 +101,7 @@ def _python_rows(profiler: cProfile.Profile, limit: int = 75) -> list[dict[str, 
             }
         )
     rows.sort(key=lambda row: row["cumulative_cpu_seconds"], reverse=True)
-    return rows[:limit]
+    return rows[:limit] if limit is not None else rows
 
 
 def _torch_rows(torch_profiler: Any, limit: int = 75) -> list[dict[str, Any]]:
@@ -121,6 +124,57 @@ def _torch_rows(torch_profiler: Any, limit: int = 75) -> list[dict[str, Any]]:
     return rows[:limit]
 
 
+def _arm_collection_limit(
+    torch_profiler: Any,
+    activities: list[Any],
+    seconds: float | None,
+) -> tuple[dict[str, Any], Callable[[], None]]:
+    """Stop Kineto event collection after a short window on the main thread."""
+    state: dict[str, Any] = {
+        "limit_seconds": seconds,
+        "limited": False,
+        "collection_seconds": None,
+        "error": None,
+    }
+    no_cleanup = lambda: None
+    required = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
+    if (
+        seconds is None
+        or seconds <= 0
+        or threading.current_thread() is not threading.main_thread()
+        or not all(hasattr(signal, name) for name in required)
+    ):
+        return state, no_cleanup
+
+    timer_kind = signal.ITIMER_REAL
+    previous_timer = signal.getitimer(timer_kind)
+    if previous_timer[0] > 0:
+        state["error"] = "SIGALRM timer already active; collected the full invocation"
+        return state, no_cleanup
+
+    sigalrm = signal.SIGALRM
+    previous_handler = signal.getsignal(sigalrm)
+    collection_started = time.monotonic()
+
+    def stop_collection(_signum: int, _frame: Any) -> None:
+        try:
+            torch_profiler.toggle_collection_dynamic(False, activities)
+        except Exception as exc:
+            state["error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            state["limited"] = True
+            state["collection_seconds"] = time.monotonic() - collection_started
+
+    signal.signal(sigalrm, stop_collection)
+    signal.setitimer(timer_kind, seconds)
+
+    def cleanup() -> None:
+        signal.setitimer(timer_kind, 0)
+        signal.signal(sigalrm, previous_handler)
+
+    return state, cleanup
+
+
 def capture_profile(
     function: Callable[[], Any],
     output_path: Path,
@@ -129,8 +183,12 @@ def capture_profile(
     label: str,
     stage: str,
     trace: bool = False,
+    torch_profile_seconds: float | None = _COMPACT_TORCH_WINDOW_SECONDS,
 ) -> Any:
-    """Run a callable under cProfile and torch.profiler, then write compact JSON."""
+    """Profile full Python execution and a bounded window of PyTorch events."""
+    capture_started = time.monotonic()
+    started = time.time()
+
     import torch
 
     requested_device = _requested_device(command)
@@ -148,11 +206,12 @@ def capture_profile(
         cuda_allocated_before = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
 
-    started = time.time()
-    monotonic_started = time.monotonic()
     error: str | None = None
-    python_profiler.enable()
+    profile_limit = None if trace else torch_profile_seconds
     torch_profiler.__enter__()
+    limit_state, cleanup_limit = _arm_collection_limit(torch_profiler, activities, profile_limit)
+    tool_started = time.monotonic()
+    python_profiler.enable()
     try:
         result = function()
     except BaseException as exc:
@@ -161,33 +220,59 @@ def capture_profile(
         raise
     finally:
         exc_info = sys.exc_info()
-        torch_profiler.__exit__(*exc_info)
         python_profiler.disable()
         if cuda:
             torch.cuda.synchronize()
-        elapsed = time.monotonic() - monotonic_started
+        tool_seconds = time.monotonic() - tool_started
+        cleanup_limit()
+
+        profiler_stop_started = time.monotonic()
+        torch_profiler.__exit__(*exc_info)
+        profiler_stop_seconds = time.monotonic() - profiler_stop_started
+
+        report_started = time.monotonic()
         trace_path = output_path.with_suffix(".trace.json")
         if trace:
             torch_profiler.export_chrome_trace(str(trace_path))
-        payload: dict[str, Any] = {
-            "schema_version": 1,
-            "stage": stage,
-            "label": label,
-            "command": command,
-            "started_at": datetime.fromtimestamp(started).astimezone().isoformat(),
-            "wall_seconds": elapsed,
-            "error": error,
-            "hardware": _hardware_metadata(requested_device),
-            "python": _python_rows(python_profiler),
-            "torch": _torch_rows(torch_profiler),
-            "trace": trace_path.name if trace else None,
-        }
+        all_python_rows = _python_rows(python_profiler, limit=None)
+        python_rows = all_python_rows[:75]
+        python_io_rows = [row for row in all_python_rows if _is_io_row(row)][:50]
+        torch_rows = _torch_rows(torch_profiler)
+        hardware = _hardware_metadata(requested_device)
+        cuda_memory = None
         if cuda:
-            payload["cuda_memory"] = {
+            cuda_memory = {
                 "allocated_before_bytes": cuda_allocated_before,
                 "allocated_after_bytes": torch.cuda.memory_allocated(),
                 "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
             }
+
+        collection_seconds = limit_state["collection_seconds"]
+        if collection_seconds is None:
+            collection_seconds = tool_seconds
+        payload: dict[str, Any] = {
+            "schema_version": 2,
+            "stage": stage,
+            "label": label,
+            "command": command,
+            "started_at": datetime.fromtimestamp(started).astimezone().isoformat(),
+            "tool_seconds": tool_seconds,
+            "profiler_stop_seconds": profiler_stop_seconds,
+            "torch_collection_limit_seconds": profile_limit,
+            "torch_collection_seconds": collection_seconds,
+            "torch_collection_limited": limit_state["limited"],
+            "torch_collection_error": limit_state["error"],
+            "error": error,
+            "hardware": hardware,
+            "python": python_rows,
+            "torch": torch_rows,
+            "python_io": python_io_rows,
+            "trace": trace_path.name if trace else None,
+        }
+        if cuda_memory is not None:
+            payload["cuda_memory"] = cuda_memory
+        payload["report_build_seconds"] = time.monotonic() - report_started
+        payload["wall_seconds"] = time.monotonic() - capture_started
         output_path.write_text(json.dumps(payload, indent=2) + "\n")
     return result
 
@@ -222,9 +307,15 @@ def _format_seconds(value: float) -> str:
 
 
 def _is_io_row(row: dict[str, Any]) -> bool:
-    description = f"{row['file']} {row['function']}".lower()
-    markers = ("nibabel", "fastfuncstuff/io", "load", "save", "read", "write", "open")
-    return any(marker in description for marker in markers)
+    filename = str(row["file"]).replace("\\", "/").lower()
+    function = str(row["function"]).lower()
+    if "importlib" in filename or filename.endswith("/threading.py"):
+        return False
+    if "/nibabel/" in filename or "/fastfuncstuff/io/" in filename:
+        return True
+    io_prefixes = ("load", "open", "read", "save", "write")
+    tokens = re.findall(r"[a-z]+", function)
+    return any(token == "tofile" or token.startswith(io_prefixes) for token in tokens)
 
 
 def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
@@ -233,23 +324,39 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
     invocations = [json.loads(path.read_text()) for path in invocation_paths]
     python_rows = _aggregate_rows(invocations, "python", ("file", "line", "function"))
     torch_rows = _aggregate_rows(invocations, "torch", ("operator",))
+    io_rows = _aggregate_rows(invocations, "python_io", ("file", "line", "function"))
+    if not io_rows:
+        io_rows = [row for row in python_rows if _is_io_row(row)]
+    tool_seconds = sum(
+        item.get("tool_seconds", item.get("wall_seconds", 0.0)) for item in invocations
+    )
+    profiler_stop_seconds = sum(item.get("profiler_stop_seconds", 0.0) for item in invocations)
+    report_build_seconds = sum(item.get("report_build_seconds", 0.0) for item in invocations)
     summary = {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": stage_dir.name,
         "invocation_count": len(invocations),
+        "tool_seconds": tool_seconds,
+        "profiler_stop_seconds": profiler_stop_seconds,
+        "report_build_seconds": report_build_seconds,
         "wall_seconds": sum(item.get("wall_seconds", 0.0) for item in invocations),
         "invocations": [
             {
                 "file": path.name,
                 "label": item.get("label"),
                 "command": item.get("command"),
+                "tool_seconds": item.get("tool_seconds", item.get("wall_seconds")),
+                "profiler_stop_seconds": item.get("profiler_stop_seconds"),
+                "report_build_seconds": item.get("report_build_seconds"),
                 "wall_seconds": item.get("wall_seconds"),
+                "torch_collection_seconds": item.get("torch_collection_seconds"),
+                "torch_collection_limited": item.get("torch_collection_limited", False),
                 "error": item.get("error"),
             }
             for path, item in zip(invocation_paths, invocations, strict=True)
         ],
         "python": python_rows,
-        "io_python": [row for row in python_rows if _is_io_row(row)],
+        "io_python": io_rows,
         "torch": torch_rows,
     }
     (stage_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -257,11 +364,23 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
     lines = [
         f"Stage: {stage_dir.name}",
         f"Invocations: {len(invocations)}",
-        f"Summed invocation wall time: {summary['wall_seconds']:.3f}s",
+        f"Summed tool time: {summary['tool_seconds']:.3f}s",
+        f"Profiler stop time: {summary['profiler_stop_seconds']:.3f}s",
+        f"Report build time: {summary['report_build_seconds']:.3f}s",
+        f"Summed profiler capture wall time: {summary['wall_seconds']:.3f}s",
     ]
     if not invocations:
         lines.extend(["", "No FFS commands executed; cached outputs may have been reused."])
     else:
+        lines.extend(["", "Per-invocation timing:"])
+        for item in summary["invocations"]:
+            sample_seconds = item["torch_collection_seconds"]
+            sample = f"{sample_seconds:.3f}s" if sample_seconds is not None else "full"
+            lines.append(
+                f"  {item['label']}: tool={item['tool_seconds']:.3f}s, "
+                f"torch_sample={sample}, stop={item['profiler_stop_seconds'] or 0:.3f}s, "
+                f"report={item['report_build_seconds'] or 0:.3f}s"
+            )
         lines.extend(["", "Top Python functions (cumulative CPU seconds):"])
         for row in summary["python"][:25]:
             location = f"{Path(row['file']).name}:{row['line']}:{row['function']}"
@@ -276,7 +395,7 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
                 f"{_format_seconds(row['cumulative_cpu_seconds'])}  "
                 f"self={row['self_cpu_seconds']:.3f}  calls={row['calls']}  {location}"
             )
-        lines.extend(["", "Top PyTorch operators (self device / self CPU seconds):"])
+        lines.extend(["", "Top sampled PyTorch operators (self device / self CPU seconds):"])
         for row in summary["torch"][:25]:
             lines.append(
                 f"device={row['self_device_seconds']:.3f}  cpu={row['self_cpu_seconds']:.3f}  "
@@ -360,6 +479,9 @@ class BenchmarkProfiler:
             "schema_version": 1,
             "created_at": datetime.now().astimezone().isoformat(),
             "trace_enabled": self.trace,
+            "torch_collection_limit_seconds": (
+                None if self.trace else _COMPACT_TORCH_WINDOW_SECONDS
+            ),
             "profiled_invocations": sum(s["invocation_count"] for s in self.stages.values()),
             "stages": {
                 name: {

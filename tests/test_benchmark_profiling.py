@@ -10,6 +10,7 @@ import pytest
 from fastfuncstuff.benchmark.profiling import (
     BenchmarkProfiler,
     StageProfiler,
+    _is_io_row,
     capture_profile,
     command_argv,
 )
@@ -77,13 +78,61 @@ def test_capture_profile_writes_compact_cpu_report(tmp_path, monkeypatch):
     assert payload["python"]
 
 
+def test_capture_profile_bounds_torch_events_but_profiles_full_python(tmp_path, monkeypatch):
+    import time
+
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    output = tmp_path / "bounded.json"
+
+    def work():
+        value = torch.ones(4)
+        for _ in range(40):
+            value.add_(1)
+            time.sleep(0.005)
+        return value
+
+    capture_profile(
+        work,
+        output,
+        command=["ffs_test", "-device", "cpu"],
+        label="bounded cpu work",
+        stage="tiny",
+        torch_profile_seconds=0.03,
+    )
+    payload = json.loads(output.read_text())
+    add_event = next(row for row in payload["torch"] if row["operator"] == "aten::add_")
+
+    assert payload["tool_seconds"] >= 0.15
+    assert payload["torch_collection_limited"] is True
+    assert payload["torch_collection_seconds"] < payload["tool_seconds"]
+    assert add_event["calls"] < 40
+    assert payload["profiler_stop_seconds"] >= 0
+    assert payload["report_build_seconds"] >= 0
+    assert all(row["function"] != "stop" for row in payload["python"])
+
+
+def test_io_classifier_avoids_threading_and_import_false_positives():
+    assert not _is_io_row({"file": "/usr/lib/threading.py", "function": "wait"})
+    assert not _is_io_row({"file": "<frozen importlib._bootstrap>", "function": "_find_and_load"})
+    assert _is_io_row({"file": "/project/fastfuncstuff/io/images.py", "function": "load_image"})
+    assert _is_io_row({"file": "/project/warp.py", "function": "save_warp_field"})
+
+
 def test_benchmark_profiler_aggregates_invocations(tmp_path):
     benchmark = BenchmarkProfiler.create(tmp_path)
+    assert _is_io_row({"file": "/numpy/io.py", "function": "loadtxt"})
     stage = benchmark.start_stage("glm")
     invocations = stage.stage_dir / "invocations"
     payload = {
         "label": "one",
         "command": ["ffs_reml"],
+        "tool_seconds": 2.0,
+        "profiler_stop_seconds": 0.2,
+        "report_build_seconds": 0.3,
+        "torch_collection_seconds": 1.0,
+        "torch_collection_limited": True,
         "wall_seconds": 2.5,
         "error": None,
         "python": [
@@ -110,6 +159,7 @@ def test_benchmark_profiler_aggregates_invocations(tmp_path):
     }
     (invocations / "001-one.json").write_text(json.dumps(payload))
 
+    payload["python_io"] = payload["python"]
     benchmark.finish_stage(stage)
     manifest = benchmark.finish()
 
@@ -117,9 +167,12 @@ def test_benchmark_profiler_aggregates_invocations(tmp_path):
     summary = json.loads((stage.stage_dir / "summary.json").read_text())
     assert summary["wall_seconds"] == 2.5
     assert summary["python"][0]["function"] == "load_image"
+    assert summary["tool_seconds"] == 2.0
+    assert summary["profiler_stop_seconds"] == 0.2
+    assert summary["report_build_seconds"] == 0.3
     assert summary["io_python"][0]["function"] == "load_image"
     assert summary["torch"][0]["operator"] == "aten::mm"
-    assert "Top PyTorch operators" in (stage.stage_dir / "summary.txt").read_text()
+    assert "Top sampled PyTorch operators" in (stage.stage_dir / "summary.txt").read_text()
 
 
 def test_profiled_ffs_timing_is_not_cached(tmp_path, monkeypatch):

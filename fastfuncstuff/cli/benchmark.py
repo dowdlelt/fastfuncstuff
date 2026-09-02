@@ -97,14 +97,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "-profile",
         action="store_true",
-        help="Profile FFS commands that execute. Writes compact per-invocation and "
-        "stage-aggregated CPU/PyTorch/CUDA reports under <data-dir>/profiles. "
-        "Does not imply -force-ffs and profiled timings are never cached.",
+        help="Profile FFS commands that execute. Captures full-run Python timings plus "
+        "a bounded 2-second PyTorch/CUDA operator sample per invocation, writing compact "
+        "reports under <data-dir>/profiles. Does not imply -force-ffs; profiled timings "
+        "are never cached.",
     )
     parser.add_argument(
         "-profile-trace",
         action="store_true",
-        help="With -profile, also export full Chrome/Perfetto traces. These can be very large.",
+        help="With -profile, disable the sampling cap and export full-run Chrome/Perfetto "
+        "traces. These can be very large.",
     )
     parser.add_argument(
         "-plot",

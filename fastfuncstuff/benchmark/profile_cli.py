@@ -30,8 +30,9 @@ def main(argv: list[str] | None = None) -> int:
     if not command:
         parser.error("a command is required after --")
 
+    console_main = _load_console_script(Path(command[0]).name)
+
     def invoke() -> object:
-        console_main = _load_console_script(Path(command[0]).name)
         previous = sys.argv
         sys.argv = command
         try:
