@@ -17,6 +17,7 @@ Key function:
 
 from __future__ import annotations
 
+import numpy
 import torch
 import torch.nn.functional as F
 from torch import Tensor
@@ -90,6 +91,83 @@ def _cliplevel(vol: Tensor, mfrac: float = 0.5) -> float:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# 6-connectivity dilation and flood fill
+# ---------------------------------------------------------------------------
+
+# How often the flood fill polls for convergence.  Each poll is a device
+# synchronisation; each extra iteration is one cheap dilation.  Overshooting by
+# a few dilations beats syncing after every one -- 4 measured fastest on both a
+# 96x96x60 EPI and a 160x160x120 anatomical.
+_FLOOD_CHECK_EVERY = 4
+
+
+def _dilate_6conn_once(x: Tensor) -> Tensor:
+    """One 6-connectivity dilation of a 5-D {0,1} volume.
+
+    Three axis-aligned max-pools, unioned, are exactly the 6-neighbourhood, and
+    about half the cost of the cross-shaped ``conv3d`` that computes the same
+    thing through a multiply-accumulate plus cuDNN algorithm selection.  The two
+    forms agree voxel-for-voxel; the test suite pins that.
+    """
+    grown = torch.maximum(
+        torch.maximum(
+            F.max_pool3d(x, (3, 1, 1), 1, (1, 0, 0)),
+            F.max_pool3d(x, (1, 3, 1), 1, (0, 1, 0)),
+        ),
+        F.max_pool3d(x, (1, 1, 3), 1, (0, 0, 1)),
+    )
+    return torch.maximum(grown, x)
+
+
+def _flood_fill_6conn(seed: Tensor, allowed: Tensor) -> Tensor:
+    """Grow *seed* through *allowed* under 6-connectivity until it stops.
+
+    Both arguments are 3-D {0,1} float volumes.  Returns the grown region as a
+    bool volume.  The iteration bound is the worst-case L1 diameter, which a
+    head-shaped region never approaches.
+
+    On the GPU this is an iterated dilation: one cheap kernel per L1 step, all
+    of it parallel.  On the CPU the same loop is a disaster -- ~60 passes over
+    the whole volume, seconds for one EPI automask -- so there we label the
+    components in a single pass instead and keep the ones the seed reaches.
+    Both paths return the same voxels; the test suite pins that.
+    """
+    nz, ny, nx = allowed.shape
+    if allowed.device.type == "cpu":
+        return _flood_fill_6conn_labelled(seed, allowed)
+    current = seed[None, None]
+    allowed_5d = allowed[None, None]
+    max_iter = nz + ny + nx
+    previous = -1.0
+    for i in range(max_iter):
+        current = _dilate_6conn_once(current) * allowed_5d
+        if (i + 1) % _FLOOD_CHECK_EVERY == 0 or i == max_iter - 1:
+            count = float(current.sum().item())
+            if count == previous:
+                break
+            previous = count
+    return current[0, 0] > 0.5
+
+
+def _flood_fill_6conn_labelled(seed: Tensor, allowed: Tensor) -> Tensor:
+    """Single-pass CPU flood fill: label *allowed*, keep the labels *seed* reaches.
+
+    A seed voxel outside *allowed* still seeds its in-region neighbours, exactly
+    as one dilation step of the iterative form would, so the entry set is taken
+    after a single dilation rather than from the raw seed.
+    """
+    from scipy import ndimage
+
+    entry = (_dilate_6conn_once(seed[None, None])[0, 0] * allowed) > 0.5
+    labels, _ = ndimage.label(
+        allowed.numpy() > 0.5, structure=ndimage.generate_binary_structure(3, 1)
+    )
+    reached = numpy.unique(labels[entry.numpy()])
+    reached = reached[reached != 0]
+    return torch.from_numpy(numpy.isin(labels, reached)).to(seed.device)
+
+
 def _dilate_6conn(mask: Tensor, iterations: int = 2) -> Tensor:
     """Dilate with 6-connectivity (face neighbors only).
 
@@ -98,20 +176,9 @@ def _dilate_6conn(mask: Tensor, iterations: int = 2) -> Tensor:
     """
     if iterations <= 0:
         return mask
-    # 6-connectivity kernel: center + 6 face neighbors
-    kernel = torch.zeros(1, 1, 3, 3, 3, device=mask.device, dtype=torch.float32)
-    kernel[0, 0, 1, 1, 1] = 1  # center
-    kernel[0, 0, 0, 1, 1] = 1  # -z
-    kernel[0, 0, 2, 1, 1] = 1  # +z
-    kernel[0, 0, 1, 0, 1] = 1  # -y
-    kernel[0, 0, 1, 2, 1] = 1  # +y
-    kernel[0, 0, 1, 1, 0] = 1  # -x
-    kernel[0, 0, 1, 1, 2] = 1  # +x
-
     x = mask.float()[None, None]
     for _ in range(iterations):
-        x = F.conv3d(x, kernel, padding=1)
-        x = (x > 0.5).float()
+        x = _dilate_6conn_once(x)
     return x[0, 0] > 0.5
 
 
@@ -285,34 +352,8 @@ def _largest_component_6conn(mask: Tensor, vol: Tensor | None = None) -> Tensor:
     nz, ny, nx = mask.shape
     seed = torch.zeros(nz * ny * nx, device=mask.device, dtype=torch.float32)
     seed[seed_idx] = 1.0
-    seed = seed.view(nz, ny, nx)
 
-    # 6-connectivity kernel
-    kernel = torch.zeros(1, 1, 3, 3, 3, device=mask.device, dtype=torch.float32)
-    kernel[0, 0, 1, 1, 1] = 1
-    kernel[0, 0, 0, 1, 1] = 1
-    kernel[0, 0, 2, 1, 1] = 1
-    kernel[0, 0, 1, 0, 1] = 1
-    kernel[0, 0, 1, 2, 1] = 1
-    kernel[0, 0, 1, 1, 0] = 1
-    kernel[0, 0, 1, 1, 2] = 1
-
-    mask_5d = mask.float()[None, None]
-    seed_5d = seed[None, None]
-
-    prev_count = 1
-    check_every = 10
-    max_iter = nz + ny + nx  # worst case: L1 diagonal
-    for i in range(max_iter):
-        seed_5d = F.conv3d(seed_5d, kernel, padding=1)
-        seed_5d = (seed_5d > 0.5).float() * mask_5d
-        if (i + 1) % check_every == 0 or i == max_iter - 1:
-            new_count = int((seed_5d > 0.5).sum().item())
-            if new_count == prev_count:
-                break
-            prev_count = new_count
-
-    return seed_5d[0, 0] > 0.5
+    return _flood_fill_6conn(seed.view(nz, ny, nx), mask.float())
 
 
 # ---------------------------------------------------------------------------
@@ -376,8 +417,6 @@ def _fill_holes_3d(mask: Tensor) -> Tensor:
     Matches AFNI's approach: invert → keep largest component (exterior) → invert.
     Any background region not connected to the border is filled.
     """
-    nz, ny, nx = mask.shape
-
     bg = (~mask).float()
     seed = torch.zeros_like(bg)
 
@@ -389,33 +428,9 @@ def _fill_holes_3d(mask: Tensor) -> Tensor:
     seed[:, :, 0] = bg[:, :, 0]
     seed[:, :, -1] = bg[:, :, -1]
 
-    # 6-connectivity flood fill from border
-    kernel = torch.zeros(1, 1, 3, 3, 3, device=mask.device, dtype=torch.float32)
-    kernel[0, 0, 1, 1, 1] = 1
-    kernel[0, 0, 0, 1, 1] = 1
-    kernel[0, 0, 2, 1, 1] = 1
-    kernel[0, 0, 1, 0, 1] = 1
-    kernel[0, 0, 1, 2, 1] = 1
-    kernel[0, 0, 1, 1, 0] = 1
-    kernel[0, 0, 1, 1, 2] = 1
-
-    seed_5d = seed[None, None]
-    bg_5d = bg[None, None]
-
-    check_every = 10
-    max_iter = nz + ny + nx
-    prev_count = int((seed_5d > 0.5).sum().item())
-    for i in range(max_iter):
-        seed_5d = F.conv3d(seed_5d, kernel, padding=1)
-        seed_5d = (seed_5d > 0.5).float() * bg_5d
-        if (i + 1) % check_every == 0 or i == max_iter - 1:
-            new_count = int((seed_5d > 0.5).sum().item())
-            if new_count == prev_count:
-                break
-            prev_count = new_count
-
-    exterior = seed_5d[0, 0] > 0.5
-    return ~exterior
+    # 6-connectivity flood fill from the border: whatever the background cannot
+    # reach from outside is an interior hole.
+    return ~_flood_fill_6conn(seed, bg)
 
 
 # ---------------------------------------------------------------------------
