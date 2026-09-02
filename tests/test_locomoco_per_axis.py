@@ -214,3 +214,52 @@ def test_flow_axes_dropped_axis_stays_inside_its_own_bound():
     )
     assert float(got[0].abs().max()) <= 2.0 + 1e-6
     assert float(got[1].abs().max()) <= 0.5 + 1e-6
+
+
+# ── the shared temporal PC basis, now that the axes can be tuned apart ───────────
+
+
+def _two_axis_warp(n_t=40, shape=(6, 6, 4), seed=0, pe2_gain=1.0):
+    """Two per-frame fields sharing one temporal mode, plus per-axis structure."""
+    g = torch.Generator().manual_seed(seed)
+    t = torch.linspace(0, 6.28, n_t)
+    common = torch.sin(t)
+    f1 = torch.randn(*shape, 1, generator=g) * common + 0.1 * torch.randn(*shape, n_t, generator=g)
+    f2 = pe2_gain * (
+        torch.randn(*shape, 1, generator=g) * common + 0.1 * torch.randn(*shape, n_t, generator=g)
+    )
+    return [(1, f1), (2, f2)]
+
+
+def test_axis_balance_shares_sum_to_one_and_sharing_never_beats_a_solo_basis():
+    from fastfuncstuff.processing.locomoco import warp_pc_basis
+
+    _u, _load, _mean, _var, bal = warp_pc_basis(_two_axis_warp(), n_pcs=5, with_balance=True)
+    assert len(bal) == 2
+    total = sum(b["share"] for b in bal)
+    assert torch.allclose(total, torch.ones_like(total), atol=1e-5)
+    for b in bal:
+        # A basis fitted to one axis alone can only do better on that axis than a basis
+        # that had to serve both; if this ever inverts, the accounting is wrong.
+        assert torch.all(b["solo_ev"] >= b["shared_ev"] - 1e-5)
+        assert torch.all(b["shared_ev"] <= 1.0 + 1e-6)
+        assert torch.all(b["shared_ev"].diff() >= -1e-6)  # cumulative
+
+
+def test_axis_balance_reports_the_louder_axis_dominating_the_shared_basis():
+    """An axis with far more variance takes over the unweighted concatenation's SVD."""
+    from fastfuncstuff.processing.locomoco import warp_pc_basis
+
+    _u, _load, _mean, _var, bal = warp_pc_basis(
+        _two_axis_warp(pe2_gain=20.0), n_pcs=4, with_balance=True
+    )
+    quiet, loud = (b for b in sorted(bal, key=lambda b: b["energy"]))
+    assert loud["energy"] > 50 * quiet["energy"]
+    # The loud axis owns the leading component and is served better by the shared basis.
+    assert float(loud["share"][0]) > 0.9
+    assert float(loud["shared_ev"][-1]) > float(quiet["shared_ev"][-1])
+    # ...and the quiet axis pays the bigger price for sharing, which is the whole point
+    # of reporting this per axis rather than one pooled explained-variance number.
+    loud_cost = float(loud["solo_ev"][-1] - loud["shared_ev"][-1])
+    quiet_cost = float(quiet["solo_ev"][-1] - quiet["shared_ev"][-1])
+    assert quiet_cost > loud_cost

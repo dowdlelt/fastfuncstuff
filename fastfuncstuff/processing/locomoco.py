@@ -7061,7 +7061,54 @@ def warp_ica_basis(components, n_components=None, pca_components=0.95, device=No
     return mixing, loadings, means, var
 
 
-def warp_pc_basis(components, n_pcs=None, device=None):
+def _axis_balance(xc, u, load, widths, axes):
+    """Per-axis accounting for a SHARED temporal basis: is it serving both axes?
+
+    Three numbers per encode axis, all from factors already computed except one small
+    solo ``svdvals`` per axis:
+
+    * ``share`` — fraction of each component's loading energy that sits on this axis.
+      A component whose share is ~1 is really a single-axis mode wearing a shared
+      basis; that is legal (its loading on the other axis is near zero) but it is what
+      a reader wants to know before using the scores as one regressor set.
+    * ``shared_ev`` — cumulative variance of THIS axis explained by the shared basis.
+      ``u`` is orthonormal, so the rank-k projection residual is
+      ``||xc_a||^2 - ||load[:k, a]||^2``; no reconstruction is formed.
+    * ``solo_ev`` — the same for a basis fitted to this axis ALONE. ``solo_ev -
+      shared_ev`` is the price of sharing, in variance points, measured on this run
+      rather than remembered from another one.
+
+    The reason this is worth reporting at all: the SVD runs on an UNWEIGHTED
+    concatenation, so the basis is pulled toward whichever axis block carries more
+    variance. Tuning the partition finer than the primary PE (per-axis ``-window`` /
+    ``-levels`` / ``-qwarp_minpatch``) adds high-spatial-frequency estimation noise to
+    that block, which buys it sway over the shared basis without adding motion. These
+    numbers are how that shows up.
+    """
+    out, start = [], 0
+    k = load.shape[0]
+    for axis, w in zip(axes, widths, strict=True):
+        blk = load[:, start : start + w]  # (k, w)
+        tot = float((xc[:, start : start + w] ** 2).sum())
+        per_k = (blk**2).sum(dim=1)
+        shared_ev = (per_k.cumsum(0) / max(tot, 1e-30)).clamp(max=1.0)
+        sv = torch.linalg.svdvals(xc[:, start : start + w])[:k]
+        solo_ev = ((sv**2).cumsum(0) / max(tot, 1e-30)).clamp(max=1.0)
+        share = per_k / (load**2).sum(dim=1).clamp(min=1e-30)
+        out.append(
+            {
+                "axis": axis,
+                "share": share.cpu(),
+                "shared_ev": shared_ev.cpu(),
+                "solo_ev": solo_ev.cpu(),
+                "energy": tot,
+            }
+        )
+        start += w
+    return out
+
+
+def warp_pc_basis(components, n_pcs=None, device=None, with_balance=False):
     """Shared temporal PCs of a per-frame warp, WITH the per-axis spatial loadings.
 
     ``warp_time_pcs`` returns the scores alone, which is all a nuisance regressor
@@ -7080,6 +7127,13 @@ def warp_pc_basis(components, n_pcs=None, device=None):
     its OWN spatial loading per axis, so a component can be dropped from one axis and
     kept on the other. Returns ``(scores (T,k), loadings [(axis, (nx,ny,nz,k))],
     means [(nx,ny,nz)], var_ratio (k,))``, or None if the warp is empty.
+
+    That 0.09/0.22 measurement predates per-axis tuning, which is exactly the knob that
+    could invalidate it: the SVD sees an UNWEIGHTED concatenation, so a partition solved
+    at a finer scale than the primary PE brings extra estimation noise into its block
+    and gains influence over the shared basis without carrying more motion.
+    ``with_balance=True`` appends :func:`_axis_balance`, which measures that per run
+    instead of trusting the old number.
     """
     built = _warp_matrix(components, device=device)
     if built is None:
@@ -7096,6 +7150,8 @@ def warp_pc_basis(components, n_pcs=None, device=None):
 
     load = u.T @ xc  # (k, S) -- component loadings over the pooled columns
     loadings, means = _split_loadings(load, mean, shapes, axes, widths, k)
+    if with_balance:
+        return u.cpu(), loadings, means, var.cpu(), _axis_balance(xc, u, load, widths, axes)
     return u.cpu(), loadings, means, var.cpu()
 
 

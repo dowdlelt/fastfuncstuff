@@ -3016,13 +3016,28 @@ def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
         [(ax, f) for _, ax, f in result.pe_displacements()],
         n_pcs=None if want in (None, -1) else want,
         device=device,
+        with_balance=True,
     )
     if got is None:
         print("  ⚠️  -write_pc_maps: the warp is empty — no components to write.")
         return
-    _u, loadings, _means, var = got
+    _u, loadings, _means, var, balance = got
     k = loadings[0][1].shape[-1]
     label_of = {ax: lbl for lbl, ax, _ in result.pe_displacements()}
+
+    # Is one shared temporal basis serving both axes, or only the louder one? The
+    # concatenation the SVD sees is unweighted, so the axis with more variance sets the
+    # basis -- and per-axis tuning changes which axis that is. One line per axis.
+    if len(balance) > 1:
+        tot_energy = sum(b["energy"] for b in balance) or 1.0
+        for b in balance:
+            lbl = label_of.get(b["axis"], f"axis{b['axis']}")
+            sh, so = float(b["shared_ev"][k - 1]), float(b["solo_ev"][k - 1])
+            print(
+                f"  {lbl}: {100 * b['energy'] / tot_energy:.0f}% of the warp's variance; "
+                f"the shared {k}-PC basis explains {sh:.3f} of it "
+                f"(a {lbl}-only basis: {so:.3f}, so sharing costs {so - sh:.3f})"
+            )
 
     scored = resp is not None and mask is not None
     rows = []
@@ -3045,11 +3060,25 @@ def _write_pc_maps(result, stem, ext, affine, args, resp, mask, device):
         # A companion table so a map can be matched to its number without reading
         # brick labels one at a time.
         tpath = f"{stem}_pcmap_scores.1D"
-        header = "# component  variance  " + "  ".join(lbl for lbl, _ in rows)
-        lines = [header]
+        share_of = {b["axis"]: b["share"] for b in balance}
+        share_cols = [
+            (label_of.get(ax, f"axis{ax}"), share_of[ax]) for ax, _ in loadings if ax in share_of
+        ]
+        header = (
+            "# component  variance  "
+            + "  ".join(f"{lbl}_enrich" for lbl, _ in rows)
+            + "  "
+            + "  ".join(f"{lbl}_share" for lbl, _ in share_cols)
+        )
+        lines = [
+            "# enrich = task-enrichment of this component's loading on that axis",
+            "# share  = fraction of the component's energy carried by that axis",
+            header,
+        ]
         for i in range(k):
             cells = "  ".join(f"{sc[i]:8.3f}" for _, sc in rows)
-            lines.append(f"{i:9d}  {float(var[i]):8.5f}  {cells}")
+            shares = "  ".join(f"{float(sh[i]):8.3f}" for _, sh in share_cols)
+            lines.append(f"{i:9d}  {float(var[i]):8.5f}  {cells}  {shares}")
         Path(tpath).write_text("\n".join(lines) + "\n")
 
 
