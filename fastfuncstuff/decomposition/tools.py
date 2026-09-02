@@ -23,7 +23,7 @@ Marchenko-Pastur distribution:
 
 from __future__ import annotations
 
-from math import lgamma, log, pi
+from math import log
 
 import numpy as np
 import torch
@@ -31,6 +31,7 @@ from scipy.special import gammaln as scipy_gammaln
 from tqdm.auto import tqdm
 
 from fastfuncstuff._compile import safe_compile
+from fastfuncstuff.decomposition.model_order import select_model_order
 from fastfuncstuff.denoise.sequential import estimate_noise_component_caps_per_run
 from fastfuncstuff.design.builder import (
     parse_afni_timing_file,
@@ -55,7 +56,10 @@ def parse_num_comps_spec(spec: str) -> int | float | str:
         Parsed numeric value, or normalized mode string.
     """
     spec_norm = spec.strip().lower()
-    if spec_norm in {"auto", "melodic", "hybrid", "current", "erank", "mp"}:
+    if spec_norm == "melodic":
+        # Back-compat: the mode used to be named after the tool it was matching.
+        spec_norm = "laplace"
+    if spec_norm in {"auto", "laplace", "hybrid", "current", "erank", "mp"}:
         return spec_norm
     try:
         if any(ch in spec_norm for ch in [".", "e"]):
@@ -64,7 +68,7 @@ def parse_num_comps_spec(spec: str) -> int | float | str:
     except ValueError as exc:
         raise ValueError(
             "Invalid -num_comps. Use int, float (0-1), or one of: "
-            "auto|melodic|hybrid|current|erank|mp"
+            "auto|laplace|hybrid|current|erank|mp"
         ) from exc
 
 
@@ -529,502 +533,6 @@ def mp_spikes_from_spectrum(evals: np.ndarray, n_samples: int, n_features: int) 
     return int((evals > lambda_plus).sum())
 
 
-def _mp_expected_eigenvalues(n_features: int, n_samples: int) -> np.ndarray:
-    """Expected eigenvalue quantiles under the Marchenko-Pastur distribution.
-
-    Port of FSL MELODIC's ``Feta()`` function.  Returns the expected
-    eigenvalue at each ordinal rank position, sorted descending
-    (index 0 = largest expected eigenvalue).
-
-    Parameters
-    ----------
-    n_features : int
-        Number of eigenvalues (temporal dimensions).
-    n_samples : int
-        Effective number of spatial samples (after resels correction).
-
-    Returns
-    -------
-    quantiles : ndarray of shape (n_features,)
-        Expected eigenvalues, descending order.
-    """
-    n1 = n_features
-    n2 = max(n1 + 1, n_samples)  # ensure n2 > n1
-
-    nu = float(n1) / float(n2)
-    bm = (1.0 - np.sqrt(nu)) ** 2  # MP lower bound
-    bp = (1.0 + np.sqrt(nu)) ** 2  # MP upper bound
-
-    # Evaluation grid for the survival function
-    lrange = 0.9 * bm
-    urange = 1.1 * bp
-    n_eta = 30 * n1
-    rangestep = (urange - lrange) / n_eta
-    eta = lrange + rangestep * np.arange(1, n_eta + 1, dtype=np.float64)
-
-    # Integration grid for MP density
-    n_teta = 10 * n1
-    stepsize = (bp - bm) / n_teta
-    teta = stepsize * np.arange(1, n_teta + 1, dtype=np.float64)
-
-    # MP density: f(x) = sqrt((x-bm)(bp-x)) / (2*pi*nu*x)  for bm <= x <= bp
-    x_abs = teta + bm
-    inner = np.clip(teta * (bp - bm - teta), 0.0, None)
-    feta_vals = np.sqrt(inner) / (2.0 * np.pi * nu * x_abs)
-
-    # Survival function: expected count of eigenvalues > eta[i]
-    claw = np.zeros(n_eta, dtype=np.float64)
-    cumval = 0.0
-    j = 0
-    for i in range(n_eta):
-        while j < n_teta and x_abs[j] < eta[i]:
-            cumval += feta_vals[j]
-            j += 1
-        claw[i] = max(n1 * (1.0 - stepsize * cumval), 0.0)
-
-    # Invert survival function to get quantiles at each integer rank
-    result = np.zeros(n1, dtype=np.float64)
-    for i in range(n_eta - 1):
-        rank_hi = int(np.floor(claw[i]))
-        rank_lo = int(np.floor(claw[i + 1]))
-        if rank_hi > rank_lo and 1 <= rank_hi <= n1:
-            result[rank_hi - 1] = eta[i]  # 0-indexed
-
-    # Fill gaps via interpolation (some ranks may not be resolved)
-    nonzero_idx = np.where(result > 0)[0]
-    if len(nonzero_idx) >= 2:
-        for i in range(n1):
-            if result[i] <= 0:
-                result[i] = np.interp(i, nonzero_idx, result[nonzero_idx])
-    elif len(nonzero_idx) == 1:
-        result[:] = result[nonzero_idx[0]]
-    else:
-        result[:] = 1.0  # fallback
-
-    # Clamp small values (FSL uses 5e-9)
-    result = np.maximum(result, 5e-9)
-    return result
-
-
-def _adjust_eigenspectrum_melodic(
-    raw_evals: np.ndarray,
-    n_eff: int,
-    verbose: bool = False,
-    capture_trace: bool = False,
-) -> tuple[np.ndarray, int] | tuple[np.ndarray, int, dict]:
-    """Adjust eigenvalue spectrum for Minka estimation, MELODIC-style.
-
-    Implements FSL MELODIC's ``adj_eigspec`` preprocessing:
-
-    1. Drop the 2 smallest eigenvalues (absorb mean/trend residuals).
-    2. Compute Marchenko-Pastur expected eigenvalues for the ratio
-       n_features / n_eff.
-    3. Divide raw eigenvalues by MP expected values (normalize noise floor).
-    4. Retain eigenvalues up to 98 % cumulative variance of the *original*
-       (unadjusted) spectrum.
-
-    Parameters
-    ----------
-    raw_evals : ndarray
-        All eigenvalues, sorted DESCENDING (largest first).
-    n_eff : int
-        Effective number of spatial samples.
-    verbose : bool
-        Print diagnostic information.
-
-    Returns
-    -------
-    adj_evals : ndarray
-        Adjusted, truncated eigenvalues for Minka estimation (descending).
-    max_ev : int
-        Number of eigenvalues retained (98 % variance cutoff).
-    """
-    # (1) Drop 2 smallest eigenvalues (FSL: AdjEV = in.Columns(3,Ncols).Reverse())
-    # Our eigenvalues are already descending, so drop the last 2 (smallest)
-    if len(raw_evals) > 4:
-        ev = raw_evals[:-2].astype(np.float64).copy()
-    else:
-        ev = raw_evals.astype(np.float64).copy()
-
-    n_feat = len(ev)
-
-    # (2) Cumulative variance of ORIGINAL (unadjusted) spectrum
-    ev_sum = ev.sum()
-    if ev_sum > 0:
-        cum_pct = np.cumsum(ev) / ev_sum
-    else:
-        cum_pct = np.ones(n_feat)
-
-    # (3) Compute MP expected eigenvalues
-    mp_expected = _mp_expected_eigenvalues(n_feat, n_eff)
-
-    # (4) Divide by MP expected (remove noise floor shape)
-    ev_adj = ev / mp_expected
-
-    # Re-sort descending after adjustment
-    ev_adj = np.sort(ev_adj)[::-1]
-
-    # (5) Find cutoff at 98% cumulative variance of ORIGINAL spectrum
-    threshold = 0.98
-    max_ev = n_feat  # default: keep all
-    for i in range(n_feat - 1):
-        if cum_pct[i] < threshold <= cum_pct[i + 1]:
-            # FSL adj_eigspec(): maxEV = ctr_i (1-based lower crossing index).
-            # In 0-based indexing, this keeps (i + 1) elements.
-            max_ev = max(1, i + 1)
-            break
-    if max_ev < 3:
-        max_ev = n_feat // 2
-
-    # (6) Truncate and take absolute value
-    ev_adj = np.abs(ev_adj[:max_ev])
-
-    if verbose:
-        print("    MP eigenvalue adjustment (MELODIC-style):")
-        print(f"      {len(raw_evals)} raw eigs → drop 2 smallest → {n_feat} eigs")
-        print(
-            f"      MP range: [{mp_expected[-1]:.4f}, {mp_expected[0]:.4f}] "
-            f"(nu={n_feat}/{n_eff}={n_feat / n_eff:.5f})"
-        )
-        print(f"      98% cumvar cutoff → {max_ev} eigs retained")
-        if len(ev_adj) > 2:
-            print(
-                f"      Adjusted range: [{ev_adj[-1]:.2f}, {ev_adj[0]:.2f}] "
-                f"(ratio={ev_adj[0] / max(ev_adj[-1], 1e-15):.1f}×)"
-            )
-
-    if not capture_trace:
-        return ev_adj, max_ev
-
-    cutoff_idx_1based = int(max_ev + 1) if max_ev < n_feat else int(n_feat)
-    trace = {
-        "n_raw_eigs": int(len(raw_evals)),
-        "n_after_drop2": int(n_feat),
-        "n_eff": int(n_eff),
-        "raw_after_drop2": ev.tolist(),
-        "cum_pct_raw_after_drop2": cum_pct.tolist(),
-        "mp_expected": mp_expected.tolist(),
-        "adjusted_before_sort": (ev / mp_expected).tolist(),
-        "adjusted_sorted": np.sort(ev / mp_expected)[::-1].tolist(),
-        "cutoff_threshold": 0.98,
-        "cutoff_max_ev": int(max_ev),
-        "cutoff_idx_1based": cutoff_idx_1based,
-        "adjusted_truncated_abs": ev_adj.tolist(),
-    }
-    return ev_adj, max_ev, trace
-
-
-def _minka_assess_dimension(
-    spectrum: np.ndarray,
-    rank: int,
-    n_samples: int,
-) -> float:
-    """Compute Minka (2000) log-evidence for PPCA with given rank.
-
-    .. deprecated:: Use ``_fsl_ppca_est`` for FSL-matching behaviour.
-    Kept for reference / testing.
-    """
-    n_features = len(spectrum)
-    eps = 1e-15
-
-    if rank < 1 or rank >= n_features:
-        return -np.inf
-
-    if spectrum[rank - 1] < eps:
-        return -np.inf
-
-    pu = -rank * log(2.0)
-    for i in range(1, rank + 1):
-        pu += lgamma((n_features - i + 1) / 2.0) - log(pi) * (n_features - i + 1) / 2.0
-
-    pl = -float(np.sum(np.log(spectrum[:rank]))) * n_samples / 2.0
-
-    v = max(eps, float(np.sum(spectrum[rank:])) / (n_features - rank))
-    pv = -log(v) * n_samples * (n_features - rank) / 2.0
-
-    m = n_features * rank - rank * (rank + 1.0) / 2.0
-    pp = log(2.0 * pi) * (m + rank) / 2.0
-
-    spectrum_hat = np.array(spectrum, dtype=np.float64, copy=True)
-    spectrum_hat[rank:] = v
-    pa = 0.0
-    for i in range(rank):
-        for j in range(i + 1, n_features):
-            diff_eig = spectrum[i] - spectrum[j]
-            diff_inv = 1.0 / spectrum_hat[j] - 1.0 / spectrum_hat[i]
-            if diff_eig < eps or diff_inv < eps:
-                pa += log(eps)
-            else:
-                pa += log(diff_eig * diff_inv * n_samples)
-
-    ll = pu + pl + pv + pp - pa / 2.0 - rank * log(n_samples) / 2.0
-    return ll
-
-
-def _fsl_ppca_est(eigenvalues: np.ndarray, N: int) -> np.ndarray:
-    """Vectorized port of FSL MELODIC's ppca_est() — Laplace evidence for all k.
-
-    This is a line-by-line port of FSL's ``melhlprfns.cc ppca_est()``.
-    It computes the Laplace-approximated log-evidence for PPCA at every
-    candidate dimension k = 1…d simultaneously, using the exact same
-    mathematical formulation as FSL MELODIC.
-
-    Parameters
-    ----------
-    eigenvalues : ndarray of shape (d,)
-        Adjusted eigenvalues (descending), as returned by
-        ``_adjust_eigenspectrum_melodic``.
-    N : int
-        Effective number of spatial samples (n_eff = floor(n_vox/(2.5*resels))).
-
-    Returns
-    -------
-    l_lap : ndarray of shape (d,)
-        Laplace log-evidence at each candidate dimension k = 1…d.
-    """
-    eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
-    d = len(eigenvalues)
-
-    logLambda = np.log(np.clip(eigenvalues, 1e-15, None))
-
-    k = np.arange(1, d + 1, dtype=np.float64)  # [1, 2, ..., d]
-    m = d * k - 0.5 * k * (k + 1)  # free parameters
-
-    # --- Stiefel manifold volume (l_probU) ---
-    k_rev = k[::-1].copy()  # [d, d-1, ..., 1]
-    loggam = np.cumsum(np.array([lgamma(0.5 * v) for v in k_rev]))
-    l_probU = -np.log(2.0) * k + loggam - np.cumsum(0.5 * np.log(pi) * k_rev)
-
-    # --- Noise variance per dimension ---
-    # tmp1(k) = sum of eigenvalues from k+1 to d  (the "noise" sum)
-    cum_ev = np.cumsum(eigenvalues)
-    total_ev = cum_ev[-1]
-    # After FSL's Reverse/cumsum trick:
-    # tmp1(k) = total - cumsum(k) = sum from k+1..d
-    tmp1 = total_ev - cum_ev  # tmp1[k-1] = sum of eigs from k+1..d (0-indexed)
-    # FSL: tmp1(1) = 0.95*tmp1(2)  [1-indexed → 0-indexed: tmp1[d-1] = 0.95*tmp1[d-2]]
-    # After Reverse, position d in 1-based was originally position 1.
-    # The final tmp1 after Reverse represents: tmp1[0]=noise_sum_for_k=1, ...
-    # FSL sets the last entry (k=d) to 0.95× previous
-    tmp1[-1] = 0.95 * tmp1[-2] if d >= 2 else 1e-10
-
-    tmp3 = d - k.copy()  # (d-k) for each dimension
-    tmp3[-1] = 1.0  # avoid division by zero at k=d
-
-    tmp4 = tmp1 / tmp3  # sigma^2 for each dimension k
-    # FSL clamps: if tmp4 < 0.01: tmp4 = 0.01, same for tmp3 and tmp1
-    tmp4 = np.maximum(tmp4, 0.01)
-    tmp3 = np.maximum(tmp3, 0.01)
-    tmp1 = np.maximum(tmp1, 0.01)
-
-    # --- l_nu: noise log-likelihood ---
-    l_nu = -(N / 2.0) * (d - k) * np.log(tmp4)
-    l_nu[-1] = 0.0
-
-    # --- l_lam: signal eigenvalue log-likelihood ---
-    l_lam = -(N / 2.0) * np.cumsum(logLambda)
-
-    # --- l_Az: Hessian log-determinant (Laplace correction) ---
-    # FSL builds d×d matrices for eigenvalue and precision differences,
-    # then accumulates via cumsum. We replicate this exactly.
-    triu = np.triu(np.ones((d, d), dtype=np.float64), k=1)  # upper tri, zero diagonal
-
-    # t1(i,j) = lambda_i - lambda_j for j > i
-    eig_row = eigenvalues[np.newaxis, :]  # (1, d)
-    t1 = triu * (eig_row.T - eig_row)  # (d, d): lambda_i - lambda_j
-
-    # t2(i,j) = 1/sigma^2_j - 1/lambda_i for j > i
-    inv_sigma = (1.0 / tmp4)[:, np.newaxis] * np.ones((1, d))  # (d, d), row i = 1/sigma^2_i
-    inv_lambda = np.ones((d, 1)) * (1.0 / np.clip(eigenvalues, 1e-15, None))[np.newaxis, :]
-    # FSL: t2 = SP(triu, t2.t() - t3.t())
-    #   t2.t()(i,j) = 1/sigma^2_j (transposed: columns become the sigma index)
-    #   t3.t()(i,j) = 1/lambda_i  (transposed: rows become the lambda index)
-    t2 = triu * (inv_sigma.T - inv_lambda.T)  # (d, d): 1/sigma^2_j - 1/lambda_i for j > i
-
-    # FSL clamps non-positive to 1 before log (→ log(1) = 0)
-    t1 = np.where(t1 <= 0, 1.0, t1)
-    t2 = np.where(t2 <= 0, 1.0, t2)
-
-    # sum log across columns for each row, then cumsum across rows
-    row_sum = np.sum(np.log(t1), axis=1) + np.sum(np.log(t2), axis=1)
-    l_Az = np.cumsum(row_sum)
-
-    # --- Combine: Laplace evidence ---
-    l_lap = l_probU + l_nu + l_Az + l_lam + 0.5 * np.log(2.0 * pi) * (m + k) - 0.5 * np.log(N) * k
-
-    return l_lap
-
-
-def _fsl_ppca_est_all(eigenvalues: np.ndarray, N: int) -> dict[str, np.ndarray]:
-    """Return all FSL PPCA criteria arrays (lap/bic/mdl/rrn/aic)."""
-    eigenvalues = np.asarray(eigenvalues, dtype=np.float64)
-    d = len(eigenvalues)
-
-    logLambda = np.log(np.clip(eigenvalues, 1e-15, None))
-
-    k = np.arange(1, d + 1, dtype=np.float64)
-    m = d * k - 0.5 * k * (k + 1)
-
-    k_rev = k[::-1].copy()
-    loggam = np.cumsum(np.array([lgamma(0.5 * v) for v in k_rev]))
-    l_probU = -np.log(2.0) * k + loggam - np.cumsum(0.5 * np.log(pi) * k_rev)
-
-    cum_ev = np.cumsum(eigenvalues)
-    total_ev = cum_ev[-1]
-    tmp1 = total_ev - cum_ev
-    tmp1[-1] = 0.95 * tmp1[-2] if d >= 2 else 1e-10
-
-    cum_log_ev = np.cumsum(logLambda)
-    total_log_ev = cum_log_ev[-1]
-    tmp2 = total_log_ev - cum_log_ev
-    tmp2[-1] = tmp2[-2] if d >= 2 else 0.0
-
-    tmp3 = d - k.copy()
-    tmp3[-1] = 1.0
-
-    tmp4 = tmp1 / tmp3
-    tmp4 = np.maximum(tmp4, 0.01)
-    tmp3 = np.maximum(tmp3, 0.01)
-    tmp1 = np.maximum(tmp1, 0.01)
-
-    l_nu = -(N / 2.0) * (d - k) * np.log(tmp4)
-    l_nu[-1] = 0.0
-
-    l_lam = -(N / 2.0) * np.cumsum(logLambda)
-
-    triu = np.triu(np.ones((d, d), dtype=np.float64), k=1)
-    eig_row = eigenvalues[np.newaxis, :]
-    t1 = triu * (eig_row.T - eig_row)
-
-    inv_sigma = (1.0 / tmp4)[:, np.newaxis] * np.ones((1, d))
-    inv_lambda = np.ones((d, 1)) * (1.0 / np.clip(eigenvalues, 1e-15, None))[np.newaxis, :]
-    t2 = triu * (inv_sigma.T - inv_lambda.T)
-
-    t1 = np.where(t1 <= 0, 1.0, t1)
-    t2 = np.where(t2 <= 0, 1.0, t2)
-    row_sum = np.sum(np.log(t1), axis=1) + np.sum(np.log(t2), axis=1)
-    l_Az = np.cumsum(row_sum)
-
-    l_lap = l_probU + l_nu + l_Az + l_lam + 0.5 * np.log(2.0 * pi) * (m + k) - 0.5 * np.log(N) * k
-    l_bic = l_lam + l_nu - 0.5 * np.log(N) * (m + k)
-
-    l_lhood = (tmp2 / tmp3) - np.log(tmp1 / tmp3)
-    l_rrn = -0.5 * N * k * np.log(np.cumsum(eigenvalues) / k) + l_nu
-    l_aic = -(-2.0 * N * tmp3 * l_lhood + 2.0 * (1.0 + d * k + 0.5 * (k - 1.0)))
-    l_mdl = -(-N * tmp3 * l_lhood + 0.5 * (1.0 + d * k + 0.5 * (k - 1.0)) * np.log(N))
-
-    return {
-        "lap": l_lap,
-        "bic": l_bic,
-        "mdl": l_mdl,
-        "rrn": l_rrn,
-        "aic": l_aic,
-    }
-
-
-def _fsl_first_peak_k(evidence: np.ndarray, max_k: int) -> int:
-    """Replicate FSL ppca_select first-peak walk-up on normalized evidence."""
-    vals = np.asarray(evidence, dtype=np.float64)
-    finite = np.isfinite(vals)
-    if not finite.any():
-        return 1
-    vmin = float(np.nanmin(vals[finite]))
-    vmax = float(np.nanmax(vals[finite]))
-    if vmax - vmin > 1e-15:
-        vals = (vals - vmin) / (vmax - vmin)
-    else:
-        vals[:] = 0.5
-
-    idx = 0
-    ceiling_idx = max(0, min(int(max_k) - 1, len(vals) - 1))
-    while idx < (len(vals) - 1) and vals[idx] < vals[idx + 1] and idx < ceiling_idx:
-        idx += 1
-    return idx + 1
-
-
-def melodic_evidence_proxy_k(
-    evals: np.ndarray,
-    n_samples: int,
-    n_features: int,
-    min_k: int,
-    max_k: int,
-    criterion: str = "aut",
-) -> tuple[int, dict]:
-    """MELODIC-style dimensionality estimation via Minka (2000) Laplace approximation.
-
-    Computes the Laplace-approximated log evidence for PPCA at each
-    candidate rank k.  Following FSL MELODIC's ``ppca_select``, the
-    selected k is the **first local maximum** — i.e. walk up from
-    min_k while the evidence is still increasing and stop at the first
-    peak.  This avoids false high-k selections caused by numerical
-    artifacts in the Hessian determinant term at large rank.
-
-    References
-    ----------
-    Minka T.P. (2000). Automatic Choice of Dimensionality for PCA. NIPS.
-    Beckmann C.F. & Smith S.M. (2004). Probabilistic ICA for fMRI. NeuroImage.
-    """
-    ev = np.clip(evals.astype(np.float64), 1e-15, None)
-    n_ev = len(ev)
-
-    max_k = min(max_k, n_ev - 1) if n_ev > 1 else 1
-    min_k = max(1, min(min_k, max_k))
-
-    # Use FSL's vectorized ppca_est criteria for exact match
-    all_criteria = _fsl_ppca_est_all(ev, n_samples)
-    all_evidence = all_criteria["lap"]
-
-    # Extract the k-range we care about (1-indexed k → 0-indexed array)
-    k_grid = np.arange(min_k, max_k + 1)
-    ll_arr = all_evidence[k_grid - 1]  # 0-indexed lookup
-    ll_vals = ll_arr.tolist()
-
-    finite_mask = np.isfinite(ll_arr)
-    if not finite_mask.any():
-        best_k = int(min_k)
-        global_max_k = int(min_k)
-    else:
-        estimators = {
-            "lap": _fsl_first_peak_k(all_criteria["lap"], max_k=max_k),
-            "bic": _fsl_first_peak_k(all_criteria["bic"], max_k=max_k),
-            "mdl": _fsl_first_peak_k(all_criteria["mdl"], max_k=max_k),
-            "rrn": _fsl_first_peak_k(all_criteria["rrn"], max_k=max_k),
-            "aic": _fsl_first_peak_k(all_criteria["aic"], max_k=max_k),
-        }
-
-        perc_ev = np.cumsum(ev) / max(float(np.sum(ev)), 1e-15)
-
-        criterion = str(criterion).lower()
-        if criterion == "aut":
-            lap_k = estimators["lap"]
-            bic_k = estimators["bic"]
-            if bic_k < lap_k and perc_ev[min(bic_k - 1, len(perc_ev) - 1)] > 0.8:
-                best_k = int(bic_k)
-                selected_criterion = "bic"
-            else:
-                best_k = int(lap_k)
-                selected_criterion = "lap"
-        elif criterion in estimators:
-            best_k = int(estimators[criterion])
-            selected_criterion = criterion
-        else:
-            best_k = int(estimators["lap"])
-            selected_criterion = "lap"
-
-        global_max_idx = int(np.argmax(ll_arr))
-        global_max_k = int(k_grid[global_max_idx])
-
-    return best_k, {
-        "k_grid": k_grid.tolist(),
-        "log_evidence": ll_vals,
-        "selected_k": best_k,
-        "global_max_k": global_max_k if finite_mask.any() else best_k,
-        "criterion": str(criterion).lower(),
-        "selected_criterion": selected_criterion if finite_mask.any() else "lap",
-        "estimators": estimators if finite_mask.any() else {"lap": best_k},
-    }
-
-
 def estimate_ica_component_count(
     data_vox_t: torch.Tensor,
     method: int | float | str,
@@ -1119,75 +627,41 @@ def estimate_ica_component_count(
 
     mode = str(method).lower()
 
-    if mode in {"auto", "melodic"}:
-        # FSL MELODIC preprocessing for Minka/Laplace dimensionality estimation:
-        # 1. Adjust eigenvalues by dividing out the Marchenko-Pastur expected
-        #    noise distribution (normalises the noise floor so it's uniform).
-        # 2. Truncate at 98% cumulative variance of the original spectrum.
-        # 3. Run Minka on the adjusted, truncated eigenvalues with N_eff.
-        # Without the MP adjustment, noise eigenvalues retain MP-shaped
-        # structure that the Laplace estimator mistakes for signal components,
-        # causing massive over-estimation of dimensionality.
-        if capture_ppca_trace:
-            adj_ev, max_ev_retained, ppca_trace = _adjust_eigenspectrum_melodic(
-                raw_evals=ev,
-                n_eff=n_samples_minka,
-                verbose=verbose,
-                capture_trace=True,
-            )
-        else:
-            adj_ev, max_ev_retained = _adjust_eigenspectrum_melodic(
-                raw_evals=ev,
-                n_eff=n_samples_minka,
-                verbose=verbose,
-                capture_trace=False,
-            )
-            ppca_trace = None
-        n_adj = len(adj_ev)
-        max_k_eff = min(rank_cap, n_adj - 1)
-        if verbose:
-            print(
-                f"    Minka/MELODIC evidence scan: k in [{auto_min_components}, {max_k_eff}] "
-                f"(n_samples={n_samples_minka:,}, {n_adj} adjusted eigs) ..."
-            )
-        k, melodic_diag = melodic_evidence_proxy_k(
-            evals=adj_ev,
+    if mode in {"auto", "laplace"}:
+        # Marchenko-Pastur ceiling + Minka Laplace evidence; see decomposition/model_order.
+        # n_samples must be the *effective* spatial sample size -- passing the raw voxel
+        # count is what makes this estimator run away into the noise bulk.
+        res = select_model_order(
+            ev,
             n_samples=n_samples_minka,
-            n_features=n_adj,
-            min_k=auto_min_components,
-            max_k=max_k_eff,
-            criterion="aut",
+            k_min=auto_min_components,
+            k_max=rank_cap,
         )
-        # Check if first-peak hit the ceiling — evidence may still be increasing
-        if k >= max_k_eff - 1:
-            ll_arr = np.asarray(melodic_diag["log_evidence"])
-            if len(ll_arr) >= 3 and ll_arr[-1] > ll_arr[-2]:
-                print(
-                    f"  ⚠ Minka first-peak was STILL INCREASING at k={k} "
-                    f"(ceiling={max_k_eff}). True dimensionality may be higher. "
-                    f"Consider increasing -max_auto_components."
-                )
-        diagnostics["mp_adjusted"] = True
-        diagnostics["n_eigs_after_adj"] = n_adj
-        if capture_ppca_trace and ppca_trace is not None:
+        if res.at_ceiling:
+            print(
+                f"  ⚠ Laplace evidence was still rising at k={res.k}, the -max_auto_components "
+                f"ceiling; the data supports up to k={res.k_mp} (Marchenko-Pastur). "
+                f"Consider raising -max_auto_components."
+            )
+        diagnostics["mp_signal_count"] = int(res.k_mp)
+        diagnostics["mp_lambda_plus"] = float(res.lambda_plus)
+        diagnostics["noise_sigma2"] = float(res.sigma2)
+        if capture_ppca_trace:
             diagnostics["ppca_trace"] = {
-                **ppca_trace,
+                "eigenvalues": ev.tolist(),
+                "log_evidence": np.asarray(res.log_evidence, dtype=np.float64).tolist(),
+                "k_min": int(res.k_min),
                 "n_eigs_for_minka": int(n_eigs_for_minka),
                 "rank_cap": int(rank_cap),
-                "max_k_eff": int(max_k_eff),
-                "criteria": {
-                    key: np.asarray(val, dtype=np.float64).tolist()
-                    for key, val in _fsl_ppca_est_all(adj_ev, n_samples_minka).items()
-                },
-                "melodic_diag": melodic_diag,
+                **res.as_dict(),
             }
         if verbose:
-            global_k = melodic_diag.get("global_max_k", k)
-            if global_k != k:
-                print(f"    Minka selected k={k} (first-peak; global max was at k={global_k})")
-            else:
-                print(f"    Minka selected k={k}")
-        return k, diagnostics, {"mode": "melodic_laplace", **melodic_diag}
+            print(
+                f"    Model order: k={res.k} "
+                f"(MP ceiling {res.k_mp}, sigma^2={res.sigma2:.4g}, "
+                f"n_samples={res.n_samples:,})"
+            )
+        return res.k, diagnostics, {"mode": "laplace_mp", **res.as_dict()}
 
     if mode in {"hybrid", "current"}:
         all_mask = torch.ones(data_vox_t.shape[0], dtype=torch.bool, device=data_vox_t.device)

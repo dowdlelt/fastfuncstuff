@@ -47,10 +47,10 @@ class TestParseNumCompsSpec:
         result = parse_num_comps_spec("auto")
         assert result == "auto"
 
-    def test_parse_melodic(self):
-        """Test parsing 'melodic' keyword."""
-        result = parse_num_comps_spec("melodic")
-        assert result == "melodic"
+    def test_parse_laplace(self):
+        """Test parsing the 'laplace' keyword, and the old 'melodic' alias for it."""
+        assert parse_num_comps_spec("laplace") == "laplace"
+        assert parse_num_comps_spec("melodic") == "laplace"
 
     def test_parse_hybrid(self):
         """Test parsing 'hybrid' keyword."""
@@ -78,7 +78,7 @@ class TestParseNumCompsSpec:
         assert result == "auto"
 
         result = parse_num_comps_spec("MeLoDiC")
-        assert result == "melodic"
+        assert result == "laplace"
 
         result = parse_num_comps_spec("  Auto  ")
         assert result == "auto"

@@ -6,7 +6,7 @@ ffs_ica.py - Fast run-wise whole-brain ICA sanity-check / demo CLI.
 Core goals
 ----------
 - Simple whole-brain ICA workflow with GPU acceleration when available.
-- Automatic component estimation, including MELODIC-style Bayesian evidence proxy.
+- Automatic component estimation (Marchenko-Pastur ceiling + Minka Laplace evidence).
 - Optional ICASSO stability analysis at the selected component count.
 - Practical preprocessing knobs for fMRI runs:
   - optional spatial blur
@@ -63,6 +63,7 @@ try:
     )
     from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica  # noqa: F401
     from fastfuncstuff.decomposition.icasso import icasso
+    from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
         apply_polort_projection,
@@ -151,19 +152,19 @@ def _run_single_ica(
     tr = float(args.tr) if args.tr is not None else float(get_tr_from_file(run_file))
     _vprint(args.verb >= 1, f"TR = {tr:.4f}s, duration = {tr * n_t:.1f}s")
 
-    # FSL GUI/FEAT typically runs MELODIC on preprocessed filtered_func_data.
-    # Running auto/melodic directly on raw BOLD can yield a lower PPCA model
-    # order even with the same final mask.
+    # Model order is a property of the data, not just the mask: unpreprocessed BOLD
+    # carries drift and motion structure that changes the eigenspectrum, and so the
+    # selected order, relative to a filtered/denoised version of the same run.
     num_spec_preview = parse_num_comps_spec(args.num_comps)
     if (
         isinstance(num_spec_preview, str)
-        and num_spec_preview in {"auto", "melodic"}
+        and num_spec_preview in {"auto", "laplace"}
         and Path(run_file).name != "filtered_func_data.nii.gz"
         and Path(run_file).name != "filtered_func_data"
     ):
         print(
-            "  Note: auto/melodic on raw input may not match GUI/FEAT model-order "
-            "selection. GUI parity is typically against filtered_func_data stage."
+            "  Note: automatic model order on raw input reflects drift and motion "
+            "structure as well as signal; expect a different order after preprocessing."
         )
 
     if shared_mask is not None and shared_mask.shape != shape3d:
@@ -306,10 +307,11 @@ def _run_single_ica(
     if data_unblurred is not None:
         del data_unblurred
 
-    # --- Estimate spatial smoothness for effective DOF (MELODIC-style) ---
-    # FSL MELODIC computes resels = FWHM_x × FWHM_y × FWHM_z from the data,
-    # then: N_eff = n_vox / (2.5 × resels).  This accounts for spatial
-    # autocorrelation so the Minka/Laplace estimator doesn't over-count DOF.
+    # --- Estimate spatial smoothness for effective DOF ---
+    # A smoothed image has fewer independent observations than voxels, and the Laplace
+    # evidence scales with that count, so feeding it the raw voxel count is what makes
+    # model order run away. One resel is FWHM_x × FWHM_y × FWHM_z voxels (Worsley et al.
+    # 1992), so N_eff = n_vox / resels.
     _vsection(args.verb >= 1, "Spatial Smoothness")
     t_step = time.time()
     if args.smoothness_fwhm is not None:
@@ -337,14 +339,12 @@ def _run_single_ica(
             f"Estimated spatial FWHM: {fwhm_geo:.2f} voxels (resels={resels:.2f})",
         )
 
-    # FSL formula: N_eff = n_vox / (2.5 × resels)
-    # where resels = FWHM_x × FWHM_y × FWHM_z (product, NOT geometric mean)
-    # Floor at n_time to avoid degenerate cases
-    n_eff = max(n_t, int(n_vox_masked / (2.5 * resels)))
+    # resels is the product FWHM_x × FWHM_y × FWHM_z, not a geometric mean.
+    # Floor at n_time to avoid degenerate cases.
+    n_eff = effective_sample_size_from_resels(n_vox_masked, resels, floor=n_t)
     _vprint(
         args.verb >= 1,
-        f"Effective spatial DOF: {n_eff:,} "
-        f"(raw={n_vox_masked:,}, correction=2.5×{resels:.1f}={2.5 * resels:.1f})",
+        f"Effective spatial DOF: {n_eff:,} (raw={n_vox_masked:,}, resels={resels:.1f})",
         t_step,
     )
 
@@ -462,12 +462,14 @@ def _run_single_ica(
     n_eff_for_model_order = n_eff
     data_for_model_order = data_vox_t
     model_order_filter_diag = None
-    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+    if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
         data_for_model_order, model_order_filter_diag = (
             ica_workflow.filter_voxels_for_melodic_model_order(data_vox_t=data_vox_t)
         )
         n_vox_model_order = int(data_for_model_order.shape[0])
-        n_eff_for_model_order = max(n_t, int(n_vox_model_order / (2.5 * resels)))
+        n_eff_for_model_order = effective_sample_size_from_resels(
+            n_vox_model_order, resels, floor=n_t
+        )
         _vprint(
             args.verb >= 1,
             "MELODIC dim-est filter: "
@@ -520,13 +522,13 @@ def _run_single_ica(
         _eig_td = _Peig(_trace_eig_flag) / run_tag
         _eig_td.mkdir(parents=True, exist_ok=True)
         _ppt = pca_diag["ppca_trace"]
-        _adj_sorted = np.array(_ppt.get("adjusted_sorted", []), dtype=np.float64)
-        _mp_exp = np.array(_ppt.get("mp_expected", []), dtype=np.float64)
-        if len(_adj_sorted) > 0:
-            np.savetxt(str(_eig_td / "eigenvalues_adjusted"), _adj_sorted, fmt="%.10g")
-        if len(_mp_exp) > 0:
-            np.save(str(_eig_td / "mp_expected.npy"), _mp_exp)
-        _vprint(args.verb >= 1, f"Trace: eigenvalue adjustment → {_eig_td}")
+        _eigs = np.array(_ppt.get("eigenvalues", []), dtype=np.float64)
+        _ll = np.array(_ppt.get("log_evidence", []), dtype=np.float64)
+        if len(_eigs) > 0:
+            np.savetxt(str(_eig_td / "eigenvalues"), _eigs, fmt="%.10g")
+        if len(_ll) > 0:
+            np.save(str(_eig_td / "log_evidence.npy"), _ll)
+        _vprint(args.verb >= 1, f"Trace: model-order evidence → {_eig_td}")
 
     _vprint(
         args.verb >= 1,
@@ -1703,16 +1705,14 @@ def _run_concat_ica(
     _vprint(args.verb >= 1, f"Concat variance: {concat_var:.4f}")
 
     # --- Spatial smoothness / effective DOF ---
-    # MELODIC: NumVox = floor(num_vox / (2.5 * resels)) feeds the MP noise floor
-    # (melhlprfns.cc adj_eigspec:444). Without this correction, MP is too tight
-    # and PPCA over-estimates component count.
+    # The effective sample size the Laplace evidence is scaled by; see the note at the
+    # single-run site above and decomposition/model_order.
     resels = resels_accum
     fwhm_geo = fwhm_geo_accum
-    n_eff = max(int(total_t), int(n_vox_masked / (2.5 * max(resels, 1e-6))))
+    n_eff = effective_sample_size_from_resels(n_vox_masked, resels, floor=int(total_t))
     _vprint(
         args.verb >= 1,
-        f"Effective spatial DOF: n_eff={n_eff:,} "
-        f"(raw V={n_vox_masked:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
+        f"Effective spatial DOF: n_eff={n_eff:,} (raw V={n_vox_masked:,}, resels={resels:.2f})",
     )
 
     # --- Component count estimation (on concat, MELODIC-style) ---
@@ -1732,13 +1732,13 @@ def _run_concat_ica(
 
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V, T_total)
-    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+    if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
         data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
             data_vox_t=data_tv.T
         )
         n_vox_model_order = int(data_for_model_order_vt.shape[0])
         n_eff_for_model_order = max(
-            int(T_total), int(n_vox_model_order / (2.5 * max(resels, 1e-6)))
+            int(T_total), effective_sample_size_from_resels(n_vox_model_order, resels)
         )
         _vprint(
             args.verb >= 1,
@@ -1809,9 +1809,9 @@ def _run_concat_ica(
         if _trace_cov is not None:
             np.save(_td / "cov_temporal.npy", _trace_cov)
         if "ppca_trace" in pca_diag:
-            _mp_exp = np.array(pca_diag["ppca_trace"].get("mp_expected", []), dtype=np.float64)
-            if len(_mp_exp) > 0:
-                np.save(str(_td / "mp_expected.npy"), _mp_exp)
+            _ll = np.array(pca_diag["ppca_trace"].get("log_evidence", []), dtype=np.float64)
+            if len(_ll) > 0:
+                np.save(str(_td / "log_evidence.npy"), _ll)
         _vprint(args.verb >= 1, f"Trace: PCA intermediates → {_td}")
 
     del data_centered, evals_t, evecs_t, sqrt_ev
@@ -2461,7 +2461,7 @@ def _run_temporal_ica(
             max_auto_k = max(5, int((stack_t - 2) * args.max_auto_components))
         else:
             max_auto_k = int(args.max_auto_components)
-        n_eff = max(stack_t, int(n_vox_masked / (2.5 * max(resels, 1e-6))))
+        n_eff = effective_sample_size_from_resels(n_vox_masked, resels, floor=stack_t)
         k_sica, _, _ = estimate_ica_component_count(
             data_vox_t=concat_tv.T,
             method=num_spec,
@@ -2960,11 +2960,10 @@ def _run_tensorial_ica(
     # structure, so n_eff scales by n_runs.
     resels = resels_accum
     fwhm_geo = fwhm_geo_accum
-    n_eff = max(int(T), int(V_total / (2.5 * max(resels, 1e-6))))
+    n_eff = effective_sample_size_from_resels(V_total, resels, floor=int(T))
     _vprint(
         args.verb >= 1,
-        f"Effective spatial DOF: n_eff={n_eff:,} "
-        f"(V_total={V_total:,}, resels={resels:.2f}, 2.5*resels={2.5 * resels:.1f})",
+        f"Effective spatial DOF: n_eff={n_eff:,} (V_total={V_total:,}, resels={resels:.2f})",
     )
 
     # --- Component estimation ----------------------------------------------
@@ -2981,12 +2980,14 @@ def _run_tensorial_ica(
 
     n_eff_for_model_order = n_eff
     data_for_model_order_vt = data_tv.T  # (V_total, T)
-    if isinstance(num_spec, str) and num_spec in {"auto", "melodic"}:
+    if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
         data_for_model_order_vt, _ = ica_workflow.filter_voxels_for_melodic_model_order(
             data_vox_t=data_tv.T
         )
         n_vox_model_order = int(data_for_model_order_vt.shape[0])
-        n_eff_for_model_order = max(int(T), int(n_vox_model_order / (2.5 * max(resels, 1e-6))))
+        n_eff_for_model_order = effective_sample_size_from_resels(
+            n_vox_model_order, resels, floor=int(T)
+        )
         _vprint(
             args.verb >= 1,
             f"MELODIC dim-est filter: kept {n_vox_model_order:,}/{V_total:,} columns; "
@@ -3348,8 +3349,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default="auto",
         help=(
-            "Component selection: INT, FLOAT(0-1), or auto/melodic/hybrid/current/erank/mp. "
-            "'auto' and 'melodic' use a MELODIC-style Bayesian evidence proxy."
+            "Component selection: INT, FLOAT(0-1), or auto/laplace/hybrid/current/erank/mp. "
+            "'auto' and 'laplace' take the Marchenko-Pastur count as a ceiling and pick "
+            "within it by Minka's PPCA Laplace evidence.  ('melodic' is accepted as an "
+            "old name for 'laplace'.)"
         ),
     )
     basic.add_argument(
@@ -3416,7 +3419,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override estimated spatial smoothness (FWHM in mm) for Minka DOF correction.  "
         "If not set, smoothness is estimated from the data.  Affects dimensionality estimation "
-        "via the MELODIC-style effective-sample-size formula: N_eff = n_vox / (2.5 × FWHM_vox).",
+        "via the resel-based effective-sample-size N_eff = n_vox / (FWHM_x·FWHM_y·FWHM_z).",
     )
     proc.add_argument(
         "-polort",

@@ -16,7 +16,6 @@ from fastfuncstuff.decomposition.postprocess import (
     save_scree_plot,
 )
 from fastfuncstuff.decomposition.tools import (
-    _adjust_eigenspectrum_melodic,
     apply_high_pass_fft,
     apply_polort_projection,
     estimate_ica_component_count,
@@ -293,47 +292,6 @@ class TestApplyHighPassFFT:
 
 
 # ---------------------------------------------------------------------------
-# tools: _adjust_eigenspectrum_melodic
-# ---------------------------------------------------------------------------
-
-
-class TestAdjustEigenspectrumMelodic:
-    def test_basic_output(self):
-        """Returns adjusted evals and max_ev count."""
-        rng = np.random.default_rng(42)
-        # Simulate descending eigenvalue spectrum
-        ev = np.sort(rng.exponential(1.0, size=30))[::-1].astype(np.float64)
-        adj_ev, max_ev = _adjust_eigenspectrum_melodic(ev, n_eff=500, verbose=False)
-        assert len(adj_ev) <= len(ev)
-        assert max_ev >= 1
-        assert max_ev <= len(ev)
-        # Adjusted evals should be positive
-        assert np.all(adj_ev > 0)
-
-    def test_small_spectrum(self):
-        """Works with <= 4 eigenvalues (skip drop-2 logic)."""
-        ev = np.array([5.0, 2.0, 1.0, 0.5], dtype=np.float64)
-        adj_ev, max_ev = _adjust_eigenspectrum_melodic(ev, n_eff=100)
-        assert len(adj_ev) >= 1
-
-    def test_capture_trace(self):
-        """capture_trace=True returns a trace dict."""
-        ev = np.sort(np.random.exponential(1.0, size=20))[::-1]
-        result = _adjust_eigenspectrum_melodic(ev, n_eff=200, capture_trace=True)
-        assert len(result) == 3
-        adj_ev, max_ev, trace = result
-        assert isinstance(trace, dict)
-        assert "n_raw_eigs" in trace
-        assert "mp_expected" in trace
-
-    def test_verbose_prints(self, capsys):
-        ev = np.sort(np.random.exponential(1.0, size=15))[::-1]
-        _adjust_eigenspectrum_melodic(ev, n_eff=100, verbose=True)
-        captured = capsys.readouterr()
-        assert "MP eigenvalue adjustment" in captured.out
-
-
-# ---------------------------------------------------------------------------
 # tools: estimate_ica_component_count
 # ---------------------------------------------------------------------------
 
@@ -378,10 +336,10 @@ class TestEstimateICAComponentCount:
         assert 1 <= k <= 30
         assert info["mode"] == "pca_variance_fraction"
 
-    def test_melodic_mode(self, fake_data):
+    def test_laplace_mode(self, fake_data):
         k, diag, info = estimate_ica_component_count(
             fake_data,
-            method="melodic",
+            method="laplace",
             max_auto_components=20,
             auto_min_components=2,
             auto_var_threshold=0.95,
@@ -390,7 +348,7 @@ class TestEstimateICAComponentCount:
             verbose=False,
         )
         assert 1 <= k <= 20
-        assert info["mode"] == "melodic_laplace"
+        assert info["mode"] == "laplace_mp"
 
     def test_erank_mode(self, fake_data):
         k, diag, info = estimate_ica_component_count(
@@ -464,7 +422,7 @@ class TestEstimateICAComponentCount:
         """n_eff parameter should not crash."""
         k, diag, info = estimate_ica_component_count(
             fake_data,
-            method="melodic",
+            method="laplace",
             max_auto_components=20,
             auto_min_components=2,
             auto_var_threshold=0.95,
@@ -478,7 +436,7 @@ class TestEstimateICAComponentCount:
     def test_capture_ppca_trace(self, fake_data):
         k, diag, info = estimate_ica_component_count(
             fake_data,
-            method="melodic",
+            method="laplace",
             max_auto_components=20,
             auto_min_components=2,
             auto_var_threshold=0.95,

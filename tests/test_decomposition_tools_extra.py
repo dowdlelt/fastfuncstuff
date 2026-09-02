@@ -3,9 +3,6 @@ import pytest
 import torch
 
 from fastfuncstuff.decomposition.tools import (
-    _fsl_first_peak_k,
-    _fsl_ppca_est,
-    _mp_expected_eigenvalues,
     apply_high_pass_fft,
     apply_polort_projection,
     batch_fit_ggm,
@@ -29,7 +26,9 @@ def test_parse_num_comps_spec_float():
 
 
 def test_parse_num_comps_spec_string():
-    assert parse_num_comps_spec("melodic") == "melodic"
+    assert parse_num_comps_spec("laplace") == "laplace"
+    # the old name still parses, mapped to the new one
+    assert parse_num_comps_spec("melodic") == "laplace"
 
 
 def test_apply_polort_projection_removes_linear_trend():
@@ -83,32 +82,6 @@ def test_mp_spikes_from_spectrum():
     spikes_evals = np.sort(spikes_evals)[::-1]
     n_spikes = mp_spikes_from_spectrum(spikes_evals, n_samples=n_samples, n_features=n_features)
     assert n_spikes >= 2
-
-
-def test_mp_expected_eigenvalues_shape():
-    n_features = 20
-    n_samples = 100
-    result = _mp_expected_eigenvalues(n_features, n_samples)
-    assert isinstance(result, np.ndarray)
-    assert result.shape == (n_features,)
-    assert np.all(result > 0)
-
-
-def test_fsl_ppca_est_returns_array():
-    eigenvalues = np.array([50.0, 20.0, 10.0, 3.0, 1.0, 0.5, 0.3, 0.2])
-    N = 500
-    result = _fsl_ppca_est(eigenvalues, N)
-    assert isinstance(result, np.ndarray)
-    assert result.shape == (len(eigenvalues),)
-    assert np.all(np.isfinite(result))
-    assert np.argmax(result) < len(eigenvalues) - 1
-
-
-def test_fsl_first_peak_k():
-    evidence = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
-    max_k = 5
-    result = _fsl_first_peak_k(evidence, max_k)
-    assert result == max_k
 
 
 def test_component_condition_correlations_shape():

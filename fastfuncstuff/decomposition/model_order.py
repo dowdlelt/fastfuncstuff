@@ -42,6 +42,7 @@ import numpy as np
 __all__ = [
     "ModelOrderResult",
     "effective_sample_size",
+    "effective_sample_size_from_resels",
     "laplace_evidence_curve",
     "mp_noise_level",
     "mp_signal_count",
@@ -108,12 +109,23 @@ def effective_sample_size(n_voxels: int, fwhm_voxels: tuple[float, float, float]
     from :mod:`fastfuncstuff.stats.fwhmx`. Values below 1 voxel mean no smoothing along
     that axis and contribute a factor of 1.
     """
-    if n_voxels <= 0:
-        raise ValueError(f"n_voxels must be positive, got {n_voxels}")
     resel = 1.0
     for f in fwhm_voxels:
         resel *= max(1.0, float(f))
-    return max(1, int(n_voxels / resel))
+    return effective_sample_size_from_resels(n_voxels, resel)
+
+
+def effective_sample_size_from_resels(n_voxels: int, resels: float, floor: int = 1) -> int:
+    """As :func:`effective_sample_size`, given the resel *product* directly.
+
+    One resel is the smoothness volume, so the count of independent observations is
+    ``n_voxels / resels`` -- the definition, with no additional scaling. ``floor`` lets a
+    caller keep the result at or above some minimum (typically the number of timepoints,
+    below which a temporal covariance estimate stops being meaningful).
+    """
+    if n_voxels <= 0:
+        raise ValueError(f"n_voxels must be positive, got {n_voxels}")
+    return max(int(floor), 1, int(n_voxels / max(float(resels), 1e-6)))
 
 
 def mp_noise_level(
