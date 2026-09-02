@@ -336,8 +336,8 @@ class BenchmarkProfiler:
     stages: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
-    def create(cls, processing_dir: Path, trace: bool = False) -> BenchmarkProfiler:
-        base = processing_dir / "benchmark_profiles"
+    def create(cls, data_dir: Path, trace: bool = False) -> BenchmarkProfiler:
+        base = data_dir / "profiles"
         stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
         root = base / stamp
         suffix = 2

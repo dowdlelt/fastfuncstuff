@@ -98,7 +98,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-profile",
         action="store_true",
         help="Profile FFS commands that execute. Writes compact per-invocation and "
-        "stage-aggregated CPU/PyTorch/CUDA reports under processing/benchmark_profiles. "
+        "stage-aggregated CPU/PyTorch/CUDA reports under <data-dir>/profiles. "
         "Does not imply -force-ffs and profiled timings are never cached.",
     )
     parser.add_argument(

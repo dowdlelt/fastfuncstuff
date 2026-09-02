@@ -533,7 +533,7 @@ def run_stages(
     if ctx.profile:
         from .profiling import BenchmarkProfiler
 
-        benchmark_profiler = BenchmarkProfiler.create(ctx.processing_dir, trace=ctx.profile_trace)
+        benchmark_profiler = BenchmarkProfiler.create(ctx.data_dir, trace=ctx.profile_trace)
         print(f"Profiles: {benchmark_profiler.root}")
 
     # Up-front dependency advisory: if a requested stage depends on stages not in

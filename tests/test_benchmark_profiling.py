@@ -143,7 +143,7 @@ def test_profiled_ffs_timing_is_not_cached(tmp_path, monkeypatch):
 
     assert result.ffs_time == 12.0
     assert recorded["stage_timings"] == {}
-    manifest_path = next((tmp_path / "processing" / "benchmark_profiles").glob("*/manifest.json"))
+    manifest_path = next((tmp_path / "profiles").glob("*/manifest.json"))
     manifest = json.loads(manifest_path.read_text())
     assert manifest["profiled_invocations"] == 0
 
