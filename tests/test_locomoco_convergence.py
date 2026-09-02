@@ -3,6 +3,7 @@
 import torch
 
 from fastfuncstuff.processing.locomoco import (
+    optical_flow_lk_2d,
     optical_flow_lk_3d_axes,
     summarize_flow_convergence,
 )
@@ -130,3 +131,39 @@ def test_conv_out_is_none_by_default_and_costs_nothing():
     )
     # Recording must not perturb the estimate it is reporting on.
     assert torch.equal(a[0], b[0])
+
+
+def test_2d_conv_out_shape_matches_levels_and_iters():
+    torch.manual_seed(0)
+    fixed = torch.rand(4, 32, 32)
+    moving = torch.roll(fixed, shifts=1, dims=1)
+    conv: list[torch.Tensor] = []
+    optical_flow_lk_2d(fixed, moving, n_levels=3, n_iters=5, conv_out=conv)
+    assert len(conv) == 1
+    assert conv[0].shape == (3, 5)  # (n_levels, n_iters), coarsest first
+    assert torch.isfinite(conv[0]).all()
+
+
+def test_2d_conv_out_records_on_both_the_1dof_and_2dof_branches():
+    # pe_only_axis picks the scalar update; None takes the coupled 2x2 solve. Both write.
+    torch.manual_seed(0)
+    fixed = torch.rand(4, 32, 32)
+    moving = torch.roll(fixed, shifts=1, dims=1)
+    for pe_axis in (0, 1, None):
+        conv: list[torch.Tensor] = []
+        optical_flow_lk_2d(
+            fixed, moving, n_levels=2, n_iters=3, pe_only_axis=pe_axis, conv_out=conv
+        )
+        assert conv[0].shape == (2, 3), pe_axis
+        assert torch.isfinite(conv[0]).all(), pe_axis
+
+
+def test_2d_recording_does_not_perturb_the_estimate():
+    torch.manual_seed(0)
+    fixed = torch.rand(4, 32, 32)
+    moving = torch.roll(fixed, shifts=1, dims=1)
+    kw = dict(n_levels=2, n_iters=3)
+    u0, v0 = optical_flow_lk_2d(fixed, moving, **kw)
+    conv: list[torch.Tensor] = []
+    u1, v1 = optical_flow_lk_2d(fixed, moving, conv_out=conv, **kw)
+    assert torch.equal(u0, u1) and torch.equal(v0, v1)

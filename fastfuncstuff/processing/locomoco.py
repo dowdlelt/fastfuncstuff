@@ -244,6 +244,24 @@ def _warp2d_pe(
     return _warp2d(img, u, v, mode, radius)
 
 
+def _weighted_step_rms(weight: torch.Tensor, comps: list[torch.Tensor]) -> torch.Tensor:
+    """Size of one LK update, weighted by where the data can actually constrain it.
+
+    ``comps`` are the per-axis update fields and ``weight`` the pooled gradient energy the
+    solve already computed. Weighted rather than masked: the weight is zero exactly where
+    the update is unconstrained, so it needs no threshold (and no quantile) on the hot
+    path, and it keeps a small, LOCAL displacement visible where a plain rms over the
+    volume would bury it under the stationary majority.
+
+    Returns a 0-dim tensor and deliberately does not synchronise — the callers record one
+    of these per iteration and copy the whole stack off the device once per sweep.
+    """
+    num = comps[0] * comps[0]
+    for c in comps[1:]:
+        num = num + c * c
+    return ((weight * num).sum() / weight.sum().clamp_min(1e-12)).sqrt()
+
+
 def optical_flow_lk_2d(
     fixed: torch.Tensor,
     moving: torch.Tensor,
@@ -256,6 +274,7 @@ def optical_flow_lk_2d(
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     max_shift: float | None = None,
+    conv_out: list[torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dense pyramidal Lucas-Kanade optical flow for a batch of 2-D image pairs.
 
@@ -276,6 +295,11 @@ def optical_flow_lk_2d(
     130-voxel axis, in the ramp-in slices at the end of a slab where the tissue signal is
     a third of mid-slab and there is nothing to track. Clamping per level keeps the
     unbounded case at the physical limit the caller already declared via ``-max_shift``.
+
+    ``conv_out``, if given, receives one ``(n_levels, n_iters)`` tensor of per-iteration
+    update sizes, levels COARSEST FIRST — the 2-D twin of the record
+    :func:`optical_flow_lk_3d_axes` keeps, and the input to
+    :func:`summarize_flow_convergence`.
     """
     fixed_pyr, moving_pyr = [fixed], [moving]
     for _ in range(n_levels - 1):
@@ -286,6 +310,7 @@ def optical_flow_lk_2d(
 
     u = torch.zeros_like(fixed_pyr[-1])
     v = torch.zeros_like(u)
+    conv_steps: list[torch.Tensor] = []
 
     for level in range(len(fixed_pyr) - 1, -1, -1):
         fx_l, mv_l = fixed_pyr[level], moving_pyr[level]
@@ -305,6 +330,7 @@ def optical_flow_lk_2d(
                 * sy
             )
 
+        iter_steps: list[torch.Tensor] = []
         for _ in range(n_iters):
             mv_w = _warp2d_pe(
                 mv_l,
@@ -319,11 +345,14 @@ def optical_flow_lk_2d(
             ix, iy = _spatial_gradients(mv_w)
             if pe_only_axis is not None:
                 ip = ix if pe_only_axis == 0 else iy
-                step = -_blur2d(ip * it, window_sigma) / (_blur2d(ip * ip, window_sigma) + reg)
+                den = _blur2d(ip * ip, window_sigma) + reg
+                step = -_blur2d(ip * it, window_sigma) / den
                 if pe_only_axis == 0:
                     u = u + step
                 else:
                     v = v + step
+                if conv_out is not None:
+                    iter_steps.append(_weighted_step_rms(den, [step]))
             else:
                 a11 = _blur2d(ix * ix, window_sigma) + reg
                 a22 = _blur2d(iy * iy, window_sigma) + reg
@@ -331,11 +360,19 @@ def optical_flow_lk_2d(
                 b1 = -_blur2d(ix * it, window_sigma)
                 b2 = -_blur2d(iy * it, window_sigma)
                 det = a11 * a22 - a12 * a12
-                u = u + (a22 * b1 - a12 * b2) / det
-                v = v + (a11 * b2 - a12 * b1) / det
+                du = (a22 * b1 - a12 * b2) / det
+                dv = (a11 * b2 - a12 * b1) / det
+                u = u + du
+                v = v + dv
+                if conv_out is not None:
+                    iter_steps.append(_weighted_step_rms(a11, [du, dv]))
             if max_shift is not None:
                 u = u.clamp(-max_shift, max_shift)
                 v = v.clamp(-max_shift, max_shift)
+        if conv_out is not None and iter_steps:
+            conv_steps.append(torch.stack(iter_steps))
+    if conv_out is not None and conv_steps:
+        conv_out.append(torch.stack(conv_steps))
 
     return u, v
 
@@ -1542,6 +1579,7 @@ def _estimate_static(
     match="none",
     match_sigma=6.0,
     gate=None,
+    conv_out=None,
 ):
     """Fixed reference: batch the flow over ALL frames at once, looping slices.
 
@@ -1597,7 +1635,7 @@ def _estimate_static(
         moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
         conf_acc: list[torch.Tensor] | None = [] if diag is not None else None
         curve_acc: list[torch.Tensor] | None = [] if curve_frame is not None else None
-        u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc)
+        u, v = flow_fn(fixed, moving, conf_out=conf_acc, curve_out=curve_acc, conv_out=conv_out)
         if gate is not None:
             gate_s = gate[s].to(device)
             u, v = u * gate_s, v * gate_s
@@ -1634,6 +1672,7 @@ def _estimate_cumulative(
     hpf_sigma=0.0,
     match="none",
     match_sigma=6.0,
+    conv_out=None,
 ):
     """Progressive reference: frame t registers to the running mean/median of the
     already-corrected frames 0..t-1 (frame 0 is the seed, zero warp). Sequential in
@@ -1664,7 +1703,7 @@ def _estimate_cumulative(
         est_moving = _spatial_highpass(_match_prep2d(moving_raw, match, match_sigma), hpf_sigma)
         fixed = _blur2d(est_fixed, smooth_sigma) if smooth_sigma > 0 else est_fixed
         moving = _blur2d(est_moving, smooth_sigma) if smooth_sigma > 0 else est_moving
-        u, v = flow_fn(fixed, moving)
+        u, v = flow_fn(fixed, moving, conv_out=conv_out)
         corr = _correct_pe(moving_raw, u, v, pe_flow_is_u, dual, warp_interp, warp_radius)
         corrected[t] = corr.cpu()
         u_all[t] = u.cpu()
@@ -1705,10 +1744,11 @@ def _build_flow_fn(
         # dual (both axes) = full 2-D flow; single respects pe_only.
         pe_only_axis = None if dual else ((0 if pe_flow_is_u else 1) if pe_only else None)
 
-        def flow_fn(fx, mv, **_unused) -> tuple[torch.Tensor, torch.Tensor]:
+        def flow_fn(fx, mv, conv_out=None, **_unused) -> tuple[torch.Tensor, torch.Tensor]:
             return optical_flow_lk_2d(
                 fx,
                 mv,
+                conv_out=conv_out,
                 n_levels=n_levels,
                 n_iters=n_iters,
                 window_sigma=window_sigma,
@@ -1734,7 +1774,9 @@ def _build_flow_fn(
             )
     elif backend == "xcorr":
 
-        def flow_fn(fx, mv, conf_out=None, curve_out=None) -> tuple[torch.Tensor, torch.Tensor]:
+        def flow_fn(
+            fx, mv, conf_out=None, curve_out=None, conv_out=None
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             return xcorr_search_flow_2d(
                 fx,
                 mv,
@@ -2038,6 +2080,21 @@ def estimate_residual_flow(
             ).cpu()
         return u, v, corr
 
+    # How the flow backend's inner iterations converged on the most recent sweep, read
+    # back by the line each refine pass prints. The xcorr/phase backends leave it empty
+    # (single-shot and whole-field respectively) and nothing is printed.
+    conv_note = {"txt": ""}
+
+    def _conv_acc() -> list[torch.Tensor] | None:
+        return [] if backend == "flow" else None
+
+    def _note_from(acc: list[torch.Tensor] | None) -> None:
+        if acc:
+            # The one synchronisation: every slice's record stayed on the device until
+            # here, so this is a single copy per sweep rather than a stall per iteration.
+            conv_note["txt"] = summarize_flow_convergence(torch.stack(acc).cpu(), n_iters)
+
+    conv_acc = _conv_acc()
     progressive = ref_mode in ("first_mean", "first_median")
     if progressive:
         u_all, v_all, corrected = _estimate_cumulative(
@@ -2053,6 +2110,7 @@ def estimate_residual_flow(
             hpf_sigma=hpf_sigma,
             match=match,
             match_sigma=match_sigma,
+            conv_out=conv_acc,
         )
     else:
         u_all, v_all, corrected = _estimate_static(
@@ -2071,7 +2129,11 @@ def estimate_residual_flow(
             match=match,
             match_sigma=match_sigma,
             gate=soft,
+            conv_out=conv_acc,
         )
+    _note_from(conv_acc)
+    if verbose and conv_note["txt"]:
+        print(f"   initial estimate:  {conv_note['txt']}")
     if progressive:
         u_all, v_all, corrected = _gate(u_all, v_all, corrected)
     # Outer reference-refinement (shared engine): rebuild the reference from the
@@ -2082,6 +2144,7 @@ def estimate_residual_flow(
         brain = _brain_mask_from(corrected.abs().mean(dim=0))  # (nS, H, W)
 
         def _est_2d(new_ref):
+            acc = _conv_acc()
             u, v, corr = _estimate_static(
                 vol,
                 ref_mode,
@@ -2098,7 +2161,9 @@ def estimate_residual_flow(
                 match=match,
                 match_sigma=match_sigma,
                 gate=soft,
+                conv_out=acc,
             )
+            _note_from(acc)
             return (u, v), corr
 
         # Frames per step-rms chunk, sized so the difference stays around 64 MiB
@@ -2129,6 +2194,7 @@ def estimate_residual_flow(
             converge_rel=converge_rel,
             max_shift=max_shift,
             verbose=verbose,
+            note=lambda: conv_note["txt"],
         )
         u_all, v_all = pair
 
@@ -4901,15 +4967,8 @@ def optical_flow_lk_3d_axes(
                     (j31 * b[0] + j32 * b[1] + j33 * b[2]) / det,
                 ]
             if conv_out is not None:
-                # Weighted, not masked: a[0][0] is the pooled gradient energy already in
-                # hand, it is zero exactly where the update is unconstrained, and using it
-                # as a weight avoids inventing a threshold (and the quantile that a
-                # threshold would need) on the hot path.
-                w = a[0][0]
-                num = upd[0] * upd[0]
-                for u in upd[1:]:
-                    num = num + u * u
-                iter_steps.append(((w * num).sum() / w.sum().clamp_min(1e-12)).sqrt())
+                # a[0][0] is the pooled gradient energy the solve already built.
+                iter_steps.append(_weighted_step_rms(a[0][0], upd))
             for i, k in enumerate(act):
                 disp[k] = disp[k] + upd[i]
                 if max_disp[k] is not None:
