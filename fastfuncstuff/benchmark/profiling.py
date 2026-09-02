@@ -18,7 +18,6 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 _T = TypeVar("_T")
-_COMPACT_TORCH_WINDOW_SECONDS = 2.0
 _SHELL_TOKENS = {"|", "||", "&&", ";", ">", ">>", "<", "2>", "2>>"}
 
 
@@ -117,60 +116,154 @@ def _torch_rows(torch_profiler: Any, limit: int = 75) -> list[dict[str, Any]]:
                 "device_seconds": float(getattr(event, "device_time_total", 0.0)) / 1e6,
             }
         )
-    rows.sort(
+    # Rank by device and by CPU separately and keep the head of each. One
+    # combined max() ranking let the CPU-side operators fill the whole table:
+    # a busy run has thousands of cheap launches whose CPU time outranks every
+    # individual kernel, so the GPU rows fell off the end and the report looked
+    # as though nothing ran on the card.
+    by_device = sorted(rows, key=lambda row: row["self_device_seconds"], reverse=True)
+    by_cpu = sorted(rows, key=lambda row: row["self_cpu_seconds"], reverse=True)
+    kept: dict[str, dict[str, Any]] = {}
+    for row in [r for r in by_device if r["self_device_seconds"] > 0][: limit // 2] + by_cpu:
+        kept.setdefault(row["operator"], row)
+        if len(kept) >= limit:
+            break
+    return sorted(
+        kept.values(),
         key=lambda row: max(row["self_device_seconds"], row["self_cpu_seconds"]),
         reverse=True,
     )
-    return rows[:limit]
 
 
-def _arm_collection_limit(
+@dataclass
+class _SampleSchedule:
+    """Duty-cycled Kineto sampling: skip startup, then sample across the run.
+
+    The window used to be the *first* two seconds of the process, which for an
+    FFS CLI is imports, argument parsing and the first read -- so the GPU
+    columns came back 0.00 for sixteen of eighteen benchmark stages. Nothing
+    was wrong with the collection; it was pointed at the wrong part of the run.
+
+    Kineto costs about 3% while collecting and nothing at all while toggled off
+    (measured: 0.109 ms/op against a 0.106 ms baseline), so the budget is set by
+    how many events are worth carrying, not by overhead. Sampling ``active``
+    seconds out of every ``active + idle`` after a ``warmup`` gives coverage of
+    every phase a long tool goes through rather than one arbitrary slice of it.
+    """
+
+    warmup: float = 1.5
+    active: float = 1.0
+    idle: float = 3.0
+    budget: float = 4.0
+
+
+_DEFAULT_SAMPLE_SCHEDULE = _SampleSchedule()
+
+
+def _arm_collection_schedule(
     torch_profiler: Any,
     activities: list[Any],
-    seconds: float | None,
+    schedule: _SampleSchedule | None,
 ) -> tuple[dict[str, Any], Callable[[], None]]:
-    """Stop Kineto event collection after a short window on the main thread."""
+    """Duty-cycle Kineto collection on the main thread via SIGALRM.
+
+    Returns the state dict recorded into the profile and a cleanup callable.
+    Collection begins switched off and is turned on once ``warmup`` has passed,
+    so process startup never fills the buffer.
+    """
+    import torch
+
     state: dict[str, Any] = {
-        "limit_seconds": seconds,
+        "schedule": None if schedule is None else vars(schedule).copy(),
         "limited": False,
+        "started": schedule is None,
         "collection_seconds": None,
+        "windows": 0,
         "error": None,
     }
     no_cleanup = lambda: None
     required = ("SIGALRM", "ITIMER_REAL", "getitimer", "setitimer")
     if (
-        seconds is None
-        or seconds <= 0
+        schedule is None
+        or schedule.active <= 0
         or threading.current_thread() is not threading.main_thread()
         or not all(hasattr(signal, name) for name in required)
     ):
         return state, no_cleanup
 
     timer_kind = signal.ITIMER_REAL
-    previous_timer = signal.getitimer(timer_kind)
-    if previous_timer[0] > 0:
+    if signal.getitimer(timer_kind)[0] > 0:
         state["error"] = "SIGALRM timer already active; collected the full invocation"
+        state["started"] = True
         return state, no_cleanup
 
     sigalrm = signal.SIGALRM
     previous_handler = signal.getsignal(sigalrm)
-    collection_started = time.monotonic()
+    collected = 0.0
+    window_opened: float | None = None
+    recording = False
 
-    def stop_collection(_signum: int, _frame: Any) -> None:
+    # Toggling the CUDA activity loses device attribution: a real ffs_moco run
+    # came back with 0.0 device seconds on every operator, while the same run
+    # left un-toggled reported 0.466 s across 201 operators. CPU events are
+    # where the volume is anyway, and Kineto costs ~3% while collecting, so the
+    # GPU side simply stays on for the whole invocation.
+    cpu_only = [a for a in activities if a == torch.profiler.ProfilerActivity.CPU]
+
+    def toggle(on: bool) -> bool:
         try:
-            torch_profiler.toggle_collection_dynamic(False, activities)
+            torch_profiler.toggle_collection_dynamic(on, cpu_only)
         except Exception as exc:
             state["error"] = f"{type(exc).__name__}: {exc}"
-        else:
-            state["limited"] = True
-            state["collection_seconds"] = time.monotonic() - collection_started
+            return False
+        return True
 
-    signal.signal(sigalrm, stop_collection)
-    signal.setitimer(timer_kind, seconds)
+    def tick(_signum: int, _frame: Any) -> None:
+        nonlocal collected, window_opened, recording
+        if recording:
+            if not toggle(False):
+                return
+            recording = False
+            if window_opened is not None:
+                collected += time.monotonic() - window_opened
+                window_opened = None
+            state["collection_seconds"] = collected
+            if collected >= schedule.budget:
+                state["limited"] = True
+                return  # spent: leave collection off for the rest of the run
+            signal.setitimer(timer_kind, schedule.idle)
+        else:
+            if not toggle(True):
+                return
+            recording = True
+            window_opened = time.monotonic()
+            state["started"] = True
+            state["windows"] += 1
+            signal.setitimer(timer_kind, schedule.active)
+
+    signal.signal(sigalrm, tick)
+    if schedule.warmup > 0:
+        # Off until the warmup elapses, so imports and startup are never sampled.
+        if not toggle(False):
+            return state, no_cleanup
+        signal.setitimer(timer_kind, schedule.warmup)
+    else:
+        # setitimer(0) *disarms* the timer rather than firing it, so a zero
+        # warmup has to open the first window here instead of via the handler.
+        recording = True
+        window_opened = time.monotonic()
+        state["started"] = True
+        state["windows"] = 1
+        signal.setitimer(timer_kind, schedule.active)
 
     def cleanup() -> None:
+        nonlocal collected, window_opened
         signal.setitimer(timer_kind, 0)
         signal.signal(sigalrm, previous_handler)
+        if window_opened is not None:  # the run ended mid-window
+            collected += time.monotonic() - window_opened
+            window_opened = None
+            state["collection_seconds"] = collected
 
     return state, cleanup
 
@@ -183,7 +276,7 @@ def capture_profile(
     label: str,
     stage: str,
     trace: bool = False,
-    torch_profile_seconds: float | None = _COMPACT_TORCH_WINDOW_SECONDS,
+    sample_schedule: _SampleSchedule | None = None,
 ) -> Any:
     """Profile full Python execution and a bounded window of PyTorch events."""
     capture_started = time.monotonic()
@@ -207,9 +300,9 @@ def capture_profile(
         torch.cuda.reset_peak_memory_stats()
 
     error: str | None = None
-    profile_limit = None if trace else torch_profile_seconds
+    schedule = None if trace else (sample_schedule or _DEFAULT_SAMPLE_SCHEDULE)
     torch_profiler.__enter__()
-    limit_state, cleanup_limit = _arm_collection_limit(torch_profiler, activities, profile_limit)
+    limit_state, cleanup_limit = _arm_collection_schedule(torch_profiler, activities, schedule)
     tool_started = time.monotonic()
     python_profiler.enable()
     try:
@@ -249,18 +342,31 @@ def capture_profile(
 
         collection_seconds = limit_state["collection_seconds"]
         if collection_seconds is None:
-            collection_seconds = tool_seconds
+            # Either the schedule never opened a window (a tool shorter than the
+            # warmup) or there is no schedule at all, as under -trace.
+            collection_seconds = tool_seconds if limit_state["started"] else 0.0
+
+        # cProfile only ever sees the thread that enabled it, so worker threads
+        # -- the threaded loader, inductor's compile workers -- and the async
+        # CUDA tail are invisible to it. Publishing the gap keeps a reader from
+        # reading the Python table as if it accounted for the whole run.
+        attributed = max((row["cumulative_cpu_seconds"] for row in all_python_rows), default=0.0)
+        unattributed = max(0.0, tool_seconds - attributed)
         payload: dict[str, Any] = {
-            "schema_version": 2,
+            "schema_version": 3,
             "stage": stage,
             "label": label,
             "command": command,
             "started_at": datetime.fromtimestamp(started).astimezone().isoformat(),
             "tool_seconds": tool_seconds,
+            "main_thread_seconds": attributed,
+            "unattributed_seconds": unattributed,
             "profiler_stop_seconds": profiler_stop_seconds,
-            "torch_collection_limit_seconds": profile_limit,
+            "torch_sample_schedule": limit_state["schedule"],
             "torch_collection_seconds": collection_seconds,
             "torch_collection_limited": limit_state["limited"],
+            "torch_collection_started": limit_state["started"],
+            "torch_collection_windows": limit_state["windows"],
             "torch_collection_error": limit_state["error"],
             "error": error,
             "hardware": hardware,
@@ -293,7 +399,9 @@ def _aggregate_rows(
             for metric in numeric:
                 if metric in row:
                     merged[metric] = merged.get(metric, 0) + row[metric]
-    sort_field = "cumulative_cpu_seconds" if section in {"python", "python_io"} else "self_device_seconds"
+    sort_field = (
+        "cumulative_cpu_seconds" if section in {"python", "python_io"} else "self_device_seconds"
+    )
     fallback = "self_cpu_seconds"
     return sorted(
         totals.values(),
@@ -351,8 +459,10 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
                 "profiler_stop_seconds": item.get("profiler_stop_seconds"),
                 "report_build_seconds": item.get("report_build_seconds"),
                 "wall_seconds": item.get("wall_seconds"),
+                "unattributed_seconds": item.get("unattributed_seconds"),
                 "torch_collection_seconds": item.get("torch_collection_seconds"),
                 "torch_collection_limited": item.get("torch_collection_limited", False),
+                "torch_collection_started": item.get("torch_collection_started", True),
                 "error": item.get("error"),
             }
             for path, item in zip(invocation_paths, invocations, strict=True)
@@ -378,10 +488,15 @@ def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
         for item in summary["invocations"]:
             sample_seconds = item["torch_collection_seconds"]
             sample = f"{sample_seconds:.3f}s" if sample_seconds is not None else "full"
+            if not item.get("torch_collection_started", True):
+                sample = "NONE (tool ended inside the warmup)"
+            hidden = item.get("unattributed_seconds")
+            # cProfile is main-thread only; say how much of the run it could not see.
+            off_thread = f", off-main-thread={hidden:.3f}s" if hidden else ""
             lines.append(
                 f"  {item['label']}: tool={item['tool_seconds']:.3f}s, "
                 f"torch_sample={sample}, stop={item['profiler_stop_seconds'] or 0:.3f}s, "
-                f"report={item['report_build_seconds'] or 0:.3f}s"
+                f"report={item['report_build_seconds'] or 0:.3f}s{off_thread}"
             )
         lines.extend(["", "Top Python functions (cumulative CPU seconds):"])
         for row in summary["python"][:25]:
@@ -481,8 +596,8 @@ class BenchmarkProfiler:
             "schema_version": 1,
             "created_at": datetime.now().astimezone().isoformat(),
             "trace_enabled": self.trace,
-            "torch_collection_limit_seconds": (
-                None if self.trace else _COMPACT_TORCH_WINDOW_SECONDS
+            "torch_sample_schedule": (
+                None if self.trace else vars(_DEFAULT_SAMPLE_SCHEDULE).copy()
             ),
             "profiled_invocations": sum(s["invocation_count"] for s in self.stages.values()),
             "stages": {

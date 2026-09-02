@@ -11,6 +11,8 @@ from fastfuncstuff.benchmark.profiling import (
     BenchmarkProfiler,
     StageProfiler,
     _is_io_row,
+    _SampleSchedule,
+    _torch_rows,
     capture_profile,
     command_argv,
 )
@@ -67,6 +69,9 @@ def test_capture_profile_writes_compact_cpu_report(tmp_path, monkeypatch):
             command=["ffs_test", "-device", "cpu"],
             label="tiny cpu work",
             stage="tiny",
+            # This work takes microseconds; the default schedule deliberately
+            # skips the first second and a half, so ask for an open window.
+            sample_schedule=_SampleSchedule(warmup=0.0, active=10.0, idle=0.0, budget=10.0),
         )
         == 12
     )
@@ -100,7 +105,7 @@ def test_capture_profile_bounds_torch_events_but_profiles_full_python(tmp_path, 
         command=["ffs_test", "-device", "cpu"],
         label="bounded cpu work",
         stage="tiny",
-        torch_profile_seconds=0.03,
+        sample_schedule=_SampleSchedule(warmup=0.02, active=0.03, idle=10.0, budget=0.03),
     )
     payload = json.loads(output.read_text())
     add_event = next(row for row in payload["torch"] if row["operator"] == "aten::add_")
@@ -226,3 +231,71 @@ def test_aggregate_stage_accepts_top_level_invocation(tmp_path):
     )
     summary = aggregate_stage(stage)
     assert summary["invocation_count"] == 1
+
+
+class _FakeEvent:
+    """Minimal stand-in for a Kineto key_average row."""
+
+    def __init__(self, key, count=1, self_cpu=0.0, self_device=0.0):
+        self.key = key
+        self.count = count
+        self.self_cpu_time_total = self_cpu * 1e6
+        self.cpu_time_total = self_cpu * 1e6
+        self.self_device_time_total = self_device * 1e6
+        self.device_time_total = self_device * 1e6
+
+
+class _FakeProfiler:
+    def __init__(self, events):
+        self._events = events
+
+    def key_averages(self):
+        return self._events
+
+
+def test_gpu_rows_survive_a_crowd_of_cheap_cpu_launches():
+    """The report used to rank on max(device, cpu) and keep the head of one list.
+
+    A busy CUDA run issues thousands of cheap launches whose CPU time outranks
+    any single kernel, so every GPU row fell off the end and the profile read as
+    though nothing had run on the card. A real ffs_moco reported 0.000 device
+    seconds this way while actually spending 0.466 s on the GPU.
+    """
+    events = [_FakeEvent(f"aten::cheap{i}", count=9000, self_cpu=0.05) for i in range(80)]
+    events += [
+        _FakeEvent("my_kernel", count=32, self_device=0.049),
+        _FakeEvent("Memcpy HtoD (Pageable -> Device)", count=1032, self_device=0.052),
+    ]
+
+    rows = _torch_rows(_FakeProfiler(events), limit=20)
+
+    operators = {row["operator"] for row in rows}
+    assert "my_kernel" in operators
+    assert "Memcpy HtoD (Pageable -> Device)" in operators
+    assert len(rows) <= 20
+    assert len({row["operator"] for row in rows}) == len(rows)  # no duplicates
+
+
+def test_row_limit_still_reports_cpu_when_nothing_touched_the_gpu():
+    events = [_FakeEvent(f"aten::op{i}", self_cpu=1.0 / (i + 1)) for i in range(40)]
+    rows = _torch_rows(_FakeProfiler(events), limit=5)
+    assert [row["operator"] for row in rows] == [f"aten::op{i}" for i in range(5)]
+
+
+def test_a_tool_shorter_than_the_warmup_says_so_rather_than_lying(tmp_path, monkeypatch):
+    """Better an explicit 'no sample' than a table that looks like an idle GPU."""
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    output = tmp_path / "short.json"
+    capture_profile(
+        lambda: torch.ones(4).sum(),
+        output,
+        command=["ffs_test", "-device", "cpu"],
+        label="instant",
+        stage="tiny",
+        sample_schedule=_SampleSchedule(warmup=30.0, active=1.0, idle=1.0, budget=1.0),
+    )
+    payload = json.loads(output.read_text())
+    assert payload["torch_collection_started"] is False
+    assert payload["torch_collection_seconds"] == 0.0

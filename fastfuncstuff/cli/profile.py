@@ -8,7 +8,9 @@ from pathlib import Path
 
 from fastfuncstuff.benchmark.profile_cli import _load_console_script
 from fastfuncstuff.benchmark.profiling import (
+    _DEFAULT_SAMPLE_SCHEDULE,
     BenchmarkProfiler,
+    _SampleSchedule,
     aggregate_stage,
     capture_profile,
     command_argv,
@@ -36,6 +38,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="DIR",
         help="Profile output parent directory. Default: ./profiles.",
+    )
+    default = _DEFAULT_SAMPLE_SCHEDULE
+    parser.add_argument(
+        "-sample",
+        nargs=3,
+        type=float,
+        metavar=("WARMUP", "ACTIVE", "IDLE"),
+        default=[default.warmup, default.active, default.idle],
+        help=(
+            "PyTorch sampling schedule in seconds: skip WARMUP, then collect\n"
+            "ACTIVE out of every ACTIVE+IDLE for the rest of the run. The warmup\n"
+            "keeps process startup out of the sample; raise it for a tool with a\n"
+            "long setup, and set it to 0 to profile a short command end to end."
+        ),
+    )
+    parser.add_argument(
+        "-sample-budget",
+        type=float,
+        default=default.budget,
+        metavar="SECONDS",
+        help="Stop sampling once this many seconds of events have been collected.",
     )
     parser.add_argument("command", nargs=argparse.REMAINDER, help="FFS command after --")
     args = parser.parse_args(argv)
@@ -75,6 +98,12 @@ def main(argv: list[str] | None = None) -> int:
             label=executable,
             stage=executable,
             trace=args.trace,
+            sample_schedule=_SampleSchedule(
+                warmup=args.sample[0],
+                active=args.sample[1],
+                idle=args.sample[2],
+                budget=args.sample_budget,
+            ),
         )
     except SystemExit as exc:
         result = int(exc.code or 0)
