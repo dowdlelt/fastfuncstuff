@@ -622,3 +622,55 @@ class TestSyntheticDataProperties:
         assert data_2d.dtype in [np.float32, np.float64], "Should be float type for GLM"
         assert not np.any(np.isnan(data_2d)), "Should not contain NaN values"
         assert not np.any(np.isinf(data_2d)), "Should not contain inf values"
+
+
+class TestGzipCompression:
+    """The .nii.gz write path: level, thread cap, and temp-file hygiene."""
+
+    def test_default_level_matches_nibabel(self):
+        """Level 6 cost 4x the time of level 1 for 9% of the size, and the
+        no-pigz fallback in the same function already wrote level 1."""
+        from nibabel.openers import Opener
+
+        from fastfuncstuff.io.afni import _gzip_level
+
+        assert _gzip_level() == Opener.default_compresslevel == 1
+
+    def test_env_override(self, monkeypatch):
+        from fastfuncstuff.io.afni import _gzip_level
+
+        monkeypatch.setenv("FFS_GZIP_LEVEL", "9")
+        assert _gzip_level() == 9
+        monkeypatch.setenv("FFS_GZIP_LEVEL", "not a number")
+        assert _gzip_level() == 1
+        monkeypatch.setenv("FFS_GZIP_LEVEL", "42")
+        assert _gzip_level() == 9  # clamped
+
+    def test_output_is_readable_gzip(self, tmp_path):
+        from fastfuncstuff.io.afni import save_nifti
+
+        data = np.arange(4 * 5 * 6 * 3, dtype=np.float32).reshape(4, 5, 6, 3)
+        path = tmp_path / "out.nii.gz"
+        save_nifti(data, str(path), affine=np.eye(4))
+        with open(path, "rb") as handle:
+            assert handle.read(2) == b"\x1f\x8b"
+        assert np.array_equal(np.asarray(nib.load(str(path)).dataobj, dtype=np.float32), data)
+
+    def test_no_temp_file_is_left_behind(self, tmp_path):
+        from fastfuncstuff.io.afni import save_nifti
+
+        data = np.zeros((3, 3, 3), dtype=np.float32)
+        save_nifti(data, str(tmp_path / "out.nii.gz"), affine=np.eye(4))
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.nii.gz"]
+
+    def test_remove_original_false_keeps_the_source(self, tmp_path):
+        """pigz deletes its input unless told otherwise; the flag used to be
+        ignored on that path, so a caller passing False lost the file."""
+        from fastfuncstuff.io.afni import _compress_gz
+
+        src = tmp_path / "keep.nii"
+        src.write_bytes(b"not really a nifti, but it compresses")
+        dst = tmp_path / "keep.nii.gz"
+        _compress_gz(src, dst, remove_original=False)
+        assert src.exists()
+        assert dst.exists()
