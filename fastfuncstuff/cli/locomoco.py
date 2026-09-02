@@ -856,7 +856,11 @@ def create_parser() -> argparse.ArgumentParser:
         "  phase  whole-field warp-and-re-read passes, which cancel the single-patch"
         " leakage bias.\n"
         "  xcorr  ignores it; it is single-shot.\n"
-        "More = better convergence for larger motion, at linear cost.",
+        "More = better convergence for larger motion, at linear cost.\n"
+        "The flow backend reports what it actually needed, per pyramid level and coarsest "
+        "first: `4 iters, conv @ 2,4,3` settled well inside the cap, while a starred level "
+        "(`2,4*,3`) never settled and prints the step it was still taking. A big residual "
+        "step there means raise this; a negligible one means the cap is harmless.",
     )
     tune.add_argument(
         "-window",

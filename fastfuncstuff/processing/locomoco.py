@@ -3612,7 +3612,8 @@ def _build_flow3d_axes_fn(
     The axes-aware counterpart of :func:`_build_flow3d_fn`, dispatching to
     :func:`optical_flow_lk_3d_axes` / :func:`xcorr_search_flow_3d_axes`. One axis and one
     echo reproduces the single-axis builder; the returned ``f`` fills ``conf_out`` /
-    ``curve_out`` / ``sep_out`` with whatever the chosen backend can supply.
+    ``curve_out`` / ``sep_out`` / ``conv_out`` with whatever the chosen backend can
+    supply (``conv_out`` is a flow-only concept: xcorr has no iteration to converge).
 
     The flow backend takes a ``max_shift`` trust region for TWO axes but not for one.
     That asymmetry is deliberate and matches the existing 2-D pair: 1-DOF
@@ -3624,7 +3625,7 @@ def _build_flow3d_axes_fn(
     """
     if backend == "flow":
 
-        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None):
+        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None, conv_out=None):
             return optical_flow_lk_3d_axes(
                 fixed_list,
                 moving_list,
@@ -3638,11 +3639,12 @@ def _build_flow3d_axes_fn(
                 max_disp=max_shift if len(axes) == 2 else None,
                 sep_floor=sep_floor,
                 sep_out=sep_out,
+                conv_out=conv_out,
                 slicewise_axis=slicewise_axis,
             )
     elif backend == "xcorr":
 
-        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None):
+        def f(fixed_list, moving_list, conf_out=None, curve_out=None, sep_out=None, conv_out=None):
             fields, confs = xcorr_search_flow_3d_axes(
                 fixed_list,
                 moving_list,
@@ -3827,6 +3829,71 @@ def _brain_mask_from(ref_mag: torch.Tensor, thresh_frac: float = 0.1) -> torch.T
     return m if bool(m.any()) else torch.ones_like(ref_mag, dtype=torch.bool)
 
 
+# The inner LK update is judged converged once it falls to this fraction of the largest
+# update that level took. Relative, because the coarse levels move whole voxels and the
+# fine ones hundredths -- an absolute floor would read as "converged" on every fine level.
+FLOW_CONV_TOL = 0.1
+# A level is flagged as capped only when this fraction of frames never converged: one
+# stubborn frame in a run of 300 is not a reason to tell the user to raise -iters.
+FLOW_CONV_CAPPED_FRAC = 0.25
+
+
+def summarize_flow_convergence(
+    steps: torch.Tensor, n_iters: int, tol: float = FLOW_CONV_TOL
+) -> str:
+    """One line on how the inner LK iterations converged, per pyramid level.
+
+    ``steps`` is ``(n_calls, n_levels, n_iters)`` -- the per-iteration update size that
+    :func:`optical_flow_lk_3d_axes` records, one call per frame, levels COARSEST FIRST so
+    the printed vector reads in the same direction as ``-levels``.
+
+    A level is converged at the first iteration whose update has fallen to ``tol`` of the
+    largest update that level took. The peak, not the first step, is the denominator: the
+    field arrives at a level already upsampled from the coarser one, so its opening step
+    is sometimes small and would make a converged level look stalled.
+
+    Note the criterion is deliberately NOT the relative-improvement test
+    :func:`_refine_converged` uses on the outer loop. These steps decay roughly
+    geometrically, and "improved by less than x% this pass" never fires on a geometric
+    decay -- it is the right question for a sequence that plateaus, which is the outer
+    loop's shape, not this one's.
+
+    Levels that hit the cap are marked ``*`` and the worst one's final step is appended in
+    voxels, which is the distinction that matters: hitting the cap while still moving
+    0.14 vox/iter means raise ``-iters``, while hitting it at 0.002 vox/iter means the
+    iterations are being spent on noise and the cap is doing no harm.
+    """
+    if steps.ndim != 3 or steps.numel() == 0:
+        return ""
+    steps = steps.float()
+    marks: list[str] = []
+    worst = 0.0
+    any_capped = False
+    for lvl in range(steps.shape[1]):
+        s = steps[:, lvl, :]  # (n_calls, n_iters)
+        peak = s.max(dim=1).values.clamp_min(1e-12)
+        above = s > tol * peak[:, None]
+        # The iteration AFTER the last one still above the threshold — not the first one
+        # below it. These sequences are not monotone: a level whose field arrived already
+        # good can take a tiny opening step and its real step second, and "first below"
+        # would call that converged at 1 and then keep moving for three more iterations.
+        n = s.shape[1]
+        last_above = n - 1 - above.flip(1).float().argmax(dim=1)
+        settled = torch.where(above.any(dim=1), last_above + 2, torch.ones_like(last_above))
+        reached = settled <= n
+        first = torch.where(reached, settled, torch.full_like(settled, n)).float()
+        med = int(first.median().item())
+        capped = float((~reached).float().mean().item()) >= FLOW_CONV_CAPPED_FRAC
+        if capped:
+            any_capped = True
+            tail = s[~reached, -1]
+            if tail.numel():
+                worst = max(worst, float(tail.median().item()))
+        marks.append(f"{med}{'*' if capped else ''}")
+    out = f"{n_iters} iters, conv @ {','.join(marks)}"
+    return f"{out}  (Δ {worst:.3f} vox)" if any_capped else out
+
+
 def _refine_converged(
     step: float, prev_step: float | None, converge: float, converge_rel: float
 ) -> str | None:
@@ -3857,6 +3924,7 @@ def _refine_loop(
     converge_rel: float,
     max_shift: float,
     verbose: bool,
+    note=None,
 ):
     """Outer reference-refinement loop — shared by the 2-D, 3-D and multi-echo paths.
 
@@ -3877,6 +3945,11 @@ def _refine_loop(
     A pass whose step grows markedly (>1.5× the previous, or > ``max_shift`` outright) is
     compounding an over-warped reference: roll it back and stop. ``-converge`` /
     ``-converge_rel`` stop early once the step (or its improvement) plateaus.
+
+    ``note``, if given, is called after each pass for a short string appended to that
+    pass's line — the estimator's own diagnostic (for flow, how its inner iterations
+    converged). Kept as a callback so this loop stays ignorant of the backend, the way it
+    already is about the shape of ``disp``.
     """
     if refine_rounds <= 0:
         return disp, corrected
@@ -3887,7 +3960,11 @@ def _refine_loop(
         disp, corrected = estimate(reduce_ref(corrected))
         step = brain_rms(disp, prev)
         if verbose:
-            print(f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)")
+            extra = note() if note is not None else ""
+            print(
+                f"   refine pass {i + 1}/{refine_rounds}: Δdisp rms {step:.4f} vox (in-brain)"
+                + (f"   {extra}" if extra else "")
+            )
         if step > max_shift or (prev_step is not None and step > 1.5 * prev_step):
             disp, corrected = saved
             if verbose:
@@ -4059,6 +4136,11 @@ def _run_3dacq_plain(
     # Dual runs also carry the per-voxel separability of the two axes (flow backend).
     sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
 
+    # How the flow backend's inner iterations converged, refreshed by every _estimate and
+    # read back by the line each pass prints. A dict rather than a nonlocal because
+    # _estimate is called through _refine_loop, which has no idea this exists.
+    conv_note = {"txt": ""}
+
     def _estimate(ref_vol: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         # One reference, or one per task-state bin. The prep runs per TEMPLATE, not per
         # frame, so a paired run costs n_bins preps instead of 1 — not n_frames.
@@ -4075,6 +4157,7 @@ def _run_3dacq_plain(
 
         disps = [torch.zeros(nx, ny, nz, nt) for _ in axes]
         corrected = torch.zeros(nx, ny, nz, nt)
+        conv_acc: list[torch.Tensor] | None = [] if backend == "flow" else None
         for t in tqdm(range(nt), desc="locomoco 3D", unit="frame", leave=True, disable=nt < 3):
             mv = vol4d[..., t].to(device)
             mvb = _prep(mv)
@@ -4083,7 +4166,12 @@ def _run_3dacq_plain(
             curve_acc: list[torch.Tensor] | None = [] if (xc and t == curve_frame) else None
             sep_acc: list[torch.Tensor] | None = [] if sep_field is not None else None
             d = flow3d(
-                [fxb[None]], [mvb[None]], conf_out=conf_acc, curve_out=curve_acc, sep_out=sep_acc
+                [fxb[None]],
+                [mvb[None]],
+                conf_out=conf_acc,
+                curve_out=curve_acc,
+                sep_out=sep_acc,
+                conv_out=conv_acc,
             )
             if null_axis is None:
                 corrected[..., t] = _shift3d_axes(
@@ -4151,6 +4239,11 @@ def _run_3dacq_plain(
                     mode=warp_interp,
                     radius=warp_radius,
                 )[0].cpu()
+        if conv_acc:
+            # The ONE synchronisation: every frame's record has stayed on the device, so
+            # this is a single (nt, nlev, n_iters) copy per estimate rather than a stall
+            # per iteration in a loop that is already host-bound.
+            conv_note["txt"] = summarize_flow_convergence(torch.stack(conv_acc).cpu(), n_iters)
         return disps, corrected
 
     # Gate before the first refine pass, not after the last: refine rebuilds its next
@@ -4196,6 +4289,8 @@ def _run_3dacq_plain(
         return paired_templates(vol4d, paired_bins, ref_mode)
 
     disp, corrected = _estimate_gated(_initial_ref())
+    if verbose and conv_note["txt"]:
+        print(f"   initial estimate:  {conv_note['txt']}")
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
     # shared engine: rebuild the reference from the corrected series and re-register.
     # The aggregate honours -ref and -first_n; the step is the in-brain rms of the field.
@@ -4223,6 +4318,7 @@ def _run_3dacq_plain(
             # takes the most permissive bound rather than tripping on the tighter axis.
             max_shift=max(max_shift),
             verbose=verbose,
+            note=lambda: conv_note["txt"],
         )
 
     # Canonical layout: u carries axis a1, v carries a0. Single-PE fills only the PE
@@ -4556,6 +4652,7 @@ def optical_flow_lk_3d_axes(
     max_disp: float | None = None,
     sep_floor: float = 1e-2,
     sep_out: list[torch.Tensor] | None = None,
+    conv_out: list[torch.Tensor] | None = None,
     slicewise_axis: int | None = None,
 ) -> list[torch.Tensor]:
     """Shared-field pyramidal LK over 1-2 encode axes and 1-N echoes, ``(B,X,Y,Z)``.
@@ -4585,6 +4682,14 @@ def optical_flow_lk_3d_axes(
     scale-free in a way a raw determinant floor is not (the determinant carries image
     contrast units, so any absolute floor would be a different constraint per dataset).
     ``sep_out``, if given, receives the map.
+
+    ``conv_out``, if given, receives one ``(n_levels, n_iters)`` tensor of per-iteration
+    update sizes, levels COARSEST FIRST — the raw material for
+    :func:`summarize_flow_convergence`. It stays on the device and is never synchronised
+    here: this runs once per frame, and an ``.item()`` per iteration would put thousands
+    of syncs into a loop that is already host-bound. Each entry is the update rms WEIGHTED
+    by the pooled gradient energy, so it reports the step where the data actually
+    constrains the fit rather than being diluted towards zero by empty background.
 
     Pooling over echoes needs no explicit SNR weighting: ``g_e`` and the residual both
     scale with echo amplitude ``s_e``, so the step is ``T + Σ s_e·N_e / Σ s_e²``, whose
@@ -4660,6 +4765,7 @@ def optical_flow_lk_3d_axes(
 
     disp = [torch.zeros_like(fpyr[0][-1]) for _ in range(n_ax)]
     sep_map: torch.Tensor | None = None
+    conv_steps: list[torch.Tensor] = []
     for lvl in range(nlev - 1, -1, -1):
         fx0 = fpyr[0][lvl]
         if disp[0].shape[1:] != fx0.shape[1:]:
@@ -4691,6 +4797,7 @@ def optical_flow_lk_3d_axes(
         # and the coupled solve would let that noise into the axis that does.
         act = [k for k in range(n_ax) if lvl >= nlev - lev[k]]
         na = len(act)
+        iter_steps: list[torch.Tensor] = []
         for _ in range(n_iters):
             # Pool the per-echo Gram/residual products FIRST and blur once at the end:
             # the window is linear, so this is identical to blurring inside the echo
@@ -4717,7 +4824,10 @@ def optical_flow_lk_3d_axes(
             # gets the aperture that suits its field, which is the whole point -- so the
             # solve below is the general (non-symmetric) inverse, reducing exactly to
             # the symmetric one when the windows agree.
-            a = [[None] * na for _ in range(na)]
+            # Seeded with a real tensor rather than None: every entry is overwritten
+            # just below (the loop assigns the diagonal and both off-diagonal halves),
+            # and the placeholder keeps the matrix concretely typed for the readers.
+            a = [[gram[(0, 0)]] * na for _ in range(na)]
             for i in range(na):
                 for m in range(i, na):
                     a[i][m] = _blur3d_b(gram[(i, m)], win[i], slicewise_axis)
@@ -4768,10 +4878,24 @@ def optical_flow_lk_3d_axes(
                     (j21 * b[0] + j22 * b[1] + j23 * b[2]) / det,
                     (j31 * b[0] + j32 * b[1] + j33 * b[2]) / det,
                 ]
+            if conv_out is not None:
+                # Weighted, not masked: a[0][0] is the pooled gradient energy already in
+                # hand, it is zero exactly where the update is unconstrained, and using it
+                # as a weight avoids inventing a threshold (and the quantile that a
+                # threshold would need) on the hot path.
+                w = a[0][0]
+                num = upd[0] * upd[0]
+                for u in upd[1:]:
+                    num = num + u * u
+                iter_steps.append(((w * num).sum() / w.sum().clamp_min(1e-12)).sqrt())
             for i, k in enumerate(act):
                 disp[k] = disp[k] + upd[i]
                 if max_disp[k] is not None:
                     disp[k] = disp[k].clamp(-max_disp[k], max_disp[k])
+        if conv_out is not None and iter_steps:
+            conv_steps.append(torch.stack(iter_steps))
+    if conv_out is not None and conv_steps:
+        conv_out.append(torch.stack(conv_steps))
     if sep_out is not None and sep_map is not None:
         # sep only exists on levels that actually solved 2+ axes together. With per-axis
         # level counts the finest levels can be single-axis, so the last map we have may
@@ -5315,6 +5439,9 @@ def estimate_residual_flow_multiecho(
     have_pooled_conf = False
     # Per-voxel separability of the two axes (flow backend only) — see optical_flow_lk_3d_axes.
     sep_field = torch.zeros(nx, ny, nz, nt) if (dual and backend == "flow") else None
+    # How the flow backend's inner iterations converged on the most recent sweep; the
+    # xcorr paths leave it empty and print nothing.
+    conv_note = {"txt": ""}
     curve_frame = None if save_corr_curve is None else max(0, min(int(save_corr_curve), nt - 1))
     corr_curve: torch.Tensor | None = None
     corr_offsets: torch.Tensor | None = None
@@ -5340,6 +5467,7 @@ def estimate_residual_flow_multiecho(
 
     def _joint_lk(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
         out = [torch.zeros(nx, ny, nz, nt) for _ in axes]
+        conv_acc: list[torch.Tensor] = []
         for t in tqdm(range(nt), desc=f"me {tag}", unit="frame", leave=True, disable=nt < 3):
             movs = [_prep(vols[j][..., t].to(device)) for j in range(e)]
             sep_acc: list[torch.Tensor] | None = [] if (dual and sep_field is not None) else None
@@ -5356,12 +5484,17 @@ def estimate_residual_flow_multiecho(
                 max_disp=max_shift if dual else None,  # per axis; single-axis LK is unclamped
                 sep_floor=sep_floor,
                 sep_out=sep_acc,
+                conv_out=conv_acc,
                 slicewise_axis=sw_axis,
             )
             for k in range(n_ax):
                 out[k][..., t] = fields[k][0].cpu()
             if sep_acc and sep_field is not None:
                 sep_field[..., t] = sep_acc[0][0].cpu()
+        if conv_acc:
+            # One synchronisation per sweep, not one per iteration — see _joint_lk's
+            # counterpart in the single-echo 3-D path.
+            conv_note["txt"] = summarize_flow_convergence(torch.stack(conv_acc).cpu(), n_iters)
         return out
 
     def _pooled_xcorr(cur_refs: list[torch.Tensor], tag: str) -> list[torch.Tensor]:
@@ -5499,6 +5632,8 @@ def estimate_residual_flow_multiecho(
         return [f * soft_xyz[..., None] for f in fields]
 
     w = _gate_me(w)
+    if verbose and conv_note["txt"]:
+        print(f"   initial estimate:  {conv_note['txt']}")
 
     # Phase 2: reference-refinement (the -refine knob; applies to BOTH backends — it is
     # the estimator-agnostic template sharpening). The initial reference is the mean/median
@@ -5549,6 +5684,7 @@ def estimate_residual_flow_multiecho(
             # than tripping on the tighter axis.
             max_shift=max(max_shift),
             verbose=verbose,
+            note=lambda: conv_note["txt"],
         )
 
     # Build per-echo results: echo e warped by alpha_e · w.
