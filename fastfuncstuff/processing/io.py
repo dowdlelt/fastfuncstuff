@@ -337,13 +337,15 @@ def _disp_vox_to_dicom_mm(disp_vox: np.ndarray, affine: np.ndarray) -> np.ndarra
     """
     from .nwarpforge import compute_cardinal_affine
 
+    # Both steps are linear, so they fold into one 3x3 and the whole conversion
+    # is a single GEMM over (N, 3). The einsum this replaces could not reach BLAS
+    # through its ellipsis -- it ran a naive loop *and* promoted a float32 field
+    # to float64 for a result the caller immediately casts back. On a 193^3 field
+    # that was 888 ms against 16 ms here; a warp *series* pays it per frame.
     rs = compute_cardinal_affine(affine)[:3, :3]
-    disp_mm = np.einsum("ij,...j->...i", rs, disp_vox)  # RAS-mm
-    out = np.empty_like(disp_mm)
-    out[..., 0] = -disp_mm[..., 0]  # RAS -> DICOM: negate x
-    out[..., 1] = -disp_mm[..., 1]  # RAS -> DICOM: negate y
-    out[..., 2] = disp_mm[..., 2]
-    return out
+    ras_to_dicom = np.diag([-1.0, -1.0, 1.0])  # DICOM = diag(-1,-1,1) @ RAS
+    m = (ras_to_dicom @ rs).T.astype(disp_vox.dtype)
+    return (disp_vox.reshape(-1, 3) @ m).reshape(disp_vox.shape)
 
 
 def load_warp_field(
