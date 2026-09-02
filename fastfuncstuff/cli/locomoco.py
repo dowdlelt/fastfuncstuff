@@ -1538,7 +1538,12 @@ def create_parser() -> argparse.ArgumentParser:
         "patchy — and the shared basis is measurably spending its budget on their "
         "union. Read the balance lines the shared run prints before reaching for this: "
         "it DOUBLES the regressor count, which is real GLM degrees of freedom, so the "
-        "honest comparison is against the same total budget (2N shared vs N+N).",
+        "honest comparison is against the same total budget (2N shared vs N+N).\n"
+        "SCOPE: this affects the -want_pcs regressors ONLY. -warp_recon, -detask ica, "
+        "-reject and -write_pc_maps still decompose the axes together — their rejection "
+        "is already per component PER AXIS (a component can be dropped on one axis and "
+        "kept on the other), so a shared basis constrains them far less than it "
+        "constrains a fixed-N regressor set.",
     )
     out.add_argument(
         "-save_mean",
