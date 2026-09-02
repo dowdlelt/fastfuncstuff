@@ -5,10 +5,8 @@ import torch
 from fastfuncstuff.decomposition.tools import (
     apply_high_pass_fft,
     apply_polort_projection,
-    batch_fit_ggm,
     component_condition_correlations,
     effective_rank_from_spectrum,
-    fit_ggm,
     mp_spikes_from_spectrum,
     parse_num_comps_spec,
 )
@@ -99,11 +97,13 @@ def test_component_condition_correlations_diagonal():
         assert corr[i, i] == pytest.approx(1.0, abs=1e-5)
 
 
-def test_fit_ggm_basic():
-    rng = np.random.RandomState(0)
-    values = rng.randn(2000)
-    result = fit_ggm(values)
-    expected_keys = {
+def test_mixture_fit_returns_the_expected_parameter_set():
+    """Shape/key contract of the mixture fit; behaviour is covered in test_mixture.py."""
+    from fastfuncstuff.decomposition.mixture import fit_gaussian_gamma_mixture
+
+    torch.manual_seed(0)
+    result = fit_gaussian_gamma_mixture(torch.randn(3, 500, dtype=torch.float64))
+    for key in (
         "mu_noise",
         "var_noise",
         "mu_pos",
@@ -113,27 +113,8 @@ def test_fit_ggm_basic():
         "pi_noise",
         "pi_pos",
         "pi_neg",
-        "p_signal",
         "converged",
-    }
-    assert expected_keys.issubset(result.keys())
-    assert isinstance(result["converged"], (bool, np.bool_))
-    assert result["p_signal"].shape == (2000,)
-
-
-def test_batch_fit_ggm_shape():
-    torch.manual_seed(0)
-    components = torch.randn(3, 500)
-    result = batch_fit_ggm(components)
-    assert result["z_signed"].shape == (3, 500)
-    assert result["p_signal"].shape == (3, 500)
-    assert result["mu_noise"].shape == (3,)
-    assert result["var_noise"].shape == (3,)
-    assert result["mu_pos"].shape == (3,)
-    assert result["var_pos"].shape == (3,)
-    assert result["mu_neg"].shape == (3,)
-    assert result["var_neg"].shape == (3,)
-    assert result["pi_noise"].shape == (3,)
-    assert result["pi_pos"].shape == (3,)
-    assert result["pi_neg"].shape == (3,)
-    assert result["converged"].shape == (3,)
+    ):
+        assert result[key].shape == (3,), key
+    for key in ("p_noise", "p_pos", "p_neg", "x_std"):
+        assert result[key].shape == (3, 500), key

@@ -63,11 +63,11 @@ try:
     )
     from fastfuncstuff.decomposition.ica import FastICA, InfoMaxICA, create_ica  # noqa: F401
     from fastfuncstuff.decomposition.icasso import icasso
+    from fastfuncstuff.decomposition.mixture import batch_mixture_zscores
     from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
     from fastfuncstuff.decomposition.tools import (
         apply_high_pass_fft,
         apply_polort_projection,
-        batch_mixture_zscores,
         build_task_design_for_run,
         component_condition_correlations,
         estimate_ica_component_count,
@@ -710,8 +710,9 @@ def _run_single_ica(
         _vprint(args.verb >= 1, f"Sign-flipped {n_flipped} ICs to positive-maximum orientation")
 
     # --- Compute ordering metrics ---
-    # FSL meldata.cc sorts by spatial-map stdev. Here we expose both stdev-share
-    # and an explained-share proxy, and sort by explained-share per user request.
+    # Two orderings are exposed: share of summed spatial-map stdev, and an
+    # explained-variance-share proxy. Default sort is explained-share, since that is
+    # what "component 1 is the biggest" is normally taken to mean.
     ic_stdev = torch.std(components, dim=1)  # (k,)
     total_stdev = float(ic_stdev.sum().item())
     if total_stdev <= 1e-15:
@@ -765,12 +766,14 @@ def _run_single_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # --- MELODIC-style noise normalization ---
-    # FSL meldata.cc save(): IC_norm = IC * diagvals * stdNoisei
-    #   diagvals  = pow(diag(unmix * unmix^T), -0.5)       -- per-component
-    #   stdNoisei = pow(stdev(Data-mix*IC)*sqrt((T-1)/(T-K)), -1)  -- per-voxel
-    # This converts raw IC maps into z-score-like units that reflect
-    # the signal-to-noise ratio at each voxel.
+    # --- Noise normalisation of the IC maps ---
+    # Raw IC maps carry the arbitrary scale of the unmixing matrix, so they are put into
+    # units of the residual noise at each voxel:
+    #   per-component  pow(diag(unmix @ unmix.T), -0.5)  removes the unmixing scale
+    #   per-voxel      1 / (stdev(Data - mix @ IC) * sqrt((T-1)/(T-K)))
+    # The sqrt((T-1)/(T-K)) is the degrees-of-freedom correction for the K components
+    # already fitted, without which the residual understates the noise (the same
+    # correction, for the same reason, as in decomposition/varnorm.py).
     # NOTE: must run BEFORE timecourse var_norm — otherwise mixing @ components
     # no longer reconstructs x_t and resid_std is corrupted, compressing IC peaks ~5x.
     raw_oic_np: np.ndarray | None = None
@@ -1585,12 +1588,12 @@ def _run_concat_ica(
         offset += rl
     total_t = int(sum(run_lengths))
 
-    # --- Temporal concatenation (MELODIC setup_migp, meldata.cc:519-587) ---
-    # MELODIC tcat with migp (default) stacks each file's data along time after
-    # scaling by 1/numfiles, optionally PCA-reducing once the stack grows past
-    # 2*migpN rows. For typical FFS-sized runs we skip the incremental PCA —
-    # SVD on (T_total, V) is cheap and exact. Divide-by-n_runs mirrors
-    # setup_migp's `tmpData = process_file(...) / numfiles` scaling.
+    # --- Temporal concatenation ---
+    # Incremental group PCA (Smith et al. 2014, see decomposition/migp.py) exists to bound
+    # memory when the full concatenation will not fit. At typical ffs run counts it does
+    # fit, so we stack outright and take one exact SVD on (T_total, V) rather than an
+    # approximation. Each run is divided by n_runs first so every run contributes equally
+    # to the group subspace instead of in proportion to its length.
     _vsection(args.verb >= 1, "Temporal Concatenation (MELODIC setup_migp-style)")
     t_step = time.time()
     if getattr(args, "migp", False):
@@ -1762,13 +1765,14 @@ def _run_concat_ica(
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # --- Whitening on concat (MELODIC melodic.cc PCA + whiten) ---
+    # --- PCA + whitening on the concatenation ---
     # Eigen-decomp of temporal covariance (T_total, T_total), keep top `order`.
     # WM = E^T / sqrt(L) : (order, T_total); DWM = E * sqrt(L) : (T_total, order).
     # whitened = WM @ data_tv  →  (order, V).
     _vsection(args.verb >= 1, "Whitening (joined on concat)")
     t_step = time.time()
-    # Center each timepoint row across voxels (MELODIC remmean(Data,2)).
+    # Centre each timepoint row across voxels: the covariance being eigendecomposed is
+    # temporal, over spatially-demeaned data, not a raw cross-product.
     row_mean = data_tv.mean(dim=1, keepdim=True)
     data_centered = data_tv - row_mean
     cov_t = (data_centered @ data_centered.T) / float(n_vox_masked)
@@ -3371,7 +3375,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="var",
         help=(
             "Component sort order: 'var' (default — by mixing variance share) "
-            "or 'stdev' (spatial-stdev share, matches MELODIC `meldata.cc`). "
+            "or 'stdev' (share of summed spatial-map stdev). "
             "Hungarian matching is order-invariant; use 'stdev' for "
             "MELODIC parity diagnostics where component indices must align."
         ),

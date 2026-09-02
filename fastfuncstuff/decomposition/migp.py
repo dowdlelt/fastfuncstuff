@@ -1,4 +1,4 @@
-"""MIGP — MELODIC's incremental group PCA (Smith 2014).
+"""MIGP — incremental group PCA (Smith et al. 2014).
 
 Stacks per-subject (or per-run) data along time, then periodically reduces the
 running stack to its top `migp_n` PC time-courses. This bounds peak memory at
@@ -7,8 +7,11 @@ preserving the top-`migp_n` subspace of the full concatenation.
 
 Reference
 ---------
-Smith S et al., NeuroImage 2014 — "Group-PCA for very large fMRI datasets"
-MELODIC source: `meldata.cc::setup_migp` (FSL 6+).
+Smith, S.M., Hyvärinen, A., Varoquaux, G., Miller, K.L. & Beckmann, C.F. (2014).
+"Group-PCA for very large fMRI datasets", NeuroImage 101:738-749.
+
+Written from that paper; FSL's implementation is not a reference for it. See
+``../fmri_wiki/notes/FSL clean-room policy.md``.
 """
 
 from __future__ import annotations
@@ -29,7 +32,7 @@ def migp_reduce(
     device: torch.device | None = None,
     verbose: bool = False,
 ) -> torch.Tensor:
-    """Run MELODIC-style MIGP on a sequence of per-run (T_i, V) tensors.
+    """Incremental group PCA over a sequence of per-run (T_i, V) tensors.
 
     Parameters
     ----------
@@ -38,17 +41,20 @@ def migp_reduce(
         is preserved (caller is responsible for any shuffling).
     migp_n : int, optional
         Target dimensionality of the reduced subspace. If None, defaults to
-        `2*T_first - 1` matching MELODIC's auto-pick.
+        ``2*T_first - 1``: comfortably more than one run contributes, so the
+        truncation cannot discard a subspace that a single run could have
+        supported on its own. The overshoot above the eventual component count is
+        what absorbs the incremental truncation error.
     migp_factor : float, default 2.0
         Reduction trigger threshold. Reduce whenever the accumulated stack
-        exceeds ``migp_factor * migp_n`` rows. Default 2.0 matches MELODIC
-        (``meldata.cc:554``, option ``--migp_factor`` defaults to 2). Larger
-        values batch more files between reductions (fewer SVD calls, more
-        memory).
+        exceeds ``migp_factor * migp_n`` rows. This trades SVD calls against peak
+        memory and nothing else -- the answer is the same either way, so 2.0 is
+        simply the point where the stack is large enough that a reduction is
+        worth its cost. Larger values batch more runs between reductions.
     scale_by_n : bool, default True
-        If True, divides each input by the total run count before stacking —
-        matches MELODIC's `tmpData / numfiles` normalization so all inputs
-        contribute equally regardless of length.
+        If True, divides each input by the total run count before stacking, so
+        every run contributes equally to the group subspace rather than in
+        proportion to its length.
     device : torch.device, optional
         Device for the running stack. Defaults to the device of the first run.
     verbose : bool
@@ -67,7 +73,7 @@ def migp_reduce(
     if device is None:
         device = runs_list[0].device
 
-    # Default migp_n: match MELODIC's `2*T_per_file - 1` rule from setup_migp.
+    # Default: twice one run's timepoints, less one. See the parameter docstring.
     if migp_n is None:
         migp_n = max(1, 2 * int(runs_list[0].shape[0]) - 1)
 
@@ -93,20 +99,21 @@ def migp_reduce(
 def _reduce_to_topk(data: torch.Tensor, k: int) -> torch.Tensor:
     """Reduce an (R, V) matrix to its top-k PC time-courses.
 
-    Matches MELODIC's ``std_pca`` → ``EigenValues`` → ``pcaE.t() * Data``
-    in ``setup_migp``: row-centers (spatial mean per timepoint) before
-    computing the temporal covariance, eigendecomposes it (matching newmat's
-    ``EigenValues`` — ascending order), keeps the top-k eigenvectors, then
-    projects the **original** (non-centered) data.
+    Row-centres (removes the spatial mean per timepoint) before forming the
+    temporal covariance, eigendecomposes it, keeps the top-k eigenvectors, then
+    projects the **original**, non-centred data. Centring belongs to the
+    covariance estimate, not to the data being reduced: the running stack has to
+    stay in the same frame across iterations or successive reductions are not
+    composing the same quantity.
 
     Sign convention: after ``eigh``, each eigenvector is flipped so its
-    largest-absolute-value element is positive. This eliminates the arbitrary
-    sign ambiguity inherent to LAPACK's ``dsyevd`` and matches the convention
-    used by Armadillo's ``eig_sym`` (MELODIC's backend).
+    largest-absolute-value element is positive. Eigenvector sign is arbitrary and
+    LAPACK makes no guarantee about it, so without fixing a convention the same
+    input can reduce to sign-flipped time-courses run to run.
 
     Precision: the entire reduction runs in float64 for numerical accuracy.
-    Errors from incremental reductions compound through varnorm's thresholding
-    step — the ~2x speed cost is negligible (covariance is only R×R and the
+    Errors from incremental reductions compound through the varnorm step
+    — the ~2x speed cost is negligible (covariance is only R×R and the
     projection dominates runtime). The result is cast back to the input dtype.
     """
     R, V = data.shape

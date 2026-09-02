@@ -43,7 +43,7 @@ from fastfuncstuff.cli_utils import (
     spinner,
 )
 from fastfuncstuff.decomposition import io as decomposition_io
-from fastfuncstuff.decomposition.tools import batch_mixture_zscores
+from fastfuncstuff.decomposition.mixture import batch_mixture_zscores
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.utils import REGISTRATION_TF32
 
