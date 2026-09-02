@@ -741,6 +741,32 @@ def create_parser() -> argparse.ArgumentParser:
         " rotation-aware mode.",
     )
     est.add_argument(
+        "-est_lev_fwhm",
+        action="store_true",
+        help="[diagnostic] Estimate the spatial smoothness (3dFWHMx ACF FWHM, mm) of the "
+        "series at every refine sweep, and print the ladder. Uncorrected first, then one "
+        "per sweep.\n"
+        "This is the sharpness number the temporal sd of -save_refine_templates cannot "
+        "give you. Motion leaves spatially correlated structure — a shifted brain differs "
+        "from its mean by something shaped like the anatomy's gradient, smooth at the "
+        "scale of the anatomy — so uncorrected motion INFLATES the FWHM and taking it out "
+        "walks the estimate back toward the thermal-noise floor. A sweep that lowers the "
+        "FWHM did real work; one that leaves it alone did not.\n"
+        "Detrended first at twice AFNI's usual polort (see -fwhm_polort): the comparison "
+        "is between sweeps of the same run, so drift is pure nuisance — it is spatially "
+        "smooth, it inflates the ACF, and left in it would let a sweep that only changed "
+        "the drift look like one that changed the smoothness.\n"
+        "Costs one FWHMx pass per sweep, which is why it is off by default.",
+    )
+    est.add_argument(
+        "-fwhm_polort",
+        type=int,
+        default=None,
+        metavar="N",
+        help="[diagnostic] Detrend degree for -est_lev_fwhm. Default is twice AFNI's "
+        "1 + floor(run_seconds/150), computed from the header TR (or -tr).",
+    )
+    est.add_argument(
         "-save_refine_templates",
         action="store_true",
         help="[diagnostic] Write the mean, median and temporal sd of the series at every "
@@ -4887,9 +4913,10 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     # Multi-echo: several inputs, one shared field per encode axis, scaled per echo.
     # 2-D multi-slice is the default; -me_3depi / -is_3depi opts into the 3-D solve,
     # exactly as -is_3depi does on the single-echo path.
-    if args.save_refine_templates and not (args.is_3dacq or dual3d):
+    if (args.save_refine_templates or args.est_lev_fwhm) and not (args.is_3dacq or dual3d):
         print(
-            "❌ -save_refine_templates is wired for the 3-D solve (-is_3dacq, or two "
+            "❌ -save_refine_templates / -est_lev_fwhm are wired for the 3-D solve "
+            "(-is_3dacq, or two "
             "encode axes). The 2-D slicewise and multi-echo paths run the same refine "
             "loop but aggregate their series differently, and the hook is not on them yet.",
             file=sys.stderr,
@@ -5039,6 +5066,26 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         corr_curve_frame = (
             data.shape[3] // 2 if args.save_corr_curve == -1 else args.save_corr_curve
         )
+
+    # -est_lev_fwhm needs mm per axis to report mm, and a detrend degree. AFNI's rule
+    # wants the run duration, so it needs a TR: -tr wins, else the header, else the rule
+    # falls back to a fixed 4 (= double AFNI's degree-2 for a typical ~5 min run) rather
+    # than guessing a duration.
+    voxdims_mm = tuple(float(v) for v in np.linalg.norm(affine[:3, :3], axis=0))
+    fwhm_polort = args.fwhm_polort
+    if args.est_lev_fwhm and fwhm_polort is None:
+        from fastfuncstuff.stats.task_coupling import default_polort
+
+        tr_for_polort = float(args.tr) if args.tr is not None else float(img.header.get_zooms()[3])
+        if 0.05 < tr_for_polort < 20.0:
+            fwhm_polort = 2 * default_polort(data.shape[3], tr_for_polort)
+        else:
+            fwhm_polort = 4
+            print(
+                f"   ⚠️  -est_lev_fwhm: header TR {tr_for_polort:g}s is not usable for "
+                "AFNI's polort rule; detrending at 4. Pass -tr or -fwhm_polort to set it."
+            )
+        print(f"   📐 -est_lev_fwhm detrend polort {fwhm_polort} (2x AFNI's rule)")
 
     # -do_blur is FWHM in mm (repo convention); convert to an in-plane voxel sigma
     # for the pre-flow Gaussian. In-plane voxel size = mean of the two non-slice axes.
@@ -5253,6 +5300,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             search_min_steps=args.search_min_steps,
             save_corr_curve=corr_curve_frame,
             save_refine_templates=args.save_refine_templates,
+            est_lev_fwhm=args.est_lev_fwhm,
+            fwhm_polort=fwhm_polort,
+            voxdims=voxdims_mm,
             hpf_sigma=hpf_sigma,
             match=args.match,
             match_sigma=args.match_sigma,
@@ -5366,6 +5416,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         # Without -events there is no active mask, so the maps go out unscored. Looking
         # at them is the point; the score is the optional part.
         _write_pc_maps(result, stem, ext, affine, args, None, None, device)
+
+    if result.refine_fwhms:
+        print("   spatial smoothness per sweep (3dFWHMx ACF):")
+        for n, f in enumerate(result.refine_fwhms):
+            tag = "uncorrected" if n == 0 else ("initial" if n == 1 else f"refine {n - 1}")
+            # The step-to-step change, not just the level: four places because a sweep
+            # that did nothing and a sweep that did a little print the same three.
+            delta = "" if n == 0 else f"  ({f - result.refine_fwhms[n - 1]:+.4f})"
+            print(f"      {tag:>12}: FWHM {f:.4f} mm{delta}")
 
     refine_tmpls = result.refine_templates
     if refine_tmpls:

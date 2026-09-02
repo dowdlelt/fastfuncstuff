@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -45,6 +46,9 @@ try:
 except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     shift1d_lanczos_triton = shift2d_triton = None
 from tqdm import tqdm
+
+if TYPE_CHECKING:
+    from fastfuncstuff.stats.fwhmx import FWHMxResult
 
 # Latched when a fused launch actually fails on this machine.
 _fused_shift_unavailable = False
@@ -1331,6 +1335,8 @@ class LocomocoResult:
     # -save_refine_templates: per refine sweep, {"mean","median","std"} -> (nx,ny,nz).
     # Index 0 is the UNCORRECTED series, so the list reads as a before/after ladder.
     refine_templates: list[dict[str, torch.Tensor]] | None = None
+    # -est_lev_fwhm: ACF FWHM (mm) per sweep, index 0 the uncorrected series.
+    refine_fwhms: list[float] | None = None
 
     def _to_nifti(self, canon: torch.Tensor) -> torch.Tensor:
         inv = [0, 0, 0, 0]
@@ -1925,6 +1931,9 @@ def estimate_residual_flow(
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     save_refine_templates: bool = False,
+    est_lev_fwhm: bool = False,
+    fwhm_polort: int | None = None,
+    voxdims: tuple[float, float, float] | None = None,
     hpf_sigma: float = 0.0,
     match: str = "none",
     match_sigma: float = 6.0,
@@ -2050,6 +2059,9 @@ def estimate_residual_flow(
             search_min_steps=search_min_steps,
             save_corr_curve=save_corr_curve,
             save_refine_templates=save_refine_templates,
+            est_lev_fwhm=est_lev_fwhm,
+            fwhm_polort=fwhm_polort,
+            voxdims=voxdims,
             warp_interp=warp_interp,
             warp_radius=warp_radius,
             hpf_sigma=hpf_sigma,
@@ -3970,6 +3982,58 @@ def refine_template_stats(series: torch.Tensor, dim: int = 3) -> dict[str, torch
     }
 
 
+def refine_fwhm(
+    series: torch.Tensor,
+    mask: torch.Tensor,
+    voxdims: tuple[float, float, float],
+    polort: int,
+    device: torch.device,
+    verbose: bool = False,
+) -> FWHMxResult:
+    """Spatial smoothness (3dFWHMx) of a corrected series, after polynomial detrending.
+
+    The sharpness scalar the refine ladder was missing. Motion leaves spatially
+    correlated structure in the timeseries — a shifted brain differs from its mean by
+    something shaped like the anatomy's gradient, which is smooth at the scale of the
+    anatomy — so uncorrected motion INFLATES the estimated FWHM and taking it out walks
+    the estimate back down toward the thermal-noise floor. Unlike an ad-hoc sharpness
+    proxy this one is the field's standard estimator, and it is already implemented
+    faithfully in :mod:`fastfuncstuff.stats.fwhmx`.
+
+    ``polort`` is deliberately run at twice AFNI's usual ``1 + floor(seconds/150)``.
+    The comparison here is between refine sweeps of the SAME run, so drift and any slow
+    residual trend are pure nuisance: they are spatially smooth, they inflate the ACF,
+    and leaving them in would let a sweep that merely changed the drift look like a
+    sweep that changed the smoothness. Over-detrending costs a few degrees of freedom in
+    a diagnostic that has 120 of them to spare.
+
+    ``series`` is ``(nx, ny, nz, T)``, ``mask`` ``(nx, ny, nz)``. Returns an
+    ``fwhmx.FWHMxResult``.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
+    nt = int(series.shape[3])
+    rows = series[mask].to(device)  # (n_masked, T)
+    # Residualise against Legendre polynomials, never raw monomials: at the doubled
+    # degree a monomial basis is badly conditioned and the "detrended" series would
+    # carry the conditioning error into the ACF.
+    poly = construct_polynomial_matrix(nt, min(polort, nt - 1), device=device)
+    q, _ = torch.linalg.qr(poly)
+    rows = rows - (rows @ q) @ q.T
+    return estimate_fwhmx_run(
+        rows,
+        mask.to(device),
+        tuple(int(v) for v in series.shape[:3]),
+        voxdims,
+        # AFNI turns -unif on whenever it detrends, and this always detrends.
+        unif=True,
+        device=device,
+        progress=verbose,
+        progress_desc="   FWHMx",
+    )
+
+
 def _refine_reduce_label(ref_mode: str) -> str:
     """Human name for what :func:`_refine_reduce` will actually do with ``ref_mode``."""
     if ref_mode in ("median", "first_median"):
@@ -4259,6 +4323,9 @@ def _run_3dacq_plain(
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
     save_refine_templates: bool = False,
+    est_lev_fwhm: bool = False,
+    fwhm_polort: int | None = None,
+    voxdims: tuple[float, float, float] | None = None,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     hpf_sigma: float = 0.0,
@@ -4393,6 +4460,29 @@ def _run_3dacq_plain(
     templates: list[dict[str, torch.Tensor]] | None = None
     if save_refine_templates:
         templates = [refine_template_stats(torch.from_numpy(np.ascontiguousarray(data)))]
+    # -est_lev_fwhm. The mask is built once from the RAW series so every sweep is scored
+    # on the same voxels; rebuilding it per sweep would let the mask move under the
+    # comparison and turn a smoothness change into a coverage change.
+    fwhms: list[float] | None = None
+    fwhm_mask: torch.Tensor | None = None
+    if est_lev_fwhm:
+        if voxdims is None:
+            raise ValueError("est_lev_fwhm needs voxdims (mm per axis) to report mm.")
+        raw = torch.from_numpy(np.ascontiguousarray(data))
+        fwhm_mask = _brain_mask_from(raw.abs().mean(dim=3))
+        pol = 4 if fwhm_polort is None else int(fwhm_polort)
+        fwhms = [float(refine_fwhm(raw, fwhm_mask, voxdims, pol, device, verbose).fwhm)]
+        if verbose:
+            print(f"   FWHM (uncorrected):  {fwhms[0]:.3f} mm")
+
+    def _observe(c: torch.Tensor) -> None:
+        if templates is not None:
+            templates.append(refine_template_stats(c))
+        if fwhms is not None and fwhm_mask is not None and voxdims is not None:
+            pol = 4 if fwhm_polort is None else int(fwhm_polort)
+            fwhms.append(float(refine_fwhm(c, fwhm_mask, voxdims, pol, device, verbose).fwhm))
+            if verbose:
+                print(f"   FWHM (sweep {len(fwhms) - 1}):     {fwhms[-1]:.3f} mm")
 
     def _estimate(ref_vol: torch.Tensor) -> tuple[list[torch.Tensor], torch.Tensor]:
         # One reference, or one per task-state bin. The prep runs per TEMPLATE, not per
@@ -4542,8 +4632,8 @@ def _run_3dacq_plain(
         return paired_templates(vol4d, paired_bins, ref_mode)
 
     disp, corrected = _estimate_gated(_initial_ref())
-    if templates is not None:
-        templates.append(refine_template_stats(corrected))
+    if templates is not None or fwhms is not None:
+        _observe(corrected)
     if verbose and conv_note["txt"]:
         print(f"   initial estimate:  {conv_note['txt']}")
     # Reference-refinement (the -refine / -workhard / -superhard knob, in 3-D) via the
@@ -4574,11 +4664,7 @@ def _run_3dacq_plain(
             max_shift=max(max_shift),
             verbose=verbose,
             note=lambda: conv_note["txt"],
-            observe=(
-                None
-                if templates is None
-                else (lambda c: templates.append(refine_template_stats(c)))
-            ),
+            observe=_observe if (templates is not None or fwhms is not None) else None,
         )
 
     # Canonical layout: u carries axis a1, v carries a0. Single-PE fills only the PE
@@ -4653,6 +4739,7 @@ def _run_3dacq_plain(
         null_field=(disp[len(axes) - 1] if null_axis is not None else None),
         null_axis=null_axis,
         refine_templates=templates,
+        refine_fwhms=fwhms,
         corrected_nifti=corrected,
         confidence=conf_field,
         corr_curve=curve_box["curve"],

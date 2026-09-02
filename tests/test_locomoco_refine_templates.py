@@ -96,3 +96,64 @@ def test_correction_drops_the_temporal_sd_below_the_uncorrected_baseline():
     sd = [float(t["std"].mean()) for t in tm]
     assert sd[1] < sd[0], sd  # the initial estimate is where the work happens
     assert all(np.isfinite(sd))
+
+
+def test_fwhm_ladder_has_one_entry_per_sweep_and_falls_on_correction():
+    res = estimate_residual_flow(
+        _moved(amp=0.6),
+        pe_axis=1,
+        slice_axis=0,
+        backend="flow",
+        n_levels=3,
+        n_iters=5,
+        dual=True,
+        is_3dacq=True,
+        pe_axis2=2,
+        refine_rounds=2,
+        est_lev_fwhm=True,
+        voxdims=(2.0, 2.0, 2.0),
+        fwhm_polort=4,
+        verbose=False,
+        device=DEV,
+    )
+    f = res.refine_fwhms
+    assert len(f) == 4  # uncorrected + initial + 2 refine passes
+    assert all(np.isfinite(f)) and all(v > 0 for v in f)
+    # Uncorrected motion leaves spatially correlated structure, so taking it out has to
+    # lower the estimate. This is the whole premise of the diagnostic.
+    assert f[1] < f[0], f
+
+
+def test_fwhm_is_off_by_default():
+    assert _run(1).refine_fwhms is None
+
+
+def test_fwhm_needs_voxel_sizes_to_report_mm():
+    import pytest
+
+    with pytest.raises(ValueError, match="voxdims"):
+        estimate_residual_flow(
+            _moved(),
+            pe_axis=1,
+            slice_axis=0,
+            backend="flow",
+            n_levels=2,
+            n_iters=3,
+            dual=True,
+            is_3dacq=True,
+            pe_axis2=2,
+            refine_rounds=0,
+            est_lev_fwhm=True,
+            verbose=False,
+            device=DEV,
+        )
+
+
+def test_detrend_uses_legendre_not_monomials():
+    # A degree-8 monomial basis on 60 points is badly conditioned enough that the
+    # "detrended" residual carries the conditioning error into the ACF. Pin that the
+    # basis actually in use stays well conditioned at the doubled degree.
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    p = construct_polynomial_matrix(60, 8, device=DEV)
+    assert float(torch.linalg.cond(p)) < 10.0
