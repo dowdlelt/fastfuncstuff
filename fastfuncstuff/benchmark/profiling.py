@@ -321,6 +321,8 @@ def _is_io_row(row: dict[str, Any]) -> bool:
 def aggregate_stage(stage_dir: Path) -> dict[str, Any]:
     """Aggregate invocation JSON files and write a readable stage report."""
     invocation_paths = sorted((stage_dir / "invocations").glob("*.json"))
+    if not invocation_paths and (stage_dir / "invocation.json").exists():
+        invocation_paths = [stage_dir / "invocation.json"]
     invocations = [json.loads(path.read_text()) for path in invocation_paths]
     python_rows = _aggregate_rows(invocations, "python", ("file", "line", "function"))
     torch_rows = _aggregate_rows(invocations, "torch", ("operator",))

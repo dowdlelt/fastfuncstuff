@@ -16,6 +16,7 @@ from fastfuncstuff.benchmark.profiling import (
 )
 from fastfuncstuff.benchmark.runner import BenchmarkContext, run_stages
 from fastfuncstuff.cli.benchmark import parse_args
+from fastfuncstuff.cli.profile import parse_args as parse_profile_args
 
 
 def test_command_argv_accepts_only_direct_ffs_commands():
@@ -207,3 +208,21 @@ def test_profile_cli_flags():
     assert args.profile_trace is False
     with pytest.raises(SystemExit):
         parse_args(["-profile-trace"])
+
+
+def test_standalone_profile_parser_accepts_command_after_separator():
+    args = parse_profile_args(["--", "ffs_reml", "-device", "cuda"])
+    assert args.command == ["ffs_reml", "-device", "cuda"]
+    assert args.trace is False
+
+
+def test_aggregate_stage_accepts_top_level_invocation(tmp_path):
+    from fastfuncstuff.benchmark.profiling import aggregate_stage
+
+    stage = tmp_path / "profile"
+    stage.mkdir()
+    (stage / "invocation.json").write_text(
+        json.dumps({"label": "ffs_reml", "python": [], "torch": [], "wall_seconds": 1.0})
+    )
+    summary = aggregate_stage(stage)
+    assert summary["invocation_count"] == 1
