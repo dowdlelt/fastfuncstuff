@@ -283,14 +283,32 @@ def test_spline_field_shape_and_smoothness():
 
 
 # ---------------------------------------------------------------------------
-# Rigid movement estimation (topup --estmov analogue)
+# Rigid movement estimation (joint with the field)
 # ---------------------------------------------------------------------------
-def test_default_estmov_matches_fsl_configs():
-    # The auto rule (warpres >= 10 mm) must reproduce FSL's b02b0 / b02b0_7T --estmov.
-    b02b0 = [20, 16, 14, 12, 10, 6, 4, 4, 4]
-    assert T._default_estmov(b02b0) == [True] * 5 + [False] * 4
-    b02b0_7t = [30, 25, 20, 18, 16, 14, 12, 10, 6, 4, 4, 4]
-    assert T._default_estmov(b02b0_7t) == [True] * 8 + [False] * 4
+def test_default_estmov_is_coarse_levels_only():
+    # Motion is estimated while the field is too coarse to mimic it (>=10 mm knots) and
+    # frozen once it can, so the flags must be a run of True followed by a run of False
+    # -- never re-enabled after being switched off.
+    for lad in (T.make_ladder(9), T.make_ladder(12, res_start=30.0), T.make_ladder(3)):
+        flags = T._default_estmov(lad.warpres)
+        assert flags == sorted(flags, reverse=True), flags
+        assert flags[0] is True, "the coarsest level must estimate motion"
+        assert flags[-1] is False, "the finest level must not"
+
+
+def test_ladder_rule_is_monotone_and_terminates_unsmoothed():
+    for kw in ({}, dict(n_levels=12, res_start=30.0), dict(n_levels=14, res_final=2.0)):
+        lad = T.make_ladder(**kw)
+        n = len(lad.warpres)
+        assert len(lad.fwhm) == len(lad.lam) == len(lad.miter) == n
+        # Knots refine (never coarsen), smoothing releases, penalty releases, effort grows.
+        assert lad.warpres == sorted(lad.warpres, reverse=True)
+        assert lad.fwhm == sorted(lad.fwhm, reverse=True)
+        assert lad.lam == sorted(lad.lam, reverse=True)
+        assert lad.miter == sorted(lad.miter)
+        # The last level fits real data at the field's final resolution.
+        assert lad.fwhm[-1] == 0.0
+        assert lad.warpres[-1] == min(lad.warpres)
 
 
 def test_drop_pe_center_translation():

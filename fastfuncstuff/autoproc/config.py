@@ -29,7 +29,7 @@ DEFAULT_OPTS: dict[str, str] = {
     "moco": "-cost wls -twopass",
     # residual PE-axis nonlinear motion (locomoco).
     "locomoco": "-backend flow -superhard -no_movie -ref mean -want_pcs 3",
-    # fieldmap distortion (blipflip); reproduces FSL b02b0 by default.
+    # fieldmap distortion (blipflip); the 9-level "standard" ladder by default.
     "blip": "-workhard",
     # measured GRE fieldmap (b0fmap). Defaults are the tool's own — the field
     # conditioning was tuned there against real sinus gradients, so overriding it
