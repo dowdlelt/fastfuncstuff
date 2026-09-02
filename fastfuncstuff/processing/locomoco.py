@@ -33,6 +33,7 @@ future NVIDIA-hardware / RAFT backend can slot in behind the same signature.
 from __future__ import annotations
 
 import functools
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -1762,13 +1763,13 @@ def estimate_residual_flow(
     ref_mode: str = "mean",
     backend: str = "flow",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
+    window_sigma: float | Sequence[float] = 2.0,
     pe_only: bool = True,
     dual: bool = False,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     patch: int = 16,
     stride: int = 8,
     warp_interp: str = "bilinear",
@@ -1788,7 +1789,7 @@ def estimate_residual_flow(
     null_min_r2: float = 0.0,
     null_skip: int = 0,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
@@ -1879,9 +1880,9 @@ def estimate_residual_flow(
         pe_axis,
         slice_axis,
         is_3dacq=is_3dacq,
-        max_shift=max_shift,
-        trial_step=trial_step,
-        window_sigma=window_sigma,
+        max_shift=max(axis_params(max_shift, 1 + (pe_axis2 is not None), "-max_shift")),
+        trial_step=min(axis_params(trial_step, 1 + (pe_axis2 is not None), "-xcorr_step")),
+        window_sigma=max(axis_params(window_sigma, 1 + (pe_axis2 is not None), "-window")),
         verbose=verbose,
     )
 
@@ -1947,6 +1948,25 @@ def estimate_residual_flow(
         print(
             f"🌀 locomoco {_geometry_report(orig_shape, pe_axis, slice_axis, is_3dacq=False, dual=dual)}"
         )
+
+    # The 2-D path solves ONE in-plane vector (u, v), not two separately-encoded fields,
+    # so there is no second axis for a per-axis value to describe: a pair here would be
+    # two settings for the same solve. Take the first and say so rather than picking one
+    # silently -- the per-axis spelling belongs to -is_3dacq.
+    n_ax_2d = 1
+    if verbose and any(
+        isinstance(v, (list, tuple)) and len(v) > 1
+        for v in (n_levels, window_sigma, max_shift, trial_step, reg_sigma)
+    ):
+        print(
+            "   ⚠ per-axis (two-value) tuning applies to the 3-D two-encode-axis solve; "
+            "this 2-D run uses the first value of each."
+        )
+    n_levels = axis_params(n_levels, n_ax_2d, "-levels")[0]
+    window_sigma = axis_params(window_sigma, n_ax_2d, "-window")[0]
+    max_shift = axis_params(max_shift, n_ax_2d, "-max_shift")[0]
+    trial_step = axis_params(trial_step, n_ax_2d, "-xcorr_step")[0]
+    reg_sigma = axis_params(reg_sigma, n_ax_2d, "-reg_sigma")[0]
 
     flow_fn = _build_flow_fn(
         backend,
@@ -2509,12 +2529,12 @@ def estimate_residual_flow_rotaware(
     ref_mode: str = "max",
     backend: str = "flow",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
+    window_sigma: float | Sequence[float] = 2.0,
     pe_only: bool = True,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     patch: int = 16,
     stride: int = 8,
     warp_interp: str = "bilinear",
@@ -2529,7 +2549,7 @@ def estimate_residual_flow_rotaware(
     automask_sigma: float = 3.0,
     coverage_erode: int | None = 1,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     device: torch.device | None = None,
@@ -2548,6 +2568,13 @@ def estimate_residual_flow_rotaware(
     anchor just fixes the per-voxel DC offset). ``fuse_weight`` is the anchor weight
     when engaged.
     """
+    # Single encode axis by construction, so a per-axis (two-value) flag has nothing to
+    # apply to here; take the value meant for the axis this path solves.
+    n_levels = axis_scalar(n_levels, "-levels")
+    window_sigma = axis_scalar(window_sigma, "-window")
+    max_shift = axis_scalar(max_shift, "-max_shift")
+    trial_step = axis_scalar(trial_step, "-xcorr_step")
+    reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     from .affine import apply_affine
 
     # 3-D acquisition ignores the slice decomposition (slice_axis is only a display hint);
@@ -2776,6 +2803,29 @@ def estimate_residual_flow_rotaware(
 # 3-D pooling and through-plane regularisation. This also dissolves the "which of the two
 # valid perpendicular cuts do I use" question: the 3-D solve uses all axes at once
 # (strictly better than running the two cuts and averaging their 2-D marginals).
+
+
+def axis_params(value, n_axes: int, name: str = "value") -> list:
+    """Broadcast a scalar-or-per-axis flag value to one entry per encode axis.
+
+    A single value applies to every axis; ``n_axes`` values are taken in encode-axis
+    order (primary PE first, then the partition). This is the one place the "1 or 2
+    values" spelling of ``-window`` / ``-max_shift`` / ``-levels`` / ``-qwarp_minpatch``
+    is interpreted, so a per-axis flag never means two different things in two backends.
+    """
+    if value is None or isinstance(value, (int, float)):
+        return [value] * n_axes
+    vals = list(value)
+    if len(vals) == 1:
+        return vals * n_axes
+    if len(vals) != n_axes:
+        raise ValueError(f"{name} takes 1 or {n_axes} value(s), got {len(vals)}: {vals}")
+    return vals
+
+
+def axis_scalar(value, name: str = "value"):
+    """The single value a one-axis path needs, from a scalar or a length-1 sequence."""
+    return axis_params(value, 1, name)[0]
 
 
 def _blur3d_b(vol: torch.Tensor, sigma: float, skip_axis: int | None = None) -> torch.Tensor:
@@ -3542,13 +3592,13 @@ def _build_flow3d_axes_fn(
     axes: list[int],
     alphas: torch.Tensor,
     *,
-    n_levels: int,
+    n_levels: int | Sequence[int],
     n_iters: int,
-    window_sigma: float,
-    max_shift: float,
-    trial_step: float,
+    window_sigma: float | Sequence[float],
+    max_shift: float | Sequence[float],
+    trial_step: float | Sequence[float],
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     warp_interp: str = "bilinear",
@@ -3864,11 +3914,11 @@ def _run_3dacq_plain(
     ref_mode: str,
     backend: str,
     smooth_sigma: float,
-    n_levels: int,
+    n_levels: int | Sequence[int],
     n_iters: int,
-    window_sigma: float,
-    max_shift: float,
-    trial_step: float,
+    window_sigma: float | Sequence[float],
+    max_shift: float | Sequence[float],
+    trial_step: float | Sequence[float],
     refine_rounds: int,
     converge: float,
     converge_rel: float,
@@ -3880,7 +3930,7 @@ def _run_3dacq_plain(
     device: torch.device,
     verbose: bool,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
@@ -3931,6 +3981,21 @@ def _run_3dacq_plain(
                 f"({axes}). The null axis has to be the un-encoded one."
             )
         axes = axes + [null_axis]
+
+    # One value per SOLVED axis. The null channel inherits the last encode axis's
+    # settings: it is a control for what the estimator invents at the scale it is run
+    # at, and the axis worth controlling is the finer-grained one (a null solved at a
+    # coarser scale than the partition would under-report exactly the fine spurious
+    # structure it exists to measure).
+    def _per_axis(value, name):
+        vals = axis_params(value, n_encoded, name)
+        return vals + [vals[-1]] * (len(axes) - n_encoded)
+
+    n_levels = _per_axis(n_levels, "-levels")
+    window_sigma = _per_axis(window_sigma, "-window")
+    max_shift = _per_axis(max_shift, "-max_shift")
+    trial_step = _per_axis(trial_step, "-xcorr_step")
+    reg_sigma = _per_axis(reg_sigma, "-reg_sigma")
     if dual:
         # Both encode axes must lie in the display plane, so the un-encoded third axis is
         # the one we cut along — the same forcing the 2-D dual-PE path applies.
@@ -4040,8 +4105,8 @@ def _run_3dacq_plain(
                 curve_box["curve"] = (
                     torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
                 )
-                rr = float(max(1, int(np.ceil(max_shift))))
-                curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step)
+                rr = float(max(1, int(np.ceil(max_shift[0]))))
+                curve_box["offsets"] = torch.arange(-rr, rr + 1e-6, trial_step[0])
         if null_axis is not None:
             # Inside the refine loop on purpose. Each pass rebuilds its reference from
             # `corrected`, so a field that still carries the spurious component bakes
@@ -4061,9 +4126,8 @@ def _run_3dacq_plain(
             # a voxel past a bound the estimator itself never violates. Measured on a
             # real run before this clamp existed: the primary axis went from 3.000 vox
             # (the bound) to 8.136.
-            if max_shift is not None:
-                for k in range(n_encoded):
-                    disps[k] = disps[k].clamp(-max_shift, max_shift)
+            for k in range(n_encoded):
+                disps[k] = disps[k].clamp(-max_shift[k], max_shift[k])
             if verbose:
                 grew = [
                     (k, before[k], float(disps[k].abs().max()))
@@ -4155,7 +4219,9 @@ def _run_3dacq_plain(
             refine_rounds=refine_rounds,
             converge=converge,
             converge_rel=converge_rel,
-            max_shift=max_shift,
+            # The divergence threshold is a guard on the whole (multi-axis) step, so it
+            # takes the most permissive bound rather than tripping on the tighter axis.
+            max_shift=max(max_shift),
             verbose=verbose,
         )
 
@@ -4268,16 +4334,16 @@ def optical_flow_lk_3d_multiecho(
     alpha: torch.Tensor,
     pe_axis: int,
     *,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
+    window_sigma: float | Sequence[float] = 2.0,
     reg: float = 1e-3,
     warp_interp: str = "bilinear",
     warp_radius: int = 3,
     match: str = "none",
     match_sigma: float = 2.0,
     ngf_eta_q: float = 0.5,
-    max_disp: float | None = None,
+    max_disp: float | Sequence[float] | None = None,
 ) -> torch.Tensor:
     """Shared-field 1-DOF (PE-axis) pyramidal LK across echoes ``(B,X,Y,Z)``.
 
@@ -4527,6 +4593,18 @@ def optical_flow_lk_3d_axes(
     An explicit per-echo weight was implemented and measured: it changed nothing, and was
     removed rather than left as a dead knob.
 
+    ``n_levels``, ``window_sigma`` and ``max_disp`` each take one value per axis (a
+    scalar applies to all). The windows are the reason the solve is written for a
+    non-symmetric ``A``: row ``k`` is pooled at ``window_sigma[k]``, so each unknown's
+    normal equation gets the aperture its own field wants. ``n_levels[k]`` is how many
+    levels, counting from the COARSEST, axis ``k`` stays in the joint solve — the
+    pyramid is as deep as the largest, and an axis that has run out drops from the
+    normal equations while still warping the moving volume with what it found. That is
+    the shape of the problem in a 3-D EPI: the primary-PE field is smooth and is
+    finished at a coarse level, the partition field is small and patchy and needs the
+    finest one, and refining the smooth axis where it has no structure left leaks its
+    noise through the off-diagonal into the axis that does.
+
     ``slicewise_axis`` makes the solve 2-D multi-slice: the pooling window, the pyramid
     blur and the pyramid downsampling all skip that axis, so each slice is solved from
     its own data alone. That is the right geometry when every slice is acquired at its
@@ -4566,6 +4644,10 @@ def optical_flow_lk_3d_axes(
         ]
 
     n_ax, n_echo = len(axes), len(fixed_list)
+    window = [float(v) for v in axis_params(window_sigma, n_ax, "window_sigma")]
+    lev = [max(1, int(v)) for v in axis_params(n_levels, n_ax, "n_levels")]
+    max_disp = axis_params(max_disp, n_ax, "max_disp")
+    n_levels = max(lev)
     fpyr = [[f] for f in fixed_list]
     mpyr = [[m] for m in moving_list]
     for _ in range(n_levels - 1):
@@ -4595,62 +4677,113 @@ def optical_flow_lk_3d_axes(
                     ).squeeze(1)
                     * scale
                 )
+                # The rescale multiplies by the pyramid ratio, so a field that reached
+                # its bound at the coarser level lands above it here. Re-clamp EVERY
+                # axis, solved or not: an axis that has dropped out is never touched by
+                # the in-loop clamp again, and would otherwise leave the pyramid holding
+                # a displacement 2x past the bound the user set.
+                if max_disp[k] is not None:
+                    disp[k] = disp[k].clamp(-max_disp[k], max_disp[k])
+        # Which axes are still being SOLVED here. An axis given fewer levels leaves the
+        # normal equations once the pyramid is finer than its allowance, keeping the
+        # field it reached; it still warps the moving volume, so the axes that carry on
+        # see it corrected. Below its own scale a smooth field has nothing left to fit,
+        # and the coupled solve would let that noise into the axis that does.
+        act = [k for k in range(n_ax) if lvl >= nlev - lev[k]]
+        na = len(act)
         for _ in range(n_iters):
-            a = [[torch.zeros_like(disp[0]) for _ in range(n_ax)] for _ in range(n_ax)]
-            b = [torch.zeros_like(disp[0]) for _ in range(n_ax)]
+            # Pool the per-echo Gram/residual products FIRST and blur once at the end:
+            # the window is linear, so this is identical to blurring inside the echo
+            # loop, at one blur per matrix entry instead of one per entry per echo.
+            gram = {}  # (i, j) upper triangle -> unblurred Sum_e a_i,e a_j,e g_i g_j
+            rhs = [None] * na
             for j in range(n_echo):
                 shifts = [float(alphas[k, j]) * disp[k] for k in range(n_ax)]
                 mw = _shift3d_axes(mpyr[j][lvl], shifts, axes, mode=warp_interp, radius=warp_radius)
                 it = mw - fpyr[j][lvl]
-                g = [_grad_axis_3d(mw, ax) for ax in axes]
-                for k in range(n_ax):
-                    ak = float(alphas[k, j])
-                    b[k] = b[k] - ak * _blur3d_b(g[k] * it, window_sigma, slicewise_axis)
-                    for m in range(k, n_ax):
-                        am = float(alphas[m, j])
-                        a[k][m] = a[k][m] + (ak * am) * _blur3d_b(
-                            g[k] * g[m], window_sigma, slicewise_axis
+                g = [_grad_axis_3d(mw, axes[k]) for k in act]
+                for i in range(na):
+                    ai = float(alphas[act[i], j])
+                    t = ai * (g[i] * it)
+                    rhs[i] = t if rhs[i] is None else rhs[i] + t
+                    for m in range(i, na):
+                        am = float(alphas[act[m], j])
+                        t = (ai * am) * (g[i] * g[m])
+                        gram[(i, m)] = t if (i, m) not in gram else gram[(i, m)] + t
+            win = [window[act[i]] for i in range(na)]
+            b = [-_blur3d_b(rhs[i], win[i], slicewise_axis) for i in range(na)]
+            # Row i is pooled at ITS OWN window. That makes A asymmetric whenever the
+            # two axes are given different windows -- each unknown's normal equation
+            # gets the aperture that suits its field, which is the whole point -- so the
+            # solve below is the general (non-symmetric) inverse, reducing exactly to
+            # the symmetric one when the windows agree.
+            a = [[None] * na for _ in range(na)]
+            for i in range(na):
+                for m in range(i, na):
+                    a[i][m] = _blur3d_b(gram[(i, m)], win[i], slicewise_axis)
+                    if m > i:
+                        a[m][i] = (
+                            a[i][m]
+                            if win[m] == win[i]
+                            else _blur3d_b(gram[(i, m)], win[m], slicewise_axis)
                         )
-            if n_ax == 1:
-                disp[0] = disp[0] + b[0] / (a[0][0] + reg)
-            elif n_ax == 2:
+            if na == 1:
+                upd = [b[0] / (a[0][0] + reg)]
+            elif na == 2:
                 a11 = a[0][0] + reg
                 a22 = a[1][1] + reg
-                a12 = a[0][1]
+                a12, a21 = a[0][1], a[1][0]
                 prod = a11 * a22
-                sep = (1.0 - (a12 * a12) / prod).clamp(0.0, 1.0)
+                sep = (1.0 - (a12 * a21) / prod).clamp(0.0, 1.0)
                 sep_map = sep
                 det = prod * sep.clamp_min(sep_floor)
-                disp[0] = disp[0] + (a22 * b[0] - a12 * b[1]) / det
-                disp[1] = disp[1] + (a11 * b[1] - a12 * b[0]) / det
+                upd = [(a22 * b[0] - a12 * b[1]) / det, (a11 * b[1] - a21 * b[0]) / det]
             else:
                 # Three axes: the same pooled normal equations, solved by cofactors
                 # rather than a batched LU -- one 3x3 per voxel is millions of tiny
                 # systems, and the closed form is a handful of elementwise products.
                 a11, a22, a33 = a[0][0] + reg, a[1][1] + reg, a[2][2] + reg
                 a12, a13, a23 = a[0][1], a[0][2], a[1][2]
-                c11 = a22 * a33 - a23 * a23
-                c12 = a13 * a23 - a12 * a33
-                c13 = a12 * a23 - a13 * a22
-                c22 = a11 * a33 - a13 * a13
-                c23 = a13 * a12 - a11 * a23
-                c33 = a11 * a22 - a12 * a12
+                a21, a31, a32 = a[1][0], a[2][0], a[2][1]
+                j11 = a22 * a33 - a23 * a32
+                j12 = a13 * a32 - a12 * a33
+                j13 = a12 * a23 - a13 * a22
+                j21 = a23 * a31 - a21 * a33
+                j22 = a11 * a33 - a13 * a31
+                j23 = a13 * a21 - a11 * a23
+                j31 = a21 * a32 - a22 * a31
+                j32 = a12 * a31 - a11 * a32
+                j33 = a11 * a22 - a12 * a21
                 prod = a11 * a22 * a33
                 # sep generalises the 2-axis measure: det over the product of the
                 # diagonal is 1 for orthogonal gradients and 0 when the axes cannot be
                 # told apart, and stays scale-free per axis where a raw determinant
                 # floor would be a different constraint on every dataset.
-                det_raw = a11 * c11 + a12 * c12 + a13 * c13
+                det_raw = a11 * j11 + a12 * j21 + a13 * j31
                 sep = (det_raw / prod).clamp(0.0, 1.0)
                 sep_map = sep
                 det = prod * sep.clamp_min(sep_floor)
-                disp[0] = disp[0] + (c11 * b[0] + c12 * b[1] + c13 * b[2]) / det
-                disp[1] = disp[1] + (c12 * b[0] + c22 * b[1] + c23 * b[2]) / det
-                disp[2] = disp[2] + (c13 * b[0] + c23 * b[1] + c33 * b[2]) / det
-            if max_disp is not None:
-                for k in range(n_ax):
-                    disp[k] = disp[k].clamp(-max_disp, max_disp)
+                upd = [
+                    (j11 * b[0] + j12 * b[1] + j13 * b[2]) / det,
+                    (j21 * b[0] + j22 * b[1] + j23 * b[2]) / det,
+                    (j31 * b[0] + j32 * b[1] + j33 * b[2]) / det,
+                ]
+            for i, k in enumerate(act):
+                disp[k] = disp[k] + upd[i]
+                if max_disp[k] is not None:
+                    disp[k] = disp[k].clamp(-max_disp[k], max_disp[k])
     if sep_out is not None and sep_map is not None:
+        # sep only exists on levels that actually solved 2+ axes together. With per-axis
+        # level counts the finest levels can be single-axis, so the last map we have may
+        # be coarser than the field; resample it rather than dropping the diagnostic or
+        # (as it did once) assigning a coarse volume into a full-resolution one.
+        if sep_map.shape[1:] != disp[0].shape[1:]:
+            sep_map = F.interpolate(
+                sep_map.unsqueeze(1),
+                size=tuple(disp[0].shape[1:]),
+                mode="trilinear",
+                align_corners=True,
+            ).squeeze(1)
         sep_out.append(sep_map)
     return disp
 
@@ -4805,12 +4938,12 @@ def xcorr_search_flow_3d_axes(
     axes: list[int],
     alphas: torch.Tensor,
     *,
-    max_shift: float = 3.0,
-    window_sigma: float = 2.0,
-    trial_step: float = 0.5,
+    max_shift: float | Sequence[float] = 3.0,
+    window_sigma: float | Sequence[float] = 2.0,
+    trial_step: float | Sequence[float] = 0.5,
     weights: list[torch.Tensor] | None = None,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     fourier_shift: bool = True,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
@@ -4840,6 +4973,12 @@ def xcorr_search_flow_3d_axes(
 
     ``curve_out`` (the correlation landscape) is only captured for the single-axis case —
     under alternation there is no single landscape, each axis has one per pass.
+
+    ``max_shift``, ``window_sigma``, ``trial_step`` and ``reg_sigma`` each take one value
+    per axis (a scalar applies to both). Because the two axes alternate as independent
+    searches rather than sharing a solve, each half-pass is simply run at its own
+    settings — a coarse searchlight over a wide range for the smooth primary-PE field,
+    a tight one for the patchy partition field.
     """
     if len(axes) not in (1, 2):
         raise ValueError(f"xcorr_search_flow_3d_axes takes 1 or 2 axes, got {axes}")
@@ -4856,18 +4995,24 @@ def xcorr_search_flow_3d_axes(
             f"got {tuple(alphas.shape)}"
         )
 
+    n_ax = len(axes)
+    ms = [float(v) for v in axis_params(max_shift, n_ax, "max_shift")]
+    win = [float(v) for v in axis_params(window_sigma, n_ax, "window_sigma")]
+    step = [float(v) for v in axis_params(trial_step, n_ax, "trial_step")]
+    rsig = [float(v) for v in axis_params(reg_sigma, n_ax, "reg_sigma")]
+
     def _search(mv: list[torch.Tensor], k: int, curves):
         return xcorr_search_flow_3d_multiecho(
             fixed_list,
             mv,
             alphas[k],
             axes[k],
-            max_shift=max_shift,
-            window_sigma=window_sigma,
-            trial_step=trial_step,
+            max_shift=ms[k],
+            window_sigma=win[k],
+            trial_step=step[k],
             weights=weights,
             noshift_margin=noshift_margin,
-            reg_sigma=reg_sigma,
+            reg_sigma=rsig[k],
             fourier_shift=fourier_shift,
             peak_mode=peak_mode,
             search_min_steps=search_min_steps,
@@ -4962,11 +5107,11 @@ def estimate_residual_flow_multiecho(
     ref_mode: str = "mean",
     backend: str = "flow",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    window_sigma: float | Sequence[float] = 2.0,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     refine_rounds: int = 0,
     converge: float = 0.0,
     converge_rel: float = 0.0,
@@ -5085,14 +5230,23 @@ def estimate_residual_flow_multiecho(
     # The axis every pooling window and pyramid step must leave alone (None = 3-D solve).
     sw_axis = disp_slice if slicewise else None
 
+    # One value per encode axis; a scalar applies to both. Order is (primary PE,
+    # partition), matching `axes`.
+    n_ax_flags = len(axes)
+    n_levels = axis_params(n_levels, n_ax_flags, "-levels")
+    window_sigma = [float(v) for v in axis_params(window_sigma, n_ax_flags, "-window")]
+    max_shift = [float(v) for v in axis_params(max_shift, n_ax_flags, "-max_shift")]
+    trial_step = [float(v) for v in axis_params(trial_step, n_ax_flags, "-xcorr_step")]
+    reg_sigma = [float(v) for v in axis_params(reg_sigma, n_ax_flags, "-reg_sigma")]
+
     _validate_estimation_inputs(
         shp,
         pe_axis,
         slice_axis,
         is_3dacq=not slicewise,
-        max_shift=max_shift,
-        trial_step=trial_step,
-        window_sigma=window_sigma,
+        max_shift=max(max_shift),
+        trial_step=min(trial_step),
+        window_sigma=max(window_sigma),
         verbose=verbose,
     )
 
@@ -5199,7 +5353,7 @@ def estimate_residual_flow_multiecho(
                 window_sigma=window_sigma,
                 warp_interp=warp_interp,
                 warp_radius=warp_radius,
-                max_disp=max_shift if dual else None,
+                max_disp=max_shift if dual else None,  # per axis; single-axis LK is unclamped
                 sep_floor=sep_floor,
                 sep_out=sep_acc,
                 slicewise_axis=sw_axis,
@@ -5245,8 +5399,8 @@ def estimate_residual_flow_multiecho(
             pooled_conf[..., t] = conf.cpu()
             if curve_acc is not None:
                 corr_curve = torch.stack(curve_acc, 0)[:, 0].permute(1, 2, 3, 0).contiguous()
-                rr = float(max(1, int(np.ceil(max_shift))))
-                corr_offsets = torch.arange(-rr, rr + 1e-6, trial_step)
+                rr = float(max(1, int(np.ceil(max_shift[0]))))
+                corr_offsets = torch.arange(-rr, rr + 1e-6, trial_step[0])
         have_pooled_conf = True
         return out
 
@@ -5391,7 +5545,9 @@ def estimate_residual_flow_multiecho(
             refine_rounds=refine_rounds,
             converge=converge,
             converge_rel=converge_rel,
-            max_shift=max_shift,
+            # A guard on the whole multi-axis step, so it takes the loosest bound rather
+            # than tripping on the tighter axis.
+            max_shift=max(max_shift),
             verbose=verbose,
         )
 
@@ -5497,11 +5653,11 @@ def estimate_residual_flow_me_scaled(
     ref_mode: str = "median",
     backend: str = "xcorr",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    window_sigma: float | Sequence[float] = 2.0,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     refine_rounds: int = 0,
     converge: float = 0.0,
     converge_rel: float = 0.0,
@@ -5512,7 +5668,7 @@ def estimate_residual_flow_me_scaled(
     coverage_erode: int | None = 1,
     flat_scaling: bool = False,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     warp_interp: str = "lanczos",
@@ -5543,6 +5699,13 @@ def estimate_residual_flow_me_scaled(
     the one-pass application of its scaled field to every other echo. Lanczos is the
     default so none of those corrected series inherits linear-interpolation blur.
     """
+    # Single encode axis by construction, so a per-axis (two-value) flag has nothing to
+    # apply to here; take the value meant for the axis this path solves.
+    n_levels = axis_scalar(n_levels, "-levels")
+    window_sigma = axis_scalar(window_sigma, "-window")
+    max_shift = axis_scalar(max_shift, "-max_shift")
+    trial_step = axis_scalar(trial_step, "-xcorr_step")
+    reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     e = len(datas)
@@ -5829,7 +5992,7 @@ def _rewarp_raw_single_pass(
 def polish_me_result(
     result: MultiEchoLocomocoResult,
     *,
-    minpatch: int = 7,
+    minpatch: int | Sequence[int] = 7,
     n_levels: int = 2,
     iters: int = 10,
     cost: str = "ncc",
@@ -5935,8 +6098,19 @@ def polish_me_result(
     # Gauss-Newton on the ncc cost: analytic image-gradient Jacobian (no autograd),
     # converges in a few steps. Starts near the solution (polish) or from the full
     # distortion (backend, needs more levels), always from seed 0.
+    # One value per encode axis, in `axes` order (PE1 then PE2). A scalar applies to
+    # both. The finest level of the ladder is the smallest of them; each axis then drops
+    # out below its own entry, so the partition can keep refining past where the smooth
+    # primary-PE field has nothing left to say.
+    mp = [int(minpatch)] * len(axes) if isinstance(minpatch, int) else [int(v) for v in minpatch]
+    if len(mp) == 1:
+        mp = mp * len(axes)
+    if len(mp) != len(axes):
+        raise ValueError(f"minpatch takes 1 or {len(axes)} value(s); got {list(minpatch)}.")
+    axis_minpatch = mp if len(set(mp)) > 1 else None
+
     cfg = QwarpConfig(
-        minpatch=minpatch,
+        minpatch=min(mp),
         cost_method=cost,
         verb=0,
         batch_optimizer_iters=iters,
@@ -5970,6 +6144,7 @@ def polish_me_result(
             device=device,
             show_progress=verbose,
             slicewise_axis=slicewise_axis,
+            axis_minpatch=axis_minpatch,
         )
         del base_echoes
         # (A, nz, ny, nx, T) -> one (nx, ny, nz, T) field per encode axis, echo-1 scale.
@@ -6033,10 +6208,11 @@ def polish_me_result(
         sel = rr[rr > 0]
         med = float(sel.median()) if sel.numel() else 0.0
         tag = "field |w|" if full else "residual |r|"
+        mp_txt = "/".join(str(v) for v in mp)
         geom = (
-            f"2-D {minpatch}×{minpatch} patches, slicewise along {'xyz'[ref.slice_axis]}"
+            f"2-D {mp_txt}×{mp_txt} patches, slicewise along {'xyz'[ref.slice_axis]}"
             if slicewise
-            else f"3-D {minpatch}³ patches"
+            else f"3-D {mp_txt}³ patches"
         )
         print(
             f"🪄 qwarp {'backend' if full else 'polish'}: {tag} median {med:.3f} vox, "
@@ -6064,15 +6240,15 @@ def estimate_residual_flow_me_interecho(
     *,
     backend: str = "xcorr",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    window_sigma: float | Sequence[float] = 2.0,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     automask: bool = False,
     automask_sigma: float = 3.0,
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     save_corr_curve: int | None = None,
@@ -6125,6 +6301,13 @@ def estimate_residual_flow_me_interecho(
     valid signal; those masks weight each pair's xcorr, and their feathered union gates
     the output ``w``. The model is therefore only trusted out to echo 2's mask floor.
     """
+    # Single encode axis by construction, so a per-axis (two-value) flag has nothing to
+    # apply to here; take the value meant for the axis this path solves.
+    n_levels = axis_scalar(n_levels, "-levels")
+    window_sigma = axis_scalar(window_sigma, "-window")
+    max_shift = axis_scalar(max_shift, "-max_shift")
+    trial_step = axis_scalar(trial_step, "-xcorr_step")
+    reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     e = len(datas)
@@ -6441,11 +6624,11 @@ def refine_interecho_temporally(
     ref_mode: str = "mean",
     backend: str = "flow",
     smooth_sigma: float = 0.0,
-    n_levels: int = 3,
+    n_levels: int | Sequence[int] = 3,
     n_iters: int = 4,
-    window_sigma: float = 2.0,
-    max_shift: float = 3.0,
-    trial_step: float = 0.5,
+    window_sigma: float | Sequence[float] = 2.0,
+    max_shift: float | Sequence[float] = 3.0,
+    trial_step: float | Sequence[float] = 0.5,
     converge: float = 0.0,
     converge_rel: float = 0.0,
     first_n: int | None = None,
@@ -6455,7 +6638,7 @@ def refine_interecho_temporally(
     coverage_erode: int | None = 1,
     scaling: str = "affine",
     noshift_margin: float = 0.0,
-    reg_sigma: float = 1.5,
+    reg_sigma: float | Sequence[float] = 1.5,
     peak_mode: str = "first_peak",
     search_min_steps: int = 5,
     warp_interp: str = "lanczos",
@@ -6520,6 +6703,13 @@ def refine_interecho_temporally(
     cannot hold a two-component field), and ``linearity_r2`` is the affine-in-TE model
     check from :func:`_affine_in_te_r2`.
     """
+    # Single encode axis by construction, so a per-axis (two-value) flag has nothing to
+    # apply to here; take the value meant for the axis this path solves.
+    n_levels = axis_scalar(n_levels, "-levels")
+    window_sigma = axis_scalar(window_sigma, "-window")
+    max_shift = axis_scalar(max_shift, "-max_shift")
+    trial_step = axis_scalar(trial_step, "-xcorr_step")
+    reg_sigma = axis_scalar(reg_sigma, "-reg_sigma")
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     e = len(datas)

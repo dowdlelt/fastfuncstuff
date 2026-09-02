@@ -3132,6 +3132,10 @@ class _MELevelPlan:
     kk_flat: Tensor
     expand_mat: Tensor
     phases: list[_MEPhasePlan]
+    # Which displacement channels this level solves for. Per LEVEL, not per plan: an
+    # encode axis whose field is smooth is refined down to a coarse patch and then
+    # dropped, while a patchy one keeps going. See ``axis_minpatch``.
+    do_xyz: tuple[bool, bool, bool] = (True, True, True)
 
 
 @dataclass
@@ -3158,6 +3162,7 @@ def _build_mescaled_plan(
     n_levels: int,
     pad: bool,
     slicewise_axis: int | None = None,
+    axis_minpatch: Sequence[int] | None = None,
 ) -> _MEScaledPlan:
     """Precompute all frame-invariant structure for the ME-scaled polish.
 
@@ -3175,6 +3180,15 @@ def _build_mescaled_plan(
 
     ``pe_grid_axes`` is one or two displacement channels; a bare int is accepted as the
     single-axis spelling.
+
+    ``axis_minpatch`` gives each encode axis its OWN finest patch width, in
+    ``pe_grid_axes`` order: axis ``k`` is solved only at levels whose patch is at least
+    ``axis_minpatch[k]`` wide, and drops out of the Gauss-Newton system below that. The
+    primary PE field of an EPI is smooth and is fully described by a coarse patch, while
+    the partition-direction field is small and local; refining both to the same width
+    spends the fine levels fitting noise into the axis that has no structure left there,
+    and the coupled solve lets that leak into the axis that does. ``None`` keeps every
+    axis active at every level.
     """
     pe_grid_axes = (pe_grid_axes,) if isinstance(pe_grid_axes, int) else tuple(pe_grid_axes)
     if slicewise_axis is not None:
@@ -3213,6 +3227,16 @@ def _build_mescaled_plan(
         mask_p = _pad_volume_faces(m.float(), padding).byte() if do_pad else m
 
     do_xyz = (0 in pe_grid_axes, 1 in pe_grid_axes, 2 in pe_grid_axes)
+    if axis_minpatch is not None and len(axis_minpatch) != len(pe_grid_axes):
+        raise ValueError(
+            f"axis_minpatch has {len(axis_minpatch)} entries but there are "
+            f"{len(pe_grid_axes)} encode axes."
+        )
+    # Per-channel floor, indexed the way do_xyz is: 0 for a channel nobody solves.
+    min_by_channel = [0, 0, 0]
+    if axis_minpatch is not None:
+        for ax, mp in zip(pe_grid_axes, axis_minpatch, strict=True):
+            min_by_channel[ax] = int(mp)
     use_ncc = config.cost_method == "ncc"
     if use_ncc:
         blok_index_vol = None
@@ -3229,11 +3253,20 @@ def _build_mescaled_plan(
         ngmin -= 1
     widths: list[int] = []
     w = ngmin
-    for _ in range(max(1, n_levels)):
+    n_lev = max(1, n_levels)
+    coarsest_needed = max(min_by_channel)
+    while True:
         widths.append(w)
         w = int(round(w / config.shrink))
         if w % 2 == 0:
             w += 1
+        # The ladder ends at the requested depth UNLESS a coarse-stopping axis would
+        # otherwise never be solved at all: it has to see at least one level wide
+        # enough for it, or the caller silently gets a single-axis fit.
+        if len(widths) >= n_lev and widths[-1] >= coarsest_needed:
+            break
+        if len(widths) >= 32:  # a runaway guard; shrink < 1 makes this unreachable
+            break
     widths = widths[::-1]  # coarsest first
     max_patch_lev1 = widths[0]
 
@@ -3244,7 +3277,6 @@ def _build_mescaled_plan(
     mask_flat = mask_p.float().reshape(-1)
     blok_flat = blok_index_vol.reshape(-1).long() if blok_index_vol is not None else None
 
-    active_dims = [d for d in range(3) if do_xyz[d]]
     levels: list[_MELevelPlan] = []
     n_active = 0
 
@@ -3258,6 +3290,11 @@ def _build_mescaled_plan(
         if pw % 2 == 0:
             pw -= 1
         if pw < 5:
+            continue
+        # An axis stops being refined once the patch is narrower than its own floor.
+        lvl_do = tuple(do_xyz[d] and pw >= min_by_channel[d] for d in range(3))
+        active_dims = [d for d in range(3) if lvl_do[d]]
+        if not active_dims:
             continue
         wid = [pw, pw, pw]
         if slicewise_axis is not None:
@@ -3364,6 +3401,7 @@ def _build_mescaled_plan(
                 kk_flat=kk_flat,
                 expand_mat=expand_mat,
                 phases=phase_plans,
+                do_xyz=lvl_do,
             )
         )
 
@@ -3673,7 +3711,7 @@ def _solve_mescaled_frame(
                 state,
                 config,
                 device,
-                plan.do_xyz,
+                level.do_xyz,
                 use_penalty=use_pen,
                 pen_fac=config.penalty_factor,
                 max_iter=config.batch_optimizer_iters,
@@ -3717,6 +3755,7 @@ def qwarp_pe_scaled_polish(
     n_levels: int = 2,
     pad: bool = True,
     slicewise_axis: int | None = None,
+    axis_minpatch: Sequence[int] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Polish a seed PE displacement field with joint multi-echo TE-scaled qwarp.
 
@@ -3750,6 +3789,10 @@ def qwarp_pe_scaled_polish(
             plane. Use it for 2-D multi-slice acquisitions (each slice has its own
             acquisition instant); ``None`` keeps the isotropic 3-D patches, right for
             3-D-acquired EPI. Must differ from ``pe_grid_axis``.
+        axis_minpatch: per-encode-axis finest patch width, in ``pe_grid_axis`` order.
+            An axis drops out of the solve at levels finer than its own entry, so a
+            smooth primary-PE field can stop at a coarse patch while the patchy
+            partition field keeps refining. ``None`` refines every axis everywhere.
 
     Returns:
         ``(warped, field)`` where ``warped`` is ``(E, nz, ny, nx)`` each source warped
@@ -3781,7 +3824,16 @@ def qwarp_pe_scaled_polish(
     alpha = torch.ones(E, device=device) if alpha is None else alpha.float().to(device)
 
     plan = _build_mescaled_plan(
-        base_echoes, axes, weight, mask, config, device, n_levels, pad, slicewise_axis
+        base_echoes,
+        axes,
+        weight,
+        mask,
+        config,
+        device,
+        n_levels,
+        pad,
+        slicewise_axis,
+        axis_minpatch,
     )
     return _solve_mescaled_frame(plan, source_echoes, seed_field, alpha, config, device)
 
@@ -3799,6 +3851,7 @@ def qwarp_pe_scaled_polish_series(
     n_levels: int = 2,
     show_progress: bool = True,
     slicewise_axis: int | None = None,
+    axis_minpatch: Sequence[int] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Per-frame joint multi-echo TE-scaled PE-only polish over a 4-D series.
 
@@ -3828,6 +3881,8 @@ def qwarp_pe_scaled_polish_series(
         show_progress: draw a persistent tqdm bar over frames.
         slicewise_axis: 2-D slicewise patches across this grid axis; see
             :func:`qwarp_pe_scaled_polish`.
+        axis_minpatch: per-encode-axis finest patch width; see
+            :func:`qwarp_pe_scaled_polish`.
 
     Returns:
         ``(warped, field)`` with ``warped`` ``(E, nz, ny, nx, T)`` and ``field``
@@ -3855,7 +3910,16 @@ def qwarp_pe_scaled_polish_series(
 
     # Build the frame-invariant geometry + base/weight/mask gathers ONCE.
     plan = _build_mescaled_plan(
-        base_echoes, axes, weight, mask, config, device, n_levels, True, slicewise_axis
+        base_echoes,
+        axes,
+        weight,
+        mask,
+        config,
+        device,
+        n_levels,
+        True,
+        slicewise_axis,
+        axis_minpatch,
     )
 
     warped = torch.empty(E, nz, ny, nx, T)

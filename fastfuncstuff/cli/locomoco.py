@@ -322,6 +322,67 @@ EXAMPLES
 """
 
 
+# Appended to every flag that accepts one value per encode axis. One sentence, written
+# once: two-axis runs would otherwise need a separate -pe2_ twin of each of these flags,
+# and the help would say the same thing six times.
+PERAXIS = (
+    "\nTakes 1 or 2 values: one applies to BOTH encode axes, two set the primary PE and "
+    "the partition separately (a 3-D EPI's partition field is small, local and patchy "
+    "where the primary PE field is smooth, so they want different scales). On a "
+    "partition-only run (-pe_dir2 alone) a pair still means PE1 PE2, and the second "
+    "value is the one used."
+)
+
+
+# (dest, flag spelling, cast) for every flag that takes one value per encode axis.
+_AXIS_FLAGS = (
+    ("levels", "-levels", int),
+    ("window", "-window", float),
+    ("max_shift", "-max_shift", float),
+    ("xcorr_step", "-xcorr_step", float),
+    ("reg_sigma", "-reg_sigma", float),
+    ("qwarp_minpatch", "-qwarp_minpatch", int),
+)
+
+
+def _axis_txt(vals) -> str:
+    """``2`` or ``2/4`` — a per-axis flag value as it should read in a settings line."""
+    v = list(vals) if isinstance(vals, (list, tuple)) else [vals]
+    out = "/".join(f"{x:g}" for x in v)
+    return out
+
+
+def _resolve_axis_flags(args, n_axes: int, partition_only: bool) -> int | None:
+    """Collapse every per-axis flag to exactly one value per encode axis, in place.
+
+    Done once, here, so that no estimator has to re-decide what a bare ``-window 2``
+    means: from this point on every one of these flags is a list as long as the run's
+    encode-axis list, in the same order.
+    """
+    for dest, flag, cast in _AXIS_FLAGS:
+        raw = getattr(args, dest)
+        vals = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+        if not 1 <= len(vals) <= 2:
+            print(f"❌ {flag} takes 1 or 2 values (PE1 [PE2]), got {len(vals)}.", file=sys.stderr)
+            return 2
+        if len(vals) == 1:
+            vals = vals * n_axes
+        elif n_axes == 1:
+            # A pair always reads PE1 PE2, even when only one of them is being solved:
+            # a -pe_dir2-only run IS the partition, so it takes the second value. Said
+            # out loud, because silently dropping half of what the user typed is how a
+            # run ends up tuned for the axis it isn't correcting.
+            keep = 1 if partition_only else 0
+            print(
+                f"   ⚠ {flag} was given two values but this run solves one encode axis; "
+                f"using the {'partition' if partition_only else 'primary PE'} value "
+                f"({vals[keep]:g})."
+            )
+            vals = [vals[keep]]
+        setattr(args, dest, [cast(v) for v in vals])
+    return None
+
+
 def create_parser() -> argparse.ArgumentParser:
     p = FfsArgumentParser(
         prog="ffs_locomoco",
@@ -769,11 +830,19 @@ def create_parser() -> argparse.ArgumentParser:
     flow.add_argument(
         "-levels",
         type=int,
-        default=3,
+        nargs="+",
+        default=[3],
         help="[flow only] Coarse-to-fine pyramid levels. The flow is solved on a stack "
         "of images each halved in size; the coarsest catches large displacements "
         "(1 px there = 2^(levels-1) px full-res), finer levels refine. More = handles "
-        "bigger motion, but risks aliasing on thin slices.",
+        "bigger motion, but risks aliasing on thin slices.\n"
+        "Per axis this is the number of levels, COUNTING FROM THE COARSEST, that the axis "
+        "stays in the joint solve: the pyramid is as deep as the larger value, and the "
+        "axis with the smaller one drops out of the 2x2 normal equations below it and "
+        "keeps the field it had. `-levels 2 4` refines both down two levels, then "
+        "refines the partition alone on the two finest — which is what you want when the "
+        "primary PE field has no structure left at that scale and fitting it there just "
+        "leaks noise into the axis that does." + PERAXIS,
     )
 
     tune = p.add_argument_group("Shared tuning (applies to the backends tagged below)")
@@ -792,7 +861,8 @@ def create_parser() -> argparse.ArgumentParser:
     tune.add_argument(
         "-window",
         type=float,
-        default=2.0,
+        nargs="+",
+        default=[2.0],
         metavar="SIGMA",
         help="[flow, xcorr] Neighbourhood Gaussian sigma, in VOXELS, over which the"
         " DISPLACEMENT is pooled.\n"
@@ -803,21 +873,22 @@ def create_parser() -> argparse.ArgumentParser:
         "Larger = smoother and more robust, but blurs fine local shifts; smaller = sharper"
         " and noisier. This is a MOTION scale, and is independent of the contrast scales"
         " -match_sigma / -me_match_sigma: intensity matching finishes before the estimator"
-        " runs, and the estimator then pools over -window on the matched data.",
+        " runs, and the estimator then pools over -window on the matched data." + PERAXIS,
     )
 
     search = p.add_argument_group("Searchlight backends (-backend phase / xcorr)")
     search.add_argument(
         "-max_shift",
         type=float,
-        default=3.0,
+        nargs="+",
+        default=[3.0],
         metavar="VOX",
         help="Largest PE shift to allow (voxels). Set just above the biggest residual "
         "shift you expect (sub- to a few voxels here). Smaller = faster xcorr (fewer "
         "trial offsets) and a tighter phase no-wrap band; too small clips real motion. "
         "phase and xcorr search within it; flow clamps its accumulated field to it, "
         "which is what stops a textureless slab-end slice random-walking to hundreds "
-        "of voxels. All three also use it as the refine divergence threshold.",
+        "of voxels. All three also use it as the refine divergence threshold." + PERAXIS,
     )
     search.add_argument(
         "-search_min_steps",
@@ -843,24 +914,26 @@ def create_parser() -> argparse.ArgumentParser:
     search.add_argument(
         "-xcorr_step",
         type=float,
-        default=0.5,
+        nargs="+",
+        default=[0.5],
         metavar="VOX",
         help="[xcorr only] Trial-offset spacing (voxels) of the correlation search — "
         "xcorr's sub-voxel knob, like -iters is for the others. The peak is fit by a "
         "5-point parabola either way; a finer step (e.g. 0.25) samples the curve more "
-        "densely for a touch more accuracy at ~2× the trials. 0.5 is the sweet spot.",
+        "densely for a touch more accuracy at ~2× the trials. 0.5 is the sweet spot." + PERAXIS,
     )
     search.add_argument(
         "-reg_sigma",
         "-reg-sigma",
         type=float,
-        default=1.5,
+        nargs="+",
+        default=[1.5],
         metavar="VOX",
         help="[xcorr] Confidence-weighted spatial smoothing of the searchlight field "
         "(Gaussian sigma, voxels). The displacement field is physically smooth, so each "
         "voxel borrows from its high-confidence neighbours (peak quality × prominence "
         "over no-shift); high-confidence voxels keep their own estimate. Fixes lone "
-        "railed/spurious peaks without blurring real structure. 0 = off. Default 1.5.",
+        "railed/spurious peaks without blurring real structure. 0 = off. Default 1.5." + PERAXIS,
     )
     search.add_argument(
         "-noshift_margin",
@@ -926,12 +999,17 @@ def create_parser() -> argparse.ArgumentParser:
         "-qwarp_minpatch",
         "-final_qwarp_minpatch",
         type=int,
-        default=7,
+        nargs="+",
+        default=[7],
         dest="qwarp_minpatch",
         help="Finest qwarp patch size (voxels), in-plane only when the patches are 2-D "
         "slicewise.\n"
         "The default suits the -final_qwarp polish; try 9 for -backend qwarp, which has the"
-        " whole field to find rather than a residual.",
+        " whole field to find rather than a residual.\n"
+        "Per axis this is the FINEST patch that axis is still solved at: it drops out of "
+        "the coupled per-patch Gauss-Newton system below its own value while the other "
+        "keeps refining. `-qwarp_minpatch 13 7` stops the smooth primary-PE field at 13 "
+        "and takes the partition down to 7." + PERAXIS,
     )
     qw.add_argument(
         "-qwarp_levels",
@@ -3531,14 +3609,15 @@ def _run_multiecho(
             f"automask={'on' if automask else 'off'}"
         )
         print(
-            f"   🪄 qwarp field: minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
+            f"   🪄 qwarp field: minpatch={_axis_txt(args.qwarp_minpatch)}, "
+            f"levels={args.qwarp_levels}, "
             f"iters={args.qwarp_iters}, cost={args.qwarp_cost}, optimizer={args.qwarp_optimizer}"
         )
     else:
         print(
             f"   TEs [{te_str}] ms, PE {_pe_label(args)} (axis {pe_axis}), backend={args.backend}, "
             f"{ref_note}, mode={mode}, scaling={scaling}, "
-            f"levels={args.levels}, iters={args.iters}, {refine_note}, "
+            f"levels={_axis_txt(args.levels)}, iters={args.iters}, {refine_note}, "
             f"automask={'on' if automask else 'off'}"
         )
     if hpf_sigma > 0:
@@ -4059,6 +4138,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     dual = two_axes and not args.is_3dacq
     dual3d = two_axes and args.is_3dacq
     pe_axes = [pe_axis, pe_axis2] if two_axes else [pe_axis]
+    if (rc := _resolve_axis_flags(args, len(pe_axes), partition_only)) is not None:
+        return rc
     args.warp_interp = _resolve_warp_interp(args.warp_interp, rotaware=rotaware)
 
     if me_mode:
@@ -4317,7 +4398,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         print(
             f"   🪄 qwarp field (E=1, ncc to {qwarp_ref_mode} of raw, refine={qwarp_refine}, "
             f"no flow pass): "
-            f"minpatch={args.qwarp_minpatch}, levels={args.qwarp_levels}, "
+            f"minpatch={_axis_txt(args.qwarp_minpatch)}, levels={args.qwarp_levels}, "
             f"iters={args.qwarp_iters}, optimizer={args.qwarp_optimizer}"
         )
 
