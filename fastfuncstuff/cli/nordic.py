@@ -372,6 +372,60 @@ Examples:
         "task is'. Default: use -task_top_frac instead.",
     )
     task_group.add_argument(
+        "-task_rescue",
+        "-task-rescue",
+        action="store_true",
+        help="Put back the removed components whose time course follows the task.\n"
+        "The single-echo sibling of -rescue: that one protects a component from removal "
+        "when it has a correlated partner in another echo (thermal noise is the only "
+        "thing independent across echoes); this one protects it when the task explains "
+        "its time course, which needs no second echo.\n"
+        "It can only ever make the denoising remove LESS. Nothing here can discard what "
+        "the threshold kept, so the trade is a bounded amount of returned noise against "
+        "a response that would otherwise be gone — turn it on to be conservative.\n"
+        "Runs an ICA of {prefix}_taskloss, lets the usual model-order estimator pick the "
+        "count (the removed field is the Marchenko-Pastur bulk, which is the regime that "
+        "estimator is built for), then scores every component's time course against the "
+        "task under familywise control — one test per component against its own "
+        "phase-randomised null, which is the right multiplicity unit.\n"
+        "The primary output then CARRIES the rescue. What was added is written beside it "
+        "as {prefix}_taskrescued, so the un-rescued series is exactly the output minus "
+        "that file and nothing is hidden. Each restored component hands back one degree "
+        "of freedom, reported so it can go into ffs_reml -adjust_dof.\n"
+        "Requires -events.",
+    )
+    task_group.add_argument(
+        "-task_rescue_comps",
+        "-task-rescue-comps",
+        type=int,
+        default=None,
+        metavar="K",
+        help="Force the ICA component count for -task_rescue instead of estimating it.\n"
+        "The estimator is conservative on the removed field, which is exactly what makes "
+        "it trustworthy for 'was anything structured taken out' — and is also its limit "
+        "here: a component NORDIC discarded was, by definition, at the thermal-noise "
+        "level inside its own patch, so pooled over the brain it can be too small a "
+        "share of the removed variance to earn a component of its own. Raising the order "
+        "gives a small leak somewhere to live. Selection stays familywise, so a higher "
+        "order costs specificity in the null distribution, not in what is restored.",
+    )
+    task_group.add_argument(
+        "-task_alpha",
+        "-task-alpha",
+        type=float,
+        default=0.05,
+        metavar="A",
+        help="Familywise error rate for -task_rescue component selection. Default 0.05.",
+    )
+    task_group.add_argument(
+        "-task_surrogates",
+        "-task-surrogates",
+        type=int,
+        default=2000,
+        metavar="N",
+        help="Phase-randomised draws per component for the -task_rescue null. Default 2000.",
+    )
+    task_group.add_argument(
         "-task_fdr_q",
         "-task-fdr-q",
         type=float,
@@ -422,6 +476,168 @@ Examples:
     add_verbose_arg(perf_group, default=1)
 
     return parser.parse_args(argv)
+
+
+def _task_rescue(outputs, args, label: str, device) -> dict | None:
+    """Decompose what was removed, and give back the components that follow the task.
+
+    The single-echo sibling of ``-rescue``. That one protects a component from removal
+    when it has a correlated partner in another echo, on the argument that thermal noise
+    is the only thing independent across echoes. This one protects a component when its
+    TIME COURSE follows the task, which needs no second echo.
+
+    It can only ever make the denoising remove **less**. Nothing here can discard
+    anything the threshold kept, so turning it on cannot make a dataset worse in the
+    direction people fear -- it trades a bounded amount of returned noise for a response
+    that would otherwise be gone. That asymmetry is why it belongs behind one flag
+    rather than in a separate tool: the same shape as ``ffs_locomoco -detask``, which can
+    only make the warp smaller.
+
+    Model order comes from the existing estimator with no special casing, and the reason
+    it can be trusted here is worth stating: the removed field IS the Marchenko-Pastur
+    bulk -- what is left once the top components are taken out -- which is exactly the
+    regime that estimator is built for. The spectrum that would mislead it is the
+    truncated one, and that is the DENOISED series, not this.
+
+    Selection is familywise across components, one test per component against its own
+    phase-randomised null. The per-voxel question does not arise: a component either
+    follows the task in time or it does not.
+    """
+    import numpy as np
+
+    from fastfuncstuff.cli.task_events import task_design_from_events
+    from fastfuncstuff.decomposition.ica import FastICA
+    from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
+    from fastfuncstuff.decomposition.tools import estimate_ica_component_count
+    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+    from fastfuncstuff.denoise.restore import restore_components
+    from fastfuncstuff.io.afni import load_nifti, save_nifti
+    from fastfuncstuff.stats.task_coupling import component_task_fit, default_polort
+
+    kept_img = load_nifti(str(outputs.magnitude_file))
+    kept = torch.as_tensor(np.ascontiguousarray(kept_img.get_fdata(dtype=np.float32)))
+    lost = torch.as_tensor(
+        np.ascontiguousarray(load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32))
+    )
+    n_t = kept.shape[3]
+    tr = args.tr if args.tr is not None else float(kept_img.header["pixdim"][4])
+    reference = (kept + lost).mean(dim=3)
+    mask = reference > 0.1 * float(reference.max())
+    # Constant voxels score a perfect fit and have poisoned two decompositions in this
+    # codebase already (the MELODIC/GGM parity hunt, the denoisatorial PC selection).
+    mask &= lost.std(dim=3) > 1e-8
+    n_in = int(mask.sum())
+    if n_in < n_t:
+        print(f"  Task rescue{label}: only {n_in} usable voxels for {n_t} frames; skipped.")
+        return None
+
+    lost_vt = lost.reshape(-1, n_t)[mask.reshape(-1)]  # (V', T)
+    voxdims = tuple(float(x) for x in kept_img.header.get_zooms()[:3])
+    resels, _, _ = estimate_smoothness_resels_acf(
+        lost.numpy(), voxdims, mask=mask.numpy(), device=torch.device("cpu")
+    )
+    n_eff = effective_sample_size_from_resels(n_in, resels, floor=n_t)
+    if args.task_rescue_comps is not None:
+        k, num_diag = int(args.task_rescue_comps), {"mode": "explicit"}
+    else:
+        k, _, num_diag = estimate_ica_component_count(
+            data_vox_t=lost_vt.to(device),
+            method="auto",
+            max_auto_components=max(2, int(round(0.66 * n_t))),
+            auto_min_components=min(5, max(2, n_t // 4)),
+            auto_var_threshold=0.90,
+            use_mp_prior=True,
+            n_eff=n_eff,
+            device=device,
+            verbose=False,
+        )
+    print(
+        f"  Task rescue{label}: {k} component(s) from the removed field "
+        f"({n_in} voxels, {resels:.2f} voxels per resel, n_eff {n_eff}, "
+        f"mode {num_diag.get('mode', '?')})"
+    )
+    if k <= 2 and args.task_rescue_comps is None:
+        # Not a warning about the estimator, which is right: the removed field is
+        # mostly thermal noise and it says so. It is a warning about what that costs
+        # HERE -- a leak has to be a big enough share of the removed variance to earn
+        # a component before this can find it.
+        print(
+            "    NOTE the estimator sees almost no structure in what was removed. That "
+            "is the expected\n"
+            "    answer when the denoising took only noise, and it is also the case in "
+            "which a small\n"
+            "    leak has no component to be found in. -task_rescue_comps forces a "
+            "higher order if you\n"
+            "    have reason to look harder; the familywise selection still decides "
+            "what comes back."
+        )
+
+    ica = FastICA(n_components=k, device=device, random_state=0)
+    ica.fit(lost_vt.T.to(device))  # (T, V') -- mixing_ comes back (T, k)
+    assert ica.mixing_ is not None and ica.components_ is not None  # fit() populates both
+    mixing = ica.mixing_.detach().cpu()
+    comps = ica.components_.detach().cpu()  # (k, V')
+
+    design, labels = task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    fit = component_task_fit(
+        mixing, design, polort=polort, n_surrogates=args.task_surrogates, alpha=args.task_alpha
+    )
+    flagged = [int(c) for c in fit["flagged"]]
+    for c in flagged:
+        print(
+            f"    comp {c:3d}: R2 {float(fit['r2'][c]):.3f}  z {float(fit['z'][c]):+.2f}  "
+            f"p {float(fit['p'][c]):.4g}"
+        )
+    if not flagged:
+        print(
+            f"    none of the {k} components follows the task above z_cut "
+            f"{float(fit['z_cut']):.2f} -- nothing put back, output unchanged."
+        )
+        return {
+            "n_components": int(k),
+            "restored_components": [],
+            "dof_returned": 0,
+            "z_cut": float(fit["z_cut"]),
+        }
+
+    # Scatter the masked maps back to the full grid, so a voxel outside the mask can
+    # never receive anything.
+    maps_kv = torch.zeros(k, int(np.prod(kept.shape[:3])), dtype=torch.float32)
+    maps_kv[:, mask.reshape(-1)] = comps.float()
+    result = restore_components(kept, lost, maps_kv, mixing.float(), flagged)
+
+    added = (result.restored - kept).numpy().astype(np.float32)
+    stem, _, ext = str(outputs.task_loss_file).partition("_taskloss")
+    added_path = f"{stem}_taskrescued{ext}"
+    save_nifti(added, output_path=added_path, reference_img=str(outputs.magnitude_file))
+    # The primary output now carries the rescue; what was added is written beside it, so
+    # the un-rescued series is exactly output minus this file and nothing is hidden.
+    save_nifti(
+        result.restored.numpy().astype(np.float32),
+        output_path=str(outputs.magnitude_file),
+        reference_img=str(outputs.magnitude_file),
+    )
+    print(
+        f"    put back {len(flagged)} component(s), "
+        f"{100 * result.var_returned_total:.2f}% of the removed field's variance, "
+        f"{result.dof_returned} degrees of freedom"
+    )
+    print(f"    what was added: {added_path}")
+    print(
+        f"    NOTE {result.dof_returned} degrees of freedom went back into the data; "
+        "carry that into ffs_reml -adjust_dof / ffs_util_updatedof."
+    )
+    return {
+        "n_components": int(k),
+        "restored_components": flagged,
+        "gammas": result.gammas.tolist(),
+        "variance_share_of_removed_total": result.var_returned_total,
+        "dof_returned": result.dof_returned,
+        "z_cut": float(fit["z_cut"]),
+        "added_file": added_path,
+        "model_order_mode": str(num_diag.get("mode", "?")),
+    }
 
 
 def _resolve_task_design(args, magnitude_file: str):
@@ -728,6 +944,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.add_mean and not args.save_residual_map:
         print("ERROR: -add-mean only affects the residual map; also pass -save-residual-map")
         sys.exit(1)
+    if args.task_rescue and args.events is None:
+        print("ERROR: -task_rescue needs -events to know what the task is")
+        sys.exit(1)
     if args.retain_dof is not None and args.retain_dof <= 0:
         print("ERROR: -retain-dof must be positive (integer components or a fraction in (0,1))")
         sys.exit(1)
@@ -905,6 +1124,15 @@ def main(argv: list[str] | None = None) -> None:
                 stem = str(outputs.task_loss_file).partition("_taskloss")[0]
                 with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
                     f.write("\n" + "\n".join(report) + "\n")
+            if args.task_rescue:
+                print_cli_section("Task rescue")
+                rescue = _task_rescue(outputs, args, label, device)
+                if rescue is not None:
+                    with open(outputs.metadata_file) as f:
+                        meta = json.load(f)
+                    meta["task_rescue"] = rescue
+                    with open(outputs.metadata_file, "w") as f:
+                        json.dump(meta, f, indent=2)
 
 
 if __name__ == "__main__":

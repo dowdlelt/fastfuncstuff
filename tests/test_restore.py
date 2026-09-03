@@ -1,7 +1,5 @@
 """Returning a wrongly-removed component to a denoised series."""
 
-import json
-
 import nibabel as nib
 import numpy as np
 import torch
@@ -116,16 +114,16 @@ def _write(path, arr, tr=None):
     nib.save(img, path)
 
 
-def test_cli_selects_the_task_component_and_restores_it(tmp_path):
-    """End to end: a task-locked component in the removed field is found and returned.
+def test_selection_and_restore_pick_the_task_component_over_a_decoy():
+    """Selection + restore together, the way ffs_nordic -task_rescue runs them.
 
     The decoy matters. A second component with matched variance but no task structure
-    has to be left where it is, or the tool is just undoing the denoising.
+    has to be left where it is, or the rescue is just undoing the denoising.
     """
-    from fastfuncstuff.cli.util_restore import main
+    from fastfuncstuff.stats.task_coupling import component_task_fit
 
     rng = np.random.RandomState(4)
-    nx, ny, nz, n_t, tr = 8, 7, 5, 96, 1.0
+    nx, ny, nz, n_t = 8, 7, 5, 96
     n_vox = nx * ny * nz
     onsets = list(range(12, n_t - 12, 24))
     box = np.zeros(n_t, dtype=np.float32)
@@ -144,43 +142,20 @@ def test_cli_selects_the_task_component_and_restores_it(tmp_path):
     removed = (np.outer(maps[0], task_tc) + np.outer(maps[1], decoy_tc)).reshape(nx, ny, nz, n_t)
     denoised = rng.normal(loc=100.0, scale=1.0, size=(nx, ny, nz, n_t)).astype(np.float32)
 
-    _write(tmp_path / "den.nii.gz", denoised, tr=tr)
-    _write(tmp_path / "rem.nii.gz", removed, tr=tr)
-    _write(tmp_path / "maps.nii.gz", maps.T.reshape(nx, ny, nz, 2))
-    np.savetxt(tmp_path / "tcs.1D", mixing, fmt="%.6f", delimiter="\t")
-    ev = tmp_path / "ev.tsv"
-    ev.write_text(
-        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t12\ttask\n" for o in onsets),
-        encoding="utf-8",
-    )
+    design = np.convolve(box, hrf / hrf.sum())[:n_t].astype(np.float32)[:, None]
+    fit = component_task_fit(torch.as_tensor(mixing), design, polort=1, n_surrogates=400, seed=0)
+    flagged = [int(c) for c in fit["flagged"]]
+    assert flagged == [0], (flagged, np.asarray(fit["r2"]))
 
-    main(
-        [
-            "-denoised",
-            str(tmp_path / "den.nii.gz"),
-            "-removed",
-            str(tmp_path / "rem.nii.gz"),
-            "-maps",
-            str(tmp_path / "maps.nii.gz"),
-            "-timecourses",
-            str(tmp_path / "tcs.1D"),
-            "-events",
-            str(ev),
-            "-prefix",
-            str(tmp_path / "OUT"),
-            "-surrogates",
-            "300",
-            "-device",
-            "cpu",
-        ]
+    res = restore_components(
+        torch.as_tensor(denoised),
+        torch.as_tensor(removed.astype(np.float32)),
+        torch.as_tensor(maps),
+        torch.as_tensor(mixing),
+        flagged,
     )
-    meta = json.loads((tmp_path / "OUT_restore.json").read_text())
-    assert meta["restored_components"] == [0], meta
-    assert meta["dof_returned"] == 1
-
-    out = nib.load(tmp_path / "OUT.nii.gz").get_fdata(dtype=np.float32)
-    delta = (out - denoised).reshape(-1, n_t)
-    # The task component came back where its map is, and the decoy's territory is
-    # untouched -- restoring both would have been the failure worth catching.
+    assert res.dof_returned == 1
+    delta = (res.restored.numpy() - denoised).reshape(-1, n_t)
+    # The task component came back where its map is; the decoy's territory is untouched.
     assert np.abs(delta[:40]).max() > 0.5
-    assert np.abs(delta[40:80]).max() < 1e-3
+    assert np.abs(delta[40:80]).max() < 1e-4
