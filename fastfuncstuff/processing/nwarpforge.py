@@ -243,6 +243,21 @@ class VoxelGridPlan:
         return self.coords[2].reshape(self.shape)
 
 
+def _resolved_device(device: torch.device) -> torch.device:
+    """Canonical form for a device EQUALITY check.
+
+    ``-device cuda`` (no index) parses to the bare ``torch.device("cuda")`` --
+    the convention every ``-device`` parser and :func:`get_device` in this
+    codebase uses. A tensor actually created on it reports back an INDEXED
+    device (``cuda:0``), and ``torch.device("cuda") != torch.device("cuda", 0)``.
+    Comparing a plan's tensors against the bare device is therefore always
+    false on CUDA; resolve both sides to the indexed form before comparing.
+    """
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 def make_voxel_grid_plan(shape: tuple[int, int, int], device: torch.device) -> VoxelGridPlan:
     """Build one compact coordinate grid for reuse across frames and transforms."""
     nz, ny, nx = shape
@@ -276,7 +291,7 @@ def make_warp_apply_plan(
 ) -> WarpApplyPlan:
     """Prepare invariant output-to-source geometry once."""
     grid = grid_plan or make_voxel_grid_plan(shape, device)
-    if grid.shape != shape or grid.coords.device != device:
+    if grid.shape != shape or grid.coords.device != _resolved_device(device):
         raise ValueError("Grid plan does not match warp shape and device")
     src_card = compute_cardinal_affine(source_affine)
     out_card = compute_cardinal_affine(output_affine)
@@ -1184,7 +1199,7 @@ def apply_composed_warp_multi(
     # AFNI uses cardinal (deobliqued) coordinate matrices for all
     # index-to-coordinate conversions, so we must do the same.
     plan = plan or make_warp_apply_plan(warp.shape, source_affine, output_affine, device)
-    if plan.grid.shape != warp.shape or plan.grid.coords.device != device:
+    if plan.grid.shape != warp.shape or plan.grid.coords.device != _resolved_device(device):
         raise ValueError("Warp application plan does not match warp shape and device")
     coords = plan.grid.coords.clone()
     coords[0].add_(warp.xd.reshape(-1))

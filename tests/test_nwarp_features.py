@@ -916,3 +916,22 @@ def test_sample_field_edge_extends():
     for mode in ("cubic", "quintic", "wsinc5"):
         out = _sample_field(field, x, y, z, mode)
         assert torch.allclose(out, torch.full((3,), 3.0), atol=1e-4), mode
+
+
+@pytest.mark.gpu
+def test_grid_plan_matches_a_bare_cuda_device():
+    """``-device cuda`` (no index) parses to the bare ``torch.device("cuda")`` --
+    same as ``get_device()`` everywhere else in this codebase -- but a tensor
+    actually created on it reports back an INDEXED device (``cuda:0``). The
+    grid-plan sanity checks compare a plan's tensors against the device the
+    caller passed in, so a naive equality check is always false on CUDA and
+    every chain with a nonlinear warp fails. See _resolved_device.
+    """
+    from fastfuncstuff.processing.nwarpforge import make_warp_apply_plan
+
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA device")
+    device = torch.device("cuda")
+    aff = np.eye(4)
+    plan = make_warp_apply_plan((6, 7, 8), aff, aff, device)
+    assert plan.grid.coords.device.type == "cuda"
