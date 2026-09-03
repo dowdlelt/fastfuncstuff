@@ -76,6 +76,10 @@ this docstring claimed it "does not need to be right, only generous, since the
 degrees-of-freedom correction handles whatever it removes". Both halves of that are wrong,
 and in opposite directions:
 
+**Everything below was measured on UNSMOOTHED 3 mm data, and the effect is much smaller
+once the data is smoothed** -- see the blur contrast at the end. Do not carry these numbers
+over to a conventionally smoothed pipeline.
+
 *It sets the model order.* At fixed effective sample size on ds005165, sweeping the rank
 2/5/10/20/30/50/80/120 moves the selected order 62/64/69/73/76/78/81/92 (rest run 1) and
 62/63/68/72/76/77/86/93 (localizer run 1). A generous rank absorbs real signal in high-SNR
@@ -99,6 +103,14 @@ many components (10.1 vs 18.0 at ``|r| >= 0.25``, top-20 .260 vs .322), which is
 the failure this module's header predicts -- dividing by total SD penalises the voxels with
 the most signal. A rank-free high-frequency spectral estimator sits in between (15.1,
 .308) and is more knob-stable than this one but still not knob-free.
+
+*Smoothing washes most of this out.* With ``-do_blur 5`` on the same runs the reproducibility
+sweep gives 23.9 / 25.0 / 26.5 / 26.9 at rank 2 / 30 / 80 / 120 -- a 13% span where the
+unsmoothed data gave 95% -- and the selected order moves 30->51 instead of 62->92. Blurring
+raises per-voxel SNR, so the noise estimate stops being what limits the decomposition. The
+same happens to the choice of estimator: total-stdev is 44% worse than the low-rank one
+unsmoothed (10.1 vs 18.0) but only 11% worse at 5 mm (22.2 vs 25.0), with HF-spectral tied
+or better. **These are low-smoothness phenomena.** On smoothed data leave the default alone.
 
 See ``../fmri_wiki/concepts/ICA noise normalisation.md``.
 """

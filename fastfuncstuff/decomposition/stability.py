@@ -32,11 +32,16 @@ same thing and fail differently:
   ``Iq=0.7`` and nine exceed 0.97.
 
   **On real data it behaves much better than that synthetic result suggests**, and the
-  earlier blanket "does not work" was too strong. Measured on ds005165 rest (5 runs,
-  T=212, 30 restarts): it returns 58-67 where the spectral default returns 76-84 and
-  MELODIC returns 59-69, with a real Iq spread (mean .854, range [.359, .995]). Its count
-  is independently supported -- cross-run matching shows the spectral extras reproduce no
-  better, so nothing real is lost by the lower number. Cost is ~17-24 s per run.
+  earlier blanket "does not work" was too strong. Measured on UNSMOOTHED ds005165 rest
+  (5 runs, T=212, 30 restarts): it returns 58-67 where the spectral default returns 76-84
+  and MELODIC returns 59-69, with a real Iq spread (mean .854, range [.359, .995]). Its
+  count is independently supported -- cross-run matching shows the spectral extras
+  reproduce no better, so nothing real is lost by the lower number. Cost ~17-24 s per run.
+
+  Those figures are specific to unsmoothed data. At ``-do_blur 5`` the spectral estimate
+  itself falls to 40 and stability to 35, the Iq floor lifts from .36 to .50 (less junk to
+  reject), and the cost drops to ~5 s because there are fewer components to cluster. The
+  gap between the two estimators narrows with smoothing.
 
   What it cannot do is discriminate *between* runs: across those five runs its counts
   correlate with MELODIC's at r=-0.26 (leave-one-out -0.74..+0.17 at n=5, i.e. no

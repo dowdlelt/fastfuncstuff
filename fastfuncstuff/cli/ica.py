@@ -3569,11 +3569,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Rank of the signal subspace removed when estimating each voxel's NOISE "
         "standard deviation for variance normalisation (default: 30).\n"
-        "This is a real quality/count trade-off, not a nuisance: raising it improves "
-        "cross-run component reproducibility (measured on ds005165 rest, k fixed at 62, "
-        "components reproducing at |r|>=0.25 across 10 run-pairs: 11.1 at rank 2, 18.0 at "
-        "30, 21.2 at 80, 21.6 at 120, against an unmatched-pair null that barely moves) "
-        "and also raises the automatic model order (62 at rank 2 to 92 at rank 120).",
+        "A real quality/count trade-off, not a nuisance -- but HOW MUCH IT MATTERS DEPENDS "
+        "ON YOUR SMOOTHING.  On UNSMOOTHED 3 mm data (ds005165 rest, 5 runs, k fixed at "
+        "62) raising it markedly improves cross-run component reproducibility: components "
+        "reproducing at |r|>=0.25 go 11.1 / 18.0 / 21.2 / 21.6 at rank 2 / 30 / 80 / 120, "
+        "against an unmatched-pair null that barely moves.  With -do_blur 5 the same sweep "
+        "gives 23.9 / 25.0 / 26.5 / 26.9 -- a 13%% span instead of 95%%, because blurring "
+        "raises per-voxel SNR and the noise estimate stops being the limiting factor.\n"
+        "It also raises the automatic model order, again more without blur (62->92 across "
+        "the sweep) than with (30->51).  Leave it alone on smoothed data.",
     )
     proc.add_argument(
         "-drop_constant",
@@ -3649,9 +3653,11 @@ def build_parser() -> argparse.ArgumentParser:
         "eigenspectrum: run -stability_runs restarts at the Marchenko-Pastur ceiling and "
         "keep the clusters reaching -icasso_min_stability.\n"
         "A reasonable second opinion on the overall level, and cheap (~20s/run at 30 "
-        "restarts).  On ds005165 rest it returns 58-67 where the spectral default returns "
-        "76-84 and MELODIC returns 59-69, and cross-run matching shows the spectral "
-        "extras reproduce no better -- so the lower count is not losing anything.\n"
+        "restarts on unsmoothed data, less on smoothed).  On UNSMOOTHED ds005165 rest it "
+        "returns 58-67 where the spectral default returns 76-84, and cross-run matching "
+        "shows the spectral extras reproduce no better -- so the lower count is not losing "
+        "anything.  With -do_blur 5 both fall together (35 of a spectral 40) and the Iq "
+        "floor lifts from .36 to .50, i.e. there is less junk to reject.\n"
         "Two limits.  It varies the initialisation but never the data, so on small "
         "synthetic problems it overcounts badly (11 clusters on rank-6 data).  And it "
         "does not discriminate between runs: its per-run counts show no detectable "
