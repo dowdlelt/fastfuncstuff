@@ -333,6 +333,8 @@ def _run_single_ica(
             voxel_sizes,
             mask=mask3d,
             device=device,
+            per_axis=bool(getattr(args, "smoothness_per_axis", False)),
+            corder=int(getattr(args, "smoothness_corder", -1)),
             verbose=args.verb >= 1,
         )
         _vprint(
@@ -1525,6 +1527,8 @@ def _run_concat_ica(
                 voxel_sizes,
                 mask=mask3d,
                 device=device,
+                per_axis=bool(getattr(args, "smoothness_per_axis", False)),
+                corder=int(getattr(args, "smoothness_corder", -1)),
                 verbose=args.verb >= 1,
             )
 
@@ -2389,7 +2393,13 @@ def _temporal_ica_preprocess_runs(
             if mask3d is not None and mask3d.shape != shape3d:
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
             resels, fwhm_geo, _ = _estimate_smoothness_resels_acf(
-                data, voxel_sizes, mask=mask3d, device=device, verbose=args.verb >= 1
+                data,
+                voxel_sizes,
+                mask=mask3d,
+                device=device,
+                per_axis=bool(getattr(args, "smoothness_per_axis", False)),
+                corder=int(getattr(args, "smoothness_corder", -1)),
+                verbose=args.verb >= 1,
             )
 
         if mask3d is not None:
@@ -2903,6 +2913,8 @@ def _run_tensorial_ica(
                 voxel_sizes,
                 mask=mask3d,
                 device=device,
+                per_axis=bool(getattr(args, "smoothness_per_axis", False)),
+                corder=int(getattr(args, "smoothness_corder", -1)),
                 verbose=args.verb >= 1,
             )
 
@@ -3480,6 +3492,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override estimated spatial smoothness (FWHM in mm) for Minka DOF correction.  "
         "If not set, smoothness is estimated from the data.  Affects dimensionality estimation "
         "via the resel-based effective-sample-size N_eff = n_vox / (FWHM_x·FWHM_y·FWHM_z).",
+    )
+    proc.add_argument(
+        "-smoothness_per_axis",
+        action="store_true",
+        help="Estimate the ACF smoothness separately along each axis instead of using the "
+        "radial (isotropic) fit that 3dFWHMx reports.  Worth it on anisotropic voxels "
+        "(thick slices), where one FWHM for three axes is wrong for all of them; on "
+        "near-isotropic data the two agree closely and the radial fit, having all "
+        "directions to constrain it, is the better-determined number.",
+    )
+    proc.add_argument(
+        "-smoothness_corder",
+        type=int,
+        default=-1,
+        help="Detrend order for the smoothness estimate (3dFWHMx -detrend).  -1 uses AFNI's "
+        "own default of n_time/30; 0 disables detrending.  Smoothness is measured before "
+        "the pipeline's own detrend, and low-frequency drift is spatially structured, so "
+        "leaving it in biases the ACF low (3.22 vs 3.57 mm measured on ds005165).",
     )
     proc.add_argument(
         "-polort",

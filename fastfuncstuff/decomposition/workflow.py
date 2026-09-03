@@ -509,6 +509,8 @@ def estimate_smoothness_resels_acf(
     voxdims: tuple[float, float, float],
     mask: np.ndarray | None = None,
     device: torch.device | None = None,
+    per_axis: bool = False,
+    corder: int | None = -1,
     verbose: bool = False,
 ) -> tuple[float, float, dict[str, object]]:
     """Resel size from the AFNI ACF smoothness estimator (:mod:`stats.fwhmx`).
@@ -523,12 +525,18 @@ def estimate_smoothness_resels_acf(
     moved to the mixed model ``a e^{-r^2/2b^2} + (1-a) e^{-r/c}`` after Eklund et al.
     (2016) for exactly this reason, and it is the estimator ``3dClustSim -acf`` consumes.
 
-    Per-axis handling: the ACF model is fitted radially and so is isotropic. Where the
-    axis-aligned samples resolve a half-max crossing, the measured per-axis FWHMs are
-    used directly. Where they do not (FWHM below the voxel width along that axis, common
-    at 3 mm), the classic per-axis FWHMs are rescaled to the ACF's overall scale --
-    keeping the anisotropy the first-difference estimator does measure well while
-    adopting the tail-aware magnitude the ACF measures well.
+    The default read is the **radial** ACF FWHM applied to all three axes, which is what
+    3dFWHMx itself reports and what the model is actually fitted to. ``per_axis=True``
+    instead uses the FWHM measured separately along each axis, falling back for any axis
+    that cannot resolve a half-max crossing to the classic per-axis FWHM rescaled to the
+    ACF's magnitude. Per-axis is the better read on anisotropic acquisitions (thick
+    slices), where one number for three axes is wrong for all of them; on near-isotropic
+    data the two agree closely and the radial fit is better constrained.
+
+    ``corder`` is passed through to ``3dFWHMx -detrend``. It defaults to AFNI's own
+    ``n_time // 30`` because this is called on *raw* timeseries, before the ICA
+    pipeline's own detrend: low-frequency drift is spatially structured, so leaving it in
+    biases the ACF low (measured 3.22 mm undetrended vs 3.57 mm detrended on ds005165).
     """
     from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
 
@@ -540,31 +548,37 @@ def estimate_smoothness_resels_acf(
     mask = np.asarray(mask, dtype=bool)
 
     resid = torch.as_tensor(data_4d[mask], device=device, dtype=torch.float32)
-    resid = resid - resid.mean(dim=1, keepdim=True)
     res = estimate_fwhmx_run(
         resid,
         torch.as_tensor(mask, device=device),
         shape3d,  # type: ignore[arg-type]
         voxdims,
         device=device,
-        unif=True,  # per-voxel MAD scaling; fMRI variance is strongly non-uniform
+        corder=corder,  # detrend + unif, as 3dFWHMx does for raw timeseries
+        # corder implies unif; ask for it explicitly so corder=None still gets the
+        # per-voxel MAD scaling rather than an un-normalised (meaningless) ACF.
+        unif=True,
         progress=False,
     )
     del resid
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Fill unresolved axes from the classic anisotropy, scaled to the ACF magnitude.
-    scale = res.fwhm / res.classic_combined if res.classic_combined > 0 else 1.0
-    fwhm_mm: list[float] = []
-    n_from_acf = 0
-    for ax in range(3):
-        measured = res.acf_fwhm_axes[ax]
-        if measured > 0:
-            fwhm_mm.append(measured)
-            n_from_acf += 1
-        else:
-            fwhm_mm.append(res.classic_fwhm[ax] * scale)
+    if per_axis:
+        # Fill unresolved axes from the classic anisotropy, scaled to the ACF magnitude.
+        scale = res.fwhm / res.classic_combined if res.classic_combined > 0 else 1.0
+        fwhm_mm = []
+        n_from_acf = 0
+        for ax in range(3):
+            measured = res.acf_fwhm_axes[ax]
+            if measured > 0:
+                fwhm_mm.append(measured)
+                n_from_acf += 1
+            else:
+                fwhm_mm.append(res.classic_fwhm[ax] * scale)
+    else:
+        fwhm_mm = [res.fwhm] * 3
+        n_from_acf = 0
 
     fwhm_vox = [f / abs(v) for f, v in zip(fwhm_mm, voxdims, strict=True)]
     resels = 1.0
@@ -582,6 +596,8 @@ def estimate_smoothness_resels_acf(
         "fwhm_mm": fwhm_mm,
         "fwhm_voxels": fwhm_vox,
         "axes_from_acf": n_from_acf,
+        "per_axis": per_axis,
+        "corder": corder,
         "resels": resels,
     }
     if verbose:
@@ -595,9 +611,10 @@ def estimate_smoothness_resels_acf(
             f"Classic per-axis FWHM (mm): "
             f"{res.classic_fwhm[0]:.3f}, {res.classic_fwhm[1]:.3f}, {res.classic_fwhm[2]:.3f}",
         )
+        src = f"{n_from_acf}/3 measured per axis" if per_axis else "radial ACF, isotropic"
         verbose_print(
             True,
             f"FWHM per axis: X={fwhm_vox[0]:.3f}, Y={fwhm_vox[1]:.3f}, Z={fwhm_vox[2]:.3f} "
-            f"voxels ({n_from_acf}/3 measured directly from the ACF)",
+            f"voxels ({src})",
         )
     return resels, fwhm_geo, diagnostics

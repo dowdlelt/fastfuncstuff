@@ -143,6 +143,25 @@ def _forman_fwhm(var: Tensor, dvar: Tensor, vox_mm: float) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
+def _trigref(corder: int, nvals: int, device) -> Tensor:
+    """AFNI's ``THD_build_trigref`` baseline: (nvals, 2*corder+3).
+
+    Columns are ``1``, ``(t-tmid)*fac``, ``((t-tmid)*fac)^2`` and then ``corder``
+    sin/cos pairs at ``2*pi*k/nvals`` (``thd_detrend.c:559``) -- the same basis
+    3dDespike uses, deliberately not a polynomial one.
+    """
+    t = torch.arange(nvals, dtype=torch.float64, device=device)
+    tm = 0.5 * (nvals - 1.0)
+    fac = 2.0 / nvals
+    cols = [torch.ones(nvals, dtype=torch.float64, device=device), (t - tm) * fac]
+    cols.append(((t - tm) * fac) ** 2)
+    for k in range(1, corder + 1):
+        fq = (2.0 * np.pi * k) / nvals
+        cols.append(torch.sin(fq * t))
+        cols.append(torch.cos(fq * t))
+    return torch.stack(cols, dim=1)
+
+
 def _acf_cluster(radius_mm: float, voxdims: tuple[float, float, float]) -> tuple[Tensor, Tensor]:
     """Sphere offsets + per-offset radii for the ACF, subsampled like AFNI.
 
@@ -202,6 +221,7 @@ def estimate_fwhmx_run(
     radius_mm: float | None = None,
     demed: bool = False,
     unif: bool = False,
+    corder: int | None = None,
     device: torch.device | None = None,
     progress: bool = True,
     progress_desc: str = "FWHMx",
@@ -226,6 +246,12 @@ def estimate_fwhmx_run(
             markedly changes the ACF on data with spatially non-uniform variance
             (high-res, anisotropic), and removes a spurious non-monotonic bump
             at larger lags. Applied to both the classic and ACF passes.
+        corder: ``3dFWHMx -detrend``. None (default) detrends nothing, which is
+            right for input that is already residuals. ``-1`` picks AFNI's own
+            default order ``n_time // 30``; a positive value sets it directly.
+            Detrending implies ``unif`` (AFNI: "-detrend disables -demed, and
+            includes -unif"). Pass this for *raw* timeseries: low-frequency drift
+            is spatially structured, so leaving it in biases the spatial ACF.
         progress: show a tqdm bar over timepoint chunks and the offset loop.
 
     Returns:
@@ -234,6 +260,19 @@ def estimate_fwhmx_run(
     """
     if device is None:
         device = resid_2d.device if resid_2d.is_cuda else torch.device("cpu")
+
+    # AFNI -detrend: project out the trigonometric baseline before anything else
+    # (3dFWHMx.c:546 -> THD_build_trigref), and force -unif as AFNI does.
+    if corder is not None:
+        n_v = int(resid_2d.shape[1])
+        order = n_v // 30 if corder < 0 else int(corder)
+        if order > 0 and 2 * order + 3 < n_v:
+            ref = _trigref(order, n_v, resid_2d.device)
+            # Least-squares projection: r <- r - (r @ ref) @ pinv(ref'ref) @ ref'.
+            q, _ = torch.linalg.qr(ref.to(torch.float32))
+            resid_2d = resid_2d - (resid_2d @ q) @ q.T
+            unif = True
+            demed = True
 
     # AFNI de-median / uniformize (THD_estimate_ACF's demed/unif). Scale is
     # irrelevant to the ACF, but dividing each voxel by its temporal MAD makes
