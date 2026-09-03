@@ -434,6 +434,7 @@ def _run_single_ica(
             _trace_vn_dir = _Pvn(_trace_single_dir) / run_tag
             _trace_vn_dir.mkdir(parents=True, exist_ok=True)
         data_vox_t, norm_msg = ica_workflow.apply_voxel_variance_normalization(
+            signal_rank=getattr(args, "varnorm_rank", None),
             data_vox_t=data_vox_t,
             num_spec=num_spec,
             n_t=n_t,
@@ -3561,6 +3562,18 @@ def build_parser() -> argparse.ArgumentParser:
         dest="voxel_norm",
         action="store_false",
         help="Disable MELODIC-style voxel variance normalization before PCA/ICA",
+    )
+    proc.add_argument(
+        "-varnorm_rank",
+        type=int,
+        default=None,
+        help="Rank of the signal subspace removed when estimating each voxel's NOISE "
+        "standard deviation for variance normalisation (default: 30).\n"
+        "This is a real quality/count trade-off, not a nuisance: raising it improves "
+        "cross-run component reproducibility (measured on ds005165 rest, k fixed at 62, "
+        "components reproducing at |r|>=0.25 across 10 run-pairs: 11.1 at rank 2, 18.0 at "
+        "30, 21.2 at 80, 21.6 at 120, against an unmatched-pair null that barely moves) "
+        "and also raises the automatic model order (62 at rank 2 to 92 at rank 120).",
     )
     proc.add_argument(
         "-drop_constant",

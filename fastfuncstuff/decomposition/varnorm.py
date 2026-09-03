@@ -71,27 +71,36 @@ __all__ = [
 DEFAULT_SIGNAL_RANK = 30
 """Rank of the signal subspace removed before measuring the noise.
 
-Intended as a *nuisance* rank: large enough to absorb the dominant structured variance in
-a typical run (drift residual, motion, the big networks), small enough to leave a residual
-with plenty of degrees of freedom to estimate a standard deviation from.
+**This is a real quality/count trade-off, not a nuisance parameter.** An earlier version of
+this docstring claimed it "does not need to be right, only generous, since the
+degrees-of-freedom correction handles whatever it removes". Both halves of that are wrong,
+and in opposite directions:
 
-**KNOWN PROBLEM -- this value directly sets the automatic model order, which is not what a
-nuisance rank is supposed to do.** Measured on ds005165 at fixed effective sample size,
-sweeping this rank 2/5/10/20/30/50/80/120 moves the selected order
-62/64/69/73/76/78/81/92 (rest run 1) and 62/63/68/72/76/77/86/93 (localizer run 1). The
-default of 30 accounts for essentially the whole gap against MELODIC: at fixed n_eff, rest
-run 1 selects 76 with this varnorm and 59 with a plain total-stdev divide (MELODIC: 59).
+*It sets the model order.* At fixed effective sample size on ds005165, sweeping the rank
+2/5/10/20/30/50/80/120 moves the selected order 62/64/69/73/76/78/81/92 (rest run 1) and
+62/63/68/72/76/77/86/93 (localizer run 1). A generous rank absorbs real signal in high-SNR
+voxels, so their estimated noise comes out too small, dividing by it over-amplifies exactly
+the voxels carrying signal, and more eigenvalues clear the floor. The DoF correction
+compensates for the dimensions removed, not for the signal absorbed. The relation is
+monotone increasing, so iterating ``rank := selected order`` does not converge.
 
-The mechanism is circular. A generous rank absorbs genuine signal in high-SNR voxels, so
-their estimated "noise" std comes out too small, so dividing by it over-amplifies exactly
-the voxels that carry signal, and more eigenvalues clear the noise floor. The
-degrees-of-freedom correction compensates for the dimensions removed but not for the
-signal absorbed. Note the relation is monotone increasing, so iterating rank := selected
-order does NOT converge.
+*But a generous rank is also better.* Judged by cross-run component reproducibility --
+5 rest runs, 10 pairs, k held fixed at 62 so the comparison is quality not count --
+components reproducing at ``|r| >= 0.25`` go 11.1 / 14.6 / 18.0 / 21.2 / 21.6 at rank
+2 / 10 / 30 / 80 / 120, and the mean of the top-20 matches goes .268 / .295 / .322 / .352 /
+.357. This is not correlation inflation: the unmatched-pair null barely moves (.0175 ->
+.0209) while the matched-minus-null excess grows .251 -> .336. The ratio peaks near rank 80.
 
-Do not "fix" this by tuning the constant to match a reference -- that is a fudge factor
-for a structural problem. The intended fix is a noise estimator that needs no rank at all;
-see ``../fmri_wiki/concepts/ICA noise normalisation.md``.
+So the default of 30 is *conservative* by the reproducibility criterion, not too generous.
+
+Do not replace this with a plain total-stdev divide to make the count match a reference.
+That was measured too, and it is much worse: at the same k it reproduces roughly half as
+many components (10.1 vs 18.0 at ``|r| >= 0.25``, top-20 .260 vs .322), which is exactly
+the failure this module's header predicts -- dividing by total SD penalises the voxels with
+the most signal. A rank-free high-frequency spectral estimator sits in between (15.1,
+.308) and is more knob-stable than this one but still not knob-free.
+
+See ``../fmri_wiki/concepts/ICA noise normalisation.md``.
 """
 
 

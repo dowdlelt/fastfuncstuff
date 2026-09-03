@@ -72,15 +72,19 @@ def apply_voxel_variance_normalization(
     n_t: int,
     n_vox_masked: int,
     trace_dir: Path | None = None,
+    signal_rank: int | None = None,
 ) -> tuple[torch.Tensor, str]:
     """Apply voxel variance normalisation; residual-noise path for automatic model order.
 
     Automatic model order reads the eigenspectrum, so the scale each voxel is put on
     directly determines the answer -- hence the residual-noise estimate there rather than
     the cheaper total-stdev divide. See :mod:`fastfuncstuff.decomposition.varnorm`.
+
+    ``signal_rank`` overrides the noise-estimate rank; None uses
+    :data:`~fastfuncstuff.decomposition.varnorm.DEFAULT_SIGNAL_RANK`.
     """
     if isinstance(num_spec, str) and num_spec in {"auto", "laplace"}:
-        data_vox_t, n_const = variance_normalize(data_vox_t)
+        data_vox_t, n_const = variance_normalize(data_vox_t, signal_rank)
         norm_msg = (
             f"Voxel-norm: residual-noise varnorm over {n_vox_masked:,} voxels "
             f"({n_const} constant voxels zeroed)"
