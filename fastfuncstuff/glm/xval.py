@@ -15,7 +15,7 @@ from math import comb
 import numpy as np
 import torch
 
-from fastfuncstuff._compile import safe_compile
+from fastfuncstuff._compile import compile_after_eager_time
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
 from fastfuncstuff.utils import factor_device
 
@@ -606,10 +606,12 @@ def _cod_from_ss_res_kernel(y_true: torch.Tensor, ss_res: torch.Tensor) -> torch
     return _cod_ratio(ss_res, ss_tot)
 
 
-# Compile through the central policy: PCH disabled (no stale-cache crashes) plus a
-# permanent eager fallback if compilation ever fails for another reason. See _compile.py.
-_cod_kernel_compiled = safe_compile(_cod_kernel, dynamic=True, fullgraph=True)
-_cod_from_ss_res_compiled = safe_compile(_cod_from_ss_res_kernel, dynamic=True, fullgraph=True)
+# Compilation is amortized across repeated GLMs in this process. One-shot fits stay
+# eager rather than paying Dynamo's multi-second fresh-process startup cost.
+_cod_kernel_compiled = compile_after_eager_time(_cod_kernel, dynamic=True, fullgraph=True)
+_cod_from_ss_res_compiled = compile_after_eager_time(
+    _cod_from_ss_res_kernel, dynamic=True, fullgraph=True
+)
 
 
 def cod_from_ss_residual(y_true: torch.Tensor, ss_residual: torch.Tensor) -> torch.Tensor:

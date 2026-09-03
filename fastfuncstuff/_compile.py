@@ -30,6 +30,7 @@ Use ``safe_compile`` everywhere instead of calling ``torch.compile`` directly.
 from __future__ import annotations
 
 import functools
+import time
 import warnings
 from collections.abc import Callable
 from typing import Any
@@ -114,4 +115,85 @@ def safe_compile(fn: Callable | None = None, **compile_kwargs: Any) -> Callable:
             return fn(*args, **kwargs)
 
     wrapper._ffs_eager = fn  # ty: ignore[unresolved-attribute]  # escape hatch for tests
+    return wrapper
+
+
+def compile_after_eager_time(
+    fn: Callable | None = None,
+    *,
+    min_eager_seconds: float = 3.0,
+    **compile_kwargs: Any,
+) -> Callable:
+    """Compile only after this process has spent enough time in eager execution.
+
+    This is for kernels shared by both one-shot and highly repetitive workloads.
+    A fresh process avoids Dynamo's multi-second startup cost when eager execution
+    is already cheaper, while repeated calls eventually compile once and reuse the
+    compiled function. CUDA timing uses asynchronous events and never synchronizes.
+    """
+    if fn is None:
+        return functools.partial(
+            compile_after_eager_time,
+            min_eager_seconds=min_eager_seconds,
+            **compile_kwargs,
+        )
+
+    state: dict[str, Any] = {
+        "eager_seconds": 0.0,
+        "cuda_unmeasured_calls": 0,
+        "pending_cuda": None,
+        "compiled": None,
+    }
+
+    def _collect_cuda_time() -> None:
+        pending = state["pending_cuda"]
+        if pending is None:
+            return
+        start, end, represented_calls = pending
+        if end.query():
+            state["eager_seconds"] += start.elapsed_time(end) * represented_calls / 1000.0
+            state["pending_cuda"] = None
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        tensor = next((arg for arg in args if isinstance(arg, torch.Tensor)), None)
+        device_type = tensor.device.type if tensor is not None else "cpu"
+
+        if device_type == "cuda":
+            _collect_cuda_time()
+        if state["eager_seconds"] >= min_eager_seconds:
+            compiled = state["compiled"]
+            if compiled is None:
+                compiled = safe_compile(fn, **compile_kwargs)
+                state["compiled"] = compiled
+            return compiled(*args, **kwargs)
+
+        if device_type == "cuda":
+            state["cuda_unmeasured_calls"] += 1
+            if state["pending_cuda"] is not None or state["cuda_unmeasured_calls"] < 64:
+                return fn(*args, **kwargs)
+
+            # Sparse sampling avoids doubling the launch bookkeeping of the tiny
+            # reductions this gate protects. One timed call represents all eager
+            # calls accumulated since the previous sample.
+            represented_calls = state["cuda_unmeasured_calls"]
+            state["cuda_unmeasured_calls"] = 0
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            result = fn(*args, **kwargs)
+            end_event.record()
+            state["pending_cuda"] = (start_event, end_event, represented_calls)
+            return result
+
+        if device_type == "mps":
+            return fn(*args, **kwargs)
+
+        start = time.perf_counter()
+        result = fn(*args, **kwargs)
+        state["eager_seconds"] += time.perf_counter() - start
+        return result
+
+    wrapper._ffs_eager = fn  # ty: ignore[unresolved-attribute]
+    wrapper._ffs_compile_state = state  # ty: ignore[unresolved-attribute]
     return wrapper
