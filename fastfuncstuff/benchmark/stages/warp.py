@@ -190,33 +190,46 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run ffs_nwarp for all runs."""
+    """Run ffs_nwarp for all runs, in one batched process.
+
+    Ten runs invoked separately pay the interpreter/torch/CUDA startup and the
+    resampler's torch.compile warmup ten times over; -batch pays both once and
+    leaves the per-run warp untouched. -master/-dxyz/-interp are the same for
+    every run, so they stay on the outer command and each manifest line carries
+    only its own warp chain, source and prefix.
+    """
     subid = f"sub-{ctx.subject}"
     master = ctx.processing_dir / f"autobox_anatQQ.{subid}.nii"
-    total = 0.0
-    n_total = n_ran = 0
 
+    jobs = []
+    n_total = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             n_total += 1
             out = _ffs_mni(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
                 continue
-            nwarp = _nwarp_chain(ctx, task, run)
-            elapsed, _ = run_timed(
-                f"ffs_nwarp "
-                f"-master {master} -dxyz 3.0 -interp wsinc5 -no_autopad "
-                f'-nwarp "{nwarp}" '
+            jobs.append(
+                f'-nwarp "{_nwarp_chain(ctx, task, run)}" '
                 f"-source {_input_path(ctx, task, run)} "
                 f"-prefix {out}"
-                f"{ctx.ffs_device_flag()}",
-                label=f"ffs_nwarp {task} run-{run}",
-                cwd=ctx.processing_dir,
             )
-            total += elapsed
-            n_ran += 1
-    ctx.note_items("ffs", n_ran, n_total)
-    return total
+    ctx.note_items("ffs", len(jobs), n_total)
+
+    if not jobs:
+        return 0.0
+
+    manifest = ctx.processing_dir / "ffs_warp_batch.txt"
+    manifest.write_text("\n".join(jobs) + "\n")
+
+    elapsed, _ = run_timed(
+        f"ffs_nwarp -master {master} -dxyz 3.0 -interp wsinc5 -no_autopad "
+        f"-batch {manifest}"
+        f"{ctx.ffs_device_flag()}",
+        label=f"ffs_nwarp batch ({len(jobs)} runs)",
+        cwd=ctx.processing_dir,
+    )
+    return elapsed
 
 
 def validate(ctx: BenchmarkContext) -> dict:

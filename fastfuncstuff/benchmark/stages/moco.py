@@ -137,39 +137,56 @@ def run_ref(ctx: BenchmarkContext) -> float:
 
 
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """Run ffs_moco for all task/run combos."""
+    """Run ffs_moco for all task/run combos, in one batched process.
+
+    Ten runs invoked separately pay the interpreter/torch/CUDA startup ten times
+    over -- and ffs_moco's torch.compile warmup with it, which is per-process and
+    dwarfs the correction of a single run. -batch pays both once; the per-run
+    correction is unchanged. Settings shared by every run stay on the outer
+    command (the batch runner uses them as each line's defaults), so a manifest
+    line carries only what actually varies.
+    """
     from pathlib import Path
 
-    total = 0.0
-    n_total = n_ran = 0
+    jobs = []
+    pairs = []
+    n_total = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
             n_total += 1
             out = _ffs_moco_path(ctx, task, run)
+            pairs.append((task, run, out))
             if Path(out).exists() and not ctx.force_ffs:
                 continue
-            n_ran += 1
-            elapsed, _ = run_timed(
-                f"ffs_moco "
+            jobs.append(
                 f"-input {_input_path(ctx, task, run)} "
-                f"-interp heptic -final heptic "
-                f"-weight_automask -base 0 "
                 f"-1Dfile {_ffs_motion_path(ctx, task, run)} "
                 f"-1Dmatrix_save {out.replace('.nii', '_mat.aff12.1D')} "
-                f"-prefix {out} -save_mean"
-                f"{ctx.ffs_device_flag()}",
-                label=f"ffs_moco {task} run-{run}",
-                cwd=ctx.processing_dir,
+                f"-prefix {out}"
             )
-            total += elapsed
+    ctx.note_items("ffs", len(jobs), n_total)
 
-            # Rename mean output
-            mean_src = ctx.processing_dir / f"mean_{Path(out).name}"
-            mean_dst = Path(_ffs_mean_path(ctx, task, run))
-            if mean_src.exists() and not mean_dst.exists():
-                mean_src.rename(mean_dst)
-    ctx.note_items("ffs", n_ran, n_total)
-    return total
+    elapsed = 0.0
+    if jobs:
+        manifest = ctx.processing_dir / "ffs_moco_batch.txt"
+        manifest.write_text("\n".join(jobs) + "\n")
+        elapsed, _ = run_timed(
+            f"ffs_moco -interp heptic -final heptic "
+            f"-weight_automask -base 0 -save_mean "
+            f"-batch {manifest}"
+            f"{ctx.ffs_device_flag()}",
+            label=f"ffs_moco batch ({len(jobs)} runs)",
+            cwd=ctx.processing_dir,
+        )
+
+    # ffs_moco writes the mean beside its -prefix as mean_<name>; the validator
+    # compares it under the stage's own name.
+    for task, run, out in pairs:
+        mean_src = ctx.processing_dir / f"mean_{Path(out).name}"
+        mean_dst = Path(_ffs_mean_path(ctx, task, run))
+        if mean_src.exists() and not mean_dst.exists():
+            mean_src.rename(mean_dst)
+    return elapsed
 
 
 def validate(ctx: BenchmarkContext) -> dict:

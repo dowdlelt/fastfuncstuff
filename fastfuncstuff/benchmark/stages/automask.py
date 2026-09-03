@@ -53,11 +53,14 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dAutomask for all mean images."""
     total = 0.0
+    n_total = n_ran = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _afni_mask(ctx, task, run)
             if out.exists() and not ctx.force_ref:
                 continue
+            n_ran += 1
             src = _mean_path(ctx, task, run)
             elapsed, _ = run_timed(
                 f"3dAutomask -overwrite -prefix {out} {src}",
@@ -65,6 +68,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
                 cwd=ctx.processing_dir,
             )
             total += elapsed
+    ctx.note_items("ref", n_ran, n_total)
     return total
 
 
@@ -76,12 +80,15 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     the startup ten times over and report it as masking cost. -batch pays it once.
     """
     jobs = []
+    n_total = 0
     for task, runs in ctx.all_task_run_pairs():
         for run in runs:
+            n_total += 1
             out = _ffs_mask(ctx, task, run)
             if out.exists() and not ctx.force_ffs:
                 continue
             jobs.append(f"-input {_mean_path(ctx, task, run)} -prefix {out}")
+    ctx.note_items("ffs", len(jobs), n_total)
 
     if not jobs:
         return 0.0

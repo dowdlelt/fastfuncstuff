@@ -100,11 +100,14 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
 def run_ref(ctx: BenchmarkContext) -> float:
     """Run AFNI 3dAllineate for all cross-run pairs."""
     total = 0.0
+    n_total = n_ran = 0
     ref = _ref_mean(ctx)
     for task, run in _align_pairs(ctx):
+        n_total += 1
         mat = _afni_mat(ctx, task, run)
         if mat.exists() and not ctx.force_ref:
             continue
+        n_ran += 1
         src = _src_mean(ctx, task, run)
         al_out = _afni_aligned(ctx, task, run)
         elapsed, _ = run_timed(
@@ -117,6 +120,7 @@ def run_ref(ctx: BenchmarkContext) -> float:
             cwd=ctx.processing_dir,
         )
         total += elapsed
+    ctx.note_items("ref", n_ran, n_total)
     return total
 
 
@@ -129,7 +133,9 @@ def run_ffs(ctx: BenchmarkContext) -> float:
     """
     ref = _ref_mean(ctx)
     jobs = []
+    n_total = 0
     for task, run in _align_pairs(ctx):
+        n_total += 1
         mat = _ffs_mat(ctx, task, run)
         if mat.exists() and not ctx.force_ffs:
             continue
@@ -141,6 +147,7 @@ def run_ffs(ctx: BenchmarkContext) -> float:
             f"-prefix {_ffs_aligned(ctx, task, run)} "
             f"-1Dmatrix_save {mat}"
         )
+    ctx.note_items("ffs", len(jobs), n_total)
 
     if not jobs:
         return 0.0
