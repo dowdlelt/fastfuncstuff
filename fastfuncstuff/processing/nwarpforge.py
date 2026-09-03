@@ -223,6 +223,68 @@ class TimeVaryingWarp:
 Transform = AffineTransform | NonlinearWarp | TimeVaryingWarp
 
 
+@dataclass(frozen=True)
+class VoxelGridPlan:
+    """Reusable homogeneous coordinates for one output grid."""
+
+    shape: tuple[int, int, int]
+    coords: Tensor  # (4, N), x/y/z/1
+
+    @property
+    def ii(self) -> Tensor:
+        return self.coords[0].reshape(self.shape)
+
+    @property
+    def jj(self) -> Tensor:
+        return self.coords[1].reshape(self.shape)
+
+    @property
+    def kk(self) -> Tensor:
+        return self.coords[2].reshape(self.shape)
+
+
+def make_voxel_grid_plan(shape: tuple[int, int, int], device: torch.device) -> VoxelGridPlan:
+    """Build one compact coordinate grid for reuse across frames and transforms."""
+    nz, ny, nx = shape
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(nz, dtype=torch.float32, device=device),
+        torch.arange(ny, dtype=torch.float32, device=device),
+        torch.arange(nx, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+    coords = torch.stack(
+        (ii.reshape(-1), jj.reshape(-1), kk.reshape(-1), torch.ones_like(ii).reshape(-1))
+    )
+    return VoxelGridPlan(shape=shape, coords=coords)
+
+
+@dataclass(frozen=True)
+class WarpApplyPlan:
+    """Grid geometry and affine conversion shared by every frame in a series."""
+
+    grid: VoxelGridPlan
+    source_from_output: Tensor
+
+
+def make_warp_apply_plan(
+    shape: tuple[int, int, int],
+    source_affine: np.ndarray,
+    output_affine: np.ndarray,
+    device: torch.device,
+    *,
+    grid_plan: VoxelGridPlan | None = None,
+) -> WarpApplyPlan:
+    """Prepare invariant output-to-source geometry once."""
+    grid = grid_plan or make_voxel_grid_plan(shape, device)
+    if grid.shape != shape or grid.coords.device != device:
+        raise ValueError("Grid plan does not match warp shape and device")
+    src_card = compute_cardinal_affine(source_affine)
+    out_card = compute_cardinal_affine(output_affine)
+    matrix = (np.linalg.inv(src_card) @ out_card).astype(np.float32)
+    source_from_output = torch.from_numpy(matrix).to(device)
+    return WarpApplyPlan(grid=grid, source_from_output=source_from_output)
+
+
 def load_affine_1D(
     path: str | Path,
     output_affine: np.ndarray,
@@ -769,7 +831,11 @@ def prepare_warp_for_grid(
     return result
 
 
-def compose_warp_then_matrix(warp: NonlinearWarp, matrix: Tensor) -> NonlinearWarp:
+def compose_warp_then_matrix(
+    warp: NonlinearWarp,
+    matrix: Tensor,
+    grid_plan: VoxelGridPlan | None = None,
+) -> NonlinearWarp:
     """Compose: output = matrix @ (x + warp(x))
 
     The matrix is applied to the warped position directly.
@@ -785,26 +851,14 @@ def compose_warp_then_matrix(warp: NonlinearWarp, matrix: Tensor) -> NonlinearWa
     nz, ny, nx = warp.shape
     device = warp.xd.device
 
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-
-    src_x = ii + warp.xd
-    src_y = jj + warp.yd
-    src_z = kk + warp.zd
-
-    coords = torch.stack(
-        [
-            src_x.reshape(-1),
-            src_y.reshape(-1),
-            src_z.reshape(-1),
-            torch.ones(nz * ny * nx, device=device),
-        ],
-        dim=0,
-    )
+    grid_plan = grid_plan or make_voxel_grid_plan(warp.shape, device)
+    if grid_plan.shape != warp.shape:
+        raise ValueError("Grid plan shape does not match warp")
+    ii, jj, kk = grid_plan.ii, grid_plan.jj, grid_plan.kk
+    coords = grid_plan.coords.clone()
+    coords[0].add_(warp.xd.reshape(-1))
+    coords[1].add_(warp.yd.reshape(-1))
+    coords[2].add_(warp.zd.reshape(-1))
 
     transformed = matrix @ coords
 
@@ -825,6 +879,7 @@ def compose_matrix_then_warp(
     warp: NonlinearWarp,
     device: torch.device,
     interp: str = "linear",
+    grid_plan: VoxelGridPlan | None = None,
 ) -> NonlinearWarp:
     """Compose: output = warp(matrix @ x)
 
@@ -841,22 +896,11 @@ def compose_matrix_then_warp(
     """
     nz, ny, nx = warp.shape
 
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-
-    coords = torch.stack(
-        [
-            ii.reshape(-1),
-            jj.reshape(-1),
-            kk.reshape(-1),
-            torch.ones(nz * ny * nx, device=device),
-        ],
-        dim=0,
-    )
+    grid_plan = grid_plan or make_voxel_grid_plan(warp.shape, device)
+    if grid_plan.shape != warp.shape:
+        raise ValueError("Grid plan shape does not match warp")
+    ii, jj, kk = grid_plan.ii, grid_plan.jj, grid_plan.kk
+    coords = grid_plan.coords
 
     transformed = matrix @ coords
 
@@ -885,6 +929,7 @@ def compose_warp_then_warp(
     warp_a: NonlinearWarp,
     warp_b: NonlinearWarp,
     interp: str = "linear",
+    grid_plan: VoxelGridPlan | None = None,
 ) -> NonlinearWarp:
     """Compose: output = B(A(x))
 
@@ -901,13 +946,10 @@ def compose_warp_then_warp(
     nz, ny, nx = warp_a.shape
     device = warp_a.xd.device
 
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-
+    grid_plan = grid_plan or make_voxel_grid_plan(warp_a.shape, device)
+    if grid_plan.shape != warp_a.shape:
+        raise ValueError("Grid plan shape does not match warp")
+    ii, jj, kk = grid_plan.ii, grid_plan.jj, grid_plan.kk
     x_after_a = ii + warp_a.xd
     y_after_a = jj + warp_a.yd
     z_after_a = kk + warp_a.zd
@@ -941,6 +983,7 @@ def compose_chain(
     time_idx: int = 0,
     verb: int = 1,
     interp: str = "linear",
+    grid_plan: VoxelGridPlan | None = None,
 ) -> NonlinearWarp:
     """Compose a chain of transforms: C(B(A(x))).
 
@@ -962,6 +1005,7 @@ def compose_chain(
     """
     if not transforms:
         raise ValueError("Empty transform chain")
+    grid_plan = grid_plan or make_voxel_grid_plan(output_shape, device)
 
     result_warp: NonlinearWarp | None = None
 
@@ -979,7 +1023,7 @@ def compose_chain(
                 if verb >= 2:
                     print(f"  [compose] created identity warp {output_shape}")
 
-            result_warp = compose_warp_then_matrix(result_warp, mat)
+            result_warp = compose_warp_then_matrix(result_warp, mat, grid_plan)
             if verb >= 2:
                 print(f"  [compose] after affine [{i}]: warp shape = {result_warp.shape}")
 
@@ -1001,7 +1045,9 @@ def compose_chain(
             else:
                 if verb >= 2:
                     print(f"  [compose] composing warp [{i}] -> {output_shape}")
-                result_warp = compose_warp_then_warp(result_warp, prepared, interp=interp)
+                result_warp = compose_warp_then_warp(
+                    result_warp, prepared, interp=interp, grid_plan=grid_plan
+                )
                 if verb >= 2:
                     print(f"  [compose] after compose: warp shape = {result_warp.shape}")
 
@@ -1077,6 +1123,7 @@ def apply_composed_warp(
     output_affine: np.ndarray,
     interp: str = "wsinc5",
     no_neg: bool = False,
+    plan: WarpApplyPlan | None = None,
 ) -> Tensor:
     """Apply composed warp to source volume.
 
@@ -1104,7 +1151,13 @@ def apply_composed_warp(
         Warped image on output grid
     """
     return apply_composed_warp_multi(
-        [source], warp, source_affine, output_affine, interp=interp, no_neg=no_neg
+        [source],
+        warp,
+        source_affine,
+        output_affine,
+        interp=interp,
+        no_neg=no_neg,
+        plan=plan,
     )[0]
 
 
@@ -1115,6 +1168,7 @@ def apply_composed_warp_multi(
     output_affine: np.ndarray,
     interp: str = "wsinc5",
     no_neg: bool = False,
+    plan: WarpApplyPlan | None = None,
 ) -> list[Tensor]:
     """Apply one composed warp to co-registered channels or time points.
 
@@ -1126,45 +1180,29 @@ def apply_composed_warp_multi(
     nz, ny, nx = warp.shape
     device = sources[0].device
 
-    # Build coordinate grids
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(nz, dtype=torch.float32, device=device),
-        torch.arange(ny, dtype=torch.float32, device=device),
-        torch.arange(nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
-
-    # Output-space coordinates after warp
-    out_x = ii + warp.xd
-    out_y = jj + warp.yd
-    out_z = kk + warp.zd
-
     # Convert output-voxel → source-voxel using CARDINAL affines.
     # AFNI uses cardinal (deobliqued) coordinate matrices for all
     # index-to-coordinate conversions, so we must do the same.
-    src_card = compute_cardinal_affine(source_affine)
-    out_card = compute_cardinal_affine(output_affine)
-    M = np.linalg.inv(src_card) @ out_card
-    M = M.astype(np.float32)
-    M_t = torch.from_numpy(M).float().to(device)
+    plan = plan or make_warp_apply_plan(warp.shape, source_affine, output_affine, device)
+    if plan.grid.shape != warp.shape or plan.grid.coords.device != device:
+        raise ValueError("Warp application plan does not match warp shape and device")
+    coords = plan.grid.coords.clone()
+    coords[0].add_(warp.xd.reshape(-1))
+    coords[1].add_(warp.yd.reshape(-1))
+    coords[2].add_(warp.zd.reshape(-1))
+    src_coords = plan.source_from_output @ coords
+    src_x = src_coords[0].reshape(nz, ny, nx)
+    src_y = src_coords[1].reshape(nz, ny, nx)
+    src_z = src_coords[2].reshape(nz, ny, nx)
 
-    N = nz * ny * nx
-    coords = torch.stack(
-        [
-            out_x.reshape(-1),
-            out_y.reshape(-1),
-            out_z.reshape(-1),
-            torch.ones(N, dtype=torch.float32, device=device),
-        ],
-        dim=0,
+    warped = warp_image_multi(
+        sources,
+        warp.xd,
+        warp.yd,
+        warp.zd,
+        mode=interp,
+        sample_coords=(src_x, src_y, src_z),
     )
-
-    src_coords = M_t @ coords
-    src_xd = src_coords[0].reshape(nz, ny, nx) - ii
-    src_yd = src_coords[1].reshape(nz, ny, nx) - jj
-    src_zd = src_coords[2].reshape(nz, ny, nx) - kk
-
-    warped = warp_image_multi(sources, src_xd, src_yd, src_zd, mode=interp)
     if no_neg:
         warped = [vol.clamp_min(0.0) for vol in warped]
     return warped
@@ -2137,6 +2175,17 @@ def nwarpforge(
             device,
         )
 
+    # Geometry is invariant across a 4-D series. Keep one compact homogeneous
+    # grid instead of rebuilding arange/meshgrid/ones for every frame and slot.
+    grid_plan = None if affine_only else make_voxel_grid_plan(output_shape, device)
+    apply_plan = (
+        make_warp_apply_plan(
+            output_shape, source_header["affine"], output_affine, device, grid_plan=grid_plan
+        )
+        if not affine_only and slice_times_t is None
+        else None
+    )
+
     # Collapse static runs once: the per-frame loop then only recomposes the
     # time-dependent pieces against pre-prepared static warps (no per-frame
     # resampling of distortion/anat/MNI warps). If nothing is time-dependent,
@@ -2158,6 +2207,7 @@ def nwarpforge(
             time_idx=0,
             interp=ainterp,
             verb=verb,
+            grid_plan=grid_plan,
         )
 
     # Tissue-following joint path: a sliding-window sampler that keeps only the
@@ -2180,6 +2230,7 @@ def nwarpforge(
                     time_idx=f,
                     interp=ainterp,
                     verb=0,
+                    grid_plan=grid_plan,
                 )
             )
             return _output_to_source_voxel_coords(comp_f, source_header["affine"], output_affine)
@@ -2311,6 +2362,7 @@ def nwarpforge(
                 output_affine=output_affine,
                 interp=interp,
                 no_neg=no_neg,
+                plan=apply_plan,
             )
             output_volumes.extend(_stash(_apply_jac(vol, static_composed)) for vol in warped_batch)
 
@@ -2343,6 +2395,7 @@ def nwarpforge(
                 time_idx=t,
                 interp=ainterp,
                 verb=0 if (t_end - t_start) > 1 else verb,
+                grid_plan=grid_plan,
             )
         )
 
@@ -2393,6 +2446,7 @@ def nwarpforge(
                     output_affine=output_affine,
                     interp=interp,
                     no_neg=no_neg,
+                    plan=apply_plan,
                 )
                 warped = torch.sqrt(warped_real**2 + warped_imag**2)
                 warped_phase = torch.atan2(warped_imag, warped_real)
@@ -2410,6 +2464,7 @@ def nwarpforge(
                     output_affine=output_affine,
                     interp=interp,
                     no_neg=no_neg,
+                    plan=apply_plan,
                 )
                 warped_phase = torch.atan2(warped_imag, warped_real)
 
@@ -2424,6 +2479,7 @@ def nwarpforge(
                     output_affine=output_affine,
                     interp=interp,
                     no_neg=no_neg,
+                    plan=apply_plan,
                 )
 
             elif phase_warp == "circular":
@@ -2439,6 +2495,7 @@ def nwarpforge(
                     output_affine=output_affine,
                     interp=interp,
                     no_neg=no_neg,
+                    plan=apply_plan,
                 )
                 warped_phase = torch.atan2(warped_sin, warped_cos)
 
@@ -2456,6 +2513,7 @@ def nwarpforge(
                 output_affine=output_affine,
                 interp=interp,
                 no_neg=no_neg,
+                plan=apply_plan,
             )
         output_volumes.append(_stash(_apply_jac(warped, composed)))
 

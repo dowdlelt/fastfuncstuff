@@ -307,6 +307,8 @@ def warp_image_multi(
     warp_yd: Tensor,
     warp_zd: Tensor,
     mode: str = "linear",
+    *,
+    sample_coords: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> list[Tensor]:
     """Warp several co-registered channels through one displacement field.
 
@@ -321,14 +323,8 @@ def warp_image_multi(
     mode = normalize_interp_mode(mode)
     if not sources:
         return []
-
-    # Treat co-registered inputs as grid_sample channels. This shares both the
-    # coordinate grid and the interpolation launch; looping channels is especially
-    # expensive on MPS, where launch latency dominates small/medium volumes.
-    if mode == "linear":
-        stack = torch.stack(tuple(sources), dim=0)
+    if sample_coords is None:
         out_nz, out_ny, out_nx = warp_xd.shape
-        src_nz, src_ny, src_nx = stack.shape[-3:]
         device = warp_xd.device
         kk, jj, ii = torch.meshgrid(
             torch.arange(out_nz, dtype=torch.float32, device=device),
@@ -336,9 +332,16 @@ def warp_image_multi(
             torch.arange(out_nx, dtype=torch.float32, device=device),
             indexing="ij",
         )
-        x = ii + warp_xd
-        y = jj + warp_yd
-        z = kk + warp_zd
+        x, y, z = ii + warp_xd, jj + warp_yd, kk + warp_zd
+    else:
+        x, y, z = sample_coords
+
+    # Treat co-registered inputs as grid_sample channels. This shares both the
+    # coordinate grid and the interpolation launch; looping channels is especially
+    # expensive on MPS, where launch latency dominates small/medium volumes.
+    if mode == "linear":
+        stack = torch.stack(tuple(sources), dim=0)
+        src_nz, src_ny, src_nx = stack.shape[-3:]
         oob = (
             (x < -0.5)
             | (x > src_nx - 0.5)
@@ -360,16 +363,7 @@ def warp_image_multi(
 
     if mode == "nearest":
         stack = torch.stack(tuple(sources), dim=0)
-        out_nz, out_ny, out_nx = warp_xd.shape
         src_nz, src_ny, src_nx = stack.shape[-3:]
-        device = warp_xd.device
-        kk, jj, ii = torch.meshgrid(
-            torch.arange(out_nz, dtype=torch.float32, device=device),
-            torch.arange(out_ny, dtype=torch.float32, device=device),
-            torch.arange(out_nx, dtype=torch.float32, device=device),
-            indexing="ij",
-        )
-        x, y, z = ii + warp_xd, jj + warp_yd, kk + warp_zd
         oob = (
             (x < -0.5)
             | (x > src_nx - 0.5)
@@ -387,22 +381,14 @@ def warp_image_multi(
         result[:, oob] = 0.0
         return list(result.unbind(0))
 
-    out_nz, out_ny, out_nx = warp_xd.shape
-    device = warp_xd.device
-    kk, jj, ii = torch.meshgrid(
-        torch.arange(out_nz, dtype=torch.float32, device=device),
-        torch.arange(out_ny, dtype=torch.float32, device=device),
-        torch.arange(out_nx, dtype=torch.float32, device=device),
-        indexing="ij",
-    )
     if len(sources) == 1:
         # Keep a singleton source genuinely 3-D.  nwarp's per-frame path uses
         # this multi-channel entry point even when there is only magnitude data;
         # stacking it would hide the fused CUDA kernel behind the channel-batched
         # portable fallback.
-        return [_separable_resample_3d(sources[0], ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)]
+        return [_separable_resample_3d(sources[0], x, y, z, mode)]
     stack = torch.stack(tuple(sources), dim=0)  # (C, nz, ny, nx)
-    out = _separable_resample_3d(stack, ii + warp_xd, jj + warp_yd, kk + warp_zd, mode)
+    out = _separable_resample_3d(stack, x, y, z, mode)
     return list(out.unbind(0))
 
 

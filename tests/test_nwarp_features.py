@@ -18,6 +18,7 @@ from fastfuncstuff.processing.nwarpforge import (
     _estimate_warp_padding,
     _pad_output_grid,
     apply_composed_warp,
+    make_warp_apply_plan,
     nwarpforge,
 )
 
@@ -300,6 +301,38 @@ def test_multi_channel_warp_matches_scalar_loop(mode):
     assert len(got) == len(expected)
     for actual, reference in zip(got, expected, strict=True):
         assert torch.allclose(actual, reference, atol=2e-5, rtol=2e-5)
+
+
+@pytest.mark.parametrize("mode", ["nearest", "linear", "cubic", "wsinc5"])
+def test_absolute_coordinate_sampling_matches_displacement_path(mode):
+    torch.manual_seed(74)
+    source = torch.randn(9, 10, 11)
+    xd = torch.randn(9, 10, 11) * 0.15
+    yd = torch.randn(9, 10, 11) * 0.15
+    zd = torch.randn(9, 10, 11) * 0.15
+    kk, jj, ii = torch.meshgrid(
+        torch.arange(9, dtype=torch.float32),
+        torch.arange(10, dtype=torch.float32),
+        torch.arange(11, dtype=torch.float32),
+        indexing="ij",
+    )
+
+    expected = I.warp_image_multi([source], xd, yd, zd, mode=mode)
+    got = I.warp_image_multi(
+        [source], xd, yd, zd, mode=mode, sample_coords=(ii + xd, jj + yd, kk + zd)
+    )
+    assert torch.allclose(got[0], expected[0], atol=2e-5, rtol=2e-5)
+
+
+def test_warp_apply_plan_reuses_geometry_without_changing_result():
+    src = torch.randn(9, 10, 11)
+    aff = _diag_affine()
+    zero = torch.zeros_like(src)
+    warp = NonlinearWarp(zero, zero.clone(), zero.clone(), {"affine": aff})
+    plan = make_warp_apply_plan(warp.shape, aff, aff, DEV)
+    expected = apply_composed_warp(src, warp, aff, aff, interp="linear")
+    got = apply_composed_warp(src, warp, aff, aff, interp="linear", plan=plan)
+    assert torch.equal(got, expected)
 
 
 # --------------------------------------------------------------------------
