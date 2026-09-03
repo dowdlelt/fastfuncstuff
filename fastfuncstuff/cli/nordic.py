@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
@@ -371,6 +372,23 @@ Examples:
         "task is'. Default: use -task_top_frac instead.",
     )
     task_group.add_argument(
+        "-task_fdr_q",
+        "-task-fdr-q",
+        type=float,
+        default=0.05,
+        metavar="Q",
+        help="Benjamini-Hochberg q for the per-patch design-overlap test. Each patch is "
+        "asked whether the directions it DISCARDED carry more of the design than a "
+        "uniformly random subspace of the same dimension would - a null that is exact "
+        "under 'this patch holds only thermal noise' (a white Wishart's eigenvectors "
+        "are Haar and independent of its eigenvalues) and that never touches the "
+        "design, which is what makes it usable where a shift or phase-randomised "
+        "surrogate is not. The patch, not the voxel, is the test unit: every voxel in a "
+        "patch is reconstructed through the same discarded subspace, so a voxelwise FDR "
+        "would count each patch once per voxel. Writes {prefix}_taskpatch (excess "
+        "overlap, and 1-q). Default 0.05.",
+    )
+    task_group.add_argument(
         "-save-task-loss",
         "-save_task_loss",
         action="store_true",
@@ -404,6 +422,66 @@ Examples:
     add_verbose_arg(perf_group, default=1)
 
     return parser.parse_args(argv)
+
+
+def _resolve_task_design(args, magnitude_file: str):
+    """Convolved design + drift degree for the per-patch test, built before the run.
+
+    The patch test lives inside the LLR loop -- it needs the discarded singular vectors,
+    which exist only there -- so unlike the -events fits this cannot be done afterwards
+    from the saved files. Header read only; the design is trimmed to the denoised frame
+    count inside the library.
+    """
+    from fastfuncstuff.cli.task_events import task_design_from_events
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.stats.task_coupling import default_polort
+
+    hdr = load_nifti(magnitude_file).header
+    n_t = int(hdr.get_data_shape()[3])
+    tr = args.tr if args.tr is not None else float(hdr["pixdim"][4])
+    if tr <= 0:
+        raise ValueError(
+            f"the input header gives TR={tr:g}s, which cannot build a design - pass -tr SEC."
+        )
+    design, labels = task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    return design.cpu().numpy(), labels, polort, tr
+
+
+def _print_patch_test(summary: dict, label: str) -> list[str]:
+    """Per-patch verdict: was the discarded subspace aligned with the design?
+
+    The z leads, not the FDR count, because that is where the dynamic range is.
+    NORDIC routinely keeps 3 of 120 components, so "is the design in what was thrown
+    away" is trivially yes for the design AND for every random direction, and the
+    upper-tail test has almost nothing to separate. The SIGNED distance from the null
+    still separates cleanly: measured across the synthetic runs, a task NORDIC
+    preserved reads a median z of -17, no task at all reads +0.3, and a task too weak
+    to survive the threshold reads +0.6 to +0.9.
+    """
+    n_in = summary["n_patches_in_brain"]
+    n_sig = summary["n_patches_significant"]
+    z = summary["z_median_in_brain"]
+    if z < -2.0:
+        verdict = "the response was preferentially KEPT"
+    elif z > 2.0:
+        verdict = "removal was selectively aligned with the design"
+    else:
+        verdict = "the design went out with the noise like any other direction"
+    return [
+        f"  PATCH TEST{label}: median z {z:+.2f} over {n_in} in-brain patches -- {verdict}",
+        "    z is how far the design sits inside what each patch DISCARDED, against "
+        "random directions",
+        "    drawn in its own drift-orthogonal subspace. Negative = preferentially "
+        "kept; ~0 = treated",
+        "    like any other direction; positive = discarded selectively.",
+        f"    {n_sig} of {n_in} patches positive at q <= {summary['fdr_q']:g} "
+        f"(BH-FDR, one-sided upper tail)",
+        f"    null: {summary['n_null_frames']} random "
+        f"{summary['n_design_columns']}-column frames; patches discarded "
+        f"{summary['mean_removed_dim']:.1f} of {summary['n_components']} components "
+        f"on average",
+    ]
 
 
 def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
@@ -655,6 +733,17 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(1)
     # The diagnostic scores the loss series, so -events has to produce it.
     save_task_loss = args.save_task_loss or args.events is not None
+    task_design = None
+    if args.events is not None:
+        # Built up front, before any denoising: the per-patch test runs INSIDE the LLR
+        # loop (it needs the discarded singular vectors), so a design resolved
+        # afterwards would be too late, and a bad -tr should fail in a second rather
+        # than after the whole run.
+        task_design, task_labels, task_polort, task_tr = _resolve_task_design(args, magn_files[0])
+        print(
+            f"Task design: {len(task_labels)} condition(s) ({', '.join(task_labels)}), "
+            f"TR {task_tr:g}s, polort {task_polort}"
+        )
 
     # Resolve the factor-sweep window: explicit values win, else LO HI N range.
     sweep_values: tuple[float, ...] | None = None
@@ -720,6 +809,9 @@ def main(argv: list[str] | None = None) -> None:
         retain_dof=args.retain_dof,
         save_num_comps=args.save_num_comps,
         save_task_loss=save_task_loss,
+        task_design=task_design,
+        task_polort=task_polort if args.events is not None else 1,
+        task_fdr_q=args.task_fdr_q,
         make_complex_nii=args.make_complex_nii,
         nifti_ext=prefix_info.nifti_ext,
         svd_batch_size=args.svd_batch_size,
@@ -790,6 +882,8 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  Residual output: {outputs.residual_file}")
         if outputs.task_loss_file is not None:
             print(f"  Task-loss output: {outputs.task_loss_file}")
+        if outputs.task_patch_file is not None:
+            print(f"  Patch-test output: {outputs.task_patch_file}")
         if outputs.num_comps_file is not None:
             print(f"  Num-comps output: {outputs.num_comps_file}")
         if outputs.recfactor_file is not None:
@@ -800,12 +894,17 @@ def main(argv: list[str] | None = None) -> None:
     if args.events is not None:
         print_cli_section("Task-leak diagnostic")
         for i, outputs in enumerate(all_outputs):
-            _task_leak_report(
-                outputs,
-                magn_files[i],
-                args,
-                f" [echo {i + 1}]" if n_echoes > 1 else "",
-            )
+            label = f" [echo {i + 1}]" if n_echoes > 1 else ""
+            _task_leak_report(outputs, magn_files[i], args, label)
+            with open(outputs.metadata_file) as f:
+                summary = json.load(f).get("task_patch_test")
+            if summary is not None:
+                report = _print_patch_test(summary, label)
+                print("")
+                print("\n".join(report))
+                stem = str(outputs.task_loss_file).partition("_taskloss")[0]
+                with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
+                    f.write("\n" + "\n".join(report) + "\n")
 
 
 if __name__ == "__main__":

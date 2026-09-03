@@ -86,6 +86,14 @@ class NordicConfig:
     # diagnostic (or an ICA of what was discarded) has to run on; see
     # _magnitude_loss. Forces the residual to be computed.
     save_task_loss: bool = False
+    # Per-patch design-overlap test (-events). The convolved (nt, K) task design; the
+    # library trims it to the frames it denoises and projects out the drift itself, so
+    # callers hand over the raw design rather than a basis. task_polort is the drift
+    # degree used for that projection.
+    task_design: np.ndarray | None = None
+    task_polort: int = 1
+    task_fdr_q: float = 0.05
+    task_null_draws: int = 96
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
     write_gzipped_niftis: bool = True
@@ -153,6 +161,7 @@ class NordicOutputs:
     recfactor_file: Path | None
     metadata_file: Path
     task_loss_file: Path | None = None
+    task_patch_file: Path | None = None
 
 
 @dataclass
@@ -184,6 +193,11 @@ class _LLRStats:
     # DoF floor (denoising capped to preserve degrees of freedom), and the floor.
     n_dof_capped: int = 0
     dof_floor: int = 0
+    # Per-patch design-overlap test (-events). excess = observed minus the random-
+    # subspace null mean, so 0 is chance; the FDR map holds 1 - q. Both patch-averaged.
+    task_overlap_map: torch.Tensor | None = None
+    task_fdr_map: torch.Tensor | None = None
+    task_summary: dict | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -501,6 +515,101 @@ def _optimal_shrinkage_weights(
     return weights
 
 
+# ---------------------------------------------------------------------------
+# Per-patch design-overlap test: did this patch discard a task-aligned direction?
+# ---------------------------------------------------------------------------
+
+
+def task_null_frames(
+    design: np.ndarray | torch.Tensor,
+    n_t: int,
+    polort: int,
+    n_null: int,
+    device: torch.device,
+    seed: int = 0,
+) -> tuple[torch.Tensor, int]:
+    """``(n_t, K*(1+n_null))`` frames: the real design first, then its null companions.
+
+    Column block 0 spans the drift-projected task design; each later block is an
+    orthonormal K-frame drawn uniformly **from the same drift-orthogonal subspace**.
+    Returns the stacked frames and K.
+
+    The null companions are the whole point and the first version of this got it wrong.
+    Comparing the design's overlap with a patch's discarded directions against a Haar
+    subspace of plain R^T reads significant on data with no task in it at all, because
+    the two sides are not comparable: the components a patch KEEPS are the top ones,
+    which are mean- and drift-dominated, while the design has had drift projected out
+    of it by construction. That alone pushes the design into the discarded subspace,
+    for every patch, leak or no leak. Drawing the null directions from the drift
+    complement removes the asymmetry -- they are then subject to exactly the same push.
+
+    The draw is Haar on the Stiefel manifold of the complement (Gaussian, project out
+    the drift, QR), and the same set of frames is reused for every patch. That makes
+    patch statistics positively dependent rather than independent, which BH-FDR
+    tolerates; drawing per patch would cost the same again and buy nothing, since the
+    frames are not what varies between patches.
+    """
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+    from fastfuncstuff.stats.task_coupling import _orthonormal_basis
+
+    x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
+    if x.ndim == 1:
+        x = x[:, None]
+    x = x[:n_t]
+    if x.shape[0] != n_t:
+        raise ValueError(f"task design has {x.shape[0]} rows, need at least {n_t}")
+    nuis = construct_polynomial_matrix(n_t, polort, device=device, dtype=torch.float64)
+    q_n = _orthonormal_basis(nuis)
+
+    def _drift_free(cols: torch.Tensor) -> torch.Tensor:
+        return cols - q_n @ (q_n.T @ cols)
+
+    q_x = _orthonormal_basis(_drift_free(x), scale=float(torch.linalg.matrix_norm(x, 2)))
+    k_design = int(q_x.shape[1])
+    if k_design == 0:
+        raise ValueError(
+            f"every task column is collinear with the polort-{polort} drift basis; "
+            "lower the drift degree or the design is not separable at this block length"
+        )
+    gen = torch.Generator(device="cpu").manual_seed(seed)
+    blocks = [q_x]
+    for _ in range(n_null):
+        g = torch.randn(n_t, k_design, generator=gen, dtype=torch.float64).to(device)
+        blocks.append(torch.linalg.qr(_drift_free(g))[0])
+    return torch.cat(blocks, dim=1).to(torch.float32), k_design
+
+
+def _overlap_zscores(obs_all: torch.Tensor) -> torch.Tensor:
+    """Per-patch z of the real design's discarded-overlap against its null companions.
+
+    ``obs_all`` is ``(n_patches, 1 + n_null)`` — column 0 the design, the rest the
+    drift-orthogonal null frames.
+
+    A z, not the empirical rank-p, and the reason is arithmetic: an empirical p from R
+    draws cannot go below ``1/(R+1)``, while BH over tens of thousands of patches needs
+    p down near ``q/n``. So the null draws estimate a mean and a spread and the tail is
+    taken as Gaussian — the same compromise AFNI's ``fizt`` maps make, and honest to
+    state: the bulk of this statistic is well behaved but its extreme tail is an
+    approximation, so read a patch count as an effect size with a calibrated floor
+    rather than as an exact false-discovery guarantee.
+    """
+    null = obs_all[:, 1:]
+    mu = null.mean(dim=1)
+    sd = null.std(dim=1).clamp(min=1e-8)
+    return (obs_all[:, 0] - mu) / sd
+
+
+def _bh_qvalues(p: torch.Tensor) -> torch.Tensor:
+    """Benjamini-Hochberg q-values, same ordering convention as AFNI's FDR curves."""
+    n = p.numel()
+    order = torch.argsort(p)
+    ranks = torch.arange(1, n + 1, device=p.device, dtype=p.dtype)
+    q_sorted = (p[order] * n / ranks).flip(0).cummin(0)[0].flip(0)
+    q = torch.empty_like(p)
+    q[order] = q_sorted.clamp(max=1.0)
+    return q
+
+
 def _llr_denoise(
     data: torch.Tensor,
     kernel_size: tuple[int, int, int],
@@ -514,6 +623,9 @@ def _llr_denoise(
     device: torch.device | None = None,
     noise_sigma: float = 0.0,
     retain_dof: float | None = None,
+    task_frames: torch.Tensor | None = None,
+    task_k_design: int = 0,
+    task_fdr_q: float = 0.05,
 ) -> tuple[torch.Tensor, _LLRStats]:
     """Patch-based local low-rank denoising with batched decomposition.
 
@@ -586,6 +698,26 @@ def _llr_denoise(
     idx_arange_K = torch.arange(K, device=device)
     n_dof_capped = 0
 
+    # Per-patch design-overlap test. Held per PATCH, not per voxel: every voxel in a
+    # patch is reconstructed through the same V, so their residual time courses are
+    # rank-coupled by construction and a voxelwise test would count each patch M times.
+    # Needs V to be a COMPLETE basis of the time axis, so the overlap with the
+    # discarded directions can be read off the (few) kept ones as the complement --
+    # summing over the hundreds of discarded columns directly costs an order of
+    # magnitude more. NORDIC sizes its kernel so a patch holds ~11 voxels per
+    # timepoint, so M >= N is the designed case; the fallback is to skip, not to
+    # silently test something else.
+    do_task = task_frames is not None and return_recon and M >= N
+    n_frames = 0 if not do_task else int(task_frames.shape[1] // max(1, task_k_design))
+    task_obs = torch.zeros(total, n_frames, dtype=torch.float32, device=device) if do_task else None
+    task_dim = torch.zeros(total, dtype=torch.long, device=device) if do_task else None
+    task_amp = torch.zeros(total, dtype=torch.float32, device=device) if do_task else None
+    if task_frames is not None and not do_task and verbose:
+        print(
+            f"  Patch design-overlap test skipped: patch holds {M} voxels for {N} "
+            "timepoints, so the patch basis does not span the time axis."
+        )
+
     # Choose decomposition method
     if decomp_method == "auto":
         use_eigh = M >= 2 * N
@@ -643,6 +775,10 @@ def _llr_denoise(
         mats = data[xi, yi, zi, :]  # (B, M, nt) — on data_dev
         if cross_device:
             mats = mats.to(device)
+        if do_task:
+            # Captured before the decomposition consumes `mats`: air patches would
+            # otherwise dominate the FDR denominator with perfect null behaviour.
+            task_amp[batch_start : batch_start + B] = mats.abs().mean(dim=(1, 2))
 
         # Flat indices for scatter (accumulators are contiguous, on `device`)
         b_corners_flat = corners_flat[batch_start : batch_start + B]
@@ -715,6 +851,27 @@ def _llr_denoise(
                 n_kept = (weights > 0).sum(dim=1)
                 idx_removed_vec = (K - n_kept).float()  # keep the numcomps map in sync
 
+        if do_task:
+            # ||V_d^H F||_F^2 for the design and every null frame F: how much of each
+            # lies in the directions this patch threw away. Read as the complement of
+            # the KEPT prefix -- the frames are orthonormal, so each block contributes
+            # exactly k_design across a complete basis, and the kept prefix is a few
+            # dozen columns against hundreds discarded.
+            kk = max(1, int(n_kept.max().item()))
+            v_kept = V[:, :, :kk] if use_eigh else vh[:, :kk, :].mH
+            q_dev = task_frames.to(device=device, dtype=v_kept.dtype)
+            proj = v_kept.mH @ q_dev  # (B, kk, k_design * n_frames)
+            c_kept = (
+                proj.abs().pow(2).reshape(B, kk, n_frames, task_k_design).sum(-1)
+            )  # (B, kk, n_frames)
+            del proj
+            # weights, not a hard mask, so continuous shrinkage degrades gracefully;
+            # for the binary NORDIC/MP threshold this is exactly the kept projector.
+            kept_overlap = (weights[:, :kk, None] * c_kept).sum(1)  # (B, n_frames)
+            task_obs[batch_start : batch_start + B] = task_k_design - kept_overlap
+            task_dim[batch_start : batch_start + B] = (K - n_kept).long()
+            del c_kept, kept_overlap, q_dev, v_kept
+
         if return_recon:
             max_k = max(1, int(n_kept.max().item()))
 
@@ -786,6 +943,66 @@ def _llr_denoise(
     if pbar is not None:
         pbar.close()
 
+    task_overlap_map = None
+    task_fdr_map = None
+    task_summary = None
+    if do_task:
+        assert task_obs is not None and task_dim is not None and task_amp is not None
+        from fastfuncstuff.stats.fdr import fdr_qvalues
+
+        zscores = _overlap_zscores(task_obs)
+        excess = task_obs[:, 0] - task_obs[:, 1:].mean(dim=1)
+        # FDR over the patches that hold tissue. Air patches behave perfectly under the
+        # null and would only inflate the denominator -- BH is a ratio, so padding it
+        # with thousands of guaranteed non-discoveries buries the real findings.
+        in_brain = task_amp > 0.1 * float(task_amp.max())
+        qvals = torch.ones_like(zscores)
+        if bool(in_brain.any()):
+            # ONE-sided, on the upper tail. A negative z is the design sitting in what
+            # the patch KEPT more than a random direction would -- the reassuring
+            # outcome, and a two-sided test reports it as a finding: on a run where
+            # NORDIC correctly preserved the response the median z is -17 and two-sided
+            # FDR flags 75% of patches.
+            z_cpu = zscores.detach().cpu().double()
+            mask_cpu = in_brain.detach().cpu()
+            p_upper = torch.special.ndtr(-z_cpu).clamp(min=1e-300)
+            q_cpu = fdr_qvalues(z_cpu, pvalues=p_upper, mask=mask_cpu)
+            q_cpu = torch.where(torch.isfinite(q_cpu), q_cpu, torch.ones_like(q_cpu))
+            qvals = q_cpu.to(qvals.device)
+        n_sig = int(((qvals <= task_fdr_q) & in_brain).sum())
+        task_summary = {
+            "n_patches": int(total),
+            "n_patches_in_brain": int(in_brain.sum()),
+            "n_patches_significant": n_sig,
+            "fdr_q": float(task_fdr_q),
+            "n_design_columns": int(task_k_design),
+            "n_null_frames": int(n_frames - 1),
+            "mean_removed_dim": float(task_dim.float().mean()),
+            "n_components": int(K),
+            "excess_overlap_median_in_brain": (
+                float(excess[in_brain].median()) if bool(in_brain.any()) else 0.0
+            ),
+            "z_median_in_brain": (
+                float(zscores[in_brain].median()) if bool(in_brain.any()) else 0.0
+            ),
+        }
+        # Painted patch-averaged, like every other per-patch map here: a voxel's value
+        # is the mean over the patches covering it.
+        task_overlap_map = torch.zeros_like(weight)
+        task_fdr_map = torch.zeros_like(weight)
+        ov_flat = task_overlap_map.reshape(-1)
+        fdr_flat = task_fdr_map.reshape(-1)
+        one_minus_q = (1.0 - qvals).to(torch.float32)
+        for batch_start in range(0, total, svd_batch_size):
+            B = min(svd_batch_size, total - batch_start)
+            b_corners = corners_flat[batch_start : batch_start + B]
+            flat_b = (b_corners[:, None] + local_offsets_flat[None, :]).reshape(-1).to(device)
+            sl = slice(batch_start, batch_start + B)
+            ov_flat.index_add_(0, flat_b, excess[sl].repeat_interleave(M))
+            fdr_flat.index_add_(0, flat_b, one_minus_q[sl].repeat_interleave(M))
+            del flat_b
+        del zscores, qvals, one_minus_q
+
     w = torch.clamp(weight, min=1.0)
     if return_recon:
         # Reclaim the batch loop's cached blocks before the weight-normalisation,
@@ -813,6 +1030,9 @@ def _llr_denoise(
         snr_weight=snr_weight / w,
         n_dof_capped=n_dof_capped,
         dof_floor=dof_floor,
+        task_overlap_map=None if task_overlap_map is None else task_overlap_map / w,
+        task_fdr_map=None if task_fdr_map is None else task_fdr_map / w,
+        task_summary=task_summary,
     )
     return recon_out, stats
 
@@ -1832,6 +2052,22 @@ def _finalize_echo(
         del residual_np
     del residual
 
+    task_patch_file: Path | None = None
+    if llr_stats.task_overlap_map is not None and llr_stats.task_fdr_map is not None:
+        task_patch_file = out_dir / f"{out_prefix.name}_taskpatch{ext}"
+        save_nifti(
+            np.stack(
+                [
+                    llr_stats.task_overlap_map.detach().cpu().numpy().astype(np.float32),
+                    llr_stats.task_fdr_map.detach().cpu().numpy().astype(np.float32),
+                ],
+                axis=-1,
+            ),
+            output_path=task_patch_file,
+            reference_img=magnitude_file,
+            brick_labels=["design_overlap_excess", "taskleak_1minus_q"],
+        )
+
     rescued_file: Path | None = None
     if llr_stats.rescued_map is not None and cfg.rescue:
         rescued_file = out_dir / f"{out_prefix.name}_rescued{ext}"
@@ -1910,11 +2146,14 @@ def _finalize_echo(
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
             "residual": str(residual_file) if residual_file is not None else None,
             "task_loss": str(task_loss_file) if task_loss_file is not None else None,
+            "task_patch": str(task_patch_file) if task_patch_file is not None else None,
             "rescued": str(rescued_file) if rescued_file is not None else None,
             "num_comps": str(num_comps_file) if num_comps_file is not None else None,
             "recfactor": str(recfactor_file) if recfactor_file is not None else None,
         },
     }
+    if llr_stats.task_summary is not None:
+        meta["task_patch_test"] = llr_stats.task_summary
     if extra_meta is not None:
         meta.update(extra_meta)
 
@@ -1931,6 +2170,7 @@ def _finalize_echo(
         recfactor_file=recfactor_file,
         metadata_file=meta_file,
         task_loss_file=task_loss_file,
+        task_patch_file=task_patch_file,
     )
 
 
@@ -1980,6 +2220,16 @@ def _llr_main_pass(
             KSP2 = KSP2.cpu()
             torch.cuda.empty_cache()
 
+    task_frames, task_k_design = None, 0
+    if cfg.task_design is not None:
+        task_frames, task_k_design = task_null_frames(
+            cfg.task_design,
+            int(KSP2.shape[3]),
+            cfg.task_polort,
+            cfg.task_null_draws,
+            dev,
+        )
+
     denoised, llr_stats = _llr_denoise(
         KSP2,
         kernel_size=kernel_pca,
@@ -1991,6 +2241,9 @@ def _llr_main_pass(
         decomp_method=cfg.decomp_method,
         device=dev,
         retain_dof=cfg.retain_dof,
+        task_frames=task_frames,
+        task_k_design=task_k_design,
+        task_fdr_q=cfg.task_fdr_q,
     )
 
     residual: torch.Tensor | None = None

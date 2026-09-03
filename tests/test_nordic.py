@@ -1165,3 +1165,77 @@ def test_task_leak_enrichment_rises_when_denoising_over_removes(tmp_path):
     assert over > base, f"over-removal did not raise enrichment: {base:.2f} -> {over:.2f}"
     assert over > 1.5, over
     assert base < 1.3, base
+
+
+def test_task_null_frames_are_orthonormal_and_drift_free(tmp_path):
+    """The null companions must live in the same subspace as the design.
+
+    That is the whole fix: comparing the design against directions drawn from plain
+    R^T reads significant on data with no task in it, because the components a patch
+    KEEPS are drift-dominated while the design has had drift projected out.
+    """
+    from fastfuncstuff.denoise.nordic import task_null_frames
+
+    n_t, polort, n_null = 120, 2, 8
+    design = np.zeros((n_t, 2), dtype=np.float32)
+    design[10:30, 0] = 1.0
+    design[60:80, 1] = 1.0
+    frames, k = task_null_frames(design, n_t, polort, n_null, torch.device("cpu"))
+    assert k == 2
+    assert frames.shape == (n_t, k * (1 + n_null))
+    drift = torch.linalg.qr(
+        torch.stack([torch.linspace(-1, 1, n_t) ** d for d in range(polort + 1)], dim=1)
+    )[0]
+    for i in range(1 + n_null):
+        blk = frames[:, i * k : (i + 1) * k].double()
+        np.testing.assert_allclose(blk.T @ blk, np.eye(k), atol=1e-5)
+        assert float((drift.double().T @ blk).abs().max()) < 1e-4, f"block {i} keeps drift"
+
+
+def _patch_summary(prefix: Path) -> dict:
+    with open(f"{prefix}_metadata.json") as f:
+        return json.load(f)["task_patch_test"]
+
+
+def _run_patch_test(tmp_path, tag, magn_file, ev):
+    from fastfuncstuff.cli.nordic import main
+
+    main(
+        [
+            "-input-magn",
+            str(magn_file),
+            "-prefix",
+            str(tmp_path / tag),
+            "-magnitude-only",
+            "-gfactor-nvols",
+            "8",
+            "-events",
+            str(ev),
+            "-device",
+            "cpu",
+        ]
+    )
+    return _patch_summary(tmp_path / tag)
+
+
+def test_patch_test_separates_a_kept_response_from_no_task(tmp_path):
+    """The signed z is what discriminates, and both directions have to be checked.
+
+    The FDR count alone cannot carry this: NORDIC keeps a handful of components out of
+    a hundred-odd, so the design is in the discarded subspace whatever happens, and so
+    is every random direction. What separates is HOW FAR from the null the design sits
+    -- strongly negative when the response was preferentially kept, ~0 when it went
+    out like any other direction.
+    """
+    planted, ev = _planted_task_run(tmp_path, seed=13, amp=25.0)
+    kept = _run_patch_test(tmp_path, "KEPT", planted, ev)
+    sub = tmp_path / "n"
+    sub.mkdir()
+    flat, _ = _planted_task_run(sub, seed=13, amp=0.0)
+    none = _run_patch_test(tmp_path, "NONE", flat, ev)
+
+    assert kept["z_median_in_brain"] < -2.0, kept
+    assert abs(none["z_median_in_brain"]) < 2.0, none
+    # One-sided: preferential KEEPING is the good outcome and must never be a finding.
+    assert kept["n_patches_significant"] == 0, kept
+    assert none["n_patches_significant"] == 0, none
