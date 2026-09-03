@@ -71,11 +71,27 @@ __all__ = [
 DEFAULT_SIGNAL_RANK = 30
 """Rank of the signal subspace removed before measuring the noise.
 
-Large enough to absorb the dominant structured variance in a typical run (drift residual,
-motion, the big networks), small enough to leave a residual with plenty of degrees of
-freedom to estimate a standard deviation from. It is a *nuisance* rank, not a model order
--- it does not need to be right, only generous, since the degrees-of-freedom correction
-handles whatever it removes.
+Intended as a *nuisance* rank: large enough to absorb the dominant structured variance in
+a typical run (drift residual, motion, the big networks), small enough to leave a residual
+with plenty of degrees of freedom to estimate a standard deviation from.
+
+**KNOWN PROBLEM -- this value directly sets the automatic model order, which is not what a
+nuisance rank is supposed to do.** Measured on ds005165 at fixed effective sample size,
+sweeping this rank 2/5/10/20/30/50/80/120 moves the selected order
+62/64/69/73/76/78/81/92 (rest run 1) and 62/63/68/72/76/77/86/93 (localizer run 1). The
+default of 30 accounts for essentially the whole gap against MELODIC: at fixed n_eff, rest
+run 1 selects 76 with this varnorm and 59 with a plain total-stdev divide (MELODIC: 59).
+
+The mechanism is circular. A generous rank absorbs genuine signal in high-SNR voxels, so
+their estimated "noise" std comes out too small, so dividing by it over-amplifies exactly
+the voxels that carry signal, and more eigenvalues clear the noise floor. The
+degrees-of-freedom correction compensates for the dimensions removed but not for the
+signal absorbed. Note the relation is monotone increasing, so iterating rank := selected
+order does NOT converge.
+
+Do not "fix" this by tuning the constant to match a reference -- that is a fudge factor
+for a structural problem. The intended fix is a noise estimator that needs no rank at all;
+see ``../fmri_wiki/concepts/ICA noise normalisation.md``.
 """
 
 

@@ -26,12 +26,22 @@ same thing and fail differently:
 
 - :func:`stability_model_order` measures **optimisation** variability -- run the ICA many
   times from different initialisations and see which components survive as tight clusters.
-  **This turns out to be a poor model-order estimator, and the failure is silent.**
-  Measured on rank-6 data at ``k_max=12``: eleven clusters clear ``Iq=0.7`` and nine
-  exceed 0.97. For a *fixed* dataset the whitened subspace is fixed too, so FastICA
-  converges to essentially the same answer from any start -- on the noise directions as
-  much as the real ones. The numbers look superb and mean little. Use it as a diagnostic
-  of whether the decomposition converged, which is what ICASSO is for, not as a count.
+  For a *fixed* dataset the whitened subspace is fixed too, so FastICA converges to
+  essentially the same answer from any start -- on the noise directions as much as the
+  real ones. On synthetic rank-6 data at ``k_max=12`` this is stark: eleven clusters clear
+  ``Iq=0.7`` and nine exceed 0.97.
+
+  **On real data it behaves much better than that synthetic result suggests**, and the
+  earlier blanket "does not work" was too strong. Measured on ds005165 rest (5 runs,
+  T=212, 30 restarts): it returns 58-67 where the spectral default returns 76-84 and
+  MELODIC returns 59-69, with a real Iq spread (mean .854, range [.359, .995]). Its count
+  is independently supported -- cross-run matching shows the spectral extras reproduce no
+  better, so nothing real is lost by the lower number. Cost is ~17-24 s per run.
+
+  What it cannot do is discriminate *between* runs: across those five runs its counts
+  correlate with MELODIC's at r=-0.26 (leave-one-out -0.74..+0.17 at n=5, i.e. no
+  detectable relationship), while the spectral estimate tracks at r~+0.95. So it is a
+  reasonable second opinion on the overall level and useless for per-run variation.
 - :func:`split_half_reproducibility` measures **sampling** variability -- decompose two
   disjoint halves of the data independently and count how many components match across
   them. This one works: on the same synthetic data it recovers the planted components and
@@ -40,6 +50,12 @@ same thing and fail differently:
 The distinction is the whole point. A component can be perfectly seed-stable and not
 reproduce on held-out runs, because seed stability never varies the data. **If you run
 only one of these, run the split-half.**
+
+Threshold warning for any reproducibility metric here: a single ``|r| >= 0.5`` cut reports
+close to zero for *every* k on single-run resting data and looks like a broken pipeline.
+It is not -- 212-TR single-run rest ICA genuinely does not reproduce that well (matching
+one run's own halves tops out around .65). Compare counts across a *range* of thresholds,
+or the mean of the top-N matches.
 """
 
 from __future__ import annotations

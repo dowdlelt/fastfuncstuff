@@ -3634,11 +3634,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Choose the component count by restart-cluster stability rather than the "
         "eigenspectrum: run -stability_runs restarts at the Marchenko-Pastur ceiling and "
-        "keep the clusters reaching -icasso_min_stability.  NOT RECOMMENDED as an "
-        "estimator: restart stability varies the initialisation but never the data, so "
-        "noise directions come back as stable as real ones and this overcounts "
-        "(measured 11 on rank-6 data).  Use -split_half for a count; this flag is here "
-        "for the Iq curve, which is a real convergence diagnostic.",
+        "keep the clusters reaching -icasso_min_stability.\n"
+        "A reasonable second opinion on the overall level, and cheap (~20s/run at 30 "
+        "restarts).  On ds005165 rest it returns 58-67 where the spectral default returns "
+        "76-84 and MELODIC returns 59-69, and cross-run matching shows the spectral "
+        "extras reproduce no better -- so the lower count is not losing anything.\n"
+        "Two limits.  It varies the initialisation but never the data, so on small "
+        "synthetic problems it overcounts badly (11 clusters on rank-6 data).  And it "
+        "does not discriminate between runs: its per-run counts show no detectable "
+        "relationship to the run-to-run variation the spectral estimate tracks.  Use it "
+        "for the level and for the Iq convergence curve, not for per-run differences.",
     )
     ica_opts.add_argument(
         "-stability_runs",
@@ -3649,7 +3654,8 @@ def build_parser() -> argparse.ArgumentParser:
     ica_opts.add_argument(
         "-split_half",
         action="store_true",
-        help="Report how many components reproduce across two disjoint halves of the "
+        help="Requires -temp_concat.  Report how many components reproduce across two "
+        "disjoint halves of the "
         "input runs: decompose each half independently, match components one-to-one by "
         "|correlation|, and count the matches clearing -split_half_thresh.  This measures "
         "whether a component is a property of the data rather than of the fit, which "
@@ -4260,6 +4266,16 @@ def main() -> None:
         print(
             f"Task annotation: {len(bids_task_labels)} conditions from BIDS events: "
             f"{bids_task_labels}"
+        )
+
+    # -split_half is only implemented on the concatenation path (it needs the runs in one
+    # matrix to split them). Accepting it silently elsewhere made it look like the check
+    # had run and found nothing to report.
+    if getattr(args, "split_half", False) and not args.temp_concat:
+        raise ValueError(
+            "-split_half requires -temp_concat: it splits the input *runs* into two "
+            "disjoint halves, which the per-run path never forms. Re-run with "
+            "-temp_concat, or drop -split_half."
         )
 
     t_pipeline = time.time()
