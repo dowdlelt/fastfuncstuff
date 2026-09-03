@@ -179,9 +179,11 @@ READING THE OUTPUTS  (3D = one value/voxel, 4D = a time series)
   _taskr_pe1.nii.gz / _taskrms_pe1.nii.gz / _taskr_data.nii.gz +
   _locomoco_taskcoupling.txt   [-events]  IS THE FIELD READING BOLD AS MOTION?
       Every backend closes a brightness-constancy data term, so a strong block design
-      hands it an intensity change on the very edges it tracks. _taskr is the SIGNED
-      partial correlation between the field and each condition (conditions on the 4th
-      axis); _taskrms is the task-explained part in VOXELS. Both are DESCRIPTIVE -- a
+      hands it an intensity change on the very edges it tracks. _taskr leads with
+      full_model_R -- the multiple correlation of the WHOLE design, which is the "how
+      well does this fit the model" number -- then the field's SIGNED marginal
+      correlation with each condition (conditions on the 4th axis); _taskrms is the
+      task-explained part in VOXELS. Both are DESCRIPTIVE -- a
       few blocks is ~2 degrees of freedom, so no surrogate can make one voxel's r
       significant, and the report says so rather than pretending otherwise.
 
@@ -1334,15 +1336,26 @@ def create_parser() -> argparse.ArgumentParser:
         "explains (over a circular-shift null), and whether that lands on top of the "
         "BOLD response — which is what separates 'BOLD leaked into the estimate' from "
         "'the subject moved with the task'.\n"
-        "Writes, per encode axis, {prefix}_taskr_pe1/pe2 — the field's SIGNED partial "
-        "correlation, labelled and tagged fico so AFNI thresholds it — and _taskrms_*, "
-        "its task-explained part in voxels.\n"
+        "Every map leads with full_model_R: the multiple correlation of the WHOLE "
+        "design, which is what 'does this fit the model' means and the only statistic "
+        "here a multi-condition run does not cap. A per-condition MARGINAL r is fitted "
+        "against one regressor with the other K-1 responses left in the residual, so "
+        "it converges to corr(x_k, sum_j x_j) — on a measured 8-condition run a voxel "
+        "carrying a noiseless copy of the full task response reads 0.11..0.31 per "
+        "condition and 1.000 on the full model.\n"
+        "Writes, per encode axis, {prefix}_taskr_pe1/pe2 — full_model_R then the "
+        "field's SIGNED marginal correlation per condition, tagged fico so AFNI "
+        "thresholds it (marginal is right on this side: 'does the field follow THIS "
+        "regressor' is the contamination question) — and _taskrms_*, its "
+        "task-explained part in voxels.\n"
         "For the DATA it writes {prefix}_taskfit_data and, on the corrected series, "
-        "{prefix}_taskfit_data_after: one bucket each, sub-bricks alternating "
-        "{cond}_Coef (percent signal change) and {cond}_Correl, so you view the "
-        "amplitude and threshold on the sub-brick after it. Both are written whenever "
-        "-events is given, fix or no fix. Inspect the after fit to judge the impact of "
-        "contamination — changes in the amplitude of the response, or blurring.\n"
+        "{prefix}_taskfit_data_after: one bucket each, full_model_R then {cond}_Coef "
+        "(percent signal change) and {cond}_Correl alternating, so you view the "
+        "amplitude and threshold on the sub-brick after it. Those two come from ONE "
+        "JOINT fit over the whole design — betas and partial correlations you can read "
+        "the way you read 3dDeconvolve's. Both are written whenever -events is given, "
+        "fix or no fix. Inspect the after fit to judge the impact of contamination — "
+        "changes in the amplitude of the response, or blurring.\n"
         "The fico p is NOMINAL — no autocorrelation correction — so it is there to "
         "threshold and colour the maps, not to be reported.\n"
         "Diagnostic only: nothing about the correction changes.",
@@ -1559,7 +1572,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         metavar="R",
-        help="Absolute |r| cut on the DATA's task map that defines 'where the task is'. "
+        help="Absolute cut on the DATA's full-model R that defines 'where the task is'. "
         "The headline number is then how much of the FIELD's task-locked displacement "
         "falls inside that mask, against the share of voxels it occupies — 1.0x means "
         "the field's task coupling is spread like the brain and has nothing to do with "
@@ -1571,7 +1584,7 @@ def create_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         metavar="FRAC",
-        help="Fraction of voxels, ranked by the DATA's own task-R2, that count as "
+        help="Fraction of voxels, ranked by the DATA's own FULL-MODEL R, that count as "
         "'where the data responds' — the stratum the report headlines and the verdict "
         "is judged on. A whole-brain median is mostly non-responding tissue and buries "
         "a real effect confined to active cortex. Default 0.1.",
@@ -2156,7 +2169,7 @@ def _pe_axis_name(label: str, axis: int, args) -> str:
     return f"{label} ({kind}{dir_txt}, axis {axis} = {letter})"
 
 
-def _coupling_stataux(n_t: int, n_ort: int, n_sub: int) -> dict:
+def _coupling_stataux(n_t: int, n_ort: int, n_sub: int, n_fit: int = 1) -> dict:
     """AFNI ``fico`` parameters for a drift-partial correlation map, per sub-brick.
 
     SAMPLES = timepoints, FIT-PARAMETERS = 1 (the single regressor each sub-brick is
@@ -2182,7 +2195,7 @@ def _coupling_stataux(n_t: int, n_ort: int, n_sub: int) -> dict:
     """
     from fastfuncstuff.io.afni import stat_type_to_stataux
 
-    return {i: stat_type_to_stataux("fico", (n_t, 1, n_ort)) for i in range(n_sub)}
+    return {i: stat_type_to_stataux("fico", (n_t, n_fit, n_ort)) for i in range(n_sub)}
 
 
 def _save_map(path, arr, labels, affine, stataux=None):
@@ -2205,42 +2218,84 @@ def _save_map(path, arr, labels, affine, stataux=None):
         )
 
 
-def _save_task_map(path, arr, labels, affine, *, n_ort=None, n_t=0):
-    """A correlation-only map (the FIELD's coupling), every sub-brick tagged ``fico``."""
-    a = arr.float()
-    n_sub = 1 if (a.ndim == 3 or a.shape[-1] == 1) else a.shape[-1]
-    stataux = None if n_ort is None else _coupling_stataux(n_t, n_ort, n_sub)
-    _save_map(path, a, labels, affine, stataux)
+def _stack_bricks(path, bricks, affine):
+    """Write ``[(name, 3-D map, stataux|None), ...]`` as one bucket, in order."""
+    import torch
+
+    names = [b[0] for b in bricks]
+    stataux = {i: b[2] for i, b in enumerate(bricks) if b[2] is not None}
+    _save_map(path, torch.stack([b[1].float() for b in bricks], dim=-1), names, affine, stataux)
+
+
+def _full_model_brick(tc, n_ort, n_t):
+    """The lead sub-brick of every task map: R of the WHOLE design, tagged ``fico``.
+
+    "How well does this voxel fit the model" is the question a reader actually has, and
+    the per-condition correlations below it cannot answer it.  Each of those is
+    MARGINAL -- fitted against one regressor with the other K-1 responses left in the
+    residual -- so on a run with several conditions it is capped at
+    ``corr(x_k, sum_j x_j)`` no matter how strong the response is.  Measured on an
+    8-condition rapid event-related run, a voxel carrying a NOISELESS copy of the full
+    task response reads 0.11..0.31 per condition and 1.000 here.
+
+    ``nfit`` is the design's rank, so AFNI's ``correl_t2p`` gets the multiple-
+    correlation null with the right numerator dof rather than a simple-r one.
+    """
+    return (
+        "full_model_R",
+        tc.r_full,
+        _coupling_stataux(n_t, n_ort, 1, n_fit=tc.n_fit)[0],
+    )
+
+
+def _save_task_map(path, tc, labels, affine, *, n_ort=None, n_t=0):
+    """The FIELD's coupling: full-model R, then the per-condition MARGINAL r.
+
+    Marginal is deliberate on this side -- "does the field follow THIS regressor" is
+    the contamination question, and letting correlated conditions share credit is the
+    honest reading of it.  ``full_model_R`` leads because it is the one that answers
+    "does the field fit the model at all".
+    """
+    stat = _coupling_stataux(n_t, n_ort, 1)[0] if n_ort is not None else None
+    bricks = [] if n_ort is None else [_full_model_brick(tc, n_ort, n_t)]
+    bricks += [(lb, tc.r[..., k], stat) for k, lb in enumerate(labels)]
+    _stack_bricks(path, bricks, affine)
 
 
 def _save_task_fit(path, tc, psc, labels, affine, n_ort, n_t):
-    """One AFNI-style bucket per condition: amplitude, then the stat to threshold it on.
+    """The DATA's fit, as an AFNI bucket: full-model R, then amplitude/stat per condition.
 
-    Sub-bricks alternate ``{cond}_Coef`` (percent signal change) and ``{cond}_Correl``
-    (the signed partial correlation, tagged ``fico``), so AFNI's usual "view the beta,
-    threshold on the sub-brick after it" gesture works without opening two datasets and
-    keeping their indices lined up by hand.
+    ``full_model_R`` first, then ``{cond}_Coef`` (percent signal change) and
+    ``{cond}_Correl`` alternating, so AFNI's usual "view the beta, threshold on the
+    sub-brick after it" gesture works without opening two datasets and keeping their
+    indices lined up by hand.
+
+    Both per-condition halves come from the JOINT fit -- one multiple regression over
+    the whole design -- which is what makes them comparable to the betas and t-stats
+    of the GLM this run is headed for.  ``nort`` absorbs the other ``n_fit - 1``
+    regressors, so the partial correlation is tagged with the dof it actually has.
     """
-    import torch
-
-    bricks, names, stataux = [], [], {}
-    stat = _coupling_stataux(n_t, n_ort, 1)[0]
+    stat = _coupling_stataux(n_t, n_ort + tc.n_fit - 1, 1)[0]
+    bricks = [_full_model_brick(tc, n_ort, n_t)]
     for k, lb in enumerate(labels):
-        bricks += [psc[..., k].float(), tc.r[..., k].float()]
-        names += [f"{lb}_Coef", f"{lb}_Correl"]
-        stataux[2 * k + 1] = stat
-    _save_map(path, torch.stack(bricks, dim=-1), names, affine, stataux)
+        bricks += [(f"{lb}_Coef", psc[..., k], None), (f"{lb}_Correl", tc.r_joint[..., k], stat)]
+    _stack_bricks(path, bricks, affine)
 
 
 def _psc_betas(tc, design, reference, mask):
-    """Condition betas as PERCENT SIGNAL CHANGE of each voxel's own temporal mean.
+    """Joint condition betas as PERCENT SIGNAL CHANGE of each voxel's temporal mean.
 
-    ``tc.beta`` is map units per unit of regressor, so the response a condition actually
-    produces is ``beta × the regressor's peak-to-trough swing``; dividing by the voxel
-    mean and scaling by 100 puts every condition, voxel and dataset on the one axis a
-    reader can judge — a 2% response is a 2% response whatever the scanner's arbitrary
-    intensity units were. Nothing extra is fitted: the betas come out of the same solve
-    as ``r``, at no additional cost.
+    ``tc.beta_joint`` is map units per unit of regressor from ONE multiple regression
+    over the whole design, so the response a condition actually produces is
+    ``beta × the regressor's peak-to-trough swing``; dividing by the voxel mean and
+    scaling by 100 puts every condition, voxel and dataset on the one axis a reader can
+    judge — a 2% response is a 2% response whatever the scanner's arbitrary intensity
+    units were. Nothing extra is fitted: the joint betas come out of the same solve as
+    ``r``, at no additional cost.
+
+    The MARGINAL ``tc.beta`` is not used here. It answers a different question, and as
+    an amplitude it is simply wrong whenever conditions are correlated: each condition
+    is credited with whatever the others explain too.
     """
     import torch
 
@@ -2248,11 +2303,11 @@ def _psc_betas(tc, design, reference, mask):
     swing = (x.amax(dim=0) - x.amin(dim=0)).clamp(min=1e-12)
     base = reference.float().abs()
     ok = (mask > 0) & (base > 0)
-    out = torch.zeros(*tc.beta.shape[:3], tc.beta.shape[-1], dtype=torch.float32)
+    out = torch.zeros(*tc.beta_joint.shape[:3], tc.beta_joint.shape[-1], dtype=torch.float32)
     for k in range(out.shape[-1]):
         out[..., k] = torch.where(
             ok,
-            100.0 * tc.beta[..., k].float() * float(swing[k]) / base.clamp(min=1e-12),
+            100.0 * tc.beta_joint[..., k].float() * float(swing[k]) / base.clamp(min=1e-12),
             torch.zeros_like(base),
         )
     return out
@@ -2299,10 +2354,15 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     # The BOLD response itself, measured the same way — the reference the field's
     # coupling is compared AGAINST, and what defines "where the data responds".
     data_tc = task_coupling(series, design, **kwargs)
-    resp, quiet, cut = responding_mask(data_tc.r, mask, args.task_top_frac, thresh=args.task_thresh)
+    # r_full, not the per-condition r: "where does the data respond to the TASK" is a
+    # whole-model question, and the per-condition marginal r cannot answer it -- with
+    # K conditions in a run the other K-1 responses stay in the residual and cap it.
+    resp, quiet, cut = responding_mask(
+        data_tc.r_full, mask, args.task_top_frac, thresh=args.task_thresh
+    )
     how = "cut" if args.task_thresh is not None else f"top {args.task_top_frac * 100:.0f}%"
     print(
-        f"  Active mask: {int(resp.sum())} voxels with data |r| > {cut:.3f} ({how}) "
+        f"  Active mask: {int(resp.sum())} voxels with data R > {cut:.3f} ({how}) "
         f"= {100 * int(resp.sum()) / max(1, int((mask > 0).sum())):.1f}% of the brain"
     )
 
@@ -2310,7 +2370,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
     pending: list[tuple] = []
     for label, axis, field in result.pe_displacements():
         tc = task_coupling(field, design, **kwargs)
-        coloc = co_location(tc.r, data_tc.r, mask)
+        coloc = co_location(tc.r_full, data_tc.r_full, mask)
         r_sum, q_sum = tc.summarize(resp), tc.summarize(quiet)
         name = _pe_axis_name(label, axis, args)
         # The gradient must be along THIS axis: a partition-direction displacement
@@ -2319,7 +2379,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         conds = r_sum.get("conditions") or []
         if not conds:
             raise ValueError("no voxel in the active mask carries temporal variance in the field")
-        best_k = max(range(len(conds)), key=lambda k: conds[k]["abs_r_median"])
+        best_k = max(range(len(conds)), key=lambda k: conds[k]["abs_rj_median"])
         slope = contamination_slope(
             tc.beta, data_tc.beta, pe_gradient(reference, axis), resp, condition=best_k
         )
@@ -2334,6 +2394,7 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
                 label=name,
                 responding=r_sum,
                 quiet=q_sum,
+                data_responding=data_tc.summarize(resp),
                 top_frac=args.task_top_frac,
                 slope=slope,
                 enrichment=enrich,
@@ -2353,9 +2414,9 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         # into one block, and pe1 vs pe2 is the first thing a reader is looking for.
         print_cli_subsection(name)
         print(
-            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
-            f"{best['abs_r_p95']:.3f} p95 in the active mask ({best['label']}), "
-            f"kappa {slope['kappa']:+.3f}"
+            f"  {tail_txt}, full-model R {r_sum['r_full_median']:.3f} med, "
+            f"joint |r| {best['abs_rj_median']:.3f} med in the active mask "
+            f"({best['label']}), kappa {slope['kappa']:+.3f}"
         )
         # The verdict sentence, and only that. The full stratum table goes to the .txt:
         # it was echoed here in full for every axis, which buried the one line that
@@ -2366,15 +2427,17 @@ def _write_task_diagnostics(result, data, stem, ext, affine, args, tr):
         # Queued, not written here: the findings above are what a reader scans, and
         # interleaving file names between them is what made this block unreadable.
         pending += [
-            (f"{stem}_taskr_{label}{ext}", tc.r, labels, polort),
+            (f"{stem}_taskr_{label}{ext}", tc, labels, polort),
             (f"{stem}_taskrms_{label}{ext}", tc.task_rms, [f"{label} task rms (vox)"], None),
         ]
 
     Path(f"{stem}_locomoco_taskcoupling.txt").write_text(("\n" + "-" * 70 + "\n\n").join(report))
     print()
     for path, arr, brick_labels, stat_polort in pending:
-        n_ort = None if stat_polort is None else stat_polort + 1
-        _save_task_map(path, arr, brick_labels, affine, n_ort=n_ort, n_t=n_t)
+        if stat_polort is None:  # the rms map: map units, no stat to attach
+            _save_map(path, arr, brick_labels, affine)
+        else:
+            _save_task_map(path, arr, brick_labels, affine, n_ort=stat_polort + 1, n_t=n_t)
     # The data side: the task response as it stands BEFORE any correction, as one
     # bucket of alternating amplitude and stat. `r` says where the response is, the PSC
     # beta says how big it is, and the amplitude is the half that moves when a
@@ -2627,7 +2690,7 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
         summary = tc.summarize(resp)
         curve = enrichment_curve(tc, resp, mask)
         tail = curve[-1] if curve else None
-        best = max(summary["conditions"], key=lambda c: c["abs_r_median"])
+        best = max(summary["conditions"], key=lambda c: c["abs_rj_median"])
         tail_txt = (
             f"tail enrichment {tail['enrichment']:.2f}x of {tail['ceiling']:.0f}x"
             if tail
@@ -2635,10 +2698,10 @@ def _write_task_after(result, design, polort, resp, mask, stem, ext, affine, arg
         )
         print_cli_subsection(name)
         print(
-            f"  {tail_txt}, |r| {best['abs_r_median']:.3f} med / "
-            f"{best['abs_r_p95']:.3f} p95 in the active mask"
+            f"  {tail_txt}, full-model R {summary['r_full_median']:.3f} med, "
+            f"joint |r| {best['abs_rj_median']:.3f} med in the active mask"
         )
-        pending.append((f"{stem}_taskr_{label}_after{ext}", tc.r))
+        pending.append((f"{stem}_taskr_{label}_after{ext}", tc))
     print()
     n_t = int(np.asarray(design).shape[0])
     for path, arr in pending:

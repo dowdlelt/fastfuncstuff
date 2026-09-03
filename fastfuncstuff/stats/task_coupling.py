@@ -39,6 +39,29 @@ the result, and the first two are corrections of a first version that got them w
   the subject is moving with the task, and no intensity invariance will fix it.  That
   distinction decides which remedy applies, and neither map alone reveals it.
 
+* **A joint fit, and a full-model R, alongside the marginal one.**  A late correction,
+  and the one that made the maps readable.  Signed marginal ``r`` is right for the
+  contamination question above ("does the field follow THIS regressor?"), but it is
+  the wrong answer to "does this map fit the model", and silently so: with K
+  conditions in a run, the other K-1 responses stay in the residual and inflate
+  ``ss_tot``, so a voxel carrying a NOISELESS copy of the full task response still
+  converges to ``corr(x_k, sum_j x_j)`` per condition.  Measured on an 8-condition
+  rapid event-related run (350 frames, TR 0.67), that ceiling is 0.11..0.31 — a
+  property of the DESIGN, unreachable by any response amplitude, and it sent a real
+  subject's per-run maps to nothing while their 3-run GLM lit up.  ``r_full`` (the
+  multiple correlation of the whole design) reads 1.000 on that same voxel, and
+  ``r_joint``/``beta_joint`` come from one multiple regression, so they are the betas
+  and partial correlations a reader of ``3dDeconvolve`` output already knows how to
+  read.  All three come out of the same solve at no extra pass over voxels: ``X_d' y``
+  is already computed as ``dots * ||x_d||``, and the joint residual sum of squares is
+  already computed as ``ss_tot - ss_task``.
+
+  ``r_full`` is also what ranks voxels wherever this module asks "is this voxel
+  task-locked" — ``responding_mask``, ``enrichment_curve``, ``strongest``.  Ranking on
+  the largest single-condition marginal ``|r|`` selects on design geometry as much as
+  on response, and misses outright the voxel that responds a little to everything,
+  which is the one an ordinary GLM lights up hardest.
+
 The primitive takes any ``(nx, ny, nz, T)`` map, not just a locomoco field.
 """
 
@@ -114,12 +137,28 @@ def _unit_columns(mat: torch.Tensor) -> torch.Tensor:
     return mat / mat.norm(dim=0, keepdim=True).clamp(min=1e-30)
 
 
+def _strength(t: torch.Tensor) -> torch.Tensor:
+    """A 3-D non-negative "how task-locked is this voxel" map.
+
+    Pass ``r_full`` (already 3-D and non-negative) to rank voxels on the WHOLE model,
+    which is what every caller here wants: "does this voxel respond to the task", not
+    "to condition 3".  A 4-D per-condition ``r`` is reduced by max-|r| for the callers
+    that still hand one over, but that reduction carries the marginal ceiling with it
+    -- on an 8-condition run a perfectly responding voxel maxes out near 0.3.
+    """
+    return t if t.ndim == 3 else t.abs().amax(dim=-1)
+
+
 @dataclass
 class TaskCoupling:
     """Per-voxel task coupling of one 4-D map, plus its empirical null."""
 
-    r: torch.Tensor  # (nx,ny,nz,K) SIGNED partial correlation, one per condition
-    beta: torch.Tensor  # (nx,ny,nz,K) SIGNED slope, MAP UNITS per unit of regressor
+    r: torch.Tensor  # (nx,ny,nz,K) SIGNED MARGINAL correlation, one per condition
+    beta: torch.Tensor  # (nx,ny,nz,K) SIGNED marginal slope, MAP UNITS per regressor unit
+    r_joint: torch.Tensor  # (nx,ny,nz,K) SIGNED PARTIAL correlation from the joint fit
+    beta_joint: torch.Tensor  # (nx,ny,nz,K) joint (multiple-regression) slope, MAP UNITS
+    r_full: torch.Tensor  # (nx,ny,nz) multiple correlation R of the WHOLE design, [0,1]
+    n_fit: int  # rank of the detrended design -- the joint fit's FIT-PARAMETERS
     task_rms: torch.Tensor  # (nx,ny,nz) rms of the task-explained part, MAP UNITS
     total_rms: torch.Tensor  # (nx,ny,nz) rms of the detrended map, MAP UNITS
     valid: torch.Tensor  # (nx,ny,nz) voxels with real detrended variance
@@ -146,6 +185,7 @@ class TaskCoupling:
             return {"n_voxels": 0, "conditions": []}
         n_k = self.r.shape[-1]
         r = self.r.reshape(-1, n_k)[m]
+        rj = self.r_joint.reshape(-1, n_k)[m]
         # NOTE: no significance and no sign-agreement statistic. Neither is attainable
         # per voxel for a block design -- see the module docstring. These are
         # DESCRIPTIVE: they say what the map looks like where you are scrubbing it.
@@ -155,12 +195,19 @@ class TaskCoupling:
                 "r_median": float(r[:, k].median()),
                 "abs_r_median": float(r[:, k].abs().median()),
                 "abs_r_p95": _quantile(r[:, k].abs(), 0.95),
+                # The joint fit's partial correlation: the same quantity a GLM t-stat
+                # carries, and the one comparable to the betas alongside it.
+                "abs_rj_median": float(rj[:, k].abs().median()),
+                "abs_rj_p95": _quantile(rj[:, k].abs(), 0.95),
             }
             for k in range(n_k)
         ]
+        rf = self.r_full.reshape(-1)[m]
         return {
             "n_voxels": n,
             "conditions": conds,
+            "r_full_median": float(rf.median()),
+            "r_full_p95": _quantile(rf, 0.95),
             "task_rms_median": float(self.task_rms.reshape(-1)[m].median()),
             "total_rms_median": float(self.total_rms.reshape(-1)[m].median()),
         }
@@ -184,9 +231,14 @@ class TaskCoupling:
 
     @property
     def strongest(self) -> dict:
-        """The condition with the largest median |r| — what the verdict is judged on."""
+        """The condition the verdict is judged on: largest median |r| from the JOINT fit.
+
+        Marginal |r| is the wrong ranker even for picking a condition. It is capped at
+        ``corr(x_k, sum_j x_j)``, so on a design where one condition happens to overlap
+        the others more it wins on design geometry rather than on response.
+        """
         conds = self.summary.get("conditions") or [{}]
-        return max(conds, key=lambda c: c.get("abs_r_median", 0.0))
+        return max(conds, key=lambda c: c.get("abs_rj_median", c.get("abs_r_median", 0.0)))
 
 
 def task_coupling(
@@ -308,8 +360,42 @@ def task_coupling(
     r = torch.where(valid[:, None], dots / norm[:, None], zero[:, None])
     # dots are against UNIT columns, so beta = dot / ||x_detrended|| puts the slope in
     # map units per unit of regressor -- the quantity the contamination test needs.
-    x_norm = (x - q_n @ (q_n.T @ x)).norm(dim=0).clamp(min=1e-30)
+    x_d = x - q_n @ (q_n.T @ x)
+    x_norm = x_d.norm(dim=0).clamp(min=1e-30)
     beta = torch.where(valid[:, None], dots / x_norm[None, :], zero[:, None])
+
+    # ---- the JOINT fit, for free -----------------------------------------------
+    # The marginal statistics above answer "does the map follow THIS regressor",
+    # which is the contamination question.  They are the wrong answer to "does the
+    # map fit the model", and badly so whenever a run holds several conditions: the
+    # other K-1 responses stay in the residual, inflating ss_tot, so a voxel that is
+    # a NOISELESS copy of the full task response still tops out at corr(x_k, sum_j
+    # x_j) -- 0.11..0.31 on a measured 8-condition rapid event-related run, whatever
+    # the response amplitude.  That ceiling belongs to the design, not to the data.
+    #
+    # No extra pass over voxels is needed.  X_d' y IS `dots * ||x_d||`, and the joint
+    # residual sum of squares IS ss_tot - ss_task, because q_x spans exactly the
+    # column space the joint fit projects onto.
+    n_fit = int(q_x.shape[1])
+    dof_joint = max(1, n_t - q_n.shape[1] - n_fit)
+    g_inv = torch.linalg.pinv(x_d.T @ x_d)
+    beta_joint = (dots * x_norm[None, :]) @ g_inv.T
+    ss_res = (ss_tot - ss_task).clamp(min=0.0)
+    # Var(beta_k) = sigma^2 * (X'X)^-1_kk. Two different things make that zero and they
+    # want opposite answers: a pinv-dropped column (the design cannot separate the
+    # regressor, so beta is 0 too -> r = 0), and a residual-free voxel (a PERFECT fit,
+    # t = inf -> r = +-1). sign(beta) gives both, which is why the zero se is handled
+    # here rather than by masking the voxel out.
+    se = ((ss_res / dof_joint)[:, None] * torch.diagonal(g_inv).clamp(min=0.0)[None, :]).sqrt()
+    t_joint = beta_joint / se.clamp(min=1e-30)
+    r_joint = torch.where(
+        se > 0, t_joint / (t_joint * t_joint + dof_joint).sqrt(), beta_joint.sign()
+    )
+    r_joint = torch.where(valid[:, None], r_joint, zero[:, None])
+    beta_joint = torch.where(valid[:, None], beta_joint, zero[:, None])
+    # Multiple correlation of the WHOLE design: the "how well does the data fit the
+    # model" number, sign-free by construction and not subject to the ceiling above.
+    r_full = torch.where(valid, (ss_task / ss_tot.clamp(min=1e-30)).clamp(0.0, 1.0).sqrt(), zero)
 
     # Zero the rms maps wherever r was zeroed, so all maps agree about which voxels
     # carry no measurement (a 1e-17 rms in a viewer reads as a real number).
@@ -319,6 +405,10 @@ def task_coupling(
     tc = TaskCoupling(
         r=r.reshape(*spatial, n_k),
         beta=beta.reshape(*spatial, n_k),
+        r_joint=r_joint.reshape(*spatial, n_k),
+        beta_joint=beta_joint.reshape(*spatial, n_k),
+        r_full=r_full.reshape(spatial),
+        n_fit=n_fit,
         task_rms=task_rms.reshape(spatial),
         total_rms=total_rms.reshape(spatial),
         valid=valid.reshape(spatial),
@@ -407,10 +497,13 @@ def co_location(field_r: torch.Tensor, data_r: torch.Tensor, mask: torch.Tensor)
     Magnitudes, not signed values: the field's sign is a direction of displacement and
     the data's is a direction of signal change, so their signed product means nothing.
     Where the two land is the question.
+
+    Takes either a 3-D ``r_full`` (preferred -- the whole model, on both sides) or a
+    4-D per-condition ``r``, which is reduced by max-|r|.
     """
     m = mask.reshape(-1) > 0
-    a = field_r.abs().amax(dim=-1).reshape(-1)[m].double()
-    b = data_r.abs().amax(dim=-1).reshape(-1)[m].double()
+    a = _strength(field_r).reshape(-1)[m].double()
+    b = _strength(data_r).reshape(-1)[m].double()
     a = a - a.mean()
     b = b - b.mean()
     denom = a.norm() * b.norm()
@@ -1129,7 +1222,9 @@ def enrichment_curve(
     bad the tail is.
 
     Condition on the FIELD instead: take the voxels where the field is most
-    task-locked and ask what share of THEM sit on activated tissue.  Measured on a
+    task-locked -- by the FULL-model R, so a field following the whole design is not
+    ranked by whichever single condition happened to catch it -- and ask what share of
+    THEM sit on activated tissue.  Measured on a
     contaminated 0.8 mm checkerboard run, where the median-based verdict said
     "no appreciable coupling":
 
@@ -1148,7 +1243,7 @@ def enrichment_curve(
     """
     m = mask.reshape(-1) > 0
     a = (active.reshape(-1) > 0)[m]
-    strength = field.r.abs().amax(dim=-1).reshape(-1)[m]
+    strength = field.r_full.reshape(-1)[m]
     vox_share = float(a.double().mean())
     if vox_share <= 0:
         return []
@@ -1183,8 +1278,15 @@ def responding_mask(
 ):
     """The voxels where the DATA responds to the task, and their complement.
 
-    ``thresh`` cuts |r| at an absolute value; otherwise the top ``top_frac`` of voxels
-    by |r| are taken.  An absolute cut is the honest one when you know what counts as
+    Pass ``r_full``: "responds to the task" is a whole-model question, not a
+    per-condition one.  Ranking by the largest single-condition marginal |r| answers
+    "which voxels does one regressor happen to explain", and on a run with several
+    conditions the other K-1 responses sit in the residual and cap that statistic near
+    ``corr(x_k, sum_j x_j)`` however strong the response is -- so the mask it selects
+    is drawn from a map that cannot exceed ~0.3 in the best case.
+
+    ``thresh`` cuts the strength map at an absolute value; otherwise the top
+    ``top_frac`` of voxels are taken.  An absolute cut is the honest one when you know what counts as
     activated; the quantile is the fallback that always yields a non-empty mask.
 
     A whole-brain median answers the wrong question.  Most of an automask is tissue
@@ -1192,7 +1294,7 @@ def responding_mask(
     confined to responding cortex vanishes — which is how the first real run reported
     "nothing to fix" while the map showed r ~ 0.58 where the data fits.
     """
-    strength = data_r.abs().amax(dim=-1)
+    strength = _strength(data_r)
     m = mask > 0
     cut = float(thresh) if thresh is not None else _quantile(strength[m], 1.0 - top_frac)
     active = (strength > cut) & m
@@ -1214,6 +1316,7 @@ def format_task_coupling_report(
     label: str = "displacement field",
     responding: dict | None = None,
     quiet: dict | None = None,
+    data_responding: dict | None = None,
     top_frac: float = 0.1,
     slope: dict | None = None,
     enrichment: dict | None = None,
@@ -1235,7 +1338,7 @@ def format_task_coupling_report(
         f"{field.n_timepoints} frames, drift polort {field.polort}",
     ]
     if enrichment is not None:
-        thr = f" at |r|_data > {active_thresh:.3f}" if active_thresh is not None else ""
+        thr = f" at R_data > {active_thresh:.3f}" if active_thresh is not None else ""
         lines.append(
             f"  active mask : {enrichment['n_active']} vox "
             f"({enrichment['voxel_share'] * 100:.1f}% of brain){thr}"
@@ -1243,10 +1346,21 @@ def format_task_coupling_report(
 
     strata = [(f"active(top{top_frac * 100:.0f}%)", responding), ("quiet", quiet)]
     strata = [(n, s) for n, s in strata if s is not None] + [("whole mask", field.summary)]
+    # The whole-model fit first, on its own line per stratum. It is the number that
+    # answers "does this map fit the model", and it is the only one of the three that
+    # a multi-condition design does not cap -- see :func:`task_coupling`.
+    lines += ["", f"  {'stratum':<18}{'FULL-MODEL R':<14}{'med':>9}{'p95':>9}"]
+    for name, st in strata:
+        if st and st.get("n_voxels", 0):
+            lines.append(
+                f"  {name:<18}{'':<14}{st.get('r_full_median', 0):>9.3f}"
+                f"{st.get('r_full_p95', 0):>9.3f}   [{st['n_voxels']} vox]"
+            )
+
     lines += [
         "",
-        f"  {'stratum':<18}{'cond':<14}{'|r| med':>9}{'|r| p95':>9}"
-        f"{'task-expl':>11}  (chance {chance * 100:.0f}%)",
+        f"  {'stratum':<18}{'cond':<14}{'joint |r|':>10}{'(p95)':>8}"
+        f"{'marg |r|':>10}{'(p95)':>8}{'task-expl':>11}  (chance {chance * 100:.0f}%)",
     ]
     for name, st in strata:
         if not st or st.get("n_voxels", 0) == 0:
@@ -1256,8 +1370,9 @@ def format_task_coupling_report(
         for i, c in enumerate(st["conditions"]):
             lines.append(
                 f"  {name if i == 0 else '':<18}{c['label'][:13]:<14}"
-                f"{c['abs_r_median']:>9.3f}{c['abs_r_p95']:>9.3f}"
-                f"{share if i == 0 else '':>11}" + (f"  [{st['n_voxels']} vox]" if i == 0 else "")
+                f"{c.get('abs_rj_median', 0):>10.3f}{c.get('abs_rj_p95', 0):>8.3f}"
+                f"{c['abs_r_median']:>10.3f}{c['abs_r_p95']:>8.3f}"
+                f"{share if i == 0 else '':>11}"
             )
 
     if curve:
@@ -1283,10 +1398,19 @@ def format_task_coupling_report(
     if tail:
         lines += ["", "  " + "  ·  ".join(tail)]
     if data is not None:
-        dc = data.strongest
+        # The DATA's own active-mask summary, not the field's: this line says how well
+        # the data fits the model where it responds, which is the reference the field's
+        # coupling above is read against.
+        d = data_responding if data_responding and data_responding.get("n_voxels") else data.summary
+        d_best = max(
+            d.get("conditions") or [{}],
+            key=lambda c: c.get("abs_rj_median", c.get("abs_r_median", 0.0)),
+        )
+        scope = "on active" if d is data_responding else "whole mask"
         lines.append(
-            f"  data response: |r| med {dc.get('abs_r_median', 0):.3f} "
-            f"p95 {dc.get('abs_r_p95', 0):.3f}   ({units} rms for the field columns)"
+            f"  data response ({scope}): full-model R med {d.get('r_full_median', 0):.3f}, "
+            f"strongest condition ({d_best.get('label', '?')}) joint |r| med "
+            f"{d_best.get('abs_rj_median', 0):.3f}   ({units} rms for the field columns)"
         )
     if coloc is not None:
         lines += ["", "  " + _verdict(field, coloc, responding, slope, enrichment, curve)]
@@ -1331,7 +1455,7 @@ def _verdict(
     conds = st.get("conditions") or []
     if not conds:
         return "No conditions to judge."
-    best = max(conds, key=lambda c: c["abs_r_median"])
+    best = max(conds, key=lambda c: c.get("abs_rj_median", c["abs_r_median"]))
     where = "where the data responds" if responding else "in the mask"
     share, chance = _share(st), field.chance_share
     ratio = share / chance if chance > 0 else 0.0

@@ -1515,7 +1515,7 @@ def test_psc_betas_are_scale_free():
 
 
 def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
-    """AFNI bucket order: view sub-brick 2k, threshold on 2k+1."""
+    """AFNI bucket order: the whole-model R, then view sub-brick 2k, threshold on 2k+1."""
     from fastfuncstuff.cli.locomoco import _save_task_fit
     from fastfuncstuff.io.afni import read_brick_labels, read_brick_stataux
     from fastfuncstuff.stats.task_coupling import task_coupling
@@ -1535,12 +1535,23 @@ def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
     import nibabel as nib
 
     img = nib.load(out)
-    assert read_brick_labels(img) == ["faces_Coef", "faces_Correl", "houses_Coef", "houses_Correl"]
+    assert read_brick_labels(img) == [
+        "full_model_R",
+        "faces_Coef",
+        "faces_Correl",
+        "houses_Coef",
+        "houses_Correl",
+    ]
     aux = read_brick_stataux(img)
-    # Only the odd sub-bricks are statistics; the betas must stay untagged.
-    assert set(aux) == {1, 3}
-    for code, params in aux.values():
-        assert code == 2 and tuple(params) == (n_t, 1.0, 2.0)
+    # Sub-brick 0 is the whole-model R and the Coef bricks stay untagged, so the stats
+    # are 0 and every 2k+1 after it.
+    assert set(aux) == {0, 2, 4}
+    # nfit = the design rank for the omnibus, 1 for a single condition -- whose nort
+    # absorbs the other n_fit-1 regressors, because the joint fit spent dof on them.
+    assert aux[0][0] == 2 and tuple(aux[0][1]) == (n_t, 2.0, 2.0)
+    for i in (2, 4):
+        code, params = aux[i]
+        assert code == 2 and tuple(params) == (n_t, 1.0, 3.0)
 
 
 def test_component_variance_in_data_recovers_a_planted_share():
@@ -1714,3 +1725,124 @@ def test_task_coupling_nuisance_columns_are_partialled_out():
     # A nuisance column that IS the design leaves nothing for the task to explain.
     with pytest.raises(ValueError, match="collinear"):
         task_coupling(data, x, polort=1, mask=mask, nuisance=xd[:, None])
+
+
+# ── the joint fit ────────────────────────────────────────────────────────────
+
+
+def _multi_design(n_t: int, n_k: int = 5, seed: int = 3) -> torch.Tensor:
+    """Several jittered event-related conditions, the shape the marginal fit fails on."""
+    rng = np.random.default_rng(seed)
+    k = np.exp(-np.arange(0, 24) / 4.0)
+    k /= k.sum()
+    cols = []
+    onsets = rng.permutation(np.arange(4, n_t - 24))[: n_k * 8].reshape(n_k, 8)
+    for row in onsets:
+        stick = np.zeros(n_t)
+        stick[row] = 1.0
+        c = np.convolve(stick, k)[:n_t]
+        cols.append(c - c.mean())
+    return torch.tensor(np.stack(cols, axis=1))
+
+
+def test_joint_fit_matches_an_ordinary_least_squares_glm():
+    """beta_joint and r_joint ARE the GLM's betas and partial correlations.
+
+    The whole point of the joint path is that a reader used to 3dDeconvolve betas and
+    t-stats can read these the same way, so it is pinned against an explicit lstsq.
+    """
+    n_t, n_k = 200, 5
+    x = _multi_design(n_t, n_k)
+    f = _field(n_t, shape=(8, 8, 4), seed=11)
+    for k in range(n_k):
+        f += (0.4 + 0.1 * k) * x[:, k]
+    tc = task_coupling(f, x, polort=2)
+
+    y = f.reshape(-1, n_t).double()
+    pol = construct_polynomial_matrix(n_t, 2, torch.device("cpu"), dtype=torch.float64)
+    d = torch.cat([x, pol], dim=1)
+    b = torch.linalg.lstsq(d, y.T).solution
+    dof = n_t - d.shape[1]
+    s2 = ((y.T - d @ b) ** 2).sum(dim=0) / dof
+    gi = torch.linalg.pinv(d.T @ d)
+    t = torch.stack([b[k] / (s2 * gi[k, k]).sqrt() for k in range(n_k)], dim=1)
+
+    assert tc.n_fit == n_k
+    assert torch.allclose(tc.beta_joint.reshape(-1, n_k), b[:n_k].T, atol=1e-9)
+    assert torch.allclose(tc.r_joint.reshape(-1, n_k), t / (t * t + dof).sqrt(), atol=1e-9)
+
+
+def test_marginal_r_is_capped_by_the_design_but_the_full_model_r_is_not():
+    """A NOISELESS copy of the full task response still reads low per condition.
+
+    This is the bug that sent a real 8-condition run's stage03 maps to nothing while
+    its 3-run GLM lit up: each marginal r converges to corr(x_k, sum_j x_j), which is a
+    property of the DESIGN, so no amount of response can lift it.
+    """
+    n_t, n_k = 200, 5
+    x = _multi_design(n_t, n_k)
+    perfect = x.sum(dim=1)
+    f = (perfect[None, None, None, :] + 100.0).repeat(4, 4, 2, 1).clone()
+    tc = task_coupling(f, x, polort=2)
+
+    # The ceiling is corr(x_k, sum_j x_j) measured the way the fit sees them: after the
+    # same polort-2 projection, since that is what tc.r is a partial correlation to.
+    q = torch.linalg.qr(
+        construct_polynomial_matrix(n_t, 2, torch.device("cpu"), dtype=torch.float64)
+    )[0]
+    xd = x - q @ (q.T @ x)
+    pd = perfect - q @ (q.T @ perfect)
+    ceiling = torch.tensor(
+        [float(torch.corrcoef(torch.stack([xd[:, k], pd]))[0, 1]) for k in range(n_k)],
+        dtype=torch.float64,
+    )
+    assert float(ceiling.max()) < 0.75  # the design's own limit, not the data's
+    assert torch.allclose(tc.r[0, 0, 0].abs(), ceiling.abs(), atol=0.02)
+    assert float(tc.r_full[0, 0, 0]) == pytest.approx(1.0, abs=1e-6)
+    assert float(tc.r_joint[0, 0, 0].abs().min()) > 0.99
+
+
+def test_full_model_r_is_the_multiple_correlation_and_stays_bounded():
+    n_t, n_k = 160, 4
+    x = _multi_design(n_t, n_k)
+    f = _field(n_t, shape=(6, 6, 4), seed=5) + 0.5 * x.sum(dim=1)
+    tc = task_coupling(f, x, polort=2)
+    r_full = tc.r_full.reshape(-1)
+    assert float(r_full.min()) >= 0.0 and float(r_full.max()) <= 1.0
+    # R of the whole design is never below the best single-condition |r| it contains.
+    assert bool((r_full + 1e-9 >= tc.r.abs().amax(dim=-1).reshape(-1)).all())
+    assert float(r_full.median()) > 0.4
+
+
+def test_responding_mask_ranks_on_the_whole_model_not_one_condition():
+    """A voxel responding a little to EVERY condition is what the active mask must find.
+
+    Ranking on the largest single-condition |r| is what stage03 used to do, and it
+    misses exactly this voxel — the one an ordinary GLM lights up hardest.
+    """
+    n_t, n_k = 200, 8
+    x = _multi_design(n_t, n_k)
+    shape = (10, 10, 4)
+    f = _field(n_t, shape=shape, seed=2)
+    f[:1] += 0.30 * x.sum(dim=1)  # responds to all of them, to none of them strongly
+    mask = torch.ones(shape, dtype=torch.bool)
+    tc = task_coupling(f, x, polort=2, mask=mask)
+
+    def hit(active):
+        return float(active[:1].double().mean())
+
+    by_full, _, _ = responding_mask(tc.r_full, mask, 0.1)
+    by_marginal, _, _ = responding_mask(tc.r, mask, 0.1)
+    assert hit(by_full) > 0.9
+    assert hit(by_full) - hit(by_marginal) > 0.1
+
+
+def test_constant_voxels_score_zero_in_the_joint_fit_too():
+    n_t, n_k = 120, 4
+    x = _multi_design(n_t, n_k)
+    f = _field(n_t, task=x[:, :1], amp=0.3)
+    f[1, 0, 0] = 7.0  # constant, non-zero
+    tc = task_coupling(f, x, polort=2)
+    assert float(tc.r_joint[1, 0, 0].abs().max()) == 0.0
+    assert float(tc.beta_joint[1, 0, 0].abs().max()) == 0.0
+    assert float(tc.r_full[1, 0, 0]) == 0.0
