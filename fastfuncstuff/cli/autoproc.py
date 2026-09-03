@@ -248,6 +248,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="residual PE-axis nonlinear motion",
     )
+    g.add_argument(
+        "-locomoco_detask",
+        "-locomoco-detask",
+        nargs="?",
+        const="field",
+        default=None,
+        metavar="MODE",
+        help="ffs_locomoco -detask MODE (field | filter[:N] | fit[:D] | ica[:N]).\n"
+        "Off by default. The stage already emits the task-coupling REPORT whenever\n"
+        "events resolve; this ACTS on it, so read that report first — see\n"
+        "`ffs_locomoco -help` for which mode suits your design.",
+    )
 
     g = p.add_argument_group("cross-run / fmap / session alignment")
     g.add_argument(
@@ -1039,6 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
         locomoco=eff(args.locomoco, "locomoco"),
+        locomoco_detask=args.locomoco_detask,
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
         xses_nonlin=eff(args.xses_nonlin, "xses_nonlin"),

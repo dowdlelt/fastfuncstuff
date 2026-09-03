@@ -86,6 +86,10 @@ class Options:
     spec_event_cols: tuple[str, str, str] | None = None
     sep_spec_event_cols: dict[str, tuple[str, str, str]] = field(default_factory=dict)
     locomoco: bool = False
+    # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
+    # CHANGES the field the correction applies, where the -events diagnostic the
+    # locomoco stage always emits only measures the contamination. Read that first.
+    locomoco_detask: str | None = None
     xrun_nonlin: bool = False
     xfmap_nonlin: bool = False
     xses_nonlin: bool = False

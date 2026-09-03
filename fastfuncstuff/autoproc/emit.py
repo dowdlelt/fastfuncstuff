@@ -1155,7 +1155,7 @@ skip_final={_skip_default(opt)} skip_stats=1{phase_skip}
 """
 
 
-def _data_arrays(plan: Plan) -> str:
+def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
     lines = [
         "",
         "# ============================ per-run data table ============================",
@@ -1168,7 +1168,7 @@ def _data_arrays(plan: Plan) -> str:
     # lane's image is on the run's own geometry, so they share one target grid.
     moco_arrays = " ".join(f"MOCO_{ln.upper()}" for ln in _lanes(plan) if ln != LANE_SBREF)
     lines.append(
-        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN XRUNBASE "
+        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN XRUNBASE EVENTS "
         f"{moco_arrays} PRECHAIN REFGRID JAC"
     )
 
@@ -1194,6 +1194,12 @@ def _data_arrays(plan: Plan) -> str:
         # Filename coordinate fragment — the stage loops build run filenames as
         # stageNN.label.${FRAG[$k]}, matching every reference in the data table.
         lines.append(f"FRAG[{q(k)}]={q(_frag(pr))}")
+        # Only locomoco reads this: its task-coupling report is per run, and a run
+        # whose events did not resolve simply goes unscored rather than failing.
+        if plan.options.locomoco:
+            ev = _events_script_path(plan, pr, bids_root)
+            if ev:
+                lines.append(f"EVENTS[{q(k)}]={q(ev)}")
         # These values contain the bash var $FMT and must expand at assignment,
         # so they are double-quoted (not shlex-quoted). The key and the values
         # are our own constructed names — no shell metacharacters beyond $FMT.
@@ -1277,6 +1283,15 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         # resolved are checked (a task with no events warns at generation time).
         | set(_all_events(plan, bids_root))
         | set(_spec_files(plan, bids_root))
+        # locomoco's task-coupling report reads events too, and with -no_glm those
+        # are BIDS originals nothing else in this list covers.
+        | {
+            ev
+            for pr in plan.runs
+            if plan.options.locomoco
+            for ev in [_events_script_path(plan, pr, bids_root)]
+            if ev
+        }
     )
     checks = " \\\n".join(f"  {shlex.quote(p)}" for p in inputs)
     # romeo (MRItools) is an external dependency, only needed with -phase_proc.
@@ -1474,11 +1489,20 @@ ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
 def _stage_locomoco(plan: Plan, script_stem: str) -> str:
     if not plan.options.locomoco:
         return ""
+    detask = plan.options.locomoco_detask
     parts = [
         '-input "stage02.moco.${FRAG[$k]}.nii$FMT"',
         '-prefix "${nlstem}.nii$FMT"',
         '-pe_dir "${pe:-y}"',
         *_split_flags(config.DEFAULT_OPTS["locomoco"]),
+        # Diagnostic only: it measures how much of the estimated field the task
+        # explains, which is exactly the failure mode a brightness-constancy data
+        # term has on a block design. -tr rides along because a 3D acquisition's
+        # header pixdim[4] is the per-partition time, not the volume TR the design
+        # is sampled at, and the design is what this fit is against.
+        '${ev:+-events "${ev}"}',
+        '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}',
+        *([f"-detask {detask}"] if detask else []),
         "-warp_format 5d",
         "-save_mean",
         "-save_max",
@@ -1495,11 +1519,17 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
 # the lane reductions, so a working directory from before the coverage lanes
 # existed re-runs and produces them instead of resuming into a stage07 that
 # cannot find its inputs.
+#
+# -events (per run, the same TSV the GLM models) turns on the task-coupling
+# report: _locomoco_taskcoupling.txt plus the taskr/taskrms maps. It is a
+# DIAGNOSTIC -- nothing about the correction changes -- and it is what to read
+# before reaching for -locomoco_detask.
 echo '== stage03: locomoco =='
 lmbatch="{script_stem}_locomocobatch.txt"; : > "$lmbatch"
 for k in "${{RUN_KEYS[@]}}"; do
   nlstem="stage03.nlmoco.${{FRAG[$k]}}"
   pe="${{PEDIR[$k]}}"; pe="${{pe//[!a-zA-Z]/}}"
+  ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
 {_manifest_line("lmbatch", parts)}
 done
 {_batch_launch("ffs_locomoco", "lmbatch", "skip_locomoco")}
@@ -2839,6 +2869,38 @@ def events_for_task(task: str, prs: list[PlanRun], bids_root: str | None, opt=No
     return found
 
 
+def events_for_run(pr: PlanRun, bids_root: str | None, opt=None) -> str | None:
+    """The events TSV for ONE run, or None — what a per-run tool needs.
+
+    :func:`events_for_task` collapses a task's files into a set for ffs_reml to
+    broadcast; ffs_locomoco's task-coupling diagnostic runs on a single series and
+    needs the file for THAT run. An explicit ``-events`` is honoured only when it is
+    one shared file: a longer list pairs with ``-input`` by position, and the per-run
+    loop has already taken that pairing apart.
+    """
+    if opt is not None and opt.events:
+        return str(opt.events[0]) if len(opt.events) == 1 else None
+    ev = find_events(pr.bold.mag_path, bids_root)
+    return str(ev) if ev is not None else None
+
+
+def _events_script_path(plan: Plan, pr: PlanRun, bids_root: str | None) -> str | None:
+    """:func:`events_for_run`, as the generated script should spell it.
+
+    Prefers the ``stimuli/`` copy when the GLM stage is writing one, so the timing a
+    diagnostic was computed against travels with the results directory and matches the
+    file the design TOML names. Falls back to the BIDS original when there is no GLM.
+    """
+    from fastfuncstuff.autoproc.glm import stimuli_map
+
+    src = events_for_run(pr, bids_root, plan.options)
+    if src is None:
+        return None
+    if plan.options.run_glm:
+        return stimuli_map(plan, bids_root).get(src, src)
+    return src
+
+
 def _events_args(task: str, prs: list[PlanRun], bids_root: str | None, opt=None) -> str:
     """The ``-events`` argument string, or a placeholder glob when nothing was
     found — the generator warns in that case, and the script carries a TODO."""
@@ -2873,7 +2935,7 @@ def write_script(
     is written into the header, commented out."""
     parts = [
         _header(plan, out_dir, invocation),
-        _data_arrays(plan),
+        _data_arrays(plan, bids_root),
         _preflight(plan, bids_root),
         _qc_helper(plan, script_stem),
         _stage_nordic(plan),

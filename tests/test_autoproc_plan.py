@@ -1799,3 +1799,83 @@ def test_warpmaster_anchor_carries_the_nonlinear_anat_link():
     lin = write_script(build_plan(subj, Options(go_to_anat=True)), "wd", bids_root="/bids")
     assert "_al_anat_nl" not in lin
     assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_anat.nii$FMT}"' in lin
+
+
+def _bids_run(root: Path, session, task, run, *, events=True, tr=2.0):
+    """A BoldRun whose paths exist on disk, so BIDS events inheritance can resolve."""
+    func = root / f"sub-X/ses-{session}/func"
+    func.mkdir(parents=True, exist_ok=True)
+    stem = f"sub-X_ses-{session}_task-{task}_run-{run}"
+    mag = func / f"{stem}_bold.nii.gz"
+    mag.touch()
+    if events:
+        (func / f"{stem}_events.tsv").write_text("onset\tduration\ttrial_type\n0\t10\ta\n")
+    return BoldRun(
+        subject="X",
+        session=session,
+        task=task,
+        run=run,
+        mag_path=mag,
+        json={"RepetitionTime": tr, "PhaseEncodingDirection": "j-"},
+    )
+
+
+def _locomoco_manifest(script: str) -> str:
+    """The printf line stage03 appends to its batch manifest."""
+    for line in script.splitlines():
+        if '>> "$lmbatch"' in line:
+            return line
+    raise AssertionError("no locomoco manifest line in the script")
+
+
+def test_locomoco_gets_the_run_events_for_the_task_coupling_report(tmp_path):
+    """The task-coupling diagnostic is the thing that says whether the field is
+    reading BOLD as motion, and it only runs with -events. Per RUN, not per task."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(subj, Options(locomoco=True))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+
+    # The stimuli/ copy, not the BIDS original: it is what the design TOML names.
+    assert "EVENTS[01:foo:1]=stimuli/sub-X_ses-01_task-foo_run-1_events.tsv" in s
+    line = _locomoco_manifest(s)
+    assert '${ev:+-events \\"${ev}\\"}' in line
+    assert '${ev:+${TR[$k]:+-tr \\"${TR[$k]}\\"}}' in line
+    assert 'ev="${EVENTS[$k]:-}"' in s
+
+
+def test_locomoco_events_fall_back_to_the_bids_original_without_a_glm(tmp_path):
+    """No GLM means no stimuli/ copy is written, so the script has to name the source."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(subj, Options(locomoco=True, run_glm=False))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    src = tmp_path / "sub-X/ses-01/func/sub-X_ses-01_task-foo_run-1_events.tsv"
+    assert f"EVENTS[01:foo:1]={src}" in s
+    assert str(src) in s.split("stage: preflight")[1]  # and preflight checks it
+
+
+def test_a_run_without_events_simply_goes_unscored(tmp_path):
+    """An unset EVENTS key must not trip `set -u`, and the run still gets corrected."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "rest", "1", events=False)])])
+    s = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root=str(tmp_path))
+    assert "EVENTS[01:rest:1]" not in s
+    assert 'ev="${EVENTS[$k]:-}"' in s
+
+
+def test_locomoco_events_are_not_emitted_without_locomoco(tmp_path):
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options(locomoco=False)), "wd", bids_root=str(tmp_path))
+    assert "EVENTS[01:foo:1]" not in s
+
+
+def test_detask_is_opt_in(tmp_path):
+    """-detask CHANGES the field the correction applies; the report does not."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plain = write_script(build_plan(subj, Options(locomoco=True)), "wd", bids_root=str(tmp_path))
+    assert "-detask" not in _locomoco_manifest(plain)
+
+    on = write_script(
+        build_plan(subj, Options(locomoco=True, locomoco_detask="filter:2")),
+        "wd",
+        bids_root=str(tmp_path),
+    )
+    assert "-detask filter:2" in _locomoco_manifest(on)
