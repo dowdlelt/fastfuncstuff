@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -84,6 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("-task", nargs="+", help="restrict to these tasks")
     g.add_argument("-out", help="output script path (default: proc_sub-<id>.sh)")
     g.add_argument("-work_dir", "-work-dir", help="working dir baked into the script (OUT)")
+    g.add_argument(
+        "-exec",
+        action="store_true",
+        help="run the generated script immediately after writing it: "
+        "bash OUT 2>&1 | tee OUT.log (both streamed live and saved). "
+        "Exits with the script's own status.",
+    )
 
     g = p.add_argument_group("recipe (preset defaults; see list below --help)")
     g.add_argument(
@@ -1141,8 +1149,21 @@ def main(argv: list[str] | None = None) -> int:
     n_stim = len(list((Path(work_dir) / STIMULI_DIR).glob("*.tsv")))
     if n_stim:
         print(f"  {n_stim} events TSV(s) copied to {STIMULI_DIR}/ (what the specs name)")
-    print("  read it, edit it, then run it.")
-    return 0
+    log_path = out_path.with_suffix(".log")
+    run_cmd = f"bash {shlex.quote(str(out_path))} 2>&1 | tee {shlex.quote(str(log_path))}"
+    if not args.exec:
+        print("  read it, edit it, then run it:")
+        print(f"    {run_cmd}")
+        return 0
+
+    print(f"  running: {run_cmd}")
+    # bash -c, not the fish/whatever login shell: the pipe and pipefail are bash
+    # syntax, and this is the exact command just printed above -- a user who
+    # copy-pastes it gets identical behaviour, log included, regardless of shell.
+    proc = subprocess.run(
+        ["bash", "-c", f"set -o pipefail; {run_cmd}"],
+    )
+    return proc.returncode
 
 
 if __name__ == "__main__":

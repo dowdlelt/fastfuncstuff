@@ -6,6 +6,7 @@ stage09 point at nothing."""
 
 from __future__ import annotations
 
+import shlex
 from pathlib import Path
 
 import pytest
@@ -251,3 +252,92 @@ def test_device_flag_is_validated_and_reaches_options():
     for bad in ("gpu", "cuda,x"):
         with pytest.raises(SystemExit):
             p.parse_args(["-bids_dir", "/bids", "-subject", "X", "-device", bad])
+
+
+def _minimal_bids(tmp_path):
+    """One-run BIDS tree with no anat -- enough for `main()` to write a script
+    (bare_bones recipe, EPI space) without hitting anatomical preflight."""
+    func = tmp_path / "sub-Y/ses-01/func"
+    func.mkdir(parents=True)
+    mag = func / "sub-Y_ses-01_task-foo_run-1_bold.nii.gz"
+    mag.write_bytes(b"")
+    mag.with_suffix("").with_suffix(".json").write_text(
+        '{"RepetitionTime": 2.0, "PhaseEncodingDirection": "j-"}'
+    )
+    return tmp_path
+
+
+def test_main_prints_the_tee_command_without_exec(tmp_path, monkeypatch, capsys):
+    """The generated script's run command is always printed, unprompted, as the
+    last thing ffs_autoproc says -- so it's on screen right when it's needed."""
+    from fastfuncstuff.cli.autoproc import main
+
+    bids = _minimal_bids(tmp_path)
+    out = tmp_path / "proc.sh"
+    monkeypatch.chdir(tmp_path)
+    rc = main(
+        [
+            "-bids_dir",
+            str(bids),
+            "-subject",
+            "Y",
+            "-recipe",
+            "bare_bones",
+            "-no_anat",
+            "-out",
+            str(out),
+            "-work_dir",
+            str(tmp_path / "work"),
+        ]
+    )
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[-2] == "  read it, edit it, then run it:"
+    assert lines[-1].strip() == f"bash {out} 2>&1 | tee {out.with_suffix('.log')}"
+
+
+def test_main_exec_runs_the_script_and_returns_its_status(tmp_path, monkeypatch, capsys):
+    """-exec shells out to `bash OUT 2>&1 | tee OUT.log` (pipefail, so the
+    script's own exit status survives the pipe) and returns that status."""
+    from fastfuncstuff.cli.autoproc import main
+
+    bids = _minimal_bids(tmp_path)
+    out = tmp_path / "proc.sh"
+    monkeypatch.chdir(tmp_path)
+
+    calls = []
+
+    class _FakeCompleted:
+        returncode = 3
+
+    def _fake_run(cmd, **kw):
+        calls.append(cmd)
+        return _FakeCompleted()
+
+    monkeypatch.setattr("fastfuncstuff.cli.autoproc.subprocess.run", _fake_run)
+
+    rc = main(
+        [
+            "-bids_dir",
+            str(bids),
+            "-subject",
+            "Y",
+            "-recipe",
+            "bare_bones",
+            "-no_anat",
+            "-out",
+            str(out),
+            "-work_dir",
+            str(tmp_path / "work"),
+            "-exec",
+        ]
+    )
+    assert rc == 3
+    assert len(calls) == 1
+    cmd = calls[0]
+    assert cmd[0] == "bash" and cmd[1] == "-c"
+    assert "set -o pipefail" in cmd[2]
+    assert f"bash {shlex.quote(str(out))}" in cmd[2]
+    assert f"tee {shlex.quote(str(out.with_suffix('.log')))}" in cmd[2]
+    out_lines = capsys.readouterr().out.splitlines()
+    assert out_lines[-1].startswith("  running: bash ")
