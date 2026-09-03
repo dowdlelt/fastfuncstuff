@@ -939,3 +939,229 @@ def test_rescue_is_all_pairs_not_anchored():
     echoes2, _ = _make_me_echoes([1.0, 4.0, 4.0], seed=12)
     res2 = _llr_denoise_multiecho(echoes2, rescue=True, **kw)
     assert float(res2[0][1].rescued_map.mean()) > 0.0, "buried first echo not rescued"
+
+
+# ---------------------------------------------------------------------------
+# Task-leak diagnostic (-events)
+# ---------------------------------------------------------------------------
+
+
+def test_task_loss_is_the_signed_magnitude_difference(tmp_path):
+    """_taskloss == |input| - |denoised|, sign kept, exactly.
+
+    The whole point of the series is that it is the magnitude a downstream GLM
+    loses. |residual| — the modulus of the removed complex field — is a different,
+    half-rectified quantity, and reading one for the other is the bug this pins.
+    """
+    rng = np.random.RandomState(7)
+    magn = np.abs(rng.normal(loc=100.0, scale=10.0, size=(12, 10, 6, 24))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+
+    cfg = NordicConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        kernel_size_pca=(3, 3, 3),
+        kernel_size_gfactor=(3, 3, 1),
+        gfactor_nvols=8,
+        patch_overlap=2,
+        gfactor_patch_overlap=2,
+        save_task_loss=True,
+        save_residual_map=True,
+        verbose=False,
+    )
+    out = run_nordic(str(magn_file), None, str(tmp_path / "NORDIC_loss"), cfg)
+
+    assert out.task_loss_file is not None and out.task_loss_file.exists()
+    loss = nib.load(out.task_loss_file).get_fdata(dtype=np.float32)
+    kept = nib.load(out.magnitude_file).get_fdata(dtype=np.float32)
+    assert loss.shape == magn.shape
+    # Magnitude-only input: |input| is the input itself, up to the round trip.
+    np.testing.assert_allclose(kept + loss, magn, rtol=0, atol=2e-3)
+    # Signed, unlike the residual map alongside it.
+    assert loss.min() < 0 < loss.max()
+    resid = nib.load(out.residual_file).get_fdata(dtype=np.float32)
+    assert (resid >= 0).all()
+
+    with open(out.metadata_file) as f:
+        assert json.load(f)["outputs"]["task_loss"] is not None
+
+
+def test_task_loss_not_written_unless_asked(tmp_path):
+    """A plain run writes neither the loss series nor a residual it did not ask for."""
+    rng = np.random.RandomState(8)
+    magn = np.abs(rng.normal(size=(10, 10, 4, 16))).astype(np.float32)
+    magn_file = tmp_path / "magn.nii.gz"
+    _write_nifti(magn_file, magn)
+    cfg = NordicConfig(
+        temporal_phase=0,
+        magnitude_only=True,
+        kernel_size_pca=(3, 3, 3),
+        kernel_size_gfactor=(3, 3, 1),
+        gfactor_nvols=8,
+        verbose=False,
+    )
+    out = run_nordic(str(magn_file), None, str(tmp_path / "NORDIC_plain"), cfg)
+    assert out.task_loss_file is None
+    assert out.residual_file is None
+    assert not (tmp_path / "NORDIC_plain_taskloss.nii.gz").exists()
+
+
+def _write_events(path: Path, onsets, duration=12.0, label="task"):
+    lines = ["onset\tduration\ttrial_type"]
+    lines += [f"{o}\t{duration}\t{label}" for o in onsets]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _planted_task_run(tmp_path, seed=3, tr=1.0, nt=120, amp=0.0):
+    """A block-design run with the response confined to one slab of voxels.
+
+    The planted response is HRF-smoothed, not a raw boxcar: the design the diagnostic
+    builds is convolved, and scoring a square wave against it costs enough of the fit
+    to blur the very contrast these tests are checking.
+    """
+    rng = np.random.RandomState(seed)
+    nx, ny, nz = 20, 16, 8
+    box = np.zeros(nt, dtype=np.float32)
+    onsets = list(range(12, nt - 12, 24))
+    for o in onsets:
+        box[int(o / tr) : int((o + 12) / tr)] = 1.0
+    hrf = np.exp(-((np.arange(30) - 6.0) ** 2) / 18.0)
+    box = np.convolve(box, hrf / hrf.sum())[:nt].astype(np.float32)
+    active = np.zeros((nx, ny, nz), dtype=np.float32)
+    active[5:10, 5:10, 2:6] = 1.0
+    magn = np.abs(rng.normal(loc=100.0, scale=8.0, size=(nx, ny, nz, nt))).astype(np.float32)
+    magn += amp * active[..., None] * box[None, None, None, :]
+    magn_file = tmp_path / "magn.nii.gz"
+    img = nib.Nifti1Image(magn, np.eye(4))
+    img.header["pixdim"][4] = tr
+    nib.save(img, magn_file)
+    ev = tmp_path / "events.tsv"
+    _write_events(ev, onsets)
+    return magn_file, ev
+
+
+def test_events_writes_the_task_leak_report(tmp_path):
+    """-events runs end to end and writes both fits plus the report."""
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, ev = _planted_task_run(tmp_path, amp=20.0)
+    prefix = tmp_path / "NORD"
+    main(
+        [
+            "-input-magn",
+            str(magn_file),
+            "-prefix",
+            str(prefix),
+            "-magnitude-only",
+            "-kernel-size-pca",
+            "3",
+            "3",
+            "3",
+            "-kernel-size-gfactor",
+            "3",
+            "3",
+            "1",
+            "-gfactor-nvols",
+            "8",
+            "-events",
+            str(ev),
+            "-device",
+            "cpu",
+        ]
+    )
+    for suffix in ("_taskloss.nii.gz", "_taskfit_kept.nii.gz", "_taskfit_lost.nii.gz"):
+        assert (tmp_path / f"NORD{suffix}").exists(), suffix
+    report = (tmp_path / "NORD_taskleak.txt").read_text()
+    assert "ENRICHMENT" in report
+    # The kept fit leads with full_model_R, then Coef/Correl per condition.
+    fit = nib.load(tmp_path / "NORD_taskfit_kept.nii.gz")
+    assert fit.shape[3] == 3
+
+
+def test_task_leak_enrichment_is_flat_when_nothing_was_planted(tmp_path):
+    """With no task in the data, what NORDIC removes is spread like the brain.
+
+    The calibration the whole diagnostic rests on: enrichment's no-relation value is
+    1.0 by construction, so a pure-noise run must not manufacture a leak. Without
+    this the headline number has no zero point.
+    """
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, ev = _planted_task_run(tmp_path, seed=11, amp=0.0)
+    prefix = tmp_path / "NULL"
+    main(
+        [
+            "-input-magn",
+            str(magn_file),
+            "-prefix",
+            str(prefix),
+            "-magnitude-only",
+            "-kernel-size-pca",
+            "3",
+            "3",
+            "3",
+            "-kernel-size-gfactor",
+            "3",
+            "3",
+            "1",
+            "-gfactor-nvols",
+            "8",
+            "-events",
+            str(ev),
+            "-device",
+            "cpu",
+        ]
+    )
+    # The floor has to be real: a whole-run mask reads ~3.9x here, which is the entire
+    # reason the enrichment is measured across a split of the run.
+    assert 0.7 < _enrichment(tmp_path / "NULL_taskleak.txt") < 1.3
+
+
+def _enrichment(report_path: Path) -> float:
+    line = next(ln for ln in report_path.read_text().splitlines() if "mask from one half" in ln)
+    return float(line.strip().split("x")[0])
+
+
+def test_task_leak_enrichment_rises_when_denoising_over_removes(tmp_path):
+    """The positive control: crank the threshold until NORDIC has to eat the response.
+
+    A diagnostic that cannot detect the thing it exists for is worse than none.
+    -factor-error scales the threshold, so at a large enough factor every patch loses
+    its signal components too, and the lost series' task energy must concentrate where
+    the response was planted.
+    """
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, ev = _planted_task_run(tmp_path, seed=5, amp=25.0)
+    for tag, factor in (("BASE", "1.0"), ("OVER", "4.0")):
+        main(
+            [
+                "-input-magn",
+                str(magn_file),
+                "-prefix",
+                str(tmp_path / tag),
+                "-magnitude-only",
+                "-kernel-size-pca",
+                "3",
+                "3",
+                "3",
+                "-kernel-size-gfactor",
+                "3",
+                "3",
+                "1",
+                "-gfactor-nvols",
+                "8",
+                "-factor-error",
+                factor,
+                "-events",
+                str(ev),
+                "-device",
+                "cpu",
+            ]
+        )
+    base = _enrichment(tmp_path / "BASE_taskleak.txt")
+    over = _enrichment(tmp_path / "OVER_taskleak.txt")
+    assert over > base, f"over-removal did not raise enrichment: {base:.2f} -> {over:.2f}"
+    assert over > 1.5, over
+    assert base < 1.3, base

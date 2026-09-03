@@ -16,6 +16,7 @@ from fastfuncstuff.cli_utils import (
     add_verbose_arg,
     parse_prefix,
     print_cli_header,
+    print_cli_section,
     setup_device,
 )
 from fastfuncstuff.denoise.nordic import NordicConfig, run_nordic, run_nordic_multiecho
@@ -288,6 +289,101 @@ Examples:
         "component rank); shows where factor*lambda lands on each patch's spectrum.",
     )
 
+    task_group = parser.add_argument_group("Task-leak diagnostic (-events)")
+    task_group.add_argument(
+        "-events",
+        nargs="+",
+        default=None,
+        metavar="TSV",
+        help="BIDS *_events.tsv for this run — switches on the task-leak diagnostic.\n"
+        "NORDIC decides what to discard from a patch's singular-value spectrum alone; "
+        "nothing in that decision knows the task, so a component carrying a real BOLD "
+        "response can fall under the threshold. This measures how much of the design "
+        "survives in what was thrown away, and — the part that separates 'we removed "
+        "some task variance' from 'we removed noise that happens to fit' — whether it "
+        "lands on the tissue that actually responds.\n"
+        "The series it scores is |input| - |denoised| (see -save-task-loss), not the "
+        "modulus of the removed complex field.\n"
+        "The headline is an ENRICHMENT: the share of the loss series' task-locked "
+        "energy that lands inside the responding mask, over the share of voxels that "
+        "mask occupies. Its no-relation value is 1.0 by construction, so it needs no "
+        "surrogate — which matters, because a block design admits none. The mask is "
+        "placed on one half of the run and the energy scored on the other; a mask drawn "
+        "from the whole run shares noise with the series it scores and reads ~3.9x on "
+        "data with no task in it at all.\n"
+        "Writes {prefix}_taskfit_input, _taskfit_kept and _taskfit_lost: one AFNI "
+        "bucket each, full_model_R then {cond}_Coef (percent signal change) and "
+        "{cond}_Correl, from one joint fit over the whole design — read them the way "
+        "you read 3dDeconvolve's. Plus {prefix}_taskleak.txt with the report.\n"
+        "Diagnostic only: the denoised output is not changed. -retain-dof is the knob "
+        "if the answer is bad. NOTE the input is not motion-corrected at this stage, so "
+        "the per-voxel fits are worse than a preprocessed run's — read the enrichment, "
+        "not the R maps.",
+    )
+    task_group.add_argument(
+        "-event_ignore",
+        "-event-ignore",
+        nargs="+",
+        default=None,
+        metavar="LABEL",
+        help="trial_type values to exclude from the task design (e.g. fixation).",
+    )
+    task_group.add_argument(
+        "-event_cols",
+        "-event-cols",
+        nargs=3,
+        default=None,
+        metavar=("ONSET_COL", "DURATION_COL", "TRIAL_TYPE_COL"),
+        help="Custom -events column names. Default: onset duration trial_type.",
+    )
+    task_group.add_argument(
+        "-tr",
+        type=float,
+        default=None,
+        metavar="SEC",
+        help="Repetition time for the task design. Default: the input header pixdim[4].",
+    )
+    task_group.add_argument(
+        "-task_polort",
+        "-task-polort",
+        type=int,
+        default=None,
+        metavar="DEG",
+        help="Legendre drift degree removed from both series AND the design before the "
+        "fit. Default: AFNI's 1 + floor(run_seconds/150).",
+    )
+    task_group.add_argument(
+        "-task_top_frac",
+        "-task-top-frac",
+        type=float,
+        default=0.1,
+        metavar="FRAC",
+        help="Fraction of voxels, ranked by the DENOISED data's own full-model R, that "
+        "count as 'where the task is' — the stratum the report headlines. Default 0.1.",
+    )
+    task_group.add_argument(
+        "-task_thresh",
+        "-task-thresh",
+        type=float,
+        default=None,
+        metavar="R",
+        help="Absolute cut on the denoised data's full-model R that defines 'where the "
+        "task is'. Default: use -task_top_frac instead.",
+    )
+    task_group.add_argument(
+        "-save-task-loss",
+        "-save_task_loss",
+        action="store_true",
+        dest="save_task_loss",
+        help="Write {prefix}_taskloss: the signed magnitude-domain loss series, "
+        "|input| - |denoised| frame by frame. This is what every GLM downstream of "
+        "NORDIC actually loses, and it keeps its sign — unlike -save-residual-map, "
+        "which is the modulus of the removed complex field and so is half-rectified "
+        "and offset by the Rician mean of the thermal noise it mostly consists of. "
+        "Implied by -events; on its own it is the series to hand to an ICA of what "
+        "was discarded.",
+    )
+
     perf_group = parser.add_argument_group("Performance")
     add_device_arg(
         perf_group,
@@ -308,6 +404,231 @@ Examples:
     add_verbose_arg(perf_group, default=1)
 
     return parser.parse_args(argv)
+
+
+def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
+    """Enrichment with the mask chosen on frames the score never sees.
+
+    The whole difficulty of this diagnostic is that every candidate mask shares noise
+    with the series being scored. ``input = kept + lost``, so ranking voxels by the
+    input's task fit lets the loss series help pick the mask it is then scored in;
+    measured on a run with NO task planted at all that alone reads 3.9x, which is not a
+    bias to caveat but a number that would be read as a leak. Ranking on the kept series
+    has the mirror flaw with the opposite sign, and a block design admits no surrogate
+    to calibrate either — a circular shift only negates it, and a phase-randomised one
+    sits at the design's own frequency (both on the record in
+    :mod:`fastfuncstuff.stats.task_coupling`).
+
+    Splitting the run in time removes the shared noise instead of correcting for it.
+    The mask comes from one contiguous half's input fit, the task energy is measured on
+    the OTHER half of the loss series, and the two halves swap roles so neither is
+    privileged. Real response is in both halves, so a real leak still concentrates;
+    thermal noise is not, so the selection cannot manufacture one. Contiguous halves
+    rather than odd/even frames: interleaving would leave each half's noise correlated
+    with the other's through the autocorrelation the split is there to break.
+
+    Returns ``(mean_enrichment, per_half)`` — or ``(None, [])`` when neither half can
+    place a mask, which happens when nothing in the run responds.
+    """
+    import torch
+
+    from fastfuncstuff.stats.task_coupling import (
+        default_polort,
+        map_enrichment,
+        responding_mask,
+        task_coupling,
+    )
+
+    n_t = source.shape[3]
+    half = n_t // 2
+    halves = [slice(0, half), slice(half, n_t)]
+    out = []
+    for rank_i, score_i in ((0, 1), (1, 0)):
+        rank_sl, score_sl = halves[rank_i], halves[score_i]
+        d_rank = torch.as_tensor(design)[rank_sl]
+        d_score = torch.as_tensor(design)[score_sl]
+        try:
+            po_r = args.task_polort or default_polort(int(d_rank.shape[0]), tr)
+            po_s = args.task_polort or default_polort(int(d_score.shape[0]), tr)
+            rank_tc = task_coupling(
+                source[..., rank_sl], d_rank, polort=po_r, mask=mask, labels=labels
+            )
+            resp, _, _ = responding_mask(
+                rank_tc.r_full, mask, args.task_top_frac, thresh=args.task_thresh
+            )
+            score_tc = task_coupling(
+                lost[..., score_sl], d_score, polort=po_s, mask=mask, labels=labels
+            )
+        except ValueError:
+            # A half with too few blocks to separate the design from its own drift, or
+            # with no voxel responding in it, contributes nothing rather than a number.
+            continue
+        out.append(map_enrichment(score_tc.task_rms, resp, mask)["enrichment"])
+    if not out:
+        return None, []
+    return sum(out) / len(out), out
+
+
+def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> None:
+    """Is the task in what NORDIC threw away, and is it where the task lives?
+
+    Three fits of one design — the input, the series that was kept, and the signed
+    magnitude loss — all in the same magnitude units, so their task-explained rms is
+    directly comparable and the ratios are the numbers this exists to produce.
+
+    A ratio alone is not evidence. A K-column design projected onto ANY series keeps
+    ``sqrt(K/df)`` of its norm, so a pure-noise loss series still reports a non-zero
+    task rms; ``TaskCoupling.chance_share`` is that floor. What carries the argument is
+    the enrichment: the share of the loss series' task-locked energy that falls inside
+    the responding mask, over the share of voxels that mask occupies. Its no-relation
+    value is 1.0 by construction, which is what makes it readable on data this stage
+    has not yet motion-corrected.
+
+    **Which voxels count as responding is biased whichever series ranks them, so both
+    bounds are reported.** ``input = kept + lost``, so ranking on the input lets the
+    loss series help choose the mask it is then scored in, and a run whose own task fit
+    is weak inflates the enrichment toward the noise in ``lost``. Ranking on the kept
+    series has the mirror flaw and is worse: a leak shows up precisely in the voxels
+    where the response did NOT survive, so selecting on what survived selects against
+    the effect being looked for -- and when the threshold strips a patch outright there
+    is no surviving response left to rank at all.
+
+    There is no surrogate to calibrate this with. A circular-shift null is invalid for
+    a block design outright (a P/2 shift only negates it, and task rms is a magnitude),
+    and a phase-randomized one sits at the design's own frequency; both are on the
+    record in :mod:`fastfuncstuff.stats.task_coupling`. So the two masks are reported
+    as a bracket around the true value. Where they agree the answer is solid. Where
+    they disagree widely the input's task fit is too weak for any mask drawn from it
+    to decide, and the unsupervised route -- an ICA of the loss series -- is the one
+    to take.
+    """
+    from pathlib import Path
+
+    from fastfuncstuff.cli.task_events import psc_betas, save_task_fit, task_design_from_events
+    from fastfuncstuff.io.afni import load_nifti
+    from fastfuncstuff.stats.task_coupling import (
+        default_polort,
+        responding_mask,
+        task_coupling,
+    )
+
+    if outputs.task_loss_file is None:
+        raise RuntimeError("the task-leak diagnostic needs the loss series but none was written")
+
+    src = load_nifti(magnitude_file)
+    tr = args.tr if args.tr is not None else float(src.header["pixdim"][4])
+    if tr <= 0:
+        raise ValueError(
+            f"the input header gives TR={tr:g}s, which cannot build a design — pass -tr SEC."
+        )
+
+    kept_img = load_nifti(str(outputs.magnitude_file))
+    kept = torch.as_tensor(np.ascontiguousarray(kept_img.get_fdata(dtype=np.float32)))
+    lost = torch.as_tensor(
+        np.ascontiguousarray(load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32))
+    )
+    affine = kept_img.affine
+    n_t = kept.shape[3]
+
+    design, labels = task_design_from_events(args, n_t, tr, torch.device("cpu"))
+    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    # Before the two fits, not after: a wrong -tr shows up here as a design that never
+    # lines up with the run, and the numbers below are uninterpretable until it is right.
+    print(
+        f"  Design{label}: {len(labels)} condition(s) ({', '.join(labels)}), "
+        f"TR {tr:g}s, polort {polort}, {n_t} frames"
+    )
+
+    # kept + lost IS the input magnitude, by construction of the loss series -- cheaper
+    # and exactly consistent with re-reading the input file, which may still carry the
+    # trailing noise volumes NORDIC trimmed. Three float32 volumes is the peak here,
+    # and this runs after the GPU work is done.
+    source = kept + lost
+    reference = source.mean(dim=3)
+    mask = reference > 0.1 * float(reference.max())
+    kwargs = dict(polort=polort, mask=mask, labels=labels)
+    src_tc = task_coupling(source, design, **kwargs)
+    kept_tc = task_coupling(kept, design, **kwargs)
+    lost_tc = task_coupling(lost, design, **kwargs)
+
+    # "Where does the data respond" is a whole-model question, so it is ranked on
+    # r_full, and on the INPUT -- see the docstring for why not on what survived.
+    resp, _quiet, cut = responding_mask(
+        src_tc.r_full, mask, args.task_top_frac, thresh=args.task_thresh
+    )
+    # The headline. Reported instead of a whole-run enrichment, not alongside one: see
+    # _split_half_enrichment for why every mask drawn from the whole run is biased by
+    # noise it shares with the series it scores.
+    enrich, per_half = _split_half_enrichment(source, lost, design, mask, tr, args, labels)
+    del source
+    src_sum = src_tc.summarize(resp)
+    kept_sum, lost_sum = kept_tc.summarize(resp), lost_tc.summarize(resp)
+    # Two ratios, answering different questions. The amplitude one is in magnitude units
+    # on both sides, so it says how big what left is next to what stayed. The share is
+    # the lost series' task-explained rms over its OWN rms, which is the only form
+    # comparable to chance_share -- that is a fraction of norm, not an amplitude, and
+    # printing it beside a task rms invites exactly the wrong reading.
+    amp_ratio = lost_sum["task_rms_median"] / max(1e-12, src_sum["task_rms_median"])
+    kept_ratio = kept_sum["task_rms_median"] / max(1e-12, src_sum["task_rms_median"])
+    lost_share = lost_sum["task_rms_median"] / max(1e-12, lost_sum["total_rms_median"])
+
+    stem, _, ext = str(outputs.task_loss_file).partition("_taskloss")
+    for name, tc in (("input", src_tc), ("kept", kept_tc), ("lost", lost_tc)):
+        save_task_fit(
+            f"{stem}_taskfit_{name}{ext}",
+            tc,
+            psc_betas(tc, design, reference, mask),
+            labels,
+            affine,
+            polort + 1,
+            n_t,
+        )
+
+    how = "cut" if args.task_thresh is not None else f"top {args.task_top_frac * 100:.0f}%"
+    lines = [
+        f"  summary mask : {int(resp.sum())} voxels, whole-run input R > {cut:.3f} "
+        f"({how}) = {100 * int(resp.sum()) / max(1, int((mask > 0).sum())):.1f}% of the brain",
+        "                 descriptive only -- the three lines below are selected on it "
+        "and read high",
+        "                 because of that. The enrichment is not.",
+        f"  input: full-model R {src_sum['r_full_median']:.3f} med, task rms "
+        f"{src_sum['task_rms_median']:.4g}",
+        f"  kept : full-model R {kept_sum['r_full_median']:.3f} med, task rms "
+        f"{kept_sum['task_rms_median']:.4g} = {100 * kept_ratio:.1f}% of the input's",
+        f"  lost : full-model R {lost_sum['r_full_median']:.3f} med, task rms "
+        f"{lost_sum['task_rms_median']:.4g} = {100 * amp_ratio:.1f}% of the input's",
+        f"  lost : task-explained share of its OWN rms {lost_share:.3f}, against "
+        f"{lost_tc.chance_share:.3f} that any {len(labels)}-column design keeps from "
+        f"pure noise",
+        "",
+        "  ENRICHMENT of the lost series' task energy on responding tissue",
+        (
+            f"    {enrich:.2f}x   mask from one half of the run, energy scored on the "
+            f"other  ({' and '.join(f'{e:.2f}x' for e in per_half)})"
+            if enrich is not None
+            else "    n/a    neither half of the run places a mask: nothing in it "
+            "responds to the design"
+        ),
+        "",
+        "  1.0x means what was removed is spread like the brain and has nothing to do with where",
+        "  the task is - the reassuring answer, and one a share above chance does NOT contradict,",
+        "  because a design projected onto pure noise keeps some of it everywhere. Well above 1.0x",
+        "  means real response left with the noise; -retain-dof caps how much any patch "
+        "may remove.",
+        "  The mask is chosen on frames the score never sees, so the 1.0x floor is real and not an",
+        "  artefact of selection - a whole-run mask reads ~3.9x on data with no task in it at all.",
+        "  Power is the cost: half a run's blocks place the mask, so a weak leak attenuates toward",
+        "  1.0x rather than showing up. An ICA of the loss series is the unsupervised next step.",
+    ]
+    print("\n".join(lines))
+    header = (
+        f"Task-leak diagnostic{label}\n"
+        f"  design         : {len(labels)} condition(s) ({', '.join(labels)}), "
+        f"TR {tr:g}s, polort {polort}, {n_t} frames"
+    )
+    Path(f"{stem}_taskleak.txt").write_text(
+        header + "\n" + "\n".join(lines) + "\n", encoding="utf-8"
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -332,6 +653,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.retain_dof is not None and args.retain_dof <= 0:
         print("ERROR: -retain-dof must be positive (integer components or a fraction in (0,1))")
         sys.exit(1)
+    # The diagnostic scores the loss series, so -events has to produce it.
+    save_task_loss = args.save_task_loss or args.events is not None
 
     # Resolve the factor-sweep window: explicit values win, else LO HI N range.
     sweep_values: tuple[float, ...] | None = None
@@ -348,6 +671,12 @@ def main(argv: list[str] | None = None) -> None:
     run_sweep_path = (
         args.factor_sweep or args.save_imgs or args.save_factor_img or args.save_eigen_img
     )
+    if run_sweep_path and args.events is not None:
+        print(
+            "ERROR: -events is a diagnostic on the denoised run; it does not apply to "
+            "the -factor-sweep path (which never writes one)."
+        )
+        sys.exit(1)
     if run_sweep_path and n_echoes > 1:
         print("ERROR: -factor-sweep / -save-*-img are single-echo only (pass one -input-magn).")
         sys.exit(1)
@@ -390,6 +719,7 @@ def main(argv: list[str] | None = None) -> None:
         add_mean=args.add_mean,
         retain_dof=args.retain_dof,
         save_num_comps=args.save_num_comps,
+        save_task_loss=save_task_loss,
         make_complex_nii=args.make_complex_nii,
         nifti_ext=prefix_info.nifti_ext,
         svd_batch_size=args.svd_batch_size,
@@ -458,12 +788,24 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  G-factor output: {outputs.gfactor_file}")
         if outputs.residual_file is not None:
             print(f"  Residual output: {outputs.residual_file}")
+        if outputs.task_loss_file is not None:
+            print(f"  Task-loss output: {outputs.task_loss_file}")
         if outputs.num_comps_file is not None:
             print(f"  Num-comps output: {outputs.num_comps_file}")
         if outputs.recfactor_file is not None:
             print(f"  Rec-factor output: {outputs.recfactor_file}")
         print(f"  Metadata: {outputs.metadata_file}")
     print(f"  Elapsed: {elapsed:.1f} s")
+
+    if args.events is not None:
+        print_cli_section("Task-leak diagnostic")
+        for i, outputs in enumerate(all_outputs):
+            _task_leak_report(
+                outputs,
+                magn_files[i],
+                args,
+                f" [echo {i + 1}]" if n_echoes > 1 else "",
+            )
 
 
 if __name__ == "__main__":

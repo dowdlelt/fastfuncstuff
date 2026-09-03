@@ -80,6 +80,12 @@ class NordicConfig:
     # baseline makes interpolation/masking behave like the real series.
     add_mean: bool = False
     save_num_comps: bool = False
+    # Write the signed magnitude-domain loss series {prefix}_taskloss: what the
+    # denoising took OUT of the magnitude, |input| - |denoised|, frame by frame.
+    # This — not the modulus of the removed complex field — is the series a task
+    # diagnostic (or an ICA of what was discarded) has to run on; see
+    # _magnitude_loss. Forces the residual to be computed.
+    save_task_loss: bool = False
     make_complex_nii: bool = False
     full_dynamic_range: bool = False
     write_gzipped_niftis: bool = True
@@ -146,6 +152,7 @@ class NordicOutputs:
     num_comps_file: Path | None
     recfactor_file: Path | None
     metadata_file: Path
+    task_loss_file: Path | None = None
 
 
 @dataclass
@@ -864,6 +871,36 @@ def _rescue_null_threshold(
         done += b
     stat = torch.cat(stats).double()
     return float(torch.quantile(stat, 1.0 - alpha).item())
+
+
+def _magnitude_loss(
+    denoised: torch.Tensor,
+    residual: torch.Tensor,
+    magn_denoised: np.ndarray,
+    chunk_z: int = 8,
+) -> np.ndarray:
+    """What the denoising took out of the MAGNITUDE series: ``|input| - |denoised|``.
+
+    Not ``|residual|``. Every GLM downstream of NORDIC runs on the magnitude, so the
+    quantity that decides whether a task effect survived is the magnitude difference,
+    and it keeps its sign — a frame where the removed component pushed the voxel down
+    reads negative. The modulus of the removed complex field is half-rectified and
+    sits on the Rician mean of the thermal noise it mostly consists of, which turns a
+    task-locked oscillation into a hump at twice the frequency and no sign at all.
+
+    Chunked over z, and the residual is staged per slab: the memory guard may have
+    left it on the CPU while ``denoised`` is on the GPU, and a whole extra 4-D complex
+    volume is exactly what that guard was avoiding.
+    """
+    nz = denoised.shape[2]
+    out = np.empty(tuple(denoised.shape), dtype=np.float32)
+    for z0 in range(0, nz, chunk_z):
+        z1 = min(nz, z0 + chunk_z)
+        blk = denoised[:, :, z0:z1] + residual[:, :, z0:z1].to(denoised.device)
+        out[:, :, z0:z1] = torch.abs(blk).cpu().numpy().astype(np.float32)
+        del blk
+    out -= magn_denoised
+    return out
 
 
 def _residual_xcorr_qc(
@@ -1737,6 +1774,9 @@ def _finalize_echo(
     # Compute magnitude (and phase) on GPU, move to CPU, then free GPU
     # to avoid holding denoised + abs + angle all at once.
     magn_np_out = torch.abs(denoised).cpu().numpy().astype(np.float32)
+    task_loss_np: np.ndarray | None = None
+    if cfg.save_task_loss and residual is not None:
+        task_loss_np = _magnitude_loss(denoised, residual, magn_np_out)
     phase_out_np: np.ndarray | None = None
     if phase_path is not None:
         phase_out_np = torch.angle(denoised).cpu().numpy().astype(np.float32)
@@ -1764,11 +1804,21 @@ def _finalize_echo(
             reference_img=magnitude_file,
         )
 
+    task_loss_file: Path | None = None
+    if task_loss_np is not None:
+        task_loss_file = out_dir / f"{out_prefix.name}_taskloss{ext}"
+        save_nifti(
+            task_loss_np,
+            output_path=task_loss_file,
+            reference_img=magnitude_file,
+        )
+        del task_loss_np
+
     residual_file: Path | None = None
-    if residual is not None:
+    if residual is not None and cfg.save_residual_map:
         residual_file = out_dir / f"{out_prefix.name}_residual{ext}"
         residual_np = torch.abs(residual).cpu().numpy().astype(np.float32)
-        del residual
+        residual = None  # free the complex volume before the float32 copy is written
         if cfg.add_mean and prepped.raw_temporal_mean is not None:
             # Baseline restored so the residual survives downstream resampling
             # like a real magnitude series (mean + removed noise). Broadcast the
@@ -1780,6 +1830,7 @@ def _finalize_echo(
             reference_img=magnitude_file,
         )
         del residual_np
+    del residual
 
     rescued_file: Path | None = None
     if llr_stats.rescued_map is not None and cfg.rescue:
@@ -1858,6 +1909,7 @@ def _finalize_echo(
             "phase": str(phase_path) if phase_path is not None else None,
             "gfactor": str(gfactor_file) if gfactor_file is not None else None,
             "residual": str(residual_file) if residual_file is not None else None,
+            "task_loss": str(task_loss_file) if task_loss_file is not None else None,
             "rescued": str(rescued_file) if rescued_file is not None else None,
             "num_comps": str(num_comps_file) if num_comps_file is not None else None,
             "recfactor": str(recfactor_file) if recfactor_file is not None else None,
@@ -1878,6 +1930,7 @@ def _finalize_echo(
         num_comps_file=num_comps_file,
         recfactor_file=recfactor_file,
         metadata_file=meta_file,
+        task_loss_file=task_loss_file,
     )
 
 
@@ -1941,7 +1994,7 @@ def _llr_main_pass(
     )
 
     residual: torch.Tensor | None = None
-    if cfg.save_residual_map:
+    if cfg.save_residual_map or cfg.save_task_loss:
         # Compute on the input's device. When KSP2 was offloaded to CPU, this
         # keeps the residual (another full 4-D volume) off the GPU rather than
         # staging KSP2 back on alongside denoised — _finalize_echo handles a
@@ -2111,7 +2164,7 @@ def run_nordic_multiecho(
     # directly comparable across echoes (a voxel correlated with its later-echo
     # counterpart in the residual flags over-removed shared signal).
     residuals: list[torch.Tensor | None] = [None] * E
-    if cfg.save_residual_map or cfg.resid_qc:
+    if cfg.save_residual_map or cfg.resid_qc or cfg.save_task_loss:
         for e in range(E):
             denoised_e = results[e][0]
             # Compute on the echo's own device: when the echoes were offloaded to
