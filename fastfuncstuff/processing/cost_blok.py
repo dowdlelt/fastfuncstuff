@@ -367,6 +367,103 @@ def _overlap_factor(ok: Tensor, blokset: BlokSet) -> Tensor:
     return (frac * frac).detach()
 
 
+@dataclass(frozen=True)
+class BatchedLocalPearsonBase:
+    """Base-only local-Pearson reductions reused across candidate evaluations."""
+
+    valid: Tensor
+    blok_index: Tensor
+    base: Tensor
+    weight: Tensor
+    weight_sum: Tensor
+    weight_sum_safe: Tensor
+    weighted_base_sum: Tensor
+    base_variance: Tensor
+    count: Tensor
+    score_weight: Tensor
+    blokset: BlokSet
+
+
+def prepare_local_pearson_batched(
+    base: Tensor,
+    weight: Tensor | None,
+    blokset: BlokSet,
+) -> BatchedLocalPearsonBase:
+    """Precompute statistics that do not depend on the warped candidate batch."""
+    device = base.device
+    idx = blokset.index.to(device)
+    valid = idx >= 0
+    bi = idx[valid]
+    b = base.reshape(-1)[valid]
+    w = torch.ones_like(b) if weight is None else weight.reshape(-1)[valid]
+    nblok = blokset.nblok
+
+    def _seg(vals: Tensor) -> Tensor:
+        return torch.zeros(nblok, dtype=vals.dtype, device=device).index_add(0, bi, vals)
+
+    wb = w * b
+    sw = _seg(w)
+    sw_safe = sw.clamp(min=1e-12)
+    swx = _seg(wb)
+    swxx = _seg(wb * b)
+    return BatchedLocalPearsonBase(
+        valid=valid,
+        blok_index=bi,
+        base=b,
+        weight=w,
+        weight_sum=sw,
+        weight_sum_safe=sw_safe,
+        weighted_base_sum=swx,
+        base_variance=swxx - swx * swx / sw_safe,
+        count=_seg(torch.ones_like(w)),
+        score_weight=torch.ones_like(sw) if weight is None else sw,
+        blokset=blokset,
+    )
+
+
+def local_pearson_value_batched_prepared(
+    prepared: BatchedLocalPearsonBase,
+    warped_batch: Tensor,
+    ppow: float = 1.0,
+) -> Tensor:
+    """Evaluate warped candidates using prepared base-only reductions."""
+    B = warped_batch.shape[0]
+    yb = warped_batch.reshape(B, -1)[:, prepared.valid]
+    wy = prepared.weight[None, :] * yb
+    nblok = prepared.blokset.nblok
+
+    def _seg_batch(vals: Tensor) -> Tensor:
+        return torch.zeros(B, nblok, dtype=vals.dtype, device=vals.device).index_add(
+            1, prepared.blok_index, vals
+        )
+
+    swy = _seg_batch(wy)
+    swyy = _seg_batch(wy * yb)
+    swxy = _seg_batch(wy * prepared.base[None, :])
+    sw_safe = prepared.weight_sum_safe
+    xv = prepared.base_variance
+    yv = swyy - swy * swy / sw_safe[None, :]
+    xy = swxy - swy * prepared.weighted_base_sum[None, :] / sw_safe[None, :]
+
+    ok = (
+        (prepared.count[None, :] >= _MIN_BLOK_PTS)
+        & (xv[None, :] > 0)
+        & (yv > 0)
+        & (prepared.weight_sum[None, :] > 0)
+    )
+    denom = (xv[None, :] * yv).clamp(min=1e-24).sqrt()
+    pcor = (xy / denom).clamp(-_CMAX, _CMAX)
+    p = torch.log((1.0 + pcor) / (1.0 - pcor))
+    pabs = p.abs() if ppow == 1.0 else p.abs().pow(ppow)
+
+    ws = prepared.score_weight[None, :]
+    contrib = torch.where(ok, ws * p * pabs, torch.zeros_like(p))
+    wsum = torch.where(ok, ws.expand(B, -1), torch.zeros_like(p)).sum(dim=1)
+    agg = 0.25 * contrib.sum(dim=1) / wsum.clamp(min=1e-12)
+    agg = agg * _overlap_factor(ok, prepared.blokset)
+    return torch.where(wsum > 0, agg, torch.zeros_like(agg))
+
+
 def local_pearson_value_batched(
     base: Tensor,
     warped_batch: Tensor,

@@ -56,12 +56,15 @@ from .cost_blok import (
     assign_bloks_points,
     local_pearson_value,
     local_pearson_value_batched,
+    local_pearson_value_batched_prepared,
     lpa_cost,
     lpa_cost_batched,
     lpc_cost,
     lpc_cost_batched,
+    prepare_local_pearson_batched,
 )
 from .cost_hist import clip_range
+from .interp import cache_resample_plans
 from .mask import automask
 from .weight import compute_weight_image
 
@@ -1435,6 +1438,9 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
     lifts utilisation out of the launch-bound regime.
     """
     is_lpc = ctx.name == "lpc"
+    pearson_base = prepare_local_pearson_batched(base_pts, weight_s, blokset)
+    # Available memory and point geometry are stable within one refinement stage.
+    candidate_batch_steps: dict[int, int] = {}
 
     def fn(matrices: Tensor) -> Tensor:
         # CMA-ES hands us population x trials matrices at once (289 of them for a
@@ -1445,12 +1451,16 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
         # for free -- it retains the activations either way -- but there T is
         # only the trial count.
         if not torch.is_grad_enabled() and matrices.shape[0] > 1:
-            step = compute_registration_candidate_batch_size(
-                points_xyz.shape[0],
-                matrices.shape[0],
-                matrices.device,
-                bytes_per_point=batched_sample_bytes_per_point(ctx.interp),
-            )
+            n_candidates = int(matrices.shape[0])
+            step = candidate_batch_steps.get(n_candidates)
+            if step is None:
+                step = compute_registration_candidate_batch_size(
+                    points_xyz.shape[0],
+                    n_candidates,
+                    matrices.device,
+                    bytes_per_point=batched_sample_bytes_per_point(ctx.interp),
+                )
+                candidate_batch_steps[n_candidates] = step
             if step < matrices.shape[0]:
                 return torch.cat(
                     [fn(matrices[s : s + step]) for s in range(0, matrices.shape[0], step)]
@@ -1459,7 +1469,7 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
         warped = sample_affine_at_points_batched(
             source_stage, matrices, points_xyz, zero_outside=True, interp=ctx.interp
         )  # (T, M)
-        val = local_pearson_value_batched(base_pts, warped, weight_s, blokset, ctx.ppow)  # (T,)
+        val = local_pearson_value_batched_prepared(pearson_base, warped, ctx.ppow)  # (T,)
         c = (-val) if is_lpc else val.abs()
         if ctx.micho is not None:
             # The histogram terms are per-transform and not batched; T is small
@@ -1522,6 +1532,7 @@ def _pick_optimizer(requested: str, n_points: int, n_trials: int, n_free: int) -
     return "cmaes" if n_points * n_trials * lam <= _BATCH_FREE_WORK else "adam"
 
 
+@cache_resample_plans()
 def _refine_cmaes_batched(
     init_params_phys_list: list[np.ndarray],
     config: AffineAlignConfig,

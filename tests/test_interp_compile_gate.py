@@ -132,3 +132,23 @@ class TestCalibration:
         assert "cpu" not in interp._compile_pending_measure  # measured and recorded
         interp._compile_cost_cache.clear()
         assert interp._measured_compile_cost("cpu") > 0.0
+
+
+class TestResamplePlanCache:
+    def test_reuses_plan_only_inside_scope(self, monkeypatch):
+        import fastfuncstuff.memory as memory
+
+        calls = []
+
+        def available(device, *, empty_cache):
+            calls.append((device, empty_cache))
+            return 1_000_000
+
+        monkeypatch.setattr(memory, "get_available_memory", available)
+        with interp.cache_resample_plans():
+            first = interp._resample_chunk_size(100, 8, DEV)
+            second = interp._resample_chunk_size(100, 8, DEV)
+        third = interp._resample_chunk_size(100, 8, DEV)
+
+        assert first == second == third
+        assert len(calls) == 2

@@ -17,6 +17,7 @@ import os
 import time
 from collections.abc import Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 
@@ -617,6 +618,21 @@ def _kernel_half_width(name: str) -> int:
     return _KERNELS[name][1]
 
 
+_resample_plan_cache: ContextVar[dict[tuple[int, int, str, int | None], int] | None] = ContextVar(
+    "resample_plan_cache", default=None
+)
+
+
+@contextmanager
+def cache_resample_plans():
+    """Reuse Memory-module chunk plans within one fixed-geometry operation."""
+    token = _resample_plan_cache.set({})
+    try:
+        yield
+    finally:
+        _resample_plan_cache.reset(token)
+
+
 def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int:
     """Voxels per chunk for the separable resampler.
 
@@ -627,6 +643,13 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     already applies the GPU 0.5 safety factor), per the [[Memory module]] rule.
     """
     from ..memory import get_available_memory
+
+    cache = _resample_plan_cache.get()
+    key = (n_points, ntaps, device.type, device.index)
+    if cache is not None:
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
 
     # Per-point peak of _gather_contract, in float32-equivalent (4-byte) units.
     # The dominant cost is *not* the float slab: advanced indexing
@@ -647,7 +670,10 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     # chunks stay safe.
     avail = get_available_memory(device, empty_cache=False)
     chunk = int(avail // max(1, bytes_per_point))
-    return max(1, min(n_points, chunk))
+    result = max(1, min(n_points, chunk))
+    if cache is not None:
+        cache[key] = result
+    return result
 
 
 def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:

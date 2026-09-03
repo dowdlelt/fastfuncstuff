@@ -20,12 +20,14 @@ from fastfuncstuff.processing.cost_blok import (
     auto_blok_radius,
     local_pearson_value,
     local_pearson_value_batched,
+    local_pearson_value_batched_prepared,
     local_pearson_value_pairs,
     lpa_cost,
     lpa_value_pairs,
     lpc_cost,
     lpc_value_pairs,
     prepare_blok_pairs,
+    prepare_local_pearson_batched,
 )
 
 DEV = torch.device("cpu")
@@ -156,6 +158,19 @@ class TestLocalPearson:
         for i in range(3):
             serial = local_pearson_value(base, warps[i], None, bs)
             assert float(batched[i]) == pytest.approx(float(serial), rel=1e-4, abs=1e-4)
+
+    @pytest.mark.parametrize("weighted", [False, True])
+    def test_prepared_batched_matches_direct(self, weighted):
+        base = _structured()
+        bs = assign_bloks(base.shape, (1, 1, 1), "tohd")
+        warps = torch.stack([base, -base, torch.randn_like(base)])
+        weight = torch.rand_like(base) if weighted else None
+
+        expected = local_pearson_value_batched(base, warps, weight, bs)
+        prepared = prepare_local_pearson_batched(base, weight, bs)
+        actual = local_pearson_value_batched_prepared(prepared, warps)
+
+        assert torch.equal(actual, expected)
 
     def test_differentiable(self):
         base = _structured((24, 24, 24))
