@@ -1222,3 +1222,54 @@ def test_null_axis_regress_skip_frames_keeps_outliers_from_setting_the_slope():
     # subtraction does not.
     out = null_axis_regress([encoded.clone(), null.clone()], 1, skip_frames=5)
     assert not torch.allclose(out[0][..., :5], encoded[..., :5])
+
+
+def test_cli_corrected_series_preserves_the_source_tr(tmp_path):
+    """The corrected series is the SOURCE for every downstream stage (ffs_nwarp
+    reads pixdim[4] straight off it for its own output's TR, and ffs_reml falls
+    back to it without an explicit -TR). save_nifti with no header defaults to
+    TR=1s, so the write must pass the source's own TR explicitly, -events or not."""
+    import nibabel as nib
+    import numpy as np
+
+    data, _ = _synth_series(shape=(10, 10, 8), nt=6, d1=[0.0] * 6, d2=[0.0] * 6, axes=(0,))
+    p = tmp_path / "in.nii.gz"
+    img = nib.Nifti1Image(data.astype(np.float32), np.eye(4))
+    img.header.set_zooms((2.0, 2.0, 2.0, 0.67))
+    nib.save(img, str(p))
+
+    stem = str(tmp_path / "o")
+    rc = _run(
+        [
+            "-input", str(p), "-prefix", stem, "-pe_dir", "x",
+            "-ref", "0", "-device", "cpu", "-no_movie", "-levels", "1", "-iters", "1",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    out_tr = float(nib.load(f"{stem}_locomoco.nii.gz").header.get_zooms()[3])
+    assert out_tr == pytest.approx(0.67), out_tr
+
+
+def test_cli_flow_field_also_preserves_the_source_tr(tmp_path):
+    """Same TR-loss risk applies to the flow/warp fields -- they carry a real time
+    axis (one frame per input volume) even though they aren't the corrected series."""
+    import nibabel as nib
+    import numpy as np
+
+    data, _ = _synth_series(shape=(10, 10, 8), nt=6, d1=[0.0] * 6, d2=[0.0] * 6, axes=(0,))
+    p = tmp_path / "in.nii.gz"
+    img = nib.Nifti1Image(data.astype(np.float32), np.eye(4))
+    img.header.set_zooms((2.0, 2.0, 2.0, 0.67))
+    nib.save(img, str(p))
+
+    stem = str(tmp_path / "o")
+    rc = _run(
+        [
+            "-input", str(p), "-prefix", stem, "-pe_dir", "x",
+            "-ref", "0", "-device", "cpu", "-no_movie", "-no_warp", "-levels", "1",
+            "-iters", "1",
+        ]
+    )  # fmt: skip
+    assert rc == 0
+    out_tr = float(nib.load(f"{stem}_flow.nii.gz").header.get_zooms()[3])
+    assert out_tr == pytest.approx(0.67), out_tr

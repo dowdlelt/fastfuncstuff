@@ -4080,6 +4080,9 @@ def _run_multiecho(
         if affine is None:
             affine = img.affine.copy()
             tr_sec = _resolve_tr(args, img) if args.events else None
+            # Not gated on -events: every OUTPUT this run writes is on the source
+            # series' own clock, whether or not the task-coupling design ran.
+            out_tr = float(img.header.get_zooms()[3])
         datas.append(d)
 
     # -detask filter/fit: cut the task out of the images the ESTIMATOR sees. The raw
@@ -4572,17 +4575,18 @@ def _run_multiecho(
                     _neg_clip(corrected_series.numpy(), args.allow_neg),
                     corr_path,
                     affine=affine,
+                    tr=out_tr,
                 )
         if not args.no_flow:
             if res.pe_axis2 is not None:
                 for label, _axis, field in res.pe_displacements():
                     fpath = f"{estem}_flow_{label}{ext}"
                     with spinner(f"Writing {Path(fpath).name}"):
-                        save_nifti(field.numpy(), fpath, affine=affine)
+                        save_nifti(field.numpy(), fpath, affine=affine, tr=out_tr)
             else:
                 flow_path = f"{estem}_flow{ext}"
                 with spinner(f"Writing {Path(flow_path).name}"):
-                    save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine)
+                    save_nifti(res.pe_displacement().numpy(), flow_path, affine=affine, tr=out_tr)
         if _want_qc(args):
             corrected = (
                 corrected_series.numpy()
@@ -4984,6 +4988,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
         return 2
     affine = img.affine.copy()
     tr_sec = _resolve_tr(args, img) if args.events else None
+    # Not gated on -events: every OUTPUT this run writes is on the source series'
+    # own clock, whether or not the task-coupling design ran. Downstream tools
+    # (ffs_nwarp's -source, ffs_reml without an explicit -TR) read pixdim[4] off
+    # this file, so a wrong value here silently mis-times the whole rest of the
+    # pipeline -- see ../fmri_wiki/log.md 2026-09-03.
+    out_tr = float(img.header.get_zooms()[3])
 
     # -inject_jitter: put a KNOWN displacement in before anything else sees the series, so
     # the estimator, the refine loop and the correction are all working on the injected
@@ -5512,6 +5522,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
                 _neg_clip(corrected_series.numpy(), args.allow_neg),
                 corr_path,
                 affine=affine,
+                tr=out_tr,
             )
 
     # Temporal reductions of the corrected series ((nx, ny, nz, T) -> over T).
@@ -5551,25 +5562,25 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             for label, _axis, field in result.pe_displacements():
                 fpath = f"{stem}_flow_{label}{ext}"
                 with spinner(f"Writing {Path(fpath).name}"):
-                    save_nifti(field.numpy(), fpath, affine=affine)
+                    save_nifti(field.numpy(), fpath, affine=affine, tr=out_tr)
             if result.null_field is not None:
                 # The un-encoded axis, as estimated and BEFORE it was regressed out.
                 # It is the diagnostic the whole flag rests on: an axis that cannot
                 # physically move, so whatever is here is what the estimator invented.
                 npath = f"{stem}_flow_null{ext}"
                 with spinner(f"Writing {Path(npath).name}"):
-                    save_nifti(result.null_field.numpy(), npath, affine=affine)
+                    save_nifti(result.null_field.numpy(), npath, affine=affine, tr=out_tr)
         elif dual:
             # No single signed scalar holds a 2-D vector — split into magnitude + angle.
             mag_path, ang_path = f"{stem}_flowmag{ext}", f"{stem}_flowang{ext}"
             with spinner(f"Writing {Path(mag_path).name}"):
-                save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine)
+                save_nifti(result.flow_magnitude().numpy(), mag_path, affine=affine, tr=out_tr)
             with spinner(f"Writing {Path(ang_path).name}"):
-                save_nifti(result.flow_angle().numpy(), ang_path, affine=affine)
+                save_nifti(result.flow_angle().numpy(), ang_path, affine=affine, tr=out_tr)
         else:
             flow_path = f"{stem}_flow{ext}"
             with spinner(f"Writing {Path(flow_path).name}"):
-                save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine)
+                save_nifti(result.pe_displacement().numpy(), flow_path, affine=affine, tr=out_tr)
             print(
                 f"  • signed PE flow 4D (voxels, ± = direction; scrub like a series): {flow_path}"
             )
