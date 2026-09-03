@@ -460,8 +460,8 @@ def _run_single_ica(
 
     _vprint(args.verb >= 1, f"Method: {args.num_comps} ...")
 
-    # FSL update_mask behavior for model-order estimation: exclude very
-    # low-variability voxels before PPCA evidence scan.
+    # Exclude near-flat voxels from the model-order estimate only: they sit at the
+    # bottom of the spectrum and drag the estimated noise floor down.
     n_eff_for_model_order = n_eff
     data_for_model_order = data_vox_t
     model_order_filter_diag = None
@@ -1594,7 +1594,7 @@ def _run_concat_ica(
             )
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
 
-        # --- Per-run temporal mean-center (MELODIC remmean) ---
+        # --- Per-run temporal mean-center ---
         run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
         run_data_list.append(run_vox)
@@ -1628,7 +1628,7 @@ def _run_concat_ica(
     # fit, so we stack outright and take one exact SVD on (T_total, V) rather than an
     # approximation. Each run is divided by n_runs first so every run contributes equally
     # to the group subspace instead of in proportion to its length.
-    _vsection(args.verb >= 1, "Temporal Concatenation (MELODIC setup_migp-style)")
+    _vsection(args.verb >= 1, "Temporal Concatenation")
     t_step = time.time()
     if getattr(args, "migp", False):
         from fastfuncstuff.decomposition.migp import migp_reduce
@@ -1690,11 +1690,11 @@ def _run_concat_ica(
             )
         _vprint(args.verb >= 1, f"Trace: pre-varnorm MIGP → {_td_pre}/migp_pre_varnorm.npy")
 
-    # --- Variance normalization (MELODIC varnorm2 on the concat matrix) ---
-    # setup_migp:579-584 — single voxel-wise varnorm on the fully-concatenated
-    # Data using min(30, Data.Nrows()-1) PCs. We honor -sep_vn as an escape
-    # hatch (per-file varnorm before concat) for debugging, but joined matches
-    # MELODIC's default pipeline.
+    # --- Variance normalization on the concatenated matrix ---
+    # One voxel-wise varnorm over the fully-concatenated data, not per run: a voxel's
+    # noise scale is a property of the voxel, so estimating it per run lets run-to-run
+    # scale differences survive into the concatenation as spurious structure. -sep_vn is
+    # the escape hatch (per-file varnorm before concat) for debugging that divergence.
     vn_scope = "none"
     varnorm_std_np: np.ndarray | None = None
     if args.voxel_norm:
@@ -2443,7 +2443,7 @@ def _temporal_ica_preprocess_runs(
             )
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
 
-        # Per-run temporal mean-center (MELODIC remmean); dual regression demeans
+        # Per-run temporal mean-center; dual regression demeans
         # again defensively but this keeps the stage-1 concat consistent.
         run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
@@ -2969,7 +2969,7 @@ def _run_tensorial_ica(
             )
             run_vox = _check_finite(run_vox, f"run{ri + 1}-post-hp", args.verb >= 1)
 
-        # Per-voxel temporal mean-center (MELODIC remmean)
+        # Per-voxel temporal mean-center
         run_vox = run_vox - run_vox.mean(dim=1, keepdim=True)
 
         run_data_list.append(run_vox)

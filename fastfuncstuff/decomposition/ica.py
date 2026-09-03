@@ -173,11 +173,12 @@ class FastICA:
 
         n_samples, n_features = X.shape  # T, V
 
-        # Step 1: PCA with MELODIC-style centering
-        # MELODIC first removes the temporal mean (remmean(alldat,2), i.e.
-        # per-voxel/column mean) before PCA.  Then cov_r row-centres on top
-        # (subtracts spatial mean per timepoint).  Whitening is applied to
-        # the temporally-demeaned data.  We replicate both steps.
+        # Step 1: PCA with two centrings, in this order.
+        # First the temporal mean per voxel (column centre): without it the mean image
+        # is one enormous rank-1 component. Then the spatial mean per timepoint (row
+        # centre) when forming the covariance: the global signal at each timepoint is a
+        # second rank-1 pattern shared by all voxels. Whitening is applied to the
+        # temporally-demeaned data.
         self.mean_ = X.mean(dim=0, keepdim=True)  # (1, V) temporal mean per voxel
         X = X - self.mean_  # temporal demean (column-centre)
 
@@ -253,7 +254,7 @@ class FastICA:
         # The whitened components already have Cov ≈ I by construction:
         # Cov = (white @ X)(white @ X)^T / V
         #     = white @ (X @ X^T / V) @ white^T
-        # Since white = Λ^(-1/2) U^T and cov_r ≈ U Λ U^T (row-centred cov),
+        # Since white = Λ^(-1/2) U^T and the row-centred covariance ≈ U Λ U^T,
         # this is approximately I. No additional sqrt(V) scaling needed.
         W, n_iter = self._fastica(pca_components, n_components)
         self.n_iter_ = n_iter
@@ -1390,9 +1391,7 @@ def _nonlinearity_batch(x: torch.Tensor, fun: str) -> tuple[torch.Tensor, torch.
         ex = torch.exp(-0.5 * x * x)
         g_prime_mean = ((1.0 - x * x) * ex).mean(dim=-1, keepdim=True)
         return x.mul_(ex), g_prime_mean
-    raise ValueError(
-        f"unknown nonlinearity {fun!r}; use logcosh, pow3, cube or exp"
-    )
+    raise ValueError(f"unknown nonlinearity {fun!r}; use logcosh, pow3, cube or exp")
 
 
 def _symmetric_decorrelation_batch(W: torch.Tensor) -> torch.Tensor:

@@ -348,7 +348,8 @@ def estimate_ica_component_count(
         Effective number of spatial samples for the Minka formula,
         accounting for spatial autocorrelation.  If None, uses raw n_vox
         (which typically over-estimates dimensionality for smooth data).
-        MELODIC uses n_vox / (2.5 * smoothness_voxels).
+        Build it from the resel count -- see
+        :func:`~fastfuncstuff.decomposition.model_order.effective_sample_size`.
     """
     x_t = data_vox_t.T  # (time, vox)
     n_time, n_vox = int(x_t.shape[0]), int(x_t.shape[1])
@@ -372,11 +373,12 @@ def estimate_ica_component_count(
             f"(component cap={rank_cap}) ..."
         )
 
-    # FSL MELODIC ppca_dim() passes remmean(alldat,2), i.e. row-mean removal
-    # (spatial mean per timepoint). cov_r then forms row-wise covariance.
-    # We match this cov_r semantics directly.
+    # Row-mean removal: subtract each timepoint's *spatial* mean before forming the
+    # temporal covariance. The global signal at a timepoint is a rank-1 spatial pattern
+    # shared by every voxel; leaving it in puts one huge eigenvalue at the top of the
+    # spectrum that the model order then has to spend a component on.
     x_t_dev = to_tensor(x_t, device=device)
-    # Row-centred covariance (cov_r semantics): subtract per-timepoint spatial mean.
+    # Row-centred covariance: subtract the per-timepoint spatial mean.
     # Use identity: (X-m)(X-m)^T = XX^T - V*mm^T to avoid a (T,V) copy.
     row_mean = x_t_dev.mean(dim=1, keepdim=True)  # (T, 1)
     corr_t = (x_t_dev @ x_t_dev.T - n_vox * (row_mean @ row_mean.T)) / float(n_vox)

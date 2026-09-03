@@ -116,11 +116,13 @@ def apply_voxel_variance_normalization(
 def filter_low_variance_voxels(
     data_vox_t: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float | int]]:
-    """Apply FSL-style variability thresholding before MELODIC PPCA dim estimation.
+    """Drop near-flat voxels before model-order estimation.
 
-    FSL runs ``update_mask`` before PPCA model-order selection and drops voxels
-    with unusually low temporal variability. This helper mirrors the thresholding
-    rule without modifying the caller's full ICA data matrix.
+    Voxels with almost no temporal variability carry no signal but do sit at the bottom
+    of the eigenspectrum, where the model-order criterion reads the noise floor. Leaving
+    them in biases that floor downward and inflates the count. Returns a filtered copy so
+    the caller's full ICA data matrix is untouched -- the filter applies to the estimate
+    only, never to what is decomposed.
     """
     if data_vox_t.ndim != 2 or data_vox_t.shape[0] < 2:
         return data_vox_t, {
