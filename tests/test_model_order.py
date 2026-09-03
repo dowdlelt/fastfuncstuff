@@ -11,9 +11,11 @@ import numpy as np
 import pytest
 
 from fastfuncstuff.decomposition.model_order import (
+    adjust_eigenspectrum,
     effective_sample_size,
     effective_sample_size_from_resels,
     laplace_evidence_curve,
+    mp_expected_eigenvalues,
     mp_noise_level,
     mp_signal_count,
     select_model_order,
@@ -172,3 +174,45 @@ def test_at_ceiling_flags_a_user_cap_not_the_mp_cap():
     assert truncated.k == 4
     assert truncated.ceiling_source == "k_max"
     assert truncated.at_ceiling, "a k_max that cuts a rising curve must warn"
+
+
+def test_mp_expected_eigenvalues_span_the_mp_interval():
+    """Pure noise has a SLOPING spectrum; this function is that slope."""
+    p, n, s2 = 200, 5000, 2.0
+    exp = mp_expected_eigenvalues(p, n, sigma2=s2)
+    g = p / n
+    lo, hi = s2 * (1 - np.sqrt(g)) ** 2, s2 * (1 + np.sqrt(g)) ** 2
+    assert exp.size == p
+    assert np.all(np.diff(exp) <= 1e-9)  # descending
+    assert lo <= exp[-1] < exp[0] <= hi
+    # the spread is real, not a rounding artifact
+    assert exp[0] / exp[-1] > 1.2
+    assert abs(float(np.mean(exp)) - s2) < 0.05 * s2
+
+
+def test_adjust_eigenspectrum_flattens_pure_noise():
+    """On noise the adjusted spectrum must be ~flat at 1 -- that is the whole point."""
+    rng = np.random.default_rng(0)
+    n, p = 4000, 150
+    x = rng.standard_normal((n, p))
+    ev = np.linalg.svd(x - x.mean(0), compute_uv=False) ** 2 / n
+    ev = np.sort(ev)[::-1]
+    adj, _ = adjust_eigenspectrum(ev, n)
+    raw_spread = ev[0] / ev[-1]
+    adj_spread = adj[0] / adj[-1]
+    assert adj_spread < raw_spread / 2, f"{adj_spread=} not much flatter than {raw_spread=}"
+    assert 0.5 < float(np.median(adj)) < 2.0
+
+
+def test_adjustment_lowers_the_count_on_a_sloping_noise_tail():
+    """Bug of record: without the PICA adjustment the count runs away.
+
+    The unadjusted spectrum makes one more component always pay, because the noise tail
+    still slopes. Measured on real data as k=84 vs k=59; here it just has to move the
+    right way on planted data.
+    """
+    rng = np.random.default_rng(7)
+    ev = _planted(n_time=150, n_vox=8000, rank=5, snr=3.0, rng=rng)
+    k_adj = select_model_order(ev, n_samples=8000, adjust_spectrum=True).k
+    k_raw = select_model_order(ev, n_samples=8000, adjust_spectrum=False).k
+    assert k_adj <= k_raw

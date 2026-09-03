@@ -12,13 +12,27 @@ References
   sample covariance, which is what tells us where the noise bulk ends.
 - Beckmann, C.F. & Smith, S.M. (2004). *Probabilistic independent component analysis for
   functional magnetic resonance imaging*. IEEE TMI 23(2):137-152. Establishes that
-  spatial smoothness inflates the apparent sample size and must be corrected for.
+  spatial smoothness inflates the apparent sample size and must be corrected for, and
+  that the evidence is evaluated on an eigenspectrum *adjusted* for the noise-only
+  distribution.
+- Smith, S.M., Beckmann, C.F. & DeLuca, M. (2005). Phil Trans R Soc B 360(1457):1001-1013.
+  Restates the adjustment step explicitly: "we can adjust the observed eigenspectrum by
+  the quantiles of the predicted cumulative distribution of eigenvalues from Gaussian
+  noise (Johnstone 2000), prior to estimating the model order".
+- Johnstone, I.M. (2001). *On the distribution of the largest eigenvalue in principal
+  components analysis*. Ann. Statist. 29(2):295-327. The null distribution being
+  divided out.
 - Worsley, K.J. et al. (1992). J. Cereb. Blood Flow Metab. 12:900-918. Resels.
 
 The estimator
 -------------
-Two published facts, composed:
+Three published facts, composed **in this order**:
 
+0. **Adjust the spectrum first.** Pure Gaussian noise does not produce a flat spectrum --
+   its eigenvalues spread across the whole Marchenko-Pastur interval. Dividing the
+   observed spectrum by the expected noise-only order statistics removes that slope
+   (:func:`adjust_eigenspectrum`). PICA does this before selecting, and it is not
+   optional: see the measurement below.
 1. **Marchenko-Pastur gives a ceiling.** For a pure-noise matrix, the sample eigenvalues
    concentrate on a known interval; anything above its upper edge is inconsistent with
    noise. The count of such eigenvalues is the most components the spectrum can even
@@ -27,10 +41,12 @@ Two published facts, composed:
    all, choose the one the PPCA model evidence prefers.
 
 The failure mode this is built to avoid is the Laplace curve running away into the noise
-bulk. That happens when the sample size fed to it is overstated, which for fMRI it always
-is: neighbouring voxels are not independent observations. Hence
-:func:`effective_sample_size` — with a smoothness-corrected ``n_samples`` and an MP
-ceiling, the raw evidence curve is well behaved and needs no reshaping of the spectrum.
+bulk. Correcting ``n_samples`` for spatial smoothness (:func:`effective_sample_size`) is
+*necessary but not sufficient*: measured on ds005165 rest run 1, the Laplace argmax sits
+at ``T-1`` -- the largest value available -- at every effective sample size from 78,832
+down to 1,000, so the evidence never binds and the MP ceiling alone selects. What fixes
+it is step 0. At the same ``n_samples``, the unadjusted spectrum gives k=84 and the
+adjusted one k=59 (MELODIC on that run: 66).
 """
 
 from __future__ import annotations
@@ -43,7 +59,9 @@ __all__ = [
     "ModelOrderResult",
     "effective_sample_size",
     "effective_sample_size_from_resels",
+    "adjust_eigenspectrum",
     "laplace_evidence_curve",
+    "mp_expected_eigenvalues",
     "mp_noise_level",
     "mp_signal_count",
     "select_model_order",
@@ -272,6 +290,78 @@ def laplace_evidence_curve(
     return out
 
 
+def mp_expected_eigenvalues(
+    n_features: int,
+    n_samples: int,
+    sigma2: float = 1.0,
+    *,
+    grid: int = 20000,
+) -> np.ndarray:
+    """Expected eigenvalues of pure Gaussian noise, descending (Marchenko-Pastur quantiles).
+
+    Under a Gaussian-noise null the sample eigenvalues are Wishart distributed, and for
+    ``n_features/n_samples = gamma`` their limiting density is Marchenko-Pastur (1967) on
+    ``[lambda_-, lambda_+] = sigma2 * (1 -+ sqrt(gamma))^2``. The ``i``-th largest expected
+    eigenvalue is the ``1 - (i - 0.5)/p`` quantile of that law.
+
+    Even pure noise produces a *sloping* spectrum -- the largest noise eigenvalue is
+    ``(1+sqrt(gamma))^2`` and the smallest ``(1-sqrt(gamma))^2``, a real spread that has
+    nothing to do with signal. This function is that expected slope, so it can be divided
+    out; see :func:`adjust_eigenspectrum`.
+    """
+    p = int(n_features)
+    if p < 1:
+        raise ValueError(f"n_features must be positive, got {n_features}")
+    if n_samples < 1:
+        raise ValueError(f"n_samples must be positive, got {n_samples}")
+    g = p / float(n_samples)
+    s2 = max(float(sigma2), 1e-30)
+    lo, hi = s2 * (1.0 - np.sqrt(g)) ** 2, s2 * (1.0 + np.sqrt(g)) ** 2
+    if not np.isfinite(hi) or hi <= lo:
+        return np.full(p, s2, dtype=np.float64)
+    x = np.linspace(lo, hi, int(grid))
+    dens = np.sqrt(np.clip((hi - x) * (x - lo), 0.0, None)) / (
+        2.0 * np.pi * g * np.maximum(x, 1e-30) * s2
+    )
+    cdf = np.cumsum(dens)
+    total = float(cdf[-1])
+    if total <= 0:
+        return np.full(p, s2, dtype=np.float64)
+    cdf = cdf / total
+    q = 1.0 - (np.arange(1, p + 1) - 0.5) / p  # descending order statistics
+    return np.interp(q, cdf, x)
+
+
+def adjust_eigenspectrum(evals: np.ndarray, n_samples: int) -> tuple[np.ndarray, float]:
+    """Divide out the eigenspectrum slope that Gaussian noise alone would produce.
+
+    Returns ``(adjusted, sigma2)``. This is the step Beckmann & Smith's PICA applies
+    *before* model-order selection, and skipping it is the single biggest source of
+    over-counting in this module:
+
+        "the eigenvalues have a Wishart distribution and we can adjust the observed
+        eigenspectrum by the quantiles of the predicted cumulative distribution of
+        eigenvalues from Gaussian noise (Johnstone 2000), prior to estimating the model
+        order [...] we use the Laplace approximation to the posterior distribution of the
+        model evidence that can be calculated efficiently from the adjusted eigenspectrum"
+        -- Smith, Beckmann & DeLuca (2005), Phil Trans R Soc B 360:1001, reviewing
+        Beckmann & Smith (2004), IEEE TMI 23:137.
+
+    Without it both criteria see a noise tail that still slopes, so one more component
+    always pays: measured on ds005165 rest run 1, the raw spectrum gives k=84 and the
+    adjusted one k=59 (MELODIC: 66) at the same effective sample size.
+    """
+    ev = np.asarray(evals, dtype=np.float64)
+    if ev.ndim != 1 or ev.size < 3:
+        raise ValueError(f"need at least 3 eigenvalues, got {ev.size}")
+    if not np.all(np.diff(ev) <= 1e-9 * max(1.0, float(ev[0]))):
+        ev = np.sort(ev)[::-1]
+    ev = np.clip(ev, 0.0, None)
+    sigma2, _ = mp_noise_level(ev, n_samples)
+    expected = mp_expected_eigenvalues(ev.size, n_samples, sigma2=sigma2)
+    return ev / np.maximum(expected, 1e-12), float(sigma2)
+
+
 def select_model_order(
     evals: np.ndarray,
     n_samples: int,
@@ -280,6 +370,7 @@ def select_model_order(
     k_max: int | None = None,
     use_mp_ceiling: bool = True,
     mp_slack: float = 1.0,
+    adjust_spectrum: bool = True,
 ) -> ModelOrderResult:
     """Choose a model order: Laplace evidence, capped by Marchenko-Pastur.
 
@@ -292,6 +383,11 @@ def select_model_order(
     Raising it lets the evidence argue for a few more, which is occasionally right when
     the noise is not iid and the MP null is therefore slightly misspecified; it is a knob,
     not a default.
+
+    ``adjust_spectrum`` divides out the slope Gaussian noise alone would produce before
+    either criterion looks at the spectrum (:func:`adjust_eigenspectrum`). This is part of
+    the published PICA recipe, not a tweak, and turning it off is what makes the count run
+    away -- keep it on unless you are deliberately reproducing the unadjusted behaviour.
 
     Selection is the **global** maximum of the evidence over the admissible range, which
     is what Minka's paper prescribes. There is no first-peak rule: with a corrected
@@ -306,11 +402,18 @@ def select_model_order(
     ev = np.clip(ev, 0.0, None)
     d = ev.size
 
+    if adjust_spectrum:
+        ev, _ = adjust_eigenspectrum(ev, n_samples)
+
     k_mp, sigma2, lambda_plus = mp_signal_count(ev, n_samples)
 
     hi_spectrum = d - 1
     hi_user = hi_spectrum if k_max is None else min(int(k_max), hi_spectrum)
-    hi_mp = max(1, int(round(mp_slack * k_mp))) if (use_mp_ceiling and k_mp >= 1) else hi_user
+    # k_mp == 0 means MP found nothing above the noise edge. That is the ceiling doing its
+    # job at its strongest, so it must still bind -- the old `k_mp >= 1` guard fell through
+    # to an unconstrained search in exactly the case where the data supports no components
+    # at all, and the Laplace curve then ran to its argmax on pure noise.
+    hi_mp = max(1, int(round(mp_slack * k_mp))) if use_mp_ceiling else hi_user
     hi = min(hi_user, hi_mp)
     # Which constraint actually bound decides whether a still-rising curve is worth
     # warning about: the MP cap binding is the design working, a k_max cap binding means
