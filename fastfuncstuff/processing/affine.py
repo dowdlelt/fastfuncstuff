@@ -18,6 +18,7 @@ Coordinate conventions:
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -980,8 +981,10 @@ def batched_sample_bytes_per_point(interp: str, *, grad: bool = False) -> int:
     alike, and modelling them all with the grid_sample number is what OOM'd the
     coarse search on a cubic run:
 
-    linear     : homogeneous coords (16) + normalized grid (12) + values and the
-                 out-of-bounds mask (~9), with gx/gy/gz freed at the stack.
+    linear     : the grid (12) plus values and the out-of-bounds mask (~9).
+                 Folding the normalization into the candidate matrix removed the
+                 (B, M, 4) voxel-coordinate tensor and the three gx/gy/gz planes
+                 that used to dominate this; measured 21.2 B/point at B=170.
     separable  : homogeneous coords (16) plus the flat-coordinate working set of
                  :func:`_separable_resample_3d` -- contiguous x/y/z copies (12),
                  floor/round bases (12), in-bounds/tiny/heavy masks (3), the
@@ -994,11 +997,44 @@ def batched_sample_bytes_per_point(interp: str, *, grad: bool = False) -> int:
     so the ``ntaps**2`` slab and the three int64 tap-index grids the forward
     pass frees per chunk are all retained at once. Measured at 588 B/point for
     cubic (17 trials x 1.22M points peaked at 12.2 GiB); 600 with a little
-    headroom.
+    headroom. Linear-with-grad measures 41.8 B/point at the 17 trials that
+    regime actually runs, where the fixed cost is worst.
     """
     if interp == "linear":
-        return 60 if grad else 45
+        return 48 if grad else 24
     return 600 if grad else 80
+
+
+@lru_cache(maxsize=32)
+def _normalized_grid_constants(
+    shape: tuple[int, int, int], device: torch.device, dtype: torch.dtype
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Grid-coordinate map and in-bounds box for one source grid.
+
+    Memoised because these are three tiny host-built tensors, and the ~110 us of
+    transfer and launch to rebuild them was a third of the sampler's wall time at
+    the small candidate counts ``-onepass`` produces.
+
+    Returns ``(matrix, lo, hi)``: a (3, 4) map from homogeneous voxel coords to
+    ``align_corners`` grid coords, and AFNI's [-0.5, n-0.5] in-bounds box carried
+    through that same map. A degenerate axis keeps grid_sample's convention of
+    sampling its single plane, so its scale is zero rather than 2/(n-1).
+    """
+    snz, sny, snx = shape
+    scale = torch.tensor(
+        [
+            2.0 / (snx - 1) if snx > 1 else 0.0,
+            2.0 / (sny - 1) if sny > 1 else 0.0,
+            2.0 / (snz - 1) if snz > 1 else 0.0,
+        ],
+        device=device,
+        dtype=dtype,
+    )
+    matrix = torch.zeros(3, 4, device=device, dtype=dtype)
+    matrix[0, 0], matrix[1, 1], matrix[2, 2] = scale[0], scale[1], scale[2]
+    matrix[:, 3] = -1.0
+    upper = torch.tensor([snx - 0.5, sny - 0.5, snz - 0.5], device=device, dtype=dtype)
+    return matrix, scale * (-0.5) - 1.0, scale * upper - 1.0
 
 
 def sample_affine_at_points_batched(
@@ -1023,25 +1059,29 @@ def sample_affine_at_points_batched(
     M = points_xyz.shape[0]
     pts = points_xyz.to(device=device, dtype=dtype)
     homog = torch.cat([pts, torch.ones(M, 1, device=device, dtype=dtype)], dim=1)  # (M,4)
-    src = torch.einsum("bij,mj->bmi", matrices.to(dtype), homog)  # (B, M, 4)
-    sx, sy, sz = src[..., 0], src[..., 1], src[..., 2]  # (B, M)
-
     snz, sny, snx = source.shape
 
     if interp == "linear":
-        # Normalized grid coords are grid_sample's alone -- building them for the
-        # separable branch too cost three (B, M) float tensors nobody reads,
-        # which at coarse-search batch sizes is gigabytes.
-        gx = 2.0 * sx / (snx - 1) - 1.0 if snx > 1 else sx * 0.0
-        gy = 2.0 * sy / (sny - 1) - 1.0 if sny > 1 else sy * 0.0
-        gz = 2.0 * sz / (snz - 1) - 1.0 if snz > 1 else sz * 0.0
-        grid = torch.stack([gx, gy, gz], dim=-1).view(1, B, M, 1, 3)
-        del gx, gy, gz
-        vals = _grid_sample_3d(source[None, None], grid).reshape(B, M)
-        del grid
-    else:
-        vals = _separable_resample_3d(source, sx, sy, sz, interp).reshape(B, M)
+        # Normalizing *after* the transform was half the sampler's wall time: it
+        # reads three (B, M) planes, writes three more, then stacks a fourth copy
+        # -- 124 MB of pure traffic at a 170-candidate generation, against a
+        # gather that costs a quarter of that. The map to grid_sample's [-1, 1]
+        # is itself affine, so it composes into the candidate matrix instead and
+        # the einsum emits the grid directly. That also drops the fourth
+        # homogeneous component, which nothing downstream ever read.
+        norm, lo, hi = _normalized_grid_constants((snz, sny, snx), device, dtype)
+        grid = torch.einsum("bij,mj->bmi", norm @ matrices.to(dtype), homog)  # (B, M, 3)
+        vals = _grid_sample_3d(source[None, None], grid.view(1, B, M, 1, 3)).reshape(B, M)
+        if zero_outside:
+            # AFNI's outval=0 half-voxel border, carried through the same affine
+            # map. Testing the grid rather than the voxel coordinate tests the
+            # position grid_sample actually reads.
+            vals = vals.masked_fill((grid < lo).any(-1) | (grid > hi).any(-1), 0.0)
+        return vals
 
+    src = torch.einsum("bij,mj->bmi", matrices.to(dtype), homog)  # (B, M, 4)
+    sx, sy, sz = src[..., 0], src[..., 1], src[..., 2]  # (B, M)
+    vals = _separable_resample_3d(source, sx, sy, sz, interp).reshape(B, M)
     if zero_outside:
         oob = (
             (sx < -0.5)

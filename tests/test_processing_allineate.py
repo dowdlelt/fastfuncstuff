@@ -1209,6 +1209,45 @@ class TestSubsampling:
             single = sample_affine_at_points(vol, M[b], pts, zero_outside=True)
             torch.testing.assert_close(batched[b], single, atol=1e-4, rtol=0.0)
 
+    def test_sample_batched_zero_outside_matches_single(self):
+        """The batched out-of-bounds mask must match the single-matrix sampler.
+
+        The batched path folds the voxel -> grid_sample normalization into the
+        candidate matrix, so its half-voxel border test happens in normalized
+        coordinates. That is only a refactor if it selects exactly the same
+        points, including for transforms that push most of the sample off the
+        volume -- an off-by-a-ULP border silently reweights the lpc overlap
+        factor rather than failing.
+        """
+        from fastfuncstuff.processing.affine import (
+            identity_params,
+            params_to_matrix,
+            sample_affine_at_points,
+            sample_affine_at_points_batched,
+        )
+
+        torch.manual_seed(0)
+        # Strictly positive, so a zero sample can only have come from the mask.
+        vol = torch.rand(16, 16, 16) + 1.0
+        # Points on the exact voxel grid put samples right on the border.
+        grid = torch.arange(16, dtype=torch.float32)
+        pts = torch.stack(torch.meshgrid(grid, grid, grid, indexing="ij"), -1).reshape(-1, 3)
+
+        mats = []
+        for dx in (0.0, 3.5, -7.0, 14.0, -20.0):  # in-bounds through mostly-off
+            p = identity_params().clone()
+            p[0], p[1], p[5] = dx, dx * 0.5, dx
+            mats.append(params_to_matrix(p))
+        M = torch.stack(mats)
+
+        batched = sample_affine_at_points_batched(vol, M, pts, zero_outside=True)
+        for b in range(M.shape[0]):
+            single = sample_affine_at_points(vol, M[b], pts, zero_outside=True)
+            assert torch.equal(batched[b] == 0, single == 0), f"mask differs for matrix {b}"
+            torch.testing.assert_close(batched[b], single, atol=1e-4, rtol=0.0)
+        # The sweep must actually exercise the border, or it proves nothing.
+        assert 0 < int((batched == 0).sum()) < batched.numel()
+
     def test_assign_bloks_points_partitions(self):
         """assign_bloks_points labels points and respects MINCOR pruning."""
         from fastfuncstuff.processing.cost_blok import assign_bloks_points
