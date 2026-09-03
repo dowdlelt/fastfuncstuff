@@ -12,6 +12,7 @@ import pytest
 
 from fastfuncstuff.decomposition.model_order import (
     effective_sample_size,
+    effective_sample_size_from_resels,
     laplace_evidence_curve,
     mp_noise_level,
     mp_signal_count,
@@ -87,6 +88,20 @@ def test_effective_sample_size_divides_by_the_resel():
     assert effective_sample_size(1000, (2.0, 2.0, 1.0)) == 250
     # Sub-voxel smoothness is no smoothing, not a sample-size *increase*.
     assert effective_sample_size(1000, (0.5, 0.5, 0.5)) == 1000
+
+
+def test_effective_sample_size_from_resels_cannot_exceed_the_voxel_count():
+    """The product form must clamp too -- it is the one every caller uses.
+
+    Bug of record: the per-axis form clamped at 1.0 per axis but the product form did
+    not, so a sub-voxel resel (barely-smoothed data, which reads FWHM < 1 voxel on every
+    axis) reported *more* independent samples than there were voxels, and inflated the
+    selected ICA model order by ~15%.
+    """
+    assert effective_sample_size_from_resels(1000, 1.0) == 1000
+    assert effective_sample_size_from_resels(1000, 4.0) == 250
+    assert effective_sample_size_from_resels(1000, 0.83) == 1000
+    assert effective_sample_size_from_resels(1000, 1e-9) == 1000
     with pytest.raises(ValueError):
         effective_sample_size(0, (1.0, 1.0, 1.0))
 

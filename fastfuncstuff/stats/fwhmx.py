@@ -63,6 +63,11 @@ class FWHMxResult:
     classic_fwhm: tuple[float, float, float]  # Forman 1-diff (x, y, z) mm
     classic_combined: float  # geometric-mean combined classic FWHM (mm)
     n_subbricks: int  # timepoints that contributed
+    # Per-axis ACF FWHM (mm), in volume_shape order. AFNI reports only the radial
+    # (isotropic) `fwhm`; this fits the same model separately along each axis, which
+    # matters for a resel product FWHMx*FWHMy*FWHMz on anisotropic data. -1.0 per axis
+    # where the fit had too few offsets to be meaningful.
+    acf_fwhm_axes: tuple[float, float, float] = (-1.0, -1.0, -1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +349,7 @@ def estimate_fwhmx_run(
     bin_r, bin_y = _collapse_radius_bins(radii_off, mag)
 
     a, b, c, fwhm = _fit_model(bin_r, bin_y, device)
+    axes_fwhm = _per_axis_acf_fwhm(offsets.cpu(), radii_off, mag, device)
     return FWHMxResult(
         a=a,
         b=b,
@@ -353,6 +359,7 @@ def estimate_fwhmx_run(
         classic_fwhm=classic,
         classic_combined=combined,
         n_subbricks=n_bricks,
+        acf_fwhm_axes=axes_fwhm,
     )
 
 
@@ -411,6 +418,56 @@ def _afni_model_fwhm(a: float, b: float, c: float, bin_r: Tensor) -> float:
     r0, r1 = float(r[i - 1]), float(r[i])
     t = (m0 - 0.5) / (m0 - m1) if m0 != m1 else 0.0
     return 2.0 * (r0 + t * (r1 - r0))
+
+
+def _per_axis_acf_fwhm(
+    offsets: Tensor, radii: Tensor, mag: Tensor, device
+) -> tuple[float, float, float]:
+    """FWHM (mm) along each grid axis from the axis-aligned ACF samples.
+
+    3dFWHMx fits its (a, b, c) model to the *radially* binned ACF, so it reports one
+    isotropic FWHM. The resel product FWHMx*FWHMy*FWHMz wants three, and on anisotropic
+    acquisitions (thick slices) the radial number is wrong for every axis. The offsets
+    lying on each axis are already in ``mag``, so this costs no extra passes.
+
+    The 3-parameter model is not fitted here: within the default ACF radius an axis
+    carries only a handful of distinct radii (four at 3 mm voxels), which will not
+    constrain three parameters. Instead the sampled curve is interpolated to its half
+    maximum and doubled -- the same discrete-crossing rule :func:`_afni_model_fwhm`
+    applies to the fitted model, just applied to the measurements directly.
+
+    Returns -1.0 for an axis whose curve never reaches 0.5 within the sampled radii.
+    """
+    del device  # all reductions here are tiny; stay on the CPU tensors
+    out: list[float] = []
+    for ax in range(3):
+        others = [i for i in range(3) if i != ax]
+        on_axis = (offsets[:, others[0]] == 0) & (offsets[:, others[1]] == 0)
+        idx = on_axis.nonzero(as_tuple=False).flatten()
+        if idx.numel() < 2:
+            out.append(-1.0)
+            continue
+        # +delta and -delta share a radius; average them, and keep radii ascending.
+        r_ax = radii[idx].to(torch.float64)
+        y_ax = mag[idx].to(torch.float64)
+        uniq: dict[float, list[float]] = {}
+        for r_v, y_v in zip(r_ax.tolist(), y_ax.tolist(), strict=True):
+            uniq.setdefault(round(r_v, 6), []).append(y_v)
+        rs = sorted(uniq)
+        ys = [float(np.mean(uniq[r])) for r in rs]
+        out.append(_half_max_crossing(rs, ys))
+    return (out[0], out[1], out[2])
+
+
+def _half_max_crossing(rs: list[float], ys: list[float]) -> float:
+    """Twice the radius where the sampled curve (rs, ys) first falls below 0.5."""
+    for i in range(1, len(rs)):
+        if ys[i] < 0.5:
+            y0, y1 = ys[i - 1], ys[i]
+            r0, r1 = rs[i - 1], rs[i]
+            t = (y0 - 0.5) / (y0 - y1) if y0 != y1 else 0.0
+            return 2.0 * (r0 + t * (r1 - r0))
+    return -1.0
 
 
 def _fit_model(bin_r: Tensor, bin_y: Tensor, device) -> tuple[float, float, float, float]:

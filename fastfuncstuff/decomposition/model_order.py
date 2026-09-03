@@ -119,13 +119,20 @@ def effective_sample_size_from_resels(n_voxels: int, resels: float, floor: int =
     """As :func:`effective_sample_size`, given the resel *product* directly.
 
     One resel is the smoothness volume, so the count of independent observations is
-    ``n_voxels / resels`` -- the definition, with no additional scaling. ``floor`` lets a
-    caller keep the result at or above some minimum (typically the number of timepoints,
-    below which a temporal covariance estimate stops being meaningful).
+    ``n_voxels / resels`` -- the definition (Nichols, "FWHM/RESEL details for SPM and
+    FSL"), with no additional scaling. ``floor`` lets a caller keep the result at or
+    above some minimum (typically the number of timepoints, below which a temporal
+    covariance estimate stops being meaningful).
+
+    ``resels`` is clamped at 1: a resel smaller than a voxel would report *more*
+    independent samples than there are voxels, which is impossible. Estimators do return
+    sub-voxel FWHMs on barely-smoothed data (a per-axis FWHM near or below the voxel
+    width), and :func:`effective_sample_size` already clamps per axis for the same
+    reason -- this is the same guard for callers that pass the product directly.
     """
     if n_voxels <= 0:
         raise ValueError(f"n_voxels must be positive, got {n_voxels}")
-    return max(int(floor), 1, int(n_voxels / max(float(resels), 1e-6)))
+    return max(int(floor), 1, int(n_voxels / max(float(resels), 1.0)))
 
 
 def mp_noise_level(

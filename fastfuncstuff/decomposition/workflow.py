@@ -66,95 +66,6 @@ def sanitize_finite_tensor(t: torch.Tensor, label: str, verbose: bool = False) -
     return t
 
 
-def estimate_spatial_smoothness_resels(
-    data_4d: np.ndarray,
-    mask: np.ndarray | None = None,
-    device: torch.device | None = None,
-    verbose: bool = False,
-) -> tuple[float, float]:
-    """Estimate spatial smoothness using MELODIC/FSL-compatible resel logic."""
-    n_t = data_4d.shape[-1]
-    shape3d = data_4d.shape[:3]
-
-    if device is None:
-        device = torch.device("cpu")
-
-    mean_t = data_4d.mean(axis=-1)
-    std_t = np.std(data_4d, axis=-1, ddof=1)
-
-    valid = std_t > 1e-10
-    if mask is not None:
-        valid = valid & mask
-    std_safe = np.where(valid, std_t, 1.0)
-    del std_t
-
-    mask_t = torch.as_tensor(valid, device=device, dtype=torch.bool)
-
-    chunk_size = max(1, min(n_t, 50))
-    ssminus = [0.0, 0.0, 0.0]
-    s2 = [0.0, 0.0, 0.0]
-
-    n_chunks = (n_t + chunk_size - 1) // chunk_size
-    for t_start in tqdm(
-        range(0, n_t, chunk_size),
-        total=n_chunks,
-        desc="  FWHM estimate",
-        leave=True,
-        disable=n_chunks <= 1,
-    ):
-        t_end = min(t_start + chunk_size, n_t)
-        chunk_np = np.empty((t_end - t_start, *shape3d), dtype=np.float32)
-        for i, ti in enumerate(range(t_start, t_end)):
-            chunk_np[i] = (data_4d[..., ti] - mean_t) / std_safe
-        chunk_np[:, ~valid] = 0.0
-        r = torch.as_tensor(chunk_np, device=device, dtype=torch.float32)
-        del chunk_np
-
-        for ax in range(3):
-            dim = ax + 1
-            r_cur = r.narrow(dim, 1, r.shape[dim] - 1)
-            r_prev = r.narrow(dim, 0, r.shape[dim] - 1)
-
-            sl_cur = [slice(None)] * 3
-            sl_prev = [slice(None)] * 3
-            sl_cur[ax] = slice(1, None)
-            sl_prev[ax] = slice(None, -1)
-            m = mask_t[tuple(sl_cur)] & mask_t[tuple(sl_prev)]
-            m = m.unsqueeze(0)
-
-            ssminus[ax] += float((r_cur * r_prev * m).sum().item())
-            s2[ax] += float((0.5 * (r_cur**2 + r_prev**2) * m).sum().item())
-
-        del r
-
-    del mask_t, mean_t, std_safe, valid
-    if device.type == "cuda":
-        torch.cuda.empty_cache()
-
-    fwhm = []
-    for ax in range(3):
-        if s2[ax] < 1e-15:
-            fwhm.append(1.0)
-            continue
-        rval = ssminus[ax] / s2[ax]
-        rval = min(abs(rval), 0.99999)
-        if rval < 1e-10:
-            fwhm.append(1.0)
-            continue
-        sigmasq = -1.0 / (4.0 * np.log(rval))
-        fwhm_ax = float(np.sqrt(8.0 * np.log(2.0) * sigmasq))
-        fwhm.append(fwhm_ax)
-
-    if verbose:
-        verbose_print(
-            True, f"  FWHM per axis: X={fwhm[0]:.3f}, Y={fwhm[1]:.3f}, Z={fwhm[2]:.3f} voxels"
-        )
-
-    resels = fwhm[0] * fwhm[1] * fwhm[2]
-    fwhm_geo = float(np.cbrt(resels))
-    return resels, fwhm_geo
-
-
 def apply_voxel_variance_normalization(
     data_vox_t: torch.Tensor,
     num_spec: int | float | str,
@@ -590,3 +501,103 @@ def run_depth_lag_analysis(
         "depth_lag_plot": depth_lag_plot,
         "depth_lag_method": depth_lag_method,
     }
+
+
+@torch.inference_mode()
+def estimate_smoothness_resels_acf(
+    data_4d: np.ndarray,
+    voxdims: tuple[float, float, float],
+    mask: np.ndarray | None = None,
+    device: torch.device | None = None,
+    verbose: bool = False,
+) -> tuple[float, float, dict[str, object]]:
+    """Resel size from the AFNI ACF smoothness estimator (:mod:`stats.fwhmx`).
+
+    Returns ``(resels, fwhm_geo_voxels, diagnostics)`` where ``resels`` is the product
+    ``FWHM_x * FWHM_y * FWHM_z`` in **voxel** units -- the size of one resel, so that
+    ``n_voxels / resels`` is the resel count (Nichols, "FWHM/RESEL details for SPM and
+    FSL"; Worsley et al. 1992).
+
+    Why not the 1-difference estimator: Forman's first-difference FWHM assumes a Gaussian
+    spatial ACF, and fMRI noise has heavier tails than Gaussian, so it reads low. AFNI
+    moved to the mixed model ``a e^{-r^2/2b^2} + (1-a) e^{-r/c}`` after Eklund et al.
+    (2016) for exactly this reason, and it is the estimator ``3dClustSim -acf`` consumes.
+
+    Per-axis handling: the ACF model is fitted radially and so is isotropic. Where the
+    axis-aligned samples resolve a half-max crossing, the measured per-axis FWHMs are
+    used directly. Where they do not (FWHM below the voxel width along that axis, common
+    at 3 mm), the classic per-axis FWHMs are rescaled to the ACF's overall scale --
+    keeping the anisotropy the first-difference estimator does measure well while
+    adopting the tail-aware magnitude the ACF measures well.
+    """
+    from fastfuncstuff.stats.fwhmx import estimate_fwhmx_run
+
+    if device is None:
+        device = torch.device("cpu")
+    shape3d = tuple(int(s) for s in data_4d.shape[:3])
+    if mask is None:
+        mask = np.ones(shape3d, dtype=bool)
+    mask = np.asarray(mask, dtype=bool)
+
+    resid = torch.as_tensor(data_4d[mask], device=device, dtype=torch.float32)
+    resid = resid - resid.mean(dim=1, keepdim=True)
+    res = estimate_fwhmx_run(
+        resid,
+        torch.as_tensor(mask, device=device),
+        shape3d,  # type: ignore[arg-type]
+        voxdims,
+        device=device,
+        unif=True,  # per-voxel MAD scaling; fMRI variance is strongly non-uniform
+        progress=False,
+    )
+    del resid
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Fill unresolved axes from the classic anisotropy, scaled to the ACF magnitude.
+    scale = res.fwhm / res.classic_combined if res.classic_combined > 0 else 1.0
+    fwhm_mm: list[float] = []
+    n_from_acf = 0
+    for ax in range(3):
+        measured = res.acf_fwhm_axes[ax]
+        if measured > 0:
+            fwhm_mm.append(measured)
+            n_from_acf += 1
+        else:
+            fwhm_mm.append(res.classic_fwhm[ax] * scale)
+
+    fwhm_vox = [f / abs(v) for f, v in zip(fwhm_mm, voxdims, strict=True)]
+    resels = 1.0
+    for f in fwhm_vox:
+        resels *= max(1.0, f)
+    fwhm_geo = float(np.cbrt(resels))
+
+    diagnostics: dict[str, object] = {
+        "acf_a": res.a,
+        "acf_b": res.b,
+        "acf_c": res.c,
+        "acf_fwhm_mm": res.fwhm,
+        "acf_radius_mm": res.radius,
+        "classic_fwhm_mm": list(res.classic_fwhm),
+        "fwhm_mm": fwhm_mm,
+        "fwhm_voxels": fwhm_vox,
+        "axes_from_acf": n_from_acf,
+        "resels": resels,
+    }
+    if verbose:
+        verbose_print(
+            True,
+            f"ACF: a={res.a:.3f} b={res.b:.3f} c={res.c:.3f} → radial FWHM={res.fwhm:.3f} mm "
+            f"(radius {res.radius:.1f} mm)",
+        )
+        verbose_print(
+            True,
+            f"Classic per-axis FWHM (mm): "
+            f"{res.classic_fwhm[0]:.3f}, {res.classic_fwhm[1]:.3f}, {res.classic_fwhm[2]:.3f}",
+        )
+        verbose_print(
+            True,
+            f"FWHM per axis: X={fwhm_vox[0]:.3f}, Y={fwhm_vox[1]:.3f}, Z={fwhm_vox[2]:.3f} "
+            f"voxels ({n_from_acf}/3 measured directly from the ACF)",
+        )
+    return resels, fwhm_geo, diagnostics

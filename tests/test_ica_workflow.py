@@ -205,57 +205,75 @@ class TestApplyVoxelVarianceNormalization:
         assert isinstance(result[1], str)
 
 
-class TestEstimateSpatialSmoothnessResels:
-    """Test spatial smoothness estimation."""
+class TestEstimateSmoothnessReselsACF:
+    """Test the ACF-based spatial smoothness estimator."""
 
-    def test_returns_tuple(self):
-        """Test that function returns (resels, fwhm_geom) tuple."""
-        # Create simple 4D data
-        data_4d = np.random.randn(10, 10, 5, 20)  # Small for speed
+    VOXDIMS = (3.0, 3.0, 3.0)
 
-        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+    def test_returns_triple(self):
+        """Returns (resels, fwhm_geom, diagnostics)."""
+        rng = np.random.default_rng(0)
+        data_4d = rng.standard_normal((12, 12, 8, 20))
 
-        resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
+        from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+
+        resels, fwhm_geom, diag = estimate_smoothness_resels_acf(
+            data_4d, self.VOXDIMS, device=torch.device("cpu")
+        )
 
         assert isinstance(resels, float)
         assert isinstance(fwhm_geom, float)
-        assert resels > 0
-        assert fwhm_geom > 0
+        assert resels >= 1.0
+        assert fwhm_geom >= 1.0
+        assert set(diag) >= {"acf_fwhm_mm", "classic_fwhm_mm", "fwhm_voxels", "resels"}
 
     def test_with_mask(self):
-        """Test smoothness estimation with a mask."""
-        data_4d = np.random.randn(10, 10, 5, 20)
-        mask = np.ones((10, 10, 5), dtype=bool)
-        mask[:2, :2, :] = False  # Exclude some voxels
+        rng = np.random.default_rng(1)
+        data_4d = rng.standard_normal((12, 12, 8, 20))
+        mask = np.ones((12, 12, 8), dtype=bool)
+        mask[:2, :2, :] = False
 
-        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+        from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
 
-        resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, mask=mask)
-
-        assert resels > 0
-        assert fwhm_geom > 0
-
-    def test_with_constant_data(self):
-        """Test handling of constant data (no variance)."""
-        # Data with no temporal variance should still return valid results
-        data_4d = np.ones((10, 10, 5, 10))
-
-        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
-
-        resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d)
-
-        # Should still return valid values (uses minimum FWHM of 1.0)
-        assert resels >= 1.0  # At minimum FWHM=1 per axis
+        resels, fwhm_geom, _ = estimate_smoothness_resels_acf(
+            data_4d, self.VOXDIMS, mask=mask, device=torch.device("cpu")
+        )
+        assert resels >= 1.0
         assert fwhm_geom >= 1.0
 
-    def test_device_parameter(self):
-        """Test that device parameter is respected."""
-        data_4d = np.random.randn(5, 5, 3, 10)
-        device = torch.device("cpu")
+    def test_smoother_data_gives_more_resels(self):
+        """The estimator must respond to smoothness, not just return the floor.
 
-        from fastfuncstuff.decomposition.workflow import estimate_spatial_smoothness_resels
+        This is the property model order depends on: a blurred volume has fewer
+        independent samples, so its resel size must come out larger.
+        """
+        from scipy.ndimage import gaussian_filter
 
-        resels, fwhm_geom = estimate_spatial_smoothness_resels(data_4d, device=device)
+        from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
 
-        # Just check it doesn't crash
-        assert resels > 0
+        rng = np.random.default_rng(2)
+        rough = rng.standard_normal((20, 20, 20, 24))
+        smooth = np.stack(
+            [gaussian_filter(rough[..., t], sigma=2.0) for t in range(rough.shape[-1])],
+            axis=-1,
+        )
+
+        r_rough, _, _ = estimate_smoothness_resels_acf(
+            rough, self.VOXDIMS, device=torch.device("cpu")
+        )
+        r_smooth, _, _ = estimate_smoothness_resels_acf(
+            smooth, self.VOXDIMS, device=torch.device("cpu")
+        )
+        assert r_smooth > r_rough * 2.0, f"{r_smooth=} not clearly above {r_rough=}"
+
+    def test_constant_data(self):
+        """Constant data has no variance; must not crash or return a sub-voxel resel."""
+        data_4d = np.ones((10, 10, 6, 10))
+
+        from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+
+        resels, fwhm_geom, _ = estimate_smoothness_resels_acf(
+            data_4d, self.VOXDIMS, device=torch.device("cpu")
+        )
+        assert resels >= 1.0
+        assert fwhm_geom >= 1.0

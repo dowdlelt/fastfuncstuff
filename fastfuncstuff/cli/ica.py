@@ -87,7 +87,7 @@ except ImportError as e:
     sys.exit(1)
 
 
-_estimate_spatial_smoothness_resels = ica_workflow.estimate_spatial_smoothness_resels
+_estimate_smoothness_resels_acf = ica_workflow.estimate_smoothness_resels_acf
 _check_finite = ica_workflow.sanitize_finite_tensor
 _vsection = ica_workflow.verbose_section
 _vprint = ica_workflow.verbose_print
@@ -328,8 +328,9 @@ def _run_single_ica(
         )
     else:
         # Estimate from data (must happen before data is freed)
-        resels, fwhm_geo = _estimate_spatial_smoothness_resels(
+        resels, fwhm_geo, _smooth_diag = _estimate_smoothness_resels_acf(
             data,
+            voxel_sizes,
             mask=mask3d,
             device=device,
             verbose=args.verb >= 1,
@@ -1519,8 +1520,9 @@ def _run_concat_ica(
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
 
             # Estimate spatial smoothness from first run
-            resels_accum, fwhm_geo_accum = _estimate_spatial_smoothness_resels(
+            resels_accum, fwhm_geo_accum, _ = _estimate_smoothness_resels_acf(
                 data,
+                voxel_sizes,
                 mask=mask3d,
                 device=device,
                 verbose=args.verb >= 1,
@@ -2386,8 +2388,8 @@ def _temporal_ica_preprocess_runs(
                 )
             if mask3d is not None and mask3d.shape != shape3d:
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
-            resels, fwhm_geo = _estimate_spatial_smoothness_resels(
-                data, mask=mask3d, device=device, verbose=args.verb >= 1
+            resels, fwhm_geo, _ = _estimate_smoothness_resels_acf(
+                data, voxel_sizes, mask=mask3d, device=device, verbose=args.verb >= 1
             )
 
         if mask3d is not None:
@@ -2896,8 +2898,9 @@ def _run_tensorial_ica(
             if mask3d is not None and mask3d.shape != shape3d:
                 raise ValueError(f"Mask shape {mask3d.shape} != data shape {shape3d}")
 
-            resels_accum, fwhm_geo_accum = _estimate_spatial_smoothness_resels(
+            resels_accum, fwhm_geo_accum, _ = _estimate_smoothness_resels_acf(
                 data,
+                voxel_sizes,
                 mask=mask3d,
                 device=device,
                 verbose=args.verb >= 1,
