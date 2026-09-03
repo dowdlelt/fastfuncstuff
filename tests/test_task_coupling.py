@@ -1459,10 +1459,10 @@ def test_coupling_stataux_matches_afni_correl_t2p_dof():
     have already had a (polort+1)-column drift basis projected out, against one
     regressor: T - (polort+1) - 1.
     """
-    from fastfuncstuff.cli.locomoco import _coupling_stataux
+    from fastfuncstuff.cli.task_events import coupling_stataux
 
     # n_ort counts EVERY column removed from both sides: polort+1 drift columns here.
-    aux = _coupling_stataux(n_t=120, n_ort=4, n_sub=2)
+    aux = coupling_stataux(n_t=120, n_ort=4, n_sub=2)
     assert set(aux) == {0, 1}
     for code, params in aux.values():
         assert code == 2  # FUNC_COR_TYPE
@@ -1471,13 +1471,13 @@ def test_coupling_stataux_matches_afni_correl_t2p_dof():
         assert nsam - nfit - nort == 120 - 3 - 2
     # A fit that also carries 5 nuisance regressors must declare their dof, or AFNI
     # credits it with dof it did not have.
-    ((_c, p_pc),) = set(_coupling_stataux(n_t=120, n_ort=4 + 5, n_sub=1).values())
+    ((_c, p_pc),) = set(coupling_stataux(n_t=120, n_ort=4 + 5, n_sub=1).values())
     assert p_pc == (120.0, 1.0, 9.0)
 
 
 def test_psc_betas_recover_a_planted_percent_signal_change():
     """A voxel modulated by 5% of its own mean must read ~5 %sig, whatever the units."""
-    from fastfuncstuff.cli.locomoco import _psc_betas
+    from fastfuncstuff.cli.task_events import psc_betas
     from fastfuncstuff.stats.task_coupling import task_coupling
 
     n_t = 120
@@ -1489,7 +1489,7 @@ def test_psc_betas_recover_a_planted_percent_signal_change():
     mask = torch.zeros(shape)
     mask[1, 1, 1] = 1
     tc = task_coupling(series, x, polort=1, mask=mask)
-    psc = _psc_betas(tc, x.numpy(), series.mean(dim=3), mask)
+    psc = psc_betas(tc, x.numpy(), series.mean(dim=3), mask)
     # The regressor swings 0->1, so beta IS the full modulation depth.
     assert abs(float(psc[1, 1, 1, 0]) - 5.0) < 0.2
     # Untouched voxels are flat, not noise: a constant voxel must not score.
@@ -1498,7 +1498,7 @@ def test_psc_betas_recover_a_planted_percent_signal_change():
 
 def test_psc_betas_are_scale_free():
     """Doubling the intensity units must not change the percentage."""
-    from fastfuncstuff.cli.locomoco import _psc_betas
+    from fastfuncstuff.cli.task_events import psc_betas
     from fastfuncstuff.stats.task_coupling import task_coupling
 
     n_t = 100
@@ -1510,13 +1510,13 @@ def test_psc_betas_are_scale_free():
         series = torch.full((*shape, n_t), 500.0 * scale)
         series[0, 0, 0] = 500.0 * scale * (1.0 + 0.03 * x[:, 0])
         tc = task_coupling(series, x, polort=1, mask=mask)
-        out.append(float(_psc_betas(tc, x.numpy(), series.mean(dim=3), mask)[0, 0, 0, 0]))
+        out.append(float(psc_betas(tc, x.numpy(), series.mean(dim=3), mask)[0, 0, 0, 0]))
     assert abs(out[0] - out[1]) < 1e-3
 
 
 def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
     """AFNI bucket order: the whole-model R, then view sub-brick 2k, threshold on 2k+1."""
-    from fastfuncstuff.cli.locomoco import _save_task_fit
+    from fastfuncstuff.cli.task_events import save_task_fit
     from fastfuncstuff.io.afni import read_brick_labels, read_brick_stataux
     from fastfuncstuff.stats.task_coupling import task_coupling
 
@@ -1530,7 +1530,7 @@ def test_save_task_fit_interleaves_coef_and_stat_per_condition(tmp_path):
     psc = torch.zeros(*shape, 2)
 
     out = tmp_path / "fit.nii.gz"
-    _save_task_fit(str(out), tc, psc, labels, np.eye(4), 2, n_t)
+    save_task_fit(str(out), tc, psc, labels, np.eye(4), 2, n_t)
 
     import nibabel as nib
 
