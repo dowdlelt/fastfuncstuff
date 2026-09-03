@@ -32,6 +32,7 @@ future NVIDIA-hardware / RAFT backend can slot in behind the same signature.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -7368,10 +7369,11 @@ def refine_interecho_temporally(
 
 
 def _warp_matrix(components, device=None, dtype=torch.float64):
-    """``(x, mean, xc, shapes, axes, widths)`` — the axes' fields as one ``(T, S)`` matrix.
+    """``(x, mean, shapes, axes, widths)`` — the axes' fields as one ``(T, S)`` matrix.
 
-    Shared by the PCA and ICA decompositions so both see exactly the same columns in
-    the same order; the per-axis split on the way out is then just a column range.
+    Materialises the whole thing, which only the ICA path needs: FastICA wants the data
+    matrix itself. The PCA path streams instead (:func:`_warp_grams`) — at T~400 frames
+    and ~10^6 voxels per axis this array is several GB.
     """
     mats, shapes, axes = [], [], []
     for axis, disp in components:
@@ -7387,8 +7389,120 @@ def _warp_matrix(components, device=None, dtype=torch.float64):
     x = torch.cat(mats, dim=1).to(dtype)
     if device is not None:
         x = x.to(device)
-    mean = x.mean(dim=0, keepdim=True)
-    return x, mean, x - mean, shapes, axes, widths
+    return x, x.mean(dim=0, keepdim=True), shapes, axes, widths
+
+
+def _warp_blocks(components):
+    """``[(axis, shape, (S_a, T) float32 block)]`` for the axes that actually moved.
+
+    The displacement arrays are already ``(nx, ny, nz, T)`` and contiguous, so the
+    reshape is a view and a voxel chunk is a contiguous row slice — which is what lets
+    the Gram accumulate without ever transposing the field.
+    """
+    out = []
+    for axis, disp in components:
+        if float(disp.abs().max()) == 0.0:
+            continue
+        t = disp.shape[-1]
+        out.append((axis, tuple(disp.shape[:3]), disp.contiguous().reshape(-1, t)))
+    return out
+
+
+@contextlib.contextmanager
+def _no_tf32():
+    """Disable TF32 matmul for the duration — a Gram is a sum of ~10^6 products."""
+    saved = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = saved
+
+
+def _warp_chunk(n_vox, n_t, device, n_pcs=1):
+    from ..memory import estimate_chunk_size
+
+    return estimate_chunk_size(n_vox, n_t, max(1, n_pcs), device, operation="warp_gram")
+
+
+def _warp_grams(blocks, device=None, want_means=False):
+    """Per-axis mean-centred Gram matrices ``X_c X_c^T`` (T, T), streamed over voxels.
+
+    Everything the warp PCA reports is a function of this (T, T) matrix: the temporal
+    factor is its eigenbasis, the spectrum its eigenvalues, and the per-axis accounting
+    in :func:`_axis_balance` is ``u^T G_a u`` and ``trace(G_a)``. Forming the full
+    ``(T, S)`` matrix in float64 to hand it to ``linalg.svd`` instead costs a 5 GB
+    allocation, a second one for the ``V^T`` that is thrown away, and a minute of gesdd
+    on a 440-frame 0.8mm run — where the Gram takes about a second.
+
+    Chunks are float32 on the compute device with a float64 accumulator, which matches
+    the float64 SVD's singular values to ~1e-10 relative. Returns ``(grams, means)``,
+    ``means`` being the per-voxel temporal mean per axis (float64) or None.
+    """
+    dev = device or torch.device("cpu")
+    n_t = blocks[0][2].shape[1]
+    grams, means = [], []
+    with _no_tf32():
+        for _axis, _shape, mat in blocks:
+            n_vox = mat.shape[0]
+            step = _warp_chunk(n_vox, n_t, dev)
+            g = torch.zeros(n_t, n_t, dtype=torch.float64, device=dev)
+            mu = torch.empty(n_vox, dtype=torch.float64) if want_means else None
+            for i in range(0, n_vox, step):
+                staged = mat[i : i + step].to(dev, torch.float32)
+                m = staged.mean(dim=1, keepdim=True)
+                # NOT in place: on CPU ``.to`` of an already-float32 tensor is the
+                # caller's own warp field, and centering it would silently strip the
+                # per-voxel mean out of the data everything downstream still uses.
+                c = staged - m
+                g += (c.T @ c).double()
+                if mu is not None:
+                    mu[i : i + step] = m[:, 0].double().cpu()
+                del staged, c, m
+            grams.append(g.cpu())
+            means.append(mu)
+    return grams, means
+
+
+def _warp_loadings(blocks, u, device=None):
+    """``[(axis, (nx, ny, nz, k))]`` — the components' spatial loadings ``X_c^T u``.
+
+    A second streaming pass, because the Gram never sees the columns. Cheap next to the
+    Gram itself (k << T) and only run when a caller actually wants the maps.
+    """
+    dev = device or torch.device("cpu")
+    n_t, k = u.shape
+    u_dev = u.to(dev, torch.float32)
+    out = []
+    with _no_tf32():
+        for _axis, shape, mat in blocks:
+            n_vox = mat.shape[0]
+            step = _warp_chunk(n_vox, n_t, dev, k)
+            load = torch.empty(n_vox, k, dtype=torch.float64)
+            for i in range(0, n_vox, step):
+                staged = mat[i : i + step].to(dev, torch.float32)
+                c = staged - staged.mean(dim=1, keepdim=True)  # see _warp_grams
+                load[i : i + step] = (c @ u_dev).double().cpu()
+                del staged, c
+            out.append(load.reshape(*shape, k).contiguous())
+    return out
+
+
+def _top_eigh(gram, k):
+    """``(vectors (T, k), values (k,), trace)`` of a Gram, largest first, sign-fixed.
+
+    ``eigh`` returns ascending order and an arbitrary column sign; anchoring the sign on
+    each component's largest-magnitude frame makes the basis reproducible run to run,
+    which the SVD it replaces never guaranteed.
+    """
+    ev, vec = torch.linalg.eigh(gram)
+    ev = ev.flip(0).clamp(min=0.0)
+    vec = vec.flip(1)
+    k = max(1, min(int(k), ev.numel()))
+    vec, ev = vec[:, :k].contiguous(), ev[:k]
+    sign = torch.sign(vec[vec.abs().argmax(dim=0), torch.arange(k)])
+    vec = vec * torch.where(sign == 0, torch.ones_like(sign), sign)
+    return vec, ev, float(torch.diagonal(gram).sum())
 
 
 def _split_loadings(load, mean, shapes, axes, widths, k):
@@ -7517,7 +7631,7 @@ def warp_ica_basis(components, n_components=None, pca_components=0.95, device=No
     built = _warp_matrix(components, device=device, dtype=torch.float32)
     if built is None:
         return None
-    x, mean, _xc, shapes, axes, widths = built
+    x, mean, shapes, axes, widths = built
     ica = FastICA(
         n_components=n_components,
         pca_components=pca_components,
@@ -7538,54 +7652,51 @@ def warp_ica_basis(components, n_components=None, pca_components=0.95, device=No
     return mixing, loadings, means, var
 
 
-def _axis_balance(xc, u, load, widths, axes):
+def _axis_balance(grams, u, axes):
     """Per-axis accounting for a SHARED temporal basis: is it serving both axes?
 
-    Three numbers per encode axis, all from factors already computed except one small
-    solo ``svdvals`` per axis:
+    Three numbers per encode axis, all read off the per-axis Gram matrices the basis
+    was built from:
 
     * ``share`` — fraction of each component's loading energy that sits on this axis.
       A component whose share is ~1 is really a single-axis mode wearing a shared
       basis; that is legal (its loading on the other axis is near zero) but it is what
       a reader wants to know before using the scores as one regressor set.
     * ``shared_ev`` — cumulative variance of THIS axis explained by the shared basis.
-      ``u`` is orthonormal, so the rank-k projection residual is
-      ``||xc_a||^2 - ||load[:k, a]||^2``; no reconstruction is formed.
-    * ``solo_ev`` — the same for a basis fitted to this axis ALONE. ``solo_ev -
-      shared_ev`` is the price of sharing, in variance points, measured on this run
-      rather than remembered from another one.
+      ``u`` is orthonormal, so the energy component ``i`` takes off axis ``a`` is
+      ``(u^T G_a u)_ii`` and the axis's total is ``trace(G_a)``; no reconstruction and
+      no ``(k, S)`` loading matrix is formed.
+    * ``solo_ev`` — the same for a basis fitted to this axis ALONE, which is just the
+      eigenvalues of ``G_a``. ``solo_ev - shared_ev`` is the price of sharing, in
+      variance points, measured on this run rather than remembered from another one.
 
-    The reason this is worth reporting at all: the SVD runs on an UNWEIGHTED
+    The reason this is worth reporting at all: the decomposition runs on an UNWEIGHTED
     concatenation, so the basis is pulled toward whichever axis block carries more
     variance. Tuning the partition finer than the primary PE (per-axis ``-window`` /
     ``-levels`` / ``-qwarp_minpatch``) adds high-spatial-frequency estimation noise to
     that block, which buys it sway over the shared basis without adding motion. These
     numbers are how that shows up.
     """
-    out, start = [], 0
-    k = load.shape[0]
-    for axis, w in zip(axes, widths, strict=True):
-        blk = load[:, start : start + w]  # (k, w)
-        tot = float((xc[:, start : start + w] ** 2).sum())
-        per_k = (blk**2).sum(dim=1)
-        shared_ev = (per_k.cumsum(0) / max(tot, 1e-30)).clamp(max=1.0)
-        sv = torch.linalg.svdvals(xc[:, start : start + w])[:k]
-        solo_ev = ((sv**2).cumsum(0) / max(tot, 1e-30)).clamp(max=1.0)
-        share = per_k / (load**2).sum(dim=1).clamp(min=1e-30)
+    k = u.shape[1]
+    per_axis = [((u.T @ g) * u.T).sum(dim=1) for g in grams]  # diag(u^T G_a u), (k,)
+    total = torch.stack(per_axis).sum(dim=0).clamp(min=1e-30)
+    out = []
+    for axis, gram, per_k in zip(axes, grams, per_axis, strict=True):
+        tot = max(float(torch.diagonal(gram).sum()), 1e-30)
+        _vec, ev, _tr = _top_eigh(gram, k)
         out.append(
             {
                 "axis": axis,
-                "share": share.cpu(),
-                "shared_ev": shared_ev.cpu(),
-                "solo_ev": solo_ev.cpu(),
+                "share": (per_k / total).cpu(),
+                "shared_ev": (per_k.cumsum(0) / tot).clamp(max=1.0).cpu(),
+                "solo_ev": (ev.cumsum(0) / tot).clamp(max=1.0).cpu(),
                 "energy": tot,
             }
         )
-        start += w
     return out
 
 
-def warp_pc_basis(components, n_pcs=None, device=None, with_balance=False):
+def warp_pc_basis(components, n_pcs=None, device=None, with_balance=False, with_loadings=True):
     """Shared temporal PCs of a per-frame warp, WITH the per-axis spatial loadings.
 
     ``warp_time_pcs`` returns the scores alone, which is all a nuisance regressor
@@ -7604,6 +7715,8 @@ def warp_pc_basis(components, n_pcs=None, device=None, with_balance=False):
     its OWN spatial loading per axis, so a component can be dropped from one axis and
     kept on the other. Returns ``(scores (T,k), loadings [(axis, (nx,ny,nz,k))],
     means [(nx,ny,nz)], var_ratio (k,))``, or None if the warp is empty.
+    ``with_loadings=False`` skips the second streaming pass and returns empty loading
+    and mean lists — for the regressor path, which only ever uses the scores.
 
     That 0.09/0.22 measurement predates per-axis tuning, which is exactly the knob that
     could invalidate it: the SVD sees an UNWEIGHTED concatenation, so a partition solved
@@ -7612,24 +7725,31 @@ def warp_pc_basis(components, n_pcs=None, device=None, with_balance=False):
     ``with_balance=True`` appends :func:`_axis_balance`, which measures that per run
     instead of trusting the old number.
     """
-    built = _warp_matrix(components, device=device)
-    if built is None:
+    blocks = _warp_blocks(components)
+    if not blocks:
         return None
-    x, mean, xc, shapes, axes, widths = built
-    n_t = x.shape[0]
-    # Economy SVD on (T, S) with T ~ 100 and S in the millions: the left factor is what
-    # we want and torch computes it without ever forming an S x S covariance.
-    u, sv, _ = torch.linalg.svd(xc, full_matrices=False)
-    k_max = int(min(n_t - 1, min(widths), sv.numel()))
-    k = k_max if n_pcs is None else max(1, min(int(n_pcs), k_max))
-    u = u[:, :k].contiguous()
-    var = (sv[:k] ** 2) / (sv**2).sum().clamp(min=1e-30)
+    axes = [b[0] for b in blocks]
+    widths = [b[2].shape[0] for b in blocks]
+    n_t = blocks[0][2].shape[1]
+    grams, means = _warp_grams(blocks, device=device, want_means=with_loadings)
+    gram = torch.stack(grams).sum(dim=0)
 
-    load = u.T @ xc  # (k, S) -- component loadings over the pooled columns
-    loadings, means = _split_loadings(load, mean, shapes, axes, widths, k)
+    k_max = int(min(n_t - 1, min(widths)))
+    k = k_max if n_pcs is None else max(1, min(int(n_pcs), k_max))
+    u, ev, trace = _top_eigh(gram, k)
+    var = ev / max(trace, 1e-30)
+
+    if with_loadings:
+        loadings = list(zip(axes, _warp_loadings(blocks, u, device=device), strict=True))
+        means = [
+            mu.reshape(shape).contiguous()
+            for mu, (_ax, shape, _m) in zip(means, blocks, strict=True)
+        ]
+    else:
+        loadings, means = [], []
     if with_balance:
-        return u.cpu(), loadings, means, var.cpu(), _axis_balance(xc, u, load, widths, axes)
-    return u.cpu(), loadings, means, var.cpu()
+        return u, loadings, means, var, _axis_balance(grams, u, axes)
+    return u, loadings, means, var
 
 
 def warp_pc_reconstruct(components, keep, n_pcs=None, device=None):
@@ -7667,21 +7787,17 @@ def warp_pc_axis_bases(components, n_pcs=5, device=None):
     regressor count doubles, which is real GLM degrees of freedom -- the comparison to
     make is against the SAME total budget, not against five shared.
     """
-    built = _warp_matrix(components, device=device)
-    if built is None:
+    blocks = _warp_blocks(components)
+    if not blocks:
         return []
-    _x, _mean, xc, _shapes, axes, widths = built
-    out, start = [], 0
-    n_t = xc.shape[0]
-    for axis, w in zip(axes, widths, strict=True):
-        blk = xc[:, start : start + w]
-        u, sv, _ = torch.linalg.svd(blk, full_matrices=False)
-        k = max(1, min(int(n_pcs), n_t - 1, w, sv.numel()))
-        sc = u[:, :k]
-        sc = sc / sc.std(dim=0, keepdim=True).clamp(min=1e-10)
-        var = (sv[:k] ** 2) / (sv**2).sum().clamp(min=1e-30)
-        out.append((axis, sc.cpu().float(), var.cpu().float()))
-        start += w
+    n_t = blocks[0][2].shape[1]
+    grams, _means = _warp_grams(blocks, device=device)
+    out = []
+    for (axis, _shape, mat), gram in zip(blocks, grams, strict=True):
+        k = max(1, min(int(n_pcs), n_t - 1, mat.shape[0]))
+        u, ev, trace = _top_eigh(gram, k)
+        sc = u / u.std(dim=0, keepdim=True).clamp(min=1e-10)
+        out.append((axis, sc.float(), (ev / max(trace, 1e-30)).float()))
     return out
 
 

@@ -3743,7 +3743,7 @@ def _pc_axis_labels(result, args):
 
 
 def _write_warp_pcs(
-    components, stem, n_pcs, *, per_axis=False, label_of=None, data=None, args=None
+    components, stem, n_pcs, *, per_axis=False, label_of=None, data=None, args=None, device=None
 ):
     """Write the top-N temporal warp PCs as {stem}_locomoco_pcs*.1D.
 
@@ -3774,7 +3774,7 @@ def _write_warp_pcs(
 
     if per_axis:
         with spinner("Computing warp PCs (per axis)"):
-            bases = warp_pc_axis_bases(components, n_pcs=n_pcs, device=None)
+            bases = warp_pc_axis_bases(components, n_pcs=n_pcs, device=device)
         if not bases:
             print("  • warp PCs: skipped (warp is all-zero)")
             return None, ""
@@ -3797,7 +3797,9 @@ def _write_warp_pcs(
         return torch.cat([sc for _lbl, sc in collected], dim=1), note
 
     with spinner("Computing warp PCs"):
-        got = warp_pc_basis(components, n_pcs=n_pcs, device=None, with_balance=True)
+        got = warp_pc_basis(
+            components, n_pcs=n_pcs, device=device, with_balance=True, with_loadings=False
+        )
     if got is None:
         print("  • warp PCs: skipped (warp is all-zero)")
         return None, ""
@@ -4620,6 +4622,7 @@ def _run_multiecho(
             label_of=_pc_axis_labels(result.per_echo[0], args),
             data=echo_mean_corr,
             args=args,
+            device=device,
         )
     if echo_mean_corr is not None:
         _write_data_task_after(echo_mean_corr, stem, args, pc_scores, pc_note)
@@ -5497,6 +5500,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
             label_of=_pc_axis_labels(result, args),
             data=corrected_series,
             args=args,
+            device=device,
         )
     _write_data_task_after(corrected_series, stem, args, pc_scores, pc_note)
 

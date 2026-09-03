@@ -326,6 +326,40 @@ def bytes_per_voxel_glm(
     return (5 * n_timepoints + n_regressors) * 4
 
 
+def bytes_per_voxel_warp_gram(
+    n_timepoints: int,
+    n_pcs: int = 1,
+) -> int:
+    """
+    Estimate memory per voxel for the streamed warp-field Gram / loadings passes.
+
+    A "voxel" here is one column of the (T, S) warp matrix. Each chunk stages the
+    float32 displacements, forms a mean-centred copy, and (on the loadings pass)
+    writes an (n, n_pcs) float64 block.
+
+    Parameters
+    ----------
+    n_timepoints : int
+        Number of frames in the warp series.
+    n_pcs : int, default=1
+        Components retained; only the loadings pass allocates these.
+
+    Returns
+    -------
+    int
+        Bytes per voxel
+
+    Notes
+    -----
+    Memory model: (3 * n_timepoints * 4) + (n_pcs * 8) bytes
+    - Staged chunk: n_timepoints * 4
+    - Centred copy: n_timepoints * 4
+    - Headroom for the transfer/temporaries: n_timepoints * 4
+    - Loadings block: n_pcs * 8 (float64, as the reconstruction consumes it)
+    """
+    return 3 * n_timepoints * 4 + n_pcs * 8
+
+
 def bytes_per_voxel_xval(
     n_timepoints: int,
     n_regressors: int,
@@ -1518,6 +1552,9 @@ def estimate_chunk_size(
         bytes_per_voxel = bytes_per_voxel_denoise(n_timepoints, n_regressors)
     elif operation == "ica_varnorm":
         bytes_per_voxel = bytes_per_voxel_ica_varnorm(n_timepoints)
+    elif operation == "warp_gram":
+        # n_regressors carries the retained component count (the loadings pass).
+        bytes_per_voxel = bytes_per_voxel_warp_gram(n_timepoints, n_regressors)
     elif operation == "prf":
         # n_regressors carries the aperture pixel count, which is what the pRF
         # refinement actually scales with (see bytes_per_voxel_prf).
