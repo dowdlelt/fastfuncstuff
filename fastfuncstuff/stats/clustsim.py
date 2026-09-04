@@ -343,6 +343,8 @@ def gumbel_extent_table(
     max_sizes: np.ndarray,
     athr: tuple[float, ...],
     n_iter: int,
+    *,
+    nodec: bool = False,
 ) -> np.ndarray:
     """``[npthr, nathr]`` cluster-size thresholds from per-iteration maxima.
 
@@ -354,7 +356,12 @@ def gumbel_extent_table(
     and a linear quantile lands a voxel or two off it in the tail.
 
     ``max_sizes`` is ``[n_iter, npthr]`` of per-iteration maximum cluster
-    sizes; the returned value for a cell can be fractional.
+    sizes; the returned value for a cell can be fractional unless ``nodec``.
+
+    The finished table is forced monotone along both axes — a looser pthr
+    and a stricter athr can only ever demand a larger cluster.  Monte-Carlo
+    noise does occasionally invert two adjacent cells, and AFNI edits those
+    out ("shouldn\'t be needed") before writing either output format.
     """
     n_pthr = max_sizes.shape[1]
     out = np.zeros((n_pthr, len(athr)), dtype=np.float64)
@@ -392,6 +399,13 @@ def gumbel_extent_table(
             g = lambda a: math.log(-math.log(1.0 - a))  # noqa: E731
             jj = ii + (g(aval) - g(alo)) / (g(ahi) - g(alo))
             out[ip, j] = max(jj, 1.0)
+
+    if nodec:
+        # AFNI's (int)(x + 0.951): round up, but tolerate a hair under.
+        out = np.floor(out + 0.951)
+    # Each column increases as pthr loosens; each row as athr tightens.
+    out = np.maximum.accumulate(out[::-1], axis=0)[::-1]
+    out = np.maximum.accumulate(out, axis=1)
     return out
 
 

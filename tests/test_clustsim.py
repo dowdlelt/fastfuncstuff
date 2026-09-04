@@ -12,6 +12,7 @@ from fastfuncstuff.stats.clustsim import (
     ACF,
     DEFAULT_CS_ATHR,
     DEFAULT_CS_PTHR,
+    LOTS_ATHR,
     NullFieldSimulator,
     acf_fwhm,
     acf_rfunc,
@@ -236,3 +237,23 @@ def test_parallel_and_serial_drivers_agree():
     a = simulate_cluster_null(mask, (3.0, 3.0, 3.0), ACF(0.5, 3.0, 4.0), n_jobs=1, **kw)
     b = simulate_cluster_null(mask, (3.0, 3.0, 3.0), ACF(0.5, 3.0, 4.0), n_jobs=3, **kw)
     np.testing.assert_array_equal(a.max_extent[("1-sided", 1)], b.max_extent[("1-sided", 1)])
+
+
+def test_gumbel_table_is_forced_monotone():
+    """Monte-Carlo noise can invert two adjacent cells; AFNI edits those out."""
+    rng = np.random.default_rng(3)
+    # Deliberately noisy: only 200 iterations over 3 nearly-identical columns.
+    sizes = rng.poisson(20, size=(200, 3)).astype(np.int64)
+    tab = gumbel_extent_table(sizes, LOTS_ATHR, 200)
+    assert np.all(np.diff(tab, axis=1) >= 0), "row must not decrease as athr tightens"
+    assert np.all(np.diff(tab, axis=0) <= 0), "column must not increase as pthr tightens"
+
+
+def test_nodec_rounds_up_before_the_table_is_read():
+    """-nodec must reach the NIML table too, not just the .1D formatting."""
+    rng = np.random.default_rng(4)
+    sizes = rng.poisson(40, size=(2000, 2)).astype(np.int64)
+    plain = gumbel_extent_table(sizes, DEFAULT_CS_ATHR, 2000)
+    rounded = gumbel_extent_table(sizes, DEFAULT_CS_ATHR, 2000, nodec=True)
+    assert np.all(rounded == np.floor(plain + 0.951))
+    assert np.all(rounded == np.round(rounded))
