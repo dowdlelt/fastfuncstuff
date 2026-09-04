@@ -132,6 +132,7 @@ class FastICA:
         random_state: int | None = None,
         whiten: bool = True,
         device: torch.device | None = None,
+        verbose: bool = True,
     ):
         self.n_components = n_components
         self.pca_components = pca_components
@@ -140,6 +141,10 @@ class FastICA:
         self.fun = fun
         self.random_state = random_state
         self.whiten = whiten
+        # The iteration bar reads `getattr(self, "verbose", True)`, so it was always on
+        # for a caller that had no way to say otherwise. A sub-second fit inside a larger
+        # report does not want a progress bar landing in the middle of the report.
+        self.verbose = verbose
         self.device = device if device is not None else get_device()
 
         # Fitted attributes

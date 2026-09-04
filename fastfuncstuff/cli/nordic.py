@@ -522,7 +522,7 @@ def parse_task_rescue(value) -> str:
     return mode
 
 
-def _scan_order(args, lost_vt, lost, mask, header, n_t, device) -> tuple[int, dict]:
+def _scan_order(args, lost_vt, lost, mask, voxdims, n_t, device) -> tuple[int, dict]:
     """Component count for the scan: forced, or the estimator under a small floor.
 
     The estimator is not wrong when it says one -- the removed field IS the
@@ -567,7 +567,6 @@ def _scan_order(args, lost_vt, lost, mask, header, n_t, device) -> tuple[int, di
         # number the floor overrides is not a default. `-task_comps est` runs it.
         return floor, {"mode": "floor", "floor": int(floor)}
     n_in = int(mask.sum())
-    voxdims = tuple(float(x) for x in header.get_zooms()[:3])
     # On the user's device, not pinned to the CPU: this is a full 4-D pass and it was
     # the single biggest cost in the scan (about 7 s on a small synthetic run, and it
     # scales with the dataset).
@@ -621,16 +620,15 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
 
     from fastfuncstuff.decomposition.ica import FastICA
     from fastfuncstuff.denoise.restore import restore_components
-    from fastfuncstuff.io.afni import load_nifti, save_nifti
+    from fastfuncstuff.io.afni import save_nifti
     from fastfuncstuff.stats.task_coupling import component_task_fit, component_variance_in_data
 
-    kept_img = load_nifti(str(outputs.magnitude_file))
-    kept = torch.as_tensor(np.ascontiguousarray(kept_img.get_fdata(dtype=np.float32)))
-    lost = torch.as_tensor(
-        np.ascontiguousarray(load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32))
-    )
+    # Both series come from the report that ran just above rather than off disk again:
+    # each is a gigabyte on a real run, and re-reading cost a decompress plus an F-to-C
+    # reorder for data already in hand.
+    kept, lost = state["kept"], state["lost"]
     n_t = kept.shape[3]
-    reference = (kept + lost).mean(dim=3)
+    reference = state["reference"]
     mask = reference > 0.1 * float(reference.max())
     # Constant voxels score a perfect fit and have poisoned two decompositions in this
     # codebase already (the MELODIC/GGM parity hunt, the denoisatorial PC selection).
@@ -641,7 +639,7 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
         return None
 
     lost_vt = lost.reshape(-1, n_t)[mask.reshape(-1)]  # (V', T)
-    k, num_diag = _scan_order(args, lost_vt, lost, mask, kept_img.header, n_t, device)
+    k, num_diag = _scan_order(args, lost_vt, lost, mask, state["voxdims"], n_t, device)
     est = num_diag.get("k_estimated")
     how = {
         "explicit": f"{k} forced",
@@ -649,7 +647,7 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
     }.get(str(num_diag.get("mode")), f"{k} = max(est {est}, floor {num_diag.get('floor')})")
     print(f"  COMPONENTS : {how}, over {n_in} vox x {n_t} frames")
 
-    ica = FastICA(n_components=k, device=device, random_state=0)
+    ica = FastICA(n_components=k, device=device, random_state=0, verbose=False)
     ica.fit(lost_vt.T.to(device))  # (T, V') -- mixing_ comes back (T, k)
     assert ica.mixing_ is not None and ica.components_ is not None  # fit() populates both
     mixing = ica.mixing_.detach().cpu()
@@ -980,10 +978,14 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         )
 
     kept_img = load_nifti(str(outputs.magnitude_file))
-    kept = torch.as_tensor(np.ascontiguousarray(kept_img.get_fdata(dtype=np.float32)))
+    # nibabel hands back an F-CONTIGUOUS array, so something has to reorder it -- and
+    # np.ascontiguousarray does that single-threaded: 4.15 s for one gigabyte, against
+    # 0.80 s for torch's threaded copy of the same array. Two volumes, so ~7 s of a run's
+    # CPU time went on a memory layout.
+    kept = torch.as_tensor(kept_img.get_fdata(dtype=np.float32)).contiguous()
     lost = torch.as_tensor(
-        np.ascontiguousarray(load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32))
-    )
+        load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32)
+    ).contiguous()
     affine = kept_img.affine
     n_t = kept.shape[3]
 
@@ -1046,11 +1048,22 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         )
 
     how = "cut" if args.task_thresh is not None else f"top {args.task_top_frac * 100:.0f}%"
-    enrich_txt = (
-        f"{enrich:.2f}x  (halves {', '.join(f'{e:.2f}' for e in per_half)})"
-        if enrich is not None
-        else "n/a  (neither half of the run places a mask)"
-    )
+    # The verdict is the whole point of the line and it is binary. Above 1.0 the removed
+    # series' task energy sits preferentially on responding tissue, which is a leak;
+    # at or below it there is nothing task-shaped in what was removed, and how far below
+    # carries no meaning -- the statistic has no informative range under its own null.
+    if enrich is None:
+        enrich_txt = "n/a  (neither half of the run places a mask)"
+    elif enrich <= 1.0:
+        enrich_txt = (
+            f"{enrich:.2f}x  (halves {', '.join(f'{e:.2f}' for e in per_half)})"
+            "  -- no task structure in what was removed"
+        )
+    else:
+        enrich_txt = (
+            f"{enrich:.2f}x  (halves {', '.join(f'{e:.2f}' for e in per_half)})"
+            "  -- SOME TASK in what was removed, concentrated where the response is"
+        )
     # Terse on stdout, long-form in the file. Every number a reader acts on is here;
     # what each one MEANS is in -help and in {prefix}_taskleak.txt, which is where a
     # reader who needs it goes once, rather than scrolling past it on every run.
@@ -1066,14 +1079,9 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         f"share {lost_share:.3f} vs {lost_tc.chance_share:.3f} chance",
         f"  ENRICHMENT : {enrich_txt}",
     ]
+    if enrich is not None and enrich > 1.0:
+        lines.append("               -retain_dof caps how much any patch may remove")
     print("\n".join(lines))
-    verdict = (
-        "1.0x = what was removed is spread like the brain: the reassuring answer."
-        if enrich is None or enrich < 1.5
-        else "well above 1.0x = real response left with the noise; -retain_dof caps "
-        "per-patch removal."
-    )
-    print(f"               {verdict}")
 
     detail = [
         "",
@@ -1103,8 +1111,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         f"TR {tr:g}s, polort {polort}, {n_t} frames"
     )
     Path(f"{stem}_taskleak.txt").write_text(
-        header + "\n" + "\n".join(lines + [f"               {verdict}"] + detail) + "\n",
-        encoding="utf-8",
+        header + "\n" + "\n".join(lines + detail) + "\n", encoding="utf-8"
     )
     # Everything the component scan and its after-fit need, so neither re-derives the
     # design, the mask or the responding stratum -- a second threshold chosen there
@@ -1123,6 +1130,10 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
         "ext": ext,
         "n_t": n_t,
         "device": device,
+        # Handed to the component scan so it need not re-read a gigabyte apiece.
+        "kept": kept,
+        "lost": lost,
+        "voxdims": tuple(float(v) for v in kept_img.header.get_zooms()[:3]),
     }
 
 
@@ -1277,6 +1288,7 @@ def main(argv: list[str] | None = None) -> None:
         for key, path in summary.get("outputs", {}).items():
             print(f"  {key}: {path}")
         print(f"  Elapsed: {elapsed:.1f} s")
+        print("")
         return
 
     if n_echoes > 1:
@@ -1299,6 +1311,28 @@ def main(argv: list[str] | None = None) -> None:
         ]
     elapsed = time.time() - t0
 
+    if args.events is not None:
+        print_cli_section("Task-leak diagnostic")
+        for i, outputs in enumerate(all_outputs):
+            label = f" [echo {i + 1}]" if n_echoes > 1 else ""
+            state = _task_leak_report(outputs, magn_files[i], args, label, device)
+            with open(outputs.metadata_file) as f:
+                summary = json.load(f).get("task_patch_test")
+            if summary is not None:
+                report = _print_patch_test(summary, label)
+                print("\n".join(report))
+                stem = str(outputs.task_loss_file).partition("_taskloss")[0]
+                with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
+                    f.write("\n" + "\n".join(report) + "\n")
+            if args.task_comps != "off":
+                scan = _task_component_scan(outputs, args, label, device, state)
+                if scan is not None:
+                    with open(outputs.metadata_file) as f:
+                        meta = json.load(f)
+                    meta["task_component_scan"] = scan
+                    with open(outputs.metadata_file, "w") as f:
+                        json.dump(meta, f, indent=2)
+
     print("\nDone")
     for i, outputs in enumerate(all_outputs):
         if n_echoes > 1:
@@ -1312,6 +1346,9 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  Residual output: {outputs.residual_file}")
         if outputs.task_loss_file is not None:
             print(f"  Task-loss output: {outputs.task_loss_file}")
+            if args.events is not None:
+                stem = str(outputs.task_loss_file).partition("_taskloss")[0]
+                print(f"  Task-leak report: {stem}_taskleak.txt")
         if outputs.task_patch_file is not None:
             print(f"  Patch-test output: {outputs.task_patch_file}")
         if outputs.num_comps_file is not None:
@@ -1320,29 +1357,9 @@ def main(argv: list[str] | None = None) -> None:
             print(f"  Rec-factor output: {outputs.recfactor_file}")
         print(f"  Metadata: {outputs.metadata_file}")
     print(f"  Elapsed: {elapsed:.1f} s")
-
-    if args.events is not None:
-        print_cli_section("Task-leak diagnostic")
-        for i, outputs in enumerate(all_outputs):
-            label = f" [echo {i + 1}]" if n_echoes > 1 else ""
-            state = _task_leak_report(outputs, magn_files[i], args, label, device)
-            with open(outputs.metadata_file) as f:
-                summary = json.load(f).get("task_patch_test")
-            if summary is not None:
-                report = _print_patch_test(summary, label)
-                print("")
-                print("\n".join(report))
-                stem = str(outputs.task_loss_file).partition("_taskloss")[0]
-                with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
-                    f.write("\n" + "\n".join(report) + "\n")
-            if args.task_comps != "off":
-                scan = _task_component_scan(outputs, args, label, device, state)
-                if scan is not None:
-                    with open(outputs.metadata_file) as f:
-                        meta = json.load(f)
-                    meta["task_component_scan"] = scan
-                    with open(outputs.metadata_file, "w") as f:
-                        json.dump(meta, f, indent=2)
+    # A blank final line: without it the next run of a batch or a loop starts on the
+    # line this one ended, and the two runs read as one.
+    print("")
 
 
 if __name__ == "__main__":
