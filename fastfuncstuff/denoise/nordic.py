@@ -33,6 +33,7 @@ import torch
 from scipy.signal.windows import tukey
 from tqdm.auto import tqdm
 
+from fastfuncstuff.cli_utils import spinner
 from fastfuncstuff.io.afni import load_nifti, save_nifti
 from fastfuncstuff.memory import (
     estimate_chunk_size,
@@ -1629,15 +1630,21 @@ def _prepare_echo(
     # ------------------------------------------------------------------
     # 1. Load data, form complex, apply ABSOLUTE_SCALE
     # ------------------------------------------------------------------
-    mag_img = load_nifti(magnitude_file)
-    mag_np = np.abs(mag_img.get_fdata(dtype=np.float32)).astype(np.float32)
+    # Each of these is a gigabyte-scale read plus a zstd decompress on a real run, and
+    # it happens before any progress bar exists -- so the tool looked wedged for several
+    # seconds at startup. `copy=False` on both: get_fdata already returns float32 here,
+    # and .astype() copies by default, so this was a spare gigabyte apiece.
+    with spinner(f"Reading {Path(magnitude_file).name}"):
+        mag_img = load_nifti(magnitude_file)
+        mag_np = np.abs(mag_img.get_fdata(dtype=np.float32)).astype(np.float32, copy=False)
 
     phase_np: np.ndarray | None = None
     phase_in_used = phase_file is not None and not cfg.magnitude_only
     if phase_in_used:
-        phase_img = load_nifti(phase_file)
-        phase_raw = phase_img.get_fdata(dtype=np.float32).astype(np.float32)
-        phase_np = _phase_to_radians(phase_raw)
+        with spinner(f"Reading {Path(phase_file).name}"):
+            phase_img = load_nifti(phase_file)
+            phase_raw = phase_img.get_fdata(dtype=np.float32).astype(np.float32, copy=False)
+            phase_np = _phase_to_radians(phase_raw)
 
     if cfg.magnitude_only:
         # MATLAB: II=single(I_M); temporal_phase=0

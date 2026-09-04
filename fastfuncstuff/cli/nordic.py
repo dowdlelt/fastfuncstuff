@@ -628,8 +628,9 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
     # reorder for data already in hand.
     kept, lost = state["kept"], state["lost"]
     n_t = kept.shape[3]
-    reference = state["reference"]
-    mask = reference > 0.1 * float(reference.max())
+    # The SAME brain mask the report used -- one definition of "brain" per run, and the
+    # decomposition then sees tissue rather than whatever an intensity cut let through.
+    mask = state["mask"].clone()
     # Constant voxels score a perfect fit and have poisoned two decompositions in this
     # codebase already (the MELODIC/GGM parity hunt, the denoisatorial PC selection).
     mask &= lost.std(dim=3) > 1e-8
@@ -924,6 +925,34 @@ def _split_half_enrichment(source, lost, design, mask, tr, args, labels, device)
     return sum(out) / len(out), out
 
 
+def _brain_mask(reference: torch.Tensor, device) -> torch.Tensor:
+    """A real automask on the magnitude mean, not an intensity cut.
+
+    What this replaced was ``reference > 0.1 * reference.max()``, which on an EPI keeps
+    whatever is bright: ghosts, neck, skull marrow, the rim where the coil sensitivity
+    peaks. It matters in both directions here. The enrichment divides by the share of
+    voxels the responding mask occupies, so junk in the denominator moves the headline;
+    and the component scan decomposes every voxel in the mask, so junk gets its own
+    independent components to be found in.
+
+    Falls back to the intensity cut if the automask comes back empty or absurd -- this
+    is a diagnostic, and it must not take a finished denoising down with it.
+    """
+    from fastfuncstuff.processing.mask import automask
+
+    cut = reference > 0.1 * float(reference.max())
+    try:
+        mask = automask(reference, device=device).to(torch.bool).cpu()
+    except (RuntimeError, ValueError) as exc:
+        print(f"  ⚠️  automask failed ({exc}); falling back to an intensity cut")
+        return cut
+    n, n_cut = int(mask.sum()), int(cut.sum())
+    if n < 0.1 * n_cut:
+        print(f"  ⚠️  automask kept only {n} voxels against {n_cut}; using the intensity cut")
+        return cut
+    return mask
+
+
 def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) -> dict:
     """Is the task in what NORDIC threw away, and is it where the task lives?
 
@@ -1004,7 +1033,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) ->
     # and this runs after the GPU work is done.
     source = kept + lost
     reference = source.mean(dim=3)
-    mask = reference > 0.1 * float(reference.max())
+    mask = _brain_mask(reference, device)
     # The series stay in host memory (three float32 volumes of a real run is more than
     # a consumer card holds) and task_coupling streams them to `device` in chunks. Left
     # on the CPU this is five full passes over a 250k-voxel, 350-frame dataset and it
