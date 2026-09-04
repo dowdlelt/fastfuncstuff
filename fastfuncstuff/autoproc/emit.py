@@ -1539,7 +1539,8 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
 # cannot find its inputs.
 #
 # -events (per run, the same TSV the GLM models) turns on the task-coupling
-# report: _locomoco_taskcoupling.txt plus the taskr/taskrms maps. It is a
+# report: _locomoco_taskcoupling.txt, the taskr/taskrms maps, and a scan of the
+# field's independent components (_locomoco_taskcomps.1D). All of it is a
 # DIAGNOSTIC -- nothing about the correction changes -- and it is what to read
 # before reaching for -locomoco_detask.
 echo '== stage03: locomoco =='
