@@ -52,6 +52,17 @@ class Options:
     # locomoco_detask is: the stage00 -events diagnostic MEASURES how much of the task
     # went out with the noise, and this ACTS on it. Read the report first.
     nordic_task_rescue: str | None = None
+    # Carry NORDIC's per-voxel component count through the warp chain and charge it
+    # against the GLM's degrees of freedom. ON by default: without it a NORDIC run's
+    # t/F stats are labelled with the model dof the GLM thinks it has, which is not the
+    # dof the data has left, and the comparison against a non-NORDIC run is then a
+    # comparison of two differently-optimistic p-values rather than of two denoisings.
+    nordic_dof_adjust: bool = True
+    # -events on the per-run diagnostics. Both default ON: they measure and change
+    # nothing, and the question they answer ("did this stage eat my task?") is one you
+    # want answered by default rather than on request.
+    nordic_events: bool = True
+    locomoco_events: bool = True
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
     # One slice-timing file (text, one offset per slice in seconds, or a JSON with
     # SliceTiming) used for EVERY run, in place of each run's BIDS sidecar. For

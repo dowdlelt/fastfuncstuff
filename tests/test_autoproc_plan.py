@@ -1922,3 +1922,100 @@ def test_a_nordic_run_without_events_simply_goes_unscored(tmp_path):
     s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root=str(tmp_path))
     assert "EVENTS[01:rest:1]" not in s
     assert 'ev="${EVENTS[$k]:-}"' in s.split("stage00: NORDIC denoise")[-1]
+
+
+def _dofloss_jobs(script: str) -> list[str]:
+    """The printf lines that append a dof-map resample to the nwarp batch."""
+    return [ln for ln in script.splitlines() if "stage10.dofloss." in ln and "printf" in ln]
+
+
+def test_nordic_dof_adjust_is_wired_end_to_end(tmp_path):
+    """The whole point: a NORDIC run's stats come out comparable to a plain one's.
+
+    Three links have to hold together or the correction is silently wrong — the map
+    has to be SAVED, carried into the final space by the run's OWN chain, and summed
+    across exactly the runs the model concatenates.
+    """
+    runs = [_bids_run(tmp_path, "01", "foo", str(i)) for i in (1, 2, 3)]
+    subj = Subject("X", [Session("01", runs)])
+    s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root=str(tmp_path))
+
+    assert "-save_num_comps" in _nordic_command(s)
+    job = _dofloss_jobs(s)
+    assert len(job) == 1, job  # one loop over RUN_KEYS, not one line per run
+    # THAT run's chain, and the same master its timeseries took.
+    assert '-nwarp \\"${CHAIN[$k]}\\"' in job[0]
+    assert "stage00.nordic.${FRAG[$k]}_numcomps" in job[0]
+    assert "-master stage10.warpmaster" in job[0]
+    # A count, not an intensity: no ringing kernel and no Jacobian modulation.
+    assert "-interp linear" in job[0] and "-no_neg" in job[0]
+    assert "-jac" not in job[0]
+    # Summed over exactly this task's three runs, and handed to the GLM.
+    total = next(ln for ln in s.splitlines() if "ffs_util_3dmath" in ln and "dofloss" in ln)
+    for i in (1, 2, 3):
+        assert f"stage10.dofloss.ses-01.task-foo.run-{i}" in total
+    assert "-sum" in total
+    assert '-adjust_dof "stage11.dofloss.task-foo.nii$FMT"' in s
+
+
+def test_no_nordic_dof_adjust_removes_every_link(tmp_path):
+    """Off means off at all three stages, not a saved map nothing consumes."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(subj, Options(want_nordic=True, nordic_dof_adjust=False))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    assert "-save_num_comps" not in _nordic_command(s)
+    assert _dofloss_jobs(s) == []
+    assert "-adjust_dof" not in s
+    assert "stage11.dofloss" not in s
+
+
+def test_dof_adjust_needs_nordic_to_have_run(tmp_path):
+    """Without NORDIC there is no component count, so nothing may claim one."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options(want_nordic=False)), "wd", bids_root=str(tmp_path))
+    assert "-adjust_dof" not in s and "dofloss" not in s
+
+
+def test_events_can_be_turned_off_per_stage(tmp_path):
+    """The two diagnostics are independent switches, and neither drags the other."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    both = Options(want_nordic=True, locomoco=True)
+
+    s = write_script(build_plan(subj, both), "wd", bids_root=str(tmp_path))
+    assert "-events" in _nordic_command(s) and "-events" in _locomoco_manifest(s)
+
+    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, nordic_events=False))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    assert "-events" not in _nordic_command(s)
+    assert "-events" in _locomoco_manifest(s)
+
+    plan = build_plan(subj, Options(want_nordic=True, locomoco=True, locomoco_events=False))
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    assert "-events" in _nordic_command(s)
+    assert "-events" not in _locomoco_manifest(s)
+
+
+def test_no_events_consumer_means_no_events_array(tmp_path):
+    """With both diagnostics off, nothing should resolve or preflight an events TSV."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(
+        subj,
+        Options(
+            want_nordic=True,
+            locomoco=True,
+            nordic_events=False,
+            locomoco_events=False,
+            run_glm=False,
+        ),
+    )
+    s = write_script(plan, "wd", bids_root=str(tmp_path))
+    assert "EVENTS[01:foo:1]" not in s
+
+
+def test_nordic_task_rescue_needs_events_to_be_on(tmp_path):
+    """-task_rescue scores against the design; with -no_nordic_events there is none."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(
+        subj, Options(want_nordic=True, nordic_task_rescue="ica", nordic_events=False)
+    )
+    assert "-task_rescue" not in _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))

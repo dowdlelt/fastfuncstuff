@@ -1197,7 +1197,7 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         # The per-run task diagnostics read this -- NORDIC's task-leak report at
         # stage00, locomoco's task-coupling report at stage03. Both are per run, and a
         # run whose events did not resolve simply goes unscored rather than failing.
-        if plan.options.locomoco or plan.options.want_nordic:
+        if _events_consumers(plan.options):
             ev = _events_script_path(plan, pr, bids_root)
             if ev:
                 lines.append(f"EVENTS[{q(k)}]={q(ev)}")
@@ -1289,7 +1289,7 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         | {
             ev
             for pr in plan.runs
-            if plan.options.locomoco or plan.options.want_nordic
+            if _events_consumers(plan.options)
             for ev in [_events_script_path(plan, pr, bids_root)]
             if ev
         }
@@ -1399,6 +1399,40 @@ done
 """
 
 
+def _events_consumers(opt) -> bool:
+    """Does any stage in this pipeline read a per-run events TSV?
+
+    Only the stages that ASK for it: the EVENTS array and the preflight path check
+    follow the same two flags the stages do, so -no_nordic_events plus
+    -no_locomoco_events leaves no dangling reference to a file nothing opens.
+    """
+    return (opt.locomoco and opt.locomoco_events) or (opt.want_nordic and opt.nordic_events)
+
+
+def _dof_adjust_on(opt) -> bool:
+    """Is the NORDIC dof correction wired end to end for this pipeline?"""
+    return bool(opt.want_nordic and opt.nordic_dof_adjust)
+
+
+def _numcomps_native(plan: Plan) -> str:
+    """This run's NORDIC component-count map, on its own acquisition grid.
+
+    ffs_nordic appends ``_numcomps`` to the -prefix stem, so it inherits whatever
+    format the magnitude output was written in.
+    """
+    fmt = "$PHASE_FMT" if _phase_on(plan) else "$FMT"
+    return "stage00.nordic.${FRAG[$k]}_numcomps.nii" + fmt
+
+
+def _numcomps_final(frag: str) -> str:
+    """The same map after this run's OWN chain has put it in the final space."""
+    return f"stage10.dofloss.{frag}.nii$FMT"
+
+
+def _task_dofloss(task: str) -> str:
+    return f"stage11.dofloss.task-{task}.nii$FMT"
+
+
 def _stage_nordic(plan: Plan) -> str:
     opt = plan.options
     if not opt.want_nordic:
@@ -1416,6 +1450,9 @@ def _stage_nordic(plan: Plan) -> str:
         else ""
     )
     rescue = opt.nordic_task_rescue
+    # The per-voxel count of components removed. stage10 carries it through this run's
+    # own warp chain and stage12 charges it against the GLM's degrees of freedom.
+    numcomps = "-save_num_comps" if _dof_adjust_on(opt) else ""
     nordic_cmd = _ffs(
         "ffs_nordic",
         [
@@ -1425,14 +1462,18 @@ def _stage_nordic(plan: Plan) -> str:
             '-noise-volume-last "$NOISE_VOLS"',
             *_split_flags(config.DEFAULT_OPTS["nordic"]),
             resid,
+            numcomps,
             # Diagnostic only: NORDIC decides what to discard from a patch's spectrum
             # alone, and nothing in that decision knows the task, so a component
             # carrying real response can fall under the threshold. -tr rides along for
             # the same reason it does at stage03 -- a 3D acquisition's pixdim[4] is the
             # per-partition time, not the volume TR the design is sampled at.
-            '${ev:+-events "${ev}"}',
-            '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}',
-            *([f"${{ev:+-task_rescue {rescue}}}"] if rescue else []),
+            *(
+                ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
+                if opt.nordic_events
+                else []
+            ),
+            *([f"${{ev:+-task_rescue {rescue}}}"] if rescue and opt.nordic_events else []),
             '-device "$DEVICE"',
         ],
     )
@@ -1518,8 +1559,11 @@ def _stage_locomoco(plan: Plan, script_stem: str) -> str:
         # term has on a block design. -tr rides along because a 3D acquisition's
         # header pixdim[4] is the per-partition time, not the volume TR the design
         # is sampled at, and the design is what this fit is against.
-        '${ev:+-events "${ev}"}',
-        '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}',
+        *(
+            ['${ev:+-events "${ev}"}', '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}']
+            if plan.options.locomoco_events
+            else []
+        ),
         *([f"-detask {detask}"] if detask else []),
         "-warp_format 5d",
         "-save_mean",
@@ -2679,10 +2723,41 @@ for k in "${{RUN_KEYS[@]}}"; do
 {_raw_source(plan)}
   printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
 done
-{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
+{_numcomps_final_jobs(plan)}{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
 echo 'done → stage10.final.*'
 {_qc_final(plan)}
+"""
+
+
+def _numcomps_final_jobs(plan: Plan) -> str:
+    """Carry each run's NORDIC component count into the final space.
+
+    The dof a voxel lost is a property of THAT run, so each map rides THAT run's own
+    chain -- the same CHAIN[$k] and the same master its timeseries just took. Anything
+    else lands the count on tissue that did not pay it.
+
+    Two differences from the data's own resample, both deliberate:
+
+    * **linear, not wsinc5.** This is a count, not an image. A windowed-sinc kernel
+      rings, and a negative or overshot dof is not a thing.
+    * **no -jac.** The Jacobian modulation conserves signal density through a
+      deformation, which is right for an intensity and wrong for a per-voxel count:
+      compressing two voxels into one does not double the components removed there.
+
+    Runs are appended to the same batch as the timeseries, so this costs no extra
+    process. Outside a run's coverage the resample gives 0, which is what the sum in
+    stage11 needs -- a voxel the run never saw is charged nothing for it.
+    """
+    if not _dof_adjust_on(plan.options):
+        return ""
+    return f"""# The dof map rides the same chain as the data it describes (linear, no -jac:
+# it is a count, not an intensity). NOTE a working directory written before this
+# existed has no _numcomps map, and skip_nordic=1 will not notice: delete the
+# stage00 outputs for those runs, or pass -no_nordic_dof_adjust.
+for k in "${{RUN_KEYS[@]}}"; do
+  printf '%s\\n' "-source \\"{_numcomps_native(plan)}\\" -nwarp \\"${{CHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" -interp linear -no_neg -prefix \\"stage10.dofloss.${{FRAG[$k]}}.nii$FMT\\"" >> "$nwarpbatch"
+done
 """
 
 
@@ -2783,6 +2858,38 @@ done
 """
 
 
+def _dofloss_sums(plan: Plan, tasks) -> list[str]:
+    """One summed dof map per task: what the model built from those runs actually lost.
+
+    The GLM concatenates a task's runs, so its error dof is the sum over runs -- and so
+    is the dof NORDIC took out of it. Each run's map is already in the final space by
+    now (stage10, through that run's OWN chain), so summing them is the whole
+    correction, and a run that does not cover a voxel contributes 0 there rather than
+    charging it for frames it never had.
+
+    What this buys is the comparison. Without it a NORDIC bucket's t/F sub-bricks carry
+    the dof the design implies, which the denoising has already spent -- so a denoised
+    run beats an undenoised one partly on accounting. ffs_reml -adjust_dof converts each
+    statistic to a z at the corrected dof, and the two become comparable.
+    """
+    opt = plan.options
+    if not _dof_adjust_on(opt):
+        return []
+    out = [
+        "",
+        "# ---- NORDIC dof: sum each task's per-run maps (already in final space) ----",
+        "# The GLM's error dof is the sum over the runs it concatenates, so the dof",
+        "# NORDIC removed from it is too. -no_nordic_dof_adjust turns this off.",
+    ]
+    for task, prs in tasks.items():
+        srcs = " ".join(f'"{_numcomps_final(_frag(pr))}"' for pr in prs)
+        out.append(
+            f'ffs_util_3dmath -input {srcs} -sum -prefix "{_task_dofloss(task)}" '
+            '-overwrite -device "$DEVICE"'
+        )
+    return out
+
+
 def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     """One GLM per task.
 
@@ -2801,6 +2908,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     out = ["", "# ============================ stage12: GLM (ffs_reml) ======================="]
     out.append(f"# One model per task. Runs when FFS_RUN_GLM=1 (default {gate} for this recipe).")
     out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
+    out += _dofloss_sums(plan, tasks)
     for task, prs in tasks.items():
         finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         resolved = events_for_task(task, prs, bids_root, opt)
@@ -2816,6 +2924,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),
             *([f"-drop_first {opt.glm_drop_first}"] if opt.glm_drop_first else []),
             *([f"-drop_last {opt.glm_drop_last}"] if opt.glm_drop_last else []),
+            *([f'-adjust_dof "{_task_dofloss(task)}"'] if _dof_adjust_on(opt) else []),
             *(_split_flags(opt.glm_opts) if opt.glm_opts else []),
             '-device "$DEVICE"',
         ]

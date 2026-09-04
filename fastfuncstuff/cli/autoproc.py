@@ -227,6 +227,30 @@ def build_parser() -> argparse.ArgumentParser:
         "output. Read the report first, and note each restored component hands back a\n"
         "degree of freedom (ffs_reml -adjust_dof).",
     )
+    g.add_argument(
+        "-no_nordic_dof_adjust",
+        "-no-nordic-dof-adjust",
+        dest="nordic_dof_adjust",
+        action="store_false",
+        default=True,
+        help="Do NOT correct the GLM's statistics for the degrees of freedom NORDIC\n"
+        "removed. On by default when NORDIC runs: stage00 saves the per-voxel component\n"
+        "count, stage10 carries each run's map through that run's own warp chain, and\n"
+        "stage12 sums them per task and passes the sum to ffs_reml -adjust_dof, which\n"
+        "converts every t/F to a z at the corrected dof.\n"
+        "This is what makes a NORDIC run comparable to a non-NORDIC one. Without it the\n"
+        "denoised run's p-values are labelled with dof the data no longer has, so it\n"
+        "wins the comparison partly by accounting.",
+    )
+    g.add_argument(
+        "-no_nordic_events",
+        "-no-nordic-events",
+        dest="nordic_events",
+        action="store_false",
+        default=True,
+        help="Do not pass each run's events to ffs_nordic (turns off the stage00\n"
+        "task-leak diagnostic). The diagnostic measures and changes nothing.",
+    )
 
     g = p.add_argument_group("slice timing & motion")
     g.add_argument(
@@ -282,6 +306,16 @@ def build_parser() -> argparse.ArgumentParser:
         "Off by default. The stage already emits the task-coupling REPORT whenever\n"
         "events resolve; this ACTS on it, so read that report first — see\n"
         "`ffs_locomoco -help` for which mode suits your design.",
+    )
+
+    g.add_argument(
+        "-no_locomoco_events",
+        "-no-locomoco-events",
+        dest="locomoco_events",
+        action="store_false",
+        default=True,
+        help="Do not pass each run's events to ffs_locomoco (turns off the stage03\n"
+        "task-coupling diagnostic). The diagnostic measures and changes nothing.",
     )
 
     g = p.add_argument_group("cross-run / fmap / session alignment")
@@ -1075,6 +1109,9 @@ def main(argv: list[str] | None = None) -> int:
         sep_spec_event_cols=event_cols_by_task,
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
+        nordic_dof_adjust=args.nordic_dof_adjust,
+        nordic_events=args.nordic_events,
+        locomoco_events=args.locomoco_events,
         locomoco_detask=args.locomoco_detask,
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),
