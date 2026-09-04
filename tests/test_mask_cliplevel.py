@@ -130,3 +130,35 @@ class TestSixConnPrimitives:
         filled = _fill_holes_3d(self._blobs() > 0.5)
         assert bool(filled[7, 7, 5])  # interior hole closed
         assert bool(filled[17, 15, 13])  # hole filling does not delete components
+
+
+class TestLargestClusterWins:
+    """The head is the BIGGEST component, not the one holding the brightest voxel.
+
+    Bug of record: automask seeded its component search at the brightest in-mask
+    voxel. On a 0.8 mm CBV run that voxel sat in a 236-voxel speck, so the mask came
+    back as 276 voxels of a 1.6 M-voxel head — and locomoco's flow, gated by it, was
+    zero everywhere but one corner without any error.
+    """
+
+    @staticmethod
+    def _head_and_speck() -> torch.Tensor:
+        vol = torch.zeros(24, 24, 24)
+        vol[4:20, 4:20, 4:20] = 100.0  # the "head"
+        vol[1, 1, 1] = 5000.0  # a detached, much brighter speck
+        return vol
+
+    def test_automask_keeps_the_head_not_the_bright_speck(self):
+        from fastfuncstuff.processing.mask import automask
+
+        m = automask(self._head_and_speck(), dilate_extra=0, device=torch.device("cpu"))
+        assert bool(m[10, 10, 10])
+        assert not bool(m[1, 1, 1])
+        assert int(m.sum()) > 1000
+
+    def test_largest_cluster_ignores_brightness(self):
+        from fastfuncstuff.processing.mask import largest_cluster_6conn
+
+        m = largest_cluster_6conn(self._head_and_speck() > 0.0)
+        assert not bool(m[1, 1, 1])
+        assert int(m.sum()) == 16**3

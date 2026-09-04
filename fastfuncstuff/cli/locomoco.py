@@ -3542,6 +3542,10 @@ def _write_dual_axis_diagnostics(result, stem: str, ext: str, affine, args, data
         if mask is not None
         else "whole FoV"
     )
+    # Say WHOSE coupling this is. It reads as the task-coupling report (which needs
+    # -events and is not printed without them), and a run with no events file that
+    # prints an r and a kappa anyway is a fair thing to be confused by.
+    print(f"    two-axis coupling ({comps[0][1]} vs {comps[1][1]} fields; no task involved)")
     print(f"    coverage: {cov}")
     print(
         f"    r = {c['r']:+.4f}, kappa = {c['kappa']:+.4f} vox/vox (R² {c['kappa_r2']:.3f})"

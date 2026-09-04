@@ -25,38 +25,11 @@ import torch
 from torch import Tensor
 
 from .grid import crop_affine, take_index_map
-from .mask import _cliplevel, erode_many
+from .mask import _cliplevel, erode_many, largest_cluster_6conn
 
 # AFNI's own defaults: thd_automask.c static clfrac=0.5, peelcount=1.
 DEFAULT_CLFRAC = 0.5
 DEFAULT_PEELCOUNT = 1
-
-
-def largest_cluster_6conn(mask: Tensor) -> Tensor:
-    """Keep the largest 6-connected component of a binary mask.
-
-    Faithful ``THD_mask_clust``: the *largest* cluster wins, not the one holding
-    the brightest voxel (which is what :func:`~fastfuncstuff.processing.mask.
-    _largest_component_6conn` finds — fine for automask, where the seed is
-    inside the brain by construction, but wrong here where the whole point is to
-    reject a bright speck that may outshine the head).
-
-    Labelling is exact rather than iterative: a flood-fill on GPU costs one pass
-    per unit of geodesic diameter (hundreds, for a head), so for a single 3D mask
-    the transfer plus an exact CPU labelling is the cheaper and more correct path.
-    """
-    if not bool(mask.any()):
-        return mask
-    from scipy import ndimage
-
-    structure = ndimage.generate_binary_structure(3, 1)  # 6-connectivity
-    labels, n = ndimage.label(mask.detach().cpu().numpy(), structure=structure)
-    if n <= 1:
-        return mask
-    counts = np.bincount(labels.ravel())
-    counts[0] = 0
-    best = int(counts.argmax())
-    return torch.from_numpy(labels == best).to(device=mask.device)
 
 
 def autobox_mask(

@@ -92,15 +92,15 @@ def compute_weight_image(
     # supra-threshold voxels (AFNI THD_mask_clust → erode → clust). Without this
     # the smoothed background fills the whole FOV (a "square", not a halo).
     if clusterize and w.sum() > 0:
-        from .mask import _largest_component_6conn
+        from .mask import largest_cluster_6conn
 
         wmax = float(w.max())
         clip2 = 0.33 * _thd_cliplevel(w, 0.33) if hist_cliplevel else 0.33 * _clip_level(w, 0.33)
         clip = max(0.05 * wmax, clip2)
         mask = w >= clip
-        mask = _largest_component_6conn(mask, vol=w)
+        mask = largest_cluster_6conn(mask)
         mask = _erode_6conn(mask)
-        mask = _largest_component_6conn(mask, vol=w)
+        mask = largest_cluster_6conn(mask)
         w = w * mask.to(w.dtype)
 
     # Re-zero the border after smoothing/clustering so it is exactly zero in the

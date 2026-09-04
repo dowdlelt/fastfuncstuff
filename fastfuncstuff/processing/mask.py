@@ -333,27 +333,32 @@ def erode_many(mask: Tensor, npeel: int = 1, peelthr: int = 17) -> Tensor:
 # ---------------------------------------------------------------------------
 
 
-def _largest_component_6conn(mask: Tensor, vol: Tensor | None = None) -> Tensor:
-    """Keep largest connected component using 6-connectivity.
+def largest_cluster_6conn(mask: Tensor) -> Tensor:
+    """Keep the largest 6-connected component of a binary mask (``THD_mask_clust``).
 
-    Uses iterative dilation from a seed (brightest voxel inside mask)
-    with a 6-connectivity kernel, AND-ed with the mask at each step.
+    The *largest* cluster wins, not the one holding the brightest voxel. Seeding on
+    the brightest voxel is the same thing on most data and catastrophically not on
+    some: on a 0.8 mm CBV run the brightest voxel in the thresholded volume sat in a
+    236-voxel speck, so the automask returned 276 voxels instead of the head's 1.6 M
+    — and everything gated by it (locomoco's flow, its coupling report) came back
+    empty without complaining.
+
+    Labelling is exact rather than iterative: a flood fill on the GPU costs one pass
+    per unit of geodesic diameter (hundreds, for a head), so for a single 3-D mask
+    the transfer plus an exact CPU labelling is both cheaper and more correct.
     """
-    if mask.sum() == 0:
+    if not bool(mask.any()):
         return mask
+    from scipy import ndimage
 
-    # Seed at brightest voxel
-    if vol is not None:
-        vals = vol.abs() * mask.float()
-        seed_idx = int(vals.reshape(-1).argmax().item())
-    else:
-        seed_idx = int(mask.float().reshape(-1).argmax().item())
-
-    nz, ny, nx = mask.shape
-    seed = torch.zeros(nz * ny * nx, device=mask.device, dtype=torch.float32)
-    seed[seed_idx] = 1.0
-
-    return _flood_fill_6conn(seed.view(nz, ny, nx), mask.float())
+    labels, n = ndimage.label(
+        mask.detach().cpu().numpy(), structure=ndimage.generate_binary_structure(3, 1)
+    )
+    if n <= 1:
+        return mask
+    counts = numpy.bincount(labels.ravel())
+    counts[0] = 0
+    return torch.from_numpy(labels == int(counts.argmax())).to(device=mask.device)
 
 
 # ---------------------------------------------------------------------------
@@ -509,7 +514,7 @@ def automask(
         print(f"  automask: after peel: {int(mask.sum().item()):,} voxels")
 
     # Step 4: largest connected component (6-connectivity)
-    mask = _largest_component_6conn(mask, vol=vol)
+    mask = largest_cluster_6conn(mask)
     if verbose:
         print(f"  automask: after cluster: {int(mask.sum().item()):,} voxels")
 
