@@ -288,6 +288,13 @@ def task_coupling(
     f = torch.as_tensor(np.asarray(field) if isinstance(field, np.ndarray) else field)
     if f.ndim != 4:
         raise ValueError(f"field must be 4-D (nx,ny,nz,T), got shape {tuple(f.shape)}")
+    # `device` says where the ARITHMETIC happens, not where the answer lives. A field
+    # too large for the card is held on the host and streamed through the GPU in chunks
+    # ([[Device management]]), and a caller that does that still has host-side masks and
+    # writes host-side files -- so the maps come back on the field's own device. Handing
+    # them back on the compute device instead is a silent relocation that blows up in
+    # the caller's next line ("found at least two devices, cuda:0 and cpu").
+    src_device = f.device
     if device is None:
         device = f.device
     x = torch.as_tensor(np.asarray(design), dtype=torch.float64, device=device)
@@ -403,15 +410,15 @@ def task_coupling(
     total_rms = torch.where(valid, (ss_tot / n_t).sqrt(), zero)
 
     tc = TaskCoupling(
-        r=r.reshape(*spatial, n_k),
-        beta=beta.reshape(*spatial, n_k),
-        r_joint=r_joint.reshape(*spatial, n_k),
-        beta_joint=beta_joint.reshape(*spatial, n_k),
-        r_full=r_full.reshape(spatial),
+        r=r.reshape(*spatial, n_k).to(src_device),
+        beta=beta.reshape(*spatial, n_k).to(src_device),
+        r_joint=r_joint.reshape(*spatial, n_k).to(src_device),
+        beta_joint=beta_joint.reshape(*spatial, n_k).to(src_device),
+        r_full=r_full.reshape(spatial).to(src_device),
         n_fit=n_fit,
-        task_rms=task_rms.reshape(spatial),
-        total_rms=total_rms.reshape(spatial),
-        valid=valid.reshape(spatial),
+        task_rms=task_rms.reshape(spatial).to(src_device),
+        total_rms=total_rms.reshape(spatial).to(src_device),
+        valid=valid.reshape(spatial).to(src_device),
         labels=labels,
         polort=polort,
         n_timepoints=n_t,
@@ -1076,6 +1083,16 @@ def component_task_fit(
     # measured per run, so no design ever has to be classified by eye.
     null_mean = float(mu.mean())
     eff_dof = float(q_x.shape[1] / null_mean) if null_mean > 0 else float("inf")
+    # E[R^2] ~ K/df holds when the surrogates behave like white noise in the design's
+    # subspace. They need not. Components with no LOW-frequency energy -- which is what
+    # a thermal-noise residual is, once a denoiser has taken the slow structure out into
+    # the components it kept -- project worse than white noise onto an HRF-convolved
+    # design, so the null mean falls below K/(T-polort-1) and this ratio runs ABOVE the
+    # residual dimension. Measured on 350 frames with an 8-column design: white noise
+    # reads 309-379, high-passed noise reads 1548. That is not a degrees of freedom and
+    # must not be printed as one, so the ceiling travels with it; the direction is the
+    # safe one (a narrower null makes the test harder to pass, not easier).
+    resid_dim = int(n_t - q_n.shape[1])
     # Empirical p with the +1 correction: a surrogate set can never license p = 0.
     p = (null >= r2[None, :]).sum(dim=0).double().add(1.0) / (n_surrogates + 1)
     max_z = ((null - mu[None, :]) / sd[None, :]).amax(dim=1)
@@ -1110,6 +1127,11 @@ def component_task_fit(
         "null_r2_median": mu,
         "null_r2_mean": null_mean,
         "eff_dof": eff_dof,
+        # eff_dof clipped to what a degrees-of-freedom count can actually be, for
+        # printing. Equal to eff_dof unless the null is narrower than white noise.
+        "eff_dof_reported": min(eff_dof, float(resid_dim)),
+        "eff_dof_capped": eff_dof > resid_dim,
+        "resid_dim": resid_dim,
         "r2_needed": r2_needed,
         "informative": informative,
         "uninformative_reason": (

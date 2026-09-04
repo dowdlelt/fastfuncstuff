@@ -1119,8 +1119,8 @@ def test_task_leak_enrichment_is_flat_when_nothing_was_planted(tmp_path):
 
 
 def _enrichment(report_path: Path) -> float:
-    line = next(ln for ln in report_path.read_text().splitlines() if "mask from one half" in ln)
-    return float(line.strip().split("x")[0])
+    line = next(ln for ln in report_path.read_text().splitlines() if "ENRICHMENT" in ln)
+    return float(line.split(":", 1)[1].strip().split("x")[0])
 
 
 def test_task_leak_enrichment_rises_when_denoising_over_removes(tmp_path):

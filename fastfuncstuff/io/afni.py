@@ -51,7 +51,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
@@ -3056,39 +3055,37 @@ def save_nifti(
     out = Path(output_path)
     out_str = str(out)
 
-    # Big writes can otherwise look wedged. Keep this fallback factual and compact;
-    # CLI spinner contexts suppress it and provide their own live status + timing.
+    # Imported here, not at module scope: cli_utils pulls in the CLI help stack, and
+    # the header-read path in this module is kept torch- and CLI-free on purpose.
+    from fastfuncstuff.cli_utils import spinner
+
+    def _do_write() -> None:
+        if out_str.endswith(".nii.zst") or (out_str.endswith(".nii.gz") and shutil.which("pigz")):
+            # Write uncompressed to a temp file first, then compress externally.
+            # This avoids nibabel's single-threaded gzip and enables pigz / zstd.
+            stem = out.name
+            for ext in (".nii.zst", ".nii.gz"):
+                if stem.endswith(ext):
+                    stem = stem[: -len(ext)]
+                    break
+            tmp_nii = out.parent / (stem + ".nii")
+            _nib_save_chunked(img, str(tmp_nii))
+            compress_nifti(tmp_nii, out, remove_original=True)
+        elif out_str.endswith(".nii"):
+            # Uncompressed direct write — same >2 GiB single-write hazard as the temp.
+            _nib_save_chunked(img, out_str)
+        else:
+            # .nii.gz without pigz → nibabel's gzip stream chunks internally, so safe.
+            nib.save(img, str(out))
+
+    # Big writes can otherwise look wedged. This goes through the SAME spinner every
+    # other write in the toolbox uses, so one run does not print three flavours of "I
+    # saved a file" -- a two-line Writing/Wrote pair here and a one-line spinner from
+    # the callers that wrap their own saves. CLI spinner contexts suppress it entirely
+    # and provide their own live status + timing.
     _nbytes = int(data.nbytes)
-    _announce = _nbytes >= _BIG_WRITE_BYTES and not io_progress_suppressed()
-    if _announce:
-        print(
-            f"    Writing {out.name} ({_nbytes / 1e9:.2f} GB uncompressed)",
-            flush=True,
-        )
-    _t_write = time.time()
-
-    if out_str.endswith(".nii.zst") or (out_str.endswith(".nii.gz") and shutil.which("pigz")):
-        # Write uncompressed to a temp file first, then compress externally.
-        # This avoids nibabel's single-threaded gzip and enables pigz / zstd.
-        stem = out.name
-        for ext in (".nii.zst", ".nii.gz"):
-            if stem.endswith(ext):
-                stem = stem[: -len(ext)]
-                break
-        tmp_nii = out.parent / (stem + ".nii")
-        _nib_save_chunked(img, str(tmp_nii))
-        compress_nifti(tmp_nii, out, remove_original=True)
-    elif out_str.endswith(".nii"):
-        # Uncompressed direct write — same >2 GiB single-write hazard as the temp above.
-        _nib_save_chunked(img, out_str)
+    if _nbytes >= _BIG_WRITE_BYTES and not io_progress_suppressed():
+        with spinner(f"Writing {out.name} ({_nbytes / 1e9:.2f} GB)"):
+            _do_write()
     else:
-        # .nii.gz without pigz → nibabel's gzip stream chunks internally, so it's safe.
-        nib.save(img, str(out))
-
-    if _announce:
-        _elapsed = time.time() - _t_write
-        try:
-            _on_disk = out.stat().st_size / 1e9
-            print(f"    Wrote {out.name} ({_on_disk:.2f} GB) in {_elapsed:.1f}s", flush=True)
-        except OSError:
-            print(f"    Wrote {out.name} in {_elapsed:.1f}s", flush=True)
+        _do_write()

@@ -400,10 +400,15 @@ Examples:
         "-task_comps",
         "-task-comps",
         default="auto",
-        metavar="N|auto|off",
-        help="Component count for the scan of the removed field. 'auto' (default) is the "
-        "usual model-order estimator with a floor; an integer forces the order; 'off' "
-        "skips the scan (and with it -task_rescue).\n"
+        metavar="N|auto|est|off",
+        help="Component count for the scan of the removed field. 'auto' (default) uses a "
+        "fixed floor of 10; 'est' runs the model-order estimator and takes max(est, 10); "
+        "an integer forces the order; 'off' skips the scan (and with it -task_rescue).\n"
+        "'auto' does not estimate because the estimate has never once changed the answer "
+        "and is not cheap: on the removed field the estimator returns 1 (four synthetic "
+        "constructions and a real 96x112x65x350 run), so max(est, floor) is the floor "
+        "every time — and getting that 1 costs a whole-volume ACF smoothness pass, "
+        "measured at 68 s on that run's geometry.\n"
         "The floor is why this is not just the estimator. That estimator is conservative "
         "on the removed field, which is what makes it trustworthy for 'was anything "
         "structured taken out' — and is also its limit here: a component NORDIC "
@@ -489,14 +494,16 @@ Examples:
 
 
 def parse_task_comps(value) -> str | int:
-    """``-task_comps`` -> ``"auto"``, ``"off"``, or a forced component count."""
+    """``-task_comps`` -> ``"auto"``, ``"est"``, ``"off"``, or a forced component count."""
     text = str(value).strip().lower()
-    if text in ("auto", "off"):
+    if text in ("auto", "est", "off"):
         return text
     try:
         k = int(text)
     except ValueError:
-        raise ValueError(f"-task_comps takes an integer, 'auto' or 'off', got {value!r}") from None
+        raise ValueError(
+            f"-task_comps takes an integer, 'auto', 'est' or 'off', got {value!r}"
+        ) from None
     if k < 1:
         raise ValueError(f"-task_comps needs at least one component, got {k}")
     return k
@@ -543,17 +550,31 @@ def _scan_order(args, lost_vt, lost, mask, header, n_t, device) -> tuple[int, di
     them, and still gives a leak room to separate from the bulk. Thirty -- the order a
     "look harder" instinct reaches for -- misses all three.
     """
+    from fastfuncstuff.cli_utils import spinner
     from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
     from fastfuncstuff.decomposition.tools import estimate_ica_component_count
     from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
 
+    floor = max(2, min(10, n_t // 8))
     if isinstance(args.task_comps, int):
         return int(args.task_comps), {"mode": "explicit"}
+    if args.task_comps != "est":
+        # The estimator is not run at all by default, because its answer has never once
+        # changed the outcome and it is not cheap. On the removed field it returns k=1 --
+        # four synthetic constructions and a real 96x112x65x350 run -- so max(est, floor)
+        # IS the floor every time; and getting that 1 costs a whole-volume ACF smoothness
+        # pass, measured at 68 s on that real run's geometry. Sixty-eight seconds for a
+        # number the floor overrides is not a default. `-task_comps est` runs it.
+        return floor, {"mode": "floor", "floor": int(floor)}
     n_in = int(mask.sum())
     voxdims = tuple(float(x) for x in header.get_zooms()[:3])
-    resels, _, _ = estimate_smoothness_resels_acf(
-        lost.numpy(), voxdims, mask=mask.numpy(), device=torch.device("cpu")
-    )
+    # On the user's device, not pinned to the CPU: this is a full 4-D pass and it was
+    # the single biggest cost in the scan (about 7 s on a small synthetic run, and it
+    # scales with the dataset).
+    with spinner("Estimating the removed field's smoothness"):
+        resels, _, _ = estimate_smoothness_resels_acf(
+            lost.numpy(), voxdims, mask=mask.numpy(), device=device
+        )
     n_eff = effective_sample_size_from_resels(n_in, resels, floor=n_t)
     k_est, _, diag = estimate_ica_component_count(
         data_vox_t=lost_vt.to(device),
@@ -566,7 +587,6 @@ def _scan_order(args, lost_vt, lost, mask, header, n_t, device) -> tuple[int, di
         device=device,
         verbose=False,
     )
-    floor = max(2, min(10, n_t // 8))
     diag = dict(diag, k_estimated=int(k_est), floor=int(floor), resels=float(resels), n_eff=n_eff)
     return max(int(k_est), floor), diag
 
@@ -595,6 +615,8 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
     phase-randomised null. The per-voxel question does not arise: a component either
     follows the task in time or it does not.
     """
+    from pathlib import Path
+
     import numpy as np
 
     from fastfuncstuff.decomposition.ica import FastICA
@@ -621,12 +643,11 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
     lost_vt = lost.reshape(-1, n_t)[mask.reshape(-1)]  # (V', T)
     k, num_diag = _scan_order(args, lost_vt, lost, mask, kept_img.header, n_t, device)
     est = num_diag.get("k_estimated")
-    how = (
-        f"forced to {k}"
-        if num_diag.get("mode") == "explicit"
-        else f"{k} = max(estimated {est}, floor {num_diag.get('floor')})"
-    )
-    print(f"  Component scan{label}: {how} over {n_in} voxels, {n_t} frames")
+    how = {
+        "explicit": f"{k} forced",
+        "floor": f"{k} (floor; -task_comps est to estimate)",
+    }.get(str(num_diag.get("mode")), f"{k} = max(est {est}, floor {num_diag.get('floor')})")
+    print(f"  COMPONENTS : {how}, over {n_in} vox x {n_t} frames")
 
     ica = FastICA(n_components=k, device=device, random_state=0)
     ica.fit(lost_vt.T.to(device))  # (T, V') -- mixing_ comes back (T, k)
@@ -654,52 +675,44 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
         "model_order_estimated": est,
         "rescued": False,
     }
+    dof_txt = f"{fit['eff_dof_reported']:.0f}{'+' if fit['eff_dof_capped'] else ''} eff DoF"
     if fit["informative"]:
         print(
-            f"    temporal criterion: {fit['eff_dof']:.0f} effective DoF, a component "
-            f"needs R2>{fit['r2_needed']:.3f} to be flagged (familywise "
-            f"alpha={fit['alpha']:g} over {k} components, {fit['n_surrogates']} surrogates)"
+            f"               R2>{fit['r2_needed']:.3f} to flag "
+            f"(fwe a={fit['alpha']:g} over {k}, {dof_txt})"
         )
     else:
         # Saying WHY beats printing "none flagged", which a reader would take as
         # evidence that nothing task-locked was removed rather than as an absent
         # measurement. A 20 s periodic block design lands here every time: a component
         # merely sharing its spectrum fits it by construction.
-        print(f"    ⚠️  temporal criterion declines: {fit['uninformative_reason']}.")
         print(
-            "        Nothing is flagged and nothing can be rescued on this design. The "
-            "enrichment above\n"
-            "        is carrying the decision alone; it needs no null and is unaffected."
+            f"               ⚠️  no power ({fit['uninformative_reason']}) -- the "
+            "enrichment decides alone"
         )
         summary["uninformative_reason"] = str(fit["uninformative_reason"])
         return summary
     for c in flagged:
         print(
-            f"    comp {c:3d}: R2 {float(fit['r2'][c]):.3f}  z {float(fit['z'][c]):+.2f}  "
-            f"p {float(fit['p'][c]):.4g}  "
-            f"{100 * float(shares['var_data'][c]):.2f}% of what was removed, "
-            f"{100 * float(shares['var_task'][c]):.1f}% of its task-locked variance"
+            f"               #{c}: R2 {float(fit['r2'][c]):.3f} z {float(fit['z'][c]):+.2f} "
+            f"p {float(fit['p'][c]):.4g}; {100 * float(shares['var_data'][c]):.2f}% of "
+            f"what was removed, {100 * float(shares['var_task'][c]):.1f}% of its task variance"
         )
     if flagged:
         summary["var_of_removed_flagged"] = [float(shares["var_data"][c]) for c in flagged]
         summary["var_of_removed_task_flagged"] = [float(shares["var_task"][c]) for c in flagged]
         print(
-            f"    {len(flagged)} of {k} component(s) follow the task above z_cut "
-            f"{float(fit['z_cut']):.2f} (familywise, alpha {args.task_alpha:g}). "
-            f"Chance share for one component is {1 / max(1, n_t - polort - 1):.3f}."
+            f"               {len(flagged)} of {k} follow the task "
+            f"(z_cut {float(fit['z_cut']):.2f})"
         )
     else:
-        print(
-            f"    none of the {k} components follows the task above z_cut "
-            f"{float(fit['z_cut']):.2f} -- nothing in what was removed is task-locked "
-            "in time."
-        )
+        print(f"               none of {k} follows the task (z_cut {float(fit['z_cut']):.2f})")
     if not args.task_rescue:
         if flagged:
-            print("    DIAGNOSTIC ONLY -- add -task_rescue to put these back.")
+            print("               DIAGNOSTIC ONLY -- -task_rescue puts these back")
         return summary
     if not flagged:
-        print("    -task_rescue: nothing to put back, output unchanged.")
+        print("               -task_rescue: nothing to put back, output unchanged")
         return summary
 
     # Scatter the masked maps back to the full grid, so a voxel outside the mask can
@@ -720,14 +733,13 @@ def _task_component_scan(outputs, args, label: str, device, state) -> dict | Non
         reference_img=str(outputs.magnitude_file),
     )
     print(
-        f"    put back {len(flagged)} component(s), "
-        f"{100 * result.var_returned_total:.2f}% of the removed field's variance, "
-        f"{result.dof_returned} degrees of freedom"
+        f"               put back {len(flagged)} comp(s), "
+        f"{100 * result.var_returned_total:.2f}% of the removed variance, "
+        f"{result.dof_returned} DoF -> {Path(added_path).name}"
     )
-    print(f"    what was added: {added_path}")
     print(
-        f"    NOTE {result.dof_returned} degrees of freedom went back into the data; "
-        "carry that into ffs_reml -adjust_dof / ffs_util_updatedof."
+        f"               carry {result.dof_returned} DoF into ffs_reml -adjust_dof / "
+        "ffs_util_updatedof"
     )
     summary |= {
         "rescued": True,
@@ -759,7 +771,9 @@ def _task_fit_after(restored, state, args, label: str) -> None:
 
     print(f"  TASK FIT KEPT -> RESCUED{label} (medians on the responding mask)")
     design, labels, polort, mask = state["design"], state["labels"], state["polort"], state["mask"]
-    after = task_coupling(restored, design, polort=polort, mask=mask, labels=labels)
+    after = task_coupling(
+        restored, design, polort=polort, mask=mask, labels=labels, device=state["device"]
+    )
     psc_after = psc_betas(after, design, state["reference"], mask)
     sel = state["resp"] > 0
     for k, lb in enumerate(labels):
@@ -832,22 +846,14 @@ def _print_patch_test(summary: dict, label: str) -> list[str]:
     else:
         verdict = "the design went out with the noise like any other direction"
     return [
-        f"  PATCH TEST{label}: median z {z:+.2f} over {n_in} in-brain patches -- {verdict}",
-        "    z is how far the design sits inside what each patch DISCARDED, against "
-        "random directions",
-        "    drawn in its own drift-orthogonal subspace. Negative = preferentially "
-        "kept; ~0 = treated",
-        "    like any other direction; positive = discarded selectively.",
-        f"    {n_sig} of {n_in} patches positive at q <= {summary['fdr_q']:g} "
-        f"(BH-FDR, one-sided upper tail)",
-        f"    null: {summary['n_null_frames']} random "
-        f"{summary['n_design_columns']}-column frames; patches discarded "
-        f"{summary['mean_removed_dim']:.1f} of {summary['n_components']} components "
-        f"on average",
+        f"  PATCH TEST : median z {z:+.2f} over {n_in} patches, {n_sig} positive at "
+        f"q <= {summary['fdr_q']:g} -- {verdict}",
+        f"               (patches discarded {summary['mean_removed_dim']:.1f} of "
+        f"{summary['n_components']} components; negative z = preferentially kept)",
     ]
 
 
-def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
+def _split_half_enrichment(source, lost, design, mask, tr, args, labels, device):
     """Enrichment with the mask chosen on frames the score never sees.
 
     The whole difficulty of this diagnostic is that every candidate mask shares noise
@@ -892,13 +898,23 @@ def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
             po_r = args.task_polort or default_polort(int(d_rank.shape[0]), tr)
             po_s = args.task_polort or default_polort(int(d_score.shape[0]), tr)
             rank_tc = task_coupling(
-                source[..., rank_sl], d_rank, polort=po_r, mask=mask, labels=labels
+                source[..., rank_sl],
+                d_rank,
+                polort=po_r,
+                mask=mask,
+                labels=labels,
+                device=device,
             )
             resp, _, _ = responding_mask(
                 rank_tc.r_full, mask, args.task_top_frac, thresh=args.task_thresh
             )
             score_tc = task_coupling(
-                lost[..., score_sl], d_score, polort=po_s, mask=mask, labels=labels
+                lost[..., score_sl],
+                d_score,
+                polort=po_s,
+                mask=mask,
+                labels=labels,
+                device=device,
             )
         except ValueError:
             # A half with too few blocks to separate the design from its own drift, or
@@ -910,7 +926,7 @@ def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
     return sum(out) / len(out), out
 
 
-def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
+def _task_leak_report(outputs, magnitude_file: str, args, label: str, device) -> dict:
     """Is the task in what NORDIC threw away, and is it where the task lives?
 
     Three fits of one design — the input, the series that was kept, and the signed
@@ -976,7 +992,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
     # Before the two fits, not after: a wrong -tr shows up here as a design that never
     # lines up with the run, and the numbers below are uninterpretable until it is right.
     print(
-        f"  Design{label}: {len(labels)} condition(s) ({', '.join(labels)}), "
+        f"  design     : {len(labels)} condition(s) ({', '.join(labels)}), "
         f"TR {tr:g}s, polort {polort}, {n_t} frames"
     )
 
@@ -987,7 +1003,11 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
     source = kept + lost
     reference = source.mean(dim=3)
     mask = reference > 0.1 * float(reference.max())
-    kwargs = dict(polort=polort, mask=mask, labels=labels)
+    # The series stay in host memory (three float32 volumes of a real run is more than
+    # a consumer card holds) and task_coupling streams them to `device` in chunks. Left
+    # on the CPU this is five full passes over a 250k-voxel, 350-frame dataset and it
+    # dominated the tool's wall clock -- minutes after a 52 s denoise.
+    kwargs = dict(polort=polort, mask=mask, labels=labels, device=device)
     src_tc = task_coupling(source, design, **kwargs)
     kept_tc = task_coupling(kept, design, **kwargs)
     lost_tc = task_coupling(lost, design, **kwargs)
@@ -1000,7 +1020,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
     # The headline. Reported instead of a whole-run enrichment, not alongside one: see
     # _split_half_enrichment for why every mask drawn from the whole run is biased by
     # noise it shares with the series it scores.
-    enrich, per_half = _split_half_enrichment(source, lost, design, mask, tr, args, labels)
+    enrich, per_half = _split_half_enrichment(source, lost, design, mask, tr, args, labels, device)
     del source
     src_sum = src_tc.summarize(resp)
     kept_sum, lost_sum = kept_tc.summarize(resp), lost_tc.summarize(resp)
@@ -1026,50 +1046,65 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
         )
 
     how = "cut" if args.task_thresh is not None else f"top {args.task_top_frac * 100:.0f}%"
+    enrich_txt = (
+        f"{enrich:.2f}x  (halves {', '.join(f'{e:.2f}' for e in per_half)})"
+        if enrich is not None
+        else "n/a  (neither half of the run places a mask)"
+    )
+    # Terse on stdout, long-form in the file. Every number a reader acts on is here;
+    # what each one MEANS is in -help and in {prefix}_taskleak.txt, which is where a
+    # reader who needs it goes once, rather than scrolling past it on every run.
     lines = [
-        f"  summary mask : {int(resp.sum())} voxels, whole-run input R > {cut:.3f} "
-        f"({how}) = {100 * int(resp.sum()) / max(1, int((mask > 0).sum())):.1f}% of the brain",
-        "                 descriptive only -- the three lines below are selected on it "
-        "and read high",
-        "                 because of that. The enrichment is not.",
-        f"  input: full-model R {src_sum['r_full_median']:.3f} med, task rms "
+        f"  mask       : {int(resp.sum())} vox ({how}, input R > {cut:.3f}) = "
+        f"{100 * int(resp.sum()) / max(1, int((mask > 0).sum())):.1f}% of brain",
+        f"  input      : R {src_sum['r_full_median']:.3f}, task rms "
         f"{src_sum['task_rms_median']:.4g}",
-        f"  kept : full-model R {kept_sum['r_full_median']:.3f} med, task rms "
-        f"{kept_sum['task_rms_median']:.4g} = {100 * kept_ratio:.1f}% of the input's",
-        f"  lost : full-model R {lost_sum['r_full_median']:.3f} med, task rms "
-        f"{lost_sum['task_rms_median']:.4g} = {100 * amp_ratio:.1f}% of the input's",
-        f"  lost : task-explained share of its OWN rms {lost_share:.3f}, against "
-        f"{lost_tc.chance_share:.3f} that any {len(labels)}-column design keeps from "
-        f"pure noise",
-        "",
-        "  ENRICHMENT of the lost series' task energy on responding tissue",
-        (
-            f"    {enrich:.2f}x   mask from one half of the run, energy scored on the "
-            f"other  ({' and '.join(f'{e:.2f}x' for e in per_half)})"
-            if enrich is not None
-            else "    n/a    neither half of the run places a mask: nothing in it "
-            "responds to the design"
-        ),
-        "",
-        "  1.0x means what was removed is spread like the brain and has nothing to do with where",
-        "  the task is - the reassuring answer, and one a share above chance does NOT contradict,",
-        "  because a design projected onto pure noise keeps some of it everywhere. Well above 1.0x",
-        "  means real response left with the noise; -retain-dof caps how much any patch "
-        "may remove.",
-        "  The mask is chosen on frames the score never sees, so the 1.0x floor is real and not an",
-        "  artefact of selection - a whole-run mask reads ~3.9x on data with no task in it at all.",
-        "  Power is the cost: half a run's blocks place the mask, so a weak leak attenuates toward",
-        "  1.0x rather than showing up -- which is why the component scan below runs too: it asks the",
-        "  same question in time, where a leak confined to a few voxels still shows.",
+        f"  kept       : R {kept_sum['r_full_median']:.3f}, task rms "
+        f"{kept_sum['task_rms_median']:.4g} ({100 * kept_ratio:.1f}% of input)",
+        f"  lost       : R {lost_sum['r_full_median']:.3f}, task rms "
+        f"{lost_sum['task_rms_median']:.4g} ({100 * amp_ratio:.1f}% of input); task "
+        f"share {lost_share:.3f} vs {lost_tc.chance_share:.3f} chance",
+        f"  ENRICHMENT : {enrich_txt}",
     ]
     print("\n".join(lines))
+    verdict = (
+        "1.0x = what was removed is spread like the brain: the reassuring answer."
+        if enrich is None or enrich < 1.5
+        else "well above 1.0x = real response left with the noise; -retain_dof caps "
+        "per-patch removal."
+    )
+    print(f"               {verdict}")
+
+    detail = [
+        "",
+        "How to read this (see also `ffs_nordic -help`):",
+        "  The mask is DESCRIPTIVE only. The input/kept/lost lines are selected on it and",
+        "  read high because of that. The enrichment is not.",
+        "",
+        "  ENRICHMENT is the share of the lost series' task-locked energy landing inside the",
+        "  responding mask, over the share of voxels that mask occupies. Its no-relation value",
+        "  is 1.0 by construction, so it needs no surrogate -- which matters, because a block",
+        "  design admits none. Well above 1.0x means real response left with the noise;",
+        "  -retain_dof caps how much any patch may remove.",
+        "",
+        "  The mask comes from one half of the run and the energy is scored on the other, so",
+        "  the 1.0x floor is real and not an artefact of selection: a whole-run mask reads",
+        "  ~3.9x on data with no task in it at all. The cost is power -- half a run's blocks",
+        "  place the mask, so a weak leak attenuates toward 1.0x rather than showing up. That",
+        "  is why the component scan runs too: it asks the same question in TIME, where a leak",
+        "  confined to a few voxels still shows.",
+        "",
+        "  NOTE the input is not motion-corrected at this stage, so the per-voxel fits are",
+        "  worse than a preprocessed run's -- read the enrichment, not the R maps.",
+    ]
     header = (
         f"Task-leak diagnostic{label}\n"
         f"  design         : {len(labels)} condition(s) ({', '.join(labels)}), "
         f"TR {tr:g}s, polort {polort}, {n_t} frames"
     )
     Path(f"{stem}_taskleak.txt").write_text(
-        header + "\n" + "\n".join(lines) + "\n", encoding="utf-8"
+        header + "\n" + "\n".join(lines + [f"               {verdict}"] + detail) + "\n",
+        encoding="utf-8",
     )
     # Everything the component scan and its after-fit need, so neither re-derives the
     # design, the mask or the responding stratum -- a second threshold chosen there
@@ -1087,6 +1122,7 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
         "stem": stem,
         "ext": ext,
         "n_t": n_t,
+        "device": device,
     }
 
 
@@ -1289,7 +1325,7 @@ def main(argv: list[str] | None = None) -> None:
         print_cli_section("Task-leak diagnostic")
         for i, outputs in enumerate(all_outputs):
             label = f" [echo {i + 1}]" if n_echoes > 1 else ""
-            state = _task_leak_report(outputs, magn_files[i], args, label)
+            state = _task_leak_report(outputs, magn_files[i], args, label, device)
             with open(outputs.metadata_file) as f:
                 summary = json.load(f).get("task_patch_test")
             if summary is not None:
@@ -1300,7 +1336,6 @@ def main(argv: list[str] | None = None) -> None:
                 with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
                     f.write("\n" + "\n".join(report) + "\n")
             if args.task_comps != "off":
-                print_cli_section("Component scan" + (" and rescue" if args.task_rescue else ""))
                 scan = _task_component_scan(outputs, args, label, device, state)
                 if scan is not None:
                     with open(outputs.metadata_file) as f:

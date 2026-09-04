@@ -2854,7 +2854,7 @@ def _warp_recon_one(result, data, args, resp, mask, device, design, polort, comp
                     tc = tc - tc.mean()
                     d = np.linalg.norm(tc) * np.linalg.norm(x)
                     cs.append(f"#{i} |r|={abs(float(tc @ x / d)) if d > 0 else 0:.2f}")
-                print(f"    {lbl} dropped components vs the design: {', '.join(cs)}")
+                print(f"    {lbl} {verb} components vs the design: {', '.join(cs)}")
 
     if any(dropped.values()):
         design = getattr(args, "_task_design", None)
@@ -2890,11 +2890,7 @@ def _warp_recon_one(result, data, args, resp, mask, device, design, polort, comp
     if scan_only:
         # Measure only. The components stay in the field and every output below this
         # point describes the field as estimated -- -detask ica is what acts on this.
-        print(
-            "    DIAGNOSTIC ONLY -- nothing was removed. -detask ica projects these "
-            "time courses\n"
-            "    out of the full-rank field; read this report before reaching for it."
-        )
+        print("    DIAGNOSTIC ONLY -- nothing removed; -detask ica is what acts on this")
         return None, keep, None
 
     if method == "ica":

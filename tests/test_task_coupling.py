@@ -1926,3 +1926,28 @@ def test_detask_ica_does_not_decompose_twice(capsys, tmp_path):
     out = capsys.readouterr().out
     assert "WARP TASK REJECTION" in out
     assert "WARP TASK SCAN" not in out
+
+
+@pytest.mark.gpu
+def test_task_coupling_returns_maps_on_the_fields_own_device():
+    """`device` says where the arithmetic happens, not where the answer lives.
+
+    Bug of record: ffs_nordic's leak report started streaming a host-held field through
+    the GPU, and task_coupling handed the maps back on the COMPUTE device. The caller's
+    next line — a responding_mask against its host-side mask — died with "found at least
+    two devices, cuda:0 and cpu". A field too large for the card is exactly the case
+    `device=` exists for, so the maps have to come back where the field is.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    rng = np.random.default_rng(0)
+    field = torch.as_tensor(rng.standard_normal((8, 8, 8, 40)).astype(np.float32))
+    design = torch.as_tensor(rng.standard_normal((40, 2)))
+    mask = torch.ones(8, 8, 8, dtype=torch.bool)
+    tc = task_coupling(field, design, polort=1, mask=mask, device=torch.device("cuda"))
+    for name in ("r", "beta", "r_joint", "beta_joint", "r_full", "task_rms", "total_rms", "valid"):
+        assert getattr(tc, name).device == field.device, name
+    # The line that actually blew up.
+    responding_mask(tc.r_full, mask, 0.1)
