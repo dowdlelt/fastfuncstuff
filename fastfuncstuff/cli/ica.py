@@ -70,6 +70,7 @@ try:
         apply_polort_projection,
         build_task_design_for_run,
         component_condition_correlations,
+        component_task_glm,
         estimate_ica_component_count,
         find_constant_voxels,
         parse_num_comps_spec,
@@ -845,6 +846,8 @@ def _run_single_ica(
     condition_spectral_corr = None
     cond_labels = None
     cond_durations = None
+    design_tc = None
+    task_glm = None
     ortvec_corr = None
     ortvec_spectral_corr = None
     ortvec_labels = None
@@ -939,6 +942,22 @@ def _run_single_ica(
                 )
         except Exception as e:
             print(f"  Warning: Could not compute ortvec correlations for run {run_idx + 1}: {e}")
+
+    # Which components hold task, in a GLM sense. The marginal correlations above are
+    # per-condition contamination scores and are capped by the design; this is the
+    # identification table, ranked on the whole model's R^2.
+    if design_tc is not None and cond_labels is not None:
+        try:
+            task_glm = component_task_glm(
+                mixing_tk=mixing,
+                design_tc=design_tc,
+                labels=list(cond_labels),
+                explained_share=total_share,
+            )
+            _vsection(args.verb >= 1, "Task GLM")
+            _vprint(args.verb >= 1, ica_postprocess.format_component_task_table(task_glm))
+        except Exception as e:
+            print(f"  Warning: Could not fit the task GLM for run {run_idx + 1}: {e}")
 
     pfx = parse_prefix(str(args.prefix))
     nii_ext = pfx.nifti_ext
@@ -1073,6 +1092,12 @@ def _run_single_ica(
             title=f"Run {run_idx + 1}: component spectral correlations",
         )
         _vprint(args.verb >= 1, f"Spectral correlation plot saved: {spectral_plot}")
+
+    if task_glm is not None:
+        task_tsv = ica_postprocess.save_component_task_table(
+            task_glm, Path(f"{out_prefix}_{run_tag}_task_glm.tsv")
+        )
+        _vprint(args.verb >= 1, f"Task GLM table saved: {task_tsv}")
 
     # --- Mixture model z-maps ---
     mixture_meta = []
@@ -1281,6 +1306,21 @@ def _run_single_ica(
             "note": "Condition and ortvec vectors are preprocessed to match ICA data temporal filtering",
         },
         "component_condition_corr": None if condition_corr is None else condition_corr.tolist(),
+        "component_task_glm": None
+        if task_glm is None
+        else {
+            "labels": task_glm["labels"],
+            "dof_model": task_glm["dof_model"],
+            "dof_resid": task_glm["dof_resid"],
+            "r2_chance": task_glm["r2_chance"],
+            "r_full": task_glm["r_full"].tolist(),
+            "r2": task_glm["r2"].tolist(),
+            "f_stat": task_glm["f_stat"].tolist(),
+            "p_value": task_glm["p_value"].tolist(),
+            "beta_joint": task_glm["beta"].tolist(),
+            "t_joint": task_glm["t"].tolist(),
+            "r_joint": task_glm["r_joint"].tolist(),
+        },
         "component_condition_spectral_corr": None
         if condition_spectral_corr is None
         else condition_spectral_corr.tolist(),
@@ -1358,6 +1398,9 @@ def _run_single_ica(
             "ica_maps": f"{out_prefix}_{run_tag}_ica_maps{nii_ext}",
             "ica_timecourses": f"{out_prefix}_{run_tag}_ica_timecourses.1D",
             "pca_scree_plot": f"{out_prefix}_{run_tag}_pca_scree.png",
+            "task_glm_table": f"{out_prefix}_{run_tag}_task_glm.tsv"
+            if task_glm is not None
+            else None,
             "component_correlation_plot": f"{out_prefix}_{run_tag}_component_correlations.png"
             if len(corr_blocks) > 0
             else None,
@@ -3714,6 +3757,9 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="TSV",
         help="BIDS *_events.tsv files for task annotation (one per run). "
+        "Fits the whole design to every component timecourse and writes "
+        "<prefix>_task_glm.tsv: full-model R2/F/p per component (which ones hold "
+        "task) plus joint beta/t per condition (which conditions). "
         "Mutually exclusive with -onsets.",
     )
     task.add_argument(

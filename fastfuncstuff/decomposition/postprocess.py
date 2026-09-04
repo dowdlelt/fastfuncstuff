@@ -481,3 +481,81 @@ def auto_mask_from_data(data_4d: np.ndarray, verbose: bool = False) -> np.ndarra
             f"({100 * n_brain / max(1, n_total):.1f}%) thresh={thresh:.2f}"
         )
     return mask
+
+
+def format_component_task_table(glm: dict, *, top_n: int | None = 20) -> str:
+    """Render :func:`component_task_glm` as the "which components hold task" table.
+
+    Sorted by full-model R^2, because that is the only column not capped by the
+    design geometry.  The lead condition is the one with the largest |t| from the
+    JOINT fit; picking it on marginal |r| would rank on how much a condition
+    overlaps the others.
+    """
+    labels = glm["labels"]
+    r2 = glm["r2"]
+    order = np.argsort(-r2)
+    if top_n is not None:
+        order = order[:top_n]
+    share = glm.get("explained_share")
+
+    lines = [
+        f"  Task GLM per component  (df {glm['dof_model']}, {glm['dof_resid']};  "
+        f"R2 at chance = {glm['r2_chance']:.3f})",
+        "  {:>5s} {:>7s} {:>7s} {:>8s} {:>9s}  {:s}".format(
+            "comp", "var%", "R2", "F", "p", "strongest condition (joint)"
+        ),
+    ]
+    for k in order:
+        k = int(k)
+        c = int(np.argmax(np.abs(glm["t"][k])))
+        var_s = "     --" if share is None else f"{100.0 * float(share[k]):6.2f}%"
+        lines.append(
+            "  {:>5d} {:s} {:7.3f} {:8.2f} {:9.2e}  {:s} (t={:+.2f}, r={:+.3f})".format(
+                k + 1,
+                var_s,
+                float(r2[k]),
+                float(glm["f_stat"][k]),
+                float(glm["p_value"][k]),
+                labels[c],
+                float(glm["t"][k, c]),
+                float(glm["r_joint"][k, c]),
+            )
+        )
+    if top_n is not None and len(r2) > top_n:
+        lines.append(f"  ... {len(r2) - top_n} more (all rows in the .tsv)")
+    return "\n".join(lines)
+
+
+def save_component_task_table(glm: dict, out_tsv: Path) -> Path:
+    """Write the full per-component / per-condition task GLM as a TSV."""
+    labels = glm["labels"]
+    share = glm.get("explained_share")
+    cols = ["component", "var_share", "r_full", "r2", "F", "p"]
+    for lab in labels:
+        cols += [f"beta_{lab}", f"t_{lab}", f"r_joint_{lab}", f"r_marginal_{lab}"]
+
+    out_tsv = Path(out_tsv)
+    with out_tsv.open("w") as fh:
+        fh.write(
+            f"# task GLM per ICA component: dof_model={glm['dof_model']} "
+            f"dof_resid={glm['dof_resid']} r2_chance={glm['r2_chance']:.6g}\n"
+        )
+        fh.write("\t".join(cols) + "\n")
+        for k in range(len(glm["r2"])):
+            row = [
+                str(k + 1),
+                "" if share is None else f"{float(share[k]):.6g}",
+                f"{float(glm['r_full'][k]):.6g}",
+                f"{float(glm['r2'][k]):.6g}",
+                f"{float(glm['f_stat'][k]):.6g}",
+                f"{float(glm['p_value'][k]):.6g}",
+            ]
+            for c in range(len(labels)):
+                row += [
+                    f"{float(glm['beta'][k, c]):.6g}",
+                    f"{float(glm['t'][k, c]):.6g}",
+                    f"{float(glm['r_joint'][k, c]):.6g}",
+                    f"{float(glm['r_marginal'][k, c]):.6g}",
+                ]
+            fh.write("\t".join(row) + "\n")
+    return out_tsv

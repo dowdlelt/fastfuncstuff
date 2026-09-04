@@ -604,3 +604,89 @@ def component_condition_correlations(
     yz = y / y_std
 
     return (xz.T @ yz) / float(x.shape[0])
+
+
+def component_task_glm(
+    mixing_tk: torch.Tensor,
+    design_tc: torch.Tensor,
+    labels: list[str],
+    *,
+    explained_share: np.ndarray | None = None,
+) -> dict:
+    """Fit the whole task design to every ICA timecourse: which components hold task.
+
+    The marginal correlation next door answers "does this component follow condition
+    k", which is a contamination question.  This answers the identification one --
+    "how much of the model is in this component, and which conditions carry it" --
+    and the two disagree whenever a run holds several conditions.  Marginal ``r`` is
+    capped at ``corr(x_k, sum_j x_j)`` because the other K-1 responses stay in the
+    residual, so a component that is a NOISELESS copy of the full task response can
+    still score 0.1--0.3 per condition.  That ceiling belongs to the design, not to
+    the component, which is why ranking is on ``r_full`` and the per-condition
+    numbers come from the JOINT fit.
+
+    Both inputs must already carry the same temporal preprocessing (polort,
+    high-pass) as the ICA data -- ``preprocess_design_for_correlation`` is what puts
+    the design on that footing.  Only the mean is removed again here.
+
+    Parameters
+    ----------
+    mixing_tk : (T, K)
+        Component timecourses, time first.
+    design_tc : (T, C)
+        HRF-convolved condition regressors.
+    labels : list of str
+        Condition names, one per design column.
+    explained_share : (K,), optional
+        Each component's share of data variance, carried through to the table so the
+        two numbers a reader wants to weigh -- how big and how task-like -- sit in
+        the same row.
+
+    Returns
+    -------
+    dict
+        ``r_full`` (K,), ``r2`` (K,), ``f_stat`` (K,), ``p_value`` (K,), the joint
+        ``beta`` / ``t`` / ``r_joint`` (K, C), the marginal ``r`` (K, C), the fit's
+        ``dof_model`` / ``dof_resid``, and ``r2_chance`` -- the R^2 a component with
+        NO task relation returns anyway, which is what keeps a table of small
+        numbers readable.
+    """
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    n_t, n_k = int(mixing_tk.shape[0]), int(mixing_tk.shape[1])
+    # task_coupling wants (nx,ny,nz,T) with time last; one "voxel" per component gives
+    # the whole table in a single call rather than a second implementation of the
+    # joint fit ([[Code reuse]]).
+    field = mixing_tk.detach().to(torch.float64).T.reshape(n_k, 1, 1, n_t)
+    tc = task_coupling(field, design_tc, polort=0, labels=labels)
+
+    r_full = tc.r_full.reshape(n_k).cpu().numpy().astype(np.float64)
+    r2 = r_full**2
+    dof_model = int(tc.n_fit)
+    # polort=0 removes the single constant column.
+    dof_resid = max(1, n_t - 1 - dof_model)
+    f_stat = (r2 / dof_model) / np.clip((1.0 - r2) / dof_resid, 1e-30, None)
+
+    from scipy import stats as _st
+
+    p_value = np.asarray(_st.f.sf(f_stat, dof_model, dof_resid), dtype=np.float64)
+
+    r_joint = tc.r_joint.reshape(n_k, -1).cpu().numpy().astype(np.float64)
+    t_joint = r_joint * np.sqrt(dof_resid / np.clip(1.0 - r_joint**2, 1e-30, None))
+
+    return {
+        "labels": list(tc.labels),
+        "r_full": r_full,
+        "r2": r2,
+        "f_stat": f_stat,
+        "p_value": p_value,
+        "beta": tc.beta_joint.reshape(n_k, -1).cpu().numpy().astype(np.float64),
+        "t": t_joint,
+        "r_joint": r_joint,
+        "r_marginal": tc.r.reshape(n_k, -1).cpu().numpy().astype(np.float64),
+        "dof_model": dof_model,
+        "dof_resid": dof_resid,
+        # chance_share is an rms share, i.e. sqrt(R^2) under the null; square it back.
+        "r2_chance": float(tc.chance_share**2),
+        "explained_share": None if explained_share is None else np.asarray(explained_share),
+    }
