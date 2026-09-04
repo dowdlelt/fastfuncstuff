@@ -87,7 +87,26 @@ def build_parser() -> FfsArgumentParser:
         help="Monte-Carlo iterations.  Below ~2000 the tail of the table is too noisy to trust.",
     )
     sim.add_argument(
-        "-seed", type=int, default=None, help="Random seed (default: nondeterministic)."
+        "-seed",
+        type=int,
+        default=None,
+        help="Random seed (default: nondeterministic).  Reproduces a run "
+        "exactly only together with -batch, since the automatic batch size "
+        "depends on how much memory is free at the time.",
+    )
+    sim.add_argument(
+        "-batch",
+        type=int,
+        default=None,
+        help="Volumes simulated per batch.  Default: from free memory on the "
+        "target device.  Lower it if the GPU is shared.",
+    )
+    sim.add_argument(
+        "-cpu_cluster",
+        action="store_true",
+        help="Cluster on CPU worker processes even when simulating on a GPU.  "
+        "The two agree exactly; this is the fallback if the fused kernels "
+        "are unavailable.",
     )
     sim.add_argument(
         "-pthr",
@@ -309,7 +328,9 @@ def main(argv: list[str] | None = None) -> int:
         sideds=sideds,
         device=device,
         n_jobs=args.jobs,
+        batch=args.batch,
         seed=args.seed,
+        on_device=False if args.cpu_cluster else None,
         verbose=verb >= 1,
     )
 

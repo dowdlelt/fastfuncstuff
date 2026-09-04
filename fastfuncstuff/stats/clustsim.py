@@ -445,20 +445,36 @@ def simulate_cluster_null(
     n_jobs: int | None = None,
     batch: int | None = None,
     seed: int | None = None,
+    on_device: bool | None = None,
     verbose: bool = True,
 ) -> ClusterNull:
     """Run the Monte-Carlo simulation and return the accumulated null.
 
-    Fields are generated in batches on ``device`` and handed to a CPU worker
-    pool for the connected-components pass, with generation of the next
-    batch overlapping the clustering of the current one.  Only the batch is
-    ever resident, so memory is independent of ``n_iter``.
+    On CUDA the whole loop stays on the card — fields are generated and
+    labelled there, and only a ``[batch, npthr]`` table of cluster maxima
+    ever crosses PCIe.  Otherwise fields are generated in batches and handed
+    to a CPU worker pool, with the next batch's generation overlapping the
+    current one's clustering.  Either way only one batch is resident, so
+    memory is independent of ``n_iter``.
+
+    ``on_device`` forces the choice; the default follows the device.
+
+    ``seed`` reproduces a run only together with ``batch``: the automatic
+    batch size is read from *free* memory, so an otherwise identical rerun
+    on a busier card draws a different set of fields.  The tables agree to
+    Monte-Carlo error either way; pin ``batch`` when you need the same
+    numbers twice.
     """
     sim = NullFieldSimulator(mask, voxmm, acf, device=device, seed=seed)
     tcrits = zthresholds(pthr, sideds)
 
     null = ClusterNull(pthr=pthr, athr=athr, nns=nns, sideds=sideds)
     null.init_storage(n_iter)
+
+    if on_device is None:
+        on_device = sim.device.type == "cuda"
+    if on_device:
+        return _simulate_on_device(sim, null, tcrits, n_iter, pthr, nns, sideds, batch, verbose)
 
     if n_jobs is None:
         n_jobs = max(1, (os.cpu_count() or 2) - 1)
@@ -525,6 +541,54 @@ def simulate_cluster_null(
     return null
 
 
+def _simulate_on_device(
+    sim: NullFieldSimulator,
+    null: ClusterNull,
+    tcrits: dict[str, np.ndarray],
+    n_iter: int,
+    pthr: tuple[float, ...],
+    nns: tuple[int, ...],
+    sideds: tuple[str, ...],
+    batch: int | None,
+    verbose: bool,
+) -> ClusterNull:
+    """Generate and label entirely on the accelerator."""
+    from fastfuncstuff.stats.cluster_gpu import build_neighbor_table, cluster_extent_batched
+
+    dev = sim.device
+    n_vox = int(sim.mask.sum())
+    if batch is None:
+        batch = _plan_batch(sim, n_iter)
+
+    # Both paths want thresholds tightest-first; remember how to put the
+    # columns back in the caller's pthr order.
+    tc_dev: dict[str, torch.Tensor] = {}
+    order: dict[str, np.ndarray] = {}
+    for s in sideds:
+        arr = np.asarray(tcrits[s], dtype=np.float64)
+        idx = np.argsort(-arr)
+        order[s] = idx
+        tc_dev[s] = torch.from_numpy(arr[idx].copy()).to(dev, torch.float32)
+
+    nbr = {nn: build_neighbor_table(sim.mask, nn, dev) for nn in nns}
+    scratch = torch.full((batch * n_vox,), -1, device=dev, dtype=torch.int32)
+
+    bar = tqdm(total=n_iter, desc="clustsim", leave=True, disable=not verbose)
+    try:
+        for start in range(0, n_iter, batch):
+            nb = min(batch, n_iter - start)
+            fields = sim.generate(nb)
+            view = scratch[: nb * n_vox] if nb != batch else scratch
+            res = cluster_extent_batched(fields, nbr, nns, sideds, tc_dev, view)
+            del fields
+            for (sided, nn), tab in res.items():
+                null.max_extent[(sided, nn)][start : start + nb, order[sided]] = tab.cpu().numpy()
+            bar.update(nb)
+    finally:
+        bar.close()
+    return null
+
+
 def _plan_batch(sim: NullFieldSimulator, n_iter: int) -> int:
     """Fields per generation batch, from free memory on the target device."""
     from fastfuncstuff.memory import get_available_memory
@@ -533,5 +597,11 @@ def _plan_batch(sim: NullFieldSimulator, n_iter: int) -> int:
     # 0.5 safety factor: PyTorch's caching allocator holds more than the
     # live tensors, and the host-side copy of the batch lands alongside.
     budget = int(avail * 0.5)
-    n = max(2, budget // max(sim.bytes_per_field(), 1))
+    per_field = sim.bytes_per_field()
+    if sim.device.type == "cuda":
+        # Labelling on-device costs far more than generation: the volume->
+        # compact-id scratch, the [K, T] adjacency and the labels all scale
+        # with the batch.  Measured ~48 bytes per (volume x mask voxel).
+        per_field = max(per_field, 48 * int(sim.mask.sum()))
+    n = max(2, budget // max(per_field, 1))
     return int(min(n, n_iter, 4096))
