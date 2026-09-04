@@ -1239,3 +1239,106 @@ def test_patch_test_separates_a_kept_response_from_no_task(tmp_path):
     # One-sided: preferential KEEPING is the good outcome and must never be a finding.
     assert kept["n_patches_significant"] == 0, kept
     assert none["n_patches_significant"] == 0, none
+
+
+def _scan(prefix: Path) -> dict | None:
+    with open(f"{prefix}_metadata.json") as f:
+        return json.load(f).get("task_component_scan")
+
+
+def _nordic_task_run(tmp_path, prefix, magn_file, ev, *extra):
+    from fastfuncstuff.cli.nordic import main
+
+    main(
+        [
+            "-input-magn",
+            str(magn_file),
+            "-prefix",
+            str(prefix),
+            "-magnitude-only",
+            "-kernel-size-pca",
+            "3",
+            "3",
+            "3",
+            "-kernel-size-gfactor",
+            "3",
+            "3",
+            "1",
+            "-gfactor-nvols",
+            "8",
+            "-factor-error",
+            "4.0",
+            "-events",
+            str(ev),
+            "-device",
+            "cpu",
+            *extra,
+        ]
+    )
+
+
+def test_component_scan_runs_by_default_and_changes_nothing(tmp_path):
+    """-events measures the removed field in TIME as well as in space, without acting.
+
+    The spatial half needs a leak big enough to move a mask placed on half the run; a
+    component that is task-locked but lives in a few voxels does not move it. So the
+    scan is not optional extra work, it is the half with power where the other has
+    none — and like every other -events output it must leave the data alone.
+    """
+    magn_file, ev = _planted_task_run(tmp_path, seed=11, amp=25.0)
+    _nordic_task_run(tmp_path, tmp_path / "SCAN", magn_file, ev)
+    scan = _scan(tmp_path / "SCAN")
+    assert scan is not None, "the component scan did not run under bare -events"
+    assert scan["rescued"] is False
+    assert scan["flagged_components"], "the planted leak was not flagged"
+    assert not (tmp_path / "SCAN_taskrescued.nii.gz").exists()
+
+
+def test_task_comps_off_skips_the_scan(tmp_path):
+    magn_file, ev = _planted_task_run(tmp_path, seed=11, amp=25.0)
+    _nordic_task_run(tmp_path, tmp_path / "OFF", magn_file, ev, "-task_comps", "off")
+    assert _scan(tmp_path / "OFF") is None
+
+
+def test_task_rescue_puts_the_response_back(tmp_path):
+    """The end-to-end bargain: -task_rescue raises the amplitude it was there to save.
+
+    Scored on the same responding mask the report uses, against the un-rescued run, so
+    a change here is the restored component and not a different stratum.
+    """
+    magn_file, ev = _planted_task_run(tmp_path, seed=11, amp=25.0)
+    _nordic_task_run(tmp_path, tmp_path / "KEPT", magn_file, ev)
+    _nordic_task_run(tmp_path, tmp_path / "RESC", magn_file, ev, "-task_rescue")
+    scan = _scan(tmp_path / "RESC")
+    assert scan is not None and scan["rescued"] is True
+    assert scan["dof_returned"] == len(scan["flagged_components"])
+    assert (tmp_path / "RESC_taskrescued.nii.gz").exists()
+    # output = un-rescued + what was added, exactly: nothing is hidden in the primary.
+    kept = nib.load(str(tmp_path / "KEPT.nii.gz")).get_fdata(dtype=np.float32)
+    resc = nib.load(str(tmp_path / "RESC.nii.gz")).get_fdata(dtype=np.float32)
+    added = nib.load(str(tmp_path / "RESC_taskrescued.nii.gz")).get_fdata(dtype=np.float32)
+    np.testing.assert_allclose(resc, kept + added, atol=1e-4)
+    r_kept = nib.load(str(tmp_path / "RESC_taskfit_kept.nii.gz")).get_fdata(dtype=np.float32)
+    r_after = nib.load(str(tmp_path / "RESC_taskfit_rescued.nii.gz")).get_fdata(dtype=np.float32)
+    assert float(np.median(r_after[..., 0])) > float(np.median(r_kept[..., 0]))
+
+
+def test_task_rescue_needs_the_scan_it_acts_on(tmp_path):
+    from fastfuncstuff.cli.nordic import main
+
+    magn_file, ev = _planted_task_run(tmp_path, seed=11, amp=0.0)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "-input-magn",
+                str(magn_file),
+                "-prefix",
+                str(tmp_path / "X"),
+                "-magnitude-only",
+                "-events",
+                str(ev),
+                "-task_rescue",
+                "-task_comps",
+                "off",
+            ]
+        )

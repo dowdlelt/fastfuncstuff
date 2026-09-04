@@ -374,40 +374,50 @@ Examples:
     task_group.add_argument(
         "-task_rescue",
         "-task-rescue",
-        action="store_true",
-        help="Put back the removed components whose time course follows the task.\n"
-        "The single-echo sibling of -rescue: that one protects a component from removal "
-        "when it has a correlated partner in another echo (thermal noise is the only "
-        "thing independent across echoes); this one protects it when the task explains "
-        "its time course, which needs no second echo.\n"
-        "It can only ever make the denoising remove LESS. Nothing here can discard what "
-        "the threshold kept, so the trade is a bounded amount of returned noise against "
-        "a response that would otherwise be gone — turn it on to be conservative.\n"
-        "Runs an ICA of {prefix}_taskloss, lets the usual model-order estimator pick the "
-        "count (the removed field is the Marchenko-Pastur bulk, which is the regime that "
-        "estimator is built for), then scores every component's time course against the "
-        "task under familywise control — one test per component against its own "
-        "phase-randomised null, which is the right multiplicity unit.\n"
+        nargs="?",
+        const="ica",
+        default=None,
+        metavar="MODE",
+        help="ACT on the component scan: put back the removed components whose time "
+        "course follows the task. MODE is 'ica' (the default, and currently the only "
+        "one) — bare -task_rescue means -task_rescue ica.\n"
+        "The measurement runs either way; this is the ffs_locomoco -detask of this tool, "
+        "an opt-in pass that can only move in one direction. Nothing here can discard "
+        "what the threshold kept, so the trade is a bounded amount of returned noise "
+        "against a response that would otherwise be gone.\n"
+        "It is also the single-echo sibling of -rescue: that one protects a component "
+        "from removal when it has a correlated partner in another echo (thermal noise is "
+        "the only thing independent across echoes); this one protects it when the task "
+        "explains its time course, which needs no second echo.\n"
         "The primary output then CARRIES the rescue. What was added is written beside it "
         "as {prefix}_taskrescued, so the un-rescued series is exactly the output minus "
         "that file and nothing is hidden. Each restored component hands back one degree "
-        "of freedom, reported so it can go into ffs_reml -adjust_dof.\n"
+        "of freedom, reported so it can go into ffs_reml -adjust_dof. The task fit is "
+        "re-run on the rescued series and printed BEFORE -> AFTER.\n"
         "Requires -events.",
     )
     task_group.add_argument(
-        "-task_rescue_comps",
-        "-task-rescue-comps",
-        type=int,
-        default=None,
-        metavar="K",
-        help="Force the ICA component count for -task_rescue instead of estimating it.\n"
-        "The estimator is conservative on the removed field, which is exactly what makes "
-        "it trustworthy for 'was anything structured taken out' — and is also its limit "
-        "here: a component NORDIC discarded was, by definition, at the thermal-noise "
-        "level inside its own patch, so pooled over the brain it can be too small a "
-        "share of the removed variance to earn a component of its own. Raising the order "
-        "gives a small leak somewhere to live. Selection stays familywise, so a higher "
-        "order costs specificity in the null distribution, not in what is restored.",
+        "-task_comps",
+        "-task-comps",
+        default="auto",
+        metavar="N|auto|off",
+        help="Component count for the scan of the removed field. 'auto' (default) is the "
+        "usual model-order estimator with a floor; an integer forces the order; 'off' "
+        "skips the scan (and with it -task_rescue).\n"
+        "The floor is why this is not just the estimator. That estimator is conservative "
+        "on the removed field, which is what makes it trustworthy for 'was anything "
+        "structured taken out' — and is also its limit here: a component NORDIC "
+        "discarded was, by definition, at the thermal-noise level inside its own patch, "
+        "so pooled over the brain it can be too small a share of the removed variance to "
+        "earn a component of its own. Measured on synthetic runs it returned k=1 every "
+        "time, and one component pooling the whole removed field is not a thing a leak "
+        "can be found in.\n"
+        "The floor is SMALL (10) on purpose, and forcing N HIGHER usually costs "
+        "detections rather than buying them: the leak's z is set by the data and barely "
+        "moves with the order, while the familywise cut grows with the number of "
+        "components tested. Measured on a planted over-removal, three seeds: flagged 3/3 "
+        "at k=5 and k=10, 0/3 at k=15, 30 and 60, with no false positive at any order on "
+        "runs with no task in them.",
     )
     task_group.add_argument(
         "-task_alpha",
@@ -415,7 +425,7 @@ Examples:
         type=float,
         default=0.05,
         metavar="A",
-        help="Familywise error rate for -task_rescue component selection. Default 0.05.",
+        help="Familywise error rate for the component scan's selection. Default 0.05.",
     )
     task_group.add_argument(
         "-task_surrogates",
@@ -423,7 +433,7 @@ Examples:
         type=int,
         default=2000,
         metavar="N",
-        help="Phase-randomised draws per component for the -task_rescue null. Default 2000.",
+        help="Phase-randomised draws per component for the component scan's null. Default 2000.",
     )
     task_group.add_argument(
         "-task_fdr_q",
@@ -478,26 +488,108 @@ Examples:
     return parser.parse_args(argv)
 
 
-def _task_rescue(outputs, args, label: str, device) -> dict | None:
-    """Decompose what was removed, and give back the components that follow the task.
+def parse_task_comps(value) -> str | int:
+    """``-task_comps`` -> ``"auto"``, ``"off"``, or a forced component count."""
+    text = str(value).strip().lower()
+    if text in ("auto", "off"):
+        return text
+    try:
+        k = int(text)
+    except ValueError:
+        raise ValueError(f"-task_comps takes an integer, 'auto' or 'off', got {value!r}") from None
+    if k < 1:
+        raise ValueError(f"-task_comps needs at least one component, got {k}")
+    return k
 
-    The single-echo sibling of ``-rescue``. That one protects a component from removal
-    when it has a correlated partner in another echo, on the argument that thermal noise
-    is the only thing independent across echoes. This one protects a component when its
-    TIME COURSE follows the task, which needs no second echo.
 
-    It can only ever make the denoising remove **less**. Nothing here can discard
-    anything the threshold kept, so turning it on cannot make a dataset worse in the
-    direction people fear -- it trades a bounded amount of returned noise for a response
-    that would otherwise be gone. That asymmetry is why it belongs behind one flag
-    rather than in a separate tool: the same shape as ``ffs_locomoco -detask``, which can
-    only make the warp smaller.
+def parse_task_rescue(value) -> str:
+    """``-task_rescue`` MODE -> the mode name. Only ``ica`` exists today.
 
-    Model order comes from the existing estimator with no special casing, and the reason
-    it can be trusted here is worth stating: the removed field IS the Marchenko-Pastur
-    bulk -- what is left once the top components are taken out -- which is exactly the
-    regime that estimator is built for. The spectrum that would mislead it is the
-    truncated one, and that is the DENOISED series, not this.
+    Mode-valued rather than a bare switch because this is the same slot as
+    ``ffs_locomoco -detask``: an opt-in pass over a measurement that ran anyway, and
+    the place a second approach would go.
+    """
+    mode = str(value).strip().lower()
+    if mode != "ica":
+        raise ValueError(f"-task_rescue MODE must be 'ica', got {value!r}")
+    return mode
+
+
+def _scan_order(args, lost_vt, lost, mask, header, n_t, device) -> tuple[int, dict]:
+    """Component count for the scan: forced, or the estimator under a small floor.
+
+    The estimator is not wrong when it says one -- the removed field IS the
+    Marchenko-Pastur bulk and mostly thermal noise, which is the regime it is built for
+    and the answer it should give. The floor is about what this particular scan is for.
+    A component NORDIC discarded was by definition at the thermal-noise level inside its
+    own patch, so pooled over the brain a real leak can be too small a share of the
+    removed variance to earn a component of its own; measured across the synthetic runs
+    the estimate came back k=1 every time, and one component pooling the whole removed
+    field is not a thing a leak can be found in.
+
+    Why the floor is SMALL, which is the counter-intuitive half. Raising the order does
+    not buy sensitivity here, it spends it: the leak's z is set by the data and barely
+    moves with k, while the familywise cut grows with the number of components tested.
+    Measured on a planted over-removal, three seeds, z of the leak against the cut::
+
+        k       leak z        z_cut        flagged     no-task z (3 seeds)
+        5      4.34-4.51    3.07-3.59        3/3         -0.09 to 0.75
+        10     4.08-4.25    3.83-3.97        3/3          0.24 to 2.30
+        15     3.99-4.19    4.06-4.30        0/3          1.18 to 2.11
+        30       4.05         4.60           0/3
+        60       4.14         5.15           0/3
+
+    Ten detects every planted leak with margin, flags nothing on runs with no task in
+    them, and still gives a leak room to separate from the bulk. Thirty -- the order a
+    "look harder" instinct reaches for -- misses all three.
+    """
+    from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
+    from fastfuncstuff.decomposition.tools import estimate_ica_component_count
+    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
+
+    if isinstance(args.task_comps, int):
+        return int(args.task_comps), {"mode": "explicit"}
+    n_in = int(mask.sum())
+    voxdims = tuple(float(x) for x in header.get_zooms()[:3])
+    resels, _, _ = estimate_smoothness_resels_acf(
+        lost.numpy(), voxdims, mask=mask.numpy(), device=torch.device("cpu")
+    )
+    n_eff = effective_sample_size_from_resels(n_in, resels, floor=n_t)
+    k_est, _, diag = estimate_ica_component_count(
+        data_vox_t=lost_vt.to(device),
+        method="auto",
+        max_auto_components=max(2, int(round(0.66 * n_t))),
+        auto_min_components=min(5, max(2, n_t // 4)),
+        auto_var_threshold=0.90,
+        use_mp_prior=True,
+        n_eff=n_eff,
+        device=device,
+        verbose=False,
+    )
+    floor = max(2, min(10, n_t // 8))
+    diag = dict(diag, k_estimated=int(k_est), floor=int(floor), resels=float(resels), n_eff=n_eff)
+    return max(int(k_est), floor), diag
+
+
+def _task_component_scan(outputs, args, label: str, device, state) -> dict | None:
+    """Decompose what was removed and ask which components follow the task.
+
+    This is the temporal half of the ``-events`` diagnostic and it runs by default,
+    because it has power exactly where the spatial half does not. The enrichment needs
+    a leak big enough to move a mask placed on half the run; a component that is
+    genuinely task-locked but lives in a handful of voxels does not move it, and shows
+    up here instead. The cost is a smoothness estimate and one small ICA -- seconds
+    against a denoising run -- so measuring is the default and ``-task_comps off`` is
+    the escape.
+
+    Nothing is changed unless ``-task_rescue`` is given. That pass is the single-echo
+    sibling of ``-rescue``: that one protects a component from removal when it has a
+    correlated partner in another echo, on the argument that thermal noise is the only
+    thing independent across echoes; this one protects it when the task explains its
+    time course, which needs no second echo. It can only ever make the denoising remove
+    **less** -- nothing here can discard what the threshold kept -- which is the
+    asymmetry that lets it sit behind one flag rather than in a separate tool, the same
+    shape as ``ffs_locomoco -detask``.
 
     Selection is familywise across components, one test per component against its own
     phase-randomised null. The per-voxel question does not arise: a component either
@@ -505,14 +597,10 @@ def _task_rescue(outputs, args, label: str, device) -> dict | None:
     """
     import numpy as np
 
-    from fastfuncstuff.cli.task_events import task_design_from_events
     from fastfuncstuff.decomposition.ica import FastICA
-    from fastfuncstuff.decomposition.model_order import effective_sample_size_from_resels
-    from fastfuncstuff.decomposition.tools import estimate_ica_component_count
-    from fastfuncstuff.decomposition.workflow import estimate_smoothness_resels_acf
     from fastfuncstuff.denoise.restore import restore_components
     from fastfuncstuff.io.afni import load_nifti, save_nifti
-    from fastfuncstuff.stats.task_coupling import component_task_fit, default_polort
+    from fastfuncstuff.stats.task_coupling import component_task_fit, component_variance_in_data
 
     kept_img = load_nifti(str(outputs.magnitude_file))
     kept = torch.as_tensor(np.ascontiguousarray(kept_img.get_fdata(dtype=np.float32)))
@@ -520,7 +608,6 @@ def _task_rescue(outputs, args, label: str, device) -> dict | None:
         np.ascontiguousarray(load_nifti(str(outputs.task_loss_file)).get_fdata(dtype=np.float32))
     )
     n_t = kept.shape[3]
-    tr = args.tr if args.tr is not None else float(kept_img.header["pixdim"][4])
     reference = (kept + lost).mean(dim=3)
     mask = reference > 0.1 * float(reference.max())
     # Constant voxels score a perfect fit and have poisoned two decompositions in this
@@ -528,49 +615,18 @@ def _task_rescue(outputs, args, label: str, device) -> dict | None:
     mask &= lost.std(dim=3) > 1e-8
     n_in = int(mask.sum())
     if n_in < n_t:
-        print(f"  Task rescue{label}: only {n_in} usable voxels for {n_t} frames; skipped.")
+        print(f"  Component scan{label}: only {n_in} usable voxels for {n_t} frames; skipped.")
         return None
 
     lost_vt = lost.reshape(-1, n_t)[mask.reshape(-1)]  # (V', T)
-    voxdims = tuple(float(x) for x in kept_img.header.get_zooms()[:3])
-    resels, _, _ = estimate_smoothness_resels_acf(
-        lost.numpy(), voxdims, mask=mask.numpy(), device=torch.device("cpu")
+    k, num_diag = _scan_order(args, lost_vt, lost, mask, kept_img.header, n_t, device)
+    est = num_diag.get("k_estimated")
+    how = (
+        f"forced to {k}"
+        if num_diag.get("mode") == "explicit"
+        else f"{k} = max(estimated {est}, floor {num_diag.get('floor')})"
     )
-    n_eff = effective_sample_size_from_resels(n_in, resels, floor=n_t)
-    if args.task_rescue_comps is not None:
-        k, num_diag = int(args.task_rescue_comps), {"mode": "explicit"}
-    else:
-        k, _, num_diag = estimate_ica_component_count(
-            data_vox_t=lost_vt.to(device),
-            method="auto",
-            max_auto_components=max(2, int(round(0.66 * n_t))),
-            auto_min_components=min(5, max(2, n_t // 4)),
-            auto_var_threshold=0.90,
-            use_mp_prior=True,
-            n_eff=n_eff,
-            device=device,
-            verbose=False,
-        )
-    print(
-        f"  Task rescue{label}: {k} component(s) from the removed field "
-        f"({n_in} voxels, {resels:.2f} voxels per resel, n_eff {n_eff}, "
-        f"mode {num_diag.get('mode', '?')})"
-    )
-    if k <= 2 and args.task_rescue_comps is None:
-        # Not a warning about the estimator, which is right: the removed field is
-        # mostly thermal noise and it says so. It is a warning about what that costs
-        # HERE -- a leak has to be a big enough share of the removed variance to earn
-        # a component before this can find it.
-        print(
-            "    NOTE the estimator sees almost no structure in what was removed. That "
-            "is the expected\n"
-            "    answer when the denoising took only noise, and it is also the case in "
-            "which a small\n"
-            "    leak has no component to be found in. -task_rescue_comps forces a "
-            "higher order if you\n"
-            "    have reason to look harder; the familywise selection still decides "
-            "what comes back."
-        )
+    print(f"  Component scan{label}: {how} over {n_in} voxels, {n_t} frames")
 
     ica = FastICA(n_components=k, device=device, random_state=0)
     ica.fit(lost_vt.T.to(device))  # (T, V') -- mixing_ comes back (T, k)
@@ -578,28 +634,73 @@ def _task_rescue(outputs, args, label: str, device) -> dict | None:
     mixing = ica.mixing_.detach().cpu()
     comps = ica.components_.detach().cpu()  # (k, V')
 
-    design, labels = task_design_from_events(args, n_t, tr, torch.device("cpu"))
-    polort = args.task_polort if args.task_polort is not None else default_polort(n_t, tr)
+    design, polort = state["design"], state["polort"]
     fit = component_task_fit(
         mixing, design, polort=polort, n_surrogates=args.task_surrogates, alpha=args.task_alpha
     )
     flagged = [int(c) for c in fit["flagged"]]
+    # What the flagged components are, as a share of what the denoising threw away. The
+    # z above says a component follows the task; this says whether it is worth anything.
+    shares = component_variance_in_data(
+        mixing, lost, polort=polort, design=design, mask=mask, device=device
+    )
+    summary = {
+        "n_components": int(k),
+        "flagged_components": flagged,
+        "z_cut": float(fit["z_cut"]),
+        "eff_dof": float(fit["eff_dof"]),
+        "informative": bool(fit["informative"]),
+        "model_order_mode": str(num_diag.get("mode", "?")),
+        "model_order_estimated": est,
+        "rescued": False,
+    }
+    if fit["informative"]:
+        print(
+            f"    temporal criterion: {fit['eff_dof']:.0f} effective DoF, a component "
+            f"needs R2>{fit['r2_needed']:.3f} to be flagged (familywise "
+            f"alpha={fit['alpha']:g} over {k} components, {fit['n_surrogates']} surrogates)"
+        )
+    else:
+        # Saying WHY beats printing "none flagged", which a reader would take as
+        # evidence that nothing task-locked was removed rather than as an absent
+        # measurement. A 20 s periodic block design lands here every time: a component
+        # merely sharing its spectrum fits it by construction.
+        print(f"    ⚠️  temporal criterion declines: {fit['uninformative_reason']}.")
+        print(
+            "        Nothing is flagged and nothing can be rescued on this design. The "
+            "enrichment above\n"
+            "        is carrying the decision alone; it needs no null and is unaffected."
+        )
+        summary["uninformative_reason"] = str(fit["uninformative_reason"])
+        return summary
     for c in flagged:
         print(
             f"    comp {c:3d}: R2 {float(fit['r2'][c]):.3f}  z {float(fit['z'][c]):+.2f}  "
-            f"p {float(fit['p'][c]):.4g}"
+            f"p {float(fit['p'][c]):.4g}  "
+            f"{100 * float(shares['var_data'][c]):.2f}% of what was removed, "
+            f"{100 * float(shares['var_task'][c]):.1f}% of its task-locked variance"
         )
-    if not flagged:
+    if flagged:
+        summary["var_of_removed_flagged"] = [float(shares["var_data"][c]) for c in flagged]
+        summary["var_of_removed_task_flagged"] = [float(shares["var_task"][c]) for c in flagged]
+        print(
+            f"    {len(flagged)} of {k} component(s) follow the task above z_cut "
+            f"{float(fit['z_cut']):.2f} (familywise, alpha {args.task_alpha:g}). "
+            f"Chance share for one component is {1 / max(1, n_t - polort - 1):.3f}."
+        )
+    else:
         print(
             f"    none of the {k} components follows the task above z_cut "
-            f"{float(fit['z_cut']):.2f} -- nothing put back, output unchanged."
+            f"{float(fit['z_cut']):.2f} -- nothing in what was removed is task-locked "
+            "in time."
         )
-        return {
-            "n_components": int(k),
-            "restored_components": [],
-            "dof_returned": 0,
-            "z_cut": float(fit["z_cut"]),
-        }
+    if not args.task_rescue:
+        if flagged:
+            print("    DIAGNOSTIC ONLY -- add -task_rescue to put these back.")
+        return summary
+    if not flagged:
+        print("    -task_rescue: nothing to put back, output unchanged.")
+        return summary
 
     # Scatter the masked maps back to the full grid, so a voxel outside the mask can
     # never receive anything.
@@ -628,16 +729,62 @@ def _task_rescue(outputs, args, label: str, device) -> dict | None:
         f"    NOTE {result.dof_returned} degrees of freedom went back into the data; "
         "carry that into ffs_reml -adjust_dof / ffs_util_updatedof."
     )
-    return {
-        "n_components": int(k),
-        "restored_components": flagged,
+    summary |= {
+        "rescued": True,
+        "mode": args.task_rescue,
         "gammas": result.gammas.tolist(),
         "variance_share_of_removed_total": result.var_returned_total,
         "dof_returned": result.dof_returned,
-        "z_cut": float(fit["z_cut"]),
         "added_file": added_path,
-        "model_order_mode": str(num_diag.get("mode", "?")),
     }
+    del lost, lost_vt, maps_kv, kept
+    _task_fit_after(result.restored, state, args, label)
+    return summary
+
+
+def _task_fit_after(restored, state, args, label: str) -> None:
+    """Re-measure the task fit on the RESCUED series, kept -> rescued.
+
+    The scan above says a component follows the task; this says what putting it back did
+    to the response, which is the question the whole diagnostic is about. It is the same
+    before/after ``ffs_locomoco`` prints on its corrected data, and for the same reason:
+    damage -- or repair -- becomes visible rather than inferred.
+
+    Both halves are reported because they are not redundant. Restoring a component that
+    carries response raises the AMPLITUDE in the voxels it lives in; ``|r|`` can move
+    either way, since what came back carries its own noise into the residual.
+    """
+    from fastfuncstuff.cli.task_events import psc_betas, save_task_fit
+    from fastfuncstuff.stats.task_coupling import task_coupling
+
+    print(f"  TASK FIT KEPT -> RESCUED{label} (medians on the responding mask)")
+    design, labels, polort, mask = state["design"], state["labels"], state["polort"], state["mask"]
+    after = task_coupling(restored, design, polort=polort, mask=mask, labels=labels)
+    psc_after = psc_betas(after, design, state["reference"], mask)
+    sel = state["resp"] > 0
+    for k, lb in enumerate(labels):
+        r0 = state["kept_r"][..., k][sel].abs()
+        r1 = after.r[..., k][sel].abs()
+        b0 = state["kept_psc"][..., k][sel].abs()
+        b1 = psc_after[..., k][sel].abs()
+        base = float(b0.median())
+        pct = 100.0 * (float(b1.median()) - base) / base if base > 0 else 0.0
+        print(
+            f"    {lb}: |r| {float(r0.median()):.3f} -> {float(r1.median()):.3f} "
+            f"({float(r1.median()) - float(r0.median()):+.3f}), amplitude "
+            f"{base:.3f} -> {float(b1.median()):.3f} %sig ({pct:+.1f}%)",
+            flush=True,
+        )
+    stem, ext = state["stem"], state["ext"]
+    save_task_fit(
+        f"{stem}_taskfit_rescued{ext}",
+        after,
+        psc_after,
+        labels,
+        state["affine"],
+        polort + 1,
+        int(state["n_t"]),
+    )
 
 
 def _resolve_task_design(args, magnitude_file: str):
@@ -763,7 +910,7 @@ def _split_half_enrichment(source, lost, design, mask, tr, args, labels):
     return sum(out) / len(out), out
 
 
-def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> None:
+def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> dict:
     """Is the task in what NORDIC threw away, and is it where the task lives?
 
     Three fits of one design — the input, the series that was kept, and the signed
@@ -912,7 +1059,8 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> None:
         "  The mask is chosen on frames the score never sees, so the 1.0x floor is real and not an",
         "  artefact of selection - a whole-run mask reads ~3.9x on data with no task in it at all.",
         "  Power is the cost: half a run's blocks place the mask, so a weak leak attenuates toward",
-        "  1.0x rather than showing up. An ICA of the loss series is the unsupervised next step.",
+        "  1.0x rather than showing up -- which is why the component scan below runs too: it asks the",
+        "  same question in time, where a leak confined to a few voxels still shows.",
     ]
     print("\n".join(lines))
     header = (
@@ -923,6 +1071,23 @@ def _task_leak_report(outputs, magnitude_file: str, args, label: str) -> None:
     Path(f"{stem}_taskleak.txt").write_text(
         header + "\n" + "\n".join(lines) + "\n", encoding="utf-8"
     )
+    # Everything the component scan and its after-fit need, so neither re-derives the
+    # design, the mask or the responding stratum -- a second threshold chosen there
+    # would let the two halves of one report disagree about where the task is.
+    return {
+        "design": design,
+        "labels": labels,
+        "polort": polort,
+        "mask": mask,
+        "resp": resp,
+        "reference": reference,
+        "kept_r": kept_tc.r,
+        "kept_psc": psc_betas(kept_tc, design, reference, mask),
+        "affine": affine,
+        "stem": stem,
+        "ext": ext,
+        "n_t": n_t,
+    }
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -944,8 +1109,18 @@ def main(argv: list[str] | None = None) -> None:
     if args.add_mean and not args.save_residual_map:
         print("ERROR: -add-mean only affects the residual map; also pass -save-residual-map")
         sys.exit(1)
+    try:
+        args.task_comps = parse_task_comps(args.task_comps)
+        if args.task_rescue is not None:
+            args.task_rescue = parse_task_rescue(args.task_rescue)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
     if args.task_rescue and args.events is None:
         print("ERROR: -task_rescue needs -events to know what the task is")
+        sys.exit(1)
+    if args.task_rescue and args.task_comps == "off":
+        print("ERROR: -task_rescue acts on the component scan that -task_comps off disables")
         sys.exit(1)
     if args.retain_dof is not None and args.retain_dof <= 0:
         print("ERROR: -retain-dof must be positive (integer components or a fraction in (0,1))")
@@ -1114,7 +1289,7 @@ def main(argv: list[str] | None = None) -> None:
         print_cli_section("Task-leak diagnostic")
         for i, outputs in enumerate(all_outputs):
             label = f" [echo {i + 1}]" if n_echoes > 1 else ""
-            _task_leak_report(outputs, magn_files[i], args, label)
+            state = _task_leak_report(outputs, magn_files[i], args, label)
             with open(outputs.metadata_file) as f:
                 summary = json.load(f).get("task_patch_test")
             if summary is not None:
@@ -1124,13 +1299,13 @@ def main(argv: list[str] | None = None) -> None:
                 stem = str(outputs.task_loss_file).partition("_taskloss")[0]
                 with open(f"{stem}_taskleak.txt", "a", encoding="utf-8") as f:
                     f.write("\n" + "\n".join(report) + "\n")
-            if args.task_rescue:
-                print_cli_section("Task rescue")
-                rescue = _task_rescue(outputs, args, label, device)
-                if rescue is not None:
+            if args.task_comps != "off":
+                print_cli_section("Component scan" + (" and rescue" if args.task_rescue else ""))
+                scan = _task_component_scan(outputs, args, label, device, state)
+                if scan is not None:
                     with open(outputs.metadata_file) as f:
                         meta = json.load(f)
-                    meta["task_rescue"] = rescue
+                    meta["task_component_scan"] = scan
                     with open(outputs.metadata_file, "w") as f:
                         json.dump(meta, f, indent=2)
 
