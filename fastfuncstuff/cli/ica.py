@@ -1485,6 +1485,11 @@ def _run_concat_ica(
     args,
     device: torch.device,
     shared_mask: np.ndarray | None,
+    onsets_files: list[str] | None = None,
+    durations: list[str] | None = None,
+    bids_task_onsets: list[list[np.ndarray]] | None = None,
+    bids_task_durations: list[float] | None = None,
+    bids_task_labels: list[str] | None = None,
 ) -> dict:
     """Run ICA on temporally concatenated runs (single-subject multi-run).
 
@@ -1497,6 +1502,12 @@ def _run_concat_ica(
     matching MELODIC's temporal concat behavior (per-file varnorm in
     process_file, then concatenation in setup_classic).
     """
+    from fastfuncstuff.decomposition import postprocess as ica_postprocess
+    from fastfuncstuff.decomposition.tools import (
+        build_concat_task_design,
+        component_task_glm,
+    )
+
     t_total = time.time()
     n_runs = len(input_files)
 
@@ -2146,6 +2157,66 @@ def _run_concat_ica(
         mixing_std = torch.clamp(mixing.std(dim=0, keepdim=True), min=1e-8)
         mixing = mixing / mixing_std
 
+    # --- Task GLM over the concatenated timeline ---
+    # Conditions share a column across runs, so this is one answer per component for
+    # the whole experiment. The per-run R2 columns next to it are the cross-run
+    # consistency: shared spatial maps, that run's own timecourse, that run's events.
+    task_glm = None
+    task_glm_per_run = None
+    if (bids_task_onsets is not None or onsets_files is not None) and tr is not None:
+        try:
+            if bids_task_onsets is not None:
+                cat_onsets = bids_task_onsets
+                cat_durations = list(bids_task_durations or [])
+                cat_labels = list(bids_task_labels or [])
+            else:
+                from fastfuncstuff.design.builder import parse_afni_timing_file, parse_durations
+
+                assert onsets_files is not None
+                cat_onsets = [parse_afni_timing_file(fp) for fp in onsets_files]
+                cat_labels = [f"cond{i + 1}" for i in range(len(cat_onsets))]
+                cat_durations = list(
+                    parse_durations(list(durations or []), len(cat_onsets), cat_labels)
+                )
+            design_cat, cat_labels, run_nuis = build_concat_task_design(
+                all_onsets=cat_onsets,
+                durations=cat_durations,
+                labels=cat_labels,
+                run_lengths=run_lengths,
+                tr=float(tr),
+                microtime_dt=args.microtime_dt,
+                polort=polort,
+                high_pass_hz=args.high_pass,
+                device=device,
+            )
+            task_glm = component_task_glm(
+                mixing_tk=mixing,
+                design_tc=design_cat,
+                labels=cat_labels,
+                explained_share=total_share,
+                polort=-1,
+                nuisance=run_nuis,
+            )
+            # Per run: same maps, this run's slice of the timecourse and design.
+            task_glm_per_run = []
+            for ri, start in enumerate(run_starts):
+                stop = start + run_lengths[ri]
+                task_glm_per_run.append(
+                    component_task_glm(
+                        mixing_tk=mixing[start:stop],
+                        design_tc=design_cat[start:stop],
+                        labels=cat_labels,
+                        explained_share=total_share,
+                    )
+                )
+            _vsection(args.verb >= 1, "Task GLM")
+            _vprint(
+                args.verb >= 1,
+                ica_postprocess.format_component_task_table(task_glm, per_run=task_glm_per_run),
+            )
+        except Exception as e:
+            print(f"  Warning: Could not fit the task GLM over the concatenation: {e}")
+
     # --- Trace: dump ICA intermediates ---
     if trace_dir:
         from pathlib import Path as _P  # noqa: N814
@@ -2218,6 +2289,12 @@ def _run_concat_ica(
         delimiter="\t",
     )
     _vprint(args.verb >= 1, f"Timecourses: {out_prefix}_concat_ica_timecourses.1D")
+
+    if task_glm is not None:
+        task_tsv = ica_postprocess.save_component_task_table(
+            task_glm, Path(f"{out_prefix}_concat_task_glm.tsv"), per_run=task_glm_per_run
+        )
+        _vprint(args.verb >= 1, f"Task GLM table saved: {task_tsv}")
 
     # Per-run timecourses (block-diag whiten path only)
     per_run_tc_paths: list[str] = []
@@ -2339,6 +2416,24 @@ def _run_concat_ica(
         "mask_type": mask_type,
         "polort": polort,
         "high_pass_hz": None if args.high_pass is None else float(args.high_pass),
+        "component_task_glm": None
+        if task_glm is None
+        else {
+            "labels": task_glm["labels"],
+            "dof_model": task_glm["dof_model"],
+            "dof_resid": task_glm["dof_resid"],
+            "r2_chance": task_glm["r2_chance"],
+            "r_full": task_glm["r_full"].tolist(),
+            "r2": task_glm["r2"].tolist(),
+            "f_stat": task_glm["f_stat"].tolist(),
+            "p_value": task_glm["p_value"].tolist(),
+            "beta_joint": task_glm["beta"].tolist(),
+            "t_joint": task_glm["t"].tolist(),
+            "r_joint": task_glm["r_joint"].tolist(),
+            "r2_per_run": None
+            if task_glm_per_run is None
+            else [g["r2"].tolist() for g in task_glm_per_run],
+        },
         "voxel_norm": bool(args.voxel_norm),
         "voxel_norm_scope": vn_scope,
         "whiten_mode": whiten_mode,
@@ -2362,6 +2457,7 @@ def _run_concat_ica(
         "outputs": {
             "ica_maps": f"{out_prefix}_concat_ica_maps{nii_ext}",
             "ica_timecourses": f"{out_prefix}_concat_ica_timecourses.1D",
+            "task_glm_table": f"{out_prefix}_concat_task_glm.tsv" if task_glm is not None else None,
             "ica_timecourses_per_run": per_run_tc_paths if per_run_tc_paths else None,
             "pca_scree_plot": f"{out_prefix}_concat_pca_scree.png",
             "ica_zmaps": f"{out_prefix}_concat_ica_zmaps{nii_ext}" if args.save_mixture_z else None,
@@ -4429,6 +4525,11 @@ def main() -> None:
             args=args,
             device=device,
             shared_mask=shared_mask,
+            onsets_files=args.onsets if _has_onsets else None,
+            durations=args.durations if _has_onsets else None,
+            bids_task_onsets=bids_task_onsets,
+            bids_task_durations=bids_task_durations,
+            bids_task_labels=bids_task_labels,
         )
         print(
             f"  Selected components: {concat_meta['n_components_selected']} "

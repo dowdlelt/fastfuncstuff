@@ -483,13 +483,20 @@ def auto_mask_from_data(data_4d: np.ndarray, verbose: bool = False) -> np.ndarra
     return mask
 
 
-def format_component_task_table(glm: dict, *, top_n: int | None = 20) -> str:
+def format_component_task_table(
+    glm: dict, *, top_n: int | None = 20, per_run: list[dict] | None = None
+) -> str:
     """Render :func:`component_task_glm` as the "which components hold task" table.
 
     Sorted by full-model R^2, because that is the only column not capped by the
     design geometry.  The lead condition is the one with the largest |t| from the
     JOINT fit; picking it on marginal |r| would rank on how much a condition
     overlaps the others.
+
+    ``per_run`` adds one R^2 column per run, from the same maps against that run's
+    own timecourse and events.  A component that holds task in every run and one
+    that holds it in a single run are the same number in the concatenated fit and
+    want very different treatment, so the spread is the point.
     """
     labels = glm["labels"]
     r2 = glm["r2"]
@@ -498,24 +505,29 @@ def format_component_task_table(glm: dict, *, top_n: int | None = 20) -> str:
         order = order[:top_n]
     share = glm.get("explained_share")
 
+    run_hdr = (
+        "" if per_run is None else "".join(f" {f'R2r{i + 1}':>6s}" for i in range(len(per_run)))
+    )
     lines = [
         f"  Task GLM per component  (df {glm['dof_model']}, {glm['dof_resid']};  "
         f"R2 at chance = {glm['r2_chance']:.3f})",
-        "  {:>5s} {:>7s} {:>7s} {:>8s} {:>9s}  {:s}".format(
-            "comp", "var%", "R2", "F", "p", "strongest condition (joint)"
+        "  {:>5s} {:>7s} {:>7s} {:>8s} {:>9s}{:s}  {:s}".format(
+            "comp", "var%", "R2", "F", "p", run_hdr, "strongest condition (joint)"
         ),
     ]
     for k in order:
         k = int(k)
         c = int(np.argmax(np.abs(glm["t"][k])))
         var_s = "     --" if share is None else f"{100.0 * float(share[k]):6.2f}%"
+        run_s = "" if per_run is None else "".join(f" {float(g['r2'][k]):6.3f}" for g in per_run)
         lines.append(
-            "  {:>5d} {:s} {:7.3f} {:8.2f} {:9.2e}  {:s} (t={:+.2f}, r={:+.3f})".format(
+            "  {:>5d} {:s} {:7.3f} {:8.2f} {:9.2e}{:s}  {:s} (t={:+.2f}, r={:+.3f})".format(
                 k + 1,
                 var_s,
                 float(r2[k]),
                 float(glm["f_stat"][k]),
                 float(glm["p_value"][k]),
+                run_s,
                 labels[c],
                 float(glm["t"][k, c]),
                 float(glm["r_joint"][k, c]),
@@ -526,11 +538,15 @@ def format_component_task_table(glm: dict, *, top_n: int | None = 20) -> str:
     return "\n".join(lines)
 
 
-def save_component_task_table(glm: dict, out_tsv: Path) -> Path:
+def save_component_task_table(
+    glm: dict, out_tsv: Path, *, per_run: list[dict] | None = None
+) -> Path:
     """Write the full per-component / per-condition task GLM as a TSV."""
     labels = glm["labels"]
     share = glm.get("explained_share")
     cols = ["component", "var_share", "r_full", "r2", "F", "p"]
+    if per_run is not None:
+        cols += [f"r2_run{i + 1:02d}" for i in range(len(per_run))]
     for lab in labels:
         cols += [f"beta_{lab}", f"t_{lab}", f"r_joint_{lab}", f"r_marginal_{lab}"]
 
@@ -550,6 +566,8 @@ def save_component_task_table(glm: dict, out_tsv: Path) -> Path:
                 f"{float(glm['f_stat'][k]):.6g}",
                 f"{float(glm['p_value'][k]):.6g}",
             ]
+            if per_run is not None:
+                row += [f"{float(g['r2'][k]):.6g}" for g in per_run]
             for c in range(len(labels)):
                 row += [
                     f"{float(glm['beta'][k, c]):.6g}",

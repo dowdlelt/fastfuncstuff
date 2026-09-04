@@ -586,6 +586,93 @@ def build_task_design_for_run(
     return design, labels, durations
 
 
+def build_concat_task_design(
+    all_onsets: list[list[np.ndarray]],
+    durations: list[float],
+    labels: list[str],
+    run_lengths: list[int],
+    tr: float,
+    *,
+    microtime_dt: float,
+    polort: int,
+    high_pass_hz: float | None,
+    device: torch.device,
+) -> tuple[torch.Tensor, list[str], torch.Tensor]:
+    """One design over the concatenated timeline, preprocessed the way tcat data is.
+
+    Conditions share a column ACROSS runs -- that is the point of fitting the
+    concatenated timecourse, and it is what makes the answer "does this component
+    carry the task over the experiment" rather than one answer per run.
+
+    Every step ffs_ica applies to a tcat run must be applied to the design blockwise,
+    or the fit charges the component for something the data no longer contains: the
+    per-run polort, the per-run high-pass, and the per-run mean-centering.  The
+    returned run-constant basis is that mean-centering made explicit, so the joint
+    fit spends the degrees of freedom it actually spent.  It is returned as a
+    NUISANCE block rather than folded into a global polort because a global constant
+    alongside per-run constants is rank-deficient ([[Block-diagonal nuisance]]).
+
+    Returns
+    -------
+    design : (T_total, C)
+        Concatenated, blockwise-preprocessed condition regressors.  Conditions with
+        no events anywhere are dropped, and ``labels`` is filtered to match.
+    labels : list of str
+    run_nuisance : (T_total, n_runs)
+        Block-diagonal per-run constants.
+    """
+    from fastfuncstuff.decomposition.postprocess import preprocess_design_for_correlation
+    from fastfuncstuff.design.matrices import (
+        build_event_design_microtime,
+        commensurate_microtime_dt,
+    )
+
+    dt = commensurate_microtime_dt(tr, microtime_dt)
+    hrf = get_spmg1_hrf(microtime_dt=dt, device=device)
+    design = build_event_design_microtime(
+        all_onsets=all_onsets,
+        durations=durations,
+        hrf_bases=hrf,
+        n_timepoints_per_run=list(run_lengths),
+        tr=tr,
+        microtime_dt=dt,
+        device=device,
+    )
+    assert isinstance(design, torch.Tensor)
+
+    offset = 0
+    blocks = []
+    for n_t_run in run_lengths:
+        block = design[offset : offset + n_t_run]
+        block = preprocess_design_for_correlation(
+            design_tc=block,
+            tr=tr,
+            polort=polort,
+            high_pass_hz=high_pass_hz,
+            device=device,
+        )
+        blocks.append(block - block.mean(dim=0, keepdim=True))
+        offset += n_t_run
+    design = torch.cat(blocks, dim=0)
+
+    keep = [k for k in range(design.shape[1]) if float(design[:, k].abs().max()) > 0]
+    if not keep:
+        raise ValueError("the concatenated task design is all zeros for every condition")
+    if len(keep) < design.shape[1]:
+        dropped = [labels[k] for k in range(design.shape[1]) if k not in keep]
+        print(f"  ⚠️  dropping condition(s) with no events in any run: {', '.join(dropped)}")
+    design = design[:, keep]
+    labels = [labels[k] for k in keep]
+
+    total_t = int(sum(run_lengths))
+    run_nuisance = torch.zeros(total_t, len(run_lengths), dtype=design.dtype, device=device)
+    offset = 0
+    for ri, n_t_run in enumerate(run_lengths):
+        run_nuisance[offset : offset + n_t_run, ri] = 1.0
+        offset += n_t_run
+    return design, labels, run_nuisance
+
+
 def component_condition_correlations(
     mixing_tk: torch.Tensor,
     design_tc: torch.Tensor,
@@ -612,6 +699,8 @@ def component_task_glm(
     labels: list[str],
     *,
     explained_share: np.ndarray | None = None,
+    polort: int = 0,
+    nuisance: torch.Tensor | None = None,
 ) -> dict:
     """Fit the whole task design to every ICA timecourse: which components hold task.
 
@@ -641,6 +730,14 @@ def component_task_glm(
         Each component's share of data variance, carried through to the table so the
         two numbers a reader wants to weigh -- how big and how task-like -- sit in
         the same row.
+    polort : int
+        Legendre degree removed from both sides.  The default 0 removes the mean
+        only, which is all a single-run design needs on top of the preprocessing it
+        already carries.  Pass -1 when ``nuisance`` supplies the whole basis.
+    nuisance : (T, P), optional
+        Extra columns removed alongside the drift basis -- the per-run constants of a
+        concatenated fit, say.  Pair it with ``polort=-1``: a global constant on top
+        of per-run constants is rank-deficient.
 
     Returns
     -------
@@ -658,13 +755,15 @@ def component_task_glm(
     # the whole table in a single call rather than a second implementation of the
     # joint fit ([[Code reuse]]).
     field = mixing_tk.detach().to(torch.float64).T.reshape(n_k, 1, 1, n_t)
-    tc = task_coupling(field, design_tc, polort=0, labels=labels)
+    tc = task_coupling(field, design_tc, polort=polort, labels=labels, nuisance=nuisance)
 
     r_full = tc.r_full.reshape(n_k).cpu().numpy().astype(np.float64)
     r2 = r_full**2
     dof_model = int(tc.n_fit)
-    # polort=0 removes the single constant column.
-    dof_resid = max(1, n_t - 1 - dof_model)
+    n_nuis = (polort + 1 if polort >= 0 else 0) + (
+        0 if nuisance is None else int(nuisance.shape[1])
+    )
+    dof_resid = max(1, n_t - n_nuis - dof_model)
     f_stat = (r2 / dof_model) / np.clip((1.0 - r2) / dof_resid, 1e-30, None)
 
     from scipy import stats as _st

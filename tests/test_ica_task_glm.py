@@ -156,3 +156,101 @@ def test_guidance_ranks_on_the_joint_fit_not_the_marginal_ceiling():
 
     assert marginal["temporal_good_scores"][0] < marginal["temporal_good_scores"][1]
     assert joint["temporal_good_scores"][0] > joint["temporal_good_scores"][1]
+
+
+def test_concat_design_is_block_preprocessed_and_run_nuisance_is_full_rank():
+    """A tcat design must carry the per-run treatment the tcat data got."""
+    from fastfuncstuff.decomposition.tools import build_concat_task_design
+
+    run_lengths = [60, 60, 40]
+    tr = 1.5
+    # condA in every run, condB only in run 1.
+    onsets = [
+        [np.array([10.0, 40.0]), np.array([12.0, 42.0]), np.array([9.0])],
+        [np.array([25.0]), np.array([]), np.array([])],
+    ]
+    design, labels, run_nuis = build_concat_task_design(
+        onsets,
+        [8.0, 8.0],
+        ["condA", "condB"],
+        run_lengths,
+        tr,
+        microtime_dt=0.1,
+        polort=1,
+        high_pass_hz=None,
+        device=torch.device("cpu"),
+    )
+    assert labels == ["condA", "condB"]
+    assert design.shape == (sum(run_lengths), 2)
+
+    # Every run block is separately mean-centered, matching the data path.
+    offset = 0
+    for n_t_run in run_lengths:
+        block = design[offset : offset + n_t_run]
+        assert torch.allclose(block.mean(dim=0), torch.zeros(2, dtype=block.dtype), atol=1e-8)
+        offset += n_t_run
+
+    # condB is absent from runs 2-3, so those blocks are zero -- one shared column,
+    # not a per-run column, is what makes the concatenated beta meaningful.
+    assert design[run_lengths[0] :, 1].abs().max() == 0
+    assert design[: run_lengths[0], 1].abs().max() > 0
+
+    # The run-constant basis must be full rank: it is the nuisance block the joint fit
+    # spends dof on, and it is paired with polort=-1 for exactly that reason.
+    assert run_nuis.shape == (sum(run_lengths), 3)
+    assert int(torch.linalg.matrix_rank(run_nuis)) == 3
+
+
+def test_concat_glm_dof_counts_the_run_constants():
+    from fastfuncstuff.decomposition.tools import build_concat_task_design
+
+    run_lengths = [80, 80]
+    onsets = [
+        [np.array([10.0, 50.0]), np.array([12.0, 52.0])],
+        [np.array([30.0]), np.array([32.0])],
+    ]
+    design, labels, run_nuis = build_concat_task_design(
+        onsets,
+        [8.0, 8.0],
+        ["a", "b"],
+        run_lengths,
+        1.5,
+        microtime_dt=0.1,
+        polort=-1,
+        high_pass_hz=None,
+        device=torch.device("cpu"),
+    )
+    mixing = torch.tensor(np.random.default_rng(4).standard_normal((160, 3)), dtype=torch.float64)
+    glm = component_task_glm(mixing, design, labels, polort=-1, nuisance=run_nuis)
+    assert glm["dof_model"] == 2
+    assert glm["dof_resid"] == 160 - 2 - 2  # two run constants, two conditions
+
+
+def test_per_run_columns_expose_a_single_run_component():
+    """The concatenated R2 alone cannot tell 'everywhere' from 'one run'."""
+    from fastfuncstuff.decomposition.postprocess import format_component_task_table
+
+    glm = {
+        "labels": ["a"],
+        "r2": np.array([0.5, 0.5]),
+        "r_full": np.array([0.71, 0.71]),
+        "f_stat": np.array([10.0, 10.0]),
+        "p_value": np.array([1e-3, 1e-3]),
+        "t": np.array([[3.0], [3.0]]),
+        "r_joint": np.array([[0.4], [0.4]]),
+        "dof_model": 1,
+        "dof_resid": 100,
+        "r2_chance": 0.01,
+        "explained_share": None,
+    }
+    per_run = [
+        {"r2": np.array([0.5, 0.9])},
+        {"r2": np.array([0.5, 0.05])},
+        {"r2": np.array([0.5, 0.05])},
+    ]
+    text = format_component_task_table(glm, per_run=per_run)
+    assert "R2r1" in text and "R2r3" in text
+    rows = [ln for ln in text.split("\n") if ln.strip().startswith(("1 ", "2 "))]
+    assert len(rows) == 2
+    # Identical concatenated R2, visibly different per-run profile.
+    assert "0.900" in text and "0.050" in text
