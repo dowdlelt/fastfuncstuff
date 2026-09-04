@@ -851,6 +851,8 @@ def _run_single_ica(
     ortvec_corr = None
     ortvec_spectral_corr = None
     ortvec_labels = None
+    ortvec_tc = None
+    ortvec_glm = None
     if bids_task_onsets is not None:
         # BIDS path: use pre-parsed all_onsets and durations
         try:
@@ -935,6 +937,7 @@ def _run_single_ica(
                     high_pass_hz=args.high_pass,
                     device=device,
                 )
+                ortvec_tc = ort_tc
                 ortvec_corr = component_condition_correlations(mixing_tk=mixing, design_tc=ort_tc)
                 ortvec_spectral_corr = ica_postprocess.component_condition_spectral_correlations(
                     mixing_tk=mixing,
@@ -958,6 +961,20 @@ def _run_single_ica(
             _vprint(args.verb >= 1, ica_postprocess.format_component_task_table(task_glm))
         except Exception as e:
             print(f"  Warning: Could not fit the task GLM for run {run_idx + 1}: {e}")
+
+    # Same fit for the nuisance side, and for the same reason: with 24 motion columns
+    # the largest marginal |r| is capped hard, so it is a bad "does this component
+    # follow the nuisance model" score. Not printed -- it only feeds the guidance.
+    if ortvec_tc is not None and ortvec_labels is not None:
+        try:
+            ortvec_glm = component_task_glm(
+                mixing_tk=mixing,
+                design_tc=ortvec_tc,
+                labels=list(ortvec_labels),
+                explained_share=total_share,
+            )
+        except Exception as e:
+            print(f"  Warning: Could not fit the ortvec GLM for run {run_idx + 1}: {e}")
 
     pfx = parse_prefix(str(args.prefix))
     nii_ext = pfx.nifti_ext
@@ -1171,6 +1188,8 @@ def _run_single_ica(
         z_maps=z_maps,
         condition_corr=condition_corr,
         ortvec_corr=ortvec_corr,
+        condition_glm=task_glm,
+        ortvec_glm=ortvec_glm,
         guidance_good_masks=guidance_good_masks,
         guidance_bad_masks=guidance_bad_masks,
         depth_mask_info=depth_mask_info,

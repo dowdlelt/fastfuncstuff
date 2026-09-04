@@ -232,8 +232,20 @@ def compute_guidance_scores(
     out_prefix: Path,
     run_tag: str,
     run_idx: int,
+    condition_glm: dict | None = None,
+    ortvec_glm: dict | None = None,
 ) -> dict:
-    """Compute spatial/temporal guidance scores and optional mask heatmaps."""
+    """Compute spatial/temporal guidance scores and optional mask heatmaps.
+
+    The temporal scores are the WHOLE design's multiple correlation when the joint
+    fit is available (``condition_glm`` / ``ortvec_glm`` from
+    :func:`~fastfuncstuff.decomposition.tools.component_task_glm`), and fall back to
+    the largest marginal ``|r|`` only when it is not.  Marginal ``|r|`` is capped at
+    ``corr(x_k, sum_j x_j)``: with several conditions -- or 24 motion columns -- the
+    other regressors' responses stay in the residual, so a component that follows the
+    model perfectly still scores by how much one regressor happens to overlap the
+    rest.  Ranking components on that ranks them on design geometry.
+    """
     spatial_scores_good = np.zeros(comp_np.shape[0], dtype=np.float32)
     spatial_scores_bad = np.zeros(comp_np.shape[0], dtype=np.float32)
     temporal_good_scores = np.zeros(comp_np.shape[0], dtype=np.float32)
@@ -241,9 +253,13 @@ def compute_guidance_scores(
     good_mask_score_table: dict[str, list[float]] = {}
     bad_mask_score_table: dict[str, list[float]] = {}
 
-    if condition_corr is not None:
+    if condition_glm is not None:
+        temporal_good_scores = np.asarray(condition_glm["r_full"], dtype=np.float32)
+    elif condition_corr is not None:
         temporal_good_scores = np.max(np.abs(condition_corr), axis=1).astype(np.float32)
-    if ortvec_corr is not None:
+    if ortvec_glm is not None:
+        temporal_bad_scores = np.asarray(ortvec_glm["r_full"], dtype=np.float32)
+    elif ortvec_corr is not None:
         temporal_bad_scores = np.max(np.abs(ortvec_corr), axis=1).astype(np.float32)
 
     for entry in guidance_good_masks:

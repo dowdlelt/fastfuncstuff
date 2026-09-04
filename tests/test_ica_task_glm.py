@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -102,3 +104,55 @@ def test_table_and_tsv_round_trip(tmp_path):
     assert "beta_a" in header and "r_marginal_b" in header
     assert len(rows) == 2 + 4
     assert all(len(r.split("\t")) == len(header) for r in rows[2:])
+
+
+def test_guidance_ranks_on_the_joint_fit_not_the_marginal_ceiling():
+    """The guidance score must not rank a component by design overlap.
+
+    Two components at the same noise level: one holds the WHOLE six-condition
+    response, the other holds a single condition. The first has more task in it and
+    r_full says so -- but its variance is spread over six regressors while the
+    second's sits on one, so the largest marginal |r| ranks them backwards.
+    """
+    from fastfuncstuff.decomposition.workflow import compute_guidance_scores
+
+    n_t, n_cond = 200, 6
+    design = _design(n_t, n_cond)
+    d = design.numpy()
+    rng = np.random.default_rng(7)
+    mixing = torch.tensor(
+        np.stack(
+            [
+                d.sum(axis=1) / d.sum(axis=1).std() + rng.standard_normal(n_t),
+                d[:, 1] / d[:, 1].std() + rng.standard_normal(n_t),
+            ],
+            axis=1,
+        ),
+        dtype=torch.float64,
+    )
+    labels = [f"cond{c + 1}" for c in range(n_cond)]
+    glm = component_task_glm(mixing, design, labels)
+    marg = component_condition_correlations(mixing, design)
+
+    # The premise: the whole-design component fits better, yet loses on marginal |r|.
+    assert glm["r_full"][0] > glm["r_full"][1]
+    assert np.max(np.abs(marg[0])) < np.max(np.abs(marg[1]))
+
+    comp = np.zeros((2, 10), dtype=np.float32)
+    kw: dict = dict(
+        comp_np=comp,
+        z_maps=None,
+        ortvec_corr=None,
+        guidance_good_masks=[],
+        guidance_bad_masks=[],
+        depth_mask_info=None,
+        good_z_thresh=2.0,
+        out_prefix=Path("unused"),
+        run_tag="run01",
+        run_idx=0,
+    )
+    marginal = compute_guidance_scores(condition_corr=marg, **kw)
+    joint = compute_guidance_scores(condition_corr=marg, condition_glm=glm, **kw)
+
+    assert marginal["temporal_good_scores"][0] < marginal["temporal_good_scores"][1]
+    assert joint["temporal_good_scores"][0] > joint["temporal_good_scores"][1]
