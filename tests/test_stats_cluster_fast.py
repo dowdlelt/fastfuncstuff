@@ -362,3 +362,57 @@ class TestClusterExtentOnePerm:
 def test_precompile_runs():
     """precompile() should JIT-warm the kernel and not raise."""
     precompile()
+
+
+def test_scratch_is_returned_clean_so_perms_do_not_contaminate():
+    """The DSU buffer is reused across perms and now clears only what it
+    touched.  If a pass ever failed to reset an entry, the *next* perm would
+    silently inherit a stale root and merge unrelated clusters -- so assert
+    both the invariant and the consequence."""
+    import numpy as np
+
+    from fastfuncstuff.stats.cluster_fast import _offsets_for_nn, cluster_extent_one_perm
+
+    rng = np.random.default_rng(0)
+    shape = (12, 12, 10)
+    mask = np.ones(shape, dtype=bool)
+    mask_flat_idx = np.flatnonzero(mask.ravel()).astype(np.int64)
+    tcrits = {s: np.array([2.5, 1.0]) for s in ("1-sided", "2-sided", "bi-sided")}
+    offsets = {nn: _offsets_for_nn(nn) for nn in (1, 2, 3)}
+    parent = np.full(int(np.prod(shape)), -1, dtype=np.int64)
+    size = np.zeros(int(np.prod(shape)), dtype=np.int64)
+
+    first = None
+    for i in range(6):
+        stat = rng.standard_normal(shape).astype(np.float32)
+        res = cluster_extent_one_perm(
+            stat,
+            mask_flat_idx,
+            shape,
+            (1, 2, 3),
+            ("1-sided", "2-sided", "bi-sided"),
+            tcrits,
+            offsets,
+            parent,
+            size,
+        )
+        assert np.all(parent == -1), f"scratch left dirty after perm {i}"
+        if i == 0:
+            first = {k: v.copy() for k, v in res.items()}
+            first_stat = stat.copy()
+
+    # Re-running the very first map after five others must reproduce it.
+    again = cluster_extent_one_perm(
+        first_stat,
+        mask_flat_idx,
+        shape,
+        (1, 2, 3),
+        ("1-sided", "2-sided", "bi-sided"),
+        tcrits,
+        offsets,
+        parent,
+        size,
+    )
+    assert first is not None
+    for k, v in first.items():
+        np.testing.assert_array_equal(v, again[k])

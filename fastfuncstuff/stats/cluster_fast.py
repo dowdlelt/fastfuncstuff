@@ -218,16 +218,24 @@ def cluster_extent_one_perm(
         tcrits_desc = tcrits_by_sided[sided]
         lowest = tcrits_desc[-1]
 
+        # Threshold and sort once per tail, not once per (tail, NN): the three
+        # connectivities differ only in which neighbours they union, and they
+        # walk the exact same suprathreshold voxels in the exact same order.
+        prepared = []
+        for eff in eff_passes:
+            above = eff > lowest
+            stat_above = eff[above]
+            order = np.argsort(-stat_above, kind="stable")
+            prepared.append(
+                (
+                    np.ascontiguousarray(mask_flat_idx[above][order]),
+                    np.ascontiguousarray(stat_above[order].astype(np.float32)),
+                )
+            )
+
         for nn in nns:
             per_pass_extents = []
-            for eff in eff_passes:
-                above = eff > lowest
-                idx_above = mask_flat_idx[above]
-                stat_above = eff[above]
-                order = np.argsort(-stat_above, kind="stable")
-                idx_sorted = np.ascontiguousarray(idx_above[order])
-                stat_sorted = np.ascontiguousarray(stat_above[order].astype(np.float32))
-                parent_scratch.fill(-1)
+            for idx_sorted, stat_sorted in prepared:
                 per_pass_extents.append(
                     _walk_dsu_extent(
                         idx_sorted,
@@ -241,6 +249,11 @@ def cluster_extent_one_perm(
                         tcrits_desc,
                     )
                 )
+                # Clear only what the walk could have touched.  A full
+                # parent.fill(-1) is a whole-volume memset, and at a p=0.05
+                # null under 5% of the volume is ever suprathreshold -- it
+                # was costing more than some of the DSU walks it reset.
+                parent_scratch[idx_sorted] = -1
             # Bi-sided: elementwise max over the +/- passes.  1-/2-sided
             # have a single pass so this is a no-op.
             stacked = np.stack(per_pass_extents, axis=0)
