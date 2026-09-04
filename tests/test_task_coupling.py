@@ -1069,7 +1069,7 @@ def test_reject_writes_plottable_timecourses_and_an_after_map(tmp_path):
                 str(tr),
                 "-device",
                 "cpu",
-                "-warp_recon",
+                "-detask",
                 "ica:30",
                 "-reject",
             ]
@@ -1846,3 +1846,83 @@ def test_constant_voxels_score_zero_in_the_joint_fit_too():
     assert float(tc.r_joint[1, 0, 0].abs().max()) == 0.0
     assert float(tc.beta_joint[1, 0, 0].abs().max()) == 0.0
     assert float(tc.r_full[1, 0, 0]) == 0.0
+
+
+def _locomoco_run(tmp_path, stem, *extra):
+    """A run with a task planted in it, put through ffs_locomoco. Returns the stdout."""
+    import nibabel as nib
+
+    from fastfuncstuff.cli.locomoco import main
+
+    n_t, tr, rng = 120, 2.5, np.random.default_rng(0)
+    x = np.zeros(n_t)
+    for onset in range(10, 300, 20):
+        x[int(onset / tr) : int((onset + 10) / tr)] = 1.0
+    series = rng.normal(0, 1, (16, 18, 8, n_t)).astype(np.float32)
+    series[4:10, 5:12, 2:6] += (2.0 * x).astype(np.float32)
+    series += 100.0
+    src = tmp_path / "in.nii.gz"
+    nib.save(nib.Nifti1Image(series, np.eye(4)), str(src))
+    ev = tmp_path / "ev.tsv"
+    ev.write_text(
+        "onset\tduration\ttrial_type\n" + "".join(f"{o}\t10\tcheck\n" for o in range(10, 300, 20))
+    )
+    rc = main(
+        [
+            "-i",
+            str(src),
+            "-o",
+            f"{stem}.nii.gz",
+            "-pe_dir1",
+            "AP",
+            "-pe_dir2",
+            "IS",
+            "-backend",
+            "flow",
+            "-refine",
+            "1",
+            "-events",
+            str(ev),
+            "-tr",
+            str(tr),
+            "-device",
+            "cpu",
+            *extra,
+        ]
+    )
+    assert rc == 0
+    return rc
+
+
+def test_component_scan_runs_by_default_and_changes_no_field(capsys, tmp_path):
+    """-events scores the field's INDEPENDENT components without touching it.
+
+    The field enrichment printed above the scan is the number that says how
+    contaminated the field is, but it cannot say which part of the field carries the
+    task, and PCA cannot find a component worth a fraction of a percent of the
+    variance. This is the half that can — and like every other -events output it must
+    leave the correction alone.
+    """
+    stem = str(tmp_path / "scan")
+    _locomoco_run(tmp_path, stem, "-task_comps", "8")
+    out = capsys.readouterr().out
+    assert "WARP TASK SCAN" in out
+    assert "DIAGNOSTIC ONLY" in out
+    assert "WARP TASK REJECTION" not in out
+    # Nothing was projected out, so the field's own rejection artefacts must be absent.
+    assert not (tmp_path / "scan_locomoco_rejected.1D").exists()
+
+
+def test_task_comps_off_skips_the_scan(capsys, tmp_path):
+    stem = str(tmp_path / "off")
+    _locomoco_run(tmp_path, stem, "-task_comps", "off")
+    assert "WARP TASK SCAN" not in capsys.readouterr().out
+
+
+def test_detask_ica_does_not_decompose_twice(capsys, tmp_path):
+    """The acting mode runs the same decomposition, so the scan must stand down."""
+    stem = str(tmp_path / "act")
+    _locomoco_run(tmp_path, stem, "-detask", "ica:8", "-reject")
+    out = capsys.readouterr().out
+    assert "WARP TASK REJECTION" in out
+    assert "WARP TASK SCAN" not in out
