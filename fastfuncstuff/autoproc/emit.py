@@ -27,7 +27,7 @@ from fastfuncstuff.autoproc.plan import (
     PlanRun,
     effective_anat_source,
     ref_anchor,
-    sbref_chain,
+    run_average_chain,
     session_fmap_ids,
     session_ref_mode,
 )
@@ -277,10 +277,10 @@ def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
 def chain_files(pr: PlanRun, fmt: str, opt=None, tokens: list[str] | None = None) -> list[str]:
     """Resolve a run's warp chain into filenames (nwarp-apply order).
 
-    ``tokens`` overrides which links to resolve — used for the SBRef chain
-    (``plan.sbref_chain``), which is the run's chain minus the within-run motion
-    tokens. The files themselves are shared: an SBRef and its BOLD are corrected
-    by exactly the same transforms from the fieldmap level up.
+    ``tokens`` overrides which links to resolve — used for the run-average chain
+    (``plan.run_average_chain``), which is the run's chain minus the within-run
+    motion tokens. The files themselves are shared: an SBRef and its BOLD are
+    corrected by exactly the same transforms from the fieldmap level up.
     """
     resolved: list[str] = []
     for tok in pr.warp_chain if tokens is None else tokens:
@@ -1168,7 +1168,7 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
     # lane's image is on the run's own geometry, so they share one target grid.
     moco_arrays = " ".join(f"MOCO_{ln.upper()}" for ln in _lanes(plan) if ln != LANE_SBREF)
     lines.append(
-        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN SBCHAIN XRUNBASE EVENTS "
+        "declare -A MAG PHASE SBREF TR PEDIR JSON FRAG CHAIN AVGCHAIN XRUNBASE EVENTS "
         f"{moco_arrays} PRECHAIN REFGRID JAC"
     )
 
@@ -1219,11 +1219,12 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         if pre:
             lines.append(f'PRECHAIN[{q(k)}]="{" ".join(pre)}"')
         lines.append(f'REFGRID[{q(k)}]="{_common_grid(pr, first_by_ses[b.session], primary)}"')
-        if plan.use_sbref:
-            # The SBRef rides the run's chain minus the within-run motion tokens:
-            # it IS the moco base, so it needs no transform of its own.
-            sbchain = chain_files(pr, ".nii$FMT", plan.options, tokens=sbref_chain(pr))
-            lines.append(f'SBCHAIN[{q(k)}]="{" ".join(sbchain)}"')
+        # The chain for images whose space is the whole run, not one volume of it
+        # (the SBRef, the NORDIC dof map): the run's chain minus the within-run
+        # motion tokens. Always emitted — the dof map needs it with or without an
+        # SBRef lane.
+        avg = chain_files(pr, ".nii$FMT", plan.options, tokens=run_average_chain(pr))
+        lines.append(f'AVGCHAIN[{q(k)}]="{" ".join(avg)}"')
         chain = chain_files(pr, ".nii$FMT", plan.options)
         lines.append(f'CHAIN[{q(k)}]="{" ".join(chain)}"')
         # Jacobian modulation for the fieldmap link, wherever that chain is
@@ -2734,10 +2735,19 @@ def _numcomps_final_jobs(plan: Plan) -> str:
     """Carry each run's NORDIC component count into the final space.
 
     The dof a voxel lost is a property of THAT run, so each map rides THAT run's own
-    chain -- the same CHAIN[$k] and the same master its timeseries just took. Anything
-    else lands the count on tissue that did not pay it.
+    chain and the same master its timeseries just took. Anything else lands the count
+    on tissue that did not pay it.
 
-    Two differences from the data's own resample, both deliberate:
+    Three differences from the data's own resample, all deliberate:
+
+    * **AVGCHAIN, not CHAIN.** NORDIC runs before motion correction on the raw run, and
+      its count is pooled over every frame -- a property of the run, not of one volume.
+      The two within-run motion links are time-varying, and ffs_nwarp resolves a
+      time-varying transform at frame 0 for a 3-D source: the map would be placed at
+      the pose of the first volume, chosen for no reason. Dropping them puts the count
+      in the moco base's space, which is the run-average space it was measured in.
+      (Bug of record: it rode the full CHAIN, so every dof map carried volume 0's
+      rigid motion and volume 0's locomoco PE field.)
 
     * **linear, not wsinc5.** This is a count, not an image. A windowed-sinc kernel
       rings, and a negative or overshot dof is not a thing.
@@ -2751,12 +2761,21 @@ def _numcomps_final_jobs(plan: Plan) -> str:
     """
     if not _dof_adjust_on(plan.options):
         return ""
-    return f"""# The dof map rides the same chain as the data it describes (linear, no -jac:
-# it is a count, not an intensity). NOTE a working directory written before this
+    return f"""# The dof map rides its run's chain minus the within-run motion links
+# (AVGCHAIN): the count is pooled over the whole run, so it belongs in the
+# run-average space, not at volume 0's pose. Linear and no -jac: it is a count,
+# not an intensity. NOTE a working directory written before this
 # existed has no _numcomps map, and skip_nordic=1 will not notice: delete the
 # stage00 outputs for those runs, or pass -no_nordic_dof_adjust.
 for k in "${{RUN_KEYS[@]}}"; do
-  printf '%s\\n' "-source \\"{_numcomps_native(plan)}\\" -nwarp \\"${{CHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" -interp linear -no_neg -prefix \\"stage10.dofloss.${{FRAG[$k]}}.nii$FMT\\"" >> "$nwarpbatch"
+  dofoutf="stage10.dofloss.${{FRAG[$k]}}.nii$FMT"
+  if [ -z "${{AVGCHAIN[$k]:-}}" ]; then
+    [ -f "$dofoutf" ] || ffs_util_resample -input "{_numcomps_native(plan)}" \\
+      -master stage10.warpmaster.nii$FMT -rmode linear \\
+      -prefix "$dofoutf" -device "$DEVICE"
+    continue
+  fi
+  printf '%s\\n' "-source \\"{_numcomps_native(plan)}\\" -nwarp \\"${{AVGCHAIN[$k]}}\\" -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" -interp linear -no_neg -prefix \\"$dofoutf\\"" >> "$nwarpbatch"
 done
 """
 
@@ -2765,7 +2784,7 @@ def _sbref_final_jobs(plan: Plan) -> str:
     """Extra stage10 batch entries putting every run's SBRef in the final space.
 
     Same batch, same master/grid, same transforms as its BOLD — minus the
-    within-run motion tokens the SBRef defines rather than needs (SBCHAIN). No
+    within-run motion tokens the SBRef defines rather than needs (AVGCHAIN). No
     slice-timing argument: a 3-D image has no time axis to shift.
 
     These are the sharpest per-run images the pipeline can produce in output
@@ -2776,20 +2795,20 @@ def _sbref_final_jobs(plan: Plan) -> str:
     if not plan.use_sbref:
         return ""
     nwarp_flags = " ".join(_split_flags(config.DEFAULT_OPTS["nwarp"]))
-    # An empty SBCHAIN means this SBRef needs no transform at all — the anchor run
+    # An empty AVGCHAIN means this SBRef needs no transform at all — the anchor run
     # of a no-anat, no-fieldmap, single-session plan, whose own space IS the final
     # space. ffs_nwarp has no identity warp, so that one is a plain regrid.
     return (
         "# SBRefs into the final space (QC; same chain minus the moco tokens).\n"
         'for k in "${RUN_KEYS[@]}"; do\n'
         '  sboutf="stage10.final.${FRAG[$k]}.src-sbref.nii$FINAL_FMT"\n'
-        '  if [ -z "${SBCHAIN[$k]:-}" ]; then\n'
+        '  if [ -z "${AVGCHAIN[$k]:-}" ]; then\n'
         '    [ -f "$sboutf" ] || ffs_util_resample -input "${SBREF[$k]}" \\\n'
         "      -master stage10.warpmaster.nii$FMT -rmode wsinc5 \\\n"
         '      -prefix "$sboutf" -device "$DEVICE"\n'
         "    continue\n"
         "  fi\n"
-        '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${SBCHAIN[$k]}\\"'
+        '  printf \'%s\\n\' "-source \\"${SBREF[$k]}\\" -nwarp \\"${AVGCHAIN[$k]}\\"'
         '${JAC[$k]:+ -jac \\"${JAC[$k]}\\"} '
         '-master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" '
         f'{nwarp_flags} -prefix \\"$sboutf\\"" >> "$nwarpbatch"\n'

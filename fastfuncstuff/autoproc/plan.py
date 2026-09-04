@@ -237,7 +237,7 @@ class PlanRun:
     warp_chain: list[str] = field(default_factory=list)
     # This run's SBRef is usable as an alignment source: it exists, and the moco
     # base IS that SBRef — which is what puts it in the run's post-moco space
-    # with no transform of its own (see ``sbref_chain``).
+    # with no transform of its own (see ``run_average_chain``).
     use_sbref: bool = False
 
 
@@ -261,16 +261,22 @@ class Plan:
         return bool(self.runs) and all(pr.use_sbref for pr in self.runs)
 
 
-def sbref_chain(pr: PlanRun) -> list[str]:
-    """The warp chain for this run's SBRef: the run's chain minus the tokens that
-    describe *within-run* motion.
+def run_average_chain(pr: PlanRun) -> list[str]:
+    """The run's chain minus the tokens that describe *within-run* motion.
 
-    ``moco`` goes because the SBRef is the moco base — it already defines the
-    space that token maps into, so applying it would be a double correction.
+    The chain for anything whose space is the run as a whole rather than one
+    volume of it: the SBRef (it IS the moco base, so ``moco`` would be a double
+    correction), and any per-run summary map estimated across every frame, such
+    as NORDIC's ``_numcomps`` dof map.
+
     ``locomoco`` goes for the same reason one step out: it converges to the mean
     of the rigid-corrected series, and its per-volume PE wiggles average to
-    roughly nothing over a run, so that mean and the SBRef describe the same
+    roughly nothing over a run, so that mean and the moco base describe the same
     space to within the accuracy locomoco itself is correcting.
+
+    Both tokens are time-varying, so applying them to a 3-D image does not even
+    pose the intended question: ffs_nwarp resolves a time-varying transform at
+    frame 0, and there is nothing special about the first volume's pose.
     """
     return [tok for tok in pr.warp_chain if tok not in ("moco", "locomoco")]
 

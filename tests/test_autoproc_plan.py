@@ -426,7 +426,7 @@ def test_fieldmap_jacobian_rides_every_application_of_the_blip_warp():
     assert jacs == {"j:stage04.blip.ses-SM.fmap-PA_warp.nii$FMT"}
     # The named warp is actually in the chains it modulates.
     assert 'CHAIN[SM:t:1]="' in script
-    for m in re.finditer(r'(?:CHAIN|SBCHAIN|PRECHAIN)\[[^\]]+\]="([^"]*)"', script):
+    for m in re.finditer(r'(?:CHAIN|AVGCHAIN|PRECHAIN)\[[^\]]+\]="([^"]*)"', script):
         assert "stage04.blip.ses-SM.fmap-PA_warp.nii$FMT" in m.group(1).split()
     # stage07 runmean (once per lane), stage10 BOLD and stage10 SBRef all pass it.
     assert script.count("${JAC[$k]:+") == 2 + len({"sbref", "max", "min", "mean"})
@@ -976,7 +976,7 @@ def test_sbref_lane_is_all_or_nothing_and_needs_moco_ref_sbref():
     that silently mixed SBRef and BOLD-mean contrast would be worse than either
     lane alone. So does a moco base that isn't the SBRef — the lane's whole
     premise is that the SBRef IS the run's post-moco space."""
-    from fastfuncstuff.autoproc.plan import sbref_chain
+    from fastfuncstuff.autoproc.plan import run_average_chain
 
     full = Subject("X", [Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")])])
     assert build_plan(full, Options()).use_sbref
@@ -993,8 +993,8 @@ def test_sbref_lane_is_all_or_nothing_and_needs_moco_ref_sbref():
     plan = build_plan(full, Options(locomoco=True))
     pr = plan.runs[1]
     assert "moco" in pr.warp_chain and "locomoco" in pr.warp_chain
-    assert "moco" not in sbref_chain(pr) and "locomoco" not in sbref_chain(pr)
-    assert sbref_chain(pr) == [t for t in pr.warp_chain if t not in ("moco", "locomoco")]
+    assert "moco" not in run_average_chain(pr) and "locomoco" not in run_average_chain(pr)
+    assert run_average_chain(pr) == [t for t in pr.warp_chain if t not in ("moco", "locomoco")]
 
 
 def test_sbref_lane_estimates_transforms_and_keeps_the_mean_lane():
@@ -1036,7 +1036,7 @@ def test_sbrefs_reach_the_final_space():
     subj = Subject("X", [Session("01", [_sbrun("01", "t", "1"), _sbrun("01", "t", "2")])])
     s = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
     assert 'sboutf="stage10.final.${FRAG[$k]}.src-sbref.nii$FINAL_FMT"' in s
-    assert '-nwarp \\"${SBCHAIN[$k]}\\"' in s
+    assert '-nwarp \\"${AVGCHAIN[$k]}\\"' in s
     # SBRefs are load-bearing once the lane is on, so preflight checks them.
     assert "/bids/sb_01_t_1.nii.gz" in s.split("stage02")[0]
 
@@ -1045,7 +1045,7 @@ def test_sbrefs_reach_the_final_space():
     bare = write_script(
         build_plan(subj, Options(go_to_anat=False, distortion=False)), "wd", bids_root="/bids"
     )
-    assert 'if [ -z "${SBCHAIN[$k]:-}" ]; then' in bare
+    assert 'if [ -z "${AVGCHAIN[$k]:-}" ]; then' in bare
     assert 'ffs_util_resample -input "${SBREF[$k]}"' in bare
 
 
@@ -1926,7 +1926,11 @@ def test_a_nordic_run_without_events_simply_goes_unscored(tmp_path):
 
 def _dofloss_jobs(script: str) -> list[str]:
     """The printf lines that append a dof-map resample to the nwarp batch."""
-    return [ln for ln in script.splitlines() if "stage10.dofloss." in ln and "printf" in ln]
+    return [
+        ln
+        for ln in script.splitlines()
+        if "printf" in ln and ("stage10.dofloss." in ln or "$dofoutf" in ln)
+    ]
 
 
 def test_nordic_dof_adjust_is_wired_end_to_end(tmp_path):
@@ -1943,8 +1947,10 @@ def test_nordic_dof_adjust_is_wired_end_to_end(tmp_path):
     assert "-save_num_comps" in _nordic_command(s)
     job = _dofloss_jobs(s)
     assert len(job) == 1, job  # one loop over RUN_KEYS, not one line per run
-    # THAT run's chain, and the same master its timeseries took.
-    assert '-nwarp \\"${CHAIN[$k]}\\"' in job[0]
+    # THAT run's chain and the same master its timeseries took — but minus the
+    # within-run motion links: a run-pooled count has no volume-0 pose.
+    assert '-nwarp \\"${AVGCHAIN[$k]}\\"' in job[0]
+    assert "${CHAIN[$k]}" not in job[0]
     assert "stage00.nordic.${FRAG[$k]}_numcomps" in job[0]
     assert "-master stage10.warpmaster" in job[0]
     # A count, not an intensity: no ringing kernel and no Jacobian modulation.
