@@ -212,6 +212,21 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="save the NORDIC residual map",
     )
+    g.add_argument(
+        "-nordic_task_rescue",
+        "-nordic-task-rescue",
+        nargs="?",
+        const="ica",
+        default=None,
+        metavar="MODE",
+        help="ffs_nordic -task_rescue MODE (ica).\n"
+        "Off by default. Whenever a run's events resolve, stage00 already emits the\n"
+        "task-leak REPORT — how much of the design survives in what the denoising threw\n"
+        "away, whether it lands on responding tissue, and which removed components\n"
+        "follow the task. This ACTS on it: the flagged components go back into the\n"
+        "output. Read the report first, and note each restored component hands back a\n"
+        "degree of freedom (ffs_reml -adjust_dof).",
+    )
 
     g = p.add_argument_group("slice timing & motion")
     g.add_argument(
@@ -1059,6 +1074,7 @@ def main(argv: list[str] | None = None) -> int:
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
         locomoco=eff(args.locomoco, "locomoco"),
+        nordic_task_rescue=args.nordic_task_rescue,
         locomoco_detask=args.locomoco_detask,
         xrun_nonlin=eff(args.xrun_nonlin, "xrun_nonlin"),
         xfmap_nonlin=eff(args.xfmap_nonlin, "xfmap_nonlin"),

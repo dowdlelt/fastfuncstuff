@@ -1194,9 +1194,10 @@ def _data_arrays(plan: Plan, bids_root: str | None = None) -> str:
         # Filename coordinate fragment — the stage loops build run filenames as
         # stageNN.label.${FRAG[$k]}, matching every reference in the data table.
         lines.append(f"FRAG[{q(k)}]={q(_frag(pr))}")
-        # Only locomoco reads this: its task-coupling report is per run, and a run
-        # whose events did not resolve simply goes unscored rather than failing.
-        if plan.options.locomoco:
+        # The per-run task diagnostics read this -- NORDIC's task-leak report at
+        # stage00, locomoco's task-coupling report at stage03. Both are per run, and a
+        # run whose events did not resolve simply goes unscored rather than failing.
+        if plan.options.locomoco or plan.options.want_nordic:
             ev = _events_script_path(plan, pr, bids_root)
             if ev:
                 lines.append(f"EVENTS[{q(k)}]={q(ev)}")
@@ -1283,12 +1284,12 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         # resolved are checked (a task with no events warns at generation time).
         | set(_all_events(plan, bids_root))
         | set(_spec_files(plan, bids_root))
-        # locomoco's task-coupling report reads events too, and with -no_glm those
-        # are BIDS originals nothing else in this list covers.
+        # The stage00 and stage03 task diagnostics read events too, and with -no_glm
+        # those are BIDS originals nothing else in this list covers.
         | {
             ev
             for pr in plan.runs
-            if plan.options.locomoco
+            if plan.options.locomoco or plan.options.want_nordic
             for ev in [_events_script_path(plan, pr, bids_root)]
             if ev
         }
@@ -1414,6 +1415,7 @@ def _stage_nordic(plan: Plan) -> str:
         if _phase_on(plan)
         else ""
     )
+    rescue = opt.nordic_task_rescue
     nordic_cmd = _ffs(
         "ffs_nordic",
         [
@@ -1423,17 +1425,33 @@ def _stage_nordic(plan: Plan) -> str:
             '-noise-volume-last "$NOISE_VOLS"',
             *_split_flags(config.DEFAULT_OPTS["nordic"]),
             resid,
+            # Diagnostic only: NORDIC decides what to discard from a patch's spectrum
+            # alone, and nothing in that decision knows the task, so a component
+            # carrying real response can fall under the threshold. -tr rides along for
+            # the same reason it does at stage03 -- a 3D acquisition's pixdim[4] is the
+            # per-partition time, not the volume TR the design is sampled at.
+            '${ev:+-events "${ev}"}',
+            '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}',
+            *([f"${{ev:+-task_rescue {rescue}}}"] if rescue else []),
             '-device "$DEVICE"',
         ],
     )
     return f"""
 # ============================ stage00: NORDIC ==============================={phase_note}
+# -events (per run, the same TSV the GLM models) turns on the task-leak report:
+# <prefix>_taskleak.txt, the _taskfit_input/_kept/_lost buckets, the per-patch
+# _taskpatch map, and a scan of the removed field's components. It MEASURES how much
+# of the design went out with the noise and whether it landed on responding tissue;
+# nothing about the denoising changes. This runs before motion correction, so read
+# the enrichment and the component scan, not the per-voxel R maps.
+# -nordic_task_rescue is what ACTS on it.
 echo '== stage00: NORDIC denoise =='
 for k in "${{RUN_KEYS[@]}}"; do
   outf="{_nordic_mag(plan)}"
   [ "$skip_nordic" -eq 1 ] && [ -f "$outf" ] && continue
   ph="${{PHASE[$k]:-}}"
   if [ -n "$ph" ]; then phase_arg=(-input_phase "$ph"); else phase_arg=(-magnitude-only); fi
+  ev="${{EVENTS[$k]:-}}"   # unset for a run whose events did not resolve; set -u
 {nordic_cmd}
 done
 """

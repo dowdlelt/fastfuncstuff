@@ -1879,3 +1879,46 @@ def test_detask_is_opt_in(tmp_path):
         bids_root=str(tmp_path),
     )
     assert "-detask filter:2" in _locomoco_manifest(on)
+
+
+def _nordic_command(script: str) -> str:
+    """The ffs_nordic invocation stage00 emits, joined onto one line."""
+    lines = script.split("stage00: NORDIC denoise")[-1].splitlines()
+    start = next(i for i, ln in enumerate(lines) if "ffs_nordic" in ln)
+    out = []
+    for ln in lines[start:]:
+        out.append(ln.rstrip("\\").strip())
+        if not ln.rstrip().endswith("\\"):
+            break
+    return " ".join(out)
+
+
+def test_nordic_gets_the_run_events_for_the_task_leak_report(tmp_path):
+    """NORDIC throws away what a patch's spectrum calls noise, and nothing in that
+    decision knows the task. The report that says whether the response went with it
+    only runs with -events, per RUN, and the TR the design is sampled at."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root=str(tmp_path))
+    assert "EVENTS[01:foo:1]=stimuli/sub-X_ses-01_task-foo_run-1_events.tsv" in s
+    cmd = _nordic_command(s)
+    assert '${ev:+-events "${ev}"}' in cmd
+    assert '${ev:+${TR[$k]:+-tr "${TR[$k]}"}}' in cmd
+
+
+def test_nordic_task_rescue_is_opt_in(tmp_path):
+    """The report MEASURES; -task_rescue changes what the denoised output contains."""
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "foo", "1")])])
+    plan = build_plan(subj, Options(want_nordic=True))
+    assert "-task_rescue" not in _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))
+    plan = build_plan(subj, Options(want_nordic=True, nordic_task_rescue="ica"))
+    cmd = _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))
+    # Guarded by ${ev:+…} like -events itself: a run with no events must not get a
+    # flag whose own tool rejects it for having nothing to score against.
+    assert "${ev:+-task_rescue ica}" in cmd
+
+
+def test_a_nordic_run_without_events_simply_goes_unscored(tmp_path):
+    subj = Subject("X", [Session("01", [_bids_run(tmp_path, "01", "rest", "1", events=False)])])
+    s = write_script(build_plan(subj, Options(want_nordic=True)), "wd", bids_root=str(tmp_path))
+    assert "EVENTS[01:rest:1]" not in s
+    assert 'ev="${EVENTS[$k]:-}"' in s.split("stage00: NORDIC denoise")[-1]

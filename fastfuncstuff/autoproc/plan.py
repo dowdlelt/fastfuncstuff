@@ -48,6 +48,10 @@ class Options:
     # chain at the final resample. Nothing between those two points touches it.
     phase_proc: bool = False
     noise_vols: int = 0
+    # ffs_nordic -task_rescue MODE, verbatim. Off by default for the same reason
+    # locomoco_detask is: the stage00 -events diagnostic MEASURES how much of the task
+    # went out with the noise, and this ACTS on it. Read the report first.
+    nordic_task_rescue: str | None = None
     slicetiming_method: str = "integrate"  # integrate (fold into final resample) | first | none
     # One slice-timing file (text, one offset per slice in seconds, or a JSON with
     # SliceTiming) used for EVERY run, in place of each run's BIDS sidecar. For
