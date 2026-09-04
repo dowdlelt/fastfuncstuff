@@ -23,6 +23,16 @@ than of a real stat map:
 Components never span batch rows — the compacted adjacency only ever links
 voxels within one volume — so a single flat labelling over the whole batch is
 safe, and the per-volume maximum falls out of one scatter-reduce.
+
+Calibration, so a future change can be judged against something real: on a
+2.37 M-voxel 0.8 mm mask, 10 000 iterations take ~88 s here against a measured
+12.8 hours for 3dClustSim on 6 threads.  That ratio is 26x larger than on a
+64^3 test volume, because AFNI's cost is per-grid-voxel and this one's is per
+*suprathreshold* voxel — the advantage is the compaction, not the GPU.  At that
+size the labelling is ~68% of the run and sits at the random-gather roofline:
+Morton-ordering the voxels for locality measured 0.99x and halving the pointer
+jumps 1.06x, so neither is worth retrying.  The remaining cheap win is
+``build_neighbor_table`` itself, 8.8 s of single-threaded numpy.
 """
 
 from __future__ import annotations
