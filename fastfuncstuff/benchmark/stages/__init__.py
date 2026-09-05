@@ -22,6 +22,7 @@ from . import (
     ica_single_trace,
     ica_solver,
     ica_trace,
+    locomoco,
     moco,
     nordic,
     phasereg,
@@ -32,6 +33,7 @@ from . import (
 
 ALL_STAGES = [
     moco,
+    locomoco,
     slicetime,
     crossalign,
     align,
