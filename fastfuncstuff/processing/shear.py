@@ -361,16 +361,28 @@ def _shear_best(q: Tensor, d: Tensor):
     """
     B = q.shape[0]
     device = q.device
+
+    # All six permutations in ONE _shear_xzyx call. The factorization is a few
+    # hundred elementwise ops on tensors with only B lanes, so per-call torch
+    # dispatch -- not arithmetic -- sets the cost, and calling it six times pays
+    # that six times over. A ds005165 CPU profile caught it: 95,622 calls (6 per
+    # frame, B=1 on the ffs_moco path) for 24.8s of the moco stage's 104.4s, a
+    # quarter of the run spent decomposing 4x4 matrices. Measured 1829 -> 314 us
+    # for the six (5.8x). Every reduction inside is per lane, so stacking the
+    # permutations along the batch changes nothing about the result.
+    perms = [list(pi) for pi in _PERMS]
+    idxs = [torch.tensor(pi, device=device) for pi in perms]
+    # permute_dmat33 / permute_dfvec3: qq[i,j]=q[pi[i],pi[j]], xx[i]=d[pi[i]]
+    qq_all = torch.cat([q[:, i][:, :, i] for i in idxs], dim=0)  # (6B, 3, 3)
+    xx_all = torch.cat([d[:, i] for i in idxs], dim=0)  # (6B, 3)
+    ax_all, scl_all, sft_all, valid_all = _shear_xzyx(qq_all, xx_all)
+
     plans = []
     norms = []
-    for pi in _PERMS:
-        pi = list(pi)
-        # permute_dmat33 / permute_dfvec3: qq[i,j]=q[pi[i],pi[j]], xx[i]=d[pi[i]]
-        idx = torch.tensor(pi, device=device)
-        qq = q[:, idx][:, :, idx]
-        xx = d[:, idx]
-        ax, scl, sft, valid = _shear_xzyx(qq, xx)
-        ax, scl, sft = _permute_back(ax, scl, sft, pi)
+    for k, pi in enumerate(perms):
+        lanes = slice(k * B, (k + 1) * B)
+        ax, scl, sft = _permute_back(ax_all[lanes], scl_all[lanes], sft_all[lanes], pi)
+        valid = valid_all[lanes]
         plans.append((ax, scl, sft, valid))
         norms.append(_norm_3shear(ax, scl, valid))
 
