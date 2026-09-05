@@ -553,7 +553,21 @@ def _wsinc5_kernel(fx: Tensor) -> Tensor:
     Returns:
         (N, 2*IRAD) kernel weights, normalized to sum to 1.
     """
-    irad, wrad, wcut, wfun_hamming = _wsinc5_params()
+    return _wsinc5_taps(fx, *_wsinc5_params())
+
+
+def _wsinc5_taps(fx: Tensor, irad: int, wrad: float, wcut: float, wfun_hamming: bool) -> Tensor:
+    """The wsinc5 tap weights for explicit parameters.
+
+    Split out of :func:`_wsinc5_kernel` so the AFNI_WSINC5_* settings arrive as
+    ARGUMENTS. Under ``torch.compile`` that is the difference between correct and
+    silently wrong: dynamo traces straight through the ``lru_cache`` on
+    :func:`_wsinc5_params` and bakes whatever it read as an unguarded constant,
+    and its code-object cache then survives a fresh ``torch.compile`` call -- so a
+    process that changed AFNI_WSINC5_RADIUS mid-run kept getting the old tap
+    count (measured: 10 taps returned where eager gave 18). As arguments they are
+    guarded, and a change recompiles.
+    """
     offsets = torch.arange(
         -(irad - 1), irad + 1, dtype=fx.dtype, device=fx.device
     )  # -(IRAD-1) .. +IRAD  (2*IRAD taps)
@@ -745,6 +759,63 @@ def _resample_chunk_size(n_points: int, ntaps: int, device: torch.device) -> int
     return result
 
 
+_compiled_kernel_fns: dict[tuple, object] = {}
+
+
+def _kernel_compile_key(kernel_fn, dt: str) -> tuple:
+    """Cache key for a compiled tap-weight kernel."""
+    return (getattr(kernel_fn, "__name__", repr(kernel_fn)), dt)
+
+
+def _get_kernel_fn(kernel_fn, device: torch.device):
+    """Return the compiled tap-weight kernel once the gather has earned a compile.
+
+    A weight evaluation is a long elementwise chain -- wsinc5 is a sinc, a
+    window, a renormalize -- that eager torch walks as ~20 separate passes over
+    the point array. Inductor fuses it into one: measured 9.78 -> 1.96 ms (5.0x)
+    for wsinc5 and 1.47 -> 0.36 ms (4.1x) for cubic at 311,904 points, both
+    bit-identical. It matters because only the GATHER was ever compiled, and the
+    weights feeding it cost more than it does: a ds005165 CPU profile had
+    _wsinc5_kernel at 32.5s of ffs_nwarp's 135.6s against ~13.7s in the compiled
+    gather, and _cubic_kernel at 9.4s of ffs_allineate's 54.1s against 3.8s.
+
+    Gated on the gather's decision rather than a second eager budget: both
+    compile in the same call, so one calibration covers the pair and there is no
+    separate number to keep honest. ``_record_compile_cost`` then measures the
+    warmup they now share.
+    """
+    dt = device.type
+    if (
+        _already_compiling()
+        or dt not in ("cpu", "cuda")
+        or _no_compile_depth
+        or os.environ.get("FFS_NWARP_NO_COMPILE") == "1"
+    ):
+        return kernel_fn
+    # Presence alone is not enough: a failed compile stores the eager function.
+    gather = _compiled_gather_contract.get(dt)
+    if gather is None or gather is _gather_contract:
+        return kernel_fn
+    key = _kernel_compile_key(kernel_fn, dt)
+    existing = _compiled_kernel_fns.get(key)
+    if existing is not None:
+        return existing
+    try:
+        if kernel_fn is _wsinc5_kernel:
+            # Read the params per call and pass them in, so they are guarded
+            # values rather than constants frozen into the trace.
+            inner = torch.compile(_wsinc5_taps, dynamic=True)
+
+            def compiled(fx: Tensor) -> Tensor:
+                return inner(fx, *_wsinc5_params())
+        else:
+            compiled = torch.compile(kernel_fn, dynamic=True)
+    except Exception:
+        compiled = kernel_fn  # compile unavailable on this build
+    _compiled_kernel_fns[key] = compiled
+    return compiled
+
+
 def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
     """Per-axis kernel weights, reusing the kernel eval across repeated offsets.
 
@@ -760,12 +831,15 @@ def _axis_weights(kernel_fn, frac: Tensor) -> Tensor:
     # torch.unique has no derivative (_unique2), so the dedup path would break the
     # autograd optimizers (allineate/qwarp refine backward through the resample).
     c = frac.numel()
+    # Keep the differentiable path eager: the optimizers backward through here,
+    # and the compile buys nothing on the handful of points they evaluate.
+    fn = kernel_fn if frac.requires_grad else _get_kernel_fn(kernel_fn, frac.device)
     if c >= 64 and not frac.requires_grad:
         probe = frac[: min(256, c)]
         if torch.unique(probe).numel() * 4 < probe.numel():
             uniq, inv = torch.unique(frac, return_inverse=True)
-            return kernel_fn(uniq)[inv]
-    return kernel_fn(frac)
+            return fn(uniq)[inv]
+    return fn(frac)
 
 
 def _gather_contract(
