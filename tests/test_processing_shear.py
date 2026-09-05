@@ -180,3 +180,77 @@ def test_batched_moco_estimation_cuda():
     import numpy as np
 
     assert np.abs(rB.params - rP.params).mean() < 0.1
+
+
+# ---------------------------------------------------------------------------
+# The six axis permutations are evaluated in one batched _shear_xzyx call.
+# Per-call torch dispatch dominates that factorization (it is hundreds of
+# elementwise ops on B lanes), so calling it six times cost 24.8s of a 104.4s
+# ffs_moco CPU run. These pin that the batching is a pure speed change.
+# ---------------------------------------------------------------------------
+
+
+def _random_rigid(seed: int, batch: int = 1):
+    """(B,3,3) rotation + (B,3) shift, at the small angles real moco produces."""
+    g = torch.Generator().manual_seed(seed)
+    mats, shifts = [], []
+    for _ in range(batch):
+        a = torch.randn(3, generator=g, dtype=torch.float64) * 0.03
+        cx, sx = torch.cos(a[0]), torch.sin(a[0])
+        cy, sy = torch.cos(a[1]), torch.sin(a[1])
+        cz, sz = torch.cos(a[2]), torch.sin(a[2])
+        rx = torch.tensor([[1, 0, 0], [0, cx, -sx], [0, sx, cx]], dtype=torch.float64)
+        ry = torch.tensor([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]], dtype=torch.float64)
+        rz = torch.tensor([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]], dtype=torch.float64)
+        mats.append(rz @ ry @ rx)
+        shifts.append(torch.randn(3, generator=g, dtype=torch.float64) * 0.5)
+    return torch.stack(mats), torch.stack(shifts)
+
+
+def test_shear_best_lanes_are_independent():
+    """A batched call must decompose each matrix the way a lone call does.
+
+    The six permutations are stacked along the batch, so a reduction that leaked
+    across lanes would show up here and nowhere else. The PLAN (which axis order,
+    and whether the lane is usable) must match exactly; the coefficients agree to
+    float64 rounding, since BLAS blocks a 5-lane batch differently from a 1-lane
+    one -- that was true of the per-permutation loop too (measured 9.3e-15).
+    """
+    from fastfuncstuff.processing.shear import _shear_best
+
+    q, d = _random_rigid(7, batch=5)
+    ax, scl, sft, valid = _shear_best(q, d)
+    for i in range(q.shape[0]):
+        ax_i, scl_i, sft_i, valid_i = _shear_best(q[i : i + 1], d[i : i + 1])
+        assert torch.equal(ax[i : i + 1], ax_i)
+        assert torch.equal(valid[i : i + 1], valid_i)
+        assert torch.allclose(scl[i : i + 1], scl_i, rtol=0, atol=1e-12)
+        assert torch.allclose(sft[i : i + 1], sft_i, rtol=0, atol=1e-12)
+
+
+def test_batched_decomposition_still_reproduces_the_pull():
+    """rigid_matrix_to_shears only marks a lane valid once it has checked that
+    the plan composes back to the requested matrix, so an all-valid batch of
+    honest rigid transforms is that safety net passing on the batched path."""
+    shape = (24, 32, 32)
+    q, d = _random_rigid(11, batch=4)
+    matrices = torch.eye(4, dtype=torch.float64).repeat(4, 1, 1)
+    matrices[:, :3, :3] = q
+    matrices[:, :3, 3] = d
+    ax, scl, sft, valid = rigid_matrix_to_shears(matrices, shape)
+    assert bool(valid.all())
+    for i in range(4):
+        ax_i, scl_i, sft_i, valid_i = rigid_matrix_to_shears(matrices[i : i + 1], shape)
+        assert torch.equal(ax[i : i + 1], ax_i)
+        assert torch.equal(valid[i : i + 1], valid_i)
+        assert torch.allclose(scl[i : i + 1], scl_i, rtol=0, atol=1e-10)
+
+
+def test_degenerate_matrix_is_still_reported_invalid():
+    """A singular input must not be rescued by the batching."""
+    from fastfuncstuff.processing.shear import _shear_best
+
+    q = torch.zeros(1, 3, 3, dtype=torch.float64)
+    d = torch.zeros(1, 3, dtype=torch.float64)
+    _, _, _, valid = _shear_best(q, d)
+    assert not bool(valid.all())
