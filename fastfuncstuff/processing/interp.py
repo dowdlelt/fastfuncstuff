@@ -42,6 +42,71 @@ def _set_triton_interp_unavailable(message: str) -> None:
         print(f"** {message}")
 
 
+# Below this many sample points the re-slice below costs more than the threads
+# win back. Measured on a 10-core M-series: the split pays from a few thousand
+# points and is worth ~9x by 3.4M (a 170-candidate affine generation).
+_CPU_GRID_SPLIT_MIN_POINTS = 1 << 13
+
+
+def _grid_sample_3d_cpu_threaded(
+    input: Tensor,
+    grid: Tensor,
+    mode: str,
+    align_corners: bool,
+) -> Tensor | None:
+    """Re-slice an ``N=1`` CPU grid_sample across N so ATen threads it.
+
+    ``grid_sampler_3d`` on CPU runs one ``at::parallel_for`` over the BATCH
+    dimension and nothing else, so an ``N=1`` call -- which is how every FFS call
+    site shapes it, packing the real batch into the grid's D/H/W instead -- pins
+    the whole sample to a single core. Measured 40.3 ms against 4.5 ms for the
+    same points split ten ways on a 10-core M-series.
+
+    The sampler is elementwise in the points, so which slot a point occupies
+    changes nothing: flattening the points and dealing them into N lanes gives a
+    bit-identical result. The source is shared by every lane through ``expand``
+    (stride 0), so no copy of the volume is made.
+
+    Returns None when the split does not apply, and the caller falls through to
+    the ordinary call.
+    """
+    if input.shape[0] != 1 or grid.shape[0] != 1:
+        return None
+    lanes = torch.get_num_threads()
+    if lanes < 2:
+        return None
+    # Autograd would allocate grad_input for the EXPANDED source -- one full
+    # volume per lane -- before summing it back down. The registration refiners
+    # backward through this, so leave those on the single-threaded path.
+    if input.requires_grad or grid.requires_grad:
+        return None
+    n_points = grid.shape[1] * grid.shape[2] * grid.shape[3]
+    if n_points < _CPU_GRID_SPLIT_MIN_POINTS:
+        return None
+
+    lanes = min(lanes, n_points)
+    pad = -n_points % lanes
+    flat = grid.reshape(1, n_points, 1, 1, 3)
+    if pad:
+        # Repeat the last point rather than inventing coordinates: the padding is
+        # trimmed off below, and a real in-bounds point cannot trip any clamping.
+        flat = torch.cat([flat, flat[:, -1:].expand(1, pad, 1, 1, 3)], dim=1)
+    per_lane = (n_points + pad) // lanes
+
+    channels = input.shape[1]
+    sampled = F.grid_sample(
+        input.expand(lanes, -1, -1, -1, -1),
+        flat.reshape(lanes, per_lane, 1, 1, 3),
+        mode=mode,
+        padding_mode="border",
+        align_corners=align_corners,
+    )  # (lanes, C, per_lane, 1, 1)
+    # Lane l holds points [l*per_lane, (l+1)*per_lane), so concatenating the lanes
+    # in order restores the caller's point order.
+    merged = sampled.reshape(lanes, channels, per_lane).permute(1, 0, 2).reshape(channels, -1)
+    return merged[:, :n_points].reshape(1, channels, *grid.shape[1:4])
+
+
 def _grid_sample_3d(
     input: Tensor,
     grid: Tensor,
@@ -63,6 +128,10 @@ def _grid_sample_3d(
             padding_mode="zeros",
             align_corners=align_corners,
         )
+    if input.device.type == "cpu":
+        threaded = _grid_sample_3d_cpu_threaded(input, grid, mode, align_corners)
+        if threaded is not None:
+            return threaded
     return F.grid_sample(
         input,
         grid,
