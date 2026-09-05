@@ -34,6 +34,8 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -3271,6 +3273,107 @@ def _grad_axis_3d(vol: torch.Tensor, axis: int) -> torch.Tensor:
     return d
 
 
+def _sync_device(device: torch.device) -> None:
+    """Make elapsed wall time meaningful on an async device.
+
+    Only called while the compile budget is still accumulating -- a handful of
+    calls before the decision lands -- so serializing here costs nothing once
+    the steady state is reached.
+    """
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    elif device.type == "mps":
+        torch.mps.synchronize()
+
+
+# Gating mirrors interp._get_gather_contract and shear._get_shear_interp:
+# accumulate eager seconds, compile once the work has paid for a warmup on this
+# machine. The Lanczos tap loop is ~48 unfused passes over the array in eager
+# (clamp, two sincs, a gather, a multiply and two accumulations per tap, six
+# taps), and inductor fuses it into one: measured 23.9 -> 3.1 ms at
+# (268, 76, 76) and 6.2 -> 0.7 ms at (54, 76, 76), i.e. 7.8-9.0x. It was 27% of
+# ffs_locomoco on a ds005165 CPU profile (41% counting its torch.sinc calls),
+# once the conv2d blur stopped dominating. CUDA already had a fused path
+# (shift1d_lanczos_triton); this is its CPU counterpart.
+#
+# Prior above the gather's 2.0s because this graph is bigger (the tap loop
+# unrolls), and below the shear's 5.0s because it is a single kernel rather than
+# a per-mode family.
+_SHIFT1D_COMPILE_BOOTSTRAP_S = 3.0
+_shift1d_eager_seconds: dict[str, float] = {"cpu": 0.0, "cuda": 0.0, "mps": 0.0}
+_compiled_shift1d: dict[str, object] = {}
+_shift1d_compile_pending: set[str] = set()
+
+
+def _shift1d_compile_allowed(device: torch.device) -> bool:
+    from . import interp as _interp
+
+    return (
+        device.type in _shift1d_eager_seconds
+        and not _interp._no_compile_depth
+        and not _interp._already_compiling()
+        and os.environ.get("FFS_NWARP_NO_COMPILE") != "1"
+    )
+
+
+def _get_shift1d_body(device: torch.device):
+    """Return the compiled Lanczos tap loop once eager time has paid for a warmup.
+
+    ``dynamic=True`` deliberately, unlike shear._get_shear_interp. A real run
+    shows only THREE signatures (the LK pyramid's 76x76, 38x38 and 19x19 levels
+    at one frame count), so static shapes would fit -- and measured 13% faster
+    -- but the frame count and resolution both vary per input, so a -batch
+    manifest spanning a few runs would mint more than dynamo's cap of 8 graphs
+    and fall silently back to eager. 13% is not worth that cliff; the shear's
+    static form is kept because there the gap was 5.7x, not 13%.
+    """
+    from . import interp as _interp
+
+    if not _shift1d_compile_allowed(device):
+        return _shift1d_lanczos_body
+    dt = device.type
+    existing = _compiled_shift1d.get(dt)
+    if existing is not None:
+        return existing
+    if _shift1d_eager_seconds[dt] < _interp._measured_compile_cost(
+        dt, "shift1d", _SHIFT1D_COMPILE_BOOTSTRAP_S
+    ):
+        return _shift1d_lanczos_body
+    try:
+        compiled = torch.compile(_shift1d_lanczos_body, dynamic=True)
+    except Exception:
+        compiled = _shift1d_lanczos_body  # compile unavailable on this build
+    _compiled_shift1d[dt] = compiled
+    if compiled is not _shift1d_lanczos_body:
+        _shift1d_compile_pending.add(dt)  # the first call through it pays the warmup
+    return compiled
+
+
+def _shift1d_lanczos_body(vol: torch.Tensor, shift, dim: int, n: int, radius: int) -> torch.Tensor:
+    """The Lanczos tap loop, split out so it can be handed to torch.compile.
+
+    ``dim`` is the tensor dim (batch already accounted) and ``n`` its length.
+    """
+    ishape = [1] * vol.ndim
+    ishape[dim] = n
+    idx = torch.arange(n, device=vol.device, dtype=vol.dtype).reshape(ishape)
+    coord = (idx + shift).expand(vol.shape)  # scalar or (B,X,Y,Z) field -> full grid
+    base = torch.floor(coord)
+    frac = coord - base
+    base = base.to(torch.long)
+    a = float(radius)
+    num = torch.zeros_like(vol)
+    den = torch.zeros_like(vol)
+    # 2*radius taps span the Lanczos support [coord-a, coord+a]; the window is zero at +-a.
+    for j in range(-(radius - 1), radius + 1):
+        tap = (base + j).clamp_(0, n - 1)
+        x = frac - j
+        w = torch.sinc(x) * torch.sinc(x / a)  # Lanczos = sinc(x)*sinc(x/a)
+        num = num + w * vol.gather(dim, tap)
+        den = den + w
+    return num / den
+
+
 def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3) -> torch.Tensor:
     """Resample a batched volume (``(B,X,Y,Z)``) or slice stack (``(B,H,W)``) along ``axis``
     ONLY — ``axis`` is the 0-based spatial axis, batch is dim 0 — by a scalar or per-voxel
@@ -3303,24 +3406,34 @@ def _shift1d_windowed_sinc(vol: torch.Tensor, shift, axis: int, radius: int = 3)
         if fused is not None:
             return fused
     n = vol.shape[dim]
-    ishape = [1] * vol.ndim
-    ishape[dim] = n
-    idx = torch.arange(n, device=vol.device, dtype=vol.dtype).reshape(ishape)
-    coord = (idx + shift).expand(vol.shape)  # scalar or (B,X,Y,Z) field → full grid
-    base = torch.floor(coord)
-    frac = coord - base
-    base = base.to(torch.long)
-    a = float(radius)
-    num = torch.zeros_like(vol)
-    den = torch.zeros_like(vol)
-    # 2·radius taps span the Lanczos support [coord-a, coord+a]; the window is zero at ±a.
-    for j in range(-(radius - 1), radius + 1):
-        tap = (base + j).clamp_(0, n - 1)
-        x = frac - j
-        w = torch.sinc(x) * torch.sinc(x / a)  # Lanczos = sinc(x)·sinc(x/a)
-        num = num + w * vol.gather(dim, tap)
-        den = den + w
-    return num / den
+    # Differentiable calls stay eager: the optimizers backward through here, and
+    # the budget must not count work the compiled path would never see.
+    if needs_grad:
+        return _shift1d_lanczos_body(vol, shift, dim, n, radius)
+
+    body = _get_shift1d_body(vol.device)
+    measuring = vol.device.type in _shift1d_compile_pending
+    # Only time while the decision is still open: eager calls feed the budget,
+    # and the one call that runs the compile reports what the warmup cost.
+    accounted = body is _shift1d_lanczos_body and _shift1d_compile_allowed(vol.device)
+    if measuring or accounted:
+        _sync_device(vol.device)
+        t0 = time.perf_counter()
+
+    out = body(vol, shift, dim, n, radius)
+
+    if measuring or accounted:
+        from . import interp as _interp
+
+        _sync_device(vol.device)
+        elapsed = time.perf_counter() - t0
+        if measuring:
+            # This call ran the compile; almost all of its wall time is that.
+            _shift1d_compile_pending.discard(vol.device.type)
+            _interp._record_compile_cost(vol.device.type, elapsed, "shift1d")
+        else:
+            _shift1d_eager_seconds[vol.device.type] += elapsed
+    return out
 
 
 def _shift2d_high_order(
