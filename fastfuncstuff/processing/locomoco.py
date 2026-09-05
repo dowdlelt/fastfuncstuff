@@ -112,11 +112,33 @@ def _gaussian_kernel1d(sigma: float, device: torch.device, dtype: torch.dtype) -
     return k
 
 
+# oneDNN switches conv2d algorithm somewhere below 17 taps on CPU, and the one
+# it picks for short kernels is much worse: at (268, 76, 76), the shape a
+# locomoco slice-movie blur actually has, a 15-tap separable blur measured
+# 52.7 ms against 7.9 ms for 17 taps -- strictly more arithmetic, 6.7x less
+# time. Zero-padding a short kernel up to the threshold is exactly identical
+# (the added taps are zeros) and buys 1.2x at sigma 0.5 rising to 3.4x at
+# sigma 2.0, which is the range the LK pyramid spends its time in.
+#
+# conv2d only. Plain conv3d has no such cliff -- it scales monotonically, and
+# padding a 7-tap kernel to 17 there measured 4x SLOWER -- so _gaussian_blur3d
+# and the slicewise 3-D blur deliberately do not use this.
+_CPU_CONV2D_MIN_TAPS = 17
+
+
+def _pad_kernel_for_cpu_conv2d(k: torch.Tensor) -> torch.Tensor:
+    """Zero-pad a 1-D conv2d kernel past oneDNN's short-kernel algorithm cliff."""
+    if k.device.type != "cpu" or k.numel() >= _CPU_CONV2D_MIN_TAPS:
+        return k
+    pad = (_CPU_CONV2D_MIN_TAPS - k.numel() + 1) // 2
+    return F.pad(k, (pad, pad))
+
+
 def _blur2d(img: torch.Tensor, sigma: float) -> torch.Tensor:
     """Separable Gaussian blur of a batch of 2-D images ``(B, H, W)``."""
     if sigma <= 0:
         return img
-    k = _gaussian_kernel1d(sigma, img.device, img.dtype)
+    k = _pad_kernel_for_cpu_conv2d(_gaussian_kernel1d(sigma, img.device, img.dtype))
     r = (k.numel() - 1) // 2
     x = img.unsqueeze(1)
     # ``replicate`` (not ``reflect``) so a blur radius larger than the plane still
@@ -1538,7 +1560,7 @@ def _blur_inplane(m: torch.Tensor, sigma: float) -> torch.Tensor:
     """Separable Gaussian blur within each ``(H, W)`` plane of a ``(nSlice, H, W)`` stack."""
     if sigma <= 0:
         return m
-    k = _gaussian_kernel1d(sigma, m.device, m.dtype)
+    k = _pad_kernel_for_cpu_conv2d(_gaussian_kernel1d(sigma, m.device, m.dtype))
     r = (k.numel() - 1) // 2
     x = m[:, None]
     x = F.conv2d(F.pad(x, (0, 0, r, r), mode="replicate"), k.view(1, 1, -1, 1))
