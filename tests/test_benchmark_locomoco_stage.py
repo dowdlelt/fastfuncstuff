@@ -60,6 +60,30 @@ def _populate(tmp_path, flow=None, corrected_shape=None, pe_dir="j-"):
     return ctx
 
 
+def _populate_synthetic(ctx, *, recovered=None, corrected=None):
+    """Write a synthetic case. By default a PERFECT recovery: the reported flow
+    is exactly the negative of the imposed field, and correcting restores the
+    clean series, so every threshold is met by construction."""
+    rng = np.random.default_rng(1)
+    clean = _series(rng)
+    # Scaled like the real fixture (SYNTH_AMPLITUDE_VOX), so a fractional
+    # amplitude error lands where it would on real data.
+    truth = (rng.random(SHAPE).astype(np.float32) - 0.5) * 2.0 * locomoco.SYNTH_AMPLITUDE_VOX
+    distorted = clean + 5.0 * truth  # any consistent 'damage' works for the ratio
+    _write(locomoco._synth_clean_path(ctx, "localizer", 1), clean)
+    _write(locomoco._synth_input_path(ctx, "localizer", 1), distorted)
+    _write(locomoco._synth_truth_path(ctx, "localizer", 1), truth)
+    _write(
+        locomoco._synth_corrected_path(ctx, "localizer", 1),
+        clean if corrected is None else corrected,
+    )
+    _write(
+        locomoco._synth_flow_path(ctx, "localizer", 1),
+        -truth if recovered is None else recovered,
+    )
+    return truth, clean
+
+
 def test_pe_axis_comes_from_the_sidecar(tmp_path):
     ctx = _populate(tmp_path, pe_dir="i-")
     assert locomoco._pe_axis(ctx, "localizer", 1) == "x"
@@ -71,13 +95,59 @@ def test_pe_axis_override_wins(tmp_path):
     assert locomoco._pe_axis(ctx, "localizer", 1) == "z"
 
 
-def test_validate_reports_diagnostics_without_a_reference(tmp_path):
+def test_validate_passes_on_a_good_synthetic_recovery(tmp_path):
+    ctx = _populate(tmp_path)
+    _populate_synthetic(ctx)
+    result = locomoco.validate(ctx)
+    assert result["passed"], result["summary"]
+    assert result["reference"] == "synthetic ground truth"
+    assert result["synth_flow_r"] < -0.99  # recovered == -imposed
+    assert result["synth_rms_err_vox"] < 1e-5
+    assert result["synth_residual_ratio"] < 1e-5
+    assert result["rms_flow_vox"] > 0  # the real run's diagnostic still reported
+
+
+def test_validate_fails_when_the_synthetic_case_is_missing(tmp_path):
+    """Without its own truth the stage has nothing to validate, and must say so
+    rather than passing on diagnostics alone."""
     ctx = _populate(tmp_path)
     result = locomoco.validate(ctx)
-    assert result["passed"]
-    assert result["reference"] is None
-    assert "no reference" in result["summary"]
-    assert result["rms_flow_vox"] > 0
+    assert not result["passed"]
+    assert "synthetic" in result["summary"]
+
+
+def test_validate_catches_a_sign_flip(tmp_path):
+    """|r| would score a flipped field perfectly; the threshold is signed."""
+    ctx = _populate(tmp_path)
+    truth, clean = _populate_synthetic(ctx)
+    _write(locomoco._synth_flow_path(ctx, "localizer", 1), truth)  # not -truth
+    result = locomoco.validate(ctx)
+    assert not result["passed"]
+    assert "flow r=" in result["summary"]
+
+
+def test_validate_catches_an_amplitude_error_that_still_correlates(tmp_path):
+    """Correlation is blind to scale; the RMS threshold is what catches this."""
+    ctx = _populate(tmp_path)
+    truth, clean = _populate_synthetic(ctx)
+    # Recovers only a tenth of the amplitude: r is still -1.0 exactly.
+    _write(locomoco._synth_flow_path(ctx, "localizer", 1), -truth * 0.1)
+    result = locomoco.validate(ctx)
+    assert result["synth_flow_r"] < -0.99  # correlation is perfect...
+    assert not result["passed"]  # ...and the amplitude is still wrong
+    assert "RMS err" in result["summary"]
+
+
+def test_validate_catches_a_correction_that_did_not_help(tmp_path):
+    """A perfect-looking field is worthless if the corrected series is no closer
+    to the clean one; the residual ratio is the end-to-end check."""
+    ctx = _populate(tmp_path)
+    truth, clean = _populate_synthetic(ctx)
+    distorted, _ = locomoco._load_vol(locomoco._synth_input_path(ctx, "localizer", 1))
+    _write(locomoco._synth_corrected_path(ctx, "localizer", 1), distorted.numpy())
+    result = locomoco.validate(ctx)
+    assert not result["passed"]
+    assert "residual ratio" in result["summary"]
 
 
 def test_validate_fails_on_an_identically_zero_flow(tmp_path):
@@ -109,11 +179,23 @@ def test_prerequisite_is_the_ffs_moco_output(tmp_path):
     assert missing == [str(locomoco._input_path(ctx, "localizer", 1))]
 
 
-def test_run_ffs_skips_when_the_output_exists(tmp_path, monkeypatch):
+def test_run_ffs_skips_only_when_BOTH_runs_are_on_disk(tmp_path, monkeypatch):
+    """The stage runs locomoco twice -- the real run and the scored synthetic
+    one -- so a directory holding only the real outputs is not done."""
     ctx = _populate(tmp_path)
 
     def _boom(*args, **kwargs):
-        pytest.fail("run_timed should not be called when the output already exists")
+        pytest.fail("run_timed should not be called when both runs already exist")
 
+    monkeypatch.setattr(locomoco, "run_timed", _boom)
+    # Synthetic outputs missing -> must NOT skip.
+    calls = []
+    monkeypatch.setattr(locomoco, "run_timed", lambda *a, **k: (calls.append(a), (0.0, None))[1])
+    monkeypatch.setattr(locomoco, "_build_synthetic_case", lambda *a, **k: None)
+    locomoco.run_ffs(ctx)
+    assert calls, "a missing synthetic case must re-run the stage"
+
+    # With both present, nothing runs.
+    _write(locomoco._synth_flow_path(ctx, "localizer", 1), np.zeros(SHAPE, dtype=np.float32))
     monkeypatch.setattr(locomoco, "run_timed", _boom)
     assert locomoco.run_ffs(ctx) == 0.0
