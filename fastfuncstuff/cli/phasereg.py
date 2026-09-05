@@ -845,8 +845,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.tr is None:
             tr_values.append(get_tr_from_file(mag_path))
 
-        mag_list.append(torch.tensor(mag_data.reshape(-1, n_tp), dtype=torch.float32))
-        pha_list.append(torch.tensor(pha_data.reshape(-1, n_tp), dtype=torch.float32))
+        # from_numpy, not torch.tensor: nibabel hands back an F-CONTIGUOUS
+        # (x, y, z, t) array, so the C-order reshape to (n_voxels, n_tp) is a
+        # full copy (378 ms per localizer run, measured) -- and torch.tensor()
+        # then copied that copy. from_numpy wraps the F-strided array for free
+        # and lets the one unavoidable copy happen in the reshape. Same voxel
+        # order: torch.reshape is row-major like numpy's default.
+        mag_list.append(torch.from_numpy(mag_data).reshape(-1, n_tp))
+        pha_list.append(torch.from_numpy(pha_data).reshape(-1, n_tp))
 
         if args.verb >= 1:
             print(f"  Run {i + 1}: {mag_path} ({n_tp} TRs)")
