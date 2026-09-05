@@ -1104,6 +1104,7 @@ def main():
         # so in-sample R² is a fair comparison metric.
         from tqdm import tqdm
 
+        from fastfuncstuff.glm.core import design_cholesky, ols_betas
         from fastfuncstuff.glm.ridge import create_single_trial_design
         from fastfuncstuff.glm.xval import compute_qr_projectors, compute_r2_metric
 
@@ -1214,12 +1215,16 @@ def main():
 
             # Fit OLS in voxel chunks (projected data stays on CPU, stream to GPU)
             proj_design_dev = projected_st_design.to(device)
+            # Factor once per HRF, not once per chunk: the design is the same for
+            # every chunk, and lstsq was re-factoring it each time (5.6x measured
+            # on this design; it was 57% of the whole stage on a CPU profile).
+            chol_L = design_cholesky(proj_design_dev)
 
             for c0 in range(0, n_voxels, chunk_size):
                 c1 = min(c0 + chunk_size, n_voxels)
                 chunk_data = projected_data[c0:c1].to(device)
 
-                chunk_betas = torch.linalg.lstsq(proj_design_dev, chunk_data.T).solution.T
+                chunk_betas = ols_betas(proj_design_dev, chunk_data, cholesky_L=chol_L)
                 chunk_pred = (proj_design_dev @ chunk_betas.T).T
                 chunk_r2 = compute_r2_metric(chunk_data, chunk_pred, metric="cod")
 
@@ -1257,12 +1262,13 @@ def main():
                 continue
             vox_indices = vox_mask.nonzero(as_tuple=True)[0]
             proj_design_dev = projected_designs_cache[hrf_idx].to(device)
+            chol_L = design_cholesky(proj_design_dev)
 
             for c0 in range(0, len(vox_indices), chunk_size):
                 c1 = min(c0 + chunk_size, len(vox_indices))
                 idx = vox_indices[c0:c1]
                 chunk_data = projected_data[idx].to(device)
-                chunk_betas = torch.linalg.lstsq(proj_design_dev, chunk_data.T).solution.T
+                chunk_betas = ols_betas(proj_design_dev, chunk_data, cholesky_L=chol_L)
                 best_betas[idx] = chunk_betas[:, :n_trials].cpu()
 
         del projected_designs_cache  # Free ~240 MB
