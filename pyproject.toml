@@ -56,6 +56,11 @@ dev = [
     "scikit-learn>=1.2",
     "ruff>=0.9",
 ]
+# ffs_viewer's window. The headless viewer core (loading, residency, colour
+# mapping, compositing) has no Qt dependency and is importable without this.
+viewer = [
+    "PySide6>=6.7",
+]
 # Optional extras for ffs_bsds: data-driven parcellation (ward/rena), alternate
 # dynamic-state backends (osl-dynamics), and the CEBRA embedding bridge. The
 # native BSDS path needs none of these.
@@ -88,6 +93,7 @@ ffs_hrfopt = "fastfuncstuff.cli.hrfopt:main"
 ffs_librarian = "fastfuncstuff.cli.librarian:main"
 ffs_ica = "fastfuncstuff.cli.ica:main"
 ffs_info = "fastfuncstuff.cli.info:main"
+ffs_viewer = "fastfuncstuff.cli.viewer:main"
 ffs_nordic = "fastfuncstuff.cli.nordic:main"
 ffs_pathfinder = "fastfuncstuff.cli.pathfinder:main"
 ffs_pyrf = "fastfuncstuff.cli.pyrf:main"

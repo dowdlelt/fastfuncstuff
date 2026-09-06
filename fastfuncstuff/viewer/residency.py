@@ -79,6 +79,16 @@ class Resident:
         return Tier.HEADER
 
     @property
+    def pending(self) -> bool:
+        """Whether a background inflate is actually in flight.
+
+        Not the same as "no array yet": a 3-D dataset is complete the moment its
+        single volume is previewed and never schedules a load, so testing for a
+        missing array would leave it reading as loading forever.
+        """
+        return self._future is not None
+
+    @property
     def ram_bytes(self) -> int:
         return 0 if self.array is None else int(self.array.nbytes)
 

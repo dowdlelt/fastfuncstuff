@@ -62,6 +62,12 @@ class Layer:
     n_panes: int = 0  # 0 = continuous; >0 = AFNI-style discrete colour bar
     sign_mode: SignMode = SignMode.BOTH
     volume_index: int = 0
+    #: Whether the global time index drives this layer. True for a time series
+    #: (a dataset with a TR), False for a stats dataset, whose sub-bricks are
+    #: unrelated contrasts rather than time points. Both are 4-D on disk, so
+    #: dimensionality cannot tell them apart -- scrubbing a stats dataset
+    #: through its contrasts would be nonsense.
+    time_linked: bool = False
 
     #: Display range. ``None`` means "derive from the data" -- resolved once the
     #: volume is resident, then cached here.

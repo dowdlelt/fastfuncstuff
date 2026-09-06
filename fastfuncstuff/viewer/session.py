@@ -18,7 +18,7 @@ from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.layers import Layer
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
 from fastfuncstuff.viewer.state import ViewerState
-from fastfuncstuff.viewer.vocab import AddLayer, install
+from fastfuncstuff.viewer.vocab import AddLayer, SetVolume, install
 
 #: Percentiles used to auto-range a layer. AFNI's autorange takes the maximum,
 #: which one bright voxel is enough to ruin; percentiles are what make a map
@@ -45,6 +45,23 @@ def derive_range(
     return (lo, hi)
 
 
+def infer_time_linked(info: DatasetInfo) -> bool:
+    """Whether the global time index should drive this dataset.
+
+    A time series and a stats dataset are both 4-D on disk, and NIfTI cannot
+    reliably tell them apart: ``pixdim[4]`` defaults to 1.0, so almost every
+    file claims a TR. Sub-brick labels are the usable signal — 3dDeconvolve and
+    ffs write them on stats output, raw time series carry none.
+
+    So: 4-D defaults to time-linked because that is the common case, and labels
+    turn it off. Both are guesses about a file that does not say, which is why
+    SET_TIME_LINKED exists to correct it.
+    """
+    if info.n_volumes <= 1:
+        return False
+    return not info.labels
+
+
 def layer_from_info(info: DatasetInfo, key: str, path: Path) -> Layer:
     """Build a display layer from a header-only read."""
     nx, ny, nz, nv = info.shape
@@ -55,6 +72,7 @@ def layer_from_info(info: DatasetInfo, key: str, path: Path) -> Layer:
         shape=(int(nx), int(ny), int(nz)),
         n_volumes=max(int(nv), 1),
         affine=np.asarray(info.affine, dtype=float),
+        time_linked=infer_time_linked(info),
     )
 
 
@@ -71,6 +89,11 @@ class ViewerSession:
         self.state = ViewerState()
         self.store = store or VolumeStore(device=device)
         self.bus = install(CommandBus(self.state, record=record), open_layer=self._open)
+        self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
+        # A time-index or sub-brick change invalidates the cached device volume;
+        # doing it here rather than in each handler means a command added later
+        # cannot forget to.
+        self.bus.subscribe(self._on_command)
 
     # -- loading -------------------------------------------------------
     def _open(self, path: str, key: str) -> Layer:
@@ -107,6 +130,12 @@ class ViewerSession:
         return chosen
 
     # -- dispatch ------------------------------------------------------
+    def _on_command(self, cmd: Command, dirty: Aspect) -> None:
+        if dirty & (Aspect.TIME | Aspect.LAYERS):
+            self.invalidate()
+        elif isinstance(cmd, SetVolume):
+            self.invalidate(cmd.key)
+
     def do(self, cmd: Command) -> Aspect:
         return self.bus.dispatch(cmd)
 
@@ -133,6 +162,58 @@ class ViewerSession:
         if res.array is not None:
             return res.array[..., idx]
         return self.store.preview(key, idx)
+
+    def display_volume(self, key: str, index: int | None = None) -> torch.Tensor | None:
+        """The currently displayed sub-brick as a device tensor, cached.
+
+        Cached per ``(layer, sub-brick)`` because a redraw asks for the same
+        volume three times -- once per plane -- and the host-to-device copy
+        measures 10 GB/s even on unified memory. Returns ``None`` when the
+        layer's data has gone, so a repaint mid-eviction draws nothing rather
+        than raising into the paint handler.
+        """
+        try:
+            res = self.store.get(key)
+        except KeyError:
+            return None
+        layer = self.state.layers.find(key)
+        if layer is None:
+            return None
+
+        if index is not None:
+            idx = index
+        elif layer.time_linked:
+            idx = self.state.time_index
+        else:
+            idx = layer.volume_index
+        idx = max(0, min(int(idx), res.info.n_volumes - 1))
+
+        cache_key = (key, idx)
+        hit = self._volume_cache.get(cache_key)
+        if hit is not None:
+            return hit
+
+        try:
+            arr = self.volume(key, idx)
+        except (KeyError, FileNotFoundError, ValueError):
+            return None
+        tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(
+            self.store.device
+        )
+        # One sub-brick per layer is enough: panes share it, and holding more
+        # would quietly duplicate what the residency store already owns.
+        for stale in [k for k in self._volume_cache if k[0] == key]:
+            del self._volume_cache[stale]
+        self._volume_cache[cache_key] = tensor
+        return tensor
+
+    def invalidate(self, key: str | None = None) -> None:
+        """Drop cached device volumes for one layer, or all of them."""
+        if key is None:
+            self._volume_cache.clear()
+            return
+        for stale in [k for k in self._volume_cache if k[0] == key]:
+            del self._volume_cache[stale]
 
     def timeseries(self, key: str, ijk: tuple[int, int, int] | None = None) -> np.ndarray:
         """The time course at a voxel, or an empty array if not yet resident.

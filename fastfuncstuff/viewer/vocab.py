@@ -154,6 +154,21 @@ class SetVolume(Command):
     index: int
 
 
+@command
+@dataclass(frozen=True)
+class SetTimeLinked(Command):
+    """Whether the global time index drives this layer.
+
+    The override for when a 4-D file's own header cannot say whether its
+    sub-bricks are time points or unrelated contrasts.
+    """
+
+    name = "SET_TIME_LINKED"
+    aspects = Aspect.SLICES | Aspect.GRAPH | Aspect.TIME
+    key: str
+    on: bool
+
+
 # ---------------------------------------------------------------------------
 # colour and threshold
 # ---------------------------------------------------------------------------
@@ -441,6 +456,14 @@ def install(bus: CommandBus, *, open_layer: OpenLayer | None = None) -> CommandB
             return Aspect.NOTHING
         st.layers.update(cmd.key, boxed=bool(cmd.on))
         return SetBoxed.aspects
+
+    @bus.handle(SetTimeLinked.name)
+    def _set_time_linked(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetTimeLinked)
+        if st.layers.get(cmd.key).time_linked == bool(cmd.on):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, time_linked=bool(cmd.on))
+        return SetTimeLinked.aspects
 
     @bus.handle(SetSeed.name)
     def _set_seed(cmd: Command, st: ViewerState) -> Aspect:
