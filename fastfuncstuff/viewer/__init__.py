@@ -27,6 +27,7 @@ from fastfuncstuff.viewer.commands import (
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, LayerStack, SignMode
 from fastfuncstuff.viewer.residency import Resident, Tier, VolumeStore
 from fastfuncstuff.viewer.session import ViewerSession, derive_range
+from fastfuncstuff.viewer.slicing import extract_plane, plane_shape, voxel_value
 from fastfuncstuff.viewer.state import DisplayGrid, Locks, Plane, ViewerState
 
 __all__ = [
@@ -51,10 +52,13 @@ __all__ = [
     "command",
     "composite",
     "derive_range",
+    "extract_plane",
     "parse_script",
+    "plane_shape",
     "registered_names",
     "resolve",
     "suprathreshold_edges",
     "threshold_alpha",
     "to_rgba8",
+    "voxel_value",
 ]
