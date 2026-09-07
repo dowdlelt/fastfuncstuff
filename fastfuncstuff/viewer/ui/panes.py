@@ -38,6 +38,7 @@ class ImagePane(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
+        self._labels: tuple[str, str, str, str] | None = None
         self.setMinimumSize(160, 160)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
@@ -66,6 +67,11 @@ class ImagePane(QtWidgets.QWidget):
     def position(self) -> int | None:
         """Which slice is currently drawn, so a redraw can be skipped."""
         return None if self._pane is None else self._pane.position
+
+    def set_layout(self, layout) -> None:
+        """Take the plane's anatomical edge labels (top, right, bottom, left)."""
+        self._labels = layout.labels
+        self.update()
 
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
@@ -137,6 +143,19 @@ class ImagePane(QtWidgets.QWidget):
         p.setFont(font)
         pos = self._pane.position if self._pane is not None else 0
         p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}")
+
+        # Anatomical edge labels. An upside-down or mirrored brain still looks
+        # like a brain, so the only thing that says which way round it is, is
+        # writing it on the edges.
+        if self._labels is not None:
+            p.setPen(QtGui.QColor(92, 142, 160))
+            top, right, bottom, left = self._labels
+            r = self.rect()
+            flags = QtCore.Qt.AlignmentFlag
+            p.drawText(r.adjusted(0, 2, 0, 0), flags.AlignTop | flags.AlignHCenter, top)
+            p.drawText(r.adjusted(0, 0, -4, 0), flags.AlignRight | flags.AlignVCenter, right)
+            p.drawText(r.adjusted(0, 0, 0, -2), flags.AlignBottom | flags.AlignHCenter, bottom)
+            p.drawText(r.adjusted(4, 0, 0, 0), flags.AlignLeft | flags.AlignVCenter, left)
         p.end()
 
     # -- input ---------------------------------------------------------

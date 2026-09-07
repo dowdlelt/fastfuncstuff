@@ -26,7 +26,7 @@ from fastfuncstuff.viewer.colormap import (
     to_rgba8,
 )
 from fastfuncstuff.viewer.layers import Layer
-from fastfuncstuff.viewer.slicing import extract_plane, plane_axes, plane_shape
+from fastfuncstuff.viewer.slicing import extract_plane, plane_layout, plane_shape
 from fastfuncstuff.viewer.state import Plane, ViewerState
 
 #: Colour drawn around suprathreshold voxels in boxed mode. Near-white reads
@@ -60,8 +60,9 @@ class PaneImage:
 
 def plane_position(state: ViewerState, plane: Plane) -> int:
     """Where the crosshair puts this plane."""
-    fixed, _, _ = plane_axes(plane)
-    return int(state.crosshair[fixed])
+    if state.grid is None:
+        return 0
+    return int(state.crosshair[plane_layout(state.grid.affine, plane).fixed])
 
 
 def _layer_alpha(layer: Layer, values: Tensor, stat: Tensor) -> tuple[Tensor, Tensor | None]:
@@ -93,8 +94,9 @@ def render_plane(
     if not visible:
         return None
 
+    layout = plane_layout(grid.affine, plane)
     pos = plane_position(state, plane) if position is None else position
-    pos = max(0, min(pos, grid.shape[plane_axes(plane)[0]] - 1))
+    pos = max(0, min(pos, grid.shape[layout.fixed] - 1))
 
     stacked: list[tuple[Tensor, Tensor]] = []
     box_overlays: list[Tensor] = []

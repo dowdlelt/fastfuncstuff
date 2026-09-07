@@ -13,30 +13,148 @@ effectively cannot.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 import torch
 from torch import Tensor
 
 from fastfuncstuff.viewer.state import DisplayGrid, Plane
 
-#: Which display axis each plane holds fixed, and which two it spans. Ordered
-#: (fixed, rows, cols) in display i/j/k indices.
-_PLANE_AXES: dict[Plane, tuple[int, int, int]] = {
-    Plane.SAGITTAL: (0, 1, 2),
-    Plane.CORONAL: (1, 0, 2),
-    Plane.AXIAL: (2, 0, 1),
+#: Which RAS direction each plane is normal to, and how the two in-plane
+#: directions should be laid out. ``up`` is the anatomical direction that must
+#: point to the top of the image, ``right`` the one that must point to its
+#: right edge.
+#:
+#: Axial and coronal both put +R to the right of the image, which is the
+#: *neurological* convention -- the subject's left appears on the viewer's
+#: left. Sagittal puts anterior to the left, so the face looks left.
+_PLANE_CONVENTION: dict[Plane, tuple[str, str, str]] = {
+    # plane: (normal, up, right)
+    Plane.AXIAL: ("S", "A", "R"),
+    Plane.CORONAL: ("A", "S", "R"),
+    Plane.SAGITTAL: ("R", "S", "P"),
 }
 
+_RAS_INDEX = {"R": 0, "A": 1, "S": 2}
+_OPPOSITE = {"R": "L", "A": "P", "S": "I", "L": "R", "P": "A", "I": "S"}
 
-def plane_axes(plane: Plane) -> tuple[int, int, int]:
+
+@dataclass(frozen=True)
+class PlaneLayout:
+    """How one plane maps onto the screen, anatomy included.
+
+    ``row``/``col`` are display-grid axes and ``row_flip``/``col_flip`` say
+    whether each runs backwards. Without this the panes show whatever order the
+    array happened to be stored in, which for a coronal slice means superior
+    can end up at the bottom -- and an upside-down brain still looks like a
+    brain, so nothing about the image says it is wrong.
+    """
+
+    fixed: int
+    row: int
+    col: int
+    row_flip: bool
+    col_flip: bool
+    #: Edge labels, clockwise from the top: (top, right, bottom, left).
+    labels: tuple[str, str, str, str]
+
+    @property
+    def axes(self) -> tuple[int, int, int]:
+        return (self.fixed, self.row, self.col)
+
+    # The flip arithmetic lives here and nowhere else. It is needed when
+    # drawing, when hit-testing a click and when placing the crosshair, and
+    # three hand-written copies is how one of them ends up mirrored.
+
+    def to_image(self, ijk: tuple[int, int, int], shape: tuple[int, int, int]) -> tuple[int, int]:
+        """Display-grid indices to (row, col) within the drawn plane."""
+        row, col = ijk[self.row], ijk[self.col]
+        if self.row_flip:
+            row = shape[self.row] - 1 - row
+        if self.col_flip:
+            col = shape[self.col] - 1 - col
+        return (int(row), int(col))
+
+    def to_ijk(
+        self,
+        row: int,
+        col: int,
+        current: tuple[int, int, int],
+        shape: tuple[int, int, int],
+    ) -> tuple[int, int, int]:
+        """(row, col) in the drawn plane back to display-grid indices."""
+        if self.row_flip:
+            row = shape[self.row] - 1 - row
+        if self.col_flip:
+            col = shape[self.col] - 1 - col
+        out = list(current)
+        out[self.row] = int(row)
+        out[self.col] = int(col)
+        return (out[0], out[1], out[2])
+
+
+def ras_axes(affine: np.ndarray) -> dict[str, tuple[int, int]]:
+    """For each of R/A/S, which display axis carries it and in which direction.
+
+    Read off the affine's columns: column ``d`` is where display axis ``d``
+    points in scanner space, so the dominant row of that column names the
+    anatomical direction it most nearly follows.
+    """
+    mat = np.asarray(affine, dtype=float)[:3, :3]
+    out: dict[str, tuple[int, int]] = {}
+    used: set[int] = set()
+    # Strongest pairings first, so a near-tie cannot steal an axis that another
+    # direction matches far better.
+    order = sorted(((abs(mat[r, d]), r, d) for r in range(3) for d in range(3)), reverse=True)
+    for _, r, d in order:
+        letter = "RAS"[r]
+        if letter in out or d in used:
+            continue
+        out[letter] = (d, 1 if mat[r, d] >= 0 else -1)
+        used.add(d)
+    return out
+
+
+def plane_layout(affine: np.ndarray, plane: Plane) -> PlaneLayout:
+    """Lay a plane out so anatomy is where a radiologist expects it."""
+    axes = ras_axes(affine)
+    normal, up, right = _PLANE_CONVENTION[plane]
+
+    def resolve(direction: str) -> tuple[int, int]:
+        """Display axis and sign for an anatomical direction like 'P'."""
+        if direction in _RAS_INDEX:
+            return axes[direction]
+        axis, sign = axes[_OPPOSITE[direction]]
+        return axis, -sign
+
+    fixed, _ = axes[normal]
+    up_axis, up_sign = resolve(up)
+    right_axis, right_sign = resolve(right)
+    return PlaneLayout(
+        fixed=fixed,
+        row=up_axis,
+        col=right_axis,
+        # Rows run down the screen, so "up" means the row index must decrease
+        # as the anatomical direction increases.
+        row_flip=up_sign > 0,
+        col_flip=right_sign < 0,
+        labels=(up, right, _OPPOSITE[up], _OPPOSITE[right]),
+    )
+
+
+def plane_axes(plane: Plane, affine: np.ndarray | None = None) -> tuple[int, int, int]:
     """``(fixed, row, col)`` display axes for a plane."""
-    return _PLANE_AXES[plane]
+    if affine is None:
+        # Identity fallback: only for callers with no grid yet.
+        return {Plane.SAGITTAL: (0, 1, 2), Plane.CORONAL: (1, 0, 2), Plane.AXIAL: (2, 0, 1)}[plane]
+    return plane_layout(affine, plane).axes
 
 
 def plane_shape(grid: DisplayGrid, plane: Plane) -> tuple[int, int]:
     """Pixel dimensions of one display plane."""
-    _, row, col = plane_axes(plane)
-    return (grid.shape[row], grid.shape[col])
+    layout = plane_layout(grid.affine, plane)
+    return (grid.shape[layout.row], grid.shape[layout.col])
 
 
 def plane_indices(
@@ -52,15 +170,18 @@ def plane_indices(
     Built on-device so a redraw never round-trips index arithmetic through the
     host.
     """
-    fixed, row, col = plane_axes(plane)
-    h, w = grid.shape[row], grid.shape[col]
-    rr = torch.arange(h, device=device, dtype=dtype).unsqueeze(1).expand(h, w)
-    cc = torch.arange(w, device=device, dtype=dtype).unsqueeze(0).expand(h, w)
-    ff = torch.full((h, w), float(position), device=device, dtype=dtype)
+    layout = plane_layout(grid.affine, plane)
+    h, w = grid.shape[layout.row], grid.shape[layout.col]
+    rows = torch.arange(h, device=device, dtype=dtype)
+    cols = torch.arange(w, device=device, dtype=dtype)
+    if layout.row_flip:
+        rows = (h - 1) - rows
+    if layout.col_flip:
+        cols = (w - 1) - cols
     out = torch.empty((h, w, 3), device=device, dtype=dtype)
-    out[..., fixed] = ff
-    out[..., row] = rr
-    out[..., col] = cc
+    out[..., layout.fixed] = float(position)
+    out[..., layout.row] = rows.unsqueeze(1).expand(h, w)
+    out[..., layout.col] = cols.unsqueeze(0).expand(h, w)
     return out
 
 

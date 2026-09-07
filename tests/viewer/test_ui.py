@@ -486,12 +486,22 @@ def _positions(win):
     return {p.value: win._panes[p].position for p in Plane}
 
 
-def test_clicking_one_pane_reslices_the_others(win, qapp):
-    win._on_pick(Plane.AXIAL, 4, 5)
+def _pick_and_expect(win, qapp, plane, row, col):
+    """Click a pane, then say where the other two should now be sitting."""
+    from fastfuncstuff.viewer.slicing import plane_layout
+
+    grid = win.session.state.grid
+    layout = plane_layout(grid.affine, plane)
+    ijk = layout.to_ijk(row, col, win.session.state.crosshair, grid.shape)
+    win._on_pick(plane, row, col)
     qapp.processEvents()
-    pos = _positions(win)
-    assert pos["sagittal"] == 4, "sagittal did not follow i"
-    assert pos["coronal"] == 5, "coronal did not follow j"
+    assert win.session.state.crosshair == ijk
+    return {p.value: ijk[plane_layout(grid.affine, p).fixed] for p in Plane}
+
+
+def test_clicking_one_pane_reslices_the_others(win, qapp):
+    expected = _pick_and_expect(win, qapp, Plane.AXIAL, 4, 5)
+    assert _positions(win) == expected
 
 
 def test_a_click_does_not_move_the_pane_that_was_clicked(win, qapp):
@@ -504,15 +514,29 @@ def test_a_click_does_not_move_the_pane_that_was_clicked(win, qapp):
 
 def test_every_pane_can_drive_the_others(win, qapp):
     """The inconsistency was per-pane, so each one needs checking."""
-    win._on_pick(Plane.SAGITTAL, 6, 3)  # rows = j, cols = k
-    qapp.processEvents()
-    assert _positions(win)["coronal"] == 6
-    assert _positions(win)["axial"] == 3
+    for plane, row, col in (
+        (Plane.SAGITTAL, 6, 3),
+        (Plane.CORONAL, 2, 4),
+        (Plane.AXIAL, 5, 1),
+    ):
+        expected = _pick_and_expect(win, qapp, plane, row, col)
+        assert _positions(win) == expected, plane
 
-    win._on_pick(Plane.CORONAL, 2, 4)  # rows = i, cols = k
-    qapp.processEvents()
-    assert _positions(win)["sagittal"] == 2
-    assert _positions(win)["axial"] == 4
+
+def test_clicks_survive_a_flipped_grid(win, qapp):
+    """A click must land on the voxel under the cursor, whatever the storage."""
+    from fastfuncstuff.viewer.slicing import plane_layout
+
+    grid = win.session.state.grid
+    for plane in Plane:
+        layout = plane_layout(grid.affine, plane)
+        h, w = grid.shape[layout.row], grid.shape[layout.col]
+        win._on_pick(plane, 0, 0)
+        qapp.processEvents()
+        corner = win.session.state.crosshair
+        win._on_pick(plane, h - 1, w - 1)
+        qapp.processEvents()
+        assert win.session.state.crosshair != corner, plane
 
 
 def test_scrolling_reslices_the_scrolled_pane(win, qapp):

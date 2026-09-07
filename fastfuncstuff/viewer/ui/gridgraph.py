@@ -17,7 +17,7 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from fastfuncstuff.viewer.slicing import plane_axes
+from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 
@@ -274,21 +274,25 @@ class GridGraphWindow(QtWidgets.QWidget):
         """Rebuild the cells around the current crosshair."""
         st = self.session.state
         n = self.grid_n
-        _, r_ax, c_ax = plane_axes(self.plane)
+        if st.grid is None:
+            self.graph.set_cells([], n, st.time_index)
+            return
+        layout = plane_layout(st.grid.affine, self.plane)
+        # Walk the grid in image order, so the cells sit where the voxels
+        # appear on screen rather than in array order.
+        centre_row, centre_col = layout.to_image(st.crosshair, st.grid.shape)
         half = n // 2
 
         cells: list[Cell] = []
         for dr in range(-half, -half + n):
             for dc in range(-half, -half + n):
-                ijk = list(st.crosshair)
-                ijk[r_ax] += dr
-                ijk[c_ax] += dc
-                if st.grid is not None:
-                    ijk = list(st.grid.clamp(tuple(ijk)))  # type: ignore[arg-type]
+                ijk = st.grid.clamp(
+                    layout.to_ijk(centre_row + dr, centre_col + dc, st.crosshair, st.grid.shape)
+                )
                 cells.append(
                     Cell(
-                        ijk=(ijk[0], ijk[1], ijk[2]),
-                        traces=self._traces(tuple(ijk)),  # type: ignore[arg-type]
+                        ijk=ijk,
+                        traces=self._traces(ijk),
                         is_centre=(dr == 0 and dc == 0),
                     )
                 )

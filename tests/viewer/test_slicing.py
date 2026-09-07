@@ -14,13 +14,19 @@ import torch
 from fastfuncstuff.viewer.slicing import (
     display_to_layer,
     extract_plane,
-    plane_axes,
     plane_indices,
+    plane_layout,
     plane_shape,
+    ras_axes,
     sample_volume,
     voxel_value,
 )
 from fastfuncstuff.viewer.state import DisplayGrid, Plane
+
+_RAS = np.diag([2.0, 3.0, 4.0, 1.0])
+_LPI = np.diag([-2.0, -3.0, 4.0, 1.0])
+#: Stored (A, S, R) rather than (R, A, S) -- a legal grid a viewer must handle.
+_SWAPPED = np.array([[0, 0, 2, 0], [3, 0, 0, 0], [0, 4, 0, 0], [0, 0, 0, 1]], dtype=float)
 
 
 def _grid(shape=(6, 8, 10), step=(2.0, 3.0, 4.0), origin=(-5.0, -9.0, -20.0)):
@@ -44,32 +50,95 @@ def _ramp(shape=(6, 8, 10)) -> torch.Tensor:
 # ---------------------------------------------------------------------------
 
 
-def test_each_plane_holds_a_different_axis_fixed():
-    assert plane_axes(Plane.SAGITTAL)[0] == 0
-    assert plane_axes(Plane.CORONAL)[0] == 1
-    assert plane_axes(Plane.AXIAL)[0] == 2
+def test_each_plane_is_normal_to_its_anatomical_axis():
+    """A plane is defined by the anatomy it cuts, not by an array index."""
+    grid = _grid()
+    axes = ras_axes(grid.affine)
+    assert plane_layout(grid.affine, Plane.AXIAL).fixed == axes["S"][0]
+    assert plane_layout(grid.affine, Plane.CORONAL).fixed == axes["A"][0]
+    assert plane_layout(grid.affine, Plane.SAGITTAL).fixed == axes["R"][0]
 
 
-def test_plane_shape_matches_the_spanned_axes():
+def test_coronal_puts_superior_at_the_top():
+    for affine in (_RAS, _LPI, _SWAPPED):
+        layout = plane_layout(affine, Plane.CORONAL)
+        assert layout.labels[0] == "S", "superior must be up"
+        assert layout.labels[2] == "I"
+
+
+def test_axial_and_coronal_put_the_subjects_left_on_the_left():
+    """Neurological convention: the viewer's left is the subject's left."""
+    for affine in (_RAS, _LPI, _SWAPPED):
+        for plane in (Plane.AXIAL, Plane.CORONAL):
+            assert plane_layout(affine, plane).labels[3] == "L"
+            assert plane_layout(affine, plane).labels[1] == "R"
+
+
+def test_axial_puts_anterior_at_the_top():
+    for affine in (_RAS, _LPI, _SWAPPED):
+        assert plane_layout(affine, Plane.AXIAL).labels[0] == "A"
+
+
+def test_sagittal_faces_left_with_superior_up():
+    for affine in (_RAS, _LPI, _SWAPPED):
+        layout = plane_layout(affine, Plane.SAGITTAL)
+        assert layout.labels == ("S", "P", "I", "A")
+
+
+def test_orientation_holds_when_the_stored_axis_order_changes():
+    """The same anatomy must land in the same screen position either way."""
+    ras = plane_layout(_RAS, Plane.CORONAL)
+    lpi = plane_layout(_LPI, Plane.CORONAL)
+    assert ras.labels == lpi.labels
+    # LPI runs right-to-left in storage, so the column must be flipped to
+    # compensate; RAS does not.
+    assert lpi.col_flip != ras.col_flip
+
+
+def test_ras_axes_reads_the_affine():
+    assert ras_axes(_RAS) == {"R": (0, 1), "A": (1, 1), "S": (2, 1)}
+    assert ras_axes(_LPI) == {"R": (0, -1), "A": (1, -1), "S": (2, 1)}
+
+
+def test_ras_axes_handles_a_permuted_grid():
+    axes = ras_axes(_SWAPPED)
+    assert {a for a, _ in axes.values()} == {0, 1, 2}, "each axis used once"
+
+
+def test_image_and_ijk_round_trip():
+    """The flip arithmetic lives in one place precisely so this holds."""
     grid = _grid((6, 8, 10))
-    assert plane_shape(grid, Plane.AXIAL) == (6, 8)
-    assert plane_shape(grid, Plane.CORONAL) == (6, 10)
-    assert plane_shape(grid, Plane.SAGITTAL) == (8, 10)
+    for affine in (_RAS, _LPI, _SWAPPED):
+        for plane in Plane:
+            layout = plane_layout(affine, plane)
+            ijk = (2, 3, 4)
+            row, col = layout.to_image(ijk, grid.shape)
+            assert layout.to_ijk(row, col, ijk, grid.shape) == ijk
+
+
+def test_plane_shape_follows_the_layout():
+    grid = _grid((6, 8, 10))
+    for plane in Plane:
+        layout = plane_layout(grid.affine, plane)
+        assert plane_shape(grid, plane) == (grid.shape[layout.row], grid.shape[layout.col])
 
 
 def test_plane_indices_hold_the_fixed_axis_constant():
     grid = _grid()
+    layout = plane_layout(grid.affine, Plane.AXIAL)
     idx = plane_indices(grid, Plane.AXIAL, 3)
-    assert torch.all(idx[..., 2] == 3)
-    assert idx.shape == (6, 8, 3)
+    assert torch.all(idx[..., layout.fixed] == 3)
 
 
-def test_plane_indices_span_the_other_two_axes():
-    grid = _grid()
-    idx = plane_indices(grid, Plane.AXIAL, 0)
-    assert float(idx[0, 0, 0]) == 0.0
-    assert float(idx[5, 0, 0]) == 5.0
-    assert float(idx[0, 7, 1]) == 7.0
+def test_plane_indices_run_backwards_along_a_flipped_axis():
+    """A flip is how superior ends up at the top rather than the bottom."""
+    grid = _grid((6, 8, 10))
+    layout = plane_layout(grid.affine, Plane.CORONAL)
+    assert layout.row_flip, "RAS coronal must flip rows to put S up"
+    idx = plane_indices(grid, Plane.CORONAL, 0)
+    top = float(idx[0, 0, layout.row])
+    bottom = float(idx[-1, 0, layout.row])
+    assert top > bottom, "row 0 should be the superior end"
 
 
 # ---------------------------------------------------------------------------
@@ -151,22 +220,31 @@ def test_extracted_plane_has_the_planes_shape():
         assert got.shape == plane_shape(grid, plane), plane
 
 
-def test_axial_plane_is_not_transposed():
-    """Rows must follow display i and columns display j, not the reverse."""
+def test_each_pixel_holds_the_voxel_the_layout_says_it_should():
+    """The orientation test: an index-encoding ramp must land where claimed."""
     grid = _grid((6, 8, 10))
     vol = _ramp((6, 8, 10))
-    got = extract_plane(vol, grid, grid.affine, Plane.AXIAL, 5)
-    assert abs(float(got[0, 0]) - 5.0) < 1e-2  # i=0, j=0, k=5
-    assert abs(float(got[3, 0]) - 30005.0) < 1e-2  # i=3, j=0, k=5
-    assert abs(float(got[0, 2]) - 205.0) < 1e-2  # i=0, j=2, k=5
+    for plane in Plane:
+        layout = plane_layout(grid.affine, plane)
+        got = extract_plane(vol, grid, grid.affine, plane, 2)
+        h, w = plane_shape(grid, plane)
+        for row, col in ((0, 0), (h - 1, 0), (0, w - 1), (h // 2, w // 2)):
+            ijk = layout.to_ijk(row, col, (2, 2, 2), grid.shape)
+            expected = ijk[0] * 10_000 + ijk[1] * 100 + ijk[2]
+            assert abs(float(got[row, col]) - expected) < 1e-2, (plane, row, col)
 
 
-def test_sagittal_plane_orientation():
-    grid = _grid((6, 8, 10))
-    vol = _ramp((6, 8, 10))
-    got = extract_plane(vol, grid, grid.affine, Plane.SAGITTAL, 2)
-    assert abs(float(got[0, 0]) - 20000.0) < 1e-2  # i=2, j=0, k=0
-    assert abs(float(got[4, 6]) - 20406.0) < 1e-2  # i=2, j=4, k=6
+def test_a_flipped_grid_shows_the_same_anatomy_the_same_way_up():
+    """LPI and RAS storage of the same brain must look identical on screen."""
+    shape = (6, 8, 10)
+    ras_grid = DisplayGrid(shape=shape, affine=_RAS)
+    lpi_grid = DisplayGrid(shape=shape, affine=_LPI)
+    vol = _ramp(shape)
+    # Mirror the volume along x so it represents the same anatomy under LPI.
+    flipped = torch.flip(vol, dims=[0])
+    a = extract_plane(vol, ras_grid, _RAS, Plane.CORONAL, 3)
+    b = extract_plane(flipped, lpi_grid, _LPI, Plane.CORONAL, 3)
+    assert torch.allclose(a, b, atol=1e-3)
 
 
 def test_a_layer_on_a_coarser_grid_still_lands_in_the_right_place():
@@ -176,7 +254,9 @@ def test_a_layer_on_a_coarser_grid_still_lands_in_the_right_place():
     vol = torch.zeros(4, 4, 4)
     vol[1, 1, 1] = 100.0  # sits at 2,2,2 mm -> display voxel (2,2,2)
     got = extract_plane(vol, grid, layer_affine, Plane.AXIAL, 2)
-    assert abs(float(got[2, 2]) - 100.0) < 1e-3
+    layout = plane_layout(grid.affine, Plane.AXIAL)
+    row, col = layout.to_image((2, 2, 2), grid.shape)
+    assert abs(float(got[row, col]) - 100.0) < 1e-3
     assert float(got[0, 0]) == pytest.approx(0.0, abs=1e-6)
 
 

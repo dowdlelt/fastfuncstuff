@@ -28,7 +28,7 @@ from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
-from fastfuncstuff.viewer.slicing import plane_axes, voxel_value
+from fastfuncstuff.viewer.slicing import plane_layout, voxel_value
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.colorbar import RangeBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
@@ -534,9 +534,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(self.session.do(cls(key=key, **kwargs)))
 
     def _on_pick(self, plane: Plane, row: int, col: int, *, seed: bool = False) -> None:
-        _, r_ax, c_ax = plane_axes(plane)
-        ijk = list(self.session.state.crosshair)
-        ijk[r_ax], ijk[c_ax] = row, col
+        grid = self.session.state.grid
+        if grid is None:
+            return
+        layout = plane_layout(grid.affine, plane)
+        ijk = layout.to_ijk(row, col, self.session.state.crosshair, grid.shape)
         # A seed click moves the crosshair as well: you clicked a voxel, and
         # leaving the crosshair behind means the graph and the readout describe
         # somewhere else. Two commands rather than one so SET_SEED stays a
@@ -556,7 +558,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(self.session.do(SetIJK(*ijk)))
 
     def _step_slice(self, plane: Plane, delta: int) -> None:
-        self._nudge(plane_axes(plane)[0], delta)
+        grid = self.session.state.grid
+        if grid is not None:
+            self._nudge(plane_layout(grid.affine, plane).fixed, delta)
 
     def _step_time(self, delta: int) -> None:
         hi = self.session.state.max_time_index()
@@ -738,10 +742,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._redraw_crosshairs()
 
     def _redraw_crosshairs(self) -> None:
+        grid = self.session.state.grid
+        if grid is None:
+            return
         ijk = self.session.state.crosshair
         for plane, pane in self._panes.items():
-            _, r_ax, c_ax = plane_axes(plane)
-            pane.set_crosshair(ijk[r_ax], ijk[c_ax])
+            layout = plane_layout(grid.affine, plane)
+            pane.set_layout(layout)
+            pane.set_crosshair(*layout.to_image(ijk, grid.shape))
 
     def _refresh_graphs(self) -> None:
         for win in self._graphs.values():
