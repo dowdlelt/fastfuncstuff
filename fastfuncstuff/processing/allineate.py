@@ -2063,6 +2063,7 @@ def _refine_adam_batched(
     last_best = np.full(T, -np.inf)
     no_improve = np.zeros(T, dtype=np.int64)
     abs_tol, patience, sync_every = 1e-6, 40, 15
+    prev_sync_best = np.full(T, -np.inf)  # -inf first time: nothing is judged hopeless yet
 
     # Forward = normalized params -> (T,) cost. The per-iter cost is launch-bound
     # (dozens of small kernels: matrix build + sample + blok scatter), so the
@@ -2133,14 +2134,30 @@ def _refine_adam_batched(
             if tqdm is not None and verb >= 1:
                 pbar.set_postfix_str(f"best={bc.max():.6f}")
 
-            # A trial still creeping by just over rel_tol keeps resetting its own
-            # counter, and the loop needs ALL of them flat, so the stage runs to
-            # its cap: on five anat-to-MNI subjects the last improvement worth
-            # having landed at 30-45% of the iterations and four of the five then
-            # ran all 300. The blur stage does not need the tolerance the sharp
-            # one does -- its job is to land inside the next stage's capture
-            # basin, not to converge -- so the caller sets it (see rel_tol).
-            if bool((no_improve >= patience).all()):
+            # The stage runs to its cap unless EVERY trial is flat, and two
+            # different things stop that happening. On five skull-stripped
+            # subjects it was ten trials creeping by just over the tolerance,
+            # each resetting its own counter -- that one is the caller's
+            # `rel_tol` to answer, and a blurred stage asks for a looser one
+            # because its job is to land inside the next stage's capture basin,
+            # not to converge. On the benchmark anat pair it was a single
+            # straggler: while the best of eleven trials sat flat from iteration
+            # 105, one trial climbed steadily from 0.14 to 0.22 for the whole
+            # 300, a gain far above any tolerance, and never plateaued.
+            #
+            # That straggler was 0.98 behind the leader and gaining 6.7e-4 per
+            # iteration -- some 2400 iterations from catching it. A trial that
+            # cannot reach the incumbent before the budget ends cannot change
+            # the answer, so it does not get a vote on when to stop. The bound
+            # is its own recent climb extrapolated over the iterations that
+            # remain, which is generous (Adam decelerates), and it only ever
+            # stops us waiting -- a trial's own result is never altered.
+            climb = np.maximum(bc - prev_sync_best, 0.0) / sync_every
+            prev_sync_best = bc.copy()
+            reachable = bc + climb * (n_iters - it)
+            leader = bc.max()
+            hopeless = reachable < leader - np.maximum(abs_tol, rel_tol * abs(leader))
+            if bool(((no_improve >= patience) | hopeless).all()):
                 break
 
     best_phys = _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span).detach().cpu().numpy()

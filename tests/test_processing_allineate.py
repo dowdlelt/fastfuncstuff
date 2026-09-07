@@ -1413,6 +1413,31 @@ class TestDerivativeFreeRefinement:
         np.testing.assert_array_equal(a, b)
         np.testing.assert_array_equal(ca, cb)
 
+    def test_a_hopeless_trial_does_not_hold_the_others_open(self):
+        """One trial far behind and still climbing kept the benchmark pair's blur
+        stage running all 300 iterations while the best of eleven sat flat from
+        105. A trial that cannot catch the leader before the budget ends cannot
+        change the answer, so it does not get a vote on when to stop."""
+        from fastfuncstuff.processing.allineate import _refine_adam_batched
+
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        target = _normalize(start, bounds) + 0.02
+        cost = self._bowl(target, bounds, device)
+
+        # Two trials on the optimum and one started far away: the far one climbs
+        # the whole time and never plateaus.
+        far = _denormalize(_normalize(start, bounds) + 0.45, bounds)
+        with _recording_cost_trace(True) as trace:
+            _refine_adam_batched(
+                [start, start, far], config, bounds, device, cost, verb=0, n_iters=400
+            )
+        assert trace.rows[-1][1] < 399, (
+            f"ran {trace.rows[-1][1] + 1} iterations waiting on a trial that could not win"
+        )
+
     def test_a_blurred_stage_stops_looser_than_a_sharp_one(self):
         """The blur stage only has to land inside the sharp stage's capture
         basin. Given the same flat-ish cost it must give up sooner than the
