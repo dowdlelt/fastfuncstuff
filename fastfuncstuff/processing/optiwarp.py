@@ -204,10 +204,8 @@ class OptiwarpConfig:
     solve, not to enforce the report's standard mid-flight."""
 
     fold_damp_rounds: int = 6
-    """Maximum local-damping retries per iteration before taking the least-folded
-    candidate anyway. A cap rather than a loop-until-clean: a step that cannot be made
-    legal in a few rounds is better left to the next iteration, which re-derives the
-    force from the image rather than from a repeatedly mangled update."""
+    """Maximum local-damping retries per iteration. If none produces a legal
+    candidate, retain the incoming field rather than accept a folding update."""
 
     fold_aware_best: bool = True
     """Require an iterate to be fold-free before it can become the best-so-far.
@@ -421,7 +419,28 @@ def _step_with_fold_guard(
         # somehow made things worse cannot be what the level walks away with.
         if float(jac.min()) > float(best_jac.min()):
             best_cand, best_jac = cand, jac
+    if float(best_jac.min()) < cfg.jac_floor:
+        return fwd, jacobian_determinant(*fwd), damped
     return best_cand, best_jac, damped
+
+
+def _resize_flow_field(fwd: Field, target: tuple[int, int, int], cfg: OptiwarpConfig) -> Field:
+    """Transfer a flow to a new grid, checking topology on that grid."""
+    resized = _resize_field(*fwd, target)
+    if cfg.fold_guard <= 0:
+        return resized
+    # Positive determinants at coarse nodes do not guarantee positivity between
+    # them. Backtrack the interpolated displacement toward identity if necessary.
+    for attempt in range(17):
+        jac = jacobian_determinant(*resized)
+        if bool(torch.isfinite(jac).all()) and float(jac.min()) >= cfg.jac_floor:
+            if attempt and cfg.verb >= 1:
+                print(
+                    f"optiwarp: reduced transferred displacement by {0.5**attempt:g} for topology"
+                )
+            return resized
+        resized = tuple(c * 0.5 for c in resized)
+    raise ValueError("Could not transfer a finite, legal flow field to the next grid")
 
 
 # ---------------------------------------------------------------------------
@@ -854,7 +873,7 @@ def optiwarp(
         f_prep = prep_intensity(f_lvl, cfg.match, cfg.match_sigma, m_bin)
         m_prep = prep_intensity(m_lvl, cfg.match, cfg.match_sigma, m_bin)
 
-        fwd = _resize_field(*fwd, target)
+        fwd = _resize_flow_field(fwd, target, cfg)
 
         if cfg.verb >= 1:
             print(
@@ -874,7 +893,7 @@ def optiwarp(
         )
         level_stats.append(stats)
 
-    fwd = _resize_field(*fwd, full_shape)
+    fwd = _resize_flow_field(fwd, full_shape, cfg)
 
     if cfg.final_qwarp:
         fwd = _run_final_qwarp(fixed, moving, weight, mask, fwd, cfg, device)

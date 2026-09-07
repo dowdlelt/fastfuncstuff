@@ -16,6 +16,8 @@ from fastfuncstuff.processing.optiwarp import (
     _exp_field,
     _flow_lk,
     _grad3,
+    _resize_flow_field,
+    _step_with_fold_guard,
     jacobian_determinant,
     optiwarp,
     prep_intensity,
@@ -57,6 +59,27 @@ def test_lk_flat_image_has_zero_flow():
     flat = torch.zeros(9, 9, 9)
     result = _flow_lk(flat, flat, (flat, flat, flat), 2, 0.01)
     assert all(torch.isfinite(v).all() and torch.count_nonzero(v) == 0 for v in result)
+
+
+def test_flow_rejects_fold_when_damping_budget_is_exhausted():
+    _, _, x = torch.meshgrid(*[torch.arange(9).float()] * 3, indexing="ij")
+    zero = torch.zeros_like(x)
+    cfg = OptiwarpConfig(step_mode="additive", total_sigma=0, fold_damp_rounds=0, verb=0)
+    result, jac, _ = _step_with_fold_guard((-2 * x, zero, zero), (zero, zero, zero), cfg)
+    assert float(jac.min()) >= cfg.jac_floor
+    assert all(torch.count_nonzero(v) == 0 for v in result)
+
+
+def test_flow_grid_transfer_checks_fine_grid_topology():
+    from fastfuncstuff.processing.formwarp import _resize_field
+
+    rng = torch.Generator().manual_seed(8)
+    coarse = tuple(torch.randn(5, 5, 5, generator=rng) * 0.25 for _ in range(3))
+    cfg = OptiwarpConfig(verb=0)
+    assert float(jacobian_determinant(*coarse).min()) >= cfg.jac_floor
+    assert float(jacobian_determinant(*_resize_field(*coarse, (17, 17, 17))).min()) < 0
+    result = _resize_flow_field(coarse, (17, 17, 17), cfg)
+    assert float(jacobian_determinant(*result).min()) >= cfg.jac_floor
 
 
 def _blobs(shape=(32, 40, 40), seed=0) -> torch.Tensor:
