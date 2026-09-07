@@ -2331,6 +2331,17 @@ def _refine_powell(
 # ---------------------------------------------------------------------------
 
 
+def _blur_rel_tol() -> float:
+    """Plateau tolerance for a BLURRED refinement stage.
+
+    Its own knob (FFS_ALLINEATE_BLUR_RTOL) because it is the one number in the
+    stage ladder that trades wall time against nothing measurable, and the
+    measurement that set it was made on one class of data -- see the comment at
+    the call site for the five-subject sweep that picked 1e-3.
+    """
+    return float(os.environ.get("FFS_ALLINEATE_BLUR_RTOL", "1e-3"))
+
+
 def _refine_progressive(
     base: Tensor,
     source: Tensor,
@@ -2507,7 +2518,7 @@ def _refine_progressive(
                     # sharp stage (S1 233 -> 237 generations), for no wall time
                     # and a worse worst case (+3.4e-4 against +1.6e-4 by a
                     # referee outside the loop).
-                    rel_tol=1e-3 if sigma_vox > 0.0 else 1e-4,
+                    rel_tol=_blur_rel_tol() if sigma_vox > 0.0 else 1e-4,
                 )
             refined = [(float(out_costs[t]), out_phys[t]) for t in range(len(trials))]
         else:
