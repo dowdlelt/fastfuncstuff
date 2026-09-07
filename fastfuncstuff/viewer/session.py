@@ -17,7 +17,7 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
-from fastfuncstuff.viewer.layers import Layer
+from fastfuncstuff.viewer.layers import AlphaMode, Layer
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
@@ -28,6 +28,12 @@ from fastfuncstuff.viewer.vocab import AddLayer, SetVolume, install
 #: which one bright voxel is enough to ruin; percentiles are what make a map
 #: readable without anyone reaching for a slider.
 AUTORANGE_PERCENTILES = (2.0, 98.0)
+
+#: Where a freshly-picked overlay starts its threshold. High enough that the
+#: underlay reads through the noise -- a quarter of the brain tinted is not a
+#: view of anything -- and low enough that real structure is already on screen
+#: before anyone touches the slider.
+OVERLAY_START_PERCENTILE = 90.0
 
 
 def derive_range(
@@ -165,6 +171,34 @@ class ViewerSession:
         self.catalog = catalog_mod.scan(directory, recursive=recursive)
         self.catalog_dir = Path(directory)
         return self.catalog
+
+    def apply_overlay_defaults(self, key: str) -> None:
+        """Give a freshly-picked overlay a state you can actually see through.
+
+        A layer loaded with threshold 0 and no alpha is opaque everywhere, so
+        dropping one on an anatomical hides it completely -- which defeats the
+        first thing anyone does, checking that the two line up. Starting at a
+        high percentile means the overlay reads as structure over anatomy from
+        the moment it lands, and the slider takes it from there.
+        """
+        layer = self.state.layers.find(key)
+        if layer is None or layer.is_computed:
+            return
+        try:
+            values = self.volume(key, 0)
+        except (KeyError, FileNotFoundError, ValueError):
+            return
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return
+        signed = bool((finite < 0).any() and (finite > 0).any())
+        threshold = float(np.percentile(np.abs(finite), OVERLAY_START_PERCENTILE))
+        self.state.layers.update(
+            key,
+            colormap="redblue" if signed else "hot",
+            threshold=threshold,
+            alpha_mode=AlphaMode.LINEAR,
+        )
 
     def suggested_underlay(self) -> CatalogEntry | None:
         return catalog_mod.suggest_underlay(self.catalog)

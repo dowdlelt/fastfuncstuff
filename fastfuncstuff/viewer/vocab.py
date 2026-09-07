@@ -420,6 +420,8 @@ def install(
         st.layers.set_overlay(layer)
         if old is not None and old.key != layer.key and session is not None:
             session.forget(old.key)
+        if session is not None:
+            session.apply_overlay_defaults(layer.key)
         dirty = SetOverlay.aspects
         if st.grid is None:
             dirty |= _adopt_grid_preserving_position(st, layer)
@@ -430,6 +432,8 @@ def install(
         assert isinstance(cmd, AddOverlay)
         layer = _load(cmd.path, cmd.key or st.layers.mint_key("O"))
         st.layers.add_overlay(layer)
+        if session is not None:
+            session.apply_overlay_defaults(layer.key)
         dirty = AddOverlay.aspects
         if st.grid is None:
             dirty |= _adopt_grid_preserving_position(st, layer)

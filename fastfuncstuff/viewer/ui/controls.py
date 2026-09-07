@@ -1,0 +1,164 @@
+"""Rendering a mode's declared controls, generically.
+
+A mode returns a list of :class:`Control` specs and this builds the widgets. No
+mode contributes UI code, which is the property that makes calc, GLM and ICA
+cheap to add: a new mode is one file describing what it needs, not a file plus a
+panel plus a wiring change.
+
+Changes are debounced. An InstaCorr parameter that alters preparation costs
+~600 ms to apply, and a slider drag emits a value per pixel, so applying every
+one would queue a minute of work to answer a gesture that took a second.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+
+from PySide6 import QtCore, QtWidgets
+
+from fastfuncstuff.viewer.modes.base import (
+    BoolControl,
+    ChoiceControl,
+    Control,
+    FloatControl,
+    IntControl,
+)
+
+#: How long to wait after the last change before applying it. Long enough to
+#: swallow a drag, short enough that a deliberate single change feels immediate.
+DEBOUNCE_MS = 250
+
+#: Sliders are integers, so a float control is quantised into this many steps.
+FLOAT_TICKS = 1000
+
+
+class ControlPanel(QtWidgets.QWidget):
+    """A form built from a mode's control declarations."""
+
+    #: (param name, value as text) -- text so it matches SET_MODE_PARAM exactly.
+    changed = QtCore.Signal(str, str)
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._form = QtWidgets.QFormLayout(self)
+        self._form.setContentsMargins(0, 0, 0, 0)
+        self._form.setSpacing(6)
+        self._widgets: dict[str, QtWidgets.QWidget] = {}
+        self._pending: dict[str, str] = {}
+        self._timer = QtCore.QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.setInterval(DEBOUNCE_MS)
+        self._timer.timeout.connect(self._flush)
+
+    # -- building ------------------------------------------------------
+    def rebuild(self, controls: Sequence[Control], values: dict[str, object]) -> None:
+        """Replace the panel with widgets for ``controls``."""
+        while self._form.count():
+            item = self._form.takeAt(0)
+            if item is None:
+                break
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._widgets.clear()
+        self._pending.clear()
+
+        for spec in controls:
+            widget, label = self._build(spec, values.get(spec.name))
+            if widget is None:
+                continue
+            if spec.help:
+                widget.setToolTip(spec.help)
+            self._widgets[spec.name] = widget
+            self._form.addRow(label, widget)
+
+    def _build(
+        self, spec: Control, value: object
+    ) -> tuple[QtWidgets.QWidget | None, QtWidgets.QWidget]:
+        label = QtWidgets.QLabel(spec.label.upper())
+
+        if isinstance(spec, BoolControl):
+            box = QtWidgets.QCheckBox()
+            box.setChecked(bool(value if value is not None else spec.default))
+            box.toggled.connect(lambda on, n=spec.name: self._queue(n, "1" if on else "0"))
+            return box, label
+
+        if isinstance(spec, ChoiceControl):
+            combo = QtWidgets.QComboBox()
+            combo.addItems(list(spec.choices))
+            combo.setCurrentText(str(value if value is not None else spec.default))
+            combo.activated.connect(
+                lambda _, n=spec.name, c=combo: self._queue(n, c.currentText(), now=True)
+            )
+            return combo, label
+
+        if isinstance(spec, IntControl):
+            box = QtWidgets.QSpinBox()
+            box.setRange(spec.lo, spec.hi)
+            box.setValue(int(value if value is not None else spec.default))
+            box.valueChanged.connect(lambda v, n=spec.name: self._queue(n, str(int(v))))
+            return box, label
+
+        if isinstance(spec, FloatControl):
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            slider.setRange(0, FLOAT_TICKS)
+            readout = QtWidgets.QLabel()
+            readout.setObjectName("value")
+            readout.setMinimumWidth(52)
+
+            current = float(value if value is not None else spec.default)
+            span = (spec.hi - spec.lo) or 1.0
+
+            def to_tick(v: float) -> int:
+                return int(round((v - spec.lo) / span * FLOAT_TICKS))
+
+            def to_value(t: int) -> float:
+                raw = spec.lo + (t / FLOAT_TICKS) * span
+                # Snap to the declared step so the readout shows 0.05, not
+                # 0.04999999999999999.
+                return round(raw / spec.step) * spec.step if spec.step else raw
+
+            slider.setValue(to_tick(current))
+            readout.setText(f"{current:g}{spec.unit}")
+
+            def on_move(t: int, n=spec.name, r=readout, u=spec.unit) -> None:
+                v = to_value(t)
+                r.setText(f"{v:g}{u}")
+                self._queue(n, repr(float(v)))
+
+            slider.valueChanged.connect(on_move)
+            h.addWidget(slider, 1)
+            h.addWidget(readout)
+            return row, label
+
+        return None, label
+
+    # -- debounce ------------------------------------------------------
+    def _queue(self, name: str, value: str, *, now: bool = False) -> None:
+        self._pending[name] = value
+        if now:
+            self._flush()
+        else:
+            self._timer.start()
+
+    def _flush(self) -> None:
+        pending, self._pending = self._pending, {}
+        for name, value in pending.items():
+            self.changed.emit(name, value)
+
+    def flush_now(self) -> None:
+        """Apply anything still pending -- on focus loss or before a save."""
+        self._timer.stop()
+        self._flush()
+
+
+def build_mode_panel(mode, on_change: Callable[[str, str], None]) -> ControlPanel:
+    """Convenience: a panel wired to one mode."""
+    panel = ControlPanel()
+    panel.rebuild(mode.controls(), mode.params)
+    panel.changed.connect(on_change)
+    return panel

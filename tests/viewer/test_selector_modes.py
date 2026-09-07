@@ -396,3 +396,49 @@ def test_seed_radius_averages_rather_than_taking_one_voxel(corr_session):
 
     corr_session.set_mode_param("seed_radius", "8.0")
     assert not np.allclose(single, corr_session.store.get(key).array[..., 0])
+
+
+# ---------------------------------------------------------------------------
+# overlay defaults
+# ---------------------------------------------------------------------------
+
+
+def test_a_picked_overlay_does_not_hide_the_underlay(session, datadir):
+    """Goal zero is checking two images line up; an opaque overlay defeats it."""
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.do(SetOverlay(str(datadir / "stats_tstat.nii.gz")))
+    overlay = session.state.layers.overlay
+    assert overlay.threshold > 0.0
+    assert overlay.alpha_mode.value != "off"
+
+
+def test_a_signed_overlay_gets_a_diverging_map(session, datadir):
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.do(SetOverlay(str(datadir / "stats_tstat.nii.gz")))
+    assert session.state.layers.overlay.colormap == "redblue"
+
+
+def test_an_all_positive_overlay_gets_a_sequential_map(session, tmp_path):
+    rng = np.random.default_rng(9)
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 8, 6)))
+    _write(tmp_path, "positive.nii.gz", rng.random((8, 8, 6)) + 1.0)
+    session.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+    session.do(SetOverlay(str(tmp_path / "positive.nii.gz")))
+    assert session.state.layers.overlay.colormap == "hot"
+
+
+def test_the_underlay_stays_opaque(session, datadir):
+    """The base image is the base image; it must not be thresholded away."""
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    base = session.state.layers.base
+    assert base.threshold == 0.0
+    assert base.colormap == "gray"
+
+
+def test_a_computed_overlay_keeps_the_modes_own_defaults(session, datadir):
+    """A mode sets its own range and threshold; the picker must not overwrite."""
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.do(SetMode("test_dummy"))
+    layer = session.state.layers.find_by_source("mode:test_dummy")
+    session.apply_overlay_defaults(layer.key)
+    assert session.state.layers.get(layer.key).colormap == layer.colormap

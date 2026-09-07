@@ -13,8 +13,14 @@ from fastfuncstuff.cli_help import FfsArgumentParser
 from fastfuncstuff.cli_utils import add_device_arg
 
 EPILOG = """\
+the core is the data selector: READ a directory, pick an UNDERLAY and an
+OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
+(View / InstaCorr); images and graphs are modular on top.
+
 keys
   arrows / PgUp PgDn   move the crosshair
+  1 2 3                toggle axial / sagittal / coronal panes
+  g                    floating grid graph (1, 4 or 9 voxels at the cursor)
   , .                  step time            v  play / pause
   [ ]                  select layer       space  show / hide layer
   t T                  threshold down / up
@@ -23,6 +29,7 @@ keys
   ctrl+O  open         ctrl+S  save session script
 
 examples
+  ffs_viewer -read results.subj01/
   ffs_viewer anat.nii.gz stats.nii.gz
   ffs_viewer -device cpu bold.nii.gz
   ffs_viewer -script session.ffs
@@ -39,6 +46,11 @@ def build_parser() -> FfsArgumentParser:
         "datasets",
         nargs="*",
         help="Datasets to load, bottom layer first (anatomy, then overlays).",
+    )
+    p.add_argument(
+        "-read",
+        metavar="DIR",
+        help="Read this directory into the underlay/overlay pickers on startup.",
     )
     p.add_argument(
         "-script",
@@ -66,6 +78,8 @@ def main(argv: list[str] | None = None) -> int:
 
         session = ViewerSession(device=setup_device(args.device))
         try:
+            if args.read:
+                session.read_directory(args.read)
             for path in args.datasets:
                 session.load(path)
             if args.script:
@@ -84,7 +98,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
 
-    return launch(args.datasets, device=args.device, script=args.script)
+    return launch(args.datasets, device=args.device, script=args.script, directory=args.read)
 
 
 if __name__ == "__main__":
