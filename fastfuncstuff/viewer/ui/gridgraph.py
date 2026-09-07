@@ -42,6 +42,8 @@ class GridGraph(QtWidgets.QWidget):
     """Paints an N x N block of time courses on one shared scale."""
 
     picked = QtCore.Signal(int, int, int)
+    #: A time index, from clicking somewhere along a trace.
+    scrubbed = QtCore.Signal(int)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -61,6 +63,36 @@ class GridGraph(QtWidgets.QWidget):
     def set_shared_scale(self, on: bool) -> None:
         self._shared_scale = bool(on)
         self.update()
+
+    def _time_length(self) -> int:
+        """Length of the time-domain trace -- the first one, by convention."""
+        for cell in self._cells:
+            if cell.traces and cell.traces[0][1].size:
+                return int(cell.traces[0][1].size)
+        return 0
+
+    def _cell_rects(self) -> list[QtCore.QRectF]:
+        n, pad = self._n, 3
+        cw = (self.width() - pad * (n + 1)) / n
+        ch = (self.height() - pad * (n + 1)) / n
+        return [
+            QtCore.QRectF(pad + c * (cw + pad), pad + r * (ch + pad), cw, ch)
+            for r in range(n)
+            for c in range(n)
+        ]
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        """Click anywhere on a trace to jump the whole viewer to that volume."""
+        nt = self._time_length()
+        if nt <= 1:
+            return
+        for rect in self._cell_rects():
+            if not rect.contains(event.position()):
+                continue
+            inner = rect.adjusted(2, 2, -2, -2)
+            frac = (event.position().x() - inner.left()) / max(inner.width(), 1.0)
+            self.scrubbed.emit(int(round(max(0.0, min(1.0, frac)) * (nt - 1))))
+            return
 
     def _bounds(self, cells: list[Cell]) -> list[tuple[float, float]]:
         """One y-range per trace index, shared across every cell.
@@ -172,6 +204,8 @@ class GridGraphWindow(QtWidgets.QWidget):
     """A floating graph window bound to one plane."""
 
     closed = QtCore.Signal(str)
+    #: A time index chosen by clicking in the plot.
+    scrubbed = QtCore.Signal(int)
 
     def __init__(self, plane: Plane, session, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -211,6 +245,7 @@ class GridGraphWindow(QtWidgets.QWidget):
         v.addLayout(bar)
 
         self.graph = GridGraph()
+        self.graph.scrubbed.connect(self.scrubbed)
         v.addWidget(self.graph, 1)
 
         # Its own table: a graph window's keys are not the main window's, and

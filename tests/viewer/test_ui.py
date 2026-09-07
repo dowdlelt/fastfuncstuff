@@ -470,3 +470,139 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
     labels = [t[0] for t in win._graphs["axial"].graph._cells[0].traces]
     assert "source" in labels, f"the correlated time course vanished: {labels}"
     assert "prepared" in labels
+
+
+# ---------------------------------------------------------------------------
+# the crosshair decides which slice each pane shows
+#
+# These pin a cluster that all had one cause: SET_IJK dirties CROSSHAIR, and
+# the pane redraw did not listen for it. Only the drawn crosshair lines moved,
+# so panes sat on stale slices until something else forced a full redraw --
+# which is why stepping time appeared to make everything "jump".
+# ---------------------------------------------------------------------------
+
+
+def _positions(win):
+    return {p.value: win._panes[p].position for p in Plane}
+
+
+def test_clicking_one_pane_reslices_the_others(win, qapp):
+    win._on_pick(Plane.AXIAL, 4, 5)
+    qapp.processEvents()
+    pos = _positions(win)
+    assert pos["sagittal"] == 4, "sagittal did not follow i"
+    assert pos["coronal"] == 5, "coronal did not follow j"
+
+
+def test_a_click_does_not_move_the_pane_that_was_clicked(win, qapp):
+    """Clicking axial changes i and j, not k -- that pane's slice is unchanged."""
+    before = _positions(win)["axial"]
+    win._on_pick(Plane.AXIAL, 3, 6)
+    qapp.processEvents()
+    assert _positions(win)["axial"] == before
+
+
+def test_every_pane_can_drive_the_others(win, qapp):
+    """The inconsistency was per-pane, so each one needs checking."""
+    win._on_pick(Plane.SAGITTAL, 6, 3)  # rows = j, cols = k
+    qapp.processEvents()
+    assert _positions(win)["coronal"] == 6
+    assert _positions(win)["axial"] == 3
+
+    win._on_pick(Plane.CORONAL, 2, 4)  # rows = i, cols = k
+    qapp.processEvents()
+    assert _positions(win)["sagittal"] == 2
+    assert _positions(win)["axial"] == 4
+
+
+def test_scrolling_reslices_the_scrolled_pane(win, qapp):
+    before = _positions(win)["axial"]
+    win._step_slice(Plane.AXIAL, 1)
+    qapp.processEvents()
+    assert _positions(win)["axial"] == before + 1
+
+
+def test_stepping_time_does_not_move_any_slice(win, qapp, tmp_path):
+    """The 'everything jumps' symptom was panes catching up on a forced redraw."""
+    from fastfuncstuff.viewer.vocab import SetOverlay
+
+    rng = np.random.default_rng(53)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    img = nib.Nifti1Image(rng.normal(size=(10, 12, 8, 20)).astype(np.float32), aff)
+    img.header["pixdim"][4] = 2.0
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(tmp_path / "bold.nii.gz"))
+    win.refresh(win.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
+    win._on_pick(Plane.AXIAL, 3, 4)
+    qapp.processEvents()
+
+    before = _positions(win)
+    win._step_time(1)
+    qapp.processEvents()
+    assert _positions(win) == before
+
+
+def test_a_seed_click_moves_the_crosshair_with_it(win, qapp):
+    """Leaving the crosshair behind makes the graph describe another voxel."""
+    win._on_pick(Plane.CORONAL, 5, 3, seed=True)
+    qapp.processEvents()
+    assert win.session.state.seed == win.session.state.crosshair
+
+
+def test_a_seed_click_records_both_commands(win, qapp):
+    """SET_SEED stays a primitive; the UI expresses the gesture as two."""
+    win.session.bus.clear_log()
+    win._on_pick(Plane.AXIAL, 2, 3, seed=True)
+    qapp.processEvents()
+    assert [c.name for c in win.session.bus.log] == ["SET_IJK", "SET_SEED"]
+
+
+# ---------------------------------------------------------------------------
+# choosing a timepoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def win4d(win, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetOverlay
+
+    rng = np.random.default_rng(61)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    img = nib.Nifti1Image(rng.normal(size=(10, 12, 8, 25)).astype(np.float32), aff)
+    img.header["pixdim"][4] = 2.0
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(tmp_path / "bold.nii.gz"))
+    win.refresh(win.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
+    win.session.store.ensure_ram(win.session.state.layers.overlay.key)
+    qapp.processEvents()
+    return win
+
+
+def test_the_time_readout_is_editable(win4d, qapp):
+    win4d.time_spin.setValue(17)
+    qapp.processEvents()
+    assert win4d.session.state.time_index == 17
+
+
+def test_the_time_readout_is_bounded_by_the_data(win4d, qapp):
+    assert win4d.time_spin.maximum() == 24
+    assert win4d.time_spin.isEnabled()
+
+
+def test_the_time_readout_is_disabled_without_a_time_series(win, qapp):
+    assert not win.time_spin.isEnabled()
+
+
+def test_clicking_the_graph_jumps_to_that_volume(win4d, qapp):
+    win4d._graph_buttons[Plane.AXIAL].setChecked(True)
+    qapp.processEvents()
+    win4d._graphs["axial"].graph.scrubbed.emit(12)
+    qapp.processEvents()
+    assert win4d.session.state.time_index == 12
+    assert win4d.time_spin.value() == 12
+
+
+def test_the_time_readout_follows_playback(win4d, qapp):
+    win4d._step_time(3)
+    qapp.processEvents()
+    assert win4d.time_spin.value() == win4d.session.state.time_index

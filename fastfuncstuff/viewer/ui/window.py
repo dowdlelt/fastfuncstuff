@@ -23,7 +23,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.colormap import available_colormaps
 from fastfuncstuff.viewer.commands import Aspect
-from fastfuncstuff.viewer.compose import render_plane
+from fastfuncstuff.viewer.compose import plane_position, render_plane
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import OverlayKind
@@ -214,6 +214,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._graph_buttons[plane] = g
             view_bar.addSeparator()
 
+        view_bar.addWidget(self._head("T"))
+        self.time_spin = QtWidgets.QSpinBox()
+        self.time_spin.setToolTip("Jump to a volume")
+        self.time_spin.setKeyboardTracking(False)
+        self.time_spin.setMaximumWidth(78)
+        self.time_spin.valueChanged.connect(self._time_spin_changed)
+        view_bar.addWidget(self.time_spin)
         self.time_label = QtWidgets.QLabel("")
         view_bar.addWidget(self.time_label)
 
@@ -340,6 +347,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if win is None:
                 win = GridGraphWindow(plane, self.session, self)
                 win.closed.connect(self._on_graph_closed)
+                win.scrubbed.connect(self._time_spin_changed)
                 self._graphs[key] = win
             win.show()
             win.raise_()
@@ -484,6 +492,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("click", "move the crosshair", None, group="navigate"),
                 Binding("ctrl+click", "set the InstaCorr seed", None, group="navigate"),
                 Binding("scroll", "step through slices", None, group="navigate"),
+                Binding("click graph", "jump to that volume", None, group="time"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
                 Binding("v", "play / pause", self._toggle_play, group="time"),
@@ -528,7 +537,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         _, r_ax, c_ax = plane_axes(plane)
         ijk = list(self.session.state.crosshair)
         ijk[r_ax], ijk[c_ax] = row, col
-        self.refresh(self.session.do(SetSeed(*ijk) if seed else SetIJK(*ijk)))
+        # A seed click moves the crosshair as well: you clicked a voxel, and
+        # leaving the crosshair behind means the graph and the readout describe
+        # somewhere else. Two commands rather than one so SET_SEED stays a
+        # primitive that a script can use without moving the view.
+        dirty = self.session.do(SetIJK(*ijk))
+        if seed:
+            dirty |= self.session.do(SetSeed(*ijk))
+        self.refresh(dirty)
         if seed and self.session.mode.needs_prepare:
             # First seed after a mode switch: the mode deferred, so preparation
             # happens here, on a worker, with the progress bar up.
@@ -548,6 +564,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         nxt = (self.session.state.time_index + delta) % (hi + 1)
         self.refresh(self.session.do(SetIndex(nxt)))
+
+    def _time_spin_changed(self, value: int) -> None:
+        self.refresh(self.session.do(SetIndex(int(value))))
 
     def _toggle_play(self) -> None:
         self._play.stop() if self._play.isActive() else self._play.start()
@@ -683,18 +702,39 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # follow those aspects and not only LAYERS -- listening for the
             # wrong one is what left it showing the previous colour scale.
             self._sync_layer_controls()
-        if dirty & (Aspect.SLICES | Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.TIME | Aspect.GRID):
-            self._redraw_panes()
+        if dirty & (
+            Aspect.SLICES
+            | Aspect.COLORMAP
+            | Aspect.THRESHOLD
+            | Aspect.TIME
+            | Aspect.GRID
+            | Aspect.CROSSHAIR
+        ):
+            # CROSSHAIR belongs here: the crosshair position *is* which slice
+            # each pane shows. Leaving it out only moved the drawn lines, so a
+            # click in one pane left the other two on their previous slices --
+            # and stepping time, which did force a redraw, made them all
+            # "jump" as they caught up.
+            self._redraw_panes(force=bool(dirty & ~(Aspect.CROSSHAIR | Aspect.GRAPH)))
         if dirty & (Aspect.CROSSHAIR | Aspect.GRID):
             self._redraw_crosshairs()
         if dirty & (Aspect.CROSSHAIR | Aspect.GRAPH | Aspect.TIME | Aspect.LAYERS):
             self._refresh_graphs()
         self._sync_readout()
 
-    def _redraw_panes(self) -> None:
+    def _redraw_panes(self, *, force: bool = True) -> None:
+        """Re-slice the visible panes.
+
+        With ``force`` false only panes whose slice actually moved are
+        re-rendered, so dragging the crosshair across the axial view redraws
+        the two panes that changed rather than all three.
+        """
         for plane, pane in self._panes.items():
-            if self._pane_buttons[plane].isChecked():
-                pane.set_pane(render_plane(self.session, plane))
+            if not self._pane_buttons[plane].isChecked():
+                continue
+            if not force and pane.position == plane_position(self.session.state, plane):
+                continue
+            pane.set_pane(render_plane(self.session, plane))
         self._redraw_crosshairs()
 
     def _redraw_crosshairs(self) -> None:
@@ -809,7 +849,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"ijk {i:>3d} {j:>3d} {k:>3d}   xyz {mm[0]:>7.1f} {mm[1]:>7.1f} {mm[2]:>7.1f}"
         )
         hi = st.max_time_index()
-        self.time_label.setText(f"t {st.time_index}/{hi}" if hi else "")
+        self.time_spin.blockSignals(True)
+        self.time_spin.setRange(0, max(hi, 0))
+        self.time_spin.setValue(st.time_index)
+        self.time_spin.setEnabled(hi > 0)
+        self.time_spin.blockSignals(False)
+        self.time_label.setText(f"/ {hi}" if hi else "")
         self.mode_label.setText(self.session.mode.status())
         parts: list[str] = []
         for layer in reversed(list(st.layers)):

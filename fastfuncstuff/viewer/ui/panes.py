@@ -62,6 +62,11 @@ class ImagePane(QtWidgets.QWidget):
             ).copy()
         self.update()
 
+    @property
+    def position(self) -> int | None:
+        """Which slice is currently drawn, so a redraw can be skipped."""
+        return None if self._pane is None else self._pane.position
+
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
