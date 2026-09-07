@@ -1756,7 +1756,10 @@ def _refine_cmaes_batched(
     # productive phase of that run (8 generations), and the tolerance is the
     # rel/abs pair the Adam refiner already uses. Together they give up 9.1e-6
     # of cost -- an order of magnitude below what the cost can resolve.
-    rel_tol, abs_tol, patience = 1e-4, 1e-6, 30
+    # FFS_CMA_PATIENCE joins the FFS_CMA_* knobs above; set it huge to get the
+    # old sigma-only termination back for an A/B.
+    rel_tol, abs_tol = 1e-4, 1e-6
+    patience = int(_os.environ.get("FFS_CMA_PATIENCE", "30"))
     stalled = torch.zeros(T, dtype=torch.long, device=device)
     prev_best = torch.full((T,), -float("inf"), device=device)
 
