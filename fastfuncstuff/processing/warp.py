@@ -237,6 +237,16 @@ class QwarpConfig:
     start_level: int = 0
     """Starting level (0 = global)."""
 
+    start_patch: int = 0
+    """Start the ladder at the first level whose patch is this wide (voxels), or 0.
+
+    A ladder index is the wrong unit for a caller who knows the scale they want to
+    work at: the level that lands on a 9-voxel patch depends on the autobox width
+    and the shrink factor, so asking for "level 10" is asking for an answer to a
+    calculation this function is already doing. Callers resuming a fit that has
+    already solved the coarse deformation -- the optiwarp hand-off above all --
+    want a patch size. Overrides :attr:`start_level` when set."""
+
     warp_flags: int = 0
     """Bit flags: 1=no-x-disp, 2=no-y-disp, 4=no-z-disp."""
 
@@ -1237,6 +1247,15 @@ def _warpomatic(
 
     levdone = False
     lev_start = max(1, config.start_level)
+    if config.start_patch > 0:
+        # Patch width shrinks geometrically (xwid0 * shrink**lev), so solve for the
+        # first level at or below the requested width instead of making the caller
+        # invert it against an autobox size they cannot see.
+        w0 = max(xwid0, ywid0, zwid0)
+        lev_p = 1
+        while lev_p < config.max_level and int(w0 * config.shrink**lev_p) > config.start_patch:
+            lev_p += 1
+        lev_start = lev_p
 
     for lev in range(lev_start, config.max_level + 1):
         if levdone:
