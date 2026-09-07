@@ -1,18 +1,20 @@
-"""Nonlinear anat-to-MNI benchmark: 3dQwarp vs ffs_optiwarp.
+"""Nonlinear anat-to-MNI: ffs_optiwarp against the align stage's references.
 
-The *align* stage compares whole pipelines (sswarper2 against
-ffs_allineate + ffs_qwarp), so its timing mixes skull-stripping and the
-affine step in with the nonlinear warp. This stage isolates the nonlinear
-step: both tools start from the SAME affine-aligned, skull-stripped
-anatomical that align already produced, and both warp it to the same MNI
-template. What differs is only the deformation engine -- AFNI's patch
-optimizer versus the optical-flow solver -- so the times are comparable
-and the correlation between the two outputs is a like-for-like agreement
-measure.
+The *align* stage warps the affine-aligned, skull-stripped anatomical to
+MNI with ffs_qwarp and scores it against AFNI's sswarper anatQQ. This
+stage puts the optical-flow engine on exactly that footing: same affine
+input, same template, same reference. So no reference tool runs here --
+anatQQ already exists, and re-running 3dQwarp on our own affine input
+would cost tens of minutes to produce a second copy of a comparison we
+already have.
 
-That also makes this the stage to run with ``-device cpu``: optical flow
-is a handful of convolutions and gathers per iteration, so unlike qwarp's
-patch search it has a real chance of staying respectable without a GPU.
+That leaves two numbers worth reading: agreement with anatQQ, directly
+comparable to what align reports for qwarp, and agreement with anatFFS,
+which is the two FFS engines head to head on identical input.
+
+It is also the stage worth running with ``-device cpu``. Optical flow is
+convolutions and gathers per iteration rather than a patch search, so it
+has a real chance of staying respectable without a GPU.
 """
 
 from __future__ import annotations
@@ -21,19 +23,16 @@ from pathlib import Path
 
 from ..runner import BenchmarkContext, run_timed
 from ..validation import compare_volumes
-from .align import _afni_anat, _afni_template, _ffs_anat, _subid
+from .align import _afni_anat, _afni_template, _subid
 
 name = "optiwarp"
-description = "Nonlinear anat-to-MNI (3dQwarp vs ffs_optiwarp)"
-# align produces the affine-aligned anatSS both engines consume, plus the
-# sswarper anatQQ that validate() uses as the third reference point.
+description = "Nonlinear anat-to-MNI (ffs_optiwarp vs sswarper/ffs_qwarp)"
+# align produces the affine-aligned anatSS this consumes, the sswarper anatQQ
+# it is scored against, and the ffs_qwarp anatFFS it is compared to.
 requires = ["align"]
 
 THRESHOLDS = {
-    # Same input, same target, different deformation engines. Held to a
-    # tighter bar than align's 0.80 because the affine step -- the largest
-    # source of disagreement there -- is shared here.
-    "optiwarp_vs_qwarp_r": 0.85,
+    # Same bar align holds ffs_qwarp to, for the same comparison.
     "optiwarp_vs_sswarper_r": 0.80,
 }
 
@@ -41,9 +40,6 @@ DEFAULTS = {
     "type": "MNI_T1",  # tuned preset (tunespec.PRESETS)
     "metric": "lpa",  # the tool default (cc) folds on same-modality data
     "extra_args": "",
-    "ref_minpatch": 11,
-    "ref_cost": "lpa",
-    "ref_extra_args": "",
 }
 
 
@@ -52,7 +48,7 @@ def _params(ctx: BenchmarkContext) -> dict:
 
 
 def _affine_dir(ctx: BenchmarkContext) -> Path:
-    """The align stage's output dir holding the affine-aligned anatSS.
+    """The align stage's output dir: affine-aligned anatSS plus anatFFS.
 
     Prefers this run's device-tagged dir, but falls back to the untagged one:
     a CPU run of this stage should be able to reuse a GPU align's affine
@@ -67,20 +63,13 @@ def _affine_dir(ctx: BenchmarkContext) -> Path:
     return tagged
 
 
-def _affine_tag(ctx: BenchmarkContext) -> str:
-    """Tag of the dir the affine input actually came from, for output naming."""
-    return _affine_dir(ctx).name[len("ffs_warper") :]
-
-
 def _affine_source(ctx: BenchmarkContext) -> Path:
     return _affine_dir(ctx) / f"al_ffs_anatSS.{_subid(ctx)}.nii"
 
 
-def _qwarp_ref(ctx: BenchmarkContext) -> Path:
-    # Named for the affine input it consumed, not for this run's device: the
-    # reference is CPU AFNI either way, and re-running it per device would
-    # burn minutes to reproduce the same file.
-    return ctx.processing_dir / f"afni_qwarp_anat{_affine_tag(ctx)}.{_subid(ctx)}.nii.gz"
+def _qwarp_anat(ctx: BenchmarkContext) -> Path:
+    """align's ffs_qwarp result, from whichever dir the affine input came from."""
+    return _affine_dir(ctx) / f"anatFFS.{_subid(ctx)}.nii.gz"
 
 
 def _optiwarp_out(ctx: BenchmarkContext) -> Path:
@@ -88,8 +77,8 @@ def _optiwarp_out(ctx: BenchmarkContext) -> Path:
 
 
 def validation_inputs(ctx: BenchmarkContext) -> list[Path]:
-    """Files validate() reads. anatFFS is optional (informational only)."""
-    return [_afni_anat(ctx), _qwarp_ref(ctx), _optiwarp_out(ctx)]
+    """Files validate() reads. anatFFS is reported when present, never required."""
+    return [_afni_anat(ctx), _optiwarp_out(ctx)]
 
 
 def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
@@ -102,30 +91,8 @@ def check_prerequisites(ctx: BenchmarkContext) -> list[str]:
     return missing
 
 
-def run_ref(ctx: BenchmarkContext) -> float:
-    """3dQwarp from the affine-aligned anat to the MNI template."""
-    out = _qwarp_ref(ctx)
-    if out.exists() and not ctx.force_ref:
-        ctx.note_items("ref", 0, 1)
-        return 0.0
-
-    p = _params(ctx)
-    elapsed, _ = run_timed(
-        f"3dQwarp -overwrite "
-        f"-base {_afni_template()} "
-        f"-source {_affine_source(ctx)} "
-        f"-prefix {out} "
-        f"-minpatch {p['ref_minpatch']} -{p['ref_cost']} "
-        f"{p['ref_extra_args']}",
-        label="3dQwarp anat-to-MNI",
-        cwd=ctx.processing_dir,
-    )
-    ctx.note_items("ref", 1, 1)
-    return elapsed
-
-
 def run_ffs(ctx: BenchmarkContext) -> float:
-    """ffs_optiwarp from the same affine-aligned anat to the same template."""
+    """ffs_optiwarp from align's affine-aligned anat to the MNI template."""
     out = _optiwarp_out(ctx)
     out.parent.mkdir(exist_ok=True)
     if out.exists() and not ctx.force_ffs:
@@ -149,29 +116,24 @@ def run_ffs(ctx: BenchmarkContext) -> float:
 
 
 def validate(ctx: BenchmarkContext) -> dict:
-    """Correlate the optical-flow warp against both AFNI reference points."""
-    vs_qwarp = compare_volumes(_qwarp_ref(ctx), _optiwarp_out(ctx))
+    """Score the optical-flow warp against anatQQ, and against anatFFS."""
     vs_ssw = compare_volumes(_afni_anat(ctx), _optiwarp_out(ctx))
 
     result = {
-        "r": vs_qwarp["r"],  # headline: the like-for-like comparison
-        "optiwarp_vs_qwarp_r": vs_qwarp["r"],
+        "r": vs_ssw["r"],  # headline: the same comparison align reports
         "optiwarp_vs_sswarper_r": vs_ssw["r"],
-        "n_voxels": vs_qwarp["n_voxels"],
+        "n_voxels": vs_ssw["n_voxels"],
     }
-    summary = f"optiwarp vs 3dQwarp r={vs_qwarp['r']:.4f}, vs anatQQ r={vs_ssw['r']:.4f}"
+    summary = f"anatQQ vs anatOPTI r={vs_ssw['r']:.4f}"
 
-    # The ffs_qwarp anat is align's output, not ours -- report the three-way
-    # agreement when it happens to exist, but never gate on it.
-    ffs_qwarp = _ffs_anat(ctx)
-    if ffs_qwarp.exists():
-        vs_ffs = compare_volumes(ffs_qwarp, _optiwarp_out(ctx))
-        result["optiwarp_vs_ffs_qwarp_r"] = vs_ffs["r"]
-        summary += f", vs anatFFS r={vs_ffs['r']:.4f}"
+    # anatFFS is align's output, not ours -- report the head-to-head when it
+    # exists, but never gate on it.
+    qwarp_anat = _qwarp_anat(ctx)
+    if qwarp_anat.exists():
+        vs_qwarp = compare_volumes(qwarp_anat, _optiwarp_out(ctx))
+        result["optiwarp_vs_ffs_qwarp_r"] = vs_qwarp["r"]
+        summary += f", vs anatFFS r={vs_qwarp['r']:.4f}"
 
-    result["passed"] = (
-        vs_qwarp["r"] >= THRESHOLDS["optiwarp_vs_qwarp_r"]
-        and vs_ssw["r"] >= THRESHOLDS["optiwarp_vs_sswarper_r"]
-    )
+    result["passed"] = vs_ssw["r"] >= THRESHOLDS["optiwarp_vs_sswarper_r"]
     result["summary"] = summary
     return result
