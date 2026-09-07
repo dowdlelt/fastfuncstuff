@@ -12,12 +12,51 @@ from fastfuncstuff.processing.optiwarp import (
     NO_X_DISP,
     NO_Z_DISP,
     OptiwarpConfig,
+    _convergence_value,
     _exp_field,
+    _flow_lk,
     _grad3,
     jacobian_determinant,
     optiwarp,
     prep_intensity,
 )
+
+
+@pytest.mark.parametrize("intensity_scale", [1e-3, 1.0, 100.0])
+def test_lk_matches_weighted_least_squares(intensity_scale):
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    rng = torch.Generator().manual_seed(42)
+    grad = tuple(torch.randn(9, 9, 9, generator=rng) * intensity_scale for _ in range(3))
+    weight = torch.rand(9, 9, 9, generator=rng)
+    diff = -0.2 * grad[0] + 0.1 * grad[1]
+
+    def box(v):
+        return _separable_smooth_3d(v * weight, 2.0, kernel_type="box")
+
+    matrix = torch.stack([box(a * b) for a in grad for b in grad], -1).reshape(9, 9, 9, 3, 3)
+    lam = 0.01 * matrix.diagonal(dim1=-2, dim2=-1).mean()
+    matrix = matrix + lam * torch.eye(3)
+    rhs = torch.stack([-box(g * diff) for g in grad], -1)
+    expected = torch.linalg.solve(matrix, rhs.unsqueeze(-1)).squeeze(-1)
+    actual = torch.stack(_flow_lk(diff, torch.zeros_like(diff), grad, 2, 0.01, weight), -1)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_flow_convergence_distinguishes_small_monotonic_improvements():
+    fast = [-0.5 - i * 1e-3 for i in range(10)]
+    slow = [-0.5 - i * 1e-9 for i in range(10)]
+    assert _convergence_value(fast, 10, relative_to_initial=True) > 1e-6
+    assert _convergence_value(slow, 10, relative_to_initial=True) < 1e-6
+    assert _convergence_value(
+        [v * 100 for v in fast], 10, relative_to_initial=True
+    ) == pytest.approx(_convergence_value(fast, 10, relative_to_initial=True))
+
+
+def test_lk_flat_image_has_zero_flow():
+    flat = torch.zeros(9, 9, 9)
+    result = _flow_lk(flat, flat, (flat, flat, flat), 2, 0.01)
+    assert all(torch.isfinite(v).all() and torch.count_nonzero(v) == 0 for v in result)
 
 
 def _blobs(shape=(32, 40, 40), seed=0) -> torch.Tensor:

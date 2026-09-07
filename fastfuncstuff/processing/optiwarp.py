@@ -261,7 +261,8 @@ class OptiwarpConfig:
     the best-metric field is returned either way, so exhaustion never over-warps."""
 
     convergence_threshold: float = 1e-6
-    """Convergence slope threshold; larger stops sooner."""
+    """Per-iteration cost improvement relative to the initial level cost;
+    larger stops sooner. The normalization stays fixed throughout a level."""
 
     invert_iters: int = 8
     """Fixed-point iterations for displacement-field inversion (the -save_inverse warp
@@ -470,20 +471,27 @@ def _flow_lk(
     diff = warped - fixed
 
     def box(v: Tensor) -> Tensor:
+        if weight is not None:
+            v = v * weight
         return _separable_smooth_3d(v, float(radius), kernel_type="box")
-
-    if weight is not None:
-        gx, gy, gz = gx * weight, gy * weight, gz * weight
 
     a11, a22, a33 = box(gx * gx), box(gy * gy), box(gz * gz)
     a12, a13, a23 = box(gx * gy), box(gx * gz), box(gy * gz)
     b1, b2, b3 = -box(gx * diff), -box(gy * diff), -box(gz * diff)
 
     # Ridge scaled to the typical structure-tensor magnitude, so `reg` is unitless.
-    lam = reg * ((a11 + a22 + a33).mean() / 3.0).clamp(min=_EPS)
+    tiny = torch.finfo(warped.dtype).tiny
+    lam = reg * ((a11 + a22 + a33).mean() / 3.0).clamp(min=tiny)
     a11 = a11 + lam
     a22 = a22 + lam
     a33 = a33 + lam
+
+    # Cofactors cube the matrix scale in the determinant. Normalize the system
+    # first so a low-contrast neighbourhood is not mistaken for a singular one.
+    scale = (a11 + a22 + a33).clamp(min=tiny)
+    a11, a22, a33 = a11 / scale, a22 / scale, a33 / scale
+    a12, a13, a23 = a12 / scale, a13 / scale, a23 / scale
+    b1, b2, b3 = b1 / scale, b2 / scale, b3 / scale
 
     c11 = a22 * a33 - a23 * a23
     c12 = a13 * a23 - a12 * a33
@@ -492,7 +500,7 @@ def _flow_lk(
     c23 = a12 * a13 - a11 * a23
     c33 = a11 * a22 - a12 * a12
     det = a11 * c11 + a12 * c12 + a13 * c13
-    inv_det = 1.0 / det.clamp(min=_EPS)
+    inv_det = 1.0 / det.clamp(min=tiny)
 
     dx = (c11 * b1 + c12 * b2 + c13 * b3) * inv_det
     dy = (c12 * b1 + c22 * b2 + c23 * b3) * inv_det
@@ -654,7 +662,10 @@ def _optiflow_level(
                 bar.set_postfix(cost=f"{cost_val:.5f}", best=f"{best_cost:.5f}")
 
             if window > 0 and len(costs) >= window:
-                if _convergence_value(costs, window) < cfg.convergence_threshold:
+                if (
+                    _convergence_value(costs, window, relative_to_initial=True)
+                    < cfg.convergence_threshold
+                ):
                     break
 
             ux, uy, uz = _flow_update(warped, fixed, fixed_grad, cfg, weight)

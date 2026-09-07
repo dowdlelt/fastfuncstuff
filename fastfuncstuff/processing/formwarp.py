@@ -686,21 +686,30 @@ def _additive_step_with_fold_guard(
     return best_cand, best_jac, damped
 
 
-def _convergence_value(costs: list[float], window: int) -> float:
+def _convergence_value(
+    costs: list[float], window: int, *, relative_to_initial: bool = False
+) -> float:
     """Trailing-window convergence measure (ANTs WindowConvergenceMonitoringFunction).
 
     Fits a line to the last ``window`` cost values (range-normalized to [0,1] so the
     measure is metric-scale-free) and returns the downward slope: positive while the
     cost is still falling, ~0 or negative once it flattens, rises, or oscillates.
     A level is "converged" when this drops below the convergence threshold.
+
+    ``relative_to_initial`` uses a fixed cost scale instead of the trailing range.
+    Optical flow can improve monotonically by arbitrarily small amounts; normalizing
+    each window's range would keep its slope large even after useful progress ends.
     """
     w = costs[-window:]
     n = len(w)
+    if n < 2:
+        return 0.0
     y = torch.tensor(w, dtype=torch.float64)
     rng = (y.max() - y.min()).item()
     if rng < 1e-12:
         return 0.0  # perfectly flat -> converged
-    y = (y - y.min()) / rng
+    scale = max(abs(costs[0]), 1e-12) if relative_to_initial else rng
+    y = (y - y.min()) / scale
     x = torch.arange(n, dtype=torch.float64)
     x = x - x.mean()
     slope = (x * (y - y.mean())).sum() / (x * x).sum()
