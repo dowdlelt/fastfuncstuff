@@ -163,6 +163,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         # Pane and graph toggles, paired the way AFNI's image/graph buttons are.
         view_bar = QtWidgets.QToolBar("views")
+        self._view_bar = view_bar
         view_bar.setMovable(False)
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, view_bar)
@@ -188,6 +189,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.time_label = QtWidgets.QLabel("")
         view_bar.addWidget(self.time_label)
+
+        # The panel toggle is appended in _build_dock, once there is a dock to
+        # toggle. It lives here with the other view switches rather than in a
+        # menu, because a panel you cannot get back is the same bug as a pane
+        # you cannot get back.
 
     @staticmethod
     def _head(text: str) -> QtWidgets.QLabel:
@@ -375,6 +381,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
         dock.setWidget(panel)
         dock.setMinimumWidth(268)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
+        self.dock = dock
+
+        # toggleViewAction rather than a hand-rolled show/hide: Qt keeps its
+        # checked state in sync with the dock however it was closed, including
+        # the X on the dock's own title bar.
+        self._view_bar.addSeparator()
+        self.panel_button = QtWidgets.QPushButton("Panel")
+        self.panel_button.setCheckable(True)
+        self.panel_button.setChecked(True)
+        self.panel_button.setToolTip("Show or hide the layers panel (p)")
+        action = dock.toggleViewAction()
+        self.panel_button.toggled.connect(
+            lambda on: action.trigger() if on != dock.isVisible() else None
+        )
+        action.toggled.connect(self.panel_button.setChecked)
+        self._view_bar.addWidget(self.panel_button)
 
     def _mode_param_changed(self, name: str, value: str) -> None:
         self.refresh(self.session.do(SetModeParam(name, value)))
@@ -406,6 +428,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ("2", self._pane_buttons[Plane.SAGITTAL].toggle),
             ("3", self._pane_buttons[Plane.CORONAL].toggle),
             ("g", self._graph_buttons[Plane.AXIAL].toggle),
+            ("p", self.panel_button.toggle),
             ("Ctrl+O", self._read_dialog),
             ("Ctrl+S", self._save_script_dialog),
         ]
