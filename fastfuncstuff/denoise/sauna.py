@@ -320,6 +320,154 @@ def _construct_3d_legendre_basis(
     return torch.stack(columns, dim=1)  # (N, n_terms)
 
 
+# The masked normal equations below never touch the (n_voxels, n_terms) design.
+# Above this many elements the pair-moment tensor stops being the cheap way to
+# hold them -- (max_deg+1)**6 grows fast -- and the slice accumulation, which is
+# only ever bounded by one x-slice, takes over.
+_PAIR_MOMENT_MAX_ELEMENTS = 1 << 23
+
+
+def _legendre_pair_basis(basis: torch.Tensor) -> torch.Tensor:
+    """Column-wise products ``basis[:, i] * basis[:, i']`` as (n, (d+1)**2)."""
+    n_pts, n_order = basis.shape
+    return (basis.unsqueeze(2) * basis.unsqueeze(1)).reshape(n_pts, n_order * n_order)
+
+
+def _separable_weighted_moments(
+    weight: torch.Tensor,
+    bx: torch.Tensor,
+    by: torch.Tensor,
+    bz: torch.Tensor,
+) -> torch.Tensor:
+    """``Σ_xyz weight[x,y,z]·bx[x,a]·by[y,b]·bz[z,c]`` -> (A, B, C).
+
+    Contracts one axis at a time, so the volume is read once against B columns
+    rather than against every (a, b, c) combination. One x-slice at a time, the
+    same blocking the dense accumulation used, but the per-slice temporary is
+    (ny, C) instead of (ny*nz, n_terms).
+    """
+    nx = weight.shape[0]
+    per_slice = torch.empty(nx, by.shape[1], bz.shape[1], device=weight.device, dtype=weight.dtype)
+    for xi in range(nx):
+        per_slice[xi] = by.transpose(0, 1) @ (weight[xi] @ bz)
+    return torch.einsum("xa,xbc->abc", bx, per_slice)
+
+
+def _masked_legendre_normal_equations(
+    mask_f: torch.Tensor,
+    target: torch.Tensor,
+    px: torch.Tensor,
+    py: torch.Tensor,
+    pz: torch.Tensor,
+    terms: list[tuple[int, int, int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """XtX and Xty for the masked 3-D Legendre design, without building it.
+
+    The design is a tensor product -- column (i,j,k) is ``Px_i·Py_j·Pz_k`` -- so
+
+        XtX[(ijk),(i'j'k')] = Σ_xyz m · (Px_i Px_i')(Py_j Py_j')(Pz_k Pz_k')
+
+    is one entry of the mask's moment tensor against the *pairwise* 1-D bases,
+    and Xty is the same thing against the plain bases with the target as the
+    weight. Both are separable contractions: ~(d+1)**2 flops per voxel instead
+    of the n_terms**2 the mask-weighted ``XtX.addmm_(Xw.T, Xw)`` spent, which is
+    148x at degree 8 and the single largest CPU cost in the whole benchmark.
+
+    The old accumulation also multiplied a design that was *zeroed* outside the
+    mask rather than compacted, so most of those flops were on zeros.
+
+    ``target`` must already be zero outside the mask (both callers build it that
+    way), because it carries the mask for the Xty half.
+    """
+    n_terms = len(terms)
+    n_order = px.shape[1]
+    device = px.device
+
+    if n_order**6 > _PAIR_MOMENT_MAX_ELEMENTS:
+        # Degrees this high are not reachable from the CLI; keep the O(1)-memory
+        # accumulation rather than a moment tensor bigger than the volume.
+        return _masked_legendre_normal_equations_dense(mask_f, target, px, py, pz, terms)
+
+    gram = _separable_weighted_moments(
+        mask_f, _legendre_pair_basis(px), _legendre_pair_basis(py), _legendre_pair_basis(pz)
+    )
+    moments = _separable_weighted_moments(target, px, py, pz)
+
+    idx = torch.tensor(terms, device=device, dtype=torch.long)  # (n_terms, 3)
+    i_idx, j_idx, k_idx = idx[:, 0], idx[:, 1], idx[:, 2]
+    pair = [a.unsqueeze(1) * n_order + a.unsqueeze(0) for a in (i_idx, j_idx, k_idx)]
+    xtx = gram[pair[0], pair[1], pair[2]]
+    xty = moments[i_idx, j_idx, k_idx]
+    assert xtx.shape == (n_terms, n_terms)
+    return xtx, xty
+
+
+def _masked_legendre_normal_equations_dense(
+    mask_f: torch.Tensor,
+    target: torch.Tensor,
+    px: torch.Tensor,
+    py: torch.Tensor,
+    pz: torch.Tensor,
+    terms: list[tuple[int, int, int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Slice-blocked accumulation of the same two quantities.
+
+    Materialises one (ny*nz, n_terms) block of the design at a time. Only worth
+    it when the pair-moment tensor would be larger than that block.
+    """
+    nx, ny, nz = mask_f.shape
+    device = px.device
+    n_terms = len(terms)
+    i_idx = torch.tensor([t[0] for t in terms], device=device)
+    j_idx = torch.tensor([t[1] for t in terms], device=device)
+    k_idx = torch.tensor([t[2] for t in terms], device=device)
+    yz_basis = (py[:, j_idx].unsqueeze(1) * pz[:, k_idx].unsqueeze(0)).reshape(ny * nz, n_terms)
+
+    xtx = torch.zeros(n_terms, n_terms, device=device, dtype=torch.float32)
+    xty = torch.zeros(n_terms, device=device, dtype=torch.float32)
+    for xi in range(nx):
+        weighted = yz_basis * px[xi, i_idx].unsqueeze(0) * mask_f[xi].reshape(-1, 1)
+        xtx.addmm_(weighted.T, weighted)
+        xty.add_(weighted.T @ target[xi].reshape(-1))
+    del yz_basis
+    return xtx, xty
+
+
+def _eval_legendre_poly(
+    coeff: torch.Tensor,
+    px: torch.Tensor,
+    py: torch.Tensor,
+    pz: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate ``Σ_ijk coeff[i,j,k,c]·Px_i·Py_j·Pz_k`` -> (nx, ny, nz, n_cand).
+
+    The same separability as the fit: contracting the coefficient tensor axis by
+    axis costs ~(d+1)·n_cand per voxel instead of the n_terms·n_cand a design
+    matmul spends.
+    """
+    nx, ny, nz = px.shape[0], py.shape[0], pz.shape[0]
+    out = torch.empty(nx, ny, nz, coeff.shape[-1], device=px.device, dtype=px.dtype)
+    for xi in range(nx):
+        gyz = torch.tensordot(px[xi], coeff, dims=([0], [0]))  # (j, k, cand)
+        gy = torch.tensordot(py, gyz, dims=([1], [0]))  # (y, k, cand)
+        out[xi] = torch.tensordot(gy, pz, dims=([1], [1])).permute(0, 2, 1)
+    return out
+
+
+def _terms_to_coeff_tensor(
+    beta: torch.Tensor,
+    terms: list[tuple[int, int, int]],
+    n_order: int,
+) -> torch.Tensor:
+    """Scatter (n_terms, n_cand) coefficients into a dense (d+1)**3 x n_cand cube."""
+    idx = torch.tensor(terms, device=beta.device, dtype=torch.long)
+    coeff = torch.zeros(
+        n_order, n_order, n_order, beta.shape[1], device=beta.device, dtype=beta.dtype
+    )
+    coeff[idx[:, 0], idx[:, 1], idx[:, 2]] = beta
+    return coeff
+
+
 def _fit_polynomial_gfactor(
     noise_vols: torch.Tensor,
     degree: int,
@@ -384,35 +532,12 @@ def _fit_polynomial_gfactor(
     Py = _legendre_1d(ny, degree, dev)  # (ny, d+1)
     Pz = _legendre_1d(nz, degree, dev)  # (nz, d+1)
 
-    # Pre-compute the YZ part of each basis term: Py[:,j] ⊗ Pz[:,k]
-    # Shape: (ny*nz, n_terms)  —  this is the big allocation (~71 MB for 230×58×1330)
-    j_idx = torch.tensor([t[1] for t in terms], device=dev)
-    k_idx = torch.tensor([t[2] for t in terms], device=dev)
-    # (ny, n_terms) * (nz, n_terms) via broadcast → (ny, nz, n_terms) → (ny*nz, n_terms)
-    yz_basis = (Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)).reshape(ny * nz, n_terms)
-
-    i_idx = torch.tensor([t[0] for t in terms], device=dev)
-
     # ------------------------------------------------------------------
-    # Accumulate normal equations X^T X and X^T y, one x-slice at a time
+    # Normal equations X^T X and X^T y as separable moments of the mask.
     # Float32 accumulation — Legendre values are O(1), sums are O(n_valid),
-    # well within float32 precision.  Consumer GPUs do FP32 matmul ~60×
-    # faster than FP64.
+    # well within float32 precision.
     # ------------------------------------------------------------------
-    XtX = torch.zeros(n_terms, n_terms, device=dev, dtype=torch.float32)
-    Xty = torch.zeros(n_terms, device=dev, dtype=torch.float32)
-
-    for xi in range(nx):
-        # Mask-weighted approach: multiply by 0/1 mask instead of boolean
-        # indexing.  Avoids copies and keeps tensors at fixed shape for
-        # optimal cuBLAS scheduling.
-        mask_f = valid_3d[xi].reshape(-1, 1).float()  # (ny*nz, 1)
-        px_vals = Px[xi, i_idx]  # (n_terms,)
-        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f  # (ny*nz, n_terms)
-        yw = log_std[xi].reshape(-1) * mask_f.squeeze()  # (ny*nz,)
-
-        XtX.addmm_(Xw.T, Xw)
-        Xty.add_(Xw.T @ yw)
+    XtX, Xty = _masked_legendre_normal_equations(valid_3d.to(Px.dtype), log_std, Px, Py, Pz, terms)
 
     # Promote to float64 only for the tiny solve (condition number). MPS has no
     # float64, so the tiny system is solved on CPU and the result returns to dev.
@@ -424,15 +549,10 @@ def _fit_polynomial_gfactor(
     beta = torch.linalg.solve(XtX_64, Xty_64).to(device=dev, dtype=torch.float32)  # (n_terms,)
 
     # ------------------------------------------------------------------
-    # Evaluate fitted = exp(X @ beta) one x-slice at a time
+    # Evaluate fitted = exp(poly), contracting the coefficient cube axis by axis
     # ------------------------------------------------------------------
-    fitted = torch.empty(nx, ny, nz, device=dev)
-    for xi in range(nx):
-        px_vals = Px[xi, i_idx]
-        X_slice = yz_basis * px_vals.unsqueeze(0)  # (ny*nz, n_terms)
-        fitted[xi] = torch.exp((X_slice @ beta).reshape(ny, nz))
-
-    del yz_basis  # free the biggest temporary
+    coeff = _terms_to_coeff_tensor(beta.unsqueeze(1), terms, Px.shape[1])
+    fitted = torch.exp(_eval_legendre_poly(coeff, Px, Py, Pz)[..., 0])
 
     # Normalize to median=1 using valid-voxel median
     median_noise = float(torch.median(fitted[valid_3d]).item())
@@ -562,28 +682,11 @@ def _poly_gfactor_multi_degree(
     Py = _legendre_1d(ny, max_deg, dev)
     Pz = _legendre_1d(nz, max_deg, dev)
 
-    # YZ basis at max degree: (ny*nz, n_terms_max)
-    j_idx = torch.tensor([t[1] for t in terms], device=dev)
-    k_idx = torch.tensor([t[2] for t in terms], device=dev)
-    yz_basis = (Py[:, j_idx].unsqueeze(1) * Pz[:, k_idx].unsqueeze(0)).reshape(ny * nz, n_terms_max)
-
-    i_idx = torch.tensor([t[0] for t in terms], device=dev)
-
     # ------------------------------------------------------------------
-    # Pass 1: accumulate normal equations at max degree (float32)
-    # Mask-weighted: multiply by 0/1 mask instead of boolean indexing.
-    # Float32 matmul is ~60× faster than float64 on consumer GPUs.
+    # Pass 1: normal equations at max degree, as separable moments of the mask
+    # (float32 — Legendre values are O(1) and the sums are O(n_valid))
     # ------------------------------------------------------------------
-    XtX = torch.zeros(n_terms_max, n_terms_max, device=dev, dtype=torch.float32)
-    Xty = torch.zeros(n_terms_max, device=dev, dtype=torch.float32)
-
-    for xi in range(nx):
-        mask_f = valid_3d[xi].reshape(-1, 1).float()  # (ny*nz, 1)
-        px_vals = Px[xi, i_idx]
-        Xw = (yz_basis * px_vals.unsqueeze(0)) * mask_f
-        yw = log_std[xi].reshape(-1) * mask_f.squeeze()
-        XtX.addmm_(Xw.T, Xw)
-        Xty.add_(Xw.T @ yw)
+    XtX, Xty = _masked_legendre_normal_equations(valid_3d.to(Px.dtype), log_std, Px, Py, Pz, terms)
 
     # Promote to float64 only for the tiny solve. MPS has no float64, so the
     # tiny sub-systems are solved on CPU (ld) and results return to dev.
@@ -611,14 +714,8 @@ def _poly_gfactor_multi_degree(
     # ------------------------------------------------------------------
     # Pass 2: evaluate ALL candidates in one batched pass
     # ------------------------------------------------------------------
-    fitted_all = torch.empty(nx, ny, nz, n_cand, device=dev)
-    for xi in range(nx):
-        px_vals = Px[xi, i_idx]
-        X_slice = yz_basis * px_vals.unsqueeze(0)  # (ny*nz, n_terms_max)
-        vals = torch.exp((X_slice @ betas_padded).float())  # (ny*nz, n_cand)
-        fitted_all[xi] = vals.reshape(ny, nz, n_cand)
-
-    del yz_basis
+    coeff = _terms_to_coeff_tensor(betas_padded, terms, Px.shape[1])
+    fitted_all = torch.exp(_eval_legendre_poly(coeff, Px, Py, Pz))
 
     # Normalize each candidate → (gfactor, global_sigma)
     results: list[tuple[torch.Tensor, float]] = []

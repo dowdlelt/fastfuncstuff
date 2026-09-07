@@ -15,12 +15,19 @@ from fastfuncstuff.denoise.sauna import (
     _c4_bias_correction,
     _calibrate_sigma,
     _construct_3d_legendre_basis,
+    _enumerate_poly_terms,
     _estimate_gfactor_from_noise,
+    _eval_legendre_poly,
     _fit_polynomial_gfactor,
     _gaussian_smooth_3d,
+    _legendre_1d,
     _loo_optimize_gfactor_degree,
     _loo_optimize_gfactor_fwhm,
+    _masked_legendre_normal_equations,
+    _masked_legendre_normal_equations_dense,
     _patch_variance_cov,
+    _poly_gfactor_multi_degree,
+    _terms_to_coeff_tensor,
     run_sauna,
 )
 
@@ -696,3 +703,84 @@ def test_run_sauna_auto_method(tmp_path):
     with open(out.metadata_file) as f:
         meta = json.load(f)
     assert meta["config"]["gfactor_method_used"] in ("gaussian", "polynomial")
+
+
+# ---------------------------------------------------------------------------
+# Separable g-factor normal equations
+#
+# The masked design is never built, so nothing downstream would notice if the
+# moment contraction indexed a pair wrong -- the fit would just be a different,
+# still-plausible smooth field. These pin it against a design matrix built
+# column by column from the definition.
+# ---------------------------------------------------------------------------
+
+
+def _explicit_design(px, py, pz, terms):
+    cols = [
+        (px[:, i, None, None] * py[None, :, j, None] * pz[None, None, :, k]).reshape(-1)
+        for i, j, k in terms
+    ]
+    return torch.stack(cols, dim=1)
+
+
+@pytest.mark.parametrize("degree", [1, 4, 8])
+def test_masked_normal_equations_match_an_explicit_design(degree):
+    torch.manual_seed(degree)
+    nx, ny, nz = 9, 11, 13
+    terms = _enumerate_poly_terms(degree)
+    px, py, pz = (_legendre_1d(n, degree) for n in (nx, ny, nz))
+    mask = (torch.rand(nx, ny, nz) > 0.4).float()
+    target = torch.randn(nx, ny, nz) * mask
+
+    design = _explicit_design(px, py, pz, terms) * mask.reshape(-1, 1)
+    want_xtx = design.T @ design
+    want_xty = design.T @ target.reshape(-1)
+
+    xtx, xty = _masked_legendre_normal_equations(mask, target, px, py, pz, terms)
+    assert torch.allclose(xtx, want_xtx, rtol=1e-4, atol=1e-4 * want_xtx.abs().max())
+    assert torch.allclose(xty, want_xty, rtol=1e-4, atol=1e-4 * want_xty.abs().max())
+
+
+def test_both_normal_equation_strategies_agree():
+    """High degrees fall back to slice accumulation; it must be the same fit."""
+    torch.manual_seed(0)
+    degree = 5
+    terms = _enumerate_poly_terms(degree)
+    px, py, pz = (_legendre_1d(n, degree) for n in (7, 9, 8))
+    mask = (torch.rand(7, 9, 8) > 0.3).float()
+    target = torch.randn(7, 9, 8) * mask
+
+    moment = _masked_legendre_normal_equations(mask, target, px, py, pz, terms)
+    dense = _masked_legendre_normal_equations_dense(mask, target, px, py, pz, terms)
+    for got, want in zip(moment, dense, strict=True):
+        assert torch.allclose(got, want, rtol=1e-4, atol=1e-4 * want.abs().max())
+
+
+def test_separable_evaluation_matches_the_design_matmul():
+    torch.manual_seed(3)
+    degree, n_cand = 6, 4
+    nx, ny, nz = 8, 10, 9
+    terms = _enumerate_poly_terms(degree)
+    px, py, pz = (_legendre_1d(n, degree) for n in (nx, ny, nz))
+    beta = torch.randn(len(terms), n_cand)
+
+    got = _eval_legendre_poly(_terms_to_coeff_tensor(beta, terms, degree + 1), px, py, pz)
+    want = (_explicit_design(px, py, pz, terms) @ beta).reshape(nx, ny, nz, n_cand)
+    assert got.shape == want.shape
+    assert torch.allclose(got, want, rtol=1e-4, atol=1e-4 * want.abs().max())
+
+
+def test_multi_degree_pass_matches_the_single_degree_fit():
+    """The batched candidate pass shares the max-degree moments; a mis-scattered
+    sub-system would only show up against the standalone fit."""
+    torch.manual_seed(7)
+    noise = torch.randn(10, 12, 9, 6)
+    degrees = (1, 3, 5)
+    # _fit_polynomial_gfactor bias-corrects the std it derives; the multi-degree
+    # pass takes the corrected map from its caller.
+    std_map = torch.std(noise, dim=-1) / _c4_bias_correction(noise.shape[-1])
+    batched = _poly_gfactor_multi_degree(std_map, degrees)
+    for (gf, sigma), degree in zip(batched, degrees, strict=True):
+        solo_gf, solo_sigma = _fit_polynomial_gfactor(noise, degree)
+        assert sigma == pytest.approx(solo_sigma, rel=1e-3)
+        assert torch.allclose(gf, solo_gf, rtol=1e-3, atol=1e-3)
