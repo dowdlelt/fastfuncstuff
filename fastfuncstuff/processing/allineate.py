@@ -1744,6 +1744,22 @@ def _refine_cmaes_batched(
     alive = torch.ones(T, dtype=torch.bool, device=device)
     n_eval = 0
 
+    # Stagnation stop. sigma alone does not end this search: once the samples
+    # are within the cost's own reproducibility (~1e-4 relative), selection is
+    # sorting noise, and CSA answers a random-looking evolution path by holding
+    # sigma up rather than shrinking it -- measured on the benchmark anat-to-MNI
+    # pair, sigma ROSE in 28-44% of generations while the best cost sat frozen.
+    # That stage ran 281 generations; the last improvement worth having was at
+    # 129, and the remaining 54% bought 2.5e-5, a third of the noise floor.
+    #
+    # patience is 3.75x the longest gap between real improvements in the
+    # productive phase of that run (8 generations), and the tolerance is the
+    # rel/abs pair the Adam refiner already uses. Together they give up 9.1e-6
+    # of cost -- an order of magnitude below what the cost can resolve.
+    rel_tol, abs_tol, patience = 1e-4, 1e-6, 30
+    stalled = torch.zeros(T, dtype=torch.long, device=device)
+    prev_best = torch.full((T,), -float("inf"), device=device)
+
     def _evaluate(cand_free: Tensor) -> Tensor:
         """(T, L, n) free-subspace points -> (T, L) costs, in one batched call."""
         L = cand_free.shape[1]
@@ -1811,7 +1827,17 @@ def _refine_cmaes_batched(
         if trace is not None:
             trace.record(gi, n_eval, float(best_c.max()), step_costs=vals, scale=float(sigma.max()))
 
-        alive = alive & (sigma > sigma_min)
+        # -inf on the first generation would make the relative threshold nan,
+        # and `best > nan` is False, which would start the stall counter at 1.
+        thresh = torch.where(
+            torch.isfinite(prev_best),
+            prev_best + torch.clamp(prev_best.abs() * rel_tol, min=abs_tol),
+            torch.full_like(prev_best, -float("inf")),
+        )
+        stalled = torch.where(best_c > thresh, torch.zeros_like(stalled), stalled + 1)
+        prev_best = torch.maximum(prev_best, best_c)
+
+        alive = alive & (sigma > sigma_min) & (stalled < patience)
         if not bool(alive.any()):
             break
         if tqdm is not None and verb >= 1:

@@ -1413,6 +1413,39 @@ class TestDerivativeFreeRefinement:
         np.testing.assert_array_equal(a, b)
         np.testing.assert_array_equal(ca, cb)
 
+    def test_cmaes_stops_when_it_stops_improving(self):
+        """sigma alone never ended this search. Once the samples are inside the
+        cost's own reproducibility, selection sorts noise and CSA holds sigma up
+        instead of shrinking it -- on the benchmark anat-to-MNI pair that left
+        54% of the stage buying a third of the noise floor."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+
+        def flat_cost(matrices):
+            return torch.zeros(matrices.shape[0], device=device)
+
+        with _recording_cost_trace(True) as trace:
+            _refine_cmaes_batched([start], config, bounds, device, flat_cost, verb=0, n_iters=500)
+        # One generation to set the incumbent, then `patience` that cannot beat it.
+        assert len(trace.rows) < 60, f"ran {len(trace.rows)} generations on a flat cost"
+
+    def test_cmaes_is_not_cut_short_while_still_climbing(self):
+        """The stall counter must reset on every real improvement, or a slow but
+        genuine climb gets truncated."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = self._bowl(_normalize(start, bounds) + 0.05, bounds, device)
+
+        with _recording_cost_trace(True) as trace:
+            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=80)
+        best = [r[3] for r in trace.rows]
+        # It either used the whole budget or stopped only after a real plateau.
+        assert len(trace.rows) == 80 or best[-1] - best[-31] < 1e-4 * abs(best[-1]) + 1e-6
+
     def test_cmaes_handles_several_trials_at_once(self):
         """T trials share one batched evaluation; each must keep its own state."""
         device = torch.device("cpu")
