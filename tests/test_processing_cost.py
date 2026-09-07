@@ -1,6 +1,8 @@
 """Tests for processing/cost.py — cost functions for image matching."""
 
+import pytest
 import torch
+import torch.nn.functional as F
 
 from fastfuncstuff.processing.cost import (
     BatchedIncrementalCorrelation,
@@ -8,6 +10,7 @@ from fastfuncstuff.processing.cost import (
     _auto_clip,
     _batched_separable_smooth_3d,
     _box_kernel_1d,
+    _conv1d_along_axis,
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
@@ -187,6 +190,28 @@ class TestSeparableSmooth3D:
         vol = torch.randn(1, 1, 8, 10, 12, device=DEV)
         smoothed = _separable_smooth_3d(vol, 2.0)
         assert smoothed.shape == vol.shape
+
+    @pytest.mark.parametrize("axis", [2, 3, 4])
+    @pytest.mark.parametrize("radius", [1, 4, 9])
+    def test_single_group_pass_matches_the_grouped_conv(self, axis, radius):
+        """The single-group CPU path is a different kernel, not a different blur.
+
+        radius=9 is wider than every extent here: the replicate padding has to
+        hold on both branches, which is what a cropped edge slice looks like.
+        """
+        torch.manual_seed(axis * 10 + radius)
+        vol = torch.randn(1, 1, 7, 9, 8, device=DEV)
+        kernel = _make_kernel_1d("gauss", radius / 2.0, vol.device)
+
+        got = _conv1d_along_axis(vol, kernel, axis, 1)
+        pad = [0, 0, 0, 0, 0, 0]
+        pad[(4 - axis) * 2] = kernel.shape[0] // 2
+        pad[(4 - axis) * 2 + 1] = kernel.shape[0] // 2
+        shape = [1, 1, 1, 1, 1]
+        shape[axis] = kernel.shape[0]
+        want = F.conv3d(F.pad(vol, tuple(pad), mode="replicate"), kernel.reshape(shape))
+        assert got.shape == want.shape
+        torch.testing.assert_close(got, want, atol=1e-5, rtol=1e-4)
 
     def test_multichannel_matches_individual_smoothing(self):
         torch.manual_seed(12)

@@ -186,6 +186,45 @@ def auto_box_radius(n_voxels_target: int = 500) -> int:
     return max(r, 1)
 
 
+def _conv1d_along_axis(vol: Tensor, kernel: Tensor, axis: int, n_groups: int) -> Tensor:
+    """One separable pass: convolve ``vol`` (1, G, D, H, W) along ``axis``.
+
+    Replicate-padded on that axis alone, so a blur radius wider than the extent
+    still applies.
+
+    Two implementations, and which one is right turns on the same thing as the
+    grid_sample lane split: what the CPU kernel has to thread over. A grouped
+    conv3d threads over the groups, so with several it is the fast path and with
+    exactly one it leaves the cores idle -- and then falls off a cache cliff
+    once the volume passes a few MB, where it measured 8-10x slower than a
+    strided-window matmul over the same points (60x220x220, K=9: 30 ms against
+    3 ms). The matmul path is the loser as soon as there IS a group dimension,
+    so the single-group test is the whole dispatch.
+
+    CUDA keeps the grouped conv unconditionally: it has plenty to parallelise
+    either way, and this is a CPU cache story.
+    """
+    radius = kernel.shape[0] // 2
+
+    if vol.device.type == "cpu" and n_groups == 1:
+        # Convolve along the outermost spatial axis, permuting to get there:
+        # unfold's window dim then strides over whole planes, which matmul reads
+        # as a strided gemv rather than materialising the K-fold window stack.
+        # The permute copies one volume; the conv it replaces is worth many.
+        moved = vol.movedim(axis, 2).contiguous() if axis != 2 else vol
+        padded = F.pad(moved, (0, 0, 0, 0, radius, radius), mode="replicate")
+        out = torch.matmul(padded.unfold(2, kernel.shape[0], 1), kernel)
+        return out.movedim(2, axis) if axis != 2 else out
+
+    pad = [0, 0, 0, 0, 0, 0]
+    pad[(4 - axis) * 2] = radius
+    pad[(4 - axis) * 2 + 1] = radius
+    shape = [1, 1, 1, 1, 1]
+    shape[axis] = kernel.shape[0]
+    k = kernel.reshape(shape).expand(n_groups, 1, *shape[2:])
+    return F.conv3d(F.pad(vol, tuple(pad), mode="replicate"), k, groups=n_groups)
+
+
 def _separable_smooth_3d(
     vol: Tensor,
     sigma: float | tuple[float, float, float],
@@ -217,29 +256,12 @@ def _separable_smooth_3d(
     n_groups = n_batch * n_chan
     vol = vol.reshape(1, n_groups, nz, ny, nx)
 
-    sz, sy, sx = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
+    sigmas = (sigma, sigma, sigma) if isinstance(sigma, (int, float)) else sigma
 
-    # Z
-    if vol.shape[2] > 1:
-        kernel = _make_kernel_1d(kernel_type, sz, vol.device)
-        radius = kernel.shape[0] // 2
-        k = kernel[None, None, :, None, None].expand(n_groups, 1, -1, 1, 1)
-        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
-        vol = F.conv3d(vol, k, groups=n_groups)
-    # Y
-    if vol.shape[3] > 1:
-        kernel = _make_kernel_1d(kernel_type, sy, vol.device)
-        radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, :, None].expand(n_groups, 1, 1, -1, 1)
-        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k, groups=n_groups)
-    # X
-    if vol.shape[4] > 1:
-        kernel = _make_kernel_1d(kernel_type, sx, vol.device)
-        radius = kernel.shape[0] // 2
-        k = kernel[None, None, None, None, :].expand(n_groups, 1, 1, 1, -1)
-        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k, groups=n_groups)
+    for axis, axis_sigma in zip((2, 3, 4), sigmas, strict=True):
+        if vol.shape[axis] > 1:
+            kernel = _make_kernel_1d(kernel_type, axis_sigma, vol.device)
+            vol = _conv1d_along_axis(vol, kernel, axis, n_groups)
 
     vol = vol.reshape(n_batch, n_chan, nz, ny, nx)
 
@@ -469,26 +491,13 @@ def _batched_separable_smooth_3d(vol: Tensor, kernel: Tensor) -> Tensor:
         Smoothed (B, 1, D, H, W).
     """
     B = vol.shape[0]
-    radius = kernel.shape[0] // 2
 
     # Reshape from (B, 1, D, H, W) to (1, B, D, H, W) for grouped conv
     vol = vol.permute(1, 0, 2, 3, 4)  # (1, B, D, H, W)
 
-    # Z axis
-    if vol.shape[2] > 1:
-        k = kernel[None, None, :, None, None].expand(B, 1, -1, 1, 1)  # (B, 1, K, 1, 1)
-        vol = F.pad(vol, (0, 0, 0, 0, radius, radius), mode="replicate")
-        vol = F.conv3d(vol, k, groups=B)
-    # Y axis
-    if vol.shape[3] > 1:
-        k = kernel[None, None, None, :, None].expand(B, 1, 1, -1, 1)
-        vol = F.pad(vol, (0, 0, radius, radius, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k, groups=B)
-    # X axis
-    if vol.shape[4] > 1:
-        k = kernel[None, None, None, None, :].expand(B, 1, 1, 1, -1)
-        vol = F.pad(vol, (radius, radius, 0, 0, 0, 0), mode="replicate")
-        vol = F.conv3d(vol, k, groups=B)
+    for axis in (2, 3, 4):
+        if vol.shape[axis] > 1:
+            vol = _conv1d_along_axis(vol, kernel, axis, B)
 
     # Back to (B, 1, D, H, W)
     return vol.permute(1, 0, 2, 3, 4)
