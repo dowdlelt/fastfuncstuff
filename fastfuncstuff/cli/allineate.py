@@ -441,6 +441,16 @@ Examples:
         "alone (for checking/hand-tuning placement)",
     )
     search_group.add_argument(
+        "-save_cost_trace",
+        "-save-cost-trace",
+        default=None,
+        metavar="FILE",
+        help="Write the refiners' per-step cost trace to FILE as a .1D "
+        "(stage, step, nevals, best, step best/median/worst, step scale). "
+        "Diagnostic: shows whether a stage is still improving or only "
+        "resampling noise around a converged point",
+    )
+    search_group.add_argument(
         "-twopass", action="store_true", default=True, help="Coarse search + refinement (default)"
     )
     search_group.add_argument(
@@ -637,7 +647,7 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     if args.save_mean:
         outs.append(derive_mean_output_path(args.prefix))
     outs.extend(prefix for _, prefix in _follower_pairs(args))
-    for name in ("save_weight", "save_automask", "save_cmass"):
+    for name in ("save_weight", "save_automask", "save_cmass", "save_cost_trace"):
         val = getattr(args, name, None)
         if val is not None:
             outs.append(val)
@@ -898,6 +908,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         save_automask_path=args.save_automask,
         save_cmass_path=args.save_cmass,
         save_weight_path=args.save_weight,
+        save_cost_trace_path=args.save_cost_trace,
     )
 
     # --- Save outputs ---

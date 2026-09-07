@@ -18,6 +18,8 @@ from __future__ import annotations
 import math
 import os
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -189,6 +191,101 @@ class AffineAlignConfig:
     def __post_init__(self):
         if self.tbest is None:
             self.tbest = _default_tbest(self.cost)
+
+
+# ---------------------------------------------------------------------------
+# Optimiser cost trace (diagnostic)
+# ---------------------------------------------------------------------------
+
+_COST_TRACE_COLUMNS = (
+    "stage",
+    "step",
+    "nevals",
+    "best",
+    "step_best",
+    "step_med",
+    "step_worst",
+    "scale",
+)
+
+
+class _CostTrace:
+    """Per-step record of what the refiners' cost actually did.
+
+    One row per optimiser *step*, not per evaluation, because the question this
+    answers is about a step's population: a search that has stopped improving
+    while its samples still spread widely is measuring noise, and best-so-far
+    alone -- which is all the progress bar shows -- cannot tell you that. For a
+    sequential optimiser (Powell) a step is one evaluation and the three
+    population columns collapse to the same number, which is still the trace.
+
+    Costs are AFNI-signed as the optimisers see them: higher is better.
+    """
+
+    def __init__(self) -> None:
+        self.rows: list[tuple[float, ...]] = []
+        self.stage = 0
+        self.stage_labels: dict[int, str] = {}
+
+    def set_stage(self, index: int, label: str) -> None:
+        self.stage = index
+        self.stage_labels[index] = label
+
+    def record(
+        self,
+        step: int,
+        nevals: int,
+        best: float,
+        step_costs=None,
+        scale: float = float("nan"),
+    ) -> None:
+        if step_costs is None:
+            lo = med = hi = best
+        else:
+            vals = torch.as_tensor(step_costs, dtype=torch.float64).flatten()
+            lo = float(vals.min())
+            hi = float(vals.max())
+            med = float(vals.median())
+        self.rows.append((self.stage, step, nevals, best, hi, med, lo, scale))
+
+    def save(self, path: str) -> None:
+        """Write an AFNI .1D: a comment header naming the columns and stages."""
+        lines = [
+            "# ffs_allineate optimiser cost trace",
+            "# costs are AFNI-signed as the optimiser sees them (higher is better)",
+            "# " + " ".join(_COST_TRACE_COLUMNS),
+            "# a stage refining trials one at a time contributes one run of "
+            "steps per trial, so step restarts within that stage",
+        ]
+        for index in sorted(self.stage_labels):
+            lines.append(f"# stage {index} = {self.stage_labels[index]}")
+        for row in self.rows:
+            lines.append(
+                f"{int(row[0]):d} {int(row[1]):d} {int(row[2]):d} "
+                + " ".join(f"{v:.8g}" for v in row[3:])
+            )
+        with open(path, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+
+# Set for the duration of one alignment rather than threaded through five
+# refiners and the stage loop that drives them; the refiners already carry as
+# many parameters as they can hold.
+_cost_trace: ContextVar[_CostTrace | None] = ContextVar("_ffs_allineate_cost_trace", default=None)
+
+
+@contextmanager
+def _recording_cost_trace(enabled: bool):
+    """Collect a trace for this alignment, or nothing at all when disabled."""
+    if not enabled:
+        yield None
+        return
+    trace = _CostTrace()
+    token = _cost_trace.set(trace)
+    try:
+        yield trace
+    finally:
+        _cost_trace.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1398,6 +1495,9 @@ def _refine_adam_normalized(
 
         if it % sync_every == 0 or it == n_iters - 1:
             bc = best_cost_t.item()  # the only host sync
+            trace = _cost_trace.get()
+            if trace is not None:
+                trace.record(it, it + 1, bc, step_costs=[float(cost.detach())])
             # Guard the first sync: with last_best == -inf the relative threshold
             # is -inf + inf == nan, and `bc > nan` is always False, which would
             # (wrongly) trip the plateau counter from iteration 0.
@@ -1707,6 +1807,10 @@ def _refine_cmaes_batched(
         C = (1 - c1 - cmu) * C + c1 * (rank1 + corr) + cmu * rankmu
         C = 0.5 * (C + C.transpose(1, 2))  # keep it exactly symmetric
 
+        trace = _cost_trace.get()
+        if trace is not None:
+            trace.record(gi, n_eval, float(best_c.max()), step_costs=vals, scale=float(sigma.max()))
+
         alive = alive & (sigma > sigma_min)
         if not bool(alive.any()):
             break
@@ -1860,6 +1964,10 @@ def _refine_pattern_batched(
         stalled = stalled + 1
         stalled = torch.where(best_val > prev_best + 1e-7, torch.zeros_like(stalled), stalled)
         prev_best = torch.maximum(prev_best, best_val)
+        trace = _cost_trace.get()
+        if trace is not None:
+            trace.record(_it, n_eval, float(best_c.max()), step_costs=vals, scale=float(h.max()))
+
         alive = alive & (h > h_min) & (stalled < patience)
         if not bool(alive.any()):
             break
@@ -1973,6 +2081,12 @@ def _refine_adam_batched(
             imp = bc > thr
             last_best = np.where(imp, bc, last_best)
             no_improve = np.where(imp, 0, no_improve + sync_every)
+            trace = _cost_trace.get()
+            if trace is not None:
+                # Only at the sync points: Adam deliberately runs ahead of the
+                # host, and a per-iteration record would sync every step and
+                # slow down the path it is supposed to be observing.
+                trace.record(it, (it + 1) * T, float(bc.max()), step_costs=cur)
             if tqdm is not None and verb >= 1:
                 pbar.set_postfix_str(f"best={bc.max():.6f}")
             if bool((no_improve >= patience).all()):
@@ -2007,6 +2121,8 @@ def _make_powell_cost(
     == better) and replaces the full-grid path (subsampled blok refinement).
     """
 
+    best_seen = [-float("inf")]
+
     def cost_fn(x_free_norm: np.ndarray) -> float:
         # Clamp to [0,1] — Powell can overshoot, producing garbage warps
         x_clamped = np.clip(x_free_norm, 0.0, 1.0)
@@ -2035,6 +2151,19 @@ def _make_powell_cost(
             if pbar is not None:
                 pbar.update(1)
                 pbar.set_postfix_str(f"cost={-val:.6f}")
+
+        trace = _cost_trace.get()
+        if trace is not None:
+            # Powell probes are not monotone -- a line search is meant to
+            # overshoot -- so the running max is tracked here rather than read
+            # off the optimiser, which never exposes it.
+            best_seen[0] = max(best_seen[0], -val)
+            trace.record(
+                counter[0] if counter else 0,
+                counter[0] if counter else 0,
+                best_seen[0],
+                step_costs=[-val],
+            )
 
         return val
 
@@ -2246,6 +2375,10 @@ def _refine_progressive(
             label = "Full resolution"
         blokrad_stage = _stage_blokrad(sigma_vox)
 
+        trace = _cost_trace.get()
+        if trace is not None:
+            trace.set_stage(si, label)
+
         if verb >= 1:
             npts = f", {sample.idx_flat.numel()} pts" if use_sample else ""
             print(f"  {label} ({base_s.shape}{npts}, {len(trials)} trials):")
@@ -2376,6 +2509,9 @@ def _refine_progressive(
 
     # --- Powell polish (single pass, tighter convergence) ---
     if config.powell_maxfev > 0:
+        trace = _cost_trace.get()
+        if trace is not None:
+            trace.set_stage(len(stages), "Powell polish")
         if verb >= 1:
             print("  Powell polish (full resolution):")
 
@@ -2793,6 +2929,7 @@ def allineate(
     save_automask_path: str | None = None,
     save_cmass_path: str | None = None,
     save_weight_path: str | None = None,
+    save_cost_trace_path: str | None = None,
 ) -> tuple[Tensor, Tensor]:
     """GPU-accelerated affine/rigid alignment.
 
@@ -2811,6 +2948,9 @@ def allineate(
         save_cmass_path: If set, save the source positioned by the cmass shift
             alone (no rotation/scale), on the base grid — lets you eyeball the
             initial placement and reproduce it with config.cmass_direct.
+        save_cost_trace_path: If set, write the refiners' per-step cost trace
+            here as a .1D — see _CostTrace. Diagnostic only; it changes nothing
+            about the fit.
 
     Returns:
         (matrix, warped):
@@ -2939,19 +3079,24 @@ def allineate(
     if verb >= 1:
         print("Refinement phase:")
 
-    best_params_phys, best_refine_cost = _refine_progressive(
-        base_opt,
-        source_opt,
-        weight_opt,
-        trial_params_list,
-        config,
-        ctx,
-        voxdims,
-        bounds,
-        device,
-        verb,
-        sample=sample,
-    )
+    with _recording_cost_trace(save_cost_trace_path is not None) as cost_trace:
+        best_params_phys, best_refine_cost = _refine_progressive(
+            base_opt,
+            source_opt,
+            weight_opt,
+            trial_params_list,
+            config,
+            ctx,
+            voxdims,
+            bounds,
+            device,
+            verb,
+            sample=sample,
+        )
+    if cost_trace is not None and save_cost_trace_path is not None:
+        cost_trace.save(save_cost_trace_path)
+        if verb >= 1:
+            print(f"  Saved cost trace: {save_cost_trace_path} ({len(cost_trace.rows)} steps)")
 
     # Build final matrix — adjust for crop offset if needed.
     def _crop_conj(residual: Tensor, offset, forward: bool = True) -> Tensor:

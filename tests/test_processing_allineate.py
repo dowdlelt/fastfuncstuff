@@ -8,6 +8,7 @@ import torch
 
 from fastfuncstuff.cli.allineate import parse_args as parse_allineate_args
 from fastfuncstuff.processing.allineate import (
+    _COST_TRACE_COLUMNS,
     AffineAlignConfig,
     CostContext,
     _batched_cost,
@@ -20,6 +21,7 @@ from fastfuncstuff.processing.allineate import (
     _compute_nonzero_bbox,
     _compute_param_bounds,
     _compute_source_validity_mask,
+    _cost_trace,
     _crop_volumes,
     _default_tbest,
     _denormalize,
@@ -33,6 +35,7 @@ from fastfuncstuff.processing.allineate import (
     _normalize_t,
     _parse_cost,
     _pick_optimizer,
+    _recording_cost_trace,
     _refine_adam_normalized,
     _refine_cmaes_batched,
     _refine_pattern_batched,
@@ -1598,3 +1601,64 @@ class TestMatchPointFloor:
         sample = _build_sample_set(base, None, (1.0, 1.0, 1.0), 0.0, "tohd", torch.device("cpu"))
         assert sample is not None
         assert sample.idx_flat.numel() == int(_SAMPLE_DEFAULT_FRAC * n_dom)
+
+
+class TestCostTrace:
+    """The optimiser cost trace (-save_cost_trace).
+
+    It exists to answer one question the progress bar cannot: is a stage still
+    improving, or only resampling noise around a converged point? That needs the
+    *step population*, not best-so-far, so these pin that the population columns
+    carry real spread and that the trace stays off unless asked for.
+    """
+
+    @staticmethod
+    def _bowl_setup():
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = TestDerivativeFreeRefinement._bowl(_normalize(start, bounds) + 0.02, bounds, device)
+        return device, bounds, config, start, cost
+
+    def test_nothing_is_recorded_unless_a_trace_is_active(self):
+        """The recorder is a ContextVar the refiners read every step; left set, it
+        would accumulate across every alignment in a batch."""
+        device, bounds, config, start, cost = self._bowl_setup()
+        assert _cost_trace.get() is None
+        _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=10)
+        assert _cost_trace.get() is None
+
+    def test_records_one_row_per_generation_with_the_population_spread(self):
+        device, bounds, config, start, cost = self._bowl_setup()
+        with _recording_cost_trace(True) as trace:
+            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=12)
+        assert trace is not None
+        assert len(trace.rows) == 12
+        for _, _, _, best, step_best, step_med, step_worst, scale in trace.rows:
+            assert step_worst <= step_med <= step_best
+            assert best >= step_best - 1e-9  # best-so-far dominates this generation
+            assert scale > 0.0
+        # A CMA generation samples a distribution: the spread is the whole point.
+        assert any(r[4] > r[6] for r in trace.rows)
+
+    def test_best_so_far_never_goes_backwards(self):
+        device, bounds, config, start, cost = self._bowl_setup()
+        with _recording_cost_trace(True) as trace:
+            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=15)
+        best = [r[3] for r in trace.rows]
+        assert best == sorted(best)
+
+    def test_file_is_a_readable_1d_with_a_labelled_header(self, tmp_path):
+        device, bounds, config, start, cost = self._bowl_setup()
+        with _recording_cost_trace(True) as trace:
+            trace.set_stage(0, "Blur sigma=2vox")
+            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=8)
+        out = tmp_path / "trace.1D"
+        trace.save(str(out))
+        text = out.read_text()
+        assert "# stage 0 = Blur sigma=2vox" in text
+        rows = np.loadtxt(out)
+        assert rows.shape == (8, len(_COST_TRACE_COLUMNS))
+        np.testing.assert_array_equal(rows[:, 0], 0)  # stage column
+        np.testing.assert_array_equal(rows[:, 1], np.arange(8))  # step column
