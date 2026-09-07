@@ -177,6 +177,31 @@ class VolumeStore:
             self._items[k] = res
         return res
 
+    def adopt(self, key: str, array: np.ndarray, *, name: str = "") -> Resident:
+        """Register an in-memory volume as if it had been loaded.
+
+        Modes compute overlays rather than reading them, but everything
+        downstream -- slicing, colour mapping, the value readout -- addresses
+        data through the store. Adopting keeps that one path instead of
+        teaching each consumer about a second kind of layer.
+        """
+        arr = np.ascontiguousarray(array, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[..., None]
+        nx, ny, nz, nv = arr.shape
+        info = DatasetInfo(
+            path=Path(name or key),
+            iname=name or key,
+            exists=True,
+            storage="MEMORY",
+            shape=(int(nx), int(ny), int(nz), int(nv)),
+        )
+        res = Resident(key=key, path=Path(name or key), info=info, array=arr)
+        with self._lock:
+            self._items[key] = res
+            self._touch(res)
+        return res
+
     def get(self, key: str) -> Resident:
         with self._lock:
             try:

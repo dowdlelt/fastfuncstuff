@@ -68,6 +68,10 @@ class Layer:
     #: dimensionality cannot tell them apart -- scrubbing a stats dataset
     #: through its contrasts would be nonsense.
     time_linked: bool = False
+    #: Where the voxels came from. ``"file"`` for anything loaded off disk;
+    #: ``"mode:<name>"`` for an overlay a mode computes and owns, which the
+    #: mode replaces in place and the picker must not offer to reload.
+    source: str = "file"
 
     #: Display range. ``None`` means "derive from the data" -- resolved once the
     #: volume is resident, then cached here.
@@ -88,6 +92,10 @@ class Layer:
     @property
     def is_4d(self) -> bool:
         return self.n_volumes > 1
+
+    @property
+    def is_computed(self) -> bool:
+        return self.source.startswith("mode:")
 
 
 @dataclass
@@ -164,6 +172,55 @@ class LayerStack:
         to = max(0, min(to, len(self.layers)))
         self.layers.insert(to, layer)
         return to
+
+    # -- underlay / overlay roles --------------------------------------
+    #
+    # Position is the truth: index 0 is drawn first, so "the underlay" is
+    # simply the bottom of the stack and "the overlay" the one above it. These
+    # helpers exist because that is how people think and how the buttons are
+    # labelled, not because the stack has a second notion of identity.
+
+    def set_underlay(self, layer: Layer) -> Layer:
+        """Replace the bottom layer, keeping everything stacked above it."""
+        if self.layers:
+            old = self.layers[0]
+            self.layers[0] = layer
+            if old.key != layer.key:
+                # Two layers must never share a key; the replaced one is gone.
+                self.layers = [layer] + [ly for ly in self.layers[1:] if ly.key != layer.key]
+        else:
+            self.layers.append(layer)
+        return layer
+
+    def set_overlay(self, layer: Layer) -> Layer:
+        """Replace the primary overlay -- the layer just above the underlay.
+
+        Additional overlays pushed with :meth:`add_overlay` are left alone, so
+        swapping the stats map you are looking at does not drop the atlas you
+        put on top of it.
+        """
+        self.layers = [ly for ly in self.layers if ly.key != layer.key]
+        if len(self.layers) >= 2:
+            self.layers[1] = layer
+        else:
+            self.layers.append(layer)
+        return layer
+
+    def add_overlay(self, layer: Layer) -> Layer:
+        """Push another overlay on top of the stack."""
+        return self.add(layer)
+
+    @property
+    def overlay(self) -> Layer | None:
+        """The primary overlay, if there is one."""
+        return self.layers[1] if len(self.layers) > 1 else None
+
+    def find_by_source(self, source: str) -> Layer | None:
+        """The layer a given mode owns, if it has produced one."""
+        for ly in self.layers:
+            if ly.source == source:
+                return ly
+        return None
 
     def visible_layers(self) -> list[Layer]:
         return [ly for ly in self.layers if ly.visible and ly.opacity > 0.0]

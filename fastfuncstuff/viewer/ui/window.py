@@ -94,7 +94,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self._panes: dict[Plane, ImagePane] = {}
         self._bridge = _Bridge()
-        self._bridge.loaded.connect(self._on_layer_loaded, QtCore.Qt.ConnectionType.QueuedConnection)
+        self._bridge.loaded.connect(
+            self._on_layer_loaded, QtCore.Qt.ConnectionType.QueuedConnection
+        )
         session.on_loaded(self._bridge.loaded.emit)
 
         self._build_panes()

@@ -14,8 +14,12 @@ import numpy as np
 import torch
 
 from fastfuncstuff.io.dsetinfo import DatasetInfo
+from fastfuncstuff.viewer import catalog as catalog_mod
+from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.layers import Layer
+from fastfuncstuff.viewer.modes import Mode, registry
+from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
 from fastfuncstuff.viewer.state import ViewerState
 from fastfuncstuff.viewer.vocab import AddLayer, SetVolume, install
@@ -88,8 +92,16 @@ class ViewerSession:
     ) -> None:
         self.state = ViewerState()
         self.store = store or VolumeStore(device=device)
-        self.bus = install(CommandBus(self.state, record=record), open_layer=self._open)
+        self.bus = install(
+            CommandBus(self.state, record=record), open_layer=self._open, session=self
+        )
+        self.catalog: list[CatalogEntry] = []
+        self.catalog_dir: Path | None = None
+        self.mode: Mode = registry.get("plain")()
+        self.mode.attach(self)
         self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
+        self._mode_dirty: Aspect = Aspect.NOTHING
+        self._hidden_input: str | None = None
         # A time-index or sub-brick change invalidates the cached device volume;
         # doing it here rather than in each handler means a command added later
         # cannot forget to.
@@ -135,9 +147,125 @@ class ViewerSession:
             self.invalidate()
         elif isinstance(cmd, SetVolume):
             self.invalidate(cmd.key)
+        # The mode reacts after the state has settled, so an InstaCorr seed sees
+        # the seed already moved. Its own dirty aspects are folded into what the
+        # dispatch reports, which is how a recomputed overlay reaches the panes.
+        self._mode_dirty = self.mode.on_command(cmd, dirty)
+        if self._mode_dirty:
+            self._hide_mode_input()
 
     def do(self, cmd: Command) -> Aspect:
-        return self.bus.dispatch(cmd)
+        self._mode_dirty = Aspect.NOTHING
+        dirty = self.bus.dispatch(cmd)
+        return dirty | self._mode_dirty
+
+    # -- catalog -------------------------------------------------------
+    def read_directory(self, directory: str | Path, *, recursive: bool = False) -> list:
+        """Populate the catalog the pickers draw from."""
+        self.catalog = catalog_mod.scan(directory, recursive=recursive)
+        self.catalog_dir = Path(directory)
+        return self.catalog
+
+    def suggested_underlay(self) -> CatalogEntry | None:
+        return catalog_mod.suggest_underlay(self.catalog)
+
+    # -- modes ---------------------------------------------------------
+    def set_mode(self, name: str) -> Aspect:
+        """Switch modes, tearing down the old one's overlay."""
+        if self.mode.name == name:
+            return Aspect.NOTHING
+        self._restore_mode_input()
+        self.mode.detach()
+        self.mode = registry.get(name)()
+        self.mode.attach(self)
+        dirty = (Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH) | self.mode.refresh()
+        self._hide_mode_input()
+        return dirty
+
+    def _hide_mode_input(self) -> None:
+        """Hide the layer the active mode consumes, remembering its state."""
+        key = self.mode.input_layer_key()
+        if key is None:
+            return
+        layer = self.state.layers.find(key)
+        if layer is None or not layer.visible:
+            return
+        self._hidden_input = key
+        self.state.layers.update(key, visible=False)
+
+    def _restore_mode_input(self) -> None:
+        key = getattr(self, "_hidden_input", None)
+        if key is None:
+            return
+        if self.state.layers.find(key) is not None:
+            self.state.layers.update(key, visible=True)
+        self._hidden_input = None
+
+    def set_mode_param(self, param: str, value: str) -> Aspect:
+        """Coerce a text parameter to its control's type and apply it."""
+        spec = next((c for c in self.mode.controls() if c.name == param), None)
+        if spec is None:
+            raise KeyError(f"mode {self.mode.name!r} has no parameter {param!r}")
+        coerced: object = value
+        default = getattr(spec, "default", None)
+        if isinstance(default, bool):
+            coerced = value not in ("0", "false", "False", "")
+        elif isinstance(default, int):
+            coerced = int(float(value))
+        elif isinstance(default, float):
+            coerced = float(value)
+        return self.mode.set_param(param, coerced)
+
+    def mode_series(self, ijk: tuple[int, int, int] | None = None) -> list[Trace]:
+        return self.mode.series(ijk or self.state.crosshair)
+
+    # -- computed overlays ---------------------------------------------
+    def install_computed_overlay(self, source: str, overlay: ComputedOverlay) -> str:
+        """Install (or update in place) the layer a mode owns.
+
+        Updating in place matters: a mode recomputes on every seed click, and
+        pushing a new layer each time would grow the stack without bound and
+        reset the threshold the user just set.
+        """
+        existing = self.state.layers.find_by_source(source)
+        key = existing.key if existing is not None else self.state.layers.mint_key("M")
+        self.store.adopt(key, overlay.values, name=overlay.name)
+        self.invalidate(key)
+
+        lo, hi = overlay.display_range or derive_range(overlay.values)
+        if existing is None:
+            layer = Layer(
+                key=key,
+                name=overlay.name,
+                path=f"<{overlay.name}>",
+                shape=tuple(int(v) for v in overlay.values.shape[:3]),
+                n_volumes=1,
+                affine=np.asarray(overlay.affine, dtype=float),
+                colormap=overlay.colormap,
+                range_lo=lo,
+                range_hi=hi,
+                threshold=overlay.threshold or 0.0,
+                source=source,
+            )
+            # Pushed on top, never into the overlay slot: replacing there would
+            # consume the mode's own input dataset, which is where the values
+            # came from in the first place.
+            self.state.layers.add_overlay(layer)
+            if self.state.grid is None:
+                self.state.adopt_grid(layer.shape, layer.affine)
+        return key
+
+    def remove_computed_overlay(self, source: str) -> None:
+        existing = self.state.layers.find_by_source(source)
+        if existing is None:
+            return
+        self.state.layers.remove(existing.key)
+        self.forget(existing.key)
+
+    def forget(self, key: str) -> None:
+        """Drop a layer's cached and resident data."""
+        self.invalidate(key)
+        self.store.close(key)
 
     def run_script(self, text: str) -> Aspect:
         return self.bus.run_script(text)

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
@@ -84,6 +85,89 @@ class SetLock(Command):
     aspects = Aspect.NOTHING
     which: str
     on: bool
+
+
+# ---------------------------------------------------------------------------
+# the data selector
+#
+# These are the core of the viewer. Everything else -- panes, graphs, modes --
+# is modular on top of picking a directory, a base image and what goes over it.
+# ---------------------------------------------------------------------------
+
+
+@command
+@dataclass(frozen=True)
+class Read(Command):
+    """Read a directory into the catalog the pickers draw from."""
+
+    name = "READ"
+    aspects = Aspect.NOTHING
+    major = True
+    directory: str
+    recursive: bool = False
+
+
+@command
+@dataclass(frozen=True)
+class SetUnderlay(Command):
+    """Replace the base image, keeping whatever is stacked over it."""
+
+    name = "SET_UNDERLAY"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
+    major = True
+    path: str
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class SetOverlay(Command):
+    """Replace the primary overlay. Extra overlays are left alone."""
+
+    name = "SET_OVERLAY"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    major = True
+    path: str
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class AddOverlay(Command):
+    """Push another overlay on top of the stack -- the +1 button."""
+
+    name = "ADD_OVERLAY"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    major = True
+    path: str
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class SetMode(Command):
+    """Switch where the overlay comes from."""
+
+    name = "SET_MODE"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
+    major = True
+    mode: str
+
+
+@command
+@dataclass(frozen=True)
+class SetModeParam(Command):
+    """Set one parameter of the active mode.
+
+    The value is carried as text so the vocabulary stays closed over scalars and
+    a recorded script keeps round-tripping; the mode coerces it to its control's
+    declared type.
+    """
+
+    name = "SET_MODE_PARAM"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    param: str
+    value: str
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +355,99 @@ class SetSeed(Command):
 OpenLayer = Callable[[str, str], Layer]
 
 
-def install(bus: CommandBus, *, open_layer: OpenLayer | None = None) -> CommandBus:
+def install(
+    bus: CommandBus,
+    *,
+    open_layer: OpenLayer | None = None,
+    session: Any = None,
+) -> CommandBus:
     """Register every handler on ``bus``.
 
     ``open_layer(path, key) -> Layer`` performs the actual load. It is injected
     rather than imported so the core stays testable without touching a disk, and
     so the UI can route loading through a worker thread without the vocabulary
     knowing that happened.
+
+    ``session`` is optional and only the catalog and mode commands need it; the
+    layer and navigation vocabulary works against bare state, which is what
+    keeps most of the test suite free of a session.
     """
+
+    def _load(path: str, key: str) -> Layer:
+        if open_layer is None:
+            raise RuntimeError("no loader installed: cannot open a dataset")
+        return open_layer(path, key)
+
+    def _adopt_grid_preserving_position(st: ViewerState, layer: Layer) -> Aspect:
+        """Move the display grid to a new underlay, staying at the same place.
+
+        Swapping the base image must not teleport the crosshair. The anatomical
+        location is what the user is looking at, so it is carried across in
+        millimetres and re-expressed in the new grid.
+        """
+        mm = st.crosshair_mm
+        st.adopt_grid(layer.shape, layer.affine)
+        if mm is not None and st.grid is not None:
+            ijk = st.grid.mm_to_ijk(mm)
+            st.crosshair = st.grid.clamp((round(ijk[0]), round(ijk[1]), round(ijk[2])))
+        return Aspect.GRID | Aspect.CROSSHAIR
+
+    @bus.handle(Read.name)
+    def _read(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, Read)
+        if session is None:
+            raise RuntimeError("READ needs a session")
+        session.read_directory(cmd.directory, recursive=bool(cmd.recursive))
+        return Aspect.NOTHING
+
+    @bus.handle(SetUnderlay.name)
+    def _set_underlay(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetUnderlay)
+        old = st.layers.base
+        layer = _load(cmd.path, cmd.key or st.layers.mint_key("U"))
+        st.layers.set_underlay(layer)
+        if old is not None and session is not None:
+            session.forget(old.key)
+        # The underlay defines the display grid: it is the base image everything
+        # else is resampled onto, so a new one re-establishes the space.
+        return Aspect.LAYERS | Aspect.SLICES | _adopt_grid_preserving_position(st, layer)
+
+    @bus.handle(SetOverlay.name)
+    def _set_overlay(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetOverlay)
+        old = st.layers.overlay
+        layer = _load(cmd.path, cmd.key or st.layers.mint_key("O"))
+        st.layers.set_overlay(layer)
+        if old is not None and old.key != layer.key and session is not None:
+            session.forget(old.key)
+        dirty = SetOverlay.aspects
+        if st.grid is None:
+            dirty |= _adopt_grid_preserving_position(st, layer)
+        return dirty
+
+    @bus.handle(AddOverlay.name)
+    def _add_overlay(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, AddOverlay)
+        layer = _load(cmd.path, cmd.key or st.layers.mint_key("O"))
+        st.layers.add_overlay(layer)
+        dirty = AddOverlay.aspects
+        if st.grid is None:
+            dirty |= _adopt_grid_preserving_position(st, layer)
+        return dirty
+
+    @bus.handle(SetMode.name)
+    def _set_mode(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetMode)
+        if session is None:
+            raise RuntimeError("SET_MODE needs a session")
+        return session.set_mode(cmd.mode)
+
+    @bus.handle(SetModeParam.name)
+    def _set_mode_param(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetModeParam)
+        if session is None:
+            raise RuntimeError("SET_MODE_PARAM needs a session")
+        return session.set_mode_param(cmd.param, cmd.value)
 
     @bus.handle(SetIJK.name)
     def _set_ijk(cmd: Command, st: ViewerState) -> Aspect:
@@ -342,10 +511,8 @@ def install(bus: CommandBus, *, open_layer: OpenLayer | None = None) -> CommandB
     @bus.handle(AddLayer.name)
     def _add_layer(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, AddLayer)
-        if open_layer is None:
-            raise RuntimeError("no loader installed: ADD_LAYER cannot run")
         key = cmd.key or st.layers.mint_key()
-        layer = open_layer(cmd.path, key)
+        layer = _load(cmd.path, key)
         st.layers.add(layer)
         dirty = Aspect.LAYERS | Aspect.SLICES
         if st.grid is None:
