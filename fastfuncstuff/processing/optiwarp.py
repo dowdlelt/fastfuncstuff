@@ -11,8 +11,8 @@ The brightness-constancy assumption is that a voxel keeps its intensity as it mo
 
     W(p + delta) = F(p)   =>   delta . grad(W) + (W - F) = 0                        (*)
 
-which is one equation per voxel in three unknowns (the aperture problem). The three
-force models differ only in how they close that system:
+which is one equation per voxel in three unknowns (the aperture problem). The
+force models differ in how they close or extend that system:
 
   ``demons``   Thirion's demons: take the minimum-norm solution of (*) along the
                gradient, with the Cachier/Vercauteren regularized denominator
@@ -26,6 +26,8 @@ force models differ only in how they close that system:
                cannot see. The 3-D analogue of ``locomoco.optical_flow_lk_3d``.
   ``hs``       Horn-Schunck: close (*) globally with a smoothness prior, solved by
                Jacobi iterations. The smoothest, slowest-moving option.
+  ``gradient`` Experimental multi-channel LK: add gradient-constancy equations to
+               brightness constancy, supplying local boundary-shape information.
 
 Because the raw flow field is only as rigid as its regularizer ("loosey goosey" at
 small scales), two things keep it honest:
@@ -55,6 +57,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from math import isfinite
 from typing import TYPE_CHECKING
 
 import torch
@@ -104,7 +107,7 @@ from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 
 _EPS = 1e-6
 
-FORCES = ("demons", "lk", "hs")
+FORCES = ("demons", "lk", "hs", "gradient")
 MATCH_MODES = ("none", "meanstd", "localnorm", "gradmag")
 STEP_MODES = ("diffeo", "additive")
 
@@ -129,7 +132,8 @@ class OptiwarpConfig:
 
     force: str = "demons"
     """Flow model: 'demons' (normalized gradient force), 'lk' (windowed Lucas-Kanade
-    structure-tensor solve), or 'hs' (Horn-Schunck global smoothness)."""
+    structure-tensor solve), 'hs' (Horn-Schunck global smoothness), or experimental
+    'gradient' (LK with brightness and gradient constancy)."""
 
     symmetric_force: bool = True
     """Use the symmetric demons force ``(grad W + grad F)/2`` instead of ``grad W``
@@ -158,6 +162,11 @@ class OptiwarpConfig:
     lk_reg: float = 1e-2
     """Tikhonov ridge added to the LK structure tensor's diagonal, relative to its
     mean trace. Guards the aperture-problem-degenerate directions."""
+
+    gradient_weight: float = 2.0
+    """Relative squared-residual weight for the three gradient channels in
+    force='gradient'. Uses lk_radius/lk_reg; 0 keeps only brightness constancy.
+    See the wiki's Gradient constancy flow note for the local translation model."""
 
     hs_alpha: float = 1.0
     """Horn-Schunck smoothness weight. Larger = smoother, slower-moving flow."""
@@ -471,6 +480,9 @@ def _flow_lk(
     radius: int,
     reg: float,
     weight: Tensor | None = None,
+    *,
+    gradient_weight: float = 0.0,
+    fixed_grad: tuple[Tensor, Tensor, Tensor] | None = None,
 ) -> Field:
     """Lucas-Kanade: per-voxel 3x3 least squares over a box neighbourhood.
 
@@ -485,8 +497,12 @@ def _flow_lk(
     its structure tensor from voxels the mask excludes, so the solve is driven by a
     no-data boundary or by air. Folding the weight into the box sums means each window
     is fit only to the data it is allowed to see.
+
+    With ``gradient_weight > 0``, add the three gradient residuals and their
+    Hessian rows to these same normal equations. This is a local translation
+    approximation, not a full variational solver; see Gradient constancy flow
+    in the companion wiki and Brox et al. (2004) for the data-term motivation.
     """
-    gx, gy, gz = grad
     diff = warped - fixed
 
     def box(v: Tensor) -> Tensor:
@@ -494,9 +510,27 @@ def _flow_lk(
             v = v * weight
         return _separable_smooth_3d(v, float(radius), kernel_type="box")
 
-    a11, a22, a33 = box(gx * gx), box(gy * gy), box(gz * gz)
-    a12, a13, a23 = box(gx * gy), box(gx * gz), box(gy * gz)
-    b1, b2, b3 = -box(gx * diff), -box(gy * diff), -box(gz * diff)
+    hessian = tuple(_grad3(g) for g in grad) if gradient_weight > 0 else ()
+    reference_grad = (
+        fixed_grad if fixed_grad is not None else (_grad3(fixed) if gradient_weight > 0 else grad)
+    )
+
+    def moment(i: int, j: int) -> Tensor:
+        value = grad[i] * grad[j]
+        for row in hessian:
+            value = value + gradient_weight * row[i] * row[j]
+        return box(value)
+
+    def rhs(i: int) -> Tensor:
+        value = grad[i] * diff
+        for channel, row in enumerate(hessian):
+            value = value + gradient_weight * row[i] * (grad[channel] - reference_grad[channel])
+        return -box(value)
+
+    a11, a22, a33 = moment(0, 0), moment(1, 1), moment(2, 2)
+    a12, a13, a23 = moment(0, 1), moment(0, 2), moment(1, 2)
+    b1, b2, b3 = rhs(0), rhs(1), rhs(2)
+    hessian = ()
 
     # Ridge scaled to the typical structure-tensor magnitude, so `reg` is unitless.
     tiny = torch.finfo(warped.dtype).tiny
@@ -572,6 +606,21 @@ def _flow_update(
         return _flow_demons(warped, fixed, grad, cfg.demons_noise)
     if cfg.force == "lk":
         return _flow_lk(warped, fixed, grad, cfg.lk_radius, cfg.lk_reg, weight)
+    if cfg.force == "gradient":
+        update = _flow_lk(
+            warped,
+            fixed,
+            grad,
+            cfg.lk_radius,
+            cfg.lk_reg,
+            weight,
+            gradient_weight=cfg.gradient_weight,
+            fixed_grad=fixed_grad,
+        )
+        # A poorly constrained neighbourhood must not throttle every other voxel.
+        norm = torch.sqrt(update[0] ** 2 + update[1] ** 2 + update[2] ** 2)
+        scale = (norm / cfg.max_step).clamp(min=1.0)
+        return update[0] / scale, update[1] / scale, update[2] / scale
     if cfg.force == "hs":
         return _flow_hs(warped, fixed, grad, cfg.hs_alpha, cfg.hs_iters)
     raise ValueError(f"unknown force {cfg.force!r}; choose from {FORCES}")
@@ -805,6 +854,10 @@ def optiwarp(
         image and the Jacobian map.
     """
     cfg = config if config is not None else OptiwarpConfig()
+    if cfg.gradient_weight < 0 or not isfinite(cfg.gradient_weight):
+        raise ValueError("gradient_weight must be finite and nonnegative")
+    if cfg.max_step <= 0 or not isfinite(cfg.max_step):
+        raise ValueError("max_step must be positive")
     if device is None:
         device = fixed.device
     if device.type == "cuda":
@@ -813,7 +866,8 @@ def optiwarp(
     fixed = fixed.float().to(device)
     moving = moving.float().to(device)
     full_shape: tuple[int, int, int] = tuple(fixed.shape)  # type: ignore[assignment]
-    predicted, available = plan_nonlinear_memory(full_shape, device, "optiwarp")
+    memory_engine = "optiwarp_gradient" if cfg.force == "gradient" else "optiwarp"
+    predicted, available = plan_nonlinear_memory(full_shape, device, memory_engine)
     if predicted > available and cfg.verb >= 1:
         print(
             f"WARNING: estimated optical-flow peak {predicted / 2**30:.1f} GiB exceeds "

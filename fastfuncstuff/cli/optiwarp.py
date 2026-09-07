@@ -108,15 +108,15 @@ def _float_list(spec: str) -> tuple[float, ...]:
 _EPILOG = """\
 THE FLOW MODELS (-force)
 ------------------------
-All three start from the same brightness-constancy statement: a voxel keeps its
-intensity as it moves, so for the currently warped moving image W and the fixed
+The models start from brightness constancy under a local displacement, so for
+the currently warped source image W and the fixed
 image F, the displacement increment d must satisfy
 
     d . grad(W)  +  (W - F)  =  0
 
 That is ONE equation per voxel in THREE unknowns -- the aperture problem. You can
-see motion across an edge but not along it. The three models differ only in how
-they supply the missing information.
+infer displacement across an edge but not along it. The models supply additional
+information through spatial support, regularity, or gradient constancy.
 
   demons  Take the minimum-norm solution, which lies along the gradient:
               d = -(W-F) * grad(W) / ( |grad(W)|^2 + (W-F)^2 / K^2 )
@@ -148,6 +148,12 @@ they supply the missing information.
           neither of the others do. The smoothest and slowest-moving; raise
           -hs_alpha for more rigidity.
 
+  gradient  Experimental LK with brightness AND gradient constancy. Each local
+          3x3 system combines intensity and boundary-shape evidence, weighted by
+          -gradient_weight. Uses -lk_radius/-lk_reg. Updates are capped locally
+          before smoothing so an ambiguous neighbourhood cannot throttle the
+          whole field. Intended for testing; no tuned preset yet.
+
 Rule of thumb: start with demons. Switch to lk if the warp looks like it is
 sliding along boundaries instead of across them. Use hs when large homogeneous
 regions need to be carried by their edges.
@@ -166,10 +172,11 @@ magnitude: edges sit in the same place with the same sign in every modality.
 KEEPING THE FIELD HONEST
 ------------------------
 Nothing in the flow equation knows about topology, so by default each update is
-exponentiated (scaling-and-squaring) and composed rather than added, making every
-increment a diffeomorphism -- the field cannot fold. -save_jacobian writes the
-proof; values <= 0 are folded voxels. -step_mode additive is the classic, faster,
-unguarded update. -final_qwarp then hands the converged field to the ffs_qwarp
+exponentiated (scaling-and-squaring) and composed rather than added. The fold
+guard checks the candidate on the discrete grid and rejects illegal updates;
+pyramid transfers are checked too. -save_jacobian records the determinant;
+values <= 0 are folded voxels. -step_mode additive uses addition with the same
+guard. -final_qwarp then hands the converged field to the ffs_qwarp
 engine for a fine-scale, pure image-match polish: flow is good at FINDING the
 deformation, patch optimization is good at nailing the last half-voxel.
 
@@ -348,7 +355,8 @@ def parse_args(
         "blind to motion along an edge. lk: least-squares a 3x3 system over a "
         "neighbourhood - sees motion along edges, needs local structure. hs: global "
         "smoothness prior by Jacobi relaxation - propagates flow from textured regions "
-        "into flat ones, smoothest and slowest.",
+        "into flat ones, smoothest and slowest. gradient: experimental local LK flow "
+        "using brightness and gradient constancy, with locally capped updates.",
     )
     flow.add_argument(
         "-asymmetric_force",
@@ -395,6 +403,13 @@ def parse_args(
         type=float,
         default=_D.lk_reg,
         help="Ridge on the LK structure tensor, relative to its mean trace.",
+    )
+    flow.add_argument(
+        "-gradient_weight",
+        type=float,
+        default=_D.gradient_weight,
+        help="-force gradient: relative weight of gradient constancy (0 = brightness "
+        "only). Uses -lk_radius and -lk_reg. Experimental; no tuned preset yet.",
     )
     flow.add_argument(
         "-hs_alpha", "-hs-alpha", type=float, default=1.0, help="Horn-Schunck smoothness weight."
@@ -620,6 +635,7 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
         demons_noise=args.demons_noise,
         lk_radius=args.lk_radius,
         lk_reg=args.lk_reg,
+        gradient_weight=args.gradient_weight,
         hs_alpha=args.hs_alpha,
         hs_iters=args.hs_iters,
         step_mode=args.step_mode,

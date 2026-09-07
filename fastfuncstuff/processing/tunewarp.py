@@ -150,6 +150,7 @@ DRIVERS = {
     "optiwarp_demons": _run_optiwarp("demons"),
     "optiwarp_lk": _run_optiwarp("lk"),
     "optiwarp_hs": _run_optiwarp("hs"),
+    "optiwarp_gradient": _run_optiwarp("gradient"),
 }
 
 

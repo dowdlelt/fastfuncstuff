@@ -405,6 +405,7 @@ class TestFlagsMatchTheRealCLIs:
         "optiwarp_demons": "optiwarp",
         "optiwarp_lk": "optiwarp",
         "optiwarp_hs": "optiwarp",
+        "optiwarp_gradient": "optiwarp",
     }
 
     def test_every_flag_parses(self):

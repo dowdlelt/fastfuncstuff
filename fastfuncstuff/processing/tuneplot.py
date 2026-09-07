@@ -50,6 +50,7 @@ BACKEND_MARKERS: dict[str, str] = {
     "optiwarp_demons": "^",
     "optiwarp_lk": "<",
     "optiwarp_hs": ">",
+    "optiwarp_gradient": "v",
 }
 _FALLBACK_MARKER = "P"
 

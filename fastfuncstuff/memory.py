@@ -932,10 +932,14 @@ def estimate_nonlinear_memory_bytes(
         # the larger branch with a small margin; tensor-live counts alone badly
         # underpredict the allocator peak because they omit backend workspaces.
         volume_equivalents = 250
-    elif engine == "optiwarp":
+    elif engine in ("optiwarp", "optiwarp_gradient"):
         # Images/weights, forward/best/update fields, gradients, composition,
         # Jacobian and smoothing scratch. LK is the largest force model.
-        volume_equivalents = 28
+        # Gradient flow also holds Hessians, four-channel normal equations and
+        # normalized cofactors. Reserve room for convolution/allocator scratch.
+        # The 193x229x193 gradient-flow CLI peaked at 5.95 GiB allocated on CUDA,
+        # including final interpolation. 220 equivalents provide a margin.
+        volume_equivalents = 220 if engine == "optiwarp_gradient" else 28
     elif engine == "qwarp":
         # Images/weights/warps plus the full-volume level-0 basis, coordinate,
         # interpolation, correlation, and Jacobian working sets.

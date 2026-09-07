@@ -383,6 +383,19 @@ _OW_FORCE = {
 }
 
 
+_OW_FORCE["gradient"] = _OW_FORCE["lk"] + (
+    ParamSpec(
+        "optiwarp.gradient_weight",
+        "-gradient_weight",
+        (0.0, 1.0, 2.0, 4.0),
+        2.0,
+        "model",
+        "Relative gradient-constancy weight in experimental multi-channel flow.",
+        bounds=(0.0, None),
+    ),
+)
+
+
 def _optiwarp(force: str) -> BackendSpec:
     return BackendSpec(
         name=f"optiwarp_{force}",
@@ -401,6 +414,7 @@ BACKENDS: dict[str, BackendSpec] = {
         _optiwarp("demons"),
         _optiwarp("lk"),
         _optiwarp("hs"),
+        _optiwarp("gradient"),
     )
 }
 
@@ -419,6 +433,7 @@ BACKEND_FIXED_ARGS: dict[str, list[str]] = {
     "optiwarp_demons": ["-force", "demons"],
     "optiwarp_lk": ["-force", "lk"],
     "optiwarp_hs": ["-force", "hs"],
+    "optiwarp_gradient": ["-force", "gradient"],
 }
 
 

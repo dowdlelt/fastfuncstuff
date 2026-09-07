@@ -61,6 +61,57 @@ def test_lk_flat_image_has_zero_flow():
     assert all(torch.isfinite(v).all() and torch.count_nonzero(v) == 0 for v in result)
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+def test_gradient_flow_matches_four_channel_normal_equations(device):
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+
+    rng = torch.Generator().manual_seed(12)
+    warped = torch.randn(9, 9, 9, generator=rng).to(device)
+    fixed = torch.randn(9, 9, 9, generator=rng).to(device)
+    weight = torch.rand(9, 9, 9, generator=rng).to(device)
+    grad, fixed_grad = _grad3(warped), _grad3(fixed)
+    rows = [grad] + [_grad3(g) for g in grad]
+    residuals = [warped - fixed] + [a - b for a, b in zip(grad, fixed_grad, strict=True)]
+
+    def box(v):
+        return _separable_smooth_3d(v * weight, 2.0, kernel_type="box")
+
+    matrix = torch.zeros(9, 9, 9, 3, 3, device=device)
+    rhs = torch.zeros(9, 9, 9, 3, device=device)
+    for row, residual, factor in zip(rows, residuals, [1, 2, 2, 2], strict=True):
+        for i in range(3):
+            rhs[..., i] -= factor * box(row[i] * residual)
+            for j in range(3):
+                matrix[..., i, j] += factor * box(row[i] * row[j])
+    ridge = 0.01 * matrix.diagonal(dim1=-2, dim2=-1).mean()
+    matrix += ridge * torch.eye(3, device=device)
+    expected = torch.linalg.solve(matrix, rhs.unsqueeze(-1)).squeeze(-1)
+    actual = torch.stack(
+        _flow_lk(
+            warped,
+            fixed,
+            grad,
+            2,
+            0.01,
+            weight,
+            gradient_weight=2.0,
+            fixed_grad=fixed_grad,
+        ),
+        -1,
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-6, rtol=2e-5)
+
+
+def test_gradient_backend_cli_and_tuner_parameters():
+    from fastfuncstuff.cli.optiwarp import _build_config, parse_args
+    from fastfuncstuff.processing.tunespec import BACKEND_FIXED_ARGS, BACKENDS
+
+    cfg = _build_config(parse_args(["-force", "gradient", "-gradient-weight", "3.5"]))
+    assert cfg.force == "gradient" and cfg.gradient_weight == 3.5
+    assert BACKEND_FIXED_ARGS["optiwarp_gradient"] == ["-force", "gradient"]
+    assert any(p.name == "optiwarp.gradient_weight" for p in BACKENDS["optiwarp_gradient"].params)
+
+
 def test_flow_rejects_fold_when_damping_budget_is_exhausted():
     _, _, x = torch.meshgrid(*[torch.arange(9).float()] * 3, indexing="ij")
     zero = torch.zeros_like(x)
@@ -192,16 +243,20 @@ def test_prep_localnorm_inverts_under_contrast_inversion():
     assert corr("gradmag") > 0.99  # edge magnitude is sign-free
 
 
-@pytest.mark.parametrize("force", ["demons", "lk", "hs"])
-def test_recovers_a_known_smooth_warp(force):
+@pytest.mark.parametrize(
+    "force,device",
+    [(force, "cpu") for force in ("demons", "lk", "hs", "gradient")]
+    + [pytest.param("gradient", "cuda", marks=pytest.mark.gpu)],
+)
+def test_recovers_a_known_smooth_warp(force, device):
     """The headline check: warp a phantom by a known field, then recover it.
 
     Each flow model must both (a) improve the image match a lot and (b) get the
     displacement field itself close to truth — matching the image while inventing the
     wrong deformation is the failure mode a correlation-only test would miss.
     """
-    fixed = _blobs()
-    truth = _smooth_field(fixed.shape, amp=2.5)
+    fixed = _blobs().to(device)
+    truth = tuple(v.to(device) for v in _smooth_field(fixed.shape, amp=2.5))
     moving_from_fixed = warp_image_linear(fixed, *truth)
 
     # `fixed` warped by `truth` is the moving image seen through the warp we want to
@@ -231,6 +286,7 @@ def test_recovers_a_known_smooth_warp(force):
     err = torch.sqrt(sum((res.fwd[i][core] - truth[i][core]) ** 2 for i in range(3))).mean()
     truth_mag = torch.sqrt(sum(truth[i][core] ** 2 for i in range(3))).mean()
     assert err < 0.4 * truth_mag, f"{force}: mean field error {err:.3f} vs truth {truth_mag:.3f}"
+    assert res.min_jacobian >= cfg.jac_floor
 
 
 def test_diffeo_step_keeps_the_field_foldless():

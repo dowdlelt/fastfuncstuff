@@ -89,6 +89,7 @@ def test_nonlinear_memory_models_scale_and_order_engines():
     syn = estimate_nonlinear_memory_bytes(shape, "formwarp")
     qwarp = estimate_nonlinear_memory_bytes(shape, "qwarp")
     assert opti < syn < qwarp
+    assert opti < estimate_nonlinear_memory_bytes(shape, "optiwarp_gradient") < syn
     assert estimate_nonlinear_memory_bytes((128, 64, 64), "optiwarp") == 2 * opti
     assert estimate_nonlinear_memory_bytes(shape, "qwarp", n_sources=3) > qwarp
 
