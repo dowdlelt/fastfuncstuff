@@ -48,6 +48,64 @@ def _set_triton_interp_unavailable(message: str) -> None:
 _CPU_GRID_SPLIT_MIN_POINTS = 1 << 13
 
 
+# aten's integer spelling of the mode. No bicubic: grid_sampler_3d has none,
+# so an unknown mode declines the split and raises from the stock call as before.
+_INTERP_MODE_CODES = {"bilinear": 0, "nearest": 1}
+_PADDING_MODE_BORDER = 1
+
+
+class _LaneGridSample3d(torch.autograd.Function):
+    """``grid_sampler_3d`` over pre-dealt lanes, differentiable in the grid only.
+
+    The lane split (see :func:`_grid_sample_3d_cpu_threaded`) is what lets ATen
+    thread the sample, but plain autograd cannot use it: the source is shared
+    across lanes by ``expand``, so a grad_input would be materialised once per
+    lane before being summed back down -- one full volume per core.
+
+    Every FFS caller that backwards through the sampler differentiates the
+    *transform*, not the image: the volume is data. So this asks the backward
+    kernel for grad_grid alone (``output_mask``), which is per-point, needs no
+    cross-lane reduction, and allocates nothing beyond the grid. The backward
+    kernel threads over the batch exactly like the forward one.
+    """
+
+    @staticmethod
+    def forward(  # type: ignore[override]
+        ctx,
+        input: Tensor,
+        lane_grid: Tensor,
+        interp_mode: int,
+        padding_mode: int,
+        align_corners: bool,
+    ) -> Tensor:
+        lanes = lane_grid.shape[0]
+        expanded = input.expand(lanes, -1, -1, -1, -1)
+        with torch.no_grad():
+            out = torch.ops.aten.grid_sampler_3d(
+                expanded, lane_grid, interp_mode, padding_mode, align_corners
+            )
+        ctx.save_for_backward(input, lane_grid)
+        ctx.sampler_config = (interp_mode, padding_mode, align_corners)
+        return out
+
+    @staticmethod
+    def backward(ctx, *grad_outputs: Tensor):
+        (grad_output,) = grad_outputs
+        input, lane_grid = ctx.saved_tensors
+        interp_mode, padding_mode, align_corners = ctx.sampler_config
+        expanded = input.expand(lane_grid.shape[0], -1, -1, -1, -1)
+        _, grad_grid = torch.ops.aten.grid_sampler_3d_backward(
+            grad_output.contiguous(),
+            expanded,
+            lane_grid,
+            interp_mode,
+            padding_mode,
+            align_corners,
+            [False, True],
+        )
+        return None, grad_grid, None, None, None
+
+
 def _grid_sample_3d_cpu_threaded(
     input: Tensor,
     grid: Tensor,
@@ -75,10 +133,14 @@ def _grid_sample_3d_cpu_threaded(
     lanes = torch.get_num_threads()
     if lanes < 2:
         return None
-    # Autograd would allocate grad_input for the EXPANDED source -- one full
-    # volume per lane -- before summing it back down. The registration refiners
-    # backward through this, so leave those on the single-threaded path.
-    if input.requires_grad or grid.requires_grad:
+    # A grad_input would be one full volume per lane (the source is shared by
+    # stride-0 expand) before the sum back down. Nothing in FFS differentiates
+    # the image -- the refiners differentiate the transform -- so that case is
+    # left on the single-threaded path rather than given a memory cliff.
+    if input.requires_grad:
+        return None
+    interp_mode = _INTERP_MODE_CODES.get(mode)
+    if interp_mode is None:
         return None
     n_points = grid.shape[1] * grid.shape[2] * grid.shape[3]
     if n_points < _CPU_GRID_SPLIT_MIN_POINTS:
@@ -90,16 +152,18 @@ def _grid_sample_3d_cpu_threaded(
     if pad:
         # Repeat the last point rather than inventing coordinates: the padding is
         # trimmed off below, and a real in-bounds point cannot trip any clamping.
-        flat = torch.cat([flat, flat[:, -1:].expand(1, pad, 1, 1, 3)], dim=1)
+        # Detached so the duplicate never routes gradient back into the real
+        # point it was copied from.
+        flat = torch.cat([flat, flat[:, -1:].detach().expand(1, pad, 1, 1, 3)], dim=1)
     per_lane = (n_points + pad) // lanes
 
     channels = input.shape[1]
-    sampled = F.grid_sample(
-        input.expand(lanes, -1, -1, -1, -1),
+    sampled = _LaneGridSample3d.apply(
+        input,
         flat.reshape(lanes, per_lane, 1, 1, 3),
-        mode=mode,
-        padding_mode="border",
-        align_corners=align_corners,
+        interp_mode,
+        _PADDING_MODE_BORDER,
+        align_corners,
     )  # (lanes, C, per_lane, 1, 1)
     # Lane l holds points [l*per_lane, (l+1)*per_lane), so concatenating the lanes
     # in order restores the caller's point order.

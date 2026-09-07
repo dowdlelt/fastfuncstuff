@@ -58,13 +58,28 @@ def test_multichannel_sources_keep_their_channel_order():
     assert torch.equal(_grid_sample_3d(src, grid), _stock(src, grid))
 
 
-def test_autograd_stays_on_the_single_threaded_path():
-    """Expanding the source would make grad_input one full volume per lane."""
+def test_grid_gradients_are_bit_identical_through_the_split():
+    """The refiners backward through this every iteration -- it is the hot path,
+    not an edge case, so the split has to hold in the backward too."""
     src = _source()
-    grid = _grid(_CPU_GRID_SPLIT_MIN_POINTS, 1, 1).requires_grad_(True)
+    shape = (9973, 1, 1)  # uneven lanes: the padded slots must contribute nothing
+    threaded = _grid(*shape).requires_grad_(True)
+    stock = _grid(*shape).requires_grad_(True)
+    assert _grid_sample_3d_cpu_threaded(src, threaded, "bilinear", True) is not None
+
+    weights = torch.linspace(-1.0, 1.0, 9973).reshape(1, 1, 9973, 1, 1)
+    (_grid_sample_3d(src, threaded) * weights).sum().backward()
+    (_stock(src, stock) * weights).sum().backward()
+    assert torch.equal(threaded.grad, stock.grad)
+
+
+def test_a_differentiable_source_stays_on_the_single_threaded_path():
+    """Expanding the source would make grad_input one full volume per lane."""
+    src = _source().requires_grad_(True)
+    grid = _grid(_CPU_GRID_SPLIT_MIN_POINTS, 1, 1)
     assert _grid_sample_3d_cpu_threaded(src, grid, "bilinear", True) is None
     _grid_sample_3d(src, grid).sum().backward()
-    assert grid.grad is not None and torch.isfinite(grid.grad).all()
+    assert src.grad is not None and torch.isfinite(src.grad).all()
 
 
 def test_split_declines_when_it_cannot_help():
