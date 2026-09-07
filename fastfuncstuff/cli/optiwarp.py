@@ -552,6 +552,18 @@ def parse_args(
         help="-final_qwarp: smallest qwarp patch size in voxels (3dQwarp -minpatch).",
     )
     qw.add_argument(
+        "-qwarp_start_patch",
+        "-qwarp-start-patch",
+        type=int,
+        default=0,
+        help="-final_qwarp: patch width (voxels) the polish starts at, skipping every "
+        "coarser level. The ladder normally opens on a whole-volume patch, which "
+        "re-solves the global deformation the flow has already found -- and re-solving "
+        "it worse is what ends the hand-off before a fine level ever runs. Set this "
+        "near -minpatch to spend the polish only where patches beat flow. "
+        "0 = the full ladder.",
+    )
+    qw.add_argument(
         "-qwarp_cost",
         "-qwarp-cost",
         type=str,
@@ -619,6 +631,7 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
     if args.final_qwarp:
         qcfg = QwarpConfig(
             minpatch=args.minpatch,
+            start_patch=args.qwarp_start_patch,
             cost_method=args.qwarp_cost,
             penalty_factor=args.qwarp_penfac,
             warp_flags=warp_flags,
