@@ -166,34 +166,43 @@ class InstaCorrMode(Mode):
                 progress(fraction, message)
 
         device = self.session.store.device if self.session is not None else torch.device("cpu")
-        step(0.05, "reading")
-        arr = torch.as_tensor(np.ascontiguousarray(self._source), dtype=torch.float32)
-        nx, ny, nz, nt = arr.shape
+        nx, ny, nz, nt = self._source.shape
 
         blur = float(self.params.get("blur") or 0.0)
         if blur > 0:
-            step(0.2, f"blurring {blur:g} mm")
+            step(0.1, f"blur {blur:g} mm")
             from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
 
             sigma = fwhm_mm_to_sigma_vox(blur, self._zooms)
-            vol = arr.permute(3, 0, 1, 2).to(device)
-            data = gaussian3d_batched(vol, sigma).reshape(nt, -1)
+            vol = torch.as_tensor(self._source, dtype=torch.float32)
+            vol = gaussian3d_batched(vol.permute(3, 0, 1, 2).to(device), sigma)
+            # (T,X,Y,Z) -> (V,T). The one transpose in the pipeline, and only
+            # on the opt-in path.
+            data = vol.reshape(nt, -1).T.contiguous()
         else:
-            data = arr.reshape(-1, nt).T.contiguous().to(device)
+            # The store keeps the array C-contiguous, so this is a free view of
+            # data that is already resident -- no copy, no upload on CPU.
+            step(0.1, "arranging")
+            data = torch.as_tensor(self._source, dtype=torch.float32).reshape(-1, nt)
+            if device.type != "cpu":
+                step(0.2, "to device")
+                data = data.to(device)
 
-        step(0.5, "detrending")
+        # Time is the last axis from here on, which is also the axis every
+        # operation below runs along -- so each one reads contiguously.
+        step(0.45, "detrend")
         data = self._detrend(data)
-        step(0.7, "filtering")
+        step(0.65, "filter")
         data = self._bandpass(data)
 
-        step(0.9, "normalizing")
-        data = data - data.mean(0, keepdim=True)
-        norm = data.norm(dim=0, keepdim=True)
+        step(0.85, "normalize")
+        data = data - data.mean(-1, keepdim=True)
+        norm = data.norm(dim=-1, keepdim=True)
         # Constant voxels -- outside the brain, mostly -- would divide by zero
         # and then correlate perfectly with everything.
-        self._valid = (norm > 1e-9).squeeze(0)
+        self._valid = (norm > 1e-9).squeeze(-1)
         data = data / norm.clamp(min=1e-9)
-        self._prepared = torch.where(self._valid.unsqueeze(0), data, torch.zeros_like(data))
+        self._prepared = torch.where(self._valid.unsqueeze(-1), data, torch.zeros_like(data))
         self._shape = (nx, ny, nz)
         self._dirty = False
         step(1.0, "ready")
@@ -206,9 +215,9 @@ class InstaCorrMode(Mode):
             return data
         from fastfuncstuff.glm.core import construct_polynomial_matrix
 
-        poly = construct_polynomial_matrix(data.shape[0], order, data.device, data.dtype)
-        q, _ = torch.linalg.qr(poly)
-        return data - q @ (q.T @ data)
+        poly = construct_polynomial_matrix(data.shape[-1], order, data.device, data.dtype)
+        q, _ = torch.linalg.qr(poly)  # (T, k)
+        return data - (data @ q) @ q.T
 
     def _bandpass(self, data: torch.Tensor) -> torch.Tensor:
         """Zero the rFFT bins outside the band.
@@ -220,7 +229,7 @@ class InstaCorrMode(Mode):
         ftop = float(self.params.get("ftop") or 0.0)
         if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0:
             return data
-        nt = data.shape[0]
+        nt = data.shape[-1]
         freqs = torch.fft.rfftfreq(nt, d=self._tr).to(data.device)
         keep = torch.ones_like(freqs, dtype=torch.bool)
         if fbot > 0:
@@ -228,8 +237,8 @@ class InstaCorrMode(Mode):
         if ftop > 0:
             keep &= freqs <= ftop
         keep[0] = False  # the mean is handled by centring, not by the filter
-        spec = torch.fft.rfft(data, dim=0) * keep.unsqueeze(1)
-        return torch.fft.irfft(spec, n=nt, dim=0)
+        spec = torch.fft.rfft(data, dim=-1) * keep
+        return torch.fft.irfft(spec, n=nt, dim=-1)
 
     # -- seed ----------------------------------------------------------
     def _seed_timecourse(self) -> torch.Tensor | None:
@@ -247,7 +256,7 @@ class InstaCorrMode(Mode):
             if not (0 <= si < nx and 0 <= sj < ny and 0 <= sk < nz):
                 return None
             flat = (si * ny + sj) * nz + sk
-            return data[:, flat] if bool(valid[flat]) else None
+            return data[flat] if bool(valid[flat]) else None
 
         rad = [max(0, int(radius / z)) for z in self._zooms]
         ii = torch.arange(max(0, si - rad[0]), min(nx, si + rad[0] + 1))
@@ -265,7 +274,7 @@ class InstaCorrMode(Mode):
         flat = flat[valid[flat]]
         if flat.numel() == 0:
             return None
-        seed = data[:, flat].mean(1)
+        seed = data[flat].mean(0)
         seed = seed - seed.mean()
         n = seed.norm()
         return seed / n if float(n) > 1e-9 else None
@@ -277,7 +286,7 @@ class InstaCorrMode(Mode):
         seed = self._seed_timecourse()
         if seed is None:
             return None
-        r = seed @ self._prepared  # the whole correlation
+        r = self._prepared @ seed  # the whole correlation, one mat-vec
         vol = r.reshape(self._shape).cpu().numpy()
         return ComputedOverlay(
             values=np.nan_to_num(vol, nan=0.0),
@@ -296,27 +305,60 @@ class InstaCorrMode(Mode):
         return Aspect.NOTHING
 
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
-        """The prepared signal, which is what was actually correlated."""
-        if self._prepared is None:
-            return []
-        nx, ny, nz = self._shape
+        """The source signal and the prepared one that was actually correlated.
+
+        The source is contributed here because the map displaces its own input
+        from the layer stack, and the graph draws from the stack -- without
+        this, setting a seed would make the very time course the correlation
+        came from disappear from view.
+        """
         i, j, k = ijk
-        if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
-            return []
-        flat = (i * ny + j) * nz + k
-        return [
-            Trace(
-                label="instacorr (prepared)",
-                values=self._prepared[:, flat].cpu().numpy(),
-                x_label="TR",
+        if self._source is not None:
+            nx, ny, nz, _ = self._source.shape
+            if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
+                return []
+        out: list[Trace] = []
+        if self._source is not None:
+            out.append(
+                Trace(
+                    label="source",
+                    values=np.asarray(self._source[i, j, k, :], dtype=np.float32),
+                    x_label="TR",
+                )
             )
-        ]
+        if self._prepared is not None:
+            nx, ny, nz = self._shape
+            if 0 <= i < nx and 0 <= j < ny and 0 <= k < nz:
+                flat = (i * ny + j) * nz + k
+                out.append(
+                    Trace(
+                        label="prepared",
+                        values=self._prepared[flat].cpu().numpy(),
+                        x_label="TR",
+                    )
+                )
+        return out
+
+    def residency(self) -> str:
+        """Where the prepared data lives and how much of it there is.
+
+        Worth surfacing: the whole design rests on the prepared array staying
+        resident between clicks, and a status line that says so is the
+        difference between trusting that and guessing.
+        """
+        if self._prepared is None:
+            return ""
+        gb = self._prepared.numel() * self._prepared.element_size() / 1e9
+        return f"{gb:.2f} GB on {self._prepared.device.type}"
 
     def status(self) -> str:
         if self._source is None:
             return "instacorr: needs a 4-D dataset"
-        if self.session is None or self.session.state.seed is None:
-            return "instacorr: ctrl-click to set a seed"
-        if self._prepared is None:
+        if self._preparing:
             return "instacorr: preparing…"
-        return f"instacorr: seed {self.session.state.seed}"
+        if self._prepared is None:
+            return "instacorr: ready to prepare"
+        where = self.residency()
+        if self.session is None or self.session.state.seed is None:
+            return f"instacorr: ctrl-click to set a seed  ·  {where}"
+        return f"instacorr: seed {self.session.state.seed}  ·  {where}"

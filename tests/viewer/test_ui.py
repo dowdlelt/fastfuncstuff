@@ -288,6 +288,59 @@ def test_the_colour_bar_tracks_the_selected_layer(win, qapp):
     assert win.colorbar._threshold == layer.threshold
 
 
+# ---------------------------------------------------------------------------
+# the bar is a view of the layer, so it must follow every aspect that changes it
+# ---------------------------------------------------------------------------
+
+
+def test_the_bar_follows_a_colormap_change(win, qapp):
+    """It listened only for LAYERS, so a colour change left it showing the old scale."""
+    from fastfuncstuff.viewer.vocab import SetColormap
+
+    win.layer_list.setCurrentRow(0)
+    key = win.session.state.layers.overlay.key
+    win.refresh(win.session.do(SetColormap(key, "viridis")))
+    qapp.processEvents()
+    assert win.colorbar._lut_name == "viridis"
+
+
+def test_the_bar_follows_a_threshold_change(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetThreshold
+
+    win.layer_list.setCurrentRow(0)
+    key = win.session.state.layers.overlay.key
+    win.refresh(win.session.do(SetThreshold(key, 1.25)))
+    qapp.processEvents()
+    assert win.colorbar._threshold == pytest.approx(1.25)
+    assert win.thr_spin.value() == pytest.approx(1.25)
+
+
+def test_the_bar_follows_a_range_change(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetRange
+
+    win.layer_list.setCurrentRow(0)
+    key = win.session.state.layers.overlay.key
+    win.refresh(win.session.do(SetRange(key, -3.0, 12.0)))
+    qapp.processEvents()
+    assert win.colorbar._hi == pytest.approx(12.0)
+    assert win.max_spin.value() == pytest.approx(12.0)
+
+
+def test_typing_a_threshold_applies_it(win, qapp):
+    win.layer_list.setCurrentRow(0)
+    win.thr_spin.setValue(0.8)
+    qapp.processEvents()
+    assert win.session.state.layers.overlay.threshold == pytest.approx(0.8)
+
+
+def test_clicking_the_bar_sets_the_threshold(win, qapp):
+    """The bar is a control, not just a picture."""
+    win.layer_list.setCurrentRow(0)
+    win.colorbar.clicked.emit(2.5)
+    qapp.processEvents()
+    assert win.session.state.layers.overlay.threshold == pytest.approx(2.5)
+
+
 def test_the_threshold_slider_spans_the_larger_half_of_the_range(win, qapp):
     """A one-sided map must not waste half its travel on values it never shows."""
     win.layer_list.setCurrentRow(0)
@@ -337,3 +390,83 @@ def test_a_disabled_optional_control_reads_as_off(win, qapp):
 
 def test_the_progress_bar_is_hidden_when_idle(win):
     assert not win.progress.isVisible()
+
+
+# ---------------------------------------------------------------------------
+# keyboard help
+# ---------------------------------------------------------------------------
+
+
+def test_h_opens_a_shortcut_list_for_the_window(win, qapp):
+    win.help.toggle()
+    qapp.processEvents()
+    assert win.help._dialog.isVisible()
+    assert "viewer" in win.help._dialog.windowTitle()
+
+
+def test_h_toggles_the_list_closed(win, qapp):
+    win.help.toggle()
+    qapp.processEvents()
+    win.help.toggle()
+    qapp.processEvents()
+    assert not win.help._dialog.isVisible()
+
+
+def test_every_listed_key_is_grouped_and_described(win):
+    for binding in win.help._bindings:
+        assert binding.description, f"{binding.keys} has no description"
+        assert binding.group, f"{binding.keys} has no group"
+
+
+def test_the_help_lists_the_keys_that_are_actually_installed(win):
+    """One table drives both, so documented and installed cannot drift apart."""
+    from PySide6 import QtGui
+
+    installed = {
+        a.shortcut().toString().lower() for a in win.actions() if not a.shortcut().isEmpty()
+    }
+    for binding in win.help._bindings:
+        if binding.action is None:
+            continue  # mouse gestures are listed but not shortcuts
+        spelling = QtGui.QKeySequence(binding.keys).toString().lower()
+        assert spelling in installed, f"{binding.keys} is listed but not installed"
+
+
+def test_a_graph_window_has_its_own_keys(win, qapp):
+    win._graph_buttons[Plane.AXIAL].setChecked(True)
+    qapp.processEvents()
+    graph = win._graphs["axial"]
+    assert graph.help._bindings
+    assert {b.group for b in graph.help._bindings} != {b.group for b in win.help._bindings}
+
+
+# ---------------------------------------------------------------------------
+# the graph must not lose the trace the map was computed from
+# ---------------------------------------------------------------------------
+
+
+def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
+    """The map displaces its input from the stack; the trace must survive."""
+    from fastfuncstuff.viewer.vocab import SetIJK, SetMode, SetOverlay, SetSeed
+
+    rng = np.random.default_rng(41)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    img = nib.Nifti1Image(rng.normal(size=(8, 9, 7, 30)).astype(np.float32), aff)
+    img.header["pixdim"][4] = 2.0
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(tmp_path / "bold.nii.gz"))
+
+    win.refresh(win.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
+    win.session.store.ensure_ram(win.session.state.layers.overlay.key)
+    win._graph_buttons[Plane.AXIAL].setChecked(True)
+    qapp.processEvents()
+
+    win.refresh(win.session.do(SetMode("instacorr")))
+    assert win.session.mode.prepare()
+    win.refresh(win.session.do(SetSeed(3, 4, 3)))
+    win.refresh(win.session.do(SetIJK(3, 4, 3)))
+    qapp.processEvents()
+
+    labels = [t[0] for t in win._graphs["axial"].graph._cells[0].traces]
+    assert "source" in labels, f"the correlated time course vanished: {labels}"
+    assert "prepared" in labels

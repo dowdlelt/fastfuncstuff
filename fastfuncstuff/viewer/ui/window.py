@@ -30,10 +30,11 @@ from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import plane_axes, voxel_value
 from fastfuncstuff.viewer.state import Plane
-from fastfuncstuff.viewer.ui.colorbar import ColorBar
+from fastfuncstuff.viewer.ui.colorbar import RangeBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.gridgraph import GridGraphWindow
 from fastfuncstuff.viewer.ui.panes import ImagePane
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
@@ -390,41 +391,23 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         form.addRow(self._head("ALPHA"), self.alpha_box)
 
+        # Min, threshold and max are edited on the bar itself. Splitting the
+        # number from the picture of the number is what let the bar go stale.
         self.thr_head = self._head("THRESH")
-        self.thr_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        self.thr_slider.setRange(0, 1000)
-        self.thr_slider.valueChanged.connect(self._threshold_moved)
-        form.addRow(self.thr_head, self.thr_slider)
+        self.rangebar = RangeBar()
+        self.rangebar.range_changed.connect(self._range_changed)
+        self.rangebar.threshold_changed.connect(self._threshold_changed)
+        self.rangebar.autorange_requested.connect(self._autorange)
+        form.addRow(self.thr_head, self.rangebar)
 
-        self.thr_label = QtWidgets.QLabel("0")
-        self.thr_label.setObjectName("value")
-        form.addRow(QtWidgets.QLabel(""), self.thr_label)
-
-        # Min and max are separate boxes, not a symmetric "range": a stats map
-        # is routinely asymmetric, and forcing one number to set both is how
-        # people end up unable to show what they are looking at.
-        range_row = QtWidgets.QWidget()
-        rh = QtWidgets.QHBoxLayout(range_row)
-        rh.setContentsMargins(0, 0, 0, 0)
-        rh.setSpacing(5)
-        self.min_spin = QtWidgets.QDoubleSpinBox()
-        self.max_spin = QtWidgets.QDoubleSpinBox()
-        for spin in (self.min_spin, self.max_spin):
-            spin.setDecimals(4)
-            spin.setRange(-1e9, 1e9)
-            spin.setKeyboardTracking(False)  # apply on commit, not per keystroke
-            spin.editingFinished.connect(self._range_changed)
-            spin.valueChanged.connect(lambda _: self._range_changed())
-            rh.addWidget(spin, 1)
-        form.addRow(self._head("MIN / MAX"), range_row)
-
-        self.autorange_button = QtWidgets.QPushButton("auto")
-        self.autorange_button.setToolTip("Re-derive min and max from the data (2-98%)")
-        self.autorange_button.clicked.connect(self._autorange)
-        form.addRow(QtWidgets.QLabel(""), self.autorange_button)
-
-        self.colorbar = ColorBar()
-        form.addRow(self.colorbar)
+        # Kept as attributes so the rest of the window (and the tests) address
+        # them by the name of the thing they control, not through the composite.
+        self.min_spin = self.rangebar.min_spin
+        self.max_spin = self.rangebar.max_spin
+        self.thr_spin = self.rangebar.thr_spin
+        self.thr_slider = self.rangebar.slider
+        self.colorbar = self.rangebar.bar
+        self.autorange_button = self.rangebar.auto_button
 
         self.opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.opacity_slider.setRange(0, 100)
@@ -488,38 +471,47 @@ class ViewerWindow(QtWidgets.QMainWindow):
     # input
     # ------------------------------------------------------------------
     def _install_shortcuts(self) -> None:
-        binds: list[tuple[str, object]] = [
-            ("Left", lambda: self._nudge(0, -1)),
-            ("Right", lambda: self._nudge(0, 1)),
-            ("Down", lambda: self._nudge(1, -1)),
-            ("Up", lambda: self._nudge(1, 1)),
-            ("PgDown", lambda: self._nudge(2, -1)),
-            ("PgUp", lambda: self._nudge(2, 1)),
-            (",", lambda: self._step_time(-1)),
-            (".", lambda: self._step_time(1)),
-            ("v", self._toggle_play),
-            ("space", self._toggle_visible),
-            ("[", lambda: self._cycle_layer(-1)),
-            ("]", lambda: self._cycle_layer(1)),
-            ("t", lambda: self._nudge_threshold(-0.05)),
-            ("Shift+T", lambda: self._nudge_threshold(0.05)),
-            ("a", self._cycle_alpha),
-            ("b", self.boxed_check.toggle),
-            ("s", self._cycle_sign),
-            ("c", self._cycle_colormap),
-            ("1", self._pane_buttons[Plane.AXIAL].toggle),
-            ("2", self._pane_buttons[Plane.SAGITTAL].toggle),
-            ("3", self._pane_buttons[Plane.CORONAL].toggle),
-            ("g", self._graph_buttons[Plane.AXIAL].toggle),
-            ("p", self.panel_button.toggle),
-            ("Ctrl+O", self._read_dialog),
-            ("Ctrl+S", self._save_script_dialog),
-        ]
-        for seq, fn in binds:
-            act = QtGui.QAction(self)
-            act.setShortcut(QtGui.QKeySequence(seq))
-            act.triggered.connect(fn)  # type: ignore[arg-type]
-            self.addAction(act)
+        """Declare every key once. The help panel reads this same table."""
+        self.help = ShortcutHelp(self, "viewer")
+        self.help.apply(
+            [
+                Binding("Left", "crosshair -x", lambda: self._nudge(0, -1), group="navigate"),
+                Binding("Right", "crosshair +x", lambda: self._nudge(0, 1), group="navigate"),
+                Binding("Down", "crosshair -y", lambda: self._nudge(1, -1), group="navigate"),
+                Binding("Up", "crosshair +y", lambda: self._nudge(1, 1), group="navigate"),
+                Binding("PgDn", "crosshair -z", lambda: self._nudge(2, -1), group="navigate"),
+                Binding("PgUp", "crosshair +z", lambda: self._nudge(2, 1), group="navigate"),
+                Binding("click", "move the crosshair", None, group="navigate"),
+                Binding("ctrl+click", "set the InstaCorr seed", None, group="navigate"),
+                Binding("scroll", "step through slices", None, group="navigate"),
+                Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
+                Binding(".", "next volume", lambda: self._step_time(1), group="time"),
+                Binding("v", "play / pause", self._toggle_play, group="time"),
+                Binding("1", "toggle axial", self._pane_buttons[Plane.AXIAL].toggle, group="view"),
+                Binding(
+                    "2", "toggle sagittal", self._pane_buttons[Plane.SAGITTAL].toggle, group="view"
+                ),
+                Binding(
+                    "3", "toggle coronal", self._pane_buttons[Plane.CORONAL].toggle, group="view"
+                ),
+                Binding(
+                    "g", "axial graph window", self._graph_buttons[Plane.AXIAL].toggle, group="view"
+                ),
+                Binding("p", "toggle the panel", self.panel_button.toggle, group="view"),
+                Binding("[", "previous layer", lambda: self._cycle_layer(-1), group="layer"),
+                Binding("]", "next layer", lambda: self._cycle_layer(1), group="layer"),
+                Binding("space", "show / hide layer", self._toggle_visible, group="layer"),
+                Binding("t", "threshold down", lambda: self._nudge_threshold(-0.05), group="layer"),
+                Binding("T", "threshold up", lambda: self._nudge_threshold(0.05), group="layer"),
+                Binding("c", "next colormap", self._cycle_colormap, group="layer"),
+                Binding("s", "next sign mode", self._cycle_sign, group="layer"),
+                Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
+                Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
+                Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
+                Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
+                Binding("h", "this list", self.help.toggle, group="session"),
+            ]
+        )
 
     def current_key(self) -> str | None:
         row = self.layer_list.currentRow()
@@ -573,24 +565,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if n:
             self.layer_list.setCurrentRow((self.layer_list.currentRow() + delta) % n)
 
-    def _threshold_moved(self, tick: int) -> None:
+    def _range_changed(self, lo: float, hi: float) -> None:
         key = self.current_key()
-        if key is None:
-            return
-        layer = self.session.state.layers.get(key)
-        hi = max(abs(layer.range_hi or 0.0), abs(layer.range_lo or 0.0)) or 1.0
-        value = tick / 1000.0 * hi
-        self.refresh(self.session.do(SetThreshold(key, value)))
-        self.thr_label.setText(f"{value:.4g}")
+        if key is not None:
+            self.refresh(self.session.do(SetRange(key, lo, hi)))
 
-    def _range_changed(self) -> None:
+    def _threshold_changed(self, value: float) -> None:
         key = self.current_key()
-        if key is None:
-            return
-        lo, hi = self.min_spin.value(), self.max_spin.value()
-        if lo == hi:
-            return  # a collapsed range shows nothing; wait for the other box
-        self.refresh(self.session.do(SetRange(key, lo, hi)))
+        if key is not None:
+            self.refresh(self.session.do(SetThreshold(key, value)))
 
     def _autorange(self) -> None:
         key = self.current_key()
@@ -610,7 +593,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(self.session.do(SetLayerOpacity(key, value / 100.0)))
 
     def _nudge_threshold(self, frac: float) -> None:
-        self.thr_slider.setValue(max(0, min(1000, self.thr_slider.value() + int(frac * 1000))))
+        slider = self.rangebar.slider
+        slider.setValue(max(0, min(1000, slider.value() + int(frac * 1000))))
 
     def _cycle_combo(self, box: QtWidgets.QComboBox, cls, kwarg: str) -> None:
         i = (box.currentIndex() + 1) % max(box.count(), 1)
@@ -694,6 +678,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._sync_layer_list()
             self._sync_pickers()
             self._sync_mode_panel()
+        elif dirty & (Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.SLICES):
+            # The bar is a view of colormap, range and threshold, so it has to
+            # follow those aspects and not only LAYERS -- listening for the
+            # wrong one is what left it showing the previous colour scale.
+            self._sync_layer_controls()
         if dirty & (Aspect.SLICES | Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.TIME | Aspect.GRID):
             self._redraw_panes()
         if dirty & (Aspect.CROSSHAIR | Aspect.GRID):
@@ -794,28 +783,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setChecked(value)
             check.setEnabled(enabled)
             check.blockSignals(False)
-        lo_v = float(layer.range_lo if layer.range_lo is not None else 0.0)
-        hi_v = float(layer.range_hi if layer.range_hi is not None else 1.0)
-        for spin, value in ((self.min_spin, lo_v), (self.max_spin, hi_v)):
-            spin.blockSignals(True)
-            step = max(abs(hi_v - lo_v) / 100.0, 1e-4)
-            spin.setSingleStep(step)
-            spin.setValue(value)
-            spin.blockSignals(False)
-
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))
         self.opacity_slider.blockSignals(False)
         self.opacity_label.setText(f"{int(round(layer.opacity * 100))}%")
-
-        # The threshold slider spans the larger half of the display range, so a
-        # one-sided map does not waste half its travel on values it never shows.
-        hi = max(abs(hi_v), abs(lo_v)) or 1.0
-        self.thr_slider.blockSignals(True)
-        self.thr_slider.setValue(int(layer.threshold / hi * 1000))
-        self.thr_slider.blockSignals(False)
-        self.thr_label.setText(f"{layer.threshold:.4g}")
-        self.colorbar.set_layer(layer)
+        self.rangebar.configure(layer)
         # One slider in every mode; only what its numbers mean moves.
         kind = self.session.mode.overlay_kind if layer.is_computed else OverlayKind.VALUE
         self.thr_head.setText(

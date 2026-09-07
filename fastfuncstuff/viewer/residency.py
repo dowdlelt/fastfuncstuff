@@ -267,6 +267,13 @@ class VolumeStore:
             arr = np.asanyarray(img.dataobj, dtype=np.float32)
             if arr.ndim == 3:
                 arr = arr[..., None]
+            # NIfTI arrives Fortran-ordered. Normalizing to C order once here
+            # costs one copy inside a load the user is already waiting on, and
+            # makes every later (voxels, time) reshape a free view. Left as-is,
+            # that copy was being paid again on every mode preparation --
+            # measured at 1.9 GB of copying per InstaCorr parameter change on a
+            # 1.4 GB dataset, for data that was already resident.
+            arr = np.ascontiguousarray(arr)
         except BaseException as exc:  # surfaced via Resident.error, not swallowed
             with self._lock:
                 res.error = exc

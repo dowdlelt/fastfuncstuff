@@ -19,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.slicing import plane_axes
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 
 SERIES_RGB = (
     (0.49, 0.89, 0.76),
@@ -211,6 +212,20 @@ class GridGraphWindow(QtWidgets.QWidget):
 
         self.graph = GridGraph()
         v.addWidget(self.graph, 1)
+
+        # Its own table: a graph window's keys are not the main window's, and
+        # `h` should show the keys of whatever has focus.
+        self.help = ShortcutHelp(self, f"graph · {plane.value}")
+        self.help.apply(
+            [
+                Binding("1", "one voxel", lambda: self.size_box.setCurrentIndex(0), group="grid"),
+                Binding("4", "four voxels", lambda: self.size_box.setCurrentIndex(1), group="grid"),
+                Binding("9", "nine voxels", lambda: self.size_box.setCurrentIndex(2), group="grid"),
+                Binding("s", "shared scale", self.shared_check.toggle, group="grid"),
+                Binding("h", "this list", self.help.toggle, group="grid"),
+                Binding("w", "close this window", self.close, group="grid"),
+            ]
+        )
         self.refresh()
 
     def _on_shared(self, on: bool) -> None:

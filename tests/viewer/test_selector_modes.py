@@ -603,3 +603,48 @@ def test_preparing_explicitly_then_refreshing_produces_the_map(corr_session):
     assert corr_session.mode.prepare()
     corr_session.refresh_mode()
     assert corr_session.state.layers.find_by_source("mode:instacorr") is not None
+
+
+# ---------------------------------------------------------------------------
+# residency: prepared data must not be re-copied from data already in RAM
+# ---------------------------------------------------------------------------
+
+
+def test_the_store_normalizes_layout_so_reshapes_are_free(corr_session):
+    """NIfTI arrives Fortran-ordered; every later reshape would copy 1.4 GB."""
+    import torch
+
+    key = corr_session.state.layers.overlay.key
+    array = corr_session.store.ensure_ram(key)
+    assert array.flags["C_CONTIGUOUS"], "layout was not normalized at load"
+
+    # The property that matters: (voxels, time) is a view, not a copy.
+    tensor = torch.as_tensor(array)
+    nt = array.shape[-1]
+    assert tensor.reshape(-1, nt).data_ptr() == tensor.data_ptr()
+
+
+def test_preparation_keeps_time_as_the_last_axis(corr_session):
+    """Every operation runs along time, so time must be the contiguous axis."""
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    prepared = corr_session.mode._prepared
+    n_voxels = int(np.prod(corr_session.mode._shape))
+    assert prepared.shape == (n_voxels, 60)
+
+
+def test_the_mode_reports_where_its_data_lives(corr_session):
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    assert "GB on cpu" in corr_session.mode.residency()
+    assert "GB on cpu" in corr_session.mode.status()
+
+
+def test_repeated_seed_moves_do_not_re_prepare(corr_session):
+    """The prepared array stays resident; a click is one mat-vec."""
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    prepared = corr_session.mode._prepared
+    for pos in ((4, 5, 3), (2, 3, 1), (3, 4, 2)):
+        corr_session.do(SetSeed(*pos))
+        assert corr_session.mode._prepared is prepared, "seed move re-prepared"
