@@ -27,6 +27,7 @@ stages:
   - slicetime
   - crossalign
   - align
+  - optiwarp
   - warp
   - glm
   - build_design
