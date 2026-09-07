@@ -30,9 +30,11 @@ from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import plane_axes, voxel_value
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui.colorbar import ColorBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.gridgraph import GridGraphWindow
 from fastfuncstuff.viewer.ui.panes import ImagePane
+from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
     Read,
@@ -41,16 +43,23 @@ from fastfuncstuff.viewer.vocab import (
     SetColormap,
     SetIJK,
     SetIndex,
+    SetLayerOpacity,
     SetLayerVisible,
     SetMode,
     SetModeParam,
     SetOverlay,
+    SetRange,
     SetSeed,
     SetSign,
     SetThreshold,
     SetTimeLinked,
     SetUnderlay,
 )
+
+#: Shown when no dataset is chosen. A picker that names a file while nothing is
+#: displayed reads as a load that failed.
+NONE_LABEL = "(none)"
+PICKER_FONT = "Menlo" if __import__("sys").platform == "darwin" else "monospace"
 
 STYLESHEET = """
 QMainWindow, QWidget { background: #07090B; color: #C9D6DA; }
@@ -75,8 +84,17 @@ QPushButton:hover { background: #16323A; }
 QPushButton:checked { background: #16323A; border-color: #5C8EA0; color: #7DE3C3; }
 QPushButton:disabled { color: #41525A; border-color: #161D22; }
 QCheckBox { color: #6B7D84; font-size: 10px; letter-spacing: 1px; }
+QCheckBox::indicator { width: 12px; height: 12px;
+    border: 1px solid #3A4A52; background: #0E1216; }
+QCheckBox::indicator:checked { background: #7DE3C3; border-color: #7DE3C3; }
+QCheckBox::indicator:disabled { border-color: #202B31; }
 QStatusBar { background: #0E1216; color: #6B7D84;
     font-family: monospace; font-size: 11px; }
+QProgressBar { background: #0E1216; border: 1px solid #1E272C; height: 12px;
+    text-align: center; font-size: 9px; color: #6B7D84; }
+QProgressBar::chunk { background: #5C8EA0; }
+QDoubleSpinBox { background: #0E1216; border: 1px solid #1E272C; padding: 2px 4px;
+    font-family: monospace; font-size: 11px; color: #C9D6DA; }
 QToolBar { background: #0E1216; border: 0; spacing: 5px; padding: 5px 7px; }
 """
 
@@ -109,6 +127,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._build_statusbar()
         self._install_shortcuts()
 
+        # Mode preparation runs on a worker; the mode is told to defer so a
+        # seed click never runs seconds of filtering inside the click handler.
+        self.runner = PreparationRunner(self)
+        self.runner.progress.connect(self._on_prepare_progress)
+        self.runner.busy_changed.connect(self._on_prepare_busy)
+        session.defer_mode_preparation = True
+        session.mode.defer_preparation = True
+
         self._play = QtCore.QTimer(self)
         self._play.setInterval(60)
         self._play.timeout.connect(lambda: self._step_time(1))
@@ -134,13 +160,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         bar.addWidget(self._head("UNDERLAY"))
         self.underlay_box = QtWidgets.QComboBox()
-        self.underlay_box.setMinimumWidth(180)
+        self.underlay_box.setFont(QtGui.QFont(PICKER_FONT))
+        self.underlay_box.addItem(NONE_LABEL, userData=None)
         self.underlay_box.activated.connect(lambda _: self._pick(self.underlay_box, SetUnderlay))
         bar.addWidget(self.underlay_box)
 
         bar.addWidget(self._head("OVERLAY"))
         self.overlay_box = QtWidgets.QComboBox()
-        self.overlay_box.setMinimumWidth(180)
+        self.overlay_box.setFont(QtGui.QFont(PICKER_FONT))
+        self.overlay_box.addItem(NONE_LABEL, userData=None)
         self.overlay_box.activated.connect(lambda _: self._pick(self.overlay_box, SetOverlay))
         bar.addWidget(self.overlay_box)
 
@@ -156,9 +184,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         for name in registry.names():
             self.mode_box.addItem(labels[name], userData=name)
         self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
-        self.mode_box.activated.connect(
-            lambda _: self.refresh(self.session.do(SetMode(self.mode_box.currentData())))
-        )
+        self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
         bar.addWidget(self.mode_box)
 
         # Pane and graph toggles, paired the way AFNI's image/graph buttons are.
@@ -196,6 +222,25 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # you cannot get back.
 
     @staticmethod
+    def _fit_picker(box: QtWidgets.QComboBox) -> None:
+        """Size a picker to its widest entry.
+
+        Qt sizes a combo to its *current* item, which on macOS truncates every
+        other row -- the volume count falls off the end, which is exactly the
+        column you scan a results directory for. The popup view needs its width
+        set separately from the closed box.
+        """
+        metrics = QtGui.QFontMetrics(box.font())
+        widest = max(
+            (metrics.horizontalAdvance(box.itemText(i)) for i in range(box.count())),
+            default=120,
+        )
+        box.setMinimumWidth(min(widest + 44, 520))
+        view = box.view()
+        if view is not None:
+            view.setMinimumWidth(min(widest + 28, 620))
+
+    @staticmethod
     def _head(text: str) -> QtWidgets.QLabel:
         lab = QtWidgets.QLabel(text)
         lab.setObjectName("head")
@@ -227,24 +272,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.dir_label.setText(
             self.session.catalog_dir.name if self.session.catalog_dir else "no directory"
         )
+        # Two columns, monospaced and padded, so a directory can be scanned by
+        # dimensions and volume count rather than read name by name.
+        width = max((len(e.name) for e in entries), default=0)
         for box in (self.underlay_box, self.overlay_box):
             box.blockSignals(True)
             box.clear()
+            # Nothing is loaded until something is picked; an entry showing in
+            # the box while the panes are empty reads as a failed load.
+            box.addItem(NONE_LABEL, userData=None)
             for e in entries:
-                box.addItem(f"{e.name}   {e.summary}", userData=e)
+                box.addItem(f"{e.name:<{width}}   {e.summary}", userData=e)
+            box.setCurrentIndex(0)
             box.blockSignals(False)
-
-        suggested = self.session.suggested_underlay()
-        if suggested is not None:
-            for i in range(self.underlay_box.count()):
-                if self.underlay_box.itemData(i).path == suggested.path:
-                    self.underlay_box.setCurrentIndex(i)
-                    break
-        # Default the overlay picker to the first thing that is not the underlay.
-        for i in range(self.overlay_box.count()):
-            if suggested is None or self.overlay_box.itemData(i).path != suggested.path:
-                self.overlay_box.setCurrentIndex(i)
-                break
+            self._fit_picker(box)
+        self._sync_pickers()
 
     # ------------------------------------------------------------------
     # panes
@@ -358,6 +400,42 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.thr_label.setObjectName("value")
         form.addRow(QtWidgets.QLabel(""), self.thr_label)
 
+        # Min and max are separate boxes, not a symmetric "range": a stats map
+        # is routinely asymmetric, and forcing one number to set both is how
+        # people end up unable to show what they are looking at.
+        range_row = QtWidgets.QWidget()
+        rh = QtWidgets.QHBoxLayout(range_row)
+        rh.setContentsMargins(0, 0, 0, 0)
+        rh.setSpacing(5)
+        self.min_spin = QtWidgets.QDoubleSpinBox()
+        self.max_spin = QtWidgets.QDoubleSpinBox()
+        for spin in (self.min_spin, self.max_spin):
+            spin.setDecimals(4)
+            spin.setRange(-1e9, 1e9)
+            spin.setKeyboardTracking(False)  # apply on commit, not per keystroke
+            spin.editingFinished.connect(self._range_changed)
+            spin.valueChanged.connect(lambda _: self._range_changed())
+            rh.addWidget(spin, 1)
+        form.addRow(self._head("MIN / MAX"), range_row)
+
+        self.autorange_button = QtWidgets.QPushButton("auto")
+        self.autorange_button.setToolTip("Re-derive min and max from the data (2-98%)")
+        self.autorange_button.clicked.connect(self._autorange)
+        form.addRow(QtWidgets.QLabel(""), self.autorange_button)
+
+        self.colorbar = ColorBar()
+        form.addRow(self.colorbar)
+
+        self.opacity_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(0, 100)
+        self.opacity_slider.setValue(100)
+        self.opacity_slider.valueChanged.connect(self._opacity_changed)
+        form.addRow(self._head("OPACITY"), self.opacity_slider)
+
+        self.opacity_label = QtWidgets.QLabel("100%")
+        self.opacity_label.setObjectName("value")
+        form.addRow(QtWidgets.QLabel(""), self.opacity_label)
+
         self.boxed_check = QtWidgets.QCheckBox("boxed")
         self.boxed_check.toggled.connect(lambda on: self._apply(SetBoxed, on=bool(on)))
         form.addRow(QtWidgets.QLabel(""), self.boxed_check)
@@ -398,8 +476,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
         action.toggled.connect(self.panel_button.setChecked)
         self._view_bar.addWidget(self.panel_button)
 
+    def _switch_mode(self, name: str) -> None:
+        self.refresh(self.session.do(SetMode(name)))
+        self._prepare_then_refresh()
+
     def _mode_param_changed(self, name: str, value: str) -> None:
         self.refresh(self.session.do(SetModeParam(name, value)))
+        self._prepare_then_refresh()
 
     # ------------------------------------------------------------------
     # input
@@ -454,6 +537,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         ijk = list(self.session.state.crosshair)
         ijk[r_ax], ijk[c_ax] = row, col
         self.refresh(self.session.do(SetSeed(*ijk) if seed else SetIJK(*ijk)))
+        if seed and self.session.mode.needs_prepare:
+            # First seed after a mode switch: the mode deferred, so preparation
+            # happens here, on a worker, with the progress bar up.
+            self._prepare_then_refresh()
 
     def _nudge(self, axis: int, delta: int) -> None:
         ijk = list(self.session.state.crosshair)
@@ -491,10 +578,36 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if key is None:
             return
         layer = self.session.state.layers.get(key)
-        hi = abs(layer.range_hi or 1.0)
+        hi = max(abs(layer.range_hi or 0.0), abs(layer.range_lo or 0.0)) or 1.0
         value = tick / 1000.0 * hi
         self.refresh(self.session.do(SetThreshold(key, value)))
         self.thr_label.setText(f"{value:.4g}")
+
+    def _range_changed(self) -> None:
+        key = self.current_key()
+        if key is None:
+            return
+        lo, hi = self.min_spin.value(), self.max_spin.value()
+        if lo == hi:
+            return  # a collapsed range shows nothing; wait for the other box
+        self.refresh(self.session.do(SetRange(key, lo, hi)))
+
+    def _autorange(self) -> None:
+        key = self.current_key()
+        if key is None:
+            return
+        from fastfuncstuff.viewer.session import derive_range
+
+        volume = self.session.volume(key)
+        lo, hi = derive_range(volume)
+        self.refresh(self.session.do(SetRange(key, float(lo), float(hi))))
+
+    def _opacity_changed(self, value: int) -> None:
+        key = self.current_key()
+        if key is None:
+            return
+        self.opacity_label.setText(f"{value}%")
+        self.refresh(self.session.do(SetLayerOpacity(key, value / 100.0)))
 
     def _nudge_threshold(self, frac: float) -> None:
         self.thr_slider.setValue(max(0, min(1000, self.thr_slider.value() + int(frac * 1000))))
@@ -535,9 +648,39 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.coord_label = QtWidgets.QLabel("")
         self.mode_label = QtWidgets.QLabel("")
         self.value_label = QtWidgets.QLabel("")
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setMaximumWidth(190)
+        self.progress.setRange(0, 100)
+        self.progress.hide()
         self.statusBar().addWidget(self.coord_label)
         self.statusBar().addWidget(self.mode_label, 1)
+        self.statusBar().addWidget(self.progress)
         self.statusBar().addPermanentWidget(self.value_label)
+
+    # -- mode preparation ----------------------------------------------
+    def _on_prepare_progress(self, fraction: float, message: str) -> None:
+        self.progress.setValue(int(fraction * 100))
+        self.progress.setFormat(f"{message}  %p%")
+
+    def _on_prepare_busy(self, busy: bool) -> None:
+        self.progress.setVisible(busy)
+        # Disabled rather than queued: a drag would otherwise stack up several
+        # multi-second preparations whose results land out of order.
+        self.mode_panel.setEnabled(not busy)
+        self.mode_box.setEnabled(not busy)
+        if not busy:
+            self.progress.reset()
+
+    def _prepare_then_refresh(self) -> None:
+        """Run the mode's slow half on a worker, then install its overlay."""
+        run_when_ready(
+            self.runner,
+            self.session.mode,
+            on_ready=lambda: self.refresh(
+                self.session.refresh_mode() | Aspect.LAYERS | Aspect.SLICES
+            ),
+            on_error=lambda msg: self.statusBar().showMessage(f"mode failed: {msg}", 8000),
+        )
 
     def _on_layer_loaded(self, key: str) -> None:
         self.session.invalidate(key)
@@ -549,6 +692,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         if dirty & (Aspect.LAYERS | Aspect.GRID):
             self._sync_layer_list()
+            self._sync_pickers()
             self._sync_mode_panel()
         if dirty & (Aspect.SLICES | Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.TIME | Aspect.GRID):
             self._redraw_panes()
@@ -574,6 +718,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
         for win in self._graphs.values():
             if win.isVisible():
                 win.refresh()
+
+    def _sync_pickers(self) -> None:
+        """Point each picker at the layer it currently governs.
+
+        A picker reading "(none)" while that layer is on screen is the same
+        confusion as one naming a file while nothing is displayed -- in both
+        cases the control disagrees with the view.
+        """
+        base = self.session.state.layers.base
+        overlay = self.session.state.layers.overlay
+        for box, layer in ((self.underlay_box, base), (self.overlay_box, overlay)):
+            box.blockSignals(True)
+            index = 0  # (none)
+            if layer is not None and not layer.is_computed:
+                for i in range(1, box.count()):
+                    entry = box.itemData(i)
+                    if entry is not None and str(entry.path) == layer.path:
+                        index = i
+                        break
+                else:
+                    # Loaded from outside the catalog: name it rather than lie.
+                    box.addItem(layer.name, userData=None)
+                    index = box.count() - 1
+            box.setCurrentIndex(index)
+            box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
         row = self.layer_list.currentRow()
@@ -625,11 +794,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setChecked(value)
             check.setEnabled(enabled)
             check.blockSignals(False)
-        hi = abs(layer.range_hi or 1.0)
+        lo_v = float(layer.range_lo if layer.range_lo is not None else 0.0)
+        hi_v = float(layer.range_hi if layer.range_hi is not None else 1.0)
+        for spin, value in ((self.min_spin, lo_v), (self.max_spin, hi_v)):
+            spin.blockSignals(True)
+            step = max(abs(hi_v - lo_v) / 100.0, 1e-4)
+            spin.setSingleStep(step)
+            spin.setValue(value)
+            spin.blockSignals(False)
+
+        self.opacity_slider.blockSignals(True)
+        self.opacity_slider.setValue(int(round(layer.opacity * 100)))
+        self.opacity_slider.blockSignals(False)
+        self.opacity_label.setText(f"{int(round(layer.opacity * 100))}%")
+
+        # The threshold slider spans the larger half of the display range, so a
+        # one-sided map does not waste half its travel on values it never shows.
+        hi = max(abs(hi_v), abs(lo_v)) or 1.0
         self.thr_slider.blockSignals(True)
-        self.thr_slider.setValue(int(layer.threshold / hi * 1000) if hi else 0)
+        self.thr_slider.setValue(int(layer.threshold / hi * 1000))
         self.thr_slider.blockSignals(False)
         self.thr_label.setText(f"{layer.threshold:.4g}")
+        self.colorbar.set_layer(layer)
         # One slider in every mode; only what its numbers mean moves.
         kind = self.session.mode.overlay_kind if layer.is_computed else OverlayKind.VALUE
         self.thr_head.setText(
@@ -666,6 +852,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         self._play.stop()
+        self.runner.wait(2000)
         for win in self._graphs.values():
             win.close()
         self.session.close()

@@ -1,15 +1,19 @@
 """InstaCorr: the overlay is a seed correlation, recomputed as you click.
 
 The measurement this is built around, on an M4 Max: a seed against 900k voxels
-by 1000 time points is 9.3 ms in float32 and 5.4 ms in float16. That is memory
-bandwidth, not arithmetic -- the correlation reads the whole prepared array once
-and does one multiply-add per element. It is already faster than the display
-refreshes, so there is no reason to subsample or to restrict the map to a slab.
+by 1000 time points is 9.3 ms in float32. That is memory bandwidth, not
+arithmetic -- the correlation reads the prepared array once and does one
+multiply-add per element. It is already faster than the display refreshes.
 
-The cost that matters is therefore *preparation*, not correlation: detrending,
-bandpassing and blurring a whole 4-D dataset takes seconds. So preparation is
-cached and only redone when a parameter that affects it changes, while moving
-the seed re-runs nothing but the one matrix-vector product.
+The cost that matters is therefore preparation, not correlation. Detrending,
+bandpassing and blurring a real dataset takes seconds, so it is split out into
+:meth:`prepare`, which the UI runs on a worker behind a progress bar. Moving the
+seed afterwards runs nothing but one matrix-vector product.
+
+Preparation captures what it needs from the source dataset rather than holding
+the layer. A mode's overlay replaces the primary overlay, which is often the
+layer the mode was computed from; keeping a reference to the array means that
+displacement cannot leave the mode unable to re-prepare.
 """
 
 from __future__ import annotations
@@ -21,10 +25,11 @@ from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
     ComputedOverlay,
     Control,
-    FloatControl,
     IntControl,
     Mode,
+    OptionalFloatControl,
     OverlayKind,
+    ProgressFn,
     Trace,
     mode,
 )
@@ -38,198 +43,226 @@ class InstaCorrMode(Mode):
     overlay_kind = OverlayKind.CORRELATION
 
     def controls(self) -> tuple[Control, ...]:
+        # Defaults are deliberately minimal: detrend only. Bandpass and blur
+        # change what the correlation means, so they are opt-in and visibly off
+        # rather than quietly applied.
         return (
             IntControl(
                 name="polort",
-                label="polort",
+                label="detrend",
                 lo=-1,
                 hi=6,
                 default=2,
-                help="Legendre detrend order; -1 disables.",
+                help="Legendre polynomial order; -1 disables detrending.",
             ),
-            FloatControl(
+            OptionalFloatControl(
                 name="fbot",
+                on_value=0.01,
                 label="highpass",
                 lo=0.0,
                 hi=0.2,
-                default=0.01,
+                default=0.0,
                 step=0.005,
-                unit="Hz",
+                unit=" Hz",
+                help="Off by default. Needs a TR to mean anything.",
             ),
-            FloatControl(
+            OptionalFloatControl(
                 name="ftop",
+                on_value=0.1,
                 label="lowpass",
                 lo=0.0,
                 hi=0.5,
-                default=0.10,
+                default=0.0,
                 step=0.005,
-                unit="Hz",
-                help="0 disables the low-pass edge.",
+                unit=" Hz",
+                help="Off by default. Needs a TR to mean anything.",
             ),
-            FloatControl(
+            OptionalFloatControl(
                 name="blur",
+                on_value=4.0,
                 label="blur",
                 lo=0.0,
                 hi=12.0,
-                default=4.0,
+                default=0.0,
                 step=0.5,
-                unit="mm",
+                unit=" mm",
+                help="Spatial smoothing applied before correlating.",
             ),
-            FloatControl(
+            OptionalFloatControl(
                 name="seed_radius",
-                label="seed r",
+                on_value=6.0,
+                label="seed radius",
                 lo=0.0,
                 hi=14.0,
-                default=6.0,
+                default=0.0,
                 step=1.0,
-                unit="mm",
-                help="Average the seed over a sphere, as AFNI does. 0 uses one voxel.",
+                unit=" mm",
+                help="Average the seed over a sphere. Off means a single voxel.",
             ),
         )
 
+    def preparation_params(self) -> frozenset[str]:
+        # seed_radius only affects which columns are averaged at compute time,
+        # so changing it must not trigger a multi-second re-preparation.
+        return frozenset({"polort", "fbot", "ftop", "blur"})
+
+    def __init__(self) -> None:
+        self._prepared: torch.Tensor | None = None
+        self._valid: torch.Tensor | None = None
+        self._shape: tuple[int, int, int] = (0, 0, 0)
+        self._affine: np.ndarray | None = None
+        self._source: np.ndarray | None = None
+        self._source_key: str | None = None
+        self._tr = 0.0
+        self._zooms = (1.0, 1.0, 1.0)
+        super().__init__()
+
     # -- source --------------------------------------------------------
-    def _source_layer(self):
-        """The 4-D layer to correlate. The first time-linked layer in the stack."""
+    def _capture_source(self) -> bool:
+        """Take a reference to the 4-D dataset and everything describing it.
+
+        Held by reference rather than by layer key so that installing the
+        correlation over the primary overlay -- which is usually this very
+        dataset -- cannot strand the mode.
+        """
+        if self._source is not None and self._source_key is not None:
+            return True
         if self.session is None:
-            return None
+            return False
         for layer in self.session.state.layers:
-            if layer.time_linked and not layer.is_computed:
-                return layer
-        return None
+            if not layer.time_linked or layer.is_computed:
+                continue
+            try:
+                res = self.session.store.get(layer.key)
+            except KeyError:
+                continue
+            if res.array is None:
+                continue  # still inflating
+            self._source = res.array
+            self._source_key = layer.key
+            self._affine = np.asarray(layer.affine, dtype=float)
+            self._tr = float(res.info.tr)
+            self._zooms = tuple(float(abs(layer.affine[i, i])) or 1.0 for i in range(3))
+            return True
+        return False
 
     def input_layer_key(self) -> str | None:
-        layer = self._source_layer()
-        return None if layer is None else layer.key
+        return self._source_key
+
+    def attach(self, session) -> None:
+        super().attach(session)
+        self._capture_source()
 
     # -- preparation ---------------------------------------------------
-    def _prepare(self) -> bool:
-        """Detrend, bandpass, blur and normalize once. Returns readiness."""
-        if not self._dirty and getattr(self, "_prepared", None) is not None:
+    def prepare(self, progress: ProgressFn | None = None) -> bool:
+        """Detrend, bandpass, blur and normalize. Seconds on a real dataset."""
+        if not self._dirty and self._prepared is not None:
             return True
-        session = self.session
-        layer = self._source_layer()
-        if session is None or layer is None:
+        if not self._capture_source() or self._source is None:
             return False
 
-        res = session.store.get(layer.key)
-        if res.array is None:
-            # Still inflating. Returning False rather than blocking keeps the
-            # click that triggered this from freezing the window.
-            return False
+        def step(fraction: float, message: str) -> None:
+            if progress is not None:
+                progress(fraction, message)
 
-        device = session.store.device
-        arr = torch.as_tensor(np.ascontiguousarray(res.array), dtype=torch.float32)
+        device = self.session.store.device if self.session is not None else torch.device("cpu")
+        step(0.05, "reading")
+        arr = torch.as_tensor(np.ascontiguousarray(self._source), dtype=torch.float32)
         nx, ny, nz, nt = arr.shape
 
-        if float(self.params.get("blur") or 0.0) > 0:
+        blur = float(self.params.get("blur") or 0.0)
+        if blur > 0:
+            step(0.2, f"blurring {blur:g} mm")
             from fastfuncstuff.stats.smooth3d import fwhm_mm_to_sigma_vox, gaussian3d_batched
 
-            zooms = tuple(float(abs(layer.affine[i, i])) or 1.0 for i in range(3))
-            sigma = fwhm_mm_to_sigma_vox(float(self.params["blur"]), zooms)
-            # (T, X, Y, Z): the batched smoother wants time on the leading axis.
+            sigma = fwhm_mm_to_sigma_vox(blur, self._zooms)
             vol = arr.permute(3, 0, 1, 2).to(device)
-            vol = gaussian3d_batched(vol, sigma)
-            data = vol.reshape(nt, -1)
+            data = gaussian3d_batched(vol, sigma).reshape(nt, -1)
         else:
             data = arr.reshape(-1, nt).T.contiguous().to(device)
 
-        data = self._detrend(data, layer)
-        data = self._bandpass(data, layer)
+        step(0.5, "detrending")
+        data = self._detrend(data)
+        step(0.7, "filtering")
+        data = self._bandpass(data)
 
+        step(0.9, "normalizing")
         data = data - data.mean(0, keepdim=True)
         norm = data.norm(dim=0, keepdim=True)
-        # Constant voxels (outside the brain, mostly) would divide by zero and
-        # then correlate perfectly with everything.
+        # Constant voxels -- outside the brain, mostly -- would divide by zero
+        # and then correlate perfectly with everything.
         self._valid = (norm > 1e-9).squeeze(0)
         data = data / norm.clamp(min=1e-9)
-        data = torch.where(self._valid.unsqueeze(0), data, torch.zeros_like(data))
-
-        self._prepared = data
+        self._prepared = torch.where(self._valid.unsqueeze(0), data, torch.zeros_like(data))
         self._shape = (nx, ny, nz)
-        self._affine = layer.affine
-        self._layer_key = layer.key
         self._dirty = False
+        step(1.0, "ready")
         return True
 
-    def _detrend(self, data: torch.Tensor, layer) -> torch.Tensor:
+    def _detrend(self, data: torch.Tensor) -> torch.Tensor:
         """Project out Legendre polynomials -- never raw monomials."""
         order = int(self.params.get("polort", 2))
         if order < 0:
             return data
         from fastfuncstuff.glm.core import construct_polynomial_matrix
 
-        nt = data.shape[0]
-        poly = construct_polynomial_matrix(nt, order, data.device, data.dtype)
+        poly = construct_polynomial_matrix(data.shape[0], order, data.device, data.dtype)
         q, _ = torch.linalg.qr(poly)
         return data - q @ (q.T @ data)
 
-    def _bandpass(self, data: torch.Tensor, layer) -> torch.Tensor:
+    def _bandpass(self, data: torch.Tensor) -> torch.Tensor:
         """Zero the rFFT bins outside the band.
 
-        Needs a TR. A dataset without one cannot be bandpassed in Hz at all, so
-        the filter is skipped rather than applied against an assumed 1 s.
+        Skipped without a TR: a filter specified in Hz against an assumed 1 s
+        sampling interval is not the filter anyone asked for.
         """
         fbot = float(self.params.get("fbot") or 0.0)
         ftop = float(self.params.get("ftop") or 0.0)
-        if fbot <= 0.0 and ftop <= 0.0:
-            return data
-        tr = self._tr(layer)
-        if tr <= 0.0:
+        if (fbot <= 0.0 and ftop <= 0.0) or self._tr <= 0.0:
             return data
         nt = data.shape[0]
-        freqs = torch.fft.rfftfreq(nt, d=tr).to(data.device)
+        freqs = torch.fft.rfftfreq(nt, d=self._tr).to(data.device)
         keep = torch.ones_like(freqs, dtype=torch.bool)
         if fbot > 0:
             keep &= freqs >= fbot
         if ftop > 0:
             keep &= freqs <= ftop
         keep[0] = False  # the mean is handled by centring, not by the filter
-        spec = torch.fft.rfft(data, dim=0)
-        spec = spec * keep.unsqueeze(1)
+        spec = torch.fft.rfft(data, dim=0) * keep.unsqueeze(1)
         return torch.fft.irfft(spec, n=nt, dim=0)
 
-    def _tr(self, layer) -> float:
-        if self.session is None:
-            return 0.0
-        try:
-            return float(self.session.store.get(layer.key).info.tr)
-        except KeyError:
-            return 0.0
-
     # -- seed ----------------------------------------------------------
-    def _seed_timecourse(self, data: torch.Tensor) -> torch.Tensor | None:
-        """Seed signal, averaged over a sphere the way AFNI does.
-
-        A single voxel is noisy enough that the map changes character as you
-        move one step; the sphere is why AFNI's InstaCorr looks stable.
-        """
-        session = self.session
-        if session is None or session.state.seed is None:
+    def _seed_timecourse(self) -> torch.Tensor | None:
+        data, valid = self._prepared, self._valid
+        if data is None or valid is None or self.session is None:
+            return None
+        seed_ijk = self.session.state.seed
+        if seed_ijk is None:
             return None
         nx, ny, nz = self._shape
-        si, sj, sk = session.state.seed
+        si, sj, sk = seed_ijk
         radius = float(self.params.get("seed_radius") or 0.0)
-        zooms = [float(abs(self._affine[i, i])) or 1.0 for i in range(3)]
 
         if radius <= 0.0:
             if not (0 <= si < nx and 0 <= sj < ny and 0 <= sk < nz):
                 return None
             flat = (si * ny + sj) * nz + sk
-            return data[:, flat] if bool(self._valid[flat]) else None
+            return data[:, flat] if bool(valid[flat]) else None
 
-        rad_vox = [max(0, int(radius / z)) for z in zooms]
-        ii = torch.arange(max(0, si - rad_vox[0]), min(nx, si + rad_vox[0] + 1))
-        jj = torch.arange(max(0, sj - rad_vox[1]), min(ny, sj + rad_vox[1] + 1))
-        kk = torch.arange(max(0, sk - rad_vox[2]), min(nz, sk + rad_vox[2] + 1))
+        rad = [max(0, int(radius / z)) for z in self._zooms]
+        ii = torch.arange(max(0, si - rad[0]), min(nx, si + rad[0] + 1))
+        jj = torch.arange(max(0, sj - rad[1]), min(ny, sj + rad[1] + 1))
+        kk = torch.arange(max(0, sk - rad[2]), min(nz, sk + rad[2] + 1))
         if not (ii.numel() and jj.numel() and kk.numel()):
             return None
         gi, gj, gk = torch.meshgrid(ii, jj, kk, indexing="ij")
         dist = torch.sqrt(
-            ((gi - si) * zooms[0]) ** 2 + ((gj - sj) * zooms[1]) ** 2 + ((gk - sk) * zooms[2]) ** 2
+            ((gi - si) * self._zooms[0]) ** 2
+            + ((gj - sj) * self._zooms[1]) ** 2
+            + ((gk - sk) * self._zooms[2]) ** 2
         )
-        inside = dist <= radius
-        flat = ((gi * ny + gj) * nz + gk)[inside].reshape(-1).to(data.device)
-        flat = flat[self._valid[flat]]
+        flat = ((gi * ny + gj) * nz + gk)[dist <= radius].reshape(-1).to(data.device)
+        flat = flat[valid[flat]]
         if flat.numel() == 0:
             return None
         seed = data[:, flat].mean(1)
@@ -239,14 +272,12 @@ class InstaCorrMode(Mode):
 
     # -- production ----------------------------------------------------
     def compute(self) -> ComputedOverlay | None:
-        if not self._prepare():
+        if self._prepared is None or self._affine is None:
             return None
-        data = self._prepared
-        seed = self._seed_timecourse(data)
+        seed = self._seed_timecourse()
         if seed is None:
             return None
-        # The whole correlation: one mat-vec over normalized columns.
-        r = seed @ data
+        r = seed @ self._prepared  # the whole correlation
         vol = r.reshape(self._shape).cpu().numpy()
         return ComputedOverlay(
             values=np.nan_to_num(vol, nan=0.0),
@@ -265,20 +296,27 @@ class InstaCorrMode(Mode):
         return Aspect.NOTHING
 
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
-        """The prepared (filtered) signal, which is what was actually correlated."""
-        if getattr(self, "_prepared", None) is None:
+        """The prepared signal, which is what was actually correlated."""
+        if self._prepared is None:
             return []
         nx, ny, nz = self._shape
         i, j, k = ijk
         if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):
             return []
         flat = (i * ny + j) * nz + k
-        vals = self._prepared[:, flat].cpu().numpy()
-        return [Trace(label="instacorr (filtered)", values=vals, x_label="TR")]
+        return [
+            Trace(
+                label="instacorr (prepared)",
+                values=self._prepared[:, flat].cpu().numpy(),
+                x_label="TR",
+            )
+        ]
 
     def status(self) -> str:
+        if self._source is None:
+            return "instacorr: needs a 4-D dataset"
         if self.session is None or self.session.state.seed is None:
             return "instacorr: ctrl-click to set a seed"
-        if getattr(self, "_prepared", None) is None:
+        if self._prepared is None:
             return "instacorr: preparing…"
         return f"instacorr: seed {self.session.state.seed}"

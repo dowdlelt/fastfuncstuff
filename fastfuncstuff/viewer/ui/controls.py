@@ -22,6 +22,7 @@ from fastfuncstuff.viewer.modes.base import (
     Control,
     FloatControl,
     IntControl,
+    OptionalFloatControl,
 )
 
 #: How long to wait after the last change before applying it. Long enough to
@@ -99,6 +100,9 @@ class ControlPanel(QtWidgets.QWidget):
             box.valueChanged.connect(lambda v, n=spec.name: self._queue(n, str(int(v))))
             return box, label
 
+        if isinstance(spec, OptionalFloatControl):
+            return self._build_optional_float(spec, value), label
+
         if isinstance(spec, FloatControl):
             row = QtWidgets.QWidget()
             h = QtWidgets.QHBoxLayout(row)
@@ -136,6 +140,67 @@ class ControlPanel(QtWidgets.QWidget):
             return row, label
 
         return None, label
+
+    def _build_optional_float(self, spec: OptionalFloatControl, value: object) -> QtWidgets.QWidget:
+        """A checkbox beside a slider, faded when off.
+
+        The distinction matters because ``off_value`` is usually zero and zero
+        is also a legal setting: a disabled high-pass and a high-pass set to
+        0 Hz look identical on a bare slider, and only one of them is a filter
+        someone chose.
+        """
+        row = QtWidgets.QWidget()
+        h = QtWidgets.QHBoxLayout(row)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+
+        check = QtWidgets.QCheckBox()
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, FLOAT_TICKS)
+        readout = QtWidgets.QLabel()
+        readout.setObjectName("value")
+        readout.setMinimumWidth(56)
+
+        span = (spec.hi - spec.lo) or 1.0
+        current = float(value if value is not None else spec.off_value)
+        on = current != spec.off_value
+        resting = current if on else (spec.on_value or (spec.lo + span / 2.0))
+
+        def to_value(tick: int) -> float:
+            raw = spec.lo + (tick / FLOAT_TICKS) * span
+            return round(raw / spec.step) * spec.step if spec.step else raw
+
+        def to_tick(v: float) -> int:
+            return int(round((v - spec.lo) / span * FLOAT_TICKS))
+
+        def paint(enabled: bool, v: float) -> None:
+            slider.setEnabled(enabled)
+            readout.setEnabled(enabled)
+            readout.setText(f"{v:g}{spec.unit}" if enabled else "off")
+
+        slider.setValue(to_tick(resting))
+        check.setChecked(on)
+        paint(on, current)
+
+        def on_toggle(checked: bool) -> None:
+            v = to_value(slider.value())
+            paint(checked, v)
+            self._queue(spec.name, repr(float(v if checked else spec.off_value)), now=True)
+
+        def on_move(tick: int) -> None:
+            v = to_value(tick)
+            if not check.isChecked():
+                readout.setText("off")
+                return
+            readout.setText(f"{v:g}{spec.unit}")
+            self._queue(spec.name, repr(float(v)))
+
+        check.toggled.connect(on_toggle)
+        slider.valueChanged.connect(on_move)
+        h.addWidget(check)
+        h.addWidget(slider, 1)
+        h.addWidget(readout)
+        return row
 
     # -- debounce ------------------------------------------------------
     def _queue(self, name: str, value: str, *, now: bool = False) -> None:

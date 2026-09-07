@@ -107,7 +107,12 @@ class ViewerSession:
         self.mode.attach(self)
         self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
         self._mode_dirty: Aspect = Aspect.NOTHING
-        self._hidden_input: str | None = None
+        self._displaced_overlay: Layer | None = None
+        #: Set once by a UI that runs mode preparation on a worker. Applied to
+        #: every mode as it is attached -- setting it on the mode afterwards
+        #: would be too late, since set_mode refreshes on the way in and that
+        #: first refresh is exactly the one that would freeze the window.
+        self.defer_mode_preparation = False
         # A time-index or sub-brick change invalidates the cached device volume;
         # doing it here rather than in each handler means a command added later
         # cannot forget to.
@@ -157,8 +162,6 @@ class ViewerSession:
         # the seed already moved. Its own dirty aspects are folded into what the
         # dispatch reports, which is how a recomputed overlay reaches the panes.
         self._mode_dirty = self.mode.on_command(cmd, dirty)
-        if self._mode_dirty:
-            self._hide_mode_input()
 
     def do(self, cmd: Command) -> Aspect:
         self._mode_dirty = Aspect.NOTHING
@@ -208,32 +211,15 @@ class ViewerSession:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:
             return Aspect.NOTHING
-        self._restore_mode_input()
         self.mode.detach()
         self.mode = registry.get(name)()
+        self.mode.defer_preparation = self.defer_mode_preparation
         self.mode.attach(self)
-        dirty = (Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH) | self.mode.refresh()
-        self._hide_mode_input()
-        return dirty
+        return (Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH) | self.mode.refresh()
 
-    def _hide_mode_input(self) -> None:
-        """Hide the layer the active mode consumes, remembering its state."""
-        key = self.mode.input_layer_key()
-        if key is None:
-            return
-        layer = self.state.layers.find(key)
-        if layer is None or not layer.visible:
-            return
-        self._hidden_input = key
-        self.state.layers.update(key, visible=False)
-
-    def _restore_mode_input(self) -> None:
-        key = getattr(self, "_hidden_input", None)
-        if key is None:
-            return
-        if self.state.layers.find(key) is not None:
-            self.state.layers.update(key, visible=True)
-        self._hidden_input = None
+    def refresh_mode(self) -> Aspect:
+        """Recompute and install the active mode's overlay."""
+        return self.mode.refresh()
 
     def set_mode_param(self, param: str, value: str) -> Aspect:
         """Coerce a text parameter to its control's type and apply it."""
@@ -288,23 +274,41 @@ class ViewerSession:
                 threshold=overlay.threshold or 0.0,
                 source=source,
             )
-            # Pushed on top, never into the overlay slot: replacing there would
-            # consume the mode's own input dataset, which is where the values
-            # came from in the first place.
-            self.state.layers.add_overlay(layer)
+            # The computed map takes the primary overlay slot. That is the one
+            # thing it may displace: the underlay is the base image everything
+            # is drawn on and must survive a mode switch. The displaced layer
+            # is remembered, not destroyed, and comes back when the mode is
+            # left -- and the mode itself holds its source data by reference,
+            # so being displaced here cannot strand it.
+            self._displaced_overlay = self.state.layers.overlay
+            self.state.layers.set_overlay(layer)
             if self.state.grid is None:
                 self.state.adopt_grid(layer.shape, layer.affine)
         return key
 
     def remove_computed_overlay(self, source: str) -> None:
+        """Drop a mode's overlay and put back whatever it displaced."""
         existing = self.state.layers.find_by_source(source)
         if existing is None:
             return
         self.state.layers.remove(existing.key)
         self.forget(existing.key)
+        displaced, self._displaced_overlay = self._displaced_overlay, None
+        if displaced is not None and self.state.layers.find(displaced.key) is None:
+            self.state.layers.set_overlay(displaced)
 
     def forget(self, key: str) -> None:
-        """Drop a layer's cached and resident data."""
+        """Drop a layer's cached and resident data.
+
+        Skips anything the current mode is using or has displaced: dropping a
+        mode's source mid-session is what turns a re-prepare into a silent
+        stale map.
+        """
+        held = {self.mode.input_layer_key()}
+        if self._displaced_overlay is not None:
+            held.add(self._displaced_overlay.key)
+        if key in held:
+            return
         self.invalidate(key)
         self.store.close(key)
 

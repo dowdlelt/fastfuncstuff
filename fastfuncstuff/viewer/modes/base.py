@@ -22,7 +22,7 @@ That is the whole contract. A new mode is one file.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -33,6 +33,11 @@ from fastfuncstuff.viewer.commands import Aspect, Command
 
 if TYPE_CHECKING:
     from fastfuncstuff.viewer.session import ViewerSession
+
+
+#: ``progress(fraction, message)`` -- called from a worker thread, so an
+#: implementation must marshal to the GUI thread itself.
+ProgressFn = Callable[[float, str], None]
 
 
 class OverlayKind(StrEnum):
@@ -65,6 +70,23 @@ class FloatControl(Control):
     default: float = 0.0
     step: float = 0.01
     unit: str = ""
+
+
+@dataclass(frozen=True)
+class OptionalFloatControl(FloatControl):
+    """A float that can be switched off entirely.
+
+    Rendered as a checkbox beside a slider, with the slider faded when off, so
+    a disabled filter reads as disabled instead of as "set to zero, probably" --
+    the distinction matters when zero is also a legal value.
+
+    ``off_value`` is what the parameter takes when unchecked; ``on_value`` is
+    where it lands when first switched on, since the default is "off" and
+    enabling a control that then does nothing is a dead end.
+    """
+
+    off_value: float = 0.0
+    on_value: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -137,8 +159,16 @@ class Mode(ABC):
     #: its overlay is whatever the user picked.
     produces_overlay: ClassVar[bool] = True
 
+    #: Set by a UI that runs preparation on a worker. When true, a refresh
+    #: that would need the slow path does nothing instead, and the UI is
+    #: responsible for preparing and then calling refresh again. Without this
+    #: a seed click would run preparation inline and freeze the window --
+    #: which is the whole failure the split exists to prevent.
+    defer_preparation: bool = False
+
     def __init__(self) -> None:
         self.session: ViewerSession | None = None
+        self._preparing = False
         self.params: dict[str, Any] = {c.name: getattr(c, "default", None) for c in self.controls()}
         self._dirty = True
 
@@ -167,8 +197,17 @@ class Mode(ABC):
         if self.params.get(name) == value:
             return Aspect.NOTHING
         self.params[name] = value
-        self.invalidate()
+        if name in self.preparation_params():
+            self.invalidate()
         return self.refresh()
+
+    def preparation_params(self) -> frozenset[str]:
+        """Parameters whose change forces the slow path.
+
+        Everything else is assumed cheap, so a control that only affects
+        ``compute`` does not pay for a re-preparation.
+        """
+        return frozenset(c.name for c in self.controls())
 
     def invalidate(self) -> None:
         """Mark cached preparation stale, so the next refresh redoes it."""
@@ -194,13 +233,49 @@ class Mode(ABC):
         return []
 
     # -- production ----------------------------------------------------
+    #
+    # Split in two because the halves have wildly different costs. InstaCorr
+    # preparation is ~600 ms on a small dataset and seconds on a real one,
+    # while the correlation itself is ~1 ms. Keeping them separate is what lets
+    # the UI run the slow half on a worker with a progress bar and the fast
+    # half per interaction, instead of freezing on every click.
+
+    def prepare(self, progress: ProgressFn | None = None) -> bool:
+        """Do the expensive, cacheable work. Must not touch session state.
+
+        Called off the GUI thread, so it may only read the session -- anything
+        it mutates would be a data race with the paint it is about to trigger.
+        Returns whether the mode is ready to compute.
+        """
+        return True
+
     @abstractmethod
     def compute(self) -> ComputedOverlay | None:
-        """Produce the overlay, or ``None`` if inputs are not ready."""
+        """Produce the overlay from prepared data. Must be fast."""
 
-    def refresh(self) -> Aspect:
-        """Recompute and install the overlay."""
+    @property
+    def needs_prepare(self) -> bool:
+        """Whether the next refresh would do slow work."""
+        return self._dirty
+
+    @property
+    def preparing(self) -> bool:
+        """Whether a worker is currently inside :meth:`prepare`."""
+        return self._preparing
+
+    def refresh(self, progress: ProgressFn | None = None) -> Aspect:
+        """Prepare if needed, then compute and install.
+
+        Blocking, unless a worker already owns preparation or the UI has asked
+        to run it itself.
+        """
         if self.session is None or not self.produces_overlay:
+            return Aspect.NOTHING
+        if self._preparing:
+            return Aspect.NOTHING
+        if self.needs_prepare and self.defer_preparation:
+            return Aspect.NOTHING
+        if not self.prepare(progress):
             return Aspect.NOTHING
         overlay = self.compute()
         if overlay is None:
@@ -254,6 +329,8 @@ __all__ = [
     "FloatControl",
     "IntControl",
     "Mode",
+    "OptionalFloatControl",
+    "ProgressFn",
     "ModeRegistry",
     "OverlayKind",
     "Trace",

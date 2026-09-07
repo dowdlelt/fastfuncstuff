@@ -318,9 +318,8 @@ def test_instacorr_needs_a_seed_before_it_draws(corr_session):
 
 
 def test_instacorr_correlates_the_shared_signal(corr_session):
+    """Defaults are detrend-only, so this is the raw correlation."""
     corr_session.do(SetMode("instacorr"))
-    corr_session.set_mode_param("blur", "0")
-    corr_session.set_mode_param("seed_radius", "0")
     corr_session.do(SetSeed(3, 4, 2))
 
     layer = corr_session.state.layers.find_by_source("mode:instacorr")
@@ -339,28 +338,39 @@ def test_instacorr_stays_within_correlation_bounds(corr_session):
     assert np.nanmin(vol) >= -1.0001 and np.nanmax(vol) <= 1.0001
 
 
-def test_instacorr_hides_its_input_but_does_not_consume_it(corr_session):
-    """The 4-D source must survive: it is where the numbers came from."""
+def test_the_map_displaces_the_overlay_never_the_underlay(corr_session):
+    """The underlay is the base image; a mode must not take it."""
+    underlay = corr_session.state.layers.base.key
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    assert corr_session.state.layers.base.key == underlay
+    assert corr_session.state.layers.overlay.is_computed
+
+
+def test_leaving_the_mode_puts_the_displaced_overlay_back(corr_session):
     bold_key = corr_session.state.layers.keys[1]
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))
-    layer = corr_session.state.layers.find(bold_key)
-    assert layer is not None, "the source dataset was consumed"
-    assert not layer.visible, "the source should be hidden while its map is shown"
-
-
-def test_leaving_instacorr_restores_the_input(corr_session):
-    bold_key = corr_session.state.layers.keys[1]
-    corr_session.do(SetMode("instacorr"))
-    corr_session.do(SetSeed(3, 4, 2))
+    assert corr_session.state.layers.find(bold_key) is None, "the map should displace it"
     corr_session.do(SetMode("plain"))
-    assert corr_session.state.layers.get(bold_key).visible
+    assert corr_session.state.layers.overlay.key == bold_key
+
+
+def test_the_mode_survives_displacing_its_own_source(corr_session):
+    """Being displaced must not strand the mode: it holds the array, not the layer."""
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    key = corr_session.state.layers.find_by_source("mode:instacorr").key
+    before = corr_session.store.get(key).array[..., 0].copy()
+
+    corr_session.set_mode_param("blur", "6.0")  # forces a full re-prepare
+    after = corr_session.store.get(key).array[..., 0]
+    assert not np.allclose(before, after), "re-prepare found no source"
 
 
 def test_changing_a_preparation_parameter_changes_the_map(corr_session):
     """The bug this caught: a stale prepare silently returned the old map."""
     corr_session.do(SetMode("instacorr"))
-    corr_session.set_mode_param("blur", "0")
     corr_session.do(SetSeed(3, 4, 2))
     key = corr_session.state.layers.find_by_source("mode:instacorr").key
     before = corr_session.store.get(key).array[..., 0].copy()
@@ -388,8 +398,6 @@ def test_instacorr_contributes_a_trace(corr_session):
 
 def test_seed_radius_averages_rather_than_taking_one_voxel(corr_session):
     corr_session.do(SetMode("instacorr"))
-    corr_session.set_mode_param("blur", "0")
-    corr_session.set_mode_param("seed_radius", "0")
     corr_session.do(SetSeed(3, 4, 2))
     key = corr_session.state.layers.find_by_source("mode:instacorr").key
     single = corr_session.store.get(key).array[..., 0].copy()
@@ -532,3 +540,66 @@ def test_ica_without_a_decomposition_says_so_rather_than_failing(session, datadi
     session.do(SetMode("ica"))
     assert session.state.layers.find_by_source("mode:ica") is None
     assert "no decomposition" in session.mode.status()
+
+
+# ---------------------------------------------------------------------------
+# defaults and the cheap/expensive split
+# ---------------------------------------------------------------------------
+
+
+def test_instacorr_defaults_to_detrend_only(corr_session):
+    """Bandpass and blur change what the correlation means; they are opt-in."""
+    corr_session.do(SetMode("instacorr"))
+    params = corr_session.mode.params
+    assert params["polort"] == 2
+    assert params["fbot"] == 0.0
+    assert params["ftop"] == 0.0
+    assert params["blur"] == 0.0
+    assert params["seed_radius"] == 0.0, "a single voxel by default"
+
+
+def test_seed_radius_is_not_a_preparation_parameter(corr_session):
+    """Changing it must not trigger a multi-second re-prepare."""
+    corr_session.do(SetMode("instacorr"))
+    assert "seed_radius" not in corr_session.mode.preparation_params()
+    assert "blur" in corr_session.mode.preparation_params()
+
+
+def test_changing_seed_radius_leaves_the_preparation_intact(corr_session):
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    assert not corr_session.mode.needs_prepare
+    corr_session.set_mode_param("seed_radius", "6.0")
+    assert not corr_session.mode.needs_prepare, "cheap change forced the slow path"
+
+
+def test_changing_blur_marks_preparation_stale(corr_session):
+    corr_session.defer_mode_preparation = True
+    corr_session.do(SetMode("instacorr"))
+    corr_session.set_mode_param("blur", "4.0")
+    assert corr_session.mode.needs_prepare
+
+
+def test_a_deferring_mode_does_not_run_the_slow_path_inline(corr_session):
+    """The freeze this fixes: a click must never run preparation itself."""
+    corr_session.defer_mode_preparation = True
+    corr_session.do(SetMode("instacorr"))
+    assert corr_session.do(SetSeed(3, 4, 2)) is not None
+    assert corr_session.mode.needs_prepare, "preparation ran inline despite deferral"
+
+
+def test_switching_into_a_mode_defers_too(corr_session):
+    """set_mode refreshes on the way in; that first refresh must defer as well."""
+    corr_session.defer_mode_preparation = True
+    corr_session.do(SetMode("instacorr"))
+    assert corr_session.mode.needs_prepare, "mode switch prepared inline"
+
+
+def test_preparing_explicitly_then_refreshing_produces_the_map(corr_session):
+    corr_session.defer_mode_preparation = True
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
+    assert corr_session.state.layers.find_by_source("mode:instacorr") is None
+    assert corr_session.mode.prepare()
+    corr_session.refresh_mode()
+    assert corr_session.state.layers.find_by_source("mode:instacorr") is not None
