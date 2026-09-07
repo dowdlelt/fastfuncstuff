@@ -1429,7 +1429,7 @@ class TestDerivativeFreeRefinement:
         with _recording_cost_trace(True) as trace:
             _refine_cmaes_batched([start], config, bounds, device, flat_cost, verb=0, n_iters=500)
         # One generation to set the incumbent, then `patience` that cannot beat it.
-        assert len(trace.rows) < 60, f"ran {len(trace.rows)} generations on a flat cost"
+        assert len(trace.rows) < 100, f"ran {len(trace.rows)} generations on a flat cost"
 
     def test_cmaes_is_not_cut_short_while_still_climbing(self):
         """The stall counter must reset on every real improvement, or a slow but
@@ -1441,10 +1441,20 @@ class TestDerivativeFreeRefinement:
         cost = self._bowl(_normalize(start, bounds) + 0.05, bounds, device)
 
         with _recording_cost_trace(True) as trace:
-            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=80)
-        best = [r[3] for r in trace.rows]
-        # It either used the whole budget or stopped only after a real plateau.
-        assert len(trace.rows) == 80 or best[-1] - best[-31] < 1e-4 * abs(best[-1]) + 1e-6
+            _refine_cmaes_batched([start], config, bounds, device, cost, verb=0, n_iters=400)
+        best = np.array([r[3] for r in trace.rows])
+        scale = np.array([r[7] for r in trace.rows])
+
+        # It stopped for one of the two legitimate reasons: sigma converged, or
+        # nothing beat the incumbent for the whole patience window. What must
+        # not happen is a stop while the climb is still paying.
+        stopped_on_sigma = scale[-1] <= 5e-4 * (1.0 + 8.0 * 0.0) or len(trace.rows) == 400
+        window = best[-min(len(best), 60) :]
+        plateaued = window[-1] - window[0] < 1e-4 * abs(window[-1]) + 1e-6
+        assert stopped_on_sigma or plateaued, (
+            f"stopped after {len(trace.rows)} generations while still improving "
+            f"by {window[-1] - window[0]:.2e}"
+        )
 
     def test_cmaes_handles_several_trials_at_once(self):
         """T trials share one batched evaluation; each must keep its own state."""

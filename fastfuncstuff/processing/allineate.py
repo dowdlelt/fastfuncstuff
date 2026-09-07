@@ -1745,21 +1745,34 @@ def _refine_cmaes_batched(
     n_eval = 0
 
     # Stagnation stop. sigma alone does not end this search: once the samples
-    # are within the cost's own reproducibility (~1e-4 relative), selection is
-    # sorting noise, and CSA answers a random-looking evolution path by holding
-    # sigma up rather than shrinking it -- measured on the benchmark anat-to-MNI
-    # pair, sigma ROSE in 28-44% of generations while the best cost sat frozen.
-    # That stage ran 281 generations; the last improvement worth having was at
-    # 129, and the remaining 54% bought 2.5e-5, a third of the noise floor.
+    # are within the cost's own reproducibility (~7.5e-5, from the blok scatter's
+    # index_add atomics), selection is sorting noise, and CSA answers a
+    # random-looking evolution path by holding sigma up rather than shrinking it
+    # -- measured, sigma ROSE in 28-44% of generations while the best cost sat
+    # frozen. Across six anat-to-MNI pairs the last improvement worth having
+    # landed at 56-78% of the generations the old sigma-only rule ran.
     #
-    # patience is 3.75x the longest gap between real improvements in the
-    # productive phase of that run (8 generations), and the tolerance is the
-    # rel/abs pair the Adam refiner already uses. Together they give up 9.1e-6
-    # of cost -- an order of magnitude below what the cost can resolve.
+    # patience is set by the criterion the stop itself rests on: give up LESS
+    # than the cost can resolve. Replayed on five 0.7mm subjects --
+    #
+    #   patience   mean generations   worst cost given up
+    #         20         59% of full             4.6e-3
+    #         30         75%                     1.1e-4
+    #         40         78%                     9.6e-5
+    #         60         85%                     6.8e-5
+    #
+    # -- there is a cliff just below 30 (the longest gap between real
+    # improvements on the worst subject was 21 generations, so a patience near
+    # it truncates a live climb), and 60 is the first value whose worst case is
+    # under the noise floor. It is 2.9x that longest gap. An earlier 30 was
+    # sized on a single pair whose longest gap was 8, which the five-subject
+    # sweep showed was not representative.
+    #
+    # The tolerance is the rel/abs pair the Adam refiner already uses.
     # FFS_CMA_PATIENCE joins the FFS_CMA_* knobs above; set it huge to get the
     # old sigma-only termination back for an A/B.
     rel_tol, abs_tol = 1e-4, 1e-6
-    patience = int(_os.environ.get("FFS_CMA_PATIENCE", "30"))
+    patience = int(_os.environ.get("FFS_CMA_PATIENCE", "60"))
     stalled = torch.zeros(T, dtype=torch.long, device=device)
     prev_best = torch.full((T,), -float("inf"), device=device)
 
