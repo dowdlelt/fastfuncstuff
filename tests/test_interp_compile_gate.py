@@ -43,6 +43,10 @@ def _isolated_gate(monkeypatch, tmp_path):
     yield
 
 
+def tmp_cost_path(mod):
+    return mod._compile_cost_path()
+
+
 def _is_compiled(fn) -> bool:
     return getattr(fn, "_is_compiled", False)
 
@@ -111,6 +115,34 @@ class TestCalibration:
         assert stored[interp._compile_cost_key("cpu")] == pytest.approx(3.25)
         interp._compile_cost_cache.clear()
         assert interp._measured_compile_cost("cpu") == pytest.approx(3.25)
+
+    def test_a_cold_compile_does_not_set_the_bar_forever(self):
+        """The gate wants the warm cost -- what the NEXT process pays. Keeping the
+        last measurement instead let one cold compile hold the bar 2-4x high, and
+        every run after it burned that much eager time before switching."""
+        interp._record_compile_cost("cpu", 11.8)  # cold cache
+        interp._record_compile_cost("cpu", 5.9)  # a following, warm process
+        interp._compile_cost_cache.clear()
+        assert interp._measured_compile_cost("cpu") == pytest.approx(5.9)
+        interp._record_compile_cost("cpu", 12.4)  # a later cold graph must not raise it
+        interp._compile_cost_cache.clear()
+        assert interp._measured_compile_cost("cpu") == pytest.approx(5.9)
+
+    def test_the_bootstrap_prior_is_never_recorded_as_a_measurement(self):
+        """The in-memory cost holds the prior until a compile pays for one. Mining
+        against it would persist a warmup nobody ever measured."""
+        interp._compile_cost_cache[interp._compile_cost_key("cpu")] = 0.5  # prior
+        interp._record_compile_cost("cpu", 9.0)
+        stored = json.loads((tmp_cost_path(interp)).read_text())
+        assert stored[interp._compile_cost_key("cpu")] == pytest.approx(9.0)
+
+    def test_an_implausibly_fast_warmup_is_ignored(self):
+        """Nothing compiles in a millisecond; letting one through would pin the
+        bar at zero and compile every one-shot run."""
+        interp._record_compile_cost("cpu", 4.0)
+        interp._record_compile_cost("cpu", 0.001)
+        interp._compile_cost_cache.clear()
+        assert interp._measured_compile_cost("cpu") == pytest.approx(4.0)
 
     def test_bootstrap_prior_when_uncalibrated(self):
         assert interp._measured_compile_cost("cpu") == interp._COMPILE_COST_BOOTSTRAP_S

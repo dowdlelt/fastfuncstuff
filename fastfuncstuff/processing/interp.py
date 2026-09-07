@@ -994,10 +994,13 @@ _compile_pending_measure: set[str] = set()
 _no_compile_depth = 0
 
 
-# Bumped whenever the compile itself changes shape (flags, or what gets traced):
-# a cost measured under the old regime does not predict the new one. v2 = the
-# move to dynamic=True, whose recorded costs were inflated by recompile churn.
-_COMPILE_COST_SCHEMA = "v2"
+# Bumped whenever the compile itself changes shape (flags, or what gets traced)
+# or how the cost is recorded: a cost measured under the old regime does not
+# predict the new one. v2 = the move to dynamic=True, whose recorded costs were
+# inflated by recompile churn. v3 = keeping the cheapest measurement rather than
+# the last, which discards the cold-compile high-water marks v2 accumulated (a
+# CPU shear entry had drifted to 25.2s against a 5.9s warm cost).
+_COMPILE_COST_SCHEMA = "v3"
 
 
 def _compile_cost_key(dt: str, what: str = "gather") -> str:
@@ -1022,12 +1025,12 @@ def _measured_compile_cost(dt: str, what: str = "gather", bootstrap: float | Non
     paid one. Falls back to a bootstrap prior that the first real measurement
     replaces -- an unfamiliar machine mis-compiles at most once.
 
-    Note the measurement is whatever the *last* compile paid, and a cold inductor
-    cache costs several times a warm one (gather ~5s cold vs ~2s warm; the shear
-    pass ~20s vs ~3s). So a first-ever compile records a pessimistic number and
-    the following run gates conservatively, until a compile on a warm cache
-    overwrites it. That self-corrects as long as the workload still reaches the
-    higher bar -- pick ``bootstrap`` above the warm cost so it can.
+    The number wanted here is what the NEXT process will pay, and that is the
+    warm-cache cost: a cold inductor cache costs several times a warm one (the
+    same shear graph measured 11.8s cold against 5.9s in a following process,
+    and the CPU calibration this replaced had drifted to 25.2s). So the record
+    keeps the cheapest measurement for a key rather than the last, which is why
+    a first-ever cold compile no longer sets the bar for every run after it.
     """
     key = _compile_cost_key(dt, what)
     if key in _compile_cost_cache:
@@ -1044,11 +1047,23 @@ def _measured_compile_cost(dt: str, what: str = "gather", bootstrap: float | Non
     return cost
 
 
+# A "warmup" faster than this did not include a compile -- something short-
+# circuited -- and must not be allowed to pin the bar near zero.
+_MIN_CREDIBLE_COMPILE_S = 0.05
+
+
 def _record_compile_cost(dt: str, seconds: float, what: str = "gather") -> None:
-    """Persist what the warmup just cost. Best-effort: a read-only or racing cache
-    only means the next process uses the prior again."""
+    """Persist the cheapest warmup seen for this key. Best-effort: a read-only or
+    racing cache only means the next process uses the prior again.
+
+    Cheapest, not latest, because the gate is asking what a warmup costs in
+    steady state and a cold-cache compile is a one-off that will not repeat for
+    that graph. Recording the last value instead let one cold compile set a bar
+    2-4x too high, and every process after it then burned that many seconds of
+    eager work -- at ~13x the compiled rate -- before it would switch."""
     key = _compile_cost_key(dt, what)
-    _compile_cost_cache[key] = seconds
+    if seconds < _MIN_CREDIBLE_COMPILE_S:
+        return
     path = _compile_cost_path()
     try:
         try:
@@ -1058,14 +1073,20 @@ def _record_compile_cost(dt: str, seconds: float, what: str = "gather") -> None:
                 data = {}
         except (OSError, ValueError):
             data = {}
+        # Against the FILE, never the in-memory value: that one may still hold the
+        # bootstrap prior, and mining a prior would record a warmup nobody paid.
+        stored = data.get(key)
+        if isinstance(stored, int | float) and stored > 0:
+            seconds = min(seconds, float(stored))
         data[key] = seconds
+        _compile_cost_cache[key] = seconds
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(f".{os.getpid()}.tmp")
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, path)  # atomic, so a concurrent reader never sees a partial file
     except OSError:
-        pass
+        _compile_cost_cache[key] = seconds  # unwritable cache: at least this process learns
 
 
 @contextmanager
