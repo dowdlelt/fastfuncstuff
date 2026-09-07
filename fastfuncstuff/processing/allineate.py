@@ -2034,6 +2034,7 @@ def _refine_adam_batched(
     lr: float = 0.01,
     desc: str = "Adam",
     compile_fwd: bool = False,
+    rel_tol: float = 1e-4,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Normalized Adam over T trials at once (one batched cost per step).
 
@@ -2061,7 +2062,7 @@ def _refine_adam_batched(
     best_norm = params_norm.detach().clone()
     last_best = np.full(T, -np.inf)
     no_improve = np.zeros(T, dtype=np.int64)
-    rel_tol, abs_tol, patience, sync_every = 1e-4, 1e-6, 40, 15
+    abs_tol, patience, sync_every = 1e-6, 40, 15
 
     # Forward = normalized params -> (T,) cost. The per-iter cost is launch-bound
     # (dozens of small kernels: matrix build + sample + blok scatter), so the
@@ -2131,6 +2132,14 @@ def _refine_adam_batched(
                 trace.record(it, (it + 1) * T, float(bc.max()), step_costs=cur)
             if tqdm is not None and verb >= 1:
                 pbar.set_postfix_str(f"best={bc.max():.6f}")
+
+            # A trial still creeping by just over rel_tol keeps resetting its own
+            # counter, and the loop needs ALL of them flat, so the stage runs to
+            # its cap: on five anat-to-MNI subjects the last improvement worth
+            # having landed at 30-45% of the iterations and four of the five then
+            # ran all 300. The blur stage does not need the tolerance the sharp
+            # one does -- its job is to land inside the next stage's capture
+            # basin, not to converge -- so the caller sets it (see rel_tol).
             if bool((no_improve >= patience).all()):
                 break
 
@@ -2484,6 +2493,21 @@ def _refine_progressive(
                     lr=lr,
                     desc=f"S{si}",
                     compile_fwd=config.compile,
+                    # A blurred stage only has to hand the next one a starting
+                    # point inside its capture basin, so chasing gains the sharp
+                    # stage will overwrite is wasted: five subjects spent 55-70%
+                    # of the blur stage earning 3e-5 to 1.4e-4, and four of the
+                    # five ran to the iteration cap because a trial creeping by
+                    # just over the sharp stage's tolerance kept resetting the
+                    # plateau counter. The sharp stage keeps that tolerance,
+                    # because there the gain IS the answer.
+                    #
+                    # 1e-3 and not looser: at 1e-2 the blur stage stops 36
+                    # iterations sooner and hands the difference straight to the
+                    # sharp stage (S1 233 -> 237 generations), for no wall time
+                    # and a worse worst case (+3.4e-4 against +1.6e-4 by a
+                    # referee outside the loop).
+                    rel_tol=1e-3 if sigma_vox > 0.0 else 1e-4,
                 )
             refined = [(float(out_costs[t]), out_phys[t]) for t in range(len(trials))]
         else:

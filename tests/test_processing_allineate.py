@@ -1413,6 +1413,37 @@ class TestDerivativeFreeRefinement:
         np.testing.assert_array_equal(a, b)
         np.testing.assert_array_equal(ca, cb)
 
+    def test_a_blurred_stage_stops_looser_than_a_sharp_one(self):
+        """The blur stage only has to land inside the sharp stage's capture
+        basin. Given the same flat-ish cost it must give up sooner than the
+        sharp stage would, or it runs to its cap chasing gains that get
+        overwritten."""
+        device = torch.device("cpu")
+        bounds = _compute_param_bounds((20, 20, 20), (1.0, 1.0, 1.0))
+        config = AffineAlignConfig(dof="rigid")
+        start = _identity_physical()
+        cost = self._bowl(_normalize(start, bounds) + 0.02, bounds, device)
+
+        from fastfuncstuff.processing.allineate import _refine_adam_batched
+
+        counts = {}
+        for tol in (1e-4, 1e-3):
+            with _recording_cost_trace(True) as trace:
+                _refine_adam_batched(
+                    [start] * 3,
+                    config,
+                    bounds,
+                    device,
+                    cost,
+                    verb=0,
+                    n_iters=400,
+                    rel_tol=tol,
+                )
+            counts[tol] = trace.rows[-1][1]
+        assert counts[1e-3] <= counts[1e-4], (
+            f"looser tolerance ran longer: {counts[1e-3]} vs {counts[1e-4]} iterations"
+        )
+
     def test_cmaes_stops_when_it_stops_improving(self):
         """sigma alone never ended this search. Once the samples are inside the
         cost's own reproducibility, selection sorts noise and CSA holds sigma up
