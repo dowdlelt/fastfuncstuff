@@ -442,3 +442,93 @@ def test_a_computed_overlay_keeps_the_modes_own_defaults(session, datadir):
     layer = session.state.layers.find_by_source("mode:test_dummy")
     session.apply_overlay_defaults(layer.key)
     assert session.state.layers.get(layer.key).colormap == layer.colormap
+
+
+# ---------------------------------------------------------------------------
+# ICA mode -- the proof that a new mode is one file
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ica_dir(tmp_path):
+    """A MELODIC-compatible decomposition, one level down as ffs writes it."""
+    rng = np.random.default_rng(21)
+    out = tmp_path / "ica_out" / "melodic_compat"
+    out.mkdir(parents=True)
+    nx, ny, nz, k, t = 8, 9, 7, 4, 40
+    maps = rng.normal(size=(nx, ny, nz, k)).astype(np.float32)
+    for i in range(k):
+        maps[i, i, i, i] = 20.0  # a distinct peak per component
+    _write(out, "melodic_IC.nii.gz", maps)
+    mix = np.column_stack([np.sin(2 * np.pi * f * np.arange(t)) for f in (0.02, 0.05, 0.1, 0.2)])
+    np.savetxt(out / "melodic_mix", mix)
+    np.savetxt(out / "melodic_FTmix", np.abs(np.fft.rfft(mix, axis=0))[1:])
+    _write(tmp_path, "anat.nii.gz", rng.random((nx, ny, nz)) * 100)
+    return tmp_path
+
+
+def test_ica_finds_a_decomposition_one_level_down(ica_dir, session):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    assert session.state.layers.find_by_source("mode:ica") is not None
+
+
+def test_ica_component_control_spans_the_decomposition(ica_dir, session):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    spec = next(c for c in session.mode.controls() if c.name == "component")
+    assert spec.hi == 3
+
+
+def test_stepping_components_swaps_the_map_and_the_name(ica_dir, session):
+    """The name is identity: showing IC 0 while displaying IC 2 is a lie."""
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    key = session.state.layers.find_by_source("mode:ica").key
+    first = session.store.get(key).array[..., 0].copy()
+
+    session.set_mode_param("component", "2")
+    layer = session.state.layers.find_by_source("mode:ica")
+    assert layer.name == "IC 2"
+    assert layer.key == key, "stepping must update in place, not add a layer"
+    assert not np.allclose(first, session.store.get(key).array[..., 0])
+
+
+def test_stepping_components_keeps_the_threshold_you_set(ica_dir, session):
+    """Reviewing components at a fixed threshold is the whole workflow."""
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    key = session.state.layers.find_by_source("mode:ica").key
+    session.state.layers.update(key, threshold=3.75)
+    session.set_mode_param("component", "1")
+    assert session.state.layers.get(key).threshold == 3.75
+
+
+def test_ica_contributes_a_timecourse_and_a_spectrum(ica_dir, session):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    traces = session.mode_series((1, 1, 1))
+    assert [t.x_label for t in traces] == ["TR", "Hz"]
+    assert traces[0].values.size == 40
+    assert traces[1].values.size == 20  # single-sided, DC dropped
+
+
+def test_the_spectrum_trace_can_be_turned_off(ica_dir, session):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(ica_dir / "ica_out")
+    session.do(SetMode("ica"))
+    session.set_mode_param("spectrum", "0")
+    assert len(session.mode_series((1, 1, 1))) == 1
+
+
+def test_ica_without_a_decomposition_says_so_rather_than_failing(session, datadir):
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.read_directory(datadir)
+    session.do(SetMode("ica"))
+    assert session.state.layers.find_by_source("mode:ica") is None
+    assert "no decomposition" in session.mode.status()

@@ -14,6 +14,7 @@ from fastfuncstuff.viewer.modes.base import (
     mode,
     registry,
 )
+from fastfuncstuff.viewer.modes.ica import ICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 
 # Registration is an import side effect, so every built-in mode must be
@@ -27,6 +28,7 @@ __all__ = [
     "Control",
     "DatasetControl",
     "FloatControl",
+    "ICAMode",
     "InstaCorrMode",
     "IntControl",
     "Mode",

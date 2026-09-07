@@ -126,12 +126,19 @@ class GridGraph(QtWidgets.QWidget):
         if not indexed:
             return
         bounds = shared if shared is not None else self._bounds([cell])
-        nt = max(t[1].size for _, t in indexed)
         inner = rect.adjusted(2, 2, -2, -2)
+        # Each trace spans the full width using its OWN length. Traces here are
+        # not always the same axis -- a 60-bin spectrum beside a 120-point time
+        # course is Hz beside TR -- so scaling both to the longest would squash
+        # the shorter one into a fraction of the cell and imply a shared x that
+        # does not exist.
+        cursor_len = 0
 
         for si, (_, values) in indexed:
             lo, hi = bounds[si] if si < len(bounds) else (0.0, 1.0)
             span = hi - lo or 1.0
+            nt = values.size
+            cursor_len = max(cursor_len, nt)
             path = QtGui.QPainterPath()
             for i, v in enumerate(values):
                 x = inner.left() + (i / max(nt - 1, 1)) * inner.width()
@@ -143,8 +150,11 @@ class GridGraph(QtWidgets.QWidget):
             p.setPen(pen)
             p.drawPath(path)
 
-        if 0 <= self._index < nt:
-            x = inner.left() + (self._index / max(nt - 1, 1)) * inner.width()
+        # The time cursor belongs to the time-domain trace, which is the first
+        # one; a spectrum has no "current time point".
+        first_len = indexed[0][1][1].size
+        if 0 <= self._index < first_len:
+            x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
             p.setPen(QtGui.QPen(QtGui.QColor(217, 164, 65, 160)))
             p.drawLine(QtCore.QPointF(x, inner.top()), QtCore.QPointF(x, inner.bottom()))
 

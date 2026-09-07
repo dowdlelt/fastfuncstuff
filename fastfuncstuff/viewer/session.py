@@ -267,7 +267,14 @@ class ViewerSession:
         self.invalidate(key)
 
         lo, hi = overlay.display_range or derive_range(overlay.values)
-        if existing is None:
+        if existing is not None:
+            # The name is identity -- showing "IC 0" while displaying IC 4 is a
+            # lie. Range and threshold deliberately do NOT follow: stepping
+            # through components at a threshold you set is how they get
+            # reviewed, and resetting it on every step would undo the gesture.
+            if existing.name != overlay.name:
+                self.state.layers.update(key, name=overlay.name)
+        else:
             layer = Layer(
                 key=key,
                 name=overlay.name,
