@@ -187,6 +187,27 @@ class TestWarpState:
         ws2 = WarpState()
         assert ws1.xd is not ws2.xd
 
+    def test_packed_warp_channels_are_writable_views(self):
+        ws = WarpState()
+        fields = [torch.full((2, 3, 4), value) for value in (1.0, 2.0, 3.0)]
+        ws.set_warp(*fields)
+
+        packed = ws.packed_warp()
+        ws.yd[0, 0, 0] = 7
+
+        assert packed.data_ptr() == ws.packed_warp().data_ptr()
+        assert packed[1, 0, 0, 0] == 7
+
+    def test_packed_warp_repairs_whole_field_replacement(self):
+        ws = WarpState()
+        ws.set_warp(*(torch.zeros(2, 3, 4) for _ in range(3)))
+        ws.xd = torch.ones(2, 3, 4)
+
+        packed = ws.packed_warp()
+
+        torch.testing.assert_close(packed[0], ws.xd)
+        assert packed[0].data_ptr() == ws.xd.data_ptr()
+
 
 # ---------------------------------------------------------------------------
 # PatchSpec dataclass

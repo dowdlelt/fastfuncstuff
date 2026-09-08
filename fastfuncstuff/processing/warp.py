@@ -394,6 +394,7 @@ class WarpState:
     xd: Tensor = field(default_factory=lambda: torch.empty(0))
     yd: Tensor = field(default_factory=lambda: torch.empty(0))
     zd: Tensor = field(default_factory=lambda: torch.empty(0))
+    warp_3ch: Tensor = field(default_factory=lambda: torch.empty(0))
     warped_source: Tensor = field(default_factory=lambda: torch.empty(0))
 
     nx: int = 0
@@ -422,6 +423,25 @@ class WarpState:
     opt_steps_weighted: int = 0  # sum over batches of steps_run * B
     opt_patches_counted: int = 0  # patches that went through the batched optimizer
     opt_hit_budget: int = 0  # patches still improving at the iteration cap
+
+    def set_warp(self, xd: Tensor, yd: Tensor, zd: Tensor) -> None:
+        """Pack a displacement field once and expose its channels as writable views."""
+        self.warp_3ch = torch.stack((xd, yd, zd))
+        self.xd, self.yd, self.zd = self.warp_3ch.unbind(0)
+
+    def packed_warp(self) -> Tensor:
+        """Return packed storage, repairing it after whole-field replacement."""
+        packed = self.warp_3ch
+        shares_storage = (
+            packed.ndim == 4
+            and packed.shape[0] == 3
+            and packed[0].data_ptr() == self.xd.data_ptr()
+            and packed[1].data_ptr() == self.yd.data_ptr()
+            and packed[2].data_ptr() == self.zd.data_ptr()
+        )
+        if not shares_storage:
+            self.set_warp(self.xd, self.yd, self.zd)
+        return self.warp_3ch
 
 
 @dataclass
@@ -2126,7 +2146,7 @@ def _improve_warp_batched(
 
     # Pre-stack global warp as 3-channel volume ONCE (avoids re-stacking
     # every optimizer iteration -- saves ~45 MB of memory copies per iter)
-    global_warp_3ch = torch.stack([state.xd, state.yd, state.zd], dim=0)
+    global_warp_3ch = state.packed_warp()
 
     # Pre-build expansion matrix: (n_active, n_total) maps active params to
     # full param vector with axis weight scaling. Replaces a Python for-loop
