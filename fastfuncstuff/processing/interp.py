@@ -1473,7 +1473,26 @@ def batched_interp_3ch(
         x, y, z: each (B, V) - sample locations.
 
     Returns:
-        Three tensors of shape (B, V).
+        Three tensors of shape (B, V). They are views into one packed result --
+        see :func:`batched_interp_3ch_packed` if you want it whole.
+    """
+    packed = batched_interp_3ch_packed(vol_3ch, x, y, z)
+    return packed[:, 0], packed[:, 1], packed[:, 2]
+
+
+def batched_interp_3ch_packed(
+    vol_3ch: Tensor,
+    x: Tensor,
+    y: Tensor,
+    z: Tensor,
+) -> Tensor:
+    """:func:`batched_interp_3ch` without splitting the result: one (B, 3, V) tensor.
+
+    The three channels come out of ``grid_sample`` already packed along a single
+    contiguous axis, so a caller that wants them stacked should take this and read
+    it by stride rather than take the split views and ``torch.stack`` them back
+    together -- that restack copies three volume-equivalents per call, and in the
+    qwarp Gauss-Newton loop it ran once per iteration.
     """
     B, V = x.shape
     _, nz, ny, nx = vol_3ch.shape
@@ -1489,8 +1508,7 @@ def batched_interp_3ch(
 
     result = _grid_sample_3d(vol_5d, grid)
     # result: (B, 3, 1, 1, V) -> (B, 3, V)
-    result = result.reshape(B, 3, V)
-    return result[:, 0], result[:, 1], result[:, 2]
+    return result.reshape(B, 3, V)
 
 
 def batched_compose_and_interpolate(

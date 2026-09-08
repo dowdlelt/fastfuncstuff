@@ -65,7 +65,7 @@ from .cost_blok import (
 from .interp import (
     batched_compose_and_interpolate,
     batched_compose_and_interpolate_multi,
-    batched_interp_3ch,
+    batched_interp_3ch_packed,
     batched_trilinear_interpolate,
     batched_trilinear_interpolate_multi,
     trilinear_interpolate,
@@ -2310,8 +2310,11 @@ def _improve_warp_batched(
                 sx = (ax_ + base_i).clamp(-0.499, nx - 0.501)
                 sy = (ay_ + base_j).clamp(-0.499, ny - 0.501)
                 sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
-                gx_, gy_, gz_ = batched_interp_3ch(source_grad_3ch, sx, sy, sz)
-                gall = torch.stack([gx_, gy_, gz_], dim=0)
+                # (B, 3, V) viewed as (3, B, V): the channels arrive packed, and
+                # both the fused kernel and the chunked fallback read g by stride,
+                # so restacking them would copy three volume-equivalents per
+                # iteration for a layout neither one needs.
+                gall = batched_interp_3ch_packed(source_grad_3ch, sx, sy, sz).permute(1, 0, 2)
                 if len(active_dims) < 3:
                     gall = gall[list(active_dims)]
                 # w and g are deliberately *not* masked here. omega is

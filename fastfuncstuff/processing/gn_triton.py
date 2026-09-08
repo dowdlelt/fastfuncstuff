@@ -154,7 +154,12 @@ def gn_normal_eqs_triton(
     h_part = torch.zeros((b, n_split, ncol_pad, ncol_pad), device=g.device, dtype=torch.float32)
     g_part = torch.zeros((b, n_split, ncol_pad), device=g.device, dtype=torch.float32)
 
-    g = g.contiguous()
+    # Read g by stride rather than forcing it contiguous: it arrives as a permuted
+    # view of the (B, 3, V) packed gradient, and making it contiguous here would
+    # reinstate exactly the three-volume copy that view exists to avoid. Only the
+    # voxel axis has to be dense, which a channel permute leaves alone.
+    if g.stride(2) != 1:
+        g = g.contiguous()
     _gn_normal_eqs_kernel[(b, n_split)](
         g,
         bt.contiguous(),
