@@ -352,6 +352,29 @@ def parse_args(
         "Raise it if the warp shows streaks of folded field.",
     )
     p.add_argument(
+        "-guard_floor",
+        "-guard-floor",
+        type=float,
+        default=_D.guard_floor,
+        help="det(J) the hard guard holds the warp to (needs -fold_guard). At the "
+        "default it only stops actual folding. Raised, it becomes a COMPRESSION LIMIT: "
+        "-fold_guard 0.5 -guard_floor 0.3 forbids compressing any voxel past 3.3x, "
+        "which on same-modality brain-to-brain scored LNCC 0.615 against 0.549 for the "
+        "penalty alone -- near-conformality is a good prior there. It is the wrong "
+        "prior wherever anatomy genuinely compresses hard (a large ventricle matched to "
+        "a small one), so it is off by default.",
+    )
+    p.add_argument(
+        "-guard_refuses",
+        "-guard-refuses",
+        action="store_true",
+        help="Let -fold_guard drop a step entirely when local damping cannot make it "
+        "safe, instead of keeping the best-damped one. Stricter, and measurably worse "
+        "where it is not needed (LNCC 0.520 against 0.587 on a NIREP pair, with damping "
+        "alone already leaving zero folded voxels): refusing discards the whole step "
+        "including the parts that were fine.",
+    )
+    p.add_argument(
         "-fold_guard",
         "-fold-guard",
         type=float,
@@ -627,6 +650,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         void_guard=args.void_guard,
         fold_penalty=args.fold_penalty,
         fold_guard=args.fold_guard,
+        guard_floor=args.guard_floor,
+        guard_refuses=args.guard_refuses,
         warp_flags=warp_flags,
         final_interp=args.final_interp,
         verb=args.verb,

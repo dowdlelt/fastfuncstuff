@@ -504,7 +504,7 @@ def test_fold_guard_refuses_a_step_it_cannot_damp_rather_than_folding():
     update = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
 
     # Given enough rounds the local damping does fix this, and the step is taken.
-    generous = SynConfig(fold_guard=0.5)
+    generous = SynConfig(fold_guard=0.5, guard_refuses=True)
     kept, jac, damped, refused = _additive_step_with_fold_guard(
         prev, update, 0.0, generous, prev_jac
     )
@@ -512,7 +512,7 @@ def test_fold_guard_refuses_a_step_it_cannot_damp_rather_than_folding():
     assert float(jac.min()) >= generous.jac_floor
 
     # Starved of rounds it cannot, and then the step is dropped rather than folded.
-    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2)
+    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2, guard_refuses=True)
     kept, jac, damped, refused = _additive_step_with_fold_guard(prev, update, 0.0, config, prev_jac)
     assert damped == 2 and refused
     assert float(jac.min()) >= config.jac_floor
@@ -533,7 +533,7 @@ def test_fold_guard_lets_an_inherited_fold_be_climbed_out_of_but_not_deepened():
         jacobian_determinant,
     )
 
-    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2)
+    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2, guard_refuses=True)
     ramp = torch.zeros(20, 20, 20)
     ramp[:, :, 10:] = -12.0
     prev = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))

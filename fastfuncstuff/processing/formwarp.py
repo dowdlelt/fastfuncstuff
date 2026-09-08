@@ -199,8 +199,36 @@ class SynConfig:
     the whole mechanism. AFNI's soft penalty is the middle road, and it is the one we
     already had a primitive for."""
 
+    guard_floor: float = FOLD_GUARD_FLOOR
+    """``det(J)`` the hard guard holds each half-field to, when :attr:`fold_guard` is on.
+
+    At the default this is the fold threshold, so the guard does what its name says and
+    only stops actual inversion. Raised, it stops being a fold guard and becomes a
+    **compression limit** -- and that turns out to be the more useful thing on
+    same-modality data. On NIREP na02->na01, ``guard_floor=0.3`` (no voxel may compress
+    past 3.3x) scores LNCC 0.615 against 0.549 for the penalty alone, because
+    near-conformality is a good prior for matching one brain to another. It is a bad
+    prior wherever real anatomy compresses hard -- a large ventricle matched to a small
+    one -- which is exactly why it is a knob and not a default.
+
+    Note this is a limit on *volume change*, not on validity: a warp is perfectly legal
+    below it. Anything at or under :attr:`jac_floor` is what is actually broken."""
+
+    guard_refuses: bool = False
+    """Whether the hard guard may drop a step outright, or only damp it locally.
+
+    Refusing throws away the whole step, including every part of it that was fine;
+    damping backs off only around the voxels at fault. Measured on NIREP na02->na01 at
+    ``guard_floor=0.3``, refusing cost LNCC 0.520 against 0.587 for damping alone, and
+    damping still ended with zero folded voxels and min det(J) +0.144 -- so the refusal
+    was buying nothing it did not already have. Both levels converge without it and
+    neither does with it.
+
+    Kept as a knob because the argument for refusing is real where a fold is genuinely
+    inadmissible: damping is best-effort and can leave harm behind, refusing cannot."""
+
     fold_guard: float = 0.0
-    """Per-round shrink (0..1) applied by the **hard** local anti-folding damping; 0 off.
+    """Per-round shrink (0..1) applied by the **hard** local damping; 0 turns it off.
 
     Off by default. A hard guard is the right tool when a fold is genuinely inadmissible
     -- ``ffs_blipflip``'s single-axis distortion fields, say -- and the wrong default
@@ -822,7 +850,7 @@ def _additive_step_with_fold_guard(
     if config.fold_guard <= 0:
         return cand, jac, 0, False
 
-    floor = config.jac_floor
+    floor = config.guard_floor
 
     def harm(candidate_jac: Tensor) -> float:
         """Total folding, as det(J) summed over the voxels under the floor.
@@ -851,7 +879,7 @@ def _additive_step_with_fold_guard(
     # Comparing against ``prev_harm`` rather than against zero is what keeps this
     # satisfiable from any starting state: a level that inherited a folded field can
     # still step, so long as it does not fold it further.
-    if best_harm > prev_harm:
+    if best_harm > prev_harm and config.guard_refuses:
         return prev, prev_jac, damped, True
     return best_cand, best_jac, damped, False
 
