@@ -30,6 +30,21 @@ try:
 except Exception:  # pragma: no cover - Triton is optional and CUDA-only
     separable_resample_3d_triton = None
 
+try:
+    from .compose_triton import compose_and_interpolate_triton
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    compose_and_interpolate_triton = None
+
+_compose_triton_unavailable = False
+
+
+def _set_compose_triton_unavailable(message: str) -> None:
+    """Latch the fused compose off for the rest of the process, saying so once."""
+    global _compose_triton_unavailable
+    _compose_triton_unavailable = True
+    print(f"** {message}")
+
+
 # Set when a fused launch actually fails on this machine (see _separable_resample_3d).
 _triton_interp_unavailable = False
 
@@ -1555,6 +1570,33 @@ def batched_compose_and_interpolate(
         warped_vals: (B, V) interpolated source values.
         ah_xd, ah_yd, ah_zd: (B, V) composed displacement fields.
     """
+    # One kernel for the whole thing: the coordinate bookkeeping around these two
+    # gathers is ~40 (B, V) passes and two grid stacks, none of which anything but
+    # grid_sample's calling convention requires. Not differentiable, so the Adam
+    # path -- which backpropagates through exactly this -- keeps the tensor form.
+    if (
+        compose_and_interpolate_triton is not None
+        and not _compose_triton_unavailable
+        and global_warp_3ch is not None
+        and base_i is not None
+        and source.device.type == "cuda"
+        and source.dtype == torch.float32
+        and source.dim() == 3
+        and not torch.is_grad_enabled()
+        and os.environ.get("FFS_COMPOSE_NO_TRITON") != "1"
+    ):
+        try:
+            return compose_and_interpolate_triton(
+                source, global_warp_3ch, patch_xd, patch_yd, patch_zd, base_i, base_j, base_k
+            )
+        except AssertionError:
+            raise  # a failed assertion is a bug here, not a missing GPU capability
+        except Exception as exc:  # pragma: no cover - needs a Triton-hostile GPU
+            _set_compose_triton_unavailable(
+                f"fused compose-and-sample unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to the portable path"
+            )
+
     # Global coordinates after local patch displacement: (B, V)
     if base_i is not None:
         xq = (base_i + patch_xd).clamp(0, nx - 1)
