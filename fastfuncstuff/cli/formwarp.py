@@ -90,6 +90,18 @@ def _float_list(spec: str) -> tuple[float, ...]:
     return tuple(float(p) for p in spec.replace(",", "x").split("x") if p != "")
 
 
+def _maybe_list(spec: str | float) -> float | tuple[float, ...]:
+    """A single number stays one, applying to every level; ``4x3x2`` becomes per-level.
+
+    The default comes through as a float (argparse does not run ``type=`` on defaults),
+    so both forms have to be accepted here rather than at the parser.
+    """
+    if not isinstance(spec, str):
+        return spec
+    values = _float_list(spec)
+    return values[0] if len(values) == 1 else values
+
+
 _EPILOG = """\
 WHICH NONLINEAR BACKEND
 -----------------------
@@ -286,16 +298,21 @@ def parse_args(
     p.add_argument(
         "-update_var",
         "-update-var",
-        type=float,
         default=_D.update_var,
-        help="Fluid regularization: update-field Gaussian sigma (voxels).",
+        help="Fluid regularization: update-field Gaussian sigma, in voxels of each "
+        "level's own grid (so a constant value is already more physical smoothing at "
+        "the coarse levels -- ANTs holds it constant for that reason). One value for "
+        "all levels, or one per level, e.g. 4x3x2.",
     )
     p.add_argument(
         "-total_var",
         "-total-var",
-        type=float,
         default=_D.total_var,
-        help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off).",
+        help="Elastic regularization: total-field Gaussian sigma (voxels; 0=off). One "
+        "value for all levels, or one per level, e.g. 2x1x0. Applied to the ACCUMULATED "
+        "field every iteration, so a nonzero value at every level decays the warp as "
+        "fast as it is built (measured LNCC 0.374 against 0.549); if it helps at all it "
+        "will be at one level.",
     )
     p.add_argument(
         "-invert_iters",
@@ -639,8 +656,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         lpa_sigma=args.lpa_sigma,
         lpa_kernel=args.lpa_kernel,
         grad_step=args.grad_step,
-        update_var=args.update_var,
-        total_var=args.total_var,
+        update_var=_maybe_list(args.update_var),
+        total_var=_maybe_list(args.total_var),
         invert_iters=args.invert_iters,
         shrink_factors=_int_list(args.shrink),
         smoothing_sigmas=_float_list(args.smooth),

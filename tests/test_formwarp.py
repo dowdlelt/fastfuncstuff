@@ -672,3 +672,45 @@ def test_fold_guard_leaves_an_improving_step_alone():
     assert float(jac.min()) >= float(prev_jac.min())
     assert not refused
     assert damped == 0, "an improving step should not be damped at all"
+
+
+def test_per_level_regularization_broadcasts_and_is_length_checked():
+    """A scalar applies to every level; a sequence must match the pyramid."""
+    from fastfuncstuff.processing.formwarp import _per_level
+
+    assert _per_level(3.0, 3, "update_var") == (3.0, 3.0, 3.0)
+    assert _per_level((4.0, 3.0, 2.0), 3, "update_var") == (4.0, 3.0, 2.0)
+    with pytest.raises(ValueError, match="2 values but there are 3 levels"):
+        _per_level((4.0, 3.0), 3, "update_var")
+
+
+def test_per_level_regularization_reaches_each_level():
+    """Each level is handed its own sigma, not the whole spec."""
+    import fastfuncstuff.processing.formwarp as fw
+
+    seen = []
+    original = fw._syn_level
+
+    def record(fixed, moving, weight, fields, n_iter, config, level_tag="", guard=None):
+        seen.append((level_tag, config.update_var, config.total_var))
+        return original(fixed, moving, weight, fields, n_iter, config, level_tag, guard)
+
+    fw._syn_level = record
+    try:
+        formwarp(
+            _blobs(16, 18, 16),
+            _blobs(16, 18, 16, shift=(1.0, 0.0, 0.0)),
+            config=SynConfig(
+                shrink_factors=(2, 1),
+                smoothing_sigmas=(1.0, 0.0),
+                iterations=(3, 3),
+                update_var=(4.0, 2.0),
+                total_var=(1.0, 0.0),
+                verb=0,
+            ),
+            device=DEVICE,
+        )
+    finally:
+        fw._syn_level = original
+
+    assert [(t, u, v) for t, u, v in seen] == [("L1", 4.0, 1.0), ("L2", 2.0, 0.0)]

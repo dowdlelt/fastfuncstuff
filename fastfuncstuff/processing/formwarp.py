@@ -40,7 +40,7 @@ differentiable form. See ``../fmri_wiki/concepts/SyN.md``.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
@@ -127,13 +127,28 @@ class SynConfig:
     """Max per-iteration displacement (voxels) after update-field normalization.
     The ANTs SyN[gradientStep]; smaller is safer, larger converges faster."""
 
-    update_var: float = 3.0
-    """Fluid regularization: Gaussian sigma (voxels) smoothing the per-iteration
-    update field. ANTs SyN[,updateFieldVarianceInVoxelSpace=3]."""
+    update_var: float | tuple[float, ...] = 3.0
+    """Fluid regularization: Gaussian sigma smoothing the per-iteration update field.
+    ANTs SyN[,updateFieldVarianceInVoxelSpace=3]. A single value applies to every level;
+    a per-level tuple (one entry per shrink factor) overrides it level by level.
 
-    total_var: float = 0.0
-    """Elastic regularization: Gaussian sigma (voxels) smoothing the accumulated
-    field. ANTs SyN[,,totalFieldVarianceInVoxelSpace=0] (0 = off)."""
+    Note the units already do most of the work: the sigma is in **voxels of the level's
+    own grid**, so a constant 3 is 12 full-resolution voxels at shrink=4 and 3 at
+    shrink=1. The physical smoothing therefore scales with the pyramid for free, which
+    is why ANTs specifies this in voxel space and holds it constant. Per-level control
+    is an extension over that, for the case where coarse and fine levels genuinely want
+    different priors -- the coarse-level regularisation is what was carrying the quality
+    on NIREP na02->na01 -- not a correction to it."""
+
+    total_var: float | tuple[float, ...] = 0.0
+    """Elastic regularization: Gaussian sigma smoothing the accumulated field.
+    ANTs SyN[,,totalFieldVarianceInVoxelSpace=0] (0 = off). Scalar or per-level, as
+    :attr:`update_var`.
+
+    Measured on NIREP na02->na01, a constant 1-2 here is badly counterproductive
+    (LNCC 0.374 against 0.549): it re-smooths the *accumulated* field on every
+    iteration, so the warp decays as fast as it is built. If it is useful at all it will
+    be at one level, which is what the per-level form is for."""
 
     shrink_factors: tuple[int, ...] = (4, 2, 1)
     """Per-level isotropic downsample factor (ANTs -f). Coarse-to-fine."""
@@ -641,6 +656,19 @@ def _invert_displacement_field_pair(
 # ---------------------------------------------------------------------------
 
 
+def _per_level(value: float | tuple[float, ...], n_levels: int, name: str) -> tuple[float, ...]:
+    """Broadcast a scalar to every level, or check a per-level sequence's length."""
+    if isinstance(value, (int, float)):
+        return (float(value),) * n_levels
+    out = tuple(float(v) for v in value)
+    if len(out) != n_levels:
+        raise ValueError(
+            f"{name} has {len(out)} values but there are {n_levels} levels; give one "
+            f"value for every shrink factor, or a single value for all of them"
+        )
+    return out
+
+
 def _shrunk_shape(shape: tuple[int, int, int], factor: int) -> tuple[int, int, int]:
     nz, ny, nx = shape
     return (
@@ -935,6 +963,9 @@ def _syn_level(
     always run the full ``n_iter``.
     """
     (fxd, fyd, fzd), (ifxd, ifyd, ifzd), (mxd, myd, mzd), (imxd, imyd, imzd) = fields
+    # formwarp() resolves the per-level forms before calling; a level sees one number.
+    update_var = float(config.update_var)  # type: ignore[arg-type]
+    total_var = float(config.total_var)  # type: ignore[arg-type]
     flags = config.warp_flags
     window = config.convergence_window
     nz, ny, nx = fixed.shape
@@ -1015,8 +1046,8 @@ def _syn_level(
         umx, umy, umz = -grads[3], -grads[4], -grads[5]
 
         # Fluid regularization of the update fields.
-        ufx, ufy, ufz = _smooth_field(ufx, ufy, ufz, config.update_var)
-        umx, umy, umz = _smooth_field(umx, umy, umz, config.update_var)
+        ufx, ufy, ufz = _smooth_field(ufx, ufy, ufz, update_var)
+        umx, umy, umz = _smooth_field(umx, umy, umz, update_var)
 
         # Then drop whatever of that update points into a no-data region, leaving the
         # two tangential directions untouched. After the smoothing, so the fluid step
@@ -1035,14 +1066,14 @@ def _syn_level(
         (fxd, fyd, fzd), jac_f, df, rf = _additive_step_with_fold_guard(
             (fxd, fyd, fzd),
             (scale * ufx, scale * ufy, scale * ufz),
-            config.total_var,
+            total_var,
             config,
             jac_f,
         )
         (mxd, myd, mzd), jac_m, dm, rm = _additive_step_with_fold_guard(
             (mxd, myd, mzd),
             (scale * umx, scale * umy, scale * umz),
-            config.total_var,
+            total_var,
             config,
             jac_m,
         )
@@ -1247,6 +1278,8 @@ def formwarp(
     n_levels = len(config.shrink_factors)
     if not (len(config.smoothing_sigmas) == len(config.iterations) == n_levels):
         raise ValueError("shrink_factors, smoothing_sigmas and iterations must have equal length")
+    update_vars = _per_level(config.update_var, n_levels, "update_var")
+    total_vars = _per_level(config.total_var, n_levels, "total_var")
 
     # Half-fields on the full grid, refined coarse-to-fine. zero == identity.
     zeros = lambda: torch.zeros(full_shape, device=device)  # noqa: E731
@@ -1296,13 +1329,16 @@ def formwarp(
         if cover is not None and config.void_guard > 0.0:
             guard = _void_guard_field(_resize_volume(cover.float(), target))
 
+        # The level sees one resolved value for each; everything below reads a scalar.
+        level_config = replace(config, update_var=update_vars[lev], total_var=total_vars[lev])
+
         (phi_f, inv_f, phi_m, inv_m), stats = _syn_level(
             f_lvl,
             m_lvl,
             w_lvl,
             (phi_f, inv_f, phi_m, inv_m),
             n_iter,
-            config,
+            level_config,
             level_tag=f"L{lev + 1}",
             guard=guard,
         )
