@@ -950,6 +950,38 @@ def estimate_nonlinear_memory_bytes(
     return voxels * volume_equivalents * 4 + fixed_overhead
 
 
+def gn_normal_eqs_voxel_chunk(
+    n_patches: int,
+    n_voxels: int,
+    n_columns: int,
+    device: torch.device,
+    *,
+    live_buffers: float = 3.0,
+    min_chunk: int = 4096,
+) -> int:
+    """Voxels per chunk for the batched Gauss-Newton normal equations.
+
+    The steepest-descent images are ``(B, V, D*nb)`` -- the only tensor in qwarp
+    that carries a *column* axis on top of the volume, so it is ``D*nb`` times a
+    volume equivalent. At the level-0 global patch (B=1, V the whole work grid)
+    that is tens of gigabytes on a 0.7 mm pair, which is why this is chunked over
+    voxels rather than sized by a volume-equivalent count like the rest of qwarp.
+
+    Voxels, not patches, because chunking over ``V`` is correct at every level:
+    ``B`` is 1 at level 0 and tens of thousands at the finest, while ``B * V`` is
+    roughly the work grid throughout. ``live_buffers`` covers the assembled
+    columns plus the copy that the direction-major reshape makes.
+
+    Returns a chunk size in voxels, never larger than ``n_voxels``.
+    """
+    if n_patches < 1 or n_voxels < 1 or n_columns < 1:
+        return max(1, n_voxels)
+    per_voxel = max(1, int(n_patches * n_columns * 4 * live_buffers))
+    budget = get_available_memory(device, empty_cache=False)
+    chunk = int(budget // per_voxel)
+    return max(1, min(n_voxels, max(min(min_chunk, n_voxels), chunk)))
+
+
 def plan_nonlinear_memory(
     shape: tuple[int, int, int],
     device: torch.device,

@@ -33,7 +33,7 @@ import torch
 from torch import Tensor
 
 from .._compile import safe_compile
-from ..memory import plan_nonlinear_memory
+from ..memory import gn_normal_eqs_voxel_chunk, plan_nonlinear_memory
 from ..utils import _prefers_cuda_batching
 
 try:
@@ -1633,6 +1633,57 @@ def _gn_steepest_descent_images(g: Tensor, hw: Tensor, bt: Tensor) -> Tensor:
     )
 
 
+def _gn_voxel_slices(n_voxels: int, chunk: int) -> Iterator[slice]:
+    """Voxel-axis slices for the chunked normal-equation accumulation."""
+    for start in range(0, n_voxels, chunk):
+        yield slice(start, min(start + chunk, n_voxels))
+
+
+def _gn_accumulate(
+    g: Tensor,
+    hw: Tensor,
+    bt: Tensor,
+    scale: Tensor,
+    omega: Tensor,
+    res: Tensor,
+    mean_cols: Tensor | None,
+    chunk: int,
+) -> tuple[Tensor, Tensor]:
+    """Accumulate ``(hmat, grad)`` over voxel chunks of the steepest-descent images.
+
+    The columns carry a parameter axis on top of the volume, which makes them
+    ``D * nb`` times the size of anything else qwarp holds -- gigabytes at the
+    level-0 global patch on a sub-millimetre grid, where they were the whole of a
+    measured out-of-memory failure. Both normal-equation terms are sums over
+    voxels, so the columns are built, consumed and dropped a slab at a time and
+    only the ``(B, n, n)`` result stays live.
+
+    They are folded by ``sqrt(omega)`` rather than ``omega`` so that one buffer
+    serves both terms: ``J' diag(omega) J`` is ``(J sqrt(omega))'`` times itself,
+    and the gradient takes the matching ``sqrt(omega) * res``. Weighting ``J``
+    twice over -- once weighted, once not, as the unchunked form did -- needs the
+    columns live in two copies at once.
+
+    ``omega`` is a weight image times a 0/1 mask, so the square root is real; the
+    clamp guards a caller passing a signed weight, not a tolerance on legitimate
+    values.
+    """
+    d, b, v = g.shape
+    ncol = d * bt.shape[1]
+    hmat = torch.zeros((b, ncol, ncol), device=g.device, dtype=torch.float32)
+    grad = torch.zeros((b, ncol), device=g.device, dtype=torch.float32)
+    for sl in _gn_voxel_slices(v, chunk):
+        rw = omega[:, sl].clamp_min(0.0).sqrt()
+        cols = _gn_steepest_descent_images(g[:, :, sl], hw, bt[sl])
+        if mean_cols is not None:
+            cols = cols.sub_(mean_cols)
+        cols = cols.div_(scale[:, sl].unsqueeze(-1)).mul_(rw.unsqueeze(-1))
+        hmat += torch.einsum("bvn,bvm->bnm", cols, cols)
+        grad += torch.einsum("bvn,bv->bn", cols, rw * res[:, sl])
+        del cols
+    return hmat, grad
+
+
 def _gn_normal_eqs_3d(
     w: Tensor,
     g: Tensor,
@@ -1672,14 +1723,26 @@ def _gn_normal_eqs_3d(
     sw = ((omega * w * w).sum(-1, keepdim=True) / wsum - mw * mw).clamp_min(1e-12).sqrt()
     res = base_hat - (w - mw) / sw  # (B, V)
 
-    # Steepest-descent images, one block of nb columns per active direction.
-    dw = _gn_steepest_descent_images(g, hw, bt)
-    mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
-    jn = (dw - mdw) / sw.unsqueeze(-1)
-    jnw = jn * omega.unsqueeze(-1)
-    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
-    grad = torch.einsum("bvn,bv->bn", jnw, res)
-    return hmat, grad
+    d, b, v = g.shape
+    ncol = d * bt.shape[1]
+
+    # The weighted patch mean of the steepest-descent images, without ever
+    # assembling them: they are an outer product of the gradient with the basis,
+    # and the mean is linear, so it contracts straight to (B, D, nb). Centring
+    # otherwise forces a whole extra pass over the largest tensor qwarp builds.
+    mean_cols = torch.einsum("dbv,vn->bdn", g * omega.unsqueeze(0), bt)
+    mean_cols = (mean_cols * hw.reshape(1, d, 1) / wsum.unsqueeze(-1)).reshape(b, 1, ncol)
+
+    return _gn_accumulate(
+        g,
+        hw,
+        bt,
+        sw.expand(-1, v),
+        omega,
+        res,
+        mean_cols,
+        gn_normal_eqs_voxel_chunk(b, v, ncol, g.device),
+    )
 
 
 def _gn_normal_eqs_local(
@@ -1734,12 +1797,11 @@ def _gn_normal_eqs_local(
     sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
 
     res = base_hat - (w - mw) / sd
-    dw = _gn_steepest_descent_images(g, hw, bt)
-    jn = dw / sd.unsqueeze(-1)
-    jnw = jn * omega.unsqueeze(-1)
-    hmat = torch.einsum("bvn,bvm->bnm", jnw, jn)
-    grad = torch.einsum("bvn,bv->bn", jnw, res)
-    return hmat, grad
+    # No patch-wide centring here (the local statistics already did it), so the
+    # columns need only one pass; see :func:`_gn_normal_eqs_3d` for why they are
+    # chunked at all.
+    chunk = gn_normal_eqs_voxel_chunk(b, v, g.shape[0] * bt.shape[1], g.device)
+    return _gn_accumulate(g, hw, bt, sd, omega, res, None, chunk)
 
 
 @dataclass(frozen=True)

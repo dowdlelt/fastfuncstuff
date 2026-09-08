@@ -22,7 +22,11 @@ from fastfuncstuff.processing.warp import (
     _filter_patches,
     _generate_patch_grid,
     _get_basis_config,
+    _gn_normal_eqs_3d,
+    _gn_normal_eqs_local,
+    _gn_steepest_descent_images,
     _gn_steepest_descent_images_broadcast,
+    _make_kernel_1d,
     _maybe_compile,
     _pad_volume,
     _pad_volume_faces,
@@ -42,6 +46,73 @@ def test_gn_steepest_descent_images_matches_direction_major_cat(n_dims):
     )
     actual = _gn_steepest_descent_images_broadcast(g, hw, bt)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+def _unchunked_normal_eqs_3d(w, g, hw, bt, omega, wsum, base_hat):
+    """The pre-chunking form of :func:`_gn_normal_eqs_3d`, held whole."""
+    mw = (omega * w).sum(-1, keepdim=True) / wsum
+    sw = ((omega * w * w).sum(-1, keepdim=True) / wsum - mw * mw).clamp_min(1e-12).sqrt()
+    res = base_hat - (w - mw) / sw
+    dw = _gn_steepest_descent_images(g, hw, bt)
+    mdw = (omega.unsqueeze(-1) * dw).sum(1, keepdim=True) / wsum.unsqueeze(-1)
+    jn = (dw - mdw) / sw.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    return torch.einsum("bvn,bvm->bnm", jnw, jn), torch.einsum("bvn,bv->bn", jnw, res)
+
+
+def _unchunked_normal_eqs_local(w, g, hw, bt, omega, base_hat, kernel, dims):
+    """The pre-chunking form of :func:`_gn_normal_eqs_local`, held whole."""
+    from fastfuncstuff.processing.cost import _batched_separable_smooth_3d
+
+    b, v = w.shape
+    nzh, nyh, nxh = dims
+
+    def sm(flat):
+        return _batched_separable_smooth_3d(flat.reshape(b, 1, nzh, nyh, nxh), kernel).reshape(b, v)
+
+    sw = sm(omega).clamp_min(1e-10)
+    mw = sm(omega * w) / sw
+    sd = (sm(omega * w * w) / sw - mw * mw).clamp_min(1e-10).sqrt()
+    res = base_hat - (w - mw) / sd
+    dw = _gn_steepest_descent_images(g, hw, bt)
+    jn = dw / sd.unsqueeze(-1)
+    jnw = jn * omega.unsqueeze(-1)
+    return torch.einsum("bvn,bvm->bnm", jnw, jn), torch.einsum("bvn,bv->bn", jnw, res)
+
+
+@pytest.mark.parametrize("chunk", [1, 37, 10**9])
+def test_gn_normal_eqs_chunking_matches_whole_tensor(monkeypatch, chunk):
+    """Splitting the steepest-descent images over voxels changes nothing.
+
+    The chunking exists because those columns carry a parameter axis on top of
+    the volume and blew a 16 GB card apart at 0.7 mm; a chunk size of one voxel
+    is the degenerate end of the same loop, so it has to give the same answer as
+    holding them whole.
+    """
+    import fastfuncstuff.processing.warp as warp_mod
+
+    monkeypatch.setattr(warp_mod, "gn_normal_eqs_voxel_chunk", lambda *a, **k: chunk)
+    torch.manual_seed(7)
+    dims = (5, 6, 7)
+    b, v, d, nb = 3, dims[0] * dims[1] * dims[2], 3, 8
+    w = torch.rand(b, v, device=DEVICE)
+    g = torch.rand(d, b, v, device=DEVICE)
+    hw = torch.rand(d, 1, 1, device=DEVICE)
+    bt = torch.rand(v, nb, device=DEVICE)
+    omega = torch.rand(b, v, device=DEVICE)
+    wsum = omega.sum(-1, keepdim=True)
+    base_hat = torch.rand(b, v, device=DEVICE)
+    kernel = _make_kernel_1d("gaussian", 1.0, DEVICE)
+
+    hmat, grad = _gn_normal_eqs_3d(w, g, hw, bt, omega, wsum, base_hat)
+    exp_h, exp_g = _unchunked_normal_eqs_3d(w, g, hw, bt, omega, wsum, base_hat)
+    torch.testing.assert_close(hmat, exp_h, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(grad, exp_g, atol=1e-4, rtol=1e-4)
+
+    hmat, grad = _gn_normal_eqs_local(w, g, hw, bt, omega, base_hat, kernel, dims)
+    exp_h, exp_g = _unchunked_normal_eqs_local(w, g, hw, bt, omega, base_hat, kernel, dims)
+    torch.testing.assert_close(hmat, exp_h, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(grad, exp_g, atol=1e-4, rtol=1e-4)
 
 
 # ---------------------------------------------------------------------------
