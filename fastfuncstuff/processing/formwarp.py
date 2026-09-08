@@ -45,7 +45,6 @@ from dataclasses import asdict, dataclass, field, replace
 import torch
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.checkpoint import checkpoint
 
 from fastfuncstuff.memory import plan_nonlinear_memory
 from fastfuncstuff.utils import _prefers_cuda_batching
@@ -433,6 +432,21 @@ def image_metric(
     raise ValueError(f"unknown metric {metric!r}; choose from {METRICS}")
 
 
+def _pad_linear1(vol: Tensor) -> Tensor:
+    """Pad a volume by one voxel on all six faces, by linear extrapolation.
+
+    Chosen so a central difference taken across the pad reproduces the one-sided
+    difference ``penalty.py:_central_diff_batched`` uses at a face: with the pad set to
+    ``2*v0 - v1``, ``0.5*(v1 - pad) == v1 - v0``.
+    """
+    for dim in (-3, -2, -1):
+        n = vol.shape[dim]
+        lo = 2.0 * vol.narrow(dim, 0, 1) - vol.narrow(dim, 1, 1)
+        hi = 2.0 * vol.narrow(dim, n - 1, 1) - vol.narrow(dim, n - 2, 1)
+        vol = torch.cat((lo, vol, hi), dim=dim)
+    return vol
+
+
 def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     """AFNI's warp-distortion energy for one half-field, as a differentiable scalar.
 
@@ -443,16 +457,40 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
     worst offender, not an average over every voxel that merely deformed.
     """
 
-    # Checkpointed, because compute_jacobian_energy is written as ~forty named
-    # full-volume expressions and autograd pins every one of them: at 256x300x256 that
-    # is about 6 GiB across the two half-fields, and it OOMs a 16 GiB card outright.
-    # Recomputing the penalty during the backward costs one extra forward -- a few ms
-    # against a scalar that the metric dwarfs -- and returns the memory.
-    def _energy(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
-        je, se = compute_jacobian_energy(xd, yd, zd)
-        return penalty_energy(je, se).sum()
+    # The deadband makes this gradient extremely sparse and there is no point paying for
+    # it densely. Measured at the finest level on NIREP na02->na01, the penalty is
+    # nonzero on every iteration but owes on a mean of 106 voxels out of 19.7M (max
+    # 1,396) -- and a dense autograd pass costs 236 ms against 50 ms for the forward
+    # alone, so 4.8x of the work exists to differentiate voxels that contribute exactly
+    # zero. Find the offenders without a graph, then rebuild the penalty differentiably
+    # on 3x3x3 patches around just those.
+    with torch.no_grad():
+        je, se = compute_jacobian_energy(*(f.detach() for f in fields))
+        owing = torch.nonzero(penalty_energy(je, se) > 0, as_tuple=False)
+    del je, se
+    if owing.numel() == 0:
+        # Routed through every field, so the graph shape does not depend on the data --
+        # a bare zero would detach the penalty on the iterations it costs nothing (most
+        # of them at the coarse levels) and autograd would then reject the unused leaf.
+        return sum(f.sum() for f in fields) * 0.0
 
-    total = checkpoint(_energy, *fields, use_reentrant=False)
+    # A central difference reaches one voxel, so a 3x3x3 patch is all the Jacobian at
+    # the centre depends on -- taken from a linearly extrapolated pad, so that a face
+    # voxel gets the same one-sided difference the dense path gives it. Clamping instead
+    # (replicate padding) halves the derivative there, and on a field whose extremes sit
+    # at the edges that is most of the penalty.
+    padded = [_pad_linear1(f) for f in fields]
+    pz, py, px = padded[0].shape
+    step = torch.tensor([0, 1, 2], device=owing.device)
+    off = torch.stack(torch.meshgrid(step, step, step, indexing="ij"), dim=-1).reshape(-1, 3)
+    nbr = owing[:, None, :] + off[None, :, :]
+    flat = (nbr[..., 0] * py + nbr[..., 1]) * px + nbr[..., 2]
+    patches = [f.reshape(-1)[flat].reshape(-1, 3, 3, 3) for f in padded]
+
+    # Same formulas as the dense path, on (N, 3, 3, 3): only the centre voxel of each
+    # patch has a true central difference, and the centre is the one we asked about.
+    je, se = compute_jacobian_energy(*patches)
+    total = penalty_energy(je[:, 1, 1, 1], se[:, 1, 1, 1]).sum()
     # ``x ** 0.25`` has an infinite derivative at zero, so the clamp is needed to keep
     # the backward finite -- but on its own it leaves a constant floor on the cost for a
     # warp that owes nothing. Gating on the indicator removes the floor and keeps the

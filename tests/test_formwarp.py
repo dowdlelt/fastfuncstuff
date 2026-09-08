@@ -714,3 +714,76 @@ def test_per_level_regularization_reaches_each_level():
         fw._syn_level = original
 
     assert [(t, u, v) for t, u, v in seen] == [("L1", 4.0, 1.0), ("L2", 2.0, 0.0)]
+
+
+@pytest.mark.parametrize("amplitude", [0.4, 3.0, 12.0])
+def test_sparse_fold_penalty_matches_the_dense_form(amplitude):
+    """The penalty is evaluated only where it owes; that must change nothing.
+
+    The deadband makes the gradient extremely sparse -- at the finest level on a real
+    pair, a mean of 106 voxels out of 19.7M -- so it is built on 3x3x3 patches around
+    the offenders rather than densely, which measured 236 ms -> 50 ms. Exactness is the
+    whole premise, and the trap is the volume face: gathering with clamped indices
+    (replicate padding) halves the derivative there, and on a field whose extremes sit
+    at the edges that silently drops most of the penalty.
+    """
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+    from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty
+    from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
+
+    config = SynConfig()
+
+    def dense(fields):
+        je, se = compute_jacobian_energy(*fields)
+        total = penalty_energy(je, se).sum()
+        return config.fold_penalty * total.clamp(min=_EPS) ** 0.25 * (total > 0)
+
+    torch.manual_seed(0)
+    field = [_separable_smooth_3d(torch.randn(20, 22, 24), 2.0) for _ in range(3)]
+    field = [c / c.abs().max() * amplitude for c in field]
+
+    leaves_d = [t.detach().requires_grad_(True) for t in field]
+    leaves_s = [t.detach().requires_grad_(True) for t in field]
+    value_d = dense(tuple(leaves_d))
+    value_s = _fold_penalty(tuple(leaves_s), config)
+    torch.testing.assert_close(value_s, value_d, rtol=1e-5, atol=1e-7)
+
+    # Gradients too, and for every field -- the zero case must still reach all three
+    # leaves or autograd rejects the unused ones.
+    grad_d = torch.autograd.grad(value_d, leaves_d)
+    grad_s = torch.autograd.grad(value_s, leaves_s)
+    for one, other in zip(grad_s, grad_d, strict=True):
+        torch.testing.assert_close(one, other, rtol=1e-4, atol=1e-7)
+
+
+def test_fold_penalty_face_voxels_are_not_half_counted():
+    """A fold sitting on the volume face must be charged exactly as the dense form does.
+
+    This is the specific trap in evaluating the penalty sparsely: gathering a 3x3x3
+    patch with clamped indices is replicate padding, whose central difference across the
+    face is half the one-sided difference the dense path uses there. On a field whose
+    extremes sit at the edges that silently drops most of the penalty -- it was an 11x
+    error in the total when first written.
+    """
+    from fastfuncstuff.processing.formwarp import _EPS, _fold_penalty, _pad_linear1
+    from fastfuncstuff.processing.penalty import compute_jacobian_energy, penalty_energy
+
+    config = SynConfig()
+    ramp = torch.zeros(12, 12, 12)
+    ramp[:, :, 1:] = -6.0  # the jump is right against the x face
+    face = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
+
+    je, se = compute_jacobian_energy(*face)
+    total = penalty_energy(je, se).sum()
+    dense = config.fold_penalty * total.clamp(min=_EPS) ** 0.25 * (total > 0)
+    assert float(dense) > 0.0
+    assert int((penalty_energy(je, se)[:, :, 0] > 0).sum()) > 0, "no fold on the face"
+
+    torch.testing.assert_close(_fold_penalty(face, config), dense, rtol=1e-5, atol=1e-7)
+
+    # The pad is linear extrapolation, not replication: that is what makes a face
+    # voxel's central difference equal the one-sided difference used densely.
+    v = torch.tensor([1.0, 2.0, 4.0]).reshape(1, 1, 3).expand(3, 3, 3).contiguous()
+    padded = _pad_linear1(v)
+    assert padded.shape == (5, 5, 5)
+    torch.testing.assert_close(padded[2, 2, 0], torch.tensor(0.0))  # 2*1 - 2
