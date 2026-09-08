@@ -177,17 +177,51 @@ class SynConfig:
     global: the only way to stop a handful of voxels inverting was to blur the entire
     field, paying fit everywhere for a defect in a few places. This tests each half
     field's Jacobian before accepting a step and halves the step only in the
-    neighbourhood that would fold. When nothing would fold it costs two determinants
-    per iteration and changes nothing."""
+    neighbourhood that would breach :attr:`invert_floor`. When nothing would, it costs
+    two determinants per iteration and changes nothing."""
 
     jac_floor: float = FOLD_GUARD_FLOOR
-    """Prospective ``det(J)`` below which :attr:`fold_guard` damps a step. Guarded on
-    each half field rather than on the composed warp: the halves are what
+    """``det(J)`` at or below which a field counts as folded.
+
+    This is the shared *definition* -- the same number optiwarp and warpqc report
+    against -- and it decides legality (:attr:`fold_aware_best`), not how hard the
+    guard damps. The guard works to the stricter :attr:`invert_floor`, because a field
+    that merely avoids folding is still one the inverter cannot handle. Judged on each
+    half field rather than on the composed warp: the halves are what
     ``invert_displacement_field`` has to invert, and an inverted half is where a folded
     composite comes from."""
 
     fold_damp_rounds: int = 6
-    """Maximum local-damping retries per iteration before taking the least-folded step."""
+    """Maximum local-damping retries per iteration before the step is refused."""
+
+    invert_floor: float = 0.3
+    """``det(J)`` the SyN loop keeps its half-fields above: the fold guard damps to
+    this, and the symmetrization round trip is discarded if it lands below it.
+
+    Deliberately stricter than :attr:`jac_floor`, because it answers a different
+    question. ``jac_floor`` asks "has this field folded" -- the reportable property,
+    shared with the other solvers and with warpqc. This asks "can
+    :func:`invert_displacement_field` still invert it", which SyN needs of *every*
+    iterate, because it re-derives both halves from their inverses each time round.
+
+    The fixed-point iteration ``e(x) = -d(x + e(x))`` contracts only while
+    ``max|grad d| < 1``, and past that
+    more iterations buy nothing at all -- measured residuals of 0.02 voxels at
+    ``max|grad d|=0.75`` against 7.2 voxels at 2.25, unchanged from 8 sweeps to 64.
+    Non-folding is the weaker condition, so a field the fold guard is perfectly happy
+    with can still come back from ``invert(invert(.))`` wrecked.
+
+    That is not hypothetical either: on NIREP na02->na01 at level 2, one round trip
+    took min det(J) from 0.477 to 0.195 with the fold guard reporting no damping
+    whatsoever, and the next iteration folded outright and never recovered. See
+    :attr:`~LevelStats.sym_rejected`.
+
+    Damping the *step* to the same floor is the other half of that. Guarding on
+    ``jac_floor`` let the metric walk each half-field down to 0.05 and park it there --
+    a floor used as a target -- which is both the un-invertible regime above and thin
+    enough that the trilinear resize onto the next level alone (0.0503 -> 0.0450) put
+    it under, handing the finer level a field that was illegal before its first step.
+    """
 
     fold_aware_best: bool = True
     """Require a state to be fold-free before it can become the best-so-far. Without
@@ -551,6 +585,16 @@ class LevelStats:
     early_stopped: bool
     best_cost: float = float("nan")
     damped_iters: int = 0  # iterations where the anti-fold guard had to intervene
+    refused_iters: int = 0
+    """Iterations whose step was refused outright: the fold guard could not damp it
+    down to a legal field within ``fold_damp_rounds``, so the field was left alone."""
+
+    sym_rejected: int = 0
+    """Iterations whose symmetrization round trip was discarded because the inverter
+    did not converge on this field (see :attr:`SynConfig.invert_floor`). The forward
+    halves stay as the step left them and the inverses come from the single inversion,
+    which is consistent with them; only the extra re-derivation is dropped."""
+
     fold_fallback: bool = False
     """No iterate at this level was fold-free, so the best *illegal* one was kept.
 
@@ -581,6 +625,10 @@ class LevelStats:
             bits.append(f"{self.wasted_iters} wasted")
         if self.damped_iters:
             bits.append(f"{self.damped_iters} fold-damped")
+        if self.refused_iters:
+            bits.append(f"{self.refused_iters} refused")
+        if self.sym_rejected:
+            bits.append(f"{self.sym_rejected} unsymmetrized")
         if self.fold_fallback:
             bits.append("NO LEGAL ITERATE (kept a folded one)")
         bits.append(f"best cost {self.best_cost:.5f}")
@@ -655,12 +703,21 @@ def _fold_damping_mask(jac: Tensor, floor: float, strength: float, radius: float
 
 
 def _additive_step_with_fold_guard(
-    prev: Field, update: Field, total_var: float, config: SynConfig
-) -> tuple[Field, Tensor, int]:
+    prev: Field, update: Field, total_var: float, config: SynConfig, prev_jac: Tensor
+) -> tuple[Field, Tensor, int, bool]:
     """Add ``update`` to ``prev``, backing off locally wherever that would fold.
 
     The elastic smoothing happens inside, because the guard has to judge the field the
     level will actually keep, and building it twice would be the only alternative.
+
+    ``prev_jac`` is the determinant of ``prev``, which the caller already holds. It is
+    what lets the guard *refuse*: if damping cannot clear the floor within
+    ``fold_damp_rounds``, taking the least-folded candidate anyway writes a fold into a
+    field that was legal, and no later iteration can undo it -- ``fold_aware_best``
+    then rejects every subsequent iterate and the level silently keeps whatever it held
+    before the fold. Standing still is strictly better than that. The exception is a
+    ``prev`` that was already folded (inherited from a coarser level), where the
+    least-folded candidate is a real improvement and refusing would freeze the level.
     """
 
     def _apply(u: Field) -> tuple[Field, Tensor]:
@@ -671,19 +728,23 @@ def _additive_step_with_fold_guard(
     ux, uy, uz = update
     cand, jac = _apply((ux, uy, uz))
     if config.fold_guard <= 0:
-        return cand, jac, 0
+        return cand, jac, 0, False
 
+    floor = config.invert_floor
     best_cand, best_jac, damped = cand, jac, 0
     for _ in range(config.fold_damp_rounds):
-        if float(best_jac.min()) >= config.jac_floor:
+        if float(best_jac.min()) >= floor:
             break
-        keep = 1.0 - _fold_damping_mask(best_jac, config.jac_floor, config.fold_guard)
+        keep = 1.0 - _fold_damping_mask(best_jac, floor, config.fold_guard)
         ux, uy, uz = ux * keep, uy * keep, uz * keep
         cand, jac = _apply((ux, uy, uz))
         damped += 1
         if float(jac.min()) > float(best_jac.min()):
             best_cand, best_jac = cand, jac
-    return best_cand, best_jac, damped
+
+    if float(best_jac.min()) < floor <= float(prev_jac.min()):
+        return prev, prev_jac, damped, True
+    return best_cand, best_jac, damped, False
 
 
 def _convergence_value(
@@ -764,7 +825,7 @@ def _syn_level(
     costs: list[float] = []
     jac_f = jacobian_determinant(fxd, fyd, fzd)
     jac_m = jacobian_determinant(mxd, myd, mzd)
-    n_damped = 0
+    n_damped = n_refused = n_sym_rejected = 0
 
     bar = None
     if _tqdm is not None and config.verb >= 1 and n_iter >= 5:
@@ -782,8 +843,9 @@ def _syn_level(
         costs.append(cost_val)
 
         # The cost reflects the current (pre-update) fields -- snapshot them as best.
-        # Legality of those fields was established when they were built, at the end of
-        # the previous iteration, so no determinant is recomputed here.
+        # ``jac_f``/``jac_m`` are the determinants of exactly those fields: whichever
+        # branch the previous iteration took, it left behind the determinant of the
+        # field it actually kept, so nothing is recomputed here.
         legal = not config.fold_aware_best or (
             min(float(jac_f.min()), float(jac_m.min())) >= config.jac_floor
         )
@@ -826,25 +888,49 @@ def _syn_level(
         # Step + elastic regularization, with the local anti-fold backoff applied to
         # each half field. Both happen inside the guard: it has to judge the field the
         # level will keep, so it builds it once and hands it back.
-        (fxd, fyd, fzd), jac_f, df = _additive_step_with_fold_guard(
-            (fxd, fyd, fzd), (scale * ufx, scale * ufy, scale * ufz), config.total_var, config
+        (fxd, fyd, fzd), jac_f, df, rf = _additive_step_with_fold_guard(
+            (fxd, fyd, fzd),
+            (scale * ufx, scale * ufy, scale * ufz),
+            config.total_var,
+            config,
+            jac_f,
         )
-        (mxd, myd, mzd), jac_m, dm = _additive_step_with_fold_guard(
-            (mxd, myd, mzd), (scale * umx, scale * umy, scale * umz), config.total_var, config
+        (mxd, myd, mzd), jac_m, dm, rm = _additive_step_with_fold_guard(
+            (mxd, myd, mzd),
+            (scale * umx, scale * umy, scale * umz),
+            config.total_var,
+            config,
+            jac_m,
         )
         n_damped += 1 if (df or dm) else 0
+        n_refused += 1 if (rf or rm) else 0
 
         if flags:
             fxd, fyd, fzd = _apply_axis_flags(fxd, fyd, fzd, flags)
             mxd, myd, mzd = _apply_axis_flags(mxd, myd, mzd, flags)
+            jac_f = jacobian_determinant(fxd, fyd, fzd)
+            jac_m = jacobian_determinant(mxd, myd, mzd)
 
         # Re-derive inverses, then re-derive forwards from them (symmetrize).
         (ifxd, ifyd, ifzd), (imxd, imyd, imzd) = _invert_displacement_field_pair(
             (fxd, fyd, fzd), (mxd, myd, mzd), config.invert_iters, voxel_grid
         )
-        (fxd, fyd, fzd), (mxd, myd, mzd) = _invert_displacement_field_pair(
+        sym_f, sym_m = _invert_displacement_field_pair(
             (ifxd, ifyd, ifzd), (imxd, imyd, imzd), config.invert_iters, voxel_grid
         )
+        # Keep the round trip only if it did no harm. It is the one operation in the
+        # loop that rewrites the field without the fold guard ever seeing the result,
+        # and its accuracy collapses on exactly the fields the guard still calls legal
+        # (SynConfig.invert_floor). Rejecting costs nothing correctness-wise: the
+        # inverses above are the inverses of the fields we then keep.
+        sym_jac_f = jacobian_determinant(*sym_f)
+        sym_jac_m = jacobian_determinant(*sym_m)
+        floor = min(config.invert_floor, float(jac_f.min()), float(jac_m.min()))
+        if min(float(sym_jac_f.min()), float(sym_jac_m.min())) >= floor:
+            (fxd, fyd, fzd), (mxd, myd, mzd) = sym_f, sym_m
+            jac_f, jac_m = sym_jac_f, sym_jac_m
+        else:
+            n_sym_rejected += 1
 
     if bar is not None:
         bar.close()
@@ -859,6 +945,8 @@ def _syn_level(
         n_iter_cap=n_iter,
         early_stopped=len(costs) < n_iter,
         damped_iters=n_damped,
+        refused_iters=n_refused,
+        sym_rejected=n_sym_rejected,
         best_cost=best_cost,
         fold_fallback=fold_fallback,
     )

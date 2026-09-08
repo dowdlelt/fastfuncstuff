@@ -407,3 +407,149 @@ def test_cli_warp_prefix_names_the_warp_independently(tmp_path):
     assert (tmp_path / "x.src-max_nl.nii.gz").exists()
     assert (tmp_path / "x_nl_WARP.nii.gz").exists()
     assert not (tmp_path / "x.src-max_nl_WARP.nii.gz").exists()
+
+
+def _field_with_gradient(scale: float, n: int = 24) -> tuple[torch.Tensor, ...]:
+    """A smooth displacement field whose ``max|grad d|`` scales with ``scale``.
+
+    One period of a sinusoid across the volume, so the gradient magnitude is set by
+    the amplitude alone — which is the quantity that decides whether the fixed-point
+    inverter contracts.
+    """
+    zz, yy, xx = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+    k = 2 * torch.pi / n
+    return (
+        scale * torch.sin(k * xx),
+        scale * torch.sin(k * yy),
+        scale * torch.sin(k * zz),
+    )
+
+
+def test_fixed_point_inversion_stops_converging_outside_the_contraction_regime():
+    """More sweeps do not rescue an inverse once ``max|grad d| > 1``.
+
+    This is the property the SyN loop has to respect: it re-derives both half-fields
+    from their inverses every iteration, so a field the inverter cannot handle is
+    silently replaced by garbage. Bounding ``det(J)`` away from zero is what keeps us
+    on the left-hand side of this.
+    """
+    from fastfuncstuff.processing.formwarp import _grad3, jacobian_determinant
+
+    def residual(field, inverse) -> float:
+        n = field[0].shape[0]
+        grid = torch.meshgrid(*(torch.arange(n, dtype=torch.float32),) * 3, indexing="ij")
+        from fastfuncstuff.processing.formwarp import _warp_diff
+
+        parts = [inv + _warp_diff(d, *inverse, grid) for d, inv in zip(field, inverse, strict=True)]
+        return float(torch.sqrt(sum(p * p for p in parts))[2:-2, 2:-2, 2:-2].max())
+
+    gentle = _field_with_gradient(1.0)
+    assert float(jacobian_determinant(*gentle).min()) > 0.3
+    assert residual(gentle, invert_displacement_field(*gentle, n_iter=8)) < 0.05
+
+    # Past contraction the residual is large and, crucially, flat in n_iter: it is not
+    # an "iterate harder" problem, so only a determinant bound can prevent it.
+    steep = _field_with_gradient(6.0)
+    assert max(float(torch.sqrt(sum(c**2 for c in _grad3(f))).max()) for f in steep) > 1.0
+    at_8 = residual(steep, invert_displacement_field(*steep, n_iter=8))
+    at_64 = residual(steep, invert_displacement_field(*steep, n_iter=64))
+    assert at_8 > 1.0
+    assert at_64 > 0.5 * at_8
+
+
+def test_fold_guard_refuses_a_step_it_cannot_damp_rather_than_folding():
+    """A step that cannot be damped legal leaves a legal field untouched.
+
+    Accepting the least-folded candidate instead writes a fold that no later iteration
+    can undo, and ``fold_aware_best`` then rejects every subsequent iterate -- the level
+    keeps whatever it held before the fold and silently stops making progress.
+    """
+    from fastfuncstuff.processing.formwarp import (
+        _additive_step_with_fold_guard,
+        jacobian_determinant,
+    )
+
+    prev = tuple(torch.zeros(20, 20, 20) for _ in range(3))
+    prev_jac = jacobian_determinant(*prev)
+    assert float(prev_jac.min()) == pytest.approx(1.0)
+
+    # A gross, spatially sharp update -- compressive, so it folds rather than merely
+    # expanding (det = 1 + d(dx)/dx, so the gradient has to go below -1).
+    ramp = torch.zeros(20, 20, 20)
+    ramp[:, :, 10:] = -12.0
+    update = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
+
+    # Given enough rounds the local damping does fix this, and the step is taken.
+    generous = SynConfig()
+    kept, jac, damped, refused = _additive_step_with_fold_guard(
+        prev, update, 0.0, generous, prev_jac
+    )
+    assert damped > 0 and not refused
+    assert float(jac.min()) >= generous.invert_floor
+
+    # Starved of rounds it cannot, and then the step is dropped rather than folded.
+    config = SynConfig(fold_damp_rounds=2)
+    kept, jac, damped, refused = _additive_step_with_fold_guard(prev, update, 0.0, config, prev_jac)
+    assert damped == 2 and refused
+    assert float(jac.min()) >= config.invert_floor
+    for kept_axis, prev_axis in zip(kept, prev, strict=True):
+        assert torch.equal(kept_axis, prev_axis)
+
+
+def test_fold_guard_still_moves_when_the_incoming_field_is_already_folded():
+    """Refusal must not freeze a level that inherited a folded field from a coarser one.
+
+    There the least-folded candidate is a genuine improvement, and refusing every step
+    would leave the level unable to do anything at all.
+    """
+    from fastfuncstuff.processing.formwarp import (
+        _additive_step_with_fold_guard,
+        jacobian_determinant,
+    )
+
+    config = SynConfig(fold_damp_rounds=2)
+    ramp = torch.zeros(20, 20, 20)
+    ramp[:, :, 10:] = -12.0
+    prev = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
+    prev_jac = jacobian_determinant(*prev)
+    assert float(prev_jac.min()) < 0.0  # inherited already folded
+
+    # The very update that gets refused from a legal field is accepted from this one.
+    update = (ramp.clone(), torch.zeros_like(ramp), torch.zeros_like(ramp))
+    kept, jac, _damped, refused = _additive_step_with_fold_guard(
+        prev, update, 0.0, config, prev_jac
+    )
+    assert not refused
+    assert float(jac.min()) < config.invert_floor  # still illegal, but it moved
+    assert not all(torch.equal(k, p) for k, p in zip(kept, prev, strict=True))
+
+
+@pytest.mark.parametrize("invert_floor", [0.3, 0.5])
+def test_syn_level_never_returns_a_field_the_inverter_cannot_handle(invert_floor):
+    """End to end: every half-warp comes back above the invertibility floor.
+
+    The regression this pins is a level that reported a fold-free *step* while the
+    symmetrization round trip it performed afterwards — unguarded, and never
+    re-checked — had already driven the field negative.
+    """
+    from fastfuncstuff.processing.formwarp import jacobian_determinant
+
+    fixed = _blobs(24, 26, 24)
+    moving = _blobs(24, 26, 24, shift=(3.0, -2.0, 1.5))
+    config = SynConfig(
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(30, 30),
+        invert_floor=invert_floor,
+        verb=0,
+    )
+    res = formwarp(fixed, moving, config=config, device=DEVICE)
+
+    for name, half in (
+        ("fixed_to_mid", res.fixed_to_mid),
+        ("moving_to_mid", res.moving_to_mid),
+        ("mid_to_fixed", res.mid_to_fixed),
+        ("mid_to_moving", res.mid_to_moving),
+    ):
+        assert float(jacobian_determinant(*half).min()) > 0.0, f"{name} folded"
+    assert all(not lev.fold_fallback for lev in res.levels)
