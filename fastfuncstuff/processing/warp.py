@@ -1687,6 +1687,30 @@ def _gn_voxel_slices(n_voxels: int, chunk: int) -> Iterator[slice]:
         yield slice(start, min(start + chunk, n_voxels))
 
 
+def _gn_weighted_columns(
+    g: Tensor,
+    hwbt: Tensor,
+    mean_cols: Tensor | None,
+    inv_scale: Tensor,
+) -> Tensor:
+    """The steepest-descent columns, centred and weighted, in one expression.
+
+    Written as a single functional chain rather than a build followed by
+    ``sub_``/``div_``/``mul_`` so that a compiled backend emits one kernel: the
+    columns are the largest tensor in the level, and eager spends a full
+    read-and-write of them on each link of that chain.
+
+    ``hwbt`` is the half-width-scaled basis over this chunk's voxels,
+    ``(1, Vc, D, nb)``; the caller builds it, because it carries no patch axis and
+    over a whole level-0 grid it would be gigabytes on its own.
+    """
+    b, v = g.shape[1], g.shape[2]
+    cols = (g.permute(1, 2, 0).unsqueeze(-1) * hwbt).reshape(b, v, -1)
+    if mean_cols is not None:
+        cols = cols - mean_cols
+    return cols * inv_scale.unsqueeze(-1)
+
+
 def _gn_accumulate(
     g: Tensor,
     hw: Tensor,
@@ -1696,6 +1720,7 @@ def _gn_accumulate(
     res: Tensor,
     mean_cols: Tensor | None,
     chunk: int,
+    columns_fn: Callable[..., Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Accumulate ``(hmat, grad)`` over voxel chunks of the steepest-descent images.
 
@@ -1718,14 +1743,16 @@ def _gn_accumulate(
     """
     d, b, v = g.shape
     ncol = d * bt.shape[1]
+    build = columns_fn if columns_fn is not None else _gn_weighted_columns
+    hw_col = hw.reshape(1, 1, d, 1)
     hmat = torch.zeros((b, ncol, ncol), device=g.device, dtype=torch.float32)
     grad = torch.zeros((b, ncol), device=g.device, dtype=torch.float32)
     for sl in _gn_voxel_slices(v, chunk):
         rw = omega[:, sl].clamp_min(0.0).sqrt()
-        cols = _gn_steepest_descent_images(g[:, :, sl], hw, bt[sl])
-        if mean_cols is not None:
-            cols = cols.sub_(mean_cols)
-        cols = cols.div_(scale[:, sl].unsqueeze(-1)).mul_(rw.unsqueeze(-1))
+        # Per chunk, not once over V: this is the basis without the patch axis,
+        # so over the whole level-0 grid it would itself be gigabytes.
+        hwbt = hw_col * bt[sl].unsqueeze(0).unsqueeze(2)
+        cols = build(g[:, :, sl], hwbt, mean_cols, rw / scale[:, sl])
         hmat += torch.einsum("bvn,bvm->bnm", cols, cols)
         grad += torch.einsum("bvn,bv->bn", cols, rw * res[:, sl])
         del cols
@@ -1740,6 +1767,7 @@ def _gn_normal_eqs_3d(
     omega: Tensor,
     wsum: Tensor,
     base_hat: Tensor,
+    columns_fn: Callable[..., Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Zero-normalised-NCC Gauss-Newton normal equations for a 3-D patch warp.
 
@@ -1790,6 +1818,7 @@ def _gn_normal_eqs_3d(
         res,
         mean_cols,
         gn_normal_eqs_voxel_chunk(b, v, ncol, g.device),
+        columns_fn,
     )
 
 
@@ -1802,6 +1831,7 @@ def _gn_normal_eqs_local(
     base_hat: Tensor,
     kernel: Tensor,
     dims: tuple[int, int, int],
+    columns_fn: Callable[..., Tensor] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Gauss-Newton normal equations for the **local** Pearson costs.
 
@@ -1849,7 +1879,7 @@ def _gn_normal_eqs_local(
     # columns need only one pass; see :func:`_gn_normal_eqs_3d` for why they are
     # chunked at all.
     chunk = gn_normal_eqs_voxel_chunk(b, v, g.shape[0] * bt.shape[1], g.device)
-    return _gn_accumulate(g, hw, bt, sd, omega, res, None, chunk)
+    return _gn_accumulate(g, hw, bt, sd, omega, res, None, chunk, columns_fn)
 
 
 @dataclass(frozen=True)
@@ -2170,6 +2200,9 @@ def _improve_warp_batched(
             gz, gy, gx = torch.gradient(source)
             state.source_grad_3ch = torch.stack([gx, gy, gz], dim=0).contiguous()
         source_grad_3ch = state.source_grad_3ch
+        # The columns are the largest tensor here and their assembly is a chain of
+        # elementwise passes over it; compiled, that chain becomes one kernel.
+        gn_columns = _maybe_compile(_gn_weighted_columns, "gn_columns", device, config.compile)
         bt = basis.reshape(basis.shape[0], -1).t().contiguous()  # (V, n_basis)
         hw_active = torch.tensor(
             [half_widths[d] * axis_weights[d] for d in active_dims],
@@ -2236,21 +2269,28 @@ def _improve_warp_batched(
                 sy = (ay_ + base_j).clamp(-0.499, ny - 0.501)
                 sz = (az_ + base_k).clamp(-0.499, nz - 0.501)
                 gx_, gy_, gz_ = batched_interp_3ch(source_grad_3ch, sx, sy, sz)
-                gall = torch.stack([gx_, gy_, gz_], dim=0)[list(active_dims)]
+                gall = torch.stack([gx_, gy_, gz_], dim=0)
+                if len(active_dims) < 3:
+                    gall = gall[list(active_dims)]
+                # w and g are deliberately *not* masked here. omega is
+                # weight * mask, and every term the normal equations build from
+                # these two passes through omega or its square root, so a
+                # masked voxel contributes zero either way -- while masking
+                # first costs four full-size elementwise passes per iteration,
+                # on the largest tensors in the level.
                 if gn_local:
                     return _gn_normal_eqs_local(
-                        w_ * mask_patches,
-                        gall * mask_patches,
+                        w_,
+                        gall,
                         hw_active,
                         bt,
                         omega,
                         base_hat,
                         gn_kernel,
                         (nzh, nyh, nxh),
+                        gn_columns,
                     )
-                return _gn_normal_eqs_3d(
-                    w_ * mask_patches, gall * mask_patches, hw_active, bt, omega, wsum, base_hat
-                )
+                return _gn_normal_eqs_3d(w_, gall, hw_active, bt, omega, wsum, base_hat, gn_columns)
 
         def gn_cost(active_params: Tensor) -> Tensor:
             with torch.no_grad():
