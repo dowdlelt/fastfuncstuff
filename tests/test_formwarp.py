@@ -504,48 +504,107 @@ def test_fold_guard_refuses_a_step_it_cannot_damp_rather_than_folding():
     update = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
 
     # Given enough rounds the local damping does fix this, and the step is taken.
-    generous = SynConfig()
+    generous = SynConfig(fold_guard=0.5)
     kept, jac, damped, refused = _additive_step_with_fold_guard(
         prev, update, 0.0, generous, prev_jac
     )
     assert damped > 0 and not refused
-    assert float(jac.min()) >= generous.invert_floor
+    assert float(jac.min()) >= generous.jac_floor
 
     # Starved of rounds it cannot, and then the step is dropped rather than folded.
-    config = SynConfig(fold_damp_rounds=2)
+    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2)
     kept, jac, damped, refused = _additive_step_with_fold_guard(prev, update, 0.0, config, prev_jac)
     assert damped == 2 and refused
-    assert float(jac.min()) >= config.invert_floor
+    assert float(jac.min()) >= config.jac_floor
     for kept_axis, prev_axis in zip(kept, prev, strict=True):
         assert torch.equal(kept_axis, prev_axis)
 
 
-def test_fold_guard_still_moves_when_the_incoming_field_is_already_folded():
-    """Refusal must not freeze a level that inherited a folded field from a coarser one.
+def test_fold_guard_lets_an_inherited_fold_be_climbed_out_of_but_not_deepened():
+    """A level that inherited a fold must still be able to step towards fixing it.
 
-    There the least-folded candidate is a genuine improvement, and refusing every step
-    would leave the level unable to do anything at all.
+    The guard compares total folding against what came in, not against zero, which is
+    what keeps it satisfiable from any starting state. Comparing against an absolute
+    bound instead makes every step illegal by definition once the field is under it,
+    and freezes the level -- the failure mode this replaced.
     """
     from fastfuncstuff.processing.formwarp import (
         _additive_step_with_fold_guard,
         jacobian_determinant,
     )
 
-    config = SynConfig(fold_damp_rounds=2)
+    config = SynConfig(fold_guard=0.5, fold_damp_rounds=2)
     ramp = torch.zeros(20, 20, 20)
     ramp[:, :, 10:] = -12.0
     prev = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
     prev_jac = jacobian_determinant(*prev)
     assert float(prev_jac.min()) < 0.0  # inherited already folded
 
-    # The very update that gets refused from a legal field is accepted from this one.
-    update = (ramp.clone(), torch.zeros_like(ramp), torch.zeros_like(ramp))
+    # Towards identity: still folded afterwards, but less so, so it is taken.
+    better = (-0.5 * ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
     kept, jac, _damped, refused = _additive_step_with_fold_guard(
-        prev, update, 0.0, config, prev_jac
+        prev, better, 0.0, config, prev_jac
     )
     assert not refused
-    assert float(jac.min()) < config.invert_floor  # still illegal, but it moved
+    assert float(jac.min()) > float(prev_jac.min())
     assert not all(torch.equal(k, p) for k, p in zip(kept, prev, strict=True))
+
+    # Deeper into the fold: refused, exactly as it would be from a clean field.
+    worse = (ramp.clone(), torch.zeros_like(ramp), torch.zeros_like(ramp))
+    kept, _jac, _damped, refused = _additive_step_with_fold_guard(
+        prev, worse, 0.0, config, prev_jac
+    )
+    assert refused
+    for kept_axis, prev_axis in zip(kept, prev, strict=True):
+        assert torch.equal(kept_axis, prev_axis)
+
+
+def test_fold_guard_is_off_by_default_and_the_soft_penalty_is_on():
+    """The default is to discourage folds, not to forbid them.
+
+    Forbidding is the right call case by case (blipflip's single-axis fields), but as a
+    default it fought 47,788 voxels of legitimate compression on NIREP na02->na01 to
+    prevent 13 actual folds.
+    """
+    from fastfuncstuff.processing.formwarp import _additive_step_with_fold_guard
+
+    config = SynConfig()
+    assert config.fold_guard == 0.0
+    assert config.fold_penalty > 0.0
+
+    # With the guard off the step is taken verbatim, folds and all.
+    prev = tuple(torch.zeros(20, 20, 20) for _ in range(3))
+    ramp = torch.zeros(20, 20, 20)
+    ramp[:, :, 10:] = -12.0
+    update = (ramp, torch.zeros_like(ramp), torch.zeros_like(ramp))
+    kept, jac, damped, refused = _additive_step_with_fold_guard(
+        prev, update, 0.0, config, torch.ones_like(ramp)
+    )
+    assert damped == 0 and not refused
+    assert float(jac.min()) < 0.0
+    torch.testing.assert_close(kept[0], ramp)
+
+
+def test_fold_penalty_charges_a_fold_and_not_ordinary_compression():
+    """Its deadband is the point: shrinking a structure is anatomy, inverting is not."""
+    from fastfuncstuff.processing.formwarp import _fold_penalty, jacobian_determinant
+
+    config = SynConfig()
+
+    def field(slope):
+        x = torch.zeros(16, 16, 16)
+        x[:, :, 8:] = slope
+        return (x, torch.zeros_like(x), torch.zeros_like(x))
+
+    # A steep but non-inverting compression: det(J) small and positive.
+    compressed = field(-1.9)
+    assert 0.0 < float(jacobian_determinant(*compressed).min()) < 0.1
+    assert float(_fold_penalty(compressed, config)) == pytest.approx(0.0, abs=1e-6)
+
+    # An inverting one: charged.
+    folded = field(-6.0)
+    assert float(jacobian_determinant(*folded).min()) < 0.0
+    assert float(_fold_penalty(folded, config)) > 0.0
 
 
 @pytest.mark.parametrize("invert_floor", [0.3, 0.5])
@@ -579,12 +638,6 @@ def test_syn_level_never_returns_a_field_the_inverter_cannot_handle(invert_floor
     assert all(not lev.fold_fallback for lev in res.levels)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="Known bug: the fold guard picks its best round by global min(), which an "
-    "unreachable inherited voxel pins, so the round that repaired the damage is "
-    "computed and discarded. Fixing it alone is not enough -- see the wiki note.",
-)
 def test_fold_guard_leaves_an_improving_step_alone():
     """No damping when the step does not make the determinant worse.
 
@@ -604,14 +657,13 @@ def test_fold_guard_leaves_an_improving_step_alone():
         jacobian_determinant,
     )
 
-    config = SynConfig()
-    # A one-voxel-deep dip: the central difference either side of it is -0.75, so
-    # det(J) = 0.25 there and 1.0 almost everywhere else.
+    config = SynConfig(fold_guard=0.5)
+    # An inherited fold the local damping cannot reach: det(J) = -0.5 in a few voxels.
     prev_x = torch.zeros(20, 20, 20)
-    prev_x[9:11, 9:11, 10] = -1.5
+    prev_x[9:11, 9:11, 10] = -3.0
     prev = (prev_x, torch.zeros_like(prev_x), torch.zeros_like(prev_x))
     prev_jac = jacobian_determinant(*prev)
-    assert 0.0 < float(prev_jac.min()) < config.invert_floor
+    assert float(prev_jac.min()) < 0.0
 
     update = (-0.05 * prev_x, torch.zeros_like(prev_x), torch.zeros_like(prev_x))
     _kept, jac, damped, refused = _additive_step_with_fold_guard(

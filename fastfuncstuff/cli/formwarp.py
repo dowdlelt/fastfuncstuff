@@ -141,6 +141,8 @@ NOT ENOUGH WARP (structures still visibly misaligned)
 
 TOO MUCH WARP (anatomy distorted, ripples, folding)
 ---------------------------------------------------
+  * Raise -fold_penalty to charge folding harder, or -fold_guard 0.5 to forbid it
+    outright (the guard can refuse a step, so it costs fit; prefer the penalty).
   * Raise -update_var (more fluid smoothing of each update) -- the first knob.
   * Turn on elastic regularization: -total_var 1-3 smooths the ACCUMULATED field,
     off by default. This is the one that stops slow accumulation of nonsense.
@@ -335,6 +337,31 @@ def parse_args(
         type=float,
         default=_D.convergence_threshold,
         help="Convergence slope threshold; larger stops sooner.",
+    )
+
+    # Folding: discouraged by default, forbidden on request
+    p.add_argument(
+        "-fold_penalty",
+        "-fold-penalty",
+        type=float,
+        default=_D.fold_penalty,
+        help="Strength of the soft anti-folding penalty (AFNI's warp-distortion "
+        "energy, same primitive as qwarp's -penfac); 0 disables it. Its deadband "
+        "charges nothing until a voxel inverts or more than doubles in volume, so "
+        "ordinary compression -- a large ventricle matched to a small one -- is free. "
+        "Raise it if the warp shows streaks of folded field.",
+    )
+    p.add_argument(
+        "-fold_guard",
+        "-fold-guard",
+        type=float,
+        default=_D.fold_guard,
+        help="Strength (0..1) of the HARD anti-folding guard, which damps or refuses "
+        "any step that would increase folding; 0 (default) leaves it off in favour of "
+        "-fold_penalty. Turn it on when a fold is genuinely inadmissible rather than "
+        "merely unwanted. As a default it costs more than it buys: on a NIREP pair it "
+        "fought 47,788 voxels of legitimate compression to prevent 13 folds, and "
+        "throttled the finest level to a standstill doing it.",
     )
 
     # Axis constraints (match qwarp)
@@ -598,6 +625,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         convergence_window=args.conv_window,
         convergence_threshold=args.conv_thresh,
         void_guard=args.void_guard,
+        fold_penalty=args.fold_penalty,
+        fold_guard=args.fold_guard,
         warp_flags=warp_flags,
         final_interp=args.final_interp,
         verb=args.verb,

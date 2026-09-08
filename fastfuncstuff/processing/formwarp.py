@@ -45,6 +45,7 @@ from dataclasses import asdict, dataclass, field
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from fastfuncstuff.memory import plan_nonlinear_memory
 from fastfuncstuff.utils import _prefers_cuda_batching
@@ -69,6 +70,7 @@ from .interp import (
 )
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
+from .penalty import compute_jacobian_energy, penalty_energy
 
 _EPS = 1e-6
 
@@ -179,8 +181,33 @@ class SynConfig:
     once the (range-normalized) downward slope of cost over the window falls below
     this — i.e. the cost has flattened. Larger = stop sooner."""
 
-    fold_guard: float = 0.5
-    """Per-round shrink (0..1) applied by the **local** anti-folding damping; 0 disables it.
+    fold_penalty: float = 0.033333
+    """Strength of the **soft** anti-folding penalty added to the cost; 0 disables it.
+
+    AFNI's ``IW3D_load_energy`` penalty (``processing/penalty.py``, shared with qwarp's
+    ``-penfac``), and the default because forbidding folds outright is the wrong shape
+    of answer. Its deadband is what makes it right here: ``je = (det(J) - 1)^2`` against
+    ``HPEN_CUT = 1.0``, so a voxel costs nothing until it has inverted or more than
+    doubled in volume. Compressing a large ventricle to a small one is anatomy, not a
+    defect, and this leaves it free -- ``det(J) = 1e-4`` is not charged at all, while
+    ``det(J) < 0`` is. Being differentiable, it steers the update rather than vetoing
+    it, so it can discourage the streaks of folded field that make an unconstrained warp
+    useless without ever being able to wedge a level.
+
+    For reference, ANTs SyN has no fold control whatsoever -- its update is
+    ``field += update * gradstep`` followed by a Gaussian smooth, and regularization is
+    the whole mechanism. AFNI's soft penalty is the middle road, and it is the one we
+    already had a primitive for."""
+
+    fold_guard: float = 0.0
+    """Per-round shrink (0..1) applied by the **hard** local anti-folding damping; 0 off.
+
+    Off by default. A hard guard is the right tool when a fold is genuinely inadmissible
+    -- ``ffs_blipflip``'s single-axis distortion fields, say -- and the wrong default
+    everywhere else: measured on NIREP na02->na01, guarding at ``invert_floor`` fought
+    47,788 voxels of legitimate compression (1.08% of the brain, which routinely
+    compresses more than 3.4x) to prevent 13 actual folds, and in doing so throttled the
+    finest level to a standstill. Enable it deliberately, per case.
 
     SyN has no fold control at all other than ``update_var``/``total_var``, which are
     global: the only way to stop a handful of voxels inverting was to blur the entire
@@ -361,6 +388,34 @@ def image_metric(
     if metric in _REG:
         return differentiable_cost(metric, a, b, weight, cc_radius=cc_radius)
     raise ValueError(f"unknown metric {metric!r}; choose from {METRICS}")
+
+
+def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
+    """AFNI's warp-distortion energy for one half-field, as a differentiable scalar.
+
+    Reuses ``penalty.py`` -- the same primitive behind qwarp's ``-penfac`` -- rather
+    than growing a second notion of what a bad warp looks like. The ``^0.25`` on the
+    total pairs with the 4th power inside :func:`penalty_energy` so that one dominant
+    voxel contributes its excess directly: the result behaves as a soft maximum over the
+    worst offender, not an average over every voxel that merely deformed.
+    """
+
+    # Checkpointed, because compute_jacobian_energy is written as ~forty named
+    # full-volume expressions and autograd pins every one of them: at 256x300x256 that
+    # is about 6 GiB across the two half-fields, and it OOMs a 16 GiB card outright.
+    # Recomputing the penalty during the backward costs one extra forward -- a few ms
+    # against a scalar that the metric dwarfs -- and returns the memory.
+    def _energy(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
+        je, se = compute_jacobian_energy(xd, yd, zd)
+        return penalty_energy(je, se).sum()
+
+    total = checkpoint(_energy, *fields, use_reentrant=False)
+    # ``x ** 0.25`` has an infinite derivative at zero, so the clamp is needed to keep
+    # the backward finite -- but on its own it leaves a constant floor on the cost for a
+    # warp that owes nothing. Gating on the indicator removes the floor and keeps the
+    # gradient at zero exactly where the energy is (every voxel inside the deadband
+    # contributes no gradient anyway).
+    return config.fold_penalty * total.clamp(min=_EPS) ** 0.25 * (total > 0)
 
 
 def _metric_cost(a: Tensor, b: Tensor, weight: Tensor, config: SynConfig) -> Tensor:
@@ -767,19 +822,36 @@ def _additive_step_with_fold_guard(
     if config.fold_guard <= 0:
         return cand, jac, 0, False
 
-    floor = config.invert_floor
-    best_cand, best_jac, damped = cand, jac, 0
-    for _ in range(config.fold_damp_rounds):
-        if float(best_jac.min()) >= floor:
-            break
+    floor = config.jac_floor
+
+    def harm(candidate_jac: Tensor) -> float:
+        """Total folding, as det(J) summed over the voxels under the floor.
+
+        One number drives which voxels to damp, when to stop, which round to keep and
+        whether to step at all. Using a different statistic for any of them is what
+        went wrong before: selecting the best round by global ``min()`` pinned it to the
+        undamped candidate whenever the minimum sat on a voxel the local damping could
+        not reach, so the round that had actually repaired the damage was computed and
+        then discarded, and the exit test kept reading the stale one. An extreme order
+        statistic over millions of voxels answers "is anything bad anywhere", which is
+        never the question -- the question is whether this step made things worse.
+        """
+        return float(torch.clamp(floor - candidate_jac, min=0.0).sum())
+
+    prev_harm = harm(prev_jac)
+    best_cand, best_jac, best_harm, damped = cand, jac, harm(jac), 0
+    while best_harm > prev_harm and damped < config.fold_damp_rounds:
         keep = 1.0 - _fold_damping_mask(best_jac, floor, config.fold_guard)
         ux, uy, uz = ux * keep, uy * keep, uz * keep
         cand, jac = _apply((ux, uy, uz))
         damped += 1
-        if float(jac.min()) > float(best_jac.min()):
-            best_cand, best_jac = cand, jac
+        if (this_harm := harm(jac)) < best_harm:
+            best_cand, best_jac, best_harm = cand, jac, this_harm
 
-    if float(best_jac.min()) < floor <= float(prev_jac.min()):
+    # Comparing against ``prev_harm`` rather than against zero is what keeps this
+    # satisfiable from any starting state: a level that inherited a folded field can
+    # still step, so long as it does not fold it further.
+    if best_harm > prev_harm:
         return prev, prev_jac, damped, True
     return best_cand, best_jac, damped, False
 
@@ -876,7 +948,14 @@ def _syn_level(
         fmid = _warp_diff(fixed, lf[0], lf[1], lf[2], voxel_grid)
         mmid = _warp_diff(moving, lm[0], lm[1], lm[2], voxel_grid)
         cost = _metric_cost(fmid, mmid, weight, config)
+        # The image term is what the level is judged and best-restored on; the penalty
+        # only steers the step. Folding lowers the image metric, so scoring the two
+        # together would let a folded iterate win on a total the penalty was meant to
+        # stop -- and would make costs from different fold_penalty settings
+        # incomparable.
         cost_val = cost.item()
+        if config.fold_penalty > 0:
+            cost = cost + _fold_penalty(tuple(lf), config) + _fold_penalty(tuple(lm), config)
         costs.append(cost_val)
 
         # The cost reflects the current (pre-update) fields -- snapshot them as best.
