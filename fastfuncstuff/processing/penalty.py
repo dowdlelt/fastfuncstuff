@@ -16,8 +16,25 @@ processes B patches in parallel on GPU without Python loops.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor
+
+try:
+    from .penalty_triton import penalty_sums_triton
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    penalty_sums_triton = None
+
+_penalty_triton_unavailable = False
+
+
+def _set_penalty_triton_unavailable(message: str) -> None:
+    """Latch the fused penalty off for the rest of the process, saying so once."""
+    global _penalty_triton_unavailable
+    if not _penalty_triton_unavailable:
+        _penalty_triton_unavailable = True
+        print(f"** {message}")
 
 
 def _central_diff_batched(vol: Tensor, dim: int) -> Tensor:
@@ -179,11 +196,36 @@ def compute_penalty_batched(
     Returns:
         (B,) penalty values, differentiable.
     """
-    # Batched Jacobian energy: (B, nz, ny, nx)
-    je, se = compute_jacobian_energy(xd, yd, zd)
+    patch_sums = None
+    # The fused kernel keeps the nine difference fields and the forty expressions
+    # over them in registers, so nothing between the displacements and this sum is
+    # ever written down. It is not differentiable, so the Adam path -- which needs
+    # a backward pass through exactly these terms -- keeps the tensor version.
+    if (
+        penalty_sums_triton is not None
+        and not _penalty_triton_unavailable
+        and xd.device.type == "cuda"
+        and xd.dtype == torch.float32
+        and xd.ndim == 4
+        and not (xd.requires_grad or yd.requires_grad or zd.requires_grad)
+        and os.environ.get("FFS_PENALTY_NO_TRITON") != "1"
+    ):
+        try:
+            patch_sums = penalty_sums_triton(xd, yd, zd, HPEN_CUT)
+        except AssertionError:
+            raise  # a failed assertion is a bug here, not a missing GPU capability
+        except Exception as exc:  # pragma: no cover - needs a Triton-hostile GPU
+            _set_penalty_triton_unavailable(
+                f"fused deformation penalty unavailable ({type(exc).__name__}: {exc}); "
+                "falling back to the tensor implementation"
+            )
 
-    # Sum over spatial dims, keep batch: (B,)
-    patch_sums = penalty_energy(je, se).sum(dim=(-3, -2, -1))
+    if patch_sums is None:
+        # Batched Jacobian energy: (B, nz, ny, nx)
+        je, se = compute_jacobian_energy(xd, yd, zd)
+        # Sum over spatial dims, keep batch: (B,)
+        patch_sums = penalty_energy(je, se).sum(dim=(-3, -2, -1))
+
     hsum = (external_sums + patch_sums).clamp(min=0)
 
     return pen_fac * hsum.pow(0.25)
