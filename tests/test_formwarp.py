@@ -94,11 +94,35 @@ def test_paired_field_inversion_matches_independent_inversions(dtype):
     fields = tuple(
         tuple(torch.randn(9, 10, 11, dtype=dtype) * 0.15 for _ in range(3)) for _ in range(2)
     )
-    expected = tuple(invert_displacement_field(*field, n_iter=5) for field in fields)
-    actual = _invert_displacement_field_pair_batched(fields[0], fields[1], n_iter=5)
-    for expected_field, actual_field in zip(expected, actual, strict=True):
-        for expected_axis, actual_axis in zip(expected_field, actual_field, strict=True):
+    expected = tuple(
+        invert_displacement_field(*field, n_iter=5, return_step=True) for field in fields
+    )
+    first, second, step = _invert_displacement_field_pair_batched(fields[0], fields[1], n_iter=5)
+    for expected_field, actual_field in zip(expected, (first, second), strict=True):
+        for expected_axis, actual_axis in zip(expected_field[:3], actual_field, strict=True):
             torch.testing.assert_close(actual_axis, expected_axis, rtol=0.0, atol=0.0)
+    # The reported final fixed-point step is the larger of the two fields' own.
+    torch.testing.assert_close(step, torch.maximum(expected[0][3], expected[1][3]))
+
+
+def test_inversion_step_reports_whether_the_fixed_point_converged():
+    """The final sweep's correction separates a contracting field from a stuck one.
+
+    This is what lets the SyN loop decline to build a symmetrization it would only
+    throw away: outside the contraction radius the step plateaus instead of shrinking,
+    so a large one means further sweeps would not have helped.
+    """
+    gentle = _field_with_gradient(1.0)
+    steep = _field_with_gradient(6.0)
+
+    *_, gentle_step = invert_displacement_field(*gentle, n_iter=8, return_step=True)
+    *_, steep_step = invert_displacement_field(*steep, n_iter=8, return_step=True)
+    assert float(gentle_step) < 0.01
+    assert float(steep_step) > 0.5
+
+    # Stuck means stuck: eight times the sweeps barely moves it.
+    *_, steep_long = invert_displacement_field(*steep, n_iter=64, return_step=True)
+    assert float(steep_long) > 0.5 * float(steep_step)
 
 
 def test_formwarp_recovers_known_shift():

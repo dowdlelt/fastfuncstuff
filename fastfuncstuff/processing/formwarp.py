@@ -161,6 +161,14 @@ class SynConfig:
     invert_iters: int = 8
     """Fixed-point iterations for displacement-field inversion."""
 
+    invert_step_tol: float = 0.05
+    """Final fixed-point correction (voxels) above which the inverse is not trusted.
+
+    The iteration contracts or it does not; outside the contraction radius the per-sweep
+    correction stops shrinking rather than the answer slowly improving, so a large final
+    step means more sweeps would not have helped. Used to skip the symmetrization round
+    trip, whose input is that inverse."""
+
     convergence_window: int = 10
     """Iterations in the trailing window used to detect convergence (ANTs -c
     convergenceWindowSize). The window's cost trend (slope) decides when a level
@@ -430,12 +438,19 @@ def invert_displacement_field(
     zd: Tensor,
     n_iter: int = 8,
     voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
-) -> tuple[Tensor, Tensor, Tensor]:
+    *,
+    return_step: bool = False,
+) -> tuple[Tensor, ...]:
     """Approximate inverse of a displacement field by fixed-point iteration.
 
     For a field ``d`` (output->source), the inverse ``e`` satisfies
     ``e(x) = -d(x + e(x))``. Iterating from ``e0 = -d`` converges for the smooth,
     small-to-moderate fields SyN produces. Sampling uses trilinear interpolation.
+
+    ``return_step`` appends the size of the final sweep's correction. It is free --
+    both iterates are already in hand -- and it is the honest convergence signal: the
+    iteration contracts only while ``max|grad d| < 1``, and outside that the step stops
+    shrinking instead of the result getting slowly better.
     """
     nz, ny, nx = xd.shape
     device = xd.device
@@ -452,16 +467,22 @@ def invert_displacement_field(
     ey = -yd
     ez = -zd
     field = torch.stack([xd, yd, zd], dim=0)
-    for _ in range(n_iter):
+    step = torch.zeros((), device=device, dtype=xd.dtype)
+    for sweep in range(n_iter):
         sx = (ii + ex).reshape(-1)
         sy = (jj + ey).reshape(-1)
         sz = (kk + ez).reshape(-1)
         sampled = trilinear_interpolate_multi(field, sx, sy, sz).T.reshape(3, nz, ny, nx)
         dx, dy, dz = sampled.unbind(0)
+        if sweep == n_iter - 1:
+            step = torch.maximum(
+                torch.maximum((-dx - ex).abs().max(), (-dy - ey).abs().max()),
+                (-dz - ez).abs().max(),
+            )
         ex = -dx
         ey = -dy
         ez = -dz
-    return ex, ey, ez
+    return (ex, ey, ez, step) if return_step else (ex, ey, ez)
 
 
 def _invert_displacement_field_pair_batched(
@@ -469,7 +490,7 @@ def _invert_displacement_field_pair_batched(
     second: Field,
     n_iter: int = 8,
     voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
-) -> tuple[Field, Field]:
+) -> tuple[Field, Field, Tensor]:
     """Invert two independent fields through one batched sampling stream."""
     nz, ny, nx = first[0].shape
     device = first[0].device
@@ -486,16 +507,28 @@ def _invert_displacement_field_pair_batched(
     fields = torch.stack((torch.stack(first), torch.stack(second)))
     kk, jj, ii = (coord.to(dtype=fields.dtype) for coord in (kk, jj, ii))
     ex, ey, ez = -fields[:, 0], -fields[:, 1], -fields[:, 2]
-    for _ in range(n_iter):
+    step = torch.zeros((), device=fields.device, dtype=fields.dtype)
+    for sweep in range(n_iter):
         sx = (ii.unsqueeze(0) + ex).reshape(2, 1, -1)
         sy = (jj.unsqueeze(0) + ey).reshape(2, 1, -1)
         sz = (kk.unsqueeze(0) + ez).reshape(2, 1, -1)
         dx, dy, dz = batched_interp_3ch_multi(fields, sx, sy, sz)
-        ex = -dx.reshape(2, nz, ny, nx)
-        ey = -dy.reshape(2, nz, ny, nx)
-        ez = -dz.reshape(2, nz, ny, nx)
+        nx_, ny_, nz_ = (
+            -dx.reshape(2, nz, ny, nx),
+            -dy.reshape(2, nz, ny, nx),
+            -dz.reshape(2, nz, ny, nx),
+        )
+        # How far the last sweep still moved. A contraction has this shrinking towards
+        # zero; a field outside the contraction radius has it stuck at some finite
+        # size, which is the signal that iterating further is pointless.
+        if sweep == n_iter - 1:
+            step = torch.maximum(
+                torch.maximum((nx_ - ex).abs().max(), (ny_ - ey).abs().max()),
+                (nz_ - ez).abs().max(),
+            )
+        ex, ey, ez = nx_, ny_, nz_
 
-    return (ex[0], ey[0], ez[0]), (ex[1], ey[1], ez[1])
+    return (ex[0], ey[0], ez[0]), (ex[1], ey[1], ez[1]), step
 
 
 def _invert_displacement_field_pair(
@@ -503,14 +536,21 @@ def _invert_displacement_field_pair(
     second: Field,
     n_iter: int = 8,
     voxel_grid: tuple[Tensor, Tensor, Tensor] | None = None,
-) -> tuple[Field, Field]:
-    """Invert two fields using the measured implementation for their device."""
+) -> tuple[Field, Field, Tensor]:
+    """Invert two fields using the measured implementation for their device.
+
+    Also returns the size of the final fixed-point step, which is how far from
+    converged the iteration still was. See :func:`_syn_level` for what reads it.
+    """
     if _prefers_cuda_batching(first[0].device):
         return _invert_displacement_field_pair_batched(first, second, n_iter, voxel_grid)
-    return (
-        invert_displacement_field(*first, n_iter=n_iter, voxel_grid=voxel_grid),
-        invert_displacement_field(*second, n_iter=n_iter, voxel_grid=voxel_grid),
+    ax, ay, az, a_step = invert_displacement_field(
+        *first, n_iter=n_iter, voxel_grid=voxel_grid, return_step=True
     )
+    bx, by, bz, b_step = invert_displacement_field(
+        *second, n_iter=n_iter, voxel_grid=voxel_grid, return_step=True
+    )
+    return (ax, ay, az), (bx, by, bz), torch.maximum(a_step, b_step)
 
 
 # ---------------------------------------------------------------------------
@@ -909,25 +949,34 @@ def _syn_level(
             jac_m = jacobian_determinant(mxd, myd, mzd)
 
         # Re-derive inverses, then re-derive forwards from them (symmetrize).
-        (ifxd, ifyd, ifzd), (imxd, imyd, imzd) = _invert_displacement_field_pair(
+        (ifxd, ifyd, ifzd), (imxd, imyd, imzd), inv_step = _invert_displacement_field_pair(
             (fxd, fyd, fzd), (mxd, myd, mzd), config.invert_iters, voxel_grid
         )
-        sym_f, sym_m = _invert_displacement_field_pair(
-            (ifxd, ifyd, ifzd), (imxd, imyd, imzd), config.invert_iters, voxel_grid
-        )
-        # Keep the round trip only if it did no harm. It is the one operation in the
-        # loop that rewrites the field without the fold guard ever seeing the result,
-        # and its accuracy collapses on exactly the fields the guard still calls legal
-        # (SynConfig.invert_floor). Rejecting costs nothing correctness-wise: the
-        # inverses above are the inverses of the fields we then keep.
-        sym_jac_f = jacobian_determinant(*sym_f)
-        sym_jac_m = jacobian_determinant(*sym_m)
-        floor = min(config.invert_floor, float(jac_f.min()), float(jac_m.min()))
-        if min(float(sym_jac_f.min()), float(sym_jac_m.min())) >= floor:
-            (fxd, fyd, fzd), (mxd, myd, mzd) = sym_f, sym_m
-            jac_f, jac_m = sym_jac_f, sym_jac_m
-        else:
+        # The round trip is only worth taking if the inverse it is built from converged.
+        # When the field is outside the contraction radius the fixed point stops
+        # shrinking, and the re-derived forward is then guaranteed to fail the check
+        # below -- so this is not a heuristic, it is declining to compute a result we
+        # would discard. It is not a small saving either: at the finest level the round
+        # trip was rejected on every single iteration, at 114 ms a time.
+        if float(inv_step) > config.invert_step_tol:
             n_sym_rejected += 1
+        else:
+            sym_f, sym_m, _ = _invert_displacement_field_pair(
+                (ifxd, ifyd, ifzd), (imxd, imyd, imzd), config.invert_iters, voxel_grid
+            )
+            # Keep it only if it did no harm. This is the one operation in the loop that
+            # rewrites the field without the fold guard ever seeing the result, and its
+            # accuracy collapses on exactly the fields the guard still calls legal
+            # (SynConfig.invert_floor). Rejecting costs nothing correctness-wise: the
+            # inverses above are the inverses of the fields we then keep.
+            sym_jac_f = jacobian_determinant(*sym_f)
+            sym_jac_m = jacobian_determinant(*sym_m)
+            floor = min(config.invert_floor, float(jac_f.min()), float(jac_m.min()))
+            if min(float(sym_jac_f.min()), float(sym_jac_m.min())) >= floor:
+                (fxd, fyd, fzd), (mxd, myd, mzd) = sym_f, sym_m
+                jac_f, jac_m = sym_jac_f, sym_jac_m
+            else:
+                n_sym_rejected += 1
 
     if bar is not None:
         bar.close()
