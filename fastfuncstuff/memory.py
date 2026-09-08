@@ -942,8 +942,13 @@ def estimate_nonlinear_memory_bytes(
         volume_equivalents = 220 if engine == "optiwarp_gradient" else 28
     elif engine == "qwarp":
         # Images/weights/warps plus the full-volume level-0 basis, coordinate,
-        # interpolation, correlation, and Jacobian working sets.
-        volume_equivalents = 61 + max(0, n_sources - 1) * 5
+        # interpolation, correlation, and Jacobian working sets. Measured peaks on
+        # CUDA after the Gauss-Newton columns were bounded: 69.8 equivalents at
+        # 193x229x193 padded to 9.89 M voxels, 76.9 at 256x300x256 padded to
+        # 24.66 M. 85 leaves margin over the larger. The previous 61 was fitted
+        # before the level-0 global patch was measured at all, and predicted
+        # 5.9 GiB for a run that took over 14 and died.
+        volume_equivalents = 85 + max(0, n_sources - 1) * 5
     else:
         raise ValueError(f"Unknown nonlinear engine {engine!r}")
     fixed_overhead = 300 * 1024**2 if engine == "qwarp" else 0
@@ -957,7 +962,7 @@ def gn_normal_eqs_voxel_chunk(
     device: torch.device,
     *,
     live_buffers: float = 3.0,
-    min_chunk: int = 4096,
+    max_elements: int = 16_000_000,
 ) -> int:
     """Voxels per chunk for the batched Gauss-Newton normal equations.
 
@@ -972,14 +977,23 @@ def gn_normal_eqs_voxel_chunk(
     roughly the work grid throughout. ``live_buffers`` covers the assembled
     columns plus the copy that the direction-major reshape makes.
 
+    ``max_elements`` is the binding bound in practice, and deliberately so: free
+    memory answers "what fits", which on an idle card is far more slab than the
+    GPU can use at once. Sweeping the cap over a 0.7 mm qwarp from 4M to 64M
+    elements moved the run between 35.7 s and 37.3 s -- flat, inside the noise --
+    while letting free memory decide instead cost 1.8 GiB of peak for none of it.
+
     Returns a chunk size in voxels, never larger than ``n_voxels``.
     """
     if n_patches < 1 or n_voxels < 1 or n_columns < 1:
         return max(1, n_voxels)
-    per_voxel = max(1, int(n_patches * n_columns * 4 * live_buffers))
+    per_chunk_voxel = max(1, n_patches * n_columns)
     budget = get_available_memory(device, empty_cache=False)
-    chunk = int(budget // per_voxel)
-    return max(1, min(n_voxels, max(min(min_chunk, n_voxels), chunk)))
+    chunk = min(
+        int(budget // max(1, int(per_chunk_voxel * 4 * live_buffers))),
+        max_elements // per_chunk_voxel,
+    )
+    return max(1, min(n_voxels, chunk))
 
 
 def plan_nonlinear_memory(
