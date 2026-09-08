@@ -58,6 +58,7 @@ from .cost import (
     _packed_lpa_correlation,
     _packed_lpc_correlation,
     _separable_smooth_3d,
+    _smoothed_weighted_moments_3d,
     pearson_correlation,
 )
 from .interp import (
@@ -306,17 +307,13 @@ def _local_cc_cost(a: Tensor, b: Tensor, radius: int, weight: Tensor) -> Tensor:
     drive from the real tissue, nothing from the void or the air. With ``w`` constant
     this is algebraically identical to the unweighted form.
     """
-    r = float(radius)
-
-    def box(v: Tensor) -> Tensor:
-        return _separable_smooth_3d(v, r, kernel_type="box")
-
-    wn = box(weight).clamp(min=_EPS)
-    am = box(weight * a) / wn
-    bm = box(weight * b) / wn
-    cov = box(weight * a * b) / wn - am * bm
-    va = (box(weight * a * a) / wn - am * am).clamp(min=_EPS)
-    vb = (box(weight * b * b) / wn - bm * bm).clamp(min=_EPS)
+    moments = _smoothed_weighted_moments_3d(a, b, weight, float(radius), "box")
+    wn = moments[0].clamp(min=_EPS)
+    am = moments[1] / wn
+    bm = moments[2] / wn
+    cov = moments[5] / wn - am * bm
+    va = (moments[3] / wn - am * am).clamp(min=_EPS)
+    vb = (moments[4] / wn - bm * bm).clamp(min=_EPS)
     cc = cov * cov / (va * vb)  # in [0, 1], higher = better
     return -(weight * cc).sum() / weight.sum().clamp(min=_EPS)
 

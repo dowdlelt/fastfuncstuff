@@ -11,6 +11,7 @@ from fastfuncstuff.processing.cost import (
     _batched_separable_smooth_3d,
     _box_kernel_1d,
     _conv1d_along_axis,
+    _filter_moment_bank,
     _gauss_kernel_1d,
     _make_kernel_1d,
     _separable_smooth_3d,
@@ -638,3 +639,44 @@ class TestBatchedIncrementalCorrelation:
         corrs = bic.evaluate(base_patches, source_patches, weight_patches)
         corrs.sum().backward()
         assert source_patches.grad is not None
+
+
+def test_moment_bank_matches_whether_it_is_batched_or_looped():
+    """The device split in ``_filter_moment_bank`` must not change the answer.
+
+    CPU filters each moment on its own (one group keeps ``_conv1d_along_axis``'s
+    strided-gemv path) while CUDA filters the bank as one grouped convolution. That is
+    purely a dispatch choice, so the two have to agree -- this pins it without needing
+    a GPU, by running the batched form explicitly on CPU tensors.
+    """
+    torch.manual_seed(0)
+    moments = tuple(torch.rand(9, 10, 11) for _ in range(6))
+
+    looped = _filter_moment_bank(moments, 2.0, "box")
+    batched = _separable_smooth_3d(torch.stack(moments)[None], 2.0, kernel_type="box")[0]
+
+    assert len(looped) == 6
+    for one, many in zip(looped, batched.unbind(0), strict=True):
+        torch.testing.assert_close(one, many, rtol=1e-6, atol=1e-6)
+
+
+def test_local_cc_cost_matches_the_unbatched_reference():
+    """``_local_cc_cost`` through the moment bank equals six separate box filters."""
+    from fastfuncstuff.processing.formwarp import _EPS, _local_cc_cost
+
+    torch.manual_seed(0)
+    shape = (12, 13, 14)
+    a, b = torch.rand(shape), torch.rand(shape)
+    w = (torch.rand(shape) > 0.3).float()
+
+    def box(v):
+        return _separable_smooth_3d(v, 3.0, kernel_type="box")
+
+    wn = box(w).clamp(min=_EPS)
+    am, bm = box(w * a) / wn, box(w * b) / wn
+    cov = box(w * a * b) / wn - am * bm
+    va = (box(w * a * a) / wn - am * am).clamp(min=_EPS)
+    vb = (box(w * b * b) / wn - bm * bm).clamp(min=_EPS)
+    reference = -(w * (cov * cov / (va * vb))).sum() / w.sum().clamp(min=_EPS)
+
+    torch.testing.assert_close(_local_cc_cost(a, b, 3, w), reference)

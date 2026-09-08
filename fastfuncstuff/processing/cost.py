@@ -270,6 +270,33 @@ def _separable_smooth_3d(
     return vol
 
 
+def _filter_moment_bank(
+    moments: tuple[Tensor, ...],
+    sigma: float | tuple[float, float, float],
+    kernel_type: str,
+) -> tuple[Tensor, ...]:
+    """Smooth several same-shape volumes, batched or not according to the device.
+
+    One grouped convolution is the right shape for CUDA, which would otherwise launch
+    three tiny kernels per moment and be bound by the launches: at 256x300x256 the
+    six-moment bank costs 23 ms batched against 58 ms one at a time, and the saving is
+    larger again in the backward, where each separate pass also drags its own
+    ``replication_pad3d_backward`` (440 ms -> 90 ms for cost plus gradient).
+
+    On CPU it is the opposite, and for the reason ``_conv1d_along_axis`` already
+    documents: its strided-gemv path only applies with a single group, so batching
+    forfeits it and falls back to grouped conv3d. Measured at 128x150x128, filtering
+    the bank as one group of six costs 261 ms against 157 ms one at a time. Looping the
+    gemv over slices of a batched pad does not recover it either (570 ms) -- the win is
+    in the whole single-group call, not in the matmul alone.
+    """
+    if moments[0].device.type == "cpu":
+        return tuple(_separable_smooth_3d(m, sigma, kernel_type=kernel_type) for m in moments)
+    stacked = torch.stack(moments)[None]
+    smoothed = _separable_smooth_3d(stacked, sigma, kernel_type=kernel_type)[0]
+    return tuple(smoothed.unbind(0))
+
+
 def _smoothed_weighted_moments_3d(
     x: Tensor,
     y: Tensor,
@@ -278,11 +305,12 @@ def _smoothed_weighted_moments_3d(
     kernel_type: str,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Filter the six weighted local-correlation moments as one channel bank."""
-    moments = torch.stack(
-        (weight, weight * x, weight * y, weight * x * x, weight * y * y, weight * x * y)
-    )[None]
-    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
-    return smoothed[0], smoothed[1], smoothed[2], smoothed[3], smoothed[4], smoothed[5]
+    sw, swx, swy, swxx, swyy, swxy = _filter_moment_bank(
+        (weight, weight * x, weight * y, weight * x * x, weight * y * y, weight * x * y),
+        sigma,
+        kernel_type,
+    )
+    return sw, swx, swy, swxx, swyy, swxy
 
 
 def _smoothed_weighted_fixed_moments_3d(
@@ -292,9 +320,10 @@ def _smoothed_weighted_fixed_moments_3d(
     kernel_type: str,
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Filter the three moments invariant while one image is repeatedly warped."""
-    moments = torch.stack((weight, weight * fixed, weight * fixed * fixed))[None]
-    smoothed = _separable_smooth_3d(moments, sigma, kernel_type=kernel_type)[0]
-    return smoothed[0], smoothed[1], smoothed[2]
+    sw, swf, swff = _filter_moment_bank(
+        (weight, weight * fixed, weight * fixed * fixed), sigma, kernel_type
+    )
+    return sw, swf, swff
 
 
 def _smoothed_weighted_moments_3d_from_fixed(
@@ -306,10 +335,11 @@ def _smoothed_weighted_moments_3d_from_fixed(
     fixed_moments: tuple[Tensor, Tensor, Tensor],
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Filter only moving-side/cross moments and combine with a fixed-side cache."""
-    dynamic = torch.stack((weight * moving, weight * moving * moving, weight * moving * fixed))[
-        None
-    ]
-    smoothed = _separable_smooth_3d(dynamic, sigma, kernel_type=kernel_type)[0]
+    smoothed = _filter_moment_bank(
+        (weight * moving, weight * moving * moving, weight * moving * fixed),
+        sigma,
+        kernel_type,
+    )
     sw, swf, swff = fixed_moments
     return sw, smoothed[0], swf, smoothed[1], swff, smoothed[2]
 
