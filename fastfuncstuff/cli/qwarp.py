@@ -468,6 +468,20 @@ def parse_args(
         "may cause edge artifacts",
     )
     g_reg.add_argument(
+        "-work_margin",
+        type=int,
+        default=None,
+        metavar="NVOX",
+        help="Blank voxels to leave around the brain on every face of the "
+        "internal work grid, cropping the faces that already have more air "
+        "than that. The default rule leaves a fraction of the *matrix* blank, "
+        "which normalises the brain to about three quarters of the box "
+        "whatever came in -- so a large-FOV volume keeps a rind of air that "
+        "every refinement level pays for. Cost and memory are both linear in "
+        "work-grid voxels. Must be at least the largest displacement the warp "
+        "needs to find, or source anatomy is pulled in from outside the grid",
+    )
+    g_reg.add_argument(
         "-save_intermediates",
         action="store_true",
         help="After each refinement level, save the running warp field and "
@@ -1759,7 +1773,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             print(f"Loaded initial warp: {args.iniwarp}")
 
     use_pad = not args.nopad
-    warp_padding = _compute_support_padding(base_3d, initial_warp=initial_warp) if use_pad else None
+    warp_margin = (args.work_margin,) * 3 if args.work_margin is not None else None
+    warp_padding = (
+        _compute_support_padding(base_3d, initial_warp=initial_warp, margin_xyz=warp_margin)
+        if use_pad
+        else None
+    )
     padding: Padding3D = warp_padding if warp_padding is not None else (0, 0, 0)
 
     px0, px1, py0, py1, pz0, pz1 = _padding_faces(padding)
@@ -1811,6 +1830,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     config = QwarpConfig(
         minpatch=args.minpatch,
+        work_margin=args.work_margin,
         max_level=args.maxlev,
         start_level=args.inilev,
         use_quintic=args.quintic,

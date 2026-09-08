@@ -132,6 +132,17 @@ class QwarpConfig:
     minpatch: int = 25
     """Minimum patch size (odd number, >= 5). Controls detail level."""
 
+    work_margin: int | None = None
+    """Blank voxels to leave around the brain on every face of the work grid.
+
+    ``None`` keeps AFNI's rule, which leaves a fraction of the *matrix* blank and
+    so normalises the brain to about three quarters of the box whatever came in.
+    A number here measures the same margin from the brain support instead, and
+    crops the faces that already have more air than that -- every level's cost is
+    linear in work-grid voxels, and on a large-FOV volume most of those voxels are
+    air. See :func:`_compute_support_padding`.
+    """
+
     blur_base: float = 0.0
     """Gaussian FWHM blur for base image (voxels)."""
 
@@ -425,8 +436,9 @@ def _compute_support_padding(
     base: Tensor,
     minimum_xyz: tuple[int, int, int] = (9, 9, 9),
     initial_warp: tuple[Tensor, Tensor, Tensor] | None = None,
+    margin_xyz: tuple[int, int, int] | None = None,
 ) -> tuple[int, int, int, int, int, int]:
-    """AFNI qwarp padding from thresholded base support, per volume face.
+    """qwarp work-grid geometry relative to the base's support, per volume face.
 
     Matches the zero-padding rule in AFNI `3dQwarp.c`: threshold at
     `0.33 * THD_cliplevel(base, 0.22)`, find the support box, then add only the
@@ -434,6 +446,15 @@ def _compute_support_padding(
     at least three newly padded slices on every face. An initial warp enlarges the
     minimum from displacement inside the fixed-image support only; unconstrained
     values in air cannot inflate the work grid.
+
+    ``margin_xyz`` replaces that rule with an explicit number of blank voxels to
+    leave on each face, and drops the "at least three more" floor -- so a face
+    that already has *more* air than asked for comes back **negative**, meaning
+    crop rather than pad. AFNI's rule is a fraction of the matrix, which
+    normalises the brain to about three quarters of the box whatever the input
+    was; that is scale-free and safe, but on a large-FOV volume it keeps a rind
+    of air that every level then pays for in voxels. Cropping to the support and
+    padding from *there* is the same geometry measured from the brain instead.
     """
     if base.ndim != 3:
         raise ValueError(f"base must be 3-D, got shape {tuple(base.shape)}")
@@ -459,17 +480,27 @@ def _compute_support_padding(
             max(floor, int(torch.ceil(component[active].detach().abs().max()).item()) + 3)
             for floor, component in zip(minimum_xyz, initial_warp, strict=True)
         )
-    tx = max(int(round(0.1234 * nx)) + 1, minimum_xyz[0])
-    ty = max(int(round(0.1234 * ny)) + 1, minimum_xyz[1])
-    tz = max(int(round(0.1234 * nz)) + 1, minimum_xyz[2])
-    return (
-        max(3, tx - i0),
-        max(3, tx - (nx - 1 - i1)),
-        max(3, ty - j0),
-        max(3, ty - (ny - 1 - j1)),
-        max(3, tz - k0),
-        max(3, tz - (nz - 1 - k1)),
+    if margin_xyz is None:
+        tx = max(int(round(0.1234 * nx)) + 1, minimum_xyz[0])
+        ty = max(int(round(0.1234 * ny)) + 1, minimum_xyz[1])
+        tz = max(int(round(0.1234 * nz)) + 1, minimum_xyz[2])
+        floor = 3
+    else:
+        tx, ty, tz = (max(m, n) for m, n in zip(margin_xyz, minimum_xyz, strict=True))
+        floor = None
+
+    faces = (
+        tx - i0,
+        tx - (nx - 1 - i1),
+        ty - j0,
+        ty - (ny - 1 - j1),
+        tz - k0,
+        tz - (nz - 1 - k1),
     )
+    if floor is None:
+        return faces
+    x0, x1, y0, y1, z0, z1 = (max(floor, f) for f in faces)
+    return x0, x1, y0, y1, z0, z1
 
 
 def _pad_volume(
@@ -494,10 +525,19 @@ def _pad_volume_faces(vol: Tensor, padding: Padding3D) -> Tensor:
 
 
 def _crop_padding(vol: Tensor, padding: Padding3D, shape: tuple[int, int, int]) -> Tensor:
-    """Crop a padded tensor back to `(nz, ny, nx)` using its lower-face offset."""
-    px0, _, py0, _, pz0, _ = _padding_faces(padding)
+    """Undo ``_pad_volume_faces``, returning a tensor on the original ``(nz, ny, nx)``.
+
+    A face may be negative, meaning the work grid was *cropped* in from the input
+    on that side rather than padded out; undoing it pads the missing slices back
+    with zeros. For a warp field that is the right filler -- outside the work box
+    nothing was estimated, so nothing moves.
+    """
+    faces = _padding_faces(padding)
+    px0, px1, py0, py1, pz0, pz1 = faces
     nz, ny, nx = shape
-    return vol[..., pz0 : pz0 + nz, py0 : py0 + ny, px0 : px0 + nx]
+    if min(faces) >= 0:
+        return vol[..., pz0 : pz0 + nz, py0 : py0 + ny, px0 : px0 + nx]
+    return _pad_volume(vol, (-px0, -px1), (-py0, -py1), (-pz0, -pz1))
 
 
 def qwarp(
@@ -560,7 +600,15 @@ def qwarp(
         raise ValueError("initial warp components must match the unpadded base shape")
 
     if padding is None:
-        padding = _compute_support_padding(base, initial_warp=initial_warp) if pad else (0, 0, 0)
+        padding = (
+            _compute_support_padding(
+                base,
+                initial_warp=initial_warp,
+                margin_xyz=(config.work_margin,) * 3 if config.work_margin is not None else None,
+            )
+            if pad
+            else (0, 0, 0)
+        )
     elif not pad and any(padding):
         raise ValueError("explicit nonzero padding conflicts with pad=False")
     padding = _padding_faces(padding)
@@ -3045,7 +3093,13 @@ def qwarp_batch(
     N = sources.shape[0]
     nz_orig, ny_orig, nx_orig = base.shape
 
-    padding = _compute_support_padding(base) if pad else (0, 0, 0, 0, 0, 0)
+    padding = (
+        _compute_support_padding(
+            base, margin_xyz=(config.work_margin,) * 3 if config.work_margin is not None else None
+        )
+        if pad
+        else (0, 0, 0, 0, 0, 0)
+    )
     do_pad = any(padding)
     if do_pad:
         base_p = _pad_volume_faces(base, padding)
@@ -3330,7 +3384,14 @@ def _build_mescaled_plan(
     nz_orig, ny_orig, nx_orig = base_echoes.shape[1:]
 
     base_mean = base_echoes.mean(0)
-    padding = _compute_support_padding(base_mean) if pad else (0, 0, 0, 0, 0, 0)
+    padding = (
+        _compute_support_padding(
+            base_mean,
+            margin_xyz=(config.work_margin,) * 3 if config.work_margin is not None else None,
+        )
+        if pad
+        else (0, 0, 0, 0, 0, 0)
+    )
     do_pad = any(padding)
 
     base_p = (

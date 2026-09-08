@@ -228,6 +228,57 @@ class TestComputeSupportPadding:
 
     # ---------------------------------------------------------------------------
 
+    def test_margin_crops_faces_that_already_have_more_air(self):
+        base = torch.zeros(64, 64, 64)
+        base[16:48, 16:48, 16:48] = 100.0
+
+        # Support runs 16..47 on every axis, so each face has 16 blank voxels.
+        # Asking for 5 gives back -11: crop, not pad.
+        assert _compute_support_padding(base, minimum_xyz=(1, 1, 1), margin_xyz=(5, 5, 5)) == (
+            -11,
+            -11,
+            -11,
+            -11,
+            -11,
+            -11,
+        )
+        # A margin wider than the air still pads, and the displacement floor
+        # still wins where it is larger than the margin asked for.
+        assert _compute_support_padding(base, minimum_xyz=(1, 1, 1), margin_xyz=(20, 20, 20)) == (
+            4,
+            4,
+            4,
+            4,
+            4,
+            4,
+        )
+        assert _compute_support_padding(base, minimum_xyz=(20, 1, 1), margin_xyz=(5, 5, 5)) == (
+            4,
+            4,
+            -11,
+            -11,
+            -11,
+            -11,
+        )
+
+    def test_negative_padding_round_trips_the_retained_region(self):
+        """A cropped face comes back zero-filled, and the kept voxels survive."""
+        vol = torch.randn(8, 10, 12)
+        padding = (-2, 3, -1, -1, 4, -3)
+
+        cropped = _pad_volume_faces(vol, padding)
+        recovered = _crop_padding(cropped, padding, tuple(vol.shape))
+
+        assert cropped.shape == (9, 8, 13)
+        assert recovered.shape == vol.shape
+        # z gained 4 slices at the front and lost 3 at the back, so z 0..4
+        # survive; y lost one slice a side; x lost two at the front.
+        torch.testing.assert_close(recovered[0:5, 1:9, 2:12], vol[0:5, 1:9, 2:12], atol=0, rtol=0)
+        assert float(recovered[5:].abs().sum()) == 0.0
+        assert float(recovered[:, :1].abs().sum()) == 0.0
+        assert float(recovered[:, 9:].abs().sum()) == 0.0
+        assert float(recovered[..., :2].abs().sum()) == 0.0
+
     def test_initial_warp_minimum_can_enlarge_margin(self):
         base = torch.zeros(64, 64, 64)
         base[16:48, 16:48, 16:48] = 100.0
