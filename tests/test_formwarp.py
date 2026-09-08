@@ -577,3 +577,46 @@ def test_syn_level_never_returns_a_field_the_inverter_cannot_handle(invert_floor
     ):
         assert float(jacobian_determinant(*half).min()) > 0.0, f"{name} folded"
     assert all(not lev.fold_fallback for lev in res.levels)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known bug: the fold guard picks its best round by global min(), which an "
+    "unreachable inherited voxel pins, so the round that repaired the damage is "
+    "computed and discarded. Fixing it alone is not enough -- see the wiki note.",
+)
+def test_fold_guard_leaves_an_improving_step_alone():
+    """No damping when the step does not make the determinant worse.
+
+    Reproduces what wedges the finest level. ``prev`` holds a one-voxel dip that the
+    step is already improving; the guard should notice the step is harmless and take
+    it. Instead it damps, because its exit test asks "is anything below the floor"
+    rather than "did this step push anything down" -- and a global ``min()`` over
+    millions of voxels can only answer the first.
+
+    Measured on NIREP na02->na01 at shrink=1: three offending voxels out of 19.7M, an
+    undamped step that *raised* min det(J) from 0.2889 to 0.2956, and the guard running
+    all six rounds on both half-fields for 120 consecutive iterations while the warp
+    advanced 0.2 voxels in total.
+    """
+    from fastfuncstuff.processing.formwarp import (
+        _additive_step_with_fold_guard,
+        jacobian_determinant,
+    )
+
+    config = SynConfig()
+    # A one-voxel-deep dip: the central difference either side of it is -0.75, so
+    # det(J) = 0.25 there and 1.0 almost everywhere else.
+    prev_x = torch.zeros(20, 20, 20)
+    prev_x[9:11, 9:11, 10] = -1.5
+    prev = (prev_x, torch.zeros_like(prev_x), torch.zeros_like(prev_x))
+    prev_jac = jacobian_determinant(*prev)
+    assert 0.0 < float(prev_jac.min()) < config.invert_floor
+
+    update = (-0.05 * prev_x, torch.zeros_like(prev_x), torch.zeros_like(prev_x))
+    _kept, jac, damped, refused = _additive_step_with_fold_guard(
+        prev, update, 0.0, config, prev_jac
+    )
+    assert float(jac.min()) >= float(prev_jac.min())
+    assert not refused
+    assert damped == 0, "an improving step should not be damped at all"
