@@ -787,3 +787,104 @@ def test_fold_penalty_face_voxels_are_not_half_counted():
     padded = _pad_linear1(v)
     assert padded.shape == (5, 5, 5)
     torch.testing.assert_close(padded[2, 2, 0], torch.tensor(0.0))  # 2*1 - 2
+
+
+def test_damping_mask_is_the_same_computed_on_a_box(monkeypatch):
+    """Restricting the dilate-and-blur to the offenders' neighbourhood changes nothing.
+
+    Dilate-then-smooth reaches (pool radius + Gaussian radius) voxels, so outside a box
+    that far from any offending voxel the mask is identically zero -- computing it there
+    was a max_pool3d and a separable blur over the whole volume for a few hundred
+    voxels. The face and empty cases are the ones worth pinning: a box clipped at the
+    volume edge, and no box at all.
+    """
+    import torch.nn.functional as F
+
+    import fastfuncstuff.processing.formwarp as fw
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+    from fastfuncstuff.processing.formwarp import _fold_damping_mask
+
+    def dense(jac, floor, strength, radius=1.0):
+        bad = (jac < floor).to(jac.dtype)[None, None]
+        core = F.max_pool3d(bad, kernel_size=5, stride=1, padding=2)[0, 0]
+        return (strength * _separable_smooth_3d(core, radius, kernel_type="gauss")).clamp(0.0, 1.0)
+
+    # The sparse path is gated on volume size (the syncs it costs do not pay below a
+    # few million voxels), so a test-sized volume would silently take the dense path and
+    # check nothing. Force it.
+    monkeypatch.setattr(fw, "_SPARSE_GUARD_MIN_VOXELS", 0)
+
+    torch.manual_seed(0)
+    cases = {
+        "scattered": torch.rand(24, 26, 28),
+        "one voxel": torch.ones(24, 26, 28).index_put_(
+            (torch.tensor([5]), torch.tensor([6]), torch.tensor([7])), torch.tensor([-1.0])
+        ),
+        "on the face": torch.ones(24, 26, 28).index_put_(
+            (torch.tensor([0]), torch.tensor([0]), torch.tensor([0])), torch.tensor([-1.0])
+        ),
+        "nothing bad": torch.ones(24, 26, 28),
+    }
+    for name, jac in cases.items():
+        torch.testing.assert_close(
+            _fold_damping_mask(jac, 0.3, 0.5), dense(jac, 0.3, 0.5), rtol=0.0, atol=0.0, msg=name
+        )
+
+
+@pytest.mark.parametrize(
+    "changed",
+    [
+        (slice(8, 20), slice(9, 21), slice(10, 22)),  # interior
+        (slice(0, 12), slice(9, 21), slice(10, 22)),  # against the near face
+        (slice(18, 30), slice(20, 32), slice(22, 34)),  # against the far face
+        (slice(15, 16), slice(16, 17), slice(17, 18)),  # a single voxel
+    ],
+)
+def test_jacobian_refreshed_in_matches_a_full_recompute(changed):
+    """Splicing a locally recomputed determinant must equal recomputing all of it.
+
+    The contract is that the region bounds every voxel whose *determinant* changed, so
+    it is the bounding box of the changed field grown by one -- the difference stencil
+    reaches that far. The subtlety is that a sub-volume's own edge gets a one-sided
+    difference, so the recompute has to read one voxel wider than it writes and throw
+    that row away; where the region already sits on a face there is nothing to widen
+    into and the one-sided difference is the correct one anyway.
+    """
+    from fastfuncstuff.processing.cost import _separable_smooth_3d
+    from fastfuncstuff.processing.formwarp import (
+        _jacobian_refreshed_in,
+        _sparse_region,
+        jacobian_determinant,
+    )
+
+    torch.manual_seed(0)
+    field = [_separable_smooth_3d(torch.randn(30, 32, 34), 3.0) * 2.0 for _ in range(3)]
+    base = jacobian_determinant(*field)
+
+    moved = [c.clone() for c in field]
+    moved[0][changed] += 0.7
+    flag = torch.zeros_like(field[0], dtype=torch.bool)
+    flag[changed] = True
+    region = _sparse_region(flag, 1)
+    assert region is not None
+
+    torch.testing.assert_close(
+        _jacobian_refreshed_in(tuple(moved), base, region),
+        jacobian_determinant(*moved),
+        rtol=0.0,
+        atol=0.0,
+    )
+
+
+def test_sparse_region_pads_clips_and_reports_emptiness():
+    from fastfuncstuff.processing.formwarp import _sparse_region
+
+    flag = torch.zeros(10, 11, 12, dtype=torch.bool)
+    assert _sparse_region(flag, 2) is None
+
+    flag[5, 6, 7] = True
+    assert _sparse_region(flag, 2) == (slice(3, 8), slice(4, 9), slice(5, 10))
+
+    flag.zero_()
+    flag[0, 10, 11] = True  # clipped at both ends
+    assert _sparse_region(flag, 3) == (slice(0, 4), slice(7, 11), slice(8, 12))

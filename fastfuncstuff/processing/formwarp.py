@@ -472,7 +472,7 @@ def _fold_penalty(fields: Field, config: SynConfig) -> Tensor:
         # Routed through every field, so the graph shape does not depend on the data --
         # a bare zero would detach the penalty on the iterations it costs nothing (most
         # of them at the coarse levels) and autograd would then reject the unused leaf.
-        return sum(f.sum() for f in fields) * 0.0
+        return (fields[0].sum() + fields[1].sum() + fields[2].sum()) * 0.0
 
     # A central difference reaches one voxel, so a 3x3x3 patch is all the Jacobian at
     # the centre depends on -- taken from a linearly extrapolated pad, so that a face
@@ -870,6 +870,24 @@ def jacobian_determinant(xd: Tensor, yd: Tensor, zd: Tensor) -> Tensor:
     )
 
 
+def _sparse_region(flag: Tensor, pad: int) -> tuple[slice, slice, slice] | None:
+    """Bounding box of ``flag``'s true entries, grown by ``pad``; None if there are none.
+
+    The guard's inputs are extremely sparse -- a few hundred voxels out of millions --
+    and every operation downstream of them has a bounded reach, so the box is what makes
+    "recompute the parts that changed" expressible with the dense kernels we already
+    have. It costs one device sync to read the extents, which is repaid many times over
+    by not touching the rest of the volume.
+    """
+    idx = torch.nonzero(flag, as_tuple=False)
+    if idx.numel() == 0:
+        return None
+    lo = (idx.amin(0) - pad).clamp(min=0).tolist()
+    hi = (idx.amax(0) + pad + 1).tolist()
+    z, y, x = (slice(int(a), min(int(b), n)) for a, b, n in zip(lo, hi, flag.shape, strict=True))
+    return z, y, x
+
+
 def _fold_damping_mask(jac: Tensor, floor: float, strength: float, radius: float = 1.0) -> Tensor:
     """A smooth 0..1 field: how much of the step to give back, per voxel.
 
@@ -883,9 +901,87 @@ def _fold_damping_mask(jac: Tensor, floor: float, strength: float, radius: float
     The soft edge is not cosmetic: scaling an update discontinuously writes a step
     into the displacement field, which is a fresh source of the defect being repaired.
     """
+    return _fold_damping_mask_and_region(jac, floor, strength, radius)[0]
+
+
+def _fold_damping_mask_dense(
+    jac: Tensor, floor: float | Tensor, strength: float, radius: float
+) -> Tensor:
+    """The mask itself, over whatever it is given -- the whole volume or one box."""
     bad = (jac < floor).to(jac.dtype)[None, None]
     core = torch.nn.functional.max_pool3d(bad, kernel_size=5, stride=1, padding=2)[0, 0]
     return (strength * _separable_smooth_3d(core, radius, kernel_type="gauss")).clamp(0.0, 1.0)
+
+
+# Below this many voxels the guard's dense kernels are cheaper than localising them.
+# _sparse_region costs two device syncs (nonzero, then reading the extents) and those do
+# not shrink with the volume, while the work they save does. Measured on the damping mask
+# with offenders scattered worst-case: dense wins by 1.8x at 1.0M voxels and 1.03x at
+# 2.5M, sparse by 1.15x at 4.8M and above. Skipping the coarse levels matters -- they run
+# the most iterations, and paying the syncs there cost more than the finest level saved
+# (a whole run went 106.3 -> 112.6 s before this).
+_SPARSE_GUARD_MIN_VOXELS = 4_000_000
+
+
+def _fold_damping_mask_and_region(
+    jac: Tensor, floor: float | Tensor, strength: float, radius: float = 1.0
+) -> tuple[Tensor, tuple[slice, slice, slice] | None]:
+    """:func:`_fold_damping_mask`, also returning the box outside which it is zero.
+
+    The caller needs that box anyway, to know what its step changed, and deriving it
+    here is free -- asking for it separately would be a second ``nonzero`` and a second
+    sync. ``None`` means "not localised": nothing was damped, or the volume is small
+    enough that the whole of it is the answer.
+    """
+    if jac.numel() < _SPARSE_GUARD_MIN_VOXELS:
+        return _fold_damping_mask_dense(jac, floor, strength, radius), None
+    # Dilate-then-smooth reaches at most (pool radius + Gaussian radius) voxels, so
+    # everything outside a box that far from any offending voxel is identically zero.
+    # Computing it there anyway is a max_pool3d and a separable blur over the whole
+    # volume for the sake of a few hundred voxels -- 124 ms an iteration, measured.
+    reach = 2 + max(1, int(3.0 * radius + 0.5))
+    region = _sparse_region(jac < floor, reach)
+    out = torch.zeros_like(jac)
+    if region is None:
+        return out, region
+    out[region] = _fold_damping_mask_dense(jac[region], floor, strength, radius)
+    return out, region
+
+
+def _grow_region(
+    region: tuple[slice, slice, slice], pad: int, shape: torch.Size
+) -> tuple[slice, slice, slice]:
+    """Widen a box by ``pad`` on every side, clipped to the volume."""
+    z, y, x = (
+        slice(max(0, r.start - pad), min(n, r.stop + pad))
+        for r, n in zip(region, shape, strict=True)
+    )
+    return z, y, x
+
+
+def _jacobian_refreshed_in(
+    fields: Field, base: Tensor, region: tuple[slice, slice, slice]
+) -> Tensor:
+    """``base`` with ``det(J)`` recomputed inside ``region``, which must bound every change.
+
+    Reads one voxel wider than it writes, so every determinant it keeps was built from a
+    true central difference; the one-sided row that a sub-volume produces at its own edge
+    is read and discarded. Where the region already sits against a face of the volume
+    there is nothing to widen into, and the one-sided difference there is the same one
+    the full-volume call would use.
+    """
+    shape = fields[0].shape
+    read = tuple(
+        slice(max(0, r.start - 1), min(n, r.stop + 1)) for r, n in zip(region, shape, strict=True)
+    )
+    det = jacobian_determinant(*(f[read] for f in fields))
+    inner = tuple(
+        slice(r.start - d.start, r.start - d.start + (r.stop - r.start))
+        for r, d in zip(region, read, strict=True)
+    )
+    out = base.clone()
+    out[region] = det[inner]
+    return out
 
 
 def _additive_step_with_fold_guard(
@@ -935,9 +1031,22 @@ def _additive_step_with_fold_guard(
     prev_harm = harm(prev_jac)
     best_cand, best_jac, best_harm, damped = cand, jac, harm(jac), 0
     while best_harm > prev_harm and damped < config.fold_damp_rounds:
-        keep = 1.0 - _fold_damping_mask(best_jac, floor, config.fold_guard)
+        mask, damped_region = _fold_damping_mask_and_region(best_jac, floor, config.fold_guard)
+        keep = 1.0 - mask
+        # The update only changes where it was damped, so the determinant only changes
+        # within a voxel of that -- and the mask already knows where that was.
+        # Recomputing all 19.7M of them every round was 179 ms an iteration. Elastic
+        # smoothing would spread the change by its own radius, so that case keeps the
+        # whole-volume path rather than growing a second reach to get wrong.
+        region = None
+        if total_var <= 0 and damped_region is not None:
+            region = _grow_region(damped_region, 1, best_jac.shape)
         ux, uy, uz = ux * keep, uy * keep, uz * keep
-        cand, jac = _apply((ux, uy, uz))
+        if region is None:
+            cand, jac = _apply((ux, uy, uz))
+        else:
+            cand = (prev[0] + ux, prev[1] + uy, prev[2] + uz)
+            jac = _jacobian_refreshed_in(cand, jac, region)
         damped += 1
         if (this_harm := harm(jac)) < best_harm:
             best_cand, best_jac, best_harm = cand, jac, this_harm
