@@ -22,6 +22,7 @@ Key speedups vs serial version:
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -79,6 +80,23 @@ from .optimizer import (
 )
 from .penalty import compute_jacobian_energy, compute_penalty_batched, penalty_energy
 from .weight import _thd_cliplevel, compute_weight_image
+
+try:
+    from .gn_triton import gn_normal_eqs_triton
+except Exception:  # pragma: no cover - Triton is optional and CUDA-only
+    gn_normal_eqs_triton = None
+
+# Set when a fused launch actually fails on this machine (see _gn_accumulate).
+_gn_triton_unavailable = False
+
+
+def _set_gn_triton_unavailable(message: str) -> None:
+    """Latch the fused normal equations off for the rest of the process, once."""
+    global _gn_triton_unavailable
+    if not _gn_triton_unavailable:
+        _gn_triton_unavailable = True
+        print(f"** {message}")
+
 
 # Cache for torch.compile'd building-block functions (stable identity, compiled once)
 _compile_cache: dict[str, Callable[..., Any]] = {}
@@ -1743,6 +1761,30 @@ def _gn_accumulate(
     """
     d, b, v = g.shape
     ncol = d * bt.shape[1]
+
+    # The fused kernel accumulates both terms straight into the per-patch tile, so
+    # it needs no chunking at all -- the chunk only ever existed to bound the
+    # columns it does not build. That is most of its advantage at the finest
+    # levels, where bounding a 76000-patch phase drove the chunk down to a handful
+    # of voxels and the eager path paid a launch per handful.
+    if (
+        gn_normal_eqs_triton is not None
+        and not _gn_triton_unavailable
+        and g.device.type == "cuda"
+        and g.dtype == torch.float32
+        and res.dtype == torch.float32
+        and os.environ.get("FFS_GN_NO_TRITON") != "1"
+    ):
+        try:
+            return gn_normal_eqs_triton(g, hw, bt, scale, omega, res, mean_cols)
+        except AssertionError:
+            raise  # a failed assertion is a bug here, not a missing GPU capability
+        except Exception as exc:  # pragma: no cover - needs a Triton-hostile GPU
+            _set_gn_triton_unavailable(
+                f"fused Gauss-Newton normal equations unavailable "
+                f"({type(exc).__name__}: {exc}); falling back to the chunked path"
+            )
+
     build = columns_fn if columns_fn is not None else _gn_weighted_columns
     hw_col = hw.reshape(1, 1, d, 1)
     hmat = torch.zeros((b, ncol, ncol), device=g.device, dtype=torch.float32)
