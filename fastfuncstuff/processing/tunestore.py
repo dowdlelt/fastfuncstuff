@@ -1643,9 +1643,13 @@ def _format_frontier(results: list[ConfigResult]) -> str:
             row += f" {v:9.4f}" if v is not None else f" {'-':>9s}"
         lines.append(row)
     lines.append(
-        "  Walk UP from the bottom and stop where the score stops being worth the\n"
-        "  roughness. A gap of a few hundredths in score across a 10x jump in 'bend'\n"
-        "  is the ranking paying for detail that is not anatomy.\n"
+        "  This is a MAP of the trade, not a recommendation. Only folding is known to\n"
+        "  be wrong -- tissue cannot turn inside out. Bending energy is a descriptor\n"
+        "  with no established bound: nothing here has measured what deformation real\n"
+        "  anatomy needs, and warping different brains onto one template is a large-\n"
+        "  deformation problem, so a rougher field is not evidence of a worse one.\n"
+        "  To find out what is normal, score warps from tools whose output the field\n"
+        "  accepts (-diag_only -warp_suffix) and compare these columns against them.\n"
         "  Mind 'n': adaptive search screens most candidates on ONE brain, and a rank\n"
         "  moves a median of 10 places between brains, so comparing an n=1 row against\n"
         "  an n=3 row compares the subjects as much as the settings. Confirm a row you\n"
