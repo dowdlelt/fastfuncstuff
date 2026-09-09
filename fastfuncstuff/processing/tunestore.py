@@ -1185,6 +1185,20 @@ def format_holdout(store: TrialStore, metric: str | None = None) -> str:
         )
     if not rows:
         return f"Held-out fits recorded, but none scored {name}."
+
+    # The held-out subjects are a different draw of brains, so some of every
+    # config's delta is the draw and not the config. The do-nothing row measures
+    # exactly that part -- it involves no settings at all -- so it is the zero a
+    # config's delta should be read against. Without this the table invites the
+    # reader to blame a setting for a harder set of heads.
+    base = next((r for cid, r in test.items() if r.is_baseline and cid in train), None)
+    if base is not None:
+        shift = (base.abs_scores.get(name, 0.0)) - (train[base.config_id].abs_scores.get(name, 0.0))
+        lines += [
+            "",
+            f"  The baseline moved {shift:+.4f} with no settings involved: that is how much harder",
+            "  the held-out brains are. Read each config's delta against THAT, not against zero.",
+        ]
     return "\n".join(lines)
 
 
