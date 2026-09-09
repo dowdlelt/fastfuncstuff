@@ -557,10 +557,14 @@ def _build_cohort_pairs(
 
     n_pairs = None if str(args.pairs).lower() == "all" else int(args.pairs)
     train = pairwise(subjects, n_pairs, split=TRAIN)
-    # Every held-out pair, not a panel of them: this set is fit once, on a handful
-    # of configs, so there is no budget reason to sample it -- and the whole value
-    # of the number is that it is not a draw of pairs chosen to look good.
-    test = pairwise(subjects, None, split=TEST) if any(s.split == TEST for s in subjects) else []
+    # The held-out panel is a fixed round-robin decided BEFORE any of it is fit, so
+    # capping it costs nothing in honesty -- what would cost is choosing which
+    # pairs to keep after seeing them. Two offsets means every held-out subject
+    # appears twice as a base and twice as a source; the full ordered set of six
+    # subjects is thirty pairs per config, which is half an hour a finalist for a
+    # number that has already stopped moving.
+    n_test = sum(s.split == TEST for s in subjects)
+    test = pairwise(subjects, 2 * n_test, split=TEST) if n_test else []
     if verb >= 1:
         print(describe_cohort(subjects, train))
         if test:

@@ -845,6 +845,32 @@ def _incumbent(
     return configs[best]
 
 
+def _fit_bar(total: int, desc: str, verb: int):
+    """A per-fit progress bar, or None when there is nothing worth watching.
+
+    A fit on a cohort volume is tens of seconds, and the adaptive loop only
+    printed a line once a candidate had been screened -- so a run spent minutes
+    at a time showing nothing at all, which is indistinguishable from being
+    stuck. The bar is the one thing that separates those two states, and its
+    final line doubles as the timing record for the run.
+    """
+    if verb < 1 or total <= 1:
+        return None
+    try:
+        from tqdm import tqdm
+    except ImportError:  # pragma: no cover
+        return None
+    return tqdm(total=total, desc=desc, unit="fit", leave=True, file=sys.stderr)
+
+
+def _say(bar, text: str) -> None:
+    """Print without tearing the bar apart."""
+    if bar is None:
+        print(text, flush=True)
+    else:
+        bar.write(text)
+
+
 def run_adaptive(
     pairs: list[SubjectPair],
     recipe: Recipe,
@@ -934,6 +960,7 @@ def run_adaptive(
         round_no = 0
         stale = 0
         best_hv = frontier_hypervolume(prior)
+        bar = _fit_bar(plan.budget, backend, verb)
         while spent < plan.budget:
             obs = _observations(store, backend, panel)
             # Bands are recomputed every round rather than fixed at the start: they
@@ -945,9 +972,10 @@ def run_adaptive(
             if band is not None and verb >= 1:
                 held = len(in_band(obs, band))
                 k = round_no % len(bands)
-                print(
+                _say(
+                    bar,
                     f"  exploring band {k + 1}/{len(bands)} "
-                    f"(score {band[0]:+.3f}..{band[1]:+.3f}, {held} config(s) there)"
+                    f"(score {band[0]:+.3f}..{band[1]:+.3f}, {held} config(s) there)",
                 )
             batch = propose(space, obs, plan.batch, rng, band=band)
             if not batch:
@@ -956,10 +984,10 @@ def run_adaptive(
                 grown = space.grow_toward(_incumbent(obs) or {}) if plan.expand else []
                 if not grown:
                     if verb >= 1:
-                        print("  space exhausted")
+                        _say(bar, "  space exhausted")
                     break
                 if verb >= 1:
-                    print(f"  expanded: {', '.join(grown)}")
+                    _say(bar, f"  expanded: {', '.join(grown)}")
                 continue
 
             # Within a round the screening brains are held fixed, so the batch's
@@ -973,12 +1001,13 @@ def run_adaptive(
                 for pair in screen_pairs:
                     run_trial(backend, pair, config, recipe, volumes, store)
                     spent += 1
+                    if bar is not None:
+                        bar.set_postfix_str(f"screen {store.trials[-1].grade}", refresh=False)
+                        bar.update(1)
                 last = store.trials[-1]
                 if verb >= 1:
                     label = " ".join(f"{k}={v}" for k, v in sorted(config.items()))
-                    print(
-                        f"  [{spent:>3}/{plan.budget}] screen {last.grade:8s} {label}", flush=True
-                    )
+                    _say(bar, f"  [{spent:>3}/{plan.budget}] screen {last.grade:8s} {label}")
 
                 if not _promising(store, backend, panel, config):
                     continue
@@ -989,23 +1018,27 @@ def run_adaptive(
                         break
                     run_trial(backend, pair, config, recipe, volumes, store)
                     spent += 1
+                    if bar is not None:
+                        bar.set_postfix_str(f"confirm {store.trials[-1].grade}", refresh=False)
+                        bar.update(1)
                 if verb >= 1:
-                    print(
-                        f"  [{spent:>3}/{plan.budget}] confirmed on {min(plan.confirm, len(rest))}"
+                    _say(
+                        bar,
+                        f"  [{spent:>3}/{plan.budget}] confirmed on {min(plan.confirm, len(rest))}",
                     )
 
             if plan.expand:
                 incumbent = _incumbent(_observations(store, backend, panel), band) or {}
                 grown = space.grow_toward(incumbent)
                 if grown and verb >= 1:
-                    print(f"  expanded: {', '.join(grown)}")
+                    _say(bar, f"  expanded: {', '.join(grown)}")
                 # Extend where the incumbent is pinned against an end, subdivide
                 # where it sits between two rungs. Without the second the search can
                 # reach a listed value but nothing between two of them, and the gaps
                 # here are large: measured 130-290x the run-to-run noise.
                 refined = space.refine_around(incumbent)
                 if refined and verb >= 1:
-                    print(f"  refined: {', '.join(refined)}")
+                    _say(bar, f"  refined: {', '.join(refined)}")
 
             store.compute_consensus(panel)
             store.save()
@@ -1021,12 +1054,15 @@ def run_adaptive(
                 best_hv = max(best_hv, hv)
                 if stale >= plan.patience:
                     if verb >= 1:
-                        print(
+                        _say(
+                            bar,
                             f"  converged: {stale} rounds without growing the frontier "
-                            f"by {plan.tol:.0%} ({spent}/{plan.budget} fits used)"
+                            f"by {plan.tol:.0%} ({spent}/{plan.budget} fits used)",
                         )
                     break
 
+        if bar is not None:
+            bar.close()
         store.compute_consensus(panel)
         store.save()
 
@@ -1081,12 +1117,18 @@ def evaluate_holdout(
             f"\nHeld out: {len(chosen)} config(s) x {len(pairs)} pair(s) on "
             f"{len({p.base for p in pairs})} unseen subject(s)"
         )
+    bar = _fit_bar(len(chosen) * len(pairs), "held out", verb)
     for r in chosen:
         for pair in pairs:
             run_trial(r.backend, pair, r.config, recipe, volumes, store)
+            if bar is not None:
+                bar.set_postfix_str(f"cfg {r.config_id}", refresh=False)
+                bar.update(1)
         if verb >= 1:
-            print(f"  [{r.config_id:>3}] {r.backend} {r.label()}", flush=True)
+            _say(bar, f"  [{r.config_id:>3}] {r.backend} {r.label()}")
         store.save()
+    if bar is not None:
+        bar.close()
 
     store.compute_consensus(recipe.panel())
     store.save()
