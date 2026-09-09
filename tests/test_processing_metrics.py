@@ -328,3 +328,95 @@ class TestPatchWiseForms:
         base, other, w, n = self._patches()
         with pytest.raises(ValueError, match="no patch-wise form"):
             batched_patch_cost("mi", base, other, w, n, n, n)
+
+
+class TestLabelDice:
+    """The label-overlap panel: an independent referee, so it has to be exact."""
+
+    @staticmethod
+    def _blocks() -> torch.Tensor:
+        seg = torch.zeros(12, 12, 12)
+        seg[1:5, 1:5, 1:5] = 1
+        seg[6:10, 6:10, 6:10] = 2
+        seg[1:3, 6:8, 1:3] = 3
+        return seg
+
+    def test_identical_segmentations_score_one(self):
+        from fastfuncstuff.processing.metrics import label_dice
+
+        seg = self._blocks()
+        d = label_dice(seg, seg)
+        assert d.numel() == 3
+        assert torch.allclose(d, torch.ones_like(d))
+
+    def test_dice_matches_the_definition(self):
+        from fastfuncstuff.processing.metrics import label_dice
+
+        a = torch.zeros(6, 6, 6)
+        a[0:4, 0, 0] = 1  # 4 voxels
+        b = torch.zeros(6, 6, 6)
+        b[2:6, 0, 0] = 1  # 4 voxels, 2 shared
+        assert float(label_dice(a, b)[0]) == pytest.approx(2 * 2 / (4 + 4))
+
+    def test_labels_absent_from_both_are_not_scored_as_zero(self):
+        """Averaging in an undrawn parcel would punish a config for nothing."""
+        from fastfuncstuff.processing.metrics import label_dice
+
+        a = torch.zeros(6, 6, 6)
+        a[0:2, 0, 0] = 1
+        a[0:2, 1, 0] = 7  # nothing uses labels 2..6
+        d = label_dice(a, a.clone())
+        assert d.numel() == 2
+
+    def test_a_label_in_one_volume_only_scores_zero(self):
+        from fastfuncstuff.processing.metrics import label_dice
+
+        a = torch.zeros(6, 6, 6)
+        a[0:2, 0, 0] = 1
+        a[0:2, 1, 0] = 2
+        b = a.clone()
+        b[b == 2] = 0
+        d = label_dice(a, b)
+        assert float(d[0]) == pytest.approx(1.0)
+        assert float(d[1]) == pytest.approx(0.0)
+
+    def test_mean_is_over_labels_not_voxels(self):
+        """A big parcel and a small one count the same, which is the whole point."""
+        from fastfuncstuff.processing.metrics import label_dice_summary
+
+        a = torch.zeros(20, 20, 20)
+        a[0:10, :, :] = 1  # 4000 voxels
+        a[19, 0, 0:2] = 2  # 2 voxels
+        b = a.clone()
+        b[b == 2] = 0  # the small parcel is lost entirely
+        s = label_dice_summary(a, b)
+        assert s["n_labels"] == 2
+        assert s["mean"] == pytest.approx(0.5)  # voxel-weighting would give ~1.0
+
+    def test_dice_metrics_are_opt_in_to_a_panel(self):
+        from fastfuncstuff.processing.metrics import LABEL_METRICS, panel_for
+
+        assert not set(LABEL_METRICS) & set(panel_for("lpa", SAME))
+        assert set(LABEL_METRICS) <= set(panel_for("lpa", SAME, labels=True))
+
+    def test_evaluating_dice_without_labels_says_so(self):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        inp = MetricInputs(base=torch.rand(6, 6, 6), moving=torch.rand(6, 6, 6))
+        with pytest.raises(ValueError, match="segmentation"):
+            evaluate_metrics(inp, ["dice"])
+
+    def test_registry_reports_afni_convention(self):
+        """Lower is better everywhere, so a perfect overlap must score 0."""
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        seg = self._blocks()
+        inp = MetricInputs(
+            base=torch.rand(12, 12, 12),
+            moving=torch.rand(12, 12, 12),
+            base_labels=seg,
+            moving_labels=seg.clone(),
+        )
+        out = evaluate_metrics(inp, ["dice", "dice_q25"])
+        assert out["dice"] == pytest.approx(0.0)
+        assert out["dice_q25"] == pytest.approx(0.0)

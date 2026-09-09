@@ -73,6 +73,11 @@ class Metric:
     contrast: tuple[str, ...] = (SAME, CROSS)
     signed: bool = False  # rewards anti-correlation; only meaningful cross-modal
     needs_grid: bool = False  # needs a volume, not flat in-mask values
+    # Scores transported LABELS rather than intensities, so it is only
+    # available when the caller carries a segmentation for both sides. Kept
+    # out of every panel unless asked for: a run without labels cannot
+    # evaluate one, and a silent zero would look like a terrible warp.
+    needs_labels: bool = False
     differentiable: bool = False  # an optimiser can descend on it
     afni: bool = False  # part of the 3dAllineate set, evaluated via allcost
 
@@ -173,11 +178,40 @@ _EXTRA: list[Metric] = [
     ),
 ]
 
-METRICS: dict[str, Metric] = {m.name: m for m in (*_AFNI, *_EXTRA)}
+
+# Label-overlap measures. These are not image similarity at all: they score a
+# manual segmentation carried through the warp against the target's own manual
+# segmentation, so the referee is a human tracing rather than the intensities the
+# fit was driven by. That independence is the whole point -- every intensity
+# functional improves monotonically with overfit, and Dice on an independent
+# label set does not have to.
+#
+# Reported as 1 - Dice so that lower is better, like everything else here.
+_LABEL: list[Metric] = [
+    Metric(
+        "dice",
+        "labelDice",
+        "1 - mean per-label Dice of the transported segmentation",
+        "label",
+        needs_grid=True,
+        needs_labels=True,
+    ),
+    Metric(
+        "dice_q25",
+        "labelDiceQ25",
+        "1 - 25th-percentile per-label Dice (the worst quarter of parcels)",
+        "label",
+        needs_grid=True,
+        needs_labels=True,
+    ),
+]
+
+METRICS: dict[str, Metric] = {m.name: m for m in (*_AFNI, *_EXTRA, *_LABEL)}
 
 ALL_METRICS = list(METRICS)
 AFNI_METRICS = [m.name for m in _AFNI]
 GRID_METRICS = [m.name for m in _EXTRA]
+LABEL_METRICS = [m.name for m in _LABEL]
 
 
 def metric(name: str) -> Metric:
@@ -200,6 +234,7 @@ def panel_for(
     contrast: str = SAME,
     exclude: Sequence[str] = (),
     grid: bool = True,
+    labels: bool = False,
 ) -> list[str]:
     """The metrics allowed to judge a fit produced under these conditions.
 
@@ -213,6 +248,8 @@ def panel_for(
       sibling — ``lpa`` and ``lpa+`` are one number at rank correlation 1.00.
     * **Grid availability.** Neighbourhood metrics need a volume; a caller with
       only scattered in-mask values passes ``grid=False`` and gets the rest.
+    * **Labels.** The overlap measures need a segmentation on both sides, which
+      most runs do not have, so they are opt-in rather than filtered out.
     """
     if contrast not in CONTRAST_REGIMES:
         raise ValueError(f"contrast must be one of {CONTRAST_REGIMES}, got {contrast!r}")
@@ -225,7 +262,10 @@ def panel_for(
     panel = [
         n
         for n, m in METRICS.items()
-        if n not in drop and m.usable_for(contrast) and (grid or not m.needs_grid)
+        if n not in drop
+        and m.usable_for(contrast)
+        and (grid or not m.needs_grid)
+        and (labels or not m.needs_labels)
     ]
     if not panel:
         raise ValueError(
@@ -400,6 +440,58 @@ def mind_cost(
     return (w * diff).sum() / w.sum().clamp(min=_EPS)
 
 
+def label_dice(base_labels: Tensor, moving_labels: Tensor) -> Tensor:
+    """Per-label Dice for two integer label volumes already on a common grid.
+
+    Background (0) is dropped, and so is any label absent from *both* volumes --
+    an unscorable label is not a Dice of zero, and averaging one in would punish
+    a config for a parcel nobody drew. A label present in one volume and not the
+    other legitimately scores 0.
+
+    Three ``bincount`` passes rather than a per-label loop or a one-hot stack:
+    on a 256x300x256 cohort volume the one-hot form is 33 x 19.7 M elements, and
+    the loop is 33 full passes over the volume for arithmetic that is three.
+    """
+    if base_labels.shape != moving_labels.shape:
+        raise ValueError(
+            f"label volumes must share a grid: {tuple(base_labels.shape)} vs "
+            f"{tuple(moving_labels.shape)}"
+        )
+    a = base_labels.reshape(-1).round().long()
+    b = moving_labels.reshape(-1).round().long()
+    if a.numel() and (int(a.min()) < 0 or int(b.min()) < 0):
+        raise ValueError("label volumes must be non-negative integers")
+    n = int(max(int(a.max()), int(b.max()))) + 1 if a.numel() else 1
+
+    inter = torch.bincount(a[a == b], minlength=n)[:n].double()
+    na = torch.bincount(a, minlength=n)[:n].double()
+    nb = torch.bincount(b, minlength=n)[:n].double()
+
+    denom = (na + nb)[1:]
+    dice = 2.0 * inter[1:] / denom.clamp(min=1.0)
+    return dice[denom > 0]
+
+
+def label_dice_summary(base_labels: Tensor, moving_labels: Tensor) -> dict[str, float]:
+    """Mean and 25th-percentile Dice, the two numbers a label panel is read on.
+
+    The mean is deliberately over *labels* and not over voxels: on this kind of
+    parcellation the largest three parcels hold several times the voxels of the
+    smallest, so a voxel-weighted mean lets them decide the ranking on their own.
+    The quartile is the robustness axis -- it catches the config that wins on
+    average by wrecking a few regions -- and it costs nothing once the per-label
+    vector exists.
+    """
+    d = label_dice(base_labels, moving_labels)
+    if d.numel() == 0:
+        return {"mean": 0.0, "q25": 0.0, "n_labels": 0}
+    return {
+        "mean": float(d.mean()),
+        "q25": float(torch.quantile(d.float(), 0.25)),
+        "n_labels": int(d.numel()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # One evaluation surface
 # ---------------------------------------------------------------------------
@@ -418,6 +510,11 @@ class MetricInputs:
     base: Tensor  # (nz, ny, nx)
     moving: Tensor  # (nz, ny, nx), already resampled onto the base grid
     weight: Tensor | None = None  # (nz, ny, nx)
+    # Integer segmentations on the same grid, for the label-overlap measures.
+    # ``moving_labels`` must have been carried through the SAME transform that
+    # produced ``moving`` -- see tunewarp.Referee.transport_labels.
+    base_labels: Tensor | None = None
+    moving_labels: Tensor | None = None
     voxdims: tuple[float, float, float] = (1.0, 1.0, 1.0)
     overlap: float | None = None
     cc_radius: int = 4
@@ -475,6 +572,19 @@ def _grid_metric(name: str, inp: MetricInputs) -> Tensor:
         return ngf_volume_cost(inp.base, inp.moving, inp.weight, inp.ngf_eta)
     if name in ("mind", "mindssc"):
         return mind_cost(inp.base, inp.moving, inp.weight, inp.mind_radius, ssc=(name == "mindssc"))
+    if name in ("dice", "dice_q25"):
+        if inp.base_labels is None or inp.moving_labels is None:
+            raise ValueError(
+                f"{name} needs base_labels and moving_labels; this run carries no "
+                "segmentation, so the label panel cannot be scored"
+            )
+        # dice and dice_q25 are two readings of one per-label vector, and both are
+        # normally asked for together, so the vector is computed once per call.
+        summary = inp.extra.get("_dice_summary")
+        if summary is None:
+            summary = label_dice_summary(inp.base_labels, inp.moving_labels)
+            inp.extra["_dice_summary"] = summary
+        return torch.tensor(1.0 - summary["mean" if name == "dice" else "q25"])
     raise ValueError(f"no grid implementation for {name!r}")
 
 
@@ -529,6 +639,7 @@ __all__ = [
     "CONTRAST_REGIMES",
     "CROSS",
     "GRID_METRICS",
+    "LABEL_METRICS",
     "METRICS",
     "SAME",
     "Metric",
@@ -538,6 +649,8 @@ __all__ = [
     "differentiable_cost",
     "differentiable_metrics",
     "evaluate_metrics",
+    "label_dice",
+    "label_dice_summary",
     "metric",
     "mind_cost",
     "mind_descriptor",
