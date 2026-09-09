@@ -799,6 +799,7 @@ def run_group_trial(
     levels: list[dict] = []
     intensity = [n for n in recipe.scored() if not METRICS[n].group]
     per_subject: dict[str, list[float]] = {}
+    worst: list[dict] = []
     cmd: list[str] = []
     spent = 0
 
@@ -842,14 +843,29 @@ def run_group_trial(
         if GRADE_ORDER.get(one["grade"], 3) > GRADE_ORDER.get(grade, 3):
             grade = one["grade"]
             reasons = [f"{pair.name}: {r}" for r in one.get("reasons", [])]
-            qc = one.get("warpqc", {})
         cautions += [c for c in one.get("cautions", []) if c not in cautions]
+        # Keep the regularity record of the subject closest to failing, not of the
+        # first one whose GRADE got worse -- when nothing folds, no grade ever gets
+        # worse and the qc was silently never recorded at all. That left every
+        # group row reporting bend 0 and jacmin 1, which blanks the frontier, the
+        # Pareto marking and the roughness half of the surrogate's objective.
+        if one.get("margin", UNCONSTRAINED_MARGIN) <= margin:
+            qc = dict(one.get("warpqc", {}))
         margin = min(margin, one.get("margin", UNCONSTRAINED_MARGIN))
         clearance = min(clearance, one.get("gate_margin", UNCONSTRAINED_MARGIN))
+        worst.append(one.get("warpqc", {}))
         if referee.device.type == "cuda":
             torch.cuda.empty_cache()
 
     scores = {k: statistics.fmean(v) for k, v in per_subject.items() if v}
+    # The two numbers the table ranks roughness on are taken across the WHOLE
+    # cohort rather than from one subject: a config is as rough as its roughest
+    # brain and squashes as hard as its most compressed one, and those need not be
+    # the same subject.
+    rough = [w for w in worst if w]
+    if rough:
+        qc["bending_energy"] = max(float(w.get("bending_energy", 0.0)) for w in rough)
+        qc["jac_min"] = min(float(w.get("jac_min", 1.0)) for w in rough)
     if len(segs) >= 2:
         summary = cross_subject_dice(segs)
         scores["xdice"] = 1.0 - summary["mean"]

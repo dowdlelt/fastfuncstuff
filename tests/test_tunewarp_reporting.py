@@ -721,3 +721,75 @@ def test_a_four_dimensional_input_takes_the_first_volume(tmp_path):
     ref = Referee(str(path), torch.device("cpu"))
     assert tuple(ref.base.shape) == (11, 10, 9)
     assert np.allclose(ref.base.numpy(), data[..., 0].transpose(2, 1, 0))
+
+
+def test_a_group_row_keeps_the_cohorts_worst_regularity(tmp_path):
+    """Bug of record: the group scorer only stored warpqc when a subject's GRADE
+    got worse, so a run where nothing folded recorded none at all -- every row
+    reported bend 0 and jacmin 1, which blanks the frontier, the Pareto marking
+    and the roughness half of the surrogate's objective."""
+    import torch
+
+    from fastfuncstuff.processing.tunespec import RECIPES
+    from fastfuncstuff.processing.tunestore import COHORT, TrialStore
+    from fastfuncstuff.processing.tunewarp import SubjectPair, run_group_trial
+
+    qcs = [
+        {"bending_energy": 0.001, "jac_min": 0.40},
+        {"bending_energy": 0.009, "jac_min": 0.30},  # roughest
+        {"bending_energy": 0.004, "jac_min": 0.05},  # most compressed
+    ]
+
+    class _Ref:
+        device = torch.device("cpu")
+        voxdims = (1.0, 1.0, 1.0)
+        base = torch.zeros(4, 4, 4)
+
+        def __init__(self, qc):
+            self._qc = qc
+
+        def score(self, *a, **k):
+            return {
+                "scores": {"lncc": -0.5},
+                "grade": "pass",
+                "reasons": [],
+                "cautions": [],
+                "warpqc": self._qc,
+                "margin": 1.0,
+                "gate_margin": 1.0,
+            }
+
+    class _Vols:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.i = -1
+
+        def referee(self, pair):
+            self.i += 1
+            return _Ref(qcs[self.i])
+
+        def source(self, pair):
+            return torch.zeros(4, 4, 4)
+
+        def source_labels(self, pair):
+            return None
+
+        def source_affine(self, pair):
+            return None
+
+    import fastfuncstuff.processing.tunewarp as tw
+
+    original = tw.DRIVERS["qwarp"]
+    tw.DRIVERS["qwarp"] = lambda b, s, c, r, d: (torch.zeros(4, 4, 4), None, [])
+    try:
+        store = TrialStore(tmp_path / "t.json")
+        pairs = [SubjectPair(f"s{i}", "tpl", f"s{i}.nii") for i in range(3)]
+        run_group_trial("qwarp", pairs, {}, RECIPES["common_T1"], _Vols(), store)
+    finally:
+        tw.DRIVERS["qwarp"] = original
+
+    row = store.trials[-1]
+    assert row.subject == COHORT
+    assert row.warpqc["bending_energy"] == pytest.approx(0.009)  # roughest subject
+    assert row.warpqc["jac_min"] == pytest.approx(0.05)  # most compressed subject

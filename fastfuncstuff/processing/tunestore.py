@@ -1193,9 +1193,17 @@ def format_holdout(store: TrialStore, metric: str | None = None) -> str:
     if not name:
         return "Held-out fits recorded, but no absolute metric in common to compare."
 
-    n_test = len({t.subject for t in store.trials if t.split == "test"})
+    # A group row is one whole cohort, so counting distinct subject names would
+    # report "1 unseen pair" for a six-subject held-out set.
+    group_rows = [t for t in store.trials if t.split == "test" and t.subject == COHORT]
+    if group_rows:
+        n_test = max(int(t.warpqc.get("n_pairs", 0)) for t in group_rows)
+        unit = "unseen pair(s) among the held-out cohort"
+    else:
+        n_test = len({t.subject for t in store.trials if t.split == "test"})
+        unit = "unseen pair(s)"
     lines = [
-        f"Held-out check ({label}, lower is better; {n_test} unseen pair(s))",
+        f"Held-out check ({label}, lower is better; {n_test} {unit})",
         "",
         f"  {'id':>4s} {'backend':16s} {'train':>9s} {'held out':>9s} {'delta':>8s} "
         f"{'grade':9s} settings",
