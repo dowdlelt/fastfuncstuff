@@ -4144,7 +4144,13 @@ def add_recipe_arg(parser, backend: str) -> None:
     )
 
 
-def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb: int = 1) -> None:
+def apply_recipe_preset(
+    args,
+    backend: str,
+    argv: list[str] | None = None,
+    verb: int = 1,
+    image: str | None = None,
+) -> None:
     """Push a ``-type`` preset onto ``args``, without overriding explicit flags.
 
     Explicit-wins is the whole contract, and it cannot be decided by comparing a
@@ -4152,6 +4158,13 @@ def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb:
     would be silently overridden by the preset. So it is decided by whether the
     flag appears in argv, which is the only thing that actually distinguishes
     "asked for" from "not mentioned".
+
+    ``image`` is any volume on the grid the tool is about to work on. A preset's
+    smoothing and patch sizes are stored in millimetres precisely so that they
+    transfer between resolutions, which means they have to be divided by THIS
+    data's voxel size before they become flags. Without it the preset silently
+    reverts to "the numbers as measured at 1 mm", which is the old behaviour and
+    wrong for anything else.
     """
     import sys
 
@@ -4172,7 +4185,7 @@ def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb:
 
     typed = {tok.lstrip("-").replace("-", "_") for tok in (sys.argv[1:] if argv is None else argv)}
     applied, skipped = {}, []
-    for dest, value in preset_config_for_cli(recipe, backend).items():
+    for dest, value in preset_config_for_cli(recipe, backend, _preset_voxdims(image)).items():
         if dest in typed:
             skipped.append(dest)
             continue
@@ -4190,6 +4203,25 @@ def apply_recipe_preset(args, backend: str, argv: list[str] | None = None, verb:
         print(f"  measured on: {preset.provenance}", file=sys.stderr)
         if preset.caveat:
             print(f"  caveat: {preset.caveat}", file=sys.stderr)
+
+
+def _preset_voxdims(image: str | None) -> tuple[float, float, float] | None:
+    """This dataset's voxel size, read from the header alone, or None if unreadable.
+
+    Never raises: a preset that cannot be scaled should fall back to its
+    as-measured values with the rest of the run intact, not abort the tool over a
+    convenience feature.
+    """
+    if not image:
+        return None
+    try:
+        from fastfuncstuff.io.headers import parse_subbrick_selector, read_nifti_header
+
+        clean, _ = parse_subbrick_selector(str(image))
+        zooms = read_nifti_header(clean).get_zooms()[:3]
+        return (float(zooms[0]), float(zooms[1]), float(zooms[2]))
+    except Exception:  # noqa: BLE001 - any header problem means "unknown"
+        return None
 
 
 # ---------------------------------------------------------------------------

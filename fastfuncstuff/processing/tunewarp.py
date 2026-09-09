@@ -47,6 +47,7 @@ from .tunespec import (
     BACKENDS,
     QWARP_TUNE_OPTIMIZER,
     Recipe,
+    config_in_voxel_units,
     fixed_for,
     qwarp_cost_for,
     render_command,
@@ -571,14 +572,20 @@ def run_trial(
     # The neighbourhood metrics are far more expensive than the AFNI functionals,
     # and scoring one that is barred from voting AND unread buys nothing.
     prefix = f"{backend}_c{store.config_id(backend, config):04d}.nii.gz"
-    cmd = render_command(backend, pair.base, pair.source, prefix, config, recipe)
     referee = volumes.referee(pair)
     source = volumes.source(pair)
+    # `config` is in millimetres, which is what the table, the surrogate and any
+    # preset speak; the engines count in voxels. The conversion happens here and
+    # in the rendered command, and nowhere else.
+    engine_config = config_in_voxel_units(backend, config, referee.voxdims)
+    cmd = render_command(
+        backend, pair.base, pair.source, prefix, config, recipe, voxdims=referee.voxdims
+    )
 
     t0 = time.time()
     try:
         warped, field, levels = DRIVERS[backend](
-            referee.base, source, config, recipe, referee.device
+            referee.base, source, engine_config, recipe, referee.device
         )
         moving_labels = None
         seg = volumes.source_labels(pair)

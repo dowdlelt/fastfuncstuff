@@ -614,7 +614,13 @@ def parse_args(
     args = p.parse_args(argv, namespace or argparse.Namespace())
     # After parsing, so that "did the user type this flag" is answerable from argv
     # rather than guessed by comparing values against defaults.
-    apply_recipe_preset(args, _PRESET_BACKEND, argv, verb=getattr(args, "verb", 1))
+    apply_recipe_preset(
+        args,
+        _PRESET_BACKEND,
+        argv,
+        verb=getattr(args, "verb", 1),
+        image=getattr(args, "base", None),
+    )
     return args
 
 

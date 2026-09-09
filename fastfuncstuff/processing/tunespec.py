@@ -83,6 +83,28 @@ class ParamSpec:
     # as the best level with "100% of subjects agree", which was the other knobs'
     # effect wearing a dead knob's name.
     resolution: float | None = None
+    # Physical units the listed values are in. "" is dimensionless (a penalty
+    # weight, an iteration count, a fraction) and passes through untouched; "mm"
+    # means the ladder, the trial table and any Preset are all in MILLIMETRES
+    # while the backend's own field is in voxels, so the value is divided by the
+    # voxel size at the two edges -- the library call and the printed command.
+    #
+    # This is what makes a tuning study transferable. Every smoothing sigma, patch
+    # size and step cap in these engines is counted in voxels, so a ladder learned
+    # at 1 mm asks a different question at 0.7 mm: `minpatch 13` is a 13 mm patch
+    # on one dataset and a 9.1 mm patch on the other, and only one of those can be
+    # the anatomical scale the finding was about. Tuning in millimetres asserts the
+    # optimum is a property of the anatomy rather than of the matrix, which is the
+    # assumption worth making and the one worth being able to falsify.
+    units: str = ""
+    # A legality constraint of the backend, in ITS units, applied after conversion.
+    # Separate from `bounds` (which constrains the search in the listed units)
+    # because this one is not a judgement about where to look: below AFNI's
+    # 5-voxel patch the basis has more parameters than the patch has voxels.
+    voxel_floor: float | None = None
+    # "odd" rounds a converted value to the nearest odd integer -- a patch size
+    # has a centre voxel, so 12 is not a patch size at any resolution.
+    quantize: str = ""
 
     @property
     def config_attr(self) -> str:
@@ -162,9 +184,14 @@ QWARP = BackendSpec(
             "0.274, trading image match for regularity (lncc -0.677 at 13, -0.634 at "
             "5). Stopping anywhere in 19..9 failed on 15 of 15 fits; 25 and 5 passed "
             "on 15 of 15. Run the fine levels or stop above them, never between. "
-            "Floored at AFNI's 5; below that the patch has fewer voxels than the "
-            "basis has parameters.",
-            bounds=(5, None),
+            "Floored at AFNI's 5 VOXELS; below that the patch has fewer voxels "
+            "than the basis has parameters. Listed and searched in mm, so the "
+            "measured levels above -- taken at 1 mm, where the two coincide -- "
+            "carry to other resolutions as the physical scale they were about.",
+            bounds=(5.0, None),
+            units="mm",
+            voxel_floor=5,
+            quantize="odd",
         ),
         ParamSpec(
             "qwarp.workhard",
@@ -202,8 +229,9 @@ FORMWARP = BackendSpec(
             (0.0, 0.5, 1.0, 2.0, 3.0),
             0.0,
             "regularization",
-            "Elastic (total-field) smoothing. Off by default, per ANTs.",
+            "Elastic (total-field) smoothing, in mm. Off by default, per ANTs.",
             resolution=GAUSS_SIGMA_RESOLUTION,
+            units="mm",
         ),
         ParamSpec(
             "formwarp.update_var",
@@ -211,8 +239,9 @@ FORMWARP = BackendSpec(
             (1.0, 2.0, 3.0, 4.0),
             3.0,
             "regularization",
-            "Fluid (update-field) smoothing.",
+            "Fluid (update-field) smoothing, in mm.",
             resolution=GAUSS_SIGMA_RESOLUTION,
+            units="mm",
         ),
         ParamSpec(
             "formwarp.grad_step",
@@ -220,7 +249,8 @@ FORMWARP = BackendSpec(
             (0.1, 0.25, 0.5),
             0.25,
             "effort",
-            "Per-iteration step size, in voxels.",
+            "Per-iteration step size, in mm.",
+            units="mm",
         ),
         ParamSpec(
             "formwarp.iters",
@@ -273,8 +303,10 @@ _OW_SHARED = (
         "regularization",
         "Elastic (total-field) smoothing. On T1->MNI, 0.0 and 0.5 fold on every "
         "subject and 1.0 is the lowest that does not -- i.e. the default is "
-        "already the best legal value, and lower merely scores better by folding.",
+        "already the best legal value, and lower merely scores better by folding. "
+        "In mm.",
         resolution=GAUSS_SIGMA_RESOLUTION,
+        units="mm",
     ),
     ParamSpec(
         "optiwarp.update_sigma",
@@ -282,8 +314,9 @@ _OW_SHARED = (
         (0.5, 1.0, 2.0),
         1.0,
         "regularization",
-        "Fluid (update-field) smoothing.",
+        "Fluid (update-field) smoothing, in mm.",
         resolution=GAUSS_SIGMA_RESOLUTION,
+        units="mm",
     ),
     ParamSpec(
         "optiwarp.match",
@@ -334,7 +367,8 @@ _OW_SHARED = (
         (0.5, 1.0, 2.0),
         1.0,
         "effort",
-        "Cap on the per-iteration displacement, in voxels.",
+        "Cap on the per-iteration displacement, in mm.",
+        units="mm",
     ),
 )
 
@@ -712,7 +746,9 @@ def preset_for(recipe: str, backend: str) -> Preset | None:
     return PRESETS.get((recipe, backend))
 
 
-def preset_config_for_cli(recipe: str, backend: str) -> dict[str, Any]:
+def preset_config_for_cli(
+    recipe: str, backend: str, voxdims: tuple[float, float, float] | None = None
+) -> dict[str, Any]:
     """A preset as ``{cli_dest: value}``, ready to push onto parsed arguments.
 
     Keyed by the CLI's own attribute name rather than the ParamSpec key, because
@@ -734,7 +770,7 @@ def preset_config_for_cli(recipe: str, backend: str) -> dict[str, Any]:
         if param.fmt == "x" and isinstance(value, (list, tuple)):
             out[param.flag.lstrip("-")] = "x".join(f"{v:g}" for v in value)
         else:
-            out[param.flag.lstrip("-")] = value
+            out[param.flag.lstrip("-")] = to_voxel_units(param, value, voxdims)
     return out
 
 
@@ -834,6 +870,63 @@ def resolve_tunable(recipe: Recipe, backend: str) -> list[ParamSpec]:
     return [p for p in spec.params if p.key in wanted]
 
 
+# ---------------------------------------------------------------------------
+# Physical units
+# ---------------------------------------------------------------------------
+#
+# The search, the trial table and the presets all speak millimetres; the engines
+# all speak voxels. Everything crossing that line goes through here, so there is
+# exactly one place where a study at 0.7 mm and a study at 1 mm are reconciled.
+
+
+def voxel_scale(voxdims: tuple[float, float, float] | None) -> float:
+    """One number for "how big is a voxel", for knobs that are isotropic in them.
+
+    The geometric mean, because these knobs -- a cubic patch size, a spherical
+    Gaussian sigma, a displacement magnitude -- act on a volume rather than along
+    an axis, and the geometric mean is the edge of the cube of equal volume. On
+    the near-isotropic anatomicals this is aimed at, every reasonable choice
+    agrees to within a percent; it matters only if someone tunes on 2 mm-thick
+    slices, where no single number is honest and the mean is at least the one
+    whose error is symmetric.
+
+    ``None`` means "not known", and yields 1.0 -- mm and voxels then coincide,
+    which is exactly the old behaviour and the right fallback for a caller that
+    has no image in hand.
+    """
+    if not voxdims:
+        return 1.0
+    dx, dy, dz = (abs(float(v)) for v in voxdims[:3])
+    if min(dx, dy, dz) <= 0:
+        return 1.0
+    return (dx * dy * dz) ** (1.0 / 3.0)
+
+
+def to_voxel_units(param: ParamSpec, value: Any, voxdims: tuple[float, float, float] | None) -> Any:
+    """One parameter value, converted from what the table stores to what the engine takes."""
+    if param.units != "mm" or not isinstance(value, (int, float)) or isinstance(value, bool):
+        return value
+    out = float(value) / voxel_scale(voxdims)
+    if param.voxel_floor is not None and out > 0:
+        out = max(out, float(param.voxel_floor))
+    if param.quantize == "odd":
+        n = int(round(out))
+        if n % 2 == 0:
+            n += 1
+        if param.voxel_floor is not None:
+            n = max(n, int(param.voxel_floor))
+        return n
+    return out
+
+
+def config_in_voxel_units(
+    backend: str, config: dict[str, Any], voxdims: tuple[float, float, float] | None
+) -> dict[str, Any]:
+    """A whole config translated out of millimetres, ready for the backend."""
+    spec = BACKENDS[backend]
+    return {k: to_voxel_units(spec.param(k), v, voxdims) for k, v in config.items()}
+
+
 def render_command(
     backend: str,
     base: str,
@@ -842,12 +935,16 @@ def render_command(
     config: dict[str, Any],
     recipe: Recipe | None = None,
     save_warp: bool = True,
+    voxdims: tuple[float, float, float] | None = None,
 ) -> list[str]:
     """Build the full command line for one trial.
 
     The same function produces the command that is *run* and the command that is
     *reported*, so what the user pastes to reproduce a trial is the thing that
-    actually ran — not a reconstruction of it.
+    actually ran — not a reconstruction of it. That is why ``voxdims`` is here:
+    the table stores millimetres and the CLI flags take voxels, so a command
+    printed without the conversion would be a *different* fit at any resolution
+    but 1 mm.
     """
     spec = BACKENDS[backend]
     cmd = [spec.command, "-base", base, "-source", source, "-prefix", prefix]
@@ -855,7 +952,7 @@ def render_command(
     if recipe is not None and spec.metric_flag:
         cmd += [spec.metric_flag, _metric_for(spec, recipe)]
     for key in sorted(config):
-        cmd += spec.param(key).render(config[key])
+        cmd += spec.param(key).render(to_voxel_units(spec.param(key), config[key], voxdims))
     if save_warp:
         cmd.append(spec.warp_flag)
     return cmd

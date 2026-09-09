@@ -115,6 +115,11 @@ class RunMeta:
     voxdims: tuple[float, ...] = ()
     n_mask_voxels: int = 0
     note: str = ""
+    # What the recorded `config` values mean. The default is the OLD answer on
+    # purpose: a stored run that predates physical units has no such key, and
+    # loading it must not claim it was recorded in millimetres. Live runs stamp
+    # "mm" explicitly at begin_run().
+    param_units: str = "voxel"
 
     def __post_init__(self) -> None:
         # JSON has no tuples, so a round trip returns lists. Coerced here so a
@@ -220,6 +225,12 @@ def comparability_warnings(runs: list[RunMeta]) -> list[str]:
                 f"run {prev.run_id} was judged by a different panel "
                 f"({len(prev.panel)} vs {len(latest.panel)} metrics); consensus ranks "
                 "from the two are measuring different things."
+            )
+        if prev.param_units != latest.param_units:
+            out.append(
+                f"run {prev.run_id} recorded its settings in {prev.param_units}s and this "
+                f"one in {latest.param_units}s. The two agree only at 1 mm; at any other "
+                "resolution the same number names a different amount of smoothing."
             )
         if prev.optimize and prev.optimize != latest.optimize:
             out.append(f"run {prev.run_id} optimised {prev.optimize}, this one {latest.optimize}.")
@@ -442,6 +453,7 @@ class TrialStore:
         the normal way this gets used, and the whole point of keeping the earlier
         run's metadata is to be able to say how it differed.
         """
+        kw.setdefault("param_units", "mm")
         meta = capture_run_meta(len(self.runs) + 1, **kw)
         self.runs.append(meta)
         return meta

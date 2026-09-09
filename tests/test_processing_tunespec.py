@@ -607,3 +607,83 @@ class TestPresets:
         text = describe_presets("optiwarp_demons")
         assert "MNI_T1" in text
         assert "measured on" in text, "the provenance must reach the user, not just the code"
+
+
+class TestPhysicalUnits:
+    """A tuning study is only worth having if it transfers to the next dataset.
+
+    Every smoothing sigma, patch size and step cap in these engines is counted in
+    voxels, so a ladder learned at 1 mm asks a different question at 0.7 mm. The
+    table stores millimetres; only the engine and the printed command see voxels.
+    """
+
+    def test_voxel_scale_is_the_geometric_mean(self):
+        from fastfuncstuff.processing.tunespec import voxel_scale
+
+        assert voxel_scale((0.7, 0.7, 0.7)) == pytest.approx(0.7)
+        assert voxel_scale((1.0, 2.0, 4.0)) == pytest.approx(2.0)
+        assert voxel_scale(None) == 1.0
+        assert voxel_scale((0.0, 1.0, 1.0)) == 1.0  # unusable header, not a crash
+
+    def test_the_same_mm_setting_is_a_different_voxel_count(self):
+        from fastfuncstuff.processing.tunespec import config_in_voxel_units
+
+        cfg = {"minpatch": 13.0}
+        assert config_in_voxel_units("qwarp", cfg, (1.0, 1.0, 1.0))["minpatch"] == 13
+        assert config_in_voxel_units("qwarp", cfg, (0.7, 0.7, 0.7))["minpatch"] == 19
+
+    def test_dimensionless_knobs_pass_through(self):
+        from fastfuncstuff.processing.tunespec import config_in_voxel_units
+
+        cfg = {"penfac": 0.033, "hfactor_q": 0.5, "workhard": (0, 2)}
+        assert config_in_voxel_units("qwarp", cfg, (0.5, 0.5, 0.5)) == cfg
+
+    def test_patch_size_stays_an_odd_integer_above_afnis_floor(self):
+        """Below 5 voxels the basis has more parameters than the patch has voxels,
+        and a patch with no centre voxel is not a patch at any resolution."""
+        from fastfuncstuff.processing.tunespec import config_in_voxel_units
+
+        out = config_in_voxel_units("qwarp", {"minpatch": 1.0}, (1.0, 1.0, 1.0))
+        assert out["minpatch"] == 5
+        for mm in (5.0, 7.0, 9.0, 13.0, 25.0):
+            n = config_in_voxel_units("qwarp", {"minpatch": mm}, (0.9, 0.9, 0.9))["minpatch"]
+            assert n % 2 == 1 and n >= 5, (mm, n)
+
+    def test_smoothing_sigmas_are_millimetres(self):
+        from fastfuncstuff.processing.tunespec import config_in_voxel_units
+
+        out = config_in_voxel_units("formwarp", {"total_var": 3.0, "update_var": 1.5}, (2.0,) * 3)
+        assert out["total_var"] == pytest.approx(1.5)
+        assert out["update_var"] == pytest.approx(0.75)
+
+    def test_zero_smoothing_stays_off(self):
+        """0 mm means "no smoothing", which must not be floored into some."""
+        from fastfuncstuff.processing.tunespec import config_in_voxel_units
+
+        assert config_in_voxel_units("formwarp", {"total_var": 0.0}, (0.5,) * 3)["total_var"] == 0.0
+
+    def test_rendered_command_carries_the_voxel_value(self):
+        """What is pasted must be the fit that ran, not the table's own units."""
+        from fastfuncstuff.processing.tunespec import render_command
+
+        cmd = render_command(
+            "qwarp", "b.nii", "s.nii", "o.nii", {"minpatch": 13.0}, voxdims=(0.7, 0.7, 0.7)
+        )
+        assert cmd[cmd.index("-minpatch") + 1] == "19"
+
+    def test_presets_are_scaled_to_the_data_they_are_applied_to(self):
+        from fastfuncstuff.processing.tunespec import preset_config_for_cli
+
+        one = preset_config_for_cli("MNI_T1", "optiwarp_demons", (1.0, 1.0, 1.0))
+        fine = preset_config_for_cli("MNI_T1", "optiwarp_demons", (0.5, 0.5, 0.5))
+        assert fine["total_sigma"] == pytest.approx(2 * one["total_sigma"])
+
+    def test_every_scale_dependent_knob_is_declared(self):
+        """The failure mode is silence: an undeclared voxel knob simply does not
+        transfer, and nothing in the table says so."""
+        from fastfuncstuff.processing.tunespec import BACKENDS
+
+        for backend, spec in BACKENDS.items():
+            for p in spec.params:
+                if "voxel" in p.help.lower():
+                    assert p.units == "mm", f"{backend}.{p.key} still described in voxels"
