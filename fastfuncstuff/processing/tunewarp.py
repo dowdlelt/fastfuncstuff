@@ -1537,6 +1537,208 @@ def _promising(store: TrialStore, backend: str, panel: list[str], config: dict) 
     return statistics.fmean([o.score for o in mine]) <= feasible[len(feasible) // 2]
 
 
+def group_diagnostics(
+    pairs: list[SubjectPair],
+    recipe: Recipe,
+    config: dict[str, Any],
+    backend: str,
+    out_dir: Path,
+    device: torch.device | None = None,
+    save_subject_labels: bool = False,
+    verb: int = 1,
+) -> list[Path]:
+    """Re-fit one config on the cohort and write everything behind its score.
+
+    The table says a setting agrees better; this says *where*, and is what makes
+    the claim checkable by looking rather than by trusting a mean. Written:
+
+    ``overlap_prob.nii.gz`` -- 4-D, one frame per label, each voxel the fraction
+    of the cohort placing that parcel there. This is the AFNI overlap-probability
+    picture: bright in the core of a region and fading at its edge, and the width
+    of that fade is the registration's real error bar.
+
+    ``agreement.nii.gz`` and ``consensus_labels.nii.gz`` -- the same stack reduced
+    to how much the cohort agrees at each voxel, and to which parcel wins there.
+
+    ``per_label.tsv`` / ``per_pair.tsv`` / ``per_subject.tsv`` -- the numbers, so a
+    finding can be read off rather than eyeballed. Per-label carries how many
+    subjects *have* each label, which is what separates a parcel the tracers left
+    out from one the warp misplaced.
+    """
+    from .metrics import cross_subject_detail, label_overlap_stack
+
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    volumes = CohortVolumes.open(pairs, device)
+
+    segs: list[torch.Tensor] = []
+    names: list[str] = []
+    rows: list[dict] = []
+    header = None
+    bar = _fit_bar(len(pairs), "diagnostics", verb)
+    for pair in pairs:
+        referee = volumes.referee(pair)
+        header = referee.header
+        t0 = time.time()
+        warped, field, _ = DRIVERS[backend](
+            referee.base,
+            volumes.source(pair),
+            config_in_voxel_units(backend, config, referee.voxdims),
+            recipe,
+            referee.device,
+        )
+        one = referee.score(warped, field, [])
+        seg = volumes.source_labels(pair)
+        if seg is not None and field is not None:
+            segs.append(
+                referee.transport_labels_through(seg, field, volumes.source_affine(pair)).to(
+                    torch.uint8
+                )
+            )
+            names.append(pair.name)
+        rows.append(
+            {
+                "subject": pair.name,
+                "grade": one["grade"],
+                "bend": float(one["warpqc"].get("bending_energy", 0.0)),
+                "jacmin": float(one["warpqc"].get("jac_min", 1.0)),
+                "seconds": time.time() - t0,
+            }
+        )
+        del warped, field
+        if bar is not None:
+            bar.update(1)
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    if bar is not None:
+        bar.close()
+
+    if len(segs) < 2:
+        raise ValueError("diagnostics need at least two transported segmentations")
+
+    detail = cross_subject_detail(segs, names)
+    labels = detail["labels"]
+    written: list[Path] = []
+
+    stack = label_overlap_stack(segs, labels)
+    written.append(
+        _save(stack, out_dir / "overlap_prob.nii.gz", header, [f"label{k}" for k in labels])
+    )
+    written.append(_save(stack.max(dim=0).values, out_dir / "agreement.nii.gz", header))
+    # argmax over a stack that is zero everywhere outside any parcel would name
+    # label 1 for the whole background, so the winner is masked to where somebody
+    # actually drew something.
+    winner = torch.tensor(labels, dtype=torch.float32)[stack.argmax(dim=0)]
+    written.append(
+        _save(winner * (stack.max(dim=0).values > 0), out_dir / "consensus_labels.nii.gz", header)
+    )
+    if save_subject_labels:
+        for seg, name in zip(segs, names, strict=True):
+            written.append(_save(seg.float(), out_dir / f"labels_{name}.nii.gz", header))
+
+    written.append(_write_label_table(out_dir / "per_label.tsv", detail, stack, len(segs)))
+    written.append(_write_pair_table(out_dir / "per_pair.tsv", detail))
+    written.append(_write_subject_table(out_dir / "per_subject.tsv", rows, detail, names))
+    del segs, stack
+    return written
+
+
+def _save(vol: torch.Tensor, path: Path, header, brick_labels: list[str] | None = None) -> Path:
+    save_image(vol.detach().cpu(), str(path), header_info=header, brick_labels=brick_labels)
+    return path
+
+
+def _write_label_table(path: Path, detail: dict, stack: torch.Tensor, n_subj: int) -> Path:
+    per_pair = detail["per_pair_label"]
+    vols = detail["volumes"]
+    lines = [
+        "\t".join(
+            [
+                "label",
+                "n_present",
+                "dice_mean",
+                "dice_min",
+                "dice_max",
+                "vol_mean_vox",
+                "vol_cv",
+                "vox_full_overlap",
+                "vox_half_overlap",
+                "peak_overlap",
+            ]
+        )
+    ]
+    for k, lab in enumerate(detail["labels"]):
+        col = per_pair[:, k]
+        col = col[~torch.isnan(col)]
+        v = vols[:, k]
+        v = v[v > 0]
+        frame = stack[k]
+        lines.append(
+            "\t".join(
+                [
+                    str(lab),
+                    str(int(detail["present"][k])),
+                    f"{float(col.mean()):.4f}" if col.numel() else "nan",
+                    f"{float(col.min()):.4f}" if col.numel() else "nan",
+                    f"{float(col.max()):.4f}" if col.numel() else "nan",
+                    f"{float(v.mean()):.0f}" if v.numel() else "0",
+                    f"{float(v.std() / v.mean()):.3f}" if v.numel() > 1 else "0",
+                    str(int((frame >= 0.999).sum())),
+                    str(int((frame >= 0.5).sum())),
+                    f"{float(frame.max()):.3f}",
+                ]
+            )
+        )
+    lines.append(f"# {n_subj} subjects; dice is per-label, averaged over subject PAIRS")
+    lines.append("# n_present: subjects carrying the label at all -- a low count means")
+    lines.append("#   the tracers left it out, not that the warp misplaced it")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _write_pair_table(path: Path, detail: dict) -> Path:
+    per_pair = detail["per_pair_label"]
+    lines = ["\t".join(["subject_a", "subject_b", "dice_mean", "dice_q25"])]
+    for i, (a, b) in enumerate(detail["pairs"]):
+        row = per_pair[i]
+        row = row[~torch.isnan(row)]
+        if row.numel() == 0:
+            continue
+        lines.append(
+            f"{a}\t{b}\t{float(row.mean()):.4f}\t{float(torch.quantile(row.float(), 0.25)):.4f}"
+        )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _write_subject_table(path: Path, rows: list[dict], detail: dict, names: list[str]) -> Path:
+    """Each subject's mean agreement with the rest, beside its own warp quality.
+
+    The column that earns its place is `dice_vs_others`: a cohort mean hides the
+    one brain that is simply different, and that brain is usually the reason a
+    setting looks worse than it is.
+    """
+    per_pair, pairs = detail["per_pair_label"], detail["pairs"]
+    mine: dict[str, list[float]] = {n: [] for n in names}
+    for i, (a, b) in enumerate(pairs):
+        row = per_pair[i]
+        row = row[~torch.isnan(row)]
+        if row.numel() == 0:
+            continue
+        mine[a].append(float(row.mean()))
+        mine[b].append(float(row.mean()))
+    lines = ["\t".join(["subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"])]
+    for r in rows:
+        vals = mine.get(r["subject"], [])
+        avg = f"{statistics.fmean(vals):.4f}" if vals else "nan"
+        lines.append(
+            f"{r['subject']}\t{avg}\t{r['grade']}\t{r['bend']:.5f}\t"
+            f"{r['jacmin']:.4f}\t{r['seconds']:.1f}"
+        )
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
 def reproduce(
     store: TrialStore,
     config_id: int,

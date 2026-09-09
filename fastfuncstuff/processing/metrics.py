@@ -514,6 +514,73 @@ def label_dice_summary(base_labels: Tensor, moving_labels: Tensor) -> dict[str, 
     }
 
 
+def cross_subject_detail(segs: Sequence[Tensor], names: Sequence[str] | None = None) -> dict:
+    """Every number behind :func:`cross_subject_dice`, for a diagnostic table.
+
+    The summary answers "how well does this cohort agree"; this answers "where
+    does it not". Returns the label ids actually drawn, the per-label Dice
+    averaged over pairs, the full pair-by-label matrix, and how many subjects
+    carry each label -- the last is what makes a missing parcel legible as
+    missing rather than as a region everybody got wrong.
+    """
+    n = len(segs)
+    if n < 2:
+        raise ValueError(f"cross-subject agreement needs at least 2 subjects, got {n}")
+    tags = list(names) if names is not None else [str(i) for i in range(n)]
+
+    n_lab = max(int(s.max()) for s in segs) + 1
+    counts = [torch.bincount(s.reshape(-1).long(), minlength=n_lab)[:n_lab].double() for s in segs]
+    present = torch.stack([c > 0 for c in counts]).sum(0)  # subjects carrying each label
+
+    pairs, rows = [], []
+    for i in range(n):
+        a = segs[i].reshape(-1).long()
+        for j in range(i + 1, n):
+            b = segs[j].reshape(-1).long()
+            joint = torch.bincount(a * n_lab + b, minlength=n_lab * n_lab)
+            inter = joint[: n_lab * n_lab].reshape(n_lab, n_lab).diagonal().double()
+            denom = counts[i] + counts[j]
+            rows.append(torch.where(denom > 0, 2.0 * inter / denom.clamp(min=1.0), torch.nan))
+            pairs.append((tags[i], tags[j]))
+            del b, joint, inter
+        del a
+
+    matrix = torch.stack(rows)  # (n_pairs, n_lab)
+    labels = [k for k in range(1, n_lab) if int(present[k]) > 0]
+    idx = torch.tensor(labels, device=matrix.device)
+    return {
+        "labels": labels,
+        "pairs": pairs,
+        "per_pair_label": matrix[:, idx],  # (n_pairs, n_labels)
+        "per_label": torch.nanmean(matrix[:, idx], dim=0),
+        "present": present[idx],
+        "volumes": torch.stack([c[idx] for c in counts]),  # (n_subjects, n_labels)
+    }
+
+
+def label_overlap_stack(segs: Sequence[Tensor], labels: Sequence[int]) -> Tensor:
+    """(n_labels, nz, ny, nx) fraction of the cohort placing each label at each voxel.
+
+    The AFNI overlap-probability picture, one frame per parcel. 1.0 means every
+    subject that *has* this label put it here.
+
+    The denominator is the number of subjects carrying the label at all, not the
+    cohort size, so a parcel nobody traced in four subjects is not reported as a
+    region the other twelve got wrong. That distinction is the whole reason a
+    per-label stack beats a single agreement map.
+    """
+    counts = torch.zeros((len(labels),) + tuple(segs[0].shape), dtype=torch.float32)
+    for k, lab in enumerate(labels):
+        present = 0
+        for seg in segs:
+            hit = seg == lab
+            if bool(hit.any()):
+                present += 1
+                counts[k] += hit.float().cpu()
+        counts[k] /= max(present, 1)
+    return counts
+
+
 def cross_subject_dice(segs: Sequence[Tensor]) -> dict[str, float]:
     """Label agreement among a whole cohort warped into one common space.
 
@@ -756,7 +823,9 @@ __all__ = [
     "differentiable_cost",
     "differentiable_metrics",
     "evaluate_metrics",
+    "cross_subject_detail",
     "cross_subject_dice",
+    "label_overlap_stack",
     "label_dice",
     "label_dice_summary",
     "metric",

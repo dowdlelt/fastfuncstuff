@@ -109,6 +109,7 @@ from fastfuncstuff.processing.tunewarp import (
     affine_align,
     enumerate_configs,
     evaluate_holdout,
+    group_diagnostics,
     reproduce,
     run_adaptive,
     run_search,
@@ -340,6 +341,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="N",
         help="Re-run config N and KEEP its outputs, so they can be looked at",
+    )
+    act.add_argument(
+        "-diagnostics",
+        "-diag",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Common-space runs: re-fit config N on the cohort and write everything "
+        "behind its score into {out}/diag/configN/ -- a 4D overlap-probability "
+        "volume with one frame per label (the AFNI-style picture: bright in a "
+        "parcel's core, fading at its edge, and the width of that fade is the "
+        "registration's real error bar), the agreement and consensus-label maps, "
+        "and per-label / per-pair / per-subject tables. Use it on the winner.",
+    )
+    act.add_argument(
+        "-save_subject_labels",
+        "-save-subject-labels",
+        action="store_true",
+        help="With -diagnostics, also write each subject's transported segmentation",
     )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
     act.add_argument(
@@ -712,6 +732,41 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n" + format_holdout(store))
         if args.plot is not None:
             _write_plot(store, args.plot or out / "frontier.png", args.recipe)
+        return 0
+
+    if args.diagnostics is not None:
+        if not args.recipe:
+            raise SystemExit("-diagnostics needs -type, since it re-runs a fit")
+        recipe = with_overrides(RECIPES[args.recipe], parse_fix(args.fix or []), args.tune)
+        if not recipe.group:
+            raise SystemExit(
+                f"-diagnostics is for common-space recipes; -type {recipe.name} scores "
+                "one pair at a time, so use -reproduce to keep its outputs instead."
+            )
+        row = next((r for r in store.results(split=None) if r.config_id == args.diagnostics), None)
+        if row is None:
+            raise SystemExit(f"no config {args.diagnostics} in {store.path}")
+        pairs, held_out = _build_cohort_pairs(args, len(store.runs), args.verb, group=True)
+        device = setup_device(args.device, tf32=REGISTRATION_TF32)
+        if args.allineate:
+            pairs = affine_align(pairs, recipe, out, device=device, verb=args.verb)
+            if held_out:
+                held_out = affine_align(held_out, recipe, out, device=device, verb=args.verb)
+        target = out / "diag" / f"config{args.diagnostics:04d}"
+        print(f"\nConfig {args.diagnostics}: {row.backend} {row.label()}")
+        written = group_diagnostics(
+            pairs + held_out,
+            recipe,
+            row.config,
+            row.backend,
+            target,
+            device=device,
+            save_subject_labels=args.save_subject_labels,
+            verb=args.verb,
+        )
+        print(f"\nWrote {len(written)} file(s) to {target}")
+        for w in written:
+            print(f"  {w.name}")
         return 0
 
     if args.reproduce is not None:

@@ -420,3 +420,87 @@ class TestLabelDice:
         out = evaluate_metrics(inp, ["dice", "dice_q25"])
         assert out["dice"] == pytest.approx(0.0)
         assert out["dice_q25"] == pytest.approx(0.0)
+
+
+class TestCrossSubjectAgreement:
+    """Common-space scoring: agreement among a cohort, and where it fails."""
+
+    @staticmethod
+    def _cohort():
+        a = torch.zeros(8, 8, 8)
+        a[1:5, 1:5, 1:5] = 1
+        a[6:8, 6:8, 6:8] = 2
+        b = a.clone()
+        b[1, 1, 1] = 0
+        c = a.clone()
+        c[c == 2] = 0  # this tracer did not draw label 2
+        return [a, b, c]
+
+    def test_identical_cohort_agrees_perfectly(self):
+        from fastfuncstuff.processing.metrics import cross_subject_dice
+
+        a = self._cohort()[0]
+        out = cross_subject_dice([a, a.clone(), a.clone()])
+        assert out["mean"] == pytest.approx(1.0)
+        assert out["n_pairs"] == 3
+
+    def test_every_unordered_pair_is_counted_once(self):
+        from fastfuncstuff.processing.metrics import cross_subject_dice
+
+        segs = self._cohort()
+        assert cross_subject_dice(segs)["n_pairs"] == 3
+        assert cross_subject_dice(segs + [segs[0].clone()])["n_pairs"] == 6
+
+    def test_a_cohort_of_one_is_not_a_cohort(self):
+        from fastfuncstuff.processing.metrics import cross_subject_dice
+
+        with pytest.raises(ValueError, match="at least 2"):
+            cross_subject_dice([self._cohort()[0]])
+
+    def test_mismatched_grids_are_refused(self):
+        from fastfuncstuff.processing.metrics import cross_subject_dice
+
+        with pytest.raises(ValueError, match="common-space grid"):
+            cross_subject_dice([torch.zeros(4, 4, 4), torch.zeros(4, 4, 5)])
+
+    def test_a_missing_parcel_is_visible_as_missing(self):
+        """The distinction the table exists for: a label the tracers left out
+        must not read as a region the warp misplaced."""
+        from fastfuncstuff.processing.metrics import cross_subject_detail
+
+        d = cross_subject_detail(self._cohort(), ["s1", "s2", "s3"])
+        assert d["labels"] == [1, 2]
+        assert [int(x) for x in d["present"]] == [3, 2]  # only 2 subjects drew label 2
+        assert float(d["per_label"][0]) > 0.99  # label 1 agrees
+        assert float(d["per_label"][1]) < 0.4  # label 2 depressed by the absence
+
+    def test_detail_reports_every_pair_by_every_label(self):
+        from fastfuncstuff.processing.metrics import cross_subject_detail
+
+        d = cross_subject_detail(self._cohort(), ["s1", "s2", "s3"])
+        assert d["per_pair_label"].shape == (3, 2)
+        assert d["pairs"] == [("s1", "s2"), ("s1", "s3"), ("s2", "s3")]
+        assert d["volumes"].shape == (3, 2)
+
+    def test_overlap_stack_is_one_frame_per_label(self):
+        from fastfuncstuff.processing.metrics import label_overlap_stack
+
+        segs = self._cohort()
+        stack = label_overlap_stack(segs, [1, 2])
+        assert stack.shape == (2, 8, 8, 8)
+        assert float(stack[0, 2, 2, 2]) == pytest.approx(1.0)  # all three agree here
+        assert float(stack[0, 1, 1, 1]) == pytest.approx(2 / 3)  # s2 dropped this voxel
+
+    def test_overlap_denominator_excludes_subjects_lacking_the_label(self):
+        """Otherwise a parcel two of three subjects drew perfectly reads as 0.67."""
+        from fastfuncstuff.processing.metrics import label_overlap_stack
+
+        stack = label_overlap_stack(self._cohort(), [1, 2])
+        assert float(stack[1, 7, 7, 7]) == pytest.approx(1.0)
+
+    def test_group_metrics_have_no_per_trial_value(self):
+        from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
+
+        inp = MetricInputs(base=torch.rand(4, 4, 4), moving=torch.rand(4, 4, 4))
+        with pytest.raises(ValueError, match="whole-cohort"):
+            evaluate_metrics(inp, ["xdice"])
