@@ -32,7 +32,7 @@ import torch
 from .allineate import _voxdims_from_header
 from .io import load_image, save_image
 from .mask import automask
-from .metrics import MetricInputs, evaluate_metrics
+from .metrics import METRICS, MetricInputs, cross_subject_dice, evaluate_metrics
 from .tuneopt import (
     Observation,
     SearchSpace,
@@ -53,7 +53,7 @@ from .tunespec import (
     render_command,
     resolve_tunable,
 )
-from .tunestore import BASELINE, TrialStore
+from .tunestore import BASELINE, COHORT, GRADE_ORDER, TrialStore
 from .warpqc import (
     FAIL,
     FAILED_MARGIN,
@@ -87,6 +87,10 @@ class SubjectPair:
     # ones read separately -- a config's score on data that helped choose it is
     # not evidence that it transfers.
     split: str = "train"
+    # Path to the affine that put `source` on the base grid, when one was run.
+    # Kept so a segmentation can go from its NATIVE grid to the base in a single
+    # gather, rather than through the affine and then the field.
+    source_affine: str | None = None
 
     @property
     def has_labels(self) -> bool:
@@ -183,7 +187,10 @@ class Referee:
         self.device = device
         self.base, self.header = load_image(base_path, device=device)
         if self.base.ndim == 4:
-            self.base = self.base[..., 0]
+            # load_image returns 4D as (nt, nz, ny, nx), so the first VOLUME is
+            # [0]. `[..., 0]` takes an x-slice and quietly hands the rest of the
+            # tool a stack of slices shaped like a volume.
+            self.base = self.base[0]
         self.voxdims = _voxdims_from_header(self.header)
         self.weight = compute_weight_image(
             self.base,
@@ -197,7 +204,7 @@ class Referee:
         if labels_path is not None:
             seg, _ = load_image(labels_path, device=device)
             if seg.ndim == 4:
-                seg = seg[..., 0]
+                seg = seg[0]
             if tuple(seg.shape) != tuple(self.base.shape):
                 raise ValueError(
                     f"segmentation {labels_path} is {tuple(seg.shape)} but its base is "
@@ -268,6 +275,55 @@ class Referee:
         if tuple(field_shape) != expected:
             raise ValueError(f"qwarp field shape {tuple(field_shape)} != planned {expected}")
         return (px0, py0, pz0)
+
+    def transport_labels_through(
+        self, labels: torch.Tensor, field: tuple, affine: torch.Tensor | None
+    ) -> torch.Tensor:
+        """Carry a NATIVE segmentation to the base grid through affine then field.
+
+        One gather, from the source's own voxels. The field says where each base
+        voxel came from in the affine-aligned volume; the affine says where that
+        location is in the source's native grid. Composing the two coordinates and
+        sampling once is the only way to avoid paying nearest-neighbour boundary
+        loss twice -- and that loss is the same order as the differences between
+        the configs being ranked, so it is not a rounding detail.
+
+        ``affine is None`` means the pair was already on a common grid (a cohort
+        like NIREP), and this reduces to the field alone.
+        """
+        if affine is None:
+            return self.transport_labels(labels, field)
+
+        from .interp import nearest_resample_3d
+
+        xd, yd, zd = field
+        lower = self._lower_padding(tuple(xd.shape))
+        kk, jj, ii = torch.meshgrid(
+            torch.arange(xd.shape[0], dtype=torch.float32, device=xd.device),
+            torch.arange(xd.shape[1], dtype=torch.float32, device=xd.device),
+            torch.arange(xd.shape[2], dtype=torch.float32, device=xd.device),
+            indexing="ij",
+        )
+        # A padded field is indexed from the padded origin, so undo the shift
+        # before handing coordinates to a matrix that speaks base voxels.
+        if lower is not None:
+            px0, py0, pz0 = lower
+            ii, jj, kk = ii - px0, jj - py0, kk - pz0
+        x, y, z = ii + xd, jj + yd, kk + zd
+        del ii, jj, kk
+
+        m = affine.to(x.device, torch.float32)
+        xs = m[0, 0] * x + m[0, 1] * y + m[0, 2] * z + m[0, 3]
+        ys = m[1, 0] * x + m[1, 1] * y + m[1, 2] * z + m[1, 3]
+        zs = m[2, 0] * x + m[2, 1] * y + m[2, 2] * z + m[2, 3]
+        del x, y, z
+        out = nearest_resample_3d(labels, xs, ys, zs).round()
+        del xs, ys, zs
+        if lower is None:
+            return out
+        from .warp import _crop_padding
+
+        return _crop_padding(out, self.qwarp_padding, tuple(self.brain.shape))
 
     def transport_labels(self, labels: torch.Tensor, field: tuple) -> torch.Tensor:
         """Carry a segmentation through a trial's field, nearest-neighbour.
@@ -345,6 +401,49 @@ class Referee:
         }
 
 
+def _score_group_baseline(
+    pairs: list[SubjectPair],
+    recipe: Recipe,
+    store: TrialStore,
+    volumes: CohortVolumes,
+) -> None:
+    """Cross-subject agreement with the affine alone, as the row to beat.
+
+    The number every config has to improve on. Without it the table says which
+    settings won but not whether the nonlinear step bought anything at all, and
+    on a template that is exactly the question -- a lot of cross-subject overlap
+    is already there from the affine.
+    """
+    intensity = [n for n in recipe.scored() if not METRICS[n].group]
+    segs, per_subject = [], {}
+    for pair in pairs:
+        referee = volumes.referee(pair)
+        source = volumes.source(pair)
+        seg = volumes.source_labels(pair)
+        if seg is not None:
+            # No field, so the labels arrive by the affine alone -- which for a
+            # pair already on a common grid means untouched.
+            segs.append(_affine_only_labels(referee, seg, volumes.source_affine(pair)))
+        for k, v in referee.score(source, None, intensity)["scores"].items():
+            per_subject.setdefault(k, []).append(v)
+
+    scores = {k: statistics.fmean(v) for k, v in per_subject.items() if v}
+    if len(segs) >= 2:
+        summary = cross_subject_dice(segs)
+        scores["xdice"] = 1.0 - summary["mean"]
+        scores["xdice_q25"] = 1.0 - summary["q25"]
+    del segs
+    store.add(BASELINE, COHORT, {}, [], seconds=0.0, split=pairs[0].split, scores=scores)
+
+
+def _affine_only_labels(
+    referee: Referee, labels: torch.Tensor, affine: torch.Tensor | None
+) -> torch.Tensor:
+    """The source segmentation on the base grid with no nonlinear warp."""
+    zero = torch.zeros(referee.brain.shape, device=labels.device)
+    return referee.transport_labels_through(labels, (zero, zero, zero), affine).to(torch.uint8)
+
+
 class CohortVolumes:
     """Everything the trials read, loaded once and kept resident a few at a time.
 
@@ -368,6 +467,7 @@ class CohortVolumes:
         self._referees: dict[str, Referee] = {}
         self._sources: dict[str, torch.Tensor] = {}
         self._labels: dict[str, torch.Tensor] = {}
+        self._affines: dict[str, torch.Tensor] = {}
         self._live_referees: list[str] = []  # LRU order, oldest first
         self._live_volumes: list[tuple[dict, str]] = []
 
@@ -403,12 +503,22 @@ class CohortVolumes:
             return None
         return self._volume(self._labels, pair.source_labels, integer=True)
 
+    def source_affine(self, pair: SubjectPair) -> torch.Tensor | None:
+        """The cached base->source matrix, or None when the pair shares a grid."""
+        if pair.source_affine is None:
+            return None
+        m = self._affines.get(pair.source_affine)
+        if m is None:
+            m = torch.from_numpy(np.loadtxt(pair.source_affine).reshape(4, 4)).float()
+            self._affines[pair.source_affine] = m
+        return m
+
     def _volume(self, store: dict, path: str, integer: bool = False) -> torch.Tensor:
         vol = store.get(path)
         if vol is None:
             loaded, _ = load_image(path)
             if loaded.ndim == 4:
-                loaded = loaded[..., 0]
+                loaded = loaded[0]
             vol = loaded.round() if integer else loaded
             store[path] = vol
         if vol.device != self.device:
@@ -509,30 +619,57 @@ def affine_align(
 
     out: list[SubjectPair] = []
     for pair in pairs:
-        dst = cache / f"{pair.name.replace('/', '_')}.nii.gz"
-        if dst.exists():
+        stem = pair.name.replace("/", "_")
+        dst = cache / f"{stem}.nii.gz"
+        mat_path = cache / f"{stem}.aff12.1D"
+        if dst.exists() and mat_path.exists():
             if verb >= 1:
                 print(f"  {pair.name}: affine cached", flush=True)
-            out.append(SubjectPair(pair.name, pair.base, str(dst)))
+            out.append(_affine_pair(pair, dst, mat_path))
             continue
 
         base, base_header = load_image(pair.base, device=device)
         source, source_header = load_image(pair.source, device=device)
         if base.ndim == 4:
-            base = base[..., 0]
+            base = base[0]
         if source.ndim == 4:
-            source = source[..., 0]
+            source = source[0]
         cfg = AffineAlignConfig(cost=recipe.optimize, device=str(device), verb=0)
         t0 = time.time()
-        _, warped = run_allineate(base, source, cfg, base_header, source_header)
+        matrix, warped = run_allineate(base, source, cfg, base_header, source_header)
         save_image(warped, str(dst), header_info=base_header)
+        # The matrix, not just the resampled image. A segmentation must reach the
+        # base grid in ONE nearest-neighbour gather -- through the affine and the
+        # trial's field composed -- because NN twice loses about a voxel of label
+        # boundary each time, and that is the same order as the differences
+        # between the configs being ranked. Composing needs the matrix.
+        np.savetxt(mat_path, np.asarray(matrix.detach().cpu(), dtype=float).reshape(4, 4))
         if verb >= 1:
             print(f"  {pair.name}: affine {time.time() - t0:.1f}s -> {dst.name}", flush=True)
-        out.append(SubjectPair(pair.name, pair.base, str(dst)))
+        out.append(_affine_pair(pair, dst, mat_path))
         del base, source, warped
         if device.type == "cuda":
             torch.cuda.empty_cache()
     return out
+
+
+def _affine_pair(pair: SubjectPair, dst: Path, mat_path: Path) -> SubjectPair:
+    """The pair rewritten to use the cached aligned image, keeping NATIVE labels.
+
+    The labels deliberately do not follow the image through the affine. They stay
+    on the source's own grid and are carried across in one gather at scoring time,
+    which is the whole point of saving the matrix.
+    """
+    aligned = SubjectPair(
+        pair.name,
+        pair.base,
+        str(dst),
+        pair.base_labels,
+        pair.source_labels,
+        pair.split,
+    )
+    aligned.source_affine = str(mat_path)
+    return aligned
 
 
 def enumerate_configs(
@@ -595,7 +732,9 @@ def run_trial(
         moving_labels = None
         seg = volumes.source_labels(pair)
         if seg is not None and field is not None:
-            moving_labels = referee.transport_labels(seg, field)
+            moving_labels = referee.transport_labels_through(
+                seg, field, volumes.source_affine(pair)
+            )
         outcome = referee.score(warped, field, recipe.scored(), moving_labels)
         outcome["levels"] = [lv.as_dict() for lv in levels]
         del warped, field, moving_labels
@@ -614,6 +753,120 @@ def run_trial(
         torch.cuda.empty_cache()
 
 
+def run_group_trial(
+    backend: str,
+    pairs: list[SubjectPair],
+    config: dict[str, Any],
+    recipe: Recipe,
+    volumes: CohortVolumes,
+    store: TrialStore,
+    bar=None,
+) -> int:
+    """Warp the whole cohort into the common space with one config, score the set.
+
+    Cross-subject agreement is a property of the *cohort*, not of any one fit, so
+    unlike :func:`run_trial` this cannot record a number until every subject has
+    been warped. That makes the search's atom N fits rather than one, and is why
+    the screen/confirm structure does not apply here: there is no partial answer
+    to screen on. Returns the fits spent.
+
+    One row is written per config rather than one per subject. The per-subject
+    facts that still matter -- did any of them fold, how long did they take -- are
+    aggregated the way ConfigResult already aggregates across subjects: the grade
+    is the WORST grade, because a setting that folds on one brain in ten is not a
+    setting that works, and the reason names which brain.
+
+    The transported segmentations are the only thing kept between fits. At sixteen
+    subjects on a 1 mm template that is ~150 MB as uint8, against dropping the
+    warped images and the fields as usual.
+    """
+    prefix = f"{backend}_c{store.config_id(backend, config):04d}.nii.gz"
+    segs: list[torch.Tensor] = []
+    grade, reasons, cautions, qc = "pass", [], [], {}
+    margin = clearance = UNCONSTRAINED_MARGIN
+    seconds = 0.0
+    levels: list[dict] = []
+    intensity = [n for n in recipe.scored() if not METRICS[n].group]
+    per_subject: dict[str, list[float]] = {}
+    cmd: list[str] = []
+    spent = 0
+
+    for pair in pairs:
+        referee = volumes.referee(pair)
+        engine_config = config_in_voxel_units(backend, config, referee.voxdims)
+        if not cmd:
+            cmd = render_command(
+                backend, pair.base, pair.source, prefix, config, recipe, voxdims=referee.voxdims
+            )
+        t0 = time.time()
+        try:
+            warped, field, lv = DRIVERS[backend](
+                referee.base, volumes.source(pair), engine_config, recipe, referee.device
+            )
+            seg = volumes.source_labels(pair)
+            if seg is not None and field is not None:
+                segs.append(
+                    referee.transport_labels_through(seg, field, volumes.source_affine(pair)).to(
+                        torch.uint8
+                    )
+                )
+            one: dict[str, Any] = referee.score(warped, field, intensity)
+            levels = [x.as_dict() for x in lv]
+            del warped, field
+        except (RuntimeError, ValueError) as exc:
+            one = {
+                "grade": FAIL,
+                "reasons": [f"{pair.name}: {type(exc).__name__}: {exc}"[:300]],
+                "margin": FAILED_MARGIN,
+                "scores": {},
+            }
+        seconds += time.time() - t0
+        spent += 1
+        if bar is not None:
+            bar.set_postfix_str(f"{pair.name} {one['grade']}", refresh=False)
+            bar.update(1)
+
+        for k, v in one.get("scores", {}).items():
+            per_subject.setdefault(k, []).append(v)
+        if GRADE_ORDER.get(one["grade"], 3) > GRADE_ORDER.get(grade, 3):
+            grade = one["grade"]
+            reasons = [f"{pair.name}: {r}" for r in one.get("reasons", [])]
+            qc = one.get("warpqc", {})
+        cautions += [c for c in one.get("cautions", []) if c not in cautions]
+        margin = min(margin, one.get("margin", UNCONSTRAINED_MARGIN))
+        clearance = min(clearance, one.get("gate_margin", UNCONSTRAINED_MARGIN))
+        if referee.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    scores = {k: statistics.fmean(v) for k, v in per_subject.items() if v}
+    if len(segs) >= 2:
+        summary = cross_subject_dice(segs)
+        scores["xdice"] = 1.0 - summary["mean"]
+        scores["xdice_q25"] = 1.0 - summary["q25"]
+        qc = {**qc, "n_labels": summary["n_labels"], "n_pairs": summary["n_pairs"]}
+    del segs
+    if volumes.device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    store.add(
+        backend,
+        COHORT,
+        config,
+        cmd,
+        seconds=seconds,
+        split=pairs[0].split,
+        scores=scores,
+        grade=grade,
+        reasons=reasons,
+        cautions=cautions,
+        warpqc=qc,
+        margin=margin,
+        gate_margin=clearance,
+        levels=levels,
+    )
+    return spent
+
+
 def score_baseline(
     pairs: list[SubjectPair],
     recipe: Recipe,
@@ -627,6 +880,9 @@ def score_baseline(
     the statement a recommendation is actually made of. Cheap: one scoring pass per
     subject, no fit.
     """
+    if recipe.group:
+        _score_group_baseline(pairs, recipe, store, volumes)
+        return
     scored = recipe.scored()
     for pair in pairs:
         referee = volumes.referee(pair)
@@ -998,6 +1254,21 @@ def run_adaptive(
             for config in batch:
                 if spent >= plan.budget:
                     break
+                label = " ".join(f"{k}={v}" for k, v in sorted(config.items()))
+
+                # A group recipe has no partial answer to screen on: cross-subject
+                # agreement only exists once the whole cohort is in the common
+                # space. So the atom is N fits, and screen/confirm do not apply.
+                if recipe.group:
+                    spent += run_group_trial(backend, pairs, config, recipe, volumes, store, bar)
+                    if verb >= 1:
+                        _say(
+                            bar,
+                            f"  [{spent:>3}/{plan.budget}] cohort "
+                            f"{store.trials[-1].grade:8s} {label}",
+                        )
+                    continue
+
                 for pair in screen_pairs:
                     run_trial(backend, pair, config, recipe, volumes, store)
                     spent += 1
@@ -1006,7 +1277,6 @@ def run_adaptive(
                         bar.update(1)
                 last = store.trials[-1]
                 if verb >= 1:
-                    label = " ".join(f"{k}={v}" for k, v in sorted(config.items()))
                     _say(bar, f"  [{spent:>3}/{plan.budget}] screen {last.grade:8s} {label}")
 
                 if not _promising(store, backend, panel, config):
@@ -1111,14 +1381,20 @@ def evaluate_holdout(
     volumes = CohortVolumes.open(pairs, device)
     done = {(t.config_id, t.subject) for t in store.trials if t.split == "test"}
     baselined = {t.subject for t in store.trials if t.backend == BASELINE and t.split == "test"}
-    fresh = [p for p in pairs if p.name not in baselined]
-    if fresh:
-        score_baseline(fresh, recipe, store, volumes)
+    if recipe.group:
+        if COHORT not in baselined:
+            score_baseline(pairs, recipe, store, volumes)
+    else:
+        fresh = [p for p in pairs if p.name not in baselined]
+        if fresh:
+            score_baseline(fresh, recipe, store, volumes)
 
     # Resuming is the normal case for a tuning directory, and a held-out fit is
     # the most expensive kind here -- every finalist against every held-out pair.
     # Repeating one buys nothing: the config, the pair and the engine are all the
     # same, so it would record the number that is already in the table.
+    if recipe.group:
+        return _holdout_group(pairs, recipe, store, chosen, volumes, verb)
     todo = [(r, p) for r in chosen for p in pairs if (r.config_id, p.name) not in done]
     already = len(chosen) * len(pairs) - len(todo)
     if verb >= 1:
@@ -1142,6 +1418,44 @@ def evaluate_holdout(
     if bar is not None:
         bar.close()
 
+    store.compute_consensus(recipe.panel())
+    store.save()
+    return [r.config_id for r in chosen]
+
+
+def _holdout_group(
+    pairs: list[SubjectPair],
+    recipe: Recipe,
+    store: TrialStore,
+    chosen: list,
+    volumes: CohortVolumes,
+    verb: int,
+) -> list[int]:
+    """The finalists re-run on the held-out subjects, scored among themselves.
+
+    The held-out cohort is scored as its own set, never pooled with the training
+    one: agreement between a training brain and a held-out brain would be partly
+    in-sample, and the number this table exists to give is the one that is not.
+    """
+    todo = [
+        r
+        for r in chosen
+        if (r.config_id, COHORT)
+        not in {(t.config_id, t.subject) for t in store.trials if t.split == "test"}
+    ]
+    if verb >= 1:
+        print(
+            f"\nHeld out: {len(todo)} config(s) x {len(pairs)} unseen subject(s)"
+            + (f" ({len(chosen) - len(todo)} already recorded)" if len(chosen) > len(todo) else "")
+        )
+    bar = _fit_bar(len(todo) * len(pairs), "held out", verb)
+    for r in todo:
+        run_group_trial(r.backend, pairs, r.config, recipe, volumes, store, bar)
+        if verb >= 1:
+            _say(bar, f"  [{r.config_id:>3}] {r.backend} {r.label()}")
+        store.save()
+    if bar is not None:
+        bar.close()
     store.compute_consensus(recipe.panel())
     store.save()
     return [r.config_id for r in chosen]

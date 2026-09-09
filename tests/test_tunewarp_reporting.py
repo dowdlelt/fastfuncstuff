@@ -699,3 +699,25 @@ class TestBands:
         rows[-1].grade = "fail"
         out = format_bands(rows, 5)
         assert " 99 " not in out, out
+
+
+def test_a_four_dimensional_input_takes_the_first_volume(tmp_path):
+    """load_image returns 4D as (nt, nz, ny, nx), so `[..., 0]` is an x-slice.
+
+    Bug of record: every entry point in the tuner sliced the wrong axis, which
+    does not raise -- it hands the engines a stack of slices shaped like a
+    volume, and the fit proceeds and reports numbers.
+    """
+    import nibabel as nib
+    import numpy as np
+    import torch
+
+    from fastfuncstuff.processing.tunewarp import Referee
+
+    data = np.random.default_rng(0).random((9, 10, 11, 4)).astype(np.float32)
+    path = tmp_path / "series.nii.gz"
+    nib.save(nib.Nifti1Image(data, np.eye(4)), path)
+
+    ref = Referee(str(path), torch.device("cpu"))
+    assert tuple(ref.base.shape) == (11, 10, 9)
+    assert np.allclose(ref.base.numpy(), data[..., 0].transpose(2, 1, 0))

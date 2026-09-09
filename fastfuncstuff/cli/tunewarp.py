@@ -556,12 +556,37 @@ def subject_names(paths: list[str]) -> list[str]:
     return [f"{s}#{i}" for i, s in enumerate(stems)]
 
 
+def _template_pairs(subjects, base: str, split: str, verb: int = 1) -> list[SubjectPair]:
+    """One pair per subject, all against the same template."""
+    side = [s for s in subjects if s.split == split]
+    if verb >= 1:
+        print(f"  {len(side)} {split} subject(s) -> {base}")
+    return [SubjectPair(s.name, base, s.image, None, s.labels, s.split) for s in side]
+
+
 def _build_cohort_pairs(
-    args: argparse.Namespace, n_run: int = 0, verb: int = 1
+    args: argparse.Namespace, n_run: int = 0, verb: int = 1, group: bool = False
 ) -> tuple[list[SubjectPair], list[SubjectPair]]:
     """Discover a labelled cohort and split it into training and held-out pairs."""
     subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix)
     subjects = split_subjects(subjects, args.holdout, seed=args.seed)
+    if verb >= 1:
+        print(describe_cohort(subjects, []))
+
+    # A group recipe warps every subject to ONE base, so there are no pairs to
+    # choose: the "panel" is the cohort itself and every member of it is fit for
+    # every config.
+    if group:
+        if not args.base or len(args.base) != 1:
+            raise SystemExit(
+                "-type common_T1 warps a cohort into one common space, so it needs "
+                "exactly one -base (the template), e.g. "
+                "-base MNI152_2009_template_SSW.nii.gz'[0]'"
+            )
+        return (
+            _template_pairs(subjects, args.base[0], TRAIN, verb),
+            _template_pairs(subjects, args.base[0], TEST, verb=0),
+        )
 
     n_train = sum(s.split == TRAIN for s in subjects)
     pool = n_train * (n_train - 1)
@@ -587,7 +612,6 @@ def _build_cohort_pairs(
     test = pairwise(subjects, 2 * n_test, split=TEST) if n_test else []
     args._held_out = [s.name for s in subjects if s.split == TEST]
     if verb >= 1:
-        print(describe_cohort(subjects, train))
         if start:
             print(f"  panel window starts at pair {start} of {pool} (run {n_run + 1})")
         if test:
@@ -707,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cohort:
         # len(store.runs) is the number of runs BEFORE this one, so a fresh study
         # is run 0 and each resume slides the panel window along.
-        pairs, held_out = _build_cohort_pairs(args, len(store.runs), args.verb)
+        pairs, held_out = _build_cohort_pairs(args, len(store.runs), args.verb, group=recipe.group)
     else:
         pairs = _build_pairs(args, recipe.pairing)
     if recipe.labels and not all(p.has_labels for p in pairs):

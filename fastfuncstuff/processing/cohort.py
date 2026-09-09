@@ -253,7 +253,8 @@ def describe_cohort(subjects: list[CohortSubject], pairs: list[SubjectPair]) -> 
         lines.append(f"  held out ({len(test)}): {_names(test)}")
         lines.append("  held-out pairs are fit ONLY after the search, on the settings it chose")
     n_train = sum(p.split == TRAIN for p in pairs)
-    lines.append(f"  {n_train} training pair(s) of a possible {len(train) * (len(train) - 1)}")
+    if pairs:
+        lines.append(f"  {n_train} training pair(s) of a possible {len(train) * (len(train) - 1)}")
     return "\n".join(lines)
 
 

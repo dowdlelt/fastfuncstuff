@@ -70,6 +70,21 @@ NARROW = "narrow"
 PINNED = "pinned"
 
 
+COHORT = "(cohort)"
+"""Subject name for a row that scores a whole cohort rather than one fit.
+
+Cross-subject agreement in a common space is a property of the set of subjects,
+so a group recipe records one row per config under this name instead of one per
+subject. The per-subject facts that still matter -- whether any of them folded,
+how long they took -- are folded into that row the same way ConfigResult already
+folds them across subjects.
+
+It is also what keeps the surrogate honest: consensus and the surrogate's target
+are computed *within* a subject, and one pseudo-subject holding every config is
+exactly the right shape for a score that is already comparable across configs.
+"""
+
+
 BASELINE = "(baseline)"
 """Backend name for the do-nothing row: the input scored without any warp.
 

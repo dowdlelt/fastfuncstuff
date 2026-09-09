@@ -507,6 +507,11 @@ class Recipe:
     # Whether trials carry a segmentation on both sides. Gates the label metrics
     # out of every derived panel, because a run without one cannot score them.
     labels: bool = False
+    # Score the cohort as a WHOLE rather than one fit at a time. A config is then
+    # only scorable once every subject has been warped into the common space, so
+    # the search's atom becomes N fits instead of one and the screen/confirm
+    # structure does not apply.
+    group: bool = False
 
     def panel(self) -> list[str]:
         """The metrics allowed to judge fits produced under this recipe.
@@ -596,6 +601,40 @@ RECIPES: dict[str, Recipe] = {
             "fold boundary, not as an optimum. With the tool default -metric cc "
             "the same settings fold ~9900 voxels: on same-modality data the "
             "metric matters more than the regularization."
+        ),
+    ),
+    "common_T1": Recipe(
+        name="common_T1",
+        describe="A labelled cohort into ONE common space (MNI or any template)",
+        optimize="lpa",
+        evaluate_exclude=("mind", "mindssc"),
+        contrast="same",
+        pairing="one_base",
+        labels=True,
+        group=True,
+        # Cross-subject label agreement in the common space. This is the quantity
+        # group analysis actually needs -- whether a template voxel means the same
+        # anatomy in every subject -- so it is a deliverable and not only a proxy.
+        #
+        # It is NOT an independent referee, and the recipe must not be read as if
+        # it were. Both sides move when the settings change, unlike the pairwise
+        # protocol where the target's tracing is fixed, so a config that drives
+        # every brain harder onto the template can raise this by making the errors
+        # agree rather than by making them small. Its companion is `cohort_T1`:
+        # tune both, and where they disagree the pairwise one is the referee.
+        judge=("xdice",),
+        report=("xdice_q25", "ls", "mi", "lncc", "ngf"),
+        tune=_ALL_REG + _ALL_EFFORT + ("qwarp.hfactor_q", "formwarp.grad_step"),
+        notes=(
+            "N fits per config rather than N(N-1), so this is the affordable mode "
+            "for benchmarking against slow tools -- each one warps the cohort once "
+            "and its transported labels are cached. The template is itself a "
+            "constraint: a warp cannot push arbitrarily hard onto it without the "
+            "alignment or the segmentations visibly failing, so the degenerate "
+            "'map everything onto one blob' optimum is unreachable. What that "
+            "constraint does NOT do is separate 'matched the template well' from "
+            "'matched it too well', which is where the tuning decision lives -- "
+            "hence the regularity gate, and hence cross-checking against cohort_T1."
         ),
     ),
     "epi2t1": Recipe(

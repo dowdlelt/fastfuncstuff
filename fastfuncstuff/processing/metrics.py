@@ -78,6 +78,10 @@ class Metric:
     # out of every panel unless asked for: a run without labels cannot
     # evaluate one, and a silent zero would look like a terrible warp.
     needs_labels: bool = False
+    # Scored once for a whole COHORT rather than once per fit: it is a property of
+    # the set of subjects in a common space, so there is no per-trial value of it
+    # and `evaluate_metrics` cannot produce one.
+    group: bool = False
     differentiable: bool = False  # an optimiser can descend on it
     afni: bool = False  # part of the 3dAllineate set, evaluated via allcost
 
@@ -203,6 +207,24 @@ _LABEL: list[Metric] = [
         "label",
         needs_grid=True,
         needs_labels=True,
+    ),
+    Metric(
+        "xdice",
+        "crossSubjectDice",
+        "1 - mean pairwise Dice between transported segs in a COMMON space",
+        "label",
+        needs_grid=True,
+        needs_labels=True,
+        group=True,
+    ),
+    Metric(
+        "xdice_q25",
+        "crossSubjectDiceQ25",
+        "1 - 25th-percentile cross-subject Dice (the worst quarter of parcels)",
+        "label",
+        needs_grid=True,
+        needs_labels=True,
+        group=True,
     ),
 ]
 
@@ -492,6 +514,86 @@ def label_dice_summary(base_labels: Tensor, moving_labels: Tensor) -> dict[str, 
     }
 
 
+def cross_subject_dice(segs: Sequence[Tensor]) -> dict[str, float]:
+    """Label agreement among a whole cohort warped into one common space.
+
+    Every unordered pair of transported segmentations is compared label by label,
+    and the per-label Dice is averaged over pairs before anything is averaged over
+    labels. This is the quantity a group analysis actually cares about: whether a
+    voxel in template space means the same anatomy in every subject.
+
+    **It is not an independent referee, and must not be read as one.** Both sides
+    move when the settings change -- unlike the direct pairwise protocol, where
+    the target's tracing is fixed -- so a config that drives every brain harder
+    onto the template can raise this number by making the errors agree rather than
+    by making them small. Correlated error looks like agreement. Read it against
+    the direct pairwise result, the regularity gate, or both.
+
+    One ``bincount`` over the joint index per pair, which yields the whole
+    confusion matrix at once: ``a * n + b`` has the intersections on its diagonal.
+    At sixteen subjects that is 120 passes rather than 360.
+    """
+    n = len(segs)
+    if n < 2:
+        raise ValueError(f"cross-subject agreement needs at least 2 subjects, got {n}")
+    shape = tuple(segs[0].shape)
+    if any(tuple(s.shape) != shape for s in segs):
+        raise ValueError("all transported segmentations must share the common-space grid")
+
+    n_lab = max(int(s.max()) for s in segs) + 1
+    device = segs[0].device
+    counts = [torch.bincount(s.reshape(-1).long(), minlength=n_lab)[:n_lab].double() for s in segs]
+
+    total = torch.zeros(n_lab, dtype=torch.float64, device=device)
+    seen = torch.zeros(n_lab, dtype=torch.float64, device=device)
+    n_pairs = 0
+    for i in range(n):
+        a = segs[i].reshape(-1).long()
+        for j in range(i + 1, n):
+            b = segs[j].reshape(-1).long()
+            joint = torch.bincount(a * n_lab + b, minlength=n_lab * n_lab)
+            inter = joint[: n_lab * n_lab].reshape(n_lab, n_lab).diagonal().double()
+            denom = counts[i] + counts[j]
+            total += torch.where(denom > 0, 2.0 * inter / denom.clamp(min=1.0), 0.0)
+            seen += (denom > 0).double()
+            n_pairs += 1
+            del b, joint, inter
+        del a
+
+    per_label = (total[1:] / seen[1:].clamp(min=1.0))[seen[1:] > 0]
+    if per_label.numel() == 0:
+        return {"mean": 0.0, "q25": 0.0, "n_labels": 0, "n_pairs": n_pairs}
+    return {
+        "mean": float(per_label.mean()),
+        "q25": float(torch.quantile(per_label.float(), 0.25)),
+        "n_labels": int(per_label.numel()),
+        "n_pairs": n_pairs,
+    }
+
+
+def overlap_probability(segs: Sequence[Tensor]) -> Tensor:
+    """Per-voxel fraction of the cohort whose transported label wins that voxel.
+
+    The picture behind AFNI's own comparison figure: at each voxel, how much of
+    the cohort agrees on whatever label is most common there, with voxels nobody
+    labelled left at zero. 1.0 means every subject put the same parcel there.
+
+    A map rather than a number on purpose -- a summary says one method agrees
+    more, a map says *where*, and the where is what a reader believes.
+    """
+    n = len(segs)
+    if n < 2:
+        raise ValueError(f"an overlap map needs at least 2 subjects, got {n}")
+    n_lab = max(int(s.max()) for s in segs) + 1
+    votes = torch.zeros((n_lab,) + tuple(segs[0].shape), dtype=torch.int16, device=segs[0].device)
+    for s in segs:
+        votes.scatter_add_(0, s.long().unsqueeze(0), torch.ones_like(votes[:1], dtype=torch.int16))
+    votes[0] = 0  # background is not a label anyone agrees about
+    best = votes.max(dim=0).values.float() / float(n)
+    del votes
+    return best
+
+
 # ---------------------------------------------------------------------------
 # One evaluation surface
 # ---------------------------------------------------------------------------
@@ -572,6 +674,11 @@ def _grid_metric(name: str, inp: MetricInputs) -> Tensor:
         return ngf_volume_cost(inp.base, inp.moving, inp.weight, inp.ngf_eta)
     if name in ("mind", "mindssc"):
         return mind_cost(inp.base, inp.moving, inp.weight, inp.mind_radius, ssc=(name == "mindssc"))
+    if name in ("xdice", "xdice_q25"):
+        raise ValueError(
+            f"{name} is a whole-cohort measure and has no per-trial value; it is "
+            "computed by the group scorer once every subject has been warped"
+        )
     if name in ("dice", "dice_q25"):
         if inp.base_labels is None or inp.moving_labels is None:
             raise ValueError(
@@ -649,12 +756,14 @@ __all__ = [
     "differentiable_cost",
     "differentiable_metrics",
     "evaluate_metrics",
+    "cross_subject_dice",
     "label_dice",
     "label_dice_summary",
     "metric",
     "mind_cost",
     "mind_descriptor",
     "ngf_volume_cost",
+    "overlap_probability",
     "panel_for",
 ]
 
