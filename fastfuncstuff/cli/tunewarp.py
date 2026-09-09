@@ -3,60 +3,68 @@
 Command: ffs_tunewarp (registered as entry point in pyproject.toml)
 
 Answers "what settings work for data like this", not "what is the best warp for
-this one pair". You give it a few already-affine-aligned subjects, it fits every
-backend across its own parameter grid, scores each result with functionals the
-backend did not optimise plus a deformation-regularity check, and prints the
+this one pair". It fits every backend across its own parameter grid, scores each
+result with evidence the backend did not optimise, and prints the
 accuracy/smoothness trade-off you pick a row out of.
 
-It is a dev tool for building defaults, so it is allowed to take a while — but
-it is not allowed to fill your disk. Trial outputs are scored and deleted;
-only the numbers and the exact command survive. When a row looks interesting,
-``-reproduce N`` re-runs it on every subject and keeps the images, alongside the
-base and the affine-aligned source, so you can actually look.
+**What counts as evidence is the choice that matters**, and there are three
+answers, in increasing order of how much they can be trusted and how much they
+cost:
+
+* **Image similarity** (`-type MNI_T1`, `epi2t1`, `epi2epi`). A jury of cost
+  functionals the fit did not use. Cheap, always available, and structurally
+  limited: every one of them improves monotonically with overfit, and the
+  regularity gate fails only on folding, so the top row is by construction the
+  loosest field that has not yet inverted.
+* **Manual segmentations, pairwise** (`-type cohort_T1 -cohort DIR`). Subject
+  A's tracing carried through the warp and compared against subject B's own
+  tracing. The referee is a human, and it has no obligation to reward overfit.
+* **Manual segmentations in one common space** (`-type common_T1 -cohort DIR
+  -base template`). Cross-subject label agreement, which is the quantity a group
+  analysis actually needs. N fits per config rather than N(N-1) -- but both sides
+  move when the settings change, so read it alongside the pairwise mode rather
+  than instead of it.
+
+Two things are load-bearing and easy to miss.
+
+**`-holdout` is on by default.** Everything else in the table is in-sample: the
+surrogate proposed those configs *because* of how they scored on those brains.
+A quarter of the subjects are reserved, the search never sees them, and the
+finalists are fit on them once at the end. Split by subject, never by pair.
+
+**Settings are in millimetres.** Smoothing sigmas, patch sizes and step caps are
+searched and stored in mm and converted to voxels only at the engine and the
+printed command, so a study at 0.7 mm and a study at 1 mm are comparable and a
+preset transfers between them.
+
+It is a dev tool for building defaults, so it is allowed to take a while -- but
+it is not allowed to fill your disk. Trial outputs are scored and deleted; only
+the numbers and the exact command survive. When a row looks interesting,
+``-reproduce N`` re-runs it keeping the images, and for a common-space run
+``-diagnostics N`` writes the overlap-probability volume and the per-label
+tables behind its score.
+
+``-diag_only NAME`` runs those same diagnostics on segmentations *another tool*
+already warped into the common space, so a head-to-head against AFNI, ANTs or
+FSL is measured by the same instrument rather than by two papers' worth of
+argument that the instruments matched. ``-collect`` concatenates every method's
+tables for pandas.
 
 **A tuning directory has a long life.** The expected shape is not one big run:
 it is a small run early in a study to get a direction, and more subjects folded
 in later to sharpen it. So pointing a second invocation at the same ``-out``
-picks up where the last one left off rather than starting over — the ladders are
-rebuilt from the trials already recorded, screening goes to whichever subjects
-the table knows least about (which puts a newly added brain first without being
-told it is new), values that folded every time they were tried are dropped, and a
-backend stops once the frontier stops moving. That last one makes ``-budget`` a
-ceiling rather than a promise: asking for 300 fits on a space that is already
-mapped costs about 60.
+picks up where the last one left off -- ladders rebuilt from the trials already
+recorded, screening sent to whichever subjects the table knows least about, the
+pair window slid so a resumed cohort study covers new ground, values that folded
+every time dropped, and held-out fits already recorded skipped.
 
 Resuming assumes the *engines* have not changed under the stored trials. The run
-records its commit and says so up front when they differ; it is a warning rather
-than a refusal, because only you can judge whether a given commit moved numbers.
+records its commit and says so up front when they differ; it also says so if the
+held-out split moved, which would quietly stop those numbers being out-of-sample.
 
-Usage:
-    # start a study (one base, many sources)
-    ffs_tunewarp -type MNI_T1 -base mni.nii.gz -source s1.nii.gz s2.nii.gz \
-                 -out tune_mni
-
-    # later: two more subjects, same directory. Prior fits are reused; the new
-    # brains are screened first; it stops when it stops learning.
-    ffs_tunewarp -type MNI_T1 -base mni.nii.gz \
-                 -source s1.nii.gz s2.nii.gz s3.nii.gz s4.nii.gz \
-                 -out tune_mni -budget 200
-
-    # read the answer
-    ffs_tunewarp -out tune_mni -list        # ranked table + the frontier
-    ffs_tunewarp -out tune_mni -bands       # what backing off the winner costs
-    ffs_tunewarp -out tune_mni -effects     # what each knob does
-    ffs_tunewarp -out tune_mni -importance  # which knobs to stop searching
-
-    # once the corner is found: fill in the room beside it rather than chase it
-    ffs_tunewarp -type MNI_T1 -base mni.nii.gz -source s1.nii.gz s2.nii.gz \
-                 -out tune_mni -explore -patience 0 -budget 60
-
-    # look at a row, on every subject
-    ffs_tunewarp -out tune_mni -reproduce 7
-
-Sources must be affine-aligned to the base. Pass ``-allineate`` to have that
-done as step 0 (cached in {out}/affine/, so re-runs skip it), or pre-align them
-yourself with ffs_allineate. Either way it is a one-time cost per subject and is
-deliberately not part of the search.
+Sources must be affine-aligned to the base. Pass ``-allineate`` to have that done
+as step 0 (cached in {out}/affine/, matrices included so a segmentation reaches
+the base grid in one gather), or pre-align them yourself with ffs_allineate.
 """
 
 from __future__ import annotations
@@ -464,84 +472,139 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _epilog() -> str:
     lines = ["Recipes:", ""]
     for name, r in sorted(RECIPES.items()):
+        judged = "labels" if r.labels else "intensities"
+        shape = "whole cohort per config" if r.group else "one pair at a time"
         lines.append(f"  {name:10s} {r.describe}")
         lines.append(f"  {'':10s}   optimize={r.optimize}, pairing={r.pairing}")
+        lines.append(f"  {'':10s}   judged on {judged}, scored {shape}")
         if r.notes:
             for chunk in _wrap(r.notes, 66):
                 lines.append(f"  {'':10s}   {chunk}")
         lines.append("")
     lines += [
-        "A study, start to finish:",
+        "THREE WAYS TO USE THIS",
         "",
-        "  # 1. early in the study: a few subjects, affine included",
-        "  ffs_tunewarp -type MNI_T1 -allineate \\",
-        "               -base MNI152_2009_template.nii.gz \\",
-        "               -source sub-00{1,2,3}/SUMA/brain.nii.gz \\",
-        "               -out tune_mni",
+        "1. Tune against a target, judged on image similarity (the original mode)",
         "",
-        "  # 2. read what it found",
-        "  ffs_tunewarp -out tune_mni -list         # ranked configs + the frontier",
-        "  ffs_tunewarp -out tune_mni -effects      # what each knob does",
-        "  ffs_tunewarp -out tune_mni -importance   # which knobs never mattered",
+        "  ffs_tunewarp -type MNI_T1 -allineate -base template.nii.gz \\",
+        "               -source sub-00{1,2,3}/brain.nii.gz -out tune_mni",
         "",
-        "  # 3. look at a row you like -- on every subject, next to its inputs",
-        "  ffs_tunewarp -out tune_mni -reproduce 23",
+        "2. Tune against manual segmentations, PAIRWISE within a labelled cohort",
         "",
-        "  # 4. LATER: more subjects, same directory. Earlier fits are reused, the",
-        "  #    new brains are screened first, and it stops when it stops learning,",
-        "  #    so a generous -budget costs only what the space can actually use.",
-        "  ffs_tunewarp -type MNI_T1 -allineate \\",
-        "               -base MNI152_2009_template.nii.gz \\",
-        "               -source sub-*/SUMA/brain.nii.gz \\",
-        "               -out tune_mni -budget 200",
+        "  ffs_tunewarp -type cohort_T1 -cohort labelled_brains/ -out tune_pairs",
         "",
-        "  # 5. spend the budget only on what you do not already know",
-        "  ffs_tunewarp -type MNI_T1 ... -out tune_mni \\",
-        "               -fix qwarp.minpatch=13 qwarp.hfactor_q=0.5",
+        "  Each pair is a real test: subject A's tracing carried through the warp,",
+        "  compared against subject B's OWN tracing. The referee is a human, not the",
+        "  intensities the fit was driven by -- which matters because every intensity",
+        "  functional improves monotonically with overfit and the gate only catches",
+        "  folding, so a similarity ranking always crowns the loosest legal field.",
         "",
-        "  # 5b. exhaustive instead, when you want every cell of the factorial",
-        "  ffs_tunewarp -type MNI_T1 ... -out tune_mni -search grid",
+        "3. Tune (or evaluate) a whole cohort in ONE common space",
         "",
-        "Pairing:",
-        "  one_base   -base ONE -source A B C     (each source vs the same base)",
-        "  paired     -base A B C -source a b c   (paired BY POSITION, never sorted)",
+        "  ffs_tunewarp -type common_T1 -allineate -cohort labelled_brains/ \\",
+        "               -base MNI152_2009_template.nii.gz -out tune_mni",
         "",
-        "The table's score is a mean rank across cost functionals, computed within",
-        "each subject and averaged. Lower is better. A PASS config always outranks",
-        "a MARGINAL one and a MARGINAL always outranks a FAIL, whatever the score:",
-        "a better similarity number never buys its way past a folded warp.",
+        "  N fits per config instead of N(N-1), scoring cross-subject label",
+        "  agreement -- which is what a group analysis actually needs. Read it",
+        "  ALONGSIDE mode 2, not instead of it: both sides move when the settings",
+        "  change, so a config that drives every brain harder onto the template can",
+        "  raise this by making the errors agree rather than by making them small.",
         "",
-        "The jury is chosen, not just filtered. A recipe's contrast regime decides",
-        "which functionals are meaningful at all -- the signed ones (lss/lpc/lpc+)",
-        "reward anti-correlation, so on same-modality data they rank the WORST warp",
-        "first -- and excluding the optimised cost excludes its whole family, since",
-        "lpa/lpa+/lpc/lpc+ are all the same number wearing different signs.",
+        "COHORT LAYOUT",
         "",
-        "Reading the table:",
+        "  -cohort DIR expects  na01.nii.gz + na01_seg.nii.gz  per subject",
+        "  (-label_suffix changes '_seg'). A subject with no tracing is still fit;",
+        "  it simply cannot be judged on anatomy.",
         "",
-        "  Every functional in the jury improves with overfit, and the gate fails only",
-        "  on FOLDING -- det(J) > 0 is a topology check, not a smoothness one. So the",
-        "  top row is the loosest field that is still legal, never an optimum, and the",
-        "  'score' column on its own cannot tell you otherwise.",
+        "HELD-OUT VALIDATION  (-holdout, on by default at 0.25)",
         "",
-        "  'bend' (bending energy) and 'jacmin' are printed next to it for that reason,",
-        "  and the FRONTIER table below the ranking is the one to read: it lists the",
-        "  configs nothing else beats on both similarity and smoothness, smoothest",
-        "  first. Walk up it and stop where the score stops being worth the roughness.",
-        "  A 10x jump in 'bend' for a few hundredths of score is the ranking paying for",
-        "  detail that is not anatomy.",
+        "  Everything in the search table is IN-SAMPLE: the surrogate proposed those",
+        "  configs because of how they scored on those brains, and the ladders grew",
+        "  toward them. -holdout reserves subjects the search never sees, and after",
+        "  it finishes the finalists are fit on them once. That is the only number",
+        "  in the output that is not in-sample.",
         "",
-        "  PINNED means the warp came back resting on the solver's own anti-fold floor,",
-        "  so the damping is what kept it legal rather than its regularization. Those",
-        "  are demoted and kept off the frontier: the same settings fold outright on a",
-        "  subject where the guard cannot hold.",
+        "  Split by SUBJECT, never by pair -- pairs A->B and A->C share a brain, so",
+        "  a held-out pair reusing a training subject measures a setting that was",
+        "  partly chosen on that same brain. Membership is a hash threshold, so",
+        "  adding subjects later leaves everyone on the side they were already on.",
+        "",
+        "  Read the gap, not the ordering, and read it against the BASELINE's own",
+        "  shift: that row involves no settings, so it measures how much harder the",
+        "  held-out brains are. Anything beyond it is optimism.",
+        "",
+        "DIAGNOSTICS AND HEAD-TO-HEAD COMPARISON",
+        "",
+        "  ffs_tunewarp -out tune_mni -type common_T1 -diagnostics 14   # the winner",
+        "  ffs_tunewarp -out cmp -diag_only 'AFNI 3dQwarp' -cohort afni_warped/",
+        "  ffs_tunewarp -out cmp -diag_only 'ANTs SyN'     -cohort ants_warped/",
+        "  ffs_tunewarp -out cmp -collect                              # all_*.tsv",
+        "",
+        "  -diagnostics re-fits one config and writes a 4D overlap-probability",
+        "  volume (one frame per label: bright in a parcel's core, fading at its",
+        "  edge -- that fade IS the registration's error bar), plus agreement and",
+        "  consensus-label maps and per-label / per-pair / per-subject tables.",
+        "",
+        "  -diag_only does the same for labels somebody ELSE already warped into",
+        "  the common space. No fitting. Same tables, same volume, same code -- a",
+        "  tool comparison is only worth reading if the instrument is identical on",
+        "  both sides, and here that is one function rather than an argument.",
+        "",
+        "  Tables are plain TSV with a 'method' column and no comment lines:",
+        "     import pandas as pd, glob",
+        "     df = pd.read_csv('cmp/diag/all_summary.tsv', sep='\\t')",
+        "",
+        "UNITS: MILLIMETRES, NOT VOXELS",
+        "",
+        "  Smoothing sigmas, patch sizes and step caps are searched, stored and",
+        "  exported in mm, and converted to voxels for the engine and the printed",
+        "  command. A ladder learned at 1 mm would otherwise ask a different",
+        "  question at 0.7 mm -- minpatch 13 is a 13 mm patch on one dataset and a",
+        "  9.1 mm patch on the other, and only one of those is the anatomical scale",
+        "  the finding was about.",
+        "",
+        "RESUMING",
+        "",
+        "  Pointing a second run at the same -out picks up where the last one left",
+        "  off: ladders rebuilt from the stored trials, screening sent to whichever",
+        "  subjects the table knows least about, values that always folded dropped,",
+        "  and held-out fits already recorded skipped. For a pairwise cohort the",
+        "  pair window also slides half a panel, so a resumed study covers new",
+        "  ground instead of re-measuring one fixed set of brains.",
+        "",
+        "  It assumes the ENGINES have not changed under the stored trials. The run",
+        "  records its commit and warns when they differ -- and warns if the",
+        "  held-out split moved, which would make those numbers no longer",
+        "  out-of-sample.",
+        "",
+        "READING THE TABLE",
+        "",
+        "  'score' is a rank WITHIN this run (lower better) and does not transfer;",
+        "  the absolute metric column beside it is the one that means anything",
+        "  outside the run. A PASS always outranks MARGINAL and MARGINAL always",
+        "  outranks FAIL, whatever the score: a better similarity number never buys",
+        "  its way past a folded warp.",
+        "",
+        "  The '1-dice' / '1-xdice' columns are stored lower-is-better like every",
+        "  other metric here. Dice itself is 1 minus what is printed.",
+        "",
+        "  Every functional in an intensity jury improves with overfit, and the gate",
+        "  fails only on FOLDING -- det(J) > 0 is a topology check, not a smoothness",
+        "  one. So the top row is the loosest field that is still legal, never an",
+        "  optimum. 'bend' and 'jacmin' are printed next to it for that reason, and",
+        "  the FRONTIER below the ranking is the table to read: the configs nothing",
+        "  else beats on both similarity and smoothness, smoothest first.",
+        "",
+        "  PINNED means the warp came back resting on the solver's own anti-fold",
+        "  floor, so the damping is what kept it legal rather than its",
+        "  regularization. Those are demoted and kept off the frontier.",
         "",
         "  Mind the 'n' column. Screening deliberately spends few fits on most",
-        "  candidates, so a row measured on one brain and one measured on four are not",
-        "  comparable; -reproduce a row before believing it.",
+        "  candidates, so a row measured on one brain and one measured on four are",
+        "  not comparable; -reproduce a row before believing it.",
         "",
-        "  -effects is the safer read for a knob: it separates 'how good when it works'",
-        "  from 'how often does it work'.",
+        "  -effects is the safer read for a knob: it separates 'how good when it",
+        "  works' from 'how often does it work'.",
     ]
     return "\n".join(lines)
 
