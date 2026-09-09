@@ -107,6 +107,8 @@ from fastfuncstuff.processing.tunewarp import (
     AdaptivePlan,
     SubjectPair,
     affine_align,
+    collect_diagnostics,
+    diagnose_warped,
     enumerate_configs,
     evaluate_holdout,
     group_diagnostics,
@@ -356,6 +358,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "and per-label / per-pair / per-subject tables. Use it on the winner.",
     )
     act.add_argument(
+        "-diag_only",
+        "-diag-only",
+        default=None,
+        metavar="NAME",
+        help="Score labels somebody ELSE already warped into the common space, and "
+        "call the result NAME (e.g. -diag_only 'AFNI 3dQwarp'). No fitting: point "
+        "-cohort at a directory of segmentations another tool produced, and it "
+        "writes the same tables and the same overlap volume an ffs config gets. "
+        "That sameness is the point -- a tool comparison is only worth reading if "
+        "the instrument is identical on both sides, and here that is not an "
+        "argument but the same function. Combine with -collect for the head-to-head.",
+    )
+    act.add_argument(
+        "-collect",
+        action="store_true",
+        help="Concatenate every method's tables under {out}/diag/ into all_*.tsv, "
+        "ready for pandas. Each row already carries a 'method' column, so this is a "
+        "concatenation, not a join: a method with a different label set or a missing "
+        "subject just contributes the rows it has.",
+    )
+    act.add_argument(
         "-save_subject_labels",
         "-save-subject-labels",
         action="store_true",
@@ -534,6 +557,16 @@ def _wrap(text: str, width: int) -> list[str]:
     if line:
         out.append(line)
     return out
+
+
+def _slug(name: str) -> str:
+    """A directory name from a method name, keeping it recognisable.
+
+    'AFNI 3dQwarp' -> 'AFNI_3dQwarp'. The full name stays in every table's method
+    column and in meta.json, so nothing depends on this being reversible.
+    """
+    keep = [c if (c.isalnum() or c in "-_.") else "_" for c in name.strip()]
+    return "".join(keep).strip("_") or "method"
 
 
 def _strip_ext(path: str) -> str:
@@ -732,6 +765,33 @@ def main(argv: list[str] | None = None) -> int:
                 print("\n" + format_holdout(store))
         if args.plot is not None:
             _write_plot(store, args.plot or out / "frontier.png", args.recipe)
+        return 0
+
+    if args.collect:
+        written = collect_diagnostics(out / "diag")
+        if not written:
+            raise SystemExit(f"no method tables under {out / 'diag'} (see -diagnostics/-diag_only)")
+        print(f"Collected {len(written)} table(s) in {out / 'diag'}:")
+        for w in written:
+            print(f"  {w.name}")
+        return 0
+
+    if args.diag_only:
+        if not args.cohort:
+            raise SystemExit("-diag_only needs -cohort DIR: the labels to score")
+        subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix, labels_only=True)
+        target = out / "diag" / _slug(args.diag_only)
+        print(f"\nScoring {len(subjects)} pre-warped segmentation(s) as {args.diag_only!r}")
+        written = diagnose_warped(
+            subjects,
+            target,
+            args.diag_only,
+            device=setup_device(args.device, tf32=REGISTRATION_TF32),
+            save_subject_labels=args.save_subject_labels,
+            verb=args.verb,
+        )
+        print(f"\nWrote {len(written)} file(s) to {target}")
+        print(open(target / "summary.tsv").read())
         return 0
 
     if args.diagnostics is not None:

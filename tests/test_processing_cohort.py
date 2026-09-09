@@ -244,3 +244,25 @@ class TestPanelSizingAndRotation:
     def test_the_window_wraps_rather_than_running_out(self):
         subs = _cohort(4)  # 12 ordered pairs
         assert len(pairwise(subs, 6, start=10)) == 6
+
+
+class TestDiagOnlyDiscovery:
+    def test_a_labels_only_directory_is_a_cohort(self, tmp_path):
+        """Another tool's output directory often holds only the warped labels --
+        the images were somebody else's input and there is no reason to keep them."""
+        for n in ("na01", "na02"):
+            (tmp_path / f"{n}_seg.nii.gz").write_bytes(b"x")
+        subs = discover_cohort(tmp_path, labels_only=True)
+        assert [s.name for s in subs] == ["na01", "na02"]
+        assert all(s.labels and not s.image for s in subs)
+
+    def test_labels_only_still_refuses_an_empty_directory(self, tmp_path):
+        with pytest.raises(ValueError, match="no files matching"):
+            discover_cohort(tmp_path, labels_only=True)
+
+    def test_images_win_when_both_are_present(self, tmp_path):
+        for n in ("na01", "na02"):
+            (tmp_path / f"{n}.nii.gz").write_bytes(b"x")
+            (tmp_path / f"{n}_seg.nii.gz").write_bytes(b"x")
+        subs = discover_cohort(tmp_path, labels_only=True)
+        assert all(s.image and s.labels for s in subs)

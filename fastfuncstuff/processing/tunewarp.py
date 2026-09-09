@@ -17,6 +17,7 @@ CLI with its outputs kept, so the winner can be looked at.
 
 from __future__ import annotations
 
+import json
 import statistics
 import subprocess
 import sys
@@ -1545,6 +1546,7 @@ def group_diagnostics(
     out_dir: Path,
     device: torch.device | None = None,
     save_subject_labels: bool = False,
+    method: str = "ffs",
     verb: int = 1,
 ) -> list[Path]:
     """Re-fit one config on the cohort and write everything behind its score.
@@ -1565,8 +1567,6 @@ def group_diagnostics(
     subjects *have* each label, which is what separates a parcel the tracers left
     out from one the warp misplaced.
     """
-    from .metrics import cross_subject_detail, label_overlap_stack
-
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir.mkdir(parents=True, exist_ok=True)
     volumes = CohortVolumes.open(pairs, device)
@@ -1613,8 +1613,45 @@ def group_diagnostics(
     if bar is not None:
         bar.close()
 
+    return write_diagnostics(
+        out_dir,
+        method,
+        segs,
+        names,
+        rows,
+        header,
+        meta={"backend": backend, "config": config, "recipe": recipe.name},
+        save_subject_labels=save_subject_labels,
+    )
+
+
+def write_diagnostics(
+    out_dir: Path,
+    method: str,
+    segs: list[torch.Tensor],
+    names: list[str],
+    rows: list[dict],
+    header: Any = None,
+    meta: dict | None = None,
+    save_subject_labels: bool = False,
+) -> list[Path]:
+    """Everything behind one method's cohort agreement, as pictures and tables.
+
+    Split from the fitting on purpose: the scorer must not care whether the
+    segmentations arrived from an ffs trial or from AFNI, ANTs or FSL applying
+    its own warp. A head-to-head comparison only means anything if every method
+    is measured by the *same* instrument, and the cheapest way to guarantee that
+    is to have exactly one.
+
+    Tables are plain TSV carrying a ``method`` column and no comment lines, so a
+    directory of methods concatenates in pandas without special-casing. What the
+    columns mean lives in ``meta.json``, not wedged into the data file.
+    """
+    from .metrics import cross_subject_detail, label_overlap_stack
+
     if len(segs) < 2:
         raise ValueError("diagnostics need at least two transported segmentations")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     detail = cross_subject_detail(segs, names)
     labels = detail["labels"]
@@ -1624,21 +1661,33 @@ def group_diagnostics(
     written.append(
         _save(stack, out_dir / "overlap_prob.nii.gz", header, [f"label{k}" for k in labels])
     )
-    written.append(_save(stack.max(dim=0).values, out_dir / "agreement.nii.gz", header))
+    agree = stack.max(dim=0).values
+    written.append(_save(agree, out_dir / "agreement.nii.gz", header))
     # argmax over a stack that is zero everywhere outside any parcel would name
     # label 1 for the whole background, so the winner is masked to where somebody
     # actually drew something.
     winner = torch.tensor(labels, dtype=torch.float32)[stack.argmax(dim=0)]
-    written.append(
-        _save(winner * (stack.max(dim=0).values > 0), out_dir / "consensus_labels.nii.gz", header)
-    )
+    written.append(_save(winner * (agree > 0), out_dir / "consensus_labels.nii.gz", header))
     if save_subject_labels:
         for seg, name in zip(segs, names, strict=True):
             written.append(_save(seg.float(), out_dir / f"labels_{name}.nii.gz", header))
 
-    written.append(_write_label_table(out_dir / "per_label.tsv", detail, stack, len(segs)))
-    written.append(_write_pair_table(out_dir / "per_pair.tsv", detail))
-    written.append(_write_subject_table(out_dir / "per_subject.tsv", rows, detail, names))
+    written.append(_write_label_table(out_dir / "per_label.tsv", method, detail, stack))
+    written.append(_write_pair_table(out_dir / "per_pair.tsv", method, detail))
+    written.append(_write_subject_table(out_dir / "per_subject.tsv", method, rows, detail, names))
+    written.append(_write_summary(out_dir / "summary.tsv", method, detail, stack, rows))
+
+    payload = {
+        "method": method,
+        "n_subjects": len(segs),
+        "n_labels": len(labels),
+        "labels": labels,
+        "subjects": names,
+        "written": [w.name for w in written],
+        **(meta or {}),
+    }
+    (out_dir / "meta.json").write_text(json.dumps(payload, indent=2, default=str) + "\n")
+    written.append(out_dir / "meta.json")
     del segs, stack
     return written
 
@@ -1648,25 +1697,29 @@ def _save(vol: torch.Tensor, path: Path, header, brick_labels: list[str] | None 
     return path
 
 
-def _write_label_table(path: Path, detail: dict, stack: torch.Tensor, n_subj: int) -> Path:
-    per_pair = detail["per_pair_label"]
-    vols = detail["volumes"]
-    lines = [
-        "\t".join(
-            [
-                "label",
-                "n_present",
-                "dice_mean",
-                "dice_min",
-                "dice_max",
-                "vol_mean_vox",
-                "vol_cv",
-                "vox_full_overlap",
-                "vox_half_overlap",
-                "peak_overlap",
-            ]
-        )
+def _write_label_table(path: Path, method: str, detail: dict, stack: torch.Tensor) -> Path:
+    """Per parcel: how well the cohort agrees on it, and how big it is.
+
+    ``n_present`` sits beside the Dice because the same absence depresses both a
+    parcel the tracers left out and one the warp misplaced -- only the count says
+    which happened.
+    """
+    per_pair, vols = detail["per_pair_label"], detail["volumes"]
+    head = [
+        "method",
+        "label",
+        "n_present",
+        "dice_mean",
+        "dice_sd",
+        "dice_min",
+        "dice_max",
+        "vol_mean_vox",
+        "vol_cv",
+        "vox_full_overlap",
+        "vox_half_overlap",
+        "peak_overlap",
     ]
+    lines = ["\t".join(head)]
     for k, lab in enumerate(detail["labels"]):
         col = per_pair[:, k]
         col = col[~torch.isnan(col)]
@@ -1676,47 +1729,48 @@ def _write_label_table(path: Path, detail: dict, stack: torch.Tensor, n_subj: in
         lines.append(
             "\t".join(
                 [
+                    method,
                     str(lab),
                     str(int(detail["present"][k])),
-                    f"{float(col.mean()):.4f}" if col.numel() else "nan",
-                    f"{float(col.min()):.4f}" if col.numel() else "nan",
-                    f"{float(col.max()):.4f}" if col.numel() else "nan",
-                    f"{float(v.mean()):.0f}" if v.numel() else "0",
-                    f"{float(v.std() / v.mean()):.3f}" if v.numel() > 1 else "0",
+                    _num(col.mean() if col.numel() else None),
+                    _num(col.std() if col.numel() > 1 else 0.0),
+                    _num(col.min() if col.numel() else None),
+                    _num(col.max() if col.numel() else None),
+                    _num(v.mean() if v.numel() else 0.0, 0),
+                    _num(v.std() / v.mean() if v.numel() > 1 else 0.0, 3),
                     str(int((frame >= 0.999).sum())),
                     str(int((frame >= 0.5).sum())),
-                    f"{float(frame.max()):.3f}",
+                    _num(frame.max(), 3),
                 ]
             )
         )
-    lines.append(f"# {n_subj} subjects; dice is per-label, averaged over subject PAIRS")
-    lines.append("# n_present: subjects carrying the label at all -- a low count means")
-    lines.append("#   the tracers left it out, not that the warp misplaced it")
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
-def _write_pair_table(path: Path, detail: dict) -> Path:
+def _write_pair_table(path: Path, method: str, detail: dict) -> Path:
+    """Every subject pair's agreement, which is what a mean is hiding."""
     per_pair = detail["per_pair_label"]
-    lines = ["\t".join(["subject_a", "subject_b", "dice_mean", "dice_q25"])]
+    lines = ["\t".join(["method", "subject_a", "subject_b", "dice_mean", "dice_q25"])]
     for i, (a, b) in enumerate(detail["pairs"]):
         row = per_pair[i]
         row = row[~torch.isnan(row)]
         if row.numel() == 0:
             continue
-        lines.append(
-            f"{a}\t{b}\t{float(row.mean()):.4f}\t{float(torch.quantile(row.float(), 0.25)):.4f}"
-        )
+        q25 = torch.quantile(row.float(), 0.25)
+        lines.append(f"{method}\t{a}\t{b}\t{_num(row.mean())}\t{_num(q25)}")
     path.write_text("\n".join(lines) + "\n")
     return path
 
 
-def _write_subject_table(path: Path, rows: list[dict], detail: dict, names: list[str]) -> Path:
-    """Each subject's mean agreement with the rest, beside its own warp quality.
+def _write_subject_table(
+    path: Path, method: str, rows: list[dict], detail: dict, names: list[str]
+) -> Path:
+    """Each subject's agreement with the rest, beside its own warp quality.
 
-    The column that earns its place is `dice_vs_others`: a cohort mean hides the
-    one brain that is simply different, and that brain is usually the reason a
-    setting looks worse than it is.
+    The column that earns its place is ``dice_vs_others``: a cohort mean hides
+    the one brain that is simply different, and that brain is usually the reason
+    a setting looks worse than it is.
     """
     per_pair, pairs = detail["per_pair_label"], detail["pairs"]
     mine: dict[str, list[float]] = {n: [] for n in names}
@@ -1727,16 +1781,173 @@ def _write_subject_table(path: Path, rows: list[dict], detail: dict, names: list
             continue
         mine[a].append(float(row.mean()))
         mine[b].append(float(row.mean()))
-    lines = ["\t".join(["subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"])]
+    lines = [
+        "\t".join(["method", "subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"])
+    ]
     for r in rows:
         vals = mine.get(r["subject"], [])
-        avg = f"{statistics.fmean(vals):.4f}" if vals else "nan"
         lines.append(
-            f"{r['subject']}\t{avg}\t{r['grade']}\t{r['bend']:.5f}\t"
-            f"{r['jacmin']:.4f}\t{r['seconds']:.1f}"
+            "\t".join(
+                [
+                    method,
+                    r["subject"],
+                    _num(statistics.fmean(vals) if vals else None),
+                    str(r.get("grade", "")),
+                    _num(r.get("bend"), 5),
+                    _num(r.get("jacmin")),
+                    _num(r.get("seconds"), 1),
+                ]
+            )
         )
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def _write_summary(
+    path: Path, method: str, detail: dict, stack: torch.Tensor, rows: list[dict]
+) -> Path:
+    """One row for one method -- concatenate a directory of these and you have the plot.
+
+    Deliberately a file rather than a printed line: the whole point of the
+    head-to-head is that every method's row is produced by the same code, so the
+    comparison cannot be an artefact of who summarised what.
+    """
+    per_label = detail["per_label"]
+    good = per_label[~torch.isnan(per_label)]
+    bends = [r["bend"] for r in rows if r.get("bend") is not None]
+    jacs = [r["jacmin"] for r in rows if r.get("jacmin") is not None]
+    secs = [r["seconds"] for r in rows if r.get("seconds") is not None]
+    head = [
+        "method",
+        "n_subjects",
+        "n_labels",
+        "n_pairs",
+        "dice_mean",
+        "dice_q25",
+        "dice_median",
+        "dice_worst_label",
+        "mean_agreement",
+        "bend_max",
+        "jacmin_min",
+        "seconds_total",
+    ]
+    row = [
+        method,
+        str(len(detail["volumes"])),
+        str(len(detail["labels"])),
+        str(len(detail["pairs"])),
+        _num(good.mean() if good.numel() else None),
+        _num(torch.quantile(good.float(), 0.25) if good.numel() else None),
+        _num(torch.quantile(good.float(), 0.5) if good.numel() else None),
+        _num(good.min() if good.numel() else None),
+        _num(stack.max(dim=0).values[stack.max(dim=0).values > 0].mean()),
+        _num(max(bends) if bends else None, 5),
+        _num(min(jacs) if jacs else None),
+        _num(sum(secs) if secs else None, 1),
+    ]
+    path.write_text("\t".join(head) + "\n" + "\t".join(row) + "\n")
+    return path
+
+
+def _num(value: Any, places: int = 4) -> str:
+    """A number for a TSV cell, or an empty cell -- never the string 'nan'.
+
+    pandas reads a blank as NaN and reads 'nan' as NaN too, but a blank cannot be
+    mistaken for a label by anything else that opens the file.
+    """
+    if value is None:
+        return ""
+    v = float(value)
+    if v != v:
+        return ""
+    return f"{v:.{places}f}"
+
+
+def diagnose_warped(
+    subjects: list,
+    out_dir: Path,
+    method: str,
+    device: torch.device | None = None,
+    save_subject_labels: bool = False,
+    verb: int = 1,
+) -> list[Path]:
+    """Score somebody else's result: labels ALREADY in the common space.
+
+    No fitting, no warping, no assumptions about who produced them. Point it at a
+    directory of segmentations that AFNI, ANTs, FSL or SPM has already carried
+    into the template, name the method, and it writes the same tables and the
+    same overlap volume that an ffs config gets.
+
+    That sameness is the entire point. A comparison between tools is only worth
+    reading if the instrument is identical on both sides, and every published
+    registration comparison has to argue that it was. Here it is not an argument:
+    there is one scorer and both sides call it.
+    """
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    segs, names, rows = [], [], []
+    for s in subjects:
+        if s.labels is None:
+            raise ValueError(
+                f"{s.name} has no segmentation. -diag_only scores labels that are "
+                "already in the common space; every subject needs one."
+            )
+        seg, header = load_image(s.labels, device=device)
+        if seg.ndim == 4:
+            seg = seg[0]
+        segs.append(seg.round().to(torch.uint8))
+        names.append(s.name)
+        # No warp was fitted here, so there is no regularity to report. Left empty
+        # rather than filled with a neutral-looking number: a blank reads as
+        # "not measured", and 1.0 would read as "measured, and perfect".
+        rows.append({"subject": s.name, "grade": "", "bend": None, "jacmin": None, "seconds": None})
+        if verb >= 1:
+            print(f"  {s.name}: {Path(s.labels).name}", flush=True)
+
+    shapes = {tuple(x.shape) for x in segs}
+    if len(shapes) > 1:
+        raise ValueError(
+            f"the segmentations are on {len(shapes)} different grids ({shapes}). "
+            "-diag_only compares them voxel to voxel, so they must already share "
+            "the common space."
+        )
+    return write_diagnostics(
+        out_dir,
+        method,
+        segs,
+        names,
+        rows,
+        header,
+        meta={"mode": "diag_only", "inputs": [s.labels for s in subjects]},
+        save_subject_labels=save_subject_labels,
+    )
+
+
+def collect_diagnostics(root: Path) -> list[Path]:
+    """Concatenate every method's tables under ``root`` into one file each.
+
+    The head-to-head, as four dataframes. Each table already carries a ``method``
+    column, so this is a concatenation and not a join -- nothing has to line up,
+    and a method with a different label set or a missing subject simply
+    contributes the rows it has.
+    """
+    written = []
+    for name in ("summary", "per_label", "per_pair", "per_subject"):
+        parts = sorted(root.glob(f"*/{name}.tsv"))
+        if not parts:
+            continue
+        header, body = None, []
+        for part in parts:
+            lines = part.read_text().splitlines()
+            if not lines:
+                continue
+            header = header or lines[0]
+            body += [ln for ln in lines[1:] if ln.strip()]
+        if header is None:
+            continue
+        dest = root / f"all_{name}.tsv"
+        dest.write_text("\n".join([header, *body]) + "\n")
+        written.append(dest)
+    return written
 
 
 def reproduce(

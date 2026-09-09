@@ -53,6 +53,7 @@ def discover_cohort(
     root: str | Path,
     pattern: str = "*.nii.gz",
     label_suffix: str = "_seg",
+    labels_only: bool = False,
 ) -> list[CohortSubject]:
     """Find subjects in a directory, pairing each image with its segmentation.
 
@@ -72,6 +73,14 @@ def discover_cohort(
     images = [
         p for p in sorted(root.glob(pattern)) if not _strip_ext(p.name).endswith(label_suffix)
     ]
+    if not images and labels_only:
+        # A directory of results from another tool may hold only the warped
+        # segmentations -- the images were the input to somebody else's pipeline
+        # and there is no reason to have kept them. Scoring needs the labels.
+        segs = [p for p in sorted(root.glob(pattern)) if _strip_ext(p.name).endswith(label_suffix)]
+        if not segs:
+            raise ValueError(f"no files matching {pattern!r} in {root}")
+        return [CohortSubject(_strip_ext(p.name)[: -len(label_suffix)], "", str(p)) for p in segs]
     if not images:
         raise ValueError(
             f"no images matching {pattern!r} in {root} (after dropping {label_suffix})"
