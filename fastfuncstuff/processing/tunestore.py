@@ -120,6 +120,12 @@ class RunMeta:
     # loading it must not claim it was recorded in millimetres. Live runs stamp
     # "mm" explicitly at begin_run().
     param_units: str = "voxel"
+    # Which subjects this batch reserved from the search. Recorded so that a later
+    # invocation can be told when it has moved one across the line: the hash
+    # threshold keeps the split stable when the COHORT grows, but nothing stops a
+    # different -holdout or -seed from re-dealing it, and a brain that moves from
+    # train to test carries every fit already spent on it into the held-out set.
+    held_out: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # JSON has no tuples, so a round trip returns lists. Coerced here so a
@@ -225,6 +231,15 @@ def comparability_warnings(runs: list[RunMeta]) -> list[str]:
                 f"run {prev.run_id} was judged by a different panel "
                 f"({len(prev.panel)} vs {len(latest.panel)} metrics); consensus ranks "
                 "from the two are measuring different things."
+            )
+        if prev.held_out and latest.held_out and set(prev.held_out) != set(latest.held_out):
+            moved = sorted(set(prev.held_out) ^ set(latest.held_out))
+            out.append(
+                f"the held-out set changed since run {prev.run_id} ({', '.join(moved[:6])}"
+                f"{', ...' if len(moved) > 6 else ''}). A subject that moved from train to "
+                "test was already fit during the search, so this directory's held-out "
+                "numbers are no longer out-of-sample. Restore the earlier -holdout/-seed, "
+                "or start a new -out directory."
             )
         if prev.param_units != latest.param_units:
             out.append(

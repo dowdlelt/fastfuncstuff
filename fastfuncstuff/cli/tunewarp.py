@@ -565,6 +565,7 @@ def _build_cohort_pairs(
     # number that has already stopped moving.
     n_test = sum(s.split == TEST for s in subjects)
     test = pairwise(subjects, 2 * n_test, split=TEST) if n_test else []
+    args._held_out = [s.name for s in subjects if s.split == TEST]
     if verb >= 1:
         print(describe_cohort(subjects, train))
         if test:
@@ -733,6 +734,7 @@ def main(argv: list[str] | None = None) -> int:
         panel=recipe.panel(),
         search=args.search,
         note=args.note,
+        held_out=list(getattr(args, "_held_out", [])),
     )
 
     # After begin_run, so `warnings()` can compare the earlier runs against the one

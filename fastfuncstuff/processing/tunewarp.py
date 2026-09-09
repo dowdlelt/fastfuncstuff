@@ -1109,23 +1109,35 @@ def evaluate_holdout(
         return []
 
     volumes = CohortVolumes.open(pairs, device)
-    if not any(t.backend == BASELINE and t.split == "test" for t in store.trials):
-        score_baseline(pairs, recipe, store, volumes)
+    done = {(t.config_id, t.subject) for t in store.trials if t.split == "test"}
+    baselined = {t.subject for t in store.trials if t.backend == BASELINE and t.split == "test"}
+    fresh = [p for p in pairs if p.name not in baselined]
+    if fresh:
+        score_baseline(fresh, recipe, store, volumes)
 
+    # Resuming is the normal case for a tuning directory, and a held-out fit is
+    # the most expensive kind here -- every finalist against every held-out pair.
+    # Repeating one buys nothing: the config, the pair and the engine are all the
+    # same, so it would record the number that is already in the table.
+    todo = [(r, p) for r in chosen for p in pairs if (r.config_id, p.name) not in done]
+    already = len(chosen) * len(pairs) - len(todo)
     if verb >= 1:
         print(
             f"\nHeld out: {len(chosen)} config(s) x {len(pairs)} pair(s) on "
             f"{len({p.base for p in pairs})} unseen subject(s)"
+            + (f" ({already} already recorded)" if already else "")
         )
-    bar = _fit_bar(len(chosen) * len(pairs), "held out", verb)
-    for r in chosen:
-        for pair in pairs:
-            run_trial(r.backend, pair, r.config, recipe, volumes, store)
-            if bar is not None:
-                bar.set_postfix_str(f"cfg {r.config_id}", refresh=False)
-                bar.update(1)
-        if verb >= 1:
-            _say(bar, f"  [{r.config_id:>3}] {r.backend} {r.label()}")
+    bar = _fit_bar(len(todo), "held out", verb)
+    seen: set[int] = set()
+    for r, pair in todo:
+        run_trial(r.backend, pair, r.config, recipe, volumes, store)
+        if bar is not None:
+            bar.set_postfix_str(f"cfg {r.config_id}", refresh=False)
+            bar.update(1)
+        if r.config_id not in seen:
+            seen.add(r.config_id)
+            if verb >= 1:
+                _say(bar, f"  [{r.config_id:>3}] {r.backend} {r.label()}")
         store.save()
     if bar is not None:
         bar.close()

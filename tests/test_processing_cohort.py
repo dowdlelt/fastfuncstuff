@@ -147,3 +147,37 @@ class TestPairwise:
     def test_one_subject_cannot_make_a_panel(self):
         with pytest.raises(ValueError, match="at least 2"):
             pairwise(_cohort(1), None)
+
+
+class TestResumeSafety:
+    """A tuning directory is meant to be reopened; the split must survive that."""
+
+    def test_changing_the_holdout_is_reported_as_contamination(self):
+        from fastfuncstuff.processing.tunestore import RunMeta, comparability_warnings
+
+        runs = [
+            RunMeta(1, "2026-09-09T00:00:00", held_out=["na02", "na08"]),
+            RunMeta(2, "2026-09-09T01:00:00", held_out=["na02", "na11"]),
+        ]
+        warn = " ".join(comparability_warnings(runs))
+        assert "held-out set changed" in warn
+        assert "na08" in warn and "na11" in warn
+
+    def test_an_unchanged_split_says_nothing(self):
+        from fastfuncstuff.processing.tunestore import RunMeta, comparability_warnings
+
+        runs = [
+            RunMeta(1, "2026-09-09T00:00:00", commit="a", held_out=["na02", "na08"]),
+            RunMeta(2, "2026-09-09T01:00:00", commit="a", held_out=["na08", "na02"]),
+        ]
+        assert not any("held-out" in w for w in comparability_warnings(runs))
+
+    def test_a_run_without_a_split_is_not_compared_against_one(self):
+        """An older study that predates holdouts must not be flagged for lacking one."""
+        from fastfuncstuff.processing.tunestore import RunMeta, comparability_warnings
+
+        runs = [
+            RunMeta(1, "2026-09-09T00:00:00", commit="a"),
+            RunMeta(2, "2026-09-09T01:00:00", commit="a", held_out=["na02"]),
+        ]
+        assert not any("held-out" in w for w in comparability_warnings(runs))
