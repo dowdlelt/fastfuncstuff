@@ -282,6 +282,10 @@ class Trial:
     # config starved of iterations, or did it over-run and fall back?
     levels: list[dict[str, Any]] = field(default_factory=list)
     run_id: int = 0  # which RunMeta produced this trial
+    # "train" for a fit that informed the search, "test" for one run afterwards on
+    # subjects it never saw. Defaulted to train so a store written before splits
+    # existed reads as what it was: every fit informed the answer.
+    split: str = "train"
     kept_outputs: str | None = None  # set when a trial was reproduced
 
     def as_dict(self) -> dict:
@@ -594,7 +598,9 @@ class TrialStore:
 
     # --- aggregation --------------------------------------------------------
 
-    def results(self, score_key: str = "consensus") -> list[ConfigResult]:
+    def results(
+        self, score_key: str = "consensus", split: str | None = "train"
+    ) -> list[ConfigResult]:
         """Aggregate trials into per-config results, best first.
 
         Ordering puts every passing config above every marginal one and every
@@ -612,7 +618,16 @@ class TrialStore:
         """
         by_config: dict[int, list[Trial]] = {}
         for t in self.trials:
+            # The default is train-only, and deliberately so: a table that mixed in
+            # the held-out fits would let the number a config was CHECKED on move
+            # the ranking it was checked against. `split=None` asks for everything.
+            if split is not None and t.split != split:
+                continue
             by_config.setdefault(t.config_id, []).append(t)
+        if not by_config and split is not None:
+            # A store with no split recorded, or one asked for a side it does not
+            # have: fall back rather than report an empty study.
+            return self.results(score_key, split=None) if any(self.trials) else []
 
         mvox = (self.runs[-1].n_voxels / 1e6) if self.runs else 0.0
         sigmas = margin_subject_sigma(self.trials)
@@ -1123,18 +1138,81 @@ def format_convergence(store: TrialStore) -> str:
     return "\n".join(lines)
 
 
+def format_holdout(store: TrialStore, metric: str | None = None) -> str:
+    """What the chosen settings scored on subjects the search never saw.
+
+    Compared on an ABSOLUTE metric, never on the consensus rank. A rank is
+    relative to the field it was computed in, so the training rank and the
+    held-out rank are ranks among different sets of trials and their difference
+    means nothing; the raw functional is the only number that carries across.
+
+    Read the gap, not the ordering. Some drop is expected and healthy -- the
+    training score is the best fit to a particular draw of brains. A config whose
+    held-out score falls much further than its neighbours' is the one that was
+    fitted to this cohort rather than to data of this kind, and a preset built on
+    it will disappoint on the next dataset.
+    """
+    train = {r.config_id: r for r in store.results(split="train")}
+    test = {r.config_id: r for r in store.results(split="test")}
+    shared = [cid for cid in test if cid in train]
+    if not shared:
+        return "No held-out fits in this directory (see -holdout)."
+
+    name = metric or headline_metric([test[c] for c in shared]) or ""
+    label = column_label(name)
+    if not name:
+        return "Held-out fits recorded, but no absolute metric in common to compare."
+
+    n_test = len({t.subject for t in store.trials if t.split == "test"})
+    lines = [
+        f"Held-out check ({label}, lower is better; {n_test} unseen pair(s))",
+        "",
+        f"  {'id':>4s} {'backend':16s} {'train':>9s} {'held out':>9s} {'delta':>8s} "
+        f"{'grade':9s} settings",
+        "  " + "-" * 92,
+    ]
+    rows = []
+    for cid in shared:
+        a, b = train[cid].abs_scores.get(name), test[cid].abs_scores.get(name)
+        if a is None or b is None:
+            continue
+        rows.append((b, cid, a, b - a))
+    for b, cid, a, delta in sorted(rows):
+        r = test[cid]
+        tag = "(baseline)" if r.is_baseline else r.label()
+        lines.append(
+            f"  {cid:>4d} {r.backend:16s} {a:9.4f} {b:9.4f} {delta:+8.4f} {r.band:9s} {tag}"
+        )
+    if not rows:
+        return f"Held-out fits recorded, but none scored {name}."
+    return "\n".join(lines)
+
+
 def headline_metric(results: list[ConfigResult]) -> str | None:
     """Which absolute metric to show beside the rank.
 
-    Preference order is deliberate: ``lncc`` first because it carries local
-    structure and is the one metric here that a reader outside this project will
-    recognise from ANTs, then ``ls`` as the plain correlation, then whatever exists.
+    Preference order is deliberate: an independent label overlap first when a run
+    has one -- it is the only entry here the fit could not see -- then ``lncc``
+    because it carries local structure and is the one metric a reader outside this
+    project will recognise from ANTs, then ``ls`` as the plain correlation.
     """
     have = {k for r in results for k in r.abs_scores}
-    for preferred in ("lncc", "ls", "mi"):
+    for preferred in ("dice", "lncc", "ls", "mi"):
         if preferred in have:
             return preferred
     return sorted(have)[0] if have else None
+
+
+def column_label(metric: str | None) -> str:
+    """What to print above a metric column.
+
+    Every metric here is stored lower-is-better, and for most of them the name and
+    the stored quantity are the same thing. Dice is the exception: it is famous as
+    a number that goes UP, so a column headed "dice" holding 1 - Dice is read
+    backwards by anyone who knows what Dice is -- which is everyone who would ask
+    for it. Naming the column after what is in it costs four characters.
+    """
+    return {"dice": "1-dice", "dice_q25": "1-diceQ25"}.get(metric or "", metric or "")
 
 
 @dataclass
@@ -1385,7 +1463,7 @@ def format_results_table(results: list[ConfigResult], limit: int = 25) -> str:
         f"{'clear':>6s} {'s/fit':>6s} {'bend':>8s} {'jacmin':>7s}"
     )
     if metric:
-        head += f" {metric:>9s}"
+        head += f" {column_label(metric):>9s}"
         if b_val is not None:
             head += f" {'vs base':>9s}"
     lines = [head + "  settings", "  " + "-" * (len(head) + 30)]
@@ -1494,7 +1572,7 @@ def _format_frontier(results: list[ConfigResult]) -> str:
     front.sort(key=lambda r: r.bending_mean)
     head = (
         f"  {'#':>4s} {'backend':16s} {'score':>8s} {'bend':>8s} {'jacmin':>7s} "
-        f"{'s/fit':>6s} {'n':>2s}" + (f" {metric:>9s}" if metric else "")
+        f"{'s/fit':>6s} {'n':>2s}" + (f" {column_label(metric):>9s}" if metric else "")
     )
     lines = ["", "  Accuracy/smoothness frontier -- smoothest first:", head, "  " + "-" * len(head)]
     for r in front:

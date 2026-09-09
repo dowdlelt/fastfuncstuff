@@ -73,6 +73,14 @@ from fastfuncstuff.cli_utils import (
     enable_determinism,
     setup_device,
 )
+from fastfuncstuff.processing.cohort import (
+    TEST,
+    TRAIN,
+    describe_cohort,
+    discover_cohort,
+    pairwise,
+    split_subjects,
+)
 from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
@@ -80,6 +88,7 @@ from fastfuncstuff.processing.tunestore import (
     format_convergence,
     format_export,
     format_guide,
+    format_holdout,
     format_importance,
     format_iteration_advice,
     format_knob_effects,
@@ -97,6 +106,7 @@ from fastfuncstuff.processing.tunewarp import (
     SubjectPair,
     affine_align,
     enumerate_configs,
+    evaluate_holdout,
     reproduce,
     run_adaptive,
     run_search,
@@ -125,6 +135,58 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-base", nargs="+", default=None, help="Base/target image(s)")
     parser.add_argument("-source", nargs="+", default=None, help="Affine-aligned source image(s)")
+
+    coh = parser.add_argument_group("Cohort (pairwise, judged on segmentations)")
+    coh.add_argument(
+        "-cohort",
+        metavar="DIR",
+        default=None,
+        help="A directory of subjects to fit PAIRWISE instead of -base/-source. "
+        "Each image is paired with its segmentation (see -label_suffix) and every "
+        "pair is a real test: subject A's tracing is carried through the warp and "
+        "compared against subject B's own tracing, so the referee is a human "
+        "rather than the intensities the fit was driven by.",
+    )
+    coh.add_argument(
+        "-label_suffix",
+        "-label-suffix",
+        default="_seg",
+        metavar="SUFFIX",
+        help="How a segmentation is named beside its image (default: _seg, i.e. "
+        "na01.nii.gz -> na01_seg.nii.gz). A subject with no match is still fit, "
+        "and simply cannot be judged on anatomy.",
+    )
+    coh.add_argument(
+        "-pairs",
+        default="16",
+        metavar="N|all",
+        help="Training pairs to fit per round of the search (default: 16). "
+        "Chosen round-robin, so every subject appears equally often as a base and "
+        "as a source and no single unusual brain can dominate a small panel. "
+        "'all' is every ordered pair, which on 16 subjects is 240 fits per config.",
+    )
+    coh.add_argument(
+        "-holdout",
+        type=float,
+        default=0.25,
+        metavar="FRAC|N",
+        help="Subjects reserved from the search entirely (default: 0.25; 0 disables). "
+        "The search never sees them, and after it finishes the settings it chose "
+        "are fit on them once -- which is the only number in the table that is not "
+        "in-sample. Split by SUBJECT, never by pair: pairs A->B and A->C share a "
+        "brain, so a held-out pair reusing a training subject measures a setting "
+        "that was partly chosen on that same brain.",
+    )
+    coh.add_argument(
+        "-holdout_configs",
+        "-holdout-configs",
+        type=int,
+        default=5,
+        metavar="N",
+        help="Finalists re-fit on the held-out subjects (default: 5). Deliberately "
+        "few: a held-out set used to CHOOSE among many candidates stops being held "
+        "out. It answers 'does the chosen setting transfer', not 'which is best'.",
+    )
     parser.add_argument(
         "-backend",
         nargs="+",
@@ -486,6 +548,29 @@ def subject_names(paths: list[str]) -> list[str]:
     return [f"{s}#{i}" for i, s in enumerate(stems)]
 
 
+def _build_cohort_pairs(
+    args: argparse.Namespace, verb: int = 1
+) -> tuple[list[SubjectPair], list[SubjectPair]]:
+    """Discover a labelled cohort and split it into training and held-out pairs."""
+    subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix)
+    subjects = split_subjects(subjects, args.holdout, seed=args.seed)
+
+    n_pairs = None if str(args.pairs).lower() == "all" else int(args.pairs)
+    train = pairwise(subjects, n_pairs, split=TRAIN)
+    # Every held-out pair, not a panel of them: this set is fit once, on a handful
+    # of configs, so there is no budget reason to sample it -- and the whole value
+    # of the number is that it is not a draw of pairs chosen to look good.
+    test = pairwise(subjects, None, split=TEST) if any(s.split == TEST for s in subjects) else []
+    if verb >= 1:
+        print(describe_cohort(subjects, train))
+        if test:
+            print(f"  {len(test)} held-out pair(s), fit after the search")
+        missing = [s.name for s in subjects if s.labels is None]
+        if missing:
+            print(f"  ! no segmentation for: {', '.join(missing)}")
+    return train, test
+
+
 def _build_pairs(args: argparse.Namespace, pairing: str) -> list[SubjectPair]:
     """Turn -base/-source into subject pairs, per the recipe's pairing rule."""
     bases, sources = args.base or [], args.source or []
@@ -572,6 +657,8 @@ def main(argv: list[str] | None = None) -> int:
             print(format_convergence(store))
         if args.list:
             print(format_results_table(store.results(), limit=args.top))
+            if any(t.split == TEST for t in store.trials):
+                print("\n" + format_holdout(store))
         if args.plot is not None:
             _write_plot(store, args.plot or out / "frontier.png", args.recipe)
         return 0
@@ -589,7 +676,16 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("-type is required to run a search (see -help for recipes)")
     fixed = parse_fix(args.fix or [])
     recipe = with_overrides(RECIPES[args.recipe], fixed, args.tune)
-    pairs = _build_pairs(args, recipe.pairing)
+    held_out: list[SubjectPair] = []
+    if args.cohort:
+        pairs, held_out = _build_cohort_pairs(args, args.verb)
+    else:
+        pairs = _build_pairs(args, recipe.pairing)
+    if recipe.labels and not all(p.has_labels for p in pairs):
+        raise SystemExit(
+            f"-type {recipe.name} is judged on segmentations, but some pairs have none. "
+            "Check -label_suffix, or pick a recipe that judges on intensities."
+        )
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
     backends = args.backend or list(recipe.backends)
 
@@ -684,6 +780,17 @@ def main(argv: list[str] | None = None) -> int:
 
     store.compute_consensus(recipe.panel())
     store.save()
+
+    if held_out:
+        evaluate_holdout(
+            held_out,
+            recipe,
+            store,
+            n_configs=args.holdout_configs,
+            device=device,
+            verb=args.verb,
+        )
+
     if (warn := store.warnings()) and args.verb < 1:
         # Already said before the fits when verbose; repeated here only for a quiet
         # run, where this is the first and last chance to say it.
@@ -691,6 +798,8 @@ def main(argv: list[str] | None = None) -> int:
         for w in warn:
             print(f"  - {w}")
     print("\n" + format_results_table(store.results(), limit=args.top))
+    if held_out:
+        print("\n" + format_holdout(store))
     if not args.no_plot:
         _write_plot(store, args.plot or out / "frontier.png", recipe.name)
     print("\nPer-knob effects:\n")

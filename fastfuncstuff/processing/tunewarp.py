@@ -82,6 +82,11 @@ class SubjectPair:
     source: str
     base_labels: str | None = None
     source_labels: str | None = None
+    # Which side of a held-out split this pair belongs to. Recorded on every trial
+    # so the ranking can be built from the training pairs alone and the held-out
+    # ones read separately -- a config's score on data that helped choose it is
+    # not evidence that it transfers.
+    split: str = "train"
 
     @property
     def has_labels(self) -> bool:
@@ -604,7 +609,7 @@ def run_trial(
         }
     seconds = time.time() - t0
 
-    store.add(backend, pair.name, config, cmd, seconds=seconds, **outcome)
+    store.add(backend, pair.name, config, cmd, seconds=seconds, split=pair.split, **outcome)
     if referee.device.type == "cuda":
         torch.cuda.empty_cache()
 
@@ -636,6 +641,7 @@ def score_baseline(
             {},
             [],
             seconds=0.0,
+            split=pair.split,
             **outcome,
         )
 
@@ -1023,6 +1029,68 @@ def run_adaptive(
 
         store.compute_consensus(panel)
         store.save()
+
+
+def evaluate_holdout(
+    pairs: list[SubjectPair],
+    recipe: Recipe,
+    store: TrialStore,
+    n_configs: int = 5,
+    device: torch.device | None = None,
+    verb: int = 1,
+) -> list[int]:
+    """Fit the settings the search chose on the subjects it never saw.
+
+    This is the only honest number a tuning run produces. Everything else in the
+    table is in-sample: the surrogate proposed those configs *because* of how they
+    scored on those brains, the ladders grew toward them, and the winner is by
+    construction the config that best fits this particular draw of subjects. Run
+    it again on brains that took no part in any of that and the score moves --
+    usually down, and how far down is the thing a reader of the preset needs.
+
+    Only the finalists are re-fit, because the point is not another ranking. A
+    held-out set used to *choose* between many candidates stops being held out;
+    it can answer "does the chosen setting transfer", once, for a few candidates.
+    Passing rows first, in the training table's own order, so the config a user
+    would actually take is always among them.
+
+    Returns the config ids that were evaluated.
+    """
+    if not pairs:
+        return []
+    device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    ranked = [r for r in store.results(split="train") if not r.is_baseline]
+    # The frontier rows are the real choices on the accuracy/smoothness trade, so
+    # they earn a slot even when a rougher config outranks them.
+    chosen: list[Any] = [r for r in ranked if r.grade == "pass"][:n_configs]
+    for r in ranked:
+        if r.pareto and r not in chosen and len(chosen) < n_configs + 2:
+            chosen.append(r)
+    if not chosen:
+        if verb >= 1:
+            print("  no passing config to check on the held-out subjects")
+        return []
+
+    volumes = CohortVolumes.open(pairs, device)
+    if not any(t.backend == BASELINE and t.split == "test" for t in store.trials):
+        score_baseline(pairs, recipe, store, volumes)
+
+    if verb >= 1:
+        print(
+            f"\nHeld out: {len(chosen)} config(s) x {len(pairs)} pair(s) on "
+            f"{len({p.base for p in pairs})} unseen subject(s)"
+        )
+    for r in chosen:
+        for pair in pairs:
+            run_trial(r.backend, pair, r.config, recipe, volumes, store)
+        if verb >= 1:
+            print(f"  [{r.config_id:>3}] {r.backend} {r.label()}", flush=True)
+        store.save()
+
+    store.compute_consensus(recipe.panel())
+    store.save()
+    return [r.config_id for r in chosen]
 
 
 def _screen_pairs(
