@@ -181,3 +181,66 @@ class TestResumeSafety:
             RunMeta(2, "2026-09-09T01:00:00", commit="a", held_out=["na02"]),
         ]
         assert not any("held-out" in w for w in comparability_warnings(runs))
+
+
+class TestPanelSizingAndRotation:
+    """The panel is the measuring instrument. Too big and the search goes blind;
+    stationary and the settings get tuned to one fixed set of brains."""
+
+    def test_panel_is_capped_at_half_the_budget(self):
+        """Total fits equal the budget, so a bigger pool leaves pairs with one
+        trial -- and a pair with one trial has no z-score, so every fit on it is
+        invisible to the surrogate."""
+        from fastfuncstuff.processing.cohort import panel_size
+
+        assert panel_size(90, 60) == 30
+        assert panel_size(90, 300) == 90  # pool-capped, not budget-capped
+        assert panel_size(2450, 120) == 60
+
+    def test_a_tiny_budget_still_gets_a_panel(self):
+        from fastfuncstuff.processing.cohort import panel_size
+
+        assert panel_size(90, 1) == 2
+
+    def test_successive_runs_share_half_their_panel(self):
+        from fastfuncstuff.processing.cohort import rotation_start
+
+        subs = _cohort(10)
+        panels = [{p.name for p in pairwise(subs, 8, start=rotation_start(r, 8))} for r in range(4)]
+        for a, b in zip(panels, panels[1:], strict=False):
+            assert len(a & b) == 4, "half the pairs should carry over"
+            assert len(b - a) == 4, "and half should be fresh"
+
+    def test_a_fresh_study_starts_at_the_beginning(self):
+        from fastfuncstuff.processing.cohort import rotation_start
+
+        assert rotation_start(0, 30) == 0
+
+    def test_rotation_covers_new_ground(self):
+        """The point of moving at all: a stationary panel re-measures the same
+        pairs no matter how much budget is spent."""
+        from fastfuncstuff.processing.cohort import rotation_start
+
+        subs = _cohort(10)
+        seen = set()
+        for r in range(6):
+            seen |= {p.name for p in pairwise(subs, 8, start=rotation_start(r, 8))}
+        assert len(seen) == 28  # against 8 if the panel never moved
+
+    def test_the_window_enumerates_every_ordered_pair_exactly_once(self):
+        subs = _cohort(6)
+        names = [p.name for p in pairwise(subs, None)]
+        assert len(names) == len(set(names)) == 30
+
+    def test_a_slid_window_is_still_balanced(self):
+        """A window that straddles an offset boundary must not over-sample a brain."""
+        import collections
+
+        subs = _cohort(10)
+        window = pairwise(subs, 30, start=17)
+        counts = collections.Counter(p.base for p in window)
+        assert set(counts.values()) == {3}
+
+    def test_the_window_wraps_rather_than_running_out(self):
+        subs = _cohort(4)  # 12 ordered pairs
+        assert len(pairwise(subs, 6, start=10)) == 6

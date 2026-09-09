@@ -156,10 +156,29 @@ def _hash_fraction(name: str, seed: int) -> float:
     return int.from_bytes(digest, "big") / 2**64
 
 
+def panel_size(n_pool: int, budget: int) -> int:
+    """The largest panel whose every pair still informs the search.
+
+    The pairs are the measuring instrument, not the thing being selected, and the
+    surrogate compares configs by z-scoring each trial *within its pair* -- which
+    is what stops a ranking of settings from becoming a ranking of brains, since
+    raw overlap varies more between pairs than between the settings under test.
+
+    A z-score needs a spread, so a pair carrying a single trial has no usable one
+    and every trial on it is dropped from the surrogate: recorded in the table,
+    invisible to the search. Total trials equal the budget, so a pool larger than
+    budget/2 guarantees that a growing share of the fits stop informing anything.
+    That is arithmetic rather than taste, which is why it is a default and not a
+    constant someone has to know.
+    """
+    return max(2, min(n_pool, budget // 2))
+
+
 def pairwise(
     subjects: list[CohortSubject],
     n_pairs: int | None = None,
     split: str | None = None,
+    start: int = 0,
 ) -> list[SubjectPair]:
     """A balanced set of ordered pairs from one side of the cohort.
 
@@ -170,6 +189,11 @@ def pairwise(
     pairs at random, this cannot happen to over-represent the one brain that is
     unlike the others -- which on a cohort of sixteen is the difference between a
     panel and an anecdote.
+
+    ``start`` slides that enumeration, cycling, so successive runs of one study
+    can draw overlapping panels rather than the same one forever. A window that
+    does not divide evenly by the subject count is balanced to within one
+    appearance per subject.
 
     ``n_pairs=None`` means every ordered pair. Direction matters and both are
     kept: A->B and B->A are different fits with different answers, and their
@@ -183,24 +207,37 @@ def pairwise(
             + (f" on the {split} side" if split else "")
         )
 
-    wanted = n * (n - 1) if n_pairs is None else min(n_pairs, n * (n - 1))
+    total = n * (n - 1)
+    wanted = total if n_pairs is None else min(n_pairs, total)
     pairs: list[SubjectPair] = []
-    for offset in range(1, n):
-        for i in range(n):
-            if len(pairs) >= wanted:
-                return pairs
-            base, source = pool[i], pool[(i + offset) % n]
-            pairs.append(
-                SubjectPair(
-                    name=f"{source.name}_to_{base.name}",
-                    base=base.image,
-                    source=source.image,
-                    base_labels=base.labels,
-                    source_labels=source.labels,
-                    split=base.split,
-                )
+    for step in range(wanted):
+        k = (start + step) % total
+        base, source = pool[k % n], pool[(k % n + 1 + k // n) % n]
+        pairs.append(
+            SubjectPair(
+                name=f"{source.name}_to_{base.name}",
+                base=base.image,
+                source=source.image,
+                base_labels=base.labels,
+                source_labels=source.labels,
+                split=base.split,
             )
+        )
     return pairs
+
+
+def rotation_start(n_run: int, panel: int) -> int:
+    """Where run ``n_run`` (0-based) should begin its round-robin window.
+
+    Half a panel per run, so each run reuses half of the last one and draws half
+    fresh. The carried-over pairs pick up a second and third trial, which sharpens
+    the within-pair calibration every config is scored against and keeps configs
+    from different runs measured partly on the same instrument -- resume pools
+    them all into one surrogate, so that matters. The fresh half is what stops a
+    study from tuning its parameters to one fixed set of brains, which is what a
+    stationary panel does no matter how much budget is spent on it.
+    """
+    return max(1, panel // 2) * max(0, n_run)
 
 
 def describe_cohort(subjects: list[CohortSubject], pairs: list[SubjectPair]) -> str:

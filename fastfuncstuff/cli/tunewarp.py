@@ -79,6 +79,8 @@ from fastfuncstuff.processing.cohort import (
     describe_cohort,
     discover_cohort,
     pairwise,
+    panel_size,
+    rotation_start,
     split_subjects,
 )
 from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
@@ -158,12 +160,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     coh.add_argument(
         "-pairs",
-        default="16",
+        default=None,
         metavar="N|all",
-        help="Training pairs to fit per round of the search (default: 16). "
-        "Chosen round-robin, so every subject appears equally often as a base and "
-        "as a source and no single unusual brain can dominate a small panel. "
-        "'all' is every ordered pair, which on 16 subjects is 240 fits per config.",
+        help="Pairs the search may draw on, per run [default: budget/2]. Chosen "
+        "round-robin, so every subject appears equally often as a base and as a "
+        "source and no single unusual brain can dominate a small panel; the window "
+        "slides half a panel each run, so a resumed study reuses half its pairs "
+        "(sharpening what they measure) and draws half fresh (so the settings are "
+        "not tuned to one fixed set of brains). The default is arithmetic, not "
+        "taste: the search compares settings by z-scoring each fit against the "
+        "other fits on the SAME pair, which needs at least two, and total fits "
+        "equal the budget -- so a pool above budget/2 makes a growing share of "
+        "your fits invisible to the search. 'all' is every ordered pair.",
     )
     coh.add_argument(
         "-holdout",
@@ -549,14 +557,26 @@ def subject_names(paths: list[str]) -> list[str]:
 
 
 def _build_cohort_pairs(
-    args: argparse.Namespace, verb: int = 1
+    args: argparse.Namespace, n_run: int = 0, verb: int = 1
 ) -> tuple[list[SubjectPair], list[SubjectPair]]:
     """Discover a labelled cohort and split it into training and held-out pairs."""
     subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix)
     subjects = split_subjects(subjects, args.holdout, seed=args.seed)
 
-    n_pairs = None if str(args.pairs).lower() == "all" else int(args.pairs)
-    train = pairwise(subjects, n_pairs, split=TRAIN)
+    n_train = sum(s.split == TRAIN for s in subjects)
+    pool = n_train * (n_train - 1)
+    if args.pairs is None:
+        n_pairs = panel_size(pool, args.budget) if args.search == "adaptive" else min(pool, 4)
+    elif str(args.pairs).lower() == "all":
+        n_pairs = None
+    else:
+        n_pairs = int(args.pairs)
+
+    # The window slides between runs so a resumed study stops re-measuring one
+    # fixed panel. The HELD-OUT panel deliberately does not move: its whole value
+    # is being the same yardstick every time the study is reopened.
+    start = rotation_start(n_run, n_pairs) if n_pairs else 0
+    train = pairwise(subjects, n_pairs, split=TRAIN, start=start)
     # The held-out panel is a fixed round-robin decided BEFORE any of it is fit, so
     # capping it costs nothing in honesty -- what would cost is choosing which
     # pairs to keep after seeing them. Two offsets means every held-out subject
@@ -568,6 +588,8 @@ def _build_cohort_pairs(
     args._held_out = [s.name for s in subjects if s.split == TEST]
     if verb >= 1:
         print(describe_cohort(subjects, train))
+        if start:
+            print(f"  panel window starts at pair {start} of {pool} (run {n_run + 1})")
         if test:
             print(f"  {len(test)} held-out pair(s), fit after the search")
         missing = [s.name for s in subjects if s.labels is None]
@@ -683,7 +705,9 @@ def main(argv: list[str] | None = None) -> int:
     recipe = with_overrides(RECIPES[args.recipe], fixed, args.tune)
     held_out: list[SubjectPair] = []
     if args.cohort:
-        pairs, held_out = _build_cohort_pairs(args, args.verb)
+        # len(store.runs) is the number of runs BEFORE this one, so a fresh study
+        # is run 0 and each resume slides the panel window along.
+        pairs, held_out = _build_cohort_pairs(args, len(store.runs), args.verb)
     else:
         pairs = _build_pairs(args, recipe.pairing)
     if recipe.labels and not all(p.has_labels for p in pairs):
