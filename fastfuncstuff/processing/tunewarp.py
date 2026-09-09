@@ -22,6 +22,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import product
 from pathlib import Path
@@ -1538,6 +1539,36 @@ def _promising(store: TrialStore, backend: str, panel: list[str], config: dict) 
     return statistics.fmean([o.score for o in mine]) <= feasible[len(feasible) // 2]
 
 
+# What a diagnostics run scores the warped IMAGES with, on top of the labels.
+# One per family rather than the whole registry: the AFNI functionals agree with
+# each other at rank correlation >= 0.96 on same-modality data, so fourteen of
+# them is one judge counted fourteen times, and each costs a pass over the volume.
+DIAGNOSTIC_METRICS = ("lpa", "ls", "mi", "nmi", "lncc", "ngf", "mse")
+
+
+def resolve_diagnostic_metrics(names: Sequence[str] | None, contrast: str = "same") -> list[str]:
+    """The intensity metrics to record beside the label scores.
+
+    ``None`` is the curated default; ``["all"]`` is every metric meaningful for
+    this contrast. Label and group metrics are dropped here whatever is asked
+    for -- they are scored from the segmentations, not from one warped image
+    against the base, and asking for them at this point is a category error
+    rather than a request.
+    """
+    from .metrics import METRICS, panel_for
+
+    if names is None:
+        wanted = list(DIAGNOSTIC_METRICS)
+    elif len(names) == 1 and names[0] == "all":
+        wanted = panel_for(None, contrast, grid=True)
+    else:
+        wanted = list(names)
+    for n in wanted:
+        if n not in METRICS:
+            raise ValueError(f"unknown metric {n!r}; see ffs_util_cost -help for the list")
+    return [n for n in wanted if not METRICS[n].needs_labels and not METRICS[n].group]
+
+
 def group_diagnostics(
     pairs: list[SubjectPair],
     recipe: Recipe,
@@ -1547,6 +1578,7 @@ def group_diagnostics(
     device: torch.device | None = None,
     save_subject_labels: bool = False,
     method: str = "ffs",
+    metrics: Sequence[str] | None = None,
     verb: int = 1,
 ) -> list[Path]:
     """Re-fit one config on the cohort and write everything behind its score.
@@ -1569,6 +1601,7 @@ def group_diagnostics(
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir.mkdir(parents=True, exist_ok=True)
+    metrics = resolve_diagnostic_metrics(metrics, recipe.contrast)
     volumes = CohortVolumes.open(pairs, device)
 
     segs: list[torch.Tensor] = []
@@ -1587,7 +1620,7 @@ def group_diagnostics(
             recipe,
             referee.device,
         )
-        one = referee.score(warped, field, [])
+        one = referee.score(warped, field, metrics)
         seg = volumes.source_labels(pair)
         if seg is not None and field is not None:
             segs.append(
@@ -1603,6 +1636,7 @@ def group_diagnostics(
                 "bend": float(one["warpqc"].get("bending_energy", 0.0)),
                 "jacmin": float(one["warpqc"].get("jac_min", 1.0)),
                 "seconds": time.time() - t0,
+                "metrics": dict(one.get("scores", {})),
             }
         )
         del warped, field
@@ -1781,24 +1815,25 @@ def _write_subject_table(
             continue
         mine[a].append(float(row.mean()))
         mine[b].append(float(row.mean()))
-    lines = [
-        "\t".join(["method", "subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"])
-    ]
+    # Whatever intensity functionals were scored become columns, in a stable
+    # order, so two methods scored with different -metrics still concatenate --
+    # pandas fills the gaps rather than refusing to line them up.
+    extra = sorted({k for r in rows for k in r.get("metrics", {})})
+    head = ["method", "subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"]
+    lines = ["\t".join(head + extra)]
     for r in rows:
         vals = mine.get(r["subject"], [])
-        lines.append(
-            "\t".join(
-                [
-                    method,
-                    r["subject"],
-                    _num(statistics.fmean(vals) if vals else None),
-                    str(r.get("grade", "")),
-                    _num(r.get("bend"), 5),
-                    _num(r.get("jacmin")),
-                    _num(r.get("seconds"), 1),
-                ]
-            )
-        )
+        cells = [
+            method,
+            r["subject"],
+            _num(statistics.fmean(vals) if vals else None),
+            str(r.get("grade", "")),
+            _num(r.get("bend"), 5),
+            _num(r.get("jacmin")),
+            _num(r.get("seconds"), 1),
+        ]
+        cells += [_num(r.get("metrics", {}).get(k)) for k in extra]
+        lines.append("\t".join(cells))
     path.write_text("\n".join(lines) + "\n")
     return path
 
@@ -1845,6 +1880,12 @@ def _write_summary(
         _num(min(jacs) if jacs else None),
         _num(sum(secs) if secs else None, 1),
     ]
+    # The intensity functionals averaged over subjects, so one row per method
+    # carries both halves: what we rank on, and what the other tools optimise.
+    for k in sorted({k for r in rows for k in r.get("metrics", {})}):
+        vals = [r["metrics"][k] for r in rows if k in r.get("metrics", {})]
+        head.append(k)
+        row.append(_num(statistics.fmean(vals) if vals else None))
     path.write_text("\t".join(head) + "\n" + "\t".join(row) + "\n")
     return path
 
@@ -1867,6 +1908,9 @@ def diagnose_warped(
     subjects: list,
     out_dir: Path,
     method: str,
+    base: str | None = None,
+    metrics: Sequence[str] | None = None,
+    contrast: str = "same",
     device: torch.device | None = None,
     save_subject_labels: bool = False,
     verb: int = 1,
@@ -1882,8 +1926,21 @@ def diagnose_warped(
     reading if the instrument is identical on both sides, and every published
     registration comparison has to argue that it was. Here it is not an argument:
     there is one scorer and both sides call it.
+
+    ``base`` turns on the intensity half of the table. Given the template and the
+    warped IMAGES beside the labels, every method also gets scored on the
+    functionals other tools optimise -- lpa, mutual information, local
+    correlation -- against the same base, with the same weight image and the same
+    mask. We rank on the labels, but a table that only carried Dice would be
+    answering a different question from the one the other tools were tuned for,
+    and the comparison is more honest for showing both.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    metrics = resolve_diagnostic_metrics(metrics, contrast)
+    referee = Referee(base, device) if base else None
+    if referee is not None and verb >= 1:
+        print(f"  scoring images against {Path(base).name}: {', '.join(metrics)}")
+
     segs, names, rows = [], [], []
     for s in subjects:
         if s.labels is None:
@@ -1899,7 +1956,29 @@ def diagnose_warped(
         # No warp was fitted here, so there is no regularity to report. Left empty
         # rather than filled with a neutral-looking number: a blank reads as
         # "not measured", and 1.0 would read as "measured, and perfect".
-        rows.append({"subject": s.name, "grade": "", "bend": None, "jacmin": None, "seconds": None})
+        row: dict[str, Any] = {
+            "subject": s.name,
+            "grade": "",
+            "bend": None,
+            "jacmin": None,
+            "seconds": None,
+            "metrics": {},
+        }
+        if referee is not None and s.image:
+            img, _ = load_image(s.image, device=device)
+            if img.ndim == 4:
+                img = img[0]
+            if tuple(img.shape) != tuple(referee.base.shape):
+                raise ValueError(
+                    f"{s.name}: warped image is {tuple(img.shape)} but the base is "
+                    f"{tuple(referee.base.shape)}. -diag_only scores what a tool "
+                    "already produced, so the images must be on the base's grid."
+                )
+            # No field to check -- somebody else's warp -- so this is the
+            # similarity half only. The regularity columns stay blank.
+            row["metrics"] = referee.score(img, None, metrics)["scores"]
+            del img
+        rows.append(row)
         if verb >= 1:
             print(f"  {s.name}: {Path(s.labels).name}", flush=True)
 
@@ -1917,7 +1996,12 @@ def diagnose_warped(
         names,
         rows,
         header,
-        meta={"mode": "diag_only", "inputs": [s.labels for s in subjects]},
+        meta={
+            "mode": "diag_only",
+            "base": base,
+            "metrics": metrics,
+            "inputs": [s.labels for s in subjects],
+        },
         save_subject_labels=save_subject_labels,
     )
 

@@ -793,3 +793,55 @@ def test_a_group_row_keeps_the_cohorts_worst_regularity(tmp_path):
     assert row.subject == COHORT
     assert row.warpqc["bending_energy"] == pytest.approx(0.009)  # roughest subject
     assert row.warpqc["jac_min"] == pytest.approx(0.05)  # most compressed subject
+
+
+def test_diagnostic_metric_resolution():
+    """Label and group metrics are scored from segmentations, not from one warped
+    image against a base, so asking for them here is a category error."""
+    from fastfuncstuff.processing.tunewarp import DIAGNOSTIC_METRICS, resolve_diagnostic_metrics
+
+    assert resolve_diagnostic_metrics(None) == list(DIAGNOSTIC_METRICS)
+    assert resolve_diagnostic_metrics(["lpa", "mi"]) == ["lpa", "mi"]
+    assert resolve_diagnostic_metrics(["lpa", "dice", "xdice"]) == ["lpa"]
+    assert len(resolve_diagnostic_metrics(["all"])) > len(DIAGNOSTIC_METRICS)
+    with pytest.raises(ValueError, match="unknown metric"):
+        resolve_diagnostic_metrics(["not_a_metric"])
+
+
+def test_diagnostic_tables_carry_the_intensity_columns(tmp_path):
+    """We rank on the labels, but the other tools were tuned on these -- a table
+    showing only Dice answers a different question from the one they optimised."""
+    import csv
+
+    import torch
+
+    from fastfuncstuff.processing.tunewarp import write_diagnostics
+
+    seg = torch.zeros(8, 8, 8, dtype=torch.uint8)
+    seg[1:5, 1:5, 1:5] = 1
+    segs = [seg, seg.clone(), seg.clone()]
+    rows = [
+        {
+            "subject": f"s{i}",
+            "grade": "",
+            "bend": None,
+            "jacmin": None,
+            "seconds": None,
+            "metrics": {"lpa": -0.5 - i, "mi": -0.2},
+        }
+        for i in range(3)
+    ]
+    write_diagnostics(tmp_path, "Some Tool", segs, ["s0", "s1", "s2"], rows)
+
+    with open(tmp_path / "per_subject.tsv") as fh:
+        per_subject = list(csv.DictReader(fh, delimiter="\t"))
+    assert [r["method"] for r in per_subject] == ["Some Tool"] * 3
+    assert float(per_subject[0]["lpa"]) == pytest.approx(-0.5)
+    # Nothing was fitted, so regularity is BLANK rather than a neutral-looking 1.0
+    assert per_subject[0]["jacmin"] == ""
+
+    with open(tmp_path / "summary.tsv") as fh:
+        summary = list(csv.DictReader(fh, delimiter="\t"))[0]
+    assert summary["method"] == "Some Tool"
+    assert float(summary["lpa"]) == pytest.approx(-1.5)  # mean over subjects
+    assert float(summary["dice_mean"]) == pytest.approx(1.0)

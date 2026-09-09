@@ -112,6 +112,7 @@ from fastfuncstuff.processing.tunestore import (
     recommend_iterations,
 )
 from fastfuncstuff.processing.tunewarp import (
+    DIAGNOSTIC_METRICS,
     AdaptivePlan,
     SubjectPair,
     affine_align,
@@ -377,6 +378,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "That sameness is the point -- a tool comparison is only worth reading if "
         "the instrument is identical on both sides, and here that is not an "
         "argument but the same function. Combine with -collect for the head-to-head.",
+    )
+    act.add_argument(
+        "-metrics",
+        nargs="+",
+        default=None,
+        metavar="NAME",
+        help="Image functionals to record beside the label scores in a diagnostics "
+        f"run [default: {' '.join(DIAGNOSTIC_METRICS)}]. 'all' takes every metric "
+        "meaningful for the contrast. With -diag_only these need -base and the "
+        "warped IMAGES beside the labels: we rank on the labels, but the other "
+        "tools were tuned on these, so a comparison that showed only Dice would be "
+        "answering a different question from the one they were optimising.",
     )
     act.add_argument(
         "-collect",
@@ -845,10 +858,14 @@ def main(argv: list[str] | None = None) -> int:
         subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix, labels_only=True)
         target = out / "diag" / _slug(args.diag_only)
         print(f"\nScoring {len(subjects)} pre-warped segmentation(s) as {args.diag_only!r}")
+        contrast = RECIPES[args.recipe].contrast if args.recipe else "same"
         written = diagnose_warped(
             subjects,
             target,
             args.diag_only,
+            base=args.base[0] if args.base else None,
+            metrics=args.metrics,
+            contrast=contrast,
             device=setup_device(args.device, tf32=REGISTRATION_TF32),
             save_subject_labels=args.save_subject_labels,
             verb=args.verb,
@@ -885,6 +902,7 @@ def main(argv: list[str] | None = None) -> int:
             target,
             device=device,
             save_subject_labels=args.save_subject_labels,
+            metrics=args.metrics,
             verb=args.verb,
         )
         print(f"\nWrote {len(written)} file(s) to {target}")
