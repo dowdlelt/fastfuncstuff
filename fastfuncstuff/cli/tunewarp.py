@@ -392,6 +392,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "answering a different question from the one they were optimising.",
     )
     act.add_argument(
+        "-warp_suffix",
+        "-warp-suffix",
+        default=None,
+        metavar="SUFFIX",
+        help="With -diag_only, also read each method's own displacement field "
+        "(e.g. -warp_suffix _WARP finds na01_WARP.nii.gz) and grade it for "
+        "folding, compression and bending with the SAME code that grades ours. "
+        "This is how 'how much deformation is normal?' becomes a measurement: the "
+        "bounds in warpqc are thresholds on a continuum, and only warps the field "
+        "already accepts can say where that continuum sits.",
+    )
+    act.add_argument(
+        "-warp_units",
+        "-warp-units",
+        choices=("mm", "voxel"),
+        default="mm",
+        help="Units of the fields read by -warp_suffix (default: mm, which is what "
+        "AFNI and ANTs write; ours are voxel). Check jac_neg_frac in the output -- "
+        "a field read under the wrong convention reports implausible folding "
+        "rather than failing, so that column is the check that it was understood.",
+    )
+    act.add_argument(
         "-collect",
         action="store_true",
         help="Concatenate every method's tables under {out}/diag/ into all_*.tsv, "
@@ -642,6 +664,22 @@ def _wrap(text: str, width: int) -> list[str]:
     return out
 
 
+def _find_warps(root: str, suffix: str, subjects) -> dict[str, str]:
+    """Match each subject to its own displacement field by name.
+
+    Matched on the subject stem rather than by position, because a method that
+    failed on one brain simply has no warp for it -- and pairing by position
+    would then silently attribute every subsequent field to the wrong subject.
+    """
+    found: dict[str, str] = {}
+    for s in subjects:
+        for cand in sorted(Path(root).glob(f"{s.name}{suffix}*")):
+            if cand.is_file():
+                found[s.name] = str(cand)
+                break
+    return found
+
+
 def _slug(name: str) -> str:
     """A directory name from a method name, keeping it recognisable.
 
@@ -862,10 +900,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.diag_only:
         if not args.cohort:
             raise SystemExit("-diag_only needs -cohort DIR: the labels to score")
-        subjects = discover_cohort(args.cohort, label_suffix=args.label_suffix, labels_only=True)
+        subjects = discover_cohort(
+            args.cohort,
+            label_suffix=args.label_suffix,
+            labels_only=True,
+            ignore_suffixes=(args.warp_suffix,) if args.warp_suffix else (),
+        )
         target = out / "diag" / _slug(args.diag_only)
         print(f"\nScoring {len(subjects)} pre-warped segmentation(s) as {args.diag_only!r}")
         contrast = RECIPES[args.recipe].contrast if args.recipe else "same"
+        warps = _find_warps(args.cohort, args.warp_suffix, subjects) if args.warp_suffix else None
+        if args.warp_suffix and not warps:
+            raise SystemExit(f"no warp files matching *{args.warp_suffix}* in {args.cohort}")
         written = diagnose_warped(
             subjects,
             target,
@@ -873,6 +919,8 @@ def main(argv: list[str] | None = None) -> int:
             base=args.base[0] if args.base else None,
             metrics=args.metrics,
             contrast=contrast,
+            warps=warps,
+            warp_units=args.warp_units,
             device=setup_device(args.device, tf32=REGISTRATION_TF32),
             save_subject_labels=args.save_subject_labels,
             verb=args.verb,

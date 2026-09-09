@@ -845,3 +845,51 @@ def test_diagnostic_tables_carry_the_intensity_columns(tmp_path):
     assert summary["method"] == "Some Tool"
     assert float(summary["lpa"]) == pytest.approx(-1.5)  # mean over subjects
     assert float(summary["dice_mean"]) == pytest.approx(1.0)
+
+
+def test_external_warp_regularity_matches_an_analytic_field(tmp_path):
+    """Grading another tool's field is only useful if the numbers are right.
+
+    A displacement of A*sin(2*pi*x/L) along x has a det(J) whose extremes are
+    known in closed form, so the loader, the unit conversion and
+    warp_regularity are all checked against them at once.
+
+    The swing is A*sin(2*pi/L), NOT the continuous 2*pi*A/L: the Jacobian comes
+    from a central difference at one-voxel spacing, and on this field the two
+    differ by 3%. Worth pinning -- it is the kind of gap that reads as a small
+    bug when it is actually the discretisation doing exactly what it should.
+    """
+    import math
+
+    import torch
+
+    from fastfuncstuff.processing.io import save_warp_field
+    from fastfuncstuff.processing.tunewarp import _warp_quality
+
+    n, amp, period = 40, 2.0, 20.0
+    x = torch.arange(n, dtype=torch.float32)
+    xd = (amp * torch.sin(2 * math.pi * x / period)).view(1, 1, n).expand(n, n, n).contiguous()
+    zeros = torch.zeros_like(xd)
+    path = tmp_path / "s01_WARP.nii.gz"
+    save_warp_field(xd, zeros, zeros.clone(), path)
+
+    out = _warp_quality(str(path), None, "voxel", torch.device("cpu"))
+    swing = amp * math.sin(2 * math.pi / period)
+    assert out["jac_p01"] == pytest.approx(1 - swing, abs=1e-3)
+    assert out["jac_p99"] == pytest.approx(1 + swing, abs=1e-3)
+    assert out["jac_neg_frac"] == 0.0
+    assert out["grade"] == "pass"
+    assert out["disp_p99_mm"] == pytest.approx(amp, abs=1e-3)
+
+
+def test_unknown_warp_units_are_refused(tmp_path):
+    import torch
+
+    from fastfuncstuff.processing.io import save_warp_field
+    from fastfuncstuff.processing.tunewarp import _warp_quality
+
+    z = torch.zeros(4, 4, 4)
+    path = tmp_path / "w.nii.gz"
+    save_warp_field(z, z.clone(), z.clone(), path)
+    with pytest.raises(ValueError, match="warp_units"):
+        _warp_quality(str(path), None, "furlongs", torch.device("cpu"))

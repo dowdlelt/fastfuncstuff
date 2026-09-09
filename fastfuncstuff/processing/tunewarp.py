@@ -1819,8 +1819,12 @@ def _write_subject_table(
     # order, so two methods scored with different -metrics still concatenate --
     # pandas fills the gaps rather than refusing to line them up.
     extra = sorted({k for r in rows for k in r.get("metrics", {})})
-    head = ["method", "subject", "dice_vs_others", "grade", "bend", "jacmin", "seconds"]
-    lines = ["\t".join(head + extra)]
+    # The regularity detail only exists when a displacement field was available
+    # -- ours always, another tool's only with -warp_suffix -- so these columns
+    # appear when there is something to put in them and are omitted otherwise.
+    reg = [k for k in _REGULARITY_COLUMNS if any(k in r for r in rows)]
+    head = ["method", "subject", "dice_vs_others", "grade", "bend", "jacmin"]
+    lines = ["\t".join(head + reg + ["seconds"] + extra)]
     for r in rows:
         vals = mine.get(r["subject"], [])
         cells = [
@@ -1830,8 +1834,9 @@ def _write_subject_table(
             str(r.get("grade", "")),
             _num(r.get("bend"), 5),
             _num(r.get("jacmin")),
-            _num(r.get("seconds"), 1),
         ]
+        cells += [_num(r.get(k), 5 if k == "jac_neg_frac" else 4) for k in reg]
+        cells.append(_num(r.get("seconds"), 1))
         cells += [_num(r.get("metrics", {}).get(k)) for k in extra]
         lines.append("\t".join(cells))
     path.write_text("\n".join(lines) + "\n")
@@ -1882,12 +1887,26 @@ def _write_summary(
     ]
     # The intensity functionals averaged over subjects, so one row per method
     # carries both halves: what we rank on, and what the other tools optimise.
+    # Worst case across the cohort: a method is as extreme as its most extreme
+    # subject, so compression takes the min and everything else the max.
+    for k in [c for c in _REGULARITY_COLUMNS if any(c in r for r in rows)]:
+        vals = [r[k] for r in rows if k in r]
+        head.append(k + ("_min" if k == "jac_p01" else "_max"))
+        row.append(_num(min(vals) if k == "jac_p01" else max(vals), 5))
     for k in sorted({k for r in rows for k in r.get("metrics", {})}):
         vals = [r["metrics"][k] for r in rows if k in r.get("metrics", {})]
         head.append(k)
         row.append(_num(statistics.fmean(vals) if vals else None))
     path.write_text("\t".join(head) + "\n" + "\t".join(row) + "\n")
     return path
+
+
+# Regularity detail beyond the two headline numbers. jac_p01 is what the gate
+# actually tests -- jac_min is one worst voxel out of millions and is only good
+# for spotting a warp resting on the solver's own guard. jac_neg_frac is the
+# only one that can say a field is WRONG rather than merely extreme, and it
+# doubles as the check that an external field was read in the right units.
+_REGULARITY_COLUMNS = ("jac_p01", "jac_p99", "jac_neg_frac", "disp_p99_mm")
 
 
 def _num(value: Any, places: int = 4) -> str:
@@ -1911,6 +1930,8 @@ def diagnose_warped(
     base: str | None = None,
     metrics: Sequence[str] | None = None,
     contrast: str = "same",
+    warps: dict[str, str] | None = None,
+    warp_units: str = "mm",
     device: torch.device | None = None,
     save_subject_labels: bool = False,
     verb: int = 1,
@@ -1934,6 +1955,19 @@ def diagnose_warped(
     mask. We rank on the labels, but a table that only carried Dice would be
     answering a different question from the one the other tools were tuned for,
     and the comparison is more honest for showing both.
+
+    ``warps`` turns on the regularity half. Given each method's own displacement
+    field, every method is graded for folding, compression and bending by the
+    same code that grades ours -- which is what makes "how much deformation is
+    normal?" an empirical question instead of a constant somebody chose. The
+    bounds in :mod:`warpqc` are explicitly documented as thresholds on a
+    continuum with real anatomical variation on both sides, and nothing here has
+    ever measured where that continuum sits for output the field accepts.
+
+    ``warp_units`` is "mm" for AFNI and ANTs fields, "voxel" for ours. Watch
+    ``jac_neg_frac``: a field read under the wrong convention does not fail
+    quietly, it reports implausible folding, so that column doubles as the check
+    that the field was understood at all.
     """
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     metrics = resolve_diagnostic_metrics(metrics, contrast)
@@ -1978,9 +2012,13 @@ def diagnose_warped(
             # similarity half only. The regularity columns stay blank.
             row["metrics"] = referee.score(img, None, metrics)["scores"]
             del img
+        warp_path = (warps or {}).get(s.name)
+        if warp_path:
+            row.update(_warp_quality(warp_path, referee, warp_units, device))
         rows.append(row)
         if verb >= 1:
-            print(f"  {s.name}: {Path(s.labels).name}", flush=True)
+            extra = f" + {Path(warp_path).name}" if warp_path else ""
+            print(f"  {s.name}: {Path(s.labels).name}{extra}", flush=True)
 
     shapes = {tuple(x.shape) for x in segs}
     if len(shapes) > 1:
@@ -2004,6 +2042,36 @@ def diagnose_warped(
         },
         save_subject_labels=save_subject_labels,
     )
+
+
+def _warp_quality(
+    path: str, referee: Referee | None, units: str, device: torch.device
+) -> dict[str, Any]:
+    """Grade somebody else's displacement field with our own regularity code."""
+    from .io import load_warp_field
+
+    xd, yd, zd, hdr = load_warp_field(path, device=device)
+    voxdims = _voxdims_from_header(hdr)
+    if units == "mm":
+        xd, yd, zd = xd / voxdims[0], yd / voxdims[1], zd / voxdims[2]
+    elif units != "voxel":
+        raise ValueError(f"warp_units must be 'mm' or 'voxel', got {units!r}")
+
+    mask = None
+    if referee is not None and tuple(xd.shape) == tuple(referee.brain.shape):
+        mask = referee.brain
+    qc = warp_regularity(xd, yd, zd, mask=mask, voxdims=voxdims)
+    grade, _ = regularity_verdict(qc)
+    del xd, yd, zd
+    return {
+        "grade": grade,
+        "bend": qc.bending_energy,
+        "jacmin": qc.jac_min,
+        "jac_p01": qc.jac_p01,
+        "jac_p99": qc.jac_p99,
+        "jac_neg_frac": qc.jac_neg_frac,
+        "disp_p99_mm": qc.disp_p99_mm,
+    }
 
 
 def collect_diagnostics(root: Path) -> list[Path]:

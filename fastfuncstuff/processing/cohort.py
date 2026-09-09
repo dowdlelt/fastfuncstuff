@@ -20,6 +20,7 @@ is in it.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -54,6 +55,7 @@ def discover_cohort(
     pattern: str = "*.nii.gz",
     label_suffix: str = "_seg",
     labels_only: bool = False,
+    ignore_suffixes: Sequence[str] = (),
 ) -> list[CohortSubject]:
     """Find subjects in a directory, pairing each image with its segmentation.
 
@@ -63,6 +65,11 @@ def discover_cohort(
     with no segmentations at all is still a cohort -- it simply cannot be judged
     on anatomy.
 
+    ``ignore_suffixes`` drops files that are neither images nor labels -- a
+    directory of another tool's output usually also holds its displacement
+    fields, and without this ``na01_WARP.nii.gz`` is discovered as a subject
+    called ``na01_WARP`` whose segmentation is missing.
+
     Sorted by name, which is what makes the round-robin panels and the split
     reproducible from the directory alone.
     """
@@ -70,14 +77,17 @@ def discover_cohort(
     if not root.is_dir():
         raise ValueError(f"cohort directory does not exist: {root}")
 
-    images = [
-        p for p in sorted(root.glob(pattern)) if not _strip_ext(p.name).endswith(label_suffix)
-    ]
+    def _wanted(path: Path) -> bool:
+        stem = _strip_ext(path.name)
+        return not any(stem.endswith(x) for x in ignore_suffixes)
+
+    candidates = [p for p in sorted(root.glob(pattern)) if _wanted(p)]
+    images = [p for p in candidates if not _strip_ext(p.name).endswith(label_suffix)]
     if not images and labels_only:
         # A directory of results from another tool may hold only the warped
         # segmentations -- the images were the input to somebody else's pipeline
         # and there is no reason to have kept them. Scoring needs the labels.
-        segs = [p for p in sorted(root.glob(pattern)) if _strip_ext(p.name).endswith(label_suffix)]
+        segs = [p for p in candidates if _strip_ext(p.name).endswith(label_suffix)]
         if not segs:
             raise ValueError(f"no files matching {pattern!r} in {root}")
         return [CohortSubject(_strip_ext(p.name)[: -len(label_suffix)], "", str(p)) for p in segs]
