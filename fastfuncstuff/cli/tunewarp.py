@@ -414,6 +414,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "rather than failing, so that column is the check that it was understood.",
     )
     act.add_argument(
+        "-method",
+        default=None,
+        metavar="NAME",
+        help="Name this result carries in the tables [default: 'ffs <backend> "
+        "c<id>' for -diagnostics, the -diag_only argument otherwise]. It is the "
+        "column a head-to-head pivots on, so every row you want to compare must "
+        "have a distinct one.",
+    )
+    act.add_argument(
         "-collect",
         action="store_true",
         help="Concatenate every method's tables under {out}/diag/ into all_*.tsv, "
@@ -921,7 +930,7 @@ def main(argv: list[str] | None = None) -> int:
         written = diagnose_warped(
             subjects,
             target,
-            args.diag_only,
+            args.method or args.diag_only,
             base=args.base[0] if args.base else None,
             metrics=args.metrics,
             contrast=contrast,
@@ -954,7 +963,10 @@ def main(argv: list[str] | None = None) -> int:
             if held_out:
                 held_out = affine_align(held_out, recipe, out, device=device, verb=args.verb)
         target = out / "diag" / f"config{args.diagnostics:04d}"
-        print(f"\nConfig {args.diagnostics}: {row.backend} {row.label()}")
+        # Every backend's winner must carry a distinct name or they collide in the
+        # method column and the head-to-head pivot silently averages them.
+        method = args.method or f"ffs {row.backend} c{row.config_id}"
+        print(f"\nConfig {args.diagnostics} as {method!r}: {row.backend} {row.label()}")
         written = group_diagnostics(
             pairs + held_out,
             recipe,
@@ -964,6 +976,7 @@ def main(argv: list[str] | None = None) -> int:
             device=device,
             save_subject_labels=args.save_subject_labels,
             metrics=args.metrics,
+            method=method,
             verb=args.verb,
         )
         print(f"\nWrote {len(written)} file(s) to {target}")
