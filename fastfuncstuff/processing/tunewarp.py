@@ -69,11 +69,22 @@ from .weight import compute_weight_image
 
 @dataclass
 class SubjectPair:
-    """One base/source pair to fit. ``name`` is what shows up in the report."""
+    """One base/source pair to fit. ``name`` is what shows up in the report.
+
+    The label paths are optional and are what turn the run into a scored-on-
+    anatomy study: ``source_labels`` is carried through the trial's own field and
+    compared against ``base_labels``, which no similarity functional can see.
+    """
 
     name: str
     base: str
     source: str
+    base_labels: str | None = None
+    source_labels: str | None = None
+
+    @property
+    def has_labels(self) -> bool:
+        return self.base_labels is not None and self.source_labels is not None
 
 
 # --- in-process backend drivers ---------------------------------------------
@@ -162,7 +173,7 @@ class Referee:
     built once per base rather than once per trial.
     """
 
-    def __init__(self, base_path: str, device: torch.device):
+    def __init__(self, base_path: str, device: torch.device, labels_path: str | None = None):
         self.device = device
         self.base, self.header = load_image(base_path, device=device)
         if self.base.ndim == 4:
@@ -176,7 +187,47 @@ class Referee:
             hist_cliplevel=True,
         )
         self.brain = automask(self.base, device=device)
+        self.labels: torch.Tensor | None = None
+        if labels_path is not None:
+            seg, _ = load_image(labels_path, device=device)
+            if seg.ndim == 4:
+                seg = seg[..., 0]
+            if tuple(seg.shape) != tuple(self.base.shape):
+                raise ValueError(
+                    f"segmentation {labels_path} is {tuple(seg.shape)} but its base is "
+                    f"{tuple(self.base.shape)}; labels must be on the base's own grid"
+                )
+            self.labels = seg.round()
         self._qwarp_padding: tuple[int, int, int, int, int, int] | None = None
+
+    # --- residency ----------------------------------------------------------
+    #
+    # A pairwise cohort has as many referees as subjects, and each holds three
+    # volumes; at 0.7 mm that is ~230 MB apiece, so sixteen of them plus a fit's
+    # own working set does not fit on a consumer card. Moving the tensors to the
+    # host and back costs a PCIe copy, against rebuilding a weight image and an
+    # automask -- which is the expensive part of constructing one of these.
+
+    def offload(self) -> None:
+        """Park this referee's volumes on the host, keeping them built."""
+        if self.base.device.type == "cpu":
+            return
+        cpu = torch.device("cpu")
+        self.base = self.base.to(cpu)
+        self.weight = self.weight.to(cpu)
+        self.brain = self.brain.to(cpu)
+        if self.labels is not None:
+            self.labels = self.labels.to(cpu)
+
+    def attach(self) -> None:
+        """Bring them back onto the compute device."""
+        if self.base.device == self.device:
+            return
+        self.base = self.base.to(self.device)
+        self.weight = self.weight.to(self.device)
+        self.brain = self.brain.to(self.device)
+        if self.labels is not None:
+            self.labels = self.labels.to(self.device)
 
     @property
     def qwarp_padding(self) -> tuple[int, int, int, int, int, int]:
@@ -192,8 +243,56 @@ class Referee:
             self._qwarp_padding = _compute_support_padding(self.base)
         return self._qwarp_padding
 
+    def _lower_padding(self, field_shape: tuple[int, ...]) -> tuple[int, int, int] | None:
+        """Where the base sits inside a field grid, or None when they agree.
+
+        qwarp estimates on a padded grid and returns the field on it, while the
+        SyN/flow backends return one the size of the base. Both go through here so
+        that anything resampled by a trial's field -- the regularity mask, a
+        segmentation -- lands back on the base's own voxels.
+        """
+        if tuple(field_shape) == tuple(self.brain.shape):
+            return None
+        px0, px1, py0, py1, pz0, pz1 = self.qwarp_padding
+        expected = (
+            self.brain.shape[0] + pz0 + pz1,
+            self.brain.shape[1] + py0 + py1,
+            self.brain.shape[2] + px0 + px1,
+        )
+        if tuple(field_shape) != expected:
+            raise ValueError(f"qwarp field shape {tuple(field_shape)} != planned {expected}")
+        return (px0, py0, pz0)
+
+    def transport_labels(self, labels: torch.Tensor, field: tuple) -> torch.Tensor:
+        """Carry a segmentation through a trial's field, nearest-neighbour.
+
+        One gather, from the source's own labels straight onto the base grid. The
+        trap this exists to avoid is resampling twice -- NN through an affine and
+        NN again through the field loses about a voxel of boundary each time, and
+        that noise is the same order as the differences between the configs being
+        ranked. Pairs whose affine is baked into the cached aligned volume already
+        satisfy this; pairs that are natively aligned (a cohort on a common grid)
+        need no affine at all.
+        """
+        from .interp import warp_image
+        from .warp import _crop_padding, _pad_volume_faces
+
+        xd, yd, zd = field
+        lower = self._lower_padding(tuple(xd.shape))
+        if lower is None:
+            return warp_image(labels, xd, yd, zd, mode="nearest").round()
+        padding = self.qwarp_padding
+        padded = _pad_volume_faces(labels, padding)
+        warped = warp_image(padded, xd, yd, zd, mode="nearest")
+        del padded
+        return _crop_padding(warped, padding, tuple(self.brain.shape)).round()
+
     def score(
-        self, warped: torch.Tensor, field: tuple | None, panel: list[str] | None = None
+        self,
+        warped: torch.Tensor,
+        field: tuple | None,
+        panel: list[str] | None = None,
+        moving_labels: torch.Tensor | None = None,
     ) -> dict[str, Any]:
         """Score an in-memory result: similarity, then deformation regularity.
 
@@ -203,7 +302,13 @@ class Referee:
         provide.
         """
         inp = MetricInputs(
-            base=self.base, moving=warped, weight=self.weight, voxdims=self.voxdims, overlap=1.0
+            base=self.base,
+            moving=warped,
+            weight=self.weight,
+            base_labels=self.labels,
+            moving_labels=moving_labels,
+            voxdims=self.voxdims,
+            overlap=1.0,
         )
         scores = evaluate_metrics(inp, panel)
         del inp
@@ -215,17 +320,7 @@ class Referee:
         margin = clearance = UNCONSTRAINED_MARGIN
         if field is not None:
             xd, yd, zd = field
-            lower_padding = None
-            if tuple(xd.shape) != tuple(self.brain.shape):
-                px0, px1, py0, py1, pz0, pz1 = self.qwarp_padding
-                expected = (
-                    self.brain.shape[0] + pz0 + pz1,
-                    self.brain.shape[1] + py0 + py1,
-                    self.brain.shape[2] + px0 + px1,
-                )
-                if tuple(xd.shape) != expected:
-                    raise ValueError(f"qwarp field shape {tuple(xd.shape)} != planned {expected}")
-                lower_padding = (px0, py0, pz0)
+            lower_padding = self._lower_padding(tuple(xd.shape))
             mask = pad_mask_to_field(self.brain, tuple(xd.shape), lower_padding_xyz=lower_padding)
             w = warp_regularity(xd, yd, zd, mask=mask, voxdims=self.voxdims)
             grade, reasons = regularity_verdict(w)
@@ -242,6 +337,142 @@ class Referee:
             "margin": margin,
             "gate_margin": clearance,
         }
+
+
+class CohortVolumes:
+    """Everything the trials read, loaded once and kept resident a few at a time.
+
+    A one-base study has one referee and a handful of sources, and holding all of
+    them on the GPU forever is both simplest and free. A pairwise cohort does not
+    work that way: every subject is a base *and* a source, so sixteen brains means
+    sixteen referees (base + weight + mask, ~230 MB each at 0.7 mm) plus sixteen
+    sources and sixteen segmentations. That is ~5 GB of standing residency against
+    a measured 6.1 GB qwarp working set on a 16 GB card, and the fit is what should
+    get the memory.
+
+    So: decode from disk exactly once (host side), and let only ``capacity`` pairs'
+    worth sit on the compute device, least-recently-used first out. An evicted
+    referee is *parked*, not destroyed -- its weight image and automask are the
+    expensive part and they survive the trip to the host.
+    """
+
+    def __init__(self, device: torch.device, capacity: int = 0):
+        self.device = device
+        self.capacity = max(1, capacity)
+        self._referees: dict[str, Referee] = {}
+        self._sources: dict[str, torch.Tensor] = {}
+        self._labels: dict[str, torch.Tensor] = {}
+        self._live_referees: list[str] = []  # LRU order, oldest first
+        self._live_volumes: list[tuple[dict, str]] = []
+
+    # --- construction -------------------------------------------------------
+
+    @classmethod
+    def open(
+        cls, pairs: list[SubjectPair], device: torch.device, capacity: int = 0
+    ) -> CohortVolumes:
+        """Prepare a cohort, sizing residency from what a fit will need."""
+        vols = cls(device, capacity or _residency_capacity(pairs, device))
+        return vols
+
+    # --- access -------------------------------------------------------------
+
+    def referee(self, pair: SubjectPair) -> Referee:
+        ref = self._referees.get(pair.base)
+        if ref is None:
+            ref = Referee(pair.base, self.device, pair.base_labels)
+            self._referees[pair.base] = ref
+        else:
+            ref.attach()
+        self._touch(self._live_referees, pair.base)
+        while len(self._live_referees) > self.capacity:
+            self._referees[self._live_referees.pop(0)].offload()
+        return ref
+
+    def source(self, pair: SubjectPair) -> torch.Tensor:
+        return self._volume(self._sources, pair.source)
+
+    def source_labels(self, pair: SubjectPair) -> torch.Tensor | None:
+        if pair.source_labels is None:
+            return None
+        return self._volume(self._labels, pair.source_labels, integer=True)
+
+    def _volume(self, store: dict, path: str, integer: bool = False) -> torch.Tensor:
+        vol = store.get(path)
+        if vol is None:
+            loaded, _ = load_image(path)
+            if loaded.ndim == 4:
+                loaded = loaded[..., 0]
+            vol = loaded.round() if integer else loaded
+            store[path] = vol
+        if vol.device != self.device:
+            vol = vol.to(self.device)
+            store[path] = vol
+        self._touch(self._live_volumes, (store, path))
+        while len(self._live_volumes) > 2 * self.capacity:
+            old_store, old_path = self._live_volumes.pop(0)
+            old_store[old_path] = old_store[old_path].to("cpu")
+        return vol
+
+    @staticmethod
+    def _touch(order: list, key: Any) -> None:
+        if key in order:
+            order.remove(key)
+        order.append(key)
+
+    # --- description --------------------------------------------------------
+
+    def describe(self, pairs: list[SubjectPair]) -> dict[str, Any]:
+        """The data's own properties, for the run record.
+
+        A preset claims some settings suit data *of a kind*; resolution, matrix and
+        how much of the volume is brain are what let the next person decide whether
+        their data is that kind.
+        """
+        ref = self.referee(pairs[0])
+        return {
+            "subjects": [p.name for p in pairs],
+            "base": pairs[0].base,
+            "shape": tuple(int(v) for v in ref.base.shape),
+            "voxdims": tuple(float(v) for v in ref.voxdims),
+            "n_mask_voxels": int(ref.brain.sum()),
+        }
+
+
+def _residency_capacity(pairs: list[SubjectPair], device: torch.device) -> int:
+    """How many pairs may stay on the device beside a fit, from the memory model.
+
+    Sized against what a fit actually needs rather than a constant, because the
+    same tool runs on a 64^3 phantom and a 0.7 mm cohort. On the CPU there is no
+    eviction worth doing -- the host is where an evicted tensor would go anyway --
+    so everything stays resident.
+    """
+    if device.type != "cuda" or not pairs:
+        return len(pairs) or 1
+
+    from ..io.headers import nifti_shape
+    from ..memory import get_available_memory
+
+    try:
+        shape = nifti_shape(pairs[0].base)[:3]
+    except (OSError, ValueError, RuntimeError):
+        return 2
+    nvox = int(np.prod(shape))
+    # base + weight + mask + source, plus two segmentations when they are carried.
+    per_pair = nvox * 4 * (4 + 2 * any(p.has_labels for p in pairs))
+    # The fit is the point; residency gets what a fit's working set does not want.
+    # `get_available_memory` already applies the caching allocator's safety factor.
+    spare = get_available_memory(device) - _fit_working_set(shape)
+    return max(1, min(len(pairs), int(spare // max(per_pair, 1))))
+
+
+def _fit_working_set(shape: tuple[int, ...]) -> int:
+    from ..memory import estimate_nonlinear_memory_bytes
+
+    try:
+        return estimate_nonlinear_memory_bytes(tuple(int(v) for v in shape[:3]), "qwarp")
+    except (ValueError, RuntimeError):  # pragma: no cover - defensive
+        return 0
 
 
 def affine_align(
@@ -327,9 +558,8 @@ def run_trial(
     pair: SubjectPair,
     config: dict[str, Any],
     recipe: Recipe,
-    referee: Referee,
+    volumes: CohortVolumes,
     store: TrialStore,
-    source: torch.Tensor,
 ) -> None:
     """Fit once in memory, score it, record the numbers, drop the tensors.
 
@@ -337,20 +567,26 @@ def run_trial(
     it is what ``reproduce()`` runs, and what a user pastes to get this result
     outside the tool.
     """
-    # Only the recipe's panel is scored, not every metric in the registry. The
-    # neighbourhood metrics are far more expensive than the AFNI functionals, and
-    # scoring a metric that is barred from voting buys nothing.
+    # Only what the recipe asks for is scored, not every metric in the registry.
+    # The neighbourhood metrics are far more expensive than the AFNI functionals,
+    # and scoring one that is barred from voting AND unread buys nothing.
     prefix = f"{backend}_c{store.config_id(backend, config):04d}.nii.gz"
     cmd = render_command(backend, pair.base, pair.source, prefix, config, recipe)
+    referee = volumes.referee(pair)
+    source = volumes.source(pair)
 
     t0 = time.time()
     try:
         warped, field, levels = DRIVERS[backend](
             referee.base, source, config, recipe, referee.device
         )
-        outcome = referee.score(warped, field, recipe.panel())
+        moving_labels = None
+        seg = volumes.source_labels(pair)
+        if seg is not None and field is not None:
+            moving_labels = referee.transport_labels(seg, field)
+        outcome = referee.score(warped, field, recipe.scored(), moving_labels)
         outcome["levels"] = [lv.as_dict() for lv in levels]
-        del warped, field
+        del warped, field, moving_labels
     except (RuntimeError, ValueError) as exc:
         # A backend that blows up on a setting is a fact about that setting, not
         # a reason to abandon the search — record it and move on.
@@ -370,8 +606,7 @@ def score_baseline(
     pairs: list[SubjectPair],
     recipe: Recipe,
     store: TrialStore,
-    referees: dict[str, Referee],
-    sources: dict[str, torch.Tensor],
+    volumes: CohortVolumes,
 ) -> None:
     """Score every subject's *input*, unwarped, as the do-nothing row.
 
@@ -380,11 +615,14 @@ def score_baseline(
     the statement a recommendation is actually made of. Cheap: one scoring pass per
     subject, no fit.
     """
-    panel = recipe.panel()
+    scored = recipe.scored()
     for pair in pairs:
-        referee = referees[pair.base]
-        source = sources[pair.source]
-        outcome = referee.score(source, None, panel)
+        referee = volumes.referee(pair)
+        source = volumes.source(pair)
+        # The identity "warp" transports the labels unchanged, so the do-nothing
+        # row carries the Dice the affine alone already bought -- which is the
+        # number every config has to beat to have been worth running.
+        outcome = referee.score(source, None, scored, volumes.source_labels(pair))
         store.add(
             BASELINE,
             pair.name,
@@ -393,23 +631,6 @@ def score_baseline(
             seconds=0.0,
             **outcome,
         )
-
-
-def describe_pairs(pairs: list[SubjectPair], referees: dict[str, Referee]) -> dict[str, Any]:
-    """The data's own properties, for the run record.
-
-    A preset claims some settings suit data *of a kind*; resolution, matrix and how
-    much of the volume is brain are what let the next person decide whether their
-    data is that kind.
-    """
-    ref = referees[pairs[0].base]
-    return {
-        "subjects": [p.name for p in pairs],
-        "base": pairs[0].base,
-        "shape": tuple(int(v) for v in ref.base.shape),
-        "voxdims": tuple(float(v) for v in ref.voxdims),
-        "n_mask_voxels": int(ref.brain.sum()),
-    }
 
 
 def run_search(
@@ -430,25 +651,20 @@ def run_search(
         if backend not in BACKENDS:
             raise ValueError(f"unknown backend {backend!r}; have {', '.join(BACKENDS)}")
 
-    # Every image is loaded exactly once for the whole search, and the base-side
+    # Every image is decoded exactly once for the whole search, and the base-side
     # referee setup (weight image, brain mask) once per distinct base. An
-    # MNI-style run shares a single referee across every subject and trial.
-    referees: dict[str, Referee] = {}
-    sources: dict[str, torch.Tensor] = {}
-    for pair in pairs:
-        if pair.base not in referees:
-            referees[pair.base] = Referee(pair.base, device)
-        if pair.source not in sources:
-            vol, _ = load_image(pair.source, device=device)
-            sources[pair.source] = vol[..., 0] if vol.ndim == 4 else vol
+    # MNI-style run shares a single referee across every subject and trial; a
+    # pairwise cohort has one per subject and lets the cache decide who stays
+    # resident.
+    volumes = CohortVolumes.open(pairs, device)
 
     if store.runs:
         # The data's own properties are only knowable once the images are open, so
         # the run record is completed here rather than at begin_run().
-        for k, v in describe_pairs(pairs, referees).items():
+        for k, v in volumes.describe(pairs).items():
             setattr(store.runs[-1], k, v)
     if not any(t.backend == BASELINE for t in store.trials):
-        score_baseline(pairs, recipe, store, referees, sources)
+        score_baseline(pairs, recipe, store, volumes)
 
     try:
         from tqdm import tqdm
@@ -473,15 +689,7 @@ def run_search(
             print(f"\n{backend}: {len(configs)} configs x {len(pairs)} subjects", flush=True)
         for config in configs:
             for pair in pairs:
-                run_trial(
-                    backend,
-                    pair,
-                    config,
-                    recipe,
-                    referees[pair.base],
-                    store,
-                    sources[pair.source],
-                )
+                run_trial(backend, pair, config, recipe, volumes, store)
                 if bar is not None:
                     last = store.trials[-1]
                     bar.set_postfix_str(f"{last.grade}", refresh=False)
@@ -678,22 +886,15 @@ def run_adaptive(
             raise ValueError(f"unknown backend {backend!r}; have {', '.join(BACKENDS)}")
 
     panel = recipe.panel()
-    referees: dict[str, Referee] = {}
-    sources: dict[str, torch.Tensor] = {}
-    for pair in pairs:
-        if pair.base not in referees:
-            referees[pair.base] = Referee(pair.base, device)
-        if pair.source not in sources:
-            vol, _ = load_image(pair.source, device=device)
-            sources[pair.source] = vol[..., 0] if vol.ndim == 4 else vol
+    volumes = CohortVolumes.open(pairs, device)
 
     if store.runs:
         # The data's own properties are only knowable once the images are open, so
         # the run record is completed here rather than at begin_run().
-        for k, v in describe_pairs(pairs, referees).items():
+        for k, v in volumes.describe(pairs).items():
             setattr(store.runs[-1], k, v)
     if not any(t.backend == BASELINE for t in store.trials):
-        score_baseline(pairs, recipe, store, referees, sources)
+        score_baseline(pairs, recipe, store, volumes)
 
     rng = np.random.default_rng(plan.seed)
     for backend in names:
@@ -757,15 +958,7 @@ def run_adaptive(
                 if spent >= plan.budget:
                     break
                 for pair in screen_pairs:
-                    run_trial(
-                        backend,
-                        pair,
-                        config,
-                        recipe,
-                        referees[pair.base],
-                        store,
-                        sources[pair.source],
-                    )
+                    run_trial(backend, pair, config, recipe, volumes, store)
                     spent += 1
                 last = store.trials[-1]
                 if verb >= 1:
@@ -781,15 +974,7 @@ def run_adaptive(
                 for pair in rest[: plan.confirm]:
                     if spent >= plan.budget:
                         break
-                    run_trial(
-                        backend,
-                        pair,
-                        config,
-                        recipe,
-                        referees[pair.base],
-                        store,
-                        sources[pair.source],
-                    )
+                    run_trial(backend, pair, config, recipe, volumes, store)
                     spent += 1
                 if verb >= 1:
                     print(

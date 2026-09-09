@@ -95,7 +95,20 @@ class TestRecipes:
     def test_every_recipe_declares_a_known_contrast_regime(self):
         for r in RECIPES.values():
             assert r.contrast in ("same", "cross"), r.name
-            assert len(r.panel()) >= 3, r.name
+            # A DERIVED panel of one or two would mean the filters had eaten the
+            # jury. An explicit `judge` is the opposite -- a deliberate choice to
+            # be judged on one independent measurement rather than a consensus of
+            # correlated ones -- so it is exempt, and only what it records is
+            # required to be substantial.
+            assert len(r.panel() if not r.judge else r.scored()) >= 3, r.name
+
+    def test_an_explicit_jury_still_records_the_derived_evidence(self):
+        """A label-judged recipe has to leave the intensity numbers in the table,
+        or 'would the cheap criterion have agreed?' cannot be asked afterwards."""
+        r = RECIPES["cohort_T1"]
+        assert r.panel() == ["dice"]
+        assert set(r.panel()) < set(r.scored())
+        assert "lncc" in r.scored()
 
     def test_epi2epi_and_mni_differ(self):
         """Same brain vs different brains are different problems."""

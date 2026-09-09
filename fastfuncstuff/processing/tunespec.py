@@ -459,6 +459,20 @@ class Recipe:
     contrast: str = "same"
     notes: str = ""
     backends: tuple[str, ...] = field(default_factory=lambda: tuple(BACKENDS))
+    # An explicit jury, replacing the derived one. Set it only when the evidence
+    # is of a different kind rather than a different flavour: the derived panel is
+    # eleven readings of the same intensities and is right to be a consensus, but a
+    # transported segmentation is one independent fact and diluting it with eleven
+    # correlated votes would throw away exactly what it was brought in for.
+    judge: tuple[str, ...] = ()
+    # Metrics scored on every trial and allowed to judge none of them. The place
+    # for a number you want recorded next to the verdict without it becoming part
+    # of the verdict -- a second reading of the jury's own evidence, or the
+    # intensity panel kept alongside a label jury so the two can be compared later.
+    report: tuple[str, ...] = ()
+    # Whether trials carry a segmentation on both sides. Gates the label metrics
+    # out of every derived panel, because a run without one cannot score them.
+    labels: bool = False
 
     def panel(self) -> list[str]:
         """The metrics allowed to judge fits produced under this recipe.
@@ -467,9 +481,30 @@ class Recipe:
         neighbourhood metrics (lncc/ngf/mind) are available to it. A caller that
         only has scattered in-mask values must ask for ``grid=False`` instead.
         """
-        from .metrics import panel_for
+        from .metrics import metric, panel_for
 
-        return panel_for(self.optimize, self.contrast, tuple(self.evaluate_exclude), grid=True)
+        if self.judge:
+            for name in self.judge:
+                metric(name)  # raises on a typo, here rather than mid-search
+            return list(self.judge)
+        return panel_for(
+            self.optimize,
+            self.contrast,
+            tuple(self.evaluate_exclude),
+            grid=True,
+            labels=self.labels,
+        )
+
+    def scored(self) -> list[str]:
+        """Everything evaluated per trial: the jury plus the recorded-only extras.
+
+        Kept distinct from :meth:`panel` because the store treats them differently
+        -- ``compute_consensus`` and the surrogate's target both filter to the jury,
+        so anything here that is not in it is carried into the table and votes on
+        nothing.
+        """
+        panel = self.panel()
+        return panel + [n for n in self.report if n not in panel]
 
 
 # The **stopping rule**, which is a real choice: it decides when "good enough" has
@@ -542,6 +577,40 @@ RECIPES: dict[str, Recipe] = {
             "the only optiwarp prep that survives a contrast inversion. The "
             "residual distortion is largely along the phase-encode axis, so a "
             "warp free in all three directions is over-parameterised."
+        ),
+    ),
+    "cohort_T1": Recipe(
+        name="cohort_T1",
+        describe="T1 to T1 across a labelled cohort: judged on manual segmentations",
+        optimize="lpa",
+        evaluate_exclude=("mind", "mindssc"),
+        contrast="same",
+        pairing="paired",
+        labels=True,
+        # One judge, and it is not the intensities. The eleven-functional consensus
+        # is the right instrument when every judge is reading the same picture and
+        # you want their disagreement averaged out; here there is a measurement that
+        # the fit could not see -- a human tracing, carried through the warp and
+        # compared against another human tracing -- and averaging it against eleven
+        # correlated intensity votes would hand the ranking back to the thing the
+        # labels were brought in to check.
+        judge=("dice",),
+        # Scored, never voting. dice_q25 is the robustness reading of the jury's own
+        # evidence; the four intensity functionals are one per family, kept so that
+        # "would the cheap criterion have picked the same config?" is answerable
+        # from the table afterwards rather than by re-running the study.
+        report=("dice_q25", "ls", "mi", "lncc", "ngf"),
+        tune=_ALL_REG + _ALL_EFFORT + ("qwarp.hfactor_q", "formwarp.grad_step"),
+        notes=(
+            "Pairwise between subjects, not to a template. Both have manual "
+            "labels, so warping A's segmentation into B and comparing against B's "
+            "own tracing has real ground truth per pair. A to-template consensus "
+            "does not: dragging every brain harder onto the template's intensity "
+            "pattern raises cross-subject label agreement whether or not the "
+            "anatomy is right, so correlated error reads as agreement and the "
+            "over-warping config wins -- exactly the failure this tool exists to "
+            "find. Ribbon parcels are almost all boundary, so Dice on them does "
+            "not saturate the way whole-structure Dice does."
         ),
     ),
     "epi2epi": Recipe(
