@@ -734,11 +734,16 @@ def main(argv: list[str] | None = None) -> int:
         pairs, held_out = _build_cohort_pairs(args, len(store.runs), args.verb, group=recipe.group)
     else:
         pairs = _build_pairs(args, recipe.pairing)
-    if recipe.labels and not all(p.has_labels for p in pairs):
-        raise SystemExit(
-            f"-type {recipe.name} is judged on segmentations, but some pairs have none. "
-            "Check -label_suffix, or pick a recipe that judges on intensities."
-        )
+    if recipe.labels:
+        # A common-space run compares the cohort's transported tracings against
+        # each other, so the target needs none of its own -- MNI has none.
+        traced = (p.has_source_labels if recipe.group else p.has_labels for p in pairs)
+        if not all(traced):
+            raise SystemExit(
+                f"-type {recipe.name} is judged on segmentations, but some subjects "
+                "have none. Check -label_suffix, or pick a recipe that judges on "
+                "intensities."
+            )
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
     backends = args.backend or list(recipe.backends)
 
@@ -794,9 +799,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  ! {w}")
 
     if args.allineate:
+        # Held-out subjects need it too. They are fit after the search, against
+        # the same base, so a native-grid source there is a shape mismatch that
+        # only shows up an hour in.
+        n_all = len(pairs) + len(held_out)
         if args.verb >= 1:
-            print(f"\nStep 0: affine ({recipe.optimize}) for {len(pairs)} subject(s)")
+            print(f"\nStep 0: affine ({recipe.optimize}) for {n_all} subject(s)")
         pairs = affine_align(pairs, recipe, out, device=device, verb=args.verb)
+        if held_out:
+            held_out = affine_align(held_out, recipe, out, device=device, verb=args.verb)
 
     if args.search == "adaptive":
         plan = AdaptivePlan(

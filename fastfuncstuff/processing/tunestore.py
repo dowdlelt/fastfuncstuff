@@ -1241,7 +1241,7 @@ def headline_metric(results: list[ConfigResult]) -> str | None:
     project will recognise from ANTs, then ``ls`` as the plain correlation.
     """
     have = {k for r in results for k in r.abs_scores}
-    for preferred in ("dice", "lncc", "ls", "mi"):
+    for preferred in ("dice", "xdice", "lncc", "ls", "mi"):
         if preferred in have:
             return preferred
     return sorted(have)[0] if have else None
@@ -1256,7 +1256,12 @@ def column_label(metric: str | None) -> str:
     backwards by anyone who knows what Dice is -- which is everyone who would ask
     for it. Naming the column after what is in it costs four characters.
     """
-    return {"dice": "1-dice", "dice_q25": "1-diceQ25"}.get(metric or "", metric or "")
+    return {
+        "dice": "1-dice",
+        "dice_q25": "1-diceQ25",
+        "xdice": "1-xdice",
+        "xdice_q25": "1-xdiceQ25",
+    }.get(metric or "", metric or "")
 
 
 @dataclass

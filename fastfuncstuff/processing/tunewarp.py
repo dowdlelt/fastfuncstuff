@@ -94,7 +94,18 @@ class SubjectPair:
 
     @property
     def has_labels(self) -> bool:
+        """Both sides traced — what a pairwise comparison against the base needs."""
         return self.base_labels is not None and self.source_labels is not None
+
+    @property
+    def has_source_labels(self) -> bool:
+        """The moving side traced, which is all a common-space run needs.
+
+        A template has no segmentation of its own and does not need one: the
+        cohort's transported tracings are compared against *each other*, not
+        against the target.
+        """
+        return self.source_labels is not None
 
 
 # --- in-process backend drivers ---------------------------------------------
@@ -1216,7 +1227,12 @@ def run_adaptive(
         round_no = 0
         stale = 0
         best_hv = frontier_hypervolume(prior)
-        bar = _fit_bar(plan.budget, backend, verb)
+        # A group recipe spends N fits per config, so a budget that is not a
+        # multiple of N cannot be hit exactly; round the bar up to what will
+        # actually be spent rather than showing a total the loop will overshoot.
+        atom = len(pairs) if recipe.group else 1
+        planned = -(-plan.budget // atom) * atom
+        bar = _fit_bar(planned, backend, verb)
         while spent < plan.budget:
             obs = _observations(store, backend, panel)
             # Bands are recomputed every round rather than fixed at the start: they
@@ -1264,8 +1280,7 @@ def run_adaptive(
                     if verb >= 1:
                         _say(
                             bar,
-                            f"  [{spent:>3}/{plan.budget}] cohort "
-                            f"{store.trials[-1].grade:8s} {label}",
+                            f"  [{spent:>3}/{planned}] cohort {store.trials[-1].grade:8s} {label}",
                         )
                     continue
 
