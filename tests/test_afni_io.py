@@ -674,3 +674,49 @@ class TestGzipCompression:
         _compress_gz(src, dst, remove_original=False)
         assert src.exists()
         assert dst.exists()
+
+
+def test_subbrick_selector_on_an_afni_bucket(tmp_path):
+    """Bug of record: AFNI's MNI152_2009_template_SSW is (x,y,z,1,5) — five
+    sub-bricks in dim[5] with a singleton time axis. Selecting on axis 3 indexed a
+    1-long axis, so `template.nii.gz[0]` quietly returned ALL FIVE volumes, and
+    the "skull-off" alignment base was the whole bucket."""
+    from fastfuncstuff.io.afni import load_nifti
+
+    data = np.zeros((4, 5, 6, 1, 5), dtype=np.float32)
+    for k in range(5):
+        data[..., 0, k] = k + 1
+    p = tmp_path / "bucket.nii.gz"
+    nib.save(nib.Nifti1Image(data, np.eye(4)), p)
+
+    import torch
+
+    from fastfuncstuff.processing.io import load_image
+
+    for k in range(5):
+        one = np.squeeze(np.asarray(load_nifti(f"{p}[{k}]").dataobj))
+        assert one.shape == (4, 5, 6)
+        assert np.allclose(one, k + 1)
+        # ...and through the loader every tool actually calls, where the singleton
+        # axes are dropped: one sub-brick has to arrive as a 3-D volume.
+        vol, _ = load_image(f"{p}[{k}]", device=torch.device("cpu"))
+        assert tuple(vol.shape) == (6, 5, 4)
+        assert torch.allclose(vol, torch.full_like(vol, float(k + 1)))
+    pair = np.squeeze(np.asarray(load_nifti(f"{p}[1..2]").dataobj))
+    assert pair.shape == (4, 5, 6, 2)
+    assert np.allclose(pair[..., 0], 2)
+
+
+def test_subbrick_selector_still_reads_a_plain_4d_series(tmp_path):
+    """The bucket fix must not move the axis for an ordinary timeseries."""
+    from fastfuncstuff.io.afni import load_nifti
+
+    data = np.zeros((4, 5, 6, 7), dtype=np.float32)
+    for t in range(7):
+        data[..., t] = t
+    p = tmp_path / "series.nii.gz"
+    nib.save(nib.Nifti1Image(data, np.eye(4)), p)
+
+    assert load_nifti(f"{p}[3]").shape == (4, 5, 6, 1)
+    assert np.allclose(np.asarray(load_nifti(f"{p}[3]").dataobj), 3)
+    assert load_nifti(f"{p}[2..4]").shape == (4, 5, 6, 3)

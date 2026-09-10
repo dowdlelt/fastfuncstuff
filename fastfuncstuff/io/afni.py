@@ -266,15 +266,26 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         data = np.asarray(img_out.dataobj)
         if data.ndim < 4:
             raise ValueError(f"Sub-brick selector requires a 4D image, got {data.ndim}D")
-        n_volumes = data.shape[3]
-        resolved = _resolve_indices(indices, n_volumes)
-        data = data[:, :, :, resolved]
+        # AFNI buckets are not always stored along dim[4]: MNI152_2009_template_SSW
+        # is (x,y,z,1,5) — five sub-bricks in dim[5] with a singleton time axis.
+        # Selecting on axis 3 there returns the whole bucket (a 1-long axis indexed
+        # by [0]), which is how `template.nii.gz[0]` silently became all five
+        # volumes instead of the skull-off one.
+        axis = 4 if data.ndim > 4 and data.shape[3] == 1 else 3
+        resolved = _resolve_indices(indices, data.shape[axis])
+        data = (
+            np.squeeze(np.take(data, resolved, axis=axis), axis=3)
+            if axis == 4
+            else data[:, :, :, resolved]
+        )
         header = img_out.header.copy()
         # Update dim[4] for the new volume count
         if data.ndim == 4:
             header["dim"][4] = data.shape[3]
         elif data.ndim == 3:
             header["dim"][4] = 1
+        header["dim"][0] = data.ndim
+        header["dim"][5] = 1
         img_out = nib.Nifti1Image(data, img_out.affine, header)
 
     return img_out
