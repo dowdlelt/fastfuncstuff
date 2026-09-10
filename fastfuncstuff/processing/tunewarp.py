@@ -1659,6 +1659,11 @@ def group_diagnostics(
     names: list[str] = []
     rows: list[dict] = []
     header = None
+    brain: torch.Tensor | None = None
+    # Summed rather than stacked: the cohort mean is the only thing wanted from
+    # it, and 16 warped 193^3 volumes held at once is memory spent for nothing.
+    warped_sum: torch.Tensor | None = None
+    n_warped = 0
     bar = _fit_bar(len(pairs), "diagnostics", verb)
     for pair in pairs:
         referee = volumes.referee(pair)
@@ -1672,6 +1677,13 @@ def group_diagnostics(
             referee.device,
         )
         one = referee.score(warped, field, metrics)
+        # A backend may hand back a padded grid; only base-shaped volumes can be
+        # summed into a cohort mean, and silently averaging mismatched ones would
+        # produce a picture that looks fine and means nothing.
+        if tuple(warped.shape) == tuple(referee.base.shape):
+            warped_sum = warped.float() if warped_sum is None else warped_sum + warped.float()
+            n_warped += 1
+            brain = referee.brain
         seg = volumes.source_labels(pair)
         if seg is not None and field is not None:
             segs.append(
@@ -1713,6 +1725,8 @@ def group_diagnostics(
         header,
         meta={"backend": backend, "config": config, "recipe": recipe.name},
         save_subject_labels=save_subject_labels,
+        mean_image=None if warped_sum is None else warped_sum / n_warped,
+        mask=brain,
     )
 
 
@@ -1725,6 +1739,8 @@ def write_diagnostics(
     header: Any = None,
     meta: dict | None = None,
     save_subject_labels: bool = False,
+    mean_image: torch.Tensor | None = None,
+    mask: torch.Tensor | None = None,
 ) -> list[Path]:
     """Everything behind one method's cohort agreement, as pictures and tables.
 
@@ -1737,6 +1753,12 @@ def write_diagnostics(
     Tables are plain TSV carrying a ``method`` column and no comment lines, so a
     directory of methods concatenates in pandas without special-casing. What the
     columns mean lives in ``meta.json``, not wedged into the data file.
+
+    Volumes are named for the method, not just filed under it. A viewer shows the
+    file name and drops the directory, so four methods' ``agreement.nii.gz`` are
+    four identical labels with no way back to which config produced them. Tables
+    keep their plain names -- ``collect_diagnostics`` and every downstream pivot
+    find them by name, and they already carry a ``method`` column.
     """
     from .metrics import cross_subject_detail, label_overlap_stack
 
@@ -1747,26 +1769,31 @@ def write_diagnostics(
     detail = cross_subject_detail(segs, names)
     labels = detail["labels"]
     written: list[Path] = []
+    tag = method_slug(method)
 
     stack = label_overlap_stack(segs, labels)
     written.append(
-        _save(stack, out_dir / "overlap_prob.nii.gz", header, [f"label{k}" for k in labels])
+        _save(stack, out_dir / f"{tag}_overlap_prob.nii.gz", header, [f"label{k}" for k in labels])
     )
     agree = stack.max(dim=0).values
-    written.append(_save(agree, out_dir / "agreement.nii.gz", header))
+    written.append(_save(agree, out_dir / f"{tag}_agreement.nii.gz", header))
     # argmax over a stack that is zero everywhere outside any parcel would name
     # label 1 for the whole background, so the winner is masked to where somebody
     # actually drew something.
     winner = torch.tensor(labels, dtype=torch.float32)[stack.argmax(dim=0)]
-    written.append(_save(winner * (agree > 0), out_dir / "consensus_labels.nii.gz", header))
+    written.append(_save(winner * (agree > 0), out_dir / f"{tag}_consensus_labels.nii.gz", header))
+    sharp = None
+    if mean_image is not None:
+        written.append(_save(mean_image, out_dir / f"{tag}_mean_warped.nii.gz", header))
+        sharp = mean_sharpness(mean_image, mask)
     if save_subject_labels:
         for seg, name in zip(segs, names, strict=True):
-            written.append(_save(seg.float(), out_dir / f"labels_{name}.nii.gz", header))
+            written.append(_save(seg.float(), out_dir / f"{tag}_labels_{name}.nii.gz", header))
 
     written.append(_write_label_table(out_dir / "per_label.tsv", method, detail, stack))
     written.append(_write_pair_table(out_dir / "per_pair.tsv", method, detail))
     written.append(_write_subject_table(out_dir / "per_subject.tsv", method, rows, detail, names))
-    written.append(_write_summary(out_dir / "summary.tsv", method, detail, stack, rows))
+    written.append(_write_summary(out_dir / "summary.tsv", method, detail, stack, rows, sharp))
 
     payload = {
         "method": method,
@@ -1781,6 +1808,41 @@ def write_diagnostics(
     written.append(out_dir / "meta.json")
     del segs, stack
     return written
+
+
+def method_slug(method: str) -> str:
+    """A method name as a filename fragment: ``ffs optiwarp_hs c62`` -> the same, joined.
+
+    Only whitespace and path separators are touched. The label is what the reader
+    has to recognise in a viewer's file list, so mangling it further would defeat
+    the point of putting it there.
+    """
+    out = "_".join(str(method).split())
+    return "".join(c for c in out if c.isalnum() or c in "_-.+") or "method"
+
+
+def mean_sharpness(mean_image: torch.Tensor, mask: torch.Tensor | None = None) -> float:
+    """Edge strength of the cohort-mean image, as a single number.
+
+    The mean of everybody's warped brain is a registration readout on its own:
+    where the cohort agrees the anatomy survives averaging, and where it does not
+    the edges wash out. That is visible at 5 subjects and obvious at 16, and it
+    reads without a segmentation -- which makes it the one agreement measure that
+    does not depend on somebody's tracing.
+
+    Mean gradient magnitude normalised by mean intensity, so it compares across
+    methods whose warped images differ in overall scale rather than in sharpness.
+    """
+    img = mean_image.float()
+    gz, gy, gx = torch.gradient(img)
+    mag = torch.sqrt(gx * gx + gy * gy + gz * gz)
+    if mask is not None and tuple(mask.shape) == tuple(img.shape):
+        sel = mask.to(torch.bool)
+        mag, img = mag[sel], img[sel]
+    level = float(img.abs().mean())
+    if level <= 0:
+        return float("nan")
+    return float(mag.mean()) / level
 
 
 def _save(vol: torch.Tensor, path: Path, header, brick_labels: list[str] | None = None) -> Path:
@@ -1901,7 +1963,12 @@ def _write_subject_table(
 
 
 def _write_summary(
-    path: Path, method: str, detail: dict, stack: torch.Tensor, rows: list[dict]
+    path: Path,
+    method: str,
+    detail: dict,
+    stack: torch.Tensor,
+    rows: list[dict],
+    sharpness: float | None = None,
 ) -> Path:
     """One row for one method -- concatenate a directory of these and you have the plot.
 
@@ -1924,6 +1991,7 @@ def _write_summary(
         "dice_median",
         "dice_worst_label",
         "mean_agreement",
+        "mean_sharpness",
         "bend_max",
         "jacmin_min",
         "seconds_total",
@@ -1938,6 +2006,7 @@ def _write_summary(
         _num(torch.quantile(good.float(), 0.5) if good.numel() else None),
         _num(good.min() if good.numel() else None),
         _num(stack.max(dim=0).values[stack.max(dim=0).values > 0].mean()),
+        _num(sharpness, 5),
         _num(max(bends) if bends else None, 5),
         _num(min(jacs) if jacs else None),
         _num(sum(secs) if secs else None, 1),
@@ -2033,6 +2102,8 @@ def diagnose_warped(
         print(f"  scoring images against {Path(base).name}: {', '.join(metrics)}")
 
     segs, names, rows = [], [], []
+    warped_sum: torch.Tensor | None = None
+    n_warped = 0
     for s in subjects:
         if s.labels is None:
             raise ValueError(
@@ -2068,6 +2139,8 @@ def diagnose_warped(
             # No field to check -- somebody else's warp -- so this is the
             # similarity half only. The regularity columns stay blank.
             row["metrics"] = referee.score(img, None, metrics)["scores"]
+            warped_sum = img.float() if warped_sum is None else warped_sum + img.float()
+            n_warped += 1
             del img
         warp_path = (warps or {}).get(s.name)
         if warp_path:
@@ -2098,6 +2171,8 @@ def diagnose_warped(
             "inputs": [s.labels for s in subjects],
         },
         save_subject_labels=save_subject_labels,
+        mean_image=None if warped_sum is None else warped_sum / n_warped,
+        mask=referee.brain if referee is not None else None,
     )
 
 

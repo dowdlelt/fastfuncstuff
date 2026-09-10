@@ -64,9 +64,7 @@ def test_migrated_cache_is_readable_by_nwarp(tmp_path):
 
     from fastfuncstuff.io.dsetinfo import read_info
 
-    xform = load_affine_1D(
-        mat_path, read_info(pair.base).affine, device=torch.device("cpu")
-    )
+    xform = load_affine_1D(mat_path, read_info(pair.base).affine, device=torch.device("cpu"))
     assert xform.matrices.shape == (1, 4, 4)
 
 
@@ -79,3 +77,26 @@ def test_block_matrix_is_refused_with_a_useful_message(tmp_path):
 
     with pytest.raises(ValueError, match="not AFNI .aff12.1D"):
         load_affine_1D(mat_path, read_info(pair.base).affine, device=torch.device("cpu"))
+
+
+def test_method_slug_survives_a_config_label():
+    from fastfuncstuff.processing.tunewarp import method_slug
+
+    assert method_slug("ffs optiwarp_hs c62") == "ffs_optiwarp_hs_c62"
+    assert method_slug("AFNI 3dQwarp") == "AFNI_3dQwarp"
+    # Path separators would file the volume somewhere else entirely.
+    assert "/" not in method_slug("a/b c")
+
+
+def test_mean_sharpness_falls_when_the_mean_is_blurred():
+    """The readout has to move the right way, or the column is decoration."""
+    from fastfuncstuff.processing.tunewarp import mean_sharpness
+
+    torch.manual_seed(0)
+    sharp = torch.zeros(24, 24, 24)
+    sharp[6:18, 6:18, 6:18] = 1.0
+    blurred = torch.nn.functional.avg_pool3d(sharp[None, None], kernel_size=5, stride=1, padding=2)[
+        0, 0
+    ]
+
+    assert mean_sharpness(sharp) > mean_sharpness(blurred)
