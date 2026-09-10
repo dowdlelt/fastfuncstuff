@@ -336,6 +336,16 @@ def test_anat_group_never_averages_across_echoes(tmp_path: Path):
     ]
 
 
+def test_anat_pick_prefers_the_corrected_reconstruction(tmp_path: Path):
+    """Alphabetical order picks 'dist' over 'undist', which is exactly backwards.
+    Both reconstructions of one scan are plain _T1w, so the label has to be read."""
+    from fastfuncstuff.autoproc.bids import _pick_anat
+
+    for good, bad in (("norm", "orig"), ("corr", "dist"), ("undist", "dist")):
+        picked = _pick_anat([Path(f"s_rec-{r}_run-1_T1w.nii.gz") for r in (bad, good)])
+        assert picked is not None and f"rec-{good}" in picked.name
+
+
 def test_anat_group_finds_a_session_with_no_bold_runs(tmp_path: Path):
     """The structural usually lives in its own ses-anat, which has no BOLD runs
     and so is not a session of the scanned Subject at all."""

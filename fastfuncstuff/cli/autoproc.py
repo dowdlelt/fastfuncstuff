@@ -636,6 +636,21 @@ def _resolve_anat(args) -> tuple[list[str], str | None]:
     return [], args.tpm_source
 
 
+def anat_candidates(subject, bids_dir: str | None = None) -> tuple[list[Path], list[Path]]:
+    """(the in-scope sessions' T1w, every T1w this subject has).
+
+    The second list leads with the first: a ses-anat holds no BOLD runs, so it is
+    not a session of this Subject at all — but it is usually where the structural
+    actually lives, and the sweep is the only way to see it."""
+    from fastfuncstuff.autoproc.bids import scan_all_anats
+
+    in_scope = [p for sess in subject.sessions for p in sess.anats]
+    every = list(in_scope)
+    if bids_dir:
+        every += [p for p in scan_all_anats(bids_dir, subject.subject) if p not in in_scope]
+    return in_scope, every
+
+
 def anat_group(subject, bids_dir: str | None = None) -> list[Path]:
     """Every scanned T1w that may be averaged with the one we would have picked.
 
@@ -645,14 +660,9 @@ def anat_group(subject, bids_dir: str | None = None) -> list[Path]:
     those is averaging different contrasts. So the group is the picked anat's own
     (acq, rec, echo) entities, pooled across the in-scope sessions: repeats of ONE
     acquisition, which is exactly what averaging is for."""
-    from fastfuncstuff.autoproc.bids import _pick_anat, scan_all_anats
+    from fastfuncstuff.autoproc.bids import _pick_anat
 
-    in_scope = [p for sess in subject.sessions for p in sess.anats]
-    every = list(in_scope)
-    if bids_dir:
-        # A ses-anat holds no BOLD runs, so it is not a session of this Subject at
-        # all — but it is usually where the structural actually lives.
-        every += [p for p in scan_all_anats(bids_dir, subject.subject) if p not in in_scope]
+    in_scope, every = anat_candidates(subject, bids_dir)
     # The in-scope session leads when it has one: same visit as the functional
     # data. Other sessions can still contribute repeats of that same acquisition.
     primary = _pick_anat(in_scope) or _pick_anat(every)
@@ -1048,19 +1058,37 @@ def _report_fmap_assignment(subject) -> None:
             )
 
 
-def _report_anat(anat_paths: list[str], from_bids: bool) -> None:
+def _report_anat(anat_paths: list[str], from_bids: bool, skipped: list[Path] | None = None) -> None:
     """Print the T1w the anat step will use — all of them when several are being
-    averaged. Printed for the same reason the events assignment is: "it found the
-    wrong anatomical" should be visible now, not after the last stage."""
+    averaged, and the ones the scan saw but rejected.
+
+    Printed for the same reason the events assignment is: "it found the wrong
+    anatomical" has to be visible now, not after the last stage. The rejected
+    list is what makes that judgeable, and -anat FILE [FILE ...] is the answer
+    when the automatic choice is wrong — no code change needed."""
     if not anat_paths:
         return
     src = "scanned from BIDS" if from_bids else "given"
-    if len(anat_paths) == 1:
-        print(f"== anat ({src}) ==\n  {anat_paths[0]}", file=sys.stderr)
-        return
-    print(f"== anat ({src}): {len(anat_paths)} T1w, aligned + averaged ==", file=sys.stderr)
+    head = f"== anat ({src})" + (
+        f": {len(anat_paths)} T1w, aligned + averaged" if len(anat_paths) > 1 else ""
+    )
+    print(f"{head} ==", file=sys.stderr)
     for i, p in enumerate(anat_paths, start=1):
-        print(f"  {i}. {p}" + ("   (base)" if i == 1 else ""), file=sys.stderr)
+        lead = f"  {i}. " if len(anat_paths) > 1 else "  "
+        print(
+            f"{lead}{p}" + ("   (base)" if i == 1 and len(anat_paths) > 1 else ""), file=sys.stderr
+        )
+    if skipped:
+        print(
+            f"  {len(skipped)} other T1w not used (different acq/rec/echo — a repeat of a"
+            " DIFFERENT image is not something to average in):",
+            file=sys.stderr,
+        )
+        for p in skipped[:10]:
+            print(f"    - {p.name}", file=sys.stderr)
+        if len(skipped) > 10:
+            print(f"    … and {len(skipped) - 10} more", file=sys.stderr)
+        print("  Wrong choice? Pass -anat FILE [FILE ...] to say exactly which.", file=sys.stderr)
 
 
 def _report_events(args, opt, subject) -> None:
@@ -1188,11 +1216,14 @@ def main(argv: list[str] | None = None) -> int:
     _report_fmap_assignment(subject)
 
     anat_paths, tpm_source = _resolve_anat(args)
-    if not anat_paths:  # fall back to the scanned in-scope T1w(s)
-        anat_paths = [str(p) for p in anat_group(subject, args.bids_dir)]
+    unused: list[Path] = []
+    if not anat_paths:  # fall back to the scanned T1w(s)
+        group = anat_group(subject, args.bids_dir)
+        anat_paths = [str(p) for p in group]
+        unused = [p for p in anat_candidates(subject, args.bids_dir)[1] if p not in group]
     anat_path = anat_paths[0] if anat_paths else None
 
-    _report_anat(anat_paths, from_bids=not (args.anat or args.suma))
+    _report_anat(anat_paths, from_bids=not (args.anat or args.suma), skipped=unused)
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
     anat_nonlin = eff(args.anat_nonlin, "anat_nonlin")

@@ -881,13 +881,26 @@ def _scan_anats(sdir: Path) -> list[Path]:
     ]
 
 
-def _pick_anat(t1s: list[Path]) -> Path | None:
-    for p in t1s:  # prefer the MP2RAGE UNI image
-        if parse_entities(p.name).get("acq") == "uni":
-            return p
-    for p in t1s:
+# `rec` labels that name the reconstruction you want and the one you don't. Both
+# are filed as plain ``_T1w``, so alphabetical order decides between them by
+# accident — and it gets "dist" before "undist" exactly backwards.
+_REC_PREFERRED = ("norm", "corr", "corrected", "undist", "undistorted")
+_REC_AVOIDED = ("orig", "dist", "distorted", "uncorr", "uncorrected", "raw")
+
+
+def _anat_rank(p: Path) -> tuple[int, int, int, str]:
+    """Sort key for "which of these _T1w is THE anat", best first."""
+    ent = parse_entities(p.name)
+    rec = (ent.get("rec") or "").lower()
+    return (
+        0 if ent.get("acq") == "uni" else 1,  # the MP2RAGE UNI image
         # A multi-echo MPRAGE files each echo AND the combined image under _T1w;
         # the one without an `echo` entity is the combination, and is the anat.
-        if "echo" not in parse_entities(p.name):
-            return p
-    return t1s[0] if t1s else None
+        0 if "echo" not in ent else 1,
+        0 if rec in _REC_PREFERRED else (2 if rec in _REC_AVOIDED else 1),
+        p.name,  # tie-break: as found on disk
+    )
+
+
+def _pick_anat(t1s: list[Path]) -> Path | None:
+    return min(t1s, key=_anat_rank) if t1s else None
