@@ -31,6 +31,8 @@ from typing import Any
 import numpy as np
 import torch
 
+from ..io.dsetinfo import read_info
+from .affine import load_matrix_1D, save_matrix_1D
 from .allineate import _voxdims_from_header
 from .io import load_image, save_image
 from .mask import automask
@@ -91,8 +93,14 @@ class SubjectPair:
     split: str = "train"
     # Path to the affine that put `source` on the base grid, when one was run.
     # Kept so a segmentation can go from its NATIVE grid to the base in a single
-    # gather, rather than through the affine and then the field.
+    # gather, rather than through the affine and then the field. It is a real
+    # AFNI ``.aff12.1D`` (DICOM mm, base->source), so ffs_nwarp / 3dNwarpApply
+    # can consume it directly; `native_source` is what turns it back into the
+    # base-voxel -> source-voxel matrix the label transport wants.
     source_affine: str | None = None
+    # The pre-alignment source, kept because `source` is rewritten to the
+    # affine-aligned copy on the base grid once step 0 has run.
+    native_source: str | None = None
 
     @property
     def has_labels(self) -> bool:
@@ -517,12 +525,21 @@ class CohortVolumes:
         return self._volume(self._labels, pair.source_labels, integer=True)
 
     def source_affine(self, pair: SubjectPair) -> torch.Tensor | None:
-        """The cached base->source matrix, or None when the pair shares a grid."""
-        if pair.source_affine is None:
+        """The cached base->source matrix, or None when the pair shares a grid.
+
+        The file on disk is DICOM mm (so AFNI and the rest of ffs can read it);
+        the label transport wants base voxels -> source voxels, so it is
+        converted back through the two grids' headers on load.
+        """
+        if pair.source_affine is None or pair.native_source is None:
             return None
         m = self._affines.get(pair.source_affine)
         if m is None:
-            m = torch.from_numpy(np.loadtxt(pair.source_affine).reshape(4, 4)).float()
+            m = load_matrix_1D(
+                pair.source_affine,
+                base_affine=read_info(pair.base).affine,
+                source_affine=read_info(pair.native_source).affine,
+            ).float()
             self._affines[pair.source_affine] = m
         return m
 
@@ -636,7 +653,9 @@ def affine_align(
         dst = cache / f"{stem}.nii.gz"
         mat_path = cache / f"{stem}.aff12.1D"
         if dst.exists() and mat_path.exists():
-            if verb >= 1:
+            if _migrate_legacy_matrix(mat_path, pair) and verb >= 1:
+                print(f"  {pair.name}: affine cache converted to AFNI mm", flush=True)
+            elif verb >= 1:
                 print(f"  {pair.name}: affine cached", flush=True)
             out.append(_affine_pair(pair, dst, mat_path))
             continue
@@ -656,7 +675,17 @@ def affine_align(
         # trial's field composed -- because NN twice loses about a voxel of label
         # boundary each time, and that is the same order as the differences
         # between the configs being ranked. Composing needs the matrix.
-        np.savetxt(mat_path, np.asarray(matrix.detach().cpu(), dtype=float).reshape(4, 4))
+        #
+        # Written in AFNI's own format rather than the base-voxel matrix
+        # allineate returns: a file named .aff12.1D that is neither 12 numbers
+        # nor DICOM mm cannot be handed to ffs_nwarp or 3dNwarpApply, and a
+        # head-to-head against another tool is exactly what these get used for.
+        save_matrix_1D(
+            matrix,
+            mat_path,
+            base_affine=base_header["affine"],
+            source_affine=source_header["affine"],
+        )
         if verb >= 1:
             print(f"  {pair.name}: affine {time.time() - t0:.1f}s -> {dst.name}", flush=True)
         out.append(_affine_pair(pair, dst, mat_path))
@@ -664,6 +693,27 @@ def affine_align(
         if device.type == "cuda":
             torch.cuda.empty_cache()
     return out
+
+
+def _migrate_legacy_matrix(mat_path: Path, pair: SubjectPair) -> bool:
+    """Rewrite a pre-AFNI-format cache file in place; True if it was converted.
+
+    Early runs wrote allineate's raw base-voxel -> source-voxel 4x4 under the
+    ``.aff12.1D`` name. Those caches are still correct, just unusable outside
+    tunewarp, and recomputing them costs ~25 s per subject for nothing.
+    """
+    vals = np.loadtxt(mat_path, ndmin=2)
+    if vals.size == 12 and vals.shape[0] <= 3:
+        return False
+    if vals.shape != (4, 4):
+        raise ValueError(f"Unrecognised affine cache {mat_path} with shape {vals.shape}")
+    save_matrix_1D(
+        torch.from_numpy(vals).float(),
+        mat_path,
+        base_affine=read_info(pair.base).affine,
+        source_affine=read_info(pair.source).affine,
+    )
+    return True
 
 
 def _affine_pair(pair: SubjectPair, dst: Path, mat_path: Path) -> SubjectPair:
@@ -682,6 +732,7 @@ def _affine_pair(pair: SubjectPair, dst: Path, mat_path: Path) -> SubjectPair:
         pair.split,
     )
     aligned.source_affine = str(mat_path)
+    aligned.native_source = pair.source
     return aligned
 
 

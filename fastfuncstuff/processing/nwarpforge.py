@@ -338,6 +338,15 @@ def load_affine_1D(
             [[float(x) for x in line.split()[:12]] for line in lines], dtype=np.float32
         )
         if mats_12.shape[1] != 12:
+            if mats_12.shape == (4, 4) or mats_12.shape == (3, 4):
+                raise ValueError(
+                    f"{path} holds a {mats_12.shape[0]}x4 matrix block, not AFNI .aff12.1D. "
+                    "An .aff12.1D is one line of 12 row-major numbers in DICOM mm "
+                    "(base->source). A block file is also usually in voxel-index space, "
+                    "so reshaping it to 12 values would be applied as mm and silently "
+                    "give the wrong answer -- convert it with "
+                    "processing.affine.save_matrix_1D(M, out, base_affine=, source_affine=)."
+                )
             raise ValueError(f"Expected 12 values per row in {path}, got {mats_12.shape[1]}")
 
     T = mats_12.shape[0]
