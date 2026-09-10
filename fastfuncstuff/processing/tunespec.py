@@ -319,6 +319,14 @@ _OW_SHARED = (
         units="mm",
     ),
     ParamSpec(
+        "optiwarp.jac_floor",
+        "-jac_floor",
+        (0.0, 0.01, 0.05, 0.1),
+        0.05,
+        "regularization",
+        "det(J) floor the local anti-fold damping holds an update above; 0 lets it fold.",
+    ),
+    ParamSpec(
         "optiwarp.match",
         "-match",
         ("localnorm", "gradmag", "meanstd"),

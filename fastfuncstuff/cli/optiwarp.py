@@ -447,6 +447,15 @@ def parse_args(
         help="Fluid regularization: update-field Gaussian sigma (voxels; 0=off).",
     )
     reg.add_argument(
+        "-jac_floor",
+        "-jac-floor",
+        type=float,
+        default=_D.jac_floor,
+        help="Prospective det(J) below which the local anti-fold damping intervenes.\n"
+        "0 lets a step fold. This is deliberately above the fold threshold: the\n"
+        "guard exists to stop inversion mid-fit, not to grade the result.",
+    )
+    reg.add_argument(
         "-total_sigma",
         "-total-sigma",
         type=float,
@@ -659,6 +668,7 @@ def _build_config(args: argparse.Namespace) -> OptiwarpConfig:
         hs_iters=args.hs_iters,
         step_mode=args.step_mode,
         max_step=args.max_step,
+        jac_floor=args.jac_floor,
         update_sigma=args.update_sigma,
         total_sigma=args.total_sigma,
         shrink_factors=_int_list(args.shrink),
