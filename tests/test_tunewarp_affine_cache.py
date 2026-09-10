@@ -100,3 +100,24 @@ def test_mean_sharpness_falls_when_the_mean_is_blurred():
     ]
 
     assert mean_sharpness(sharp) > mean_sharpness(blurred)
+
+
+def test_collect_unions_columns_across_methods(tmp_path):
+    """A method with extra columns must not shift everyone else's rows."""
+    from fastfuncstuff.processing.tunewarp import collect_diagnostics
+
+    (tmp_path / "old").mkdir()
+    (tmp_path / "old" / "summary.tsv").write_text("method\tdice_mean\nold\t0.61\n")
+    (tmp_path / "new").mkdir()
+    (tmp_path / "new" / "summary.tsv").write_text(
+        "method\tdice_mean\tmean_sharpness\nnew\t0.64\t0.21\n"
+    )
+
+    collect_diagnostics(tmp_path)
+    lines = (tmp_path / "all_summary.tsv").read_text().strip("\n").split("\n")
+    cols = lines[0].split("\t")
+    assert cols == ["method", "dice_mean", "mean_sharpness"]
+    rows = {r.split("\t")[0]: dict(zip(cols, r.split("\t"), strict=True)) for r in lines[1:]}
+    assert rows["old"]["dice_mean"] == "0.61"
+    assert rows["old"]["mean_sharpness"] == ""
+    assert rows["new"]["mean_sharpness"] == "0.21"

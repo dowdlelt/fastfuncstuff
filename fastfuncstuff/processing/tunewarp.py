@@ -2220,26 +2220,40 @@ def collect_diagnostics(root: Path) -> list[Path]:
     """Concatenate every method's tables under ``root`` into one file each.
 
     The head-to-head, as four dataframes. Each table already carries a ``method``
-    column, so this is a concatenation and not a join -- nothing has to line up,
-    and a method with a different label set or a missing subject simply
-    contributes the rows it has.
+    column, so this is a concatenation and not a join -- a method with a
+    different label set or a missing subject simply contributes the rows it has.
+
+    Columns are unioned rather than assumed identical. Methods legitimately
+    differ in what they carry: an external tool run without ``-warp_suffix`` has
+    no regularity columns, ``-metrics`` changes the intensity block, and a
+    directory accumulated across sessions mixes tool versions. Taking the first
+    file's header and appending everyone else's rows to it produced a file that
+    was silently one column out of register -- readable by nothing, and wrong in
+    a way that looks like data.
     """
     written = []
     for name in ("summary", "per_label", "per_pair", "per_subject"):
         parts = sorted(root.glob(f"*/{name}.tsv"))
         if not parts:
             continue
-        header, body = None, []
+        tables: list[tuple[list[str], list[list[str]]]] = []
+        columns: list[str] = []
         for part in parts:
-            lines = part.read_text().splitlines()
+            lines = [ln for ln in part.read_text().splitlines() if ln.strip()]
             if not lines:
                 continue
-            header = header or lines[0]
-            body += [ln for ln in lines[1:] if ln.strip()]
-        if header is None:
+            head = lines[0].split("\t")
+            tables.append((head, [ln.split("\t") for ln in lines[1:]]))
+            columns += [c for c in head if c not in columns]
+        if not tables:
             continue
+        body = []
+        for head, rows_in in tables:
+            for row in rows_in:
+                cell = dict(zip(head, row, strict=False))
+                body.append("\t".join(cell.get(c, "") for c in columns))
         dest = root / f"all_{name}.tsv"
-        dest.write_text("\n".join([header, *body]) + "\n")
+        dest.write_text("\n".join(["\t".join(columns), *body]) + "\n")
         written.append(dest)
     return written
 
