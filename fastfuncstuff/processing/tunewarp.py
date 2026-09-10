@@ -1680,12 +1680,18 @@ def group_diagnostics(
                 )
             )
             names.append(pair.name)
+        qc = one["warpqc"]
         rows.append(
             {
                 "subject": pair.name,
                 "grade": one["grade"],
-                "bend": float(one["warpqc"].get("bending_energy", 0.0)),
-                "jacmin": float(one["warpqc"].get("jac_min", 1.0)),
+                "bend": float(qc.get("bending_energy", 0.0)),
+                "jacmin": float(qc.get("jac_min", 1.0)),
+                # The same regularity detail -diag_only records for somebody
+                # else's field. Without it the head-to-head grades the other
+                # tools on four columns ours leave blank, and "is jac_p01 = 0.068
+                # unusual?" has nothing on our side of the table to compare.
+                **{k: float(qc[k]) for k in _REGULARITY_COLUMNS if k in qc},
                 "seconds": time.time() - t0,
                 "metrics": dict(one.get("scores", {})),
             }
