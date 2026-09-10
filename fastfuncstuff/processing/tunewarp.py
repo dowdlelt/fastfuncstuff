@@ -2114,9 +2114,19 @@ def _warp_quality(
     elif units != "voxel":
         raise ValueError(f"warp_units must be 'mm' or 'voxel', got {units!r}")
 
+    # Somebody else's field arrives on their own grid -- 3dQwarp pads, so the
+    # shapes never match and the mask used to be dropped entirely. That graded
+    # the external tool over its whole padded volume, background included, while
+    # ours is graded inside the brain: a different instrument on each side of the
+    # comparison the tables exist to make. The affines say where the base sits.
     mask = None
-    if referee is not None and tuple(xd.shape) == tuple(referee.brain.shape):
-        mask = referee.brain
+    if referee is not None:
+        mask = pad_mask_to_field(
+            referee.brain,
+            tuple(xd.shape),
+            mask_affine=referee.header["affine"],
+            field_affine=hdr["affine"],
+        )
     qc = warp_regularity(xd, yd, zd, mask=mask, voxdims=voxdims)
     grade, _ = regularity_verdict(qc)
     del xd, yd, zd
