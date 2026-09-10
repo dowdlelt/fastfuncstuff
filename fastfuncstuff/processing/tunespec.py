@@ -611,6 +611,24 @@ RECIPES: dict[str, Recipe] = {
             "metric matters more than the regularization."
         ),
     ),
+    "MNI_T1a": Recipe(
+        name="MNI_T1a",
+        describe="T1 to MNI, as tuned on NIREP16 (0.7 mm 3T, manual cortical labels)",
+        optimize="lpa",
+        evaluate_exclude=("mind", "mindssc"),
+        contrast="same",
+        pairing="one_base",
+        tune=_ALL_REG + _ALL_EFFORT + ("qwarp.hfactor_q", "formwarp.grad_step"),
+        # Lettered, not descriptive. These settings are one search on one kind of
+        # data; a later search on different data becomes MNI_T1b beside this
+        # rather than quietly redefining what somebody already shipped against.
+        notes=(
+            "The settings ffs_tunewarp measured on NIREP16 -> MNI152_2009 at "
+            "1 mm, scored by cross-subject agreement of 33 manual cortical "
+            "parcels over 16 subjects rather than by image similarity alone. "
+            "See [[registration bake-off]]."
+        ),
+    ),
     "common_T1": Recipe(
         name="common_T1",
         describe="A labelled cohort into ONE common space (MNI or any template)",
@@ -742,27 +760,67 @@ class Preset:
     backend: str
     config: dict[str, Any]
     provenance: str
+    dated: str = ""  # ISO date the settings were measured
+    # CLI dests set verbatim, for parts of the answer that are not tunable
+    # parameters -- which force model won is a setting the user would otherwise
+    # have to know to pass alongside the preset that assumes it.
+    extra: dict[str, Any] = field(default_factory=dict)
+    see_also: str = ""
     caveat: str = ""
+    # For a tool with several engines behind one command: the one to use when the
+    # caller named a recipe but not an engine. Without it, ffs_optiwarp has to
+    # hardcode which force model a recipe meant, which is exactly the fact the
+    # recipe is supposed to carry.
+    preferred: bool = False
 
-    def describe(self) -> str:
-        settings = " ".join(f"{k}={v}" for k, v in sorted(self.config.items())) or "(defaults)"
-        out = f"{settings}\n    measured on: {self.provenance}"
+    def describe(self, in_family: bool = False) -> str:
+        """One preset as the flags it sets, one per line.
+
+        One per line because argparse wraps: a settings list on one line comes
+        out broken mid-value and re-indented to nothing, which is how a preset
+        stops being inspectable and starts being a magic word.
+        """
+        spec = BACKENDS[self.backend]
+        head = f"{self.recipe}  (set {self.dated})" if self.dated else self.recipe
+        if in_family:
+            # Several engines share one command, so the heading has to say which
+            # of them -type lands on and how to reach the others.
+            head += "  [default]" if self.preferred else f"  [-force {self.extra.get('force', '')}]"
+        lines = [head]
+        for dest, value in self.extra.items():
+            lines.append(f"    -{dest} {value}")
+        for key, value in self.config.items():
+            param = spec.param(key)
+            shown = " ".join(f"{v:g}" for v in value) if isinstance(value, (list, tuple)) else value
+            unit = " mm" if param.units == "mm" else ""
+            lines.append(f"    {param.flag} {shown}{unit}")
+        lines.append(f"    measured on: {self.provenance}")
+        if self.see_also:
+            lines.append(f"    {self.see_also}")
         if self.caveat:
-            out += f"\n    caveat: {self.caveat}"
-        return out
+            lines.append(f"    caveat: {self.caveat}")
+        return "\n".join(lines)
 
 
 # Keyed (recipe, backend). Grown by running ffs_tunewarp and pasting what
 # `-export` prints; deliberately hand-committed rather than written at runtime, so
 # that a default change is a reviewable diff with a provenance line attached.
+_NIREP16 = (
+    "NIREP16 (16 subjects, 0.7 mm 3T T1) -> MNI152_2009 at 1 mm, ranked by "
+    "cross-subject agreement of 33 manual cortical parcels over 120 pairs"
+)
+
 PRESETS: dict[tuple[str, str], Preset] = {
     ("MNI_T1", "optiwarp_demons"): Preset(
         recipe="MNI_T1",
         backend="optiwarp_demons",
         config={"total_sigma": 1.0, "update_sigma": 0.5},
+        extra={"force": "demons"},
+        preferred=True,
+        dated="2026-08-15",
         provenance=(
-            "5 FreeSurfer brains -> MNI152_2009_template, 480 fits, -metric lpa, "
-            "2026-08-15. Near-best consensus and 4.75x cheaper than formwarp "
+            "5 FreeSurfer brains -> MNI152_2009_template, 480 fits, -metric lpa. "
+            "Near-best consensus and 4.75x cheaper than formwarp "
             "(2.4 s/fit vs 11.4)."
         ),
         caveat=(
@@ -775,9 +833,10 @@ PRESETS: dict[tuple[str, str], Preset] = {
         recipe="MNI_T1",
         backend="formwarp",
         config={"total_var": 0.5, "update_var": 4.0, "grad_step": 0.5},
+        dated="2026-08-15",
         provenance=(
-            "5 FreeSurfer brains -> MNI152_2009_template, 300 fits, -metric lpa, "
-            "2026-08-15. total_var 0.0 scored better but was the only level that "
+            "5 FreeSurfer brains -> MNI152_2009_template, 300 fits, -metric lpa. "
+            "total_var 0.0 scored better but was the only level that "
             "ever folded, so the shipped value is the best that never did."
         ),
         caveat=(
@@ -785,7 +844,75 @@ PRESETS: dict[tuple[str, str], Preset] = {
             "robust choice here: 299 PASS / 1 MARGINAL / 0 FAIL over 60 configs."
         ),
     ),
+    ("MNI_T1a", "optiwarp_hs"): Preset(
+        recipe="MNI_T1a",
+        backend="optiwarp_hs",
+        config={
+            "total_sigma": 0.0,
+            "update_sigma": 1.0,
+            "max_step": 2.0,
+            "conv_window": 10,
+            "conv_threshold": 1e-06,
+            "jac_floor": 0.0,
+        },
+        extra={"force": "hs"},
+        preferred=True,
+        dated="2026-09-10",
+        provenance=_NIREP16 + ".",
+        caveat=(
+            "The search that chose these ran with jac_floor at its 0.05 default "
+            "and every warp came out pressed against it. jac_floor=0.0 was "
+            "measured afterwards and folded nothing -- the diffeo step already "
+            "cannot fold -- so the rest of these settings are the best UNDER a "
+            "throttle that is now off, and are worth re-tuning without it."
+        ),
+    ),
+    ("MNI_T1a", "optiwarp_gradient"): Preset(
+        recipe="MNI_T1a",
+        backend="optiwarp_gradient",
+        config={
+            "total_sigma": 2.0,
+            "update_sigma": 1.560661,
+            "max_step": 1.0,
+            "conv_window": 20,
+            "conv_threshold": 0.0,
+        },
+        extra={"force": "gradient"},
+        dated="2026-09-10",
+        provenance=_NIREP16 + ".",
+        see_also="the hs force model scored higher on this data.",
+    ),
+    ("MNI_T1a", "formwarp"): Preset(
+        recipe="MNI_T1a",
+        backend="formwarp",
+        config={
+            "total_var": 0.0,
+            "update_var": 4.0,
+            "grad_step": 1.0,
+            "conv_window": 7,
+            "conv_threshold": 1e-06,
+        },
+        dated="2026-09-10",
+        provenance=_NIREP16 + ".",
+        see_also="ffs_optiwarp scored higher here; see its -help.",
+    ),
+    ("MNI_T1a", "qwarp"): Preset(
+        recipe="MNI_T1a",
+        backend="qwarp",
+        config={"penfac": 0.1, "minpatch": 5, "hfactor_q": 0.7, "workhard": (0, 2)},
+        dated="2026-09-10",
+        provenance=_NIREP16 + ".",
+        see_also="ffs_optiwarp scored higher here; see its -help.",
+    ),
 }
+
+
+def preferred_backend(recipe: str, family: str, fallback: str) -> str:
+    """Which backend of a family this recipe means when the caller did not say."""
+    for (rec, backend), preset in PRESETS.items():
+        if rec == recipe and backend.startswith(family) and preset.preferred:
+            return backend
+    return fallback
 
 
 def preset_for(recipe: str, backend: str) -> Preset | None:
@@ -811,7 +938,9 @@ def preset_config_for_cli(
     if preset is None:
         return {}
     spec = BACKENDS[backend]
-    out: dict[str, Any] = {}
+    # Verbatim: these are already CLI dests, and there is no ParamSpec to say
+    # what units they would be converted out of.
+    out: dict[str, Any] = dict(preset.extra)
     for key, value in preset.config.items():
         param = spec.param(key)
         if param.fmt == "x" and isinstance(value, (list, tuple)):
@@ -822,14 +951,22 @@ def preset_config_for_cli(
 
 
 def describe_presets(backend: str) -> str:
-    """The ``-type`` help text for one backend, generated from the presets."""
-    rows = [(r, p) for (r, b), p in sorted(PRESETS.items()) if b == backend]
+    """The ``-type`` help text for one backend, generated from the presets.
+
+    A family prefix (``"optiwarp"``) lists every engine behind that one command,
+    because ``-type`` picks the engine too: showing only one force model's
+    presets would hide the recipe that switches to another.
+    """
+    if backend in BACKENDS:
+        rows = [(r, p) for (r, b), p in sorted(PRESETS.items()) if b == backend]
+    else:
+        rows = [(r, p) for (r, b), p in sorted(PRESETS.items()) if b.startswith(backend)]
     if not rows:
         return "No tuned presets exist for this backend yet."
-    lines = []
-    for recipe, preset in rows:
-        lines.append(f"  {recipe}: {preset.describe()}")
-    return "\n".join(lines)
+    family = backend not in BACKENDS
+    if family:
+        rows.sort(key=lambda rp: (rp[0], not rp[1].preferred))
+    return "\n".join(preset.describe(in_family=family) for _, preset in rows)
 
 
 def find_param(dotted: str) -> ParamSpec:

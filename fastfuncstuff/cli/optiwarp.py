@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import shlex
+import sys
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -90,6 +91,7 @@ def _fmt_schedule(values) -> str:
 # single source of truth; this is a view of it.
 # Which PRESETS family `-type` should look up for this tool. The optiwarp
 # force models share a parameter set, so one entry covers all three.
+# Only the fallback now: which engine a recipe means is the recipe's to say.
 _PRESET_BACKEND = "optiwarp_demons"
 
 _D = OptiwarpConfig()
@@ -613,7 +615,7 @@ def parse_args(
         help="Interpolation for the final warped image.",
     )
 
-    add_recipe_arg(p, _PRESET_BACKEND)
+    add_recipe_arg(p, "optiwarp")
     add_deterministic_arg(p)
     add_device_arg(
         p,
@@ -623,9 +625,21 @@ def parse_args(
     args = p.parse_args(argv, namespace or argparse.Namespace())
     # After parsing, so that "did the user type this flag" is answerable from argv
     # rather than guessed by comparing values against defaults.
+    # Which force model the recipe meant, unless the caller named one. The three
+    # engines are separate backends with separate presets, so a recipe that is
+    # silent about -force would otherwise land on whichever one was hardcoded
+    # here -- and that was demons, from a search hs has since beaten.
+    from fastfuncstuff.processing.tunespec import preferred_backend
+
+    typed_force = any(t.lstrip("-").replace("-", "_") == "force" for t in (argv or sys.argv[1:]))
+    backend = (
+        f"optiwarp_{args.force}"
+        if typed_force or not args.recipe
+        else preferred_backend(args.recipe, "optiwarp", _PRESET_BACKEND)
+    )
     apply_recipe_preset(
         args,
-        _PRESET_BACKEND,
+        backend,
         argv,
         verb=getattr(args, "verb", 1),
         image=getattr(args, "base", None),

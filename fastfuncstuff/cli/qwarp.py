@@ -35,7 +35,9 @@ from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_deterministic_arg,
     add_device_arg,
+    add_recipe_arg,
     add_verbose_arg,
+    apply_recipe_preset,
     collect_batch_jobs,
     enable_determinism,
     parse_prefix,
@@ -878,6 +880,7 @@ def parse_args(
         "GPU / Hardware",
         "Device selection and memory management.",
     )
+    add_recipe_arg(p, "qwarp")
     add_deterministic_arg(g_hw)
     add_device_arg(
         g_hw,
@@ -904,7 +907,17 @@ def parse_args(
         help="Print GPU memory estimate for the input data and exit without running registration",
     )
 
-    return p.parse_args(argv, namespace or argparse.Namespace())
+    args = p.parse_args(argv, namespace or argparse.Namespace())
+    # After parsing, so that "did the user type this flag" is answerable from
+    # argv rather than guessed by comparing values against defaults.
+    apply_recipe_preset(
+        args,
+        "qwarp",
+        argv,
+        verb=getattr(args, "verb", 1),
+        image=getattr(args, "base", None),
+    )
+    return args
 
 
 def _zeropad_width(n: int) -> int:
