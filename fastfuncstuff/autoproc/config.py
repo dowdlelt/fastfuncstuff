@@ -58,6 +58,11 @@ DEFAULT_OPTS: dict[str, str] = {
     # uses the plain one. Which applies is set by -suma/-tpm, not by the user.
     "segment": "-niter 2000 -samp 1.5",
     "segment_fstpm": "-ngaus 1 1 1 1 1 2 3 4 -cleanup 0 -samp 1.5",
+    # T1w-to-T1w alignment before averaging repeats of one acquisition. Rigid:
+    # same subject, same acquisition, so anything beyond pose is the scanner
+    # drifting and not something to fit away. -cmass because two sessions can put
+    # the head in quite different places on the table.
+    "anat_avg": "-rigid -cost lpa -source_automask -autoweight -cmass -final wsinc5",
     # skull stripping (-anat_skull yes). FreeSurfer's mri_synthstrip, NOT an ffs
     # tool — needs FreeSurfer >= 8 on $PATH. --no-csf trims the outer CSF rim: the
     # anat is an alignment target for cross-modal lpc, and a bright CSF collar is

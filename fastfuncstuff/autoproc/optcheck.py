@@ -36,6 +36,7 @@ STAGE_TOOL: dict[str, str] = {
     "xses": "allineate",
     "xses_nl": "formwarp",
     "anat": "allineate",
+    "anat_avg": "allineate",
     "segment": "segment",
     "segment_fstpm": "segment",
     "nwarp": "nwarp",

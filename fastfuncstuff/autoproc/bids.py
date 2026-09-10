@@ -308,7 +308,8 @@ class Session:
     session: str | None
     bold_runs: list[BoldRun] = field(default_factory=list)
     fmaps: list[FmapGroup] = field(default_factory=list)
-    anat: Path | None = None
+    anat: Path | None = None  # the T1w this session offers as THE anat
+    anats: list[Path] = field(default_factory=list)  # every T1w found here
 
     @property
     def tasks(self) -> list[str]:
@@ -399,6 +400,18 @@ def scan_subject(
     return out
 
 
+def scan_all_anats(bids_root: str | Path, subject: str) -> list[Path]:
+    """Every T1w this subject has, in EVERY session — including the ones with no
+    BOLD runs, which never make it into a :class:`Subject`.
+
+    A dedicated ``ses-anat`` (or an anat collected on a different visit) is the
+    normal way a structural is filed, and it is invisible to the functional scan
+    that :func:`scan_subject` does."""
+    sub_dir = Path(bids_root) / f"sub-{_norm_id(subject, 'sub-')}"
+    session_dirs = sorted(sub_dir.glob("ses-*")) or [sub_dir]
+    return [p for sdir in session_dirs for p in _scan_anats(sdir)]
+
+
 def _scan_session(
     sdir: Path,
     bids_root: Path,
@@ -466,7 +479,8 @@ def _scan_session(
         sess.fmaps = _scan_fmaps(fmap_dir, bids_root, sess.bold_runs, fmap_pe_dir, fmap_kind)
 
     # ---- anat: prefer acq-uni T1w (MP2RAGE), else first T1w / MPRAGE ----
-    sess.anat = _pick_anat(sdir)
+    sess.anats = _scan_anats(sdir)
+    sess.anat = _pick_anat(sess.anats)
     return sess
 
 
@@ -849,19 +863,31 @@ def _resolve_intended(fmap_json: dict, tag: str, bold_runs: list[BoldRun]) -> li
     return [(r.task, r.run) for r in bold_runs if r.task == tag]
 
 
-def _pick_anat(sdir: Path) -> Path | None:
+def _scan_anats(sdir: Path) -> list[Path]:
+    """Every T1w in the session, in filename order.
+
+    All of them, not just the one that gets picked: an MP2RAGE session holds
+    inv1/inv2/uni under the same ``_T1w`` suffix, and a session can hold several
+    runs of the same acquisition — which of those may be averaged together is a
+    contrast question the caller answers (see ``anat_group`` in cli/autoproc)."""
     anat_dir = sdir / "anat"
     if not anat_dir.is_dir():
-        return None
-    t1s = [
+        return []
+    return [
         p
         for p in sorted(anat_dir.glob("*_T1w.nii*"))
         # quirk: skip non-BIDS derivatives (denoised/border/ROI) that lack sidecars.
         if not any(tok in p.name for tok in ("_denoised", "_border", "_ROI"))
     ]
-    if not t1s:
-        return None
+
+
+def _pick_anat(t1s: list[Path]) -> Path | None:
     for p in t1s:  # prefer the MP2RAGE UNI image
         if parse_entities(p.name).get("acq") == "uni":
             return p
-    return t1s[0]
+    for p in t1s:
+        # A multi-echo MPRAGE files each echo AND the combined image under _T1w;
+        # the one without an `echo` entity is the combination, and is the anat.
+        if "echo" not in parse_entities(p.name):
+            return p
+    return t1s[0] if t1s else None

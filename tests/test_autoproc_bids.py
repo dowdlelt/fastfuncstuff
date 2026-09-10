@@ -279,6 +279,78 @@ def test_anat_prefers_uni(tmp_path: Path):
     assert "acq-uni" in subj.sessions[0].anat.name
 
 
+def test_anat_group_pools_repeats_of_one_acquisition(tmp_path: Path):
+    """Several T1w may be averaged only if they are the same image twice. An
+    MP2RAGE session files inv1/inv2/uni all as _T1w, so the group is the picked
+    anat's own (acq, rec) — here the two uni runs, across both sessions."""
+    from fastfuncstuff.cli.autoproc import anat_group
+
+    for ses, runs in (("WB1", ("01", "02")), ("WB2", ("01",))):
+        d = tmp_path / "sub-ME1" / f"ses-{ses}"
+        _touch(d / "func" / f"sub-ME1_ses-{ses}_task-x_run-01_bold.nii.gz", {"RepetitionTime": 1.5})
+        _touch(d / "anat" / f"sub-ME1_ses-{ses}_acq-inv1_T1w.nii.gz", {})
+        for r in runs:
+            _touch(d / "anat" / f"sub-ME1_ses-{ses}_acq-uni_run-{r}_T1w.nii.gz", {})
+    group = anat_group(scan_subject(tmp_path, "ME1"))
+    assert [p.name for p in group] == [
+        "sub-ME1_ses-WB1_acq-uni_run-01_T1w.nii.gz",
+        "sub-ME1_ses-WB1_acq-uni_run-02_T1w.nii.gz",
+        "sub-ME1_ses-WB2_acq-uni_run-01_T1w.nii.gz",
+    ]
+
+
+def test_anat_group_keeps_reconstructions_apart(tmp_path: Path):
+    """rec-norm and the raw reconstruction are not the same image; averaging them
+    would average two different intensity normalisations."""
+    from fastfuncstuff.cli.autoproc import anat_group
+
+    d = tmp_path / "sub-01" / "ses-01"
+    _touch(d / "func" / "sub-01_ses-01_task-x_run-01_bold.nii.gz", {"RepetitionTime": 1.5})
+    _touch(d / "anat" / "sub-01_ses-01_rec-norm_run-1_T1w.nii.gz", {})
+    _touch(d / "anat" / "sub-01_ses-01_rec-norm_run-2_T1w.nii.gz", {})
+    _touch(d / "anat" / "sub-01_ses-01_run-3_T1w.nii.gz", {})
+    group = anat_group(scan_subject(tmp_path, "01"))
+    assert [p.name for p in group] == [
+        "sub-01_ses-01_rec-norm_run-1_T1w.nii.gz",
+        "sub-01_ses-01_rec-norm_run-2_T1w.nii.gz",
+    ]
+
+
+def test_anat_group_never_averages_across_echoes(tmp_path: Path):
+    """A multi-echo MPRAGE files each echo AND the combination under _T1w. The
+    combination is the anat, and the echoes are not repeats of it."""
+    from fastfuncstuff.cli.autoproc import anat_group
+
+    d = tmp_path / "sub-01" / "ses-anat"
+    f = tmp_path / "sub-01" / "ses-fine"
+    _touch(f / "func" / "sub-01_ses-fine_task-x_run-01_bold.nii.gz", {"RepetitionTime": 1.5})
+    for run in ("1", "2"):
+        for echo in ("1", "2", "3", "4"):
+            _touch(d / "anat" / f"sub-01_ses-anat_rec-norm_run-{run}_echo-{echo}_T1w.nii.gz", {})
+        _touch(d / "anat" / f"sub-01_ses-anat_rec-norm_run-{run}_T1w.nii.gz", {})
+        _touch(d / "anat" / f"sub-01_ses-anat_rec-orig_run-{run}_T1w.nii.gz", {})
+    group = anat_group(scan_subject(tmp_path, "01"), str(tmp_path))
+    assert [p.name for p in group] == [
+        "sub-01_ses-anat_rec-norm_run-1_T1w.nii.gz",
+        "sub-01_ses-anat_rec-norm_run-2_T1w.nii.gz",
+    ]
+
+
+def test_anat_group_finds_a_session_with_no_bold_runs(tmp_path: Path):
+    """The structural usually lives in its own ses-anat, which has no BOLD runs
+    and so is not a session of the scanned Subject at all."""
+    from fastfuncstuff.cli.autoproc import anat_group
+
+    _touch(
+        tmp_path / "sub-01" / "ses-fine" / "func" / "sub-01_ses-fine_task-x_run-01_bold.nii.gz",
+        {"RepetitionTime": 1.5},
+    )
+    _touch(tmp_path / "sub-01" / "ses-anat" / "anat" / "sub-01_ses-anat_T1w.nii.gz", {})
+    subj = scan_subject(tmp_path, "01")
+    assert [s.session for s in subj.sessions] == ["fine"]  # ses-anat is not one
+    assert [p.name for p in anat_group(subj, str(tmp_path))] == ["sub-01_ses-anat_T1w.nii.gz"]
+
+
 def test_find_events_ignores_image_only_entities(tmp_path: Path):
     """The bug of record: a `part-mag_bold.nii.gz` run pairs with an events TSV
     that carries no `part-` entity at all (part describes the image, not the

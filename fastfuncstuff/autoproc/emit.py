@@ -955,18 +955,30 @@ def _qc_anat(plan: Plan) -> str:
         # Both states, so the nonlinear link is visible as the step between them —
         # and so the one the final grid is built from is the one you can see.
         items.append((_al_anat_nl(plan), f"{src}_al_anat_nl"))
+    opt = plan.options
     calls = [_qc_call(_qc_stem("anat"), items)]
-    if plan.options.anat_skull:
-        # head vs brain on the input grid: the one stack that shows whether the
-        # strip ate cortex. It cannot join the group above — that one lives on the
-        # autoboxed grid, and qc_tcat stacks, it does not resample.
+    if opt.anat_skull:
+        # pre-strip vs brain on the input grid: the one stack that shows whether
+        # the strip ate cortex. It cannot join the group above — that one lives on
+        # the autoboxed grid, and qc_tcat stacks, it does not resample.
+        pre = _anat_prestrip(opt)
         calls.insert(
             0,
             _qc_call(
                 _qc_stem("anat_strip"),
-                [(_anat_head(), "anat_head"), (_anat_brain(), "anat_brain")],
+                [
+                    (pre, "anat_avg" if opt.anat_extra else "anat_head"),
+                    (_anat_brain(), "anat_brain"),
+                ],
             ),
         )
+    if opt.anat_extra:
+        # Every T1w that went into the mean, plus the mean: a rigid alignment that
+        # missed shows up here as the one sub-brick that does not overlay.
+        ins: QCItems = [(opt.anat_path or "$ANAT", "anat_in1")]
+        ins += [(_anat_in_al(k), f"anat_in{k}") for k in range(2, len(opt.anat_extra) + 2)]
+        ins.append((_anat_avg(), "anat_avg"))
+        calls.insert(0, _qc_call(_qc_stem("anat_avg"), ins))
     return _qc_block("EPI → anat", calls)
 
 
@@ -2329,8 +2341,11 @@ def _stage_anat(plan: Plan) -> str:
         anat_ph = (
             opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
         )
+        if opt.anat_extra:
+            out.append(_anat_average_block(opt, anat_ph))
+            anat_ph = _anat_avg()
         if opt.anat_skull:
-            out.append(_skullstrip_block(anat_ph))
+            out.append(_skullstrip_block(opt, anat_ph))
             anat_ph = _anat_brain()
         src = _anat_source_image(plan)
         mode = effective_anat_source(plan)
@@ -2404,6 +2419,57 @@ def _stage_anat(plan: Plan) -> str:
     return "\n".join(p for p in out if p) + "\n"
 
 
+def _anat_avg() -> str:
+    """The mean of several T1w of one acquisition, aligned to the first.
+
+    Averaging repeats is free SNR on the image every cross-modal cost function
+    and (with -anat_skull yes) the strip has to work from, and it is the reason
+    the anat can be left to the BIDS scan instead of pointed at by hand."""
+    return "stage09.anat_avg.nii.gz"
+
+
+def _anat_in_al(k: int) -> str:
+    """One non-first T1w, rigidly aligned onto the first one's grid."""
+    return f"stage09.anat_in{k}_al.nii.gz"
+
+
+def _anat_average_block(opt, base: str) -> str:
+    """Align every extra T1w to the first and average them.
+
+    Plain .gz throughout: these are images to look at when the mean comes out
+    blurred, and stock AFNI cannot open .nii.zst."""
+    al_opts = _split_flags(config.DEFAULT_OPTS["anat_avg"])
+    avg = _anat_avg()
+    steps = []
+    for k, extra in enumerate(opt.anat_extra, start=2):
+        steps.append(
+            _ffs(
+                "ffs_allineate",
+                [
+                    f'-base "{base}"',
+                    f"-source {shlex.quote(extra)}",
+                    f'-prefix "{_anat_in_al(k)}"',
+                    *al_opts,
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+    aligned = [_anat_in_al(k) for k in range(2, len(opt.anat_extra) + 2)]
+    inputs = " ".join(f'"{p}"' for p in [base, *aligned])
+    steps.append(
+        _ffs(
+            "ffs_util_3dmath",
+            [f"-input {inputs}", "-mean", f'-prefix "{avg}"', '-device "$DEVICE"'],
+        )
+    )
+    body = "\n".join(steps)
+    n = len(opt.anat_extra) + 1
+    return f"""# --- average {n} T1w of one acquisition (aligned to the first) ---
+if [ ! -f "{avg}" ]; then
+{body}
+fi"""
+
+
 def _anat_head() -> str:
     """The anat as it arrived, with its skull (-anat_skull yes).
 
@@ -2419,25 +2485,37 @@ def _anat_brain() -> str:
     return "stage09.anat_brain.nii.gz"
 
 
-def _skullstrip_block(src: str) -> str:
+def _anat_prestrip(opt) -> str:
+    """The image mri_synthstrip reads — and the record of what went into the
+    strip: the average when there were several T1w, else the copy kept of the one."""
+    return _anat_avg() if opt.anat_extra else _anat_head()
+
+
+def _skullstrip_block(opt, src: str) -> str:
     """Strip the anat in-script with FreeSurfer's mri_synthstrip (>= 8).
 
-    An already-.nii.gz anat is copied byte for byte, keeping its integer dtype;
-    anything else goes through ffs_util_3dmath, because the copy has to really be
-    the .nii.gz its name claims for stock AFNI to open it next to the brain."""
+    A single input anat is first copied in beside its brain, so the results dir
+    still holds what went into the strip — byte for byte when it is already a
+    .nii.gz (keeping its integer dtype), else through ffs_util_3dmath, because
+    the copy has to really be the .nii.gz its name claims for stock AFNI to open
+    it. An averaged anat is already that record and is stripped where it lies."""
     strip_opts = " ".join(_split_flags(config.DEFAULT_OPTS["synthstrip"]))
-    head, brain = _anat_head(), _anat_brain()
-    if src.endswith(".nii.gz"):
-        copy = f'  cp -f "{src}" "{head}"'
+    head, brain = _anat_prestrip(opt), _anat_brain()
+    if opt.anat_extra:
+        copy = ""
+    elif src.endswith(".nii.gz"):
+        copy = f'  cp -f "{src}" "{head}"\n'
     else:
-        copy = _ffs(
-            "ffs_util_3dmath",
-            [f'-input "{src}"', "-expr 'a'", f'-prefix "{head}"', '-device "$DEVICE"'],
+        copy = (
+            _ffs(
+                "ffs_util_3dmath",
+                [f'-input "{src}"', "-expr 'a'", f'-prefix "{head}"', '-device "$DEVICE"'],
+            )
+            + "\n"
         )
     return f"""# --- skull strip the anat (-anat_skull yes) ---
 if [ ! -f "{brain}" ]; then
-{copy}
-  mri_synthstrip -i "{head}" -o "{brain}" {strip_opts}
+{copy}  mri_synthstrip -i "{head}" -o "{brain}" {strip_opts}
 fi"""
 
 

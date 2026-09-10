@@ -2049,3 +2049,25 @@ def test_anat_skull_no_uses_the_anat_as_given():
     s = _skull_script()
     assert "synthstrip" not in s
     assert 'ANAT="/data/sub-X_T1w.nii.gz"' in s
+
+
+def test_multiple_anats_are_aligned_averaged_then_stripped():
+    """Order matters: the strip and everything downstream must see the MEAN, and
+    the mean has to be built from aligned images (a mean of unaligned T1w is a
+    blur, and it is the thing every cross-modal cost then works from)."""
+    s = _skull_script(anat_extra=["/data/sub-X_run-2_T1w.nii.gz"], anat_skull=True)
+    assert '-base "/data/sub-X_T1w.nii.gz"' in s  # first anat is the alignment base
+    assert '-prefix "stage09.anat_in2_al.nii.gz"' in s
+    assert '-input "/data/sub-X_T1w.nii.gz" "stage09.anat_in2_al.nii.gz" \\\n    -mean' in s
+    assert 'mri_synthstrip -i "stage09.anat_avg.nii.gz"' in s
+    assert s.index('-prefix "stage09.anat_avg.nii.gz"') < s.index("mri_synthstrip -i")
+    # No second copy of the average under the head name — it IS the strip's record.
+    assert "stage09.anat_head" not in s
+
+
+def test_multiple_anats_without_a_skull_still_average():
+    """-anat_skull no is about stripping, not about averaging: repeats of an
+    already-stripped anat are just as worth averaging."""
+    s = _skull_script(anat_extra=["/data/sub-X_run-2_T1w.nii.gz"])
+    assert "synthstrip" not in s
+    assert 'ANAT="stage09.anat_avg.nii.gz"' in s

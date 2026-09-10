@@ -137,6 +137,9 @@ class Options:
     final_dxyz: str | None = None  # final output voxel size (mm); None → input EPI res
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
     anat_path: str | None = None  # T1w to align to (baked into the script if found)
+    # Further T1w of the SAME acquisition (extra runs, other sessions). Aligned to
+    # anat_path and averaged with it before anything else touches the anat.
+    anat_extra: list[str] = field(default_factory=list)
     # -anat_skull yes: the anat still has a skull, so strip it in-script with
     # mri_synthstrip before anything aligns to it.
     anat_skull: bool = False
