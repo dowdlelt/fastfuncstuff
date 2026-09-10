@@ -101,8 +101,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     g = p.add_argument_group("anatomical & reference space")
-    g.add_argument("-anat", help="skull-stripped T1w to align to (e.g. SUMA brain.nii.gz)")
+    g.add_argument(
+        "-anat",
+        help="T1w to align to (e.g. SUMA brain.nii.gz); add -anat_skull yes if it "
+        "still has a skull",
+    )
     g.add_argument("-suma", help="FreeSurfer SUMA dir; brain.nii.gz + builds a TPM from aseg.auto")
+    g.add_argument(
+        "-anat_skull",
+        "-anat-skull",
+        choices=["no", "yes"],
+        default="no",
+        help="does -anat still have a skull? no (default) = it is already stripped "
+        "(a SUMA brain.nii.gz). yes = strip it in-script with FreeSurfer's "
+        "mri_synthstrip (FreeSurfer >= 8 required on $PATH), so a T1w straight off "
+        "the scanner can be the alignment target with no recon-all. Both images are "
+        "written: stage09.anat_head (as given) and stage09.anat_brain (stripped, "
+        "what everything aligns to). This gives no tissue priors, so -anat_nonlin "
+        "still needs -tpm.",
+    )
     g.add_argument("-no_anat", "-no-anat", action="store_true", help="stay in EPI space (no anat)")
     g.add_argument(
         "-final_dxyz",
@@ -653,10 +670,41 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             "not the functional session."
         )
     if opt.anat_nonlin and not opt.tpm and not opt.fs_tpm:
+        skull = (
+            " -anat_skull yes strips the anat but derives no tissue priors, so the "
+            "nonlinear step needs -tpm even so."
+            if opt.anat_skull
+            else ""
+        )
         errors.append(
             "-anat_nonlin (ffs_segment) needs a subject TPM: pass -tpm FILE, or -suma DIR "
-            "to build one from FreeSurfer (aseg.auto + SurfVol)."
+            "to build one from FreeSurfer (aseg.auto + SurfVol)." + skull
         )
+    if not opt.anat_skull and anat_path and not args.anat and not args.suma:
+        # Scanned out of the BIDS tree: a bare T1w there is raw off the scanner far
+        # more often than it is stripped, and an unstripped alignment target sends
+        # cross-modal lpc to the skull.
+        warnings.append(
+            f"the anat was found in the BIDS tree ({anat_path}) and is assumed to be "
+            "skull-stripped. If it is not, pass -anat_skull yes."
+        )
+    if opt.anat_skull:
+        if args.suma:
+            errors.append(
+                "-anat_skull yes with -suma: the SUMA brain.nii.gz is already stripped. "
+                "Drop -anat_skull, or point -anat at the unstripped T1w instead."
+            )
+        # Only warned about when the script will actually run the strip.
+        elif (
+            opt.go_to_anat
+            and opt.ref_file is None
+            and opt.grand_reference is None
+            and shutil.which("mri_synthstrip") is None
+        ):
+            warnings.append(
+                "-anat_skull yes: 'mri_synthstrip' is not on $PATH (it ships with "
+                "FreeSurfer >= 8). The script's preflight will refuse to run until it is."
+            )
     if opt.slicetiming_method != "none" and opt.tr is None:
         # Slice timing needs a TR per run; the sidecar is the only source here.
         no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]
@@ -1129,6 +1177,7 @@ def main(argv: list[str] | None = None) -> int:
         # -ref_image is the answer for every level; -anat_source overrides it for
         # the anat step alone.
         anat_source=args.anat_source or args.ref_image or "auto",
+        anat_skull=args.anat_skull == "yes",
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,
         moco_ref=args.moco_ref,

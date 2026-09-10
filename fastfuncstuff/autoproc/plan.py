@@ -136,7 +136,10 @@ class Options:
     go_to_anat: bool = True  # False → final space is the EPI grandmean
     final_dxyz: str | None = None  # final output voxel size (mm); None → input EPI res
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
-    anat_path: str | None = None  # skull-stripped T1w (baked into the script if found)
+    anat_path: str | None = None  # T1w to align to (baked into the script if found)
+    # -anat_skull yes: the anat still has a skull, so strip it in-script with
+    # mri_synthstrip before anything aligns to it.
+    anat_skull: bool = False
     moco_ref: str = "sbref"  # moco base: sbref|first|last|<int>  (sbref → sbref if present)
     # Which EPI-contrast image the anat linear step aligns to. All choices live on
     # the SAME grid (the reference fmap's undistorted space) — see

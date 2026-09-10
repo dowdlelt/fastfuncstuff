@@ -86,6 +86,7 @@ STAGE_NUMBERS: dict[str, int] = {
     "grandmean": 8,
     "xref": 9,  # align this data's grandmean to an external -grand_reference
     "anat": 9,
+    "anat_strip": 9,  # the -anat_skull yes head/brain QC pair
     "nlanat": 9,
     "final": 10,
     "scale": 11,

@@ -58,6 +58,11 @@ DEFAULT_OPTS: dict[str, str] = {
     # uses the plain one. Which applies is set by -suma/-tpm, not by the user.
     "segment": "-niter 2000 -samp 1.5",
     "segment_fstpm": "-ngaus 1 1 1 1 1 2 3 4 -cleanup 0 -samp 1.5",
+    # skull stripping (-anat_skull yes). FreeSurfer's mri_synthstrip, NOT an ffs
+    # tool — needs FreeSurfer >= 8 on $PATH. --no-csf trims the outer CSF rim: the
+    # anat is an alignment target for cross-modal lpc, and a bright CSF collar is
+    # the part of the head an EPI has no counterpart for.
+    "synthstrip": "--no-csf",
     # final compose+resample (ffs_nwarp).
     "nwarp": "-interp wsinc5 -no_neg",
     # ROMEO temporal phase unwrapping (-phase_proc). "-t epi" is the single-echo

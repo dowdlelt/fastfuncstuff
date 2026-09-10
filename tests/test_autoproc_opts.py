@@ -102,7 +102,10 @@ def test_every_stage_default_passes_its_own_tools_parser(key):
 
 
 def test_every_opts_key_is_mapped_to_a_tool():
-    unmapped = set(config.STAGE_OPT_KEYS) - set(optcheck.STAGE_TOOL) - {"unwrap"}
+    # "unwrap" (ROMEO) and "synthstrip" (FreeSurfer) are external tools with no
+    # parser of ours to ask.
+    external = {"unwrap", "synthstrip"}
+    unmapped = set(config.STAGE_OPT_KEYS) - set(optcheck.STAGE_TOOL) - external
     assert not unmapped, f"no tool mapping (so no typo check) for: {sorted(unmapped)}"
 
 

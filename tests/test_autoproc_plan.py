@@ -2025,3 +2025,27 @@ def test_nordic_task_rescue_needs_events_to_be_on(tmp_path):
         subj, Options(want_nordic=True, nordic_task_rescue="ica", nordic_events=False)
     )
     assert "-task_rescue" not in _nordic_command(write_script(plan, "wd", bids_root=str(tmp_path)))
+
+
+def _skull_script(**kw):
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "foo", "2")])])
+    opt = Options(go_to_anat=True, anat_path="/data/sub-X_T1w.nii.gz", **kw)
+    return write_script(build_plan(subj, opt), "wd", bids_root="/bids")
+
+
+def test_anat_skull_strips_before_anything_aligns_to_the_anat():
+    """-anat_skull yes: everything downstream must see the BRAIN, not the head —
+    the autobox, the allineate base and the final grid all descend from $ANAT."""
+    s = _skull_script(anat_skull=True)
+    assert 'mri_synthstrip -i "stage09.anat_head.nii.gz" -o "stage09.anat_brain.nii.gz"' in s
+    assert 'ANAT="stage09.anat_brain.nii.gz"' in s
+    assert 'cp -f "/data/sub-X_T1w.nii.gz" "stage09.anat_head.nii.gz"' in s  # kept as given
+    assert "mri_synthstrip" in s.split("stage: preflight")[1].split("stage")[0]
+    # The strip precedes the crop that every later stage inherits its FOV from.
+    assert s.index("mri_synthstrip -i") < s.index('-prefix "stage09.anat_autobox.nii.gz"')
+
+
+def test_anat_skull_no_uses_the_anat_as_given():
+    s = _skull_script()
+    assert "synthstrip" not in s
+    assert 'ANAT="/data/sub-X_T1w.nii.gz"' in s

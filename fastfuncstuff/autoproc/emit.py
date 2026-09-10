@@ -955,7 +955,19 @@ def _qc_anat(plan: Plan) -> str:
         # Both states, so the nonlinear link is visible as the step between them —
         # and so the one the final grid is built from is the one you can see.
         items.append((_al_anat_nl(plan), f"{src}_al_anat_nl"))
-    return _qc_block("EPI → anat", [_qc_call(_qc_stem("anat"), items)])
+    calls = [_qc_call(_qc_stem("anat"), items)]
+    if plan.options.anat_skull:
+        # head vs brain on the input grid: the one stack that shows whether the
+        # strip ate cortex. It cannot join the group above — that one lives on the
+        # autoboxed grid, and qc_tcat stacks, it does not resample.
+        calls.insert(
+            0,
+            _qc_call(
+                _qc_stem("anat_strip"),
+                [(_anat_head(), "anat_head"), (_anat_brain(), "anat_brain")],
+            ),
+        )
+    return _qc_block("EPI → anat", calls)
 
 
 def _qc_final(plan: Plan) -> str:
@@ -1313,6 +1325,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
     tools = [*_TOOLS, *dict.fromkeys(nl_tools)]
     if _phase_on(plan):
         tools = [*tools, "romeo"]
+    if opt.anat_skull and _own_anat(opt):
+        tools = [*tools, "mri_synthstrip"]
     return f"""
 # =============================== stage: preflight ===========================
 echo '== preflight: inputs + tools =='
@@ -2313,9 +2327,11 @@ def _stage_anat(plan: Plan) -> str:
         seg_mats = f"{gr}/stage09.anat.aff12.1D stage09.xref.aff12.1D"
     else:
         anat_ph = (
-            opt.anat_path
-            or "${FFS_ANAT:?set FFS_ANAT to the skull-stripped T1w (SUMA brain.nii.gz)}"
+            opt.anat_path or "${FFS_ANAT:?set FFS_ANAT to the T1w to align to (SUMA brain.nii.gz)}"
         )
+        if opt.anat_skull:
+            out.append(_skullstrip_block(anat_ph))
+            anat_ph = _anat_brain()
         src = _anat_source_image(plan)
         mode = effective_anat_source(plan)
         box = _anat_box()
@@ -2386,6 +2402,43 @@ def _stage_anat(plan: Plan) -> str:
         out.append(_anat_nl_anchor_call(plan))
     out.append(_qc_anat(plan))
     return "\n".join(p for p in out if p) + "\n"
+
+
+def _anat_head() -> str:
+    """The anat as it arrived, with its skull (-anat_skull yes).
+
+    Written even though nothing downstream reads it: a strip is a decision, and
+    the only way to see what came off is to still have what went in. Plain .gz so
+    it opens in stock AFNI next to the brain."""
+    return "stage09.anat_head.nii.gz"
+
+
+def _anat_brain() -> str:
+    """The skull-stripped anat (-anat_skull yes) — what stage09 actually aligns
+    to, standing in for the SUMA brain.nii.gz a FreeSurfer subject would have."""
+    return "stage09.anat_brain.nii.gz"
+
+
+def _skullstrip_block(src: str) -> str:
+    """Strip the anat in-script with FreeSurfer's mri_synthstrip (>= 8).
+
+    An already-.nii.gz anat is copied byte for byte, keeping its integer dtype;
+    anything else goes through ffs_util_3dmath, because the copy has to really be
+    the .nii.gz its name claims for stock AFNI to open it next to the brain."""
+    strip_opts = " ".join(_split_flags(config.DEFAULT_OPTS["synthstrip"]))
+    head, brain = _anat_head(), _anat_brain()
+    if src.endswith(".nii.gz"):
+        copy = f'  cp -f "{src}" "{head}"'
+    else:
+        copy = _ffs(
+            "ffs_util_3dmath",
+            [f'-input "{src}"', "-expr 'a'", f'-prefix "{head}"', '-device "$DEVICE"'],
+        )
+    return f"""# --- skull strip the anat (-anat_skull yes) ---
+if [ ! -f "{brain}" ]; then
+{copy}
+  mri_synthstrip -i "{head}" -o "{brain}" {strip_opts}
+fi"""
 
 
 def _fs_tpm_block(opt) -> str:
