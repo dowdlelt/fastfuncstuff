@@ -9,8 +9,8 @@ tokens into filenames.
 Warp-chain token order (output/anat space → native source; the same order
 ``ffs_nwarp -nwarp`` consumes, leftmost acting first on the output coordinate)::
 
-    anat_lin  xref_nl xref_lin  anat_nl  xses_nl xses_lin  xfmap_nl xfmap_lin
-        blip_half  wxrun_nl wxrun_lin  locomoco  moco
+    mni_nl mni_lin  anat_lin  xref_nl xref_lin  anat_nl  xses_nl xses_lin
+        xfmap_nl xfmap_lin  blip_half  wxrun_nl wxrun_lin  locomoco  moco
 
 Verified against both reference ffs scripts and the AFNI final-apply block:
   * own-anat, single session (floc):   anat_lin  anat_nl  blip_half  wxrun*  ...
@@ -136,6 +136,12 @@ class Options:
     go_to_anat: bool = True  # False → final space is the EPI grandmean
     final_dxyz: str | None = None  # final output voxel size (mm); None → input EPI res
     anat_nonlin: bool = False  # segment/rbr nonlinear anat refinement
+    # -do_mni: one more affine+nonlinear pair at the head of every chain, taking
+    # the anat (and so the whole dataset) to an MNI template. Applied in the same
+    # single resample as everything else — see plan.py's chain order.
+    do_mni: bool = False
+    mni_template: str | None = None  # the template dataset (AFNI's MNI SSW [0])
+    mni_backend: str = "optiwarp_hs"  # engine for the nonlinear half (-mni_use)
     anat_path: str | None = None  # T1w to align to (baked into the script if found)
     # Further T1w of the SAME acquisition (extra runs, other sessions). Aligned to
     # anat_path and averaged with it before anything else touches the anat.
@@ -197,6 +203,12 @@ class Options:
 # Canonical chain order, reference-side first. Each token carries the level it
 # belongs to so the drop rules read cleanly.
 _CHAIN_ORDER = (
+    # -do_mni: anat → MNI template, estimated on the (skull-stripped) anat itself
+    # and therefore acting last on the data — which in this leftmost-acts-first
+    # order puts it at the very head. The pair is (nl, lin) like every other
+    # "affine then warp" level: the warp was estimated FROM the affine result.
+    "mni_nl",
+    "mni_lin",
     "anat_lin",
     "xref_nl",
     "xref_lin",
@@ -544,6 +556,8 @@ def build_warp_chain(pr: PlanRun, opt: Options, multi_session: bool) -> list[str
     has_fmap = pr.fmap is not None
     grand_ref = opt.has_grand_ref
     include = {
+        "mni_lin": opt.go_to_anat and opt.do_mni,
+        "mni_nl": opt.go_to_anat and opt.do_mni,
         "anat_lin": opt.go_to_anat,
         # xref: align this data's grandmean to the external reference's grandmean.
         "xref_lin": opt.go_to_anat and grand_ref,

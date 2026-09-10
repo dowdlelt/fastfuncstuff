@@ -218,6 +218,17 @@ def _anat_lin_files(opt) -> list[str]:
     return [f"{gr.rstrip('/')}/{anat}"] if gr else [anat]
 
 
+def _mni_files(opt, tail: str) -> list[str]:
+    """The anat→MNI link at the very head of the chain (-do_mni).
+
+    Borrowed from the reference results dir in -grand_reference mode, for the same
+    reason the anat matrix is: two datasets anchored on one reference must reach
+    MNI through the SAME warp, or they are in two slightly different MNI spaces."""
+    name = stem(NameKey("mni")) + tail
+    gr = getattr(opt, "grand_reference", None) if opt is not None else None
+    return [f"{gr.rstrip('/')}/{name}"] if gr else [name]
+
+
 # The pre-chain tokens: run-native → the session's common grid. Applied on their
 # own to a run's lane image they build its "runmean" (see stage07). With
 # fieldmaps the common grid is the reference fmap's undistorted space and all
@@ -245,6 +256,13 @@ def _nl_source_args(in_source: bool, aligned: str, native: str, matrix: str) -> 
 def _token_files(pr: PlanRun, tok: str, fmt: str, opt) -> list[str]:
     """The concrete file(s) one warp-chain token resolves to. Single source of
     truth for both the full chain and the fmap sub-chain (no drift)."""
+    if tok == "mni_nl":
+        # .gz, not $FMT: every backend takes the warp's extension from its -prefix,
+        # and that prefix is the whole-brain MNI underlay, which has to be openable
+        # in stock AFNI (it cannot read .nii.zst).
+        return _mni_files(opt, "_nl_WARP.nii.gz")
+    if tok == "mni_lin":
+        return _mni_files(opt, ".aff12.1D")
     if tok == "anat_lin":
         return _anat_lin_files(opt)
     if tok == "xref_nl":
@@ -1339,6 +1357,8 @@ def _preflight(plan: Plan, bids_root: str | None = None) -> str:
         tools = [*tools, "romeo"]
     if opt.anat_skull and _own_anat(opt):
         tools = [*tools, "mri_synthstrip"]
+    if opt.do_mni and _own_anat(opt):
+        tools = [*tools, config.nl_command(opt.mni_backend).split()[0]]
     return f"""
 # =============================== stage: preflight ===========================
 echo '== preflight: inputs + tools =='
@@ -2046,7 +2066,9 @@ def _stage_grandmean(plan: Plan, script_stem: str) -> str:
 # Tokens that do NOT belong to the grandmean chain: the within-run motion the
 # lane images already have baked in, and everything ABOVE grandmean space (which
 # is by definition estimated from the grandmean, so it cannot act before it).
-_GRANDMEAN_DROP = frozenset({"moco", "locomoco", "anat_lin", "anat_nl", "xref_lin", "xref_nl"})
+_GRANDMEAN_DROP = frozenset(
+    {"moco", "locomoco", "mni_lin", "mni_nl", "anat_lin", "anat_nl", "xref_lin", "xref_nl"}
+)
 
 
 def _grandmean_tokens(pr: PlanRun) -> list[str]:
@@ -2416,7 +2438,158 @@ def _stage_anat(plan: Plan) -> str:
         )
         out.append(_anat_nl_anchor_call(plan))
     out.append(_qc_anat(plan))
+    out.append(_stage_mni(plan))
     return "\n".join(p for p in out if p) + "\n"
+
+
+def _mni_lin_anat() -> str:
+    """The anat affine-aligned to the template — the nonlinear step's source, and
+    the image that says whether the affine alone was already in the right place."""
+    return "stage09.anat_mni_lin.nii.gz"
+
+
+def _anat_mni() -> str:
+    """The anat in MNI: affine + nonlinear. The whole-brain underlay in the output
+    space, and the grid stage10a crops the warpmaster out of."""
+    return "stage09.anat_mni.nii.gz"
+
+
+def _al_mni(plan: Plan) -> str:
+    """The EPI anchor in MNI — the master the final grid is cut from.
+
+    The anat lands in MNI by construction (it is what the warp was fitted on); the
+    EPI has to be pushed through the whole head of the chain to get there, exactly
+    as :func:`_al_anat_nl` does one link lower."""
+    return f"stage09.{effective_anat_source(plan)}_al_mni.nii$FMT"
+
+
+def _mni_head_chain(plan: Plan) -> list[str]:
+    """Chain head down to the deepest anat-level link — mni_nl, mni_lin and
+    everything between them and the space the anchor already sits in."""
+    if not plan.runs:
+        return []
+    pr = plan.runs[0]
+    toks = list(pr.warp_chain)
+    last = "anat_nl" if "anat_nl" in toks else "anat_lin"
+    if last not in toks:
+        return []
+    return chain_files(pr, ".nii$FMT", plan.options, tokens=toks[: toks.index(last) + 1])
+
+
+def _stage_mni(plan: Plan) -> str:
+    """-do_mni: anat → MNI template, affine then nonlinear (stage09b).
+
+    Estimated on the SKULL-STRIPPED anat against the template's own stripped
+    sub-brick — a skull is the loudest thing in a T1 and the least like the
+    template's. Both links go at the head of every run's chain, so the data still
+    makes exactly ONE trip through an interpolator: this stage warps nothing but
+    the anat itself.
+
+    Run late in stage09 because it needs $ANAT, and before stage10a because the
+    warpmaster is cut out of what it produces."""
+    opt = plan.options
+    if not (opt.do_mni and opt.go_to_anat):
+        return ""
+    if opt.grand_reference:
+        # Borrowed, like the anat matrix: nothing to compute, and the anchor image
+        # comes from the reference dir too (see _final_master).
+        gr = opt.grand_reference.rstrip("/")
+        return (
+            "\n# ============================ stage09b: MNI (borrowed) =====================\n"
+            f"# anat→MNI warp borrowed from {gr}/stage09.mni* (not recomputed).\n"
+        )
+    # Sub-brick 0 of AFNI's SSW template is the skull-off volume; a plain template
+    # has one volume and [0] is still it. Quoted whole: the selector's brackets are
+    # a glob to the shell and belong to the tool.
+    base = (
+        shlex.quote(f"{opt.mni_template}[0]")
+        if opt.mni_template
+        else '"${FFS_MNI_TEMPLATE:?set -mni_template}[0]"'
+    )
+    lin = _ffs(
+        "ffs_allineate",
+        [
+            f"-base {base}",
+            f'-source "{_anat_box()}"',
+            f'-prefix "{_mni_lin_anat()}"',
+            f'-1Dmatrix_save "{stem(NameKey("mni"))}.aff12.1D"',
+            *_split_flags(config.DEFAULT_OPTS["mni"]),
+            '-device "$DEVICE"',
+        ],
+    )
+    nl = _ffs(
+        config.nl_command(opt.mni_backend),
+        [
+            f"-base {base}",
+            f'-source "{_mni_lin_anat()}"',
+            f'-prefix "{_anat_mni()}"',
+            "-save_warp",
+            f'-warp_prefix "{stem(NameKey("mni"))}_nl"',
+            *_split_flags(config.DEFAULT_OPTS["mni_nonlin"]),
+            '-device "$DEVICE"',
+        ],
+    )
+    warp = _mni_files(opt, "_nl_WARP.nii.gz")[0]
+    return "\n".join(
+        [
+            "",
+            "# ============================ stage09b: anat → MNI =========================",
+            "# The last link in every run's chain, estimated here and applied once, at the",
+            "# very end of stage10's single resample. Only the anat is warped in this",
+            "# stage; the data never makes a second trip through an interpolator.",
+            "echo '== stage09b: anat → MNI =='",
+            f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{stem(NameKey("mni"))}.aff12.1D" ]; then',
+            "  # base = the template's skull-off volume, source = the stripped anat.",
+            f"{lin}",
+            "fi",
+            f'if [ "$skip_anat" -ne 1 ] || [ ! -f "{warp}" ]; then',
+            f"{nl}",
+            "fi",
+            _mni_anchor_call(plan),
+            _qc_mni(plan),
+        ]
+    )
+
+
+def _mni_anchor_call(plan: Plan) -> str:
+    """Push the EPI anchor through the whole head of the chain into MNI.
+
+    This is what stage10a boxes the output grid out of, so it has to be the anchor
+    in the state the DATA ends up in — every link at or above the anat, MNI
+    included — and on the same grid as the anat that will underlay it."""
+    out = _al_mni(plan)
+    head = _mni_head_chain(plan)
+    if not head:
+        return ""
+    call = _ffs(
+        "ffs_nwarp",
+        [
+            f'-source "{_anat_source_image(plan)}"',
+            f'-nwarp "{" ".join(head)}"',
+            f'-master "{_anat_mni()}"',
+            *_split_flags(config.DEFAULT_OPTS["nwarp"]),
+            f'-prefix "{out}"',
+            '-device "$DEVICE"',
+        ],
+    )
+    return f'[ -f "{out}" ] || \\\n{call}'
+
+
+def _qc_mni(plan: Plan) -> str:
+    """Template, anat-after-affine, anat-after-warp, and the EPI anchor — the four
+    images that are all supposed to be the same brain in the same place."""
+    opt = plan.options
+    if not (_qc_on(plan) and opt.do_mni and not opt.grand_reference):
+        return ""
+    tmpl = opt.mni_template or "$FFS_MNI_TEMPLATE"
+    items: QCItems = [
+        (f"{tmpl}[0]", "template"),
+        (_mni_lin_anat(), "anat_affine"),
+        (_anat_mni(), "anat_nonlin"),
+    ]
+    if _mni_head_chain(plan):
+        items.append((_al_mni(plan), f"{effective_anat_source(plan)}_al_mni"))
+    return _qc_block("anat → MNI", [_qc_call(_qc_stem("mni"), items)])
 
 
 def _anat_avg() -> str:
@@ -2640,7 +2813,10 @@ def _anat_head_chain(plan: Plan) -> list[str]:
     toks = list(pr.warp_chain)
     if "anat_nl" not in toks:
         return []
-    head = toks[: toks.index("anat_nl") + 1]
+    # ...but NOT the -do_mni pair above it: this image is the anchor in ANAT
+    # space (it is mastered on the anat), and stage09b's own anchor is the one
+    # that goes on to MNI.
+    head = [t for t in toks[: toks.index("anat_nl") + 1] if not t.startswith("mni_")]
     return chain_files(pr, ".nii$FMT", plan.options, tokens=head)
 
 
@@ -2690,6 +2866,9 @@ def _final_master(plan: Plan) -> str:
         # Globbed because the reference's file is named for ITS -anat_source, which
         # this script has no way to know.
         gr = opt.grand_reference.rstrip("/")
+        if opt.do_mni:
+            # ...and with -do_mni the shared space is MNI, one link further out.
+            return f"$(ls {gr}/stage09.*_al_mni.nii* 2>/dev/null | head -1 || true)"
         # `|| true` so a miss leaves MASTER empty for the guard below to report,
         # rather than tripping `set -o pipefail` with no explanation.
         # _al_anat_nl first: with -anat_nonlin that is the shape the reference's
@@ -2698,7 +2877,16 @@ def _final_master(plan: Plan) -> str:
             f"$(ls {gr}/stage09.*_al_anat_nl.nii* {gr}/stage09.*_al_anat.nii* "
             "2>/dev/null | head -1 || true)"
         )
+    if opt.do_mni:
+        return _al_mni(plan)
     return _al_anat_nl(plan) if opt.anat_nonlin else _al_anat(plan)
+
+
+def _final_anat(plan: Plan) -> str:
+    """The whole-brain anatomical in the FINAL space — the ancestor of the results
+    underlay. With -do_mni that is the anat warped to the template, not the anat's
+    own cropped grid, or the underlay would be a brain the data never lands on."""
+    return _anat_mni() if plan.options.do_mni else _anat_box()
 
 
 def _final_dxyz_default(plan: Plan) -> str:
@@ -2772,7 +2960,7 @@ def _stage_warpmaster(plan: Plan) -> str:
                 anat_fov,
                 "ffs_util_resample",
                 [
-                    f'-input "{_anat_box()}"',
+                    f'-input "{_final_anat(plan)}"',
                     f'-master "{box}"',
                     f'-prefix "{anat_fov}"',
                     '-device "$DEVICE"',

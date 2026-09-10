@@ -37,6 +37,9 @@ STAGE_TOOL: dict[str, str] = {
     "xses_nl": "formwarp",
     "anat": "allineate",
     "anat_avg": "allineate",
+    "mni": "allineate",
+    # The engine is a runtime choice (-mni_use); this is only the default.
+    "mni_nonlin": "optiwarp",
     "segment": "segment",
     "segment_fstpm": "segment",
     "nwarp": "nwarp",

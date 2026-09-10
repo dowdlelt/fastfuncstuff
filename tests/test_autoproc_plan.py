@@ -2071,3 +2071,74 @@ def test_multiple_anats_without_a_skull_still_average():
     s = _skull_script(anat_extra=["/data/sub-X_run-2_T1w.nii.gz"])
     assert "synthstrip" not in s
     assert 'ANAT="stage09.anat_avg.nii.gz"' in s
+
+
+def test_do_mni_puts_both_links_at_the_head_of_every_chain():
+    """MNI is the LAST thing that happens to the data, which in this chain order
+    (leftmost acts first on coordinates) means the two leftmost tokens — and it
+    has to stay inside the one resample every run already gets."""
+    s = _skull_script(anat_skull=True, do_mni=True, mni_template="/t/MNI.nii.gz")
+    chain = next(line for line in s.splitlines() if line.startswith("CHAIN["))
+    links = chain.split('="')[1].rstrip('"').split()
+    assert links[:3] == [
+        "stage09.mni_nl_WARP.nii.gz",
+        "stage09.mni.aff12.1D",
+        "stage09.anat.aff12.1D",
+    ]
+    # One resample, not two: the only ffs_nwarp -do_mni adds anywhere in the
+    # script is the single anchor call, never one per run.
+    assert s.count("ffs_nwarp") == _skull_script(anat_skull=True).count("ffs_nwarp") + 1
+
+
+def test_do_mni_is_estimated_on_the_stripped_anat_against_the_template():
+    """Plain affine-then-nonlinear, both from the anat to the template. The
+    template's sub-brick 0 is its skull-off volume."""
+    s = _skull_script(anat_skull=True, do_mni=True, mni_template="/t/MNI.nii.gz")
+    assert "-base '/t/MNI.nii.gz[0]'" in s
+    assert '-source "stage09.anat_autobox.nii.gz"' in s  # the stripped anat
+    assert '-1Dmatrix_save "stage09.mni.aff12.1D"' in s
+    # the nonlinear half starts from the affine result, and writes the chain's warp
+    assert '-source "stage09.anat_mni_lin.nii.gz"' in s
+    assert '-warp_prefix "stage09.mni_nl"' in s
+    assert "-type MNI_T1a" in s
+
+
+def test_do_mni_moves_the_final_grid_and_underlay_into_mni():
+    """The warpmaster is cut out of the anchor in the OUTPUT space. If it stayed in
+    anat space the data would land on a grid one warp away from where it is."""
+    s = _skull_script(anat_skull=True, do_mni=True, mni_template="/t/MNI.nii.gz")
+    assert 'MASTER="${FFS_MASTER:-stage09.grandmean_al_mni.nii$FMT}"' in s
+    assert '-input "stage09.anat_mni.nii.gz"' in s  # underlay ancestor
+    # and the anchor gets there through the same head-of-chain the data does
+    assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D stage09.anat.aff12.1D"' in s
+
+
+def test_do_mni_coexists_with_anat_nonlin():
+    """Different jobs: anat_nl brings the EPI to the anat (PE-axis, from segment),
+    mni_* takes the anat to the template. Both links, in that order."""
+    s = _skull_script(
+        anat_skull=True,
+        do_mni=True,
+        mni_template="/t/MNI.nii.gz",
+        anat_nonlin=True,
+        tpm="/t/tpm.nii.gz",
+    )
+    chain = next(line for line in s.splitlines() if line.startswith("CHAIN["))
+    links = chain.split('="')[1].rstrip('"').split()
+    assert links[:4] == [
+        "stage09.mni_nl_WARP.nii.gz",
+        "stage09.mni.aff12.1D",
+        "stage09.anat.aff12.1D",
+        "stage09.nlanat_invwarp.nii$FMT",
+    ]
+
+
+def test_do_mni_stays_out_of_the_grandmean_chain():
+    """Bug of record: the grandmean is what the anat step ALIGNS, and the MNI warp
+    is estimated from the result — so a run resampled into grandmean space must
+    not carry it. Left in, stage08b asked for a warp that does not exist yet."""
+    s = _skull_script(anat_skull=True, do_mni=True, mni_template="/t/MNI.nii.gz")
+    gm = [line for line in s.splitlines() if "stage08.gmrun" in line or "$GMGRID" in line]
+    assert not any("mni" in line for line in gm), gm
+    # ...and the anat-space anchor stops at the anat, too.
+    assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D"' not in s

@@ -32,6 +32,10 @@ from fastfuncstuff.autoproc.plan import Options, build_plan
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
+# The tuned-preset recipe -do_mni runs under. Named once: the op string says it
+# (`-type MNI_T1a`) and the family→engine resolution has to agree with it.
+MNI_RECIPE = "MNI_T1a"
+
 
 def _opt_help(key: str) -> str:
     return f"(default: {config.DEFAULT_OPTS[key]!r})"
@@ -144,6 +148,33 @@ def build_parser() -> argparse.ArgumentParser:
         const=True,
         default=None,
         help="ffs_segment nonlinear anat warp (needs -tpm or -suma)",
+    )
+    g.add_argument(
+        "-do_mni",
+        "-do-mni",
+        action="store_true",
+        help="also take the output to an MNI template: an affine + nonlinear anat→MNI "
+        "pair estimated on the skull-stripped anat and applied at the head of every "
+        "run's warp chain, so the data still makes ONE trip through an interpolator. "
+        "The final grid, mask and underlay all move to MNI with it.",
+    )
+    g.add_argument(
+        "-mni_use",
+        "-mni-use",
+        # Families first, then the individual engines — "qwarp" and "formwarp" are
+        # both, so dict.fromkeys keeps each spelling once.
+        choices=list(dict.fromkeys(["optiwarp", *config.nl_backends()])),
+        default="optiwarp",
+        help="engine for the nonlinear half of -do_mni. A family name picks the "
+        "member the -type recipe prefers (optiwarp → optiwarp_hs for MNI_T1a). "
+        "(default: optiwarp)",
+    )
+    g.add_argument(
+        "-mni_template",
+        "-mni-template",
+        metavar="FILE",
+        help="MNI template to align to; sub-brick 0 must be the skull-stripped "
+        "volume. Default: MNI152_2009_template_SSW.nii.gz beside the afni on $PATH.",
     )
     g.add_argument(
         "-ref_image",
@@ -679,6 +710,31 @@ def anat_group(subject, bids_dir: str | None = None) -> list[Path]:
     return [primary, *rest]
 
 
+def _resolve_mni(args) -> tuple[str, str | None]:
+    """(backend, template) for -do_mni.
+
+    A family name (``optiwarp``) is resolved through the preset registry rather
+    than by picking a member here: which engine of a family a recipe means is the
+    recipe's fact, and MNI_T1a's answer is hs, not the family's own default."""
+    from fastfuncstuff.processing.tunespec import preferred_backend
+
+    backend = args.mni_use
+    if backend not in config.nl_backends():
+        backend = preferred_backend(MNI_RECIPE, backend, f"{backend}_demons")
+    template = args.mni_template or find_mni_template()
+    return backend, template
+
+
+def find_mni_template() -> str | None:
+    """AFNI's MNI152_2009_template_SSW.nii.gz, found the way a user would: next to
+    the afni on $PATH. Sub-brick 0 is its skull-off volume."""
+    afni = shutil.which("afni")
+    if afni is None:
+        return None
+    cand = Path(afni).resolve().parent / "MNI152_2009_template_SSW.nii.gz"
+    return str(cand) if cand.is_file() else None
+
+
 def _resolve_nl_backends(args) -> dict[str, str]:
     """Which engine runs each nonlinear stage: per-stage flag, then -nl_backend.
 
@@ -712,6 +768,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         key: config.nl_command(getattr(opt, f"{key}_backend")).split()[0].removeprefix("ffs_")
         for key in config.NL_STAGE_KEYS
     }
+    nl_module["mni_nonlin"] = config.nl_command(opt.mni_backend).split()[0].removeprefix("ffs_")
     for key in (*config.STAGE_OPT_KEYS, "glm"):
         val = getattr(args, f"{key}_opts", None)
         if val:
@@ -767,6 +824,34 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 "-anat_skull yes: 'mri_synthstrip' is not on $PATH (it ships with "
                 "FreeSurfer >= 8). The script's preflight will refuse to run until it is."
             )
+    if opt.do_mni:
+        if not opt.go_to_anat:
+            errors.append("-do_mni needs an anatomical: it is the anat that reaches MNI. ")
+        if opt.ref_file:
+            errors.append(
+                "-do_mni with -ref_file: the reference's transforms are yours to supply, "
+                "so add the anat→MNI pair to -ref_transforms instead."
+            )
+        if opt.mni_template is None:
+            errors.append(
+                "-do_mni found no MNI template: 'afni' is not on $PATH (its directory is "
+                "where MNI152_2009_template_SSW.nii.gz lives). Pass -mni_template FILE."
+            )
+        elif not Path(opt.mni_template).exists():
+            errors.append(f"-mni_template not found: {opt.mni_template}")
+        if opt.grand_reference:
+            # Borrowed rather than recomputed — but only if the reference has one.
+            missing = [
+                f"{opt.grand_reference.rstrip('/')}/stage09.mni{tail}"
+                for tail in (".aff12.1D", "_nl_WARP.nii.gz")
+            ]
+            absent = [m for m in missing if not Path(m).exists()]
+            if absent:
+                errors.append(
+                    "-do_mni with -grand_reference borrows the reference's anat→MNI warp, "
+                    f"and it is not there: {', '.join(absent)}. Re-run the reference with "
+                    "-do_mni first."
+                )
     if opt.slicetiming_method != "none" and opt.tr is None:
         # Slice timing needs a TR per run; the sidecar is the only source here.
         no_tr = [r for s in subject.sessions for r in s.bold_runs if r.tr is None]
@@ -1227,6 +1312,16 @@ def main(argv: list[str] | None = None) -> int:
 
     go_to_anat = False if args.no_anat else rget("go_to_anat", True)
     anat_nonlin = eff(args.anat_nonlin, "anat_nonlin")
+    mni_backend, mni_template = _resolve_mni(args)
+    if args.do_mni:
+        # The template and the engine are both resolved rather than typed by the
+        # user, so both get printed: the output space is not a detail.
+        print(
+            f"== MNI ==\n  template:  {mni_template}\n"
+            f"  nonlinear: {config.nl_command(mni_backend)} "
+            f"{config.DEFAULT_OPTS['mni_nonlin']}",
+            file=sys.stderr,
+        )
     event_cols, event_cols_by_task = _resolve_event_cols(args)
 
     # TPM resolution: an explicit -tpm wins; else, with -suma, build one in-script
@@ -1278,6 +1373,9 @@ def main(argv: list[str] | None = None) -> int:
         # the anat step alone.
         anat_source=args.anat_source or args.ref_image or "auto",
         anat_skull=args.anat_skull == "yes",
+        do_mni=args.do_mni,
+        mni_backend=mni_backend,
+        mni_template=mni_template,
         anat_nonlin_input=args.anat_nonlin_input,
         anat_path=anat_path if go_to_anat else None,
         anat_extra=anat_paths[1:] if go_to_anat else [],

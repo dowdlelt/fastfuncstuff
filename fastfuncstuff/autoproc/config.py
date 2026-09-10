@@ -58,6 +58,14 @@ DEFAULT_OPTS: dict[str, str] = {
     # uses the plain one. Which applies is set by -suma/-tpm, not by the user.
     "segment": "-niter 2000 -samp 1.5",
     "segment_fstpm": "-ngaus 1 1 1 1 1 2 3 4 -cleanup 0 -samp 1.5",
+    # -do_mni: the anat → MNI template affine. 12 DoF (a brain is not the
+    # template's size), lpa because both sides are T1, and a wide -tbest because
+    # this is a one-shot alignment whose failure costs the whole output space.
+    "mni": "-affine -cost lpa -source_automask -autoweight -cmass -tbest 16 -final wsinc5",
+    # ...and its nonlinear half, on whichever engine -mni_use names. -type is the
+    # tuned-preset registry: MNI_T1a is what ffs_tunewarp measured on NIREP16 →
+    # MNI152_2009 against manual cortical labels, and all three engines carry it.
+    "mni_nonlin": "-type MNI_T1a",
     # T1w-to-T1w alignment before averaging repeats of one acquisition. Rigid:
     # same subject, same acquisition, so anything beyond pose is the scanner
     # drifting and not something to fit away. -cmass because two sessions can put
