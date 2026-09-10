@@ -121,3 +121,18 @@ def test_collect_unions_columns_across_methods(tmp_path):
     assert rows["old"]["dice_mean"] == "0.61"
     assert rows["old"]["mean_sharpness"] == ""
     assert rows["new"]["mean_sharpness"] == "0.21"
+
+
+def test_fix_reaches_the_diagnostics_config():
+    """-fix on -diagnostics must move the knob, not just the recipe's tune list.
+
+    It used to be applied only to the recipe, which searches nothing on this
+    path, so the flag was accepted and silently did nothing -- a fold-floor
+    sweep produced three bit-identical results.
+    """
+    from fastfuncstuff.processing.tunespec import fixed_for, parse_fix
+
+    stored = {"hs_alpha": 1.0, "update_sigma": 1.0}
+    pinned = fixed_for(parse_fix(["optiwarp.jac_floor=0.0"]), "optiwarp_hs")
+    assert pinned == {"jac_floor": 0.0}
+    assert {**stored, **pinned}["jac_floor"] == 0.0

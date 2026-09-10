@@ -91,7 +91,13 @@ from fastfuncstuff.processing.cohort import (
     rotation_start,
     split_subjects,
 )
-from fastfuncstuff.processing.tunespec import BACKENDS, RECIPES, parse_fix, with_overrides
+from fastfuncstuff.processing.tunespec import (
+    BACKENDS,
+    RECIPES,
+    fixed_for,
+    parse_fix,
+    with_overrides,
+)
 from fastfuncstuff.processing.tunestore import (
     TrialStore,
     format_bands,
@@ -987,7 +993,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.diagnostics is not None:
         if not args.recipe:
             raise SystemExit("-diagnostics needs -type, since it re-runs a fit")
-        recipe = with_overrides(RECIPES[args.recipe], parse_fix(args.fix or []), args.tune)
+        diag_fix = parse_fix(args.fix or [])
+        recipe = with_overrides(RECIPES[args.recipe], diag_fix, args.tune)
         if not recipe.group:
             raise SystemExit(
                 f"-diagnostics is for common-space recipes; -type {recipe.name} scores "
@@ -1006,11 +1013,19 @@ def main(argv: list[str] | None = None) -> int:
         # Every backend's winner must carry a distinct name or they collide in the
         # method column and the head-to-head pivot silently averages them.
         method = args.method or f"ffs {row.backend} c{row.config_id}"
+        # -fix has to reach the config, not just the recipe. Re-running a stored
+        # winner with one knob moved is the whole reason to pin one here, and the
+        # recipe's tune list -- all this used to touch -- means nothing on a path
+        # that searches nothing. The flag was accepted and silently did nothing.
+        pinned = fixed_for(diag_fix, row.backend)
+        config = {**row.config, **pinned}
         print(f"\nConfig {args.diagnostics} as {method!r}: {row.backend} {row.label()}")
+        if pinned:
+            print("  pinned: " + " ".join(f"{k}={v}" for k, v in sorted(pinned.items())))
         written = group_diagnostics(
             pairs + held_out,
             recipe,
-            row.config,
+            config,
             row.backend,
             target,
             device=device,
