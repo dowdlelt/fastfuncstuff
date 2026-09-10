@@ -34,7 +34,7 @@ import torch
 from ..io.dsetinfo import read_info
 from .affine import load_matrix_1D, save_matrix_1D
 from .allineate import _voxdims_from_header
-from .io import load_image, save_image
+from .io import load_image, load_warp_field, save_image, save_warp_field
 from .mask import automask
 from .metrics import METRICS, MetricInputs, cross_subject_dice, evaluate_metrics
 from .tuneopt import (
@@ -1620,6 +1620,88 @@ def resolve_diagnostic_metrics(names: Sequence[str] | None, contrast: str = "sam
     return [n for n in wanted if not METRICS[n].needs_labels and not METRICS[n].group]
 
 
+def _fit_cache_key(backend: str, config: dict, recipe_name: str, pair: SubjectPair) -> str:
+    """What a cached fit is only valid for: the fit, not the scoring around it."""
+    payload = {
+        "backend": backend,
+        "config": {k: str(v) for k, v in sorted(config.items())},
+        "recipe": recipe_name,
+        "base": pair.base,
+        "source": pair.source,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def _load_cached_fit(
+    cache: Path, pair: SubjectPair, key: str, device: torch.device
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...] | None, float | None] | None:
+    """A previous run's warped image and field, when they were made the same way.
+
+    The original fit's wall time comes back with them. Reporting the ~0.3 s it
+    takes to read the cache would turn the seconds column into a measure of disk
+    speed, and that column is how the frontier weighs a backend.
+    """
+    stem = _cache_stem(cache, pair)
+    keyfile = Path(stem + ".key.json")
+    warped_path = Path(stem + "_warped.nii.zst")
+    if not (keyfile.exists() and warped_path.exists()) or keyfile.read_text() != key:
+        return None
+    warped, _ = load_image(str(warped_path), device=device)
+    field_path = Path(stem + "_field.nii.zst")
+    field = None
+    if field_path.exists():
+        xd, yd, zd, _ = load_warp_field(str(field_path), device=device)
+        field = (xd, yd, zd)
+    secs_path = Path(stem + ".secs.json")
+    secs = json.loads(secs_path.read_text()) if secs_path.exists() else None
+    return warped, field, secs
+
+
+def _cache_stem(cache: Path, pair: SubjectPair) -> str:
+    return str(cache / pair.name.replace("/", "_"))
+
+
+def _save_cached_fit(
+    cache: Path,
+    pair: SubjectPair,
+    key: str,
+    warped: torch.Tensor,
+    field: tuple[torch.Tensor, ...] | None,
+    header: Any,
+    seconds: float | None = None,
+) -> None:
+    """Keep the fit so the next question does not cost another fit.
+
+    Every column added to the diagnostics so far has forced a refit of every
+    config already measured -- the tables are reductions, and nothing the
+    reduction was computed from survived. The field is kept as well as the image
+    because a comparison that grows a new tool also grows new questions about
+    deformation, and re-deriving those from scratch is the expensive half.
+
+    ``.nii.zst`` because these are exactly what the format is for: big
+    intermediates written once and read many times.
+    """
+    cache.mkdir(parents=True, exist_ok=True)
+    stem = _cache_stem(cache, pair)
+    save_image(warped.detach().cpu(), stem + "_warped.nii.zst", header_info=header)
+    if field is not None:
+        xd, yd, zd = field
+        save_warp_field(
+            xd.detach().cpu(),
+            yd.detach().cpu(),
+            zd.detach().cpu(),
+            stem + "_field.nii.zst",
+            header_info=header,
+            units="voxels",
+        )
+    if seconds is not None:
+        Path(stem + ".secs.json").write_text(json.dumps(seconds))
+    # Written last: a key file present is the promise that the volumes beside it
+    # are complete, so a run killed mid-save invalidates itself rather than
+    # handing back half a fit.
+    Path(stem + ".key.json").write_text(key)
+
+
 def group_diagnostics(
     pairs: list[SubjectPair],
     recipe: Recipe,
@@ -1630,6 +1712,7 @@ def group_diagnostics(
     save_subject_labels: bool = False,
     method: str = "ffs",
     metrics: Sequence[str] | None = None,
+    cache_dir: Path | None = None,
     verb: int = 1,
 ) -> list[Path]:
     """Re-fit one config on the cohort and write everything behind its score.
@@ -1669,13 +1752,22 @@ def group_diagnostics(
         referee = volumes.referee(pair)
         header = referee.header
         t0 = time.time()
-        warped, field, _ = DRIVERS[backend](
-            referee.base,
-            volumes.source(pair),
-            config_in_voxel_units(backend, config, referee.voxdims),
-            recipe,
-            referee.device,
-        )
+        key = _fit_cache_key(backend, config, recipe.name, pair)
+        cached = _load_cached_fit(cache_dir, pair, key, referee.device) if cache_dir else None
+        fit_seconds = None
+        if cached is not None:
+            warped, field, fit_seconds = cached
+        else:
+            warped, field, _ = DRIVERS[backend](
+                referee.base,
+                volumes.source(pair),
+                config_in_voxel_units(backend, config, referee.voxdims),
+                recipe,
+                referee.device,
+            )
+            fit_seconds = time.time() - t0
+            if cache_dir is not None:
+                _save_cached_fit(cache_dir, pair, key, warped, field, referee.header, fit_seconds)
         one = referee.score(warped, field, metrics)
         # A backend may hand back a padded grid; only base-shaped volumes can be
         # summed into a cohort mean, and silently averaging mismatched ones would
@@ -1704,7 +1796,7 @@ def group_diagnostics(
                 # tools on four columns ours leave blank, and "is jac_p01 = 0.068
                 # unusual?" has nothing on our side of the table to compare.
                 **{k: float(qc[k]) for k in _REGULARITY_COLUMNS if k in qc},
-                "seconds": time.time() - t0,
+                "seconds": fit_seconds,
                 "metrics": dict(one.get("scores", {})),
             }
         )

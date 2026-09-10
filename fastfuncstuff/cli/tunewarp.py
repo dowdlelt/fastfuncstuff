@@ -442,6 +442,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="With -diagnostics, also write each subject's transported segmentation",
     )
+    parser.add_argument(
+        "-cache_fits",
+        "-cache-fits",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help="With -diagnostics, keep each subject's warped image and displacement\n"
+        "field so a later question is a read rather than a re-fit. Defaults to\n"
+        "{out}/diag/cache/<config>; give a DIR to put it elsewhere. Roughly 2.7 GB\n"
+        "per config at 1 mm for 16 subjects, as .nii.zst. A cache entry is reused\n"
+        "only when the backend, the config and both input paths match.",
+    )
     act.add_argument("-top", type=int, default=25, help="Rows to show (default: 25)")
     act.add_argument(
         "-plot",
@@ -899,6 +912,20 @@ def _write_plot(store, path, recipe: str | None) -> None:
         print("  (no frontier plot: no config in this table produced a warp)")
 
 
+def _cache_dir(args: argparse.Namespace, out: Path, config_id: int) -> Path | None:
+    """Where a -diagnostics run keeps its fits, or None when it keeps none.
+
+    Filed under the config: two configs of the same backend differ only in their
+    config dict, so a shared directory would leave the key check as the only
+    thing standing between them and each other's fits.
+    """
+    if args.cache_fits is None:
+        return None
+    if args.cache_fits:
+        return Path(args.cache_fits)
+    return out / "diag" / "cache" / f"config{config_id:04d}"
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if getattr(args, "deterministic", False):
@@ -1032,6 +1059,7 @@ def main(argv: list[str] | None = None) -> int:
             save_subject_labels=args.save_subject_labels,
             metrics=args.metrics,
             method=method,
+            cache_dir=_cache_dir(args, out, args.diagnostics),
             verb=args.verb,
         )
         print(f"\nWrote {len(written)} file(s) to {target}")

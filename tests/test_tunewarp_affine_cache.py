@@ -136,3 +136,42 @@ def test_fix_reaches_the_diagnostics_config():
     pinned = fixed_for(parse_fix(["optiwarp.jac_floor=0.0"]), "optiwarp_hs")
     assert pinned == {"jac_floor": 0.0}
     assert {**stored, **pinned}["jac_floor"] == 0.0
+
+
+def test_fit_cache_round_trips_image_field_and_time(tmp_path):
+    """A cached fit must come back identical, with the ORIGINAL wall time.
+
+    Reporting the read time would turn the seconds column into a measure of disk
+    speed, and that column is how the frontier weighs a backend.
+    """
+    from fastfuncstuff.processing.tunewarp import (
+        SubjectPair,
+        _fit_cache_key,
+        _load_cached_fit,
+        _save_cached_fit,
+    )
+
+    pair = _pair(tmp_path)
+    cache = tmp_path / "cache"
+    key = _fit_cache_key("optiwarp_hs", {"jac_floor": 0.0}, "common_T1", pair)
+
+    assert _load_cached_fit(cache, pair, key, torch.device("cpu")) is None
+
+    torch.manual_seed(0)
+    warped = torch.rand(8, 9, 10)
+    field = tuple(torch.rand(8, 9, 10) for _ in range(3))
+    header = {"affine": np.diag([1.0, 1.0, 1.0, 1.0])}
+    _save_cached_fit(cache, pair, key, warped, field, header, seconds=87.1)
+
+    got = _load_cached_fit(cache, pair, key, torch.device("cpu"))
+    assert got is not None
+    back, back_field, secs = got
+    assert torch.allclose(back, warped, atol=1e-5)
+    assert back_field is not None
+    for a, b in zip(back_field, field, strict=True):
+        assert torch.allclose(a, b, atol=1e-5)
+    assert secs == 87.1
+
+    # A different config must not collide with this entry.
+    other = _fit_cache_key("optiwarp_hs", {"jac_floor": 0.05}, "common_T1", pair)
+    assert _load_cached_fit(cache, pair, other, torch.device("cpu")) is None
