@@ -3208,14 +3208,14 @@ def _mask_anat() -> str:
     return "stage10.mask_anat.nii$FMT"
 
 
-def _mask_epi_anat() -> str:
+def _mask_brain() -> str:
     """EPI coverage ∩ anat brain — the tissue this dataset actually has.
 
     The EPI automask keeps whatever is bright in an EPI (eyes, neck fat, a rim of
     skull marrow); the anat mask has no such extras but covers a whole head the
     EPI slab never saw. The intersection is the only one of the three that is both
     brain and acquired, which is what a GLM should be fit inside."""
-    return "stage10.mask_epi_anat.nii$FMT"
+    return "stage10.mask_brain.nii$FMT"
 
 
 def _glm_mask(plan: Plan) -> str:
@@ -3230,7 +3230,7 @@ def _glm_mask(plan: Plan) -> str:
         return ""
     if not _own_anat(plan.options):
         return _mask_epi()
-    return {"epi": _mask_epi(), "anat": _mask_anat(), "epi_anat": _mask_epi_anat()}[mode]
+    return {"epi": _mask_epi(), "anat": _mask_anat(), "brain": _mask_brain()}[mode]
 
 
 def _stage_masks(plan: Plan) -> str:
@@ -3259,14 +3259,13 @@ def _stage_masks(plan: Plan) -> str:
     ]
     if have_anat:
         out.append(
-            "# mask_anat is the anat brain automasked on the same grid, and mask_epi_anat\n"
-            "# their intersection: acquired AND brain. -glm_mask picks which one (if any)\n"
-            "# stage12 is fit inside; all three are written either way."
+            "# mask_anat is the anat brain automasked on the same grid, and mask_brain\n"
+            "# their intersection: acquired AND brain. The GLM is fit inside that one."
         )
     else:
         out.append(
             "# No anat of this pipeline's own (-grand_reference / -ref_file), so there is\n"
-            "# no brain to intersect with and mask_epi is the only mask there can be."
+            "# no anat mask to intersect with and the GLM is fit inside mask_epi."
         )
     out.append("echo '== stage10b: masks =='")
     # Built here rather than with ffs_nwarp -save_mean's outputs listed inline so a
@@ -3322,12 +3321,12 @@ def _stage_masks(plan: Plan) -> str:
         )
         out.append(
             guarded(
-                _mask_epi_anat(),
+                _mask_brain(),
                 "ffs_util_3dmath",
                 [
                     f'-input "{_mask_epi()}" "{_mask_anat()}"',
                     "-expr 'step(a)*step(b)'",
-                    f'-prefix "{_mask_epi_anat()}"',
+                    f'-prefix "{_mask_brain()}"',
                     '-device "$DEVICE"',
                 ],
             )
@@ -3340,7 +3339,7 @@ def _stage_masks(plan: Plan) -> str:
     else:
         out.append(
             "# -glm_mask none: stage12 is fit in every voxel. Re-generate with\n"
-            "# -glm_mask epi_anat (or epi / anat) to fit inside one of the masks above."
+            "# -glm_mask brain (or epi / anat) to fit inside one of the masks above."
         )
     return "\n".join(out) + "\n" + _qc_masks(plan)
 
@@ -3350,12 +3349,12 @@ def _qc_masks(plan: Plan) -> str:
 
     A mask is only ever wrong in a way you can see: mask_epi reaching into the
     neck, mask_anat sitting a few voxels off the data because the anat link is
-    off, mask_epi_anat hollow where the two disagree."""
+    off, mask_brain hollow where the two disagree."""
     if not _qc_on(plan):
         return ""
     items = [("stage10.meanall.nii$FMT", "meanall"), (_mask_epi(), "epi")]
     if _own_anat(plan.options):
-        items += [(_mask_anat(), "anat"), (_mask_epi_anat(), "epi_anat")]
+        items += [(_mask_anat(), "anat"), (_mask_brain(), "brain")]
     return _qc_block("final-space masks", [_qc_call(_qc_stem("mask"), items)])
 
 

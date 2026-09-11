@@ -103,7 +103,8 @@ class Options:
     # Which stage10b mask the GLM is fit inside: "none" (every voxel in the
     # dataset, the default -- a mask is an analysis decision, and an over-tight
     # one drops voxels from the stats with nothing to show for it), "epi" (what
-    # was acquired), "anat" (what is brain) or "epi_anat" (both). The masks
+    # was acquired), "anat" (what is brain) or "brain" (both — the intersection,
+    # stage10.mask_brain). The masks
     # themselves are always built; this only decides which one ffs_reml is given.
     glm_mask: str = "none"
     # Attach Monte-Carlo cluster-size tables to the stat buckets (ffs_reml

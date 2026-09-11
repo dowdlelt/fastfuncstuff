@@ -557,15 +557,15 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-glm_mask",
         "-glm-mask",
-        choices=("none", "epi", "anat", "epi_anat"),
+        choices=("none", "epi", "anat", "brain"),
         default="none",
         help="which stage10b mask to fit the GLM inside. none (default) fits "
         "every voxel -- a mask is an analysis decision, and an over-tight one "
         "drops voxels from the stats with nothing left to show it happened. epi "
         "= the automask of the final-space data (what was acquired), anat = the "
         "anat brain automasked on the same grid (what is brain, with no eyes or "
-        "neck), epi_anat = their intersection. All three are written either way, "
-        "so this is re-runnable against stage12 alone.",
+        "neck), brain = their intersection (stage10.mask_brain). All three are "
+        "written either way, so this is re-runnable against stage12 alone.",
     )
     g.add_argument(
         "-glm_label",
@@ -1021,7 +1021,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     # The anat side of the mask needs an anat this pipeline segments and aligns
     # itself; borrowed/overridden reference geometry brings no local brain to mask
     # with, so say so rather than emitting a -mask for a file that is never written.
-    if opt.glm_mask in ("anat", "epi_anat") and not (
+    if opt.glm_mask in ("anat", "brain") and not (
         opt.go_to_anat and opt.ref_file is None and opt.grand_reference is None
     ):
         warnings.append(
