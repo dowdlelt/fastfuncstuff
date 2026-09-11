@@ -95,6 +95,11 @@ class Options:
     # its buckets carry a `blur<FWHM>` token (naming.blur_tag) and a re-run at a
     # different FWHM neither re-does preprocessing nor clobbers the first fit.
     glm_blur: float | None = None
+    # Free-form token naming this model variant, sharing the blur tag's slot
+    # (``stage12.fir.stats-reml.task-X.nii.gz``). What it means is the user's
+    # business -- a different nuisance set, a different HRF, a hand-edited TOML;
+    # all the pipeline knows is that two variants must not share a bucket name.
+    glm_label: str | None = None
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False

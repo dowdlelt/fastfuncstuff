@@ -3239,22 +3239,27 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     nothing to build a spec from.
     """
     from fastfuncstuff.autoproc.glm import nuisance_specs, runs_by_task, spec_path
-    from fastfuncstuff.autoproc.naming import blur_tag
+    from fastfuncstuff.autoproc.naming import glm_tag
 
     opt = plan.options
     tasks = runs_by_task(plan)
-    # "stage12." or "stage12.blur6." — the token rides on the buckets, not on the
-    # design, because the xmat is the same model either way.
-    tag = blur_tag(opt.glm_blur)
+    # "stage12." or "stage12.blur6.noloco." — the token rides on the buckets, not
+    # on the design, because -glm_blur does not change the xmat and -glm_label
+    # only names a TOML you edited yourself.
+    tag = glm_tag(opt.glm_blur, opt.glm_label)
     stem = f"stage12.{tag}." if tag else "stage12."
     gate = "1" if opt.run_glm else "0"
     out = ["", "# ============================ stage12: GLM (ffs_reml) ======================="]
     out.append(f"# One model per task. Runs when FFS_RUN_GLM=1 (default {gate} for this recipe).")
-    if tag:
+    if opt.glm_blur:
         out.append(
             f"# Smoothed at {opt.glm_blur:g} mm FWHM inside the GLM (-glm_blur); stage10 stays"
-            f"\n# unsmoothed, and these buckets carry the {tag} token so an unsmoothed fit of"
-            "\n# the same task is not overwritten."
+            "\n# unsmoothed, so re-running this stage at another FWHM re-does nothing upstream."
+        )
+    if tag:
+        out.append(
+            f"# These buckets carry the '{tag}' variant token, so this fit does not overwrite"
+            "\n# another variant of the same task (and the skip_stats guard below keys on it)."
         )
     out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
     out += _dofloss_sums(plan, tasks)

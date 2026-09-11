@@ -12,6 +12,7 @@ written (the point is: no broken scripts).
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import shutil
 import subprocess
@@ -554,6 +555,17 @@ def build_parser() -> argparse.ArgumentParser:
         "smoothed fit of the same task sit side by side.",
     )
     g.add_argument(
+        "-glm_label",
+        "-glm-label",
+        default=None,
+        metavar="TAG",
+        help="name this model variant. TAG lands in the bucket names next to the "
+        "blur token (-glm_label fir -> stage12.fir.stats-reml.task-X.nii.gz), so "
+        "two models of the same task -- a different nuisance set, a different "
+        "HRF, a hand-edited design TOML -- do not overwrite each other. Letters, "
+        "digits, - and _ only.",
+    )
+    g.add_argument(
         "-glm_spec_overwrite",
         "-glm-spec-overwrite",
         action="store_true",
@@ -976,6 +988,14 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             f"-glm_blur must be a positive FWHM in mm (got {opt.glm_blur:g}); "
             "omit the flag for no smoothing."
         )
+    # The label becomes a filename token in a dot-delimited scheme, and reaches a
+    # generated bash script -- so anything but [A-Za-z0-9_-] is refused here
+    # rather than producing an unparseable name or a shell surprise.
+    if opt.glm_label is not None and not re.fullmatch(r"[A-Za-z0-9_-]+", opt.glm_label):
+        errors.append(
+            f"-glm_label {opt.glm_label!r}: use letters, digits, - and _ only (it becomes a "
+            "filename token, and '.' is what separates tokens)."
+        )
     # A -sep_spec_event_cols entry naming a task that is not in scope is almost
     # always a typo, and it would silently do nothing.
     all_tasks = {r.task for s in subject.sessions for r in s.bold_runs}
@@ -1367,6 +1387,7 @@ def main(argv: list[str] | None = None) -> int:
         glm_drop_first=args.glm_drop_first,
         glm_drop_last=args.glm_drop_last,
         glm_blur=args.glm_blur,
+        glm_label=args.glm_label,
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,

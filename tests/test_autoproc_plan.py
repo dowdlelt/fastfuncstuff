@@ -2147,7 +2147,7 @@ def test_do_mni_stays_out_of_the_grandmean_chain():
 def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
     """-glm_blur smooths inside ffs_reml and labels the outputs, so a second FWHM
     is a stage12-only re-run that does not overwrite the first fit."""
-    from fastfuncstuff.autoproc.naming import blur_tag
+    from fastfuncstuff.autoproc.naming import blur_tag, glm_tag
 
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
     plain = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root="/bids")
@@ -2167,6 +2167,18 @@ def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
     # A fractional FWHM keeps the token dot-free (the naming scheme is dot-delimited).
     assert blur_tag(2.5) == "blur2p5"
     assert blur_tag(None) == "" and blur_tag(0) == ""
+
+    # -glm_label names any other variant, in the same slot and a fixed order, so
+    # the same two settings always land on the same name.
+    labelled = write_script(
+        build_plan(subj, Options(run_glm=True, glm_blur=6.0, glm_label="noloco")),
+        "wd",
+        bids_root="/bids",
+    )
+    assert '-Rbuck "stage12.blur6.noloco.stats-reml.task-foo.nii$GLM_FMT"' in labelled
+    assert glm_tag(None, "fir") == "fir"
+    assert glm_tag(2.5, "fir") == "blur2p5.fir"
+    assert glm_tag(None, None) == "" and glm_tag(6.0, "  ") == "blur6"
 
 
 def test_stage12_guard_makes_skip_stats_real():

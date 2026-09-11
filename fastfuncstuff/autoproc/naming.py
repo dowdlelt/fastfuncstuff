@@ -174,6 +174,15 @@ def stem(key: NameKey) -> str:
     return f"{prefix}.{c}" if c else prefix
 
 
+def glm_tag(fwhm: float | None, label: str | None = None) -> str:
+    """The variant token for a GLM run's outputs (``blur6.noloco``), or ``""``.
+
+    Both halves are optional and they compose in a fixed order so the same two
+    settings always produce the same name, whichever order they were typed in.
+    """
+    return ".".join(t for t in (blur_tag(fwhm), (label or "").strip()) if t)
+
+
 def blur_tag(fwhm: float | None) -> str:
     """The ``blur<FWHM>`` token for a GLM run's outputs, or ``""`` for no blur.
 
