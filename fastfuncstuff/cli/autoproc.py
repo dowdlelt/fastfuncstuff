@@ -555,6 +555,19 @@ def build_parser() -> argparse.ArgumentParser:
         "smoothed fit of the same task sit side by side.",
     )
     g.add_argument(
+        "-glm_mask",
+        "-glm-mask",
+        choices=("none", "epi", "anat", "epi_anat"),
+        default="none",
+        help="which stage10b mask to fit the GLM inside. none (default) fits "
+        "every voxel -- a mask is an analysis decision, and an over-tight one "
+        "drops voxels from the stats with nothing left to show it happened. epi "
+        "= the automask of the final-space data (what was acquired), anat = the "
+        "anat brain automasked on the same grid (what is brain, with no eyes or "
+        "neck), epi_anat = their intersection. All three are written either way, "
+        "so this is re-runnable against stage12 alone.",
+    )
+    g.add_argument(
         "-glm_label",
         "-glm-label",
         default=None,
@@ -571,7 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="attach Monte-Carlo cluster-size thresholds (3dClustSim) to each "
         "task's stat bucket, so the AFNI viewer reports cluster significance. "
         "Runs inside ffs_reml off that fit's own residual ACF and the pipeline's "
-        "epi_mask, so it needs no extra input and writes no residual dataset. "
+        "final-space mask, so it needs no extra input and writes no residual dataset. "
         "Adds roughly a minute or two per task.",
     )
     g.add_argument(
@@ -1005,6 +1018,16 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             f"-glm_label {opt.glm_label!r}: use letters, digits, - and _ only (it becomes a "
             "filename token, and '.' is what separates tokens)."
         )
+    # The anat side of the mask needs an anat this pipeline segments and aligns
+    # itself; borrowed/overridden reference geometry brings no local brain to mask
+    # with, so say so rather than emitting a -mask for a file that is never written.
+    if opt.glm_mask in ("anat", "epi_anat") and not (
+        opt.go_to_anat and opt.ref_file is None and opt.grand_reference is None
+    ):
+        warnings.append(
+            f"-glm_mask {opt.glm_mask} needs this pipeline's own anat (-anat / BIDS T1w, "
+            "no -grand_reference or -ref_file) — falling back to the EPI mask."
+        )
     # A -sep_spec_event_cols entry naming a task that is not in scope is almost
     # always a typo, and it would silently do nothing.
     all_tasks = {r.task for s in subject.sessions for r in s.bold_runs}
@@ -1397,6 +1420,7 @@ def main(argv: list[str] | None = None) -> int:
         glm_drop_last=args.glm_drop_last,
         glm_blur=args.glm_blur,
         glm_label=args.glm_label,
+        glm_mask=args.glm_mask,
         clustsim=args.clustsim,
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,

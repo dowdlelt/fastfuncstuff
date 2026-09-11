@@ -2794,7 +2794,7 @@ def _al_anat_nl(plan: Plan) -> str:
     CHAIN actually does. That link is a real, PE-axis-only deformation of several
     voxels, so an ``_al_anat`` derived grid/mask/QC describes a brain shape the
     data never lands in. This image is the anchor pushed through the whole head
-    of the chain, and is what stage10a boxes, masks and QCs against."""
+    of the chain, and is what stage10a boxes the output grid out of."""
     return f"stage09.{effective_anat_source(plan)}_al_anat_nl.nii$FMT"
 
 
@@ -2910,8 +2910,9 @@ def _stage_warpmaster(plan: Plan) -> str:
     output FOV, the automask and the final QC's sub-brick 0 all describe a brain
     shape several PE-axis voxels away from the one the runs land in. The EPI FOV is
     usually a slab, not the whole head, so this crop is what keeps the output from
-    carrying the anat's empty space. epi_mask is a dilated automask on that grid,
-    used to mask the GLM. Two anat underlays come out of this: the whole-brain
+    carrying the anat's empty space. No mask is made here — an automask of the
+    anchor is not an automask of the data; that is stage10b's job. Two anat
+    underlays come out of this: the whole-brain
     stage09.anat_autobox and stage10.anat_in_epi_fov, the same anat at anat
     resolution over the warpmaster's FOV — the one to overlay results on. MASTER
     and FINAL_DXYZ are defined here once and reused by stage10 (same shell); the
@@ -2919,7 +2920,6 @@ def _stage_warpmaster(plan: Plan) -> str:
     opt = plan.options
     box = "stage10.warpmaster_box.nii$FMT"
     wm = "stage10.warpmaster.nii$FMT"
-    mask = "epi_mask.nii$FMT"
     anat_fov = "stage10.anat_in_epi_fov.nii.gz"
 
     def guarded(outfile: str, tool: str, parts: list[str]) -> str:
@@ -2927,11 +2927,11 @@ def _stage_warpmaster(plan: Plan) -> str:
 
     out = [
         "",
-        "# ============================ stage10a: warpmaster + mask ==================",
-        "# Fix the final output grid and analysis mask before the resample. The",
-        "# warpmaster is the anat-space EPI target autoboxed to the EPI's own coverage",
-        "# and resampled to the EPI voxel size; stage10 lands every run on it (-master).",
-        "# epi_mask is a dilated automask on that grid (masks the GLM).",
+        "# ============================ stage10a: warpmaster ========================",
+        "# Fix the final output grid before the resample. The warpmaster is the",
+        "# anat-space EPI target autoboxed to the EPI's own coverage and resampled to",
+        "# the EPI voxel size; stage10 lands every run on it (-master). The analysis",
+        "# masks come after the data does, in stage10b.",
     ]
     if _own_anat(opt):
         out += [
@@ -2939,7 +2939,7 @@ def _stage_warpmaster(plan: Plan) -> str:
             "# the underlay for results; stage09.anat_autobox is the whole-brain one.",
         ]
     out += [
-        "echo '== stage10a: warpmaster + mask =='",
+        "echo '== stage10a: warpmaster =='",
         # Defined once here and reused by stage10; FFS_* overrides still win.
         f'MASTER="${{FFS_MASTER:-{_final_master(plan)}}}"',
         '[ -n "$MASTER" ] || { echo "stage10a: no master dataset; set FFS_MASTER" >&2; exit 1; }',
@@ -2979,13 +2979,6 @@ def _stage_warpmaster(plan: Plan) -> str:
                 "-rmode wsinc5",
                 '-device "$DEVICE"',
             ],
-        )
-    )
-    out.append(
-        guarded(
-            mask,
-            "ffs_util_automask",
-            [f'-input "{wm}"', f'-prefix "{mask}"', "-dilate 2", '-device "$DEVICE"'],
         )
     )
     return "\n".join(out) + "\n"
@@ -3196,6 +3189,175 @@ done
 """
 
 
+def _mask_epi() -> str:
+    """The EPI automask on the final grid: every voxel this dataset imaged."""
+    return "stage10.mask_epi.nii$FMT"
+
+
+def _anat_on_final() -> str:
+    """The anat resampled onto the exact final grid (FOV *and* EPI voxel size).
+
+    stage10.anat_in_epi_fov is the same anat on the same FOV at ANAT resolution —
+    the better underlay. This one exists so the anat mask is built on the grid the
+    data is on, with no resampling of a binary mask afterwards."""
+    return "stage10.anat_in_epi_grid.nii.gz"
+
+
+def _mask_anat() -> str:
+    """The anat brain automasked on the final grid."""
+    return "stage10.mask_anat.nii$FMT"
+
+
+def _mask_brain() -> str:
+    """EPI coverage ∩ anat brain — the tissue this dataset actually has.
+
+    The EPI automask keeps whatever is bright in an EPI (eyes, neck fat, a rim of
+    skull marrow); the anat mask has no such extras but covers a whole head the
+    EPI slab never saw. The intersection is the only one of the three that is both
+    brain and acquired, which is what a GLM should be fit inside."""
+    return "stage10.mask_brain.nii$FMT"
+
+
+def _glm_mask(plan: Plan) -> str:
+    """The stage10b mask stage12 is fit inside (-glm_mask), or "" for no mask.
+
+    The anat modes fall back to the EPI mask when this pipeline has no anat of its
+    own to mask with (-grand_reference / -ref_file) — the generator warns about
+    that at parse time rather than emitting a -mask naming a file nothing writes.
+    """
+    mode = plan.options.glm_mask
+    if mode == "none":
+        return ""
+    if not _own_anat(plan.options):
+        return _mask_epi()
+    return {"epi": _mask_epi(), "anat": _mask_anat(), "epi_anat": _mask_brain()}[mode]
+
+
+def _stage_masks(plan: Plan) -> str:
+    """Masks of the data as it actually came out, on the final grid.
+
+    Deliberately stage10b and not stage10a: an automask made before the resample is
+    an automask of the *anchor*, and what the GLM has to be masked against is the
+    timeseries every run landed on. stage10.meanall is every run's own mean
+    averaged — the whole dataset as one 3D image, which is what an automask wants.
+    """
+    opt = plan.options
+    meanall = "stage10.meanall.nii$FMT"
+    wm = "stage10.warpmaster.nii$FMT"
+    anat_fov = "stage10.anat_in_epi_fov.nii.gz"
+    have_anat = _own_anat(opt)
+
+    def guarded(outfile: str, tool: str, parts: list[str]) -> str:
+        return f'[ -f "{outfile}" ] || \\\n' + _ffs(tool, parts)
+
+    out = [
+        "",
+        "# ============================ stage10b: masks ==============================",
+        "# Masks in the FINAL space at the final voxel size, built from the data that",
+        "# came out of stage10 (not from the pre-resample anchor). stage10.meanall is",
+        "# the mean of every run's mean; mask_epi is its automask.",
+    ]
+    if have_anat:
+        out.append(
+            "# mask_anat is the anat brain automasked on the same grid, and mask_brain\n"
+            "# their intersection: acquired AND brain. The GLM is fit inside that one."
+        )
+    else:
+        out.append(
+            "# No anat of this pipeline's own (-grand_reference / -ref_file), so there is\n"
+            "# no anat mask to intersect with and the GLM is fit inside mask_epi."
+        )
+    out.append("echo '== stage10b: masks =='")
+    # Built here rather than with ffs_nwarp -save_mean's outputs listed inline so a
+    # 100-run recipe doesn't put 100 filenames on one line.
+    out.append(f'if [ ! -f "{meanall}" ]; then')
+    out.append("  allmeans=()")
+    out.append(
+        '  for k in "${RUN_KEYS[@]}"; do '
+        'allmeans+=("mean_stage10.final.${FRAG[$k]}.nii$FINAL_FMT"); done'
+    )
+    out.append(
+        _ffs(
+            "ffs_util_3dmath",
+            ['-input "${allmeans[@]}"', "-mean", f'-prefix "{meanall}"', '-device "$DEVICE"'],
+        )
+    )
+    out.append("fi")
+    # -dilate 1, not the tool's 2: this mask gets intersected with the anat, and a
+    # 2-voxel grow at EPI resolution is most of a gyrus.
+    out.append(
+        guarded(
+            _mask_epi(),
+            "ffs_util_automask",
+            [f'-input "{meanall}"', f'-prefix "{_mask_epi()}"', "-dilate 1", '-device "$DEVICE"'],
+        )
+    )
+    if have_anat:
+        out.append(
+            guarded(
+                _anat_on_final(),
+                "ffs_util_resample",
+                [
+                    f'-input "{anat_fov}"',
+                    f'-master "{wm}"',
+                    "-rmode cubic",
+                    f'-prefix "{_anat_on_final()}"',
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+        # No dilation: the whole point of the anat side is that it has no extras.
+        out.append(
+            guarded(
+                _mask_anat(),
+                "ffs_util_automask",
+                [
+                    f'-input "{_anat_on_final()}"',
+                    f'-prefix "{_mask_anat()}"',
+                    "-dilate 0",
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+        out.append(
+            guarded(
+                _mask_brain(),
+                "ffs_util_3dmath",
+                [
+                    f'-input "{_mask_epi()}" "{_mask_anat()}"',
+                    "-expr 'step(a)*step(b)'",
+                    f'-prefix "{_mask_brain()}"',
+                    '-device "$DEVICE"',
+                ],
+            )
+        )
+    glm_mask = _glm_mask(plan)
+    if glm_mask:
+        # One place the GLM's mask is named; FFS_GLM_MASK swaps it without
+        # regenerating the script (the other three are sitting right there).
+        out.append(f'GLM_MASK="${{FFS_GLM_MASK:-{glm_mask}}}"')
+    else:
+        out.append(
+            "# -glm_mask none: stage12 is fit in every voxel. Re-generate with\n"
+            "# -glm_mask epi_anat (or epi / anat) to fit inside one of the masks above."
+        )
+    return "\n".join(out) + "\n" + _qc_masks(plan)
+
+
+def _qc_masks(plan: Plan) -> str:
+    """The three masks over the image they were made from, in one stack.
+
+    A mask is only ever wrong in a way you can see: mask_epi reaching into the
+    neck, mask_anat sitting a few voxels off the data because the anat link is
+    off, mask_brain hollow where the two disagree."""
+    if not _qc_on(plan):
+        return ""
+    items = [("stage10.meanall.nii$FMT", "meanall"), (_mask_epi(), "epi")]
+    if _own_anat(plan.options):
+        items += [(_mask_anat(), "anat"), (_mask_brain(), "brain")]
+    return _qc_block("final-space masks", [_qc_call(_qc_stem("mask"), items)])
+
+
 def _dofloss_sums(plan: Plan, tasks) -> list[str]:
     """One summed dof map per task: what the model built from those runs actually lost.
 
@@ -3276,7 +3438,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             f'-Rbuck "{rbuck}"',
             "-tout",
             "-fout",
-            "-mask epi_mask.nii$FMT",
+            *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
             "-do_scale",
             *([f"-do_blur {opt.glm_blur:g}"] if opt.glm_blur else []),
             # The ACF comes from the residuals this fit already has in memory,
@@ -3460,6 +3622,7 @@ def write_script(
         _stage_anat(plan),
         _stage_warpmaster(plan),
         _stage_final(plan, script_stem),
+        _stage_masks(plan),
         _stage_stats(plan, bids_root),
     ]
     return "\n".join(p for p in parts if p).rstrip() + "\n"

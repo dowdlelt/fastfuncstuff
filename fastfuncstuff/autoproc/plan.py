@@ -100,6 +100,12 @@ class Options:
     # business -- a different nuisance set, a different HRF, a hand-edited TOML;
     # all the pipeline knows is that two variants must not share a bucket name.
     glm_label: str | None = None
+    # Which stage10b mask the GLM is fit inside: "none" (every voxel in the
+    # dataset, the default -- a mask is an analysis decision, and an over-tight
+    # one drops voxels from the stats with nothing to show for it), "epi" (what
+    # was acquired), "anat" (what is brain) or "epi_anat" (both). The masks
+    # themselves are always built; this only decides which one ffs_reml is given.
+    glm_mask: str = "none"
     # Attach Monte-Carlo cluster-size tables to the stat buckets (ffs_reml
     # -clustsim). Opt-in: the inputs are all there and it costs ~100 s a task,
     # but a cluster-correction table is a statistical claim, not a default.

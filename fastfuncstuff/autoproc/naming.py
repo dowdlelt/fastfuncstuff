@@ -92,6 +92,9 @@ STAGE_NUMBERS: dict[str, int] = {
     "anat_strip": 9,  # the -anat_skull yes head/brain QC pair
     "nlanat": 9,
     "final": 10,
+    # The final-space masks (stage10b) — after "final" because they are made FROM
+    # the resampled data, not from the anchor it landed on.
+    "mask": 10,
     "scale": 11,
     # The GLM's design TOML. Written at generation time, but numbered for where
     # it is consumed: immediately before stats, which reads it via -spec.

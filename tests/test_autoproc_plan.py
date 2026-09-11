@@ -458,19 +458,18 @@ def test_header_carries_the_generating_command():
 
 
 def test_warpmaster_defines_grid_mask_and_stats():
-    """stage10a builds the warpmaster grid + epi_mask before stage10, stage10
-    resamples onto it, and the GLM emits OLS+REML buckets masked by epi_mask.
+    """stage10a builds the warpmaster grid before stage10, stage10 resamples onto
+    it, stage10b masks the data that came out, and the GLM emits OLS+REML buckets.
     The anat underlays (whole-brain box + the EPI-FOV crop of it) are emitted only
     when we own the anat."""
     subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
     plan = build_plan(subj, Options(go_to_anat=True, run_glm=True))
     s = write_script(plan, "wd", bids_root="/bids")
 
-    # warpmaster grid + mask are built, and defined before the resample stage.
+    # warpmaster grid is built, and defined before the resample stage.
     assert s.index("stage10a: warpmaster") < s.index("stage10: final compose")
     assert "ffs_util_autobox" in s and "ffs_util_resample" in s
     assert '-prefix "stage10.warpmaster.nii$FMT"' in s
-    assert '-prefix "epi_mask.nii$FMT"' in s and "-dilate 2" in s
     assert '[ -f "stage09.anat_autobox.nii.gz" ] ||' in s  # own anat → whole-brain underlay
     assert '[ -f "stage10.anat_in_epi_fov.nii.gz" ] ||' in s  # ... and the EPI-FOV crop
     # The alignment base is the boxed anat, and its output is named for the source.
@@ -483,7 +482,10 @@ def test_warpmaster_defines_grid_mask_and_stats():
     # GLM: OLS by default + REML, masked, scaled.
     assert '-Obuck "stage12.stats-ols.task-foo.nii$GLM_FMT"' in s
     assert '-Rbuck "stage12.stats-reml.task-foo.nii$GLM_FMT"' in s
-    assert "-mask epi_mask.nii$FMT" in s and "-do_scale" in s
+    assert "-do_scale" in s
+    # -glm_mask defaults to none: no mask flag at all, and nothing names a mask
+    # the script does not write.
+    assert "-mask " not in s
 
     # No-own-anat borrow mode: still a warpmaster, but no viewing brain.
     borrow = write_script(
@@ -2205,6 +2207,55 @@ def test_stage12_guard_makes_skip_stats_real():
     assert '[ ! -f "stage12.blur4.stats-reml.task-foo.nii$GLM_FMT" ]' in blurred
 
 
+def test_stage10b_masks_and_glm_mask_modes():
+    """stage10b masks the FINAL data (not the pre-resample anchor), builds all
+    three masks whatever -glm_mask says, and -glm_mask picks which one reaches
+    ffs_reml."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")], anat=Path("/anat/T1w.nii.gz"))])
+
+    def gen(**kw):
+        return write_script(
+            build_plan(subj, Options(go_to_anat=True, run_glm=True, **kw)),
+            "wd",
+            bids_root="/bids",
+        )
+
+    s = gen()
+    # After the data exists, not before: an automask of the warpmaster is an
+    # automask of the anchor.
+    assert s.index("stage10: final compose") < s.index("stage10b: masks")
+    assert '-prefix "stage10.meanall.nii$FMT"' in s
+    for m in ("mask_epi", "mask_anat", "mask_brain"):
+        assert f'-prefix "stage10.{m}.nii$FMT"' in s
+    # The anat side is masked on the final grid, and the intersection is a product
+    # of the two masks, not a second automask.
+    assert '-master "stage10.warpmaster.nii$FMT"' in s
+    assert "-expr 'step(a)*step(b)'" in s
+    # Default is no mask at all.
+    assert "GLM_MASK=" not in s and "-mask " not in s
+
+    for mode, want in (
+        ("epi", "stage10.mask_epi.nii$FMT"),
+        ("anat", "stage10.mask_anat.nii$FMT"),
+        ("epi_anat", "stage10.mask_brain.nii$FMT"),
+    ):
+        g = gen(glm_mask=mode)
+        assert f'GLM_MASK="${{FFS_GLM_MASK:-{want}}}"' in g
+        assert '-mask "$GLM_MASK"' in g
+
+    # No anat of our own: the masks that need one are not emitted, and the anat
+    # modes fall back to the EPI mask rather than naming a file nobody writes.
+    borrow = write_script(
+        build_plan(
+            subj, Options(grand_reference="/floc.results", run_glm=True, glm_mask="epi_anat")
+        ),
+        "wd",
+        bids_root="/bids",
+    )
+    assert "stage10.mask_anat" not in borrow and "stage10.mask_brain" not in borrow
+    assert 'GLM_MASK="${FFS_GLM_MASK:-stage10.mask_epi.nii$FMT}"' in borrow
+
+
 def test_clustsim_rides_the_reml_command_not_a_separate_stage():
     """-clustsim is one flag on stage12: the ACF comes from residuals ffs_reml
     already holds, so there is no errts to write and no stage13 to run."""
@@ -2221,6 +2272,8 @@ def test_clustsim_rides_the_reml_command_not_a_separate_stage():
     assert "-Rerrts" not in on and "stage13" not in on
     assert "ffs_clustsim" not in on
     assert on.count("-clustsim") == 1
-    assert "-mask epi_mask.nii$FMT" in on
+    # -clustsim needs no mask flag: with -glm_mask none ffs_reml automasks the
+    # grand mean for its own diagnostics, which is where the ACF comes from.
+    assert "-mask " not in on
     # Only the GLM command changes.
     assert off.split("stage12: GLM")[0] == on.split("stage12: GLM")[0]
