@@ -13,6 +13,13 @@ requires-python = ">=3.11"
 dependencies = [
     "numpy>=1.23",
     "torch>=2.0",
+    # Apple Silicon only. utils.get_device picks MPS by default on a Mac, and
+    # the policy in utils._MPS_CPU_OPS -- which ops stay on Metal and which are
+    # routed to the CPU -- was measured against 2.14's native Metal linalg and
+    # its native 3-D grid_sample (border padding + backward). On an older torch
+    # those ops fall back to the CPU or raise, so the table would be wrong in
+    # both directions. CUDA and CPU hosts are unaffected by this floor.
+    "torch>=2.14; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "nibabel>=5.1",
     "scipy>=1.10",
     "matplotlib>=3.7",

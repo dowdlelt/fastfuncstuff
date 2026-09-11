@@ -145,7 +145,6 @@ def test_fit_cache_round_trips_image_field_and_time(tmp_path):
     speed, and that column is how the frontier weighs a backend.
     """
     from fastfuncstuff.processing.tunewarp import (
-        SubjectPair,
         _fit_cache_key,
         _load_cached_fit,
         _save_cached_fit,

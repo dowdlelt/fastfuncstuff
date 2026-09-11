@@ -251,27 +251,60 @@ Frank efficiency). See `docs/` for details.
 ### PyTorch, CPU and Mac MPS
 
 The CPU paths are first-class and honour `-device cpu,N`, `FFS_NUM_THREADS`, and
-`OMP_NUM_THREADS`. On Apple Silicon, choose the device by workload:
+`OMP_NUM_THREADS`. On Apple Silicon you no longer have to choose: **`-device auto`
+(the default) picks MPS**, and the toolbox routes the individual operations that
+Metal handles badly back to the CPU for you. Two mechanisms do that:
 
-- Use `-device mps` for `ffs_moco`, `ffs_locomoco`, and `ffs_allineate` on typical
-  full-size brain volumes. Their interpolation, optical-flow, and batched sampling
-  kernels have enough work to outrun the Mac CPU. CPU can still win on small images.
-- Prefer `-device cpu` for `ffs_reml`, `ffs_hrfopt`, `ffs_denoise`, `ffs_ridge`, and
-  `ffs_fitbasis`. Apple CPU linear algebra is difficult for MPS to beat at their
-  usual matrix sizes. The same is true for `ffs_deconvolve` and ordinary
-  `ffs_perm` jobs; `ffs_denoisatorial` may benefit from MPS only when its large
-  float32 combination batches outweigh MPS's CPU fallback for QR.
-- MPS remains best-effort. The supported paths use float32 bulk computation and
-  explicit CPU-float64 islands for sensitive or unsupported operations. If an MPS
-  path causes trouble, rerun with `-device cpu`.
+- Ops PyTorch has not implemented for Metal fall back to the CPU automatically
+  (`PYTORCH_ENABLE_MPS_FALLBACK`, set before torch is imported).
+- Ops that *are* implemented but are broken or slower than Apple's CPU are listed
+  in `fastfuncstuff/utils.py:_MPS_CPU_OPS` and routed off Metal explicitly.
+  Regenerate that table after a torch upgrade with
+  `python scripts/bench_mps_policy.py`.
+
+Measured on an M4 Max, torch 2.14 (CPU-float32 time ÷ MPS time; >1 means MPS wins):
+
+| Stays on Metal | | Routed to the CPU | |
+|---|---|---|---|
+| grid_sample 3-D | 17.5× (2.7× fwd+bwd) | QR (1000,60) | 12000× *slower* |
+| rfft | 13× | cholesky (500,500) | 10× slower |
+| elementwise | 3.8× | solve (500,500) | 4.3× slower |
+| matmul (large) | 3.6× | SVD, pinv | ~1.5× slower |
+| eigh (batched) | 3.2× | eigh (unbatched) | 1.15× slower |
+| conv3d | 1.7× | batched SVD, lstsq | error in the Metal compiler |
+
+Apple Silicon requires torch ≥ 2.14, which is where native Metal linear algebra
+and native 3-D `grid_sample` (border padding and backward) landed. Auto-detect
+declines MPS on an older torch, and on a build where the CPU fallback did not
+arm, rather than hand you a device that dies partway through a fit.
+
+Device choice still has a size dimension, because the CPU-float64 islands cost a
+round-trip. Measured on a single-run OLS fit (10 regressors), MPS against CPU:
+
+| voxels x TRs | winner |
+|---|---|
+| 20k x 300 | CPU by 17x (251 ms vs 15 ms) |
+| 100k x 300 | CPU by 1.6x |
+| 300k x 300 | **MPS by 1.4x** |
+| 300k x 900 | **MPS by 1.5x** |
+
+The crossover sits near ~200k voxels, which is why MPS is the default: real fMRI
+volumes live above it, and when the CPU does win below it the whole fit was a few
+hundred milliseconds anyway. For a small ROI or a quick interactive fit, `-device
+cpu` is measurably faster.
+
+float64 is the one hard limit: Metal has none. Numerically sensitive steps run
+CPU-float64 automatically and reduction accumulators stay float32 on-device, so
+results are correct either way — but `-device cpu` remains fully supported and is
+the right call when you want guaranteed full float64 precision.
 
 Nonlinear registration has its own device profile:
 
 | Tool | Apple Silicon recommendation | Why |
 |---|---|---|
 | `ffs_optiwarp` | MPS for LK/HS; benchmark demons | Forward-only flow kernels work natively; LK/HS usually win on full-size volumes. |
-| `ffs_formwarp` | CPU | SyN needs 3-D `grid_sample` backward, which currently falls back from MPS to CPU every iteration. |
-| `ffs_qwarp` | CPU | Its autograd patch optimizer hits the same MPS backward fallback; CUDA remains the fastest target. |
+| `ffs_formwarp` | MPS | SyN leans on 3-D `grid_sample` backward, which torch 2.14 runs natively on Metal (~2.7× the CPU fwd+bwd) instead of falling back every iteration. |
+| `ffs_qwarp` | MPS | Its autograd patch optimizer uses the same backward; CUDA remains the fastest target overall. |
 | `ffs_nwarp` | MPS for full-size volumes | Forward-only application, three-component composition, static frames, phase channels, and frozen temporal taps share memory-planned interpolation work. |
 
 For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
