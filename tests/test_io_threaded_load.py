@@ -117,6 +117,26 @@ def test_resolve_load_threads_bounds():
     assert resolve_load_threads(10, bytes_per_run=10**15) == 1
 
 
+def test_load_threads_leave_the_inner_pool_fed(monkeypatch):
+    """Concurrency must not starve the per-run reorder, which is >80% of a load.
+
+    The old rule took as many runs in flight as the core count allowed, so 5
+    runs on a 6-core budget got 1 inner thread each and the whole load came out
+    slower than reading the runs one at a time (17.5 s vs 13.6 s measured).
+    Two in flight is a double buffer -- enough to hide a decode behind the
+    previous reorder -- and everything else goes to the inner pool.
+    """
+    for var in ("FFS_LOAD_THREADS", "FFS_NUM_THREADS", "SLURM_CPUS_PER_TASK"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("OMP_NUM_THREADS", "6")
+    assert resolve_load_threads(5) == 2
+    monkeypatch.setenv("OMP_NUM_THREADS", "12")
+    assert resolve_load_threads(5) == 2
+    # Only once the inner pool is capped out do spare cores buy concurrency.
+    monkeypatch.setenv("OMP_NUM_THREADS", "32")
+    assert resolve_load_threads(8) == 4
+
+
 def test_load_threads_respect_the_cpu_budget(monkeypatch):
     """The loader draws from the same budget as compute: a 2-core cap must not
     become 8 loader threads just because there are 20 runs to read."""

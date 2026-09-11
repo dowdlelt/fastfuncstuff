@@ -1065,6 +1065,12 @@ def _load_run_array(
     return np.ascontiguousarray(data_np, dtype=np.float32)
 
 
+# Ceiling on the per-run inner pool (the voxel-major reorder, and zstd). Past
+# this the reorder is memory-bandwidth bound, so extra threads buy nothing --
+# which is also what makes it safe to spend surplus cores on run concurrency.
+_MAX_INNER_THREADS = 8
+
+
 def resolve_load_threads(
     n_runs: int,
     bytes_per_run: int | None = None,
@@ -1073,10 +1079,20 @@ def resolve_load_threads(
     """Decide how many runs to decode concurrently.
 
     Loading is three per-run stages that all release the GIL (zstd subprocess,
-    nibabel read, the transpose-shaped copy), so threads overlap them for a
-    ~3-4x wall-clock win. The cost is that *k* runs are in flight at once, so
-    the count is bounded by host RAM through the memory module, never
-    hardcoded. ``FFS_LOAD_THREADS`` overrides, and 1 disables threading.
+    nibabel read, the transpose-shaped copy), so threads overlap them. The cost
+    is that *k* runs are in flight at once, so the count is bounded by host RAM
+    through the memory module, never hardcoded. ``FFS_LOAD_THREADS`` overrides,
+    and 1 disables threading.
+
+    Concurrency is deliberately kept low. It exists to hide one run's decode
+    behind the previous run's reorder, and a single spare run does that; beyond
+    a double buffer the runs in flight only divide the cores away from the
+    reorder, which is over 80% of a load and scales near-linearly to this
+    module's inner cap. Measured on 5 x 1.5 GB runs over 6 cores: 2 in flight
+    12.7 s, 3 -> 14.0 s, and 5 -- what the old "as concurrent as the core count
+    allows" rule chose -- 17.5 s, slower than loading the runs one at a time,
+    because each got a single inner thread. Grow past the double buffer only
+    once the inner pool is capped out and there are still cores spare.
     """
     import os
 
@@ -1099,9 +1115,7 @@ def resolve_load_threads(
     # Same budget as compute: whatever FFS_NUM_THREADS / OMP_NUM_THREADS / the
     # scheduler says this process may use, not the size of the machine.
     n_cpu, _ = resolve_cpu_threads()
-    # One core stays for the consuming thread; past ~8 the gain flattens
-    # anyway (memory bandwidth, not cores, is the limit).
-    workers = min(n_runs, max(1, n_cpu - 1), 8)
+    workers = min(n_runs, n_cpu, max(2, n_cpu // _MAX_INNER_THREADS))
 
     if bytes_per_run:
         # Each in-flight run costs roughly two copies: nibabel's array and the
@@ -1238,7 +1252,7 @@ def load_and_concatenate_runs(
     # load, so give it whatever cores the outer run-level pool left unused. With
     # one run in flight (single-run tools) that is the whole budget.
     n_cpu, _ = resolve_cpu_threads()
-    inner_threads = max(1, min(8, n_cpu // n_threads))
+    inner_threads = max(1, min(_MAX_INNER_THREADS, n_cpu // n_threads))
     # On CUDA the reorder happens device-side instead -- but only with a single
     # run in flight, so the VRAM budget is not raced by concurrent workers.
     reorder_device = (
