@@ -308,7 +308,7 @@ Nonlinear registration has its own device profile:
 | `ffs_nwarp` | MPS for full-size volumes | Forward-only application, three-component composition, static frames, phase channels, and frozen temporal taps share memory-planned interpolation work. |
 
 For `ffs_formwarp` and `ffs_qwarp`, `-device auto` therefore selects CPU on a
-Mac unless CUDA is available. An explicit `-device mps` is still honored.
+Mac unless CUDA is available. An explicit `-device mps` is still honored (but falls back to cpu automatically as needed).
 
 Other compute-heavy tools have a mixed Apple Silicon profile:
 
