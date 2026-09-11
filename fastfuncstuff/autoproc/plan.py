@@ -100,6 +100,10 @@ class Options:
     # business -- a different nuisance set, a different HRF, a hand-edited TOML;
     # all the pipeline knows is that two variants must not share a bucket name.
     glm_label: str | None = None
+    # Attach Monte-Carlo cluster-size tables to the stat buckets (ffs_reml
+    # -clustsim). Opt-in: the inputs are all there and it costs ~100 s a task,
+    # but a cluster-correction table is a statistical claim, not a default.
+    clustsim: bool = False
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False

@@ -4335,6 +4335,7 @@ def _run_clustsim(args, diag, device) -> None:
     threshold is not a label you can copy across models.
     """
     from fastfuncstuff.stats.clustsim import ACF, attach_clustsim_tables
+    from fastfuncstuff.stats.niml import resolve_mask_idcode
 
     print()
     print("=" * 70)
@@ -4377,6 +4378,10 @@ def _run_clustsim(args, diag, device) -> None:
                 n_iter=args.clustsim_niter,
                 device=device,
                 mask_name=str(Path(args.mask).resolve()) if args.mask else "<automask>",
+                # AFNI cross-references the table's mask by IDCODE; without a
+                # -mask file there is nothing on disk to take one from, and the
+                # resolver synthesises a stable stand-in.
+                mask_idcode=resolve_mask_idcode(args.mask),
                 commandline=" ".join(["ffs_reml", *sys.argv[1:]]),
                 verbose=True,
             )

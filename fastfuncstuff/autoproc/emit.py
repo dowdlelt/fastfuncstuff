@@ -3279,6 +3279,9 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             "-mask epi_mask.nii$FMT",
             "-do_scale",
             *([f"-do_blur {opt.glm_blur:g}"] if opt.glm_blur else []),
+            # The ACF comes from the residuals this fit already has in memory,
+            # so this needs no -Rerrts and no second pass over the data.
+            *(["-clustsim"] if opt.clustsim else []),
             # -TR only when the user gave one: a 3D acquisition's header TR is the
             # per-partition time, not the volume TR the design is sampled at.
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),

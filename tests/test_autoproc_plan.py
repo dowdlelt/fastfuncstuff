@@ -2203,3 +2203,24 @@ def test_stage12_guard_makes_skip_stats_real():
         build_plan(subj, Options(run_glm=True, glm_blur=4.0)), "wd", bids_root="/bids"
     )
     assert '[ ! -f "stage12.blur4.stats-reml.task-foo.nii$GLM_FMT" ]' in blurred
+
+
+def test_clustsim_rides_the_reml_command_not_a_separate_stage():
+    """-clustsim is one flag on stage12: the ACF comes from residuals ffs_reml
+    already holds, so there is no errts to write and no stage13 to run."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    off = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root="/bids")
+    assert "-clustsim" not in off
+
+    on = write_script(
+        build_plan(subj, Options(run_glm=True, clustsim=True)), "wd", bids_root="/bids"
+    )
+    assert "-clustsim" in on
+    # No residual dataset, and no extra stage: the mask it needs is already
+    # passed to the same command.
+    assert "-Rerrts" not in on and "stage13" not in on
+    assert "ffs_clustsim" not in on
+    assert on.count("-clustsim") == 1
+    assert "-mask epi_mask.nii$FMT" in on
+    # Only the GLM command changes.
+    assert off.split("stage12: GLM")[0] == on.split("stage12: GLM")[0]

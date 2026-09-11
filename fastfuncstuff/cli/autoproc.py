@@ -566,6 +566,15 @@ def build_parser() -> argparse.ArgumentParser:
         "digits, - and _ only.",
     )
     g.add_argument(
+        "-clustsim",
+        action="store_true",
+        help="attach Monte-Carlo cluster-size thresholds (3dClustSim) to each "
+        "task's stat bucket, so the AFNI viewer reports cluster significance. "
+        "Runs inside ffs_reml off that fit's own residual ACF and the pipeline's "
+        "epi_mask, so it needs no extra input and writes no residual dataset. "
+        "Adds roughly a minute or two per task.",
+    )
+    g.add_argument(
         "-glm_spec_overwrite",
         "-glm-spec-overwrite",
         action="store_true",
@@ -1388,6 +1397,7 @@ def main(argv: list[str] | None = None) -> int:
         glm_drop_last=args.glm_drop_last,
         glm_blur=args.glm_blur,
         glm_label=args.glm_label,
+        clustsim=args.clustsim,
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
