@@ -3194,17 +3194,21 @@ def _mask_epi() -> str:
     return "stage10.mask_epi.nii$FMT"
 
 
-def _anat_on_final() -> str:
-    """The anat resampled onto the exact final grid (FOV *and* EPI voxel size).
+def _mask_anat_hires() -> str:
+    """The anat brain mask at ANAT resolution — what :func:`_mask_anat` is
+    downsampled from.
 
-    stage10.anat_in_epi_fov is the same anat on the same FOV at ANAT resolution —
-    the better underlay. This one exists so the anat mask is built on the grid the
-    data is on, with no resampling of a binary mask afterwards."""
-    return "stage10.anat_in_epi_grid.nii.gz"
+    Masking happens here rather than after the resample because automask is only
+    as good as the image under it: a 1 mm anat dropped to a 4 mm EPI grid is a
+    partial-volume blur, and thresholding THAT loses exactly the thin cortex the
+    anat was brought in to describe. Dilated by one ANAT voxel, which is a
+    fraction of an EPI voxel — a millimetre of slack, not a gyrus of it."""
+    return "stage10.mask_anat_hires.nii$FMT"
 
 
 def _mask_anat() -> str:
-    """The anat brain automasked on the final grid."""
+    """The anat brain mask on the final grid (nearest-neighbour from the
+    anat-resolution one — a binary mask has no business being interpolated)."""
     return "stage10.mask_anat.nii$FMT"
 
 
@@ -3259,13 +3263,15 @@ def _stage_masks(plan: Plan) -> str:
     ]
     if have_anat:
         out.append(
-            "# mask_anat is the anat brain automasked on the same grid, and mask_brain\n"
-            "# their intersection: acquired AND brain. The GLM is fit inside that one."
+            "# mask_anat is the anat brain masked at ANAT resolution and dropped onto this\n"
+            "# grid nearest-neighbour (automasking a downsampled anat loses thin cortex),\n"
+            "# and mask_brain is their intersection: acquired AND brain. -glm_mask picks\n"
+            "# which one (if any) stage12 is fit inside; all three are written either way."
         )
     else:
         out.append(
             "# No anat of this pipeline's own (-grand_reference / -ref_file), so there is\n"
-            "# no anat mask to intersect with and the GLM is fit inside mask_epi."
+            "# no brain to intersect with and mask_epi is the only mask there can be."
         )
     out.append("echo '== stage10b: masks =='")
     # Built here rather than with ffs_nwarp -save_mean's outputs listed inline so a
@@ -3293,28 +3299,28 @@ def _stage_masks(plan: Plan) -> str:
         )
     )
     if have_anat:
+        # Mask at anat resolution, THEN drop to the final grid: see _mask_anat_hires.
         out.append(
             guarded(
-                _anat_on_final(),
-                "ffs_util_resample",
+                _mask_anat_hires(),
+                "ffs_util_automask",
                 [
                     f'-input "{anat_fov}"',
-                    f'-master "{wm}"',
-                    "-rmode cubic",
-                    f'-prefix "{_anat_on_final()}"',
+                    f'-prefix "{_mask_anat_hires()}"',
+                    "-dilate 1",
                     '-device "$DEVICE"',
                 ],
             )
         )
-        # No dilation: the whole point of the anat side is that it has no extras.
         out.append(
             guarded(
                 _mask_anat(),
-                "ffs_util_automask",
+                "ffs_util_resample",
                 [
-                    f'-input "{_anat_on_final()}"',
+                    f'-input "{_mask_anat_hires()}"',
+                    f'-master "{wm}"',
+                    "-rmode NN",
                     f'-prefix "{_mask_anat()}"',
-                    "-dilate 0",
                     '-device "$DEVICE"',
                 ],
             )

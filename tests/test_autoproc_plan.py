@@ -2227,10 +2227,16 @@ def test_stage10b_masks_and_glm_mask_modes():
     assert '-prefix "stage10.meanall.nii$FMT"' in s
     for m in ("mask_epi", "mask_anat", "mask_brain"):
         assert f'-prefix "stage10.{m}.nii$FMT"' in s
-    # The anat side is masked on the final grid, and the intersection is a product
-    # of the two masks, not a second automask.
-    assert '-master "stage10.warpmaster.nii$FMT"' in s
+    # The anat side is masked at ANAT resolution and brought down nearest-neighbour
+    # (never automasked after the downsample, never interpolated as a binary map),
+    # and the intersection is a product of the two masks, not a third automask.
+    assert '-input "stage10.anat_in_epi_fov.nii.gz"' in s
+    assert '-prefix "stage10.mask_anat_hires.nii$FMT"' in s
+    assert '-input "stage10.mask_anat_hires.nii$FMT"' in s
+    assert '-master "stage10.warpmaster.nii$FMT"' in s and "-rmode NN" in s
     assert "-expr 'step(a)*step(b)'" in s
+    stage10b = s[s.index("stage10b: masks") :].split("# ====", 2)[0]
+    assert stage10b.count("ffs_util_automask") == 2  # meanall + the anat, and no more
     # Default is no mask at all.
     assert "GLM_MASK=" not in s and "-mask " not in s
 
