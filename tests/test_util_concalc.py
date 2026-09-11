@@ -229,3 +229,80 @@ def test_synthetic_round_trip_matches_reml_to_floatprecision(tmp_path):
     # boilerplate than belongs in a single unit test. Real-data validation
     # against the user's AFNI proc dir is the current acceptance gate.
     pytest.skip("synthetic round-trip plumbing TBD")
+
+
+def _rvar_like(tmp_path, name, labels, data):
+    """Write a 4-D NIfTI carrying AFNI sub-brick labels."""
+    from fastfuncstuff.cli.util_concalc import _afni_brick_labels_extension
+
+    img = nib.Nifti1Image(data.astype(np.float32), np.eye(4))
+    img.header.extensions.append(_afni_brick_labels_extension(labels))
+    path = tmp_path / name
+    nib.save(img, str(path))
+    return path
+
+
+def test_concalc_refuses_a_stats_bucket_passed_as_rvar(tmp_path):
+    """A bucket as -rvar read its F-stat as the ARMA `a` and said nothing.
+
+    The two files differ by one suffix, and sub-bricks 0/1/3 of a bucket are
+    finite floats, so nothing downstream complained: the ARMA covariance was
+    built from an F-stat, and the contrasts came out as noise on the handful of
+    voxels whose garbage (a, b) happened to land inside the unit square.
+    """
+    from fastfuncstuff.cli.util_concalc import _check_is_rvar
+
+    rng = np.random.default_rng(0)
+    shape = (6, 6, 4)
+    bucket_labels = ["Full_Fstat", "face#0_Coef", "face#0_Tstat", "house#0_Coef"]
+    bucket = np.abs(rng.normal(0, 3, (*shape, 4)))  # F-stats and coefs: continuous
+    bpath = _rvar_like(tmp_path, "stats.nii.gz", bucket_labels, bucket)
+
+    # 1) the same file for both -- the shape of the real mistake.
+    assert _check_is_rvar(str(bpath), str(bpath), bucket_labels, bucket) == 1
+
+    # 2) a *different* bucket: caught on the labels.
+    other = _rvar_like(tmp_path, "other.nii.gz", bucket_labels, bucket)
+    stats = tmp_path / "elsewhere.nii.gz"
+    nib.save(nib.Nifti1Image(bucket, np.eye(4)), str(stats))
+    assert _check_is_rvar(str(other), str(stats), bucket_labels, bucket) == 1
+
+    # 3) unlabelled, so only the values can tell. Two independent tells, and
+    #    neither depends on the dataset's size:
+    #    (a) F-stats mostly sit outside the unit square an ARMA parameter lives in
+    #        -- this is why the bad run showed almost no voxels at any threshold.
+    assert _check_is_rvar(str(other), str(stats), [], bucket) == 1
+    #    (b) in-range but continuous: ~one distinct pair per voxel, where a grid
+    #        repeats itself however big the brain gets.
+    big = (40, 40, 20)  # past the ratio arm's voxel floor
+    cont = np.stack([rng.uniform(-0.9, 0.9, big) for _ in range(4)], axis=-1)
+    assert _check_is_rvar(str(other), str(stats), [], cont) == 1
+
+    # 4) a real Rvar passes: a and b come off a grid, so few distinct pairs.
+    grid = np.array([-0.4, -0.2, 0.0, 0.2, 0.4])
+    a = rng.choice(grid, big)
+    b = rng.choice(grid, big)
+    real = np.stack([a, b, np.ones(big), np.full(big, 2.0)], axis=-1)
+    labels = ["a", "b", "lambda", "StDev"]
+    rpath = _rvar_like(tmp_path, "stats_ffsremlvar.nii.gz", labels, real)
+    assert _check_is_rvar(str(rpath), str(stats), labels, real) == 0
+    # ... and so must a small one, where every voxel may hold its own pair.
+    tiny = np.stack(
+        [rng.choice(grid, shape), rng.choice(grid, shape), np.ones(shape), np.ones(shape)],
+        axis=-1,
+    )
+    assert _check_is_rvar(str(rpath), str(stats), labels, tiny) == 0
+
+
+def test_rvar_companion_is_found_beside_the_bucket(tmp_path):
+    """-rvar can be omitted: ffs_reml writes the companion under a fixed name,
+    and the only wrong answer to guess was the bucket itself."""
+    from fastfuncstuff.cli.util_concalc import _rvar_companion
+
+    stats = tmp_path / "stage12.stats-reml.task-x.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((2, 2, 2, 2), np.float32), np.eye(4)), str(stats))
+    assert _rvar_companion(str(stats)) is None
+
+    comp = tmp_path / "stage12.stats-reml.task-x_ffsremlvar.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((2, 2, 2, 4), np.float32), np.eye(4)), str(comp))
+    assert _rvar_companion(str(stats)) == str(comp)

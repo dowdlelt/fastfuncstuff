@@ -64,8 +64,10 @@ def _build_parser() -> argparse.ArgumentParser:
         required=False,
         metavar="FILE",
         help="Companion *_ffsremlvar file from ffs_reml. "
-        "Sub-bricks 0/1/3 are a, b, StDev. Required for REML "
-        "buckets; pass -ols for OLS buckets instead.",
+        "Sub-bricks 0/1/3 are a, b, StDev. Omit it and the companion beside "
+        "-stats is found automatically; pass -ols for OLS buckets instead. "
+        "Note this is NOT the stats bucket -- concalc refuses that, because "
+        "reading an F-stat as an ARMA parameter fails silently.",
     )
     p.add_argument(
         "-ols",
@@ -203,6 +205,19 @@ def _format_stataux_block(
         " " + "\n ".join(f"{v:g}" for v in stataux_floats),
         ";".join(syms),
     )
+
+
+#: Ceiling on distinct (a, b) pairs in a real Rvar. 3dREMLfit's default grid is
+#: |a|,|b| <= 0.8 at 3 levels -- ~117 valid pairs -- and ffs_reml's is the same
+#: shape; 2000 leaves room for a finer -Grid without admitting a continuous map.
+_MAX_PLAUSIBLE_AB_PAIRS = 2000
+#: An ARMA parameter is inside the unit square by construction, so essentially
+#: every voxel of a real Rvar is; 0.5 is far below anything legitimate.
+_MIN_IN_RANGE_FRACTION = 0.5
+#: The distinct-pairs-per-voxel arm needs enough voxels for the ratio to mean
+#: something: below this a real Rvar may honestly have a pair per voxel.
+_RATIO_MIN_VOXELS = 5000
+_RATIO_MAX_FRACTION = 0.25
 
 
 def _read_brick_labels(img) -> list[str]:
@@ -355,6 +370,106 @@ def _bin_index(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray, np
     bin_idx = np.full(a.shape, -1, dtype=np.int64)
     bin_idx[valid] = inverse
     return bin_idx, unique_ab, valid
+
+
+#: What ffs_reml labels the first four sub-bricks of an Rvar companion.
+_RVAR_HEAD = ("a", "b", "lambda", "stdev")
+
+
+def _rvar_companion(stats_path: str) -> str | None:
+    """The ``*_ffsremlvar`` file ffs_reml writes beside a -Rbuck, if it exists."""
+    from fastfuncstuff.io.afni import replace_afni_extension
+
+    stem = replace_afni_extension(stats_path, "")
+    for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
+        cand = f"{stem}_ffsremlvar{ext}"
+        if Path(cand).exists():
+            return cand
+    return None
+
+
+def _check_is_rvar(rvar_path: str, stats_path: str, labels: list[str], rvar) -> int:
+    """Refuse a -rvar that is not an Rvar. Returns an exit code (0 = fine).
+
+    Passing the stats bucket here is an easy mistake -- the two files differ by
+    one suffix -- and it is silent: sub-bricks 0/1/3 of a bucket are an F-stat
+    and two coefficients, which are finite floats, so everything downstream
+    "works". The ARMA covariance is then built from a continuous F-stat instead
+    of an autocorrelation, and the contrasts come out as noise on the handful of
+    voxels whose garbage (a, b) happened to land inside the unit square.
+
+    Two checks, because an older Rvar may carry no labels. The value check is
+    the one that catches it either way: a and b come off a bounded grid
+    (3dREMLfit's default is |a|,|b| <= 0.8 at 3 levels, a few hundred valid
+    pairs), so tens of thousands of distinct pairs means these are not ARMA
+    parameters.
+    """
+    hint = (
+        "Pass the *_ffsremlvar companion ffs_reml writes beside the bucket"
+        + (f" -- looks like {Path(c).name}" if (c := _rvar_companion(stats_path)) else "")
+        + ", or -ols for an OLS bucket."
+    )
+
+    if Path(rvar_path).resolve() == Path(stats_path).resolve():
+        print(
+            f"ERROR: -rvar and -stats are the same file ({Path(rvar_path).name}).\n"
+            f"       A stats bucket is never its own Rvar. {hint}",
+            file=sys.stderr,
+        )
+        return 1
+
+    head = [lab.strip().lower() for lab in labels[:4]]
+    if head and head != list(_RVAR_HEAD):
+        print(
+            f"ERROR: {Path(rvar_path).name} is not an Rvar -- its first sub-bricks are "
+            f"{', '.join(labels[:4])}, expected a, b, lambda, StDev.\n"
+            f"       {hint}",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Value checks, for a file with no labels. Both describe the same property
+    # from different sides -- a and b come off a bounded grid -- and neither
+    # depends on how many voxels the dataset has.
+    a, b = rvar[..., 0].ravel(), rvar[..., 1].ravel()
+    finite = np.isfinite(a) & np.isfinite(b)
+    n_finite = int(finite.sum())
+    if n_finite == 0:
+        return 0  # nothing to judge; the shape check upstream is all we have
+    in_range = finite & (np.abs(a) < 1.0) & (np.abs(b) < 1.0)
+    frac_in = float(in_range.sum()) / n_finite
+    if frac_in < _MIN_IN_RANGE_FRACTION:
+        print(
+            f"ERROR: {Path(rvar_path).name} does not hold ARMA parameters -- only "
+            f"{100 * frac_in:.1f}% of its sub-brick 0/1 values satisfy |a|,|b| < 1.\n"
+            "       Every ARMA parameter is inside the unit square by construction, so this "
+            "is some other map (an F-stat and a coefficient, most likely).\n"
+            f"       {hint}",
+            file=sys.stderr,
+        )
+        return 1
+
+    pairs = np.stack([np.round(a[in_range], 3), np.round(b[in_range], 3)], 1)
+    n_pairs = len(np.unique(pairs, axis=0))
+    n_in = int(in_range.sum())
+    # A grid repeats itself: distinct pairs stay flat as voxels grow. A
+    # continuous map has nearly one pair per voxel. The ratio arm only kicks in
+    # once there are enough voxels for "flat" to mean anything -- on a small
+    # mask a real Rvar can legitimately have a pair for every voxel.
+    too_many = n_pairs > _MAX_PLAUSIBLE_AB_PAIRS or (
+        n_in >= _RATIO_MIN_VOXELS and n_pairs > _RATIO_MAX_FRACTION * n_in
+    )
+    if too_many:
+        print(
+            f"ERROR: {Path(rvar_path).name} does not hold ARMA parameters -- sub-bricks 0/1 "
+            f"take {n_pairs:,} distinct (a, b) values over {n_in:,} voxels.\n"
+            "       They come off a bounded grid, so the distinct pairs are a few hundred "
+            "however big the brain is; this many means the file is a continuous map.\n"
+            f"       {hint}",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
 
 
 def _xtxinv_per_bin(
@@ -682,8 +797,19 @@ def main() -> int:
         print("ERROR: -rvar and -ols are mutually exclusive.", file=sys.stderr)
         return 1
     if not args.ols and not args.rvar:
-        print("ERROR: pass -rvar FILE (REML bucket) or -ols (OLS bucket).", file=sys.stderr)
-        return 1
+        # ffs_reml writes the companion beside the bucket under a fixed name, so
+        # there is nothing to guess: find it rather than making the user spell
+        # out a path whose only wrong answer is the bucket itself.
+        args.rvar = _rvar_companion(args.stats)
+        if args.rvar is None:
+            print(
+                "ERROR: pass -rvar FILE (REML bucket) or -ols (OLS bucket).\n"
+                f"       No *_ffsremlvar companion was found beside {Path(args.stats).name}.",
+                file=sys.stderr,
+            )
+            return 1
+        if args.verb >= 1:
+            print(f"🔎 Rvar not given; using the companion {Path(args.rvar).name}", flush=True)
 
     # ── 1) Resolve and compile the spec to get X + column labels ──────────
     spec_path = _resolve_spec_path(args.spec)
@@ -762,8 +888,6 @@ def main() -> int:
         return 1
 
     # ── 4) Load Rvar and stats bucket ───────────────────────────────────
-    if args.verb >= 1:
-        print(f"📥 Reading Rvar : {args.rvar}", flush=True)
     # REML path reads Rvar (a, b, σ); OLS path skips it (covariance is I,
     # σ² is derived per voxel from any existing β/t pair further below).
     if args.ols:
@@ -774,13 +898,17 @@ def main() -> int:
         if args.verb >= 1:
             print(f"📥 Reading Rvar : {args.rvar}", flush=True)
         with spinner(f"Loading {Path(args.rvar).name}"):
-            rvar = load_nifti(args.rvar).get_fdata(dtype=np.float32)
+            rvar_img = load_nifti(args.rvar)
+            rvar = rvar_img.get_fdata(dtype=np.float32)
         if rvar.shape[-1] < 4:
             print(
                 f"ERROR: Rvar has {rvar.shape[-1]} sub-bricks; expected ≥4 (a, b, lambda, StDev).",
                 file=sys.stderr,
             )
             return 1
+        rc = _check_is_rvar(args.rvar, args.stats, _read_brick_labels(rvar_img), rvar)
+        if rc:
+            return rc
         a_map = rvar[..., 0]
         b_map = rvar[..., 1]
         stdev_map = rvar[..., 3]
