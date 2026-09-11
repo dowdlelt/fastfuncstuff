@@ -49,6 +49,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from fastfuncstuff.utils import linalg_lstsq
+
 
 @dataclass
 class RestoreResult:
@@ -112,7 +114,7 @@ def restore_components(
     # lstsq rather than solve: two components can be near-duplicates after an ICA that
     # split one source, and a singular Gram should give the minimum-norm answer instead
     # of a crash the user cannot act on.
-    gammas = torch.linalg.lstsq(gram, rhs.unsqueeze(1)).solution.squeeze(1)
+    gammas = linalg_lstsq(gram, rhs.unsqueeze(1)).solution.squeeze(1)
 
     out = denoised.reshape(n_vox, n_t).clone().double()
     added = (s_sel * gammas.unsqueeze(1)).T @ a_sel.T  # (V, T)

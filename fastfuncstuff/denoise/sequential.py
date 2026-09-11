@@ -79,12 +79,12 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import dyn_chunk_estimator
-from fastfuncstuff.utils import factor_device, get_device, linalg_device
+from fastfuncstuff.utils import cpu_if_mps, factor_device, get_device, linalg_device
 
 
 def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
     """QR on a native backend, returning the reusable projector in place."""
-    qr_device = torch.device("cpu") if matrix.device.type == "mps" else matrix.device
+    qr_device = cpu_if_mps(matrix.device, "qr")
     Q, _ = torch.linalg.qr(matrix.to(qr_device))
     return Q.to(matrix.device)
 

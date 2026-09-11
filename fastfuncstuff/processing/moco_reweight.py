@@ -17,7 +17,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.design.builder import legendre_polynomials
-from fastfuncstuff.utils import linalg_device, warn_mps_float32_precision
+from fastfuncstuff.utils import linalg_device, linalg_lstsq, warn_mps_float32_precision
 
 from .affine import _build_homo_coords, identity_params, params_to_matrix_batched
 from .cost import _separable_smooth_3d
@@ -193,7 +193,7 @@ def _detrend_columns(mat: Tensor, poly: Tensor) -> Tensor:
     columns have the drift (and mean) removed.
     """
     # beta = pinv(poly) @ mat ; resid = mat - poly @ beta
-    sol = torch.linalg.lstsq(poly, mat).solution
+    sol = linalg_lstsq(poly, mat).solution
     return mat - poly @ sol
 
 

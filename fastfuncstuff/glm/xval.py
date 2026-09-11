@@ -17,7 +17,7 @@ import torch
 
 from fastfuncstuff._compile import compile_after_eager_time
 from fastfuncstuff.memory import estimate_chunk_size, get_available_memory
-from fastfuncstuff.utils import factor_device
+from fastfuncstuff.utils import cpu_if_mps, factor_device
 
 
 def compute_qr_projectors(
@@ -68,9 +68,10 @@ def compute_qr_projectors(
         run_nuisance_clean = run_nuisance[:, nonzero_mask]
 
         if run_nuisance_clean.shape[1] > 0:
-            # MPS routes QR through an implicit CPU fallback. This matrix is small;
-            # factor it explicitly on CPU and copy the reusable projector once.
-            qr_device = torch.device("cpu") if device.type == "mps" else device
+            # Metal's QR is native now but pathologically slow at tall-skinny
+            # shapes (see utils._MPS_CPU_OPS). Factor on CPU and copy the
+            # reusable projector once.
+            qr_device = cpu_if_mps(device, "qr")
             Q, _ = torch.linalg.qr(run_nuisance_clean.to(qr_device))
             Q = Q.to(device)
             q_factors.append(Q)

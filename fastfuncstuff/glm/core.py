@@ -20,7 +20,7 @@ from tqdm.auto import tqdm
 from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.design.matrices import build_task_design
 from fastfuncstuff.memory import bytes_per_voxel_glm, estimate_chunk_size, make_vram_debugger
-from fastfuncstuff.utils import get_device, linalg_device, to_tensor
+from fastfuncstuff.utils import cpu_if_mps, get_device, linalg_device, linalg_lstsq, to_tensor
 
 from .xval import cod_from_ss_residual
 
@@ -194,7 +194,7 @@ def orthogonalize_design(X: torch.Tensor, Z: torch.Tensor) -> torch.Tensor:
 
     # Project out Z from X: X_orth = X - Z * (Z'Z)^-1 * Z'X
     # Using QR for numerical stability
-    qr_device = torch.device("cpu") if Z.device.type == "mps" else Z.device
+    qr_device = cpu_if_mps(Z.device, "qr")
     Q, _ = torch.linalg.qr(Z.to(qr_device))
     Q = Q.to(Z.device)
     X_orth = X - Q @ (Q.T @ X)
@@ -238,7 +238,7 @@ def ols_betas(
     if cholesky_L is not None:
         xty = design.to(ld).T @ data.to(ld).T  # (n_regressors, n_voxels)
         return torch.cholesky_solve(xty, cholesky_L.to(ld)).to(data.device).T
-    return torch.linalg.lstsq(design.to(ld), data.T.to(ld)).solution.T.to(data.device)
+    return linalg_lstsq(design.to(ld), data.T.to(ld)).solution.T.to(data.device)
 
 
 def fit_glm_chunk(
@@ -299,7 +299,7 @@ def fit_glm_chunk(
         betas = torch.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
     else:
         try:
-            betas = torch.linalg.lstsq(design.to(ld), data.T.to(ld)).solution.T.to(device)
+            betas = linalg_lstsq(design.to(ld), data.T.to(ld)).solution.T.to(device)
         except RuntimeError:
             Q, R = torch.linalg.qr(design.to(ld))
             betas = torch.linalg.solve_triangular(R, Q.T @ data.T.to(ld), upper=True).T.to(device)

@@ -74,6 +74,7 @@ from fastfuncstuff.io.afni import (
     load_nifti,
     save_nifti,
 )
+from fastfuncstuff.utils import linalg_lstsq
 
 
 def parse_tps_windows(tps_window_args, n_conditions):
@@ -782,7 +783,7 @@ def main():
         try:
             betas_poly = torch.linalg.solve(poly_XTX, poly_XTy)  # (n_poly, n_voxels)
         except Exception:
-            betas_poly = torch.linalg.lstsq(poly_XTX, poly_XTy).solution
+            betas_poly = linalg_lstsq(poly_XTX, poly_XTy).solution
 
         betas_poly = betas_poly.T.cpu().numpy()  # (n_voxels, n_poly)
 

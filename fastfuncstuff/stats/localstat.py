@@ -47,7 +47,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.memory import get_available_memory
-from fastfuncstuff.utils import warn_mps_float32_precision
+from fastfuncstuff.utils import linalg_lstsq, warn_mps_float32_precision
 
 # ACF model is fit with at least this many distinct radius bins present; below
 # this a 3-parameter fit is meaningless.  AFNI requires >= 10 surviving
@@ -459,7 +459,7 @@ def fit_acf_batched(
             try:
                 delta = torch.linalg.solve(aug, -g.unsqueeze(-1)).squeeze(-1)
             except RuntimeError:
-                delta = torch.linalg.lstsq(aug, -g.unsqueeze(-1)).solution.squeeze(-1)
+                delta = linalg_lstsq(aug, -g.unsqueeze(-1)).solution.squeeze(-1)
 
             na = (a.squeeze(1) + delta[:, 0]).view(-1, 1)
             nb = (b.squeeze(1) + delta[:, 1]).view(-1, 1)

@@ -66,7 +66,7 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
-from fastfuncstuff.utils import get_device, parabolic_peak_offset
+from fastfuncstuff.utils import get_device, linalg_lstsq, parabolic_peak_offset
 
 AMP_RIDGE_DEFAULT = 1e-3
 """Default ridge on the amplitude solve (relative to ``mean(diag(XtX))``).
@@ -454,7 +454,7 @@ def _project_out(mat: Tensor, Z: Tensor | None) -> Tensor:
     # mat: (..., T); Z: (T, nz)
     shp = mat.shape
     flat = mat.reshape(-1, shp[-1])
-    coef = torch.linalg.lstsq(Z, flat.T).solution  # (nz, N)
+    coef = linalg_lstsq(Z, flat.T).solution  # (nz, N)
     return (flat - (Z @ coef).T).reshape(shp)
 
 

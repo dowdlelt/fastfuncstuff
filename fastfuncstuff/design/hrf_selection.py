@@ -27,7 +27,7 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, linalg_lstsq, to_tensor
 
 from .hrf import get_hrf_library
 from .matrices import build_task_design
@@ -1411,7 +1411,7 @@ def fit_glm_hrf_library_with_xval(
         # Quick OLS fit on projected data+design to show what R² looks like
         print("\nQuick OLS diagnostic (canonical design on projected data):")
         _X = projected_canonical_design.to(projected_data.device)
-        _b = torch.linalg.lstsq(_X, projected_data[: min(1000, n_voxels), :].T).solution
+        _b = linalg_lstsq(_X, projected_data[: min(1000, n_voxels), :].T).solution
         _pred = (_X @ _b).T
         _y = projected_data[: min(1000, n_voxels), :]
         _ss_res = ((_y - _pred) ** 2).sum(dim=1)
@@ -2368,7 +2368,7 @@ def _fit_voxelwise_hrf_single_trial(
 
             # OLS via lstsq (numerically stable for ill-conditioned single-trial designs)
             # full_design: (n_timepoints, n_trials + n_nuisance), data.T: (n_timepoints, n_voxels)
-            all_betas = torch.linalg.lstsq(
+            all_betas = linalg_lstsq(
                 full_design_device, chunk_data_device.T
             ).solution  # (n_full, n_voxels)
             all_betas = all_betas.T  # (n_voxels, n_full)

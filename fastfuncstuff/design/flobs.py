@@ -41,7 +41,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.design.hrf import get_spm_hrf_with_derivatives, pighs_halfcos
-from fastfuncstuff.utils import get_device, warn_mps_cpu_fallback
+from fastfuncstuff.utils import get_device, linalg_lstsq, warn_mps_cpu_fallback
 
 
 def _move_mps_to_cpu(obj: object) -> object:
@@ -744,7 +744,7 @@ def fit_basis_constrained_ridge(
         if use_chol_ols:
             beta_chunk = _solve_from_cholesky(L0, Xty_chunk)
         else:
-            beta_chunk = torch.linalg.lstsq(X_factor, y_chunk.T.cpu().double()).solution.to(
+            beta_chunk = linalg_lstsq(X_factor, y_chunk.T.cpu().double()).solution.to(
                 device=device, dtype=compute_dtype
             )
         pred = (X_full @ beta_chunk).T  # (chunk, n_t)
@@ -1353,7 +1353,7 @@ def fit_basis_cone_prior(
         b = (
             torch.cholesky_solve(Xty, L0)
             if use_chol_ols
-            else torch.linalg.lstsq(X_full, y_chunk.T).solution
+            else linalg_lstsq(X_full, y_chunk.T).solution
         )
         resid = y_chunk - (X_full @ b).T
         beta_ols_full[start:end] = b.T.cpu()
@@ -1734,7 +1734,7 @@ def cv_basis_constrained_ridge(
                     L0 = torch.linalg.cholesky(XtX)
                     beta_chunk = torch.cholesky_solve(Xty, L0)
                 except torch.linalg.LinAlgError:
-                    beta_chunk = torch.linalg.lstsq(X_train, y_train.T).solution
+                    beta_chunk = linalg_lstsq(X_train, y_train.T).solution
                 # beta_chunk: (n_task_cols, n_voxels)
                 task_betas = beta_chunk.T
             else:
@@ -3634,7 +3634,7 @@ def estimate_and_apply_arma11_prewhitening(
             L0 = torch.linalg.cholesky(XtX)
             beta = torch.cholesky_solve(Xty, L0)
         except torch.linalg.LinAlgError:
-            beta = torch.linalg.lstsq(X_full, y_dev.T).solution
+            beta = linalg_lstsq(X_full, y_dev.T).solution
 
         resid = y_dev - (X_full @ beta).T  # (n_voxels, n_tp_r)
         residual_mean_per_run.append(resid.mean(dim=0).detach().cpu().numpy())

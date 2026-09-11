@@ -9,7 +9,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import get_device, linalg_lstsq, to_tensor
 
 
 def commensurate_microtime_dt(tr: float, target_dt: float = 0.1) -> float:
@@ -2045,7 +2045,7 @@ def fit_penalized_glm_cv(
                 betas = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, n_voxels)
             except Exception:
                 # Fallback to lstsq if singular
-                betas = torch.linalg.lstsq(penalized_XTX, XTy).solution
+                betas = linalg_lstsq(penalized_XTX, XTy).solution
 
             # Predict the held-out runs
             y_pred = (X_test @ betas).T  # (n_voxels, n_test)
@@ -2181,7 +2181,7 @@ def fit_penalized_glm(
             try:
                 betas_chunk = torch.linalg.solve(penalized_XTX, XTy)  # (n_basis, chunk_voxels)
             except Exception:
-                betas_chunk = torch.linalg.lstsq(penalized_XTX, XTy).solution
+                betas_chunk = linalg_lstsq(penalized_XTX, XTy).solution
 
             betas_chunk = betas_chunk.T  # (chunk_voxels, n_basis)
 
@@ -2199,7 +2199,7 @@ def fit_penalized_glm(
                 try:
                     beta_voxel = torch.linalg.solve(penalized_XTX, XTy_voxel)
                 except Exception:
-                    beta_voxel = torch.linalg.lstsq(penalized_XTX, XTy_voxel).solution
+                    beta_voxel = linalg_lstsq(penalized_XTX, XTy_voxel).solution
 
                 betas_chunk[voxel_idx, :] = beta_voxel
 

@@ -31,6 +31,8 @@ import numpy as np
 import torch
 from scipy.linalg import toeplitz
 
+from fastfuncstuff.utils import linalg_lstsq
+
 
 def estimate_ar1_coefficient(
     residuals: torch.Tensor | np.ndarray, device: torch.device | None = None
@@ -300,7 +302,7 @@ def compute_detection_power_empirical(
     # Step 1: Estimate AR(1) coefficient if requested
     if estimate_ar1:
         # Fit OLS first
-        ols_betas = torch.linalg.lstsq(design, data).solution
+        ols_betas = linalg_lstsq(design, data).solution
         ols_residuals = data - design @ ols_betas
 
         # Estimate AR(1) from residuals
@@ -437,7 +439,7 @@ def compute_estimation_efficiency_empirical(
 
     # Step 2: Estimate AR(1)
     if estimate_ar1:
-        ols_betas = torch.linalg.lstsq(X_FIR, data).solution
+        ols_betas = linalg_lstsq(X_FIR, data).solution
         ols_residuals = data - X_FIR @ ols_betas
         rho = estimate_ar1_coefficient(ols_residuals, device=device)
     else:

@@ -43,6 +43,7 @@ except ImportError:
 
 # Import for R² metric computation
 from fastfuncstuff.glm.xval import compute_r2_metric
+from fastfuncstuff.utils import cpu_if_mps
 
 
 def _gpu_interp_fracs(
@@ -122,10 +123,10 @@ def _fit_ridge_multiple_fracs(
     n_targets = y.shape[1]
     n_fracs = len(fracs)
 
-    # MPS implements SVD through an implicit CPU fallback. Factor the shared
-    # design explicitly on CPU, then copy its reusable factors once; all
-    # voxel-scale products remain on Metal.
-    factor_device = torch.device("cpu") if device.type == "mps" else device
+    # Metal has a native SVD now, but it loses to Apple's CPU LAPACK at design
+    # sizes (see utils._MPS_CPU_OPS). Factor the shared design on CPU, then copy
+    # its reusable factors once; all voxel-scale products remain on Metal.
+    factor_device = cpu_if_mps(device, "svd")
     U, S, Vt = torch.linalg.svd(X.to(factor_device), full_matrices=False)
 
     # Handle rank-deficiency: Filter out zero/tiny singular values

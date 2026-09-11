@@ -53,6 +53,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.design.matrices import build_task_design
+from fastfuncstuff.utils import linalg_lstsq
 
 # A triple whose worst column exceeds this is refused.  4 s blocks at TR 2 land
 # at 5.9 and 10 s blocks at 1.7, so the threshold sits in the gap between "the
@@ -126,7 +127,7 @@ def column_vifs(design: torch.Tensor) -> torch.Tensor:
             vifs[j] = 1.0
             continue
         others = torch.cat([X[:, :j], X[:, j + 1 :]], dim=1)
-        beta = torch.linalg.lstsq(others, own.unsqueeze(1)).solution
+        beta = linalg_lstsq(others, own.unsqueeze(1)).solution
         ss_res = float(((own.unsqueeze(1) - others @ beta) ** 2).sum())
         # Relative, not `<= 0`: an exactly duplicated column leaves a residual
         # around 1e-31 rather than zero, and a VIF of 2e31 is infinity wearing

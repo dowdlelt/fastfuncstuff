@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from ..utils import linalg_lstsq
+
 
 class BatchOptStats(NamedTuple):
     """Optimizer-budget telemetry for one batched-patch optimization call."""
@@ -340,7 +342,7 @@ def optimize_warp_params_gauss_newton(
         try:
             delta = torch.linalg.solve(damped, grad.unsqueeze(-1)).squeeze(-1)
         except RuntimeError:
-            delta = torch.linalg.lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
+            delta = linalg_lstsq(damped, grad.unsqueeze(-1)).solution.squeeze(-1)
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
         trial = (best_params + delta).clamp(-param_max, param_max)

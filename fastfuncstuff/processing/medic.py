@@ -32,6 +32,8 @@ import torch
 from torch import Tensor
 from tqdm import tqdm
 
+from ..utils import linalg_lstsq
+
 # Map a phase-encoding direction string to a NIfTI spatial axis (0=i/x, 1=j/y,
 # 2=k/z).  The sign ("j-") only affects displacement polarity, handled later.
 PE_AXIS_MAP = {
@@ -589,7 +591,7 @@ def detrend_time(field: Tensor, order: int = 1) -> Tensor:
     nx, ny, nz, nt = field.shape
     p = construct_polynomial_matrix(nt, order, field.device, field.dtype)  # (T, order+1)
     y = field.reshape(-1, nt).t()  # (T, V)
-    betas = torch.linalg.lstsq(p, y).solution
+    betas = linalg_lstsq(p, y).solution
     resid = y - p @ betas
     return resid.t().reshape(nx, ny, nz, nt)
 
