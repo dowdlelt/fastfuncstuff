@@ -208,7 +208,11 @@ def format_report(info: DatasetInfo, st: _Style, show_history: bool = True) -> s
         if info.is_nifti
         else ""
     )
-    rows.append(("space", f"{info.space}   {xform}".rstrip()))
+    # The view is what AFNI actually dispatches on, and for a NIfTI it comes
+    # from the xform code, not from the extension's space name — so print it
+    # next to both, where a half-converted MNI file (space MNI, view +orig)
+    # is visible at a glance.
+    rows.append(("space", f"{info.space} {st.bold(info.view)}   {xform}".rstrip()))
 
     tilt = (
         st.warn(f"oblique — {info.obliquity:.3f}° from plumb")

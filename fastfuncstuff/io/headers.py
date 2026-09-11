@@ -19,6 +19,16 @@ import nibabel as nib
 
 _NIFTI_ECODE_AFNI = 4
 
+# NIfTI sform/qform xform codes (nifti1.h). For a NIfTI dataset AFNI derives the
+# +orig/+tlrc VIEW from these codes, not from the AFNI extension -- see
+# thd_niftiread.c:NIFTI_code_to_view and io/afni.py:_resolve_space_codes.
+_NIFTI_XFORM_UNKNOWN = 0
+_NIFTI_XFORM_SCANNER_ANAT = 1
+_NIFTI_XFORM_ALIGNED_ANAT = 2
+_NIFTI_XFORM_TALAIRACH = 3
+_NIFTI_XFORM_MNI_152 = 4
+_NIFTI_XFORM_TEMPLATE_OTHER = 5
+
 _XML_LABS_RE = re.compile(r'atr_name\s*=\s*"BRICK_LABS"[^>]*>\s*"([^"]+)"', re.S)
 _XML_STATAUX_RE = re.compile(
     r'<AFNI_atr[^>]*atr_name\s*=\s*"BRICK_STATAUX"[^>]*>\s*([0-9eE.+\-\s]+?)\s*</AFNI_atr>',

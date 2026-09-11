@@ -74,6 +74,21 @@ from fastfuncstuff.io.headers import (
     _NIFTI_ECODE_AFNI as _NIFTI_ECODE_AFNI,
 )
 from fastfuncstuff.io.headers import (
+    _NIFTI_XFORM_ALIGNED_ANAT as _NIFTI_XFORM_ALIGNED_ANAT,
+)
+from fastfuncstuff.io.headers import (
+    _NIFTI_XFORM_MNI_152 as _NIFTI_XFORM_MNI_152,
+)
+from fastfuncstuff.io.headers import (
+    _NIFTI_XFORM_SCANNER_ANAT as _NIFTI_XFORM_SCANNER_ANAT,
+)
+from fastfuncstuff.io.headers import (
+    _NIFTI_XFORM_TALAIRACH as _NIFTI_XFORM_TALAIRACH,
+)
+from fastfuncstuff.io.headers import (
+    _NIFTI_XFORM_TEMPLATE_OTHER as _NIFTI_XFORM_TEMPLATE_OTHER,
+)
+from fastfuncstuff.io.headers import (
     _XML_LABS_RE as _XML_LABS_RE,
 )
 from fastfuncstuff.io.headers import (
@@ -2237,6 +2252,62 @@ def _append_history_note(header: Any) -> None:
         set_afni_atr(header, "HISTORY_NOTE", entry, ni_type="String")
 
 
+# AFNI's space_name -> generic_space table (from AFNI_atlas_spaces.niml, the
+# file AFNI itself reads). Only the *generic* space decides the NIfTI xform
+# code, so every flavour of MNI collapses to "MNI" and every flavour of
+# Talairach to "TLRC". A name that isn't listed is a template AFNI doesn't know,
+# which space_to_nifti_code maps to TEMPLATE_OTHER.
+_AFNI_GENERIC_SPACE: dict[str, str] = {
+    "ORIG": "ORIG",
+    "ACPC": "ACPC",
+    "TT_N27": "TLRC",
+    "TT_avg": "TLRC",
+    "TLRC": "TLRC",
+    "MNI_152": "MNI",
+    "MNI": "MNI",
+    "MNI_ANAT": "MNI_ANAT",
+    "MNIa": "MNI_ANAT",
+    "MNI_SPM2": "MNI",
+    "MNI_FSL": "MNI",
+    "MNI_OTHER": "MNI",
+    "HaskinsPeds": "HaskinsPeds",
+    "MNI_2009c_asym": "MNI",
+    "MNI_N27": "MNI",
+}
+
+
+def space_to_nifti_code(space: str | None) -> int:
+    """AFNI template-space name -> NIfTI sform/qform code.
+
+    Port of ``thd_niftiwrite.c:space_to_NIFTI_code``: ORIG/ACPC -> 1
+    (scanner-anat), TLRC -> 3, MNI -> 4, any other named template -> 5
+    (TEMPLATE_OTHER). MNI_ANAT is deliberately 5 there, not 2 or 4.
+    """
+    if not space:
+        return _NIFTI_XFORM_SCANNER_ANAT
+    generic = _AFNI_GENERIC_SPACE.get(space, space)
+    if generic == "TLRC":
+        return _NIFTI_XFORM_TALAIRACH
+    if generic == "MNI":
+        return _NIFTI_XFORM_MNI_152
+    if generic in ("ORIG", "ACPC"):
+        return _NIFTI_XFORM_SCANNER_ANAT
+    return _NIFTI_XFORM_TEMPLATE_OTHER
+
+
+def nifti_code_to_space(code: int) -> str | None:
+    """NIfTI sform/qform code -> AFNI space name, or None when ambiguous.
+
+    Port of ``thd_niftiread.c:NIFTI_code_to_space``. Code 5 says "some
+    template" without saying which, so it gets no name back.
+    """
+    if code == _NIFTI_XFORM_TALAIRACH:
+        return "TLRC"
+    if code == _NIFTI_XFORM_MNI_152:
+        return "MNI"
+    return None
+
+
 def get_afni_space_info(header: Any) -> dict[str, str | int]:
     """Extract AFNI view code and template space from a NIfTI header.
 
@@ -2288,9 +2359,16 @@ def set_afni_space_info(
     """Set AFNI view code and template space in a NIfTI header's extension.
 
     Args:
-        header: nibabel NIfTI header (must already have an AFNI extension)
+        header: nibabel NIfTI header
         view: 0 (orig), 1 (acpc), or 2 (tlrc)
         space: Template space string, e.g. "ORIG", "MNI_2009c_asym"
+
+    TEMPLATE_SPACE is *created* when the extension doesn't carry one (a header
+    built from scratch has no space attribute at all, and a regex replace on a
+    missing attribute is a silent no-op). SCENE_DATA's view slot is only
+    rewritten where it already exists: for a NIfTI file AFNI takes the view from
+    the s/qform code, and inventing the rest of SCENE_DATA would also invent a
+    dataset type this function has no way to know.
     """
     import re
 
@@ -2313,7 +2391,7 @@ def set_afni_space_info(
             )
 
             # Update TEMPLATE_SPACE
-            xml = re.sub(
+            xml, n_space = re.subn(
                 r'(atr_name="TEMPLATE_SPACE"\s*>\s*\n\s*)"[^"]*"',
                 rf'\1"{space}"',
                 xml,
@@ -2321,7 +2399,52 @@ def set_afni_space_info(
 
             new_ext = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
             extensions[i] = new_ext
-            break
+            if not n_space:
+                set_afni_atr(header, "TEMPLATE_SPACE", space, ni_type="String")
+            return
+
+    # No AFNI extension yet — set_afni_atr makes a minimal one.
+    set_afni_atr(header, "TEMPLATE_SPACE", space, ni_type="String")
+
+
+def _resolve_space_codes(header: Any) -> tuple[int, int]:
+    """Reconcile the NIfTI s/qform codes with the AFNI extension's space.
+
+    For a NIfTI dataset AFNI reads the +orig/+tlrc VIEW from the s/qform code
+    (``thd_niftiread.c:NIFTI_code_to_view``), never from the extension; the
+    extension's TEMPLATE_SPACE only *names* the space, and is consulted for the
+    view solely when the code is 2. So the two halves of ``3drefit -space MNI
+    -view tlrc`` live in different places, and a file that inherits one without
+    the other is half-converted: an extension saying MNI_2009c_asym over a code
+    saying scanner-anat loads as +orig, and AFNI then refuses to combine it with
+    a genuine +tlrc dataset. Bug of record: -do_mni output warped correctly into
+    MNI but every stage10/stage12 file came back +orig.
+
+    Whichever half claims a template space wins, and the other is written to
+    match. Returns ``(sform_code, qform_code)``, always equal — AFNI writes them
+    that way too (thd_niftiwrite.c), for FSL's benefit.
+    """
+    if header is None:
+        return _NIFTI_XFORM_SCANNER_ANAT, _NIFTI_XFORM_SCANNER_ANAT
+
+    code = int(header["sform_code"]) or int(header["qform_code"])
+
+    space = str(get_afni_space_info(header).get("space") or "")
+    ext_code = space_to_nifti_code(space)
+
+    if ext_code > _NIFTI_XFORM_ALIGNED_ANAT:
+        # The extension names a template. It is the more specific of the two
+        # (MNI_2009c_asym vs "code 4"), so it sets the code.
+        code = ext_code
+    elif code > _NIFTI_XFORM_ALIGNED_ANAT:
+        # The code says template but the extension never said which — a bucket
+        # built on a fresh header, or one whose attributes were dropped. Name it.
+        named = nifti_code_to_space(code)
+        if named is not None:
+            set_afni_space_info(header, view=2, space=named)
+
+    code = code or _NIFTI_XFORM_SCANNER_ANAT
+    return code, code
 
 
 def set_afni_func_type(header: Any, func_code: int = 11) -> None:
@@ -3037,12 +3160,11 @@ def save_nifti(
         n_sub = data.shape[3] if data.ndim == 4 else 1
         _set_afni_brick_stataux(header, brick_stataux, n_sub)
 
-    # Carry the input's space codes across; a header we invented claims
-    # scanner-anat, which is what every grid we write actually is.
-    qcode = int(header["qform_code"]) if header is not None else 0
-    scode = int(header["sform_code"]) if header is not None else 0
-    qcode = qcode or scode or 1
-    scode = scode or qcode
+    # Carry the input's space across — and keep its two halves consistent. The
+    # NIfTI xform code and the extension's TEMPLATE_SPACE each carry part of
+    # AFNI's "-space MNI -view tlrc" pair, and a header we invented claims
+    # neither. See _resolve_space_codes.
+    scode, qcode = _resolve_space_codes(header)
 
     # Create NIfTI image
     img = nib.Nifti1Image(_to_file_order(data), affine, header=header)

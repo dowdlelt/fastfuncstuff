@@ -460,6 +460,77 @@ class TestDataTypeHandling:
         assert np.allclose(img.get_qform(), affine)
 
 
+class TestTemplateSpace:
+    """AFNI's space/view pair straddles the NIfTI header and the AFNI extension."""
+
+    @staticmethod
+    def _ext(space: str | None) -> str:
+        body = (
+            '<AFNI_atr\n  ni_type="String"\n  ni_dimen="1"\n'
+            f'  atr_name="TEMPLATE_SPACE" >\n "{space}"\n</AFNI_atr>\n'
+            if space is not None
+            else ""
+        )
+        return (
+            '<?xml version="1.0" ?>\n<AFNI_attributes\n  self_idcode="AFN_old"\n'
+            '  NIfTI_nums="5,5,5,1,1,16"\n  ni_form="ni_group" >\n'
+            f"{body}</AFNI_attributes>\n"
+        )
+
+    def _write(self, temp_output_dir, name, space, code):
+        from fastfuncstuff.io.afni import _NIFTI_ECODE_AFNI, save_nifti
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        hdr = nib.Nifti1Header()
+        hdr.set_sform(affine, code=code)
+        hdr.set_qform(affine, code=code)
+        if space is not None:
+            hdr.extensions.append(
+                nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, self._ext(space).encode())
+            )
+        out = temp_output_dir / name
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=affine, header=hdr)
+        return nib.load(str(out))
+
+    def test_extension_space_sets_the_xform_code(self, temp_output_dir):
+        """An MNI extension over a scanner-anat code reads back as +orig.
+
+        AFNI takes a NIfTI dataset's view from the xform code, never from the
+        extension (thd_niftiread.c:NIFTI_code_to_view); TEMPLATE_SPACE only
+        names the space. A warped-to-MNI file that inherited the name but not
+        the code is half-converted, and AFNI won't combine it with a real
+        +tlrc dataset. Bug of record: every -do_mni stage10/stage12 output.
+        """
+        img = self._write(temp_output_dir, "mni.nii.gz", "MNI_2009c_asym", 1)
+        assert int(img.header["sform_code"]) == 4
+        assert int(img.header["qform_code"]) == 4
+
+    def test_talairach_and_unknown_templates(self, temp_output_dir):
+        img = self._write(temp_output_dir, "tt.nii.gz", "TT_N27", 1)
+        assert int(img.header["sform_code"]) == 3
+        # A template AFNI has no generic space for -> TEMPLATE_OTHER, not MNI.
+        img = self._write(temp_output_dir, "other.nii.gz", "MNI_ANAT", 1)
+        assert int(img.header["sform_code"]) == 5
+
+    def test_orig_stays_orig(self, temp_output_dir):
+        """The reconciliation must not promote a native-space dataset."""
+        img = self._write(temp_output_dir, "orig.nii.gz", "ORIG", 1)
+        assert int(img.header["sform_code"]) == 1
+        img = self._write(temp_output_dir, "noext.nii.gz", None, 0)
+        assert int(img.header["sform_code"]) == 1
+
+    def test_xform_code_names_the_space_when_the_extension_does_not(self, temp_output_dir):
+        """The other half: a header that claims MNI but carries no space name."""
+        from fastfuncstuff.io.afni import _NIFTI_ECODE_AFNI
+
+        img = self._write(temp_output_dir, "coded.nii.gz", None, 4)
+        assert int(img.header["sform_code"]) == 4
+        xml = next(
+            e.content.decode() for e in img.header.extensions if e.get_code() == _NIFTI_ECODE_AFNI
+        )
+        assert 'atr_name="TEMPLATE_SPACE"' in xml and '"MNI"' in xml
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 

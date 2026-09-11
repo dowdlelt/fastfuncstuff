@@ -56,6 +56,24 @@ _DATUM_NAMES: dict[str, str] = {
 # carries no AFNI extension to say so itself.
 _SPACE_FROM_CODE: dict[int, str] = {0: "ORIG", 1: "ORIG", 2: "ORIG", 3: "TLRC", 4: "MNI", 5: "MNI"}
 
+
+def _view_from_code(code: int, space: str) -> str:
+    """AFNI's +orig/+acpc/+tlrc view for a NIfTI dataset.
+
+    Port of ``thd_niftiread.c:NIFTI_code_to_view``: the xform code decides,
+    and the AFNI extension's space name is consulted only for code 2. The
+    extension saying "MNI_2009c_asym" over a code of 1 is still +orig — which
+    is exactly the half-converted state this field exists to make visible.
+    """
+    if code in (3, 4, 5):
+        return "+tlrc"
+    if code == 2:
+        if space in ("", "ORIG"):
+            return "+orig"
+        return "+acpc" if space == "ACPC" else "+tlrc"
+    return "+orig"
+
+
 _XFORM_NAMES: dict[int, str] = {
     0: "unknown",
     1: "scanner",
@@ -109,6 +127,7 @@ class DatasetInfo:
     affine: np.ndarray = field(default_factory=lambda: np.eye(4))
     orient: str = "???"
     space: str = "ORIG"
+    view: str = "+orig"
     obliquity: float = 0.0
     qform_code: int = 0
     sform_code: int = 0
@@ -374,6 +393,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     info.space = space or _SPACE_FROM_CODE.get(
         int(hdr["sform_code"]) or int(hdr["qform_code"]), "ORIG"
     )
+    info.view = _view_from_code(int(hdr["sform_code"]) or int(hdr["qform_code"]), info.space)
     info.labels = read_brick_labels(hdr)
     info.history = _decode_history(_afni_atr(ext_text, "HISTORY_NOTE") or "")
     # scl_slope 0 is the NIfTI spelling of "no scaling", not a zeroing scale factor.
@@ -416,6 +436,9 @@ def _read_afni_info(p: Path, iname: str, indices: list[int] | None) -> DatasetIn
     offsets = hinfo.get("TAXIS_OFFSETS")
     info.slice_timing = [float(x) for x in offsets] if offsets else None
     info.space = str(hinfo.get("TEMPLATE_SPACE", "ORIG"))
+    # A BRIK wears its view in the filename; the AFNI extension's SCENE_DATA
+    # agrees, but the name is what AFNI itself dispatches on.
+    info.view = next((v for v in ("+tlrc", "+acpc", "+orig") if v in head.name), "+orig")
     labs = hinfo.get("BRICK_LABS")
     info.labels = str(labs).split("~") if labs else []
     info.history = str(hinfo.get("HISTORY_NOTE", "") or "")
