@@ -192,21 +192,12 @@ def _grid_sample_3d(
     mode: str = "bilinear",
     align_corners: bool = True,
 ) -> Tensor:
-    """grid_sample wrapper with MPS compatibility.
+    """grid_sample wrapper, with a threaded CPU path.
 
-    MPS doesn't support padding_mode='border', so on MPS we clamp the grid
-    to [-1, 1] and use padding_mode='zeros' instead (equivalent result since
-    all coordinates are in-bounds after clamping).
+    MPS used to lack ``padding_mode='border'`` and needed a clamp-the-grid
+    workaround; torch 2.14 samples border natively and matches the CPU to
+    1.2e-07, so every backend takes the same call now.
     """
-    if input.device.type == "mps":
-        grid = grid.clamp(-1.0, 1.0)
-        return F.grid_sample(
-            input,
-            grid,
-            mode=mode,
-            padding_mode="zeros",
-            align_corners=align_corners,
-        )
     if input.device.type == "cpu":
         threaded = _grid_sample_3d_cpu_threaded(input, grid, mode, align_corners)
         if threaded is not None:

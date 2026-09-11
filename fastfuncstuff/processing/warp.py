@@ -35,7 +35,7 @@ from torch import Tensor
 
 from .._compile import safe_compile
 from ..memory import gn_normal_eqs_voxel_chunk, plan_nonlinear_memory
-from ..utils import _prefers_cuda_batching
+from ..utils import _prefers_cuda_batching, mps_is_good_for
 
 try:
     from tqdm import tqdm as _tqdm
@@ -1194,12 +1194,15 @@ def _warpomatic(
     if config.start_level == 0:
         first_cost = state.cost
 
-        # Level 0: progressive basis complexity. CUDA and CPU use the resident
-        # batched optimizer (B=1), avoiding SciPy/Powell's repeated tensor↔NumPy
-        # boundary. MPS stays serial because 3-D grid-sample backward currently
-        # falls to CPU and makes the autograd path substantially slower.
+        # Level 0: progressive basis complexity. The resident batched optimizer
+        # (B=1) avoids SciPy/Powell's repeated tensor↔NumPy boundary, so it wins
+        # wherever grid_sample's backward is native. MPS stayed serial for years
+        # because that backward fell to the CPU; torch 2.14 runs it on Metal at
+        # ~2.7x the CPU's speed (fwd+bwd, 64³ -> 32³). Keyed to the policy table
+        # rather than hardcoded so the serial path comes back if a future torch
+        # regresses grid_sample and it lands in utils._MPS_CPU_OPS.
         lev0_bases = ["cubic_lite", "cubic", "quintic_lite"]
-        use_batched_lev0 = device.type != "mps"
+        use_batched_lev0 = device.type != "mps" or mps_is_good_for("grid_sample")
 
         if use_batched_lev0:
             lev0_patch = PatchSpec(
