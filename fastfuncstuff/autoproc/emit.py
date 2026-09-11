@@ -3261,9 +3261,14 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     for task, prs in tasks.items():
         finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         resolved = events_for_task(task, prs, bids_root, opt)
+        rbuck = f"{stem}stats-reml.task-{task}.nii$GLM_FMT"
+        # Same guard every other stage has, and the toggle it reads was already in
+        # the preamble -- it just had nothing to switch. Editing the design TOML
+        # and re-running the script is the common case, so say what to flip.
+        out.append(f'if [ "$skip_stats" -ne 1 ] || [ ! -f "{rbuck}" ]; then')
         common = [
             f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
-            f'-Rbuck "{stem}stats-reml.task-{task}.nii$GLM_FMT"',
+            f'-Rbuck "{rbuck}"',
             "-tout",
             "-fout",
             "-mask epi_mask.nii$FMT",
@@ -3288,6 +3293,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
                     "those regressors is not in this pipeline."
                 )
             out.append(_ffs("ffs_reml", [f"-input {finals}", f"-spec {spec}", *common], indent=""))
+            out.append(_stats_guard_close(task))
             continue
 
         out.append(
@@ -3320,8 +3326,24 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
                 indent="",
             )
         )
+        out.append(_stats_guard_close(task))
     out.append("fi")
     return "\n".join(out) + "\n"
+
+
+def _stats_guard_close(task: str) -> str:
+    """Close one task's skip_stats guard, naming the way back in.
+
+    The message is the point: a refit after editing the design TOML is the
+    single most common reason to re-run this script, and without it a skipped
+    stage12 looks like the GLM ran.
+    """
+    return (
+        "else\n"
+        f'  echo "stage12 task-{task}: bucket exists — skipping the GLM. '
+        'Set skip_stats=0 above (or delete it) to refit."\n'
+        "fi"
+    )
 
 
 def events_for_task(task: str, prs: list[PlanRun], bids_root: str | None, opt=None) -> list[str]:

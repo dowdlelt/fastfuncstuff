@@ -2167,3 +2167,27 @@ def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
     # A fractional FWHM keeps the token dot-free (the naming scheme is dot-delimited).
     assert blur_tag(2.5) == "blur2p5"
     assert blur_tag(None) == "" and blur_tag(0) == ""
+
+
+def test_stage12_guard_makes_skip_stats_real():
+    """skip_stats sat in the preamble switching nothing: stage12 always refit and
+    silently replaced the previous buckets. Now it guards like every other stage."""
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1"), _run("01", "bar", "2")])])
+    sh = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root="/bids")
+
+    assert "skip_stats=1" in sh  # still declared...
+    for task in ("foo", "bar"):  # ...and now read, once per task
+        guard = (
+            f'if [ "$skip_stats" -ne 1 ] || [ ! -f "stage12.stats-reml.task-{task}.nii$GLM_FMT" ]'
+        )
+        assert guard in sh
+    assert sh.count('if [ "$skip_stats" -ne 1 ]') == 2
+    # A skipped GLM says so: silence would read as "the model ran".
+    assert sh.count("skipping the GLM") == 2
+
+    # The guard keys on the tagged name, so changing -glm_blur refits without a
+    # toggle flip -- a different bucket is a different question, not a re-run.
+    blurred = write_script(
+        build_plan(subj, Options(run_glm=True, glm_blur=4.0)), "wd", bids_root="/bids"
+    )
+    assert '[ ! -f "stage12.blur4.stats-reml.task-foo.nii$GLM_FMT" ]' in blurred
