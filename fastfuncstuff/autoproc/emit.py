@@ -3239,24 +3239,36 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
     nothing to build a spec from.
     """
     from fastfuncstuff.autoproc.glm import nuisance_specs, runs_by_task, spec_path
+    from fastfuncstuff.autoproc.naming import blur_tag
 
     opt = plan.options
     tasks = runs_by_task(plan)
+    # "stage12." or "stage12.blur6." — the token rides on the buckets, not on the
+    # design, because the xmat is the same model either way.
+    tag = blur_tag(opt.glm_blur)
+    stem = f"stage12.{tag}." if tag else "stage12."
     gate = "1" if opt.run_glm else "0"
     out = ["", "# ============================ stage12: GLM (ffs_reml) ======================="]
     out.append(f"# One model per task. Runs when FFS_RUN_GLM=1 (default {gate} for this recipe).")
+    if tag:
+        out.append(
+            f"# Smoothed at {opt.glm_blur:g} mm FWHM inside the GLM (-glm_blur); stage10 stays"
+            f"\n# unsmoothed, and these buckets carry the {tag} token so an unsmoothed fit of"
+            "\n# the same task is not overwritten."
+        )
     out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
     out += _dofloss_sums(plan, tasks)
     for task, prs in tasks.items():
         finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         resolved = events_for_task(task, prs, bids_root, opt)
         common = [
-            f'-Obuck "stage12.stats-ols.task-{task}.nii$GLM_FMT"',
-            f'-Rbuck "stage12.stats-reml.task-{task}.nii$GLM_FMT"',
+            f'-Obuck "{stem}stats-ols.task-{task}.nii$GLM_FMT"',
+            f'-Rbuck "{stem}stats-reml.task-{task}.nii$GLM_FMT"',
             "-tout",
             "-fout",
             "-mask epi_mask.nii$FMT",
             "-do_scale",
+            *([f"-do_blur {opt.glm_blur:g}"] if opt.glm_blur else []),
             # -TR only when the user gave one: a 3D acquisition's header TR is the
             # per-partition time, not the volume TR the design is sampled at.
             *([f"-TR {opt.tr:g}"] if opt.tr is not None else []),

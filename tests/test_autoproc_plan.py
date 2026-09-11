@@ -2142,3 +2142,28 @@ def test_do_mni_stays_out_of_the_grandmean_chain():
     assert not any("mni" in line for line in gm), gm
     # ...and the anat-space anchor stops at the anat, too.
     assert '-nwarp "stage09.mni_nl_WARP.nii.gz stage09.mni.aff12.1D"' not in s
+
+
+def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
+    """-glm_blur smooths inside ffs_reml and labels the outputs, so a second FWHM
+    is a stage12-only re-run that does not overwrite the first fit."""
+    from fastfuncstuff.autoproc.naming import blur_tag
+
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+    plain = write_script(build_plan(subj, Options(run_glm=True)), "wd", bids_root="/bids")
+    assert "-do_blur" not in plain
+    assert '-Rbuck "stage12.stats-reml.task-foo.nii$GLM_FMT"' in plain
+
+    blurred = write_script(
+        build_plan(subj, Options(run_glm=True, glm_blur=6.0)), "wd", bids_root="/bids"
+    )
+    assert "-do_blur 6" in blurred
+    assert '-Obuck "stage12.blur6.stats-ols.task-foo.nii$GLM_FMT"' in blurred
+    assert '-Rbuck "stage12.blur6.stats-reml.task-foo.nii$GLM_FMT"' in blurred
+    # Only the GLM changes: every earlier stage is byte-identical, which is what
+    # makes "edit one parameter, re-run stage12" true.
+    assert plain.split("stage12: GLM")[0] == blurred.split("stage12: GLM")[0]
+
+    # A fractional FWHM keeps the token dot-free (the naming scheme is dot-delimited).
+    assert blur_tag(2.5) == "blur2p5"
+    assert blur_tag(None) == "" and blur_tag(0) == ""

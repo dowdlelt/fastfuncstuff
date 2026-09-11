@@ -89,6 +89,12 @@ class Options:
     # by N*TR automatically -- the design is compiled against the trimmed runs.
     glm_drop_first: int = 0
     glm_drop_last: int = 0
+    # Spatial smoothing FWHM (mm) applied inside the GLM (ffs_reml -do_blur), or
+    # None for none. Smoothing at GLM time rather than as a preprocessing stage
+    # keeps stage10 unsmoothed: the blurred fit is a *parameter of the model*, so
+    # its buckets carry a `blur<FWHM>` token (naming.blur_tag) and a re-run at a
+    # different FWHM neither re-does preprocessing nor clobbers the first fit.
+    glm_blur: float | None = None
     # Write the design TOML even if one is already there (an edited spec is
     # otherwise never clobbered — that is the whole point of generating it).
     glm_spec_overwrite: bool = False

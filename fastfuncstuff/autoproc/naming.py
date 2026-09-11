@@ -172,3 +172,17 @@ def stem(key: NameKey) -> str:
     prefix = f"stage{STAGE_NUMBERS[key.label]:02d}.{key.label}"
     c = coord(key)
     return f"{prefix}.{c}" if c else prefix
+
+
+def blur_tag(fwhm: float | None) -> str:
+    """The ``blur<FWHM>`` token for a GLM run's outputs, or ``""`` for no blur.
+
+    Sits between the stage number and the label (``stage12.blur3.stats-reml…``)
+    the way ``QC`` does, so an unblurred and a blurred fit of the same task
+    coexist in one directory and ``ls *.blur*`` is the smoothed set. The decimal
+    point becomes ``p`` (``2.5`` → ``blur2p5``): every token in this scheme is
+    dot-delimited, so a literal ``.`` inside one would make the name unparseable.
+    """
+    if not fwhm:
+        return ""
+    return "blur" + f"{float(fwhm):g}".replace(".", "p").replace("-", "m")
