@@ -2185,6 +2185,61 @@ def test_glm_blur_tags_the_buckets_and_leaves_preprocessing_alone():
     assert glm_tag(None, None) == "" and glm_tag(6.0, "  ") == "blur6"
 
 
+def test_glm_blur_per_task_overrides_the_dataset_wide_one():
+    """-glm_blur FWHM TASK smooths one task differently; the bare -glm_blur is
+    what every task it does not name gets. The blur token keeps them apart."""
+    subj = Subject(
+        "X",
+        [Session("01", [_run("01", "img", "1"), _run("01", "loc", "2"), _run("01", "rest", "3")])],
+    )
+
+    both = write_script(
+        build_plan(subj, Options(run_glm=True, glm_blur=3.0, sep_glm_blur={"img": 6.0})),
+        "wd",
+        bids_root="/bids",
+    )
+    assert '-Rbuck "stage12.blur6.stats-reml.task-img.nii$GLM_FMT"' in both
+    for task in ("loc", "rest"):
+        assert f'-Rbuck "stage12.blur3.stats-reml.task-{task}.nii$GLM_FMT"' in both
+    assert both.count("-do_blur 6") == 1 and both.count("-do_blur 3") == 2
+
+    # No bare -glm_blur: the tasks nothing names are not smoothed at all, and
+    # their buckets carry no token (they are the plain fit).
+    only = write_script(
+        build_plan(subj, Options(run_glm=True, sep_glm_blur={"img": 6.0})),
+        "wd",
+        bids_root="/bids",
+    )
+    assert only.count("-do_blur") == 1 and "-do_blur 6" in only
+    assert '-Rbuck "stage12.stats-reml.task-loc.nii$GLM_FMT"' in only
+    # The skip guard keys on the per-task name, so re-running after changing one
+    # task's FWHM refits that task and leaves the others' buckets alone.
+    assert '[ ! -f "stage12.blur6.stats-reml.task-img.nii$GLM_FMT" ]' in only
+    assert '[ ! -f "stage12.stats-reml.task-rest.nii$GLM_FMT" ]' in only
+
+
+def test_glm_blur_cli_forms():
+    """-glm_blur takes FWHM, optionally a TASK, and repeats."""
+    from fastfuncstuff.cli.autoproc import _resolve_glm_blur, build_parser
+
+    p = build_parser()
+    base = ["-bids_dir", "/b", "-subject", "X"]
+
+    def res(*argv):
+        return _resolve_glm_blur(p.parse_args(base + list(argv)))
+
+    assert res() == (None, {})
+    assert res("-glm_blur", "3") == (3.0, {})
+    assert res("-glm_blur", "3", "-glm_blur", "6", "img") == (3.0, {"img": 6.0})
+    # A task may be spelled with or without the BIDS entity prefix.
+    assert res("-glm_blur", "6", "task-img") == (None, {"img": 6.0})
+    assert res("-glm_blur", "6", "a", "-glm_blur", "2", "b") == (None, {"a": 6.0, "b": 2.0})
+    # Two tasks in one entry is a typo, and so is putting the name first.
+    for bad in (("-glm_blur", "6", "a", "b"), ("-glm_blur", "img", "6")):
+        with pytest.raises(SystemExit):
+            res(*bad)
+
+
 def test_stage12_guard_makes_skip_stats_real():
     """skip_stats sat in the preamble switching nothing: stage12 always refit and
     silently replaced the previous buckets. Now it guards like every other stage."""

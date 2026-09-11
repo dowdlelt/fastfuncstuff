@@ -545,14 +545,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument(
         "-glm_blur",
         "-glm-blur",
-        type=float,
+        action="append",
+        nargs="+",
         default=None,
-        metavar="FWHM",
+        metavar="FWHM [TASK]",
         help="spatially smooth at GLM time with a Gaussian of FWHM mm "
         "(ffs_reml -do_blur). Preprocessing stays unsmoothed, so this is one "
         "parameter you can change and re-run stage12 alone. Blurred buckets are "
         "tagged (stage12.blur6.stats-reml.task-X.nii.gz), so an unsmoothed and a "
-        "smoothed fit of the same task sit side by side.",
+        "smoothed fit of the same task sit side by side. Add a TASK to smooth "
+        "just that one, and repeat the flag: `-glm_blur 3 -glm_blur 6 ImgStim` "
+        "gives ImgStim 6 mm and every other task 3 mm. With only task-specific "
+        "entries, the tasks none of them names are not smoothed at all.",
     )
     g.add_argument(
         "-glm_mask",
@@ -1005,11 +1009,14 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             )
     # A blur of 0 or less is not a no-op request, it is a typo: -do_blur would
     # reject it downstream, an hour of preprocessing later.
-    if opt.glm_blur is not None and opt.glm_blur <= 0:
-        errors.append(
-            f"-glm_blur must be a positive FWHM in mm (got {opt.glm_blur:g}); "
-            "omit the flag for no smoothing."
-        )
+    for what, fwhm in [("-glm_blur", opt.glm_blur)] + [
+        (f"-glm_blur ... {t}", f) for t, f in sorted(opt.sep_glm_blur.items())
+    ]:
+        if fwhm is not None and fwhm <= 0:
+            errors.append(
+                f"{what} must be a positive FWHM in mm (got {fwhm:g}); "
+                "omit the flag for no smoothing."
+            )
     # The label becomes a filename token in a dot-delimited scheme, and reaches a
     # generated bash script -- so anything but [A-Za-z0-9_-] is refused here
     # rather than producing an unparseable name or a shell surprise.
@@ -1036,6 +1043,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             warnings.append(
                 f"-sep_spec_event_cols names task '{task}', which is not in this "
                 f"subject/scope ({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
+            )
+    for task in sorted(opt.sep_glm_blur):
+        if task not in all_tasks:
+            warnings.append(
+                f"-glm_blur names task '{task}', which is not in this subject/scope "
+                f"({', '.join(sorted(all_tasks)) or 'none'}) — that FWHM is never used."
             )
     # The requested event columns must exist in the files, or the design compiles
     # to nothing an hour later. Checked here; the spec writer falls back the same
@@ -1095,6 +1108,35 @@ def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
             f"  known: {', '.join(config.GLM_ORTVEC)}"
         )
     return names
+
+
+def _resolve_glm_blur(args) -> tuple[float | None, dict[str, float]]:
+    """``(dataset-wide FWHM, {task: FWHM})`` from repeated ``-glm_blur FWHM [TASK]``.
+
+    A bare FWHM is the default for every task no entry names; a task named twice
+    keeps the last. Shape errors are refused here rather than reaching a script.
+    """
+    wide: float | None = None
+    per_task: dict[str, float] = {}
+    for entry in args.glm_blur or []:
+        if len(entry) > 2:
+            raise SystemExit(
+                "ffs_autoproc: -glm_blur takes a FWHM and at most one TASK "
+                f"(got {' '.join(entry)}); repeat the flag for a second task."
+            )
+        try:
+            fwhm = float(entry[0])
+        except ValueError:
+            raise SystemExit(
+                f"ffs_autoproc: -glm_blur {entry[0]!r} is not a FWHM in mm. The "
+                "number comes first: -glm_blur 6 ImgStim."
+            ) from None
+        if len(entry) == 1:
+            wide = fwhm
+        else:
+            task = entry[1]
+            per_task[task[len("task-") :] if task.startswith("task-") else task] = fwhm
+    return wide, per_task
 
 
 def _resolve_event_cols(
@@ -1394,6 +1436,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
     event_cols, event_cols_by_task = _resolve_event_cols(args)
+    glm_blur, sep_glm_blur = _resolve_glm_blur(args)
 
     # TPM resolution: an explicit -tpm wins; else, with -suma, build one in-script
     # from FreeSurfer outputs (no ahead-of-time SPM TPM needed).
@@ -1418,7 +1461,8 @@ def main(argv: list[str] | None = None) -> int:
         glm_opts=args.glm_opts or "",
         glm_drop_first=args.glm_drop_first,
         glm_drop_last=args.glm_drop_last,
-        glm_blur=args.glm_blur,
+        glm_blur=glm_blur,
+        sep_glm_blur=sep_glm_blur,
         glm_label=args.glm_label,
         glm_mask=args.glm_mask,
         clustsim=args.clustsim,

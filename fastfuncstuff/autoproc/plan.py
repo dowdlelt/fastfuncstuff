@@ -95,6 +95,12 @@ class Options:
     # its buckets carry a `blur<FWHM>` token (naming.blur_tag) and a re-run at a
     # different FWHM neither re-does preprocessing nor clobbers the first fit.
     glm_blur: float | None = None
+    # Per-task override of the above (``-glm_blur 6 ImgStim``): a task in here is
+    # smoothed at its own FWHM, everything else at ``glm_blur``. Spatial scale is
+    # a property of the EFFECT being looked for -- a retinotopy run and a
+    # whole-brain localiser of the same session do not want the same kernel --
+    # and the tag keeps the buckets apart, so this needs no second pipeline.
+    sep_glm_blur: dict[str, float] = field(default_factory=dict)
     # Free-form token naming this model variant, sharing the blur tag's slot
     # (``stage12.fir.stats-reml.task-X.nii.gz``). What it means is the user's
     # business -- a different nuisance set, a different HRF, a hand-edited TOML;

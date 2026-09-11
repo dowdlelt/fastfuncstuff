@@ -3423,29 +3423,41 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
 
     opt = plan.options
     tasks = runs_by_task(plan)
-    # "stage12." or "stage12.blur6.noloco." — the token rides on the buckets, not
-    # on the design, because -glm_blur does not change the xmat and -glm_label
-    # only names a TOML you edited yourself.
-    tag = glm_tag(opt.glm_blur, opt.glm_label)
-    stem = f"stage12.{tag}." if tag else "stage12."
     gate = "1" if opt.run_glm else "0"
     out = ["", "# ============================ stage12: GLM (ffs_reml) ======================="]
     out.append(f"# One model per task. Runs when FFS_RUN_GLM=1 (default {gate} for this recipe).")
-    if opt.glm_blur:
-        out.append(
-            f"# Smoothed at {opt.glm_blur:g} mm FWHM inside the GLM (-glm_blur); stage10 stays"
-            "\n# unsmoothed, so re-running this stage at another FWHM re-does nothing upstream."
+    blurs = {task: _task_blur(opt, task) for task in tasks}
+    if any(blurs.values()):
+        how = (
+            f"{opt.glm_blur:g} mm FWHM"
+            if opt.glm_blur
+            else "no smoothing by default, and per task: "
         )
-    if tag:
+        per = ", ".join(
+            f"task-{t} {f:g} mm" for t, f in sorted(opt.sep_glm_blur.items()) if t in tasks
+        )
         out.append(
-            f"# These buckets carry the '{tag}' variant token, so this fit does not overwrite"
-            "\n# another variant of the same task (and the skip_stats guard below keys on it)."
+            f"# Smoothed inside the GLM (-glm_blur): {how}{'; ' + per if per and opt.glm_blur else per}."
+            "\n# stage10 stays unsmoothed, so re-running this stage at another FWHM re-does"
+            "\n# nothing upstream, and each FWHM's buckets carry their own blur token."
+        )
+    if opt.glm_label:
+        out.append(
+            f"# These buckets carry the '{opt.glm_label}' variant token, so this fit does not"
+            "\n# overwrite another variant of the same task (the skip_stats guard keys on it)."
         )
     out.append(f'if [ "${{FFS_RUN_GLM:-{gate}}}" = "1" ]; then')
     out += _dofloss_sums(plan, tasks)
     for task, prs in tasks.items():
         finals = " ".join(f'"stage10.final.{_frag(pr)}.nii$FINAL_FMT"' for pr in prs)
         resolved = events_for_task(task, prs, bids_root, opt)
+        # "stage12." or "stage12.blur6.noloco." — the token rides on the buckets,
+        # not on the design, because -glm_blur does not change the xmat and
+        # -glm_label only names a TOML you edited yourself. Per task, because the
+        # blur is: two tasks smoothed differently must not share a bucket name.
+        blur = blurs[task]
+        tag = glm_tag(blur, opt.glm_label)
+        stem = f"stage12.{tag}." if tag else "stage12."
         rbuck = f"{stem}stats-reml.task-{task}.nii$GLM_FMT"
         # Same guard every other stage has, and the toggle it reads was already in
         # the preamble -- it just had nothing to switch. Editing the design TOML
@@ -3458,7 +3470,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             "-fout",
             *(['-mask "$GLM_MASK"'] if _glm_mask(plan) else []),
             "-do_scale",
-            *([f"-do_blur {opt.glm_blur:g}"] if opt.glm_blur else []),
+            *([f"-do_blur {blur:g}"] if blur else []),
             # The ACF comes from the residuals this fit already has in memory,
             # so this needs no -Rerrts and no second pass over the data.
             *(["-clustsim"] if opt.clustsim else []),
@@ -3517,6 +3529,12 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
         out.append(_stats_guard_close(task))
     out.append("fi")
     return "\n".join(out) + "\n"
+
+
+def _task_blur(opt, task: str) -> float | None:
+    """The GLM smoothing FWHM for one task: its own ``-glm_blur FWHM TASK`` entry,
+    else the bare ``-glm_blur`` that stands for every task nothing else names."""
+    return opt.sep_glm_blur.get(task, opt.glm_blur)
 
 
 def _stats_guard_close(task: str) -> str:
