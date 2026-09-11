@@ -30,9 +30,22 @@ for the full attribution."""
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 __version__ = "0.1.0"
+
+# Let Metal hand any op it has not implemented back to the CPU instead of
+# raising. PyTorch registers that fallback from the environment when the ATen
+# MPS library loads, so it has to be set *before* torch is imported -- setting
+# it afterwards is silently too late. Importing any fastfuncstuff submodule
+# runs this package __init__ first, and nothing above imports torch, so the CLI
+# entry points and `import fastfuncstuff.x` both win the race. A caller who did
+# `import torch` first does not; utils.mps_fallback_active probes for that
+# rather than assuming, and get_device stays on the CPU when it is missing.
+# An explicit setting is respected either way -- someone debugging which op
+# fell back needs to be able to turn it off.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 
 # Every public name, mapped to the (module, attribute) it lives in. Importing
 # them eagerly meant that `import fastfuncstuff.<anything>` -- a header read, a

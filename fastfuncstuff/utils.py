@@ -6,6 +6,7 @@ Device management and helper functions
 from __future__ import annotations
 
 import contextlib
+import functools
 import os
 import threading
 import warnings
@@ -49,17 +50,25 @@ def get_device(prefer_device: str | None = None) -> torch.device:
     Select the execution device.
 
     This is a CUDA-first codebase with a first-class CPU fallback; Apple Silicon
-    (MPS) is supported as a best-effort third device. An explicitly requested
-    backend is always honoured end-to-end — we never silently override the
-    caller's choice. When no preference is given we use CUDA where available
-    and CPU otherwise. MPS remains an explicit opt-in: its incomplete operator
-    and float64 support make it a poor general default even on fast Apple GPUs.
+    (MPS) is the third supported backend. An explicitly requested backend is
+    always honoured end-to-end — we never silently override the caller's choice.
+    With no preference we auto-detect: CUDA, then MPS on Apple Silicon, then CPU.
 
-    On MPS the only hard limitation is float64 (the Metal backend has no float64
-    support at all); numerically sensitive steps fall back to CPU-float64 via
-    :func:`linalg_device`, and reduction accumulators stay on-device in float32.
+    MPS used to be an explicit opt-in because picking it meant accepting that
+    some ops would simply raise. That is no longer the trade: unimplemented ops
+    fall back to the CPU automatically (PYTORCH_ENABLE_MPS_FALLBACK, set in
+    ``fastfuncstuff/__init__.py``), and the handful of ops where Metal is broken
+    or slower than the Mac CPU are routed off it by :func:`cpu_if_mps`. So a Mac
+    user no longer has to know which of our tools happen to be Metal-friendly —
+    the default is "use the GPU for what it is good at". We still decline MPS if
+    the fallback did not arm in time (see :func:`mps_fallback_active`), since
+    without it an unimplemented op raises in the middle of a long fit.
+
+    Two things stay true on MPS. float64 is unsupported by Metal outright, so
+    numerically sensitive steps run CPU-float64 via :func:`linalg_device` and
+    reduction accumulators stay on-device in float32 (:func:`accum_dtype`).
     Users who want guaranteed full float64 precision on a Mac can pass
-    ``-device cpu``.
+    ``-device cpu``, which remains fully supported.
 
     Parameters
     ----------
@@ -102,6 +111,27 @@ def get_device(prefer_device: str | None = None) -> torch.device:
         return torch.device("cuda")
 
     if torch.backends.mps.is_available():
+        # Without the CPU fallback armed, an op Metal lacks raises rather than
+        # falling back, and auto-detect must not hand the user a device that
+        # dies partway through a fit. -device mps is still available to them.
+        if not _torch_at_least(_MPS_MIN_TORCH):
+            warnings.warn(
+                f"MPS is available but torch {torch.__version__} predates "
+                f"{_MPS_MIN_TORCH[0]}.{_MPS_MIN_TORCH[1]}, which this codebase's "
+                "Metal policy is measured against. Using CPU; upgrade torch, or "
+                "pass -device mps to override.",
+                stacklevel=2,
+            )
+            return torch.device("cpu")
+        if mps_fallback_active():
+            return torch.device("mps")
+        warnings.warn(
+            "MPS is available but the PyTorch CPU fallback did not arm (torch was "
+            "imported before fastfuncstuff, or PYTORCH_ENABLE_MPS_FALLBACK=0). "
+            "Using CPU; import fastfuncstuff before torch, or pass -device mps to "
+            "override.",
+            stacklevel=2,
+        )
         return torch.device("cpu")
 
     warnings.warn(
@@ -109,6 +139,157 @@ def get_device(prefer_device: str | None = None) -> torch.device:
         stacklevel=2,
     )
     return torch.device("cpu")
+
+
+# ---------------------------------------------------------------------------
+# MPS policy -- one table, two questions
+# ---------------------------------------------------------------------------
+# Apple Silicon is the default device on a Mac now (see get_device), so every
+# op runs on Metal unless this table says otherwise. An op earns a row for one
+# of exactly two measured reasons:
+#
+#   BROKEN  it raises on MPS. PYTORCH_ENABLE_MPS_FALLBACK -- set in
+#           fastfuncstuff/__init__.py before torch is imported -- already
+#           rescues the "not implemented for the MPS device" kind silently and
+#           automatically. It does NOT rescue a kernel that *is* registered and
+#           then fails inside Metal, which is how torch 2.14's batched SVD and
+#           lstsq break. Those need a row.
+#   SLOWER  it runs and is correct, but the CPU wins by enough to matter.
+#
+# Both are measured, never assumed: scripts/bench_mps_policy.py regenerates the
+# numbers on the machine in front of you. Keeping them in one dict is the whole
+# point -- when a torch release lands better kernels, re-run the script and
+# delete a row, rather than grepping the tree for `device.type == "mps"`.
+#
+# float64 is deliberately not in this table. That is a dtype limitation, not an
+# op one, and it has its own routing: linalg_device / accum_dtype / factor_device.
+# The torch release the table below was measured against. Auto-detect declines
+# MPS under this floor: on an older torch the native Metal linalg and 3-D
+# grid_sample this policy assumes are absent, so both halves of the table --
+# what we keep on Metal and what we route off it -- would be wrong. -device mps
+# still works for anyone who wants to override that.
+_MPS_MIN_TORCH = (2, 14)
+
+
+def _torch_at_least(minimum: tuple[int, int]) -> bool:
+    """True when the running torch is at least *minimum*, ignoring any suffix."""
+    try:
+        parts = torch.__version__.split("+", 1)[0].split(".")
+        return (int(parts[0]), int(parts[1])) >= minimum
+    except (ValueError, IndexError):
+        # An unparseable version string (a nightly, a source build) is assumed
+        # new enough -- refusing the GPU over a cosmetic string would be worse.
+        return True
+
+
+# Measured on an M4 Max (32 GPU cores), torch 2.14.0, quiet GPU. Ratios are
+# CPU-float32 time over MPS time, so "12000x slower" means MPS took that much
+# longer. Re-run scripts/bench_mps_policy.py after a torch upgrade.
+_MPS_CPU_OPS: dict[str, str] = {
+    # 2.14's Jacobi QR is a catastrophe at the tall-skinny shapes every nuisance
+    # projector in this codebase uses. Not a typo: a (2000,300) QR takes over
+    # nine minutes on Metal against 5.8 ms on the CPU.
+    "qr": "torch 2.14: (1000,60) 7166 ms vs 0.60 ms CPU (12000x slower)",
+    # Registered but broken -- these abort inside the Metal shader compiler
+    # ("Failed to created pipeline state object"), which is a runtime error
+    # rather than a missing op, so PYTORCH_ENABLE_MPS_FALLBACK does not catch
+    # it. They must be routed off MPS explicitly.
+    "svd_batched": "torch 2.14: Metal pipeline-state compile failure (not rescued by the env fallback)",
+    "lstsq": "torch 2.14: Metal pipeline-state compile failure (not rescued by the env fallback)",
+    # These all work correctly on Metal now; they are simply slower than Apple's
+    # CPU LAPACK at the matrix sizes we hand them (designs, folds, projectors).
+    "svd": "torch 2.14: (1000,200) 6.2 ms vs 4.3 ms CPU (1.5x slower)",
+    "cholesky": "torch 2.14: (500,500) 1.97 ms vs 0.20 ms CPU (10x slower)",
+    "solve": "torch 2.14: (500,500) 2.45 ms vs 0.56 ms CPU (4.3x slower)",
+    "pinv": "torch 2.14: (1000,150) 4.4 ms vs 3.0 ms CPU (1.5x slower)",
+    "eigh": "torch 2.14: (500,500) 9.0 ms vs 7.9 ms CPU (1.15x slower); the "
+    "*batched* case is 3.2x faster on MPS -- use op 'eigh_batched' for that",
+}
+
+# Ops deliberately kept on Metal, recorded so a future reader does not "fix"
+# them back onto the CPU. Measured in the same run as _MPS_CPU_OPS.
+#
+#   grid_sample 3-D   17.5x forward, 2.7x forward+backward -- new in 2.14, and
+#                     the single biggest win for registration/warping. Before
+#                     2.14 this fell back to the CPU and *lost* (0.68x).
+#   eigh (batched)    3.2x on (200,64,64)
+#   rfft              13x        elementwise   3.8x
+#   matmul (large)    3.6x       conv3d        1.7x (was 1.03x in 2.8)
+_MPS_KEEP_OPS: frozenset[str] = frozenset(
+    {"eigh_batched", "grid_sample", "fft", "conv3d", "matmul", "reduce"}
+)
+
+
+def cpu_if_mps(device: torch.device, op: str) -> torch.device:
+    """Where to run *op*: the CPU when MPS would break or lose, else *device*.
+
+    The one place the "does MPS do this well?" question gets answered. Call it
+    instead of writing ``torch.device("cpu") if device.type == "mps" else device``
+    inline -- that idiom is correct but scatters the policy across dozens of
+    files, each with its own stale comment about what Metal could do in 2024.
+
+    ``op`` must be a key of :data:`_MPS_CPU_OPS` or the literal ``"*"`` group
+    names below; an unknown name raises rather than quietly leaving the work on
+    MPS, because a typo that silently keeps a 7-second QR on Metal is exactly
+    the bug this function exists to prevent.
+    """
+    if device.type != "mps":
+        return device
+    if op in _MPS_KEEP_OPS:
+        return device
+    if op not in _MPS_CPU_OPS:
+        raise KeyError(
+            f"cpu_if_mps: unknown op {op!r}. Add it to _MPS_CPU_OPS (with a "
+            "measured reason) or _MPS_KEEP_OPS in fastfuncstuff/utils.py. "
+            "Known: " + ", ".join(sorted(set(_MPS_CPU_OPS) | _MPS_KEEP_OPS))
+        )
+    return torch.device("cpu")
+
+
+def mps_is_good_for(op: str) -> bool:
+    """True when *op* should stay on Metal. The inverse view of :data:`_MPS_CPU_OPS`.
+
+    Use it for the "should I even take this branch?" question -- picking a
+    batched algorithm over a serial one, say -- where :func:`cpu_if_mps` would
+    give you a device you do not need.
+    """
+    return op not in _MPS_CPU_OPS
+
+
+@functools.lru_cache(maxsize=1)
+def mps_fallback_active() -> bool:
+    """True when an op Metal lacks silently falls back to the CPU.
+
+    Asks the question by *doing* it rather than by inferring it from import
+    order. PyTorch registers the fallback when the ATen MPS library loads, so
+    ``import torch`` before ``import fastfuncstuff`` misses the window -- but so
+    does nothing else, and an import-order proxy gets the common case backwards:
+    a user whose shell already exports PYTORCH_ENABLE_MPS_FALLBACK=1 is armed no
+    matter when torch was imported.
+
+    ``linalg_eig`` is the canary: it has no Metal kernel, so with the fallback
+    registered it quietly computes on the CPU and without it raises
+    NotImplementedError. The environment variable is checked too, because a
+    future torch that implements eig natively would otherwise make the probe
+    succeed for the wrong reason.
+
+    Cached -- the answer cannot change within a process.
+    """
+    if not torch.backends.mps.is_available():
+        return False
+    if os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "") in ("", "0"):
+        return False
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torch.linalg.eig(torch.eye(2, device="mps"))
+    except NotImplementedError:
+        return False
+    except Exception:
+        # Some other failure (a driver hiccup, an unrelated build problem) is
+        # not evidence about the fallback; don't refuse the GPU over it.
+        return True
+    return True
 
 
 def linalg_device(device: torch.device) -> torch.device:
@@ -150,6 +331,29 @@ def factor_device(device: torch.device) -> torch.device:
     transfer would dwarf what the factorization saves.
     """
     return torch.device("cpu") if device.type in ("cuda", "mps") else device
+
+
+def linalg_lstsq(a: torch.Tensor, b: torch.Tensor, **kwargs):
+    """``torch.linalg.lstsq`` that survives Metal, returning on the input device.
+
+    torch 2.14's MPS lstsq aborts inside the Metal shader compiler for some
+    shapes and not others -- (256,32) fails every time, (1000,60) succeeds every
+    time -- and it surfaces as a RuntimeError, which is the one kind of failure
+    PYTORCH_ENABLE_MPS_FALLBACK does *not* intercept. A call site cannot know
+    which side of that line its matrix falls on, so on MPS every lstsq runs on
+    the CPU and comes back. A no-op on CUDA and CPU.
+
+    Same story for the batched SVD that lstsq drives internally; see
+    :data:`_MPS_CPU_OPS`.
+    """
+    work = cpu_if_mps(a.device, "lstsq")
+    if work == a.device:
+        return torch.linalg.lstsq(a, b, **kwargs)
+    result = torch.linalg.lstsq(a.to(work), b.to(work), **kwargs)
+    # Rebuild the named tuple on the caller's device; .solution is what almost
+    # every call site reads, but residuals/rank/singular_values must survive too.
+    # torch's return_types are structseqs: they take one sequence, not *args.
+    return type(result)([x.to(a.device) if isinstance(x, torch.Tensor) else x for x in result])
 
 
 def pinv_f64(matrix: torch.Tensor) -> torch.Tensor:

@@ -14,8 +14,14 @@ import torch
 
 from fastfuncstuff.memory import estimate_chunk_size
 from fastfuncstuff.utils import (
+    _MPS_CPU_OPS,
+    _MPS_KEEP_OPS,
+    _torch_at_least,
     calc_memory_usage,
+    cpu_if_mps,
     get_device,
+    linalg_lstsq,
+    mps_is_good_for,
     print_device_info,
     to_tensor,
 )
@@ -71,12 +77,34 @@ class TestGetDevice:
         with pytest.raises(ValueError, match="Unknown prefer_device"):
             get_device(prefer_device="tpu")
 
-    def test_auto_prefers_cpu_over_mps(self):
-        """MPS is explicit-only because its operator coverage is incomplete."""
+    def test_auto_prefers_mps_over_cpu(self):
+        """A Mac user should get the GPU without having to ask for it."""
         with mock.patch("torch.cuda.is_available", return_value=False):
             with mock.patch("torch.backends.mps.is_available", return_value=True):
-                device = get_device()
-                assert device.type == "cpu"
+                with mock.patch("fastfuncstuff.utils.mps_fallback_active", return_value=True):
+                    with mock.patch("fastfuncstuff.utils._torch_at_least", return_value=True):
+                        assert get_device().type == "mps"
+
+    def test_auto_declines_mps_without_the_cpu_fallback(self):
+        """Without the fallback armed, an op Metal lacks raises mid-fit.
+
+        Auto-detect must not hand the user a device that dies partway through a
+        long run just because torch was imported before fastfuncstuff.
+        """
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            with mock.patch("torch.backends.mps.is_available", return_value=True):
+                with mock.patch("fastfuncstuff.utils.mps_fallback_active", return_value=False):
+                    with mock.patch("fastfuncstuff.utils._torch_at_least", return_value=True):
+                        with pytest.warns(UserWarning, match="fallback did not arm"):
+                            assert get_device().type == "cpu"
+
+    def test_auto_declines_mps_on_old_torch(self):
+        """The Metal policy table is measured against a specific torch."""
+        with mock.patch("torch.cuda.is_available", return_value=False):
+            with mock.patch("torch.backends.mps.is_available", return_value=True):
+                with mock.patch("fastfuncstuff.utils._torch_at_least", return_value=False):
+                    with pytest.warns(UserWarning, match="predates"):
+                        assert get_device().type == "cpu"
 
     def test_explicit_mps_is_honoured(self):
         with mock.patch("torch.backends.mps.is_available", return_value=True):
@@ -427,3 +455,98 @@ class TestSymmetricDecorrelation:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestMPSPolicy:
+    """The single table that decides what runs on Metal (utils._MPS_CPU_OPS).
+
+    These are policy tests, not performance tests: they pin the *shape* of the
+    decision so a future edit cannot quietly send a 7-second QR back to the GPU.
+    The numbers behind the table come from scripts/bench_mps_policy.py.
+    """
+
+    def test_cpu_if_mps_is_identity_off_metal(self):
+        for dev in (torch.device("cpu"), torch.device("cuda:0")):
+            assert cpu_if_mps(dev, "qr") == dev
+            assert cpu_if_mps(dev, "grid_sample") == dev
+
+    def test_slow_and_broken_ops_leave_metal(self):
+        mps = torch.device("mps")
+        # QR is the headline: torch 2.14 runs it natively and ~12000x slower
+        # than Apple's CPU LAPACK at the tall-skinny shapes we use.
+        assert cpu_if_mps(mps, "qr").type == "cpu"
+        # Registered but aborts inside the Metal shader compiler, which the
+        # PYTORCH_ENABLE_MPS_FALLBACK env var does not intercept.
+        assert cpu_if_mps(mps, "lstsq").type == "cpu"
+        assert cpu_if_mps(mps, "svd_batched").type == "cpu"
+
+    def test_ops_metal_wins_stay_on_metal(self):
+        mps = torch.device("mps")
+        for op in ("grid_sample", "eigh_batched", "fft", "conv3d", "matmul"):
+            assert cpu_if_mps(mps, op).type == "mps", op
+
+    def test_unknown_op_raises_rather_than_defaulting_to_metal(self):
+        """A typo must not silently leave work on a backend we never measured."""
+        with pytest.raises(KeyError, match="unknown op"):
+            cpu_if_mps(torch.device("mps"), "qrr")
+
+    def test_batched_and_unbatched_eigh_disagree(self):
+        """The split that makes the table worth having.
+
+        Unbatched eigh loses to the CPU; the batched case wins by 3.2x. One
+        'is eigh ok on MPS?' answer would be wrong for one of them.
+        """
+        mps = torch.device("mps")
+        assert cpu_if_mps(mps, "eigh").type == "cpu"
+        assert cpu_if_mps(mps, "eigh_batched").type == "mps"
+
+    def test_every_reason_names_the_torch_it_was_measured_on(self):
+        """A reason without a version is folklore; it must be re-checkable."""
+        for op, reason in _MPS_CPU_OPS.items():
+            assert "torch" in reason.lower(), f"{op}: {reason!r}"
+
+    def test_keep_and_cpu_lists_are_disjoint(self):
+        assert not (set(_MPS_CPU_OPS) & set(_MPS_KEEP_OPS))
+
+    def test_mps_is_good_for_matches_the_table(self):
+        assert not mps_is_good_for("qr")
+        assert mps_is_good_for("grid_sample")
+
+    def test_torch_version_floor_parses(self):
+        assert _torch_at_least((0, 1))
+        assert not _torch_at_least((99, 0))
+
+
+class TestLinalgLstsq:
+    """lstsq must survive Metal's shape-dependent shader-compiler failure."""
+
+    def test_matches_torch_on_cpu(self):
+        torch.manual_seed(0)
+        a, b = torch.randn(64, 4), torch.randn(64, 3)
+        assert torch.allclose(linalg_lstsq(a, b).solution, torch.linalg.lstsq(a, b).solution)
+
+    def test_returns_a_full_result_tuple(self):
+        """Call sites read .solution, but the other fields must survive the trip."""
+        a, b = torch.randn(64, 4), torch.randn(64, 3)
+        result = linalg_lstsq(a, b)
+        assert hasattr(result, "solution")
+        assert hasattr(result, "residuals")
+        assert hasattr(result, "rank")
+
+    @pytest.mark.gpu
+    def test_survives_the_shape_that_kills_metal(self):
+        """(256,32) reliably aborts in the Metal shader compiler on torch 2.14.
+
+        Not a hypothetical: this exact shape raises RuntimeError through bare
+        torch.linalg.lstsq, and it is a RuntimeError rather than a
+        NotImplementedError, so PYTORCH_ENABLE_MPS_FALLBACK does not catch it.
+        """
+        if not torch.backends.mps.is_available():
+            pytest.skip("no MPS")
+        torch.manual_seed(0)
+        a = torch.randn(256, 32, device="mps")
+        b = torch.randn(256, 8, device="mps")
+        got = linalg_lstsq(a, b).solution
+        assert got.device.type == "mps"
+        expected = torch.linalg.lstsq(a.cpu(), b.cpu()).solution
+        assert torch.allclose(got.cpu(), expected, atol=1e-5)
