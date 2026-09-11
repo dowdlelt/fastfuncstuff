@@ -296,13 +296,16 @@ Examples:
         "-xmat",
         required=False,
         help="When using -spec, override the auto-derived output xmat path "
-        "(default: <specname>.xmat.1D in the spec's directory). Ignored "
-        "without -spec.",
+        "(default: <specname>.xmat.1D in the spec's directory, which is "
+        "rewritten on every run). A path named here is NOT overwritten "
+        "without -overwrite. Ignored without -spec.",
     )
     required.add_argument(
         "-overwrite",
         action="store_true",
-        help="Allow -spec compile to overwrite an existing -xmat output.",
+        help="Allow -spec compile to overwrite an existing -xmat output. Only "
+        "needed for an -xmat path you named yourself: the auto-derived "
+        "<specname>.xmat.1D is always rebuilt from the spec.",
     )
 
     # Output arguments - REML
@@ -1481,7 +1484,13 @@ def main():
             spec=str(spec_path),
             xmat=str(compiled_xmat),
             verb=0,  # quiet — our header above + the REML banner are enough
-            overwrite=args.overwrite,
+            # An auto-derived xmat is a file this tool owns and can rebuild from
+            # the spec in a second, so it is always rewritten: the whole point of
+            # -spec is that you edit the TOML and re-run the SAME command, and a
+            # stale xmat from the previous fit is not something to protect. (It
+            # used to abort here -- fatal under `bash script.sh`, which has no tty
+            # to answer the prompt.) A -xmat you named yourself still asks.
+            overwrite=args.overwrite or not args.xmat,
             # The xmat is built against the trimmed runs, so -drop_first works
             # through -spec even though the compiled result is used as -matrix.
             drop_first=int(getattr(args, "drop_first", 0) or 0),

@@ -503,6 +503,76 @@ def test_compile_refuses_to_overwrite_xmat(tmp_path):
     assert xmat.read_text() == "this is stale content\n"
 
 
+def test_reml_spec_rebuilds_its_own_xmat_but_still_guards_a_named_one(tmp_path):
+    """`ffs_reml -spec` re-run after a TOML edit must not abort on the stale xmat.
+
+    Editing the design and re-running the SAME command is the whole point of
+    -spec, and the auto-derived <specname>.xmat.1D is a file ffs_reml owns. It
+    used to hit _confirm_overwrite and exit 1 -- fatal under `bash script.sh`,
+    which has no tty to answer the prompt with. An -xmat the user named is still
+    theirs, so that one keeps asking.
+    """
+    import subprocess
+    import sys
+
+    import nibabel as nib
+
+    bold = tmp_path / "run1.nii.gz"
+    nib.Nifti1Image(np.random.rand(3, 3, 3, 40).astype(np.float32), np.eye(4)).to_filename(bold)
+    ev = tmp_path / "r01.tsv"
+    _write_events_tsv(ev, [(4.0, 2.0, "task"), (20.0, 2.0, "task")])
+    spec = Spec(
+        meta=MetaSpec(
+            runs=[RunSpec(bold=str(bold), events=str(ev))],
+            tr=1.0,
+            n_timepoints_per_run=[40],
+            polort=2,
+        ),
+        events=[EventSpec(trial_type="task", duration=2.0, hrf="SPMG1")],
+    )
+    spec_path = tmp_path / "design.toml"
+    write_spec(spec, spec_path)
+
+    def run(*extra):
+        # stdin closed on purpose: _confirm_overwrite's prompt is unanswerable
+        # without a tty, which is exactly the generated-script situation.
+        return subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-m",
+                "fastfuncstuff.cli.reml",
+                "-input",
+                str(bold),
+                "-spec",
+                str(spec_path),
+                "-Rbuck",
+                str(tmp_path / "out.nii.gz"),
+                "-device",
+                "cpu",
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+
+    auto_xmat = spec_path.with_suffix(".xmat.1D")
+    assert run().returncode == 0
+    assert auto_xmat.is_file()
+    auto_xmat.write_text("stale\n")  # stand in for "you edited the TOML"
+    second = run()
+    assert second.returncode == 0, second.stdout[-2000:] + second.stderr[-2000:]
+    assert auto_xmat.read_text() != "stale\n", "auto-derived xmat must be rebuilt"
+
+    named = tmp_path / "mine.1D"
+    named.write_text("mine\n")
+    guarded = run("-xmat", str(named))
+    assert guarded.returncode != 0
+    assert named.read_text() == "mine\n", "a user-named xmat is not clobbered"
+    assert run("-xmat", str(named), "-overwrite").returncode == 0
+
+
 def test_compile_reorders_columns_to_afni_layout(tmp_path):
     """xmat columns come out polort → stim → nuisance, matching AFNI."""
     from fastfuncstuff.cli.design_spec import _do_compile
