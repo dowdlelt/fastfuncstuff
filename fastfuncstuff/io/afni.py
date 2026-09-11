@@ -187,6 +187,111 @@ def _run_zstd_decode(filepath: str | Path, out_file, threads: int | None = None)
         )
 
 
+# sizeof_hdr as it appears in the first 4 bytes of a NIfTI file, native and
+# byte-swapped. The value is how a reader tells NIfTI-1 from NIfTI-2 and, by
+# which spelling matched, the file's endianness.
+_NIFTI1_MAGIC_SIZES = (348, 1543569408)
+_NIFTI2_MAGIC_SIZES = (540, 471072768)
+
+
+def _read_exactly(stream: Any, n: int) -> bytes:
+    """Read exactly *n* bytes from a pipe, or raise.
+
+    A pipe hands back short reads whenever the writer is mid-block, so a bare
+    ``read(n)`` silently truncates.
+    """
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        chunk = stream.readinto(view[got:])
+        if not chunk:
+            raise EOFError(f"stream ended after {got} of {n} bytes")
+        got += chunk
+    return bytes(buf)
+
+
+def _decode_zst_to_image(filepath: Path, threads: int | None) -> nib.Nifti1Image:
+    """Decode a .nii.zst straight off the zstd pipe into one array.
+
+    The alternative -- and what this replaced -- is decompressing to a temp file
+    and letting nibabel read it back, which costs a full uncompressed write plus
+    a read per run (1.5 GB each way for a typical run) and leaves the data cold
+    in page cache for the reorder that immediately follows.
+
+    Reading the header first is what makes a single allocation possible: it
+    gives the shape and dtype, so the rest of the stream lands directly in the
+    array that is returned. Peak memory is one copy of the data, never two.
+
+    Raises on anything unexpected -- a NIfTI flavour we did not anticipate, a
+    truncated stream, a scaled or non-float32 brick -- so the caller can fall
+    back to the temp-file path rather than this guessing.
+    """
+    cmd = _zstd_decode_command(filepath, threads)
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    try:
+        # bufsize=0 makes this a raw FileIO, which supports readinto; the stub
+        # only promises the buffered IO[Any] interface.
+        stream: Any = proc.stdout
+        assert stream is not None
+
+        head = _read_exactly(stream, 4)
+        sizeof_hdr = int(np.frombuffer(head, dtype="<i4")[0])
+        if sizeof_hdr in _NIFTI1_MAGIC_SIZES:
+            hdr_cls: Any = nib.Nifti1Header
+            hdr_len = 348
+        elif sizeof_hdr in _NIFTI2_MAGIC_SIZES:
+            hdr_cls = nib.Nifti2Header
+            hdr_len = 540
+        else:
+            raise ValueError(f"{filepath}: not a NIfTI stream (sizeof_hdr={sizeof_hdr})")
+
+        # Header, then everything up to vox_offset -- the AFNI extension lives
+        # in that gap. Parse twice: the first pass only to learn where the data
+        # starts, the second over the whole block so the extensions come with it.
+        prefix = head + _read_exactly(stream, hdr_len - 4)
+        offset = int(hdr_cls.from_fileobj(io.BytesIO(prefix), check=False).get_data_offset())
+        if offset > len(prefix):
+            prefix += _read_exactly(stream, offset - len(prefix))
+        header = hdr_cls.from_fileobj(io.BytesIO(prefix), check=False)
+
+        shape = tuple(int(d) for d in header.get_data_shape())
+        dtype = np.dtype(header.get_data_dtype())
+        # nibabel's rule: a slope of 0 or NaN means "no scaling recorded".
+        slope = float(header["scl_slope"]) if np.isfinite(header["scl_slope"]) else 0.0
+        inter = float(header["scl_inter"]) if np.isfinite(header["scl_inter"]) else 0.0
+        if (slope not in (0.0, 1.0)) or inter != 0.0:
+            raise ValueError(f"{filepath}: scaled data, leave it to nibabel")
+
+        # Allocate flat and C-contiguous so the raw bytes can be read straight
+        # in; the F-order reshape that follows is a stride change, not a copy,
+        # and gives the x-fastest layout NIfTI stores.
+        flat = np.empty(int(np.prod(shape)) if shape else 0, dtype=dtype)
+        view = memoryview(flat).cast("B")
+        got = 0
+        while got < flat.nbytes:
+            chunk = stream.readinto(view[got:])
+            if not chunk:
+                raise EOFError(f"{filepath}: stream ended after {got} of {flat.nbytes} data bytes")
+            got += chunk
+        data = flat.reshape(shape, order="F")
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+        err = proc.stderr.read() if proc.stderr is not None else b""
+        if proc.stderr is not None:
+            proc.stderr.close()
+        rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"{cmd[0]} failed on {filepath}: {err.decode(errors='replace')[:200]}")
+
+    # float32 for the same reason the temp-file path passed dtype to get_fdata:
+    # float64 doubles peak RAM per volume for no benefit on a 4D load.
+    if data.dtype != np.float32:
+        data = data.astype(np.float32)
+    return nib.Nifti1Image(data, header.get_best_affine(), header)
+
+
 def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
@@ -234,40 +339,10 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
     if str(filepath).endswith(".nii.zst"):
         _require_zstd()
 
-        # Decompress to temporary file
-        with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
-            tmp_path = tmp.name
-
         try:
-            # Pzstd-written files contain independent frames and decode in
-            # parallel. Stock-zstd files and installations without pzstd take
-            # the unchanged serial fallback path.
-            with open(tmp_path, "wb") as out_file:
-                _run_zstd_decode(filepath, out_file, zstd_threads)
-
-            # Load the decompressed file
-            img = nib.load(tmp_path)
-            # nib.load()'s stub return type is the loose FileBasedImage base;
-            # a .nii is always a real Nifti1Image/Nifti2Image at runtime.
-            assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
-
-            # Load data into memory and create new image to avoid lazy loading issues
-            # This ensures the temp file can be safely deleted. Read as float32:
-            # get_fdata() defaults to float64, which doubles peak RAM per volume
-            # (catastrophic for whole-dataset 4D loads) for no benefit -- callers
-            # that need float64 recast downstream.
-            data = img.get_fdata(dtype=np.float32)
-            affine = img.affine
-            header = img.header.copy()
-
-            # Create new image from in-memory data
-            img_inmem = nib.Nifti1Image(data, affine, header)
-
-        finally:
-            # Clean up temporary file
-            Path(tmp_path).unlink(missing_ok=True)
-
-        img_out = img_inmem
+            img_out = _decode_zst_to_image(filepath, zstd_threads)
+        except Exception:
+            img_out = _load_zst_via_tempfile(filepath, zstd_threads)
 
     else:
         # Standard nibabel loading for .nii and .nii.gz
@@ -276,34 +351,71 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         # Nifti1Image, matching the .nii.zst branch above.
         assert isinstance(img_out, nib.Nifti1Image)
 
-    # Apply sub-brick selection if requested
-    if indices is not None:
-        data = np.asarray(img_out.dataobj)
-        if data.ndim < 4:
-            raise ValueError(f"Sub-brick selector requires a 4D image, got {data.ndim}D")
-        # AFNI buckets are not always stored along dim[4]: MNI152_2009_template_SSW
-        # is (x,y,z,1,5) — five sub-bricks in dim[5] with a singleton time axis.
-        # Selecting on axis 3 there returns the whole bucket (a 1-long axis indexed
-        # by [0]), which is how `template.nii.gz[0]` silently became all five
-        # volumes instead of the skull-off one.
-        axis = 4 if data.ndim > 4 and data.shape[3] == 1 else 3
-        resolved = _resolve_indices(indices, data.shape[axis])
-        data = (
-            np.squeeze(np.take(data, resolved, axis=axis), axis=3)
-            if axis == 4
-            else data[:, :, :, resolved]
-        )
-        header = img_out.header.copy()
-        # Update dim[4] for the new volume count
-        if data.ndim == 4:
-            header["dim"][4] = data.shape[3]
-        elif data.ndim == 3:
-            header["dim"][4] = 1
-        header["dim"][0] = data.ndim
-        header["dim"][5] = 1
-        img_out = nib.Nifti1Image(data, img_out.affine, header)
+    return _apply_selector_to_image(img_out, indices)
 
-    return img_out
+
+def _load_zst_via_tempfile(filepath: Path, zstd_threads: int | None) -> nib.Nifti1Image:
+    """Decompress to a temp file and let nibabel read it back.
+
+    The fallback for anything :func:`_decode_zst_to_image` declines to handle
+    (scaled bricks, an unfamiliar NIfTI flavour, a pzstd that dies mid-stream):
+    slower by a full uncompressed write and read, but it delegates every parsing
+    decision to nibabel.
+    """
+    with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as tmp:
+        tmp_path = tmp.name
+
+    try:
+        # Pzstd-written files contain independent frames and decode in
+        # parallel. Stock-zstd files and installations without pzstd take
+        # the unchanged serial fallback path.
+        with open(tmp_path, "wb") as out_file:
+            _run_zstd_decode(filepath, out_file, zstd_threads)
+
+        img = nib.load(tmp_path)
+        # nib.load()'s stub return type is the loose FileBasedImage base;
+        # a .nii is always a real Nifti1Image/Nifti2Image at runtime.
+        assert isinstance(img, (nib.Nifti1Image, nib.Nifti2Image))
+
+        # Materialise before the temp file goes away. Read as float32:
+        # get_fdata() defaults to float64, which doubles peak RAM per volume
+        # (catastrophic for whole-dataset 4D loads) for no benefit -- callers
+        # that need float64 recast downstream.
+        data = img.get_fdata(dtype=np.float32)
+        return nib.Nifti1Image(data, img.affine, img.header.copy())
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+def _apply_selector_to_image(img_out: nib.Nifti1Image, indices: list | None) -> nib.Nifti1Image:
+    """Apply a parsed AFNI sub-brick selector to a loaded image."""
+    if indices is None:
+        return img_out
+
+    data = np.asarray(img_out.dataobj)
+    if data.ndim < 4:
+        raise ValueError(f"Sub-brick selector requires a 4D image, got {data.ndim}D")
+    # AFNI buckets are not always stored along dim[4]: MNI152_2009_template_SSW
+    # is (x,y,z,1,5) — five sub-bricks in dim[5] with a singleton time axis.
+    # Selecting on axis 3 there returns the whole bucket (a 1-long axis indexed
+    # by [0]), which is how `template.nii.gz[0]` silently became all five
+    # volumes instead of the skull-off one.
+    axis = 4 if data.ndim > 4 and data.shape[3] == 1 else 3
+    resolved = _resolve_indices(indices, data.shape[axis])
+    data = (
+        np.squeeze(np.take(data, resolved, axis=axis), axis=3)
+        if axis == 4
+        else data[:, :, :, resolved]
+    )
+    header = img_out.header.copy()
+    # Update dim[4] for the new volume count
+    if data.ndim == 4:
+        header["dim"][4] = data.shape[3]
+    elif data.ndim == 3:
+        header["dim"][4] = 1
+    header["dim"][0] = data.ndim
+    header["dim"][5] = 1
+    return nib.Nifti1Image(data, img_out.affine, header)
 
 
 def read_afni_onset_file(filepath: str | Path) -> list[np.ndarray]:

@@ -169,6 +169,66 @@ class TestZstRoundtrip:
         assert np.allclose(img.get_fdata(), data, rtol=1e-5)
         assert np.allclose(img.affine, affine)
 
+    def test_in_memory_decode_matches_the_tempfile_path(self, temp_output_dir):
+        """The streaming decoder must agree with nibabel byte for byte.
+
+        It parses the NIfTI header itself so the rest of the stream can land
+        directly in the returned array -- one allocation, and no uncompressed
+        temp file written and read back per run. That earns it the burden of
+        proving it reproduces the path that delegates parsing to nibabel,
+        extensions and all.
+        """
+        import shutil
+
+        if shutil.which("zstd") is None:
+            pytest.skip("zstd not on PATH")
+        from fastfuncstuff.io.afni import (
+            _decode_zst_to_image,
+            _load_zst_via_tempfile,
+            save_nifti,
+        )
+
+        rng = np.random.default_rng(0)
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        affine[:3, 3] = [-40.0, 30.0, -20.0]
+        for name, data in (
+            ("vol4d.nii.zst", rng.normal(size=(7, 6, 5, 4)).astype(np.float32)),
+            ("vol3d.nii.zst", rng.normal(size=(7, 6, 5)).astype(np.float32)),
+        ):
+            out = temp_output_dir / name
+            save_nifti(data, str(out), affine=affine, tr=1.5, brick_labels=None)
+
+            fast = _decode_zst_to_image(out, 2)
+            slow = _load_zst_via_tempfile(out, 2)
+            assert np.array_equal(np.asarray(fast.dataobj), np.asarray(slow.dataobj))
+            assert np.asarray(fast.dataobj).dtype == np.float32
+            assert np.allclose(fast.affine, slow.affine)
+            assert np.allclose(fast.header.get_zooms(), slow.header.get_zooms())
+            # The AFNI extension lives between the header and vox_offset, which
+            # is exactly the span the streaming reader has to walk past.
+            assert [e.get_code() for e in fast.header.extensions] == [
+                e.get_code() for e in slow.header.extensions
+            ]
+
+    def test_in_memory_decode_refuses_scaled_data(self, temp_output_dir):
+        """A scl_slope must send the caller to nibabel, not get silently ignored."""
+        import shutil
+        import subprocess
+
+        if shutil.which("zstd") is None:
+            pytest.skip("zstd not on PATH")
+        from fastfuncstuff.io.afni import _decode_zst_to_image
+
+        img = nib.Nifti1Image(np.arange(24, dtype=np.int16).reshape(2, 3, 4), np.eye(4))
+        img.header["scl_slope"] = 2.0
+        img.header["scl_inter"] = 1.0
+        plain = temp_output_dir / "scaled.nii"
+        img.to_filename(str(plain))
+        subprocess.run(["zstd", "-q", "-f", str(plain), "-o", str(plain) + ".zst"], check=True)
+
+        with pytest.raises(ValueError, match="scaled"):
+            _decode_zst_to_image(Path(str(plain) + ".zst"), 1)
+
     def test_decode_command_uses_only_its_cpu_share(self, monkeypatch):
         from fastfuncstuff.io import afni
 
