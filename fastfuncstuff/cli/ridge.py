@@ -1192,7 +1192,7 @@ def main():
             polort=args.polort,
             trial_labels=trial_labels,
             autoscale=args.autoscale,
-            chunk_size=args.chunk_size,
+            chunk_size=args.chunk_size if args.chunk_size > 0 else None,
             device=device,
             verbose=args.verb >= 1,
         )
