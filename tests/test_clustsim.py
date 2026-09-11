@@ -339,6 +339,22 @@ def test_reml_clustsim_attaches_tables_and_survives_adjust_dof(tmp_path):
     # -clustsim needs no -save_acf: it turns the residual ACF path on itself.
     assert not list(tmp_path.glob("*.blur_est_*"))
 
+    # The twenty side files live in their own directory. They share the bucket's
+    # stem, so left loose they bury it -- and make it a tab-completion neighbour
+    # of theirs, which is how a bucket gets passed to concalc as -rvar.
+    side = tmp_path / "stats_clustsim"
+    assert side.is_dir()
+    assert len(list(side.glob("*.niml"))) == 9  # 3 NN x 3 sidedness
+    assert len(list(side.glob("*.1D"))) == 9
+    assert (side / "stats.mask").is_file()
+    assert not list(tmp_path.glob("*.niml")), "side files must not sit beside the bucket"
+    assert sorted(p.name for p in tmp_path.glob("stats*")) == [
+        "stats.json",
+        "stats.nii.gz",
+        "stats_clustsim",
+        "stats_ffsremlvar.nii.gz",
+    ]
+
     # ... and the tables outlive the dof rewrite, which is what the ordering buys.
     adjusted = tmp_path / "s2.nii.gz"
     run(adjusted, "-adjust_dof", "5")

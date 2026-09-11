@@ -443,9 +443,10 @@ Examples:
         dest="clustsim_prefix",
         metavar="PREFIX",
         help="Where to write the -clustsim .1D / .niml / .mask side files "
-        "(default: the stat bucket's own path minus its extension, plus "
-        "'.CStemp'). The tables are in the header either way; these are the "
-        "readable copy.",
+        "(default: a <bucket>_clustsim/ directory beside the bucket). There are "
+        "twenty of them and they share the bucket's stem, so they get their own "
+        "folder rather than burying it. The tables are in the bucket's header "
+        "either way; these are the readable copy.",
     )
     diag_out.add_argument(
         "-adjust_dof",
@@ -4360,9 +4361,12 @@ def _run_clustsim(args, diag, device) -> None:
         if target is None:
             continue
         a, b, c, fwhm = acf_vals
-        prefix = args.clustsim_prefix or (
-            replace_afni_extension(target, "").removesuffix(".nii") + ".CStemp"
-        )
+        # Its own directory. Twenty .1D/.niml/.mask files sharing the bucket's
+        # stem drown the results folder and, worse, make the bucket itself a
+        # tab-completion neighbour of them -- which is how a stats bucket ends up
+        # passed to ffs_util_concalc as -rvar.
+        stem = replace_afni_extension(target, "").removesuffix(".nii")
+        prefix = args.clustsim_prefix or str(Path(stem + "_clustsim") / Path(stem).name)
         print(
             f"  • {target}\n"
             f"    ACF({a:.4f}, {b:.4f}, {c:.4f}) from the {label.upper()} residuals, "
