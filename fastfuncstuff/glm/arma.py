@@ -4545,6 +4545,8 @@ def fit_glm_arma11(
                 results.ols_results.voxel_mask = spatial_metadata["voxel_mask"]
             if "affine" in spatial_metadata:
                 results.ols_results.affine = spatial_metadata["affine"]
+            if "nifti_header" in spatial_metadata:
+                results.ols_results.nifti_header = spatial_metadata["nifti_header"]
 
         # Write OLS results immediately if callback provided (frees memory!)
         if ols_write_callback is not None:

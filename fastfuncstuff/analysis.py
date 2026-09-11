@@ -1344,6 +1344,15 @@ def analyze_from_design_matrix(
             spatial_metadata["voxel_mask"] = mask_tensor
         if affine is not None:
             spatial_metadata["affine"] = affine
+        if nifti_header is not None:
+            # The OLS bucket is written from inside the fit (the callback below
+            # frees the OLS arrays early), long before the header is attached to
+            # the merged results at the end of this function. Without it here the
+            # bucket is built on a blank nibabel header: no AFNI extension, so no
+            # TEMPLATE_SPACE, so an MNI-warped input writes its stats out as
+            # +orig/ORIG while the REML bucket from the same command comes out
+            # +tlrc/MNI_2009c_asym.
+            spatial_metadata["nifti_header"] = nifti_header
 
         # Grouped designs: per-voxel HRF and/or slicewise (-slibase). Both assign a
         # design to each voxel-group; combined, the group is (HRF, slice). Build
