@@ -605,3 +605,205 @@ def _plan_batch(sim: NullFieldSimulator, n_iter: int) -> int:
         per_field = max(per_field, 48 * int(sim.mask.sum()))
     n = max(2, budget // max(per_field, 1))
     return int(min(n, n_iter, 4096))
+
+
+# ---------------------------------------------------------------------------
+# Tables, and attaching them to a stats dataset
+# ---------------------------------------------------------------------------
+
+
+def _prob6(p: float) -> str:
+    """AFNI ``prob6``: a p-value in exactly 6 characters (column headers)."""
+    if p >= 0.00010:
+        return f"{p:7.5f}"[1:]
+    dec = int(0.9999 - math.log10(p))
+    return f"{p * 10.0**dec:4.1f}e-{dec:1d}"[1:]
+
+
+def _prob9(p: float) -> str:
+    """AFNI ``prob9``: a p-value in exactly 9 characters (row labels)."""
+    if p >= 0.00010:
+        return f"{p:9.6f}"
+    dec = int(0.9999 - math.log10(p))
+    return f"{p * 10.0**dec:6.3f}e-{dec:1d}"
+
+
+def write_1d_table(
+    path,
+    table: np.ndarray,
+    *,
+    nn: int,
+    sidedness: str,
+    pthr: tuple[float, ...],
+    athr: tuple[float, ...],
+    shape: tuple[int, int, int],
+    voxmm: tuple[float, float, float],
+    mask_count: int,
+    commandline: str,
+    nodec: bool,
+) -> None:
+    """Write one ``ppp.NN{n}_{sided}.1D``.
+
+    Byte-for-byte 3dClustSim's layout, down to ``prob9``/``prob6`` and the
+    ``%7.1f`` cells, because these files are read by eye and by afni_proc.
+    """
+    from pathlib import Path
+
+    n_total = int(np.prod(shape))
+    in_mask = " in mask" if mask_count < n_total else ""
+    lines = [
+        f"# {commandline}",
+        f"# {sidedness} thresholding",
+        "# Grid: {}x{}x{} {:.2f}x{:.2f}x{:.2f} mm^3 ({} voxels{})".format(
+            *shape, *voxmm, mask_count, in_mask
+        ),
+        "#",
+        "# CLUSTER SIZE THRESHOLD(pthr,alpha) in Voxels",
+        f"# -NN {nn}  | alpha = Prob(Cluster >= given size)",
+        "#  pthr  |" + "".join(f" {_prob6(a)}" for a in athr),
+        "# ------ |" + " ------" * len(athr),
+    ]
+    for i, p in enumerate(pthr):
+        cells = ""
+        for v in table[i]:
+            if nodec:
+                cells += f"{int(v):7d}"  # already rounded by gumbel_extent_table
+            elif v <= 9999.9:
+                cells += f"{v:7.1f}"
+            else:
+                cells += f"{v:7.0f}"
+        lines.append(f"{_prob9(p)} {cells}")
+    Path(path).write_text("\n".join(lines) + "\n")
+
+
+def print_table_summary(null, nns, sideds, pthr, athr, niter, stream=None) -> None:
+    """Echo the first NN/sidedness table — the one people read off the terminal."""
+    import sys
+
+    stream = stream or sys.stderr
+    sided, nn = sideds[0], nns[0]
+    table = gumbel_extent_table(null.max_extent[(sided, nn)], athr, niter)
+    print(f"\n# NN{nn} {sided} — cluster size threshold (voxels)", file=stream)
+    print("#  pthr  | " + " ".join(f"{a:.5f}"[1:].rjust(6) for a in athr), file=stream)
+    print("# ------ | " + " ".join("------" for _ in athr), file=stream)
+    for i, p in enumerate(pthr):
+        print(f" {p:.6f} " + " ".join(f"{v:6.1f}" for v in table[i]), file=stream)
+    print("", file=stream)
+
+
+#: NIML `thresholding` keeps the hyphen; filenames and 3drefit attributes don't.
+SIDED_ATTR = {"1-sided": "1sided", "2-sided": "2sided", "bi-sided": "bisided"}
+
+
+def attach_clustsim_tables(
+    mask: np.ndarray,
+    voxmm: tuple[float, float, float],
+    acf: ACF,
+    *,
+    prefix,
+    refit=None,
+    n_iter: int = 10000,
+    pthr: tuple[float, ...] = DEFAULT_CS_PTHR,
+    athr: tuple[float, ...] = DEFAULT_CS_ATHR,
+    nns: tuple[int, ...] = (1, 2, 3),
+    sideds: tuple[str, ...] = ("1-sided", "2-sided", "bi-sided"),
+    device=None,
+    n_jobs: int | None = None,
+    batch: int | None = None,
+    seed: int | None = None,
+    on_device: bool | None = None,
+    nodec: bool = False,
+    commandline: str = "",
+    mask_name: str = "<inline>",
+    mask_idcode: str | None = None,
+    summary: bool = True,
+    verbose: bool = True,
+) -> dict:
+    """Simulate the null, write the ``.1D``/``.niml``/``.mask`` set, and refit.
+
+    The whole of ``ffs_clustsim`` downstream of "what is the ACF": both the CLI
+    and ``ffs_reml -clustsim`` enter here, so a table attached during a GLM fit
+    and one attached afterwards are produced by the same code, not by two
+    spellings of it.
+
+    ``mask`` is a boolean volume, ``prefix`` the output stem. Returns the
+    ``{(NN, sided_attr): niml path}`` map that was injected into ``refit``.
+    """
+    from pathlib import Path
+
+    from fastfuncstuff.stats.niml import run_refit, write_clustsim_niml, write_mask_b64
+
+    prefix = Path(prefix)
+    out_dir = prefix.parent
+    base = prefix.name
+    out_dir.mkdir(parents=True, exist_ok=True)
+    shape = tuple(int(s) for s in mask.shape)
+
+    null = simulate_cluster_null(
+        mask,
+        voxmm,
+        acf,
+        n_iter=n_iter,
+        pthr=pthr,
+        athr=athr,
+        nns=nns,
+        sideds=sideds,
+        device=device,
+        n_jobs=n_jobs,
+        batch=batch,
+        seed=seed,
+        on_device=on_device,
+        verbose=verbose,
+    )
+
+    mask_b64 = out_dir / f"{base}.mask"
+    mask_count = write_mask_b64(mask_b64, mask)
+
+    niml_files: dict[tuple[int, str], Path] = {}
+    for sided in sideds:
+        for nn in nns:
+            table = gumbel_extent_table(null.max_extent[(sided, nn)], athr, n_iter, nodec=nodec)
+            tag = SIDED_ATTR[sided]
+            write_1d_table(
+                out_dir / f"{base}.NN{nn}_{tag}.1D",
+                table,
+                nn=nn,
+                sidedness=sided,
+                pthr=pthr,
+                athr=athr,
+                shape=shape,
+                voxmm=voxmm,
+                mask_count=mask_count,
+                commandline=commandline,
+                nodec=nodec,
+            )
+            niml_path = out_dir / f"{base}.NN{nn}_{tag}.niml"
+            write_clustsim_niml(
+                niml_path,
+                table,
+                nn=nn,
+                sidedness=sided,
+                commandline=commandline,
+                nxyz=shape,
+                dxyz=voxmm,
+                pthr=pthr,
+                athr=athr,
+                n_perms=n_iter,
+                mask_count=mask_count,
+                mask_idcode=mask_idcode,
+                mask_name=mask_name,
+            )
+            niml_files[(nn, tag)] = niml_path
+
+    if summary and verbose:
+        print_table_summary(null, nns, sideds, pthr, athr, n_iter)
+
+    if refit is not None:
+        run_refit(
+            stat_path=Path(refit),
+            niml_files=niml_files,
+            mask_b64_path=mask_b64,
+            write_script_path=out_dir / f"{base}.3drefit.cmd",
+            verbose=verbose,
+        )
+    return niml_files

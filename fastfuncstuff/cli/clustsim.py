@@ -27,7 +27,6 @@ degrees of freedom.
 
 from __future__ import annotations
 
-import math
 import sys
 import time
 from pathlib import Path
@@ -36,9 +35,8 @@ import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 
-# Sidedness spellings: the hyphenated form is what the NIML `thresholding`
-# attribute carries; the bare form names the file and the 3drefit attribute.
-_SIDED_ATTR = {"1-sided": "1sided", "2-sided": "2sided", "bi-sided": "bisided"}
+# The hyphenated spelling is what the NIML `thresholding` attribute carries; the
+# bare form (stats.clustsim.SIDED_ATTR) names the file and the 3drefit attribute.
 _SIDED_FROM_CLI = {"1sided": "1-sided", "2sided": "2-sided", "bisided": "bi-sided"}
 
 
@@ -184,73 +182,6 @@ def build_parser() -> FfsArgumentParser:
 
 
 # ---------------------------------------------------------------------------
-# .1D table, in 3dClustSim's layout
-# ---------------------------------------------------------------------------
-
-
-def _prob6(p: float) -> str:
-    """AFNI ``prob6``: a p-value in exactly 6 characters (column headers)."""
-    if p >= 0.00010:
-        return f"{p:7.5f}"[1:]
-    dec = int(0.9999 - math.log10(p))
-    return f"{p * 10.0**dec:4.1f}e-{dec:1d}"[1:]
-
-
-def _prob9(p: float) -> str:
-    """AFNI ``prob9``: a p-value in exactly 9 characters (row labels)."""
-    if p >= 0.00010:
-        return f"{p:9.6f}"
-    dec = int(0.9999 - math.log10(p))
-    return f"{p * 10.0**dec:6.3f}e-{dec:1d}"
-
-
-def write_1d_table(
-    path: Path,
-    table: np.ndarray,
-    *,
-    nn: int,
-    sidedness: str,
-    pthr: tuple[float, ...],
-    athr: tuple[float, ...],
-    shape: tuple[int, int, int],
-    voxmm: tuple[float, float, float],
-    mask_count: int,
-    commandline: str,
-    nodec: bool,
-) -> None:
-    """Write one ``ppp.NN{n}_{sided}.1D``.
-
-    Byte-for-byte 3dClustSim's layout, down to ``prob9``/``prob6`` and the
-    ``%7.1f`` cells, because these files are read by eye and by afni_proc.
-    """
-    n_total = int(np.prod(shape))
-    in_mask = " in mask" if mask_count < n_total else ""
-    lines = [
-        f"# {commandline}",
-        f"# {sidedness} thresholding",
-        "# Grid: {}x{}x{} {:.2f}x{:.2f}x{:.2f} mm^3 ({} voxels{})".format(
-            *shape, *voxmm, mask_count, in_mask
-        ),
-        "#",
-        "# CLUSTER SIZE THRESHOLD(pthr,alpha) in Voxels",
-        f"# -NN {nn}  | alpha = Prob(Cluster >= given size)",
-        "#  pthr  |" + "".join(f" {_prob6(a)}" for a in athr),
-        "# ------ |" + " ------" * len(athr),
-    ]
-    for i, p in enumerate(pthr):
-        cells = ""
-        for v in table[i]:
-            if nodec:
-                cells += f"{int(v):7d}"  # already rounded by gumbel_extent_table
-            elif v <= 9999.9:
-                cells += f"{v:7.1f}"
-            else:
-                cells += f"{v:7.0f}"
-        lines.append(f"{_prob9(p)} {cells}")
-    path.write_text("\n".join(lines) + "\n")
-
-
-# ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------
 
@@ -267,16 +198,10 @@ def main(argv: list[str] | None = None) -> int:
         LOTS_ATHR,
         LOTS_PTHR,
         acf_fwhm,
-        gumbel_extent_table,
+        attach_clustsim_tables,
         random_field_grid,
-        simulate_cluster_null,
     )
-    from fastfuncstuff.stats.niml import (
-        resolve_mask_idcode,
-        run_refit,
-        write_clustsim_niml,
-        write_mask_b64,
-    )
+    from fastfuncstuff.stats.niml import resolve_mask_idcode
 
     t_start = time.time()
     verb = getattr(args, "verb", 1)
@@ -316,11 +241,14 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
-    # ── Simulate ───────────────────────────────────────────────────────────
-    null = simulate_cluster_null(
+    # ── Tables + refit ─────────────────────────────────────────────────────
+    prefix = parse_prefix(args.prefix)
+    attach_clustsim_tables(
         mask,
         voxmm,
         acf,
+        prefix=Path(prefix.stem),
+        refit=args.refit,
         n_iter=args.niter,
         pthr=pthr,
         athr=athr,
@@ -331,73 +259,14 @@ def main(argv: list[str] | None = None) -> int:
         batch=args.batch,
         seed=args.seed,
         on_device=False if args.cpu_cluster else None,
+        nodec=args.nodec,
+        commandline=" ".join(["ffs_clustsim", *sys.argv[1:]]),
+        mask_name=str(Path(args.mask).resolve()),
+        mask_idcode=resolve_mask_idcode(args.mask),
         verbose=verb >= 1,
     )
-
-    # ── Tables ─────────────────────────────────────────────────────────────
-    prefix = parse_prefix(args.prefix)
-    out_dir = Path(prefix.stem).parent
-    base = Path(prefix.stem).name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    cmd_line = " ".join(["ffs_clustsim", *sys.argv[1:]])
-
-    mask_b64 = out_dir / f"{base}.mask"
-    mask_count = write_mask_b64(mask_b64, mask)
-    mask_idcode = resolve_mask_idcode(args.mask)
-    mask_name = str(Path(args.mask).resolve())
-
-    niml_files: dict[tuple[int, str], Path] = {}
-    for sided in sideds:
-        for nn in nns:
-            table = gumbel_extent_table(
-                null.max_extent[(sided, nn)], athr, args.niter, nodec=args.nodec
-            )
-            tag = _SIDED_ATTR[sided]
-            write_1d_table(
-                out_dir / f"{base}.NN{nn}_{tag}.1D",
-                table,
-                nn=nn,
-                sidedness=sided,
-                pthr=pthr,
-                athr=athr,
-                shape=shape,
-                voxmm=voxmm,
-                mask_count=mask_count,
-                commandline=cmd_line,
-                nodec=args.nodec,
-            )
-            niml_path = out_dir / f"{base}.NN{nn}_{tag}.niml"
-            write_clustsim_niml(
-                niml_path,
-                table,
-                nn=nn,
-                sidedness=sided,
-                commandline=cmd_line,
-                nxyz=shape,
-                dxyz=voxmm,
-                pthr=pthr,
-                athr=athr,
-                n_perms=args.niter,
-                mask_count=mask_count,
-                mask_idcode=mask_idcode,
-                mask_name=mask_name,
-            )
-            niml_files[(nn, tag)] = niml_path
-
-    if verb >= 1:
-        _print_summary(null, nns, sideds, pthr, athr, args.niter, gumbel_extent_table)
-
-    # ── Attach to the stats dataset ────────────────────────────────────────
-    if args.refit is not None:
-        ok = run_refit(
-            stat_path=Path(args.refit),
-            niml_files=niml_files,
-            mask_b64_path=mask_b64,
-            write_script_path=out_dir / f"{base}.3drefit.cmd",
-            verbose=verb >= 1,
-        )
-        if verb >= 1 and ok:
-            print(f"[ffs_clustsim] cluster tables inserted into {args.refit}", file=sys.stderr)
+    if args.refit is not None and verb >= 1:
+        print(f"[ffs_clustsim] cluster tables inserted into {args.refit}", file=sys.stderr)
 
     if verb >= 1:
         print(f"[ffs_clustsim] done in {time.time() - t_start:.1f}s", file=sys.stderr)
@@ -435,22 +304,6 @@ def _estimate_acf(resid_path, mask, shape, voxmm, device, verb):
             file=sys.stderr,
         )
     return ACF(est.a, est.b, est.c)
-
-
-def _print_summary(null, nns, sideds, pthr, athr, niter, table_fn):
-    """Echo the NN1 table, the one people actually read off the terminal."""
-    sided = sideds[0]
-    nn = nns[0]
-    table = table_fn(null.max_extent[(sided, nn)], athr, niter)
-    print(f"\n# NN{nn} {sided} — cluster size threshold (voxels)", file=sys.stderr)
-    print("#  pthr  | " + " ".join(f"{a:.5f}"[1:].rjust(6) for a in athr), file=sys.stderr)
-    print("# ------ | " + " ".join("------" for _ in athr), file=sys.stderr)
-    for i, p in enumerate(pthr):
-        print(
-            f" {p:.6f} " + " ".join(f"{v:6.1f}" for v in table[i]),
-            file=sys.stderr,
-        )
-    print("", file=sys.stderr)
 
 
 if __name__ == "__main__":
