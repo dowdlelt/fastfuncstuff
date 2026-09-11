@@ -2225,7 +2225,7 @@ def test_stage10b_masks_and_glm_mask_modes():
     # automask of the anchor.
     assert s.index("stage10: final compose") < s.index("stage10b: masks")
     assert '-prefix "stage10.meanall.nii$FMT"' in s
-    for m in ("mask_epi", "mask_anat", "mask_brain"):
+    for m in ("mask_epi", "mask_anat", "mask_epi_anat"):
         assert f'-prefix "stage10.{m}.nii$FMT"' in s
     # The anat side is masked on the final grid, and the intersection is a product
     # of the two masks, not a second automask.
@@ -2237,7 +2237,7 @@ def test_stage10b_masks_and_glm_mask_modes():
     for mode, want in (
         ("epi", "stage10.mask_epi.nii$FMT"),
         ("anat", "stage10.mask_anat.nii$FMT"),
-        ("epi_anat", "stage10.mask_brain.nii$FMT"),
+        ("epi_anat", "stage10.mask_epi_anat.nii$FMT"),
     ):
         g = gen(glm_mask=mode)
         assert f'GLM_MASK="${{FFS_GLM_MASK:-{want}}}"' in g
@@ -2252,7 +2252,7 @@ def test_stage10b_masks_and_glm_mask_modes():
         "wd",
         bids_root="/bids",
     )
-    assert "stage10.mask_anat" not in borrow and "stage10.mask_brain" not in borrow
+    assert "stage10.mask_anat" not in borrow and "stage10.mask_epi_anat" not in borrow
     assert 'GLM_MASK="${FFS_GLM_MASK:-stage10.mask_epi.nii$FMT}"' in borrow
 
 
