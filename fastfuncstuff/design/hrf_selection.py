@@ -3161,18 +3161,8 @@ def _save_hrf_index_bucket(
 
     Sub-brick 0: HRF_index  (1-based integer stored as float32)
     Sub-brick 1: <r2_label> (max R² at the selected HRF; use as threshold mask in AFNI)
-
-    3drefit is called (when available) to embed the sub-brick labels so AFNI
-    displays them immediately without manual relabelling.
     """
-    import shutil
-    import subprocess
-    import tempfile
-    from pathlib import Path as _Path
-
-    import nibabel as nib
-
-    from fastfuncstuff.io.afni import compress_nifti
+    from fastfuncstuff.io.afni import save_nifti
 
     # Stack into (n_voxels, 2)
     stacked = torch.stack([hrf_index.float().cpu(), r2_max.float().cpu()], dim=1)
@@ -3193,36 +3183,12 @@ def _save_hrf_index_bucket(
     if affine is None:
         affine = np.eye(4)
 
-    fp = _Path(filepath)
-    labels = ["HRF_index", r2_label]
-
-    # Always write an uncompressed .nii first so 3drefit can work on it
-    if str(fp).endswith(".nii.gz"):
-        nii_path = fp.parent / (fp.name[:-3])  # drop .gz → .nii
-    else:
-        nii_path = fp
-
-    nib.save(nib.Nifti1Image(vol4d.astype(np.float32), affine), str(nii_path))
-
-    # Apply sub-brick labels via 3drefit if available
-    if shutil.which("3drefit"):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as lf:
-            lf.write(" ".join(labels))
-            labels_file = lf.name
-        try:
-            subprocess.run(
-                ["3drefit", "-relabel_all", labels_file, str(nii_path)],
-                check=True,
-                capture_output=True,
-            )
-        except subprocess.CalledProcessError:
-            pass  # File still valid, just unlabelled
-        finally:
-            _Path(labels_file).unlink(missing_ok=True)
-
-    # Compress to final destination if needed
-    if str(fp).endswith(".nii.gz"):
-        compress_nifti(nii_path, fp, remove_original=True)
+    save_nifti(
+        vol4d.astype(np.float32),
+        output_path=filepath,
+        affine=affine,
+        brick_labels=["HRF_index", r2_label],
+    )
 
 
 def _save_volume(

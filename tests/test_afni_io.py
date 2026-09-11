@@ -591,6 +591,106 @@ class TestTemplateSpace:
         assert 'atr_name="TEMPLATE_SPACE"' in xml and '"MNI"' in xml
 
 
+class TestInheritedGridSpace:
+    """A map written on a grid we read inherits that grid's template space.
+
+    Bug of record: ffs_hrfopt (and every other tool that writes a statistical
+    map from an affine alone) turned MNI_2009c_asym input into +orig output, so
+    the R2 map would not overlay on the template the analysis ran in.
+    """
+
+    @staticmethod
+    def _mni_source(path, affine):
+        from fastfuncstuff.io.afni import save_nifti, set_afni_space_info
+
+        hdr = nib.Nifti1Header()
+        hdr.set_sform(affine, code=1)
+        hdr.set_qform(affine, code=1)
+        set_afni_space_info(hdr, view=2, space="MNI_2009c_asym")
+        save_nifti(
+            np.random.rand(5, 5, 5, 3).astype(np.float32), str(path), affine=affine, header=hdr
+        )
+
+    def test_map_on_the_input_grid_inherits_mni(self, temp_output_dir):
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        affine[:3, 3] = [-90.0, -126.0, -72.0]
+        src = temp_output_dir / "epi_mni.nii.gz"
+        self._mni_source(src, affine)
+
+        # What every GLM CLI does: read the runs, then write a derived map with
+        # the affine it kept and no header at all.
+        loaded = load_nifti(str(src))
+        out = temp_output_dir / "r2.nii.gz"
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=loaded.affine)
+
+        img = nib.load(str(out))
+        assert int(img.header["sform_code"]) == 4
+        assert int(img.header["qform_code"]) == 4
+        xml = next(
+            e.content.decode()
+            for e in img.header.extensions
+            if e.get_code() == 4  # NIFTI_ECODE_AFNI
+        )
+        assert "MNI_2009c_asym" in xml
+
+    def test_a_different_grid_is_not_guessed_at(self, temp_output_dir):
+        """A tool that resamples or warps writes on a grid nobody read."""
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        src = temp_output_dir / "epi_mni2.nii.gz"
+        self._mni_source(src, affine)
+        load_nifti(str(src))
+
+        other = np.diag([3.0, 3.0, 3.0, 1.0])
+        out = temp_output_dir / "resampled.nii.gz"
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=other)
+        assert int(nib.load(str(out)).header["sform_code"]) == 1
+
+    def test_a_header_that_names_a_template_still_wins(self, temp_output_dir):
+        """Inheritance only fills the gap; it never overrides a stated space.
+
+        The gap is wider than "no header at all": the GLM writers build a bucket
+        header from scratch, which names no space, and a header inherited from
+        an EPI names the EPI's. Only a header that actually claims a template
+        is treated as the caller having decided.
+        """
+        from fastfuncstuff.io.afni import load_nifti, save_nifti, set_afni_space_info
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        src = temp_output_dir / "epi_mni3.nii.gz"
+        self._mni_source(src, affine)
+        load_nifti(str(src))
+
+        hdr = nib.Nifti1Header()
+        hdr.set_sform(affine, code=1)
+        hdr.set_qform(affine, code=1)
+        set_afni_space_info(hdr, view=2, space="TT_N27")
+        out = temp_output_dir / "stated.nii.gz"
+        save_nifti(np.random.rand(5, 5, 5).astype(np.float32), str(out), affine=affine, header=hdr)
+        assert int(nib.load(str(out)).header["sform_code"]) == 3
+
+    def test_a_fabricated_bucket_header_inherits(self, temp_output_dir):
+        """What the GLM writers actually hand over: a bare, space-less header."""
+        from fastfuncstuff.io.afni import load_nifti, save_nifti
+
+        affine = np.diag([2.5, 2.5, 2.5, 1.0])
+        src = temp_output_dir / "epi_mni4.nii.gz"
+        self._mni_source(src, affine)
+        load_nifti(str(src))
+
+        out = temp_output_dir / "bucket.nii.gz"
+        save_nifti(
+            np.random.rand(5, 5, 5, 2).astype(np.float32),
+            str(out),
+            affine=affine,
+            header=nib.Nifti1Header(),
+        )
+        assert int(nib.load(str(out)).header["sform_code"]) == 4
+
+
 class TestEdgeCases:
     """Test edge cases and error handling."""
 

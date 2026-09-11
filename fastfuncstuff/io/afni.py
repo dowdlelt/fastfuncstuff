@@ -292,6 +292,78 @@ def _decode_zst_to_image(filepath: Path, threads: int | None) -> nib.Nifti1Image
     return nib.Nifti1Image(data, header.get_best_affine(), header)
 
 
+# Template space of every grid read in this process, keyed by the grid itself.
+#
+# A tool that writes a statistical map on its input's grid hands save_nifti an
+# affine and nothing else -- it has no header to inherit from, because the map
+# is something it computed, not something it read. The result is a file that is
+# geometrically correct but claims +orig, so AFNI refuses to overlay an MNI
+# analysis on the MNI template it came from. Threading a header through every
+# such writer is ~100 call sites of the same plumbing, each of which can be
+# forgotten again; recording the space at the single read path and looking it
+# up at the single write path cannot be.
+#
+# Keyed on the grid so the inheritance is only ever applied to output that
+# lives in a space we actually read. A tool that resamples or warps writes on a
+# grid nobody loaded (or on its master's grid, which it did load), so it either
+# gets no answer -- the pre-existing behaviour -- or the right one. Only grids
+# whose space is a named template are recorded; ORIG is what a fresh header
+# already says.
+_SPACE_BY_GRID: dict[bytes, str] = {}
+_SPACE_BY_GRID_MAX = 16
+
+
+def _grid_key(affine: np.ndarray) -> bytes:
+    """Hashable identity for a grid, tolerant of float round-tripping."""
+    return np.round(np.asarray(affine, dtype=np.float64), 4).tobytes()
+
+
+def _record_grid_space(img: nib.Nifti1Image) -> None:
+    """Remember the template space of a dataset we just read. Never raises."""
+    try:
+        header = img.header
+        space = str(get_afni_space_info(header).get("space") or "")
+        if space_to_nifti_code(space) <= _NIFTI_XFORM_ALIGNED_ANAT:
+            # The extension does not name a template; the xform code may still.
+            code = int(header["sform_code"]) or int(header["qform_code"])
+            named = nifti_code_to_space(code) if code > _NIFTI_XFORM_ALIGNED_ANAT else None
+            if named is None:
+                return
+            space = named
+        key = _grid_key(img.affine)
+        if key in _SPACE_BY_GRID:
+            del _SPACE_BY_GRID[key]
+        elif len(_SPACE_BY_GRID) >= _SPACE_BY_GRID_MAX:
+            del _SPACE_BY_GRID[next(iter(_SPACE_BY_GRID))]
+        _SPACE_BY_GRID[key] = space
+    except Exception:
+        pass
+
+
+def _names_a_template(header: Any) -> bool:
+    """True when *header* already claims a template space, in either half."""
+    if header is None:
+        return False
+    try:
+        space = str(get_afni_space_info(header).get("space") or "")
+        if space_to_nifti_code(space) > _NIFTI_XFORM_ALIGNED_ANAT:
+            return True
+        code = int(header["sform_code"]) or int(header["qform_code"])
+        return code > _NIFTI_XFORM_ALIGNED_ANAT
+    except Exception:
+        return True
+
+
+def _inherited_grid_space(affine: np.ndarray | None) -> str | None:
+    """Template space recorded for *affine*, or None if that grid is unknown."""
+    if affine is None:
+        return None
+    try:
+        return _SPACE_BY_GRID.get(_grid_key(affine))
+    except Exception:
+        return None
+
+
 def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.Nifti1Image:
     """
     Load NIfTI files with support for .nii, .nii.gz, and .nii.zst formats.
@@ -350,6 +422,8 @@ def load_nifti(filepath: str | Path, *, zstd_threads: int | None = None) -> nib.
         # Stub gap (see above); this function's contract is to always return
         # Nifti1Image, matching the .nii.zst branch above.
         assert isinstance(img_out, nib.Nifti1Image)
+
+    _record_grid_space(img_out)
 
     return _apply_selector_to_image(img_out, indices)
 
@@ -3298,6 +3372,12 @@ def save_nifti(
             "nibabel is required to save NIfTI files. Install with: pip install nibabel"
         ) from err
 
+    # A caller who nominated a reference file has said which dataset's geometry
+    # governs; anything else may be writing a map it computed rather than a
+    # dataset it read, and so may have no space to carry across. See
+    # _SPACE_BY_GRID.
+    inherit_space = reference_img is None
+
     # Get affine and header info
     if reference_img is not None:
         affine, header = _reference_geometry(reference_img)
@@ -3341,6 +3421,15 @@ def save_nifti(
     if brick_stataux is not None:
         n_sub = data.shape[3] if data.ndim == 4 else 1
         _set_afni_brick_stataux(header, brick_stataux, n_sub)
+
+    # Nothing said what space this map is in, but something read its grid. The
+    # header the caller passed counts as "nothing" when it is one it built
+    # itself: a fabricated header names no template, and neither does one
+    # inherited from a native-space dataset that the output no longer lives in.
+    if inherit_space and not _names_a_template(header):
+        space = _inherited_grid_space(affine)
+        if space is not None:
+            set_afni_space_info(header, view=2, space=space)
 
     # Carry the input's space across — and keep its two halves consistent. The
     # NIfTI xform code and the extension's TEMPLATE_SPACE each carry part of
