@@ -419,6 +419,35 @@ Examples:
         "-save_tsnr use). No-op if -mask was supplied (that mask is already on disk).",
     )
     diag_out.add_argument(
+        "-clustsim",
+        action="store_true",
+        help="Monte-Carlo cluster-size thresholds (3dClustSim) for the stat bucket, "
+        "attached to its header so the AFNI viewer reports cluster significance. "
+        "The ACF comes from this fit's own residuals -- already in memory, estimated "
+        "per run and averaged -- so no residual dataset is written and no .1D is "
+        "parsed back in. Needs a mask (-mask, else the automask of the grand mean).",
+    )
+    diag_out.add_argument(
+        "-clustsim_niter",
+        "-clustsim-niter",
+        dest="clustsim_niter",
+        type=int,
+        default=10000,
+        metavar="N",
+        help="Monte-Carlo iterations for -clustsim. Below ~2000 the tail of the "
+        "table is too noisy to trust.",
+    )
+    diag_out.add_argument(
+        "-clustsim_prefix",
+        "-clustsim-prefix",
+        dest="clustsim_prefix",
+        metavar="PREFIX",
+        help="Where to write the -clustsim .1D / .niml / .mask side files "
+        "(default: the stat bucket's own path minus its extension, plus "
+        "'.CStemp'). The tables are in the header either way; these are the "
+        "readable copy.",
+    )
+    diag_out.add_argument(
         "-adjust_dof",
         "-adjust-dof",
         dest="adjust_dof",
@@ -2815,7 +2844,11 @@ def main():
     # Preprocessing: Blur and/or Scale if requested
     # ==========================================================================
     # Whole-dataset diagnostics need the manual load path (data resident in RAM).
-    want_diag = bool(args.save_grandmean or args.save_tsnr or args.save_acf or args.save_mask)
+    # -clustsim rides the -save_acf path: it needs the same per-run residual ACF,
+    # so it turns on residual computation and the FWHMx estimate without
+    # requiring the user to ask for the tables it happens to be built on.
+    want_acf = bool(args.save_acf or args.clustsim)
+    want_diag = bool(args.save_grandmean or args.save_tsnr or want_acf or args.save_mask)
     # The guard has to see RAW data, before the blur smears nonzero samples into
     # the dead voxels and destroys the exact-zero signature. Detection therefore
     # runs inside the per-run load callback below, which forces the resident-load
@@ -3246,7 +3279,7 @@ def main():
             censor_trim=trim,
             want_residuals=bool(args.Rerrts)
             or bool(args.save_clean)
-            or (want_diag and bool(args.save_tsnr or args.save_acf)),
+            or (want_diag and bool(args.save_tsnr or want_acf)),
             want_ljung_box=bool(args.Rvar),
             run_validity=guard_validity,
             handle_missing=args.handle_missing,
@@ -3381,7 +3414,7 @@ def main():
             # mean) for resid tSNR + per-run FWHMx.
             _resid = getattr(results, "residuals", None)
             _label = "ols" if analysis_method == "ols" else "reml"
-            _want_resid_obs = _resid is not None and (args.save_tsnr or args.save_acf)
+            _want_resid_obs = _resid is not None and (args.save_tsnr or want_acf)
             if _want_resid_obs or args.save_mask:
                 from fastfuncstuff.glm.reml_diagnostics import resolve_mask
 
@@ -3398,6 +3431,10 @@ def main():
                 # 3dAutomask dilation/fill ran on the CPU grand mean (millions of
                 # voxels) — a big CPU spike right before the GPU ACF.
                 _dmask = resolve_mask(_user_mask, _gm, device=device)
+                # Keep it: -clustsim runs after the buckets are written (and
+                # after -adjust_dof rewrites them) and needs this exact mask --
+                # the simulation geometry has to be the one the ACF came from.
+                diag._mask = _dmask
 
                 # -save_mask: persist the diagnostics automask (only when we made
                 # one — a user-supplied -mask is already on disk). Route through
@@ -3432,7 +3469,7 @@ def main():
                         {_label: _full[_dmf]},
                         _dmask,
                         want_tsnr=bool(args.save_tsnr),
-                        want_fwhmx=bool(args.save_acf),
+                        want_fwhmx=want_acf,
                     )
 
             if args.save_grandmean:
@@ -4254,10 +4291,98 @@ def main():
                 # Most likely: no AFNI stat metadata (needs 3drefit at write time).
                 print(f"  ⚠️  skipped {actual}: {e}")
 
+    if args.clustsim:
+        _run_clustsim(args, diag, device)
+
     print()
     print("=" * 70)
     print("✅ ffs_reml completed successfully!")
     print("=" * 70)
+
+
+def _resolve_written_bucket(buck: str | None) -> str | None:
+    """The path a -Obuck/-Rbuck actually landed on, or None if it was not written.
+
+    write_glm_bucket_as_nifti compresses, so a requested ``.nii`` becomes
+    ``.nii.gz``; -adjust_dof does the same dance just above.
+    """
+    if not buck:
+        return None
+    if Path(buck).exists():
+        return buck
+    stem = buck
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+            break
+    for ext in (".nii.gz", ".nii.zst", ".nii"):
+        if Path(stem + ext).exists():
+            return stem + ext
+    return None
+
+
+def _run_clustsim(args, diag, device) -> None:
+    """Attach Monte-Carlo cluster-size tables to the stat bucket(s) (-clustsim).
+
+    Runs last, after -adjust_dof: that rewrites the bucket file wholesale, so
+    tables injected before it would be written straight back out of existence.
+
+    Each bucket gets a table built from *its own* model's residual ACF. There is
+    normally exactly one: OLS residuals exist only under -Oerrts and are freed
+    long before this point, so an ARMA run with both buckets tables the REML one
+    and leaves the OLS bucket alone. Borrowing the REML table for the OLS bucket
+    would be quietly wrong -- the two smoothnesses differ, and a cluster
+    threshold is not a label you can copy across models.
+    """
+    from fastfuncstuff.stats.clustsim import ACF, attach_clustsim_tables
+
+    print()
+    print("=" * 70)
+    print("🎲 ClustSim: Monte-Carlo cluster-size thresholds (-clustsim)")
+    print("=" * 70)
+
+    if diag is None or diag._mask is None or not diag.acf:
+        print("  ⚠️  skipped: no residual ACF was estimated (needs residuals and a mask).")
+        return
+
+    mask = diag._mask.detach().cpu().numpy().astype(bool)
+    if not mask.any():
+        print("  ⚠️  skipped: the mask is empty.")
+        return
+    voxmm = tuple(abs(float(v)) for v in diag.voxdims)
+
+    for label, buck in (("ols", args.Obuck), ("reml", args.Rbuck)):
+        acf_vals = diag.acf.get(label)
+        if acf_vals is None:
+            continue
+        target = _resolve_written_bucket(buck)
+        if target is None:
+            continue
+        a, b, c, fwhm = acf_vals
+        prefix = args.clustsim_prefix or (
+            replace_afni_extension(target, "").removesuffix(".nii") + ".CStemp"
+        )
+        print(
+            f"  • {target}\n"
+            f"    ACF({a:.4f}, {b:.4f}, {c:.4f}) from the {label.upper()} residuals, "
+            f"FWHM {fwhm:.2f} mm; {int(mask.sum()):,} voxels; {args.clustsim_niter} iterations"
+        )
+        try:
+            attach_clustsim_tables(
+                mask,
+                voxmm,
+                ACF(a, b, c),
+                prefix=Path(prefix),
+                refit=target,
+                n_iter=args.clustsim_niter,
+                device=device,
+                mask_name=str(Path(args.mask).resolve()) if args.mask else "<automask>",
+                commandline=" ".join(["ffs_reml", *sys.argv[1:]]),
+                verbose=True,
+            )
+            print(f"    cluster tables inserted into {target}")
+        except Exception as e:  # never lose a finished GLM to a table
+            print(f"    ⚠️  ClustSim failed (the bucket is still valid): {e}")
 
 
 if __name__ == "__main__":

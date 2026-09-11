@@ -194,16 +194,27 @@ def fwhmx_report_text(rows) -> str:
     return "\n".join(lines) + "\n"
 
 
+def mean_acf(rows) -> tuple[float, float, float, float]:
+    """Run-averaged ``(a, b, c, FWHM)`` of the residual ACF.
+
+    Averaging the per-run estimates, rather than estimating once over the
+    concatenated residuals, is what afni_proc.py's blur estimate does: each run
+    has its own smoothness, and the concatenation's ACF is not their mean.
+    Empty runs are skipped. This is the triple ``3dClustSim -acf`` wants.
+    """
+    if not rows:
+        return 0.0, 0.0, 0.0, 0.0
+    m = np.array([(res.a, res.b, res.c, res.fwhm) for _run, res in rows]).mean(0)
+    return float(m[0]), float(m[1]), float(m[2]), float(m[3])
+
+
 def blur_est_1D(rows) -> str:
     """Run-averaged ACF params + FWHM as a 1-line .1D (AFNI blur-estimate style).
 
     One data line ``a b c FWHM`` (the mean over runs), ready to feed the ACF
-    triple to ``3dClustSim -acf a b c``. Empty runs are skipped in the mean.
+    triple to ``3dClustSim -acf a b c``.
     """
-    a = b = c = fwhm = 0.0
-    if rows:
-        m = np.array([(res.a, res.b, res.c, res.fwhm) for _run, res in rows]).mean(0)
-        a, b, c, fwhm = (float(v) for v in m)
+    a, b, c, fwhm = mean_acf(rows)
     return (
         "# run-averaged spatial ACF of the residuals (3dFWHMx -ACF)\n"
         "# a b c FWHM   (feed 'a b c' to 3dClustSim -acf; FWHM in mm)\n"
@@ -233,6 +244,11 @@ class DatasetDiagnostics:
 
     maps: dict[str, np.ndarray] = field(default_factory=dict)
     tables: dict[str, str] = field(default_factory=dict)
+    #: Run-averaged residual ACF per label, ``{"reml": (a, b, c, FWHM)}``. The
+    #: rendered tables are for reading; this is the one ffs_reml -clustsim feeds
+    #: to the simulation, so the table on disk and the table in the header come
+    #: from the same numbers.
+    acf: dict[str, tuple[float, float, float, float]] = field(default_factory=dict)
     # Cached between hooks.
     _scaled_mean: Tensor | None = None
     _mask: Tensor | None = None
@@ -305,6 +321,7 @@ class DatasetDiagnostics:
                 # Per-run detail (classic + ACF) + run-averaged .1D.
                 self.tables[f"fwhmx_{label}"] = fwhmx_report_text(rows)
                 self.tables[f"blur_est_{label}"] = blur_est_1D(rows)
+                self.acf[label] = mean_acf(rows)
 
     # -- saving --------------------------------------------------------------
     def save_map(self, name: str, path, affine: np.ndarray | None = None, header=None) -> bool:

@@ -257,3 +257,89 @@ def test_nodec_rounds_up_before_the_table_is_read():
     rounded = gumbel_extent_table(sizes, DEFAULT_CS_ATHR, 2000, nodec=True)
     assert np.all(rounded == np.floor(plain + 0.951))
     assert np.all(rounded == np.round(rounded))
+
+
+def test_reml_clustsim_attaches_tables_and_survives_adjust_dof(tmp_path):
+    """`ffs_reml -clustsim` puts AFNI-readable cluster tables in its own bucket.
+
+    The ordering is the load-bearing part: -adjust_dof rewrites the bucket file
+    wholesale and does NOT carry the AFNI_CLUSTSIM_* attributes across, so tables
+    injected before it would be written straight back out of existence. This
+    asserts both flags together leave the tables in place.
+    """
+    import re
+    import subprocess
+    import sys
+
+    import nibabel as nib
+    import numpy as np
+
+    rng = np.random.default_rng(3)
+    bold = tmp_path / "run1.nii.gz"
+    nib.Nifti1Image(
+        (rng.normal(0, 1, (16, 16, 12, 60)) + 100).astype(np.float32), np.diag([3, 3, 3, 1])
+    ).to_filename(bold)
+    mask = tmp_path / "mask.nii.gz"
+    m = np.zeros((16, 16, 12), np.uint8)
+    m[3:13, 3:13, 2:10] = 1
+    nib.Nifti1Image(m, np.diag([3, 3, 3, 1])).to_filename(mask)
+    ev = tmp_path / "ev.tsv"
+    ev.write_text("onset\tduration\ttrial_type\n6\t3\ta\n30\t3\ta\n54\t3\tb\n78\t3\tb\n")
+
+    def clustsim_attrs(path):
+        txt = "".join(
+            e.get_content().decode("utf-8", "replace")
+            for e in nib.load(str(path)).header.extensions
+        )
+        return sorted(set(re.findall(r"AFNI_CLUSTSIM_\w+", txt)))
+
+    def run(out, *extra):
+        res = subprocess.run(  # noqa: S603
+            [
+                sys.executable,
+                "-m",
+                "fastfuncstuff.cli.reml",
+                "-input",
+                str(bold),
+                "-events",
+                str(ev),
+                "-TR",
+                "1.5",
+                "-mask",
+                str(mask),
+                "-Rbuck",
+                str(out),
+                "-tout",
+                "-fout",
+                "-do_scale",
+                "-clustsim",
+                "-clustsim_niter",
+                "200",
+                "-device",
+                "cpu",
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            cwd=tmp_path,
+        )
+        assert res.returncode == 0, res.stdout[-3000:] + res.stderr[-3000:]
+        return res
+
+    plain = tmp_path / "stats.nii.gz"
+    run(plain)
+    attrs = clustsim_attrs(plain)
+    assert "AFNI_CLUSTSIM_MASK" in attrs
+    # Every NN x sidedness the defaults ask for.
+    for nn in (1, 2, 3):
+        for sided in ("1sided", "2sided", "bisided"):
+            assert f"AFNI_CLUSTSIM_NN{nn}_{sided}" in attrs
+
+    # -clustsim needs no -save_acf: it turns the residual ACF path on itself.
+    assert not list(tmp_path.glob("*.blur_est_*"))
+
+    # ... and the tables outlive the dof rewrite, which is what the ordering buys.
+    adjusted = tmp_path / "s2.nii.gz"
+    run(adjusted, "-adjust_dof", "5")
+    assert clustsim_attrs(adjusted) == attrs
