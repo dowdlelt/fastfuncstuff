@@ -38,6 +38,25 @@ from fastfuncstuff.processing.nwarpforge import (
 )
 from fastfuncstuff.utils import REGISTRATION_TF32
 
+# -save_mean/-save_max/-save_min with no value: derive the path from -prefix.
+# Same sentinel dance as ffs_moco, so the two tools spell the flag identically.
+_FROM_PREFIX = "\x00from_prefix"
+
+
+def _reduction_path(value: str | None, which: str, prefix: str | None) -> str | None:
+    """Where a temporal reduction goes: the PREFIX given to the flag, or
+    ``{which}_{prefix}`` when the flag was passed bare."""
+    if value is None:
+        return None
+    if value is not _FROM_PREFIX:
+        return value
+    if prefix is None:
+        print(
+            f"Error: -save_{which} with no value needs -prefix to derive a path.", file=sys.stderr
+        )
+        sys.exit(1)
+    return derive_prefixed_output_path(prefix, which)
+
 
 def parse_args(
     argv: list[str] | None = None, namespace: argparse.Namespace | None = None
@@ -140,15 +159,26 @@ Examples:
     )
     io_group.add_argument(
         "-save_mean",
-        action="store_true",
-        help="If output is 4D, save mean as mean_{prefix_basename}{ext}",
+        "-save-mean",
+        dest="save_mean",
+        nargs="?",
+        const=_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="If output is 4D, save its temporal mean. With no value the path is "
+        "mean_{prefix_basename}{ext}; give a PREFIX to write it there instead "
+        "(what a naming scheme with a fixed stem wants).",
     )
     io_group.add_argument(
         "-save_max",
         "-save-max",
         dest="save_max",
-        action="store_true",
-        help="If output is 4D, save the temporal MAX as max_{prefix_basename}{ext} "
+        nargs="?",
+        const=_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="If output is 4D, save the temporal MAX (max_{prefix_basename}{ext} "
+        "with no value, or the PREFIX you give) "
         "— the union of every voxel imaged in any volume (motion/warp carry edge "
         "voxels out of the FoV, where the mean dims them). Computed on the OUTPUT "
         "grid, so it is exact for the final space.",
@@ -157,8 +187,12 @@ Examples:
         "-save_min",
         "-save-min",
         dest="save_min",
-        action="store_true",
-        help="If output is 4D, save the temporal MIN as min_{prefix_basename}{ext} "
+        nargs="?",
+        const=_FROM_PREFIX,
+        default=None,
+        metavar="PREFIX",
+        help="If output is 4D, save the temporal MIN (min_{prefix_basename}{ext} "
+        "with no value, or the PREFIX you give) "
         "— 0 wherever any volume lost the voxel, i.e. >0 is the region with "
         "complete data at every timepoint (an analysis mask).",
     )
@@ -345,8 +379,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     if args.phase:
         outs.append(args.phase_prefix or derive_phase_output_path(args.prefix))
     for want, which in ((args.save_mean, "mean"), (args.save_max, "max"), (args.save_min, "min")):
-        if want:
-            outs.append(derive_prefixed_output_path(args.prefix, which))
+        path = _reduction_path(want, which, args.prefix)
+        if path:
+            outs.append(path)
     if args.save_first_last:
         outs.append(derive_prefixed_output_path(args.prefix, "firstlast"))
     return outs
@@ -502,9 +537,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         verb=verb,
         time_range=time_range,
         debug=args.debug,
-        save_mean=args.save_mean,
-        save_max=args.save_max,
-        save_min=args.save_min,
+        save_mean=_reduction_path(args.save_mean, "mean", args.prefix),
+        save_max=_reduction_path(args.save_max, "max", args.prefix),
+        save_min=_reduction_path(args.save_min, "min", args.prefix),
         save_first_last_flag=args.save_first_last,
         dxyz=args.dxyz,
         no_neg=args.no_neg,

@@ -1719,9 +1719,9 @@ def nwarpforge(
     verb: int = 1,
     time_range: tuple[int, int] | None = None,
     debug: bool = False,
-    save_mean: bool = False,
-    save_max: bool = False,
-    save_min: bool = False,
+    save_mean: str | bool | None = None,
+    save_max: str | bool | None = None,
+    save_min: str | bool | None = None,
     save_first_last_flag: bool = False,
     dxyz: float | None = None,
     no_neg: bool = False,
@@ -1752,6 +1752,9 @@ def nwarpforge(
         master_path: Path to master dataset for output grid (optional). The
             literal string "WARP"/"NWARP" uses the first nonlinear warp's grid
             as the output master (matching 3dNwarpApply -master WARP).
+        save_mean/save_max/save_min: Temporal reductions of the warped 4-D
+            output. A path writes there; True keeps the derived sibling name
+            ({which}_{prefix}); None/False writes nothing.
         interp: Final interpolation method ("nearest"/"NN", "linear", "cubic",
             "quintic", "heptic", or "wsinc5")
         phase_warp: How to warp phase data when -phase is given:
@@ -2615,7 +2618,8 @@ def nwarpforge(
             if verb >= 1:
                 print(f"-save_{which} requested, but output is not 4D; skipping")
             continue
-        out_path = derive_prefixed_output_path(prefix, which)
+        # A str is where the caller wants it; True keeps the derived sibling name.
+        out_path = want if isinstance(want, str) else derive_prefixed_output_path(prefix, which)
         with progress_context(f"Writing {which} {out_path}"):
             save_image(reduce(output), out_path, header_info=output_header)
 

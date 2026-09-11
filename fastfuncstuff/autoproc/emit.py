@@ -1000,6 +1000,18 @@ def _qc_anat(plan: Plan) -> str:
     return _qc_block("EPI → anat", calls)
 
 
+def _final_mean(frag: str) -> str:
+    """The per-run temporal mean of the final series, for a ``_frag`` (or a bash
+    expression that expands to one).
+
+    ``_mean`` on the end, not ``mean_`` on the front: every other file in this
+    directory starts with its stage, and a tool-appended suffix is how stage02's
+    ``_mean``/``_max``/``_min`` already read. ffs_nwarp's bare ``-save_mean``
+    would put the token in front and drop the file to the top of the listing,
+    away from the run it belongs to."""
+    return f"stage10.final.{frag}_mean.nii$FINAL_FMT"
+
+
 def _qc_final(plan: Plan) -> str:
     """THE final QC: every run's mean, in output space, in one file.
 
@@ -1014,8 +1026,7 @@ def _qc_final(plan: Plan) -> str:
     calls = [
         _qc_call(
             _qc_stem("final"),
-            [wm]
-            + [(f"mean_stage10.final.{_frag(pr)}.nii$FINAL_FMT", _frag(pr)) for pr in plan.runs],
+            [wm] + [(_final_mean(_frag(pr)), _frag(pr)) for pr in plan.runs],
         )
     ]
     if plan.use_sbref:
@@ -1769,12 +1780,12 @@ def _blip_b0(pr: PlanRun, st: str) -> str:
                 f"-master {shlex.quote(epi)}",
                 f'-nwarp "{st}_warp.nii$FMT"',
                 f"-jac {axis}",
-                "-save_mean",
+                f'-save_mean "{st}_mean.nii$FMT"',
                 f'-prefix "{tmp}"',
                 '-device "$DEVICE"',
             ],
         )
-        mean += f'\n  mv -f "mean_{st}_unwarped.nii$FMT" "{st}_mean.nii$FMT"\n  rm -f "{tmp}"'
+        mean += f'\n  rm -f "{tmp}"'
     else:
         mean = _ffs(
             "ffs_nwarp",
@@ -3015,7 +3026,8 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
     phase_out = (
         '  phoutf="stage10.final.${FRAG[$k]}.part-phase.nii$FINAL_FMT"\n' if _phase_on(plan) else ""
     )
-    # -save_mean is not optional: mean_stage10.final.<frag> is the per-run image
+    meanf = _final_mean("${FRAG[$k]}")
+    # -save_mean is not optional: stage10.final.<frag>_mean is the per-run image
     # the final QC stack is built from, and it costs one temporal reduction of a
     # series ffs_nwarp already has in memory.
     return f"""
@@ -3026,15 +3038,16 @@ def _stage_final(plan: Plan, script_stem: str) -> str:
 # read in place (NORDIC output, or BIDS magnitude with noise vols trimmed inline)
 # so no raw copy is materialised. The chain lands every run on the stage10a
 # warpmaster grid (MASTER/FINAL_DXYZ set there). skip_final=1 → -batch_skip.
-# -save_mean writes mean_stage10.final.<frag> per run — the QC stack below.
+# -save_mean writes stage10.final.<frag>_mean per run — the QC stack below.
 {phase_note}echo '== stage10: final compose + resample =='
 nwarpbatch="{batchfile}"
 : > "$nwarpbatch"
 for k in "${{RUN_KEYS[@]}}"; do
   outf="stage10.final.${{FRAG[$k]}}.nii$FINAL_FMT"
+  meanf="{meanf}"
 {phase_out}{st}
 {_raw_source(plan)}
-  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
+  printf '%s\\n' "-source \\"$raw\\" -nwarp \\"${{CHAIN[$k]}}\\"${{JAC[$k]:+ -jac \\"${{JAC[$k]}}\\"}} -master stage10.warpmaster.nii$FMT -dxyz \\"$FINAL_DXYZ\\" {nwarp_flags} $st_str -save_mean \\"$meanf\\" -prefix \\"$outf\\"{phase_args}" >> "$nwarpbatch"
 done
 {_numcomps_final_jobs(plan)}{_sbref_final_jobs(plan)}batch_skip=(); [ "$skip_final" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_nwarp -batch "$nwarpbatch" "${{batch_skip[@]}}" -device "$DEVICE"
@@ -3279,8 +3292,7 @@ def _stage_masks(plan: Plan) -> str:
     out.append(f'if [ ! -f "{meanall}" ]; then')
     out.append("  allmeans=()")
     out.append(
-        '  for k in "${RUN_KEYS[@]}"; do '
-        'allmeans+=("mean_stage10.final.${FRAG[$k]}.nii$FINAL_FMT"); done'
+        f'  for k in "${{RUN_KEYS[@]}}"; do allmeans+=("{_final_mean("${FRAG[$k]}")}"); done'
     )
     out.append(
         _ffs(

@@ -223,6 +223,28 @@ def test_nwarp_expected_outputs_prefix_verbatim_plus_derived():
     assert "firstlast_out.nii.gz" in outs
 
 
+def test_nwarp_save_mean_takes_a_path_and_batch_skip_follows_it():
+    """-save_mean PREFIX writes where it is told, and -batch_skip looks there —
+    a naming scheme with a fixed stem cannot live with mean_ on the front."""
+    from fastfuncstuff.cli.nwarp import _expected_outputs, parse_args
+
+    a = parse_args(
+        [
+            "-source",
+            "epi.nii.gz",
+            "-nwarp",
+            "w.nii",
+            "-prefix",
+            "stage10.final.run-1.nii.zst",
+            "-save_mean",
+            "stage10.final.run-1_mean.nii.zst",
+        ]
+    )
+    outs = _expected_outputs(a)
+    assert "stage10.final.run-1_mean.nii.zst" in outs
+    assert not any(o.startswith("mean_") for o in outs)
+
+
 # --------------------------------------------------------------------------
 # ffs_allineate / ffs_formwarp._expected_outputs
 # --------------------------------------------------------------------------

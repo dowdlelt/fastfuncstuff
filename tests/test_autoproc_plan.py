@@ -1378,11 +1378,13 @@ def test_qc_final_stack_is_every_runs_mean_in_output_space():
     dataset-wide stack: if anything moves here, no earlier stage fixed it."""
     subj = Subject("X", [Session("01", [_run("01", "t", "1"), _run("01", "t", "2")])])
     s = write_script(build_plan(subj, Options(go_to_anat=False)), "wd", bids_root="/bids")
-    assert "-save_mean -prefix" in s
+    # The mean is named for its run, not prefixed with "mean_": stage first, as
+    # every other file in the directory is.
+    assert '-save_mean \\"$meanf\\"' in s
     assert _qc(s)["stage10.QC.final.nii.gz"] == [
         "stage10.warpmaster.nii$FMT",
-        "mean_stage10.final.ses-01.task-t.run-1.nii$FINAL_FMT",
-        "mean_stage10.final.ses-01.task-t.run-2.nii$FINAL_FMT",
+        "stage10.final.ses-01.task-t.run-1_mean.nii$FINAL_FMT",
+        "stage10.final.ses-01.task-t.run-2_mean.nii$FINAL_FMT",
     ]
 
 
@@ -1400,7 +1402,7 @@ def test_qc_skips_single_image_groups_and_honours_no_qc():
     assert "qc_tcat" not in off
     # The per-run mean survives -no_qc: it is a useful output in its own right,
     # not scaffolding for the stack.
-    assert "-save_mean -prefix" in off
+    assert '-save_mean \\"$meanf\\"' in off
 
 
 def test_qc_single_session_grandmean_stack_is_not_a_duplicate():
