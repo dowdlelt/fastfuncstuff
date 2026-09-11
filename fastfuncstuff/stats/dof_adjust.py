@@ -393,6 +393,11 @@ def update_dof_in_file(
         output_path,
         affine=img.affine,
         tr=tr,
+        # Pass the source header, not just its affine: save_nifti edits the AFNI
+        # extension in place, so everything this rewrite does not own rides
+        # across -- the AFNI_CLUSTSIM_* cluster tables above all. Building a
+        # fresh header instead silently un-cluster-corrects the bucket.
+        header=img.header.copy(),
         brick_labels=result.labels,
         brick_stataux=result.stataux,
     )

@@ -306,3 +306,71 @@ def test_rvar_companion_is_found_beside_the_bucket(tmp_path):
     comp = tmp_path / "stage12.stats-reml.task-x_ffsremlvar.nii.gz"
     nib.save(nib.Nifti1Image(np.zeros((2, 2, 2, 4), np.float32), np.eye(4)), str(comp))
     assert _rvar_companion(str(stats)) == str(comp)
+
+
+def _clustsim_attr_names(path):
+    import re
+
+    txt = "".join(
+        e.get_content().decode("utf-8", "replace") for e in nib.load(str(path)).header.extensions
+    )
+    return sorted(set(re.findall(r"AFNI_CLUSTSIM_\w+", txt)))
+
+
+def test_bucket_rewrites_keep_the_clustsim_tables(tmp_path):
+    """Rewriting a bucket must not silently un-cluster-correct it.
+
+    Both concalc and the dof adjust rebuild a stats dataset. They own the
+    sub-brick metadata they recompute; the AFNI_CLUSTSIM_* tables describe the
+    dataset and belong to it. Dropping them leaves a bucket that looks fine and
+    no longer reports cluster significance in the viewer.
+    """
+    from fastfuncstuff.cli.util_concalc import _CONCALC_OWNED_ATRS, _save_bucket
+    from fastfuncstuff.io.afni import set_afni_atr
+
+    labels = ["Full_Fstat", "face#0_Coef", "face#0_Tstat"]
+    data = np.zeros((4, 4, 3, 3), np.float32)
+    src = nib.Nifti1Image(data, np.eye(4))
+    from fastfuncstuff.cli.util_concalc import _afni_brick_labels_extension
+
+    src.header.extensions.append(_afni_brick_labels_extension(labels))
+    set_afni_atr(src.header, "AFNI_CLUSTSIM_NN1_1sided", "<3dClustSim_NN1 />")
+    set_afni_atr(src.header, "AFNI_CLUSTSIM_MASK", "abc123")
+    spath = tmp_path / "stats.nii.gz"
+    nib.save(src, str(spath))
+    before = _clustsim_attr_names(spath)
+    assert before == ["AFNI_CLUSTSIM_MASK", "AFNI_CLUSTSIM_NN1_1sided"]
+
+    out = tmp_path / "out.nii.gz"
+    _save_bucket(out, data, labels, nib.load(str(spath)))
+    assert _clustsim_attr_names(out) == before
+
+    # The labels concalc DOES own are the recomputed ones, not carried twice.
+    assert "BRICK_LABS" in _CONCALC_OWNED_ATRS
+    txt = "".join(
+        e.get_content().decode("utf-8", "replace") for e in nib.load(str(out)).header.extensions
+    )
+    assert txt.count('atr_name="BRICK_LABS"') == 1
+
+
+def test_dof_adjust_keeps_the_clustsim_tables(tmp_path):
+    """Same property for ffs_util_updatedof / ffs_reml -adjust_dof."""
+    from fastfuncstuff.io.afni import save_nifti, set_afni_atr
+    from fastfuncstuff.stats.dof_adjust import resolve_dof_adjust_arg, update_dof_in_file
+
+    data = np.abs(np.random.default_rng(1).normal(0, 2, (4, 4, 3, 2))).astype(np.float32)
+    path = tmp_path / "stats.nii.gz"
+    save_nifti(
+        data,
+        str(path),
+        affine=np.eye(4),
+        brick_labels=["face#0_Coef", "face#0_Tstat"],
+        brick_stataux={1: (3, (40.0,))},  # fitt(40)
+    )
+    img = nib.load(str(path))
+    set_afni_atr(img.header, "AFNI_CLUSTSIM_NN1_1sided", "<3dClustSim_NN1 />")
+    nib.save(img, str(path))
+    assert _clustsim_attr_names(path) == ["AFNI_CLUSTSIM_NN1_1sided"]
+
+    update_dof_in_file(str(path), resolve_dof_adjust_arg("5"), str(path), verbose=False)
+    assert _clustsim_attr_names(path) == ["AFNI_CLUSTSIM_NN1_1sided"]

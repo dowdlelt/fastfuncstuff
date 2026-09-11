@@ -3061,6 +3061,62 @@ def set_afni_atr(
         extensions.append(nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, payload.encode("utf-8")))
 
 
+def iter_afni_atrs(header: Any) -> list[tuple[str, str]]:
+    """``[(atr_name, raw <AFNI_atr> block)]`` from a NIfTI's AFNI extension.
+
+    The raw block is returned verbatim so it can be re-emitted without knowing
+    its type or re-escaping its body.
+    """
+    try:
+        extensions = header.extensions or []
+    except AttributeError:
+        return []
+    for ext in extensions:
+        if ext.get_code() != _NIFTI_ECODE_AFNI:
+            continue
+        xml = ext.content.decode("utf-8", errors="replace")
+        out = []
+        for m in re.finditer(r"<AFNI_atr\s[^>]*>.*?</AFNI_atr>", xml, flags=re.DOTALL):
+            block = m.group(0)
+            nm = re.search(r'atr_name="([^"]*)"', block)
+            if nm:
+                out.append((nm.group(1), block))
+        return out
+    return []
+
+
+def carry_afni_atrs(src_header: Any, dst_header: Any, skip: set[str]) -> list[str]:
+    """Copy AFNI attributes from one header to another, except those in *skip*.
+
+    For tools that rebuild a stats bucket: they own the sub-brick metadata they
+    recompute (BRICK_LABS and friends), but everything else in the extension --
+    the ``AFNI_CLUSTSIM_*`` cluster tables above all -- belongs to the dataset,
+    not to the rewrite, and silently dropping it is how a cluster-corrected
+    bucket stops being cluster-corrected. Returns the names carried over.
+    """
+    import nibabel as nib
+
+    blocks = [(n, b) for n, b in iter_afni_atrs(src_header) if n not in skip]
+    if not blocks:
+        return []
+    try:
+        extensions = dst_header.extensions
+    except AttributeError:
+        return []
+    for i, ext in enumerate(extensions):
+        if ext.get_code() != _NIFTI_ECODE_AFNI:
+            continue
+        xml = ext.content.decode("utf-8", errors="replace")
+        add = "".join(b if b.endswith("\n") else b + "\n" for _n, b in blocks)
+        if "</AFNI_attributes>" in xml:
+            xml = xml.replace("</AFNI_attributes>", add + "</AFNI_attributes>", 1)
+        else:
+            xml += add
+        extensions[i] = nib.nifti1.Nifti1Extension(_NIFTI_ECODE_AFNI, xml.encode("utf-8"))
+        return [n for n, _b in blocks]
+    return []
+
+
 class _ChunkedFileWriter(io.IOBase):
     """Wrap a binary file so each ``write`` is split into <=1 GiB pieces.
 

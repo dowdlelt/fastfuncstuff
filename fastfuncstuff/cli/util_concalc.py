@@ -43,7 +43,7 @@ from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
 from fastfuncstuff.cli_utils import setup_device, spinner
 from fastfuncstuff.design.spec import load_spec, resolve_contrast
 from fastfuncstuff.glm.arma import build_arma11_covariance
-from fastfuncstuff.io.afni import load_nifti, read_afni_design_matrix
+from fastfuncstuff.io.afni import carry_afni_atrs, load_nifti, read_afni_design_matrix
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -206,6 +206,10 @@ def _format_stataux_block(
         ";".join(syms),
     )
 
+
+#: The AFNI attributes concalc rewrites itself. Everything else in the source
+#: bucket's extension is carried across untouched -- see _save_bucket.
+_CONCALC_OWNED_ATRS = frozenset({"BRICK_LABS", "BRICK_STATAUX", "BRICK_STATSYM"})
 
 #: Ceiling on distinct (a, b) pairs in a real Rvar. 3dREMLfit's default grid is
 #: |a|,|b| <= 0.8 at 3 levels -- ~117 valid pairs -- and ffs_reml's is the same
@@ -785,6 +789,15 @@ def _save_bucket(
         ext for ext in (new_img.header.extensions or []) if ext.get_code() != 4
     ]
     new_img.header.extensions.append(_afni_bucket_extension(labels, stataux))
+    # concalc owns the sub-brick metadata it just recomputed and nothing else.
+    # The rest of the extension describes the dataset -- the AFNI_CLUSTSIM_*
+    # tables above all -- so it rides across; dropping it would quietly
+    # un-cluster-correct a bucket that was.
+    carried = carry_afni_atrs(reference_img.header, new_img.header, skip=_CONCALC_OWNED_ATRS)
+    if carried:
+        n_cs = sum(1 for c in carried if c.startswith("AFNI_CLUSTSIM"))
+        extra = f" (incl. {n_cs} ClustSim)" if n_cs else ""
+        print(f"   carried {len(carried)} AFNI attribute(s) across{extra}", flush=True)
     with spinner(f"Writing {out_path.name}"):
         nib.save(new_img, str(out_path))
 
