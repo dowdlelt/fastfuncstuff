@@ -22,8 +22,13 @@ DERIVE projects a design's nuisance out of a run and keeps the result as a new
 layer just above it, so raw and denoised sit next to each other in the stack --
 graphable together, and one keypress apart under solo.
 
+A CARPET window (grayplot) draws every voxel of one run at once, automasked and
+row-sorted -- by correlation with the dominant component, with the seed voxel,
+or with the mean of what an overlay picked out. Point it at a DERIVE'd layer to
+see a cleaned carpet; the overlay is drawn as a band beside the rows.
+
 keys (main window)
-  n  N                 new image / new graph window
+  n  N  C              new image / graph / carpet window
   f  F                 tile / stagger every window      r  raise them all
   d                    dark / light palette
   arrows / PgUp PgDn   move the crosshair
@@ -45,6 +50,9 @@ keys (image window)
 
 keys (graph window)
   + -                  more / fewer voxels    s  shared scale    w  close
+
+keys (carpet window)
+  o                    next row order         r  rebuild         w  close
 
 examples
   ffs_viewer -read results.subj01/

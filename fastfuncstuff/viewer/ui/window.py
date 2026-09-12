@@ -48,6 +48,9 @@ from fastfuncstuff.viewer.vocab import (
     SelectLayer,
     SetAlpha,
     SetBoxed,
+    SetCarpetDetrend,
+    SetCarpetOrder,
+    SetCarpetScaling,
     SetColormap,
     SetIJK,
     SetIndex,
@@ -64,8 +67,12 @@ from fastfuncstuff.viewer.vocab import (
     SetThresholdIndex,
     SetTimeLinked,
     SetUnderlay,
+    SetViewTraces,
     SetVolume,
 )
+
+#: Commands that change what a carpet draws, as opposed to what is around it.
+CARPET_SETTINGS = (SetCarpetDetrend, SetCarpetOrder, SetCarpetScaling, SetViewTraces)
 
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
 #: displayed reads as a load that failed.
@@ -93,6 +100,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         session.on_loaded(self._bridge.loaded.emit)
 
         self.manager = WindowManager(session, self._dispatch, self)
+        self.manager.rebuild_requested.connect(self.rebuild_carpet)
 
         self._build_selector()
         self._build_panel()
@@ -126,6 +134,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(self.session.do(cmd))
         if isinstance(cmd, SetSeed) and self.session.mode.needs_prepare:
             self._prepare_then_refresh()
+        # A carpet's own settings decide its picture, so changing one rebuilds
+        # it. Everything else that could invalidate it -- a new overlay, a new
+        # layer -- only marks it stale, because a carpet is seconds of work and
+        # rebuilding on a threshold drag would be unusable.
+        if isinstance(cmd, CARPET_SETTINGS):
+            viewport = self.session.state.viewports.find(cmd.view)
+            if viewport is not None and viewport.is_carpet:
+                self.rebuild_carpet(cmd.view)
 
     # ------------------------------------------------------------------
     # the core: read / underlay / overlay / +1 / mode
@@ -196,6 +212,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         for text, key, tip, slot in (
             ("+IMAGE", "n", "Open another image window", self._new_image),
             ("+GRAPH", "N", "Open a graph window", self._new_graph),
+            ("+CARPET", "C", "Open a carpet plot of the selected run", self._new_carpet),
             ("TILE", "f", "Lay every window out on a grid", self._tile),
             ("STACK", "F", "Stagger the windows so each title bar is reachable", self._cascade),
             ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
@@ -302,6 +319,57 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _new_graph(self) -> None:
         self.manager.open(ViewKind.GRAPH, self._next_plane())
         self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
+
+    def _new_carpet(self) -> None:
+        vid = self.manager.open(ViewKind.CARPET, Plane.AXIAL)
+        # Start it on the layer the controls are aimed at, which is what
+        # "carpet this" means when a run is selected.
+        layer = self.session.state.selected_layer()
+        if layer is not None and layer.time_linked and layer.n_volumes > 1:
+            self.session.do(SetViewTraces(vid, layer.key))
+        self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
+        self.rebuild_carpet(vid)
+
+    def rebuild_carpet(self, vid: str) -> None:
+        """Build one carpet on the worker and hand the picture back.
+
+        Same split as a mode and as DERIVE: the arithmetic touches only arrays,
+        the install happens here. A carpet of a real run is several seconds, so
+        this is never allowed near the click handler.
+        """
+        from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+
+        window = self.manager.windows.get(vid)
+        viewport = self.session.state.viewports.find(vid)
+        if not isinstance(window, CarpetWindow) or viewport is None or self.runner.busy:
+            return
+        built: dict[str, object] = {}
+
+        def job(progress) -> bool:
+            _, carpet = self.session.build_carpet(viewport, progress=progress)
+            built["carpet"] = carpet
+            return True
+
+        def done(ok: bool, error: str) -> None:
+            self.runner.finished.disconnect(done)
+            window.set_busy(False)
+            if ok:
+                window.show_carpet(built.get("carpet"))
+            else:
+                # On the window rather than the status bar: the thing that
+                # failed is the thing you are looking at.
+                window.show_carpet(None, error or "could not build a carpet")
+
+        window.set_busy(True)
+        self.runner.finished.connect(done)
+        if not self.runner.run(job):
+            self.runner.finished.disconnect(done)
+            window.set_busy(False)
+
+    def _rebuild_carpets(self) -> None:
+        """Rebuild every carpet whose settings changed. One at a time."""
+        for window in self.manager.carpets():
+            self.rebuild_carpet(window.vid)
 
     def _next_plane(self) -> Plane:
         """Offer the plane that is not already on screen, then wrap.
@@ -626,6 +694,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("PgUp", "crosshair +z", lambda: self._nudge(2, 1), group="navigate"),
                 Binding("n", "open an image window", self._new_image, group="windows"),
                 Binding("N", "open a graph window", self._new_graph, group="windows"),
+                Binding("C", "open a carpet plot", self._new_carpet, group="windows"),
                 Binding("f", "tile every window", self._tile, group="windows"),
                 Binding("F", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
@@ -893,6 +962,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # anything tries to draw into it.
         if dirty & (Aspect.VIEWPORTS | Aspect.LAYERS | Aspect.GRID):
             self.manager.sync()
+        if dirty & (Aspect.LAYERS | Aspect.GRID):
+            self.manager.mark_carpets_stale()
         self.manager.redraw(dirty)
         self._sync_readout()
 

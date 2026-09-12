@@ -265,6 +265,89 @@ class ViewerSession:
         wanted = set(viewport.traces)
         return [ly for ly in available if ly.key in wanted]
 
+    def carpet_source(self, viewport) -> Layer | None:
+        """The one layer a carpet window draws.
+
+        Reuses a graph's trace selection rather than inventing a second way to
+        say "this layer": a carpet is a graph of every voxel, and the picker
+        that chooses what a graph plots is the same question.
+        """
+        available = self.graph_layers()
+        if not available:
+            return None
+        for key in viewport.traces:
+            found = next((ly for ly in available if ly.key == key), None)
+            if found is not None:
+                return found
+        return available[-1]
+
+    def carpet_overlay(self, source: Layer) -> Layer | None:
+        """Which layer labels a carpet's rows.
+
+        The topmost visible layer that is not the run being drawn -- not
+        "overlay-prime". In a stack of anat, run and stats the thing worth
+        drawing beside the rows is the stats map on top, and overlay-prime is
+        the run itself.
+        """
+        for layer in reversed(list(self.state.layers)):
+            if layer.key != source.key and layer.visible:
+                return layer
+        return None
+
+    def build_carpet(self, viewport, *, progress=None):
+        """Render one carpet window's picture. Slow; runs on the worker.
+
+        Reads arrays and returns one, like a mode's prepare() -- no session
+        state is touched, because the thread that paints owns all of that.
+        """
+        from fastfuncstuff.viewer import carpet as carpet_mod
+
+        layer = self.carpet_source(viewport)
+        if layer is None:
+            raise ValueError("no time series loaded to draw a carpet of")
+        data = self.store.ensure_ram(layer.key)
+
+        overlay = self.carpet_overlay(layer)
+        order_volume = None
+        if viewport.order in ("overlay", "roi"):
+            if overlay is None or overlay.key == layer.key:
+                raise ValueError(f"ordering by {viewport.order!r} needs an overlay above the run")
+            order_volume = self._aligned_volume(overlay, layer)
+
+        seed = None
+        if viewport.order == "seed":
+            ijk = self.state.seed or self.state.crosshair
+            seed = self.timeseries(layer.key, ijk)
+
+        sidebar = None
+        if overlay is not None and overlay.key != layer.key:
+            sidebar = self._aligned_volume(overlay, layer)
+
+        return layer, carpet_mod.build_carpet(
+            data,
+            order=viewport.order,
+            seed_series=seed,
+            order_volume=order_volume,
+            sidebar_volume=sidebar,
+            polort=int(viewport.detrend),
+            normalize=viewport.scaling,
+            device=self.store.device,
+            progress=progress,
+        )
+
+    def _aligned_volume(self, layer: Layer, like: Layer) -> np.ndarray | None:
+        """One layer's values on another's voxel grid, or None if they differ.
+
+        A carpet's rows are the *series*' voxels, so an overlay can only label
+        them if it sits on the same grid. Resampling it here would work, but a
+        silent resample is how a stat map ends up labelling the wrong rows --
+        better to say the overlay does not apply.
+        """
+        if layer.shape != like.shape or not np.allclose(layer.affine, like.affine, atol=1e-4):
+            return None
+        volume = self.volume(layer.key)
+        return np.asarray(volume, dtype=np.float32)
+
     def set_mode(self, name: str) -> Aspect:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:

@@ -327,9 +327,7 @@ def extract_plane(
     still goes through ``grid_sample``; at 0.08 ms the special case would cost
     more in divergent code paths than it saves.
     """
-    ijk = plane_indices(
-        grid, plane, position, view=view, device=volume.device, dtype=volume.dtype
-    )
+    ijk = plane_indices(grid, plane, position, view=view, device=volume.device, dtype=volume.dtype)
     layer_ijk = display_to_layer(ijk, grid.affine, layer_affine)
     return sample_volume(volume, layer_ijk, mode=mode, fill=fill)
 

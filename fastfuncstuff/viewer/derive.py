@@ -169,6 +169,24 @@ def orthonormal_basis(columns: np.ndarray, *, tol: float = RANK_TOL) -> np.ndarr
     return np.ascontiguousarray(u[:, :rank])
 
 
+def project_out(
+    flat: torch.Tensor,
+    basis: torch.Tensor,
+    *,
+    keep_mean: bool = True,
+) -> torch.Tensor:
+    """Residualise ``(V, T)`` against an orthonormal ``(T, r)`` basis.
+
+    The one-block form, so the carpet plot and the derived layer residualise
+    through the same three lines rather than two that drift.
+    """
+    mean = flat.mean(-1, keepdim=True)
+    out = flat - (flat @ basis) @ basis.T
+    if keep_mean:
+        out = out - out.mean(-1, keepdim=True) + mean
+    return out
+
+
 def denoise(
     data: np.ndarray,
     nuisance: Nuisance,
@@ -214,11 +232,7 @@ def denoise(
     for start in range(0, flat.shape[0], chunk):
         stop = min(start + chunk, flat.shape[0])
         block = torch.as_tensor(flat[start:stop]).to(device)
-        mean = block.mean(-1, keepdim=True)
-        block = block - (block @ basis) @ basis.T
-        if keep_mean:
-            block = block - block.mean(-1, keepdim=True) + mean
-        out[start:stop] = block.cpu().numpy()
+        out[start:stop] = project_out(block, basis, keep_mean=keep_mean).cpu().numpy()
         if progress is not None:
             progress(stop / flat.shape[0], f"projecting {nuisance.n_columns} columns")
 
@@ -231,5 +245,6 @@ __all__ = [
     "denoise",
     "legendre_columns",
     "orthonormal_basis",
+    "project_out",
     "read_nuisance",
 ]

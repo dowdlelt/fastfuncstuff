@@ -19,6 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
@@ -31,6 +32,9 @@ TILE_GAP = 6
 class WindowManager(QtCore.QObject):
     """Owns the companion windows and keeps them matching the viewports."""
 
+    #: A carpet needs rebuilding on the worker; the controller owns the runner.
+    rebuild_requested = QtCore.Signal(str)
+
     def __init__(
         self,
         session,
@@ -41,7 +45,7 @@ class WindowManager(QtCore.QObject):
         self.session = session
         self._dispatch = dispatch
         self._parent = parent
-        self.windows: dict[str, ImageWindow | GraphWindow] = {}
+        self.windows: dict[str, ImageWindow | GraphWindow | CarpetWindow] = {}
         #: Set while the manager is placing windows, so the geometry it writes
         #: back does not read as the user having dragged them.
         self._placing = False
@@ -65,9 +69,13 @@ class WindowManager(QtCore.QObject):
                 win.show()
             win.apply(viewport)
 
-    def _build(self, viewport: Viewport) -> ImageWindow | GraphWindow:
+    def _build(self, viewport: Viewport) -> ImageWindow | GraphWindow | CarpetWindow:
         if viewport.is_image:
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
+        elif viewport.is_carpet:
+            win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.scrubbed.connect(self._on_scrubbed)
+            win.rebuild_requested.connect(self.rebuild_requested)
         else:
             win = GraphWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
@@ -109,6 +117,8 @@ class WindowManager(QtCore.QObject):
                 if images:
                     win.redraw()
             elif graphs:
+                # A carpet's refresh only moves its time cursor; the picture
+                # itself is seconds of work and is rebuilt deliberately.
                 win.refresh()
 
     def restyle(self) -> None:
@@ -120,7 +130,14 @@ class WindowManager(QtCore.QObject):
     def open(self, kind: ViewKind, plane: Plane = Plane.AXIAL) -> str:
         return self.session.open_view(kind, plane)
 
-    def focused(self) -> ImageWindow | GraphWindow | None:
+    def carpets(self) -> list[CarpetWindow]:
+        return [w for w in self.windows.values() if isinstance(w, CarpetWindow)]
+
+    def mark_carpets_stale(self) -> None:
+        for window in self.carpets():
+            window.mark_stale()
+
+    def focused(self) -> ImageWindow | GraphWindow | CarpetWindow | None:
         """Whichever companion window has focus, if any."""
         active = QtWidgets.QApplication.activeWindow()
         for win in self.windows.values():

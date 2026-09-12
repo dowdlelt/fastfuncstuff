@@ -1161,3 +1161,99 @@ def test_zoom_and_pan_are_recorded(win, qapp):
     qapp.processEvents()
     names = [c.name for c in win.session.bus.log]
     assert "SET_ZOOM" in names and "SET_PAN" in names
+
+
+# ---------------------------------------------------------------------------
+# the carpet window
+# ---------------------------------------------------------------------------
+
+
+def _carpet(win4d, qapp):
+    win4d.session.store.ensure_ram(win4d.session.state.layers.overlay.key)
+    win4d.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    win4d._new_carpet()
+    assert win4d.runner.wait(30_000)
+    qapp.processEvents()
+    return win4d.manager.carpets()[0]
+
+
+def test_a_carpet_opens_as_its_own_window(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    assert carpet.isWindow()
+    assert win4d.session.state.viewports.get(carpet.vid).kind.value == "carpet"
+    assert carpet.view._image is not None
+
+
+def test_the_carpet_draws_one_column_per_volume(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    assert carpet.view._image.width() == win4d.session.state.layers.overlay.n_volumes
+
+
+def test_changing_the_order_rebuilds_it(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetCarpetOrder
+
+    carpet = _carpet(win4d, qapp)
+    before = carpet.info.text()
+    win4d._dispatch(SetCarpetOrder(carpet.vid, "voxel"))
+    win4d.runner.wait(30_000)
+    qapp.processEvents()
+    assert carpet.info.text() != before
+    assert "acquisition order" in carpet.info.text()
+
+
+def test_an_unknown_order_is_refused(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetCarpetOrder
+
+    carpet = _carpet(win4d, qapp)
+    with pytest.raises(KeyError):
+        win4d.session.do(SetCarpetOrder(carpet.vid, "spiral"))
+
+
+def test_a_layer_change_marks_it_stale_rather_than_rebuilding(win4d, qapp, tmp_path):
+    """Seconds of work; rebuilding on a threshold drag would be unusable.
+
+    But a sidebar drawn from an overlay that has since been swapped is a stale
+    widget with no numbers on it to contradict, so it has to say so.
+    """
+    from fastfuncstuff.viewer.vocab import AddOverlay
+
+    carpet = _carpet(win4d, qapp)
+    assert "stale" not in carpet.info.text()
+
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    other = tmp_path / "other.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((10, 12, 8), np.float32), aff), str(other))
+    win4d.refresh(win4d.session.do(AddOverlay(str(other))))
+    qapp.processEvents()
+    assert "stale" in carpet.info.text()
+
+
+def test_the_carpet_scrubs_time_like_a_graph(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    carpet.scrubbed.emit(9)
+    qapp.processEvents()
+    assert win4d.session.state.time_index == 9
+
+
+def test_the_carpet_is_recorded_and_replayable(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    script = win4d.session.to_script()
+    assert f"OPEN_VIEW {carpet.vid} carpet" in script
+
+    replayed = ViewerSession(device=CPU)
+    try:
+        replayed.run_script(script)
+        assert replayed.state.viewports.get(carpet.vid).is_carpet
+    finally:
+        replayed.close()
+
+
+def test_the_carpet_sheds_its_controls_when_narrow(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(700, 400)
+    qapp.processEvents()
+    assert carpet.controls.isVisible()
+    carpet.resize(150, 150)
+    qapp.processEvents()
+    assert not carpet.controls.isVisible()

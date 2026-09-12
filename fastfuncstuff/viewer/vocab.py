@@ -210,6 +210,35 @@ class SetViewSharedScale(Command):
 
 @command
 @dataclass(frozen=True)
+class SetCarpetOrder(Command):
+    """How a carpet's rows are sorted -- see :mod:`viewer.carpet`."""
+
+    name = "SET_CARPET_ORDER"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    order: str
+
+
+@command
+@dataclass(frozen=True)
+class SetCarpetDetrend(Command):
+    name = "SET_CARPET_DETREND"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    detrend: int
+
+
+@command
+@dataclass(frozen=True)
+class SetCarpetScaling(Command):
+    name = "SET_CARPET_SCALING"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    scaling: str
+
+
+@command
+@dataclass(frozen=True)
 class SetViewGeometry(Command):
     """Where a window sits on screen, so a saved session comes back tiled."""
 
@@ -755,6 +784,27 @@ def install(
     def _set_view_shared(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewSharedScale)
         return _set_view(st, cmd.view, SetViewSharedScale.aspects, shared_scale=bool(cmd.on))
+
+    @bus.handle(SetCarpetOrder.name)
+    def _set_carpet_order(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetCarpetOrder)
+        from fastfuncstuff.viewer.carpet import ORDERINGS
+
+        if cmd.order not in ORDERINGS:
+            raise KeyError(f"unknown carpet ordering {cmd.order!r}; have {ORDERINGS}")
+        return _set_view(st, cmd.view, SetCarpetOrder.aspects, order=cmd.order)
+
+    @bus.handle(SetCarpetDetrend.name)
+    def _set_carpet_detrend(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetCarpetDetrend)
+        return _set_view(st, cmd.view, SetCarpetDetrend.aspects, detrend=int(cmd.detrend))
+
+    @bus.handle(SetCarpetScaling.name)
+    def _set_carpet_scaling(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetCarpetScaling)
+        if cmd.scaling not in ("z", "psc"):
+            raise KeyError(f"unknown carpet scaling {cmd.scaling!r}")
+        return _set_view(st, cmd.view, SetCarpetScaling.aspects, scaling=cmd.scaling)
 
     @bus.handle(SetViewGeometry.name)
     def _set_view_geometry(cmd: Command, st: ViewerState) -> Aspect:

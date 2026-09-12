@@ -57,6 +57,7 @@ MAX_GRID = 16
 class ViewKind(StrEnum):
     IMAGE = "image"
     GRAPH = "graph"
+    CARPET = "carpet"
 
 
 @dataclass(frozen=True)
@@ -99,6 +100,16 @@ class Viewport:
     traces: tuple[str, ...] = ()
     shared_scale: bool = True
 
+    # -- carpet --------------------------------------------------------
+    #: Row order. See :mod:`viewer.carpet` for what each one groups.
+    order: str = "pc1"
+    #: Legendre drift projected out before drawing. A carpet is unreadable
+    #: through a linear ramp; anything richer is a job for DERIVE, and then
+    #: this window is pointed at the result.
+    detrend: int = 1
+    #: ``z`` or ``psc``.
+    scaling: str = "z"
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -115,6 +126,10 @@ class Viewport:
         return self.kind is ViewKind.GRAPH
 
     @property
+    def is_carpet(self) -> bool:
+        return self.kind is ViewKind.CARPET
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -126,6 +141,8 @@ class Viewport:
         "axial" alone stops identifying anything -- and the id is what a
         script addresses, so seeing it is what makes a recording readable.
         """
+        if self.is_carpet:
+            return f"carpet · {self.order}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -151,8 +168,8 @@ class ViewportSet:
         return [v.id for v in self.viewports]
 
     def mint_id(self, kind: ViewKind) -> str:
-        """A fresh id: ``V1`` for images, ``G1`` for graphs."""
-        stem = "V" if kind is ViewKind.IMAGE else "G"
+        """A fresh id: ``V1`` images, ``G1`` graphs, ``C1`` carpets."""
+        stem = {ViewKind.IMAGE: "V", ViewKind.GRAPH: "G", ViewKind.CARPET: "C"}[kind]
         n = self._seq.get(stem, 0)
         while True:
             n += 1
@@ -202,6 +219,10 @@ class ViewportSet:
     @property
     def graphs(self) -> list[Viewport]:
         return self.of_kind(ViewKind.GRAPH)
+
+    @property
+    def carpets(self) -> list[Viewport]:
+        return self.of_kind(ViewKind.CARPET)
 
 
 def clamp_grid(n: int) -> int:
