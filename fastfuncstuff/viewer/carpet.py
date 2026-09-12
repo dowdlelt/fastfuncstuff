@@ -120,10 +120,19 @@ def _first_pc(rows: torch.Tensor) -> torch.Tensor:
     covariance: the covariance costs V*T^2 and this costs V*T*q, and what the
     component is used for is an *ordering*. A slightly rotated first component
     reorders rows that were already adjacent.
+
+    Routed off Metal through the measured policy, because ``svd_lowrank``'s
+    range finder is a ``linalg.qr`` -- the one op in the table that does not
+    merely lose on MPS but asks for a 44 GiB buffer and dies. Nothing here
+    tests ``device.type``; the table is the single place that question is
+    answered.
     """
+    from fastfuncstuff.utils import cpu_if_mps
+
+    where = cpu_if_mps(rows.device, "qr")
     q = min(4, min(rows.shape) - 1) or 1
-    _, _, v = torch.svd_lowrank(rows, q=q, niter=2)
-    return v[:, 0]
+    _, _, v = torch.svd_lowrank(rows.to(where), q=q, niter=2)
+    return v[:, 0].to(rows.device)
 
 
 def _correlate(rows: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:

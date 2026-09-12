@@ -30,7 +30,28 @@ class Binding:
 
 
 def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
-    """Register every binding on ``widget`` as a window-level shortcut."""
+    """Register every binding on ``widget`` as a window-level shortcut.
+
+    Refuses a table with two bindings on one key. Qt does **not** distinguish
+    case in a key sequence -- ``QKeySequence("d") == QKeySequence("D")`` -- so a
+    table offering `d` for one thing and `D` for another registers two actions
+    on the same key, and Qt then fires *neither*, reporting an ambiguous
+    overload to stderr where nobody reads it. Five pairs were written that way
+    before anyone tried them. Uppercase means ``shift+d``, spelled out.
+    """
+    seen: dict[str, str] = {}
+    for binding in bindings:
+        for spelling in (binding.keys, *binding.aliases):
+            if binding.action is None:
+                continue
+            key = QtGui.QKeySequence(spelling).toString()
+            if key in seen:
+                raise ValueError(
+                    f"two shortcuts on {key!r}: {seen[key]!r} and {binding.description!r}. "
+                    "Qt ignores case, so 'd' and 'D' are one key; write 'shift+d'."
+                )
+            seen[key] = binding.description
+
     for binding in bindings:
         if binding.action is None:
             continue
@@ -45,6 +66,30 @@ def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
             # Every binding here is a nullary gesture, so none of them want it.
             action.triggered.connect(lambda *_, fn=binding.action: fn())
             widget.addAction(action)
+
+
+#: Widget types that eat plain keystrokes when focused. Lists and combos both
+#: implement type-to-search, so a focused one consumes every letter; a button
+#: takes Space. None of them need the keyboard here -- each has a shortcut of
+#: its own -- and a control that silently disables the shortcut table the
+#: moment you click it is worse than one you cannot tab to.
+_KEY_EATERS = (QtWidgets.QAbstractItemView, QtWidgets.QComboBox, QtWidgets.QAbstractButton)
+
+
+def keep_keys_for_shortcuts(root: QtWidgets.QWidget) -> None:
+    """Stop ``root``'s controls from swallowing single-key shortcuts.
+
+    Clicking a layer in the list is the most common gesture in the viewer, and
+    it moved focus into a QListWidget -- after which `d`, `c`, `o` and the rest
+    went to its type-to-search instead of to the action table. Reported as "the
+    keyboard shortcuts don't work", which is exactly what it looked like.
+
+    Text entry is deliberately untouched: while you are typing a path into a
+    line edit, the letters belong to the line edit.
+    """
+    for widget in root.findChildren(QtWidgets.QWidget):
+        if isinstance(widget, _KEY_EATERS):
+            widget.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
 
 
 class ShortcutsDialog(QtWidgets.QDialog):

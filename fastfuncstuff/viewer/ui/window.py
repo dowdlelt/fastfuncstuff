@@ -35,7 +35,7 @@ from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.manager import WindowManager
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
@@ -106,6 +106,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._build_panel()
         self._build_statusbar()
         self._install_shortcuts()
+        keep_keys_for_shortcuts(self)
 
         # Mode preparation runs on a worker; the mode is told to defer so a
         # seed click never runs seconds of filtering inside the click handler.
@@ -211,10 +212,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         for text, key, tip, slot in (
             ("+IMAGE", "n", "Open another image window", self._new_image),
-            ("+GRAPH", "N", "Open a graph window", self._new_graph),
-            ("+CARPET", "C", "Open a carpet plot of the selected run", self._new_carpet),
+            ("+GRAPH", "\u21e7N", "Open a graph window", self._new_graph),
+            ("+CARPET", "\u21e7C", "Open a carpet plot of the selected run", self._new_carpet),
             ("TILE", "f", "Lay every window out on a grid", self._tile),
-            ("STACK", "F", "Stagger the windows so each title bar is reachable", self._cascade),
+            (
+                "STACK",
+                "\u21e7F",
+                "Stagger the windows so each title bar is reachable",
+                self._cascade,
+            ),
             ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
@@ -588,10 +594,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.polort_spin.setMaximumWidth(70)
         row2.addWidget(self.polort_spin)
         row2.addStretch(1)
-        self.denoise_button = QtWidgets.QPushButton(key_label("DENOISE", "D"))
+        self.denoise_button = QtWidgets.QPushButton(key_label("DENOISE", "\u21e7D"))
         self.denoise_button.setToolTip(
             "Project the nuisance out of the selected layer, as a new layer "
-            "just above it (D).\nNeighbours in the stack are what [ and ] "
+            "just above it (shift+D).\nNeighbours in the stack are what [ and ] "
             "flip between, so raw against denoised is one keypress."
         )
         self.denoise_button.clicked.connect(self._denoise)
@@ -693,10 +699,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("PgDn", "crosshair -z", lambda: self._nudge(2, -1), group="navigate"),
                 Binding("PgUp", "crosshair +z", lambda: self._nudge(2, 1), group="navigate"),
                 Binding("n", "open an image window", self._new_image, group="windows"),
-                Binding("N", "open a graph window", self._new_graph, group="windows"),
-                Binding("C", "open a carpet plot", self._new_carpet, group="windows"),
+                Binding("shift+n", "open a graph window", self._new_graph, group="windows"),
+                Binding("shift+c", "open a carpet plot", self._new_carpet, group="windows"),
                 Binding("f", "tile every window", self._tile, group="windows"),
-                Binding("F", "stagger every window", self._cascade, group="windows"),
+                Binding("shift+f", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
                 Binding("d", "dark / light palette", self._toggle_theme, group="windows"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
@@ -706,12 +712,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("]", "next layer", lambda: self._cycle_layer(1), group="layer"),
                 Binding("space", "show / hide layer", self._toggle_visible, group="layer"),
                 Binding("t", "threshold down", lambda: self._nudge_threshold(-0.05), group="layer"),
-                Binding("T", "threshold up", lambda: self._nudge_threshold(0.05), group="layer"),
+                Binding(
+                    "shift+t", "threshold up", lambda: self._nudge_threshold(0.05), group="layer"
+                ),
                 Binding("c", "next colormap", self._cycle_colormap, group="layer"),
                 Binding("s", "next sign mode", self._cycle_sign, group="layer"),
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
-                Binding("D", "denoise the selected layer", self._denoise, group="layer"),
+                Binding("shift+d", "denoise the selected layer", self._denoise, group="layer"),
                 Binding("{", "move layer down the stack", lambda: self._reorder(-1), group="layer"),
                 Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
                 Binding("u", "make it the underlay", self._make_underlay, group="layer"),

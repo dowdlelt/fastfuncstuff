@@ -31,7 +31,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import SetViewGrid, SetViewSharedScale, SetViewTraces
 
@@ -324,6 +324,7 @@ class GraphWindow(QtWidgets.QWidget):
                 Binding("w", "close this window", self.close, group="window"),
             ]
         )
+        keep_keys_for_shortcuts(self)
 
     def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 (Qt)
         """Shed the controls as the window narrows; the keys still work."""

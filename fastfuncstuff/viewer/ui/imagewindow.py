@@ -23,7 +23,7 @@ from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.panes import ImagePane
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetIJK,
@@ -135,6 +135,7 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("w", "close this window", self.close, group="window"),
             ]
         )
+        keep_keys_for_shortcuts(self)
 
     def _button(self, text: str, key: str, tip: str) -> QtWidgets.QPushButton:
         """A header button that knows how to say itself in less space."""

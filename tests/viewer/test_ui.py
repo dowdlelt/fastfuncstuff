@@ -1257,3 +1257,77 @@ def test_the_carpet_sheds_its_controls_when_narrow(win4d, qapp):
     carpet.resize(150, 150)
     qapp.processEvents()
     assert not carpet.controls.isVisible()
+
+
+# ---------------------------------------------------------------------------
+# the keys have to actually fire
+#
+# Reported as "the shortcuts don't work". Two causes, both invisible in code:
+# Qt does not distinguish case in a key sequence, so `d` and `D` registered two
+# actions on one key and Qt fired neither; and clicking a layer moved focus
+# into a QListWidget, whose type-to-search then ate every letter.
+# ---------------------------------------------------------------------------
+
+
+def test_no_two_shortcuts_share_a_key(win, qapp):
+    """`d` and `D` are the same key to Qt. Five pairs were written that way."""
+    from PySide6 import QtGui
+
+    windows = [win, *win.manager.windows.values()]
+    for window in windows:
+        seen: dict[str, str] = {}
+        for binding in window.help._bindings:
+            if binding.action is None:
+                continue
+            key = QtGui.QKeySequence(binding.keys).toString()
+            assert key not in seen, (
+                f"{type(window).__name__}: {key!r} is both "
+                f"{seen[key]!r} and {binding.description!r}"
+            )
+            seen[key] = binding.description
+
+
+def test_installing_two_bindings_on_one_key_is_refused(qapp):
+    from fastfuncstuff.viewer.ui.shortcuts import Binding, install
+
+    widget = QtWidgets.QWidget()
+    try:
+        with pytest.raises(ValueError, match="two shortcuts"):
+            install(
+                widget,
+                [
+                    Binding("d", "dark / light", lambda: None),
+                    Binding("D", "denoise", lambda: None),
+                ],
+            )
+    finally:
+        widget.deleteLater()
+
+
+def test_clicking_a_layer_does_not_disable_the_keyboard(win, qapp):
+    """The list's type-to-search was eating every letter after a click."""
+    from PySide6 import QtCore
+
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert win.layer_list.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
+    for box in (win.cmap_box, win.mode_box, win.underlay_box):
+        assert box.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
+
+
+def test_text_entry_keeps_its_keys(win):
+    """While you are typing a path, the letters belong to the line edit."""
+    from PySide6 import QtCore
+
+    assert win.matrix_edit.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus
+
+
+def test_the_theme_key_fires(win, qapp):
+    from PySide6 import QtGui
+
+    action = next(a for a in win.actions() if a.shortcut() == QtGui.QKeySequence("d"))
+    action.trigger()
+    qapp.processEvents()
+    assert win.session.state.theme == "light"
+    win._toggle_theme()
+    qapp.processEvents()

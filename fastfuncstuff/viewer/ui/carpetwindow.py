@@ -19,7 +19,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.carpet import ORDER_LABELS, ORDERINGS, Carpet
 from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetCarpetDetrend,
@@ -245,6 +245,7 @@ class CarpetWindow(QtWidgets.QWidget):
                 Binding("w", "close this window", self.close, group="window"),
             ]
         )
+        keep_keys_for_shortcuts(self)
 
     # -- input ---------------------------------------------------------
     def _pick_layer(self, _index: int) -> None:
