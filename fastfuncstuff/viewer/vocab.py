@@ -221,8 +221,16 @@ class SetCarpetOrder(Command):
 
 @command
 @dataclass(frozen=True)
-class SetCarpetDetrend(Command):
-    name = "SET_CARPET_DETREND"
+class SetViewDetrend(Command):
+    """Legendre drift projected out before a carpet or a matrix is built.
+
+    Not carpet-specific, which is why it is not called that: a correlation
+    between two undetrended runs is mostly a correlation between two drifts,
+    so a matrix window needs the same control for a stronger reason than the
+    carpet does.
+    """
+
+    name = "SET_VIEW_DETREND"
     aspects = Aspect.VIEWPORTS | Aspect.GRAPH
     view: str
     detrend: int
@@ -230,11 +238,42 @@ class SetCarpetDetrend(Command):
 
 @command
 @dataclass(frozen=True)
-class SetCarpetScaling(Command):
-    name = "SET_CARPET_SCALING"
+class SetViewScaling(Command):
+    name = "SET_VIEW_SCALING"
     aspects = Aspect.VIEWPORTS | Aspect.GRAPH
     view: str
     scaling: str
+
+
+@command
+@dataclass(frozen=True)
+class SetMatrixOrder(Command):
+    """How a correlation matrix's nodes are ordered -- see :mod:`viewer.matrix`.
+
+    The most consequential control on the window. A connectivity matrix in
+    atlas order is a picture of the atlas's numbering; seriated, the same
+    numbers become blocks on the diagonal and the blocks are the networks.
+    """
+
+    name = "SET_MATRIX_ORDER"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    order: str
+
+
+@command
+@dataclass(frozen=True)
+class SetViewRois(Command):
+    """Which ROI layer supplies a matrix window's nodes, by layer key.
+
+    ``-`` means the topmost ROI layer, and no ROI layer at all means the
+    matrix falls back to bins of voxels grouped by how they move.
+    """
+
+    name = "SET_VIEW_ROIS"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    key: str = ""
 
 
 @command
@@ -811,17 +850,32 @@ def install(
             raise KeyError(f"unknown carpet ordering {cmd.order!r}; have {ORDERINGS}")
         return _set_view(st, cmd.view, SetCarpetOrder.aspects, order=cmd.order)
 
-    @bus.handle(SetCarpetDetrend.name)
+    @bus.handle(SetViewDetrend.name)
     def _set_carpet_detrend(cmd: Command, st: ViewerState) -> Aspect:
-        assert isinstance(cmd, SetCarpetDetrend)
-        return _set_view(st, cmd.view, SetCarpetDetrend.aspects, detrend=int(cmd.detrend))
+        assert isinstance(cmd, SetViewDetrend)
+        return _set_view(st, cmd.view, SetViewDetrend.aspects, detrend=int(cmd.detrend))
 
-    @bus.handle(SetCarpetScaling.name)
+    @bus.handle(SetMatrixOrder.name)
+    def _set_matrix_order(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetMatrixOrder)
+        from fastfuncstuff.viewer.matrix import ORDERINGS
+
+        if cmd.order not in ORDERINGS:
+            raise KeyError(f"unknown matrix ordering {cmd.order!r}; have {ORDERINGS}")
+        return _set_view(st, cmd.view, SetMatrixOrder.aspects, matrix_order=cmd.order)
+
+    @bus.handle(SetViewRois.name)
+    def _set_view_rois(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewRois)
+        key = "" if cmd.key in ("", "-") else cmd.key
+        return _set_view(st, cmd.view, SetViewRois.aspects, rois=key)
+
+    @bus.handle(SetViewScaling.name)
     def _set_carpet_scaling(cmd: Command, st: ViewerState) -> Aspect:
-        assert isinstance(cmd, SetCarpetScaling)
+        assert isinstance(cmd, SetViewScaling)
         if cmd.scaling not in ("z", "psc"):
             raise KeyError(f"unknown carpet scaling {cmd.scaling!r}")
-        return _set_view(st, cmd.view, SetCarpetScaling.aspects, scaling=cmd.scaling)
+        return _set_view(st, cmd.view, SetViewScaling.aspects, scaling=cmd.scaling)
 
     @bus.handle(SetViewGeometry.name)
     def _set_view_geometry(cmd: Command, st: ViewerState) -> Aspect:

@@ -48,15 +48,14 @@ from fastfuncstuff.viewer.vocab import (
     SelectLayer,
     SetAlpha,
     SetBoxed,
-    SetCarpetDetrend,
     SetCarpetOrder,
-    SetCarpetScaling,
     SetColormap,
     SetIJK,
     SetIndex,
     SetLayerOpacity,
     SetLayerRoi,
     SetLayerVisible,
+    SetMatrixOrder,
     SetMode,
     SetModeParam,
     SetOverlay,
@@ -68,12 +67,26 @@ from fastfuncstuff.viewer.vocab import (
     SetThresholdIndex,
     SetTimeLinked,
     SetUnderlay,
+    SetViewDetrend,
+    SetViewRois,
+    SetViewScaling,
     SetViewTraces,
     SetVolume,
 )
 
-#: Commands that change what a carpet draws, as opposed to what is around it.
-CARPET_SETTINGS = (SetCarpetDetrend, SetCarpetOrder, SetCarpetScaling, SetViewTraces)
+#: Commands that change what a built window draws, as opposed to what is around
+#: it. A carpet and a matrix are both seconds of arithmetic, so these rebuild
+#: and everything else only marks the picture stale.
+BUILT_SETTINGS = (
+    SetViewDetrend,
+    SetCarpetOrder,
+    SetMatrixOrder,
+    SetViewRois,
+    SetMatrixOrder,
+    SetViewRois,
+    SetViewScaling,
+    SetViewTraces,
+)
 
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
 #: displayed reads as a load that failed.
@@ -101,7 +114,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         session.on_loaded(self._bridge.loaded.emit)
 
         self.manager = WindowManager(session, self._dispatch, self)
-        self.manager.rebuild_requested.connect(self.rebuild_carpet)
+        self.manager.rebuild_requested.connect(self.rebuild_view)
+        self.manager.roi_picked.connect(self._go_to_roi)
 
         self._build_selector()
         self._build_panel()
@@ -136,14 +150,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(self.session.do(cmd))
         if isinstance(cmd, SetSeed) and self.session.mode.needs_prepare:
             self._prepare_then_refresh()
-        # A carpet's own settings decide its picture, so changing one rebuilds
-        # it. Everything else that could invalidate it -- a new overlay, a new
-        # layer -- only marks it stale, because a carpet is seconds of work and
-        # rebuilding on a threshold drag would be unusable.
-        if isinstance(cmd, CARPET_SETTINGS):
+        # A built window's own settings decide its picture, so changing one
+        # rebuilds it. Everything else that could invalidate it -- a new
+        # overlay, a new layer -- only marks it stale, because this is seconds
+        # of work and rebuilding on a threshold drag would be unusable.
+        if isinstance(cmd, BUILT_SETTINGS):
             viewport = self.session.state.viewports.find(cmd.view)
-            if viewport is not None and viewport.is_carpet:
-                self.rebuild_carpet(cmd.view)
+            if viewport is not None and (viewport.is_carpet or viewport.is_matrix):
+                self.rebuild_view(cmd.view)
 
     # ------------------------------------------------------------------
     # the core: read / underlay / overlay / +1 / mode
@@ -215,6 +229,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ("+IMAGE", "n", "Open another image window", self._new_image),
             ("+GRAPH", "\u21e7N", "Open a graph window", self._new_graph),
             ("+CARPET", "\u21e7C", "Open a carpet plot of the selected run", self._new_carpet),
+            (
+                "+MATRIX",
+                "\u21e7M",
+                "Open a correlation matrix of the ROIs, or of voxel bins",
+                self._new_matrix,
+            ),
             ("TILE", "f", "Lay every window out on a grid", self._tile),
             (
                 "STACK",
@@ -328,44 +348,57 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
 
     def _new_carpet(self) -> None:
-        vid = self.manager.open(ViewKind.CARPET, Plane.AXIAL)
+        self._open_built(ViewKind.CARPET)
+
+    def _new_matrix(self) -> None:
+        self._open_built(ViewKind.MATRIX)
+
+    def _open_built(self, kind: ViewKind) -> None:
+        vid = self.manager.open(kind, Plane.AXIAL)
         # Start it on the layer the controls are aimed at, which is what
-        # "carpet this" means when a run is selected.
+        # "carpet this" or "correlate this" means when a run is selected.
         layer = self.session.state.selected_layer()
         if layer is not None and layer.time_linked and layer.n_volumes > 1:
             self.session.do(SetViewTraces(vid, layer.key))
         self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
-        self.rebuild_carpet(vid)
+        self.rebuild_view(vid)
 
-    def rebuild_carpet(self, vid: str) -> None:
-        """Build one carpet on the worker and hand the picture back.
+    def rebuild_view(self, vid: str) -> None:
+        """Build one carpet or matrix on the worker and hand the picture back.
 
         Same split as a mode and as DERIVE: the arithmetic touches only arrays,
-        the install happens here. A carpet of a real run is several seconds, so
-        this is never allowed near the click handler.
+        the install happens here. Either picture is several seconds on a real
+        run, so this is never allowed near the click handler.
         """
         from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+        from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
 
         window = self.manager.windows.get(vid)
         viewport = self.session.state.viewports.find(vid)
-        if not isinstance(window, CarpetWindow) or viewport is None or self.runner.busy:
+        if viewport is None or self.runner.busy:
+            return
+        if isinstance(window, CarpetWindow):
+            build, show, what = self.session.build_carpet, window.show_carpet, "a carpet"
+        elif isinstance(window, MatrixWindow):
+            build, show, what = self.session.build_matrix, window.show_matrix, "a matrix"
+        else:
             return
         built: dict[str, object] = {}
 
         def job(progress) -> bool:
-            _, carpet = self.session.build_carpet(viewport, progress=progress)
-            built["carpet"] = carpet
+            _, picture = build(viewport, progress=progress)
+            built["picture"] = picture
             return True
 
         def done(ok: bool, error: str) -> None:
             self.runner.finished.disconnect(done)
             window.set_busy(False)
             if ok:
-                window.show_carpet(built.get("carpet"))
+                show(built.get("picture"))
             else:
                 # On the window rather than the status bar: the thing that
                 # failed is the thing you are looking at.
-                window.show_carpet(None, error or "could not build a carpet")
+                show(None, error or f"could not build {what}")
 
         window.set_busy(True)
         self.runner.finished.connect(done)
@@ -373,10 +406,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.runner.finished.disconnect(done)
             window.set_busy(False)
 
-    def _rebuild_carpets(self) -> None:
-        """Rebuild every carpet whose settings changed. One at a time."""
-        for window in self.manager.carpets():
-            self.rebuild_carpet(window.vid)
+    def _go_to_roi(self, key: str, index: int) -> None:
+        """Put the crosshair in the region a matrix row names.
+
+        The centre of mass, not a peak: an ROI has no peak, and the centre is
+        the one point that means the same thing for a sphere, a parcel and a
+        C-shaped structure -- even when, for the last of those, it is outside
+        the region. Better a defined answer than a plausible one.
+        """
+        rois = self.session.roi_set(key)
+        found = rois.find(index) if rois is not None else None
+        if found is not None:
+            self._dispatch(SetIJK(*found.center_ijk))
 
     def _next_plane(self) -> Plane:
         """Offer the plane that is not already on screen, then wrap.
@@ -712,6 +753,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("n", "open an image window", self._new_image, group="windows"),
                 Binding("shift+n", "open a graph window", self._new_graph, group="windows"),
                 Binding("shift+c", "open a carpet plot", self._new_carpet, group="windows"),
+                Binding("shift+m", "open a correlation matrix", self._new_matrix, group="windows"),
                 Binding("f", "tile every window", self._tile, group="windows"),
                 Binding("shift+f", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
@@ -982,7 +1024,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if dirty & (Aspect.VIEWPORTS | Aspect.LAYERS | Aspect.GRID):
             self.manager.sync()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
-            self.manager.mark_carpets_stale()
+            self.manager.mark_built_stale()
         self.manager.redraw(dirty)
         self._sync_readout()
 

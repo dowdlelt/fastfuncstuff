@@ -22,18 +22,26 @@ from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
 from fastfuncstuff.viewer.vocab import CloseView, SetViewGeometry
 
 #: Gap left between tiled windows, and around the edge of the work area.
 TILE_GAP = 6
 
+#: Every kind of companion window. They share no base class on purpose -- what
+#: they have in common is the four methods the manager calls, not an ancestry.
+Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow
+
 
 class WindowManager(QtCore.QObject):
     """Owns the companion windows and keeps them matching the viewports."""
 
-    #: A carpet needs rebuilding on the worker; the controller owns the runner.
+    #: A carpet or matrix needs rebuilding on the worker; the controller owns
+    #: the runner.
     rebuild_requested = QtCore.Signal(str)
+    #: A window asked to make one ROI the focus: (layer key, label value).
+    roi_picked = QtCore.Signal(str, int)
 
     def __init__(
         self,
@@ -45,7 +53,7 @@ class WindowManager(QtCore.QObject):
         self.session = session
         self._dispatch = dispatch
         self._parent = parent
-        self.windows: dict[str, ImageWindow | GraphWindow | CarpetWindow] = {}
+        self.windows: dict[str, Companion] = {}
         #: Set while the manager is placing windows, so the geometry it writes
         #: back does not read as the user having dragged them.
         self._placing = False
@@ -69,12 +77,20 @@ class WindowManager(QtCore.QObject):
                 win.show()
             win.apply(viewport)
 
-    def _build(self, viewport: Viewport) -> ImageWindow | GraphWindow | CarpetWindow:
+    def _build(self, viewport: Viewport) -> Companion:
         if viewport.is_image:
             win = ImageWindow(viewport.id, self.session, self._dispatch, self._parent)
         elif viewport.is_carpet:
             win = CarpetWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.scrubbed.connect(self._on_scrubbed)
+            # Both axes of a carpet mean something outside it: across is the
+            # volume, down is a voxel. Wiring only the first made half of every
+            # click disappear.
+            win.located.connect(self._on_located)
+            win.rebuild_requested.connect(self.rebuild_requested)
+        elif viewport.is_matrix:
+            win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.node_picked.connect(self.roi_picked)
             win.rebuild_requested.connect(self.rebuild_requested)
         else:
             win = GraphWindow(viewport.id, self.session, self._dispatch, self._parent)
@@ -92,6 +108,11 @@ class WindowManager(QtCore.QObject):
         from fastfuncstuff.viewer.vocab import SetIndex
 
         self._dispatch(SetIndex(int(index)))
+
+    def _on_located(self, i: int, j: int, k: int) -> None:
+        from fastfuncstuff.viewer.vocab import SetIJK
+
+        self._dispatch(SetIJK(int(i), int(j), int(k)))
 
     # -- drawing ---------------------------------------------------------
     def redraw(self, dirty: Aspect) -> None:
@@ -133,11 +154,15 @@ class WindowManager(QtCore.QObject):
     def carpets(self) -> list[CarpetWindow]:
         return [w for w in self.windows.values() if isinstance(w, CarpetWindow)]
 
-    def mark_carpets_stale(self) -> None:
-        for window in self.carpets():
+    def built(self) -> list[CarpetWindow | MatrixWindow]:
+        """Windows whose picture is computed rather than drawn from state."""
+        return [w for w in self.windows.values() if isinstance(w, CarpetWindow | MatrixWindow)]
+
+    def mark_built_stale(self) -> None:
+        for window in self.built():
             window.mark_stale()
 
-    def focused(self) -> ImageWindow | GraphWindow | CarpetWindow | None:
+    def focused(self) -> Companion | None:
         """Whichever companion window has focus, if any."""
         active = QtWidgets.QApplication.activeWindow()
         for win in self.windows.values():
@@ -224,4 +249,4 @@ class WindowManager(QtCore.QObject):
         self.windows.clear()
 
 
-__all__ = ["TILE_GAP", "WindowManager"]
+__all__ = ["TILE_GAP", "Companion", "WindowManager"]

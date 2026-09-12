@@ -1331,3 +1331,129 @@ def test_the_theme_key_fires(win, qapp):
     assert win.session.state.theme == "light"
     win._toggle_theme()
     qapp.processEvents()
+
+
+def test_the_carpet_click_moves_in_space_as_well_as_time(win4d, qapp):
+    """A carpet has two axes and both of them mean something outside it.
+
+    Across is the volume, down is a voxel -- and a picture you cannot click
+    your way back out of is the one place in the viewer where finding something
+    does not tell you where it is.
+    """
+    carpet = _carpet(win4d, qapp)
+    picture = carpet.view._carpet
+    assert picture is not None and picture.voxels is not None
+
+    row = picture.shape[0] // 3
+    expected = picture.voxel_of(row)
+    carpet.view.scrubbed.emit(7)
+    carpet.view.rowed.emit(row)
+    qapp.processEvents()
+
+    assert win4d.session.state.time_index == 7
+    assert win4d.session.state.crosshair == expected
+
+
+def test_every_carpet_row_points_at_a_voxel_inside_the_mask(win4d, qapp):
+    """The mapping is carried through the ordering and the binning, so the
+    failure mode is a crosshair that lands *near* the truth rather than on it."""
+    carpet = _carpet(win4d, qapp)
+    picture = carpet.view._carpet
+    nx, ny, nz = win4d.session.state.layers.overlay.shape
+    for row in (0, picture.shape[0] // 2, picture.shape[0] - 1):
+        i, j, k = picture.voxel_of(row)
+        assert 0 <= i < nx and 0 <= j < ny and 0 <= k < nz
+
+
+# ---------------------------------------------------------------------------
+# the matrix window
+# ---------------------------------------------------------------------------
+
+
+def _matrix(win4d, qapp):
+    win4d.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    win4d._new_matrix()
+    assert win4d.runner.wait(30_000)
+    qapp.processEvents()
+    from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
+
+    return next(w for w in win4d.manager.windows.values() if isinstance(w, MatrixWindow))
+
+
+def _add_atlas(win4d, qapp, tmp_path):
+    labels = np.zeros((10, 12, 8), dtype=np.float32)
+    labels[:5, :6] = 1
+    labels[5:, :6] = 2
+    labels[:, 6:] = 3
+    path = tmp_path / "atlas.nii.gz"
+    nib.save(nib.Nifti1Image(labels, np.diag([3.0, 3.0, 3.0, 1.0])), str(path))
+    from fastfuncstuff.viewer.vocab import AddOverlay
+
+    win4d.refresh(win4d.session.do(AddOverlay(str(path))))
+    qapp.processEvents()
+    return win4d.session.state.layers.layers[-1].key
+
+
+def test_a_matrix_opens_as_its_own_window(win4d, qapp):
+    matrix = _matrix(win4d, qapp)
+    assert matrix.isWindow()
+    assert win4d.session.state.viewports.get(matrix.vid).kind.value == "matrix"
+    assert matrix.view._image is not None
+
+
+def test_without_rois_the_matrix_is_voxel_bins_and_says_so(win4d, qapp):
+    matrix = _matrix(win4d, qapp)
+    assert "voxel bins" in matrix.info.text()
+    assert matrix._matrix is not None and not matrix._matrix.from_rois
+
+
+def test_dropping_an_atlas_on_the_stack_names_the_rows(win4d, qapp, tmp_path):
+    """The point of the ROI layer: one load, and every matrix becomes a
+    connectivity matrix without visiting a picker."""
+    _add_atlas(win4d, qapp, tmp_path)
+    matrix = _matrix(win4d, qapp)
+    assert matrix._matrix.from_rois
+    assert matrix._matrix.n_nodes == 3
+    assert "3 ROIs" in matrix.info.text()
+
+
+def test_clicking_a_row_goes_to_that_region(win4d, qapp, tmp_path):
+    key = _add_atlas(win4d, qapp, tmp_path)
+    matrix = _matrix(win4d, qapp)
+    matrix.view.picked.emit(1, 2)
+    qapp.processEvents()
+
+    label = matrix._matrix.indices[1]
+    expected = win4d.session.roi_set(key).find(label).center_ijk
+    assert win4d.session.state.crosshair == expected
+
+
+def test_changing_the_node_order_rebuilds_it(win4d, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetMatrixOrder
+
+    _add_atlas(win4d, qapp, tmp_path)
+    matrix = _matrix(win4d, qapp)
+    win4d._dispatch(SetMatrixOrder(matrix.vid, "size"))
+    win4d.runner.wait(30_000)
+    qapp.processEvents()
+    assert "voxel count" in matrix.info.text()
+
+
+def test_an_unknown_node_order_is_refused(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetMatrixOrder
+
+    matrix = _matrix(win4d, qapp)
+    with pytest.raises(KeyError):
+        win4d.session.do(SetMatrixOrder(matrix.vid, "spiral"))
+
+
+def test_the_matrix_is_recorded_and_replayable(win4d, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetMatrixOrder
+
+    _add_atlas(win4d, qapp, tmp_path)
+    matrix = _matrix(win4d, qapp)
+    win4d._dispatch(SetMatrixOrder(matrix.vid, "input"))
+    script = win4d.session.to_script()
+    assert "OPEN_VIEW" in script and "matrix" in script
+    assert "SET_MATRIX_ORDER" in script

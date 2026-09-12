@@ -278,12 +278,13 @@ class ViewerSession:
         wanted = set(viewport.traces)
         return [ly for ly in available if ly.key in wanted]
 
-    def carpet_source(self, viewport) -> Layer | None:
-        """The one layer a carpet window draws.
+    def series_source(self, viewport) -> Layer | None:
+        """The one run a carpet or a matrix window is built from.
 
         Reuses a graph's trace selection rather than inventing a second way to
-        say "this layer": a carpet is a graph of every voxel, and the picker
-        that chooses what a graph plots is the same question.
+        say "this layer": a carpet is a graph of every voxel and a matrix is a
+        graph of every pair, and the picker that chooses what a graph plots is
+        the same question in all three.
         """
         available = self.graph_layers()
         if not available:
@@ -315,7 +316,7 @@ class ViewerSession:
         """
         from fastfuncstuff.viewer import carpet as carpet_mod
 
-        layer = self.carpet_source(viewport)
+        layer = self.series_source(viewport)
         if layer is None:
             raise ValueError("no time series loaded to draw a carpet of")
         data = self.store.ensure_ram(layer.key)
@@ -342,6 +343,52 @@ class ViewerSession:
             seed_series=seed,
             order_volume=order_volume,
             sidebar_volume=sidebar,
+            polort=int(viewport.detrend),
+            normalize=viewport.scaling,
+            device=self.store.device,
+            progress=progress,
+        )
+
+    def matrix_rois(self, viewport):
+        """The ROI set a matrix window uses, or ``None`` for voxel bins.
+
+        A named layer wins; otherwise the topmost ROI layer, so dropping an
+        atlas on the stack is enough to turn every open matrix into a
+        connectivity matrix without visiting a picker.
+        """
+        if viewport.rois:
+            return self.roi_set(viewport.rois)
+        for layer in reversed(self.roi_layers()):
+            found = self.roi_set(layer.key)
+            if found is not None and len(found):
+                return found
+        return None
+
+    def build_matrix(self, viewport, *, progress=None):
+        """Build one matrix window's picture. Slow; runs on the worker.
+
+        Reads arrays and returns one, like a mode's prepare() -- no session
+        state is touched, because the thread that paints owns all of that.
+        """
+        from fastfuncstuff.viewer import matrix as matrix_mod
+
+        layer = self.series_source(viewport)
+        if layer is None:
+            raise ValueError("no time series loaded to correlate")
+        data = self.store.ensure_ram(layer.key)
+
+        rois = self.matrix_rois(viewport)
+        if rois is not None and rois.shape != layer.shape:
+            # Saying so beats resampling silently: an atlas averaged on the
+            # wrong grid gives a full matrix of plausible numbers.
+            raise ValueError(
+                f"{rois.name} is on a {rois.shape} grid and {layer.name} is {layer.shape}; "
+                "resample one to the other to correlate them"
+            )
+        return layer, matrix_mod.build_matrix(
+            data,
+            rois=rois,
+            order=viewport.matrix_order,
             polort=int(viewport.detrend),
             normalize=viewport.scaling,
             device=self.store.device,

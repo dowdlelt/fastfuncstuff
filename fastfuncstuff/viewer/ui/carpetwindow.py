@@ -22,9 +22,9 @@ from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
-    SetCarpetDetrend,
     SetCarpetOrder,
-    SetCarpetScaling,
+    SetViewDetrend,
+    SetViewScaling,
     SetViewTraces,
 )
 
@@ -38,6 +38,11 @@ class CarpetView(QtWidgets.QWidget):
 
     #: A time index, from clicking somewhere along the carpet.
     scrubbed = QtCore.Signal(int)
+    #: A row index, from the same click. A carpet has two axes and both of them
+    #: mean something in the rest of the viewer -- across is the volume, down
+    #: is a voxel -- so a click that moved only the time cursor was throwing
+    #: half of itself away.
+    rowed = QtCore.Signal(int)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -145,9 +150,11 @@ class CarpetView(QtWidgets.QWidget):
         if self._carpet is None:
             return
         rect = self._carpet_rect()
-        nt = self._carpet.shape[1]
+        rows, nt = self._carpet.shape
         frac = (event.position().x() - rect.left()) / max(rect.width(), 1)
         self.scrubbed.emit(int(round(max(0.0, min(1.0, frac)) * (nt - 1))))
+        down = (event.position().y() - rect.top()) / max(rect.height(), 1)
+        self.rowed.emit(max(0, min(int(down * rows), rows - 1)))
 
 
 class CarpetWindow(QtWidgets.QWidget):
@@ -155,6 +162,8 @@ class CarpetWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(str)
     scrubbed = QtCore.Signal(int)
+    #: (i, j, k) of the voxel a clicked row stands for.
+    located = QtCore.Signal(int, int, int)
     #: Asks the controller to rebuild on the worker; it owns the runner.
     rebuild_requested = QtCore.Signal(str)
 
@@ -212,14 +221,14 @@ class CarpetWindow(QtWidgets.QWidget):
             "Drift projected out first; a carpet is unreadable through a ramp"
         )
         self.polort_spin.valueChanged.connect(
-            lambda n: self._dispatch(SetCarpetDetrend(self.vid, int(n)))
+            lambda n: self._dispatch(SetViewDetrend(self.vid, int(n)))
         )
         row2.addWidget(self.polort_spin)
         self.scale_box = QtWidgets.QComboBox()
         self.scale_box.addItem("z", userData="z")
         self.scale_box.addItem("% change", userData="psc")
         self.scale_box.activated.connect(
-            lambda _: self._dispatch(SetCarpetScaling(self.vid, self.scale_box.currentData()))
+            lambda _: self._dispatch(SetViewScaling(self.vid, self.scale_box.currentData()))
         )
         row2.addWidget(self.scale_box)
         row2.addStretch(1)
@@ -231,6 +240,7 @@ class CarpetWindow(QtWidgets.QWidget):
 
         self.view = CarpetView()
         self.view.scrubbed.connect(self.scrubbed)
+        self.view.rowed.connect(self._locate)
         v.addWidget(self.view, 1)
 
         self.help = ShortcutHelp(self, f"carpet · {vid}")
@@ -240,7 +250,7 @@ class CarpetWindow(QtWidgets.QWidget):
                 Binding(
                     "r", "rebuild", lambda: self.rebuild_requested.emit(self.vid), group="carpet"
                 ),
-                Binding("click", "jump to that volume", None, group="carpet"),
+                Binding("click", "jump to that volume and that voxel", None, group="carpet"),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]
@@ -248,6 +258,13 @@ class CarpetWindow(QtWidgets.QWidget):
         keep_keys_for_shortcuts(self)
 
     # -- input ---------------------------------------------------------
+    def _locate(self, row: int) -> None:
+        """Turn a clicked row back into a place in the brain."""
+        carpet = self.view._carpet
+        where = carpet.voxel_of(row) if carpet is not None else None
+        if where is not None:
+            self.located.emit(*where)
+
     def _pick_layer(self, _index: int) -> None:
         key = self.layer_box.currentData()
         if key:
@@ -264,7 +281,7 @@ class CarpetWindow(QtWidgets.QWidget):
     # -- output --------------------------------------------------------
     def apply(self, viewport: Viewport) -> None:
         self.setWindowTitle(viewport.title)
-        source = self.session.carpet_source(viewport)
+        source = self.session.series_source(viewport)
         self.layer_box.blockSignals(True)
         self.layer_box.clear()
         for layer in self.session.graph_layers():

@@ -58,6 +58,7 @@ class ViewKind(StrEnum):
     IMAGE = "image"
     GRAPH = "graph"
     CARPET = "carpet"
+    MATRIX = "matrix"
 
 
 @dataclass(frozen=True)
@@ -100,12 +101,22 @@ class Viewport:
     traces: tuple[str, ...] = ()
     shared_scale: bool = True
 
-    # -- carpet --------------------------------------------------------
+    # -- carpet and matrix ---------------------------------------------
     #: Row order. See :mod:`viewer.carpet` for what each one groups.
     order: str = "pc1"
+    #: Node order in a matrix window. A separate field from ``order`` because
+    #: the two vocabularies have nothing in common -- "corr with the seed
+    #: voxel" is not a thing you can do to a connectivity matrix, and sharing
+    #: one field would mean a window that changed meaning when you switched it.
+    matrix_order: str = "hierarchical"
+    #: Which ROI layer supplies a matrix's nodes, as a layer key. Empty means
+    #: the topmost ROI layer, and no ROI layer at all means the matrix falls
+    #: back to bins of voxels.
+    rois: str = ""
     #: Legendre drift projected out before drawing. A carpet is unreadable
-    #: through a linear ramp; anything richer is a job for DERIVE, and then
-    #: this window is pointed at the result.
+    #: through a linear ramp and a correlation between two undetrended runs is
+    #: mostly a correlation between two drifts; anything richer is a job for
+    #: DERIVE, and then this window is pointed at the result.
     detrend: int = 1
     #: ``z`` or ``psc``.
     scaling: str = "z"
@@ -130,6 +141,10 @@ class Viewport:
         return self.kind is ViewKind.CARPET
 
     @property
+    def is_matrix(self) -> bool:
+        return self.kind is ViewKind.MATRIX
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -143,6 +158,8 @@ class Viewport:
         """
         if self.is_carpet:
             return f"carpet · {self.order}  [{self.id}]"
+        if self.is_matrix:
+            return f"matrix · {self.matrix_order}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -168,8 +185,13 @@ class ViewportSet:
         return [v.id for v in self.viewports]
 
     def mint_id(self, kind: ViewKind) -> str:
-        """A fresh id: ``V1`` images, ``G1`` graphs, ``C1`` carpets."""
-        stem = {ViewKind.IMAGE: "V", ViewKind.GRAPH: "G", ViewKind.CARPET: "C"}[kind]
+        """A fresh id: ``V1`` images, ``G1`` graphs, ``C1`` carpets, ``M1`` matrices."""
+        stem = {
+            ViewKind.IMAGE: "V",
+            ViewKind.GRAPH: "G",
+            ViewKind.CARPET: "C",
+            ViewKind.MATRIX: "M",
+        }[kind]
         n = self._seq.get(stem, 0)
         while True:
             n += 1
@@ -223,6 +245,10 @@ class ViewportSet:
     @property
     def carpets(self) -> list[Viewport]:
         return self.of_kind(ViewKind.CARPET)
+
+    @property
+    def matrices(self) -> list[Viewport]:
+        return self.of_kind(ViewKind.MATRIX)
 
 
 def clamp_grid(n: int) -> int:
