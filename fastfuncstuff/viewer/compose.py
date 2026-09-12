@@ -19,8 +19,10 @@ from torch import Tensor
 
 from fastfuncstuff.viewer.colormap import (
     apply_colormap,
+    apply_label_colors,
     build_lut,
     composite,
+    label_edges,
     suprathreshold_edges,
     threshold_alpha,
     to_rgba8,
@@ -129,6 +131,18 @@ def render_plane(
                 if stat_vol is None
                 else extract_plane(stat_vol, grid, layer.affine, plane, pos, view=view)
             )
+
+        # A label layer is coloured by identity rather than by magnitude, and
+        # nothing about a range, a threshold or an alpha ramp applies to it --
+        # "half of region 12" is not a thing. Boxed, though, means something
+        # better here than it does on a stat map: the borders between regions.
+        palette = session.roi_palette(layer.key, values.device) if layer.roi else None
+        if palette is not None:
+            rgb, alpha = apply_label_colors(values, palette)
+            stacked.append((rgb, alpha * float(layer.opacity)))
+            if layer.boxed:
+                box_overlays.append(label_edges(values))
+            continue
 
         lo = layer.range_lo if layer.range_lo is not None else 0.0
         hi = layer.range_hi if layer.range_hi is not None else 1.0

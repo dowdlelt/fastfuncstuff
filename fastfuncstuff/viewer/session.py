@@ -21,6 +21,7 @@ from fastfuncstuff.viewer.layers import AlphaMode, Layer
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
+from fastfuncstuff.viewer.rois import RoiSet, looks_like_labels, rois_from_frames, rois_from_labels
 from fastfuncstuff.viewer.state import Plane, ViewerState
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import AddLayer, CloseView, OpenView, SetVolume, install
@@ -109,6 +110,11 @@ class ViewerSession:
         self.mode: Mode = registry.get("plain")()
         self.mode.attach(self)
         self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
+        #: Built on demand from a layer's voxels and kept until the flag or the
+        #: layer changes. Describing an atlas is one pass over the volume, and
+        #: the crosshair readout asks which region it is on every move.
+        self._roi_sets: dict[str, RoiSet] = {}
+        self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._mode_dirty: Aspect = Aspect.NOTHING
         self._displaced_overlay: Layer | None = None
         #: Set once by a UI that runs mode preparation on a worker. Applied to
@@ -134,6 +140,13 @@ class ViewerSession:
         preview = self.store.preview(key)
         lo, hi = derive_range(preview)
         layer = layer.with_(range_lo=lo, range_hi=hi)
+        # A 3-D volume of small non-negative integers is an atlas or a
+        # segmentation far more often than it is a picture, and guessing here
+        # is what lets one land already coloured and already named. A 4-D stack
+        # of masks cannot be told from a stats bucket, so that one waits to be
+        # asked.
+        if layer.n_volumes == 1 and looks_like_labels(preview):
+            layer = layer.with_(roi=True)
         if layer.n_volumes > 1:
             self.store.load_async(key, on_done=self._on_loaded)
         return layer
@@ -635,6 +648,110 @@ class ViewerSession:
             return
         for stale in [k for k in self._volume_cache if k[0] == key]:
             del self._volume_cache[stale]
+
+    # -- ROIs ----------------------------------------------------------
+    def roi_set(self, key: str) -> RoiSet | None:
+        """The groups one ROI layer defines, or ``None`` if it defines none.
+
+        Never blocks. A 4-D set of masks needs every frame, and the readout
+        asks this on every crosshair move -- so an unloaded one answers
+        ``None`` and answers properly once the inflate lands, rather than
+        freezing the window for the seconds it takes.
+        """
+        layer = self.state.layers.find(key)
+        if layer is None or not layer.roi:
+            return None
+        hit = self._roi_sets.get(key)
+        if hit is not None:
+            return hit
+        try:
+            res = self.store.get(key)
+        except KeyError:
+            return None
+        if layer.n_volumes > 1:
+            if res.array is None:
+                return None
+            built = rois_from_frames(
+                res.array,
+                name=layer.name,
+                frame_names=layer.labels,
+                source=f"file:{key}",
+            )
+        else:
+            try:
+                volume = self.volume(key, 0)
+            except (KeyError, FileNotFoundError, ValueError):
+                return None
+            built = rois_from_labels(
+                volume,
+                name=layer.name,
+                names=self._label_table(res),
+                source=f"file:{key}",
+            )
+        self._roi_sets[key] = built
+        return built
+
+    def _label_table(self, res: Resident) -> dict:
+        """Region names for a label volume: the header first, then a sidecar.
+
+        The sidecar lookup happens here rather than in the header read because
+        it is a guess by filename, and it is only a *safe* guess once something
+        has established that this volume really is labels. ``run1.txt`` beside
+        ``run1.nii.gz`` is a stimulus timing file far more often than a LUT.
+        """
+        from fastfuncstuff.io.labels import label_table
+
+        if res.info.value_labels:
+            return dict(res.info.value_labels)
+        try:
+            return label_table(res.path)
+        except OSError:
+            return {}
+
+    def roi_palette(self, key: str, device: torch.device | None = None) -> torch.Tensor | None:
+        """``(max label + 1, 3)`` colours in ``[0, 1]``, for the renderer.
+
+        Indexed by label value, so drawing is one gather and the colour on
+        screen is the same one the ROI list shows beside the region's name --
+        there is no second palette to fall out of step.
+        """
+        rois = self.roi_set(key)
+        if rois is None or not len(rois):
+            return None
+        where = device or self.store.device
+        cache_key = (key, str(where))
+        hit = self._roi_palettes.get(cache_key)
+        if hit is not None:
+            return hit
+        built = torch.as_tensor(rois.palette(), dtype=torch.float32, device=where) / 255.0
+        self._roi_palettes[cache_key] = built
+        return built
+
+    def forget_rois(self, key: str | None = None) -> None:
+        """Drop cached ROI descriptions, for one layer or all of them."""
+        if key is None:
+            self._roi_sets.clear()
+            self._roi_palettes.clear()
+            return
+        self._roi_sets.pop(key, None)
+        for stale in [k for k in self._roi_palettes if k[0] == key]:
+            del self._roi_palettes[stale]
+
+    def roi_layers(self) -> list[Layer]:
+        """Every layer that defines ROIs, bottom-up."""
+        return [ly for ly in self.state.layers if ly.roi]
+
+    def roi_at(self, ijk: tuple[int, int, int] | None = None):
+        """``(layer, roi)`` for the topmost ROI layer covering a voxel."""
+        where = ijk if ijk is not None else self.state.crosshair
+        for layer in reversed(self.roi_layers()):
+            rois = self.roi_set(layer.key)
+            if rois is None:
+                continue
+            found = rois.at(where)
+            if found is not None:
+                return layer, found
+        return None
 
     def timeseries(self, key: str, ijk: tuple[int, int, int] | None = None) -> np.ndarray:
         """The time course at a voxel, or an empty array if not yet resident.

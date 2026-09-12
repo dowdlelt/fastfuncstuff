@@ -55,6 +55,7 @@ from fastfuncstuff.viewer.vocab import (
     SetIJK,
     SetIndex,
     SetLayerOpacity,
+    SetLayerRoi,
     SetLayerVisible,
     SetMode,
     SetModeParam,
@@ -532,6 +533,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.boxed_check = QtWidgets.QCheckBox(key_label("boxed", "b"))
         self.boxed_check.toggled.connect(lambda on: self._apply(SetBoxed, on=bool(on)))
         form.addRow(QtWidgets.QLabel(""), self.boxed_check)
+
+        self.roi_check = QtWidgets.QCheckBox("is ROIs")
+        self.roi_check.setToolTip(
+            "The values are region identities, not magnitudes: colour by "
+            "identity, name the region in the readout, and let a correlation "
+            "matrix or a seed be built from it. Guessed for a 3-D volume of "
+            "small integers; turn it on for a 4-D stack of masks."
+        )
+        self.roi_check.toggled.connect(lambda on: self._apply(SetLayerRoi, on=bool(on)))
+        form.addRow(QtWidgets.QLabel(""), self.roi_check)
 
         self.timelink_check = QtWidgets.QCheckBox("follows time")
         self.timelink_check.setToolTip(
@@ -1049,6 +1060,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.blockSignals(False)
         for check, value, enabled in (
             (self.boxed_check, layer.boxed, True),
+            (self.roi_check, layer.roi, not layer.is_computed),
             (self.timelink_check, layer.time_linked, layer.n_volumes > 1),
         ):
             check.blockSignals(True)
@@ -1137,6 +1149,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if vol is None:
                 continue
             val = voxel_value(vol, st.grid, layer.affine, st.crosshair)
+            if layer.roi:
+                # "37" is not what you want to know when you are pointing at
+                # the thalamus, and it is the one readout that has to survive
+                # being outside every region -- hence "--", not "0".
+                rois = self.session.roi_set(layer.key)
+                found = rois.at(st.crosshair) if rois is not None else None
+                parts.append(f"{layer.name}={found.name if found else '--'}")
+                continue
             # Only where the header actually named something: appending "#0" to
             # every 3-D anatomy would be noise dressed as information.
             tag = f" {layer.sub_brick()}" if layer.labels else ""

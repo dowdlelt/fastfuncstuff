@@ -64,6 +64,13 @@ class Layer:
     #: 3dDeconvolve write these; a raw time series has none. Empty means the
     #: sub-bricks have no names, not that they were not read.
     labels: tuple[str, ...] = ()
+    #: Whether this layer's values are group identities rather than magnitudes.
+    #: An atlas, a segmentation, a clusterize result. It changes how the layer
+    #: is drawn (one colour per label, no scale), what the readout says (the
+    #: region's name, not "37"), and what the layer can be used *for* -- an ROI
+    #: layer is what a correlation matrix's rows are made of. Guessed on load
+    #: for a 3-D integer volume; SET_LAYER_ROI corrects the guess.
+    roi: bool = False
 
     visible: bool = True
     opacity: float = 1.0

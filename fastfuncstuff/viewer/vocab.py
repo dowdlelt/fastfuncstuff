@@ -464,6 +464,23 @@ class SetTimeLinked(Command):
     on: bool
 
 
+@command
+@dataclass(frozen=True)
+class SetLayerRoi(Command):
+    """Whether this layer's values are region identities rather than magnitudes.
+
+    Guessed on load for a 3-D volume of small integers, and this is how the
+    guess is corrected in either direction -- on for a 4-D stack of masks,
+    whose frames cannot be told from a stats bucket's sub-bricks, and off for
+    the rare integer picture that only looks like an atlas.
+    """
+
+    name = "SET_LAYER_ROI"
+    aspects = Aspect.SLICES | Aspect.LAYERS
+    key: str
+    on: bool
+
+
 # ---------------------------------------------------------------------------
 # colour and threshold
 # ---------------------------------------------------------------------------
@@ -991,6 +1008,19 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, time_linked=bool(cmd.on))
         return SetTimeLinked.aspects
+
+    @bus.handle(SetLayerRoi.name)
+    def _set_layer_roi(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetLayerRoi)
+        if st.layers.get(cmd.key).roi == bool(cmd.on):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, roi=bool(cmd.on))
+        if session is not None:
+            # The description was built from the old answer to "is this
+            # labels?", and a stale one would keep colouring the layer after
+            # the flag that asked for it was turned off.
+            session.forget_rois(cmd.key)
+        return SetLayerRoi.aspects
 
     @bus.handle(SetSeed.name)
     def _set_seed(cmd: Command, st: ViewerState) -> Aspect:

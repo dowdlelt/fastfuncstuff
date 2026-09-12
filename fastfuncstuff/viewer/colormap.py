@@ -139,6 +139,38 @@ def apply_colormap(
     return lut[idx]
 
 
+def apply_label_colors(values: Tensor, palette: Tensor) -> tuple[Tensor, Tensor]:
+    """Colour a label field by identity: ``(rgb, alpha)``, no scale involved.
+
+    A label volume has no range to normalise against -- region 40 is not twice
+    region 20 -- so this indexes a palette by the value itself and makes
+    everything outside every region transparent. ``palette`` is ``(N, 3)`` in
+    ``[0, 1]``, indexed by label value, with row 0 unused.
+    """
+    idx = torch.nan_to_num(values).round().long().clamp(0, palette.shape[0] - 1)
+    return palette[idx], (idx > 0).to(palette.dtype)
+
+
+def label_edges(values: Tensor) -> Tensor:
+    """Boolean map of voxels on a boundary between two different labels.
+
+    Not :func:`suprathreshold_edges` on the union: an atlas outlined as one
+    blob is a picture of the brain's convex hull. What makes outlines worth
+    having on a parcellation is the borders *between* regions, so the test is
+    "my neighbour has a different label", and the background counts as a label
+    for that purpose so the outer rim is drawn too.
+    """
+    if values.ndim != 2:
+        raise ValueError("edges are computed on a 2-D slice")
+    labels = torch.nan_to_num(values).round()
+    interior = torch.ones_like(labels, dtype=torch.bool)
+    interior[:-1, :] &= labels[1:, :] == labels[:-1, :]
+    interior[1:, :] &= labels[:-1, :] == labels[1:, :]
+    interior[:, :-1] &= labels[:, 1:] == labels[:, :-1]
+    interior[:, 1:] &= labels[:, :-1] == labels[:, 1:]
+    return (labels > 0) & ~interior
+
+
 def threshold_alpha(
     stat: Tensor,
     threshold: float,

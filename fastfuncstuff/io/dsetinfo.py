@@ -34,6 +34,7 @@ from fastfuncstuff.io.headers import (
     read_brick_labels,
     read_brick_stataux,
 )
+from fastfuncstuff.io.labels import parse_atlas_points, parse_dtable, read_value_labels
 
 # RAS+ (NIfTI) → AFNI DICOM order (x = Left+, y = Posterior+, z = Superior+).
 AFNI_FROM_RAS = np.diag([-1.0, -1.0, 1.0, 1.0])
@@ -134,6 +135,12 @@ class DatasetInfo:
     sform_code: int = 0
 
     labels: list[str] = field(default_factory=list)
+    #: ``{value: LabelEntry}`` for a label volume that names its regions in its
+    #: own header. Only the header route is taken here: a sidecar table is
+    #: found by name, and "the .txt next to run1.nii.gz" is as likely to be a
+    #: stimulus timing file as a LUT -- so that lookup waits until something
+    #: has decided the volume really is labels.
+    value_labels: dict = field(default_factory=dict)
     #: ``BRICK_STATAUX``: ``{sub_brick: (afni_stat_code, params)}``. What lets
     #: a reader turn a t or an F into a p without being told the DoF -- the
     #: bucket already says. Empty when the dataset carries no stat metadata.
@@ -401,6 +408,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     info.view = _view_from_code(int(hdr["sform_code"]) or int(hdr["qform_code"]), info.space)
     info.labels = read_brick_labels(hdr)
     info.stataux = read_brick_stataux(hdr)
+    info.value_labels = read_value_labels(hdr)
     info.history = _decode_history(_afni_atr(ext_text, "HISTORY_NOTE") or "")
     # scl_slope 0 is the NIfTI spelling of "no scaling", not a zeroing scale factor.
     slope = float(hdr["scl_slope"]) if np.isfinite(hdr["scl_slope"]) else 1.0
@@ -447,6 +455,12 @@ def _read_afni_info(p: Path, iname: str, indices: list[int] | None) -> DatasetIn
     info.view = next((v for v in ("+tlrc", "+acpc", "+orig") if v in head.name), "+orig")
     labs = hinfo.get("BRICK_LABS")
     info.labels = str(labs).split("~") if labs else []
+    points = hinfo.get("ATLAS_LABEL_TABLE")
+    dtable = hinfo.get("VALUE_LABEL_DTABLE")
+    if points:
+        info.value_labels = parse_atlas_points(str(points))
+    elif dtable:
+        info.value_labels = parse_dtable(str(dtable))
     info.history = str(hinfo.get("HISTORY_NOTE", "") or "")
     return info
 
