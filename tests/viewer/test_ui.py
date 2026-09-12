@@ -996,3 +996,108 @@ def test_a_second_click_re_derives_instead_of_chaining(win4d, qapp):
     # And the recording names the real source, so a replay does not chain.
     lines = [ln for ln in win4d.session.to_script().splitlines() if ln.startswith("DENOISE")]
     assert all(ln.split()[1] == src for ln in lines)
+
+
+# ---------------------------------------------------------------------------
+# reordering and removing layers
+#
+# MOVE_LAYER and REMOVE_LAYER were registered commands with no UI at all, so
+# the stack could only grow and a derived layer could not actually be promoted
+# to underlay despite that being the point of making it. Neither handler was
+# reached by a test either, which is how one of them stayed unregistered
+# through a green run.
+# ---------------------------------------------------------------------------
+
+
+def test_raise_and_lower_walk_the_stack(win, qapp):
+    before = list(win.session.state.layers.keys)
+    win.layer_list.setCurrentRow(0)  # the top layer
+    qapp.processEvents()
+    win._reorder(-1)
+    qapp.processEvents()
+    assert win.session.state.layers.keys == before[::-1]
+    win._reorder(1)
+    qapp.processEvents()
+    assert win.session.state.layers.keys == before
+
+
+def test_reordering_past_either_end_does_nothing(win, qapp):
+    before = list(win.session.state.layers.keys)
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    win._reorder(1)  # already on top
+    qapp.processEvents()
+    assert win.session.state.layers.keys == before
+
+
+def test_promoting_to_underlay_brings_its_grid_with_it(win, qapp, tmp_path):
+    """The underlay defines the display grid, however it got to the bottom."""
+    from fastfuncstuff.viewer.vocab import AddOverlay
+
+    aff = np.diag([6.0, 6.0, 6.0, 1.0])
+    coarse = tmp_path / "coarse.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((5, 6, 4), np.float32), aff), str(coarse))
+    win.refresh(win.session.do(AddOverlay(str(coarse))))
+    qapp.processEvents()
+    assert win.session.state.grid.shape == (10, 12, 8)  # the anat's
+
+    win.layer_list.setCurrentRow(0)  # the coarse one, on top
+    qapp.processEvents()
+    win._make_underlay()
+    qapp.processEvents()
+    assert win.session.state.layers.base.name == "coarse.nii.gz"
+    assert win.session.state.grid.shape == (5, 6, 4)
+
+
+def test_dropping_a_layer_releases_its_voxels(win, qapp):
+    key = win.session.state.layers.overlay.key
+    assert key in win.session.store.keys()
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    win._drop_layer()
+    qapp.processEvents()
+    assert win.session.state.layers.find(key) is None
+    assert key not in win.session.store.keys()
+
+
+def test_the_last_layer_cannot_be_dropped(win, qapp):
+    """A viewer showing nothing is a state whose only way out is undo."""
+    while len(win.session.state.layers) > 1:
+        win.layer_list.setCurrentRow(0)
+        win._drop_layer()
+        qapp.processEvents()
+    win.layer_list.setCurrentRow(0)
+    win._drop_layer()
+    qapp.processEvents()
+    assert len(win.session.state.layers) == 1
+
+
+def test_dropping_the_underlay_regrids_onto_what_is_left(win, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import AddOverlay
+
+    aff = np.diag([6.0, 6.0, 6.0, 1.0])
+    coarse = tmp_path / "coarse.nii.gz"
+    nib.save(nib.Nifti1Image(np.zeros((5, 6, 4), np.float32), aff), str(coarse))
+    win.refresh(win.session.do(AddOverlay(str(coarse))))
+    win.layer_list.setCurrentRow(0)
+    win._make_underlay()
+    qapp.processEvents()
+    assert win.session.state.grid.shape == (5, 6, 4)
+
+    win.layer_list.setCurrentRow(win.layer_list.count() - 1)  # the underlay
+    qapp.processEvents()
+    win._drop_layer()
+    qapp.processEvents()
+    assert win.session.state.grid.shape == win.session.state.layers.base.shape
+
+
+def test_the_stack_gestures_go_through_the_bus(win, qapp):
+    """Recorded, so a rearranged stack comes back from a replay."""
+    win.session.bus.clear_log()
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    win._reorder(-1)
+    win._drop_layer()
+    qapp.processEvents()
+    names = [c.name for c in win.session.bus.log]
+    assert "MOVE_LAYER" in names and "REMOVE_LAYER" in names

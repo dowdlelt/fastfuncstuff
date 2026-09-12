@@ -85,17 +85,22 @@ class ViewerState:
         return self.grid.ijk_to_mm(self.crosshair)
 
     def selected_layer(self):
-        """The layer the controls act on, falling back to the top of the stack.
+        """The layer the controls act on, defaulting to the top of the stack.
 
-        A fallback rather than ``None``: with a stack loaded there is always
-        something the controls should be aimed at, and the topmost layer is
-        the one that was most recently put there.
+        The default is *adopted*, not merely reported. A selection that
+        re-resolves to "whatever is on top" is not a selection: it moves when
+        the stack is reordered, so two presses of the same key act on two
+        different layers -- the second one lowers whatever the first one
+        promoted past. Writing it down the first time it is asked for makes it
+        stick, and it stays sticky until the layer is removed.
         """
         if self.selected is not None:
             found = self.layers.find(self.selected)
             if found is not None:
                 return found
-        return self.layers.layers[-1] if len(self.layers) else None
+        top = self.layers.layers[-1] if len(self.layers) else None
+        self.selected = top.key if top is not None else None
+        return top
 
     def max_time_index(self) -> int:
         """Longest 4-D extent in the stack, so scrubbing spans everything."""

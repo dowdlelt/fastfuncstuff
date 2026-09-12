@@ -42,7 +42,9 @@ from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
     Denoise,
+    MoveLayer,
     Read,
+    RemoveLayer,
     SelectLayer,
     SetAlpha,
     SetBoxed,
@@ -352,7 +354,27 @@ class ViewerWindow(QtWidgets.QMainWindow):
             "A soloed image window draws whichever one is selected here."
         )
         self.layer_list.currentRowChanged.connect(self._row_selected)
+        # Drag to reorder. The list is drawn top-first while the stack is
+        # stored bottom-first, so the drop row is translated in one place --
+        # _row_selected and this are the only two that know about the flip.
+        self.layer_list.setDragDropMode(QtWidgets.QAbstractItemView.DragDropMode.InternalMove)
+        self.layer_list.model().rowsMoved.connect(self._rows_moved)
         v.addWidget(self.layer_list)
+
+        stack_row = QtWidgets.QHBoxLayout()
+        stack_row.setSpacing(4)
+        for text, key, tip, slot in (
+            ("LOWER", "{", "Move the selected layer down the stack", lambda: self._reorder(-1)),
+            ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
+            ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
+            ("DROP", "del", "Remove the selected layer", self._drop_layer),
+        ):
+            b = QtWidgets.QPushButton(key_label(text, key))
+            b.setToolTip(f"{tip} ({key})")
+            b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+            b.clicked.connect(slot)
+            stack_row.addWidget(b)
+        v.addLayout(stack_row)
 
         self._build_derive(v)
 
@@ -621,6 +643,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
                 Binding("D", "denoise the selected layer", self._denoise, group="layer"),
+                Binding("{", "move layer down the stack", lambda: self._reorder(-1), group="layer"),
+                Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
+                Binding("u", "make it the underlay", self._make_underlay, group="layer"),
+                Binding(
+                    "Del",
+                    "remove the layer",
+                    self._drop_layer,
+                    group="layer",
+                    aliases=("Backspace",),
+                ),
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
                 Binding("h", "this list", self.help.toggle, group="session"),
@@ -636,6 +668,68 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if key is None:
             return
         self._dispatch(cls(key=key, **kwargs))
+
+    # -- reordering the stack -------------------------------------------
+    def _stack_index(self, row: int) -> int:
+        """List row (top-first) to stack index (bottom-first)."""
+        return self.layer_list.count() - 1 - row
+
+    def _rows_moved(self, _parent, start: int, _end, _dest, row: int) -> None:
+        """A drag landed. Translate it and let the command bus do the move."""
+        key = self._key_at_row(start)
+        if key is None:
+            return
+        # Qt reports the destination as the row the item was inserted *before*,
+        # which is one past itself when dragging downward in the widget.
+        target = row - 1 if row > start else row
+        self._dispatch(MoveLayer(key, self._stack_index(target)))
+        self._sync_layer_list()
+
+    def _key_at_row(self, row: int) -> str | None:
+        keys = list(reversed(self.session.state.layers.keys))
+        return keys[row] if 0 <= row < len(keys) else None
+
+    def _reorder(self, delta: int) -> None:
+        """Move the selected layer one place through the stack."""
+        key = self.current_key()
+        if key is None:
+            return
+        stack = self.session.state.layers
+        target = stack.index_of(key) + delta
+        if 0 <= target < len(stack):
+            self._dispatch(MoveLayer(key, target))
+            self._sync_layer_list()
+
+    def _make_underlay(self) -> None:
+        """Promote the selected layer to the bottom, grid and all.
+
+        The gesture a derived layer wanted: denoise a run, then put the result
+        underneath everything and look at the stats on top of it.
+        """
+        key = self.current_key()
+        if key is not None and self.session.state.layers.index_of(key) != 0:
+            self._dispatch(MoveLayer(key, 0))
+            self._sync_layer_list()
+
+    def _drop_layer(self) -> None:
+        """Remove the selected layer, unless it is the only one left.
+
+        Same rule as the last image window and the panel that could not be
+        reopened: a state whose only way out is the control you just used is
+        not a state to allow.
+        """
+        key = self.current_key()
+        if key is None:
+            return
+        if len(self.session.state.layers) <= 1:
+            self.statusBar().showMessage(
+                "the last layer stays; there would be nothing to show", 5000
+            )
+            return
+        name = self.session.state.layers.get(key).name
+        self._dispatch(RemoveLayer(key))
+        self._sync_layer_list()
+        self.statusBar().showMessage(f"removed {name}", 4000)
 
     def _row_selected(self, row: int) -> None:
         keys = list(reversed(self.session.state.layers.keys))

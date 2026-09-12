@@ -796,18 +796,42 @@ def install(
             dirty |= Aspect.GRID | Aspect.CROSSHAIR
         return dirty
 
+    def _regrid_if_base_changed(st: ViewerState, was: str | None) -> Aspect:
+        """Follow the underlay's grid when the bottom of the stack changes.
+
+        "The underlay defines the display grid" is the rule everything else
+        rests on, so a layer arriving at index 0 by being moved there has to
+        bring its grid with it exactly as one arriving by SET_UNDERLAY does.
+        Without this, promoting a 2 mm functional under a 1 mm anatomy left
+        every pane resampling the functional into the anatomy's grid and
+        quietly claiming a resolution that is not there.
+        """
+        base = st.layers.base
+        if base is None or base.key == was:
+            return Aspect.NOTHING
+        return _adopt_grid_preserving_position(st, base)
+
     @bus.handle(RemoveLayer.name)
     def _remove_layer(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, RemoveLayer)
+        was = st.layers.base.key if st.layers.base is not None else None
         st.layers.remove(cmd.key)
-        return RemoveLayer.aspects
+        if session is not None:
+            # Release the voxels too. forget() declines for anything the active
+            # mode is using or has displaced, which is the one case where the
+            # data has to outlive the layer.
+            session.forget(cmd.key)
+        return RemoveLayer.aspects | _regrid_if_base_changed(st, was)
 
     @bus.handle(MoveLayer.name)
     def _move_layer(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, MoveLayer)
+        was = st.layers.base.key if st.layers.base is not None else None
         before = st.layers.index_of(cmd.key)
         after = st.layers.move(cmd.key, cmd.to)
-        return Aspect.NOTHING if before == after else MoveLayer.aspects
+        if before == after:
+            return Aspect.NOTHING
+        return MoveLayer.aspects | _regrid_if_base_changed(st, was)
 
     @bus.handle(SetColormap.name)
     def _set_colormap(cmd: Command, st: ViewerState) -> Aspect:
