@@ -79,6 +79,16 @@ def test_seriation_puts_a_hidden_block_back_together():
     assert blocks == (6,)
 
 
+def test_the_module_count_is_one_more_than_the_lines_drawn():
+    """Boundaries and modules are off by one, and the status line says modules."""
+    rng = np.random.default_rng(6)
+    data, labels = _networks(rng)
+    m = build_matrix(
+        data, rois=rois_from_labels(labels), order="hierarchical", polort=-1, device=CPU
+    )
+    assert f"{len(m.blocks) + 1} modules" in m.status()
+
+
 def test_without_rois_the_nodes_are_bins_and_say_so():
     rng = np.random.default_rng(3)
     data, _ = _networks(rng)

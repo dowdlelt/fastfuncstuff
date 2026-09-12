@@ -98,7 +98,9 @@ class CorrMatrix:
             text += f"   {self.n_voxels:,} voxels"
         text += f"   {ORDER_LABELS.get(self.order, self.order)}"
         if self.blocks:
-            text += f"   {len(self.blocks)} modules"
+            # blocks are the boundaries between modules, so there is always one
+            # more module than there are lines drawn.
+            text += f"   {len(self.blocks) + 1} modules"
         return text
 
 
