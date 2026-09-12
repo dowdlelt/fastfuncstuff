@@ -35,6 +35,12 @@ from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import SetViewGrid, SetViewSharedScale, SetViewTraces
 
+#: Below these the header and the trace toggles go away. Nothing is lost but
+#: the reminder -- + - and s still work, and a small graph beside a small image
+#: is a reasonable thing to want.
+BARE_WIDTH = 190
+TRACES_WIDTH = 240
+
 
 @dataclass
 class Cell:
@@ -56,7 +62,7 @@ class GridGraph(QtWidgets.QWidget):
         self._n = 1
         self._index = 0
         self._shared_scale = True
-        self.setMinimumSize(220, 180)
+        self.setMinimumSize(60, 48)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
@@ -225,6 +231,7 @@ class GraphWindow(QtWidgets.QWidget):
         self._dispatch = dispatch
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.resize(520, 420)
+        self.setMinimumSize(90, 80)
         self.setStyleSheet(theme.stylesheet())
 
         v = QtWidgets.QVBoxLayout(self)
@@ -259,15 +266,19 @@ class GraphWindow(QtWidgets.QWidget):
         bar.addStretch(1)
         self.info = QtWidgets.QLabel("")
         bar.addWidget(self.info)
-        v.addLayout(bar)
+        self.header = QtWidgets.QWidget()
+        self.header.setLayout(bar)
+        v.addWidget(self.header)
 
         # One toggle per plottable layer, in the trace's own colour, so a line
         # in the plot and the control that turns it off are the same object as
         # far as the eye is concerned.
-        self.trace_bar = QtWidgets.QHBoxLayout()
-        self.trace_bar.setSpacing(5)
+        self.trace_host = QtWidgets.QWidget()
+        self.trace_bar = QtWidgets.QHBoxLayout(self.trace_host)
+        self.trace_bar.setContentsMargins(0, 0, 0, 0)
+        self.trace_bar.setSpacing(4)
         self._trace_buttons: list[QtWidgets.QPushButton] = []
-        v.addLayout(self.trace_bar)
+        v.addWidget(self.trace_host)
 
         self.graph = GridGraph()
         self.graph.scrubbed.connect(self.scrubbed)
@@ -288,6 +299,13 @@ class GraphWindow(QtWidgets.QWidget):
                 Binding("w", "close this window", self.close, group="window"),
             ]
         )
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 (Qt)
+        """Shed the controls as the window narrows; the keys still work."""
+        size = event.size()
+        self.header.setVisible(size.width() >= BARE_WIDTH)
+        self.trace_host.setVisible(size.width() >= TRACES_WIDTH and size.height() >= 170)
+        super().resizeEvent(event)
 
     # -- input ---------------------------------------------------------
     def step_grid(self, delta: int) -> None:

@@ -37,7 +37,9 @@ class ImagePane(QtWidgets.QWidget):
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
         self._labels: tuple[str, str, str, str] | None = None
-        self.setMinimumSize(160, 160)
+        # Deliberately tiny. A pane's minimum is a floor under the whole
+        # window, and a wall of small images is a real way to look at data.
+        self.setMinimumSize(48, 48)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )

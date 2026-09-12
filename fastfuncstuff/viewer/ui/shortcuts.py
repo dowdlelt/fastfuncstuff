@@ -38,7 +38,12 @@ def install(widget: QtWidgets.QWidget, bindings: Sequence[Binding]) -> None:
             action = QtGui.QAction(widget)
             action.setShortcut(QtGui.QKeySequence(spelling))
             action.setShortcutContext(QtCore.Qt.ShortcutContext.WindowShortcut)
-            action.triggered.connect(binding.action)  # type: ignore[arg-type]
+            # Swallow QAction.triggered's `checked` argument. PySide6 passes it
+            # to any slot that will accept one, so a binding written as
+            # `lambda p=plane: ...` -- the natural way to capture a loop
+            # variable -- silently receives False as `p` instead of the plane.
+            # Every binding here is a nullary gesture, so none of them want it.
+            action.triggered.connect(lambda *_, fn=binding.action: fn())
             widget.addAction(action)
 
 

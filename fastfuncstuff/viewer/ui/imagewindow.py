@@ -36,6 +36,13 @@ from fastfuncstuff.viewer.vocab import (
 
 PLANE_KEYS = {Plane.AXIAL: "1", Plane.SAGITTAL: "2", Plane.CORONAL: "3"}
 
+#: Header widths. Below the first the buttons keep only their key, below the
+#: second the header goes away entirely -- the keys still work, so nothing is
+#: lost but the reminder, and a nine-window wall of small images is worth more
+#: than a row of labels on each.
+COMPACT_WIDTH = 330
+BARE_WIDTH = 170
+
 
 class ImageWindow(QtWidgets.QWidget):
     """One image viewport as a top-level window."""
@@ -60,33 +67,34 @@ class ImageWindow(QtWidgets.QWidget):
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
 
-        bar = QtWidgets.QHBoxLayout()
-        bar.setContentsMargins(7, 5, 7, 5)
-        bar.setSpacing(7)
+        self.header = QtWidgets.QWidget()
+        bar = QtWidgets.QHBoxLayout(self.header)
+        bar.setContentsMargins(6, 4, 6, 4)
+        bar.setSpacing(4)
+        #: (button, full label, key-only label), walked on every resize.
+        self._labels: list[tuple[QtWidgets.QPushButton, str, str]] = []
         self._plane_buttons: dict[Plane, QtWidgets.QPushButton] = {}
         for plane, key in PLANE_KEYS.items():
-            b = QtWidgets.QPushButton(theme.key_label(plane.value[:3].upper(), key))
-            b.setCheckable(True)
-            b.setToolTip(f"Show the {plane.value} plane ({key})")
+            b = self._button(plane.value[:3].upper(), key, f"Show the {plane.value} plane")
             b.clicked.connect(
                 lambda _=False, p=plane: self._dispatch(SetViewPlane(self.vid, str(p)))
             )
             bar.addWidget(b)
             self._plane_buttons[plane] = b
-        bar.addSpacing(8)
+        bar.addSpacing(6)
 
-        self.solo_button = QtWidgets.QPushButton(theme.key_label("SOLO", "o"))
-        self.solo_button.setCheckable(True)
-        self.solo_button.setToolTip(
+        self.solo_button = self._button(
+            "SOLO",
+            "o",
             "Draw only the selected layer. With [ and ] this flips between "
-            "neighbouring layers in place, which is how alignment is checked."
+            "neighbouring layers in place, which is how alignment is checked.",
         )
         self.solo_button.clicked.connect(lambda on: self._dispatch(SetViewSolo(self.vid, bool(on))))
         bar.addWidget(self.solo_button)
 
-        self.lock_button = QtWidgets.QPushButton(theme.key_label("LOCK", "l"))
-        self.lock_button.setCheckable(True)
-        self.lock_button.setToolTip("Follow the shared crosshair (l). Unlock to park a slice.")
+        self.lock_button = self._button(
+            "LOCK", "l", "Follow the shared crosshair. Unlock to park a slice."
+        )
         self.lock_button.clicked.connect(self._toggle_lock)
         bar.addWidget(self.lock_button)
 
@@ -94,13 +102,15 @@ class ImageWindow(QtWidgets.QWidget):
         self.slice_label = QtWidgets.QLabel("")
         self.slice_label.setObjectName("value")
         bar.addWidget(self.slice_label)
-        v.addLayout(bar)
+        v.addWidget(self.header)
 
         self.pane = ImagePane(Plane.AXIAL)
         self.pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         self.pane.stepped.connect(self._step)
         v.addWidget(self.pane, 1)
+        self.resize(420, 420)
+        self.setMinimumSize(64, 64)
 
         self.help = ShortcutHelp(self, f"image · {vid}")
         self.help.apply(
@@ -118,6 +128,26 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("w", "close this window", self.close, group="window"),
             ]
         )
+
+    def _button(self, text: str, key: str, tip: str) -> QtWidgets.QPushButton:
+        """A header button that knows how to say itself in less space."""
+        full, bare = theme.key_label(text, key), f"[{key}]"
+        b = QtWidgets.QPushButton(full)
+        b.setCheckable(True)
+        b.setToolTip(f"{tip}  ({key})")
+        b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
+        self._labels.append((b, full, bare))
+        return b
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:  # noqa: N802 (Qt)
+        """Shed the header as the window narrows, rather than refusing to."""
+        width = event.size().width()
+        self.header.setVisible(width >= BARE_WIDTH)
+        compact = width < COMPACT_WIDTH
+        for button, full, bare in self._labels:
+            button.setText(bare if compact else full)
+        self.slice_label.setVisible(not compact)
+        super().resizeEvent(event)
 
     # -- input ---------------------------------------------------------
     def _set_plane(self, plane: Plane) -> None:

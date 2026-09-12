@@ -772,3 +772,66 @@ def test_the_time_readout_follows_playback(win4d, qapp):
     win4d._step_time(3)
     qapp.processEvents()
     assert win4d.time_spin.value() == win4d.session.state.time_index
+
+
+# ---------------------------------------------------------------------------
+# shortcuts must not receive QAction's `checked` argument
+# ---------------------------------------------------------------------------
+
+
+def test_a_binding_that_captures_a_loop_variable_keeps_it(win, qapp):
+    """QAction.triggered passes a bool to any slot that will take one.
+
+    The natural way to capture a loop variable is `lambda p=plane: ...`, whose
+    arity is one -- so PySide6 handed it False and the plane became the string
+    "False". Pressing 2 in an image window did nothing at all.
+
+    Triggered through the installed QAction rather than a synthetic key event,
+    because that is the object that supplies the spurious argument.
+    """
+    image = image_of(win, Plane.AXIAL)
+    action = next(a for a in image.actions() if a.shortcut().toString() == "2")
+    action.trigger()
+    qapp.processEvents()
+    assert win.session.state.viewports.get(image.vid).plane is Plane.SAGITTAL
+
+
+# ---------------------------------------------------------------------------
+# a window has to be able to get small
+# ---------------------------------------------------------------------------
+
+
+def test_an_image_window_sheds_its_header_as_it_narrows(win, qapp):
+    """The header's own width was the floor under the whole window."""
+    image = image_of(win, Plane.AXIAL)
+    image.show()
+    image.resize(420, 420)
+    qapp.processEvents()
+    assert image.header.isVisible()
+    assert image.solo_button.text() == "S[O]LO"
+
+    image.resize(240, 240)
+    qapp.processEvents()
+    assert image.header.isVisible()
+    assert image.solo_button.text() == "[o]", "compact buttons keep only the key"
+
+    image.resize(120, 120)
+    qapp.processEvents()
+    assert not image.header.isVisible()
+
+
+def test_an_image_window_can_be_made_tiny(win, qapp):
+    """A wall of small images is a real way to look at data.
+
+    The header's layout still *hints* at a wide minimum, and Qt applies that
+    hint before any resize happens -- so the window refused to narrow, which
+    meant the resize that would have collapsed the header never fired. An
+    explicit minimum is what breaks that circle.
+    """
+    image = image_of(win, Plane.AXIAL)
+    image.show()
+    qapp.processEvents()
+    assert image.minimumSize().width() <= 100
+    image.resize(90, 90)
+    qapp.processEvents()
+    assert image.width() == 90
