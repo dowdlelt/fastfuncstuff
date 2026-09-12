@@ -274,3 +274,30 @@ def test_a_graph_keeps_only_the_traces_it_names() -> None:
         assert session.traces_for(st.viewports.get(vid)) == []
     finally:
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# a grid big enough to be worth having
+# ---------------------------------------------------------------------------
+
+
+def test_the_grid_reaches_well_past_sixty_four_cells() -> None:
+    assert MAX_GRID * MAX_GRID >= 256
+
+
+def test_decimation_bounds_the_points_without_moving_the_time_axis() -> None:
+    """Thinning the values alone would stretch a trace across its cell."""
+    import numpy as np
+
+    from fastfuncstuff.viewer.ui.gridgraph import _decimate
+
+    values = np.arange(400.0)
+    idx, vals = _decimate(values, width=30.0)
+    assert idx.size <= 60
+    assert idx[0] == 0 and idx[-1] == values.size - 1
+    assert np.array_equal(vals, values[idx])
+
+    # Short enough to draw in full: left alone.
+    short = np.arange(10.0)
+    idx, vals = _decimate(short, width=200.0)
+    assert np.array_equal(vals, short)

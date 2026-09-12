@@ -36,6 +36,9 @@ class ImagePane(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
+        #: Voxel footprints of the open graphs, as (row, col, n_rows, n_cols)
+        #: in image indices. The crosshair opens up around them.
+        self._coverage: list[tuple[int, int, int, int]] = []
         self._labels: tuple[str, str, str, str] | None = None
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
@@ -76,6 +79,20 @@ class ImagePane(QtWidgets.QWidget):
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
+
+    def set_coverage(self, boxes: list[tuple[int, int, int, int]]) -> None:
+        """Say which voxels the open graphs are reading, in image indices.
+
+        Drawn as the crosshair's own gap rather than as a separate annotation:
+        the gap already exists to keep the voxel under inspection visible, and
+        a graph makes that "the voxels under inspection". Sizing it to the
+        actual footprint is the difference between knowing the grid is 5x5 and
+        seeing which 25 voxels that is.
+        """
+        boxes = [tuple(int(v) for v in b) for b in boxes]  # type: ignore[misc]
+        if boxes != self._coverage:
+            self._coverage = boxes  # type: ignore[assignment]
+            self.update()
 
     # -- geometry ------------------------------------------------------
     def _target_rect(self) -> QtCore.QRect:
@@ -123,19 +140,7 @@ class ImagePane(QtWidgets.QWidget):
         p.drawImage(rect, self._image)
 
         if self._cross is not None:
-            row, col = self._cross
-            x = rect.x() + (col + 0.5) / self._image.width() * rect.width()
-            y = rect.y() + (row + 0.5) / self._image.height() * rect.height()
-            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*CROSSHAIR_RGB, 0.85))
-            pen.setWidth(1)
-            p.setPen(pen)
-            # A gap at the centre so the voxel under inspection stays visible --
-            # AFNI's xhair gap, and the reason it exists.
-            gap = 5
-            p.drawLine(int(rect.left()), int(y), int(x - gap), int(y))
-            p.drawLine(int(x + gap), int(y), int(rect.right()), int(y))
-            p.drawLine(int(x), int(rect.top()), int(x), int(y - gap))
-            p.drawLine(int(x), int(y + gap), int(x), int(rect.bottom()))
+            self._paint_crosshair(p, rect)
 
         p.setPen(QtGui.QColor.fromRgbF(*LABEL_RGB))
         font = p.font()
@@ -157,6 +162,39 @@ class ImagePane(QtWidgets.QWidget):
             p.drawText(r.adjusted(0, 0, 0, -2), flags.AlignBottom | flags.AlignHCenter, bottom)
             p.drawText(r.adjusted(4, 0, 0, 0), flags.AlignLeft | flags.AlignVCenter, left)
         p.end()
+
+    def _paint_crosshair(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
+        assert self._cross is not None and self._image is not None
+        row, col = self._cross
+        iw, ih = self._image.width(), self._image.height()
+        sx, sy = rect.width() / iw, rect.height() / ih
+        x = rect.x() + (col + 0.5) * sx
+        y = rect.y() + (row + 0.5) * sy
+
+        colour = QtGui.QColor.fromRgbF(*CROSSHAIR_RGB, 0.85)
+        pen = QtGui.QPen(colour)
+        pen.setWidth(1)
+        p.setPen(pen)
+
+        # Each footprint drawn, and the largest sets the gap. Two graphs at
+        # different sizes read as nested squares, which is what they are.
+        gap_x = gap_y = 5.0
+        faint = QtGui.QColor.fromRgbF(*CROSSHAIR_RGB, 0.55)
+        for brow, bcol, nrows, ncols in self._coverage:
+            bx, by = rect.x() + bcol * sx, rect.y() + brow * sy
+            box = QtCore.QRectF(bx, by, ncols * sx, nrows * sy)
+            p.setPen(QtGui.QPen(faint))
+            p.drawRect(box)
+            gap_x = max(gap_x, max(x - box.left(), box.right() - x))
+            gap_y = max(gap_y, max(y - box.top(), box.bottom() - y))
+        p.setPen(pen)
+
+        # A gap at the centre so the voxel -- or the block of voxels a graph is
+        # reading -- stays visible. AFNI's xhair gap, and the reason it exists.
+        p.drawLine(QtCore.QLineF(rect.left(), y, x - gap_x, y))
+        p.drawLine(QtCore.QLineF(x + gap_x, y, rect.right(), y))
+        p.drawLine(QtCore.QLineF(x, rect.top(), x, y - gap_y))
+        p.drawLine(QtCore.QLineF(x, y + gap_y, x, rect.bottom()))
 
     # -- input ---------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)

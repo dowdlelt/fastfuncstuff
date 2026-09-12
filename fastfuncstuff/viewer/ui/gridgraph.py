@@ -42,6 +42,22 @@ BARE_WIDTH = 190
 TRACES_WIDTH = 240
 
 
+def _decimate(values: np.ndarray, width: float) -> tuple[np.ndarray, np.ndarray]:
+    """Sample indices and values, thinned to about two points per pixel.
+
+    Returned as an (index, value) pair rather than a shorter array so the x
+    positions stay on the original time axis -- thinning the values alone would
+    stretch the trace across the cell and put the time cursor in the wrong
+    place.
+    """
+    n = int(values.size)
+    budget = max(2, int(width * 2))
+    if n <= budget:
+        return np.arange(n), values
+    idx = np.linspace(0, n - 1, budget).astype(np.intp)
+    return idx, values[idx]
+
+
 @dataclass
 class Cell:
     ijk: tuple[int, int, int]
@@ -183,9 +199,14 @@ class GridGraph(QtWidgets.QWidget):
             span = hi - lo or 1.0
             nt = values.size
             cursor_len = max(cursor_len, nt)
+            # Decimate to the width of the cell. At a 16x16 grid a cell is
+            # about thirty pixels wide, and drawing four hundred points into
+            # thirty pixels costs the whole paint and shows nothing -- the
+            # y-range still comes from every sample, so the envelope is honest.
+            xs, ys = _decimate(values, inner.width())
             path = QtGui.QPainterPath()
-            for i, v in enumerate(values):
-                x = inner.left() + (i / max(nt - 1, 1)) * inner.width()
+            for i, (t, v) in enumerate(zip(xs, ys, strict=True)):
+                x = inner.left() + (t / max(nt - 1, 1)) * inner.width()
                 y = inner.bottom() - (float(v) - lo) / span * inner.height()
                 pt = QtCore.QPointF(x, y)
                 path.moveTo(pt) if i == 0 else path.lineTo(pt)

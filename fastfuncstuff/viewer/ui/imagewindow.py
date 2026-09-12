@@ -225,7 +225,27 @@ class ImageWindow(QtWidgets.QWidget):
             return
         layout = plane_layout(state.grid.affine, vp.plane)
         self.pane.set_layout(layout)
-        self.pane.set_crosshair(*layout.to_image(state.crosshair, state.grid.shape))
+        row, col = layout.to_image(state.crosshair, state.grid.shape)
+        self.pane.set_crosshair(row, col)
+        self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
+
+    def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
+        """Footprints of the graphs reading this plane, in image indices.
+
+        Only graphs on the *same* plane. An axial graph's 5x5 block is three
+        voxels of one slice as far as a sagittal view is concerned, and drawing
+        that as a box on sagittal would claim a coverage the graph does not
+        have. The block walks from ``-half`` exactly as the graph does, so the
+        square on screen is the voxels the cells are showing rather than an
+        approximation of them.
+        """
+        out: list[tuple[int, int, int, int]] = []
+        for graph in self.session.state.viewports.graphs:
+            if graph.plane is not plane:
+                continue
+            half = graph.grid_n // 2
+            out.append((row - half, col - half, graph.grid_n, graph.grid_n))
+        return out
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         self.closed.emit(self.vid)

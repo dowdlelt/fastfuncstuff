@@ -88,6 +88,11 @@ class WindowManager(QtCore.QObject):
     # -- drawing ---------------------------------------------------------
     def redraw(self, dirty: Aspect) -> None:
         """Push whatever changed into whichever windows care about it."""
+        # VIEWPORTS belongs in the image set, not only in sync(): an image
+        # draws the footprint of every *graph* on its plane, so opening a graph
+        # or stepping its grid changes what an image has to show. This is the
+        # same hazard as the crosshair redraw that did not listen for
+        # CROSSHAIR -- a consumer whose input is wider than it looks.
         images = dirty & (
             Aspect.SLICES
             | Aspect.COLORMAP
@@ -96,6 +101,7 @@ class WindowManager(QtCore.QObject):
             | Aspect.GRID
             | Aspect.CROSSHAIR
             | Aspect.LAYERS
+            | Aspect.VIEWPORTS
         )
         graphs = dirty & (Aspect.CROSSHAIR | Aspect.GRAPH | Aspect.TIME | Aspect.LAYERS)
         for win in list(self.windows.values()):

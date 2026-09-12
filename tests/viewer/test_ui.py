@@ -835,3 +835,56 @@ def test_an_image_window_can_be_made_tiny(win, qapp):
     image.resize(90, 90)
     qapp.processEvents()
     assert image.width() == 90
+
+
+# ---------------------------------------------------------------------------
+# the crosshair says what the graph is reading
+# ---------------------------------------------------------------------------
+
+
+def test_the_crosshair_opens_to_the_graphs_footprint(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetViewGrid
+
+    axial = image_of(win, Plane.AXIAL)
+    assert axial.pane._coverage == [], "no graph open, no box"
+
+    graph = open_graph(win, qapp, Plane.AXIAL)
+    win.refresh(win.session.do(SetViewGrid(graph.vid, 5)))
+    qapp.processEvents()
+    (row, col, n_rows, n_cols) = axial.pane._coverage[0]
+    assert (n_rows, n_cols) == (5, 5)
+
+    # Centred the way the graph walks it: from -half, inclusive.
+    cross_row, cross_col = axial.pane._cross
+    assert (row, col) == (cross_row - 2, cross_col - 2)
+
+
+def test_the_footprint_follows_the_grid_size(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetViewGrid
+
+    axial = image_of(win, Plane.AXIAL)
+    graph = open_graph(win, qapp, Plane.AXIAL)
+    for n in (1, 3, 8, 16):
+        win.refresh(win.session.do(SetViewGrid(graph.vid, n)))
+        qapp.processEvents()
+        assert axial.pane._coverage[0][2:] == (n, n)
+
+
+def test_only_the_graphs_own_plane_gets_a_box(win, qapp):
+    """An axial block is one slice as far as sagittal is concerned."""
+    open_graph(win, qapp, Plane.AXIAL)
+    qapp.processEvents()
+    assert image_of(win, Plane.AXIAL).pane._coverage != []
+    assert image_of(win, Plane.SAGITTAL).pane._coverage == []
+
+
+def test_two_graphs_of_different_sizes_read_as_nested_boxes(win, qapp):
+    from fastfuncstuff.viewer.vocab import SetViewGrid
+
+    a = open_graph(win, qapp, Plane.AXIAL)
+    b = open_graph(win, qapp, Plane.AXIAL)
+    win.refresh(win.session.do(SetViewGrid(a.vid, 3)))
+    win.refresh(win.session.do(SetViewGrid(b.vid, 9)))
+    qapp.processEvents()
+    sizes = sorted(box[2] for box in image_of(win, Plane.AXIAL).pane._coverage)
+    assert sizes == [3, 9]

@@ -47,10 +47,11 @@ class Plane(StrEnum):
 #: Cells per side in a graph viewport. The grid is stepped with + and - rather
 #: than chosen from a menu of 1/4/9: it is a square that grows, and the useful
 #: size depends on voxel size and on what you are chasing, not on three blessed
-#: values. Capped where a cell stops being readable rather than where it stops
-#: being fast.
+#: values. The cap is where a cell stops being readable at a sane window size,
+#: not where it stops being fast -- traces decimate to the cell width, so 256
+#: cells paint in about the time 16 used to.
 MIN_GRID = 1
-MAX_GRID = 8
+MAX_GRID = 16
 
 
 class ViewKind(StrEnum):

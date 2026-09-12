@@ -55,6 +55,10 @@ dev = [
     "pytest>=7.0",
     "scikit-learn>=1.2",
     "ruff>=0.9",
+    # The viewer's UI tests are part of the suite, and they skip silently
+    # without Qt -- so a dev install that omits it reports a green run over a
+    # third of the viewer that never executed.
+    "PySide6>=6.7",
 ]
 # ffs_viewer's window. The headless viewer core (loading, residency, colour
 # mapping, compositing) has no Qt dependency and is importable without this.
