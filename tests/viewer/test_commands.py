@@ -14,6 +14,7 @@ import pytest
 from fastfuncstuff.viewer import vocab
 from fastfuncstuff.viewer.commands import (
     Aspect,
+    Command,
     CommandBus,
     parse_script,
     registered_names,
@@ -359,3 +360,43 @@ def test_visible_layers_skips_hidden_and_transparent():
     stack.update("b", visible=False)
     stack.update("c", opacity=0.0)
     assert [ly.key for ly in stack.visible_layers()] == ["a"]
+
+
+def test_every_registered_command_has_a_handler():
+    """A command reachable from a script is reachable from a replay.
+
+    This catches a command whose handler was never written. It does *not*
+    catch one registered to the wrong function -- the name is in the table
+    either way -- which is what the check in CommandBus.handle is for.
+    """
+    bus = _session()
+    missing = sorted(name for name in registered_names() if name not in bus._handlers)
+    assert missing == []
+
+
+def test_a_handler_of_the_wrong_shape_is_refused_at_registration():
+    """The bug this exists for: a helper written between the decorator and
+    its target, so the decorator registered the helper and the real handler was
+    never registered at all. The name was in the table, pointing at the wrong
+    function, and the whole suite stayed green.
+    """
+    bus = CommandBus(ViewerState())
+
+    with pytest.raises(TypeError, match="does not look like a command handler"):
+
+        @bus.handle("SET_IJK")
+        def _helper(state: ViewerState, was: str | None) -> Aspect:  # the real shape
+            return Aspect.NOTHING
+
+    with pytest.raises(TypeError, match="does not look like a command handler"):
+
+        @bus.handle("SET_IJK")
+        def _unannotated(cmd, state):
+            return Aspect.NOTHING
+
+    # And the real shape still registers.
+    @bus.handle("SET_IJK")
+    def _good(cmd: Command, state: ViewerState) -> Aspect:
+        return Aspect.NOTHING
+
+    assert "SET_IJK" in bus._handlers

@@ -16,6 +16,7 @@ sessions stay human-editable and the vocabulary reads as familiar.
 
 from __future__ import annotations
 
+import inspect
 import shlex
 import typing
 from collections.abc import Callable, Iterable, Iterator, Sequence
@@ -233,11 +234,27 @@ class CommandBus:
 
     # -- registration --------------------------------------------------
     def handle(self, name: str) -> Callable[[Handler], Handler]:
-        """Register the handler for one command name."""
+        """Register the handler for one command name.
+
+        The first parameter must be annotated ``Command``. That is not
+        ceremony: a helper once got written between ``@bus.handle(...)`` and
+        the function it was meant to decorate, so the decorator registered the
+        *helper* and the real handler was never registered at all. Nothing
+        caught it -- the name was in the table, pointing at the wrong function,
+        and a table-is-full check passes on exactly that. Checking the shape of
+        what is registered is what distinguishes the two.
+        """
 
         def deco(fn: Handler) -> Handler:
             if name in self._handlers:
                 raise ValueError(f"handler for {name!r} already registered")
+            params = list(inspect.signature(fn).parameters.values())
+            if len(params) != 2 or params[0].annotation not in (Command, "Command"):
+                raise TypeError(
+                    f"handler for {name!r} is {fn.__name__}(...), which does not look like a "
+                    "command handler: it must take (cmd: Command, state). A function that "
+                    "landed between the decorator and its target registers silently."
+                )
             self._handlers[name] = fn
             return fn
 
