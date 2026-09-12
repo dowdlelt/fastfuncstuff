@@ -251,7 +251,8 @@ class CommandBus:
             params = list(inspect.signature(fn).parameters.values())
             if len(params) != 2 or params[0].annotation not in (Command, "Command"):
                 raise TypeError(
-                    f"handler for {name!r} is {fn.__name__}(...), which does not look like a "
+                    f"handler for {name!r} is {getattr(fn, '__name__', fn)!s}(...), which does not "
+                    "look like a "
                     "command handler: it must take (cmd: Command, state). A function that "
                     "landed between the decorator and its target registers silently."
                 )
