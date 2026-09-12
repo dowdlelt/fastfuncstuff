@@ -273,6 +273,24 @@ class CommandBus:
             listener(cmd, dirty)
         return dirty
 
+    def record(self, cmd: Command) -> None:
+        """Log a command whose effect has already been applied.
+
+        The one case this exists for: work slow enough to run on a worker. The
+        UI computes the result off-thread and installs it on the GUI thread, so
+        by the time the command could be dispatched its effect is already
+        there, and dispatching would redo seconds of arithmetic to reach the
+        state the session is in.
+
+        Replay is unaffected -- it dispatches the command for real, which is
+        right, because a headless replay has no interface to keep responsive.
+        Use this only when the effect is genuinely equivalent to dispatching;
+        anything else puts a lie in the recording, which is the failure the
+        whole bus exists to prevent.
+        """
+        if self.recording:
+            self._log.append(cmd)
+
     def dispatch_all(self, cmds: Iterable[Command]) -> Aspect:
         """Apply a sequence, returning the union of what it dirtied."""
         total = Aspect.NOTHING

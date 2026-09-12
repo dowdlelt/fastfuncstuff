@@ -75,7 +75,10 @@ class Layer:
     time_linked: bool = False
     #: Where the voxels came from. ``"file"`` for anything loaded off disk;
     #: ``"mode:<name>"`` for an overlay a mode computes and owns, which the
-    #: mode replaces in place and the picker must not offer to reload.
+    #: mode replaces in place and the picker must not offer to reload;
+    #: ``"derived:<op>:<source key>"`` for one the viewer computed and then
+    #: kept -- a denoised copy of a run is a dataset, not a mode's output, and
+    #: it outlives the mode that was active when it was made.
     source: str = "file"
 
     #: Display range. ``None`` means "derive from the data" -- resolved once the
@@ -101,6 +104,15 @@ class Layer:
     @property
     def is_computed(self) -> bool:
         return self.source.startswith("mode:")
+
+    @property
+    def is_derived(self) -> bool:
+        return self.source.startswith("derived:")
+
+    @property
+    def derived_from(self) -> str | None:
+        """The key this layer was computed from, if it was."""
+        return self.source.split(":", 2)[2] if self.is_derived else None
 
     def sub_brick(self, index: int | None = None) -> str:
         """How one sub-brick should be named on screen.

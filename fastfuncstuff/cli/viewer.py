@@ -18,6 +18,10 @@ OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
 (View / InstaCorr / ICA). the main window is a controller -- every image and
 every graph is a companion window you open, arrange and close.
 
+DERIVE projects a design's nuisance out of a run and keeps the result as a new
+layer just above it, so raw and denoised sit next to each other in the stack --
+graphable together, and one keypress apart under solo.
+
 keys (main window)
   n  N                 new image / new graph window
   f  F                 tile / stagger every window      r  raise them all
@@ -27,6 +31,7 @@ keys (main window)
   [ ]                  select layer       space  show / hide layer
   t T                  threshold down / up
   a  alpha mode        s  sign mode       b  boxed      c  colormap
+  D                    denoise the selected run into a new layer
   ctrl+O  open         ctrl+S  save session script       h  this list
 
 keys (image window)

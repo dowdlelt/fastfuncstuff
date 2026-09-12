@@ -71,6 +71,26 @@ class SetIndex(Command):
 
 @command
 @dataclass(frozen=True)
+class Denoise(Command):
+    """Project a design's nuisance regressors out of a layer, as a new layer.
+
+    ``matrix`` is an ``.xmat.1D`` (whose ColumnGroups say which columns are
+    nuisance) or a plain 1D file (all of whose columns are). ``polort`` adds
+    Legendre drift on top and defaults to off, because an xmat already carries
+    its own.
+    """
+
+    name = "DENOISE"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
+    major = True
+    key: str
+    matrix: str = ""
+    polort: int = -1
+    keep_mean: bool = True
+
+
+@command
+@dataclass(frozen=True)
 class SetTheme(Command):
     """Switch the interface palette. ``dark`` or ``light``."""
 
@@ -660,6 +680,18 @@ def install(
             return Aspect.NOTHING
         st.viewports.update(vid, **changes)
         return aspects
+
+    @bus.handle(Denoise.name)
+    def _denoise(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, Denoise)
+        if session is None:
+            raise RuntimeError("DENOISE needs a session")
+        return session.denoise(
+            cmd.key,
+            matrix=cmd.matrix,
+            polort=int(cmd.polort),
+            keep_mean=bool(cmd.keep_mean),
+        )
 
     @bus.handle(SetTheme.name)
     def _set_theme(cmd: Command, st: ViewerState) -> Aspect:

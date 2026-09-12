@@ -296,6 +296,113 @@ class ViewerSession:
     def mode_series(self, ijk: tuple[int, int, int] | None = None) -> list[Trace]:
         return self.mode.series(ijk or self.state.crosshair)
 
+    # -- derived layers -------------------------------------------------
+    #
+    # Same split as a mode's prepare()/compute(): the arithmetic is seconds
+    # over a whole 4-D array and runs on a worker, so it must not touch session
+    # state; installing the result is instant and happens on the GUI thread.
+
+    def compute_denoise(
+        self,
+        key: str,
+        *,
+        matrix: str = "",
+        polort: int = -1,
+        keep_mean: bool = True,
+        progress=None,
+    ) -> tuple[np.ndarray, str]:
+        """The slow half: residualise a run, and say what was projected out.
+
+        Touches nothing but the arrays it reads and the one it builds, so it is
+        safe on a worker thread.
+        """
+        from fastfuncstuff.viewer import derive
+
+        layer = self.state.layers.get(key)
+        if layer.n_volumes <= 1:
+            raise ValueError(f"{layer.name} is not a time series; nothing to denoise")
+        nuisance = derive.read_nuisance(matrix or None, n_time=layer.n_volumes, polort=polort)
+        data = self.store.ensure_ram(key)
+        values = derive.denoise(
+            data,
+            nuisance,
+            device=self.store.device,
+            keep_mean=keep_mean,
+            progress=progress,
+        )
+        return values, nuisance.description
+
+    def denoise(
+        self,
+        key: str,
+        *,
+        matrix: str = "",
+        polort: int = -1,
+        keep_mean: bool = True,
+        progress=None,
+    ) -> Aspect:
+        """Both halves, in order. What the DENOISE command runs on replay."""
+        values, detail = self.compute_denoise(
+            key, matrix=matrix, polort=polort, keep_mean=keep_mean, progress=progress
+        )
+        return self.install_derived(key, values, op="denoise", detail=detail)
+
+    def install_derived(
+        self, source_key: str, values: np.ndarray, *, op: str, detail: str = ""
+    ) -> Aspect:
+        """Put a computed dataset into the stack, right above what made it.
+
+        Two decisions, both about making the comparison the easy one:
+
+        * It lands **immediately above its source** and inherits how the source
+          is drawn. Neighbours in the stack are what `[`, `]` and a soloed
+          window flip between, so raw against denoised is one keypress -- the
+          same gesture that checks an EPI against an anat.
+        * Re-deriving from the same source with the same operation **replaces**
+          the layer rather than pushing another. Clicking twice must not grow
+          the stack without bound, and the parameters that produced it are in
+          the recorded command either way.
+        """
+        source = self.state.layers.get(source_key)
+        tag = f"derived:{op}:{source_key}"
+        existing = self.state.layers.find_by_source(tag)
+        key = existing.key if existing is not None else self.state.layers.mint_key("D")
+        name = f"{source.name} ·{op}d"
+
+        self.store.adopt(key, values, name=name)
+        self.invalidate(key)
+        if existing is not None:
+            self.state.layers.update(key, name=name, path=f"<{op}: {detail}>")
+            return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
+
+        self.state.layers.add(
+            Layer(
+                key=key,
+                name=name,
+                # No file backs it, so the field that would hold one carries
+                # the provenance instead: what was projected out, in words.
+                path=f"<{op}: {detail}>",
+                shape=source.shape,
+                n_volumes=int(values.shape[3]) if values.ndim == 4 else 1,
+                affine=source.affine,
+                labels=source.labels,
+                visible=source.visible,
+                opacity=source.opacity,
+                colormap=source.colormap,
+                # The same display range as its source, so the two are
+                # comparable at a glance rather than each auto-scaled to
+                # itself -- which would hide exactly the difference you made
+                # the layer to see.
+                range_lo=source.range_lo,
+                range_hi=source.range_hi,
+                time_linked=source.time_linked,
+                source=tag,
+            ),
+            at=self.state.layers.index_of(source_key) + 1,
+        )
+        self.state.selected = key
+        return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
+
     # -- computed overlays ---------------------------------------------
     def install_computed_overlay(self, source: str, overlay: ComputedOverlay) -> str:
         """Install (or update in place) the layer a mode owns.

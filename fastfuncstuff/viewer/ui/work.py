@@ -1,4 +1,4 @@
-"""Running a mode's slow preparation off the GUI thread.
+"""Running slow work off the GUI thread.
 
 Mode preparation is seconds on a real dataset -- InstaCorr has to detrend,
 filter and normalize the whole 4-D array. Doing that in the click handler
@@ -13,6 +13,10 @@ session mutation stays on the thread that paints.
 While a preparation is running the mode's controls are disabled rather than
 queued. Queueing would let a drag stack up several multi-second preparations
 whose results arrive in an order nobody asked for.
+
+Deriving a layer -- projecting a design's nuisance out of a run -- has the same
+shape and goes through the same runner: seconds of arithmetic over a whole 4-D
+array, a progress fraction, and a result installed back on the GUI thread.
 """
 
 from __future__ import annotations
@@ -27,16 +31,23 @@ class _Signals(QtCore.QObject):
     finished = QtCore.Signal(bool, str)
 
 
-class _PrepareTask(QtCore.QRunnable):
-    def __init__(self, mode) -> None:
+class _Task(QtCore.QRunnable):
+    """Any slow job that takes a progress callback and returns truthiness.
+
+    Mode preparation was the first; deriving a layer is the second, and it has
+    the same shape -- seconds of arithmetic over a whole 4-D array that must
+    not run on the thread that paints.
+    """
+
+    def __init__(self, job: Callable[[Callable[[float, str], None]], object]) -> None:
         super().__init__()
-        self.mode = mode
+        self.job = job
         self.signals = _Signals()
 
     @QtCore.Slot()
     def run(self) -> None:
         try:
-            ok = self.mode.prepare(self.signals.progress.emit)
+            ok = self.job(self.signals.progress.emit)
         except Exception as exc:  # surfaced in the status bar, never swallowed
             self.signals.finished.emit(False, f"{type(exc).__name__}: {exc}")
             return
@@ -71,11 +82,17 @@ class PreparationRunner(QtCore.QObject):
         """Begin preparing. Returns False if one is already running."""
         if self._busy:
             return False
-        self._busy = True
-        self.busy_changed.emit(True)
         mode._preparing = True
         self._mode = mode
-        task = _PrepareTask(mode)
+        return self.run(mode.prepare)
+
+    def run(self, job: Callable[[Callable[[float, str], None]], object]) -> bool:
+        """Run any slow job on the worker. False if one is already running."""
+        if self._busy:
+            return False
+        self._busy = True
+        self.busy_changed.emit(True)
+        task = _Task(job)
         task.signals.progress.connect(self.progress, QtCore.Qt.ConnectionType.QueuedConnection)
         task.signals.finished.connect(self._on_finished, QtCore.Qt.ConnectionType.QueuedConnection)
         self._pool.start(task)
@@ -85,6 +102,7 @@ class PreparationRunner(QtCore.QObject):
     def _on_finished(self, ok: bool, error: str) -> None:
         if getattr(self, "_mode", None) is not None:
             self._mode._preparing = False
+            self._mode = None
         self._busy = False
         self.busy_changed.emit(False)
         self.finished.emit(ok, error)

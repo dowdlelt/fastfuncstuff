@@ -41,6 +41,7 @@ from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
+    Denoise,
     Read,
     SelectLayer,
     SetAlpha,
@@ -353,6 +354,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.layer_list.currentRowChanged.connect(self._row_selected)
         v.addWidget(self.layer_list)
 
+        self._build_derive(v)
+
         form = QtWidgets.QFormLayout()
         form.setSpacing(7)
 
@@ -456,6 +459,127 @@ class ViewerWindow(QtWidgets.QMainWindow):
         scroll.setWidget(panel)
         self.setCentralWidget(scroll)
 
+    def _build_derive(self, parent: QtWidgets.QVBoxLayout) -> None:
+        """Make a new dataset out of one already in the stack.
+
+        Lives beside the layer list rather than in the mode panel because what
+        it produces is a *layer*, not a mode's overlay: it stays when the mode
+        changes, it can be graphed, and it can become the underlay.
+        """
+        self.derive_head = self._head("DERIVE")
+        parent.addWidget(self.derive_head)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(5)
+        self.matrix_edit = QtWidgets.QLineEdit()
+        self.matrix_edit.setPlaceholderText("design .xmat.1D or a 1D file")
+        self.matrix_edit.setToolTip(
+            "An xmat's ColumnGroups say which of its columns are nuisance, so "
+            "the design's own answer is used.\nA plain 1D file is nuisance "
+            "throughout, which is what a motion file is."
+        )
+        row.addWidget(self.matrix_edit, 1)
+        browse = QtWidgets.QPushButton("…")
+        browse.setMaximumWidth(34)
+        browse.clicked.connect(self._browse_matrix)
+        row.addWidget(browse)
+        parent.addLayout(row)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(5)
+        row2.addWidget(self._head("POLORT"))
+        self.polort_spin = QtWidgets.QSpinBox()
+        self.polort_spin.setRange(-1, 9)
+        self.polort_spin.setValue(-1)
+        self.polort_spin.setToolTip(
+            "Legendre drift columns to add. -1 is off, which is the default "
+            "because an xmat already carries its own."
+        )
+        self.polort_spin.setMaximumWidth(70)
+        row2.addWidget(self.polort_spin)
+        row2.addStretch(1)
+        self.denoise_button = QtWidgets.QPushButton(key_label("DENOISE", "D"))
+        self.denoise_button.setToolTip(
+            "Project the nuisance out of the selected layer, as a new layer "
+            "just above it (D).\nNeighbours in the stack are what [ and ] "
+            "flip between, so raw against denoised is one keypress."
+        )
+        self.denoise_button.clicked.connect(self._denoise)
+        row2.addWidget(self.denoise_button)
+        parent.addLayout(row2)
+
+    def _browse_matrix(self) -> None:
+        start = str(self.session.catalog_dir or Path.cwd())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Design matrix or nuisance file", start, "1D / xmat (*.1D);;All (*)"
+        )
+        if path:
+            self.matrix_edit.setText(path)
+
+    def _denoise_source(self, key: str) -> str:
+        """Which layer a denoise should actually read.
+
+        Deriving selects the new layer, which is the right feedback -- but it
+        means a second click would land on the result and chain a denoise onto
+        a denoise. Almost nobody means that; what they mean is "again, with the
+        polort I just changed". So a denoise aimed at something this same
+        operation produced is redirected to what produced it, and the recorded
+        command names that, so a replay does not chain either.
+        """
+        layer = self.session.state.layers.get(key)
+        if layer.source.startswith("derived:denoise:"):
+            origin = layer.derived_from
+            if origin is not None and self.session.state.layers.find(origin) is not None:
+                return origin
+        return key
+
+    def _denoise(self) -> None:
+        """Derive on the worker: it is a whole 4-D array, not a click's work."""
+        key = self.current_key()
+        if key is None or self.runner.busy:
+            return
+        key = self._denoise_source(key)
+        layer = self.session.state.layers.get(key)
+        if layer.n_volumes <= 1:
+            self.statusBar().showMessage(f"{layer.name} is not a time series", 5000)
+            return
+        cmd = Denoise(
+            key,
+            matrix=self.matrix_edit.text().strip(),
+            polort=int(self.polort_spin.value()),
+        )
+
+        pending: dict[str, object] = {}
+
+        def job(progress) -> bool:
+            # Only the arithmetic runs here. It reads arrays and builds one;
+            # it does not touch the layer stack, because the worker thread has
+            # no business mutating what the GUI thread is painting from.
+            values, detail = self.session.compute_denoise(
+                cmd.key, matrix=cmd.matrix, polort=cmd.polort, progress=progress
+            )
+            pending["values"], pending["detail"] = values, detail
+            return True
+
+        def done(ok: bool, error: str) -> None:
+            self.runner.finished.disconnect(done)
+            if not ok:
+                if error:
+                    self.statusBar().showMessage(f"denoise failed: {error}", 10000)
+                return
+            dirty = self.session.install_derived(
+                cmd.key, pending["values"], op="denoise", detail=str(pending["detail"])
+            )
+            # Recorded rather than dispatched: the effect is already installed,
+            # and dispatching would redo the projection to arrive where we are.
+            self.session.bus.record(cmd)
+            self.refresh(dirty)
+            self.statusBar().showMessage(f"derived from {layer.name}", 5000)
+
+        self.runner.finished.connect(done)
+        if not self.runner.run(job):
+            self.runner.finished.disconnect(done)
+
     def _switch_mode(self, name: str) -> None:
         self._dispatch(SetMode(name))
         self._prepare_then_refresh()
@@ -496,6 +620,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("s", "next sign mode", self._cycle_sign, group="layer"),
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
+                Binding("D", "denoise the selected layer", self._denoise, group="layer"),
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
                 Binding("h", "this list", self.help.toggle, group="session"),
@@ -758,6 +883,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setEnabled(enabled)
             check.blockSignals(False)
         self._sync_brick_pickers(layer)
+        # A 3-D anatomy has no nuisance to project out of it.
+        derivable = layer.n_volumes > 1
+        for widget in (self.matrix_edit, self.polort_spin, self.denoise_button):
+            widget.setEnabled(derivable and not self.runner.busy)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))
         self.opacity_slider.blockSignals(False)

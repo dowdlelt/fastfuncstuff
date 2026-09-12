@@ -945,3 +945,54 @@ def test_the_palette_is_recorded_so_a_replay_looks_the_same(win, qapp):
     assert "SET_THEME light" in win.session.to_script()
     win._toggle_theme()
     qapp.processEvents()
+
+
+# ---------------------------------------------------------------------------
+# deriving a layer
+# ---------------------------------------------------------------------------
+
+
+def test_the_derive_controls_are_off_for_a_three_d_layer(win, qapp):
+    """An anatomy has no nuisance to project out of it."""
+    win.layer_list.setCurrentRow(1)  # the underlay: 3-D
+    qapp.processEvents()
+    assert not win.denoise_button.isEnabled()
+
+
+def test_denoise_runs_off_the_gui_thread_and_installs_on_it(win4d, qapp):
+    src = win4d.session.state.layers.overlay.key
+    win4d.session.store.ensure_ram(src)
+    win4d.layer_list.setCurrentRow(0)
+    win4d.polort_spin.setValue(2)
+    qapp.processEvents()
+
+    win4d._denoise()
+    assert win4d.runner.wait(20_000)
+    qapp.processEvents()
+
+    derived = win4d.session.state.layers.find_by_source(f"derived:denoise:{src}")
+    assert derived is not None
+    assert "DENOISE" in win4d.session.to_script()
+
+
+def test_a_second_click_re_derives_instead_of_chaining(win4d, qapp):
+    """Deriving selects the result, so a naive second click would chain."""
+    src = win4d.session.state.layers.overlay.key
+    win4d.session.store.ensure_ram(src)
+    win4d.layer_list.setCurrentRow(0)
+    win4d.polort_spin.setValue(1)
+    qapp.processEvents()
+
+    win4d._denoise()
+    win4d.runner.wait(20_000)
+    qapp.processEvents()
+    after_one = len(win4d.session.state.layers)
+
+    win4d.polort_spin.setValue(3)
+    win4d._denoise()
+    win4d.runner.wait(20_000)
+    qapp.processEvents()
+    assert len(win4d.session.state.layers) == after_one
+    # And the recording names the real source, so a replay does not chain.
+    lines = [ln for ln in win4d.session.to_script().splitlines() if ln.startswith("DENOISE")]
+    assert all(ln.split()[1] == src for ln in lines)
