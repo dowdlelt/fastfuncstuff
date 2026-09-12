@@ -94,6 +94,75 @@ class PlaneLayout:
         return (out[0], out[1], out[2])
 
 
+@dataclass(frozen=True)
+class PlaneView:
+    """Which part of a plane is drawn, and at what magnification.
+
+    Zoom **crops** rather than interpolates: the sampled region shrinks and the
+    pane's existing scale-to-fit blows it up with smoothing off. That keeps the
+    rule the pane already states -- a viewer must not invent voxels that are
+    not there -- and it is cheaper, because magnifying costs fewer samples
+    rather than more.
+
+    It composes with :class:`PlaneLayout` rather than duplicating it. The flip
+    arithmetic lives in exactly one place for the reason written there, and an
+    offset that only *some* of the four callers applied would land in the same
+    family of bug: a crosshair drawn where the click did not happen.
+    """
+
+    layout: PlaneLayout
+    shape: tuple[int, int, int]
+    zoom: float = 1.0
+    #: Pan in display-grid voxels along the plane's own (row, col) axes. Voxels
+    #: rather than a fraction of the window, so the meaning of a drag does not
+    #: change as you zoom.
+    pan: tuple[float, float] = (0.0, 0.0)
+
+    @property
+    def extent(self) -> tuple[int, int]:
+        """Full plane size in display-grid voxels, (rows, cols)."""
+        return (self.shape[self.layout.row], self.shape[self.layout.col])
+
+    @property
+    def span(self) -> tuple[int, int]:
+        """Size of the drawn window, which is also the image's pixel size."""
+        h, w = self.extent
+        z = max(float(self.zoom), 1e-3)
+        return (max(1, min(h, round(h / z))), max(1, min(w, round(w / z))))
+
+    @property
+    def origin(self) -> tuple[int, int]:
+        """Top-left of the drawn window, clamped inside the plane.
+
+        Clamped so panning cannot walk the view off the data and leave a blank
+        pane with no indication of which way to come back.
+        """
+        h, w = self.extent
+        sh, sw = self.span
+        r0 = round((h - sh) / 2.0 + float(self.pan[0]))
+        c0 = round((w - sw) / 2.0 + float(self.pan[1]))
+        return (max(0, min(r0, h - sh)), max(0, min(c0, w - sw)))
+
+    @property
+    def is_identity(self) -> bool:
+        return self.span == self.extent and self.origin == (0, 0)
+
+    def to_image(self, ijk: tuple[int, int, int]) -> tuple[int, int]:
+        """Display-grid indices to (row, col) in the drawn image.
+
+        May fall outside the image when the voxel is off-view; callers that
+        draw a crosshair want that, so it is not clamped.
+        """
+        row, col = self.layout.to_image(ijk, self.shape)
+        r0, c0 = self.origin
+        return (row - r0, col - c0)
+
+    def to_ijk(self, row: int, col: int, current: tuple[int, int, int]) -> tuple[int, int, int]:
+        """(row, col) in the drawn image back to display-grid indices."""
+        r0, c0 = self.origin
+        return self.layout.to_ijk(int(row) + r0, int(col) + c0, current, self.shape)
+
+
 def ras_axes(affine: np.ndarray) -> dict[str, tuple[int, int]]:
     """For each of R/A/S, which display axis carries it and in which direction.
 
@@ -162,22 +231,27 @@ def plane_indices(
     plane: Plane,
     position: int,
     *,
+    view: PlaneView | None = None,
     device: torch.device | None = None,
     dtype: torch.dtype = torch.float32,
 ) -> Tensor:
     """``(H, W, 3)`` display-grid indices covering one plane.
 
-    Built on-device so a redraw never round-trips index arithmetic through the
-    host.
+    ``view`` crops and magnifies; without one the whole plane is covered. Built
+    on-device so a redraw never round-trips index arithmetic through the host.
     """
     layout = plane_layout(grid.affine, plane)
-    h, w = grid.shape[layout.row], grid.shape[layout.col]
-    rows = torch.arange(h, device=device, dtype=dtype)
-    cols = torch.arange(w, device=device, dtype=dtype)
+    if view is None:
+        view = PlaneView(layout=layout, shape=grid.shape)
+    full_h, full_w = view.extent
+    h, w = view.span
+    r0, c0 = view.origin
+    rows = torch.arange(h, device=device, dtype=dtype) + float(r0)
+    cols = torch.arange(w, device=device, dtype=dtype) + float(c0)
     if layout.row_flip:
-        rows = (h - 1) - rows
+        rows = (full_h - 1) - rows
     if layout.col_flip:
-        cols = (w - 1) - cols
+        cols = (full_w - 1) - cols
     out = torch.empty((h, w, 3), device=device, dtype=dtype)
     out[..., layout.fixed] = float(position)
     out[..., layout.row] = rows.unsqueeze(1).expand(h, w)
@@ -243,6 +317,7 @@ def extract_plane(
     plane: Plane,
     position: int,
     *,
+    view: PlaneView | None = None,
     mode: str = "bilinear",
     fill: float = 0.0,
 ) -> Tensor:
@@ -252,7 +327,9 @@ def extract_plane(
     still goes through ``grid_sample``; at 0.08 ms the special case would cost
     more in divergent code paths than it saves.
     """
-    ijk = plane_indices(grid, plane, position, device=volume.device, dtype=volume.dtype)
+    ijk = plane_indices(
+        grid, plane, position, view=view, device=volume.device, dtype=volume.dtype
+    )
     layer_ijk = display_to_layer(ijk, grid.affine, layer_affine)
     return sample_volume(volume, layer_ijk, mode=mode, fill=fill)
 

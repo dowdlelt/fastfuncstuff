@@ -18,7 +18,7 @@ from collections.abc import Callable
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.commands import Command
-from fastfuncstuff.viewer.compose import render_viewport
+from fastfuncstuff.viewer.compose import plane_view, render_viewport
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
@@ -27,11 +27,13 @@ from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetIJK,
+    SetPan,
     SetSeed,
     SetViewLocked,
     SetViewPlane,
     SetViewPosition,
     SetViewSolo,
+    SetZoom,
 )
 
 PLANE_KEYS = {Plane.AXIAL: "1", Plane.SAGITTAL: "2", Plane.CORONAL: "3"}
@@ -108,6 +110,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
         self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
         self.pane.stepped.connect(self._step)
+        self.pane.panned.connect(self._pan_by)
         v.addWidget(self.pane, 1)
         self.resize(420, 420)
         self.setMinimumSize(64, 64)
@@ -120,6 +123,10 @@ class ImageWindow(QtWidgets.QWidget):
                     for p, k in PLANE_KEYS.items()
                 ],
                 Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
+                Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
+                Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
+                Binding("0", "fit the whole plane", self._reset_view, group="view"),
+                Binding("right-drag", "pan", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
                 Binding("click", "move the crosshair", None, group="view"),
@@ -169,15 +176,34 @@ class ImageWindow(QtWidgets.QWidget):
     def _pick(self, row: int, col: int, *, seed: bool) -> None:
         state = self.session.state
         vp = self._viewport()
-        if state.grid is None or vp is None:
+        view = None if vp is None else plane_view(state, vp)
+        if state.grid is None or vp is None or view is None:
             return
-        layout = plane_layout(state.grid.affine, vp.plane)
-        ijk = layout.to_ijk(row, col, state.crosshair, state.grid.shape)
+        # Through the view, not the layout: when the pane is showing a crop,
+        # image pixel (0, 0) is not grid voxel 0 and a click would land
+        # wherever the offset happened not to be applied.
+        ijk = view.to_ijk(row, col, state.crosshair)
         # A click in an unlocked window still reports where it was clicked --
         # it just does not take its own slice from the crosshair afterwards.
         self._dispatch(SetIJK(*ijk))
         if seed:
             self._dispatch(SetSeed(*ijk))
+
+    def _zoom_by(self, factor: float) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetZoom(self.vid, max(1.0, min(vp.zoom * factor, 16.0))))
+
+    def _reset_view(self) -> None:
+        """Back to the whole plane. One key, because a lost view is a dead end."""
+        if self._viewport() is not None:
+            self._dispatch(SetZoom(self.vid, 1.0))
+            self._dispatch(SetPan(self.vid, 0.0, 0.0))
+
+    def _pan_by(self, d_row: float, d_col: float) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetPan(self.vid, vp.pan[0] + d_row, vp.pan[1] + d_col))
 
     def _step(self, delta: int) -> None:
         state = self.session.state
@@ -230,8 +256,12 @@ class ImageWindow(QtWidgets.QWidget):
             return
         layout = plane_layout(state.grid.affine, vp.plane)
         self.pane.set_layout(layout)
-        row, col = layout.to_image(state.crosshair, state.grid.shape)
+        view = plane_view(state, vp)
+        if view is None:
+            return
+        row, col = view.to_image(state.crosshair)
         self.pane.set_crosshair(row, col)
+        self.pane.set_zoomed(not view.is_identity)
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:

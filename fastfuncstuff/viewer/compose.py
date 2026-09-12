@@ -26,7 +26,7 @@ from fastfuncstuff.viewer.colormap import (
     to_rgba8,
 )
 from fastfuncstuff.viewer.layers import Layer
-from fastfuncstuff.viewer.slicing import extract_plane, plane_layout, plane_shape
+from fastfuncstuff.viewer.slicing import PlaneView, extract_plane, plane_layout, plane_shape
 from fastfuncstuff.viewer.state import Plane, ViewerState
 
 #: Colour drawn around suprathreshold voxels in boxed mode. Near-white reads
@@ -81,6 +81,7 @@ def render_plane(
     *,
     position: int | None = None,
     solo_key: str | None = None,
+    view: PlaneView | None = None,
 ) -> PaneImage | None:
     """Composite every visible layer for one display plane.
 
@@ -114,7 +115,7 @@ def render_plane(
         volume = session.display_volume(layer.key)
         if volume is None:
             continue
-        values = extract_plane(volume, grid, layer.affine, plane, pos)
+        values = extract_plane(volume, grid, layer.affine, plane, pos, view=view)
 
         # The threshold statistic may live in a different sub-brick than the one
         # being displayed -- that is the normal case for a stats dataset, where
@@ -126,7 +127,7 @@ def render_plane(
             stat = (
                 values
                 if stat_vol is None
-                else extract_plane(stat_vol, grid, layer.affine, plane, pos)
+                else extract_plane(stat_vol, grid, layer.affine, plane, pos, view=view)
             )
 
         lo = layer.range_lo if layer.range_lo is not None else 0.0
@@ -157,6 +158,23 @@ def render_plane(
     return PaneImage(rgba=to_rgba8(rgb), plane=plane, position=pos)
 
 
+def plane_view(state: ViewerState, viewport) -> PlaneView | None:
+    """The crop-and-magnify a viewport asks for, or ``None`` for the whole plane.
+
+    One function so the renderer, the crosshair and the hit test all read the
+    viewport the same way. Four separate readings is the shape of the bug the
+    flip arithmetic already taught us about.
+    """
+    if state.grid is None:
+        return None
+    return PlaneView(
+        layout=plane_layout(state.grid.affine, viewport.plane),
+        shape=state.grid.shape,
+        zoom=float(viewport.zoom),
+        pan=(float(viewport.pan[0]), float(viewport.pan[1])),
+    )
+
+
 def render_viewport(session, viewport) -> PaneImage | None:
     """Render what one image window shows.
 
@@ -173,7 +191,13 @@ def render_viewport(session, viewport) -> PaneImage | None:
     # An unlocked window stays on the slice it was parked on; a locked one has
     # no slice of its own and takes the crosshair's.
     position = None if viewport.locked else viewport.position
-    return render_plane(session, viewport.plane, position=position, solo_key=solo)
+    return render_plane(
+        session,
+        viewport.plane,
+        position=position,
+        solo_key=solo,
+        view=plane_view(session.state, viewport),
+    )
 
 
 def render_all(session) -> dict[Plane, PaneImage]:
@@ -205,6 +229,7 @@ __all__ = [
     "cached_lut",
     "empty_pane",
     "plane_position",
+    "plane_view",
     "render_all",
     "render_plane",
     "render_viewport",

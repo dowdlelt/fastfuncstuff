@@ -1101,3 +1101,63 @@ def test_the_stack_gestures_go_through_the_bus(win, qapp):
     qapp.processEvents()
     names = [c.name for c in win.session.bus.log]
     assert "MOVE_LAYER" in names and "REMOVE_LAYER" in names
+
+
+# ---------------------------------------------------------------------------
+# zoom and pan, per window
+# ---------------------------------------------------------------------------
+
+
+def test_zooming_crops_the_rendered_image(win, qapp):
+    image = image_of(win, Plane.AXIAL)
+    image.redraw()
+    before = image.pane._image.width()
+    image._zoom_by(2.0)
+    qapp.processEvents()
+    assert image.pane._image.width() < before
+    assert image.pane._zoomed
+
+
+def test_a_click_still_lands_on_the_voxel_under_it_when_zoomed(win, qapp):
+    """The hit test has to apply the crop offset the drawing applied."""
+    image = image_of(win, Plane.AXIAL)
+    image._zoom_by(2.0)
+    qapp.processEvents()
+    image.redraw()
+    row, col = image.pane._cross
+    before = win.session.state.crosshair
+    image.pane.picked.emit(row, col)
+    qapp.processEvents()
+    assert win.session.state.crosshair == before
+
+
+def test_zoom_is_per_window(win, qapp):
+    a = image_of(win, Plane.AXIAL)
+    b = image_of(win, Plane.CORONAL)
+    a._zoom_by(2.0)
+    qapp.processEvents()
+    assert win.session.state.viewports.get(a.vid).zoom > 1.0
+    assert win.session.state.viewports.get(b.vid).zoom == 1.0
+
+
+def test_reset_brings_the_whole_plane_back(win, qapp):
+    image = image_of(win, Plane.AXIAL)
+    image._zoom_by(2.0)
+    image._pan_by(3.0, 2.0)
+    qapp.processEvents()
+    image._reset_view()
+    qapp.processEvents()
+    viewport = win.session.state.viewports.get(image.vid)
+    assert (viewport.zoom, viewport.pan) == (1.0, (0.0, 0.0))
+    image.redraw()
+    assert not image.pane._zoomed
+
+
+def test_zoom_and_pan_are_recorded(win, qapp):
+    win.session.bus.clear_log()
+    image = image_of(win, Plane.AXIAL)
+    image._zoom_by(2.0)
+    image._pan_by(1.0, 1.0)
+    qapp.processEvents()
+    names = [c.name for c in win.session.bus.log]
+    assert "SET_ZOOM" in names and "SET_PAN" in names

@@ -29,6 +29,7 @@ keys (main window)
   arrows / PgUp PgDn   move the crosshair
   , .                  step time            v  play / pause
   [ ]                  select layer       space  show / hide layer
+  { }  u  Del          lower / raise layer, make underlay, remove
   t T                  threshold down / up
   a  alpha mode        s  sign mode       b  boxed      c  colormap
   D                    denoise the selected run into a new layer
@@ -38,7 +39,9 @@ keys (image window)
   1 2 3                axial / sagittal / coronal
   o                    solo the selected layer (flip between layers with [ ])
   l                    follow the crosshair, or unlock to park a slice
-  ctrl+click           set the InstaCorr seed             w  close
+  + -  0               zoom in / out, fit the whole plane
+  right-drag           pan            ctrl+click  set the InstaCorr seed
+  w                    close
 
 keys (graph window)
   + -                  more / fewer voxels    s  shared scale    w  close

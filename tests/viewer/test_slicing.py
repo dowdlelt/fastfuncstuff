@@ -275,3 +275,90 @@ def test_voxel_value_is_none_outside_the_layer():
     grid = _grid((6, 8, 10))
     vol = _ramp((4, 4, 4))
     assert voxel_value(vol, grid, grid.affine, (5, 7, 9)) is None
+
+
+# ---------------------------------------------------------------------------
+# PlaneView: zoom crops, and every consumer must apply the same offset
+# ---------------------------------------------------------------------------
+
+
+class TestPlaneView:
+    """Zoom and pan were commands with nothing drawing from them.
+
+    The hazard in wiring them up is the one PlaneLayout already documents: the
+    offset is needed when drawing, when hit-testing a click, when placing the
+    crosshair and when boxing a graph's footprint, and a copy that forgets it
+    puts the crosshair where the click did not happen.
+    """
+
+    @staticmethod
+    def _view(zoom=1.0, pan=(0.0, 0.0), shape=(40, 48, 32)):
+        from fastfuncstuff.viewer.slicing import PlaneView, plane_layout
+        from fastfuncstuff.viewer.state import Plane
+
+        affine = np.diag([2.0, 2.0, 2.0, 1.0])
+        return PlaneView(layout=plane_layout(affine, Plane.AXIAL), shape=shape, zoom=zoom, pan=pan)
+
+    def test_zoom_one_covers_the_whole_plane(self):
+        view = self._view()
+        assert view.span == view.extent
+        assert view.origin == (0, 0)
+        assert view.is_identity
+
+    def test_zoom_crops_rather_than_interpolating(self):
+        """Magnifying costs fewer samples, not more, and invents no voxels."""
+        view = self._view(zoom=2.0)
+        full_h, full_w = view.extent
+        assert view.span == (round(full_h / 2), round(full_w / 2))
+
+    def test_the_crop_is_centred_before_any_pan(self):
+        view = self._view(zoom=2.0)
+        h, w = view.extent
+        sh, sw = view.span
+        assert view.origin == ((h - sh) // 2, (w - sw) // 2)
+
+    def test_pan_moves_the_window_in_voxels(self):
+        view = self._view(zoom=2.0, pan=(5.0, -3.0))
+        base = self._view(zoom=2.0).origin
+        assert view.origin == (base[0] + 5, base[1] - 3)
+
+    def test_pan_cannot_walk_the_view_off_the_data(self):
+        """A blank pane with no indication of the way back is a dead end."""
+        h, w = self._view().extent
+        far = self._view(zoom=2.0, pan=(10_000.0, -10_000.0))
+        sh, sw = far.span
+        assert far.origin == (h - sh, 0)
+
+    def test_a_point_round_trips_through_the_crop(self):
+        view = self._view(zoom=2.0, pan=(4.0, 2.0))
+        ijk = (20, 24, 16)
+        row, col = view.to_image(ijk)
+        assert view.to_ijk(row, col, ijk) == ijk
+
+    def test_the_offset_is_actually_applied(self):
+        """Same voxel, different zoom: the image coordinates must differ."""
+        ijk = (20, 24, 16)
+        assert self._view().to_image(ijk) != self._view(zoom=2.0).to_image(ijk)
+
+    def test_one_image_pixel_is_still_one_voxel(self):
+        """Cropping magnifies by drawing fewer pixels, not by sub-sampling."""
+        view = self._view(zoom=4.0)
+        ijk = (20, 24, 16)
+        row, col = view.to_image(ijk)
+        moved = view.to_ijk(row, col + 1, ijk)
+        assert abs(moved[view.layout.col] - ijk[view.layout.col]) == 1
+
+    def test_plane_indices_follow_the_view(self):
+        from fastfuncstuff.viewer.slicing import plane_indices
+        from fastfuncstuff.viewer.state import DisplayGrid, Plane
+
+        grid = DisplayGrid.from_layer((40, 48, 32), np.diag([2.0, 2.0, 2.0, 1.0]))
+        view = self._view(zoom=2.0)
+        idx = plane_indices(grid, Plane.AXIAL, 16, view=view)
+        assert tuple(idx.shape[:2]) == view.span
+        # And they start at the crop's origin, in the plane's own axes.
+        r0, c0 = view.origin
+        full_h, _ = view.extent
+        first_row = float(idx[0, 0, view.layout.row])
+        expected = (full_h - 1 - r0) if view.layout.row_flip else r0
+        assert first_row == expected

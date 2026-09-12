@@ -29,6 +29,9 @@ class ImagePane(QtWidgets.QWidget):
     stepped = QtCore.Signal(int)
     #: Seed request (ctrl/cmd-click), same coordinates as ``picked``.
     seeded = QtCore.Signal(int, int)
+    #: Right-button drag, in image pixels. Left stays the crosshair, because
+    #: moving where you are looking is the gesture you make most.
+    panned = QtCore.Signal(float, float)
 
     def __init__(self, plane: Plane, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -36,10 +39,12 @@ class ImagePane(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._pane: PaneImage | None = None
         self._cross: tuple[int, int] | None = None
+        self._drag_from: QtCore.QPointF | None = None
         #: Voxel footprints of the open graphs, as (row, col, n_rows, n_cols)
         #: in image indices. The crosshair opens up around them.
         self._coverage: list[tuple[int, int, int, int]] = []
         self._labels: tuple[str, str, str, str] | None = None
+        self._zoomed = False
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
         self.setMinimumSize(48, 48)
@@ -76,6 +81,12 @@ class ImagePane(QtWidgets.QWidget):
         self._labels = layout.labels
         self.update()
 
+    def set_zoomed(self, on: bool) -> None:
+        """Whether the pane is showing a crop, for the corner readout."""
+        if on != self._zoomed:
+            self._zoomed = bool(on)
+            self.update()
+
     def set_crosshair(self, row: int, col: int) -> None:
         self._cross = (int(row), int(col))
         self.update()
@@ -105,6 +116,13 @@ class ImagePane(QtWidgets.QWidget):
         scale = min(self.width() / iw, self.height() / ih)
         w, h = max(1, int(iw * scale)), max(1, int(ih * scale))
         return QtCore.QRect((self.width() - w) // 2, (self.height() - h) // 2, w, h)
+
+    def _image_scale(self) -> float:
+        """Widget pixels per image pixel, for turning a drag into voxels."""
+        rect = self._target_rect()
+        if self._image is None or self._image.width() == 0 or rect.width() == 0:
+            return 1.0
+        return max(rect.width() / self._image.width(), 1e-6)
 
     def _to_indices(self, pos: QtCore.QPointF) -> tuple[int, int] | None:
         """Widget point to (row, col) display indices, or None if outside."""
@@ -148,7 +166,10 @@ class ImagePane(QtWidgets.QWidget):
         font.setPointSize(9)
         p.setFont(font)
         pos = self._pane.position if self._pane is not None else 0
-        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}")
+        # Saying so on the image, because a cropped brain still looks like a
+        # brain -- the same reason the edge labels are written on.
+        zoom = "  zoom" if self._zoomed else ""
+        p.drawText(6, 15, f"{self.plane.value.upper()}  {pos}{zoom}")
 
         # Anatomical edge labels. An upside-down or mirrored brain still looks
         # like a brain, so the only thing that says which way round it is, is
@@ -200,6 +221,9 @@ class ImagePane(QtWidgets.QWidget):
 
     # -- input ---------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if event.button() == QtCore.Qt.MouseButton.RightButton:
+            self._drag_from = event.position()
+            return
         idx = self._to_indices(event.position())
         if idx is None:
             return
@@ -212,6 +236,15 @@ class ImagePane(QtWidgets.QWidget):
             self.picked.emit(*idx)
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if event.buttons() & QtCore.Qt.MouseButton.RightButton:
+            if self._drag_from is not None:
+                scale = self._image_scale()
+                delta = event.position() - self._drag_from
+                self._drag_from = event.position()
+                # Negated: dragging the image right should bring what is on the
+                # left into view, the way dragging a map works.
+                self.panned.emit(-delta.y() / scale, -delta.x() / scale)
+            return
         if not (event.buttons() & QtCore.Qt.MouseButton.LeftButton):
             return
         idx = self._to_indices(event.position())
