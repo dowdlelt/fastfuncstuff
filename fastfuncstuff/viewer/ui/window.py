@@ -56,8 +56,10 @@ from fastfuncstuff.viewer.vocab import (
     SetSeed,
     SetSign,
     SetThreshold,
+    SetThresholdIndex,
     SetTimeLinked,
     SetUnderlay,
+    SetVolume,
 )
 
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
@@ -329,6 +331,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         form = QtWidgets.QFormLayout()
         form.setSpacing(7)
+
+        # A stats bucket is a stack of named contrasts, and the names are in
+        # the header -- ffs and 3dDeconvolve both write them. Showing "volume
+        # 3" instead of "Faces#0_Coef" makes you go and run 3dinfo to find out
+        # what you are looking at, which is the one thing a viewer is for.
+        self.brick_box = QtWidgets.QComboBox()
+        self.brick_box.setFont(QtGui.QFont(MONO))
+        self.brick_box.setToolTip("Which sub-brick this layer colours by")
+        self.brick_box.activated.connect(
+            lambda i: self._apply(SetVolume, index=int(self.brick_box.itemData(i)))
+        )
+        self.brick_head = self._head("OLAY")
+        form.addRow(self.brick_head, self.brick_box)
+
+        self.thrbrick_box = QtWidgets.QComboBox()
+        self.thrbrick_box.setFont(QtGui.QFont(MONO))
+        self.thrbrick_box.setToolTip(
+            "Which sub-brick the threshold reads.\n"
+            "The stats case is colouring by a coefficient and thresholding on its t."
+        )
+        self.thrbrick_box.activated.connect(
+            lambda i: self._apply(SetThresholdIndex, index=self.thrbrick_box.itemData(i))
+        )
+        self.thrbrick_head = self._head("THR ON")
+        form.addRow(self.thrbrick_head, self.thrbrick_box)
 
         self.cmap_box = QtWidgets.QComboBox()
         self.cmap_box.addItems(available_colormaps())
@@ -703,6 +730,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setChecked(value)
             check.setEnabled(enabled)
             check.blockSignals(False)
+        self._sync_brick_pickers(layer)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))
         self.opacity_slider.blockSignals(False)
@@ -717,6 +745,42 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 OverlayKind.COMPONENT: key_label("THRESH", "t") + " z",
             }.get(kind, key_label("THRESH", "t"))
         )
+
+    def _sync_brick_pickers(self, layer) -> None:
+        """Show the sub-brick pickers only where sub-bricks are a choice.
+
+        A time series is scrubbed by the T control and its "sub-bricks" are
+        time points, so a picker listing four hundred of them is noise. What
+        wants naming is the other 4-D case: a bucket of unrelated contrasts.
+        """
+        show = layer.n_volumes > 1 and not layer.time_linked
+        for head, box in (
+            (self.brick_head, self.brick_box),
+            (self.thrbrick_head, self.thrbrick_box),
+        ):
+            head.setVisible(show)
+            box.setVisible(show)
+        if not show:
+            return
+        names = [layer.sub_brick(i) for i in range(layer.n_volumes)]
+        self.brick_box.blockSignals(True)
+        self.brick_box.clear()
+        for i, name in enumerate(names):
+            self.brick_box.addItem(name, userData=i)
+        self.brick_box.setCurrentIndex(min(layer.volume_index, layer.n_volumes - 1))
+        self.brick_box.blockSignals(False)
+
+        self.thrbrick_box.blockSignals(True)
+        self.thrbrick_box.clear()
+        # "same" rather than a blank row: thresholding on the displayed
+        # sub-brick is a real choice, and the one a plain map wants.
+        self.thrbrick_box.addItem("same as OLAY", userData=None)
+        for i, name in enumerate(names):
+            self.thrbrick_box.addItem(name, userData=i)
+        self.thrbrick_box.setCurrentIndex(
+            0 if layer.threshold_index is None else layer.threshold_index + 1
+        )
+        self.thrbrick_box.blockSignals(False)
 
     def _sync_readout(self) -> None:
         st = self.session.state
@@ -744,7 +808,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             if vol is None:
                 continue
             val = voxel_value(vol, st.grid, layer.affine, st.crosshair)
-            parts.append(f"{layer.name}={'--' if val is None else f'{val:.4g}'}")
+            # Only where the header actually named something: appending "#0" to
+            # every 3-D anatomy would be noise dressed as information.
+            tag = f" {layer.sub_brick()}" if layer.labels else ""
+            parts.append(f"{layer.name}{tag}={'--' if val is None else f'{val:.4g}'}")
         self.value_label.setText("   ".join(parts[:3]))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)

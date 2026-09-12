@@ -55,6 +55,11 @@ class Layer:
     shape: tuple[int, int, int]
     n_volumes: int
     affine: np.ndarray
+    #: Sub-brick labels from the header, when the file carries them --
+    #: ``("Full_Fstat", "Faces#0_Coef", "Faces#0_Tstat", ...)``. ffs and
+    #: 3dDeconvolve write these; a raw time series has none. Empty means the
+    #: sub-bricks have no names, not that they were not read.
+    labels: tuple[str, ...] = ()
 
     visible: bool = True
     opacity: float = 1.0
@@ -96,6 +101,18 @@ class Layer:
     @property
     def is_computed(self) -> bool:
         return self.source.startswith("mode:")
+
+    def sub_brick(self, index: int | None = None) -> str:
+        """How one sub-brick should be named on screen.
+
+        The index is always shown, even when there is a label: the label is
+        what you recognise and the index is what a command takes, and a readout
+        that gives only one of them makes you go and look up the other.
+        """
+        i = self.volume_index if index is None else index
+        if 0 <= i < len(self.labels) and self.labels[i]:
+            return f"#{i} {self.labels[i]}"
+        return f"#{i}"
 
 
 @dataclass

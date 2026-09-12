@@ -376,6 +376,22 @@ class SetVolume(Command):
 
 @command
 @dataclass(frozen=True)
+class SetThresholdIndex(Command):
+    """Which sub-brick supplies the threshold statistic.
+
+    ``-`` thresholds on the sub-brick being displayed, which is what a plain
+    intensity map wants. Naming a different one is the stats case: colour by
+    the coefficient, threshold on its t.
+    """
+
+    name = "SET_THRESHOLD_INDEX"
+    aspects = Aspect.THRESHOLD | Aspect.SLICES
+    key: str
+    index: int | None = None
+
+
+@command
+@dataclass(frozen=True)
 class SetTimeLinked(Command):
     """Whether the global time index drives this layer.
 
@@ -784,6 +800,16 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, volume_index=value)
         return SetVolume.aspects
+
+    @bus.handle(SetThresholdIndex.name)
+    def _set_threshold_index(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetThresholdIndex)
+        layer = st.layers.get(cmd.key)
+        value = None if cmd.index is None else max(0, min(int(cmd.index), layer.n_volumes - 1))
+        if layer.threshold_index == value:
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, threshold_index=value)
+        return SetThresholdIndex.aspects
 
     @bus.handle(SetPanes.name)
     def _set_panes(cmd: Command, st: ViewerState) -> Aspect:

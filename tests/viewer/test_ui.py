@@ -457,6 +457,84 @@ def test_the_progress_bar_is_hidden_when_idle(win):
 
 
 # ---------------------------------------------------------------------------
+# sub-brick labels
+#
+# ffs and 3dDeconvolve both write them, io/headers.py reads them, and until now
+# nothing displayed them -- so a stats bucket read as "volume 3" and you had to
+# go and run 3dinfo to find out which contrast that was.
+# ---------------------------------------------------------------------------
+
+
+def _labelled_bucket(path, labels):
+    """A 4-D NIfTI carrying AFNI BRICK_LABS, the way a stats bucket does."""
+    rng = np.random.default_rng(11)
+    data = rng.normal(size=(10, 12, 8, len(labels))).astype(np.float32)
+    img = nib.Nifti1Image(data, np.diag([3.0, 3.0, 3.0, 1.0]))
+    payload = ("BRICK_LABS=" + "~".join(labels) + "\x00").encode()
+    img.header.extensions.append(nib.nifti1.Nifti1Extension(4, payload))
+    nib.save(img, str(path))
+    return path
+
+
+@pytest.fixture
+def winstats(win, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetOverlay
+
+    path = _labelled_bucket(
+        tmp_path / "stats.nii.gz", ["Full_Fstat", "Faces#0_Coef", "Faces#0_Tstat"]
+    )
+    win.refresh(win.session.do(SetOverlay(str(path))))
+    qapp.processEvents()
+    return win
+
+
+def test_a_stats_bucket_keeps_its_sub_brick_labels(winstats):
+    layer = winstats.session.state.layers.overlay
+    assert layer.labels == ("Full_Fstat", "Faces#0_Coef", "Faces#0_Tstat")
+    assert layer.sub_brick(1) == "#1 Faces#0_Coef"
+
+
+def test_the_sub_brick_picker_lists_the_labels(winstats, qapp):
+    winstats.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert winstats.brick_box.isVisible()
+    listed = [winstats.brick_box.itemText(i) for i in range(winstats.brick_box.count())]
+    assert listed == ["#0 Full_Fstat", "#1 Faces#0_Coef", "#2 Faces#0_Tstat"]
+
+
+def test_picking_a_sub_brick_changes_what_is_displayed(winstats, qapp):
+    winstats.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    winstats.brick_box.setCurrentIndex(2)
+    winstats.brick_box.activated.emit(2)
+    qapp.processEvents()
+    assert winstats.session.state.layers.overlay.volume_index == 2
+
+
+def test_the_threshold_can_read_a_different_sub_brick(winstats, qapp):
+    """Colour by the coefficient, threshold on its t -- the stats case."""
+    winstats.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    winstats.thrbrick_box.setCurrentIndex(3)  # row 0 is "same as OLAY"
+    winstats.thrbrick_box.activated.emit(3)
+    qapp.processEvents()
+    assert winstats.session.state.layers.overlay.threshold_index == 2
+
+
+def test_the_readout_names_the_sub_brick(winstats, qapp):
+    winstats.refresh(Aspect.SLICES)
+    qapp.processEvents()
+    assert "Full_Fstat" in winstats.value_label.text()
+
+
+def test_a_time_series_offers_no_sub_brick_picker(win4d, qapp):
+    """Its sub-bricks are time points; the T control already steps them."""
+    win4d.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert not win4d.brick_box.isVisible()
+
+
+# ---------------------------------------------------------------------------
 # keyboard help
 # ---------------------------------------------------------------------------
 
