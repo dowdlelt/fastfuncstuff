@@ -1,28 +1,39 @@
-"""Floating grid-graph windows: 1, 4 or 9 voxels around the cursor.
+"""Floating graph windows: an N x N block of voxels around the cursor.
 
 Separate top-level windows rather than a docked pane, because looking at time
 courses is something you do sometimes -- the default view is images, and a graph
 that is always present is a graph that is always stealing space from them.
 
-One widget paints the whole N x N grid rather than nesting N**2 child widgets.
-At 9 cells the difference is not performance so much as control: a single
-paintEvent can share one y-scale across every cell, which is the only way the
-grid is comparable rather than nine separate autoscaled pictures.
+Two things a graph window owns, both of which the single fixed pane could not:
+
+* **Which layers it plots.** A stack of func, anat and stats has exactly one
+  thing worth drawing a line for, and once it also holds a denoised copy of the
+  func, which lines you want is a choice. Selection is per window, so one graph
+  can stay on the raw series while another follows the cleaned one.
+* **How big the block is.** Stepped with + and -, not chosen from 1/4/9: it is
+  a square that grows, and how far out you want to look depends on voxel size
+  and on what you are chasing.
+
+One widget paints the whole grid rather than nesting N**2 children. At 16 cells
+the difference is not performance so much as control: a single paintEvent can
+share one y-scale across every cell, which is the only way the grid is
+comparable rather than sixteen separate autoscaled pictures.
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastfuncstuff.viewer.commands import Command
 from fastfuncstuff.viewer.slicing import plane_layout
-from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
-
-GRID_SIZES = (1, 2, 3)  # 1, 4, 9 voxels
+from fastfuncstuff.viewer.viewports import Viewport
+from fastfuncstuff.viewer.vocab import SetViewGrid, SetViewSharedScale, SetViewTraces
 
 
 @dataclass
@@ -194,84 +205,164 @@ class GridGraph(QtWidgets.QWidget):
             p.drawText(QtCore.QPointF(rect.left() + 4, rect.top() + 11), f"{i} {j} {k}")
 
 
-class GridGraphWindow(QtWidgets.QWidget):
-    """A floating graph window bound to one plane."""
+class GraphWindow(QtWidgets.QWidget):
+    """A floating graph viewport."""
 
     closed = QtCore.Signal(str)
     #: A time index chosen by clicking in the plot.
     scrubbed = QtCore.Signal(int)
 
-    def __init__(self, plane: Plane, session, parent: QtWidgets.QWidget | None = None) -> None:
+    def __init__(
+        self,
+        vid: str,
+        session,
+        dispatch: Callable[[Command], None],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
-        self.plane = plane
+        self.vid = vid
         self.session = session
+        self._dispatch = dispatch
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
-        self.setWindowTitle(f"graph · {plane.value}")
-        self.resize(460, 380)
+        self.resize(520, 420)
         self.setStyleSheet(theme.stylesheet())
 
         v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(6, 6, 6, 6)
-        v.setSpacing(5)
+        v.setContentsMargins(7, 6, 7, 7)
+        v.setSpacing(6)
 
         bar = QtWidgets.QHBoxLayout()
-        bar.addWidget(QtWidgets.QLabel("VOXELS"))
-        self.size_box = QtWidgets.QComboBox()
-        self.size_box.addItems(["1", "4", "9"])
-        self.size_box.setCurrentIndex(1)
-        self.size_box.currentIndexChanged.connect(lambda _: self.refresh())
-        bar.addWidget(self.size_box)
-        self.shared_check = QtWidgets.QCheckBox("shared scale")
-        self.shared_check.setChecked(True)
+        bar.setSpacing(6)
+        minus = QtWidgets.QPushButton("[-]")
+        minus.setToolTip("Fewer voxels (-)")
+        minus.clicked.connect(lambda: self.step_grid(-1))
+        plus = QtWidgets.QPushButton("[+]")
+        plus.setToolTip("More voxels (+)")
+        plus.clicked.connect(lambda: self.step_grid(1))
+        for b in (minus, plus):
+            b.setMaximumWidth(42)
+        bar.addWidget(minus)
+        self.count_label = QtWidgets.QLabel("")
+        self.count_label.setObjectName("value")
+        bar.addWidget(self.count_label)
+        bar.addWidget(plus)
+        bar.addSpacing(10)
+
+        self.shared_check = QtWidgets.QCheckBox(theme.key_label("shared scale", "s"))
         self.shared_check.setToolTip(
             "One y-scale across all cells, so neighbouring voxels are comparable."
         )
-        self.shared_check.toggled.connect(self._on_shared)
+        self.shared_check.clicked.connect(
+            lambda on: self._dispatch(SetViewSharedScale(self.vid, bool(on)))
+        )
         bar.addWidget(self.shared_check)
         bar.addStretch(1)
         self.info = QtWidgets.QLabel("")
         bar.addWidget(self.info)
         v.addLayout(bar)
 
+        # One toggle per plottable layer, in the trace's own colour, so a line
+        # in the plot and the control that turns it off are the same object as
+        # far as the eye is concerned.
+        self.trace_bar = QtWidgets.QHBoxLayout()
+        self.trace_bar.setSpacing(5)
+        self._trace_buttons: list[QtWidgets.QPushButton] = []
+        v.addLayout(self.trace_bar)
+
         self.graph = GridGraph()
         self.graph.scrubbed.connect(self.scrubbed)
         v.addWidget(self.graph, 1)
 
-        # Its own table: a graph window's keys are not the main window's, and
+        # Its own table: a graph window's keys are not an image window's, and
         # `h` should show the keys of whatever has focus.
-        self.help = ShortcutHelp(self, f"graph · {plane.value}")
+        self.help = ShortcutHelp(self, f"graph · {vid}")
         self.help.apply(
             [
-                Binding("1", "one voxel", lambda: self.size_box.setCurrentIndex(0), group="grid"),
-                Binding("4", "four voxels", lambda: self.size_box.setCurrentIndex(1), group="grid"),
-                Binding("9", "nine voxels", lambda: self.size_box.setCurrentIndex(2), group="grid"),
-                Binding("s", "shared scale", self.shared_check.toggle, group="grid"),
-                Binding("h", "this list", self.help.toggle, group="grid"),
-                Binding("w", "close this window", self.close, group="grid"),
+                Binding(
+                    "+", "more voxels", lambda: self.step_grid(1), group="grid", aliases=("=",)
+                ),
+                Binding("-", "fewer voxels", lambda: self.step_grid(-1), group="grid"),
+                Binding("s", "shared scale", self.shared_check.click, group="grid"),
+                Binding("click", "jump to that volume", None, group="grid"),
+                Binding("h", "this list", self.help.toggle, group="window"),
+                Binding("w", "close this window", self.close, group="window"),
             ]
         )
-        self.refresh()
 
-    def _on_shared(self, on: bool) -> None:
-        self.graph.set_shared_scale(on)
+    # -- input ---------------------------------------------------------
+    def step_grid(self, delta: int) -> None:
+        vp = self._viewport()
+        if vp is not None:
+            self._dispatch(SetViewGrid(self.vid, vp.grid_n + delta))
 
-    @property
-    def grid_n(self) -> int:
-        return GRID_SIZES[self.size_box.currentIndex()]
+    def _toggle_trace(self, key: str) -> None:
+        """Turn one layer's line on or off in this window.
+
+        Stored as the explicit set of layers to keep rather than as the set to
+        drop, so a layer loaded later starts plotted -- which is what someone
+        who just loaded it is looking for.
+        """
+        vp = self._viewport()
+        if vp is None:
+            return
+        current = [ly.key for ly in self.session.traces_for(vp)]
+        if key in current:
+            current.remove(key)
+        else:
+            current = [ly.key for ly in self.session.graph_layers() if ly.key in {*current, key}]
+        self._dispatch(SetViewTraces(self.vid, ",".join(current)))
+
+    def _viewport(self) -> Viewport | None:
+        return self.session.state.viewports.find(self.vid)
+
+    # -- output --------------------------------------------------------
+    def apply(self, viewport: Viewport) -> None:
+        self.setWindowTitle(viewport.title)
+        self.count_label.setText(f"{viewport.cells:>3d}")
+        self.shared_check.setChecked(viewport.shared_scale)
+        self.graph.set_shared_scale(viewport.shared_scale)
+        self._rebuild_trace_buttons(viewport)
+
+    def _rebuild_trace_buttons(self, viewport: Viewport) -> None:
+        while self.trace_bar.count():
+            item = self.trace_bar.takeAt(0)
+            widget = item.widget() if item is not None else None
+            if widget is not None:
+                widget.deleteLater()
+        self._trace_buttons.clear()
+
+        plottable = self.session.graph_layers()
+        shown = {ly.key for ly in self.session.traces_for(viewport)}
+        for i, layer in enumerate(plottable):
+            colour = QtGui.QColor.fromRgbF(*theme.SERIES_RGB[i % len(theme.SERIES_RGB)])
+            b = QtWidgets.QPushButton(layer.name)
+            b.setCheckable(True)
+            b.setChecked(layer.key in shown)
+            b.setStyleSheet(f"QPushButton:checked {{ color: {colour.name()}; }}")
+            b.clicked.connect(lambda _=False, k=layer.key: self._toggle_trace(k))
+            self.trace_bar.addWidget(b)
+            self._trace_buttons.append(b)
+        if not plottable:
+            self.trace_bar.addWidget(QtWidgets.QLabel("no time series loaded"))
+        self.trace_bar.addStretch(1)
 
     def refresh(self) -> None:
         """Rebuild the cells around the current crosshair."""
         st = self.session.state
-        n = self.grid_n
+        vp = self._viewport()
+        if vp is None:
+            return
+        n = vp.grid_n
         if st.grid is None:
             self.graph.set_cells([], n, st.time_index)
             return
-        layout = plane_layout(st.grid.affine, self.plane)
+        layout = plane_layout(st.grid.affine, vp.plane)
         # Walk the grid in image order, so the cells sit where the voxels
         # appear on screen rather than in array order.
         centre_row, centre_col = layout.to_image(st.crosshair, st.grid.shape)
         half = n // 2
 
+        traced = self.session.traces_for(vp)
         cells: list[Cell] = []
         for dr in range(-half, -half + n):
             for dc in range(-half, -half + n):
@@ -279,21 +370,15 @@ class GridGraphWindow(QtWidgets.QWidget):
                     layout.to_ijk(centre_row + dr, centre_col + dc, st.crosshair, st.grid.shape)
                 )
                 cells.append(
-                    Cell(
-                        ijk=ijk,
-                        traces=self._traces(ijk),
-                        is_centre=(dr == 0 and dc == 0),
-                    )
+                    Cell(ijk=ijk, traces=self._traces(traced, ijk), is_centre=(dr == 0 and dc == 0))
                 )
         self.graph.set_cells(cells, n, st.time_index)
-        self.info.setText(self.session.mode.status() or f"{n * n} voxels")
+        self.info.setText(self.session.mode.status())
 
-    def _traces(self, ijk: tuple[int, int, int]) -> list[tuple[str, np.ndarray]]:
-        """Layer time courses plus whatever the active mode contributes."""
+    def _traces(self, layers, ijk: tuple[int, int, int]) -> list[tuple[str, np.ndarray]]:
+        """The selected layers' time courses, plus whatever the mode adds."""
         out: list[tuple[str, np.ndarray]] = []
-        for layer in self.session.state.layers:
-            if not layer.time_linked:
-                continue
+        for layer in layers:
             values = self.session.timeseries(layer.key, ijk)
             if values.size:
                 out.append((layer.name, values))
@@ -303,5 +388,8 @@ class GridGraphWindow(QtWidgets.QWidget):
         return out
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
-        self.closed.emit(self.plane.value)
+        self.closed.emit(self.vid)
         super().closeEvent(event)
+
+
+__all__ = ["Cell", "GraphWindow", "GridGraph"]

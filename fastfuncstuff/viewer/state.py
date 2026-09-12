@@ -17,7 +17,7 @@ from fastfuncstuff.viewer.layers import LayerStack
 # Plane lives in viewports.py because a viewport takes one as a field
 # default and this module holds the viewports; re-exported here because
 # `from viewer.state import Plane` is how the rest of the viewer says it.
-from fastfuncstuff.viewer.viewports import Plane, ViewKind, ViewportSet
+from fastfuncstuff.viewer.viewports import Plane, ViewportSet
 
 
 @dataclass(frozen=True)
@@ -92,17 +92,6 @@ class ViewerState:
             if found is not None:
                 return found
         return self.layers.layers[-1] if len(self.layers) else None
-
-    def default_layout(self) -> None:
-        """Open what a viewer with nothing configured should show.
-
-        Three images, no graph. Goal zero is an underlay and an overlay
-        together; a graph is something you ask for.
-        """
-        if len(self.viewports):
-            return
-        for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
-            self.viewports.open(ViewKind.IMAGE, plane)
 
     def max_time_index(self) -> int:
         """Longest 4-D extent in the stack, so scrubbing spans everything."""

@@ -220,6 +220,23 @@ class ViewerSession:
         self.do(OpenView(vid, str(kind), str(plane)))
         return vid
 
+    def default_layout(self) -> Aspect:
+        """Open what a viewer with nothing configured should show.
+
+        Three images, no graph. Goal zero is an underlay and an overlay
+        together; a graph is something you ask for.
+
+        Dispatched rather than built directly, so the recording starts with the
+        windows it started with -- a script that replays into a viewer with no
+        windows in it is a script that does not restore the session.
+        """
+        if len(self.state.viewports):
+            return Aspect.NOTHING
+        dirty = Aspect.NOTHING
+        for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
+            dirty |= self.do(OpenView(self.state.viewports.mint_id(ViewKind.IMAGE), "image", plane))
+        return dirty
+
     def close_view(self, vid: str) -> Aspect:
         return self.do(CloseView(vid))
 

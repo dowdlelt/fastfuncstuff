@@ -90,12 +90,24 @@ def test_grid_clamps_rather_than_raising() -> None:
 
 
 def test_default_layout_is_three_images_and_no_graph() -> None:
-    st = ViewerState()
-    st.default_layout()
-    assert [v.plane for v in st.viewports.images] == [Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL]
-    assert st.viewports.graphs == []
-    st.default_layout()  # idempotent: a second call must not double the windows
-    assert len(st.viewports) == 3
+    from fastfuncstuff.viewer.session import ViewerSession
+
+    session = ViewerSession()
+    try:
+        session.default_layout()
+        st = session.state
+        assert [v.plane for v in st.viewports.images] == [
+            Plane.AXIAL,
+            Plane.SAGITTAL,
+            Plane.CORONAL,
+        ]
+        assert st.viewports.graphs == []
+        session.default_layout()  # idempotent: must not double the windows
+        assert len(st.viewports) == 3
+        # Through the bus, so a replayed script comes back with its windows.
+        assert session.to_script().count("OPEN_VIEW") == 3
+    finally:
+        session.close()
 
 
 # ---------------------------------------------------------------------------

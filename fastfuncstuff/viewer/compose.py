@@ -80,8 +80,13 @@ def render_plane(
     plane: Plane,
     *,
     position: int | None = None,
+    solo_key: str | None = None,
 ) -> PaneImage | None:
     """Composite every visible layer for one display plane.
+
+    With ``solo_key`` only that layer is drawn, and its visibility flag is
+    ignored -- soloing a hidden layer that then stays hidden would make the
+    flip-between-two gesture fail silently on every other press.
 
     Returns ``None`` when there is nothing to draw, so callers can distinguish
     an empty session from a black image.
@@ -90,7 +95,11 @@ def render_plane(
     grid = state.grid
     if grid is None:
         return None
-    visible = state.layers.visible_layers()
+    if solo_key is not None:
+        only = state.layers.find(solo_key)
+        visible = [only] if only is not None else []
+    else:
+        visible = state.layers.visible_layers()
     if not visible:
         return None
 
@@ -148,6 +157,25 @@ def render_plane(
     return PaneImage(rgba=to_rgba8(rgb), plane=plane, position=pos)
 
 
+def render_viewport(session, viewport) -> PaneImage | None:
+    """Render what one image window shows.
+
+    The window's own settings -- which plane, and whether it is soloed -- are
+    read here rather than by the widget, so a screenshot and the screen come
+    from the same call.
+    """
+    solo = None
+    if viewport.solo:
+        layer = session.state.selected_layer()
+        solo = layer.key if layer is not None else None
+        if solo is None:
+            return None
+    # An unlocked window stays on the slice it was parked on; a locked one has
+    # no slice of its own and takes the crosshair's.
+    position = None if viewport.locked else viewport.position
+    return render_plane(session, viewport.plane, position=position, solo_key=solo)
+
+
 def render_all(session) -> dict[Plane, PaneImage]:
     """Every plane at the current crosshair."""
     out: dict[Plane, PaneImage] = {}
@@ -179,4 +207,5 @@ __all__ = [
     "plane_position",
     "render_all",
     "render_plane",
+    "render_viewport",
 ]

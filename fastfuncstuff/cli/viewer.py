@@ -15,18 +15,27 @@ from fastfuncstuff.cli_utils import add_device_arg
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
 OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
-(View / InstaCorr); images and graphs are modular on top.
+(View / InstaCorr / ICA). the main window is a controller -- every image and
+every graph is a companion window you open, arrange and close.
 
-keys
+keys (main window)
+  n  N                 new image / new graph window
+  f  F                 tile / stagger every window      r  raise them all
   arrows / PgUp PgDn   move the crosshair
-  1 2 3                toggle axial / sagittal / coronal panes
-  g                    floating grid graph (1, 4 or 9 voxels at the cursor)
   , .                  step time            v  play / pause
   [ ]                  select layer       space  show / hide layer
   t T                  threshold down / up
   a  alpha mode        s  sign mode       b  boxed      c  colormap
-  ctrl+click           set the InstaCorr seed
-  ctrl+O  open         ctrl+S  save session script
+  ctrl+O  open         ctrl+S  save session script       h  this list
+
+keys (image window)
+  1 2 3                axial / sagittal / coronal
+  o                    solo the selected layer (flip between layers with [ ])
+  l                    follow the crosshair, or unlock to park a slice
+  ctrl+click           set the InstaCorr seed             w  close
+
+keys (graph window)
+  + -                  more / fewer voxels    s  shared scale    w  close
 
 examples
   ffs_viewer -read results.subj01/

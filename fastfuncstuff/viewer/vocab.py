@@ -132,6 +132,17 @@ class SetViewLocked(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewPosition(Command):
+    """Park an unlocked window on one slice. ``-`` puts it back on follow."""
+
+    name = "SET_VIEW_POSITION"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    position: int | None = None
+
+
+@command
+@dataclass(frozen=True)
 class SetViewGrid(Command):
     """Cells per side in a graph window: 1 -> 1 voxel, 3 -> 9, 4 -> 16."""
 
@@ -654,6 +665,12 @@ def install(
     def _set_view_locked(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetViewLocked)
         return _set_view(st, cmd.view, SetViewLocked.aspects, locked=bool(cmd.on))
+
+    @bus.handle(SetViewPosition.name)
+    def _set_view_position(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewPosition)
+        pos = None if cmd.position is None else int(cmd.position)
+        return _set_view(st, cmd.view, SetViewPosition.aspects, position=pos)
 
     @bus.handle(SetViewGrid.name)
     def _set_view_grid(cmd: Command, st: ViewerState) -> Aspect:

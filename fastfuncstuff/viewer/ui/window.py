@@ -1,17 +1,19 @@
-"""The main window: a data selector, with everything else modular on top.
+"""The controller: a data selector, driving N companion windows.
 
 The core is one row -- Read, Underlay, Overlay, +1, Mode. That is the whole
-viewer; images, graphs and mode panels are things you turn on above it.
+viewer; images and graphs are things you turn on beside it.
 
-Two consequences of taking that seriously:
+This window holds no brain. Every image and every graph is a top-level window
+described by a :class:`~viewer.viewports.Viewport` and reconciled by
+:class:`~viewer.ui.manager.WindowManager`, which is what makes two views of the
+same plane, a per-window zoom, a parked reference slice and a layout you can
+replay all the same mechanism rather than four. The controller's job is to hold
+the things there is exactly one of: what is loaded, what the stack looks like,
+how the selected layer is coloured, and what the mode is doing.
 
-* **No graph in the default layout.** Goal zero is looking at an underlay and
-  an overlay together, and a graph that is always present is always taking
-  space from the images. Graphs are floating windows opened per plane, the way
-  AFNI's image and graph buttons pair up.
-* **The window contains no mode-specific code.** It asks the active mode what
-  controls to show and renders whatever it declares, so adding calc, GLM or ICA
-  never touches this file.
+The other rule kept from the single-window layout: **the window contains no
+mode-specific code.** It asks the active mode what controls to show and renders
+whatever it declares.
 """
 
 from __future__ import annotations
@@ -22,24 +24,24 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.colormap import available_colormaps
-from fastfuncstuff.viewer.commands import Aspect
-from fastfuncstuff.viewer.compose import plane_position, render_plane
+from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
-from fastfuncstuff.viewer.slicing import plane_layout, voxel_value
+from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.colorbar import RangeBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
-from fastfuncstuff.viewer.ui.gridgraph import GridGraphWindow
-from fastfuncstuff.viewer.ui.panes import ImagePane
+from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
-from fastfuncstuff.viewer.ui.theme import MONO, stylesheet
+from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
+from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
     Read,
+    SelectLayer,
     SetAlpha,
     SetBoxed,
     SetColormap,
@@ -75,19 +77,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.session = session
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
-        self.resize(1280, 880)
+        self.resize(430, 820)
 
-        self._panes: dict[Plane, ImagePane] = {}
-        self._graphs: dict[str, GridGraphWindow] = {}
         self._bridge = _Bridge()
         self._bridge.loaded.connect(
             self._on_layer_loaded, QtCore.Qt.ConnectionType.QueuedConnection
         )
         session.on_loaded(self._bridge.loaded.emit)
 
+        self.manager = WindowManager(session, self._dispatch, self)
+
         self._build_selector()
-        self._build_panes()
-        self._build_dock()
+        self._build_panel()
         self._build_statusbar()
         self._install_shortcuts()
 
@@ -103,7 +104,20 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._play.setInterval(60)
         self._play.timeout.connect(lambda: self._step_time(1))
 
+        session.default_layout()
         self.refresh(Aspect.ALL)
+
+    def _dispatch(self, cmd: Command) -> None:
+        """The single entry point every widget and window mutates state through.
+
+        Mode preparation is kicked off here rather than at each call site: the
+        seed can be set from any image window, and the first seed after a mode
+        switch is exactly the one whose filtering would freeze the GUI if it
+        ran inline.
+        """
+        self.refresh(self.session.do(cmd))
+        if isinstance(cmd, SetSeed) and self.session.mode.needs_prepare:
+            self._prepare_then_refresh()
 
     # ------------------------------------------------------------------
     # the core: read / underlay / overlay / +1 / mode
@@ -113,84 +127,86 @@ class ViewerWindow(QtWidgets.QMainWindow):
         bar.setMovable(False)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, bar)
 
-        self.read_button = QtWidgets.QPushButton("READ")
+        self.read_button = QtWidgets.QPushButton(key_label("READ", "^O"))
         self.read_button.setToolTip("Read a directory into the pickers (ctrl+O)")
         self.read_button.clicked.connect(self._read_dialog)
         bar.addWidget(self.read_button)
 
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
-        bar.addSeparator()
 
-        bar.addWidget(self._head("UNDERLAY"))
+        picks = QtWidgets.QToolBar("data")
+        picks.setMovable(False)
+        self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, picks)
+
+        grid_host = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(grid_host)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(5)
+
+        grid.addWidget(self._head("UNDERLAY"), 0, 0)
         self.underlay_box = QtWidgets.QComboBox()
         self.underlay_box.setFont(QtGui.QFont(MONO))
         self.underlay_box.addItem(NONE_LABEL, userData=None)
         self.underlay_box.activated.connect(lambda _: self._pick(self.underlay_box, SetUnderlay))
-        bar.addWidget(self.underlay_box)
+        grid.addWidget(self.underlay_box, 0, 1)
 
-        bar.addWidget(self._head("OVERLAY"))
+        grid.addWidget(self._head("OVERLAY"), 1, 0)
         self.overlay_box = QtWidgets.QComboBox()
         self.overlay_box.setFont(QtGui.QFont(MONO))
         self.overlay_box.addItem(NONE_LABEL, userData=None)
         self.overlay_box.activated.connect(lambda _: self._pick(self.overlay_box, SetOverlay))
-        bar.addWidget(self.overlay_box)
+        grid.addWidget(self.overlay_box, 1, 1)
 
-        self.plus_button = QtWidgets.QPushButton("+1")
+        self.plus_button = QtWidgets.QPushButton("[+]1")
         self.plus_button.setToolTip("Add the selected dataset on top, keeping the current overlay")
         self.plus_button.clicked.connect(lambda: self._pick(self.overlay_box, AddOverlay))
-        bar.addWidget(self.plus_button)
-        bar.addSeparator()
+        grid.addWidget(self.plus_button, 1, 2)
 
-        bar.addWidget(self._head("MODE"))
+        grid.addWidget(self._head("MODE"), 2, 0)
         self.mode_box = QtWidgets.QComboBox()
         labels = registry.labels()
         for name in registry.names():
             self.mode_box.addItem(labels[name], userData=name)
         self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
         self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
-        bar.addWidget(self.mode_box)
+        grid.addWidget(self.mode_box, 2, 1)
+        grid.setColumnStretch(1, 1)
+        picks.addWidget(grid_host)
 
-        # Pane and graph toggles, paired the way AFNI's image/graph buttons are.
-        view_bar = QtWidgets.QToolBar("views")
-        self._view_bar = view_bar
-        view_bar.setMovable(False)
+        self._build_window_bar()
+
+    def _build_window_bar(self) -> None:
+        """Open and arrange the companion windows."""
+        bar = QtWidgets.QToolBar("windows")
+        bar.setMovable(False)
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
-        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, view_bar)
-        view_bar.addWidget(self._head("VIEW"))
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, bar)
+        bar.addWidget(self._head("WINDOWS"))
 
-        self._pane_buttons: dict[Plane, QtWidgets.QPushButton] = {}
-        self._graph_buttons: dict[Plane, QtWidgets.QPushButton] = {}
-        for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
-            b = QtWidgets.QPushButton(plane.value[:3].capitalize())
-            b.setCheckable(True)
-            b.setChecked(True)
-            b.toggled.connect(lambda on, p=plane: self._toggle_pane(p, on))
-            view_bar.addWidget(b)
-            self._pane_buttons[plane] = b
+        for text, key, tip, slot in (
+            ("+IMAGE", "n", "Open another image window", self._new_image),
+            ("+GRAPH", "N", "Open a graph window", self._new_graph),
+            ("TILE", "f", "Lay every window out on a grid", self._tile),
+            ("STACK", "F", "Stagger the windows so each title bar is reachable", self._cascade),
+            ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
+        ):
+            b = QtWidgets.QPushButton(key_label(text, key))
+            b.setToolTip(f"{tip} ({key})")
+            b.clicked.connect(slot)
+            bar.addWidget(b)
 
-            g = QtWidgets.QPushButton("Gr")
-            g.setCheckable(True)
-            g.setToolTip(f"Floating {plane.value} graph: 1, 4 or 9 voxels at the cursor")
-            g.toggled.connect(lambda on, p=plane: self._toggle_graph(p, on))
-            view_bar.addWidget(g)
-            self._graph_buttons[plane] = g
-            view_bar.addSeparator()
-
-        view_bar.addWidget(self._head("T"))
+        bar.addSeparator()
+        bar.addWidget(self._head("T"))
         self.time_spin = QtWidgets.QSpinBox()
-        self.time_spin.setToolTip("Jump to a volume")
+        self.time_spin.setToolTip("Jump to a volume ( , and . step, v plays )")
         self.time_spin.setKeyboardTracking(False)
-        self.time_spin.setMaximumWidth(78)
+        self.time_spin.setMaximumWidth(84)
         self.time_spin.valueChanged.connect(self._time_spin_changed)
-        view_bar.addWidget(self.time_spin)
+        bar.addWidget(self.time_spin)
         self.time_label = QtWidgets.QLabel("")
-        view_bar.addWidget(self.time_label)
-
-        # The panel toggle is appended in _build_dock, once there is a dock to
-        # toggle. It lives here with the other view switches rather than in a
-        # menu, because a panel you cannot get back is the same bug as a pane
-        # you cannot get back.
+        bar.addWidget(self.time_label)
 
     @staticmethod
     def _fit_picker(box: QtWidgets.QComboBox) -> None:
@@ -221,7 +237,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         entry: CatalogEntry | None = box.currentData()
         if entry is None:
             return
-        self.refresh(self.session.do(cls(str(entry.path))))
+        self._dispatch(cls(str(entry.path)))
         self._sync_layer_list()
 
     def _read_dialog(self) -> None:
@@ -260,111 +276,84 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._sync_pickers()
 
     # ------------------------------------------------------------------
-    # panes
+    # companion windows
     # ------------------------------------------------------------------
-    def _build_panes(self) -> None:
-        self._pane_host = QtWidgets.QWidget()
-        self._pane_layout = QtWidgets.QGridLayout(self._pane_host)
-        self._pane_layout.setContentsMargins(0, 0, 0, 0)
-        self._pane_layout.setSpacing(1)
+    def _new_image(self) -> None:
+        self.manager.open(ViewKind.IMAGE, self._next_plane())
+        self.refresh(Aspect.VIEWPORTS | Aspect.SLICES)
+
+    def _new_graph(self) -> None:
+        self.manager.open(ViewKind.GRAPH, self._next_plane())
+        self.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
+
+    def _next_plane(self) -> Plane:
+        """Offer the plane that is not already on screen, then wrap.
+
+        Opening a second image window onto the plane you are already looking at
+        is almost never what was meant the first few times, and is one keypress
+        away when it is.
+        """
+        shown = [v.plane for v in self.session.state.viewports.images]
         for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
-            pane = ImagePane(plane)
-            pane.picked.connect(lambda a, b, p=plane: self._on_pick(p, a, b))
-            pane.seeded.connect(lambda a, b, p=plane: self._on_pick(p, a, b, seed=True))
-            pane.stepped.connect(lambda d, p=plane: self._step_slice(p, d))
-            self._panes[plane] = pane
-        self.setCentralWidget(self._pane_host)
-        self._relayout_panes()
+            if plane not in shown:
+                return plane
+        return Plane.AXIAL
 
-    def _relayout_panes(self) -> None:
-        """Re-flow whichever panes are enabled into as square a grid as fits."""
-        for plane, pane in self._panes.items():
-            self._pane_layout.removeWidget(pane)
-            pane.setVisible(self._pane_buttons[plane].isChecked())
-        shown = [
-            p
-            for p in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL)
-            if self._pane_buttons[p].isChecked()
-        ]
-        cols = 1 if len(shown) <= 1 else 2
-        for i, plane in enumerate(shown):
-            self._pane_layout.addWidget(self._panes[plane], i // cols, i % cols)
-        for c in range(2):
-            self._pane_layout.setColumnStretch(c, 1 if c < cols else 0)
-        for r in range(2):
-            self._pane_layout.setRowStretch(r, 1)
+    def _tile(self) -> None:
+        self.manager.tile(self)
 
-    def _toggle_pane(self, plane: Plane, on: bool) -> None:
-        # Refuse to close the last pane: an image viewer showing no images is a
-        # state whose only way out is the control the user just used.
-        if not on and not any(b.isChecked() for b in self._pane_buttons.values()):
-            self._pane_buttons[plane].setChecked(True)
-            return
-        self._relayout_panes()
-        self._redraw_panes()
+    def _cascade(self) -> None:
+        self.manager.cascade(self)
 
-    def _toggle_graph(self, plane: Plane, on: bool) -> None:
-        key = plane.value
-        if on:
-            win = self._graphs.get(key)
-            if win is None:
-                win = GridGraphWindow(plane, self.session, self)
-                win.closed.connect(self._on_graph_closed)
-                win.scrubbed.connect(self._time_spin_changed)
-                self._graphs[key] = win
-            win.show()
-            win.raise_()
-            win.refresh()
-        elif key in self._graphs:
-            self._graphs[key].hide()
-
-    def _on_graph_closed(self, key: str) -> None:
-        for plane, button in self._graph_buttons.items():
-            if plane.value == key:
-                button.setChecked(False)
+    def _raise_all(self) -> None:
+        self.manager.raise_all()
 
     # ------------------------------------------------------------------
-    # dock: layers, layer controls, mode controls
+    # the panel: layers, layer controls, mode controls
     # ------------------------------------------------------------------
-    def _build_dock(self) -> None:
-        dock = QtWidgets.QDockWidget("layers", self)
+    def _build_panel(self) -> None:
         panel = QtWidgets.QWidget()
         v = QtWidgets.QVBoxLayout(panel)
-        v.setContentsMargins(8, 8, 8, 8)
+        v.setContentsMargins(9, 9, 9, 9)
         v.setSpacing(8)
 
+        v.addWidget(self._head("LAYERS  [ / ]"))
         self.layer_list = QtWidgets.QListWidget()
-        self.layer_list.setMaximumHeight(150)
-        self.layer_list.currentRowChanged.connect(lambda _: self._sync_layer_controls())
+        self.layer_list.setMaximumHeight(190)
+        self.layer_list.setToolTip(
+            "[ and ] step through the stack; space hides a layer.\n"
+            "A soloed image window draws whichever one is selected here."
+        )
+        self.layer_list.currentRowChanged.connect(self._row_selected)
         v.addWidget(self.layer_list)
 
         form = QtWidgets.QFormLayout()
-        form.setSpacing(6)
+        form.setSpacing(7)
 
         self.cmap_box = QtWidgets.QComboBox()
         self.cmap_box.addItems(available_colormaps())
         self.cmap_box.activated.connect(
             lambda _: self._apply(SetColormap, colormap=self.cmap_box.currentText())
         )
-        form.addRow(self._head("COLOR"), self.cmap_box)
+        form.addRow(self._head(key_label("COLOR", "c")), self.cmap_box)
 
         self.sign_box = QtWidgets.QComboBox()
         self.sign_box.addItems([m.value for m in SignMode])
         self.sign_box.activated.connect(
             lambda _: self._apply(SetSign, mode=self.sign_box.currentText())
         )
-        form.addRow(self._head("SIGN"), self.sign_box)
+        form.addRow(self._head(key_label("SIGN", "s")), self.sign_box)
 
         self.alpha_box = QtWidgets.QComboBox()
         self.alpha_box.addItems([m.value for m in AlphaMode])
         self.alpha_box.activated.connect(
             lambda _: self._apply(SetAlpha, mode=self.alpha_box.currentText())
         )
-        form.addRow(self._head("ALPHA"), self.alpha_box)
+        form.addRow(self._head(key_label("ALPHA", "a")), self.alpha_box)
 
         # Min, threshold and max are edited on the bar itself. Splitting the
         # number from the picture of the number is what let the bar go stale.
-        self.thr_head = self._head("THRESH")
+        self.thr_head = self._head(key_label("THRESH", "t"))
         self.rangebar = RangeBar()
         self.rangebar.range_changed.connect(self._range_changed)
         self.rangebar.threshold_changed.connect(self._threshold_changed)
@@ -390,7 +379,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.opacity_label.setObjectName("value")
         form.addRow(QtWidgets.QLabel(""), self.opacity_label)
 
-        self.boxed_check = QtWidgets.QCheckBox("boxed")
+        self.boxed_check = QtWidgets.QCheckBox(key_label("boxed", "b"))
         self.boxed_check.toggled.connect(lambda on: self._apply(SetBoxed, on=bool(on)))
         form.addRow(QtWidgets.QLabel(""), self.boxed_check)
 
@@ -410,32 +399,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
         v.addWidget(self.mode_panel)
         v.addStretch(1)
 
-        dock.setWidget(panel)
-        dock.setMinimumWidth(268)
-        self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, dock)
-        self.dock = dock
-
-        # toggleViewAction rather than a hand-rolled show/hide: Qt keeps its
-        # checked state in sync with the dock however it was closed, including
-        # the X on the dock's own title bar.
-        self._view_bar.addSeparator()
-        self.panel_button = QtWidgets.QPushButton("Panel")
-        self.panel_button.setCheckable(True)
-        self.panel_button.setChecked(True)
-        self.panel_button.setToolTip("Show or hide the layers panel (p)")
-        action = dock.toggleViewAction()
-        self.panel_button.toggled.connect(
-            lambda on: action.trigger() if on != dock.isVisible() else None
-        )
-        action.toggled.connect(self.panel_button.setChecked)
-        self._view_bar.addWidget(self.panel_button)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        scroll.setWidget(panel)
+        self.setCentralWidget(scroll)
 
     def _switch_mode(self, name: str) -> None:
-        self.refresh(self.session.do(SetMode(name)))
+        self._dispatch(SetMode(name))
         self._prepare_then_refresh()
 
     def _mode_param_changed(self, name: str, value: str) -> None:
-        self.refresh(self.session.do(SetModeParam(name, value)))
+        self._dispatch(SetModeParam(name, value))
         self._prepare_then_refresh()
 
     # ------------------------------------------------------------------
@@ -443,7 +418,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     def _install_shortcuts(self) -> None:
         """Declare every key once. The help panel reads this same table."""
-        self.help = ShortcutHelp(self, "viewer")
+        self.help = ShortcutHelp(self, "nexus")
         self.help.apply(
             [
                 Binding("Left", "crosshair -x", lambda: self._nudge(0, -1), group="navigate"),
@@ -452,24 +427,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("Up", "crosshair +y", lambda: self._nudge(1, 1), group="navigate"),
                 Binding("PgDn", "crosshair -z", lambda: self._nudge(2, -1), group="navigate"),
                 Binding("PgUp", "crosshair +z", lambda: self._nudge(2, 1), group="navigate"),
-                Binding("click", "move the crosshair", None, group="navigate"),
-                Binding("ctrl+click", "set the InstaCorr seed", None, group="navigate"),
-                Binding("scroll", "step through slices", None, group="navigate"),
-                Binding("click graph", "jump to that volume", None, group="time"),
+                Binding("n", "open an image window", self._new_image, group="windows"),
+                Binding("N", "open a graph window", self._new_graph, group="windows"),
+                Binding("f", "tile every window", self._tile, group="windows"),
+                Binding("F", "stagger every window", self._cascade, group="windows"),
+                Binding("r", "raise every window", self._raise_all, group="windows"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
                 Binding("v", "play / pause", self._toggle_play, group="time"),
-                Binding("1", "toggle axial", self._pane_buttons[Plane.AXIAL].toggle, group="view"),
-                Binding(
-                    "2", "toggle sagittal", self._pane_buttons[Plane.SAGITTAL].toggle, group="view"
-                ),
-                Binding(
-                    "3", "toggle coronal", self._pane_buttons[Plane.CORONAL].toggle, group="view"
-                ),
-                Binding(
-                    "g", "axial graph window", self._graph_buttons[Plane.AXIAL].toggle, group="view"
-                ),
-                Binding("p", "toggle the panel", self.panel_button.toggle, group="view"),
                 Binding("[", "previous layer", lambda: self._cycle_layer(-1), group="layer"),
                 Binding("]", "next layer", lambda: self._cycle_layer(1), group="layer"),
                 Binding("space", "show / hide layer", self._toggle_visible, group="layer"),
@@ -486,54 +451,34 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
 
     def current_key(self) -> str | None:
-        row = self.layer_list.currentRow()
-        keys = list(reversed(self.session.state.layers.keys))
-        return keys[row] if 0 <= row < len(keys) else None
+        layer = self.session.state.selected_layer()
+        return None if layer is None else layer.key
 
     def _apply(self, cls, **kwargs) -> None:
         key = self.current_key()
         if key is None:
             return
-        self.refresh(self.session.do(cls(key=key, **kwargs)))
+        self._dispatch(cls(key=key, **kwargs))
 
-    def _on_pick(self, plane: Plane, row: int, col: int, *, seed: bool = False) -> None:
-        grid = self.session.state.grid
-        if grid is None:
-            return
-        layout = plane_layout(grid.affine, plane)
-        ijk = layout.to_ijk(row, col, self.session.state.crosshair, grid.shape)
-        # A seed click moves the crosshair as well: you clicked a voxel, and
-        # leaving the crosshair behind means the graph and the readout describe
-        # somewhere else. Two commands rather than one so SET_SEED stays a
-        # primitive that a script can use without moving the view.
-        dirty = self.session.do(SetIJK(*ijk))
-        if seed:
-            dirty |= self.session.do(SetSeed(*ijk))
-        self.refresh(dirty)
-        if seed and self.session.mode.needs_prepare:
-            # First seed after a mode switch: the mode deferred, so preparation
-            # happens here, on a worker, with the progress bar up.
-            self._prepare_then_refresh()
+    def _row_selected(self, row: int) -> None:
+        keys = list(reversed(self.session.state.layers.keys))
+        if 0 <= row < len(keys):
+            self._dispatch(SelectLayer(keys[row]))
 
     def _nudge(self, axis: int, delta: int) -> None:
         ijk = list(self.session.state.crosshair)
         ijk[axis] += delta
-        self.refresh(self.session.do(SetIJK(*ijk)))
-
-    def _step_slice(self, plane: Plane, delta: int) -> None:
-        grid = self.session.state.grid
-        if grid is not None:
-            self._nudge(plane_layout(grid.affine, plane).fixed, delta)
+        self._dispatch(SetIJK(*ijk))
 
     def _step_time(self, delta: int) -> None:
         hi = self.session.state.max_time_index()
         if hi <= 0:
             return
         nxt = (self.session.state.time_index + delta) % (hi + 1)
-        self.refresh(self.session.do(SetIndex(nxt)))
+        self._dispatch(SetIndex(nxt))
 
     def _time_spin_changed(self, value: int) -> None:
-        self.refresh(self.session.do(SetIndex(int(value))))
+        self._dispatch(SetIndex(int(value)))
 
     def _toggle_play(self) -> None:
         self._play.stop() if self._play.isActive() else self._play.start()
@@ -543,7 +488,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if key is None:
             return
         layer = self.session.state.layers.get(key)
-        self.refresh(self.session.do(SetLayerVisible(key, not layer.visible)))
+        self._dispatch(SetLayerVisible(key, not layer.visible))
         self._sync_layer_list()
 
     def _cycle_layer(self, delta: int) -> None:
@@ -554,12 +499,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _range_changed(self, lo: float, hi: float) -> None:
         key = self.current_key()
         if key is not None:
-            self.refresh(self.session.do(SetRange(key, lo, hi)))
+            self._dispatch(SetRange(key, lo, hi))
 
     def _threshold_changed(self, value: float) -> None:
         key = self.current_key()
         if key is not None:
-            self.refresh(self.session.do(SetThreshold(key, value)))
+            self._dispatch(SetThreshold(key, value))
 
     def _autorange(self) -> None:
         key = self.current_key()
@@ -569,14 +514,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         volume = self.session.volume(key)
         lo, hi = derive_range(volume)
-        self.refresh(self.session.do(SetRange(key, float(lo), float(hi))))
+        self._dispatch(SetRange(key, float(lo), float(hi)))
 
     def _opacity_changed(self, value: int) -> None:
         key = self.current_key()
         if key is None:
             return
         self.opacity_label.setText(f"{value}%")
-        self.refresh(self.session.do(SetLayerOpacity(key, value / 100.0)))
+        self._dispatch(SetLayerOpacity(key, value / 100.0))
 
     def _nudge_threshold(self, frac: float) -> None:
         slider = self.rangebar.slider
@@ -608,7 +553,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def open_path(self, path: str | Path) -> None:
         """Open one dataset: as the underlay if there is none, else on top."""
         cmd = SetUnderlay if not len(self.session.state.layers) else AddOverlay
-        self.refresh(self.session.do(cmd(str(path))))
+        self._dispatch(cmd(str(path)))
         self._sync_layer_list()
 
     # ------------------------------------------------------------------
@@ -616,8 +561,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
     # ------------------------------------------------------------------
     def _build_statusbar(self) -> None:
         self.coord_label = QtWidgets.QLabel("")
+        self.coord_label.setObjectName("value")
         self.mode_label = QtWidgets.QLabel("")
         self.value_label = QtWidgets.QLabel("")
+        self.value_label.setObjectName("value")
         self.progress = QtWidgets.QProgressBar()
         self.progress.setMaximumWidth(190)
         self.progress.setRange(0, 100)
@@ -669,55 +616,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # follow those aspects and not only LAYERS -- listening for the
             # wrong one is what left it showing the previous colour scale.
             self._sync_layer_controls()
-        if dirty & (
-            Aspect.SLICES
-            | Aspect.COLORMAP
-            | Aspect.THRESHOLD
-            | Aspect.TIME
-            | Aspect.GRID
-            | Aspect.CROSSHAIR
-        ):
-            # CROSSHAIR belongs here: the crosshair position *is* which slice
-            # each pane shows. Leaving it out only moved the drawn lines, so a
-            # click in one pane left the other two on their previous slices --
-            # and stepping time, which did force a redraw, made them all
-            # "jump" as they caught up.
-            self._redraw_panes(force=bool(dirty & ~(Aspect.CROSSHAIR | Aspect.GRAPH)))
-        if dirty & (Aspect.CROSSHAIR | Aspect.GRID):
-            self._redraw_crosshairs()
-        if dirty & (Aspect.CROSSHAIR | Aspect.GRAPH | Aspect.TIME | Aspect.LAYERS):
-            self._refresh_graphs()
+        # Windows first: a viewport that has just appeared has to exist before
+        # anything tries to draw into it.
+        if dirty & (Aspect.VIEWPORTS | Aspect.LAYERS | Aspect.GRID):
+            self.manager.sync()
+        self.manager.redraw(dirty)
         self._sync_readout()
-
-    def _redraw_panes(self, *, force: bool = True) -> None:
-        """Re-slice the visible panes.
-
-        With ``force`` false only panes whose slice actually moved are
-        re-rendered, so dragging the crosshair across the axial view redraws
-        the two panes that changed rather than all three.
-        """
-        for plane, pane in self._panes.items():
-            if not self._pane_buttons[plane].isChecked():
-                continue
-            if not force and pane.position == plane_position(self.session.state, plane):
-                continue
-            pane.set_pane(render_plane(self.session, plane))
-        self._redraw_crosshairs()
-
-    def _redraw_crosshairs(self) -> None:
-        grid = self.session.state.grid
-        if grid is None:
-            return
-        ijk = self.session.state.crosshair
-        for plane, pane in self._panes.items():
-            layout = plane_layout(grid.affine, plane)
-            pane.set_layout(layout)
-            pane.set_crosshair(*layout.to_image(ijk, grid.shape))
-
-    def _refresh_graphs(self) -> None:
-        for win in self._graphs.values():
-            if win.isVisible():
-                win.refresh()
 
     def _sync_pickers(self) -> None:
         """Point each picker at the layer it currently governs.
@@ -745,9 +649,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
-        row = self.layer_list.currentRow()
+        selected = self.current_key()
         self.layer_list.blockSignals(True)
         self.layer_list.clear()
+        keys = list(reversed(self.session.state.layers.keys))
         for layer in reversed(list(self.session.state.layers)):
             try:
                 pending = self.session.store.get(layer.key).pending
@@ -756,9 +661,13 @@ class ViewerWindow(QtWidgets.QMainWindow):
             mark = "▣" if layer.visible else "▢"
             tag = " ·computed" if layer.is_computed else (" ·loading" if pending else "")
             self.layer_list.addItem(f"{mark} {layer.name}{tag}")
+        if keys:
+            row = keys.index(selected) if selected in keys else 0
+            self.layer_list.setCurrentRow(row)
+        # Unblocked only after the row is set. A sync that writes back into
+        # state is a refresh that dispatches, which puts a SELECT_LAYER into
+        # the recording for every repaint and can recurse.
         self.layer_list.blockSignals(False)
-        if self.layer_list.count():
-            self.layer_list.setCurrentRow(max(0, min(row, self.layer_list.count() - 1)))
         self._sync_layer_controls()
 
     def _sync_mode_panel(self) -> None:
@@ -803,10 +712,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         kind = self.session.mode.overlay_kind if layer.is_computed else OverlayKind.VALUE
         self.thr_head.setText(
             {
-                OverlayKind.STATISTIC: "THRESH stat",
-                OverlayKind.CORRELATION: "THRESH r",
-                OverlayKind.COMPONENT: "THRESH z",
-            }.get(kind, "THRESH")
+                OverlayKind.STATISTIC: key_label("THRESH", "t") + " stat",
+                OverlayKind.CORRELATION: key_label("THRESH", "t") + " r",
+                OverlayKind.COMPONENT: key_label("THRESH", "t") + " z",
+            }.get(kind, key_label("THRESH", "t"))
         )
 
     def _sync_readout(self) -> None:
@@ -839,10 +748,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.value_label.setText("   ".join(parts[:3]))
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
+        # The controller is the session; closing it closes the companions too,
+        # or they linger with nothing driving them.
         self._play.stop()
         self.runner.wait(2000)
-        for win in self._graphs.values():
-            win.close()
+        self.manager.close_all()
         self.session.close()
         super().closeEvent(event)
 
@@ -854,7 +764,7 @@ def launch(
     script: str | None = None,
     directory: str | None = None,
 ) -> int:
-    """Open a window and run the Qt loop."""
+    """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
@@ -871,6 +781,7 @@ def launch(
     if script:
         win.refresh(session.run_script(Path(script).read_text()))
     win.show()
+    win.manager.tile(win)
     return app.exec()
 
 

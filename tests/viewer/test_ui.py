@@ -22,12 +22,30 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6 import QtWidgets  # noqa: E402
 
+from fastfuncstuff.viewer.commands import Aspect  # noqa: E402
 from fastfuncstuff.viewer.session import ViewerSession  # noqa: E402
 from fastfuncstuff.viewer.state import Plane  # noqa: E402
 from fastfuncstuff.viewer.ui.window import ViewerWindow  # noqa: E402
+from fastfuncstuff.viewer.viewports import ViewKind  # noqa: E402
 from fastfuncstuff.viewer.vocab import SetOverlay, SetUnderlay  # noqa: E402
 
 CPU = torch.device("cpu")
+
+
+def image_of(win, plane):
+    """The image window currently showing ``plane``."""
+    for viewport in win.session.state.viewports.images:
+        if viewport.plane is plane:
+            return win.manager.windows[viewport.id]
+    raise AssertionError(f"no image window on {plane}")
+
+
+def open_graph(win, qapp, plane=Plane.AXIAL):
+    """Open a graph window through the manager and return it."""
+    vid = win.manager.open(ViewKind.GRAPH, plane)
+    win.refresh(Aspect.VIEWPORTS | Aspect.GRAPH)
+    qapp.processEvents()
+    return win.manager.windows[vid]
 
 
 @pytest.fixture(scope="session")
@@ -62,67 +80,117 @@ def win(qapp, datadir):
 
 
 # ---------------------------------------------------------------------------
-# the panel must always be recoverable
+# companion windows
+#
+# The bug class that used to live here was "a panel with no way back". The
+# panel is now the controller window itself, so what replaces it is the same
+# question asked of the companions: can every window that can be closed be
+# opened again, and does closing one leave the session consistent.
 # ---------------------------------------------------------------------------
 
 
-def test_the_panel_starts_visible(win):
-    assert win.dock.isVisible()
-    assert win.panel_button.isChecked()
+def test_the_default_layout_is_three_images_and_no_graph(win):
+    """Goal zero is an underlay and an overlay; a graph is something you ask for."""
+    assert [v.plane for v in win.session.state.viewports.images] == [
+        Plane.AXIAL,
+        Plane.SAGITTAL,
+        Plane.CORONAL,
+    ]
+    assert win.session.state.viewports.graphs == []
 
 
-def test_closing_the_panel_by_its_x_unchecks_the_button(win, qapp):
-    """Otherwise the button lies about the state and cannot bring it back."""
-    win.dock.close()
+def test_every_viewport_has_a_real_window(win):
+    assert set(win.manager.windows) == set(win.session.state.viewports.ids)
+    assert all(w.isWindow() for w in win.manager.windows.values())
+
+
+def test_the_controller_holds_no_image(win):
+    """The whole point of the split: the controller is controls, not brains.
+
+    Companion windows are Qt children of the controller for ownership, so the
+    check is on what the controller *lays out*, not on what it parents.
+    """
+    from fastfuncstuff.viewer.ui.panes import ImagePane
+
+    assert win.centralWidget().findChildren(ImagePane) == []
+
+
+def test_closing_a_window_closes_its_viewport(win, qapp):
+    target = win.session.state.viewports.images[1]
+    win.manager.windows[target.id].close()
     qapp.processEvents()
-    assert not win.dock.isVisible()
-    assert not win.panel_button.isChecked()
+    assert target.id not in win.session.state.viewports.ids
+    assert target.id not in win.manager.windows
 
 
-def test_the_button_reopens_a_panel_closed_by_its_x(win, qapp):
-    """The bug this file exists for: a panel with no way back."""
-    win.dock.close()
+def test_a_closed_window_can_always_be_opened_again(win, qapp):
+    for viewport in list(win.session.state.viewports):
+        win.manager.windows[viewport.id].close()
     qapp.processEvents()
-    win.panel_button.click()
+    assert win.manager.windows == {}
+    win._new_image()
     qapp.processEvents()
-    assert win.dock.isVisible()
+    assert len(win.manager.windows) == 1
 
 
-def test_the_button_round_trips(win, qapp):
-    for _ in range(3):
-        win.panel_button.click()
-        qapp.processEvents()
-        assert not win.dock.isVisible()
-        win.panel_button.click()
-        qapp.processEvents()
-        assert win.dock.isVisible()
-
-
-# ---------------------------------------------------------------------------
-# panes
-# ---------------------------------------------------------------------------
-
-
-def test_panes_start_visible(win):
-    assert all(b.isChecked() for b in win._pane_buttons.values())
-
-
-def test_a_pane_can_be_hidden_and_restored(win, qapp):
-    button = win._pane_buttons[Plane.SAGITTAL]
-    button.setChecked(False)
+def test_a_new_image_offers_a_plane_that_is_not_already_shown(win, qapp):
+    """Opening a fourth wraps; opening onto a free plane comes first."""
+    sagittal = image_of(win, Plane.SAGITTAL)
+    sagittal.close()
     qapp.processEvents()
-    assert not win._panes[Plane.SAGITTAL].isVisible()
-    button.setChecked(True)
+    win._new_image()
     qapp.processEvents()
-    assert win._panes[Plane.SAGITTAL].isVisible()
+    assert Plane.SAGITTAL in [v.plane for v in win.session.state.viewports.images]
 
 
-def test_the_last_pane_cannot_be_closed(win, qapp):
-    """An image viewer showing no images has no obvious way out."""
-    for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
-        win._pane_buttons[plane].setChecked(False)
-        qapp.processEvents()
-    assert sum(b.isChecked() for b in win._pane_buttons.values()) == 1
+def test_two_windows_of_the_same_plane_are_independent(win, qapp):
+    """The assumption the viewport change exists to remove."""
+    from fastfuncstuff.viewer.vocab import SetViewSolo
+
+    first = image_of(win, Plane.AXIAL)
+    second_id = win.manager.open(ViewKind.IMAGE, Plane.AXIAL)
+    win.refresh(Aspect.VIEWPORTS | Aspect.SLICES)
+    qapp.processEvents()
+    assert second_id != first.vid
+    win.refresh(win.session.do(SetViewSolo(second_id, True)))
+    qapp.processEvents()
+    assert win.manager.windows[second_id].solo_button.isChecked()
+    assert not first.solo_button.isChecked()
+
+
+def test_a_repaint_does_not_write_back_into_the_recording(win, qapp):
+    """A sync that dispatches is a repaint that mutates state.
+
+    Selection moved into state, so the layer list has to be told what is
+    selected -- and setting a row fires the same signal a click does. Left
+    unguarded, every redraw appended a SELECT_LAYER to the recording and could
+    recurse through refresh.
+    """
+    win.session.bus.clear_log()
+    win.refresh(Aspect.ALL)
+    qapp.processEvents()
+    assert [c.name for c in win.session.bus.log] == []
+
+
+def test_tiling_gives_every_window_a_rectangle(win, qapp):
+    win._tile()
+    qapp.processEvents()
+    rects = [v.geometry for v in win.session.state.viewports]
+    assert all(r is not None for r in rects)
+    # Recorded per window: collapsing on command type alone would leave one.
+    lines = [ln for ln in win.session.to_script().splitlines() if ln.startswith("SET_VIEW_GEOM")]
+    assert len(lines) == len(rects)
+
+
+def test_tiling_does_not_cover_the_controller(win, qapp):
+    """Tiling over the controller hides the panel the windows are driven from."""
+    win.show()
+    qapp.processEvents()
+    win._tile()
+    qapp.processEvents()
+    controller = win.frameGeometry()
+    for child in win.manager.windows.values():
+        assert not controller.intersects(child.geometry())
 
 
 # ---------------------------------------------------------------------------
@@ -130,35 +198,31 @@ def test_the_last_pane_cannot_be_closed(win, qapp):
 # ---------------------------------------------------------------------------
 
 
-def test_no_graph_window_by_default(win):
-    """Goal zero is images; a graph must not take space until asked for."""
-    assert win._graphs == {}
-
-
 def test_a_graph_opens_as_a_floating_window(win, qapp):
-    win._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
-    graph = win._graphs["axial"]
-    assert graph.isWindow(), "the graph must not be docked into the main window"
+    graph = open_graph(win, qapp)
+    assert graph.isWindow(), "the graph must not be docked into the controller"
     assert graph.isVisible()
 
 
-def test_closing_a_graph_unchecks_its_button(win, qapp):
-    win._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
-    win._graphs["axial"].close()
-    qapp.processEvents()
-    assert not win._graph_buttons[Plane.AXIAL].isChecked()
-
-
-def test_graph_cell_count_follows_the_size_choice(win, qapp):
-    win._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
-    graph = win._graphs["axial"]
-    for index, expected in enumerate((1, 4, 9)):
-        graph.size_box.setCurrentIndex(index)
+def test_the_graph_grid_steps_rather_than_choosing_a_preset(win, qapp):
+    """Plus and minus, not 1/4/9: it is a square that grows."""
+    graph = open_graph(win, qapp)
+    seen = []
+    for _ in range(3):
+        graph.step_grid(1)
+        qapp.processEvents()
         graph.refresh()
-        assert len(graph.graph._cells) == expected
+        seen.append(len(graph.graph._cells))
+    assert seen == [9, 16, 25]
+
+
+def test_the_graph_grid_clamps_at_one(win, qapp):
+    graph = open_graph(win, qapp)
+    for _ in range(5):
+        graph.step_grid(-1)
+        qapp.processEvents()
+    graph.refresh()
+    assert len(graph.graph._cells) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -197,12 +261,12 @@ def test_switching_to_a_mode_renders_its_declared_controls(win, qapp):
 def test_the_threshold_label_follows_the_mode(win, qapp):
     from fastfuncstuff.viewer.vocab import SetMode
 
-    assert win.thr_head.text() == "THRESH"
+    assert win.thr_head.text() == "[T]HRESH"  # the key is written into the label
     win.refresh(win.session.do(SetMode("ica")))
     qapp.processEvents()
     # No decomposition here, so no computed layer -- the label stays generic
     # rather than claiming units it is not showing.
-    assert win.thr_head.text() == "THRESH"
+    assert win.thr_head.text() == "[T]HRESH"
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +465,7 @@ def test_h_opens_a_shortcut_list_for_the_window(win, qapp):
     win.help.toggle()
     qapp.processEvents()
     assert win.help._dialog.isVisible()
-    assert "viewer" in win.help._dialog.windowTitle()
+    assert "nexus" in win.help._dialog.windowTitle()
 
 
 def test_h_toggles_the_list_closed(win, qapp):
@@ -433,11 +497,15 @@ def test_the_help_lists_the_keys_that_are_actually_installed(win):
 
 
 def test_a_graph_window_has_its_own_keys(win, qapp):
-    win._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
-    graph = win._graphs["axial"]
+    graph = open_graph(win, qapp)
     assert graph.help._bindings
     assert {b.group for b in graph.help._bindings} != {b.group for b in win.help._bindings}
+
+
+def test_an_image_window_has_its_own_keys(win):
+    image = image_of(win, Plane.AXIAL)
+    assert image.help._bindings
+    assert "o" in {b.keys for b in image.help._bindings}
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +526,7 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
 
     win.refresh(win.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
     win.session.store.ensure_ram(win.session.state.layers.overlay.key)
-    win._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
+    graph = open_graph(win, qapp)
 
     win.refresh(win.session.do(SetMode("instacorr")))
     assert win.session.mode.prepare()
@@ -467,7 +534,7 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
     win.refresh(win.session.do(SetIJK(3, 4, 3)))
     qapp.processEvents()
 
-    labels = [t[0] for t in win._graphs["axial"].graph._cells[0].traces]
+    labels = [t[0] for t in graph.graph._cells[0].traces]
     assert "source" in labels, f"the correlated time course vanished: {labels}"
     assert "prepared" in labels
 
@@ -483,18 +550,22 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
 
 
 def _positions(win):
-    return {p.value: win._panes[p].position for p in Plane}
+    return {p.value: image_of(win, p).pane.position for p in Plane}
+
+
+def _click(win, qapp, plane, row, col, *, seed=False):
+    image_of(win, plane)._pick(row, col, seed=seed)
+    qapp.processEvents()
 
 
 def _pick_and_expect(win, qapp, plane, row, col):
-    """Click a pane, then say where the other two should now be sitting."""
+    """Click a window, then say where the other two should now be sitting."""
     from fastfuncstuff.viewer.slicing import plane_layout
 
     grid = win.session.state.grid
     layout = plane_layout(grid.affine, plane)
     ijk = layout.to_ijk(row, col, win.session.state.crosshair, grid.shape)
-    win._on_pick(plane, row, col)
-    qapp.processEvents()
+    _click(win, qapp, plane, row, col)
     assert win.session.state.crosshair == ijk
     return {p.value: ijk[plane_layout(grid.affine, p).fixed] for p in Plane}
 
@@ -507,8 +578,7 @@ def test_clicking_one_pane_reslices_the_others(win, qapp):
 def test_a_click_does_not_move_the_pane_that_was_clicked(win, qapp):
     """Clicking axial changes i and j, not k -- that pane's slice is unchanged."""
     before = _positions(win)["axial"]
-    win._on_pick(Plane.AXIAL, 3, 6)
-    qapp.processEvents()
+    _click(win, qapp, Plane.AXIAL, 3, 6)
     assert _positions(win)["axial"] == before
 
 
@@ -531,17 +601,15 @@ def test_clicks_survive_a_flipped_grid(win, qapp):
     for plane in Plane:
         layout = plane_layout(grid.affine, plane)
         h, w = grid.shape[layout.row], grid.shape[layout.col]
-        win._on_pick(plane, 0, 0)
-        qapp.processEvents()
+        _click(win, qapp, plane, 0, 0)
         corner = win.session.state.crosshair
-        win._on_pick(plane, h - 1, w - 1)
-        qapp.processEvents()
+        _click(win, qapp, plane, h - 1, w - 1)
         assert win.session.state.crosshair != corner, plane
 
 
 def test_scrolling_reslices_the_scrolled_pane(win, qapp):
     before = _positions(win)["axial"]
-    win._step_slice(Plane.AXIAL, 1)
+    image_of(win, Plane.AXIAL)._step(1)
     qapp.processEvents()
     assert _positions(win)["axial"] == before + 1
 
@@ -557,8 +625,7 @@ def test_stepping_time_does_not_move_any_slice(win, qapp, tmp_path):
     img.header.set_xyzt_units("mm", "sec")
     nib.save(img, str(tmp_path / "bold.nii.gz"))
     win.refresh(win.session.do(SetOverlay(str(tmp_path / "bold.nii.gz"))))
-    win._on_pick(Plane.AXIAL, 3, 4)
-    qapp.processEvents()
+    _click(win, qapp, Plane.AXIAL, 3, 4)
 
     before = _positions(win)
     win._step_time(1)
@@ -568,16 +635,14 @@ def test_stepping_time_does_not_move_any_slice(win, qapp, tmp_path):
 
 def test_a_seed_click_moves_the_crosshair_with_it(win, qapp):
     """Leaving the crosshair behind makes the graph describe another voxel."""
-    win._on_pick(Plane.CORONAL, 5, 3, seed=True)
-    qapp.processEvents()
+    _click(win, qapp, Plane.CORONAL, 5, 3, seed=True)
     assert win.session.state.seed == win.session.state.crosshair
 
 
 def test_a_seed_click_records_both_commands(win, qapp):
     """SET_SEED stays a primitive; the UI expresses the gesture as two."""
     win.session.bus.clear_log()
-    win._on_pick(Plane.AXIAL, 2, 3, seed=True)
-    qapp.processEvents()
+    _click(win, qapp, Plane.AXIAL, 2, 3, seed=True)
     assert [c.name for c in win.session.bus.log] == ["SET_IJK", "SET_SEED"]
 
 
@@ -618,9 +683,8 @@ def test_the_time_readout_is_disabled_without_a_time_series(win, qapp):
 
 
 def test_clicking_the_graph_jumps_to_that_volume(win4d, qapp):
-    win4d._graph_buttons[Plane.AXIAL].setChecked(True)
-    qapp.processEvents()
-    win4d._graphs["axial"].graph.scrubbed.emit(12)
+    graph = open_graph(win4d, qapp)
+    graph.graph.scrubbed.emit(12)
     qapp.processEvents()
     assert win4d.session.state.time_index == 12
     assert win4d.time_spin.value() == 12

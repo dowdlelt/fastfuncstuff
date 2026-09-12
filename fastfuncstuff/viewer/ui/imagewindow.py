@@ -1,0 +1,205 @@
+"""A floating image window: one viewport, one plane, its own settings.
+
+Image windows are top-level and independent because the things people want two
+of are images. Two axial views soloed on an EPI and an anat, flipped between,
+is how you see what registration did; a reference slice parked while you
+navigate elsewhere is how you compare. Neither is expressible when the number
+of images is fixed at three and their identity is their plane.
+
+The window owns no state. It reads a :class:`~viewer.viewports.Viewport` and
+dispatches commands, so what it shows is reproducible from a recorded script
+rather than from whatever the widgets happen to be set to.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+
+from PySide6 import QtCore, QtGui, QtWidgets
+
+from fastfuncstuff.viewer.commands import Command
+from fastfuncstuff.viewer.compose import render_viewport
+from fastfuncstuff.viewer.slicing import plane_layout
+from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui import theme
+from fastfuncstuff.viewer.ui.panes import ImagePane
+from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.viewports import Viewport
+from fastfuncstuff.viewer.vocab import (
+    SetIJK,
+    SetSeed,
+    SetViewLocked,
+    SetViewPlane,
+    SetViewPosition,
+    SetViewSolo,
+)
+
+PLANE_KEYS = {Plane.AXIAL: "1", Plane.SAGITTAL: "2", Plane.CORONAL: "3"}
+
+
+class ImageWindow(QtWidgets.QWidget):
+    """One image viewport as a top-level window."""
+
+    closed = QtCore.Signal(str)
+
+    def __init__(
+        self,
+        vid: str,
+        session,
+        dispatch: Callable[[Command], None],
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.vid = vid
+        self.session = session
+        self._dispatch = dispatch
+        self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
+        self.setStyleSheet(theme.stylesheet())
+
+        v = QtWidgets.QVBoxLayout(self)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(0)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(7, 5, 7, 5)
+        bar.setSpacing(7)
+        self._plane_buttons: dict[Plane, QtWidgets.QPushButton] = {}
+        for plane, key in PLANE_KEYS.items():
+            b = QtWidgets.QPushButton(theme.key_label(plane.value[:3].upper(), key))
+            b.setCheckable(True)
+            b.setToolTip(f"Show the {plane.value} plane ({key})")
+            b.clicked.connect(
+                lambda _=False, p=plane: self._dispatch(SetViewPlane(self.vid, str(p)))
+            )
+            bar.addWidget(b)
+            self._plane_buttons[plane] = b
+        bar.addSpacing(8)
+
+        self.solo_button = QtWidgets.QPushButton(theme.key_label("SOLO", "o"))
+        self.solo_button.setCheckable(True)
+        self.solo_button.setToolTip(
+            "Draw only the selected layer. With [ and ] this flips between "
+            "neighbouring layers in place, which is how alignment is checked."
+        )
+        self.solo_button.clicked.connect(lambda on: self._dispatch(SetViewSolo(self.vid, bool(on))))
+        bar.addWidget(self.solo_button)
+
+        self.lock_button = QtWidgets.QPushButton(theme.key_label("LOCK", "l"))
+        self.lock_button.setCheckable(True)
+        self.lock_button.setToolTip("Follow the shared crosshair (l). Unlock to park a slice.")
+        self.lock_button.clicked.connect(self._toggle_lock)
+        bar.addWidget(self.lock_button)
+
+        bar.addStretch(1)
+        self.slice_label = QtWidgets.QLabel("")
+        self.slice_label.setObjectName("value")
+        bar.addWidget(self.slice_label)
+        v.addLayout(bar)
+
+        self.pane = ImagePane(Plane.AXIAL)
+        self.pane.picked.connect(lambda r, c: self._pick(r, c, seed=False))
+        self.pane.seeded.connect(lambda r, c: self._pick(r, c, seed=True))
+        self.pane.stepped.connect(self._step)
+        v.addWidget(self.pane, 1)
+
+        self.help = ShortcutHelp(self, f"image · {vid}")
+        self.help.apply(
+            [
+                *[
+                    Binding(k, f"{p.value} plane", lambda p=p: self._set_plane(p), group="plane")
+                    for p, k in PLANE_KEYS.items()
+                ],
+                Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
+                Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
+                Binding("scroll", "step through slices", None, group="view"),
+                Binding("click", "move the crosshair", None, group="view"),
+                Binding("ctrl+click", "set the InstaCorr seed", None, group="view"),
+                Binding("h", "this list", self.help.toggle, group="window"),
+                Binding("w", "close this window", self.close, group="window"),
+            ]
+        )
+
+    # -- input ---------------------------------------------------------
+    def _set_plane(self, plane: Plane) -> None:
+        self._dispatch(SetViewPlane(self.vid, str(plane)))
+
+    def _toggle_lock(self, on: bool) -> None:
+        # Unlocking parks the window on the slice it is showing. Without that
+        # it would keep following until something else moved, which reads as
+        # the button not working.
+        if not on:
+            pane_pos = self.pane.position
+            if pane_pos is not None:
+                self._dispatch(SetViewPosition(self.vid, int(pane_pos)))
+        self._dispatch(SetViewLocked(self.vid, bool(on)))
+
+    def _viewport(self) -> Viewport | None:
+        return self.session.state.viewports.find(self.vid)
+
+    def _pick(self, row: int, col: int, *, seed: bool) -> None:
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return
+        layout = plane_layout(state.grid.affine, vp.plane)
+        ijk = layout.to_ijk(row, col, state.crosshair, state.grid.shape)
+        # A click in an unlocked window still reports where it was clicked --
+        # it just does not take its own slice from the crosshair afterwards.
+        self._dispatch(SetIJK(*ijk))
+        if seed:
+            self._dispatch(SetSeed(*ijk))
+
+    def _step(self, delta: int) -> None:
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return
+        axis = plane_layout(state.grid.affine, vp.plane).fixed
+        if vp.locked:
+            ijk = list(state.crosshair)
+            ijk[axis] += delta
+            self._dispatch(SetIJK(*ijk))
+            return
+        here = vp.position if vp.position is not None else state.crosshair[axis]
+        limit = state.grid.shape[axis] - 1
+        self._dispatch(SetViewPosition(self.vid, max(0, min(here + delta, limit))))
+
+    # -- output --------------------------------------------------------
+    def apply(self, viewport: Viewport) -> None:
+        """Push the viewport's settings into the widgets."""
+        self.setWindowTitle(viewport.title)
+        for plane, button in self._plane_buttons.items():
+            button.setChecked(plane is viewport.plane)
+        self.solo_button.setChecked(viewport.solo)
+        self.lock_button.setChecked(viewport.locked)
+        self.pane.plane = viewport.plane
+
+    def redraw(self) -> None:
+        vp = self._viewport()
+        if vp is None:
+            return
+        self.pane.set_pane(render_viewport(self.session, vp))
+        state = self.session.state
+        if state.grid is not None:
+            layout = plane_layout(state.grid.affine, vp.plane)
+            extent = state.grid.shape[layout.fixed]
+            pos = self.pane.position
+            follow = "" if vp.locked else " parked"
+            self.slice_label.setText(f"{'--' if pos is None else pos}/{extent - 1}{follow}")
+        self.redraw_crosshair()
+
+    def redraw_crosshair(self) -> None:
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return
+        layout = plane_layout(state.grid.affine, vp.plane)
+        self.pane.set_layout(layout)
+        self.pane.set_crosshair(*layout.to_image(state.crosshair, state.grid.shape))
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
+        self.closed.emit(self.vid)
+        super().closeEvent(event)
+
+
+__all__ = ["ImageWindow"]

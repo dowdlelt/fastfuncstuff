@@ -70,10 +70,14 @@ class Viewport:
     kind: ViewKind
     plane: Plane = Plane.AXIAL
 
-    #: Follow the shared crosshair and time index. An unlocked viewport keeps
-    #: the slice it was parked on, which is how you leave a reference view up
-    #: while navigating somewhere else.
+    #: Follow the shared crosshair. An unlocked viewport keeps the slice it
+    #: was parked on, which is how you leave a reference view up while
+    #: navigating somewhere else.
     locked: bool = True
+    #: The parked slice, set when a viewport is unlocked. ``None`` means it is
+    #: following the crosshair and has no slice of its own -- which is why it
+    #: is a separate field rather than a number that is sometimes ignored.
+    position: int | None = None
 
     # -- image ---------------------------------------------------------
     zoom: float = 1.0
