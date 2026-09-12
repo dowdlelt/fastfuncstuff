@@ -562,6 +562,26 @@ def accumulate_cluster_null(
     return null
 
 
+def cluster_map(
+    stat3d: np.ndarray,
+    threshold: float,
+    *,
+    sidedness: str = "bi-sided",
+    nn: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Label one volume at one threshold: ``(labels, sizes, masses)``.
+
+    The same connected-component pass the permutation null uses, exposed for
+    callers that have a real statistic map and a threshold already chosen --
+    an interactive clusterize, rather than a distribution being accumulated.
+    Labels are 1-based; 0 is everything that did not survive.
+    """
+    _, _, labels, sizes, masses = _cluster_extent_mass_one(
+        np.asarray(stat3d, dtype=np.float32), float(threshold), sidedness, int(nn)
+    )
+    return labels, sizes, masses
+
+
 def compute_observed_cluster_masks(
     t_obs_in_mask: np.ndarray,
     mask: np.ndarray,

@@ -115,6 +115,7 @@ class ViewerSession:
         #: the crosshair readout asks which region it is on every move.
         self._roi_sets: dict[str, RoiSet] = {}
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
+        self._clustsim: dict[str, dict] = {}
         self._mode_dirty: Aspect = Aspect.NOTHING
         self._displaced_overlay: Layer | None = None
         #: Set once by a UI that runs mode preparation on a worker. Applied to
@@ -773,6 +774,126 @@ class ViewerSession:
         built = torch.as_tensor(rois.palette(), dtype=torch.float32, device=where) / 255.0
         self._roi_palettes[cache_key] = built
         return built
+
+    # -- clusters ------------------------------------------------------
+    def clustsim_table(self, key: str, nn: int, sidedness: str):
+        """This dataset's own ClustSim table for one NN and sidedness.
+
+        Read from the file the layer came from, and cached, because it is a
+        header parse and the window asks on every threshold drag. ``None`` when
+        the dataset carries none, which the table then reports rather than
+        papering over.
+        """
+        cache = self._clustsim.get(key)
+        if cache is None:
+            from fastfuncstuff.stats.clustsim import read_clustsim_tables
+
+            try:
+                from fastfuncstuff.io.headers import read_nifti_header
+
+                cache = read_clustsim_tables(read_nifti_header(self.store.get(key).path))
+            except Exception:  # a header that will not parse simply has no tables
+                cache = {}
+            self._clustsim[key] = cache
+        return cache.get((int(nn), sidedness))
+
+    def clusterize(self, key: str | None = None, *, nn: int = 1, min_voxels: int = 1):
+        """Cluster one layer at the threshold it is currently drawn with.
+
+        The layer's own threshold, not one passed in: a table computed at a
+        different cut does not describe the picture beside it, and two things
+        on screen disagreeing is worse than either alone.
+        """
+        from fastfuncstuff.stats.fdr import stat_value_to_pvalue
+        from fastfuncstuff.viewer.clusters import SIDEDNESS, clusterize
+
+        layer = self.state.layers.find(key) if key else self.state.selected_layer()
+        if layer is None:
+            raise ValueError("no layer to clusterize")
+        if layer.threshold <= 0:
+            raise ValueError(f"{layer.name} has no threshold set; nothing to cluster")
+        values = self.volume(layer.key, layer.volume_index)
+        stat = self.volume(layer.key, layer.threshold_brick)
+
+        # The p the threshold corresponds to is what indexes a ClustSim row, so
+        # a bucket that does not say what test it is gets no corrected alpha --
+        # rather than one read off whichever row happened to be first.
+        pthr = None
+        spec = layer.stat_spec()
+        if spec is not None:
+            pthr = stat_value_to_pvalue(float(layer.threshold), spec[0], spec[1])
+        table = self.clustsim_table(layer.key, nn, SIDEDNESS[layer.sign_mode])
+
+        # The determinant of the affine's rotation block, not the product of
+        # three zooms: on an oblique dataset those differ, and cluster volumes
+        # in mm3 are a number people put in papers.
+        affine = np.asarray(layer.affine, dtype=float)
+        return layer, clusterize(
+            values,
+            stat=stat,
+            threshold=float(layer.threshold),
+            sign_mode=layer.sign_mode,
+            nn=nn,
+            min_voxels=min_voxels,
+            affine=affine,
+            voxel_mm3=float(abs(np.linalg.det(affine[:3, :3]))),
+            table=table,
+            pthr=pthr,
+        )
+
+    def cluster_series(self, table, index: int) -> np.ndarray | None:
+        """Mean time course of one cluster, from a run on the same grid.
+
+        The cluster's average, not its peak voxel's. The peak is by definition
+        the most extreme voxel in the blob, so its time course is the one most
+        selected for -- plotting it is the classic way to make an effect look
+        larger than it is.
+
+        ``None`` rather than blocking when no run is resident: the window asks
+        on every row click.
+        """
+        if table is None:
+            return None
+        picked = np.asarray(table.labels) == int(index)
+        if not picked.any():
+            return None
+        for layer in reversed(self.graph_layers()):
+            if layer.shape != picked.shape:
+                continue
+            resident = self.store.get(layer.key)
+            if resident.array is None:
+                continue
+            return np.asarray(resident.array[picked].mean(0), dtype=np.float32)
+        return None
+
+    def install_rois(self, rois, *, name: str, source: str) -> str:
+        """Adopt an ROI set as a layer, so it can be used like any other.
+
+        The clusters a threshold just produced become an atlas the moment they
+        are in the stack: the matrix can use them as nodes, the readout names
+        them, and a seed can come from one. Nothing downstream has to learn
+        what a cluster is.
+        """
+        key = self.state.layers.mint_key("R")
+        self.store.adopt(key, rois.labels.astype(np.float32), name=name)
+        shape = rois.shape
+        grid_affine = self.state.grid.affine if self.state.grid is not None else np.eye(4)
+        self.state.layers.add(
+            Layer(
+                key=key,
+                name=name,
+                path=name,
+                shape=shape,
+                n_volumes=1,
+                affine=np.asarray(grid_affine, dtype=float),
+                roi=True,
+                source=source,
+                range_lo=0.0,
+                range_hi=float(max(rois.indices, default=1)),
+            )
+        )
+        self._roi_sets[key] = rois
+        return key
 
     def forget_rois(self, key: str | None = None) -> None:
         """Drop cached ROI descriptions, for one layer or all of them."""

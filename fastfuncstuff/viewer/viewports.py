@@ -59,6 +59,7 @@ class ViewKind(StrEnum):
     GRAPH = "graph"
     CARPET = "carpet"
     MATRIX = "matrix"
+    CLUSTERS = "clusters"
 
 
 @dataclass(frozen=True)
@@ -145,6 +146,10 @@ class Viewport:
         return self.kind is ViewKind.MATRIX
 
     @property
+    def is_clusters(self) -> bool:
+        return self.kind is ViewKind.CLUSTERS
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -160,6 +165,8 @@ class Viewport:
             return f"carpet · {self.order}  [{self.id}]"
         if self.is_matrix:
             return f"matrix · {self.matrix_order}  [{self.id}]"
+        if self.is_clusters:
+            return f"clusters  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -185,12 +192,13 @@ class ViewportSet:
         return [v.id for v in self.viewports]
 
     def mint_id(self, kind: ViewKind) -> str:
-        """A fresh id: ``V1`` images, ``G1`` graphs, ``C1`` carpets, ``M1`` matrices."""
+        """A fresh id: ``V1`` image, ``G1`` graph, ``C1`` carpet, ``M1`` matrix, ``K1`` clusters."""
         stem = {
             ViewKind.IMAGE: "V",
             ViewKind.GRAPH: "G",
             ViewKind.CARPET: "C",
             ViewKind.MATRIX: "M",
+            ViewKind.CLUSTERS: "K",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:
@@ -249,6 +257,10 @@ class ViewportSet:
     @property
     def matrices(self) -> list[Viewport]:
         return self.of_kind(ViewKind.MATRIX)
+
+    @property
+    def cluster_views(self) -> list[Viewport]:
+        return self.of_kind(ViewKind.CLUSTERS)
 
 
 def clamp_grid(n: int) -> int:

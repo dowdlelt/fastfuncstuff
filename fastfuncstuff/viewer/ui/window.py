@@ -116,6 +116,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.manager = WindowManager(session, self._dispatch, self)
         self.manager.rebuild_requested.connect(self.rebuild_view)
         self.manager.roi_picked.connect(self._go_to_roi)
+        self.manager.rois_requested.connect(self._clusters_to_rois)
 
         self._build_selector()
         self._build_panel()
@@ -235,6 +236,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 "Open a correlation matrix of the ROIs, or of voxel bins",
                 self._new_matrix,
             ),
+            (
+                "+CLUSTERS",
+                "\u21e7K",
+                "Clusterize the selected layer at its current threshold",
+                self._new_clusters,
+            ),
             ("TILE", "f", "Lay every window out on a grid", self._tile),
             (
                 "STACK",
@@ -352,6 +359,61 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _new_matrix(self) -> None:
         self._open_built(ViewKind.MATRIX)
+
+    def _new_clusters(self) -> None:
+        vid = self.manager.open(ViewKind.CLUSTERS, Plane.AXIAL)
+        self.refresh(Aspect.VIEWPORTS)
+        self.refresh_clusters(vid)
+
+    def refresh_clusters(self, vid: str | None = None) -> None:
+        """Recompute one cluster table, or every one, from the current threshold.
+
+        On the GUI thread on purpose: connected components on a single volume
+        is milliseconds, so a table that lags the slider would be a worse lie
+        than the wait is a cost. The heavy windows are the ones on the worker.
+        """
+        from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
+
+        targets = (
+            self.manager.cluster_windows()
+            if vid is None
+            else [w for w in [self.manager.windows.get(vid)] if isinstance(w, ClusterWindow)]
+        )
+        for window in targets:
+            try:
+                source, table = self.session.clusterize(
+                    None, nn=window.nn, min_voxels=window.min_voxels
+                )
+            except (ValueError, KeyError, FileNotFoundError) as exc:
+                # On the window, not the status bar: the thing that could not
+                # be clustered is the thing you are looking at.
+                window.show_table("", None, str(exc))
+                continue
+            window.show_table(
+                source.key,
+                table,
+                f"{source.name}   {table.summary()}" + (f"   · {table.note}" if table.note else ""),
+            )
+
+    def _clusters_to_rois(self, vid: str) -> None:
+        """Adopt one cluster table as an ROI layer.
+
+        The clusters become an atlas: matrix nodes, a named readout, a seed.
+        Dispatched through the session so the new layer is a layer like any
+        other -- the only thing it does not have is a file behind it.
+        """
+        from fastfuncstuff.viewer.clusters import rois_from_clusters
+        from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
+
+        window = self.manager.windows.get(vid)
+        if not isinstance(window, ClusterWindow) or window._table is None:
+            return
+        source = window._source_key
+        name = f"clusters of {self.session.state.layers.get(source).name}" if source else "clusters"
+        rois = rois_from_clusters(window._table, name=name, source=f"clusters:{source}")
+        self.session.install_rois(rois, name=name, source=f"clusters:{source}")
+        self.refresh(Aspect.LAYERS | Aspect.SLICES)
+        self.statusBar().showMessage(f"{len(rois)} clusters are now an ROI layer", 4000)
 
     def _open_built(self, kind: ViewKind) -> None:
         vid = self.manager.open(kind, Plane.AXIAL)
@@ -1025,6 +1087,11 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.manager.sync()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
             self.manager.mark_built_stale()
+        # The cluster table describes the picture, so it follows the threshold
+        # rather than waiting to be asked. Anything cheaper than the redraw it
+        # sits beside can afford to.
+        if dirty & (Aspect.THRESHOLD | Aspect.LAYERS | Aspect.GRID):
+            self.refresh_clusters()
         self.manager.redraw(dirty)
         self._sync_readout()
 

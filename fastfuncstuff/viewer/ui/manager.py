@@ -20,6 +20,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
@@ -31,7 +32,7 @@ TILE_GAP = 6
 
 #: Every kind of companion window. They share no base class on purpose -- what
 #: they have in common is the four methods the manager calls, not an ancestry.
-Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow
+Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow | ClusterWindow
 
 
 class WindowManager(QtCore.QObject):
@@ -42,6 +43,8 @@ class WindowManager(QtCore.QObject):
     rebuild_requested = QtCore.Signal(str)
     #: A window asked to make one ROI the focus: (layer key, label value).
     roi_picked = QtCore.Signal(str, int)
+    #: A cluster window asked for its table to become an ROI layer.
+    rois_requested = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -91,6 +94,11 @@ class WindowManager(QtCore.QObject):
         elif viewport.is_matrix:
             win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.node_picked.connect(self.roi_picked)
+            win.rebuild_requested.connect(self.rebuild_requested)
+        elif viewport.is_clusters:
+            win = ClusterWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.located.connect(self._on_located)
+            win.rois_requested.connect(self.rois_requested)
             win.rebuild_requested.connect(self.rebuild_requested)
         else:
             win = GraphWindow(viewport.id, self.session, self._dispatch, self._parent)
@@ -155,8 +163,16 @@ class WindowManager(QtCore.QObject):
         return [w for w in self.windows.values() if isinstance(w, CarpetWindow)]
 
     def built(self) -> list[CarpetWindow | MatrixWindow]:
-        """Windows whose picture is computed rather than drawn from state."""
+        """Windows whose picture is computed rather than drawn from state.
+
+        A cluster window is not one of them: labelling a single volume is
+        milliseconds, so it recomputes as the threshold moves instead of going
+        stale and waiting to be asked.
+        """
         return [w for w in self.windows.values() if isinstance(w, CarpetWindow | MatrixWindow)]
+
+    def cluster_windows(self) -> list[ClusterWindow]:
+        return [w for w in self.windows.values() if isinstance(w, ClusterWindow)]
 
     def mark_built_stale(self) -> None:
         for window in self.built():

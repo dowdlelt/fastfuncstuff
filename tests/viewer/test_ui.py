@@ -1457,3 +1457,122 @@ def test_the_matrix_is_recorded_and_replayable(win4d, qapp, tmp_path):
     script = win4d.session.to_script()
     assert "OPEN_VIEW" in script and "matrix" in script
     assert "SET_MATRIX_ORDER" in script
+
+
+# ---------------------------------------------------------------------------
+# the cluster window
+# ---------------------------------------------------------------------------
+
+
+def _blobby(win4d, qapp, tmp_path):
+    """A stat layer with two blobs of different sizes, selected and thresholded."""
+    from fastfuncstuff.viewer.vocab import AddOverlay, SelectLayer, SetThreshold
+
+    v = np.zeros((10, 12, 8), dtype=np.float32)
+    v[1:5, 1:5, 1:3] = 4.0
+    v[1, 1, 1] = 9.0
+    v[8:10, 9:11, 1:2] = -6.0
+    path = tmp_path / "blobs.nii.gz"
+    nib.save(nib.Nifti1Image(v, np.diag([3.0, 3.0, 3.0, 1.0])), str(path))
+    win4d.refresh(win4d.session.do(AddOverlay(str(path))))
+    key = win4d.session.state.layers.layers[-1].key
+    win4d.refresh(win4d.session.do(SelectLayer(key)))
+    win4d.refresh(win4d.session.do(SetThreshold(key, 2.0)))
+    qapp.processEvents()
+    return key
+
+
+def _clusters(win4d, qapp, tmp_path):
+    """The blob layer's key and its cluster window. One layer, not two -- a
+    second AddOverlay of the same file makes the selected layer a different
+    one from the key the test then thresholds."""
+    key = _blobby(win4d, qapp, tmp_path)
+    win4d._new_clusters()
+    qapp.processEvents()
+    return key, win4d.manager.cluster_windows()[0]
+
+
+def test_clusters_are_listed_biggest_first(win4d, qapp, tmp_path):
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    assert window.table.rowCount() == 2
+    assert window.table.item(0, 1).text() == "32"
+    assert window.table.item(1, 1).text() == "4"
+
+
+def test_clicking_a_cluster_goes_to_its_peak(win4d, qapp, tmp_path):
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    window.table.setCurrentCell(0, 0)
+    qapp.processEvents()
+    assert win4d.session.state.crosshair == (1, 1, 1)
+
+
+def test_the_table_follows_the_threshold_rather_than_going_stale(win4d, qapp, tmp_path):
+    """A cluster table computed at a different cut does not describe the
+    picture beside it, and two things on screen disagreeing is the worse bug."""
+    from fastfuncstuff.viewer.vocab import SetThreshold
+
+    key, window = _clusters(win4d, qapp, tmp_path)
+    assert window.table.rowCount() == 2
+
+    # At 5.0 the +4.0 body is gone but its 9.0 peak and the -6.0 blob remain,
+    # which is bi-sided clustering doing what it says.
+    win4d._dispatch(SetThreshold(key, 5.0))
+    qapp.processEvents()
+    assert [window.table.item(r, 1).text() for r in range(window.table.rowCount())] == ["4", "1"]
+
+    win4d._dispatch(SetThreshold(key, 7.0))  # only the 9.0 peak survives
+    qapp.processEvents()
+    assert window.table.rowCount() == 1
+    assert window.table.item(0, 1).text() == "1"
+
+
+def test_an_unthresholded_layer_says_so_instead_of_listing_everything(win4d, qapp, tmp_path):
+    from fastfuncstuff.viewer.vocab import SetThreshold
+
+    key, window = _clusters(win4d, qapp, tmp_path)
+    win4d._dispatch(SetThreshold(key, 0.0))
+    qapp.processEvents()
+    assert window.table.rowCount() == 0
+    assert "no threshold" in window.info.text()
+
+
+def test_without_a_clustsim_table_the_alpha_column_is_empty_and_the_note_says_why(
+    win4d, qapp, tmp_path
+):
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    assert window.table.item(0, 7).text() == "--"
+    assert "no ClustSim table" in window.info.text()
+
+
+def test_clusters_become_an_roi_layer_that_everything_else_can_use(win4d, qapp, tmp_path):
+    """The loop the whole design is for: a threshold produces clusters, the
+    clusters become an atlas, the atlas becomes a correlation matrix."""
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    before = len(win4d.session.state.layers)
+    window.rois_button.click()
+    qapp.processEvents()
+
+    assert len(win4d.session.state.layers) == before + 1
+    added = win4d.session.state.layers.layers[-1]
+    assert added.roi
+    rois = win4d.session.roi_set(added.key)
+    assert [r.name for r in rois] == ["C1", "C2"]
+
+    matrix = _matrix(win4d, qapp)
+    assert matrix._matrix.from_rois
+    assert matrix._matrix.names == ("C1", "C2") or set(matrix._matrix.names) == {"C1", "C2"}
+
+
+def test_a_cluster_plots_its_mean_and_not_its_peak_voxel(win4d, qapp, tmp_path):
+    """The peak is by definition the most extreme voxel, so its time course is
+    the one most selected for -- plotting it flatters the effect."""
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    window.table.setCurrentCell(0, 0)
+    qapp.processEvents()
+
+    series = window.trace._series
+    assert series is not None
+    run = win4d.session.state.layers.overlay
+    picked = window._table.labels == 1
+    expected = win4d.session.store.get(run.key).array[picked].mean(0)
+    assert np.allclose(series, expected, atol=1e-4)
