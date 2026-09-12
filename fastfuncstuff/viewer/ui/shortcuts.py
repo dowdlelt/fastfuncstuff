@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastfuncstuff.viewer.ui import theme
+
 
 @dataclass(frozen=True)
 class Binding:
@@ -48,12 +50,7 @@ class ShortcutsDialog(QtWidgets.QDialog):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(f"keys · {title}")
-        self.setStyleSheet(
-            "QDialog { background: #07090B; }"
-            "QLabel { color: #C9D6DA; font-family: monospace; font-size: 11px; }"
-            "QLabel#group { color: #5C8EA0; font-size: 10px; letter-spacing: 2px; }"
-            "QLabel#key { color: #7DE3C3; font-family: monospace; font-size: 11px; }"
-        )
+        self.setStyleSheet(theme.stylesheet())
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(16, 14, 16, 14)
         outer.setSpacing(4)

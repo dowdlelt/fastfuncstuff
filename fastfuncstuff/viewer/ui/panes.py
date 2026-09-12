@@ -17,9 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.compose import PaneImage
 from fastfuncstuff.viewer.slicing import plane_axes
 from fastfuncstuff.viewer.state import Plane
-
-CROSSHAIR_RGB = (0.35, 0.95, 0.85)
-LABEL_RGB = (0.55, 0.65, 0.70)
+from fastfuncstuff.viewer.ui.theme import CROSSHAIR_RGB, FAINT, LABEL_RGB  # noqa: F401
 
 
 class ImagePane(QtWidgets.QWidget):
@@ -106,9 +104,9 @@ class ImagePane(QtWidgets.QWidget):
     # -- painting ------------------------------------------------------
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor(7, 9, 11))
+        p.fillRect(self.rect(), QtGui.QColor("#0B0E0C"))
         if self._image is None:
-            p.setPen(QtGui.QColor(65, 82, 90))
+            p.setPen(QtGui.QColor(FAINT))
             p.drawText(
                 self.rect(),
                 QtCore.Qt.AlignmentFlag.AlignCenter,

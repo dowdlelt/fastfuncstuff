@@ -19,15 +19,9 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
 
-SERIES_RGB = (
-    (0.49, 0.89, 0.76),
-    (0.98, 0.65, 0.35),
-    (0.45, 0.70, 0.95),
-    (0.85, 0.75, 0.35),
-    (0.80, 0.55, 0.85),
-)
 GRID_SIZES = (1, 2, 3)  # 1, 4, 9 voxels
 
 
@@ -119,9 +113,9 @@ class GridGraph(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor(7, 9, 11))
+        p.fillRect(self.rect(), QtGui.QColor(theme.BG))
         if not self._cells:
-            p.setPen(QtGui.QColor(65, 82, 90))
+            p.setPen(QtGui.QColor(theme.FAINT))
             p.drawText(
                 self.rect(),
                 QtCore.Qt.AlignmentFlag.AlignCenter,
@@ -150,7 +144,7 @@ class GridGraph(QtWidgets.QWidget):
         cell: Cell,
         shared: list[tuple[float, float]] | None,
     ) -> None:
-        border = QtGui.QColor(45, 90, 100) if cell.is_centre else QtGui.QColor(30, 39, 44)
+        border = QtGui.QColor(theme.EDGE_LIT) if cell.is_centre else QtGui.QColor(theme.EDGE)
         p.setPen(QtGui.QPen(border))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         p.drawRect(rect)
@@ -178,7 +172,7 @@ class GridGraph(QtWidgets.QWidget):
                 y = inner.bottom() - (float(v) - lo) / span * inner.height()
                 pt = QtCore.QPointF(x, y)
                 path.moveTo(pt) if i == 0 else path.lineTo(pt)
-            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*SERIES_RGB[si % len(SERIES_RGB)]))
+            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*theme.SERIES_RGB[si % len(theme.SERIES_RGB)]))
             pen.setWidthF(1.6 if cell.is_centre else 1.0)
             p.setPen(pen)
             p.drawPath(path)
@@ -188,13 +182,13 @@ class GridGraph(QtWidgets.QWidget):
         first_len = indexed[0][1][1].size
         if 0 <= self._index < first_len:
             x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
-            p.setPen(QtGui.QPen(QtGui.QColor(217, 164, 65, 160)))
+            p.setPen(QtGui.QPen(QtGui.QColor(232, 197, 106, 170)))
             p.drawLine(QtCore.QPointF(x, inner.top()), QtCore.QPointF(x, inner.bottom()))
 
         if self._n <= 3:
-            p.setPen(QtGui.QColor(85, 101, 112))
+            p.setPen(QtGui.QColor(theme.DIM))
             f = p.font()
-            f.setPointSize(7)
+            f.setPointSize(9)
             p.setFont(f)
             i, j, k = cell.ijk
             p.drawText(QtCore.QPointF(rect.left() + 4, rect.top() + 11), f"{i} {j} {k}")
@@ -214,12 +208,7 @@ class GridGraphWindow(QtWidgets.QWidget):
         self.setWindowFlag(QtCore.Qt.WindowType.Window, True)
         self.setWindowTitle(f"graph · {plane.value}")
         self.resize(460, 380)
-        self.setStyleSheet(
-            "QWidget { background: #07090B; color: #C9D6DA; }"
-            "QLabel { color: #6B7D84; font-size: 10px; letter-spacing: 1px; }"
-            "QComboBox, QCheckBox { color: #C9D6DA; font-size: 11px; }"
-            "QComboBox { background: #0E1216; border: 1px solid #1E272C; padding: 2px 5px; }"
-        )
+        self.setStyleSheet(theme.stylesheet())
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(6, 6, 6, 6)

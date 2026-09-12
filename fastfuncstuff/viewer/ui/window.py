@@ -35,6 +35,7 @@ from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.gridgraph import GridGraphWindow
 from fastfuncstuff.viewer.ui.panes import ImagePane
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp
+from fastfuncstuff.viewer.ui.theme import MONO, stylesheet
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
@@ -60,44 +61,6 @@ from fastfuncstuff.viewer.vocab import (
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
 #: displayed reads as a load that failed.
 NONE_LABEL = "(none)"
-PICKER_FONT = "Menlo" if __import__("sys").platform == "darwin" else "monospace"
-
-STYLESHEET = """
-QMainWindow, QWidget { background: #07090B; color: #C9D6DA; }
-QDockWidget::title { background: #0E1216; padding: 6px 8px;
-    font-size: 10px; letter-spacing: 2px; }
-QListWidget { background: #0E1216; border: 1px solid #1E272C; outline: none;
-    font-family: monospace; font-size: 11px; }
-QListWidget::item { padding: 4px 7px; }
-QListWidget::item:selected { background: #16323A; }
-QLabel { color: #6B7D84; font-size: 10px; letter-spacing: 1px; }
-QLabel#value { color: #C9D6DA; font-family: monospace; font-size: 11px; }
-QLabel#head { color: #5C8EA0; font-size: 10px; letter-spacing: 2px; }
-QSlider::groove:horizontal { height: 2px; background: #1E272C; }
-QSlider::handle:horizontal { background: #7DE3C3; width: 8px; margin: -5px 0; }
-QComboBox, QSpinBox { background: #0E1216; border: 1px solid #1E272C;
-    padding: 3px 6px; font-family: monospace; font-size: 11px; color: #C9D6DA; }
-QComboBox QAbstractItemView { background: #0E1216; color: #C9D6DA;
-    selection-background-color: #16323A; }
-QPushButton { background: #0E1216; border: 1px solid #1E272C; padding: 4px 10px;
-    font-family: monospace; font-size: 11px; letter-spacing: 1px; color: #C9D6DA; }
-QPushButton:hover { background: #16323A; }
-QPushButton:checked { background: #16323A; border-color: #5C8EA0; color: #7DE3C3; }
-QPushButton:disabled { color: #41525A; border-color: #161D22; }
-QCheckBox { color: #6B7D84; font-size: 10px; letter-spacing: 1px; }
-QCheckBox::indicator { width: 12px; height: 12px;
-    border: 1px solid #3A4A52; background: #0E1216; }
-QCheckBox::indicator:checked { background: #7DE3C3; border-color: #7DE3C3; }
-QCheckBox::indicator:disabled { border-color: #202B31; }
-QStatusBar { background: #0E1216; color: #6B7D84;
-    font-family: monospace; font-size: 11px; }
-QProgressBar { background: #0E1216; border: 1px solid #1E272C; height: 12px;
-    text-align: center; font-size: 9px; color: #6B7D84; }
-QProgressBar::chunk { background: #5C8EA0; }
-QDoubleSpinBox { background: #0E1216; border: 1px solid #1E272C; padding: 2px 4px;
-    font-family: monospace; font-size: 11px; color: #C9D6DA; }
-QToolBar { background: #0E1216; border: 0; spacing: 5px; padding: 5px 7px; }
-"""
 
 
 class _Bridge(QtCore.QObject):
@@ -111,7 +74,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.session = session
         self.setWindowTitle("nexus")
-        self.setStyleSheet(STYLESHEET)
+        self.setStyleSheet(stylesheet())
         self.resize(1280, 880)
 
         self._panes: dict[Plane, ImagePane] = {}
@@ -161,14 +124,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         bar.addWidget(self._head("UNDERLAY"))
         self.underlay_box = QtWidgets.QComboBox()
-        self.underlay_box.setFont(QtGui.QFont(PICKER_FONT))
+        self.underlay_box.setFont(QtGui.QFont(MONO))
         self.underlay_box.addItem(NONE_LABEL, userData=None)
         self.underlay_box.activated.connect(lambda _: self._pick(self.underlay_box, SetUnderlay))
         bar.addWidget(self.underlay_box)
 
         bar.addWidget(self._head("OVERLAY"))
         self.overlay_box = QtWidgets.QComboBox()
-        self.overlay_box.setFont(QtGui.QFont(PICKER_FONT))
+        self.overlay_box.setFont(QtGui.QFont(MONO))
         self.overlay_box.addItem(NONE_LABEL, userData=None)
         self.overlay_box.activated.connect(lambda _: self._pick(self.overlay_box, SetOverlay))
         bar.addWidget(self.overlay_box)
