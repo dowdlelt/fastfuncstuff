@@ -55,6 +55,10 @@ class Layer:
     shape: tuple[int, int, int]
     n_volumes: int
     affine: np.ndarray
+    #: ``BRICK_STATAUX``: ``{sub_brick: (afni_stat_code, params)}``. This is
+    #: what makes a threshold expressible as a p -- the bucket states its own
+    #: test and degrees of freedom, so nothing has to be typed or guessed.
+    stataux: dict[int, tuple[int, tuple[float, ...]]] = field(default_factory=dict)
     #: Sub-brick labels from the header, when the file carries them --
     #: ``("Full_Fstat", "Faces#0_Coef", "Faces#0_Tstat", ...)``. ffs and
     #: 3dDeconvolve write these; a raw time series has none. Empty means the
@@ -113,6 +117,45 @@ class Layer:
     def derived_from(self) -> str | None:
         """The key this layer was computed from, if it was."""
         return self.source.split(":", 2)[2] if self.is_derived else None
+
+    @property
+    def threshold_brick(self) -> int:
+        """The sub-brick the threshold actually reads.
+
+        ``threshold_index`` when one is chosen, otherwise the displayed
+        sub-brick -- which is the rule :mod:`viewer.compose` applies, stated
+        once here so the readout cannot describe a different brick than the
+        one being cut on.
+        """
+        return self.volume_index if self.threshold_index is None else self.threshold_index
+
+    def stat_spec(
+        self, index: int | None = None
+    ) -> tuple[str, float | tuple[float, float] | None] | None:
+        """``("fitt", dof)`` for a sub-brick that is a statistic, else ``None``.
+
+        ``None`` is the honest answer for a plain intensity map, and it is what
+        the p control keys off: offering a p-value for a beta would be inviting
+        a number that means nothing.
+        """
+        from fastfuncstuff.io.afni import stataux_to_stat_type
+
+        entry = self.stataux.get(self.threshold_brick if index is None else index)
+        if entry is None:
+            return None
+        code, params = entry
+        name = stataux_to_stat_type(int(code))
+        if name is None:
+            return None
+        if name == "fift":
+            return (name, (float(params[0]), float(params[1]))) if len(params) >= 2 else None
+        if name == "fitt":
+            return (name, float(params[0])) if params else None
+        if name == "fizt":
+            return (name, None)
+        # A code we can name but cannot convert -- correlation, chi-squared and
+        # the rest. Saying so beats quoting a p from the wrong distribution.
+        return None
 
     def sub_brick(self, index: int | None = None) -> str:
         """How one sub-brick should be named on screen.

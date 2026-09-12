@@ -32,6 +32,7 @@ from fastfuncstuff.io.headers import (
     _resolve_indices,
     parse_subbrick_selector,
     read_brick_labels,
+    read_brick_stataux,
 )
 
 # RAS+ (NIfTI) → AFNI DICOM order (x = Left+, y = Posterior+, z = Superior+).
@@ -133,6 +134,10 @@ class DatasetInfo:
     sform_code: int = 0
 
     labels: list[str] = field(default_factory=list)
+    #: ``BRICK_STATAUX``: ``{sub_brick: (afni_stat_code, params)}``. What lets
+    #: a reader turn a t or an F into a p without being told the DoF -- the
+    #: bucket already says. Empty when the dataset carries no stat metadata.
+    stataux: dict[int, tuple[int, tuple[float, ...]]] = field(default_factory=dict)
     history: str = ""
     descrip: str = ""
     scl_slope: float = 1.0
@@ -395,6 +400,7 @@ def _read_nifti_info(p: Path, iname: str, indices: list[int] | None) -> DatasetI
     )
     info.view = _view_from_code(int(hdr["sform_code"]) or int(hdr["qform_code"]), info.space)
     info.labels = read_brick_labels(hdr)
+    info.stataux = read_brick_stataux(hdr)
     info.history = _decode_history(_afni_atr(ext_text, "HISTORY_NOTE") or "")
     # scl_slope 0 is the NIfTI spelling of "no scaling", not a zeroing scale factor.
     slope = float(hdr["scl_slope"]) if np.isfinite(hdr["scl_slope"]) else 1.0

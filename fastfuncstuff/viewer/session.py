@@ -84,6 +84,7 @@ def layer_from_info(info: DatasetInfo, key: str, path: Path) -> Layer:
         n_volumes=max(int(nv), 1),
         affine=np.asarray(info.affine, dtype=float),
         labels=tuple(info.labels),
+        stataux=dict(info.stataux),
         time_linked=infer_time_linked(info),
     )
 

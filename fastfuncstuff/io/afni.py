@@ -2953,6 +2953,19 @@ def stat_type_to_stataux(
     return code, tuple(float(p) for p in params)
 
 
+def stataux_to_stat_type(code: int) -> str | None:
+    """``3 -> "fitt"``. The inverse of :func:`stat_type_to_stataux`'s first half.
+
+    Readers get ``(code, params)`` out of ``BRICK_STATAUX`` and need the string
+    prefix to hand to anything that converts a statistic to a p-value.
+    ``None`` for a code this build does not name.
+    """
+    for name, value in _FUNC_TYPE_CODES.items():
+        if value == code:
+            return name
+    return None
+
+
 def _statsym_for(code: int, params: tuple[float, ...]) -> str:
     """Symbolic AFNI stat label for one sub-brick (``Correl(a,b,c)`` / ``Ttest(dof)``
     / ``Ftest(n,d)`` / ``Zscore()``). ``"none"`` for non-stat sub-bricks. Uses the

@@ -128,6 +128,8 @@ class RangeBar(QtWidgets.QWidget):
         super().__init__(parent)
         self._layer_hi = 1.0
         self._syncing = False
+        #: ``(stat_code, dof)`` of the sub-brick the threshold reads, or None.
+        self._stat: tuple[str, object] | None = None
 
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(0, 0, 0, 0)
@@ -162,9 +164,34 @@ class RangeBar(QtWidgets.QWidget):
         row.addWidget(self.auto_button)
         v.addLayout(row)
 
+        # A statistic's threshold is really a p; the stat value is the units it
+        # happens to be stored in. The bucket states its own test and DoF in
+        # BRICK_STATAUX, so nothing here has to be typed or remembered -- and
+        # the row hides entirely on a map that is not a statistic, because a
+        # p-value quoted for a beta is a number that means nothing.
+        self._stat_row = QtWidgets.QHBoxLayout()
+        self._stat_row.setContentsMargins(0, 0, 0, 0)
+        self._stat_row.setSpacing(4)
+        self.stat_label = QtWidgets.QLabel("")
+        self.stat_label.setToolTip("The test this sub-brick carries, from BRICK_STATAUX")
+        self.p_spin = QtWidgets.QDoubleSpinBox()
+        self.p_spin.setDecimals(6)
+        self.p_spin.setRange(1e-6, 0.999999)
+        self.p_spin.setValue(0.001)
+        self.p_spin.setKeyboardTracking(False)
+        self.p_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
+        self.p_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.p_spin.setMaximumWidth(110)
+        self._stat_row.addWidget(self.stat_label, 1)
+        self._stat_row.addWidget(self.p_spin)
+        self._stat_host = QtWidgets.QWidget()
+        self._stat_host.setLayout(self._stat_row)
+        v.addWidget(self._stat_host)
+
         self.min_spin.valueChanged.connect(self._emit_range)
         self.max_spin.valueChanged.connect(self._emit_range)
         self.thr_spin.valueChanged.connect(self._threshold_from_spin)
+        self.p_spin.valueChanged.connect(self._threshold_from_p)
 
     @staticmethod
     def _spin(tip: str) -> QtWidgets.QDoubleSpinBox:
@@ -202,8 +229,32 @@ class RangeBar(QtWidgets.QWidget):
             # does not waste half its travel on values it never shows.
             self._layer_hi = max(abs(hi), abs(lo)) or 1.0
             self.slider.setValue(int(round(min(layer.threshold / self._layer_hi, 1.0) * TICKS)))
+            self._configure_stat(layer)
         finally:
             self._syncing = False
+
+    def _configure_stat(self, layer) -> None:
+        """Show the p row only where a p means something, and keep it honest."""
+        from fastfuncstuff.stats.fdr import is_two_sided, stat_value_to_pvalue
+
+        self._stat = layer.stat_spec()
+        self._stat_host.setVisible(self._stat is not None)
+        if self._stat is None:
+            return
+        code, dof = self._stat
+        sided = "2-sided" if is_two_sided(code) else "1-sided"
+        # Naming the test and its sidedness on the control, because "p < 0.001"
+        # is two different thresholds depending on which one is meant.
+        self.stat_label.setText(f"{layer.sub_brick(layer.threshold_brick)}  p {sided}")
+        self.p_spin.setToolTip(
+            f"Threshold as a {sided} p-value of the {code} this sub-brick carries.\n"
+            "Sets the threshold; the threshold sets it back."
+        )
+        try:
+            p = stat_value_to_pvalue(float(layer.threshold), code, dof)
+        except (ValueError, OverflowError):
+            return
+        self.p_spin.setValue(min(max(p, self.p_spin.minimum()), self.p_spin.maximum()))
 
     # -- outgoing ------------------------------------------------------
     def _emit_range(self) -> None:
@@ -227,3 +278,21 @@ class RangeBar(QtWidgets.QWidget):
 
     def _threshold_from_bar(self, value: float) -> None:
         self._apply_threshold(abs(value))
+
+    def _threshold_from_p(self, p: float) -> None:
+        """Typing a p sets the threshold, which is the only stored value.
+
+        One source of truth on purpose: p is a *view* of the threshold, the way
+        the colour bar is a view of the range. Storing both would let them
+        disagree, and a threshold that disagrees with its own p-value is the
+        worst kind of wrong -- it looks precise.
+        """
+        if self._syncing or self._stat is None:
+            return
+        from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+        code, dof = self._stat
+        try:
+            self._apply_threshold(pvalue_to_stat(float(p), code, dof))
+        except (ValueError, OverflowError):
+            return
