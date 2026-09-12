@@ -888,3 +888,60 @@ def test_two_graphs_of_different_sizes_read_as_nested_boxes(win, qapp):
     qapp.processEvents()
     sizes = sorted(box[2] for box in image_of(win, Plane.AXIAL).pane._coverage)
     assert sizes == [3, 9]
+
+
+# ---------------------------------------------------------------------------
+# light mode
+# ---------------------------------------------------------------------------
+
+
+def test_one_switch_flips_the_whole_interface(win, qapp):
+    from fastfuncstuff.viewer.ui import theme
+
+    assert win.session.state.theme == "dark"
+    win._toggle_theme()
+    qapp.processEvents()
+    assert win.session.state.theme == "light"
+    assert theme.palette().name == "light"
+
+    # Every window, not just the one the button is on.
+    light = theme.LIGHT.bg
+    assert light in win.styleSheet()
+    assert all(light in w.styleSheet() for w in win.manager.windows.values())
+
+    win._toggle_theme()
+    qapp.processEvents()
+    assert theme.palette().name == "dark"
+
+
+def test_the_theme_button_names_where_it_takes_you(win, qapp):
+    """A button labelled with the current state reads as a status light."""
+    assert win.theme_button.text() == "LIGHT [d]"
+    win._toggle_theme()
+    qapp.processEvents()
+    # The key is bracketed inside the word when the word contains it.
+    assert win.theme_button.text() == "[D]ARK"
+    win._toggle_theme()
+    qapp.processEvents()
+
+
+def test_a_window_opened_after_the_switch_is_born_light(win, qapp):
+    from fastfuncstuff.viewer.ui import theme
+
+    win._toggle_theme()
+    qapp.processEvents()
+    win._new_graph()
+    qapp.processEvents()
+    graph = win.manager.windows[win.session.state.viewports.graphs[0].id]
+    assert theme.LIGHT.bg in graph.styleSheet()
+    win._toggle_theme()
+    qapp.processEvents()
+
+
+def test_the_palette_is_recorded_so_a_replay_looks_the_same(win, qapp):
+    win.session.bus.clear_log()
+    win._toggle_theme()
+    qapp.processEvents()
+    assert "SET_THEME light" in win.session.to_script()
+    win._toggle_theme()
+    qapp.processEvents()

@@ -45,7 +45,12 @@ class Aspect(IntFlag):
     #: A window opened, closed, or changed what it shows. The window manager
     #: reconciles against the viewport list when it sees this.
     VIEWPORTS = auto()
-    ALL = CROSSHAIR | SLICES | COLORMAP | THRESHOLD | LAYERS | TIME | GRAPH | GRID | VIEWPORTS
+    #: The interface's palette changed. Every window restyles; nothing
+    #: re-slices, because a palette says nothing about the data.
+    THEME = auto()
+    ALL = (
+        CROSSHAIR | SLICES | COLORMAP | THRESHOLD | LAYERS | TIME | GRAPH | GRID | VIEWPORTS | THEME
+    )
 
 
 @dataclass(frozen=True)

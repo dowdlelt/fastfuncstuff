@@ -111,6 +111,11 @@ class WindowManager(QtCore.QObject):
             elif graphs:
                 win.refresh()
 
+    def restyle(self) -> None:
+        """Re-read the palette in every companion window."""
+        for win in list(self.windows.values()):
+            win.restyle()
+
     # -- opening ---------------------------------------------------------
     def open(self, kind: ViewKind, plane: Plane = Plane.AXIAL) -> str:
         return self.session.open_view(kind, plane)

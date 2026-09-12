@@ -71,6 +71,16 @@ class SetIndex(Command):
 
 @command
 @dataclass(frozen=True)
+class SetTheme(Command):
+    """Switch the interface palette. ``dark`` or ``light``."""
+
+    name = "SET_THEME"
+    aspects = Aspect.THEME
+    theme: str
+
+
+@command
+@dataclass(frozen=True)
 class OpenView(Command):
     """Open an image or graph window.
 
@@ -650,6 +660,16 @@ def install(
             return Aspect.NOTHING
         st.viewports.update(vid, **changes)
         return aspects
+
+    @bus.handle(SetTheme.name)
+    def _set_theme(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetTheme)
+        if cmd.theme not in ("dark", "light"):
+            raise KeyError(f"unknown theme {cmd.theme!r}")
+        if st.theme == cmd.theme:
+            return Aspect.NOTHING
+        st.theme = cmd.theme
+        return SetTheme.aspects
 
     @bus.handle(OpenView.name)
     def _open_view(cmd: Command, st: ViewerState) -> Aspect:

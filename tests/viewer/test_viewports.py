@@ -301,3 +301,55 @@ def test_decimation_bounds_the_points_without_moving_the_time_axis() -> None:
     short = np.arange(10.0)
     idx, vals = _decimate(short, width=200.0)
     assert np.array_equal(vals, short)
+
+
+# ---------------------------------------------------------------------------
+# palettes
+# ---------------------------------------------------------------------------
+
+
+def test_every_palette_defines_every_colour() -> None:
+    """A colour defined in one palette and missing from the other is a hole."""
+    from dataclasses import fields as dc_fields
+
+    from fastfuncstuff.viewer.ui import theme
+
+    for pal in theme.PALETTES.values():
+        for f in dc_fields(pal):
+            value = getattr(pal, f.name)
+            assert value, f"{pal.name}.{f.name} is empty"
+        assert len(pal.series) >= 4, f"{pal.name} has too few trace colours"
+
+
+def test_switching_to_an_unknown_palette_raises() -> None:
+    import pytest as _pytest
+
+    from fastfuncstuff.viewer.ui import theme
+
+    with _pytest.raises(KeyError):
+        theme.set_theme("solarized")
+    assert theme.palette().name in theme.PALETTES
+
+
+def test_setting_the_palette_already_active_changes_nothing() -> None:
+    from fastfuncstuff.viewer.ui import theme
+
+    theme.set_theme("dark")
+    assert theme.set_theme("dark") is False
+    assert theme.set_theme("light") is True
+    theme.set_theme("dark")
+
+
+def test_the_theme_command_round_trips() -> None:
+    from fastfuncstuff.viewer.vocab import SetTheme
+
+    bus = _bus()
+    assert bus.dispatch(SetTheme("light")) & Aspect.THEME
+    assert bus.state.theme == "light"
+    assert bus.dispatch(SetTheme("light")) is Aspect.NOTHING
+    with pytest.raises(KeyError):
+        bus.dispatch(SetTheme("chartreuse"))
+
+    replayed = ViewerState()
+    vocab.install(CommandBus(replayed)).dispatch_all(parse_script(bus.to_script()))
+    assert replayed.theme == "light"

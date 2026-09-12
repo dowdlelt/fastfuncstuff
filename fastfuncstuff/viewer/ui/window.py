@@ -31,6 +31,7 @@ from fastfuncstuff.viewer.modes.base import OverlayKind
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane
+from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.manager import WindowManager
@@ -55,6 +56,7 @@ from fastfuncstuff.viewer.vocab import (
     SetRange,
     SetSeed,
     SetSign,
+    SetTheme,
     SetThreshold,
     SetThresholdIndex,
     SetTimeLinked,
@@ -107,6 +109,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._play.timeout.connect(lambda: self._step_time(1))
 
         session.default_layout()
+        self._apply_theme()
         self.refresh(Aspect.ALL)
 
     def _dispatch(self, cmd: Command) -> None:
@@ -198,6 +201,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
             b.setToolTip(f"{tip} ({key})")
             b.clicked.connect(slot)
             bar.addWidget(b)
+
+        bar.addSeparator()
+        # Names the palette you would switch *to*, not the one you are in: a
+        # button labelled with the current state reads as a status light and
+        # gets pressed by people who wanted it to stay that way.
+        self.theme_button = QtWidgets.QPushButton("")
+        self.theme_button.setToolTip("Switch between the dark and light palette (d)")
+        self.theme_button.clicked.connect(self._toggle_theme)
+        bar.addWidget(self.theme_button)
 
         bar.addSeparator()
         bar.addWidget(self._head("T"))
@@ -309,6 +321,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _raise_all(self) -> None:
         self.manager.raise_all()
+
+    def _toggle_theme(self) -> None:
+        self._dispatch(SetTheme("light" if self.session.state.theme == "dark" else "dark"))
+
+    def _apply_theme(self) -> None:
+        """Push the palette into every window, including this one."""
+        name = self.session.state.theme
+        theme.set_theme(name)
+        self.setStyleSheet(stylesheet())
+        self.rangebar.restyle()
+        self.theme_button.setText(key_label("LIGHT" if name == "dark" else "DARK", "d"))
+        self.manager.restyle()
 
     # ------------------------------------------------------------------
     # the panel: layers, layer controls, mode controls
@@ -459,6 +483,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("f", "tile every window", self._tile, group="windows"),
                 Binding("F", "stagger every window", self._cascade, group="windows"),
                 Binding("r", "raise every window", self._raise_all, group="windows"),
+                Binding("d", "dark / light palette", self._toggle_theme, group="windows"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
                 Binding("v", "play / pause", self._toggle_play, group="time"),
@@ -634,6 +659,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def refresh(self, dirty: Aspect) -> None:
         if dirty is Aspect.NOTHING:
             return
+        if dirty & Aspect.THEME:
+            self._apply_theme()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
             self._sync_layer_list()
             self._sync_pickers()

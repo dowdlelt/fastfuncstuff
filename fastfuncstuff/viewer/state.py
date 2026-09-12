@@ -73,6 +73,10 @@ class ViewerState:
     selected: str | None = None
     #: Seed voxel for InstaCorr, in display-grid indices. ``None`` until set.
     seed: tuple[int, int, int] | None = None
+    #: Interface palette. State rather than a widget setting so a recorded
+    #: session comes back looking the way it was recorded -- a screenshot from
+    #: a replay should match the one that prompted it.
+    theme: str = "dark"
 
     @property
     def crosshair_mm(self) -> tuple[float, float, float] | None:

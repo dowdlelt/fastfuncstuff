@@ -21,6 +21,7 @@ every graph is a companion window you open, arrange and close.
 keys (main window)
   n  N                 new image / new graph window
   f  F                 tile / stagger every window      r  raise them all
+  d                    dark / light palette
   arrows / PgUp PgDn   move the crosshair
   , .                  step time            v  play / pause
   [ ]                  select layer       space  show / hide layer

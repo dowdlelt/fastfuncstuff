@@ -146,9 +146,10 @@ class GridGraph(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor(theme.BG))
+        c = theme.palette()
+        p.fillRect(self.rect(), QtGui.QColor(c.bg))
         if not self._cells:
-            p.setPen(QtGui.QColor(theme.FAINT))
+            p.setPen(QtGui.QColor(c.faint))
             p.drawText(
                 self.rect(),
                 QtCore.Qt.AlignmentFlag.AlignCenter,
@@ -177,7 +178,8 @@ class GridGraph(QtWidgets.QWidget):
         cell: Cell,
         shared: list[tuple[float, float]] | None,
     ) -> None:
-        border = QtGui.QColor(theme.EDGE_LIT) if cell.is_centre else QtGui.QColor(theme.EDGE)
+        c = theme.palette()
+        border = QtGui.QColor(c.edge_lit) if cell.is_centre else QtGui.QColor(c.edge)
         p.setPen(QtGui.QPen(border))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         p.drawRect(rect)
@@ -210,7 +212,7 @@ class GridGraph(QtWidgets.QWidget):
                 y = inner.bottom() - (float(v) - lo) / span * inner.height()
                 pt = QtCore.QPointF(x, y)
                 path.moveTo(pt) if i == 0 else path.lineTo(pt)
-            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*theme.SERIES_RGB[si % len(theme.SERIES_RGB)]))
+            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*c.series[si % len(c.series)]))
             pen.setWidthF(1.6 if cell.is_centre else 1.0)
             p.setPen(pen)
             p.drawPath(path)
@@ -220,11 +222,13 @@ class GridGraph(QtWidgets.QWidget):
         first_len = indexed[0][1][1].size
         if 0 <= self._index < first_len:
             x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
-            p.setPen(QtGui.QPen(QtGui.QColor(232, 197, 106, 170)))
+            cursor = QtGui.QColor(c.warn)
+            cursor.setAlpha(170)
+            p.setPen(QtGui.QPen(cursor))
             p.drawLine(QtCore.QPointF(x, inner.top()), QtCore.QPointF(x, inner.bottom()))
 
         if self._n <= 3:
-            p.setPen(QtGui.QColor(theme.DIM))
+            p.setPen(QtGui.QColor(c.dim))
             f = p.font()
             f.setPointSize(9)
             p.setFont(f)
@@ -373,7 +377,8 @@ class GraphWindow(QtWidgets.QWidget):
         plottable = self.session.graph_layers()
         shown = {ly.key for ly in self.session.traces_for(viewport)}
         for i, layer in enumerate(plottable):
-            colour = QtGui.QColor.fromRgbF(*theme.SERIES_RGB[i % len(theme.SERIES_RGB)])
+            series = theme.palette().series
+            colour = QtGui.QColor.fromRgbF(*series[i % len(series)])
             b = QtWidgets.QPushButton(layer.name)
             b.setCheckable(True)
             b.setChecked(layer.key in shown)
@@ -425,6 +430,14 @@ class GraphWindow(QtWidgets.QWidget):
             if trace.values.size:
                 out.append((trace.label, trace.values))
         return out
+
+    def restyle(self) -> None:
+        """Re-read the palette after a theme switch."""
+        self.setStyleSheet(theme.stylesheet())
+        viewport = self._viewport()
+        if viewport is not None:
+            self._rebuild_trace_buttons(viewport)
+        self.graph.update()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         self.closed.emit(self.vid)

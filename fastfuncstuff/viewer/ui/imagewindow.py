@@ -204,6 +204,11 @@ class ImageWindow(QtWidgets.QWidget):
         self.lock_button.setChecked(viewport.locked)
         self.pane.plane = viewport.plane
 
+    def restyle(self) -> None:
+        """Re-read the palette after a theme switch."""
+        self.setStyleSheet(theme.stylesheet())
+        self.pane.update()
+
     def redraw(self) -> None:
         vp = self._viewport()
         if vp is None:

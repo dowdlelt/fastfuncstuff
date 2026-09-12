@@ -17,7 +17,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from fastfuncstuff.viewer.compose import PaneImage
 from fastfuncstuff.viewer.slicing import plane_axes
 from fastfuncstuff.viewer.state import Plane
-from fastfuncstuff.viewer.ui.theme import CROSSHAIR_RGB, FAINT, LABEL_RGB  # noqa: F401
+from fastfuncstuff.viewer.ui import theme
 
 
 class ImagePane(QtWidgets.QWidget):
@@ -123,9 +123,10 @@ class ImagePane(QtWidgets.QWidget):
     # -- painting ------------------------------------------------------
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor("#0B0E0C"))
+        c = theme.palette()
+        p.fillRect(self.rect(), QtGui.QColor(c.bg))
         if self._image is None:
-            p.setPen(QtGui.QColor(FAINT))
+            p.setPen(QtGui.QColor(c.faint))
             p.drawText(
                 self.rect(),
                 QtCore.Qt.AlignmentFlag.AlignCenter,
@@ -142,7 +143,7 @@ class ImagePane(QtWidgets.QWidget):
         if self._cross is not None:
             self._paint_crosshair(p, rect)
 
-        p.setPen(QtGui.QColor.fromRgbF(*LABEL_RGB))
+        p.setPen(QtGui.QColor.fromRgbF(*c.label))
         font = p.font()
         font.setPointSize(9)
         p.setFont(font)
@@ -153,7 +154,7 @@ class ImagePane(QtWidgets.QWidget):
         # like a brain, so the only thing that says which way round it is, is
         # writing it on the edges.
         if self._labels is not None:
-            p.setPen(QtGui.QColor(92, 142, 160))
+            p.setPen(QtGui.QColor(c.edge_label))
             top, right, bottom, left = self._labels
             r = self.rect()
             flags = QtCore.Qt.AlignmentFlag
@@ -171,7 +172,8 @@ class ImagePane(QtWidgets.QWidget):
         x = rect.x() + (col + 0.5) * sx
         y = rect.y() + (row + 0.5) * sy
 
-        colour = QtGui.QColor.fromRgbF(*CROSSHAIR_RGB, 0.85)
+        cross = theme.palette().crosshair
+        colour = QtGui.QColor.fromRgbF(*cross, 0.85)
         pen = QtGui.QPen(colour)
         pen.setWidth(1)
         p.setPen(pen)
@@ -179,7 +181,7 @@ class ImagePane(QtWidgets.QWidget):
         # Each footprint drawn, and the largest sets the gap. Two graphs at
         # different sizes read as nested squares, which is what they are.
         gap_x = gap_y = 5.0
-        faint = QtGui.QColor.fromRgbF(*CROSSHAIR_RGB, 0.55)
+        faint = QtGui.QColor.fromRgbF(*cross, 0.55)
         for brow, bcol, nrows, ncols in self._coverage:
             bx, by = rect.x() + bcol * sx, rect.y() + brow * sy
             box = QtCore.QRectF(bx, by, ncols * sx, nrows * sy)

@@ -20,6 +20,7 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from fastfuncstuff.viewer.colormap import apply_colormap, build_lut
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
+from fastfuncstuff.viewer.ui import theme
 
 BAR_HEIGHT = 26
 TICKS = 1000
@@ -56,7 +57,8 @@ class ColorBar(QtWidgets.QWidget):
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
         p = QtGui.QPainter(self)
-        p.fillRect(self.rect(), QtGui.QColor(7, 9, 11))
+        c = theme.palette()
+        p.fillRect(self.rect(), QtGui.QColor(c.bg))
         w = max(self.width() - 2, 1)
         bar = QtCore.QRect(1, 1, w, BAR_HEIGHT - 2)
         try:
@@ -84,13 +86,13 @@ class ColorBar(QtWidgets.QWidget):
                 QtGui.QColor.fromRgbF(r, g, b),
             )
 
-        p.setPen(QtGui.QPen(QtGui.QColor(30, 39, 44)))
+        p.setPen(QtGui.QPen(QtGui.QColor(c.edge)))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
         p.drawRect(bar)
 
         span = (self._hi - self._lo) or 1.0
         if self._threshold > 0:
-            p.setPen(QtGui.QPen(QtGui.QColor(217, 164, 65)))
+            p.setPen(QtGui.QPen(QtGui.QColor(c.warn)))
             for edge in (self._threshold, -self._threshold):
                 if not (self._lo <= edge <= self._hi):
                     continue
@@ -148,7 +150,7 @@ class RangeBar(QtWidgets.QWidget):
         self.min_spin = self._spin("lowest value shown")
         self.thr_spin = self._spin("threshold: values nearer zero than this are cut")
         self.max_spin = self._spin("highest value shown")
-        self.thr_spin.setStyleSheet("color: #D9A441;")
+        self.thr_spin.setStyleSheet(f"color: {theme.palette().warn};")
         self.auto_button = QtWidgets.QPushButton("auto")
         self.auto_button.setToolTip("Re-derive min and max from the data")
         self.auto_button.setMaximumWidth(46)
@@ -176,6 +178,11 @@ class RangeBar(QtWidgets.QWidget):
         return spin
 
     # -- incoming ------------------------------------------------------
+    def restyle(self) -> None:
+        """Re-read the palette after a theme switch."""
+        self.thr_spin.setStyleSheet(f"color: {theme.palette().warn};")
+        self.bar.update()
+
     def configure(self, layer) -> None:
         """Show one layer. The single entry point, so nothing can go stale."""
         self._syncing = True
