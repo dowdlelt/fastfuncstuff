@@ -28,7 +28,8 @@ from fastfuncstuff.viewer.layers import AlphaMode, Layer, LayerStack, SignMode
 from fastfuncstuff.viewer.residency import Resident, Tier, VolumeStore
 from fastfuncstuff.viewer.session import ViewerSession, derive_range
 from fastfuncstuff.viewer.slicing import extract_plane, plane_shape, voxel_value
-from fastfuncstuff.viewer.state import DisplayGrid, Locks, Plane, ViewerState
+from fastfuncstuff.viewer.state import DisplayGrid, Plane, ViewerState
+from fastfuncstuff.viewer.viewports import ViewKind, Viewport, ViewportSet
 
 __all__ = [
     "AlphaMode",
@@ -38,11 +39,13 @@ __all__ = [
     "DisplayGrid",
     "Layer",
     "LayerStack",
-    "Locks",
     "Plane",
     "Resident",
     "SignMode",
     "Tier",
+    "ViewKind",
+    "Viewport",
+    "ViewportSet",
     "ViewerSession",
     "ViewerState",
     "VolumeStore",

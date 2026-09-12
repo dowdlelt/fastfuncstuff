@@ -9,23 +9,15 @@ three resample-mode menus to avoid is now cheaper than the menu would be.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import StrEnum
 
 import numpy as np
 
 from fastfuncstuff.viewer.layers import LayerStack
 
-
-class Plane(StrEnum):
-    """The three cardinal display planes.
-
-    Oblique views are a display grid with a rotated affine rather than a fourth
-    plane, so this stays closed.
-    """
-
-    AXIAL = "axial"
-    SAGITTAL = "sagittal"
-    CORONAL = "coronal"
+# Plane lives in viewports.py because a viewport takes one as a field
+# default and this module holds the viewports; re-exported here because
+# `from viewer.state import Plane` is how the rest of the viewer says it.
+from fastfuncstuff.viewer.viewports import Plane, ViewKind, ViewportSet
 
 
 @dataclass(frozen=True)
@@ -61,21 +53,6 @@ class DisplayGrid:
 
 
 @dataclass
-class Locks:
-    """What stays synchronised across panes.
-
-    This replaces AFNI's cross-controller Lock system. In a single-window
-    layout the interesting locks are between panes rather than between
-    top-level windows, which makes them cheap to reason about.
-    """
-
-    crosshair: bool = True
-    zoom: bool = True
-    time: bool = True
-    threshold: bool = False
-
-
-@dataclass
 class ViewerState:
     """Everything the UI draws from.
 
@@ -86,9 +63,14 @@ class ViewerState:
     grid: DisplayGrid | None = None
     crosshair: tuple[int, int, int] = (0, 0, 0)
     time_index: int = 0
-    zoom: float = 1.0
-    pan: tuple[float, float] = (0.0, 0.0)
-    locks: Locks = field(default_factory=Locks)
+    #: The open image and graph windows. Zoom, pan and what a window is locked
+    #: to live here rather than on the state, because none of them mean
+    #: anything once there is more than one window.
+    viewports: ViewportSet = field(default_factory=ViewportSet)
+    #: Which layer the controls act on, and the one a soloed viewport draws.
+    #: In state rather than in a list widget so that `[` and `]` are commands
+    #: a script can replay, and so solo has something to be solo *of*.
+    selected: str | None = None
     #: Seed voxel for InstaCorr, in display-grid indices. ``None`` until set.
     seed: tuple[int, int, int] | None = None
 
@@ -97,6 +79,30 @@ class ViewerState:
         if self.grid is None:
             return None
         return self.grid.ijk_to_mm(self.crosshair)
+
+    def selected_layer(self):
+        """The layer the controls act on, falling back to the top of the stack.
+
+        A fallback rather than ``None``: with a stack loaded there is always
+        something the controls should be aimed at, and the topmost layer is
+        the one that was most recently put there.
+        """
+        if self.selected is not None:
+            found = self.layers.find(self.selected)
+            if found is not None:
+                return found
+        return self.layers.layers[-1] if len(self.layers) else None
+
+    def default_layout(self) -> None:
+        """Open what a viewer with nothing configured should show.
+
+        Three images, no graph. Goal zero is an underlay and an overlay
+        together; a graph is something you ask for.
+        """
+        if len(self.viewports):
+            return
+        for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
+            self.viewports.open(ViewKind.IMAGE, plane)
 
     def max_time_index(self) -> int:
         """Longest 4-D extent in the stack, so scrubbing spans everything."""
@@ -114,3 +120,6 @@ class ViewerState:
         self.grid = DisplayGrid.from_layer(shape, affine)
         i, j, k = (s // 2 for s in self.grid.shape)
         self.crosshair = (i, j, k)
+
+
+__all__ = ["DisplayGrid", "Plane", "ViewerState"]

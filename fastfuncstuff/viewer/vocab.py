@@ -18,7 +18,8 @@ from typing import Any
 
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus, command
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
-from fastfuncstuff.viewer.state import ViewerState
+from fastfuncstuff.viewer.state import Plane, ViewerState
+from fastfuncstuff.viewer.viewports import ViewKind, clamp_grid
 
 # ---------------------------------------------------------------------------
 # navigation
@@ -59,11 +60,135 @@ class SetIndex(Command):
     index: int
 
 
+# ---------------------------------------------------------------------------
+# viewports: the open windows
+#
+# Every one of these names a window. That is the whole point of the group --
+# zoom, pan and "what am I locked to" were state on the viewer until there was
+# more than one window, at which point they stopped describing anything.
+# ---------------------------------------------------------------------------
+
+
+@command
+@dataclass(frozen=True)
+class OpenView(Command):
+    """Open an image or graph window.
+
+    The id is given rather than returned because a command has to be fully
+    determined to replay: a script that says ``OPEN_VIEW V2 image axial``
+    rebuilds the same window, where one that minted an id at replay time would
+    drift from every later line that addresses it.
+    """
+
+    name = "OPEN_VIEW"
+    aspects = Aspect.VIEWPORTS
+    major = True
+    view: str
+    kind: str = "image"
+    plane: str = "axial"
+
+
+@command
+@dataclass(frozen=True)
+class CloseView(Command):
+    name = "CLOSE_VIEW"
+    aspects = Aspect.VIEWPORTS
+    major = True
+    view: str
+
+
+@command
+@dataclass(frozen=True)
+class SetViewPlane(Command):
+    """Point a window at a different plane, without opening another."""
+
+    name = "SET_VIEW_PLANE"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    plane: str
+
+
+@command
+@dataclass(frozen=True)
+class SetViewSolo(Command):
+    """Draw only the selected layer in this window, instead of the stack."""
+
+    name = "SET_VIEW_SOLO"
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
+class SetViewLocked(Command):
+    """Whether this window follows the shared crosshair and time index."""
+
+    name = "SET_VIEW_LOCKED"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
+class SetViewGrid(Command):
+    """Cells per side in a graph window: 1 -> 1 voxel, 3 -> 9, 4 -> 16."""
+
+    name = "SET_VIEW_GRID"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    n: int
+
+
+@command
+@dataclass(frozen=True)
+class SetViewTraces(Command):
+    """Which layers a graph window plots, as comma-separated layer keys.
+
+    Empty (or ``-``) means every time-linked layer, which is both the sensible
+    default and the only selection that keeps meaning something as the stack
+    grows. Naming keys is what lets a graph stay on the functional while the
+    images show a stat map on an anatomy.
+    """
+
+    name = "SET_VIEW_TRACES"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    keys: str = ""
+
+
+@command
+@dataclass(frozen=True)
+class SetViewSharedScale(Command):
+    name = "SET_VIEW_SHARED_SCALE"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
+class SetViewGeometry(Command):
+    """Where a window sits on screen, so a saved session comes back tiled."""
+
+    name = "SET_VIEW_GEOMETRY"
+    aspects = Aspect.VIEWPORTS
+    view: str
+    x: int
+    y: int
+    w: int
+    h: int
+
+
 @command
 @dataclass(frozen=True)
 class SetZoom(Command):
+    """Zoom one window. Zoom is per window; there is no viewer-wide zoom."""
+
     name = "SET_ZOOM"
-    aspects = Aspect.SLICES
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
     zoom: float
 
 
@@ -71,20 +196,10 @@ class SetZoom(Command):
 @dataclass(frozen=True)
 class SetPan(Command):
     name = "SET_PAN"
-    aspects = Aspect.SLICES
+    aspects = Aspect.VIEWPORTS | Aspect.SLICES
+    view: str
     x: float
     y: float
-
-
-@command
-@dataclass(frozen=True)
-class SetLock(Command):
-    """Toggle one pane-synchronisation lock."""
-
-    name = "SET_LOCK"
-    aspects = Aspect.NOTHING
-    which: str
-    on: bool
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +322,16 @@ class MoveLayer(Command):
     aspects = Aspect.LAYERS | Aspect.SLICES
     key: str
     to: int
+
+
+@command
+@dataclass(frozen=True)
+class SelectLayer(Command):
+    """Aim the controls at one layer -- and say what a soloed window draws."""
+
+    name = "SELECT_LAYER"
+    aspects = Aspect.LAYERS
+    key: str
 
 
 @command
@@ -486,31 +611,93 @@ def install(
         st.time_index = target
         return SetIndex.aspects
 
+    def _set_view(st: ViewerState, vid: str, aspects: Aspect, **changes: object) -> Aspect:
+        """Apply changes to one viewport, reporting nothing when unchanged.
+
+        Every viewport command routes through here so that "did this actually
+        change" is answered once. A drag that re-sends the value it already has
+        must not repaint every window.
+        """
+        current = st.viewports.get(vid)
+        if all(getattr(current, k) == v for k, v in changes.items()):
+            return Aspect.NOTHING
+        st.viewports.update(vid, **changes)
+        return aspects
+
+    @bus.handle(OpenView.name)
+    def _open_view(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, OpenView)
+        if st.viewports.find(cmd.view) is not None:
+            return Aspect.NOTHING  # replaying a script that already opened it
+        st.viewports.open(ViewKind(cmd.kind), Plane(cmd.plane), vid=cmd.view)
+        return OpenView.aspects
+
+    @bus.handle(CloseView.name)
+    def _close_view(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, CloseView)
+        if st.viewports.find(cmd.view) is None:
+            return Aspect.NOTHING
+        st.viewports.close(cmd.view)
+        return CloseView.aspects
+
+    @bus.handle(SetViewPlane.name)
+    def _set_view_plane(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewPlane)
+        return _set_view(st, cmd.view, SetViewPlane.aspects, plane=Plane(cmd.plane))
+
+    @bus.handle(SetViewSolo.name)
+    def _set_view_solo(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewSolo)
+        return _set_view(st, cmd.view, SetViewSolo.aspects, solo=bool(cmd.on))
+
+    @bus.handle(SetViewLocked.name)
+    def _set_view_locked(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewLocked)
+        return _set_view(st, cmd.view, SetViewLocked.aspects, locked=bool(cmd.on))
+
+    @bus.handle(SetViewGrid.name)
+    def _set_view_grid(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewGrid)
+        return _set_view(st, cmd.view, SetViewGrid.aspects, grid_n=clamp_grid(cmd.n))
+
+    @bus.handle(SetViewTraces.name)
+    def _set_view_traces(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewTraces)
+        keys = tuple(k for k in (cmd.keys or "").split(",") if k and k != "-")
+        return _set_view(st, cmd.view, SetViewTraces.aspects, traces=keys)
+
+    @bus.handle(SetViewSharedScale.name)
+    def _set_view_shared(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewSharedScale)
+        return _set_view(st, cmd.view, SetViewSharedScale.aspects, shared_scale=bool(cmd.on))
+
+    @bus.handle(SetViewGeometry.name)
+    def _set_view_geometry(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewGeometry)
+        rect = (int(cmd.x), int(cmd.y), int(cmd.w), int(cmd.h))
+        return _set_view(st, cmd.view, SetViewGeometry.aspects, geometry=rect)
+
     @bus.handle(SetZoom.name)
     def _set_zoom(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetZoom)
-        z = max(0.05, float(cmd.zoom))
-        if z == st.zoom:
-            return Aspect.NOTHING
-        st.zoom = z
-        return SetZoom.aspects
+        return _set_view(st, cmd.view, SetZoom.aspects, zoom=max(0.05, float(cmd.zoom)))
 
     @bus.handle(SetPan.name)
     def _set_pan(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetPan)
-        target = (float(cmd.x), float(cmd.y))
-        if target == st.pan:
-            return Aspect.NOTHING
-        st.pan = target
-        return SetPan.aspects
+        return _set_view(st, cmd.view, SetPan.aspects, pan=(float(cmd.x), float(cmd.y)))
 
-    @bus.handle(SetLock.name)
-    def _set_lock(cmd: Command, st: ViewerState) -> Aspect:
-        assert isinstance(cmd, SetLock)
-        if not hasattr(st.locks, cmd.which):
-            raise KeyError(f"unknown lock {cmd.which!r}")
-        setattr(st.locks, cmd.which, bool(cmd.on))
-        return Aspect.NOTHING
+    @bus.handle(SelectLayer.name)
+    def _select_layer(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SelectLayer)
+        if st.layers.find(cmd.key) is None:
+            raise KeyError(f"no layer {cmd.key!r}")
+        if st.selected == cmd.key:
+            return Aspect.NOTHING
+        st.selected = cmd.key
+        # SLICES as well as LAYERS: a soloed window draws the selected layer,
+        # so changing the selection changes what is on screen.
+        return SelectLayer.aspects | Aspect.SLICES
 
     @bus.handle(AddLayer.name)
     def _add_layer(cmd: Command, st: ViewerState) -> Aspect:

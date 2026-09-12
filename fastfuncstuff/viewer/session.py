@@ -21,8 +21,9 @@ from fastfuncstuff.viewer.layers import AlphaMode, Layer
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
-from fastfuncstuff.viewer.state import ViewerState
-from fastfuncstuff.viewer.vocab import AddLayer, SetVolume, install
+from fastfuncstuff.viewer.state import Plane, ViewerState
+from fastfuncstuff.viewer.viewports import ViewKind
+from fastfuncstuff.viewer.vocab import AddLayer, CloseView, OpenView, SetVolume, install
 
 #: Percentiles used to auto-range a layer. AFNI's autorange takes the maximum,
 #: which one bright voxel is enough to ruin; percentiles are what make a map
@@ -207,6 +208,44 @@ class ViewerSession:
         return catalog_mod.suggest_underlay(self.catalog)
 
     # -- modes ---------------------------------------------------------
+    # -- viewports -----------------------------------------------------
+    def open_view(self, kind: ViewKind, plane: Plane) -> str:
+        """Open a window and return its id.
+
+        The id is minted here and passed into the command rather than being
+        returned by it, so the recorded line names the window it opened and
+        every later line that addresses that window still resolves on replay.
+        """
+        vid = self.state.viewports.mint_id(kind)
+        self.do(OpenView(vid, str(kind), str(plane)))
+        return vid
+
+    def close_view(self, vid: str) -> Aspect:
+        return self.do(CloseView(vid))
+
+    def graph_layers(self) -> list[Layer]:
+        """Layers a graph can plot: the time-linked ones, bottom-up.
+
+        A 3-D anatomy is never offered. It has no time course, and listing it
+        with an empty checkbox invites the reading that the trace is hidden
+        rather than that it does not exist.
+        """
+        return [ly for ly in self.state.layers if ly.time_linked and ly.n_volumes > 1]
+
+    def traces_for(self, viewport) -> list[Layer]:
+        """The layers one graph viewport should plot.
+
+        An empty selection means all of them: a new layer starts plotted, which
+        is what someone who just loaded it expects. Keys that no longer name a
+        layer are dropped rather than erroring, because a viewport outlives the
+        layers it was pointed at.
+        """
+        available = self.graph_layers()
+        if not viewport.traces:
+            return available
+        wanted = set(viewport.traces)
+        return [ly for ly in available if ly.key in wanted]
+
     def set_mode(self, name: str) -> Aspect:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:

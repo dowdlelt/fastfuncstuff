@@ -42,7 +42,10 @@ class Aspect(IntFlag):
     TIME = auto()
     GRAPH = auto()
     GRID = auto()
-    ALL = CROSSHAIR | SLICES | COLORMAP | THRESHOLD | LAYERS | TIME | GRAPH | GRID
+    #: A window opened, closed, or changed what it shows. The window manager
+    #: reconciles against the viewport list when it sees this.
+    VIEWPORTS = auto()
+    ALL = CROSSHAIR | SLICES | COLORMAP | THRESHOLD | LAYERS | TIME | GRAPH | GRID | VIEWPORTS
 
 
 @dataclass(frozen=True)
@@ -306,13 +309,33 @@ class CommandBus:
         return [c for c in self._log if c.major]
 
 
+def _target(cmd: Command) -> tuple[Any, ...]:
+    """What a command is aimed at, for deciding whether two supersede.
+
+    Dragging one layer's opacity slider emits a line per pixel and only the
+    last matters. Setting the geometry of four windows in a row also emits four
+    lines of one type -- and every one of them matters, because each names a
+    different window. So the fields that identify a target take part in the
+    comparison: same type *and* same target is a supersede, same type and
+    different target is two separate actions.
+    """
+    return tuple(
+        getattr(cmd, f.name) for f in fields(cmd) if f.name in ("key", "view", "which", "name")
+    )
+
+
 def _collapse(log: Sequence[Command]) -> Iterator[Command]:
-    """Drop superseded runs of the same non-major command type."""
+    """Drop superseded runs of the same non-major command, per target."""
     for i, cmd in enumerate(log):
         if cmd.major:
             yield cmd
             continue
         nxt = log[i + 1] if i + 1 < len(log) else None
-        if nxt is not None and type(nxt) is type(cmd) and not nxt.major:
+        if (
+            nxt is not None
+            and type(nxt) is type(cmd)
+            and not nxt.major
+            and _target(nxt) == _target(cmd)
+        ):
             continue
         yield cmd
