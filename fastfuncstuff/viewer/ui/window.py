@@ -389,11 +389,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 # be clustered is the thing you are looking at.
                 window.show_table("", None, str(exc))
                 continue
-            window.show_table(
-                source.key,
-                table,
-                f"{source.name}   {table.summary()}" + (f"   · {table.note}" if table.note else ""),
-            )
+            window.show_table(source.key, table, f"{source.name}   {table.summary()}")
 
     def _clusters_to_rois(self, vid: str) -> None:
         """Adopt one cluster table as an ROI layer.
@@ -433,9 +429,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         run, so this is never allowed near the click handler.
         """
         from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+        from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
         from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
 
         window = self.manager.windows.get(vid)
+        # A cluster window asks through the same signal, but its answer is
+        # milliseconds and belongs on this thread -- and before this branch
+        # its NN and MIN controls asked a question nobody answered.
+        if isinstance(window, ClusterWindow):
+            self.refresh_clusters(vid)
+            return
         viewport = self.session.state.viewports.find(vid)
         if viewport is None or self.runner.busy:
             return

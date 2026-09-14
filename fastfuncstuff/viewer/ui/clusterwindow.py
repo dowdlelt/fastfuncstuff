@@ -33,6 +33,16 @@ COLUMNS = ("#", "voxels", "mm³", "peak", "x", "y", "z", "α")
 #: Height of the selected cluster's mean time course, in pixels.
 TRACE_HEIGHT = 64
 BARE_WIDTH = 260
+#: Where the minimum cluster size starts. High on purpose: a stat map at a
+#: loose threshold is mostly one-voxel speckle, and a table of tens of
+#: thousands of those is both useless and the slowest thing this window can be
+#: asked to draw. Lowering it is one edit; waiting out a table nobody wanted
+#: is not.
+DEFAULT_MIN_VOXELS = 100
+#: Rows actually put in the table. The clusters past it are still counted in
+#: the summary and still in the label map MAKE ROIS adopts -- a QTableWidget
+#: row is milliseconds, and nobody reads row 5,000.
+MAX_TABLE_ROWS = 1000
 
 
 class TraceStrip(QtWidgets.QWidget):
@@ -132,9 +142,13 @@ class ClusterWindow(QtWidgets.QWidget):
         bar.addWidget(QtWidgets.QLabel("MIN"))
         self.min_spin = QtWidgets.QSpinBox()
         self.min_spin.setRange(1, 100_000)
-        self.min_spin.setValue(1)
+        self.min_spin.setValue(DEFAULT_MIN_VOXELS)
         self.min_spin.setMaximumWidth(80)
-        self.min_spin.setToolTip("Drop clusters below this many voxels")
+        # Committed on enter, not per keystroke: typing 1000 on the way to
+        # 100 would otherwise cluster at 1, then 10, and a typo can cost the
+        # wait this default exists to avoid.
+        self.min_spin.setKeyboardTracking(False)
+        self.min_spin.setToolTip("Drop clusters below this many voxels (applies on enter)")
         self.min_spin.valueChanged.connect(lambda _: self.rebuild_requested.emit(self.vid))
         bar.addWidget(self.min_spin)
 
@@ -226,11 +240,14 @@ class ClusterWindow(QtWidgets.QWidget):
         self._table = table
         self._source_key = source_key
         self.trace.set_series(None, (0, 0, 0))
-        self.table.setRowCount(0 if table is None else len(table))
+        shown = 0 if table is None else min(len(table), MAX_TABLE_ROWS)
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(shown)
         if table is None:
+            self.table.setUpdatesEnabled(True)
             self.info.setText(message or "nothing to cluster")
             return
-        for row, cluster in enumerate(table):
+        for row, cluster in enumerate(table.clusters[:shown]):
             cells = (
                 str(cluster.index),
                 f"{cluster.n_voxels:,}",
@@ -248,9 +265,12 @@ class ClusterWindow(QtWidgets.QWidget):
                         QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter
                     )
                 self.table.setItem(row, column, item)
+        self.table.setUpdatesEnabled(True)
         self.table.resizeColumnsToContents()
         note = f"   · {table.note}" if table.note else ""
-        self.info.setText(message or f"{table.summary()}{note}")
+        if len(table) > shown:
+            note += f"   · first {shown:,} listed; raise MIN to see the rest"
+        self.info.setText(f"{message or table.summary()}{note}")
 
     @staticmethod
     def _alpha_text(table: ClusterTable, cluster) -> str:

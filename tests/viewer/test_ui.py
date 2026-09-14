@@ -1489,7 +1489,10 @@ def _clusters(win4d, qapp, tmp_path):
     key = _blobby(win4d, qapp, tmp_path)
     win4d._new_clusters()
     qapp.processEvents()
-    return key, win4d.manager.cluster_windows()[0]
+    window = win4d.manager.cluster_windows()[0]
+    window.min_spin.setValue(1)  # the blobs are smaller than the default minimum
+    qapp.processEvents()
+    return key, window
 
 
 def test_clusters_are_listed_biggest_first(win4d, qapp, tmp_path):
@@ -1576,3 +1579,25 @@ def test_a_cluster_plots_its_mean_and_not_its_peak_voxel(win4d, qapp, tmp_path):
     picked = window._table.labels == 1
     expected = win4d.session.store.get(run.key).array[picked].mean(0)
     assert np.allclose(series, expected, atol=1e-4)
+
+
+def test_the_cluster_window_starts_with_a_minimum_that_keeps_out_speckle(win4d, qapp, tmp_path):
+    """Opening it on a loose threshold used to list every one-voxel cluster,
+    which on a whole brain is tens of thousands of rows and a frozen window."""
+    from fastfuncstuff.viewer.ui.clusterwindow import DEFAULT_MIN_VOXELS
+
+    _blobby(win4d, qapp, tmp_path)
+    win4d._new_clusters()
+    qapp.processEvents()
+    window = win4d.manager.cluster_windows()[0]
+    assert window.min_voxels == DEFAULT_MIN_VOXELS >= 50
+    assert window.table.rowCount() == 0
+    assert not window.min_spin.keyboardTracking()
+
+
+def test_changing_the_cluster_minimum_recomputes_the_table(win4d, qapp, tmp_path):
+    _key, window = _clusters(win4d, qapp, tmp_path)
+    assert window.table.rowCount() == 2
+    window.min_spin.setValue(10)
+    qapp.processEvents()
+    assert window.table.rowCount() == 1
