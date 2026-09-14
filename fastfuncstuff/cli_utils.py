@@ -4094,7 +4094,7 @@ def image_support(
     ``brain`` only ever damps the metric -- an automask boundary is real anatomy, and
     filling across it would splice one image's skull into the other's.
     """
-    from fastfuncstuff.processing.mask import automask, data_coverage_mask
+    from fastfuncstuff.processing.mask import automask, data_coverage_mask, looks_skull_stripped
 
     v = vol.float().to(device)
     brain = None
@@ -4109,6 +4109,14 @@ def image_support(
             frac = 100.0 * cover.float().mean().item()
             if frac < 99.95:
                 print(f"Coverage ({label}): {frac:.1f}% of voxels hold data")
+        if verb >= 0 and looks_skull_stripped(cover):
+            print(
+                f"  ⚠️  WARNING: the {label}'s zero background looks like a masked brain, not "
+                "missing data.\n"
+                "      Coverage handling will erase that boundary and block the warp from "
+                "pulling tissue in across it.\n"
+                "      For skull-stripped images, rerun with -nocoverage."
+            )
     return brain, cover
 
 
