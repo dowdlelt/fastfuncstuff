@@ -52,6 +52,7 @@ METHOD / CREDIT
 from __future__ import annotations
 
 import argparse
+import re
 import shlex
 import sys
 from datetime import datetime
@@ -213,16 +214,28 @@ def create_parser() -> argparse.ArgumentParser:
     )
     sched.add_argument(
         "-pad_phase_wrap",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Pad each scan by N voxels at both ends of the phase-encode axis with slices "
-        "wrapped from the opposite end, estimate on that grid, then crop back. Use when "
-        "distortion pushes tissue (skull, scalp) past the FOV edge so it aliases in at the "
-        "other end: without it the solver matches that wrapped signal where it landed and "
-        "pulls the wrong end of the brain. How much depends on the data and the FOV margin "
-        "-- try a few values. Only the estimate and blipflip's own _unwarped images see the "
-        "wrap; applying the saved warp with ffs_nwarp does not.",
+        default="0",
+        metavar="N | S1,S2",
+        help="Handle tissue that distortion pushed past the phase-encode edge of the FOV, "
+        "where it aliases in at the other end. Without this the solver matches that wrapped "
+        "signal where it landed and pulls the wrong end of the brain.\n"
+        "  N (one unsigned number): pad every scan by N voxels at both PE ends with slices "
+        "wrapped from the opposite end.\n"
+        "  S1,S2 (one signed number per scan, blip_up first; also '-5 +5'): say where each "
+        "scan's wrap belongs. -K moves that scan's first K slices (low index end) to beyond "
+        "its last; +K moves its last K slices to before its first; 0 leaves it. All scans "
+        "are then zero-padded onto one grid. E.g. -5,0 when only blip_up wrapped.\n"
+        "The amount is data-dependent -- try a few, the run prints which anatomical ends "
+        "each move goes between. The estimate is cropped back to the input grid; applying "
+        "the saved warp with ffs_nwarp does not wrap.",
+    )
+
+    sched.add_argument(
+        "-save_pad_phase",
+        action="store_true",
+        help="Write {prefix}_padphase: the inputs after -pad_phase_wrap, one volume per "
+        "scan, on the padded grid the field is estimated on (header origin moved so it "
+        "overlays the inputs). Check that each wrapped slab landed where it belongs.",
     )
 
     mot = parser.add_argument_group("Movement (topup --estmov analogue)")
@@ -388,6 +401,8 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     outs = [f"{pinfo.stem}_warp{pinfo.nifti_ext}"]
     if not args.no_unwarped:
         outs.append(f"{pinfo.stem}_unwarped{pinfo.nifti_ext}")
+    if getattr(args, "save_pad_phase", False):
+        outs.append(f"{pinfo.stem}_padphase{pinfo.nifti_ext}")
     movie = resolve_movie_path(args)
     if movie is not None:
         outs.append(movie)
@@ -401,7 +416,66 @@ def _validate_batch_run(run_args: argparse.Namespace) -> None:
         raise ValueError("run is missing " + ", ".join("-" + m for m in missing))
 
 
+_SIGNED_LIST = re.compile(r"^[+-]?\d+(,[+-]?\d+)*,?$")
+
+
+def _join_signed_values(argv: list[str]) -> list[str]:
+    """Fold the values after -pad_phase_wrap into one ``flag=value`` token.
+
+    argparse reads ``-5,+5`` as an unknown flag, and ``-5 +5`` as two positionals, so
+    the signed per-scan form would never reach the option otherwise.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok.lstrip("-").replace("-", "_") == "pad_phase_wrap":
+            vals = []
+            while i + 1 < len(argv) and _SIGNED_LIST.match(argv[i + 1]):
+                i += 1
+                vals.append(argv[i].strip(","))
+            out.append(f"{tok}={','.join(vals)}" if vals else tok)
+        else:
+            out.append(tok)
+        i += 1
+    return out
+
+
+def _parse_phase_wrap(spec: str, n_scans: int) -> tuple[int, list[int] | None]:
+    """``-pad_phase_wrap`` -> (symmetric wrap padding, per-scan unwrap shifts or None)."""
+    tokens = [t for t in spec.replace(",", " ").split() if t]
+    if len(tokens) == 1 and tokens[0][0] not in "+-":
+        n = int(tokens[0])
+        if n < 0:
+            raise SystemExit("ffs_blipflip: -pad_phase_wrap N must be >= 0")
+        return n, None
+    if len(tokens) != n_scans:
+        raise SystemExit(
+            f"ffs_blipflip: -pad_phase_wrap needs one unsigned number, or one signed shift per "
+            f"scan ({n_scans}); got {spec!r}"
+        )
+    return 0, [int(t) for t in tokens]
+
+
+def _pe_ends(affine: np.ndarray, nifti_axis: int) -> tuple[str, str]:
+    """Anatomical names of the (low-index, high-index) ends of a voxel axis."""
+    col = np.asarray(affine)[:3, nifti_axis]
+    world = int(np.argmax(np.abs(col)))
+    towards = "RAS"[world] if col[world] > 0 else "LPI"[world]
+    away = {"R": "L", "L": "R", "A": "P", "P": "A", "S": "I", "I": "S"}[towards]
+    names = {
+        "R": "right",
+        "L": "left",
+        "A": "anterior",
+        "P": "posterior",
+        "S": "superior",
+        "I": "inferior",
+    }
+    return names[away], names[towards]
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = _join_signed_values(list(sys.argv[1:] if argv is None else argv))
     args = create_parser().parse_args(argv)
 
     if args.batch is not None or args.batch_run:
@@ -411,7 +485,9 @@ def main(argv: list[str] | None = None) -> int:
             tool="ffs_blipflip",
             jobs=collect_batch_jobs(args.batch, args.batch_run),
             device=_resolve_device(args.device),
-            parse_line=lambda line, base: create_parser().parse_args(shlex.split(line), base),
+            parse_line=lambda line, base: create_parser().parse_args(
+                _join_signed_values(shlex.split(line)), base
+            ),
             defaults=args,
             dispatch=_dispatch_raising,
             validate=_validate_batch_run,
@@ -543,13 +619,40 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             else [f"blip_up ({pe_dirs[0]})", f"blip_down ({pe_dirs[1]})"]
         ),
     )
+    wrap_pad, unwrap = _parse_phase_wrap(args.pad_phase_wrap, len(scans))
+    if args.verb >= 1 and unwrap is not None:
+        for i, (k, sc) in enumerate(zip(unwrap, scans, strict=True)):
+            if k == 0:
+                continue
+            low, high = _pe_ends(affine, sc.pe_axis)
+            src, dst = (low, high) if k < 0 else (high, low)
+            print(
+                f"  unwrap scan {i + 1} ({pe_dirs[i]}): {abs(k)} slices at the {src} end -> beyond the {dst} end"
+            )
+    elif args.verb >= 1 and wrap_pad:
+        print(f"  wrap padding: {wrap_pad} voxels at both phase-encode ends")
+    if args.save_pad_phase:
+        padded, pad_tdims, front = T.pad_scans_pe(scans, wrap_pad, unwrap)
+        pad_affine = np.array(affine, dtype=float, copy=True)
+        for d in pad_tdims:
+            # Voxel index grew by `front` on this axis; move the origin back by as much.
+            axis = {2: 0, 1: 1, 0: 2}[d]
+            pad_affine[:3, 3] -= front * pad_affine[:3, axis]
+        pad_path = f"{stem}_padphase{ext}"
+        _save_zyx(pad_path, torch.stack(padded, dim=-1), pad_affine)
+        if args.verb >= 1:
+            print(
+                f"  wrote {pad_path}  (inputs as estimated: {tuple(padded[0].shape[::-1])}, one volume per scan)"
+            )
+
     solve_dtype = torch.float64 if args.precision == "float64" else torch.float32
     result = T.run_topup(
         scans,
         vox,
         cfg,
         pe_shift=args.pe_shift,
-        wrap_pad=args.pad_phase_wrap,
+        wrap_pad=wrap_pad,
+        unwrap=unwrap,
         progress=args.verb >= 1,
         solve_dtype=solve_dtype,
         mask_field=not args.no_mask_field,

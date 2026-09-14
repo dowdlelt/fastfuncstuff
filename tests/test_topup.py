@@ -462,3 +462,64 @@ def test_wrap_padding_reconciles_blips_at_the_pe_edges():
 
     # Measured 4.41 -> 2.56.
     assert edge_disagreement(4) < 0.75 * edge_disagreement(0)
+
+
+def test_unwrap_pe_moves_the_slab_and_zero_fills():
+    v = torch.arange(1, 7, dtype=torch.float32).reshape(1, 6, 1)  # y = 1..6
+    up = T.unwrap_pe(v, 1, -2, front=1, back=2)[0, :, 0].tolist()
+    assert up == [0, 0, 0, 3, 4, 5, 6, 1, 2]  # first 2 moved past the end, zeros behind
+    down = T.unwrap_pe(v, 1, +1, front=1, back=2)[0, :, 0].tolist()
+    assert down == [6, 1, 2, 3, 4, 5, 0, 0, 0]  # last 1 moved before the start
+    still = T.unwrap_pe(v, 1, 0, front=1, back=2)[0, :, 0].tolist()
+    assert still == [0, 1, 2, 3, 4, 5, 6, 0, 0]
+
+
+def test_unwrap_recovers_the_field_where_only_one_blip_aliased():
+    """Only blip_up's edge tissue left the FOV; saying so should beat guessing symmetric."""
+    nz, big, nx, ro, lo = 16, 40, 28, 0.5, 4
+    n = big - 2 * lo
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(big).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    true = 5.0 * ((yy > lo) & (yy < big - lo - 1)).float()
+    for cy, a in [(lo + 2.5, 120.0), (20, 60.0), (big - lo - 4, 80.0)]:
+        true = true + a * torch.exp(
+            -(((zz - 8) / 5) ** 2 + ((yy - cy) / 2.5) ** 2 + ((xx - 14) / 6) ** 2)
+        )
+    field = -8.0 * torch.exp(-(((yy - lo - 3) / 5) ** 2)) * torch.exp(-(((xx - 14) / 10) ** 2))
+
+    def acquire(sign):
+        disp = field * ro * sign
+        return T._resample_pe(true, -disp, 1) / T._jacobian_pe(disp, 1).clamp(min=0.1)
+
+    def fov(v):  # crop to the FOV; what fell outside aliases in at the other end
+        out = v[:, lo : lo + n].clone()
+        out[:, -lo:] += v[:, :lo]
+        out[:, :lo] += v[:, lo + n :]
+        return out
+
+    def cfg():
+        return T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
+        )
+
+    up, down = acquire(+1.0), acquire(-1.0)
+    ref = T.run_topup(
+        [T.ScanSpec(up, 1, 1.0, ro), T.ScanSpec(down, 1, -1.0, ro)],
+        (3, 2.5, 2.5),
+        cfg(),
+        progress=False,
+    )
+    scans = [T.ScanSpec(fov(up), 1, 1.0, ro), T.ScanSpec(fov(down), 1, -1.0, ro)]
+    band = torch.zeros(nz, n, nx, dtype=torch.bool)
+    band[3:-3, :8, 4:-4] = True
+
+    def err(**kw):
+        r = T.run_topup(scans, (3, 2.5, 2.5), cfg(), progress=False, **kw)
+        assert r.field_hz.shape == (nz, n, nx)
+        return (r.field_hz - ref.field_hz[:, lo : lo + n])[band].abs().mean().item()
+
+    none, right, wrong = err(), err(unwrap=[4, 0]), err(unwrap=[-4, 0])
+    # Measured 0.60 / 0.26 / 5.16 Hz against an 8 Hz peak.
+    assert right < 0.6 * none
+    assert wrong > 3 * none

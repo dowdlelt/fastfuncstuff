@@ -154,6 +154,7 @@ class WarpMovieRecorder:
         self._denom = torch.tensor(
             [max(nz - 1, 1), max(ny - 1, 1), max(nx - 1, 1)], device=self.device
         ).float()
+        self._image_offset = torch.zeros(3, device=self.device)
         self._reference = None
         if reference is not None:
             if tuple(reference.shape) != planes.grid_shape:
@@ -173,15 +174,24 @@ class WarpMovieRecorder:
         """Declare how subsequent captures' fields map onto the planes' grid."""
         self.frame = frame
 
-    def set_images(self, images: Sequence[Tensor]) -> None:
-        """Replace the rows' images -- for a tool that rescales, shifts or motion-corrects
-        its working copies after the recorder was built. Same count, same grid."""
+    def set_images(
+        self, images: Sequence[Tensor], offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    ) -> None:
+        """Replace the rows' images -- for a tool that rescales, shifts, pads or
+        motion-corrects its working copies after the recorder was built.
+
+        ``offset`` is the (z, y, x) index in the new images of the planes grid's voxel 0,
+        so a padded working copy can be shown with its padding reachable: tissue a warp
+        pulls in from beyond the original grid then appears instead of black.
+        """
         if len(images) != self.n_rows:
             raise ValueError(f"need {self.n_rows} images, got {len(images)}")
-        for img in images:
-            if tuple(img.shape) != self.planes.grid_shape:
-                raise ValueError("replacement images must be on the planes' grid")
+        shape = tuple(images[0].shape)
+        if any(tuple(img.shape) != shape for img in images):
+            raise ValueError("replacement images must share one grid")
         self._moving = [img.detach().float().to(self.device)[None, None] for img in images]
+        self._image_offset = torch.tensor(offset, device=self.device).float()
+        self._denom = torch.tensor([max(n - 1, 1) for n in shape], device=self.device).float()
 
     def set_context(self, text: str) -> None:
         """Text prepended to every later caption (a pyramid octave, a pass)."""
@@ -223,7 +233,7 @@ class WarpMovieRecorder:
         return x
 
     def _sample_moving(self, row: int, x: Tensor) -> Tensor:
-        grid = (2.0 * x / self._denom - 1.0).flip(-1)[None, None, None]
+        grid = (2.0 * (x + self._image_offset) / self._denom - 1.0).flip(-1)[None, None, None]
         return F.grid_sample(
             self._moving[row], grid, mode="bilinear", padding_mode="zeros", align_corners=True
         ).reshape(-1)
@@ -281,7 +291,7 @@ class WarpMovieRecorder:
     def capture_identity(self, label: str = "", pinned: bool = True) -> None:
         """Capture every row unwarped (a movie's starting frame)."""
         with torch.no_grad():
-            values = torch.stack([m.reshape(-1)[self._flat] for m in self._moving])
+            values = torch.stack([self._sample_moving(r, self._points) for r in range(self.n_rows)])
         text = f"{self.context}  {label}".strip() if self.context else label
         self._store(values, text, pinned)
 

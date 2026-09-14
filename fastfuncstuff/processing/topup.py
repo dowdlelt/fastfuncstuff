@@ -45,7 +45,7 @@ only motion modelled is an optional single global translation along PE
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
 from typing import TYPE_CHECKING
@@ -553,6 +553,69 @@ def wrap_pad_pe(vol: Tensor, tdims: list[int], n: int) -> Tensor:
             raise ValueError(f"wrap padding {n} must be smaller than the PE axis length {size}")
         vol = torch.cat((vol.narrow(d, size - n, n), vol, vol.narrow(d, 0, n)), dim=d)
     return vol.contiguous()
+
+
+def unwrap_pe(vol: Tensor, tdim: int, shift: int, front: int, back: int) -> Tensor:
+    """Move a scan's aliased edge slab to where it belongs, on a grid padded for all scans.
+
+    The output is ``front + n + back`` long on ``tdim``, the scan's original voxels at
+    ``front..front+n-1`` -- except the wrapped slab:
+
+    - ``shift < 0``: the first ``|shift|`` slices belong past the high-index edge; they
+      move to ``front+n..front+n+|shift|-1`` and their original place is zero.
+    - ``shift > 0``: the last ``shift`` slices belong before the low-index edge; they
+      move to ``front-shift..front-1`` and their original place is zero.
+
+    Everything else is zero, so scans with different (or no) shifts share one grid.
+    Unlike :func:`wrap_pad_pe` this states which scan wrapped and by how much, rather
+    than offering every scan the other end's slices.
+    """
+    n = vol.shape[tdim]
+    if abs(shift) >= n:
+        raise ValueError(f"unwrap shift {shift} must be smaller than the PE axis length {n}")
+    if shift > front or -shift > back:
+        raise ValueError("front/back padding must cover the shift")
+    v = vol.movedim(tdim, 0)
+    out = torch.zeros((front + n + back, *v.shape[1:]), dtype=vol.dtype, device=vol.device)
+    if shift < 0:
+        m = -shift
+        out[front + m : front + n] = v[m:]
+        out[front + n : front + n + m] = v[:m]
+    elif shift > 0:
+        out[front : front + n - shift] = v[: n - shift]
+        out[front - shift : front] = v[n - shift :]
+    else:
+        out[front : front + n] = v
+    return out.movedim(0, tdim).contiguous()
+
+
+def pad_scans_pe(
+    scans: Sequence[ScanSpec], wrap_pad: int = 0, unwrap: Sequence[int] | None = None
+) -> tuple[list[Tensor], list[int], int]:
+    """Apply ``wrap_pad`` or per-scan ``unwrap`` to every scan's data.
+
+    Returns ``(padded data per scan, padded tensor dims, voxels added before index 0)``.
+    The single definition of the padded grid: :func:`run_topup` estimates on it and
+    ``ffs_blipflip -save_pad_phase`` writes it, so the two cannot drift apart.
+    """
+    tdims = sorted({_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in scans})
+    if unwrap is not None:
+        if wrap_pad > 0:
+            raise ValueError("wrap_pad and unwrap are alternatives; pass one")
+        if len(unwrap) != len(scans):
+            raise ValueError(f"unwrap needs one shift per scan ({len(scans)}), got {len(unwrap)}")
+        if len(tdims) != 1:
+            raise ValueError("unwrap needs every scan to share one phase-encode axis")
+        front = max([0, *unwrap])
+        back = max([0, *(-k for k in unwrap)])
+        data = [
+            unwrap_pe(sc.data, tdims[0], k, front, back)
+            for sc, k in zip(scans, unwrap, strict=True)
+        ]
+        return data, tdims, front
+    if wrap_pad > 0:
+        return [wrap_pad_pe(sc.data, tdims, wrap_pad) for sc in scans], tdims, wrap_pad
+    return [sc.data for sc in scans], [], 0
 
 
 def compute_mask(scans: list[ScanSpec]) -> Tensor:
@@ -1361,6 +1424,7 @@ def run_topup(
     motion_interp: str = "cubic",
     recorder: WarpMovieRecorder | None = None,
     wrap_pad: int = 0,
+    unwrap: Sequence[int] | None = None,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1381,7 +1445,9 @@ def run_topup(
     ``wrap_pad`` pads every scan by that many voxels at both ends of each PE axis with
     slices wrapped from the opposite end (see :func:`wrap_pad_pe`), estimates on the
     padded grid, and crops ``field_hz``/``unwarped``/``mean_unwarped`` back. ``coeff``
-    and ``basis`` stay on the padded grid.
+    and ``basis`` stay on the padded grid. ``unwrap`` is the per-scan alternative: one
+    signed slice count per scan, telling each scan where its aliased edge belongs (see
+    :func:`unwrap_pe`); every scan shares one PE axis. The crop is the same.
 
     ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
     row per scan) captures every scan undistorted by the running field after each
@@ -1412,15 +1478,14 @@ def run_topup(
         )
 
     orig_shape = shape
-    pad_tdims = sorted({_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in work}) if wrap_pad > 0 else []
-    for sc in work:
-        sc.data = wrap_pad_pe(sc.data, pad_tdims, wrap_pad)
+    padded, pad_tdims, front = pad_scans_pe(work, wrap_pad, unwrap)
+    for sc, data in zip(work, padded, strict=True):
+        sc.data = data
     shape = tuple(work[0].data.shape)  # type: ignore[assignment]
     crop = tuple(
-        slice(wrap_pad, wrap_pad + n) if d in pad_tdims else slice(None)
-        for d, n in enumerate(orig_shape)
+        slice(front, front + n) if d in pad_tdims else slice(None) for d, n in enumerate(orig_shape)
     )
-    offset = tuple(float(wrap_pad) if d in pad_tdims else 0.0 for d in range(3))
+    offset = tuple(float(front) if d in pad_tdims else 0.0 for d in range(3))
 
     shift = 0.0
     if pe_shift:
@@ -1450,7 +1515,7 @@ def run_topup(
     if recorder is not None:
         from fastfuncstuff.viz.warp_movie import FieldFrame
 
-        recorder.set_images([sc.data[crop] for sc in work])
+        recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
         recorder.set_frame(FieldFrame(offset=offset, full_shape=shape, mapping="stride"))
         recorder.capture_identity(label="start")
 
@@ -1542,7 +1607,7 @@ def run_topup(
                 verbose=progress,
             )
             if recorder is not None:
-                recorder.set_images([sc.data[crop] for sc in work])
+                recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
     level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.

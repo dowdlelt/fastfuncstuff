@@ -373,3 +373,21 @@ def test_blipflip_rows_follow_opposite_blips():
             100.0 / float(scan.data.mean())
         )
         torch.testing.assert_close(row[inner], ref[inner], atol=0.05, rtol=1e-2)
+
+
+def test_padded_replacement_images_reach_their_padding():
+    """A padded working copy shows the same pixels, and the padding is reachable."""
+    shape = (8, 10, 12)
+    img = _texture(shape)
+    planes = build_slice_planes(shape, np.eye(4), "ax,sag")
+    rec = WarpMovieRecorder(img, planes, every=1, device=CPU)
+    padded = torch.nn.functional.pad(img, (0, 0, 3, 2, 0, 0), value=-7.0)  # y: 3 before, 2 after
+    rec.set_images([padded], offset=(0.0, 3.0, 0.0))
+    rec.capture_identity()
+    torch.testing.assert_close(
+        rec._frames[0].values[0].float(), img.reshape(-1)[planes.flat_indices()], atol=1e-3, rtol=0
+    )
+    yy_shift = (torch.zeros(shape), torch.full(shape, -3.0), torch.zeros(shape))
+    rec.capture_displacement(yy_shift)  # type: ignore[arg-type]
+    first_rows = torch.as_tensor(planes.points[:, 1] < 0.5)
+    assert torch.allclose(rec._frames[1].values[0].float()[first_rows], torch.tensor(-7.0))
