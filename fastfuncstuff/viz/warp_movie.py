@@ -33,7 +33,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .compose import compose_frame, edge_range, intensity_window
+from .compose import compose_frame, display_edges, edge_range, intensity_window, panel_sizes
 from .encode import movie_path, write_movie
 from .slices import SlicePlanes
 
@@ -56,8 +56,8 @@ class WarpMovieRecorder:
         every: Fixed capture cadence in :meth:`tick` calls. Mutually exclusive with
             ``max_frames``.
         max_frames: Frame budget for unpinned frames (see module docstring).
-        edges: Optional (nz, ny, nx) edge-strength map of the *base* to overlay on
-            every frame (:func:`fastfuncstuff.processing.edges.edge_map`).
+        reference: Optional (nz, ny, nx) fixed image (the base) on the same grid. Its
+            planes are kept so ``render(overlay="edges")`` can outline it.
         tool: Name shown at the start of every caption.
         device: Where sampling happens. Defaults to ``moving``'s device.
     """
@@ -69,7 +69,7 @@ class WarpMovieRecorder:
         *,
         every: int | None = None,
         max_frames: int | None = 150,
-        edges: Tensor | None = None,
+        reference: Tensor | None = None,
         tool: str = "",
         device: torch.device | None = None,
     ) -> None:
@@ -100,13 +100,12 @@ class WarpMovieRecorder:
         denom = torch.tensor([max(nz - 1, 1), max(ny - 1, 1), max(nx - 1, 1)], device=self.device)
         self._denom = denom.float()
         self._plane_grid = self._normalize(self._points)
-        self._edges = None
-        if edges is not None:
-            if tuple(edges.shape) != planes.grid_shape:
-                raise ValueError("edges must be on the planes' grid")
-            self._edges = (
-                edges.detach().float().reshape(-1).to(self.device)[self._flat].cpu().numpy()
-            )
+        self._reference = None
+        if reference is not None:
+            if tuple(reference.shape) != planes.grid_shape:
+                raise ValueError("reference must be on the planes' grid")
+            flat = self._flat.to(reference.device)
+            self._reference = reference.detach().float().reshape(-1)[flat].cpu().numpy()
 
     # -- capture -------------------------------------------------------------------
 
@@ -218,24 +217,29 @@ class WarpMovieRecorder:
             fmt: ``mp4`` or ``gif``.
             hold: Seconds each pinned frame (a level's result) stays on screen; the
                 final frame is held at least a second.
-            overlay: ``none`` or ``edges`` (needs ``edges`` at construction).
+            overlay: ``none`` or ``edges`` -- thin edges of ``reference``, found in each
+                displayed plane at display resolution (see :func:`.compose.display_edges`).
             edge_opacity: 0..1 blend of the edge colour.
         """
         if not self._frames:
             return None
         if overlay not in ("none", "edges"):
             raise ValueError(f"unknown overlay {overlay!r}")
-        if overlay == "edges" and self._edges is None:
-            raise ValueError("overlay='edges' needs an edge map passed to the recorder")
+        if overlay == "edges" and self._reference is None:
+            raise ValueError("overlay='edges' needs a reference image passed to the recorder")
 
         values = torch.stack([f.values for f in self._frames]).float().cpu().numpy()
         views = self.planes.views
         window = intensity_window(values[0])
         edge_panels: Sequence[np.ndarray] | None = None
         edge_vmax = 1.0
-        if overlay == "edges" and self._edges is not None:
-            edge_panels = self.planes.split(self._edges)
-            edge_vmax = edge_range(self._edges)
+        if overlay == "edges" and self._reference is not None:
+            sizes = panel_sizes(views, size)
+            edge_panels = [
+                display_edges(plane, hw)
+                for plane, hw in zip(self.planes.split(self._reference), sizes, strict=True)
+            ]
+            edge_vmax = edge_range(np.concatenate([e.ravel() for e in edge_panels]))
 
         n = len(self._frames)
         hold_n = max(1, int(round(hold * fps)))

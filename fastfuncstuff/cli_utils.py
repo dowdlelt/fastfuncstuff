@@ -4547,7 +4547,7 @@ def build_warp_movie_recorder(
 
     ``base`` and ``source`` must share one (nz, ny, nx) grid whose header affine is
     ``affine``; the base only sets the cut positions and, for ``-movie_overlay
-    edges``, supplies the edges.
+    edges``, supplies the outlines.
     """
     if getattr(args, "movie", None) is None:
         return None
@@ -4561,22 +4561,12 @@ def build_warp_movie_recorder(
         center = center_of_mass_ras(weight.detach().cpu().numpy(), affine)
     planes = build_slice_planes(grid, affine, args.movie_views, center)  # type: ignore[arg-type]
 
-    edges = None
-    if args.movie_overlay == "edges":
-        from fastfuncstuff.processing.edges import edge_map
-
-        zooms = np.linalg.norm(np.asarray(affine)[:3, :3], axis=0)
-        edges = edge_map(
-            base.to(device),
-            spacing=(float(zooms[2]), float(zooms[1]), float(zooms[0])),
-            mask=None if mask is None else mask.to(device),
-        )
     return WarpMovieRecorder(
         source,
         planes,
         every=args.movie_every,
         max_frames=None if args.movie_every is not None else args.movie_frames,
-        edges=edges,
+        reference=base if args.movie_overlay == "edges" else None,
         tool=tool,
         device=device,
     )

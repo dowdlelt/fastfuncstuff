@@ -124,15 +124,32 @@ def test_render_writes_a_gif_with_edges(tmp_path):
     shape = (12, 14, 16)
     moving = _texture(shape)
     planes = build_slice_planes(shape, np.eye(4), "ax,sag,cor")
-    edges = torch.zeros(shape)
-    edges[:, 7, :] = 1.0
-    rec = WarpMovieRecorder(moving, planes, every=1, edges=edges, tool="test", device=CPU)
+    rec = WarpMovieRecorder(moving, planes, every=1, reference=moving, tool="test", device=CPU)
     zero = tuple(torch.zeros(shape) for _ in range(3))
     rec.capture_displacement(zero, label="L1 it 0")  # type: ignore[arg-type]
     rec.capture_displacement(zero, label="L1 best", pinned=True)  # type: ignore[arg-type]
     out = rec.render(str(tmp_path / "m"), fps=4, size=64, fmt="gif", overlay="edges")
     assert out is not None and out.endswith(".gif")
     assert (tmp_path / "m.gif").stat().st_size > 0
+
+
+def test_display_edges_do_not_fill_a_cut_along_a_surface():
+    """A slice lying along a boundary must not draw a filled patch.
+
+    On the MNI template the mid-sagittal cut runs along the medial surface, and a 3-D
+    edge map sliced there showed a solid occipital blob. The minimal version: a
+    smooth step across z, cut exactly at the step.
+    """
+    from fastfuncstuff.processing.edges import edge_map
+    from fastfuncstuff.viz.compose import display_edges
+
+    n = 24
+    z = torch.arange(n).float()[:, None, None].expand(n, n, n)
+    step = torch.sigmoid(z - n // 2) * 100.0
+    cut = n // 2
+
+    assert (edge_map(step)[cut] > 0).float().mean() > 0.9  # the artifact
+    assert (display_edges(step[cut].numpy(), (n * 3, n * 3)) > 0).mean() < 0.01
 
 
 def test_edge_overlay_is_drawn_in_colour():

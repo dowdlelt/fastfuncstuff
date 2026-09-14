@@ -63,6 +63,36 @@ def colorize_edges(strength: np.ndarray, vmax: float) -> tuple[np.ndarray, np.nd
     return rgb, strength > 0
 
 
+def display_edges(
+    plane: np.ndarray, size: tuple[int, int], sigma: float = 1.0, threshold: float = 0.1
+) -> np.ndarray:
+    """Thin edges of one displayed plane, found at its display resolution.
+
+    Edges are computed in 2-D on the plane *after* upscaling to ``size``, for two
+    reasons. A 3-D edge map cut by a slice shows filled patches wherever a surface
+    runs parallel to the cut. And edges found on the native grid and then enlarged
+    are as thick as the enlargement -- a 2 mm grid shown at 2.7x draws 5-pixel lines
+    that bury the anatomy the overlay is meant to be judged against.
+
+    Args:
+        plane: (rows, cols) reference image on the native grid.
+        size: (h, w) display pixels (from :func:`panel_sizes`).
+        sigma: Smoothing in *native* voxels, so the edges found do not depend on the
+            display size.
+        threshold: As in :func:`fastfuncstuff.processing.edges.edge_map`.
+    """
+    import torch
+
+    from fastfuncstuff.processing.edges import _median_cross, edge_map
+
+    native = torch.as_tensor(np.nan_to_num(plane), dtype=torch.float32)
+    if min(native.shape) >= 3:
+        native = _median_cross(native)
+    big = torch.tensor(_resize(native.numpy(), size, True), dtype=torch.float32)
+    mag = min(size[0] / plane.shape[0], size[1] / plane.shape[1])
+    return edge_map(big, sigma=sigma * mag, median=False, threshold=threshold).numpy()
+
+
 def panel_sizes(views: Sequence[PlaneView], height: int) -> list[tuple[int, int]]:
     """(h, w) pixels per panel, one mm-per-pixel scale shared by every panel.
 
@@ -119,7 +149,8 @@ def compose_frame(
         height: Pixel height of the physically tallest panel.
         window: (lo, hi) greyscale display range, fixed for the whole movie so
             brightness does not flicker between frames.
-        edges: Optional per-view (rows, cols) edge strength to overlay.
+        edges: Optional per-view edge strength to overlay, at panel resolution
+            (:func:`display_edges`) or at plane resolution (upscaled nearest).
         edge_vmax: Strength at which edge colour saturates (see :func:`edge_range`).
         edge_opacity: 0..1 blend of the edge colour over the greyscale.
         label: Caption text.
@@ -135,7 +166,7 @@ def compose_frame(
         rgb = np.repeat(_resize((grey * 255).astype(np.uint8), (h, w), True)[..., None], 3, -1)
         rgb = rgb.astype(np.float32) / 255.0
         if edges is not None:
-            # Nearest-neighbour: blurring a one-voxel ridge smears it back into a band.
+            # Nearest-neighbour: blurring a one-pixel ridge smears it back into a band.
             colour, on = colorize_edges(_resize(edges[i], (h, w), False), edge_vmax)
             rgb[on] = rgb[on] * (1 - edge_opacity) + colour[on] * edge_opacity
         rendered.append((rgb * 255).astype(np.uint8))
