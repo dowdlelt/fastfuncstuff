@@ -13,7 +13,7 @@ the actions someone remembered to instrument.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -57,6 +57,9 @@ class WindowManager(QtCore.QObject):
         self._dispatch = dispatch
         self._parent = parent
         self.windows: dict[str, Companion] = {}
+        #: The controller letter every window title starts with, so B's axial
+        #: and A's axial can be told apart on a crowded screen.
+        self.label = ""
         #: Set while the manager is placing windows, so the geometry it writes
         #: back does not read as the user having dragged them.
         self._placing = False
@@ -79,6 +82,8 @@ class WindowManager(QtCore.QObject):
                     win.setGeometry(QtCore.QRect(*viewport.geometry))
                 win.show()
             win.apply(viewport)
+            if self.label:
+                win.setWindowTitle(f"[{self.label}] {viewport.title}")
 
     def _build(self, viewport: Viewport) -> Companion:
         if viewport.is_image:
@@ -192,7 +197,15 @@ class WindowManager(QtCore.QObject):
             win.raise_()
 
     # -- arrangement -----------------------------------------------------
-    def tile(self, anchor: QtWidgets.QWidget | None = None) -> None:
+    def _placeable(self, peers: Sequence[WindowManager]) -> list[tuple[WindowManager, Companion]]:
+        """Visible windows of this manager and its peers, grouped by manager."""
+        return [
+            (mgr, win) for mgr in (self, *peers) for win in mgr.windows.values() if win.isVisible()
+        ]
+
+    def tile(
+        self, anchor: QtWidgets.QWidget | None = None, peers: Sequence[WindowManager] = ()
+    ) -> None:
         """Lay every window out on a grid over the free part of the screen.
 
         The arrangement is computed here and written back as one
@@ -201,7 +214,7 @@ class WindowManager(QtCore.QObject):
         actually had, on a screen that may be a different size, instead of
         re-running a tiling algorithm against different inputs.
         """
-        windows = [w for w in self.windows.values() if w.isVisible()]
+        windows = self._placeable(peers)
         if not windows:
             return
         area = self._work_area(anchor)
@@ -211,18 +224,20 @@ class WindowManager(QtCore.QObject):
         ch = (area.height() - TILE_GAP * (rows + 1)) // rows
         self._placing = True
         try:
-            for i, win in enumerate(windows):
+            for i, (mgr, win) in enumerate(windows):
                 r, c = divmod(i, cols)
                 x = area.x() + TILE_GAP + c * (cw + TILE_GAP)
                 y = area.y() + TILE_GAP + r * (ch + TILE_GAP)
                 win.setGeometry(x, y, cw, ch)
-                self._dispatch(SetViewGeometry(win.vid, x, y, cw, ch))
+                mgr.record_geometry(win.vid, x, y, cw, ch)
         finally:
             self._placing = False
 
-    def cascade(self, anchor: QtWidgets.QWidget | None = None) -> None:
+    def cascade(
+        self, anchor: QtWidgets.QWidget | None = None, peers: Sequence[WindowManager] = ()
+    ) -> None:
         """Stagger the windows so every title bar is reachable."""
-        windows = [w for w in self.windows.values() if w.isVisible()]
+        windows = self._placeable(peers)
         if not windows:
             return
         area = self._work_area(anchor)
@@ -231,13 +246,23 @@ class WindowManager(QtCore.QObject):
         h = min(area.height() - step * len(windows), max(420, area.height() // 2))
         self._placing = True
         try:
-            for i, win in enumerate(windows):
+            for i, (mgr, win) in enumerate(windows):
                 x, y = area.x() + TILE_GAP + i * step, area.y() + TILE_GAP + i * step
                 win.setGeometry(x, y, w, h)
-                self._dispatch(SetViewGeometry(win.vid, x, y, w, h))
+                mgr.record_geometry(win.vid, x, y, w, h)
                 win.raise_()
         finally:
             self._placing = False
+
+    def record_geometry(self, vid: str, x: int, y: int, w: int, h: int) -> None:
+        """Write a placement into this manager's own session.
+
+        Straight to the session rather than through the dispatch callback: the
+        window has already been moved, so there is nothing to redraw, and a
+        controller's dispatch also makes that controller active -- tiling A and
+        B together must not flip the panel between them once per window.
+        """
+        self.session.do(SetViewGeometry(vid, x, y, w, h))
 
     def _work_area(self, anchor: QtWidgets.QWidget | None) -> QtCore.QRect:
         """The screen, minus whatever the controller window is occupying.

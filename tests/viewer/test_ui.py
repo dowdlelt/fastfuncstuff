@@ -1714,3 +1714,100 @@ def test_changing_the_cluster_minimum_recomputes_the_table(win4d, qapp, tmp_path
     window.min_spin.setValue(10)
     qapp.processEvents()
     assert window.table.rowCount() == 1
+
+
+# ---------------------------------------------------------------------------
+# controllers: A, B, ... as tabs
+# ---------------------------------------------------------------------------
+
+
+def _second_controller(win, qapp, datadir, *, underlay="stats.nii.gz"):
+    """Open controller B and give it an underlay of its own."""
+    ctl = win.new_controller()
+    win.refresh(win.session.do(SetUnderlay(str(datadir / underlay))))
+    qapp.processEvents()
+    return ctl
+
+
+def test_a_second_controller_is_a_tab_with_its_own_stack(win, qapp, datadir):
+    a = win.active
+    b = _second_controller(win, qapp, datadir)
+    assert [c.letter for c in win.controllers] == ["A", "B"]
+    assert win.tabs.count() == 2 and win.active is b
+    assert win.session is b.session and win.session is not a.session
+    assert len(b.session.state.layers) == 1 and len(a.session.state.layers) == 2
+    # The panel is a view of the active tab, so it lists B's stack.
+    assert win.layer_list.count() == 1
+
+    win.activate(a)
+    qapp.processEvents()
+    assert win.layer_list.count() == 2
+    assert win.tabs.currentIndex() == 0
+
+
+def test_every_window_title_says_which_controller_it_belongs_to(win, qapp, datadir):
+    _second_controller(win, qapp, datadir)
+    for ctl in win.controllers:
+        titles = [w.windowTitle() for w in ctl.manager.windows.values()]
+        assert titles and all(t.startswith(f"[{ctl.letter}]") for t in titles)
+
+
+def test_controllers_share_the_crosshair_in_millimetres(win, qapp, datadir):
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    a = win.active
+    b = _second_controller(win, qapp, datadir)
+    win.activate(a)
+    win._dispatch(SetIJK(2, 3, 4))
+    qapp.processEvents()
+    assert b.session.state.crosshair_mm == pytest.approx(a.session.state.crosshair_mm)
+    assert b.session.state.crosshair == (2, 3, 4)
+
+
+def test_a_click_in_b_s_window_moves_b_and_makes_b_active(win, qapp, datadir):
+    """Each controller's windows dispatch into their own session. Routing
+    through 'whichever tab is showing' would move A when B's image was clicked."""
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    a = win.active
+    b = _second_controller(win, qapp, datadir)
+    win.activate(a)
+    b_image = next(iter(b.manager.windows.values()))
+    b_image._dispatch(SetIJK(5, 6, 1))
+    qapp.processEvents()
+    assert win.active is b
+    assert b.session.state.crosshair == (5, 6, 1)
+    assert a.session.state.crosshair == (5, 6, 1)  # followed, being linked
+
+
+def test_unlinked_controllers_keep_their_own_place(win, qapp, datadir):
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    a = win.active
+    b = _second_controller(win, qapp, datadir)
+    win.link_check.setChecked(False)
+    win.activate(a)
+    before = b.session.state.crosshair
+    win._dispatch(SetIJK(1, 1, 1))
+    qapp.processEvents()
+    assert b.session.state.crosshair == before
+
+
+def test_closing_a_controller_closes_its_windows_and_the_last_one_stays(win, qapp, datadir):
+    a = win.active
+    b = _second_controller(win, qapp, datadir)
+    b_windows = list(b.manager.windows.values())
+    assert win.close_controller(b)
+    qapp.processEvents()
+    assert win.controllers == [a] and win.active is a
+    assert all(not w.isVisible() for w in b_windows)
+    assert not win.close_controller(a)
+
+
+def test_tiling_places_every_controller_s_windows(win, qapp, datadir):
+    b = _second_controller(win, qapp, datadir)
+    win._tile()
+    qapp.processEvents()
+    for ctl in win.controllers:
+        assert all(v.geometry is not None for v in ctl.session.state.viewports)
+    assert win.active is b  # arranging windows is not choosing a controller

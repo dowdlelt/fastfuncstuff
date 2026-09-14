@@ -14,10 +14,20 @@ how the selected layer is coloured, and what the mode is doing.
 The other rule kept from the single-window layout: **the window contains no
 mode-specific code.** It asks the active mode what controls to show and renders
 whatever it declares.
+
+**Controllers.** AFNI's A, B, C: one controller per thing being compared -- two
+subjects, a subject and a template, raw and denoised -- each with its own
+directory, stack, mode and windows, and all of them following one crosshair.
+Here a controller is a tab. The panel widgets exist once and always show the
+active tab, so a tab is only a :class:`ViewerSession` plus the windows that
+draw it; nothing about the panel had to be taught that there is more than one.
+The crosshair is linked in millimetres, not voxels, because two subjects are
+two grids, and time is linked by index.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -72,6 +82,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewScaling,
     SetViewTraces,
     SetVolume,
+    SetXYZ,
 )
 
 #: Commands that change what a built window draws, as opposed to what is around
@@ -99,24 +110,34 @@ class _Bridge(QtCore.QObject):
     loaded = QtCore.Signal(str)
 
 
+#: Controller names, in the order they are handed out. Ten is past the point
+#: where tabs stop being a comparison and start being a filing system.
+LETTERS = "ABCDEFGHIJ"
+
+
+@dataclass(eq=False)
+class Controller:
+    """One tab: a session, and the windows that draw it."""
+
+    letter: str
+    session: ViewerSession
+    manager: WindowManager
+    bridge: _Bridge
+
+
 class ViewerWindow(QtWidgets.QMainWindow):
     def __init__(self, session: ViewerSession) -> None:
         super().__init__()
-        self.session = session
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
         self.resize(430, 820)
 
-        self._bridge = _Bridge()
-        self._bridge.loaded.connect(
-            self._on_layer_loaded, QtCore.Qt.ConnectionType.QueuedConnection
-        )
-        session.on_loaded(self._bridge.loaded.emit)
-
-        self.manager = WindowManager(session, self._dispatch, self)
-        self.manager.rebuild_requested.connect(self.rebuild_view)
-        self.manager.rois_requested.connect(self._clusters_to_rois)
-        self.manager.rows_selected.connect(self._carpet_rows_to_layer)
+        self.controllers: list[Controller] = []
+        #: Whether controllers follow each other's crosshair and time index.
+        #: On by default, as in AFNI: comparing two subjects at the same place
+        #: is the reason to open a second controller at all.
+        self.linked = True
+        self._active = self._add_controller(session)
 
         self._build_selector()
         self._build_panel()
@@ -129,16 +150,180 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.runner = PreparationRunner(self)
         self.runner.progress.connect(self._on_prepare_progress)
         self.runner.busy_changed.connect(self._on_prepare_busy)
-        session.defer_mode_preparation = True
-        session.mode.defer_preparation = True
 
         self._play = QtCore.QTimer(self)
         self._play.setInterval(60)
         self._play.timeout.connect(lambda: self._step_time(1))
 
-        session.default_layout()
+        self._sync_tabs()
         self._apply_theme()
         self.refresh(Aspect.ALL)
+
+    # ------------------------------------------------------------------
+    # controllers
+    # ------------------------------------------------------------------
+    @property
+    def session(self) -> ViewerSession:
+        """The active controller's session; what every panel widget acts on."""
+        return self._active.session
+
+    @property
+    def manager(self) -> WindowManager:
+        """The active controller's windows."""
+        return self._active.manager
+
+    @property
+    def active(self) -> Controller:
+        return self._active
+
+    def _add_controller(self, session: ViewerSession) -> Controller:
+        used = {c.letter for c in self.controllers}
+        letter = next((ch for ch in LETTERS if ch not in used), f"{len(self.controllers) + 1}")
+        bridge = _Bridge()
+        manager = WindowManager(session, lambda cmd: None, self)
+        ctl = Controller(letter=letter, session=session, manager=manager, bridge=bridge)
+        # Each controller's windows dispatch into their own session. Bound per
+        # controller rather than through ``self.session``, which is whichever
+        # tab is active -- a click in B's axial window while A's tab is showing
+        # would otherwise move A.
+        manager._dispatch = lambda cmd, c=ctl: self._dispatch_from(c, cmd)
+        manager.label = letter
+        manager.rebuild_requested.connect(lambda vid, c=ctl: self._on(c, self.rebuild_view, vid))
+        manager.rois_requested.connect(lambda vid, c=ctl: self._on(c, self._clusters_to_rois, vid))
+        manager.rows_selected.connect(
+            lambda vid, a, b, c=ctl: self._on(c, self._carpet_rows_to_layer, vid, a, b)
+        )
+        bridge.loaded.connect(
+            lambda key, c=ctl: self._on_layer_loaded(c, key),
+            QtCore.Qt.ConnectionType.QueuedConnection,
+        )
+        session.on_loaded(bridge.loaded.emit)
+        # Mode preparation runs on a worker; the mode is told to defer so a
+        # seed click never runs seconds of filtering inside the click handler.
+        session.defer_mode_preparation = True
+        session.mode.defer_preparation = True
+        session.default_layout()
+        self.controllers.append(ctl)
+        return ctl
+
+    def _on(self, ctl: Controller, slot, *args) -> None:
+        """Run a controller-level slot with that controller active."""
+        self.activate(ctl)
+        slot(*args)
+
+    def new_controller(self) -> Controller:
+        """Open another controller, linked, on the directory the active one reads.
+
+        Same directory because the usual next step is picking a different file
+        from it -- another subject, the template -- and READ is one click away
+        when it is not.
+        """
+        source = self._active.session
+        session = ViewerSession(device=source.store.device)
+        if source.state.theme != session.state.theme:
+            session.do(SetTheme(source.state.theme))
+        if source.catalog_dir is not None:
+            session.do(Read(str(source.catalog_dir)))
+        ctl = self._add_controller(session)
+        self.tabs.blockSignals(True)
+        self.tabs.addTab(ctl.letter)
+        self.tabs.blockSignals(False)
+        self._sync_tabs()
+        ctl.manager.sync()
+        ctl.manager.restyle()
+        self.activate(ctl)
+        # Carry the crosshair across on the way in, or the new windows open at
+        # their own grid's centre while every other controller is elsewhere.
+        if self.linked and source.state.crosshair_mm is not None:
+            self._follow(ctl, source.state.crosshair_mm, source.state.time_index)
+        self.refresh(Aspect.ALL)
+        self._tile()
+        return ctl
+
+    def close_controller(self, ctl: Controller) -> bool:
+        """Close one controller and its windows. The last one stays."""
+        if len(self.controllers) <= 1:
+            self.statusBar().showMessage("the last controller stays", 4000)
+            return False
+        if self.runner.busy:
+            self.statusBar().showMessage("wait for the running job before closing a tab", 5000)
+            return False
+        index = self.controllers.index(ctl)
+        ctl.manager.close_all()
+        ctl.session.close()
+        self.controllers.remove(ctl)
+        self.tabs.blockSignals(True)
+        self.tabs.removeTab(index)
+        self.tabs.blockSignals(False)
+        if ctl is self._active:
+            self._active = self.controllers[max(0, index - 1)]
+            self._show_active()
+        self._sync_tabs()
+        return True
+
+    def activate(self, ctl: Controller) -> None:
+        """Point the panel at one controller."""
+        if ctl is self._active:
+            return
+        self._active = ctl
+        self._show_active()
+
+    def _show_active(self) -> None:
+        ctl = self._active
+        self.tabs.blockSignals(True)
+        self.tabs.setCurrentIndex(self.controllers.index(ctl))
+        self.tabs.blockSignals(False)
+        self.setWindowTitle(f"nexus · {ctl.letter}")
+        self._sync_catalog()
+        self._sync_layer_list()
+        self._sync_mode_panel()
+        self._sync_readout()
+
+    def _sync_tabs(self) -> None:
+        many = len(self.controllers) > 1
+        self.tabs.setTabsClosable(many)
+        self.link_check.setVisible(many)
+
+    def _dispatch_from(self, ctl: Controller, cmd: Command) -> None:
+        """A companion window acted: that window's controller becomes active.
+
+        Touching a window is choosing what the controls are about, exactly as
+        clicking a tab is, so the panel follows the hand rather than staying on
+        a tab whose windows nobody is looking at.
+        """
+        self.activate(ctl)
+        self._dispatch(cmd)
+
+    def _follow(self, ctl: Controller, mm, time_index: int | None) -> None:
+        """Move one controller to a place and a volume, and redraw its windows."""
+        dirty = Aspect.NOTHING
+        if mm is not None:
+            dirty |= ctl.session.do(SetXYZ(*mm))
+        if time_index is not None:
+            dirty |= ctl.session.do(SetIndex(int(time_index)))
+        self._refresh_windows(ctl, dirty)
+
+    def _propagate(self, before_mm, before_time: int) -> None:
+        """Carry a crosshair or time change from the active controller to the rest."""
+        if not self.linked or len(self.controllers) < 2:
+            return
+        state = self.session.state
+        mm = state.crosshair_mm
+        moved = mm is not None and mm != before_mm
+        stepped = state.time_index != before_time
+        if not (moved or stepped):
+            return
+        for other in self.controllers:
+            if other is not self._active:
+                self._follow(other, mm if moved else None, state.time_index if stepped else None)
+
+    def _set_linked(self, on: bool) -> None:
+        self.linked = bool(on)
+        if self.linked:
+            state = self.session.state
+            for other in self.controllers:
+                if other is not self._active:
+                    self._follow(other, state.crosshair_mm, state.time_index)
 
     def _dispatch(self, cmd: Command) -> None:
         """The single entry point every widget and window mutates state through.
@@ -148,7 +333,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         switch is exactly the one whose filtering would freeze the GUI if it
         ran inline.
         """
+        before_mm, before_time = self.session.state.crosshair_mm, self.session.state.time_index
         self.refresh(self.session.do(cmd))
+        self._propagate(before_mm, before_time)
         if isinstance(cmd, SetSeed) and self.session.mode.needs_prepare:
             self._prepare_then_refresh()
         # A built window's own settings decide its picture, so changing one
@@ -164,8 +351,42 @@ class ViewerWindow(QtWidgets.QMainWindow):
     # the core: read / underlay / overlay / +1 / mode
     # ------------------------------------------------------------------
     def _build_selector(self) -> None:
+        tabs_bar = QtWidgets.QToolBar("controllers")
+        tabs_bar.setMovable(False)
+        self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, tabs_bar)
+        self.tabs = QtWidgets.QTabBar()
+        self.tabs.setExpanding(False)
+        self.tabs.setDrawBase(False)
+        self.tabs.setToolTip(
+            "Controllers. Each has its own directory, stack, mode and windows;\n"
+            "their windows are titled [A], [B]... and share one crosshair while linked."
+        )
+        for ctl in self.controllers:
+            self.tabs.addTab(ctl.letter)
+        self.tabs.currentChanged.connect(
+            lambda i: self.activate(self.controllers[i]) if 0 <= i < len(self.controllers) else None
+        )
+        self.tabs.tabCloseRequested.connect(
+            lambda i: (
+                self.close_controller(self.controllers[i])
+                if 0 <= i < len(self.controllers)
+                else None
+            )
+        )
+        tabs_bar.addWidget(self.tabs)
+        new_tab = QtWidgets.QPushButton(key_label("+", "^T"))
+        new_tab.setToolTip("Open another controller, linked to this one (ctrl+T)")
+        new_tab.clicked.connect(self.new_controller)
+        tabs_bar.addWidget(new_tab)
+        self.link_check = QtWidgets.QCheckBox("linked")
+        self.link_check.setChecked(True)
+        self.link_check.setToolTip("Controllers follow one crosshair (in mm) and one time index")
+        self.link_check.toggled.connect(self._set_linked)
+        tabs_bar.addWidget(self.link_check)
+
         bar = QtWidgets.QToolBar("selector")
         bar.setMovable(False)
+        self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, bar)
 
         self.read_button = QtWidgets.QPushButton(key_label("READ", "^O"))
@@ -380,7 +601,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(Aspect.VIEWPORTS)
         self.refresh_clusters(vid)
 
-    def refresh_clusters(self, vid: str | None = None) -> None:
+    def refresh_clusters(self, vid: str | None = None, ctl: Controller | None = None) -> None:
         """Recompute one cluster table, or every one, from the current threshold.
 
         On the GUI thread on purpose: connected components on a single volume
@@ -389,14 +610,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """
         from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 
+        ctl = ctl or self._active
         targets = (
-            self.manager.cluster_windows()
+            ctl.manager.cluster_windows()
             if vid is None
-            else [w for w in [self.manager.windows.get(vid)] if isinstance(w, ClusterWindow)]
+            else [w for w in [ctl.manager.windows.get(vid)] if isinstance(w, ClusterWindow)]
         )
         for window in targets:
             try:
-                source, table = self.session.clusterize(
+                source, table = ctl.session.clusterize(
                     None, nn=window.nn, min_voxels=window.min_voxels
                 )
             except (ValueError, KeyError, FileNotFoundError) as exc:
@@ -546,17 +768,27 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 return plane
         return Plane.AXIAL
 
+    def _peers(self) -> list[WindowManager]:
+        return [c.manager for c in self.controllers if c is not self._active]
+
     def _tile(self) -> None:
-        self.manager.tile(self)
+        """Tile every controller's windows together, so A and B sit side by side."""
+        self.manager.tile(self, peers=self._peers())
 
     def _cascade(self) -> None:
-        self.manager.cascade(self)
+        self.manager.cascade(self, peers=self._peers())
 
     def _raise_all(self) -> None:
-        self.manager.raise_all()
+        for ctl in self.controllers:
+            ctl.manager.raise_all()
 
     def _toggle_theme(self) -> None:
-        self._dispatch(SetTheme("light" if self.session.state.theme == "dark" else "dark"))
+        """One palette for the whole screen, recorded in every controller."""
+        name = "light" if self.session.state.theme == "dark" else "dark"
+        for other in self.controllers:
+            if other is not self._active:
+                other.session.do(SetTheme(name))
+        self._dispatch(SetTheme(name))
 
     def _apply_theme(self) -> None:
         """Push the palette into every window, including this one."""
@@ -565,7 +797,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.setStyleSheet(stylesheet())
         self.rangebar.restyle()
         self.theme_button.setText(key_label("LIGHT" if name == "dark" else "DARK", "d"))
-        self.manager.restyle()
+        for ctl in self.controllers:
+            ctl.manager.restyle()
 
     # ------------------------------------------------------------------
     # the panel: layers, layer controls, mode controls
@@ -591,25 +824,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.layer_list.model().rowsMoved.connect(self._rows_moved)
         v.addWidget(self.layer_list)
 
-        stack_row = QtWidgets.QHBoxLayout()
+        # Two rows of three: five buttons in one row is wider than the panel,
+        # and a panel wider than its window scrolls sideways.
+        stack_row = QtWidgets.QGridLayout()
         stack_row.setSpacing(4)
-        for text, key, tip, slot in (
-            ("LOWER", "{", "Move the selected layer down the stack", lambda: self._reorder(-1)),
-            ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
-            ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
-            ("DROP", "del", "Remove the selected layer", self._drop_layer),
+        for position, (text, key, tip, slot) in enumerate(
             (
-                "SAVE",
-                "\u21e7S",
-                "Write the selected layer to a NIfTI file",
-                self._save_layer_dialog,
-            ),
+                ("LOWER", "{", "Move the selected layer down the stack", lambda: self._reorder(-1)),
+                ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
+                ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
+                ("DROP", "del", "Remove the selected layer", self._drop_layer),
+                (
+                    "SAVE",
+                    "\u21e7S",
+                    "Write the selected layer to a NIfTI file",
+                    self._save_layer_dialog,
+                ),
+            )
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setToolTip(f"{tip} ({key})")
             b.setStyleSheet(f"QPushButton {{ font-size: {theme.FONT_SMALL}px; padding: 3px 6px; }}")
             b.clicked.connect(slot)
-            stack_row.addWidget(b)
+            stack_row.addWidget(b, *divmod(position, 3))
         v.addLayout(stack_row)
 
         self._build_derive(v)
@@ -836,6 +1073,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
             matrix=self.matrix_edit.text().strip(),
             polort=int(self.polort_spin.value()),
         )
+        # Held, not re-read: the tab may change while the worker runs, and the
+        # result belongs to the controller it was computed from.
+        ctl = self._active
+        session = ctl.session
 
         pending: dict[str, object] = {}
 
@@ -843,7 +1084,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # Only the arithmetic runs here. It reads arrays and builds one;
             # it does not touch the layer stack, because the worker thread has
             # no business mutating what the GUI thread is painting from.
-            values, detail = self.session.compute_denoise(
+            values, detail = session.compute_denoise(
                 cmd.key, matrix=cmd.matrix, polort=cmd.polort, progress=progress
             )
             pending["values"], pending["detail"] = values, detail
@@ -855,13 +1096,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 if error:
                     self.statusBar().showMessage(f"denoise failed: {error}", 10000)
                 return
-            dirty = self.session.install_derived(
+            dirty = session.install_derived(
                 cmd.key, pending["values"], op="denoise", detail=str(pending["detail"])
             )
             # Recorded rather than dispatched: the effect is already installed,
             # and dispatching would redo the projection to arrive where we are.
-            self.session.bus.record(cmd)
-            self.refresh(dirty)
+            session.bus.record(cmd)
+            if ctl is self._active:
+                self.refresh(dirty)
+            else:
+                self._refresh_windows(ctl, dirty)
             self.statusBar().showMessage(f"derived from {layer.name}", 5000)
 
         self.runner.finished.connect(done)
@@ -926,11 +1170,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     group="layer",
                     aliases=("Backspace",),
                 ),
+                Binding(
+                    "ctrl+t", "open another controller", self.new_controller, group="controllers"
+                ),
+                *[
+                    Binding(
+                        f"ctrl+{n}",
+                        f"controller {letter}",
+                        lambda letter=letter: self._activate_letter(letter),
+                        group="controllers",
+                    )
+                    for n, letter in enumerate(LETTERS[:5], start=1)
+                ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
                 Binding("h", "this list", self.help.toggle, group="session"),
             ]
         )
+
+    def _activate_letter(self, letter: str) -> None:
+        found = next((c for c in self.controllers if c.letter == letter), None)
+        if found is not None:
+            self.activate(found)
 
     def current_key(self) -> str | None:
         layer = self.session.state.selected_layer()
@@ -1134,19 +1395,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _prepare_then_refresh(self) -> None:
         """Run the mode's slow half on a worker, then install its overlay."""
+        ctl = self._active
+
+        def ready() -> None:
+            dirty = ctl.session.refresh_mode() | Aspect.LAYERS | Aspect.SLICES
+            if ctl is self._active:
+                self.refresh(dirty)
+            else:
+                self._refresh_windows(ctl, dirty)
+
         run_when_ready(
             self.runner,
-            self.session.mode,
-            on_ready=lambda: self.refresh(
-                self.session.refresh_mode() | Aspect.LAYERS | Aspect.SLICES
-            ),
+            ctl.session.mode,
+            on_ready=ready,
             on_error=lambda msg: self.statusBar().showMessage(f"mode failed: {msg}", 8000),
         )
 
-    def _on_layer_loaded(self, key: str) -> None:
-        self.session.invalidate(key)
-        self._sync_layer_list()
-        self.refresh(Aspect.SLICES | Aspect.GRAPH)
+    def _on_layer_loaded(self, ctl: Controller, key: str) -> None:
+        ctl.session.invalidate(key)
+        if ctl is self._active:
+            self._sync_layer_list()
+            self.refresh(Aspect.SLICES | Aspect.GRAPH)
+        else:
+            self._refresh_windows(ctl, Aspect.SLICES | Aspect.GRAPH)
 
     def refresh(self, dirty: Aspect) -> None:
         if dirty is Aspect.NOTHING:
@@ -1162,19 +1433,25 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # follow those aspects and not only LAYERS -- listening for the
             # wrong one is what left it showing the previous colour scale.
             self._sync_layer_controls()
+        self._refresh_windows(self._active, dirty)
+        self._sync_readout()
+
+    def _refresh_windows(self, ctl: Controller, dirty: Aspect) -> None:
+        """Bring one controller's windows up to date, active or not."""
+        if dirty is Aspect.NOTHING:
+            return
         # Windows first: a viewport that has just appeared has to exist before
         # anything tries to draw into it.
         if dirty & (Aspect.VIEWPORTS | Aspect.LAYERS | Aspect.GRID):
-            self.manager.sync()
+            ctl.manager.sync()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
-            self.manager.mark_built_stale()
+            ctl.manager.mark_built_stale()
         # The cluster table describes the picture, so it follows the threshold
         # rather than waiting to be asked. Anything cheaper than the redraw it
         # sits beside can afford to.
         if dirty & (Aspect.THRESHOLD | Aspect.LAYERS | Aspect.GRID):
-            self.refresh_clusters()
-        self.manager.redraw(dirty)
-        self._sync_readout()
+            self.refresh_clusters(ctl=ctl)
+        ctl.manager.redraw(dirty)
 
     def _sync_pickers(self) -> None:
         """Point each picker at the layer it currently governs.
@@ -1248,7 +1525,24 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _sync_layer_controls(self) -> None:
         key = self.current_key()
+        # Off rather than left showing the last layer: an empty controller's
+        # panel otherwise reads as holding the stack of the tab before it.
+        for widget in (
+            self.brick_box,
+            self.thrbrick_box,
+            self.cmap_box,
+            self.sign_box,
+            self.alpha_box,
+            self.rangebar,
+            self.opacity_slider,
+            self.boxed_check,
+        ):
+            widget.setEnabled(key is not None)
         if key is None:
+            for check in (self.roi_check, self.timelink_check):
+                check.setEnabled(False)
+            for widget in (self.matrix_edit, self.polort_spin, self.denoise_button):
+                widget.setEnabled(False)
             return
         layer = self.session.state.layers.get(key)
         for box, value in (
@@ -1328,11 +1622,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         st = self.session.state
         if st.grid is None:
             self.coord_label.setText("no data — press READ")
+            self.value_label.setText("")
+            self.mode_label.setText("")
             return
         i, j, k = st.crosshair
         mm = st.crosshair_mm or (0.0, 0.0, 0.0)
+        which = f"{self._active.letter}  " if len(self.controllers) > 1 else ""
         self.coord_label.setText(
-            f"ijk {i:>3d} {j:>3d} {k:>3d}   xyz {mm[0]:>7.1f} {mm[1]:>7.1f} {mm[2]:>7.1f}"
+            f"{which}ijk {i:>3d} {j:>3d} {k:>3d}   xyz {mm[0]:>7.1f} {mm[1]:>7.1f} {mm[2]:>7.1f}"
         )
         hi = st.max_time_index()
         self.time_spin.blockSignals(True)
@@ -1382,8 +1679,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # or they linger with nothing driving them.
         self._play.stop()
         self.runner.wait(2000)
-        self.manager.close_all()
-        self.session.close()
+        for ctl in self.controllers:
+            ctl.manager.close_all()
+            ctl.session.close()
         super().closeEvent(event)
 
 
@@ -1412,7 +1710,7 @@ def launch(
         win.refresh(session.run_script(Path(script).read_text()))
     win.dock_left()
     win.show()
-    win.manager.tile(win)
+    win._tile()
     return app.exec()
 
 
