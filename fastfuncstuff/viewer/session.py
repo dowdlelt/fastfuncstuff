@@ -448,6 +448,14 @@ class ViewerSession:
         self.mode.attach(self)
         return (Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH) | self.mode.refresh()
 
+    def mode_named(self, name: str) -> Mode | None:
+        """This session's instance of a mode it has been in, active or not.
+
+        How one mode reads another's state without the stack in between --
+        Denoise taking the components ICA's review labelled noise.
+        """
+        return self._modes.get(name)
+
     def refresh_mode(self) -> Aspect:
         """Recompute and install the active mode's overlay."""
         return self.mode.refresh()

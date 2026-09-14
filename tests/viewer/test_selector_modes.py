@@ -797,3 +797,65 @@ def test_coming_back_to_a_mode_resumes_where_it_was(ica_dir, session):
     assert session.mode.labels == {0: "noise"}
     assert session.mode.params["component"] == 1
     assert session.state.layers.find_by_source("mode:ica").name == "A_ICA IC 1"
+
+
+def _ica_matching_run(tmp_path, nt=40):
+    """A run and a decomposition of the same length, so ICA noise can apply."""
+    rng = np.random.default_rng(12)
+    out = tmp_path / "ica_out" / "melodic_compat"
+    out.mkdir(parents=True)
+    t = np.arange(nt)
+    mix = np.column_stack([np.sin(2 * np.pi * f * t) for f in (0.02, 0.05, 0.1, 0.2)])
+    np.savetxt(out / "melodic_mix", mix)
+    _write(out, "melodic_IC.nii.gz", rng.normal(size=(8, 9, 7, 4)))
+    run = rng.normal(size=(8, 9, 7, nt)) + 50 + 5 * mix[:, 3]
+    _write(tmp_path, "anat.nii.gz", rng.random((8, 9, 7)) * 100)
+    _write(tmp_path, "bold.nii.gz", run, tr=2.0)
+    return tmp_path, mix
+
+
+def test_denoise_regresses_what_ica_labelled_noise(tmp_path):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    d, mix = _ica_matching_run(tmp_path)
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(SetUnderlay(str(d / "anat.nii.gz")))
+        s.do(AddOverlay(str(d / "bold.nii.gz")))
+        s.store.ensure_ram(s.state.layers.keys[1])
+        s.do(SetMode("ica"))
+        s.set_mode_param("folder", str(d / "ica_out"))
+        s.set_mode_param("component", "3")
+        s.do(ModeAction("noise"))
+
+        s.do(SetMode("denoise"))
+        s.set_mode_param("polort", "-1")
+        s.set_mode_param("ica_noise", "1")
+        s.do(ModeAction("apply"))
+        assert "ICA noise 1/4 non-aggressive" in s.mode.status()
+        clean = s.store.get(s.state.layers.find_by_source("derived:denoise:O2").key).array
+        raw = s.store.get("O2").array
+        r_raw = np.corrcoef(raw[4, 4, 3], mix[:, 3])[0, 1]
+        r_clean = np.corrcoef(clean[4, 4, 3], mix[:, 3])[0, 1]
+        assert abs(r_raw) > 0.5 and abs(r_clean) < 0.05
+    finally:
+        s.close()
+
+
+def test_ica_noise_with_nothing_labelled_says_so_at_the_button(tmp_path):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    d, _mix = _ica_matching_run(tmp_path)
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(SetUnderlay(str(d / "anat.nii.gz")))
+        s.do(AddOverlay(str(d / "bold.nii.gz")))
+        s.store.ensure_ram(s.state.layers.keys[1])
+        s.do(SetMode("ica"))
+        s.set_mode_param("folder", str(d / "ica_out"))
+        s.do(SetMode("denoise"))
+        s.set_mode_param("ica_noise", "1")
+        with pytest.raises(ValueError, match="no component is labelled noise"):
+            s.do(ModeAction("apply"))
+    finally:
+        s.close()

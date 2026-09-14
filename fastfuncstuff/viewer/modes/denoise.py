@@ -24,6 +24,7 @@ from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
     ActionControl,
     BoolControl,
+    ChoiceControl,
     ComputedOverlay,
     Control,
     IntControl,
@@ -77,6 +78,20 @@ class DenoiseMode(Mode):
                 default=2,
                 help="Legendre drift columns added on top; -1 for none. Harmless "
                 "beside an xmat's own: duplicated directions collapse.",
+            ),
+            BoolControl(
+                name="ica_noise",
+                label="ICA noise",
+                default=False,
+                help="Also regress out the components this tab's ICA review labelled noise.",
+            ),
+            ChoiceControl(
+                name="ica_style",
+                label="ICA style",
+                choices=("non-aggressive", "aggressive"),
+                default="non-aggressive",
+                help="Non-aggressive (ICA-AROMA's default) fits every component and removes only "
+                "the noise ones' share; aggressive projects the noise time courses out entirely.",
             ),
             BoolControl(
                 name="keep_mean",
@@ -136,7 +151,11 @@ class DenoiseMode(Mode):
         if layer is None:
             self._message = "no run to denoise"
             return Aspect.NOTHING
+        ica = None
+        if self.params.get("ica_noise"):
+            ica = self._ica_columns(int(layer.n_volumes))
         self._job = {
+            "ica": ica,
             "key": layer.key,
             "name": layer.name,
             "data": self.session.store.ensure_ram(layer.key),
@@ -149,6 +168,31 @@ class DenoiseMode(Mode):
         self._message = f"denoising {layer.name}…"
         self.invalidate()
         return self.refresh()
+
+    def _ica_columns(self, n_time: int) -> tuple[np.ndarray, list[int], str]:
+        """This tab's ICA mixing matrix and its noise components, checked now.
+
+        Checked on the GUI thread at APPLY rather than discovered on the worker,
+        so "nothing is labelled noise" is a message at the button, not a failed
+        job in the status bar a second later.
+        """
+        assert self.session is not None
+        from fastfuncstuff.viewer.modes.ica import ICAMode
+
+        found = self.session.mode_named("ica")
+        mix = found.mixing_matrix() if isinstance(found, ICAMode) else None
+        noise = found.noise_components() if isinstance(found, ICAMode) else []
+        if mix is None:
+            raise ValueError(
+                "ICA noise is on, but this tab has no decomposition loaded in ICA mode"
+            )
+        if not noise:
+            raise ValueError("ICA noise is on, but no component is labelled noise yet")
+        if mix.shape[0] != n_time:
+            raise ValueError(
+                f"the decomposition has {mix.shape[0]} time points and the run has {n_time}"
+            )
+        return mix, noise, str(self.params.get("ica_style") or "non-aggressive")
 
     def _carpets(self) -> Aspect:
         from fastfuncstuff.viewer.state import Plane
@@ -177,16 +221,47 @@ class DenoiseMode(Mode):
             self._dirty = False
             return False
         data = job["data"]
-        nuisance = derive.read_nuisance(
-            job["matrix"] or None, n_time=int(data.shape[-1]), polort=job["polort"]
-        )
-        clean = derive.denoise(
-            data, nuisance, device=job["device"], keep_mean=job["keep_mean"], progress=progress
-        )
+        n_time = int(data.shape[-1])
+        nuisance = None
+        if job["matrix"] or job["polort"] >= 0 or job["ica"] is None:
+            nuisance = derive.read_nuisance(
+                job["matrix"] or None, n_time=n_time, polort=job["polort"]
+            )
+        if job["ica"] is None:
+            assert nuisance is not None
+            clean = derive.denoise(
+                data, nuisance, device=job["device"], keep_mean=job["keep_mean"], progress=progress
+            )
+            description = nuisance.description
+        else:
+            mix, noise, style = job["ica"]
+            is_noise = np.isin(np.arange(mix.shape[1]), noise)
+            # Aggressive: only the noise time courses enter the fit, so all of
+            # their variance goes. Non-aggressive: every component is fitted and
+            # the signal ones stay, taking their share of what they overlap.
+            ica_cols = mix if style == "non-aggressive" else mix[:, is_noise]
+            ica_remove = is_noise if style == "non-aggressive" else np.ones(len(noise), bool)
+            blocks = [ica_cols]
+            remove = [ica_remove]
+            if nuisance is not None:
+                blocks.insert(0, nuisance.columns)
+                remove.insert(0, np.ones(nuisance.n_columns, bool))
+            clean = derive.denoise_partial(
+                data,
+                np.concatenate(blocks, axis=1),
+                np.concatenate(remove),
+                device=job["device"],
+                keep_mean=job["keep_mean"],
+                progress=progress,
+            )
+            ica_text = f"ICA noise {len(noise)}/{mix.shape[1]} {style}"
+            description = (
+                f"{nuisance.description} + {ica_text}" if nuisance is not None else ica_text
+            )
         if progress is not None:
             progress(1.0, "variance removed")
         removed = derive.variance_removed(data, clean)
-        self._result = (clean, removed, nuisance.description)
+        self._result = (clean, removed, description)
         self._installed = False
         self._dirty = False
         return True

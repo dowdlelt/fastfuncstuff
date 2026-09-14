@@ -270,6 +270,10 @@ class ICAMode(Mode):
         """Components labelled noise -- what a denoise would regress out."""
         return sorted(k for k, v in self.labels.items() if v == "noise")
 
+    def mixing_matrix(self) -> np.ndarray | None:
+        """``(T, K)`` component time courses, or ``None`` before a load."""
+        return None if self._mix is None else np.asarray(self._mix, dtype=np.float64)
+
     # -- graph ---------------------------------------------------------
     def _timecourse(self, k: int) -> Trace | None:
         if self._mix is None or k >= self._mix.shape[1]:

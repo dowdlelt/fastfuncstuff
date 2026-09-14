@@ -374,7 +374,7 @@ class ModeRegistry:
     def __init__(self) -> None:
         self._modes: dict[str, type[Mode]] = {}
 
-    def register(self, cls: type[Mode]) -> type[Mode]:
+    def register[M: Mode](self, cls: type[M]) -> type[M]:
         if not cls.name:
             raise ValueError(f"{cls.__name__} must set a name")
         self._modes[cls.name] = cls

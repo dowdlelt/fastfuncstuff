@@ -318,3 +318,65 @@ def test_the_provenance_is_written_where_a_path_would_be(session):
     session.denoise(src, polort=3)
     derived = session.state.layers.find_by_source(f"derived:denoise:{src}")
     assert "polort 3" in derived.path
+
+
+# ---------------------------------------------------------------------------
+# partial regression: ICA noise, aggressive and not
+# ---------------------------------------------------------------------------
+
+
+def _overlapping_components(nt=200, seed=11):
+    """A signal and a noise component that share variance, and a run of both."""
+    from fastfuncstuff.viewer.derive import denoise_partial  # noqa: F401
+
+    rng = np.random.default_rng(seed)
+    signal = rng.normal(size=nt)
+    noise = 0.6 * signal + 0.8 * rng.normal(size=nt)  # correlated with signal
+    mix = np.column_stack([signal, noise])
+    data = np.zeros((3, 3, 2, nt), dtype=np.float32)
+    data[...] = (100 + 2.0 * signal + 1.5 * noise).astype(np.float32)
+    return data, mix, signal, noise
+
+
+def test_removing_every_column_is_the_ordinary_projection():
+    from fastfuncstuff.viewer.derive import Nuisance, denoise_partial
+
+    data = _series()
+    cols = legendre_columns(data.shape[-1], 2)[:, 1:]  # drift without the constant
+    partial = denoise_partial(data, cols, np.ones(cols.shape[1], bool), device=CPU)
+    full = denoise(data, Nuisance(np.column_stack([np.ones(len(cols)), cols]), (), ""), device=CPU)
+    assert np.allclose(partial, full, atol=1e-3)
+
+
+def test_non_aggressive_keeps_what_the_noise_shares_with_the_signal():
+    """The fit credits shared variance to the signal component, so only the
+    noise component's own contribution is subtracted -- and the signal's
+    coefficient comes through untouched."""
+    from fastfuncstuff.viewer.derive import denoise_partial
+
+    data, mix, signal, _noise = _overlapping_components()
+    gentle = denoise_partial(data, mix, np.array([False, True]), device=CPU)
+    # Demeaned: keep_mean restores the voxel's own mean, which includes the
+    # removed component's mean -- the time course is the claim under test.
+    kept = gentle[0, 0, 0] - gentle[0, 0, 0].mean()
+    expected = 2.0 * (signal - signal.mean())
+    assert np.allclose(kept, expected, atol=1e-3)
+
+
+def test_aggressive_removes_the_shared_part_too():
+    from fastfuncstuff.viewer.derive import denoise_partial
+
+    data, mix, signal, noise = _overlapping_components()
+    harsh = denoise_partial(data, mix[:, [1]], np.array([True]), device=CPU)
+    kept = harsh[0, 0, 0] - harsh[0, 0, 0].mean()
+    assert abs(np.corrcoef(kept, noise)[0, 1]) < 1e-3
+    gentle = denoise_partial(data, mix, np.array([False, True]), device=CPU)[0, 0, 0]
+    assert kept.var() < (gentle - gentle.mean()).var()
+
+
+def test_partial_regression_keeps_each_voxels_mean():
+    from fastfuncstuff.viewer.derive import denoise_partial
+
+    data, mix, _s, _n = _overlapping_components()
+    out = denoise_partial(data, mix, np.array([False, True]), device=CPU)
+    assert np.allclose(out.mean(-1), data.mean(-1), atol=1e-2)

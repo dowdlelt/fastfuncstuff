@@ -239,6 +239,72 @@ def denoise(
     return out.reshape(nx, ny, nz, nt)
 
 
+def denoise_partial(
+    data: np.ndarray,
+    design: np.ndarray,
+    remove: np.ndarray,
+    *,
+    device: torch.device | None = None,
+    keep_mean: bool = True,
+    progress: ProgressFn | None = None,
+) -> np.ndarray:
+    """Fit every column of ``design`` jointly, subtract only the ``remove`` ones.
+
+    The non-aggressive ICA cleanup (``fsl_regfilt``, ICA-AROMA's default): the
+    signal components stay in the fit, so variance a noise component shares
+    with a signal component is credited to the fit rather than subtracted. With
+    every column marked for removal it is the ordinary projection.
+
+    One joint fit, never a regression per nuisance set in turn -- sequential
+    regressions re-introduce what the earlier step removed (Lindquist 2019).
+    An intercept is always fitted and never removed, so a design without a
+    constant column cannot drag each voxel's mean around.
+    """
+    if data.ndim != 4:
+        raise ValueError(f"expected a 4-D series, got shape {data.shape}")
+    nx, ny, nz, nt = data.shape
+    design = np.asarray(design, dtype=np.float64)
+    remove = np.asarray(remove, dtype=bool)
+    if design.ndim != 2 or design.shape[0] != nt:
+        raise ValueError(f"design has {design.shape[0]} rows, dataset has {nt} volumes")
+    if remove.shape != (design.shape[1],) or not remove.any():
+        raise ValueError("nothing marked for removal")
+
+    full = np.concatenate([np.ones((nt, 1)), design], axis=1)
+    removing = np.concatenate([[False], remove])
+    device = device or torch.device("cpu")
+    # pinv in float64 on the CPU: (p, T) is tiny, it is the numerically
+    # sensitive step, and pinv on MPS falls back anyway.
+    fit = torch.as_tensor(np.linalg.pinv(full), dtype=torch.float32).to(device)  # (p, T)
+    columns = torch.as_tensor(full[:, removing], dtype=torch.float32).to(device)  # (T, r)
+    picked = torch.as_tensor(np.flatnonzero(removing), device=device)
+
+    flat = np.asarray(data, dtype=np.float32).reshape(-1, nt)
+    out = np.empty_like(flat)
+    from fastfuncstuff.memory import estimate_chunk_size
+
+    chunk = estimate_chunk_size(
+        n_voxels=flat.shape[0],
+        n_timepoints=nt,
+        n_regressors=int(full.shape[1]),
+        device=device,
+        operation="denoise",
+    )
+    for start in range(0, flat.shape[0], chunk):
+        stop = min(start + chunk, flat.shape[0])
+        block = torch.as_tensor(flat[start:stop]).to(device)
+        betas = block @ fit.T  # (V, p)
+        cleaned = block - betas[:, picked] @ columns.T
+        if keep_mean:
+            cleaned = cleaned - cleaned.mean(-1, keepdim=True) + block.mean(-1, keepdim=True)
+        out[start:stop] = cleaned.cpu().numpy()
+        if progress is not None:
+            progress(
+                stop / flat.shape[0], f"regressing {int(remove.sum())} of {remove.size} columns"
+            )
+    return out.reshape(nx, ny, nz, nt)
+
+
 def variance_removed(raw: np.ndarray, clean: np.ndarray, *, block: int = 65536) -> np.ndarray:
     """Per voxel, the fraction of temporal variance the projection took away.
 
@@ -263,6 +329,7 @@ __all__ = [
     "NUISANCE_GROUP_MAX",
     "Nuisance",
     "denoise",
+    "denoise_partial",
     "legendre_columns",
     "orthonormal_basis",
     "project_out",
