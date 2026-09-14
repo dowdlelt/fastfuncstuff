@@ -40,6 +40,9 @@ _SCALES: dict[str, tuple[tuple[float, float, float], ...]] = {
         (0.98, 0.65, 0.35),
         (0.85, 0.2, 0.12),
     ),
+    # One colour at every value. For a mask -- a carpet selection -- where
+    # "in" is the whole message and a ramp would invent a magnitude.
+    "red": ((0.95, 0.12, 0.1), (0.95, 0.12, 0.1)),
     "viridis": (
         (0.267, 0.005, 0.329),
         (0.229, 0.322, 0.545),

@@ -17,7 +17,7 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
-from fastfuncstuff.viewer.layers import AlphaMode, Layer
+from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
@@ -897,6 +897,79 @@ class ViewerSession:
         )
         self._roi_sets[key] = rois
         return key
+
+    def install_selection(
+        self, source: str, mask: np.ndarray, *, like: Layer, name: str
+    ) -> tuple[str, Aspect]:
+        """Put a voxel selection in the stack as a mask layer, or update it.
+
+        One layer per selecting window, keyed by ``source``, and replaced in
+        place on every new selection -- a selection is a question being
+        refined, and a stack that grows a layer per drag answers a different
+        one.
+
+        On creation it goes on top, is selected, and every other visible layer
+        above the underlay is hidden: the selected voxels may be scattered
+        across the brain, and a stat map drawn over them hides exactly where
+        they went. Only on creation, so an overlay turned back on by hand stays
+        on while the selection is refined.
+        """
+        values = np.asarray(mask, dtype=np.float32)
+        existing = self.state.layers.find_by_source(source)
+        key = existing.key if existing is not None else self.state.layers.mint_key("S")
+        self.store.adopt(key, values, name=name)
+        self.invalidate(key)
+        if existing is not None:
+            self.state.layers.update(key, name=name, path=f"<{name}>")
+            return key, Aspect.LAYERS | Aspect.SLICES
+
+        base = self.state.layers.base
+        for layer in list(self.state.layers):
+            if layer.visible and (base is None or layer.key != base.key):
+                self.state.layers.update(layer.key, visible=False)
+        self.state.layers.add(
+            Layer(
+                key=key,
+                name=name,
+                path=f"<{name}>",
+                shape=tuple(int(v) for v in values.shape[:3]),
+                n_volumes=1,
+                affine=np.asarray(like.affine, dtype=float),
+                colormap="red",
+                sign_mode=SignMode.POS,
+                range_lo=0.0,
+                range_hi=1.0,
+                threshold=0.5,
+                source=source,
+            )
+        )
+        self.state.selected = key
+        if self.state.grid is None:
+            self.state.adopt_grid(like.shape, like.affine)
+        return key, Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
+
+    def save_layer(self, key: str, path: str | Path) -> Path:
+        """Write one layer's voxels to NIfTI, on its own grid.
+
+        What makes a selection, a derived run or an adopted cluster map a
+        result rather than something that only existed while the viewer was
+        open. Sub-brick labels go with it, so a bucket saved back out still
+        names its contrasts.
+        """
+        from fastfuncstuff.io.afni import save_nifti
+
+        layer = self.state.layers.get(key)
+        data = np.asarray(self.store.ensure_ram(key), dtype=np.float32)
+        if data.ndim == 4 and data.shape[3] == 1:
+            data = data[..., 0]
+        out = Path(path)
+        save_nifti(
+            data,
+            output_path=out,
+            affine=np.asarray(layer.affine, dtype=float),
+            brick_labels=list(layer.labels) or None,
+        )
+        return out
 
     def forget_rois(self, key: str | None = None) -> None:
         """Drop cached ROI descriptions, for one layer or all of them."""

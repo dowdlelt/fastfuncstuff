@@ -1365,6 +1365,103 @@ def test_every_carpet_row_points_at_a_voxel_inside_the_mask(win4d, qapp):
         assert 0 <= i < nx and 0 <= j < ny and 0 <= k < nz
 
 
+def _drag_rows(view, qapp, y0, y1):
+    """Press, move and release on a carpet the way a hand would."""
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    x = view.width() // 2
+    QTest.mousePress(view, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(x, y0))
+    QTest.mouseMove(view, QtCore.QPoint(x, (y0 + y1) // 2))
+    QTest.mouseMove(view, QtCore.QPoint(x, y1))
+    QTest.mouseRelease(view, QtCore.Qt.MouseButton.LeftButton, pos=QtCore.QPoint(x, y1))
+    qapp.processEvents()
+
+
+def test_dragging_carpet_rows_makes_one_red_overlay_of_their_voxels(win4d, qapp):
+    """The selection is a layer like any other, on top, selected, and alone:
+    the voxels may be anywhere, and a stat map over them hides where."""
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(600, 400)
+    qapp.processEvents()
+    stack = win4d.session.state.layers
+    before = len(stack)
+    others = [ly.key for ly in stack if ly.key != stack.base.key]
+
+    view = carpet.view
+    _drag_rows(view, qapp, 10, view.height() // 3)
+
+    assert len(stack) == before + 1
+    selection = stack.layers[-1]
+    assert selection.source == f"selection:{carpet.vid}"
+    assert selection.colormap == "red"
+    assert win4d.session.state.selected == selection.key
+    assert all(not stack.get(k).visible for k in others)
+    assert stack.base.visible
+
+    first, last = view._selection
+    expected = view._carpet.mask_of_rows(first, last)
+    shown = win4d.session.volume(selection.key, 0) > 0.5
+    assert np.array_equal(shown, expected) and expected.any()
+
+
+def test_a_new_drag_updates_the_same_overlay(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(600, 400)
+    qapp.processEvents()
+    view = carpet.view
+    _drag_rows(view, qapp, 10, 60)
+    stack = win4d.session.state.layers
+    count, key = len(stack), stack.layers[-1].key
+    first_voxels = int((win4d.session.volume(key, 0) > 0.5).sum())
+
+    _drag_rows(view, qapp, 10, view.height() - 10)
+    assert len(stack) == count
+    assert stack.layers[-1].key == key
+    assert int((win4d.session.volume(key, 0) > 0.5).sum()) > first_voxels
+
+
+def test_a_short_press_on_the_carpet_is_still_a_click(win4d, qapp):
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(600, 400)
+    qapp.processEvents()
+    before = len(win4d.session.state.layers)
+    _drag_rows(carpet.view, qapp, 100, 101)
+    assert len(win4d.session.state.layers) == before
+    assert carpet.view._selection is None
+
+
+def test_a_selection_can_be_saved_and_read_back(win4d, qapp, tmp_path):
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(600, 400)
+    qapp.processEvents()
+    _drag_rows(carpet.view, qapp, 10, 120)
+    layer = win4d.session.state.layers.layers[-1]
+    out = win4d.session.save_layer(layer.key, tmp_path / "picked.nii.gz")
+
+    img = nib.load(str(out))
+    assert img.shape == layer.shape
+    assert np.allclose(img.affine, layer.affine)
+    assert np.array_equal(np.asarray(img.dataobj) > 0.5, win4d.session.volume(layer.key, 0) > 0.5)
+
+
+def test_a_layer_with_no_file_is_named_once_in_the_picker(win4d, qapp):
+    """Every sync used to append another copy of the name to the picker."""
+    carpet = _carpet(win4d, qapp)
+    carpet.resize(600, 400)
+    qapp.processEvents()
+    _drag_rows(carpet.view, qapp, 10, 120)
+    stack = win4d.session.state.layers
+    from fastfuncstuff.viewer.vocab import MoveLayer
+
+    win4d._dispatch(MoveLayer(stack.layers[-1].key, 1))  # make it overlay-prime
+    for _ in range(3):
+        win4d.refresh(Aspect.LAYERS)
+    name = stack.overlay.name
+    texts = [win4d.overlay_box.itemText(i) for i in range(win4d.overlay_box.count())]
+    assert texts.count(name) == 1
+
+
 # ---------------------------------------------------------------------------
 # the matrix window
 # ---------------------------------------------------------------------------

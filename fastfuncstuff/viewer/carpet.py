@@ -80,6 +80,37 @@ class Carpet:
     #: you cannot click your way back out of. A binned row stands for many
     #: voxels; this is the one at the centre of the bin.
     voxels: np.ndarray | None = None
+    #: ``(n_voxels,)`` flat voxel indices in display order, before binning, and
+    #: the 3-D shape they index. What a row *range* stands for is every voxel
+    #: its bins averaged -- not the representatives -- so selecting rows needs
+    #: the whole ordering rather than one voxel per row.
+    order_ids: np.ndarray | None = None
+    volume_shape: tuple[int, int, int] | None = None
+
+    def voxels_in_rows(self, first: int, last: int) -> np.ndarray:
+        """Flat indices of every voxel drawn in rows ``first..last`` inclusive.
+
+        Uses the same bin edges :func:`~viewer.series.bin_rows` averaged with,
+        so the selection is exactly the voxels whose time courses made those
+        rows of the picture.
+        """
+        if self.order_ids is None:
+            return np.empty(0, dtype=np.int64)
+        rows = self.shape[0]
+        lo, hi = sorted((max(0, min(int(first), rows - 1)), max(0, min(int(last), rows - 1))))
+        n = int(self.order_ids.shape[0])
+        if n <= rows:
+            return self.order_ids[lo : hi + 1]
+        edges = np.linspace(0, n, rows + 1).round().astype(int)
+        return self.order_ids[int(edges[lo]) : max(int(edges[hi + 1]), int(edges[hi]) + 1)]
+
+    def mask_of_rows(self, first: int, last: int) -> np.ndarray:
+        """The selected rows as a boolean volume on the run's grid."""
+        if self.volume_shape is None:
+            raise ValueError("this carpet does not record the grid its rows came from")
+        mask = np.zeros(int(np.prod(self.volume_shape)), dtype=bool)
+        mask[self.voxels_in_rows(first, last)] = True
+        return mask.reshape(self.volume_shape)
 
     def voxel_of(self, row: int) -> tuple[int, int, int] | None:
         """Where row ``row`` came from, or ``None`` if that was not recorded."""
@@ -164,6 +195,8 @@ def build_carpet(
         units=units,
         limit=limit,
         voxels=voxels.astype(np.int32),
+        order_ids=flat_ids.astype(np.int64),
+        volume_shape=(int(data.shape[0]), int(data.shape[1]), int(data.shape[2])),
     )
 
 

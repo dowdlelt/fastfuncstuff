@@ -31,6 +31,10 @@ from fastfuncstuff.viewer.vocab import (
 #: Width of the overlay band drawn beside the carpet, in pixels.
 SIDEBAR_WIDTH = 14
 BARE_WIDTH = 300
+#: Vertical travel, in pixels, before a press becomes a row selection rather
+#: than a click. Small enough that a short band is selectable, large enough
+#: that a hand tremor on a click does not select three rows.
+DRAG_START = 4
 
 
 class CarpetView(QtWidgets.QWidget):
@@ -43,6 +47,10 @@ class CarpetView(QtWidgets.QWidget):
     #: is a voxel -- so a click that moved only the time cursor was throwing
     #: half of itself away.
     rowed = QtCore.Signal(int)
+    #: (first row, last row) of a click-and-drag, inclusive, in either order.
+    #: Rows only: a band in time is a volume range, and nothing downstream has
+    #: a use for one yet.
+    selected = QtCore.Signal(int, int)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -50,12 +58,21 @@ class CarpetView(QtWidgets.QWidget):
         self._image: QtGui.QImage | None = None
         self._band: QtGui.QImage | None = None
         self._index = 0
+        #: Row range currently highlighted, kept after the drag so the picture
+        #: still says which rows the selection layer came from.
+        self._selection: tuple[int, int] | None = None
+        self._press: QtCore.QPointF | None = None
+        self._dragging = False
         self.setMinimumSize(80, 60)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
 
     def set_carpet(self, carpet: Carpet | None) -> None:
+        # A rebuilt carpet has a different ordering, so the old highlight would
+        # sit over rows that now mean other voxels.
+        if carpet is not self._carpet:
+            self._selection = None
         self._carpet = carpet
         self._image = None if carpet is None else self._grey(carpet)
         self._band = None if carpet is None else self._sidebar(carpet)
@@ -137,6 +154,19 @@ class CarpetView(QtWidgets.QWidget):
             p.drawImage(QtCore.QRect(0, 0, SIDEBAR_WIDTH, self.height()), self._band)
 
         assert self._carpet is not None
+        if self._selection is not None:
+            rows = max(self._carpet.shape[0], 1)
+            lo, hi = sorted(self._selection)
+            top = rect.top() + lo / rows * rect.height()
+            bottom = rect.top() + (hi + 1) / rows * rect.height()
+            accent = QtGui.QColor(c.key)
+            accent.setAlpha(70)
+            band = QtCore.QRectF(0.0, top, float(self.width()), max(bottom - top, 1.0))
+            p.fillRect(band, accent)
+            accent.setAlpha(220)
+            p.setPen(QtGui.QPen(accent))
+            p.drawLine(QtCore.QPointF(0.0, top), QtCore.QPointF(float(self.width()), top))
+            p.drawLine(QtCore.QPointF(0.0, bottom), QtCore.QPointF(float(self.width()), bottom))
         nt = self._carpet.shape[1]
         if 0 <= self._index < nt and nt > 1:
             x = rect.left() + (self._index + 0.5) / nt * rect.width()
@@ -146,15 +176,49 @@ class CarpetView(QtWidgets.QWidget):
             p.drawLine(QtCore.QPointF(x, 0.0), QtCore.QPointF(x, float(self.height())))
         p.end()
 
+    def _row_at(self, y: float) -> int:
+        assert self._carpet is not None
+        rect = self._carpet_rect()
+        rows = self._carpet.shape[0]
+        down = (y - rect.top()) / max(rect.height(), 1)
+        return max(0, min(int(down * rows), rows - 1))
+
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
-        if self._carpet is None:
+        if self._carpet is None or event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        self._press = event.position()
+        self._dragging = False
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        if self._carpet is None or self._press is None:
+            return
+        if not self._dragging and abs(event.position().y() - self._press.y()) < DRAG_START:
+            return
+        self._dragging = True
+        self._selection = (self._row_at(self._press.y()), self._row_at(event.position().y()))
+        self.update()
+
+    def mouseReleaseEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
+        """A drag selects rows; anything shorter is a click, as it always was.
+
+        Decided on release rather than press, so starting a drag does not first
+        jump the crosshair and the time cursor to wherever it began.
+        """
+        if self._carpet is None or self._press is None:
+            return
+        press, self._press = self._press, None
+        if self._dragging:
+            self._dragging = False
+            first, last = self._row_at(press.y()), self._row_at(event.position().y())
+            self._selection = (first, last)
+            self.update()
+            self.selected.emit(first, last)
             return
         rect = self._carpet_rect()
-        rows, nt = self._carpet.shape
-        frac = (event.position().x() - rect.left()) / max(rect.width(), 1)
+        nt = self._carpet.shape[1]
+        frac = (press.x() - rect.left()) / max(rect.width(), 1)
         self.scrubbed.emit(int(round(max(0.0, min(1.0, frac)) * (nt - 1))))
-        down = (event.position().y() - rect.top()) / max(rect.height(), 1)
-        self.rowed.emit(max(0, min(int(down * rows), rows - 1)))
+        self.rowed.emit(self._row_at(press.y()))
 
 
 class CarpetWindow(QtWidgets.QWidget):
@@ -166,6 +230,8 @@ class CarpetWindow(QtWidgets.QWidget):
     located = QtCore.Signal(int, int, int)
     #: Asks the controller to rebuild on the worker; it owns the runner.
     rebuild_requested = QtCore.Signal(str)
+    #: (view id, first row, last row) of a dragged selection.
+    rows_selected = QtCore.Signal(str, int, int)
 
     def __init__(
         self,
@@ -241,6 +307,7 @@ class CarpetWindow(QtWidgets.QWidget):
         self.view = CarpetView()
         self.view.scrubbed.connect(self.scrubbed)
         self.view.rowed.connect(self._locate)
+        self.view.selected.connect(lambda a, b: self.rows_selected.emit(self.vid, a, b))
         v.addWidget(self.view, 1)
 
         self.help = ShortcutHelp(self, f"carpet · {vid}")
@@ -251,6 +318,12 @@ class CarpetWindow(QtWidgets.QWidget):
                     "r", "rebuild", lambda: self.rebuild_requested.emit(self.vid), group="carpet"
                 ),
                 Binding("click", "jump to that volume and that voxel", None, group="carpet"),
+                Binding(
+                    "drag",
+                    "select those rows' voxels as a red overlay layer",
+                    None,
+                    group="carpet",
+                ),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]

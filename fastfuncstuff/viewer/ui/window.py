@@ -116,6 +116,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.manager = WindowManager(session, self._dispatch, self)
         self.manager.rebuild_requested.connect(self.rebuild_view)
         self.manager.rois_requested.connect(self._clusters_to_rois)
+        self.manager.rows_selected.connect(self._carpet_rows_to_layer)
 
         self._build_selector()
         self._build_panel()
@@ -425,6 +426,53 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.refresh(Aspect.LAYERS | Aspect.SLICES)
         self.statusBar().showMessage(f"{len(rois)} clusters are now an ROI layer", 4000)
 
+    def _carpet_rows_to_layer(self, vid: str, first: int, last: int) -> None:
+        """Turn a dragged band of carpet rows into a mask layer in the stack.
+
+        One layer per carpet window, updated in place by every new drag, so
+        refining a selection is refining one overlay. The mask is on the run's
+        own grid -- a carpet row is that run's voxel -- and the image windows
+        resample it like any other layer.
+        """
+        from fastfuncstuff.viewer.ui.carpetwindow import CarpetWindow
+
+        window = self.manager.windows.get(vid)
+        viewport = self.session.state.viewports.find(vid)
+        if not isinstance(window, CarpetWindow) or viewport is None:
+            return
+        carpet = window.view._carpet
+        run = self.session.series_source(viewport)
+        if carpet is None or run is None or carpet.volume_shape != run.shape:
+            self.statusBar().showMessage("rebuild the carpet (r) before selecting from it", 5000)
+            return
+        mask = carpet.mask_of_rows(first, last)
+        lo, hi = sorted((first, last))
+        name = f"{vid} rows {lo}-{hi} ·{int(mask.sum()):,} vox"
+        _key, dirty = self.session.install_selection(f"selection:{vid}", mask, like=run, name=name)
+        self.refresh(dirty)
+        self.statusBar().showMessage(f"{int(mask.sum()):,} voxels selected from {run.name}", 4000)
+
+    def _save_layer_dialog(self) -> None:
+        """Write the selected layer to disk, whatever made it."""
+        key = self.current_key()
+        if key is None:
+            return
+        layer = self.session.state.layers.get(key)
+        stem = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in layer.name)
+        stem = stem.removesuffix(".nii.gz").removesuffix(".nii").strip("_") or key
+        start = str((self.session.catalog_dir or Path.cwd()) / f"{stem}.nii.gz")
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, f"Save {layer.name}", start, "NIfTI (*.nii.gz *.nii);;All (*)"
+        )
+        if not path:
+            return
+        try:
+            self.session.save_layer(key, path)
+        except (OSError, ValueError) as exc:
+            self.statusBar().showMessage(f"could not save: {exc}", 8000)
+            return
+        self.statusBar().showMessage(f"wrote {path}", 5000)
+
     def _open_built(self, kind: ViewKind) -> None:
         vid = self.manager.open(kind, Plane.AXIAL)
         # Start it on the layer the controls are aimed at, which is what
@@ -550,6 +598,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ("RAISE", "}", "Move the selected layer up the stack", lambda: self._reorder(1)),
             ("UNDERLAY", "u", "Make the selected layer the underlay", self._make_underlay),
             ("DROP", "del", "Remove the selected layer", self._drop_layer),
+            (
+                "SAVE",
+                "\u21e7S",
+                "Write the selected layer to a NIfTI file",
+                self._save_layer_dialog,
+            ),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
             b.setToolTip(f"{tip} ({key})")
@@ -863,6 +917,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
                 Binding("u", "make it the underlay", self._make_underlay, group="layer"),
                 Binding(
+                    "shift+s", "save the layer to a file", self._save_layer_dialog, group="layer"
+                ),
+                Binding(
                     "Del",
                     "remove the layer",
                     self._drop_layer,
@@ -1139,8 +1196,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
                         break
                 else:
                     # Loaded from outside the catalog: name it rather than lie.
-                    box.addItem(layer.name, userData=None)
-                    index = box.count() - 1
+                    # Reused rather than appended, or every sync grows the
+                    # picker by one more copy of the same name.
+                    index = next(
+                        (
+                            i
+                            for i in range(1, box.count())
+                            if box.itemData(i) is None and box.itemText(i) == layer.name
+                        ),
+                        -1,
+                    )
+                    if index < 0:
+                        box.addItem(layer.name, userData=None)
+                        index = box.count() - 1
             box.setCurrentIndex(index)
             box.blockSignals(False)
 

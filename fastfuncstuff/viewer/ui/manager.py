@@ -43,6 +43,8 @@ class WindowManager(QtCore.QObject):
     rebuild_requested = QtCore.Signal(str)
     #: A cluster window asked for its table to become an ROI layer.
     rois_requested = QtCore.Signal(str)
+    #: A carpet window's rows were dragged over: (view id, first, last).
+    rows_selected = QtCore.Signal(str, int, int)
 
     def __init__(
         self,
@@ -89,6 +91,7 @@ class WindowManager(QtCore.QObject):
             # click disappear.
             win.located.connect(self._on_located)
             win.rebuild_requested.connect(self.rebuild_requested)
+            win.rows_selected.connect(self.rows_selected)
         elif viewport.is_matrix:
             win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)

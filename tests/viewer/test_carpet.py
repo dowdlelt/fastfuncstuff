@@ -286,3 +286,39 @@ def test_automask_finds_the_brain_and_not_the_air():
     overlap = (mask & brain).sum() / brain.sum()
     assert overlap > 0.9
     assert mask.sum() < brain.size * 0.9
+
+
+# ---------------------------------------------------------------------------
+# selecting rows
+# ---------------------------------------------------------------------------
+
+
+def test_selecting_every_row_selects_every_voxel_in_the_mask():
+    data, brain, _band, _ = _run()
+    carpet = build_carpet(data, mask=brain, order="pc1", polort=1, max_rows=50, device=CPU)
+    assert carpet.binned
+    mask = carpet.mask_of_rows(0, carpet.shape[0] - 1)
+    assert np.array_equal(mask, brain)
+
+
+def test_a_row_range_is_the_voxels_whose_average_drew_it():
+    """Bins partition the ordering, so adjacent ranges never overlap and a
+    selection's size is the sum of its bins -- not one voxel per row."""
+    data, brain, _band, _ = _run()
+    carpet = build_carpet(data, mask=brain, order="pc1", polort=1, max_rows=50, device=CPU)
+    top = carpet.mask_of_rows(0, 9)
+    bottom = carpet.mask_of_rows(10, 49)
+    assert not (top & bottom).any()
+    assert int(top.sum()) + int(bottom.sum()) == int(brain.sum())
+    assert int(top.sum()) > 10
+    # dragging upward names the same rows as dragging downward
+    assert np.array_equal(carpet.mask_of_rows(9, 0), top)
+
+
+def test_the_coherent_band_is_what_you_select_at_the_top_of_a_sorted_carpet():
+    data, brain, band, _special = _run()
+    carpet = build_carpet(
+        data, mask=brain, order="seed", seed_series=data[band][0], polort=1, device=CPU
+    )
+    selected = carpet.mask_of_rows(0, int(band.sum()) - 1)
+    assert (selected & band).sum() / band.sum() > 0.8
