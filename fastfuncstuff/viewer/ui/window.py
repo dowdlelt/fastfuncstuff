@@ -115,7 +115,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.manager = WindowManager(session, self._dispatch, self)
         self.manager.rebuild_requested.connect(self.rebuild_view)
-        self.manager.roi_picked.connect(self._go_to_roi)
         self.manager.rois_requested.connect(self._clusters_to_rois)
 
         self._build_selector()
@@ -485,19 +484,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if not self.runner.run(job):
             self.runner.finished.disconnect(done)
             window.set_busy(False)
-
-    def _go_to_roi(self, key: str, index: int) -> None:
-        """Put the crosshair in the region a matrix row names.
-
-        The centre of mass, not a peak: an ROI has no peak, and the centre is
-        the one point that means the same thing for a sphere, a parcel and a
-        C-shaped structure -- even when, for the last of those, it is outside
-        the region. Better a defined answer than a plausible one.
-        """
-        rois = self.session.roi_set(key)
-        found = rois.find(index) if rois is not None else None
-        if found is not None:
-            self._dispatch(SetIJK(*found.center_ijk))
 
     def _next_plane(self) -> Plane:
         """Offer the plane that is not already on screen, then wrap.

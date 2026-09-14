@@ -41,8 +41,6 @@ class WindowManager(QtCore.QObject):
     #: A carpet or matrix needs rebuilding on the worker; the controller owns
     #: the runner.
     rebuild_requested = QtCore.Signal(str)
-    #: A window asked to make one ROI the focus: (layer key, label value).
-    roi_picked = QtCore.Signal(str, int)
     #: A cluster window asked for its table to become an ROI layer.
     rois_requested = QtCore.Signal(str)
 
@@ -93,7 +91,7 @@ class WindowManager(QtCore.QObject):
             win.rebuild_requested.connect(self.rebuild_requested)
         elif viewport.is_matrix:
             win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
-            win.node_picked.connect(self.roi_picked)
+            win.located.connect(self._on_located)
             win.rebuild_requested.connect(self.rebuild_requested)
         elif viewport.is_clusters:
             win = ClusterWindow(viewport.id, self.session, self._dispatch, self._parent)

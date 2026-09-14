@@ -1418,15 +1418,31 @@ def test_dropping_an_atlas_on_the_stack_names_the_rows(win4d, qapp, tmp_path):
     assert "3 ROIs" in matrix.info.text()
 
 
-def test_clicking_a_row_goes_to_that_region(win4d, qapp, tmp_path):
+def test_the_triangle_decides_which_end_of_a_pair_a_click_goes_to(win4d, qapp, tmp_path):
+    """Every cell is two nodes. Below the diagonal the click goes to the row's
+    region, above it to the column's -- so both ends of an edge are one click
+    away, on the two mirrored cells."""
     key = _add_atlas(win4d, qapp, tmp_path)
     matrix = _matrix(win4d, qapp)
-    matrix.view.picked.emit(1, 2)
-    qapp.processEvents()
+    rois = win4d.session.roi_set(key)
 
-    label = matrix._matrix.indices[1]
-    expected = win4d.session.roi_set(key).find(label).center_ijk
-    assert win4d.session.state.crosshair == expected
+    matrix.view.picked.emit(2, 0)  # lower triangle: the row
+    qapp.processEvents()
+    assert win4d.session.state.crosshair == rois.find(matrix._matrix.indices[2]).center_ijk
+
+    matrix.view.picked.emit(0, 1)  # upper triangle: the column
+    qapp.processEvents()
+    assert win4d.session.state.crosshair == rois.find(matrix._matrix.indices[1]).center_ijk
+
+
+def test_a_voxel_bin_cell_moves_the_crosshair_too(win4d, qapp):
+    """Bins have no name, but they are still somewhere; a click that did
+    nothing without an atlas was a dead end."""
+    matrix = _matrix(win4d, qapp)
+    assert not matrix._matrix.from_rois
+    matrix.view.picked.emit(3, 1)
+    qapp.processEvents()
+    assert win4d.session.state.crosshair == matrix._matrix.location_of(3)
 
 
 def test_changing_the_node_order_rebuilds_it(win4d, qapp, tmp_path):

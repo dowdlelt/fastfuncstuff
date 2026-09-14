@@ -124,3 +124,24 @@ def test_every_ordering_returns_the_same_matrix_permuted():
                 a = reference.indices.index(left)
                 b = reference.indices.index(right)
                 assert m.matrix[i, j] == pytest.approx(reference.matrix[a, b], abs=1e-5)
+
+
+def test_every_node_knows_where_it_is_after_reordering():
+    """A click on a node has to land in that node's region, not the region
+    that held its row before the ordering moved it."""
+    rng = np.random.default_rng(5)
+    data, labels = _networks(rng)
+    rois = rois_from_labels(labels)
+    m = build_matrix(data, rois=rois, order="hierarchical", polort=-1, device=CPU)
+    for node, label in enumerate(m.indices):
+        assert labels[m.location_of(node)] == label
+
+
+def test_a_voxel_bin_points_at_a_voxel_inside_the_mask():
+    rng = np.random.default_rng(6)
+    data, _ = _networks(rng)
+    mask = np.zeros(data.shape[:3], dtype=bool)
+    mask[:6] = True
+    m = build_matrix(data, mask=mask, order="input", polort=-1, max_nodes=10, device=CPU)
+    assert m.locations is not None and m.locations.shape == (m.n_nodes, 3)
+    assert all(mask[m.location_of(node)] for node in range(m.n_nodes))

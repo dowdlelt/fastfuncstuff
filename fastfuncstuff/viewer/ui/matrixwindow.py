@@ -6,9 +6,13 @@ colour readable: a strip of each node's own colour along both edges, which is
 what ties a row to the region drawn in the image windows, and separators on the
 diagonal where a hierarchical ordering found a module boundary.
 
-A cell is a question with an answer, so clicking one is wired: it names both
-nodes, moves the crosshair to the row's region, and draws that region's time
-course underneath. Without that a connectivity matrix is a texture.
+A cell is a pair, so clicking one is wired as a pair: both nodes' time courses
+are drawn underneath, one over the other, and the crosshair goes to one of the
+two. Which one is decided by the triangle -- below the diagonal the row's node
+(named on the left edge), above it the column's (named along the top). The
+matrix is symmetric, so every pair is reachable from both sides, and "go to
+the other end of this edge" is a click on the mirrored cell rather than a
+modifier key. Without that a connectivity matrix is a texture.
 
 Built on the worker, because averaging and correlating a whole run is seconds.
 """
@@ -35,8 +39,8 @@ from fastfuncstuff.viewer.vocab import (
 
 #: Width of the identity strips along the top and left edges, in pixels.
 STRIP = 10
-#: Height of the selected node's time course under the matrix.
-TRACE_HEIGHT = 46
+#: Height of the selected pair's time courses under the matrix.
+TRACE_HEIGHT = 64
 BARE_WIDTH = 300
 
 
@@ -60,6 +64,12 @@ class MatrixView(QtWidgets.QWidget):
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
+
+    @staticmethod
+    def target(row: int, col: int) -> int:
+        """The node a click on ``(row, col)`` goes to: the row's below the
+        diagonal, the column's above it."""
+        return row if row >= col else col
 
     def set_matrix(self, matrix: CorrMatrix | None) -> None:
         self._matrix = matrix
@@ -190,25 +200,44 @@ class MatrixView(QtWidgets.QWidget):
         )
 
     def _draw_trace(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
-        """The selected node's own time course, under the matrix."""
-        assert self._matrix is not None
-        if self._row < 0 or self._row >= self._matrix.series.shape[0]:
+        """Both nodes of the selected cell, overlaid on one shared scale.
+
+        One scale for both, because the question a cell asks is whether the two
+        move together, and two independently stretched lines answer it with a
+        picture that always looks like yes. The node the crosshair went to is
+        drawn last and thicker, so it reads as the one being pointed at.
+        """
+        m = self._matrix
+        assert m is not None
+        k = m.series.shape[0]
+        if not (0 <= self._row < k and 0 <= self._col < k):
             return
         top = rect.bottom() + 4
         height = self.height() - top - 2
         if height < 12:
             return
-        series = self._matrix.series[self._row]
-        span = float(np.abs(series).max()) or 1.0
-        path = QtGui.QPainterPath()
-        for i, value in enumerate(series):
-            x = rect.left() + i / max(len(series) - 1, 1) * rect.width()
-            y = top + height * (0.5 - 0.45 * float(value) / span)
-            path.lineTo(x, y) if i else path.moveTo(x, y)
-        pen = QtGui.QPen(QtGui.QColor(*self._matrix.colors[self._row]))
-        pen.setWidth(1)
-        p.setPen(pen)
-        p.drawPath(path)
+        target = self.target(self._row, self._col)
+        other = self._col if target == self._row else self._row
+        nodes = [other, target] if other != target else [target]
+        span = max(float(np.abs(m.series[n]).max()) for n in nodes) or 1.0
+        for n in nodes:
+            series = m.series[n]
+            path = QtGui.QPainterPath()
+            for i, value in enumerate(series):
+                x = rect.left() + i / max(len(series) - 1, 1) * rect.width()
+                y = top + height * (0.5 - 0.45 * float(value) / span)
+                path.lineTo(x, y) if i else path.moveTo(x, y)
+            pen = QtGui.QPen(QtGui.QColor(*m.colors[n]))
+            pen.setWidthF(2.0 if n == target and len(nodes) > 1 else 1.0)
+            p.setPen(pen)
+            p.drawPath(path)
+        p.setPen(QtGui.QColor(theme.palette().faint))
+        label = (
+            m.name_of(target)
+            if len(nodes) == 1
+            else f"{m.name_of(target)} (bold)  with  {m.name_of(other)}   r {m.matrix[self._row, self._col]:+.2f}"
+        )
+        p.drawText(rect.left() + 3, top + 11, label)
 
     # -- input ---------------------------------------------------------
     def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
@@ -217,7 +246,10 @@ class MatrixView(QtWidgets.QWidget):
             return
         row, col = cell
         m = self._matrix
-        self.hovered.emit(f"{m.name_of(row)}  x  {m.name_of(col)}   r = {m.matrix[row, col]:+.3f}")
+        self.hovered.emit(
+            f"{m.name_of(row)}  x  {m.name_of(col)}   r = {m.matrix[row, col]:+.3f}"
+            f"   · click goes to {m.name_of(self.target(row, col))}"
+        )
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         cell = self._cell_at(event.position())
@@ -232,8 +264,8 @@ class MatrixWindow(QtWidgets.QWidget):
     """A floating correlation-matrix viewport."""
 
     closed = QtCore.Signal(str)
-    #: (layer key, label value) of a clicked row's ROI; -1 for a voxel bin.
-    node_picked = QtCore.Signal(str, int)
+    #: (i, j, k) of the node a clicked cell points at.
+    located = QtCore.Signal(int, int, int)
     rebuild_requested = QtCore.Signal(str)
 
     def __init__(
@@ -334,7 +366,12 @@ class MatrixWindow(QtWidgets.QWidget):
                 Binding(
                     "r", "rebuild", lambda: self.rebuild_requested.emit(self.vid), group="matrix"
                 ),
-                Binding("click", "name a pair, and go to the row's region", None, group="matrix"),
+                Binding(
+                    "click",
+                    "plot a pair; go to the row's node below the diagonal, the column's above",
+                    None,
+                    group="matrix",
+                ),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
             ]
@@ -355,19 +392,12 @@ class MatrixWindow(QtWidgets.QWidget):
     def _on_hovered(self, text: str) -> None:
         self.info.setText(text)
 
-    def _on_picked(self, row: int, _col: int) -> None:
-        if self._matrix is None or not self._matrix.from_rois:
+    def _on_picked(self, row: int, col: int) -> None:
+        if self._matrix is None:
             return
-        viewport = self._viewport()
-        source = self._roi_key(viewport)
-        if source:
-            self.node_picked.emit(source, int(self._matrix.indices[row]))
-
-    def _roi_key(self, viewport: Viewport | None) -> str:
-        if viewport is not None and viewport.rois:
-            return viewport.rois
-        layers = self.session.roi_layers()
-        return layers[-1].key if layers else ""
+        where = self._matrix.location_of(MatrixView.target(row, col))
+        if where is not None and min(where) >= 0:
+            self.located.emit(*where)
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)

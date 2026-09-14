@@ -34,6 +34,7 @@ from fastfuncstuff.viewer.rois import RoiSet, roi_means
 from fastfuncstuff.viewer.series import (
     ProgressFn,
     bin_counts,
+    bin_representatives,
     bin_rows,
     correlate,
     correlation_matrix,
@@ -83,6 +84,17 @@ class CorrMatrix:
     #: Voxels behind the whole matrix, before any reduction.
     n_voxels: int = 0
     from_rois: bool = False
+    #: ``(K, 3)`` voxel indices, one per displayed node: an ROI's centre, or
+    #: for a voxel bin the voxel at the middle of the bin -- the same stand-in
+    #: a binned carpet row uses. A bin's voxels are scattered by construction,
+    #: so no centre of them is inside any of them; the middle one is.
+    locations: np.ndarray | None = None
+
+    def location_of(self, node: int) -> tuple[int, int, int] | None:
+        if self.locations is None or not (0 <= node < self.locations.shape[0]):
+            return None
+        i, j, k = (int(v) for v in self.locations[node])
+        return (i, j, k)
 
     @property
     def n_nodes(self) -> int:
@@ -236,12 +248,20 @@ def build_matrix(
             dtype=np.int64,
         )
         indices = present
+        locations = np.array(
+            [r.center_ijk if r else (-1, -1, -1) for r in described], dtype=np.int32
+        ).reshape(-1, 3)
     else:
         # Order first, then bin: the bins are only meaningful because the rows
         # inside one were already alike, which is the same argument the carpet
         # makes for averaging rather than striding.
-        rows = rows[torch.argsort(correlate(rows, first_pc(rows)), descending=True)]
+        by_pc = torch.argsort(correlate(rows, first_pc(rows)), descending=True)
+        rows = rows[by_pc]
         series = bin_rows(rows, max_nodes)
+        flat_ids = np.flatnonzero(flat_mask)[by_pc.cpu().numpy()]
+        locations = np.stack(
+            np.unravel_index(bin_representatives(flat_ids, max_nodes), data.shape[:3]), 1
+        ).astype(np.int32)
         counts = bin_counts(n_voxels, max_nodes)
         names = tuple(str(i + 1) for i in range(series.shape[0]))
         colors = _node_colors(int(series.shape[0]))
@@ -269,6 +289,7 @@ def build_matrix(
         blocks=blocks,
         n_voxels=n_voxels,
         from_rois=rois is not None,
+        locations=locations[index],
     )
 
 
