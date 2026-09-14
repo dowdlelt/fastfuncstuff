@@ -66,6 +66,8 @@ from torch import Tensor
 from fastfuncstuff.memory import plan_nonlinear_memory
 
 if TYPE_CHECKING:
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
+
     from .warp import QwarpConfig
 
 try:
@@ -640,6 +642,7 @@ def _optiflow_level(
     cfg: OptiwarpConfig,
     level_tag: str = "",
     guard: tuple[Tensor, ...] | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> tuple[Field, float, LevelStats]:
     """Run up to ``n_iter`` optical-flow updates at one resolution.
 
@@ -715,6 +718,10 @@ def _optiflow_level(
                     )
                 )
             costs.append(cost_val)
+            if recorder is not None and recorder.tick():
+                recorder.capture_displacement(
+                    fwd, label=f"{level_tag}  it {len(costs) - 1}  cost {cost_val:.5f}"
+                )
             # The legality of `fwd` was established when it was built, at the end of
             # the previous iteration, so no determinant is recomputed here.
             legal = not cfg.fold_aware_best or float(jac.min()) >= cfg.jac_floor
@@ -829,6 +836,7 @@ def optiwarp(
     moving_cover: Tensor | None = None,
     config: OptiwarpConfig | None = None,
     device: torch.device | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> OptiwarpResult:
     """Register ``moving`` to ``fixed`` by multiresolution 3-D optical flow.
 
@@ -848,6 +856,9 @@ def optiwarp(
             since ``-match gradmag`` is built out of edges.
         config: :class:`OptiwarpConfig`. Uses defaults if None.
         device: Torch device. Inferred from ``fixed`` if None.
+        recorder: Optional :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder`
+            on the full grid. Captures the source through the running field during
+            each level, plus each level's returned (best) field as a pinned frame.
 
     Returns:
         :class:`OptiwarpResult` with the moving->fixed warp, its inverse, the warped
@@ -943,9 +954,26 @@ def optiwarp(
             guard = _void_guard_field(_resize_volume(cover.float(), target))
 
         fwd, best_cost, stats = _optiflow_level(
-            f_prep, m_prep, w_lvl, fwd, n_iter, cfg, level_tag=f"L{lev + 1}", guard=guard
+            f_prep,
+            m_prep,
+            w_lvl,
+            fwd,
+            n_iter,
+            cfg,
+            level_tag=f"L{lev + 1}/{n_levels} shrink {factor}",
+            guard=guard,
+            recorder=recorder,
         )
         level_stats.append(stats)
+        if recorder is not None:
+            # The level returns its best iterate, not its last; pin that so the movie
+            # shows the jump back rather than implying the wander was kept.
+            recorder.capture_displacement(
+                fwd,
+                label=f"L{lev + 1}/{n_levels} shrink {factor}  best @ it {stats.best_iter}"
+                f"  cost {best_cost:.5f}",
+                pinned=True,
+            )
 
     fwd = _resize_flow_field(fwd, full_shape, cfg)
 

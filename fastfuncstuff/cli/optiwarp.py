@@ -48,12 +48,16 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
+    add_warp_movie_args,
     apply_recipe_preset,
+    build_warp_movie_recorder,
     collect_batch_jobs,
     combine_brain_masks,
     enable_determinism,
     image_support,
     parse_prefix,
+    render_warp_movie,
+    resolve_movie_path,
     run_batch_jobs,
     sanitize_volume,
     setup_device,
@@ -615,6 +619,8 @@ def parse_args(
         help="Interpolation for the final warped image.",
     )
 
+    add_warp_movie_args(p)
+
     add_recipe_arg(p, "optiwarp")
     add_deterministic_arg(p)
     add_device_arg(
@@ -734,6 +740,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         outs.append(f"{prefix}_WARPINV{ext}")
     if args.save_jacobian:
         outs.append(f"{prefix}_JAC{ext}")
+    movie = resolve_movie_path(args)
+    if movie is not None:
+        outs.append(movie)
     return outs
 
 
@@ -868,6 +877,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     warp_stem, nii_ext = _warp_stem(args, pfx), pfx.nifti_ext
 
     if timeseries:
+        if args.movie is not None and args.verb >= 1:
+            print("WARNING: -movie records a single 3D registration; ignored for a 4D -source")
         return _run_timeseries(
             args,
             base,
@@ -884,6 +895,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             t0,
         )
 
+    recorder = build_warp_movie_recorder(
+        args, base, source, out_info["affine"], device, "optiwarp", mask=mask
+    )
     res = optiwarp(
         base,
         source,
@@ -893,6 +907,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         moving_cover=src_cover,
         config=config,
         device=device,
+        recorder=recorder,
     )
 
     warped_path = pfx.as_file()
@@ -924,6 +939,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             save_image(res.jacobian.cpu(), jac_path, header_info=out_info)
         if args.verb >= 1:
             print(f"Saved Jacobian map: {jac_path}")
+
+    render_warp_movie(recorder, args, args.verb)
 
     if args.verb >= 1:
         print(f"Done in {time.time() - t0:.1f}s")
