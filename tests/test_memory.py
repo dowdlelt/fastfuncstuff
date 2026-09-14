@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from fastfuncstuff import memory as memory_module
 from fastfuncstuff.memory import (
     NORDIC_GPU_MAX_FRACTION,
     NORDIC_GPU_RESERVE_BYTES,
@@ -516,6 +517,39 @@ class TestEstimateKeepOnCpu:
             data_threshold_gb=0.1,
         )
         assert result is True
+
+    def test_cuda_gate_sees_a_busy_card(self, monkeypatch):
+        """A neighbour process on the card must push the same data to CPU.
+
+        The gate used to read ``total_memory - memory_reserved``, which counts
+        another process's VRAM as ours to spend. A 8 GiB dataset then routed
+        onto a card with only 8 GiB genuinely free and OOM'd a few steps later
+        in the first mask shrink. Driving the decision off the driver's figure
+        is what makes the two cases below differ at all.
+        """
+        gib = 1024**3
+        free_bytes = {"value": 0}
+
+        def fake_available(device, safety_factor=None, empty_cache=True):
+            assert safety_factor == 1.0, "the fraction is applied by the gate, not the probe"
+            return free_bytes["value"]
+
+        monkeypatch.setattr(memory_module, "get_available_memory", fake_available)
+
+        # 2e6 voxels x 1074 TRs x 4 bytes ~ 8.0 GiB
+        kwargs = dict(
+            n_voxels=2_000_000,
+            n_timepoints_total=1074,
+            device=torch.device("cuda"),
+            force_cpu=False,
+            gpu_safety_fraction=0.6,
+        )
+
+        free_bytes["value"] = int(15.46 * gib)  # idle card: 9.28 GiB budget
+        assert estimate_keep_on_cpu(**kwargs) is False
+
+        free_bytes["value"] = int(8.0 * gib)  # neighbour holding 7.5 GiB: 4.8 GiB budget
+        assert estimate_keep_on_cpu(**kwargs) is True
 
 
 class TestIntegration:

@@ -1705,12 +1705,15 @@ def estimate_keep_on_cpu(
     if force_cpu:
         return True
     elif device.type == "cuda":
-        # Check actual GPU free memory if available
+        # Ask the driver, not ``total - reserved``: the latter counts VRAM that
+        # OTHER processes hold as ours to spend, so on a shared card it routes
+        # a dataset onto the GPU that does not fit beside the neighbour. Every
+        # other sizing path in this module already goes through
+        # get_available_memory; this gate was the last hand-rolled one.
         try:
-            free_mem = (
-                torch.cuda.get_device_properties(device).total_memory
-                - torch.cuda.memory_reserved(device)
-            ) / (1024**3)
+            free_mem = get_available_memory(device, safety_factor=1.0, empty_cache=False) / (
+                1024**3
+            )
             return data_size_gb > free_mem * gpu_safety_fraction
         except Exception:
             return data_size_gb > data_threshold_gb
