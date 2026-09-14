@@ -129,6 +129,8 @@ class ImageWindow(QtWidgets.QWidget):
                 Binding("right-drag", "pan", None, group="view"),
                 Binding("l", "follow the crosshair", self.lock_button.click, group="view"),
                 Binding("scroll", "step through slices", None, group="view"),
+                Binding(".", "next volume", lambda: self._step_time(1), group="time"),
+                Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding("click", "move the crosshair", None, group="view"),
                 Binding("ctrl+click", "set the InstaCorr seed", None, group="view"),
                 Binding("h", "this list", self.help.toggle, group="window"),
@@ -189,6 +191,15 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetIJK(*ijk))
         if seed:
             self._dispatch(SetSeed(*ijk))
+
+    def _step_time(self, delta: int) -> None:
+        """Step the shared volume index, wrapping -- the controller's , and . here too."""
+        from fastfuncstuff.viewer.vocab import SetIndex
+
+        st = self.session.state
+        hi = st.max_time_index()
+        if hi > 0:
+            self._dispatch(SetIndex((st.time_index + delta) % (hi + 1)))
 
     def _zoom_by(self, factor: float) -> None:
         vp = self._viewport()

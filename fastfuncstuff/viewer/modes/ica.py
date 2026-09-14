@@ -29,7 +29,6 @@ import numpy as np
 from fastfuncstuff.viewer.commands import Aspect, Command
 from fastfuncstuff.viewer.modes.base import (
     ActionControl,
-    BoolControl,
     Control,
     IntControl,
     Mode,
@@ -94,12 +93,6 @@ class ICAMode(Mode):
                 hi=max(self._n_components - 1, 0),
                 default=0,
                 help="Which independent component to show.",
-            ),
-            BoolControl(
-                name="spectrum",
-                label="spectrum",
-                default=True,
-                help="Add the spectrum as a second trace in grid graphs.",
             ),
         )
 
@@ -285,6 +278,8 @@ class ICAMode(Mode):
             label=f"IC {k} time course {self._label_text(k)}".strip(),
             values=np.asarray(self._mix[:, k]),
             x_label="TR",
+            key="timecourse",
+            short="IC time course",
         )
 
     def _spectrum(self, k: int) -> Trace | None:
@@ -307,7 +302,14 @@ class ICAMode(Mode):
             nyquist = 0.5 / self._tr
             x = np.linspace(nyquist / values.size, nyquist, values.size)
             x_label = "Hz"
-        return Trace(label=f"IC {k} {what}", values=values, x=x, x_label=x_label)
+        return Trace(
+            label=f"IC {k} {what}",
+            values=values,
+            x=x,
+            x_label=x_label,
+            key="spectrum",
+            short="IC spectrum",
+        )
 
     def panels(self) -> dict[str, Trace]:
         if self._maps is None:
@@ -330,12 +332,9 @@ class ICAMode(Mode):
         if self._maps is None:
             return []
         k = self._index
-        out = [t for t in [self._timecourse(k)] if t is not None]
-        if self.params.get("spectrum", True):
-            spectrum = self._spectrum(k)
-            if spectrum is not None:
-                out.append(spectrum)
-        return out
+        # Both, always: whether the spectrum is drawn is a tick box on each
+        # graph window, not a mode-wide switch that hides it from all of them.
+        return [t for t in (self._timecourse(k), self._spectrum(k)) if t is not None]
 
     # -- reaction ------------------------------------------------------
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:

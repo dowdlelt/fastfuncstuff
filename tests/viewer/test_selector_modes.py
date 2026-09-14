@@ -594,14 +594,6 @@ def test_ica_contributes_a_timecourse_and_a_spectrum(ica_dir, session):
     assert traces[1].values.size == 20  # single-sided, DC dropped
 
 
-def test_the_spectrum_trace_can_be_turned_off(ica_dir, session):
-    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
-    session.read_directory(ica_dir / "ica_out")
-    session.do(SetMode("ica"))
-    session.set_mode_param("spectrum", "0")
-    assert len(session.mode_series((1, 1, 1))) == 1
-
-
 def test_ica_without_a_decomposition_says_so_rather_than_failing(session, datadir):
     session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
     session.read_directory(datadir)

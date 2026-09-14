@@ -167,6 +167,20 @@ class Trace:
     #: Free-text axis hint, e.g. "TR" or "Hz". The graph shows it; nothing
     #: parses it.
     x_label: str = ""
+    #: Stable identity across recomputes -- ``timecourse``, not "IC 3 time
+    #: course" -- so a graph's tick box and colour for this line survive
+    #: stepping to IC 4. Falls back to the label.
+    key: str = ""
+    #: Short name for a legend; falls back to the label.
+    short: str = ""
+
+    @property
+    def ident(self) -> str:
+        return self.key or self.label
+
+    @property
+    def legend(self) -> str:
+        return self.short or self.label
 
 
 # ---------------------------------------------------------------------------

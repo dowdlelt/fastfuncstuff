@@ -614,8 +614,8 @@ def test_the_graph_keeps_the_source_trace_after_a_seed(win, qapp, tmp_path):
     qapp.processEvents()
 
     labels = [t[0] for t in graph.graph._cells[0].traces]
-    assert "source" in labels, f"the correlated time course vanished: {labels}"
-    assert "prepared" in labels
+    assert "mode:source" in labels, f"the correlated time course vanished: {labels}"
+    assert "mode:prepared" in labels
 
 
 # ---------------------------------------------------------------------------
@@ -1987,3 +1987,82 @@ def test_review_keys_in_a_trace_window_label_and_step(win, qapp, ica_folder):
     spin = win.mode_panel._widgets["component"]
     assert spin.value() == 2
     assert "IC 2" in window.view._trace.label
+
+
+# ---------------------------------------------------------------------------
+# the graph legend: tick lines off, colours stay put
+# ---------------------------------------------------------------------------
+
+
+def _ica_graph(win4d, qapp, ica_folder):
+    _ica(win4d, qapp, ica_folder)
+    graph = open_graph(win4d, qapp)
+    win4d.refresh(Aspect.GRAPH | Aspect.LAYERS)
+    qapp.processEvents()
+    return graph
+
+
+def test_the_graph_legend_offers_every_layer_and_every_mode_line(win4d, qapp, ica_folder):
+    graph = _ica_graph(win4d, qapp, ica_folder)
+    run = win4d.session.graph_layers()[0].key
+    assert set(graph._trace_checks) == {run, "mode:timecourse", "mode:spectrum"}
+    assert all(box.isChecked() for box in graph._trace_checks.values())
+    assert graph._trace_checks["mode:spectrum"].text() == "IC spectrum"
+    assert graph._trace_checks[run].text() == "bold"
+
+
+def test_unticking_the_spectrum_takes_it_off_the_graph_and_keeps_colours(win4d, qapp, ica_folder):
+    """Colours come from each line's place in the whole list, so hiding one
+    must not hand its colour to the next line along."""
+    graph = _ica_graph(win4d, qapp, ica_folder)
+    before = dict(graph.graph._colors)
+    graph._trace_checks["mode:spectrum"].setChecked(False)
+    qapp.processEvents()
+
+    idents = {t[0] for cell in graph.graph._cells for t in cell.traces}
+    assert "mode:spectrum" not in idents and "mode:timecourse" in idents
+    assert graph.graph._colors["mode:timecourse"] == before["mode:timecourse"]
+    assert not graph._trace_checks["mode:spectrum"].isChecked()
+    assert "SET_VIEW_HIDDEN" in win4d.session.to_script()
+
+    # stepping to another component is a new line with the same identity
+    win4d._mode_action("next")
+    qapp.processEvents()
+    idents = {t[0] for cell in graph.graph._cells for t in cell.traces}
+    assert "mode:spectrum" not in idents
+
+
+def test_a_layer_can_be_ticked_off_and_back_on(win4d, qapp):
+    graph = open_graph(win4d, qapp)
+    run = win4d.session.graph_layers()[0].key
+    graph._trace_checks[run].setChecked(False)
+    qapp.processEvents()
+    assert not any(cell.traces for cell in graph.graph._cells)
+    graph._trace_checks[run].setChecked(True)
+    qapp.processEvents()
+    assert all(cell.traces for cell in graph.graph._cells)
+
+
+def _press(window, qapp, key):
+    from PySide6 import QtGui
+
+    action = next(a for a in window.actions() if a.shortcut() == QtGui.QKeySequence(key))
+    action.trigger()
+    qapp.processEvents()
+
+
+def test_left_right_and_comma_period_step_time_in_a_graph(win4d, qapp):
+    graph = open_graph(win4d, qapp)
+    st = win4d.session.state
+    for key, expected in (("Right", 1), (".", 2), ("Left", 1), (",", 0), (",", 24)):
+        _press(graph, qapp, key)
+        assert st.time_index == expected, key
+
+
+def test_comma_and_period_step_time_in_an_image_window(win4d, qapp):
+    image = image_of(win4d, Plane.AXIAL)
+    _press(image, qapp, ".")
+    _press(image, qapp, ".")
+    assert win4d.session.state.time_index == 2
+    _press(image, qapp, ",")
+    assert win4d.session.state.time_index == 1

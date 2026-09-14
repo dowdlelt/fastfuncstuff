@@ -201,6 +201,21 @@ class SetViewTraces(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewHidden(Command):
+    """Which lines a graph window leaves out, as comma-separated identities.
+
+    A layer key, or ``mode:<key>`` for a line the mode adds (``mode:spectrum``).
+    ``-`` or empty draws everything.
+    """
+
+    name = "SET_VIEW_HIDDEN"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    keys: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetViewSharedScale(Command):
     name = "SET_VIEW_SHARED_SCALE"
     aspects = Aspect.VIEWPORTS | Aspect.GRAPH
@@ -869,6 +884,12 @@ def install(
         assert isinstance(cmd, SetViewTraces)
         keys = tuple(k for k in (cmd.keys or "").split(",") if k and k != "-")
         return _set_view(st, cmd.view, SetViewTraces.aspects, traces=keys)
+
+    @bus.handle(SetViewHidden.name)
+    def _set_view_hidden(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewHidden)
+        keys = tuple(k for k in (cmd.keys or "").split(",") if k and k != "-")
+        return _set_view(st, cmd.view, SetViewHidden.aspects, hidden=keys)
 
     @bus.handle(SetViewSharedScale.name)
     def _set_view_shared(cmd: Command, st: ViewerState) -> Aspect:

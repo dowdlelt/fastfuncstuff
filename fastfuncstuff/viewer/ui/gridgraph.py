@@ -33,7 +33,16 @@ from fastfuncstuff.viewer.slicing import plane_layout
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.viewports import Viewport
-from fastfuncstuff.viewer.vocab import SetViewGrid, SetViewSharedScale, SetViewTraces
+from fastfuncstuff.viewer.vocab import (
+    SetIndex,
+    SetViewGrid,
+    SetViewHidden,
+    SetViewSharedScale,
+    SetViewTraces,
+)
+
+#: Longest name a legend tick box shows; the full one is its tooltip.
+LEGEND_CHARS = 22
 
 #: Below these the header and the trace toggles go away. Nothing is lost but
 #: the reminder -- + - and s still work, and a small graph beside a small image
@@ -61,8 +70,84 @@ def _decimate(values: np.ndarray, width: float) -> tuple[np.ndarray, np.ndarray]
 @dataclass
 class Cell:
     ijk: tuple[int, int, int]
+    #: ``(identity, values)``. The identity -- a layer key or ``mode:<key>`` --
+    #: is what picks the colour and the shared range, so hiding one line leaves
+    #: every other line its own colour instead of shifting them all along.
     traces: list[tuple[str, np.ndarray]]
     is_centre: bool
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One tickable line in a graph window's legend."""
+
+    ident: str
+    name: str
+    full: str
+    #: Whether the line is a time course -- what the time cursor and a
+    #: click-to-scrub are measured along. A spectrum is not.
+    is_time: bool = True
+
+
+class FlowLayout(QtWidgets.QLayout):
+    """Left to right, wrapping onto new rows. Qt ships none.
+
+    A stack with a run, its denoised copy and a mode's two lines is four tick
+    boxes, and one row of those is wider than a graph window beside an image.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None, spacing: int = 4) -> None:
+        super().__init__(parent)
+        self._items: list[QtWidgets.QLayoutItem] = []
+        self.setSpacing(spacing)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item: QtWidgets.QLayoutItem) -> None:  # noqa: N802 (Qt)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QtWidgets.QLayoutItem | None:  # noqa: N802 (Qt)
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> QtWidgets.QLayoutItem | None:  # noqa: N802 (Qt)
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> QtCore.Qt.Orientation:  # noqa: N802 (Qt)
+        return QtCore.Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 (Qt)
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 (Qt)
+        return self._arrange(QtCore.QRect(0, 0, width, 0), move=False)
+
+    def setGeometry(self, rect: QtCore.QRect) -> None:  # noqa: N802 (Qt)
+        super().setGeometry(rect)
+        self._arrange(rect, move=True)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802 (Qt)
+        return self.minimumSize()
+
+    def minimumSize(self) -> QtCore.QSize:  # noqa: N802 (Qt)
+        size = QtCore.QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    def _arrange(self, rect: QtCore.QRect, *, move: bool) -> int:
+        x, y, row_h = rect.x(), rect.y(), 0
+        gap = self.spacing()
+        for item in self._items:
+            hint = item.sizeHint()
+            if x + hint.width() > rect.right() and row_h > 0:
+                x, y, row_h = rect.x(), y + row_h + gap, 0
+            if move:
+                item.setGeometry(QtCore.QRect(QtCore.QPoint(x, y), hint))
+            x += hint.width() + gap
+            row_h = max(row_h, hint.height())
+        return y + row_h - rect.y()
 
 
 class GridGraph(QtWidgets.QWidget):
@@ -78,24 +163,45 @@ class GridGraph(QtWidgets.QWidget):
         self._n = 1
         self._index = 0
         self._shared_scale = True
+        self._colors: dict[str, QtGui.QColor] = {}
+        self._time: set[str] = set()
         self.setMinimumSize(60, 48)
         self.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding
         )
 
-    def set_cells(self, cells: list[Cell], n: int, index: int) -> None:
+    def set_cells(
+        self,
+        cells: list[Cell],
+        n: int,
+        index: int,
+        colors: dict[str, QtGui.QColor] | None = None,
+        time_keys: set[str] | None = None,
+    ) -> None:
         self._cells, self._n, self._index = cells, n, index
+        if colors is not None:
+            self._colors = colors
+        if time_keys is not None:
+            self._time = time_keys
         self.update()
+
+    def _time_trace(self, cell: Cell) -> np.ndarray | None:
+        """The first time-domain line in a cell; a spectrum has no 'now'."""
+        for ident, values in cell.traces:
+            if values.size and (not self._time or ident in self._time):
+                return values
+        return None
 
     def set_shared_scale(self, on: bool) -> None:
         self._shared_scale = bool(on)
         self.update()
 
     def _time_length(self) -> int:
-        """Length of the time-domain trace -- the first one, by convention."""
+        """Length of the first time-domain trace in any cell."""
         for cell in self._cells:
-            if cell.traces and cell.traces[0][1].size:
-                return int(cell.traces[0][1].size)
+            values = self._time_trace(cell)
+            if values is not None:
+                return int(values.size)
         return 0
 
     def _cell_rects(self) -> list[QtCore.QRectF]:
@@ -121,8 +227,8 @@ class GridGraph(QtWidgets.QWidget):
             self.scrubbed.emit(int(round(max(0.0, min(1.0, frac)) * (nt - 1))))
             return
 
-    def _bounds(self, cells: list[Cell]) -> list[tuple[float, float]]:
-        """One y-range per trace index, shared across every cell.
+    def _bounds(self, cells: list[Cell]) -> dict[str, tuple[float, float]]:
+        """One y-range per line, shared across every cell.
 
         Per *trace* rather than one range for everything, because the traces on
         a cell are routinely in different units -- raw BOLD counts next to a
@@ -130,18 +236,18 @@ class GridGraph(QtWidgets.QWidget):
         one onto the axis and makes it useless. Sharing across cells is what
         keeps neighbouring voxels comparable, which is the point of the grid.
         """
-        n_traces = max((len(c.traces) for c in cells), default=0)
-        out: list[tuple[float, float]] = []
-        for i in range(n_traces):
-            vals = [c.traces[i][1] for c in cells if len(c.traces) > i and c.traces[i][1].size]
-            if not vals:
-                out.append((0.0, 1.0))
-                continue
+        grouped: dict[str, list[np.ndarray]] = {}
+        for cell in cells:
+            for ident, values in cell.traces:
+                if values.size:
+                    grouped.setdefault(ident, []).append(values)
+        out: dict[str, tuple[float, float]] = {}
+        for ident, vals in grouped.items():
             lo = float(min(float(np.nanmin(v)) for v in vals))
             hi = float(max(float(np.nanmax(v)) for v in vals))
             if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
                 lo, hi = lo - 1.0, lo + 1.0
-            out.append((lo, hi))
+            out[ident] = (lo, hi)
         return out
 
     def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802 (Qt)
@@ -176,7 +282,7 @@ class GridGraph(QtWidgets.QWidget):
         p: QtGui.QPainter,
         rect: QtCore.QRectF,
         cell: Cell,
-        shared: list[tuple[float, float]] | None,
+        shared: dict[str, tuple[float, float]] | None,
     ) -> None:
         c = theme.palette()
         border = QtGui.QColor(c.edge_lit) if cell.is_centre else QtGui.QColor(c.edge)
@@ -196,8 +302,8 @@ class GridGraph(QtWidgets.QWidget):
         # does not exist.
         cursor_len = 0
 
-        for si, (_, values) in indexed:
-            lo, hi = bounds[si] if si < len(bounds) else (0.0, 1.0)
+        for si, (ident, values) in indexed:
+            lo, hi = bounds.get(ident, (0.0, 1.0))
             span = hi - lo or 1.0
             nt = values.size
             cursor_len = max(cursor_len, nt)
@@ -212,14 +318,17 @@ class GridGraph(QtWidgets.QWidget):
                 y = inner.bottom() - (float(v) - lo) / span * inner.height()
                 pt = QtCore.QPointF(x, y)
                 path.moveTo(pt) if i == 0 else path.lineTo(pt)
-            pen = QtGui.QPen(QtGui.QColor.fromRgbF(*c.series[si % len(c.series)]))
+            colour = self._colors.get(ident) or QtGui.QColor.fromRgbF(*c.series[si % len(c.series)])
+            pen = QtGui.QPen(colour)
             pen.setWidthF(1.6 if cell.is_centre else 1.0)
             p.setPen(pen)
             p.drawPath(path)
 
-        # The time cursor belongs to the time-domain trace, which is the first
-        # one; a spectrum has no "current time point".
-        first_len = indexed[0][1][1].size
+        # The time cursor belongs to a time-domain trace; a spectrum has no
+        # "current time point", and with every time course ticked off there is
+        # no cursor to draw.
+        timeline = self._time_trace(cell)
+        first_len = 0 if timeline is None else timeline.size
         if 0 <= self._index < first_len:
             x = inner.left() + (self._index / max(first_len - 1, 1)) * inner.width()
             cursor = QtGui.QColor(c.warn)
@@ -295,14 +404,14 @@ class GraphWindow(QtWidgets.QWidget):
         self.header.setLayout(bar)
         v.addWidget(self.header)
 
-        # One toggle per plottable layer, in the trace's own colour, so a line
-        # in the plot and the control that turns it off are the same object as
-        # far as the eye is concerned.
+        # One tick box per line -- every plottable layer and every line the mode
+        # adds -- in the line's own colour, so a line in the plot and the
+        # control that turns it off are the same object as far as the eye is
+        # concerned. Wraps rather than widening the window.
         self.trace_host = QtWidgets.QWidget()
-        self.trace_bar = QtWidgets.QHBoxLayout(self.trace_host)
-        self.trace_bar.setContentsMargins(0, 0, 0, 0)
-        self.trace_bar.setSpacing(4)
-        self._trace_buttons: list[QtWidgets.QPushButton] = []
+        self.trace_bar = FlowLayout(self.trace_host)
+        self._trace_checks: dict[str, QtWidgets.QCheckBox] = {}
+        self._legend: tuple = ()
         v.addWidget(self.trace_host)
 
         self.graph = GridGraph()
@@ -319,6 +428,20 @@ class GraphWindow(QtWidgets.QWidget):
                 ),
                 Binding("-", "fewer voxels", lambda: self.step_grid(-1), group="grid"),
                 Binding("s", "shared scale", self.shared_check.click, group="grid"),
+                Binding(
+                    "Right",
+                    "next volume",
+                    lambda: self.step_time(1),
+                    group="time",
+                    aliases=(".",),
+                ),
+                Binding(
+                    "Left",
+                    "previous volume",
+                    lambda: self.step_time(-1),
+                    group="time",
+                    aliases=(",",),
+                ),
                 Binding("click", "jump to that volume", None, group="grid"),
                 Binding("h", "this list", self.help.toggle, group="window"),
                 Binding("w", "close this window", self.close, group="window"),
@@ -339,22 +462,58 @@ class GraphWindow(QtWidgets.QWidget):
         if vp is not None:
             self._dispatch(SetViewGrid(self.vid, vp.grid_n + delta))
 
-    def _toggle_trace(self, key: str) -> None:
-        """Turn one layer's line on or off in this window.
+    def step_time(self, delta: int) -> None:
+        """Step the shared volume index, wrapping, as , and . do everywhere."""
+        st = self.session.state
+        hi = st.max_time_index()
+        if hi > 0:
+            self._dispatch(SetIndex((st.time_index + delta) % (hi + 1)))
 
-        Stored as the explicit set of layers to keep rather than as the set to
-        drop, so a layer loaded later starts plotted -- which is what someone
-        who just loaded it is looking for.
+    def _toggle(self, ident: str, on: bool) -> None:
+        """Tick one line on or off in this window.
+
+        Off is recorded in ``hidden``. On also re-admits a layer a script left
+        out of ``traces``, so a tick box never shows checked for a line that
+        is not drawn.
         """
         vp = self._viewport()
         if vp is None:
             return
-        current = [ly.key for ly in self.session.traces_for(vp)]
-        if key in current:
-            current.remove(key)
-        else:
-            current = [ly.key for ly in self.session.graph_layers() if ly.key in {*current, key}]
-        self._dispatch(SetViewTraces(self.vid, ",".join(current)))
+        hidden = [k for k in vp.hidden if k != ident]
+        if not on:
+            hidden.append(ident)
+        elif not ident.startswith("mode:") and vp.traces and ident not in vp.traces:
+            keep = {*vp.traces, ident}
+            order = [ly.key for ly in self.session.graph_layers() if ly.key in keep]
+            self._dispatch(SetViewTraces(self.vid, ",".join(order)))
+        self._dispatch(SetViewHidden(self.vid, ",".join(hidden)))
+
+    def entries(self, viewport: Viewport) -> list[Entry]:
+        """Every line this window could draw, in a fixed order: layers, then the mode's."""
+        out = []
+        for layer in self.session.graph_layers():
+            stem = layer.name.removesuffix(".gz").removesuffix(".nii")
+            out.append(Entry(layer.key, _clip(stem), layer.name))
+        st = self.session.state
+        if st.grid is not None:
+            for trace in self.session.mode_series(st.crosshair):
+                out.append(
+                    Entry(
+                        f"mode:{trace.ident}",
+                        _clip(trace.legend),
+                        trace.label,
+                        is_time=trace.x_label in ("", "TR"),
+                    )
+                )
+        return out
+
+    def _drawn(self, viewport: Viewport) -> set[str]:
+        layers = {ly.key for ly in self.session.traces_for(viewport)}
+        return {
+            e.ident
+            for e in self.entries(viewport)
+            if e.ident not in viewport.hidden and (e.ident.startswith("mode:") or e.ident in layers)
+        }
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)
@@ -365,31 +524,53 @@ class GraphWindow(QtWidgets.QWidget):
         self.count_label.setText(f"{viewport.cells:>3d}")
         self.shared_check.setChecked(viewport.shared_scale)
         self.graph.set_shared_scale(viewport.shared_scale)
-        self._rebuild_trace_buttons(viewport)
+        self._sync_legend(viewport)
 
-    def _rebuild_trace_buttons(self, viewport: Viewport) -> None:
+    def _colors(self, entries: list[Entry]) -> dict[str, QtGui.QColor]:
+        """A colour per line by its place in the full list, not the drawn one."""
+        series = theme.palette().series
+        return {
+            e.ident: QtGui.QColor.fromRgbF(*series[i % len(series)]) for i, e in enumerate(entries)
+        }
+
+    def _sync_legend(self, viewport: Viewport, *, force: bool = False) -> None:
+        """Rebuild the tick boxes only when the set of lines or their state moved.
+
+        Checked on every refresh, because a mode's lines appear without any
+        layer changing -- ICA loading a folder is one -- but rebuilt only on a
+        real difference, since a crosshair drag refreshes at display rate.
+        """
+        entries = self.entries(viewport)
+        drawn = self._drawn(viewport)
+        signature = (tuple((e.ident, e.name) for e in entries), tuple(sorted(drawn)))
+        if signature == self._legend and not force:
+            return
+        self._legend = signature
         while self.trace_bar.count():
             item = self.trace_bar.takeAt(0)
             widget = item.widget() if item is not None else None
             if widget is not None:
                 widget.deleteLater()
-        self._trace_buttons.clear()
+        self._trace_checks.clear()
 
-        plottable = self.session.graph_layers()
-        shown = {ly.key for ly in self.session.traces_for(viewport)}
-        for i, layer in enumerate(plottable):
-            series = theme.palette().series
-            colour = QtGui.QColor.fromRgbF(*series[i % len(series)])
-            b = QtWidgets.QPushButton(layer.name)
-            b.setCheckable(True)
-            b.setChecked(layer.key in shown)
-            b.setStyleSheet(f"QPushButton:checked {{ color: {colour.name()}; }}")
-            b.clicked.connect(lambda _=False, k=layer.key: self._toggle_trace(k))
-            self.trace_bar.addWidget(b)
-            self._trace_buttons.append(b)
-        if not plottable:
+        faint = theme.palette().faint
+        for entry, colour in zip(entries, self._colors(entries).values(), strict=True):
+            box = QtWidgets.QCheckBox(entry.name)
+            box.setToolTip(entry.full)
+            on = entry.ident in drawn
+            box.setChecked(on)
+            box.setStyleSheet(
+                f"QCheckBox {{ color: {colour.name() if on else faint}; }}"
+                f"QCheckBox::indicator:checked {{ background: {colour.name()};"
+                f" border: 1px solid {colour.name()}; }}"
+            )
+            box.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+            box.toggled.connect(lambda checked, k=entry.ident: self._toggle(k, bool(checked)))
+            self.trace_bar.addWidget(box)
+            self._trace_checks[entry.ident] = box
+        if not entries:
             self.trace_bar.addWidget(QtWidgets.QLabel("no time series loaded"))
-        self.trace_bar.addStretch(1)
+        self.trace_host.updateGeometry()
 
     def refresh(self) -> None:
         """Rebuild the cells around the current crosshair."""
@@ -407,7 +588,10 @@ class GraphWindow(QtWidgets.QWidget):
         centre_row, centre_col = layout.to_image(st.crosshair, st.grid.shape)
         half = n // 2
 
-        traced = self.session.traces_for(vp)
+        self._sync_legend(vp)
+        entries = self.entries(vp)
+        drawn = self._drawn(vp)
+        traced = [ly for ly in self.session.traces_for(vp) if ly.key in drawn]
         cells: list[Cell] = []
         for dr in range(-half, -half + n):
             for dc in range(-half, -half + n):
@@ -415,21 +599,34 @@ class GraphWindow(QtWidgets.QWidget):
                     layout.to_ijk(centre_row + dr, centre_col + dc, st.crosshair, st.grid.shape)
                 )
                 cells.append(
-                    Cell(ijk=ijk, traces=self._traces(traced, ijk), is_centre=(dr == 0 and dc == 0))
+                    Cell(
+                        ijk=ijk,
+                        traces=self._traces(traced, ijk, drawn),
+                        is_centre=(dr == 0 and dc == 0),
+                    )
                 )
-        self.graph.set_cells(cells, n, st.time_index)
+        self.graph.set_cells(
+            cells,
+            n,
+            st.time_index,
+            colors=self._colors(entries),
+            time_keys={e.ident for e in entries if e.is_time},
+        )
         self.info.setText(self.session.mode.status())
 
-    def _traces(self, layers, ijk: tuple[int, int, int]) -> list[tuple[str, np.ndarray]]:
-        """The selected layers' time courses, plus whatever the mode adds."""
+    def _traces(
+        self, layers, ijk: tuple[int, int, int], drawn: set[str]
+    ) -> list[tuple[str, np.ndarray]]:
+        """The ticked layers' time courses, plus the mode's ticked lines."""
         out: list[tuple[str, np.ndarray]] = []
         for layer in layers:
             values = self.session.timeseries(layer.key, ijk)
             if values.size:
-                out.append((layer.name, values))
+                out.append((layer.key, values))
         for trace in self.session.mode_series(ijk):
-            if trace.values.size:
-                out.append((trace.label, trace.values))
+            ident = f"mode:{trace.ident}"
+            if trace.values.size and ident in drawn:
+                out.append((ident, trace.values))
         return out
 
     def restyle(self) -> None:
@@ -437,7 +634,7 @@ class GraphWindow(QtWidgets.QWidget):
         self.setStyleSheet(theme.stylesheet())
         viewport = self._viewport()
         if viewport is not None:
-            self._rebuild_trace_buttons(viewport)
+            self._sync_legend(viewport, force=True)
         self.graph.update()
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
@@ -445,4 +642,8 @@ class GraphWindow(QtWidgets.QWidget):
         super().closeEvent(event)
 
 
-__all__ = ["Cell", "GraphWindow", "GridGraph"]
+def _clip(text: str) -> str:
+    return text if len(text) <= LEGEND_CHARS else text[: LEGEND_CHARS - 1] + "…"
+
+
+__all__ = ["Cell", "Entry", "FlowLayout", "GraphWindow", "GridGraph"]

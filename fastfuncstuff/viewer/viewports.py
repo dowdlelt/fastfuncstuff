@@ -102,6 +102,11 @@ class Viewport:
     #: offered -- an anatomy has no time course to draw.
     traces: tuple[str, ...] = ()
     shared_scale: bool = True
+    #: Lines a graph window has ticked off, by identity: a layer key, or
+    #: ``mode:<trace key>`` for a line a mode adds. The set to *hide* rather
+    #: than to show, for the same reason ``traces`` defaults to everything: a
+    #: line that appears later -- a mode's spectrum -- starts drawn.
+    hidden: tuple[str, ...] = ()
 
     # -- carpet and matrix ---------------------------------------------
     #: Row order. See :mod:`viewer.carpet` for what each one groups.

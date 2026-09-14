@@ -351,6 +351,8 @@ class InstaCorrMode(Mode):
             out.append(
                 Trace(
                     label="source",
+                    key="source",
+                    short="icorr source",
                     values=np.asarray(self._source[i, j, k, :], dtype=np.float32),
                     x_label="TR",
                 )
@@ -362,6 +364,8 @@ class InstaCorrMode(Mode):
                 out.append(
                     Trace(
                         label="prepared",
+                        key="prepared",
+                        short="icorr prepared",
                         values=self._prepared[flat].cpu().numpy(),
                         x_label="TR",
                     )
