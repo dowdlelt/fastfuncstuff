@@ -535,6 +535,26 @@ def forward_scans(
     return modulated, mean
 
 
+def wrap_pad_pe(vol: Tensor, tdims: list[int], n: int) -> Tensor:
+    """Pad ``vol`` by ``n`` voxels at both ends of each tensor dim in ``tdims``, wrapping.
+
+    The front gets the last ``n`` slices and the back the first ``n``. EPI's phase-encode
+    axis is periodic in the acquisition: signal displaced past one edge of the FOV
+    aliases in at the other. A zero or clamped edge gives the field no way to express
+    that, so the solver matches the wrapped tissue as if it belonged where it landed --
+    pulling the opposite end of the brain the wrong way. Padding with the wrapped
+    slices puts the aliased signal back where the model can pull it from.
+    """
+    if n <= 0:
+        return vol
+    for d in tdims:
+        size = vol.shape[d]
+        if n >= size:
+            raise ValueError(f"wrap padding {n} must be smaller than the PE axis length {size}")
+        vol = torch.cat((vol.narrow(d, size - n, n), vol, vol.narrow(d, 0, n)), dim=d)
+    return vol.contiguous()
+
+
 def compute_mask(scans: list[ScanSpec]) -> Tensor:
     """Intersection mask of finite/positive data, with PE-axis edge planes zeroed.
 
@@ -1340,6 +1360,7 @@ def run_topup(
     motion_ref: int = 0,
     motion_interp: str = "cubic",
     recorder: WarpMovieRecorder | None = None,
+    wrap_pad: int = 0,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1356,6 +1377,11 @@ def run_topup(
     cost here, because the numerically sensitive reductions (cost, CG inner products)
     accumulate in float64 regardless (see :func:`_dot64`); the smooth Hz field itself has
     plenty of headroom in float32. Pass ``torch.float64`` to reproduce the old behaviour.
+
+    ``wrap_pad`` pads every scan by that many voxels at both ends of each PE axis with
+    slices wrapped from the opposite end (see :func:`wrap_pad_pe`), estimates on the
+    padded grid, and crops ``field_hz``/``unwarped``/``mean_unwarped`` back. ``coeff``
+    and ``basis`` stay on the padded grid.
 
     ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
     row per scan) captures every scan undistorted by the running field after each
@@ -1385,6 +1411,17 @@ def run_topup(
             )
         )
 
+    orig_shape = shape
+    pad_tdims = sorted({_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in work}) if wrap_pad > 0 else []
+    for sc in work:
+        sc.data = wrap_pad_pe(sc.data, pad_tdims, wrap_pad)
+    shape = tuple(work[0].data.shape)  # type: ignore[assignment]
+    crop = tuple(
+        slice(wrap_pad, wrap_pad + n) if d in pad_tdims else slice(None)
+        for d, n in enumerate(orig_shape)
+    )
+    offset = tuple(float(wrap_pad) if d in pad_tdims else 0.0 for d in range(3))
+
     shift = 0.0
     if pe_shift:
         shift = estimate_pe_shift(work)
@@ -1413,8 +1450,8 @@ def run_topup(
     if recorder is not None:
         from fastfuncstuff.viz.warp_movie import FieldFrame
 
-        recorder.set_images([sc.data for sc in work])
-        recorder.set_frame(FieldFrame(mapping="stride"))
+        recorder.set_images([sc.data[crop] for sc in work])
+        recorder.set_frame(FieldFrame(offset=offset, full_shape=shape, mapping="stride"))
         recorder.capture_identity(label="start")
 
     n_lev = config.n_levels()
@@ -1505,7 +1542,7 @@ def run_topup(
                 verbose=progress,
             )
             if recorder is not None:
-                recorder.set_images([sc.data for sc in work])
+                recorder.set_images([sc.data[crop] for sc in work])
     level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
@@ -1538,6 +1575,8 @@ def run_topup(
         # Jacobian-modulated undistorted images, un-scaled back to native intensity.
         modulated, _ = forward_scans(full_coeff, full_basis, work)
         unwarped = [(m / s).to(dtype) for m, s in zip(modulated, scales, strict=True)]
+    field_hz = field_hz[crop]
+    unwarped = [u[crop] for u in unwarped]
     mean_unwarped = torch.stack(unwarped, dim=0).mean(dim=0)
     return TopupResult(
         field_hz=field_hz,

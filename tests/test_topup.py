@@ -407,3 +407,58 @@ def test_motion_estimation_reconciles_moved_pair():
     assert torch.allclose(res_on.motion_matrices[0], eye), "reference scan should not move"
     dz = res_on.motion_matrices[1][2, 3].item()
     assert -1.7 < dz < -0.9, f"z-translation not recovered: {dz}"
+
+
+def test_wrap_pad_pe_takes_the_opposite_end():
+    vol = torch.arange(2 * 6 * 3, dtype=torch.float32).reshape(2, 6, 3)
+    out = T.wrap_pad_pe(vol, [1], 2)
+    assert out.shape == (2, 10, 3)
+    assert torch.equal(out[:, :2], vol[:, -2:])
+    assert torch.equal(out[:, 2:8], vol)
+    assert torch.equal(out[:, 8:], vol[:, :2])
+
+
+def _aliasing_pair(nz=16, ny=32, nx=28, readout=0.5):
+    """Tissue against both PE edges, pushed across them: the acquisition aliases."""
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(ny).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    true = torch.full((nz, ny, nx), 5.0)
+    for cy, a in [(1.5, 120.0), (30.0, 90.0), (16, 60.0)]:
+        true += a * torch.exp(
+            -(((zz - 8) / 5) ** 2 + ((yy - cy) / 2.5) ** 2 + ((xx - 14) / 6) ** 2)
+        )
+    field = 6.0 * torch.cos(2 * math.pi * (yy + 0.5) / ny) * torch.exp(-(((xx - 14) / 10) ** 2))
+
+    def observed(sign):
+        disp = field * readout * sign
+        coord = (torch.arange(ny).float()[None, :, None] - disp) % ny  # periodic PE sampling
+        lo = coord.floor().long() % ny
+        hi = (lo + 1) % ny
+        fr = coord - coord.floor()
+        o = torch.gather(true, 1, lo) * (1 - fr) + torch.gather(true, 1, hi) * fr
+        return o / T._jacobian_pe(disp, 1).clamp(min=0.1)
+
+    return field, [
+        T.ScanSpec(observed(+1.0), 1, +1.0, readout),
+        T.ScanSpec(observed(-1.0), 1, -1.0, readout),
+    ]
+
+
+def test_wrap_padding_reconciles_blips_at_the_pe_edges():
+    """Without the wrap, signal aliased across the FOV edge is matched where it landed."""
+    field, scans = _aliasing_pair()
+    band = torch.zeros_like(field, dtype=torch.bool)
+    band[3:-3, :5, 4:-4] = True
+    band[3:-3, -5:, 4:-4] = True
+
+    def edge_disagreement(pad):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
+        )
+        r = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, wrap_pad=pad)
+        assert r.field_hz.shape == field.shape and r.unwarped[0].shape == field.shape
+        return ((r.unwarped[0] - r.unwarped[1])[band]).pow(2).mean().sqrt().item()
+
+    # Measured 4.41 -> 2.56.
+    assert edge_disagreement(4) < 0.75 * edge_disagreement(0)

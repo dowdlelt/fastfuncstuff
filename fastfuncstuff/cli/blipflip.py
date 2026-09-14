@@ -211,6 +211,19 @@ def create_parser() -> argparse.ArgumentParser:
         "between the two scans (tiny scanner shift), then estimate the field. A rigid "
         "shift is confounded by the field itself, so it is capped small; off by default.",
     )
+    sched.add_argument(
+        "-pad_phase_wrap",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Pad each scan by N voxels at both ends of the phase-encode axis with slices "
+        "wrapped from the opposite end, estimate on that grid, then crop back. Use when "
+        "distortion pushes tissue (skull, scalp) past the FOV edge so it aliases in at the "
+        "other end: without it the solver matches that wrapped signal where it landed and "
+        "pulls the wrong end of the brain. How much depends on the data and the FOV margin "
+        "-- try a few values. Only the estimate and blipflip's own _unwarped images see the "
+        "wrap; applying the saved warp with ffs_nwarp does not.",
+    )
 
     mot = parser.add_argument_group("Movement (topup --estmov analogue)")
     mot.add_argument(
@@ -536,6 +549,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         vox,
         cfg,
         pe_shift=args.pe_shift,
+        wrap_pad=args.pad_phase_wrap,
         progress=args.verb >= 1,
         solve_dtype=solve_dtype,
         mask_field=not args.no_mask_field,
