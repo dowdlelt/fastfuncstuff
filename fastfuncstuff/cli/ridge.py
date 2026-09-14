@@ -517,6 +517,11 @@ def main():
         print(f"  TR from header: {args.tr}s")
     else:
         print(f"  TR (specified): {args.tr}s")
+
+    # Every field is unpacked; drop the loader's handle so the full-volume
+    # (n_voxels, n_timepoints) tensor has exactly one reference and any later
+    # shrink of *data* can actually free the pre-mask copy.
+    del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     # Shift event timing to the retained window before anything else touches the

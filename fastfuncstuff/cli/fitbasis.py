@@ -2542,6 +2542,11 @@ def main() -> int:
     mask = load_result.mask
     n_voxels = load_result.n_voxels
     n_timepoints = load_result.n_timepoints
+
+    # Every field is unpacked; drop the loader's handle so the full-volume
+    # (n_voxels, n_timepoints) tensor has exactly one reference and any later
+    # shrink of *data* can actually free the pre-mask copy.
+    del load_result
     if args.tr is None:
         args.tr = tr
     # -flobs-dt is both the HRF sampling grid and the convolution grid here,

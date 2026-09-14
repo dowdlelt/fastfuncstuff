@@ -1829,6 +1829,13 @@ def main():
     # Update args.tr with loaded value (for later use)
     if args.tr is None:
         args.tr = load_result.tr
+
+    # Drop the loader's handle now that every field is unpacked. It is the only
+    # other reference to the full-volume (n_voxels, n_timepoints) tensor, so
+    # holding it means the automask/restrict_voxels shrinks below free nothing --
+    # the pre-mask copy stays resident for the whole run and the two live
+    # side by side (7.2 GiB + 2.9 GiB on a 5-run 763k-voxel dataset).
+    del load_result
     args.microtime_dt = resolve_microtime_dt(args.tr, args.microtime_dt)
 
     # Timing was parsed before the load, so the -drop_first shift lands here,

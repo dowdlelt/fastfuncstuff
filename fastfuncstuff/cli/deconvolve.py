@@ -1069,6 +1069,11 @@ def main():
     tr = load_result.tr
     mask = load_result.mask
     nx, ny, nz = load_result.volume_shape
+
+    # Every field is unpacked; drop the loader's handle so the full-volume
+    # (n_voxels, n_timepoints) tensor has exactly one reference and any later
+    # shrink of *data* can actually free the pre-mask copy.
+    del load_result
     n_timepoints_per_run = run_lengths_from_starts(run_starts, n_timepoints)
     n_voxels_loaded = data.shape[0]
 

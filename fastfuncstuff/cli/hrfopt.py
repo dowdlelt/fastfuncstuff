@@ -882,6 +882,11 @@ def main():
     scale_info = load_result.scale_info
     violations_mask = load_result.violations_mask
 
+    # Every field is unpacked; drop the loader's handle so the full-volume
+    # (n_voxels, n_timepoints) tensor has exactly one reference and any later
+    # shrink of *data* can actually free the pre-mask copy.
+    del load_result
+
     # Update args.tr with extracted value (for consistency with rest of code)
     if args.tr is None:
         args.tr = tr

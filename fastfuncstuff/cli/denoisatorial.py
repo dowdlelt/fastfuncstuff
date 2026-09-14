@@ -1135,6 +1135,13 @@ def main():
 
     nifti_header = load_result.nifti_header
 
+    # Drop the loader's handle now that every field is unpacked. It is the only
+    # other reference to the full-volume (n_voxels, n_timepoints) tensor, so
+    # holding it means the automask/restrict_voxels shrinks below free nothing --
+    # the pre-mask copy stays resident for the whole run and the two live
+    # side by side (7.2 GiB + 2.9 GiB on a 5-run 763k-voxel dataset).
+    del load_result
+
     # HRF model parsing needs the TR (FIR/TENT derive their basis count from it),
     # so it has to wait until the header has been read.
     from fastfuncstuff.cli_utils import parse_hrf_model_args, validate_hrf_compatibility
