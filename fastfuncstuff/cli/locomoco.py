@@ -1808,71 +1808,6 @@ def create_parser() -> argparse.ArgumentParser:
     return p
 
 
-def _find_ffmpeg() -> str | None:
-    """System ffmpeg binary path, if available (for small/fast h264 mp4)."""
-    import shutil
-
-    return shutil.which("ffmpeg")
-
-
-def _write_mp4_ffmpeg(frames: np.ndarray, path: str, fps: int, ffmpeg: str) -> None:
-    """Pipe RGB frames straight to the system ffmpeg → h264 mp4 (no pip deps)."""
-    import subprocess
-
-    # h264 + yuv420p needs even dimensions; pad the sheet if odd.
-    t, h, w, _ = frames.shape
-    ph, pw = h + (h % 2), w + (w % 2)
-    if (ph, pw) != (h, w):
-        padded = np.full((t, ph, pw, 3), 255, np.uint8)
-        padded[:, :h, :w] = frames
-        frames = padded
-        h, w = ph, pw
-    cmd = [
-        ffmpeg,
-        "-y",
-        "-loglevel",
-        "error",
-        "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
-        "-s",
-        f"{w}x{h}",
-        "-r",
-        str(fps),
-        "-i",
-        "-",
-        "-an",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        "20",
-        path,
-    ]
-    proc = subprocess.run(cmd, input=frames.tobytes(), capture_output=True)
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.decode(errors="replace")[-500:])
-
-
-def _write_movie(frames: np.ndarray, path: str, fps: int, fmt: str) -> str:
-    """Write ``(T, H, W, 3)`` uint8 frames as a movie; return the actual path."""
-    if fmt == "mp4":
-        ffmpeg = _find_ffmpeg()
-        if ffmpeg is not None:
-            _write_mp4_ffmpeg(frames, path, fps, ffmpeg)
-            return path
-        gif_path = str(Path(path).with_suffix(".gif"))
-        print(f"  ⚠️  no ffmpeg on PATH; writing GIF instead: {gif_path}")
-        path = gif_path
-
-    import imageio.v2 as imageio
-
-    imageio.mimwrite(path, list(frames), duration=1000.0 / max(fps, 1), loop=0)
-    return path
-
-
 # Presets bump the levers that helped on spatially-varying (local stretch/squish)
 # field tests: bicubic warp (better for flow, neutral elsewhere), more convergence
 # iterations, reference-refinement rounds, and denser search.
@@ -5563,11 +5498,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device | None) -> int:
     _write_xcorr_diagnostics(result, stem, ext, affine, args)
 
     if not args.no_movie:
-        fmt = args.movie_format or ("mp4" if _find_ffmpeg() else "gif")
+        from fastfuncstuff.viz.encode import default_movie_format, write_movie
+
+        fmt = args.movie_format or default_movie_format()
         frames = result.flow_movie(max_mag=args.flow_max)
         movie_path = f"{stem}_flow.{fmt}"
         with spinner(f"Writing {Path(movie_path).name}"):
-            _write_movie(frames, movie_path, args.fps, fmt)
+            write_movie(frames, movie_path, args.fps, fmt)
 
     print_cli_footer("ffs_locomoco")
     return 0
