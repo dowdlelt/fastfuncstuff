@@ -52,7 +52,6 @@ METHOD / CREDIT
 from __future__ import annotations
 
 import argparse
-import os
 import shlex
 import sys
 from datetime import datetime
@@ -525,10 +524,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         affine,
         device,
         "blipflip",
-        row_labels=[
-            f"{os.path.basename(p).split('.')[0]} ({pe})"
-            for p, pe in zip(paths, pe_dirs, strict=True)
-        ],
+        row_labels=(
+            [f"scan {i + 1} ({pe})" for i, pe in enumerate(pe_dirs)]
+            if args.imain
+            else [f"blip_up ({pe_dirs[0]})", f"blip_down ({pe_dirs[1]})"]
+        ),
     )
     solve_dtype = torch.float64 if args.precision == "float64" else torch.float32
     result = T.run_topup(
