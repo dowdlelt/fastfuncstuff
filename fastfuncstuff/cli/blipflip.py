@@ -222,9 +222,12 @@ def create_parser() -> argparse.ArgumentParser:
         "  N (one unsigned number): pad every scan by N voxels at both PE ends with slices "
         "wrapped from the opposite end.\n"
         "  S1,S2 (one signed number per scan, blip_up first; also '-5 +5'): say where each "
-        "scan's wrap belongs. -K moves that scan's first K slices (low index end) to beyond "
-        "its last; +K moves its last K slices to before its first; 0 leaves it. All scans "
-        "are then zero-padded onto one grid. E.g. -5,0 when only blip_up wrapped.\n"
+        "scan's wrap belongs. The sign is the direction the wrapped slab MOVES, in "
+        "anatomical terms, whatever the storage order: +K takes the K slices at the "
+        "left/posterior/inferior end and moves them beyond the right/anterior/superior end; "
+        "-K the reverse; 0 leaves the scan. For an A/P phase encode, +9 = 'the back of the "
+        "brain wrapped to the front; put it back behind the front'. All scans are then "
+        "zero-padded onto one grid. E.g. -5,0 when only blip_up wrapped.\n"
         "The amount is data-dependent -- try a few, the run prints which anatomical ends "
         "each move goes between. The estimate is cropped back to the input grid; applying "
         "the saved warp with ffs_nwarp does not wrap.",
@@ -474,6 +477,18 @@ def _pe_ends(affine: np.ndarray, nifti_axis: int) -> tuple[str, str]:
     return names[away], names[towards]
 
 
+def _anatomical_moves_to_index_shifts(
+    moves: list[int], pe_axes: list[int], affine: np.ndarray
+) -> list[int]:
+    """``-pad_phase_wrap`` shifts (+ moves the slab toward R/A/S) -> ``unwrap_pe`` shifts
+    (negative moves the low-index slab past the high-index end)."""
+    shifts = []
+    for k, axis in zip(moves, pe_axes, strict=True):
+        _, high = _pe_ends(affine, axis)
+        shifts.append(-k if high in ("right", "anterior", "superior") else k)
+    return shifts
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = _join_signed_values(list(sys.argv[1:] if argv is None else argv))
     args = create_parser().parse_args(argv)
@@ -619,16 +634,24 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             else [f"blip_up ({pe_dirs[0]})", f"blip_down ({pe_dirs[1]})"]
         ),
     )
-    wrap_pad, unwrap = _parse_phase_wrap(args.pad_phase_wrap, len(scans))
-    if args.verb >= 1 and unwrap is not None:
-        for i, (k, sc) in enumerate(zip(unwrap, scans, strict=True)):
-            if k == 0:
-                continue
+    wrap_pad, moves = _parse_phase_wrap(args.pad_phase_wrap, len(scans))
+    unwrap = None
+    if moves is not None:
+        # The flag speaks anatomy (+ moves the slab toward R/A/S); unwrap_pe speaks index
+        # order (shift < 0 moves the low-index slab past the high end). Storage order is
+        # per-file, so map through the affine -- reading the sign as index order put the
+        # air in front of the head behind the occipital pole on an A>P-stored scan.
+        unwrap = _anatomical_moves_to_index_shifts(moves, [sc.pe_axis for sc in scans], affine)
+        for i, (k, sc) in enumerate(zip(moves, scans, strict=True)):
             low, high = _pe_ends(affine, sc.pe_axis)
-            src, dst = (low, high) if k < 0 else (high, low)
-            print(
-                f"  unwrap scan {i + 1} ({pe_dirs[i]}): {abs(k)} slices at the {src} end -> beyond the {dst} end"
-            )
+            index_points_positive = high in ("right", "anterior", "superior")
+            if args.verb >= 1 and k != 0:
+                neg_end, pos_end = (low, high) if index_points_positive else (high, low)
+                src, dst = (neg_end, pos_end) if k > 0 else (pos_end, neg_end)
+                print(
+                    f"  unwrap scan {i + 1} ({pe_dirs[i]}): {abs(k)} slices at the {src} end "
+                    f"-> beyond the {dst} end"
+                )
     elif args.verb >= 1 and wrap_pad:
         print(f"  wrap padding: {wrap_pad} voxels at both phase-encode ends")
     if args.save_pad_phase:

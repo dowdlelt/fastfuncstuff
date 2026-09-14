@@ -523,3 +523,25 @@ def test_unwrap_recovers_the_field_where_only_one_blip_aliased():
     # Measured 0.60 / 0.26 / 5.16 Hz against an 8 Hz peak.
     assert right < 0.6 * none
     assert wrong > 3 * none
+
+
+def test_pad_phase_wrap_sign_is_anatomical_not_index_order():
+    """+K must move the posterior slab forward however the file is stored.
+
+    Read as index order, +9 on a scan indexed posterior-to-anterior put the air in
+    front of the head behind the occipital pole.
+    """
+    import numpy as np
+
+    from fastfuncstuff.cli.blipflip import _anatomical_moves_to_index_shifts
+
+    ras = np.diag([2.0, 2.0, 2.0, 1.0])  # j increases toward anterior
+    lpi = np.diag([-2.0, -2.0, 2.0, 1.0])  # j increases toward posterior
+    vol = torch.arange(1, 11, dtype=torch.float32).reshape(1, 10, 1)
+    for affine, posterior_first in ((ras, True), (lpi, False)):
+        (shift,) = _anatomical_moves_to_index_shifts([+3], [1], affine)
+        out = T.unwrap_pe(vol, 1, shift, front=max(0, shift), back=max(0, -shift))[0, :, 0]
+        # The three most posterior slices must now sit beyond the anterior end.
+        posterior = [1.0, 2.0, 3.0] if posterior_first else [10.0, 9.0, 8.0]
+        beyond_anterior = out[-3:].tolist() if posterior_first else out[:3].flip(0).tolist()
+        assert beyond_anterior == posterior
