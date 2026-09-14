@@ -545,3 +545,18 @@ def test_pad_phase_wrap_sign_is_anatomical_not_index_order():
         posterior = [1.0, 2.0, 3.0] if posterior_first else [10.0, 9.0, 8.0]
         beyond_anterior = out[-3:].tolist() if posterior_first else out[:3].flip(0).tolist()
         assert beyond_anterior == posterior
+
+
+def test_padding_skips_all_zero_edge_planes():
+    """A reversed-PE recon's empty edge line must not be dragged into the image."""
+    v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)  # empty last plane
+    # Last 2 DATA slices (4, 5) move before the start; the empty plane stays at the edge.
+    out = T.unwrap_pe(v, 1, +2, front=2, back=0)[0, :, 0].tolist()
+    assert out == [4, 5, 1, 2, 3, 0, 0, 0]
+    # First 2 slices move past the end, against the data (not after the empty plane).
+    out = T.unwrap_pe(v, 1, -2, front=0, back=2)[0, :, 0].tolist()
+    assert out == [0, 0, 3, 4, 5, 1, 2, 0]
+    # Symmetric wrap: no zero plane between the volume and its wrapped neighbours.
+    out = T.wrap_pad_pe(v, [1], 2)[0, :, 0].tolist()
+    assert out == [4, 5, 1, 2, 3, 4, 5, 1, 2, 0]
+    assert out[2:7] == [1, 2, 3, 4, 5]  # data keeps its own voxels, so the crop is unchanged

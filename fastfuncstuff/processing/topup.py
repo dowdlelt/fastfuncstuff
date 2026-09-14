@@ -535,23 +535,51 @@ def forward_scans(
     return modulated, mean
 
 
+def _edge_zero_planes(v: Tensor) -> tuple[int, int]:
+    """Count all-zero planes at the start and end of dim 0 (the PE axis, moved first).
+
+    Some reversed-PE reconstructions leave one exactly-empty line at the PE edge. It is
+    not signal, and a slab moved with it in tow drags an empty plane into the middle of
+    the image, so the wrap logic works on the planes between these runs.
+    """
+    has_data = (v.reshape(v.shape[0], -1) != 0).any(dim=1)
+    idx = torch.nonzero(has_data).flatten()
+    if idx.numel() == 0:
+        return v.shape[0], 0
+    return int(idx[0]), v.shape[0] - 1 - int(idx[-1])
+
+
 def wrap_pad_pe(vol: Tensor, tdims: list[int], n: int) -> Tensor:
     """Pad ``vol`` by ``n`` voxels at both ends of each tensor dim in ``tdims``, wrapping.
 
-    The front gets the last ``n`` slices and the back the first ``n``. EPI's phase-encode
-    axis is periodic in the acquisition: signal displaced past one edge of the FOV
-    aliases in at the other. A zero or clamped edge gives the field no way to express
-    that, so the solver matches the wrapped tissue as if it belonged where it landed --
-    pulling the opposite end of the brain the wrong way. Padding with the wrapped
-    slices puts the aliased signal back where the model can pull it from.
+    The front gets the last ``n`` slices of data and the back the first ``n``. EPI's
+    phase-encode axis is periodic in the acquisition: signal displaced past one edge of
+    the FOV aliases in at the other. A zero or clamped edge gives the field no way to
+    express that, so the solver matches the wrapped tissue as if it belonged where it
+    landed -- pulling the opposite end of the brain the wrong way. Padding with the
+    wrapped slices puts the aliased signal back where the model can pull it from.
+
+    All-zero planes at an edge (see :func:`_edge_zero_planes`) are not data: the wrapped
+    slices are taken from, and placed against, the planes that hold signal, and the
+    empty planes end up at the outer edge. The volume keeps its own voxels at
+    ``n..n+size-1``, so the crop back is unchanged.
     """
     if n <= 0:
         return vol
     for d in tdims:
         size = vol.shape[d]
-        if n >= size:
-            raise ValueError(f"wrap padding {n} must be smaller than the PE axis length {size}")
-        vol = torch.cat((vol.narrow(d, size - n, n), vol, vol.narrow(d, 0, n)), dim=d)
+        v = vol.movedim(d, 0)
+        z_lo, z_hi = _edge_zero_planes(v)
+        real = v[z_lo : size - z_hi]
+        if n >= real.shape[0]:
+            raise ValueError(
+                f"wrap padding {n} must be smaller than the PE data extent {real.shape[0]}"
+            )
+        out = torch.zeros((size + 2 * n, *v.shape[1:]), dtype=vol.dtype, device=vol.device)
+        out[n + z_lo : n + size - z_hi] = real
+        out[z_lo : n + z_lo] = real[-n:]
+        out[n + size - z_hi : 2 * n + size - z_hi] = real[:n]
+        vol = out.movedim(0, d)
     return vol.contiguous()
 
 
@@ -562,30 +590,39 @@ def unwrap_pe(vol: Tensor, tdim: int, shift: int, front: int, back: int) -> Tens
     ``front..front+n-1`` -- except the wrapped slab:
 
     - ``shift < 0``: the first ``|shift|`` slices belong past the high-index edge; they
-      move to ``front+n..front+n+|shift|-1`` and their original place is zero.
+      move there and their original place is zero.
     - ``shift > 0``: the last ``shift`` slices belong before the low-index edge; they
-      move to ``front-shift..front-1`` and their original place is zero.
+      move there and their original place is zero.
 
-    Everything else is zero, so scans with different (or no) shifts share one grid.
-    Unlike :func:`wrap_pad_pe` this states which scan wrapped and by how much, rather
-    than offering every scan the other end's slices.
+    "First" and "last" count planes that hold data: all-zero edge planes (see
+    :func:`_edge_zero_planes`) are skipped, and the slab lands directly against the
+    data at the far end, so no empty plane is carried into the image. Everything else
+    is zero, so scans with different (or no) shifts share one grid. Unlike
+    :func:`wrap_pad_pe` this states which scan wrapped and by how much, rather than
+    offering every scan the other end's slices.
     """
     n = vol.shape[tdim]
-    if abs(shift) >= n:
-        raise ValueError(f"unwrap shift {shift} must be smaller than the PE axis length {n}")
     if shift > front or -shift > back:
         raise ValueError("front/back padding must cover the shift")
     v = vol.movedim(tdim, 0)
     out = torch.zeros((front + n + back, *v.shape[1:]), dtype=vol.dtype, device=vol.device)
-    if shift < 0:
-        m = -shift
-        out[front + m : front + n] = v[m:]
-        out[front + n : front + n + m] = v[:m]
-    elif shift > 0:
-        out[front : front + n - shift] = v[: n - shift]
-        out[front - shift : front] = v[n - shift :]
-    else:
+    if shift == 0:
         out[front : front + n] = v
+        return out.movedim(0, tdim).contiguous()
+    z_lo, z_hi = _edge_zero_planes(v)
+    real = v[z_lo : n - z_hi]
+    k = abs(shift)
+    if k >= real.shape[0]:
+        raise ValueError(
+            f"unwrap shift {shift} must be smaller than the PE data extent {real.shape[0]}"
+        )
+    start, stop = front + z_lo, front + n - z_hi  # where the data sits
+    if shift < 0:
+        out[start + k : stop] = real[k:]
+        out[stop : stop + k] = real[:k]
+    else:
+        out[start : stop - k] = real[:-k]
+        out[start - k : start] = real[-k:]
     return out.movedim(0, tdim).contiguous()
 
 
