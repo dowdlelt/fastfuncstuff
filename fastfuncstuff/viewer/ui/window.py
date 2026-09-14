@@ -1275,6 +1275,19 @@ class ViewerWindow(QtWidgets.QMainWindow):
             parts.append(f"{layer.name}{tag}={'--' if val is None else f'{val:.4g}'}")
         self.value_label.setText("   ".join(parts[:3]))
 
+    def dock_left(self) -> None:
+        """Park the controller at the left edge of its screen, full height.
+
+        Left rather than wherever the window system drops it, so tiling always
+        has one contiguous region to its right to fill.
+        """
+        screen = self.screen() or QtGui.QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        self.resize(self.width(), area.height() - (self.frameGeometry().height() - self.height()))
+        self.move(area.topLeft())
+
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802 (Qt)
         # The controller is the session; closing it closes the companions too,
         # or they linger with nothing driving them.
@@ -1308,6 +1321,7 @@ def launch(
         win.open_path(p)
     if script:
         win.refresh(session.run_script(Path(script).read_text()))
+    win.dock_left()
     win.show()
     win.manager.tile(win)
     return app.exec()
