@@ -48,3 +48,21 @@ def test_restrict_voxels_composes_with_existing_mask():
     vol = np.zeros(mask_flat.size, dtype=np.float32)
     vol[mask_flat] = new_data[:, 0].numpy()
     assert vol[0] == 0.0 and vol[7] == 0.0
+
+
+def test_restrict_voxels_keeping_everything_does_not_copy():
+    # The all-True case is the one apply_automask hits when the mask spares
+    # every loaded voxel. Returning the same object matters on a full-volume
+    # load: the gather would otherwise need the matrix's size again in free
+    # VRAM to produce a tensor equal to the one it was handed.
+    volume_shape = (2, 2, 2)
+    prior_flat = np.array([False, True, True, True, True, True, True, False])
+    data = torch.arange(6 * 2, dtype=torch.float32).reshape(6, 2)
+    keep = torch.ones(6, dtype=torch.bool)
+
+    new_data, mask, mask_flat, n_voxels = restrict_voxels(data, keep, volume_shape, prior_flat)
+
+    assert new_data is data
+    assert n_voxels == 6
+    assert np.array_equal(mask_flat, prior_flat)
+    assert mask.shape == volume_shape

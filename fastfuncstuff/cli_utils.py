@@ -828,8 +828,24 @@ def restrict_voxels(
     else:
         new_flat[keep_np] = True
 
-    data = data[torch.as_tensor(keep_np, device=data.device)]
     new_mask = new_flat.reshape(volume_shape)
+    if bool(keep_np.all()):
+        # Nothing to drop. The gather below would copy the whole matrix, and
+        # need its size over again in free memory, to hand back an identical
+        # tensor -- on a full-volume load that is several GiB for no change.
+        return data, new_mask, new_flat, int(new_flat.sum())
+
+    # A boolean gather is out-of-place, so the source and the result are both
+    # resident at the peak; there is no in-place way to shrink a tensor and
+    # actually release the tail. Give the caching allocator's free blocks back
+    # to the driver first -- they are usually fragmented too small to serve one
+    # (n_keep, n_timepoints) request, and a run that dies here tends to miss by
+    # less than that slack (bug-of-record: 1.44 GiB stranded in the cache, a
+    # 2.84 GiB request, 2.85 GiB reported free).
+    if data.is_cuda:
+        torch.cuda.empty_cache()
+
+    data = data[torch.as_tensor(keep_np, device=data.device)]
     return data, new_mask, new_flat, int(new_flat.sum())
 
 
