@@ -234,6 +234,17 @@ def create_parser() -> argparse.ArgumentParser:
     )
 
     sched.add_argument(
+        "-pad_phase_empty",
+        choices=("zero", "unknown"),
+        default="zero",
+        help="How the cost treats voxels a signed -pad_phase_wrap emptied (the moved slab's "
+        "old place, and zero padding added for the other scan). zero: they are measured "
+        "zeros, so pushing tissue into them costs something. unknown: they are left out "
+        "of the cost like missing data -- which makes them a blind zone the field can dump "
+        "mismatched tissue into (seen as frontal tissue squashed against the FOV edge). "
+        "A scan's own all-zero edge planes are always unknown.",
+    )
+    sched.add_argument(
         "-save_pad_phase",
         action="store_true",
         help="Write {prefix}_padphase: the inputs after -pad_phase_wrap, one volume per "
@@ -655,7 +666,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     elif args.verb >= 1 and wrap_pad:
         print(f"  wrap padding: {wrap_pad} voxels at both phase-encode ends")
     if args.save_pad_phase:
-        padded, pad_tdims, front = T.pad_scans_pe(scans, wrap_pad, unwrap)
+        padded, pad_tdims, front, _ = T.pad_scans_pe(scans, wrap_pad, unwrap)
         pad_affine = np.array(affine, dtype=float, copy=True)
         for d in pad_tdims:
             # Voxel index grew by `front` on this axis; move the origin back by as much.
@@ -676,6 +687,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         pe_shift=args.pe_shift,
         wrap_pad=wrap_pad,
         unwrap=unwrap,
+        empty_as_zero=args.pad_phase_empty == "zero",
         progress=args.verb >= 1,
         solve_dtype=solve_dtype,
         mask_field=not args.no_mask_field,

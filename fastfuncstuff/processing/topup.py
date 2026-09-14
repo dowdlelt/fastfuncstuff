@@ -626,12 +626,39 @@ def unwrap_pe(vol: Tensor, tdim: int, shift: int, front: int, back: int) -> Tens
     return out.movedim(0, tdim).contiguous()
 
 
+def _declared_empty_pe(
+    n: int, z_lo: int, z_hi: int, shift: int, front: int, back: int, device
+) -> Tensor:
+    """Which PE positions of an :func:`unwrap_pe` output the unwrap declared empty.
+
+    True where the grid holds neither the scan's data nor one of its own all-zero edge
+    planes: the slab's vacated place and the zero padding added for other scans. Those
+    zeros are a statement ("nothing belongs here"), unlike a recon's empty line, which
+    is simply unmeasured.
+    """
+    empty = torch.ones(front + n + back, dtype=torch.bool, device=device)
+    if shift == 0:
+        empty[front : front + n] = False
+        return empty
+    empty[front : front + z_lo] = False  # the scan's own empty planes stay unmeasured
+    empty[front + n - z_hi : front + n] = False
+    k = abs(shift)
+    start, stop = front + z_lo, front + n - z_hi
+    if shift < 0:
+        empty[start + k : stop + k] = False
+    else:
+        empty[start - k : stop - k] = False
+    return empty
+
+
 def pad_scans_pe(
     scans: Sequence[ScanSpec], wrap_pad: int = 0, unwrap: Sequence[int] | None = None
-) -> tuple[list[Tensor], list[int], int]:
+) -> tuple[list[Tensor], list[int], int, list[Tensor] | None]:
     """Apply ``wrap_pad`` or per-scan ``unwrap`` to every scan's data.
 
-    Returns ``(padded data per scan, padded tensor dims, voxels added before index 0)``.
+    Returns ``(padded data per scan, padded tensor dims, voxels added before index 0,
+    declared-empty PE positions per scan)``. The last is a 1-D bool along the PE axis
+    for ``unwrap`` (see :func:`_declared_empty_pe`) and None otherwise.
     The single definition of the padded grid: :func:`run_topup` estimates on it and
     ``ffs_blipflip -save_pad_phase`` writes it, so the two cannot drift apart.
     """
@@ -645,25 +672,42 @@ def pad_scans_pe(
             raise ValueError("unwrap needs every scan to share one phase-encode axis")
         front = max([0, *unwrap])
         back = max([0, *(-k for k in unwrap)])
-        data = [
-            unwrap_pe(sc.data, tdims[0], k, front, back)
-            for sc, k in zip(scans, unwrap, strict=True)
-        ]
-        return data, tdims, front
+        data, empty = [], []
+        for sc, k in zip(scans, unwrap, strict=True):
+            data.append(unwrap_pe(sc.data, tdims[0], k, front, back))
+            z_lo, z_hi = _edge_zero_planes(sc.data.movedim(tdims[0], 0))
+            n = sc.data.shape[tdims[0]]
+            empty.append(_declared_empty_pe(n, z_lo, z_hi, k, front, back, sc.data.device))
+        return data, tdims, front, empty
     if wrap_pad > 0:
-        return [wrap_pad_pe(sc.data, tdims, wrap_pad) for sc in scans], tdims, wrap_pad
-    return [sc.data for sc in scans], [], 0
+        return [wrap_pad_pe(sc.data, tdims, wrap_pad) for sc in scans], tdims, wrap_pad, None
+    return [sc.data for sc in scans], [], 0, None
 
 
-def compute_mask(scans: list[ScanSpec]) -> Tensor:
+def compute_mask(
+    scans: list[ScanSpec],
+    declared_empty: Sequence[Tensor] | None = None,
+    pe_tdim: int = 1,
+) -> Tensor:
     """Intersection mask of finite/positive data, with PE-axis edge planes zeroed.
 
     Mirrors topup's trick of excluding a one-voxel frame in the non-PE and PE
     directions so small edge effects don't dominate the SSD.
+
+    ``declared_empty`` (one 1-D bool along ``pe_tdim`` per scan) marks positions an
+    unwrap emptied on purpose. They count as measured zeros rather than missing data:
+    left out of the cost, they are a blind zone the field can push mismatched tissue
+    into at no cost -- on a reported pair the vacated anterior slab had the cost active
+    on 9.5% of voxels, and the fine levels squashed frontal tissue into it.
     """
     m = torch.ones_like(scans[0].data, dtype=torch.bool)
-    for sc in scans:
-        m &= torch.isfinite(sc.data) & (sc.data > (sc.data.mean() * 1e-3))
+    for i, sc in enumerate(scans):
+        ok = torch.isfinite(sc.data) & (sc.data > (sc.data.mean() * 1e-3))
+        if declared_empty is not None:
+            view = [1, 1, 1]
+            view[pe_tdim] = -1
+            ok |= declared_empty[i].view(view)
+        m &= ok
     # Zero the outer plane on every axis (cheap, symmetric version of topup's frame).
     m[0, :, :] = False
     m[-1, :, :] = False
@@ -1462,6 +1506,7 @@ def run_topup(
     recorder: WarpMovieRecorder | None = None,
     wrap_pad: int = 0,
     unwrap: Sequence[int] | None = None,
+    empty_as_zero: bool = True,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1484,7 +1529,9 @@ def run_topup(
     padded grid, and crops ``field_hz``/``unwarped``/``mean_unwarped`` back. ``coeff``
     and ``basis`` stay on the padded grid. ``unwrap`` is the per-scan alternative: one
     signed slice count per scan, telling each scan where its aliased edge belongs (see
-    :func:`unwrap_pe`); every scan shares one PE axis. The crop is the same.
+    :func:`unwrap_pe`); every scan shares one PE axis. The crop is the same. With
+    ``empty_as_zero`` the positions an unwrap empties are scored as zeros, not skipped
+    (see :func:`compute_mask`).
 
     ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
     row per scan) captures every scan undistorted by the running field after each
@@ -1515,7 +1562,9 @@ def run_topup(
         )
 
     orig_shape = shape
-    padded, pad_tdims, front = pad_scans_pe(work, wrap_pad, unwrap)
+    padded, pad_tdims, front, declared_empty = pad_scans_pe(work, wrap_pad, unwrap)
+    if not empty_as_zero:
+        declared_empty = None
     for sc, data in zip(work, padded, strict=True):
         sc.data = data
     shape = tuple(work[0].data.shape)  # type: ignore[assignment]
@@ -1588,7 +1637,8 @@ def run_topup(
             coeff = refit_coeff(prev_field, new_basis)
         basis = new_basis
 
-        mask = compute_mask(level_scans)
+        level_empty = None if declared_empty is None else [e[::ss] for e in declared_empty]
+        mask = compute_mask(level_scans, level_empty, pad_tdims[0] if pad_tdims else 1)
         on_step = None
         if recorder is not None:
             recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")

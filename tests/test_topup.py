@@ -560,3 +560,22 @@ def test_padding_skips_all_zero_edge_planes():
     out = T.wrap_pad_pe(v, [1], 2)[0, :, 0].tolist()
     assert out == [4, 5, 1, 2, 3, 4, 5, 1, 2, 0]
     assert out[2:7] == [1, 2, 3, 4, 5]  # data keeps its own voxels, so the crop is unchanged
+
+
+def test_declared_empty_positions_are_scored_as_zeros():
+    """Vacated slab and padding count; a scan's own empty edge plane does not."""
+    v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)
+    scans = [T.ScanSpec(v, 1, 1.0, 0.05)]
+    data, tdims, front, empty = T.pad_scans_pe(scans, unwrap=[+2])
+    assert data[0][0, :, 0].tolist() == [4, 5, 1, 2, 3, 0, 0, 0]
+    # 5, 6: where 4 and 5 came from (declared empty); 7: the recon's empty line (unmeasured).
+    assert empty is not None and empty[0].tolist() == [False] * 5 + [True, True, False]
+
+    big = data[0].expand(3, 8, 3).contiguous()
+    padded = [T.ScanSpec(big, 1, 1.0, 0.05)]
+    blind = T.compute_mask(padded)[1, :, 1].tolist()
+    scored = T.compute_mask(padded, empty, pe_tdim=1)[1, :, 1].tolist()
+    # compute_mask also drops the outer frame plane on every axis (index 0 and 7 here).
+    assert blind[5:7] == [False, False]
+    assert scored[5:7] == [True, True]
+    assert scored[7] is False
