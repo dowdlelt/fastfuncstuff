@@ -689,6 +689,10 @@ def install(
             session.forget(old.key)
         if session is not None:
             session.apply_overlay_defaults(layer.key)
+        # An overlay is picked in order to be adjusted, so the controls land on
+        # it -- otherwise the first threshold drag moves whatever was selected
+        # before, which is usually the anatomy.
+        st.selected = layer.key
         dirty = SetOverlay.aspects
         if st.grid is None:
             dirty |= _adopt_grid_preserving_position(st, layer)
@@ -701,6 +705,7 @@ def install(
         st.layers.add_overlay(layer)
         if session is not None:
             session.apply_overlay_defaults(layer.key)
+        st.selected = layer.key
         dirty = AddOverlay.aspects
         if st.grid is None:
             dirty |= _adopt_grid_preserving_position(st, layer)

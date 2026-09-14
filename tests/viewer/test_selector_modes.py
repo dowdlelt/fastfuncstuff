@@ -648,3 +648,19 @@ def test_repeated_seed_moves_do_not_re_prepare(corr_session):
     for pos in ((4, 5, 3), (2, 3, 1), (3, 4, 2)):
         corr_session.do(SetSeed(*pos))
         assert corr_session.mode._prepared is prepared, "seed move re-prepared"
+
+
+def test_a_picked_overlay_is_what_the_controls_act_on(session, datadir):
+    """Picking an overlay is picking the thing about to be thresholded; a
+    selection left on the anatomy makes the first threshold drag move it."""
+    from fastfuncstuff.viewer.vocab import SelectLayer
+
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    base = session.state.layers.base.key
+    session.do(SelectLayer(base))
+    session.do(SetOverlay(str(datadir / "stats_tstat.nii.gz")))
+    assert session.state.selected == session.state.layers.overlay.key
+
+    session.do(SelectLayer(base))
+    session.do(AddOverlay(str(datadir / "brainmask.nii.gz")))
+    assert session.state.selected == session.state.layers.layers[-1].key

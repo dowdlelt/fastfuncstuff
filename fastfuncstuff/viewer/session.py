@@ -591,6 +591,9 @@ class ViewerSession:
             # so being displaced here cannot strand it.
             self._displaced_overlay = self.state.layers.overlay
             self.state.layers.set_overlay(layer)
+            # Selected for the same reason a picked overlay is: a mode's map
+            # arrives to be thresholded.
+            self.state.selected = key
             if self.state.grid is None:
                 self.state.adopt_grid(layer.shape, layer.affine)
         return key
