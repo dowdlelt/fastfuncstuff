@@ -15,6 +15,15 @@ Everything else a mode needs is declared, not coded:
   adding a mode never means adding widget code.
 * :meth:`Mode.series` contributes traces to the graph windows -- an ICA
   component's time course, a GLM's fitted response.
+* :meth:`Mode.actions` declares buttons -- KEEP, APPLY -- the same way controls
+  are declared, and :meth:`Mode.action` runs one.
+
+**What a mode makes is a layer, and it outlives the mode.** The live output is
+named for the controller and the mode (``A_ICORR``) and stays in the stack when
+you switch away; coming back picks it up again. KEEP freezes a numbered copy
+(``A_ICORR_1``) so two seeds, or two components, can be flipped between. That is
+what lets tabs compose modes: B denoises a run, then B's InstaCorr correlates
+the result, and ``B_ICORR`` sits beside ``A_ICORR``.
 
 That is the whole contract. A new mode is one file.
 """
@@ -108,6 +117,20 @@ class BoolControl(Control):
 
 
 @dataclass(frozen=True)
+class PathControl(Control):
+    """A file path, typed or browsed. Committed on enter, never per keystroke."""
+
+    default: str = ""
+    #: Qt file-dialog filter, e.g. ``"1D / xmat (*.1D);;All (*)"``.
+    filter: str = "All (*)"
+
+
+@dataclass(frozen=True)
+class ActionControl(Control):
+    """A button. Runs :meth:`Mode.action` with this control's name."""
+
+
+@dataclass(frozen=True)
 class DatasetControl(Control):
     """Pick a dataset from the catalog -- a mode's input, not its overlay."""
 
@@ -154,6 +177,8 @@ class Mode(ABC):
 
     name: ClassVar[str] = ""
     label: ClassVar[str] = ""
+    #: Short upper-case stem for what this mode makes: ``A_ICORR``, ``B_ICA``.
+    tag: ClassVar[str] = ""
     overlay_kind: ClassVar[OverlayKind] = OverlayKind.VALUE
     #: Whether this mode owns an overlay layer at all. Plain mode does not --
     #: its overlay is whatever the user picked.
@@ -178,10 +203,19 @@ class Mode(ABC):
         self._dirty = True
 
     def detach(self) -> None:
-        """Drop the mode's overlay so switching modes leaves no residue."""
-        if self.session is not None and self.produces_overlay:
-            self.session.remove_computed_overlay(self.layer_source)
+        """Let go of the session. The output layer stays where it is.
+
+        It used to be removed, on the theory that switching modes should leave
+        no residue. But the output is the result: an InstaCorr map you switch
+        away from to go and denoise is the map you wanted to compare against.
+        """
         self.session = None
+
+    def output_name(self, detail: str = "") -> str:
+        """``A_ICORR``, or ``A_ICA IC 3`` when the output has an identity of its own."""
+        label = self.session.label if self.session is not None else ""
+        stem = f"{label}_{self.tag or self.name.upper()}" if label else (self.tag or self.name)
+        return f"{stem} {detail}" if detail else stem
 
     @property
     def layer_source(self) -> str:
@@ -191,6 +225,27 @@ class Mode(ABC):
     def controls(self) -> Sequence[Control]:
         """Parameters the UI should offer. Static per mode."""
         return ()
+
+    def actions(self) -> Sequence[ActionControl]:
+        """Buttons the UI should offer. KEEP, for any mode with an output."""
+        if not self.produces_overlay:
+            return ()
+        return (
+            ActionControl(
+                name="keep",
+                label="keep",
+                help="Freeze a numbered copy of the current output (A_ICORR_1, _2, ...) "
+                "to compare the next one against.",
+            ),
+        )
+
+    def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
+        """Run one declared action on the GUI thread; return what it dirtied."""
+        if name == "keep" and self.produces_overlay:
+            if self.session is None:
+                return Aspect.NOTHING
+            return self.session.keep_output(self)
+        raise KeyError(f"mode {self.name!r} has no action {name!r}")
 
     def set_param(self, name: str, value: Any) -> Aspect:
         """Update a parameter and recompute if it changed."""
@@ -330,6 +385,8 @@ __all__ = [
     "IntControl",
     "Mode",
     "OptionalFloatControl",
+    "PathControl",
+    "ActionControl",
     "ProgressFn",
     "ModeRegistry",
     "OverlayKind",

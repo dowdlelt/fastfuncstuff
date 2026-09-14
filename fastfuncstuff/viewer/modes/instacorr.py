@@ -40,6 +40,7 @@ from fastfuncstuff.viewer.vocab import SetSeed
 class InstaCorrMode(Mode):
     name = "instacorr"
     label = "InstaCorr"
+    tag = "ICORR"
     overlay_kind = OverlayKind.CORRELATION
 
     def controls(self) -> tuple[Control, ...]:
@@ -241,13 +242,28 @@ class InstaCorrMode(Mode):
         return torch.fft.irfft(spec, n=nt, dim=-1)
 
     # -- seed ----------------------------------------------------------
+    def _to_source(self, ijk: tuple[int, int, int]) -> tuple[int, int, int]:
+        """A display-grid voxel as a voxel of the run being correlated.
+
+        Through millimetres, because the display grid is the underlay's: with a
+        1 mm anatomy under a 3 mm run, anatomy voxel (120, 140, 90) is far past
+        the run's edge, and indexing the run with it silently produced no map.
+        """
+        grid = self.session.state.grid if self.session is not None else None
+        if grid is None or self._affine is None:
+            return ijk
+        mm = grid.ijk_to_mm(ijk)
+        v = np.linalg.inv(self._affine) @ np.array([*mm, 1.0])
+        i, j, k = (int(round(float(c))) for c in v[:3])
+        return (i, j, k)
+
     def _seed_timecourse(self) -> torch.Tensor | None:
         data, valid = self._prepared, self._valid
         if data is None or valid is None or self.session is None:
             return None
-        seed_ijk = self.session.state.seed
-        if seed_ijk is None:
+        if self.session.state.seed is None:
             return None
+        seed_ijk = self._to_source(self.session.state.seed)
         nx, ny, nz = self._shape
         si, sj, sk = seed_ijk
         radius = float(self.params.get("seed_radius") or 0.0)
@@ -291,7 +307,7 @@ class InstaCorrMode(Mode):
         return ComputedOverlay(
             values=np.nan_to_num(vol, nan=0.0),
             affine=self._affine,
-            name="instacorr",
+            name=self.output_name(),
             kind=OverlayKind.CORRELATION,
             colormap="redblue",
             display_range=(-1.0, 1.0),
@@ -312,7 +328,7 @@ class InstaCorrMode(Mode):
         this, setting a seed would make the very time course the correlation
         came from disappear from view.
         """
-        i, j, k = ijk
+        i, j, k = self._to_source(ijk)
         if self._source is not None:
             nx, ny, nz, _ = self._source.shape
             if not (0 <= i < nx and 0 <= j < ny and 0 <= k < nz):

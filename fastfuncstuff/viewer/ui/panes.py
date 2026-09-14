@@ -11,6 +11,8 @@ not on every expose event.
 
 from __future__ import annotations
 
+import sys
+
 import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -222,6 +224,17 @@ class ImagePane(QtWidgets.QWidget):
     # -- input ---------------------------------------------------------
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         if event.button() == QtCore.Qt.MouseButton.RightButton:
+            # macOS turns a physical ctrl+click into a right-button press (and
+            # reports ctrl as Meta), so the gesture the status line asks for
+            # arrived here as the start of a pan and never set a seed.
+            if (
+                sys.platform == "darwin"
+                and event.modifiers() & QtCore.Qt.KeyboardModifier.MetaModifier
+            ):
+                idx = self._to_indices(event.position())
+                if idx is not None:
+                    self.seeded.emit(*idx)
+                return
             self._drag_from = event.position()
             return
         idx = self._to_indices(event.position())

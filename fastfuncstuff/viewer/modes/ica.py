@@ -60,6 +60,7 @@ def _first(directory: Path, names: tuple[str, ...]) -> Path | None:
 class ICAMode(Mode):
     name = "ica"
     label = "ICA"
+    tag = "ICA"
     overlay_kind = OverlayKind.COMPONENT
 
     def controls(self) -> tuple[Control, ...]:
@@ -165,7 +166,7 @@ class ICAMode(Mode):
         return ComputedOverlay(
             values=values,
             affine=self._affine,
-            name=f"IC {k}",
+            name=self.output_name(f"IC {k}"),
             kind=OverlayKind.COMPONENT,
             colormap="redblue",
             display_range=(-top, top) if top > 0 else None,

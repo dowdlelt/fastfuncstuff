@@ -14,6 +14,7 @@ from fastfuncstuff.viewer.modes.base import (
     mode,
     registry,
 )
+from fastfuncstuff.viewer.modes.denoise import DenoiseMode  # noqa: E402
 from fastfuncstuff.viewer.modes.ica import ICAMode  # noqa: E402
 from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 
@@ -26,6 +27,7 @@ __all__ = [
     "ChoiceControl",
     "ComputedOverlay",
     "Control",
+    "DenoiseMode",
     "DatasetControl",
     "FloatControl",
     "ICAMode",

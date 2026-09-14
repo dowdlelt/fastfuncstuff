@@ -117,7 +117,10 @@ class ViewerSession:
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._clustsim: dict[str, dict] = {}
         self._mode_dirty: Aspect = Aspect.NOTHING
-        self._displaced_overlay: Layer | None = None
+        #: The controller letter this session is, set by a UI that has several.
+        #: It is the stem every mode output is named with -- ``A_ICORR`` -- so a
+        #: layer compared across tabs says which tab made it.
+        self.label = "A"
         #: Set once by a UI that runs mode preparation on a worker. Applied to
         #: every mode as it is attached -- setting it on the mode afterwards
         #: would be too late, since set_mode refreshes on the way in and that
@@ -493,7 +496,13 @@ class ViewerSession:
         return self.install_derived(key, values, op="denoise", detail=detail)
 
     def install_derived(
-        self, source_key: str, values: np.ndarray, *, op: str, detail: str = ""
+        self,
+        source_key: str,
+        values: np.ndarray,
+        *,
+        op: str,
+        detail: str = "",
+        name: str | None = None,
     ) -> Aspect:
         """Put a computed dataset into the stack, right above what made it.
 
@@ -512,7 +521,7 @@ class ViewerSession:
         tag = f"derived:{op}:{source_key}"
         existing = self.state.layers.find_by_source(tag)
         key = existing.key if existing is not None else self.state.layers.mint_key("D")
-        name = f"{source.name} ·{op}d"
+        name = name or f"{source.name} ·{op}d"
 
         self.store.adopt(key, values, name=name)
         self.invalidate(key)
@@ -549,12 +558,34 @@ class ViewerSession:
         return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
 
     # -- computed overlays ---------------------------------------------
+    def _add_on_top(self, layer: Layer) -> None:
+        """Push a made layer on top, selected, with other overlays hidden.
+
+        Hidden only here, on creation: whatever it was computed from -- a run,
+        usually -- drawn under a correlation map is noise over the anatomy. A
+        layer switched back on by hand stays on while the output is refined.
+        """
+        base = self.state.layers.base
+        for other in list(self.state.layers):
+            if other.visible and (base is None or other.key != base.key):
+                self.state.layers.update(other.key, visible=False)
+        self.state.layers.add(layer)
+        self.state.selected = layer.key
+        if self.state.grid is None:
+            self.state.adopt_grid(layer.shape, layer.affine)
+
+    # -- computed overlays ---------------------------------------------
     def install_computed_overlay(self, source: str, overlay: ComputedOverlay) -> str:
         """Install (or update in place) the layer a mode owns.
 
         Updating in place matters: a mode recomputes on every seed click, and
         pushing a new layer each time would grow the stack without bound and
         reset the threshold the user just set.
+
+        On top of the stack, not in the overlay slot. It used to displace the
+        primary overlay and hand it back when the mode was left, which made
+        sense while an output died with its mode; now that it stays, a layer
+        taken out of the stack would never come back.
         """
         existing = self.state.layers.find_by_source(source)
         key = existing.key if existing is not None else self.state.layers.mint_key("M")
@@ -570,44 +601,67 @@ class ViewerSession:
             if existing.name != overlay.name:
                 self.state.layers.update(key, name=overlay.name)
         else:
-            layer = Layer(
-                key=key,
-                name=overlay.name,
-                path=f"<{overlay.name}>",
-                shape=tuple(int(v) for v in overlay.values.shape[:3]),
-                n_volumes=1,
-                affine=np.asarray(overlay.affine, dtype=float),
-                colormap=overlay.colormap,
-                range_lo=lo,
-                range_hi=hi,
-                threshold=overlay.threshold or 0.0,
-                source=source,
+            self._add_on_top(
+                Layer(
+                    key=key,
+                    name=overlay.name,
+                    path=f"<{overlay.name}>",
+                    shape=tuple(int(v) for v in overlay.values.shape[:3]),
+                    n_volumes=1,
+                    affine=np.asarray(overlay.affine, dtype=float),
+                    colormap=overlay.colormap,
+                    range_lo=lo,
+                    range_hi=hi,
+                    threshold=overlay.threshold or 0.0,
+                    source=source,
+                )
             )
-            # The computed map takes the primary overlay slot. That is the one
-            # thing it may displace: the underlay is the base image everything
-            # is drawn on and must survive a mode switch. The displaced layer
-            # is remembered, not destroyed, and comes back when the mode is
-            # left -- and the mode itself holds its source data by reference,
-            # so being displaced here cannot strand it.
-            self._displaced_overlay = self.state.layers.overlay
-            self.state.layers.set_overlay(layer)
-            # Selected for the same reason a picked overlay is: a mode's map
-            # arrives to be thresholded.
-            self.state.selected = key
-            if self.state.grid is None:
-                self.state.adopt_grid(layer.shape, layer.affine)
         return key
 
     def remove_computed_overlay(self, source: str) -> None:
-        """Drop a mode's overlay and put back whatever it displaced."""
+        """Drop a mode's output layer, if it has one."""
         existing = self.state.layers.find_by_source(source)
         if existing is None:
             return
         self.state.layers.remove(existing.key)
         self.forget(existing.key)
-        displaced, self._displaced_overlay = self._displaced_overlay, None
-        if displaced is not None and self.state.layers.find(displaced.key) is None:
-            self.state.layers.set_overlay(displaced)
+
+    def keep_output(self, mode: Mode) -> Aspect:
+        """Freeze the mode's live output as ``A_ICORR_1``, ``A_ICORR_2``, ...
+
+        The copy goes directly under the live layer and starts hidden: it is
+        identical to what is on top until the next seed moves the live one, and
+        two identical maps stacked would only double the alpha. ``[`` and ``]``
+        step to it, and solo flips between the two.
+        """
+        live = self.state.layers.find_by_source(mode.layer_source)
+        if live is None:
+            return Aspect.NOTHING
+        values = np.array(self.store.ensure_ram(live.key), dtype=np.float32, copy=True)
+        stem = mode.output_name()
+        taken = [ly for ly in self.state.layers if ly.source == f"kept:{mode.layer_source}"]
+        number = 1 + max(
+            (int(n) for ly in taken if (n := ly.name[len(stem) + 1 :].split(" ")[0]).isdigit()),
+            default=0,
+        )
+        detail = live.name[len(stem) :].strip()
+        name = f"{stem}_{number}" + (f" {detail}" if detail else "")
+        key = self.state.layers.mint_key("K")
+        self.store.adopt(key, values, name=name)
+        self.state.layers.add(
+            live.with_(
+                key=key,
+                name=name,
+                path=f"<{name}>",
+                visible=False,
+                source=f"kept:{mode.layer_source}",
+            ),
+            at=self.state.layers.index_of(live.key),
+        )
+        return Aspect.LAYERS | Aspect.SLICES
+
+    def mode_action(self, name: str) -> Aspect:
+        return self.mode.action(name)
 
     def forget(self, key: str) -> None:
         """Drop a layer's cached and resident data.
@@ -617,8 +671,6 @@ class ViewerSession:
         stale map.
         """
         held = {self.mode.input_layer_key()}
-        if self._displaced_overlay is not None:
-            held.add(self._displaced_overlay.key)
         if key in held:
             return
         self.invalidate(key)
@@ -923,11 +975,7 @@ class ViewerSession:
             self.state.layers.update(key, name=name, path=f"<{name}>")
             return key, Aspect.LAYERS | Aspect.SLICES
 
-        base = self.state.layers.base
-        for layer in list(self.state.layers):
-            if layer.visible and (base is None or layer.key != base.key):
-                self.state.layers.update(layer.key, visible=False)
-        self.state.layers.add(
+        self._add_on_top(
             Layer(
                 key=key,
                 name=name,
@@ -943,9 +991,6 @@ class ViewerSession:
                 source=source,
             )
         )
-        self.state.selected = key
-        if self.state.grid is None:
-            self.state.adopt_grid(like.shape, like.affine)
         return key, Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
 
     def save_layer(self, key: str, path: str | Path) -> Path:

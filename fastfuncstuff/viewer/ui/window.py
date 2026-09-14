@@ -51,7 +51,7 @@ from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
     AddOverlay,
-    Denoise,
+    ModeAction,
     MoveLayer,
     Read,
     RemoveLayer,
@@ -150,6 +150,10 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.runner = PreparationRunner(self)
         self.runner.progress.connect(self._on_prepare_progress)
         self.runner.busy_changed.connect(self._on_prepare_busy)
+        self._rebuild_queue: list[tuple[Controller, str]] = []
+        # Deferred a turn so the job that just finished has handed its picture
+        # over before the next one takes the worker.
+        self.runner.finished.connect(lambda *_: QtCore.QTimer.singleShot(0, self._drain_rebuilds))
 
         self._play = QtCore.QTimer(self)
         self._play.setInterval(60)
@@ -188,6 +192,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # would otherwise move A.
         manager._dispatch = lambda cmd, c=ctl: self._dispatch_from(c, cmd)
         manager.label = letter
+        session.label = letter
         manager.rebuild_requested.connect(lambda vid, c=ctl: self._on(c, self.rebuild_view, vid))
         manager.rois_requested.connect(lambda vid, c=ctl: self._on(c, self._clusters_to_rois, vid))
         manager.rows_selected.connect(
@@ -849,8 +854,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             stack_row.addWidget(b, *divmod(position, 3))
         v.addLayout(stack_row)
 
-        self._build_derive(v)
-
         # The layer form and the colour bar side by side: the bar stands on end
         # to the right of the pickers, so the numbers that define it sit in the
         # column of space the form's labels leave free instead of claiming a
@@ -975,6 +978,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         v.addWidget(self.mode_head)
         self.mode_panel = ControlPanel()
         self.mode_panel.changed.connect(self._mode_param_changed)
+        self.mode_panel.action_requested.connect(self._mode_action)
         v.addWidget(self.mode_panel)
         v.addStretch(1)
 
@@ -984,134 +988,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         scroll.setWidget(panel)
         self.setCentralWidget(scroll)
 
-    def _build_derive(self, parent: QtWidgets.QVBoxLayout) -> None:
-        """Make a new dataset out of one already in the stack.
-
-        Lives beside the layer list rather than in the mode panel because what
-        it produces is a *layer*, not a mode's overlay: it stays when the mode
-        changes, it can be graphed, and it can become the underlay.
-        """
-        self.derive_head = self._head("DERIVE")
-        parent.addWidget(self.derive_head)
-
-        row = QtWidgets.QHBoxLayout()
-        row.setSpacing(5)
-        self.matrix_edit = QtWidgets.QLineEdit()
-        self.matrix_edit.setPlaceholderText("design .xmat.1D or a 1D file")
-        self.matrix_edit.setToolTip(
-            "An xmat's ColumnGroups say which of its columns are nuisance, so "
-            "the design's own answer is used.\nA plain 1D file is nuisance "
-            "throughout, which is what a motion file is."
-        )
-        row.addWidget(self.matrix_edit, 1)
-        browse = QtWidgets.QPushButton("…")
-        browse.setMaximumWidth(34)
-        browse.clicked.connect(self._browse_matrix)
-        row.addWidget(browse)
-        parent.addLayout(row)
-
-        row2 = QtWidgets.QHBoxLayout()
-        row2.setSpacing(5)
-        row2.addWidget(self._head("POLORT"))
-        self.polort_spin = QtWidgets.QSpinBox()
-        self.polort_spin.setRange(-1, 9)
-        self.polort_spin.setValue(-1)
-        self.polort_spin.setToolTip(
-            "Legendre drift columns to add. -1 is off, which is the default "
-            "because an xmat already carries its own."
-        )
-        self.polort_spin.setMaximumWidth(70)
-        row2.addWidget(self.polort_spin)
-        row2.addStretch(1)
-        self.denoise_button = QtWidgets.QPushButton(key_label("DENOISE", "\u21e7D"))
-        self.denoise_button.setToolTip(
-            "Project the nuisance out of the selected layer, as a new layer "
-            "just above it (shift+D).\nNeighbours in the stack are what [ and ] "
-            "flip between, so raw against denoised is one keypress."
-        )
-        self.denoise_button.clicked.connect(self._denoise)
-        row2.addWidget(self.denoise_button)
-        parent.addLayout(row2)
-
-    def _browse_matrix(self) -> None:
-        start = str(self.session.catalog_dir or Path.cwd())
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Design matrix or nuisance file", start, "1D / xmat (*.1D);;All (*)"
-        )
-        if path:
-            self.matrix_edit.setText(path)
-
-    def _denoise_source(self, key: str) -> str:
-        """Which layer a denoise should actually read.
-
-        Deriving selects the new layer, which is the right feedback -- but it
-        means a second click would land on the result and chain a denoise onto
-        a denoise. Almost nobody means that; what they mean is "again, with the
-        polort I just changed". So a denoise aimed at something this same
-        operation produced is redirected to what produced it, and the recorded
-        command names that, so a replay does not chain either.
-        """
-        layer = self.session.state.layers.get(key)
-        if layer.source.startswith("derived:denoise:"):
-            origin = layer.derived_from
-            if origin is not None and self.session.state.layers.find(origin) is not None:
-                return origin
-        return key
-
-    def _denoise(self) -> None:
-        """Derive on the worker: it is a whole 4-D array, not a click's work."""
-        key = self.current_key()
-        if key is None or self.runner.busy:
-            return
-        key = self._denoise_source(key)
-        layer = self.session.state.layers.get(key)
-        if layer.n_volumes <= 1:
-            self.statusBar().showMessage(f"{layer.name} is not a time series", 5000)
-            return
-        cmd = Denoise(
-            key,
-            matrix=self.matrix_edit.text().strip(),
-            polort=int(self.polort_spin.value()),
-        )
-        # Held, not re-read: the tab may change while the worker runs, and the
-        # result belongs to the controller it was computed from.
-        ctl = self._active
-        session = ctl.session
-
-        pending: dict[str, object] = {}
-
-        def job(progress) -> bool:
-            # Only the arithmetic runs here. It reads arrays and builds one;
-            # it does not touch the layer stack, because the worker thread has
-            # no business mutating what the GUI thread is painting from.
-            values, detail = session.compute_denoise(
-                cmd.key, matrix=cmd.matrix, polort=cmd.polort, progress=progress
-            )
-            pending["values"], pending["detail"] = values, detail
-            return True
-
-        def done(ok: bool, error: str) -> None:
-            self.runner.finished.disconnect(done)
-            if not ok:
-                if error:
-                    self.statusBar().showMessage(f"denoise failed: {error}", 10000)
-                return
-            dirty = session.install_derived(
-                cmd.key, pending["values"], op="denoise", detail=str(pending["detail"])
-            )
-            # Recorded rather than dispatched: the effect is already installed,
-            # and dispatching would redo the projection to arrive where we are.
-            session.bus.record(cmd)
-            if ctl is self._active:
-                self.refresh(dirty)
-            else:
-                self._refresh_windows(ctl, dirty)
-            self.statusBar().showMessage(f"derived from {layer.name}", 5000)
-
-        self.runner.finished.connect(done)
-        if not self.runner.run(job):
-            self.runner.finished.disconnect(done)
-
     def _switch_mode(self, name: str) -> None:
         self._dispatch(SetMode(name))
         self._prepare_then_refresh()
@@ -1119,6 +995,44 @@ class ViewerWindow(QtWidgets.QMainWindow):
     def _mode_param_changed(self, name: str, value: str) -> None:
         self._dispatch(SetModeParam(name, value))
         self._prepare_then_refresh()
+
+    def _mode_action(self, name: str) -> None:
+        """Press a mode's button, then finish whatever slow work it started.
+
+        A button may open windows -- Denoise's CARPETS opens two -- and a built
+        window opened that way has no picture until someone rebuilds it, so any
+        that appeared are queued for the worker.
+        """
+        before = set(self.session.state.viewports.ids)
+        try:
+            self._dispatch(ModeAction(name))
+        except (KeyError, ValueError, OSError) as exc:
+            self.statusBar().showMessage(f"{name} failed: {exc}", 8000)
+            return
+        if self.session.mode.needs_prepare and self.runner.busy:
+            self.statusBar().showMessage(f"busy; press {name.upper()} again when it finishes", 6000)
+        self._prepare_then_refresh()
+        for vid in self.session.state.viewports.ids:
+            if vid not in before:
+                viewport = self.session.state.viewports.find(vid)
+                if viewport is not None and (viewport.is_carpet or viewport.is_matrix):
+                    self._queue_rebuild(vid)
+        self._sync_mode_panel()
+
+    def _queue_rebuild(self, vid: str) -> None:
+        """Rebuild a window now, or as soon as the worker is free.
+
+        The runner does one job at a time and refuses a second, so two carpets
+        opened by one click would otherwise leave the second one empty.
+        """
+        self._rebuild_queue.append((self._active, vid))
+        self._drain_rebuilds()
+
+    def _drain_rebuilds(self) -> None:
+        while self._rebuild_queue and not self.runner.busy:
+            ctl, vid = self._rebuild_queue.pop(0)
+            if ctl in self.controllers and ctl.session.state.viewports.find(vid) is not None:
+                self._on(ctl, self.rebuild_view, vid)
 
     # ------------------------------------------------------------------
     # input
@@ -1156,7 +1070,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("s", "next sign mode", self._cycle_sign, group="layer"),
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
-                Binding("shift+d", "denoise the selected layer", self._denoise, group="layer"),
                 Binding("{", "move layer down the stack", lambda: self._reorder(-1), group="layer"),
                 Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
                 Binding("u", "make it the underlay", self._make_underlay, group="layer"),
@@ -1513,8 +1426,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _sync_mode_panel(self) -> None:
         mode = self.session.mode
-        self.mode_panel.rebuild(mode.controls(), mode.params)
-        has = bool(mode.controls())
+        self.mode_panel.rebuild(mode.controls(), mode.params, mode.actions())
+        has = bool(mode.controls()) or bool(mode.actions())
         self.mode_head.setVisible(has)
         self.mode_panel.setVisible(has)
         idx = self.mode_box.findData(mode.name)
@@ -1541,8 +1454,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if key is None:
             for check in (self.roi_check, self.timelink_check):
                 check.setEnabled(False)
-            for widget in (self.matrix_edit, self.polort_spin, self.denoise_button):
-                widget.setEnabled(False)
             return
         layer = self.session.state.layers.get(key)
         for box, value in (
@@ -1563,10 +1474,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setEnabled(enabled)
             check.blockSignals(False)
         self._sync_brick_pickers(layer)
-        # A 3-D anatomy has no nuisance to project out of it.
-        derivable = layer.n_volumes > 1
-        for widget in (self.matrix_edit, self.polort_spin, self.denoise_button):
-            widget.setEnabled(derivable and not self.runner.busy)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))
         self.opacity_slider.blockSignals(False)

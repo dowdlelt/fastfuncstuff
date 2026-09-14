@@ -239,6 +239,26 @@ def denoise(
     return out.reshape(nx, ny, nz, nt)
 
 
+def variance_removed(raw: np.ndarray, clean: np.ndarray, *, block: int = 65536) -> np.ndarray:
+    """Per voxel, the fraction of temporal variance the projection took away.
+
+    ``1 - var(clean) / var(raw)``, in blocks of voxels so neither array is
+    duplicated whole -- on a real run each is a gigabyte. Constant voxels,
+    which have no variance to remove, are 0 rather than NaN.
+    """
+    nt = raw.shape[-1]
+    r = np.asarray(raw, dtype=np.float32).reshape(-1, nt)
+    c = np.asarray(clean, dtype=np.float32).reshape(-1, nt)
+    out = np.zeros(r.shape[0], dtype=np.float32)
+    for start in range(0, r.shape[0], block):
+        stop = min(start + block, r.shape[0])
+        before = r[start:stop].var(-1)
+        after = c[start:stop].var(-1)
+        ok = before > 1e-12
+        out[start:stop][ok] = 1.0 - after[ok] / before[ok]
+    return np.clip(out, 0.0, 1.0).reshape(raw.shape[:-1])
+
+
 __all__ = [
     "NUISANCE_GROUP_MAX",
     "Nuisance",
@@ -247,4 +267,5 @@ __all__ = [
     "orthonormal_basis",
     "project_out",
     "read_nuisance",
+    "variance_removed",
 ]

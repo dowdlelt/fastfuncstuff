@@ -394,6 +394,17 @@ class SetModeParam(Command):
     value: str
 
 
+@command
+@dataclass(frozen=True)
+class ModeAction(Command):
+    """Press one of the active mode's buttons -- KEEP, APPLY."""
+
+    name = "MODE_ACTION"
+    aspects = Aspect.LAYERS | Aspect.SLICES
+    major = True
+    action: str
+
+
 # ---------------------------------------------------------------------------
 # layers
 # ---------------------------------------------------------------------------
@@ -724,6 +735,13 @@ def install(
         if session is None:
             raise RuntimeError("SET_MODE_PARAM needs a session")
         return session.set_mode_param(cmd.param, cmd.value)
+
+    @bus.handle(ModeAction.name)
+    def _mode_action(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, ModeAction)
+        if session is None:
+            raise RuntimeError("MODE_ACTION needs a session")
+        return session.mode_action(cmd.action)
 
     @bus.handle(SetIJK.name)
     def _set_ijk(cmd: Command, st: ViewerState) -> Aspect:

@@ -255,6 +255,7 @@ def test_switching_to_a_mode_renders_its_declared_controls(win, qapp):
         "ftop",
         "blur",
         "seed_radius",
+        "action:keep",
     }
 
 
@@ -948,54 +949,100 @@ def test_the_palette_is_recorded_so_a_replay_looks_the_same(win, qapp):
 
 
 # ---------------------------------------------------------------------------
-# deriving a layer
+# denoise, as a mode
 # ---------------------------------------------------------------------------
 
 
-def test_the_derive_controls_are_off_for_a_three_d_layer(win, qapp):
-    """An anatomy has no nuisance to project out of it."""
-    win.layer_list.setCurrentRow(1)  # the underlay: 3-D
-    qapp.processEvents()
-    assert not win.denoise_button.isEnabled()
+def _denoise_mode(win4d, qapp, polort="2"):
+    from fastfuncstuff.viewer.vocab import SetMode
 
-
-def test_denoise_runs_off_the_gui_thread_and_installs_on_it(win4d, qapp):
     src = win4d.session.state.layers.overlay.key
     win4d.session.store.ensure_ram(src)
-    win4d.layer_list.setCurrentRow(0)
-    win4d.polort_spin.setValue(2)
+    win4d._switch_mode("denoise")
+    win4d._mode_param_changed("polort", polort)
     qapp.processEvents()
+    assert win4d.session.mode.name == "denoise" and SetMode
+    return src
 
-    win4d._denoise()
+
+def _apply(win4d, qapp):
+    win4d.mode_panel._widgets["action:apply"].click()
     assert win4d.runner.wait(20_000)
     qapp.processEvents()
-
-    derived = win4d.session.state.layers.find_by_source(f"derived:denoise:{src}")
-    assert derived is not None
-    assert "DENOISE" in win4d.session.to_script()
-
-
-def test_a_second_click_re_derives_instead_of_chaining(win4d, qapp):
-    """Deriving selects the result, so a naive second click would chain."""
-    src = win4d.session.state.layers.overlay.key
-    win4d.session.store.ensure_ram(src)
-    win4d.layer_list.setCurrentRow(0)
-    win4d.polort_spin.setValue(1)
     qapp.processEvents()
 
-    win4d._denoise()
-    win4d.runner.wait(20_000)
+
+def test_denoise_is_a_mode_with_an_apply_button(win4d, qapp):
+    _denoise_mode(win4d, qapp)
+    assert {"matrix", "polort", "keep_mean", "action:apply", "action:carpets"} <= set(
+        win4d.mode_panel._widgets
+    )
+    assert not hasattr(win4d, "denoise_button"), "DERIVE left the controller"
+
+
+def test_apply_runs_off_the_gui_thread_and_leaves_a_run_and_a_map(win4d, qapp):
+    src = _denoise_mode(win4d, qapp)
+    _apply(win4d, qapp)
+    stack = win4d.session.state.layers
+    derived = stack.find_by_source(f"derived:denoise:{src}")
+    assert derived is not None and derived.name == "A_DENOISE"
+    assert derived.n_volumes == stack.get(src).n_volumes
+    vr = stack.find_by_source("mode:denoise")
+    assert vr is not None and vr.name == "A_DENOISE_VR"
+    assert win4d.session.state.selected == vr.key
+    removed = win4d.session.volume(vr.key, 0)
+    assert np.all((removed >= 0) & (removed <= 1)) and removed.max() > 0
+    assert "MODE_ACTION apply" in win4d.session.to_script()
+
+
+def test_a_parameter_change_does_not_run_the_projection(win4d, qapp):
+    """Seconds of work per spin-box click is the freeze APPLY exists to avoid."""
+    _denoise_mode(win4d, qapp)
+    before = len(win4d.session.state.layers)
+    win4d._mode_param_changed("polort", "3")
     qapp.processEvents()
+    assert not win4d.runner.busy
+    assert len(win4d.session.state.layers) == before
+
+
+def test_applying_again_replaces_rather_than_chaining(win4d, qapp):
+    """Applying selects the map, and a selected A_DENOISE must not become the
+    input of the next APPLY."""
+    src = _denoise_mode(win4d, qapp, polort="1")
+    _apply(win4d, qapp)
     after_one = len(win4d.session.state.layers)
+    derived = win4d.session.state.layers.find_by_source(f"derived:denoise:{src}")
+    from fastfuncstuff.viewer.vocab import SelectLayer
 
-    win4d.polort_spin.setValue(3)
-    win4d._denoise()
-    win4d.runner.wait(20_000)
-    qapp.processEvents()
+    win4d._dispatch(SelectLayer(derived.key))
+    win4d._mode_param_changed("polort", "3")
+    _apply(win4d, qapp)
     assert len(win4d.session.state.layers) == after_one
-    # And the recording names the real source, so a replay does not chain.
-    lines = [ln for ln in win4d.session.to_script().splitlines() if ln.startswith("DENOISE")]
-    assert all(ln.split()[1] == src for ln in lines)
+    assert win4d.session.state.layers.find_by_source(f"derived:denoise:{derived.key}") is None
+
+
+def test_carpets_opens_raw_and_denoised_side_by_side(win4d, qapp):
+    src = _denoise_mode(win4d, qapp)
+    _apply(win4d, qapp)
+    win4d.mode_panel._widgets["action:carpets"].click()
+    for _ in range(4):
+        win4d.runner.wait(20_000)
+        qapp.processEvents()
+    carpets = win4d.session.state.viewports.carpets
+    assert len(carpets) == 2
+    derived = win4d.session.state.layers.find_by_source(f"derived:denoise:{src}")
+    assert [v.traces for v in carpets] == [(src,), (derived.key,)]
+    windows = win4d.manager.carpets()
+    assert all(w.view._carpet is not None for w in windows), "the second carpet was never built"
+
+
+def test_leaving_denoise_keeps_what_it_made(win4d, qapp):
+    src = _denoise_mode(win4d, qapp)
+    _apply(win4d, qapp)
+    win4d._switch_mode("plain")
+    qapp.processEvents()
+    assert win4d.session.state.layers.find_by_source(f"derived:denoise:{src}") is not None
+    assert win4d.session.state.layers.find_by_source("mode:denoise") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1315,11 +1362,14 @@ def test_clicking_a_layer_does_not_disable_the_keyboard(win, qapp):
         assert box.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
 
 
-def test_text_entry_keeps_its_keys(win):
+def test_text_entry_keeps_its_keys(win, qapp):
     """While you are typing a path, the letters belong to the line edit."""
-    from PySide6 import QtCore
+    from PySide6 import QtCore, QtWidgets
 
-    assert win.matrix_edit.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus
+    win._switch_mode("denoise")
+    qapp.processEvents()
+    edit = win.mode_panel._widgets["matrix"].findChild(QtWidgets.QLineEdit)
+    assert edit is not None and edit.focusPolicy() != QtCore.Qt.FocusPolicy.NoFocus
 
 
 def test_the_theme_key_fires(win, qapp):
@@ -1811,3 +1861,59 @@ def test_tiling_places_every_controller_s_windows(win, qapp, datadir):
     for ctl in win.controllers:
         assert all(v.geometry is not None for v in ctl.session.state.viewports)
     assert win.active is b  # arranging windows is not choosing a controller
+
+
+# ---------------------------------------------------------------------------
+# instacorr from a click
+# ---------------------------------------------------------------------------
+
+
+def test_a_mac_ctrl_click_seeds_instacorr_and_draws_a_map(win4d, qapp, monkeypatch):
+    """macOS delivers ctrl+click as a right-button press with Meta held, which
+    the pane took for the start of a pan -- so the documented gesture never
+    produced a map."""
+    from PySide6 import QtCore
+    from PySide6.QtTest import QTest
+
+    from fastfuncstuff.viewer.ui import panes
+
+    monkeypatch.setattr(panes.sys, "platform", "darwin")
+    win4d._switch_mode("instacorr")
+    assert win4d.runner.wait(20_000)
+    qapp.processEvents()
+
+    image = image_of(win4d, Plane.AXIAL)
+    pane = image.pane
+    image.resize(400, 400)
+    qapp.processEvents()
+    QTest.mouseClick(
+        pane,
+        QtCore.Qt.MouseButton.RightButton,
+        QtCore.Qt.KeyboardModifier.MetaModifier,
+        pane.rect().center(),
+    )
+    for _ in range(3):
+        win4d.runner.wait(20_000)
+        qapp.processEvents()
+
+    assert win4d.session.state.seed is not None
+    layer = win4d.session.state.layers.find_by_source("mode:instacorr")
+    assert layer is not None and layer.name == "A_ICORR"
+    assert win4d.session.state.selected == layer.key
+
+
+def test_keep_from_the_panel_numbers_the_copies(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetSeed
+
+    win4d._switch_mode("instacorr")
+    win4d.runner.wait(20_000)
+    qapp.processEvents()
+    win4d._dispatch(SetSeed(3, 4, 2))
+    win4d.runner.wait(20_000)
+    qapp.processEvents()
+    for _ in range(2):
+        win4d.mode_panel._widgets["action:keep"].click()
+        qapp.processEvents()
+    names = [ly.name for ly in win4d.session.state.layers if ly.source.startswith("kept:")]
+    assert names == ["A_ICORR_1", "A_ICORR_2"]
+    assert win4d.layer_list.count() == len(win4d.session.state.layers)

@@ -17,12 +17,14 @@ from collections.abc import Callable, Sequence
 from PySide6 import QtCore, QtWidgets
 
 from fastfuncstuff.viewer.modes.base import (
+    ActionControl,
     BoolControl,
     ChoiceControl,
     Control,
     FloatControl,
     IntControl,
     OptionalFloatControl,
+    PathControl,
 )
 
 #: How long to wait after the last change before applying it. Long enough to
@@ -38,6 +40,8 @@ class ControlPanel(QtWidgets.QWidget):
 
     #: (param name, value as text) -- text so it matches SET_MODE_PARAM exactly.
     changed = QtCore.Signal(str, str)
+    #: A declared button was pressed: the action's name.
+    action_requested = QtCore.Signal(str)
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
@@ -52,7 +56,12 @@ class ControlPanel(QtWidgets.QWidget):
         self._timer.timeout.connect(self._flush)
 
     # -- building ------------------------------------------------------
-    def rebuild(self, controls: Sequence[Control], values: dict[str, object]) -> None:
+    def rebuild(
+        self,
+        controls: Sequence[Control],
+        values: dict[str, object],
+        actions: Sequence[ActionControl] = (),
+    ) -> None:
         """Replace the panel with widgets for ``controls``."""
         while self._form.count():
             item = self._form.takeAt(0)
@@ -73,6 +82,24 @@ class ControlPanel(QtWidgets.QWidget):
             self._widgets[spec.name] = widget
             self._form.addRow(label, widget)
 
+        if actions:
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(5)
+            for spec in actions:
+                button = QtWidgets.QPushButton(spec.label.upper())
+                button.setToolTip(spec.help)
+                # Pending edits first: pressing APPLY straight after typing a
+                # path must apply the path that was typed.
+                button.clicked.connect(
+                    lambda _=False, n=spec.name: (self.flush_now(), self.action_requested.emit(n))
+                )
+                h.addWidget(button)
+                self._widgets[f"action:{spec.name}"] = button
+            h.addStretch(1)
+            self._form.addRow(QtWidgets.QLabel(""), row)
+
     def _build(
         self, spec: Control, value: object
     ) -> tuple[QtWidgets.QWidget | None, QtWidgets.QWidget]:
@@ -83,6 +110,32 @@ class ControlPanel(QtWidgets.QWidget):
             box.setChecked(bool(value if value is not None else spec.default))
             box.toggled.connect(lambda on, n=spec.name: self._queue(n, "1" if on else "0"))
             return box, label
+
+        if isinstance(spec, PathControl):
+            row = QtWidgets.QWidget()
+            h = QtWidgets.QHBoxLayout(row)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(4)
+            edit = QtWidgets.QLineEdit(str(value if value is not None else spec.default))
+            edit.setPlaceholderText("none")
+            # On enter or focus-out, not per keystroke: a half-typed path is not
+            # a parameter.
+            edit.editingFinished.connect(
+                lambda n=spec.name, e=edit: self._queue(n, e.text().strip(), now=True)
+            )
+            browse = QtWidgets.QPushButton("…")
+            browse.setMaximumWidth(34)
+
+            def pick(_=False, n=spec.name, e=edit, flt=spec.filter) -> None:
+                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, spec.label, e.text(), flt)
+                if path:
+                    e.setText(path)
+                    self._queue(n, path, now=True)
+
+            browse.clicked.connect(pick)
+            h.addWidget(edit, 1)
+            h.addWidget(browse)
+            return row, label
 
         if isinstance(spec, ChoiceControl):
             combo = QtWidgets.QComboBox()
@@ -224,6 +277,6 @@ class ControlPanel(QtWidgets.QWidget):
 def build_mode_panel(mode, on_change: Callable[[str, str], None]) -> ControlPanel:
     """Convenience: a panel wired to one mode."""
     panel = ControlPanel()
-    panel.rebuild(mode.controls(), mode.params)
+    panel.rebuild(mode.controls(), mode.params, mode.actions())
     panel.changed.connect(on_change)
     return panel

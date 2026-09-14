@@ -220,7 +220,7 @@ class _Dummy(Mode):
         return ComputedOverlay(
             values=vals,
             affine=self.session.state.grid.affine,
-            name="dummy",
+            name=self.output_name(),
             kind=OverlayKind.STATISTIC,
         )
 
@@ -243,13 +243,47 @@ def test_switching_mode_installs_its_overlay(session, datadir):
     assert layer is not None and layer.is_computed
 
 
-def test_switching_away_removes_the_computed_overlay(session, datadir):
+def test_switching_away_keeps_the_output_and_coming_back_reuses_it(session, datadir):
+    """The output is the result: a map you leave the mode to compare against
+    has to still be there, and returning must not stack a second one."""
     session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
     session.do(SetMode("test_dummy"))
     key = session.state.layers.find_by_source("mode:test_dummy").key
     session.do(SetMode("plain"))
-    assert session.state.layers.find_by_source("mode:test_dummy") is None
-    assert key not in session.store.keys()
+    assert session.state.layers.find(key) is not None
+    assert key in session.store.keys()
+
+    session.do(SetMode("test_dummy"))
+    assert [ly.key for ly in session.state.layers if ly.source == "mode:test_dummy"] == [key]
+
+
+def test_a_mode_output_is_named_for_the_controller(session, datadir):
+    session.label = "B"
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.do(SetMode("test_dummy"))
+    assert session.state.layers.find_by_source("mode:test_dummy").name == "B_TEST_DUMMY"
+
+
+def test_keep_freezes_numbered_copies_under_the_live_output(session, datadir):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
+    session.do(SetMode("test_dummy"))
+    live = session.state.layers.find_by_source("mode:test_dummy")
+    session.do(ModeAction("keep"))
+    session.set_mode_param("gain", "5.0")
+    session.do(ModeAction("keep"))
+
+    kept = [ly for ly in session.state.layers if ly.source == "kept:mode:test_dummy"]
+    assert [ly.name for ly in kept] == ["A_TEST_DUMMY_1", "A_TEST_DUMMY_2"]
+    assert all(not ly.visible for ly in kept)
+    assert session.state.layers.layers[-1].key == live.key, "the live output stays on top"
+    first, second = (session.store.get(ly.key).array[..., 0] for ly in kept)
+    assert first.max() == pytest.approx(2.0) and second.max() == pytest.approx(5.0)
+    # a copy, not a view: moving the live map must not move the kept one
+    session.set_mode_param("gain", "9.0")
+    assert session.store.get(kept[0].key).array[..., 0].max() == pytest.approx(2.0)
+    assert "MODE_ACTION keep" in session.to_script()
 
 
 def test_a_mode_updates_its_overlay_in_place(session, datadir):
@@ -338,22 +372,54 @@ def test_instacorr_stays_within_correlation_bounds(corr_session):
     assert np.nanmin(vol) >= -1.0001 and np.nanmax(vol) <= 1.0001
 
 
-def test_the_map_displaces_the_overlay_never_the_underlay(corr_session):
-    """The underlay is the base image; a mode must not take it."""
+def test_the_map_goes_on_top_and_hides_the_run_under_it(corr_session):
+    """The underlay stays the base; the run stays in the stack (other tabs and
+    carpets read it) but is hidden, because a run drawn under a correlation
+    map is noise over the anatomy."""
     underlay = corr_session.state.layers.base.key
-    corr_session.do(SetMode("instacorr"))
-    corr_session.do(SetSeed(3, 4, 2))
-    assert corr_session.state.layers.base.key == underlay
-    assert corr_session.state.layers.overlay.is_computed
-
-
-def test_leaving_the_mode_puts_the_displaced_overlay_back(corr_session):
     bold_key = corr_session.state.layers.keys[1]
     corr_session.do(SetMode("instacorr"))
     corr_session.do(SetSeed(3, 4, 2))
-    assert corr_session.state.layers.find(bold_key) is None, "the map should displace it"
+    stack = corr_session.state.layers
+    assert stack.base.key == underlay
+    assert stack.layers[-1].source == "mode:instacorr"
+    assert stack.layers[-1].name == "A_ICORR"
+    assert corr_session.state.selected == stack.layers[-1].key
+    assert stack.find(bold_key) is not None and not stack.get(bold_key).visible
+
+
+def test_leaving_instacorr_keeps_the_map(corr_session):
+    corr_session.do(SetMode("instacorr"))
+    corr_session.do(SetSeed(3, 4, 2))
     corr_session.do(SetMode("plain"))
-    assert corr_session.state.layers.overlay.key == bold_key
+    assert corr_session.state.layers.find_by_source("mode:instacorr") is not None
+
+
+def test_a_seed_on_a_finer_underlay_lands_on_the_right_run_voxel(tmp_path):
+    """The seed is a display-grid voxel -- the anatomy's. Indexing a 2x coarser
+    run with it pointed off the edge, and ctrl-click drew nothing at all."""
+    rng = np.random.default_rng(8)
+    nx, ny, nz, nt = 10, 12, 8, 60
+    data = rng.normal(0, 1.0, (nx, ny, nz, nt)).astype(np.float32)
+    signal = np.sin(2 * np.pi * np.arange(nt) / 15.0).astype(np.float32)
+    data[6:9, 7:10, 4:7, :] += signal * 6.0
+    _write(tmp_path, "anat.nii.gz", rng.random((20, 24, 16)) * 100, step=1.5)
+    _write(tmp_path, "bold.nii.gz", data, tr=2.0, step=3.0)
+
+    s = ViewerSession(device=CPU)
+    try:
+        s.do(SetUnderlay(str(tmp_path / "anat.nii.gz")))
+        s.do(AddOverlay(str(tmp_path / "bold.nii.gz")))
+        s.store.ensure_ram(s.state.layers.keys[1])
+        s.do(SetMode("instacorr"))
+        # Both grids share an origin, so run voxel (7, 8, 5) is anat voxel (14, 16, 10).
+        s.do(SetSeed(14, 16, 10))
+        layer = s.state.layers.find_by_source("mode:instacorr")
+        assert layer is not None, "no map: the seed missed the run"
+        vol = s.store.get(layer.key).array[..., 0]
+        assert vol[7, 8, 5] == pytest.approx(1.0, abs=1e-4)
+    finally:
+        s.close()
 
 
 def test_the_mode_survives_displacing_its_own_source(corr_session):
@@ -500,7 +566,7 @@ def test_stepping_components_swaps_the_map_and_the_name(ica_dir, session):
 
     session.set_mode_param("component", "2")
     layer = session.state.layers.find_by_source("mode:ica")
-    assert layer.name == "IC 2"
+    assert layer.name == "A_ICA IC 2"
     assert layer.key == key, "stepping must update in place, not add a layer"
     assert not np.allclose(first, session.store.get(key).array[..., 0])
 
