@@ -22,12 +22,21 @@ from fastfuncstuff.viewer.colormap import apply_colormap, build_lut
 from fastfuncstuff.viewer.layers import AlphaMode, SignMode
 from fastfuncstuff.viewer.ui import theme
 
-BAR_HEIGHT = 26
+#: The bar stands on end beside the layer form, so its width is fixed and its
+#: height is whatever the form is -- the same arrangement AFNI's controller
+#: has, and it gives the panel back the full row the horizontal bar took.
+BAR_WIDTH = 22
+BAR_MIN_HEIGHT = 150
 TICKS = 1000
 
 
 class ColorBar(QtWidgets.QWidget):
-    """The gradient itself, with threshold markers."""
+    """The gradient itself, standing on end, with threshold markers.
+
+    The maximum is at the top. A colour scale read bottom-to-top is how every
+    figure draws one, and it puts the threshold slider's travel beside the
+    colours it cuts.
+    """
 
     clicked = QtCore.Signal(float)
 
@@ -39,10 +48,10 @@ class ColorBar(QtWidgets.QWidget):
         self._sign = SignMode.BOTH
         self._panes = 0
         self._alpha = AlphaMode.OFF
-        self.setMinimumHeight(BAR_HEIGHT)
-        self.setMaximumHeight(BAR_HEIGHT)
+        self.setFixedWidth(BAR_WIDTH)
+        self.setMinimumHeight(BAR_MIN_HEIGHT)
         self.setSizePolicy(
-            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed
+            QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Expanding
         )
 
     def configure(self, layer) -> None:
@@ -59,15 +68,15 @@ class ColorBar(QtWidgets.QWidget):
         p = QtGui.QPainter(self)
         c = theme.palette()
         p.fillRect(self.rect(), QtGui.QColor(c.bg))
-        w = max(self.width() - 2, 1)
-        bar = QtCore.QRect(1, 1, w, BAR_HEIGHT - 2)
+        h = max(self.height() - 2, 1)
+        bar = QtCore.QRect(1, 1, BAR_WIDTH - 2, h)
         try:
             lut = build_lut(self._lut_name, 256, device=torch.device("cpu"))
         except KeyError:
             p.end()
             return
 
-        values = torch.linspace(self._lo, self._hi, w)
+        values = torch.linspace(self._hi, self._lo, h)
         rgb = apply_colormap(
             values,
             lut=lut,
@@ -76,13 +85,13 @@ class ColorBar(QtWidgets.QWidget):
             sign_mode=self._sign,
             n_panes=self._panes,
         )
-        for x in range(w):
-            r, g, b = (float(c) for c in rgb[x])
-            if self._threshold > 0 and abs(float(values[x])) < self._threshold:
+        for y in range(h):
+            r, g, b = (float(c) for c in rgb[y])
+            if self._threshold > 0 and abs(float(values[y])) < self._threshold:
                 fade = 0.28 if self._alpha is AlphaMode.OFF else 0.55
                 r, g, b = r * fade, g * fade, b * fade
             p.fillRect(
-                QtCore.QRect(bar.x() + x, bar.y(), 1, bar.height()),
+                QtCore.QRect(bar.x(), bar.y() + y, bar.width(), 1),
                 QtGui.QColor.fromRgbF(r, g, b),
             )
 
@@ -100,24 +109,24 @@ class ColorBar(QtWidgets.QWidget):
                     continue
                 if self._sign is SignMode.NEG and edge > 0:
                     continue
-                x = bar.x() + int((edge - self._lo) / span * w)
-                p.drawLine(x, bar.top(), x, bar.bottom())
+                y = bar.y() + int((self._hi - edge) / span * h)
+                p.drawLine(bar.left(), y, bar.right(), y)
         p.end()
 
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802 (Qt)
         """Click the bar to set the threshold to the value under the cursor."""
-        w = max(self.width() - 2, 1)
-        frac = max(0.0, min(1.0, (event.position().x() - 1) / w))
-        self.clicked.emit(self._lo + frac * (self._hi - self._lo))
+        h = max(self.height() - 2, 1)
+        frac = max(0.0, min(1.0, (event.position().y() - 1) / h))
+        self.clicked.emit(self._hi - frac * (self._hi - self._lo))
 
 
 class RangeBar(QtWidgets.QWidget):
-    """Colour bar plus the three numbers that define it, in one place.
+    """Colour bar plus the three numbers that define it, in one column pair.
 
-    Layout, top to bottom: the gradient, a threshold slider spanning exactly
-    the bar's width so the handle lines up with the colour it selects, and the
-    min / threshold / max editors sitting under the ends and the middle they
-    control.
+    Layout, left to right: the gradient, a vertical threshold slider beside it,
+    and the numbers -- max at the top, min at the bottom, threshold (and its p,
+    for a statistic) between them -- each sitting next to the end of the bar it
+    controls.
     """
 
     range_changed = QtCore.Signal(float, float)
@@ -131,49 +140,51 @@ class RangeBar(QtWidgets.QWidget):
         #: ``(stat_code, dof)`` of the sub-brick the threshold reads, or None.
         self._stat: tuple[str, object] | None = None
 
-        v = QtWidgets.QVBoxLayout(self)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(3)
+        h = QtWidgets.QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(3)
 
         self.bar = ColorBar()
         self.bar.clicked.connect(self._threshold_from_bar)
-        v.addWidget(self.bar)
+        h.addWidget(self.bar)
 
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
         self.slider.setRange(0, TICKS)
-        # Flush with the bar so the handle points at the colour it thresholds.
         self.slider.setContentsMargins(0, 0, 0, 0)
         self.slider.valueChanged.connect(self._threshold_from_slider)
-        v.addWidget(self.slider)
+        h.addWidget(self.slider)
 
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(4)
+        numbers = QtWidgets.QVBoxLayout()
+        numbers.setContentsMargins(2, 0, 0, 0)
+        numbers.setSpacing(3)
         self.min_spin = self._spin("lowest value shown")
         self.thr_spin = self._spin("threshold: values nearer zero than this are cut")
         self.max_spin = self._spin("highest value shown")
         self.thr_spin.setStyleSheet(f"color: {theme.palette().warn};")
         self.auto_button = QtWidgets.QPushButton("auto")
         self.auto_button.setToolTip("Re-derive min and max from the data")
-        self.auto_button.setMaximumWidth(46)
+        # Sized by its text, not capped: a fixed width under the stylesheet's
+        # padding is what clipped the word to "au".
+        self.auto_button.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Fixed
+        )
         self.auto_button.clicked.connect(self.autorange_requested)
 
-        row.addWidget(self.min_spin, 1)
-        row.addWidget(self.thr_spin, 1)
-        row.addWidget(self.max_spin, 1)
-        row.addWidget(self.auto_button)
-        v.addLayout(row)
+        numbers.addWidget(self._caption("max"))
+        numbers.addWidget(self.max_spin)
+        numbers.addStretch(1)
+        numbers.addWidget(self._caption("thresh"))
+        numbers.addWidget(self.thr_spin)
 
         # A statistic's threshold is really a p; the stat value is the units it
         # happens to be stored in. The bucket states its own test and DoF in
         # BRICK_STATAUX, so nothing here has to be typed or remembered -- and
-        # the row hides entirely on a map that is not a statistic, because a
+        # the p hides entirely on a map that is not a statistic, because a
         # p-value quoted for a beta is a number that means nothing.
-        self._stat_row = QtWidgets.QHBoxLayout()
-        self._stat_row.setContentsMargins(0, 0, 0, 0)
-        self._stat_row.setSpacing(4)
         self.stat_label = QtWidgets.QLabel("")
         self.stat_label.setToolTip("The test this sub-brick carries, from BRICK_STATAUX")
+        self.stat_label.setWordWrap(True)
+        self.stat_label.setStyleSheet(f"font-size: {theme.FONT_SMALL}px;")
         self.p_spin = QtWidgets.QDoubleSpinBox()
         self.p_spin.setDecimals(6)
         self.p_spin.setRange(1e-6, 0.999999)
@@ -181,17 +192,30 @@ class RangeBar(QtWidgets.QWidget):
         self.p_spin.setKeyboardTracking(False)
         self.p_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)
         self.p_spin.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.p_spin.setMaximumWidth(110)
-        self._stat_row.addWidget(self.stat_label, 1)
-        self._stat_row.addWidget(self.p_spin)
         self._stat_host = QtWidgets.QWidget()
-        self._stat_host.setLayout(self._stat_row)
-        v.addWidget(self._stat_host)
+        stat_col = QtWidgets.QVBoxLayout(self._stat_host)
+        stat_col.setContentsMargins(0, 0, 0, 0)
+        stat_col.setSpacing(2)
+        stat_col.addWidget(self.stat_label)
+        stat_col.addWidget(self.p_spin)
+        numbers.addWidget(self._stat_host)
+
+        numbers.addStretch(1)
+        numbers.addWidget(self._caption("min"))
+        numbers.addWidget(self.min_spin)
+        numbers.addWidget(self.auto_button)
+        h.addLayout(numbers, 1)
 
         self.min_spin.valueChanged.connect(self._emit_range)
         self.max_spin.valueChanged.connect(self._emit_range)
         self.thr_spin.valueChanged.connect(self._threshold_from_spin)
         self.p_spin.valueChanged.connect(self._threshold_from_p)
+
+    @staticmethod
+    def _caption(text: str) -> QtWidgets.QLabel:
+        label = QtWidgets.QLabel(text)
+        label.setObjectName("head")
+        return label
 
     @staticmethod
     def _spin(tip: str) -> QtWidgets.QDoubleSpinBox:

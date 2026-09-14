@@ -296,6 +296,21 @@ class ViewerWindow(QtWidgets.QMainWindow):
             view.setMinimumWidth(min(widest + 28, 620))
 
     @staticmethod
+    def _shrinkable(box: QtWidgets.QComboBox) -> None:
+        """Let a combo narrow below its longest entry; the popup still shows it.
+
+        A sub-brick label can be forty characters, and a form column sized to
+        it pushes the colour bar off the side of the controller.
+        """
+        box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        box.setMinimumContentsLength(8)
+        view = box.view()
+        if view is not None:
+            view.setTextElideMode(QtCore.Qt.TextElideMode.ElideNone)
+
+    @staticmethod
     def _head(text: str) -> QtWidgets.QLabel:
         lab = QtWidgets.QLabel(text)
         lab.setObjectName("head")
@@ -559,8 +574,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self._build_derive(v)
 
+        # The layer form and the colour bar side by side: the bar stands on end
+        # to the right of the pickers, so the numbers that define it sit in the
+        # column of space the form's labels leave free instead of claiming a
+        # full-width band of their own below it.
+        controls = QtWidgets.QHBoxLayout()
+        controls.setSpacing(8)
         form = QtWidgets.QFormLayout()
         form.setSpacing(7)
+        form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
 
         # A stats bucket is a stack of named contrasts, and the names are in
         # the header -- ffs and 3dDeconvolve both write them. Showing "volume
@@ -572,6 +594,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.brick_box.activated.connect(
             lambda i: self._apply(SetVolume, index=int(self.brick_box.itemData(i)))
         )
+        self._shrinkable(self.brick_box)
         self.brick_head = self._head("OLAY")
         form.addRow(self.brick_head, self.brick_box)
 
@@ -584,6 +607,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.thrbrick_box.activated.connect(
             lambda i: self._apply(SetThresholdIndex, index=self.thrbrick_box.itemData(i))
         )
+        self._shrinkable(self.thrbrick_box)
         self.thrbrick_head = self._head("THR ON")
         form.addRow(self.thrbrick_head, self.thrbrick_box)
 
@@ -615,7 +639,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.rangebar.range_changed.connect(self._range_changed)
         self.rangebar.threshold_changed.connect(self._threshold_changed)
         self.rangebar.autorange_requested.connect(self._autorange)
-        form.addRow(self.thr_head, self.rangebar)
 
         # Kept as attributes so the rest of the window (and the tests) address
         # them by the name of the thing they control, not through the composite.
@@ -630,11 +653,16 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.opacity_slider.setRange(0, 100)
         self.opacity_slider.setValue(100)
         self.opacity_slider.valueChanged.connect(self._opacity_changed)
-        form.addRow(self._head("OPACITY"), self.opacity_slider)
-
         self.opacity_label = QtWidgets.QLabel("100%")
         self.opacity_label.setObjectName("value")
-        form.addRow(QtWidgets.QLabel(""), self.opacity_label)
+        self.opacity_label.setMinimumWidth(
+            QtGui.QFontMetrics(self.font()).horizontalAdvance("100%") + 4
+        )
+        opacity_row = QtWidgets.QHBoxLayout()
+        opacity_row.setSpacing(4)
+        opacity_row.addWidget(self.opacity_slider, 1)
+        opacity_row.addWidget(self.opacity_label)
+        form.addRow(self._head("OPACITY"), opacity_row)
 
         self.boxed_check = QtWidgets.QCheckBox(key_label("boxed", "b"))
         self.boxed_check.toggled.connect(lambda on: self._apply(SetBoxed, on=bool(on)))
@@ -657,7 +685,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self.timelink_check.toggled.connect(lambda on: self._apply(SetTimeLinked, on=bool(on)))
         form.addRow(QtWidgets.QLabel(""), self.timelink_check)
-        v.addLayout(form)
+        controls.addLayout(form, 1)
+
+        bar_column = QtWidgets.QVBoxLayout()
+        bar_column.setSpacing(4)
+        bar_column.addWidget(self.thr_head)
+        bar_column.addWidget(self.rangebar, 1)
+        controls.addLayout(bar_column)
+        v.addLayout(controls)
 
         self.mode_head = self._head("MODE PARAMETERS")
         v.addWidget(self.mode_head)
