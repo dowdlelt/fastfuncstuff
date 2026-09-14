@@ -440,8 +440,37 @@ def _resize_flow_field(fwd: Field, target: tuple[int, int, int], cfg: OptiwarpCo
     resized = _resize_field(*fwd, target)
     if cfg.fold_guard <= 0:
         return resized
-    # Positive determinants at coarse nodes do not guarantee positivity between
-    # them. Backtrack the interpolated displacement toward identity if necessary.
+
+    def _legal(j: Tensor) -> bool:
+        return bool(torch.isfinite(j).all()) and float(j.min()) >= cfg.jac_floor
+
+    # Positive determinants at coarse nodes do not guarantee positivity between them,
+    # and a level's best field sits right at the floor. What goes negative on the
+    # finer grid is local detail, so repair it locally: blend toward a smoothed copy
+    # only around the offending voxels. Two things this is deliberately not:
+    #  - Halving the whole field. That was the only repair, and one voxel at -0.08
+    #    threw away half of a level's warp everywhere (seen as a jump back toward the
+    #    start in the -movie at every level boundary).
+    #  - Shrinking displacement locally, as the step guard does. Steps are ~1 voxel,
+    #    but an accumulated field is several, and the damping mask's edge times that
+    #    magnitude is itself a new fold. Smoothing changes the field by its local
+    #    detail only, so the blend edge stays small.
+    jac = jacobian_determinant(*resized)
+    if _legal(jac):
+        return resized
+    for rnd in range(8):
+        blend = _fold_damping_mask(jac, cfg.jac_floor, 1.0)
+        smooth = _smooth_field(resized[0], resized[1], resized[2], 1.0)
+        resized = tuple(c + blend * (s - c) for c, s in zip(resized, smooth, strict=True))  # type: ignore[assignment]
+        jac = jacobian_determinant(*resized)
+        if _legal(jac):
+            if cfg.verb >= 1:
+                print(
+                    f"optiwarp: smoothed transferred displacement locally ({rnd + 1} rounds) for topology"
+                )
+            return resized
+
+    # Last resort: backtrack the whole displacement toward identity.
     for attempt in range(17):
         jac = jacobian_determinant(*resized)
         if bool(torch.isfinite(jac).all()) and float(jac.min()) >= cfg.jac_floor:

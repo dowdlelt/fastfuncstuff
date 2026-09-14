@@ -133,6 +133,33 @@ def test_flow_grid_transfer_checks_fine_grid_topology():
     assert float(jacobian_determinant(*result).min()) >= cfg.jac_floor
 
 
+def test_flow_grid_transfer_repairs_folds_locally_without_shrinking_the_warp():
+    """A few near-fold voxels must not cost the whole field its displacement.
+
+    The transfer used to halve the entire field until legal: at a level boundary one
+    voxel at det(J)=-0.08 discarded half of the level's warp everywhere.
+    """
+    from fastfuncstuff.processing.formwarp import _resize_field
+
+    n, fine = 13, (49, 49, 49)
+    rng = torch.Generator().manual_seed(8)
+    # A large, smooth, legal warp (a 1.5-voxel translation), plus a corner patch of
+    # the random detail known to fold between coarse nodes once upsampled 4x.
+    detail = torch.zeros(3, n, n, n)
+    detail[:, :5, :5, :5] = torch.stack(
+        [torch.randn(5, 5, 5, generator=rng) * 0.25 for _ in range(3)]
+    )
+    coarse = (1.5 + detail[0], detail[1], detail[2])
+    cfg = OptiwarpConfig(verb=0, jac_floor=0.0)
+    assert float(jacobian_determinant(*_resize_field(*coarse, fine)).min()) < 0
+
+    result = _resize_flow_field(coarse, fine, cfg)
+    assert float(jacobian_determinant(*result).min()) >= cfg.jac_floor
+    # Far from the patch, the translation (4x on the finer grid) survives intact.
+    far = result[0][32:, 32:, 32:]
+    torch.testing.assert_close(far, torch.full_like(far, 6.0), atol=1e-4, rtol=0)
+
+
 def _blobs(shape=(32, 40, 40), seed=0) -> torch.Tensor:
     """A textured phantom: enough structure at small scales for flow to lock onto."""
     from fastfuncstuff.processing.cost import _separable_smooth_3d
