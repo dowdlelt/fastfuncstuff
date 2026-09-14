@@ -168,17 +168,18 @@ def clusterize(
     elif pthr is None:
         note = "the threshold has no p, so no ClustSim row applies"
 
-    clusters = []
-    for index in range(1, len(keep) + 1):
-        picked = labels == index
-        alpha = None
-        if table is not None and pthr is not None:
-            alpha = table.alpha_for(pthr, int(picked.sum()))
-        clusters.append(
-            _measure(volume, picked, index=index, affine=affine, voxel_mm3=voxel_mm3, alpha=alpha)
-        )
+    clusters = _measure_all(
+        volume,
+        labels,
+        len(keep),
+        affine=affine,
+        voxel_mm3=voxel_mm3,
+        alpha_of=(
+            (lambda n: table.alpha_for(pthr, n)) if table is not None and pthr is not None else None
+        ),
+    )
     return ClusterTable(
-        clusters=tuple(clusters),
+        clusters=clusters,
         labels=labels.astype(np.int32),
         threshold=float(threshold),
         sidedness=sidedness,
@@ -190,34 +191,63 @@ def clusterize(
     )
 
 
-def _measure(
+def _measure_all(
     volume: np.ndarray,
-    picked: np.ndarray,
+    labels: np.ndarray,
+    n: int,
     *,
-    index: int,
     affine: np.ndarray | None,
     voxel_mm3: float,
-    alpha: float | None,
-) -> Cluster:
-    coords = np.argwhere(picked)
-    inside = volume[picked]
-    magnitude = np.abs(inside)
-    peak_at = int(np.argmax(magnitude))
-    peak_ijk = tuple(int(v) for v in coords[peak_at])
-    weights = magnitude / max(float(magnitude.sum()), 1e-12)
-    com = tuple(float(v) for v in (coords * weights[:, None]).sum(0))
-    return Cluster(
-        index=index,
-        n_voxels=int(coords.shape[0]),
-        volume_mm3=float(coords.shape[0]) * float(voxel_mm3),
-        peak=float(inside[peak_at]),
-        peak_ijk=peak_ijk,  # type: ignore[arg-type]
-        peak_xyz=_to_mm(peak_ijk, affine),
-        com_ijk=com,  # type: ignore[arg-type]
-        com_xyz=_to_mm(com, affine),
-        mean=float(inside.mean()),
-        alpha=alpha,
+    alpha_of,
+) -> tuple[Cluster, ...]:
+    """Measure every cluster in one pass over the suprathreshold voxels.
+
+    One pass, not one per cluster: a mask per label is O(clusters x voxels),
+    and a stat map at a loose threshold with no minimum size has tens of
+    thousands of one-voxel clusters -- that product was minutes of frozen
+    window on a whole brain.
+    """
+    if n == 0:
+        return ()
+    flat = labels.reshape(-1)
+    where = np.flatnonzero(flat)
+    lab = flat[where].astype(np.int64)
+    values = volume.reshape(-1)[where].astype(np.float64)
+    magnitude = np.abs(values)
+    coords = np.stack(np.unravel_index(where, labels.shape), 1).astype(np.float64)
+
+    counts = np.bincount(lab, minlength=n + 1)
+    sums = np.bincount(lab, weights=values, minlength=n + 1)
+    mass = np.bincount(lab, weights=magnitude, minlength=n + 1)
+    com = np.stack(
+        [np.bincount(lab, weights=coords[:, a] * magnitude, minlength=n + 1) for a in range(3)], 1
     )
+    # Sorting by label, then by descending magnitude, puts each cluster's peak
+    # first in its run -- the same argmax the per-cluster version took.
+    order = np.lexsort((-magnitude, lab))
+    firsts = order[np.searchsorted(lab[order], np.arange(1, n + 1))]
+
+    out = []
+    for index in range(1, n + 1):
+        count = int(counts[index])
+        at = int(firsts[index - 1])
+        peak_ijk = tuple(int(v) for v in coords[at])
+        centre = tuple(float(v) for v in com[index] / max(float(mass[index]), 1e-12))
+        out.append(
+            Cluster(
+                index=index,
+                n_voxels=count,
+                volume_mm3=float(count) * float(voxel_mm3),
+                peak=float(values[at]),
+                peak_ijk=peak_ijk,  # type: ignore[arg-type]
+                peak_xyz=_to_mm(peak_ijk, affine),
+                com_ijk=centre,  # type: ignore[arg-type]
+                com_xyz=_to_mm(centre, affine),
+                mean=float(sums[index]) / max(count, 1),
+                alpha=None if alpha_of is None else alpha_of(count),
+            )
+        )
+    return tuple(out)
 
 
 def _to_mm(ijk, affine: np.ndarray | None) -> tuple[float, float, float]:

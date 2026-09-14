@@ -116,3 +116,25 @@ def test_clusters_become_an_roi_set():
 def test_a_threshold_of_zero_is_refused():
     with pytest.raises(ValueError, match="threshold above zero"):
         clusterize(_two_blobs(), threshold=0.0)
+
+
+def test_many_tiny_clusters_are_measured_like_a_few_big_ones():
+    """The one-pass measurement has to agree with measuring each mask alone.
+
+    It replaced a mask per cluster, which froze the window for minutes on a
+    stat map with tens of thousands of one-voxel clusters.
+    """
+    rng = np.random.default_rng(4)
+    v = rng.normal(size=(20, 18, 14)).astype(np.float32)
+    table = clusterize(v, threshold=1.5)
+    assert len(table) > 100
+    assert table.n_voxels == int((np.abs(v) > 1.5).sum())
+    for cluster in (table.clusters[0], table.clusters[len(table) // 2], table.clusters[-1]):
+        picked = table.labels == cluster.index
+        inside = v[picked]
+        assert cluster.n_voxels == int(picked.sum())
+        assert cluster.peak == pytest.approx(float(inside[np.argmax(np.abs(inside))]))
+        assert v[cluster.peak_ijk] == pytest.approx(cluster.peak)
+        assert cluster.mean == pytest.approx(float(inside.mean()), rel=1e-5)
+        w = np.abs(inside) / np.abs(inside).sum()
+        assert np.allclose(cluster.com_ijk, (np.argwhere(picked) * w[:, None]).sum(0), atol=1e-4)
