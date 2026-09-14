@@ -123,10 +123,17 @@ class WindowManager(QtCore.QObject):
 
         self._dispatch(SetIndex(int(index)))
 
-    def _on_located(self, i: int, j: int, k: int) -> None:
-        from fastfuncstuff.viewer.vocab import SetIJK
+    def _on_located(self, x: float, y: float, z: float) -> None:
+        """A window pointed at a place, in millimetres.
 
-        self._dispatch(SetIJK(int(i), int(j), int(k)))
+        Millimetres because what these windows know is a voxel of the *run* --
+        a carpet row, a matrix node, a cluster peak -- and the crosshair lives
+        on the underlay's grid. Handing over the run's indices as display
+        indices was right only when the two grids happened to be one.
+        """
+        from fastfuncstuff.viewer.vocab import SetXYZ
+
+        self._dispatch(SetXYZ(float(x), float(y), float(z)))
 
     # -- drawing ---------------------------------------------------------
     def redraw(self, dirty: Aspect) -> None:

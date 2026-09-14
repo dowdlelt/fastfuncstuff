@@ -265,7 +265,7 @@ class MatrixWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(str)
     #: (i, j, k) of the node a clicked cell points at.
-    located = QtCore.Signal(int, int, int)
+    located = QtCore.Signal(float, float, float)
     rebuild_requested = QtCore.Signal(str)
 
     def __init__(
@@ -396,8 +396,12 @@ class MatrixWindow(QtWidgets.QWidget):
         if self._matrix is None:
             return
         where = self._matrix.location_of(MatrixView.target(row, col))
-        if where is not None and min(where) >= 0:
-            self.located.emit(*where)
+        viewport = self._viewport()
+        run = self.session.series_source(viewport) if viewport is not None else None
+        if where is not None and min(where) >= 0 and run is not None:
+            from fastfuncstuff.viewer.ui.carpetwindow import _voxel_to_mm
+
+            self.located.emit(*_voxel_to_mm(run.affine, where))
 
     def _viewport(self) -> Viewport | None:
         return self.session.state.viewports.find(self.vid)

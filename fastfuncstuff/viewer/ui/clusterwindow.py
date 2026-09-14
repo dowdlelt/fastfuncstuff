@@ -99,7 +99,7 @@ class ClusterWindow(QtWidgets.QWidget):
 
     closed = QtCore.Signal(str)
     #: (i, j, k) of a clicked cluster's peak.
-    located = QtCore.Signal(int, int, int)
+    located = QtCore.Signal(float, float, float)
     #: Asks the controller to turn this table into an ROI layer.
     rois_requested = QtCore.Signal(str)
     rebuild_requested = QtCore.Signal(str)
@@ -215,7 +215,8 @@ class ClusterWindow(QtWidgets.QWidget):
         if self._table is None or not (0 <= row < len(self._table)):
             return
         cluster = self._table.clusters[row]
-        self.located.emit(*cluster.peak_ijk)
+        # The table already carries the peak in mm, on the layer's own grid.
+        self.located.emit(*cluster.peak_xyz)
         self._show_trace(cluster)
 
     def _show_trace(self, cluster) -> None:

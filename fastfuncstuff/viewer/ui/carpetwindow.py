@@ -37,6 +37,11 @@ BARE_WIDTH = 300
 DRAG_START = 4
 
 
+def _voxel_to_mm(affine, ijk) -> tuple[float, float, float]:
+    x, y, z = (np.asarray(affine, dtype=float) @ np.array([*ijk, 1.0]))[:3]
+    return (float(x), float(y), float(z))
+
+
 class CarpetView(QtWidgets.QWidget):
     """Paints one carpet, plus the overlay band and the time cursor."""
 
@@ -227,7 +232,7 @@ class CarpetWindow(QtWidgets.QWidget):
     closed = QtCore.Signal(str)
     scrubbed = QtCore.Signal(int)
     #: (i, j, k) of the voxel a clicked row stands for.
-    located = QtCore.Signal(int, int, int)
+    located = QtCore.Signal(float, float, float)
     #: Asks the controller to rebuild on the worker; it owns the runner.
     rebuild_requested = QtCore.Signal(str)
     #: (view id, first row, last row) of a dragged selection.
@@ -335,8 +340,10 @@ class CarpetWindow(QtWidgets.QWidget):
         """Turn a clicked row back into a place in the brain."""
         carpet = self.view._carpet
         where = carpet.voxel_of(row) if carpet is not None else None
-        if where is not None:
-            self.located.emit(*where)
+        viewport = self._viewport()
+        run = self.session.series_source(viewport) if viewport is not None else None
+        if where is not None and run is not None:
+            self.located.emit(*_voxel_to_mm(run.affine, where))
 
     def _pick_layer(self, _index: int) -> None:
         key = self.layer_box.currentData()
