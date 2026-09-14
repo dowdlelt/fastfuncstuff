@@ -108,6 +108,11 @@ class ViewerSession:
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
         self.mode: Mode = registry.get("plain")()
+        #: Every mode this session has been in, by name. Switching back resumes
+        #: the same instance -- its folder, its component, its unsaved labels --
+        #: because a mode left to go and look at something else is a mode you
+        #: are coming back to.
+        self._modes: dict[str, Mode] = {self.mode.name: self.mode}
         self.mode.attach(self)
         self._volume_cache: dict[tuple[str, int], torch.Tensor] = {}
         #: Built on demand from a layer's voxels and kept until the flag or the
@@ -254,6 +259,24 @@ class ViewerSession:
         dirty = Aspect.NOTHING
         for plane in (Plane.AXIAL, Plane.SAGITTAL, Plane.CORONAL):
             dirty |= self.do(OpenView(self.state.viewports.mint_id(ViewKind.IMAGE), "image", plane))
+        return dirty
+
+    def open_mode_panels(self) -> Aspect:
+        """Open a trace window for each panel the active mode names, once.
+
+        Dispatched, so the windows are in the recording like any other. A panel
+        already on screen is left alone -- re-entering a mode must not stack a
+        second spectrum window over the first.
+        """
+        from fastfuncstuff.viewer.vocab import SetViewPanel
+
+        shown = {v.panel for v in self.state.viewports.of_kind(ViewKind.TRACE)}
+        dirty = Aspect.NOTHING
+        for name in self.mode.panel_names():
+            if name in shown:
+                continue
+            vid = self.open_view(ViewKind.TRACE, Plane.AXIAL)
+            dirty |= Aspect.VIEWPORTS | self.do(SetViewPanel(vid, name))
         return dirty
 
     def close_view(self, vid: str) -> Aspect:
@@ -416,8 +439,11 @@ class ViewerSession:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:
             return Aspect.NOTHING
+        cls = registry.get(name)
         self.mode.detach()
-        self.mode = registry.get(name)()
+        cached = self._modes.get(name)
+        self.mode = cached if isinstance(cached, cls) else cls()
+        self._modes[name] = self.mode
         self.mode.defer_preparation = self.defer_mode_preparation
         self.mode.attach(self)
         return (Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH) | self.mode.refresh()

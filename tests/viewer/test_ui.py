@@ -1917,3 +1917,73 @@ def test_keep_from_the_panel_numbers_the_copies(win4d, qapp):
     names = [ly.name for ly in win4d.session.state.layers if ly.source.startswith("kept:")]
     assert names == ["A_ICORR_1", "A_ICORR_2"]
     assert win4d.layer_list.count() == len(win4d.session.state.layers)
+
+
+# ---------------------------------------------------------------------------
+# ica review
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def ica_folder(tmp_path):
+    rng = np.random.default_rng(21)
+    out = tmp_path / "ica_out" / "melodic_compat"
+    out.mkdir(parents=True)
+    maps = rng.normal(size=(10, 12, 8, 4)).astype(np.float32)
+    nib.save(nib.Nifti1Image(maps, np.diag([3.0, 3.0, 3.0, 1.0])), str(out / "melodic_IC.nii.gz"))
+    t = np.arange(40)
+    np.savetxt(out / "melodic_mix", np.column_stack([np.sin(0.1 * f * t) for f in (1, 2, 3, 4)]))
+    return tmp_path / "ica_out"
+
+
+def _ica(win, qapp, folder):
+    win._switch_mode("ica")
+    win.runner.wait(20_000)
+    qapp.processEvents()
+    win._mode_param_changed("folder", str(folder))
+    win.runner.wait(20_000)
+    qapp.processEvents()
+    qapp.processEvents()
+
+
+def test_ica_loads_in_the_window_where_preparation_is_deferred(win, qapp, ica_folder):
+    """Its prepare() never cleared the dirty flag, so under the window's
+    deferred preparation the decomposition never loaded at all."""
+    _ica(win, qapp, ica_folder)
+    layer = win.session.state.layers.find_by_source("mode:ica")
+    assert layer is not None and layer.name == "A_ICA IC 0"
+
+
+def test_entering_ica_opens_a_timecourse_and_a_spectrum_window_once(win, qapp, ica_folder):
+    from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
+
+    _ica(win, qapp, ica_folder)
+    win._switch_mode("plain")
+    win._switch_mode("ica")
+    qapp.processEvents()
+    traces = [w for w in win.manager.windows.values() if isinstance(w, TraceWindow)]
+    panels = sorted(win.session.state.viewports.get(w.vid).panel for w in traces)
+    assert panels == ["spectrum", "timecourse"]
+    timecourse = next(
+        w for w in traces if win.session.state.viewports.get(w.vid).panel == "timecourse"
+    )
+    assert timecourse.view._trace is not None and timecourse.view._trace.values.size == 40
+    assert timecourse.windowTitle().startswith("[A] timecourse")
+
+
+def test_review_keys_in_a_trace_window_label_and_step(win, qapp, ica_folder):
+    from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
+
+    _ica(win, qapp, ica_folder)
+    window = next(w for w in win.manager.windows.values() if isinstance(w, TraceWindow))
+    window.action_requested.emit("noise")
+    qapp.processEvents()
+    window.action_requested.emit("next")
+    qapp.processEvents()
+    mode = win.session.mode
+    assert mode.labels == {0: "noise"}
+    assert mode.params["component"] == 2
+    # the panel follows the mode, so the spin box shows where the review is
+    spin = win.mode_panel._widgets["component"]
+    assert spin.value() == 2
+    assert "IC 2" in window.view._trace.label

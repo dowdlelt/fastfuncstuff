@@ -278,6 +278,17 @@ class SetViewRois(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewPanel(Command):
+    """Which of the active mode's named panels a trace window shows."""
+
+    name = "SET_VIEW_PANEL"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    panel: str
+
+
+@command
+@dataclass(frozen=True)
 class SetViewGeometry(Command):
     """Where a window sits on screen, so a saved session comes back tiled."""
 
@@ -899,6 +910,11 @@ def install(
         if cmd.scaling not in ("z", "psc"):
             raise KeyError(f"unknown carpet scaling {cmd.scaling!r}")
         return _set_view(st, cmd.view, SetViewScaling.aspects, scaling=cmd.scaling)
+
+    @bus.handle(SetViewPanel.name)
+    def _set_view_panel(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewPanel)
+        return _set_view(st, cmd.view, SetViewPanel.aspects, panel=str(cmd.panel))
 
     @bus.handle(SetViewGeometry.name)
     def _set_view_geometry(cmd: Command, st: ViewerState) -> Aspect:

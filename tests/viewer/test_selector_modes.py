@@ -587,7 +587,9 @@ def test_ica_contributes_a_timecourse_and_a_spectrum(ica_dir, session):
     session.read_directory(ica_dir / "ica_out")
     session.do(SetMode("ica"))
     traces = session.mode_series((1, 1, 1))
-    assert [t.x_label for t in traces] == ["TR", "Hz"]
+    # No 4-D layer here, so no TR: the spectrum's axis is bins, not a Hz
+    # scale invented from an assumed sampling rate.
+    assert [t.x_label for t in traces] == ["TR", "bin"]
     assert traces[0].values.size == 40
     assert traces[1].values.size == 20  # single-sided, DC dropped
 
@@ -730,3 +732,76 @@ def test_a_picked_overlay_is_what_the_controls_act_on(session, datadir):
     session.do(SelectLayer(base))
     session.do(AddOverlay(str(datadir / "brainmask.nii.gz")))
     assert session.state.selected == session.state.layers.layers[-1].key
+
+
+def test_ica_loads_a_chosen_folder_rather_than_the_read_directory(ica_dir, session, datadir):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.read_directory(datadir)  # somewhere with no decomposition
+    session.do(SetMode("ica"))
+    assert session.state.layers.find_by_source("mode:ica") is None
+    session.set_mode_param("folder", str(ica_dir / "ica_out"))
+    layer = session.state.layers.find_by_source("mode:ica")
+    assert layer is not None and layer.name == "A_ICA IC 0"
+
+
+def test_labelling_steps_on_and_names_the_map(ica_dir, session):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.do(SetMode("ica"))
+    session.set_mode_param("folder", str(ica_dir / "ica_out"))
+    session.do(ModeAction("noise"))
+    assert session.mode.labels == {0: "noise"}
+    assert session.mode.params["component"] == 1, "a label steps to the next component"
+    session.do(ModeAction("signal"))
+    session.do(ModeAction("prev"))
+    assert session.state.layers.find_by_source("mode:ica").name == "A_ICA IC 1 [signal]"
+    assert session.mode.noise_components() == [0]
+    assert "1 signal, 1 noise, 2 left" in session.mode.status()
+
+
+def test_labels_are_saved_beside_the_decomposition_and_read_back(ica_dir, session):
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.do(SetMode("ica"))
+    session.set_mode_param("folder", str(ica_dir / "ica_out"))
+    session.do(ModeAction("noise"))
+    session.do(ModeAction("noise"))
+    assert "unsaved" in session.mode.status()
+    session.do(ModeAction("save_labels"))
+    saved = (ica_dir / "ica_out" / "melodic_compat" / "ic_labels.tsv").read_text().splitlines()
+    assert saved[:4] == ["component\tlabel", "0\tnoise", "1\tnoise", "2\tunlabelled"]
+
+    fresh = ViewerSession(device=CPU)
+    try:
+        fresh.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+        fresh.do(SetMode("ica"))
+        fresh.set_mode_param("folder", str(ica_dir / "ica_out"))
+        assert fresh.mode.labels == {0: "noise", 1: "noise"}
+    finally:
+        fresh.close()
+
+
+def test_ica_offers_a_timecourse_and_a_spectrum_panel(ica_dir, session):
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.do(SetMode("ica"))
+    session.set_mode_param("folder", str(ica_dir / "ica_out"))
+    panels = session.mode.panels()
+    assert set(panels) == set(session.mode.panel_names()) == {"timecourse", "spectrum"}
+    assert panels["timecourse"].values.size == 40
+
+
+def test_coming_back_to_a_mode_resumes_where_it_was(ica_dir, session):
+    """Folder, component and unsaved labels survive a trip to another mode."""
+    from fastfuncstuff.viewer.vocab import ModeAction
+
+    session.do(SetUnderlay(str(ica_dir / "anat.nii.gz")))
+    session.do(SetMode("ica"))
+    session.set_mode_param("folder", str(ica_dir / "ica_out"))
+    session.do(ModeAction("noise"))
+    session.do(SetMode("plain"))
+    session.do(SetMode("ica"))
+    assert session.mode.labels == {0: "noise"}
+    assert session.mode.params["component"] == 1
+    assert session.state.layers.find_by_source("mode:ica").name == "A_ICA IC 1"

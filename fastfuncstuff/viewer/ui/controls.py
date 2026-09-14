@@ -83,11 +83,13 @@ class ControlPanel(QtWidgets.QWidget):
             self._form.addRow(label, widget)
 
         if actions:
+            # A grid of three, not one row: ICA declares seven buttons, and a
+            # row that long made the whole panel wider than its window.
             row = QtWidgets.QWidget()
-            h = QtWidgets.QHBoxLayout(row)
+            h = QtWidgets.QGridLayout(row)
             h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(5)
-            for spec in actions:
+            h.setSpacing(4)
+            for position, spec in enumerate(actions):
                 button = QtWidgets.QPushButton(spec.label.upper())
                 button.setToolTip(spec.help)
                 # Pending edits first: pressing APPLY straight after typing a
@@ -95,10 +97,10 @@ class ControlPanel(QtWidgets.QWidget):
                 button.clicked.connect(
                     lambda _=False, n=spec.name: (self.flush_now(), self.action_requested.emit(n))
                 )
-                h.addWidget(button)
+                button.setMinimumWidth(10)
+                h.addWidget(button, *divmod(position, 3))
                 self._widgets[f"action:{spec.name}"] = button
-            h.addStretch(1)
-            self._form.addRow(QtWidgets.QLabel(""), row)
+            self._form.addRow(row)
 
     def _build(
         self, spec: Control, value: object
@@ -118,6 +120,9 @@ class ControlPanel(QtWidgets.QWidget):
             h.setSpacing(4)
             edit = QtWidgets.QLineEdit(str(value if value is not None else spec.default))
             edit.setPlaceholderText("none")
+            edit.setMinimumWidth(40)
+            # Show the end of a long path -- the folder name -- not its root.
+            edit.setCursorPosition(len(edit.text()))
             # On enter or focus-out, not per keystroke: a half-typed path is not
             # a parameter.
             edit.editingFinished.connect(
@@ -126,8 +131,11 @@ class ControlPanel(QtWidgets.QWidget):
             browse = QtWidgets.QPushButton("…")
             browse.setMaximumWidth(34)
 
-            def pick(_=False, n=spec.name, e=edit, flt=spec.filter) -> None:
-                path, _ = QtWidgets.QFileDialog.getOpenFileName(self, spec.label, e.text(), flt)
+            def pick(_=False, n=spec.name, e=edit, flt=spec.filter, folder=spec.directory) -> None:
+                if folder:
+                    path = QtWidgets.QFileDialog.getExistingDirectory(self, spec.label, e.text())
+                else:
+                    path, _ = QtWidgets.QFileDialog.getOpenFileName(self, spec.label, e.text(), flt)
                 if path:
                     e.setText(path)
                     self._queue(n, path, now=True)

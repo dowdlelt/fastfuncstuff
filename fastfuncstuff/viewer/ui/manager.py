@@ -24,6 +24,7 @@ from fastfuncstuff.viewer.ui.clusterwindow import ClusterWindow
 from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
 from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
 from fastfuncstuff.viewer.ui.matrixwindow import MatrixWindow
+from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
 from fastfuncstuff.viewer.viewports import ViewKind, Viewport
 from fastfuncstuff.viewer.vocab import CloseView, SetViewGeometry
 
@@ -32,7 +33,7 @@ TILE_GAP = 6
 
 #: Every kind of companion window. They share no base class on purpose -- what
 #: they have in common is the four methods the manager calls, not an ancestry.
-Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow | ClusterWindow
+Companion = ImageWindow | GraphWindow | CarpetWindow | MatrixWindow | ClusterWindow | TraceWindow
 
 
 class WindowManager(QtCore.QObject):
@@ -45,6 +46,8 @@ class WindowManager(QtCore.QObject):
     rois_requested = QtCore.Signal(str)
     #: A carpet window's rows were dragged over: (view id, first, last).
     rows_selected = QtCore.Signal(str, int, int)
+    #: A window's key asked the active mode for an action, by name.
+    mode_action_requested = QtCore.Signal(str)
 
     def __init__(
         self,
@@ -101,6 +104,9 @@ class WindowManager(QtCore.QObject):
             win = MatrixWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)
             win.rebuild_requested.connect(self.rebuild_requested)
+        elif viewport.is_trace:
+            win = TraceWindow(viewport.id, self.session, self._dispatch, self._parent)
+            win.action_requested.connect(self.mode_action_requested)
         elif viewport.is_clusters:
             win = ClusterWindow(viewport.id, self.session, self._dispatch, self._parent)
             win.located.connect(self._on_located)

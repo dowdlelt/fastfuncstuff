@@ -60,6 +60,7 @@ class ViewKind(StrEnum):
     CARPET = "carpet"
     MATRIX = "matrix"
     CLUSTERS = "clusters"
+    TRACE = "trace"
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,12 @@ class Viewport:
     #: ``z`` or ``psc``.
     scaling: str = "z"
 
+    # -- trace -----------------------------------------------------------
+    #: Which of the active mode's named panels a trace window shows --
+    #: ``timecourse``, ``spectrum``. A name rather than an index, so a script
+    #: that opened the spectrum window still opens it when a mode adds a panel.
+    panel: str = ""
+
     #: Last known on-screen rectangle, so a saved session comes back where it
     #: was. The window manager writes it; nothing else reads it.
     geometry: tuple[int, int, int, int] | None = None
@@ -150,6 +157,10 @@ class Viewport:
         return self.kind is ViewKind.CLUSTERS
 
     @property
+    def is_trace(self) -> bool:
+        return self.kind is ViewKind.TRACE
+
+    @property
     def cells(self) -> int:
         return self.grid_n * self.grid_n
 
@@ -167,6 +178,8 @@ class Viewport:
             return f"matrix · {self.matrix_order}  [{self.id}]"
         if self.is_clusters:
             return f"clusters  [{self.id}]"
+        if self.is_trace:
+            return f"{self.panel or 'trace'}  [{self.id}]"
         what = self.plane.value if self.is_image else f"graph · {self.plane.value}"
         extra = " · solo" if self.solo else ""
         if self.is_graph:
@@ -199,6 +212,7 @@ class ViewportSet:
             ViewKind.CARPET: "C",
             ViewKind.MATRIX: "M",
             ViewKind.CLUSTERS: "K",
+            ViewKind.TRACE: "T",
         }[kind]
         n = self._seq.get(stem, 0)
         while True:

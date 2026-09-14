@@ -195,6 +195,9 @@ class ViewerWindow(QtWidgets.QMainWindow):
         session.label = letter
         manager.rebuild_requested.connect(lambda vid, c=ctl: self._on(c, self.rebuild_view, vid))
         manager.rois_requested.connect(lambda vid, c=ctl: self._on(c, self._clusters_to_rois, vid))
+        manager.mode_action_requested.connect(
+            lambda name, c=ctl: self._on(c, self._mode_action, name)
+        )
         manager.rows_selected.connect(
             lambda vid, a, b, c=ctl: self._on(c, self._carpet_rows_to_layer, vid, a, b)
         )
@@ -990,6 +993,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
     def _switch_mode(self, name: str) -> None:
         self._dispatch(SetMode(name))
+        self.refresh(self.session.open_mode_panels())
         self._prepare_then_refresh()
 
     def _mode_param_changed(self, name: str, value: str) -> None:
@@ -1004,6 +1008,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         that appeared are queued for the worker.
         """
         before = set(self.session.state.viewports.ids)
+        if not any(a.name == name for a in self.session.mode.actions()):
+            return  # a trace window's key for an action this mode does not have
         try:
             self._dispatch(ModeAction(name))
         except (KeyError, ValueError, OSError) as exc:

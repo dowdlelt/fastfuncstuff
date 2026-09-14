@@ -123,6 +123,8 @@ class PathControl(Control):
     default: str = ""
     #: Qt file-dialog filter, e.g. ``"1D / xmat (*.1D);;All (*)"``.
     filter: str = "All (*)"
+    #: Browse for a folder rather than a file.
+    directory: bool = False
 
 
 @dataclass(frozen=True)
@@ -286,6 +288,14 @@ class Mode(ABC):
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:
         """Extra graph traces at a voxel."""
         return []
+
+    def panel_names(self) -> tuple[str, ...]:
+        """Named lines this mode shows in windows of their own, opened on entry."""
+        return ()
+
+    def panels(self) -> dict[str, Trace]:
+        """The current line for each of :meth:`panel_names`."""
+        return {}
 
     # -- production ----------------------------------------------------
     #

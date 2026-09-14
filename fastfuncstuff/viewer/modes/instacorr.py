@@ -154,6 +154,19 @@ class InstaCorrMode(Mode):
         super().attach(session)
         self._capture_source()
 
+    def detach(self) -> None:
+        """Free the prepared array; it can be gigabytes of device memory.
+
+        The instance is kept for its parameters, and the map stays in the
+        stack, so coming back costs one re-preparation and nothing else.
+        """
+        self._prepared = None
+        self._valid = None
+        self._source = None
+        self._source_key = None
+        self._dirty = True
+        super().detach()
+
     # -- preparation ---------------------------------------------------
     def prepare(self, progress: ProgressFn | None = None) -> bool:
         """Detrend, bandpass, blur and normalize. Seconds on a real dataset."""
