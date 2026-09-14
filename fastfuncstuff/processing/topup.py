@@ -45,14 +45,19 @@ only motion modelled is an optional single global translation along PE
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .cost import _separable_smooth_3d
+
+if TYPE_CHECKING:
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
 
 try:
     from tqdm import tqdm as _tqdm
@@ -1020,6 +1025,7 @@ def gn_solve_level(
     jac_penalty: float = 0.0,
     jac_floor: float = 0.1,
     reject_folds: bool = True,
+    on_step: Callable[[Tensor, int, float], None] | None = None,
 ) -> tuple[Tensor, float]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1031,8 +1037,9 @@ def gn_solve_level(
     operator and are kept in sync by ``tests/test_topup.py``. A backtracking,
     step-rejecting line search guards every step. ``jac_penalty > 0`` adds the anti-fold
     barrier (weight relative to the data SSD, like ``lam``); ``reject_folds`` additionally
-    vetoes any accepted step that introduces/worsens a negative Jacobian. Returns
-    ``(coefficients, cost)``.
+    vetoes any accepted step that introduces/worsens a negative Jacobian. ``on_step``
+    is called with ``(coefficients, iteration, cost)`` after every accepted step.
+    Returns ``(coefficients, cost)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
     n_sm1 = max(1, len(scans) - 1)
@@ -1112,6 +1119,8 @@ def gn_solve_level(
         )
         if not accepted:
             break
+        if on_step is not None:
+            on_step(coeff, _it, new_cost)
         if prev_cost is not None and abs(prev_cost - new_cost) < 1e-6 * prev_cost:
             break
         prev_cost = new_cost
@@ -1330,6 +1339,7 @@ def run_topup(
     estimate_motion: bool = False,
     motion_ref: int = 0,
     motion_interp: str = "cubic",
+    recorder: WarpMovieRecorder | None = None,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1346,6 +1356,10 @@ def run_topup(
     cost here, because the numerically sensitive reductions (cost, CG inner products)
     accumulate in float64 regardless (see :func:`_dot64`); the smooth Hz field itself has
     plenty of headroom in float32. Pass ``torch.float64`` to reproduce the old behaviour.
+
+    ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
+    row per scan) captures every scan undistorted by the running field after each
+    accepted Gauss-Newton step, with each level's result pinned.
     """
     config.validate()
     shape = tuple(scans[0].data.shape)  # type: ignore[assignment]
@@ -1386,6 +1400,23 @@ def run_topup(
     else:
         estmov = [False] * config.n_levels()  # off, or no second scan to move against
 
+    def _movie_chains(field_hz: Tensor) -> list[list[tuple[Tensor, Tensor, Tensor]]]:
+        # Each scan moves along its own PE axis by field * readout * sign voxels.
+        chains = []
+        for sc in work:
+            disp = (field_hz * (sc.readout * sc.sign)).float()
+            comps = [torch.zeros_like(disp)] * 3  # x, y, z displacement slots
+            comps[2 - _NIFTI_AXIS_TO_TDIM[sc.pe_axis]] = disp
+            chains.append([(comps[0], comps[1], comps[2])])
+        return chains
+
+    if recorder is not None:
+        from fastfuncstuff.viz.warp_movie import FieldFrame
+
+        recorder.set_images([sc.data for sc in work])
+        recorder.set_frame(FieldFrame(mapping="stride"))
+        recorder.capture_identity(label="start")
+
     n_lev = config.n_levels()
     level_bar = _bar(
         total=n_lev,
@@ -1419,6 +1450,11 @@ def run_topup(
         basis = new_basis
 
         mask = compute_mask(level_scans)
+        on_step = None
+        if recorder is not None:
+            recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
+            on_step = _movie_step(recorder, basis, _movie_chains)
+
         level_bar.set_postfix_str(
             f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} "
             f"grid={'x'.join(map(str, level_shape))} knots={'x'.join(map(str, basis.coeff_shape))}"
@@ -1440,7 +1476,15 @@ def run_topup(
             jac_penalty=config.jac_penalty,
             jac_floor=config.jac_floor,
             reject_folds=config.reject_folds,
+            on_step=on_step,
         )
+        if recorder is not None:
+            recorder.capture(
+                _movie_chains(basis.field(coeff)),
+                label=f"done  cost {cost:.3e}",
+                pinned=True,
+                modulate=True,
+            )
         level_bar.update(1)
         level_bar.set_postfix_str(
             f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} cost={cost:.3e}"
@@ -1460,6 +1504,8 @@ def run_topup(
                 interp=motion_interp,
                 verbose=progress,
             )
+            if recorder is not None:
+                recorder.set_images([sc.data for sc in work])
     level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
@@ -1473,6 +1519,14 @@ def run_topup(
         # field so warp, field map and unwarped stay mutually consistent (the coeff
         # in the result is still the raw fit).
         field_hz = taper_field_to_object(field_hz, work, voxel_sizes)
+        if recorder is not None:
+            recorder.set_context("")
+            recorder.capture(
+                _movie_chains(field_hz),
+                label="final field, tapered to the object",
+                pinned=True,
+                modulate=True,
+            )
         field_s = field_hz.to(solve_dtype)
         unwarped = []
         for sc, s in zip(work, scales, strict=True):
@@ -1494,6 +1548,22 @@ def run_topup(
         mean_unwarped=mean_unwarped,
         motion_matrices=motion_mats,
     )
+
+
+def _movie_step(
+    recorder: WarpMovieRecorder,
+    basis: SplineFieldBasis,
+    chains: Callable[[Tensor], list[list[tuple[Tensor, Tensor, Tensor]]]],
+) -> Callable[[Tensor, int, float], None]:
+    """A Gauss-Newton ``on_step`` that records the scans through this level's field."""
+
+    def on_step(coeff: Tensor, it: int, cost: float) -> None:
+        if recorder.tick():
+            recorder.capture(
+                chains(basis.field(coeff)), label=f"it {it}  cost {cost:.3e}", modulate=True
+            )
+
+    return on_step
 
 
 def _resize_field(field: Tensor, out_shape: tuple[int, int, int]) -> Tensor:

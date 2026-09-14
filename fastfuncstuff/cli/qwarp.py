@@ -37,10 +37,14 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
+    add_warp_movie_args,
     apply_recipe_preset,
+    build_warp_movie_recorder,
     collect_batch_jobs,
     enable_determinism,
     parse_prefix,
+    render_warp_movie,
+    resolve_movie_path,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -880,6 +884,7 @@ def parse_args(
         "GPU / Hardware",
         "Device selection and memory management.",
     )
+    add_warp_movie_args(p)
     add_recipe_arg(p, "qwarp")
     add_deterministic_arg(g_hw)
     add_device_arg(
@@ -1537,6 +1542,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     if not args.no_save_warp:
         # The warp is written .nii.gz regardless of the prefix's own extension.
         outs.append(f"{_warp_stem(args, pfx)}_WARP.nii.gz")
+    movie = resolve_movie_path(args)
+    if movie is not None:
+        outs.append(movie)
     return outs
 
 
@@ -1984,6 +1992,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     #   -partials           -> warped images concatenated into one 4D movie
     #                          {prefix}_partials.nii.gz (flushed after the run)
     # In timeseries mode only the first volume dumps (warned below).
+    # -movie records the first registration only, like the per-level dumps.
+    movie_rec = None
+
     level_cb = None
     if args.save_intermediates or args.partials or args.partial_warps:
         level_cb = _LevelDumper(
@@ -2109,6 +2120,11 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             # First volume only: attach per-level intermediate callback
             if level_cb is not None and i == 0:
                 vol_overrides["level_callback"] = level_cb
+            if args.movie is not None and i == 0:
+                movie_rec = build_warp_movie_recorder(
+                    args, base_3d, src_vol, base_info["affine"], device, "qwarp", mask=weight
+                )
+                vol_overrides["movie_recorder"] = movie_rec
             if vol_overrides:
                 vol_config = replace(config, **vol_overrides)
 
@@ -2359,6 +2375,13 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
                 t_config = replace(config, level_callback=level_cb)
                 if nt > 1 and args.verb >= 1:
                     print("  (saving intermediates for this timepoint only)")
+            if args.movie is not None and t == 0:
+                movie_rec = build_warp_movie_recorder(
+                    args, base_3d, src_vol, base_info["affine"], device, "qwarp", mask=weight
+                )
+                t_config = replace(t_config, movie_recorder=movie_rec)
+                if nt > 1 and args.verb >= 1:
+                    print("  (-movie records this timepoint only)")
 
             warped, xd, yd, zd = qwarp(
                 base_gpu,
@@ -2469,6 +2492,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         level_cb.finalize()
         if args.verb >= 1 and args.partials and n_movie:
             print(f"Per-level movie: {prefix}_partials.nii.gz ({n_movie} levels)")
+
+    render_warp_movie(movie_rec, args, args.verb)
 
     elapsed = time.time() - t0
     if args.verb >= 1:

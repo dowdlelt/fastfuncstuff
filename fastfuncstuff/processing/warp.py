@@ -386,6 +386,11 @@ class QwarpConfig:
     callee is responsible for cropping and moving to CPU if needed. Used to
     save per-level intermediate warps and warped images."""
 
+    movie_recorder: Any = None
+    """Optional :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` on the
+    UNPADDED base grid. :func:`qwarp` declares the padding to it; frames are captured
+    after each checkerboard phase and pinned at each level's end."""
+
 
 @dataclass
 class WarpState:
@@ -710,10 +715,27 @@ def qwarp(
         state.zd = torch.zeros(nz, ny, nx, device=device)
         state.warped_source = source_p.clone()
 
+    recorder = config.movie_recorder
+    if recorder is not None:
+        from fastfuncstuff.viz.warp_movie import FieldFrame
+
+        px0, _, py0, _, pz0, _ = padding
+        # Pyramid octaves are align_corners=False resizes of the padded grid.
+        recorder.set_frame(
+            FieldFrame(offset=(pz0, py0, px0), full_shape=(nz, ny, nx), mapping="centres")
+        )
+        recorder.capture_displacement(
+            (state.xd, state.yd, state.zd),
+            label="initial warp" if initial_warp is not None else "start",
+            pinned=True,
+        )
+
     if config.pyramid_factor > 1 and initial_warp is None and config.start_level == 0:
         _warpomatic_pyramid(base_p, source_p, weight_p, mask_p, state, config, device)
     else:
         _warpomatic(base_p, source_p, weight_p, mask_p, state, config, device)
+    if recorder is not None:
+        recorder.set_context("")
     if level_log is not None:
         level_log.extend(state.level_log)
 
@@ -1103,6 +1125,9 @@ def _warpomatic_pyramid(
                     f"qwarp_torch: pyramid {tag} at {gx}x{gy}x{gz}, refine from lev={start_level}"
                 )
 
+        if config.movie_recorder is not None:
+            config.movie_recorder.set_context("" if scale == 1 else f"pyramid 1/{scale}")
+
         # Recurse with pyramid off. Per-level dumps (-partials/-partial_warps)
         # only fire at full resolution, not on the downsampled octaves.
         cfg_s = replace(
@@ -1321,6 +1346,12 @@ def _warpomatic(
 
         if config.level_callback is not None:
             config.level_callback(0, state.xd, state.yd, state.zd, state.warped_source)
+        if config.movie_recorder is not None:
+            config.movie_recorder.capture_displacement(
+                (state.xd, state.yd, state.zd),
+                label=f"lev=0 global  cost {state.cost:.5f}",
+                pinned=True,
+            )
 
     # --- Levels 1..N: progressively smaller patches (batched GPU) ---
     xwid0 = ittt - ibbb + 1
@@ -1595,6 +1626,15 @@ def _warpomatic(
                 if lev_pbar is not None:
                     lev_pbar.update(len(phase_patches))
 
+                recorder = config.movie_recorder
+                if recorder is not None and recorder.tick():
+                    pass_tag = f" pass {_pass + 1}/{nlevr}" if nlevr > 1 else ""
+                    recorder.capture_displacement(
+                        (state.xd, state.yd, state.zd),
+                        label=f"lev={lev} {xwid}x{ywid}x{zwid}{pass_tag}  "
+                        f"phase {phase_order.index(phase_idx) + 1}/8",
+                    )
+
         # Light warp smoothing to reduce patch boundary artifacts
         # Sigma scales with patch overlap: half the overlap width
         # xdel is the step between patches, (nxh - xdel) is the overlap
@@ -1632,6 +1672,12 @@ def _warpomatic(
                     source, state.xd, state.yd, state.zd, mode=config.interp
                 )
             state.cost = cost_at_start
+            if config.movie_recorder is not None:
+                config.movie_recorder.capture_displacement(
+                    (state.xd, state.yd, state.zd),
+                    label=f"lev={lev} {xwid}x{ywid}x{zwid}  worsened, rolled back",
+                    pinned=True,
+                )
             if config.verb >= 1:
                 msg = (
                     f"lev={lev} worsened cost {cost_at_start:.5f}=>{worsened:.5f}; "
@@ -1686,6 +1732,12 @@ def _warpomatic(
 
         if config.level_callback is not None:
             config.level_callback(lev, state.xd, state.yd, state.zd, state.warped_source)
+        if config.movie_recorder is not None:
+            config.movie_recorder.capture_displacement(
+                (state.xd, state.yd, state.zd),
+                label=f"lev={lev} {xwid}x{ywid}x{zwid} done  cost {state.cost:.5f}",
+                pinned=True,
+            )
 
         # Early stopping: if this level barely improved cost, skip finer levels
         if config.level_stop_tol > 0 and cost_at_start < 0:

@@ -52,6 +52,7 @@ METHOD / CREDIT
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import sys
 from datetime import datetime
@@ -67,8 +68,12 @@ PE_DIRECTION_WORDS = ("i", "j", "k", "i-", "j-", "k-", "x", "y", "z", "x-", "y-"
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
+    add_warp_movie_args,
+    build_warp_movie_recorder,
     collect_batch_jobs,
     parse_prefix,
+    render_warp_movie,
+    resolve_movie_path,
     run_batch_jobs,
     setup_device,
 )
@@ -277,6 +282,7 @@ def create_parser() -> argparse.ArgumentParser:
         extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
     )
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
+    add_warp_movie_args(parser, overlay=False)
     add_batch_args(
         parser,
         tool="ffs_blipflip",
@@ -370,6 +376,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     outs = [f"{pinfo.stem}_warp{pinfo.nifti_ext}"]
     if not args.no_unwarped:
         outs.append(f"{pinfo.stem}_unwarped{pinfo.nifti_ext}")
+    movie = resolve_movie_path(args)
+    if movie is not None:
+        outs.append(movie)
     return outs
 
 
@@ -508,6 +517,19 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         print(f"ffs_blipflip: -motion_ref {args.motion_ref} out of range.", file=sys.stderr)
         return 2
 
+    # One movie row per scan; run_topup swaps in its rescaled/shifted working copies.
+    recorder = build_warp_movie_recorder(
+        args,
+        None,
+        [sc.data for sc in scans],
+        affine,
+        device,
+        "blipflip",
+        row_labels=[
+            f"{os.path.basename(p).split('.')[0]} ({pe})"
+            for p, pe in zip(paths, pe_dirs, strict=True)
+        ],
+    )
     solve_dtype = torch.float64 if args.precision == "float64" else torch.float32
     result = T.run_topup(
         scans,
@@ -520,6 +542,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         estimate_motion=args.estmov,
         motion_ref=args.motion_ref,
         motion_interp=args.motion_interp,
+        recorder=recorder,
     )
 
     # ---- outputs ----
@@ -618,6 +641,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             fh.write("\n".join(rows) + "\n")
         if args.verb >= 1:
             print(f"  wrote {movpar_path}  (per-scan rigid movement)")
+
+    render_warp_movie(recorder, args, args.verb)
 
     pe_letter = {0: "i", 1: "j", 2: "k"}[ref.pe_axis]
     if args.verb >= 1:

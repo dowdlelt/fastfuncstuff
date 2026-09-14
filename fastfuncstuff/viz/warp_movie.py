@@ -1,8 +1,8 @@
 """Record a nonlinear warp as the optimizer builds it, then render it as a movie.
 
 The recorder never warps a volume. A frame only shows a few display planes, so it
-pulls the source image through the *current* field at just those planes' pixels --
-a few hundred thousand trilinear samples, small next to one optimizer iteration.
+follows each plane pixel through the *current* field(s) and samples the source there
+-- a few hundred thousand trilinear samples, small next to one optimizer iteration.
 The samples stay on the device as float16 until :meth:`WarpMovieRecorder.render`,
 so capturing costs no host sync; composition and encoding happen once, on the CPU,
 after the fit.
@@ -15,6 +15,11 @@ doubles its stride -- so the kept frames always stay evenly spaced in iteration
 count and never exceed the budget. Pinned frames (a level's returned field) are
 never dropped.
 
+Tools differ in how their working grid relates to the image. :class:`FieldFrame`
+says so once: a padding offset (qwarp works on a padded grid), and how a coarse level
+was made from the full grid (an align-corners resize, an align-centres resize, or a
+stride). A capture then accepts fields on any level of that pyramid.
+
 Calling convention for a tool::
 
     if recorder is not None and recorder.tick():
@@ -25,6 +30,7 @@ Calling convention for a tool::
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -38,20 +44,61 @@ from .encode import movie_path, write_movie
 from .slices import SlicePlanes
 
 Field = tuple[Tensor, Tensor, Tensor]
+"""``(xd, yd, zd)`` voxel displacements, each (nz, ny, nx) on one grid: output voxel
+(k, j, i) samples the source at (i + xd, j + yd, k + zd) -- the convention of
+:func:`fastfuncstuff.processing.interp.warp_image_linear`."""
+
+_PYRAMID_MAPPINGS = ("corners", "centres", "stride")
+
+
+@dataclass(frozen=True)
+class FieldFrame:
+    """Where a tool's fields live relative to the display planes' grid.
+
+    Attributes:
+        offset: (z, y, x) index, in the field's full-resolution grid, of the planes
+            grid's voxel 0. Nonzero when the tool pads (qwarp).
+        full_shape: The field's full-resolution grid. ``None`` means the planes grid.
+        mapping: How a coarse level of shape ``g`` was made from ``full_shape`` ``N``:
+            ``corners`` (``F.interpolate(align_corners=True)``, the optiwarp/formwarp
+            pyramid), ``centres`` (``align_corners=False``, qwarp's octaves) or
+            ``stride`` (``vol[::s]``, blipflip's subsampling).
+    """
+
+    offset: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    full_shape: tuple[int, int, int] | None = None
+    mapping: str = "corners"
+
+    def __post_init__(self) -> None:
+        if self.mapping not in _PYRAMID_MAPPINGS:
+            raise ValueError(f"mapping must be one of {_PYRAMID_MAPPINGS}, got {self.mapping!r}")
+
+
+def _level_affine(n: int, g: int, mapping: str) -> tuple[float, float]:
+    """(a, b) with level coordinate = a * full coordinate + b, for one axis."""
+    if g == n:
+        return 1.0, 0.0
+    if mapping == "corners":
+        return ((g - 1) / (n - 1) if n > 1 else 1.0), 0.0
+    if mapping == "centres":
+        a = g / n
+        return a, 0.5 * a - 0.5
+    return 1.0 / math.ceil(n / g), 0.0  # stride: g = ceil(n / s)
 
 
 @dataclass
 class _Frame:
-    values: Tensor
+    values: Tensor  # (n_rows, N) float16
     label: str
     pinned: bool
 
 
 class WarpMovieRecorder:
-    """Accumulates sampled display planes of a source image seen through a warp.
+    """Accumulates sampled display planes of one or more images seen through warps.
 
     Args:
-        moving: (nz, ny, nx) image being warped, on the grid the planes index.
+        moving: (nz, ny, nx) image being warped, or a sequence of them -- one movie row
+            each (blipflip's blip-up and blip-down) -- all on the planes' grid.
         planes: Display planes, from :func:`fastfuncstuff.viz.slices.build_slice_planes`.
         every: Fixed capture cadence in :meth:`tick` calls. Mutually exclusive with
             ``max_frames``.
@@ -59,47 +106,54 @@ class WarpMovieRecorder:
         reference: Optional (nz, ny, nx) fixed image (the base) on the same grid. Its
             planes are kept so ``render(overlay="edges")`` can outline it.
         tool: Name shown at the start of every caption.
-        device: Where sampling happens. Defaults to ``moving``'s device.
+        row_labels: Optional name per row, drawn on the row.
+        device: Where sampling happens. Defaults to the first image's device.
     """
 
     def __init__(
         self,
-        moving: Tensor,
+        moving: Tensor | Sequence[Tensor],
         planes: SlicePlanes,
         *,
         every: int | None = None,
         max_frames: int | None = 150,
         reference: Tensor | None = None,
         tool: str = "",
+        row_labels: Sequence[str] | None = None,
         device: torch.device | None = None,
     ) -> None:
+        images = [moving] if isinstance(moving, Tensor) else list(moving)
+        if not images:
+            raise ValueError("at least one moving image is required")
         if every is not None and every < 1:
             raise ValueError("every must be >= 1")
         if every is None and (max_frames is None or max_frames < 2):
             raise ValueError("max_frames must be >= 2 when no fixed cadence is given")
-        if tuple(moving.shape) != planes.grid_shape:
-            raise ValueError(
-                f"moving {tuple(moving.shape)} is not on the planes' grid {planes.grid_shape}"
-            )
-        self.device = device if device is not None else moving.device
+        for img in images:
+            if tuple(img.shape) != planes.grid_shape:
+                raise ValueError(
+                    f"moving {tuple(img.shape)} is not on the planes' grid {planes.grid_shape}"
+                )
+        if row_labels is not None and len(row_labels) != len(images):
+            raise ValueError("need one row label per moving image")
+        self.device = device if device is not None else images[0].device
         self.planes = planes
         self.tool = tool
-        self._every = every
+        self.row_labels = list(row_labels) if row_labels is not None else None
+        self.frame = FieldFrame()
+        self.context = ""
         self._max_frames = None if every is not None else max_frames
         self._stride = every or 1
         self._ticks = 0
         self._frames: list[_Frame] = []
 
-        nz, ny, nx = planes.grid_shape
-        self._moving = moving.detach().float().to(self.device)[None, None]
+        self._moving = [img.detach().float().to(self.device)[None, None] for img in images]
         self._points = torch.as_tensor(planes.points, device=self.device)
         self._flat = torch.as_tensor(planes.flat_indices(), device=self.device)
-        # grid_sample's normalized frame with align_corners=True is the same for a
-        # coarse pyramid level and the full grid when the level was made by an
-        # align_corners resize -- which every FFS pyramid is -- so one grid serves all.
-        denom = torch.tensor([max(nz - 1, 1), max(ny - 1, 1), max(nx - 1, 1)], device=self.device)
-        self._denom = denom.float()
-        self._plane_grid = self._normalize(self._points)
+        nz, ny, nx = planes.grid_shape
+        self._denom = torch.tensor(
+            [max(nz - 1, 1), max(ny - 1, 1), max(nx - 1, 1)], device=self.device
+        ).float()
         self._reference = None
         if reference is not None:
             if tuple(reference.shape) != planes.grid_shape:
@@ -107,12 +161,33 @@ class WarpMovieRecorder:
             flat = self._flat.to(reference.device)
             self._reference = reference.detach().float().reshape(-1)[flat].cpu().numpy()
 
-    # -- capture -------------------------------------------------------------------
+    @property
+    def n_rows(self) -> int:
+        return len(self._moving)
 
-    def _normalize(self, zyx: Tensor) -> Tensor:
-        """(N, 3) z,y,x voxel coordinates -> (1, 1, 1, N, 3) x,y,z grid_sample grid."""
-        g = 2.0 * zyx / self._denom - 1.0
-        return g.flip(-1)[None, None, None]
+    @property
+    def n_frames(self) -> int:
+        return len(self._frames)
+
+    def set_frame(self, frame: FieldFrame) -> None:
+        """Declare how subsequent captures' fields map onto the planes' grid."""
+        self.frame = frame
+
+    def set_images(self, images: Sequence[Tensor]) -> None:
+        """Replace the rows' images -- for a tool that rescales, shifts or motion-corrects
+        its working copies after the recorder was built. Same count, same grid."""
+        if len(images) != self.n_rows:
+            raise ValueError(f"need {self.n_rows} images, got {len(images)}")
+        for img in images:
+            if tuple(img.shape) != self.planes.grid_shape:
+                raise ValueError("replacement images must be on the planes' grid")
+        self._moving = [img.detach().float().to(self.device)[None, None] for img in images]
+
+    def set_context(self, text: str) -> None:
+        """Text prepended to every later caption (a pyramid octave, a pass)."""
+        self.context = text
+
+    # -- capture -------------------------------------------------------------------
 
     def tick(self) -> bool:
         """Advance one iteration; True when this iteration should be captured."""
@@ -120,12 +195,97 @@ class WarpMovieRecorder:
         self._ticks += 1
         return due
 
-    @property
-    def n_frames(self) -> int:
-        return len(self._frames)
+    def _sample_field(self, field: Field, x: Tensor) -> Tensor:
+        """Displacement (N, 3) z,y,x in planes-grid voxels at planes-grid points ``x``."""
+        xd, yd, zd = field
+        g = tuple(xd.shape)
+        full = self.frame.full_shape or self.planes.grid_shape
+        q = x + torch.tensor(self.frame.offset, device=x.device, dtype=x.dtype)
+        coords, scales = [], []
+        for axis in range(3):
+            a, b = _level_affine(full[axis], g[axis], self.frame.mapping)
+            c = q[:, axis] * a + b
+            coords.append(2.0 * c / max(g[axis] - 1, 1) - 1.0 if g[axis] > 1 else c * 0.0)
+            scales.append(1.0 / a)
+        grid = torch.stack(coords[::-1], dim=-1)[None, None, None]
+        stacked = torch.stack((xd, yd, zd))[None].to(device=x.device, dtype=x.dtype)
+        sampled = F.grid_sample(
+            stacked, grid, mode="bilinear", padding_mode="border", align_corners=True
+        )[0, :, 0, 0]  # (3, N) as x, y, z
+        return torch.stack(
+            (sampled[2] * scales[0], sampled[1] * scales[1], sampled[0] * scales[2]), dim=1
+        )
 
-    def capture_values(self, values: Tensor, label: str = "", pinned: bool = False) -> None:
-        """Store an already-sampled (N,) plane vector as a frame."""
+    def _follow(self, chain: Sequence[Field], x: Tensor) -> Tensor:
+        """Push planes-grid points through ``chain`` in order: x <- x + u(x) per field."""
+        for field in chain:
+            x = x + self._sample_field(field, x)
+        return x
+
+    def _sample_moving(self, row: int, x: Tensor) -> Tensor:
+        grid = (2.0 * x / self._denom - 1.0).flip(-1)[None, None, None]
+        return F.grid_sample(
+            self._moving[row], grid, mode="bilinear", padding_mode="zeros", align_corners=True
+        ).reshape(-1)
+
+    def _jacobian(self, chain: Sequence[Field]) -> Tensor:
+        """det of d(mapped point)/d(point) by central differences at the plane pixels."""
+        cols = []
+        for axis in range(3):
+            step = torch.zeros(3, device=self.device)
+            step[axis] = 1.0
+            cols.append(
+                (
+                    self._follow(chain, self._points + step)
+                    - self._follow(chain, self._points - step)
+                )
+                / 2.0
+            )
+        return torch.linalg.det(torch.stack(cols, dim=-1))
+
+    def capture(
+        self,
+        chains: Sequence[Sequence[Field]],
+        label: str = "",
+        pinned: bool = False,
+        modulate: bool = False,
+    ) -> None:
+        """Capture every row through its own chain of fields.
+
+        Args:
+            chains: One sequence of fields per row, applied in order (a composition:
+                the point moves by the first field, then by the second at the moved
+                point). Fields may sit on any level of the grid :attr:`frame` describes.
+            label: Caption for the frame (after :attr:`context`).
+            pinned: Never dropped by the frame budget, and held on screen.
+            modulate: Scale intensity by the Jacobian determinant of the chain, as a
+                distortion correction that conserves signal does (blipflip).
+        """
+        if len(chains) != self.n_rows:
+            raise ValueError(f"need one chain per row ({self.n_rows}), got {len(chains)}")
+        with torch.no_grad():
+            rows = []
+            for r, chain in enumerate(chains):
+                vals = self._sample_moving(r, self._follow(chain, self._points))
+                if modulate:
+                    vals = vals * self._jacobian(chain)
+                rows.append(vals)
+            values = torch.stack(rows)
+        text = f"{self.context}  {label}".strip() if self.context else label
+        self._store(values, text, pinned)
+
+    def capture_displacement(self, field: Field, label: str = "", pinned: bool = False) -> None:
+        """Single-row shorthand: the source seen through one displacement field."""
+        self.capture([[field]], label, pinned)
+
+    def capture_identity(self, label: str = "", pinned: bool = True) -> None:
+        """Capture every row unwarped (a movie's starting frame)."""
+        with torch.no_grad():
+            values = torch.stack([m.reshape(-1)[self._flat] for m in self._moving])
+        text = f"{self.context}  {label}".strip() if self.context else label
+        self._store(values, text, pinned)
+
+    def _store(self, values: Tensor, label: str, pinned: bool) -> None:
         self._frames.append(_Frame(values.detach().to(torch.float16), label, pinned))
         if self._max_frames is not None:
             n_free = sum(not f.pinned for f in self._frames)
@@ -145,55 +305,6 @@ class WarpMovieRecorder:
             ordinal += 1
         self._frames = kept
         self._stride *= 2
-
-    def capture_displacement(self, field: Field, label: str = "", pinned: bool = False) -> None:
-        """Capture the source pulled through a displacement field.
-
-        ``field`` is ``(xd, yd, zd)``, each (gz, gy, gx) in voxel units *of that grid*
-        -- the convention of :func:`fastfuncstuff.processing.interp.warp_image_linear`,
-        where output voxel (k, j, i) samples the source at (i + xd, j + yd, k + zd).
-        The grid may be a coarse pyramid level (an align_corners resize of the full
-        grid); its displacements are rescaled to full-grid voxels here.
-        """
-        with torch.no_grad():
-            xd, yd, zd = field
-            full = self.planes.grid_shape
-            if tuple(xd.shape) == full:
-                disp = torch.stack([c.reshape(-1)[self._flat] for c in (zd, yd, xd)], dim=1)
-            else:
-                gz, gy, gx = xd.shape
-                stacked = torch.stack((xd, yd, zd))[None].float()
-                sampled = F.grid_sample(
-                    stacked,
-                    self._plane_grid,
-                    mode="bilinear",
-                    padding_mode="border",
-                    align_corners=True,
-                )[0, :, 0, 0]  # (3, N) as x, y, z
-                ratio = torch.tensor(
-                    [
-                        (full[2] - 1) / max(gx - 1, 1),
-                        (full[1] - 1) / max(gy - 1, 1),
-                        (full[0] - 1) / max(gz - 1, 1),
-                    ],
-                    device=self.device,
-                )
-                disp = (sampled * ratio[:, None]).flip(0).T  # (N, 3) z, y, x
-            src = self._points + disp.to(self._points.dtype)
-            values = F.grid_sample(
-                self._moving,
-                self._normalize(src),
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            ).reshape(-1)
-        self.capture_values(values, label, pinned)
-
-    def capture_identity(self, label: str = "", pinned: bool = True) -> None:
-        """Capture the unwarped source (the movie's starting frame)."""
-        with torch.no_grad():
-            values = self._moving.reshape(-1)[self._flat]
-        self.capture_values(values, label, pinned)
 
     # -- render --------------------------------------------------------------------
 
@@ -230,7 +341,7 @@ class WarpMovieRecorder:
 
         values = torch.stack([f.values for f in self._frames]).float().cpu().numpy()
         views = self.planes.views
-        window = intensity_window(values[0])
+        windows = [intensity_window(values[0, r]) for r in range(self.n_rows)]
         edge_panels: Sequence[np.ndarray] | None = None
         edge_vmax = 1.0
         if overlay == "edges" and self._reference is not None:
@@ -244,17 +355,18 @@ class WarpMovieRecorder:
         n = len(self._frames)
         hold_n = max(1, int(round(hold * fps)))
         out: list[np.ndarray] = []
-        for i, (f, row) in enumerate(zip(self._frames, values, strict=True)):
+        for i, (f, frame_values) in enumerate(zip(self._frames, values, strict=True)):
             label = f"{self.tool}  {f.label}".strip() if self.tool else f.label
             frame = compose_frame(
-                self.planes.split(row),
+                [self.planes.split(row) for row in frame_values],
                 views,
                 size,
-                window,
+                windows,
                 edges=edge_panels,
                 edge_vmax=edge_vmax,
                 edge_opacity=edge_opacity,
                 label=label,
+                row_labels=self.row_labels,
                 progress=i / max(n - 1, 1),
             )
             repeats = hold_n if f.pinned else 1

@@ -41,6 +41,7 @@ differentiable form. See ``../fmri_wiki/concepts/SyN.md``.
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -70,6 +71,9 @@ from .interp import (
 from .mask import cross_fill_no_data
 from .nwarpforge import NonlinearWarp, compose_warp_then_warp
 from .penalty import compute_jacobian_energy, penalty_energy
+
+if TYPE_CHECKING:
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
 
 _EPS = 1e-6
 
@@ -1098,6 +1102,7 @@ def _syn_level(
     config: SynConfig,
     level_tag: str = "",
     guard: tuple[Tensor, ...] | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> tuple[tuple[Field, Field, Field, Field], LevelStats]:
     """Run up to ``n_iter`` symmetric SyN updates at one resolution.
 
@@ -1163,6 +1168,13 @@ def _syn_level(
         if config.fold_penalty > 0:
             cost = cost + _fold_penalty(tuple(lf), config) + _fold_penalty(tuple(lm), config)
         costs.append(cost_val)
+        if recorder is not None and recorder.tick():
+            # moving->fixed is mid->fixed's inverse half, then moving's half: the same
+            # composition formwarp() builds for the final warp.
+            recorder.capture(
+                [[(ifxd, ifyd, ifzd), (mxd, myd, mzd)]],
+                label=f"it {len(costs) - 1}  cost {cost_val:.5f}",
+            )
 
         # The cost reflects the current (pre-update) fields -- snapshot them as best.
         # ``jac_f``/``jac_m`` are the determinants of exactly those fields: whichever
@@ -1350,6 +1362,7 @@ def formwarp(
     moving_cover: Tensor | None = None,
     config: SynConfig | None = None,
     device: torch.device | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> SynResult:
     """Register ``moving`` to ``fixed`` with symmetric SyN.
 
@@ -1363,6 +1376,9 @@ def formwarp(
             Both are excluded from the metric *and* cross-filled (see below).
         config: :class:`SynConfig`. Uses defaults if None.
         device: Torch device. Inferred from ``fixed`` if None.
+        recorder: Optional :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder`
+            on the full grid. Captures the moving image through the composed half-warps
+            during each level, plus each level's returned (best) fields, pinned.
 
     Returns:
         :class:`SynResult` with the moving->fixed warp, its inverse, the warped image,
@@ -1479,6 +1495,8 @@ def formwarp(
         # The level sees one resolved value for each; everything below reads a scalar.
         level_config = replace(config, update_var=update_vars[lev], total_var=total_vars[lev])
 
+        if recorder is not None:
+            recorder.set_context(f"L{lev + 1}/{n_levels} shrink {factor}")
         (phi_f, inv_f, phi_m, inv_m), stats = _syn_level(
             f_lvl,
             m_lvl,
@@ -1488,8 +1506,15 @@ def formwarp(
             level_config,
             level_tag=f"L{lev + 1}",
             guard=guard,
+            recorder=recorder,
         )
         level_stats.append(stats)
+        if recorder is not None:
+            recorder.capture(
+                [[inv_f, phi_m]],
+                label=f"best @ it {stats.best_iter}  cost {stats.best_cost:.5f}",
+                pinned=True,
+            )
 
     # Restore to full resolution if the finest level was still shrunk.
     phi_f = _resize_field(*phi_f, full_shape)  # type: ignore[arg-type]

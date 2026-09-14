@@ -98,7 +98,7 @@ def test_coarse_level_capture_matches_full_resolution_warp():
 
     up = _resize_field(*field, full)
     expected = warp_image_linear(moving, *up).reshape(-1)[planes.flat_indices()]
-    got = rec._frames[0].values.float()
+    got = rec._frames[0].values[0].float()
     torch.testing.assert_close(got, expected, atol=2e-3, rtol=1e-3)
 
 
@@ -158,7 +158,7 @@ def test_edge_overlay_is_drawn_in_colour():
     img = planes.split(np.full(64, 0.5, np.float32))
     edge = np.zeros((8, 8), np.float32)
     edge[4, :] = 1.0
-    frame = compose_frame(img, planes.views, 64, (0.0, 1.0), edges=[edge], edge_vmax=1.0)
+    frame = compose_frame([img], planes.views, 64, [(0.0, 1.0)], edges=[edge], edge_vmax=1.0)
     rgb = frame.astype(int)
     coloured = (rgb[..., 0] - rgb[..., 2]) > 100
     assert coloured.any()
@@ -186,3 +186,190 @@ def test_optiwarp_pins_one_frame_per_level():
     assert len(pinned) == 2
     assert pinned[0].label.startswith("L1/2") and pinned[1].label.startswith("L2/2")
     assert sum(not f.pinned for f in rec._frames) <= 8
+
+
+def _padded_centres_field(full, pads, coarse, seed=3):
+    """A smooth field on a coarse, align_corners=False grid of a padded full grid."""
+    import torch.nn.functional as F
+
+    padded = tuple(n + 2 * p for n, p in zip(full, pads, strict=True))
+    g = torch.Generator().manual_seed(seed)
+    small = [torch.randn(4, 4, 4, generator=g) * 0.5 for _ in range(3)]
+    level = [
+        F.interpolate(c[None, None], size=coarse, mode="trilinear", align_corners=True)[0, 0]
+        for c in small
+    ]
+    ratio = [padded[2] / coarse[2], padded[1] / coarse[1], padded[0] / coarse[0]]  # x, y, z
+    up = [
+        F.interpolate(c[None, None], size=padded, mode="trilinear", align_corners=False)[0, 0] * r
+        for c, r in zip(level, ratio, strict=True)
+    ]
+    return padded, tuple(level), tuple(up)
+
+
+def test_padded_centres_level_matches_qwarp_upsampling():
+    """qwarp: a padded grid, and pyramid octaves made by align_corners=False resizes."""
+    from fastfuncstuff.viz.warp_movie import FieldFrame
+
+    full, pads = (14, 16, 18), (2, 3, 4)
+    padded, level, up = _padded_centres_field(full, pads, (10, 11, 13))
+    moving = _texture(full)
+    planes = build_slice_planes(full, np.eye(4), "ax,sag,cor", (9, 8, 7))
+    rec = WarpMovieRecorder(moving, planes, every=1, device=CPU)
+    rec.set_frame(FieldFrame(offset=pads, full_shape=padded, mapping="centres"))
+    rec.capture_displacement(level)  # type: ignore[arg-type]
+
+    # The way qwarp itself applies it: pad the source, warp on the padded grid, crop.
+    import torch.nn.functional as F
+
+    pz, py, px = pads
+    src_p = F.pad(moving, (px, px, py, py, pz, pz))
+    warped = warp_image_linear(src_p, *up)[pz:-pz, py:-py, px:-px]
+    expected = warped.reshape(-1)[planes.flat_indices()]
+    torch.testing.assert_close(rec._frames[0].values[0].float(), expected, atol=2e-3, rtol=1e-3)
+
+
+def test_stride_level_scales_displacement_by_the_stride():
+    """blipflip: a level made by vol[::s] carries displacement in level voxels."""
+    from fastfuncstuff.viz.warp_movie import FieldFrame
+
+    full, s = (13, 16, 16), 2
+    level_shape = tuple(-(-n // s) for n in full)
+    moving = _texture(full)
+    # Linear in the level's y index, so trilinear sampling is exact everywhere.
+    yy = torch.arange(level_shape[1]).float()[None, :, None].expand(level_shape)
+    level = (torch.zeros(level_shape), 0.05 * yy + 0.2, torch.zeros(level_shape))
+    planes = build_slice_planes(full, np.eye(4), "ax,cor", (8, 8, 6))
+    rec = WarpMovieRecorder(moving, planes, every=1, device=CPU)
+    rec.set_frame(FieldFrame(mapping="stride"))
+    rec.capture_displacement(level)  # type: ignore[arg-type]
+
+    yf = torch.arange(full[1]).float()[None, :, None].expand(full)
+    full_disp = (torch.zeros(full), s * (0.05 * yf / s + 0.2), torch.zeros(full))
+    expected = warp_image_linear(moving, *full_disp).reshape(-1)[planes.flat_indices()]
+    # Keep points inside the level grid's span and whose sample stays in the volume:
+    # past either edge only the boundary handling differs.
+    py = torch.as_tensor(planes.points[:, 1])
+    shifted = py + full_disp[1].reshape(-1)[planes.flat_indices()]
+    inside = (py <= (level_shape[1] - 1) * s) & (shifted < full[1] - 1)
+    got = rec._frames[0].values[0].float()
+    torch.testing.assert_close(got[inside], expected[inside], atol=2e-3, rtol=1e-3)
+
+
+def test_chain_matches_composed_warp():
+    """formwarp: the moving->fixed field is two half-warps composed."""
+    from fastfuncstuff.processing.nwarpforge import NonlinearWarp, compose_warp_then_warp
+
+    shape = (14, 15, 16)
+    moving = _texture(shape)
+    g = torch.Generator().manual_seed(5)
+    a = tuple((torch.randn(shape, generator=g) * 0.3).clamp(-0.8, 0.8) for _ in range(3))
+    b = tuple((torch.randn(shape, generator=g) * 0.3).clamp(-0.8, 0.8) for _ in range(3))
+    for f in (a, b):
+        for c in f:
+            c[[0, 1, -2, -1]] = 0
+            c[:, [0, 1, -2, -1]] = 0
+            c[:, :, [0, 1, -2, -1]] = 0
+    planes = build_slice_planes(shape, np.eye(4), "ax,sag,cor")
+    rec = WarpMovieRecorder(moving, planes, every=1, device=CPU)
+    rec.capture([[a, b]])  # type: ignore[list-item]
+
+    c = compose_warp_then_warp(NonlinearWarp(*a, {}), NonlinearWarp(*b, {}))
+    expected = warp_image_linear(moving, c.xd, c.yd, c.zd).reshape(-1)[planes.flat_indices()]
+    torch.testing.assert_close(rec._frames[0].values[0].float(), expected, atol=2e-3, rtol=1e-3)
+
+
+def test_modulation_scales_by_the_jacobian():
+    shape = (12, 12, 12)
+    moving = torch.full(shape, 10.0)
+    planes = build_slice_planes(shape, np.eye(4), "ax", (6, 6, 6))
+    yy = torch.arange(12).float()[None, :, None].expand(shape)
+    stretch = (torch.zeros(shape), 0.2 * (yy - 6), torch.zeros(shape))  # d(disp)/dy = 0.2
+    rec = WarpMovieRecorder([moving, moving], planes, every=1, device=CPU)
+    zero = tuple(torch.zeros(shape) for _ in range(3))
+    rec.capture([[stretch], [zero]], modulate=True)  # type: ignore[list-item]
+    up, still = rec._frames[0].values.float()
+    ax = planes.split(up.numpy())[0]
+    np.testing.assert_allclose(ax[3:8, 3:8], 12.0, atol=1e-3)  # 10 * (1 + 0.2)
+    np.testing.assert_allclose(still.numpy(), 10.0, atol=1e-4)
+
+
+def test_two_row_render(tmp_path):
+    shape = (10, 12, 12)
+    planes = build_slice_planes(shape, np.eye(4), "ax,sag")
+    rec = WarpMovieRecorder(
+        [_texture(shape, 1), _texture(shape, 2)],
+        planes,
+        every=1,
+        row_labels=["up", "down"],
+        device=CPU,
+    )
+    rec.capture_identity()
+    out = rec.render(str(tmp_path / "rows.gif"), size=48, fmt="gif")
+    assert out is not None and (tmp_path / "rows.gif").stat().st_size > 0
+
+
+def test_formwarp_pins_one_frame_per_level():
+    from fastfuncstuff.processing.formwarp import SynConfig, formwarp
+
+    shape = (16, 18, 18)
+    fixed = _texture(shape, seed=4)
+    moving = _texture(shape, seed=4).roll(1, dims=1)
+    planes = build_slice_planes(shape, np.eye(4), "ax")
+    rec = WarpMovieRecorder(moving, planes, max_frames=6, device=CPU)
+    cfg = SynConfig(
+        shrink_factors=(2, 1),
+        smoothing_sigmas=(1.0, 0.0),
+        iterations=(6, 6),
+        convergence_window=0,
+        verb=0,
+    )
+    formwarp(fixed, moving, config=cfg, recorder=rec)
+    pinned = [f.label for f in rec._frames if f.pinned]
+    assert len(pinned) == 2 and pinned[0].startswith("L1/2") and pinned[1].startswith("L2/2")
+    assert any(not f.pinned for f in rec._frames)
+
+
+def test_qwarp_captures_phases_and_levels():
+    from fastfuncstuff.processing.warp import QwarpConfig, qwarp
+
+    shape = (20, 20, 20)
+    base = _texture(shape, seed=6)
+    source = _texture(shape, seed=6).roll(1, dims=0)
+    planes = build_slice_planes(shape, np.eye(4), "ax,cor")
+    rec = WarpMovieRecorder(source, planes, max_frames=40, device=CPU)
+    cfg = QwarpConfig(minpatch=11, max_level=1, cost_method="pearson", verb=0, movie_recorder=rec)
+    qwarp(base, source, config=cfg, device=CPU)
+    labels = [f.label for f in rec._frames]
+    assert labels[0] == "start"
+    assert any("phase" in lab for lab in labels)
+    assert any(f.pinned and "lev=1" in f.label for f in rec._frames)
+
+
+def test_blipflip_rows_follow_opposite_blips():
+    from test_topup import _make_synthetic
+
+    from fastfuncstuff.processing import topup as T
+
+    _, _, scans = _make_synthetic()
+    shape = tuple(scans[0].data.shape)
+    planes = build_slice_planes(shape, np.eye(4), "ax")
+    rec = WarpMovieRecorder([s.data for s in scans], planes, max_frames=10, device=CPU)
+    cfg = T.TopupConfig(
+        warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[4, 4], subsamp=[2, 1]
+    )
+    res = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, recorder=rec)
+    pinned = [f for f in rec._frames if f.pinned]
+    assert [f.label.split()[0] for f in pinned] == ["start", "L1/2", "L2/2", "final"]
+    # The final frame is the tool's own unwarped output, sampled at the planes.
+    final = pinned[-1].values.float()
+    py = torch.as_tensor(planes.points[:, 1])
+    for row, unwarped, scan in zip(final, res.unwarped, scans, strict=True):
+        # Where the PE sample leaves the volume topup clamps and the movie pads zero.
+        shifted = py + (res.field_hz * scan.readout * scan.sign).reshape(-1)[planes.flat_indices()]
+        inner = (py > 1) & (py < shape[1] - 2) & (shifted > 1) & (shifted < shape[1] - 2)
+        # run_topup works on copies rescaled to mean 100 and hands back native units.
+        ref = unwarped.float().reshape(-1)[planes.flat_indices()] * (
+            100.0 / float(scan.data.mean())
+        )
+        torch.testing.assert_close(row[inner], ref[inner], atol=0.05, rtol=1e-2)

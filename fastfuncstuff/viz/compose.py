@@ -130,58 +130,59 @@ def _font(px: int):
 
 
 def compose_frame(
-    panels: Sequence[np.ndarray],
+    rows: Sequence[Sequence[np.ndarray]],
     views: Sequence[PlaneView],
     height: int,
-    window: tuple[float, float],
+    windows: Sequence[tuple[float, float]],
     *,
     edges: Sequence[np.ndarray] | None = None,
     edge_vmax: float = 1.0,
     edge_opacity: float = 1.0,
     label: str = "",
+    row_labels: Sequence[str] | None = None,
     progress: float | None = None,
 ) -> np.ndarray:
-    """One (H, W, 3) uint8 movie frame: a caption strip over side-by-side panels.
+    """One (H, W, 3) uint8 movie frame: a caption strip over rows of side-by-side panels.
 
     Args:
-        panels: One (rows, cols) float image per view, display order.
+        rows: Per row (one image being warped), one (rows, cols) float image per view.
         views: The matching :class:`PlaneView` descriptions.
         height: Pixel height of the physically tallest panel.
-        window: (lo, hi) greyscale display range, fixed for the whole movie so
-            brightness does not flicker between frames.
-        edges: Optional per-view edge strength to overlay, at panel resolution
-            (:func:`display_edges`) or at plane resolution (upscaled nearest).
+        windows: Per row, the (lo, hi) greyscale display range -- fixed for the whole
+            movie so brightness does not flicker between frames.
+        edges: Optional per-view edge strength drawn over every row, at panel
+            resolution (:func:`display_edges`) or at plane resolution (upscaled nearest).
         edge_vmax: Strength at which edge colour saturates (see :func:`edge_range`).
         edge_opacity: 0..1 blend of the edge colour over the greyscale.
         label: Caption text.
+        row_labels: Optional name drawn at the start of each row.
         progress: Optional 0..1 fraction drawn as a thin bar under the caption.
     """
     from PIL import Image, ImageDraw
 
+    if len(windows) != len(rows):
+        raise ValueError("need one display window per row")
     sizes = panel_sizes(views, height)
-    lo, hi = window
-    rendered: list[np.ndarray] = []
-    for i, (img, (h, w)) in enumerate(zip(panels, sizes, strict=True)):
-        grey = np.clip((np.nan_to_num(img) - lo) / (hi - lo), 0.0, 1.0)
-        rgb = np.repeat(_resize((grey * 255).astype(np.uint8), (h, w), True)[..., None], 3, -1)
-        rgb = rgb.astype(np.float32) / 255.0
-        if edges is not None:
-            # Nearest-neighbour: blurring a one-pixel ridge smears it back into a band.
-            colour, on = colorize_edges(_resize(edges[i], (h, w), False), edge_vmax)
-            rgb[on] = rgb[on] * (1 - edge_opacity) + colour[on] * edge_opacity
-        rendered.append((rgb * 255).astype(np.uint8))
-
     font_px = max(10, height // 18)
     strip = font_px + 8
     bar = 3 if progress is not None else 0
     width = sum(w for _, w in sizes) + _GAP * (len(sizes) - 1)
-    canvas = np.full((strip + bar + height, width, 3), _BG, np.uint8)
+    top = strip + bar
+    canvas = np.full((top + len(rows) * (height + _GAP) - _GAP, width, 3), _BG, np.uint8)
 
-    x = 0
-    for img, (h, w) in zip(rendered, sizes, strict=True):
-        y = strip + bar + (height - h) // 2
-        canvas[y : y + h, x : x + w] = img
-        x += w + _GAP
+    for r, (panels, (lo, hi)) in enumerate(zip(rows, windows, strict=True)):
+        x = 0
+        for i, (img, (h, w)) in enumerate(zip(panels, sizes, strict=True)):
+            grey = np.clip((np.nan_to_num(img) - lo) / (hi - lo), 0.0, 1.0)
+            rgb = np.repeat(_resize((grey * 255).astype(np.uint8), (h, w), True)[..., None], 3, -1)
+            rgb = rgb.astype(np.float32) / 255.0
+            if edges is not None:
+                # Nearest-neighbour: blurring a one-pixel ridge smears it back into a band.
+                colour, on = colorize_edges(_resize(edges[i], (h, w), False), edge_vmax)
+                rgb[on] = rgb[on] * (1 - edge_opacity) + colour[on] * edge_opacity
+            y = top + r * (height + _GAP) + (height - h) // 2
+            canvas[y : y + h, x : x + w] = (rgb * 255).astype(np.uint8)
+            x += w + _GAP
 
     if progress is not None:
         canvas[strip : strip + bar, : int(round(np.clip(progress, 0, 1) * width))] = (90, 150, 220)
@@ -191,9 +192,13 @@ def compose_frame(
     if label:
         draw.text((4, 4), label, fill=(235, 235, 235), font=_font(font_px))
     small = _font(max(9, font_px - 3))
-    x = 0
-    for v, (h, w) in zip(views, sizes, strict=True):
-        y = strip + bar + (height - h) // 2
-        draw.text((x + 3, y + 2), v.left_letter, fill=(120, 200, 255), font=small)
-        x += w + _GAP
+    for r in range(len(rows)):
+        x = 0
+        for i, (v, (h, w)) in enumerate(zip(views, sizes, strict=True)):
+            y = top + r * (height + _GAP) + (height - h) // 2
+            text = v.left_letter
+            if i == 0 and row_labels:
+                text = f"{v.left_letter}  {row_labels[r]}"
+            draw.text((x + 3, y + 2), text, fill=(120, 200, 255), font=small)
+            x += w + _GAP
     return np.asarray(pil)
