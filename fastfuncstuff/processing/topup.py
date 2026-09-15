@@ -2061,18 +2061,28 @@ def _prepare_level_scans(
     subsamp: int,
 ) -> list[ScanSpec]:
     """Smooth (FWHM mm) and optionally subsample each scan for one level."""
+    # Every level brings a new kernel width, so a benchmarking cuDNN autotunes each blur
+    # afresh: ~1.1 s of tuning for 11 ms of convolution over a 12-level schedule.
+    benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        return [_prepare_level_scan(sc, voxel_sizes, fwhm_mm, subsamp) for sc in scans]
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
+
+
+def _prepare_level_scan(
+    sc: ScanSpec, voxel_sizes: tuple[float, float, float], fwhm_mm: float, subsamp: int
+) -> ScanSpec:
     vz, vy, vx = voxel_sizes
-    out: list[ScanSpec] = []
-    for sc in scans:
-        d = sc.data
-        if fwhm_mm > 0:
-            # Convert FWHM(mm) to sigma(voxels); use mean voxel size (fields are smooth).
-            sigma_vox = (fwhm_mm / (2.0 * math.sqrt(2.0 * math.log(2.0)))) / ((vz + vy + vx) / 3.0)
-            if sigma_vox > 0:
-                # Smooth in float32 (the shared kernel is float32; smoothing is not the
-                # numerically sensitive step) and restore the solve dtype.
-                d = _separable_smooth_3d(d.float(), sigma_vox).to(d.dtype)
-        if subsamp > 1:
-            d = d[::subsamp, ::subsamp, ::subsamp].contiguous()
-        out.append(ScanSpec(data=d, pe_axis=sc.pe_axis, sign=sc.sign, readout=sc.readout))
-    return out
+    d = sc.data
+    if fwhm_mm > 0:
+        # Convert FWHM(mm) to sigma(voxels); use mean voxel size (fields are smooth).
+        sigma_vox = (fwhm_mm / (2.0 * math.sqrt(2.0 * math.log(2.0)))) / ((vz + vy + vx) / 3.0)
+        if sigma_vox > 0:
+            # Smooth in float32 (the shared kernel is float32; smoothing is not the
+            # numerically sensitive step) and restore the solve dtype.
+            d = _separable_smooth_3d(d.float(), sigma_vox).to(d.dtype)
+    if subsamp > 1:
+        d = d[::subsamp, ::subsamp, ::subsamp].contiguous()
+    return ScanSpec(data=d, pe_axis=sc.pe_axis, sign=sc.sign, readout=sc.readout)
