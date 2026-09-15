@@ -171,7 +171,7 @@ def create_parser() -> argparse.ArgumentParser:
         help="Preset schedule: 'quick' (3 levels), 'standard' (9 levels, default), "
         "'workhard' (12 levels — coarser start, longer descent, 1000x lower lambda and twice "
         "the iterations, for large fields), "
-        "'superhard' (14 levels, pushed further: knots down to 2 mm, extra low-lambda "
+        "'superhard' (14 levels, as workhard but knots down to 2 mm, extra low-lambda "
         "refinement). Higher tiers are slower. Each tier's per-level lists are printed "
         "under SCHEDULE PRESETS at the end of -help, ready to copy.",
     )
@@ -408,8 +408,17 @@ _PRESETS: dict[str, dict] = {
         miter_scale=2,
     ),
     # As above but pushed to 2 mm knots -- only meaningful for sub-2 mm voxels, and the
-    # low final lambda leans on the fold barrier to stay diffeomorphic.
-    "superhard": dict(n_levels=14, res_start=30.0, res_final=2.0, lam_final=1e-13, miter_final=30),
+    # low final lambda leans on the fold barrier to stay diffeomorphic. Same 1000x lower
+    # lambda and doubled iterations as workhard, so the two tiers stay comparable.
+    "superhard": dict(
+        n_levels=14,
+        res_start=30.0,
+        res_final=2.0,
+        lam_start=5e-7,
+        lam_final=1e-16,
+        miter_final=30,
+        miter_scale=2,
+    ),
 }
 
 
