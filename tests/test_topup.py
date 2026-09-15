@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from fastfuncstuff.processing import topup as T
@@ -579,3 +580,76 @@ def test_declared_empty_positions_are_scored_as_zeros():
     assert blind[5:7] == [False, False]
     assert scored[5:7] == [True, True]
     assert scored[7] is False
+
+
+def test_level_stops_when_the_field_stops_moving():
+    # The displacement stop must end a level before miter and report why. Mechanism only:
+    # on this phantom the sub-0.1-vox steps it cuts still added up to ~0.6 vox, so how
+    # early to stop is a real-data question, not something to assert here.
+    _, _, scans = _make_synthetic()
+
+    def run(min_update):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[40, 40], subsamp=[1, 1]
+        )
+        cfg.min_update_vox = min_update
+        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+
+    early, full = run(0.1), run(0.0)
+    assert [lv.stop for lv in early.levels] == ["converged", "converged"]
+    assert [lv.stop for lv in full.levels] == ["miter", "miter"]
+    assert all(lv.last_update_vox < 0.1 for lv in early.levels)
+
+
+def test_help_schedule_lines_round_trip_to_the_preset():
+    # The -help preset lines are meant to be pasted back on the command line.
+    import shlex
+
+    from fastfuncstuff.cli import blipflip as B
+
+    for name in B._PRESETS:
+        cfg = B._build_config(name)
+        argv = ["-config", name, "-pe_dir", "j", "-prefix", "x"]
+        argv += shlex.split(B._schedule_flags(cfg, "").replace("\n", " "))
+        args = B.create_parser().parse_args(argv)
+        assert args.warpres == cfg.warpres and args.fwhm == cfg.fwhm
+        assert args.miter == cfg.miter
+        assert all(math.isclose(a, b, rel_tol=0.01) for a, b in zip(args.lam, cfg.lam, strict=True))
+
+
+def test_fused_normal_matvec_equals_jt_j():
+    # The CG matvec skips the masked gather/scatter and applies the penalty through
+    # coefficient-space Kronecker Grams; it must still be exactly J^T J (+ the 1e-8 ridge),
+    # with the barrier active, two scans, and both penalty models.
+    torch.manual_seed(7)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    for reg_mode in ("bending", "membrane"):
+        lin = T._linearize(coeff, basis, scans, mask_idx, 1, 3e-3, reg_mode, 5.0, 0.1)
+        assert lin.barrier_b, "barrier rows should be active"
+        matvec = T._NormalOperator(lin, T.reg_gram_terms(basis, reg_mode))
+        v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+        ref = T._lin_jtu(lin, T._lin_jv(lin, v)) + 1e-8 * v.reshape(-1)
+        got = matvec(v.reshape(-1))
+        assert (got - ref).norm() < 1e-10 * ref.norm(), reg_mode
+
+
+@pytest.mark.gpu
+def test_cuda_graphed_cg_matches_eager():
+    # The per-level CG replays one captured iteration against buffers the linearisation is
+    # copied into; across several Gauss-Newton steps it must give exactly the eager result.
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    _, _, scans = _make_synthetic()
+    dev = torch.device("cuda")
+    scans = [T.ScanSpec(s.data.to(dev), s.pe_axis, s.sign, s.readout) for s in scans]
+
+    def run(graphs):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1]
+        )
+        cfg.cuda_graphs = graphs
+        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+
+    eager, graphed = run(False), run(True)
+    assert [lv.iters for lv in eager.levels] == [lv.iters for lv in graphed.levels]
+    assert torch.equal(eager.field_hz, graphed.field_hz)

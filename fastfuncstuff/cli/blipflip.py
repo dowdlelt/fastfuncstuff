@@ -94,7 +94,7 @@ def create_parser() -> argparse.ArgumentParser:
         description="Blip-up/blip-down susceptibility distortion correction "
         "(blip-up/blip-down field model, Andersson et al. 2003).",
         formatter_class=FfsHelpFormatter,
-        epilog=__doc__.split("METHOD / CREDIT")[1].strip(),
+        epilog=_schedule_epilog() + "\n\n" + __doc__.split("METHOD / CREDIT")[1].strip(),
     )
 
     inp = parser.add_argument_group("Inputs (pick the pair form OR -imain)")
@@ -169,9 +169,11 @@ def create_parser() -> argparse.ArgumentParser:
         choices=("standard", "quick", "workhard", "superhard"),
         default="standard",
         help="Preset schedule: 'quick' (3 levels), 'standard' (9 levels, default), "
-        "'workhard' (12 levels — coarser start, longer descent, for high-field data), "
-        "'superhard' (14 levels, pushed further: knots down to 2 mm, extra low-lambda "
-        "refinement). Higher tiers are slower.",
+        "'workhard' (12 levels — coarser start, longer descent, 1000x lower lambda and twice "
+        "the iterations, for large fields), "
+        "'superhard' (14 levels, as workhard but knots down to 2 mm, extra low-lambda "
+        "refinement). Higher tiers are slower. Each tier's per-level lists are printed "
+        "under SCHEDULE PRESETS at the end of -help, ready to copy.",
     )
     sched.add_argument(
         "-workhard",
@@ -187,13 +189,45 @@ def create_parser() -> argparse.ArgumentParser:
         dest="config",
         help="Shortcut for -config superhard (most precise, slowest).",
     )
-    sched.add_argument("-warpres", type=_float_list, help="Override knot spacing (mm) per level.")
-    sched.add_argument("-fwhm", type=_float_list, help="Override smoothing FWHM (mm) per level.")
-    sched.add_argument(
-        "-lambda", dest="lam", type=_float_list, help="Override penalty weight per level."
+    _per_level = (
+        " One value per level (comma-separated), or a single value for every level. "
+        "Default: the -config tier's list, shown under SCHEDULE PRESETS at the end of -help."
     )
-    sched.add_argument("-miter", type=_int_list, help="Override max GN iters per level.")
-    sched.add_argument("-subsamp", type=_int_list, help="Override subsampling factor per level.")
+    sched.add_argument(
+        "-warpres", type=_float_list, metavar="MM,...", help="Knot spacing (mm)." + _per_level
+    )
+    sched.add_argument(
+        "-fwhm", type=_float_list, metavar="MM,...", help="Data smoothing FWHM (mm)." + _per_level
+    )
+    sched.add_argument(
+        "-lambda",
+        dest="lam",
+        type=_float_list,
+        metavar="W,...",
+        help="Bending-energy weight, relative to the data cost (see -no_ssqlambda)." + _per_level,
+    )
+    sched.add_argument(
+        "-miter",
+        type=_int_list,
+        metavar="N,...",
+        help="Max Gauss-Newton iterations; a level can end sooner (see -min_update)." + _per_level,
+    )
+    sched.add_argument(
+        "-subsamp",
+        type=_int_list,
+        metavar="K,...",
+        help="Integer subsampling factor (1 = full resolution)." + _per_level,
+    )
+    sched.add_argument(
+        "-min_update",
+        type=float,
+        default=0.0,
+        metavar="VOX",
+        help="End a level once a Gauss-Newton step moves the displacement less than this many "
+        "voxels (worst voxel in the mask). The cost alone cannot tell a stalled level: it keeps "
+        "creeping down while the field has stopped moving. 0 = always run -miter iterations. Small steps can still add up, so "
+        "check the per-level lines before relying on it.",
+    )
     sched.add_argument(
         "-reg_mode",
         choices=("bending", "membrane"),
@@ -320,6 +354,12 @@ def create_parser() -> argparse.ArgumentParser:
         misc,
         extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
     )
+    misc.add_argument(
+        "-no_cuda_graphs",
+        action="store_true",
+        help="Launch every solver kernel from Python instead of replaying captured CUDA graphs. "
+        "Same result, several times slower on a GPU; for debugging.",
+    )
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
     add_warp_movie_args(parser, overlay=False)
     add_batch_args(
@@ -352,33 +392,83 @@ def _voxel_sizes_zyx(affine: np.ndarray) -> tuple[float, float, float]:
     return (vz, vy, vx)  # (vz, vy, vx) to match (nz, ny, nx) data
 
 
-def _build_config(name: str):
-    """Return the TopupConfig for a preset name.
+# Each tier is one call to make_ladder with different endpoints: more levels, a coarser
+# start, a finer final knot spacing and a lower final regularisation buy a more precise
+# field at increasing cost. See the ladder docstring for what each knob means.
+_PRESETS: dict[str, dict] = {
+    # Default. Whole-head down to 4 mm knots with two refinement levels.
+    "standard": dict(n_levels=9),
+    # Three levels, stopping at 8 mm knots: enough for a smooth whole-head field,
+    # not enough to resolve frontal/temporal detail. For a quick look.
+    "quick": dict(n_levels=3, res_final=8.0, n_refine=0, lam_final=1e-5, miter_final=10),
+    # Coarser start and a longer descent for high-field data, where the field is both
+    # larger in amplitude and richer in structure. Penalty 1000x lower at every level and
+    # twice the iterations: at standard's lambda the coarse levels settle on a nearly flat
+    # field and cannot make the large shifts, which is what they exist for (on a real
+    # pair, lowering lambda fixed what more iterations had not).
+    "workhard": dict(
+        n_levels=12,
+        res_start=30.0,
+        lam_start=5e-7,
+        lam_final=1e-14,
+        miter_scale=2,
+    ),
+    # As above but pushed to 2 mm knots -- only meaningful for sub-2 mm voxels, and the
+    # low final lambda leans on the fold barrier to stay diffeomorphic. Same 1000x lower
+    # lambda and doubled iterations as workhard, so the two tiers stay comparable.
+    "superhard": dict(
+        n_levels=14,
+        res_start=30.0,
+        res_final=2.0,
+        lam_start=5e-7,
+        lam_final=1e-16,
+        miter_final=30,
+        miter_scale=2,
+    ),
+}
 
-    Each tier is one call to :func:`make_ladder` with different endpoints: more levels,
-    a coarser start, a finer final knot spacing and a lower final regularisation buy a
-    more precise field at increasing cost. See the ladder docstring for what each knob
-    means; nothing here is a transcribed table.
-    """
+
+def _fmt_list(vals, kind: str) -> str:
+    if kind == "lam":
+        return ",".join(f"{v:.3g}" for v in vals)
+    return ",".join(f"{v:g}" for v in vals)
+
+
+def _schedule_flags(cfg, indent: str) -> str:
+    """The schedule as command-line flags, one per line, so a line can be copied and edited."""
+    rows = [
+        ("-warpres", cfg.warpres, ""),
+        ("-fwhm", cfg.fwhm, ""),
+        ("-lambda", cfg.lam, "lam"),
+        ("-miter", cfg.miter, ""),
+    ]
+    return "\n".join(f"{indent}{flag:<9}{_fmt_list(v, kind)}" for flag, v, kind in rows)
+
+
+def _schedule_epilog() -> str:
+    lines = [
+        "SCHEDULE PRESETS",
+        "  Every schedule flag takes one value per level; copy a line, edit an element. A",
+        "  single value applies to every level (-miter 30). A list you pass replaces that",
+        "  list of the chosen -config tier, so its length must match the tier's level count.",
+        "  -subsamp is 1 at every level in every tier.",
+    ]
+    for name in _PRESETS:
+        cfg = _build_config(name)
+        tag = "default, " if name == "standard" else ""
+        lines += [
+            "",
+            f"  -config {name}  ({tag}{cfg.n_levels()} levels)",
+            _schedule_flags(cfg, "    "),
+        ]
+    return "\n".join(lines)
+
+
+def _build_config(name: str):
+    """Return the TopupConfig for a preset name (see ``_PRESETS``)."""
     from fastfuncstuff.processing.topup import TopupConfig, make_ladder
 
-    presets: dict[str, dict] = {
-        # Three levels, stopping at 8 mm knots: enough for a smooth whole-head field,
-        # not enough to resolve frontal/temporal detail. For a quick look.
-        "quick": dict(n_levels=3, res_final=8.0, n_refine=0, lam_final=1e-5, miter_final=10),
-        # Default. Whole-head down to 4 mm knots with two refinement levels.
-        "standard": dict(n_levels=9),
-        # Coarser start and twice the descent for high-field data, where the field is
-        # both larger in amplitude and richer in structure.
-        "workhard": dict(n_levels=12, res_start=30.0),
-        # As above but pushed to 2 mm knots -- only meaningful for sub-2 mm voxels, and
-        # the low final lambda leans on the fold barrier to stay diffeomorphic.
-        "superhard": dict(
-            n_levels=14, res_start=30.0, res_final=2.0, lam_final=1e-13, miter_final=30
-        ),
-    }
-    kw = presets.get(name, presets["standard"])
-    lad = make_ladder(**kw)
+    lad = make_ladder(**_PRESETS.get(name, _PRESETS["standard"]))
     return TopupConfig(
         warpres=lad.warpres,
         fwhm=lad.fwhm,
@@ -601,16 +691,27 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
 
     # ---- schedule ----
     cfg = _build_config(args.config)
-    if args.warpres:
-        cfg.warpres = args.warpres
-    if args.fwhm:
-        cfg.fwhm = args.fwhm
-    if args.lam:
-        cfg.lam = args.lam
-    if args.miter:
-        cfg.miter = args.miter
-    if args.subsamp:
-        cfg.subsamp = args.subsamp
+    # -warpres first: a full knot list sets the level count the other lists broadcast to.
+    for name in ("warpres", "fwhm", "lam", "miter", "subsamp"):
+        vals = getattr(args, name)
+        if vals:
+            setattr(cfg, name, list(vals) * cfg.n_levels() if len(vals) == 1 else list(vals))
+    flags = {"warpres": "-warpres", "fwhm": "-fwhm", "lam": "-lambda", "miter": "-miter"}
+    flags["subsamp"] = "-subsamp"
+    bad = [
+        f"{flags[k]} ({len(getattr(cfg, k))})"
+        for k in flags
+        if len(getattr(cfg, k)) != cfg.n_levels()
+    ]
+    if bad:
+        print(
+            f"ffs_blipflip: the schedule has {cfg.n_levels()} levels (-warpres) but "
+            f"{', '.join(bad)} do not; give one value per level, or a single value",
+            file=sys.stderr,
+        )
+        return 2
+    cfg.min_update_vox = args.min_update
+    cfg.cuda_graphs = not args.no_cuda_graphs
     cfg.reg_mode = args.reg_mode
     cfg.ssqlambda = not args.no_ssqlambda
     cfg.jac_penalty = 0.0 if args.no_antifold else args.jac_penalty
@@ -623,7 +724,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             f"voxel(zyx)={tuple(round(v, 3) for v in vox)} mm, device={device}, "
             f"precision={args.precision}"
         )
-        print(f"  schedule '{args.config}': {cfg.n_levels()} levels")
+        print(f"  schedule '{args.config}': {cfg.n_levels()} levels, as run:")
+        print(_schedule_flags(cfg, "    "))
+        print(f"    -min_update {cfg.min_update_vox:g}")
         if no_readout:
             print("  no -readout given: field map (Hz) disabled; warp is unaffected.")
 

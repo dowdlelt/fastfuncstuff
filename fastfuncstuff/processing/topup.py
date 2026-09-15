@@ -114,6 +114,7 @@ def make_ladder(
     fwhm_ratio: float = 0.4,
     miter_start: int = 5,
     miter_final: int = 20,
+    miter_scale: int = 1,
 ) -> _Ladder:
     """Generate a coarse-to-fine schedule from a rule, rather than a tuned table.
 
@@ -147,7 +148,8 @@ def make_ladder(
 
     **Iteration count** ramps from ``miter_start`` to ``miter_final``. Coarse levels have
     few coefficients and converge in a handful of Gauss-Newton steps; fine levels have
-    many and are where the accuracy is actually won.
+    many and are where the accuracy is actually won. ``miter_scale`` multiplies the
+    rounded counts, so a tier can say "twice the standard iterations" exactly.
     """
     if n_levels < 2:
         raise ValueError(f"n_levels must be >= 2, got {n_levels}")
@@ -176,7 +178,8 @@ def make_ladder(
     lam = _geom(lam_start, lam_final, n_levels)
 
     miter = [
-        int(round(miter_start + (miter_final - miter_start) * (i / (n_levels - 1)) ** 2))
+        miter_scale
+        * int(round(miter_start + (miter_final - miter_start) * (i / (n_levels - 1)) ** 2))
         for i in range(n_levels)
     ]
     return _Ladder(warpres=warpres, fwhm=fwhm, lam=lam, miter=miter)
@@ -229,6 +232,21 @@ class TopupConfig:
 
     reg_mode: str = "bending"
     """Regularisation model: ``"bending"`` (energy of 2nd derivs) or ``"membrane"``."""
+
+    min_update_vox: float = 0.0
+    """End a level once an accepted step moves the field less than this (voxels of PE
+    displacement, worst case over the mask and scans). ``0`` (default) runs every level to
+    ``miter``. Off by default: small steps can still add up (on a phantom, stopping at
+    0.1 vox left the field 0.6 vox short of a full run), so a threshold needs real data.
+
+    The cost-based stop cannot see a stalled level: with ``ssqlambda`` each small data
+    gain relaxes the penalty a little, so the cost keeps creeping down by more than any
+    sane relative tolerance while the field has stopped moving. On a phantom, the 20 mm
+    level converged in 3 steps and then ran 25 more, each moving the field < 0.03 vox."""
+
+    cuda_graphs: bool = True
+    """Replay each level's CG iteration as a captured CUDA graph (CUDA only; see
+    :class:`_LevelCG`). Identical results; ``False`` launches every kernel from Python."""
 
     cg_iters: int = 50
     """Max conjugate-gradient iterations per Gauss-Newton step."""
@@ -882,8 +900,15 @@ def _fold_barrier_rows(
 
     Zero wherever the warp is safely diffeomorphic; nonzero only at an incipient fold.
     """
+    return _barrier_rows_scaled(field_hz, scans, math.sqrt(barrier_eff), jac_floor)
+
+
+def _barrier_rows_scaled(
+    field_hz: Tensor, scans: list[ScanSpec], sm: float | Tensor, jac_floor: float
+) -> list[Tensor]:
+    """:func:`_fold_barrier_rows` with the weight's square root given directly (a scalar
+    tensor, for a captured graph that replays with a new weight)."""
     c = 1.0 - jac_floor
-    sm = math.sqrt(barrier_eff)
     rows: list[Tensor] = []
     for td, a in _fold_barrier_specs(scans):
         g = a * _central_diff_pe(field_hz, td)  # = d(disp)/d(pe)
@@ -915,6 +940,31 @@ def _residual_vector(
     jac_floor: float = 0.1,
 ) -> Tensor:
     """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows."""
+    return _residual_rows(
+        coeff,
+        basis,
+        scans,
+        mask_idx,
+        n_scans_minus_1,
+        math.sqrt(lam_eff) if lam_eff > 0 else None,
+        reg_mode,
+        math.sqrt(barrier_eff) if barrier_eff > 0 else None,
+        jac_floor,
+    )
+
+
+def _residual_rows(
+    coeff: Tensor,
+    basis: SplineFieldBasis,
+    scans: list[ScanSpec],
+    mask_idx: Tensor,
+    n_scans_minus_1: int,
+    sqrt_lam: float | Tensor | None,
+    reg_mode: str,
+    sqrt_barrier: float | Tensor | None,
+    jac_floor: float,
+) -> Tensor:
+    """:func:`_residual_vector` with the square-rooted weights given (``None`` = term off)."""
     field_hz = basis.field(coeff)
     modulated: list[Tensor] = []
     for sc in scans:
@@ -927,10 +977,10 @@ def _residual_vector(
     scale = 1.0 / math.sqrt(max(1, mask_idx.numel()) * max(1, n_scans_minus_1))
     data_rows = [(m - mean).reshape(-1)[mask_idx] * scale for m in modulated]
     rows = data_rows
-    if lam_eff > 0:
-        rows = rows + [math.sqrt(lam_eff) * reg_residual(field_hz, reg_mode)]
-    if barrier_eff > 0:
-        rows = rows + _fold_barrier_rows(field_hz, scans, barrier_eff, jac_floor)
+    if sqrt_lam is not None:
+        rows = rows + [sqrt_lam * reg_residual(field_hz, reg_mode)]
+    if sqrt_barrier is not None:
+        rows = rows + _barrier_rows_scaled(field_hz, scans, sqrt_barrier, jac_floor)
     return torch.cat(rows)
 
 
@@ -944,11 +994,12 @@ def _dot64(a: Tensor, b: Tensor) -> Tensor:
     return (a * b).sum(dtype=torch.float64)
 
 
-def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> Tensor:
+def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> tuple[Tensor, int]:
     """Conjugate gradient for the SPD system ``matvec(x) = b`` (matrix-free).
 
     Vectors stay in ``b``'s dtype (float32 hot path); the scalar inner products
     accumulate in float64 (:func:`_dot64`) so the recurrence stays stable.
+    Returns ``(x, iterations)``.
     """
     dt = b.dtype
     x = torch.zeros_like(b)
@@ -957,18 +1008,18 @@ def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> Tensor:
     rs = _dot64(r, r)
     rs0 = rs
     if rs0 <= 0:
-        return x
-    for _ in range(max_iter):
+        return x, 0
+    for it in range(max_iter):
         Ap = matvec(p)
         alpha = rs / _dot64(p, Ap).clamp_min(1e-30)
         x = x + alpha.to(dt) * p
         r = r - alpha.to(dt) * Ap
         rs_new = _dot64(r, r)
         if rs_new <= tol * tol * rs0:
-            break
+            return x, it + 1
         p = r + (rs_new / rs).to(dt) * p
         rs = rs_new
-    return x
+    return x, max_iter
 
 
 def _gn_direction(coeff, residual, lam_eff, cg_iters, cg_tol):
@@ -998,7 +1049,7 @@ def _gn_direction(coeff, residual, lam_eff, cg_iters, cg_tol):
         return vjp(jv).reshape(-1) + 1e-8 * v
 
     g = vjp(r0.detach()).reshape(-1)  # J^T r
-    delta = _cg_solve(matvec, -g, cg_iters, cg_tol)
+    delta, _ = _cg_solve(matvec, -g, cg_iters, cg_tol)
     return delta, cost
 
 
@@ -1135,6 +1186,313 @@ def _lin_jtu(lin: _Linearization, u: Tensor) -> Tensor:
     return lin.basis.field_adjoint(gfield).reshape(-1)
 
 
+def _axis_grams(B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``(BᵀB, (D1 B)ᵀ(D1 B), (D2 B)ᵀ(D2 B))`` for one axis of the separable basis.
+
+    ``D1``/``D2`` are exactly the stencils of :func:`_first_diff`/:func:`_second_diff`
+    (zero rows at the boundaries), applied down the voxel axis of ``B``.
+    """
+    d1 = _first_diff(B, 0)
+    d2 = _second_diff(B, 0)
+    return B.T @ B, d1.T @ d1, d2.T @ d2
+
+
+def _kron3_apply(Kz: Tensor, Ky: Tensor, Kx: Tensor, c: Tensor) -> Tensor:
+    t = torch.einsum("ac,cyx->ayx", Kz, c)
+    t = torch.einsum("by,ayx->abx", Ky, t)
+    return torch.einsum("cx,abx->abc", Kx, t)
+
+
+def reg_gram_terms(
+    basis: SplineFieldBasis, reg_mode: str
+) -> list[tuple[float, Tensor, Tensor, Tensor]]:
+    """``RᵀR`` pulled back to coefficient space as a sum of weighted Kronecker products.
+
+    Each difference operator in :func:`reg_residual` acts along one axis, and the field is
+    ``(Bz ⊗ By ⊗ Bx) c``, so ``D_d`` only touches that axis's factor:
+    ``||D_z f||² = cᵀ (G_z^D ⊗ G_y ⊗ G_x) c``. Applying ``BᵀRᵀRB`` this way costs three
+    small einsums on the knot grid per term, instead of six derivative volumes and their
+    adjoints on the voxel grid -- the same operator, exactly.
+    """
+    (z0, z1, z2), (y0, y1, y2), (x0, x1, x2) = (
+        _axis_grams(basis.Bz),
+        _axis_grams(basis.By),
+        _axis_grams(basis.Bx),
+    )
+    if reg_mode == "membrane":
+        return [(1.0, z1, y0, x0), (1.0, z0, y1, x0), (1.0, z0, y0, x1)]
+    return [
+        (1.0, z2, y0, x0),
+        (1.0, z0, y2, x0),
+        (1.0, z0, y0, x2),
+        (2.0, z1, y1, x0),
+        (2.0, z1, y0, x1),
+        (2.0, z0, y1, x1),
+    ]
+
+
+def _capture_cuda_graph(step: Callable[[], None], device: torch.device):
+    """Warm ``step`` up on a side stream, then capture it as a CUDA graph.
+
+    ``step`` must write its outputs into tensors it can find again (attributes, or
+    ``copy_`` into buffers): the ones created during the captured call are the ones every
+    replay refreshes. Nothing inside may synchronise with the host.
+    """
+    side = torch.cuda.Stream(device=device)
+    # The side stream must not read buffers the default stream is still filling.
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    return graph
+
+
+class _LevelResidual:
+    """The cost evaluations of one level -- data SSD, Gauss-Newton ``r``, line-search
+    trials -- CUDA-graphed when possible, bit-identical to :func:`_residual_vector`.
+
+    Each is ~50 small kernels on the level grid, three or more times per Gauss-Newton
+    step. Which terms are on (penalty, barrier) is fixed per call site, so there is one
+    graph per combination, replaying with the coefficients and the square-rooted weights
+    copied into buffers. The float64 cost is summed inside the graph over the same
+    concatenated vector, so line-search accept/reject decisions cannot change.
+    """
+
+    def __init__(
+        self,
+        basis: SplineFieldBasis,
+        scans: list[ScanSpec],
+        mask_idx: Tensor,
+        n_sm1: int,
+        reg_mode: str,
+        jac_floor: float,
+        use_graph: bool,
+    ):
+        self.args = (basis, scans, mask_idx, n_sm1)
+        self.reg_mode = reg_mode
+        self.jac_floor = jac_floor
+        self.use_graph = use_graph
+        self.graphs: dict[tuple[bool, bool], dict] = {}
+
+    def residual(self, c: Tensor, lam_eff: float, barrier_eff: float) -> tuple[Tensor, float]:
+        """``(residual vector, cost)``. On the graphed path the vector is a buffer the next
+        call overwrites -- use it before evaluating again."""
+        if not self.use_graph:
+            r = _residual_vector(c, *self.args, lam_eff, self.reg_mode, barrier_eff, self.jac_floor)
+            return r, float(_dot64(r, r))
+        st = self._state(c, lam_eff > 0, barrier_eff > 0)
+        st["c"].copy_(c)
+        if lam_eff > 0:
+            st["sqrt_lam"].fill_(math.sqrt(lam_eff))
+        if barrier_eff > 0:
+            st["sqrt_bar"].fill_(math.sqrt(barrier_eff))
+        st["graph"].replay()
+        return st["r"], float(st["cost"])
+
+    def cost(self, c: Tensor, lam_eff: float, barrier_eff: float) -> float:
+        return self.residual(c, lam_eff, barrier_eff)[1]
+
+    def _state(self, c: Tensor, with_reg: bool, with_bar: bool) -> dict:
+        key = (with_reg, with_bar)
+        if key in self.graphs:
+            return self.graphs[key]
+        st: dict = {
+            "c": c.detach().clone(),
+            "sqrt_lam": torch.ones((), device=c.device, dtype=c.dtype),
+            "sqrt_bar": torch.ones((), device=c.device, dtype=c.dtype),
+        }
+
+        def step() -> None:
+            r = _residual_rows(
+                st["c"],
+                *self.args,
+                st["sqrt_lam"] if with_reg else None,
+                self.reg_mode,
+                st["sqrt_bar"] if with_bar else None,
+                self.jac_floor,
+            )
+            st["r"], st["cost"] = r, _dot64(r, r)
+
+        st["graph"] = _capture_cuda_graph(step, c.device)
+        self.graphs[key] = st
+        return st
+
+    def close(self) -> None:
+        if self.graphs:
+            torch.cuda.synchronize(next(iter(self.graphs.values()))["c"].device)
+            self.graphs.clear()
+
+
+class _NormalOperator:
+    """``v -> JᵀJ v`` on dense volumes, the same operator as ``_lin_jtu(_lin_jv(v))``.
+
+    The masked gather in ``J`` followed by the scatter in ``Jᵀ`` is a multiply by the mask,
+    and the scan-centering adjoint is a no-op on rows that are already centred, so the
+    data block needs no index ops, stacks or concatenation. Scans sharing a PE axis share
+    one difference and one adjoint difference. The penalty goes through
+    :func:`reg_gram_terms` on the knot grid.
+
+    With ``own_buffers`` the linearisation lives in tensors this object allocated, and
+    :meth:`load` copies a new one in place -- what a captured CUDA graph needs, since it
+    replays against fixed storage. Without, it just references ``lin``.
+    """
+
+    def __init__(
+        self,
+        lin: _Linearization,
+        reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None,
+        own_buffers: bool = False,
+    ):
+        self.basis = lin.basis
+        self.reg_terms = reg_terms or []
+        self.pe_tdim = list(lin.pe_tdim)
+        self.tdims = sorted(set(lin.pe_tdim))
+        self.barrier_tdim = list(lin.barrier_tdim)
+        self.own = own_buffers
+        self._bind(*self._derive(lin))
+
+    @staticmethod
+    def _derive(lin: _Linearization):
+        shape = lin.shape
+        ref = lin.P[0]
+        mask_f = torch.zeros(
+            int(shape[0] * shape[1] * shape[2]), device=ref.device, dtype=ref.dtype
+        )
+        mask_f[lin.mask_idx] = lin.scale * lin.scale
+        aP = [a * P for a, P in zip(lin.a, lin.P, strict=True)]
+        aQ = [a * Q for a, Q in zip(lin.a, lin.Q, strict=True)]
+        b2 = [B * B for B in lin.barrier_b]
+        lam = torch.tensor(lin.lam_eff, device=ref.device, dtype=ref.dtype)
+        return mask_f.reshape(shape), aP, aQ, b2, lam
+
+    def _bind(self, mask_f, aP, aQ, b2, lam):
+        if self.own:
+            mask_f, lam = mask_f.clone(), lam.clone()
+            aP, aQ, b2 = ([t.clone() for t in ts] for ts in (aP, aQ, b2))
+        self.mask_f, self.aP, self.aQ, self.b2, self.lam = mask_f, aP, aQ, b2, lam
+
+    def load(self, lin: _Linearization) -> None:
+        mask_f, aP, aQ, b2, lam = self._derive(lin)
+        if not self.own:
+            self._bind(mask_f, aP, aQ, b2, lam)
+            return
+        self.mask_f.copy_(mask_f)
+        self.lam.copy_(lam)
+        for dst, src in zip([*self.aP, *self.aQ, *self.b2], [*aP, *aQ, *b2], strict=True):
+            dst.copy_(src)
+
+    def __call__(self, v: Tensor) -> Tensor:
+        c = v.reshape(self.basis.coeff_shape)
+        dfield = self.basis.field(c)
+        n_scans = len(self.aP)
+        diffs = {td: _central_diff_pe(dfield, td) for td in self.tdims}
+        dms = [self.aP[s] * dfield + self.aQ[s] * diffs[self.pe_tdim[s]] for s in range(n_scans)]
+        dmean = sum(dms) / n_scans
+        g = torch.zeros_like(dfield)
+        back = {td: torch.zeros_like(dfield) for td in self.tdims}
+        for s in range(n_scans):
+            w = self.mask_f * (dms[s] - dmean)
+            g = g + self.aP[s] * w
+            back[self.pe_tdim[s]] = back[self.pe_tdim[s]] + self.aQ[s] * w
+        for B2, td in zip(self.b2, self.barrier_tdim, strict=True):
+            back.setdefault(td, torch.zeros_like(dfield))
+            back[td] = back[td] + B2 * _central_diff_pe(dfield, td)
+        for td, b in back.items():
+            g = g + _central_diff_pe_adjoint(b, td)
+        out = self.basis.field_adjoint(g)
+        for wgt, Kz, Ky, Kx in self.reg_terms:
+            out = out + (self.lam * wgt) * _kron3_apply(Kz, Ky, Kx, c)
+        return out.reshape(-1) + 1e-8 * v
+
+
+class _LevelCG:
+    """The Gauss-Newton normal-equation solve for one level, CUDA-graphed when it can be.
+
+    Each CG iteration is ~60 small kernels on a few-MB volume, so on a GPU the solve is
+    bound by Python launching them, not by the arithmetic (a real 72x100x100 pair ran at
+    low GPU utilisation, and float64 was no slower than float32). Shapes are fixed within
+    a level, so one iteration -- matvec, step, residual update, new direction -- is
+    captured once and replayed; each Gauss-Newton step only copies its linearisation into
+    the operator's buffers. The convergence test reads one scalar per iteration, so the
+    iteration count and the result are exactly those of :func:`_cg_solve`.
+
+    A Jacobi (diagonal) preconditioner was tried and removed: on a real pair CG still hit
+    the 50-iteration cap at every level, ran slower, and moved the warp by brain p99 4.4 mm.
+    The bending penalty leaves affine field components and off-mask coefficients nearly
+    free, so the cap is doing regularisation, and the diagonal speeds up exactly those
+    weak directions.
+    """
+
+    def __init__(self, reg_terms, use_graph: bool):
+        self.reg_terms = reg_terms
+        self.use_graph = use_graph
+        self.op: _NormalOperator | None = None
+        self.graph = None
+        self.iters = 0
+        self.solves = 0
+
+    def solve(self, lin: _Linearization, b: Tensor, max_iter: int, tol: float) -> Tensor:
+        self.solves += 1
+        if not self.use_graph:
+            x, n = _cg_solve(_NormalOperator(lin, self.reg_terms), b, max_iter, tol)
+            self.iters += n
+            return x
+        if self.graph is None or self.op is None:
+            self._capture(lin, b)
+        else:
+            self.op.load(lin)
+        graph = self.graph
+        assert graph is not None
+        dt = b.dtype
+        self.x.zero_()
+        self.r.copy_(b)
+        self.p.copy_(b)
+        self.rs.copy_(_dot64(b, b))
+        rs0 = float(self.rs)
+        if rs0 <= 0:
+            return torch.zeros_like(b)
+        for it in range(max_iter):
+            graph.replay()
+            if float(self.rs_new) <= tol * tol * rs0:
+                self.iters += it + 1
+                break
+        else:
+            self.iters += max_iter
+        return self.x.to(dt, copy=True)
+
+    def _iteration(self) -> None:
+        # One _cg_solve iteration on static buffers; p and rs are advanced unconditionally
+        # (harmless once converged: only x is returned).
+        assert self.op is not None
+        dt = self.x.dtype
+        Ap = self.op(self.p)
+        alpha = self.rs / _dot64(self.p, Ap).clamp_min(1e-30)
+        self.x.add_(alpha.to(dt) * self.p)
+        self.r.sub_(alpha.to(dt) * Ap)
+        self.rs_new.copy_(_dot64(self.r, self.r))
+        self.p.copy_(self.r + (self.rs_new / self.rs).to(dt) * self.p)
+        self.rs.copy_(self.rs_new)
+
+    def _capture(self, lin: _Linearization, b: Tensor) -> None:
+        self.op = _NormalOperator(lin, self.reg_terms, own_buffers=True)
+        self.x, self.r, self.p = (torch.zeros_like(b) for _ in range(3))
+        self.rs = torch.ones((), device=b.device, dtype=torch.float64)
+        self.rs_new = torch.ones_like(self.rs)
+        self.p.copy_(b)
+        self.graph = _capture_cuda_graph(self._iteration, b.device)
+
+    def close(self) -> None:
+        if self.graph is not None:
+            # A graph's private pool must not be released under queued replays.
+            torch.cuda.synchronize(self.x.device)
+            self.graph = None
+            self.op = None
+
+
 def _gn_direction_analytic(
     coeff: Tensor,
     basis: SplineFieldBasis,
@@ -1147,29 +1505,45 @@ def _gn_direction_analytic(
     cg_tol: float,
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
+    solver: _LevelCG | None = None,
+    level_residual: _LevelResidual | None = None,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
     The forward model is linearised once (:func:`_linearize`) and every CG matvec is
-    ``J^T (J v)`` via :func:`_lin_jv` / :func:`_lin_jtu` — einsum + elementwise +
+    ``J^T (J v)`` via :class:`_NormalOperator` (the fused form of :func:`_lin_jv` /
+    :func:`_lin_jtu`) — einsum + elementwise +
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
     """
-    r0 = _residual_vector(
-        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
-    )
-    cost = float(_dot64(r0, r0))
+    if level_residual is None:
+        level_residual = _LevelResidual(basis, scans, mask_idx, n_sm1, reg_mode, jac_floor, False)
+    # On the graphed path r0 is a buffer the next evaluation overwrites; J^T r0 below is
+    # queued before any.
+    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff)
     lin = _linearize(
         coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
     )
 
-    def matvec(v: Tensor) -> Tensor:
-        jv = _lin_jv(lin, v.reshape(coeff.shape))
-        return _lin_jtu(lin, jv) + 1e-8 * v
-
+    if solver is None:
+        solver = _LevelCG(reg_gram_terms(basis, reg_mode) if lam_eff > 0 else None, False)
     g = _lin_jtu(lin, r0)  # J^T r
-    delta = _cg_solve(matvec, -g, cg_iters, cg_tol)
+    delta = solver.solve(lin, -g, cg_iters, cg_tol)
     return delta, cost
+
+
+@dataclass
+class LevelReport:
+    """How one level of :func:`gn_solve_level` went -- what the progress line shows."""
+
+    iters: int
+    stop: str  # "converged" | "miter" | "no descent" | "flat cost"
+    last_update_vox: float  # displacement moved by the final accepted step
+    shift_added_vox: float  # displacement change over the whole level
+    max_shift_vox: float  # largest displacement at the level's end
+    reg_ratio: float  # bending-energy cost / data cost at the level's end
+    cost: float
+    cg_iters_mean: float = float("nan")  # CG iterations per Gauss-Newton step
 
 
 def gn_solve_level(
@@ -1190,7 +1564,9 @@ def gn_solve_level(
     jac_floor: float = 0.1,
     reject_folds: bool = True,
     on_step: Callable[[Tensor, int, float], None] | None = None,
-) -> tuple[Tensor, float]:
+    min_update_vox: float = 0.0,
+    use_graph: bool = True,
+) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
     ``J^T J`` is applied matrix-free. With ``analytic`` (default) the forward model is
@@ -1203,7 +1579,9 @@ def gn_solve_level(
     barrier (weight relative to the data SSD, like ``lam``); ``reject_folds`` additionally
     vetoes any accepted step that introduces/worsens a negative Jacobian. ``on_step``
     is called with ``(coefficients, iteration, cost)`` after every accepted step.
-    Returns ``(coefficients, cost)``.
+    ``min_update_vox > 0`` ends the level once a step moves the displacement less than
+    that (see :attr:`TopupConfig.min_update_vox`).
+    Returns ``(coefficients, cost, report)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
     n_sm1 = max(1, len(scans) - 1)
@@ -1216,19 +1594,50 @@ def gn_solve_level(
             c, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
         )
 
-    def data_ssd(c: Tensor) -> float:
-        r = residual(c, 0.0, 0.0)  # data term only — never scaled by the barrier/reg
-        return float(_dot64(r, r))
+    level_residual = _LevelResidual(
+        basis,
+        scans,
+        mask_idx,
+        n_sm1,
+        reg_mode,
+        jac_floor,
+        analytic and use_graph and coeff.device.type == "cuda",
+    )
 
+    def data_ssd(c: Tensor) -> float:
+        # Data term only — never scaled by the barrier/reg.
+        return level_residual.cost(c, 0.0, 0.0)
+
+    # Displacement is field * readout * sign, so the worst-case voxel move of a field
+    # change is its largest |value| in the mask times the largest |readout|.
+    max_readout = max(abs(sc.readout) for sc in scans)
+
+    def disp_vox(field_hz: Tensor) -> float:
+        if mask_idx.numel() == 0:
+            return 0.0
+        return float(field_hz.reshape(-1)[mask_idx].abs().max()) * max_readout
+
+    # The penalty's coefficient-space Gram depends only on the basis: build it once a level,
+    # along with the (possibly CUDA-graphed) normal-equation solver that uses it.
+    solver = None
+    if analytic:
+        reg_terms = reg_gram_terms(basis, reg_mode) if lam > 0 else None
+        solver = _LevelCG(reg_terms, use_graph and coeff.device.type == "cuda")
+    field_start = basis.field(coeff)
+    field_prev = field_start
     bar = _bar(
         total=max_iter,
         desc=desc,
-        leave=False,
+        leave=True,
         disable=not progress,
-        bar_format="  {desc} {bar} {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
+        bar_format="{desc} {bar:12} {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
     )
     prev_cost = None
     last_cost = float("nan")
+    last_update = 0.0
+    stop = "miter"
+    iters = 0
+    lam_eff = lam
     for _it in range(max_iter):
         # ssq-scale both the smoothness (lam) and anti-fold (jac_penalty) weights by the
         # current data SSD so they are invariant to intensity scale and image size.
@@ -1248,6 +1657,8 @@ def gn_solve_level(
                 cg_tol,
                 barrier_eff,
                 jac_floor,
+                solver,
+                level_residual,
             )
         else:
             delta, cost = _gn_direction(
@@ -1266,8 +1677,7 @@ def gn_solve_level(
         new_cost = cost
         for _ in range(12):
             trial = coeff + (step * delta).reshape(coeff.shape)
-            r_new = residual(trial, lam_eff, barrier_eff)
-            new_cost = float(_dot64(r_new, r_new))
+            new_cost = level_residual.cost(trial, lam_eff, barrier_eff)
             folds = guard and _min_jacobian(basis.field(trial), barrier_specs) < min(
                 0.0, cur_min_jac
             )
@@ -1278,18 +1688,50 @@ def gn_solve_level(
             step *= 0.5
         last_cost = new_cost if accepted else cost
         bar.update(1)
-        bar.set_postfix_str(
-            f"cost={last_cost:.3e} λ={lam_eff:.1e}{'' if accepted else ' (reject)'}"
-        )
         if not accepted:
+            stop = "no descent"
             break
+        iters += 1
+        field_now = basis.field(coeff)
+        last_update = disp_vox(field_now - field_prev)
+        field_prev = field_now
+        bar.set_postfix_str(
+            f"step {last_update:.3f} vox  max {disp_vox(field_now):.2f} vox  cost {last_cost:.3e}"
+        )
         if on_step is not None:
             on_step(coeff, _it, new_cost)
+        if min_update_vox > 0 and last_update < min_update_vox:
+            stop = "converged"
+            break
         if prev_cost is not None and abs(prev_cost - new_cost) < 1e-6 * prev_cost:
+            stop = "flat cost"
             break
         prev_cost = new_cost
+
+    field_end = basis.field(coeff)
+    data_end = data_ssd(coeff)
+    reg_rows = reg_residual(field_end, reg_mode) if lam > 0 else None
+    reg_end = lam_eff * float(_dot64(reg_rows, reg_rows)) if reg_rows is not None else 0.0
+    report = LevelReport(
+        iters=iters,
+        stop=stop,
+        last_update_vox=last_update,
+        shift_added_vox=disp_vox(field_end - field_start),
+        max_shift_vox=disp_vox(field_end),
+        reg_ratio=reg_end / data_end if data_end > 0 else float("nan"),
+        cost=last_cost,
+        cg_iters_mean=solver.iters / solver.solves if solver and solver.solves else float("nan"),
+    )
+    bar.set_postfix_str(
+        f"{stop:<10}  +{report.shift_added_vox:.2f} -> {report.max_shift_vox:.2f} vox  "
+        f"last step {last_update:.3f}  reg/data {report.reg_ratio:.3f}  "
+        f"cg {report.cg_iters_mean:.0f}/{cg_iters}"
+    )
     bar.close()
-    return coeff, last_cost
+    if solver is not None:
+        solver.close()
+    level_residual.close()
+    return coeff, last_cost, report
 
 
 # ----------------------------------------------------------------------------
@@ -1490,6 +1932,7 @@ class TopupResult:
     unwarped: list[Tensor]  # per-scan Jacobian-modulated undistorted images (native intensity)
     mean_unwarped: Tensor  # mean of the undistorted images
     motion_matrices: list[Tensor]  # per-scan composed rigid voxel matrix (identity if unused)
+    levels: list[LevelReport] = _dc_field(default_factory=list)  # one per schedule level
 
 
 def run_topup(
@@ -1606,13 +2049,12 @@ def run_topup(
         recorder.capture_identity(label="start")
 
     n_lev = config.n_levels()
-    level_bar = _bar(
-        total=n_lev,
-        desc="blipflip",
-        leave=True,
-        disable=not progress,
-        bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} levels [{elapsed}<{remaining}] {postfix}",
-    )
+    reports: list[LevelReport] = []
+    if progress:
+        print(
+            "  one line per level: iterations [time] | why it stopped | displacement added -> "
+            "largest | last step | bending/data cost | CG iterations per step / cap"
+        )
     coeff = None
     basis = None
     for lvl in range(n_lev):
@@ -1644,11 +2086,7 @@ def run_topup(
             recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
             on_step = _movie_step(recorder, basis, _movie_chains)
 
-        level_bar.set_postfix_str(
-            f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} "
-            f"grid={'x'.join(map(str, level_shape))} knots={'x'.join(map(str, basis.coeff_shape))}"
-        )
-        coeff, cost = gn_solve_level(
+        coeff, cost, report = gn_solve_level(
             coeff,
             basis,
             level_scans,
@@ -1660,13 +2098,17 @@ def run_topup(
             config.cg_iters,
             config.cg_tol,
             progress,
-            desc=f"L{lvl + 1}/{n_lev} {wr}mm",
+            desc=f"  L{lvl + 1:<2} {wr:>4g}mm fwhm {fwhm:>2g} λ {lam:.1e}"
+            + (f" ss {ss}" if ss > 1 else ""),
             analytic=config.analytic_gn,
             jac_penalty=config.jac_penalty,
             jac_floor=config.jac_floor,
             reject_folds=config.reject_folds,
             on_step=on_step,
+            min_update_vox=config.min_update_vox,
+            use_graph=config.cuda_graphs,
         )
+        reports.append(report)
         if recorder is not None:
             recorder.capture(
                 _movie_chains(basis.field(coeff)),
@@ -1674,10 +2116,6 @@ def run_topup(
                 pinned=True,
                 modulate=True,
             )
-        level_bar.update(1)
-        level_bar.set_postfix_str(
-            f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} cost={cost:.3e}"
-        )
 
         # Rigid movement update, block-coordinate with the field (topup --estmov). Run
         # after the level's field solve (movement estimated *with* the field at this
@@ -1695,7 +2133,6 @@ def run_topup(
             )
             if recorder is not None:
                 recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
-    level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
     assert basis is not None and coeff is not None
@@ -1738,6 +2175,7 @@ def run_topup(
         unwarped=unwarped,
         mean_unwarped=mean_unwarped,
         motion_matrices=motion_mats,
+        levels=reports,
     )
 
 
@@ -1773,18 +2211,28 @@ def _prepare_level_scans(
     subsamp: int,
 ) -> list[ScanSpec]:
     """Smooth (FWHM mm) and optionally subsample each scan for one level."""
+    # Every level brings a new kernel width, so a benchmarking cuDNN autotunes each blur
+    # afresh: ~1.1 s of tuning for 11 ms of convolution over a 12-level schedule.
+    benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        return [_prepare_level_scan(sc, voxel_sizes, fwhm_mm, subsamp) for sc in scans]
+    finally:
+        torch.backends.cudnn.benchmark = benchmark
+
+
+def _prepare_level_scan(
+    sc: ScanSpec, voxel_sizes: tuple[float, float, float], fwhm_mm: float, subsamp: int
+) -> ScanSpec:
     vz, vy, vx = voxel_sizes
-    out: list[ScanSpec] = []
-    for sc in scans:
-        d = sc.data
-        if fwhm_mm > 0:
-            # Convert FWHM(mm) to sigma(voxels); use mean voxel size (fields are smooth).
-            sigma_vox = (fwhm_mm / (2.0 * math.sqrt(2.0 * math.log(2.0)))) / ((vz + vy + vx) / 3.0)
-            if sigma_vox > 0:
-                # Smooth in float32 (the shared kernel is float32; smoothing is not the
-                # numerically sensitive step) and restore the solve dtype.
-                d = _separable_smooth_3d(d.float(), sigma_vox).to(d.dtype)
-        if subsamp > 1:
-            d = d[::subsamp, ::subsamp, ::subsamp].contiguous()
-        out.append(ScanSpec(data=d, pe_axis=sc.pe_axis, sign=sc.sign, readout=sc.readout))
-    return out
+    d = sc.data
+    if fwhm_mm > 0:
+        # Convert FWHM(mm) to sigma(voxels); use mean voxel size (fields are smooth).
+        sigma_vox = (fwhm_mm / (2.0 * math.sqrt(2.0 * math.log(2.0)))) / ((vz + vy + vx) / 3.0)
+        if sigma_vox > 0:
+            # Smooth in float32 (the shared kernel is float32; smoothing is not the
+            # numerically sensitive step) and restore the solve dtype.
+            d = _separable_smooth_3d(d.float(), sigma_vox).to(d.dtype)
+    if subsamp > 1:
+        d = d[::subsamp, ::subsamp, ::subsamp].contiguous()
+    return ScanSpec(data=d, pe_axis=sc.pe_axis, sign=sc.sign, readout=sc.readout)
