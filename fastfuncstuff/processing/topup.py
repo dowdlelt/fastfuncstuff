@@ -1149,6 +1149,101 @@ def _lin_jtu(lin: _Linearization, u: Tensor) -> Tensor:
     return lin.basis.field_adjoint(gfield).reshape(-1)
 
 
+def _axis_grams(B: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    """``(BᵀB, (D1 B)ᵀ(D1 B), (D2 B)ᵀ(D2 B))`` for one axis of the separable basis.
+
+    ``D1``/``D2`` are exactly the stencils of :func:`_first_diff`/:func:`_second_diff`
+    (zero rows at the boundaries), applied down the voxel axis of ``B``.
+    """
+    d1 = _first_diff(B, 0)
+    d2 = _second_diff(B, 0)
+    return B.T @ B, d1.T @ d1, d2.T @ d2
+
+
+def _kron3_apply(Kz: Tensor, Ky: Tensor, Kx: Tensor, c: Tensor) -> Tensor:
+    t = torch.einsum("ac,cyx->ayx", Kz, c)
+    t = torch.einsum("by,ayx->abx", Ky, t)
+    return torch.einsum("cx,abx->abc", Kx, t)
+
+
+def reg_gram_terms(
+    basis: SplineFieldBasis, reg_mode: str
+) -> list[tuple[float, Tensor, Tensor, Tensor]]:
+    """``RᵀR`` pulled back to coefficient space as a sum of weighted Kronecker products.
+
+    Each difference operator in :func:`reg_residual` acts along one axis, and the field is
+    ``(Bz ⊗ By ⊗ Bx) c``, so ``D_d`` only touches that axis's factor:
+    ``||D_z f||² = cᵀ (G_z^D ⊗ G_y ⊗ G_x) c``. Applying ``BᵀRᵀRB`` this way costs three
+    small einsums on the knot grid per term, instead of six derivative volumes and their
+    adjoints on the voxel grid -- the same operator, exactly.
+    """
+    (z0, z1, z2), (y0, y1, y2), (x0, x1, x2) = (
+        _axis_grams(basis.Bz),
+        _axis_grams(basis.By),
+        _axis_grams(basis.Bx),
+    )
+    if reg_mode == "membrane":
+        return [(1.0, z1, y0, x0), (1.0, z0, y1, x0), (1.0, z0, y0, x1)]
+    return [
+        (1.0, z2, y0, x0),
+        (1.0, z0, y2, x0),
+        (1.0, z0, y0, x2),
+        (2.0, z1, y1, x0),
+        (2.0, z1, y0, x1),
+        (2.0, z0, y1, x1),
+    ]
+
+
+def _normal_matvec_builder(
+    lin: _Linearization, reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None
+) -> Callable[[Tensor], Tensor]:
+    """``v -> JᵀJ v`` on dense volumes, the same operator as ``_lin_jtu(_lin_jv(v))``.
+
+    The masked gather in ``J`` followed by the scatter in ``Jᵀ`` is a multiply by the mask,
+    and the scan-centering adjoint is a no-op on rows that are already centred, so the
+    data block needs no index ops, stacks or concatenation. Scans sharing a PE axis share
+    one difference and one adjoint difference. The penalty goes through
+    :func:`reg_gram_terms` on the knot grid.
+    """
+    shape = lin.shape
+    mask_f = torch.zeros(
+        int(shape[0] * shape[1] * shape[2]), device=lin.P[0].device, dtype=lin.P[0].dtype
+    )
+    mask_f[lin.mask_idx] = lin.scale * lin.scale
+    mask_f = mask_f.reshape(shape)
+    n_scans = len(lin.P)
+    aP = [lin.a[s] * lin.P[s] for s in range(n_scans)]
+    aQ = [lin.a[s] * lin.Q[s] for s in range(n_scans)]
+    tdims = sorted(set(lin.pe_tdim))
+    barrier = [(B * B, td) for B, td in zip(lin.barrier_b, lin.barrier_tdim, strict=True)]
+    lam = lin.lam_eff if reg_terms else 0.0
+
+    def matvec(v: Tensor) -> Tensor:
+        c = v.reshape(lin.basis.coeff_shape)
+        dfield = lin.basis.field(c)
+        diffs = {td: _central_diff_pe(dfield, td) for td in tdims}
+        dms = [aP[s] * dfield + aQ[s] * diffs[lin.pe_tdim[s]] for s in range(n_scans)]
+        dmean = sum(dms) / n_scans
+        g = torch.zeros_like(dfield)
+        back = {td: torch.zeros_like(dfield) for td in tdims}
+        for s in range(n_scans):
+            w = mask_f * (dms[s] - dmean)
+            g = g + aP[s] * w
+            back[lin.pe_tdim[s]] = back[lin.pe_tdim[s]] + aQ[s] * w
+        for B2, td in barrier:
+            back.setdefault(td, torch.zeros_like(dfield))
+            back[td] = back[td] + B2 * _central_diff_pe(dfield, td)
+        for td, b in back.items():
+            g = g + _central_diff_pe_adjoint(b, td)
+        out = lin.basis.field_adjoint(g)
+        if lam > 0:
+            for wgt, Kz, Ky, Kx in reg_terms or []:
+                out = out + (lam * wgt) * _kron3_apply(Kz, Ky, Kx, c)
+        return out.reshape(-1) + 1e-8 * v
+
+    return matvec
+
+
 def _gn_direction_analytic(
     coeff: Tensor,
     basis: SplineFieldBasis,
@@ -1161,11 +1256,13 @@ def _gn_direction_analytic(
     cg_tol: float,
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
+    reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None = None,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
     The forward model is linearised once (:func:`_linearize`) and every CG matvec is
-    ``J^T (J v)`` via :func:`_lin_jv` / :func:`_lin_jtu` — einsum + elementwise +
+    ``J^T (J v)`` via :func:`_normal_matvec_builder` (the fused form of :func:`_lin_jv` /
+    :func:`_lin_jtu`) — einsum + elementwise +
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
     """
@@ -1177,9 +1274,9 @@ def _gn_direction_analytic(
         coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
     )
 
-    def matvec(v: Tensor) -> Tensor:
-        jv = _lin_jv(lin, v.reshape(coeff.shape))
-        return _lin_jtu(lin, jv) + 1e-8 * v
+    if reg_terms is None and lam_eff > 0:
+        reg_terms = reg_gram_terms(basis, reg_mode)
+    matvec = _normal_matvec_builder(lin, reg_terms)
 
     g = _lin_jtu(lin, r0)  # J^T r
     delta = _cg_solve(matvec, -g, cg_iters, cg_tol)
@@ -1259,6 +1356,8 @@ def gn_solve_level(
             return 0.0
         return float(field_hz.reshape(-1)[mask_idx].abs().max()) * max_readout
 
+    # The penalty's coefficient-space Gram depends only on the basis: build it once a level.
+    reg_terms = reg_gram_terms(basis, reg_mode) if (analytic and lam > 0) else None
     field_start = basis.field(coeff)
     field_prev = field_start
     bar = _bar(
@@ -1293,6 +1392,7 @@ def gn_solve_level(
                 cg_tol,
                 barrier_eff,
                 jac_floor,
+                reg_terms,
             )
         else:
             delta, cost = _gn_direction(

@@ -614,3 +614,19 @@ def test_help_schedule_lines_round_trip_to_the_preset():
         assert args.warpres == cfg.warpres and args.fwhm == cfg.fwhm
         assert args.miter == cfg.miter
         assert all(math.isclose(a, b, rel_tol=0.01) for a, b in zip(args.lam, cfg.lam, strict=True))
+
+
+def test_fused_normal_matvec_equals_jt_j():
+    # The CG matvec skips the masked gather/scatter and applies the penalty through
+    # coefficient-space Kronecker Grams; it must still be exactly J^T J (+ the 1e-8 ridge),
+    # with the barrier active, two scans, and both penalty models.
+    torch.manual_seed(7)
+    basis, scans, mask_idx, coeff = _small_gn_setup()
+    for reg_mode in ("bending", "membrane"):
+        lin = T._linearize(coeff, basis, scans, mask_idx, 1, 3e-3, reg_mode, 5.0, 0.1)
+        assert lin.barrier_b, "barrier rows should be active"
+        matvec = T._normal_matvec_builder(lin, T.reg_gram_terms(basis, reg_mode))
+        v = torch.randn(basis.coeff_shape, dtype=torch.float64)
+        ref = T._lin_jtu(lin, T._lin_jv(lin, v)) + 1e-8 * v.reshape(-1)
+        got = matvec(v.reshape(-1))
+        assert (got - ref).norm() < 1e-10 * ref.norm(), reg_mode
