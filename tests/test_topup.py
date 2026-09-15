@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from fastfuncstuff.processing import topup as T
@@ -625,8 +626,30 @@ def test_fused_normal_matvec_equals_jt_j():
     for reg_mode in ("bending", "membrane"):
         lin = T._linearize(coeff, basis, scans, mask_idx, 1, 3e-3, reg_mode, 5.0, 0.1)
         assert lin.barrier_b, "barrier rows should be active"
-        matvec = T._normal_matvec_builder(lin, T.reg_gram_terms(basis, reg_mode))
+        matvec = T._NormalOperator(lin, T.reg_gram_terms(basis, reg_mode))
         v = torch.randn(basis.coeff_shape, dtype=torch.float64)
         ref = T._lin_jtu(lin, T._lin_jv(lin, v)) + 1e-8 * v.reshape(-1)
         got = matvec(v.reshape(-1))
         assert (got - ref).norm() < 1e-10 * ref.norm(), reg_mode
+
+
+@pytest.mark.gpu
+def test_cuda_graphed_cg_matches_eager():
+    # The per-level CG replays one captured iteration against buffers the linearisation is
+    # copied into; across several Gauss-Newton steps it must give exactly the eager result.
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    _, _, scans = _make_synthetic()
+    dev = torch.device("cuda")
+    scans = [T.ScanSpec(s.data.to(dev), s.pe_axis, s.sign, s.readout) for s in scans]
+
+    def run(graphs):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[6, 6], subsamp=[1, 1]
+        )
+        cfg.cuda_graphs = graphs
+        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+
+    eager, graphed = run(False), run(True)
+    assert [lv.iters for lv in eager.levels] == [lv.iters for lv in graphed.levels]
+    assert torch.equal(eager.field_hz, graphed.field_hz)

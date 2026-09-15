@@ -354,6 +354,12 @@ def create_parser() -> argparse.ArgumentParser:
         misc,
         extra="Use CPU on Mac: the stable CG reductions require float64, which MPS does not support.",
     )
+    misc.add_argument(
+        "-no_cuda_graphs",
+        action="store_true",
+        help="Launch every solver kernel from Python instead of replaying captured CUDA graphs. "
+        "Same result, several times slower on a GPU; for debugging.",
+    )
     misc.add_argument("-verb", type=int, default=1, help="Verbosity (0/1/2).")
     add_warp_movie_args(parser, overlay=False)
     add_batch_args(
@@ -705,6 +711,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         )
         return 2
     cfg.min_update_vox = args.min_update
+    cfg.cuda_graphs = not args.no_cuda_graphs
     cfg.reg_mode = args.reg_mode
     cfg.ssqlambda = not args.no_ssqlambda
     cfg.jac_penalty = 0.0 if args.no_antifold else args.jac_penalty

@@ -244,6 +244,10 @@ class TopupConfig:
     sane relative tolerance while the field has stopped moving. On a phantom, the 20 mm
     level converged in 3 steps and then ran 25 more, each moving the field < 0.03 vox."""
 
+    cuda_graphs: bool = True
+    """Replay each level's CG iteration as a captured CUDA graph (CUDA only; see
+    :class:`_LevelCG`). Identical results; ``False`` launches every kernel from Python."""
+
     cg_iters: int = 50
     """Max conjugate-gradient iterations per Gauss-Newton step."""
 
@@ -1194,9 +1198,7 @@ def reg_gram_terms(
     ]
 
 
-def _normal_matvec_builder(
-    lin: _Linearization, reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None
-) -> Callable[[Tensor], Tensor]:
+class _NormalOperator:
     """``v -> JᵀJ v`` on dense volumes, the same operator as ``_lin_jtu(_lin_jv(v))``.
 
     The masked gather in ``J`` followed by the scatter in ``Jᵀ`` is a multiply by the mask,
@@ -1204,44 +1206,157 @@ def _normal_matvec_builder(
     data block needs no index ops, stacks or concatenation. Scans sharing a PE axis share
     one difference and one adjoint difference. The penalty goes through
     :func:`reg_gram_terms` on the knot grid.
-    """
-    shape = lin.shape
-    mask_f = torch.zeros(
-        int(shape[0] * shape[1] * shape[2]), device=lin.P[0].device, dtype=lin.P[0].dtype
-    )
-    mask_f[lin.mask_idx] = lin.scale * lin.scale
-    mask_f = mask_f.reshape(shape)
-    n_scans = len(lin.P)
-    aP = [lin.a[s] * lin.P[s] for s in range(n_scans)]
-    aQ = [lin.a[s] * lin.Q[s] for s in range(n_scans)]
-    tdims = sorted(set(lin.pe_tdim))
-    barrier = [(B * B, td) for B, td in zip(lin.barrier_b, lin.barrier_tdim, strict=True)]
-    lam = lin.lam_eff if reg_terms else 0.0
 
-    def matvec(v: Tensor) -> Tensor:
-        c = v.reshape(lin.basis.coeff_shape)
-        dfield = lin.basis.field(c)
-        diffs = {td: _central_diff_pe(dfield, td) for td in tdims}
-        dms = [aP[s] * dfield + aQ[s] * diffs[lin.pe_tdim[s]] for s in range(n_scans)]
+    With ``own_buffers`` the linearisation lives in tensors this object allocated, and
+    :meth:`load` copies a new one in place -- what a captured CUDA graph needs, since it
+    replays against fixed storage. Without, it just references ``lin``.
+    """
+
+    def __init__(
+        self,
+        lin: _Linearization,
+        reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None,
+        own_buffers: bool = False,
+    ):
+        self.basis = lin.basis
+        self.reg_terms = reg_terms or []
+        self.pe_tdim = list(lin.pe_tdim)
+        self.tdims = sorted(set(lin.pe_tdim))
+        self.barrier_tdim = list(lin.barrier_tdim)
+        self.own = own_buffers
+        self._bind(*self._derive(lin))
+
+    @staticmethod
+    def _derive(lin: _Linearization):
+        shape = lin.shape
+        ref = lin.P[0]
+        mask_f = torch.zeros(
+            int(shape[0] * shape[1] * shape[2]), device=ref.device, dtype=ref.dtype
+        )
+        mask_f[lin.mask_idx] = lin.scale * lin.scale
+        aP = [a * P for a, P in zip(lin.a, lin.P, strict=True)]
+        aQ = [a * Q for a, Q in zip(lin.a, lin.Q, strict=True)]
+        b2 = [B * B for B in lin.barrier_b]
+        lam = torch.tensor(lin.lam_eff, device=ref.device, dtype=ref.dtype)
+        return mask_f.reshape(shape), aP, aQ, b2, lam
+
+    def _bind(self, mask_f, aP, aQ, b2, lam):
+        if self.own:
+            mask_f, lam = mask_f.clone(), lam.clone()
+            aP, aQ, b2 = ([t.clone() for t in ts] for ts in (aP, aQ, b2))
+        self.mask_f, self.aP, self.aQ, self.b2, self.lam = mask_f, aP, aQ, b2, lam
+
+    def load(self, lin: _Linearization) -> None:
+        mask_f, aP, aQ, b2, lam = self._derive(lin)
+        if not self.own:
+            self._bind(mask_f, aP, aQ, b2, lam)
+            return
+        self.mask_f.copy_(mask_f)
+        self.lam.copy_(lam)
+        for dst, src in zip([*self.aP, *self.aQ, *self.b2], [*aP, *aQ, *b2], strict=True):
+            dst.copy_(src)
+
+    def __call__(self, v: Tensor) -> Tensor:
+        c = v.reshape(self.basis.coeff_shape)
+        dfield = self.basis.field(c)
+        n_scans = len(self.aP)
+        diffs = {td: _central_diff_pe(dfield, td) for td in self.tdims}
+        dms = [self.aP[s] * dfield + self.aQ[s] * diffs[self.pe_tdim[s]] for s in range(n_scans)]
         dmean = sum(dms) / n_scans
         g = torch.zeros_like(dfield)
-        back = {td: torch.zeros_like(dfield) for td in tdims}
+        back = {td: torch.zeros_like(dfield) for td in self.tdims}
         for s in range(n_scans):
-            w = mask_f * (dms[s] - dmean)
-            g = g + aP[s] * w
-            back[lin.pe_tdim[s]] = back[lin.pe_tdim[s]] + aQ[s] * w
-        for B2, td in barrier:
+            w = self.mask_f * (dms[s] - dmean)
+            g = g + self.aP[s] * w
+            back[self.pe_tdim[s]] = back[self.pe_tdim[s]] + self.aQ[s] * w
+        for B2, td in zip(self.b2, self.barrier_tdim, strict=True):
             back.setdefault(td, torch.zeros_like(dfield))
             back[td] = back[td] + B2 * _central_diff_pe(dfield, td)
         for td, b in back.items():
             g = g + _central_diff_pe_adjoint(b, td)
-        out = lin.basis.field_adjoint(g)
-        if lam > 0:
-            for wgt, Kz, Ky, Kx in reg_terms or []:
-                out = out + (lam * wgt) * _kron3_apply(Kz, Ky, Kx, c)
+        out = self.basis.field_adjoint(g)
+        for wgt, Kz, Ky, Kx in self.reg_terms:
+            out = out + (self.lam * wgt) * _kron3_apply(Kz, Ky, Kx, c)
         return out.reshape(-1) + 1e-8 * v
 
-    return matvec
+
+class _LevelCG:
+    """The Gauss-Newton normal-equation solve for one level, CUDA-graphed when it can be.
+
+    Each CG iteration is ~60 small kernels on a few-MB volume, so on a GPU the solve is
+    bound by Python launching them, not by the arithmetic (a real 72x100x100 pair ran at
+    low GPU utilisation, and float64 was no slower than float32). Shapes are fixed within
+    a level, so one iteration -- matvec, step, residual update, new direction -- is
+    captured once and replayed; each Gauss-Newton step only copies its linearisation into
+    the operator's buffers. The convergence test reads one scalar per iteration, so the
+    iteration count and the result are exactly those of :func:`_cg_solve`.
+    """
+
+    def __init__(self, reg_terms, use_graph: bool):
+        self.reg_terms = reg_terms
+        self.use_graph = use_graph
+        self.op: _NormalOperator | None = None
+        self.graph = None
+
+    def solve(self, lin: _Linearization, b: Tensor, max_iter: int, tol: float) -> Tensor:
+        if not self.use_graph:
+            return _cg_solve(_NormalOperator(lin, self.reg_terms), b, max_iter, tol)
+        if self.graph is None or self.op is None:
+            self._capture(lin, b)
+        else:
+            self.op.load(lin)
+        graph = self.graph
+        assert graph is not None
+        dt = b.dtype
+        self.x.zero_()
+        self.r.copy_(b)
+        self.p.copy_(b)
+        self.rs.copy_(_dot64(b, b))
+        rs0 = float(self.rs)
+        if rs0 <= 0:
+            return torch.zeros_like(b)
+        for _ in range(max_iter):
+            graph.replay()
+            if float(self.rs_new) <= tol * tol * rs0:
+                break
+        return self.x.to(dt, copy=True)
+
+    def _iteration(self) -> None:
+        # One _cg_solve iteration on static buffers; p and rs are advanced unconditionally
+        # (harmless once converged: only x is returned).
+        assert self.op is not None
+        dt = self.x.dtype
+        Ap = self.op(self.p)
+        alpha = self.rs / _dot64(self.p, Ap).clamp_min(1e-30)
+        self.x.add_(alpha.to(dt) * self.p)
+        self.r.sub_(alpha.to(dt) * Ap)
+        self.rs_new.copy_(_dot64(self.r, self.r))
+        self.p.copy_(self.r + (self.rs_new / self.rs).to(dt) * self.p)
+        self.rs.copy_(self.rs_new)
+
+    def _capture(self, lin: _Linearization, b: Tensor) -> None:
+        self.op = _NormalOperator(lin, self.reg_terms, own_buffers=True)
+        self.x, self.r, self.p = (torch.zeros_like(b) for _ in range(3))
+        self.rs = torch.ones((), device=b.device, dtype=torch.float64)
+        self.rs_new = torch.ones_like(self.rs)
+        self.p.copy_(b)
+        side = torch.cuda.Stream(device=b.device)
+        # The side stream must not read buffers the default stream is still filling.
+        side.wait_stream(torch.cuda.current_stream(b.device))
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                self._iteration()
+        torch.cuda.current_stream(b.device).wait_stream(side)
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph):
+            self._iteration()
+
+    def close(self) -> None:
+        if self.graph is not None:
+            # A graph's private pool must not be released under queued replays.
+            torch.cuda.synchronize(self.x.device)
+            self.graph = None
+            self.op = None
 
 
 def _gn_direction_analytic(
@@ -1256,12 +1371,12 @@ def _gn_direction_analytic(
     cg_tol: float,
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
-    reg_terms: list[tuple[float, Tensor, Tensor, Tensor]] | None = None,
+    solver: _LevelCG | None = None,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
     The forward model is linearised once (:func:`_linearize`) and every CG matvec is
-    ``J^T (J v)`` via :func:`_normal_matvec_builder` (the fused form of :func:`_lin_jv` /
+    ``J^T (J v)`` via :class:`_NormalOperator` (the fused form of :func:`_lin_jv` /
     :func:`_lin_jtu`) — einsum + elementwise +
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
@@ -1274,12 +1389,10 @@ def _gn_direction_analytic(
         coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
     )
 
-    if reg_terms is None and lam_eff > 0:
-        reg_terms = reg_gram_terms(basis, reg_mode)
-    matvec = _normal_matvec_builder(lin, reg_terms)
-
+    if solver is None:
+        solver = _LevelCG(reg_gram_terms(basis, reg_mode) if lam_eff > 0 else None, False)
     g = _lin_jtu(lin, r0)  # J^T r
-    delta = _cg_solve(matvec, -g, cg_iters, cg_tol)
+    delta = solver.solve(lin, -g, cg_iters, cg_tol)
     return delta, cost
 
 
@@ -1315,6 +1428,7 @@ def gn_solve_level(
     reject_folds: bool = True,
     on_step: Callable[[Tensor, int, float], None] | None = None,
     min_update_vox: float = 0.0,
+    use_graph: bool = True,
 ) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1356,8 +1470,12 @@ def gn_solve_level(
             return 0.0
         return float(field_hz.reshape(-1)[mask_idx].abs().max()) * max_readout
 
-    # The penalty's coefficient-space Gram depends only on the basis: build it once a level.
-    reg_terms = reg_gram_terms(basis, reg_mode) if (analytic and lam > 0) else None
+    # The penalty's coefficient-space Gram depends only on the basis: build it once a level,
+    # along with the (possibly CUDA-graphed) normal-equation solver that uses it.
+    solver = None
+    if analytic:
+        reg_terms = reg_gram_terms(basis, reg_mode) if lam > 0 else None
+        solver = _LevelCG(reg_terms, use_graph and coeff.device.type == "cuda")
     field_start = basis.field(coeff)
     field_prev = field_start
     bar = _bar(
@@ -1392,7 +1510,7 @@ def gn_solve_level(
                 cg_tol,
                 barrier_eff,
                 jac_floor,
-                reg_terms,
+                solver,
             )
         else:
             delta, cost = _gn_direction(
@@ -1461,6 +1579,8 @@ def gn_solve_level(
         f"last step {last_update:.3f}  reg/data {report.reg_ratio:.3f}"
     )
     bar.close()
+    if solver is not None:
+        solver.close()
     return coeff, last_cost, report
 
 
@@ -1836,6 +1956,7 @@ def run_topup(
             reject_folds=config.reject_folds,
             on_step=on_step,
             min_update_vox=config.min_update_vox,
+            use_graph=config.cuda_graphs,
         )
         reports.append(report)
         if recorder is not None:
