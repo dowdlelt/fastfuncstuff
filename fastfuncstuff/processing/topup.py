@@ -114,6 +114,7 @@ def make_ladder(
     fwhm_ratio: float = 0.4,
     miter_start: int = 5,
     miter_final: int = 20,
+    miter_scale: int = 1,
 ) -> _Ladder:
     """Generate a coarse-to-fine schedule from a rule, rather than a tuned table.
 
@@ -147,7 +148,8 @@ def make_ladder(
 
     **Iteration count** ramps from ``miter_start`` to ``miter_final``. Coarse levels have
     few coefficients and converge in a handful of Gauss-Newton steps; fine levels have
-    many and are where the accuracy is actually won.
+    many and are where the accuracy is actually won. ``miter_scale`` multiplies the
+    rounded counts, so a tier can say "twice the standard iterations" exactly.
     """
     if n_levels < 2:
         raise ValueError(f"n_levels must be >= 2, got {n_levels}")
@@ -176,7 +178,8 @@ def make_ladder(
     lam = _geom(lam_start, lam_final, n_levels)
 
     miter = [
-        int(round(miter_start + (miter_final - miter_start) * (i / (n_levels - 1)) ** 2))
+        miter_scale
+        * int(round(miter_start + (miter_final - miter_start) * (i / (n_levels - 1)) ** 2))
         for i in range(n_levels)
     ]
     return _Ladder(warpres=warpres, fwhm=fwhm, lam=lam, miter=miter)
@@ -229,6 +232,17 @@ class TopupConfig:
 
     reg_mode: str = "bending"
     """Regularisation model: ``"bending"`` (energy of 2nd derivs) or ``"membrane"``."""
+
+    min_update_vox: float = 0.0
+    """End a level once an accepted step moves the field less than this (voxels of PE
+    displacement, worst case over the mask and scans). ``0`` (default) runs every level to
+    ``miter``. Off by default: small steps can still add up (on a phantom, stopping at
+    0.1 vox left the field 0.6 vox short of a full run), so a threshold needs real data.
+
+    The cost-based stop cannot see a stalled level: with ``ssqlambda`` each small data
+    gain relaxes the penalty a little, so the cost keeps creeping down by more than any
+    sane relative tolerance while the field has stopped moving. On a phantom, the 20 mm
+    level converged in 3 steps and then ran 25 more, each moving the field < 0.03 vox."""
 
     cg_iters: int = 50
     """Max conjugate-gradient iterations per Gauss-Newton step."""
@@ -1172,6 +1186,19 @@ def _gn_direction_analytic(
     return delta, cost
 
 
+@dataclass
+class LevelReport:
+    """How one level of :func:`gn_solve_level` went -- what the progress line shows."""
+
+    iters: int
+    stop: str  # "converged" | "miter" | "no descent" | "flat cost"
+    last_update_vox: float  # displacement moved by the final accepted step
+    shift_added_vox: float  # displacement change over the whole level
+    max_shift_vox: float  # largest displacement at the level's end
+    reg_ratio: float  # bending-energy cost / data cost at the level's end
+    cost: float
+
+
 def gn_solve_level(
     coeff: Tensor,
     basis: SplineFieldBasis,
@@ -1190,7 +1217,8 @@ def gn_solve_level(
     jac_floor: float = 0.1,
     reject_folds: bool = True,
     on_step: Callable[[Tensor, int, float], None] | None = None,
-) -> tuple[Tensor, float]:
+    min_update_vox: float = 0.0,
+) -> tuple[Tensor, float, LevelReport]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
     ``J^T J`` is applied matrix-free. With ``analytic`` (default) the forward model is
@@ -1203,7 +1231,9 @@ def gn_solve_level(
     barrier (weight relative to the data SSD, like ``lam``); ``reject_folds`` additionally
     vetoes any accepted step that introduces/worsens a negative Jacobian. ``on_step``
     is called with ``(coefficients, iteration, cost)`` after every accepted step.
-    Returns ``(coefficients, cost)``.
+    ``min_update_vox > 0`` ends the level once a step moves the displacement less than
+    that (see :attr:`TopupConfig.min_update_vox`).
+    Returns ``(coefficients, cost, report)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
     n_sm1 = max(1, len(scans) - 1)
@@ -1220,15 +1250,30 @@ def gn_solve_level(
         r = residual(c, 0.0, 0.0)  # data term only — never scaled by the barrier/reg
         return float(_dot64(r, r))
 
+    # Displacement is field * readout * sign, so the worst-case voxel move of a field
+    # change is its largest |value| in the mask times the largest |readout|.
+    max_readout = max(abs(sc.readout) for sc in scans)
+
+    def disp_vox(field_hz: Tensor) -> float:
+        if mask_idx.numel() == 0:
+            return 0.0
+        return float(field_hz.reshape(-1)[mask_idx].abs().max()) * max_readout
+
+    field_start = basis.field(coeff)
+    field_prev = field_start
     bar = _bar(
         total=max_iter,
         desc=desc,
-        leave=False,
+        leave=True,
         disable=not progress,
-        bar_format="  {desc} {bar} {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
+        bar_format="{desc} {bar:12} {n_fmt}/{total_fmt} [{elapsed}] {postfix}",
     )
     prev_cost = None
     last_cost = float("nan")
+    last_update = 0.0
+    stop = "miter"
+    iters = 0
+    lam_eff = lam
     for _it in range(max_iter):
         # ssq-scale both the smoothness (lam) and anti-fold (jac_penalty) weights by the
         # current data SSD so they are invariant to intensity scale and image size.
@@ -1278,18 +1323,45 @@ def gn_solve_level(
             step *= 0.5
         last_cost = new_cost if accepted else cost
         bar.update(1)
-        bar.set_postfix_str(
-            f"cost={last_cost:.3e} λ={lam_eff:.1e}{'' if accepted else ' (reject)'}"
-        )
         if not accepted:
+            stop = "no descent"
             break
+        iters += 1
+        field_now = basis.field(coeff)
+        last_update = disp_vox(field_now - field_prev)
+        field_prev = field_now
+        bar.set_postfix_str(
+            f"step {last_update:.3f} vox  max {disp_vox(field_now):.2f} vox  cost {last_cost:.3e}"
+        )
         if on_step is not None:
             on_step(coeff, _it, new_cost)
+        if min_update_vox > 0 and last_update < min_update_vox:
+            stop = "converged"
+            break
         if prev_cost is not None and abs(prev_cost - new_cost) < 1e-6 * prev_cost:
+            stop = "flat cost"
             break
         prev_cost = new_cost
+
+    field_end = basis.field(coeff)
+    data_end = data_ssd(coeff)
+    reg_rows = reg_residual(field_end, reg_mode) if lam > 0 else None
+    reg_end = lam_eff * float(_dot64(reg_rows, reg_rows)) if reg_rows is not None else 0.0
+    report = LevelReport(
+        iters=iters,
+        stop=stop,
+        last_update_vox=last_update,
+        shift_added_vox=disp_vox(field_end - field_start),
+        max_shift_vox=disp_vox(field_end),
+        reg_ratio=reg_end / data_end if data_end > 0 else float("nan"),
+        cost=last_cost,
+    )
+    bar.set_postfix_str(
+        f"{stop:<10}  +{report.shift_added_vox:.2f} -> {report.max_shift_vox:.2f} vox  "
+        f"last step {last_update:.3f}  reg/data {report.reg_ratio:.3f}"
+    )
     bar.close()
-    return coeff, last_cost
+    return coeff, last_cost, report
 
 
 # ----------------------------------------------------------------------------
@@ -1490,6 +1562,7 @@ class TopupResult:
     unwarped: list[Tensor]  # per-scan Jacobian-modulated undistorted images (native intensity)
     mean_unwarped: Tensor  # mean of the undistorted images
     motion_matrices: list[Tensor]  # per-scan composed rigid voxel matrix (identity if unused)
+    levels: list[LevelReport] = _dc_field(default_factory=list)  # one per schedule level
 
 
 def run_topup(
@@ -1606,13 +1679,12 @@ def run_topup(
         recorder.capture_identity(label="start")
 
     n_lev = config.n_levels()
-    level_bar = _bar(
-        total=n_lev,
-        desc="blipflip",
-        leave=True,
-        disable=not progress,
-        bar_format="{desc} |{bar}| {n_fmt}/{total_fmt} levels [{elapsed}<{remaining}] {postfix}",
-    )
+    reports: list[LevelReport] = []
+    if progress:
+        print(
+            "  one line per level: iterations [time] | why it stopped | displacement added -> "
+            "largest | last step | bending/data cost"
+        )
     coeff = None
     basis = None
     for lvl in range(n_lev):
@@ -1644,11 +1716,7 @@ def run_topup(
             recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
             on_step = _movie_step(recorder, basis, _movie_chains)
 
-        level_bar.set_postfix_str(
-            f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} "
-            f"grid={'x'.join(map(str, level_shape))} knots={'x'.join(map(str, basis.coeff_shape))}"
-        )
-        coeff, cost = gn_solve_level(
+        coeff, cost, report = gn_solve_level(
             coeff,
             basis,
             level_scans,
@@ -1660,13 +1728,16 @@ def run_topup(
             config.cg_iters,
             config.cg_tol,
             progress,
-            desc=f"L{lvl + 1}/{n_lev} {wr}mm",
+            desc=f"  L{lvl + 1:<2} {wr:>4g}mm fwhm {fwhm:>2g} λ {lam:.1e}"
+            + (f" ss {ss}" if ss > 1 else ""),
             analytic=config.analytic_gn,
             jac_penalty=config.jac_penalty,
             jac_floor=config.jac_floor,
             reject_folds=config.reject_folds,
             on_step=on_step,
+            min_update_vox=config.min_update_vox,
         )
+        reports.append(report)
         if recorder is not None:
             recorder.capture(
                 _movie_chains(basis.field(coeff)),
@@ -1674,10 +1745,6 @@ def run_topup(
                 pinned=True,
                 modulate=True,
             )
-        level_bar.update(1)
-        level_bar.set_postfix_str(
-            f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} cost={cost:.3e}"
-        )
 
         # Rigid movement update, block-coordinate with the field (topup --estmov). Run
         # after the level's field solve (movement estimated *with* the field at this
@@ -1695,7 +1762,6 @@ def run_topup(
             )
             if recorder is not None:
                 recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
-    level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
     assert basis is not None and coeff is not None
@@ -1738,6 +1804,7 @@ def run_topup(
         unwarped=unwarped,
         mean_unwarped=mean_unwarped,
         motion_matrices=motion_mats,
+        levels=reports,
     )
 
 

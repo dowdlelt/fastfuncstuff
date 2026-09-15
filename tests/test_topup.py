@@ -579,3 +579,38 @@ def test_declared_empty_positions_are_scored_as_zeros():
     assert blind[5:7] == [False, False]
     assert scored[5:7] == [True, True]
     assert scored[7] is False
+
+
+def test_level_stops_when_the_field_stops_moving():
+    # The displacement stop must end a level before miter and report why. Mechanism only:
+    # on this phantom the sub-0.1-vox steps it cuts still added up to ~0.6 vox, so how
+    # early to stop is a real-data question, not something to assert here.
+    _, _, scans = _make_synthetic()
+
+    def run(min_update):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[40, 40], subsamp=[1, 1]
+        )
+        cfg.min_update_vox = min_update
+        return T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False)
+
+    early, full = run(0.1), run(0.0)
+    assert [lv.stop for lv in early.levels] == ["converged", "converged"]
+    assert [lv.stop for lv in full.levels] == ["miter", "miter"]
+    assert all(lv.last_update_vox < 0.1 for lv in early.levels)
+
+
+def test_help_schedule_lines_round_trip_to_the_preset():
+    # The -help preset lines are meant to be pasted back on the command line.
+    import shlex
+
+    from fastfuncstuff.cli import blipflip as B
+
+    for name in B._PRESETS:
+        cfg = B._build_config(name)
+        argv = ["-config", name, "-pe_dir", "j", "-prefix", "x"]
+        argv += shlex.split(B._schedule_flags(cfg, "").replace("\n", " "))
+        args = B.create_parser().parse_args(argv)
+        assert args.warpres == cfg.warpres and args.fwhm == cfg.fwhm
+        assert args.miter == cfg.miter
+        assert all(math.isclose(a, b, rel_tol=0.01) for a, b in zip(args.lam, cfg.lam, strict=True))
