@@ -307,6 +307,25 @@ class TestGLMEdgeCases:
         # Results should be finite (no NaN/Inf)
         assert torch.all(torch.isfinite(results.betas))
 
+    def test_glm_rank_deficient_min_norm_betas(self, device):
+        """Exactly collinear columns give the minimum-norm betas, not a blow-up.
+
+        Two conditions locked at a fixed onset gap make their FIR lags exact
+        duplicates. The singular path used lstsq, whose only CUDA driver
+        (gels) assumes full rank and returned |beta| ~1e6 for every column.
+        """
+        torch.manual_seed(0)
+        n_timepoints, n_voxels = 505, 8
+        base = torch.randn(n_timepoints, 20, device=device)
+        X = torch.cat([base, base[:, :9]], dim=1)  # rank 20 / 29
+        data = (X[:, :20] @ torch.randn(20, n_voxels) + 0.5 * torch.randn(n_timepoints, n_voxels)).T
+
+        with pytest.warns(RuntimeWarning, match="rank 20 / 29"):
+            results = fit_glm(data, X, tr=1.0, max_poly_degree=-1, verbose=False, device=device)
+
+        expected = (torch.linalg.pinv(X.double()) @ data.double().T).T
+        assert torch.allclose(results.betas.double(), expected, atol=1e-4)
+
     def test_glm_zero_variance_data(self, device):
         """Test GLM with zero-variance data (constant signal)."""
         n_timepoints = 100
