@@ -994,11 +994,12 @@ def _dot64(a: Tensor, b: Tensor) -> Tensor:
     return (a * b).sum(dtype=torch.float64)
 
 
-def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> Tensor:
+def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> tuple[Tensor, int]:
     """Conjugate gradient for the SPD system ``matvec(x) = b`` (matrix-free).
 
     Vectors stay in ``b``'s dtype (float32 hot path); the scalar inner products
     accumulate in float64 (:func:`_dot64`) so the recurrence stays stable.
+    Returns ``(x, iterations)``.
     """
     dt = b.dtype
     x = torch.zeros_like(b)
@@ -1007,18 +1008,18 @@ def _cg_solve(matvec, b: Tensor, max_iter: int, tol: float) -> Tensor:
     rs = _dot64(r, r)
     rs0 = rs
     if rs0 <= 0:
-        return x
-    for _ in range(max_iter):
+        return x, 0
+    for it in range(max_iter):
         Ap = matvec(p)
         alpha = rs / _dot64(p, Ap).clamp_min(1e-30)
         x = x + alpha.to(dt) * p
         r = r - alpha.to(dt) * Ap
         rs_new = _dot64(r, r)
         if rs_new <= tol * tol * rs0:
-            break
+            return x, it + 1
         p = r + (rs_new / rs).to(dt) * p
         rs = rs_new
-    return x
+    return x, max_iter
 
 
 def _gn_direction(coeff, residual, lam_eff, cg_iters, cg_tol):
@@ -1048,7 +1049,7 @@ def _gn_direction(coeff, residual, lam_eff, cg_iters, cg_tol):
         return vjp(jv).reshape(-1) + 1e-8 * v
 
     g = vjp(r0.detach()).reshape(-1)  # J^T r
-    delta = _cg_solve(matvec, -g, cg_iters, cg_tol)
+    delta, _ = _cg_solve(matvec, -g, cg_iters, cg_tol)
     return delta, cost
 
 
@@ -1418,6 +1419,12 @@ class _LevelCG:
     captured once and replayed; each Gauss-Newton step only copies its linearisation into
     the operator's buffers. The convergence test reads one scalar per iteration, so the
     iteration count and the result are exactly those of :func:`_cg_solve`.
+
+    A Jacobi (diagonal) preconditioner was tried and removed: on a real pair CG still hit
+    the 50-iteration cap at every level, ran slower, and moved the warp by brain p99 4.4 mm.
+    The bending penalty leaves affine field components and off-mask coefficients nearly
+    free, so the cap is doing regularisation, and the diagonal speeds up exactly those
+    weak directions.
     """
 
     def __init__(self, reg_terms, use_graph: bool):
@@ -1425,10 +1432,15 @@ class _LevelCG:
         self.use_graph = use_graph
         self.op: _NormalOperator | None = None
         self.graph = None
+        self.iters = 0
+        self.solves = 0
 
     def solve(self, lin: _Linearization, b: Tensor, max_iter: int, tol: float) -> Tensor:
+        self.solves += 1
         if not self.use_graph:
-            return _cg_solve(_NormalOperator(lin, self.reg_terms), b, max_iter, tol)
+            x, n = _cg_solve(_NormalOperator(lin, self.reg_terms), b, max_iter, tol)
+            self.iters += n
+            return x
         if self.graph is None or self.op is None:
             self._capture(lin, b)
         else:
@@ -1443,10 +1455,13 @@ class _LevelCG:
         rs0 = float(self.rs)
         if rs0 <= 0:
             return torch.zeros_like(b)
-        for _ in range(max_iter):
+        for it in range(max_iter):
             graph.replay()
             if float(self.rs_new) <= tol * tol * rs0:
+                self.iters += it + 1
                 break
+        else:
+            self.iters += max_iter
         return self.x.to(dt, copy=True)
 
     def _iteration(self) -> None:
@@ -1528,6 +1543,7 @@ class LevelReport:
     max_shift_vox: float  # largest displacement at the level's end
     reg_ratio: float  # bending-energy cost / data cost at the level's end
     cost: float
+    cg_iters_mean: float = float("nan")  # CG iterations per Gauss-Newton step
 
 
 def gn_solve_level(
@@ -1704,10 +1720,12 @@ def gn_solve_level(
         max_shift_vox=disp_vox(field_end),
         reg_ratio=reg_end / data_end if data_end > 0 else float("nan"),
         cost=last_cost,
+        cg_iters_mean=solver.iters / solver.solves if solver and solver.solves else float("nan"),
     )
     bar.set_postfix_str(
         f"{stop:<10}  +{report.shift_added_vox:.2f} -> {report.max_shift_vox:.2f} vox  "
-        f"last step {last_update:.3f}  reg/data {report.reg_ratio:.3f}"
+        f"last step {last_update:.3f}  reg/data {report.reg_ratio:.3f}  "
+        f"cg {report.cg_iters_mean:.0f}/{cg_iters}"
     )
     bar.close()
     if solver is not None:
@@ -2035,7 +2053,7 @@ def run_topup(
     if progress:
         print(
             "  one line per level: iterations [time] | why it stopped | displacement added -> "
-            "largest | last step | bending/data cost"
+            "largest | last step | bending/data cost | CG iterations per step / cap"
         )
     coeff = None
     basis = None
