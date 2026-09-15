@@ -20,7 +20,14 @@ from tqdm.auto import tqdm
 from fastfuncstuff.design.builder import legendre_polynomials
 from fastfuncstuff.design.matrices import build_task_design
 from fastfuncstuff.memory import bytes_per_voxel_glm, estimate_chunk_size, make_vram_debugger
-from fastfuncstuff.utils import cpu_if_mps, get_device, linalg_device, linalg_lstsq, to_tensor
+from fastfuncstuff.utils import (
+    cpu_if_mps,
+    get_device,
+    linalg_device,
+    linalg_lstsq,
+    to_factor_f64,
+    to_tensor,
+)
 
 from .xval import cod_from_ss_residual
 
@@ -224,6 +231,35 @@ def design_cholesky(design: torch.Tensor) -> torch.Tensor | None:
         return None
 
 
+@torch.inference_mode()
+def design_pinv(design: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Rank-truncated ``(X⁺, (X'X)⁺, rank)`` for a rank-deficient design.
+
+    The companion to :func:`fit_glm_chunk`'s ``pinv_design`` argument, for when
+    :func:`design_cholesky` fails. CUDA's ``lstsq`` has only the ``gels`` driver,
+    an unpivoted QR that assumes full rank: on a design with exactly collinear
+    columns (FIR/TENT lags of two conditions locked at a fixed onset gap) it
+    amplifies float32 rounding in the null space by ~1e6, and back-substitution
+    carries the blow-up into every earlier column's betas.
+
+    The SVD runs once in float64 on :func:`factor_device` (the CPU on consumer
+    cards, where it is fast); the projector is cast back so each voxel chunk
+    only pays a float32 matmul. The truncation tolerance uses the *design's*
+    dtype -- a float32 design only carries float32 precision, so its "exact"
+    duplicates differ at ~1e-7 and a float64 tolerance would keep them.
+    """
+    X = to_factor_f64(design)
+    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
+    tol = max(X.shape) * torch.finfo(design.dtype).eps * S[0]
+    rank = int((S > tol).sum().item())
+    V = Vh[:rank].T
+    s = S[:rank]
+    pinv_x = (V / s) @ U[:, :rank].T
+    xtx_pinv = (V / s**2) @ V.T
+    out = {"device": design.device, "dtype": design.dtype}
+    return pinv_x.to(**out), xtx_pinv.to(**out), rank
+
+
 def ols_betas(
     design: torch.Tensor, data: torch.Tensor, cholesky_L: torch.Tensor | None = None
 ) -> torch.Tensor:
@@ -247,6 +283,7 @@ def fit_glm_chunk(
     want_residuals: bool = False,
     want_predicted: bool = False,
     cholesky_L: torch.Tensor | None = None,
+    pinv_design: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -272,6 +309,10 @@ def fit_glm_chunk(
         When provided, uses ``cholesky_solve`` which is ~30× faster than
         ``lstsq`` on CUDA because the expensive factorization is done once
         outside the voxel loop.  If None, falls back to ``lstsq``.
+    pinv_design : torch.Tensor, optional
+        (n_regressors, n_timepoints) rank-truncated pseudo-inverse from
+        :func:`design_pinv`, for a rank-deficient design.  Gives the
+        minimum-norm betas; ``lstsq`` on CUDA does not.
 
     Returns
     -------
@@ -297,6 +338,8 @@ def fit_glm_chunk(
         # Compute xty on ld directly to avoid an extra MPS→CPU transfer when ld=cpu.
         xty = design.to(ld).T @ data.to(ld).T  # (n_regressors, n_voxels)
         betas = torch.cholesky_solve(xty, cholesky_L.to(ld)).to(device).T
+    elif pinv_design is not None:
+        betas = data @ pinv_design.T
     else:
         try:
             betas = linalg_lstsq(design.to(ld), data.T.to(ld)).solution.T.to(device)
@@ -689,6 +732,7 @@ def fit_glm(
         inspect_design(design_concat, near_zero_eps=1e-10)
 
     L = None
+    pinv_design = None
     try:
         L = torch.linalg.cholesky(xtx_ld)
         xtx_inv = torch.cholesky_inverse(L).to(design_concat.device)
@@ -711,8 +755,7 @@ def fit_glm(
             # fit complete (with a least-norm solution) rather than
             # crashing; we surface the rank deficit so the analyst
             # knows the design is degenerate.
-            xtx_f64 = xtx_ld.to(torch.float64)
-            rank = int(torch.linalg.matrix_rank(xtx_f64).item())
+            pinv_design, xtx_inv, rank = design_pinv(design_concat)
             n_reg = xtx_ld.shape[0]
             # Always print the design inspection on a singular path —
             # the user needs to see WHICH columns are degenerate, not
@@ -736,7 +779,6 @@ def fit_glm(
                 RuntimeWarning,
                 stacklevel=2,
             )
-            xtx_inv = torch.linalg.pinv(xtx_f64).to(xtx_ld.dtype).to(design_concat.device)
 
     # Determine which columns are "task" vs "nuisance"
     # If task_indices provided (from AFNI StimBots/StimTops), use those
@@ -867,7 +909,12 @@ def fit_glm(
 
         # Fit this chunk using pre-factored Cholesky (avoids re-factorizing design per chunk)
         betas_dev, r2_dev, ss_residual_dev, residuals_dev, predicted_dev = fit_glm_chunk(
-            chunk_data, design_concat, want_residuals, want_predicted, cholesky_L=L
+            chunk_data,
+            design_concat,
+            want_residuals,
+            want_predicted,
+            cholesky_L=L,
+            pinv_design=pinv_design,
         )
 
         # Extract only task regressors (ignore nuisance)
