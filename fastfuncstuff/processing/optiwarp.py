@@ -66,6 +66,8 @@ from torch import Tensor
 from fastfuncstuff.memory import plan_nonlinear_memory
 
 if TYPE_CHECKING:
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
+
     from .warp import QwarpConfig
 
 try:
@@ -438,8 +440,37 @@ def _resize_flow_field(fwd: Field, target: tuple[int, int, int], cfg: OptiwarpCo
     resized = _resize_field(*fwd, target)
     if cfg.fold_guard <= 0:
         return resized
-    # Positive determinants at coarse nodes do not guarantee positivity between
-    # them. Backtrack the interpolated displacement toward identity if necessary.
+
+    def _legal(j: Tensor) -> bool:
+        return bool(torch.isfinite(j).all()) and float(j.min()) >= cfg.jac_floor
+
+    # Positive determinants at coarse nodes do not guarantee positivity between them,
+    # and a level's best field sits right at the floor. What goes negative on the
+    # finer grid is local detail, so repair it locally: blend toward a smoothed copy
+    # only around the offending voxels. Two things this is deliberately not:
+    #  - Halving the whole field. That was the only repair, and one voxel at -0.08
+    #    threw away half of a level's warp everywhere (seen as a jump back toward the
+    #    start in the -movie at every level boundary).
+    #  - Shrinking displacement locally, as the step guard does. Steps are ~1 voxel,
+    #    but an accumulated field is several, and the damping mask's edge times that
+    #    magnitude is itself a new fold. Smoothing changes the field by its local
+    #    detail only, so the blend edge stays small.
+    jac = jacobian_determinant(*resized)
+    if _legal(jac):
+        return resized
+    for rnd in range(8):
+        blend = _fold_damping_mask(jac, cfg.jac_floor, 1.0)
+        smooth = _smooth_field(resized[0], resized[1], resized[2], 1.0)
+        resized = tuple(c + blend * (s - c) for c, s in zip(resized, smooth, strict=True))  # type: ignore[assignment]
+        jac = jacobian_determinant(*resized)
+        if _legal(jac):
+            if cfg.verb >= 1:
+                print(
+                    f"optiwarp: smoothed transferred displacement locally ({rnd + 1} rounds) for topology"
+                )
+            return resized
+
+    # Last resort: backtrack the whole displacement toward identity.
     for attempt in range(17):
         jac = jacobian_determinant(*resized)
         if bool(torch.isfinite(jac).all()) and float(jac.min()) >= cfg.jac_floor:
@@ -640,6 +671,7 @@ def _optiflow_level(
     cfg: OptiwarpConfig,
     level_tag: str = "",
     guard: tuple[Tensor, ...] | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> tuple[Field, float, LevelStats]:
     """Run up to ``n_iter`` optical-flow updates at one resolution.
 
@@ -715,6 +747,10 @@ def _optiflow_level(
                     )
                 )
             costs.append(cost_val)
+            if recorder is not None and recorder.tick():
+                recorder.capture_displacement(
+                    fwd, label=f"{level_tag}  it {len(costs) - 1}  cost {cost_val:.5f}"
+                )
             # The legality of `fwd` was established when it was built, at the end of
             # the previous iteration, so no determinant is recomputed here.
             legal = not cfg.fold_aware_best or float(jac.min()) >= cfg.jac_floor
@@ -829,6 +865,7 @@ def optiwarp(
     moving_cover: Tensor | None = None,
     config: OptiwarpConfig | None = None,
     device: torch.device | None = None,
+    recorder: WarpMovieRecorder | None = None,
 ) -> OptiwarpResult:
     """Register ``moving`` to ``fixed`` by multiresolution 3-D optical flow.
 
@@ -848,6 +885,9 @@ def optiwarp(
             since ``-match gradmag`` is built out of edges.
         config: :class:`OptiwarpConfig`. Uses defaults if None.
         device: Torch device. Inferred from ``fixed`` if None.
+        recorder: Optional :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder`
+            on the full grid. Captures the source through the running field during
+            each level, plus each level's returned (best) field as a pinned frame.
 
     Returns:
         :class:`OptiwarpResult` with the moving->fixed warp, its inverse, the warped
@@ -943,9 +983,26 @@ def optiwarp(
             guard = _void_guard_field(_resize_volume(cover.float(), target))
 
         fwd, best_cost, stats = _optiflow_level(
-            f_prep, m_prep, w_lvl, fwd, n_iter, cfg, level_tag=f"L{lev + 1}", guard=guard
+            f_prep,
+            m_prep,
+            w_lvl,
+            fwd,
+            n_iter,
+            cfg,
+            level_tag=f"L{lev + 1}/{n_levels} shrink {factor}",
+            guard=guard,
+            recorder=recorder,
         )
         level_stats.append(stats)
+        if recorder is not None:
+            # The level returns its best iterate, not its last; pin that so the movie
+            # shows the jump back rather than implying the wander was kept.
+            recorder.capture_displacement(
+                fwd,
+                label=f"L{lev + 1}/{n_levels} shrink {factor}  best @ it {stats.best_iter}"
+                f"  cost {best_cost:.5f}",
+                pinned=True,
+            )
 
     fwd = _resize_flow_field(fwd, full_shape, cfg)
 

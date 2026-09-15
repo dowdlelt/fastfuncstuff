@@ -45,14 +45,19 @@ only motion modelled is an optional single global translation along PE
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from dataclasses import field as _dc_field
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
 
 from .cost import _separable_smooth_3d
+
+if TYPE_CHECKING:
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
 
 try:
     from tqdm import tqdm as _tqdm
@@ -530,15 +535,179 @@ def forward_scans(
     return modulated, mean
 
 
-def compute_mask(scans: list[ScanSpec]) -> Tensor:
+def _edge_zero_planes(v: Tensor) -> tuple[int, int]:
+    """Count all-zero planes at the start and end of dim 0 (the PE axis, moved first).
+
+    Some reversed-PE reconstructions leave one exactly-empty line at the PE edge. It is
+    not signal, and a slab moved with it in tow drags an empty plane into the middle of
+    the image, so the wrap logic works on the planes between these runs.
+    """
+    has_data = (v.reshape(v.shape[0], -1) != 0).any(dim=1)
+    idx = torch.nonzero(has_data).flatten()
+    if idx.numel() == 0:
+        return v.shape[0], 0
+    return int(idx[0]), v.shape[0] - 1 - int(idx[-1])
+
+
+def wrap_pad_pe(vol: Tensor, tdims: list[int], n: int) -> Tensor:
+    """Pad ``vol`` by ``n`` voxels at both ends of each tensor dim in ``tdims``, wrapping.
+
+    The front gets the last ``n`` slices of data and the back the first ``n``. EPI's
+    phase-encode axis is periodic in the acquisition: signal displaced past one edge of
+    the FOV aliases in at the other. A zero or clamped edge gives the field no way to
+    express that, so the solver matches the wrapped tissue as if it belonged where it
+    landed -- pulling the opposite end of the brain the wrong way. Padding with the
+    wrapped slices puts the aliased signal back where the model can pull it from.
+
+    All-zero planes at an edge (see :func:`_edge_zero_planes`) are not data: the wrapped
+    slices are taken from, and placed against, the planes that hold signal, and the
+    empty planes end up at the outer edge. The volume keeps its own voxels at
+    ``n..n+size-1``, so the crop back is unchanged.
+    """
+    if n <= 0:
+        return vol
+    for d in tdims:
+        size = vol.shape[d]
+        v = vol.movedim(d, 0)
+        z_lo, z_hi = _edge_zero_planes(v)
+        real = v[z_lo : size - z_hi]
+        if n >= real.shape[0]:
+            raise ValueError(
+                f"wrap padding {n} must be smaller than the PE data extent {real.shape[0]}"
+            )
+        out = torch.zeros((size + 2 * n, *v.shape[1:]), dtype=vol.dtype, device=vol.device)
+        out[n + z_lo : n + size - z_hi] = real
+        out[z_lo : n + z_lo] = real[-n:]
+        out[n + size - z_hi : 2 * n + size - z_hi] = real[:n]
+        vol = out.movedim(0, d)
+    return vol.contiguous()
+
+
+def unwrap_pe(vol: Tensor, tdim: int, shift: int, front: int, back: int) -> Tensor:
+    """Move a scan's aliased edge slab to where it belongs, on a grid padded for all scans.
+
+    The output is ``front + n + back`` long on ``tdim``, the scan's original voxels at
+    ``front..front+n-1`` -- except the wrapped slab:
+
+    - ``shift < 0``: the first ``|shift|`` slices belong past the high-index edge; they
+      move there and their original place is zero.
+    - ``shift > 0``: the last ``shift`` slices belong before the low-index edge; they
+      move there and their original place is zero.
+
+    "First" and "last" count planes that hold data: all-zero edge planes (see
+    :func:`_edge_zero_planes`) are skipped, and the slab lands directly against the
+    data at the far end, so no empty plane is carried into the image. Everything else
+    is zero, so scans with different (or no) shifts share one grid. Unlike
+    :func:`wrap_pad_pe` this states which scan wrapped and by how much, rather than
+    offering every scan the other end's slices.
+    """
+    n = vol.shape[tdim]
+    if shift > front or -shift > back:
+        raise ValueError("front/back padding must cover the shift")
+    v = vol.movedim(tdim, 0)
+    out = torch.zeros((front + n + back, *v.shape[1:]), dtype=vol.dtype, device=vol.device)
+    if shift == 0:
+        out[front : front + n] = v
+        return out.movedim(0, tdim).contiguous()
+    z_lo, z_hi = _edge_zero_planes(v)
+    real = v[z_lo : n - z_hi]
+    k = abs(shift)
+    if k >= real.shape[0]:
+        raise ValueError(
+            f"unwrap shift {shift} must be smaller than the PE data extent {real.shape[0]}"
+        )
+    start, stop = front + z_lo, front + n - z_hi  # where the data sits
+    if shift < 0:
+        out[start + k : stop] = real[k:]
+        out[stop : stop + k] = real[:k]
+    else:
+        out[start : stop - k] = real[:-k]
+        out[start - k : start] = real[-k:]
+    return out.movedim(0, tdim).contiguous()
+
+
+def _declared_empty_pe(
+    n: int, z_lo: int, z_hi: int, shift: int, front: int, back: int, device
+) -> Tensor:
+    """Which PE positions of an :func:`unwrap_pe` output the unwrap declared empty.
+
+    True where the grid holds neither the scan's data nor one of its own all-zero edge
+    planes: the slab's vacated place and the zero padding added for other scans. Those
+    zeros are a statement ("nothing belongs here"), unlike a recon's empty line, which
+    is simply unmeasured.
+    """
+    empty = torch.ones(front + n + back, dtype=torch.bool, device=device)
+    if shift == 0:
+        empty[front : front + n] = False
+        return empty
+    empty[front : front + z_lo] = False  # the scan's own empty planes stay unmeasured
+    empty[front + n - z_hi : front + n] = False
+    k = abs(shift)
+    start, stop = front + z_lo, front + n - z_hi
+    if shift < 0:
+        empty[start + k : stop + k] = False
+    else:
+        empty[start - k : stop - k] = False
+    return empty
+
+
+def pad_scans_pe(
+    scans: Sequence[ScanSpec], wrap_pad: int = 0, unwrap: Sequence[int] | None = None
+) -> tuple[list[Tensor], list[int], int, list[Tensor] | None]:
+    """Apply ``wrap_pad`` or per-scan ``unwrap`` to every scan's data.
+
+    Returns ``(padded data per scan, padded tensor dims, voxels added before index 0,
+    declared-empty PE positions per scan)``. The last is a 1-D bool along the PE axis
+    for ``unwrap`` (see :func:`_declared_empty_pe`) and None otherwise.
+    The single definition of the padded grid: :func:`run_topup` estimates on it and
+    ``ffs_blipflip -save_pad_phase`` writes it, so the two cannot drift apart.
+    """
+    tdims = sorted({_NIFTI_AXIS_TO_TDIM[sc.pe_axis] for sc in scans})
+    if unwrap is not None:
+        if wrap_pad > 0:
+            raise ValueError("wrap_pad and unwrap are alternatives; pass one")
+        if len(unwrap) != len(scans):
+            raise ValueError(f"unwrap needs one shift per scan ({len(scans)}), got {len(unwrap)}")
+        if len(tdims) != 1:
+            raise ValueError("unwrap needs every scan to share one phase-encode axis")
+        front = max([0, *unwrap])
+        back = max([0, *(-k for k in unwrap)])
+        data, empty = [], []
+        for sc, k in zip(scans, unwrap, strict=True):
+            data.append(unwrap_pe(sc.data, tdims[0], k, front, back))
+            z_lo, z_hi = _edge_zero_planes(sc.data.movedim(tdims[0], 0))
+            n = sc.data.shape[tdims[0]]
+            empty.append(_declared_empty_pe(n, z_lo, z_hi, k, front, back, sc.data.device))
+        return data, tdims, front, empty
+    if wrap_pad > 0:
+        return [wrap_pad_pe(sc.data, tdims, wrap_pad) for sc in scans], tdims, wrap_pad, None
+    return [sc.data for sc in scans], [], 0, None
+
+
+def compute_mask(
+    scans: list[ScanSpec],
+    declared_empty: Sequence[Tensor] | None = None,
+    pe_tdim: int = 1,
+) -> Tensor:
     """Intersection mask of finite/positive data, with PE-axis edge planes zeroed.
 
     Mirrors topup's trick of excluding a one-voxel frame in the non-PE and PE
     directions so small edge effects don't dominate the SSD.
+
+    ``declared_empty`` (one 1-D bool along ``pe_tdim`` per scan) marks positions an
+    unwrap emptied on purpose. They count as measured zeros rather than missing data:
+    left out of the cost, they are a blind zone the field can push mismatched tissue
+    into at no cost -- on a reported pair the vacated anterior slab had the cost active
+    on 9.5% of voxels, and the fine levels squashed frontal tissue into it.
     """
     m = torch.ones_like(scans[0].data, dtype=torch.bool)
-    for sc in scans:
-        m &= torch.isfinite(sc.data) & (sc.data > (sc.data.mean() * 1e-3))
+    for i, sc in enumerate(scans):
+        ok = torch.isfinite(sc.data) & (sc.data > (sc.data.mean() * 1e-3))
+        if declared_empty is not None:
+            view = [1, 1, 1]
+            view[pe_tdim] = -1
+            ok |= declared_empty[i].view(view)
+        m &= ok
     # Zero the outer plane on every axis (cheap, symmetric version of topup's frame).
     m[0, :, :] = False
     m[-1, :, :] = False
@@ -1020,6 +1189,7 @@ def gn_solve_level(
     jac_penalty: float = 0.0,
     jac_floor: float = 0.1,
     reject_folds: bool = True,
+    on_step: Callable[[Tensor, int, float], None] | None = None,
 ) -> tuple[Tensor, float]:
     """Gauss-Newton least-squares minimisation of the topup cost at one level.
 
@@ -1031,8 +1201,9 @@ def gn_solve_level(
     operator and are kept in sync by ``tests/test_topup.py``. A backtracking,
     step-rejecting line search guards every step. ``jac_penalty > 0`` adds the anti-fold
     barrier (weight relative to the data SSD, like ``lam``); ``reject_folds`` additionally
-    vetoes any accepted step that introduces/worsens a negative Jacobian. Returns
-    ``(coefficients, cost)``.
+    vetoes any accepted step that introduces/worsens a negative Jacobian. ``on_step``
+    is called with ``(coefficients, iteration, cost)`` after every accepted step.
+    Returns ``(coefficients, cost)``.
     """
     mask_idx = torch.nonzero(mask.reshape(-1), as_tuple=False).squeeze(-1)
     n_sm1 = max(1, len(scans) - 1)
@@ -1112,6 +1283,8 @@ def gn_solve_level(
         )
         if not accepted:
             break
+        if on_step is not None:
+            on_step(coeff, _it, new_cost)
         if prev_cost is not None and abs(prev_cost - new_cost) < 1e-6 * prev_cost:
             break
         prev_cost = new_cost
@@ -1330,6 +1503,10 @@ def run_topup(
     estimate_motion: bool = False,
     motion_ref: int = 0,
     motion_interp: str = "cubic",
+    recorder: WarpMovieRecorder | None = None,
+    wrap_pad: int = 0,
+    unwrap: Sequence[int] | None = None,
+    empty_as_zero: bool = True,
 ) -> TopupResult:
     """Estimate the off-resonance field from opposing-PE scans.
 
@@ -1346,6 +1523,19 @@ def run_topup(
     cost here, because the numerically sensitive reductions (cost, CG inner products)
     accumulate in float64 regardless (see :func:`_dot64`); the smooth Hz field itself has
     plenty of headroom in float32. Pass ``torch.float64`` to reproduce the old behaviour.
+
+    ``wrap_pad`` pads every scan by that many voxels at both ends of each PE axis with
+    slices wrapped from the opposite end (see :func:`wrap_pad_pe`), estimates on the
+    padded grid, and crops ``field_hz``/``unwarped``/``mean_unwarped`` back. ``coeff``
+    and ``basis`` stay on the padded grid. ``unwrap`` is the per-scan alternative: one
+    signed slice count per scan, telling each scan where its aliased edge belongs (see
+    :func:`unwrap_pe`); every scan shares one PE axis. The crop is the same. With
+    ``empty_as_zero`` the positions an unwrap empties are scored as zeros, not skipped
+    (see :func:`compute_mask`).
+
+    ``recorder`` (a :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` with one
+    row per scan) captures every scan undistorted by the running field after each
+    accepted Gauss-Newton step, with each level's result pinned.
     """
     config.validate()
     shape = tuple(scans[0].data.shape)  # type: ignore[assignment]
@@ -1371,6 +1561,18 @@ def run_topup(
             )
         )
 
+    orig_shape = shape
+    padded, pad_tdims, front, declared_empty = pad_scans_pe(work, wrap_pad, unwrap)
+    if not empty_as_zero:
+        declared_empty = None
+    for sc, data in zip(work, padded, strict=True):
+        sc.data = data
+    shape = tuple(work[0].data.shape)  # type: ignore[assignment]
+    crop = tuple(
+        slice(front, front + n) if d in pad_tdims else slice(None) for d, n in enumerate(orig_shape)
+    )
+    offset = tuple(float(front) if d in pad_tdims else 0.0 for d in range(3))
+
     shift = 0.0
     if pe_shift:
         shift = estimate_pe_shift(work)
@@ -1385,6 +1587,23 @@ def run_topup(
         estmov = config.estmov if config.estmov is not None else _default_estmov(config.warpres)
     else:
         estmov = [False] * config.n_levels()  # off, or no second scan to move against
+
+    def _movie_chains(field_hz: Tensor) -> list[list[tuple[Tensor, Tensor, Tensor]]]:
+        # Each scan moves along its own PE axis by field * readout * sign voxels.
+        chains = []
+        for sc in work:
+            disp = (field_hz * (sc.readout * sc.sign)).float()
+            comps = [torch.zeros_like(disp)] * 3  # x, y, z displacement slots
+            comps[2 - _NIFTI_AXIS_TO_TDIM[sc.pe_axis]] = disp
+            chains.append([(comps[0], comps[1], comps[2])])
+        return chains
+
+    if recorder is not None:
+        from fastfuncstuff.viz.warp_movie import FieldFrame
+
+        recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
+        recorder.set_frame(FieldFrame(offset=offset, full_shape=shape, mapping="stride"))
+        recorder.capture_identity(label="start")
 
     n_lev = config.n_levels()
     level_bar = _bar(
@@ -1418,7 +1637,13 @@ def run_topup(
             coeff = refit_coeff(prev_field, new_basis)
         basis = new_basis
 
-        mask = compute_mask(level_scans)
+        level_empty = None if declared_empty is None else [e[::ss] for e in declared_empty]
+        mask = compute_mask(level_scans, level_empty, pad_tdims[0] if pad_tdims else 1)
+        on_step = None
+        if recorder is not None:
+            recorder.set_context(f"L{lvl + 1}/{n_lev} {wr}mm")
+            on_step = _movie_step(recorder, basis, _movie_chains)
+
         level_bar.set_postfix_str(
             f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} "
             f"grid={'x'.join(map(str, level_shape))} knots={'x'.join(map(str, basis.coeff_shape))}"
@@ -1440,7 +1665,15 @@ def run_topup(
             jac_penalty=config.jac_penalty,
             jac_floor=config.jac_floor,
             reject_folds=config.reject_folds,
+            on_step=on_step,
         )
+        if recorder is not None:
+            recorder.capture(
+                _movie_chains(basis.field(coeff)),
+                label=f"done  cost {cost:.3e}",
+                pinned=True,
+                modulate=True,
+            )
         level_bar.update(1)
         level_bar.set_postfix_str(
             f"warpres={wr}mm fwhm={fwhm}mm ss={ss} λ={lam:.1e} cost={cost:.3e}"
@@ -1460,6 +1693,8 @@ def run_topup(
                 interp=motion_interp,
                 verbose=progress,
             )
+            if recorder is not None:
+                recorder.set_images([sc.data for sc in work], offset=offset)  # type: ignore[arg-type]
     level_bar.close()
 
     # Expand the final field back to the full (un-subsampled) grid.
@@ -1473,6 +1708,14 @@ def run_topup(
         # field so warp, field map and unwarped stay mutually consistent (the coeff
         # in the result is still the raw fit).
         field_hz = taper_field_to_object(field_hz, work, voxel_sizes)
+        if recorder is not None:
+            recorder.set_context("")
+            recorder.capture(
+                _movie_chains(field_hz),
+                label="final field, tapered to the object",
+                pinned=True,
+                modulate=True,
+            )
         field_s = field_hz.to(solve_dtype)
         unwarped = []
         for sc, s in zip(work, scales, strict=True):
@@ -1484,6 +1727,8 @@ def run_topup(
         # Jacobian-modulated undistorted images, un-scaled back to native intensity.
         modulated, _ = forward_scans(full_coeff, full_basis, work)
         unwarped = [(m / s).to(dtype) for m, s in zip(modulated, scales, strict=True)]
+    field_hz = field_hz[crop]
+    unwarped = [u[crop] for u in unwarped]
     mean_unwarped = torch.stack(unwarped, dim=0).mean(dim=0)
     return TopupResult(
         field_hz=field_hz,
@@ -1494,6 +1739,22 @@ def run_topup(
         mean_unwarped=mean_unwarped,
         motion_matrices=motion_mats,
     )
+
+
+def _movie_step(
+    recorder: WarpMovieRecorder,
+    basis: SplineFieldBasis,
+    chains: Callable[[Tensor], list[list[tuple[Tensor, Tensor, Tensor]]]],
+) -> Callable[[Tensor, int, float], None]:
+    """A Gauss-Newton ``on_step`` that records the scans through this level's field."""
+
+    def on_step(coeff: Tensor, it: int, cost: float) -> None:
+        if recorder.tick():
+            recorder.capture(
+                chains(basis.field(coeff)), label=f"it {it}  cost {cost:.3e}", modulate=True
+            )
+
+    return on_step
 
 
 def _resize_field(field: Tensor, out_shape: tuple[int, int, int]) -> Tensor:

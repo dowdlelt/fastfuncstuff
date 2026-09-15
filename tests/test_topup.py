@@ -407,3 +407,175 @@ def test_motion_estimation_reconciles_moved_pair():
     assert torch.allclose(res_on.motion_matrices[0], eye), "reference scan should not move"
     dz = res_on.motion_matrices[1][2, 3].item()
     assert -1.7 < dz < -0.9, f"z-translation not recovered: {dz}"
+
+
+def test_wrap_pad_pe_takes_the_opposite_end():
+    vol = torch.arange(2 * 6 * 3, dtype=torch.float32).reshape(2, 6, 3)
+    out = T.wrap_pad_pe(vol, [1], 2)
+    assert out.shape == (2, 10, 3)
+    assert torch.equal(out[:, :2], vol[:, -2:])
+    assert torch.equal(out[:, 2:8], vol)
+    assert torch.equal(out[:, 8:], vol[:, :2])
+
+
+def _aliasing_pair(nz=16, ny=32, nx=28, readout=0.5):
+    """Tissue against both PE edges, pushed across them: the acquisition aliases."""
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(ny).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    true = torch.full((nz, ny, nx), 5.0)
+    for cy, a in [(1.5, 120.0), (30.0, 90.0), (16, 60.0)]:
+        true += a * torch.exp(
+            -(((zz - 8) / 5) ** 2 + ((yy - cy) / 2.5) ** 2 + ((xx - 14) / 6) ** 2)
+        )
+    field = 6.0 * torch.cos(2 * math.pi * (yy + 0.5) / ny) * torch.exp(-(((xx - 14) / 10) ** 2))
+
+    def observed(sign):
+        disp = field * readout * sign
+        coord = (torch.arange(ny).float()[None, :, None] - disp) % ny  # periodic PE sampling
+        lo = coord.floor().long() % ny
+        hi = (lo + 1) % ny
+        fr = coord - coord.floor()
+        o = torch.gather(true, 1, lo) * (1 - fr) + torch.gather(true, 1, hi) * fr
+        return o / T._jacobian_pe(disp, 1).clamp(min=0.1)
+
+    return field, [
+        T.ScanSpec(observed(+1.0), 1, +1.0, readout),
+        T.ScanSpec(observed(-1.0), 1, -1.0, readout),
+    ]
+
+
+def test_wrap_padding_reconciles_blips_at_the_pe_edges():
+    """Without the wrap, signal aliased across the FOV edge is matched where it landed."""
+    field, scans = _aliasing_pair()
+    band = torch.zeros_like(field, dtype=torch.bool)
+    band[3:-3, :5, 4:-4] = True
+    band[3:-3, -5:, 4:-4] = True
+
+    def edge_disagreement(pad):
+        cfg = T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
+        )
+        r = T.run_topup(scans, (3.0, 2.5, 2.5), cfg, progress=False, wrap_pad=pad)
+        assert r.field_hz.shape == field.shape and r.unwarped[0].shape == field.shape
+        return ((r.unwarped[0] - r.unwarped[1])[band]).pow(2).mean().sqrt().item()
+
+    # Measured 4.41 -> 2.56.
+    assert edge_disagreement(4) < 0.75 * edge_disagreement(0)
+
+
+def test_unwrap_pe_moves_the_slab_and_zero_fills():
+    v = torch.arange(1, 7, dtype=torch.float32).reshape(1, 6, 1)  # y = 1..6
+    up = T.unwrap_pe(v, 1, -2, front=1, back=2)[0, :, 0].tolist()
+    assert up == [0, 0, 0, 3, 4, 5, 6, 1, 2]  # first 2 moved past the end, zeros behind
+    down = T.unwrap_pe(v, 1, +1, front=1, back=2)[0, :, 0].tolist()
+    assert down == [6, 1, 2, 3, 4, 5, 0, 0, 0]  # last 1 moved before the start
+    still = T.unwrap_pe(v, 1, 0, front=1, back=2)[0, :, 0].tolist()
+    assert still == [0, 1, 2, 3, 4, 5, 6, 0, 0]
+
+
+def test_unwrap_recovers_the_field_where_only_one_blip_aliased():
+    """Only blip_up's edge tissue left the FOV; saying so should beat guessing symmetric."""
+    nz, big, nx, ro, lo = 16, 40, 28, 0.5, 4
+    n = big - 2 * lo
+    zz, yy, xx = torch.meshgrid(
+        torch.arange(nz).float(), torch.arange(big).float(), torch.arange(nx).float(), indexing="ij"
+    )
+    true = 5.0 * ((yy > lo) & (yy < big - lo - 1)).float()
+    for cy, a in [(lo + 2.5, 120.0), (20, 60.0), (big - lo - 4, 80.0)]:
+        true = true + a * torch.exp(
+            -(((zz - 8) / 5) ** 2 + ((yy - cy) / 2.5) ** 2 + ((xx - 14) / 6) ** 2)
+        )
+    field = -8.0 * torch.exp(-(((yy - lo - 3) / 5) ** 2)) * torch.exp(-(((xx - 14) / 10) ** 2))
+
+    def acquire(sign):
+        disp = field * ro * sign
+        return T._resample_pe(true, -disp, 1) / T._jacobian_pe(disp, 1).clamp(min=0.1)
+
+    def fov(v):  # crop to the FOV; what fell outside aliases in at the other end
+        out = v[:, lo : lo + n].clone()
+        out[:, -lo:] += v[:, :lo]
+        out[:, :lo] += v[:, lo + n :]
+        return out
+
+    def cfg():
+        return T.TopupConfig(
+            warpres=[16, 10], fwhm=[5, 2], lam=[1e-3, 1e-4], miter=[8, 8], subsamp=[1, 1]
+        )
+
+    up, down = acquire(+1.0), acquire(-1.0)
+    ref = T.run_topup(
+        [T.ScanSpec(up, 1, 1.0, ro), T.ScanSpec(down, 1, -1.0, ro)],
+        (3, 2.5, 2.5),
+        cfg(),
+        progress=False,
+    )
+    scans = [T.ScanSpec(fov(up), 1, 1.0, ro), T.ScanSpec(fov(down), 1, -1.0, ro)]
+    band = torch.zeros(nz, n, nx, dtype=torch.bool)
+    band[3:-3, :8, 4:-4] = True
+
+    def err(**kw):
+        r = T.run_topup(scans, (3, 2.5, 2.5), cfg(), progress=False, **kw)
+        assert r.field_hz.shape == (nz, n, nx)
+        return (r.field_hz - ref.field_hz[:, lo : lo + n])[band].abs().mean().item()
+
+    none, right, wrong = err(), err(unwrap=[4, 0]), err(unwrap=[-4, 0])
+    # Measured 0.60 / 0.26 / 5.16 Hz against an 8 Hz peak.
+    assert right < 0.6 * none
+    assert wrong > 3 * none
+
+
+def test_pad_phase_wrap_sign_is_anatomical_not_index_order():
+    """+K must move the posterior slab forward however the file is stored.
+
+    Read as index order, +9 on a scan indexed posterior-to-anterior put the air in
+    front of the head behind the occipital pole.
+    """
+    import numpy as np
+
+    from fastfuncstuff.cli.blipflip import _anatomical_moves_to_index_shifts
+
+    ras = np.diag([2.0, 2.0, 2.0, 1.0])  # j increases toward anterior
+    lpi = np.diag([-2.0, -2.0, 2.0, 1.0])  # j increases toward posterior
+    vol = torch.arange(1, 11, dtype=torch.float32).reshape(1, 10, 1)
+    for affine, posterior_first in ((ras, True), (lpi, False)):
+        (shift,) = _anatomical_moves_to_index_shifts([+3], [1], affine)
+        out = T.unwrap_pe(vol, 1, shift, front=max(0, shift), back=max(0, -shift))[0, :, 0]
+        # The three most posterior slices must now sit beyond the anterior end.
+        posterior = [1.0, 2.0, 3.0] if posterior_first else [10.0, 9.0, 8.0]
+        beyond_anterior = out[-3:].tolist() if posterior_first else out[:3].flip(0).tolist()
+        assert beyond_anterior == posterior
+
+
+def test_padding_skips_all_zero_edge_planes():
+    """A reversed-PE recon's empty edge line must not be dragged into the image."""
+    v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)  # empty last plane
+    # Last 2 DATA slices (4, 5) move before the start; the empty plane stays at the edge.
+    out = T.unwrap_pe(v, 1, +2, front=2, back=0)[0, :, 0].tolist()
+    assert out == [4, 5, 1, 2, 3, 0, 0, 0]
+    # First 2 slices move past the end, against the data (not after the empty plane).
+    out = T.unwrap_pe(v, 1, -2, front=0, back=2)[0, :, 0].tolist()
+    assert out == [0, 0, 3, 4, 5, 1, 2, 0]
+    # Symmetric wrap: no zero plane between the volume and its wrapped neighbours.
+    out = T.wrap_pad_pe(v, [1], 2)[0, :, 0].tolist()
+    assert out == [4, 5, 1, 2, 3, 4, 5, 1, 2, 0]
+    assert out[2:7] == [1, 2, 3, 4, 5]  # data keeps its own voxels, so the crop is unchanged
+
+
+def test_declared_empty_positions_are_scored_as_zeros():
+    """Vacated slab and padding count; a scan's own empty edge plane does not."""
+    v = torch.tensor([1, 2, 3, 4, 5, 0], dtype=torch.float32).reshape(1, 6, 1)
+    scans = [T.ScanSpec(v, 1, 1.0, 0.05)]
+    data, tdims, front, empty = T.pad_scans_pe(scans, unwrap=[+2])
+    assert data[0][0, :, 0].tolist() == [4, 5, 1, 2, 3, 0, 0, 0]
+    # 5, 6: where 4 and 5 came from (declared empty); 7: the recon's empty line (unmeasured).
+    assert empty is not None and empty[0].tolist() == [False] * 5 + [True, True, False]
+
+    big = data[0].expand(3, 8, 3).contiguous()
+    padded = [T.ScanSpec(big, 1, 1.0, 0.05)]
+    blind = T.compute_mask(padded)[1, :, 1].tolist()
+    scored = T.compute_mask(padded, empty, pe_tdim=1)[1, :, 1].tolist()
+    # compute_mask also drops the outer frame plane on every axis (index 0 and 7 here).
+    assert blind[5:7] == [False, False]
+    assert scored[5:7] == [True, True]
+    assert scored[7] is False

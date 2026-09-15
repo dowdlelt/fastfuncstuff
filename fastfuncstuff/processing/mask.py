@@ -587,6 +587,31 @@ def data_coverage_mask(
     return _erode_6conn(cover, iterations=erode)
 
 
+def looks_skull_stripped(cover: Tensor) -> bool:
+    """True when a coverage mask looks like a masked object, not missing data.
+
+    The coverage machinery (:func:`cross_fill_no_data`, the void guard) exists for a
+    clipped field of view, and on that it is right. On a skull-stripped image the zero
+    background is a real edge, and treating it as no-data stops a registration pulling
+    tissue in across the brain boundary -- silently, because nothing fails.
+
+    The two look different. A clipped FoV leaves most of the grid covered (a wedge or
+    slab is missing); an acquisition slab covers a box, which fills its bounding box.
+    A stripped brain covers a minority of the grid and roughly half of its own bounding
+    box. Hence: under 40% of the grid, and under 75% of the covered bounding box.
+    """
+    covered = cover > 0
+    frac = float(covered.float().mean())
+    if not 0.01 < frac < 0.40:
+        return False
+    extent = 1
+    for dim in range(covered.ndim):
+        others = tuple(d for d in range(covered.ndim) if d != dim)
+        idx = torch.nonzero(covered.any(dim=others)).flatten()
+        extent *= int(idx[-1] - idx[0] + 1)
+    return int(covered.sum()) / extent < 0.75
+
+
 def cross_fill_no_data(
     fixed: Tensor,
     moving: Tensor,

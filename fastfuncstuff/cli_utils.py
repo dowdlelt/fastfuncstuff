@@ -4094,7 +4094,7 @@ def image_support(
     ``brain`` only ever damps the metric -- an automask boundary is real anatomy, and
     filling across it would splice one image's skull into the other's.
     """
-    from fastfuncstuff.processing.mask import automask, data_coverage_mask
+    from fastfuncstuff.processing.mask import automask, data_coverage_mask, looks_skull_stripped
 
     v = vol.float().to(device)
     brain = None
@@ -4109,6 +4109,14 @@ def image_support(
             frac = 100.0 * cover.float().mean().item()
             if frac < 99.95:
                 print(f"Coverage ({label}): {frac:.1f}% of voxels hold data")
+        if verb >= 0 and looks_skull_stripped(cover):
+            print(
+                f"  ⚠️  WARNING: the {label}'s zero background looks like a masked brain, not "
+                "missing data.\n"
+                "      Coverage handling will erase that boundary and block the warp from "
+                "pulling tissue in across it.\n"
+                "      For skull-stripped images, rerun with -nocoverage."
+            )
     return brain, cover
 
 
@@ -4442,3 +4450,160 @@ def resolve_hrf_library_spec(
         if lib_duration is not None:
             print(f"  Library was measured at {float(lib_duration):.2f}s events")
     return raw_path, [0.0] * len(durations), True
+
+
+def add_warp_movie_args(parser, overlay: bool = True) -> None:
+    """Register the shared ``-movie*`` flags: a movie of a warp as it is optimized.
+
+    One flag set for every tool that can feed a
+    :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder`, so a movie of qwarp and
+    one of optiwarp are asked for, and look, the same way. ``overlay=False`` omits
+    ``-movie_overlay`` for tools with no fixed image to outline (blipflip).
+    """
+    from fastfuncstuff.viz.encode import MOVIE_FORMATS
+
+    g = parser.add_argument_group("Warp movie")
+    g.add_argument(
+        "-movie",
+        metavar="PREFIX",
+        default=None,
+        help="Write a movie of the source as the warp develops: one row of mid-brain "
+        "slices, one frame every few iterations plus each level's result (held on "
+        "screen). Every frame is captioned with its level, iteration and cost. "
+        "PREFIX gets .mp4 or .gif appended unless it already ends in one.",
+    )
+    g.add_argument(
+        "-movie_views",
+        default="ax,sag,cor",
+        metavar="LIST",
+        help="Comma-separated panels, in order: any of ax, sag, cor.",
+    )
+    g.add_argument("-movie_fps", type=int, default=10, metavar="N", help="Movie frame rate.")
+    g.add_argument(
+        "-movie_size",
+        type=int,
+        default=256,
+        metavar="PX",
+        help="Pixel height of the tallest panel (all panels share one mm-per-pixel scale).",
+    )
+    g.add_argument(
+        "-movie_format",
+        choices=MOVIE_FORMATS,
+        default=None,
+        help="Container. Default: mp4 if ffmpeg is on PATH, else gif.",
+    )
+    cadence = g.add_mutually_exclusive_group()
+    cadence.add_argument(
+        "-movie_frames",
+        type=int,
+        default=150,
+        metavar="N",
+        help="Frame budget. Frames stay evenly spaced in iterations however early the "
+        "levels stop; level results are extra and always kept.",
+    )
+    cadence.add_argument(
+        "-movie_every",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Capture every N iterations instead of spreading -movie_frames (no cap).",
+    )
+    g.add_argument(
+        "-movie_hold",
+        type=float,
+        default=0.5,
+        metavar="SEC",
+        help="Seconds each level's result stays on screen.",
+    )
+    if overlay:
+        g.add_argument(
+            "-movie_overlay",
+            choices=("none", "edges"),
+            default="none",
+            help="edges: draw the base's thin edges (red to yellow by strength) over every "
+            "frame, as in AFNI's @SSwarper QC images -- misalignment shows as tissue "
+            "boundaries sliding against a fixed outline.",
+        )
+    g.add_argument(
+        "-movie_slices",
+        type=int,
+        nargs=3,
+        default=None,
+        metavar=("R", "A", "S"),
+        help="Cut positions as RAS-ordered voxel indices (the frame ffs_info -vis_slice "
+        "uses). Default: the base's intensity centre of mass.",
+    )
+
+
+def resolve_movie_path(args) -> str | None:
+    """Concrete path ``-movie`` will write, or None when no movie was asked for."""
+    if getattr(args, "movie", None) is None:
+        return None
+    from fastfuncstuff.viz.encode import default_movie_format, movie_path
+
+    return movie_path(args.movie, args.movie_format or default_movie_format())
+
+
+def build_warp_movie_recorder(
+    args,
+    base: torch.Tensor | None,
+    source: torch.Tensor | Sequence[torch.Tensor],
+    affine: np.ndarray,
+    device: torch.device,
+    tool: str,
+    mask: torch.Tensor | None = None,
+    row_labels: Sequence[str] | None = None,
+):
+    """A :class:`WarpMovieRecorder` from the ``-movie*`` flags, or None if not asked.
+
+    ``base`` and every ``source`` (one movie row each) must share one (nz, ny, nx)
+    grid whose header affine is ``affine``. The base sets the cut positions and, for
+    ``-movie_overlay edges``, supplies the outlines; with no base the first source
+    sets the cuts.
+    """
+    if getattr(args, "movie", None) is None:
+        return None
+    from fastfuncstuff.viz.slices import build_slice_planes, center_of_mass_ras
+    from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
+
+    sources = [source] if isinstance(source, torch.Tensor) else list(source)
+    anchor = base if base is not None else sources[0]
+    grid = tuple(anchor.shape)
+    center = args.movie_slices
+    if center is None:
+        weight = anchor if mask is None else anchor * (mask.to(anchor.device) > 0)
+        center = center_of_mass_ras(weight.detach().cpu().numpy(), affine)
+    planes = build_slice_planes(grid, affine, args.movie_views, center)  # type: ignore[arg-type]
+
+    overlay = getattr(args, "movie_overlay", "none")
+    return WarpMovieRecorder(
+        sources,
+        planes,
+        every=args.movie_every,
+        max_frames=None if args.movie_every is not None else args.movie_frames,
+        reference=base if overlay == "edges" else None,
+        tool=tool,
+        row_labels=row_labels,
+        device=device,
+    )
+
+
+def render_warp_movie(recorder, args, verb: int = 1) -> str | None:
+    """Encode what ``recorder`` captured with the ``-movie*`` settings; print where."""
+    if recorder is None:
+        return None
+    from fastfuncstuff.viz.encode import default_movie_format
+
+    fmt = args.movie_format or default_movie_format()
+    with spinner(f"Rendering movie ({recorder.n_frames} frames)"):
+        path = recorder.render(
+            args.movie,
+            fps=args.movie_fps,
+            size=args.movie_size,
+            fmt=fmt,
+            hold=args.movie_hold,
+            overlay=getattr(args, "movie_overlay", "none"),
+        )
+    if verb >= 1 and path is not None:
+        print(f"Saved warp movie: {path}")
+    return path

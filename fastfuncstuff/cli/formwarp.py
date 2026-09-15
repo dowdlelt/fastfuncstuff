@@ -36,12 +36,16 @@ from fastfuncstuff.cli_utils import (
     add_device_arg,
     add_recipe_arg,
     add_verbose_arg,
+    add_warp_movie_args,
     apply_recipe_preset,
+    build_warp_movie_recorder,
     collect_batch_jobs,
     combine_brain_masks,
     enable_determinism,
     image_support,
     parse_prefix,
+    render_warp_movie,
+    resolve_movie_path,
     run_batch_jobs,
     sanitize_volume,
     setup_device,
@@ -441,6 +445,8 @@ def parse_args(
         help="Interpolation for the final warped image.",
     )
 
+    add_warp_movie_args(p)
+
     # Device
     add_recipe_arg(p, _PRESET_BACKEND)
     add_deterministic_arg(p)
@@ -505,6 +511,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
             f"{prefix}_HALF_fixed2mid{ext}",
             f"{prefix}_HALF_moving2mid{ext}",
         ]
+    movie = resolve_movie_path(args)
+    if movie is not None:
+        outs.append(movie)
     return outs
 
 
@@ -685,6 +694,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
     warp_stem = _warp_stem(args, pfx)
 
     if timeseries:
+        if args.movie is not None and args.verb >= 1:
+            print("WARNING: -movie records a single 3D registration; ignored for a 4D -source")
         return _run_timeseries(
             args,
             base,
@@ -701,6 +712,9 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
             t0,
         )
 
+    recorder = build_warp_movie_recorder(
+        args, base, source, out_info["affine"], device, "formwarp", mask=mask
+    )
     res = formwarp(
         base,
         source,
@@ -710,6 +724,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         moving_cover=src_cover,
         config=config,
         device=device,
+        recorder=recorder,
     )
 
     warped_path = pfx.as_file()
@@ -743,6 +758,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> int:
         _save_warp(res.moving_to_mid, f"{p}_HALF_mid2moving{nii_ext}", "mid->moving half-warp")
         _save_warp(res.mid_to_fixed, f"{p}_HALF_fixed2mid{nii_ext}", "fixed->mid half-warp")
         _save_warp(res.mid_to_moving, f"{p}_HALF_moving2mid{nii_ext}", "moving->mid half-warp")
+
+    render_warp_movie(recorder, args, args.verb)
 
     if args.verb >= 1:
         print(f"Done in {time.time() - t0:.1f}s")

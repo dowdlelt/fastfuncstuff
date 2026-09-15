@@ -691,7 +691,9 @@ def test_per_level_regularization_reaches_each_level():
     seen = []
     original = fw._syn_level
 
-    def record(fixed, moving, weight, fields, n_iter, config, level_tag="", guard=None):
+    def record(
+        fixed, moving, weight, fields, n_iter, config, level_tag="", guard=None, recorder=None
+    ):
         seen.append((level_tag, config.update_var, config.total_var))
         return original(fixed, moving, weight, fields, n_iter, config, level_tag, guard)
 
