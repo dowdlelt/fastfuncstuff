@@ -900,8 +900,15 @@ def _fold_barrier_rows(
 
     Zero wherever the warp is safely diffeomorphic; nonzero only at an incipient fold.
     """
+    return _barrier_rows_scaled(field_hz, scans, math.sqrt(barrier_eff), jac_floor)
+
+
+def _barrier_rows_scaled(
+    field_hz: Tensor, scans: list[ScanSpec], sm: float | Tensor, jac_floor: float
+) -> list[Tensor]:
+    """:func:`_fold_barrier_rows` with the weight's square root given directly (a scalar
+    tensor, for a captured graph that replays with a new weight)."""
     c = 1.0 - jac_floor
-    sm = math.sqrt(barrier_eff)
     rows: list[Tensor] = []
     for td, a in _fold_barrier_specs(scans):
         g = a * _central_diff_pe(field_hz, td)  # = d(disp)/d(pe)
@@ -933,6 +940,31 @@ def _residual_vector(
     jac_floor: float = 0.1,
 ) -> Tensor:
     """Full residual: masked data rows, then sqrt(lam) reg rows, then anti-fold rows."""
+    return _residual_rows(
+        coeff,
+        basis,
+        scans,
+        mask_idx,
+        n_scans_minus_1,
+        math.sqrt(lam_eff) if lam_eff > 0 else None,
+        reg_mode,
+        math.sqrt(barrier_eff) if barrier_eff > 0 else None,
+        jac_floor,
+    )
+
+
+def _residual_rows(
+    coeff: Tensor,
+    basis: SplineFieldBasis,
+    scans: list[ScanSpec],
+    mask_idx: Tensor,
+    n_scans_minus_1: int,
+    sqrt_lam: float | Tensor | None,
+    reg_mode: str,
+    sqrt_barrier: float | Tensor | None,
+    jac_floor: float,
+) -> Tensor:
+    """:func:`_residual_vector` with the square-rooted weights given (``None`` = term off)."""
     field_hz = basis.field(coeff)
     modulated: list[Tensor] = []
     for sc in scans:
@@ -945,10 +977,10 @@ def _residual_vector(
     scale = 1.0 / math.sqrt(max(1, mask_idx.numel()) * max(1, n_scans_minus_1))
     data_rows = [(m - mean).reshape(-1)[mask_idx] * scale for m in modulated]
     rows = data_rows
-    if lam_eff > 0:
-        rows = rows + [math.sqrt(lam_eff) * reg_residual(field_hz, reg_mode)]
-    if barrier_eff > 0:
-        rows = rows + _fold_barrier_rows(field_hz, scans, barrier_eff, jac_floor)
+    if sqrt_lam is not None:
+        rows = rows + [sqrt_lam * reg_residual(field_hz, reg_mode)]
+    if sqrt_barrier is not None:
+        rows = rows + _barrier_rows_scaled(field_hz, scans, sqrt_barrier, jac_floor)
     return torch.cat(rows)
 
 
@@ -1198,6 +1230,102 @@ def reg_gram_terms(
     ]
 
 
+def _capture_cuda_graph(step: Callable[[], None], device: torch.device):
+    """Warm ``step`` up on a side stream, then capture it as a CUDA graph.
+
+    ``step`` must write its outputs into tensors it can find again (attributes, or
+    ``copy_`` into buffers): the ones created during the captured call are the ones every
+    replay refreshes. Nothing inside may synchronise with the host.
+    """
+    side = torch.cuda.Stream(device=device)
+    # The side stream must not read buffers the default stream is still filling.
+    side.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(side):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream(device).wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        step()
+    return graph
+
+
+class _LevelResidual:
+    """The cost evaluations of one level -- data SSD, Gauss-Newton ``r``, line-search
+    trials -- CUDA-graphed when possible, bit-identical to :func:`_residual_vector`.
+
+    Each is ~50 small kernels on the level grid, three or more times per Gauss-Newton
+    step. Which terms are on (penalty, barrier) is fixed per call site, so there is one
+    graph per combination, replaying with the coefficients and the square-rooted weights
+    copied into buffers. The float64 cost is summed inside the graph over the same
+    concatenated vector, so line-search accept/reject decisions cannot change.
+    """
+
+    def __init__(
+        self,
+        basis: SplineFieldBasis,
+        scans: list[ScanSpec],
+        mask_idx: Tensor,
+        n_sm1: int,
+        reg_mode: str,
+        jac_floor: float,
+        use_graph: bool,
+    ):
+        self.args = (basis, scans, mask_idx, n_sm1)
+        self.reg_mode = reg_mode
+        self.jac_floor = jac_floor
+        self.use_graph = use_graph
+        self.graphs: dict[tuple[bool, bool], dict] = {}
+
+    def residual(self, c: Tensor, lam_eff: float, barrier_eff: float) -> tuple[Tensor, float]:
+        """``(residual vector, cost)``. On the graphed path the vector is a buffer the next
+        call overwrites -- use it before evaluating again."""
+        if not self.use_graph:
+            r = _residual_vector(c, *self.args, lam_eff, self.reg_mode, barrier_eff, self.jac_floor)
+            return r, float(_dot64(r, r))
+        st = self._state(c, lam_eff > 0, barrier_eff > 0)
+        st["c"].copy_(c)
+        if lam_eff > 0:
+            st["sqrt_lam"].fill_(math.sqrt(lam_eff))
+        if barrier_eff > 0:
+            st["sqrt_bar"].fill_(math.sqrt(barrier_eff))
+        st["graph"].replay()
+        return st["r"], float(st["cost"])
+
+    def cost(self, c: Tensor, lam_eff: float, barrier_eff: float) -> float:
+        return self.residual(c, lam_eff, barrier_eff)[1]
+
+    def _state(self, c: Tensor, with_reg: bool, with_bar: bool) -> dict:
+        key = (with_reg, with_bar)
+        if key in self.graphs:
+            return self.graphs[key]
+        st: dict = {
+            "c": c.detach().clone(),
+            "sqrt_lam": torch.ones((), device=c.device, dtype=c.dtype),
+            "sqrt_bar": torch.ones((), device=c.device, dtype=c.dtype),
+        }
+
+        def step() -> None:
+            r = _residual_rows(
+                st["c"],
+                *self.args,
+                st["sqrt_lam"] if with_reg else None,
+                self.reg_mode,
+                st["sqrt_bar"] if with_bar else None,
+                self.jac_floor,
+            )
+            st["r"], st["cost"] = r, _dot64(r, r)
+
+        st["graph"] = _capture_cuda_graph(step, c.device)
+        self.graphs[key] = st
+        return st
+
+    def close(self) -> None:
+        if self.graphs:
+            torch.cuda.synchronize(next(iter(self.graphs.values()))["c"].device)
+            self.graphs.clear()
+
+
 class _NormalOperator:
     """``v -> JᵀJ v`` on dense volumes, the same operator as ``_lin_jtu(_lin_jv(v))``.
 
@@ -1340,16 +1468,7 @@ class _LevelCG:
         self.rs = torch.ones((), device=b.device, dtype=torch.float64)
         self.rs_new = torch.ones_like(self.rs)
         self.p.copy_(b)
-        side = torch.cuda.Stream(device=b.device)
-        # The side stream must not read buffers the default stream is still filling.
-        side.wait_stream(torch.cuda.current_stream(b.device))
-        with torch.cuda.stream(side):
-            for _ in range(2):
-                self._iteration()
-        torch.cuda.current_stream(b.device).wait_stream(side)
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
-            self._iteration()
+        self.graph = _capture_cuda_graph(self._iteration, b.device)
 
     def close(self) -> None:
         if self.graph is not None:
@@ -1372,6 +1491,7 @@ def _gn_direction_analytic(
     barrier_eff: float = 0.0,
     jac_floor: float = 0.1,
     solver: _LevelCG | None = None,
+    level_residual: _LevelResidual | None = None,
 ) -> tuple[Tensor, float]:
     """Analytic Gauss-Newton step: same math as :func:`_gn_direction`, no autograd.
 
@@ -1381,10 +1501,11 @@ def _gn_direction_analytic(
     finite-difference adjoints — eliminating the gather-backward that dominated the
     autograd path. Precision-neutral: it evaluates the identical ``J^T J`` operator.
     """
-    r0 = _residual_vector(
-        coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
-    )
-    cost = float(_dot64(r0, r0))
+    if level_residual is None:
+        level_residual = _LevelResidual(basis, scans, mask_idx, n_sm1, reg_mode, jac_floor, False)
+    # On the graphed path r0 is a buffer the next evaluation overwrites; J^T r0 below is
+    # queued before any.
+    r0, cost = level_residual.residual(coeff, lam_eff, barrier_eff)
     lin = _linearize(
         coeff, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
     )
@@ -1457,9 +1578,19 @@ def gn_solve_level(
             c, basis, scans, mask_idx, n_sm1, lam_eff, reg_mode, barrier_eff, jac_floor
         )
 
+    level_residual = _LevelResidual(
+        basis,
+        scans,
+        mask_idx,
+        n_sm1,
+        reg_mode,
+        jac_floor,
+        analytic and use_graph and coeff.device.type == "cuda",
+    )
+
     def data_ssd(c: Tensor) -> float:
-        r = residual(c, 0.0, 0.0)  # data term only — never scaled by the barrier/reg
-        return float(_dot64(r, r))
+        # Data term only — never scaled by the barrier/reg.
+        return level_residual.cost(c, 0.0, 0.0)
 
     # Displacement is field * readout * sign, so the worst-case voxel move of a field
     # change is its largest |value| in the mask times the largest |readout|.
@@ -1511,6 +1642,7 @@ def gn_solve_level(
                 barrier_eff,
                 jac_floor,
                 solver,
+                level_residual,
             )
         else:
             delta, cost = _gn_direction(
@@ -1529,8 +1661,7 @@ def gn_solve_level(
         new_cost = cost
         for _ in range(12):
             trial = coeff + (step * delta).reshape(coeff.shape)
-            r_new = residual(trial, lam_eff, barrier_eff)
-            new_cost = float(_dot64(r_new, r_new))
+            new_cost = level_residual.cost(trial, lam_eff, barrier_eff)
             folds = guard and _min_jacobian(basis.field(trial), barrier_specs) < min(
                 0.0, cur_min_jac
             )
@@ -1581,6 +1712,7 @@ def gn_solve_level(
     bar.close()
     if solver is not None:
         solver.close()
+    level_residual.close()
     return coeff, last_cost, report
 
 
