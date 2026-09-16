@@ -243,6 +243,105 @@ def scan_trial_types(
     return sorted(durations.keys()), durations
 
 
+def _fmt_dur(d: float, digits: int = 6) -> str:
+    """Render a duration for use inside a label: ``2.0 -> '2'``, ``2.5 -> '2p5'``."""
+    if float(d).is_integer():
+        return f"{int(d)}"
+    return f"{d:.{digits}g}".replace(".", "p")
+
+
+def _unique_dur_digits(durations: list[float]) -> int:
+    """Fewest significant digits (>= 6) that keep every duration's label distinct.
+
+    Bug of record: ``%g`` rendered 10.00823 and 10.00818 both as ``10p0082``; the
+    label also names the timing file, so the second split overwrote the first
+    and two columns carried the same onsets.
+    """
+    for digits in range(6, 18):
+        if len({_fmt_dur(d, digits) for d in durations}) == len(durations):
+            return digits
+    return 17
+
+
+def predicted_stim_labels(
+    events: list[EventSpec],
+    durations_per_tt: dict[str, list[float]],
+    tr: float,
+) -> list[str]:
+    """The stim labels compile will build for these events — including the
+    ``{trial_type}_dur{d}`` splits — so contrasts can be checked before compile.
+
+    ``durations_per_tt`` must already be filtered (``scan_trial_types`` does
+    that). Mirrors ``cli.design_spec._expand_event_to_stims``; a -drop_first
+    trim that removes every event of one duration is the one case it can miss.
+    """
+    labels: list[str] = []
+    for ev in events:
+        durs = sorted(
+            {
+                round_event_time(d, ev.round_duration, tr)
+                for d in durations_per_tt.get(ev.trial_type, [])
+                if d == d
+            }
+        )
+        if ev.duration != "from_events" or ev.mode == "im" or len(durs) <= 1:
+            labels.append(ev.trial_type)
+            continue
+        digits = _unique_dur_digits(durs)
+        labels += [f"{ev.trial_type}_dur{_fmt_dur(d, digits)}" for d in durs]
+    return labels
+
+
+def parse_contrasts_text(text: str, source: str = "<contrasts>") -> list[ContrastSpec]:
+    """Parse a TOML fragment holding only ``[[contrasts]]`` tables.
+
+    Anything else is refused: the fragment is pasted verbatim into a design TOML
+    that already has [meta] and [[events]], so a stray table would duplicate or
+    silently override part of the model.
+    """
+    try:
+        raw = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ValueError(f"{source}: not valid TOML: {exc}") from None
+    extra = sorted(set(raw) - {"contrasts"})
+    if extra:
+        raise ValueError(
+            f"{source}: only [[contrasts]] tables are allowed (found {', '.join(extra)})"
+        )
+    out: list[ContrastSpec] = []
+    for i, c_raw in enumerate(raw.get("contrasts", [])):
+        try:
+            c = ContrastSpec(**c_raw)
+        except TypeError as exc:
+            raise ValueError(f"{source}: contrast #{i + 1}: {exc}") from None
+        if c.balance not in ("none", "sum1", "zero"):
+            raise ValueError(f"{source}: contrast '{c.label}': balance must be none|sum1|zero")
+        out.append(c)
+    if not out:
+        raise ValueError(f"{source}: no [[contrasts]] tables found")
+    return out
+
+
+def check_contrasts(
+    contrasts: list[ContrastSpec],
+    stim_labels: list[str],
+    extra_labels: list[str] | None = None,
+    existing_labels: list[str] | None = None,
+) -> list[str]:
+    """Every problem with ``contrasts`` against the design's labels, as messages."""
+    problems: list[str] = []
+    seen = set(existing_labels or [])
+    for c in contrasts:
+        if c.label in seen:
+            problems.append(f"contrast label '{c.label}' is used more than once")
+        seen.add(c.label)
+        try:
+            resolve_contrast(c, stim_labels, extra_labels=extra_labels)
+        except ValueError as exc:
+            problems.append(f"contrast '{c.label}': {exc}")
+    return problems
+
+
 def duration_stats_comment(durations: list[float]) -> str:
     """One-line summary of a trial_type's durations. Informational only —
     a comment cannot influence what compile produces."""

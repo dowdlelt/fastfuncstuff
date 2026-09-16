@@ -672,6 +672,21 @@ def build_parser() -> argparse.ArgumentParser:
             "once per variant (e.g. -glm_label lefthemi, then -glm_label righthemi).",
         )
 
+    g.add_argument(
+        "-prebuilt_contrasts",
+        "-prebuilt-contrasts",
+        action="append",
+        nargs=2,
+        default=None,
+        metavar=("TASK", "FILE"),
+        help="a file of [[contrasts]] tables (plain TOML text) to paste into TASK's "
+        "design TOML. Every label is checked against the regressors that design "
+        "will actually build — after event filters, rounding and duration splits — "
+        "and a typo stops ffs_autoproc instead of the GLM an hour later. The text "
+        "goes in verbatim, comments and all. Repeatable, also per task. Only reaches "
+        "a TOML that is (re)written — add -glm_spec_overwrite for an existing one.",
+    )
+
     g = p.add_argument_group("QC")
     g.add_argument(
         "-no_qc",
@@ -1098,6 +1113,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
         ("-round_onsets", opt.sep_round_onsets),
         ("-round_durations", opt.sep_round_durations),
         ("-event_filter_in/out", opt.event_filters),
+        ("-prebuilt_contrasts", opt.prebuilt_contrasts),
     ):
         for task in sorted(per_task):
             if task not in all_tasks:
@@ -1210,6 +1226,27 @@ def _resolve_event_filters(args) -> dict[str, list]:
             per_task.setdefault(task, []).append(
                 EventFilter(column=entry[1], values=list(entry[2:]), action=action)
             )
+    return per_task
+
+
+def _resolve_prebuilt_contrasts(args) -> dict[str, list[str]]:
+    """``{task: [absolute path]}``; each file must exist and parse as [[contrasts]] only.
+
+    Label checks need the events, so they happen when the design TOML is written.
+    """
+    from fastfuncstuff.design.spec import parse_contrasts_text
+
+    per_task: dict[str, list[str]] = {}
+    for task, path in args.prebuilt_contrasts or []:
+        task = task[len("task-") :] if task.startswith("task-") else task
+        p = Path(path).expanduser()
+        if not p.is_file():
+            raise SystemExit(f"ffs_autoproc: -prebuilt_contrasts {task}: no such file {path}")
+        try:
+            parse_contrasts_text(p.read_text(), str(p))
+        except ValueError as exc:
+            raise SystemExit(f"ffs_autoproc: -prebuilt_contrasts {task}: {exc}") from None
+        per_task.setdefault(task, []).append(str(p.resolve()))
     return per_task
 
 
@@ -1606,6 +1643,7 @@ def main(argv: list[str] | None = None) -> int:
         round_durations=round_durations,
         sep_round_durations=sep_round_durations,
         event_filters=_resolve_event_filters(args),
+        prebuilt_contrasts=_resolve_prebuilt_contrasts(args),
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,
@@ -1697,12 +1735,21 @@ def main(argv: list[str] | None = None) -> int:
     tag = f" [{args.recipe}]" if args.recipe else ""
     print(f"wrote {out_path}{tag}  ({len(plan.runs)} run(s), ref session {plan.ref_session})")
     print(f"  working dir baked in: {work_dir}")
+    failed = [(t, st) for t, _, st in spec_rows if st.startswith("error")]
     for task, path, status in spec_rows:
         note = {
             "wrote": "design spec written — EDIT IT (contrasts, HRF) before the GLM stage",
             "kept": "design spec already exists, left untouched (-glm_spec_overwrite to replace)",
         }.get(status, status)
         print(f"  task-{task}: {Path(path).name}  [{note}]")
+    if failed:
+        for task, status in failed:
+            print(f"ERROR task-{task}: {status[len('error: ') :]}", file=sys.stderr)
+        print(
+            "ffs_autoproc: design spec(s) not written — fix the above and re-run.",
+            file=sys.stderr,
+        )
+        return 1
     n_stim = len(list((Path(work_dir) / STIMULI_DIR).glob("*.tsv")))
     if n_stim:
         print(f"  {n_stim} events TSV(s) copied to {STIMULI_DIR}/ (what the specs name)")

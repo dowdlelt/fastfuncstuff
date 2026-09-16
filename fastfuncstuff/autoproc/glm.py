@@ -224,20 +224,76 @@ def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
     return max(int(n_tp) - int(noise_vols), 0)
 
 
-def _kept_status(dest: Path, requested: list) -> str:
-    """ "kept", plus a warning when the kept TOML's event filters are not the ones asked for."""
-    from fastfuncstuff.design.spec import load_spec
+def _kept_status(dest: Path, task: str, opt) -> str:
+    """Status for a TOML left in place: a warning when it is not what was asked for."""
+    from fastfuncstuff.design.spec import load_spec, parse_contrasts_text
 
     try:
-        have = load_spec(dest).meta.event_filters
+        kept = load_spec(dest)
     except (OSError, ValueError):
         return "kept"
-    if [f.describe() for f in have] == [f.describe() for f in requested]:
+    problems = []
+    requested = opt.event_filters.get(task, [])
+    if [f.describe() for f in kept.meta.event_filters] != [f.describe() for f in requested]:
+        problems.append("its event_filters differ from the ones requested")
+    have = {c.label for c in kept.contrasts}
+    missing = [
+        c.label
+        for path in opt.prebuilt_contrasts.get(task, [])
+        for c in parse_contrasts_text(Path(path).read_text(), str(path))
+        if c.label not in have
+    ]
+    if missing:
+        problems.append(f"it lacks the prebuilt contrast(s) {', '.join(missing)}")
+    if not problems:
         return "kept"
-    return (
-        "kept — WARNING: its event_filters differ from the ones requested; pass "
-        "-glm_spec_overwrite to regenerate it"
+    return f"kept — WARNING: {'; '.join(problems)}; pass -glm_spec_overwrite to regenerate it"
+
+
+def prebuilt_contrast_blocks(task: str, opt, spec, events_paths: list, event_cols) -> list[str]:
+    """Validated ``-prebuilt_contrasts`` text for ``task``, ready to append verbatim.
+
+    Raises ValueError listing every unresolvable label or duplicate at once.
+    """
+    from fastfuncstuff.design.spec import (
+        DEFAULT_EVENT_COLUMNS,
+        check_contrasts,
+        parse_contrasts_text,
+        predicted_stim_labels,
+        scan_trial_types,
     )
+
+    files = opt.prebuilt_contrasts.get(task, [])
+    if not files:
+        return []
+    _, durations = scan_trial_types(
+        events_paths,
+        tuple(event_cols) if event_cols else DEFAULT_EVENT_COLUMNS,
+        set(spec.meta.drop_trial_types),
+        spec.meta.event_filters,
+    )
+    labels = predicted_stim_labels(spec.events, durations, spec.meta.tr)
+    extra = [sv.label for sv in spec.stim_vec]
+    blocks, problems, seen = [], [], []
+    for path in files:
+        text = Path(path).read_text()
+        contrasts = parse_contrasts_text(text, str(path))
+        problems += [
+            f"{Path(path).name}: {p}" for p in check_contrasts(contrasts, labels, extra, seen)
+        ]
+        seen += [c.label for c in contrasts]
+        blocks.append(
+            f"\n# ---- prebuilt contrasts from {path} (-prebuilt_contrasts) ----\n"
+            + text.rstrip()
+            + "\n"
+        )
+    if problems:
+        raise ValueError(
+            "prebuilt contrasts do not match this design:\n    "
+            + "\n    ".join(problems)
+            + f"\n  design labels: {', '.join(labels + extra)}"
+        )
+    return blocks
 
 
 def write_design_specs(
@@ -253,7 +309,7 @@ def write_design_specs(
     would be the worst bug this tool could have.
     """
     from fastfuncstuff.autoproc.emit import _frag
-    from fastfuncstuff.design.spec import build_stub_spec, write_spec
+    from fastfuncstuff.design.spec import build_stub_spec, load_spec, write_spec
 
     opt = plan.options
     rows: list[tuple[str, str, str]] = []
@@ -281,7 +337,7 @@ def write_design_specs(
             continue
 
         if dest.exists() and not opt.glm_spec_overwrite:
-            rows.append((task, str(dest), _kept_status(dest, opt.event_filters.get(task, []))))
+            rows.append((task, str(dest), _kept_status(dest, task, opt)))
             continue
 
         # Scan the copies under work_dir, but record the work-dir-relative name:
@@ -323,6 +379,15 @@ def write_design_specs(
         for run_spec, rel in zip(spec.meta.runs, rel_paths, strict=True):
             run_spec.events = rel
 
+        # Prebuilt contrasts are checked against the labels compile WILL build
+        # (filters, rounding and _dur splits applied), so a typo fails now rather
+        # than an hour into the GLM. A bad one is an error, not a skip.
+        try:
+            prebuilt = prebuilt_contrast_blocks(task, opt, spec, scan_paths, event_cols)
+        except ValueError as exc:
+            rows.append((task, str(dest), f"error: {exc}"))
+            continue
+
         out_dir.mkdir(parents=True, exist_ok=True)
         write_spec(
             spec,
@@ -345,5 +410,9 @@ def write_design_specs(
             event_notes=notes,
             include_contrast_examples=True,
         )
+        if prebuilt:
+            with open(dest, "a") as fh:
+                fh.write("".join(prebuilt))
+            load_spec(dest)  # the pasted text must leave a loadable design
         rows.append((task, str(dest), "wrote"))
     return rows

@@ -2447,3 +2447,62 @@ def test_filtered_task_gets_a_labelled_toml_with_its_filters(tmp_path: Path):
     _, rows = run("noface", "place")
     status = dict((t, st) for t, _, st in rows)["floc"]
     assert status.startswith("kept") and "WARNING" in status
+
+
+def test_prebuilt_contrasts_are_validated_and_pasted_verbatim(tmp_path: Path):
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_two_tasks(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    good = tmp_path / "floc_contrasts.toml"
+    good.write_text(
+        "[[contrasts]]                       # t-test, classic A minus B\n"
+        'label = "face_vs_place"\nsym = "SYM: +1*face -1*place"\nbalance = "none"\n'
+    )
+    wd = tmp_path / "wd"
+    plan = build_plan(subj, Options(run_glm=True, prebuilt_contrasts={"floc": [str(good)]}))
+    rows = write_design_specs(plan, str(tmp_path), str(wd))
+    assert dict((t, st) for t, _, st in rows)["floc"] == "wrote"
+    toml = wd / "stage11.design.task-floc.toml"
+    assert "# t-test, classic A minus B" in toml.read_text()  # comments survive
+    assert [c.label for c in load_spec(toml).contrasts] == ["face_vs_place"]
+    assert load_spec(wd / "stage11.design.task-imagery.toml").contrasts == []
+
+    # A kept TOML that lacks them says so.
+    bad = tmp_path / "typo.toml"
+    bad.write_text('[[contrasts]]\nlabel = "f"\nsym = "SYM: +1*fcae"\n')
+    plan = build_plan(subj, Options(run_glm=True, prebuilt_contrasts={"floc": [str(bad)]}))
+    status = dict((t, st) for t, _, st in write_design_specs(plan, str(tmp_path), str(wd)))
+    assert "lacks the prebuilt contrast(s) f" in status["floc"]
+
+    # A label the design will not build is an error, and nothing is written.
+    plan = build_plan(
+        subj,
+        Options(run_glm=True, glm_spec_overwrite=True, prebuilt_contrasts={"floc": [str(bad)]}),
+    )
+    toml.unlink()
+    status = dict((t, st) for t, _, st in write_design_specs(plan, str(tmp_path), str(wd)))
+    assert status["floc"].startswith("error:") and "fcae" in status["floc"]
+    assert not toml.exists()
+
+
+def test_prebuilt_contrasts_flag_refuses_missing_or_non_contrast_files(tmp_path: Path):
+    from fastfuncstuff.cli.autoproc import _resolve_prebuilt_contrasts, build_parser
+
+    p = build_parser()
+    base = ["-bids_dir", "/b", "-subject", "X"]
+    ok = tmp_path / "c.toml"
+    ok.write_text('[[contrasts]]\nlabel = "x"\nsym = "SYM: +1*a"\n')
+    got = _resolve_prebuilt_contrasts(
+        p.parse_args(base + ["-prebuilt_contrasts", "task-t", str(ok)])
+    )
+    assert got == {"t": [str(ok.resolve())]}
+    notcon = tmp_path / "n.toml"
+    notcon.write_text("[meta]\ntr = 2\n")
+    for path in (tmp_path / "missing.toml", notcon):
+        with pytest.raises(SystemExit):
+            _resolve_prebuilt_contrasts(
+                p.parse_args(base + ["-prebuilt_contrasts", "t", str(path)])
+            )

@@ -48,6 +48,8 @@ from fastfuncstuff.design.spec import (
     EventSpec,
     NuisanceSpec,
     RoundMode,
+    _fmt_dur,
+    _unique_dur_digits,
     build_stub_spec,
     load_spec,
     resolve_contrast,
@@ -486,26 +488,6 @@ def _expand_event_to_stims(
     _write_afni_timing(timing_path, [[o for o, _ in run] for run in per_run])
     hrf = _inject_duration(event.hrf, dur_value)
     return [(timing_path, event.trial_type, hrf, event.mode == "im")]
-
-
-def _fmt_dur(d: float, digits: int = 6) -> str:
-    """Render a duration for use inside a label: ``2.0 -> '2'``, ``2.5 -> '2p5'``."""
-    if float(d).is_integer():
-        return f"{int(d)}"
-    return f"{d:.{digits}g}".replace(".", "p")
-
-
-def _unique_dur_digits(durations: list[float]) -> int:
-    """Fewest significant digits (>= 6) that keep every duration's label distinct.
-
-    Bug of record: ``%g`` rendered 10.00823 and 10.00818 both as ``10p0082``; the
-    label also names the timing file, so the second split overwrote the first
-    and two columns carried the same onsets.
-    """
-    for digits in range(6, 18):
-        if len({_fmt_dur(d, digits) for d in durations}) == len(durations):
-            return digits
-    return 17
 
 
 def _inject_duration(hrf: str, duration: float) -> str:
