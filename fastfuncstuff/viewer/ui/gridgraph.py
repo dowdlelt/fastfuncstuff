@@ -35,10 +35,23 @@ from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_f
 from fastfuncstuff.viewer.viewports import Viewport
 from fastfuncstuff.viewer.vocab import (
     SetIndex,
+    SetViewDetrend,
     SetViewGrid,
     SetViewHidden,
     SetViewSharedScale,
     SetViewTraces,
+)
+
+#: What each polynomial order removes, said the way a person would say it.
+#: Names where names exist and are worth more than the number; the number
+#: everywhere else, because "nonic" helps nobody.
+DETREND_LABELS: tuple[tuple[int, str], ...] = (
+    (-1, "none"),
+    (0, "mean"),
+    (1, "linear"),
+    (2, "quadratic"),
+    (3, "cubic"),
+    *((n, f"poly {n}") for n in range(4, 10)),
 )
 
 #: Longest name a legend tick box shows; the full one is its tooltip.
@@ -437,6 +450,29 @@ class GraphWindow(QtWidgets.QWidget):
         self.graph.scrubbed.connect(self.scrubbed)
         v.addWidget(self.graph, 1)
 
+        # Along the bottom, because it describes what was done to everything
+        # above it rather than selecting what to look at.
+        foot = QtWidgets.QHBoxLayout()
+        foot.setSpacing(5)
+        foot.setContentsMargins(0, 0, 0, 0)
+        foot.addWidget(QtWidgets.QLabel("DETREND"))
+        self.detrend_box = QtWidgets.QComboBox()
+        for order, label in DETREND_LABELS:
+            self.detrend_box.addItem(label, userData=order)
+        self.detrend_box.setToolTip(
+            "Project Legendre polynomials out of every line drawn here, together.\n"
+            "Raw time courses are separated by their means, so the shape they share —\n"
+            "which is the thing being compared — is spread across the plot. Removing\n"
+            "the mean stacks them; removing the trend does the same for scanner drift.\n"
+            "Display only: the data is untouched, and DERIVE is what changes it."
+        )
+        self.detrend_box.activated.connect(
+            lambda _: self._dispatch(SetViewDetrend(self.vid, int(self.detrend_box.currentData())))
+        )
+        foot.addWidget(self.detrend_box)
+        foot.addStretch(1)
+        v.addLayout(foot)
+
         # Its own table: a graph window's keys are not an image window's, and
         # `h` should show the keys of whatever has focus.
         self.help = ShortcutHelp(self, f"graph · {vid}")
@@ -543,6 +579,11 @@ class GraphWindow(QtWidgets.QWidget):
         self.count_label.setText(f"{viewport.cells:>3d}")
         self.shared_check.setChecked(viewport.shared_scale)
         self.graph.set_shared_scale(viewport.shared_scale)
+        # Blocked, so showing the viewport's value does not read back as a
+        # choice and put a SET_VIEW_DETREND into the recording per repaint.
+        self.detrend_box.blockSignals(True)
+        self.detrend_box.setCurrentIndex(max(self.detrend_box.findData(int(viewport.detrend)), 0))
+        self.detrend_box.blockSignals(False)
         self._sync_legend(viewport)
 
     def _colors(self, entries: list[Entry]) -> dict[str, QtGui.QColor]:
@@ -620,7 +661,7 @@ class GraphWindow(QtWidgets.QWidget):
                 cells.append(
                     Cell(
                         ijk=ijk,
-                        traces=self._traces(traced, ijk, drawn),
+                        traces=self._traces(traced, ijk, drawn, vp.detrend),
                         is_centre=(dr == 0 and dc == 0),
                     )
                 )
@@ -634,18 +675,26 @@ class GraphWindow(QtWidgets.QWidget):
         self.info.setText(self.session.mode.status())
 
     def _traces(
-        self, layers, ijk: tuple[int, int, int], drawn: set[str]
+        self, layers, ijk: tuple[int, int, int], drawn: set[str], polort: int = -1
     ) -> list[tuple[str, np.ndarray]]:
-        """The ticked layers' time courses, plus the mode's ticked lines."""
+        """The ticked layers' time courses, plus the mode's ticked lines.
+
+        Detrended together or not at all. The setting belongs to the window
+        rather than to a line, because its purpose is to make lines
+        *comparable*: removing the mean from one of them and not the others
+        would be the one thing worse than removing it from none.
+        """
+        from fastfuncstuff.viewer.derive import detrend_trace
+
         out: list[tuple[str, np.ndarray]] = []
         for layer in layers:
             values = self.session.timeseries(layer.key, ijk)
             if values.size:
-                out.append((layer.key, values))
+                out.append((layer.key, detrend_trace(values, polort)))
         for trace in self.session.mode_series(ijk):
             ident = f"mode:{trace.ident}"
             if trace.values.size and ident in drawn:
-                out.append((ident, trace.values))
+                out.append((ident, detrend_trace(trace.values, polort)))
         return out
 
     def restyle(self) -> None:

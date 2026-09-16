@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -167,6 +168,49 @@ def orthonormal_basis(columns: np.ndarray, *, tol: float = RANK_TOL) -> np.ndarr
         raise ValueError("nuisance matrix is all zeros")
     rank = int(np.sum(s > s[0] * tol))
     return np.ascontiguousarray(u[:, :rank])
+
+
+#: Highest polynomial order offered anywhere in the viewer. Past this a drift
+#: model is fitting the signal, and the carpet's spin box says the same number.
+MAX_POLORT = 9
+
+
+@lru_cache(maxsize=128)
+def drift_basis(n_time: int, order: int) -> np.ndarray:
+    """Cached orthonormal Legendre drift basis, ``(T, r)``.
+
+    Cached because a grid graph asks for the same basis once per line per cell
+    -- a 5x5 grid with three lines is 75 identical SVDs per crosshair move, for
+    a matrix that depends on nothing but its two arguments.
+
+    The array is returned read-only, since every caller shares one copy.
+    """
+    basis = orthonormal_basis(legendre_columns(n_time, order))
+    basis.setflags(write=False)
+    return basis
+
+
+def detrend_trace(values: np.ndarray, order: int) -> np.ndarray:
+    """Project Legendre drift out of one line, for looking at rather than keeping.
+
+    Display-only, and centred on zero rather than on the original mean --
+    which is the whole point. Several voxels' time courses drawn raw are
+    separated by their means, so the shape they share, which is the thing being
+    compared, is spread across the height of the plot. Removing order 0 stacks
+    them on top of each other; removing order 1 does the same for a scanner
+    drift that would otherwise dominate everything.
+
+    Asking for more polynomial than the data can support is not an error: the
+    SVD in :func:`orthonormal_basis` drops the deficient directions, so the
+    line goes flat, which is the true consequence of the request.
+    """
+    if order < 0:
+        return values
+    v = np.asarray(values, dtype=np.float64)
+    if v.ndim != 1 or v.size < 2:
+        return values
+    basis = drift_basis(int(v.size), int(order))
+    return np.ascontiguousarray(v - basis @ (basis.T @ v), dtype=np.float32)
 
 
 def project_out(

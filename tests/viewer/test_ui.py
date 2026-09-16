@@ -2170,3 +2170,130 @@ def test_an_image_window_declares_its_arrows_so_h_can_list_them(flipped):
     image = _image_window(flipped)
     keys = {b.keys for b in image.help._bindings}
     assert {"Left", "Right", "Up", "Down", "PgUp", "PgDn"} <= keys
+
+
+# ---------------------------------------------------------------------------
+# the graph window's detrend menu
+#
+# One setting for the window, applied to every line it draws. Per-line would be
+# the one thing worse than none at all: the purpose is to make lines
+# comparable, and detrending some of them destroys exactly that.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def graphed(qapp, tmp_path):
+    """A window with a graph open on a run whose voxels differ in baseline."""
+    from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
+    from fastfuncstuff.viewer.vocab import SetIJK, SetUnderlay
+
+    nt = 60
+    t = np.arange(nt, dtype=np.float32)
+    shared = 4.0 * np.sin(2 * np.pi * t / 15.0)
+    data = np.zeros((6, 6, 4, nt), np.float32)
+    for i in range(6):
+        for j in range(6):
+            data[i, j, :] = 300.0 + 50.0 * i + (0.4 + 0.2 * j) * t + shared
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    img = nib.Nifti1Image(data, aff)
+    img.header["pixdim"][4] = 2.0
+    nib.save(img, str(tmp_path / "run.nii.gz"))
+
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    w.read_directory(tmp_path)
+    w.refresh(session.do(SetUnderlay(str(tmp_path / "run.nii.gz"))))
+    session.store.ensure_ram(next(iter(session.state.layers)).key)
+    w.show()
+    qapp.processEvents()
+    w._new_graph()
+    qapp.processEvents()
+    w.refresh(session.do(SetIJK(3, 3, 2)))
+    qapp.processEvents()
+    graph = next(x for x in w.manager.windows.values() if isinstance(x, GraphWindow))
+    yield w, graph, data
+    w.close()
+
+
+def _curves(graph):
+    return [np.asarray(v) for cell in graph.graph._cells for _, v in cell.traces]
+
+
+def test_a_graph_starts_undetrended(graphed):
+    """A time course in its own units at its own level is what a graph is for."""
+    win, graph, _ = graphed
+    assert win.session.state.viewports.find(graph.vid).detrend == -1
+    assert graph.detrend_box.currentText() == "none"
+
+
+def test_a_carpet_still_starts_detrended(qapp, win):
+    """The default is per kind: a carpet is unreadable through a ramp."""
+    from fastfuncstuff.viewer.viewports import ViewKind
+
+    vid = win.session.open_view(ViewKind.CARPET, Plane.AXIAL)
+    assert win.session.state.viewports.find(vid).detrend == 1
+
+
+def test_the_menu_offers_every_order_up_to_nine(graphed):
+    win, graph, _ = graphed
+    orders = [graph.detrend_box.itemData(i) for i in range(graph.detrend_box.count())]
+    assert orders == list(range(-1, 10))
+    assert graph.detrend_box.itemText(0) == "none"
+    assert graph.detrend_box.itemText(1) == "mean"
+    assert graph.detrend_box.itemText(2) == "linear"
+
+
+def test_removing_the_mean_stacks_every_curve_at_zero(graphed, qapp):
+    from fastfuncstuff.viewer.vocab import SetViewDetrend
+
+    win, graph, _ = graphed
+    win.refresh(win.session.do(SetViewDetrend(graph.vid, 0)))
+    qapp.processEvents()
+    curves = _curves(graph)
+    assert len(curves) > 1
+    assert max(abs(c.mean()) for c in curves) < 1e-3
+
+
+def test_removing_the_trend_lays_the_shared_shape_on_itself(graphed, qapp):
+    """Baselines and drifts differ per voxel; the response does not."""
+    from fastfuncstuff.viewer.vocab import SetViewDetrend
+
+    win, graph, _ = graphed
+
+    win.refresh(win.session.do(SetViewDetrend(graph.vid, -1)))
+    qapp.processEvents()
+    raw = np.stack(_curves(graph))
+    apart = float(np.mean(np.std(raw - raw.mean(axis=1, keepdims=True), axis=0)))
+
+    win.refresh(win.session.do(SetViewDetrend(graph.vid, 1)))
+    qapp.processEvents()
+    flat = np.stack(_curves(graph))
+    together = float(np.mean(np.std(flat - flat.mean(axis=1, keepdims=True), axis=0)))
+
+    assert together < apart / 4, "the curves must converge on one shape"
+
+
+def test_detrending_changes_the_picture_and_not_the_data(graphed, qapp):
+    from fastfuncstuff.viewer.vocab import SetViewDetrend
+
+    win, graph, original = graphed
+    key = next(iter(win.session.state.layers)).key
+    win.refresh(win.session.do(SetViewDetrend(graph.vid, 3)))
+    qapp.processEvents()
+    assert np.allclose(win.session.store.ensure_ram(key), original, atol=1e-4)
+
+
+def test_the_menu_follows_the_viewport_without_dispatching(graphed, qapp):
+    """A widget that writes back on every repaint recurses into the recording."""
+    from fastfuncstuff.viewer.vocab import SetViewDetrend
+
+    win, graph, _ = graphed
+    win.refresh(win.session.do(SetViewDetrend(graph.vid, 2)))
+    qapp.processEvents()
+    assert graph.detrend_box.currentData() == 2
+    assert graph.detrend_box.currentText() == "quadratic"
+
+    before = len(win.session.to_script().splitlines())
+    for _ in range(5):
+        graph.apply(win.session.state.viewports.find(graph.vid))
+    assert len(win.session.to_script().splitlines()) == before

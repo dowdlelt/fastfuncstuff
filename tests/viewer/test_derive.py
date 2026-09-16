@@ -380,3 +380,85 @@ def test_partial_regression_keeps_each_voxels_mean():
     data, mix, _s, _n = _overlapping_components()
     out = denoise_partial(data, mix, np.array([False, True]), device=CPU)
     assert np.allclose(out.mean(-1), data.mean(-1), atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# display-only detrending, for graph windows
+#
+# Distinct from denoise(): nothing is written, nothing is kept, and the result
+# is centred on zero rather than on the original mean. That last part is the
+# point -- traces drawn raw are separated by their baselines, so the shape they
+# share is spread across the height of the plot instead of laid on top of
+# itself.
+# ---------------------------------------------------------------------------
+
+
+def test_order_minus_one_is_the_identity():
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    values = np.array([3.0, 1.0, 4.0, 1.0, 5.0])
+    assert detrend_trace(values, -1) is values
+
+
+def test_order_zero_removes_the_mean_and_nothing_else():
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    rng = np.random.default_rng(0)
+    values = 500.0 + rng.normal(0, 3, 64)
+    out = detrend_trace(values, 0)
+    assert out.mean() == pytest.approx(0.0, abs=1e-4)
+    assert out.std() == pytest.approx(values.std(), rel=1e-4), "shape must survive"
+
+
+def test_order_one_removes_a_linear_drift():
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    t = np.arange(100.0)
+    wave = 3.0 * np.sin(2 * np.pi * t / 25.0)
+    out = detrend_trace(400.0 + 0.7 * t + wave, 1)
+    assert out.mean() == pytest.approx(0.0, abs=1e-4)
+    # The ramp is gone: nothing left correlates with time.
+    assert abs(np.corrcoef(out, t)[0, 1]) < 1e-6
+    # And what remains is the wave. Not to machine precision -- a finite sine
+    # is not exactly orthogonal to a ramp, so fitting the ramp takes a little
+    # of the wave with it, which is a property of the projection and not a bug.
+    assert np.corrcoef(out, wave)[0, 1] > 0.97
+
+
+def test_two_traces_with_different_baselines_land_on_each_other():
+    """The whole purpose: make the shared shape comparable."""
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    t = np.arange(80.0)
+    shape = 2.0 * np.sin(t / 6.0)
+    a = 100.0 + 0.1 * t + shape
+    b = 900.0 + 0.9 * t + shape
+    assert abs(a.mean() - b.mean()) > 700
+    assert np.abs(detrend_trace(a, 1) - detrend_trace(b, 1)).max() < 1e-3
+
+
+def test_asking_for_more_polynomial_than_data_flattens_rather_than_fails():
+    """The SVD drops the deficient directions; a flat line is the true answer."""
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    out = detrend_trace(np.array([1.0, 5.0, 2.0, 8.0]), 9)
+    assert np.isfinite(out).all()
+    assert np.abs(out).max() < 1e-4
+
+
+def test_the_drift_basis_is_shared_and_not_writable():
+    """A grid graph asks for the same basis once per line per cell."""
+    from fastfuncstuff.viewer.derive import drift_basis
+
+    first = drift_basis(64, 2)
+    assert drift_basis(64, 2) is first, "cached, or a 5x5 grid pays 75 SVDs a move"
+    assert not first.flags.writeable, "every caller shares this one copy"
+
+
+def test_detrending_does_not_touch_its_input():
+    from fastfuncstuff.viewer.derive import detrend_trace
+
+    values = np.linspace(10.0, 20.0, 32)
+    before = values.copy()
+    detrend_trace(values, 1)
+    assert np.array_equal(values, before)

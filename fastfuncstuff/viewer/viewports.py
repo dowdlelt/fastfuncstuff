@@ -246,7 +246,15 @@ class ViewportSet:
         return viewport
 
     def open(self, kind: ViewKind, plane: Plane, *, vid: str | None = None) -> Viewport:
-        return self.add(Viewport(id=vid or self.mint_id(kind), kind=kind, plane=plane))
+        # A carpet defaults to removing the linear trend because it is
+        # unreadable through a ramp. A graph defaults to removing nothing,
+        # because a time course drawn in its own units, at its own level, is
+        # what a graph is *for* -- detrending it is a question you ask, not the
+        # state you start in.
+        detrend = -1 if kind is ViewKind.GRAPH else Viewport.detrend
+        return self.add(
+            Viewport(id=vid or self.mint_id(kind), kind=kind, plane=plane, detrend=detrend)
+        )
 
     def close(self, vid: str) -> Viewport:
         v = self.get(vid)
