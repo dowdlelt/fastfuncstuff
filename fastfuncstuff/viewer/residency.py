@@ -21,10 +21,21 @@ as it does on CUDA.
 The ~6 s inflate is also why loading is split in two. Volume 0 goes on screen
 almost immediately and the rest arrives on a worker thread; ``zlib`` releases
 the GIL while inflating, so that thread genuinely does not block the UI.
+
+**Eviction needs something to evict back to.** A dataset read off disk can be
+dropped for free, because the file is still there. One the viewer *made* -- a
+mode's output, a motion-corrected run, a selection -- has no file behind it, so
+dropping it destroys it. Those are parked in a spill directory first, as raw
+``.npy``: no compression, because a student's laptop is the machine that both
+runs out of RAM and has the slow disk, and paying gzip on the way out would
+turn a stall into a freeze. Reads come back memory-mapped, so scrubbing a
+spilled run pages in one volume at a time instead of inflating the whole thing.
 """
 
 from __future__ import annotations
 
+import shutil
+import tempfile
 import threading
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -66,7 +77,19 @@ class Resident:
     #: a counter cannot go backwards when the system clock does.
     used_at: int = 0
     error: BaseException | None = None
+    #: Where this dataset's array was parked when RAM ran short. Only ever set
+    #: for a memory-backed dataset; a file-backed one already has its file.
+    spill: Path | None = None
     _future: Future[np.ndarray] | None = field(default=None, repr=False)
+
+    @property
+    def memory_backed(self) -> bool:
+        """Whether this dataset exists only because the viewer made it.
+
+        ``path`` is a label for these, not a location, so it is the one thing
+        that must never be handed to a reader.
+        """
+        return self.info.storage == "MEMORY"
 
     @property
     def tier(self) -> Tier:
@@ -121,6 +144,7 @@ class VolumeStore:
         device_budget: int | None = None,
         max_workers: int = 2,
         zstd_threads: int | None = None,
+        spill_dir: str | Path | None = None,
     ) -> None:
         self.device = device or torch.device("cpu")
         self._ram_budget = ram_budget
@@ -129,6 +153,11 @@ class VolumeStore:
         self._items: dict[str, Resident] = {}
         self._lock = threading.RLock()
         self._clock = 0
+        # Made on first spill, not on construction: a session that never runs
+        # short of RAM should leave nothing behind in the temp directory. A
+        # caller-supplied directory is used as-is and never removed.
+        self._spill_dir: Path | None = Path(spill_dir).expanduser() if spill_dir else None
+        self._owns_spill_dir = spill_dir is None
         self._pool = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix="ffs-viewer-load"
         )
@@ -202,6 +231,39 @@ class VolumeStore:
             self._touch(res)
         return res
 
+    # -- spill ---------------------------------------------------------
+    def spill_dir(self) -> Path:
+        """The directory parked arrays go to, made on demand."""
+        with self._lock:
+            if self._spill_dir is None:
+                self._spill_dir = Path(tempfile.mkdtemp(prefix="ffs-viewer-"))
+            self._spill_dir.mkdir(parents=True, exist_ok=True)
+            return self._spill_dir
+
+    def _write_spill(self, key: str, array: np.ndarray) -> Path:
+        """Park one array, atomically enough that a crash cannot half-write it."""
+        # Keys are minted (``D1``, ``A_ICORR``) so they are already filename-safe,
+        # but a mode is free to name its output, so do not trust that.
+        stem = "".join(c if c.isalnum() or c in "-_" else "_" for c in key)
+        final = self.spill_dir() / f"{stem}.npy"
+        scratch = final.with_suffix(".npy.part")
+        # Through a file object, not a path: np.save silently appends ".npy" to
+        # a path that does not already end in it, so the rename below would
+        # look for a file that was never written.
+        with open(scratch, "wb") as fh:
+            np.save(fh, array, allow_pickle=False)
+        scratch.replace(final)
+        return final
+
+    def _drop_spill(self, res: Resident) -> None:
+        if res.spill is None:
+            return
+        try:
+            res.spill.unlink(missing_ok=True)
+        except OSError:
+            pass  # a temp file we could not remove is not worth failing a close over
+        res.spill = None
+
     def get(self, key: str) -> Resident:
         with self._lock:
             try:
@@ -215,7 +277,9 @@ class VolumeStore:
 
     def close(self, key: str) -> None:
         with self._lock:
-            self._items.pop(key, None)
+            res = self._items.pop(key, None)
+        if res is not None:
+            self._drop_spill(res)
 
     # -- preview -------------------------------------------------------
     def preview(self, key: str, index: int = 0) -> np.ndarray:
@@ -228,7 +292,14 @@ class VolumeStore:
         res = self.get(key)
         if index == 0 and res.preview is not None:
             return res.preview
-        vol, _ = read_volume(res.path, index)
+        if res.spill is not None:
+            # Memory-mapped, so stepping through a spilled run touches one
+            # volume's worth of pages rather than reading the whole array back
+            # in to throw all but one slab away.
+            mapped = np.load(res.spill, mmap_mode="r", allow_pickle=False)
+            vol = np.ascontiguousarray(mapped[..., index], dtype=np.float32)
+        else:
+            vol, _ = read_volume(res.path, index)
         if index == 0:
             with self._lock:
                 res.preview = vol
@@ -261,6 +332,15 @@ class VolumeStore:
     def _inflate(self, key: str) -> np.ndarray:
         res = self.get(key)
         try:
+            if res.spill is not None:
+                arr = np.ascontiguousarray(np.load(res.spill, allow_pickle=False), dtype=np.float32)
+                with self._lock:
+                    res.array = arr
+                    res._future = None
+                    self._touch(res)
+                self._enforce_ram_budget(protect=key)
+                return arr
+
             from fastfuncstuff.io.afni import load_nifti
 
             img = load_nifti(res.path, zstd_threads=self._zstd_threads)
@@ -328,15 +408,42 @@ class VolumeStore:
             torch.cuda.empty_cache()
 
     def release(self, key: str) -> None:
-        """Drop both device and RAM copies, keeping the header and preview."""
+        """Drop both device and RAM copies, keeping the header and preview.
+
+        Free for a dataset read off disk -- the file is still there to read
+        again. A dataset the viewer *made* has no such file, so it is written
+        to the spill directory first. Without that step the LRU silently
+        destroys exactly the results a session exists to produce, and the next
+        access fails on a path that never existed.
+        """
         self.demote(key)
         with self._lock:
             res = self._items.get(key)
-            if res is not None:
-                res.array = None
+            if res is None or res.array is None:
+                return
+            array = res.array if (res.memory_backed and res.spill is None) else None
+        if array is not None:
+            try:
+                spill = self._write_spill(key, array)
+            except (OSError, ValueError):
+                # Overshooting the RAM budget is recoverable; losing the only
+                # copy of a result is not. Keep it resident and let the
+                # eviction pass move on to a dataset that has a file.
+                return
+            with self._lock:
+                res.spill = spill
+        with self._lock:
+            res.array = None
 
     def shutdown(self) -> None:
         self._pool.shutdown(wait=False, cancel_futures=True)
+        with self._lock:
+            spill_dir = self._spill_dir if self._owns_spill_dir else None
+            self._spill_dir = None
+            for res in self._items.values():
+                res.spill = None
+        if spill_dir is not None:
+            shutil.rmtree(spill_dir, ignore_errors=True)
 
     # -- eviction ------------------------------------------------------
     def _touch(self, res: Resident) -> None:

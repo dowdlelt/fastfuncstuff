@@ -283,3 +283,113 @@ def test_a_session_replays_from_its_own_script(session, dataset, tmp_path):
         assert replay.state.layers.keys == [key]
     finally:
         replay.close()
+
+
+# ---------------------------------------------------------------------------
+# spilling: what happens to data the viewer made when RAM runs short
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def made():
+    """A volume the viewer made rather than read -- a mode output, a moco run."""
+    values = np.arange(6 * 5 * 4 * 8, dtype=np.float32).reshape(6, 5, 4, 8)
+    return values
+
+
+def test_eviction_does_not_destroy_a_volume_the_viewer_made(made):
+    """The bug: an adopted layer has no file, so releasing it used to lose it.
+
+    A student's laptop hits the RAM budget with a motion-corrected run and its
+    source both resident, and the LRU picks one. Whichever it picks must still
+    be there afterwards.
+    """
+    store = VolumeStore(device=CPU, ram_budget=1024)
+    try:
+        store.adopt("A_MOCO", made, name="A_MOCO_result")
+        store.adopt("B_AUX", np.zeros_like(made), name="B_aux")
+        store._enforce_ram_budget(protect="B_AUX")
+
+        res = store.get("A_MOCO")
+        assert res.array is None, "expected the LRU to evict it"
+        assert res.spill is not None, "evicted without being parked anywhere"
+        assert np.array_equal(store.ensure_ram("A_MOCO"), made)
+    finally:
+        store.shutdown()
+
+
+def test_a_spilled_volume_can_still_be_scrubbed(made):
+    """Stepping time on a spilled run must not inflate the whole array."""
+    store = VolumeStore(device=CPU, ram_budget=1024)
+    try:
+        store.adopt("A_MOCO", made, name="A_MOCO_result")
+        store.adopt("B_AUX", np.zeros_like(made), name="B_aux")
+        store._enforce_ram_budget(protect="B_AUX")
+
+        assert np.array_equal(store.preview("A_MOCO", 5), made[..., 5])
+        assert store.get("A_MOCO").array is None, "a preview must not promote"
+    finally:
+        store.shutdown()
+
+
+def test_a_file_backed_dataset_is_never_spilled(store, dataset):
+    """It already has a file; writing a second copy would be pure waste."""
+    path, _ = dataset
+    key = store.open(path).key
+    store.ensure_ram(key)
+    store.release(key)
+    assert store.get(key).spill is None
+
+
+def test_closing_a_layer_takes_its_spill_file_with_it(made):
+    store = VolumeStore(device=CPU, ram_budget=1024)
+    try:
+        store.adopt("A_MOCO", made, name="A_MOCO_result")
+        store.adopt("B_AUX", np.zeros_like(made), name="B_aux")
+        store._enforce_ram_budget(protect="B_AUX")
+        parked = store.get("A_MOCO").spill
+        assert parked is not None and parked.exists()
+
+        store.close("A_MOCO")
+        assert not parked.exists()
+    finally:
+        store.shutdown()
+
+
+def test_shutdown_removes_a_spill_directory_it_made(made):
+    store = VolumeStore(device=CPU, ram_budget=1024)
+    store.adopt("A_MOCO", made, name="A_MOCO_result")
+    store.adopt("B_AUX", np.zeros_like(made), name="B_aux")
+    store._enforce_ram_budget(protect="B_AUX")
+    spill_dir = store.spill_dir()
+    assert spill_dir.exists()
+
+    store.shutdown()
+    assert not spill_dir.exists()
+
+
+def test_a_supplied_spill_directory_outlives_the_store(made, tmp_path):
+    """A directory the caller chose is theirs; only a temp one we made is ours."""
+    mine = tmp_path / "scratch"
+    store = VolumeStore(device=CPU, ram_budget=1024, spill_dir=mine)
+    store.adopt("A_MOCO", made, name="A_MOCO_result")
+    store.adopt("B_AUX", np.zeros_like(made), name="B_aux")
+    store._enforce_ram_budget(protect="B_AUX")
+    assert (mine / "A_MOCO.npy").exists()
+
+    store.shutdown()
+    assert mine.exists()
+
+
+def test_spilling_keeps_the_data_when_the_disk_refuses(made, monkeypatch):
+    """Overshooting the budget is recoverable; losing the only copy is not."""
+    store = VolumeStore(device=CPU, ram_budget=1024)
+    try:
+        store.adopt("A_MOCO", made, name="A_MOCO_result")
+        monkeypatch.setattr(
+            VolumeStore, "_write_spill", lambda *a, **k: (_ for _ in ()).throw(OSError("full"))
+        )
+        store.release("A_MOCO")
+        assert np.array_equal(store.get("A_MOCO").array, made)
+    finally:
+        store.shutdown()
