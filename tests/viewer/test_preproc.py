@@ -426,3 +426,103 @@ def test_a_tool_with_no_qc_volumes_still_installs(preproc):
         assert sum(1 for layer in s.state.layers if layer.is_derived) == 1
     finally:
         del tools._tools["bare"]
+
+
+# ---------------------------------------------------------------------------
+# the details pane: what the job printed, folded away until asked for
+# ---------------------------------------------------------------------------
+
+
+def test_line_writer_emits_whole_lines_not_print_fragments():
+    """print() writes the text and the newline separately."""
+    from fastfuncstuff.viewer.ui.work import _LineWriter
+
+    seen = []
+    w = _LineWriter(seen.append)
+    print("hello", file=w)
+    print("world", file=w)
+    assert seen == ["hello", "world"]
+
+
+def test_line_writer_flushes_a_trailing_line_without_a_newline():
+    from fastfuncstuff.viewer.ui.work import _LineWriter
+
+    seen = []
+    w = _LineWriter(seen.append)
+    w.write("no newline yet")
+    assert seen == []
+    w.flush()
+    assert seen == ["no newline yet"]
+
+
+class ChattyTool(Tool):
+    name, label, tag, op = "chatty", "Chatty", "CHATTY", "chatty"
+    blurb = "Prints while it works."
+
+    def run(self, session, params, progress=None):
+        print("chatty: starting")
+        print("chatty: two things happened")
+        return ToolOutcome(values=np.asarray(session.store.ensure_ram(params["input"])))
+
+
+@pytest.fixture
+def with_chatty():
+    tools._tools["chatty"] = ChattyTool()
+    yield
+    del tools._tools["chatty"]
+
+
+def _run_dialog(win, qapp, name):
+    """Press a tool button and drive the worker to completion."""
+    win._mode_action(name)
+    dialog = win._tool_dialogs[name]
+    dialog._start()
+    for _ in range(2000):
+        qapp.processEvents()
+        if not dialog._running:
+            break
+    win.runner.wait(30_000)
+    for _ in range(20):
+        qapp.processEvents()
+    return dialog
+
+
+def test_what_a_tool_prints_reaches_the_details_pane(win, qapp, with_chatty):
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    dialog = _run_dialog(w, qapp, "chatty")
+    assert "chatty: starting" in dialog._log.toPlainText()
+    assert "chatty: two things happened" in dialog._log.toPlainText()
+
+
+def test_the_pane_stays_folded_and_is_only_offered_once_there_is_output(win, qapp, with_chatty):
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    w._mode_action("chatty")
+    assert not w._tool_dialogs["chatty"]._details.isVisible(), "nothing printed yet"
+
+    dialog = _run_dialog(w, qapp, "chatty")
+    assert dialog._details.isVisible(), "offered once there is something to read"
+    assert not dialog._log.isVisible(), "but still folded away"
+
+    dialog._details.setChecked(True)
+    assert dialog._log.isVisible()
+
+
+def test_a_silent_tool_never_grows_a_disclosure_arrow(win, qapp, with_double):
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    dialog = _run_dialog(w, qapp, "double")
+    assert not dialog._details.isVisible()
+    assert dialog._log.toPlainText() == ""
+
+
+def test_the_log_describes_this_run_not_the_last_one(win, qapp, with_chatty):
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    first = _run_dialog(w, qapp, "chatty")
+    assert first._log.toPlainText().count("chatty: starting") == 1
+
+    second = _run_dialog(w, qapp, "chatty")
+    assert second is first
+    assert second._log.toPlainText().count("chatty: starting") == 1

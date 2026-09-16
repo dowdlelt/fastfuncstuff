@@ -21,6 +21,8 @@ array, a progress fraction, and a result installed back on the GUI thread.
 
 from __future__ import annotations
 
+import contextlib
+import io
 from collections.abc import Callable
 
 from PySide6 import QtCore, QtWidgets
@@ -29,6 +31,33 @@ from PySide6 import QtCore, QtWidgets
 class _Signals(QtCore.QObject):
     progress = QtCore.Signal(float, str)
     finished = QtCore.Signal(bool, str)
+    logged = QtCore.Signal(str)
+
+
+class _LineWriter(io.TextIOBase):
+    """A stdout stand-in that hands finished lines to a callback.
+
+    Line-buffered rather than per-write, because ``print`` makes two writes --
+    the text, then the newline -- and emitting those separately would put every
+    other log line in the pane empty.
+    """
+
+    def __init__(self, emit: Callable[[str], None]) -> None:
+        super().__init__()
+        self._emit = emit
+        self._held = ""
+
+    def write(self, text: str) -> int:
+        self._held += text
+        while "\n" in self._held:
+            line, self._held = self._held.split("\n", 1)
+            self._emit(line)
+        return len(text)
+
+    def flush(self) -> None:
+        if self._held:
+            self._emit(self._held)
+            self._held = ""
 
 
 class _Task(QtCore.QRunnable):
@@ -46,8 +75,20 @@ class _Task(QtCore.QRunnable):
 
     @QtCore.Slot()
     def run(self) -> None:
+        # What the job prints is the job explaining itself -- ffs_moco names its
+        # device, its cost function and its per-volume timing -- and in a GUI
+        # session all of that went to a terminal nobody was reading. Captured
+        # here rather than by each caller so any slow job gets a log for free.
+        #
+        # redirect_stdout swaps sys.stdout process-wide, which is only safe
+        # because the runner runs exactly one job at a time.
+        writer = _LineWriter(self.signals.logged.emit)
         try:
-            ok = self.job(self.signals.progress.emit)
+            with contextlib.redirect_stdout(writer):
+                try:
+                    ok = self.job(self.signals.progress.emit)
+                finally:
+                    writer.flush()
         except Exception as exc:  # surfaced in the status bar, never swallowed
             self.signals.finished.emit(False, f"{type(exc).__name__}: {exc}")
             return
@@ -59,6 +100,8 @@ class PreparationRunner(QtCore.QObject):
 
     #: (fraction, message) while working.
     progress = QtCore.Signal(float, str)
+    #: One line the running job printed.
+    logged = QtCore.Signal(str)
     #: (succeeded, error message) when done.
     finished = QtCore.Signal(bool, str)
     #: True while a preparation is in flight.
@@ -94,6 +137,7 @@ class PreparationRunner(QtCore.QObject):
         self.busy_changed.emit(True)
         task = _Task(job)
         task.signals.progress.connect(self.progress, QtCore.Qt.ConnectionType.QueuedConnection)
+        task.signals.logged.connect(self.logged, QtCore.Qt.ConnectionType.QueuedConnection)
         task.signals.finished.connect(self._on_finished, QtCore.Qt.ConnectionType.QueuedConnection)
         self._pool.start(task)
         return True

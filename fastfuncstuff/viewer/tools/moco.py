@@ -144,9 +144,10 @@ class MocoTool(Tool):
             interp=str(params.get("interp") or "heptic"),
             final_interp=str(params.get("final_interp") or "wsinc5"),
             device=str(session.store.device),
-            # The dialog is the progress report; a second one on stdout is noise
-            # in a GUI session, and nobody is reading the terminal.
-            verb=0,
+            # Its running report is the dialog's details pane, which is where
+            # the interesting part of a preproc step actually is: the device it
+            # picked, the cost function, and what the estimation cost per volume.
+            verb=1,
         )
 
         if progress is not None:

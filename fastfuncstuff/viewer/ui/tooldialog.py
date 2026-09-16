@@ -73,6 +73,29 @@ class ToolDialog(QtWidgets.QDialog):
         self._bar.hide()
         outer.addWidget(self._bar)
 
+        # Folded away by default. The tool says what it is doing on one line;
+        # this is where it says how. Worth having open while learning what a
+        # step costs, and worth having shut the rest of the time.
+        self._details = QtWidgets.QToolButton()
+        self._details.setText("details")
+        self._details.setCheckable(True)
+        self._details.setAutoRaise(True)
+        self._details.setArrowType(QtCore.Qt.ArrowType.RightArrow)
+        self._details.setToolButtonStyle(QtCore.Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self._details.toggled.connect(self._show_details)
+        self._details.hide()
+        outer.addWidget(self._details, 0, QtCore.Qt.AlignmentFlag.AlignLeft)
+
+        self._log = QtWidgets.QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(QtGui.QFont(theme.MONO, theme.FONT_SMALL))
+        self._log.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self._log.setMinimumHeight(140)
+        # A long run is not a reason to hold a megabyte of scrollback.
+        self._log.setMaximumBlockCount(2000)
+        self._log.hide()
+        outer.addWidget(self._log)
+
         row = QtWidgets.QHBoxLayout()
         row.addStretch(1)
         self._close = QtWidgets.QPushButton("CLOSE")
@@ -138,6 +161,7 @@ class ToolDialog(QtWidgets.QDialog):
         def done(ok: bool, error: str) -> None:
             self._runner.finished.disconnect(done)
             self._runner.progress.disconnect(self._on_progress)
+            self._runner.logged.disconnect(self._on_logged)
             self._set_running(False)
             if not ok:
                 self._say(error or f"{spec.title} failed")
@@ -152,11 +176,17 @@ class ToolDialog(QtWidgets.QDialog):
 
         self._set_running(True)
         self._say("starting…")
+        # Cleared per run: the log describes this attempt, not the history of
+        # every interpolation you have tried.
+        self._log.clear()
+        self._details.hide()
         self._runner.progress.connect(self._on_progress)
+        self._runner.logged.connect(self._on_logged)
         self._runner.finished.connect(done)
         if not self._runner.run(job):
             self._runner.finished.disconnect(done)
             self._runner.progress.disconnect(self._on_progress)
+            self._runner.logged.disconnect(self._on_logged)
             self._set_running(False)
             self._say("busy with something else; try again in a moment")
 
@@ -185,6 +215,23 @@ class ToolDialog(QtWidgets.QDialog):
     def _say(self, text: str) -> None:
         self._status.setText(text)
         self._status.setVisible(bool(text))
+
+    @QtCore.Slot(str)
+    def _on_logged(self, line: str) -> None:
+        self._log.appendPlainText(line)
+        # Only offered once there is something to read, so a tool that prints
+        # nothing does not grow a disclosure arrow onto an empty box.
+        self._details.show()
+
+    def _show_details(self, open_: bool) -> None:
+        self._log.setVisible(open_)
+        self._details.setArrowType(
+            QtCore.Qt.ArrowType.DownArrow if open_ else QtCore.Qt.ArrowType.RightArrow
+        )
+        # Shrink back to the form when it folds, rather than leaving a tall
+        # empty dialog behind.
+        if not open_:
+            self.adjustSize()
 
     # -- closing -------------------------------------------------------
     def keyPressEvent(self, event: QtGui.QKeyEvent) -> None:  # noqa: N802 (Qt)
