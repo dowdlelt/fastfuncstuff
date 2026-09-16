@@ -74,6 +74,12 @@ class AuxVolume:
     #: Centre the display range on zero. What makes a signed difference map
     #: readable, and wrong for anything measured in intensity units.
     symmetric: bool = False
+    #: Volumes sharing a non-empty group get one display range, computed across
+    #: all of them. Two maps meant to be flipped between have to be drawn on the
+    #: same scale or the comparison is a lie: auto-scaled separately, a corrected
+    #: difference of pure noise fills the colour bar exactly as the uncorrected
+    #: one did, and the picture says nothing happened.
+    range_group: str = ""
 
 
 @dataclass

@@ -37,21 +37,35 @@ from fastfuncstuff.viewer.modes.base import (
     mode,
 )
 from fastfuncstuff.viewer.tools import registry as tools
-from fastfuncstuff.viewer.tools.base import Tool, ToolOutcome
+from fastfuncstuff.viewer.tools.base import AuxVolume, Tool, ToolOutcome
 
 
-def symmetric_range(values: np.ndarray) -> tuple[float, float] | None:
-    """A display window centred on zero, for a signed map.
+def symmetric_range(*volumes: np.ndarray) -> tuple[float, float] | None:
+    """A display window centred on zero, spanning every volume given.
 
     The 99th percentile of the magnitude rather than the maximum: one hot voxel
     at the edge of the field of view would otherwise set the scale and leave the
     map that matters looking empty.
+
+    Several volumes at once because a scale is only comparable if it is shared.
+    A before-and-after pair scaled separately draws corrected noise exactly as
+    boldly as uncorrected motion, which is the opposite of what the pair is for.
     """
-    finite = values[np.isfinite(values)]
-    if not finite.size:
+    finite = [v[np.isfinite(v)] for v in volumes]
+    pooled = np.concatenate([f for f in finite if f.size]) if finite else np.array([])
+    if not pooled.size:
         return None
-    top = float(np.percentile(np.abs(finite), 99.0))
+    top = float(np.percentile(np.abs(pooled), 99.0))
     return (-top, top) if top > 0 else None
+
+
+def shared_ranges(aux: list[AuxVolume]) -> dict[str, tuple[float, float] | None]:
+    """One display range per named range group."""
+    groups: dict[str, list[np.ndarray]] = {}
+    for volume in aux:
+        if volume.range_group:
+            groups.setdefault(volume.range_group, []).append(volume.values)
+    return {name: symmetric_range(*values) for name, values in groups.items()}
 
 
 @mode
@@ -191,6 +205,7 @@ class PreprocMode(Mode):
         stem = self.output_name_for(tool)
         op = tool.op or tool.name
         dirty = Aspect.NOTHING
+        pooled = shared_ranges(outcome.aux)
 
         for volume in reversed(outcome.aux):
             dirty |= self.session.install_derived(
@@ -201,7 +216,9 @@ class PreprocMode(Mode):
                 name=f"{stem} {volume.name}",
                 labels=volume.labels or None,
                 colormap=volume.colormap or None,
-                display_range=symmetric_range(volume.values) if volume.symmetric else None,
+                display_range=pooled.get(volume.range_group)
+                if volume.range_group
+                else (symmetric_range(volume.values) if volume.symmetric else None),
                 # Four QC volumes switched on at once would bury the anatomy.
                 # They are here to be flipped to, not to be drawn over.
                 visible=False,

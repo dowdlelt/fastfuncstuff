@@ -78,6 +78,10 @@ def qc_volumes(series: np.ndarray, when: str) -> list[AuxVolume]:
             labels=("diff(last-first)",),
             colormap="redblue",
             symmetric=True,
+            # The before and after maps share one scale. Flipping between them
+            # is the entire point, and it only means anything if the colour bar
+            # means the same thing in both.
+            range_group="diff",
         ),
     ]
 

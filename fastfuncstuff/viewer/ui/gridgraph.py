@@ -131,16 +131,35 @@ class FlowLayout(QtWidgets.QLayout):
         return self.minimumSize()
 
     def minimumSize(self) -> QtCore.QSize:  # noqa: N802 (Qt)
+        """The largest single item. Wrapped height comes from heightForWidth."""
         size = QtCore.QSize()
         for item in self._items:
-            size = size.expandedTo(item.minimumSize())
+            size = size.expandedTo(self._effective(item))
         return size
+
+    @staticmethod
+    def _effective(item: QtWidgets.QLayoutItem) -> QtCore.QSize:
+        """How much room the item will really take, not what it asks for.
+
+        A styled QCheckBox here hints 187x8 while its own minimumSizeHint is
+        198x15 -- the indicator has a floor the hint does not know about, and
+        Qt honours the floor when it draws. Laying out by the hint packs rows
+        8px apart for widgets that come out 15px tall, so the bottom row
+        overruns the host and slides under the plot below it: visible, and
+        slightly covered.
+
+        QLayoutItem.minimumSize does not rescue this (it reports the same 8),
+        so the widget has to be asked directly.
+        """
+        size = item.sizeHint().expandedTo(item.minimumSize())
+        widget = item.widget()
+        return size if widget is None else size.expandedTo(widget.minimumSizeHint())
 
     def _arrange(self, rect: QtCore.QRect, *, move: bool) -> int:
         x, y, row_h = rect.x(), rect.y(), 0
         gap = self.spacing()
         for item in self._items:
-            hint = item.sizeHint()
+            hint = self._effective(item)
             if x + hint.width() > rect.right() and row_h > 0:
                 x, y, row_h = rect.x(), y + row_h + gap, 0
             if move:

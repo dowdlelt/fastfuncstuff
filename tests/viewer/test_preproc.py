@@ -33,7 +33,7 @@ nib = pytest.importorskip("nibabel")
 pytest.importorskip("PySide6")
 CPU = torch.device("cpu")
 
-from PySide6 import QtWidgets  # noqa: E402  (after the importorskip above)
+from PySide6 import QtCore, QtWidgets  # noqa: E402  (after the importorskip above)
 
 from fastfuncstuff.viewer.ui.window import ViewerWindow  # noqa: E402
 
@@ -649,3 +649,146 @@ def test_a_panel_draws_every_line_it_was_given(qapp):
         [Trace(label="ok", values=np.arange(10.0)), Trace(label="short", values=np.array([1.0]))]
     )
     assert [t.label for t in view._traces] == ["ok"]
+
+
+# ---------------------------------------------------------------------------
+# reading a before-and-after pair
+# ---------------------------------------------------------------------------
+
+
+def test_the_two_difference_maps_share_one_scale(preproc):
+    """Separately scaled, corrected noise fills the bar as boldly as motion.
+
+    Which would say nothing happened when everything did. The pair is only a
+    comparison if the colour bar means the same thing in both.
+    """
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    spec = s.mode.dialog_for("moco")
+    spec.install(spec.run({**spec.params, "interp": "linear", "final_interp": "linear"}, None))
+
+    diffs = [layer for layer in s.state.layers if "diff" in layer.name]
+    assert len(diffs) == 2
+    assert len({(layer.range_lo, layer.range_hi) for layer in diffs}) == 1
+    assert diffs[0].range_lo == pytest.approx(-diffs[0].range_hi)
+
+
+def test_a_range_group_pools_its_volumes(preproc, with_double):
+    from fastfuncstuff.viewer.modes.preproc import shared_ranges
+
+    big = AuxVolume(slot="a", name="a", values=np.full((2, 2, 2, 1), 50.0), range_group="g")
+    small = AuxVolume(slot="b", name="b", values=np.full((2, 2, 2, 1), 1.0), range_group="g")
+    ranges = shared_ranges([big, small])
+    assert set(ranges) == {"g"}
+    lo, hi = ranges["g"]
+    assert hi == pytest.approx(50.0), "the louder volume sets the shared scale"
+    assert lo == pytest.approx(-50.0)
+
+
+def test_volumes_without_a_group_keep_their_own_scale(preproc):
+    from fastfuncstuff.viewer.modes.preproc import shared_ranges
+
+    assert shared_ranges([AuxVolume(slot="a", name="a", values=np.zeros((2, 2, 2, 1)))]) == {}
+
+
+# ---------------------------------------------------------------------------
+# stepping a layer's own sub-bricks
+# ---------------------------------------------------------------------------
+
+
+def test_stepping_sub_bricks_moves_the_layer_not_the_clock(win, qapp):
+    """A first/last stack is named states, not time points."""
+    w, d = win
+    key = w.session.load(d / "run1.nii.gz")
+    w.session.state.layers.update(key, time_linked=False, labels=("first", "last"))
+    w._sync_layer_list()
+    qapp.processEvents()
+
+    before = w.session.state.time_index
+    w._step_brick(1)
+    assert w.session.state.layers.get(key).volume_index == 1
+    assert w.session.state.time_index == before, "the global clock must not move"
+
+
+def test_stepping_sub_bricks_wraps(win, qapp):
+    w, d = win
+    key = w.session.load(d / "run1.nii.gz")
+    n = w.session.state.layers.get(key).n_volumes
+    w._sync_layer_list()
+    for _ in range(n):
+        w._step_brick(1)
+    assert w.session.state.layers.get(key).volume_index == 0
+
+
+def test_the_time_keys_say_so_when_they_cannot_move_this_layer(win, qapp):
+    """Otherwise the key reads as broken rather than as aimed elsewhere."""
+    w, d = win
+    key = w.session.load(d / "run1.nii.gz")
+    w.session.state.layers.update(key, time_linked=False)
+    w._sync_layer_list()
+    qapp.processEvents()
+
+    w._step_time(1)
+    assert "< and >" in w.statusBar().currentMessage()
+
+
+def test_no_hint_for_a_layer_the_time_keys_do_move(win, qapp):
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    w._sync_layer_list()
+    qapp.processEvents()
+    w.statusBar().clearMessage()
+    w._step_time(1)
+    assert w.statusBar().currentMessage() == ""
+
+
+# ---------------------------------------------------------------------------
+# the layer list's tick box
+# ---------------------------------------------------------------------------
+
+
+def _item_for(win, key):
+    for i in range(win.layer_list.count()):
+        item = win.layer_list.item(i)
+        if item.data(QtCore.Qt.ItemDataRole.UserRole) == key:
+            return item
+    raise KeyError(key)
+
+
+def test_the_tick_box_answers_a_click(win, qapp):
+    """It used to be a glyph in the row's text that only looked clickable."""
+    w, d = win
+    key = w.session.load(d / "run1.nii.gz")
+    w._sync_layer_list()
+    qapp.processEvents()
+    assert w.session.state.layers.get(key).visible
+
+    _item_for(w, key).setCheckState(QtCore.Qt.CheckState.Unchecked)
+    qapp.processEvents()
+    assert not w.session.state.layers.get(key).visible
+
+    _item_for(w, key).setCheckState(QtCore.Qt.CheckState.Checked)
+    qapp.processEvents()
+    assert w.session.state.layers.get(key).visible
+
+
+def test_the_tick_box_shows_what_the_key_did(win, qapp):
+    """Space and the box are two ways to the same state, so they must agree."""
+    w, d = win
+    key = w.session.load(d / "run1.nii.gz")
+    w._sync_layer_list()
+    qapp.processEvents()
+    w._toggle_visible()
+    qapp.processEvents()
+    assert _item_for(w, key).checkState() is QtCore.Qt.CheckState.Unchecked
+
+
+def test_redrawing_the_list_does_not_dispatch_visibility_changes(win, qapp):
+    """A sync that writes back into state recurses and pollutes the recording."""
+    w, d = win
+    w.session.load(d / "run1.nii.gz")
+    w._sync_layer_list()
+    before = len(w.session.to_script().splitlines())
+    for _ in range(5):
+        w._sync_layer_list()
+    assert len(w.session.to_script().splitlines()) == before

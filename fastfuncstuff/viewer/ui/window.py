@@ -825,10 +825,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.layer_list = QtWidgets.QListWidget()
         self.layer_list.setMaximumHeight(190)
         self.layer_list.setToolTip(
-            "[ and ] step through the stack; space hides a layer.\n"
+            "[ and ] step through the stack; space or the tick box hides a layer.\n"
             "A soloed image window draws whichever one is selected here."
         )
         self.layer_list.currentRowChanged.connect(self._row_selected)
+        # Visibility used to be a glyph in the row's text, which looked like a
+        # tick box and was not one -- clicking it only selected the row. A real
+        # check state is the same information and answers the click.
+        self.layer_list.itemChanged.connect(self._item_checked)
         # Drag to reorder. The list is drawn top-first while the stack is
         # stored bottom-first, so the drop row is translated in one place --
         # _row_selected and this are the only two that know about the flip.
@@ -1109,6 +1113,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("d", "dark / light palette", self._toggle_theme, group="windows"),
                 Binding(",", "previous volume", lambda: self._step_time(-1), group="time"),
                 Binding(".", "next volume", lambda: self._step_time(1), group="time"),
+                Binding(
+                    "<",
+                    "previous sub-brick of this layer",
+                    lambda: self._step_brick(-1),
+                    group="time",
+                ),
+                Binding(
+                    ">",
+                    "next sub-brick of this layer",
+                    lambda: self._step_brick(1),
+                    group="time",
+                ),
                 Binding("v", "play / pause", self._toggle_play, group="time"),
                 Binding("[", "previous layer", lambda: self._cycle_layer(-1), group="layer"),
                 Binding("]", "next layer", lambda: self._cycle_layer(1), group="layer"),
@@ -1245,6 +1261,40 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         nxt = (self.session.state.time_index + delta) % (hi + 1)
         self._dispatch(SetIndex(nxt))
+        self._hint_if_unmoved()
+
+    def _hint_if_unmoved(self) -> None:
+        """Say so when the time keys cannot move the layer being looked at.
+
+        A QC stack of first and last is 4-D and selected and does not follow the
+        time slider, by design -- its sub-bricks are named states, not time
+        points. Pressing `.` on it therefore scrubs everything *else*, which
+        reads as the key being broken rather than as aimed somewhere else.
+        """
+        key = self.current_key()
+        if key is None:
+            return
+        layer = self.session.state.layers.find(key)
+        if layer is None or layer.time_linked or layer.n_volumes <= 1:
+            return
+        self.statusBar().showMessage(
+            f"{layer.name} does not follow the time slider — use < and > to step its sub-bricks",
+            6000,
+        )
+
+    def _step_brick(self, delta: int) -> None:
+        """Step the selected layer's own sub-brick, whatever time is doing."""
+        key = self.current_key()
+        if key is None:
+            return
+        layer = self.session.state.layers.find(key)
+        if layer is None or layer.n_volumes <= 1:
+            return
+        nxt = (layer.volume_index + delta) % layer.n_volumes
+        self._dispatch(SetVolume(key=key, index=nxt))
+        name = layer.labels[nxt] if nxt < len(layer.labels) else f"#{nxt}"
+        self.statusBar().showMessage(f"{layer.name}: {name}", 4000)
+        self._sync_layer_controls()
 
     def _time_spin_changed(self, value: int) -> None:
         self._dispatch(SetIndex(int(value)))
@@ -1259,6 +1309,22 @@ class ViewerWindow(QtWidgets.QMainWindow):
         layer = self.session.state.layers.get(key)
         self._dispatch(SetLayerVisible(key, not layer.visible))
         self._sync_layer_list()
+
+    def _item_checked(self, item: QtWidgets.QListWidgetItem) -> None:
+        """A tick box was clicked: show or hide that layer.
+
+        Addressed by the key stored on the item rather than by its row, because
+        the list is drawn top-first over a bottom-first stack and a row number
+        is the one thing here that means two different things.
+        """
+        key = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if key is None:
+            return
+        layer = self.session.state.layers.find(key)
+        wanted = item.checkState() is QtCore.Qt.CheckState.Checked
+        if layer is None or layer.visible == wanted:
+            return
+        self._dispatch(SetLayerVisible(key, wanted))
 
     def _cycle_layer(self, delta: int) -> None:
         n = self.layer_list.count()
@@ -1463,9 +1529,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 pending = self.session.store.get(layer.key).pending
             except KeyError:
                 pending = False
-            mark = "▣" if layer.visible else "▢"
             tag = " ·computed" if layer.is_computed else (" ·loading" if pending else "")
-            self.layer_list.addItem(f"{mark} {layer.name}{tag}")
+            item = QtWidgets.QListWidgetItem(f"{layer.name}{tag}")
+            item.setFlags(item.flags() | QtCore.Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(
+                QtCore.Qt.CheckState.Checked if layer.visible else QtCore.Qt.CheckState.Unchecked
+            )
+            item.setData(QtCore.Qt.ItemDataRole.UserRole, layer.key)
+            self.layer_list.addItem(item)
         if keys:
             row = keys.index(selected) if selected in keys else 0
             self.layer_list.setCurrentRow(row)
