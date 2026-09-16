@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, ClassVar
 
@@ -133,10 +133,37 @@ class ActionControl(Control):
 
 
 @dataclass(frozen=True)
-class DatasetControl(Control):
-    """Pick a dataset from the catalog -- a mode's input, not its overlay."""
+class DialogSpec:
+    """A window one of a mode's buttons opens, described without naming Qt.
 
-    kinds: tuple[str, ...] = ()
+    Some actions are not a button press but a small form: pick an input, set two
+    parameters, run something slow, keep the result. Declaring that here rather
+    than building it in the window is what keeps the rule that a new mode -- or a
+    new preproc tool -- is one file and no window code.
+
+    The two callables are deliberately split by thread, the same split
+    :meth:`Mode.prepare` and :meth:`Mode.compute` make and for the same reason:
+    ``run`` is slow and goes on a worker, ``install`` touches the session and so
+    must land back on the thread that paints.
+    """
+
+    #: Identifies the dialog, so pressing the same button twice reuses the window
+    #: rather than stacking a second one over the first.
+    name: str
+    title: str
+    #: One line under the title saying what the step does.
+    blurb: str = ""
+    controls: tuple[Control, ...] = ()
+    #: Starting values, by control name. The dialog owns them from then on --
+    #: a tool's settings are per-run, not mode state that outlives the window.
+    params: dict[str, Any] = field(default_factory=dict)
+    #: ``run(params, progress) -> result``, on a worker thread.
+    run: Callable[[dict[str, Any], ProgressFn | None], Any] | None = None
+    #: ``install(result) -> Aspect``, on the GUI thread.
+    install: Callable[[Any], Aspect] | None = None
+    run_label: str = "run"
+    #: Why the dialog cannot run right now, or empty when it can.
+    blocked: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +281,14 @@ class Mode(ABC):
                 "to compare the next one against.",
             ),
         )
+
+    def dialog_for(self, action: str) -> DialogSpec | None:
+        """The form this action opens, or ``None`` if it acts immediately.
+
+        Checked before :meth:`action`, so a mode declares a button once and
+        decides here whether pressing it does something or asks something first.
+        """
+        return None
 
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
         """Run one declared action on the GUI thread; return what it dirtied."""
@@ -404,7 +439,7 @@ __all__ = [
     "ChoiceControl",
     "ComputedOverlay",
     "Control",
-    "DatasetControl",
+    "DialogSpec",
     "FloatControl",
     "IntControl",
     "Mode",

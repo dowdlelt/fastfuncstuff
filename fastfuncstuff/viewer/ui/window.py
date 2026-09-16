@@ -47,6 +47,7 @@ from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
+from fastfuncstuff.viewer.ui.tooldialog import ToolDialog
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
@@ -151,6 +152,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.runner.progress.connect(self._on_prepare_progress)
         self.runner.busy_changed.connect(self._on_prepare_busy)
         self._rebuild_queue: list[tuple[Controller, str]] = []
+        #: Open tool dialogs, by tool name. One per tool, reused on re-press.
+        self._tool_dialogs: dict[str, ToolDialog] = {}
         # Deferred a turn so the job that just finished has handed its picture
         # over before the next one takes the worker.
         self.runner.finished.connect(lambda *_: QtCore.QTimer.singleShot(0, self._drain_rebuilds))
@@ -273,6 +276,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """Point the panel at one controller."""
         if ctl is self._active:
             return
+        self._close_tool_dialogs()
         self._active = ctl
         self._show_active()
 
@@ -1010,6 +1014,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         before = set(self.session.state.viewports.ids)
         if not any(a.name == name for a in self.session.mode.actions()):
             return  # a trace window's key for an action this mode does not have
+        # Asked before the action is dispatched, so a mode declares a button
+        # once and decides for itself whether pressing it acts or asks first.
+        spec = self.session.mode.dialog_for(name)
+        if spec is not None:
+            self._open_tool_dialog(spec)
+            return
         try:
             self._dispatch(ModeAction(name))
         except (KeyError, ValueError, OSError) as exc:
@@ -1024,6 +1034,32 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 if viewport is not None and (viewport.is_carpet or viewport.is_matrix):
                     self._queue_rebuild(vid)
         self._sync_mode_panel()
+
+    def _open_tool_dialog(self, spec) -> None:
+        """Show one tool's form, reusing the window if it is already up."""
+        dialog = self._tool_dialogs.get(spec.name)
+        if dialog is None:
+            dialog = ToolDialog(spec, self.runner, self.refresh, self)
+            self._tool_dialogs[spec.name] = dialog
+        else:
+            # Re-seeded rather than rebuilt: the input dropdown has to pick up
+            # layers loaded since it was last opened.
+            dialog.reseed(spec)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _close_tool_dialogs(self) -> None:
+        """Drop every tool form.
+
+        Called when the active controller changes. A dialog's spec closes over
+        the session that made it, so leaving one open across a tab switch would
+        quietly run the tool against the stack you are no longer looking at.
+        """
+        for dialog in self._tool_dialogs.values():
+            dialog.close()
+            dialog.deleteLater()
+        self._tool_dialogs.clear()
 
     def _queue_rebuild(self, vid: str) -> None:
         """Rebuild a window now, or as soon as the worker is free.

@@ -5,7 +5,7 @@ from fastfuncstuff.viewer.modes.base import (
     ChoiceControl,
     ComputedOverlay,
     Control,
-    DatasetControl,
+    DialogSpec,
     FloatControl,
     IntControl,
     Mode,
@@ -21,6 +21,7 @@ from fastfuncstuff.viewer.modes.instacorr import InstaCorrMode  # noqa: E402
 # Registration is an import side effect, so every built-in mode must be
 # imported here or it will not appear in the mode selector.
 from fastfuncstuff.viewer.modes.plain import PlainMode  # noqa: E402
+from fastfuncstuff.viewer.modes.preproc import PreprocMode  # noqa: E402
 
 __all__ = [
     "BoolControl",
@@ -28,7 +29,7 @@ __all__ = [
     "ComputedOverlay",
     "Control",
     "DenoiseMode",
-    "DatasetControl",
+    "DialogSpec",
     "FloatControl",
     "ICAMode",
     "InstaCorrMode",
@@ -36,6 +37,7 @@ __all__ = [
     "Mode",
     "OverlayKind",
     "PlainMode",
+    "PreprocMode",
     "Trace",
     "mode",
     "registry",
