@@ -2067,3 +2067,106 @@ def test_comma_and_period_step_time_in_an_image_window(win4d, qapp):
     assert win4d.session.state.time_index == 2
     _press(image, qapp, ",")
     assert win4d.session.state.time_index == 1
+
+
+# ---------------------------------------------------------------------------
+# arrow keys in an image window
+#
+# The controller's arrows move along volume axes, because a controller has no
+# picture and "+y" is the only meaning available. An image window does have a
+# picture, so its arrows have to mean up/down/left/right *in that picture* --
+# a different thing on every plane, and on a flipped axis the opposite thing.
+# ---------------------------------------------------------------------------
+
+
+def _image_window(win):
+    from fastfuncstuff.viewer.ui.imagewindow import ImageWindow
+
+    return next(w for w in win.manager.windows.values() if isinstance(w, ImageWindow))
+
+
+@pytest.fixture
+def flipped(qapp, tmp_path):
+    """A window on a dataset whose x axis runs the other way (LAS-ish)."""
+    from fastfuncstuff.viewer.vocab import SetUnderlay
+
+    rng = np.random.default_rng(5)
+    aff = np.diag([-3.0, 3.0, 4.0, 1.0])
+    aff[:3, 3] = (36.0, -36.0, -20.0)
+    nib.save(
+        nib.Nifti1Image(rng.random((14, 16, 12)).astype(np.float32) * 100, aff),
+        str(tmp_path / "anat.nii.gz"),
+    )
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    w.read_directory(tmp_path)
+    w.refresh(session.do(SetUnderlay(str(tmp_path / "anat.nii.gz"))))
+    w.show()
+    qapp.processEvents()
+    yield w
+    w.close()
+
+
+@pytest.mark.parametrize("plane", list(Plane))
+@pytest.mark.parametrize(
+    ("drow", "dcol"), [(0, -1), (0, 1), (-1, 0), (1, 0)], ids=["left", "right", "up", "down"]
+)
+def test_arrows_move_the_crosshair_the_way_the_picture_reads(flipped, qapp, plane, drow, dcol):
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.vocab import SetIJK, SetViewPlane
+
+    win = flipped
+    image = _image_window(win)
+    win.refresh(win.session.do(SetViewPlane(image.vid, str(plane))))
+    qapp.processEvents()
+
+    win.session.do(SetIJK(7, 8, 6))  # middle, clear of every edge
+    view = plane_view(win.session.state, win.session.state.viewports.find(image.vid))
+    before = view.to_image(win.session.state.crosshair)
+
+    image._nudge_in_plane(drow, dcol)
+
+    after = view.to_image(win.session.state.crosshair)
+    assert (after[0] - before[0], after[1] - before[1]) == (drow, dcol)
+
+
+def test_the_edge_stops_rather_than_wrapping_to_the_far_side(flipped, qapp):
+    """Converting an out-of-range row through a flipped axis lands at the far
+    edge, which would make a held arrow key teleport the crosshair."""
+    from fastfuncstuff.viewer.compose import plane_view
+    from fastfuncstuff.viewer.vocab import SetIJK, SetViewPlane
+
+    win = flipped
+    image = _image_window(win)
+    win.refresh(win.session.do(SetViewPlane(image.vid, str(Plane.AXIAL))))
+    qapp.processEvents()
+    win.session.do(SetIJK(7, 8, 6))
+
+    view = plane_view(win.session.state, win.session.state.viewports.find(image.vid))
+    for _ in range(100):
+        image._nudge_in_plane(-1, 0)
+    assert view.to_image(win.session.state.crosshair)[0] == 0
+
+
+def test_page_keys_step_the_slice(flipped, qapp):
+    from fastfuncstuff.viewer.slicing import plane_layout
+    from fastfuncstuff.viewer.vocab import SetIJK, SetViewPlane
+
+    win = flipped
+    image = _image_window(win)
+    win.refresh(win.session.do(SetViewPlane(image.vid, str(Plane.AXIAL))))
+    qapp.processEvents()
+    win.session.do(SetIJK(7, 8, 6))
+
+    state = win.session.state
+    axis = plane_layout(state.grid.affine, Plane.AXIAL).fixed
+    before = state.crosshair[axis]
+    image._step(1)
+    assert state.crosshair[axis] == before + 1
+
+
+def test_an_image_window_declares_its_arrows_so_h_can_list_them(flipped):
+    """The table is both what is installed and what the help shows."""
+    image = _image_window(flipped)
+    keys = {b.keys for b in image.help._bindings}
+    assert {"Left", "Right", "Up", "Down", "PgUp", "PgDn"} <= keys

@@ -122,6 +122,20 @@ class ImageWindow(QtWidgets.QWidget):
                     Binding(k, f"{p.value} plane", lambda p=p: self._set_plane(p), group="plane")
                     for p, k in PLANE_KEYS.items()
                 ],
+                Binding(
+                    "Left", "crosshair left", lambda: self._nudge_in_plane(0, -1), group="navigate"
+                ),
+                Binding(
+                    "Right", "crosshair right", lambda: self._nudge_in_plane(0, 1), group="navigate"
+                ),
+                Binding(
+                    "Up", "crosshair up", lambda: self._nudge_in_plane(-1, 0), group="navigate"
+                ),
+                Binding(
+                    "Down", "crosshair down", lambda: self._nudge_in_plane(1, 0), group="navigate"
+                ),
+                Binding("PgUp", "next slice", lambda: self._step(1), group="navigate"),
+                Binding("PgDn", "previous slice", lambda: self._step(-1), group="navigate"),
                 Binding("o", "solo the selected layer", self.solo_button.click, group="view"),
                 Binding("+", "zoom in", lambda: self._zoom_by(1.25), group="view", aliases=("=",)),
                 Binding("-", "zoom out", lambda: self._zoom_by(1 / 1.25), group="view"),
@@ -191,6 +205,34 @@ class ImageWindow(QtWidgets.QWidget):
         self._dispatch(SetIJK(*ijk))
         if seed:
             self._dispatch(SetSeed(*ijk))
+
+    def _nudge_in_plane(self, drow: int, dcol: int) -> None:
+        """Move the crosshair one voxel, in the direction the key points on screen.
+
+        Screen-relative rather than volume-relative, which is the difference
+        between this and the controller's arrow keys. The controller has no
+        picture, so ``Up`` there can only mean "+y"; here there is a picture,
+        and ``Up`` has to mean up in it whatever axis that turns out to be.
+        Which axis, and which way along it, is what the plane's layout knows.
+
+        The step is applied to the volume axis rather than to the image row or
+        column, because converting an out-of-range row back through a flipped
+        axis lands at the *far* edge: pressing Up at the top of a flipped plane
+        would jump the crosshair to the bottom. The layout's flip is the whole
+        of the difference, so applying it here is equivalent and cannot wrap.
+        """
+        state = self.session.state
+        vp = self._viewport()
+        if state.grid is None or vp is None:
+            return
+        layout = plane_layout(state.grid.affine, vp.plane)
+        axis = layout.col if dcol else layout.row
+        flipped = layout.col_flip if dcol else layout.row_flip
+        step = dcol or drow
+        ijk = list(state.crosshair)
+        # SetIJK clamps to the grid, so the edge stops rather than wrapping.
+        ijk[axis] += -step if flipped else step
+        self._dispatch(SetIJK(*ijk))
 
     def _step_time(self, delta: int) -> None:
         """Step the shared volume index, wrapping -- the controller's , and . here too."""
