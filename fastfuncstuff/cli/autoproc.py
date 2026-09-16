@@ -628,6 +628,33 @@ def build_parser() -> argparse.ArgumentParser:
         "does not force the others to be spelled out.",
     )
 
+    g.add_argument(
+        "-round_onsets",
+        "-round-onsets",
+        action="append",
+        nargs="+",
+        default=None,
+        metavar="N [TASK ...]",
+        help="round event onsets in the design TOML (round_onset in each [[events]] "
+        "block). N is decimal places (0 = nearest second, 1 = nearest tenth) or TR "
+        "(nearest multiple of the TR). No TASK = every task; name tasks to limit it, "
+        "and repeat the flag for different N: `-round_onsets 1 -round_onsets TR "
+        "loc08pos`. Not ffs_reml's -round_onsets THRESHOLD. Only reaches a TOML "
+        "that is (re)written — add -glm_spec_overwrite for an existing one.",
+    )
+    g.add_argument(
+        "-round_durations",
+        "-round-durations",
+        action="append",
+        nargs="+",
+        default=None,
+        metavar="N [TASK ...]",
+        help="round event durations the same way (round_duration). This is the fix "
+        "for frame-timing jitter: duration = from_events gives one column per EXACT "
+        "duration, so 9.9915 s and 10.0083 s blocks become separate, often "
+        "collinear, regressors. `-round_durations 0` merges them.",
+    )
+
     g = p.add_argument_group("QC")
     g.add_argument(
         "-no_qc",
@@ -1044,6 +1071,16 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 f"-sep_spec_event_cols names task '{task}', which is not in this "
                 f"subject/scope ({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
             )
+    for flag, per_task in (
+        ("-round_onsets", opt.sep_round_onsets),
+        ("-round_durations", opt.sep_round_durations),
+    ):
+        for task in sorted(per_task):
+            if task not in all_tasks:
+                warnings.append(
+                    f"{flag} names task '{task}', which is not in this subject/scope "
+                    f"({', '.join(sorted(all_tasks)) or 'none'}) — it does nothing."
+                )
     for task in sorted(opt.sep_glm_blur):
         if task not in all_tasks:
             warnings.append(
@@ -1108,6 +1145,31 @@ def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
             f"  known: {', '.join(config.GLM_ORTVEC)}"
         )
     return names
+
+
+def _resolve_round_modes(
+    entries: list[list[str]] | None, flag: str
+) -> tuple[int | str | None, dict[str, int | str]]:
+    """``(dataset-wide mode, {task: mode})`` from repeated ``FLAG N [TASK ...]``.
+
+    A bare N applies to every task no entry names; a task named twice keeps the
+    last. A bad N is refused here rather than at GLM time an hour later.
+    """
+    from fastfuncstuff.design.spec import parse_round_mode
+
+    wide: int | str | None = None
+    per_task: dict[str, int | str] = {}
+    for entry in entries or []:
+        try:
+            mode = parse_round_mode(entry[0], flag)
+        except ValueError as exc:
+            raise SystemExit(f"ffs_autoproc: {exc}. The mode comes first: {flag} 0 TASK.") from None
+        assert mode is not None
+        if len(entry) == 1:
+            wide = mode
+        for task in entry[1:]:
+            per_task[task[len("task-") :] if task.startswith("task-") else task] = mode
+    return wide, per_task
 
 
 def _resolve_glm_blur(args) -> tuple[float | None, dict[str, float]]:
@@ -1437,6 +1499,10 @@ def main(argv: list[str] | None = None) -> int:
         )
     event_cols, event_cols_by_task = _resolve_event_cols(args)
     glm_blur, sep_glm_blur = _resolve_glm_blur(args)
+    round_onsets, sep_round_onsets = _resolve_round_modes(args.round_onsets, "-round_onsets")
+    round_durations, sep_round_durations = _resolve_round_modes(
+        args.round_durations, "-round_durations"
+    )
 
     # TPM resolution: an explicit -tpm wins; else, with -suma, build one in-script
     # from FreeSurfer outputs (no ahead-of-time SPM TPM needed).
@@ -1469,6 +1535,10 @@ def main(argv: list[str] | None = None) -> int:
         glm_spec_overwrite=args.glm_spec_overwrite,
         spec_event_cols=event_cols,
         sep_spec_event_cols=event_cols_by_task,
+        round_onsets=round_onsets,
+        sep_round_onsets=sep_round_onsets,
+        round_durations=round_durations,
+        sep_round_durations=sep_round_durations,
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,

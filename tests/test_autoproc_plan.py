@@ -2338,3 +2338,44 @@ def test_clustsim_rides_the_reml_command_not_a_separate_stage():
     assert "-mask " not in on
     # Only the GLM command changes.
     assert off.split("stage12: GLM")[0] == on.split("stage12: GLM")[0]
+
+
+def test_round_flags_parse_per_task():
+    from fastfuncstuff.cli.autoproc import _resolve_round_modes, build_parser
+
+    p = build_parser()
+    base = ["-bids_dir", "/b", "-subject", "X"]
+
+    def res(*argv):
+        return _resolve_round_modes(p.parse_args(base + list(argv)).round_durations, "-rd")
+
+    assert res() == (None, {})
+    assert res("-round_durations", "0") == (0, {})
+    assert res("-round_durations", "1", "-round_durations", "TR", "task-a", "b") == (
+        1,
+        {"a": "TR", "b": "TR"},
+    )
+    for bad in (("-round_durations", "0.5"), ("-round_durations", "loc08pos", "0")):
+        with pytest.raises(SystemExit):
+            res(*bad)
+
+
+def test_round_flags_reach_the_design_toml(tmp_path: Path):
+    """A per-task entry wins over the dataset-wide value; both land in [[events]]."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_two_tasks(tmp_path)
+    plan = build_plan(
+        scan_subject(tmp_path, "ME1"),
+        Options(
+            run_glm=True, round_durations=0, sep_round_durations={"floc": "TR"}, round_onsets=1
+        ),
+    )
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+
+    floc = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert {(e.round_onset, e.round_duration) for e in floc.events} == {(1, "TR")}
+    imagery = load_spec(tmp_path / "wd" / "stage11.design.task-imagery.toml")
+    assert {(e.round_onset, e.round_duration) for e in imagery.events} == {(1, 0)}

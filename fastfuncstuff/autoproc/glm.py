@@ -198,6 +198,14 @@ def stim_vec_specs(task: str, opt) -> list:
     return out
 
 
+def round_modes(task: str, opt) -> tuple[int | str | None, int | str | None]:
+    """``(round_onset, round_duration)`` for ``task``; a per-task entry wins."""
+    return (
+        opt.sep_round_onsets.get(task, opt.round_onsets),
+        opt.sep_round_durations.get(task, opt.round_durations),
+    )
+
+
 def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
     """Timepoints the preprocessed run will have: the raw header's count minus
     any trailing noise volumes the pipeline trims up front."""
@@ -269,6 +277,7 @@ def write_design_specs(
         nuisance, _skipped = nuisance_specs(task, opt)
         stim_vecs = stim_vec_specs(task, opt)
         event_cols, _warn = resolve_event_cols(task, scan_paths, opt)
+        round_onset, round_duration = round_modes(task, opt)
         try:
             spec, notes = build_stub_spec(
                 [Path(f"stage10.final.{_frag(pr)}.nii{opt.final_fmt}") for pr in prs],
@@ -278,6 +287,8 @@ def write_design_specs(
                 event_cols=event_cols,
                 nuisance=nuisance,
                 stim_vec=stim_vecs,
+                round_onset=round_onset,
+                round_duration=round_duration,
             )
         except (ValueError, OSError) as exc:
             rows.append((task, str(dest), f"skipped: {exc}"))

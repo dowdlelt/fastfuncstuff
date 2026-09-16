@@ -128,6 +128,14 @@ class Options:
     # the defaults for that task, with a warning.
     spec_event_cols: tuple[str, str, str] | None = None
     sep_spec_event_cols: dict[str, tuple[str, str, str]] = field(default_factory=dict)
+    # Event-time rounding written into every [[events]] block: decimal places
+    # (0 = nearest second) or "TR". Same wide + per-task split as glm_blur. The
+    # common reason is duration jitter: from_events splits a condition into one
+    # column per EXACT duration, which can make a design singular.
+    round_onsets: int | str | None = None
+    sep_round_onsets: dict[str, int | str] = field(default_factory=dict)
+    round_durations: int | str | None = None
+    sep_round_durations: dict[str, int | str] = field(default_factory=dict)
     locomoco: bool = False
     # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
     # CHANGES the field the correction applies, where the -events diagnostic the

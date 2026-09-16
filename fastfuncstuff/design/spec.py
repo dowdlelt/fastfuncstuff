@@ -57,8 +57,8 @@ class EventSpec:
     # a user override at compile time and would silently discard `duration`.
     hrf: str = "SPMG1"
     mode: Literal["condition", "im"] = "condition"
-    round_onset: float | Literal["TR"] | None = None
-    round_duration: float | None = None
+    round_onset: int | Literal["TR"] | None = None
+    round_duration: int | Literal["TR"] | None = None
 
 
 @dataclass
@@ -149,6 +149,41 @@ class Spec:
 DEFAULT_EVENT_COLUMNS = ("onset", "duration", "trial_type")
 DEFAULT_DROP_TRIAL_TYPES = ("rest", "Rest", "REST", "baseline")
 
+RoundMode = int | Literal["TR"] | None
+
+
+def parse_round_mode(value, what: str = "rounding") -> RoundMode:
+    """Normalise a rounding mode: a decimal-place count >= 0, ``"TR"``, or None.
+
+    Refuses anything else. A fractional value (0.5) used to be truncated to 0
+    decimals by ``int()`` without a word, which reads as "half a TR" to anyone
+    coming from ffs_reml -round_onsets THRESHOLD.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().upper() == "TR":
+            return "TR"
+        try:
+            value = float(value)
+        except ValueError:
+            raise ValueError(f"{what}: {value!r} is not a decimal-place count or 'TR'") from None
+    if isinstance(value, bool) or not float(value).is_integer() or value < 0:
+        raise ValueError(
+            f"{what}: {value!r} must be a whole number of decimal places "
+            "(0 = nearest second, 1 = nearest tenth, ...) or 'TR'"
+        )
+    return int(value)
+
+
+def round_event_time(value: float, mode: RoundMode, tr: float) -> float:
+    """Round an onset or duration: ``mode`` decimals, the nearest TR multiple, or as-is."""
+    if mode is None:
+        return value
+    if mode == "TR":
+        return round(value / tr) * tr
+    return round(value, int(mode))
+
 
 def bold_header(path: str | Path) -> tuple[int, float]:
     """(n_timepoints, TR) from a NIfTI header — no voxel data is read."""
@@ -223,6 +258,8 @@ def build_stub_spec(
     default_hrf: str = "SPMG1",
     nuisance: list[NuisanceSpec] | None = None,
     stim_vec: list[StimVecSpec] | None = None,
+    round_onset: RoundMode = None,
+    round_duration: RoundMode = None,
 ) -> tuple[Spec, dict[str, str]]:
     """Build a stub Spec (+ per-trial-type informational notes) from BOLD
     headers and events TSVs.
@@ -277,16 +314,34 @@ def build_stub_spec(
         meta.events_columns = EventsColumns(onset=cols[0], duration=cols[1], trial_type=cols[2])
 
     events = [
-        EventSpec(trial_type=tt, duration="from_events", hrf=default_hrf, mode="condition")
-        for tt in trial_types
-    ]
-    notes = {
-        tt: (
-            "observed durations (informational, no effect on compile): "
-            + duration_stats_comment(durations_per_tt[tt])
+        EventSpec(
+            trial_type=tt,
+            duration="from_events",
+            hrf=default_hrf,
+            mode="condition",
+            round_onset=round_onset,
+            round_duration=round_duration,
         )
         for tt in trial_types
-    }
+    ]
+    notes = {}
+    for tt in trial_types:
+        note = "observed durations (informational, no effect on compile): " + (
+            duration_stats_comment(durations_per_tt[tt])
+        )
+        # Compile splits on EXACT durations, so frame-timing jitter (9.9915 vs
+        # 10.0083 s) silently multiplies the columns — and paired conditions
+        # with one event per column become identical, i.e. a singular design.
+        n_split = len(
+            {round_event_time(d, round_duration, float(tr)) for d in durations_per_tt[tt] if d == d}
+        )
+        if n_split > 1:
+            note += (
+                f"\nWARNING: {n_split} distinct durations -> compile splits this into "
+                f"{n_split} columns ({tt}_dur...). If they are the same event, set "
+                "round_duration (e.g. 0) to merge them."
+            )
+        notes[tt] = note
     return (
         Spec(
             meta=meta,
@@ -339,6 +394,13 @@ def load_spec(path: str | Path) -> Spec:
     )
 
     events = [EventSpec(**e) for e in raw.get("events", [])]
+    for ev in events:
+        ev.round_onset = parse_round_mode(
+            ev.round_onset, f"{path}: event '{ev.trial_type}' round_onset"
+        )
+        ev.round_duration = parse_round_mode(
+            ev.round_duration, f"{path}: event '{ev.trial_type}' round_duration"
+        )
 
     nuisance: list[NuisanceSpec] = []
     for n_raw in raw.get("nuisance", []):
@@ -543,7 +605,7 @@ def write_spec(
     lines.append("#                              single-trial / amplitude-modulation analyses.")
     lines.append("#")
     lines.append("# round_onset    Pre-convolution onset rounding (applied before grouping).")
-    lines.append("#                  <number>  — round to this many decimal places (0 = integers)")
+    lines.append("#                  <integer> — round to this many decimal places (0 = integers)")
     lines.append('#                  "TR"      — snap to the nearest TR boundary')
     lines.append("#                  omitted   — no rounding")
     lines.append("#")

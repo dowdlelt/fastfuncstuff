@@ -37,9 +37,11 @@ from fastfuncstuff.design.builder import (
 from fastfuncstuff.design.spec import (
     EventSpec,
     NuisanceSpec,
+    RoundMode,
     build_stub_spec,
     load_spec,
     resolve_contrast,
+    round_event_time,
     write_spec,
 )
 
@@ -278,24 +280,12 @@ def _do_stub(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _round_value(value: float, mode: float | str | None, tr: float) -> float:
-    if mode is None:
-        return value
-    if isinstance(mode, str):
-        if mode.upper() == "TR":
-            return round(value / tr) * tr
-        raise ValueError(f"Unknown rounding mode: {mode!r}")
-    # Numeric: decimals (0 = integers, 1 = tenths, …) following AFNI convention.
-    decimals = int(mode)
-    return round(value, decimals)
-
-
 def _read_events_for_condition(
     events_path: Path,
     trial_type: str,
     cols: tuple[str, str, str],
-    round_onset: float | str | None,
-    round_duration: float | None,
+    round_onset: RoundMode,
+    round_duration: RoundMode,
     tr: float,
 ) -> list[tuple[float, float]]:
     """Return (onset, duration) pairs for one trial_type in one events file,
@@ -312,8 +302,8 @@ def _read_events_for_condition(
                 duration = float(row[dur_col])
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Could not parse onset/duration in {events_path}: {exc}") from exc
-            onset = _round_value(onset, round_onset, tr)
-            duration = _round_value(duration, round_duration, tr)
+            onset = round_event_time(onset, round_onset, tr)
+            duration = round_event_time(duration, round_duration, tr)
             out.append((onset, duration))
     return out
 
@@ -442,10 +432,22 @@ def _expand_event_to_stims(
             return [(timing_path, event.trial_type, hrf, event.mode == "im")]
 
         # condition mode + multiple durations -> split per duration.
+        # Loud, because a split nobody asked for (frame-timing jitter) looks like
+        # mangled condition names downstream and can make the design singular.
+        n_events = sum(len(run) for run in per_run)
+        print(
+            f"⚠️  Event '{event.trial_type}': {len(unique_durs)} distinct durations "
+            f"({min(unique_durs):g}–{max(unique_durs):g} s) → split into "
+            f"{len(unique_durs)} regressors for {n_events} events. If these are one "
+            'event type with timing jitter, set round_duration = 0 (or 1, or "TR") '
+            "in its [[events]] block.",
+            flush=True,
+        )
         out: list[tuple[Path, str, str, bool]] = []
+        digits = _unique_dur_digits(unique_durs)
         for d in unique_durs:
             per_run_onsets = [[o for o, dd in run if dd == d] for run in per_run]
-            label = f"{event.trial_type}_dur{_fmt_dur(d)}"
+            label = f"{event.trial_type}_dur{_fmt_dur(d, digits)}"
             timing_path = tmpdir / f"{label}.1D"
             _write_afni_timing(timing_path, per_run_onsets)
             hrf = _inject_duration(event.hrf, d)
@@ -460,11 +462,24 @@ def _expand_event_to_stims(
     return [(timing_path, event.trial_type, hrf, event.mode == "im")]
 
 
-def _fmt_dur(d: float) -> str:
+def _fmt_dur(d: float, digits: int = 6) -> str:
     """Render a duration for use inside a label: ``2.0 -> '2'``, ``2.5 -> '2p5'``."""
     if float(d).is_integer():
         return f"{int(d)}"
-    return f"{d:g}".replace(".", "p")
+    return f"{d:.{digits}g}".replace(".", "p")
+
+
+def _unique_dur_digits(durations: list[float]) -> int:
+    """Fewest significant digits (>= 6) that keep every duration's label distinct.
+
+    Bug of record: ``%g`` rendered 10.00823 and 10.00818 both as ``10p0082``; the
+    label also names the timing file, so the second split overwrote the first
+    and two columns carried the same onsets.
+    """
+    for digits in range(6, 18):
+        if len({_fmt_dur(d, digits) for d in durations}) == len(durations):
+            return digits
+    return 17
 
 
 def _inject_duration(hrf: str, duration: float) -> str:
