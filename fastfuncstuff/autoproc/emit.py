@@ -1310,7 +1310,7 @@ def _spec_files(plan: Plan, bids_root: str | None) -> list[str]:
     if not plan.options.run_glm:
         return []
     return [
-        spec_path(task)
+        spec_path(task, plan.options)
         for task, prs in runs_by_task(plan).items()
         if events_for_task(task, prs, bids_root, plan.options)
     ]
@@ -3484,7 +3484,7 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
             '-device "$DEVICE"',
         ]
         if resolved:
-            spec = spec_path(task)
+            spec = spec_path(task, opt)
             _, skipped = nuisance_specs(task, opt)
             out.append(f"# task-{task}: model = {spec} (edit that, not this command).")
             if skipped:
@@ -3519,6 +3519,11 @@ def _stage_stats(plan: Plan, bids_root: str | None) -> str:
                 [
                     f"-input {finals}",
                     f"-events {_events_args(task, prs, bids_root, opt)}",
+                    *(
+                        f"-event_filter_{f.action} {shlex.quote(f.column)} "
+                        + " ".join(shlex.quote(v) for v in f.values)
+                        for f in opt.event_filters.get(task, [])
+                    ),
                     *ort_parts,
                     "-polort 3",
                     *common,

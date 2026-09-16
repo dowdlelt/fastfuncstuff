@@ -25,9 +25,18 @@ from fastfuncstuff.autoproc.plan import Plan, PlanRun
 from fastfuncstuff.design.spec import DEFAULT_EVENT_COLUMNS
 
 
-def spec_path(task: str) -> str:
-    """The design TOML's name, relative to the script's working dir."""
-    return f"stage{STAGE_NUMBERS['design']:02d}.design.task-{task}.toml"
+def spec_path(task: str, opt=None) -> str:
+    """The design TOML's name, relative to the script's working dir.
+
+    A task with event filters gets the -glm_label in its name: the left- and
+    right-hemifield fits of one task are different designs, and an existing TOML
+    is kept rather than regenerated, so a shared name would fit the first
+    variant's design under the second variant's label.
+    """
+    tag = ""
+    if opt is not None and opt.event_filters.get(task) and opt.glm_label:
+        tag = f"{opt.glm_label}."
+    return f"stage{STAGE_NUMBERS['design']:02d}.design.{tag}task-{task}.toml"
 
 
 def runs_by_task(plan: Plan) -> dict[str, list[PlanRun]]:
@@ -198,6 +207,14 @@ def stim_vec_specs(task: str, opt) -> list:
     return out
 
 
+def round_modes(task: str, opt) -> tuple[int | str | None, int | str | None]:
+    """``(round_onset, round_duration)`` for ``task``; a per-task entry wins."""
+    return (
+        opt.sep_round_onsets.get(task, opt.round_onsets),
+        opt.sep_round_durations.get(task, opt.round_durations),
+    )
+
+
 def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
     """Timepoints the preprocessed run will have: the raw header's count minus
     any trailing noise volumes the pipeline trims up front."""
@@ -205,6 +222,22 @@ def _n_timepoints(pr: PlanRun, noise_vols: int) -> int:
 
     n_tp, _ = bold_header(pr.bold.mag_path)
     return max(int(n_tp) - int(noise_vols), 0)
+
+
+def _kept_status(dest: Path, requested: list) -> str:
+    """ "kept", plus a warning when the kept TOML's event filters are not the ones asked for."""
+    from fastfuncstuff.design.spec import load_spec
+
+    try:
+        have = load_spec(dest).meta.event_filters
+    except (OSError, ValueError):
+        return "kept"
+    if [f.describe() for f in have] == [f.describe() for f in requested]:
+        return "kept"
+    return (
+        "kept — WARNING: its event_filters differ from the ones requested; pass "
+        "-glm_spec_overwrite to regenerate it"
+    )
 
 
 def write_design_specs(
@@ -232,7 +265,7 @@ def write_design_specs(
     copy_events(plan, bids_root, work_dir)
     copies = stimuli_map(plan, bids_root)
     for task, prs in runs_by_task(plan).items():
-        dest = out_dir / spec_path(task)
+        dest = out_dir / spec_path(task, opt)
         if opt.events:
             events = [Path(e) for e in opt.events]
             if len(events) == 1:
@@ -248,7 +281,7 @@ def write_design_specs(
             continue
 
         if dest.exists() and not opt.glm_spec_overwrite:
-            rows.append((task, str(dest), "kept"))
+            rows.append((task, str(dest), _kept_status(dest, opt.event_filters.get(task, []))))
             continue
 
         # Scan the copies under work_dir, but record the work-dir-relative name:
@@ -269,6 +302,7 @@ def write_design_specs(
         nuisance, _skipped = nuisance_specs(task, opt)
         stim_vecs = stim_vec_specs(task, opt)
         event_cols, _warn = resolve_event_cols(task, scan_paths, opt)
+        round_onset, round_duration = round_modes(task, opt)
         try:
             spec, notes = build_stub_spec(
                 [Path(f"stage10.final.{_frag(pr)}.nii{opt.final_fmt}") for pr in prs],
@@ -278,6 +312,9 @@ def write_design_specs(
                 event_cols=event_cols,
                 nuisance=nuisance,
                 stim_vec=stim_vecs,
+                round_onset=round_onset,
+                round_duration=round_duration,
+                event_filters=opt.event_filters.get(task),
             )
         except (ValueError, OSError) as exc:
             rows.append((task, str(dest), f"skipped: {exc}"))

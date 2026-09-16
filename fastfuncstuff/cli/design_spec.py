@@ -26,8 +26,18 @@ from pathlib import Path
 import numpy as np
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_ortvec_arguments
-from fastfuncstuff.design.bids_events import check_events_pairing
+from fastfuncstuff.cli_utils import (
+    add_event_filter_arguments,
+    add_ortvec_arguments,
+    resolve_event_filters,
+)
+from fastfuncstuff.design.bids_events import (
+    EventFilter,
+    check_events_pairing,
+    check_filter_columns,
+    event_row_passes,
+    warn_unmatched_filters,
+)
 from fastfuncstuff.design.builder import (
     build_design_matrix,
     good_list_from_censor,
@@ -37,9 +47,11 @@ from fastfuncstuff.design.builder import (
 from fastfuncstuff.design.spec import (
     EventSpec,
     NuisanceSpec,
+    RoundMode,
     build_stub_spec,
     load_spec,
     resolve_contrast,
+    round_event_time,
     write_spec,
 )
 
@@ -111,6 +123,7 @@ def _build_parser() -> argparse.ArgumentParser:
     # flags. See the generated [[nuisance]] section header in design.toml for
     # the full padding-semantics writeup.
     add_ortvec_arguments(p_stub)
+    add_event_filter_arguments(p_stub)
     p_stub.add_argument(
         "-overwrite",
         action="store_true",
@@ -242,6 +255,7 @@ def _do_stub(args: argparse.Namespace) -> int:
         drop_trial_types=list(args.drop_trial_types),
         default_hrf=args.default_hrf,
         nuisance=_build_nuisance_from_cli_args(args, len(bold_paths)),
+        event_filters=resolve_event_filters(args),
     )
 
     out_path = Path(args.out)
@@ -278,25 +292,14 @@ def _do_stub(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _round_value(value: float, mode: float | str | None, tr: float) -> float:
-    if mode is None:
-        return value
-    if isinstance(mode, str):
-        if mode.upper() == "TR":
-            return round(value / tr) * tr
-        raise ValueError(f"Unknown rounding mode: {mode!r}")
-    # Numeric: decimals (0 = integers, 1 = tenths, …) following AFNI convention.
-    decimals = int(mode)
-    return round(value, decimals)
-
-
 def _read_events_for_condition(
     events_path: Path,
     trial_type: str,
     cols: tuple[str, str, str],
-    round_onset: float | str | None,
-    round_duration: float | None,
+    round_onset: RoundMode,
+    round_duration: RoundMode,
     tr: float,
+    event_filters: list[EventFilter] | None = None,
 ) -> list[tuple[float, float]]:
     """Return (onset, duration) pairs for one trial_type in one events file,
     with rounding applied per the event spec."""
@@ -304,16 +307,19 @@ def _read_events_for_condition(
     out: list[tuple[float, float]] = []
     with open(events_path, newline="") as fh:
         reader = csv.DictReader(fh, delimiter="\t")
+        check_filter_columns(list(reader.fieldnames or []), event_filters, events_path)
         for row in reader:
             if str(row.get(tt_col, "")).strip() != trial_type:
+                continue
+            if not event_row_passes(row, event_filters):
                 continue
             try:
                 onset = float(row[onset_col])
                 duration = float(row[dur_col])
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"Could not parse onset/duration in {events_path}: {exc}") from exc
-            onset = _round_value(onset, round_onset, tr)
-            duration = _round_value(duration, round_duration, tr)
+            onset = round_event_time(onset, round_onset, tr)
+            duration = round_event_time(duration, round_duration, tr)
             out.append((onset, duration))
     return out
 
@@ -388,6 +394,7 @@ def _expand_event_to_stims(
     tmpdir: Path,
     trim=None,
     run_lengths_sec: list[float] | None = None,
+    event_filters: list[EventFilter] | None = None,
 ) -> list[tuple[Path, str, str, bool]]:
     """
     Expand one EventSpec into one or more (timing_file, label, hrf, im_flag)
@@ -410,9 +417,18 @@ def _expand_event_to_stims(
             event.round_onset,
             event.round_duration,
             tr,
+            event_filters,
         )
         for ef in events_files
     ]
+    # One TOML serves several filtered fits (ffs_reml -spec X -event_filter_out
+    # hemifield right), so a block the filters emptied is skipped, not fatal.
+    if event_filters and not any(per_run):
+        print(
+            f"   Event '{event.trial_type}': every row filtered out — not modelled.",
+            flush=True,
+        )
+        return []
 
     if trim is not None and trim.active:
         per_run = _shift_events_for_trim(per_run, trim, run_lengths_sec or [])
@@ -442,10 +458,22 @@ def _expand_event_to_stims(
             return [(timing_path, event.trial_type, hrf, event.mode == "im")]
 
         # condition mode + multiple durations -> split per duration.
+        # Loud, because a split nobody asked for (frame-timing jitter) looks like
+        # mangled condition names downstream and can make the design singular.
+        n_events = sum(len(run) for run in per_run)
+        print(
+            f"⚠️  Event '{event.trial_type}': {len(unique_durs)} distinct durations "
+            f"({min(unique_durs):g}–{max(unique_durs):g} s) → split into "
+            f"{len(unique_durs)} regressors for {n_events} events. If these are one "
+            'event type with timing jitter, set round_duration = 0 (or 1, or "TR") '
+            "in its [[events]] block.",
+            flush=True,
+        )
         out: list[tuple[Path, str, str, bool]] = []
+        digits = _unique_dur_digits(unique_durs)
         for d in unique_durs:
             per_run_onsets = [[o for o, dd in run if dd == d] for run in per_run]
-            label = f"{event.trial_type}_dur{_fmt_dur(d)}"
+            label = f"{event.trial_type}_dur{_fmt_dur(d, digits)}"
             timing_path = tmpdir / f"{label}.1D"
             _write_afni_timing(timing_path, per_run_onsets)
             hrf = _inject_duration(event.hrf, d)
@@ -460,11 +488,24 @@ def _expand_event_to_stims(
     return [(timing_path, event.trial_type, hrf, event.mode == "im")]
 
 
-def _fmt_dur(d: float) -> str:
+def _fmt_dur(d: float, digits: int = 6) -> str:
     """Render a duration for use inside a label: ``2.0 -> '2'``, ``2.5 -> '2p5'``."""
     if float(d).is_integer():
         return f"{int(d)}"
-    return f"{d:g}".replace(".", "p")
+    return f"{d:.{digits}g}".replace(".", "p")
+
+
+def _unique_dur_digits(durations: list[float]) -> int:
+    """Fewest significant digits (>= 6) that keep every duration's label distinct.
+
+    Bug of record: ``%g`` rendered 10.00823 and 10.00818 both as ``10p0082``; the
+    label also names the timing file, so the second split overwrote the first
+    and two columns carried the same onsets.
+    """
+    for digits in range(6, 18):
+        if len({_fmt_dur(d, digits) for d in durations}) == len(durations):
+            return digits
+    return 17
 
 
 def _inject_duration(hrf: str, duration: float) -> str:
@@ -883,6 +924,12 @@ def _do_compile(args: argparse.Namespace) -> int:
     if any(ef is None for ef in events_files):
         raise ValueError("Every [meta].runs entry must have an 'events' field for compile.")
 
+    event_filters = list(spec.meta.event_filters) + list(getattr(args, "event_filters", None) or [])
+    if event_filters:
+        for f in event_filters:
+            print(f"🔎 Event filter: {f.describe()}", flush=True)
+        warn_unmatched_filters([ef for ef in events_files if ef is not None], event_filters)
+
     # Expand events → AFNI timing files in a tempdir.
     tmpdir = Path(tempfile.mkdtemp(prefix="ffs_design_spec_"))
     timing_files: list[Path] = []
@@ -891,7 +938,7 @@ def _do_compile(args: argparse.Namespace) -> int:
     im_modes: list[bool] = []
     for ev in spec.events:
         for path, label, hrf, im_flag in _expand_event_to_stims(
-            ev, events_files, cols, spec.meta.tr, tmpdir, trim, run_lengths_sec
+            ev, events_files, cols, spec.meta.tr, tmpdir, trim, run_lengths_sec, event_filters
         ):
             timing_files.append(path)
             stim_labels.append(label)

@@ -705,3 +705,180 @@ def test_compile_refuses_hrfopt(tmp_path):
     )()
     with pytest.raises(ValueError, match="hrfopt"):
         _do_compile(args)
+
+
+def test_parse_round_mode_refuses_fractions():
+    """0.5 used to be truncated to 0 decimals without a word."""
+    from fastfuncstuff.design.spec import parse_round_mode, round_event_time
+
+    assert parse_round_mode(None) is None
+    assert parse_round_mode(0) == 0
+    assert parse_round_mode("1") == 1
+    assert parse_round_mode("tr") == "TR"
+    for bad in (0.5, -1, "half", True):
+        with pytest.raises(ValueError):
+            parse_round_mode(bad)
+    assert round_event_time(9.9915, 0, 2.0) == 10.0
+    assert round_event_time(10.0083, 1, 2.0) == 10.0
+    assert round_event_time(2.9, "TR", 2.0) == 2.0
+
+
+def test_load_spec_rejects_fractional_round_duration(tmp_path):
+    spec = _make_spec(tmp_path)
+    spec.events[1].round_duration = 0.5  # type: ignore[assignment]
+    path = tmp_path / "design.toml"
+    write_spec(spec, path)
+    with pytest.raises(ValueError, match="round_duration"):
+        load_spec(path)
+
+
+def _jittered_pairs_spec(tmp_path: Path, round_duration) -> Spec:
+    """Bug of record: paired stimuli share an onset within a run, partners rotate
+    across runs, and each block's duration carries a few ms of frame jitter."""
+    runs = []
+    rows_per_run = [
+        [(10.0, 9.9915, "a"), (10.0, 9.9915, "b"), (40.0, 10.0083, "c")],
+        [(10.0, 10.0082, "a"), (10.0, 10.0082, "c"), (40.0, 9.9914, "b")],
+    ]
+    for i, rows in enumerate(rows_per_run):
+        ev = tmp_path / f"r{i}.tsv"
+        _write_events_tsv(ev, rows)
+        runs.append(RunSpec(bold="unused.nii.gz", events=str(ev)))
+    return Spec(
+        meta=MetaSpec(runs=runs, tr=2.0, n_timepoints_per_run=[40, 40], polort=1),
+        events=[
+            EventSpec(trial_type=t, duration="from_events", round_duration=round_duration)
+            for t in ("a", "b", "c")
+        ],
+    )
+
+
+@pytest.mark.parametrize("round_duration", [None, 0])
+def test_duration_jitter_split_is_singular_until_rounded(tmp_path, capsys, round_duration):
+    from fastfuncstuff.cli.design_spec import _do_compile
+    from fastfuncstuff.io.afni import read_afni_design_matrix
+
+    spec_path = tmp_path / "design.toml"
+    write_spec(_jittered_pairs_spec(tmp_path, round_duration), spec_path)
+    xmat = tmp_path / "X.xmat.1D"
+    args = type(
+        "A", (), {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True}
+    )()
+    assert _do_compile(args) == 0
+    info = read_afni_design_matrix(str(xmat))
+    X = np.asarray(info["matrix"], dtype=np.float64)
+    out = capsys.readouterr().out
+    if round_duration is None:
+        # One column per exact duration: a_dur9.9915 and b_dur9.9915 are the same event.
+        assert "a_dur9p9915" in info["stim_labels"]
+        assert "distinct durations" in out
+        assert np.linalg.matrix_rank(X) < X.shape[1]
+    else:
+        assert info["stim_labels"] == ["a", "b", "c"]
+        assert "distinct durations" not in out
+        assert np.linalg.matrix_rank(X) == X.shape[1]
+
+
+def test_stub_notes_warn_of_duration_split_and_carry_rounding(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.design.spec import build_stub_spec
+
+    ev = tmp_path / "r01.tsv"
+    _write_events_tsv(ev, [(5.0, 9.9915, "face"), (25.0, 10.0083, "face")])
+    nii = nib.Nifti1Image(np.zeros((2, 2, 2, 60), dtype=np.float32), np.eye(4))
+    nii.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+    bold = tmp_path / "r01.nii.gz"
+    nib.save(nii, bold)
+
+    _spec, notes = build_stub_spec([bold], [ev])
+    assert "2 distinct durations" in notes["face"]
+
+    spec, notes = build_stub_spec([bold], [ev], round_onset="TR", round_duration=0)
+    assert "distinct durations" not in notes["face"]
+    assert (spec.events[0].round_onset, spec.events[0].round_duration) == ("TR", 0)
+
+
+def test_split_labels_stay_unique_for_near_equal_durations():
+    from fastfuncstuff.cli.design_spec import _fmt_dur, _unique_dur_digits
+
+    durs = [10.008192, 10.008182, 2.5, 3.0]
+    digits = _unique_dur_digits(durs)
+    labels = {_fmt_dur(d, digits) for d in durs}
+    assert len(labels) == len(durs)
+    assert _fmt_dur(2.5, digits) == "2p5" and _fmt_dur(3.0, digits) == "3"
+
+
+def _hemifield_paired_spec(tmp_path: Path) -> Spec:
+    """Every onset pairs a right location (r1/r2) with a left one (l1/l2), partners
+    rotating across runs: right-sum minus left-sum is an exact null direction."""
+    pairs_per_run = [[("r1", "l1"), ("r2", "l2")], [("r1", "l2"), ("r2", "l1")]]
+    runs = []
+    for i, pairs in enumerate(pairs_per_run):
+        ev = tmp_path / f"hemi_r{i}.tsv"
+        lines = ["onset\tduration\ttrial_type\themifield"]
+        for j, (right, left) in enumerate(pairs):
+            onset = 10.0 + 30.0 * j
+            lines += [f"{onset}\t10\t{right}\tright", f"{onset}\t10\t{left}\tleft"]
+        ev.write_text("\n".join(lines) + "\n")
+        runs.append(RunSpec(bold="unused.nii.gz", events=str(ev)))
+    return Spec(
+        meta=MetaSpec(runs=runs, tr=2.0, n_timepoints_per_run=[40, 40], polort=1),
+        events=[EventSpec(trial_type=t) for t in ("l1", "l2", "r1", "r2")],
+    )
+
+
+def _compile_xmat(tmp_path: Path, spec: Spec, **extra):
+    from fastfuncstuff.cli.design_spec import _do_compile
+    from fastfuncstuff.io.afni import read_afni_design_matrix
+
+    spec_path = tmp_path / "design.toml"
+    write_spec(spec, spec_path)
+    xmat = tmp_path / "X.xmat.1D"
+    fields = {"spec": str(spec_path), "xmat": str(xmat), "verb": 0, "overwrite": True, **extra}
+    assert _do_compile(type("A", (), fields)()) == 0
+    return read_afni_design_matrix(str(xmat))
+
+
+def test_event_filter_recovers_a_full_rank_design_from_hemifield_pairs(tmp_path):
+    """One TOML, filtered at fit time (ffs_reml -spec X -event_filter_out ...):
+    blocks the filter empties are skipped, and each hemifield's design is full rank."""
+    from fastfuncstuff.design.bids_events import EventFilter
+
+    spec = _hemifield_paired_spec(tmp_path)
+    info = _compile_xmat(tmp_path, spec)
+    X = np.asarray(info["matrix"], dtype=np.float64)
+    assert np.linalg.matrix_rank(X) < X.shape[1]
+
+    info = _compile_xmat(tmp_path, spec, event_filters=[EventFilter("hemifield", ["right"], "out")])
+    X = np.asarray(info["matrix"], dtype=np.float64)
+    assert info["stim_labels"] == ["l1", "l2"]
+    assert np.linalg.matrix_rank(X) == X.shape[1]
+
+    # The same filter written into the TOML, and round-tripped through it.
+    spec.meta.event_filters = [EventFilter("hemifield", ["left"], "out")]
+    info = _compile_xmat(tmp_path, spec)
+    assert info["stim_labels"] == ["r1", "r2"]
+    loaded = load_spec(tmp_path / "design.toml")
+    assert [f.describe() for f in loaded.meta.event_filters] == ["-event_filter_out hemifield left"]
+
+
+def test_stub_spec_omits_trial_types_the_filter_removes(tmp_path):
+    import nibabel as nib
+
+    from fastfuncstuff.design.bids_events import EventFilter
+    from fastfuncstuff.design.spec import build_stub_spec
+
+    spec = _hemifield_paired_spec(tmp_path)
+    nii = nib.Nifti1Image(np.zeros((2, 2, 2, 40), dtype=np.float32), np.eye(4))
+    nii.header.set_zooms((1.0, 1.0, 1.0, 2.0))
+    bold = tmp_path / "b.nii.gz"
+    nib.save(nii, bold)
+    events = [Path(r.events) for r in spec.meta.runs if r.events]
+    stub, _ = build_stub_spec(
+        [bold, bold], events, event_filters=[EventFilter("hemifield", ["left"], "in")]
+    )
+    assert [e.trial_type for e in stub.events] == ["l1", "l2"]
+    assert stub.meta.event_filters[0].action == "in"
+    with pytest.raises(ValueError, match="nope"):
+        build_stub_spec([bold, bold], events, event_filters=[EventFilter("nope", ["x"])])

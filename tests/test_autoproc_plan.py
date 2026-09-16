@@ -2338,3 +2338,112 @@ def test_clustsim_rides_the_reml_command_not_a_separate_stage():
     assert "-mask " not in on
     # Only the GLM command changes.
     assert off.split("stage12: GLM")[0] == on.split("stage12: GLM")[0]
+
+
+def test_round_flags_parse_per_task():
+    from fastfuncstuff.cli.autoproc import _resolve_round_modes, build_parser
+
+    p = build_parser()
+    base = ["-bids_dir", "/b", "-subject", "X"]
+
+    def res(*argv):
+        return _resolve_round_modes(p.parse_args(base + list(argv)).round_durations, "-rd")
+
+    assert res() == (None, {})
+    assert res("-round_durations", "0") == (0, {})
+    assert res("-round_durations", "1", "-round_durations", "TR", "task-a", "b") == (
+        1,
+        {"a": "TR", "b": "TR"},
+    )
+    for bad in (("-round_durations", "0.5"), ("-round_durations", "loc08pos", "0")):
+        with pytest.raises(SystemExit):
+            res(*bad)
+
+
+def test_round_flags_reach_the_design_toml(tmp_path: Path):
+    """A per-task entry wins over the dataset-wide value; both land in [[events]]."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_two_tasks(tmp_path)
+    plan = build_plan(
+        scan_subject(tmp_path, "ME1"),
+        Options(
+            run_glm=True, round_durations=0, sep_round_durations={"floc": "TR"}, round_onsets=1
+        ),
+    )
+    write_design_specs(plan, str(tmp_path), str(tmp_path / "wd"))
+
+    floc = load_spec(tmp_path / "wd" / "stage11.design.task-floc.toml")
+    assert {(e.round_onset, e.round_duration) for e in floc.events} == {(1, "TR")}
+    imagery = load_spec(tmp_path / "wd" / "stage11.design.task-imagery.toml")
+    assert {(e.round_onset, e.round_duration) for e in imagery.events} == {(1, 0)}
+
+
+def test_event_filters_parse_per_task():
+    from fastfuncstuff.cli.autoproc import _resolve_event_filters, build_parser
+
+    p = build_parser()
+    args = p.parse_args(
+        ["-bids_dir", "/b", "-subject", "X"]
+        + ["-event_filter_out", "task-loc08pos", "hemifield", "right"]
+        + ["-event_filter_out", "loc08pos", "vertical_field", "upper", "lower"]
+        + ["-event_filter_in", "floc", "trial_type", "face"]
+    )
+    got = {t: [f.describe() for f in fs] for t, fs in _resolve_event_filters(args).items()}
+    assert got == {
+        "loc08pos": [
+            "-event_filter_out hemifield right",
+            "-event_filter_out vertical_field upper lower",
+        ],
+        "floc": ["-event_filter_in trial_type face"],
+    }
+    with pytest.raises(SystemExit):
+        _resolve_event_filters(
+            p.parse_args(
+                ["-bids_dir", "/b", "-subject", "X", "-event_filter_out", "loc08pos", "hemifield"]
+            )
+        )
+
+
+def test_filtered_task_gets_a_labelled_toml_with_its_filters(tmp_path: Path):
+    """Left and right variants of one task must not share a TOML: an existing one
+    is kept, so the second variant would silently fit the first one's design."""
+    from fastfuncstuff.autoproc.bids import scan_subject
+    from fastfuncstuff.autoproc.glm import write_design_specs
+    from fastfuncstuff.design.bids_events import EventFilter
+    from fastfuncstuff.design.spec import load_spec
+
+    _bids_two_tasks(tmp_path)
+    subj = scan_subject(tmp_path, "ME1")
+    wd = tmp_path / "wd"
+
+    def run(label, value, overwrite=False):
+        opt = Options(
+            run_glm=True,
+            glm_label=label,
+            glm_spec_overwrite=overwrite,
+            event_filters={"floc": [EventFilter("trial_type", [value], "out")]},
+        )
+        plan = build_plan(subj, opt)
+        return plan, write_design_specs(plan, str(tmp_path), str(wd))
+
+    plan, _ = run("noface", "face")
+    run("noplace", "place")
+    assert [
+        e.trial_type for e in load_spec(wd / "stage11.design.noface.task-floc.toml").events
+    ] == ["place"]
+    assert [
+        e.trial_type for e in load_spec(wd / "stage11.design.noplace.task-floc.toml").events
+    ] == ["face"]
+    # The unfiltered task keeps its plain name even under a label.
+    assert (wd / "stage11.design.task-imagery.toml").is_file()
+
+    s = write_script(plan, str(wd), bids_root=str(tmp_path))
+    assert "-spec stage11.design.noface.task-floc.toml" in s
+
+    # Same label, different filter: kept, but not silently.
+    _, rows = run("noface", "place")
+    status = dict((t, st) for t, _, st in rows)["floc"]
+    assert status.startswith("kept") and "WARNING" in status

@@ -23,6 +23,7 @@ from __future__ import annotations
 import csv
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -393,11 +394,95 @@ def drop_late_events(
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class EventFilter:
+    """Keep (``action="in"``) or drop (``action="out"``) events rows by a column's value.
+
+    Several filters AND together, so ``out hemifield right`` then ``out
+    vertical_field upper`` keeps only the left-lower events. The column may be any
+    column in the TSV, not just the onset/duration/trial_type triple.
+    """
+
+    column: str
+    values: list[str]
+    action: str = "out"
+
+    def __post_init__(self) -> None:
+        if self.action not in ("in", "out"):
+            raise ValueError(f"event filter action must be 'in' or 'out' (got {self.action!r})")
+        if not self.values:
+            raise ValueError(f"event filter on column {self.column!r} needs at least one value")
+        self.values = [str(v).strip() for v in self.values]
+
+    def matches(self, cell: Any) -> bool:
+        """Exact string match, or numeric equality so ``2`` matches ``2.0``."""
+        text = str(cell if cell is not None else "").strip()
+        if text in self.values:
+            return True
+        try:
+            num = float(text)
+        except ValueError:
+            return False
+        for v in self.values:
+            try:
+                if float(v) == num:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def keeps(self, row: dict[str, Any]) -> bool:
+        return self.matches(row.get(self.column)) == (self.action == "in")
+
+    def describe(self) -> str:
+        return f"-event_filter_{self.action} {self.column} {' '.join(self.values)}"
+
+
+def check_filter_columns(
+    fieldnames: list[str], filters: list[EventFilter] | None, path: Path | str
+) -> None:
+    """Refuse a filter on a column the TSV does not have — it would filter nothing."""
+    for f in filters or []:
+        if f.column not in fieldnames:
+            raise ValueError(
+                f"Event filter column '{f.column}' not found in {path}.\n"
+                f"  Available columns: {fieldnames}"
+            )
+
+
+def event_row_passes(row: dict[str, Any], filters: list[EventFilter] | None) -> bool:
+    return all(f.keeps(row) for f in filters or [])
+
+
+def warn_unmatched_filters(
+    event_files: list[Path | str], filters: list[EventFilter] | None
+) -> None:
+    """Warn about a filter value that no row of any file carries — almost always a typo
+    (``Right`` for ``right``), and it would silently keep or drop everything."""
+    if not filters:
+        return
+    seen: dict[int, bool] = {i: False for i in range(len(filters))}
+    for path in event_files:
+        with open(path, newline="") as fh:
+            for row in csv.DictReader(fh, delimiter="\t"):
+                for i, f in enumerate(filters):
+                    if not seen[i] and f.matches(row.get(f.column)):
+                        seen[i] = True
+    for i, f in enumerate(filters):
+        if not seen[i]:
+            print(
+                f"WARNING: {f.describe()}: no row in any events file has that value, "
+                f"so this filter {'drops every event' if f.action == 'in' else 'does nothing'}.",
+                file=sys.stderr,
+            )
+
+
 def read_tsv_rows(
     path: Path | str,
     onset_col: str = "onset",
     duration_col: str = "duration",
     trial_type_col: str = "trial_type",
+    event_filters: list[EventFilter] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Read one BIDS events TSV, keeping every column of every usable row.
 
@@ -429,11 +514,14 @@ def read_tsv_rows(
                     f"  Available columns: {fieldnames}\n"
                     f"  Use -event_cols to specify custom column names."
                 )
+        check_filter_columns(fieldnames, event_filters, path)
 
         rows: list[dict[str, Any]] = []
         for row_num, row in enumerate(reader, start=2):  # row 1 is header
             trial_type = str(row[trial_type_col]).strip()
             if not trial_type or trial_type.lower() == "n/a":
+                continue
+            if not event_row_passes(row, event_filters):
                 continue
             try:
                 onset = float(row[onset_col])
@@ -457,6 +545,7 @@ def _read_tsv(
     onset_col: str,
     duration_col: str,
     trial_type_col: str,
+    event_filters: list[EventFilter] | None = None,
 ) -> list[tuple[float, float, str]]:
     """
     Read one BIDS events TSV.
@@ -471,7 +560,7 @@ def _read_tsv(
     ValueError
         If a required column is missing or a row cannot be parsed.
     """
-    rows, _ = read_tsv_rows(path, onset_col, duration_col, trial_type_col)
+    rows, _ = read_tsv_rows(path, onset_col, duration_col, trial_type_col, event_filters)
     return [(float(r["_onset"]), float(r["_duration"]), str(r["_trial_type"])) for r in rows]
 
 
@@ -486,6 +575,7 @@ def parse_bids_events(
     event_cols: tuple[str, str, str] | None = None,
     round_durations: int | None = None,
     n_runs: int | None = None,
+    event_filters: list[EventFilter] | None = None,
 ) -> tuple[list[list[np.ndarray]], list[float], list[str]]:
     """
     Parse BIDS *_events.tsv files into onset/duration/label structures.
@@ -522,6 +612,9 @@ def parse_bids_events(
         stimulus timing and therefore ships one BIDS ``*_events.tsv`` for the
         whole task (a valid BIDS pattern).  When more than one file is given,
         ``n_runs`` (if set) must equal the file count; otherwise it is ignored.
+    event_filters : list of EventFilter, optional
+        Row filters on any TSV column, applied before conditions are collected, so
+        a condition whose every row is filtered out is not a condition at all.
 
     Returns
     -------
@@ -576,8 +669,9 @@ def parse_bids_events(
     run_events: list[list[tuple[float, float, str]]] = []
     all_conditions: set[str] = set()
 
+    warn_unmatched_filters(sorted_files, event_filters)
     for tsv_path in sorted_files:
-        events = _read_tsv(Path(tsv_path), onset_col, duration_col, trial_type_col)
+        events = _read_tsv(Path(tsv_path), onset_col, duration_col, trial_type_col, event_filters)
         # Drop ignored conditions
         events = [(on, dur, ct) for on, dur, ct in events if ct not in ignore_set]
         run_events.append(events)
@@ -591,6 +685,7 @@ def parse_bids_events(
         raise ValueError(
             "No conditions remain after applying event_ignore filter.\n"
             f"  Ignored: {sorted(ignore_set)}"
+            + "".join(f"\n  {f.describe()}" for f in event_filters or [])
         )
 
     cond_to_idx: dict[str, int] = {c: i for i, c in enumerate(condition_labels)}

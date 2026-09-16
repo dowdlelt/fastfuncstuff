@@ -41,6 +41,7 @@ try:
     from fastfuncstuff.cli_utils import (
         add_cv_strategy_arg,
         add_device_arg,
+        add_event_filter_arguments,
         add_noise_ceiling_args,
         add_ortvec_arguments,
         add_trim_args,
@@ -55,6 +56,7 @@ try:
         parse_device_arg,
         parse_input_files,
         parse_prefix,  # noqa: F401 — TODO: apply parse_prefix to individual output flags
+        resolve_event_filters,
         resolve_microtime_dt,
         trim_spec_from_args,
     )
@@ -980,6 +982,7 @@ Examples:
             "Durations are derived from the TSV data."
         ),
     )
+    add_event_filter_arguments(onset_group)
     onset_group.add_argument(
         "-event_ignore",
         nargs="+",
@@ -1485,6 +1488,15 @@ def main():
     if not any(_design_sources):
         print("ERROR: Must specify one of -matrix, -onsets, -events, or -spec")
         sys.exit(1)
+    try:
+        event_filters = resolve_event_filters(args)
+    except ValueError as exc:
+        print(f"ERROR: {exc}")
+        sys.exit(1)
+    # A filter reads TSV columns, so it means nothing to an xmat or a .1D timing file.
+    if event_filters and not (args.events or args.spec):
+        print("ERROR: -event_filter_in/-event_filter_out need -events or -spec")
+        sys.exit(1)
 
     _matrix_from_spec = False
 
@@ -1525,6 +1537,9 @@ def main():
             # through -spec even though the compiled result is used as -matrix.
             drop_first=int(getattr(args, "drop_first", 0) or 0),
             drop_last=int(getattr(args, "drop_last", 0) or 0),
+            # Stacked on the TOML's own [meta].event_filters, so one design can be
+            # fit per hemifield (or any subset) without a second TOML.
+            event_filters=event_filters,
         )
         rc = _design_spec_compile(compile_args)
         if rc != 0:
@@ -1902,6 +1917,7 @@ def main():
                 event_cols=tuple(args.event_cols) if args.event_cols else None,
                 round_durations=args.round_durations,
                 input_files=input_files,
+                event_filters=event_filters,
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
@@ -2197,6 +2213,7 @@ def main():
                 n_runs=n_runs,
                 run_lengths_sec=_run_len_sec if args.allow_late_events else None,
                 n_basis=n_basis if n_basis else 1,
+                event_filters=event_filters,
             )
 
             # Override label/count bookkeeping so downstream design_info uses

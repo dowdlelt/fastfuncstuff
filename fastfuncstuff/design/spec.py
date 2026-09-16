@@ -16,7 +16,10 @@ import fnmatch
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from fastfuncstuff.design.bids_events import EventFilter
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -47,6 +50,8 @@ class MetaSpec:
         default_factory=lambda: ["rest", "Rest", "REST", "baseline"]
     )
     censor: str | None = None  # path to outcount.1D-style keep mask (1=keep,0=cut)
+    # Row filters on any events-TSV column (ffs_reml -event_filter_in/out), ANDed.
+    event_filters: list[EventFilter] = field(default_factory=list)
 
 
 @dataclass
@@ -57,8 +62,8 @@ class EventSpec:
     # a user override at compile time and would silently discard `duration`.
     hrf: str = "SPMG1"
     mode: Literal["condition", "im"] = "condition"
-    round_onset: float | Literal["TR"] | None = None
-    round_duration: float | None = None
+    round_onset: int | Literal["TR"] | None = None
+    round_duration: int | Literal["TR"] | None = None
 
 
 @dataclass
@@ -149,6 +154,41 @@ class Spec:
 DEFAULT_EVENT_COLUMNS = ("onset", "duration", "trial_type")
 DEFAULT_DROP_TRIAL_TYPES = ("rest", "Rest", "REST", "baseline")
 
+RoundMode = int | Literal["TR"] | None
+
+
+def parse_round_mode(value, what: str = "rounding") -> RoundMode:
+    """Normalise a rounding mode: a decimal-place count >= 0, ``"TR"``, or None.
+
+    Refuses anything else. A fractional value (0.5) used to be truncated to 0
+    decimals by ``int()`` without a word, which reads as "half a TR" to anyone
+    coming from ffs_reml -round_onsets THRESHOLD.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        if value.strip().upper() == "TR":
+            return "TR"
+        try:
+            value = float(value)
+        except ValueError:
+            raise ValueError(f"{what}: {value!r} is not a decimal-place count or 'TR'") from None
+    if isinstance(value, bool) or not float(value).is_integer() or value < 0:
+        raise ValueError(
+            f"{what}: {value!r} must be a whole number of decimal places "
+            "(0 = nearest second, 1 = nearest tenth, ...) or 'TR'"
+        )
+    return int(value)
+
+
+def round_event_time(value: float, mode: RoundMode, tr: float) -> float:
+    """Round an onset or duration: ``mode`` decimals, the nearest TR multiple, or as-is."""
+    if mode is None:
+        return value
+    if mode == "TR":
+        return round(value / tr) * tr
+    return round(value, int(mode))
+
 
 def bold_header(path: str | Path) -> tuple[int, float]:
     """(n_timepoints, TR) from a NIfTI header — no voxel data is read."""
@@ -171,19 +211,29 @@ def scan_trial_types(
     events_files: list[Path],
     cols: tuple[str, str, str] = DEFAULT_EVENT_COLUMNS,
     drop: set[str] | None = None,
+    event_filters: list[EventFilter] | None = None,
 ) -> tuple[list[str], dict[str, list[float]]]:
     """Read every events TSV; return sorted surviving trial_types and the
-    durations observed for each (used for the informational stub comments)."""
+    durations observed for each (used for the informational stub comments).
+
+    ``event_filters`` apply here too: a trial type whose every row is filtered out
+    gets no [[events]] block, since compile would find nothing to model."""
     import csv
+
+    from fastfuncstuff.design.bids_events import check_filter_columns, event_row_passes
 
     drop = drop or set()
     _, dur_col, tt_col = cols
     durations: dict[str, list[float]] = {}
     for path in events_files:
         with open(path, newline="") as fh:
-            for row in csv.DictReader(fh, delimiter="\t"):
+            reader = csv.DictReader(fh, delimiter="\t")
+            check_filter_columns(list(reader.fieldnames or []), event_filters, path)
+            for row in reader:
                 tt = str(row.get(tt_col, "")).strip()
                 if not tt or tt.lower() == "n/a" or tt in drop:
+                    continue
+                if not event_row_passes(row, event_filters):
                     continue
                 try:
                     dur = float(row[dur_col])
@@ -223,6 +273,9 @@ def build_stub_spec(
     default_hrf: str = "SPMG1",
     nuisance: list[NuisanceSpec] | None = None,
     stim_vec: list[StimVecSpec] | None = None,
+    round_onset: RoundMode = None,
+    round_duration: RoundMode = None,
+    event_filters: list[EventFilter] | None = None,
 ) -> tuple[Spec, dict[str, str]]:
     """Build a stub Spec (+ per-trial-type informational notes) from BOLD
     headers and events TSVs.
@@ -258,7 +311,9 @@ def build_stub_spec(
             f"for {len(bold_paths)} runs"
         )
 
-    trial_types, durations_per_tt = scan_trial_types(events_paths, cols, set(drop_list))
+    trial_types, durations_per_tt = scan_trial_types(
+        events_paths, cols, set(drop_list), event_filters
+    )
     if not trial_types:
         raise ValueError("No trial_types survived the drop filter — nothing to model.")
 
@@ -271,22 +326,41 @@ def build_stub_spec(
         n_timepoints_per_run=list(n_timepoints_per_run),
         polort=auto_polort([n * float(tr) for n in n_timepoints_per_run]),
         drop_trial_types=drop_list,
+        event_filters=list(event_filters or []),
     )
     # Only set events_columns when customised, so the TOML keeps the defaults implicit.
     if event_cols:
         meta.events_columns = EventsColumns(onset=cols[0], duration=cols[1], trial_type=cols[2])
 
     events = [
-        EventSpec(trial_type=tt, duration="from_events", hrf=default_hrf, mode="condition")
-        for tt in trial_types
-    ]
-    notes = {
-        tt: (
-            "observed durations (informational, no effect on compile): "
-            + duration_stats_comment(durations_per_tt[tt])
+        EventSpec(
+            trial_type=tt,
+            duration="from_events",
+            hrf=default_hrf,
+            mode="condition",
+            round_onset=round_onset,
+            round_duration=round_duration,
         )
         for tt in trial_types
-    }
+    ]
+    notes = {}
+    for tt in trial_types:
+        note = "observed durations (informational, no effect on compile): " + (
+            duration_stats_comment(durations_per_tt[tt])
+        )
+        # Compile splits on EXACT durations, so frame-timing jitter (9.9915 vs
+        # 10.0083 s) silently multiplies the columns — and paired conditions
+        # with one event per column become identical, i.e. a singular design.
+        n_split = len(
+            {round_event_time(d, round_duration, float(tr)) for d in durations_per_tt[tt] if d == d}
+        )
+        if n_split > 1:
+            note += (
+                f"\nWARNING: {n_split} distinct durations -> compile splits this into "
+                f"{n_split} columns ({tt}_dur...). If they are the same event, set "
+                "round_duration (e.g. 0) to merge them."
+            )
+        notes[tt] = note
     return (
         Spec(
             meta=meta,
@@ -337,8 +411,33 @@ def load_spec(path: str | Path) -> Spec:
         ),
         censor=meta_raw.get("censor"),
     )
+    if "event_filters" in meta_raw:
+        from fastfuncstuff.design.bids_events import EventFilter
+
+        for i, f_raw in enumerate(meta_raw["event_filters"]):
+            try:
+                values = f_raw["values"]
+                meta.event_filters.append(
+                    EventFilter(
+                        column=f_raw["column"],
+                        values=[values] if isinstance(values, (str, int, float)) else values,
+                        action=f_raw.get("action", "out"),
+                    )
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"{path}: [meta].event_filters[{i}] needs column, values and "
+                    f"action ('in' or 'out'): {exc}"
+                ) from None
 
     events = [EventSpec(**e) for e in raw.get("events", [])]
+    for ev in events:
+        ev.round_onset = parse_round_mode(
+            ev.round_onset, f"{path}: event '{ev.trial_type}' round_onset"
+        )
+        ev.round_duration = parse_round_mode(
+            ev.round_duration, f"{path}: event '{ev.trial_type}' round_duration"
+        )
 
     nuisance: list[NuisanceSpec] = []
     for n_raw in raw.get("nuisance", []):
@@ -496,6 +595,21 @@ def write_spec(
         f'events_columns = {{ onset = "{ec.onset}", '
         f'duration = "{ec.duration}", trial_type = "{ec.trial_type}" }}'
     )
+    if spec.meta.event_filters:
+        import json
+
+        lines.append("")
+        lines.append("# Row filters on any events-TSV column, applied before anything is modelled.")
+        lines.append(
+            '# action "out" drops matching rows, "in" keeps only them; filters AND together.'
+        )
+        lines.append("event_filters = [")
+        for f in spec.meta.event_filters:
+            lines.append(
+                f"  {{ column = {json.dumps(f.column)}, values = "
+                f"[{', '.join(json.dumps(v) for v in f.values)}], action = {json.dumps(f.action)} }},"
+            )
+        lines.append("]")
     lines.append("")
     lines.append("# One entry per imaging run. 'bold' is the 4D NIfTI; 'events' is the BIDS")
     lines.append("# events.tsv that goes with it. Order here MUST match the order in which")
@@ -543,7 +657,7 @@ def write_spec(
     lines.append("#                              single-trial / amplitude-modulation analyses.")
     lines.append("#")
     lines.append("# round_onset    Pre-convolution onset rounding (applied before grouping).")
-    lines.append("#                  <number>  — round to this many decimal places (0 = integers)")
+    lines.append("#                  <integer> — round to this many decimal places (0 = integers)")
     lines.append('#                  "TR"      — snap to the nearest TR boundary')
     lines.append("#                  omitted   — no rounding")
     lines.append("#")
