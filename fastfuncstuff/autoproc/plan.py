@@ -136,6 +136,10 @@ class Options:
     sep_round_onsets: dict[str, int | str] = field(default_factory=dict)
     round_durations: int | str | None = None
     sep_round_durations: dict[str, int | str] = field(default_factory=dict)
+    # {task: [EventFilter]} from -event_filter_in/-event_filter_out, written to that
+    # task's [meta].event_filters. A filtered design is a model variant, so it must
+    # carry -glm_label, which also names its TOML (see glm.spec_path).
+    event_filters: dict[str, list] = field(default_factory=dict)
     locomoco: bool = False
     # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
     # CHANGES the field the correction applies, where the -events diagnostic the

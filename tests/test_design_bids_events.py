@@ -675,3 +675,59 @@ class TestCheckEventsPairing:
         events = [f"task-BBBB_run-{i}_events.tsv" for i in (2, 3)]
         with pytest.raises(ValueError, match="entity check"):
             check_events_pairing(inputs, events, n_runs=2)
+
+
+class TestEventFilters:
+    def _tsv(self, tmp_path, name="run-01_events.tsv"):
+        f = tmp_path / name
+        f.write_text(
+            "onset\tduration\ttrial_type\themifield\tvertical_field\tlocation\n"
+            "10\t10\tloc02\tright\tupper\t2\n"
+            "10\t10\tloc06\tleft\tlower\t6\n"
+            "20\t10\tloc04\tright\tlower\t4\n"
+            "20\t10\tloc08\tleft\tupper\t8\n"
+        )
+        return f
+
+    def test_out_filters_and_together(self, tmp_path):
+        from fastfuncstuff.design.bids_events import EventFilter
+
+        f = self._tsv(tmp_path)
+        _, _, labels = parse_bids_events(
+            [f], event_filters=[EventFilter("hemifield", ["right"], "out")]
+        )
+        assert labels == ["loc06", "loc08"]
+        _, _, labels = parse_bids_events(
+            [f],
+            event_filters=[
+                EventFilter("hemifield", ["right"], "out"),
+                EventFilter("vertical_field", ["upper"], "out"),
+            ],
+        )
+        assert labels == ["loc06"]
+
+    def test_in_filter_multiple_values_and_numeric_match(self, tmp_path):
+        from fastfuncstuff.design.bids_events import EventFilter
+
+        f = self._tsv(tmp_path)
+        _, _, labels = parse_bids_events(
+            [f], event_filters=[EventFilter("location", ["2.0", "8"], "in")]
+        )
+        assert labels == ["loc02", "loc08"]
+
+    def test_missing_column_is_an_error_and_typo_warns(self, tmp_path, capsys):
+        from fastfuncstuff.design.bids_events import EventFilter
+
+        f = self._tsv(tmp_path)
+        with pytest.raises(ValueError, match="hemisphere"):
+            parse_bids_events([f], event_filters=[EventFilter("hemisphere", ["right"])])
+        parse_bids_events([f], event_filters=[EventFilter("hemifield", ["Right"])])
+        assert "does nothing" in capsys.readouterr().err
+
+    def test_trial_table_rows_follow_the_filter(self, tmp_path):
+        from fastfuncstuff.design.bids_events import EventFilter
+        from fastfuncstuff.design.trial_table import read_run_event_rows
+
+        f = self._tsv(tmp_path)
+        rows, _ = read_run_event_rows([f], event_filters=[EventFilter("hemifield", ["left"], "in")])
+        assert [r["_trial_type"] for r in rows[0]] == ["loc06", "loc08"]

@@ -655,6 +655,23 @@ def build_parser() -> argparse.ArgumentParser:
         "collinear, regressors. `-round_durations 0` merges them.",
     )
 
+    for action, verb in (("in", "keep only"), ("out", "drop")):
+        g.add_argument(
+            f"-event_filter_{action}",
+            f"-event-filter-{action}",
+            action="append",
+            nargs="+",
+            default=None,
+            metavar="TASK COLUMN VALUE",
+            help=f"{verb} that task's events rows whose COLUMN (any TSV column) equals "
+            "one of the VALUEs; written as [meta].event_filters in its design TOML "
+            "(ffs_reml -event_filter_" + action + "). Repeatable; filters AND "
+            "together: `-event_filter_out loc08pos hemifield right -event_filter_out "
+            "loc08pos vertical_field upper`. A filtered design is a model variant, so "
+            "-glm_label is required and names its TOML and buckets — run autoproc "
+            "once per variant (e.g. -glm_label lefthemi, then -glm_label righthemi).",
+        )
+
     g = p.add_argument_group("QC")
     g.add_argument(
         "-no_qc",
@@ -1052,6 +1069,12 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             f"-glm_label {opt.glm_label!r}: use letters, digits, - and _ only (it becomes a "
             "filename token, and '.' is what separates tokens)."
         )
+    if opt.event_filters and opt.glm_label is None:
+        errors.append(
+            "-event_filter_in/-event_filter_out change the design, so the fit is a model "
+            "variant: name it with -glm_label (e.g. -glm_label lefthemi). The label "
+            "names the design TOML and the stage12 buckets, so variants cannot collide."
+        )
     # The anat side of the mask needs an anat this pipeline segments and aligns
     # itself; borrowed/overridden reference geometry brings no local brain to mask
     # with, so say so rather than emitting a -mask for a file that is never written.
@@ -1074,6 +1097,7 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
     for flag, per_task in (
         ("-round_onsets", opt.sep_round_onsets),
         ("-round_durations", opt.sep_round_durations),
+        ("-event_filter_in/out", opt.event_filters),
     ):
         for task in sorted(per_task):
             if task not in all_tasks:
@@ -1103,6 +1127,29 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
             _cols, warn = resolve_event_cols(task, paths, opt)
             if warn:
                 warnings.append(warn)
+
+    # A filter on a column the TSVs lack would build the wrong model an hour from now.
+    if opt.run_glm and opt.event_filters:
+        import csv
+
+        for task in sorted(set(opt.event_filters) & all_tasks):
+            if opt.events:
+                paths = [Path(e) for e in opt.events]
+            else:
+                paths = [ev for _, ev in _events_by_run(args.bids_dir, task, subject) if ev]
+            for path in paths:
+                try:
+                    with open(path, newline="") as fh:
+                        header = next(csv.reader(fh, delimiter="\t"), [])
+                except OSError:
+                    continue
+                absent = sorted({f.column for f in opt.event_filters[task]} - set(header))
+                if absent:
+                    errors.append(
+                        f"-event_filter_in/out task-{task}: column(s) {', '.join(absent)} "
+                        f"not in {Path(path).name} (columns: {', '.join(header)})."
+                    )
+                    break
 
     # Events: not a hard error (preprocessing still runs), but warn per task so
     # the user knows the GLM will fail without them.
@@ -1145,6 +1192,25 @@ def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
             f"  known: {', '.join(config.GLM_ORTVEC)}"
         )
     return names
+
+
+def _resolve_event_filters(args) -> dict[str, list]:
+    """``{task: [EventFilter]}`` from ``-event_filter_in/out TASK COLUMN VALUE ...``."""
+    from fastfuncstuff.design.bids_events import EventFilter
+
+    per_task: dict[str, list] = {}
+    for action in ("in", "out"):
+        for entry in getattr(args, f"event_filter_{action}", None) or []:
+            if len(entry) < 3:
+                raise SystemExit(
+                    f"ffs_autoproc: -event_filter_{action} takes TASK COLUMN VALUE [VALUE ...] "
+                    f"(got {' '.join(entry)})."
+                )
+            task = entry[0][len("task-") :] if entry[0].startswith("task-") else entry[0]
+            per_task.setdefault(task, []).append(
+                EventFilter(column=entry[1], values=list(entry[2:]), action=action)
+            )
+    return per_task
 
 
 def _resolve_round_modes(
@@ -1539,6 +1605,7 @@ def main(argv: list[str] | None = None) -> int:
         sep_round_onsets=sep_round_onsets,
         round_durations=round_durations,
         sep_round_durations=sep_round_durations,
+        event_filters=_resolve_event_filters(args),
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,

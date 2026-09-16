@@ -2543,6 +2543,41 @@ class TimingSpec:
         return len(self.condition_labels)
 
 
+def add_event_filter_arguments(parser_or_group) -> None:
+    """Register ``-event_filter_in`` / ``-event_filter_out COLUMN VALUE [VALUE ...]``."""
+    for action, verb in (("in", "keep only"), ("out", "drop")):
+        parser_or_group.add_argument(
+            f"-event_filter_{action}",
+            action="append",
+            nargs="+",
+            default=None,
+            metavar="COLUMN VALUE",
+            help=(
+                f"{verb} -events rows whose COLUMN (any TSV column) equals one of the "
+                "VALUEs, before conditions are collected. Repeatable; filters AND "
+                "together, so `-event_filter_out hemifield right -event_filter_out "
+                "vertical_field upper` keeps left-lower rows. Values match as text, "
+                "or numerically (2 matches 2.0)."
+            ),
+        )
+
+
+def resolve_event_filters(args) -> list:
+    """``[EventFilter]`` from ``-event_filter_in`` / ``-event_filter_out``, in/out order."""
+    from fastfuncstuff.design.bids_events import EventFilter
+
+    out = []
+    for action in ("in", "out"):
+        for entry in getattr(args, f"event_filter_{action}", None) or []:
+            if len(entry) < 2:
+                raise ValueError(
+                    f"-event_filter_{action} needs a COLUMN and at least one VALUE "
+                    f"(got {' '.join(entry)})"
+                )
+            out.append(EventFilter(column=entry[0], values=list(entry[1:]), action=action))
+    return out
+
+
 def parse_timing_spec(
     *,
     events: list[str] | None,
@@ -2554,6 +2589,7 @@ def parse_timing_spec(
     round_durations: int | None = None,
     input_files: list[str] | None = None,
     verbose: bool = True,
+    event_filters: list | None = None,
     trim: TrimSpec | None = None,
     run_lengths_tr: list[int] | None = None,
     allow_missing_durations: bool = False,
@@ -2607,7 +2643,11 @@ def parse_timing_spec(
             event_cols=event_cols,
             round_durations=round_durations,
             n_runs=n_runs,
+            event_filters=event_filters,
         )
+        if event_filters and verbose:
+            for f in event_filters:
+                print(f"  Event filter: {f.describe()}")
         spec = TimingSpec(
             all_onsets=all_onsets,
             durations=durations,
