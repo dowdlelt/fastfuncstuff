@@ -315,14 +315,14 @@ class ICAMode(Mode):
             short="IC spectrum",
         )
 
-    def panels(self) -> dict[str, Trace]:
+    def panels(self) -> dict[str, list[Trace]]:
         if self._maps is None:
             return {}
         k = self._index
-        out = {}
+        out: dict[str, list[Trace]] = {}
         for name, trace in (("timecourse", self._timecourse(k)), ("spectrum", self._spectrum(k))):
             if trace is not None:
-                out[name] = trace
+                out[name] = [trace]
         return out
 
     def series(self, ijk: tuple[int, int, int]) -> list[Trace]:

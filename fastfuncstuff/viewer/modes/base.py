@@ -342,8 +342,14 @@ class Mode(ABC):
         """Named lines this mode shows in windows of their own, opened on entry."""
         return ()
 
-    def panels(self) -> dict[str, Trace]:
-        """The current line for each of :meth:`panel_names`."""
+    def panels(self) -> dict[str, list[Trace]]:
+        """The current lines for each of :meth:`panel_names`.
+
+        A list because the natural unit of a panel is sometimes a set -- six
+        motion parameters mean nothing plotted apart. Lines in one panel share
+        a y-axis, so they must share units: that is what makes translation and
+        rotation two panels rather than one crowded one.
+        """
         return {}
 
     # -- production ----------------------------------------------------

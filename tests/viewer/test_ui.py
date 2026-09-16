@@ -1967,7 +1967,8 @@ def test_entering_ica_opens_a_timecourse_and_a_spectrum_window_once(win, qapp, i
     timecourse = next(
         w for w in traces if win.session.state.viewports.get(w.vid).panel == "timecourse"
     )
-    assert timecourse.view._trace is not None and timecourse.view._trace.values.size == 40
+    drawn = timecourse.view._traces
+    assert len(drawn) == 1 and drawn[0].values.size == 40
     assert timecourse.windowTitle().startswith("[A] timecourse")
 
 
@@ -1986,7 +1987,7 @@ def test_review_keys_in_a_trace_window_label_and_step(win, qapp, ica_folder):
     # the panel follows the mode, so the spin box shows where the review is
     spin = win.mode_panel._widgets["component"]
     assert spin.value() == 2
-    assert "IC 2" in window.view._trace.label
+    assert "IC 2" in window.view._traces[0].label
 
 
 # ---------------------------------------------------------------------------

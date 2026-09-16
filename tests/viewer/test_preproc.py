@@ -526,3 +526,126 @@ def test_the_log_describes_this_run_not_the_last_one(win, qapp, with_chatty):
     second = _run_dialog(w, qapp, "chatty")
     assert second is first
     assert second._log.toPlainText().count("chatty: starting") == 1
+
+
+# ---------------------------------------------------------------------------
+# the motion plot
+# ---------------------------------------------------------------------------
+
+
+def test_motion_panels_split_rotation_from_translation():
+    """One y-axis per panel, so a panel's lines must share units."""
+    from fastfuncstuff.viewer.tools.moco import ROTATION, TRANSLATION, motion_panels
+
+    panels = motion_panels(np.zeros((12, 6)))
+    assert set(panels) == {ROTATION, TRANSLATION}
+    assert [t.legend for t in panels[ROTATION]] == ["roll (deg)", "pitch (deg)", "yaw (deg)"]
+    assert [t.legend for t in panels[TRANSLATION]] == ["dS (mm)", "dL (mm)", "dP (mm)"]
+    assert all(t.x_label == "TR" for t in panels[ROTATION])
+
+
+def test_the_plot_cannot_drift_from_the_1D_file(tmp_path):
+    """The teaching failure this guards against is a plot that quietly lies.
+
+    The solver reports the *correction*; everyone means the subject's motion,
+    which is its negation in a different column order. A viewer that read the
+    solver's columns directly would draw a picture disagreeing with the .1D
+    written beside it from the same run.
+    """
+    from fastfuncstuff.processing.ffs_moco import save_moco_1D
+    from fastfuncstuff.viewer.tools.moco import ROTATION, TRANSLATION, motion_panels
+
+    rng = np.random.default_rng(4)
+    params = rng.normal(0, 2, size=(20, 6))
+
+    panels = motion_panels(params)
+    plotted = np.concatenate(
+        [
+            np.stack([t.values for t in panels[ROTATION]], axis=1),
+            np.stack([t.values for t in panels[TRANSLATION]], axis=1),
+        ],
+        axis=1,
+    )
+    save_moco_1D(params, str(tmp_path / "ref.1D"))
+    # The file is %8.4f, so it round-trips only to that precision.
+    assert np.allclose(plotted, np.loadtxt(tmp_path / "ref.1D"), atol=1e-4)
+
+
+def test_moco_hands_the_layer_affine_to_the_solver(preproc, monkeypatch):
+    """Without it the reported motion is in the wrong space, silently.
+
+    Omitting header_info does not fail; it produces parameters that differ by
+    millimetres, which is exactly the kind of wrong that gets believed.
+    """
+    import fastfuncstuff.processing.ffs_moco as ffs_moco
+
+    s, d = preproc
+    key = s.load(d / "run1.nii.gz")
+    seen = {}
+    real = ffs_moco.moco
+
+    def spy(series, config, header_info=None, base_vol=None):
+        seen["affine"] = None if header_info is None else header_info.get("affine")
+        return real(series, config, header_info=header_info, base_vol=base_vol)
+
+    monkeypatch.setattr(ffs_moco, "moco", spy)
+    spec = s.mode.dialog_for("moco")
+    spec.run({**spec.params, "interp": "linear", "final_interp": "linear"}, None)
+
+    expected = s.state.layers.get(key).affine
+    assert seen["affine"] is not None, "the solver was given no affine"
+    assert np.allclose(seen["affine"], expected)
+
+
+def test_preproc_has_no_plots_until_something_has_run(preproc, with_double):
+    s, d = preproc
+    assert s.mode.panel_names() == ()
+    s.load(d / "run1.nii.gz")
+    _run(s.mode, "double", {})
+    assert s.mode.panel_names() == (), "a tool with no panels adds none"
+
+
+def test_a_tools_plots_replace_the_last_tools(preproc):
+    """Two tools' plots on screen at once is how the wrong one gets read."""
+
+    class Plotter(Tool):
+        name, label, tag, op = "plotter", "Plotter", "PLOT", "plotter"
+        blurb = ""
+
+        def __init__(self, panel):
+            self._panel = panel
+
+        def run(self, session, params, progress=None):
+            from fastfuncstuff.viewer.modes.base import Trace
+
+            return ToolOutcome(
+                values=np.asarray(session.store.ensure_ram(params["input"])),
+                panels={self._panel: [Trace(label="x", values=np.arange(8.0))]},
+            )
+
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    tools._tools["plotter"] = Plotter("first plot")
+    try:
+        _run(s.mode, "plotter", {})
+        assert s.mode.panel_names() == ("first plot",)
+        tools._tools["plotter"] = Plotter("second plot")
+        _run(s.mode, "plotter", {})
+        assert s.mode.panel_names() == ("second plot",)
+    finally:
+        del tools._tools["plotter"]
+
+
+def test_a_panel_draws_every_line_it_was_given(qapp):
+    from fastfuncstuff.viewer.modes.base import Trace
+    from fastfuncstuff.viewer.ui.tracewindow import PlotView
+
+    view = PlotView()
+    view.set_traces([Trace(label=f"l{i}", values=np.arange(10.0) * i) for i in range(1, 4)])
+    assert len(view._traces) == 3
+
+    # A line of one point cannot be drawn and must not blank the panel.
+    view.set_traces(
+        [Trace(label="ok", values=np.arange(10.0)), Trace(label="short", values=np.array([1.0]))]
+    )
+    assert [t.label for t in view._traces] == ["ok"]

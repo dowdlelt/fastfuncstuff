@@ -1039,7 +1039,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         """Show one tool's form, reusing the window if it is already up."""
         dialog = self._tool_dialogs.get(spec.name)
         if dialog is None:
-            dialog = ToolDialog(spec, self.runner, self.refresh, self)
+            dialog = ToolDialog(spec, self.runner, self._on_tool_installed, self)
             self._tool_dialogs[spec.name] = dialog
         else:
             # Re-seeded rather than rebuilt: the input dropdown has to pick up
@@ -1048,6 +1048,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
+
+    def _on_tool_installed(self, dirty: Aspect) -> None:
+        """A tool's result is in; open any plots it brought with it.
+
+        Through the same open_mode_panels the mode selector uses, so a tool's
+        motion plot is a trace window like ICA's spectrum -- in the recording,
+        closable, and reopened by entering the mode again.
+        """
+        self.refresh(dirty | self.session.open_mode_panels())
 
     def _close_tool_dialogs(self) -> None:
         """Drop every tool form.

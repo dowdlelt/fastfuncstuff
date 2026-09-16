@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
-from fastfuncstuff.viewer.modes.base import ChoiceControl, Control, ProgressFn
+from fastfuncstuff.viewer.modes.base import ChoiceControl, Control, ProgressFn, Trace
 from fastfuncstuff.viewer.tools.base import AuxVolume, Tool, ToolOutcome, tool
 
 if TYPE_CHECKING:
@@ -80,6 +80,43 @@ def qc_volumes(series: np.ndarray, when: str) -> list[AuxVolume]:
             symmetric=True,
         ),
     ]
+
+
+#: The two panels the estimated motion is drawn in. Two rather than one because
+#: the six parameters do not share units, and a shared y-axis is what makes a
+#: panel readable: half a degree and half a millimetre are not the same size.
+TRANSLATION = "motion · translation"
+ROTATION = "motion · rotation"
+
+
+def motion_panels(params: np.ndarray) -> dict[str, list[Trace]]:
+    """The six estimated parameters, as AFNI reports them, in two plots.
+
+    Goes through ``to_afni_motion`` rather than reading the solver's columns
+    directly, so this picture and the .1D file ffs_moco writes from the same run
+    cannot disagree about sign or order -- which they would, since the solver
+    works in correction parameters and everyone reports subject motion.
+    """
+    from fastfuncstuff.processing.ffs_moco import AFNI_MOTION_LABELS, to_afni_motion
+
+    motion = to_afni_motion(params)
+    rotation, translation = motion[:, :3], motion[:, 3:]
+    out: dict[str, list[Trace]] = {}
+    for panel, block, names, unit in (
+        (ROTATION, rotation, AFNI_MOTION_LABELS[:3], "deg"),
+        (TRANSLATION, translation, AFNI_MOTION_LABELS[3:], "mm"),
+    ):
+        out[panel] = [
+            Trace(
+                label=f"{name} ({unit})",
+                values=np.ascontiguousarray(block[:, i]),
+                x_label="TR",
+                key=f"moco_{name}",
+                short=f"{name} ({unit})",
+            )
+            for i, name in enumerate(names)
+        ]
+    return out
 
 
 @tool
@@ -165,7 +202,17 @@ class MocoTool(Tool):
             values=aligned,
             detail=f"base {which}, {config.interp}/{config.final_interp}",
             aux=[*qc_volumes(values, "before"), *qc_volumes(aligned, "after")],
+            panels=motion_panels(result.params),
         )
 
 
-__all__ = ["MocoTool", "BASES", "KERNELS", "base_index", "qc_volumes"]
+__all__ = [
+    "MocoTool",
+    "BASES",
+    "KERNELS",
+    "ROTATION",
+    "TRANSLATION",
+    "base_index",
+    "motion_panels",
+    "qc_volumes",
+]

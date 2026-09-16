@@ -33,6 +33,7 @@ from fastfuncstuff.viewer.modes.base import (
     DialogSpec,
     Mode,
     ProgressFn,
+    Trace,
     mode,
 )
 from fastfuncstuff.viewer.tools import registry as tools
@@ -61,8 +62,22 @@ class PreprocMode(Mode):
     # empty A_PREPROC layer and offer a KEEP button for it.
     produces_overlay = False
 
+    def __init__(self) -> None:
+        #: Panels from the last tool that ran, by window title. Kept on the mode
+        #: rather than the tool because a tool is a stateless description of how
+        #: to do something, and this is the result of having done it.
+        self._panels: dict[str, list[Trace]] = {}
+        super().__init__()
+
     def compute(self) -> ComputedOverlay | None:
         return None
+
+    def panel_names(self) -> tuple[str, ...]:
+        """Nothing until something has run. Preproc has no standing plots."""
+        return tuple(self._panels)
+
+    def panels(self) -> dict[str, list[Trace]]:
+        return self._panels
 
     def actions(self) -> tuple[ActionControl, ...]:
         """One button per registered tool; the registry is the only list."""
@@ -169,6 +184,10 @@ class PreprocMode(Mode):
         """
         if self.session is None:
             return Aspect.NOTHING
+        # Replaced, not merged: these describe this run. Leaving the previous
+        # tool's plots up beside a new tool's result is how you end up reading
+        # the wrong motion parameters.
+        self._panels = dict(outcome.panels)
         stem = self.output_name_for(tool)
         op = tool.op or tool.name
         dirty = Aspect.NOTHING

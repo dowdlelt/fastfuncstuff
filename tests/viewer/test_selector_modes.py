@@ -781,7 +781,10 @@ def test_ica_offers_a_timecourse_and_a_spectrum_panel(ica_dir, session):
     session.set_mode_param("folder", str(ica_dir / "ica_out"))
     panels = session.mode.panels()
     assert set(panels) == set(session.mode.panel_names()) == {"timecourse", "spectrum"}
-    assert panels["timecourse"].values.size == 40
+    # One line each, but a panel is a list now: a set of lines sharing one
+    # y-axis is the general case and a single line the degenerate one.
+    assert [len(v) for v in panels.values()] == [1, 1]
+    assert panels["timecourse"][0].values.size == 40
 
 
 def test_coming_back_to_a_mode_resumes_where_it_was(ica_dir, session):

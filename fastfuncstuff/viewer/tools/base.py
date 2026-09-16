@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 
 import numpy as np
 
-from fastfuncstuff.viewer.modes.base import Control, ProgressFn
+from fastfuncstuff.viewer.modes.base import Control, ProgressFn, Trace
 
 if TYPE_CHECKING:
     from fastfuncstuff.viewer.session import ViewerSession
@@ -100,6 +100,9 @@ class ToolOutcome:
     #: QC volumes made alongside the result, in the order they should read in
     #: the stack.
     aux: list[AuxVolume] = field(default_factory=list)
+    #: Named plots the tool wants opened beside the images, each a set of lines
+    #: sharing one y-axis. The key is what the window is titled.
+    panels: dict[str, list[Trace]] = field(default_factory=dict)
 
 
 class Tool(ABC):

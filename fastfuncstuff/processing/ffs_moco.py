@@ -678,6 +678,30 @@ def _get_voxel_sizes(affine: np.ndarray) -> np.ndarray:
     return np.sqrt((affine[:3, :3] ** 2).sum(axis=0))
 
 
+#: AFNI 3dvolreg's motion-parameter columns, in its order, with their units.
+AFNI_MOTION_LABELS: tuple[str, ...] = ("roll", "pitch", "yaw", "dS", "dL", "dP")
+AFNI_MOTION_UNITS: tuple[str, ...] = ("deg", "deg", "deg", "mm", "mm", "mm")
+
+
+def to_afni_motion(params_array: np.ndarray) -> np.ndarray:
+    """``(nt, 6)`` DICOM correction params to AFNI's reported motion.
+
+    Two conventions differ here and both matter. The solver's parameters are
+    ``[dx, dy, dz, rz, rx, ry]`` and describe the *correction*; what 3dvolreg
+    reports -- and what anybody means by "the motion parameters" -- is the
+    subject's motion, which is their negation, in the order
+    ``roll pitch yaw dS dL dP``.
+
+    One function so the .1D file and any plot of it cannot drift apart. A
+    viewer that drew these in solver order, or without the sign flip, would
+    disagree with the file written beside it from the same run.
+    """
+    p = np.asarray(params_array, dtype=float)
+    dx, dy, dz = p[:, 0], p[:, 1], p[:, 2]
+    rz, rx, ry = p[:, 3], p[:, 4], p[:, 5]
+    return np.stack([-rz, -rx, -ry, -dz, -dx, -dy], axis=1)
+
+
 def save_moco_1D(
     params_array: np.ndarray,
     path: str,
@@ -698,11 +722,10 @@ def save_moco_1D(
         params_array: (nt, 6) array of [dx, dy, dz, rz, rx, ry] in DICOM space.
         path: output file path.
     """
+    motion = to_afni_motion(params_array)
     with open(path, "w") as f:
-        for t in range(params_array.shape[0]):
-            dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
-            rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
-            f.write(f"  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}\n")
+        for row in motion:
+            f.write("  " + "  ".join(f"{v:8.4f}" for v in row) + "\n")
 
 
 def save_moco_dfile(
@@ -721,14 +744,13 @@ def save_moco_dfile(
         rms_after: (nt,) RMS after alignment.
         path: output file path.
     """
+    motion = to_afni_motion(params_array)
     with open(path, "w") as f:
-        for t in range(params_array.shape[0]):
-            dx, dy, dz = params_array[t, 0], params_array[t, 1], params_array[t, 2]
-            rz, rx, ry = params_array[t, 3], params_array[t, 4], params_array[t, 5]
+        for t, row in enumerate(motion):
             f.write(
-                f"  {t:4d}  {-rz:8.4f}  {-rx:8.4f}  {-ry:8.4f}"
-                f"  {-dz:8.4f}  {-dx:8.4f}  {-dy:8.4f}"
-                f"  {rms_before[t]:11.4g}  {rms_after[t]:11.4g}\n"
+                f"  {t:4d}  "
+                + "  ".join(f"{v:8.4f}" for v in row)
+                + f"  {rms_before[t]:11.4g}  {rms_after[t]:11.4g}\n"
             )
 
 
