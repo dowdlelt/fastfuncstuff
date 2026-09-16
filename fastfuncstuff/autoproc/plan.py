@@ -140,6 +140,9 @@ class Options:
     # task's [meta].event_filters. A filtered design is a model variant, so it must
     # carry -glm_label, which also names its TOML (see glm.spec_path).
     event_filters: dict[str, list] = field(default_factory=dict)
+    # {task: [path]} from -prebuilt_contrasts: TOML fragments of [[contrasts]]
+    # validated against the design's labels and appended verbatim to its TOML.
+    prebuilt_contrasts: dict[str, list[str]] = field(default_factory=dict)
     locomoco: bool = False
     # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
     # CHANGES the field the correction applies, where the -events diagnostic the

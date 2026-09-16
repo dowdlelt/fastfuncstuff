@@ -882,3 +882,37 @@ def test_stub_spec_omits_trial_types_the_filter_removes(tmp_path):
     assert stub.meta.event_filters[0].action == "in"
     with pytest.raises(ValueError, match="nope"):
         build_stub_spec([bold, bold], events, event_filters=[EventFilter("nope", ["x"])])
+
+
+@pytest.mark.parametrize("round_duration", [None, 0])
+def test_predicted_stim_labels_match_what_compile_builds(tmp_path, round_duration):
+    """Prebuilt contrasts are validated against the prediction, so it must agree
+    with compile — including the _dur splits jitter produces."""
+    from fastfuncstuff.design.spec import predicted_stim_labels, scan_trial_types
+
+    spec = _jittered_pairs_spec(tmp_path, round_duration)
+    info = _compile_xmat(tmp_path, spec)
+    events = [Path(r.events) for r in spec.meta.runs if r.events]
+    _, durations = scan_trial_types(events)
+    assert predicted_stim_labels(spec.events, durations, spec.meta.tr) == info["stim_labels"]
+
+
+def test_parse_and_check_contrasts_text():
+    from fastfuncstuff.design.spec import check_contrasts, parse_contrasts_text
+
+    text = (
+        '[[contrasts]]   # t-test\nlabel = "a_vs_b"\nsym = "SYM: +1*a -1*b"\nbalance = "none"\n'
+        '[[contrasts]]\nlabel = "any"\nsym = ["SYM: +1*a", "SYM: +1*b"]\n'
+    )
+    cs = parse_contrasts_text(text)
+    assert [c.label for c in cs] == ["a_vs_b", "any"]
+    assert check_contrasts(cs, ["a", "b"]) == []
+    problems = check_contrasts(cs, ["a", "bb"], existing_labels=["any"])
+    assert any("'b'" in p for p in problems) and any("more than once" in p for p in problems)
+    for bad in (
+        '[meta]\ntr = 1\n[[contrasts]]\nlabel="x"\nsym="SYM: +1*a"\n',
+        "label = 1",
+        "[[contrasts]]\nsym = 'SYM: +1*a'\n",
+    ):
+        with pytest.raises(ValueError):
+            parse_contrasts_text(bad)
