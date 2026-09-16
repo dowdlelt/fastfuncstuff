@@ -20,7 +20,7 @@ import numpy as np
 import torch
 
 from fastfuncstuff.viewer.modes.base import ChoiceControl, Control, ProgressFn
-from fastfuncstuff.viewer.tools.base import Tool, ToolOutcome, tool
+from fastfuncstuff.viewer.tools.base import AuxVolume, Tool, ToolOutcome, tool
 
 if TYPE_CHECKING:
     from fastfuncstuff.viewer.session import ViewerSession
@@ -45,6 +45,41 @@ def base_index(which: str, n_volumes: int) -> int:
     if which == "last":
         return n_volumes - 1
     return 0
+
+
+def qc_volumes(series: np.ndarray, when: str) -> list[AuxVolume]:
+    """The first and last volumes, and their difference, for one run.
+
+    This is the picture that shows whether motion correction did anything. The
+    difference between the first and last volume of an uncorrected run has the
+    shape of the brain in it -- bright rims where an edge moved across a voxel
+    boundary. Corrected, the same difference is noise. Two maps, side by side,
+    and the step explains itself.
+
+    Split into an intensity pair and a signed difference rather than one
+    three-volume stack, because they cannot share a display range: first and
+    last are in intensity units and the difference is centred on zero, so one
+    window that suits either draws the other as a flat rectangle.
+    """
+    first, last = series[..., 0], series[..., -1]
+    return [
+        AuxVolume(
+            slot=f"qc_pair_{when}",
+            name=f"first/last ({when})",
+            values=np.stack([first, last], axis=-1),
+            labels=("first", "last"),
+        ),
+        AuxVolume(
+            slot=f"qc_diff_{when}",
+            name=f"diff ({when})",
+            # Signed and unclamped: where the signal went matters as much as
+            # how far, and a diverging map shows both directions at once.
+            values=(last - first)[..., None],
+            labels=("diff(last-first)",),
+            colormap="redblue",
+            symmetric=True,
+        ),
+    ]
 
 
 @tool
@@ -128,7 +163,8 @@ class MocoTool(Tool):
         return ToolOutcome(
             values=aligned,
             detail=f"base {which}, {config.interp}/{config.final_interp}",
+            aux=[*qc_volumes(values, "before"), *qc_volumes(aligned, "after")],
         )
 
 
-__all__ = ["MocoTool", "BASES", "KERNELS", "base_index"]
+__all__ = ["MocoTool", "BASES", "KERNELS", "base_index", "qc_volumes"]

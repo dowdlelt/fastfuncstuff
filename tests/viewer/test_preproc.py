@@ -25,8 +25,8 @@ from fastfuncstuff.viewer.modes import registry
 from fastfuncstuff.viewer.modes.base import ChoiceControl
 from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.tools import registry as tools
-from fastfuncstuff.viewer.tools.base import Tool, ToolOutcome
-from fastfuncstuff.viewer.tools.moco import base_index
+from fastfuncstuff.viewer.tools.base import AuxVolume, Tool, ToolOutcome
+from fastfuncstuff.viewer.tools.moco import base_index, qc_volumes
 from fastfuncstuff.viewer.vocab import SetMode
 
 nib = pytest.importorskip("nibabel")
@@ -156,8 +156,27 @@ class DoubleTool(Tool):
     blurb = "Doubles every voxel."
 
     def run(self, session, params, progress=None):
-        values = session.store.ensure_ram(params["input"])
-        return ToolOutcome(values=np.asarray(values) * 2.0, detail="x2")
+        values = np.asarray(session.store.ensure_ram(params["input"]))
+        return ToolOutcome(
+            values=values * 2.0,
+            detail="x2",
+            aux=[
+                AuxVolume(
+                    slot="pair",
+                    name="pair",
+                    values=values[..., :2],
+                    labels=("first", "last"),
+                ),
+                AuxVolume(
+                    slot="signed",
+                    name="signed",
+                    values=(values[..., -1] - values[..., 0])[..., None],
+                    labels=("diff",),
+                    colormap="redblue",
+                    symmetric=True,
+                ),
+            ],
+        )
 
 
 @pytest.fixture
@@ -172,6 +191,11 @@ def _run(mode, tool_name, params):
     spec = mode.dialog_for(tool_name)
     merged = {**spec.params, **params}
     return spec.install(spec.run(merged, None))
+
+
+def _results(session, op="double"):
+    """Layers that are a tool's result, not the QC volumes made beside it."""
+    return [layer for layer in session.state.layers if layer.source.startswith(f"derived:{op}:")]
 
 
 def test_the_output_lands_directly_above_its_input(preproc, with_double):
@@ -198,7 +222,7 @@ def test_running_again_replaces_rather_than_piles_up(preproc, with_double):
     s.load(d / "run1.nii.gz")
     for _ in range(3):
         _run(s.mode, "double", {})
-    assert sum(1 for layer in s.state.layers if layer.is_derived) == 1
+    assert len(_results(s)) == 1
 
 
 def test_running_on_a_different_input_makes_a_second_layer(preproc, with_double):
@@ -208,7 +232,7 @@ def test_running_on_a_different_input_makes_a_second_layer(preproc, with_double)
     offered = s.mode.inputs_for(tools.find("double"))
     for label in offered:
         _run(s.mode, "double", {"input": label})
-    assert sum(1 for layer in s.state.layers if layer.is_derived) == 2
+    assert len(_results(s)) == 2
 
 
 def test_the_result_stays_in_memory_and_writes_nothing(preproc, with_double, tmp_path):
@@ -307,3 +331,98 @@ def test_a_form_does_not_survive_a_controller_switch(win, qapp):
     w.new_controller()
     qapp.processEvents()
     assert not w._tool_dialogs
+
+
+# ---------------------------------------------------------------------------
+# QC volumes: the half of a preproc step that teaches
+# ---------------------------------------------------------------------------
+
+
+def test_qc_volumes_split_intensity_from_difference():
+    """One stack cannot window both: intensity units against a signed map."""
+    series = np.zeros((4, 4, 3, 5), np.float32)
+    series[..., 0] = 10.0
+    series[..., -1] = 14.0
+    pair, diff = qc_volumes(series, "before")
+
+    assert pair.values.shape == (4, 4, 3, 2)
+    assert pair.labels == ("first", "last")
+    assert not pair.symmetric
+
+    assert diff.values.shape == (4, 4, 3, 1)
+    assert np.allclose(diff.values[..., 0], 4.0), "signed last - first"
+    assert diff.symmetric and diff.colormap == "redblue"
+
+
+def test_qc_volumes_are_named_for_when_they_were_taken():
+    before = {v.slot for v in qc_volumes(np.zeros((2, 2, 2, 3), np.float32), "before")}
+    after = {v.slot for v in qc_volumes(np.zeros((2, 2, 2, 3), np.float32), "after")}
+    assert not (before & after), "before and after must not replace each other"
+
+
+def test_qc_layers_arrive_hidden(preproc, with_double):
+    """Four QC volumes switched on at once would bury the anatomy."""
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    _run(s.mode, "double", {})
+    made = [layer for layer in s.state.layers if layer.is_derived]
+    assert len(made) == 3
+    hidden = [layer for layer in made if not layer.visible]
+    assert len(hidden) == 2, "the result shows; its QC volumes wait to be flipped to"
+
+
+def test_the_result_stays_adjacent_to_its_source(preproc, with_double):
+    """QC volumes must not push the result away from what [ and ] compare."""
+    s, d = preproc
+    key = s.load(d / "run1.nii.gz")
+    _run(s.mode, "double", {})
+    keys = [layer.key for layer in s.state.layers]
+    result = s.state.layers.find_by_source(f"derived:double:{key}")
+    assert keys.index(result.key) == keys.index(key) + 1
+
+
+def test_a_signed_map_gets_its_own_window_not_the_runs(preproc, with_double):
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    _run(s.mode, "double", {})
+    signed = next(layer for layer in s.state.layers if layer.name.endswith("signed"))
+    assert signed.colormap == "redblue"
+    assert signed.range_lo is not None and signed.range_lo == pytest.approx(-signed.range_hi)
+
+
+def test_qc_volumes_do_not_follow_the_time_slider(preproc, with_double):
+    """Its sub-bricks are 'first' and 'last', not time points."""
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    _run(s.mode, "double", {})
+    pair = next(layer for layer in s.state.layers if layer.name.endswith("pair"))
+    assert not pair.time_linked
+
+
+def test_re_running_replaces_the_qc_volumes_too(preproc, with_double):
+    s, d = preproc
+    s.load(d / "run1.nii.gz")
+    for _ in range(3):
+        _run(s.mode, "double", {})
+    assert sum(1 for layer in s.state.layers if layer.is_derived) == 3
+
+
+def test_a_tool_with_no_qc_volumes_still_installs(preproc):
+    """aux is optional; the contract must not require it."""
+
+    class Bare(Tool):
+        name, label, tag, op = "bare", "Bare", "BARE", "bare"
+        blurb = ""
+
+        def run(self, session, params, progress=None):
+            return ToolOutcome(values=np.asarray(session.store.ensure_ram(params["input"])))
+
+    tools._tools["bare"] = Bare()
+    try:
+        s, d = preproc
+        s.load(d / "run1.nii.gz")
+        _run(s.mode, "bare", {})
+        assert len(_results(s, "bare")) == 1
+        assert sum(1 for layer in s.state.layers if layer.is_derived) == 1
+    finally:
+        del tools._tools["bare"]

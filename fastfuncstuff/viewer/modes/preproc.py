@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
+
 from fastfuncstuff.viewer.commands import Aspect
 from fastfuncstuff.viewer.modes.base import (
     ActionControl,
@@ -35,6 +37,20 @@ from fastfuncstuff.viewer.modes.base import (
 )
 from fastfuncstuff.viewer.tools import registry as tools
 from fastfuncstuff.viewer.tools.base import Tool, ToolOutcome
+
+
+def symmetric_range(values: np.ndarray) -> tuple[float, float] | None:
+    """A display window centred on zero, for a signed map.
+
+    The 99th percentile of the magnitude rather than the maximum: one hot voxel
+    at the edge of the field of view would otherwise set the scale and leave the
+    map that matters looking empty.
+    """
+    finite = values[np.isfinite(values)]
+    if not finite.size:
+        return None
+    top = float(np.percentile(np.abs(finite), 99.0))
+    return (-top, top) if top > 0 else None
 
 
 @mode
@@ -144,15 +160,41 @@ class PreprocMode(Mode):
         return outcome
 
     def _install(self, tool: Tool, outcome: ToolOutcome) -> Aspect:
-        """On the GUI thread. Lands above the source, replacing a previous run."""
+        """On the GUI thread. Lands above the source, replacing a previous run.
+
+        QC volumes go in first and the result last, because each lands directly
+        above the source: installing in that order leaves the result adjacent to
+        the run it corrected, which is what `[` and `]` flip between, with the
+        QC volumes stacked above it in the order the tool listed them.
+        """
         if self.session is None:
             return Aspect.NOTHING
-        return self.session.install_derived(
+        stem = self.output_name_for(tool)
+        op = tool.op or tool.name
+        dirty = Aspect.NOTHING
+
+        for volume in reversed(outcome.aux):
+            dirty |= self.session.install_derived(
+                outcome.source_key,
+                volume.values,
+                op=f"{op}.{volume.slot}",
+                detail=outcome.detail,
+                name=f"{stem} {volume.name}",
+                labels=volume.labels or None,
+                colormap=volume.colormap or None,
+                display_range=symmetric_range(volume.values) if volume.symmetric else None,
+                # Four QC volumes switched on at once would bury the anatomy.
+                # They are here to be flipped to, not to be drawn over.
+                visible=False,
+                select=False,
+            )
+
+        return dirty | self.session.install_derived(
             outcome.source_key,
             outcome.values,
-            op=tool.op or tool.name,
+            op=op,
             detail=outcome.detail,
-            name=self.output_name_for(tool),
+            name=stem,
         )
 
     def output_name_for(self, tool: Tool) -> str:

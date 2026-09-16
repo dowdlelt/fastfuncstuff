@@ -537,6 +537,11 @@ class ViewerSession:
         op: str,
         detail: str = "",
         name: str | None = None,
+        labels: tuple[str, ...] | None = None,
+        colormap: str | None = None,
+        display_range: tuple[float, float] | None = None,
+        visible: bool | None = None,
+        select: bool = True,
     ) -> Aspect:
         """Put a computed dataset into the stack, right above what made it.
 
@@ -550,17 +555,34 @@ class ViewerSession:
           the layer rather than pushing another. Clicking twice must not grow
           the stack without bound, and the parameters that produced it are in
           the recorded command either way.
+
+        Inheriting the source's drawing is right for a dataset of the same kind
+        -- a denoised or motion-corrected run -- and wrong for a QC volume made
+        alongside it. A difference map is signed and centred on zero, so it
+        wants its own colour map and its own symmetric range; carrying over the
+        intensity window of the run it came from would draw it as a black
+        rectangle. Hence the overrides: given, they win; omitted, the source
+        still decides.
         """
         source = self.state.layers.get(source_key)
         tag = f"derived:{op}:{source_key}"
         existing = self.state.layers.find_by_source(tag)
         key = existing.key if existing is not None else self.state.layers.mint_key("D")
         name = name or f"{source.name} ·{op}d"
+        lo, hi = display_range if display_range is not None else (source.range_lo, source.range_hi)
 
         self.store.adopt(key, values, name=name)
         self.invalidate(key)
         if existing is not None:
-            self.state.layers.update(key, name=name, path=f"<{op}: {detail}>")
+            self.state.layers.update(
+                key,
+                name=name,
+                path=f"<{op}: {detail}>",
+                n_volumes=int(values.shape[3]) if values.ndim == 4 else 1,
+                labels=labels if labels is not None else source.labels,
+                range_lo=lo,
+                range_hi=hi,
+            )
             return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
 
         self.state.layers.add(
@@ -573,22 +595,26 @@ class ViewerSession:
                 shape=source.shape,
                 n_volumes=int(values.shape[3]) if values.ndim == 4 else 1,
                 affine=source.affine,
-                labels=source.labels,
-                visible=source.visible,
+                labels=labels if labels is not None else source.labels,
+                visible=source.visible if visible is None else visible,
                 opacity=source.opacity,
-                colormap=source.colormap,
+                colormap=colormap or source.colormap,
                 # The same display range as its source, so the two are
                 # comparable at a glance rather than each auto-scaled to
                 # itself -- which would hide exactly the difference you made
                 # the layer to see.
-                range_lo=source.range_lo,
-                range_hi=source.range_hi,
-                time_linked=source.time_linked,
+                range_lo=lo,
+                range_hi=hi,
+                # A QC volume is not the run's time base: its sub-bricks are
+                # "first" and "last", not time points, so scrubbing must not
+                # drag it along.
+                time_linked=source.time_linked and labels is None,
                 source=tag,
             ),
             at=self.state.layers.index_of(source_key) + 1,
         )
-        self.state.selected = key
+        if select:
+            self.state.selected = key
         return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
 
     # -- computed overlays ---------------------------------------------

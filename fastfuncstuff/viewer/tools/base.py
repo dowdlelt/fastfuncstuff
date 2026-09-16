@@ -50,6 +50,33 @@ if TYPE_CHECKING:
 
 
 @dataclass
+class AuxVolume:
+    """A small volume a tool made on the side, to look at rather than to use.
+
+    The teaching half of a preproc step. Motion correction's real output is a
+    corrected run, but what *shows* that it worked is the difference between the
+    first and last volumes, before against after: structured edges around the
+    brain beforehand, noise afterwards.
+
+    These stay in RAM like everything a tool makes, arrive hidden so four of
+    them do not bury the anatomy, and can be saved one at a time if one turns
+    out to be worth keeping.
+    """
+
+    #: Stable within a tool, so re-running replaces this volume rather than
+    #: adding a fifth: ``qc_diff_before``, not "difference map 3".
+    slot: str
+    #: What the layer is called, after the tool's stem: ``A_MOCO diff (before)``.
+    name: str
+    values: np.ndarray
+    labels: tuple[str, ...] = ()
+    colormap: str = ""
+    #: Centre the display range on zero. What makes a signed difference map
+    #: readable, and wrong for anything measured in intensity units.
+    symmetric: bool = False
+
+
+@dataclass
 class ToolOutcome:
     """What a tool made, in the form the session installs it from.
 
@@ -70,6 +97,9 @@ class ToolOutcome:
     #: every tool would have to repeat, and forgetting it puts the result in
     #: the wrong place in the stack.
     source_key: str = ""
+    #: QC volumes made alongside the result, in the order they should read in
+    #: the stack.
+    aux: list[AuxVolume] = field(default_factory=list)
 
 
 class Tool(ABC):
@@ -124,4 +154,4 @@ registry = ToolRegistry()
 tool = registry.register
 
 
-__all__ = ["Tool", "ToolOutcome", "ToolRegistry", "registry", "tool"]
+__all__ = ["AuxVolume", "Tool", "ToolOutcome", "ToolRegistry", "registry", "tool"]

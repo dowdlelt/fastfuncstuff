@@ -1,9 +1,24 @@
 """Preproc tools. Importing the package registers every built-in tool."""
 
-from fastfuncstuff.viewer.tools.base import Tool, ToolOutcome, ToolRegistry, registry, tool
+from fastfuncstuff.viewer.tools.base import (
+    AuxVolume,
+    Tool,
+    ToolOutcome,
+    ToolRegistry,
+    registry,
+    tool,
+)
 
 # Registration is an import side effect, so every built-in tool must be
 # imported here or its button will not appear in Preproc.
 from fastfuncstuff.viewer.tools.moco import MocoTool  # noqa: E402
 
-__all__ = ["MocoTool", "Tool", "ToolOutcome", "ToolRegistry", "registry", "tool"]
+__all__ = [
+    "AuxVolume",
+    "MocoTool",
+    "Tool",
+    "ToolOutcome",
+    "ToolRegistry",
+    "registry",
+    "tool",
+]
