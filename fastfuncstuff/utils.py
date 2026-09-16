@@ -212,6 +212,18 @@ _MPS_CPU_OPS: dict[str, str] = {
     "MPS vs 30 ms CPU (19x slower; Metal's best run of several was 105 ms, still 3.3x). "
     "Metal is launch-bound on it -- at its best it is flat ~110 ms from 0.1M to 12.6M "
     "output voxels -- while the CPU scales with the work and wins at every size",
+    # The viewer's compositing path, and the only entry here that is about
+    # *safety* before speed. Metal has no cross-thread story: two Python threads
+    # in MPS at once abort the process outright with "failed assertion _status <
+    # MTLCommandBufferStatusCommitted", not an exception anything can catch. The
+    # viewer composites on the GUI thread while a worker runs a mode or a preproc
+    # tool, so leaving the repaint on MPS makes every long-running tool a race
+    # against the user's next click. Routing the repaint to the CPU leaves the
+    # worker as the only thread on the GPU -- and it is faster anyway, because a
+    # slice-sized array is all copy and no arithmetic.
+    "viewer_compose": "torch 2.14: slice-sized host->device copies, 1.77 ms vs 1.29 ms "
+    "CPU per 3-plane repaint (104x94x57) -- and Metal aborts outright if the GUI "
+    "thread enters it while a worker is already inside it",
 }
 
 # Ops deliberately kept on Metal, recorded so a future reader does not "fix"

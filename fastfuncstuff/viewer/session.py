@@ -725,6 +725,25 @@ class ViewerSession:
     def resident(self, key: str) -> Resident:
         return self.store.get(key)
 
+    @property
+    def display_device(self) -> torch.device:
+        """Where compositing happens, which is not always where computing does.
+
+        The GUI thread repaints while a worker is inside a mode's preparation or
+        a preproc tool, so these are two threads using one device. CUDA is fine
+        with that -- work serialises on its stream -- and keeps the GPU here. MPS
+        is not: two threads in Metal abort the process on an internal assertion
+        that nothing can catch, which showed up as the viewer vanishing when you
+        clicked the brain while motion correction was running.
+
+        So on Metal the repaint moves to the CPU and the worker keeps the GPU to
+        itself. The policy lives in the measured table rather than in an
+        ``if device.type == "mps"`` here; see ``utils.py:_MPS_CPU_OPS``.
+        """
+        from fastfuncstuff.utils import cpu_if_mps
+
+        return cpu_if_mps(self.store.device, "viewer_compose")
+
     def volume(self, key: str, index: int | None = None) -> np.ndarray:
         """One 3-D volume for display, from RAM when resident, disk when not."""
         res = self.store.get(key)
@@ -769,7 +788,7 @@ class ViewerSession:
         except (KeyError, FileNotFoundError, ValueError):
             return None
         tensor = torch.as_tensor(np.ascontiguousarray(arr), dtype=torch.float32).to(
-            self.store.device
+            self.display_device
         )
         # One sub-brick per layer is enough: panes share it, and holding more
         # would quietly duplicate what the residency store already owns.
@@ -855,7 +874,7 @@ class ViewerSession:
         rois = self.roi_set(key)
         if rois is None or not len(rois):
             return None
-        where = device or self.store.device
+        where = device or self.display_device
         cache_key = (key, str(where))
         hit = self._roi_palettes.get(cache_key)
         if hit is not None:

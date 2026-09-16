@@ -393,3 +393,40 @@ def test_spilling_keeps_the_data_when_the_disk_refuses(made, monkeypatch):
         assert np.array_equal(store.get("A_MOCO").array, made)
     finally:
         store.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# where compositing happens
+# ---------------------------------------------------------------------------
+
+
+def test_compositing_stays_off_metal_while_a_worker_owns_it():
+    """The viewer used to die mid-click if a tool was running on the GPU.
+
+    Two Python threads inside MPS abort the process on an internal Metal
+    assertion, and the viewer has exactly that shape: the GUI thread repaints
+    while a worker runs a mode or a preproc tool. The repaint is the half that
+    moves, because a slice-sized array is all copy and no arithmetic.
+    """
+    session = ViewerSession(device=torch.device("mps"))
+    try:
+        assert session.store.device.type == "mps", "compute stays on the GPU"
+        assert session.display_device.type == "cpu"
+    finally:
+        session.close()
+
+
+@pytest.mark.parametrize("kind", ["cpu", "cuda"])
+def test_compositing_stays_on_a_device_that_tolerates_two_threads(kind):
+    session = ViewerSession(device=torch.device(kind))
+    try:
+        assert session.display_device.type == kind
+    finally:
+        session.close()
+
+
+def test_a_displayed_sub_brick_lands_on_the_display_device(session, dataset):
+    path, _ = dataset
+    key = session.load(path)
+    session.store.ensure_ram(key)
+    assert session.display_volume(key).device.type == session.display_device.type
