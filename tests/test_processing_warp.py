@@ -5,6 +5,7 @@ that can be tested in isolation without NIfTI files.
 """
 
 import math
+import os
 
 import pytest
 import torch
@@ -912,32 +913,54 @@ class TestPatchWriteBackDedup:
 
     @pytest.mark.gpu
     @pytest.mark.slow
-    def test_qwarp_batch_is_deterministic(self):
-        """The batched multi-volume write-back must not depend on scatter luck."""
-        from fastfuncstuff.processing.interp import warp_image
-        from fastfuncstuff.processing.warp import qwarp_batch
+    def test_qwarp_batch_is_deterministic_when_asked(self):
+        """-deterministic must make the batched multi-volume fit bit-reproducible.
 
-        nz, ny, nx = 8, 20, 20
-        g = torch.Generator().manual_seed(4)
-        base = torch.rand(nz, ny, nx, generator=g)
-        base = torch.nn.functional.avg_pool3d(base[None, None], 3, 1, 1)[0, 0] + 0.05
-        zz, yy, xx = torch.meshgrid(
-            torch.linspace(0, 1, nz),
-            torch.linspace(0, 1, ny),
-            torch.linspace(0, 1, nx),
-            indexing="ij",
+        Default CUDA runs are NOT reproducible, by design (see add_deterministic_arg):
+        cuBLAS GEMM selection, index_add and cuDNN all drift, so asserting equality
+        without the switch fails for reasons unrelated to qwarp. The write-back dedup
+        this once guarded end to end is unit-tested above on CPU. cuBLAS reads its
+        workspace variable at initialisation, which an earlier GPU test in the session
+        may already have done -- hence a fresh interpreter.
+        """
+        import subprocess
+        import sys
+        import textwrap
+
+        from fastfuncstuff.cli_utils import CUBLAS_DETERMINISM_ENV, CUBLAS_DETERMINISM_VALUE
+
+        script = textwrap.dedent(
+            """
+            import torch
+            from fastfuncstuff.processing.interp import warp_image
+            from fastfuncstuff.processing.warp import QwarpConfig, qwarp_batch
+
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            nz, ny, nx = 8, 20, 20
+            g = torch.Generator().manual_seed(4)
+            base = torch.rand(nz, ny, nx, generator=g)
+            base = torch.nn.functional.avg_pool3d(base[None, None], 3, 1, 1)[0, 0] + 0.05
+            zz, yy, xx = torch.meshgrid(
+                torch.linspace(0, 1, nz), torch.linspace(0, 1, ny), torch.linspace(0, 1, nx),
+                indexing="ij",
+            )
+            w = 1.2 * torch.sin(2 * torch.pi * xx) * torch.sin(torch.pi * yy) * torch.sin(torch.pi * zz)
+            z0 = torch.zeros_like(w)
+            sources = torch.stack(
+                [warp_image(base, z0, -s * w, z0, mode="linear") for s in (0.8, 1.0)]
+            )
+            base, sources = base.cuda(), sources.cuda()
+            cfg = QwarpConfig(minpatch=9, cost_method="lpa", verb=0)
+            a = qwarp_batch(base, sources, config=cfg)
+            b = qwarp_batch(base, sources, config=cfg)
+            assert all(torch.equal(fa, fb) for fa, fb in zip(a[1:], b[1:], strict=True))
+            """
         )
-        w = 1.2 * torch.sin(2 * torch.pi * xx) * torch.sin(torch.pi * yy) * torch.sin(torch.pi * zz)
-        z0 = torch.zeros_like(w)
-        sources = torch.stack([warp_image(base, z0, -s * w, z0, mode="linear") for s in (0.8, 1.0)])
-
-        base = base.cuda()
-        sources = sources.cuda()
-        cfg = QwarpConfig(minpatch=9, cost_method="lpa", verb=0)
-        a = qwarp_batch(base, sources, config=cfg)
-        b = qwarp_batch(base, sources, config=cfg)
-        for fa, fb in zip(a[1:], b[1:], strict=True):
-            assert torch.equal(fa, fb), "qwarp_batch is not reproducible"
+        env = {**os.environ, CUBLAS_DETERMINISM_ENV: CUBLAS_DETERMINISM_VALUE}
+        proc = subprocess.run(
+            [sys.executable, "-c", script], env=env, capture_output=True, text=True
+        )
+        assert proc.returncode == 0, f"qwarp_batch is not reproducible:\n{proc.stderr[-2000:]}"
 
     def test_qwarp_cpu_level_zero_uses_resident_batched_optimizer(self, monkeypatch):
         """CPU level zero must not cross into SciPy/Powell for every evaluation."""
@@ -1134,6 +1157,7 @@ class TestGaussNewtonPatchOptimizer:
 
         base, moving = self._pair()
         warped, *_ = self._run(optimizer="gn")
+        warped = warped.cpu()
         before = evaluate_metrics(MetricInputs(base=base, moving=moving), ["ls"])["ls"]
         after = evaluate_metrics(MetricInputs(base=base, moving=warped), ["ls"])["ls"]
         assert after < before
@@ -1145,8 +1169,8 @@ class TestGaussNewtonPatchOptimizer:
         from fastfuncstuff.processing.metrics import MetricInputs, evaluate_metrics
 
         base, _ = self._pair()
-        adam, *_ = self._run()
-        gn, *_ = self._run(optimizer="gn")
+        adam = self._run()[0].cpu()
+        gn = self._run(optimizer="gn")[0].cpu()
         a = evaluate_metrics(MetricInputs(base=base, moving=adam), ["ls"])["ls"]
         g = evaluate_metrics(MetricInputs(base=base, moving=gn), ["ls"])["ls"]
         assert abs(a - g) < 0.15, f"GN diverged from Adam: {g:.4f} vs {a:.4f}"
@@ -1169,12 +1193,16 @@ class TestGaussNewtonPatchOptimizer:
         b = self._run(optimizer="gn")[0]
         assert torch.equal(a, b)
 
-    def test_falls_back_to_adam_for_costs_without_a_surrogate(self):
+    def test_falls_back_to_adam_for_costs_without_a_surrogate(self, monkeypatch):
         """The descriptor costs have no least-squares residual, so GN cannot apply
         -- and asking for it must not silently produce a different (or broken)
         answer. lpa and lncc DO have one, via locally normalised residuals; see
         TestGaussNewtonLocalCosts."""
         import torch
+
+        # mind smooths through conv3d; cuDNN's default algorithms drift run to run,
+        # which would fail the equality below on two identical Adam fits.
+        monkeypatch.setattr(torch.backends.cudnn, "deterministic", True)
 
         from fastfuncstuff.processing.warp import QwarpConfig, qwarp
 
