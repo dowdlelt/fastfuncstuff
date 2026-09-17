@@ -289,6 +289,7 @@ def test_decimation_bounds_the_points_without_moving_the_time_axis() -> None:
     """Thinning the values alone would stretch a trace across its cell."""
     import numpy as np
 
+    pytest.importorskip("PySide6")
     from fastfuncstuff.viewer.ui.gridgraph import _decimate
 
     values = np.arange(400.0)

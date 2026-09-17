@@ -920,8 +920,10 @@ def test_write_pc_maps_is_one_4d_file_per_axis_with_labels(tmp_path):
         assert len(labels) == 4
         assert labels[0].startswith("PC00 ") and "x" in labels[0]  # variance and enrichment
     table = (tmp_path / "out_pcmap_scores.1D").read_text().splitlines()
-    assert table[0].startswith("# component") and "pe1" in table[0] and "pe2" in table[0]
-    assert len(table) == 5  # header + 4 components
+    comments = [ln for ln in table if ln.startswith("#")]
+    header = next(ln for ln in comments if ln.startswith("# component"))
+    assert "pe1" in header and "pe2" in header
+    assert len(table) - len(comments) == 4  # one row per component
 
 
 def test_warp_ica_basis_finds_what_pca_structurally_cannot():

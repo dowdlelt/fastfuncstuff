@@ -546,7 +546,12 @@ class TestLinalgLstsq:
     def test_matches_torch_on_cpu(self):
         torch.manual_seed(0)
         a, b = torch.randn(64, 4), torch.randn(64, 3)
-        assert torch.allclose(linalg_lstsq(a, b).solution, torch.linalg.lstsq(a, b).solution)
+        # atol, not the default rtol alone: the first CPU LAPACK call in a process
+        # differs from later identical calls by ~1e-7, which is a large *relative*
+        # error on a near-zero coefficient.
+        assert torch.allclose(
+            linalg_lstsq(a, b).solution, torch.linalg.lstsq(a, b).solution, atol=1e-5
+        )
 
     def test_returns_a_full_result_tuple(self):
         """Call sites read .solution, but the other fields must survive the trip."""
