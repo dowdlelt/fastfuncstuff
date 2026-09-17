@@ -42,7 +42,7 @@ from fastfuncstuff.viewer.session import ViewerSession
 from fastfuncstuff.viewer.slicing import voxel_value
 from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
-from fastfuncstuff.viewer.ui.colorbar import RangeBar
+from fastfuncstuff.viewer.ui.colorbar import RangeBar, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
 from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
@@ -71,10 +71,12 @@ from fastfuncstuff.viewer.vocab import (
     SetModeParam,
     SetOverlay,
     SetRange,
+    SetRangeMirror,
     SetSeed,
     SetSign,
     SetTheme,
     SetThreshold,
+    SetThresholdFollow,
     SetThresholdIndex,
     SetTimeLinked,
     SetUnderlay,
@@ -900,7 +902,30 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         self._shrinkable(self.thrbrick_box)
         self.thrbrick_head = self._head("THR ON")
-        form.addRow(self.thrbrick_head, self.thrbrick_box)
+        # Two exclusive boxes rather than more rows in the menu: they say how
+        # the threshold sub-brick moves when OLAY does, not which one it is.
+        self.thr_same_check = QtWidgets.QCheckBox("same")
+        self.thr_same_check.setToolTip(
+            "Threshold on the OLAY sub-brick itself, following it as it changes.\n"
+            "The case for a t or an F shown directly."
+        )
+        self.thr_next_check = QtWidgets.QCheckBox("+1")
+        self.thr_next_check.setToolTip(
+            "Threshold on the sub-brick after OLAY, following it as it changes:\n"
+            "stepping through the _Coef sub-bricks keeps cutting on each one's _Tstat."
+        )
+        for check, mode in ((self.thr_same_check, "same"), (self.thr_next_check, "next")):
+            check.clicked.connect(
+                lambda on, m=mode: self._apply(SetThresholdFollow, mode=m if on else "fixed")
+            )
+        self.thrbrick_row = QtWidgets.QWidget()
+        thr_row = QtWidgets.QHBoxLayout(self.thrbrick_row)
+        thr_row.setContentsMargins(0, 0, 0, 0)
+        thr_row.setSpacing(4)
+        thr_row.addWidget(self.thrbrick_box, 1)
+        thr_row.addWidget(self.thr_same_check)
+        thr_row.addWidget(self.thr_next_check)
+        form.addRow(self.thrbrick_head, self.thrbrick_row)
 
         self.cmap_box = QtWidgets.QComboBox()
         self.cmap_box.addItems(available_colormaps())
@@ -916,20 +941,36 @@ class ViewerWindow(QtWidgets.QMainWindow):
         )
         form.addRow(self._head(key_label("SIGN", "s")), self.sign_box)
 
-        self.alpha_box = QtWidgets.QComboBox()
-        self.alpha_box.addItems([m.value for m in AlphaMode])
-        self.alpha_box.activated.connect(
-            lambda _: self._apply(SetAlpha, mode=self.alpha_box.currentText())
-        )
-        form.addRow(self._head(key_label("ALPHA", "a")), self.alpha_box)
+        # Off is both boxes clear: a fade is a choice you make, not a state
+        # you have to find in a menu to leave.
+        self.alpha_linear_check = QtWidgets.QCheckBox("linear")
+        self.alpha_quad_check = QtWidgets.QCheckBox("quadratic")
+        for check, mode in (
+            (self.alpha_linear_check, AlphaMode.LINEAR),
+            (self.alpha_quad_check, AlphaMode.QUADRATIC),
+        ):
+            check.setToolTip("Fade sub-threshold voxels instead of hiding them.")
+            check.clicked.connect(
+                lambda on, m=mode: self._apply(SetAlpha, mode=(m if on else AlphaMode.OFF).value)
+            )
+        self.alpha_row = QtWidgets.QWidget()
+        alpha_row = QtWidgets.QHBoxLayout(self.alpha_row)
+        alpha_row.setContentsMargins(0, 0, 0, 0)
+        alpha_row.setSpacing(6)
+        alpha_row.addWidget(self.alpha_linear_check)
+        alpha_row.addWidget(self.alpha_quad_check)
+        alpha_row.addStretch(1)
+        form.addRow(self._head(key_label("ALPHA", "a")), self.alpha_row)
 
         # Min, threshold and max are edited on the bar itself. Splitting the
         # number from the picture of the number is what let the bar go stale.
-        self.thr_head = self._head(key_label("THRESH", "t"))
         self.rangebar = RangeBar()
+        self.thr_head = self.rangebar.thr_caption
+        self.thr_head.setText(key_label("THRESH", "t"))
         self.rangebar.range_changed.connect(self._range_changed)
         self.rangebar.threshold_changed.connect(self._threshold_changed)
         self.rangebar.autorange_requested.connect(self._autorange)
+        self.rangebar.mirror_changed.connect(lambda on: self._apply(SetRangeMirror, on=on))
 
         # Kept as attributes so the rest of the window (and the tests) address
         # them by the name of the thing they control, not through the composite.
@@ -980,7 +1021,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         bar_column = QtWidgets.QVBoxLayout()
         bar_column.setSpacing(4)
-        bar_column.addWidget(self.thr_head)
+        bar_column.addWidget(self._head("RANGE"))
         bar_column.addWidget(self.rangebar, 1)
         controls.addLayout(bar_column)
         v.addLayout(controls)
@@ -1347,9 +1388,18 @@ class ViewerWindow(QtWidgets.QMainWindow):
             return
         from fastfuncstuff.viewer.session import derive_range
 
-        volume = self.session.volume(key)
-        lo, hi = derive_range(volume)
-        self._dispatch(SetRange(key, float(lo), float(hi)))
+        layer = self.session.state.layers.get(key)
+        if layer.time_linked or layer.n_volumes <= 1 or layer.is_computed:
+            lo, hi = derive_range(self.session.volume(key))
+            self._dispatch(SetRange(key, float(lo), float(hi)))
+            return
+        # The sub-brick on screen, not the time index -- which on a bucket is
+        # always 0, so auto kept re-deriving the F's range whatever was shown.
+        look = self.session.overlay_look(key, layer.volume_index, colormap=layer.colormap)
+        if "range_lo" in look:
+            self._dispatch(SetRange(key, float(look["range_lo"]), float(look["range_hi"])))
+        if look.get("colormap", layer.colormap) != layer.colormap:
+            self._dispatch(SetColormap(key, str(look["colormap"])))
 
     def _opacity_changed(self, value: int) -> None:
         key = self.current_key()
@@ -1368,7 +1418,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self._apply(cls, **{kwarg: box.currentText()})
 
     def _cycle_alpha(self) -> None:
-        self._cycle_combo(self.alpha_box, SetAlpha, "mode")
+        layer = self.session.state.layers.find(self.current_key() or "")
+        if layer is None:
+            return
+        modes = list(AlphaMode)
+        nxt = modes[(modes.index(layer.alpha_mode) + 1) % len(modes)]
+        self._apply(SetAlpha, mode=nxt.value)
 
     def _cycle_sign(self) -> None:
         self._cycle_combo(self.sign_box, SetSign, "mode")
@@ -1567,7 +1622,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.thrbrick_box,
             self.cmap_box,
             self.sign_box,
-            self.alpha_box,
+            self.alpha_row,
             self.rangebar,
             self.opacity_slider,
             self.boxed_check,
@@ -1581,13 +1636,14 @@ class ViewerWindow(QtWidgets.QMainWindow):
         for box, value in (
             (self.cmap_box, layer.colormap),
             (self.sign_box, layer.sign_mode.value),
-            (self.alpha_box, layer.alpha_mode.value),
         ):
             box.blockSignals(True)
             box.setCurrentText(value)
             box.blockSignals(False)
         for check, value, enabled in (
             (self.boxed_check, layer.boxed, True),
+            (self.alpha_linear_check, layer.alpha_mode is AlphaMode.LINEAR, True),
+            (self.alpha_quad_check, layer.alpha_mode is AlphaMode.QUADRATIC, True),
             (self.roi_check, layer.roi, not layer.is_computed),
             (self.timelink_check, layer.time_linked, layer.n_volumes > 1),
         ):
@@ -1600,7 +1656,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))
         self.opacity_slider.blockSignals(False)
         self.opacity_label.setText(f"{int(round(layer.opacity * 100))}%")
-        self.rangebar.configure(layer)
+        scale = None if thresholds_itself(layer) else self.session.threshold_scale(key)
+        self.rangebar.configure(layer, threshold_scale=scale)
         # One slider in every mode; only what its numbers mean moves.
         kind = self.session.mode.overlay_kind if layer.is_computed else OverlayKind.VALUE
         self.thr_head.setText(
@@ -1621,7 +1678,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         show = layer.n_volumes > 1 and not layer.time_linked
         for head, box in (
             (self.brick_head, self.brick_box),
-            (self.thrbrick_head, self.thrbrick_box),
+            (self.thrbrick_head, self.thrbrick_row),
         ):
             head.setVisible(show)
             box.setVisible(show)
@@ -1637,15 +1694,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.thrbrick_box.blockSignals(True)
         self.thrbrick_box.clear()
-        # "same" rather than a blank row: thresholding on the displayed
-        # sub-brick is a real choice, and the one a plain map wants.
-        self.thrbrick_box.addItem("same as OLAY", userData=None)
         for i, name in enumerate(names):
             self.thrbrick_box.addItem(name, userData=i)
-        self.thrbrick_box.setCurrentIndex(
-            0 if layer.threshold_index is None else layer.threshold_index + 1
-        )
+        # Always the sub-brick actually cut on, whichever rule chose it.
+        self.thrbrick_box.setCurrentIndex(min(layer.threshold_brick, layer.n_volumes - 1))
         self.thrbrick_box.blockSignals(False)
+        for check, mode in ((self.thr_same_check, "same"), (self.thr_next_check, "next")):
+            check.blockSignals(True)
+            check.setChecked(layer.threshold_follow == mode)
+            check.blockSignals(False)
 
     def _sync_readout(self) -> None:
         st = self.session.state

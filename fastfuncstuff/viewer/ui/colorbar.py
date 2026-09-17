@@ -30,6 +30,11 @@ BAR_MIN_HEIGHT = 150
 TICKS = 1000
 
 
+def thresholds_itself(layer) -> bool:
+    """Whether the threshold reads the sub-brick being coloured."""
+    return layer.threshold_brick == layer.volume_index
+
+
 class ColorBar(QtWidgets.QWidget):
     """The gradient itself, standing on end, with threshold markers.
 
@@ -58,7 +63,9 @@ class ColorBar(QtWidgets.QWidget):
         self._lut_name = layer.colormap
         self._lo = float(layer.range_lo if layer.range_lo is not None else 0.0)
         self._hi = float(layer.range_hi if layer.range_hi is not None else 1.0)
-        self._threshold = float(layer.threshold)
+        # Marked on the bar only when it is in the bar's units. A t of 3 drawn
+        # on a beta scale that tops out at 0.4 is a line in the wrong place.
+        self._threshold = float(layer.threshold) if thresholds_itself(layer) else 0.0
         self._sign = layer.sign_mode
         self._panes = int(layer.n_panes)
         self._alpha = layer.alpha_mode
@@ -121,38 +128,44 @@ class ColorBar(QtWidgets.QWidget):
 
 
 class RangeBar(QtWidgets.QWidget):
-    """Colour bar plus the three numbers that define it, in one column pair.
+    """Colour bar with its range beside it and the threshold below it.
 
-    Layout, left to right: the gradient, a vertical threshold slider beside it,
-    and the numbers -- max at the top, min at the bottom, threshold (and its p,
-    for a statistic) between them -- each sitting next to the end of the bar it
-    controls.
+    Max sits at the top of the bar and min at the bottom, with auto between
+    them: those three are the colour scale. The threshold, its slider and its
+    p go underneath, because the threshold is not a point on this scale -- it
+    usually reads another sub-brick (colour by the beta, cut on its t), and
+    placing it between max and min implied units it does not have.
     """
 
     range_changed = QtCore.Signal(float, float)
+    mirror_changed = QtCore.Signal(bool)
     threshold_changed = QtCore.Signal(float)
     autorange_requested = QtCore.Signal()
 
     def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
         super().__init__(parent)
         self._layer_hi = 1.0
+        self._thresholds_itself = True
         self._syncing = False
         #: ``(stat_code, dof)`` of the sub-brick the threshold reads, or None.
         self._stat: tuple[str, object] | None = None
 
-        h = QtWidgets.QHBoxLayout(self)
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+        h = QtWidgets.QHBoxLayout()
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(3)
+        outer.addLayout(h, 1)
 
         self.bar = ColorBar()
         self.bar.clicked.connect(self._threshold_from_bar)
         h.addWidget(self.bar)
 
-        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Vertical)
+        self.slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         self.slider.setRange(0, TICKS)
         self.slider.setContentsMargins(0, 0, 0, 0)
         self.slider.valueChanged.connect(self._threshold_from_slider)
-        h.addWidget(self.slider)
 
         numbers = QtWidgets.QVBoxLayout()
         numbers.setContentsMargins(2, 0, 0, 0)
@@ -162,7 +175,10 @@ class RangeBar(QtWidgets.QWidget):
         self.max_spin = self._spin("highest value shown")
         self.thr_spin.setStyleSheet(f"color: {theme.palette().warn};")
         self.auto_button = QtWidgets.QPushButton("auto")
-        self.auto_button.setToolTip("Re-derive min and max from the data")
+        self.auto_button.setToolTip(
+            "Re-derive min and max from the sub-brick shown: symmetric about\n"
+            "zero when it has both signs, from zero when it has one."
+        )
         # Sized by its text, not capped: a fixed width under the stylesheet's
         # padding is what clipped the word to "au".
         self.auto_button.setSizePolicy(
@@ -173,8 +189,27 @@ class RangeBar(QtWidgets.QWidget):
         numbers.addWidget(self._caption("max"))
         numbers.addWidget(self.max_spin)
         numbers.addStretch(1)
-        numbers.addWidget(self._caption("thresh"))
-        numbers.addWidget(self.thr_spin)
+        numbers.addWidget(self.auto_button)
+        self.mirror_check = QtWidgets.QCheckBox("mirror")
+        self.mirror_check.setToolTip("Hold min at -max, so zero stays in the middle of the bar")
+        self.mirror_check.clicked.connect(lambda on: self.mirror_changed.emit(bool(on)))
+        numbers.addWidget(self.mirror_check)
+        numbers.addStretch(1)
+        numbers.addWidget(self._caption("min"))
+        numbers.addWidget(self.min_spin)
+        h.addLayout(numbers, 1)
+
+        below = QtWidgets.QVBoxLayout()
+        below.setContentsMargins(0, 0, 0, 0)
+        below.setSpacing(3)
+        thr_row = QtWidgets.QHBoxLayout()
+        thr_row.setSpacing(4)
+        #: Replaced by the window with the mode's name for its threshold.
+        self.thr_caption = self._caption("thresh")
+        thr_row.addWidget(self.thr_caption)
+        thr_row.addWidget(self.thr_spin, 1)
+        below.addLayout(thr_row)
+        below.addWidget(self.slider)
 
         # A statistic's threshold is really a p; the stat value is the units it
         # happens to be stored in. The bucket states its own test and DoF in
@@ -198,13 +233,8 @@ class RangeBar(QtWidgets.QWidget):
         stat_col.setSpacing(2)
         stat_col.addWidget(self.stat_label)
         stat_col.addWidget(self.p_spin)
-        numbers.addWidget(self._stat_host)
-
-        numbers.addStretch(1)
-        numbers.addWidget(self._caption("min"))
-        numbers.addWidget(self.min_spin)
-        numbers.addWidget(self.auto_button)
-        h.addLayout(numbers, 1)
+        below.addWidget(self._stat_host)
+        outer.addLayout(below)
 
         self.min_spin.valueChanged.connect(self._emit_range)
         self.max_spin.valueChanged.connect(self._emit_range)
@@ -234,8 +264,13 @@ class RangeBar(QtWidgets.QWidget):
         self.thr_spin.setStyleSheet(f"color: {theme.palette().warn};")
         self.bar.update()
 
-    def configure(self, layer) -> None:
-        """Show one layer. The single entry point, so nothing can go stale."""
+    def configure(self, layer, threshold_scale: float | None = None) -> None:
+        """Show one layer. The single entry point, so nothing can go stale.
+
+        ``threshold_scale`` is the largest magnitude in the sub-brick the
+        threshold reads. Without it the slider spans the colour range, which
+        is only right when the threshold reads the coloured sub-brick.
+        """
         self._syncing = True
         try:
             self.bar.configure(layer)
@@ -249,9 +284,20 @@ class RangeBar(QtWidgets.QWidget):
             ):
                 spin.setSingleStep(step)
                 spin.setValue(value)
-            # The slider spans the larger half of the range, so a one-sided map
-            # does not waste half its travel on values it never shows.
-            self._layer_hi = max(abs(hi), abs(lo)) or 1.0
+            self.mirror_check.setChecked(bool(layer.range_mirror))
+            # Faded rather than hidden: the number is still true, just not yours to set.
+            self.min_spin.setEnabled(not layer.range_mirror)
+            self._thresholds_itself = thresholds_itself(layer)
+            self.thr_spin.setSingleStep(
+                step if threshold_scale is None else max(threshold_scale / 100.0, 1e-4)
+            )
+            # The slider spans the sub-brick the threshold cuts on. On the
+            # coloured one that is the larger half of the range, so a one-sided
+            # map does not waste half its travel on values it never shows.
+            if threshold_scale is not None:
+                self._layer_hi = float(threshold_scale) or 1.0
+            else:
+                self._layer_hi = max(abs(hi), abs(lo)) or 1.0
             self.slider.setValue(int(round(min(layer.threshold / self._layer_hi, 1.0) * TICKS)))
             self._configure_stat(layer)
         finally:
@@ -285,6 +331,8 @@ class RangeBar(QtWidgets.QWidget):
         if self._syncing:
             return
         lo, hi = self.min_spin.value(), self.max_spin.value()
+        if self.mirror_check.isChecked():
+            lo = -abs(hi)
         if lo == hi:
             return  # a collapsed range shows nothing; wait for the other box
         self.range_changed.emit(lo, hi)
@@ -301,7 +349,9 @@ class RangeBar(QtWidgets.QWidget):
         self._apply_threshold(value)
 
     def _threshold_from_bar(self, value: float) -> None:
-        self._apply_threshold(abs(value))
+        # A point on the colour scale is a threshold only in the scale's units.
+        if self._thresholds_itself:
+            self._apply_threshold(abs(value))
 
     def _threshold_from_p(self, p: float) -> None:
         """Typing a p sets the threshold, which is the only stored value.

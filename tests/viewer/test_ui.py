@@ -516,8 +516,8 @@ def test_the_threshold_can_read_a_different_sub_brick(winstats, qapp):
     """Colour by the coefficient, threshold on its t -- the stats case."""
     winstats.layer_list.setCurrentRow(0)
     qapp.processEvents()
-    winstats.thrbrick_box.setCurrentIndex(3)  # row 0 is "same as OLAY"
-    winstats.thrbrick_box.activated.emit(3)
+    winstats.thrbrick_box.setCurrentIndex(2)
+    winstats.thrbrick_box.activated.emit(2)
     qapp.processEvents()
     assert winstats.session.state.layers.overlay.threshold_index == 2
 

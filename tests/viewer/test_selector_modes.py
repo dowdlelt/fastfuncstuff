@@ -478,12 +478,16 @@ def test_seed_radius_averages_rather_than_taking_one_voxel(corr_session):
 
 
 def test_a_picked_overlay_does_not_hide_the_underlay(session, datadir):
-    """Goal zero is checking two images line up; an opaque overlay defeats it."""
+    """Goal zero is checking two images line up; an opaque overlay defeats it.
+
+    A threshold does that. Alpha starts off: a fade makes which voxels survive
+    something to squint at, so it is opt-in.
+    """
     session.do(SetUnderlay(str(datadir / "anat.nii.gz")))
     session.do(SetOverlay(str(datadir / "stats_tstat.nii.gz")))
     overlay = session.state.layers.overlay
     assert overlay.threshold > 0.0
-    assert overlay.alpha_mode.value != "off"
+    assert overlay.alpha_mode.value == "off"
 
 
 def test_a_signed_overlay_gets_a_diverging_map(session, datadir):

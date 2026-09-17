@@ -18,7 +18,7 @@ from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
 from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_of
-from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
+from fastfuncstuff.viewer.layers import Layer, SignMode
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
 from fastfuncstuff.viewer.residency import Resident, VolumeStore
@@ -122,6 +122,7 @@ class ViewerSession:
         self._roi_sets: dict[str, RoiSet] = {}
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._clustsim: dict[str, dict] = {}
+        self._threshold_scales: dict[tuple[str, int], float] = {}
         #: Designs offered in graph windows, by resolved path.
         self.designs: dict[str, Design] = {}
         self._design_errors: dict[str, str] = {}
@@ -226,14 +227,71 @@ class ViewerSession:
         finite = values[np.isfinite(values)]
         if finite.size == 0:
             return
-        signed = bool((finite < 0).any() and (finite > 0).any())
         threshold = float(np.percentile(np.abs(finite), OVERLAY_START_PERCENTILE))
+        # Alpha stays off: a hard threshold is what a stats map is read at, and
+        # a fade makes "which voxels survive" something you have to squint at.
         self.state.layers.update(
-            key,
-            colormap="redblue" if signed else "hot",
-            threshold=threshold,
-            alpha_mode=AlphaMode.LINEAR,
+            key, threshold=threshold, **self.overlay_look(key, 0, colormap="hot")
         )
+
+    def overlay_look(self, key: str, index: int, *, colormap: str) -> dict[str, object]:
+        """Colour scale for one sub-brick of an overlay: range, and hot or red-blue.
+
+        A signed sub-brick gets a symmetric range and a diverging map, so zero
+        sits in the middle of the bar and a negative effect is as visible as a
+        positive one. A one-signed one runs from zero. The colormap is only
+        swapped between the two defaults -- a map someone chose stays.
+
+        Percentiles over the non-zero voxels: a bucket is zero outside the
+        mask, and counting that zero puts the 98th percentile near nothing.
+        """
+        try:
+            values = self.volume(key, index)
+        except (KeyError, FileNotFoundError, ValueError):
+            return {}
+        finite = values[np.isfinite(values) & (values != 0)]
+        if finite.size == 0:
+            return {}
+        top = float(np.percentile(np.abs(finite), AUTORANGE_PERCENTILES[1])) or 1.0
+        negative, positive = bool((finite < 0).any()), bool((finite > 0).any())
+        out: dict[str, object] = {}
+        if negative and positive:
+            out.update(range_lo=-top, range_hi=top)
+            signed = True
+        elif negative:
+            out.update(range_lo=-top, range_hi=0.0)
+            signed = True
+        else:
+            out.update(range_lo=0.0, range_hi=top)
+            signed = False
+        if colormap in ("hot", "redblue"):
+            out["colormap"] = "redblue" if signed else "hot"
+        return out
+
+    def threshold_scale(self, key: str) -> float:
+        """How far a threshold slider on this layer should reach.
+
+        Read from the sub-brick the threshold *applies to*, not the displayed
+        one: colouring by a beta of 0.3 and thresholding on its t of 12 is the
+        ordinary case, and a slider spanning the beta can never reach the t.
+        """
+        layer = self.state.layers.get(key)
+        brick = layer.threshold_brick
+        # Only a file's sub-bricks hold still; a mode rewrites its overlay in
+        # place under the same key.
+        cacheable = layer.source == "file" and not layer.time_linked
+        cached = self._threshold_scales.get((key, brick)) if cacheable else None
+        if cached is not None:
+            return cached
+        try:
+            values = self.volume(key, None if layer.time_linked else brick)
+        except (KeyError, FileNotFoundError, ValueError):
+            return 1.0
+        finite = np.abs(values[np.isfinite(values)])
+        scale = (float(finite.max()) if finite.size else 0.0) or 1.0
+        if cacheable:
+            self._threshold_scales[(key, brick)] = scale
+        return scale
 
     def suggested_underlay(self) -> CatalogEntry | None:
         return catalog_mod.suggest_underlay(self.catalog)
@@ -874,6 +932,8 @@ class ViewerSession:
         if key in held:
             return
         self.invalidate(key)
+        for stale in [k for k in self._threshold_scales if k[0] == key]:
+            del self._threshold_scales[stale]
         self.store.close(key)
 
     def run_script(self, text: str) -> Aspect:

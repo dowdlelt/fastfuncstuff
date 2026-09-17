@@ -630,6 +630,33 @@ class SetThreshold(Command):
 
 @command
 @dataclass(frozen=True)
+class SetRangeMirror(Command):
+    """Hold a layer's min at the negation of its max."""
+
+    name = "SET_RANGE_MIRROR"
+    aspects = Aspect.COLORMAP
+    key: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
+class SetThresholdFollow(Command):
+    """How the threshold sub-brick moves with the displayed one.
+
+    ``same`` thresholds on the shown sub-brick; ``next`` on the one after it,
+    so stepping through ``Faces#0_Coef`` keeps thresholding on ``Faces#0_Tstat``;
+    ``fixed`` keeps the current threshold sub-brick while the overlay changes.
+    """
+
+    name = "SET_THRESHOLD_FOLLOW"
+    aspects = Aspect.THRESHOLD | Aspect.SLICES
+    key: str
+    mode: str
+
+
+@command
+@dataclass(frozen=True)
 class SetAlpha(Command):
     """Set the sub-threshold fade mode (off / linear / quadratic)."""
 
@@ -673,6 +700,14 @@ class SetSeed(Command):
 # ---------------------------------------------------------------------------
 
 OpenLayer = Callable[[str, str], Layer]
+
+#: Values SET_THRESHOLD_FOLLOW takes.
+THRESHOLD_FOLLOW = ("same", "next", "fixed")
+
+
+def _next_brick(layer: Layer, index: int) -> int:
+    """The sub-brick after ``index``: a coefficient's t in a 3dDeconvolve-style bucket."""
+    return min(index + 1, layer.n_volumes - 1)
 
 
 def install(
@@ -1081,18 +1116,63 @@ def install(
         value = max(0, min(int(cmd.index), layer.n_volumes - 1))
         if layer.volume_index == value:
             return Aspect.NOTHING
-        st.layers.update(cmd.key, volume_index=value)
-        return SetVolume.aspects
+        changes: dict[str, object] = {"volume_index": value}
+        if layer.threshold_follow == "next":
+            changes["threshold_index"] = _next_brick(layer, value)
+        if session is not None and not layer.time_linked and layer.source == "file":
+            # A bucket's sub-bricks are different quantities: an F's range is
+            # no range for a beta, and a signed map drawn in "hot" hides half
+            # of itself. So the colour scale is re-derived for the new one.
+            changes.update(session.overlay_look(cmd.key, value, colormap=layer.colormap))
+            if layer.range_mirror and "range_hi" in changes:
+                top = max(abs(float(changes["range_lo"])), abs(float(changes["range_hi"])))  # type: ignore[arg-type]
+                changes.update(range_lo=-top, range_hi=top)
+        st.layers.update(cmd.key, **changes)
+        return SetVolume.aspects | Aspect.COLORMAP | Aspect.THRESHOLD
 
     @bus.handle(SetThresholdIndex.name)
     def _set_threshold_index(cmd: Command, st: ViewerState) -> Aspect:
         assert isinstance(cmd, SetThresholdIndex)
         layer = st.layers.get(cmd.key)
         value = None if cmd.index is None else max(0, min(int(cmd.index), layer.n_volumes - 1))
-        if layer.threshold_index == value:
+        # Naming a sub-brick is choosing it: it stops following the overlay.
+        follow = "same" if value is None else "fixed"
+        if (layer.threshold_index, layer.threshold_follow) == (value, follow):
             return Aspect.NOTHING
-        st.layers.update(cmd.key, threshold_index=value)
+        st.layers.update(cmd.key, threshold_index=value, threshold_follow=follow)
         return SetThresholdIndex.aspects
+
+    @bus.handle(SetRangeMirror.name)
+    def _set_range_mirror(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetRangeMirror)
+        layer = st.layers.get(cmd.key)
+        on = bool(cmd.on)
+        if layer.range_mirror == on:
+            return Aspect.NOTHING
+        changes: dict[str, object] = {"range_mirror": on}
+        if on and layer.range_hi is not None:
+            top = max(abs(layer.range_hi), abs(layer.range_lo or 0.0))
+            changes.update(range_lo=-top, range_hi=top)
+        st.layers.update(cmd.key, **changes)
+        return SetRangeMirror.aspects
+
+    @bus.handle(SetThresholdFollow.name)
+    def _set_threshold_follow(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetThresholdFollow)
+        if cmd.mode not in THRESHOLD_FOLLOW:
+            raise ValueError(
+                f"threshold follow must be one of {THRESHOLD_FOLLOW}, not {cmd.mode!r}"
+            )
+        layer = st.layers.get(cmd.key)
+        index = {
+            "same": None,
+            "next": _next_brick(layer, layer.volume_index),
+            "fixed": layer.threshold_brick,
+        }[cmd.mode]
+        if (layer.threshold_index, layer.threshold_follow) == (index, cmd.mode):
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, threshold_index=index, threshold_follow=cmd.mode)
+        return SetThresholdFollow.aspects
 
     @bus.handle(SetPanes.name)
     def _set_panes(cmd: Command, st: ViewerState) -> Aspect:
@@ -1119,6 +1199,9 @@ def install(
         if hi < lo:
             lo, hi = hi, lo
         layer = st.layers.get(cmd.key)
+        if layer.range_mirror:
+            hi = max(abs(lo), abs(hi))
+            lo = -hi
         if (layer.range_lo, layer.range_hi) == (lo, hi):
             return Aspect.NOTHING
         st.layers.update(cmd.key, range_lo=lo, range_hi=hi)

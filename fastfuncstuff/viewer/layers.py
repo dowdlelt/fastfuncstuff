@@ -96,11 +96,18 @@ class Layer:
     #: volume is resident, then cached here.
     range_lo: float | None = None
     range_hi: float | None = None
+    #: Hold min at -max, so a signed map's zero stays mid-bar while max moves.
+    range_mirror: bool = False
 
     threshold: float = 0.0
     #: Sub-brick supplying the threshold statistic. ``None`` thresholds on the
     #: displayed volume itself, which is what a plain intensity map wants.
     threshold_index: int | None = None
+    #: How the threshold sub-brick moves when the displayed one does. ``same``
+    #: thresholds on whatever is shown (``threshold_index`` is None); ``next``
+    #: reads the sub-brick after it, which is a bucket's ``_Coef`` / ``_Tstat``
+    #: pairing; ``fixed`` stays on the chosen one while the overlay changes.
+    threshold_follow: str = "same"
     alpha_mode: AlphaMode = AlphaMode.OFF
     boxed: bool = False
 
