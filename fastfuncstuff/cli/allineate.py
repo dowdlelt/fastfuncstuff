@@ -49,6 +49,7 @@ from fastfuncstuff.processing.affine import (
     grid_from_dxyz,
     load_matrix_1D,
     save_matrix_1D,
+    voxel_matrix_to_dicom,
 )
 from fastfuncstuff.processing.allineate import AffineAlignConfig, allineate
 from fastfuncstuff.processing.io import derive_mean_output_path, load_image, save_image
@@ -81,6 +82,22 @@ def _out_matrix(
     ao = torch.as_tensor(np.asarray(out_affine), dtype=torch.float64)
     out = matrix.detach().cpu().double() @ torch.linalg.inv(ab) @ ao
     return out.to(device=device, dtype=matrix.dtype)
+
+
+def _inverse_dicom_matrix(
+    matrix: torch.Tensor, base_affine: np.ndarray, source_affine: np.ndarray
+) -> torch.Tensor:
+    """The solved transform the other way round, in AFNI DICOM mm.
+
+    An .aff12.1D is base->source in *millimetres*, and mm coordinates carry no
+    grid, so the reverse transform is simply the inverse of that 4x4 -- loading
+    it with the two datasets swapped is what re-expresses it in their voxel
+    spaces. Inverted on the CPU in float64: header transforms are tiny and
+    precision-sensitive, and consumer CUDA is slow at float64 while Metal has
+    none at all.
+    """
+    dicom = voxel_matrix_to_dicom(matrix.detach().cpu(), base_affine, source_affine)
+    return torch.linalg.inv(dicom.double())
 
 
 def _resample(
@@ -198,6 +215,13 @@ Examples:
   # Apply existing matrix:
   allineate -base mni.nii -source subj.nii -prefix out.nii -1Dmatrix_apply mat.aff12.1D
 
+  # Solve on the cheap grid -- hi-res anat onto the low-res EPI -- and keep the
+  # EPI->anat matrix that the run does not otherwise produce:
+  allineate -base epi.nii -source anat.nii -prefix anat_on_epi.nii \\
+            -1Dmatrix_save anat2epi.aff12.1D -1Dmatrix_save_inv epi2anat.aff12.1D
+  allineate -base anat.nii -source epi.nii -prefix epi_on_anat.nii \\
+            -1Dmatrix_apply epi2anat.aff12.1D
+
   # Solve on the skull-stripped volume, carry the original along:
   allineate -base mni.nii -source subj_ss.nii -prefix out_ss.nii \\
             -source_follower subj.nii -follower_prefix out_orig.nii
@@ -226,6 +250,18 @@ Examples:
     )
     io_group.add_argument(
         "-1Dmatrix_save", default=None, help="Save affine matrix as .aff12.1D (AFNI format)"
+    )
+    io_group.add_argument(
+        "-1Dmatrix_save_inv",
+        "-1Dmatrix-save-inv",
+        default=None,
+        metavar="FILE",
+        help="Also save the INVERSE transform as .aff12.1D -- the source->base "
+        "direction, ready to -1Dmatrix_apply with -base and -source swapped. The "
+        "point is which way round to solve: the search and the final resample both "
+        "cost by the BASE grid, so aligning a hi-res anat onto a low-res EPI is far "
+        "cheaper than the reverse, and this hands you the EPI-to-anat matrix out of "
+        "that run. (.aff12.1D is in mm, so the inverse needs no grid of its own.)",
     )
     io_group.add_argument(
         "-1Dmatrix_apply", default=None, help="Apply existing matrix (skip alignment)"
@@ -656,9 +692,10 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
     -source_automask), the job simply isn't skipped next time — safe, since
     re-running costs less than a wrong skip."""
     outs: list[str] = [args.prefix]
-    matrix_save = getattr(args, "1Dmatrix_save", None)
-    if matrix_save is not None:
-        outs.append(matrix_save)
+    for flag in ("1Dmatrix_save", "1Dmatrix_save_inv"):
+        saved = getattr(args, flag, None)
+        if saved is not None:
+            outs.append(saved)
     if args.save_mean:
         outs.append(derive_mean_output_path(args.prefix))
     outs.extend(prefix for _, prefix in _follower_pairs(args))
@@ -981,6 +1018,15 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         )
         if verb >= 1:
             print(f"  Matrix: {matrix_save_path}")
+
+    matrix_inv_path = getattr(args, "1Dmatrix_save_inv", None)
+    if matrix_inv_path is not None:
+        save_matrix_1D(
+            _inverse_dicom_matrix(matrix, base_header["affine"], source_header["affine"]),
+            matrix_inv_path,
+        )
+        if verb >= 1:
+            print(f"  Inverse matrix: {matrix_inv_path}")
 
     # --- Apply to all 4D volumes ---
     if source_4d is not None:
