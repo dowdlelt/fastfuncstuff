@@ -47,6 +47,8 @@ class Design:
     #: ColumnGroups, when the file has them: -1 drift, 0 nuisance, >0 stimulus.
     groups: tuple[int, ...]
     run_starts: tuple[int, ...]
+    #: When the file was read, so a rerun GLM's rewritten xmat is noticed.
+    mtime_ns: int = 0
 
     @property
     def n_runs(self) -> int:
@@ -136,6 +138,7 @@ def _load_design(path: str, _mtime: int) -> Design:
             labels=tuple(design["column_labels"]),
             groups=tuple(int(g) for g in (design.get("column_groups") or ())),
             run_starts=tuple(starts),
+            mtime_ns=_mtime,
         )
 
     from fastfuncstuff.design.hrf_selection import load_nuisance_file
@@ -150,6 +153,7 @@ def _load_design(path: str, _mtime: int) -> Design:
         labels=tuple(f"{stem}#{i}" for i in range(matrix.shape[1])),
         groups=(),
         run_starts=(0,),
+        mtime_ns=_mtime,
     )
 
 

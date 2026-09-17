@@ -7,6 +7,7 @@ This is what a UI, a CLI or a test drives. Nothing above this layer touches
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -25,7 +26,14 @@ from fastfuncstuff.viewer.residency import Resident, VolumeStore
 from fastfuncstuff.viewer.rois import RoiSet, looks_like_labels, rois_from_frames, rois_from_labels
 from fastfuncstuff.viewer.state import Plane, ViewerState
 from fastfuncstuff.viewer.viewports import ViewKind
-from fastfuncstuff.viewer.vocab import AddLayer, CloseView, OpenView, SetVolume, install
+from fastfuncstuff.viewer.vocab import (
+    AddLayer,
+    CloseView,
+    OpenView,
+    ReloadLayer,
+    SetVolume,
+    install,
+)
 
 #: Percentiles used to auto-range a layer. AFNI's autorange takes the maximum,
 #: which one bright voxel is enough to ruin; percentiles are what make a map
@@ -91,6 +99,13 @@ def layer_from_info(info: DatasetInfo, key: str, path: Path) -> Layer:
     )
 
 
+def _canonical(path) -> Path:
+    try:
+        return Path(path).resolve()
+    except OSError:
+        return Path(path).absolute()
+
+
 def _fmt(value: float | None) -> str:
     return "--" if value is None else f"{value:.4g}"
 
@@ -125,6 +140,11 @@ class ViewerSession:
         )
         self.catalog: list[CatalogEntry] = []
         self.catalog_dir: Path | None = None
+        self.catalog_recursive = False
+        #: Catalog files that appeared or changed since the directory was
+        #: read, as ``{path: "new" | "updated"}``. Cleared per file when it is
+        #: picked, and wholesale by a fresh READ.
+        self.catalog_fresh: dict[Path, str] = {}
         self.mode: Mode = registry.get("plain")()
         #: Every mode this session has been in, by name. Switching back resumes
         #: the same instance -- its folder, its component, its unsaved labels --
@@ -223,7 +243,55 @@ class ViewerSession:
         """Populate the catalog the pickers draw from."""
         self.catalog = catalog_mod.scan(directory, recursive=recursive)
         self.catalog_dir = Path(directory)
+        self.catalog_recursive = bool(recursive)
+        self.catalog_fresh = {}
         return self.catalog
+
+    def apply_rescan(self, result: catalog_mod.Rescan) -> list[str]:
+        """Take a rescan's catalog, mark what is new, reload what was overwritten.
+
+        Returns the keys of the layers reloaded. Runs on the GUI thread: the
+        header reads happened on a worker, and this only swaps lists and
+        dispatches.
+        """
+        self.catalog = result.entries
+        for path in result.removed:
+            self.catalog_fresh.pop(path, None)
+        for path in result.added:
+            self.catalog_fresh[path] = "new"
+        for path in result.changed:
+            # Something new that was then rewritten is still new to the person.
+            self.catalog_fresh.setdefault(path, "updated")
+        reloaded = self.layers_from(result.changed)
+        for key in reloaded:
+            self.do(ReloadLayer(key))
+        return reloaded
+
+    def layers_from(self, paths) -> list[str]:
+        """Keys of loaded file layers whose file is one of ``paths``."""
+        wanted = {_canonical(p) for p in paths}
+        return [
+            ly.key
+            for ly in self.state.layers
+            if ly.source == "file" and _canonical(ly.path) in wanted
+        ]
+
+    def drop_layer_data(self, key: str) -> None:
+        """Forget everything read from a layer's file, ahead of reading it again.
+
+        Unlike :meth:`forget` this does not spare the mode's input: a file
+        overwritten under the mode is exactly the case where its cached voxels
+        are wrong.
+        """
+        layer = self.state.layers.find(key)
+        self.invalidate(key)
+        self.forget_rois(key)
+        for stale in [k for k in self._threshold_scales if k[0] == key]:
+            del self._threshold_scales[stale]
+        if layer is not None:
+            self._provenance_cache.pop(layer.path, None)
+            self._run_cache.clear()
+        self.store.close(key)
 
     def apply_overlay_defaults(self, key: str) -> None:
         """Give a freshly-picked overlay a state you can actually see through.
@@ -686,14 +754,22 @@ class ViewerSession:
 
         Both outcomes are remembered per spelling of the path: this is asked on
         every repaint, and resolving a path or failing to read one costs a trip
-        to the filesystem each time. Loading through :meth:`load_design` is
-        what re-reads a file that changed.
+        to the filesystem each time -- except one stat of a known file, so a
+        design rewritten by a rerun fit is read again rather than drawn stale.
         """
         if path in self._design_errors:
             return None
         resolved = self._design_paths.get(path)
         if resolved is not None and resolved in self.designs:
-            return self.designs[resolved]
+            cached = self.designs[resolved]
+            try:
+                current = os.stat(resolved).st_mtime_ns
+            except OSError:
+                return cached
+            # One stat per repaint; re-reading the matrix only when a rerun
+            # GLM has rewritten it.
+            if current == cached.mtime_ns:
+                return cached
         try:
             design = self.load_design(path)
         except (OSError, ValueError, IndexError) as exc:

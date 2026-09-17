@@ -29,11 +29,13 @@ from __future__ import annotations
 
 import os
 import signal
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.colormap import available_colormaps
 from fastfuncstuff.viewer.commands import Aspect, Command
@@ -130,12 +132,36 @@ class Controller:
     bridge: _Bridge
 
 
+#: How long a directory has to stay quiet before a rescan runs.
+RESCAN_QUIET_MS = 1200
+BACKGROUND = QtCore.Qt.ItemDataRole.BackgroundRole
+FOREGROUND = QtCore.Qt.ItemDataRole.ForegroundRole
+
+
 class ViewerWindow(QtWidgets.QMainWindow):
+    #: ``(session, future, manual)`` from the rescan worker, delivered on the GUI thread.
+    _rescanned = QtCore.Signal(object)
+
     def __init__(self, session: ViewerSession) -> None:
         super().__init__()
         self.setWindowTitle("nexus")
         self.setStyleSheet(stylesheet())
         self.resize(430, 820)
+
+        # Watching the directory. A pipeline writes a file in bursts, so a
+        # change starts a quiet period and the rescan runs once it ends,
+        # rather than once per write.
+        self._watcher = QtCore.QFileSystemWatcher(self)
+        self._watcher.directoryChanged.connect(lambda _: self._schedule_rescan())
+        self._watcher.fileChanged.connect(lambda _: self._schedule_rescan())
+        self._rescan_timer = QtCore.QTimer(self)
+        self._rescan_timer.setSingleShot(True)
+        self._rescan_timer.setInterval(RESCAN_QUIET_MS)
+        self._rescan_timer.timeout.connect(self._start_rescan)
+        self._rescan_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="rescan")
+        self._rescan_busy = False
+        self._rescan_again = False
+        self._rescanned.connect(self._on_rescanned, QtCore.Qt.ConnectionType.QueuedConnection)
 
         self.controllers: list[Controller] = []
         #: Whether controllers follow each other's crosshair and time index.
@@ -410,6 +436,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.read_button.clicked.connect(self._read_dialog)
         bar.addWidget(self.read_button)
 
+        self.rescan_button = QtWidgets.QPushButton("RESCAN")
+        self.rescan_button.setToolTip(
+            "Look for new and rewritten files now.\n"
+            "This happens on its own when the directory changes; the button is\n"
+            "for writes the system does not report, such as from another machine."
+        )
+        self.rescan_button.clicked.connect(lambda: self._start_rescan(manual=True))
+        bar.addWidget(self.rescan_button)
+
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
 
@@ -558,6 +593,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if entry is None:
             return
         self._dispatch(cls(str(entry.path)))
+        if self.session.catalog_fresh.pop(entry.path, None) is not None:
+            self._sync_catalog()
         self._sync_layer_list()
 
     def _read_dialog(self) -> None:
@@ -573,12 +610,91 @@ class ViewerWindow(QtWidgets.QMainWindow):
             f"read {len(self.session.catalog)} datasets from {directory}", 5000
         )
 
+    # -- rescanning ------------------------------------------------------
+    def _watch(self) -> None:
+        """Watch the catalog's directory and every loaded file.
+
+        Files as well as the directory: an overwrite in place changes a file
+        without necessarily touching its directory. Re-armed after every
+        rescan, because a file replaced by rename is a new inode and its old
+        watch is gone.
+        """
+        wanted: set[str] = set()
+        if self.session.catalog_dir is not None:
+            wanted.add(str(self.session.catalog_dir))
+            wanted.update(ly.path for ly in self.session.state.layers if ly.source == "file")
+        wanted = {p for p in wanted if Path(p).exists()}
+        current = set(self._watcher.directories()) | set(self._watcher.files())
+        if current - wanted:
+            self._watcher.removePaths(sorted(current - wanted))
+        if wanted - current:
+            self._watcher.addPaths(sorted(wanted - current))
+
+    def _schedule_rescan(self) -> None:
+        if self.session.catalog_dir is not None:
+            self._rescan_timer.start()
+
+    def _start_rescan(self, manual: bool = False) -> None:
+        """Stat the directory on a worker and header-read only what changed."""
+        session = self.session
+        if session.catalog_dir is None:
+            return
+        if self._rescan_busy:
+            self._rescan_again = True
+            return
+        self._rescan_busy = True
+        future = self._rescan_pool.submit(
+            catalog_mod.rescan,
+            session.catalog_dir,
+            list(session.catalog),
+            recursive=session.catalog_recursive,
+        )
+        future.add_done_callback(lambda f, s=session, m=manual: self._rescanned.emit((s, f, m)))
+
+    def _on_rescanned(self, payload) -> None:
+        session, future, manual = payload
+        self._rescan_busy = False
+        try:
+            result = future.result()
+        except Exception as exc:  # a vanished directory, a permissions change
+            self.statusBar().showMessage(f"rescan failed: {exc}", 6000)
+            result = None
+        live = any(ctl.session is session for ctl in self.controllers)
+        if result is not None and live and (result.any or manual):
+            reloaded = session.apply_rescan(result)
+            if session is self.session:
+                self._sync_catalog()
+                self.refresh(Aspect.ALL if reloaded else Aspect.NOTHING)
+            names = [session.state.layers.get(k).name for k in reloaded]
+            parts = [
+                f"{len(result.added)} new",
+                f"{len(result.changed)} updated",
+                f"{len(result.removed)} gone",
+            ]
+            tail = f"; reloaded {', '.join(names)}" if names else ""
+            self.statusBar().showMessage(f"rescan: {', '.join(parts)}{tail}", 8000)
+        elif result is not None:
+            self._watch()
+        if self._rescan_again:
+            self._rescan_again = False
+            self._start_rescan()
+
+    def changeEvent(self, event: QtCore.QEvent) -> None:  # noqa: N802 (Qt)
+        # Coming back to the window is when someone expects to see what they
+        # just wrote -- and a write from another machine raises no event.
+        if event.type() == QtCore.QEvent.Type.ActivationChange and self.isActiveWindow():
+            self._schedule_rescan()
+        super().changeEvent(event)
+
     def _sync_catalog(self) -> None:
         """Fill the pickers, defaulting the underlay to the likeliest base image."""
         entries = self.session.catalog
+        fresh = self.session.catalog_fresh
         self.dir_label.setText(
             self.session.catalog_dir.name if self.session.catalog_dir else "no directory"
         )
+        self._watch()
+        c = theme.palette()
         # Two columns, monospaced and padded, so a directory can be scanned by
         # dimensions and volume count rather than read name by name.
         width = max((len(e.name) for e in entries), default=0)
@@ -589,7 +705,17 @@ class ViewerWindow(QtWidgets.QMainWindow):
             # the box while the panes are empty reads as a failed load.
             box.addItem(NONE_LABEL, userData=None)
             for e in entries:
-                box.addItem(f"{e.name:<{width}}   {e.summary}", userData=e)
+                mark = fresh.get(e.path)
+                box.addItem(
+                    f"{e.name:<{width}}   {e.summary}" + (f"   {mark}" if mark else ""),
+                    userData=e,
+                )
+                if mark:
+                    # Picked out until it is opened, so what the pipeline just
+                    # wrote can be found without reading 277 names.
+                    row = box.count() - 1
+                    box.setItemData(row, QtGui.QBrush(QtGui.QColor(c.select)), BACKGROUND)
+                    box.setItemData(row, QtGui.QBrush(QtGui.QColor(c.accent)), FOREGROUND)
             box.setCurrentIndex(0)
             box.blockSignals(False)
             self._fit_picker(box)
@@ -1577,6 +1703,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
+        self._watch()
         selected = self.current_key()
         self.layer_list.blockSignals(True)
         self.layer_list.clear()
@@ -1766,6 +1893,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # The controller is the session; closing it closes the companions too,
         # or they linger with nothing driving them.
         self._play.stop()
+        self._rescan_timer.stop()
+        self._rescan_pool.shutdown(wait=False, cancel_futures=True)
         self.runner.wait(2000)
         for ctl in self.controllers:
             ctl.manager.close_all()

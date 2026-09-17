@@ -465,6 +465,22 @@ class ModeAction(Command):
 
 @command
 @dataclass(frozen=True)
+class ReloadLayer(Command):
+    """Re-read a loaded layer's file in place, keeping how it is drawn.
+
+    For a dataset overwritten on disk while it was on screen. The key, stack
+    position, colour map, range and threshold stay; the voxels, header and
+    sub-brick labels are read again.
+    """
+
+    name = "RELOAD_LAYER"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH | Aspect.THRESHOLD
+    major = True
+    key: str
+
+
+@command
+@dataclass(frozen=True)
 class AddLayer(Command):
     """Load a dataset and push it onto the stack.
 
@@ -765,6 +781,34 @@ def install(
             raise RuntimeError("READ needs a session")
         session.read_directory(cmd.directory, recursive=bool(cmd.recursive))
         return Aspect.NOTHING
+
+    @bus.handle(ReloadLayer.name)
+    def _reload_layer(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, ReloadLayer)
+        old = st.layers.get(cmd.key)
+        if session is not None:
+            session.drop_layer_data(cmd.key)
+        fresh = _load(old.path, cmd.key)
+        last = fresh.n_volumes - 1
+        # Everything about how it is drawn carries over; everything read from
+        # the file is taken from the new header.
+        st.layers.update(
+            cmd.key,
+            name=fresh.name,
+            shape=fresh.shape,
+            n_volumes=fresh.n_volumes,
+            affine=fresh.affine,
+            stataux=fresh.stataux,
+            labels=fresh.labels,
+            volume_index=min(old.volume_index, last),
+            threshold_index=None if old.threshold_index is None else min(old.threshold_index, last),
+        )
+        dirty = ReloadLayer.aspects
+        base = st.layers.base
+        regridded = old.shape != fresh.shape or bool((abs(old.affine - fresh.affine) > 1e-6).any())
+        if base is not None and base.key == cmd.key and regridded:
+            dirty |= _adopt_grid_preserving_position(st, fresh)
+        return dirty
 
     @bus.handle(SetUnderlay.name)
     def _set_underlay(cmd: Command, st: ViewerState) -> Aspect:

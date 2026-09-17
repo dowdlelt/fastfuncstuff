@@ -55,6 +55,9 @@ class CatalogEntry:
     tr: float = 0.0
     labels: tuple[str, ...] = ()
     file_bytes: int = 0
+    #: ``(bytes, mtime_ns)`` of the file (and a HEAD's BRIK) when it was read.
+    #: What a rescan compares, so an overwrite in place is caught by name.
+    signature: tuple[int, int] = (0, 0)
 
     @property
     def is_4d(self) -> bool:
@@ -162,6 +165,9 @@ def describe(paths: Iterable[str | Path]) -> Iterator[CatalogEntry]:
         if not info.exists or info.shape[0] == 0:
             continue
         nx, ny, nz, nv = info.shape
+        sig = signature(path)
+        if sig is None:
+            continue
         yield CatalogEntry(
             path=path,
             name=path.name,
@@ -171,6 +177,7 @@ def describe(paths: Iterable[str | Path]) -> Iterator[CatalogEntry]:
             tr=float(info.tr),
             labels=tuple(info.labels),
             file_bytes=int(info.file_bytes),
+            signature=sig,
         )
 
 
@@ -183,6 +190,100 @@ def natural_key(text: str) -> tuple[tuple[int, int | str], ...]:
     )
 
 
+def signature(path: Path) -> tuple[int, int] | None:
+    """Size and modification time, or ``None`` if the file has gone.
+
+    A HEAD's voxels are in its BRIK, and rewriting a dataset rewrites the BRIK
+    -- the HEAD alone would miss exactly the change that matters.
+    """
+    parts = [path]
+    if path.name.endswith(".HEAD"):
+        stem = path.name.removesuffix(".HEAD")
+        parts += [path.with_name(stem + ext) for ext in (".BRIK", ".BRIK.gz")]
+    size, mtime, found = 0, 0, False
+    for part in parts:
+        try:
+            st = part.stat()
+        except OSError:
+            continue
+        found = True
+        size += st.st_size
+        mtime = max(mtime, st.st_mtime_ns)
+    return (size, mtime) if found else None
+
+
+@dataclass(frozen=True)
+class Rescan:
+    """A directory re-read against what was already known about it."""
+
+    entries: list[CatalogEntry]
+    added: frozenset[Path]
+    changed: frozenset[Path]
+    removed: frozenset[Path]
+
+    @property
+    def any(self) -> bool:
+        return bool(self.added or self.changed or self.removed)
+
+
+def rescan(
+    directory: str | Path, previous: list[CatalogEntry], *, recursive: bool = False
+) -> Rescan:
+    """Re-read a directory, reading headers only for files that are new or changed.
+
+    A full scan reads every header -- 3.8 s for 277 datasets on one results
+    directory -- which is too slow to repeat every time a pipeline stage
+    writes a file. A stat is not: an unchanged size and mtime reuses the entry.
+
+    A file that exists but will not read yet is one being written. It keeps
+    its previous entry, if it had one, and is not reported as changed until a
+    later rescan can read it -- reporting it now would reload a half-written
+    dataset.
+    """
+    known = {e.path: e for e in previous}
+    kept: list[CatalogEntry] = []
+    fresh: list[Path] = []
+    for path in discover(directory, recursive=recursive):
+        old = known.get(path)
+        if old is not None and signature(path) == old.signature:
+            kept.append(old)
+        else:
+            fresh.append(path)
+    described = {e.path: e for e in describe(fresh)}
+    added, changed = set(), set()
+    for path in fresh:
+        entry = described.get(path)
+        old = known.get(path)
+        if entry is None:
+            if old is not None:
+                kept.append(old)
+            continue
+        kept.append(entry)
+        (changed if old is not None else added).add(path)
+    present = {e.path for e in kept}
+    removed = frozenset(p for p in known if p not in present)
+    return Rescan(
+        entries=sort_entries(kept, directory),
+        added=frozenset(added),
+        changed=frozenset(changed),
+        removed=removed,
+    )
+
+
+def sort_entries(entries: list[CatalogEntry], directory: str | Path) -> list[CatalogEntry]:
+    """Natural name order, relative to the directory -- see :func:`scan`."""
+    root = Path(directory)
+
+    def key(entry: CatalogEntry):
+        try:
+            rel = entry.path.relative_to(root)
+        except ValueError:
+            rel = entry.path
+        return natural_key(rel.as_posix())
+
+    return sorted(entries, key=key)
+
+
 def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry]:
     """Read a directory into a pickable catalog, in natural name order.
 
@@ -192,18 +293,7 @@ def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry
     blocks, because a stage's mean volume guesses "anat" and its runs "func".
     Relative to the directory, so a recursive scan keeps subfolders together.
     """
-    root = Path(directory)
-    entries = list(describe(discover(directory, recursive=recursive)))
-
-    def key(entry: CatalogEntry):
-        try:
-            rel = entry.path.relative_to(root)
-        except ValueError:
-            rel = entry.path
-        return natural_key(rel.as_posix())
-
-    entries.sort(key=key)
-    return entries
+    return sort_entries(list(describe(discover(directory, recursive=recursive))), directory)
 
 
 def suggest_underlay(entries: list[CatalogEntry]) -> CatalogEntry | None:
