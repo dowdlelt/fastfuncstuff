@@ -13,6 +13,7 @@ eagerly rather than on demand.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Iterable, Iterator
@@ -173,14 +174,35 @@ def describe(paths: Iterable[str | Path]) -> Iterator[CatalogEntry]:
         )
 
 
-#: Order the picker lists kinds in: what you pick first comes first.
-KIND_ORDER = {Kind.ANAT: 0, Kind.FUNC: 1, Kind.STATS: 2, Kind.MASK: 3, Kind.OTHER: 4}
+def natural_key(text: str) -> tuple[tuple[int, int | str], ...]:
+    """Sort key that reads digit runs as numbers: ``run-2`` before ``run-10``."""
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in re.split(r"(\d+)", text.lower())
+        if part
+    )
 
 
 def scan(directory: str | Path, *, recursive: bool = False) -> list[CatalogEntry]:
-    """Read a directory into a sorted, pickable catalog."""
+    """Read a directory into a pickable catalog, in natural name order.
+
+    By name and not by guessed kind. Pipelines number their outputs --
+    ``stage02.moco``, ``stage12.stats`` -- and that order is the one a person
+    navigates by; grouping by kind first scattered each stage across four
+    blocks, because a stage's mean volume guesses "anat" and its runs "func".
+    Relative to the directory, so a recursive scan keeps subfolders together.
+    """
+    root = Path(directory)
     entries = list(describe(discover(directory, recursive=recursive)))
-    entries.sort(key=lambda e: (KIND_ORDER.get(e.kind, 9), e.name.lower()))
+
+    def key(entry: CatalogEntry):
+        try:
+            rel = entry.path.relative_to(root)
+        except ValueError:
+            rel = entry.path
+        return natural_key(rel.as_posix())
+
+    entries.sort(key=key)
     return entries
 
 

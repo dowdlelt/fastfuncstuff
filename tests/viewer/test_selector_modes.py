@@ -103,9 +103,27 @@ def test_suggested_underlay_prefers_the_biggest_anatomical(datadir):
     assert cat.suggest_underlay(cat.scan(datadir)).name == "anat.nii.gz"
 
 
-def test_scan_sorts_anat_before_stats(datadir):
-    kinds = [e.kind for e in cat.scan(datadir)]
-    assert kinds.index(Kind.ANAT) < kinds.index(Kind.STATS)
+def test_scan_lists_in_pipeline_order_not_by_kind(tmp_path):
+    """Stage prefixes are the order a person navigates by; kind groups scattered them."""
+    rng = np.random.default_rng(3)
+    names = [
+        "stage12.stats.task-B.nii.gz",  # stats
+        "stage02.moco.task-a.run-10.nii.gz",  # func
+        "stage02.moco.task-a.run-2.nii.gz",
+        "stage02.moco.task-a.run-2_mean.nii.gz",  # guesses anat
+        "Stage03.nlmoco.nii.gz",
+    ]
+    for name in names:
+        four_d = "mean" not in name and "stats" not in name
+        shape = (6, 6, 5, 20) if four_d else (6, 6, 5)
+        _write(tmp_path, name, rng.random(shape), tr=2.0 if four_d else 0.0)
+    assert [e.name for e in cat.scan(tmp_path)] == [
+        "stage02.moco.task-a.run-2.nii.gz",
+        "stage02.moco.task-a.run-2_mean.nii.gz",
+        "stage02.moco.task-a.run-10.nii.gz",
+        "Stage03.nlmoco.nii.gz",
+        "stage12.stats.task-B.nii.gz",
+    ]
 
 
 def test_scanning_a_non_directory_is_an_error(tmp_path):
