@@ -68,12 +68,22 @@ def clip_range(data: Tensor) -> tuple[float, float] | None:
 
 @dataclass
 class JointHist:
-    """Normalized joint + marginal histograms (sum to 1)."""
+    """Normalized joint + marginal histograms (sum to 1).
 
-    xyc: Tensor  # (nbp, nbp)
-    xc: Tensor  # (nbp,)
-    yc: Tensor  # (nbp,)
+    Every field carries an optional leading batch axis: ``xyc`` is (nbp, nbp) or
+    (B, nbp, nbp), the marginals (nbp,) or (B, nbp). The measures below reduce
+    over the trailing axes and return a scalar or (B,) to match, so one
+    histogram and a stack of them go through exactly the same arithmetic.
+    """
+
+    xyc: Tensor  # (..., nbp, nbp)
+    xc: Tensor  # (..., nbp)
+    yc: Tensor  # (..., nbp)
     nbp: int
+
+    @property
+    def batched(self) -> bool:
+        return self.xyc.dim() == 3
 
 
 def build_joint_hist(
@@ -83,40 +93,61 @@ def build_joint_hist(
     nbin: int | None = None,
     base_clip: tuple[float, float] | None = None,
     source_clip: tuple[float, float] | None = None,
+    batched: bool = False,
 ) -> JointHist:
     """Bilinear-deposit 2D histogram of (base, warped), differentiable in warped.
 
     Equal-size bins span the data range (or the clip range when provided),
     matching ``INCOR_addto_2Dhist`` for the non-clipped case.
+
+    With ``batched``, ``warped`` is (B, M): B candidate transforms scored against
+    the same base points, which is how the refiners ask for it. All B are
+    deposited by one ``index_add_`` into a (B, nbp*nbp) buffer rather than by B
+    of them -- the deposit is launch-bound at these point counts, so B
+    histograms cost barely more than one. The flag is explicit because ``warped``
+    is just as often a 3-D volume, which flattens to a single histogram.
     """
     x = base.reshape(-1)
-    y = warped.reshape(-1)
+    y = warped.reshape(warped.shape[0], -1) if batched else warped.reshape(1, -1)
     if weight is not None:
         w = weight.reshape(-1)
         good = w > 0
-        x, y, w = x[good], y[good], w[good]
+        x, w, y = x[good], w[good], y[:, good]
     else:
         w = torch.ones_like(x)
 
-    n = x.numel()
+    nb, n = y.shape
     if nbin is None:
         nbin = compute_nbin(n)
     nbm = nbin - 1
     nbp = nbin + 1
     device = x.device
 
+    def _out(xyc: Tensor, xc: Tensor, yc: Tensor) -> JointHist:
+        return JointHist(xyc, xc, yc, nbp) if batched else JointHist(xyc[0], xc[0], yc[0], nbp)
+
     # Bin extents define the (fixed) histogram support and carry no gradient.
     xd, yd = x.detach(), y.detach()
     xb = base_clip[0] if base_clip else float(xd.min())
     xt = base_clip[1] if base_clip else float(xd.max())
-    yb = source_clip[0] if source_clip else float(yd.min())
-    yt = source_clip[1] if source_clip else float(yd.max())
-    if xt <= xb or yt <= yb:
-        z = torch.zeros(nbp, nbp, device=device)
-        return JointHist(z, z[:, 0].clone(), z[0].clone(), nbp)
+    if source_clip:
+        yb = torch.full((nb, 1), float(source_clip[0]), device=device, dtype=y.dtype)
+        yt = torch.full((nb, 1), float(source_clip[1]), device=device, dtype=y.dtype)
+    else:
+        # Without a clip range each candidate spans its own warped values, exactly
+        # as a one-at-a-time build would.
+        yb = yd.min(dim=1, keepdim=True).values
+        yt = yd.max(dim=1, keepdim=True).values
+    if xt <= xb:
+        z = torch.zeros(nb, nbp, nbp, device=device)
+        return _out(z, z[:, :, 0].clone(), z[:, 0].clone())
+    # A candidate whose warped values are all one number (a transform that fell
+    # entirely outside the source) has no histogram; its row stays zero, which is
+    # what every measure below reads as "no information".
+    live = (yt > yb).to(y.dtype)
 
     xi = nbm / (xt - xb)
-    yi = nbm / (yt - yb)
+    yi = nbm / (yt - yb).clamp(min=1e-12)
 
     xx = ((x - xb) * xi).clamp(0.0, nbm)
     yy = ((y - yb) * yi).clamp(0.0, nbm)
@@ -127,29 +158,61 @@ def build_joint_hist(
     x1 = 1.0 - fx
     y1 = 1.0 - fy
 
-    # Linear indices into the (nbp, nbp) joint histogram for the 4 corners.
-    base_idx = jj * nbp + kk
-    xyc = torch.zeros(nbp * nbp, device=device)
-    xyc.index_add_(0, base_idx, x1 * y1 * w)
-    xyc.index_add_(0, base_idx + nbp, fx * y1 * w)  # (jj+1, kk)
-    xyc.index_add_(0, base_idx + 1, x1 * fy * w)  # (jj, kk+1)
-    xyc.index_add_(0, base_idx + nbp + 1, fx * fy * w)
-    xyc = xyc.reshape(nbp, nbp)
+    # Linear indices into each candidate's (nbp, nbp) joint histogram, offset by
+    # the candidate so one deposit fills the whole stack.
+    row = torch.arange(nb, device=device)[:, None]
+    base_idx = (jj[None, :] * nbp + kk) + row * (nbp * nbp)
+    wl = w * live
+    xyc = torch.zeros(nb * nbp * nbp, device=device)
+    xyc.index_add_(0, base_idx.reshape(-1), (x1 * y1 * wl).reshape(-1))
+    xyc.index_add_(0, (base_idx + nbp).reshape(-1), (fx * y1 * wl).reshape(-1))  # (jj+1, kk)
+    xyc.index_add_(0, (base_idx + 1).reshape(-1), (x1 * fy * wl).reshape(-1))  # (jj, kk+1)
+    xyc.index_add_(0, (base_idx + nbp + 1).reshape(-1), (fx * fy * wl).reshape(-1))
+    xyc = xyc.reshape(nb, nbp, nbp)
 
-    xc = torch.zeros(nbp, device=device)
-    xc.index_add_(0, jj, x1 * w)
-    xc.index_add_(0, jj + 1, fx * w)
-    yc = torch.zeros(nbp, device=device)
-    yc.index_add_(0, kk, y1 * w)
-    yc.index_add_(0, kk + 1, fy * w)
+    # The x marginal depends only on the base points, so it is one histogram
+    # broadcast across the candidates (scaled by the same liveness).
+    xc1 = torch.zeros(nbp, device=device)
+    xc1.index_add_(0, jj, x1 * w)
+    xc1.index_add_(0, jj + 1, fx * w)
+    xc = xc1[None, :] * live
+
+    kidx = kk + row * nbp
+    yc = torch.zeros(nb * nbp, device=device)
+    yc.index_add_(0, kidx.reshape(-1), (y1 * wl).reshape(-1))
+    yc.index_add_(0, (kidx + 1).reshape(-1), (fy * wl).reshape(-1))
+    yc = yc.reshape(nb, nbp)
 
     nww = w.sum().clamp(min=1e-12)
-    return JointHist(xyc / nww, xc / nww, yc / nww, nbp)
+    return _out(xyc / nww, xc / nww, yc / nww)
 
 
 # ---------------------------------------------------------------------------
 # Measures (ports of the INCOR_* functions in thd_incorrelate.c)
 # ---------------------------------------------------------------------------
+
+
+def _masked(mask: Tensor, value: Tensor) -> Tensor:
+    """``value`` where ``mask``, else 0 -- and no gradient from the masked-out entries.
+
+    Boolean *indexing* (``x[x > 0]``) would do the same for one histogram but goes
+    ragged the moment there is a batch axis, so the masking is done in place with
+    the where/where pattern: the masked-out entries never see the log or the
+    division, so neither the value nor its gradient can be a NaN.
+    """
+    return torch.where(mask, value, torch.zeros_like(value))
+
+
+def _safe(mask: Tensor, value: Tensor) -> Tensor:
+    """``value`` where ``mask``, else 1 -- the operand to feed log/divide."""
+    return torch.where(mask, value, torch.ones_like(value))
+
+
+def _xlogx(p: Tensor) -> Tensor:
+    """p log p with 0 log 0 = 0, elementwise."""
+    pos = p > 0
+    safe = _safe(pos, p)
+    return _masked(pos, safe * safe.log())
 
 
 def _entropy_terms(h: JointHist):
@@ -158,77 +221,70 @@ def _entropy_terms(h: JointHist):
     vv = sum xc log xc + sum yc log yc      (== -(Hx+Hy))
     uu = sum xyc log xyc                     (== -H(x,y))
     """
-    xc, yc, xyc = h.xc, h.yc, h.xyc
-    vv = (xc[xc > 0] * xc[xc > 0].log()).sum() + (yc[yc > 0] * yc[yc > 0].log()).sum()
-    pos = xyc[xyc > 0]
-    uu = (pos * pos.log()).sum()
+    vv = _xlogx(h.xc).sum(-1) + _xlogx(h.yc).sum(-1)
+    uu = _xlogx(h.xyc).sum((-2, -1))
     return vv, uu
 
 
 def mutual_info(h: JointHist) -> Tensor:
     """MI in bits = 1.4427 * sum xyc log(xyc/(xc*yc))  (INCOR_mutual_info)."""
     xc, yc, xyc = h.xc, h.yc, h.xyc
-    denom = xc[:, None] * yc[None, :]
+    denom = xc[..., :, None] * yc[..., None, :]
     mask = (xyc > 0) & (denom > 0)
-    val = (xyc[mask] * (xyc[mask] / denom[mask]).log()).sum()
-    return _LOG2E * val
+    val = _masked(mask, _safe(mask, xyc) * (_safe(mask, xyc) / _safe(mask, denom)).log())
+    return _LOG2E * val.sum((-2, -1))
 
 
 def joint_entropy(h: JointHist) -> Tensor:
     """H(base, source) using natural log (INCOR / je)."""
-    pos = h.xyc[h.xyc > 0]
-    return -(pos * pos.log()).sum()
+    return -_xlogx(h.xyc).sum((-2, -1))
 
 
 def norm_mutinf(h: JointHist) -> Tensor:
     """H(x,y) / [H(x)+H(y)] = uu/vv  (INCOR_norm_mutinf; small == redundant)."""
     vv, uu = _entropy_terms(h)
-    if vv == 0:
-        return torch.zeros((), device=h.xyc.device)
-    return uu / vv
+    ok = vv != 0
+    return _masked(ok, uu / _safe(ok, vv))
+
+
+def _corr_ratio(marg: Tensor, other: Tensor, xyc: Tensor, axis: int, nbp: int) -> Tensor:
+    """Conditional-variance ratio along ``axis`` of the joint histogram.
+
+    ``axis`` is the one summed over to get the conditional moments: -1 for
+    Var(y|x)/Var(y), -2 for Var(x|y)/Var(x).
+    """
+    idx = torch.arange(nbp, device=xyc.device, dtype=xyc.dtype)
+    shaped = idx[:, None] if axis == -2 else idx
+    mm = (shaped * xyc).sum(axis)
+    vv = (shaped**2 * xyc).sum(axis)
+    pos = marg > 0
+    cyvar = _masked(pos, vv - mm**2 / _safe(pos, marg)).sum(-1)
+    m1 = (idx * other).sum(-1)
+    v1 = (idx**2 * other).sum(-1)
+    uvar = v1 - m1**2
+    ok = uvar > 0
+    # An unvarying marginal has no ratio to take; AFNI's guard returns 1 there.
+    return torch.where(ok, cyvar / _safe(ok, uvar), torch.ones_like(cyvar))
 
 
 def _corr_ratio_yx(h: JointHist) -> Tensor:
     """Var(y|x)/Var(y) using bin-index moments (INCOR_corr_ratio)."""
-    xc, xyc = h.xc, h.xyc
-    nbp = h.nbp
-    jdx = torch.arange(nbp, device=xyc.device, dtype=xyc.dtype)
-    # Var(y|x): for each x-bin column, moments of y over j
-    mm = (jdx[None, :] * xyc).sum(dim=1)  # E(y|x)*xc
-    vv = (jdx[None, :] ** 2 * xyc).sum(dim=1)  # E(y^2|x)*xc
-    pos = xc > 0
-    cyvar = (vv[pos] - mm[pos] ** 2 / xc[pos]).sum()
-    # Var(y)
-    mY = (jdx * h.yc).sum()
-    vY = (jdx**2 * h.yc).sum()
-    uyvar = vY - mY**2
-    return cyvar / uyvar if uyvar > 0 else torch.ones((), device=xyc.device)
+    return _corr_ratio(h.xc, h.yc, h.xyc, -1, h.nbp)
 
 
 def _corr_ratio_xy(h: JointHist) -> Tensor:
     """Var(x|y)/Var(x)."""
-    yc, xyc = h.yc, h.xyc
-    nbp = h.nbp
-    idx = torch.arange(nbp, device=xyc.device, dtype=xyc.dtype)
-    mm = (idx[:, None] * xyc).sum(dim=0)
-    vv = (idx[:, None] ** 2 * xyc).sum(dim=0)
-    pos = yc > 0
-    cyvar = (vv[pos] - mm[pos] ** 2 / yc[pos]).sum()
-    mX = (idx * h.xc).sum()
-    vX = (idx**2 * h.xc).sum()
-    uxvar = vX - mX**2
-    return cyvar / uxvar if uxvar > 0 else torch.ones((), device=xyc.device)
+    return _corr_ratio(h.yc, h.xc, h.xyc, -2, h.nbp)
 
 
 def hellinger(h: JointHist) -> Tensor:
     """Hellinger affinity sum sqrt(xyc*xc*yc)  (INCOR_hellinger returns 1-this)."""
     xc, yc, xyc = h.xc, h.yc, h.xyc
-    prod = xyc * xc[:, None] * yc[None, :]
+    prod = xyc * xc[..., :, None] * yc[..., None, :]
     # sqrt has an infinite slope at 0; route the gradient only through the
     # strictly-positive entries (the zero entries contribute 0 and no grad).
     pos = prod > 0
-    safe = torch.where(pos, prod, torch.ones_like(prod))
-    return torch.where(pos, safe.sqrt(), torch.zeros_like(prod)).sum()
+    return _masked(pos, _safe(pos, prod).sqrt()).sum((-2, -1))
 
 
 @dataclass
@@ -298,8 +354,11 @@ def combo_terms(
     nbin=None,
     base_clip=None,
     source_clip=None,
+    batched: bool = False,
 ) -> Tensor:
     """Weighted (hel, mi, nmi, crA) sum in ffs convention, from ONE histogram.
+
+    ``batched`` scores a (B, M) stack of candidates and returns (B,).
 
     This is the extra half of AFNI's lpc+/lpa+ combination. Calling the four
     ``*_cost`` helpers instead would build four *identical* joint histograms —
@@ -309,7 +368,7 @@ def combo_terms(
     cost and an unusable one.
     """
     w_hel, w_mi, w_nmi, w_cra = weights
-    h = build_joint_hist(base, warped, weight, nbin, base_clip, source_clip)
+    h = build_joint_hist(base, warped, weight, nbin, base_clip, source_clip, batched)
     total = None
 
     def _add(acc, term):
@@ -324,7 +383,8 @@ def combo_terms(
     if w_cra:
         total = _add(total, w_cra * (1.0 - 0.5 * (_corr_ratio_yx(h) + _corr_ratio_xy(h))))
     if total is None:
-        return torch.zeros((), device=h.xyc.device)
+        shape = h.xyc.shape[:1] if h.batched else ()
+        return torch.zeros(shape, device=h.xyc.device)
     return total
 
 

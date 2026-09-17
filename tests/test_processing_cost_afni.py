@@ -224,6 +224,45 @@ class TestHistogramCosts:
 # ---------------------------------------------------------------------------
 
 
+def test_batched_histogram_is_the_same_arithmetic_as_one_at_a_time():
+    """B candidates in one deposit must equal B deposits, values and gradients.
+
+    This is the whole justification for the batched path: it exists only to save
+    kernel launches (600 ms -> 34 ms for 187 candidates), so any difference in what
+    it computes is a bug, not a trade-off.
+    """
+    g = torch.Generator().manual_seed(3)
+    m, b = 4000, 6
+    base = torch.rand(m, generator=g) * 100
+    warped = torch.rand(b, m, generator=g) * 80 + 10
+    # A candidate that landed entirely outside the source: constant values, no
+    # histogram support, and every measure must read it as "no information".
+    warped[2] = 0.0
+    weight = torch.rand(m, generator=g) * 2
+    w_micho = (0.4, 0.2, 0.2, 0.4)
+
+    for clips in ({}, {"base_clip": (0.0, 100.0), "source_clip": (0.0, 100.0)}):
+        one = torch.stack(
+            [
+                ch.combo_terms(base, warped[t], w_micho, weight=weight, nbin=32, **clips)
+                for t in range(b)
+            ]
+        )
+        many = ch.combo_terms(base, warped, w_micho, weight=weight, nbin=32, batched=True, **clips)
+        torch.testing.assert_close(many, one, atol=1e-6, rtol=1e-6)
+
+    # The batched build also has to be differentiable the same way -- the refiner
+    # takes gradients through it.
+    wa = warped.clone().requires_grad_(True)
+    ch.combo_terms(base, wa, w_micho, weight=weight, nbin=32, batched=True).sum().backward()
+    wb = warped.clone().requires_grad_(True)
+    torch.stack(
+        [ch.combo_terms(base, wb[t], w_micho, weight=weight, nbin=32) for t in range(b)]
+    ).sum().backward()
+    assert wa.grad is not None and float(wa.grad.abs().sum()) > 0
+    torch.testing.assert_close(wa.grad, wb.grad, atol=1e-6, rtol=1e-6)
+
+
 def _afni_allcostx(base_path, source_path, weight_path):
     """Run 3dAllineate -allcostX -> {name: value}.
 
