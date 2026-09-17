@@ -331,6 +331,17 @@ class _AffineMovie:
     def tick(self) -> bool:
         return bool(self.recorder.tick())
 
+    @staticmethod
+    def trial_tag(index: int, n_trials: int) -> str:
+        """`` trial k/N`` when there is more than one, else nothing.
+
+        Worth the caption space: the refiners show the best trial *of the moment*,
+        and which trial that is can change from one frame to the next -- most
+        visibly at a stage boundary, where the sharp cost can rank the trials
+        differently from the blurred one and the picture jumps to another basin.
+        """
+        return f" trial {index + 1}/{n_trials}" if n_trials > 1 else ""
+
     def capture(self, params, label: str, pinned: bool = False) -> None:
         """Frame from a (12,) residual parameter vector (tensor or array)."""
         p = torch.as_tensor(params, dtype=torch.float32, device=self.device)
@@ -1937,7 +1948,7 @@ def _refine_cmaes_batched(
             t_best = int(best_c.argmax())
             movie.capture(
                 _denormalize_t(best_x[t_best].clamp(0.0, 1.0), bmin, span),
-                f"{desc} gen {gi}  cost {float(best_c[t_best]):.6f}",
+                f"{desc} gen {gi}{movie.trial_tag(t_best, T)}  cost {float(best_c[t_best]):.6f}",
             )
 
         # -inf on the first generation would make the relative threshold nan,
@@ -2111,7 +2122,7 @@ def _refine_pattern_batched(
             t_best = int(best_c.argmax())
             movie.capture(
                 _denormalize_t(best_x[t_best].clamp(0.0, 1.0), bmin, span),
-                f"{desc} step {_it}  cost {float(best_c[t_best]):.6f}",
+                f"{desc} step {_it}{movie.trial_tag(t_best, T)}  cost {float(best_c[t_best]):.6f}",
             )
 
         alive = alive & (h > h_min) & (stalled < patience)
@@ -2240,7 +2251,7 @@ def _refine_adam_batched(
                 t_best = int(bc.argmax())
                 movie.capture(
                     _denormalize_t(best_norm[t_best].clamp(0.0, 1.0), bmin, span),
-                    f"{desc} it {it}  cost {float(bc[t_best]):.6f}",
+                    f"{desc} it {it}{movie.trial_tag(t_best, T)}  cost {float(bc[t_best]):.6f}",
                 )
             if tqdm is not None and verb >= 1:
                 pbar.set_postfix_str(f"best={bc.max():.6f}")
