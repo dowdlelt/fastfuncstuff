@@ -27,6 +27,8 @@ two grids, and time is linked by index.
 
 from __future__ import annotations
 
+import os
+import signal
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -1771,6 +1773,28 @@ class ViewerWindow(QtWidgets.QMainWindow):
         super().closeEvent(event)
 
 
+def quit_on_interrupt(app: QtWidgets.QApplication, win: QtWidgets.QWidget) -> QtCore.QTimer:
+    """Let Ctrl+C in the terminal close the viewer.
+
+    Python only runs its signal handlers between bytecodes, and inside
+    ``app.exec()`` the interpreter is idle in Qt's C++ loop -- so SIGINT sat
+    pending until something else woke Python, which on an idle window is
+    never. A timer that does nothing hands control back often enough for the
+    handler to run. Closing the window rather than exiting means the same
+    cleanup as the close button: workers stopped, sessions released.
+    """
+
+    def interrupted(_signum, _frame) -> None:
+        win.close()
+        app.quit()
+
+    signal.signal(signal.SIGINT, interrupted)
+    timer = QtCore.QTimer(win)
+    timer.timeout.connect(lambda: None)
+    timer.start(200)
+    return timer
+
+
 def launch(
     paths: list[str],
     *,
@@ -1781,9 +1805,14 @@ def launch(
     """Open the controller and run the Qt loop."""
     from fastfuncstuff.cli_utils import setup_device
 
+    # The GTK accessibility bridge prints a dbind warning at every start on a
+    # desktop whose at-spi bus it cannot reach, and nothing here uses it.
+    # setdefault, so someone who needs a screen reader can still turn it on.
+    os.environ.setdefault("NO_AT_BRIDGE", "1")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
     session = ViewerSession(device=setup_device(device))
     win = ViewerWindow(session)
+    quit_on_interrupt(app, win)
 
     # A directory, or the one the first dataset lives in, so the pickers are
     # populated before anyone reaches for Read.

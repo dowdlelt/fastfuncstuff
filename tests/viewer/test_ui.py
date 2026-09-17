@@ -2297,3 +2297,25 @@ def test_the_menu_follows_the_viewport_without_dispatching(graphed, qapp):
     for _ in range(5):
         graph.apply(win.session.state.viewports.find(graph.vid))
     assert len(win.session.to_script().splitlines()) == before
+
+
+def test_ctrl_c_in_the_terminal_closes_the_viewer(qapp, datadir):
+    """Qt's C++ loop starved Python's SIGINT handler, so Ctrl+C did nothing."""
+    import signal
+
+    from fastfuncstuff.viewer.ui.window import quit_on_interrupt
+
+    previous = signal.getsignal(signal.SIGINT)
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    w.show()
+    qapp.processEvents()
+    try:
+        timer = quit_on_interrupt(qapp, w)
+        assert timer.isActive(), "without a wake-up the handler never runs"
+        signal.getsignal(signal.SIGINT)(signal.SIGINT, None)
+        qapp.processEvents()
+        assert not w.isVisible()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        w.close()
