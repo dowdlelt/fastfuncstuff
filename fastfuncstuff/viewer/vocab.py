@@ -216,6 +216,22 @@ class SetViewHidden(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewRegressors(Command):
+    """Design columns a graph window keeps, as comma-separated ``run:col:path``.
+
+    Run is 1-based, as the xmat's ``Run#1Pol#0`` counts; column is the xmat's
+    own 0-based index, because labels repeat (``motion[0]`` once per run).
+    ``-`` or empty pins nothing.
+    """
+
+    name = "SET_VIEW_REGRESSORS"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    pins: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetViewSharedScale(Command):
     name = "SET_VIEW_SHARED_SCALE"
     aspects = Aspect.VIEWPORTS | Aspect.GRAPH
@@ -890,6 +906,16 @@ def install(
         assert isinstance(cmd, SetViewHidden)
         keys = tuple(k for k in (cmd.keys or "").split(",") if k and k != "-")
         return _set_view(st, cmd.view, SetViewHidden.aspects, hidden=keys)
+
+    @bus.handle(SetViewRegressors.name)
+    def _set_view_regressors(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewRegressors)
+        from fastfuncstuff.viewer.design import Pin
+
+        pins = tuple(p for p in (cmd.pins or "").split(",") if p and p != "-")
+        for p in pins:
+            Pin.decode(p)  # a malformed spec fails here, not at paint time
+        return _set_view(st, cmd.view, SetViewRegressors.aspects, regressors=pins)
 
     @bus.handle(SetViewSharedScale.name)
     def _set_view_shared(cmd: Command, st: ViewerState) -> Aspect:

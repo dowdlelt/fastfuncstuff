@@ -107,6 +107,10 @@ class Viewport:
     #: than to show, for the same reason ``traces`` defaults to everything: a
     #: line that appears later -- a mode's spectrum -- starts drawn.
     hidden: tuple[str, ...] = ()
+    #: Design columns kept in a graph, as :class:`viewer.design.Pin` specs
+    #: (``run:col:path``). Separate from ``traces`` because a regressor is not
+    #: a layer: it has no voxels, and it is the same line in every cell.
+    regressors: tuple[str, ...] = ()
 
     # -- carpet and matrix ---------------------------------------------
     #: Row order. See :mod:`viewer.carpet` for what each one groups.

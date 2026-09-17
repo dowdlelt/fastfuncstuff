@@ -38,6 +38,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewDetrend,
     SetViewGrid,
     SetViewHidden,
+    SetViewRegressors,
     SetViewSharedScale,
     SetViewTraces,
 )
@@ -470,6 +471,49 @@ class GraphWindow(QtWidgets.QWidget):
             lambda _: self._dispatch(SetViewDetrend(self.vid, int(self.detrend_box.currentData())))
         )
         foot.addWidget(self.detrend_box)
+        foot.addSpacing(10)
+
+        # Design columns. Picked here and kept as a line in the legend, so the
+        # three menus are a way to name one regressor, not a display state.
+        foot.addWidget(QtWidgets.QLabel("DESIGN"))
+        self.design_box = QtWidgets.QComboBox()
+        self.design_box.setToolTip(
+            "A design matrix or 1D file. A stats overlay's own design is offered\n"
+            "automatically, read from the GLM command in its history."
+        )
+        self.design_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.design_box.setMinimumContentsLength(10)
+        self.design_box.activated.connect(lambda _: self._design_picked())
+        foot.addWidget(self.design_box)
+        load = QtWidgets.QPushButton("1D…")
+        load.setToolTip("Load an xmat or any 1D file of regressors.")
+        load.clicked.connect(self._load_design)
+        foot.addWidget(load)
+        self.run_box = QtWidgets.QComboBox()
+        self.run_box.setToolTip("Which run's rows of the design to draw.")
+        self.run_box.activated.connect(lambda _: self._menu_picked())
+        foot.addWidget(self.run_box)
+        self.column_box = QtWidgets.QComboBox()
+        self.column_box.setToolTip("Stimulus columns first, then nuisance, then drift.")
+        self.column_box.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.column_box.setMinimumContentsLength(12)
+        self.column_box.activated.connect(lambda _: self._menu_picked())
+        foot.addWidget(self.column_box)
+        self.pin_button = QtWidgets.QPushButton("pin")
+        self.pin_button.setToolTip(
+            "Keep this column in the graph as its own line. Drawn as the design\n"
+            "has it: DETREND does not touch it, and it has its own y-range."
+        )
+        self.pin_button.clicked.connect(self._toggle_pin)
+        foot.addWidget(self.pin_button)
+        #: A person has used the menus. Until then they follow the automatic
+        #: column, so the obvious pin is one click; after, they stay put.
+        self._design_chosen = False
+        self._design_signature: tuple = ()
         foot.addStretch(1)
         v.addLayout(foot)
 
@@ -537,7 +581,7 @@ class GraphWindow(QtWidgets.QWidget):
         hidden = [k for k in vp.hidden if k != ident]
         if not on:
             hidden.append(ident)
-        elif not ident.startswith("mode:") and vp.traces and ident not in vp.traces:
+        elif not ident.startswith(("mode:", "design:")) and vp.traces and ident not in vp.traces:
             keep = {*vp.traces, ident}
             order = [ly.key for ly in self.session.graph_layers() if ly.key in keep]
             self._dispatch(SetViewTraces(self.vid, ",".join(order)))
@@ -560,6 +604,8 @@ class GraphWindow(QtWidgets.QWidget):
                         is_time=trace.x_label in ("", "TR"),
                     )
                 )
+        for reg in self.session.regressor_series(viewport):
+            out.append(Entry(reg.ident, _clip(reg.legend), reg.full))
         return out
 
     def _drawn(self, viewport: Viewport) -> set[str]:
@@ -567,7 +613,8 @@ class GraphWindow(QtWidgets.QWidget):
         return {
             e.ident
             for e in self.entries(viewport)
-            if e.ident not in viewport.hidden and (e.ident.startswith("mode:") or e.ident in layers)
+            if e.ident not in viewport.hidden
+            and (e.ident.startswith(("mode:", "design:")) or e.ident in layers)
         }
 
     def _viewport(self) -> Viewport | None:
@@ -584,6 +631,7 @@ class GraphWindow(QtWidgets.QWidget):
         self.detrend_box.blockSignals(True)
         self.detrend_box.setCurrentIndex(max(self.detrend_box.findData(int(viewport.detrend)), 0))
         self.detrend_box.blockSignals(False)
+        self._sync_design_menus(viewport)
         self._sync_legend(viewport)
 
     def _colors(self, entries: list[Entry]) -> dict[str, QtGui.QColor]:
@@ -652,6 +700,14 @@ class GraphWindow(QtWidgets.QWidget):
         entries = self.entries(vp)
         drawn = self._drawn(vp)
         traced = [ly for ly in self.session.traces_for(vp) if ly.key in drawn]
+        all_regressors = self.session.regressor_series(vp)
+        regressors = [r for r in all_regressors if r.ident in drawn]
+        # A new sub-brick moves the automatic column without touching the
+        # viewport, so apply() never hears about it.
+        signature = (tuple(r.pin for r in all_regressors), tuple(self.session.designs))
+        if signature != self._design_signature:
+            self._design_signature = signature
+            self._sync_design_menus(vp)
         cells: list[Cell] = []
         for dr in range(-half, -half + n):
             for dc in range(-half, -half + n):
@@ -661,7 +717,7 @@ class GraphWindow(QtWidgets.QWidget):
                 cells.append(
                     Cell(
                         ijk=ijk,
-                        traces=self._traces(traced, ijk, drawn, vp.detrend),
+                        traces=self._traces(traced, ijk, drawn, vp.detrend, regressors),
                         is_centre=(dr == 0 and dc == 0),
                     )
                 )
@@ -675,7 +731,12 @@ class GraphWindow(QtWidgets.QWidget):
         self.info.setText(self.session.mode.status())
 
     def _traces(
-        self, layers, ijk: tuple[int, int, int], drawn: set[str], polort: int = -1
+        self,
+        layers,
+        ijk: tuple[int, int, int],
+        drawn: set[str],
+        polort: int = -1,
+        regressors=(),
     ) -> list[tuple[str, np.ndarray]]:
         """The ticked layers' time courses, plus the mode's ticked lines.
 
@@ -685,6 +746,7 @@ class GraphWindow(QtWidgets.QWidget):
         would be the one thing worse than removing it from none.
         """
         from fastfuncstuff.viewer.derive import detrend_trace
+        from fastfuncstuff.viewer.design import fit_length
 
         out: list[tuple[str, np.ndarray]] = []
         for layer in layers:
@@ -695,7 +757,129 @@ class GraphWindow(QtWidgets.QWidget):
             ident = f"mode:{trace.ident}"
             if trace.values.size and ident in drawn:
                 out.append((ident, detrend_trace(trace.values, polort)))
+        # Not detrended: the point is to see the timing the model was fit
+        # with, and a polynomial taken out of a boxcar moves its baseline.
+        n_time = next((v.size for k, v in out if not k.startswith("mode:")), 0)
+        for reg in regressors:
+            out.append((reg.ident, fit_length(reg.values, n_time)))
         return out
+
+    # -- design regressors ---------------------------------------------
+    def _load_design(self) -> None:
+        start = str(self.session.catalog_dir or "")
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Design matrix or 1D file", start, "1D files (*.1D *.txt *.tsv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            design = self.session.load_design(path)
+        except (OSError, ValueError, IndexError) as exc:
+            QtWidgets.QMessageBox.warning(self, "Could not read design", str(exc))
+            return
+        self._design_chosen = True
+        vp = self._viewport()
+        if vp is not None:
+            self._sync_design_menus(vp, select=design.path)
+
+    def _menu_picked(self) -> None:
+        self._design_chosen = True
+        self._sync_pin_button()
+
+    def _design_picked(self) -> None:
+        self._design_chosen = True
+        design = self._current_design()
+        if design is not None:
+            self._fill_run_and_column(design)
+        self._sync_pin_button()
+
+    def _current_design(self):
+        path = self.design_box.currentData()
+        return self.session.designs.get(path) if path else None
+
+    def _current_pin(self):
+        from fastfuncstuff.viewer.design import Pin
+
+        design = self._current_design()
+        run, col = self.run_box.currentData(), self.column_box.currentData()
+        if design is None or run is None or col is None:
+            return None
+        return Pin(design.path, int(run), int(col))
+
+    def _fill_run_and_column(self, design, run: int | None = None, col: int | None = None) -> None:
+        for box in (self.run_box, self.column_box):
+            box.blockSignals(True)
+            box.clear()
+        for r in range(1, design.n_runs + 1):
+            self.run_box.addItem(f"run {r}", userData=r)
+        for c in design.display_order():
+            self.column_box.addItem(design.label(c), userData=c)
+        if run is not None:
+            self.run_box.setCurrentIndex(max(self.run_box.findData(run), 0))
+        if col is not None:
+            self.column_box.setCurrentIndex(max(self.column_box.findData(col), 0))
+        for box in (self.run_box, self.column_box):
+            box.blockSignals(False)
+
+    def _sync_design_menus(self, viewport: Viewport, *, select: str | None = None) -> None:
+        """Offer every loaded design; follow the automatic column until a choice is made.
+
+        Rebuilt without dispatching anything: the menus name a regressor, and
+        only pinning it is a change to the window.
+        """
+        from fastfuncstuff.viewer.design import AUTO_IDENT
+
+        regs = self.session.regressor_series(viewport)
+        auto = next((r.pin for r in regs if r.ident == AUTO_IDENT), None)
+        paths = list(self.session.designs)
+        current = select or self.design_box.currentData()
+        if auto is not None and not self._design_chosen:
+            current = auto.path
+        changed = [self.design_box.itemData(i) for i in range(self.design_box.count())] != paths
+        if changed:
+            self.design_box.blockSignals(True)
+            self.design_box.clear()
+            for path in paths:
+                self.design_box.addItem(_clip(path.rsplit("/", 1)[-1]), userData=path)
+                self.design_box.setItemData(
+                    self.design_box.count() - 1, path, QtCore.Qt.ItemDataRole.ToolTipRole
+                )
+            self.design_box.blockSignals(False)
+        index = self.design_box.findData(current) if current else -1
+        if index < 0 and self.design_box.count():
+            index = 0
+        design_moved = index != self.design_box.currentIndex() or changed or select is not None
+        self.design_box.blockSignals(True)
+        self.design_box.setCurrentIndex(index)
+        self.design_box.blockSignals(False)
+        design = self._current_design()
+        if design is None:
+            self.run_box.clear()
+            self.column_box.clear()
+        elif auto is not None and not self._design_chosen and auto.path == design.path:
+            if (self.run_box.currentData(), self.column_box.currentData()) != (auto.run, auto.col):
+                self._fill_run_and_column(design, auto.run, auto.col)
+        elif design_moved or self.run_box.count() != design.n_runs:
+            self._fill_run_and_column(design)
+        self._sync_pin_button(viewport)
+
+    def _sync_pin_button(self, viewport: Viewport | None = None) -> None:
+        viewport = viewport or self._viewport()
+        pin = self._current_pin()
+        self.pin_button.setEnabled(pin is not None)
+        pinned = viewport is not None and pin is not None and pin.encode() in viewport.regressors
+        self.pin_button.setText("unpin" if pinned else "pin")
+
+    def _toggle_pin(self) -> None:
+        vp = self._viewport()
+        pin = self._current_pin()
+        if vp is None or pin is None:
+            return
+        spec = pin.encode()
+        pins = [p for p in vp.regressors if p != spec]
+        if len(pins) == len(vp.regressors):
+            pins.append(spec)
+        self._dispatch(SetViewRegressors(self.vid, ",".join(pins)))
 
     def restyle(self) -> None:
         """Re-read the palette after a theme switch."""

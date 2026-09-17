@@ -17,6 +17,7 @@ from fastfuncstuff.io.dsetinfo import DatasetInfo
 from fastfuncstuff.viewer import catalog as catalog_mod
 from fastfuncstuff.viewer.catalog import CatalogEntry
 from fastfuncstuff.viewer.commands import Aspect, Command, CommandBus
+from fastfuncstuff.viewer.design import Design, Provenance, RegressorTrace, run_of
 from fastfuncstuff.viewer.layers import AlphaMode, Layer, SignMode
 from fastfuncstuff.viewer.modes import Mode, registry
 from fastfuncstuff.viewer.modes.base import ComputedOverlay, Trace
@@ -121,6 +122,12 @@ class ViewerSession:
         self._roi_sets: dict[str, RoiSet] = {}
         self._roi_palettes: dict[tuple[str, str], torch.Tensor] = {}
         self._clustsim: dict[str, dict] = {}
+        #: Designs offered in graph windows, by resolved path.
+        self.designs: dict[str, Design] = {}
+        self._design_errors: dict[str, str] = {}
+        self._design_paths: dict[str, str] = {}
+        self._provenance_cache: dict[str, Provenance | None] = {}
+        self._run_cache: dict[tuple[Provenance, str], int | None] = {}
         self._mode_dirty: Aspect = Aspect.NOTHING
         #: The controller letter this session is, set by a UI that has several.
         #: It is the stem every mode output is named with -- ``A_ICORR`` -- so a
@@ -477,6 +484,139 @@ class ViewerSession:
 
     def mode_series(self, ijk: tuple[int, int, int] | None = None) -> list[Trace]:
         return self.mode.series(ijk or self.state.crosshair)
+
+    # -- design regressors ----------------------------------------------
+    #
+    # Voxel-independent lines in a graph: a design column is the same curve in
+    # every cell. Read from disk on demand and cached by path, so a crosshair
+    # drag never re-parses a history or an xmat.
+
+    def load_design(self, path: str | Path) -> Design:
+        """Read a design and offer it in every graph window's DESIGN menu."""
+        from fastfuncstuff.viewer.design import load_design
+
+        design = load_design(path)
+        self.designs[design.path] = design
+        self._design_errors.pop(str(path), None)
+        return design
+
+    def design(self, path: str) -> Design | None:
+        """A design by path as some history or pin wrote it, or ``None`` if unreadable.
+
+        Both outcomes are remembered per spelling of the path: this is asked on
+        every repaint, and resolving a path or failing to read one costs a trip
+        to the filesystem each time. Loading through :meth:`load_design` is
+        what re-reads a file that changed.
+        """
+        if path in self._design_errors:
+            return None
+        resolved = self._design_paths.get(path)
+        if resolved is not None and resolved in self.designs:
+            return self.designs[resolved]
+        try:
+            design = self.load_design(path)
+        except (OSError, ValueError, IndexError) as exc:
+            self._design_errors[path] = str(exc)
+            return None
+        self._design_paths[path] = design.path
+        return design
+
+    def _provenance(self, layer: Layer) -> Provenance | None:
+        from fastfuncstuff.io.dsetinfo import read_info
+        from fastfuncstuff.viewer.design import parse_provenance
+
+        if layer.path not in self._provenance_cache:
+            try:
+                history = read_info(layer.path).history
+            except (OSError, ValueError):
+                history = ""
+            path = Path(layer.path)
+            self._provenance_cache[layer.path] = parse_provenance(
+                history, stats_name=path.name, base=path.parent
+            )
+        return self._provenance_cache[layer.path]
+
+    def auto_regressor(self) -> tuple[Design, int, int] | None:
+        """The design column the shown stats sub-brick is about, for the graphed run.
+
+        Only a ``_Coef`` or ``_Tstat`` of one column qualifies: a contrast or an
+        F spans several, and picking one to draw would misdescribe it. The run
+        is the first graphed layer that the fit lists as an input, and the
+        column is drawn only if that run's length matches the layer's -- a
+        trimmed or re-cut run would put every event in the wrong place.
+        """
+        st = self.state
+        stats = [
+            ly
+            for ly in reversed(list(st.layers))
+            if ly.visible and not ly.time_linked and ly.labels and ly.source == "file"
+        ]
+        for layer in stats:
+            provenance = self._provenance(layer)
+            if provenance is None:
+                continue
+            design = self.design(provenance.design)
+            if design is None:
+                continue
+            index = layer.volume_index
+            label = layer.labels[index] if 0 <= index < len(layer.labels) else ""
+            col = design.column_for_brick(label)
+            if col is None:
+                return None
+            for run_layer in self.graph_layers():
+                run = self._run_of(provenance, run_layer.path)
+                if run is None:
+                    continue
+                if run > design.n_runs or design.run_length(run) != run_layer.n_volumes:
+                    return None
+                return design, run, col
+            return None
+        return None
+
+    def _run_of(self, provenance: Provenance, path: str) -> int | None:
+        # Resolving paths touches the filesystem, and this is asked per repaint.
+        key = (provenance, path)
+        if key not in self._run_cache:
+            self._run_cache[key] = run_of(provenance, path)
+        return self._run_cache[key]
+
+    def regressor_series(self, viewport) -> list[RegressorTrace]:
+        """The automatic column, then the pinned ones, for one graph window."""
+        from fastfuncstuff.viewer.design import AUTO_IDENT, Pin, pin_label
+
+        out: list[RegressorTrace] = []
+        auto = self.auto_regressor()
+        if auto is not None:
+            design, run, col = auto
+            out.append(
+                RegressorTrace(
+                    AUTO_IDENT,
+                    f"{pin_label(design, run, col)} (auto)",
+                    f"{Path(design.path).name}: run {run}, column {col} "
+                    "-- follows the stats sub-brick shown",
+                    design.column(run, col),
+                    Pin(design.path, run, col),
+                )
+            )
+        for spec in viewport.regressors:
+            pin = Pin.decode(spec)
+            design = self.design(pin.path)
+            if design is None:
+                continue
+            try:
+                values = design.column(pin.run, pin.col)
+            except IndexError:
+                continue
+            out.append(
+                RegressorTrace(
+                    pin.ident,
+                    pin_label(design, pin.run, pin.col),
+                    f"{Path(design.path).name}: run {pin.run}, column {pin.col}",
+                    values,
+                    pin,
+                )
+            )
+        return out
 
     # -- derived layers -------------------------------------------------
     #
