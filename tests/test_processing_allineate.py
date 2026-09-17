@@ -1763,6 +1763,38 @@ class TestCostTrace:
         np.testing.assert_array_equal(rows[:, 1], np.arange(8))  # step column
 
 
+def test_batched_overlap_penalty_matches_one_at_a_time():
+    """The candidate axis is a pure batching of the same warp-and-count.
+
+    CMA-ES asks for population x trials penalties at once (187 for a rigid fit),
+    each of which warps a whole volume; doing them one at a time cost more than
+    the point-sampled cost they are added to.
+    """
+    from fastfuncstuff.processing.affine import params_to_matrix
+    from fastfuncstuff.processing.allineate import _overlap_penalty
+
+    g = torch.Generator().manual_seed(11)
+    shape = (14, 16, 16)
+    cov = (torch.rand(shape, generator=g) > 0.4).float()
+    dom = (torch.rand(shape, generator=g) > 0.4).float()
+    ctx = CostContext(
+        name="lpc", src_cov=cov, base_dom=dom, ov_denom=float(dom.sum()), ov_weight=0.4
+    )
+    params = torch.zeros(9, 12)
+    params[:, 6:9] = 1.0
+    params[:, 0] = torch.linspace(-6, 6, 9)  # from full overlap out to none
+    params[:, 3] = torch.linspace(-20, 20, 9)
+    mats = torch.stack([params_to_matrix(p) for p in params])
+
+    one = torch.stack([_overlap_penalty(ctx, mats[t], shape) for t in range(mats.shape[0])])
+    many = _overlap_penalty(ctx, mats, shape)
+    assert one.shape == many.shape == (9,)
+    assert float(many.max()) > 0  # the far candidates really are penalised
+    torch.testing.assert_close(many, one, atol=1e-5, rtol=1e-5)
+    # A single matrix still answers with a scalar, for the non-batched cost path.
+    assert _overlap_penalty(ctx, mats[0], shape).shape == ()
+
+
 class TestMovie:
     """The -movie recorder's view of the search (see viz/warp_movie.py)."""
 

@@ -428,6 +428,13 @@ def _base_cost(name: str) -> str:
     return _parse_cost(name)[0]
 
 
+# Bytes of scratch per candidate per point in the batched histogram deposit: the
+# scaled coordinate, its bin index (int64), the fractional part and its
+# complement, the linear index (int64) and the deposited product. Measured shapes,
+# not a guess -- see cost_hist.build_joint_hist.
+_MICHO_BYTES_PER_POINT = 56
+
+
 def _micho_terms(ctx: CostContext, base_v: Tensor, warped_v: Tensor, weight_v) -> Tensor:
     """The lpc+/lpa+ extra terms, in ffs (higher == better) units.
 
@@ -435,23 +442,47 @@ def _micho_terms(ctx: CostContext, base_v: Tensor, warped_v: Tensor, weight_v) -
     just the standalone ffs cost, so the combination collapses to a plain
     weighted sum ``base + sum(w_i * term_i)`` (the constant offsets AFNI carries
     do not affect the optimum).
+
+    ``warped_v`` may be one set of sampled values or (B, M) for B candidates,
+    which then returns (B,). The batch is what makes the combination affordable:
+    one histogram per candidate in a Python loop was costing more than the
+    point-sampled cost it is added to (793 ms against 19 ms for 187 candidates),
+    because a deposit of this size is launch-bound. Candidates are chunked to the
+    registration memory budget.
     """
     base_v = base_v.reshape(-1)
-    warped_v = warped_v.reshape(-1)
+    batched = warped_v.dim() > 1
+    warped_v = warped_v.reshape(warped_v.shape[0], -1) if batched else warped_v.reshape(-1)
     weight_v = None if weight_v is None else weight_v.reshape(-1)
     idx = ctx.micho_subset(base_v.numel(), base_v.device)
     if idx is not None:
         base_v = base_v[idx]
-        warped_v = warped_v[idx]
+        warped_v = warped_v[..., idx]
         weight_v = None if weight_v is None else weight_v[idx]
-    return cost_hist.combo_terms(
-        base_v,
-        warped_v,
-        ctx.micho,  # type: ignore[arg-type]
-        weight=weight_v,
-        base_clip=ctx.base_clip,
-        source_clip=ctx.source_clip,
+
+    def _terms(w: Tensor) -> Tensor:
+        return cost_hist.combo_terms(
+            base_v,
+            w,
+            ctx.micho,  # type: ignore[arg-type]
+            weight=weight_v,
+            base_clip=ctx.base_clip,
+            source_clip=ctx.source_clip,
+            batched=batched,
+        )
+
+    if not batched:
+        return _terms(warped_v)
+    b = warped_v.shape[0]
+    chunk = max(
+        1,
+        compute_registration_candidate_batch_size(
+            base_v.numel(), b, base_v.device, bytes_per_point=_MICHO_BYTES_PER_POINT
+        ),
     )
+    if chunk >= b:
+        return _terms(warped_v)
+    return torch.cat([_terms(warped_v[s : s + chunk]) for s in range(0, b, chunk)])
 
 
 # Costs built from the 2D joint histogram.
@@ -673,7 +704,7 @@ def _voxdims_from_header(header: dict | None) -> tuple[float, float, float]:
 
 
 def _overlap_penalty(ctx: CostContext, matrix: Tensor, out_shape) -> Tensor:
-    """AFNI lpc+/lpa+ overlap penalty as a differentiable scalar (>= 0).
+    """AFNI lpc+/lpa+ overlap penalty, differentiable and >= 0.
 
     Warps the soft source-coverage map by ``matrix`` and measures the fraction
     of the base brain domain it covers, then applies AFNI's
@@ -681,11 +712,28 @@ def _overlap_penalty(ctx: CostContext, matrix: Tensor, out_shape) -> Tensor:
     fraction depends on the warp through grid_sample, so the term is
     differentiable and the Adam/Powell refiner is actively pushed back toward
     overlap rather than only being re-ranked after the fact.
+
+    ``matrix`` may be a single (4, 4) -- returning a scalar -- or (B, 4, 4),
+    returning (B,). The batched form is the one that matters: this warps a whole
+    volume per candidate, and CMA-ES asks for population x trials of them at
+    once (187 for a rigid fit at -tbest 11), which one at a time was costing
+    more than the point-sampled cost it is added to. Candidates are chunked to
+    the same memory budget the coarse search uses.
     """
-    warped_cov = apply_affine(ctx.src_cov, matrix, out_shape, zero_outside=True)
-    ov = (ctx.base_dom * warped_cov).sum() / max(ctx.ov_denom, 1e-6)
+    single = matrix.dim() == 2
+    matrices = matrix[None] if single else matrix
+    b = matrices.shape[0]
+    chunk = b if single else _estimate_chunk_size(tuple(out_shape), matrices.device, b)
+    parts = []
+    for start in range(0, b, max(chunk, 1)):
+        warped_cov = apply_affine_batched(
+            ctx.src_cov, matrices[start : start + max(chunk, 1)], out_shape, zero_outside=True
+        )
+        parts.append((ctx.base_dom * warped_cov).sum(dim=(-3, -2, -1)))
+    ov = torch.cat(parts) / max(ctx.ov_denom, 1e-6)
     ovv = torch.clamp(9.95 - 10.0 * ov, min=0.0)
-    return ovv * ovv
+    pen = ovv * ovv
+    return pen[0] if single else pen
 
 
 def _compute_cost(
@@ -1673,19 +1721,9 @@ def _batched_sampled_cost(source_stage, points_xyz, base_pts, weight_s, blokset,
         val = local_pearson_value_batched_prepared(pearson_base, warped, ctx.ppow)  # (T,)
         c = (-val) if is_lpc else val.abs()
         if ctx.micho is not None:
-            # The histogram terms are per-transform and not batched; T is small
-            # (tbest+1), so a loop costs a few kernels, not a rewrite.
-            c = c + torch.stack(
-                [_micho_terms(ctx, base_pts, warped[t], weight_s) for t in range(warped.shape[0])]
-            )
+            c = c + _micho_terms(ctx, base_pts, warped, weight_s)
         if ctx.ov_weight > 0.0 and ctx.src_cov is not None:
-            pens = torch.stack(
-                [
-                    _overlap_penalty(ctx, matrices[t], ctx.src_cov.shape)
-                    for t in range(matrices.shape[0])
-                ]
-            )
-            c = c - ctx.ov_weight * pens
+            c = c - ctx.ov_weight * _overlap_penalty(ctx, matrices, ctx.src_cov.shape)
         return c
 
     def grad_batch_limit() -> int:
