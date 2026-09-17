@@ -1064,11 +1064,11 @@ class TestOverlapPenalty:
 
         ctx = self._ctx_with_cov()
         ident = params_to_matrix(identity_params())
-        pen_ident = _overlap_penalty(ctx, ident, ctx.src_cov.shape)
+        pen_ident = _overlap_penalty(ctx, ident)
 
         p = identity_params().clone()
         p[0] = 30.0  # shift coverage fully out of the base domain
-        pen_off = _overlap_penalty(ctx, params_to_matrix(p), ctx.src_cov.shape)
+        pen_off = _overlap_penalty(ctx, params_to_matrix(p))
 
         assert pen_ident.item() < 1.0  # near-full overlap -> ~0 penalty
         assert pen_off.item() > 50.0  # no overlap -> large penalty
@@ -1786,13 +1786,24 @@ def test_batched_overlap_penalty_matches_one_at_a_time():
     params[:, 3] = torch.linspace(-20, 20, 9)
     mats = torch.stack([params_to_matrix(p) for p in params])
 
-    one = torch.stack([_overlap_penalty(ctx, mats[t], shape) for t in range(mats.shape[0])])
-    many = _overlap_penalty(ctx, mats, shape)
+    one = torch.stack([_overlap_penalty(ctx, mats[t]) for t in range(mats.shape[0])])
+    many = _overlap_penalty(ctx, mats)
     assert one.shape == many.shape == (9,)
     assert float(many.max()) > 0  # the far candidates really are penalised
     torch.testing.assert_close(many, one, atol=1e-5, rtol=1e-5)
     # A single matrix still answers with a scalar, for the non-batched cost path.
-    assert _overlap_penalty(ctx, mats[0], shape).shape == ()
+    assert _overlap_penalty(ctx, mats[0]).shape == ()
+
+    # And reading the coverage at the base domain's own voxels is the same number
+    # as warping the whole grid and masking it -- that equivalence is the only
+    # reason the cheaper form is allowed.
+    from fastfuncstuff.processing.affine import apply_affine
+
+    for t in range(mats.shape[0]):
+        warped = apply_affine(cov, mats[t], shape, zero_outside=True)
+        ov = (dom * warped).sum() / ctx.ov_denom
+        expected = torch.clamp(9.95 - 10.0 * ov, min=0.0) ** 2
+        torch.testing.assert_close(many[t], expected, atol=1e-4, rtol=1e-4)
 
 
 class TestMovie:
