@@ -337,19 +337,19 @@ def test_setting_the_palette_already_active_changes_nothing() -> None:
     theme.set_theme("dark")
     assert theme.set_theme("dark") is False
     assert theme.set_theme("light") is True
-    theme.set_theme("dark")
+    theme.set_theme("light")  # the default, so later tests start where a user does
 
 
 def test_the_theme_command_round_trips() -> None:
     from fastfuncstuff.viewer.vocab import SetTheme
 
     bus = _bus()
-    assert bus.dispatch(SetTheme("light")) & Aspect.THEME
-    assert bus.state.theme == "light"
-    assert bus.dispatch(SetTheme("light")) is Aspect.NOTHING
+    assert bus.dispatch(SetTheme("dark")) & Aspect.THEME
+    assert bus.state.theme == "dark"
+    assert bus.dispatch(SetTheme("dark")) is Aspect.NOTHING
     with pytest.raises(KeyError):
         bus.dispatch(SetTheme("chartreuse"))
 
     replayed = ViewerState()
     vocab.install(CommandBus(replayed)).dispatch_all(parse_script(bus.to_script()))
-    assert replayed.theme == "light"
+    assert replayed.theme == "dark"

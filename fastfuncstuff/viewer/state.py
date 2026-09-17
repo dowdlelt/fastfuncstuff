@@ -76,7 +76,7 @@ class ViewerState:
     #: Interface palette. State rather than a widget setting so a recorded
     #: session comes back looking the way it was recorded -- a screenshot from
     #: a replay should match the one that prompted it.
-    theme: str = "dark"
+    theme: str = "light"
 
     @property
     def crosshair_mm(self) -> tuple[float, float, float] | None:

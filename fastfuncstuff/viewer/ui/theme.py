@@ -124,7 +124,7 @@ LIGHT = Palette(
 )
 
 PALETTES = {p.name: p for p in (DARK, LIGHT)}
-_active = DARK
+_active = LIGHT
 
 
 def palette() -> Palette:

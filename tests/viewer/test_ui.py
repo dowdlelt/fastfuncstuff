@@ -899,34 +899,34 @@ def test_two_graphs_of_different_sizes_read_as_nested_boxes(win, qapp):
 def test_one_switch_flips_the_whole_interface(win, qapp):
     from fastfuncstuff.viewer.ui import theme
 
-    assert win.session.state.theme == "dark"
+    assert win.session.state.theme == "light"
     win._toggle_theme()
     qapp.processEvents()
-    assert win.session.state.theme == "light"
-    assert theme.palette().name == "light"
+    assert win.session.state.theme == "dark"
+    assert theme.palette().name == "dark"
 
     # Every window, not just the one the button is on.
-    light = theme.LIGHT.bg
-    assert light in win.styleSheet()
-    assert all(light in w.styleSheet() for w in win.manager.windows.values())
+    dark = theme.DARK.bg
+    assert dark in win.styleSheet()
+    assert all(dark in w.styleSheet() for w in win.manager.windows.values())
 
     win._toggle_theme()
     qapp.processEvents()
-    assert theme.palette().name == "dark"
+    assert theme.palette().name == "light"
 
 
 def test_the_theme_button_names_where_it_takes_you(win, qapp):
     """A button labelled with the current state reads as a status light."""
-    assert win.theme_button.text() == "LIGHT [d]"
-    win._toggle_theme()
-    qapp.processEvents()
     # The key is bracketed inside the word when the word contains it.
     assert win.theme_button.text() == "[D]ARK"
     win._toggle_theme()
     qapp.processEvents()
+    assert win.theme_button.text() == "LIGHT [d]"
+    win._toggle_theme()
+    qapp.processEvents()
 
 
-def test_a_window_opened_after_the_switch_is_born_light(win, qapp):
+def test_a_window_opened_after_the_switch_is_born_dark(win, qapp):
     from fastfuncstuff.viewer.ui import theme
 
     win._toggle_theme()
@@ -934,7 +934,7 @@ def test_a_window_opened_after_the_switch_is_born_light(win, qapp):
     win._new_graph()
     qapp.processEvents()
     graph = win.manager.windows[win.session.state.viewports.graphs[0].id]
-    assert theme.LIGHT.bg in graph.styleSheet()
+    assert theme.DARK.bg in graph.styleSheet()
     win._toggle_theme()
     qapp.processEvents()
 
@@ -943,7 +943,7 @@ def test_the_palette_is_recorded_so_a_replay_looks_the_same(win, qapp):
     win.session.bus.clear_log()
     win._toggle_theme()
     qapp.processEvents()
-    assert "SET_THEME light" in win.session.to_script()
+    assert "SET_THEME dark" in win.session.to_script()
     win._toggle_theme()
     qapp.processEvents()
 
@@ -1378,7 +1378,7 @@ def test_the_theme_key_fires(win, qapp):
     action = next(a for a in win.actions() if a.shortcut() == QtGui.QKeySequence("d"))
     action.trigger()
     qapp.processEvents()
-    assert win.session.state.theme == "light"
+    assert win.session.state.theme == "dark"
     win._toggle_theme()
     qapp.processEvents()
 
