@@ -129,6 +129,7 @@ NL_BACKEND_OPTS: dict[str, str] = {
     "optiwarp_demons": "-metric lpa -final_interp wsinc5",
     "optiwarp_lk": "-metric lpa -final_interp wsinc5",
     "optiwarp_hs": "-metric lpa -final_interp wsinc5",
+    "optiwarp_gradient": "-metric lpa -final_interp wsinc5",
     "qwarp": "-cost lpa -final wsinc5",
 }
 
