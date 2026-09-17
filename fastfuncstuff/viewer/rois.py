@@ -38,6 +38,13 @@ from fastfuncstuff.io.labels import LabelEntry
 #: 1000, so the line sits just above the biggest atlas anyone actually uses.
 MAX_AUTO_LABELS = 1000
 
+#: Fraction of neighbouring non-zero voxel pairs that must share a value for a
+#: volume to read as labels. Measured on one subject: aparc+aseg 0.90, a binary
+#: mask 1.0, and the anatomies 0.19-0.21 -- including FreeSurfer's 8-bit brain
+#: in float32, 147 whole-number values that passed every other test here and
+#: loaded as an atlas painted in 147 colours.
+MIN_LABEL_FLATNESS = 0.5
+
 #: Golden angle on the hue circle. Successive indices land as far apart as any
 #: sequence can, which matters because adjacent labels in an atlas are usually
 #: adjacent in space too -- a linear hue ramp would make neighbouring parcels
@@ -166,7 +173,29 @@ def looks_like_labels(volume: np.ndarray) -> bool:
         return False
     distinct = np.unique(finite)
     positive = distinct[distinct > 0]
-    return 0 < positive.size <= MAX_AUTO_LABELS
+    if not 0 < positive.size <= MAX_AUTO_LABELS:
+        return False
+    return arr.ndim != 3 or flatness(arr) >= MIN_LABEL_FLATNESS
+
+
+def flatness(volume: np.ndarray) -> float:
+    """How often a non-zero voxel's neighbour holds the same value.
+
+    What separates a parcellation from an integer-valued picture. Counting
+    distinct values cannot: an 8-bit anatomy has fewer than a Schaefer atlas.
+    But labels come in patches, and intensity changes from voxel to voxel.
+    """
+    inside = volume > 0
+    equal = pairs = 0
+    for axis in range(3):
+        a = np.moveaxis(volume, axis, 0)
+        m = np.moveaxis(inside, axis, 0)
+        both = m[1:] & m[:-1]
+        # Masks multiplied, not used to index: fancy indexing copies both
+        # halves of a 7M-voxel volume three times over.
+        pairs += int(np.count_nonzero(both))
+        equal += int(np.count_nonzero(both & (a[1:] == a[:-1])))
+    return equal / pairs if pairs else 1.0
 
 
 def _describe(

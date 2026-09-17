@@ -55,7 +55,21 @@ def test_an_anatomy_does_not_read_as_an_atlas():
     rng = np.random.default_rng(0)
     assert not looks_like_labels(rng.normal(size=(8, 8, 8)))  # continuous
     assert not looks_like_labels(rng.integers(0, 20000, size=(40, 40, 40)))  # too many
-    assert looks_like_labels(rng.integers(0, 12, size=(8, 8, 8)))
+    atlas = np.kron(rng.integers(0, 12, size=(4, 4, 4)), np.ones((3, 3, 3), dtype=int))
+    assert looks_like_labels(atlas)
+
+
+def test_an_eight_bit_anatomy_in_float_does_not_read_as_an_atlas():
+    """FreeSurfer's brain: ~150 whole-number intensities, smooth rather than patched.
+
+    Passed the integer, sign and count tests, and loaded as 150 colours.
+    """
+    z, y, x = np.mgrid[0:24, 0:24, 0:24]
+    brain = 60 + 40 * np.sin(x / 3.0) * np.cos(y / 4.0) + 20 * np.sin(z / 2.5)
+    brain += np.random.default_rng(1).normal(scale=4, size=brain.shape)
+    anat = np.clip(np.round(brain), 1, 158).astype(np.float32)
+    assert 50 < np.unique(anat).size <= 158
+    assert not looks_like_labels(anat)
 
 
 def test_every_roi_gets_its_own_colour():
