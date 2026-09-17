@@ -91,6 +91,23 @@ def layer_from_info(info: DatasetInfo, key: str, path: Path) -> Layer:
     )
 
 
+def _fmt(value: float | None) -> str:
+    return "--" if value is None else f"{value:.4g}"
+
+
+def _brick_name(layer: Layer, index: int) -> str:
+    """``A#0_Coef `` for a labelled sub-brick; nothing for a plain volume."""
+    if 0 <= index < len(layer.labels) and layer.labels[index]:
+        return f"{layer.labels[index]} "
+    return f"#{index} " if layer.n_volumes > 1 and not layer.time_linked else ""
+
+
+def _short(name: str, limit: int = 24) -> str:
+    for ext in (".nii.gz", ".nii.zst", ".nii", ".HEAD"):
+        name = name.removesuffix(ext)
+    return name if len(name) <= limit else "…" + name[-(limit - 1) :]
+
+
 class ViewerSession:
     """Owns the state, the residency store and the bus."""
 
@@ -542,6 +559,44 @@ class ViewerSession:
 
     def mode_series(self, ijk: tuple[int, int, int] | None = None) -> list[Trace]:
         return self.mode.series(ijk or self.state.crosshair)
+
+    # -- overlay readout -------------------------------------------------
+
+    def overlay_readout(self) -> list[str]:
+        """One line per visible overlay: its value(s) under the crosshair, top layer first.
+
+        A stats overlay cut on another sub-brick shows both numbers -- the beta
+        you are colouring by and the t deciding whether it is drawn -- since
+        either alone leaves you asking what the other one is. A region layer
+        names the region. The layer's name leads only when there are several
+        overlays, because with one it is already on screen in the picker.
+        """
+        from fastfuncstuff.viewer.slicing import voxel_value
+
+        st = self.state
+        if st.grid is None:
+            return []
+        overlays = [ly for ly in list(st.layers)[1:] if ly.visible]
+        lines: list[str] = []
+        for layer in reversed(overlays):
+            volume = self.display_volume(layer.key)
+            if volume is None:
+                continue
+            prefix = f"{_short(layer.name)}  " if len(overlays) > 1 else ""
+            if layer.roi:
+                rois = self.roi_set(layer.key)
+                found = rois.at(st.crosshair) if rois is not None else None
+                lines.append(f"{prefix}{found.name if found else '--'}")
+                continue
+            value = voxel_value(volume, st.grid, layer.affine, st.crosshair)
+            parts = [f"{_brick_name(layer, layer.volume_index)}{_fmt(value)}"]
+            if layer.threshold_index is not None and layer.threshold_index != layer.volume_index:
+                stat_vol = self.display_volume(layer.key, index=layer.threshold_index)
+                if stat_vol is not None:
+                    stat = voxel_value(stat_vol, st.grid, layer.affine, st.crosshair)
+                    parts.append(f"{_brick_name(layer, layer.threshold_index)}{_fmt(stat)}")
+            lines.append(prefix + "   ".join(parts))
+        return lines
 
     # -- overlay colour per voxel ---------------------------------------
 

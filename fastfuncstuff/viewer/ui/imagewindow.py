@@ -317,6 +317,7 @@ class ImageWindow(QtWidgets.QWidget):
         self.pane.set_crosshair(row, col)
         self.pane.set_zoomed(not view.is_identity)
         self.pane.set_coverage(self._graph_coverage(vp.plane, row, col))
+        self.pane.set_readout(self.session.overlay_readout())
 
     def _graph_coverage(self, plane: Plane, row: int, col: int) -> list[tuple[int, int, int, int]]:
         """Footprints of the graphs reading this plane, in image indices.

@@ -434,3 +434,73 @@ def test_the_first_line_is_drawn_in_ink(tinted):
     _, g, _ = tinted
     entries = g.entries(g._viewport())
     assert g._colors(entries)[entries[0].ident].name() == QtGui.QColor(theme.palette().text).name()
+
+
+# ---------------------------------------------------------------------------
+# the value under the crosshair, in the corner of the image
+# ---------------------------------------------------------------------------
+
+
+def test_the_readout_names_the_shown_sub_brick_and_its_value(session):
+    from fastfuncstuff.viewer.vocab import SetIJK, SetVolume
+
+    key = _stats(session).key
+    session.do(SetVolume(key, 1))
+    session.do(SetIJK(3, 3, 2))
+    beta = float(_brick(session, 1)[3, 3, 2])
+    assert session.overlay_readout() == [f"A#0_Coef {beta:.4g}"]
+
+
+def test_cutting_on_another_sub_brick_shows_both_numbers(session):
+    from fastfuncstuff.viewer.vocab import SetIJK, SetThresholdFollow, SetVolume
+
+    key = _stats(session).key
+    session.do(SetVolume(key, 1))
+    session.do(SetThresholdFollow(key, "next"))
+    session.do(SetIJK(3, 3, 2))
+    (line,) = session.overlay_readout()
+    t = float(_brick(session, 2)[3, 3, 2])
+    assert line.startswith("A#0_Coef ") and line.endswith(f"A#0_Tstat {t:.4g}")
+
+
+def test_outside_the_overlay_reads_as_a_dash_not_a_zero(session):
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    session.do(SetIJK(0, 0, 0))
+    assert session.overlay_readout()[0].endswith(" 0")  # inside the grid: a real zero
+    session.state.layers.update(
+        _stats(session).key, affine=np.diag([3.0, 3.0, 3.0, 1.0]) @ _shift(100)
+    )
+    session.invalidate()
+    assert session.overlay_readout()[0].endswith("--")
+
+
+def _shift(voxels: int) -> np.ndarray:
+    m = np.eye(4)
+    m[:3, 3] = voxels
+    return m
+
+
+def test_a_hidden_overlay_is_not_read_out(session):
+    from fastfuncstuff.viewer.vocab import SetLayerVisible
+
+    session.do(SetLayerVisible(_stats(session).key, False))
+    assert session.overlay_readout() == []
+
+
+def test_the_image_corner_follows_the_crosshair(win, qapp):
+    from fastfuncstuff.viewer.state import Plane
+    from fastfuncstuff.viewer.vocab import SetIJK
+
+    pane = next(
+        w.pane
+        for w in win.manager.windows.values()
+        if getattr(w, "pane", None) is not None and w.pane.plane is Plane.AXIAL
+    )
+    win.refresh(win.session.do(SetIJK(3, 3, 2)))
+    qapp.processEvents()
+    first = list(pane._readout)
+    win.refresh(win.session.do(SetIJK(4, 5, 2)))
+    qapp.processEvents()
+    assert pane._readout and pane._readout != first
+    assert pane._readout == win.session.overlay_readout()

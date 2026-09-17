@@ -46,6 +46,7 @@ class ImagePane(QtWidgets.QWidget):
         #: in image indices. The crosshair opens up around them.
         self._coverage: list[tuple[int, int, int, int]] = []
         self._labels: tuple[str, str, str, str] | None = None
+        self._readout: list[str] = []
         self._zoomed = False
         # Deliberately tiny. A pane's minimum is a floor under the whole
         # window, and a wall of small images is a real way to look at data.
@@ -87,6 +88,12 @@ class ImagePane(QtWidgets.QWidget):
         """Whether the pane is showing a crop, for the corner readout."""
         if on != self._zoomed:
             self._zoomed = bool(on)
+            self.update()
+
+    def set_readout(self, lines: list[str]) -> None:
+        """The overlay value(s) under the crosshair, drawn in the upper right."""
+        if lines != self._readout:
+            self._readout = list(lines)
             self.update()
 
     def set_crosshair(self, row: int, col: int) -> None:
@@ -185,7 +192,36 @@ class ImagePane(QtWidgets.QWidget):
             p.drawText(r.adjusted(0, 0, -4, 0), flags.AlignRight | flags.AlignVCenter, right)
             p.drawText(r.adjusted(0, 0, 0, -2), flags.AlignBottom | flags.AlignHCenter, bottom)
             p.drawText(r.adjusted(4, 0, 0, 0), flags.AlignLeft | flags.AlignVCenter, left)
+        if self._readout:
+            self._paint_readout(p)
         p.end()
+
+    def _paint_readout(self, p: QtGui.QPainter) -> None:
+        """Values in the corner, on a translucent plate so they read over the brain."""
+        c = theme.palette()
+        font = QtGui.QFont(p.font())
+        font.setFamily(theme.MONO)
+        font.setPointSize(9)
+        p.setFont(font)
+        metrics = QtGui.QFontMetrics(font)
+        pad, line_h = 4, metrics.height()
+        width = max(metrics.horizontalAdvance(line) for line in self._readout) + 2 * pad
+        # Never wider than the pane: a narrow tile keeps the start of each line.
+        width = min(width, self.width() - 8)
+        height = line_h * len(self._readout) + 2 * pad
+        plate = QtCore.QRect(self.width() - width - 4, 4, width, height)
+        ground = QtGui.QColor(c.bg)
+        ground.setAlphaF(0.72)
+        p.fillRect(plate, ground)
+        p.setPen(QtGui.QColor(c.text))
+        for n, line in enumerate(self._readout):
+            row = QtCore.QRect(
+                plate.x() + pad, plate.y() + pad + n * line_h, width - 2 * pad, line_h
+            )
+            text = metrics.elidedText(line, QtCore.Qt.TextElideMode.ElideRight, row.width())
+            p.drawText(
+                row, QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, text
+            )
 
     def _paint_crosshair(self, p: QtGui.QPainter, rect: QtCore.QRect) -> None:
         assert self._cross is not None and self._image is not None
