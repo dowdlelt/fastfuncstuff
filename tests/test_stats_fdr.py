@@ -121,6 +121,19 @@ class TestPValueToStat:
                 value = pvalue_to_stat(p, code, dof)
                 assert stat_value_to_pvalue(value, code, dof) == pytest.approx(p, rel=1e-5)
 
+    def test_a_large_statistic_keeps_a_nonzero_p(self):
+        """The tensor path floors at 0 near t = 15; the readout must not."""
+        from fastfuncstuff.stats.fdr import pvalue_to_stat, stat_value_to_pvalue
+
+        for code, dof, value in (
+            ("fitt", 2680.0, 30.0),
+            ("fift", (14.0, 2680.0), 50.0),
+            ("fizt", None, 20.0),
+        ):
+            p = stat_value_to_pvalue(value, code, dof)
+            assert 0.0 < p < 1e-30
+            assert pvalue_to_stat(p, code, dof) == pytest.approx(value, rel=1e-6)
+
     def test_the_t_threshold_matches_afni(self):
         """t(120) at two-sided p = 0.001 is 3.3735 in AFNI's own readout."""
         from fastfuncstuff.stats.fdr import pvalue_to_stat

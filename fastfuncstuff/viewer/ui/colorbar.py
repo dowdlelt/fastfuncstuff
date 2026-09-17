@@ -15,6 +15,8 @@ still drawn, just faintly.
 
 from __future__ import annotations
 
+import re
+
 import torch
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -127,6 +129,53 @@ class ColorBar(QtWidgets.QWidget):
         self.clicked.emit(self._hi - frac * (self._hi - self._lo))
 
 
+class PValueSpin(QtWidgets.QDoubleSpinBox):
+    """A p box that shows 3e-12 as 3e-12.
+
+    Fixed decimals either cap the smallest p that can be typed or show a
+    strong effect as 0.000000. Formatting with ``g`` keeps 0.001 as 0.001 and
+    switches to scientific notation below it.
+    """
+
+    def __init__(self, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        # Qt rounds the stored value to `decimals`, so this has to reach the
+        # smallest double for a 1e-300 to survive at all.
+        self.setDecimals(323)
+        self.setRange(1e-300, 0.999999)
+
+    def textFromValue(self, value: float) -> str:  # noqa: N802 (Qt)
+        return f"{value:.3g}"
+
+    def valueFromText(self, text: str) -> float:  # noqa: N802 (Qt)
+        try:
+            return float(text)
+        except ValueError:
+            return self.value()
+
+    def validate(self, text: str, pos: int) -> object:
+        # Anything a float could become while being typed: "1e", "1e-", "0.".
+        if re.fullmatch(r"[0-9]*\.?[0-9]*([eE][-+]?[0-9]*)?", text.strip()):
+            return (
+                (QtGui.QValidator.State.Intermediate, text, pos)
+                if not _parses(text)
+                else (
+                    QtGui.QValidator.State.Acceptable,
+                    text,
+                    pos,
+                )
+            )
+        return (QtGui.QValidator.State.Invalid, text, pos)
+
+
+def _parses(text: str) -> bool:
+    try:
+        value = float(text)
+    except ValueError:
+        return False
+    return 0.0 < value < 1.0
+
+
 class RangeBar(QtWidgets.QWidget):
     """Colour bar with its range beside it and the threshold below it.
 
@@ -220,9 +269,7 @@ class RangeBar(QtWidgets.QWidget):
         self.stat_label.setToolTip("The test this sub-brick carries, from BRICK_STATAUX")
         self.stat_label.setWordWrap(True)
         self.stat_label.setStyleSheet(f"font-size: {theme.FONT_SMALL}px;")
-        self.p_spin = QtWidgets.QDoubleSpinBox()
-        self.p_spin.setDecimals(6)
-        self.p_spin.setRange(1e-6, 0.999999)
+        self.p_spin = PValueSpin()
         self.p_spin.setValue(0.001)
         self.p_spin.setKeyboardTracking(False)
         self.p_spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.ButtonSymbols.NoButtons)

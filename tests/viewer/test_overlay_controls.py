@@ -295,3 +295,42 @@ def test_mirror_fades_min_and_tracks_max(win, qapp):
     layer = win.session.state.layers.overlay
     assert (layer.range_lo, layer.range_hi) == (-3.5, 3.5)
     assert win.min_spin.value() == -3.5
+
+
+def test_a_tiny_p_reads_and_types_in_scientific_notation(qapp, tmp_path):
+    """Fixed decimals showed a strong effect as 0.000000 and capped what could be typed."""
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.stats.fdr import pvalue_to_stat
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import SetOverlay, SetThreshold, SetUnderlay
+
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    rng = np.random.default_rng(9)
+    save_nifti(rng.random((6, 6, 5)).astype(np.float32) * 100, tmp_path / "anat.nii.gz", affine=aff)
+    save_nifti(
+        (rng.normal(size=(6, 6, 5, 1)) * 10).astype(np.float32),
+        tmp_path / "t.nii.gz",
+        affine=aff,
+        brick_labels=["A#0_Tstat"],
+        brick_stataux={0: (3, (100.0,))},
+    )
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    try:
+        w.refresh(session.do(SetUnderlay(str(tmp_path / "anat.nii.gz"))))
+        w.refresh(session.do(SetOverlay(str(tmp_path / "t.nii.gz"))))
+        key = session.state.layers.overlay.key
+        w.refresh(session.do(SetThreshold(key, 25.0)))
+        qapp.processEvents()
+        p_spin = w.rangebar.p_spin
+        assert "e-" in p_spin.text() and p_spin.value() > 0.0
+
+        p_spin.lineEdit().setText("1e-12")
+        p_spin.interpretText()
+        qapp.processEvents()
+        expected = pvalue_to_stat(1e-12, "fitt", 100.0)
+        assert session.state.layers.overlay.threshold == pytest.approx(expected, rel=1e-6)
+    finally:
+        w.close()
+        session.close()

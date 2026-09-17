@@ -27,7 +27,7 @@ import torch
 # Two-sided z for q: z = qginv(q/2) where qginv = inverse upper-tail Gaussian.
 # Implemented via scipy.stats.norm.isf for the curve build (CPU, 101 points).
 try:
-    from scipy.special import ndtri
+    from scipy.special import betaincinv, ndtr, ndtri
     from scipy.stats import f as _scipy_f
     from scipy.stats import t as _scipy_t
 except ImportError as _err:  # pragma: no cover
@@ -129,7 +129,12 @@ def pvalue_to_stat(
     if code == "fift":
         if not isinstance(dof, tuple) or len(dof) != 2:
             raise ValueError("stat_code='fift' requires dof=(df_num, df_den)")
-        return float(_scipy_f.isf(p, dfn=float(dof[0]), dfd=float(dof[1])))
+        dfn, dfd = float(dof[0]), float(dof[1])
+        # Through the incomplete beta rather than f.isf, which returns inf
+        # below p ~ 1e-100 -- a threshold typed as a small p became infinite.
+        # P(F > f) = I_x(dfd/2, dfn/2) with x = dfd / (dfd + dfn * f).
+        x = float(betaincinv(dfd / 2.0, dfn / 2.0, p))
+        return dfd / dfn * (1.0 / x - 1.0) if x > 0 else float("inf")
     if code == "fizt":
         return float(-ndtri(p / 2.0))
     raise ValueError(f"Unsupported stat_code: {stat_code!r}")
@@ -140,9 +145,28 @@ def stat_value_to_pvalue(
     stat_code: str,
     dof: float | tuple[float, float] | None = None,
 ) -> float:
-    """Scalar convenience over :func:`stat_to_pvalue`, for a readout."""
-    out = stat_to_pvalue(torch.tensor([float(value)], dtype=torch.float32), stat_code, dof)
-    return float(out[0])
+    """One statistic's p, with the same sidedness as :func:`stat_to_pvalue`.
+
+    Through scipy's survival functions rather than the tensor path, the way
+    :func:`pvalue_to_stat` already is. The tensor path is built for maps and
+    returns exactly 0 past t = 15 or so, where the true p is 1e-48; a readout
+    that shows 0 there, and a p box that cannot be typed back into, both come
+    from that floor.
+    """
+    code = stat_code.lower()
+    v = float(value)
+    if code == "fitt":
+        if dof is None:
+            raise ValueError("stat_code='fitt' requires scalar dof")
+        scalar = float(dof[0] if isinstance(dof, tuple) else dof)
+        return float(min(1.0, 2.0 * _scipy_t.sf(abs(v), df=scalar)))
+    if code == "fift":
+        if not isinstance(dof, tuple) or len(dof) != 2:
+            raise ValueError("stat_code='fift' requires dof=(df_num, df_den)")
+        return float(_scipy_f.sf(v, dfn=float(dof[0]), dfd=float(dof[1])))
+    if code == "fizt":
+        return float(min(1.0, 2.0 * ndtr(-abs(v))))
+    raise ValueError(f"Unsupported stat_code: {stat_code!r}")
 
 
 # ---------------------------------------------------------------------------
