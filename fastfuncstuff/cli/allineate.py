@@ -22,6 +22,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
@@ -141,7 +142,13 @@ def _apply_followers(
             warped = torch.stack(
                 [
                     _resample(follower[t], fm, out_shape, args.final_interp, args.no_neg)
-                    for t in range(follower.shape[0])
+                    for t in tqdm(
+                        range(follower.shape[0]),
+                        desc=f"  Resampling {Path(path).name}",
+                        unit="vol",
+                        leave=True,
+                        disable=verb < 1 or follower.shape[0] < 4,
+                    )
                 ]
             )
         else:
@@ -779,10 +786,17 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if source_4d is None:
             warped = _resample(source, om, out_shape, args.final_interp, args.no_neg)
         else:
-            if verb >= 1:
-                print(f"  Volumes: {source_4d.shape[0]}")
             warped = torch.stack(
-                [_resample(vol, om, out_shape, args.final_interp, args.no_neg) for vol in source_4d]
+                [
+                    _resample(vol, om, out_shape, args.final_interp, args.no_neg)
+                    for vol in tqdm(
+                        source_4d,
+                        desc=f"  Resampling {source_4d.shape[0]} volumes",
+                        unit="vol",
+                        leave=True,
+                        disable=verb < 1 or source_4d.shape[0] < 4,
+                    )
+                ]
             )
         if verb >= 1:
             print_cli_section("Outputs")
@@ -970,12 +984,18 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
 
     # --- Apply to all 4D volumes ---
     if source_4d is not None:
-        if verb >= 1:
-            print(f"  Resampling {source_4d.shape[0]} source volumes")
         om = _out_matrix(matrix, base_header["affine"], out_affine, device)
+        # One resample per volume, each a full-grid wsinc5 by default: minutes for a
+        # long run, so it gets a bar rather than a line that sits there.
         aligned_vols = [
             _resample(source_4d[t], om, out_shape, args.final_interp, args.no_neg)
-            for t in range(source_4d.shape[0])
+            for t in tqdm(
+                range(source_4d.shape[0]),
+                desc=f"  Resampling {source_4d.shape[0]} volumes",
+                unit="vol",
+                leave=True,
+                disable=verb < 1 or source_4d.shape[0] < 4,
+            )
         ]
         result_4d = torch.stack(aligned_vols)
         with spinner(f"Writing {Path(args.prefix).name}"):
