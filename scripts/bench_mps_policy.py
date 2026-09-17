@@ -146,11 +146,50 @@ CASES: dict[str, tuple[str, object]] = {
             )
         ),
     ),
+    # Not a torch primitive: fastfuncstuff's own separable gather, which is what
+    # -final wsinc5/cubic runs through. grid_sample (above) is the linear path and
+    # a different verdict entirely, so the two must be measured apart.
+    # Not a torch primitive: fastfuncstuff's own separable gather, which is what
+    # -final wsinc5/cubic runs through. grid_sample (above) is the linear path and
+    # a different verdict entirely, so the two are measured apart. Measured through
+    # apply_affine_wsinc5 rather than the bare gather, because the slab chunking is
+    # part of the op as every caller meets it -- one unchunked shot is 10x worse on
+    # Metal (1.1 s), which would overstate the case for routing it off.
+    "separable_resample": (
+        "wsinc5 affine resample (60,80,80) -> (60,80,80)",
+        lambda d, t: (
+            lambda A=_build((60, 80, 80), d, t), M=_shift_matrix(d, t): _unpoliced_wsinc5_affine()(
+                A, M, (60, 80, 80)
+            )
+        ),
+    ),
     "reduce_ss": (
         "sum-of-squares (50k,1000)",
         lambda d, t: lambda A=_build((50000, 1000), d, t): (A * A).sum(dim=-1),
     ),
 }
+
+
+def _shift_matrix(device, dtype):
+    """A small shift + rotation, so no sample lands on a grid node (AFNI's fast path)."""
+    from fastfuncstuff.processing.affine import params_to_matrix
+
+    p = torch.zeros(12, dtype=torch.float32)
+    p[0], p[3], p[6:9] = 2.3, 4.0, 1.0
+    return params_to_matrix(p).to(device=device, dtype=dtype)
+
+
+def _unpoliced_wsinc5_affine():
+    """``apply_affine_wsinc5`` with the MPS routing switched off.
+
+    This script measures the policy, so it has to reach the op the policy hides:
+    the resampler routes itself to the CPU on MPS, and left alone the MPS column
+    here would be the CPU column measured twice.
+    """
+    from fastfuncstuff.processing import affine, interp
+
+    interp.cpu_if_mps = lambda device, op: device
+    return affine.apply_affine_wsinc5
 
 
 def _warm_metal() -> None:

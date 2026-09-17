@@ -25,6 +25,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
+from fastfuncstuff.utils import cpu_if_mps
+
 try:
     from .interp_triton import separable_resample_3d_triton
 except Exception:  # pragma: no cover - Triton is optional and CUDA-only
@@ -1217,6 +1219,21 @@ def _separable_resample_3d(
         Resampled volume with same shape as coordinate arrays (a leading ``C`` axis
         is prepended when ``source`` is channel-batched).
     """
+    # Metal runs this correctly but loses badly on it (3-19x, see _MPS_CPU_OPS):
+    # it is launch-bound, taking much the same time for 0.1M output voxels as for
+    # 12.6M, where the CPU scales with the work. The round trip is ~1 ms on unified
+    # memory, so routing wins even when the caller wants the result back on MPS.
+    run_on = cpu_if_mps(source.device, "separable_resample")
+    if run_on != source.device:
+        out = _separable_resample_3d(
+            source.to(run_on),
+            x_coords.to(run_on),
+            y_coords.to(run_on),
+            z_coords.to(run_on),
+            kernel_name,
+        )
+        return out.to(source.device)
+
     needs_grad = torch.is_grad_enabled() and (
         source.requires_grad
         or x_coords.requires_grad

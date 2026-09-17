@@ -204,6 +204,14 @@ _MPS_CPU_OPS: dict[str, str] = {
     "pinv": "torch 2.14: (1000,150) 4.4 ms vs 3.0 ms CPU (1.5x slower)",
     "eigh": "torch 2.14: (500,500) 9.0 ms vs 7.9 ms CPU (1.15x slower); the "
     "*batched* case is 3.2x faster on MPS -- use op 'eigh_batched' for that",
+    # The hand-rolled separable gather (wsinc5/cubic/quintic/heptic), not
+    # grid_sample -- which stays on Metal and wins by 4-6x. This one is
+    # launch-bound on Metal: ~105-120 ms whatever the output size, while the CPU
+    # scales with the work and wins everywhere.
+    "separable_resample": "torch 2.14: wsinc5 affine resample to (60,80,80) 580 ms on "
+    "MPS vs 30 ms CPU (19x slower; Metal's best run of several was 105 ms, still 3.3x). "
+    "Metal is launch-bound on it -- at its best it is flat ~110 ms from 0.1M to 12.6M "
+    "output voxels -- while the CPU scales with the work and wins at every size",
 }
 
 # Ops deliberately kept on Metal, recorded so a future reader does not "fix"

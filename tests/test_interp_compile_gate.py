@@ -184,3 +184,21 @@ class TestResamplePlanCache:
 
         assert first == second == third
         assert len(calls) == 2
+
+
+def test_the_resampler_asks_the_mps_policy_where_to_run(monkeypatch):
+    """The routing must live at the call site, not in the caller's head.
+
+    Metal loses this op by 3-19x (utils._MPS_CPU_OPS: separable_resample), and the
+    only thing that keeps it off Metal is this consultation -- which no CPU or CUDA
+    test would notice going missing.
+    """
+    asked: list[tuple[str, str]] = []
+
+    def spy(device, op):
+        asked.append((device.type, op))
+        return device
+
+    monkeypatch.setattr(interp, "cpu_if_mps", spy)
+    _resample()
+    assert ("cpu", "separable_resample") in asked

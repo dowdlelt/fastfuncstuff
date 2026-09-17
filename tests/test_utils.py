@@ -485,6 +485,17 @@ class TestMPSPolicy:
         for op in ("grid_sample", "eigh_batched", "fft", "conv3d", "matmul"):
             assert cpu_if_mps(mps, op).type == "mps", op
 
+    def test_the_two_resamplers_go_opposite_ways(self):
+        """Linear stays on Metal; the separable gather does not.
+
+        Both are "resampling", which is why this pair is worth pinning: Metal's
+        grid_sample wins by 4-6x, while the 11-tap separable kernel behind
+        -final wsinc5/cubic is launch-bound there and loses by 3-19x.
+        """
+        mps = torch.device("mps")
+        assert cpu_if_mps(mps, "grid_sample").type == "mps"
+        assert cpu_if_mps(mps, "separable_resample").type == "cpu"
+
     def test_unknown_op_raises_rather_than_defaulting_to_metal(self):
         """A typo must not silently leave work on a backend we never measured."""
         with pytest.raises(KeyError, match="unknown op"):
