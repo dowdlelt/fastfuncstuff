@@ -391,3 +391,94 @@ def test_padded_replacement_images_reach_their_padding():
     rec.capture_displacement(yy_shift)  # type: ignore[arg-type]
     first_rows = torch.as_tensor(planes.points[:, 1] < 0.5)
     assert torch.allclose(rec._frames[1].values[0].float()[first_rows], torch.tensor(-7.0))
+
+
+def test_affine_capture_matches_the_tools_own_resampling():
+    """allineate: a (4, 4) on a source that never leaves its own grid."""
+    from fastfuncstuff.processing.affine import apply_affine, params_to_matrix
+
+    base_shape, src_shape = (12, 14, 16), (10, 12, 13)
+    moving = _texture(src_shape)
+    p = torch.zeros(12)
+    p[0:3] = torch.tensor([1.5, -0.5, 0.7])
+    p[3], p[6:9] = 7.0, 1.0
+    matrix = params_to_matrix(p)
+
+    planes = build_slice_planes(base_shape, np.eye(4), "ax,sag,cor")
+    with pytest.raises(ValueError, match="own_grid"):
+        WarpMovieRecorder(moving, planes, every=1, device=CPU)  # still guarded without it
+    rec = WarpMovieRecorder(moving, planes, every=1, own_grid=True, device=CPU)
+    rec.capture_matrix(matrix)
+
+    expected = apply_affine(moving, matrix, base_shape, zero_outside=True).reshape(-1)[
+        planes.flat_indices()
+    ]
+    # Compare where the sample lands a voxel inside the source: at the edge only the
+    # out-of-bounds handling differs (a hard zero against grid_sample's ramp).
+    pts = torch.as_tensor(planes.points).flip(-1)  # (N, 3) x, y, z
+    mapped = pts @ matrix[:3, :3].T + matrix[:3, 3]
+    hi = torch.tensor([src_shape[2] - 2, src_shape[1] - 2, src_shape[0] - 2]).float()
+    inside = ((mapped > 1.0) & (mapped < hi)).all(dim=1)
+    assert inside.any()
+    torch.testing.assert_close(
+        rec._frames[0].values[0].float()[inside], expected[inside], atol=2e-3, rtol=1e-3
+    )
+
+
+def test_edges_can_skip_the_base_row():
+    shape = (8, 8, 8)
+    planes = build_slice_planes(shape, np.eye(4), "ax")
+    img = planes.split(np.full(64, 0.5, np.float32))
+    edge = np.zeros((8, 8), np.float32)
+    edge[4, :] = 1.0
+    frame = compose_frame(
+        [img, img],
+        planes.views,
+        64,
+        [(0.0, 1.0)] * 2,
+        edges=[edge],
+        edge_vmax=1.0,
+        edge_rows=[False, True],
+    )
+    coloured = (frame.astype(int)[..., 0] - frame.astype(int)[..., 2]) > 100
+    assert not coloured[: frame.shape[0] // 2].any()
+    assert coloured[frame.shape[0] // 2 :].any()
+
+
+def test_base_row_adds_a_row_to_the_movie(tmp_path):
+    from PIL import Image
+
+    shape = (10, 12, 12)
+    planes = build_slice_planes(shape, np.eye(4), "ax")
+    rec = WarpMovieRecorder(
+        _texture(shape), planes, every=1, reference=_texture(shape, 9), device=CPU
+    )
+    rec.capture_identity()
+    plain = rec.render(str(tmp_path / "plain"), size=48, fmt="gif", overlay="edges")
+    stacked = rec.render(str(tmp_path / "stacked"), size=48, fmt="gif", overlay="base+edges")
+    assert plain is not None and stacked is not None
+    h_plain = Image.open(plain).size[1]
+    h_stacked = Image.open(stacked).size[1]
+    assert h_stacked - h_plain == 48 + 4  # one more panel row plus the gap
+
+
+def test_display_window_survives_an_empty_opening_frame(monkeypatch):
+    """An affine can start with the source off the grid; that must not set the scale."""
+    import fastfuncstuff.viz.warp_movie as wm
+
+    shape = (10, 12, 12)
+    planes = build_slice_planes(shape, np.eye(4), "ax")
+    rec = WarpMovieRecorder(_texture(shape), planes, every=1, device=CPU)
+    away = torch.eye(4)
+    away[0, 3] = 1000.0
+    rec.capture_matrix(away, label="off the grid")
+    rec.capture_matrix(torch.eye(4), label="home")
+    assert float(rec._frames[0].values.abs().max()) == 0.0
+
+    written: list[np.ndarray] = []
+    monkeypatch.setattr(wm, "write_movie", lambda frames, path, fps, fmt: written.append(frames))
+    rec.render("unused", size=48, fmt="gif")
+    last = written[0][-1]
+    # With a window taken from the empty frame alone the texture clips to solid white.
+    assert (last == 255).mean() < 0.5
+    assert last.std() > 0

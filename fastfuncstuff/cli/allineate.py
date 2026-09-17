@@ -29,11 +29,15 @@ from fastfuncstuff.cli_utils import (
     add_deterministic_arg,
     add_device_arg,
     add_verbose_arg,
+    add_warp_movie_args,
+    build_warp_movie_recorder,
     collect_batch_jobs,
     enable_determinism,
     print_cli_footer,
     print_cli_header,
     print_cli_section,
+    render_warp_movie,
+    resolve_movie_path,
     run_batch_jobs,
     setup_device,
     spinner,
@@ -571,6 +575,10 @@ Examples:
         "can overshoot to a worse optimum)",
     )
 
+    # The affine's opening frames can show nothing at all where the headers put the
+    # source, so the base rides along in its own row unless asked otherwise.
+    add_warp_movie_args(parser, what="alignment", overlay_default="base")
+
     # --- Hardware ---
     hw_group = parser.add_argument_group("Hardware")
     add_device_arg(
@@ -651,6 +659,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         val = getattr(args, name, None)
         if val is not None:
             outs.append(val)
+    movie = resolve_movie_path(args)
+    if movie is not None:
+        outs.append(movie)
     return outs
 
 
@@ -755,6 +766,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         if verb >= 1:
             print_cli_section("Applying existing transform")
             print(f"  Matrix: {matrix_path}")
+        if args.movie is not None and verb >= 1:
+            print("  WARNING: -movie records a search; ignored with -1Dmatrix_apply")
 
         matrix = load_matrix_1D(
             matrix_path,
@@ -898,6 +911,12 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         print(f"  Device: {device}")
         print_cli_section("Estimating transform")
     # --- Run alignment ---
+    # The movie's row is the NATIVE source (own_grid): every frame maps the base's
+    # display planes through the transform of the moment, so the last frame is the
+    # output itself rather than a re-warp of some intermediate copy.
+    recorder = build_warp_movie_recorder(
+        args, base, source, base_header["affine"], device, "allineate", own_grid=True
+    )
     t1 = time.time()
     matrix, warped = allineate(
         base,
@@ -909,6 +928,7 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
         save_cmass_path=args.save_cmass,
         save_weight_path=args.save_weight,
         save_cost_trace_path=args.save_cost_trace,
+        movie_recorder=recorder,
     )
 
     # --- Save outputs ---
@@ -972,6 +992,8 @@ def _dispatch_run(args: argparse.Namespace, device: torch.device) -> None:
                 print(f"  Mean: {mean_path}")
     elif args.save_mean and verb >= 1:
         print("  Mean: skipped (source is 3D)")
+
+    render_warp_movie(recorder, args, verb)
 
     if verb >= 1:
         print(f"  Alignment: {time.time() - t1:.2f}s")

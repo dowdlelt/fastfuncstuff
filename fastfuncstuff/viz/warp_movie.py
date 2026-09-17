@@ -20,6 +20,11 @@ says so once: a padding offset (qwarp works on a padded grid), and how a coarse 
 was made from the full grid (an align-corners resize, an align-centres resize, or a
 stride). A capture then accepts fields on any level of that pyramid.
 
+An affine tool (allineate) has no field at all: its transform is a (4, 4) matrix, and
+its moving image usually lives on its own grid rather than the base's. Both are the same
+machinery -- a chain element may be a matrix instead of a field, and ``own_grid`` says
+the moving images are reached only through one.
+
 Calling convention for a tool::
 
     if recorder is not None and recorder.tick():
@@ -48,7 +53,14 @@ Field = tuple[Tensor, Tensor, Tensor]
 (k, j, i) samples the source at (i + xd, j + yd, k + zd) -- the convention of
 :func:`fastfuncstuff.processing.interp.warp_image_linear`."""
 
+Transform = Field | Tensor
+"""One step of a chain: a displacement :data:`Field`, or a (4, 4) affine mapping
+planes-grid voxel ``(x, y, z, 1)`` to the moving image's voxel ``(x, y, z)`` -- the
+convention of :func:`fastfuncstuff.processing.affine.apply_affine`."""
+
 _PYRAMID_MAPPINGS = ("corners", "centres", "stride")
+OVERLAYS = ("none", "edges", "base", "base+edges")
+"""How :meth:`WarpMovieRecorder.render` shows the reference image."""
 
 
 @dataclass(frozen=True)
@@ -98,15 +110,21 @@ class WarpMovieRecorder:
 
     Args:
         moving: (nz, ny, nx) image being warped, or a sequence of them -- one movie row
-            each (blipflip's blip-up and blip-down) -- all on the planes' grid.
+            each (blipflip's blip-up and blip-down) -- all on one grid, the planes'
+            unless ``own_grid``.
         planes: Display planes, from :func:`fastfuncstuff.viz.slices.build_slice_planes`.
         every: Fixed capture cadence in :meth:`tick` calls. Mutually exclusive with
             ``max_frames``.
         max_frames: Frame budget for unpinned frames (see module docstring).
-        reference: Optional (nz, ny, nx) fixed image (the base) on the same grid. Its
-            planes are kept so ``render(overlay="edges")`` can outline it.
+        reference: Optional (nz, ny, nx) fixed image (the base) on the planes' grid. Its
+            planes are kept so ``render`` can outline it (``overlay="edges"``) or show it
+            in its own row (``overlay="base"``).
         tool: Name shown at the start of every caption.
         row_labels: Optional name per row, drawn on the row.
+        own_grid: The moving images live on their own grid, not the planes' -- an affine
+            tool's native source, reached only through the matrix each chain carries. Their
+            shape is then not checked against the planes, and :meth:`capture_identity`
+            (which samples at the plane pixels themselves) is not available.
         device: Where sampling happens. Defaults to the first image's device.
     """
 
@@ -120,6 +138,7 @@ class WarpMovieRecorder:
         reference: Tensor | None = None,
         tool: str = "",
         row_labels: Sequence[str] | None = None,
+        own_grid: bool = False,
         device: torch.device | None = None,
     ) -> None:
         images = [moving] if isinstance(moving, Tensor) else list(moving)
@@ -129,11 +148,13 @@ class WarpMovieRecorder:
             raise ValueError("every must be >= 1")
         if every is None and (max_frames is None or max_frames < 2):
             raise ValueError("max_frames must be >= 2 when no fixed cadence is given")
-        for img in images:
-            if tuple(img.shape) != planes.grid_shape:
-                raise ValueError(
-                    f"moving {tuple(img.shape)} is not on the planes' grid {planes.grid_shape}"
-                )
+        if any(tuple(img.shape) != tuple(images[0].shape) for img in images):
+            raise ValueError("every moving image must share one grid")
+        if not own_grid and tuple(images[0].shape) != planes.grid_shape:
+            raise ValueError(
+                f"moving {tuple(images[0].shape)} is not on the planes' grid "
+                f"{planes.grid_shape} (pass own_grid=True for an image reached by a matrix)"
+            )
         if row_labels is not None and len(row_labels) != len(images):
             raise ValueError("need one row label per moving image")
         self.device = device if device is not None else images[0].device
@@ -141,6 +162,7 @@ class WarpMovieRecorder:
         self.tool = tool
         self.row_labels = list(row_labels) if row_labels is not None else None
         self.frame = FieldFrame()
+        self.own_grid = own_grid
         self.context = ""
         self._max_frames = None if every is not None else max_frames
         self._stride = every or 1
@@ -150,9 +172,8 @@ class WarpMovieRecorder:
         self._moving = [img.detach().float().to(self.device)[None, None] for img in images]
         self._points = torch.as_tensor(planes.points, device=self.device)
         self._flat = torch.as_tensor(planes.flat_indices(), device=self.device)
-        nz, ny, nx = planes.grid_shape
         self._denom = torch.tensor(
-            [max(nz - 1, 1), max(ny - 1, 1), max(nx - 1, 1)], device=self.device
+            [max(n - 1, 1) for n in images[0].shape], device=self.device
         ).float()
         self._image_offset = torch.zeros(3, device=self.device)
         self._reference = None
@@ -226,10 +247,24 @@ class WarpMovieRecorder:
             (sampled[2] * scales[0], sampled[1] * scales[1], sampled[0] * scales[2]), dim=1
         )
 
-    def _follow(self, chain: Sequence[Field], x: Tensor) -> Tensor:
-        """Push planes-grid points through ``chain`` in order: x <- x + u(x) per field."""
-        for field in chain:
-            x = x + self._sample_field(field, x)
+    def _apply_matrix(self, matrix: Tensor, x: Tensor) -> Tensor:
+        """Map planes-grid points (z, y, x) through a (4, 4) affine written in (x, y, z)."""
+        m = matrix.to(device=x.device, dtype=x.dtype)
+        return (x.flip(-1) @ m[:3, :3].T + m[:3, 3]).flip(-1)
+
+    def _follow(self, chain: Sequence[Transform], x: Tensor) -> Tensor:
+        """Push planes-grid points through ``chain`` in order.
+
+        A field moves the point by its displacement there (x <- x + u(x)); a (4, 4) matrix
+        maps it outright (x <- M x), which is also how it leaves the planes' grid for an
+        affine tool's own source grid.
+        """
+        for step in chain:
+            x = (
+                self._apply_matrix(step, x)
+                if isinstance(step, Tensor)
+                else x + self._sample_field(step, x)
+            )
         return x
 
     def _sample_moving(self, row: int, x: Tensor) -> Tensor:
@@ -255,7 +290,7 @@ class WarpMovieRecorder:
 
     def capture(
         self,
-        chains: Sequence[Sequence[Field]],
+        chains: Sequence[Sequence[Transform]],
         label: str = "",
         pinned: bool = False,
         modulate: bool = False,
@@ -263,9 +298,10 @@ class WarpMovieRecorder:
         """Capture every row through its own chain of fields.
 
         Args:
-            chains: One sequence of fields per row, applied in order (a composition:
-                the point moves by the first field, then by the second at the moved
-                point). Fields may sit on any level of the grid :attr:`frame` describes.
+            chains: One sequence of transforms per row, applied in order (a composition:
+                the point moves by the first, then by the second at the moved point).
+                Fields may sit on any level of the grid :attr:`frame` describes; a (4, 4)
+                affine maps the point directly (see :data:`Transform`).
             label: Caption for the frame (after :attr:`context`).
             pinned: Never dropped by the frame budget, and held on screen.
             modulate: Scale intensity by the Jacobian determinant of the chain, as a
@@ -288,8 +324,14 @@ class WarpMovieRecorder:
         """Single-row shorthand: the source seen through one displacement field."""
         self.capture([[field]], label, pinned)
 
+    def capture_matrix(self, matrix: Tensor, label: str = "", pinned: bool = False) -> None:
+        """Single-row shorthand: the source seen through one (4, 4) affine."""
+        self.capture([[matrix]], label, pinned)
+
     def capture_identity(self, label: str = "", pinned: bool = True) -> None:
         """Capture every row unwarped (a movie's starting frame)."""
+        if self.own_grid:
+            raise ValueError("capture_identity needs the moving images on the planes' grid")
         with torch.no_grad():
             values = torch.stack([self._sample_moving(r, self._points) for r in range(self.n_rows)])
         text = f"{self.context}  {label}".strip() if self.context else label
@@ -338,45 +380,73 @@ class WarpMovieRecorder:
             fmt: ``mp4`` or ``gif``.
             hold: Seconds each pinned frame (a level's result) stays on screen; the
                 final frame is held at least a second.
-            overlay: ``none`` or ``edges`` -- thin edges of ``reference``, found in each
-                displayed plane at display resolution (see :func:`.compose.display_edges`).
+            overlay: How the reference (base) is shown. ``none``; ``edges`` -- its thin
+                edges over every moving row, found in each displayed plane at display
+                resolution (see :func:`.compose.display_edges`); ``base`` -- the base
+                itself as a still row above the moving rows, for a pair whose edges say
+                little (an affine start where the source is barely in the field of view);
+                or ``base+edges`` for both.
             edge_opacity: 0..1 blend of the edge colour.
         """
         if not self._frames:
             return None
-        if overlay not in ("none", "edges"):
-            raise ValueError(f"unknown overlay {overlay!r}")
-        if overlay == "edges" and self._reference is None:
-            raise ValueError("overlay='edges' needs a reference image passed to the recorder")
+        if overlay not in OVERLAYS:
+            raise ValueError(f"unknown overlay {overlay!r}; choose from {', '.join(OVERLAYS)}")
+        show_base = overlay in ("base", "base+edges")
+        draw_edges = overlay in ("edges", "base+edges")
+        if (show_base or draw_edges) and self._reference is None:
+            raise ValueError(f"overlay={overlay!r} needs a reference image passed to the recorder")
 
         values = torch.stack([f.values for f in self._frames]).float().cpu().numpy()
         views = self.planes.views
-        windows = [intensity_window(values[0, r]) for r in range(self.n_rows)]
+        # One window per row for the whole movie, so brightness cannot flicker between
+        # frames. Taken from the first and last frames together: an affine's opening
+        # frame can leave the source entirely outside the base's field of view, and an
+        # all-zero frame alone would set the scale for every frame after it.
+        windows = [
+            intensity_window(np.concatenate((values[0, r], values[-1, r])))
+            for r in range(self.n_rows)
+        ]
         edge_panels: Sequence[np.ndarray] | None = None
         edge_vmax = 1.0
-        if overlay == "edges" and self._reference is not None:
+        if draw_edges and self._reference is not None:
             sizes = panel_sizes(views, size)
             edge_panels = [
                 display_edges(plane, hw)
                 for plane, hw in zip(self.planes.split(self._reference), sizes, strict=True)
             ]
             edge_vmax = edge_range(np.concatenate([e.ravel() for e in edge_panels]))
+        base_panels = base_window = None
+        edge_rows = None
+        if show_base and self._reference is not None:
+            base_panels = self.planes.split(self._reference)
+            base_window = intensity_window(self._reference)
+            # The base row is the outline's source, so drawing the outline on it says nothing
+            # and hides the anatomy the moving rows are being judged against.
+            edge_rows = [False] + [True] * self.n_rows
 
         n = len(self._frames)
         hold_n = max(1, int(round(hold * fps)))
         out: list[np.ndarray] = []
         for i, (f, frame_values) in enumerate(zip(self._frames, values, strict=True)):
             label = f"{self.tool}  {f.label}".strip() if self.tool else f.label
+            rows = [self.planes.split(row) for row in frame_values]
+            row_windows, row_labels = windows, self.row_labels
+            if base_panels is not None and base_window is not None:
+                rows = [base_panels, *rows]
+                row_windows = [base_window, *windows]
+                row_labels = ["base", *(self.row_labels or [""] * self.n_rows)]
             frame = compose_frame(
-                [self.planes.split(row) for row in frame_values],
+                rows,
                 views,
                 size,
-                windows,
+                row_windows,
                 edges=edge_panels,
                 edge_vmax=edge_vmax,
                 edge_opacity=edge_opacity,
+                edge_rows=edge_rows,
                 label=label,
-                row_labels=self.row_labels,
+                row_labels=row_labels,
                 progress=i / max(n - 1, 1),
             )
             repeats = hold_n if f.pinned else 1

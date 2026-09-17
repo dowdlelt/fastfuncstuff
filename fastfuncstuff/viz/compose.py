@@ -138,6 +138,7 @@ def compose_frame(
     edges: Sequence[np.ndarray] | None = None,
     edge_vmax: float = 1.0,
     edge_opacity: float = 1.0,
+    edge_rows: Sequence[bool] | None = None,
     label: str = "",
     row_labels: Sequence[str] | None = None,
     progress: float | None = None,
@@ -154,6 +155,8 @@ def compose_frame(
             resolution (:func:`display_edges`) or at plane resolution (upscaled nearest).
         edge_vmax: Strength at which edge colour saturates (see :func:`edge_range`).
         edge_opacity: 0..1 blend of the edge colour over the greyscale.
+        edge_rows: Per row, whether the edges are drawn over it (default: every row). A
+            movie that shows the base in its own row does not outline that row.
         label: Caption text.
         row_labels: Optional name drawn at the start of each row.
         progress: Optional 0..1 fraction drawn as a thin bar under the caption.
@@ -176,7 +179,7 @@ def compose_frame(
             grey = np.clip((np.nan_to_num(img) - lo) / (hi - lo), 0.0, 1.0)
             rgb = np.repeat(_resize((grey * 255).astype(np.uint8), (h, w), True)[..., None], 3, -1)
             rgb = rgb.astype(np.float32) / 255.0
-            if edges is not None:
+            if edges is not None and (edge_rows is None or edge_rows[r]):
                 # Nearest-neighbour: blurring a one-pixel ridge smears it back into a band.
                 colour, on = colorize_edges(_resize(edges[i], (h, w), False), edge_vmax)
                 rgb[on] = rgb[on] * (1 - edge_opacity) + colour[on] * edge_opacity

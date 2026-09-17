@@ -1761,3 +1761,130 @@ class TestCostTrace:
         assert rows.shape == (8, len(_COST_TRACE_COLUMNS))
         np.testing.assert_array_equal(rows[:, 0], 0)  # stage column
         np.testing.assert_array_equal(rows[:, 1], np.arange(8))  # step column
+
+
+class TestMovie:
+    """The -movie recorder's view of the search (see viz/warp_movie.py)."""
+
+    @staticmethod
+    def _pair():
+        base = _sphere_volume((18, 20, 20), center=(10, 10, 9), radius=6)
+        source = _sphere_volume((18, 20, 20), center=(8, 11, 10), radius=6)
+        return base, source
+
+    @staticmethod
+    def _recorder(base, source, max_frames=20):
+        from fastfuncstuff.viz.slices import build_slice_planes
+        from fastfuncstuff.viz.warp_movie import WarpMovieRecorder
+
+        planes = build_slice_planes(tuple(base.shape), np.eye(4), "ax,cor")
+        return WarpMovieRecorder(
+            source,
+            planes,
+            max_frames=max_frames,
+            reference=base,
+            tool="allineate",
+            row_labels=["source"],
+            own_grid=True,
+            device=torch.device("cpu"),
+        )
+
+    @staticmethod
+    def _cfg(**kw):
+        return AffineAlignConfig(
+            dof="rigid",
+            cost="lpa",
+            tbest=3,
+            adam_iters_2x=20,
+            adam_iters_1x=20,
+            powell_maxfev=0,
+            final_interp="linear",
+            verb=0,
+            **kw,
+        )
+
+    def test_the_stages_each_leave_their_mark(self):
+        base, source = self._pair()
+        rec = self._recorder(base, source)
+        allineate(base, source, config=self._cfg(), movie_recorder=rec)
+        labels = [f.label for f in rec._frames]
+        pinned = [f.label for f in rec._frames if f.pinned]
+        assert labels[0].startswith("start") and "headers" in labels[0]
+        assert any("cmass shift" in lab for lab in pinned)
+        assert any("candidate 1/" in lab for lab in pinned)
+        assert any(lab.startswith("Full resolution") for lab in labels)
+        assert pinned[-1].startswith("final")
+        # The budget is for the free frames; a stage's result is never dropped.
+        assert sum(not f.pinned for f in rec._frames) <= 20
+
+    def test_the_last_frame_is_the_tools_own_output(self):
+        """The movie ends on the volume ffs_allineate writes, not on an intermediate."""
+        base, source = self._pair()
+        rec = self._recorder(base, source)
+        _, warped = allineate(base, source, config=self._cfg(), movie_recorder=rec)
+        planes = rec.planes
+        expected = warped.reshape(-1)[planes.flat_indices()]
+        final = rec._frames[-1].values[0].float()
+        # float16 storage in the recorder, and the zero margin where the source's own
+        # edge falls outside is handled a half voxel apart from apply_affine's.
+        inner = expected > 0.05
+        torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)
+
+    def test_no_recorder_leaves_the_search_untouched(self):
+        base, source = self._pair()
+        m_plain, _ = allineate(base, source, config=self._cfg())
+        rec = self._recorder(base, source)
+        m_movie, _ = allineate(base, source, config=self._cfg(), movie_recorder=rec)
+        torch.testing.assert_close(m_plain, m_movie, atol=0, rtol=0)
+        assert rec.n_frames > 0
+
+    def test_the_ladders_two_rungs_share_one_frame_of_reference(self):
+        """A work-grid fit and the base-grid finish must land in the same picture.
+
+        The residual the refiners hand over lives on whichever grid prepared it, so
+        the movie's map has to change with the rung. If it does not, the final frame
+        stops matching the output -- which is exactly what this asserts.
+        """
+        # Big enough that the 4 mm work grid is not rejected as degenerate.
+        base = _sphere_volume((36, 40, 40), center=(20, 20, 18), radius=12)
+        source = _sphere_volume((36, 40, 40), center=(17, 22, 20), radius=12)
+        base_header = {"affine": np.diag([2.0, 2.0, 2.0, 1.0])}
+        source_header = {"affine": np.diag([4.0, 4.0, 4.0, 1.0])}
+        rec = self._recorder(base, source)
+        _, warped = allineate(
+            base,
+            source,
+            config=self._cfg(),
+            base_header=base_header,
+            source_header=source_header,
+            movie_recorder=rec,
+        )
+        assert any(f.label.startswith("base grid") for f in rec._frames)
+        expected = warped.reshape(-1)[rec.planes.flat_indices()]
+        final = rec._frames[-1].values[0].float()
+        inner = expected > 0.05
+        torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)
+
+    def test_a_cross_grid_source_is_shown_where_its_header_puts_it(self):
+        """Different grids: the opening frame is the header placement, holes and all."""
+        base = _sphere_volume((18, 20, 20), center=(10, 10, 9), radius=6)
+        source = _sphere_volume((12, 14, 14), center=(6, 7, 6), radius=4)
+        base_header = {"affine": np.diag([2.0, 2.0, 2.0, 1.0])}
+        source_affine = np.diag([3.0, 3.0, 3.0, 1.0])
+        source_affine[:3, 3] = [-6.0, 4.0, 2.0]
+        rec = self._recorder(base, source)
+        _, warped = allineate(
+            base,
+            source,
+            config=self._cfg(),
+            base_header=base_header,
+            source_header={"affine": source_affine},
+            movie_recorder=rec,
+        )
+        # A source that covers part of the base FOV covers part of the frame too.
+        covered = (rec._frames[0].values[0] != 0).float().mean()
+        assert 0.05 < float(covered) < 0.8
+        expected = warped.reshape(-1)[rec.planes.flat_indices()]
+        final = rec._frames[-1].values[0].float()
+        inner = expected > 0.05
+        torch.testing.assert_close(final[inner], expected[inner], atol=2e-3, rtol=2e-3)

@@ -4492,24 +4492,28 @@ def resolve_hrf_library_spec(
     return raw_path, [0.0] * len(durations), True
 
 
-def add_warp_movie_args(parser, overlay: bool = True) -> None:
-    """Register the shared ``-movie*`` flags: a movie of a warp as it is optimized.
+def add_warp_movie_args(
+    parser, overlay: bool = True, what: str = "warp", overlay_default: str = "none"
+) -> None:
+    """Register the shared ``-movie*`` flags: a movie of a fit as it is optimized.
 
     One flag set for every tool that can feed a
     :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder`, so a movie of qwarp and
     one of optiwarp are asked for, and look, the same way. ``overlay=False`` omits
-    ``-movie_overlay`` for tools with no fixed image to outline (blipflip).
+    ``-movie_overlay`` for tools with no fixed image to outline (blipflip); ``what``
+    names what develops, for a tool that fits something other than a warp, and
+    ``overlay_default`` lets such a tool ask for a different default view of the base.
     """
     from fastfuncstuff.viz.encode import MOVIE_FORMATS
 
-    g = parser.add_argument_group("Warp movie")
+    g = parser.add_argument_group(f"{what.capitalize()} movie")
     g.add_argument(
         "-movie",
         metavar="PREFIX",
         default=None,
-        help="Write a movie of the source as the warp develops: one row of mid-brain "
-        "slices, one frame every few iterations plus each level's result (held on "
-        "screen). Every frame is captioned with its level, iteration and cost. "
+        help=f"Write a movie of the source as the {what} develops: one row of mid-brain "
+        "slices, one frame every few iterations plus each stage's result (held on "
+        "screen). Every frame is captioned with its stage, iteration and cost. "
         "PREFIX gets .mp4 or .gif appended unless it already ends in one.",
     )
     g.add_argument(
@@ -4539,7 +4543,7 @@ def add_warp_movie_args(parser, overlay: bool = True) -> None:
         default=150,
         metavar="N",
         help="Frame budget. Frames stay evenly spaced in iterations however early the "
-        "levels stop; level results are extra and always kept.",
+        "stages stop; each stage's result is extra and always kept.",
     )
     cadence.add_argument(
         "-movie_every",
@@ -4553,16 +4557,20 @@ def add_warp_movie_args(parser, overlay: bool = True) -> None:
         type=float,
         default=0.5,
         metavar="SEC",
-        help="Seconds each level's result stays on screen.",
+        help="Seconds each stage's result stays on screen.",
     )
     if overlay:
+        from fastfuncstuff.viz.warp_movie import OVERLAYS
+
         g.add_argument(
             "-movie_overlay",
-            choices=("none", "edges"),
-            default="none",
-            help="edges: draw the base's thin edges (red to yellow by strength) over every "
-            "frame, as in AFNI's @SSwarper QC images -- misalignment shows as tissue "
-            "boundaries sliding against a fixed outline.",
+            choices=OVERLAYS,
+            default=overlay_default,
+            help="How the base is shown. edges: its thin edges (red to yellow by strength) "
+            "over every frame, as in AFNI's @SSwarper QC images -- misalignment shows as "
+            "tissue boundaries sliding against a fixed outline. base: the base itself as a "
+            "still row above the moving one, which is what an affine start needs (edges say "
+            "nothing while the source is still off the field of view). base+edges: both.",
         )
     g.add_argument(
         "-movie_slices",
@@ -4593,13 +4601,14 @@ def build_warp_movie_recorder(
     tool: str,
     mask: torch.Tensor | None = None,
     row_labels: Sequence[str] | None = None,
+    own_grid: bool = False,
 ):
     """A :class:`WarpMovieRecorder` from the ``-movie*`` flags, or None if not asked.
 
-    ``base`` and every ``source`` (one movie row each) must share one (nz, ny, nx)
-    grid whose header affine is ``affine``. The base sets the cut positions and, for
-    ``-movie_overlay edges``, supplies the outlines; with no base the first source
-    sets the cuts.
+    ``base`` sets the cut positions, the outlines and the base row; ``affine`` is its
+    header affine. Every ``source`` (one movie row each) is on the base's grid too,
+    unless ``own_grid`` says they stay on their own and every capture carries the matrix
+    that reaches them (allineate). With no base the first source sets the cuts.
     """
     if getattr(args, "movie", None) is None:
         return None
@@ -4609,21 +4618,25 @@ def build_warp_movie_recorder(
     sources = [source] if isinstance(source, torch.Tensor) else list(source)
     anchor = base if base is not None else sources[0]
     grid = tuple(anchor.shape)
+    if own_grid and base is None:
+        raise ValueError("own_grid needs a base to build the display planes on")
     center = args.movie_slices
     if center is None:
         weight = anchor if mask is None else anchor * (mask.to(anchor.device) > 0)
         center = center_of_mass_ras(weight.detach().cpu().numpy(), affine)
     planes = build_slice_planes(grid, affine, args.movie_views, center)  # type: ignore[arg-type]
 
-    overlay = getattr(args, "movie_overlay", "none")
     return WarpMovieRecorder(
         sources,
         planes,
         every=args.movie_every,
         max_frames=None if args.movie_every is not None else args.movie_frames,
-        reference=base if overlay == "edges" else None,
+        # Only the base's plane pixels are kept, so carrying it costs a few hundred
+        # kilobytes and leaves every -movie_overlay choice open at render time.
+        reference=base,
         tool=tool,
         row_labels=row_labels,
+        own_grid=own_grid,
         device=device,
     )
 
@@ -4645,5 +4658,5 @@ def render_warp_movie(recorder, args, verb: int = 1) -> str | None:
             overlay=getattr(args, "movie_overlay", "none"),
         )
     if verb >= 1 and path is not None:
-        print(f"Saved warp movie: {path}")
+        print(f"Saved movie: {path}")
     return path

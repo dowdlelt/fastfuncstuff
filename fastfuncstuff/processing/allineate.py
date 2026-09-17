@@ -18,6 +18,7 @@ from __future__ import annotations
 import math
 import os
 import sys
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -286,6 +287,79 @@ def _recording_cost_trace(enabled: bool):
         yield trace
     finally:
         _cost_trace.reset(token)
+
+
+# ---------------------------------------------------------------------------
+# Movie recording
+# ---------------------------------------------------------------------------
+
+
+class _AffineMovie:
+    """Turns what the search is currently trying into frames of a ``-movie``.
+
+    The recorder (:mod:`fastfuncstuff.viz.warp_movie`) samples the *native* source at
+    the display planes through a base->source matrix, so a frame always shows the
+    source exactly where the output would put it. What the stages hand over instead is
+    a residual parameter vector on whatever grid they were prepared on -- cropped,
+    decimated by the resolution ladder, or the base's own -- so each stage declares its
+    own :meth:`set_map` and the frames stay comparable across the hand-offs.
+
+    Like :class:`_CostTrace`, this rides a ContextVar rather than a parameter threaded
+    through five refiners; the capture sites sit next to the trace's, at the host syncs
+    the refiners already pay for, so a movie costs no extra one.
+    """
+
+    def __init__(self, recorder, device: torch.device) -> None:
+        self.recorder = recorder
+        self.device = device
+        self.prefix = ""
+        self._map: Callable[[Tensor], Tensor] = lambda m: m
+
+    def set_map(self, fn: Callable[[Tensor], Tensor]) -> None:
+        """Declare how a residual matrix of the current stage becomes base->source."""
+        self._map = fn
+
+    def set_prefix(self, text: str) -> None:
+        """Name the pass the stages belong to, so the ladder's two rungs read apart."""
+        self.prefix = text
+        self.stage("")
+
+    def stage(self, label: str) -> None:
+        """Name the phase every later caption belongs to."""
+        self.recorder.set_context(" ".join(t for t in (self.prefix, label) if t))
+
+    def tick(self) -> bool:
+        return bool(self.recorder.tick())
+
+    def capture(self, params, label: str, pinned: bool = False) -> None:
+        """Frame from a (12,) residual parameter vector (tensor or array)."""
+        p = torch.as_tensor(params, dtype=torch.float32, device=self.device)
+        self.capture_residual(params_to_matrix(p), label, pinned)
+
+    def capture_residual(self, residual: Tensor, label: str, pinned: bool = False) -> None:
+        """Frame from a residual (4, 4) on the current stage's grid."""
+        self.capture_matrix(self._map(residual.to(self.device)), label, pinned)
+
+    def capture_matrix(self, matrix: Tensor, label: str, pinned: bool = False) -> None:
+        """Frame from a base-voxel -> source-native-voxel matrix (no mapping applied)."""
+        self.recorder.capture_matrix(matrix, label, pinned)
+
+
+_movie: ContextVar[_AffineMovie | None] = ContextVar("_ffs_allineate_movie", default=None)
+
+
+@contextmanager
+def _recording_movie(recorder, device: torch.device):
+    """Expose a movie recorder to the search for this alignment, if there is one."""
+    if recorder is None:
+        yield None
+        return
+    movie = _AffineMovie(recorder, device)
+    token = _movie.set(movie)
+    try:
+        yield movie
+    finally:
+        _movie.reset(token)
 
 
 # ---------------------------------------------------------------------------
@@ -1153,6 +1227,16 @@ def _coarse_search_joint(
     # busy (launch-bound otherwise). The fine refinement does the heavy lifting.
     nkeep = min(B, config.tbest + 2)
     top = costs.topk(nkeep).indices.tolist()
+    movie = _movie.get()
+    if movie is not None:
+        # The sweep itself is one batched evaluation -- there is no sequence of states
+        # to film -- so the movie shows what it elected out of B seeds, then films the
+        # polish that follows.
+        movie.stage("coarse")
+        movie.capture(
+            seeds[top[0]], f"best of {B} seeds  cost {float(costs[top[0]]):.6f}", pinned=True
+        )
+        movie.stage("coarse polish")
     coarse_cost = _batched_sampled_cost(source_blur, pts_xyz, base_pts, weight_c, blokset_c, ctx_c)
     out_phys, out_costs = _refine_adam_batched(
         [seeds[i].cpu().numpy() for i in top],
@@ -1163,7 +1247,7 @@ def _coarse_search_joint(
         verb=0,
         n_iters=40,
         lr=config.adam_lr_2x,
-        desc="coarse",
+        desc="seeds",
         compile_fwd=config.compile,
     )
     polished = [(float(out_costs[t]), out_phys[t]) for t in range(len(top))]
@@ -1498,6 +1582,12 @@ def _refine_adam_normalized(
             trace = _cost_trace.get()
             if trace is not None:
                 trace.record(it, it + 1, bc, step_costs=[float(cost.detach())])
+            movie = _movie.get()
+            if movie is not None and movie.tick():
+                movie.capture(
+                    _denormalize_t(best_norm.clamp(0.0, 1.0), bmin, span),
+                    f"{desc} it {it}  cost {bc:.6f}",
+                )
             # Guard the first sync: with last_best == -inf the relative threshold
             # is -inf + inf == nan, and `bc > nan` is always False, which would
             # (wrongly) trip the plateau counter from iteration 0.
@@ -1842,6 +1932,13 @@ def _refine_cmaes_batched(
         trace = _cost_trace.get()
         if trace is not None:
             trace.record(gi, n_eval, float(best_c.max()), step_costs=vals, scale=float(sigma.max()))
+        movie = _movie.get()
+        if movie is not None and movie.tick():
+            t_best = int(best_c.argmax())
+            movie.capture(
+                _denormalize_t(best_x[t_best].clamp(0.0, 1.0), bmin, span),
+                f"{desc} gen {gi}  cost {float(best_c[t_best]):.6f}",
+            )
 
         # -inf on the first generation would make the relative threshold nan,
         # and `best > nan` is False, which would start the stall counter at 1.
@@ -2009,6 +2106,13 @@ def _refine_pattern_batched(
         trace = _cost_trace.get()
         if trace is not None:
             trace.record(_it, n_eval, float(best_c.max()), step_costs=vals, scale=float(h.max()))
+        movie = _movie.get()
+        if movie is not None and movie.tick():
+            t_best = int(best_c.argmax())
+            movie.capture(
+                _denormalize_t(best_x[t_best].clamp(0.0, 1.0), bmin, span),
+                f"{desc} step {_it}  cost {float(best_c[t_best]):.6f}",
+            )
 
         alive = alive & (h > h_min) & (stalled < patience)
         if not bool(alive.any()):
@@ -2131,6 +2235,13 @@ def _refine_adam_batched(
                 # host, and a per-iteration record would sync every step and
                 # slow down the path it is supposed to be observing.
                 trace.record(it, (it + 1) * T, float(bc.max()), step_costs=cur)
+            movie = _movie.get()
+            if movie is not None and movie.tick():
+                t_best = int(bc.argmax())
+                movie.capture(
+                    _denormalize_t(best_norm[t_best].clamp(0.0, 1.0), bmin, span),
+                    f"{desc} it {it}  cost {float(bc[t_best]):.6f}",
+                )
             if tqdm is not None and verb >= 1:
                 pbar.set_postfix_str(f"best={bc.max():.6f}")
 
@@ -2232,6 +2343,12 @@ def _make_powell_cost(
                 best_seen[0],
                 step_costs=[-val],
             )
+
+        movie = _movie.get()
+        if movie is not None and movie.tick():
+            # The probe itself, not the best so far: a line search is meant to
+            # overshoot, and watching it do so is the point of showing the polish.
+            movie.capture_residual(matrix, f"eval {counter[0] if counter else 0}  cost {-val:.6f}")
 
         return val
 
@@ -2449,14 +2566,19 @@ def _refine_progressive(
             base_s = _separable_smooth_3d(base, sigma_vox)
             source_s = _separable_smooth_3d(source, sigma_vox)
             label = f"Blur σ={sigma_vox:g}vox"
+            # The movie's caption font is a bitmap one -- σ draws as a box.
+            movie_label = f"blur {sigma_vox:g} vox"
         else:
             base_s, source_s = base, source
-            label = "Full resolution"
+            label = movie_label = "Full resolution"
         blokrad_stage = _stage_blokrad(sigma_vox)
 
         trace = _cost_trace.get()
         if trace is not None:
             trace.set_stage(si, label)
+        movie = _movie.get()
+        if movie is not None:
+            movie.stage(movie_label)
 
         if verb >= 1:
             npts = f", {sample.idx_flat.numel()} pts" if use_sample else ""
@@ -2559,6 +2681,8 @@ def _refine_progressive(
                 )
                 refined.append((cost, params_out))
         refined.sort(key=lambda c: -c[0])
+        if movie is not None:
+            movie.capture(refined[0][1], f"best of {len(refined)}  cost {refined[0][0]:.6f}", True)
 
         if dedup_after:
             # Keep the best plus any trial not too close to a better one, so the
@@ -2606,6 +2730,9 @@ def _refine_progressive(
         trace = _cost_trace.get()
         if trace is not None:
             trace.set_stage(len(stages), "Powell polish")
+        movie = _movie.get()
+        if movie is not None:
+            movie.stage("Powell polish")
         if verb >= 1:
             print("  Powell polish (full resolution):")
 
@@ -2629,6 +2756,8 @@ def _refine_progressive(
             desc="Polish",
             cost_fn=polish_cost_fn,
         )
+        if movie is not None:
+            movie.capture(best_params, f"polished  cost {best_cost:.6f}", pinned=True)
 
     return best_params, best_cost
 
@@ -2754,6 +2883,9 @@ class _GridSetup:
     weight: Tensor | None
     weight_opt: Tensor | None
     align_matrix: Tensor
+    cmass_shift: np.ndarray
+    """The (dx, dy, dz) voxel shift baked into ``align_matrix``, for a caller that needs
+    the placement before it (the movie's opening frame) or wants to report it."""
     crop_offset: tuple[int, int, int] | None
     ctx: CostContext
     voxdims: tuple[float, float, float]
@@ -3005,6 +3137,7 @@ def _prepare_grid(
         weight=weight,
         weight_opt=weight_opt,
         align_matrix=align_matrix,
+        cmass_shift=cmass_shift,
         crop_offset=crop_offset,
         ctx=ctx,
         voxdims=voxdims,
@@ -3024,6 +3157,7 @@ def allineate(
     save_cmass_path: str | None = None,
     save_weight_path: str | None = None,
     save_cost_trace_path: str | None = None,
+    movie_recorder=None,
 ) -> tuple[Tensor, Tensor]:
     """GPU-accelerated affine/rigid alignment.
 
@@ -3045,6 +3179,10 @@ def allineate(
         save_cost_trace_path: If set, write the refiners' per-step cost trace
             here as a .1D — see _CostTrace. Diagnostic only; it changes nothing
             about the fit.
+        movie_recorder: Optional
+            :class:`~fastfuncstuff.viz.warp_movie.WarpMovieRecorder` built on the
+            base's grid with the NATIVE source as its row (``own_grid=True``), which
+            records the alignment as it is found — see _AffineMovie.
 
     Returns:
         (matrix, warped):
@@ -3053,12 +3191,40 @@ def allineate(
     """
     if config is None:
         config = AffineAlignConfig()
+    # The recorder is reached through a ContextVar rather than five more parameters,
+    # so it is opened here and the whole alignment runs inside it.
+    with _recording_movie(movie_recorder, _align_device(base, config)):
+        return _align(
+            base,
+            source,
+            config,
+            base_header,
+            source_header,
+            save_automask_path,
+            save_cmass_path,
+            save_weight_path,
+            save_cost_trace_path,
+        )
 
-    if config.device is not None:
-        device = torch.device(config.device)
-    else:
-        device = base.device
 
+def _align_device(base: Tensor, config: AffineAlignConfig) -> torch.device:
+    """Where the alignment runs: ``config.device`` if given, else the base's own."""
+    return torch.device(config.device) if config.device is not None else base.device
+
+
+def _align(
+    base: Tensor,
+    source: Tensor,
+    config: AffineAlignConfig,
+    base_header: dict | None,
+    source_header: dict | None,
+    save_automask_path: str | None,
+    save_cmass_path: str | None,
+    save_weight_path: str | None,
+    save_cost_trace_path: str | None,
+) -> tuple[Tensor, Tensor]:
+    """The alignment itself; :func:`allineate` is its public, movie-wrapped door."""
+    device = _align_device(base, config)
     base = base.to(device)
     source_native = source.to(device)
     verb = config.verb
@@ -3091,10 +3257,71 @@ def allineate(
     init_params = setup.init_params
     cost_name = ctx.name
 
+    # Build final matrix — adjust for crop offset if needed.
+    def _crop_conj(residual: Tensor, offset, forward: bool = True) -> Tensor:
+        """Move a residual between cropped-base and full-base voxel coordinates.
+
+        The residual maps cropped-base voxels → cropped-source voxels. Source was
+        cropped identically, so undo the crop by conjugating with the offset
+        (full_base_voxel = crop_base_voxel + offset → T(+off) @ M @ T(-off)).
+        ``forward=False`` conjugates the other way, which is how a fit from one
+        grid is handed to another grid's (differently cropped) refinement.
+        """
+        if offset is None:
+            return residual
+        x_off, y_off, z_off = offset
+        sign = 1.0 if forward else -1.0
+        T_pos = torch.eye(4, device=device, dtype=torch.float32)
+        T_neg = torch.eye(4, device=device, dtype=torch.float32)
+        T_pos[0, 3], T_pos[1, 3], T_pos[2, 3] = (
+            sign * float(x_off),
+            sign * float(y_off),
+            sign * float(z_off),
+        )
+        T_neg[0, 3], T_neg[1, 3], T_neg[2, 3] = (
+            -sign * float(x_off),
+            -sign * float(y_off),
+            -sign * float(z_off),
+        )
+        return T_pos @ residual @ T_neg
+
+    def _residual_to_final(residual: Tensor, stp: _GridSetup, to_base: Tensor | None) -> Tensor:
+        """Cropped residual on ``stp``'s grid → the caller's base→native pull.
+
+        ``align_matrix`` is the base→source map that already carries the cmass
+        shift the source was resampled through. ``to_base`` (full base voxel →
+        work voxel) undoes a decimated optimisation grid: the source side of the
+        matrix is native voxels either way, so only the base side needs mapping,
+        and right-multiplying does it exactly.
+        """
+        final = stp.align_matrix @ _crop_conj(residual, stp.crop_offset)
+        return final if to_base is None else final @ to_base
+
     # Free source_native from GPU during optimization — it's only needed for the
-    # final resample. Can be large (e.g., 320³ anat = 131 MB).
+    # final resample. Can be large (e.g., 320³ anat = 131 MB). A movie recorder holds
+    # its own device copy, which is what -movie costs.
     if source_native.shape != base.shape:
         source_native = source_native.cpu()
+
+    movie = _movie.get()
+    if movie is not None:
+        movie.set_map(lambda m, stp=setup, tb=full_to_work: _residual_to_final(m, stp, tb))
+        movie.stage("start")
+        # Where the headers alone put the source: often barely inside the base's field
+        # of view, or outside it altogether, which is the thing the cmass shift exists
+        # to fix and the first thing to look at when an alignment fails. Conjugating a
+        # pure translation by the crop offset returns it unchanged, so the un-shifted
+        # placement is exactly the residual that undoes the shift.
+        un_cmass = torch.eye(4, device=device)
+        un_cmass[:3, 3] = -torch.as_tensor(setup.cmass_shift, device=device, dtype=torch.float32)
+        movie.capture_residual(un_cmass, "as the headers place it", pinned=True)
+        if np.any(setup.cmass_shift != 0.0):
+            t = setup.cmass_shift
+            movie.capture_residual(
+                torch.eye(4, device=device),
+                f"cmass shift ({t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}) vox",
+                pinned=True,
+            )
 
     # Stage 2: coarse search to seed the refinement.
     if not config.twopass:
@@ -3169,6 +3396,15 @@ def allineate(
             )
             trial_params_list = [p.cpu().numpy().copy() for p in best_list]
 
+    if movie is not None and config.twopass:
+        movie.stage("coarse")
+        n_trials = len(trial_params_list)
+        for k, p_trial in enumerate(trial_params_list):
+            # The last one is usually the insurance seed (AFNI's pinit): identity
+            # residual, i.e. "trust the cmass shift and no rotation".
+            tag = " (identity)" if np.allclose(p_trial, _identity_physical()) else ""
+            movie.capture(p_trial, f"candidate {k + 1}/{n_trials}{tag}", pinned=True)
+
     # Stage 3: Progressive refinement (Adam GPU + Powell polish)
     if verb >= 1:
         print("Refinement phase:")
@@ -3191,46 +3427,6 @@ def allineate(
         cost_trace.save(save_cost_trace_path)
         if verb >= 1:
             print(f"  Saved cost trace: {save_cost_trace_path} ({len(cost_trace.rows)} steps)")
-
-    # Build final matrix — adjust for crop offset if needed.
-    def _crop_conj(residual: Tensor, offset, forward: bool = True) -> Tensor:
-        """Move a residual between cropped-base and full-base voxel coordinates.
-
-        The residual maps cropped-base voxels → cropped-source voxels. Source was
-        cropped identically, so undo the crop by conjugating with the offset
-        (full_base_voxel = crop_base_voxel + offset → T(+off) @ M @ T(-off)).
-        ``forward=False`` conjugates the other way, which is how a fit from one
-        grid is handed to another grid's (differently cropped) refinement.
-        """
-        if offset is None:
-            return residual
-        x_off, y_off, z_off = offset
-        sign = 1.0 if forward else -1.0
-        T_pos = torch.eye(4, device=device, dtype=torch.float32)
-        T_neg = torch.eye(4, device=device, dtype=torch.float32)
-        T_pos[0, 3], T_pos[1, 3], T_pos[2, 3] = (
-            sign * float(x_off),
-            sign * float(y_off),
-            sign * float(z_off),
-        )
-        T_neg[0, 3], T_neg[1, 3], T_neg[2, 3] = (
-            -sign * float(x_off),
-            -sign * float(y_off),
-            -sign * float(z_off),
-        )
-        return T_pos @ residual @ T_neg
-
-    def _residual_to_final(residual: Tensor, stp: _GridSetup, to_base: Tensor | None) -> Tensor:
-        """Cropped residual on ``stp``'s grid → the caller's base→native pull.
-
-        ``align_matrix`` is the base→source map that already carries the cmass
-        shift the source was resampled through. ``to_base`` (full base voxel →
-        work voxel) undoes a decimated optimisation grid: the source side of the
-        matrix is native voxels either way, so only the base side needs mapping,
-        and right-multiplying does it exactly.
-        """
-        final = stp.align_matrix @ _crop_conj(residual, stp.crop_offset)
-        return final if to_base is None else final @ to_base
 
     best_t = torch.tensor(best_params_phys, dtype=torch.float32, device=device)
     final_matrix = _residual_to_final(params_to_matrix(best_t), setup, full_to_work)
@@ -3257,6 +3453,9 @@ def allineate(
             save_automask_path=save_automask_path,
             save_weight_path=save_weight_path,
         )
+        if movie is not None:
+            movie.set_map(lambda m, stp=setup: _residual_to_final(m, stp, None))
+            movie.set_prefix("base grid")
         residual_f = _crop_conj(
             torch.linalg.inv(setup.align_matrix) @ final_matrix, setup.crop_offset, forward=False
         )
@@ -3286,6 +3485,13 @@ def allineate(
         )
         init_params, full_to_work = setup.init_params, None
         source_native = source_native.to(device)
+
+    if movie is not None:
+        # The matrix the output is resampled with, so this frame IS the saved volume
+        # (up to -final's interpolation) -- the movie ends on what the tool produced.
+        movie.set_prefix("")
+        movie.stage("")
+        movie.capture_matrix(final_matrix, f"final  cost {best_refine_cost:.6f}", pinned=True)
 
     # AFNI-style final-fit parameter report. The final matrix is voxel base->
     # source; convert to AFNI DICOM mm when both affines are known so the numbers
