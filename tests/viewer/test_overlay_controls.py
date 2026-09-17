@@ -334,3 +334,103 @@ def test_a_tiny_p_reads_and_types_in_scientific_notation(qapp, tmp_path):
     finally:
         w.close()
         session.close()
+
+
+# ---------------------------------------------------------------------------
+# a graph coloured by the overlay
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tinted(qapp, tmp_path):
+    """A run under a stats map whose left half survives and right half does not."""
+    from fastfuncstuff.io.afni import save_nifti
+    from fastfuncstuff.viewer.session import ViewerSession
+    from fastfuncstuff.viewer.ui.gridgraph import GraphWindow
+    from fastfuncstuff.viewer.ui.window import ViewerWindow
+    from fastfuncstuff.viewer.vocab import (
+        SetIJK,
+        SetOverlay,
+        SetThreshold,
+        SetUnderlay,
+        SetViewGrid,
+    )
+
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    rng = np.random.default_rng(2)
+    save_nifti(
+        rng.normal(size=(8, 8, 4, 30)).astype(np.float32) + 100,
+        tmp_path / "run.nii.gz",
+        affine=aff,
+        tr=2.0,
+    )
+    stat = np.zeros((8, 8, 4, 2), np.float32)
+    stat[:4, ..., 0] = 0.8  # beta, coloured
+    stat[4:, ..., 0] = -0.8
+    stat[:4, ..., 1] = 9.0  # its t: only the left half passes
+    stat[4:, ..., 1] = -1.0
+    save_nifti(stat, tmp_path / "stats.nii.gz", affine=aff, brick_labels=["A#0_Coef", "A#0_Tstat"])
+
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    w.refresh(session.do(SetUnderlay(str(tmp_path / "run.nii.gz"))))
+    w.refresh(session.do(SetOverlay(str(tmp_path / "stats.nii.gz"))))
+    key = session.state.layers.overlay.key
+    session.store.ensure_ram(session.state.layers.base.key)
+    w.show()
+    qapp.processEvents()
+    w._new_graph()
+    qapp.processEvents()
+    g = next(x for x in w.manager.windows.values() if isinstance(x, GraphWindow))
+    w.refresh(session.do(SetViewGrid(g.vid, 8)))
+    w.refresh(session.do(SetIJK(4, 4, 2)))
+    from fastfuncstuff.viewer.vocab import SetThresholdFollow
+
+    w.refresh(session.do(SetThresholdFollow(key, "next")))
+    w.refresh(session.do(SetThreshold(key, 3.0)))
+    qapp.processEvents()
+    yield w, g, key
+    w.close()
+
+
+def test_a_graph_is_untinted_until_asked(tinted):
+    _, g, _ = tinted
+    assert not g.tint_check.isChecked()
+    assert all(cell.tint is None for cell in g.graph._cells)
+
+
+def test_surviving_cells_take_the_overlay_colour_and_cut_ones_none(tinted, qapp):
+    """Coloured by the beta, cut on the t: the same rule the slices draw by."""
+    w, g, key = tinted
+    g.tint_check.click()
+    qapp.processEvents()
+    g.refresh()
+    assert w.session.state.viewports.find(g.vid).tint
+    left = [c for c in g.graph._cells if c.ijk[0] < 4]
+    right = [c for c in g.graph._cells if c.ijk[0] >= 4]
+    assert left and right
+    assert all(c.tint is not None for c in left)
+    assert all(c.tint is None for c in right)
+    # A positive beta on red-blue is on the red side.
+    r, _, b = left[0].tint
+    assert r > b
+
+
+def test_moving_the_threshold_recolours_the_cells(tinted, qapp):
+    from fastfuncstuff.viewer.vocab import SetThreshold
+
+    w, g, key = tinted
+    g.tint_check.click()
+    w.refresh(w.session.do(SetThreshold(key, 20.0)))
+    qapp.processEvents()
+    assert all(c.tint is None for c in g.graph._cells)
+
+
+def test_the_first_line_is_drawn_in_ink(tinted):
+    from PySide6 import QtGui
+
+    from fastfuncstuff.viewer.ui import theme
+
+    _, g, _ = tinted
+    entries = g.entries(g._viewport())
+    assert g._colors(entries)[entries[0].ident].name() == QtGui.QColor(theme.palette().text).name()

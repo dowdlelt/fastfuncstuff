@@ -232,6 +232,17 @@ class SetViewRegressors(Command):
 
 @command
 @dataclass(frozen=True)
+class SetViewTint(Command):
+    """Colour a graph's cells by the overlay at their voxel."""
+
+    name = "SET_VIEW_TINT"
+    aspects = Aspect.VIEWPORTS | Aspect.GRAPH
+    view: str
+    on: bool
+
+
+@command
+@dataclass(frozen=True)
 class SetViewSharedScale(Command):
     name = "SET_VIEW_SHARED_SCALE"
     aspects = Aspect.VIEWPORTS | Aspect.GRAPH
@@ -951,6 +962,11 @@ def install(
         for p in pins:
             Pin.decode(p)  # a malformed spec fails here, not at paint time
         return _set_view(st, cmd.view, SetViewRegressors.aspects, regressors=pins)
+
+    @bus.handle(SetViewTint.name)
+    def _set_view_tint(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetViewTint)
+        return _set_view(st, cmd.view, SetViewTint.aspects, tint=bool(cmd.on))
 
     @bus.handle(SetViewSharedScale.name)
     def _set_view_shared(cmd: Command, st: ViewerState) -> Aspect:

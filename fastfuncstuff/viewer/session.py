@@ -543,6 +543,74 @@ class ViewerSession:
     def mode_series(self, ijk: tuple[int, int, int] | None = None) -> list[Trace]:
         return self.mode.series(ijk or self.state.crosshair)
 
+    # -- overlay colour per voxel ---------------------------------------
+
+    def overlay_colors(
+        self, cells: list[tuple[int, int, int]]
+    ) -> list[tuple[float, float, float] | None] | None:
+        """The primary overlay's colour at each display voxel, or ``None`` where it is cut.
+
+        Drawn exactly as the slices draw it -- the same LUT, range, sign mode
+        and threshold sub-brick -- so a cell's colour and the voxel under the
+        crosshair cannot disagree. The threshold is applied hard whatever the
+        alpha mode: a cell either shows a surviving voxel or it does not, and a
+        faded wash would be unreadable behind the curves.
+
+        ``None`` for the whole answer when there is no overlay to read.
+        """
+        from fastfuncstuff.viewer.colormap import (
+            apply_colormap,
+            apply_label_colors,
+            threshold_alpha,
+        )
+        from fastfuncstuff.viewer.compose import cached_lut
+
+        st = self.state
+        layer = st.layers.overlay
+        if layer is None or not layer.visible or st.grid is None or not cells:
+            return None
+        volume = self.display_volume(layer.key)
+        if volume is None:
+            return None
+
+        # Display voxels to this layer's voxels: an overlay need not share the
+        # underlay's grid, and the slices resample it for the same reason.
+        ijk = np.asarray(cells, dtype=float)
+        mm = np.c_[ijk, np.ones(len(cells))] @ np.asarray(st.grid.affine, float).T
+        own = np.rint(mm @ np.linalg.inv(np.asarray(layer.affine, float)).T)[:, :3].astype(int)
+        shape = np.asarray(volume.shape[:3])
+        inside = np.all((own >= 0) & (own < shape), axis=1)
+        clipped = np.clip(own, 0, shape - 1)
+        index = torch.as_tensor(clipped.T, device=volume.device)
+        values = volume[index[0], index[1], index[2]].float()
+
+        palette = self.roi_palette(layer.key, values.device) if layer.roi else None
+        if palette is not None:
+            rgb, alpha = apply_label_colors(values, palette)
+        else:
+            stat = values
+            if layer.threshold_index is not None:
+                stat_vol = self.display_volume(layer.key, index=layer.threshold_index)
+                if stat_vol is not None:
+                    stat = stat_vol[index[0], index[1], index[2]].float()
+            lo = layer.range_lo if layer.range_lo is not None else 0.0
+            hi = layer.range_hi if layer.range_hi is not None else 1.0
+            rgb = apply_colormap(
+                values,
+                lut=cached_lut(layer.colormap, values.device),
+                lo=float(lo),
+                hi=float(hi),
+                sign_mode=layer.sign_mode,
+                n_panes=layer.n_panes,
+            )
+            alpha = threshold_alpha(stat, layer.threshold, sign_mode=layer.sign_mode)
+        rgb_np = rgb.float().cpu().numpy()
+        keep = (alpha.float().cpu().numpy() > 0) & inside
+        return [
+            (float(r), float(g), float(b)) if k else None
+            for (r, g, b), k in zip(rgb_np, keep, strict=True)
+        ]
+
     # -- design regressors ----------------------------------------------
     #
     # Voxel-independent lines in a graph: a design column is the same curve in

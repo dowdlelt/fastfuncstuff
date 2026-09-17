@@ -102,6 +102,10 @@ class Viewport:
     #: offered -- an anatomy has no time course to draw.
     traces: tuple[str, ...] = ()
     shared_scale: bool = True
+    #: Wash each cell in the overlay's colour at its voxel when it survives
+    #: the threshold, and grey it when it does not -- the graph then says
+    #: which of the curves are the ones the map is showing.
+    tint: bool = False
     #: Lines a graph window has ticked off, by identity: a layer key, or
     #: ``mode:<trace key>`` for a line a mode adds. The set to *hide* rather
     #: than to show, for the same reason ``traces`` defaults to everything: a

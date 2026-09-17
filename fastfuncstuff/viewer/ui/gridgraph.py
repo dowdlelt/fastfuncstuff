@@ -40,6 +40,7 @@ from fastfuncstuff.viewer.vocab import (
     SetViewHidden,
     SetViewRegressors,
     SetViewSharedScale,
+    SetViewTint,
     SetViewTraces,
 )
 
@@ -54,6 +55,10 @@ DETREND_LABELS: tuple[tuple[int, str], ...] = (
     (3, "cubic"),
     *((n, f"poly {n}") for n in range(4, 10)),
 )
+
+#: Opacity of a surviving cell's overlay colour, and of a cut cell's grey.
+TINT_ALPHA = 0.32
+CUT_ALPHA = 0.30
 
 #: Longest name a legend tick box shows; the full one is its tooltip.
 LEGEND_CHARS = 22
@@ -89,6 +94,9 @@ class Cell:
     #: every other line its own colour instead of shifting them all along.
     traces: list[tuple[str, np.ndarray]]
     is_centre: bool
+    #: The overlay's colour at this voxel when it survives the threshold,
+    #: ``None`` when it does not. Only read while the window is tinting.
+    tint: tuple[float, float, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +204,7 @@ class GridGraph(QtWidgets.QWidget):
         self._n = 1
         self._index = 0
         self._shared_scale = True
+        self._tinting = False
         self._colors: dict[str, QtGui.QColor] = {}
         self._time: set[str] = set()
         self.setMinimumSize(60, 48)
@@ -224,6 +233,10 @@ class GridGraph(QtWidgets.QWidget):
             if values.size and (not self._time or ident in self._time):
                 return values
         return None
+
+    def set_tinting(self, on: bool) -> None:
+        self._tinting = bool(on)
+        self.update()
 
     def set_shared_scale(self, on: bool) -> None:
         self._shared_scale = bool(on)
@@ -318,6 +331,16 @@ class GridGraph(QtWidgets.QWidget):
         shared: dict[str, tuple[float, float]] | None,
     ) -> None:
         c = theme.palette()
+        if self._tinting:
+            # A wash, not a fill: the curves are still what is being read, and
+            # a saturated cell hides a trace drawn in a similar hue.
+            if cell.tint is not None:
+                wash = QtGui.QColor.fromRgbF(*cell.tint)
+                wash.setAlphaF(TINT_ALPHA)
+            else:
+                wash = QtGui.QColor(c.faint)
+                wash.setAlphaF(CUT_ALPHA)
+            p.fillRect(rect, wash)
         border = QtGui.QColor(c.edge_lit) if cell.is_centre else QtGui.QColor(c.edge)
         p.setPen(QtGui.QPen(border))
         p.setBrush(QtCore.Qt.BrushStyle.NoBrush)
@@ -430,6 +453,14 @@ class GraphWindow(QtWidgets.QWidget):
             lambda on: self._dispatch(SetViewSharedScale(self.vid, bool(on)))
         )
         bar.addWidget(self.shared_check)
+
+        self.tint_check = QtWidgets.QCheckBox(theme.key_label("olay colour", "o"))
+        self.tint_check.setToolTip(
+            "Wash each cell in the overlay's colour at its voxel where it survives\n"
+            "the threshold, and grey it where it does not."
+        )
+        self.tint_check.clicked.connect(lambda on: self._dispatch(SetViewTint(self.vid, bool(on))))
+        bar.addWidget(self.tint_check)
         bar.addStretch(1)
         self.info = QtWidgets.QLabel("")
         bar.addWidget(self.info)
@@ -527,6 +558,7 @@ class GraphWindow(QtWidgets.QWidget):
                 ),
                 Binding("-", "fewer voxels", lambda: self.step_grid(-1), group="grid"),
                 Binding("s", "shared scale", self.shared_check.click, group="grid"),
+                Binding("o", "colour cells by the overlay", self.tint_check.click, group="grid"),
                 Binding(
                     "Right",
                     "next volume",
@@ -626,6 +658,8 @@ class GraphWindow(QtWidgets.QWidget):
         self.count_label.setText(f"{viewport.cells:>3d}")
         self.shared_check.setChecked(viewport.shared_scale)
         self.graph.set_shared_scale(viewport.shared_scale)
+        self.tint_check.setChecked(viewport.tint)
+        self.graph.set_tinting(viewport.tint)
         # Blocked, so showing the viewport's value does not read back as a
         # choice and put a SET_VIEW_DETREND into the recording per repaint.
         self.detrend_box.blockSignals(True)
@@ -635,8 +669,15 @@ class GraphWindow(QtWidgets.QWidget):
         self._sync_legend(viewport)
 
     def _colors(self, entries: list[Entry]) -> dict[str, QtGui.QColor]:
-        """A colour per line by its place in the full list, not the drawn one."""
-        series = theme.palette().series
+        """A colour per line by its place in the full list, not the drawn one.
+
+        The first line is drawn in ink -- black on light, white on dark -- so
+        the run you loaded reads as the data and every added line as a
+        comparison against it.
+        """
+        c = theme.palette()
+        ink = QtGui.QColor(c.text)
+        series = ((ink.redF(), ink.greenF(), ink.blueF()), *c.series)
         return {
             e.ident: QtGui.QColor.fromRgbF(*series[i % len(series)]) for i, e in enumerate(entries)
         }
@@ -709,18 +750,27 @@ class GraphWindow(QtWidgets.QWidget):
             self._design_signature = signature
             self._sync_design_menus(vp)
         cells: list[Cell] = []
-        for dr in range(-half, -half + n):
-            for dc in range(-half, -half + n):
-                ijk = st.grid.clamp(
+        positions = [
+            (
+                dr,
+                dc,
+                st.grid.clamp(
                     layout.to_ijk(centre_row + dr, centre_col + dc, st.crosshair, st.grid.shape)
+                ),
+            )
+            for dr in range(-half, -half + n)
+            for dc in range(-half, -half + n)
+        ]
+        tints = self.session.overlay_colors([ijk for _, _, ijk in positions]) if vp.tint else None
+        for position, (dr, dc, ijk) in enumerate(positions):
+            cells.append(
+                Cell(
+                    ijk=ijk,
+                    traces=self._traces(traced, ijk, drawn, vp.detrend, regressors),
+                    is_centre=(dr == 0 and dc == 0),
+                    tint=tints[position] if tints else None,
                 )
-                cells.append(
-                    Cell(
-                        ijk=ijk,
-                        traces=self._traces(traced, ijk, drawn, vp.detrend, regressors),
-                        is_centre=(dr == 0 and dc == 0),
-                    )
-                )
+            )
         self.graph.set_cells(
             cells,
             n,

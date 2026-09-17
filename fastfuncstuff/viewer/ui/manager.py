@@ -159,7 +159,16 @@ class WindowManager(QtCore.QObject):
             | Aspect.LAYERS
             | Aspect.VIEWPORTS
         )
-        graphs = dirty & (Aspect.CROSSHAIR | Aspect.GRAPH | Aspect.TIME | Aspect.LAYERS)
+        # THRESHOLD and COLORMAP too: a graph tinted by the overlay changes
+        # colour when its cut or its scale does.
+        graphs = dirty & (
+            Aspect.CROSSHAIR
+            | Aspect.GRAPH
+            | Aspect.TIME
+            | Aspect.LAYERS
+            | Aspect.THRESHOLD
+            | Aspect.COLORMAP
+        )
         for win in list(self.windows.values()):
             if isinstance(win, ImageWindow):
                 if images:
