@@ -75,3 +75,16 @@ def test_default_grids_present():
     assert len(DEFAULT_ATHR) == 10
     assert DEFAULT_PTHR[0] == 0.10
     assert DEFAULT_ATHR[-1] == 0.01
+
+
+def test_bisided_labels_stay_distinct_past_uint16():
+    """cc3d returns uint16 labels for small counts; offsetting the negative
+    tail used to wrap past 65535 and merge its clusters into positive ones."""
+    stat = np.zeros((80, 80, 44), dtype=np.float32)
+    # Isolated single voxels on a stride-2 lattice: 40*40*22 = 35200 per tail.
+    stat[0::2, 0::2, 0::2] = 5.0
+    stat[1::2, 1::2, 1::2] = -5.0
+    _, _, labels, sizes, _ = _cluster_extent_mass_one(stat, 3.0, "bi-sided", 1)
+    assert len(sizes) == 70400
+    assert int(labels.max()) == 70400
+    assert len(np.unique(labels[labels > 0])) == 70400

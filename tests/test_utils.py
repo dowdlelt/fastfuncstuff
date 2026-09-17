@@ -496,6 +496,18 @@ class TestMPSPolicy:
         assert cpu_if_mps(mps, "grid_sample").type == "mps"
         assert cpu_if_mps(mps, "separable_resample").type == "cpu"
 
+    def test_compositing_leaves_metal_so_two_threads_never_share_it(self):
+        """The viewer repaints while a worker computes; Metal aborts on that.
+
+        Not a speed entry like the rest of the table. Two Python threads inside
+        MPS kill the process outright -- "failed assertion _status <
+        MTLCommandBufferStatusCommitted" -- so the GUI thread has to be kept out
+        of Metal entirely while a mode or a preproc tool holds it.
+        """
+        assert cpu_if_mps(torch.device("mps"), "viewer_compose").type == "cpu"
+        # CUDA serialises concurrent work on its stream, so it keeps the GPU.
+        assert cpu_if_mps(torch.device("cuda:0"), "viewer_compose").type == "cuda"
+
     def test_unknown_op_raises_rather_than_defaulting_to_metal(self):
         """A typo must not silently leave work on a backend we never measured."""
         with pytest.raises(KeyError, match="unknown op"):

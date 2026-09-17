@@ -98,3 +98,83 @@ def test_fdr_addfdr_writer_roundtrip(tmp_path):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-x", "-v"])
+
+
+# ---------------------------------------------------------------------------
+# p <-> stat, as one pair
+# ---------------------------------------------------------------------------
+
+
+class TestPValueToStat:
+    """The inverse of stat_to_pvalue, and it has to agree with it exactly.
+
+    Two sidedness conventions in one viewer is a bug that presents as a
+    rounding error: a threshold typed as p = 0.001 and a threshold reported as
+    p = 0.001 would be different cuts.
+    """
+
+    def test_round_trips_against_its_own_forward(self):
+        from fastfuncstuff.stats.fdr import pvalue_to_stat, stat_value_to_pvalue
+
+        for code, dof in (("fitt", 100.0), ("fizt", None), ("fift", (3.0, 100.0))):
+            for p in (0.05, 0.01, 0.001, 1e-5):
+                value = pvalue_to_stat(p, code, dof)
+                assert stat_value_to_pvalue(value, code, dof) == pytest.approx(p, rel=1e-5)
+
+    def test_a_large_statistic_keeps_a_nonzero_p(self):
+        """The tensor path floors at 0 near t = 15; the readout must not."""
+        from fastfuncstuff.stats.fdr import pvalue_to_stat, stat_value_to_pvalue
+
+        for code, dof, value in (
+            ("fitt", 2680.0, 30.0),
+            ("fift", (14.0, 2680.0), 50.0),
+            ("fizt", None, 20.0),
+        ):
+            p = stat_value_to_pvalue(value, code, dof)
+            assert 0.0 < p < 1e-30
+            assert pvalue_to_stat(p, code, dof) == pytest.approx(value, rel=1e-6)
+
+    def test_the_t_threshold_matches_afni(self):
+        """t(120) at two-sided p = 0.001 is 3.3735 in AFNI's own readout."""
+        from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+        assert pvalue_to_stat(0.001, "fitt", 120.0) == pytest.approx(3.3735, abs=5e-4)
+
+    def test_f_is_upper_tail_not_halved(self):
+        from scipy.stats import f as scipy_f
+
+        from fastfuncstuff.stats.fdr import is_two_sided, pvalue_to_stat
+
+        assert not is_two_sided("fift")
+        assert pvalue_to_stat(0.01, "fift", (3.0, 50.0)) == pytest.approx(
+            scipy_f.isf(0.01, dfn=3.0, dfd=50.0)
+        )
+
+    def test_t_and_z_are_two_tailed(self):
+        from scipy.stats import norm
+
+        from fastfuncstuff.stats.fdr import is_two_sided, pvalue_to_stat
+
+        assert is_two_sided("fitt") and is_two_sided("fizt")
+        assert pvalue_to_stat(0.05, "fizt") == pytest.approx(norm.isf(0.025))
+
+    def test_a_p_outside_the_open_unit_interval_is_refused(self):
+        from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+        for bad in (0.0, 1.0, -0.1, 2.0):
+            with pytest.raises(ValueError, match="p must be"):
+                pvalue_to_stat(bad, "fizt")
+
+    def test_missing_degrees_of_freedom_are_refused(self):
+        from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+        with pytest.raises(ValueError, match="requires scalar dof"):
+            pvalue_to_stat(0.01, "fitt")
+        with pytest.raises(ValueError, match="requires dof"):
+            pvalue_to_stat(0.01, "fift", 50.0)
+
+    def test_an_unknown_code_is_refused(self):
+        from fastfuncstuff.stats.fdr import pvalue_to_stat
+
+        with pytest.raises(ValueError, match="Unsupported stat_code"):
+            pvalue_to_stat(0.01, "fico", 50.0)

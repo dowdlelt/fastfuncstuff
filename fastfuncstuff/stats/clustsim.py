@@ -39,8 +39,10 @@ the tables, not identical numbers.
 
 from __future__ import annotations
 
+import html
 import math
 import os
+import re
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
@@ -807,3 +809,126 @@ def attach_clustsim_tables(
             verbose=verbose,
         )
     return niml_files
+
+
+# ---------------------------------------------------------------------------
+# Reading tables back out of a dataset that carries them
+#
+# 3dClustSim's output is only useful if something reads it. AFNI's Clusterize
+# panel reads the attributes 3drefit wrote; so does this, against the same
+# format write_clustsim_niml produces -- which is the point of matching AFNI's
+# spelling there rather than inventing one.
+# ---------------------------------------------------------------------------
+
+_CS_HEAD_RE = re.compile(
+    r"<3dClustSim_NN[123]\b(?P<attrs>.*?)>(?P<body>.*?)</3dClustSim_NN[123]>", re.S
+)
+_CS_KV_RE = re.compile(r'(\w+)\s*=\s*"([^"]*)"')
+
+SIDED_FROM_ATTR = {v: k for k, v in SIDED_ATTR.items()}
+
+
+@dataclass(frozen=True)
+class ClustSimTable:
+    """One ``3dClustSim`` table: cluster sizes by per-voxel p and corrected alpha."""
+
+    nn: int
+    sidedness: str
+    pthr: tuple[float, ...]
+    athr: tuple[float, ...]
+    #: ``(len(pthr), len(athr))`` minimum cluster size, in voxels.
+    sizes: np.ndarray
+    n_iter: int = 0
+
+    def _row(self, pthr: float) -> np.ndarray:
+        """The size-vs-alpha curve at the nearest tabulated per-voxel p.
+
+        Nearest rather than interpolated between rows: the rows are decades
+        apart (0.01, 0.005, 0.002, …) and a number interpolated across that gap
+        would carry a precision the simulation never had. The caller is told
+        which p was actually used.
+        """
+        return self.sizes[int(np.argmin(np.abs(np.asarray(self.pthr) - float(pthr))))]
+
+    def nearest_pthr(self, pthr: float) -> float:
+        return float(self.pthr[int(np.argmin(np.abs(np.asarray(self.pthr) - float(pthr))))])
+
+    def size_for(self, pthr: float, alpha: float) -> float:
+        """Cluster size that survives at ``alpha``, for a per-voxel ``pthr``."""
+        row = self._row(pthr)
+        athr = np.asarray(self.athr, dtype=float)
+        # The table runs from loose alpha to strict; interp needs ascending x.
+        order = np.argsort(athr)
+        return float(np.interp(float(alpha), athr[order], row[order]))
+
+    def alpha_for(self, pthr: float, size: int) -> float:
+        """Corrected alpha for a cluster of ``size`` voxels.
+
+        Clamped to the table at both ends rather than extrapolated. Past the
+        largest tabulated size the truth is "more significant than the smallest
+        alpha simulated", and past the smallest it is "less significant than
+        the largest" -- both are bounds, and a curve fitted past the last row
+        would turn either into a number that looks like a measurement.
+        :attr:`alpha_range` is what tells a caller which end it landed on.
+        """
+        row = np.asarray(self._row(pthr), dtype=float)
+        athr = np.asarray(self.athr, dtype=float)
+        order = np.argsort(row)  # size ascending <=> alpha descending
+        return float(np.interp(float(size), row[order], athr[order]))
+
+    @property
+    def alpha_range(self) -> tuple[float, float]:
+        """``(strictest, loosest)`` alpha the simulation actually covers."""
+        return (float(min(self.athr)), float(max(self.athr)))
+
+
+def parse_clustsim_niml(text: str) -> ClustSimTable | None:
+    """Parse one ``<3dClustSim_NNn …>`` element. Inverse of the writer above."""
+    m = _CS_HEAD_RE.search(html.unescape(text))
+    if not m:
+        return None
+    attrs = dict(_CS_KV_RE.findall(m.group("attrs")))
+    try:
+        pthr = tuple(float(v) for v in attrs["pthr"].split(","))
+        athr = tuple(float(v) for v in attrs["athr"].split(","))
+    except (KeyError, ValueError):
+        return None
+    rows = [
+        [float(v) for v in line.split()]
+        for line in m.group("body").strip().splitlines()
+        if line.strip()
+    ]
+    sizes = np.asarray(rows, dtype=np.float64)
+    if sizes.shape != (len(pthr), len(athr)):
+        return None
+    nn_match = re.search(r"<3dClustSim_NN([123])", m.group(0))
+    return ClustSimTable(
+        nn=int(nn_match.group(1)) if nn_match else 1,
+        sidedness=attrs.get("thresholding", "bi-sided"),
+        pthr=pthr,
+        athr=athr,
+        sizes=sizes,
+        n_iter=int(float(attrs.get("iter", 0) or 0)),
+    )
+
+
+def read_clustsim_tables(img) -> dict[tuple[int, str], ClustSimTable]:
+    """Every ClustSim table attached to a dataset, keyed ``(nn, sidedness)``.
+
+    Empty when the dataset carries none, which is the common case and is worth
+    saying out loud rather than filling in with a default simulation: a cluster
+    threshold from somebody else's smoothness is worse than no threshold.
+    """
+    from fastfuncstuff.io.headers import _afni_ext_text
+
+    text = _afni_ext_text(img)
+    out: dict[tuple[int, str], ClustSimTable] = {}
+    for m in re.finditer(
+        r'atr_name\s*=\s*"AFNI_CLUSTSIM_NN([123])_(1sided|2sided|bisided)"[^>]*>(.*?)</AFNI_atr>',
+        text,
+        re.S,
+    ):
+        table = parse_clustsim_niml(m.group(3))
+        if table is not None:
+            out[(int(m.group(1)), SIDED_FROM_ATTR[m.group(2)])] = table
+    return out

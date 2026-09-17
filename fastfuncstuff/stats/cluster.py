@@ -144,7 +144,10 @@ def _cluster_extent_mass_one(
             all_masses.append(masses)
             # Splice into combined label map with offset
             mask_nonzero = lab > 0
-            combined_labels[mask_nonzero] = lab[mask_nonzero] + offset
+            # Widened before the offset: cc3d returns uint16 when it can, and
+            # NumPy 2 keeps the narrow type, so past 65535 total the negative
+            # tail's labels wrapped onto the positive tail's.
+            combined_labels[mask_nonzero] = lab[mask_nonzero].astype(np.int32) + offset
             offset += n_lab
         if not all_sizes:
             empty = np.zeros(0, dtype=np.int64)
@@ -560,6 +563,26 @@ def accumulate_cluster_null(
         pool.shutdown(wait=True)
 
     return null
+
+
+def cluster_map(
+    stat3d: np.ndarray,
+    threshold: float,
+    *,
+    sidedness: str = "bi-sided",
+    nn: int = 1,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Label one volume at one threshold: ``(labels, sizes, masses)``.
+
+    The same connected-component pass the permutation null uses, exposed for
+    callers that have a real statistic map and a threshold already chosen --
+    an interactive clusterize, rather than a distribution being accumulated.
+    Labels are 1-based; 0 is everything that did not survive.
+    """
+    _, _, labels, sizes, masses = _cluster_extent_mass_one(
+        np.asarray(stat3d, dtype=np.float32), float(threshold), sidedness, int(nn)
+    )
+    return labels, sizes, masses
 
 
 def compute_observed_cluster_masks(
