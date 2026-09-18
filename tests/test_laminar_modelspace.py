@@ -34,7 +34,7 @@ from fastfuncstuff.laminar.experiment import (
     layer_model_targets,
     posterior_model_probabilities,
 )
-from fastfuncstuff.laminar.inversion import variational_laplace
+from fastfuncstuff.laminar.inversion import variational_laplace, vec
 from fastfuncstuff.laminar.params import P0, ModelSpec
 
 ORACLE = Path(__file__).parent / "laminar_oracle" / "laminar_modelspace_oracle.json"
@@ -297,3 +297,62 @@ def test_model_probabilities_do_not_overflow_on_a_wide_spread():
     f = np.asarray(ordinary)
     naive = np.exp(f - f.min()) / np.exp(f - f.min()).sum()
     assert np.abs(p(ordinary).numpy() - naive).max() < 1e-12
+
+
+# --------------------------------------------------------------------------
+# Lockstep batching
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.slow
+def test_lockstep_is_bit_identical_to_serial():
+    """Sharing the forward call must not perturb a single fit.
+
+    The whole design rests on this: each fit runs its own unchanged Variational
+    Laplace scheme and only the integration is shared, so anything other than an
+    exact match means the coroutine refactor changed the arithmetic.
+    """
+    from fastfuncstuff.laminar.inversion import (
+        variational_laplace,
+        variational_laplace_lockstep,
+    )
+
+    o = _oracle()
+    block = o["per_k"][1]
+    K, ns = int(block["K"]), int(block["ns"])
+    spec = _spec(o, K)
+
+    def t(a):
+        return torch.tensor(np.asarray(a, dtype=float), dtype=torch.float64)
+
+    y = t(block["y"]).reshape(ns, K)
+    u = t(block["u"]).reshape(-1, 2)
+    rows = t(block["mask_rows"]).reshape(-1).to(torch.bool)
+    kernel = t(o["kernel"]).reshape(-1)
+
+    targets = layer_model_targets(3)[:4]  # null and the three singles
+    priors = [faes_priors(spec, tg) for tg in targets]
+
+    serial = [variational_laplace(spec, pr, u, y, rows=rows, kernel=kernel) for pr in priors]
+    lock = variational_laplace_lockstep(
+        spec, priors, u, [y] * len(priors), rows=rows, kernel=kernel
+    )
+
+    assert len(lock) == len(serial)
+    for a, c, tg in zip(serial, lock, targets, strict=True):
+        assert float(a.F) == float(c.F), f"{tg}: F differs"
+        assert a.n_iter == c.n_iter, f"{tg}: iteration count differs"
+        assert torch.equal(vec(a.Ep), vec(c.Ep)), f"{tg}: posterior means differ"
+
+
+def test_lockstep_validates_its_inputs():
+    from fastfuncstuff.laminar.inversion import variational_laplace_lockstep
+
+    spec = ModelSpec(N=3, K=6, n_inputs=2, n_mod=1)
+    pr = faes_priors(spec, (1, 0, 0))
+    y = torch.zeros(10, 6, dtype=torch.float64)
+    u = torch.zeros(100, 2, dtype=torch.float64)
+    with pytest.raises(ValueError, match="priors against"):
+        variational_laplace_lockstep(spec, [pr, pr], u, [y])
+    with pytest.raises(ValueError, match="scans, expected"):
+        variational_laplace_lockstep(spec, [pr, pr], u, [y, torch.zeros(9, 6, dtype=torch.float64)])

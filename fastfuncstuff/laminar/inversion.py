@@ -198,30 +198,28 @@ def masked_vec(y: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
     return y[rows].mT.reshape(-1)
 
 
-def variational_laplace(
+def _vl_coroutine(
     spec: ModelSpec,
     priors: Priors,
-    u: torch.Tensor,
     y: torch.Tensor,
     *,
     rows: torch.Tensor | None = None,
-    kernel: torch.Tensor | None = None,
     max_iter: int = 128,
     verbose: bool = False,
-    **integrate_kwargs,
-) -> VLResult:
-    """Invert the laminar model against one depth-resolved data matrix.
+):
+    """The Variational Laplace scheme, with the forward model lifted out.
 
-    Parameters
-    ----------
-    y : ``(n_scans, K)`` observed laminar BOLD.
-    rows : boolean mask over time points. ``None`` fits every point. Faes et al.
-        concatenate two conditions separated by white-noise padding and mask the
-        padding out, which is the only reason it exists.
+    A generator: it yields a ``(n_probe, n_params)`` matrix of parameter vectors
+    it needs predictions for, and receives the corresponding
+    ``(n_probe, n_scans, K)`` predictions back via ``send``. It never calls
+    :func:`~fastfuncstuff.laminar.integrate.integrate` itself.
 
-    Returns
-    -------
-    :class:`VLResult`, whose ``F`` is the quantity model comparison ranks.
+    That inversion of control is the whole point. Integrating is ~99% of the
+    cost and is host-bound, so one call carrying many fits' probes costs little
+    more than one carrying a single fit's. Driving several of these coroutines
+    in lockstep -- :func:`variational_laplace_lockstep` -- shares that call
+    across fits while leaving each one's arithmetic bit-identical to running it
+    alone, because nothing here changes.
     """
     n_scans, K = y.shape
     if K != spec.K:
@@ -263,27 +261,25 @@ def variational_laplace(
         sl = slice(i * ns_kept, (i + 1) * ns_kept)
         Q[i, sl, sl] = torch.eye(ns_kept, dtype=dtype, device=device)
 
-    def predict_batch(p_batch: torch.Tensor) -> torch.Tensor:
-        """Predicted response for a batch of reduced-space parameter vectors."""
-        full = pE_vec.expand(p_batch.shape[0], -1).clone()
-        full[:, free_idx] += p_batch
-        P = unvec(full, spec)
-        return integrate(u, P, spec, n_scans, kernel=kernel, **integrate_kwargs)
-
-    def linearise(p: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward-difference Jacobian and prediction, in one batched pass.
+    def probe_matrix(p: torch.Tensor) -> torch.Tensor:
+        """Parameter vectors whose predictions the next step needs.
 
         ``spm_diff`` walks the parameters one at a time; here the unperturbed
-        point and all ``np`` perturbations are a single batch, which is the
-        batch-first payoff showing up for the first time.
+        point and all ``np`` perturbations are one batch. Row 0 is the current
+        point, rows 1..np are its forward differences.
+
+        Returned unpadded: the *driver* pads to a bucketed width, because in
+        lockstep it is the combined width across fits that has to hit a bucket,
+        not each fit's separately.
         """
-        # Padded to a bucketed width: the number of free parameters varies across
-        # a model space, and each distinct width is its own ~20 s compile. The
-        # spare rows repeat the unperturbed point and are discarded.
-        n_probe = np_ + 1
-        probes = p.expand(batch_bucket(n_probe), -1).clone()
-        probes[1:n_probe] += torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
-        preds = predict_batch(probes)[:n_probe]
+        probes = p.expand(np_ + 1, -1).clone()
+        probes[1:] += torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
+        full = pE_vec.expand(np_ + 1, -1).clone()
+        full[:, free_idx] += probes
+        return full
+
+    def finish_linearise(preds: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward-difference Jacobian from the predictions just received."""
         f0 = preds[0]
         dfdp = torch.stack(
             [masked_vec(preds[j + 1], rows) - masked_vec(f0, rows) for j in range(np_)], dim=1
@@ -310,7 +306,8 @@ def variational_laplace(
     k = 0
 
     for k in range(1, max_iter + 1):
-        dfdp, y_pred = linearise(p)
+        preds = yield probe_matrix(p)
+        dfdp, y_pred = finish_linearise(preds)
         if not torch.isfinite(dfdp).all() or float(dfdp.abs().max()) > math.exp(32):
             # The reference retreats up to four times here before giving up. We
             # do the same rather than erroring: a diverged linearisation early
@@ -319,7 +316,8 @@ def variational_laplace(
             for _ in range(4):
                 v_rate = min(v_rate - 2.0, -4.0)
                 p = best["p"] + spm_dx(dFdpp, dFdp, v_rate)
-                dfdp, y_pred = linearise(p)
+                preds = yield probe_matrix(p)
+                dfdp, y_pred = finish_linearise(preds)
                 if torch.isfinite(dfdp).all() and float(dfdp.abs().max()) <= math.exp(32):
                     recovered = True
                     break
@@ -421,3 +419,157 @@ def variational_laplace(
         converged=converged,
         history=history,
     )
+
+
+def _pad_to_bucket(full: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Pad a probe matrix up to a compiled batch width.
+
+    Every distinct batch width is its own static compile of the integration step
+    (~20 s), so the width must come from a small set. The padding rows repeat
+    the last probe and their predictions are discarded.
+    """
+    n = full.shape[0]
+    width = batch_bucket(n)
+    if width == n:
+        return full, n
+    return torch.cat([full, full[-1:].expand(width - n, -1)], dim=0), n
+
+
+def variational_laplace(
+    spec: ModelSpec,
+    priors: Priors,
+    u: torch.Tensor,
+    y: torch.Tensor,
+    *,
+    rows: torch.Tensor | None = None,
+    kernel: torch.Tensor | None = None,
+    max_iter: int = 128,
+    verbose: bool = False,
+    **integrate_kwargs,
+) -> VLResult:
+    """Invert the laminar model against one depth-resolved data matrix.
+
+    Parameters
+    ----------
+    y : ``(n_scans, K)`` observed laminar BOLD.
+    rows : boolean mask over time points. ``None`` fits every point. Faes et al.
+        concatenate two conditions separated by white-noise padding and mask the
+        padding out, which is the only reason it exists.
+
+    Returns
+    -------
+    :class:`VLResult`, whose ``F`` is the quantity model comparison ranks.
+    """
+    n_scans = int(y.shape[0])
+    co = _vl_coroutine(spec, priors, y, rows=rows, max_iter=max_iter, verbose=verbose)
+    try:
+        full = next(co)
+        while True:
+            padded, n = _pad_to_bucket(full)
+            preds = integrate(
+                u, unvec(padded, spec), spec, n_scans, kernel=kernel, **integrate_kwargs
+            )
+            full = co.send(preds[:n])
+    except StopIteration as stop:
+        return stop.value
+
+
+def variational_laplace_lockstep(
+    spec: ModelSpec,
+    priors_list: list[Priors],
+    u: torch.Tensor,
+    y_list: list[torch.Tensor],
+    *,
+    rows: torch.Tensor | None = None,
+    kernel: torch.Tensor | None = None,
+    max_iter: int = 128,
+    progress: bool = False,
+    **integrate_kwargs,
+) -> list[VLResult]:
+    """Invert many models, or many datasets, sharing the forward model.
+
+    Each fit runs its own Variational Laplace scheme, unchanged -- the results
+    are bit-identical to calling :func:`variational_laplace` on each in turn.
+    What is shared is the expensive part: at every iteration the probes of all
+    still-running fits are concatenated into a *single* integration.
+
+    That pays because the integration is host-bound, not compute-bound. Measured
+    at K=9 on CPU, one probe row costs 205 us per step and 64 rows cost 286 us,
+    so a batch of sixty-four fits' worth of probes costs about what one fit's
+    does. The plateau breaks past ~128 rows, so the speedup is large but well
+    short of the row count.
+
+    ``priors_list`` and ``y_list`` are zipped: pass one ``y`` repeated to fit a
+    model space against fixed data, or one set of priors repeated to fit the
+    same model across parcels, seeds or conditions. ``u`` is shared, so every
+    fit must have the same design and the same number of scans.
+
+    Fits converge at different iteration counts, and the batch runs until the
+    slowest finishes. Finished fits stop contributing probes, but the batch
+    **width is held fixed** for the whole run.
+
+    Bug of record: letting the width shrink as fits drop out is the obvious
+    thing and it made lockstep *slower than serial*, 0.94x. Each narrower width
+    crosses a bucket boundary into a shape that has never been compiled, and at
+    ~20 s per compile a single run paid three or four of them -- more than the
+    batching saved. Holding the width costs almost nothing, because the step is
+    host-bound and the padding rows are close to free, which is the same
+    property that makes the batching worth doing at all.
+    """
+    if len(priors_list) != len(y_list):
+        raise ValueError(f"{len(priors_list)} priors against {len(y_list)} datasets")
+    n_scans = int(y_list[0].shape[0])
+    for i, y in enumerate(y_list):
+        if int(y.shape[0]) != n_scans:
+            raise ValueError(f"dataset {i} has {int(y.shape[0])} scans, expected {n_scans}")
+
+    coroutines = [
+        _vl_coroutine(spec, pr, y, rows=rows, max_iter=max_iter)
+        for pr, y in zip(priors_list, y_list, strict=True)
+    ]
+    results: list[VLResult | None] = [None] * len(coroutines)
+    pending: dict[int, torch.Tensor] = {}
+    for i, co in enumerate(coroutines):
+        try:
+            pending[i] = next(co)
+        except StopIteration as stop:  # pragma: no cover - max_iter=0
+            results[i] = stop.value
+
+    bar = None
+    if progress:
+        try:
+            from tqdm.auto import tqdm
+
+            bar = tqdm(total=len(coroutines), desc="laminar lockstep", leave=True)
+        except ImportError:  # pragma: no cover - tqdm is a soft dependency
+            bar = None
+
+    # One width for the whole run, set by the opening batch. See the docstring.
+    width = batch_bucket(sum(int(m.shape[0]) for m in pending.values()))
+
+    while pending:
+        idx = sorted(pending)
+        sizes = [int(pending[i].shape[0]) for i in idx]
+        stacked = torch.cat([pending[i] for i in idx], dim=0)
+        n_real = int(stacked.shape[0])
+        if n_real < width:
+            stacked = torch.cat([stacked, stacked[-1:].expand(width - n_real, -1)], dim=0)
+        elif n_real > width:  # pragma: no cover - the opening batch is the widest
+            stacked, n_real = _pad_to_bucket(stacked)
+        preds = integrate(u, unvec(stacked, spec), spec, n_scans, kernel=kernel, **integrate_kwargs)
+        preds = preds[:n_real]
+
+        offset = 0
+        for i, n in zip(idx, sizes, strict=True):
+            chunk = preds[offset : offset + n]
+            offset += n
+            try:
+                pending[i] = coroutines[i].send(chunk)
+            except StopIteration as stop:
+                results[i] = stop.value
+                del pending[i]
+                if bar is not None:
+                    bar.update(1)
+    if bar is not None:
+        bar.close()
+    return [r for r in results if r is not None]

@@ -34,6 +34,7 @@ from fastfuncstuff.laminar.experiment import (
     depth_inclusion_probabilities,
     drive_priors,
     faes_priors,
+    fit_independent,
     fit_model_space,
     layer_model_names,
     layer_model_targets,
@@ -47,7 +48,12 @@ from fastfuncstuff.laminar.forward import (
     neuronal_to_vascular,
 )
 from fastfuncstuff.laminar.integrate import build_input, integrate
-from fastfuncstuff.laminar.inversion import Priors, VLResult, variational_laplace
+from fastfuncstuff.laminar.inversion import (
+    Priors,
+    VLResult,
+    variational_laplace,
+    variational_laplace_lockstep,
+)
 from fastfuncstuff.laminar.layers import (
     depth_bin_centres,
     estimate_depth_psf,
@@ -87,12 +93,14 @@ __all__ = [
     "estimate_depth_psf",
     "drive_priors",
     "faes_priors",
+    "fit_independent",
     "fit_model_space",
     "label_mean",
     "layer_model_names",
     "layer_model_targets",
     "posterior_model_probabilities",
     "variational_laplace",
+    "variational_laplace_lockstep",
     "voxels_to_layers",
     "apply_depth_psf",
     "baseline_hemodynamics",

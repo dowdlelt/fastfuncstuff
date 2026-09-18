@@ -284,6 +284,63 @@ def depth_inclusion_probabilities(
     return probs @ membership
 
 
+def _fit_one_worker(args):
+    """Top-level so it can be pickled to a worker process."""
+    import torch as _torch
+
+    from fastfuncstuff.laminar.inversion import variational_laplace as _vl
+
+    # One thread per worker. These tensors are ~50 elements wide, so torch's
+    # intra-op threading costs more in synchronisation than it recovers, and the
+    # parallelism that actually pays is across independent fits.
+    _torch.set_num_threads(1)
+    spec, priors, u, y, rows, kernel, kwargs = args
+    return _vl(spec, priors, u, y, rows=rows, kernel=kernel, **kwargs)
+
+
+def fit_independent(
+    spec: ModelSpec,
+    priors_list: list[Priors],
+    u: torch.Tensor,
+    y_list: list[torch.Tensor],
+    *,
+    rows: torch.Tensor | None = None,
+    kernel: torch.Tensor | None = None,
+    n_workers: int | None = None,
+    **vl_kwargs,
+) -> list[VLResult]:
+    """Fit many models across processes, one thread each.
+
+    The complement to :func:`~fastfuncstuff.laminar.inversion.variational_laplace_lockstep`,
+    and useful when the fits do *not* share a design -- different ``u``, a
+    different number of scans, or different ``K`` -- which is exactly when
+    lockstep cannot batch them.
+
+    Prefer lockstep where it applies: sharing one integration beats running
+    several, and the two compete for the same cores rather than composing.
+
+    ``n_workers`` defaults to the physical core count. Each worker pays its own
+    ~20 s compile on first use, though inductor's on-disk cache makes that a
+    one-time cost per machine rather than per run.
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor
+
+    if len(priors_list) != len(y_list):
+        raise ValueError(f"{len(priors_list)} priors against {len(y_list)} datasets")
+    if n_workers is None:
+        n_workers = max(1, (os.cpu_count() or 2) // 2)
+    n_workers = min(n_workers, len(priors_list))
+
+    payload = [
+        (spec, pr, u, y, rows, kernel, vl_kwargs) for pr, y in zip(priors_list, y_list, strict=True)
+    ]
+    if n_workers == 1:
+        return [_fit_one_worker(a) for a in payload]
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        return list(pool.map(_fit_one_worker, payload))
+
+
 def fit_model_space(
     spec_for_k: dict[int, ModelSpec],
     data_for_k: dict[int, torch.Tensor],
