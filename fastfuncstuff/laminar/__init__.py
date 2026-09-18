@@ -54,6 +54,14 @@ from fastfuncstuff.laminar.layers import (
     voxels_to_layers,
 )
 from fastfuncstuff.laminar.params import P0, ModelSpec, zero_params
+from fastfuncstuff.laminar.recovery import (
+    RecoveryResult,
+    noise_sd_from_hyperparameters,
+    recover_model_space,
+    recover_with_fixed_s_d,
+    s_d_misspecification_profile,
+    simulate_laminar_data,
+)
 
 __all__ = [
     "P0",
@@ -64,6 +72,12 @@ __all__ = [
     "laminar_impulse_response",
     "static_deveining_matrix",
     "ModelSpec",
+    "RecoveryResult",
+    "noise_sd_from_hyperparameters",
+    "recover_model_space",
+    "recover_with_fixed_s_d",
+    "s_d_misspecification_profile",
+    "simulate_laminar_data",
     "Priors",
     "VLResult",
     "bayesian_parameter_average",
