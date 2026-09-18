@@ -187,11 +187,21 @@ Outputs:
         {prefix}_xval_r2_by_npcs.npy          - CV R² for each number of PCs
         {prefix}_metadata.json                - Full metadata for reproducibility
 
+  Always:
+    {prefix}_run01_PCs.txt             - Every extracted component timecourse, in
+                                         the order the figures number them
+
   With -save_pcs timecourse/both:
     {prefix}_noise_pcs.pt              - PC timecourses (.pt PyTorch file)
 
   With -save_pcs spatial/both:
-    {prefix}_run01_pc_weights.nii.gz   - Spatial PC weights per run (4D NIfTI)
+    {prefix}_run01_pc_weights.nii.gz   - Component weight maps per run (4D NIfTI,
+                                         sub-brik k = PC k+1, every component).
+                                         Same maps the PC figures draw, in the
+                                         space -component_map_space names.
+
+  When the cross-validation selected at least one component:
+    {prefix}_run01_selected_PCs.txt    - Just the selected ones, as regressors
 
   With -plots yes/full:
     {prefix}_denoising_summary.png     - CV performance summary
@@ -735,8 +745,10 @@ Notes:
         help="Which parts of the noise components to write out.\n"
         "  no          neither.\n"
         "  timecourse  the per-run component timecourses, as a .pt file.\n"
-        "  spatial     the per-component weight maps, as NIfTI.\n"
-        "  both        both of the above.",
+        "  spatial     the per-component weight maps, as NIfTI -- every extracted\n"
+        "              component, sub-brik k = the PC{k+1} figure.\n"
+        "  both        both of the above.\n"
+        "The per-run text files of the component timecourses are written either way.",
     )
     out_opts.add_argument(
         "-component_map_space",
@@ -1061,6 +1073,40 @@ def save_denoising_results(
         json.dump(metadata, f, indent=2)
     output_files["metadata"] = metadata_path
 
+    # The component spatial maps, resolved once in the space `component_map_space`
+    # names, so the saved NIfTI and the per-PC figures are the same numbers. They
+    # used to be built separately -- the file from the noise-pool loadings, the
+    # figure from a full-brain refit -- which made the two impossible to compare.
+    component_maps_per_run = None
+    component_maps_mask = None  # Full-volume boolean for the space the maps live in
+    if save_pcs_mode in ["spatial", "both"] or plots_mode == "full":
+        if component_map_space == "full" and data_for_component_maps is not None:
+            component_maps_per_run = [
+                ld.numpy()
+                for ld in compute_full_brain_pc_loadings(
+                    data=data_for_component_maps,
+                    noise_pcs_per_run=results.noise_pcs_per_run,
+                    run_starts=run_starts,
+                    brain_mask=None,
+                    verbose=False,
+                )
+            ]
+            component_maps_mask = voxel_mask_np
+        elif results.pc_loadings_per_run is not None:
+            component_maps_per_run = [
+                ld.cpu().numpy() if torch.is_tensor(ld) else ld
+                for ld in results.pc_loadings_per_run
+            ]
+            # Pool-space maps: the noise pool sits inside the brain mask, so the
+            # full-volume support is the two-level scatter of both.
+            noise_pool_np = results.noise_pool_mask.cpu().numpy()
+            if voxel_mask_np is not None:
+                combined = np.zeros(int(np.prod(volume_shape)), dtype=bool)
+                combined[np.where(voxel_mask_np)[0][noise_pool_np]] = True
+                component_maps_mask = combined
+            else:
+                component_maps_mask = noise_pool_np
+
     # 6. Noise PCs (based on save_pcs_mode)
     if save_pcs_mode in ["timecourse", "both"]:
         pcs_path = f"{output_prefix}_noise_pcs.pt"
@@ -1075,71 +1121,75 @@ def save_denoising_results(
         output_files["noise_pcs_timecourse"] = pcs_path
 
     if save_pcs_mode in ["spatial", "both"]:
-        # Save PC spatial weights as NIfTI files (per run, per PC)
-        if results.pc_loadings_per_run is not None:
-            # Helper to reshape noise pool loadings to full volume
-            noise_pool_np = results.noise_pool_mask.cpu().numpy()
-
-            def loadings_to_volume(loadings_flat):
-                """Map noise pool loadings back to full volume (zeros outside noise pool)"""
-                if voxel_mask_np is not None:
-                    # Two-level mask: voxel_mask (full volume) and noise_pool (within masked voxels)
-                    # Map noise_pool indices into full-volume indices via voxel_mask
-                    brain_indices = np.where(voxel_mask_np)[0]
-                    noise_pool_indices = brain_indices[noise_pool_np]
-                    vol = np.zeros(np.prod(volume_shape), dtype=loadings_flat.dtype)
-                    vol[noise_pool_indices] = loadings_flat
-                else:
-                    # No brain mask, noise_pool is directly in volume space
-                    vol = np.zeros(np.prod(volume_shape), dtype=loadings_flat.dtype)
-                    vol[noise_pool_np] = loadings_flat
-                return vol.reshape(volume_shape)
-
-            n_runs = len(results.pc_loadings_per_run)
-            for run_idx, loadings in enumerate(results.pc_loadings_per_run):
-                loadings_np = loadings.cpu().numpy() if torch.is_tensor(loadings) else loadings
-                n_pcs = loadings_np.shape[1]
-
-                # Save each PC as a separate volume (or combine into 4D)
-                pc_vols = []
-                for pc_idx in range(
-                    min(n_pcs, results.optimal_n_components + 3)
-                ):  # Save optimal + a few more
-                    pc_vol = loadings_to_volume(loadings_np[:, pc_idx])
-                    pc_vols.append(pc_vol)
-
-                # Stack into 4D and save
-                pc_4d = np.stack(pc_vols, axis=-1)
+        # Every extracted component, not optimal+3: the figures show all of them,
+        # and a map you cannot open beside its figure is no use. Sub-brik k is
+        # PC k+1, the same component the PC{k+1:02d} figure draws.
+        if component_maps_per_run is not None:
+            n_runs = len(component_maps_per_run)
+            for run_idx, loadings_np in enumerate(component_maps_per_run):
+                n_pcs = int(loadings_np.shape[1])
                 pc_path = f"{output_prefix}_run{run_idx + 1:02d}_pc_weights{nii_ext}"
-                save_nifti(pc_4d, output_path=pc_path, affine=affine, header=nifti_header)
+                save_4d_nifti(
+                    np.asarray(loadings_np, dtype=np.float32),
+                    pc_path,
+                    volume_shape,
+                    affine,
+                    mask_flat=component_maps_mask,
+                    header=nifti_header,
+                    brick_labels=[f"PC{k + 1:02d}" for k in range(n_pcs)],
+                )
                 output_files[f"run{run_idx + 1}_pc_weights"] = pc_path
 
-            print(f"  Saved PC spatial weights for {n_runs} runs")
+            n_saved = int(component_maps_per_run[0].shape[1])
+            print(
+                f"  Saved {n_saved} component spatial maps per run for {n_runs} runs"
+                f" (space: {component_map_space})"
+            )
         else:
             print("  Warning: PC loadings not available (run with return_loadings=True)")
 
-    # 6b. Save selected PCs as text files (one per run)
-    # These are the PC timecourses for the optimal number of components
+    # 6b. Component timecourses as text (one file per run)
+    #
+    # Two files, because they answer different questions. The `_PCs.txt` file is
+    # every extracted component, in figure order, so a component can be plotted
+    # against its figure -- it exists even when the selection kept none, which is
+    # when you most want to look. The `_selected_PCs.txt` file is the regressor
+    # set downstream tools read (cli_utils.py:load_denoise_regressors), so it is
+    # written only when there is something in it; an empty file there is a
+    # silently broken design, not an empty nuisance model.
     n_runs = len(results.noise_pcs_per_run)
+    n_selected_total = 0
     for run_idx, pcs in enumerate(results.noise_pcs_per_run):
         pcs_np = pcs.cpu().numpy() if torch.is_tensor(pcs) else pcs
-        # Take only the selected (optimal) number of PCs
-        n_selected = min(results.optimal_n_components, pcs_np.shape[1])
-        selected_pcs = pcs_np[:, :n_selected]
+        n_all = int(pcs_np.shape[1])
+        n_selected = min(results.optimal_n_components, n_all)
+        n_selected_total = n_selected
 
-        pc_txt_path = f"{output_prefix}_run{run_idx + 1:02d}_selected_PCs.txt"
-        # Save with header
-        with open(pc_txt_path, "w") as f:
-            f.write(f"# Selected noise PCs for run {run_idx + 1}\n")
-            f.write(f"# n_components: {n_selected}\n")
-            f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {selected_pcs.shape[1]} PCs\n")
-            f.write(f"# Columns: PC1, PC2, ..., PC{n_selected}\n")
-            np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
-        output_files[f"run{run_idx + 1}_selected_pcs_txt"] = pc_txt_path
+        all_txt_path = f"{output_prefix}_run{run_idx + 1:02d}_PCs.txt"
+        with open(all_txt_path, "w") as f:
+            f.write(f"# All extracted noise components for run {run_idx + 1}\n")
+            f.write(f"# n_components: {n_all} (selected by cross-validation: {n_selected})\n")
+            f.write(f"# Shape: {pcs_np.shape[0]} timepoints x {n_all} PCs\n")
+            f.write(f"# Columns: PC1, PC2, ..., PC{n_all}\n")
+            np.savetxt(f, pcs_np, fmt="%.6f", delimiter="\t")
+        output_files[f"run{run_idx + 1}_pcs_txt"] = all_txt_path
 
-    print(
-        f"  Saved selected PCs ({results.optimal_n_components} PCs) as text files for {n_runs} runs"
-    )
+        if n_selected > 0:
+            selected_pcs = pcs_np[:, :n_selected]
+            pc_txt_path = f"{output_prefix}_run{run_idx + 1:02d}_selected_PCs.txt"
+            with open(pc_txt_path, "w") as f:
+                f.write(f"# Selected noise PCs for run {run_idx + 1}\n")
+                f.write(f"# n_components: {n_selected}\n")
+                f.write(f"# Shape: {selected_pcs.shape[0]} timepoints x {n_selected} PCs\n")
+                f.write(f"# Columns: PC1, PC2, ..., PC{n_selected}\n")
+                np.savetxt(f, selected_pcs, fmt="%.6f", delimiter="\t")
+            output_files[f"run{run_idx + 1}_selected_pcs_txt"] = pc_txt_path
+
+    print(f"  Saved all component timecourses as text files for {n_runs} runs")
+    if n_selected_total > 0:
+        print(f"  Saved selected PCs ({results.optimal_n_components} PCs) for {n_runs} runs")
+    else:
+        print("  No components were selected, so no *_selected_PCs.txt was written")
 
     # 6c. Noise-pool PCA scree plot (default on)
     if save_scree_plot:
@@ -1205,27 +1255,16 @@ def save_denoising_results(
                     else None
                 )
 
-                # Create combined mask: voxel_mask (brain) AND noise_pool_mask (low R²)
-                # This maps noise pool indices to full volume space
-                noise_pool_mask_np = results.noise_pool_mask.cpu().numpy()
-
-                if component_map_space == "full" and data_for_component_maps is not None:
-                    full_loadings = compute_full_brain_pc_loadings(
-                        data=data_for_component_maps,
-                        noise_pcs_per_run=results.noise_pcs_per_run,
-                        run_starts=run_starts,
-                        brain_mask=None,
-                        verbose=False,
-                    )
-                    loadings_cpu = [ld.numpy() for ld in full_loadings]
-                    noise_pool_mask_for_plot = None
-                else:
-                    loadings_cpu = (
-                        [ld.cpu().numpy() for ld in results.pc_loadings_per_run]
-                        if results.pc_loadings_per_run
-                        else None
-                    )
-                    noise_pool_mask_for_plot = noise_pool_mask_np
+                # The maps resolved above, so a figure and the NIfTI beside it are
+                # the same numbers. Full-brain maps already live in brain-mask
+                # space, so only pool-space maps need the second-level mask.
+                loadings_cpu = component_maps_per_run
+                pool_space = not (
+                    component_map_space == "full" and data_for_component_maps is not None
+                )
+                noise_pool_mask_for_plot = (
+                    results.noise_pool_mask.cpu().numpy() if pool_space else None
+                )
 
                 plot_denoising_pcs(
                     noise_pcs_per_run=pcs_cpu,

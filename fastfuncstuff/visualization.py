@@ -1437,12 +1437,12 @@ def plot_denoising_pcs(
         # (GridSpec width_ratios are the run lengths), so a spatial pattern can
         # be read against the timecourse wobble that produced it.
         if has_weights:
-            cmap = plt.get_cmap("RdBu_r").copy()
+            cmap = plt.get_cmap("turbo").copy()
             # Out-of-mask voxels and the gutters between cuts are NaN. They have
-            # to be a colour the map cannot produce: zero weight is white in
-            # RdBu_r, so leaving background at zero made "no data" and "no
-            # loading" identical.
-            cmap.set_bad(color="black")
+            # to be a colour the map cannot produce, or "no data" and some real
+            # loading become the same picture -- white, since turbo runs dark
+            # blue through green to dark red and never reaches it.
+            cmap.set_bad(color="white")
 
             for run_idx, weights in enumerate(pc_weights_per_run):
                 if run_idx >= n_runs or pc_idx >= weights.shape[1]:

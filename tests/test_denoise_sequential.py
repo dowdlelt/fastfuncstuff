@@ -1279,6 +1279,77 @@ def test_r2_stack_subbriks_are_in_label_order(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# -save_pcs: what the component files hold
+# ---------------------------------------------------------------------------
+
+
+def _results_with_components(n_voxels=8, n_tp=12, n_comp=5, n_selected=0):
+    """Results carrying component timecourses and pool-space loadings."""
+    results = _minimal_results(with_ceiling=False, n_voxels=n_voxels)
+    results.optimal_n_components = n_selected
+    results.noise_pcs_per_run = [torch.randn(n_tp, n_comp)]
+    results.pc_loadings_per_run = [torch.randn(n_voxels, n_comp)]
+    return results
+
+
+def _save_components(tmp_path, results, **kwargs):
+    from fastfuncstuff.cli.denoise import save_denoising_results
+
+    return save_denoising_results(
+        results=results,
+        output_prefix=str(tmp_path / "out"),
+        volume_shape=(2, 2, 2),
+        affine=np.eye(4),
+        run_starts=[0],
+        tr=1.0,
+        save_pcs_mode="both",
+        save_scree_plot=False,
+        nii_ext=".nii.gz",
+        **kwargs,
+    )
+
+
+def test_spatial_maps_hold_every_extracted_component(tmp_path):
+    """Not optimal+3: the figures draw all of them, and the file must match.
+
+    With nothing selected the old code wrote three sub-briks, which could not be
+    lined up with component_diagnostics_PC01..PC05.png at all.
+    """
+    import nibabel as nib
+
+    results = _results_with_components(n_comp=5, n_selected=0)
+    files = _save_components(tmp_path, results)
+
+    image = nib.load(files["run1_pc_weights"])
+    assert image.shape == (2, 2, 2, 5)
+    saved = image.get_fdata().reshape(-1, 5)
+    assert np.allclose(saved, results.pc_loadings_per_run[0].numpy(), atol=1e-5)
+
+
+def test_all_component_timecourses_are_written_even_when_none_are_selected(tmp_path):
+    """The empty-selection case is exactly when you want to look at the curves."""
+    results = _results_with_components(n_comp=5, n_selected=0)
+    files = _save_components(tmp_path, results)
+
+    columns = np.loadtxt(files["run1_pcs_txt"])
+    assert columns.shape == (12, 5)
+    assert np.allclose(columns, results.noise_pcs_per_run[0].numpy(), atol=1e-5)
+
+    # An empty regressor file downstream is a broken design, not an empty model.
+    assert "run1_selected_pcs_txt" not in files
+    assert not (tmp_path / "out_run01_selected_PCs.txt").exists()
+
+
+def test_selected_pcs_are_still_written_when_the_selection_kept_some(tmp_path):
+    results = _results_with_components(n_comp=5, n_selected=2)
+    files = _save_components(tmp_path, results)
+
+    selected = np.loadtxt(files["run1_selected_pcs_txt"])
+    assert selected.shape == (12, 2)
+    assert np.allclose(selected, results.noise_pcs_per_run[0].numpy()[:, :2], atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
 # zero_event_strategy wiring for the PC-count curve
 # ---------------------------------------------------------------------------
 
