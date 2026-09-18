@@ -45,6 +45,7 @@ Ported from ``LBR_gen_fx_fcn.m`` (which is the readable symbolic source the
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -170,6 +171,142 @@ def _expand_N(spec: ModelSpec, p0_val: torch.Tensor, p: torch.Tensor) -> torch.T
     return (p0_val * torch.exp(p))[..., None].expand(*p.shape, spec.N)
 
 
+@dataclass
+class ForwardCache:
+    """Everything in the model that does not depend on the state.
+
+    The integrator calls the right-hand side once per 50 ms microtime bin --
+    tens of thousands of times per inversion -- and the baseline hemodynamics,
+    the depth mapping and every ``P0 * exp(P)`` expansion are identical at every
+    one of them. Hoisting them out is loop-invariant work, not kernel
+    efficiency, and it is where essentially all of the wall clock was going.
+
+    Bitwise identical to computing them inline; :func:`f_ode` still builds one
+    on demand when none is supplied.
+    """
+
+    # neuronal
+    A_base: torch.Tensor  # P.A with its diagonal replaced by -sigma*exp(diag)
+    B: torch.Tensor
+    C: torch.Tensor
+    mu_log: torch.Tensor
+    lam_log: torch.Tensor
+    Bmu: torch.Tensor
+    Blam: torch.Tensor
+    mu0: torch.Tensor
+    lam0: torch.Tensor
+    c1: torch.Tensor
+    c2: torch.Tensor
+    c3: torch.Tensor
+    # depth mapping and hemodynamics
+    n2k: torch.Tensor
+    t0v: torch.Tensor
+    t0d: torch.Tensor
+    tau_v: torch.Tensor
+    tau_d: torch.Tensor
+    inv_al_v: torch.Tensor
+    inv_al_d: torch.Tensor
+    nr: torch.Tensor
+    sum_v: torch.Tensor  # t0v + tau_v
+    sum_d: torch.Tensor  # t0d + tau_d
+    w_v_in: torch.Tensor  # venule share of each depth's ascending-vein inflow
+    w_d_in: torch.Tensor  # share arriving from the depth below
+    # observation equation
+    V0vq: torch.Tensor
+    V0dq: torch.Tensor
+    H0: torch.Tensor
+    k1v: torch.Tensor
+    k2v: torch.Tensor
+    k3v: torch.Tensor
+    k1d: torch.Tensor
+    k2d: torch.Tensor
+    k3d: torch.Tensor
+
+
+def build_cache(
+    spec: ModelSpec, P: dict[str, torch.Tensor], *, shift_depths: bool = False
+) -> ForwardCache:
+    """Precompute the state-independent half of the model. See :class:`ForwardCache`."""
+    if not (spec.p0.tau_v_same and spec.p0.tau_d_same):
+        raise NotImplementedError(
+            "asymmetric inflation/deflation tau needs the reference's history-dependent "
+            "branch; set tau_v_same and tau_d_same"
+        )
+    p0 = p0_tensors(spec)
+    K = spec.K
+
+    # The diagonal of A is replaced by -sigma*exp(diag(A)): self-inhibition is
+    # parameterised multiplicatively around the global time constant sigma, so
+    # sigma alone sets the overall temporal scale of the neuronal response.
+    sigma = p0["sigma"] * torch.exp(P["sigma"])
+    A = P["A"]
+    diagA = torch.diagonal(A, dim1=-2, dim2=-1)
+    A_base = A - torch.diag_embed(diagA) - torch.diag_embed(sigma[..., None] * torch.exp(diagA))
+
+    n2k = neuronal_to_vascular(spec, P, shift_depths=shift_depths)
+    hemo = baseline_hemodynamics(spec, P)
+    F0v, F0d = hemo["F0v"], hemo["F0d"]
+    t0v, t0d = hemo["t0v"], hemo["t0d"]
+
+    al_v = _expand_K(spec, p0["al_v"], P["al_v"])
+    al_d = _expand_K(spec, p0["al_d"], P["al_d"])
+    tau_v = _expand_K(spec, p0["tau_v_in"], P["tau_v_in"])
+    tau_d = _expand_K(spec, p0["tau_d_in"], P["tau_d_in"])
+
+    w_d_in = torch.zeros_like(F0d)
+    w_d_in[..., :-1] = F0d[..., 1:] / F0d[..., :-1]
+
+    # --- observation equation constants ---
+    V0vq = hemo["V0v"] / 100.0 * K
+    V0dq = hemo["V0d"] / 100.0 * K
+    E0v = _expand_K(spec, p0["E0v"], P["E0v"])
+    E0d = _expand_K(spec, p0["E0d"], P["E0d"])
+    TE, B0 = spec.TE, spec.B0
+    nu0v = p0["suscep"] * p0["gyro"] * p0["Hct_v"] * B0
+    nu0d = p0["suscep"] * p0["gyro"] * p0["Hct_d"] * B0
+    ep_v = p0["rho_v"] / p0["rho_t"] * torch.exp(-TE * (p0["R2s_v"] - p0["R2s_t"]))
+    ep_d = p0["rho_d"] / p0["rho_t"] * torch.exp(-TE * (p0["R2s_d"] - p0["R2s_t"]))
+
+    return ForwardCache(
+        A_base=A_base,
+        B=P["B"],
+        C=P["C"],
+        mu_log=P["mu"],
+        lam_log=P["lam"],
+        Bmu=P["Bmu"],
+        Blam=P["Blam"],
+        mu0=p0["mu"],
+        lam0=p0["lam"],
+        c1=_expand_N(spec, p0["c1"], P["c1"]),
+        c2=_expand_N(spec, p0["c2"], P["c2"]),
+        c3=_expand_N(spec, p0["c3"], P["c3"]),
+        n2k=n2k,
+        t0v=t0v,
+        t0d=t0d,
+        tau_v=tau_v,
+        tau_d=tau_d,
+        inv_al_v=1.0 / al_v,
+        inv_al_d=1.0 / al_d,
+        nr=_expand_K(spec, p0["nr"], P["nr"]),
+        sum_v=t0v + tau_v,
+        sum_d=t0d + tau_d,
+        w_v_in=F0v / F0d,
+        w_d_in=w_d_in,
+        V0vq=V0vq,
+        V0dq=V0dq,
+        H0=1.0 / (1.0 - V0vq - V0dq + ep_v * V0vq + ep_d * V0dq),
+        k1v=4.3 * nu0v * E0v * TE,
+        k2v=ep_v * p0["r0v"] * E0v * TE,
+        k3v=1.0 - ep_v,
+        k1d=4.3 * nu0d * E0d * TE,
+        # Bug of record: the reference scales the ascending vein's intravascular
+        # term by the *venule* ratio ep_v. Replicated deliberately -- changing
+        # it would silently break parity with the published fits.
+        k2d=ep_v * p0["r0d"] * E0d * TE,
+        k3d=1.0 - ep_d,
+    )
+
+
 def f_ode(
     x: torch.Tensor,
     u: torch.Tensor,
@@ -177,6 +314,7 @@ def f_ode(
     spec: ModelSpec,
     *,
     shift_depths: bool = False,
+    cache: ForwardCache | None = None,
 ) -> torch.Tensor:
     """Right-hand side of the laminar generative model.
 
@@ -186,6 +324,8 @@ def f_ode(
     u : ``(..., n_inputs)`` input at this instant. Modulatory inputs come
         first, then driving inputs -- ``B[m]`` multiplies ``u[..., m]``.
     P : estimated log-deviations from ``P0``.
+    cache : a :class:`ForwardCache` from :func:`build_cache`, built here if
+        omitted. The integrator always passes one.
 
     Notes
     -----
@@ -196,15 +336,18 @@ def f_ode(
     branch, and we only implement that case -- a history-dependent RHS is not a
     vector field and cannot be batched or differentiated cleanly.
     """
-    if not (spec.p0.tau_v_same and spec.p0.tau_d_same):
-        raise NotImplementedError(
-            "asymmetric inflation/deflation tau needs the reference's history-dependent "
-            "branch; set tau_v_same and tau_d_same"
-        )
+    c = build_cache(spec, P, shift_depths=shift_depths) if cache is None else cache
+    return rhs(x, u, c, spec.N, spec.K)
 
-    p0 = p0_tensors(spec)
-    N, K = spec.N, spec.K
 
+def rhs(x: torch.Tensor, u: torch.Tensor, c: ForwardCache, N: int, K: int) -> torch.Tensor:
+    """State equation from a prebuilt cache, with no parameter bookkeeping.
+
+    Split out from :func:`f_ode` because this is the function the integrator
+    differentiates tens of thousands of times, and it is the unit handed to
+    ``torch.compile``: everything it touches is a tensor or a Python int, so
+    dynamo traces the depth loop into one fused graph.
+    """
     xE = x[..., 0:N]
     xI = x[..., N : 2 * N]
     xA = x[..., 2 * N : 3 * N]
@@ -217,83 +360,69 @@ def f_ode(
     q_d = torch.exp(x[..., base + 3 * K : base + 4 * K])
 
     # ---- neuronal ---------------------------------------------------------
-    # The diagonal of A is replaced by -sigma*exp(diag(A)): self-inhibition is
-    # parameterised multiplicatively around the global time constant sigma, so
-    # sigma alone sets the overall temporal scale of the neuronal response.
-    sigma = p0["sigma"] * torch.exp(P["sigma"])
-    A = P["A"]
-    diagA = torch.diagonal(A, dim1=-2, dim2=-1)
-    A = A - torch.diag_embed(diagA) - torch.diag_embed(sigma[..., None] * torch.exp(diagA))
-    n_mod = P["B"].shape[-3]
+    n_mod = c.B.shape[-3]
+    A = c.A_base
     for m in range(n_mod):
-        A = A + u[..., m, None, None] * P["B"][..., m, :, :]
+        A = A + u[..., m, None, None] * c.B[..., m, :, :]
 
     u_mod = u[..., :n_mod]
-    mu = p0["mu"] * torch.exp(P["mu"][..., None] + (P["Bmu"] * u_mod[..., None, :]).sum(-1))
-    lam = p0["lam"] * torch.exp(P["lam"][..., None] + (P["Blam"] * u_mod[..., None, :]).sum(-1))
+    mu = c.mu0 * torch.exp(c.mu_log[..., None] + (c.Bmu * u_mod[..., None, :]).sum(-1))
+    lam = c.lam0 * torch.exp(c.lam_log[..., None] + (c.Blam * u_mod[..., None, :]).sum(-1))
     mu = mu.expand(*torch.broadcast_shapes(mu.shape[:-1], xE.shape[:-1]), N)
     lam = lam.expand(*torch.broadcast_shapes(lam.shape[:-1], xE.shape[:-1]), N)
 
-    CU = (P["C"] * u[..., None, :]).sum(-1)  # (..., N)
-
-    c1 = _expand_N(spec, p0["c1"], P["c1"])
-    c2 = _expand_N(spec, p0["c2"], P["c2"])
-    c3 = _expand_N(spec, p0["c3"], P["c3"])
+    CU = (c.C * u[..., None, :]).sum(-1)  # (..., N)
 
     dxE = (A @ xE[..., None])[..., 0] - mu * xI + CU
     dxI = lam * (xE - xI)
-    dxA = xE - c1 * xA
-    dlog_xF = (c2 * xA - c3 * (xF - 1.0)) / xF
+    dxA = xE - c.c1 * xA
+    dlog_xF = (c.c2 * xA - c.c3 * (xF - 1.0)) / xF
 
     # ---- neurovascular coupling across depths -----------------------------
-    n2k = neuronal_to_vascular(spec, P, shift_depths=shift_depths)
     # Relative CBF at each vascular depth: a weighted blend of the neuronal
     # depths' CBF, expressed as a deviation from baseline so weights that do
     # not sum to 1 (after the nb correction) cannot shift the resting state.
-    cbf_k = (n2k @ (xF - 1.0)[..., None])[..., 0] + 1.0
+    cbf_k = (c.n2k @ (xF - 1.0)[..., None])[..., 0] + 1.0
 
     # ---- hemodynamics -----------------------------------------------------
-    hemo = baseline_hemodynamics(spec, P)
-    F0v, F0d = hemo["F0v"], hemo["F0d"]
-    t0v, t0d = hemo["t0v"], hemo["t0d"]
-
-    al_v = _expand_K(spec, p0["al_v"], P["al_v"])
-    al_d = _expand_K(spec, p0["al_d"], P["al_d"])
-    nr = _expand_K(spec, p0["nr"], P["nr"])
-    tau_v = _expand_K(spec, p0["tau_v_in"], P["tau_v_in"])
-    tau_d = _expand_K(spec, p0["tau_d_in"], P["tau_d_in"])
+    t0v, t0d = c.t0v, c.t0d
+    tau_d = c.tau_d
+    w_v_in, w_d_in = c.w_v_in, c.w_d_in
 
     # Venules: outflow is the steady-state power law blended with the inflow by
     # the viscoelastic constant (Eq. 3 of Havlicek & Uludag 2020, rearranged).
-    fv = (t0v * v_v ** (1.0 / al_v) + tau_v * cbf_k) / (t0v + tau_v)
+    fv = (t0v * v_v**c.inv_al_v + c.tau_v * cbf_k) / c.sum_v
     dlog_v_v = (cbf_k - fv) / (t0v * v_v)
     # CMRO2 from the n-ratio: m = (f - 1)/n + 1.
-    cmro2 = (cbf_k + nr - 1.0) / nr
+    cmro2 = (cbf_k + c.nr - 1.0) / c.nr
     dlog_q_v = (cmro2 - fv * q_v / v_v) / (t0v * q_v)
 
     # Ascending vein: a serial chain from the deepest depth up to the surface.
     # K is 7-11, so the Python loop is negligible next to the batch dimension.
-    w_v_in = F0v / F0d  # venule share of this depth's AV inflow
-    w_d_in = torch.zeros_like(F0d)
-    w_d_in[..., :-1] = F0d[..., 1:] / F0d[..., :-1]  # share from the depth below
-
-    dlog_v_d = torch.zeros_like(v_d)
-    dlog_q_d = torch.zeros_like(q_d)
+    # Accumulate into lists and stack once. In-place writes into a preallocated
+    # tensor are the obvious way to write this and cost roughly 20x more under
+    # forward-mode AD, which has to materialise and copy the tangent on every
+    # assignment. The integrator differentiates this function at every microtime
+    # bin, so that overhead was the whole runtime.
+    dv_d: list[torch.Tensor] = [torch.empty(0)] * K
+    dq_d: list[torch.Tensor] = [torch.empty(0)] * K
     fd_next = torch.zeros_like(v_d[..., 0])
     qv_ratio = q_v / v_v
     qd_ratio = q_d / v_d
     for k in range(K - 1, -1, -1):
         inflow = fv[..., k] * w_v_in[..., k] + fd_next * w_d_in[..., k]
-        fd_k = (t0d[..., k] * v_d[..., k] ** (1.0 / al_d[..., k]) + tau_d[..., k] * inflow) / (
-            t0d[..., k] + tau_d[..., k]
-        )
+        fd_k = (t0d[..., k] * v_d[..., k] ** c.inv_al_d[..., k] + tau_d[..., k] * inflow) / c.sum_d[
+            ..., k
+        ]
         dhb_in = fv[..., k] * w_v_in[..., k] * qv_ratio[..., k]
         if k < K - 1:
             dhb_in = dhb_in + fd_next * w_d_in[..., k] * qd_ratio[..., k + 1]
-        dlog_v_d[..., k] = (inflow - fd_k) / (t0d[..., k] * v_d[..., k])
-        dlog_q_d[..., k] = (dhb_in - fd_k * qd_ratio[..., k]) / (t0d[..., k] * q_d[..., k])
+        dv_d[k] = (inflow - fd_k) / (t0d[..., k] * v_d[..., k])
+        dq_d[k] = (dhb_in - fd_k * qd_ratio[..., k]) / (t0d[..., k] * q_d[..., k])
         fd_next = fd_k
 
+    dlog_v_d = torch.stack(dv_d, dim=-1)
+    dlog_q_d = torch.stack(dq_d, dim=-1)
     return torch.cat([dxE, dxI, dxA, dlog_xF, dlog_v_v, dlog_q_v, dlog_v_d, dlog_q_d], dim=-1)
 
 
@@ -302,6 +431,8 @@ def g_obs(
     P: dict[str, torch.Tensor],
     spec: ModelSpec,
     kernel: torch.Tensor | None = None,
+    *,
+    cache: ForwardCache | None = None,
 ) -> torch.Tensor:
     """Laminar BOLD signal (percent change) at each of the K vascular depths.
 
@@ -313,7 +444,7 @@ def g_obs(
     ``kernel`` applies the depth point-spread function that maps model depths
     onto sampled voxels.
     """
-    p0 = p0_tensors(spec)
+    c = build_cache(spec, P) if cache is None else cache
     N, K = spec.N, spec.K
     base = 4 * N
     v_v = torch.exp(x[..., base + 0 * K : base + 1 * K])
@@ -321,33 +452,9 @@ def g_obs(
     v_d = torch.exp(x[..., base + 2 * K : base + 3 * K])
     q_d = torch.exp(x[..., base + 3 * K : base + 4 * K])
 
-    hemo = baseline_hemodynamics(spec, P)
-    # CBV0 as a fraction of tissue rather than an absolute volume in mL.
-    V0vq = hemo["V0v"] / 100.0 * K
-    V0dq = hemo["V0d"] / 100.0 * K
-
-    E0v = _expand_K(spec, p0["E0v"], P["E0v"])
-    E0d = _expand_K(spec, p0["E0d"], P["E0d"])
-
-    TE, B0 = spec.TE, spec.B0
-    nu0v = p0["suscep"] * p0["gyro"] * p0["Hct_v"] * B0
-    nu0d = p0["suscep"] * p0["gyro"] * p0["Hct_d"] * B0
-
-    # Baseline intra-to-extra-vascular signal ratio
-    ep_v = p0["rho_v"] / p0["rho_t"] * torch.exp(-TE * (p0["R2s_v"] - p0["R2s_t"]))
-    ep_d = p0["rho_d"] / p0["rho_t"] * torch.exp(-TE * (p0["R2s_d"] - p0["R2s_t"]))
-
-    H0 = 1.0 / (1.0 - V0vq - V0dq + ep_v * V0vq + ep_d * V0dq)
-
-    k1v = 4.3 * nu0v * E0v * TE
-    k2v = ep_v * p0["r0v"] * E0v * TE
-    k3v = 1.0 - ep_v
-    k1d = 4.3 * nu0d * E0d * TE
-    # Bug of record: the reference scales the ascending vein's intravascular
-    # term by the *venule* ratio ep_v. Replicated deliberately -- changing it
-    # would silently break parity with the published fits.
-    k2d = ep_v * p0["r0d"] * E0d * TE
-    k3d = 1.0 - ep_d
+    V0vq, V0dq, H0 = c.V0vq, c.V0dq, c.H0
+    k1v, k2v, k3v = c.k1v, c.k2v, c.k3v
+    k1d, k2d, k3d = c.k1d, c.k2d, c.k3d
 
     lbr = (
         H0

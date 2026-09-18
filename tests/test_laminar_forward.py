@@ -160,7 +160,8 @@ def test_baseline_cbv_increases_toward_surface():
 def test_sample_indices_match_spm_int_it():
     """ceil((0:v-1)*u/v) + D, the reference's output sampling."""
     idx = sample_indices(n_micro=32 * 10, n_scans=10, delay_bins=16)
-    expected = np.ceil(np.arange(10) * 320 / 10).astype(int) + 16
+    # -1 converts the reference's 1-based microtime index to our 0-based one.
+    expected = np.ceil(np.arange(10) * 320 / 10).astype(int) + 16 - 1
     assert np.array_equal(idx.numpy(), expected)
 
 
