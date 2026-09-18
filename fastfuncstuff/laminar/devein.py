@@ -49,6 +49,7 @@ from dataclasses import dataclass
 
 import torch
 
+from fastfuncstuff.laminar.forward import neuronal_to_vascular
 from fastfuncstuff.laminar.integrate import batch_bucket, integrate
 from fastfuncstuff.laminar.params import ModelSpec
 
@@ -210,39 +211,46 @@ def apply_deveining(values: torch.Tensor, W_inv: torch.Tensor) -> torch.Tensor:
 
 def deveining_fidelity(
     impulse_response: torch.Tensor,
+    spec: ModelSpec,
+    P: dict[str, torch.Tensor],
     *,
     mode: str = "peak",
 ) -> dict[str, torch.Tensor]:
     """How much a static, and then a scalar, correction gives up.
 
     Returns diagnostics that decide whether the cheap form is defensible for a
-    given ROI, rather than assuming it:
+    given ROI, rather than assuming it.
 
-    ``from_deeper`` / ``from_shallower``
-        Fraction of each output depth's amplitude contributed by neuronal depths
-        below / above the one lying at that cortical position. These must be
-        read as a pair, because two different mechanisms mix depths and only one
-        of them is a vein:
+    Two mechanisms mix depths and only one of them is a vein:
 
-        * the neuronal -> vascular Gaussian basis spreads activity across
-          neighbouring depths **symmetrically**, and is not contamination at all
-          -- it is the depth mapping;
-        * venous drainage adds mass **directionally**, from deeper depths only.
+    * the neuronal -> vascular Gaussian basis spreads activity across
+      neighbouring depths **symmetrically**, and is not contamination at all --
+      it is the depth mapping;
+    * venous drainage adds mass **directionally**, from deeper depths only.
 
-        So ``from_shallower`` is the symmetric-spread floor, and the asymmetry
-        between them is the part a vein caused. A metric that merely summed
-        off-diagonal mass would conflate the two and report a boundary depth as
-        heavily contaminated when it is simply straddling two neuronal depths.
-    ``drainage_asymmetry``
-        ``from_deeper - from_shallower``: the directional, vein-attributable
-        fraction. This is what a per-depth scalar cannot remove, because
-        rescaling a depth against itself cannot subtract what leaked in from
-        below. Expect it near zero at the deepest depth and largest at the
-        surface.
+    Separating them is harder than it looks, and two earlier versions of this
+    function got it wrong in the same way. Summing off-diagonal mass conflates
+    them outright. Assigning each vascular depth an "own" neuronal depth and
+    measuring asymmetry about it also fails, because the symmetric floor is not
+    zero and varies with ``k``: a vascular depth whose centre falls between two
+    neuronal centres sources heavily from one side *through the basis alone*,
+    and scores as the most veined depth in the ROI. There is no binning that
+    fixes this -- the notion of an "own depth" is the flaw.
 
-        ``K > N``, so "its own depth" is not the matrix diagonal: vascular depth
-        ``k`` is paired with the neuronal depth covering that fraction of
-        cortex, ``k * N // K``.
+    So the basis is not approximated, it is **computed**, and the drainage is
+    what the actual mixing has on top of it:
+
+    ``drainage_shift``
+        How much deeper each vascular depth sources its signal than the pure
+        depth mapping predicts, in units of neuronal depths. A centre-of-mass
+        difference: positive means the row draws from deeper than the basis
+        alone would give, which only a vein can cause. Expect ~0 at the deepest
+        depth and largest at the surface. This is the quantity a per-depth
+        scalar cannot remove, because rescaling a depth against itself cannot
+        subtract what drained into it.
+    ``source_centre`` / ``basis_centre``
+        The two centres of mass the shift is a difference of, if you want to
+        plot them against each other.
     ``peak_lag``
         Scans from drive to peak, per (K, N) pair. Spread across the column is
         the transit delay a static operator discards.
@@ -254,19 +262,23 @@ def deveining_fidelity(
     W, _ = static_deveining_matrix(impulse_response, mode=mode)
     K, N = W.shape
     mag = W.abs()
-    total = mag.sum(dim=1).clamp(min=1e-300)
-    own = (torch.arange(K, device=W.device) * N // K).clamp(max=N - 1)
-    col = torch.arange(N, device=W.device)[None, :].expand(K, N)
-    own_col = own[:, None]
-    from_deeper = torch.where(col > own_col, mag, mag.new_zeros(())).sum(dim=1) / total
-    from_shallower = torch.where(col < own_col, mag, mag.new_zeros(())).sum(dim=1) / total
+    w_norm = mag / mag.sum(dim=1, keepdim=True).clamp(min=1e-300)
+
+    # The vein-free reference: the neuronal -> vascular mapping on its own.
+    basis = neuronal_to_vascular(spec, P).to(dtype=W.dtype)
+    if basis.ndim > 2:  # a batched parameter set; the mapping is shared
+        basis = basis.reshape(-1, K, N)[0]
+    b_norm = basis.abs() / basis.abs().sum(dim=1, keepdim=True).clamp(min=1e-300)
+
+    depth_index = torch.arange(N, device=W.device, dtype=W.dtype)
+    source_centre = (w_norm * depth_index).sum(dim=1)
+    basis_centre = (b_norm * depth_index).sum(dim=1)
 
     peak_lag = impulse_response.abs().argmax(dim=-1).to(impulse_response.dtype)
     return {
-        "from_deeper": from_deeper,
-        "from_shallower": from_shallower,
-        "drainage_asymmetry": from_deeper - from_shallower,
-        "own_depth": own,
+        "drainage_shift": source_centre - basis_centre,
+        "source_centre": source_centre,
+        "basis_centre": basis_centre,
         "peak_lag": peak_lag,
         "lag_spread": peak_lag.max(dim=1).values - peak_lag.min(dim=1).values,
     }

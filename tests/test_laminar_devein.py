@@ -29,10 +29,15 @@ N_SCANS = 12
 
 
 @pytest.fixture(scope="module")
-def impulse():
+def params():
     P = zero_params(SPEC)
     P["C"] = torch.tensor([[0.0, 1.0]] * SPEC.N, dtype=SPEC.dtype)
-    return laminar_impulse_response(SPEC, P, N_SCANS, amplitude=1.0)
+    return P
+
+
+@pytest.fixture(scope="module")
+def impulse(params):
+    return laminar_impulse_response(SPEC, params, N_SCANS, amplitude=1.0)
 
 
 def test_impulse_response_shape_is_output_by_input_by_time(impulse):
@@ -58,33 +63,30 @@ def test_drainage_is_superficial_and_the_operator_is_triangular(impulse):
     )
 
 
-def test_the_deepest_depth_is_clean_and_the_surface_is_not(impulse):
+def test_the_deepest_depth_is_clean_and_the_surface_is_not(impulse, params):
     """The asymmetry deveining exists to undo.
 
-    Every depth below drains through the superficial one, so it collects
-    cross-laminar mass from below; nothing drains downward, so the deepest depth
-    is essentially its own neurons alone. Measured on the fitted operator, not
-    assumed.
+    Every depth below drains through the superficial one, so it sources from
+    deeper than the depth mapping alone would give; nothing drains downward, so
+    the deepest depth sits exactly on the basis. Measured against the computed
+    basis, not against an assumed "own depth".
     """
-    d = deveining_fidelity(impulse, mode="auc")
-    asym = d["drainage_asymmetry"]
-    assert float(asym[0]) > 0.3, "surface should be heavily contaminated from below"
-    assert float(asym[-1]) == pytest.approx(0.0, abs=0.02), "deepest depth should be clean"
-    # Superficial half contaminated more than deep half.
+    d = deveining_fidelity(impulse, SPEC, params, mode="auc")
+    shift = d["drainage_shift"]
+    assert float(shift[0]) > 0.3, "surface should source well below its own depth"
+    assert float(shift[-1]) == pytest.approx(0.0, abs=0.02), "deepest depth should be clean"
     half = SPEC.K // 2
-    assert float(asym[:half].mean()) > float(asym[half:].mean())
+    assert float(shift[:half].mean()) > float(shift[half:].mean())
 
 
-def test_drainage_is_one_way(impulse):
-    """Mass arrives from below, never from above.
+def test_drainage_is_one_way(impulse, params):
+    """No vascular depth sources *shallower* than the basis predicts.
 
-    The symmetric neuronal->vascular basis puts a little mass on the shallower
-    side at a depth boundary; a vein puts none there at all. So from_shallower
-    stays at the basis floor while from_deeper is large.
+    A vein can only move the centre of mass deeper. A negative shift anywhere
+    would mean the mixing draws from above, which has no physical path.
     """
-    d = deveining_fidelity(impulse, mode="auc")
-    assert float(d["from_shallower"].max()) < 0.05
-    assert float(d["from_deeper"].max()) > 0.3
+    shift = deveining_fidelity(impulse, SPEC, params, mode="auc")["drainage_shift"]
+    assert float(shift.min()) > -1e-6, f"negative drainage shift: {shift.tolist()}"
 
 
 def test_forward_mixing_is_strictly_triangular(impulse):
@@ -98,10 +100,10 @@ def test_forward_mixing_is_strictly_triangular(impulse):
     assert float(W[0, -1].abs()) > 0.05
 
 
-def test_transit_imposes_a_lag_spread(impulse):
+def test_transit_imposes_a_lag_spread(impulse, params):
     """A scalar correction cannot represent a delay. Assert there is one to
     represent: contributions to a depth must not all peak on the same scan."""
-    spread = deveining_fidelity(impulse, mode="auc")["lag_spread"]
+    spread = deveining_fidelity(impulse, SPEC, params, mode="auc")["lag_spread"]
     assert float(spread.max()) > 0, "no transit delay found; a static operator would be exact"
 
 
@@ -164,3 +166,56 @@ def test_deveined_timecourses_returns_aligned_axes():
 def test_static_deveining_rejects_an_unknown_mode(impulse):
     with pytest.raises(ValueError, match="mode must be"):
         static_deveining_matrix(impulse, mode="median")
+
+
+def test_uniform_drive_gives_sloped_bold_that_deveining_flattens():
+    """The claim, end to end: uniform neurons, sloped BOLD, flat again after.
+
+    Drive every neuronal depth equally. The draining vein turns that into a BOLD
+    profile ramping steeply toward the surface -- the bias this whole module
+    exists to undo. Applying the operator must recover the flat profile.
+
+    Not circular in the way it looks: the operator is built from *impulse*
+    responses while the measured curve comes from a *boxcar* run, so this also
+    checks the static reduction survives a change of stimulus shape.
+    """
+    P = zero_params(SPEC)
+    P["C"] = torch.tensor([[0.0, 1.0]] * SPEC.N, dtype=SPEC.dtype)
+    n_micro = int(round(20 * SPEC.TR / SPEC.dt))
+    u = build_input(SPEC, [[], [2.0]], [[], [2.0]], n_micro)
+    dev = deveined_timecourses(SPEC, P, u, 20)
+
+    measured = dev.y_predicted[1:14].max(dim=0).values  # (K,)
+    # The vein imposed a real gradient: surface well above the deepest depth.
+    assert float(measured[0] / measured[-1]) > 1.5, "no draining-vein ramp to undo"
+
+    ir = laminar_impulse_response(SPEC, P, 20, amplitude=1.0)
+    _, W_inv = static_deveining_matrix(ir, mode="auc")
+    deveined = apply_deveining(measured, W_inv)
+
+    spread = float(deveined.max() - deveined.min()) / float(deveined.mean().abs())
+    assert spread < 0.15, f"deveined profile should be flat for uniform drive, spread={spread:.3f}"
+
+
+def test_drainage_shift_is_basis_referenced_at_every_k():
+    """Bug of record: the contamination metric was wrong twice, the same way.
+
+    Summing off-diagonal mass conflates the symmetric neuronal->vascular basis
+    with directional drainage. Assigning each vascular depth an "own" neuronal
+    depth and measuring asymmetry about it fails too: the symmetric floor is not
+    zero and varies with k, so a depth whose centre falls between two neuronal
+    centres scored as the most veined in the ROI. No binning fixes it -- the
+    basis has to be computed and subtracted.
+
+    Checked at three K because the earlier versions passed at K=6 and failed at
+    K=7 and K=9.
+    """
+    for K in (6, 7, 9):
+        spec = ModelSpec(N=3, K=K, n_inputs=2, n_mod=1)
+        P = zero_params(spec)
+        P["C"] = torch.tensor([[0.0, 1.0]] * spec.N, dtype=spec.dtype)
+        ir = laminar_impulse_response(spec, P, 16, amplitude=1.0)
+        shift = deveining_fidelity(ir, spec, P, mode="auc")["drainage_shift"]
+        assert float(shift[-1]) == pytest.approx(0.0, abs=1e-3), f"K={K} deepest not clean"
+        assert float(shift.argmax()) < K / 2, f"K={K} contamination must peak superficially"
+        assert float(shift.min()) > -1e-6, f"K={K} drainage must be one-way"

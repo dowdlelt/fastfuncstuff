@@ -78,9 +78,10 @@ import torch
 
 from fastfuncstuff.laminar import (
     ModelSpec, P0,
-    build_input, estimate_depth_psf, fit_model_space, integrate,
-    label_mean, layer_model_names, posterior_model_probabilities,
-    voxels_to_layers,
+    apply_deveining, build_input, deveined_timecourses, deveining_fidelity,
+    estimate_depth_psf, fit_model_space, integrate, label_mean,
+    laminar_impulse_response, layer_model_names, posterior_model_probabilities,
+    static_deveining_matrix, voxels_to_layers,
 )
 
 plt.rcParams.update({
@@ -516,38 +517,176 @@ parameters and reading out the *neuronal* states instead of the BOLD gives the
 depth-resolved neuronal timecourses — the draining-vein bias removed by
 construction rather than by regression.
 
-Compare the two panels: the BOLD profile rises steeply toward the surface, and
-the neuronal one does not.
+`deveined_timecourses` is the exact form: it re-integrates the fit. Compare the
+measured BOLD curve at each depth against the inferred neuronal one.
 """)
 
 code("""
-_, states = integrate(
-    u_for_k[K_fit], res_best.Ep, spec, ns,
-    kernel=kernel_for_k[K_fit], return_states=True,
+dev = deveined_timecourses(
+    spec, res_best.Ep, u_for_k[K_fit], ns,
+    y_measured=torch.as_tensor(y_obs), kernel=kernel_for_k[K_fit],
 )
-states = states.numpy()
-xE = states[:, : spec.N]                       # excitatory activity per neuronal depth
+xE = dev.neuronal.numpy()
+y_hat_dev = dev.y_predicted.numpy()
+print(f"neuronal {xE.shape} (TR x neuronal depth), BOLD {y_hat_dev.shape} (TR x vascular depth)")
+""")
 
-fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
-for i, name in enumerate(depth_names):
-    axes[0].plot(xE[:, i], lw=2, label=name)
-axes[0].set(xlabel="TR (concatenated)", ylabel="excitatory activity (a.u.)",
-            title="Deveined laminar neuronal response")
+md("""
+### Curves, before and after
+
+The left panel is what the scanner measured at each vascular depth: every curve
+carries everything draining through it from below. The right panel is what the
+model says the neurons did. The superficial BOLD curve is the one that changes
+most, because it is the one most contaminated.
+""")
+
+code("""
+era = slice(1, n_tr_era)
+t_era = np.arange(n_tr_era - 1) * CFG["TR"]
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharex=True)
+cmap = plt.get_cmap("viridis")
+for k in range(K_fit):
+    axes[0].plot(t_era, y_obs[era, k], lw=1.8, color=cmap(k / max(K_fit - 1, 1)),
+                 label=f"depth {k}" if k in (0, K_fit - 1) else None)
+axes[0].set(xlabel="time (s)", ylabel="signal change (%)",
+            title=f"Measured BOLD, {K_fit} vascular depths (0 = CSF)")
 axes[0].legend(fontsize=8)
+axes[0].axhline(0, color="0.7", lw=0.8)
 
-peak_bold = y_obs[1:n_tr_era].max(axis=0)
-axes[1].plot(peak_bold, np.arange(K_fit), "o-", color="#c44e52", lw=2)
-axes[1].set(xlabel="peak signal change (%)", ylabel="depth index (0 = CSF)",
+for i, name in enumerate(depth_names):
+    axes[1].plot(t_era, xE[era, i], lw=2, label=name)
+axes[1].set(xlabel="time (s)", ylabel="excitatory activity (a.u.)",
+            title="Deveined laminar neuronal response")
+axes[1].legend(fontsize=8)
+axes[1].axhline(0, color="0.7", lw=0.8)
+plt.tight_layout()
+""")
+
+code("""
+fig, axes = plt.subplots(1, 2, figsize=(9, 3.6))
+
+peak_bold = y_obs[era].max(axis=0)
+axes[0].plot(peak_bold, np.arange(K_fit), "o-", color="#c44e52", lw=2)
+axes[0].set(xlabel="peak signal change (%)", ylabel="depth index (0 = CSF)",
             title="Measured BOLD depth profile")
+axes[0].invert_yaxis()
+
+peak_neuronal = xE[era].max(axis=0)
+axes[1].plot(peak_neuronal, np.arange(spec.N), "o-", color="#55a868", lw=2)
+axes[1].set(xlabel="peak excitatory activity (a.u.)", ylabel="neuronal depth",
+            title="Inferred neuronal depth profile")
+axes[1].set_yticks(range(spec.N))
+axes[1].set_yticklabels(depth_names)
+axes[1].invert_yaxis()
+plt.tight_layout()
+""")
+
+md("""
+## 11. The deveining operator: a depth x ROI correction you can reuse
+
+The timecourses above are exact but tied to this fit. What a downstream analysis
+usually wants is an **operator** — something to multiply into betas, FIR/TENT
+curves or event-related averages from any design.
+
+`laminar_impulse_response` gives the full transfer: BOLD at each vascular depth
+in response to neuronal drive at each neuronal depth alone. Depth *k* responds to
+depth *n* with a **kernel**, not a number — the vein delays and smears — so the
+honest object has a time axis.
+""")
+
+code("""
+ir = laminar_impulse_response(spec, res_best.Ep, n_scans=20, amplitude=1.0)
+print(f"transfer {tuple(ir.shape)}  (vascular depth, neuronal depth, TR)")
+
+W, W_inv = static_deveining_matrix(ir, mode="auc")
+fid = deveining_fidelity(ir, spec, res_best.Ep, mode="auc")
+
+row_norm = (W.abs() / W.abs().sum(1, keepdim=True)).numpy()
+print("\\nRow-normalised forward mixing (rows = vascular depth, 0 = superficial):")
+for k in range(K_fit):
+    bars = "  ".join(f"{v:5.3f}" for v in row_norm[k])
+    print(f"  depth {k}:  {bars}")
+""")
+
+code("""
+fig, axes = plt.subplots(1, 3, figsize=(13, 3.6))
+
+im = axes[0].imshow(row_norm, cmap="magma", aspect="auto", vmin=0, vmax=1)
+axes[0].set(xlabel="neuronal depth", ylabel="vascular depth (0 = CSF)",
+            title="Forward mixing W (row-normalised)")
+axes[0].set_xticks(range(spec.N))
+axes[0].set_xticklabels(depth_names, rotation=20, ha="right")
+plt.colorbar(im, ax=axes[0], fraction=0.046)
+
+shift = fid["drainage_shift"].numpy()
+axes[1].plot(shift, np.arange(K_fit), "o-", color="#4c72b0", lw=2)
+axes[1].set(xlabel="depths deeper than the basis predicts", ylabel="vascular depth",
+            title="Vein-attributable contamination")
+axes[1].axvline(0, color="0.7", lw=0.8)
 axes[1].invert_yaxis()
 
-peak_neuronal = xE[1:n_tr_era].max(axis=0)
-axes[2].plot(peak_neuronal, np.arange(spec.N), "o-", color="#55a868", lw=2)
-axes[2].set(xlabel="peak excitatory activity (a.u.)", ylabel="neuronal depth",
-            yticks=range(spec.N), yticklabels=depth_names,
-            title="Inferred neuronal depth profile")
-axes[2].invert_yaxis()
+for k in (0, K_fit // 2, K_fit - 1):
+    axes[2].plot(ir[k].sum(0).numpy(), lw=2, label=f"depth {k}")
+axes[2].set(xlabel="TR after drive", ylabel="BOLD (a.u.)",
+            title="Transit delay and smearing")
+axes[2].legend(fontsize=8)
 plt.tight_layout()
+""")
+
+md("""
+**Read the left panel as the justification for all of this.** The matrix is
+strictly triangular: the deepest depth draws essentially everything from its own
+neurons, while the superficial depth draws roughly half its signal from below.
+
+That is why a *per-depth scalar* is the wrong shape. Rescaling a depth against
+itself cannot subtract what drained into it — the fix at the surface is not
+"multiply by 0.5", it is "remove the half belonging to the depths beneath". The
+K x N matrix expresses that; K scalars cannot.
+
+The middle panel separates the two mechanisms that mix depths. The
+neuronal-to-vascular Gaussian basis spreads activity **symmetrically** and is not
+contamination at all — it is the depth mapping. Only venous drainage is
+**directional**. So the basis is computed explicitly and subtracted: what remains
+is how much deeper each depth sources than the mapping alone would give, which
+only a vein can cause. It is exactly zero at the deepest depth.
+""")
+
+md("""
+### Applying it: deveined amplitudes
+
+`apply_deveining` is the whole point — a matrix multiply that turns
+depth-resolved measured amplitudes into neuronal-depth ones. It broadcasts over
+leading axes, so parcels and timepoints come along for free.
+""")
+
+code("""
+measured_peaks = torch.as_tensor(y_obs[era].max(axis=0))     # (K,) measured per depth
+deveined_peaks = apply_deveining(measured_peaks, W_inv)      # (N,) neuronal depths
+
+print("measured BOLD peak per vascular depth (%):")
+print("   " + "  ".join(f"{v:6.3f}" for v in measured_peaks.numpy()))
+print("\\ndeveined amplitude per neuronal depth:")
+for name, v in zip(depth_names, deveined_peaks.numpy()):
+    print(f"   {name:>12s}: {v:8.4f}")
+
+# The same operator applied to a whole stack of parcels x depths would be
+# apply_deveining(betas, W_inv) with betas of shape (n_parcels, K).
+fake_parcels = measured_peaks.expand(4, K_fit)
+print(f"\\nbatched over parcels: {tuple(fake_parcels.shape)} -> "
+      f"{tuple(apply_deveining(fake_parcels, W_inv).shape)}")
+""")
+
+md("""
+**Caveats that must travel with this output.** Deconvolution amplifies noise:
+removing the deep contribution means subtracting a *prediction* that carries
+posterior uncertainty. A scalar multiplier hides this, scaling signal and noise
+together so tSNR looks untouched — the matrix does not. And the operator assumes
+amplitudes in the units it was fitted in (percent signal change against the same
+baseline), at an effect size near the one it was derived at, since the model is
+nonlinear.
+
+See `../../fmri_wiki/concepts/Model-derived static deveining.md`.
 """)
 
 md("""
