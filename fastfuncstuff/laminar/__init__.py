@@ -21,6 +21,14 @@ batch-first throughout, because the GPU pays off only across the combinatorics
 See ``../fmri_wiki/concepts/Laminar generative model.md``.
 """
 
+from fastfuncstuff.laminar.devein import (
+    DeveinedResult,
+    apply_deveining,
+    deveined_timecourses,
+    deveining_fidelity,
+    laminar_impulse_response,
+    static_deveining_matrix,
+)
 from fastfuncstuff.laminar.experiment import (
     bayesian_parameter_average,
     faes_priors,
@@ -48,6 +56,12 @@ from fastfuncstuff.laminar.params import P0, ModelSpec, zero_params
 
 __all__ = [
     "P0",
+    "DeveinedResult",
+    "apply_deveining",
+    "deveined_timecourses",
+    "deveining_fidelity",
+    "laminar_impulse_response",
+    "static_deveining_matrix",
     "ModelSpec",
     "Priors",
     "VLResult",
