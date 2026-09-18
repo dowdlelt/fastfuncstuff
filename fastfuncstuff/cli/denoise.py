@@ -24,6 +24,7 @@ For help:
 
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -194,11 +195,18 @@ Outputs:
   With -save_pcs timecourse/both:
     {prefix}_noise_pcs.pt              - PC timecourses (.pt PyTorch file)
 
-  With -save_pcs spatial/both:
+  With -save_pcs spatial/both/all:
     {prefix}_run01_pc_weights.nii.gz   - Component weight maps per run (4D NIfTI,
                                          sub-brik k = PC k+1, every component).
                                          Same maps the PC figures draw, in the
                                          space -component_map_space names.
+
+  With -save_pcs all (and figures, with -plots all):
+    {prefix}_run01_pc_weights_amplitude.nii.gz
+                                       - The same components, amplitude-weighted
+                                         instead of amplitude-free. A different
+                                         picture, not more voxels: see
+                                         -component_map_space.
 
   When the cross-validation selected at least one component:
     {prefix}_run01_selected_PCs.txt    - Just the selected ones, as regressors
@@ -206,6 +214,7 @@ Outputs:
   With -plots yes/full:
     {prefix}_denoising_summary.png     - CV performance summary
     {prefix}_component_diagnostics_PC01.png - Per-component diagnostic plots (full mode)
+    {prefix}_component_diagnostics_amplitude_PC01.png - The amplitude-weighted set (all mode)
 
     With -save_model_fit:
         {prefix}_initial_betas.nii.gz      - Initial model betas (4D)
@@ -704,13 +713,16 @@ Notes:
     out_opts.add_argument(
         "-plots",
         type=str,
-        choices=["no", "yes", "full"],
+        choices=["no", "yes", "full", "all"],
         default="no",
         help="Diagnostic figures to write.\n"
         "  no    none.\n"
         "  yes   the summary figure: selection curve, gain against the floor, R² distribution.\n"
         "  full  the summary plus one figure per component -- timecourse with the runs laid out"
-        " left to right, and multi-planar cuts of its spatial weights under each run.",
+        " left to right, and multi-planar cuts of its spatial weights under each run.\n"
+        "  all   as full, but one set of component figures per map flavour: the amplitude-free"
+        " maps and the amplitude-weighted ones, which show genuinely different things"
+        " (see -component_map_space). The second set is suffixed _amplitude.",
     )
     out_opts.add_argument(
         "-no_scree_plot",
@@ -740,7 +752,7 @@ Notes:
     out_opts.add_argument(
         "-save_pcs",
         type=str,
-        choices=["no", "timecourse", "spatial", "both"],
+        choices=["no", "timecourse", "spatial", "both", "all"],
         default="timecourse",
         help="Which parts of the noise components to write out.\n"
         "  no          neither.\n"
@@ -748,17 +760,31 @@ Notes:
         "  spatial     the per-component weight maps, as NIfTI -- every extracted\n"
         "              component, sub-brik k = the PC{k+1} figure.\n"
         "  both        both of the above.\n"
+        "  all         both, with the spatial maps written in BOTH flavours: the\n"
+        "              amplitude-free maps and the amplitude-weighted ones\n"
+        "              (see -component_map_space). The second set is suffixed\n"
+        "              _amplitude.\n"
         "The per-run text files of the component timecourses are written either way.",
     )
     out_opts.add_argument(
         "-component_map_space",
         type=str,
-        choices=["full", "noise_pool"],
+        choices=["full", "full_amplitude", "noise_pool"],
         default="full",
         help=(
-            "Where the per-component spatial maps are defined.\n"
-            "  full        refit each component's weights to every brain voxel, so the map shows"
-            " where the component reaches, not just where it came from.\n"
+            "Which per-component spatial map to write. The two full-brain flavours are\n"
+            "different pictures, not the same picture over more voxels.\n"
+            "  full        refit each component's weights to every brain voxel, preparing"
+            " every voxel the way the extraction prepared the noise pool (same nuisance"
+            " projected out, each timeseries unit-normalized). Amplitude-free, so it is"
+            " comparable across voxels, and it reproduces the noise_pool map exactly where"
+            " the pool is -- the same map, filled in. This is the one to read for WHERE a"
+            " component lives.\n"
+            "  full_amplitude  the raw dot product with the unprepared data. A covariance:"
+            " it scales with each voxel's own amplitude, so it is partly a picture of where"
+            " the signal is big (correlates ~0.64 with plain voxel amplitude, and only ~0.7"
+            " with the amplitude-free map on the very same voxels). Read it for HOW MUCH"
+            " variance removing the component would cost.\n"
             "  noise_pool  show the extraction-space weights only. Cheaper, and the map is then"
             " blank outside the pool."
         ),
@@ -892,6 +918,113 @@ def save_final_design_matrix_plot(
     return out_path
 
 
+@dataclass
+class ComponentMapSet:
+    """One flavour of component spatial map, with where it is defined.
+
+    `suffix` is what separates the files and figures of two flavours asked for in
+    the same run; the primary one carries no suffix, so a single-flavour run keeps
+    the names it has always had.
+    """
+
+    key: str
+    suffix: str
+    description: str
+    maps_per_run: list[np.ndarray]
+    mask_flat: np.ndarray | None
+    pool_space: bool
+
+
+def _resolve_component_maps(
+    results: DenoiseResults,
+    run_starts: list[int],
+    volume_shape: tuple,
+    voxel_mask_np: np.ndarray | None,
+    data_for_component_maps: torch.Tensor | None,
+    nuisance_per_run: list[torch.Tensor] | None,
+    component_map_space: str,
+    want_both: bool,
+    needed: bool,
+) -> list[ComponentMapSet]:
+    """Build the component maps the requested modes call for.
+
+    The two full-brain flavours answer different questions and look genuinely
+    different -- see `sequential.py:compute_full_brain_pc_loadings`. `full` is
+    amplitude-free and reproduces the pool loadings where the pool is; `amplitude`
+    is the raw covariance, which is partly a picture of where the signal is big.
+    """
+    if not needed:
+        return []
+
+    def _pool_mask() -> np.ndarray:
+        # The noise pool sits inside the brain mask, so the full-volume support is
+        # the two-level scatter of both.
+        noise_pool_np = results.noise_pool_mask.cpu().numpy()
+        if voxel_mask_np is None:
+            return noise_pool_np
+        combined = np.zeros(int(np.prod(volume_shape)), dtype=bool)
+        combined[np.where(voxel_mask_np)[0][noise_pool_np]] = True
+        return combined
+
+    def _pool_set(suffix: str = "") -> ComponentMapSet | None:
+        if results.pc_loadings_per_run is None:
+            return None
+        return ComponentMapSet(
+            key="noise_pool",
+            suffix=suffix,
+            description="extraction-space (noise pool) loadings",
+            maps_per_run=[
+                ld.cpu().numpy() if torch.is_tensor(ld) else ld
+                for ld in results.pc_loadings_per_run
+            ],
+            mask_flat=_pool_mask(),
+            pool_space=True,
+        )
+
+    def _full_set(match_extraction: bool, suffix: str) -> ComponentMapSet:
+        return ComponentMapSet(
+            key="full" if match_extraction else "amplitude",
+            suffix=suffix,
+            description=(
+                "full-brain, prepared as the extraction was (amplitude-free)"
+                if match_extraction
+                else "full-brain, raw covariance (amplitude-weighted)"
+            ),
+            maps_per_run=[
+                ld.numpy()
+                for ld in compute_full_brain_pc_loadings(
+                    data=data_for_component_maps,
+                    noise_pcs_per_run=results.noise_pcs_per_run,
+                    run_starts=run_starts,
+                    brain_mask=None,
+                    verbose=False,
+                    nuisance_per_run=nuisance_per_run,
+                    match_extraction=match_extraction,
+                )
+            ],
+            mask_flat=voxel_mask_np,
+            pool_space=False,
+        )
+
+    can_refit = data_for_component_maps is not None
+    if want_both and can_refit:
+        # The pair worth comparing: same components, same voxels, one amplitude-free
+        # and one amplitude-weighted.
+        return [_full_set(True, ""), _full_set(False, "_amplitude")]
+
+    if component_map_space == "full" and can_refit:
+        sets = [_full_set(True, "")]
+    elif component_map_space == "full_amplitude" and can_refit:
+        sets = [_full_set(False, "")]
+    else:
+        sets = []
+
+    if not sets:
+        pool = _pool_set()
+        return [pool] if pool is not None else []
+    return sets
+
+
 def save_denoising_results(
     results: DenoiseResults,
     output_prefix: str,
@@ -900,6 +1033,7 @@ def save_denoising_results(
     run_starts: list[int],
     tr: float,
     data_for_component_maps: torch.Tensor | None = None,
+    nuisance_per_run: list[torch.Tensor] | None = None,
     voxel_mask: torch.Tensor | None = None,
     plots_mode: str = "no",
     slice_axis: str = "x",
@@ -1073,39 +1207,21 @@ def save_denoising_results(
         json.dump(metadata, f, indent=2)
     output_files["metadata"] = metadata_path
 
-    # The component spatial maps, resolved once in the space `component_map_space`
-    # names, so the saved NIfTI and the per-PC figures are the same numbers. They
-    # used to be built separately -- the file from the noise-pool loadings, the
-    # figure from a full-brain refit -- which made the two impossible to compare.
-    component_maps_per_run = None
-    component_maps_mask = None  # Full-volume boolean for the space the maps live in
-    if save_pcs_mode in ["spatial", "both"] or plots_mode == "full":
-        if component_map_space == "full" and data_for_component_maps is not None:
-            component_maps_per_run = [
-                ld.numpy()
-                for ld in compute_full_brain_pc_loadings(
-                    data=data_for_component_maps,
-                    noise_pcs_per_run=results.noise_pcs_per_run,
-                    run_starts=run_starts,
-                    brain_mask=None,
-                    verbose=False,
-                )
-            ]
-            component_maps_mask = voxel_mask_np
-        elif results.pc_loadings_per_run is not None:
-            component_maps_per_run = [
-                ld.cpu().numpy() if torch.is_tensor(ld) else ld
-                for ld in results.pc_loadings_per_run
-            ]
-            # Pool-space maps: the noise pool sits inside the brain mask, so the
-            # full-volume support is the two-level scatter of both.
-            noise_pool_np = results.noise_pool_mask.cpu().numpy()
-            if voxel_mask_np is not None:
-                combined = np.zeros(int(np.prod(volume_shape)), dtype=bool)
-                combined[np.where(voxel_mask_np)[0][noise_pool_np]] = True
-                component_maps_mask = combined
-            else:
-                component_maps_mask = noise_pool_np
+    # The component spatial maps, resolved once per requested flavour, so the
+    # saved NIfTI and the per-PC figures are the same numbers. They used to be
+    # built separately -- the file from the noise-pool loadings, the figure from a
+    # full-brain refit -- which made the two impossible to compare.
+    component_map_sets = _resolve_component_maps(
+        results=results,
+        run_starts=run_starts,
+        volume_shape=volume_shape,
+        voxel_mask_np=voxel_mask_np,
+        data_for_component_maps=data_for_component_maps,
+        nuisance_per_run=nuisance_per_run,
+        component_map_space=component_map_space,
+        want_both=save_pcs_mode == "all" or plots_mode == "all",
+        needed=save_pcs_mode in ["spatial", "both", "all"] or plots_mode in ["full", "all"],
+    )
 
     # 6. Noise PCs (based on save_pcs_mode)
     if save_pcs_mode in ["timecourse", "both"]:
@@ -1120,31 +1236,34 @@ def save_denoising_results(
         )
         output_files["noise_pcs_timecourse"] = pcs_path
 
-    if save_pcs_mode in ["spatial", "both"]:
+    if save_pcs_mode in ["spatial", "both", "all"]:
         # Every extracted component, not optimal+3: the figures show all of them,
         # and a map you cannot open beside its figure is no use. Sub-brik k is
         # PC k+1, the same component the PC{k+1:02d} figure draws.
-        if component_maps_per_run is not None:
-            n_runs = len(component_maps_per_run)
-            for run_idx, loadings_np in enumerate(component_maps_per_run):
-                n_pcs = int(loadings_np.shape[1])
-                pc_path = f"{output_prefix}_run{run_idx + 1:02d}_pc_weights{nii_ext}"
-                save_4d_nifti(
-                    np.asarray(loadings_np, dtype=np.float32),
-                    pc_path,
-                    volume_shape,
-                    affine,
-                    mask_flat=component_maps_mask,
-                    header=nifti_header,
-                    brick_labels=[f"PC{k + 1:02d}" for k in range(n_pcs)],
-                )
-                output_files[f"run{run_idx + 1}_pc_weights"] = pc_path
+        if component_map_sets:
+            for map_set in component_map_sets:
+                n_runs = len(map_set.maps_per_run)
+                for run_idx, loadings_np in enumerate(map_set.maps_per_run):
+                    n_pcs = int(loadings_np.shape[1])
+                    pc_path = (
+                        f"{output_prefix}_run{run_idx + 1:02d}_pc_weights{map_set.suffix}{nii_ext}"
+                    )
+                    save_4d_nifti(
+                        np.asarray(loadings_np, dtype=np.float32),
+                        pc_path,
+                        volume_shape,
+                        affine,
+                        mask_flat=map_set.mask_flat,
+                        header=nifti_header,
+                        brick_labels=[f"PC{k + 1:02d}" for k in range(n_pcs)],
+                    )
+                    output_files[f"run{run_idx + 1}_pc_weights{map_set.suffix}"] = pc_path
 
-            n_saved = int(component_maps_per_run[0].shape[1])
-            print(
-                f"  Saved {n_saved} component spatial maps per run for {n_runs} runs"
-                f" (space: {component_map_space})"
-            )
+                n_saved = int(map_set.maps_per_run[0].shape[1])
+                print(
+                    f"  Saved {n_saved} component spatial maps per run for {n_runs} runs"
+                    f" -- {map_set.description}"
+                )
         else:
             print("  Warning: PC loadings not available (run with return_loadings=True)")
 
@@ -1215,7 +1334,7 @@ def save_denoising_results(
                 print(f"  Warning: Could not save noise-pool PCA scree plot: {e}")
 
     # 7. Plots (based on plots_mode)
-    if plots_mode in ["yes", "full"]:
+    if plots_mode in ["yes", "full", "all"]:
         try:
             from fastfuncstuff.visualization import plot_denoising_pcs, plot_denoising_summary
 
@@ -1243,11 +1362,8 @@ def save_denoising_results(
 
             plt.close(summary_fig)
 
-            # Per-PC plots (only for "full" mode)
-            if plots_mode == "full":
-                print(
-                    f"  Component diagnostics: method={noise_method.upper()}, map_space={component_map_space}"
-                )
+            # Per-PC plots (only for "full"/"all" mode)
+            if plots_mode in ["full", "all"]:
                 # Convert PC tensors to CPU for plotting
                 pcs_cpu = (
                     [pc.cpu() for pc in results.noise_pcs_per_run]
@@ -1255,42 +1371,46 @@ def save_denoising_results(
                     else None
                 )
 
-                # The maps resolved above, so a figure and the NIfTI beside it are
-                # the same numbers. Full-brain maps already live in brain-mask
-                # space, so only pool-space maps need the second-level mask.
-                loadings_cpu = component_maps_per_run
-                pool_space = not (
-                    component_map_space == "full" and data_for_component_maps is not None
-                )
-                noise_pool_mask_for_plot = (
-                    results.noise_pool_mask.cpu().numpy() if pool_space else None
-                )
+                # One set of figures per map flavour, from the same maps that were
+                # saved as NIfTI, so a figure and the volume beside it are the same
+                # numbers. Only pool-space maps need the second-level mask.
+                for map_set in component_map_sets:
+                    print(
+                        f"  Component diagnostics: method={noise_method.upper()},"
+                        f" maps={map_set.description}"
+                    )
+                    figure_prefix = f"{fig_prefix}/component_diagnostics{map_set.suffix}"
+                    plot_denoising_pcs(
+                        noise_pcs_per_run=pcs_cpu,
+                        run_starts=run_starts,
+                        component_variance_ratio_per_run=results.metadata.get(
+                            "ic_variance_ratio_per_run"
+                        ),
+                        pc_weights_per_run=map_set.maps_per_run,
+                        volume_shape=volume_shape,
+                        voxel_mask=voxel_mask_np,
+                        noise_pool_mask=(
+                            results.noise_pool_mask.cpu().numpy() if map_set.pool_space else None
+                        ),
+                        n_pcs_to_show=results.metadata.get(
+                            "extraction_max_components", results.metadata.get("max_components", 0)
+                        ),
+                        n_slices=3,
+                        slice_axis=slice_axis,
+                        tr=tr,
+                        optimal_n_pcs=results.optimal_n_components,
+                        output_prefix=figure_prefix,
+                        affine=affine,
+                        return_figs=False,
+                    )
+                    output_files[f"component_diagnostic_plots{map_set.suffix}"] = (
+                        f"{figure_prefix}_PC*.png"
+                    )
 
-                plot_denoising_pcs(
-                    noise_pcs_per_run=pcs_cpu,
-                    run_starts=run_starts,
-                    component_variance_ratio_per_run=results.metadata.get(
-                        "ic_variance_ratio_per_run"
-                    ),
-                    pc_weights_per_run=loadings_cpu,
-                    volume_shape=volume_shape,
-                    voxel_mask=voxel_mask_np,
-                    noise_pool_mask=noise_pool_mask_for_plot,
-                    n_pcs_to_show=results.metadata.get(
-                        "extraction_max_components", results.metadata.get("max_components", 0)
-                    ),
-                    n_slices=3,
-                    slice_axis=slice_axis,
-                    tr=tr,
-                    optimal_n_pcs=results.optimal_n_components,
-                    output_prefix=f"{fig_prefix}/component_diagnostics",
-                    affine=affine,
-                    return_figs=False,
-                )
-                output_files["component_diagnostic_plots"] = (
-                    f"{fig_prefix}/component_diagnostics_PC*.png"
-                )
-                output_files["pc_diagnostic_plots"] = output_files["component_diagnostic_plots"]
+                if component_map_sets:
+                    output_files["pc_diagnostic_plots"] = output_files[
+                        f"component_diagnostic_plots{component_map_sets[0].suffix}"
+                    ]
 
         except ImportError as e:
             print(f"  Warning: Could not import visualization module: {e}")
@@ -3568,6 +3688,9 @@ def main():
             run_starts=run_starts,
             tr=args.tr,
             data_for_component_maps=data,
+            # The same nuisance the components were extracted against, so the
+            # amplitude-free maps can reproduce that preparation.
+            nuisance_per_run=nuisance_per_run,
             voxel_mask=voxel_mask,
             plots_mode=args.plots,
             slice_axis=args.plot_ax,

@@ -1302,10 +1302,9 @@ def _save_components(tmp_path, results, **kwargs):
         affine=np.eye(4),
         run_starts=[0],
         tr=1.0,
-        save_pcs_mode="both",
         save_scree_plot=False,
         nii_ext=".nii.gz",
-        **kwargs,
+        **{"save_pcs_mode": "both", **kwargs},
     )
 
 
@@ -1338,6 +1337,25 @@ def test_all_component_timecourses_are_written_even_when_none_are_selected(tmp_p
     # An empty regressor file downstream is a broken design, not an empty model.
     assert "run1_selected_pcs_txt" not in files
     assert not (tmp_path / "out_run01_selected_PCs.txt").exists()
+
+
+def test_save_pcs_all_writes_both_map_flavours(tmp_path):
+    """-save_pcs all doubles the maps: amplitude-free, and amplitude-weighted."""
+    import nibabel as nib
+
+    results = _results_with_components(n_voxels=8, n_tp=12, n_comp=4, n_selected=1)
+    files = _save_components(
+        tmp_path,
+        results,
+        save_pcs_mode="all",
+        data_for_component_maps=torch.randn(8, 12),
+        voxel_mask=torch.ones(8, dtype=torch.bool),
+    )
+
+    plain = nib.load(files["run1_pc_weights"]).get_fdata()
+    amplitude = nib.load(files["run1_pc_weights_amplitude"]).get_fdata()
+    assert plain.shape == amplitude.shape == (2, 2, 2, 4)
+    assert not np.allclose(plain, amplitude), "the two flavours must not be the same map"
 
 
 def test_selected_pcs_are_still_written_when_the_selection_kept_some(tmp_path):
@@ -1575,3 +1593,66 @@ def test_explicit_min_gain_overrides_the_auto_floor():
     floor, _, source = pc_selection_floor(curve, pc_min_gain=0.0)
     assert source == "user"
     assert (curve - curve[0]).max() > floor
+
+
+# ---------------------------------------------------------------------------
+# The two component-map flavours
+# ---------------------------------------------------------------------------
+
+
+def test_matched_prep_reproduces_the_pool_loadings_where_the_pool_is():
+    """The default full-brain map must be the pool map, filled in -- not a new one.
+
+    The extraction projects the nuisance out and unit-normalizes each voxel before
+    the PCA. A refit on raw data is a covariance instead: it scales with each
+    voxel's own amplitude, which made the saved map and the pool map look like
+    different components.
+    """
+    from fastfuncstuff.denoise.sequential import (
+        compute_full_brain_pc_loadings,
+        extract_noise_pcs_per_run,
+    )
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    torch.manual_seed(1)
+    n_vox, n_tp = 400, 120
+    # A wide spread of voxel amplitudes is what separates the two flavours.
+    scale = torch.exp(torch.randn(n_vox, 1) * 0.8) * 500
+    comp = torch.randn(n_tp)
+    data = (
+        scale
+        + scale * 0.015 * (torch.randn(n_vox, 1) * comp)
+        + scale * 0.05 * torch.linspace(-1, 1, n_tp)
+        + torch.randn(n_vox, n_tp) * scale * 0.01
+    )
+    pool = torch.zeros(n_vox, dtype=torch.bool)
+    pool[: n_vox // 2] = True
+    poly = construct_polynomial_matrix(n_tp, 3, device=data.device)
+
+    pcs, pool_loadings = extract_noise_pcs_per_run(
+        data,
+        [0],
+        pool,
+        max_components=3,
+        nuisance_per_run=[poly],
+        return_loadings=True,
+        device=torch.device("cpu"),
+    )
+
+    matched = compute_full_brain_pc_loadings(
+        data, pcs, [0], device=torch.device("cpu"), nuisance_per_run=[poly]
+    )
+    raw = compute_full_brain_pc_loadings(
+        data, pcs, [0], device=torch.device("cpu"), match_extraction=False
+    )
+
+    def corr(a, b):
+        return float(torch.corrcoef(torch.stack([a, b]))[0, 1])
+
+    n_pool = int(pool.sum())
+    for k in range(3):
+        assert corr(matched[0][:n_pool, k], pool_loadings[0][:, k]) > 0.9999
+        # The raw flavour is a different map on the very same voxels, and part of
+        # what it draws is just voxel amplitude.
+        assert corr(raw[0][:n_pool, k], pool_loadings[0][:, k]) < 0.9
+        assert corr(raw[0][:, k].abs(), scale[:, 0]) > 0.4

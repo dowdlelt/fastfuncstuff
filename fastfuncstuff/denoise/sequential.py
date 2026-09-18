@@ -1008,6 +1008,8 @@ def compute_full_brain_pc_loadings(
     chunk_size: int | None = None,
     device: torch.device | None = None,
     verbose: bool = False,
+    nuisance_per_run: list[torch.Tensor] | None = None,
+    match_extraction: bool = True,
 ) -> list[torch.Tensor]:
     """
     Compute full-brain spatial loadings for noise PCs by fitting PCs to all brain voxels.
@@ -1017,6 +1019,25 @@ def compute_full_brain_pc_loadings(
 
     For orthonormal PCs (from PCA), the loadings are simply data @ PCs since
     PCs.T @ PCs = I (identity matrix).
+
+    ``match_extraction`` decides *which map you get*, and the two are genuinely
+    different pictures, not the same picture over more voxels:
+
+    - True (default): prepare every voxel the way
+      :func:`extract_noise_pcs_per_run` prepared the noise pool -- project the
+      same per-run nuisance out, then unit-length normalize each timeseries --
+      before the dot product. The result is amplitude-free, a correlation-like
+      "how much does this voxel's shape match the component", and it reproduces
+      the pool-space loadings exactly on pool voxels (up to one scale factor per
+      component, since the PC timecourses were rescaled to unit variance after
+      extraction). This is what "the same map, filled in" means.
+    - False: the raw dot product. That is a covariance: it scales with each
+      voxel's own amplitude and picks up whatever the component overlaps that is
+      still in the data. On data with a realistic spread of voxel amplitudes it
+      correlates only ~0.7 with the pool loadings on the very same voxels, while
+      correlating ~0.64 with plain voxel amplitude. Useful for "how much signal
+      variance would removing this component cost here", misleading for "where
+      does this component live".
 
     Parameters
     ----------
@@ -1035,6 +1056,13 @@ def compute_full_brain_pc_loadings(
         Device for computation (defaults to the device ``data`` is already on)
     verbose : bool, default=False
         Print progress
+    nuisance_per_run : list of torch.Tensor, optional
+        The per-run nuisance the components were extracted against. Projected out
+        before the fit when ``match_extraction`` is set. Leaving it out with
+        ``match_extraction=True`` still normalizes, but the drift then sets the
+        norm, so pass it whenever you have it.
+    match_extraction : bool, default=True
+        Prepare the data the way the extraction did (see above).
 
     Returns
     -------
@@ -1088,6 +1116,16 @@ def compute_full_brain_pc_loadings(
         # Get data for this run: (n_voxels, n_tp_run)
         run_data = data[:, start_tp:end_tp]
 
+        # The same projector the extraction used, built once per run. Applied per
+        # chunk so a whole-brain run never has to exist twice.
+        q_nuisance = None
+        if (
+            match_extraction
+            and nuisance_per_run is not None
+            and nuisance_per_run[run_idx].shape[1] > 0
+        ):
+            q_nuisance = _qr_projector(nuisance_per_run[run_idx].to(run_data.device))
+
         # Accumulate on the compute device — a CPU output tensor cannot take an
         # assignment from a CUDA chunk, which is what pinned this to CPU before.
         loadings_full = torch.zeros(n_voxels_full, pcs.shape[1], device=device)
@@ -1100,6 +1138,13 @@ def compute_full_brain_pc_loadings(
 
             # Data chunk: (chunk_size, n_tp_run)
             chunk_data = run_data[brain_voxel_idx.to(run_data.device), :]
+
+            if match_extraction:
+                if q_nuisance is not None:
+                    chunk_data = chunk_data - (chunk_data @ q_nuisance) @ q_nuisance.T
+                # Equal say per voxel, exactly as the extraction gave the pool.
+                norms = torch.norm(chunk_data, dim=1, keepdim=True).clamp(min=1e-10)
+                chunk_data = chunk_data / norms
 
             # For orthonormal PCs, loadings = data @ PCs (no inverse needed)
             chunk_loadings = chunk_data @ pcs
