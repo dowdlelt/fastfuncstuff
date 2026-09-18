@@ -92,6 +92,216 @@ torch.set_num_threads(max(1, torch.get_num_threads() // 2))
 """)
 
 md("""
+---
+
+# Part 0 — The problem, and how the model solves it
+
+*This part is orientation. Skip to Configuration if you already have the model in
+your head.*
+
+## The problem: veins lie about depth
+
+Gradient-echo BOLD at 7T is dominated by **venous** signal. Blood drains from deep
+cortex toward the pial surface through ascending veins, and it carries the
+deoxyhaemoglobin changes with it. So the signal you measure at a superficial
+depth contains not only what the superficial neurons did, but everything that
+drained up from below — delayed and smeared by the transit.
+
+That produces the signature every laminar fMRI paper has to deal with: **measured
+GE-BOLD ramps steeply toward the pial surface no matter which layer was actually
+active.** A purely deep neuronal response still produces its largest BOLD signal
+at the surface.
+
+Three families of fix exist:
+
+| approach | idea | limitation |
+|---|---|---|
+| vein masking | find and discard veiny voxels | throws away signal; veins are everywhere |
+| phase regression | veins have a phase signature; regress it out | suppresses the voxel, does not redistribute |
+| static deconvolution ([[Menon 2002]]) | subtract a fixed fraction of deeper layers | the fraction is *assumed* |
+| **this** | invert a physiological model of the draining | needs the model to be right |
+
+The argument for the last one: the leakage is not a fixed fraction. It depends on
+how much blood is flowing, which depends on activity, which is what you are
+trying to measure. A **fixed** point-spread function cannot express an
+activity-dependent blur. A generative model can, because it simulates the
+draining.
+
+## The chain, in one paragraph
+
+Neuronal activity at each cortical depth drives a vasoactive signal, which drives
+cerebral blood flow. Flow inflates the local **venules** (a balloon) and washes
+out deoxyhaemoglobin. The venules empty into an **ascending vein** that runs from
+deep cortex to the surface, collecting from every depth on the way. The BOLD
+signal at a depth is then a weighted sum of the dHb and blood-volume changes in
+*both* compartments at that depth. Invert that chain and you get the neuronal
+activity back.
+
+## The two parameters that carry the science: C and B
+
+Almost everything else in the model is physiology. These two are the hypothesis.
+
+**`C` — the driving input.** Shape `(N, n_inputs)`. `C[n, j]` is how strongly
+stimulus column `j` drives neuronal depth `n`. This is *where the input arrives*.
+A visual stimulus arriving in layer 4 is a large `C` at the middle depth.
+
+**`B` — the modulation.** Shape `(n_mod, N, N)`, and only the diagonal is used
+here. `B[0, n, n]` is how much the excitatory self-connection at depth `n`
+*changes* when the modulatory input is on. This is *what a condition changed*.
+
+The distinction matters and is the one students trip on:
+
+> `C` says **where the signal enters**. `B` says **what got stronger or weaker
+> between conditions**.
+
+Faes et al. ask a `B` question: two tone conditions, predictable versus
+mispredicted, and which depth's excitability differed. That is why their model
+space is over `B`.
+
+If you only have **one** condition — visual perception alone, or mental imagery
+alone — there is nothing to modulate, and the question becomes a `C` question:
+which depths receive drive at all. `drive_priors` builds that model space. It is
+the harder inference, for a reason worth internalising: with two conditions,
+systematic error in the vascular model partly **cancels** in the comparison; with
+one condition there is nothing to cancel against, so the answer leans entirely on
+the vein parameters being right.
+
+## What a "model" is here
+
+This is the part that surprises people. The eight models in the model space are
+**not eight different equations**. They are one equation with eight different
+patterns of *prior variance*.
+
+Setting `pC["B"][0, 1, 1] = 0` means "the middle depth's modulation is fixed at
+zero and is not estimated" — the parameter is projected out entirely, so the
+model genuinely has fewer free parameters. Setting it non-zero means "estimate
+it". The eight members are the eight subsets of {superficial, middle, deep}.
+
+That is also what makes the whole thing batchable: every member integrates
+identical code, so the model space is a batch dimension rather than a loop over
+different models.
+
+## How a model wins: free energy
+
+The comparison quantity is the **free energy** `F`, a bound on the log model
+evidence. It is *not* goodness of fit. It is
+
+    F = accuracy − complexity
+
+where complexity charges for how far the parameters had to move from their priors
+and how much the posterior narrowed. A model that fits better by adding a
+parameter only wins if the improvement outruns the cost of that parameter.
+
+Differences in `F` are **log Bayes factors**: a difference of 3 is already
+decisive, 20 is overwhelming. `posterior_model_probabilities` turns a set of `F`
+into a softmax over models, which is the form results get reported in.
+
+**Caveat you should carry** (see the end of this notebook): parameter recovery
+shows this readout *over-selects*. When the true generator is a single depth, the
+true depth is always inside the winning model — but the winner carries a spurious
+extra depth about a third of the time. Prefer
+`depth_inclusion_probabilities`, which marginalises over the model space rather
+than crowning one winner.
+""")
+
+md("""
+## Variable dictionary — MATLAB ↔ `fastfuncstuff.laminar`
+
+The reference code uses SPM/DCM naming conventions that are not self-describing.
+This is the map. Names on the left are what appear in
+`apply_laminar_BOLD_model.m`, `LBR_model_fx.m`, `LBR_gen_fx_fcn.m` and
+`LBR_param_priors.m`.
+
+### The hypothesis parameters
+
+| MATLAB | here | shape | meaning |
+|---|---|---|---|
+| `pE.C`, `spC.C` | `pE["C"]`, `pC["C"]` | `(N, n_inputs)` | driving input strength per neuronal depth |
+| `pE.B`, `spC.B` | `pE["B"]`, `pC["B"]` | `(n_mod, N, N)` | modulation of the self-connection; diagonal only |
+| `pE.A` | `pE["A"]` | `(N, N)` | fixed connectivity; diagonal is the self-decay |
+| `M.pE` | `Priors.pE` | — | prior **means** (log deviations from `P0`) |
+| `M.pC` | `Priors.pC` | — | prior **variances**; zero = not estimated |
+
+### Neuronal and neurovascular
+
+| MATLAB | here | meaning |
+|---|---|---|
+| `sigma` | `P["sigma"]` | excitatory self-decay rate (Hz) |
+| `mu` | `P["mu"]` | inhibitory → excitatory gain |
+| `lam` | `P["lam"]` | inhibitory time constant |
+| `c1, c2, c3` | `P["c1"]`, `P["c2"]`, `P["c3"]` | vasoactive signal decay, CBF gain, CBF feedback |
+| `nsig` | `P["nsig"]` | width of the neuronal → vascular depth mapping |
+
+### The vascular tree — the part that does the deveining
+
+| MATLAB | here | meaning |
+|---|---|---|
+| `V0t` | `P0.V0t` | total baseline CBV (%) |
+| `w_v` | `P0.w_v` | venule share of baseline CBV |
+| `s_v`, `s_d` | `P["s_v"]`, `P["s_d"]` | **baseline CBV depth slope**, venule / ascending vein |
+| `t0v` | `P["t0v"]` | venule transit time |
+| `al_v`, `al_d` | `P["al_v"]`, `P["al_d"]` | Grubb exponents (CBV↔CBF coupling) |
+| `tau_v`, `tau_d` | `P["tau_v_*"]`, `P["tau_d_*"]` | viscoelastic time constants |
+| `E0v`, `E0d` | `P["E0v"]`, `P["E0d"]` | baseline oxygen extraction |
+| `nr` | `P0.nr` | CBF:CMRO2 coupling ratio (n-ratio) |
+
+`s_d` is the one to watch. It sets how baseline ascending-vein blood volume grows
+toward the surface, and therefore how much deep signal shows up superficially.
+**Underestimating it gives qualitatively wrong laminar profiles; overestimating
+is safe.** We reproduce that asymmetry — see the end of the notebook.
+
+### Data and bookkeeping
+
+| MATLAB | here | meaning |
+|---|---|---|
+| `Y.y` | `y` | `(n_scans, K)` depth-sampled BOLD, percent signal change |
+| `M.Mask` | `rows` | which time points enter the fit (boolean over scans) |
+| `DCM.U.u` | `u` | `(n_micro, n_inputs)` stimulus at microtime resolution |
+| `M.kernel` | `kernel` | depth point-spread function |
+| `Ki` | `K_values` | number of **vascular** depths |
+| `N` | `spec.N` | number of **neuronal** depths (3) |
+| `M.dt` | `spec.dt` | microtime step (0.05 s) |
+| `inv_DCM.F` | `res.F` | free energy |
+| `inv_DCM.Ep` | `res.Ep` | posterior means |
+| `inv_DCM.Cp` | `res.Cp` | posterior covariance |
+| `inv_DCM.Eh` | `res.Eh` | log-precision per depth (noise level) |
+| `spm_dcm_bpa` | `bayesian_parameter_average` | precision-weighted average across K |
+
+### Two conventions that cause bugs
+
+**Depth 0 is superficial (CSF), depth K−1 is deepest.** Blood flows from high
+index to low. The reference achieves this with an `fliplr` inside
+`BOLD_voxels2layers_flipdata`; we do it in `voxels_to_layers`. Getting it
+backwards silently inverts every conclusion.
+
+**`N` and `K` are different depth counts.** `N = 3` neuronal depths carry the
+hypothesis; `K = 7…11` vascular depths carry the blood. `K > N` deliberately: the
+extra vascular depths over-determine the neuronal ones, which is what makes the
+estimate stable. The Gaussian mapping between them is controlled by `nsig`.
+
+### The state vector
+
+`integrate(..., return_states=True)` returns `(n_scans, n_states)` laid out to
+match MATLAB's column-major `[xn(:); xk(:)]`:
+
+| slice | quantity | scale |
+|---|---|---|
+| `[0:N]` | excitatory neuronal | linear |
+| `[N:2N]` | inhibitory neuronal | linear |
+| `[2N:3N]` | vasoactive signal | linear |
+| `[3N:4N]` | CBF | **log** |
+| `[4N+0K : 4N+1K]` | venule volume | **log** |
+| `[4N+1K : 4N+2K]` | venule dHb | **log** |
+| `[4N+2K : 4N+3K]` | ascending-vein volume | **log** |
+| `[4N+3K : 4N+4K]` | ascending-vein dHb | **log** |
+
+The log scaling is why the reference's Jacobian has a missing chain-rule factor —
+it differentiates with respect to the *exponentiated* states. We reproduce that
+deliberately under `jacobian="reference"`, because the published numbers were
+produced with it.
+""")
+
+md("""
 ## Configuration
 """)
 
@@ -358,14 +568,50 @@ plt.tight_layout()
 md("""
 ## 6. Invert the full model space
 
-Eight hypotheses about **which neuronal depths carry the modulatory effect** —
-the null, each depth alone, each pair, and all three. A "model" here is a pattern
-of prior *variances* on `B`, not a different set of equations: the same
-integration runs for every member, and only which entries are allowed to move
-changes.
+### What is actually being compared
 
-Times four vascular resolutions. **32 inversions**, where the reference runs 16
-and notes that even that "takes long".
+Eight models, one per subset of {superficial, middle, deep}. Each asks: *did the
+modulatory input change the excitability of these depths?* The null says no depth
+changed; the full model says all three did.
+
+Remember these are **the same equations** with different prior variances. Model
+`(1,0,1)` sets `pC["B"][0]` to `diag([e^0.5, 0, e^0.5])`, so the superficial and
+deep modulations are estimated and the middle one is pinned at exactly zero and
+projected out of the parameter space entirely.
+
+### What gets estimated in every model
+
+| parameter | why it is free |
+|---|---|
+| `C` (3 values) | the drive has to be allowed to differ across depth |
+| `sigma` | neuronal decay rate, sets the response shape |
+| `nsig` | how broadly a neuronal depth feeds vascular depths |
+| `al_d` | ascending-vein Grubb exponent |
+| `s_d` | ascending-vein baseline CBV slope — the deveining parameter |
+| `B` at targeted depths | **the hypothesis** |
+
+`mu` and `lam` get non-zero prior *means* but zero variance. They control the
+adaptation that shapes the post-stimulus undershoot, which a short inter-trial
+interval cannot observe — estimating them would be fitting noise.
+
+### Why four K, and why average rather than pick
+
+`K` is the number of vascular compartments the blood is modelled in. Nobody knows
+the right value; the papers argue for 7–11. Rather than choose, all four are
+inverted and the posteriors are combined by **Bayesian parameter averaging** —
+precision-weighted, so a `K` that determined the parameters sharply counts more.
+
+This works only because *model complexity does not grow with K*: the baseline CBV
+depth profile is a single slope `s_d`, not one free parameter per depth. The
+parameter vector is the same length at K=7 and K=11 (73 in MATLAB, 53 here — we
+omit parameters the reference carries but never estimates).
+
+### Speed
+
+The eight models share a design and data, so they are inverted in **lockstep**: a
+single integration call carries every model's probes. Bit-identical to fitting
+them one at a time, about twice as fast. Integration is ~92% of an inversion, so
+that is where the time goes.
 """)
 
 code("""
@@ -442,10 +688,30 @@ for n, f, pp in sorted(zip(names, F, p_model), key=lambda t: -t[1]):
 md("""
 ## 8. The deveined result
 
-The winning model's `B` is the estimated **modulation of neuronal
-self-excitation at each cortical depth** — the quantity the whole pipeline
-exists to recover. This is a statement about neurons, with the draining vein
-modelled and removed, not about the BOLD depth profile.
+`B` per depth, with credible intervals, from the averaged posterior.
+
+### How to read this
+
+Each bar is the estimated **change in excitability** at that neuronal depth
+between the two conditions, in log units — `B` multiplies the excitatory
+self-connection, so positive means the depth became *more* excitable when the
+modulatory input was on.
+
+The error bars are 90% credible intervals from the posterior covariance `Cp`.
+These are **not** confidence intervals from repeated sampling; they are the
+width of the posterior given the model and the priors. A bar whose interval
+excludes zero is a depth the data constrained away from no-effect.
+
+### Why this is the deveined answer
+
+The numbers are at **neuronal** depths, not vascular ones. Getting here required
+the model to explain away the draining: the measured BOLD profile ramps toward
+the surface, and the fit has to decide how much of that ramp is neurons and how
+much is blood arriving from below. That decision is what `s_d` and the ascending
+vein chain encode.
+
+Compare against the measured BOLD profile in section 10 — if they disagree in
+shape, the vein was doing the work.
 """)
 
 code("""

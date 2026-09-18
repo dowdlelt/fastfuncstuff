@@ -48,7 +48,10 @@ from fastfuncstuff.laminar.experiment import (
     posterior_model_probabilities,
 )
 from fastfuncstuff.laminar.integrate import integrate
-from fastfuncstuff.laminar.inversion import variational_laplace
+from fastfuncstuff.laminar.inversion import (
+    variational_laplace,
+    variational_laplace_lockstep,
+)
 from fastfuncstuff.laminar.params import ModelSpec
 
 
@@ -170,12 +173,19 @@ def recover_model_space(
     )
 
     priors_fn = faes_priors if on == "B" else drive_priors
-    F = []
-    for target in targets:
-        res = variational_laplace(
-            spec, priors_fn(spec, target), u, y, rows=rows, kernel=kernel, **vl_kwargs
-        )
-        F.append(float(res.F))
+    # The whole model space against one dataset is exactly the lockstep case:
+    # same design, same data, different priors. Bit-identical to fitting them
+    # one at a time, and about twice as fast.
+    fits = variational_laplace_lockstep(
+        spec,
+        [priors_fn(spec, target) for target in targets],
+        u,
+        [y] * len(targets),
+        rows=rows,
+        kernel=kernel,
+        **vl_kwargs,
+    )
+    F = [float(r.F) for r in fits]
     probs = posterior_model_probabilities(F).tolist()
     return RecoveryResult(
         true_index=true_index,
