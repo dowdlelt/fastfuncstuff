@@ -483,16 +483,19 @@ def apply_depth_psf(lbr: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     surface. Replicated literally -- this sits directly between model and data.
     """
     L = kernel.shape[-1]
-    if L % 2 == 0:
-        raise ValueError(f"depth PSF kernel must have odd length, got {L}")
+    # MATLAB's conv(a, k, 'same') keeps full-convolution samples starting at
+    # floor(L/2). For odd L that is the symmetric centre and matches numpy; for
+    # even L it is one sample later than numpy's, so the padding has to be
+    # asymmetric. K = 10 is in the published set, so the even case is real.
+    start = L // 2
+    pad_left, pad_right = L - 1 - start, start
 
     def _same_conv(a: torch.Tensor) -> torch.Tensor:
-        # MATLAB conv(a, k, 'same') == correlation with the reversed kernel,
-        # cropped to a's length.
+        # conv(a, k) == correlation with the reversed kernel.
         w = kernel.flip(-1).reshape(1, 1, L).to(a.dtype)
         flat = a.reshape(-1, 1, a.shape[-1])
-        out = torch.nn.functional.conv1d(flat, w, padding=L // 2)
-        return out.reshape(a.shape)
+        flat = torch.nn.functional.pad(flat, (pad_left, pad_right))
+        return torch.nn.functional.conv1d(flat, w).reshape(a.shape)
 
     # Pad with one replicated sample at each end before blurring so the edge
     # depths are not pulled toward zero, then drop the pad.

@@ -21,6 +21,14 @@ batch-first throughout, because the GPU pays off only across the combinatorics
 See ``../fmri_wiki/concepts/Laminar generative model.md``.
 """
 
+from fastfuncstuff.laminar.experiment import (
+    bayesian_parameter_average,
+    faes_priors,
+    fit_model_space,
+    layer_model_names,
+    layer_model_targets,
+    posterior_model_probabilities,
+)
 from fastfuncstuff.laminar.forward import (
     apply_depth_psf,
     baseline_hemodynamics,
@@ -29,11 +37,31 @@ from fastfuncstuff.laminar.forward import (
     neuronal_to_vascular,
 )
 from fastfuncstuff.laminar.integrate import build_input, integrate
+from fastfuncstuff.laminar.inversion import Priors, VLResult, variational_laplace
+from fastfuncstuff.laminar.layers import (
+    depth_bin_centres,
+    estimate_depth_psf,
+    label_mean,
+    voxels_to_layers,
+)
 from fastfuncstuff.laminar.params import P0, ModelSpec, zero_params
 
 __all__ = [
     "P0",
     "ModelSpec",
+    "Priors",
+    "VLResult",
+    "bayesian_parameter_average",
+    "depth_bin_centres",
+    "estimate_depth_psf",
+    "faes_priors",
+    "fit_model_space",
+    "label_mean",
+    "layer_model_names",
+    "layer_model_targets",
+    "posterior_model_probabilities",
+    "variational_laplace",
+    "voxels_to_layers",
     "apply_depth_psf",
     "baseline_hemodynamics",
     "build_input",
