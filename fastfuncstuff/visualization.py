@@ -1064,23 +1064,35 @@ def plot_noise_pool_pca_scree(
     return fig
 
 
-# Multi-planar cut geometry for the denoising PC figures.
+# Multi-planar cut geometry for the denoising PC figures, in RAS+ index order
+# (axis 0 = R, 1 = A, 2 = S), which is what `termvis.to_ras` hands back. Volumes
+# must be reoriented through the affine first: a dataset written LPI and one
+# written RAI are the same brain, and only the header says which is which -- the
+# old index-space specs drew whichever of upside-down, mirrored or rotated the
+# input happened to imply.
 #
-# Each plane is transposed so the anatomical superior axis runs up the page
-# under origin="lower": rows are the second-named axis, columns the first.
+# Display convention is AFNI's, and matches `viz/slices.py`: radiological, so
+# subject right is on the left of the axial and coronal panels; superior is up on
+# the sagittal and coronal, anterior up on the axial and to the right on the
+# sagittal. Panels are drawn with origin="upper".
+#
+# Fields: (name, cut axis, row axis, col axis, flip rows, flip cols, left letter).
 _PLANE_SPECS = (
-    ("Sagittal", 0, 2, 1),  # cut along x, rows = z, cols = y
-    ("Coronal", 1, 2, 0),  # cut along y, rows = z, cols = x
-    ("Axial", 2, 1, 0),  # cut along z, rows = y, cols = x
+    ("Sagittal", 0, 2, 1, True, False, "P"),
+    ("Coronal", 1, 2, 0, True, True, "R"),
+    ("Axial", 2, 1, 0, True, True, "R"),
 )
 
 
-def _plane_slice(vol: np.ndarray, cut_ax: int, idx: int, row_ax: int) -> np.ndarray:
-    """Take one 2-D cut with `row_ax` as the vertical (row) axis."""
+def _plane_slice(
+    vol: np.ndarray, cut_ax: int, idx: int, row_ax: int, flip_rows: bool, flip_cols: bool
+) -> np.ndarray:
+    """One 2-D cut of a RAS-ordered volume, laid out for display."""
     cut = np.take(vol, idx, axis=cut_ax)
     # np.take drops cut_ax, so the surviving axes keep their relative order.
     remaining = [a for a in range(3) if a != cut_ax]
-    return cut if remaining[0] == row_ax else cut.T
+    img = cut if remaining[0] == row_ax else cut.T
+    return img[:: -1 if flip_rows else 1, :: -1 if flip_cols else 1]
 
 
 def _cut_indices(mask_vol: np.ndarray | None, cut_ax: int, n_cut: int, extent: int) -> np.ndarray:
@@ -1148,6 +1160,7 @@ def plot_denoising_pcs(
     optimal_n_pcs: int | None = None,
     output_prefix: str | None = None,
     voxel_sizes: tuple[float, float, float] | None = None,
+    affine: np.ndarray | None = None,
     return_figs: bool = True,
 ) -> list[plt.Figure]:
     """
@@ -1195,7 +1208,14 @@ def plot_denoising_pcs(
         Whether to return figure handles. Set to False when saving many plots
         to avoid retaining open figures in memory.
     voxel_sizes : tuple of float, optional
-        Voxel sizes in mm (sx, sy, sz). If provided, preserves physical aspect ratio.
+        Voxel sizes in mm (sx, sy, sz), in the storage axis order. Ignored when
+        `affine` is given, which carries the same information and the orientation
+        with it.
+    affine : ndarray, optional
+        4x4 voxel-to-world affine of the volume. Cuts are taken in RAS after
+        reorienting through it, so the panels read the same way whatever order
+        the data was stored in. Without it the storage order is assumed to be
+        RAS already, which is only right for some inputs.
 
     Returns
     -------
@@ -1236,15 +1256,34 @@ def plot_denoising_pcs(
     max_pcs_available = min(pc.shape[1] for pc in pcs_np)
     n_pcs_to_show = min(n_pcs_to_show, max_pcs_available)
 
-    # All three planes are always drawn; slice_axis only picks which leads.
+    # All three planes are always drawn; slice_axis only picks which leads. The
+    # axes are anatomical (RAS), not storage, so 'x' is the sagittal plane of the
+    # subject whatever the acquisition's axis order was.
     lead_ax = {"x": 0, "y": 1, "z": 2}.get(slice_axis.lower(), 0)
     plane_specs = sorted(_PLANE_SPECS, key=lambda spec: spec[1] != lead_ax)
+
+    # Reorient through the header once. Without the affine the storage order has
+    # to be taken on faith, which is how the panels ended up upside down or
+    # mirrored depending on the input.
+    from fastfuncstuff.termvis import to_ras
+
+    if affine is not None:
+        aff = np.asarray(affine, dtype=np.float64)
+    else:
+        sx, sy, sz = voxel_sizes if voxel_sizes is not None else (1.0, 1.0, 1.0)
+        aff = np.diag([float(sx), float(sy), float(sz), 1.0])
 
     # Mask geometry is the same for every PC, so resolve it once. Cropping to the
     # mask box is what keeps the brain, not the surround, at figure scale.
     mask_vol = None
     crop = (slice(None), slice(None), slice(None))
     disp_shape = tuple(volume_shape) if volume_shape is not None else None
+    mm = (1.0, 1.0, 1.0)
+
+    if volume_shape is not None:
+        _probe, zooms_ras = to_ras(np.zeros(volume_shape, dtype=np.float32), aff)
+        disp_shape = _probe.shape
+        mm = (float(zooms_ras[0]) or 1.0, float(zooms_ras[1]) or 1.0, float(zooms_ras[2]) or 1.0)
 
     if volume_shape is not None and voxel_mask is not None:
         # The support of the weights, built by the same two-level scatter the
@@ -1257,7 +1296,7 @@ def plot_denoising_pcs(
             support[voxel_mask] = brain
         else:
             support[voxel_mask] = True
-        mask_vol = support.reshape(volume_shape)
+        mask_vol, _ = to_ras(support.reshape(volume_shape), aff)
         crop = _mask_bbox(mask_vol)
         mask_vol = mask_vol[crop]
         disp_shape = mask_vol.shape
@@ -1286,16 +1325,13 @@ def plot_denoising_pcs(
         tc_h = 4.0
 
         if has_weights:
-            sx, sy, sz = voxel_sizes if voxel_sizes is not None else (1.0, 1.0, 1.0)
-            mm = (float(sx), float(sy), float(sz))
-
             # Each plane row is sized from the physical shape of its montage, so a
             # thin slab gets a short-and-wide sagittal row instead of being
             # squashed into an equal-height one. Size against the narrowest run
             # column so no row overflows the figure.
             min_col_w = fig_w * (min(run_lengths) / total_tps)
             plane_row_h = []
-            for _name, _cut_ax, row_ax, col_ax in plane_specs:
+            for _name, _cut_ax, row_ax, col_ax, _fr, _fc, _left in plane_specs:
                 h_mm = disp_shape[row_ax] * mm[row_ax]
                 w_mm = n_slices * disp_shape[col_ax] * mm[col_ax]
                 plane_row_h.append(max(0.6, min_col_w * h_mm / w_mm))
@@ -1308,7 +1344,9 @@ def plot_denoising_pcs(
             fig = plt.figure(figsize=(fig_w, fig_h))
 
             split = (pane_h + 0.5) / fig_h
-            gs_tc = fig.add_gridspec(1, 1, top=1.0 - 0.7 / fig_h, bottom=split + 0.35 / fig_h)
+            # The 0.9in gap is the timecourse's x-label plus the panel row's
+            # "Run n" titles, which collided at the old 0.35.
+            gs_tc = fig.add_gridspec(1, 1, top=1.0 - 0.7 / fig_h, bottom=split + 0.9 / fig_h)
             gs = fig.add_gridspec(
                 3,
                 n_runs,
@@ -1399,15 +1437,6 @@ def plot_denoising_pcs(
         # (GridSpec width_ratios are the run lengths), so a spatial pattern can
         # be read against the timecourse wobble that produced it.
         if has_weights:
-            # One scale for every run and plane of this PC, so brightness
-            # differences between columns mean something.
-            all_w = np.concatenate(
-                [np.abs(w[:, pc_idx]) for w in pc_weights_per_run if pc_idx < w.shape[1] and w.size]
-            )
-            vmax = float(np.percentile(all_w, 98)) if all_w.size else 1.0
-            if not np.isfinite(vmax) or vmax <= 0:
-                vmax = 1.0
-
             cmap = plt.get_cmap("RdBu_r").copy()
             # Out-of-mask voxels and the gutters between cuts are NaN. They have
             # to be a colour the map cannot produce: zero weight is white in
@@ -1423,6 +1452,17 @@ def plot_denoising_pcs(
                 run_weights = weights[:, pc_idx]
                 vol = np.zeros(int(np.prod(volume_shape)))
 
+                # This run's own scale for this component. A run's loadings carry
+                # that run's noise amplitude and the component's arbitrary norm,
+                # so a shared scale only decides which columns are legible; it
+                # says nothing. Symmetric about zero, because the sign is real,
+                # and clipped at the 98th percentile so one hot voxel does not
+                # wash out the pattern.
+                finite = run_weights[np.isfinite(run_weights)]
+                vmax = float(np.percentile(np.abs(finite), 98)) if finite.size else 1.0
+                if not np.isfinite(vmax) or vmax <= 0:
+                    vmax = 1.0
+
                 # TODO - fit PCs to whole brain mask - so we can see how they fit in all areas and
                 # plot all voxels, not just noise pool. We would also want to save those nii (4d, per run, of pcs)
                 if voxel_mask is not None and noise_pool_mask is not None:
@@ -1434,13 +1474,18 @@ def plot_denoising_pcs(
                     vol[voxel_mask] = run_weights
                 else:
                     vol = run_weights
-                vol = vol.reshape(volume_shape)[crop]
+                vol, _ = to_ras(vol.reshape(volume_shape), aff)
+                vol = vol[crop]
                 if mask_vol is not None:
                     vol = np.where(mask_vol, vol, np.nan)
 
-                for plane_idx, (name, cut_ax, row_ax, col_ax) in enumerate(plane_specs):
+                for plane_idx, (name, cut_ax, row_ax, col_ax, fr, fc, left) in enumerate(
+                    plane_specs
+                ):
                     idxs = _cut_indices(mask_vol, cut_ax, n_slices, disp_shape[cut_ax])
-                    montage = _montage_2d([_plane_slice(vol, cut_ax, int(i), row_ax) for i in idxs])
+                    montage = _montage_2d(
+                        [_plane_slice(vol, cut_ax, int(i), row_ax, fr, fc) for i in idxs]
+                    )
 
                     ax = fig.add_subplot(gs[plane_idx, run_idx])
                     ax.axis("off")
@@ -1453,7 +1498,7 @@ def plot_denoising_pcs(
                         # code folded in the voxel *counts* too and stretched
                         # every non-cubic volume.
                         aspect=mm[row_ax] / mm[col_ax],
-                        origin="lower",
+                        origin="upper",
                         interpolation="nearest",
                     )
 
@@ -1470,6 +1515,19 @@ def plot_denoising_pcs(
                             va="center",
                             fontsize=10,
                             color="dimgray",
+                        )
+                        # Which way the panel faces, stated rather than assumed
+                        # by the reader: radiological, so this is the subject's
+                        # right on the axial and coronal.
+                        ax.text(
+                            0.005,
+                            0.02,
+                            left,
+                            transform=ax.transAxes,
+                            ha="left",
+                            va="bottom",
+                            fontsize=9,
+                            color="0.7",
                         )
 
         plt.suptitle(pc_label, fontsize=14, fontweight="bold", y=0.98)

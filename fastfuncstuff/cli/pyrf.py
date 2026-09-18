@@ -1232,7 +1232,7 @@ def _plot_noise_components(
         tr=loaded.tr,
         optimal_n_pcs=chosen,
         output_prefix=figure_prefix,
-        voxel_sizes=tuple(loaded.voxel_sizes),
+        affine=loaded.affine,  # Carries voxel size and orientation both
         return_figs=False,
     )
 

@@ -1245,6 +1245,7 @@ def save_denoising_results(
                     tr=tr,
                     optimal_n_pcs=results.optimal_n_components,
                     output_prefix=f"{fig_prefix}/component_diagnostics",
+                    affine=affine,
                     return_figs=False,
                 )
                 output_files["component_diagnostic_plots"] = (
@@ -3377,7 +3378,7 @@ def main():
                         tr=args.tr,
                         optimal_n_pcs=optimal_pcs,
                         output_prefix=f"{args.prefix}_figures/component_diagnostics",
-                        voxel_sizes=voxel_sizes,  # Preserve physical voxel shape
+                        affine=affine,  # Carries voxel size and orientation both
                         return_figs=False,
                     )
                     output_files["component_diagnostic_plots"] = (
