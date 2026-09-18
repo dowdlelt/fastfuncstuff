@@ -27,6 +27,7 @@ import torch
 from fastfuncstuff.laminar.integrate import batch_bucket, build_input
 from fastfuncstuff.laminar.inversion import (
     Priors,
+    masked_vec,
     spm_dx,
     spm_inv,
     spm_logdet,
@@ -281,3 +282,48 @@ def test_batch_bucket_is_monotone_and_powers_of_two():
     assert batch_bucket(65) == 128
     widths = [batch_bucket(n) for n in range(1, 300)]
     assert widths == sorted(widths)
+
+
+def test_error_precision_is_diagonal_by_construction():
+    """The structure the M-step exploits, asserted rather than assumed.
+
+    SPM writes the error precision as sum_i exp(h_i) Q_i, with Q[i] selecting
+    depth i's block of the response vector. Because masked_vec is depth-major,
+    each Q[i] is the identity on one contiguous block, so the sum is diagonal --
+    which is what lets the M-step replace ny^3 matmuls with ns_kept^2 work.
+
+    If masked_vec ever stopped being depth-major, or a correlated noise model
+    introduced off-block terms, the M-step would silently compute the wrong
+    thing. This is the guard.
+    """
+    n_scans, K = 10, 4
+    rows = torch.zeros(n_scans, dtype=torch.bool)
+    rows[2:7] = True
+    ns_kept = int(rows.sum())
+
+    # Depth-major means entry (i * ns_kept + t) is depth i, retained time t.
+    y = torch.arange(n_scans * K, dtype=torch.float64).reshape(n_scans, K)
+    v = masked_vec(y, rows)
+    assert v.numel() == ns_kept * K
+    for i in range(K):
+        block = v[i * ns_kept : (i + 1) * ns_kept]
+        assert torch.equal(block, y[rows, i]), f"depth {i} block is not contiguous"
+
+    # Hence the precision built from those blocks is diagonal.
+    ny = ns_kept * K
+    h = torch.tensor([0.5, -0.2, 1.3, 0.0], dtype=torch.float64)
+    Q = torch.zeros(K, ny, ny, dtype=torch.float64)
+    for i in range(K):
+        sl = slice(i * ns_kept, (i + 1) * ns_kept)
+        Q[i, sl, sl] = torch.eye(ns_kept, dtype=torch.float64)
+    iS = (Q * torch.exp(h)[:, None, None]).sum(0)
+    assert torch.equal(iS, torch.diag(torch.diagonal(iS))), "iS is not diagonal"
+    assert torch.allclose(torch.diagonal(iS), torch.exp(h).repeat_interleave(ns_kept))
+
+    # And PS[i] PS[j] vanishes off the diagonal, so dFdhh is diagonal.
+    S = torch.diag(1.0 / torch.diagonal(iS))
+    PS = (Q * torch.exp(h)[:, None, None]) @ S
+    for i in range(K):
+        for j in range(K):
+            if i != j:
+                assert float((PS[i] @ PS[j]).abs().max()) == 0.0, f"blocks {i},{j} overlap"

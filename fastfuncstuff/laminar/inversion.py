@@ -255,11 +255,18 @@ def _vl_coroutine(
         if priors.hC is None
         else spm_inv(priors.hC.to(dtype=dtype, device=device))
     )
-    # Q[i] selects depth i's block of the masked response vector.
-    Q = torch.zeros(nh, ny, ny, dtype=dtype, device=device)
-    for i in range(nh):
-        sl = slice(i * ns_kept, (i + 1) * ns_kept)
-        Q[i, sl, sl] = torch.eye(ns_kept, dtype=dtype, device=device)
+    # SPM writes the error precision as sum_i exp(h_i) Q_i, with Q[i] the
+    # identity on depth i's block of the (depth-major) response vector. Forming
+    # those as dense (nh, ny, ny) tensors and multiplying through costs ny^3 per
+    # term; exploiting the structure costs ns_kept^2. Nothing here is an
+    # approximation -- the structure is exact:
+    #
+    #   * iS is *diagonal*: exp(h_i) repeated ns_kept times. So is S.
+    #   * PS[i] is supported on block i alone, so trace(PS[i] PS[j]) vanishes
+    #     for i != j and dFdhh is diagonal.
+    #   * J' Pi[i] J touches only block i's rows of J.
+    #
+    # At K=9 this replaces 8 x 9 x 126^3 flops per iteration with 8 x 9 x 14^2.
 
     def probe_matrix(p: torch.Tensor) -> torch.Tensor:
         """Parameter vectors whose predictions the next step needs.
@@ -331,30 +338,33 @@ def _vl_coroutine(
         J = -dfdp
 
         # --- M-step: Fisher scoring on the log-precisions ------------------
+        # Depth-major, so J and e split into nh contiguous blocks of ns_kept.
+        Jb = J.reshape(nh, ns_kept, np_)
+        eb = e.reshape(nh, ns_kept)
         for _ in range(8):
-            iS = (Q * (math.exp(-32) + torch.exp(h))[:, None, None]).sum(0)
-            S = spm_inv(iS)
-            Pp = (J.mT @ iS @ J).real if J.is_complex() else J.mT @ iS @ J
+            lam = math.exp(-32) + torch.exp(h)  # (nh,) precision per depth
+            d_iS = lam.repeat_interleave(ns_kept)  # diagonal of iS
+            # spm_inv's ridge, on what is here a diagonal matrix.
+            eps = torch.finfo(dtype).eps * torch.clamp(d_iS.max(), min=1.0)
+            tol = torch.clamp(eps * ny, min=math.exp(-32))
+            d_S = 1.0 / (d_iS + tol)
+
+            Pp = (J.mT * d_iS) @ J
             Cp = spm_inv(Pp + ipC)
 
-            Pi = Q * torch.exp(h)[:, None, None]
-            PS = Pi @ S
-            JPJ = J.mT @ Pi @ J
+            eh = torch.exp(h)
+            # PS[i] lives on block i with value eh_i * d_S there.
+            tr_PS = eh * d_S.reshape(nh, ns_kept).sum(1)
+            JPJ = eh[:, None, None] * (Jb.mT @ Jb)
 
             dFdh = torch.stack(
                 [
-                    torch.diagonal(PS[i]).sum() / 2
-                    - (e @ Pi[i] @ e) / 2
-                    - _trace_prod(Cp, JPJ[i]) / 2
+                    tr_PS[i] / 2 - (eh[i] * (eb[i] * eb[i]).sum()) / 2 - _trace_prod(Cp, JPJ[i]) / 2
                     for i in range(nh)
                 ]
             )
-            dFdhh = torch.zeros(nh, nh, dtype=dtype, device=device)
-            for i in range(nh):
-                for j in range(i, nh):
-                    val = -_trace_prod(PS[i], PS[j]) / 2
-                    dFdhh[i, j] = val
-                    dFdhh[j, i] = val
+            # trace(PS[i] PS[j]) = 0 for i != j: disjoint blocks.
+            dFdhh = torch.diag(-(eh**2) * (d_S.reshape(nh, ns_kept) ** 2).sum(1) / 2)
 
             d = h - hE
             dFdh = dFdh - ihC @ d
@@ -373,7 +383,9 @@ def _vl_coroutine(
         # to model size and is the part most easily got wrong.
         L = torch.stack(
             [
-                spm_logdet(iS) / 2 - (e @ iS @ e) / 2 - ny * math.log(2 * math.pi) / 2,
+                torch.log(d_iS).sum() / 2
+                - (d_iS * e * e).sum() / 2
+                - ny * math.log(2 * math.pi) / 2,
                 spm_logdet(ipC @ Cp) / 2 - (p @ ipC @ p) / 2,
                 spm_logdet(ihC @ Ch) / 2 - (d @ ihC @ d) / 2,
             ]
@@ -383,8 +395,8 @@ def _vl_coroutine(
 
         if bool(F > best["F"]) or k < 3:
             best = {"F": F, "p": p.clone(), "h": h.clone(), "Cp": Cp.clone()}
-            dFdp = -(J.mT @ iS @ e) - ipC @ p
-            dFdpp = -(J.mT @ iS @ J) - ipC
+            dFdp = -(J.mT @ (d_iS * e)) - ipC @ p
+            dFdpp = -Pp - ipC
             v_rate = min(v_rate + 0.5, 4.0)
             tag = "EM:(+)"
         else:
