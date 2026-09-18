@@ -89,6 +89,64 @@ def faes_priors(
     return Priors(pE=pE, pC=pC)
 
 
+def drive_priors(
+    spec: ModelSpec,
+    target: tuple[int, ...] | list[int],
+    *,
+    c_variance: float = 1.0,
+) -> Priors:
+    """Priors for a **single-condition** model space, on the drive ``C``.
+
+    :func:`faes_priors` asks which depths are *modulated* between two conditions,
+    which needs two conditions to compare. This asks which depths are *driven* at
+    all, from one condition alone -- "where does the input arrive?" rather than
+    "what changed?". ``C`` is a linear per-depth gain on the driving input, so
+    freeing it at a subset of depths is the same shape of hypothesis, moved from
+    ``B`` to ``C``.
+
+    Written for experiments where the conditions cannot be contrasted because
+    they are not the same kind of event -- bottom-up perception against top-down
+    imagery, say, where one has an enormous driving input and the other a weak
+    endogenous signal, and their difference is not interpretable as a modulation.
+
+    **This is the harder inference and it is worth knowing why.** Fitting two
+    conditions jointly lets systematic error in the vascular model cancel between
+    them. A single condition has nothing to cancel against, so the inferred
+    laminar profile rests entirely on the ascending-vein parameters being right
+    -- and the documented failure mode is asymmetric: *underestimating* ``s_d``
+    gives qualitatively wrong laminar profiles, while overestimating is safe.
+
+    For a strong and a weak condition in the same session there is usually a
+    better route than fitting the weak one: the vasculature belongs to the tissue
+    and not to the task, so fit the strong condition, then take the operator from
+    :func:`~fastfuncstuff.laminar.devein.laminar_impulse_response` at the weak
+    condition's amplitude and apply it. That spends none of the weak condition's
+    SNR on estimating physiology.
+    """
+    N = spec.N
+    t = torch.as_tensor(list(target), dtype=spec.dtype, device=spec.device)
+
+    pE = zero_params(spec)
+    pC = zero_params(spec)
+    # The driving input is the last column; a modulatory column, if present, is
+    # left at zero because a single condition has nothing to modulate.
+    drive_mean = torch.zeros(N, spec.n_inputs, dtype=spec.dtype, device=spec.device)
+    drive_var = torch.zeros_like(drive_mean)
+    drive_mean[:, -1] = t
+    drive_var[:, -1] = t * c_variance
+    pE["C"] = drive_mean
+    pC["C"] = drive_var
+
+    pE["mu"] = torch.tensor(-0.8, dtype=spec.dtype, device=spec.device)
+    pE["lam"] = torch.tensor(1.8, dtype=spec.dtype, device=spec.device)
+
+    pC["nsig"] = torch.tensor(math.exp(-4), dtype=spec.dtype, device=spec.device)
+    pC["sigma"] = torch.tensor(math.exp(-2), dtype=spec.dtype, device=spec.device)
+    pC["al_d"] = torch.tensor(math.exp(-5), dtype=spec.dtype, device=spec.device)
+    pC["s_d"] = torch.tensor(math.exp(-1), dtype=spec.dtype, device=spec.device)
+    return Priors(pE=pE, pC=pC)
+
+
 @dataclass
 class BPAResult:
     """Posterior averaged over vascular resolutions."""

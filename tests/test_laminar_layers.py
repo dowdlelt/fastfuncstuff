@@ -19,6 +19,7 @@ import torch
 
 from fastfuncstuff.laminar.experiment import (
     bayesian_parameter_average,
+    drive_priors,
     faes_priors,
     layer_model_names,
     layer_model_targets,
@@ -339,3 +340,42 @@ def test_psf_cost_rejects_a_negative_variance():
     assert np.isinf(cost) and cost > 0
     finite, _, _ = _conv_kernel_cost(np.array([1.0, 0.05]), y, inp, dist)
     assert np.isfinite(finite)
+
+
+# --------------------------------------------------------------------------
+# Single-condition model space (drive rather than modulation)
+# --------------------------------------------------------------------------
+
+
+def test_drive_priors_free_only_the_targeted_depths():
+    """The single-condition hypothesis: which depths receive input at all."""
+    spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
+    priors = drive_priors(spec, (1, 0, 1))
+    # The driving column is the last one; a modulatory column stays pinned,
+    # because a single condition has nothing to modulate.
+    assert priors.pC["C"][0, -1] > 0
+    assert priors.pC["C"][1, -1] == 0
+    assert priors.pC["C"][2, -1] > 0
+    assert torch.all(priors.pC["C"][:, :-1] == 0)
+    assert torch.all(priors.pC["B"] == 0), "no modulation in a single-condition fit"
+    # Prior mean follows the target: undriven depths start at zero drive.
+    assert priors.pE["C"][1, -1] == 0
+    assert priors.pE["C"][0, -1] == 1
+
+
+def test_drive_and_modulation_spaces_estimate_different_parameters():
+    """faes_priors asks what changed; drive_priors asks what is driven."""
+    spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
+    mod = faes_priors(spec, (1, 1, 1))
+    drive = drive_priors(spec, (1, 1, 1))
+    assert torch.any(mod.pC["B"] > 0) and torch.all(drive.pC["B"] == 0)
+    # Both still estimate the vascular parameters the profile depends on.
+    for key in ("s_d", "al_d", "sigma", "nsig"):
+        assert mod.pC[key] > 0 and drive.pC[key] > 0, key
+
+
+def test_drive_model_space_null_is_nested_in_the_rest():
+    spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
+    counts = [int((vec(drive_priors(spec, t).pC) > 0).sum()) for t in layer_model_targets(3)]
+    assert counts[0] == min(counts)
+    assert counts[-1] == max(counts) == counts[0] + 3
