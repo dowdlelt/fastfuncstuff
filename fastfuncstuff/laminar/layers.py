@@ -117,7 +117,15 @@ def _conv_kernel_cost(
     ``par`` is (amplitude, variance). The model is: take the true high-resolution
     depth profile, convolve it along depth with a Gaussian, and it should look
     like what the voxel grid actually measured.
+
+    Nelder-Mead is unconstrained and does propose a negative variance here. The
+    reference lets that through and takes ``sqrt`` of it, producing a NaN cost;
+    the simplex then moves away because NaN compares false, so it recovers by
+    accident rather than by design. Rejecting the step explicitly is the same
+    intent without depending on NaN comparison semantics.
     """
+    if par[1] <= 0:
+        return np.inf, np.zeros(1), np.zeros(1)
     sp = np.linspace(0, 1, 1000)
     kernel = 1.0 / np.sqrt(2 * np.pi * par[1]) * np.exp(-((sp - 0.5) ** 2) / (2 * par[1]))
     kernel = kernel / kernel.sum()
