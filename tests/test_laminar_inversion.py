@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 import torch
 
-from fastfuncstuff.laminar.integrate import build_input
+from fastfuncstuff.laminar.integrate import batch_bucket, build_input
 from fastfuncstuff.laminar.inversion import (
     Priors,
     spm_dx,
@@ -251,3 +251,33 @@ def test_default_hyperprior_matches_spm():
     y = torch.tensor(np.asarray(o["y"], dtype=float), dtype=torch.float64).reshape(o["ns"], o["K"])
     ours = 4.0 - float(torch.log(y.var()))
     assert abs(ours - float(np.asarray(step["hE"]).reshape(-1)[0])) < 1e-10
+
+
+def test_batch_bucket_collapses_the_model_space_to_one_shape():
+    """Bug of record: the shape count, not any one shape, was the problem.
+
+    Each distinct batch width is its own ~20 s static compile of the Ito-Taylor
+    step, and dynamo stops compiling after `recompile_limit` of them -- silently,
+    running eager at 137x the cost from then on. The eight-model space spans
+    batch widths 8 to 11, which together with four vascular depths made 16
+    shapes against a default limit of 8; it reverted to eager on inversion 17 of
+    32. Bucketing must leave the whole model space on a single width.
+    """
+    from fastfuncstuff.laminar.experiment import faes_priors, layer_model_targets
+
+    spec = ModelSpec(N=3, K=9, n_inputs=2, n_mod=1)
+    widths = {
+        batch_bucket(int((vec(faes_priors(spec, t).pC) > 0).sum()) + 1)
+        for t in layer_model_targets(3)
+    }
+    assert widths == {16}
+
+
+def test_batch_bucket_is_monotone_and_powers_of_two():
+    assert batch_bucket(1) == 16  # floored: a lone fit shares the model space shape
+    assert batch_bucket(16) == 16
+    assert batch_bucket(17) == 32
+    assert batch_bucket(64) == 64
+    assert batch_bucket(65) == 128
+    widths = [batch_bucket(n) for n in range(1, 300)]
+    assert widths == sorted(widths)

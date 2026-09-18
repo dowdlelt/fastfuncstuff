@@ -53,6 +53,21 @@ def configure_inductor() -> None:
         return
     _configured = True
     try:
+        import torch._dynamo.config as dyn
+
+        # Dynamo stops compiling after `recompile_limit` distinct specializations
+        # of one function and runs it eagerly from then on -- raising nothing, so
+        # safe_compile's except-and-warn path below never sees it. The default of
+        # 8 assumes many shapes means a bug; for us it means a shape sweep. ffs
+        # compiles few distinct kernels but routinely varies chunk sizes, batch
+        # widths and depth counts, so the limit is the wrong guard entirely.
+        #
+        # Bug of record: the laminar model space visits 4 vascular depths x 4
+        # parameter-count batch widths = 16 shapes. It silently reverted to eager
+        # on the 17th of 32 inversions and ran 137x slower for the rest -- 11 s
+        # per fit became 25 minutes, announced only as a stderr warning.
+        dyn.recompile_limit = max(getattr(dyn, "recompile_limit", 8), 64)
+
         import torch._inductor.config as ind
 
         # The fragile bit: disable the precompiled-header optimization. The .so

@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from fastfuncstuff.laminar.integrate import integrate
+from fastfuncstuff.laminar.integrate import batch_bucket, integrate
 from fastfuncstuff.laminar.params import PARAM_SHAPES, ModelSpec, zero_params
 
 #: Deterministic flatten order. Only needs to be self-consistent -- the free
@@ -277,9 +277,13 @@ def variational_laplace(
         point and all ``np`` perturbations are a single batch, which is the
         batch-first payoff showing up for the first time.
         """
-        probes = p.expand(np_ + 1, -1).clone()
-        probes[1:] += torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
-        preds = predict_batch(probes)
+        # Padded to a bucketed width: the number of free parameters varies across
+        # a model space, and each distinct width is its own ~20 s compile. The
+        # spare rows repeat the unperturbed point and are discarded.
+        n_probe = np_ + 1
+        probes = p.expand(batch_bucket(n_probe), -1).clone()
+        probes[1:n_probe] += torch.eye(np_, dtype=dtype, device=device) * FINDIFF_STEP
+        preds = predict_batch(probes)[:n_probe]
         f0 = preds[0]
         dfdp = torch.stack(
             [masked_vec(preds[j + 1], rows) - masked_vec(f0, rows) for j in range(np_)], dim=1

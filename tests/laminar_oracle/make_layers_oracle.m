@@ -1,5 +1,13 @@
-% Dump the voxel->depth sampling and the estimated depth PSF, the two steps the
+% Dump the voxel->depth sampling and the estimated depth PSF: the two steps the
 % reference driver comments out as too slow and ships as cached .mat files.
+%
+% The reference computes its label-wise means as
+%     for i = 1:nlab, out(i) = nanmean(v(MAT_ind==i)); end
+% which is a full pass over a 1.5M-voxel volume per label, ~196k times over, and
+% ten times again for the PSF profiles. That does not finish. accumarray gets the
+% same quantity in one pass; the loop form is spot-checked below on a subset so
+% this stays an oracle and not an assumption.
+
 REF = '/home/logan/Dropbox/Resources/code/matlab_toolboxes/predictive_tones';
 addpath(genpath(fullfile(REF,'Code_laminar_BOLD_model')));
 addpath(genpath(fullfile(REF,'Code_layering')));
@@ -21,23 +29,35 @@ sel_sel = sel>=0.0005 & sel<=0.9995;
 ind_vox_sel = ind_vox(sel_sel);
 depth_map_vox_sel = EV_vox_d(ind_vox_sel);
 
-% (a) the downsampling loop the driver comments out
-EV_vox_r = EVV2(:);
 nlab = length(unique(MAT_ind(:)));
-EV_ds = zeros(nlab,1);
-for i = 1:nlab, EV_ds(i) = nanmean(EV_vox_r(MAT_ind==i)); end
+assert(max(MAT_ind(:)) == nlab, 'labels are not 1..nlab contiguous');
+
+% (a) the downsampling the driver comments out
+EV_vox_r = EVV2(:);
+EV_ds = label_nanmean(EV_vox_r, MAT_ind(:), nlab);
+
+% spot-check accumarray against the reference loop on the first 200 labels
+chk = zeros(200,1);
+for i = 1:200, chk(i) = nanmean(EV_vox_r(MAT_ind==i)); end
+same_nan = all(isnan(chk) == isnan(EV_ds(1:200)));
+d = max(abs(chk(~isnan(chk)) - EV_ds(~isnan(chk))));
+if isempty(d), d = 0; end
+fprintf('accumarray vs reference loop, 200 labels: max |diff| = %g\n', d);
+assert(same_nan && d < 1e-12, 'accumarray disagrees with the reference loop');
 
 % (b) voxel -> depth sampling, condition 1, K = 7 and 9
 perVoxResp = [];
 for cond = 1:6
     perVoxResp(cond,:,:) = eval(['squeeze(nanmean(nanmean(ER_avg_cond' num2str(cond) ',2),1));']);
 end
-md = squeeze(perVoxResp(1,:,:)); md = md(sel_sel,:);
+md = squeeze(perVoxResp(1,:,:));
+md = md(sel_sel,:);
 y7 = BOLD_voxels2layers_flipdata(md, depth_map_vox_sel, 7);
 y9 = BOLD_voxels2layers_flipdata(md, depth_map_vox_sel, 9);
 
 % (c) the PSF estimate, with the random curvature centres pinned and reported
-rng(7); m = 0.5 + 0.06*randn(10,1);
+rng(7);
+m = 0.5 + 0.06*randn(10,1);
 nsig = (1/(4*(N+1)))^2;
 IF = [];
 for i = 1:length(m)
@@ -47,7 +67,7 @@ IF = reshape(IF,[numel(EVV2),length(m)]);
 [EV_vox_s,ind0] = unique(EVV2(:));
 IFr = zeros(nlab,size(IF,2));
 for j = 1:size(IF,2)
-    for i = 1:nlab, IFr(i,j) = nanmean(IF(MAT_ind==i,j)); end
+    IFr(:,j) = label_nanmean(IF(:,j), MAT_ind(:), nlab);
 end
 [dist, ind] = sort(EV_vox_d(ind_vox_sel));
 yy = IFr(ind_vox_sel,:); yy = yy(ind,:);
@@ -61,12 +81,30 @@ for K = [7 9 10 11]
     kern{end+1} = ek(:);
 end
 
-out = struct('m',m,'est',est(:),'EV_ds',EV_ds, ...
-             'ind_vox_sel0',ind_vox_sel(:)-1,'depth_sel',depth_map_vox_sel(:), ...
-             'data_sel',md,'y7',y7,'y9',y9, ...
-             'kernel7',kern{1},'kernel9',kern{2},'kernel10',kern{3},'kernel11',kern{4}, ...
-             'nlab',nlab);
+% (d) a small self-contained case pinning the NaN handling of the label mean
+rng(11);
+small_v = randn(500,1); small_v(1:37:end) = NaN;
+small_l = randi(20,500,1);
+small_out = label_nanmean(small_v, small_l, 25);
+
+out = struct('m',full(m),'est',full(est(:)),'EV_ds',full(EV_ds), ...
+             'ind_vox_sel0',full(ind_vox_sel(:)-1),'depth_sel',full(depth_map_vox_sel(:)), ...
+             'data_sel',full(md),'y7',full(y7),'y9',full(y9), ...
+             'kernel7',full(kern{1}),'kernel9',full(kern{2}), ...
+             'kernel10',full(kern{3}),'kernel11',full(kern{4}), ...
+             'nlab',nlab, ...
+             'small_v',full(small_v),'small_l0',full(small_l-1),'small_out',full(small_out));
 fid=fopen(fullfile(fileparts(mfilename('fullpath')),'laminar_layers_oracle.json'),'w');
 fprintf(fid,'%s',jsonencode(out)); fclose(fid);
 fprintf('est = [%g %g]; nlab = %d\n', est(1), est(2), nlab);
 disp('wrote laminar_layers_oracle.json');
+
+function out = label_nanmean(v, lab, nlab)
+% nanmean of v within each integer label 1..nlab, in one pass.
+v = v(:); lab = lab(:);
+good = ~isnan(v);
+s = accumarray(lab(good), v(good), [nlab 1], @sum, 0);
+n = accumarray(lab(good), 1,       [nlab 1], @sum, 0);
+out = s ./ n;
+out(n == 0) = NaN;
+end

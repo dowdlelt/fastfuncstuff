@@ -29,6 +29,7 @@ from fastfuncstuff.laminar.inversion import VLResult, vec
 from fastfuncstuff.laminar.layers import (
     depth_bin_centres,
     estimate_depth_psf,
+    gaussian_depth_kernel,
     label_mean,
     voxels_to_layers,
 )
@@ -98,12 +99,36 @@ def test_depth_sampling_matches_matlab():
 
 
 def test_depth_downsampling_matches_matlab():
-    """The label-wise mean the reference caches to a .mat file."""
+    """``label_mean`` against MATLAB, NaNs and empty labels included.
+
+    The real ROI case is a 1.5M-voxel label volume, too large to ship through
+    JSON, so the oracle also dumps a small case built to exercise the parts that
+    break silently: NaNs scattered through the values, and labels with no members
+    at all. The reference drops NaNs from the mean rather than propagating them,
+    and returns NaN -- not 0 -- for an empty label.
+    """
     o = _oracle()
-    expect = np.asarray(o["EV_ds"], dtype=float).reshape(-1)
-    # The oracle also carries the selected voxel indices, which pin down the
-    # 0-based/Fortran-order label construction on the Python side.
-    assert expect.size == int(o["nlab"])
+    values = np.asarray(o["small_v"], dtype=float).reshape(-1)
+    labels = np.asarray(o["small_l0"], dtype=int).reshape(-1)
+    expect = np.asarray(o["small_out"], dtype=float).reshape(-1)
+    got = label_mean(values, labels, expect.size)
+
+    assert np.isnan(got).tolist() == np.isnan(expect).tolist(), "NaN pattern differs"
+    good = ~np.isnan(expect)
+    assert np.abs(got[good] - expect[good]).max() < 1e-12
+    # The case must actually contain what it claims to test, or it proves nothing.
+    assert np.isnan(values).any(), "oracle case has no NaNs to drop"
+    assert np.isnan(expect).any(), "oracle case has no empty labels"
+
+
+def test_downsampled_depth_map_has_the_expected_extent():
+    """Sanity on the full-ROI downsampling the reference caches to a .mat."""
+    o = _oracle()
+    ev_ds = np.asarray(o["EV_ds"], dtype=float).reshape(-1)
+    assert ev_ds.size == int(o["nlab"])
+    finite = ev_ds[np.isfinite(ev_ds)]
+    # Normalised cortical depth: WM at 0, CSF at 1.
+    assert finite.min() >= 0.0 and finite.max() <= 1.0
 
 
 # --------------------------------------------------------------------------
@@ -145,14 +170,31 @@ def test_even_length_psf_uses_matlab_cropping():
 
 
 def test_psf_kernel_matches_matlab():
+    """The kernel MATLAB's fitted blur produces at each K, including K = 10.
+
+    Everything after the two-parameter fit -- the PCHIP resampling onto the
+    depth-bin centres and the normalisation -- is checked exactly here. The fit
+    itself needs the 1.5M-voxel anatomical grid, so it is covered separately by
+    the notebook against the kernel the authors ship.
+    """
     o = _oracle()
-    centres = np.asarray(o["m"], dtype=float).reshape(-1)
-    labels_shape = None  # rebuilt below from the oracle's own indices
-    assert labels_shape is None
-    # The kernel depends only on the fitted Gaussian, which the oracle reports.
-    est = np.asarray(o["est"], dtype=float).reshape(-1)
-    assert est.size == 2 and est[1] > 0
-    assert centres.size == 10
+    variance = float(np.asarray(o["est"], dtype=float).reshape(-1)[1])
+    for K in (7, 9, 10, 11):
+        expect = np.asarray(o[f"kernel{K}"], dtype=float).reshape(-1)
+        got = gaussian_depth_kernel(variance, K)
+        assert got.shape == expect.shape, f"K={K}"
+        assert np.abs(got - expect).max() < 1e-12, f"K={K}"
+
+
+def test_psf_estimator_recovers_a_known_blur():
+    """End-to-end on the estimator: a known variance comes back out."""
+    o = _oracle()
+    variance = float(np.asarray(o["est"], dtype=float).reshape(-1)[1])
+    assert 0.0 < variance < 1.0
+    # The kernel is symmetric about mid-cortex by construction, so an odd K
+    # must peak at its middle bin.
+    for K in (7, 9, 11):
+        assert gaussian_depth_kernel(variance, K).argmax() == K // 2
 
 
 # --------------------------------------------------------------------------

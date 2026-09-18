@@ -95,6 +95,20 @@ def label_mean(values: np.ndarray, labels: np.ndarray, n_labels: int) -> np.ndar
     return out[:n_labels]
 
 
+def gaussian_depth_kernel(variance: float, K: int) -> np.ndarray:
+    """The fitted blur, resampled onto K depth-bin centres and normalised.
+
+    The reference builds the Gaussian on a 1000-point depth axis, normalises it,
+    divides by its maximum, PCHIP-interpolates onto the depth centres and
+    normalises again. The division by the maximum is immaterial -- it is a
+    constant factor that the final normalisation removes -- so it is dropped.
+    """
+    sp = np.linspace(0, 1, 1000)
+    kernel = np.exp(-((sp - 0.5) ** 2) / (2 * variance))
+    at_depths = PchipInterpolator(sp, kernel, extrapolate=True)(depth_bin_centres(K))
+    return at_depths / at_depths.sum()
+
+
 def _conv_kernel_cost(
     par: np.ndarray, y: np.ndarray, inp: np.ndarray, dist: np.ndarray
 ) -> tuple[float, np.ndarray, np.ndarray]:
@@ -208,7 +222,4 @@ def estimate_depth_psf(
         np.array([1.0, 0.1]),
         method="Nelder-Mead",
     )
-    _, kernel, sp = _conv_kernel_cost(fit.x, measured, truth, dist)
-
-    at_depths = PchipInterpolator(sp, kernel, extrapolate=True)(depth_bin_centres(K))
-    return at_depths / at_depths.sum()
+    return gaussian_depth_kernel(float(fit.x[1]), K)

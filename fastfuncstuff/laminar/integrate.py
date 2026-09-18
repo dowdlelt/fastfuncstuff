@@ -91,7 +91,38 @@ def _taylor_step(
 # against ~200 ops. Compiled, dynamo traces the dual computation and the unrolled
 # depth loop into one fused graph -- ~245 us, a 137x speedup, agreeing with eager
 # to 1e-13. This is the difference between an inversion taking minutes and hours.
+#
+# dynamic=False is load-bearing. Measured on this step, `dynamic=True` compiles
+# once and never recompiles, but runs at 28-57 ms -- eager speed. Generalizing the
+# shapes defeats the fusion entirely, so the only fast path is a static
+# specialization per shape, and the shape count is managed by `batch_bucket`.
 _compiled_step = safe_compile(_taylor_step, dynamic=False)
+
+
+def batch_bucket(n: int) -> int:
+    """Round a batch width up to the next power of two, floored at 16.
+
+    Every distinct batch width is a separate static compile of ``_taylor_step``
+    (~20 s each), so callers that vary their batch -- the model space, where the
+    width is one per free parameter, or per-parcel fitting -- must not pass the
+    raw count through. Bucketing trades padded rows for compiled variants.
+
+    The padding is close to free because the step is host-bound -- ~200 tiny ops
+    on a few dozen states, so per-op dispatch dominates the arithmetic. That
+    regime exists on any machine; only its width is hardware-specific. Measured
+    at K=9, float64, on a 6-core Xeon W-2133: batch 1 costs 205 us and batch 64
+    costs 286 us, so 64x the rows cost 1.4x the time; the plateau breaks around
+    128 and per-row cost turns back upward by 512 as it becomes compute-bound.
+
+    Those numbers justify the padding but are deliberately not encoded here: the
+    bucket has no cap and no measured constant, so it stays correct wherever a
+    given machine's plateau sits. Code that needs to *choose* a batch size -- per
+    parcel fitting, say -- should measure or derive it rather than hardcode one,
+    the way ``memory.py`` derives chunk sizes instead of assuming them.
+    """
+    if n <= 16:
+        return 16
+    return 1 << (n - 1).bit_length()
 
 
 def delay_bins(spec: ModelSpec, delay_seconds: float | None = None) -> int:
