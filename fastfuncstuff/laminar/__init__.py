@@ -31,6 +31,7 @@ from fastfuncstuff.laminar.devein import (
 )
 from fastfuncstuff.laminar.experiment import (
     bayesian_parameter_average,
+    depth_inclusion_probabilities,
     drive_priors,
     faes_priors,
     fit_model_space,
@@ -81,6 +82,7 @@ __all__ = [
     "Priors",
     "VLResult",
     "bayesian_parameter_average",
+    "depth_inclusion_probabilities",
     "depth_bin_centres",
     "estimate_depth_psf",
     "drive_priors",

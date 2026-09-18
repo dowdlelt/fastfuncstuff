@@ -230,3 +230,70 @@ def test_reference_reuses_one_kernel_at_every_k():
     assert kernel.size == 7
     assert [int(b["K"]) for b in o["per_k"]] == [7, 9]
     assert kernel.sum() == pytest.approx(1.0)
+
+
+# --------------------------------------------------------------------------
+# Marginal depth inclusion (the recommended readout)
+# --------------------------------------------------------------------------
+
+
+def test_depth_inclusion_marginalises_over_the_model_space():
+    """P(depth modulated) sums every model containing that depth."""
+    from fastfuncstuff.laminar.experiment import depth_inclusion_probabilities
+
+    targets = layer_model_targets(3)
+    # A model space where 'deep' alone is overwhelmingly favoured.
+    F = [-100.0] * 8
+    F[targets.index((0, 0, 1))] = -50.0
+    inc = depth_inclusion_probabilities(F).numpy()
+    assert inc[2] > 0.99 and inc[0] < 0.01 and inc[1] < 0.01
+
+    # A tie between 'deep' and 'superficial+deep' must leave deep certain and
+    # superficial at one half -- the case winner-takes-all would report as a
+    # categorical two-depth effect.
+    F = [-1e6] * 8
+    F[targets.index((0, 0, 1))] = 0.0
+    F[targets.index((1, 0, 1))] = 0.0
+    inc = depth_inclusion_probabilities(F).numpy()
+    assert inc[2] == pytest.approx(1.0, abs=1e-9)
+    assert inc[0] == pytest.approx(0.5, abs=1e-9)
+    assert inc[1] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_depth_inclusion_is_bounded_and_matches_a_certain_model():
+    from fastfuncstuff.laminar.experiment import depth_inclusion_probabilities
+
+    targets = layer_model_targets(3)
+    F = [-1e6] * 8
+    F[targets.index((1, 1, 1))] = 0.0
+    inc = depth_inclusion_probabilities(F).numpy()
+    assert np.allclose(inc, [1.0, 1.0, 1.0], atol=1e-9)
+
+    F = [-1e6] * 8
+    F[0] = 0.0  # null
+    inc = depth_inclusion_probabilities(F).numpy()
+    assert np.allclose(inc, [0.0, 0.0, 0.0], atol=1e-9)
+
+
+def test_model_probabilities_do_not_overflow_on_a_wide_spread():
+    """Bug of record: the reference shifts by the minimum, which overflows.
+
+    Subtracting the minimum leaves the best model's exponent as large as the
+    entire spread of F, so a spread past ~709 nats gives inf/inf = nan for every
+    model -- a silent, total loss of the result. The example ROI spans 232 nats
+    and is safe; a stronger effect or a wider model space would not be.
+    """
+    from fastfuncstuff.laminar.experiment import posterior_model_probabilities as p
+
+    wide = [-1e6] * 8
+    wide[3] = 0.0
+    probs = p(wide).numpy()
+    assert np.isfinite(probs).all(), "wide free-energy spread overflowed"
+    assert probs[3] == pytest.approx(1.0)
+    assert probs.sum() == pytest.approx(1.0)
+
+    # Unchanged where the reference does not overflow.
+    ordinary = [-352.98, -276.81, -237.18, -140.48, -216.50, -125.72, -131.80, -120.78]
+    f = np.asarray(ordinary)
+    naive = np.exp(f - f.min()) / np.exp(f - f.min()).sum()
+    assert np.abs(p(ordinary).numpy() - naive).max() < 1e-12
