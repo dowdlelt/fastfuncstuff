@@ -94,6 +94,9 @@ class InstaGLMMode(Mode):
         self._task_key: tuple | None = None
         self._task: tuple[np.ndarray, list[str]] | None = None
         self._message = ""
+        #: What was last installed, so a switch between two different questions
+        #: can be told from a refit of the same one.
+        self._shown: tuple[str, str] | None = None
         super().__init__()
 
     # -- declaration ---------------------------------------------------
@@ -515,9 +518,17 @@ class InstaGLMMode(Mode):
         # map are not the same question.
         self.overlay_kind = overlay_kind
 
-        values = self._fit.volume(kind, column=column, psc=str(self.params.get("psc") or "swing"))
+        psc = str(self.params.get("psc") or "swing")
+        values = self._fit.volume(kind, column=column, psc=psc)
         label = self._fit.model.labels[column] if self._fit.model.n_columns else ""
         detail = f"{label} {kind}" if kind in ("beta", "t", "unique R2") else kind
+
+        # A t map, a beta map in percent signal change and an R2 map are three
+        # different questions living under one layer, and a threshold set on
+        # one of them describes none of the others. So the scale follows a
+        # change of question -- but not a refit, where the map still means what
+        # it meant and the threshold is the gesture being made.
+        was, self._shown = self._shown, (kind, psc)
         return ComputedOverlay(
             values=values,
             affine=self._fit.prepared.affine,
@@ -526,6 +537,7 @@ class InstaGLMMode(Mode):
             colormap=colormap,
             display_range=span,
             threshold=threshold,
+            rescale=was is not None and was != self._shown,
         )
 
     # -- graph lines ---------------------------------------------------

@@ -255,6 +255,28 @@ def test_the_overlay_kind_follows_the_map_being_shown(glm_session):
     assert glm_session.mode.overlay_kind is OverlayKind.STATISTIC
 
 
+def test_switching_to_a_different_question_takes_the_new_scale(glm_session):
+    """A beta in percent signal change, a t and an R2 are three questions under
+    one layer, and a threshold set on one of them describes none of the others.
+    Keeping the beta range would render the R2 map flat."""
+    _enter(glm_session, events=glm_session.events, show="beta")
+    glm_session.set_mode_param("show", "R2")
+    layer = glm_session.state.layers.find_by_source(SOURCE)
+    assert (layer.range_lo, layer.range_hi) == (0.0, 1.0)
+    assert layer.threshold == pytest.approx(0.05)
+    assert layer.colormap == "hot"
+
+
+def test_a_refit_leaves_the_threshold_you_set_alone(glm_session):
+    """The other half of the same rule: the map still means what it meant, and
+    the threshold is the gesture being made."""
+    _enter(glm_session, events=glm_session.events, show="t")
+    key = glm_session.state.layers.find_by_source(SOURCE).key
+    glm_session.state.layers.update(key, threshold=7.0)
+    glm_session.set_mode_param("polort", "4")
+    assert glm_session.state.layers.get(key).threshold == pytest.approx(7.0)
+
+
 def test_the_layer_name_says_which_column_and_which_map(glm_session):
     _enter(glm_session, events=glm_session.events, show="beta", column="faces")
     layer = glm_session.state.layers.find_by_source(SOURCE)

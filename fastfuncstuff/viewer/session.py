@@ -1055,8 +1055,20 @@ class ViewerSession:
             # lie. Range and threshold deliberately do NOT follow: stepping
             # through components at a threshold you set is how they get
             # reviewed, and resetting it on every step would undo the gesture.
+            # Unless the mode says this output is a different quantity from the
+            # last one, in which case the old scale describes nothing.
+            changes: dict[str, object] = {}
             if existing.name != overlay.name:
-                self.state.layers.update(key, name=overlay.name)
+                changes["name"] = overlay.name
+            if overlay.rescale:
+                changes.update(
+                    colormap=overlay.colormap,
+                    range_lo=lo,
+                    range_hi=hi,
+                    threshold=overlay.threshold or 0.0,
+                )
+            if changes:
+                self.state.layers.update(key, **changes)
         else:
             self._add_on_top(
                 Layer(
