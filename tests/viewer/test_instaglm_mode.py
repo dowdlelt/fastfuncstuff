@@ -158,6 +158,26 @@ def test_changing_the_design_does_refit(glm_session):
     assert glm_session.mode._fit.model.n_columns == before.model.n_columns + 3
 
 
+def test_stepping_polort_does_not_reconvolve_the_events(glm_session):
+    """Convolving events at microtime costs sixteen times the fit it feeds, and
+    "step up through the polynomials and watch the fit improve" is the single
+    gesture this mode exists for. It must not pay for a convolution per step."""
+    mode = _enter(glm_session, events=glm_session.events)
+    block = mode._task
+    assert block is not None
+
+    for changed in ("polort", "ort_deriv", "pcs"):
+        glm_session.set_mode_param(changed, "3" if changed == "polort" else "1")
+        assert glm_session.mode._task is block, f"{changed} reconvolved the events"
+
+
+def test_moving_the_hrf_does_reconvolve_the_events(glm_session):
+    mode = _enter(glm_session, events=glm_session.events, basis="custom", peak=5.0)
+    block = mode._task
+    glm_session.set_mode_param("peak", "9.0")
+    assert glm_session.mode._task is not block
+
+
 def test_the_two_psc_conventions_differ_by_the_regressors_swing(glm_session):
     mode = _enter(glm_session, events=glm_session.events, show="beta", column="faces")
     swing = _map(glm_session).copy()

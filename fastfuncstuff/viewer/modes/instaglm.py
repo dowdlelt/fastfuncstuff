@@ -84,6 +84,15 @@ class InstaGLMMode(Mode):
         self._tr = 0.0
         self._hrf: np.ndarray | None = None
         self._hrf_dt = 0.1
+        #: The convolved task block and the inputs it was built from. Keyed
+        #: rather than rebuilt because convolving events at microtime costs
+        #: 0.5 s on a real run -- sixteen times the fit it feeds -- and
+        #: stepping polort, ticking the ortvec derivatives on or asking for
+        #: another noise PC changes none of its inputs. Without this, the one
+        #: gesture the mode exists for ("step up through the polynomials and
+        #: watch the fit improve") pays for a convolution per step.
+        self._task_key: tuple | None = None
+        self._task: tuple[np.ndarray, list[str]] | None = None
         self._message = ""
         super().__init__()
 
@@ -279,6 +288,9 @@ class InstaGLMMode(Mode):
         self._fit = None
         self._source_key = None
         self._dirty = True
+        # The task block is design sized, not voxel sized, so it survives:
+        # coming back to compare against an InstaCorr map should not pay for a
+        # convolution it already did.
         super().detach()
 
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:
@@ -288,6 +300,7 @@ class InstaGLMMode(Mode):
             # gesture people expect to pick that up.
             self._prepared = None
             self._fit = None
+            self._task_key = None
             self.invalidate()
             return self.refresh(progress)
         return super().action(name, progress)
@@ -359,18 +372,7 @@ class InstaGLMMode(Mode):
         task, task_labels = None, []
         events_path = str(self.params.get("events") or "").strip()
         if events_path:
-            if progress is not None:
-                progress(0.15, "events")
-            events = engine.read_events(events_path, n_time=n_time, tr=tr)
-            curves, suffixes = self._hrf_curves(tr, device)
-            task, task_labels = engine.task_columns(
-                events,
-                n_time=n_time,
-                tr=tr,
-                curves=curves,
-                suffixes=suffixes,
-                device=device,
-            )
+            task, task_labels = self._task_block(events_path, n_time, tr, device, progress)
 
         ort, ort_labels = None, []
         ortvec_path = str(self.params.get("ortvec") or "").strip()
@@ -421,6 +423,50 @@ class InstaGLMMode(Mode):
             ort_derivatives=deriv,
             pcs=pcs,
         )
+
+    def _task_block(
+        self,
+        events_path: str,
+        n_time: int,
+        tr: float,
+        device: torch.device,
+        progress: ProgressFn | None,
+    ) -> tuple[np.ndarray, list[str]]:
+        """The convolved condition columns, rebuilt only when their inputs move."""
+        from pathlib import Path
+
+        try:
+            stamp = Path(events_path).stat().st_mtime_ns
+        except OSError:
+            stamp = 0
+        key = (
+            events_path,
+            stamp,
+            n_time,
+            tr,
+            str(self.params.get("basis") or "spmg1"),
+            int(self.params.get("hrf_index", 0)),
+            float(self.params.get("peak", 6.0)),
+            float(self.params.get("width", 1.0)),
+            float(self.params.get("undershoot", 0.167)),
+        )
+        if key == self._task_key and self._task is not None:
+            # The HRF panel draws whatever the last build produced, and the
+            # cached block was built from exactly these numbers, so the curve
+            # on screen still describes the columns in the model.
+            return self._task
+
+        if progress is not None:
+            progress(0.15, "events")
+        events = engine.read_events(events_path, n_time=n_time, tr=tr)
+        curves, suffixes = self._hrf_curves(tr, device)
+        if progress is not None:
+            progress(0.25, "convolving")
+        self._task = engine.task_columns(
+            events, n_time=n_time, tr=tr, curves=curves, suffixes=suffixes, device=device
+        )
+        self._task_key = key
+        return self._task
 
     def _hrf_curves(self, tr: float, device: torch.device) -> tuple[torch.Tensor, tuple[str, ...]]:
         from fastfuncstuff.design.matrices import commensurate_microtime_dt
