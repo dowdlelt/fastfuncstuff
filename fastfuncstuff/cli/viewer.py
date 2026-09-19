@@ -15,12 +15,22 @@ from fastfuncstuff.cli_utils import add_device_arg
 EPILOG = """\
 the core is the data selector: READ a directory, pick an UNDERLAY and an
 OVERLAY, then +1 to stack another. MODE changes where the overlay comes from
-(View / InstaCorr / ICA). the main window is a controller -- every image and
-every graph is a companion window you open, arrange and close.
+(View / InstaCorr / InstaGLM / ICA / Denoise / Preproc). the main window is a
+controller -- every image and every graph is a companion window you open,
+arrange and close.
 
 DERIVE projects a design's nuisance out of a run and keeps the result as a new
 layer just above it, so raw and denoised sit next to each other in the stack --
 graphable together, and one keypress apart under solo.
+
+INSTAGLM fits one run against one events file and then lets you take the model
+apart: step the drift order, add a motion file and its derivatives, add PCs off
+the noise pool, move the HRF's peak. Every column is pickable as a map of its
+own -- a condition's percent signal change, a motion parameter's, the t or the
+variance only that one regressor explains -- and each graph window draws the
+measurement, the same measurement with the nuisance taken out, the fit and the
+residual at every voxel it shows. Changing the design refits; changing which map
+you are looking at does not.
 
 A CARPET window (grayplot) draws every voxel of one run at once, automasked and
 row-sorted -- by correlation with the dominant component, with the seed voxel,

@@ -182,6 +182,15 @@ class ComputedOverlay:
     colormap: str = "redblue"
     display_range: tuple[float, float] | None = None
     threshold: float | None = None
+    #: Whether this output means something different from the last one, so the
+    #: colour scale must follow it. Off by default, because the usual update is
+    #: the *same* quantity recomputed -- the next seed, the next component --
+    #: and resetting a threshold on every step would undo the gesture a review
+    #: is made of. A mode whose output can change *kind* under one layer sets
+    #: it: InstaGLM switching a beta map in percent signal change for a t map
+    #: is not a rescale of the same picture, it is a different question, and
+    #: keeping the old range renders the new one flat.
+    rescale: bool = False
 
 
 @dataclass

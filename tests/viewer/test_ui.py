@@ -2319,3 +2319,127 @@ def test_ctrl_c_in_the_terminal_closes_the_viewer(qapp, datadir):
     finally:
         signal.signal(signal.SIGINT, previous)
         w.close()
+
+
+# ---------------------------------------------------------------------------
+# InstaGLM, as a mode
+#
+# The mode is one file and declares everything it needs, so what is worth
+# testing through the real window is precisely the part that is NOT declared
+# once: the column picker's choices come from the model that was just fitted,
+# which means they have to survive the panel being rebuilt under them.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def win_glm(win, qapp, tmp_path):
+    """A run with a bright box, so the automask finds a brain to fit."""
+    rng = np.random.default_rng(17)
+    aff = np.diag([3.0, 3.0, 3.0, 1.0])
+    data = rng.normal(5.0, 0.5, (10, 12, 8, 40)).astype(np.float32)
+    data[2:8, 3:9, 2:6, :] += 1000.0 + np.linspace(0, 30, 40, dtype=np.float32)
+    img = nib.Nifti1Image(data, aff)
+    img.header["pixdim"][4] = 2.0
+    img.header.set_xyzt_units("mm", "sec")
+    nib.save(img, str(tmp_path / "glmbold.nii.gz"))
+
+    events = tmp_path / "sub-01_events.tsv"
+    events.write_text(
+        "onset\tduration\ttrial_type\n"
+        + "".join(f"{o}\t2\tfaces\n" for o in (4, 24, 44))
+        + "".join(f"{o}\t2\thouses\n" for o in (14, 34, 54))
+    )
+
+    from fastfuncstuff.viewer.vocab import SetOverlay
+
+    win.refresh(win.session.do(SetOverlay(str(tmp_path / "glmbold.nii.gz"))))
+    win.session.store.ensure_ram(win.session.state.layers.overlay.key)
+    qapp.processEvents()
+    win.events_file = str(events)
+    return win
+
+
+def _instaglm(win_glm, qapp, **params):
+    win_glm._switch_mode("instaglm")
+    assert win_glm.runner.wait(20_000)
+    qapp.processEvents()
+    for name, value in params.items():
+        win_glm._mode_param_changed(name, str(value))
+        assert win_glm.runner.wait(20_000)
+        qapp.processEvents()
+    return win_glm.session.mode
+
+
+def test_instaglm_declares_its_whole_panel(win_glm, qapp):
+    _instaglm(win_glm, qapp)
+    assert {
+        "events",
+        "basis",
+        "hrf_index",
+        "peak",
+        "width",
+        "undershoot",
+        "polort",
+        "ortvec",
+        "ort_deriv",
+        "pcs",
+        "show",
+        "column",
+        "psc",
+        "action:fit",
+        "action:keep",
+    } <= set(win_glm.mode_panel._widgets)
+
+
+def test_the_fit_runs_off_the_gui_thread(win_glm, qapp):
+    """A refit is tens of milliseconds but the gather is seconds, and a gather
+    on the paint thread is the freeze the prepare/compute split exists to
+    prevent."""
+    win_glm._switch_mode("instaglm")
+    assert win_glm.session.mode.defer_preparation, "the window must own preparation"
+    assert win_glm.runner.wait(20_000)
+    qapp.processEvents()
+    assert win_glm.session.mode._fit is not None
+
+
+def test_the_column_picker_offers_the_model_that_was_fitted(win_glm, qapp):
+    """A dynamic ChoiceControl: the choices are discovered by the fit, and the
+    panel is rebuilt afterwards, so the combo has to come back with them."""
+    _instaglm(win_glm, qapp)
+    combo = win_glm.mode_panel._widgets["column"]
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Pol#0", "Pol#1", "Pol#2"]
+
+    _instaglm(win_glm, qapp, events=win_glm.events_file)
+    combo = win_glm.mode_panel._widgets["column"]
+    offered = [combo.itemText(i) for i in range(combo.count())]
+    assert offered[:2] == ["faces", "houses"]
+    assert "Pol#2" in offered
+
+
+def test_entering_instaglm_opens_an_hrf_window(win_glm, qapp):
+    from fastfuncstuff.viewer.ui.tracewindow import TraceWindow
+
+    _instaglm(win_glm, qapp, events=win_glm.events_file)
+    traces = [w for w in win_glm.manager.windows.values() if isinstance(w, TraceWindow)]
+    panels = [win_glm.session.state.viewports.get(w.vid).panel for w in traces]
+    assert panels == ["hrf"]
+    assert traces[0].view._traces[0].label == "HRF"
+
+
+def test_the_graph_legend_gains_the_models_lines(win_glm, qapp):
+    """The five lines the mode contributes have to reach a graph window as tick
+    boxes, or the whole "watch the fit improve" half of the mode is invisible."""
+    _instaglm(win_glm, qapp, events=win_glm.events_file)
+    graph = open_graph(win_glm, qapp)
+    idents = {e.ident for e in graph.entries(win_glm.session.state.viewports.get(graph.vid))}
+    assert {"mode:data", "mode:signal", "mode:fit", "mode:resid", "mode:column"} <= idents
+
+
+def test_switching_the_shown_map_redraws_without_a_refit(win_glm, qapp):
+    _instaglm(win_glm, qapp, events=win_glm.events_file)
+    before = win_glm.session.mode._fit
+    win_glm._mode_param_changed("show", "t")
+    qapp.processEvents()
+    assert win_glm.session.mode._fit is before
+    layer = win_glm.session.state.layers.find_by_source("mode:instaglm")
+    assert layer is not None and layer.name.endswith(" t")
