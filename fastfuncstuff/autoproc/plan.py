@@ -143,6 +143,12 @@ class Options:
     # {task: [path]} from -prebuilt_contrasts: TOML fragments of [[contrasts]]
     # validated against the design's labels and appended verbatim to its TOML.
     prebuilt_contrasts: dict[str, list[str]] = field(default_factory=dict)
+    # ffs_moco -motsim SPEC, verbatim ("both,12", "forward,0.95", ...). None =
+    # off. Estimated inside stage02 rather than as a stage of its own: the base
+    # volume and the matrices are already there, and the backward variant's
+    # re-registration then inherits the settings of the correction that ran.
+    # Feeds the GLM through GLM_ORTVEC["motsim"].
+    motsim: str | None = None
     locomoco: bool = False
     # ffs_locomoco -detask MODE, verbatim. Off by default and deliberately so: it
     # CHANGES the field the correction applies, where the -events diagnostic the

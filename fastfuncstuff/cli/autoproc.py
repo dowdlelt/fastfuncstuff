@@ -348,6 +348,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="moco base: sbref (else first) | first | last | <int>",
     )
     g.add_argument(
+        "-motsim",
+        nargs="?",
+        const="both,12",
+        default=None,
+        metavar="MODE[,N]",
+        help="motion-simulation nuisance regressors, estimated inside stage02\n"
+        "(ffs_moco -motsim) and written as {stem}.motsim.1D per run. Models the\n"
+        "SIGNAL changes the motion caused rather than the parameters themselves.\n"
+        "MODE is forward|backward|both; N is a PC count or a fraction in (0,1)\n"
+        "asking for that much of the simulated series' variance. Bare -motsim is\n"
+        "both,12 (Patriat 2017's 12Both); forward,12 skips the second registration\n"
+        "pass and the paper found it no worse. Selecting it for the GLM is\n"
+        "-glm_ortvec motsim; in a DEFAULT nuisance set it replaces motion and\n"
+        "motion_deriv, which its PCs are derived from.",
+    )
+    g.add_argument(
         "-locomoco",
         action="store_const",
         const=True,
@@ -1056,6 +1072,26 @@ def preflight(args, opt: Options, anat_path: str | None, subject) -> tuple[list[
                 f"-anat_source {opt.anat_source} needs fieldmaps; falling back to grandmean "
                 "(ffs_segment is what recovers the distortion in that case)."
             )
+    # A bad -motsim spec is a typo, and the script it would write runs for hours
+    # before ffs_moco rejects it.
+    if opt.motsim is not None:
+        from fastfuncstuff.processing.motsim import parse_motsim_spec
+
+        try:
+            parse_motsim_spec(opt.motsim)
+        except ValueError as exc:
+            errors.append(f"-motsim: {exc}")
+
+        # Estimating them and not modelling with them is a legitimate thing to
+        # want (the .1D is a diagnostic in its own right), but it is far more
+        # often a forgotten flag, and the whole run is spent before you find out.
+        if "motsim" not in opt.glm_ortvec:
+            warnings.append(
+                "-motsim is on but the GLM does not use it. The regressors are still "
+                "written per run; add -glm_ortvec motsim (or a bare -glm_ortvec, which "
+                "puts MotSim in place of motion/motion_deriv) to model with them."
+            )
+
     # A regressor named explicitly but not produced by this pipeline is a real
     # mismatch worth saying out loud; the same entry coming from the default set
     # is dropped silently (config.GLM_ORTVEC[...]["requires"]).
@@ -1201,6 +1237,10 @@ def _resolve_glm_ortvec(args, recipe: dict) -> list[str]:
         names = list(config.DEFAULT_GLM_ORTVEC)
     else:
         names = list(args.glm_ortvec)
+    # A set nobody spelled out is a default, and the default with -motsim on is
+    # MotSim in place of the parameters it was derived from.
+    if args.motsim is not None and not args.glm_ortvec:
+        names = config.apply_motsim_default(names)
     unknown = [n for n in names if n not in config.GLM_ORTVEC]
     if unknown:
         raise SystemExit(
@@ -1644,6 +1684,7 @@ def main(argv: list[str] | None = None) -> int:
         sep_round_durations=sep_round_durations,
         event_filters=_resolve_event_filters(args),
         prebuilt_contrasts=_resolve_prebuilt_contrasts(args),
+        motsim=eff(args.motsim, "motsim", None),
         locomoco=eff(args.locomoco, "locomoco"),
         nordic_task_rescue=args.nordic_task_rescue,
         nordic_dof_adjust=args.nordic_dof_adjust,

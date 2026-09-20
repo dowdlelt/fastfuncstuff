@@ -2506,3 +2506,46 @@ def test_prebuilt_contrasts_flag_refuses_missing_or_non_contrast_files(tmp_path:
             _resolve_prebuilt_contrasts(
                 p.parse_args(base + ["-prebuilt_contrasts", "t", str(path)])
             )
+
+
+def test_motsim_rides_along_with_stage02_and_feeds_the_glm():
+    """MotSim is estimated by the correction that produced the motion, not by a
+    stage of its own: that is what lets the backward variant re-register under
+    the same settings. The GLM then globs the .1D stage02 wrote."""
+    from fastfuncstuff.autoproc import config
+
+    subj = Subject("X", [Session("01", [_run("01", "foo", "1")])])
+
+    s = write_script(
+        build_plan(subj, Options(motsim="forward,0.95", glm_ortvec=["motsim"])),
+        "wd",
+        bids_root="/bids",
+    )
+    assert "-motsim forward,0.95" in s
+    assert '-motsim_1D \\"${mstem}.motsim.1D\\"' in s
+    # No second tool invocation — the flags are on the stage02 ffs_moco line.
+    assert "ffs_motsim" not in s
+
+    off = write_script(build_plan(subj, Options()), "wd", bids_root="/bids")
+    assert "-motsim" not in off
+
+    # The GLM's glob has to match what stage02 named.
+    pattern = config.GLM_ORTVEC["motsim"]["pattern"].replace("{task}", "foo")
+    assert pattern.startswith("stage02.moco.")
+    assert pattern.endswith(".motsim.1D")
+
+
+def test_motsim_replaces_the_motion_params_only_in_a_default_set():
+    """Its PCs come from those very parameters, so a default set carrying both
+    spends degrees of freedom twice. Naming both by hand is still honoured."""
+    from fastfuncstuff.autoproc.config import DEFAULT_GLM_ORTVEC, apply_motsim_default
+
+    swapped = apply_motsim_default(list(DEFAULT_GLM_ORTVEC))
+    assert "motsim" in swapped
+    assert "motion" not in swapped and "motion_deriv" not in swapped
+    assert "locomoco" in swapped  # unrelated sources survive
+
+    # Idempotent, and a set with no motion params is left alone.
+    assert apply_motsim_default(swapped) == swapped
+    assert apply_motsim_default(["locomoco"]) == ["locomoco"]
+    assert apply_motsim_default([]) == []

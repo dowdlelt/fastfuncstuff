@@ -190,11 +190,34 @@ GLM_ORTVEC: dict[str, dict[str, str]] = {
         "requires": "locomoco",
         "note": "top-N temporal PCs of the residual nonlinear motion warp",
     },
+    "motsim": {
+        "pattern": "stage02.moco.*task-{task}*.motsim.1D",
+        "transform": "none",
+        "requires": "motsim",
+        "note": "temporal PCs of the simulated motion-induced signal changes "
+        "(Patriat 2017); models the SIGNAL motion caused rather than the "
+        "parameters, so it replaces motion/motion_deriv rather than joining them",
+    },
 }
 # What a bare `-glm_ortvec` (or a recipe asking for nuisance) selects. Entries
 # whose `requires` is unmet are dropped silently here — this is the default set,
 # not an explicit request.
 DEFAULT_GLM_ORTVEC = ("motion", "motion_deriv", "locomoco")
+
+
+def apply_motsim_default(names: list[str]) -> list[str]:
+    """Swap the motion parameters for MotSim in a set that came from a default.
+
+    MotSim replaces ``motion``/``motion_deriv`` rather than joining them. Its PCs
+    are derived FROM those same parameters, so carrying both spends 18 degrees of
+    freedom to say what 12 already said; [[Patriat 2017]] compares the two as
+    alternatives and never stacks them. Only applied to a set the user did not
+    spell out -- naming both by hand is a deliberate choice and is honoured.
+    """
+    if "motsim" in names:
+        return names
+    out = [n for n in names if n not in ("motion", "motion_deriv")]
+    return ["motsim", *out] if len(out) != len(names) else out
 
 
 # ---------------------------------------------------------------------------

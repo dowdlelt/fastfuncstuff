@@ -1571,6 +1571,15 @@ def _stage_moco(plan: Plan, script_stem: str) -> str:
     # locomoco estimates residual motion per volume: it needs the rigid-corrected
     # 4D, not the mean. Only then is it worth writing this intermediate.
     ts_arg = ' -prefix \\"${mstem}.nii$FMT\\"' if plan.options.locomoco else ""
+    # MotSim rides along with the correction that produced the motion: the base
+    # volume and the matrices are already in memory, and the backward variant's
+    # re-registration inherits this run's settings, so it models the residual of
+    # THIS correction. See config.GLM_ORTVEC["motsim"].
+    motsim_arg = (
+        f' -motsim {plan.options.motsim} -motsim_1D \\"${{mstem}}.motsim.1D\\"'
+        if plan.options.motsim
+        else ""
+    )
     return f"""
 # ============================ stage02: motion correction ====================
 # Batched: ONE ffs_moco process motion-corrects every run, so the Python/CUDA/
@@ -1596,7 +1605,7 @@ for k in "${{RUN_KEYS[@]}}"; do
     last)  nv=$(ffs_info -nv "$raw"); base_str="-base $((nv - 1))" ;;
     *)     base_str="-base \\"$MOCO_REF\\"" ;;   # integer volume index
   esac
-  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"" >> "$mocobatch"
+  printf '%s\\n' "-input \\"$raw\\" $base_str {moco_flags}{ts_arg} {_moco_reduction_flags()} -1Dmatrix_save \\"${{mstem}}.aff12.1D\\" -1Dfile \\"${{mstem}}.motion.1D\\"{motsim_arg}" >> "$mocobatch"
 done
 batch_skip=(); [ "$skip_moco" -eq 1 ] && batch_skip=(-batch_skip)
 ffs_moco -batch "$mocobatch" "${{batch_skip[@]}}" -device "$DEVICE"
