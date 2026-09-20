@@ -20,7 +20,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from fastfuncstuff.utils import get_device, to_tensor
+from fastfuncstuff.utils import cpu_if_mps, get_device, to_tensor
 
 
 class PCA:
@@ -147,7 +147,7 @@ class PCA:
         if n_features > 10 * n_samples:  # n_features >> n_samples (typical for fMRI)
             # Covariance approach: SVD on (n_samples, n_samples) instead of (n_samples, n_features)
             cov = X @ X.T  # (n_samples, n_samples)
-            svd_device = torch.device("cpu") if self.device.type == "mps" else self.device
+            svd_device = cpu_if_mps(self.device, "svd")
             U, S_squared, _ = torch.linalg.svd(cov.to(svd_device), full_matrices=False)
             U = U.to(self.device)
             S_squared = S_squared.to(self.device)
@@ -175,7 +175,7 @@ class PCA:
             # X = U @ S @ V^T
             # Components are rows of V^T (columns of V)
             # Scores are U @ S
-            svd_device = torch.device("cpu") if self.device.type == "mps" else self.device
+            svd_device = cpu_if_mps(self.device, "svd")
             U, S, Vt = torch.linalg.svd(X.to(svd_device), full_matrices=False)
             U = U.to(self.device)
             S = S.to(self.device)

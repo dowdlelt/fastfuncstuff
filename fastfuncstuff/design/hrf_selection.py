@@ -27,7 +27,7 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import dyn_chunk_estimator, estimate_chunk_size, estimate_keep_on_cpu
-from fastfuncstuff.utils import get_device, linalg_lstsq, to_tensor
+from fastfuncstuff.utils import cpu_if_mps, get_device, linalg_lstsq, to_tensor
 
 from .hrf import get_hrf_library
 from .matrices import build_task_design
@@ -227,8 +227,9 @@ def _pinv_for_compute(design: torch.Tensor, device: torch.device) -> torch.Tenso
     explicit avoids repeated hidden transfers and backend warnings while leaving
     the large voxel-wise multiplications on Metal.
     """
-    factor_device = torch.device("cpu") if device.type == "mps" else device
-    return torch.linalg.pinv(design.to(factor_device)).to(device)
+    # cpu_if_mps, not factor_device: these designs are float32, and pulling a
+    # float32 pinv off CUDA would be a pessimization (see factor_device's table).
+    return torch.linalg.pinv(design.to(cpu_if_mps(device, "pinv"))).to(device)
 
 
 def _evaluate_hrfs_batched(
