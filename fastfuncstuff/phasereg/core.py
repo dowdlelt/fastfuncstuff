@@ -212,31 +212,6 @@ def _build_task_design_canonical(
     return designs
 
 
-def _signal_mask(
-    mag_detrended: torch.Tensor,
-    signal_thresh: float,
-) -> torch.Tensor:
-    """Compute a boolean mask of voxels with sufficient signal.
-
-    Voxels whose mean |magnitude| is below signal_thresh * max(mean) are
-    excluded from regression (air, skull, low-SNR).  Matches phaseprep's
-    ``mm > 0.03 * max(mm)`` logic.
-
-    Parameters
-    ----------
-    mag_detrended : Tensor (n_timepoints, n_voxels)
-    signal_thresh : float
-        Fraction of max mean signal (e.g. 0.03 = 3%).
-
-    Returns
-    -------
-    mask : Tensor (n_voxels,), bool
-    """
-    mean_sig = mag_detrended.abs().mean(dim=0)
-    thresh = signal_thresh * mean_sig.max()
-    return mean_sig > thresh
-
-
 def _apply_sgf(
     phase_detrended: torch.Tensor,
     sgf_mode: str,

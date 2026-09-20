@@ -519,45 +519,6 @@ def parse_args():
     return parser
 
 
-def _labels_from_timing_files(timing_files: list[str]) -> list[str]:
-    """Extract unique condition labels from timing filenames.
-
-    Finds the parts of each stem that differ across files.
-    E.g. ['onsets.localizer.times.bodies.txt', 'onsets.localizer.times.faces.txt']
-    → ['bodies', 'faces']
-    """
-    stems = [Path(f).stem for f in timing_files]
-    if len(stems) == 1:
-        return [stems[0]]
-
-    sep = "." if "." in stems[0] else "_"
-    parts_list = [s.split(sep) for s in stems]
-    min_len = min(len(p) for p in parts_list)
-
-    # Find common prefix length
-    common_prefix = 0
-    for i in range(min_len):
-        if len({p[i] for p in parts_list}) == 1:
-            common_prefix += 1
-        else:
-            break
-
-    # Find common suffix length
-    common_suffix = 0
-    for i in range(1, min_len - common_prefix + 1):
-        if len({p[-i] for p in parts_list}) == 1:
-            common_suffix += 1
-        else:
-            break
-
-    labels = []
-    for parts in parts_list:
-        end = len(parts) - common_suffix if common_suffix > 0 else len(parts)
-        unique = parts[common_prefix:end]
-        labels.append(sep.join(unique) if unique else sep.join(parts))
-    return labels
-
-
 def parse_tent_windows(tent_window_args, n_conditions):
     """
     Parse tent_window arguments into per-condition (bot, top) tuples

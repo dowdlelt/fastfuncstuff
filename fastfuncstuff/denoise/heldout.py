@@ -49,7 +49,6 @@ import torch
 from fastfuncstuff.glm.moments import (
     RunMoments,
     compute_run_moments,
-    run_bounds,
     solve_from_moments,
 )
 
@@ -66,19 +65,6 @@ def _augmented_nuisance(
         return base_nuisance
     selected = pcs[:, list(selection)].to(base_nuisance.device, base_nuisance.dtype)
     return torch.cat([base_nuisance, selected], dim=1)
-
-
-def _subset_time_indices(
-    run_starts: list[int], n_timepoints: int, runs: list[int]
-) -> tuple[list[int], list[int]]:
-    """Timepoint indices for a subset of runs, plus their starts in the subset."""
-    time_indices: list[int] = []
-    local_starts: list[int] = []
-    for r in runs:
-        local_starts.append(len(time_indices))
-        start, end = run_bounds(run_starts, n_timepoints, r)
-        time_indices.extend(range(start, end))
-    return time_indices, local_starts
 
 
 def heldout_prediction_r2(

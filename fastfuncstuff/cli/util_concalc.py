@@ -623,37 +623,6 @@ def _select_non_contrast_subbricks(
     return keep
 
 
-def _identify_subbricks(labels: list[str]) -> dict[str, list[int]]:
-    """Split sub-brick labels into categories so we know which to keep when
-    rewriting the bucket. Returns indices grouped as:
-
-    - ``coef``      β sub-bricks for stim regressors (kept; we need β values)
-    - ``tstat``     per-stim t-stats (kept untouched — they were ANY-vs-zero)
-    - ``contrast``  existing contrast outputs (Coef + Tstat; *dropped* on rewrite)
-    - ``other``     overall Full_Fstat, partial R² etc. (kept verbatim)
-    """
-    groups: dict[str, list[int]] = {
-        "coef": [],
-        "tstat": [],
-        "contrast": [],
-        "other": [],
-    }
-    # Contrasts are anything whose Coef/Tstat label *doesn't* match a #0
-    # suffix on a stim — but in practice everything in the bucket today is
-    # either Full_Fstat, `<stim>#N_Coef/Tstat`, or `<contrast>_Coef/Tstat`.
-    # We discriminate via the explicit contrast-name list at runtime.
-    for i, lbl in enumerate(labels):
-        if lbl == "Full_Fstat" or lbl.endswith("_Rsq") or lbl.endswith("_Fstat"):
-            groups["other"].append(i)
-        elif _COEF_RE.match(lbl):
-            groups["coef"].append(i)
-        elif _TSTAT_RE.match(lbl):
-            groups["tstat"].append(i)
-        else:
-            groups["other"].append(i)
-    return groups
-
-
 def _beta_per_voxel_by_label(
     bucket_data: np.ndarray,
     labels: list[str],
