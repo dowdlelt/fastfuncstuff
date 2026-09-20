@@ -49,7 +49,6 @@ def analyze_from_onsets(
     run_starts: list[int] | None = None,
     device: torch.device | None = None,
     test_n_voxels: int | None = None,
-    enable_quick_estimate: bool = False,
     stim_labels: list[str] | None = None,
     polort: int | None = None,
     verbose: bool = True,
@@ -107,8 +106,6 @@ def analyze_from_onsets(
         Device for computation
     test_n_voxels : int, optional
         If provided, only analyze a subset of voxels for testing (extracts cube from center)
-    enable_quick_estimate : bool
-        Enable quick ARMA parameter estimation (only used with method='arma11')
     stim_labels : list of str, optional
         Labels for each stimulus condition (for metadata/output organization)
     polort : int, optional
@@ -373,7 +370,6 @@ def analyze_from_onsets(
             a_grid=arma_a_grid,
             b_grid=arma_b_grid,
             device=device,
-            enable_quick_estimate=enable_quick_estimate,
             run_starts=run_starts,
         )
 
@@ -409,7 +405,6 @@ def analyze_from_design_matrix(
     voxel_chunk_size: int | None = None,
     use_double: bool = False,
     debug_memory: bool = False,
-    enable_quick_estimate: bool = False,
     force_exhaustive_search: bool = False,
     use_grid_batching: bool | None = None,
     want_r2_partial: bool = False,
@@ -1425,7 +1420,6 @@ def analyze_from_design_matrix(
                 device=device,
                 use_double=use_double,
                 debug_memory=debug_memory,
-                enable_quick_estimate=enable_quick_estimate,
                 force_exhaustive_search=force_exhaustive_search,
                 use_grid_batching=use_grid_batching,
                 glt_labels=design_info.get("glt_labels", None),
@@ -1461,7 +1455,6 @@ def analyze_from_design_matrix(
                 device=device,
                 use_double=use_double,
                 debug_memory=debug_memory,
-                enable_quick_estimate=enable_quick_estimate,
                 force_exhaustive_search=force_exhaustive_search,
                 use_grid_batching=use_grid_batching,
                 glt_labels=design_info.get("glt_labels", None),

@@ -3906,7 +3906,6 @@ def fit_glm_arma11(
     use_double: bool = False,
     use_qr: bool = False,
     debug_memory: bool = False,
-    enable_quick_estimate: bool = False,
     force_exhaustive_search: bool = False,
     glt_labels: list[str] | None = None,
     glt_matrices: list[np.ndarray] | None = None,

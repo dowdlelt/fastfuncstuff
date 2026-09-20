@@ -676,17 +676,6 @@ Examples:
         ),
     )
     arma_opts.add_argument(
-        "-quick_estimate",
-        action="store_true",
-        help=(
-            "EXPERIMENTAL: Enable fast grid search with early stopping (GPU only). "
-            "Uses smart ordering + batch convergence detection to stop early. "
-            "Can be 2-3x faster but may miss true optima for some voxels. "
-            "Default: exhaustive search (recommended for publication). "
-            "Use this flag ONLY for exploratory analysis or when speed is critical."
-        ),
-    )
-    arma_opts.add_argument(
         "-exhaustive",
         action="store_true",
         help=(
@@ -3161,7 +3150,6 @@ def main():
                     b_grid_str or args.b_grid,
                     args.grid_batching,
                     args.no_grid_batching,
-                    args.quick_estimate,
                     args.load_Rvar,
                     args.Rvar,
                 ]
@@ -3276,7 +3264,6 @@ def main():
             voxel_chunk_size=args.batch_size,
             use_double=args.use_double,
             debug_memory=args.debug_memory,
-            enable_quick_estimate=args.quick_estimate,
             force_exhaustive_search=args.exhaustive,
             use_grid_batching=use_grid_batching,
             want_r2_partial=bool(args.rpartial),  # True if flag is set (any mode)
