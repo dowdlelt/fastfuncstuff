@@ -302,6 +302,16 @@ def describe(parser: argparse.ArgumentParser) -> list[OptionSpec]:
         )
         # argparse stores the first help line verbatim; shells want one short line.
         help_text = " ".join((action.help or "").split())
+        if "%(" in help_text:
+            # argparse expands %(default)s and friends when it renders --help. A
+            # completion reads action.help raw, so without this the shell shows
+            # the literal token.
+            params = {k: v for k, v in vars(action).items() if v is not argparse.SUPPRESS}
+            params["prog"] = ""
+            try:
+                help_text = help_text % params
+            except (KeyError, TypeError, ValueError):
+                pass
         if len(help_text) > 90:
             help_text = help_text[:87].rstrip() + "..."
         spec = OptionSpec(

@@ -331,3 +331,26 @@ def test_device_still_completes_for_hand_rolled_flags():
     parser.add_argument("-device", default="auto", help="cuda | cpu | mps")
     spec = next(s for s in describe(parser) if "-device" in s.option_strings)
     assert spec.completes == "device"
+
+
+def test_describe_expands_argparse_help_tokens():
+    """argparse substitutes %(default)s when it renders --help; describe() reads
+    action.help raw, so without expanding it the shell shows the literal token."""
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.completion import describe
+
+    p = FfsArgumentParser(prog="ffs_x")
+    p.add_argument("-model", default="both,12", help="the model [default: %(default)s]")
+    spec = next(s for s in describe(p) if "-model" in s.option_strings)
+    assert spec.help == "the model [default: both,12]"
+
+
+def test_describe_leaves_an_unexpandable_token_alone():
+    from fastfuncstuff.cli_help import FfsArgumentParser
+    from fastfuncstuff.completion import describe
+
+    p = FfsArgumentParser(prog="ffs_x")
+    action = p.add_argument("-thing", help="placeholder")
+    action.help = "uses %(nosuchfield)s"  # argparse rejects this at add_argument
+    spec = next(s for s in describe(p) if "-thing" in s.option_strings)
+    assert spec.help == "uses %(nosuchfield)s"

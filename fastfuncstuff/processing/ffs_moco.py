@@ -736,7 +736,7 @@ def save_moco_dfile(
 ) -> None:
     """Save 9-column diagnostic file.
 
-    Format: vol# roll pitch yaw dI dS dL rms_before rms_after
+    Format: vol# roll pitch yaw dS dL dP rms_before rms_after
 
     Args:
         params_array: (nt, 6) DICOM motion parameters.

@@ -363,6 +363,7 @@ Key flags:
 - `-twopass` for coarse-blur + fine-pass when motion is large.
 - `-1Dfile` / `-1Dmatrix_save` / `-dfile` for motion parameter outputs in AFNI format.
 - `-save_mean` writes the mean of the corrected output (useful as a reference for `ffs_motsim` or downstream alignment).
+- `-motsim MODE[,N]` estimates MotSim nuisance regressors in-line — see [MotSim inside `ffs_moco`](#motsim-inside-ffs_moco-and-ffs_autoproc).
 
 ### `ffs_slicetime` — slice-timing correction
 
@@ -442,20 +443,37 @@ Key flags:
 
 ### `ffs_motsim` — motion-simulation regressors
 
-Implements Patriat et al. (2017): apply motion parameters to a reference EPI, simulate motion-induced signal changes, then PCA them into regressors of no interest.
+Implements Patriat et al. (2017). Regressing the 6 realignment parameters assumes the signal change they cause is a linear function of them; at a curved intensity edge it is not. MotSim models the signal changes instead: move the reference by the inverse of the estimated motion, and every fluctuation in the resulting series is caused by motion and nothing else. Its temporal PCs are the regressors.
+
+**Usually you do not need this tool.** `ffs_moco -motsim` computes the same thing during the correction, where the base volume and the matrices are already in hand and the `backward` variant re-registers under the settings of the correction that actually ran. Reach for `ffs_motsim` when the motion was estimated elsewhere, or when you want a second model over motion you already have on disk.
 
 ```
 ffs_motsim \
-    -base mean_epi.nii.gz \
-    -aff12 epi.aff12.1D \
-    -prefix motsim
+    -base epi_mc_mean.nii.gz \
+    -aff12 epi_mc.aff12.1D \
+    -model both,12 \
+    -prefix epi
 ```
 
 Key flags:
 
 - Input motion: `-aff12 .aff12.1D` (preferred), `-1Dfile motion.1D`, or `-dfile diag.1D` — all from `ffs_moco`.
-- `-n_pcs N` (default 12) — components to retain.
-- `-variant {forward,backward,both}` — Patriat's `both` (concatenated forward+backward sims) is the default and recommended.
+- `-model MODE[,N]` — one spec, the same string `ffs_moco -motsim` and `ffs_autoproc -motsim` take.
+  - `MODE` is `forward` (the simulated series; no second registration pass), `backward` (that series re-registered — interpolation and motion-estimation error), or `both` (the two spatially concatenated, then one PCA).
+  - `N` is a PC count, or a fraction in `(0, 1)` asking for that much of the *simulated* series' variance. Omitted means 12.
+  - The paper's four models: `both,12` = 12Both, `both,24` = 24Both, `forward,12` = 12Forw, `backward,12` = 12Back. 12 was chosen only to match the regressor count of the model it competed with; explained variance asymptotes to the slope of random regressors at ~12–15.
+- `-mask` / `-dilate N` (default 2) — the mask is dilated outward either way. The gain over the plain motion parameters lives at the brain edge, so a tight mask discards it.
+
+### MotSim inside `ffs_moco` and `ffs_autoproc`
+
+```
+ffs_moco -input epi.nii.gz -base 0 -1Dfile mc.motion.1D \
+         -motsim both,12 -motsim_1D mc.motsim.1D
+
+ffs_autoproc ... -motsim both,12 -glm_ortvec motsim
+```
+
+`ffs_moco -motsim` writes `{prefix}_motsim.1D` (or `-motsim_1D PATH`), and the output is tracked by `-batch_skip`. `ffs_autoproc -motsim` sets that flag on the stage02 line and writes one `.motsim.1D` per run; `-glm_ortvec motsim` selects it as a `[[nuisance]]` block. In a nuisance set you did not spell out, MotSim *replaces* `motion` and `motion_deriv` — its PCs are derived from those same parameters, so carrying both spends degrees of freedom twice.
 
 ### `ffs_util_automask` — brain mask from a 3D volume
 
