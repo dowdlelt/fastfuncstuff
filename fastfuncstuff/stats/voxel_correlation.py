@@ -23,6 +23,7 @@ from dataclasses import dataclass
 import torch
 
 from fastfuncstuff.memory import get_available_memory
+from fastfuncstuff.utils import accum_dtype
 
 
 @dataclass
@@ -183,7 +184,7 @@ def corr_histogram_distance(
     # them (CPU/CUDA, exact counts for free), float32 on MPS (no float64 there).
     # No per-block host round-trip — the user's speed/accuracy call is "don't ship
     # tensors around; float32 is fine." We sync once, at the end.
-    acc_dtype = torch.float32 if device.type == "mps" else torch.float64
+    acc_dtype = accum_dtype(device)
     r_edges = torch.linspace(-1.0, 1.0, r_bins + 1, device=device)
     abs_edges = torch.linspace(0.0, 1.0, r_bins + 1, device=device)
     r_hist = torch.zeros(r_bins, dtype=acc_dtype, device=device)

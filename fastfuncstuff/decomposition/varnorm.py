@@ -61,6 +61,8 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import widest_float_dtype
+
 __all__ = [
     "DEFAULT_SIGNAL_RANK",
     "apply_noise_std_map",
@@ -153,7 +155,7 @@ def noise_std_map(
 
     # Temporal demeaning: the covariance whose eigenvectors we want is of the time series
     # about their own means, and the mean is separately accounted for in the DoF below.
-    work_dtype = torch.float32 if x_t.device.type == "mps" else torch.float64
+    work_dtype = widest_float_dtype(x_t.device)
     xc = x_t.to(work_dtype)
     xc = xc - xc.mean(dim=0, keepdim=True)
 

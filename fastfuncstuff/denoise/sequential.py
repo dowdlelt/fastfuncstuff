@@ -79,7 +79,13 @@ from fastfuncstuff.glm.xval import (
     project_out_nuisance_per_run,
 )
 from fastfuncstuff.memory import dyn_chunk_estimator
-from fastfuncstuff.utils import cpu_if_mps, factor_device, get_device, linalg_device
+from fastfuncstuff.utils import (
+    accum_dtype,
+    cpu_if_mps,
+    factor_device,
+    get_device,
+    linalg_device,
+)
 
 
 def _qr_projector(matrix: torch.Tensor) -> torch.Tensor:
@@ -1740,7 +1746,7 @@ def cross_validate_noise_pcs(
 
     accum_dev = linalg_device(device)
     # MPS has no float64; reduce in float32 there and promote on the accumulator.
-    reduce_dtype = torch.float32 if accum_dev.type == "mps" else torch.float64
+    reduce_dtype = accum_dtype(accum_dev)
 
     def _load_run(chunk_cpu: torch.Tensor, run_idx: int) -> torch.Tensor:
         """Nuisance-projected data for one run of one voxel chunk, on proj_device.

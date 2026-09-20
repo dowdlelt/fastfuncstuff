@@ -17,7 +17,12 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.design.builder import legendre_polynomials
-from fastfuncstuff.utils import linalg_device, linalg_lstsq, warn_mps_float32_precision
+from fastfuncstuff.utils import (
+    linalg_device,
+    linalg_lstsq,
+    warn_mps_float32_precision,
+    widest_float_dtype,
+)
 
 from .affine import _build_homo_coords, identity_params, params_to_matrix_batched
 from .cost import _separable_smooth_3d
@@ -239,7 +244,7 @@ def _estimate_motion(
     # Per-group normal matrix JtWJ (P, ndof, ndof), float64 (matches whole-image
     # GN). MPS has no float64, so the normal equations and per-group solve run in
     # float32 there (use -device cpu for full-precision reweighting).
-    solve_dtype = torch.float32 if device.type == "mps" else torch.float64
+    solve_dtype = widest_float_dtype(device)
     if device.type == "mps":
         warn_mps_float32_precision("moco reweight GN solve")
     JtWJ = torch.zeros(P, ndof, ndof, dtype=solve_dtype, device=device)

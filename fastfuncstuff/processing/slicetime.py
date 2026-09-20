@@ -26,6 +26,8 @@ import torch
 from torch import Tensor
 from tqdm.auto import tqdm
 
+from fastfuncstuff.utils import widest_float_dtype
+
 
 def _interp_dtype(device: torch.device) -> torch.dtype:
     """Interpolation working dtype: float64, or float32 on MPS (no float64).
@@ -34,7 +36,7 @@ def _interp_dtype(device: torch.device) -> torch.dtype:
     fMRI SNR, so float32 on MPS is acceptable (use ``-device cpu`` for the exact
     float64 path that matches 3dTshift bit-for-bit).
     """
-    return torch.float32 if device.type == "mps" else torch.float64
+    return widest_float_dtype(device)
 
 
 # ---------------------------------------------------------------------------

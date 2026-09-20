@@ -28,7 +28,7 @@ from torch import Tensor
 from tqdm.auto import tqdm
 
 from fastfuncstuff.memory import estimate_chunk_size
-from fastfuncstuff.utils import warn_mps_float32_precision
+from fastfuncstuff.utils import warn_mps_float32_precision, widest_float_dtype
 
 # ---------------------------------------------------------------------------
 # Model
@@ -166,7 +166,7 @@ def fit_loglinear(y: Tensor, tes: Tensor, weights: Tensor | None = None) -> tupl
     # Design columns c0 = 1, c1 = -TE. Work in float64 for the closed-form solve;
     # MPS has no float64, so it computes in float32 there (full-batch over voxels,
     # so a CPU fallback would be a large transfer — use -device cpu for full precision).
-    dtype = torch.float32 if y.device.type == "mps" else torch.float64
+    dtype = widest_float_dtype(y.device)
     te = tes.to(dtype)
     w = w.to(dtype)
     logy = logy.to(dtype)

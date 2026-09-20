@@ -40,6 +40,8 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from fastfuncstuff.utils import widest_float_dtype
+
 # Max correlation allowed before the Fisher stretch blows up (mri_genalign.c).
 _CMAX = 0.9999
 
@@ -50,7 +52,7 @@ def _coord_dtype(device: torch.device) -> torch.dtype:
     MPS has no float64. Blok coordinates are small (≤ a few hundred), so float32
     floor/round math is exact enough for the lattice assignment there.
     """
-    return torch.float32 if device.type == "mps" else torch.float64
+    return widest_float_dtype(device)
 
 
 # volume(blok) / siz**3 for each shape — used by the auto-radius formula

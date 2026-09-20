@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from fastfuncstuff.glm.core import orthogonalize_design
+from fastfuncstuff.utils import widest_float_dtype
 
 
 @dataclass(frozen=True)
@@ -783,7 +784,7 @@ def _refine_css_batch(
         applier = applier.with_bounds(_group_bounds(group, n_groups))
     else:
         group = None
-    solve_dtype = torch.float32 if current.device.type == "mps" else torch.float64
+    solve_dtype = widest_float_dtype(current.device)
 
     final_parameters = current.clone()
     n_iters = torch.full((n_voxels,), config.max_iter, device=current.device, dtype=torch.int32)

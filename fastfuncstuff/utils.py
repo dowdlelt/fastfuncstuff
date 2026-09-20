@@ -406,6 +406,25 @@ def to_factor_f64(t: torch.Tensor) -> torch.Tensor:
     return t.to(device=factor_device(t.device)).to(torch.float64)
 
 
+def widest_float_dtype(device: torch.device) -> torch.dtype:
+    """The widest float *device* supports: float64, or float32 on Metal.
+
+    For work that wants float64 and can live with float32 when Metal is the
+    only option -- normal equations, closed-form solves, optimizer state,
+    covariance eigendecompositions. Call it instead of writing
+    ``torch.float32 if device.type == "mps" else torch.float64`` inline; that
+    idiom is correct but scatters the float64 policy across the tree, which is
+    the same mistake :func:`cpu_if_mps` exists to prevent for op routing.
+
+    This answers "what dtype can I use?", not "should this run on MPS at all?"
+    (:func:`cpu_if_mps`) nor "where does float64 linalg run?"
+    (:func:`linalg_device` / :func:`factor_device`). Keep the comment at the
+    call site explaining why float32 is tolerable for *that* operation -- this
+    function cannot know that.
+    """
+    return torch.float32 if device.type == "mps" else torch.float64
+
+
 def accum_dtype(device: torch.device) -> torch.dtype:
     """Return the dtype for reduction accumulators (sum-of-squares, R², RSS).
 
@@ -413,8 +432,11 @@ def accum_dtype(device: torch.device) -> torch.dtype:
     sum-of-squares reductions. MPS cannot hold float64, so we accumulate in
     float32 there; callers should pair this with a numerically stable
     *two-pass* (mean-centred) reduction to avoid catastrophic cancellation.
+
+    The value is :func:`widest_float_dtype`; this name carries the extra
+    two-pass obligation that a plain solve or optimizer state does not have.
     """
-    return torch.float32 if device.type == "mps" else torch.float64
+    return widest_float_dtype(device)
 
 
 def to_linalg_f64(t: torch.Tensor) -> torch.Tensor:

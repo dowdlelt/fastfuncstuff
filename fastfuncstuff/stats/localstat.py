@@ -47,7 +47,7 @@ from torch import Tensor
 from tqdm import tqdm
 
 from fastfuncstuff.memory import get_available_memory
-from fastfuncstuff.utils import linalg_lstsq, warn_mps_float32_precision
+from fastfuncstuff.utils import linalg_lstsq, warn_mps_float32_precision, widest_float_dtype
 
 # ACF model is fit with at least this many distinct radius bins present; below
 # this a 3-parameter fit is meaningless.  AFNI requires >= 10 surviving
@@ -657,7 +657,7 @@ def local_acf(
 
     # MPS has no float64; the batched ACF LM fit runs in float32 there (the fit
     # is full-batch over voxels, so a CPU fallback would be a large transfer).
-    acf_dtype = torch.float32 if device.type == "mps" else torch.float64
+    acf_dtype = widest_float_dtype(device)
     if device.type == "mps":
         warn_mps_float32_precision("ACF (FWHMx) LM fit")
     bin_radius_d = nb.bin_radius.to(device=device, dtype=acf_dtype)

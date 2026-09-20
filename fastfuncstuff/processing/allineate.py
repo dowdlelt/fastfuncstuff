@@ -30,6 +30,7 @@ from scipy.optimize import minimize
 from torch import Tensor
 
 from fastfuncstuff.memory import compute_registration_candidate_batch_size
+from fastfuncstuff.utils import widest_float_dtype
 
 from . import cost_hist
 from .affine import (
@@ -1802,7 +1803,7 @@ _BATCH_FREE_WORK = 8.5e7
 
 def _cma_state_dtype(device: torch.device) -> torch.dtype:
     """Use double CMA state except on Metal, which has no float64 tensors."""
-    return torch.float32 if device.type == "mps" else torch.float64
+    return widest_float_dtype(device)
 
 
 def _pick_optimizer(requested: str, n_points: int, n_trials: int, n_free: int) -> str:
