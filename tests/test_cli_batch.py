@@ -747,3 +747,58 @@ def _parse_toy(line: str, base=None) -> argparse.Namespace:
     p.add_argument("-force", default="demons")
     p.add_argument("-batch", default=None)
     return p.parse_args(shlex.split(line), base)
+
+
+# --------------------------------------------------------------------------
+# ffs_moco -motsim
+# --------------------------------------------------------------------------
+
+
+def test_moco_motsim_bare_flag_is_the_papers_headline_model():
+    from fastfuncstuff.cli.moco import parse_args
+    from fastfuncstuff.processing.motsim import MotSimSpec, parse_motsim_spec
+
+    a = parse_args(["-input", "epi.nii.gz", "-prefix", "out", "-motsim"])
+    assert parse_motsim_spec(a.motsim) == MotSimSpec("both", 12)
+
+
+def test_moco_motsim_output_is_tracked_for_batch_skip():
+    """A resumed -batch run must not skip a run whose motsim file is missing."""
+    from fastfuncstuff.cli.moco import _expected_outputs, parse_args
+
+    derived = parse_args(["-input", "epi.nii.gz", "-prefix", "out", "-motsim", "both,12"])
+    assert "out_motsim.1D" in _expected_outputs(derived)
+
+    explicit = parse_args(
+        ["-input", "epi.nii.gz", "-1Dfile", "m.1D", "-motsim", "-motsim_1D", "r01.motsim.1D"]
+    )
+    assert "r01.motsim.1D" in _expected_outputs(explicit)
+
+
+def test_moco_motsim_alone_is_a_valid_request():
+    from fastfuncstuff.cli.moco import _validate_run_args, parse_args
+
+    _validate_run_args(
+        parse_args(["-input", "epi.nii.gz", "-motsim", "-motsim_1D", "r01.motsim.1D"])
+    )
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        # A bad spec must be caught before a 300-volume registration is paid for.
+        (["-motsim", "sideways,12", "-prefix", "out"], "must be one of"),
+        (["-motsim", "both,0", "-prefix", "out"], "must be >= 1"),
+        # Nowhere to write.
+        (["-motsim", "both,12", "-1Dfile", "m.1D"], "-motsim_1D"),
+        # Dependent flags without the feature.
+        (["-motsim_1D", "x.1D", "-prefix", "out"], "only applies with -motsim"),
+        (["-motsim_mask", "m.nii.gz", "-prefix", "out"], "only applies with -motsim"),
+    ],
+)
+def test_moco_motsim_bad_requests_exit_early(capsys, argv, expected):
+    from fastfuncstuff.cli.moco import _validate_run_args, parse_args
+
+    with pytest.raises(SystemExit):
+        _validate_run_args(parse_args(["-input", "epi.nii.gz", *argv]))
+    assert expected in capsys.readouterr().err

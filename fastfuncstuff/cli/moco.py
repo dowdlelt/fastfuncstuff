@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
 from fastfuncstuff.cli_utils import (
     add_batch_args,
     add_device_arg,
@@ -54,6 +54,13 @@ from fastfuncstuff.processing.io import (
     save_tsnr,
 )
 from fastfuncstuff.processing.locomoco import normalize_axis_argv, resolve_pe_axis
+from fastfuncstuff.processing.motsim import (
+    motsim_regressors,
+    parse_motsim_spec,
+)
+from fastfuncstuff.processing.motsim import (
+    save_1d as save_motsim_1D,
+)
 from fastfuncstuff.processing.shiftcorr import (
     apply_shift,
     estimate_shifts,
@@ -558,6 +565,47 @@ def parse_args(
         "value): 0 wherever ANY volume lost the voxel, so >0 is exactly the region "
         "with complete data for every timepoint.",
     )
+    # --- MotSim nuisance regressors ---
+    ms_group = parser.add_argument_group("MotSim regressors (Patriat et al. 2017)")
+    suggest(
+        ms_group.add_argument(
+            "-motsim",
+            nargs="?",
+            const="both,12",
+            default=None,
+            metavar="MODE[,N]",
+            help="Estimate motion-simulation nuisance regressors in-line and write "
+            "them as a .1D. MODE is forward|backward|both; N is a PC count, or a "
+            "fraction in (0,1) asking for that much of the simulated series' "
+            "variance. Bare -motsim means both,12, the paper's 12Both. This is the "
+            "right place to compute them: the base volume and the per-volume "
+            "matrices are already here, and 'backward' re-registers the simulated "
+            "series under THIS run's settings, so it measures the residual of the "
+            "correction that actually ran. 'forward' skips that second pass and "
+            "costs almost nothing.",
+        ),
+        ("both,12", "both,24", "both,0.95", "forward,12", "forward,0.95", "backward,12"),
+    )
+    ms_group.add_argument(
+        "-motsim_1D",
+        "-motsim-1D",
+        dest="motsim_1D",
+        default=None,
+        metavar="OUT.1D",
+        help="Where to write the MotSim regressors. Derived from -prefix "
+        "({prefix}_motsim.1D) when omitted.",
+    )
+    ms_group.add_argument(
+        "-motsim_mask",
+        "-motsim-mask",
+        dest="motsim_mask",
+        default=None,
+        metavar="MASK.nii.gz",
+        help="Brain mask for the MotSim PCA. An automask of the base is used "
+        "otherwise. Either way it is dilated 2 voxels outward, because the "
+        "improvement over the plain motion parameters lives at the brain edge.",
+    )
+
     out_group.add_argument(
         "-save_first_last",
         "-save-first-last",
@@ -890,6 +938,57 @@ def _save_estimation_outputs(args, result, header_info, verb) -> None:
                 save_image(result.patch_labels.float(), w_patch, header_info=header_info)
 
 
+def _motsim_path(args) -> str | None:
+    """Where ``-motsim`` writes, or None when it is off."""
+    if args.motsim is None:
+        return None
+    if args.motsim_1D is not None:
+        return args.motsim_1D
+    return f"{parse_prefix(args.prefix).stem}_motsim.1D"
+
+
+def _save_motsim(args, result, reference, config, device, header_info, verb) -> None:
+    """Estimate MotSim regressors from this run's own base and matrices.
+
+    Deliberately in-line rather than a second pass over the data: everything the
+    method needs is already in hand, and the backward variant's re-registration
+    inherits ``config``, so what it models is the residual of the correction that
+    just ran rather than of a cheaper one configured elsewhere.
+    """
+    out_path = _motsim_path(args)
+    if out_path is None:
+        return
+
+    spec = parse_motsim_spec(args.motsim)
+    mask = None
+    if args.motsim_mask is not None:
+        with spinner(f"Loading {Path(args.motsim_mask).name}", enabled=verb >= 1):
+            mask_data, _ = load_image(args.motsim_mask, device=torch.device("cpu"))
+        mask = mask_data > 0.5
+
+    if verb >= 1:
+        print(f"MotSim regressors ({spec}):")
+    t0 = time.time()
+    ms = motsim_regressors(
+        reference.detach().to(device="cpu", dtype=torch.float32),
+        result.matrices_vox,
+        spec,
+        device,
+        config=config,
+        mask=mask,
+        header_info=header_info,
+        verb=verb,
+    )
+    save_motsim_1D(ms.pcs, ms.var_explained, out_path, spec.variant, result.matrices_vox.shape[0])
+    if verb >= 1:
+        cum = float(ms.var_explained.sum()) * 100.0
+        print(
+            f"  {ms.pcs.shape[1]} PCs, {cum:.1f}% of the simulated series' variance "
+            f"({time.time() - t0:.2f}s)"
+        )
+        print(f"Saved motsim: {out_path}")
+
+
 def _parse_reg_echo(reg_echo: str | None, n_echoes: int) -> tuple[bool, int]:
     """Resolve -reg_echo into (use_mean, zero_based_echo_index).
 
@@ -970,6 +1069,7 @@ def _validate_run_args(args: argparse.Namespace) -> None:
             "save_shifts",
             "onedfile_shiftcorr",
             "onedmatrix_shiftcorr",
+            "motsim",
         )
     ) or _want_qc(args)
     if not _any_output:
@@ -1006,11 +1106,35 @@ def _validate_run_args(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
 
+    _validate_motsim_args(args)
+
     # The QC files are named after -prefix; require it when requested.
     if _want_qc(args) and args.prefix is None:
         print(
             "Error: -save_first_last / -save_first_last_diff / -save_tsnr / "
             "-save_initial name their files after -prefix; pass -prefix.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+def _validate_motsim_args(args: argparse.Namespace) -> None:
+    """Validate the -motsim request, before a 300-volume registration is paid for."""
+    for name, flag in (("motsim_1D", "-motsim_1D"), ("motsim_mask", "-motsim_mask")):
+        if getattr(args, name, None) is not None and args.motsim is None:
+            print(f"Error: {flag} only applies with -motsim.", file=sys.stderr)
+            sys.exit(1)
+    if args.motsim is None:
+        return
+    try:
+        parse_motsim_spec(args.motsim)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if args.motsim_1D is None and args.prefix is None:
+        print(
+            "Error: -motsim writes {prefix}_motsim.1D by default, and there is no "
+            "-prefix to derive it from. Pass -motsim_1D OUT.1D.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -1223,6 +1347,9 @@ def _expected_outputs(args: argparse.Namespace) -> list[str]:
         val = getattr(args, name, None)
         if val is not None:
             outs.append(val)
+    motsim_out = _motsim_path(args)
+    if motsim_out is not None:
+        outs.append(motsim_out)
 
     # -me_3depi: the QC tables, plus the per-echo total-transform files.
     if args.me_3depi:
@@ -1362,6 +1489,15 @@ def _run_single_echo(args, input_file: str, device: torch.device, verb: int) -> 
         _write_qc(args, result.aligned, data, base_path, header_info, verb)
 
     _save_estimation_outputs(args, result, header_info, verb)
+    _save_motsim(
+        args,
+        result,
+        base_vol if base_vol is not None else data[base_index],
+        config,
+        device,
+        header_info,
+        verb,
+    )
 
 
 def _run_multi_echo(
@@ -1418,6 +1554,13 @@ def _run_multi_echo(
     # The dfile's post-alignment RMS must be measured against the SHIFT-CORRECTED
     # base, since that is the geometry the matrices were estimated in.
     reg_base_shifted = reg_data[base_index].clone() if est is not None else None
+    # The MotSim reference, grabbed before the estimation series is freed. It is
+    # the reg echo's base, which is the volume the matrices below describe.
+    motsim_base = (
+        None
+        if args.motsim is None
+        else (base_vol if base_vol is not None else reg_data[base_index].clone())
+    )
     del reg_data  # free the estimation series before loading echoes for resampling
 
     write_series = args.prefix is not None
@@ -1497,6 +1640,8 @@ def _run_multi_echo(
                 torch.cuda.empty_cache()
 
     _save_estimation_outputs(args, result, header_info, verb)
+    if motsim_base is not None:
+        _save_motsim(args, result, motsim_base, config, device, header_info, verb)
     if est is not None:
         _save_shiftcorr_params(args, result, est, shift_axis, header_info, verb)
 
