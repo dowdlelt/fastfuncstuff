@@ -346,7 +346,7 @@ Key flags:
 
 ### `ffs_moco` — motion correction
 
-GPU port of `3dvolreg`. Outputs the corrected timeseries plus optional motion parameter files. Slower than `3dvolreg`, lets call it a proof of some principle. 
+GPU port of `3dvolreg`. Outputs the corrected timeseries plus optional motion parameter files. Used to be slower than single-core `3dvolreg` — that turned out to be the resampler, not threading: a rigid rotation as four 1D shears is 32 taps per voxel against a 3D gather's 512. 300 volumes of 104×104×66 on CPU now run in 25.5s against `3dvolreg`'s 21.3s to BRIK / 42.6s to `.nii.gz`.
 
 ```
 ffs_moco \
