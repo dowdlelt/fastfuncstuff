@@ -200,7 +200,6 @@ def save_image(
     path: str | Path,
     header_info: dict | None = None,
     affine: np.ndarray | None = None,
-    use_pigz: bool = True,
     brick_labels: list[str] | None = None,
 ) -> None:
     """Save a torch tensor as a NIfTI image.
@@ -210,7 +209,6 @@ def save_image(
         path: Output path (.nii or .nii.gz).
         header_info: Dict from load_image with 'affine' and 'header'.
         affine: 4x4 affine matrix. Uses header_info's affine or identity if None.
-        use_pigz: Use pigz for parallel gzip compression (default: True if available).
         brick_labels: Optional per-sub-brick labels written into the AFNI NIfTI
             extension (BRICK_LABS) so AFNI viewers show them.
     """
@@ -247,7 +245,6 @@ def save_warp_field(
     affine: np.ndarray | None = None,
     units: str = "voxels",
     padding: tuple[int, int, int] | tuple[int, int, int, int, int, int] | None = None,
-    use_pigz: bool = True,
 ) -> None:
     """Save displacement warp field as a 4D NIfTI.
 

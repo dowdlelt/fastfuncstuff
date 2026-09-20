@@ -2389,11 +2389,9 @@ def fit_denoising_model(
     max_noise_fraction : float, default=0.95
         Maximum fraction of voxels in noise pool
     polort : int, default=2
-        Unused. Kept for API compatibility: drift is supplied by the caller in
-        ``nuisance`` (per run), never built here.
-        Polynomial order to project out from noise pool before PCA.
-        This prevents slow drift from dominating extracted components.
-        Set to -1 to disable polynomial projection.
+        Unused, and kept only so existing callers do not break. Drift is
+        supplied by the caller in ``nuisance`` (per run, block-diagonal) and is
+        never built here -- passing a different ``polort`` changes nothing.
     cv_strategy : int or float, default=1
         Cross-validation strategy:
         - 1 (or 'loro'): Leave-one-run-out (default)

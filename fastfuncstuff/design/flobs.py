@@ -525,18 +525,23 @@ def fit_basis_constrained_ridge(
     ----------
     data : array, shape (n_voxels, n_timepoints)
         Preprocessed BOLD signal.
-    design_task : array, shape (n_timepoints, n_conditions × n_basis)
-        Task design: each condition convolved with each FLOBS basis
-        function.  Columns must be in condition-major order
-        (cond0×basis0..N, cond1×basis0..N, …) — same convention as
+    design_task : array, shape (n_timepoints, n_blocks × n_basis)
+        Task design: each block convolved with each FLOBS basis
+        function.  Columns must be in block-major order
+        (block0×basis0..N, block1×basis0..N, …) — same convention as
         :func:`fastfuncstuff.design.builder.build_per_run_task_designs`.
-    basis : FLOBSBasis
-        Output of :func:`generate_flobs_basis`.  ``basis.m`` and
-        ``basis.C`` define the Gaussian prior on each condition's
-        basis coefficients.
-    n_conditions : int
-        Number of conditions in the task design (so we know how to
-        block ``design_task``).
+    basis_functions : array, shape (n_basis, n_t)
+        The FLOBS basis, one row per basis function.  From
+        :func:`generate_flobs_basis`.
+    prior_mean : array, shape (n_basis,)
+        Mean of the Gaussian prior on one block's basis coefficients.
+    prior_cov : array, shape (n_basis, n_basis)
+        Covariance of that prior.  Inverted once and tiled down the
+        block diagonal, so every block shares the same prior.
+    n_blocks : int
+        Number of blocks in the task design — one per condition for an
+        LSA fit, one per trial for a single-trial fit.  ``design_task``
+        must have exactly ``n_blocks × n_basis`` columns.
     nuisance : array, shape (n_timepoints, n_nuisance), optional
         Additional regressors (polynomial drift, motion, etc.) that
         get fit with NO prior — these are "free" parameters.  If

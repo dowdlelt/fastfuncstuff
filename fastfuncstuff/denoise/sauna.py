@@ -126,15 +126,17 @@ def _c4_bias_correction(k: int) -> float:
 def _gaussian_smooth_3d(
     vol: torch.Tensor,
     fwhm: float,
-    voxel_size: tuple[float, float, float] = (1.0, 1.0, 1.0),
 ) -> torch.Tensor:
     """3D Gaussian smoothing via separable 1D convolutions.
+
+    Deliberately voxel-unit, not mm: the g-factor FWHM this serves is chosen by
+    LOO cross-validation over a voxel grid, so an anisotropic mm-based sigma
+    would silently redefine the tuned default.
 
     Parameters
     ----------
     vol : (nx, ny, nz) tensor
     fwhm : full-width at half-maximum in voxel units
-    voxel_size : voxel dimensions (for anisotropic data)
 
     Returns
     -------

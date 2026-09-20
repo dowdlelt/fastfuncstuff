@@ -4007,11 +4007,13 @@ def fit_glm_arma11(
           - Memory: Can be 10+ GB with long timeseries
           - Speed: Fastest (all Cholesky factorizations precomputed)
           - Best for: Short timeseries, float32, abundant GPU memory
-    n_glt : int, default=0
-        Number of GLT contrasts (parsed from design matrix .xmat.1D file).
-        If > 0: Allocates var_betas (n_voxels × n_regressors × n_regressors) for contrast computation.
-        If 0: Skips var_betas allocation to save memory (critical with many regressors).
-        Example: 322 regressors × 918k voxels = 762 GB saved when n_glt=0!
+    glt_labels : list of str, optional
+        Names for the GLT contrasts, one per entry of ``glt_matrices``.
+    glt_matrices : list of np.ndarray, optional
+        General linear test contrast matrices, each (n_rows, n_regressors).
+        Contrasts are evaluated inside the voxel-chunk loop, so the full
+        ``var_betas`` (n_voxels × n_regressors × n_regressors) is never
+        materialised -- at 322 regressors × 918k voxels that would be 762 GB.
 
     Returns
     -------
