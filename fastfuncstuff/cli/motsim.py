@@ -1,6 +1,12 @@
 """CLI for MotSim: Motion-simulation regressors (Patriat, Reynolds & Birn 2017).
 
 See fastfuncstuff.processing.motsim for the library implementation.
+
+ffs_moco runs the same code in-line via its own ``-motsim`` flag, which is the
+cheaper route: it already holds the base volume and the per-volume matrices, and
+its backward pass inherits the settings of the correction that actually ran. This
+tool is for the after-the-fact case — regressors from motion someone else
+estimated, or a second model over motion you already have on disk.
 """
 
 from __future__ import annotations
@@ -12,22 +18,48 @@ from pathlib import Path
 
 import torch
 
-from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter
-from fastfuncstuff.cli_utils import add_verbose_arg, setup_device, spinner
+from fastfuncstuff.cli_help import FfsArgumentParser, FfsHelpFormatter, suggest
+from fastfuncstuff.cli_utils import add_device_arg, add_verbose_arg, setup_device, spinner
 from fastfuncstuff.processing.io import load_image, save_image
 from fastfuncstuff.processing.motsim import (
-    automask_dilate,
-    expand_mask_both,
-    extract_pcs,
     load_dfile,
     load_motion_1d,
+    motsim_regressors,
     params_to_voxel_matrices,
-    run_backward_sim,
-    run_forward_sim,
+    parse_motsim_spec,
     save_1d,
 )
 from fastfuncstuff.processing.nwarpforge import load_affine_1D
 from fastfuncstuff.utils import REGISTRATION_TF32
+
+EPILOG = """\
+model spec (-model MODE[,N]):
+  MODE   forward   the simulated series itself (MotSim). No second registration
+                   pass, so roughly half the cost of 'both' and not measurably
+                   worse in the paper.
+         backward  that series re-registered (MotSimReg): what a real correction
+                   leaves behind — interpolation error and motion-estimation error.
+         both      forward and backward spatially concatenated, then one PCA.
+  N      an integer    exactly N components.
+         0 < N < 1     however many reach that fraction of the simulated series'
+                       variance. The paper's medians for 'both': 5 PCs -> 90%,
+                       7 -> 95%, 16 -> 99%.
+         omitted       12.
+
+  The paper's four models spell out as: both,12 (12Both) · both,24 (24Both) ·
+  forward,12 (12Forw) · backward,12 (12Back). 12 was chosen only to match the
+  regressor count of the 6-params-plus-derivatives model it competed with;
+  explained variance asymptotes to the slope of random regressors at ~12-15.
+
+examples:
+  # the paper's headline model, from an ffs_moco run you already have
+  ffs_motsim -base epi_mc_mean.nii.gz -aff12 epi_mc.aff12.1D \\
+             -model both,12 -prefix epi
+
+  # cheap variant, components chosen by variance rather than by count
+  ffs_motsim -base epi_mc_mean.nii.gz -1Dfile motion.1D \\
+             -model forward,0.95 -prefix epi
+"""
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -35,9 +67,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="ffs_motsim",
         description=(
             "Generate motion-simulation nuisance regressors (Patriat et al. 2017). "
-            "Applies motion parameters to a reference EPI to simulate motion-induced "
-            "signal changes, then extracts PCs as regressors of no interest."
+            "Moves a reference EPI by the inverse of the estimated motion to simulate "
+            "the signal changes that motion caused, then extracts temporal PCs as "
+            "regressors of no interest."
         ),
+        epilog=EPILOG,
         formatter_class=FfsHelpFormatter,
     )
 
@@ -46,8 +80,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g_io.add_argument(
         "-base",
         required=True,
-        metavar="MEAN.nii.gz",
-        help="Reference EPI volume (3D). Typically the mean or base volume from motion correction",
+        metavar="BASE.nii.gz",
+        help="Reference EPI volume (3D). The registration base is the faithful "
+        "choice — that is the volume the motion was estimated against. A 4D input "
+        "is averaged, which trades simulation sharpness for less noise",
     )
     g_mot = p.add_mutually_exclusive_group(required=True)
     g_mot.add_argument(
@@ -67,7 +103,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-dfile",
         metavar="DFILE.1D",
         help="9-column diagnostic file from ffs_moco "
-        "(-dfile output: vol# roll pitch yaw dI dS dL rms_bef rms_aft)",
+        "(-dfile output: vol# roll pitch yaw dS dL dP rms_bef rms_aft)",
     )
     g_io.add_argument(
         "-prefix",
@@ -77,23 +113,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     add_verbose_arg(g_io, default=1)
 
-    # ── PCA options ──
-    g_pca = p.add_argument_group("PCA Options")
-    g_pca.add_argument(
-        "-n_pcs",
-        type=int,
-        default=12,
-        metavar="N",
-        help="Number of PCs to extract [default: %(default)s]",
-    )
-    g_pca.add_argument(
-        "-variant",
-        choices=["forward", "backward", "both"],
-        default="both",
-        help="Which simulation(s) to use: 'forward' = inverse-motion "
-        "simulation only, 'backward' = re-registered simulation only, "
-        "'both' = spatial concatenation (recommended, Patriat et al.) "
-        "[default: %(default)s]",
+    # ── Model ──
+    g_model = p.add_argument_group("Model")
+    suggest(
+        g_model.add_argument(
+            "-model",
+            default="both,12",
+            metavar="MODE[,N]",
+            help="Which simulation and how many components; see the spec table "
+            "below [default: %(default)s]",
+        ),
+        ("both,12", "both,24", "both,0.95", "forward,12", "forward,0.95", "backward,12"),
     )
 
     # ── Mask ──
@@ -102,15 +132,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-mask",
         default=None,
         metavar="MASK.nii.gz",
-        help="Brain mask. If not provided, auto-generated from "
-        "the reference via intensity thresholding",
+        help="Brain mask. Auto-generated from the reference (ffs automask) otherwise. "
+        "Either way it is dilated by -dilate",
     )
     g_mask.add_argument(
         "-dilate",
         type=int,
         default=2,
         metavar="N",
-        help="Dilate mask by N voxels to capture edge effects [default: %(default)s]",
+        help="Dilate the mask N voxels outward. The improvement over the standard "
+        "motion model lives at the brain edge, so a tight mask discards it "
+        "[default: %(default)s]",
     )
 
     # ── Processing ──
@@ -119,7 +151,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "-interp",
         default="cubic",
         choices=["linear", "cubic", "quintic", "heptic", "wsinc5"],
-        help="Interpolation method for resampling [default: %(default)s]",
+        help="Interpolation for the simulated resampling [default: %(default)s]",
     )
     g_proc.add_argument(
         "-save_sim",
@@ -127,7 +159,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Also save the simulated 4D volumes as NIfTI "
         "(PREFIX_forward.nii.gz, PREFIX_backward.nii.gz)",
     )
-    g_proc.add_argument("-device", type=str, default=None, help="Force device: 'cuda', 'cpu', etc.")
+    g_proc.add_argument(
+        "-save_mask",
+        action="store_true",
+        help="Also save the dilated PCA mask (PREFIX_motsim_mask.nii.gz)",
+    )
+    add_device_arg(g_proc)
 
     return p.parse_args(argv)
 
@@ -136,11 +173,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     t0 = time.time()
 
-    # Device
+    try:
+        spec = parse_motsim_spec(args.model)
+    except ValueError as exc:
+        print(f"ffs_motsim: {exc}", file=sys.stderr)
+        return 1
+
     device = setup_device(args.device, tf32=REGISTRATION_TF32)
 
     if args.verb >= 1:
-        print(f"ffs_motsim: device={device}")
+        print(f"ffs_motsim: device={device}, model={spec}")
 
     # Load reference
     with spinner(f"Loading {Path(args.base).name}"):
@@ -178,15 +220,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Motion matrices: {nt} timepoints (from {src_label})")
 
     # Mask
+    mask = None
     if args.mask:
         with spinner(f"Loading {Path(args.mask).name}"):
             mask_data, _ = load_image(args.mask, device=torch.device("cpu"))
         mask = mask_data > 0.5
-    else:
-        mask = automask_dilate(reference, dilate_voxels=args.dilate)
-    n_vox = mask.sum().item()
-    if args.verb >= 1:
-        print(f"Mask: {n_vox} voxels ({n_vox / mask.numel() * 100:.1f}%)")
 
     # Prefix
     prefix = args.prefix
@@ -194,57 +232,46 @@ def main(argv: list[str] | None = None) -> int:
         if prefix.endswith(ext):
             prefix = prefix[: -len(ext)]
 
-    # --- Forward simulation ---
-    forward_sim = run_forward_sim(
-        reference, matrices_vox, device, interp=args.interp, verb=args.verb
+    result = motsim_regressors(
+        reference,
+        matrices_vox,
+        spec,
+        device,
+        interp=args.interp,
+        mask=mask,
+        dilate=args.dilate,
+        header_info=header_info,
+        keep_sims=args.save_sim,
+        verb=args.verb,
     )
+
+    n_vox = int(result.mask.sum())
+    if args.verb >= 1:
+        print(f"Mask: {n_vox} voxels ({n_vox / result.mask.numel() * 100:.1f}%)")
 
     if args.save_sim:
-        with spinner(f"Writing {Path(prefix).name}_forward.nii.gz"):
-            save_image(forward_sim, f"{prefix}_forward.nii.gz", header_info=header_info)
-        if args.verb >= 1:
-            print(f"Saved: {prefix}_forward.nii.gz")
-
-    # --- Backward simulation (if needed) ---
-    backward_sim = None
-    if args.variant in ("backward", "both"):
-        backward_sim = run_backward_sim(
-            forward_sim,
-            reference,
-            device,
-            interp=args.interp,
-            verb=args.verb,
-        )
-        if args.save_sim:
-            with spinner(f"Writing {Path(prefix).name}_backward.nii.gz"):
-                save_image(backward_sim, f"{prefix}_backward.nii.gz", header_info=header_info)
+        for name, sim in (("forward", result.forward), ("backward", result.backward)):
+            if sim is None:
+                continue
+            with spinner(f"Writing {Path(prefix).name}_{name}.nii.gz"):
+                save_image(sim, f"{prefix}_{name}.nii.gz", header_info=header_info)
             if args.verb >= 1:
-                print(f"Saved: {prefix}_backward.nii.gz")
+                print(f"Saved: {prefix}_{name}.nii.gz")
 
-    # --- Extract PCs ---
-    if args.variant == "forward":
-        pca_input = forward_sim
-    elif args.variant == "backward":
-        pca_input = backward_sim
-    else:  # "both"
-        pca_input = torch.cat([forward_sim, backward_sim], dim=1)
+    if args.save_mask:
+        with spinner(f"Writing {Path(prefix).name}_motsim_mask.nii.gz"):
+            save_image(result.mask.float(), f"{prefix}_motsim_mask.nii.gz", header_info=header_info)
+        if args.verb >= 1:
+            print(f"Saved: {prefix}_motsim_mask.nii.gz")
 
-    pcs, var_explained = extract_pcs(
-        pca_input,
-        mask if args.variant != "both" else expand_mask_both(mask),
-        args.n_pcs,
-        args.verb,
-    )
-
-    # Save
     out_path = f"{prefix}_motsim.1D"
-    save_1d(pcs, var_explained, out_path, args.variant, nt)
+    save_1d(result.pcs, result.var_explained, out_path, spec.variant, nt)
 
     elapsed = time.time() - t0
     if args.verb >= 1:
-        var_pct = [f"{v * 100:.1f}%" for v in var_explained.tolist()]
+        var_pct = [f"{v * 100:.1f}%" for v in result.var_explained.tolist()]
         print(
-            f"Extracted {args.n_pcs} MotSim PCs ({args.variant}), "
+            f"Extracted {result.pcs.shape[1]} MotSim PCs ({spec.variant}), "
             f"var explained: {', '.join(var_pct)}"
         )
         print(f"Saved: {out_path}")
