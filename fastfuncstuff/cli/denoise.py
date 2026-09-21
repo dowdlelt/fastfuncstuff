@@ -1369,14 +1369,25 @@ def save_denoising_results(
             fig_prefix = f"{output_prefix}_figures"
             Path(fig_prefix).mkdir(parents=True, exist_ok=True)
             overlap_path = f"{fig_prefix}/pc_task_overlap.png"
-            overlap_fig = plot_pc_task_overlap(
+            # Split across figures at 5 runs each: grouped bars over 20
+            # components are unreadable once there are many runs.
+            overlap_figs = plot_pc_task_overlap(
                 overlap,
                 optimal_n_components=results.optimal_n_components,
                 output_path=overlap_path,
             )
-            plt.close(overlap_fig)
-            output_files["pc_task_overlap_plot"] = overlap_path
-            print(f"  Saved: {overlap_path}")
+            for fig_i, ov_fig in enumerate(overlap_figs):
+                plt.close(ov_fig)
+                saved = (
+                    overlap_path
+                    if len(overlap_figs) == 1
+                    else f"{fig_prefix}/pc_task_overlap_{fig_i + 1:02d}.png"
+                )
+                key = "pc_task_overlap_plot" + (
+                    "" if len(overlap_figs) == 1 else f"_{fig_i + 1:02d}"
+                )
+                output_files[key] = saved
+                print(f"  Saved: {saved}")
         except Exception as e:
             print(f"  Warning: Could not save PC/task overlap plot: {e}")
 

@@ -1902,12 +1902,33 @@ def plot_denoising_summary(
     return fig
 
 
+def split_runs_for_figures(n_runs: int, max_per_figure: int = 5) -> list[list[int]]:
+    """Split runs into balanced groups of at most ``max_per_figure``.
+
+    Balanced rather than greedy: 11 runs at a cap of 5 gives 4/4/3, not 5/5/1.
+    A trailing figure with one run next to figures with five reads as though
+    that run were special.
+    """
+    if n_runs <= max_per_figure:
+        return [list(range(n_runs))]
+    n_figs = -(-n_runs // max_per_figure)  # ceil
+    base, extra = divmod(n_runs, n_figs)
+    groups: list[list[int]] = []
+    start = 0
+    for i in range(n_figs):
+        size = base + (1 if i < extra else 0)
+        groups.append(list(range(start, start + size)))
+        start += size
+    return groups
+
+
 def plot_pc_task_overlap(
     overlap: dict,
     optimal_n_components: int | None = None,
     output_path: str | None = None,
     figsize: tuple[int, int] = (12, 8),
-) -> plt.Figure:
+    max_runs_per_figure: int = 5,
+) -> list[plt.Figure]:
     """Noise-PC / task-design overlap, per component and as a subspace.
 
     Both panels carry the phase-randomised null, which is the entire point: an
@@ -1921,6 +1942,12 @@ def plot_pc_task_overlap(
     implies a component that does not exist. Panel 2's per-run curves ARE
     commensurable: "the first k PCs of this run" is well defined everywhere.
 
+    Runs are split across figures at ``max_runs_per_figure``, because 20 runs
+    of grouped bars over 20 components is 400 bars and unreadable. Every figure
+    carries the all-run mean and the null, so the groups stay comparable.
+    Returns one figure per group; ``output_path`` gains a ``_01`` suffix when
+    there is more than one.
+
     Drawn from
     :func:`~fastfuncstuff.denoise.sequential.compute_pc_task_overlap`.
     """
@@ -1931,127 +1958,139 @@ def plot_pc_task_overlap(
     sub_null = np.asarray(overlap["subspace_null_mean"])
     sub_sd = np.asarray(overlap["subspace_null_sd"])
     sub_z = np.asarray(overlap["subspace_z"])
-    # PC k is a different component in every run -- the components are extracted
-    # per run and k is only a rank in that run's own variance ordering. Plotting
-    # the run-mean alone implies a component that does not exist.
     per_run = np.asarray(overlap.get("per_pc_by_run", per_pc[None, :]))
     sub_run = np.asarray(overlap.get("subspace_by_run", sub[None, :]))
     n_runs = per_run.shape[0]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
     x = np.arange(1, len(per_pc) + 1)
-    run_colors = plt.cm.tab10(np.linspace(0, 0.9, n_runs))
-
-    ax1.axhspan(
-        0,
-        float(p95[0]),
-        color="gray",
-        alpha=0.22,
-        zorder=1,
-        label="spectrum-matched null (to p95)",
-    )
-    ax1.axhline(
-        float(null_mean[0]), color="black", linestyle=":", linewidth=1, zorder=2, label="null mean"
-    )
-    # Grouped bars: one per run, so a component that is task-locked in one run
-    # and not in another is visible instead of averaged away.
-    width = 0.8 / n_runs
-    for r in range(n_runs):
-        ax1.bar(
-            x + (r - (n_runs - 1) / 2) * width,
-            per_run[r],
-            width=width,
-            color=run_colors[r],
-            label=f"run {r + 1}",
-            zorder=3,
-        )
-    n_exceed = int((per_run > p95[None, :]).sum())
-    ax1.set_xlabel("Noise PC index (a per-run RANK — PC k differs between runs)")
-    ax1.set_ylabel("R² of PC explained by task design")
-    ax1.set_title(
-        f"Per-component overlap with the task design — {n_exceed} of "
-        f"{per_run.size} run×PC bars exceed the null "
-        f"(~{0.05 * per_run.size:.0f} expected by chance)",
-        fontweight="bold",
-        fontsize=10,
-    )
-    ax1.legend(fontsize=7, loc="upper right", ncol=2)
-    ax1.grid(True, alpha=0.3, axis="y", zorder=0)
-    step = max(1, len(per_pc) // 20)
-    ax1.set_xticks(x[::step])
-    ax1.set_xticklabels([str(int(v)) for v in x[::step]])
-
-    # Panel 2 is the one that predicts beta contamination. An overlap spread
-    # thinly over many components leaves panel 1 looking innocent while this
-    # one climbs away from its null. Here the per-run curves ARE commensurable:
-    # "the first k PCs of this run" is a well-defined set in every run.
     ks = np.arange(len(sub))
-    ax2.fill_between(
-        ks,
-        sub_null - 2 * sub_sd,
-        sub_null + 2 * sub_sd,
-        color="gray",
-        alpha=0.25,
-        label="null ±2 SD",
-        zorder=1,
-    )
-    ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
-    for r in range(n_runs):
+    # Counts are over ALL runs, so every figure reports the same global result
+    # rather than a per-group count that looks weaker for being a subset.
+    n_exceed = int((per_run > p95[None, :]).sum())
+    groups = split_runs_for_figures(n_runs, max_runs_per_figure)
+    figures: list[plt.Figure] = []
+
+    for g_idx, runs in enumerate(groups):
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
+        colors = plt.cm.tab10(np.linspace(0, 0.9, max(len(runs), 2)))
+
+        ax1.axhspan(
+            0,
+            float(p95[0]),
+            color="gray",
+            alpha=0.22,
+            zorder=1,
+            label="spectrum-matched null (to p95)",
+        )
+        ax1.axhline(
+            float(null_mean[0]),
+            color="black",
+            linestyle=":",
+            linewidth=1,
+            zorder=2,
+            label="null mean",
+        )
+        width = 0.8 / len(runs)
+        for slot, r in enumerate(runs):
+            ax1.bar(
+                x + (slot - (len(runs) - 1) / 2) * width,
+                per_run[r],
+                width=width,
+                color=colors[slot],
+                label=f"run {r + 1}",
+                zorder=3,
+            )
+        span = f"runs {runs[0] + 1}-{runs[-1] + 1} of {n_runs}" if n_runs > 1 else "1 run"
+        ax1.set_xlabel("Noise PC index (a per-run RANK — PC k differs between runs)")
+        ax1.set_ylabel("R² of PC explained by task design")
+        ax1.set_title(
+            f"Per-component overlap with the task design — {span}\n"
+            f"{n_exceed} of {per_run.size} run×PC bars exceed the null across ALL runs "
+            f"(~{0.05 * per_run.size:.0f} expected by chance)",
+            fontweight="bold",
+            fontsize=10,
+        )
+        ax1.legend(fontsize=7, loc="upper right", ncol=2)
+        ax1.grid(True, alpha=0.3, axis="y", zorder=0)
+        step = max(1, len(per_pc) // 20)
+        ax1.set_xticks(x[::step])
+        ax1.set_xticklabels([str(int(v)) for v in x[::step]])
+
+        # Panel 2 is the one that predicts beta contamination. An overlap spread
+        # thinly over many components leaves panel 1 looking innocent while this
+        # one climbs away from its null.
+        ax2.fill_between(
+            ks,
+            sub_null - 2 * sub_sd,
+            sub_null + 2 * sub_sd,
+            color="gray",
+            alpha=0.25,
+            label="null ±2 SD",
+            zorder=1,
+        )
+        ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
+        for slot, r in enumerate(runs):
+            ax2.plot(
+                ks,
+                sub_run[r],
+                "-",
+                color=colors[slot],
+                linewidth=1.0,
+                alpha=0.75,
+                label=f"run {r + 1}",
+                zorder=3,
+            )
         ax2.plot(
             ks,
-            sub_run[r],
-            "-",
-            color=run_colors[r],
-            linewidth=1.0,
-            alpha=0.75,
-            label=f"run {r + 1}",
-            zorder=3,
+            sub,
+            "o-",
+            color="firebrick",
+            linewidth=2,
+            markersize=4,
+            label=f"mean of all {n_runs} runs",
+            zorder=4,
         )
-    ax2.plot(
-        ks,
-        sub,
-        "o-",
-        color="firebrick",
-        linewidth=2,
-        markersize=4,
-        label="mean across runs",
-        zorder=4,
-    )
-    if optimal_n_components is not None:
-        ax2.axvline(
-            optimal_n_components,
-            color="red",
-            linestyle="--",
-            linewidth=1.5,
-            label=f"selected: {optimal_n_components}",
+        if optimal_n_components is not None:
+            ax2.axvline(
+                optimal_n_components,
+                color="red",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"selected: {optimal_n_components}",
+            )
+        peak_k = int(np.argmax(sub_z))
+        ax2.text(
+            0.98,
+            0.06,
+            f"peak z = {sub_z[peak_k]:+.1f} (k={peak_k})",
+            transform=ax2.transAxes,
+            ha="right",
+            va="bottom",
+            fontsize=9,
+            color="firebrick",
+            fontweight="bold",
         )
-    # Placed in axes coordinates: anchoring it to the curve put it through the
-    # title whenever the curve ended near the top, which is the common case.
-    peak_k = int(np.argmax(sub_z))
-    ax2.text(
-        0.98,
-        0.06,
-        f"peak z = {sub_z[peak_k]:+.1f} (k={peak_k})",
-        transform=ax2.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=9,
-        color="firebrick",
-        fontweight="bold",
-    )
-    ax2.set_xlabel("Number of noise PCs (k)")
-    ax2.set_ylabel("Fraction of DESIGN variance\ninside the k-PC subspace")
-    ax2.set_title(
-        "Subspace overlap — what actually contaminates the betas\n"
-        "(an overlap spread thinly over many PCs leaves the panel above innocent)",
-        fontweight="bold",
-        fontsize=10,
-    )
-    ax2.legend(fontsize=7, loc="upper left", ncol=2)
-    ax2.grid(True, alpha=0.3)
-    ax2.set_xticks(ks[:: max(1, len(ks) // 20)])
+        ax2.set_xlabel("Number of noise PCs (k)")
+        ax2.set_ylabel("Fraction of DESIGN variance\ninside the k-PC subspace")
+        ax2.set_title(
+            "Subspace overlap — what actually contaminates the betas\n"
+            "(an overlap spread thinly over many PCs leaves the panel above innocent)",
+            fontweight="bold",
+            fontsize=10,
+        )
+        ax2.legend(fontsize=7, loc="upper left", ncol=2)
+        ax2.grid(True, alpha=0.3)
+        ax2.set_xticks(ks[:: max(1, len(ks) // 20)])
 
-    fig.tight_layout()
-    if output_path:
-        fig.savefig(output_path, dpi=120, bbox_inches="tight")
-    return fig
+        fig.tight_layout()
+        if output_path:
+            if len(groups) == 1:
+                path = output_path
+            else:
+                stem, _, ext = str(output_path).rpartition(".")
+                path = f"{stem}_{g_idx + 1:02d}.{ext}"
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(path, dpi=120, bbox_inches="tight")
+        figures.append(fig)
+
+    return figures

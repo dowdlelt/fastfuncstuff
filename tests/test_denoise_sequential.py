@@ -1865,3 +1865,30 @@ def test_pc_task_overlap_subspace_is_monotone_and_bounded():
         qk, _ = np.linalg.qr(pc0[:, :k])
         explicit = ((qk @ (qk.T @ d)) ** 2).sum() / (d**2).sum()
         assert per_run["subspace"][k] == pytest.approx(explicit, abs=1e-9)
+
+
+@pytest.mark.parametrize(
+    "n_runs,expected",
+    [
+        (1, [1]),
+        (5, [5]),
+        (6, [3, 3]),
+        (7, [4, 3]),
+        (10, [5, 5]),
+        (11, [4, 4, 3]),
+        (20, [5, 5, 5, 5]),
+    ],
+)
+def test_run_figure_split_is_balanced(n_runs, expected):
+    """Runs split into balanced groups, never a lone trailing run.
+
+    Greedy packing would give 11 -> 5/5/1, and a figure holding one run beside
+    figures holding five reads as though that run were singled out.
+    """
+    from fastfuncstuff.visualization import split_runs_for_figures
+
+    groups = split_runs_for_figures(n_runs)
+    assert [len(g) for g in groups] == expected
+    # Every run appears exactly once, in order.
+    assert [r for g in groups for r in g] == list(range(n_runs))
+    assert all(len(g) <= 5 for g in groups)
