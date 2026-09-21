@@ -4360,7 +4360,13 @@ def enable_determinism(verb: int = 1) -> None:
 # ---------------------------------------------------------------------------
 
 
-def add_hrf_library_args(group, *, dest_prefix: str = "hrf_library") -> None:
+def add_hrf_library_args(
+    group,
+    *,
+    dest_prefix: str = "hrf_library",
+    impulse_note: str | None = None,
+    raw_note: str | None = None,
+) -> None:
     """Register ``-hrf-library`` / ``-hrf-library-raw`` on one argument group.
 
     ffs_librarian emits two library files that are indistinguishable by
@@ -4369,36 +4375,59 @@ def add_hrf_library_args(group, *, dest_prefix: str = "hrf_library") -> None:
     was measured at -- so which flag was used is the only record of which kind
     is in hand.  Registering both from one place keeps that distinction spelled
     the same way in every tool that can consume a library.
+
+    One spelling each: ``FfsArgumentParser`` derives the ``-hrf_library_raw``
+    twin at parse time, and a twin registered here would show up in ``-help``
+    and in the completions, which are meant to offer one name per flag.
+
+    Only for tools whose design is built from onsets.  ffs_pyrf deliberately
+    has no ``-raw`` form: its stimulus is a per-TR aperture sequence with no
+    event durations to double-count, so a duration-convolved library would be
+    wrong there rather than merely unsupported.
+
+    ``impulse_note`` / ``raw_note`` are appended to the shared text as their
+    own paragraph.  The distinction between the two files is identical
+    everywhere and belongs here; what a given tool then DOES with the library
+    -- which flag loads it, what it is matched against -- differs per tool and
+    would be lost if the help were shared wholesale.
     """
+    flag = f"-{dest_prefix.replace('_', '-')}"
+
+    impulse_help = (
+        "Custom HRF library of IMPULSE RESPONSES, e.g.\n"
+        "ffs_librarian's {prefix}_hrflibrary.tsv.  The stimulus\n"
+        "duration is applied here, by building the design's\n"
+        "onsets as boxcars."
+    )
+    raw_help = (
+        "Custom HRF library that is already DURATION-CONVOLVED,\n"
+        "e.g. ffs_librarian's {prefix}_hrfraw.tsv.  The design's\n"
+        "onsets are built as IMPULSES instead, because the curve\n"
+        "already carries the duration; convolving again would\n"
+        "apply it twice.\n"
+        "\n"
+        "Use it when ffs_librarian warned that the impulse\n"
+        "deconvolution was not identifiable for your design.\n"
+        f"Mutually exclusive with {flag}."
+    )
+    if impulse_note:
+        impulse_help += "\n\n" + impulse_note
+    if raw_note:
+        raw_help += "\n\n" + raw_note
+
     group.add_argument(
-        f"-{dest_prefix.replace('_', '-')}",
+        flag,
         dest=dest_prefix,
         default=None,
         metavar="TSV",
-        help=(
-            "Custom HRF library of IMPULSE RESPONSES, e.g.\n"
-            "ffs_librarian's {prefix}_hrflibrary.tsv.  The stimulus\n"
-            "duration is applied here, by building the design's\n"
-            "onsets as boxcars."
-        ),
+        help=impulse_help,
     )
     group.add_argument(
-        f"-{dest_prefix.replace('_', '-')}-raw",
-        f"-{dest_prefix}_raw",
+        f"{flag}-raw",
         dest=f"{dest_prefix}_raw",
         default=None,
         metavar="TSV",
-        help=(
-            "Custom HRF library that is already DURATION-CONVOLVED,\n"
-            "e.g. ffs_librarian's {prefix}_hrfraw.tsv.  The design's\n"
-            "onsets are built as IMPULSES instead, because the curve\n"
-            "already carries the duration; convolving again would\n"
-            "apply it twice.\n"
-            "\n"
-            "Use it when ffs_librarian warned that the impulse\n"
-            "deconvolution was not identifiable for your design.\n"
-            "Mutually exclusive with the flag above."
-        ),
+        help=raw_help,
     )
 
 

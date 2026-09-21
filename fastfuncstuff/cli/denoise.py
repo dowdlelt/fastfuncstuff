@@ -47,6 +47,7 @@ try:
         add_cv_metric_arg,
         add_cv_strategy_arg,
         add_device_arg,
+        add_hrf_library_args,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -585,34 +586,10 @@ Notes:
         default=None,
         help="HRFoptfast output prefix. Loads {prefix}_hrf_index.nii.gz for per-voxel HRFs.",
     )
-    proc_opts.add_argument(
-        "-hrf-library",
-        dest="hrf_library",
-        type=str,
-        default=None,
-        metavar="TSV",
-        help=(
-            "Custom HRF library of IMPULSE RESPONSES (ffs_librarian's\n"
-            "{prefix}_hrflibrary.tsv); used when the per-voxel HRF\n"
-            "library is loaded for denoising.  The stimulus duration\n"
-            "is applied by the design's onsets."
-        ),
-    )
-    proc_opts.add_argument(
-        "-hrf-library-raw",
-        "-hrf_library_raw",
-        dest="hrf_library_raw",
-        type=str,
-        default=None,
-        metavar="TSV",
-        help=(
-            "As above but for a DURATION-CONVOLVED library\n"
-            "(ffs_librarian's {prefix}_hrfraw.tsv).  The onsets are\n"
-            "built as IMPULSES instead, since the curve already\n"
-            "carries the duration -- convolving again applies it\n"
-            "twice.  Match whichever form ffs_hrfopt used to produce\n"
-            "the indices being loaded."
-        ),
+    add_hrf_library_args(
+        proc_opts,
+        impulse_note="Used when the per-voxel HRF library is loaded for\ndenoising.",
+        raw_note=("Match whichever form ffs_hrfopt used to produce the\nindices being loaded."),
     )
     proc_opts.add_argument(
         "-polort",

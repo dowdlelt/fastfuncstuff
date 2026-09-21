@@ -472,12 +472,26 @@ def create_parser() -> argparse.ArgumentParser:
             "number generated. Defaults to the whole library / 20 PIGHS shapes"
         ),
     )
+    # Not cli_utils.add_hrf_library_args: that registers a -raw twin for a
+    # DURATION-CONVOLVED library, which is meaningless here. A pRF design is a
+    # per-TR aperture sequence, not an onset list, so there is no event duration
+    # to carry -- the library is built at stim_duration=tr and the HRF stays an
+    # impulse response (see _build_hrf_library). A -raw form would offer to
+    # double-count a duration this model never applies.
     model.add_argument(
         "-hrf-library",
-        "-hrf_library",
         dest="hrf_library",
         default=None,
-        help="Custom column-wise HRF TSV, e.g. from ffs_librarian (-hrf library only)",
+        metavar="TSV",
+        help=(
+            "Custom HRF library of IMPULSE RESPONSES, e.g.\n"
+            "ffs_librarian's {prefix}_hrflibrary.tsv.  Used only\n"
+            "with -hrf library.\n"
+            "\n"
+            "There is no -raw form: the stimulus is a per-TR aperture\n"
+            "sequence with no event duration, so a duration-convolved\n"
+            "library would apply a duration this model never uses."
+        ),
     )
     model.add_argument(
         "-save-canonical",

@@ -43,6 +43,7 @@ try:
         add_cv_metric_arg,
         add_cv_strategy_arg,
         add_device_arg,
+        add_hrf_library_args,
         add_load_threads_arg,
         add_noise_ceiling_args,
         add_ortvec_arguments,
@@ -260,19 +261,6 @@ Notes:
         help="Number of HRFs in library (default: 20, only affects pighs mode)",
     )
     hrf_opts.add_argument(
-        "-hrf-library",
-        dest="hrf_library",
-        default=None,
-        metavar="TSV",
-        help=(
-            "Path to a custom HRF library TSV of IMPULSE RESPONSES (same "
-            "format as getcanonicalhrflibrary.tsv; ffs_librarian writes this "
-            "as {prefix}_hrflibrary.tsv).  The stimulus duration is applied "
-            "here, by building the onset matrix as boxcars.  Used only when "
-            "-hrf_mode library."
-        ),
-    )
-    hrf_opts.add_argument(
         "-save_selected_tr",
         "-save-selected-tr",
         dest="save_selected_tr",
@@ -293,31 +281,16 @@ Notes:
             "actually showed?' is a two-volume comparison."
         ),
     )
-    hrf_opts.add_argument(
-        "-hrf-library-raw",
-        dest="hrf_library_raw",
-        default=None,
-        metavar="TSV",
-        help=(
-            "Path to a DURATION-CONVOLVED library: ffs_librarian's\n"
-            "{prefix}_hrfraw.tsv, whose curves are already the\n"
-            "response to an event of the duration they were\n"
-            "measured at.\n"
-            "\n"
-            "Convolving those with a boxcar again would count the\n"
-            "duration twice, so this loader builds the onset matrix\n"
-            "as IMPULSES and lets the curve carry the duration.\n"
+    add_hrf_library_args(
+        hrf_opts,
+        impulse_note="Used only when -hrf_mode library.",
+        raw_note=(
             "Everything downstream -- per-voxel selection, xval, the\n"
             "saved index map -- is unchanged.\n"
             "\n"
-            "Use it when ffs_librarian warned that the impulse\n"
-            "deconvolution was not identifiable for your design.\n"
-            "The duration-convolved curves are sound in that case\n"
-            "even though the impulse library is not.\n"
-            "\n"
             "Valid only if -durations matches what the library was\n"
             "built at; the sidecar {prefix}_metadata.json is checked\n"
-            "when present.  Mutually exclusive with -hrf-library."
+            "when present."
         ),
     )
 
