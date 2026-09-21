@@ -350,14 +350,26 @@ mean (routine in noise -- it is a real value, not a bug).
                 means trials were dropped or censored unevenly.
   interaction   r2_full - r2_additive. Response specific to a particular (A, B)
                 combination, beyond what A and B contribute separately.
-  preference    (unique_B - unique_A) / (unique_B + unique_A). Dimensionless,
-                -1 = purely A-driven, +1 = purely B-driven, 0 = equal. Being a
-                RATIO it is largely insensitive to how reliable the voxel is, so
-                it survives low SNR far better than the raw R2 maps. Usually the
-                map to look at first. Reported as 0 where the denominator is not
-                POSITIVE (both uniquenesses go negative in noise, and a denominator
-                of -1e-3 would otherwise flip the sign for no reason) or where the
-                noise ceiling is below 0.01.
+  preference    (unique_B - unique_A) / (unique_B + unique_A). Dimensionless;
+                sign is the direction, 0 = equal. Being a RATIO it is largely
+                insensitive to how reliable the voxel is, so it survives low SNR
+                far better than the raw R2 maps. Usually the map to look at first.
+
+                NOT bounded to [-1, +1]. -1 and +1 are where the losing factor's
+                unique variance is exactly 0; beyond them it went NEGATIVE, i.e.
+                adding that factor actively hurt held-out prediction. |pref| = 1.7
+                is therefore a real and readable result ("B wins, A is worse than
+                nothing"), not a bug -- but it is not the same claim as 1.0, and
+                the magnitude is not a strength: it grows as the DENOMINATOR
+                shrinks, so read strength off unique_A / unique_B (or their
+                _frac_ceiling forms), never off |preference|.
+
+                Reported as 0 where the denominator is not POSITIVE (both
+                uniquenesses go negative in noise, and a denominator of -1e-3
+                would otherwise flip the sign for no reason), where it is below
+                -min_preference_frac_ceiling x the noise ceiling (a ratio of two
+                numbers that are both ~0 diverges), or where the ceiling itself is
+                below 0.01.
 
 Note on "adds up": these are CROSS-VALIDATED commonality measures, not classical
 variance components. Uniquenesses can be negative, and the four pieces need not
@@ -618,6 +630,20 @@ mapping back to the original labels is written to {prefix}_varpart.json).
             "this fraction of the voxel's noise ceiling before any nonzero rank is "
             "reported. Without it, voxels whose interaction was shrunk away entirely have "
             "a flat curve and the argmax reads float noise as structure."
+        ),
+    )
+    opt.add_argument(
+        "-min_preference_frac_ceiling",
+        "-min-preference-frac-ceiling",
+        dest="min_preference_frac_ceiling",
+        type=float,
+        default=0.05,
+        help=(
+            "Interpretability floor for preference: the two uniquenesses must SUM to this "
+            "fraction of the voxel's noise ceiling before a ratio is reported, else 0. "
+            "Preference is a ratio and diverges as that sum approaches zero, so without "
+            "this a parcel where neither factor explained anything reads as an "
+            "overwhelming preference. Set 0 to report every positive denominator."
         ),
     )
     opt.add_argument(
@@ -916,6 +942,7 @@ def main() -> int:
         max_rank=args.max_rank,
         min_ncsnr_for_rank=args.min_ncsnr_for_rank,
         min_interaction_frac_ceiling=args.min_interaction_frac_ceiling,
+        min_preference_frac_ceiling=args.min_preference_frac_ceiling,
         n_nuclear_taus=args.nuclear_taus,
         nested_gamma=args.nested_gamma,
         strict_run_locality=args.strict_run_locality,
@@ -953,6 +980,9 @@ def main() -> int:
         print("       treat the partition as approximate and check for dropped trials.")
     for pair, frac in d["rank_undetermined_frac_per_pair"].items():
         print(f"   rank undetermined for {pair} (ncsnr < {args.min_ncsnr_for_rank}): {frac:.1%}")
+    if res.preference is not None:
+        pref_frac = d["preference_uninterpretable_frac"]
+        print(f"   preference zeroed as uninterpretable: {pref_frac:.1%} of units")
     print(
         f"   gamma selection: {'nested inner folds' if args.nested_gamma else 'reporting folds (legacy)'}"
     )
