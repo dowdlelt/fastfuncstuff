@@ -749,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
             load_afni_mask,
             load_nifti,
             save_nifti,
+            to_voxel_major,
         )
         from fastfuncstuff.phasereg.core import phase_regress
         from fastfuncstuff.utils import configure_torch_backends, get_device  # noqa: F401
@@ -845,14 +846,14 @@ def main(argv: list[str] | None = None) -> int:
         if args.tr is None:
             tr_values.append(get_tr_from_file(mag_path))
 
-        # from_numpy, not torch.tensor: nibabel hands back an F-CONTIGUOUS
-        # (x, y, z, t) array, so the C-order reshape to (n_voxels, n_tp) is a
-        # full copy (378 ms per localizer run, measured) -- and torch.tensor()
-        # then copied that copy. from_numpy wraps the F-strided array for free
-        # and lets the one unavoidable copy happen in the reshape. Same voxel
-        # order: torch.reshape is row-major like numpy's default.
-        mag_list.append(torch.from_numpy(mag_data).reshape(-1, n_tp))
-        pha_list.append(torch.from_numpy(pha_data).reshape(-1, n_tp))
+        # nibabel hands back an F-CONTIGUOUS (x, y, z, t) array, so the C-order
+        # flatten to (n_voxels, n_tp) is a full four-axis memory reversal -- 378 ms
+        # per localizer run when done as a single-threaded reshape. to_voxel_major
+        # threads that copy (~4.7x measured) and returns it C-contiguous, so
+        # from_numpy then wraps it for free. Same voxel order: both are a C-order
+        # flatten of (x, y, z), matching mask.flatten().
+        mag_list.append(torch.from_numpy(to_voxel_major(mag_data)))
+        pha_list.append(torch.from_numpy(to_voxel_major(pha_data)))
 
         if args.verb >= 1:
             print(f"  Run {i + 1}: {mag_path} ({n_tp} TRs)")

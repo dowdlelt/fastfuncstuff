@@ -76,7 +76,12 @@ try:
         parse_num_comps_spec,
         prune_mask_constant_voxels,
     )
-    from fastfuncstuff.io.afni import get_tr_from_file, load_afni_mask, load_nifti
+    from fastfuncstuff.io.afni import (
+        get_tr_from_file,
+        load_afni_mask,
+        load_nifti,
+        to_voxel_major,
+    )
     from fastfuncstuff.utils import (
         gaussian_blur_3d,
         scale_to_percent_signal,
@@ -242,7 +247,7 @@ def _run_single_ica(
     if mask3d is not None:
         data_vox_t_np = data[mask3d].astype(np.float32)
     else:
-        data_vox_t_np = data.reshape(-1, n_t).astype(np.float32)
+        data_vox_t_np = to_voxel_major(data)
 
     # Constant voxels must leave the mask, not just be zeroed — see
     # tools.find_constant_voxels for why (mixture-model collapse).
@@ -302,7 +307,7 @@ def _run_single_ica(
         if mask3d is not None:
             depth_source_vox_t_np = source_4d[mask3d].astype(np.float32)
         else:
-            depth_source_vox_t_np = source_4d.reshape(-1, n_t).astype(np.float32)
+            depth_source_vox_t_np = to_voxel_major(source_4d)
 
     # Done with optional unblurred copy once depth source is prepared.
     if data_unblurred is not None:
@@ -1610,7 +1615,7 @@ def _run_concat_ica(
         if mask3d is not None:
             run_vox_np = data[mask3d].astype(np.float32)
         else:
-            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+            run_vox_np = to_voxel_major(data)
         del data
 
         if ri == 0:
@@ -2564,7 +2569,7 @@ def _temporal_ica_preprocess_runs(
         if mask3d is not None:
             run_vox_np = data[mask3d].astype(np.float32)
         else:
-            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+            run_vox_np = to_voxel_major(data)
         del data
 
         if ri == 0:
@@ -3080,7 +3085,7 @@ def _run_tensorial_ica(
         if mask3d is not None:
             run_vox_np = data[mask3d].astype(np.float32)
         else:
-            run_vox_np = data.reshape(-1, n_t_run).astype(np.float32)
+            run_vox_np = to_voxel_major(data)
         del data
 
         if ri == 0:
