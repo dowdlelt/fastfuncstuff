@@ -299,6 +299,12 @@ class DenoiseResults:
     initial_noise_ceiling: torch.Tensor | None = None
     initial_explainable_r2: torch.Tensor | None = None
     noise_ceiling_notes: list[str] = field(default_factory=list)
+    # (n_voxels, max_components + 1) from clean_reference_diagnostic. The
+    # aggregate curve cannot say whether an excess is task signal the PCs
+    # rescued or motion the projection happened to take with it; only where it
+    # falls in the brain can. Gray matter and task regions argue the first,
+    # edges and ventricles and sinuses the second.
+    clean_reference_excess_per_voxel: np.ndarray | None = None
 
 
 @dataclass
@@ -3256,6 +3262,7 @@ def fit_denoising_model(
     clean_ss_tot_fraction: np.ndarray | None = None
     r2_clean_null: np.ndarray | None = None
     r2_clean_excess: np.ndarray | None = None
+    clean_excess_per_voxel: np.ndarray | None = None
     if clean_reference_diagnostic:
         if verbose:
             print("\nStep 4b: Diagnostic sweep against a PC-projected referee...")
@@ -3323,6 +3330,9 @@ def fit_denoising_model(
         # noise made task-locked the raw curve gained an indistinguishable
         # +0.086 and the excess +0.223. The raw curve cannot tell those apart.
         r2_clean_excess = r2_clean_reference - r2_clean_null
+        # Kept per voxel, not just aggregated: the curve says an excess exists,
+        # the map says whether to believe it.
+        clean_excess_per_voxel = (clean_maps_per_voxel - clean_null_per_voxel).astype(np.float32)
         del clean_maps_per_voxel, clean_null_per_voxel, clean_frac_per_voxel
 
         # Unconditional, like the other decision lines: -verb defaults to 0, so
@@ -3735,6 +3745,7 @@ def fit_denoising_model(
         initial_noise_ceiling=initial_noise_ceiling,
         initial_explainable_r2=initial_explainable_r2,
         noise_ceiling_notes=noise_ceiling_notes,
+        clean_reference_excess_per_voxel=clean_excess_per_voxel,
         pcselection_mask=pcselection_mask,
         noise_pool_mask=noise_pool_mask,
         criteria_mask=criteria_mask,

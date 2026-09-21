@@ -168,6 +168,13 @@ Outputs:
                                                 k PCs (labelled npc00..npcN). The
                                                 selection curve is this file's median
                                                 over criteria voxels.
+        {prefix}_clean_reference_excess.nii.gz - With -diag_clean_reference: per-voxel
+                                                excess over the null at every count,
+                                                same npc00..npcN layout. Look at WHERE
+                                                it lives: gray matter and task regions
+                                                argue the PCs rescued task signal,
+                                                edges/ventricles/sinuses argue the
+                                                projection just took motion with it.
 
         Each stack carries the ceiling built at ITS OWN PC count, because the two
         R²s are scored on differently-projected data and a ceiling only bounds an
@@ -1173,6 +1180,25 @@ def save_denoising_results(
             brick_labels=[f"npc{k:02d}" for k in range(results.xval_r2_per_voxel.shape[1])],
         )
         output_files["xval_r2_by_pc"] = r2_by_pc_path
+
+    # 3f. Per-voxel clean-reference excess, when the diagnostic ran. Saved
+    # unconditionally with it rather than behind another flag: the aggregate
+    # curve can say an excess exists but not whether it is task signal the PCs
+    # rescued or motion the projection took with it, and that question is the
+    # reason to have run the diagnostic at all.
+    if results.clean_reference_excess_per_voxel is not None:
+        excess_path = f"{output_prefix}_clean_reference_excess{nii_ext}"
+        excess = np.asarray(results.clean_reference_excess_per_voxel, dtype=np.float32)
+        save_4d_nifti(
+            excess,
+            excess_path,
+            volume_shape,
+            affine,
+            mask_flat=voxel_mask_np,
+            header=nifti_header,
+            brick_labels=[f"npc{k:02d}" for k in range(excess.shape[1])],
+        )
+        output_files["clean_reference_excess"] = excess_path
 
     # 4. CV R² arrays
     xval_r2_path = f"{output_prefix}_xval_r2_by_npcs.npy"
