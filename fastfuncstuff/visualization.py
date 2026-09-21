@@ -1900,3 +1900,93 @@ def plot_denoising_summary(
         plt.savefig(output_path, dpi=150, bbox_inches="tight")
 
     return fig
+
+
+def plot_pc_task_overlap(
+    overlap: dict,
+    optimal_n_components: int | None = None,
+    output_path: str | None = None,
+    figsize: tuple[int, int] = (12, 8),
+) -> plt.Figure:
+    """Noise-PC / task-design overlap, per component and as a subspace.
+
+    Both panels carry the phase-randomised null, which is the entire point: an
+    HRF-convolved design is smooth and so is physiological noise, so the bars
+    are meaningless without the band. Drawn from
+    :func:`~fastfuncstuff.denoise.sequential.compute_pc_task_overlap`.
+    """
+    per_pc = np.asarray(overlap["per_pc"])
+    p95 = np.asarray(overlap["per_pc_null_p95"])
+    null_mean = np.asarray(overlap["per_pc_null_mean"])
+    sub = np.asarray(overlap["subspace"])
+    sub_null = np.asarray(overlap["subspace_null_mean"])
+    sub_sd = np.asarray(overlap["subspace_null_sd"])
+    sub_z = np.asarray(overlap["subspace_z"])
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
+    x = np.arange(1, len(per_pc) + 1)
+
+    exceeds = per_pc > p95
+    ax1.bar(x[~exceeds], per_pc[~exceeds], color="steelblue", label="PC (within null)", zorder=3)
+    if exceeds.any():
+        ax1.bar(x[exceeds], per_pc[exceeds], color="firebrick", label="exceeds null p95", zorder=3)
+    ax1.axhspan(
+        0, float(p95[0]), color="gray", alpha=0.22, zorder=1, label="spectrum-matched null (to p95)"
+    )
+    ax1.axhline(
+        float(null_mean[0]), color="black", linestyle=":", linewidth=1, zorder=2, label="null mean"
+    )
+    ax1.set_xlabel("Noise PC")
+    ax1.set_ylabel("R² of PC explained by task design")
+    ax1.set_title(
+        "Per-component overlap with the task design "
+        f"({int(exceeds.sum())} of {len(per_pc)} exceed the null; ~{0.05 * len(per_pc):.0f} expected)",
+        fontweight="bold",
+    )
+    ax1.legend(fontsize=8, loc="upper right")
+    ax1.grid(True, alpha=0.3, axis="y", zorder=0)
+
+    # Panel 2 is the one that predicts beta contamination. An overlap spread
+    # thinly over many components leaves panel 1 looking innocent while this
+    # one climbs away from its null.
+    ks = np.arange(len(sub))
+    ax2.plot(
+        ks, sub, "o-", color="firebrick", linewidth=2, markersize=4, label="observed", zorder=3
+    )
+    ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
+    ax2.fill_between(
+        ks,
+        sub_null - 2 * sub_sd,
+        sub_null + 2 * sub_sd,
+        color="gray",
+        alpha=0.25,
+        label="null ±2 SD",
+        zorder=1,
+    )
+    if optimal_n_components is not None:
+        ax2.axvline(
+            optimal_n_components,
+            color="red",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"selected: {optimal_n_components}",
+        )
+    peak_k = int(np.argmax(sub_z))
+    ax2.annotate(
+        f"z = {sub_z[peak_k]:+.1f} at k={peak_k}",
+        xy=(peak_k, sub[peak_k]),
+        xytext=(-10, 14),
+        textcoords="offset points",
+        fontsize=8,
+        color="firebrick",
+    )
+    ax2.set_xlabel("Number of noise PCs (k)")
+    ax2.set_ylabel("Fraction of DESIGN variance\ninside the k-PC subspace")
+    ax2.set_title("Subspace overlap — what actually contaminates the betas", fontweight="bold")
+    ax2.legend(fontsize=8, loc="upper left")
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    if output_path:
+        fig.savefig(output_path, dpi=120, bbox_inches="tight")
+    return fig

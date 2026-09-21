@@ -2496,6 +2496,8 @@ def fit_denoising_model(
     r2_method: str = "auto",
     zero_event_strategy: str = "zero",
     clean_reference_diagnostic: bool = False,
+    compute_task_overlap: bool = False,
+    task_overlap_surrogates: int = 200,
     ceiling_method: str = "auto",
     repeat_groups: list[list[int]] | None = None,
     device: torch.device | None = None,
@@ -3176,6 +3178,27 @@ def fit_denoising_model(
     if verbose:
         print("\nStep 4: Cross-validating PC selection (ALL voxels)...")
 
+    # PC/design overlap, computed here because everything it needs is in hand
+    # and it costs a few seconds. Independent of the CV: it asks whether the
+    # noise pool's structure is task-correlated at all, which is the question
+    # behind every "should I be removing these?" argument.
+    pc_task_overlap: dict | None = None
+    if compute_task_overlap:
+        try:
+            overlap_design = (
+                design_matrix if not per_hrf_mode else next(iter(designs_by_hrf.values()))  # type: ignore[union-attr]
+            )
+            pc_task_overlap = compute_pc_task_overlap(
+                noise_pcs=noise_pcs,
+                design_matrix=overlap_design,
+                run_starts=run_starts,
+                n_timepoints=n_timepoints,
+                nuisance=nuisance if isinstance(nuisance, list) else None,
+                n_surrogates=task_overlap_surrogates,
+            )
+        except Exception as exc:  # diagnostic only; never fail a fit for it
+            print(f"  Warning: PC/task overlap not computed: {exc}")
+
     if per_hrf_mode:
         # Per-HRF mode: Process each HRF group separately, then aggregate
         assert hrf_indices is not None
@@ -3682,6 +3705,11 @@ def fit_denoising_model(
         "xval_r2_all_voxels": r2_all_voxels.tolist(),
     }
 
+    if pc_task_overlap is not None:
+        metadata["pc_task_overlap"] = {
+            k: np.asarray(v).tolist() for k, v in pc_task_overlap.items()
+        }
+
     if r2_clean_reference is not None:
         # Not comparable in level to the curve above -- its denominator shrinks
         # with the PC count, which is what ss_tot_fraction records. Shape only.
@@ -3758,3 +3786,118 @@ def fit_denoising_model(
         improvement=improvement,
         metadata=metadata,
     )
+
+
+def compute_pc_task_overlap(
+    noise_pcs: list[torch.Tensor],
+    design_matrix: torch.Tensor,
+    run_starts: list[int],
+    n_timepoints: int,
+    nuisance: list[torch.Tensor] | None = None,
+    n_surrogates: int = 200,
+    seed: int = 0,
+) -> dict:
+    """How much the noise PCs and the task design overlap, against a fair null.
+
+    Two views, because they answer different questions and the first one alone
+    is actively misleading:
+
+    * ``per_pc`` — R2 of each PC explained by the task design. Reads as
+      "is this component task-locked?"
+    * ``subspace`` — fraction of the DESIGN's variance lying inside the first-k
+      PC subspace. This is the one that predicts beta contamination, and it is
+      not recoverable from the per-PC numbers: an overlap spread thinly across
+      many components leaves every individual PC looking innocent.
+
+    Both are scored against **phase-randomised surrogates of the PCs**, which
+    preserve each component's power spectrum and destroy only its phase
+    relationship to the task. Without that null the numbers are unreadable: an
+    HRF-convolved design is smooth, physiological noise is smooth, and any two
+    smooth timeseries correlate. Measured on real data, the naive chance level
+    for a 7-condition design over 455 df is 0.015 while the spectrum-matched
+    null sits at 0.085 -- so a PC scoring 0.12 looks like a 8x enrichment and is
+    in fact unremarkable.
+
+    Returns a dict of arrays: ``per_pc`` and ``per_pc_null_p95`` (n_components,),
+    ``subspace`` and ``subspace_null_mean`` / ``subspace_null_sd`` / ``subspace_z``
+    (n_components + 1,), indexed by k.
+    """
+    rng = np.random.default_rng(seed)
+    n_runs = len(run_starts)
+    n_comp = min(int(pcs.shape[1]) for pcs in noise_pcs)
+
+    def _slice(r: int) -> slice:
+        end = run_starts[r + 1] if r < n_runs - 1 else n_timepoints
+        return slice(run_starts[r], end)
+
+    def _phase_randomise(x: np.ndarray) -> np.ndarray:
+        spec = np.fft.rfft(x, axis=0)
+        phase = rng.uniform(0, 2 * np.pi, spec.shape)
+        phase[0] = 0.0
+        return np.fft.irfft(np.abs(spec) * np.exp(1j * phase), n=x.shape[0], axis=0)
+
+    per_pc_obs: list[np.ndarray] = []
+    per_pc_null: list[np.ndarray] = []
+    sub_obs = np.zeros(n_comp + 1)
+    sub_null = np.zeros((n_surrogates, n_comp + 1))
+
+    for r in range(n_runs):
+        sl = _slice(r)
+        design_run = design_matrix[sl, :].detach().cpu().numpy().astype(np.float64)
+        pcs_run = noise_pcs[r][:, :n_comp].detach().cpu().numpy().astype(np.float64)
+
+        # Everything below lives in the nuisance-orthogonal space, matching the
+        # GLM: drift the design never sees cannot contaminate its betas.
+        if nuisance is not None:
+            q_nuis, _ = np.linalg.qr(nuisance[r].detach().cpu().numpy().astype(np.float64))
+            design_run = design_run - q_nuis @ (q_nuis.T @ design_run)
+            pcs_run = pcs_run - q_nuis @ (q_nuis.T @ pcs_run)
+
+        q_design, _ = np.linalg.qr(design_run)
+
+        def _explained_by_design(mat: np.ndarray, q_design=q_design) -> np.ndarray:
+            fit = q_design @ (q_design.T @ mat)
+            return (fit**2).sum(axis=0) / np.maximum((mat**2).sum(axis=0), 1e-12)
+
+        def _design_in_subspace_cumulative(
+            basis: np.ndarray, design_run=design_run, total=None
+        ) -> np.ndarray:
+            """Design variance inside the first-k columns, for every k at once.
+
+            QR is nested -- the first k columns of Q span the first k columns of
+            the input -- so every k shares one factorization, and the energy is
+            then a cumulative sum of per-direction projections. The obvious loop
+            redoes a QR per k, which is 20x the work for the same numbers.
+            """
+            q_basis, _ = np.linalg.qr(basis)
+            coef = q_basis.T @ design_run  # (n_comp, n_cond)
+            per_dir = (coef**2).sum(axis=1)
+            return np.concatenate([[0.0], np.cumsum(per_dir)]) / total
+
+        design_energy = max((design_run**2).sum(), 1e-12)
+        per_pc_obs.append(_explained_by_design(pcs_run))
+        sub_obs += _design_in_subspace_cumulative(pcs_run, total=design_energy) / n_runs
+
+        for s_idx in range(n_surrogates):
+            surr = _phase_randomise(pcs_run)
+            if nuisance is not None:
+                surr = surr - q_nuis @ (q_nuis.T @ surr)
+            if s_idx < 40 or n_surrogates <= 40:
+                # The per-PC null converges fast (one number per component per
+                # surrogate); only the subspace null needs the full count.
+                per_pc_null.append(_explained_by_design(surr))
+            sub_null[s_idx] += _design_in_subspace_cumulative(surr, total=design_energy) / n_runs
+
+    null_stack = np.concatenate([n.ravel() for n in per_pc_null])
+    sd = sub_null.std(axis=0)
+    return {
+        "per_pc": np.mean(per_pc_obs, axis=0),
+        "per_pc_null_p95": np.full(n_comp, float(np.percentile(null_stack, 95))),
+        "per_pc_null_mean": np.full(n_comp, float(null_stack.mean())),
+        "subspace": sub_obs,
+        "subspace_null_mean": sub_null.mean(axis=0),
+        "subspace_null_sd": sd,
+        "subspace_z": np.divide(
+            sub_obs - sub_null.mean(axis=0), sd, out=np.zeros_like(sub_obs), where=sd > 1e-12
+        ),
+    }

@@ -1768,3 +1768,100 @@ def test_matched_prep_reproduces_the_pool_loadings_where_the_pool_is():
         # what it draws is just voxel amplitude.
         assert corr(raw[0][:n_pool, k], pool_loadings[0][:, k]) < 0.9
         assert corr(raw[0][:, k].abs(), scale[:, 0]) > 0.4
+
+
+# ---------------------------------------------------------------------------
+# PC / task-design overlap, against a spectrum-matched null
+# ---------------------------------------------------------------------------
+
+
+def _overlap_case(rho: float, n_runs=3, tp=240, n_comp=6, seed=3):
+    """PCs whose FIRST component carries a controlled amount of the design."""
+    torch.manual_seed(seed)
+    from fastfuncstuff.glm.core import construct_polynomial_matrix
+
+    n_tp = n_runs * tp
+    run_starts = [i * tp for i in range(n_runs)]
+    design = torch.zeros(n_tp, 2)
+    for c in range(2):
+        for r in range(n_runs):
+            design[r * tp + 10 + 7 * c :: 26, c] = 1.0
+    # Smooth it, so the design has the low-frequency character that makes a
+    # naive chance level wrong and the spectrum-matched null necessary.
+    kern = torch.ones(1, 1, 9) / 9
+    for c in range(2):
+        design[:, c] = torch.nn.functional.conv1d(
+            design[:, c].view(1, 1, -1), kern, padding=4
+        ).view(-1)[:n_tp]
+
+    nuisance = [construct_polynomial_matrix(tp, 2, DEVICE).float() for _ in range(n_runs)]
+    pcs = []
+    for r in range(n_runs):
+        sl = slice(r * tp, (r + 1) * tp)
+        task_r = design[sl, :].sum(dim=1)
+        task_r = (task_r - task_r.mean()) / task_r.std()
+        indep = torch.randn(tp)
+        indep = indep - task_r * (torch.dot(indep, task_r) / torch.dot(task_r, task_r))
+        indep = (indep - indep.mean()) / indep.std()
+        first = rho * task_r + float(np.sqrt(max(0.0, 1 - rho**2))) * indep
+        rest = torch.randn(tp, n_comp - 1)
+        pcs.append(torch.cat([first.view(-1, 1), rest], dim=1))
+    return pcs, design, run_starts, n_tp, nuisance
+
+
+def test_pc_task_overlap_tracks_real_overlap_not_smoothness():
+    """Overlap must rise with genuine design correlation and sit at the null without it.
+
+    The naive chance level for a smooth design is far too low -- a PC can score
+    several times "chance" purely by being smooth. The phase-randomised null is
+    what makes the number readable, so this checks the observed value against
+    THAT, at rho=0 and rho=0.7.
+    """
+    from fastfuncstuff.denoise.sequential import compute_pc_task_overlap
+
+    zs = {}
+    for rho in (0.0, 0.7):
+        pcs, design, run_starts, n_tp, nuisance = _overlap_case(rho)
+        out = compute_pc_task_overlap(
+            pcs, design, run_starts, n_tp, nuisance=nuisance, n_surrogates=60
+        )
+        zs[rho] = float(out["subspace_z"][1])
+
+    # No real overlap -> indistinguishable from spectrum-matched surrogates.
+    assert abs(zs[0.0]) < 3.0
+    # Strong overlap -> far outside them, and ordered.
+    assert zs[0.7] > 6.0
+    assert zs[0.7] > zs[0.0] + 5.0
+
+
+def test_pc_task_overlap_subspace_is_monotone_and_bounded():
+    """Design variance inside the first-k PCs can only grow, and never exceeds 1."""
+    from fastfuncstuff.denoise.sequential import compute_pc_task_overlap
+
+    pcs, design, run_starts, n_tp, nuisance = _overlap_case(0.4)
+    out = compute_pc_task_overlap(pcs, design, run_starts, n_tp, nuisance=nuisance, n_surrogates=40)
+    sub = np.asarray(out["subspace"])
+    assert sub[0] == pytest.approx(0.0)
+    assert np.all(np.diff(sub) >= -1e-9)
+    assert sub.max() <= 1.0 + 1e-9
+
+    # The nested-QR shortcut must agree with the obvious per-k QR it replaced:
+    # QR nests, so Q[:, :k] spans the first k columns and the energy is a
+    # cumulative sum. Checked on run 0 against an explicit per-k factorization.
+    qn, _ = np.linalg.qr(nuisance[0].numpy().astype(np.float64))
+    d = design[: run_starts[1], :].numpy().astype(np.float64)
+    d = d - qn @ (qn.T @ d)
+    pc0 = pcs[0].numpy().astype(np.float64)
+    pc0 = pc0 - qn @ (qn.T @ pc0)
+    per_run = compute_pc_task_overlap(
+        [pcs[0]],
+        design[: run_starts[1], :],
+        [0],
+        run_starts[1],
+        nuisance=[nuisance[0]],
+        n_surrogates=1,
+    )
+    for k in (1, 3, 5):
+        qk, _ = np.linalg.qr(pc0[:, :k])
+        explicit = ((qk @ (qk.T @ d)) ** 2).sum() / (d**2).sum()
+        assert per_run["subspace"][k] == pytest.approx(explicit, abs=1e-9)

@@ -1356,6 +1356,30 @@ def save_denoising_results(
             except Exception as e:
                 print(f"  Warning: Could not save noise-pool PCA scree plot: {e}")
 
+    # 6d. Noise-PC / task-design overlap. Answers "is my noise pool
+    # task-correlated at all?", which is the premise behind -diag_clean_reference
+    # and behind every argument about whether these PCs should be removed.
+    overlap = results.metadata.get("pc_task_overlap")
+    if overlap is not None:
+        try:
+            import matplotlib.pyplot as plt
+
+            from fastfuncstuff.visualization import plot_pc_task_overlap
+
+            fig_prefix = f"{output_prefix}_figures"
+            Path(fig_prefix).mkdir(parents=True, exist_ok=True)
+            overlap_path = f"{fig_prefix}/pc_task_overlap.png"
+            overlap_fig = plot_pc_task_overlap(
+                overlap,
+                optimal_n_components=results.optimal_n_components,
+                output_path=overlap_path,
+            )
+            plt.close(overlap_fig)
+            output_files["pc_task_overlap_plot"] = overlap_path
+            print(f"  Saved: {overlap_path}")
+        except Exception as e:
+            print(f"  Warning: Could not save PC/task overlap plot: {e}")
+
     # 7. Plots (based on plots_mode)
     if plots_mode in ["yes", "full", "all"]:
         try:
@@ -3608,6 +3632,7 @@ def main():
             r2_threshold=args.r2_threshold,
             zero_event_strategy=args.zero_event,
             clean_reference_diagnostic=args.diag_clean_reference,
+            compute_task_overlap=args.plots in ("yes", "full", "all"),
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
@@ -3651,6 +3676,7 @@ def main():
             r2_threshold=args.r2_threshold,
             zero_event_strategy=args.zero_event,
             clean_reference_diagnostic=args.diag_clean_reference,
+            compute_task_overlap=args.plots in ("yes", "full", "all"),
             intensity_mask=brainthresh_mask,
             max_components=args.max_comps,
             variance_threshold=args.variance_threshold,
