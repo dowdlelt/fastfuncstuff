@@ -657,18 +657,6 @@ def plot_prediction(pred, ax):
     _style_axes(ax)
 
 
-def plot_behavior_correlation(corrs, ax):
-    """Per-state correlation of a state feature (e.g. occupancy) with behaviour."""
-    corrs = np.asarray(corrs)
-    k = len(corrs)
-    ax.axhline(0, color=_INK2, linewidth=0.8)
-    ax.bar(range(k), corrs, color=state_colors(k), width=0.72)
-    _set_state_xticks(ax, k)
-    ax.set_ylabel("corr with behaviour")
-    ax.set_title("State feature ↔ behaviour")
-    _style_axes(ax)
-
-
 def plot_selection_surface(results, path: str | Path | None = None):
     """Held-out log-likelihood over the ``(n_states, max_ldim)`` grid.
 

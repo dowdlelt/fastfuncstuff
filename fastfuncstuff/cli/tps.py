@@ -147,42 +147,6 @@ def parse_tps_windows(tps_window_args, n_conditions):
             )
 
 
-def parse_n_knots(n_knots_args, n_conditions):
-    """
-    Parse number of knots (basis functions) per condition
-
-    Supports:
-    - Single value: applies to all conditions
-    - Per-condition: one value per condition
-
-    Parameters
-    ----------
-    n_knots_args : int or list of int
-        Command-line arguments for -n_knots
-    n_conditions : int
-        Number of stimulus conditions
-
-    Returns
-    -------
-    n_knots_list : list of int
-        Number of knots for each condition
-    """
-    if isinstance(n_knots_args, int):
-        # Single value
-        return [n_knots_args] * n_conditions
-    elif len(n_knots_args) == 1:
-        # Single value passed as list
-        return [n_knots_args[0]] * n_conditions
-    elif len(n_knots_args) == n_conditions:
-        # Per-condition
-        return n_knots_args
-    else:
-        raise ValueError(
-            f"Got {len(n_knots_args)} n_knots values but {n_conditions} conditions. "
-            "Use one value for all conditions or one per condition."
-        )
-
-
 def main():
     parser = FfsArgumentParser(
         description="TPS HRF estimation with cross-validated smoothness selection",

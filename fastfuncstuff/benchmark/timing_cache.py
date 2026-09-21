@@ -852,36 +852,3 @@ def compare_stage_metrics(
         )
 
     return deltas
-
-
-def get_metric_history(
-    data_dir: Path,
-    stage_name: str,
-    metric_name: str,
-    ffs_arch_id: str | None = None,
-    dataset_id: str = "",
-    max_points: int = 20,
-) -> list[dict[str, Any]]:
-    """Get the history of a single metric across runs.
-
-    Returns a list of {commit_short, timestamp, value, passed} dicts,
-    newest first.
-    """
-    recent = get_recent_runs(data_dir, ffs_arch_id, dataset_id, max_runs=max_points)
-    history = []
-    for run in recent:
-        stage = run.get("stages", {}).get(stage_name, {})
-        metrics = stage.get("metrics", {})
-        if metric_name in metrics:
-            git = run.get("git", {})
-            history.append(
-                {
-                    "commit_short": git.get("commit_short", "?"),
-                    "commit": git.get("commit", ""),
-                    "branch": git.get("branch", ""),
-                    "timestamp": run.get("timestamp", "")[:19],
-                    "value": metrics[metric_name],
-                    "passed": stage.get("passed"),
-                }
-            )
-    return history
