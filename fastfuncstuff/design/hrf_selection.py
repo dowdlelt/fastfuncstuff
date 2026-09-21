@@ -78,7 +78,16 @@ def load_nuisance_file(
     >>> # Load with validation
     >>> motion = load_nuisance_file('motion.1D', expected_rows=200)
     """
-    filepath = Path(filepath)
+    # AFNI 1D selectors, stripped before the path is touched: [cols] and {rows},
+    # with the file type doing the disambiguating -- on a dataset the brackets
+    # pick volumes, on a text file they pick columns, exactly as in AFNI. This
+    # is the one place every -ortvec* mode loads through, so supporting it here
+    # gives all four flags (and every other caller) the syntax at once.
+    from fastfuncstuff.io.headers import apply_1d_selectors, parse_1d_selectors
+
+    clean_path, sel_columns, sel_rows = parse_1d_selectors(filepath)
+    selector_src = str(filepath)
+    filepath = Path(clean_path)
     if not filepath.exists():
         raise FileNotFoundError(f"Nuisance file not found: {filepath}")
 
@@ -118,6 +127,10 @@ def load_nuisance_file(
     # Ensure 2D
     if data.ndim == 1:
         data = data.reshape(-1, 1)
+
+    # Before the row-count check, so expected_rows is compared against what the
+    # caller actually gets rather than against the file on disk.
+    data = apply_1d_selectors(data, sel_columns, sel_rows, source=selector_src)
 
     # Validate row count if expected
     if expected_rows is not None and data.shape[0] != expected_rows:
