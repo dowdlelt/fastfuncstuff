@@ -1912,7 +1912,16 @@ def plot_pc_task_overlap(
 
     Both panels carry the phase-randomised null, which is the entire point: an
     HRF-convolved design is smooth and so is physiological noise, so the bars
-    are meaningless without the band. Drawn from
+    are meaningless without the band.
+
+    Panel 1 is drawn PER RUN rather than run-averaged. The components are
+    extracted per run, so PC k is a different timeseries in each one and shares
+    only a rank in that run's variance ordering -- on real data the spread
+    across runs was as large as the mean, and a single bar labelled "PC 1"
+    implies a component that does not exist. Panel 2's per-run curves ARE
+    commensurable: "the first k PCs of this run" is well defined everywhere.
+
+    Drawn from
     :func:`~fastfuncstuff.denoise.sequential.compute_pc_task_overlap`.
     """
     per_pc = np.asarray(overlap["per_pc"])
@@ -1922,42 +1931,61 @@ def plot_pc_task_overlap(
     sub_null = np.asarray(overlap["subspace_null_mean"])
     sub_sd = np.asarray(overlap["subspace_null_sd"])
     sub_z = np.asarray(overlap["subspace_z"])
+    # PC k is a different component in every run -- the components are extracted
+    # per run and k is only a rank in that run's own variance ordering. Plotting
+    # the run-mean alone implies a component that does not exist.
+    per_run = np.asarray(overlap.get("per_pc_by_run", per_pc[None, :]))
+    sub_run = np.asarray(overlap.get("subspace_by_run", sub[None, :]))
+    n_runs = per_run.shape[0]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize)
     x = np.arange(1, len(per_pc) + 1)
+    run_colors = plt.cm.tab10(np.linspace(0, 0.9, n_runs))
 
-    exceeds = per_pc > p95
-    ax1.bar(x[~exceeds], per_pc[~exceeds], color="steelblue", label="PC (within null)", zorder=3)
-    if exceeds.any():
-        ax1.bar(x[exceeds], per_pc[exceeds], color="firebrick", label="exceeds null p95", zorder=3)
     ax1.axhspan(
-        0, float(p95[0]), color="gray", alpha=0.22, zorder=1, label="spectrum-matched null (to p95)"
+        0,
+        float(p95[0]),
+        color="gray",
+        alpha=0.22,
+        zorder=1,
+        label="spectrum-matched null (to p95)",
     )
     ax1.axhline(
         float(null_mean[0]), color="black", linestyle=":", linewidth=1, zorder=2, label="null mean"
     )
-    ax1.set_xlabel("Noise PC")
+    # Grouped bars: one per run, so a component that is task-locked in one run
+    # and not in another is visible instead of averaged away.
+    width = 0.8 / n_runs
+    for r in range(n_runs):
+        ax1.bar(
+            x + (r - (n_runs - 1) / 2) * width,
+            per_run[r],
+            width=width,
+            color=run_colors[r],
+            label=f"run {r + 1}",
+            zorder=3,
+        )
+    n_exceed = int((per_run > p95[None, :]).sum())
+    ax1.set_xlabel("Noise PC index (a per-run RANK — PC k differs between runs)")
     ax1.set_ylabel("R² of PC explained by task design")
     ax1.set_title(
-        "Per-component overlap with the task design "
-        f"({int(exceeds.sum())} of {len(per_pc)} exceed the null; ~{0.05 * len(per_pc):.0f} expected)",
+        f"Per-component overlap with the task design — {n_exceed} of "
+        f"{per_run.size} run×PC bars exceed the null "
+        f"(~{0.05 * per_run.size:.0f} expected by chance)",
         fontweight="bold",
+        fontsize=10,
     )
-    ax1.legend(fontsize=8, loc="upper right")
+    ax1.legend(fontsize=7, loc="upper right", ncol=2)
     ax1.grid(True, alpha=0.3, axis="y", zorder=0)
-    # Integer ticks: these are component indices, not a continuous axis.
     step = max(1, len(per_pc) // 20)
     ax1.set_xticks(x[::step])
     ax1.set_xticklabels([str(int(v)) for v in x[::step]])
 
     # Panel 2 is the one that predicts beta contamination. An overlap spread
     # thinly over many components leaves panel 1 looking innocent while this
-    # one climbs away from its null.
+    # one climbs away from its null. Here the per-run curves ARE commensurable:
+    # "the first k PCs of this run" is a well-defined set in every run.
     ks = np.arange(len(sub))
-    ax2.plot(
-        ks, sub, "o-", color="firebrick", linewidth=2, markersize=4, label="observed", zorder=3
-    )
-    ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
     ax2.fill_between(
         ks,
         sub_null - 2 * sub_sd,
@@ -1967,6 +1995,28 @@ def plot_pc_task_overlap(
         label="null ±2 SD",
         zorder=1,
     )
+    ax2.plot(ks, sub_null, "-", color="black", linewidth=1.2, label="null mean", zorder=2)
+    for r in range(n_runs):
+        ax2.plot(
+            ks,
+            sub_run[r],
+            "-",
+            color=run_colors[r],
+            linewidth=1.0,
+            alpha=0.75,
+            label=f"run {r + 1}",
+            zorder=3,
+        )
+    ax2.plot(
+        ks,
+        sub,
+        "o-",
+        color="firebrick",
+        linewidth=2,
+        markersize=4,
+        label="mean across runs",
+        zorder=4,
+    )
     if optimal_n_components is not None:
         ax2.axvline(
             optimal_n_components,
@@ -1975,20 +2025,31 @@ def plot_pc_task_overlap(
             linewidth=1.5,
             label=f"selected: {optimal_n_components}",
         )
+    # Placed in axes coordinates: anchoring it to the curve put it through the
+    # title whenever the curve ended near the top, which is the common case.
     peak_k = int(np.argmax(sub_z))
-    ax2.annotate(
-        f"z = {sub_z[peak_k]:+.1f} at k={peak_k}",
-        xy=(peak_k, sub[peak_k]),
-        xytext=(-10, 14),
-        textcoords="offset points",
-        fontsize=8,
+    ax2.text(
+        0.98,
+        0.06,
+        f"peak z = {sub_z[peak_k]:+.1f} (k={peak_k})",
+        transform=ax2.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
         color="firebrick",
+        fontweight="bold",
     )
     ax2.set_xlabel("Number of noise PCs (k)")
     ax2.set_ylabel("Fraction of DESIGN variance\ninside the k-PC subspace")
-    ax2.set_title("Subspace overlap — what actually contaminates the betas", fontweight="bold")
-    ax2.legend(fontsize=8, loc="upper left")
+    ax2.set_title(
+        "Subspace overlap — what actually contaminates the betas\n"
+        "(an overlap spread thinly over many PCs leaves the panel above innocent)",
+        fontweight="bold",
+        fontsize=10,
+    )
+    ax2.legend(fontsize=7, loc="upper left", ncol=2)
     ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(ks[:: max(1, len(ks) // 20)])
 
     fig.tight_layout()
     if output_path:

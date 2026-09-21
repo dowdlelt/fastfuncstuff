@@ -3799,28 +3799,36 @@ def compute_pc_task_overlap(
 ) -> dict:
     """How much the noise PCs and the task design overlap, against a fair null.
 
-    Two views, because they answer different questions and the first one alone
-    is actively misleading:
+        Two views, because they answer different questions and the first one alone
+        is actively misleading:
 
-    * ``per_pc`` — R2 of each PC explained by the task design. Reads as
-      "is this component task-locked?"
-    * ``subspace`` — fraction of the DESIGN's variance lying inside the first-k
-      PC subspace. This is the one that predicts beta contamination, and it is
-      not recoverable from the per-PC numbers: an overlap spread thinly across
-      many components leaves every individual PC looking innocent.
+        * ``per_pc`` — R2 of each PC explained by the task design. Reads as
+          "is this component task-locked?"
+        * ``subspace`` — fraction of the DESIGN's variance lying inside the first-k
+          PC subspace. This is the one that predicts beta contamination, and it is
+          not recoverable from the per-PC numbers: an overlap spread thinly across
+          many components leaves every individual PC looking innocent.
 
-    Both are scored against **phase-randomised surrogates of the PCs**, which
-    preserve each component's power spectrum and destroy only its phase
-    relationship to the task. Without that null the numbers are unreadable: an
-    HRF-convolved design is smooth, physiological noise is smooth, and any two
-    smooth timeseries correlate. Measured on real data, the naive chance level
-    for a 7-condition design over 455 df is 0.015 while the spectrum-matched
-    null sits at 0.085 -- so a PC scoring 0.12 looks like a 8x enrichment and is
-    in fact unremarkable.
+        Both are scored against **phase-randomised surrogates of the PCs**, which
+        preserve each component's power spectrum and destroy only its phase
+        relationship to the task. Without that null the numbers are unreadable: an
+        HRF-convolved design is smooth, physiological noise is smooth, and any two
+        smooth timeseries correlate. Measured on real data, the naive chance level
+        for a 7-condition design over 455 df is 0.015 while the spectrum-matched
+        null sits at 0.085 -- so a PC scoring 0.12 looks like a 8x enrichment and is
+        in fact unremarkable.
 
-    Returns a dict of arrays: ``per_pc`` and ``per_pc_null_p95`` (n_components,),
-    ``subspace`` and ``subspace_null_mean`` / ``subspace_null_sd`` / ``subspace_z``
-    (n_components + 1,), indexed by k.
+    PC index is a **per-run rank**, not an identity: the components are
+        extracted per run, so PC k in run 1 and PC k in run 2 are different
+        timeseries that merely sit at the same position in their own run's variance
+        ordering. Hence ``per_pc_by_run`` / ``subspace_by_run``, which the figure
+        plots; the run-averaged versions are a summary, and on real data the spread
+        across runs was as large as the mean.
+
+        Returns a dict of arrays: ``per_pc_by_run`` (n_runs, n_components),
+        ``subspace_by_run`` (n_runs, n_components + 1), their run-means ``per_pc``
+        and ``subspace``, and the null summaries ``per_pc_null_p95``,
+        ``subspace_null_mean`` / ``subspace_null_sd`` / ``subspace_z``.
     """
     rng = np.random.default_rng(seed)
     n_runs = len(run_starts)
@@ -3838,6 +3846,7 @@ def compute_pc_task_overlap(
 
     per_pc_obs: list[np.ndarray] = []
     per_pc_null: list[np.ndarray] = []
+    sub_by_run: list[np.ndarray] = []
     sub_obs = np.zeros(n_comp + 1)
     sub_null = np.zeros((n_surrogates, n_comp + 1))
 
@@ -3876,7 +3885,9 @@ def compute_pc_task_overlap(
 
         design_energy = max((design_run**2).sum(), 1e-12)
         per_pc_obs.append(_explained_by_design(pcs_run))
-        sub_obs += _design_in_subspace_cumulative(pcs_run, total=design_energy) / n_runs
+        run_sub = _design_in_subspace_cumulative(pcs_run, total=design_energy)
+        sub_by_run.append(run_sub)
+        sub_obs += run_sub / n_runs
 
         for s_idx in range(n_surrogates):
             surr = _phase_randomise(pcs_run)
@@ -3891,6 +3902,13 @@ def compute_pc_task_overlap(
     null_stack = np.concatenate([n.ravel() for n in per_pc_null])
     sd = sub_null.std(axis=0)
     return {
+        # Per run, because PC k is a DIFFERENT component in each run: the PCs are
+        # extracted per run and k is only a rank in that run's own variance
+        # ordering. The mean is kept for a one-number summary, but plotting it
+        # alone implies a component that does not exist -- measured spreads
+        # across runs were as large as the means themselves.
+        "per_pc_by_run": np.asarray(per_pc_obs),
+        "subspace_by_run": np.asarray(sub_by_run),
         "per_pc": np.mean(per_pc_obs, axis=0),
         "per_pc_null_p95": np.full(n_comp, float(np.percentile(null_stack, 95))),
         "per_pc_null_mean": np.full(n_comp, float(null_stack.mean())),
