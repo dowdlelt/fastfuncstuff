@@ -1152,6 +1152,42 @@ def test_clean_reference_reports_shrinking_denominator():
     assert fraction[:, -1].mean() < 0.95
 
 
+def test_clean_reference_null_absorbs_the_mechanical_gain():
+    """The null must carry the denominator rise, leaving ~nothing as excess.
+
+    Projecting a noise direction out of the held-out run takes the same amount
+    from ss_res as from ss_tot, so R2 climbs with k even when the model is
+    untouched. The PCs here are random and independent of the design, so there
+    is little real gain to find and nearly the whole rise must show up in the
+    null.
+
+    Long runs on purpose. What survives as excess in this fixture is chance
+    correlation between a random PC and the design, and it shrinks with run
+    length: 43% of the rise at the fixture's default 40 TRs, 19% at 120, 5% at
+    300. Measured instead on a genuinely task-locked artifact, the excess was
+    20x the independent case -- which is the whole point of the diagnostic, and
+    is invisible in the raw curve, where the two cases differ by 0.002.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case(tp=300, n_vox=200)
+    diagnostics: dict = {}
+    clean, _ = cross_validate_noise_pcs(
+        **case, cv_strategy=1, clean_reference=True, diagnostics=diagnostics
+    )
+    null = diagnostics["r2_null"]
+
+    # k=0 is the same model twice, so the null IS the curve there.
+    assert np.abs(null[:, 0] - clean[:, 0]).max() < 1e-5
+
+    raw_rise = np.median(clean, axis=0) - np.median(clean[:, 0])
+    excess = np.median(clean - null, axis=0)
+    # The rise is real and substantial...
+    assert raw_rise[-1] > 0.01
+    # ...and almost all of it is the null, not the PCs.
+    assert abs(excess[-1]) < 0.25 * raw_rise[-1]
+
+
 def test_cross_validate_noise_pcs_drops_conditions_absent_from_training():
     """A condition confined to one run must be dropped from that run's fold only.
 

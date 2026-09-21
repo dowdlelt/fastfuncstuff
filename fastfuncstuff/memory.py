@@ -1302,9 +1302,10 @@ def dyn_chunk_estimator(
         # - Data: n_timepoints × 4 bytes
         # - Predictions for each PC count: (max_components + 1) × n_timepoints × 4 bytes
         # - Actuals: n_timepoints × 4 bytes, or one per PC count when the
-        #   scoring reference is itself projected per count (clean_reference)
-        n_actual_copies = (max_components + 1) if per_component_actuals else 1
-        bytes_per_voxel = n_timepoints * (max_components + 1 + n_actual_copies) * 4
+        #   scoring reference is itself projected per count (clean_reference),
+        #   which also carries a null prediction per count
+        n_copies = 3 * (max_components + 1) if per_component_actuals else (max_components + 2)
+        bytes_per_voxel = n_timepoints * n_copies * 4
 
     elif operation == "ridge":
         # Ridge regression with fraction grid

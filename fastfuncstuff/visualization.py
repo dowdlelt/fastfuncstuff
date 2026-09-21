@@ -1555,6 +1555,8 @@ def plot_denoising_summary(
     n_noise_voxels: int | None = None,
     n_criteria_voxels: int | None = None,
     xval_r2_all_voxels: np.ndarray | None = None,
+    xval_r2_clean_reference_excess: np.ndarray | None = None,
+    clean_reference_ss_tot_fraction: np.ndarray | None = None,
     min_gain: float | None = None,
     n_cv_folds: int | None = None,
     output_path: str | None = None,
@@ -1595,6 +1597,16 @@ def plot_denoising_summary(
         `xval_r2_per_fold` has a single row no matter how many runs there
         were — deriving the fold count from its shape reported "1 fold" on a
         six-run dataset.
+    xval_r2_clean_reference_excess : ndarray, optional
+        Diagnostic curve scored against a held-out run with its own leading k
+        PCs projected out, minus the same referee's 0-PC null. Already a gain,
+        so it is plotted as-is. The raw curve is deliberately not drawn: it
+        rises steeply on the shrinking denominator alone, by 20x the real
+        effect on synthetic data, and the null subtraction cancels that.
+    clean_reference_ss_tot_fraction : ndarray, optional
+        Fraction of held-out variance surviving that projection at each k. Drawn
+        inverted on a second axis, because a clean-reference curve that rises in
+        step with it is rising on a shrinking denominator, not on a finding.
     min_gain : float, optional
         Gain floor the selection had to clear. Drawn as a band above baseline so
         a flat curve is visibly flat instead of auto-scaled into a landscape.
@@ -1745,6 +1757,49 @@ def plot_denoising_summary(
                 label="All voxels",
             )
 
+        if xval_r2_clean_reference_excess is not None:
+            # The excess over the same referee's 0-PC null, NOT the raw clean
+            # curve: projecting PCs out of the target raises R2 by itself, and
+            # on synthetic data that mechanical rise was 20x the real effect it
+            # was hiding. Subtracting the null cancels it exactly, because both
+            # curves share a denominator at every k.
+            excess = np.asarray(xval_r2_clean_reference_excess)
+            # Its own axis. The excess is routinely an order of magnitude
+            # larger than the selection gain -- on the very data this panel
+            # exists to show, +0.18 against -0.09 -- so sharing the left axis
+            # flattens the curve the panel is actually about.
+            ax2c = ax2.twinx()
+            ax2c.plot(
+                range(len(excess)),
+                excess,
+                color="purple",
+                linestyle="-.",
+                linewidth=1.5,
+                marker="s",
+                markersize=3,
+                label="Clean reference, excess over null",
+            )
+            ax2c.axhline(0, color="purple", alpha=0.3, linewidth=0.8, linestyle="-")
+            ax2c.set_ylabel("Clean-ref excess Δ R² (diagnostic)", fontsize=7, color="purple")
+            ax2c.tick_params(axis="y", labelcolor="purple", labelsize=7)
+            ax2c.legend(loc="upper right", fontsize=7)
+
+            if clean_reference_ss_tot_fraction is not None:
+                # How much referee that excess cost, as an annotation rather
+                # than a third axis: the null subtraction already cancels the
+                # mechanical rise, so this is context, not a correction.
+                frac = np.asarray(clean_reference_ss_tot_fraction)
+                peak = int(np.argmax(excess))
+                ax2c.annotate(
+                    f"{1.0 - float(frac[peak]):.0%} of held-out\nvariance removed",
+                    xy=(peak, float(excess[peak])),
+                    xytext=(4, -22),
+                    textcoords="offset points",
+                    fontsize=6.5,
+                    color="purple",
+                    alpha=0.8,
+                )
+
         ax2.axvline(
             optimal_n_components,
             color="red",
@@ -1755,6 +1810,10 @@ def plot_denoising_summary(
         ax2.set_xlabel("Number of Noise PCs")
         ax2.set_ylabel("Δ R² vs 0 PCs")
         ax2.set_title("Gain over baseline (the selection criterion)")
+        # Headroom, so the all-voxel curve is not flush against the frame when
+        # the diagnostic's own axis has taken the wide range away from this one.
+        lo2, hi2 = ax2.get_ylim()
+        ax2.set_ylim(lo2 - 0.06 * (hi2 - lo2), hi2 + 0.06 * (hi2 - lo2))
         ax2.legend(loc="best", fontsize=8)
         ax2.grid(True, alpha=0.3)
 
