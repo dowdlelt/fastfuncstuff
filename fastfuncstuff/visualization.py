@@ -1945,6 +1945,10 @@ def plot_pc_task_overlap(
     )
     ax1.legend(fontsize=8, loc="upper right")
     ax1.grid(True, alpha=0.3, axis="y", zorder=0)
+    # Integer ticks: these are component indices, not a continuous axis.
+    step = max(1, len(per_pc) // 20)
+    ax1.set_xticks(x[::step])
+    ax1.set_xticklabels([str(int(v)) for v in x[::step]])
 
     # Panel 2 is the one that predicts beta contamination. An overlap spread
     # thinly over many components leaves panel 1 looking innocent while this
