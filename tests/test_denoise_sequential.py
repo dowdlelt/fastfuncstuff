@@ -960,7 +960,9 @@ def _fwl_case(n_runs=4, tp=40, n_vox=90, max_comp=3, ragged=False):
     )
 
 
-def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100, zero_event_strategy="zero"):
+def _explicit_full_model_r2(
+    case, cv_strategy=1, n_perms=100, zero_event_strategy="zero", clean_reference=False
+):
     """Reference R² built the slow, obvious way: fit [X | zero-padded PCs] directly.
 
     This is the formulation the fast path replaced. It exists here so the
@@ -1037,6 +1039,22 @@ def _explicit_full_model_r2(case, cv_strategy=1, n_perms=100, zero_event_strateg
             betas = (pinv @ data_p[:, tr_tps].double().T)[:n_fit, :]
             design_te = design_p[te_tps, :][:, fit_mask].double()
 
+            if clean_reference:
+                # The referee loses its own leading k PCs, so the prediction has
+                # to be built in that same subspace. Explicit pinv projector on
+                # the raw PC columns -- independent of the nested Gram-Schmidt
+                # recursion the fast path uses.
+                for r in test_runs:
+                    n_use = min(k, pcs[r].shape[1])
+                    if n_use == 0:
+                        continue
+                    r_tps = torch.arange(run_starts[r], run_ends[r])
+                    local = torch.searchsorted(te_tps, r_tps)
+                    x_pc = pcs[r][:, :n_use].double()
+                    proj = x_pc @ torch.linalg.pinv(x_pc, rcond=1e-6)
+                    design_te[local, :] -= proj @ design_te[local, :]
+                    actual[:, r_tps] -= (proj @ actual[:, r_tps].T).T
+
             if zero_event_strategy == "nuisance":
                 # Per test RUN, since which columns are unpredictable depends on
                 # the run being scored, not on the fold.
@@ -1074,6 +1092,64 @@ def test_cross_validate_noise_pcs_matches_explicit_full_model(ragged):
     reference = _explicit_full_model_r2(case, cv_strategy=1)
 
     assert np.abs(fast - reference).max() < 1e-4
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_clean_reference_matches_explicit_projection(ragged):
+    """The incremental nested referee must equal an explicit per-k projection.
+
+    ``clean_reference`` projects the held-out run's own leading k PCs out of
+    both the referee and the design predicting it. The fast path does that as a
+    rank-1 update per k off the nested basis; this checks it against a fresh
+    pinv projector built from the raw PC columns at each k.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case(ragged=ragged)
+    fast, _ = cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True)
+    reference = _explicit_full_model_r2(case, cv_strategy=1, clean_reference=True)
+
+    assert np.abs(fast - reference).max() < 1e-4
+
+
+def test_clean_reference_agrees_with_default_at_zero_pcs():
+    """At k=0 nothing is projected, so the two referees must be the same one.
+
+    A drift here means clean_reference changed something other than the
+    reference -- the training fit, say -- which would make the whole curve
+    incomparable to the default one rather than just differently scaled.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    default, _ = cross_validate_noise_pcs(**case, cv_strategy=1)
+    clean, _ = cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True)
+
+    assert np.abs(clean[:, 0] - default[:, 0]).max() < 1e-5
+    # And past k=0 it must actually differ, or the flag is a silent no-op.
+    assert np.abs(clean[:, 1:] - default[:, 1:]).max() > 1e-4
+
+
+def test_clean_reference_reports_shrinking_denominator():
+    """The diagnostic has to expose the denominator the mode gives away.
+
+    Part of any rise in this curve is the referee losing variance, so the
+    fraction that survives is reported alongside it. It is 1.0 at k=0 and can
+    only fall: an orthogonal projection never adds variance back.
+    """
+    from fastfuncstuff.denoise.sequential import cross_validate_noise_pcs
+
+    case = _fwl_case()
+    diagnostics: dict = {}
+    cross_validate_noise_pcs(**case, cv_strategy=1, clean_reference=True, diagnostics=diagnostics)
+
+    fraction = diagnostics["ss_tot_fraction"]
+    assert fraction.shape == (case["data"].shape[0], case["max_components"] + 1)
+    assert np.allclose(fraction[:, 0], 1.0)
+    assert np.all(np.diff(fraction, axis=1) <= 1e-6)
+    # The fixture injects PC noise into every run, so the loss is real, not
+    # round-off.
+    assert fraction[:, -1].mean() < 0.95
 
 
 def test_cross_validate_noise_pcs_drops_conditions_absent_from_training():

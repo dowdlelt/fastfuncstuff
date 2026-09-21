@@ -1121,6 +1121,7 @@ def dyn_chunk_estimator(
     max_chunk_size: int | None = None,
     safety_factor: float | None = None,
     verbose: bool = False,
+    per_component_actuals: bool = False,
 ) -> int:
     """
     Dynamic chunk size estimator with operation-specific memory modeling.
@@ -1158,6 +1159,10 @@ def dyn_chunk_estimator(
     max_components : int, default=0
         For denoising: maximum number of PCs/ICs to test
         Affects memory when storing predictions for all component counts
+    per_component_actuals : bool, default=False
+        For denoising without streaming stats: the held-out data being scored
+        against differs per component count, so it is stored once per count
+        rather than once. Doubles the accumulator term.
     data_location : str, default="auto"
         Where full data lives: "cpu", "gpu", or "auto" (detect from device)
         "cpu" = data on CPU, chunks stream to GPU (lower GPU memory)
@@ -1296,8 +1301,10 @@ def dyn_chunk_estimator(
         # GPU memory per voxel:
         # - Data: n_timepoints × 4 bytes
         # - Predictions for each PC count: (max_components + 1) × n_timepoints × 4 bytes
-        # - Actuals: n_timepoints × 4 bytes
-        bytes_per_voxel = n_timepoints * (max_components + 2) * 4
+        # - Actuals: n_timepoints × 4 bytes, or one per PC count when the
+        #   scoring reference is itself projected per count (clean_reference)
+        n_actual_copies = (max_components + 1) if per_component_actuals else 1
+        bytes_per_voxel = n_timepoints * (max_components + 1 + n_actual_copies) * 4
 
     elif operation == "ridge":
         # Ridge regression with fraction grid
