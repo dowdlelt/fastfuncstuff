@@ -3283,47 +3283,15 @@ def fit_denoising_model(
             diagnostics=clean_diag,
         )
         # Summarised over the same voxels as the main curve so the two are
-        # read side by side; the criteria mask is not known yet, so this is
-        # the all-voxel aggregate and is labelled as such.
-        agg = np.median if metric == "median" else np.mean
-        r2_clean_reference = agg(clean_maps, axis=0)
-        clean_ss_tot_fraction = agg(clean_diag["ss_tot_fraction"], axis=0)
-        r2_clean_null = agg(clean_diag["r2_null"], axis=0)
-        # The headline. Raw and null both climb steeply on the shrinking
-        # denominator alone; their difference is what the PCs did to the fit.
-        # Measured on synthetic data: with noise independent of the task the
-        # raw curve gained +0.084 and the excess +0.004, while with the same
-        # noise made task-locked the raw curve gained an indistinguishable
-        # +0.086 and the excess +0.223. The raw curve cannot tell those apart.
-        r2_clean_excess = r2_clean_reference - r2_clean_null
-        del clean_maps, clean_diag
-
-        # Unconditional, like the other decision lines: -verb defaults to 0, so
-        # anything gated on verbose is invisible in normal use, and a diagnostic
-        # nobody sees is worse than one that was never run.
-        peak = int(np.argmax(r2_clean_excess))
-        print(
-            f"  Clean-reference diagnostic: excess over its own null peaks at {peak} PCs "
-            f"({r2_clean_excess[peak]:+.4f}), with "
-            f"{1.0 - clean_ss_tot_fraction[peak]:.1%} of held-out variance removed from "
-            f"the referee there."
-        )
-        # Same floor the real selection uses, derived from this curve's own
-        # roughness rather than from the main one's -- they have different
-        # denominators, so a gain floor does not carry across.
-        excess_floor, _, _ = pc_selection_floor(r2_clean_excess, pc_min_gain)
-        if r2_clean_excess[peak] > excess_floor:
-            print(
-                "  That is a real excess: the PCs improve the fit even when the referee "
-                "is denoised too. Task-correlated noise is the usual cause, and the main "
-                "curve below will under-count PCs if so."
-            )
-        else:
-            print(
-                "  No meaningful excess -- the raw clean curve's rise is its shrinking "
-                "denominator, not the PCs. The main curve's verdict stands."
-            )
-        print("  Diagnostic only; it never selects.")
+        # Held per voxel until the criteria mask exists. Aggregating here would
+        # summarise the diagnostic over ALL voxels while the selection curve it
+        # is meant to be read against is a median over criteria voxels only --
+        # on a real dataset those differed by 0.10 in R2 (-0.007 vs +0.097),
+        # with 89% of the all-voxel median coming from the noise pool.
+        clean_maps_per_voxel = clean_maps
+        clean_null_per_voxel = clean_diag["r2_null"]
+        clean_frac_per_voxel = clean_diag["ss_tot_fraction"]
+        del clean_diag
 
     # Determine criteria voxels: R² > threshold in ANY PC count (GLMdenoise Step 7)
     threshold = pcR2cutoff if pcR2cutoff is not None else 0.0
@@ -3335,6 +3303,60 @@ def fit_denoising_model(
 
     # Convert criteria_mask_final to torch tensor
     criteria_mask = torch.from_numpy(criteria_mask_final)
+
+    # -------------------------------------------------------------------
+    # Step 4b, part two: summarise the diagnostic over the same electorate
+    # -------------------------------------------------------------------
+    if clean_reference_diagnostic:
+        agg = np.median if metric == "median" else np.mean
+        # Criteria voxels when there are any: the selection curve is their
+        # median, and a diagnostic meant to contradict it has to be read on the
+        # same voxels. Falling back to all voxels keeps it defined either way.
+        vox = criteria_mask_final if criteria_mask_final.any() else slice(None)
+        r2_clean_reference = agg(clean_maps_per_voxel[vox], axis=0)
+        r2_clean_null = agg(clean_null_per_voxel[vox], axis=0)
+        clean_ss_tot_fraction = agg(clean_frac_per_voxel[vox], axis=0)
+        # The headline. Raw and null both drift with the shrinking denominator;
+        # their difference is what refitting the betas with k PCs actually did.
+        # Measured on synthetic data: with noise independent of the task the
+        # raw curve gained +0.084 and the excess +0.004, while with the same
+        # noise made task-locked the raw curve gained an indistinguishable
+        # +0.086 and the excess +0.223. The raw curve cannot tell those apart.
+        r2_clean_excess = r2_clean_reference - r2_clean_null
+        del clean_maps_per_voxel, clean_null_per_voxel, clean_frac_per_voxel
+
+        # Unconditional, like the other decision lines: -verb defaults to 0, so
+        # anything gated on verbose is invisible in normal use, and a diagnostic
+        # nobody sees is worse than one that was never run.
+        peak = int(np.argmax(r2_clean_excess))
+        n_vox_diag = int(criteria_mask_final.sum()) if criteria_mask_final.any() else n_voxels
+        print(
+            f"  Clean-reference diagnostic ({n_vox_diag:,} criteria voxels): excess over "
+            f"its own null peaks at {peak} PCs ({r2_clean_excess[peak]:+.4f}), with "
+            f"{1.0 - clean_ss_tot_fraction[peak]:.1%} of held-out variance removed from "
+            f"the referee there."
+        )
+        # The floor cannot come from pc_selection_floor: that takes 1% of the
+        # curve's baseline, and this curve's baseline is identically zero by
+        # construction, so its dominant arm contributes nothing and what is
+        # left is roughness alone. Scale it to the quantity the excess would
+        # have to be worth arguing about instead -- the selection curve's own
+        # baseline, which is the R2 the PCs would have to improve on.
+        rough_floor, _, _ = pc_selection_floor(r2_clean_excess, pc_min_gain)
+        scale_floor = 0.05 * abs(float(np.median(r2_maps[vox], axis=0)[0]))
+        excess_floor = rough_floor if pc_min_gain is not None else max(rough_floor, scale_floor)
+        if r2_clean_excess[peak] > excess_floor:
+            print(
+                f"  That clears the floor ({excess_floor:.4f}): the PCs improve the fit even "
+                "when the referee is denoised too, so the main curve may be under-counting. "
+                "Task-correlated noise is the usual cause."
+            )
+        else:
+            print(
+                f"  Below the floor ({excess_floor:.4f}) -- not a meaningful excess. The "
+                "main curve's verdict stands."
+            )
+        print("  Diagnostic only; it never selects.")
 
     # Transpose r2_maps for compatibility with downstream code
     r2_per_voxel = r2_maps  # (n_voxels, n_pc_counts)
@@ -3659,6 +3681,12 @@ def fit_denoising_model(
         assert r2_clean_null is not None and r2_clean_excess is not None
         metadata["xval_r2_clean_reference_null"] = r2_clean_null.tolist()
         metadata["xval_r2_clean_reference_excess"] = r2_clean_excess.tolist()
+        # Which voxels the four curves above are a median over, so a saved run
+        # can be read without guessing whether it is the criteria electorate.
+        metadata["clean_reference_n_voxels"] = int(
+            criteria_mask_final.sum() if criteria_mask_final.any() else n_voxels
+        )
+        metadata["clean_reference_voxels"] = "criteria" if criteria_mask_final.any() else "all"
 
     if ic_variance_ratio_per_run is not None:
         metadata["ic_variance_ratio_per_run"] = [
