@@ -163,6 +163,18 @@ def _short(name: str, limit: int = 24) -> str:
     return name if len(name) <= limit else "…" + name[-(limit - 1) :]
 
 
+def _voxel_size(affine: np.ndarray) -> float:
+    """One number for how big this grid's voxels are: the cube root of one
+    voxel's volume.
+
+    A single scalar rather than three, because the question it answers --
+    is this layer coarser than the grid -- has one answer. ``abs(det)`` rather
+    than the diagonal so an oblique or anisotropic grid is measured by the
+    volume it actually covers.
+    """
+    return float(abs(np.linalg.det(np.asarray(affine, dtype=float)[:3, :3])) ** (1.0 / 3.0))
+
+
 class ViewerSession:
     """Owns the state, the residency store and the bus."""
 
@@ -629,6 +641,35 @@ class ViewerSession:
             return None
         volume = self.volume(layer.key)
         return np.asarray(volume, dtype=np.float32)
+
+    # -- how a layer is drawn into the grid --------------------------------
+
+    #: Beyond this ratio of layer voxel to display voxel, ``auto`` calls it
+    #: upsampling. Not 1.0, because two grids that differ by a rounding error
+    #: are the same grid, and flipping interpolation on that is noise.
+    UPSAMPLE_RATIO = 1.2
+
+    def resample_mode(self, layer: Layer) -> str:
+        """``"nearest"`` or ``"linear"`` for one layer. Display only.
+
+        This changes how the layer is *drawn* and nothing else. The voxels in
+        the store are untouched, every readout, graph, carpet, cluster table
+        and mode input still reads the layer's own array on the layer's own
+        grid, and switching it does not invalidate a fit.
+
+        ``auto`` decides by direction; see :attr:`Layer.resample` for why that
+        is the axis that matters.
+        """
+        if layer.resample in ("nearest", "linear"):
+            return layer.resample
+        grid = self.state.grid
+        if grid is None:
+            return "linear"
+        return (
+            "nearest"
+            if _voxel_size(layer.affine) > _voxel_size(grid.affine) * self.UPSAMPLE_RATIO
+            else "linear"
+        )
 
     # -- what a mode reads -----------------------------------------------
 

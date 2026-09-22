@@ -86,6 +86,7 @@ from fastfuncstuff.viewer.vocab import (
     SetModeParam,
     SetRange,
     SetRangeMirror,
+    SetResample,
     SetSeed,
     SetSign,
     SetTheme,
@@ -467,6 +468,25 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.dir_label = QtWidgets.QLabel("no directory")
         bar.addWidget(self.dir_label)
+
+        # Pushed to the right end of the row: it is not part of the load
+        # gesture and should not sit in the middle of it.
+        spacer = QtWidgets.QWidget()
+        spacer.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Preferred
+        )
+        bar.addWidget(spacer)
+
+        self.debug_button = QtWidgets.QPushButton("DEBUG")
+        self.debug_button.setToolTip(
+            "Write everything about this session to a text file and copy the\n"
+            "path: every layer's grid, affine and voxel size, which one is\n"
+            "defining the display, what the mode is reading, and the full\n"
+            "recorded script -- which replays the session against the same\n"
+            "files. For handing to someone who cannot see your screen."
+        )
+        self.debug_button.clicked.connect(self._write_debug_report)
+        bar.addWidget(self.debug_button)
 
         picks = QtWidgets.QToolBar("data")
         picks.setMovable(False)
@@ -1139,6 +1159,30 @@ class ViewerWindow(QtWidgets.QMainWindow):
         alpha_row.addStretch(1)
         form.addRow(self._head(key_label("ALPHA", "a")), self.alpha_row)
 
+        # Display only, and the label says so, because the obvious worry on
+        # seeing an interpolation control next to a statistic map is that it is
+        # touching the numbers. It is not: the voxels, the graphs, the cluster
+        # table and the mode's input all read the layer's own array on the
+        # layer's own grid whatever this says.
+        self.resample_box = QtWidgets.QComboBox()
+        self.resample_box.setToolTip(
+            "How this layer is PAINTED into the display grid. Nothing else --\n"
+            "the data, the graphs, the cluster table and what a mode fits are\n"
+            "untouched by it.\n\n"
+            "auto: nearest when the layer is coarser than the grid, linear when\n"
+            "finer. So a 3 mm run drawn on a 1 mm anatomy keeps its own voxels\n"
+            "instead of being smoothed into a resolution it does not have.\n"
+            "Press 'e' to cycle."
+        )
+        for label, value in (("auto", "auto"), ("nearest", "nearest"), ("linear", "linear")):
+            self.resample_box.addItem(label, userData=value)
+        self.resample_box.activated.connect(
+            lambda i: self._apply(SetResample, how=str(self.resample_box.itemData(i)))
+        )
+        self._shrinkable(self.resample_box)
+        self.resample_head = self._head(key_label("DRAW", "e"))
+        form.addRow(self.resample_head, self.resample_box)
+
         # Min, threshold and max are edited on the bar itself. Splitting the
         # number from the picture of the number is what let the bar go stale.
         self.rangebar = RangeBar()
@@ -1380,6 +1424,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                 Binding("s", "next sign mode", self._cycle_sign, group="layer"),
                 Binding("a", "next alpha mode", self._cycle_alpha, group="layer"),
                 Binding("b", "toggle boxed", self.boxed_check.toggle, group="layer"),
+                Binding(
+                    "e",
+                    "cycle how it is drawn (auto / nearest / linear)",
+                    self._cycle_resample,
+                    group="layer",
+                ),
                 Binding("{", "move layer down the stack", lambda: self._reorder(-1), group="layer"),
                 Binding("}", "move layer up the stack", lambda: self._reorder(1), group="layer"),
                 Binding("u", "make it the underlay", self._make_underlay, group="layer"),
@@ -1648,6 +1698,46 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.session.save_script(path, header="nexus session")
             self.statusBar().showMessage(f"wrote {path}", 4000)
 
+    def debug_report(self) -> str:
+        """This controller's state as text, with every other controller after it.
+
+        All of them, because a question about one tab is usually a question
+        about how it differs from the tab beside it.
+        """
+        from fastfuncstuff.viewer import report
+
+        parts = [report.describe(self.session)]
+        for ctl in self.controllers:
+            if ctl.session is not self.session:
+                parts.append(report.describe(ctl.session))
+        return ("\n\n" + "=" * 78 + "\n\n").join(parts)
+
+    def _write_debug_report(self) -> None:
+        """Write the report beside the data, or to a temp file, and say where.
+
+        Beside the data because that is the directory already open in the
+        terminal the question is going to be asked from. The path goes on the
+        clipboard as well as into the status bar: it exists to be pasted.
+        """
+        import tempfile
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        name = f"ffs_viewer_state_{stamp}.txt"
+        directory = self.session.catalog_dir
+        out = Path(directory) / name if directory else Path(tempfile.gettempdir()) / name
+        try:
+            out.write_text(self.debug_report())
+        except OSError:
+            # A read-only results directory is normal; the report is worth more
+            # than the placement.
+            out = Path(tempfile.gettempdir()) / name
+            out.write_text(self.debug_report())
+        clip = QtWidgets.QApplication.clipboard()
+        if clip is not None:
+            clip.setText(str(out))
+        self.statusBar().showMessage(f"wrote {out} (path copied)", 8000)
+
     def open_path(self, path: str | Path) -> None:
         """Open one dataset, on top of whatever is already loaded."""
         self._dispatch(Load(str(path)))
@@ -1829,6 +1919,23 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.mode_box.setCurrentIndex(idx)
             self.mode_box.blockSignals(False)
 
+    def _cycle_resample(self) -> None:
+        """auto -> nearest -> linear -> auto on the selected layer.
+
+        A cycle rather than a toggle because the useful gesture is comparing
+        the two against the automatic choice, and three states is one key.
+        """
+        layer = self.session.state.selected_layer()
+        if layer is None:
+            return
+        order = ("auto", "nearest", "linear")
+        nxt = (
+            order[(order.index(layer.resample) + 1) % len(order)]
+            if layer.resample in order
+            else "auto"
+        )
+        self._apply(SetResample, how=nxt)
+
     def _sync_layer_controls(self) -> None:
         key = self.current_key()
         # Off rather than left showing the last layer: an empty controller's
@@ -1842,6 +1949,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.rangebar,
             self.opacity_slider,
             self.boxed_check,
+            self.resample_box,
         ):
             widget.setEnabled(key is not None)
         if key is None:
@@ -1867,6 +1975,15 @@ class ViewerWindow(QtWidgets.QMainWindow):
             check.setChecked(value)
             check.setEnabled(enabled)
             check.blockSignals(False)
+        # "auto (nearest)" rather than "auto": the whole value of the automatic
+        # setting is knowing which way it went, and a layer that looks blocky
+        # while the box says "auto" is a question rather than an answer.
+        resolved = self.session.resample_mode(layer)
+        self.resample_box.blockSignals(True)
+        self.resample_box.setItemText(0, f"auto ({resolved})")
+        index = self.resample_box.findData(layer.resample)
+        self.resample_box.setCurrentIndex(max(index, 0))
+        self.resample_box.blockSignals(False)
         self._sync_brick_pickers(layer)
         self.opacity_slider.blockSignals(True)
         self.opacity_slider.setValue(int(round(layer.opacity * 100)))

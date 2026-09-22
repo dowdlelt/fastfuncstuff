@@ -110,6 +110,19 @@ class Layer:
     threshold_follow: str = "same"
     alpha_mode: AlphaMode = AlphaMode.OFF
     boxed: bool = False
+    #: How this layer is sampled into the display grid: ``auto``, ``nearest``
+    #: or ``linear``.
+    #:
+    #: ``auto`` decides by direction, which is the thing that actually matters.
+    #: Drawing a 3 mm functional on a 1 mm anatomical's grid is *upsampling*,
+    #: and interpolating it there paints a resolution the data does not have --
+    #: a thresholded cluster's edge lands between real voxels, and a map you
+    #: are about to believe looks smoother and larger than it is. So a layer
+    #: coarser than the grid is sampled nearest, and its voxels stay visible as
+    #: voxels. A layer finer than the grid is being downsampled, where nearest
+    #: aliases and linear is right. Override when the guess is wrong: a smooth
+    #: coarse field -- a warp, a bias estimate -- reads better interpolated.
+    resample: str = "auto"
 
     def with_(self, **changes: object) -> Layer:
         """Return a copy with fields replaced."""

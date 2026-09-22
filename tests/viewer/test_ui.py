@@ -9,6 +9,7 @@ be restored, a control that desynchronises from the state it displays.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -2534,3 +2535,47 @@ def test_switching_the_shown_map_redraws_without_a_refit(win_glm, qapp):
     assert win_glm.session.mode._fit is before
     layer = win_glm.session.state.layers.find_by_source("mode:instaglm")
     assert layer is not None and layer.name.endswith(" t")
+
+
+# ---------------------------------------------------------------------------
+# drawing mode and the debug report
+# ---------------------------------------------------------------------------
+
+
+def test_the_draw_box_names_which_way_auto_went(win, qapp):
+    """ "auto" alone is a question; the useful thing is knowing the answer."""
+    win.layer_list.setCurrentRow(0)
+    qapp.processEvents()
+    assert win.resample_box.itemText(0).startswith("auto (")
+    assert win.resample_box.currentText().startswith("auto")
+
+
+def test_e_cycles_how_the_layer_is_drawn(win, qapp):
+    from fastfuncstuff.viewer.ui.shortcuts import Binding  # noqa: F401
+
+    key = win.current_key()
+    assert win.session.state.layers.get(key).resample == "auto"
+    for expected in ("nearest", "linear", "auto"):
+        win._cycle_resample()
+        qapp.processEvents()
+        assert win.session.state.layers.get(key).resample == expected
+
+
+def test_the_debug_button_writes_a_report_and_says_where(win, qapp, tmp_path):
+    win._write_debug_report()
+    qapp.processEvents()
+    message = win.statusBar().currentMessage()
+    assert message.startswith("wrote ") and "path copied" in message
+    written = Path(message[len("wrote ") :].split(" (")[0])
+    assert written.exists()
+    text = written.read_text()
+    assert "# ffs viewer session report" in text
+    assert "DEFINES DISPLAY GRID" in text
+    assert "## script" in text
+
+
+def test_the_debug_report_covers_every_controller(win, qapp):
+    win.new_controller()
+    qapp.processEvents()
+    text = win.debug_report()
+    assert text.count("# ffs viewer session report") == len(win.controllers)

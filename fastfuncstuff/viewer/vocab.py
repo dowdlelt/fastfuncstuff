@@ -749,6 +749,22 @@ class SetBoxed(Command):
     on: bool
 
 
+@command
+@dataclass(frozen=True)
+class SetResample(Command):
+    """How a layer is painted into the display grid: auto, nearest or linear.
+
+    Display only. Nothing about the layer's voxels, what a graph plots, what a
+    mode reads or what a cluster table counts depends on it -- which is why it
+    dirties SLICES and nothing else.
+    """
+
+    name = "SET_RESAMPLE"
+    aspects = Aspect.SLICES
+    key: str
+    how: str = "auto"
+
+
 # ---------------------------------------------------------------------------
 # instacorr
 # ---------------------------------------------------------------------------
@@ -1357,6 +1373,17 @@ def install(
             return Aspect.NOTHING
         st.layers.update(cmd.key, boxed=bool(cmd.on))
         return SetBoxed.aspects
+
+    @bus.handle(SetResample.name)
+    def _set_resample(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetResample)
+        how = str(cmd.how)
+        if how not in ("auto", "nearest", "linear"):
+            raise ValueError(f"resample must be auto, nearest or linear, not {how!r}")
+        if st.layers.get(cmd.key).resample == how:
+            return Aspect.NOTHING
+        st.layers.update(cmd.key, resample=how)
+        return SetResample.aspects
 
     @bus.handle(SetTimeLinked.name)
     def _set_time_linked(cmd: Command, st: ViewerState) -> Aspect:
