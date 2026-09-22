@@ -119,21 +119,18 @@ class DenoiseMode(Mode):
         return frozenset()
 
     # -- which run -----------------------------------------------------
-    def source_layer(self):
-        """The selected layer if it is a run, else the topmost run that was
-        not itself denoised -- denoising a denoise is almost never meant."""
-        if self.session is None:
-            return None
-        state = self.session.state
-        chosen = state.layers.find(state.selected) if state.selected else None
-        if chosen is not None and chosen.time_linked and chosen.n_volumes > 1:
-            if chosen.source.startswith("derived:denoise:") and chosen.derived_from:
-                return state.layers.find(chosen.derived_from) or chosen
-            return chosen
-        for layer in reversed(list(state.layers)):
-            if layer.time_linked and layer.n_volumes > 1 and not layer.is_derived:
-                return layer
-        return None
+    def default_input(self, candidates):
+        """The topmost run this mode did not itself produce.
+
+        Denoising a denoise is almost never what was meant, and the output is
+        selected when it lands -- so without this, pressing APPLY twice cleans
+        the cleaned run. It is still in the input picker, so chaining is one
+        choice away; it just is not what the second press does.
+        """
+        return next(
+            (ly for ly in candidates if not ly.source.startswith("derived:denoise:")),
+            super().default_input(candidates),
+        )
 
     # -- actions -------------------------------------------------------
     def action(self, name: str, progress: ProgressFn | None = None) -> Aspect:

@@ -17,6 +17,8 @@ class PlainMode(Mode):
     label = "View"
     overlay_kind = OverlayKind.VALUE
     produces_overlay = False
+    # Nothing to read: the overlay is whatever is in the stack.
+    input_kind = "none"
 
     def compute(self) -> ComputedOverlay | None:
         return None

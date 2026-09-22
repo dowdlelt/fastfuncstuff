@@ -74,6 +74,8 @@ class ICAMode(Mode):
     label = "ICA"
     tag = "ICA"
     overlay_kind = OverlayKind.COMPONENT
+    # The decomposition comes from a folder, not from the stack.
+    input_kind = "none"
 
     def controls(self) -> tuple[Control, ...]:
         # The range is discovered, so this is built per call rather than fixed:

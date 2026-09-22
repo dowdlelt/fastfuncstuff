@@ -71,6 +71,15 @@ class ViewerState:
     #: In state rather than in a list widget so that `[` and `]` are commands
     #: a script can replay, and so solo has something to be solo *of*.
     selected: str | None = None
+    #: Which layer a mode reads. Deliberately its own field: what a mode
+    #: computes *from* and what the screen shows are different questions, and
+    #: tying them together is what forced the run to stay visible under its own
+    #: correlation map. A layer can be unticked, buried at the bottom or
+    #: unselected and still be the input -- it only has to be loaded.
+    #: ``None`` means "whichever loaded layer the mode can use", resolved by
+    #: :meth:`ViewerSession.input_layer` and never written back, so the answer
+    #: keeps following the stack until someone names one.
+    input_key: str | None = None
     #: Seed voxel for InstaCorr, in display-grid indices. ``None`` until set.
     seed: tuple[int, int, int] | None = None
     #: Interface palette. State rather than a widget setting so a recorded

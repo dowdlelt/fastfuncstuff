@@ -325,6 +325,15 @@ class Mode(ABC):
     #: Whether this mode owns an overlay layer at all. Plain mode does not --
     #: its overlay is whatever the user picked.
     produces_overlay: ClassVar[bool] = True
+    #: What this mode can read, as a declaration rather than a search, in the
+    #: same words :attr:`~fastfuncstuff.viewer.tools.base.Tool.input_kind`
+    #: uses: ``"4d"`` for a time series, ``"any"`` for any loaded layer,
+    #: ``"none"`` for a mode that reads nothing from the stack. Each mode used
+    #: to find its own input with its own rule -- "the selected layer if it is
+    #: a run, else the topmost run" in one, "the first time-linked layer" in
+    #: another -- so two modes could silently disagree about what they were
+    #: looking at, and neither could be told otherwise.
+    input_kind: ClassVar[str] = "4d"
 
     #: Set by a UI that runs preparation on a worker. When true, a refresh
     #: that would need the slow path does nothing instead, and the UI is
@@ -418,15 +427,46 @@ class Mode(ABC):
         """Mark cached preparation stale, so the next refresh redoes it."""
         self._dirty = True
 
+    def accepts(self, layer: Any) -> bool:
+        """Whether this mode could read that layer. Drives the input picker.
+
+        Visibility and selection are deliberately not consulted: whether a run
+        is ticked is a statement about the picture, not about what the numbers
+        are good for, and the whole point of naming an input is to be able to
+        fit one thing while looking at another.
+        """
+        if self.input_kind == "none" or layer.is_computed:
+            # A mode's own live output is not an input. A ``derived:`` layer --
+            # a denoised copy of a run -- is, which is what lets one mode's
+            # result be the next one's data.
+            return False
+        if self.input_kind == "4d":
+            return bool(layer.time_linked and layer.n_volumes > 1)
+        return True
+
+    def default_input(self, candidates: Sequence[Any]) -> Any | None:
+        """Which candidate to read when nobody has named one. Topmost first.
+
+        A hook rather than a fixed rule because "the obvious one" is
+        mode-specific: Denoise walks past a run it denoised itself, since
+        denoising a denoise is almost never what was meant -- while still
+        offering it, because chaining is not forbidden, just not the default.
+        """
+        return candidates[0] if candidates else None
+
+    def source_layer(self) -> Any | None:
+        """The layer this mode reads: the named input, or the best candidate."""
+        return None if self.session is None else self.session.input_layer(self)
+
     def input_layer_key(self) -> str | None:
         """The layer this mode consumes, if any.
 
-        An input is not a display layer: once InstaCorr is showing a
-        correlation, drawing the 4-D series it was computed from on top of the
-        anatomy is just noise. The session hides the input while the mode is
-        active and restores it on the way out.
+        What :meth:`~ViewerSession.forget` will not free. Modes that cache a
+        prepared array override this to report the key they prepared *from*,
+        which can lag the current answer by one re-preparation.
         """
-        return None
+        layer = self.source_layer()
+        return None if layer is None else layer.key
 
     # -- reaction ------------------------------------------------------
     def on_command(self, cmd: Command, dirty: Aspect) -> Aspect:

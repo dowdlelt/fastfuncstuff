@@ -422,6 +422,22 @@ class AddOverlay(Command):
 
 @command
 @dataclass(frozen=True)
+class SetInput(Command):
+    """Name the layer the active mode reads. Empty key restores the default.
+
+    Separate from SET_SELECTED because they answer different questions: what
+    the controls act on, and what the fit is computed from. Tying them together
+    meant adjusting an anatomical's colour scale re-pointed the GLM at it.
+    """
+
+    name = "SET_INPUT"
+    aspects = Aspect.LAYERS | Aspect.GRAPH
+    major = True
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetMode(Command):
     """Switch where the overlay comes from."""
 
@@ -853,6 +869,13 @@ def install(
         if st.grid is None:
             dirty |= _adopt_grid_preserving_position(st, layer)
         return dirty
+
+    @bus.handle(SetInput.name)
+    def _set_input(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, SetInput)
+        if session is None:
+            raise RuntimeError("SET_INPUT needs a session")
+        return session.set_input(cmd.key)
 
     @bus.handle(SetMode.name)
     def _set_mode(cmd: Command, st: ViewerState) -> Aspect:

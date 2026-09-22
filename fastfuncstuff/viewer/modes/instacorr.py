@@ -120,34 +120,33 @@ class InstaCorrMode(Mode):
 
     # -- source --------------------------------------------------------
     def _capture_source(self) -> bool:
-        """Take a reference to the 4-D dataset and everything describing it.
+        """Take a reference to the chosen run and everything describing it.
 
         Held by reference rather than by layer key so that installing the
-        correlation over the primary overlay -- which is usually this very
-        dataset -- cannot strand the mode.
+        correlation on top of the run it came from -- and hiding that run --
+        cannot strand the mode.
         """
-        if self._source is not None and self._source_key is not None:
+        layer = self.source_layer()
+        if layer is None or self.session is None:
+            return self._source is not None and self._source_key is not None
+        if self._source is not None and self._source_key == layer.key:
             return True
-        if self.session is None:
+        try:
+            res = self.session.store.get(layer.key)
+        except KeyError:
             return False
-        for layer in self.session.state.layers:
-            if not layer.time_linked or layer.is_computed:
-                continue
-            try:
-                res = self.session.store.get(layer.key)
-            except KeyError:
-                continue
-            if res.array is None:
-                continue  # still inflating
-            self._source = res.array
-            self._source_key = layer.key
-            self._affine = np.asarray(layer.affine, dtype=float)
-            self._tr = float(res.info.tr)
-            self._zooms = tuple(float(abs(layer.affine[i, i])) or 1.0 for i in range(3))
-            return True
-        return False
+        if res.array is None:
+            return False  # still inflating
+        self._source = res.array
+        self._source_key = layer.key
+        self._affine = np.asarray(layer.affine, dtype=float)
+        self._tr = float(res.info.tr)
+        self._zooms = tuple(float(abs(layer.affine[i, i])) or 1.0 for i in range(3))
+        self._dirty = True
+        return True
 
     def input_layer_key(self) -> str | None:
+        """The run the prepared array came from; see InstaGLM for why."""
         return self._source_key
 
     def attach(self, session) -> None:

@@ -345,20 +345,13 @@ class InstaGLMMode(Mode):
         return ("hrf",)
 
     # -- the run -------------------------------------------------------
-    def source_layer(self):
-        """The selected layer if it is a run, else the topmost run."""
-        if self.session is None:
-            return None
-        state = self.session.state
-        chosen = state.layers.find(state.selected) if state.selected else None
-        if chosen is not None and chosen.time_linked and chosen.n_volumes > 1:
-            return chosen
-        for layer in reversed(list(state.layers)):
-            if layer.time_linked and layer.n_volumes > 1:
-                return layer
-        return None
-
     def input_layer_key(self) -> str | None:
+        """The run the cached fit belongs to, not the one now chosen.
+
+        They differ for exactly one refresh after the input is changed, and
+        that is the refresh in which freeing the old array would leave the
+        prepared fit pointing at nothing.
+        """
         return self._source_key
 
     def attach(self, session) -> None:

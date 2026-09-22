@@ -8,7 +8,7 @@ This is what a UI, a CLI or a test drives. Nothing above this layer touches
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -625,6 +625,51 @@ class ViewerSession:
         volume = self.volume(layer.key)
         return np.asarray(volume, dtype=np.float32)
 
+    # -- what a mode reads -----------------------------------------------
+
+    def input_candidates(self, mode: Mode | None = None) -> list[Layer]:
+        """Every layer the mode could read, topmost first.
+
+        Every *loaded* layer, not every visible one. Unticking a run is how you
+        get it out of the picture once its stats map is drawn over the anatomy,
+        and it would be a strange viewer in which that also stopped you fitting
+        the run.
+        """
+        mode = self.mode if mode is None else mode
+        return [ly for ly in reversed(list(self.state.layers)) if mode.accepts(ly)]
+
+    def input_layer(self, mode: Mode | None = None) -> Layer | None:
+        """The layer the mode reads: the named one, else the best candidate.
+
+        The fallback is recomputed rather than written back, unlike
+        :meth:`ViewerState.selected_layer`, and the difference is deliberate.
+        A selection is a gesture and has to stay where it was put; an input
+        nobody has named is a default, and a default that froze onto the first
+        run loaded would mean the second run could never be fitted without
+        first being found in a menu.
+        """
+        mode = self.mode if mode is None else mode
+        named = self.state.layers.find(self.state.input_key) if self.state.input_key else None
+        if named is not None and mode.accepts(named):
+            return named
+        return mode.default_input(self.input_candidates(mode))
+
+    def set_input(self, key: str | None) -> Aspect:
+        """Name the layer the mode reads, or clear it back to the default."""
+        key = key or None
+        if key is not None and self.state.layers.find(key) is None:
+            raise KeyError(f"no layer {key!r} to use as input")
+        before = self.input_layer()
+        self.state.input_key = key
+        after = self.input_layer()
+        if before is not None and after is not None and before.key == after.key:
+            return Aspect.NOTHING
+        # The prepared array belongs to the old input, so it is not merely
+        # stale -- recomputing without re-preparing would draw the last run's
+        # map and label it with this one's name.
+        self.mode.invalidate()
+        return Aspect.LAYERS | Aspect.GRAPH | self.mode.refresh()
+
     def set_mode(self, name: str) -> Aspect:
         """Switch modes, tearing down the old one's overlay."""
         if self.mode.name == name:
@@ -1055,17 +1100,20 @@ class ViewerSession:
         return Aspect.LAYERS | Aspect.SLICES | Aspect.GRAPH
 
     # -- computed overlays ---------------------------------------------
-    def _add_on_top(self, layer: Layer) -> None:
-        """Push a made layer on top, selected, with other overlays hidden.
+    def _add_on_top(self, layer: Layer, *, hide: Iterable[str] = ()) -> None:
+        """Push a made layer on top, selected, hiding the layers named.
 
-        Hidden only here, on creation: whatever it was computed from -- a run,
-        usually -- drawn under a correlation map is noise over the anatomy. A
-        layer switched back on by hand stays on while the output is refined.
+        Only on creation, and only the ones named: a result is worth looking
+        at, and a 4-D run left drawn under its own correlation map is noise
+        over the anatomy, but those are the two facts -- everything else in the
+        stack was put there on purpose. This used to hide every visible layer
+        above the underlay, which made a second map impossible to keep beside
+        the first without switching it back on after every recompute.
         """
-        base = self.state.layers.base
-        for other in list(self.state.layers):
-            if other.visible and (base is None or other.key != base.key):
-                self.state.layers.update(other.key, visible=False)
+        for key in hide:
+            found = self.state.layers.find(key)
+            if found is not None and found.visible and found.key != layer.key:
+                self.state.layers.update(key, visible=False)
         self.state.layers.add(layer)
         self.state.selected = layer.key
         if self.state.grid is None:
@@ -1124,8 +1172,10 @@ class ViewerSession:
             if changes:
                 self.state.layers.update(key, **changes)
         else:
+            consumed = self.mode.input_layer_key() if self.mode.layer_source == source else None
             self._add_on_top(
-                Layer(
+                hide=[consumed] if consumed else [],
+                layer=Layer(
                     key=key,
                     name=overlay.name,
                     path=f"<{overlay.name}>",
@@ -1139,7 +1189,7 @@ class ViewerSession:
                     threshold=overlay.threshold or 0.0,
                     source=source,
                     **cut,
-                )
+                ),
             )
         return key
 
@@ -1507,7 +1557,7 @@ class ViewerSession:
         one.
 
         On creation it goes on top, is selected, and every other visible layer
-        above the underlay is hidden: the selected voxels may be scattered
+        above the bottom of the stack is hidden: the selected voxels may be scattered
         across the brain, and a stat map drawn over them hides exactly where
         they went. Only on creation, so an overlay turned back on by hand stays
         on while the selection is refined.
@@ -1521,8 +1571,10 @@ class ViewerSession:
             self.state.layers.update(key, name=name, path=f"<{name}>")
             return key, Aspect.LAYERS | Aspect.SLICES
 
+        base = self.state.layers.base
         self._add_on_top(
-            Layer(
+            hide=[ly.key for ly in self.state.layers if base is None or ly.key != base.key],
+            layer=Layer(
                 key=key,
                 name=name,
                 path=f"<{name}>",
@@ -1535,7 +1587,7 @@ class ViewerSession:
                 range_hi=1.0,
                 threshold=0.5,
                 source=source,
-            )
+            ),
         )
         return key, Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
 
