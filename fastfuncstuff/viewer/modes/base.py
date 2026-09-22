@@ -1,9 +1,16 @@
-"""Modes: where the overlay comes from.
+"""Modes: where a computed layer comes from.
 
-The viewer's core is the data selector -- underlay, overlay, +1. A mode changes
-only one thing about that core: instead of the overlay being a file you picked,
-it is something computed from what is loaded. InstaCorr computes a correlation,
-calc evaluates an expression, GLM fits a model, ICA reads a decomposition.
+The viewer's core is the data selector: load a dataset, and it is a layer. A
+mode changes one thing about that -- instead of a layer being a file you
+picked, it is something computed from one that is loaded. InstaCorr computes a
+correlation, calc evaluates an expression, GLM fits a model, ICA reads a
+decomposition.
+
+Which loaded layer a mode reads is :attr:`ViewerState.input_key`, set by the
+INPUT picker and resolved by :meth:`ViewerSession.input_layer`. It is a
+separate question from what is drawn and from what is selected, so a run can be
+switched off in the stack -- or buried under the anatomy -- and still be the
+data the fit is made of.
 
 Everything else a mode needs is declared, not coded:
 

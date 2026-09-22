@@ -221,12 +221,12 @@ def _rows(box):
 
 def test_a_file_written_while_open_appears_marked_new(win, qapp, folder):
     _write(folder / "stage05.written_later.nii.gz", np.ones((6, 7, 5)))
-    assert _wait(qapp, lambda: any("stage05.written_later" in t for t in _rows(win.overlay_box))), (
+    assert _wait(qapp, lambda: any("stage05.written_later" in t for t in _rows(win.data_box))), (
         "the directory watcher never produced a rescan"
     )
-    row = next(i for i, t in enumerate(_rows(win.overlay_box)) if "stage05" in t)
-    assert win.overlay_box.itemText(row).endswith("new")
-    assert win.overlay_box.itemData(row, win_background()) is not None
+    row = next(i for i, t in enumerate(_rows(win.data_box)) if "stage05" in t)
+    assert win.data_box.itemText(row).endswith("new")
+    assert win.data_box.itemData(row, win_background()) is not None
 
 
 def win_background():
@@ -238,13 +238,13 @@ def win_background():
 def test_opening_a_new_file_clears_its_mark(win, qapp, folder):
     _write(folder / "stage05.written_later.nii.gz", np.ones((6, 7, 5)))
     win._start_rescan(manual=True)
-    assert _wait(qapp, lambda: any("stage05" in t for t in _rows(win.overlay_box)))
-    row = next(i for i, t in enumerate(_rows(win.overlay_box)) if "stage05" in t)
-    win.overlay_box.setCurrentIndex(row)
-    win.overlay_box.activated.emit(row)
+    assert _wait(qapp, lambda: any("stage05" in t for t in _rows(win.data_box)))
+    row = next(i for i, t in enumerate(_rows(win.data_box)) if "stage05" in t)
+    win.data_box.setCurrentIndex(row)
+    win.data_box.activated.emit(row)
     qapp.processEvents()
-    row = next(i for i, t in enumerate(_rows(win.overlay_box)) if "stage05" in t)
-    assert not win.overlay_box.itemText(row).endswith("new")
+    row = next(i for i, t in enumerate(_rows(win.data_box)) if "stage05" in t)
+    assert not win.data_box.itemText(row).endswith("new")
 
 
 def test_overwriting_the_loaded_underlay_reloads_it(win, qapp, folder):
@@ -263,4 +263,4 @@ def test_the_rescan_button_finds_what_the_watcher_did_not(win, qapp, folder):
     win._watcher.removePaths(win._watcher.directories() + win._watcher.files())
     _write(folder / "stage06.remote.nii.gz", np.ones((6, 7, 5)))
     win.rescan_button.click()
-    assert _wait(qapp, lambda: any("stage06.remote" in t for t in _rows(win.underlay_box)))
+    assert _wait(qapp, lambda: any("stage06.remote" in t for t in _rows(win.data_box)))

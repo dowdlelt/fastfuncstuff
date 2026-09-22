@@ -1,7 +1,15 @@
 """The controller: a data selector, driving N companion windows.
 
-The core is one row -- Read, Underlay, Overlay, +1, Mode. That is the whole
-viewer; images and graphs are things you turn on beside it.
+The core is one row -- Read, Data, Load, Mode -- over a stack list. That is the
+whole viewer; images and graphs are things you turn on beside it.
+
+It used to be Read, Underlay, Overlay, +1, Mode, which made you say what kind
+of thing a file was before you had opened it. The answer changes with the
+question: an anatomical is an overlay when you are checking alignment, a run is
+an underlay while you set its mask, and a GLM result wants the run loaded but
+not drawn. So there is one load, and where a layer sits, whether it is drawn
+and whether a mode reads it are three separate things decided afterwards -- the
+first in the stack list, the second by its tick box, the third by INPUT.
 
 This window holds no brain. Every image and every graph is a top-level window
 described by a :class:`~viewer.viewports.Viewport` and reconciled by
@@ -57,7 +65,7 @@ from fastfuncstuff.viewer.ui.widgets import RowSizedList
 from fastfuncstuff.viewer.ui.work import PreparationRunner, run_when_ready
 from fastfuncstuff.viewer.viewports import ViewKind
 from fastfuncstuff.viewer.vocab import (
-    AddOverlay,
+    Load,
     ModeAction,
     MoveLayer,
     Read,
@@ -76,7 +84,6 @@ from fastfuncstuff.viewer.vocab import (
     SetMatrixOrder,
     SetMode,
     SetModeParam,
-    SetOverlay,
     SetRange,
     SetRangeMirror,
     SetSeed,
@@ -86,7 +93,6 @@ from fastfuncstuff.viewer.vocab import (
     SetThresholdFollow,
     SetThresholdIndex,
     SetTimeLinked,
-    SetUnderlay,
     SetViewDetrend,
     SetViewRois,
     SetViewScaling,
@@ -111,7 +117,10 @@ BUILT_SETTINGS = (
 
 #: Shown when no dataset is chosen. A picker that names a file while nothing is
 #: displayed reads as a load that failed.
-NONE_LABEL = "(none)"
+#: The picker's first row. It names what LOAD will open next rather than what
+#: is on screen -- the stack list below says that -- so it prompts rather than
+#: reporting "(none)" over a window full of data.
+NONE_LABEL = "(choose a dataset)"
 
 
 class _Bridge(QtCore.QObject):
@@ -464,31 +473,35 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, picks)
 
+        # One row, not the UNDERLAY / OVERLAY / [+]1 grid this replaces. Those
+        # three asked which of two kinds of thing a file was before it had been
+        # opened, and the answer was mostly wrong: an anatomical is an overlay
+        # when you are checking alignment, a run is an underlay while you set
+        # its mask. Loading is loading; where it sits and whether it is drawn
+        # are answered afterwards, in the stack, by the layer it became.
         grid_host = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(grid_host)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(5)
+        row = QtWidgets.QHBoxLayout(grid_host)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(5)
 
-        grid.addWidget(self._head("UNDERLAY"), 0, 0)
-        self.underlay_box = QtWidgets.QComboBox()
-        self.underlay_box.setFont(QtGui.QFont(MONO))
-        self.underlay_box.addItem(NONE_LABEL, userData=None)
-        self.underlay_box.activated.connect(lambda _: self._pick(self.underlay_box, SetUnderlay))
-        grid.addWidget(self.underlay_box, 0, 1)
+        row.addWidget(self._head("DATA"))
+        self.data_box = QtWidgets.QComboBox()
+        self.data_box.setFont(QtGui.QFont(MONO))
+        self.data_box.addItem(NONE_LABEL, userData=None)
+        # Picking is loading: the extra click on LOAD would be a confirmation
+        # of something already unambiguous, and the button stays for the second
+        # copy -- the same file over itself, at two thresholds.
+        self.data_box.activated.connect(lambda _: self._pick(self.data_box, Load))
+        row.addWidget(self.data_box, 1)
 
-        grid.addWidget(self._head("OVERLAY"), 1, 0)
-        self.overlay_box = QtWidgets.QComboBox()
-        self.overlay_box.setFont(QtGui.QFont(MONO))
-        self.overlay_box.addItem(NONE_LABEL, userData=None)
-        self.overlay_box.activated.connect(lambda _: self._pick(self.overlay_box, SetOverlay))
-        grid.addWidget(self.overlay_box, 1, 1)
+        self.load_button = QtWidgets.QPushButton(key_label("LOAD", "^L"))
+        self.load_button.setToolTip(
+            "Put the chosen dataset on top of the stack (ctrl+L).\n"
+            "Press it again for a second copy of the same file."
+        )
+        self.load_button.clicked.connect(lambda: self._pick(self.data_box, Load))
+        row.addWidget(self.load_button)
 
-        self.plus_button = QtWidgets.QPushButton("[+]1")
-        self.plus_button.setToolTip("Add the selected dataset on top, keeping the current overlay")
-        self.plus_button.clicked.connect(lambda: self._pick(self.overlay_box, AddOverlay))
-        grid.addWidget(self.plus_button, 1, 2)
-
-        grid.setColumnStretch(1, 1)
         picks.addWidget(grid_host)
 
         self._build_window_bar()
@@ -730,7 +743,7 @@ class ViewerWindow(QtWidgets.QMainWindow):
         # Two columns, monospaced and padded, so a directory can be scanned by
         # dimensions and volume count rather than read name by name.
         width = max((len(e.name) for e in entries), default=0)
-        for box in (self.underlay_box, self.overlay_box):
+        for box in (self.data_box,):
             box.blockSignals(True)
             box.clear()
             # Nothing is loaded until something is picked; an entry showing in
@@ -751,7 +764,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             box.setCurrentIndex(0)
             box.blockSignals(False)
             self._fit_picker(box)
-        self._sync_pickers()
 
     # ------------------------------------------------------------------
     # companion windows
@@ -1394,6 +1406,12 @@ class ViewerWindow(QtWidgets.QMainWindow):
                     for n, letter in enumerate(LETTERS[:5], start=1)
                 ],
                 Binding("ctrl+o", "read a directory", self._read_dialog, group="session"),
+                Binding(
+                    "ctrl+l",
+                    "load the chosen dataset",
+                    lambda: self._pick(self.data_box, Load),
+                    group="session",
+                ),
                 Binding("ctrl+s", "save session script", self._save_script_dialog, group="session"),
                 Binding("h", "this list", self.help.toggle, group="session"),
             ]
@@ -1631,9 +1649,8 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(f"wrote {path}", 4000)
 
     def open_path(self, path: str | Path) -> None:
-        """Open one dataset: as the underlay if there is none, else on top."""
-        cmd = SetUnderlay if not len(self.session.state.layers) else AddOverlay
-        self._dispatch(cmd(str(path)))
+        """Open one dataset, on top of whatever is already loaded."""
+        self._dispatch(Load(str(path)))
         self._sync_layer_list()
 
     # ------------------------------------------------------------------
@@ -1701,7 +1718,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
             self._apply_theme()
         if dirty & (Aspect.LAYERS | Aspect.GRID):
             self._sync_layer_list()
-            self._sync_pickers()
             self._sync_mode_panel()
         elif dirty & (Aspect.COLORMAP | Aspect.THRESHOLD | Aspect.SLICES):
             # The bar is a view of colormap, range and threshold, so it has to
@@ -1727,42 +1743,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         if dirty & (Aspect.THRESHOLD | Aspect.LAYERS | Aspect.GRID):
             self.refresh_clusters(ctl=ctl)
         ctl.manager.redraw(dirty)
-
-    def _sync_pickers(self) -> None:
-        """Point each picker at the layer it currently governs.
-
-        A picker reading "(none)" while that layer is on screen is the same
-        confusion as one naming a file while nothing is displayed -- in both
-        cases the control disagrees with the view.
-        """
-        base = self.session.state.layers.base
-        overlay = self.session.state.layers.overlay
-        for box, layer in ((self.underlay_box, base), (self.overlay_box, overlay)):
-            box.blockSignals(True)
-            index = 0  # (none)
-            if layer is not None and not layer.is_computed:
-                for i in range(1, box.count()):
-                    entry = box.itemData(i)
-                    if entry is not None and str(entry.path) == layer.path:
-                        index = i
-                        break
-                else:
-                    # Loaded from outside the catalog: name it rather than lie.
-                    # Reused rather than appended, or every sync grows the
-                    # picker by one more copy of the same name.
-                    index = next(
-                        (
-                            i
-                            for i in range(1, box.count())
-                            if box.itemData(i) is None and box.itemText(i) == layer.name
-                        ),
-                        -1,
-                    )
-                    if index < 0:
-                        box.addItem(layer.name, userData=None)
-                        index = box.count() - 1
-            box.setCurrentIndex(index)
-            box.blockSignals(False)
 
     def _sync_layer_list(self) -> None:
         self._watch()

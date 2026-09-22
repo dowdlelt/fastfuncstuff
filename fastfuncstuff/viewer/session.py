@@ -512,18 +512,23 @@ class ViewerSession:
                 return found
         return available[-1]
 
-    def carpet_overlay(self, source: Layer) -> Layer | None:
-        """Which layer labels a carpet's rows.
+    def top_visible(self, *, besides: str | None = None) -> Layer | None:
+        """The topmost drawn layer, optionally ignoring one.
 
-        The topmost visible layer that is not the run being drawn -- not
-        "overlay-prime". In a stack of anat, run and stats the thing worth
-        drawing beside the rows is the stats map on top, and overlay-prime is
-        the run itself.
+        "What is on top" rather than "overlay-prime": in a stack of anat, run
+        and stats the thing worth reading a colour off is the stats map, and
+        index 1 is the run. Asked by everything that has to colour something
+        outside the panes -- a carpet's sidebar, a graph cell's wash -- so that
+        all of them agree with the picture and with each other.
         """
         for layer in reversed(list(self.state.layers)):
-            if layer.key != source.key and layer.visible:
+            if layer.visible and layer.key != besides:
                 return layer
         return None
+
+    def carpet_overlay(self, source: Layer) -> Layer | None:
+        """Which layer labels a carpet's rows: whatever is on top of the run."""
+        return self.top_visible(besides=source.key)
 
     def build_carpet(self, viewport, *, progress=None):
         """Render one carpet window's picture. Slow; runs on the worker.
@@ -756,7 +761,7 @@ class ViewerSession:
     def overlay_colors(
         self, cells: list[tuple[int, int, int]]
     ) -> list[tuple[float, float, float] | None] | None:
-        """The primary overlay's colour at each display voxel, or ``None`` where it is cut.
+        """The topmost drawn layer's colour at each display voxel, or ``None`` where cut.
 
         Drawn exactly as the slices draw it -- the same LUT, range, sign mode
         and threshold sub-brick -- so a cell's colour and the voxel under the
@@ -774,8 +779,13 @@ class ViewerSession:
         from fastfuncstuff.viewer.compose import cached_lut
 
         st = self.state
-        layer = st.layers.overlay
-        if layer is None or not layer.visible or st.grid is None or not cells:
+        layer = self.top_visible()
+        base = st.layers.base
+        if layer is not None and base is not None and layer.key == base.key:
+            # Only the base image is drawn, and washing a graph in the anatomy
+            # it is already sitting on says nothing.
+            layer = None
+        if layer is None or st.grid is None or not cells:
             return None
         volume = self.display_volume(layer.key)
         if volume is None:

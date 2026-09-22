@@ -386,8 +386,31 @@ class Read(Command):
 
 @command
 @dataclass(frozen=True)
+class Load(Command):
+    """Read a dataset into the stack, on top.
+
+    The one load verb. There used to be three -- SET_UNDERLAY, SET_OVERLAY and
+    ADD_OVERLAY -- because the viewer inherited AFNI's idea that a dataset
+    arrives as one of two kinds of thing. It does not: a layer is a layer, and
+    which one is at the bottom is an arrangement, not an identity. The three
+    are still understood so that recorded scripts replay, but nothing in the
+    interface issues them.
+    """
+
+    name = "LOAD"
+    aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
+    major = True
+    path: str
+    key: str = ""
+
+
+@command
+@dataclass(frozen=True)
 class SetUnderlay(Command):
-    """Replace the base image, keeping whatever is stacked over it."""
+    """Replace the base image, keeping whatever is stacked over it.
+
+    Legacy: a recorded script's spelling of LOAD-then-make-it-the-bottom.
+    """
 
     name = "SET_UNDERLAY"
     aspects = Aspect.LAYERS | Aspect.SLICES | Aspect.GRID
@@ -399,7 +422,10 @@ class SetUnderlay(Command):
 @command
 @dataclass(frozen=True)
 class SetOverlay(Command):
-    """Replace the primary overlay. Extra overlays are left alone."""
+    """Replace the primary overlay. Extra overlays are left alone.
+
+    Legacy; see :class:`Load`.
+    """
 
     name = "SET_OVERLAY"
     aspects = Aspect.LAYERS | Aspect.SLICES
@@ -411,7 +437,10 @@ class SetOverlay(Command):
 @command
 @dataclass(frozen=True)
 class AddOverlay(Command):
-    """Push another overlay on top of the stack -- the +1 button."""
+    """Push another overlay on top of the stack.
+
+    Legacy; see :class:`Load`, which is what the interface issues.
+    """
 
     name = "ADD_OVERLAY"
     aspects = Aspect.LAYERS | Aspect.SLICES
@@ -824,6 +853,28 @@ def install(
         regridded = old.shape != fresh.shape or bool((abs(old.affine - fresh.affine) > 1e-6).any())
         if base is not None and base.key == cmd.key and regridded:
             dirty |= _adopt_grid_preserving_position(st, fresh)
+        return dirty
+
+    @bus.handle(Load.name)
+    def _load_layer(cmd: Command, st: ViewerState) -> Aspect:
+        assert isinstance(cmd, Load)
+        first = not len(st.layers)
+        layer = _load(cmd.path, cmd.key or st.layers.mint_key("L"))
+        st.layers.add(layer)
+        if session is not None and not first:
+            # The first thing loaded is the picture; everything after it is
+            # over something, so it needs a threshold to be seen through.
+            session.apply_overlay_defaults(layer.key)
+        # Selected, because loading a dataset is how you say which one you are
+        # about to adjust -- otherwise the first threshold drag moves whatever
+        # was selected before, which is usually the anatomy.
+        st.selected = layer.key
+        dirty = Load.aspects
+        if first:
+            # The bottom of the stack defines the display grid, and the first
+            # layer is the bottom of the stack.
+            st.adopt_grid(layer.shape, layer.affine)
+            dirty |= Aspect.GRID | Aspect.CROSSHAIR
         return dirty
 
     @bus.handle(SetUnderlay.name)

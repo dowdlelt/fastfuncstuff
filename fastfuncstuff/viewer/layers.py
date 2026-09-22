@@ -262,9 +262,13 @@ class LayerStack:
     # -- underlay / overlay roles --------------------------------------
     #
     # Position is the truth: index 0 is drawn first, so "the underlay" is
-    # simply the bottom of the stack and "the overlay" the one above it. These
-    # helpers exist because that is how people think and how the buttons are
-    # labelled, not because the stack has a second notion of identity.
+    # simply the bottom of the stack and "the overlay" the one above it.
+    #
+    # The two *replacing* helpers below are legacy. Nothing in the interface
+    # calls them any more -- LOAD adds a layer and the stack list arranges it
+    # -- but SET_UNDERLAY and SET_OVERLAY still have to mean what they meant
+    # when a recorded script was written, and that is replacement. The plain
+    # accessors are position, which is not legacy and not going anywhere.
 
     def set_underlay(self, layer: Layer) -> Layer:
         """Replace the bottom layer, keeping everything stacked above it."""

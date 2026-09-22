@@ -341,28 +341,54 @@ def test_an_unticked_run_is_still_offered_as_an_input(win4d, qapp):
 # ---------------------------------------------------------------------------
 
 
-def test_a_fresh_read_selects_nothing(qapp, datadir):
-    """A picker naming a file while the panes are empty reads as a failed load."""
+def test_a_fresh_read_loads_nothing(qapp, datadir):
+    """Reading a directory fills the picker; it does not open anything."""
     session = ViewerSession(device=CPU)
     w = ViewerWindow(session)
     try:
         w.read_directory(datadir)
         qapp.processEvents()
-        assert w.underlay_box.currentText() == "(none)"
-        assert w.overlay_box.currentText() == "(none)"
+        assert w.data_box.currentIndex() == 0
+        assert w.data_box.count() == 3  # the prompt plus two datasets
         assert len(session.state.layers) == 0
     finally:
         w.close()
 
 
-def test_the_pickers_follow_what_is_loaded(win):
-    assert win.underlay_box.currentText().startswith("anat.nii.gz")
-    assert win.overlay_box.currentText().startswith("stats.nii.gz")
+def test_picking_a_dataset_loads_it_on_top(qapp, datadir):
+    """One verb. Picking twice stacks two layers rather than replacing one."""
+    session = ViewerSession(device=CPU)
+    w = ViewerWindow(session)
+    try:
+        w.read_directory(datadir)
+        qapp.processEvents()
+        for name in ("anat.nii.gz", "stats.nii.gz"):
+            row = next(i for i in range(w.data_box.count()) if name in w.data_box.itemText(i))
+            w.data_box.setCurrentIndex(row)
+            w.data_box.activated.emit(row)
+            qapp.processEvents()
+        assert [ly.name for ly in session.state.layers] == ["anat.nii.gz", "stats.nii.gz"]
+        # The first one in defines the grid, because it is the bottom of the stack.
+        assert session.state.grid.shape == session.state.layers.layers[0].shape
+        assert session.state.selected == session.state.layers.layers[-1].key
+    finally:
+        w.close()
+
+
+def test_the_picker_offers_only_files_on_disk(win4d, qapp):
+    """It says what LOAD will open, so a derived layer has no row in it.
+
+    The old picker mirrored the stack and grew a row per file-less layer, which
+    offered to re-open something that was never on disk.
+    """
+    texts = [win4d.data_box.itemText(i) for i in range(win4d.data_box.count())]
+    assert all(t.startswith("(") or ".nii" in t for t in texts)
+    assert not any("C1" in t for t in texts)
 
 
 def test_picker_rows_are_two_columns(win):
     """Dimensions and volume count must be scannable, not truncated."""
-    row = win.underlay_box.itemText(1)
+    row = win.data_box.itemText(1)
     assert "anat.nii.gz" in row
     assert "10x12x8" in row
 
@@ -371,12 +397,11 @@ def test_pickers_are_wide_enough_for_their_widest_row(win):
     """Qt sizes a combo to its current item, which truncates the rest on macOS."""
     from PySide6 import QtGui
 
-    metrics = QtGui.QFontMetrics(win.underlay_box.font())
+    metrics = QtGui.QFontMetrics(win.data_box.font())
     widest = max(
-        metrics.horizontalAdvance(win.underlay_box.itemText(i))
-        for i in range(win.underlay_box.count())
+        metrics.horizontalAdvance(win.data_box.itemText(i)) for i in range(win.data_box.count())
     )
-    assert win.underlay_box.minimumWidth() >= widest
+    assert win.data_box.minimumWidth() >= widest
 
 
 # ---------------------------------------------------------------------------
@@ -1424,7 +1449,7 @@ def test_clicking_a_layer_does_not_disable_the_keyboard(win, qapp):
     win.layer_list.setCurrentRow(0)
     qapp.processEvents()
     assert win.layer_list.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
-    for box in (win.cmap_box, win.mode_box, win.underlay_box):
+    for box in (win.cmap_box, win.mode_box, win.data_box):
         assert box.focusPolicy() == QtCore.Qt.FocusPolicy.NoFocus
 
 
@@ -1561,8 +1586,8 @@ def test_a_selection_can_be_saved_and_read_back(win4d, qapp, tmp_path):
     assert np.array_equal(np.asarray(img.dataobj) > 0.5, win4d.session.volume(layer.key, 0) > 0.5)
 
 
-def test_a_layer_with_no_file_is_named_once_in_the_picker(win4d, qapp):
-    """Every sync used to append another copy of the name to the picker."""
+def test_a_selection_layer_never_enters_the_picker(win4d, qapp):
+    """The picker used to grow a row per file-less layer, once per sync."""
     carpet = _carpet(win4d, qapp)
     carpet.resize(600, 400)
     qapp.processEvents()
@@ -1570,12 +1595,12 @@ def test_a_layer_with_no_file_is_named_once_in_the_picker(win4d, qapp):
     stack = win4d.session.state.layers
     from fastfuncstuff.viewer.vocab import MoveLayer
 
-    win4d._dispatch(MoveLayer(stack.layers[-1].key, 1))  # make it overlay-prime
+    win4d._dispatch(MoveLayer(stack.layers[-1].key, 1))
     for _ in range(3):
         win4d.refresh(Aspect.LAYERS)
-    name = stack.overlay.name
-    texts = [win4d.overlay_box.itemText(i) for i in range(win4d.overlay_box.count())]
-    assert texts.count(name) == 1
+    name = stack.layers[1].name
+    texts = [win4d.data_box.itemText(i) for i in range(win4d.data_box.count())]
+    assert texts.count(name) == 0
 
 
 # ---------------------------------------------------------------------------
