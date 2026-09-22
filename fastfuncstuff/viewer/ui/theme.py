@@ -210,6 +210,7 @@ QComboBox QAbstractItemView {{ background: {c.panel}; color: {c.text};
     selection-background-color: {c.select}; selection-color: {c.accent}; }}
 QPushButton {{ background: {c.panel}; border: 1px solid {c.edge}; padding: 5px 11px;
     font-family: {MONO}; font-size: {FONT_BODY}px; letter-spacing: 1px; color: {c.text}; }}
+QPushButton#tool {{ padding: 4px 5px; letter-spacing: 0px; }}
 QPushButton:hover {{ background: {c.select}; border-color: {c.edge_lit}; }}
 QPushButton:checked {{ background: {c.select}; border-color: {c.edge_lit}; color: {c.accent}; }}
 QPushButton:disabled {{ color: {c.faint}; border-color: {c.edge}; }}

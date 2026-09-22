@@ -48,6 +48,7 @@ from fastfuncstuff.viewer.state import Plane
 from fastfuncstuff.viewer.ui import theme
 from fastfuncstuff.viewer.ui.colorbar import RangeBar, thresholds_itself
 from fastfuncstuff.viewer.ui.controls import ControlPanel
+from fastfuncstuff.viewer.ui.flow import FlowBar
 from fastfuncstuff.viewer.ui.manager import WindowManager
 from fastfuncstuff.viewer.ui.shortcuts import Binding, ShortcutHelp, keep_keys_for_shortcuts
 from fastfuncstuff.viewer.ui.theme import MONO, key_label, stylesheet
@@ -477,14 +478,6 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.plus_button.clicked.connect(lambda: self._pick(self.overlay_box, AddOverlay))
         grid.addWidget(self.plus_button, 1, 2)
 
-        grid.addWidget(self._head("MODE"), 2, 0)
-        self.mode_box = QtWidgets.QComboBox()
-        labels = registry.labels()
-        for name in registry.names():
-            self.mode_box.addItem(labels[name], userData=name)
-        self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
-        self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
-        grid.addWidget(self.mode_box, 2, 1)
         grid.setColumnStretch(1, 1)
         picks.addWidget(grid_host)
 
@@ -496,7 +489,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
         bar.setMovable(False)
         self.addToolBarBreak(QtCore.Qt.ToolBarArea.TopToolBarArea)
         self.addToolBar(QtCore.Qt.ToolBarArea.TopToolBarArea, bar)
-        bar.addWidget(self._head("WINDOWS"))
+
+        # The mode picker lives here rather than as a third row of the dataset
+        # grid. That grid's value column is stretched to fit a forty-character
+        # filename, and the mode names are the six shortest strings in the
+        # interface -- so MODE was the widest control in the window and said
+        # the least. Here it is sized to its own text and the row it used to
+        # occupy goes back to the window buttons, several of which were being
+        # pushed into the toolbar's overflow menu and so were not findable at
+        # all.
+        # Expanding, or the toolbar hands the host only its size hint -- which
+        # a flow layout reports as its widest single item, because it can
+        # always wrap. The buttons then flow one per row down a 104-pixel
+        # column, which is worse than the overflow menu this replaces.
+        flow = FlowBar(spacing=4)
+        bar.addWidget(flow)
+
+        flow.addWidget(self._head("MODE"))
+        self.mode_box = QtWidgets.QComboBox()
+        labels = registry.labels()
+        for name in registry.names():
+            self.mode_box.addItem(labels[name], userData=name)
+        self.mode_box.setCurrentIndex(self.mode_box.findData(self.session.mode.name))
+        self.mode_box.setSizeAdjustPolicy(QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.mode_box.activated.connect(lambda _: self._switch_mode(self.mode_box.currentData()))
+        flow.addWidget(self.mode_box)
 
         for text, key, tip, slot in (
             ("+IMAGE", "n", "Open another image window", self._new_image),
@@ -524,29 +541,29 @@ class ViewerWindow(QtWidgets.QMainWindow):
             ("RAISE", "r", "Bring every companion window to the front", self._raise_all),
         ):
             b = QtWidgets.QPushButton(key_label(text, key))
+            b.setObjectName("tool")
             b.setToolTip(f"{tip} ({key})")
             b.clicked.connect(slot)
-            bar.addWidget(b)
+            flow.addWidget(b)
 
-        bar.addSeparator()
         # Names the palette you would switch *to*, not the one you are in: a
         # button labelled with the current state reads as a status light and
         # gets pressed by people who wanted it to stay that way.
         self.theme_button = QtWidgets.QPushButton("")
         self.theme_button.setToolTip("Switch between the dark and light palette (d)")
+        self.theme_button.setObjectName("tool")
         self.theme_button.clicked.connect(self._toggle_theme)
-        bar.addWidget(self.theme_button)
+        flow.addWidget(self.theme_button)
 
-        bar.addSeparator()
-        bar.addWidget(self._head("T"))
+        flow.addWidget(self._head("T"))
         self.time_spin = QtWidgets.QSpinBox()
         self.time_spin.setToolTip("Jump to a volume ( , and . step, v plays )")
         self.time_spin.setKeyboardTracking(False)
         self.time_spin.setMaximumWidth(84)
         self.time_spin.valueChanged.connect(self._time_spin_changed)
-        bar.addWidget(self.time_spin)
+        flow.addWidget(self.time_spin)
         self.time_label = QtWidgets.QLabel("")
-        bar.addWidget(self.time_label)
+        flow.addWidget(self.time_label)
 
     @staticmethod
     def _fit_picker(box: QtWidgets.QComboBox) -> None:
