@@ -69,6 +69,7 @@ from fastfuncstuff.viewer.vocab import (
     SetColormap,
     SetIJK,
     SetIndex,
+    SetInput,
     SetLayerOpacity,
     SetLayerRoi,
     SetLayerVisible,
@@ -1192,6 +1193,31 @@ class ViewerWindow(QtWidgets.QMainWindow):
 
         self.mode_head = self._head("MODE PARAMETERS")
         v.addWidget(self.mode_head)
+
+        # Above the parameters, because it is the first thing the mode needs
+        # and the one the parameters are all about. Its own row rather than a
+        # declared control, since every mode that reads anything asks the same
+        # question and none of them should have to say so.
+        input_row = QtWidgets.QHBoxLayout()
+        input_row.setSpacing(6)
+        self.input_head = self._head("INPUT")
+        input_row.addWidget(self.input_head)
+        self.input_box = QtWidgets.QComboBox()
+        self.input_box.setFont(QtGui.QFont(MONO))
+        self.input_box.setToolTip(
+            "Which loaded dataset this mode computes from.\n"
+            "Independent of what is drawn: a run can be unticked in the stack,\n"
+            "or sitting under the anatomy, and still be what the fit reads."
+        )
+        self.input_box.activated.connect(
+            lambda i: self._dispatch_input(self.input_box.itemData(i) or "")
+        )
+        self._shrinkable(self.input_box)
+        input_row.addWidget(self.input_box, 1)
+        self.input_row_host = QtWidgets.QWidget()
+        self.input_row_host.setLayout(input_row)
+        v.addWidget(self.input_row_host)
+
         self.mode_panel = ControlPanel()
         self.mode_panel.changed.connect(self._mode_param_changed)
         self.mode_panel.action_requested.connect(self._mode_action)
@@ -1767,12 +1793,56 @@ class ViewerWindow(QtWidgets.QMainWindow):
         self.layer_list.rows_changed()
         self._sync_layer_controls()
 
+    def _dispatch_input(self, key: str) -> None:
+        self._dispatch(SetInput(key))
+        self._prepare_then_refresh()
+
+    def _sync_input_box(self) -> None:
+        """List what the mode could read, and point at what it does read.
+
+        Hidden entirely for a mode that reads nothing from the stack, and shown
+        disabled with a reason when there is nothing it could read -- an empty
+        drop-down says "pick one" about a list with nothing in it.
+        """
+        mode = self.session.mode
+        if mode.input_kind == "none":
+            self.input_row_host.setVisible(False)
+            return
+        self.input_row_host.setVisible(True)
+        candidates = self.session.input_candidates()
+        current = self.session.input_layer()
+        self.input_box.blockSignals(True)
+        self.input_box.clear()
+        if not candidates:
+            wanted = "a 4-D time series" if mode.input_kind == "4d" else "a dataset"
+            self.input_box.addItem(f"(load {wanted})", userData="")
+            self.input_box.setEnabled(False)
+        else:
+            self.input_box.setEnabled(True)
+            # "(auto)" names the default rather than hiding it, so a stack with
+            # two runs in it does not silently fit one of them.
+            head = candidates[0].name if candidates else ""
+            self.input_box.addItem(f"(auto: {head})", userData="")
+            for layer in candidates:
+                self.input_box.addItem(f"{layer.name} [{layer.key}]", userData=layer.key)
+            named = self.session.state.input_key
+            index = self.input_box.findData(named) if named else 0
+            self.input_box.setCurrentIndex(index if index >= 0 else 0)
+        self.input_box.blockSignals(False)
+        self.input_box.setToolTip(
+            "Which loaded dataset this mode computes from"
+            + (f" -- now {current.name}.\n" if current is not None else ".\n")
+            + "Independent of what is drawn: a run can be unticked in the stack,\n"
+            "or sitting under the anatomy, and still be what the fit reads."
+        )
+
     def _sync_mode_panel(self) -> None:
         mode = self.session.mode
         self.mode_panel.rebuild(mode.controls(), mode.params, mode.actions())
         has = bool(mode.controls()) or bool(mode.actions())
         self.mode_head.setVisible(has)
         self.mode_panel.setVisible(has)
+        self._sync_input_box()
         idx = self.mode_box.findData(mode.name)
         if idx >= 0 and idx != self.mode_box.currentIndex():
             self.mode_box.blockSignals(True)

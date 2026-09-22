@@ -276,6 +276,67 @@ def test_the_threshold_label_follows_the_mode(win, qapp):
 
 
 # ---------------------------------------------------------------------------
+# the mode's input row
+# ---------------------------------------------------------------------------
+
+
+def test_a_mode_that_reads_nothing_shows_no_input_row(win, qapp):
+    """View has no input; a box saying "(auto: anat)" would invent a fit."""
+    assert win.session.mode.name == "plain"
+    assert not win.input_row_host.isVisible()
+
+
+def test_the_input_row_lists_the_runs_and_names_the_default(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    assert win4d.input_row_host.isVisible()
+    texts = [win4d.input_box.itemText(i) for i in range(win4d.input_box.count())]
+    assert texts[0].startswith("(auto: bold.nii.gz")
+    assert any("bold.nii.gz" in t for t in texts[1:])
+    # The 3-D anatomical is not offered: InstaCorr cannot correlate it.
+    assert not any("anat.nii.gz" in t for t in texts)
+
+
+def test_picking_an_input_re_points_the_mode(win4d, qapp):
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    row = next(i for i in range(1, win4d.input_box.count()) if win4d.input_box.itemData(i))
+    key = win4d.input_box.itemData(row)
+    win4d.input_box.setCurrentIndex(row)
+    win4d.input_box.activated.emit(row)
+    qapp.processEvents()
+    assert win4d.session.state.input_key == key
+    assert f"SET_INPUT {key}" in win4d.session.to_script()
+
+
+def test_the_input_row_says_so_when_there_is_nothing_to_read(win, qapp):
+    """An empty drop-down invites a click that cannot be answered."""
+    from fastfuncstuff.viewer.vocab import SetMode
+
+    win.refresh(win.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    assert win.input_row_host.isVisible()
+    assert not win.input_box.isEnabled()
+    assert "load" in win.input_box.currentText()
+
+
+def test_an_unticked_run_is_still_offered_as_an_input(win4d, qapp):
+    """The whole point: hiding a run is about the picture, not the data."""
+    from fastfuncstuff.viewer.vocab import SetLayerVisible, SetMode
+
+    run = next(ly for ly in win4d.session.state.layers if ly.n_volumes > 1)
+    win4d.refresh(win4d.session.do(SetLayerVisible(run.key, on=False)))
+    win4d.refresh(win4d.session.do(SetMode("instacorr")))
+    qapp.processEvents()
+    keys = [win4d.input_box.itemData(i) for i in range(win4d.input_box.count())]
+    assert run.key in keys
+
+
+# ---------------------------------------------------------------------------
 # the pickers must agree with what is on screen
 # ---------------------------------------------------------------------------
 
