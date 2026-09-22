@@ -25,6 +25,9 @@ required its own fit rather than ``glm/core.py:fit_glm``.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -77,6 +80,28 @@ LINE_HELP = {
     "resid": "what the model did not account for",
     "column": "the selected column's own contribution",
 }
+
+
+def _short_labels(path: str, labels: Sequence[str], *, distinguish: bool) -> list[str]:
+    """Name a regressor file's columns in something a picker can show.
+
+    ``read_nuisance`` names a plain 1D file's columns after its stem, which for
+    a pipeline output is the whole provenance --
+    ``stage02.moco.ses-01.task-dynaloc.run-01.motion#0``. Forty-five characters
+    of it is the same on every column, and it is the last word that says what
+    the regressor *is*. An xmat's own labels are left alone; they were chosen.
+    """
+    stem = Path(path).name
+    for ext in (".1D", ".txt", ".tsv"):
+        stem = stem.removesuffix(ext)
+    short = stem.rsplit(".", 1)[-1] or stem
+    out = []
+    for label in labels:
+        # Only the names this reader invented, which are exactly the ones that
+        # start with the stem it invented them from.
+        name = f"{short}{label[len(stem) :]}" if label.startswith(stem) else str(label)
+        out.append(f"{short}:{name}" if distinguish and not label.startswith(stem) else name)
+    return out
 
 
 @mode
@@ -485,8 +510,6 @@ class InstaGLMMode(Mode):
         two motion estimates in the same model stay tellable apart in the
         column picker.
         """
-        from pathlib import Path
-
         from fastfuncstuff.viewer.derive import read_nuisance
 
         paths = PathListControl.enabled(self.params.get("ortvec"))
@@ -500,8 +523,7 @@ class InstaGLMMode(Mode):
             if read.columns is None or read.columns.size == 0:
                 continue
             blocks.append(np.asarray(read.columns, dtype=float))
-            stem = Path(path).name.split(".")[0]
-            labels += [f"{stem}:{label}" if len(paths) > 1 else label for label in read.labels]
+            labels += _short_labels(path, read.labels, distinguish=len(paths) > 1)
         if not blocks:
             return None, []
         return np.concatenate(blocks, axis=1), labels
@@ -515,8 +537,6 @@ class InstaGLMMode(Mode):
         progress: ProgressFn | None,
     ) -> tuple[np.ndarray, list[str]]:
         """The convolved condition columns, rebuilt only when their inputs move."""
-        from pathlib import Path
-
         try:
             stamp = Path(events_path).stat().st_mtime_ns
         except OSError:

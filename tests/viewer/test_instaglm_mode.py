@@ -429,9 +429,7 @@ def test_going_back_to_same_drops_the_second_volume(glm_session):
 
 
 def test_both_maps_follow_one_column_picker(glm_session):
-    mode = _enter(
-        glm_session, events=glm_session.events, show="beta", thresh="t", column="Pol#1"
-    )
+    mode = _enter(glm_session, events=glm_session.events, show="beta", thresh="t", column="Pol#1")
     stored = glm_session.store.get(_layer(glm_session).key).array
     k = mode._fit.model.index_of("Pol#1")
     np.testing.assert_allclose(stored[..., 0], mode._fit.volume("beta", column=k))
@@ -467,9 +465,11 @@ def test_several_ortvec_files_are_fitted_side_by_side(glm_session):
     mode = _enter(glm_session, ortvec=f"+{a}|+{b}")
     assert sum(c.group == "ort" for c in mode._fit.model.columns) == 5
     # Named for their file, since two motion estimates in one model are
-    # otherwise two sets of columns called the same thing.
-    assert any(lab.startswith("motion:") for lab in mode._fit.model.labels)
-    assert any(lab.startswith("physio:") for lab in mode._fit.model.labels)
+    # otherwise two sets of columns called the same thing -- but by the last
+    # word of the name, not the whole pipeline stem it came with.
+    labels = mode._fit.model.labels
+    assert [lab for lab in labels if lab.startswith("motion#")] == [f"motion#{i}" for i in range(3)]
+    assert [lab for lab in labels if lab.startswith("physio#")] == [f"physio#{i}" for i in range(2)]
 
 
 def test_unticking_a_file_drops_its_columns_without_forgetting_it(glm_session):
@@ -489,3 +489,14 @@ def test_a_single_unprefixed_path_still_works(glm_session):
     a = _ortvec(glm_session, "motion.1D", 3, seed=1)
     mode = _enter(glm_session, ortvec=a)
     assert sum(c.group == "ort" for c in mode._fit.model.columns) == 3
+
+
+def test_a_pipeline_stem_is_not_carried_into_every_column_name(glm_session):
+    """`stage02.moco.ses-01.task-dynaloc.run-01.motion#0` is forty-five
+    characters of provenance repeated on every column, and the last word is
+    the only part that says what the regressor is."""
+    path = glm_session.tmp / "stage02.moco.ses-01.task-face.run-01.motion.1D"
+    np.savetxt(path, np.random.default_rng(5).normal(size=(N_TIME, 6)))
+    mode = _enter(glm_session, ortvec=f"+{path}")
+    ort = [c.label for c in mode._fit.model.columns if c.group == "ort"]
+    assert ort == [f"motion#{i}" for i in range(6)]
